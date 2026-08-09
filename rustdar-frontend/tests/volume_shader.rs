@@ -49,10 +49,10 @@ use naga::back::glsl;
 use naga::proc::{BoundsCheckPolicies, BoundsCheckPolicy};
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 use rustdar_frontend::volume::raymarch::{
-    BINDING_BLIT_SAMPLER, BINDING_BLIT_TEXTURE, BINDING_GRID_SAMPLER, BINDING_GRID_TEXTURE,
-    BINDING_LUT_SAMPLER, BINDING_LUT_TEXTURE, BINDING_UNIFORM, ENTRY_FS_BLIT_GAMMA,
-    ENTRY_FS_BLIT_LINEAR, ENTRY_FS_RAYMARCH, ENTRY_POINTS, ENTRY_VS_BLIT, ENTRY_VS_RAYMARCH,
-    ShaderStage, VOLUME_SHADER_WGSL,
+    BINDING_BLIT_SAMPLER, BINDING_BLIT_TEXTURE, BINDING_FLOOR_SAMPLER, BINDING_FLOOR_TEXTURE,
+    BINDING_GRID_SAMPLER, BINDING_GRID_TEXTURE, BINDING_LUT_SAMPLER, BINDING_LUT_TEXTURE,
+    BINDING_UNIFORM, ENTRY_FS_BLIT_GAMMA, ENTRY_FS_BLIT_LINEAR, ENTRY_FS_RAYMARCH, ENTRY_POINTS,
+    ENTRY_VS_BLIT, ENTRY_VS_RAYMARCH, ShaderStage, VOLUME_SHADER_WGSL,
 };
 
 /// What kind of resource one bind group layout entry is.
@@ -67,24 +67,30 @@ enum BindingKind {
     Sampler,
 }
 
-/// One pipeline layout, in binding order.
-type Layout = &'static [(u32, BindingKind)];
+/// One pipeline layout: `(group, binding, kind)` in declaration order —
+/// groups in ascending order, entries in binding order within each, which is
+/// the order wgpu-hal walks them.
+type Layout = &'static [(u32, u32, BindingKind)];
 
 /// The raymarch's bind group layout, in the order `create_bind_group_layout`
 /// declares it.
 const RAYMARCH_LAYOUT: Layout = &[
-    (BINDING_UNIFORM, BindingKind::UniformBuffer),
-    (BINDING_GRID_TEXTURE, BindingKind::Texture),
-    (BINDING_GRID_SAMPLER, BindingKind::Sampler),
-    (BINDING_LUT_TEXTURE, BindingKind::Texture),
-    (BINDING_LUT_SAMPLER, BindingKind::Sampler),
+    (0, BINDING_UNIFORM, BindingKind::UniformBuffer),
+    (0, BINDING_GRID_TEXTURE, BindingKind::Texture),
+    (0, BINDING_GRID_SAMPLER, BindingKind::Sampler),
+    (0, BINDING_LUT_TEXTURE, BindingKind::Texture),
+    (0, BINDING_LUT_SAMPLER, BindingKind::Sampler),
+    // The floor rides group 1, and the counters do NOT restart: wgpu-hal
+    // keeps one counter per binding type across the whole pipeline layout.
+    (1, BINDING_FLOOR_TEXTURE, BindingKind::Texture),
+    (1, BINDING_FLOOR_SAMPLER, BindingKind::Sampler),
 ];
 
 /// The blit's, whose counters restart at zero — which is the whole reason the
 /// two are kept apart.
 const BLIT_LAYOUT: Layout = &[
-    (BINDING_BLIT_TEXTURE, BindingKind::Texture),
-    (BINDING_BLIT_SAMPLER, BindingKind::Sampler),
+    (0, BINDING_BLIT_TEXTURE, BindingKind::Texture),
+    (0, BINDING_BLIT_SAMPLER, BindingKind::Sampler),
 ];
 
 /// Which layout an entry point is compiled against.
@@ -109,13 +115,13 @@ fn binding_map(layout: Layout) -> glsl::BindingMap {
     let mut uniform_buffers = 0u8;
     let mut map = glsl::BindingMap::default();
 
-    for &(binding, kind) in layout {
+    for &(group, binding, kind) in layout {
         let counter = match kind {
             BindingKind::Sampler => &mut samplers,
             BindingKind::Texture => &mut textures,
             BindingKind::UniformBuffer => &mut uniform_buffers,
         };
-        map.insert(naga::ResourceBinding { group: 0, binding }, *counter);
+        map.insert(naga::ResourceBinding { group, binding }, *counter);
         *counter += 1;
     }
     map
@@ -387,30 +393,37 @@ fn the_translated_raymarch_samples_a_3d_texture_at_an_explicit_level() {
 #[test]
 fn the_binding_map_counts_per_binding_type_the_way_wgpu_hal_does() {
     let raymarch = binding_map(RAYMARCH_LAYOUT);
-    let slot = |binding: u32| {
+    let slot = |group: u32, binding: u32| {
         *raymarch
-            .get(&naga::ResourceBinding { group: 0, binding })
-            .unwrap_or_else(|| panic!("binding {binding} is missing from the map"))
+            .get(&naga::ResourceBinding { group, binding })
+            .unwrap_or_else(|| panic!("group {group} binding {binding} is missing from the map"))
     };
-    assert_eq!(slot(BINDING_UNIFORM), 0);
-    assert_eq!(slot(BINDING_GRID_TEXTURE), 0);
-    assert_eq!(slot(BINDING_GRID_SAMPLER), 0);
+    assert_eq!(slot(0, BINDING_UNIFORM), 0);
+    assert_eq!(slot(0, BINDING_GRID_TEXTURE), 0);
+    assert_eq!(slot(0, BINDING_GRID_SAMPLER), 0);
     assert_eq!(
-        slot(BINDING_LUT_TEXTURE),
+        slot(0, BINDING_LUT_TEXTURE),
         1,
         "the second texture did not take the texture counter's second slot"
     );
     assert_eq!(
-        slot(BINDING_LUT_SAMPLER),
+        slot(0, BINDING_LUT_SAMPLER),
         1,
         "the second sampler did not take the sampler counter's second slot"
     );
     assert_ne!(
-        slot(BINDING_LUT_TEXTURE),
+        slot(0, BINDING_LUT_TEXTURE),
         BINDING_LUT_TEXTURE as u8,
         "the map is writing binding numbers rather than per-type counters; on \
          this layout those differ, which is what makes the difference visible"
     );
+    assert_eq!(
+        slot(1, BINDING_FLOOR_TEXTURE),
+        2,
+        "the floor's texture must continue the pipeline-wide texture counter \
+         across the group boundary, not restart it"
+    );
+    assert_eq!(slot(1, BINDING_FLOOR_SAMPLER), 2);
 
     let blit = binding_map(BLIT_LAYOUT);
     for binding in [BINDING_BLIT_TEXTURE, BINDING_BLIT_SAMPLER] {

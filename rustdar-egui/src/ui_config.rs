@@ -802,6 +802,9 @@ fn restore_content(pane_idx: usize, pc: &PaneConfig, pane_count: usize) -> PaneC
                 region,
                 source_pane,
                 rendered_for: None,
+                // Not persisted: the floor defaults on for every session, and
+                // a pane that turned it off holds that for the session only.
+                hide_floor: false,
             }))
         }
     }

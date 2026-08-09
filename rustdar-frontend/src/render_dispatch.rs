@@ -1272,6 +1272,70 @@ impl RenderDispatcher {
         true
     }
 
+    /// Render a map floor for a finished voxel build, in the background.
+    ///
+    /// A `JobRequest::Radar` at the volume's lowest reflectivity tilt — the
+    /// exact rasterizer the 2D pane draws with — whose reply is resampled
+    /// onto the box footprint (`resample_floor`) in the job's own delivery
+    /// closure, off the frame thread natively, and sent through the floor
+    /// channel. Returns `false` when the budget is full; the caller keeps its
+    /// dedupe entry unwritten and the next completed build tries again.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_floor_render(
+        &mut self,
+        site: String,
+        region: Option<rustdar_egui::pane::VolumeRegion>,
+        input: rustdar_radar::render_input::RenderInput,
+        site_lat: f64,
+        x_range_km: (f64, f64),
+        y_range_km: (f64, f64),
+        sender: std::sync::mpsc::Sender<crate::channels::FloorResponse>,
+        window: Option<WindowRef>,
+    ) -> bool {
+        if self.renders_in_flight.load(Ordering::Relaxed) >= MAX_CONCURRENT_RENDERS {
+            return false;
+        }
+        self.renders_in_flight.fetch_add(1, Ordering::Relaxed);
+        let guard = RenderGuard(Arc::clone(&self.renders_in_flight));
+        let started = web_time::Instant::now();
+
+        let job = crate::offload::Job::Described(crate::offload::JobRequest::Radar {
+            input: Box::new(input),
+            // The floor is a picture; nobody hovers it.
+            values_wanted: false,
+        });
+        crate::offload::offload_job("floor-render", job, move |output| {
+            let _guard = guard;
+            let image = output
+                .and_then(crate::offload::JobOutput::frame)
+                .and_then(|frame| {
+                    crate::volume::floor::resample_floor(
+                        &frame.image,
+                        frame.max_range_km,
+                        site_lat,
+                        x_range_km,
+                        y_range_km,
+                    )
+                });
+            log::info!(
+                "3D volume view: {} the {site} floor in {} ms off the frame thread",
+                if image.is_some() {
+                    "rendered"
+                } else {
+                    "no picture for"
+                },
+                started.elapsed().as_millis(),
+            );
+            let _ = sender.send(crate::channels::FloorResponse {
+                site,
+                region,
+                image,
+            });
+            crate::app::notify_redraw(&window);
+        });
+        true
+    }
+
     /// Shared dispatch for both Level II and Level III renders.
     ///
     /// The tail below — the guard, the cancellation check, the send and the

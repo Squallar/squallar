@@ -73,7 +73,10 @@ struct Volume {
     //    mirrors; the cloud rung halves it, which is what takes the jitter's
     //    per-step opacity quantum below visibility. A zero (a stale buffer)
     //    falls to the dt floor against the ceiling rather than hanging.
-    // w: reserved, zero.
+    // w: 1 to draw the map floor — the ground texture on the box's bottom
+    //    face, composited behind the volume at the ray's own plane hit. 0 —
+    //    the instrument default — draws no floor and leaves every mask
+    //    exactly as it was.
     flags: vec4<f32>,
 }
 
@@ -90,6 +93,16 @@ struct Volume {
 // 3.0 has no `sampler1D` at all.
 @group(0) @binding(3) var lut_texture: texture_2d<f32>;
 @group(0) @binding(4) var lut_sampler: sampler;
+
+// The map floor: the ground the box stands on, as the 2D pane would draw it,
+// registered to the box footprint (u across x, v down from the north edge).
+// In its own group because its lifetime is its own — group 0 is rebuilt per
+// grid upload, the floor per floor render, and a pipeline may bind a
+// placeholder here when no floor is in hand. Straight gamma-encoded RGBA,
+// opaque where there is ground; the march decodes and composites it at the
+// ray's own hit with the bottom plane.
+@group(1) @binding(0) var floor_texture: texture_2d<f32>;
+@group(1) @binding(1) var floor_sampler: sampler;
 
 // ---------------------------------------------------------------------------
 // sRGB transfer functions
@@ -300,6 +313,40 @@ fn shading(p: vec3<f32>) -> f32 {
     return ambient + (1.0 - ambient) * wrap * wrap;
 }
 
+// Where this ray meets the box's bottom face, or a negative number for a ray
+// that never does.
+//
+// The floor is the z = 0 plane clipped to the unit square in x and y — the
+// box's own bottom face, so a hit is always on the box boundary: for an eye
+// above the plane it coincides with the ray's box exit, and for an eye below
+// it with (or before) the entry. That dichotomy is what lets the march
+// composite the floor with one comparison instead of interleaving it into the
+// loop.
+fn floor_hit(eye: vec3<f32>, direction: vec3<f32>) -> f32 {
+    if abs(direction.z) < RAY_DIRECTION_EPSILON {
+        return -1.0;
+    }
+    let t = -eye.z / direction.z;
+    if t <= 0.0 {
+        return -1.0;
+    }
+    let hit = eye + direction * t;
+    if hit.x < 0.0 || hit.x > 1.0 || hit.y < 0.0 || hit.y > 1.0 {
+        return -1.0;
+    }
+    return t;
+}
+
+// The floor's colour where the ray lands, linear and straight.
+//
+// v runs down from the box's north edge, which is row 0 of the floor image —
+// the same convention as every raster the 2D pane draws.
+fn floor_colour(eye: vec3<f32>, direction: vec3<f32>, t: f32) -> vec4<f32> {
+    let hit = eye + direction * t;
+    let sample = textureSampleLevel(floor_texture, floor_sampler, vec2<f32>(hit.x, 1.0 - hit.y), 0.0);
+    return vec4<f32>(linear_from_gamma_rgb(sample.rgb), sample.a);
+}
+
 @fragment
 fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
     let eye = volume.eye_in_box.xyz;
@@ -307,6 +354,17 @@ fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
     let span = slab_entry_exit(eye, direction);
     if span.y <= span.x {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
+
+    let floor_t = select(-1.0, floor_hit(eye, direction), volume.flags.w > 0.5);
+    // An eye under the bottom plane looking up meets the floor at (or before)
+    // its entry into the volume, so the floor is in front and the volume is
+    // wholly hidden behind it: the floor is the fragment. `span.x` rather
+    // than 0 so an inside-the-box eye — whose entry is clamped to 0 strictly
+    // above the plane — never takes this arm.
+    if floor_t >= 0.0 && floor_t <= span.x {
+        let ground = floor_colour(eye, direction, floor_t);
+        return vec4<f32>(gamma_from_linear_rgb(ground.rgb) * ground.a, ground.a);
     }
 
     // Cells this ray crosses per unit of `t`, in the grid's anisotropic cell
@@ -385,7 +443,19 @@ fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
         t = t + dt;
     }
 
-    let alpha = 1.0 - transmittance;
+    // The floor behind the volume: an eye above the plane meets it at the box
+    // exit, so whatever light the march did not absorb lands on the ground
+    // and composites under the accumulation — the same premultiplied algebra
+    // as the volume's own samples, at the end because the plane bounds the
+    // box from below and nothing can be behind it.
+    var transmitted = transmittance;
+    if floor_t > span.x {
+        let ground = floor_colour(eye, direction, floor_t);
+        accumulated = accumulated + transmittance * ground.a * ground.rgb;
+        transmitted = transmittance * (1.0 - ground.a);
+    }
+
+    let alpha = 1.0 - transmitted;
     if alpha <= 0.0 {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }

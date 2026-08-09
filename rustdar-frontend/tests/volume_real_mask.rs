@@ -223,6 +223,47 @@ fn render_a_real_volume_mask() {
         size,
     );
 
+    // The production floor, end to end: the 2D rasterizer at the lowest
+    // reflectivity tilt, `resample_floor` onto this very grid's footprint,
+    // and the raymarch compositing the volume over it — written as a third
+    // frame beside the mask and the colour render.
+    let floor_pixels = rustdar_radar::render::find_closest_elevation(
+        &scan,
+        rustdar_radar::types::RadarProduct::Reflectivity,
+        0.0,
+    )
+    .and_then(|elevation| {
+        rustdar_radar::render::render_radar_to_image(
+            &scan,
+            elevation,
+            rustdar_radar::types::RadarProduct::Reflectivity,
+            site_lat,
+            site_lon,
+        )
+    })
+    .and_then(|(image, max_range_km, _)| {
+        rustdar_frontend::volume::floor::resample_floor(
+            &image,
+            max_range_km,
+            site_lat,
+            grid.x_range_km(),
+            grid.y_range_km(),
+        )
+    })
+    .and_then(|floor| {
+        let texture = pipelines.upload_floor(&device, &queue, floor.size, &floor.rgba)?;
+        uniform.map_floor = true;
+        let volume = pipelines
+            .upload_volume(&device, &queue, grid_dims, grid.indices(), grid.lut())
+            .expect("the grid uploads twice as readily as once");
+        volume.write_uniform(&queue, &uniform);
+        let target = pipelines.create_offscreen(&device, size);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        pipelines.encode_raymarch_with_floor(&mut encoder, &target, &volume, Some(&texture));
+        queue.submit(Some(encoder.finish()));
+        Some(read_back(&device, &queue, target.texture(), size))
+    });
+
     let mask: Vec<u8> = mask_pixels.iter().map(|px| px[3]).collect();
     let masked = mask.iter().filter(|&&a| a > 0).count();
     let masked_solid = mask.iter().filter(|&&a| a >= 128).count();
@@ -235,6 +276,9 @@ fn render_a_real_volume_mask() {
 
     write_pgm(&format!("{out_prefix}_mask.pgm"), size, &mask);
     write_ppm(&format!("{out_prefix}_colour.ppm"), size, &colour_pixels);
+    if let Some(floor_pixels) = &floor_pixels {
+        write_ppm(&format!("{out_prefix}_floor.ppm"), size, floor_pixels);
+    }
 
     let (x0, x1) = grid.x_range_km();
     let (y0, y1) = grid.y_range_km();
@@ -300,7 +344,14 @@ fn render_a_real_volume_mask() {
     let meta_path = format!("{out_prefix}_meta.txt");
     std::fs::write(&meta_path, &meta).unwrap_or_else(|e| panic!("writing {meta_path}: {e}"));
     println!("{meta}");
-    println!("wrote {out_prefix}_mask.pgm, {out_prefix}_colour.ppm, {meta_path}");
+    println!(
+        "wrote {out_prefix}_mask.pgm, {out_prefix}_colour.ppm{}, {meta_path}",
+        if floor_pixels.is_some() {
+            format!(", {out_prefix}_floor.ppm")
+        } else {
+            String::new()
+        },
+    );
 }
 
 // ── The volume ───────────────────────────────────────────────────────────────

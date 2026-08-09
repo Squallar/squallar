@@ -1222,6 +1222,7 @@ fn volume_pane_outcome(
     volume.camera.nudge(delta);
     let camera = volume.camera;
     let region = volume.region;
+    let floor = !volume.hide_floor;
     let already_rendered = volume.rendered_for.clone();
 
     // Everything below is a reason there is no picture, in the order the user
@@ -1274,6 +1275,7 @@ fn volume_pane_outcome(
         target,
         camera,
         size_px,
+        floor,
     }) {
         VolumePaint::Callback(callback) => {
             // Hand-constructed, because `egui_wgpu::Callback` has a private
@@ -1353,6 +1355,20 @@ pub(crate) fn render_volume_controls(ui: &mut egui::Ui, pane: &mut crate::pane::
         "Stretches the box vertically so storm structure is legible. Heights the pane reports \
          stay in real kft MSL at every setting.",
     );
+
+    // Positive in the UI, inverted in storage — see `VolumePane::hide_floor`
+    // for why the stored form is the negation.
+    let mut show_floor = !volume.hide_floor;
+    if ui
+        .checkbox(&mut show_floor, "Map floor")
+        .on_hover_text(
+            "Draws the ground under the volume: the base reflectivity as the 2D map shows it, \
+             registered to the box.",
+        )
+        .changed()
+    {
+        volume.hide_floor = !show_floor;
+    }
 
     if ui
         .button("Reset view")

@@ -773,6 +773,15 @@ pub struct VolumePane {
     /// Which volume the grid on screen was built from, or `None` before the
     /// first build.
     pub rendered_for: Option<VolumeTarget>,
+    /// Whether this pane has turned the map floor **off**.
+    ///
+    /// Stored inverted so the derived `Default` — `false` — is the floor
+    /// showing, which is the shipped default: the floor is the ground the 2D
+    /// map gives the volume, and a pane that opens without it is a box
+    /// hanging in the void. The inversion is contained here; everything
+    /// downstream reads [`crate::volume_view::VolumeFrameState::floor`],
+    /// which is the positive form.
+    pub hide_floor: bool,
 }
 
 impl VolumePane {

@@ -334,6 +334,18 @@ pub struct App {
     /// [`extract_current_volume`]: App::extract_current_volume
     #[cfg(test)]
     pub(crate) volume_extractions: std::cell::Cell<u32>,
+
+    /// Which `(site, region)` scopes have a floor render dispatched or landed
+    /// for which volume stamp — the dedupe that keeps one floor per sealed
+    /// sweep when several products' builds complete for one volume.
+    ///
+    /// A `Vec` with a linear scan because a `VolumeRegion` is not `Hash` and
+    /// the bound is one entry per live 3D scope. Entries for scopes the store
+    /// no longer holds are dropped as new ones are recorded.
+    floor_rendered: Vec<(
+        (String, Option<rustdar_egui::pane::VolumeRegion>),
+        chrono::NaiveDateTime,
+    )>,
 }
 
 /// Bookkeeping for the periodic config write.
@@ -567,6 +579,7 @@ impl App {
             volume_store: std::sync::Arc::new(crate::volume::bridge::VolumeStore::new()),
             #[cfg(test)]
             volume_extractions: std::cell::Cell::new(0),
+            floor_rendered: Vec::new(),
             http_client,
             #[cfg(not(target_arch = "wasm32"))]
             tokio_runtime,
@@ -1048,8 +1061,9 @@ impl App {
         use crate::volume::bridge::VolumeEntry;
 
         while let Ok(vr) = self.channels.voxel_receiver.try_recv() {
-            let entry = match vr.grid {
-                Some(grid) => VolumeEntry::Ready(std::sync::Arc::new(*grid)),
+            let ready_grid = vr.grid.map(|grid| std::sync::Arc::new(*grid));
+            let entry = match &ready_grid {
+                Some(grid) => VolumeEntry::Ready(std::sync::Arc::clone(grid)),
                 // `build_voxels` has already logged which invariant it refused
                 // on; the message is for the centre of the pane.
                 None => VolumeEntry::Refused(format!(
@@ -1074,6 +1088,102 @@ impl App {
                 self.volume_store.live_ids().len(),
                 self.volume_store.memory_bytes() / (1024 * 1024),
             );
+            // The floor stands under this grid, so it refreshes at the
+            // grid's own cadence — from here, where the grid's exact x/y
+            // ranges are in hand, rather than from a re-derivation of the
+            // footprint that could drift from the build's.
+            if let Some(grid) = ready_grid {
+                self.maybe_spawn_floor_render(&vr.target, &grid);
+            }
+        }
+    }
+
+    /// Dispatch a floor render for a completed build, unless this scope
+    /// already has one for this stamp.
+    ///
+    /// The floor is the lowest-tilt **reflectivity** whatever moment the grid
+    /// holds — it is the ground the 2D map shows, not a projection of the
+    /// pane's product — extracted from the current merged volume the same way
+    /// every render payload is.
+    fn maybe_spawn_floor_render(
+        &mut self,
+        target: &rustdar_egui::pane::VolumeTarget,
+        grid: &rustdar_radar::voxel::VoxelGrid,
+    ) {
+        use rustdar_radar::types::RadarProduct;
+
+        let scope = (target.volume.site.clone(), target.region);
+        let stamp = target.volume.collected;
+        if self
+            .floor_rendered
+            .iter()
+            .any(|(s, at)| *s == scope && *at == stamp)
+        {
+            return;
+        }
+
+        let Some(site) = rustdar_radar::sites::get_radar_site(&target.volume.site) else {
+            return;
+        };
+        // The whole-volume reflectivity payload, reduced to its lowest tilt:
+        // `to_scan` rebuilds a `Scan` from the payload's own sweeps, and
+        // `find_closest_elevation(0.0)` picks the base tilt exactly as the 2D
+        // pane's tilt ladder would.
+        let Some(volume_input) =
+            self.extract_current_volume(&target.volume.site, RadarProduct::Reflectivity)
+        else {
+            return;
+        };
+        let scan = volume_input.to_scan();
+        let Some(elevation) =
+            rustdar_radar::render::find_closest_elevation(&scan, RadarProduct::Reflectivity, 0.0)
+        else {
+            return;
+        };
+        let Some(input) = rustdar_radar::render_input::RenderInput::extract(
+            &scan,
+            elevation,
+            RadarProduct::Reflectivity,
+            site.lat,
+            site.lon,
+            None,
+            None,
+        ) else {
+            return;
+        };
+
+        let spawned = self.render.spawn_floor_render(
+            target.volume.site.clone(),
+            target.region,
+            input,
+            site.lat,
+            grid.x_range_km(),
+            grid.y_range_km(),
+            self.channels.floor_sender.clone(),
+            self.window.clone(),
+        );
+        if !spawned {
+            // Budget full: nothing recorded, the next completed build for
+            // this scope tries again.
+            return;
+        }
+        // Replace this scope's entry, and drop entries for scopes the store
+        // no longer holds — they have no builds completing, so keeping them
+        // would grow the list by one per site or region ever visited.
+        let store = std::sync::Arc::clone(&self.volume_store);
+        self.floor_rendered
+            .retain(|(s, _)| *s != scope && store.holds_scope(&s.0, &s.1));
+        self.floor_rendered.push((scope, stamp));
+    }
+
+    /// Take delivery of finished floor renders.
+    fn poll_floor_results(&mut self) {
+        while let Ok(fr) = self.channels.floor_receiver.try_recv() {
+            let Some(image) = fr.image else {
+                continue;
+            };
+            self.volume_store
+                .set_floor(&fr.site, fr.region, std::sync::Arc::new(image));
         }
     }
 
@@ -1429,6 +1539,7 @@ impl App {
         // Finished voxel builds land before the stamps are published, so a
         // build and its announcement cannot straddle a frame.
         self.poll_voxel_results();
+        self.poll_floor_results();
 
         // After both drains, so the UI is told about a volume on the frame it
         // arrived rather than the frame after. A 3D pane reads this to decide

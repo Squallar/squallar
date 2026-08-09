@@ -161,6 +161,21 @@ pub const BINDING_BLIT_TEXTURE: u32 = 5;
 /// See [`BINDING_BLIT_TEXTURE`].
 pub const BINDING_BLIT_SAMPLER: u32 = 6;
 
+/// The map floor's bindings, in **group 1** of the raymarch pipeline.
+///
+/// A group of their own because their lifetime is their own: group 0 is
+/// rebuilt with every grid upload, the floor with every floor render, and
+/// when no floor is in hand the pipelines' one-texel transparent placeholder
+/// binds here — so `encode_raymarch` always has a complete layout and the
+/// shader's floor arm is dead code until `flags.w` says otherwise.
+pub const BINDING_FLOOR_TEXTURE: u32 = 0;
+/// See [`BINDING_FLOOR_TEXTURE`].
+pub const BINDING_FLOOR_SAMPLER: u32 = 1;
+
+/// The format the floor travels as: straight, gamma-encoded RGBA, exactly the
+/// bytes the 2D pane's rasters hold; the shader decodes.
+pub const FLOOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
 /// The format the raymarch renders into.
 ///
 /// **Not** `Rgba8UnormSrgb`. The raymarch writes bytes that are already
@@ -249,11 +264,17 @@ pub struct VolumePipelines {
     raymarch: wgpu::RenderPipeline,
     blit: wgpu::RenderPipeline,
     volume_layout: wgpu::BindGroupLayout,
+    floor_layout: wgpu::BindGroupLayout,
     blit_layout: wgpu::BindGroupLayout,
     quad: wgpu::Buffer,
     grid_sampler: wgpu::Sampler,
     lut_sampler: wgpu::Sampler,
+    floor_sampler: wgpu::Sampler,
     blit_sampler: wgpu::Sampler,
+    /// What binds at group 1 when no floor is in hand: one transparent texel.
+    /// The raymarch's layout is total either way, and the shader's floor arm
+    /// stays dead until `flags.w` turns it on.
+    empty_floor: FloorTexture,
     blit_entry_point: &'static str,
 }
 
@@ -329,6 +350,28 @@ impl VolumePipelines {
             ],
         });
 
+        let floor_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(&label("floor.layout")),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: BINDING_FLOOR_TEXTURE,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: BINDING_FLOOR_SAMPLER,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
         let blit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some(&label("blit.layout")),
             entries: &[
@@ -390,6 +433,19 @@ impl VolumePipelines {
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
+        // `Linear` because the floor is a map being looked at obliquely, and
+        // `ClampToEdge` so the last row of ground does not bleed round to the
+        // opposite edge of the box.
+        let floor_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some(&label("floor.sampler")),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
         // `Linear` here is what makes the resolution rung usable at all: it is
         // the filter that turns a 720 x 450 offscreen back into a 1440 x 900
         // pane without it reading as a mosaic.
@@ -409,7 +465,7 @@ impl VolumePipelines {
         let raymarch_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(&label("raymarch.pipeline_layout")),
-                bind_group_layouts: &[Some(&volume_layout)],
+                bind_group_layouts: &[Some(&volume_layout), Some(&floor_layout)],
                 immediate_size: 0,
             });
         let blit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -476,17 +532,64 @@ impl VolumePipelines {
             cache: None,
         });
 
+        // Created and never written: WebGPU zero-initialises textures, so the
+        // placeholder is one transparent texel with no upload — and the queue
+        // this constructor deliberately does not take is not needed for it.
+        let empty_floor = create_floor_texture(device, &floor_layout, &floor_sampler, [1, 1]);
+
         Self {
             raymarch,
             blit,
             volume_layout,
+            floor_layout,
             blit_layout,
             quad,
             grid_sampler,
             lut_sampler,
+            floor_sampler,
             blit_sampler,
+            empty_floor,
             blit_entry_point,
         }
+    }
+
+    /// Upload a floor image, ready to bind at group 1.
+    ///
+    /// `rgba` is straight, gamma-encoded bytes, row 0 the box footprint's
+    /// north edge — the registration `floor_colour` in the shader assumes.
+    pub fn upload_floor(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        size: [u32; 2],
+        rgba: &[u8],
+    ) -> Option<FloorTexture> {
+        let expected = (size[0] as usize)
+            .checked_mul(size[1] as usize)
+            .and_then(|texels| texels.checked_mul(4));
+        if size[0] == 0 || size[1] == 0 || expected != Some(rgba.len()) {
+            log::error!(
+                "3D volume view: refusing a {size:?} floor with {} bytes",
+                rgba.len(),
+            );
+            return None;
+        }
+        let floor = create_floor_texture(device, &self.floor_layout, &self.floor_sampler, size);
+        queue.write_texture(
+            floor.texture.as_image_copy(),
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(size[0] * 4),
+                rows_per_image: Some(size[1]),
+            },
+            wgpu::Extent3d {
+                width: size[0],
+                height: size[1],
+                depth_or_array_layers: 1,
+            },
+        );
+        Some(floor)
     }
 
     /// Upload the quad. Separate from `new` because it needs a queue.
@@ -715,7 +818,23 @@ impl VolumePipelines {
         target: &OffscreenTarget,
         volume: &VolumeTextures,
     ) {
-        self.encode_raymarch_with_timestamps(encoder, target, volume, None);
+        self.encode_raymarch_with_floor(encoder, target, volume, None);
+    }
+
+    /// [`Self::encode_raymarch`], with a floor to stand the volume on.
+    ///
+    /// `None` binds the one-texel transparent placeholder — the layout is
+    /// total either way, and whether the shader *reads* the floor is the
+    /// uniform's `flags.w`, written by the bridge only when it also had a
+    /// floor to bind.
+    pub fn encode_raymarch_with_floor(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &OffscreenTarget,
+        volume: &VolumeTextures,
+        floor: Option<&FloorTexture>,
+    ) {
+        self.encode_raymarch_with_timestamps(encoder, target, volume, floor, None);
     }
 
     /// [`Self::encode_raymarch`], with timestamp queries bracketing the pass.
@@ -731,6 +850,7 @@ impl VolumePipelines {
         encoder: &mut wgpu::CommandEncoder,
         target: &OffscreenTarget,
         volume: &VolumeTextures,
+        floor: Option<&FloorTexture>,
         timestamp_writes: Option<wgpu::RenderPassTimestampWrites>,
     ) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -751,6 +871,7 @@ impl VolumePipelines {
         });
         pass.set_pipeline(&self.raymarch);
         pass.set_bind_group(0, &volume.bind_group, &[]);
+        pass.set_bind_group(1, &floor.unwrap_or(&self.empty_floor).bind_group, &[]);
         pass.set_vertex_buffer(0, self.quad.slice(..));
         pass.draw(0..QUAD_VERTEX_COUNT, 0..1);
     }
@@ -787,6 +908,57 @@ impl OffscreenTarget {
     /// The texture itself, for a readback in a test.
     pub fn texture(&self) -> &wgpu::Texture {
         &self.texture
+    }
+}
+
+/// A floor image on the GPU, with the bind group the raymarch reads it
+/// through at group 1.
+pub struct FloorTexture {
+    texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+}
+
+/// A floor texture of `size` texels and its bind group. No upload: WebGPU
+/// zero-initialises, so an unwritten floor is transparent — which is exactly
+/// what the placeholder wants to be.
+fn create_floor_texture(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    size: [u32; 2],
+) -> FloorTexture {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(&label("floor")),
+        size: wgpu::Extent3d {
+            width: size[0].max(1),
+            height: size[1].max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: FLOOR_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(&label("floor.bind_group")),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: BINDING_FLOOR_TEXTURE,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: BINDING_FLOOR_SAMPLER,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    });
+    FloorTexture {
+        texture,
+        bind_group,
     }
 }
 
@@ -1294,16 +1466,18 @@ mod tests {
     /// uncaptured-error sink instead.
     #[test]
     fn the_shaders_bindings_are_the_ones_the_layouts_declare() {
-        for (binding, name) in [
-            (BINDING_UNIFORM, "volume"),
-            (BINDING_GRID_TEXTURE, "grid_texture"),
-            (BINDING_GRID_SAMPLER, "grid_sampler"),
-            (BINDING_LUT_TEXTURE, "lut_texture"),
-            (BINDING_LUT_SAMPLER, "lut_sampler"),
-            (BINDING_BLIT_TEXTURE, "blit_texture"),
-            (BINDING_BLIT_SAMPLER, "blit_sampler"),
+        for (group, binding, name) in [
+            (0, BINDING_UNIFORM, "volume"),
+            (0, BINDING_GRID_TEXTURE, "grid_texture"),
+            (0, BINDING_GRID_SAMPLER, "grid_sampler"),
+            (0, BINDING_LUT_TEXTURE, "lut_texture"),
+            (0, BINDING_LUT_SAMPLER, "lut_sampler"),
+            (0, BINDING_BLIT_TEXTURE, "blit_texture"),
+            (0, BINDING_BLIT_SAMPLER, "blit_sampler"),
+            (1, BINDING_FLOOR_TEXTURE, "floor_texture"),
+            (1, BINDING_FLOOR_SAMPLER, "floor_sampler"),
         ] {
-            let expected = format!("@group(0) @binding({binding}) var");
+            let expected = format!("@group({group}) @binding({binding}) var");
             let line = VOLUME_SHADER_WGSL
                 .lines()
                 .find(|line| line.starts_with(&expected))
@@ -1312,14 +1486,14 @@ mod tests {
                 });
             assert!(
                 line.contains(name),
-                "binding {binding} is declared as `{line}`, not as `{name}`"
+                "group {group} binding {binding} is declared as `{line}`, not as `{name}`"
             );
         }
 
         let bindings = shader_code().matches("@binding(").count();
         assert_eq!(
-            bindings, 7,
-            "volume.wgsl declares {bindings} bindings; this file names 7, and a \
+            bindings, 9,
+            "volume.wgsl declares {bindings} bindings; this file names 9, and a \
              binding the layouts do not declare fails pipeline creation"
         );
     }
@@ -1336,7 +1510,7 @@ mod tests {
         let samplers = code.matches(": sampler;").count();
         assert_eq!(
             (textures, samplers),
-            (3, 3),
+            (4, 4),
             "volume.wgsl declares {textures} textures and {samplers} samplers; \
              naga refuses a texture sampled through two samplers in one entry \
              point"

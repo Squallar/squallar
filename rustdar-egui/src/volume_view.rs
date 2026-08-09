@@ -142,6 +142,12 @@ pub struct VolumeFrameState {
     pub camera: OrbitCamera,
     /// The pane's size in physical pixels, before any quality rung is applied.
     pub size_px: [u32; 2],
+    /// Whether this pane wants the map floor drawn under the volume.
+    ///
+    /// The positive form of `VolumePane::hide_floor`, resolved at the one
+    /// place the pane's state is read. The renderer may still draw no floor —
+    /// none may be in hand yet — but it must never draw one against this.
+    pub floor: bool,
 }
 
 /// What the painter answered.
@@ -906,6 +912,7 @@ mod tests {
             },
             camera: OrbitCamera::default(),
             size_px: [800, 600],
+            floor: true,
         };
         let VolumePaint::Callback(payload) = painter.paint(&frame) else {
             panic!("the painting stub must paint");

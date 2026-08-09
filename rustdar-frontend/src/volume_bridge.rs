@@ -254,6 +254,13 @@ struct StoreInner {
     /// and it means `VolumeTarget`'s derived `PartialEq` is the only comparison
     /// needed, rather than a hand-written `Hash` that has to agree with it.
     entries: Vec<StoredVolume>,
+    /// The map floors, at most one per `(site, region)` — the floor is a
+    /// property of the ground under the box, so two panes showing two moments
+    /// of one volume stand on one floor. Pruned against the entries' scopes
+    /// whenever one is set or a pane lets go, so a floor cannot outlive every
+    /// pane that could stand on it. Ids come from the same counter as the
+    /// grids', so the GPU side's per-id caches cannot collide.
+    floors: Vec<StoredFloor>,
 }
 
 struct StoredVolume {
@@ -263,6 +270,13 @@ struct StoredVolume {
     /// Which panes are holding this. Empty is impossible: the entry is dropped
     /// when the last pane lets go.
     panes: Vec<usize>,
+}
+
+struct StoredFloor {
+    id: u64,
+    site: String,
+    region: Option<rustdar_egui::pane::VolumeRegion>,
+    image: Arc<crate::volume::floor::FloorImage>,
 }
 
 /// What the store holds for one target, with the id its GPU upload is keyed by.
@@ -378,9 +392,11 @@ impl VolumeStore {
     }
 
     /// This pane is holding nothing. Drops whatever it was holding if it was the
-    /// last one.
+    /// last one, and any floor nothing stands on afterwards.
     pub fn release(&self, pane_idx: usize) {
-        self.lock().detach(pane_idx);
+        let mut inner = self.lock();
+        inner.detach(pane_idx);
+        inner.prune_floors();
     }
 
     /// What is in hand for `target`, if anything.
@@ -458,6 +474,70 @@ impl VolumeStore {
         self.lock().entries.iter().map(|e| e.id).collect()
     }
 
+    /// Put the floor for `(site, region)` in hand, replacing any older one.
+    ///
+    /// Dropped on the spot when no held entry has that scope — a floor that
+    /// arrived after every pane moved on answers a question nobody is asking,
+    /// and keeping it would be an unbounded cache keyed by history.
+    pub fn set_floor(
+        &self,
+        site: &str,
+        region: Option<rustdar_egui::pane::VolumeRegion>,
+        image: Arc<crate::volume::floor::FloorImage>,
+    ) {
+        let mut inner = self.lock();
+        let scoped = inner
+            .entries
+            .iter()
+            .any(|e| e.target.volume.site == site && e.target.region == region);
+        inner
+            .floors
+            .retain(|f| !(f.site == site && f.region == region));
+        if !scoped {
+            return;
+        }
+        let id = inner.next_id;
+        inner.next_id += 1;
+        inner.floors.push(StoredFloor {
+            id,
+            site: site.to_owned(),
+            region,
+            image,
+        });
+        inner.prune_floors();
+    }
+
+    /// The floor under `target`'s box, if one is in hand.
+    pub fn floor_for(
+        &self,
+        target: &VolumeTarget,
+    ) -> Option<(u64, Arc<crate::volume::floor::FloorImage>)> {
+        let inner = self.lock();
+        inner
+            .floors
+            .iter()
+            .find(|f| f.site == target.volume.site && f.region == target.region)
+            .map(|f| (f.id, Arc::clone(&f.image)))
+    }
+
+    /// Every floor id still in hand, for the GPU side's upload cache.
+    pub fn live_floor_ids(&self) -> Vec<u64> {
+        self.lock().floors.iter().map(|f| f.id).collect()
+    }
+
+    /// Whether any held entry — built, building or refused — has this
+    /// `(site, region)` scope. The App's floor dedupe prunes against it.
+    pub fn holds_scope(
+        &self,
+        site: &str,
+        region: &Option<rustdar_egui::pane::VolumeRegion>,
+    ) -> bool {
+        self.lock()
+            .entries
+            .iter()
+            .any(|e| e.target.volume.site == site && e.target.region == *region)
+    }
+
     /// Host bytes the store is holding, and how many volumes that is.
     ///
     /// Reported rather than bounded, and logged on every build — because the
@@ -505,6 +585,22 @@ impl StoreInner {
             entry.panes.retain(|&p| p != pane_idx);
         }
         self.entries.retain(|e| !e.panes.is_empty());
+    }
+
+    /// Drop every floor whose `(site, region)` matches no held entry.
+    ///
+    /// The floors' whole lifetime rule: a floor exists exactly while some
+    /// entry — built, building or refused — shares its scope, which bounds
+    /// the memory at one ~1 MiB image per live scope with no cap constant to
+    /// tune.
+    fn prune_floors(&mut self) {
+        let entries = &self.entries;
+        self.floors
+            .retain(|f| {
+                entries
+                    .iter()
+                    .any(|e| e.target.volume.site == f.site && e.target.region == f.region)
+            });
     }
 
     /// Detach `pane_idx` from everything it can no longer show, given that it
@@ -669,13 +765,25 @@ impl VolumePainter for BridgeVolumePainter {
         uniform.empty_index_threshold = empty_index_threshold_for(grid.fade_band());
         uniform.edge_soft_width = EDGE_SOFT_WIDTH;
 
+        // The floor: drawn only when the pane wants it AND one is in hand.
+        // The flag and the texture travel together on purpose — a raised flag
+        // over the placeholder would composite a transparent ground, which
+        // draws nothing but claims to.
+        let floor = frame
+            .floor
+            .then(|| self.store.floor_for(&frame.target))
+            .flatten();
+        uniform.map_floor = floor.is_some();
+
         let callback = VolumeCallback {
             pane_idx: frame.pane_idx,
             grid_id: found.id,
             grid,
+            floor,
             uniform,
             offscreen_px: fitted.size,
             live_ids: self.store.live_ids(),
+            live_floor_ids: self.store.live_floor_ids(),
         };
 
         VolumePaint::Callback(paint_payload(callback))
@@ -753,6 +861,9 @@ pub struct VolumeResources {
     /// One upload per grid, keyed by the store's id. Two panes on one volume
     /// share the entry, which is the GPU half of the store's refcounting.
     uploads: HashMap<u64, VolumeTextures>,
+    /// One upload per floor, keyed by the store's floor id and retained the
+    /// same way — uploaded once when the floor lands, reused every frame.
+    floors: HashMap<u64, crate::volume::raymarch::FloorTexture>,
 }
 
 impl VolumeResources {
@@ -768,6 +879,7 @@ impl VolumeResources {
             pipelines,
             targets: HashMap::new(),
             uploads: HashMap::new(),
+            floors: HashMap::new(),
         }
     }
 
@@ -777,7 +889,9 @@ impl VolumeResources {
     /// a pane-sized `Rgba8Unorm` target (~3 MiB at 900²) and, when the last pane
     /// on a volume lets go, the 3D texture and its table. Dropping the handles
     /// is the free — wgpu reference-counts them and the allocation goes when the
-    /// last reference does.
+    /// last reference does. The floor uploads are pruned on the next frame's
+    /// `prepare` against the store's own floor ids, which the release has
+    /// already shrunk.
     pub fn release_pane(&mut self, pane_idx: usize, live_ids: &[u64]) {
         self.targets.remove(&pane_idx);
         self.uploads.retain(|id, _| live_ids.contains(id));
@@ -793,6 +907,9 @@ struct VolumeCallback {
     pane_idx: usize,
     grid_id: u64,
     grid: Arc<VoxelGrid>,
+    /// The floor under this box, when the pane wants one and one is in hand.
+    /// `uniform.map_floor` is true exactly when this is `Some`.
+    floor: Option<(u64, Arc<crate::volume::floor::FloorImage>)>,
     uniform: VolumeUniform,
     offscreen_px: [u32; 2],
     /// Every grid the store still holds, so `prepare` can free the uploads for
@@ -800,6 +917,8 @@ struct VolumeCallback {
     /// store because `prepare` runs with no access to anything but its
     /// arguments.
     live_ids: Vec<u64>,
+    /// The same, for the floor uploads.
+    live_floor_ids: Vec<u64>,
 }
 
 impl egui_wgpu::CallbackTrait for VolumeCallback {
@@ -824,9 +943,11 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
             pipelines,
             targets,
             uploads,
+            floors,
         } = resources;
 
         uploads.retain(|id, _| self.live_ids.contains(id));
+        floors.retain(|id, _| self.live_floor_ids.contains(id));
 
         let slot = targets.entry(self.pane_idx).or_default();
         pipelines.ensure_offscreen(device, slot, self.offscreen_px);
@@ -858,11 +979,28 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
             }
         };
 
+        // The floor's upload, once per floor id — the same entry discipline
+        // as the grid's, minus the refusal arm: `upload_floor` validates the
+        // byte count itself and an invalid floor simply stays unbound, with
+        // `map_floor` still set. That mismatch cannot happen from the one
+        // producer (`resample_floor` sizes its own buffer), and the symptom
+        // if it ever did would be a transparent floor, not a crash.
+        let floor_texture = self.floor.as_ref().and_then(|(floor_id, image)| {
+            match floors.entry(*floor_id) {
+                std::collections::hash_map::Entry::Occupied(occupied) => {
+                    Some(&*occupied.into_mut())
+                }
+                std::collections::hash_map::Entry::Vacant(vacant) => pipelines
+                    .upload_floor(device, queue, image.size, &image.rgba)
+                    .map(|texture| &*vacant.insert(texture)),
+            }
+        });
+
         textures.write_uniform(queue, &self.uniform);
         // Into egui's own encoder, which egui submits before its own commands —
         // so the offscreen is written before the blit reads it. The other order
         // paints the previous frame's volume, which reads as input lag.
-        pipelines.encode_raymarch(egui_encoder, target, textures);
+        pipelines.encode_raymarch_with_floor(egui_encoder, target, textures, floor_texture);
 
         Vec::new()
     }
@@ -1279,6 +1417,62 @@ mod tests {
         );
     }
 
+    /// A floor lands only under a held scope, replaces its predecessor, and
+    /// leaves when the last pane on its scope does.
+    ///
+    /// The lifetime rule in four asserts: scoped set sticks, unscoped set is
+    /// dropped on the spot, a second set is a replacement rather than an
+    /// accumulation, and release prunes. The id changing across the
+    /// replacement is what lets the GPU side see a new floor arrive at all —
+    /// its upload cache is keyed by id.
+    #[test]
+    fn a_floor_exists_exactly_while_a_pane_stands_on_its_scope() {
+        let store = VolumeStore::new();
+        let t = target(RadarProduct::Reflectivity, 0);
+        let image = || {
+            Arc::new(crate::volume::floor::FloorImage {
+                size: [1, 1],
+                rgba: vec![0, 0, 0, 255],
+            })
+        };
+
+        // Unscoped: nothing holds this site, so the floor is dropped.
+        store.set_floor("KTLX", None, image());
+        assert!(
+            store.floor_for(&t).is_none(),
+            "a floor for a scope nothing holds must be dropped, not cached",
+        );
+
+        build(&store, 0, &t, "held");
+        store.set_floor("KTLX", None, image());
+        let (first_id, _) = store.floor_for(&t).expect("a scoped floor lands");
+
+        // A region-scoped target is a different ground and must not answer.
+        let mut regioned = t.clone();
+        regioned.region = rustdar_egui::pane::VolumeRegion::new(
+            rustdar_egui::pane::GeoPoint {
+                lat: 35.3,
+                lon: -97.3,
+            },
+            40.0,
+        );
+        assert!(
+            regioned.region.is_some() && store.floor_for(&regioned).is_none(),
+            "a site-wide floor must not stand under a region box",
+        );
+
+        // Replacement, not accumulation.
+        store.set_floor("KTLX", None, image());
+        let (second_id, _) = store.floor_for(&t).expect("the replacement lands");
+        assert_ne!(second_id, first_id, "a replaced floor must get a new id");
+        assert_eq!(store.live_floor_ids().len(), 1, "one floor per scope");
+
+        // The last pane letting go takes the floor with it.
+        store.release(0);
+        assert!(store.floor_for(&t).is_none());
+        assert!(store.live_floor_ids().is_empty());
+    }
+
     /// Exactly one of the six samplable moments clears the fade bar today, and
     /// the bands here are `rustdar_radar::voxel`'s own measurements.
     ///
@@ -1421,6 +1615,19 @@ mod tests {
             body.contains("uniform.step_cells = CLOUD_STEP_CELLS"),
             "`paint` no longer halves the march step on the cloud rung, so the \
              jitter's per-step opacity residual returns as a visible stipple",
+        );
+        // The floor's flag-and-texture pairing: the flag must be exactly
+        // "a floor is in hand and the pane asked", or the shader composites
+        // a ground nobody bound (a transparent no-op that claims to draw) or
+        // draws one against the pane's toggle.
+        assert!(
+            body.contains("uniform.map_floor = floor.is_some()"),
+            "`paint` no longer ties the floor flag to the floor being in hand",
+        );
+        assert!(
+            body.contains(".then(|| self.store.floor_for(&frame.target))"),
+            "`paint` no longer consults the pane's floor toggle before looking \
+             a floor up, so the per-pane escape hatch is dead",
         );
     }
 

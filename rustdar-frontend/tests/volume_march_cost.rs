@@ -209,6 +209,7 @@ fn timed_passes(
             &mut encoder,
             target,
             volume,
+            None,
             Some(wgpu::RenderPassTimestampWrites {
                 query_set: &queries,
                 beginning_of_pass_write_index: Some(0),

@@ -288,6 +288,30 @@ fn raymarch_once(
     read_back(device, queue, target.texture(), size)
 }
 
+/// [`raymarch_once`], with a floor bound at group 1.
+#[allow(clippy::too_many_arguments)]
+fn raymarch_once_with_floor(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipelines: &VolumePipelines,
+    cells: [u32; 3],
+    indices: &[u8],
+    lut: &[u8],
+    uniform: &VolumeUniform,
+    size: [u32; 2],
+    floor: &rustdar_frontend::volume::raymarch::FloorTexture,
+) -> Vec<[u8; 4]> {
+    let volume = pipelines
+        .upload_volume(device, queue, cells, indices, lut)
+        .expect("the grid and palette were refused");
+    volume.write_uniform(queue, uniform);
+    let target = pipelines.create_offscreen(device, size);
+    let mut encoder = device.create_command_encoder(&Default::default());
+    pipelines.encode_raymarch_with_floor(&mut encoder, &target, &volume, Some(floor));
+    queue.submit(Some(encoder.finish()));
+    read_back(device, queue, target.texture(), size)
+}
+
 /// The pixel at the centre of a `size`-shaped image.
 fn centre(pixels: &[[u8; 4]], size: [u32; 2]) -> [u8; 4] {
     pixels[((size[1] / 2) * size[0] + size[0] / 2) as usize]
@@ -556,6 +580,124 @@ fn opacity_accumulates_per_kilometre_not_per_box_diagonal() {
 /// about a pixel at its edges and the viewport is not, so the boundary is two
 /// different things by design.
 ///
+/// The map floor stands under the volume — drawn only when the flag says,
+/// the right way up, and behind the volume's own opacity.
+///
+/// Four renders through one down-looking camera, each closing a mutation:
+///
+/// 1. Floor bound but `map_floor` off: nothing paints. Removing the shader's
+///    `flags.w` gate fails here — and this is the instrument contract, since
+///    every mask harness renders with a floor-capable pipeline now.
+/// 2. Flag on over an empty grid: the whole footprint is the floor, opaque.
+///    Deleting the after-march composite fails here.
+/// 3. The floor's orientation: a red-north/blue-south floor renders red at
+///    the top of the image. Dropping the `1 - hit.y` flip renders it blue.
+/// 4. A saturating slab over the west half occludes the floor there and
+///    leaves it visible to the east: the floor is behind the volume, not
+///    over it.
+///
+/// ```text
+/// cargo test -p rustdar-frontend --test volume_gpu \
+///     the_map_floor_stands_under_the_volume_and_only_when_asked \
+///     -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
+fn the_map_floor_stands_under_the_volume_and_only_when_asked() {
+    let _serialised = gpu_lock();
+    let size = [128u32, 128];
+    let cells = [16u32, 16, 16];
+
+    let (device, queue) = device();
+    let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Bgra8Unorm));
+    pipelines.upload_quad(&queue);
+
+    // Red top half (the box's north), blue bottom half. Opaque.
+    let floor_side = 8usize;
+    let mut floor_rgba = Vec::with_capacity(floor_side * floor_side * 4);
+    for row in 0..floor_side {
+        for _col in 0..floor_side {
+            if row < floor_side / 2 {
+                floor_rgba.extend_from_slice(&[255, 0, 0, 255]);
+            } else {
+                floor_rgba.extend_from_slice(&[0, 0, 255, 255]);
+            }
+        }
+    }
+    let floor = pipelines
+        .upload_floor(&device, &queue, [floor_side as u32, floor_side as u32], &floor_rgba)
+        .expect("a well-shaped floor uploads");
+
+    let empty = vec![0u8; (cells[0] * cells[1] * cells[2]) as usize];
+    let mut lut = vec![0u8; VOLUME_LUT_BYTES];
+    for entry in 1..lut.len() / 4 {
+        lut[entry * 4..entry * 4 + 4].copy_from_slice(&[255, 255, 255, 255]);
+    }
+
+    // Looking down the z axis: image rows run from the box's north (top) to
+    // south, columns west to east.
+    let mut uniform = VolumeUniform::new([10.0, 10.0, 10.0], cells);
+    uniform.box_from_clip = box_from_clip_down(2);
+    uniform.eye_in_box = eye_outside(2);
+    uniform.extinction_per_km = 1000.0;
+    uniform.gradient_shading = false;
+
+    // 1. Bound but not asked for: the flag is the gate, not the binding.
+    let pixels = raymarch_once_with_floor(
+        &device, &queue, &pipelines, cells, &empty, &lut, &uniform, size, &floor,
+    );
+    assert!(
+        pixels.iter().all(|px| *px == [0, 0, 0, 0]),
+        "a floor bound at group 1 painted with map_floor off; the shader has \
+         lost its flags.w gate and every mask instrument now stands on ground",
+    );
+
+    // 2 + 3. Asked for, over an empty grid: the footprint is ground, opaque,
+    // and the right way up.
+    uniform.map_floor = true;
+    let pixels = raymarch_once_with_floor(
+        &device, &queue, &pipelines, cells, &empty, &lut, &uniform, size, &floor,
+    );
+    let top = pixels[(size[1] / 4 * size[0] + size[0] / 2) as usize];
+    let bottom = pixels[(3 * size[1] / 4 * size[0] + size[0] / 2) as usize];
+    assert_eq!(top[3], 255, "the floor must be opaque ground");
+    assert!(
+        top[0] > 200 && top[2] < 50,
+        "the box's north edge must show the floor image's row 0 (red), got \
+         {top:?}; a flipped v axis puts the map upside down",
+    );
+    assert!(
+        bottom[2] > 200 && bottom[0] < 50,
+        "the box's south edge must show the floor image's bottom rows (blue), \
+         got {bottom:?}",
+    );
+
+    // 4. A saturating slab over the west half: the volume composites over
+    // the floor where it stands, and the floor shows to the east.
+    let mut west_slab = vec![0u8; (cells[0] * cells[1] * cells[2]) as usize];
+    for z in 0..cells[2] {
+        for y in 0..cells[1] {
+            for x in 0..cells[0] / 2 {
+                west_slab[((z * cells[1] + y) * cells[0] + x) as usize] = 255;
+            }
+        }
+    }
+    let pixels = raymarch_once_with_floor(
+        &device, &queue, &pipelines, cells, &west_slab, &lut, &uniform, size, &floor,
+    );
+    let west = pixels[(size[1] / 4 * size[0] + size[0] / 4) as usize];
+    let east = pixels[(size[1] / 4 * size[0] + 3 * size[0] / 4) as usize];
+    assert!(
+        west.iter().take(3).all(|c| *c > 200),
+        "over the slab the volume (saturated white) must hide the floor, got \
+         {west:?}; the floor is compositing in front of the march",
+    );
+    assert!(
+        east[0] > 200 && east[2] < 50,
+        "east of the slab the floor (red at this row) must show, got {east:?}",
+    );
+}
+
 /// The smoothed reconstruction really reaches the coarse level: a lone voxel
 /// paints a **wider** footprint through the cloud rung than through the raw
 /// field.

@@ -183,6 +183,16 @@ pub struct VolumeUniform {
     /// covers the span in ceiling-many steps rather than hanging — but no
     /// writer produces it.
     pub step_cells: f32,
+    /// Whether the march draws the map floor at the box's bottom face. Rides
+    /// `flags.w`.
+    ///
+    /// **`false` here, deliberately**, like every other production knob on
+    /// this struct: the floor moves alpha on every ray that meets the ground,
+    /// so the instrument default is no floor, and the bridge sets this only
+    /// when it also bound a real floor texture at group 1 — a flag raised
+    /// over the placeholder would compositate a transparent ground, which is
+    /// a no-op but a lie about what was drawn.
+    pub map_floor: bool,
     /// The mip level the march reconstructs the field at, `0..=1`. Rides
     /// `flags.y`.
     ///
@@ -225,6 +235,7 @@ impl VolumeUniform {
             gradient_shading: true,
             step_cells: 1.0,
             reconstruction_lod: 0.0,
+            map_floor: false,
         }
     }
 
@@ -272,7 +283,7 @@ impl VolumeUniform {
                 f32::from(u8::from(self.gradient_shading)),
                 self.reconstruction_lod,
                 self.step_cells,
-                0.0,
+                f32::from(u8::from(self.map_floor)),
             ],
         );
 
@@ -349,6 +360,7 @@ mod tests {
             gradient_shading: true,
             step_cells: 602.0,
             reconstruction_lod: 601.0,
+            map_floor: true,
         }
     }
 
@@ -482,7 +494,7 @@ mod tests {
                 "light_dir_ambient",
             ),
             (OFFSET_TRANSFER, [501.0, 502.0, 503.0, 504.0], "transfer"),
-            (OFFSET_FLAGS, [1.0, 601.0, 602.0, 0.0], "flags"),
+            (OFFSET_FLAGS, [1.0, 601.0, 602.0, 1.0], "flags"),
         ] {
             let lane = offset / 4;
             assert_eq!(
@@ -516,12 +528,10 @@ mod tests {
 
         for (offset, lane_in_member, member) in [
             (OFFSET_EYE_IN_BOX, 3, "eye_in_box.w"),
-            // box_size_km.w is no longer reserved: it carries the vertical
-            // exaggeration the shading lights the displayed geometry with.
-            // Neither are flags.y (the reconstruction level) nor flags.z
-            // (the march step).
+            // box_size_km.w and the three upper flags lanes are no longer
+            // reserved: they carry the vertical exaggeration, the
+            // reconstruction level, the march step and the floor switch.
             (OFFSET_GRID_DIMS, 3, "grid_dims.w"),
-            (OFFSET_FLAGS, 3, "flags.w"),
         ] {
             let lane = offset / 4 + lane_in_member;
             assert_eq!(packed[lane], 0.0, "`{member}` is not written as zero");
