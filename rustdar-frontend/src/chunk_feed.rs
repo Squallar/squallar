@@ -460,30 +460,15 @@ mod tests {
     ///
     /// The tail matters as much as the bridge: when the poller comes home
     /// with no volume yet (a fresh feed, pre-first-chunk), the live answer is
-    /// `None` and the bridge must not overrule it with the stale copy.
+    /// `None` and the bridge must not overrule it with the stale copy. The
+    /// poller-home `snapshot` is the bridge's **only writer** — the planted
+    /// copy is stale residue it must overwrite — so the round dispatched
+    /// after it is what proves the refresh happened: a bridge that never
+    /// refreshes serves the residue there, a volume no frame has resolved
+    /// since.
     #[test]
     fn a_round_in_flight_does_not_take_the_snapshot_with_it() {
-        use nexrad_model::data::{PulseWidth, Scan, VolumeCoveragePattern};
-        let volume = std::sync::Arc::new(Scan::new(
-            VolumeCoveragePattern::new(
-                212,
-                0,
-                0.5,
-                PulseWidth::Short,
-                false,
-                0,
-                false,
-                0,
-                false,
-                false,
-                0,
-                false,
-                false,
-                Vec::new(),
-            ),
-            Vec::new(),
-        ));
-
+        let volume = stub_volume();
         let mut mgr = ChunkFeedManager::new();
         mgr.ensure("KICT");
         mgr.feeds.get_mut("KICT").expect("ensured").last_snapshot =
@@ -500,11 +485,23 @@ mod tests {
         );
 
         mgr.finish_round("KICT", poller, &empty());
+        // The poller-home call: the production refresh takes the live answer
+        // (`None` — this poller never ingested a chunk) into the bridge.
         assert!(
             mgr.snapshot("KICT").is_none(),
             "a poller home with no volume yet answers None, and a bridge that \
              never refreshes would overrule it with the stale copy",
         );
+
+        // The next round serves the bridge state that call established.
+        mgr.force_due("KICT");
+        let poller = mgr.take_for_round("KICT").expect("the next round leaves");
+        assert!(
+            mgr.snapshot("KICT").is_none(),
+            "the poller-home refresh never reached the bridge, so the round \
+             serves a volume no frame has resolved since",
+        );
+        mgr.finish_round("KICT", poller, &empty());
     }
 
     fn empty() -> Result<PollOutcome, String> {
