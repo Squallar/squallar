@@ -2523,6 +2523,15 @@ impl Gui {
         self.region_arm
     }
 
+    /// The in-flight section handle drag, if any — the state both armed-drag
+    /// setters must clear, and the tests' way of watching them do it.
+    #[cfg(test)]
+    pub(crate) fn section_edit_drag_for_test(
+        &self,
+    ) -> Option<crate::ui_section_edit::SectionEditDrag> {
+        self.section_edit_drag
+    }
+
     /// Apply the pane conversion the frame asked for, if any.
     ///
     /// Called from [`Self::ui`] after the pane loop, where every pane is back in

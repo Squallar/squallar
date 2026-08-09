@@ -7476,6 +7476,94 @@ mod tests {
         );
     }
 
+    /// 45m. **Arming the region drag mid-flight kills the handle drag, and
+    ///      the dead drag never commits.**
+    ///
+    ///      Three doc comments claim "both armed setters clear an in-flight
+    ///      drag"; nothing observed it. The un-cleared failure is quiet today
+    ///      — the drag freezes under the armed mode, misses its release, and
+    ///      dies un-committed one frame after disarm — but that is three
+    ///      accidents deep, and one refactor from committing a line the user
+    ///      dragged half a gesture ago. The clear is pinned where it is
+    ///      claimed: at the setter, the instant the mode goes on.
+    #[test]
+    fn arming_the_region_drag_clears_a_handle_drag_in_flight() {
+        let (mut h, a, b) = harness_with_committed_section();
+        let b_px = h.screen_of(0, b);
+
+        h.mouse_move(b_px);
+        h.frame();
+        h.mouse_press(b_px);
+        h.frame();
+        h.mouse_move(b_px + egui::vec2(-60.0, 30.0));
+        h.frame();
+        assert!(
+            h.gui_mut().section_edit_drag_for_test().is_some(),
+            "precondition: the press on the B cap began a drag"
+        );
+
+        h.set_region_arm(true);
+        assert!(
+            h.gui_mut().section_edit_drag_for_test().is_none(),
+            "arming the region drag left the handle drag alive: one drag on \
+             one map pane would be two gestures"
+        );
+
+        // And nothing about the dead drag ever commits: the release lands
+        // where a live drag would have re-aimed the line, and the line does
+        // not move.
+        h.frame();
+        h.mouse_release(b_px + egui::vec2(-80.0, 40.0));
+        h.frames_for(2, FRAME_DT);
+        h.set_region_arm(false);
+        h.frames_for(2, FRAME_DT);
+        assert_eq!(
+            h.section_line(1),
+            Some(SectionLine::new(a, b).expect("the fixture's line")),
+            "a drag killed by the arming still moved the line"
+        );
+    }
+
+    /// 45n. **Arming the section draw mid-flight kills the handle drag too**
+    ///      — the other armed setter, making the same claim, pinned the same
+    ///      way. 45f proves the handles go *inert* while the draw is armed;
+    ///      this pins the half the setters' docs add: the drag that already
+    ///      existed is gone the instant the mode goes on, and never commits.
+    #[test]
+    fn arming_the_section_draw_clears_a_handle_drag_in_flight() {
+        let (mut h, a, b) = harness_with_committed_section();
+        let b_px = h.screen_of(0, b);
+
+        h.mouse_move(b_px);
+        h.frame();
+        h.mouse_press(b_px);
+        h.frame();
+        h.mouse_move(b_px + egui::vec2(-60.0, 30.0));
+        h.frame();
+        assert!(
+            h.gui_mut().section_edit_drag_for_test().is_some(),
+            "precondition: the press on the B cap began a drag"
+        );
+
+        h.set_section_draw_armed(true);
+        assert!(
+            h.gui_mut().section_edit_drag_for_test().is_none(),
+            "arming the section draw left the handle drag alive: one drag on \
+             one map pane would be two gestures"
+        );
+
+        h.frame();
+        h.mouse_release(b_px + egui::vec2(-80.0, 40.0));
+        h.frames_for(2, FRAME_DT);
+        h.set_section_draw_armed(false);
+        h.frames_for(2, FRAME_DT);
+        assert_eq!(
+            h.section_line(1),
+            Some(SectionLine::new(a, b).expect("the fixture's line")),
+            "a drag killed by the arming still moved the line"
+        );
+    }
+
     /// 46. **A tap while armed is discarded, and the mode stays armed.**
     ///
     ///     A stray tap is the single most likely thing to happen right after
