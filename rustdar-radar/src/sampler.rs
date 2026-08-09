@@ -676,6 +676,16 @@ impl Column {
         // reading wrapped at the lower limit is the one whose seam is easier
         // to cross unnoticed — so testing against the larger limit would miss
         // exactly the straddles the mixed-PRF ladder creates.
+        //
+        // This pair spans *tilts*, and the guard's line sits at
+        // `SEAM_PROXIMITY_ACROSS_TILTS` — higher than the bilinear's,
+        // because across hundreds of metres of depth a real fold's ends
+        // stray further from the seam and a real shear's ends reach nearer
+        // it, so this path demands more before refusing to interpolate.
+        // The constant's doc carries the corpus that set it, including what
+        // the guard here still misses: even at the old `0.5` it never kept
+        // every real fold, so its fraction is a measured break-even, not a
+        // construction.
         let fold_limit = match (lo.fold_limit_ms, hi.fold_limit_ms) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -684,7 +694,7 @@ impl Column {
             self.blend,
             &[lo.sample, hi.sample],
             &[1.0 - t, t],
-            fold_limit,
+            fold_limit.map(Seam::AcrossTilts),
         )
     }
 }
@@ -1089,7 +1099,15 @@ impl<'a> VolumeSampler<'a> {
             weights[side * 2] = wa * (1.0 - fr);
             weights[side * 2 + 1] = wa * fr;
         }
-        blend(self.blend, &corners, &weights, rung.fold_limit_ms)
+        // These corners span *gates* (and radials) of one sweep, so the
+        // guard's line sits at `SEAM_PROXIMITY_ACROSS_GATES` — see the
+        // constant for the corpus that set it apart from the tilt path's.
+        blend(
+            self.blend,
+            &corners,
+            &weights,
+            rung.fold_limit_ms.map(Seam::AcrossGates),
+        )
     }
 }
 
@@ -1351,8 +1369,9 @@ fn estimate_fold_limit(radials: &[Radial], slot: MomentSlot) -> Option<f64> {
     (limit >= FOLD_LIMIT_FLOOR_MS).then_some(limit)
 }
 
-/// How near the seam both extremes must sit before a straddle is read as a
-/// fold, as a fraction of the fold limit.
+/// How near the seam both extremes must sit before a straddle between
+/// adjacent *gates* — the corners of one rung's bilinear — is read as a fold,
+/// as a fraction of the fold limit.
 ///
 /// **This is a fraction, and saying so is the point.** An earlier rule tested
 /// only that the extremes changed sign and spread by more than `limit`, and
@@ -1361,17 +1380,94 @@ fn estimate_fold_limit(radials: &[Radial], slot: MomentSlot) -> Option<f64> {
 /// the middle, above it through the seam. That argument is sound about
 /// *likelihood* and wrong about *posterior*: break-even likelihood is
 /// break-even belief only if a fold and a non-fold were equally likely before
-/// either was measured, and they are not. Over the volumes measured below the
-/// sign-changing population near a spread ratio of 1.0 outnumbers the folded
-/// population by one to two orders of magnitude, so a rule that splits the
-/// likelihood evenly hands almost all of the disputed band to the wrong answer.
+/// either was measured, and they are not. On every population measured the
+/// sign-changing pairs near a spread ratio of 1.0 outnumber the folded ones
+/// by one to two orders of magnitude, so a rule that splits the likelihood
+/// evenly hands almost all of the disputed band to the wrong answer.
 ///
-/// `0.5` is where the requirement below stops being free. See
-/// [`straddles_fold`] for what the requirement *is* and why the number cannot
-/// be argued away.
-const SEAM_PROXIMITY: f64 = 0.5;
+/// # Where the number comes from
+///
+/// The criterion is marginal, not global. Each step up in the fraction stops
+/// the guard firing on one band of pairs, and that band holds both
+/// oracle-confirmed folds (now averaged across the seam — given up) and
+/// oracle-confirmed shear (no longer refused — won). The fraction stops
+/// earning at the step where the band's confirmed shear stops outnumbering
+/// its confirmed folds — where that ratio crosses 1. Swept by `seam_probe`
+/// over its arbitration corpus — 56 VCP 31 volumes over 22 sites and eight
+/// dates, VCP 31 being the only operational pattern that puts the seam at
+/// 11–12.5 m/s — the quad bands cross between 0.55 and 0.65, so `0.60`. The
+/// KILN holdout, a site the arbitration never saw, measured once and
+/// afterwards, reproduces the crossing to within one band; the seven-volume
+/// storm control and the VCP 32/35 mid-Nyquist control are recorded with the
+/// corpus in `seam_probe`'s module doc.
+const SEAM_PROXIMITY_ACROSS_GATES: f64 = 0.60;
 
-/// Whether these corners sit on opposite sides of a fold seam.
+/// How near the seam both rungs must sit before a straddle between adjacent
+/// *tilts* — the pair [`Column::at_height_km`] lerps between — is read as a
+/// fold, as a fraction of the fold limit.
+///
+/// # Why this is not [`SEAM_PROXIMITY_ACROSS_GATES`]
+///
+/// [`straddles_fold`]'s argument — one wrap of a smooth field leaves *both*
+/// sides of the discontinuity near `±limit` — assumes the pair's own true
+/// change is small next to the Nyquist interval. Between adjacent gates of
+/// one sweep that holds. Between adjacent tilts it fails: the two rungs sit
+/// hundreds of metres apart, and against a 12.3 m/s Nyquist the real veer
+/// across that depth moves a reading well away from the seam before it
+/// wraps, so a genuine fold across tilts often presents with one end deep
+/// inside the range — the shape the rule reads as shear. That asymmetry is
+/// in the data, not just the argument: at every adequately-powered site of
+/// the corpus, quad recall exceeds rung-pair recall at the same fraction, by
+/// 2.4–13.0 points at `0.50` and 14.4–51.6 at `0.75`, and the gap widens
+/// monotonically with the fraction. So the vertical guard buys each step of
+/// its fraction with more real folds than the horizontal guard pays for the
+/// same step, and its break-even lands higher: the rung-pair marginal bands
+/// cross between 0.65 and 0.70 on the arbitration corpus, `0.67`, and the
+/// KILN holdout reproduces that crossing to within one band too. One
+/// constant serving both paths would put both numbers wrong, and whoever
+/// tuned it would be trading quad false fires against rung-pair recall
+/// without either trade being visible.
+///
+/// # What the pre-corpus text here claimed, corrected
+///
+/// The first version of this guard shipped `0.5` for both paths, argued from
+/// one clear-air volume and a fourteen-volume mixed corpus, and its doc made
+/// two claims the VCP 31 corpus overturned. It said neither the old rule nor
+/// this one ever fires on a pair the oracle can confirm is smooth shear:
+/// pooled over the arbitration corpus at `0.5`, the guard fires on 4,774
+/// confirmed-shear quads and 9,034 confirmed-shear rung pairs. And it read
+/// as if the box rule kept every real fold by construction, which the
+/// vertical path never did: at `0.5` the rung-pair guard already misses 6.6%
+/// of oracle-confirmed folds (93.4% recall pooled), and at `0.75` it would
+/// miss 30.8% (69.2%). The by-construction argument is a good approximation
+/// exactly where [`SEAM_PROXIMITY_ACROSS_GATES`] applies; here it is only a
+/// tendency, which is why this number is a measured break-even and not a
+/// theorem.
+const SEAM_PROXIMITY_ACROSS_TILTS: f64 = 0.67;
+
+/// Which adjacency a velocity blend spans, carrying the fold limit its guard
+/// tests against.
+///
+/// This is how the two seam-proximity constants stay with their own paths:
+/// the fraction cannot be passed at all. A call site says which adjacency its
+/// corners span, and the number follows from that inside [`straddles_fold`] —
+/// so putting [`SEAM_PROXIMITY_ACROSS_TILTS`] on the bilinear takes a call
+/// site claiming in words that gate neighbours are tilt neighbours, where a
+/// bare fraction parameter would have compiled with the two values swapped
+/// and said nothing.
+#[derive(Clone, Copy)]
+enum Seam {
+    /// The corners of one rung's bilinear — adjacent gates and adjacent
+    /// radials of one sweep — guarded at [`SEAM_PROXIMITY_ACROSS_GATES`].
+    /// Carries the rung's own fold limit, m/s.
+    AcrossGates(f64),
+    /// The two rungs of the vertical lerp — adjacent tilts of the ladder —
+    /// guarded at [`SEAM_PROXIMITY_ACROSS_TILTS`]. Carries the tighter of
+    /// the pair's fold limits, m/s.
+    AcrossTilts(f64),
+}
+
+/// Whether these corners sit on opposite sides of the fold seam they span.
 ///
 /// **What a fold does is wrap a continuous field across `±limit`, so both
 /// sides of the discontinuity it leaves behind are *near* `±limit`.** Take a
@@ -1382,51 +1478,42 @@ const SEAM_PROXIMITY: f64 = 0.5;
 /// sits well inside the range cannot be one fold of a smooth field — it is
 /// real shear, and this refuses it.
 ///
-/// That is the whole rule: `lo < −f·limit && hi > f·limit`. Two things it
-/// used to say separately now fall out of it and are not tested again.
-/// Opposite signs: `lo` is below a negative bound and `hi` above a positive
-/// one. More than half a period of spread: `hi − lo > 2f·limit`, which at
-/// `f = 0.5` is exactly the old test — so this is *strictly stronger* than
-/// what it replaces and can only fire where that fired.
+/// That is the whole rule: `lo < −f·limit && hi > f·limit`, where `seam`
+/// says what the corners are adjacent across and `f` follows from that —
+/// [`SEAM_PROXIMITY_ACROSS_GATES`] or [`SEAM_PROXIMITY_ACROSS_TILTS`], which
+/// is where the two numbers and the corpus that set them are argued. Two
+/// things the rule used to say separately fall out of it and are not tested
+/// again. Opposite signs: `lo` is below a negative bound and `hi` above a
+/// positive one. More than half a period of spread: `hi − lo > 2f·limit`,
+/// which at any `f ≥ ½` — and both shipped fractions are — clears a whole
+/// period, so on either path this is *strictly stronger* than the
+/// sign-change-and-spread rule it replaced and can only fire where that
+/// fired.
 ///
 /// Only the extreme pair is tested. That is exhaustive rather than a shortcut:
 /// if any pair among the corners straddles, the widest pair's ends are at
 /// least as far either side of zero, so the extremes straddle too.
 ///
-/// # What the fraction buys, and what it does not
+/// # What the fractions buy, and what they do not
 ///
-/// Measured over fourteen archive volumes across six sites, sampled as the
-/// sampler itself samples — four-corner quads through [`VolumeSampler::column`]
-/// and two-rung pairs through [`Column::at_height_km`], 360 azimuths × 150 km:
+/// The recall, false-fire and per-band numbers live with the constants, and
+/// the instrument that measured them is `seam_probe`. An earlier version of
+/// this comment carried a was→now fire table over a fourteen-volume mixed
+/// corpus and two claims measured at the first shipped fraction — `0.5` on
+/// both paths: that neither the old rule nor this one ever fires on a pair
+/// the oracle can confirm is smooth shear, and, riding the construction
+/// argument above, that every real fold is kept. The VCP 31 corpus
+/// overturned both — the correction, with numbers, is on
+/// [`SEAM_PROXIMITY_ACROSS_TILTS`] — and the table went with them because
+/// its "now" column described `0.5`, which no longer ships on either path.
 ///
-/// | volume | quad fires, was → now | rung fires, was → now |
-/// |---|---|---|
-/// | KCRP 2021-08-01 | 0.277% → 0.102% | 0.099% → 0.014% |
-/// | KCRP 2021-12-31 | 1.181% → 0.574% | 0.578% → 0.126% |
-/// | KDMX 2025-01-01 clear air | 15.871% → 10.630% | 10.711% → 5.015% |
-/// | KFTG 2023-06-22 | 0.235% → 0.202% | 0.185% → 0.094% |
-/// | KLWX 2018-03-02 | 7.003% → 6.804% | 16.801% → 14.862% |
-/// | KTLX 2019-07-15 | 0.045% → 0.018% | 0.013% → 0.004% |
-/// | KMSX 2022-06-04 | 0.013% → 0.003% | 0.005% → 0.001% |
-///
-/// Scored against an independent oracle — a four-point continuity test on the
-/// surrounding field, which is *not* keyed on the pair and so cannot flatter a
-/// rule that is — this costs 0.6 points of fold recall on quads (99.63% →
-/// 99.05%, pooled over 41,899 oracle-confirmed folds) and 0.2 on rung pairs
-/// (99.93% → 99.77%). Neither rule ever fires on a pair the oracle can confirm
-/// is smooth shear; what both fire on is pairs the oracle calls *undecidable*,
-/// where neither reading is smooth and four numbers cannot say which.
-///
-/// **Two things this does not do, recorded so nobody re-derives them.** It
-/// does not empty the disputed population: on the clear-air volume it removes
-/// roughly half of it and leaves the rest, because a low Nyquist velocity
-/// (12.3 m/s there) makes ordinary boundary-layer shear comparable to the seam
-/// itself and no test on two numbers can separate the two. And the argument
-/// above — that a fold leaves both sides *near* the seam — assumes the pair's
-/// own true change is small next to `limit`, which holds between adjacent
-/// gates and holds far less well between adjacent *tilts* on a low-Nyquist
-/// coverage pattern, where the two rungs can be hundreds of metres apart. On
-/// that one population the fraction buys much less than it does elsewhere.
+/// What the fractions do not do survives every corpus and is recorded so
+/// nobody re-derives it: they do not empty the disputed population. On a
+/// low-Nyquist clear-air volume ordinary boundary-layer shear is comparable
+/// to the seam itself, no test on two numbers can separate the two, and
+/// raising either fraction only moves through that population — which is why
+/// both stop at their measured break-even rather than pressing on towards
+/// certainty.
 ///
 /// # The shape of the spread statistic, stated where it holds
 ///
@@ -1440,14 +1527,18 @@ const SEAM_PROXIMITY: f64 = 0.5;
 /// no second mode. A threshold cannot be placed "in the valley" on a
 /// distribution that has none, which is the other half of why the argument
 /// here is about what folding *does* rather than about where the counts fall.
-fn straddles_fold(corners: &[Sample], limit: f64) -> bool {
+fn straddles_fold(corners: &[Sample], seam: Seam) -> bool {
+    let (fraction, limit) = match seam {
+        Seam::AcrossGates(limit) => (SEAM_PROXIMITY_ACROSS_GATES, limit),
+        Seam::AcrossTilts(limit) => (SEAM_PROXIMITY_ACROSS_TILTS, limit),
+    };
     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
     for corner in corners {
         let value = f64::from(corner.value);
         lo = lo.min(value);
         hi = hi.max(value);
     }
-    lo < -SEAM_PROXIMITY * limit && hi > SEAM_PROXIMITY * limit
+    lo < -fraction * limit && hi > fraction * limit
 }
 
 /// Combine weighted corner samples.
@@ -1469,7 +1560,7 @@ fn straddles_fold(corners: &[Sample], limit: f64) -> bool {
 ///   instead of being averaged out of existence, which is the reporting
 ///   `MomentValue::RangeFolded` never got from this crate before.
 ///
-/// `fold_limit` extends that last idea to corners that all *did* measure
+/// `seam` extends that last idea to corners that all *did* measure
 /// something. **A velocity pair straddling the Nyquist seam averages to a
 /// number neither gate saw, and the number it averages to reads as calm air:
 /// +24.50 and −24.50 m/s average to exactly 0.000, which is the display's word
@@ -1478,9 +1569,10 @@ fn straddles_fold(corners: &[Sample], limit: f64) -> bool {
 /// discontinuity, and no weighted mean of two points on opposite sides of one
 /// lands near either. So a straddle falls through to the same heaviest-corner
 /// answer an echo edge gets, for the same stated reason: it fabricates
-/// nothing. See [`straddles_fold`] for how a straddle is recognised and what
-/// that recognition costs; `None` means this moment has no seam to straddle
-/// and restores the previous behaviour exactly.
+/// nothing. See [`straddles_fold`] for how a straddle is recognised, and the
+/// [`Seam`] variants for why the recognition draws its line differently
+/// across gates than across tilts; `None` means this moment has no seam to
+/// straddle and restores the previous behaviour exactly.
 ///
 /// **Heaviest means the largest bilinear weight — the *nearest* sample — not
 /// the largest magnitude.** Picking the fastest corner would bias every fold
@@ -1490,14 +1582,14 @@ fn straddles_fold(corners: &[Sample], limit: f64) -> bool {
 ///
 /// Ties go to the earliest corner, so the result does not depend on iteration
 /// order.
-fn blend(kind: Blend, corners: &[Sample], weights: &[f64], fold_limit: Option<f64>) -> Sample {
+fn blend(kind: Blend, corners: &[Sample], weights: &[f64], seam: Option<Seam>) -> Sample {
     debug_assert_eq!(
         corners.len(),
         weights.len(),
         "every corner needs exactly one weight",
     );
     if corners.iter().all(|c| c.status == SampleStatus::Value)
-        && !fold_limit.is_some_and(|limit| straddles_fold(corners, limit))
+        && !seam.is_some_and(|seam| straddles_fold(corners, seam))
     {
         let total: f64 = weights.iter().sum();
         if total > 0.0 {
@@ -4098,35 +4190,38 @@ mod tests {
              test is no longer standing on the defect it was written for",
         );
 
-        // With the seam known, the nearer gate answers verbatim.
+        // With the seam known, the nearer gate answers verbatim. These
+        // corners are gate neighbours, so the guard is armed across gates.
+        let seam = Some(Seam::AcrossGates(limit));
         assert_eq!(
-            blend(Blend::Arithmetic, &[out, back], &[0.5, 0.5], Some(limit)).value(),
+            blend(Blend::Arithmetic, &[out, back], &[0.5, 0.5], seam).value(),
             Some(24.5),
         );
         assert_eq!(
-            blend(Blend::Arithmetic, &[back, out], &[0.5, 0.5], Some(limit)).value(),
+            blend(Blend::Arithmetic, &[back, out], &[0.5, 0.5], seam).value(),
             Some(-24.5),
             "the tie goes to the earliest corner here too, so the seam rule \
              did not smuggle in an order dependence",
         );
         assert_eq!(
-            blend(Blend::Arithmetic, &[out, back], &[0.3, 0.7], Some(limit)).value(),
+            blend(Blend::Arithmetic, &[out, back], &[0.3, 0.7], seam).value(),
             Some(-24.5),
         );
 
         // **Heaviest is the nearest sample, not the fastest one.** With the
         // near corner at +18 and the far one at −24.5, a "largest magnitude"
         // reading of the rule would answer −24.5 and turn every fold edge into
-        // a peak-hold. Both corners sit outside `SEAM_PROXIMITY · 24.5`, so
-        // the guard really does fire and the answer really is a choice.
+        // a peak-hold. Both corners sit outside `SEAM_PROXIMITY_ACROSS_GATES
+        // · 24.5`, so the guard really does fire and the answer really is a
+        // choice.
         let near_side = [Sample::found(18.0), Sample::found(-24.5)];
         assert!(
-            straddles_fold(&near_side, limit),
+            straddles_fold(&near_side, Seam::AcrossGates(limit)),
             "precondition: the guard does not fire on this pair, so the answer \
              below is an ordinary mean and says nothing about heaviest",
         );
         assert_eq!(
-            blend(Blend::Arithmetic, &near_side, &[0.7, 0.3], Some(limit)).value(),
+            blend(Blend::Arithmetic, &near_side, &[0.7, 0.3], seam).value(),
             Some(18.0),
             "the heaviest corner is the nearest one, not the fastest one",
         );
@@ -4138,7 +4233,7 @@ mod tests {
                 Blend::Arithmetic,
                 &[out, out, out, back],
                 &[0.4, 0.2, 0.2, 0.2],
-                Some(limit),
+                seam,
             )
             .value(),
             Some(24.5),
@@ -4148,64 +4243,387 @@ mod tests {
     /// The straddle test asks where each extreme sits, not how far apart the
     /// two are — so it is a box around the seam and not a band on the spread,
     /// and the difference between those two shapes is the whole point.
+    ///
+    /// Every claim in the first half is a claim about the rule's *shape*, so
+    /// each is asserted across both adjacencies; the second half is where
+    /// each adjacency's own line sits, at the finest resolution a `Sample`
+    /// can carry. The lines are pinned by value in
+    /// [`each_guard_draws_its_line_at_its_own_fraction`] and through the
+    /// integrated paths by the two `holds_its_line` tests beside it.
     #[test]
     fn the_straddle_test_needs_both_extremes_near_the_seam() {
-        let s = |a: f64, b: f64, limit: f64| {
-            straddles_fold(&[Sample::found(a as f32), Sample::found(b as f32)], limit)
-        };
+        for seam in [Seam::AcrossGates as fn(f64) -> Seam, Seam::AcrossTilts] {
+            let s = |a: f64, b: f64, limit: f64| {
+                straddles_fold(
+                    &[Sample::found(a as f32), Sample::found(b as f32)],
+                    seam(limit),
+                )
+            };
 
-        // Same sign is a ramp, never a fold — however wide.
-        assert!(!s(2.0, 40.0, 20.0), "a same-sign ramp is not a fold");
-        assert!(!s(-2.0, -40.0, 20.0));
+            // Same sign is a ramp, never a fold — however wide.
+            assert!(!s(2.0, 40.0, 20.0), "a same-sign ramp is not a fold");
+            assert!(!s(-2.0, -40.0, 20.0));
 
-        // Opposite signs but nowhere near the seam: an ordinary zero crossing,
-        // which is the zero isodop and must keep interpolating smoothly.
-        assert!(
-            !s(2.0, -2.0, 20.0),
-            "an ordinary zero crossing is not a fold"
-        );
-        assert!(!s(9.0, -9.0, 20.0));
+            // Opposite signs but nowhere near the seam: an ordinary zero
+            // crossing, which is the zero isodop and must keep interpolating
+            // smoothly.
+            assert!(
+                !s(2.0, -2.0, 20.0),
+                "an ordinary zero crossing is not a fold"
+            );
+            assert!(!s(9.0, -9.0, 20.0));
 
-        // Each extreme is tested on its own side. Exactly on the bound does
-        // not fire; the tie is broken towards interpolating.
-        assert!(!s(10.0, -10.0, 20.0), "the bound itself does not fire");
-        assert!(!s(10.001, -10.0, 20.0), "one end past it is not enough");
-        assert!(!s(10.0, -10.001, 20.0), "nor is the other end alone");
-        assert!(s(10.001, -10.001, 20.0), "both ends past it does");
+            // **The pair that the old spread-only rule got wrong.** −5 and
+            // +25 against a 20 m/s limit spread by 30, which clears a whole
+            // fold period, and change sign — so the old rule called it a
+            // fold. It cannot be one: a single wrap of a smooth field leaves
+            // *both* sides near ±20, and −5 is a quarter of the way in.
+            assert!(
+                !s(25.0, -5.0, 20.0),
+                "a wide straddle with one end deep inside the range is shear, \
+                 not a fold — this is the case the spread test could not see",
+            );
+            assert!(!s(5.0, -25.0, 20.0), "and the same the other way round");
 
-        // **The pair that the old spread-only rule got wrong.** −5 and +25
-        // against a 20 m/s limit spread by 30, which clears a whole fold
-        // period, and change sign — so the old rule called it a fold. It
-        // cannot be one: a single wrap of a smooth field leaves *both* sides
-        // near ±20, and −5 is a quarter of the way in.
-        assert!(
-            !s(25.0, -5.0, 20.0),
-            "a wide straddle with one end deep inside the range is shear, not \
-             a fold — this is the case the spread test could not see",
-        );
-        assert!(!s(5.0, -25.0, 20.0), "and the same the other way round");
+            // A real fold: piled against the ±limit seam.
+            assert!(s(19.5, -19.5, 20.0));
 
-        // A real fold: piled against the ±limit seam.
-        assert!(s(19.5, -19.5, 20.0));
+            // A corner of exactly zero is on no side of the seam.
+            assert!(!s(0.0, -24.5, 12.0), "zero is not the far side of a seam");
 
-        // A corner of exactly zero is on no side of the seam.
-        assert!(!s(0.0, -24.5, 12.0), "zero is not the far side of a seam");
-
-        // Strictly stronger than the rule it replaces: everything that fires
-        // here would have fired under sign-change-plus-spread, and the
-        // converse fails, which the `25.0, -5.0` case above is.
-        for a in -60..=60 {
-            for b in -60..=60 {
-                let (a, b) = (f64::from(a) * 0.5, f64::from(b) * 0.5);
-                let (lo, hi) = (a.min(b), a.max(b));
-                let old = lo < 0.0 && hi > 0.0 && hi - lo > 20.0;
-                assert!(
-                    !s(a, b, 20.0) || old,
-                    "{a} and {b} fire under the seam rule but not under the \
-                     spread rule, so the new rule is not strictly stronger",
-                );
+            // Strictly stronger than the rule it replaces: everything that
+            // fires here would have fired under sign-change-plus-spread, and
+            // the converse fails, which the `25.0, -5.0` case above is. This
+            // holds for any fraction at or above ½, so it holds on both
+            // paths.
+            for a in -60..=60 {
+                for b in -60..=60 {
+                    let (a, b) = (f64::from(a) * 0.5, f64::from(b) * 0.5);
+                    let (lo, hi) = (a.min(b), a.max(b));
+                    let old = lo < 0.0 && hi > 0.0 && hi - lo > 20.0;
+                    assert!(
+                        !s(a, b, 20.0) || old,
+                        "{a} and {b} fire under the seam rule but not under \
+                         the spread rule, so the new rule is not strictly \
+                         stronger",
+                    );
+                }
             }
         }
+
+        // Each extreme is tested on its own side of its own adjacency's
+        // line, and one end past it is not enough. (An earlier fixture put
+        // the pair *exactly* on the bound and pinned that the tie
+        // interpolates, which `0.5 · 20` afforded because 10.0 survives the
+        // trip through a `Sample`'s `f32`; neither shipped fraction's bound
+        // is representable there, so the nearest half-m/s readings either
+        // side — the finest step legacy-resolution velocity takes — stand
+        // in, and the strictness of the comparison stays visible in the
+        // rule's own `<`.)
+        let g = |a: f64, b: f64| {
+            straddles_fold(
+                &[Sample::found(a as f32), Sample::found(b as f32)],
+                Seam::AcrossGates(20.0),
+            )
+        };
+        assert!(!g(11.5, -11.5), "57.5% is inside the gate line (60%)");
+        assert!(!g(12.5, -11.5), "one end past the gate line is not enough");
+        assert!(!g(11.5, -12.5), "nor is the other end alone");
+        assert!(g(12.5, -12.5), "62.5% is past the gate line on both ends");
+
+        let t = |a: f64, b: f64| {
+            straddles_fold(
+                &[Sample::found(a as f32), Sample::found(b as f32)],
+                Seam::AcrossTilts(20.0),
+            )
+        };
+        assert!(!t(13.0, -13.0), "65% is inside the tilt line (67%)");
+        assert!(!t(13.5, -13.0), "one end past the tilt line is not enough");
+        assert!(!t(13.0, -13.5), "nor is the other end alone");
+        assert!(t(13.5, -13.5), "67.5% is past the tilt line on both ends");
+    }
+
+    /// The two fractions, by value, and that they are two.
+    ///
+    /// Each number is the output of the corpus arbitration recorded on its
+    /// constant, so a drift in either is a re-decision and must read as one
+    /// here. The inequality is pinned separately because it is a separate
+    /// claim: an edit landing both paths on one number — either number —
+    /// undoes the split while leaving one of the value pins green. And the
+    /// *direction* is pinned because it is the physical content of the whole
+    /// argument: across tilts a real fold's ends stray further from the
+    /// seam, so the vertical guard must be the more reluctant one.
+    #[test]
+    fn each_guard_draws_its_line_at_its_own_fraction() {
+        assert_eq!(
+            SEAM_PROXIMITY_ACROSS_GATES, 0.60,
+            "the gate fraction moved off its corpus break-even",
+        );
+        assert_eq!(
+            SEAM_PROXIMITY_ACROSS_TILTS, 0.67,
+            "the tilt fraction moved off its corpus break-even",
+        );
+        assert_ne!(
+            SEAM_PROXIMITY_ACROSS_GATES, SEAM_PROXIMITY_ACROSS_TILTS,
+            "the two adjacencies measured different break-evens; one number \
+             serving both paths is the exact collapse the corpus ruled out",
+        );
+        // Compile-time on purpose — clippy points out the operands are
+        // constants, and taking the hint makes this pin the hardest kind to
+        // silence: reordering the two fractions does not fail a test run, it
+        // refuses to build one.
+        const {
+            assert!(
+                SEAM_PROXIMITY_ACROSS_TILTS > SEAM_PROXIMITY_ACROSS_GATES,
+                "the vertical guard must demand more than the bilinear, not less",
+            );
+        }
+
+        // One pair, read across each adjacency: what fires between two gates
+        // need not fire between two tilts. This is the observable the two
+        // constants exist to create, and no single fraction — whichever
+        // value it took — could answer it both ways.
+        let pair = [Sample::found(13.0), Sample::found(-13.0)];
+        assert!(
+            straddles_fold(&pair, Seam::AcrossGates(20.0)),
+            "±13 against a limit of 20 is past the gate line",
+        );
+        assert!(
+            !straddles_fold(&pair, Seam::AcrossTilts(20.0)),
+            "±13 against a limit of 20 is short of the tilt line",
+        );
+    }
+
+    /// **The gate guard's line, held from both sides through the real
+    /// bilinear.** A range seam between ±11 on a sweep whose limit is 20
+    /// puts both extremes at 55% of the limit — inside the 60% line — and
+    /// must interpolate; a seam between ±13 puts them at 65% — past it — and
+    /// must snap to a measured speed. The second fixture is half of the swap
+    /// detector: under the tilt fraction 65% is *inside* the line, so these
+    /// fixtures fail if the gate guard regresses to the old 0.5, moves off
+    /// its break-even, or trades fractions with the tilt guard.
+    #[test]
+    fn the_gate_guard_holds_its_line_from_both_sides() {
+        // ── 55%: inside the line. Crossing the seam must visit speeds
+        // between the sides, which a snapped read never produces. The
+        // 20 m/s planted at the first gate arms the guard at 20, so the
+        // ratio under test is set by the seam values, not by the pair.
+        let scan = Scan::new(
+            vcp(&[0.5]),
+            vec![make_sweep(
+                1,
+                0.5,
+                360,
+                200,
+                None,
+                Some(&|_, slant| {
+                    Some(if slant < gate_slant_km(1) {
+                        20.0
+                    } else if slant < 10.0 {
+                        11.0
+                    } else {
+                        -11.0
+                    })
+                }),
+            )],
+        );
+        let sampler = VolumeSampler::new(&scan, RadarProduct::Velocity).unwrap();
+        assert_eq!(
+            sampler.rungs[0].fold_limit_ms,
+            Some(20.0),
+            "precondition: the planted gate did not set the limit, so the \
+             ratio below is not the one this test is about",
+        );
+        assert!(
+            !straddles_fold(
+                &[Sample::found(11.0), Sample::found(-11.0)],
+                Seam::AcrossGates(20.0),
+            ),
+            "±11 against 20 is 55%, inside the 60% line, and must not fire",
+        );
+        let (mut between, mut saw_inner, mut saw_outer) = (0u32, false, false);
+        for step in 0..4000 {
+            let ground_km = 5.0 + f64::from(step) * 0.0025;
+            let Some(value) = sampler.column(90.0, ground_km).rungs()[0].sample.value() else {
+                continue;
+            };
+            assert!(
+                (-11.0..=11.0).contains(&value),
+                "{ground_km} km read {value} m/s, outside the two speeds \
+                 either side of the seam",
+            );
+            if value == 11.0 {
+                saw_inner = true;
+            } else if value == -11.0 {
+                saw_outer = true;
+            } else {
+                between += 1;
+            }
+        }
+        assert!(
+            saw_inner && saw_outer,
+            "precondition: the swept range never crossed the seam",
+        );
+        assert!(
+            between > 20,
+            "only {between} samples fell between ±11; a 55% straddle is \
+             being snapped rather than interpolated — the gate guard is \
+             firing below its own line",
+        );
+
+        // ── 65%: past the line. Every read is a measured speed. ──
+        let scan = Scan::new(
+            vcp(&[0.5]),
+            vec![make_sweep(
+                1,
+                0.5,
+                360,
+                200,
+                None,
+                Some(&|_, slant| {
+                    Some(if slant < gate_slant_km(1) {
+                        20.0
+                    } else if slant < 10.0 {
+                        13.0
+                    } else {
+                        -13.0
+                    })
+                }),
+            )],
+        );
+        let sampler = VolumeSampler::new(&scan, RadarProduct::Velocity).unwrap();
+        assert_eq!(sampler.rungs[0].fold_limit_ms, Some(20.0));
+        assert!(
+            straddles_fold(
+                &[Sample::found(13.0), Sample::found(-13.0)],
+                Seam::AcrossGates(20.0),
+            ),
+            "±13 against 20 is 65%, past the 60% line, and must fire",
+        );
+        let mut crossed = false;
+        let mut previous = None;
+        for step in 0..4000 {
+            let ground_km = 5.0 + f64::from(step) * 0.0025;
+            let Some(value) = sampler.column(90.0, ground_km).rungs()[0].sample.value() else {
+                continue;
+            };
+            assert!(
+                value == 13.0 || value == -13.0,
+                "{ground_km} km read {value} m/s across a 65% straddle the \
+                 gate guard must refuse to average — under a swapped tilt \
+                 fraction this seam would interpolate",
+            );
+            if previous.is_some_and(|p| p != value) {
+                crossed = true;
+            }
+            previous = Some(value);
+        }
+        assert!(
+            crossed,
+            "precondition: the swept range never crossed the seam, so this \
+             test never exercised the blend it was written for",
+        );
+    }
+
+    /// **The tilt guard's line, held from both sides through the real
+    /// lerp.** Two tilts at ±12.5 under a limit of 20 put the pair at 62.5%
+    /// — past the *gate* line at 60%, short of the *tilt* line at 67% — so
+    /// the lerp must keep interpolating: the midpoint is the plain mean,
+    /// 0.0. Two tilts at ±14 are at 70%, past the line, and must snap to a
+    /// measured speed. The 62.5% fixture is the other half of the swap
+    /// detector: under the gate fraction it fires, so it fails if the tilt
+    /// guard regresses to the old 0.5, moves off its break-even, or trades
+    /// fractions with the gate guard.
+    #[test]
+    fn the_tilt_guard_holds_its_line_from_both_sides() {
+        // The midpoint of the lerp between tilts at `±speed`, with both
+        // rungs' guards armed at 20 m/s by a planted first gate.
+        let lerped_mid = |speed: f32| {
+            let scan = Scan::new(
+                vcp(&[0.5, 4.5]),
+                vec![
+                    make_sweep(
+                        1,
+                        0.5,
+                        360,
+                        200,
+                        None,
+                        Some(&move |_, slant| {
+                            Some(if slant < gate_slant_km(1) {
+                                20.0
+                            } else {
+                                f64::from(speed)
+                            })
+                        }),
+                    ),
+                    make_sweep(
+                        2,
+                        4.5,
+                        360,
+                        200,
+                        None,
+                        Some(&move |_, slant| {
+                            Some(if slant < gate_slant_km(1) {
+                                -20.0
+                            } else {
+                                f64::from(-speed)
+                            })
+                        }),
+                    ),
+                ],
+            );
+            let sampler = VolumeSampler::new(&scan, RadarProduct::Velocity).unwrap();
+            for rung in 0..2 {
+                assert_eq!(
+                    sampler.rungs[rung].fold_limit_ms,
+                    Some(20.0),
+                    "precondition: a planted gate did not set this rung's \
+                     limit, so the ratio under test is not the stated one",
+                );
+            }
+            let column = sampler.column(90.0, 30.0);
+            let rungs = column.rungs();
+            assert_eq!(rungs[0].sample.value(), Some(speed));
+            assert_eq!(rungs[1].sample.value(), Some(-speed));
+            let mid = 0.5 * (rungs[0].height_km + rungs[1].height_km);
+            column.at_height_km(mid)
+        };
+
+        // ── 62.5%: short of the tilt line, past the gate line. ──
+        let pair = [Sample::found(12.5), Sample::found(-12.5)];
+        assert!(
+            !straddles_fold(&pair, Seam::AcrossTilts(20.0)),
+            "±12.5 against 20 is 62.5%, short of the 67% line, and must not \
+             fire",
+        );
+        assert!(
+            straddles_fold(&pair, Seam::AcrossGates(20.0)),
+            "precondition: the same pair is past the gate line, so a swap of \
+             the two fractions cannot leave the lerp below green",
+        );
+        let value = lerped_mid(12.5).value().expect("both rungs measured");
+        assert!(
+            value.abs() < 1e-6,
+            "±12.5 under a 20 m/s limit is short of the tilt line and must \
+             lerp to its plain mean at the midpoint; it read {value}, a \
+             corner — the tilt guard is drawing the gate guard's line",
+        );
+
+        // ── 70%: past the tilt line. The midpoint is a measured speed. ──
+        assert!(
+            straddles_fold(
+                &[Sample::found(14.0), Sample::found(-14.0)],
+                Seam::AcrossTilts(20.0),
+            ),
+            "±14 against 20 is 70%, past the 67% line, and must fire",
+        );
+        let value = lerped_mid(14.0).value().expect("both rungs measured");
+        assert!(
+            value == 14.0 || value == -14.0,
+            "the midpoint between a +14 tilt and a −14 tilt read {value}, \
+             which is a speed neither tilt measured — the tilt guard did not \
+             fire past its own line",
+        );
     }
 
     /// **The vertical lerp is the total case: a two-corner blend at `t = 0.5`
@@ -4374,8 +4792,14 @@ mod tests {
             "precondition: the sign-change-and-spread rule does not fire here, \
              so this test cannot observe its removal",
         );
+        // (The corners span gates, and the gate line has since moved outward
+        // from the 0.5 this test was written against to its corpus
+        // break-even at 0.60 — which *widens* the disputed band and leaves
+        // this pair, at 20% of the limit, still deep inside the population
+        // the two rules disagree about. The preconditions above are what
+        // hold that claim in place.)
         assert!(
-            !straddles_fold(&pair, limit),
+            !straddles_fold(&pair, Seam::AcrossGates(limit)),
             "a straddle with one end a fifth of the way into the range was \
              read as a fold",
         );
@@ -4488,7 +4912,7 @@ mod tests {
                 Blend::Arithmetic,
                 &[Sample::found(near as f32), Sample::found(far as f32)],
                 &[0.5, 0.5],
-                Some(24.5),
+                Some(Seam::AcrossGates(24.5)),
             )
             .value(),
             Some(((near + far) / 2.0) as f32),
@@ -4542,8 +4966,8 @@ mod tests {
         // the midpoint. That number is the one the whole change exists to
         // refuse *when there is a seam*, and here there is not, so it must
         // survive: with the floor at 7.0 instead of 8.0 both sweeps would arm
-        // at 7.5, `±7.5` clears `SEAM_PROXIMITY · 7.5` at both ends, and this
-        // would read ±7.5 rather than nothing.
+        // at 7.5, `±7.5` clears `SEAM_PROXIMITY_ACROSS_TILTS · 7.5` at both
+        // ends, and this would read ±7.5 rather than nothing.
         let scan = Scan::new(
             vcp(&[0.5, 4.5]),
             vec![
@@ -4590,13 +5014,22 @@ mod tests {
     /// passing, because every other fixture arms both rungs.
     ///
     /// The shape is real rather than contrived. A clear-air coverage pattern
-    /// folds at around 12.5 m/s; a higher cut of the same volume looking at
-    /// slow air can report nothing over [`FOLD_LIMIT_FLOOR_MS`] and so claims
-    /// no seam at all, while the cut below it folds.
+    /// measures a fold limit around 11 m/s; a higher cut of the same volume
+    /// looking at slow air can report nothing over [`FOLD_LIMIT_FLOOR_MS`]
+    /// and so claims no seam at all, while the cut below it folds.
+    ///
+    /// (The armed sweep read 12.5 when the vertical fraction was 0.5. This
+    /// pair must beat `SEAM_PROXIMITY_ACROSS_TILTS` of the one measured
+    /// limit on both ends while its slow side stays under the 8.0 floor
+    /// that keeps that sweep unarmed — which caps the armed limit below
+    /// `8.0 / 0.67 ≈ 11.9`. At 12.5 the old pair sat at 60% and the tilt
+    /// guard now rightly declines it, so the one-sided arm this test exists
+    /// to pin was never reached; the straddle precondition below is what
+    /// keeps this fixture from going silently dead the same way again.)
     #[test]
     fn a_lerp_between_one_measured_seam_and_one_unmeasured_still_guards() {
         for (low, high, expect_lo, expect_hi) in
-            [(12.5, -7.5, 12.5f32, -7.5f32), (7.5, -12.5, 7.5, -12.5)]
+            [(11.0, -7.5, 11.0f32, -7.5f32), (7.5, -11.0, 7.5, -11.0)]
         {
             let scan = Scan::new(
                 vcp(&[0.5, 4.5]),
@@ -4620,6 +5053,20 @@ mod tests {
                 "precondition: {low}/{high} armed {} rungs, so this fixture \
                  does not exercise the one-sided arm",
                 claimed.len(),
+            );
+            // precondition: the pair still straddles at the tilt fraction of
+            // the one measured limit — without this, a fraction change can
+            // park the fixture below the line and the assert at the bottom
+            // stops observing the arm it names.
+            let limit = claimed[0].expect("one rung claimed a seam");
+            assert!(
+                straddles_fold(
+                    &[Sample::found(low as f32), Sample::found(high as f32)],
+                    Seam::AcrossTilts(limit),
+                ),
+                "precondition: {low}/{high} does not straddle at the tilt \
+                 fraction of {limit}, so the guard below never fires and the \
+                 one-sided arm goes unobserved",
             );
 
             let column = sampler.column(90.0, 30.0);
@@ -4707,9 +5154,12 @@ mod tests {
         // entirely, so this pins the `min` and not merely that some limit was
         // reaching the lerp.
         let pair = [Sample::found(11.5), Sample::found(-11.0)];
-        assert!(straddles_fold(&pair, 11.5), "the tighter seam is crossed");
         assert!(
-            !straddles_fold(&pair, 30.0),
+            straddles_fold(&pair, Seam::AcrossTilts(11.5)),
+            "the tighter seam is crossed",
+        );
+        assert!(
+            !straddles_fold(&pair, Seam::AcrossTilts(30.0)),
             "precondition: the wider limit also fires here, so this fixture \
              cannot tell `min` from `max`",
         );
