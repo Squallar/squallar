@@ -1287,6 +1287,25 @@ impl App {
                         let timestamp = scan_data.timestamp;
                         let scan_arc = Arc::new(scan_data.scan);
 
+                        // An archive volume for a site the chunk feed has already
+                        // moved past.
+                        //
+                        // The archive publishes a volume only once every cut is
+                        // finished, so what it returns while a feed is running is
+                        // by construction the volume *before* the one being
+                        // assembled. Applying it walks the display backwards by a
+                        // whole volume — which is what a user pressing Refresh
+                        // least expects, and how this was found.
+                        //
+                        // The volume is still real and still complete, so it goes
+                        // to the loops and the cache; only the live display is
+                        // left alone. Once the feed retires `chunks_are_feeding`
+                        // goes false and the archive is applied unconditionally,
+                        // which is the whole point of the fallback.
+                        let feed_is_ahead = self.chunks_are_feeding(&site)
+                            && fetch::latest_scan_time_for_site(self.gui.panes(), &site)
+                                .is_some_and(|shown| timestamp <= shown);
+
                         // Every path out of this arm holds a complete archive
                         // volume, including the two below that decline to put it
                         // on screen — so the 3D pane is offered it here, above
@@ -1309,8 +1328,29 @@ impl App {
                         // warning that is always on is one the reader learns to
                         // ignore, and it is the same line that has to be
                         // believed in live mode.
-                        self.base_scans
-                            .insert(site.clone(), (Arc::clone(&scan_arc), scan_info.timestamp));
+                        //
+                        // Guarded against walking *backwards* while the feed is
+                        // ahead: the feed's whole closed volumes roll the base
+                        // forward at volume end, up to ~7 minutes before the
+                        // archive publishes the same volume, so in that window a
+                        // manual Refresh returns the volume *before* the one
+                        // already based — and an unconditional insert would put
+                        // the older ladder back under every whole-volume
+                        // consumer. Deliberately **not** a plain only-if-newer:
+                        // with no feed ahead the insert stays unconditional, so a
+                        // historic navigation still re-bases the substrate on
+                        // the volume shown — a section pane stamps its target
+                        // with the pane's own time while cutting from
+                        // `base_scans`, and a base pinned newer than the display
+                        // would cut newer data under the navigated caption.
+                        let advances_the_base = self
+                            .base_scans
+                            .get(&site)
+                            .is_none_or(|(_, held)| scan_info.timestamp > *held);
+                        if advances_the_base || !feed_is_ahead {
+                            self.base_scans
+                                .insert(site.clone(), (Arc::clone(&scan_arc), scan_info.timestamp));
+                        }
 
                         // When auto-poll delivers a new scan, check if any pane
                         // on this site is viewing live. If all panes on this site
@@ -1323,24 +1363,6 @@ impl App {
                                     .is_some_and(|p| p.site == site && p.viewing_live)
                             })
                         };
-                        // An archive volume for a site the chunk feed has already
-                        // moved past.
-                        //
-                        // The archive publishes a volume only once every cut is
-                        // finished, so what it returns while a feed is running is
-                        // by construction the volume *before* the one being
-                        // assembled. Applying it walks the display backwards by a
-                        // whole volume — which is what a user pressing Refresh
-                        // least expects, and how this was found.
-                        //
-                        // The volume is still real and still complete, so it goes
-                        // to the loops and the cache; only the live display is
-                        // left alone. Once the feed retires `chunks_are_feeding`
-                        // goes false and the archive is applied unconditionally,
-                        // which is the whole point of the fallback.
-                        let feed_is_ahead = self.chunks_are_feeding(&site)
-                            && fetch::latest_scan_time_for_site(self.gui.panes(), &site)
-                                .is_some_and(|shown| timestamp <= shown);
 
                         if scan_resp.is_auto_poll && !any_pane_live_for_site {
                             log::info!("Auto-poll: caching scan (historic mode) @ {}", timestamp);
@@ -4555,6 +4577,63 @@ mod chunk_feed_precedence_tests {
             "precondition: this is the auto-poll-while-historic arm",
         );
         assert_eq!(collected(&historic), Some(at(15)));
+    }
+
+    /// **A Refresh in the pre-publication window must not walk the base back.**
+    /// The feed's whole closed volumes roll `base_scans` forward at volume
+    /// end, up to ~7 minutes before the archive publishes the same volume —
+    /// so in that window a manual Refresh returns the volume *before* the one
+    /// already based, and the drain's unconditional insert put the older
+    /// ladder back under every whole-volume consumer.
+    ///
+    /// The guard is scoped to the feed-ahead window on purpose, and the third
+    /// phase is the boundary: with no feed ahead, the base still follows the
+    /// display backwards, because a historic navigation re-bases the substrate
+    /// on the volume shown — a section pane stamps its target with the pane's
+    /// own time while cutting from `base_scans`, so a base pinned newer than
+    /// the display would cut newer data under the navigated caption.
+    #[test]
+    fn a_refresh_in_the_pre_publication_window_does_not_walk_the_base_back() {
+        let based = |app: &App| app.base_scans.get("KTLX").map(|(_, at)| *at);
+        let mut app = app_showing(at(10));
+        app.chunk_feeds.ensure("KTLX");
+        // The feed's whole closed volume is already the merge base.
+        app.base_scans
+            .insert("KTLX".to_string(), (Arc::new(stamped_scan(10)), at(10)));
+
+        // A manual Refresh in the window: the archive answers the previous
+        // volume.
+        send_archive(&app, at(5));
+        app.poll_data_channels();
+        assert_eq!(
+            based(&app),
+            Some(at(10)),
+            "a manual Refresh in the pre-publication window regressed the \
+             merge base one volume, under every whole-volume consumer",
+        );
+
+        // The counterweight: a genuinely newer archive volume still advances
+        // it.
+        send_archive(&app, at(15));
+        app.poll_data_channels();
+        assert_eq!(based(&app), Some(at(15)), "a newer volume was refused");
+
+        // And with the feed no longer ahead, the base follows the display —
+        // backwards included.
+        app.chunk_feeds
+            .force_retire_at("KTLX", std::time::Duration::from_secs(1));
+        assert!(
+            !app.chunks_are_feeding("KTLX"),
+            "precondition: feed retired"
+        );
+        send_archive(&app, at(12));
+        app.poll_data_channels();
+        assert_eq!(
+            based(&app),
+            Some(at(12)),
+            "with no feed ahead the base must follow the volume on display, \
+             or a navigated section cuts newer data under an older caption",
+        );
     }
 
     /// And the recorded volume reaches the pane that has to name it.
