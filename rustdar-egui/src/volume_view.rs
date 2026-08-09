@@ -636,6 +636,62 @@ mod tests {
         }
     }
 
+    /// A camera zoomed all the way in stands *inside* the box and still gets a
+    /// view: finite matrices, an eye in the unit cube, and the centre ray on
+    /// the pivot.
+    ///
+    /// This is the geometry half of the #6 zoom: `MIN_EYE_DISTANCE` is 0.05
+    /// half-diagonals, which is inside the box from every default angle, and
+    /// nothing in `build_view` assumes the eye is outside — the derivation is a
+    /// point and a direction, not a framing. The GPU half (the raymarch's slab
+    /// entry clamped to zero so an inside eye marches forward from itself)
+    /// lives in `rustdar-frontend`'s silhouette harness, where the shader runs.
+    /// Checked at 1x and 12x, because the stop is measured against the
+    /// stretched box.
+    #[test]
+    fn a_camera_at_the_zoom_stop_is_inside_the_box_and_still_has_a_view() {
+        for exaggeration in [1.0, 12.0] {
+            let mut camera =
+                OrbitCamera::restore(225.0, 25.0, 2.5, [0.0; 3], exaggeration).expect("finite");
+            camera.nudge(crate::pane::OrbitDelta {
+                zoom_factor: 1e6,
+                ..Default::default()
+            });
+            let view = view_for(camera, BOX_KM, 1.6)
+                .expect("the zoom's near stop must still be a viewable camera");
+            assert!(
+                view.eye_in_box.iter().all(|c| (0.0..=1.0).contains(c)),
+                "at {exaggeration}x the fully-zoomed eye should be inside the \
+                 box, got {:?}",
+                view.eye_in_box,
+            );
+            assert!(
+                view.box_from_clip
+                    .iter()
+                    .flatten()
+                    .all(|value| value.is_finite()),
+                "at {exaggeration}x the inside-the-box view built a non-finite \
+                 matrix",
+            );
+            // The orbit still aims at the pivot from inside: the centre ray
+            // reaches the box's centre, exactly as it does from outside.
+            let ray = direction(&view, [0.0, 0.0]);
+            let wanted = normalize([
+                0.5 - view.eye_in_box[0],
+                0.5 - view.eye_in_box[1],
+                0.5 - view.eye_in_box[2],
+            ])
+            .expect("a direction to the centre");
+            for axis in 0..3 {
+                assert!(
+                    (ray[axis] - wanted[axis]).abs() < 1e-3,
+                    "at {exaggeration}x the inside centre ray {ray:?} is off the \
+                     pivot ({wanted:?})",
+                );
+            }
+        }
+    }
+
     /// Yaw is a compass bearing of the *eye*, so the default camera is to the
     /// south-west of the box exactly as [`OrbitCamera::default`] promises.
     ///

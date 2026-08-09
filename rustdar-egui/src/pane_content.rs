@@ -848,7 +848,24 @@ const MAX_PITCH_DEG: f32 = 89.0;
 /// Eye distance is in multiples of the volume box's half-diagonal, so the camera
 /// never has to know the grid's dimensions and the same limits hold for every
 /// grid-spec rung. 1.0 is the eye on the box's corner sphere.
-const MIN_EYE_DISTANCE: f32 = 1.05;
+///
+/// # The minimum admits the inside of the box
+///
+/// 0.05 is well inside the corner sphere: at the default whole-scan box it puts
+/// the eye a few kilometres from the pivot, which is inside-the-storm close —
+/// the zoom GR2Analyst allows and the one a 1.05 floor was refusing. Inside is
+/// a supported camera, not an accident: the raymarch clamps its slab entry to
+/// zero (`max(near.z, 0.0)` in `slab_entry_exit`), so a ray from inside the box
+/// marches forward from the eye rather than from behind it, and
+/// `rustdar-frontend`'s silhouette harness renders from an inside eye to prove
+/// the GPU agrees.
+///
+/// Not zero, and not merely to avoid a strange picture: at exactly 0 the eye
+/// sits *on* the pivot, the orbit offset is the zero vector, and
+/// `volume_view::build_view` finds no forward direction and refuses the frame —
+/// a pane that goes blank at the end of the zoom's travel. 0.05 keeps the
+/// direction defined with two orders of magnitude to spare.
+const MIN_EYE_DISTANCE: f32 = 0.05;
 const MAX_EYE_DISTANCE: f32 = 8.0;
 
 /// How far the pivot may be pushed from the box's centre, as a fraction of the
@@ -1583,6 +1600,40 @@ mod tests {
         });
         assert_eq!(camera.pitch_deg(), -MAX_PITCH_DEG);
         assert_eq!(camera.eye_distance(), MIN_EYE_DISTANCE);
+    }
+
+    /// The zoom's near stop is 0.05 half-diagonals — inside the box, by the
+    /// literal.
+    ///
+    /// Pinned as a number rather than as `MIN_EYE_DISTANCE`, because the
+    /// property is the *value*: at 1.05 (the old floor) the eye can never enter
+    /// the box and "zoom in as far as I want" stops a whole box away from the
+    /// storm; at 0.05 the eye ends up inside it, which the raymarch supports by
+    /// clamping its slab entry to zero. A symbolic assertion would follow the
+    /// constant wherever it went and could not see this regress. Checked at 1x
+    /// and 12x exaggeration: the limit is in half-diagonals of the *stretched*
+    /// box, so the stop is the same fraction of the view whatever the stretch.
+    #[test]
+    fn the_zoom_stops_at_a_twentieth_of_a_half_diagonal() {
+        for exaggeration in [1.0, 12.0] {
+            let mut camera =
+                OrbitCamera::restore(225.0, 25.0, 2.5, [0.0; 3], exaggeration).expect("finite");
+            camera.nudge(OrbitDelta {
+                zoom_factor: 1e6,
+                ..Default::default()
+            });
+            assert_eq!(
+                camera.eye_distance(),
+                0.05,
+                "at {exaggeration}x the zoom's near stop moved; 0.05 half-diagonals \
+                 is the inside-the-box zoom #6 asked for, and anything at or above \
+                 1.0 locks the eye out of the box again",
+            );
+        }
+        // And the same literal from the restore path, so a persisted camera
+        // cannot come back with a closer zoom than the wheel can reach.
+        let restored = OrbitCamera::restore(225.0, 25.0, 0.001, [0.0; 3], 3.0).expect("finite");
+        assert_eq!(restored.eye_distance(), 0.05);
     }
 
     /// The exaggeration knob clamps a finite value and refuses a non-finite one.

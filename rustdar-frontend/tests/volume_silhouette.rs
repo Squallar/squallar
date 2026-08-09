@@ -1095,6 +1095,116 @@ fn an_off_centre_sphere_puts_its_silhouette_where_the_rays_say() {
     );
 }
 
+/// An eye **inside** the box sees what is ahead of it and none of what is
+/// behind it.
+///
+/// The GPU half of the #6 zoom: `OrbitCamera`'s minimum eye distance is 0.05
+/// half-diagonals, which puts the eye inside the volume, and the shader's
+/// licence for that is one clamp — `slab_entry_exit` takes
+/// `max(near.z, 0.0)`, so a ray from an inside eye marches forward from the
+/// eye rather than from the box wall *behind* it. This is the test that can
+/// see that clamp break: without it the march starts at a negative parameter,
+/// samples the line behind the eye, and a shape planted at the camera's back
+/// composites in front of everything. So two renders from the same inside
+/// camera: a sphere wholly behind the eye must paint **nothing**, and a
+/// sphere ahead must land exactly where the rays say. At 1x and 12x
+/// exaggeration, because the zoom stop is measured against the stretched box.
+///
+/// ```text
+/// cargo test -p rustdar-frontend --test volume_silhouette \
+///     an_eye_inside_the_box_sees_ahead_and_none_of_what_is_behind \
+///     -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
+fn an_eye_inside_the_box_sees_ahead_and_none_of_what_is_behind() {
+    let _serialised = gpu_lock();
+    let (device, queue) = device();
+    let pipelines = VolumePipelines::new(&device, attachments());
+    pipelines.upload_quad(&queue);
+    let lut = hard_mask_lut();
+    let size = [384u32, 384];
+    let cells = [128u32, 128, 128];
+    const RADIUS: f32 = 0.08;
+    // Due south of the pivot looking north, level, at the zoom's near stop.
+    const AHEAD: [f32; 3] = [0.5, 0.75, 0.5];
+    const BEHIND: [f32; 3] = [0.5, 0.15, 0.5];
+
+    for exaggeration in [1.0f32, 12.0] {
+        let uniform = masking_uniform(camera(180.0, 0.0, 0.05, exaggeration), BOX_KM, cells, size);
+        assert!(
+            uniform.eye_in_box.iter().all(|c| (0.0..=1.0).contains(c)),
+            "precondition at {exaggeration}x: the fully-zoomed eye must be inside \
+             the box, got {:?}",
+            uniform.eye_in_box,
+        );
+        // The behind sphere must be wholly behind the eye, or the render is
+        // entitled to paint it and the assertion below tests nothing.
+        assert!(
+            BEHIND[1] + RADIUS < uniform.eye_in_box[1],
+            "precondition at {exaggeration}x: the sphere at {BEHIND:?} reaches \
+             past the eye at {:?}",
+            uniform.eye_in_box,
+        );
+
+        let planted_behind = plant(cells, |c| {
+            let d = [c[0] - BEHIND[0], c[1] - BEHIND[1], c[2] - BEHIND[2]];
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() < RADIUS
+        });
+        let pixels = raymarch_once(
+            &device,
+            &queue,
+            &pipelines,
+            cells,
+            &planted_behind,
+            &lut,
+            &uniform,
+            size,
+        );
+        let painted = rendered_mask(&pixels).iter().filter(|on| **on).count();
+        assert_eq!(
+            painted, 0,
+            "at {exaggeration}x a sphere wholly behind an inside eye painted \
+             {painted} pixels; the march is starting at the box wall behind the \
+             camera instead of at the camera",
+        );
+
+        let planted_ahead = plant(cells, |c| {
+            let d = [c[0] - AHEAD[0], c[1] - AHEAD[1], c[2] - AHEAD[2]];
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() < RADIUS
+        });
+        let pixels = raymarch_once(
+            &device,
+            &queue,
+            &pipelines,
+            cells,
+            &planted_ahead,
+            &lut,
+            &uniform,
+            size,
+        );
+        let rendered = rendered_mask(&pixels);
+        let expected = analytic_mask(&uniform, size, |o, d| {
+            hits_ellipsoid(o, d, AHEAD, [RADIUS; 3])
+        });
+        let metrics = compare(&rendered, &expected, size);
+        metrics.report(&format!("inside eye, {exaggeration}x, sphere ahead"));
+        let coverage = covered_fraction(&rendered, &expected);
+        assert!(
+            coverage > 0.99,
+            "at {exaggeration}x an inside eye lost {:.3}% of the silhouette \
+             ahead of it",
+            (1.0 - coverage) * 100.0,
+        );
+        assert!(
+            metrics.centroid_magnitude_px < 1.5,
+            "at {exaggeration}x the silhouette ahead of an inside eye strayed \
+             {:.3} px from where the rays say it is",
+            metrics.centroid_magnitude_px,
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 3. Slabs
 // ---------------------------------------------------------------------------

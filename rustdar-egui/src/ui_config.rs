@@ -1239,10 +1239,12 @@ mod tests {
             "pitch {}",
             camera.pitch_deg()
         );
-        assert!(
-            camera.eye_distance() > 1.0,
-            "distance {}",
-            camera.eye_distance()
+        assert_eq!(
+            camera.eye_distance(),
+            0.05,
+            "an under-range saved distance must clamp to the zoom's near stop \
+             (0.05 half-diagonals — inside the box is a supported camera), not \
+             be discarded",
         );
     }
 
