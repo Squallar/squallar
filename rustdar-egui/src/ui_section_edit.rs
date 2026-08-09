@@ -727,6 +727,29 @@ mod tests {
             bearing_deg(line()),
             bearing_deg(swept)
         );
+        // Signed, not absolute: the grabbed point must move *toward* the
+        // pointer's bearing about the pivot, so the line's bearing lands at
+        // its old value plus exactly the pivot-relative swing from the press
+        // to the pointer. A negated delta sweeps the line the other way and
+        // misses this by roughly twice the swing — ~100° here — while every
+        // magnitude-only assertion above still passes.
+        let to = point(mid.lat + 0.4, mid.lon);
+        let (to_bearing, _) =
+            rustdar_radar::beam::site_bearing_range_km(mid.lat, mid.lon, to.lat, to.lon);
+        let (from_bearing, _) = rustdar_radar::beam::site_bearing_range_km(
+            mid.lat,
+            mid.lon,
+            press_on_line.lat,
+            press_on_line.lon,
+        );
+        let want = (bearing_deg(line()) + (to_bearing - from_bearing)).rem_euclid(360.0);
+        let off = (bearing_deg(swept).rem_euclid(360.0) - want).rem_euclid(360.0);
+        assert!(
+            off.min(360.0 - off) < 0.05,
+            "the sweep did not carry the grabbed point toward the pointer: \
+             wanted bearing {want}, got {}",
+            bearing_deg(swept).rem_euclid(360.0)
+        );
 
         // A sweep press on the pivot has no bearing to rotate from: refused,
         // preview kept.

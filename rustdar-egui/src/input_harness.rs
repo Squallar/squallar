@@ -7201,6 +7201,18 @@ mod tests {
                 lon: press_lon,
             },
         );
+        // Where the pointer will end, unprojected now — the drag suppresses
+        // panning, so the ground under that pixel must not move either. The
+        // sweep's signed contract: the grabbed point sits on the pivot→B
+        // side, so the committed line's bearing must land where the *pointer*
+        // is about the pivot — not merely differ from the old bearing.
+        let release_ground = h.ground_at(0, press_px + egui::vec2(-40.0, -48.0));
+        let (want_bearing, _) = rustdar_radar::beam::site_bearing_range_km(
+            mid_before.lat,
+            mid_before.lon,
+            release_ground.y(),
+            release_ground.x(),
+        );
 
         h.set_modifiers(egui::Modifiers {
             shift: true,
@@ -7240,6 +7252,19 @@ mod tests {
             .abs()
                 > 2.0,
             "a drag across the line's run turned it by nothing"
+        );
+        // And it turned the right way: the grabbed point followed the pointer
+        // about the pivot, so the line's bearing landed on the pointer's. A
+        // negated sweep delta turns the line *away* from the pointer by the
+        // same magnitude — every assertion above still passes, and this one
+        // misses by roughly twice the swing (~100° here).
+        let got = crate::ui_section_edit::bearing_deg(line).rem_euclid(360.0);
+        let off = (got - want_bearing.rem_euclid(360.0)).rem_euclid(360.0);
+        assert!(
+            off.min(360.0 - off) < 3.0,
+            "the grabbed point swept away from the pointer: the line's \
+             bearing landed at {got}\u{b0}, the pointer sat on \
+             {want_bearing}\u{b0} from the pivot"
         );
     }
 
