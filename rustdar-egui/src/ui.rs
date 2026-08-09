@@ -1698,7 +1698,10 @@ impl Gui {
                 Some(line) => {
                     // The ends are named A and B because that is what the map
                     // paints at them; the length is the same haversine the
-                    // hover readout uses rather than a second copy of it.
+                    // hover readout uses rather than a second copy of it. An
+                    // en dash, not an arrow: U+2192 has no glyph in the app's
+                    // font and renders as tofu, where the volume caption's
+                    // "0–59 kft MSL" shows the dash rendering fine.
                     let (_, km) = rustdar_radar::beam::site_bearing_range_km(
                         line.a().lat,
                         line.a().lon,
@@ -1707,7 +1710,7 @@ impl Gui {
                     );
                     let unit = self.preferences.distance;
                     ui.label(format!(
-                        "A \u{2192} B: {:.0} {}",
+                        "A \u{2013} B: {:.0} {}",
                         unit.convert_from_km(km),
                         unit.suffix()
                     ));

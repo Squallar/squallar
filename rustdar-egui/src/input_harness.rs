@@ -6305,7 +6305,7 @@ mod tests {
                 "Reflectivity",
                 "Step:",
                 crate::ui::SECTION_SIDEBAR_HEADER,
-                "A \u{2192} B:",
+                "A \u{2013} B:",
                 crate::ui::NON_MAP_LAYERS_NOTE,
             ],
         );
