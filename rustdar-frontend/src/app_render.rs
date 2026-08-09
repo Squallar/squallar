@@ -765,26 +765,30 @@ impl super::App {
                 continue;
             };
             let (lat, lon) = (scan_info.site.lat, scan_info.site.lon);
-            let Some(data) = self.scan_data.get(site.as_str()).map(Arc::clone) else {
-                continue;
-            };
+
+            // The current merged volume — the base plus every sealed sweep —
+            // and **not** `scan_data`, whose mid-volume content is the growing
+            // snapshot alone: cutting from that is what made a section's
+            // ladder start one rung tall after every roll. The section reads
+            // the same resolve the target's fingerprint and the 3D build read,
+            // so all three describe one volume.
+            let base = self
+                .base_scans
+                .get(site.as_str())
+                .map(|(scan, _)| Arc::clone(scan));
+            let overlay = self.chunk_feeds.snapshot(site.as_str());
 
             // The two refusals that have to be *named* rather than left as a
             // blank pane. Checked here, before any budget is taken, because both
             // are properties of the volume and the product rather than of the
             // cut — dispatching would burn a render slot to be told the same
             // thing, and on wasm there is only one slot.
-            if data.coverage_pattern().elevation_cuts().is_empty() {
-                // The live chunk feed's mid-flight state: `chunks.rs` stands in
-                // an empty coverage pattern until the VCP message lands, and
-                // `VolumeSampler::new` refuses it rather than inventing a ladder
-                // out of the sweeps' own elevation numbers. It resolves itself
-                // on the next volume, so the key is *not* written — the pane
+            if let Some(reason) = section_source_refusal(base.as_deref(), overlay.as_deref()) {
+                // Both reasons resolve themselves — the mid-flight pattern
+                // arrives with the next volume start, the first download is
+                // already in flight — so the key is *not* written: the pane
                 // will ask again, and get an answer.
-                self.mark_section_unavailable(
-                    pane_idx,
-                    rustdar_egui::pane::SectionUnavailable::AwaitingCoveragePattern,
-                );
+                self.mark_section_unavailable(pane_idx, reason);
                 continue;
             }
             if rustdar_radar::sampler::samplable(target.product).is_none() {
@@ -807,12 +811,25 @@ impl super::App {
                 continue;
             }
 
+            // The extraction, deferred: it walks the merged volume's ~15 MB of
+            // gate bytes on this thread, so the dispatcher only runs it when
+            // its payload cache misses — the closure owns the `Arc`s and
+            // resolves the same merge the refusal check above cleared.
+            let product = target.product;
+            let extract = move || {
+                let current = rustdar_radar::current::resolve(base.as_deref(), overlay.as_deref())?;
+                rustdar_radar::render_input::RenderInput::extract_volume_parts(
+                    current.pattern(),
+                    current.sweeps(),
+                    product,
+                    lat,
+                    lon,
+                )
+            };
             if self.render.spawn_section_render(
                 pane_idx,
                 &target,
-                &data,
-                lat,
-                lon,
+                extract,
                 self.channels.section_sender.clone(),
                 self.window.clone(),
             ) && let Some(section) = self
@@ -855,23 +872,23 @@ impl super::App {
             );
             return None;
         };
-        // Counted off the `Scan` the cut will be made from, and **not** off the
-        // pane's `ScanInfo::product_elevations`. See `SectionTarget::sweeps`: the
+        // The ladder fingerprint, resolved over the same merged volume the cut
+        // will be extracted from — **not** off the pane's
+        // `ScanInfo::product_elevations`. See `SectionTarget::ladder`: the
         // pane's angle set is merged rather than replaced as chunks land, so
         // after one complete volume it already holds the whole VCP and never
         // moves again — which would freeze the key exactly the way the volume
-        // timestamp does, one volume later. A missing scan counts zero rather
-        // than refusing: the dispatch below has its own arm for that, and this
-        // one is about naming the key.
-        let sweeps = self
-            .scan_data
-            .get(site.as_str())
-            .map_or(0, |scan| sweeps_carrying(scan, product));
+        // timestamp does, one volume later. An unresolvable ladder keys zero
+        // rather than refusing: the dispatch below has its own arm for that,
+        // and this one is about naming the key.
+        let ladder = self
+            .current_ladder_fingerprint(site.as_str(), product)
+            .unwrap_or(0);
         Some(rustdar_egui::pane::SectionTarget {
             volume: rustdar_egui::pane::VolumeStamp { site, collected },
             product,
             line,
-            sweeps,
+            ladder,
         })
     }
 
@@ -2028,31 +2045,27 @@ impl super::App {
     }
 }
 
-/// How many of `scan`'s sweeps carry `product`'s moment.
+/// Why no section can be cut from what the app holds for a site, or `None`
+/// when one can.
 ///
-/// The staleness discriminator for a cross-section — see
-/// [`SectionTarget::sweeps`](rustdar_egui::pane::SectionTarget) for why the count
-/// has to come off the `Scan` rather than off the pane's accumulated `ScanInfo`.
-///
-/// The predicate is the first radial's, which is what
-/// `ScanInfo::discover_product_elevations` and `RenderInput::extract_with` both
-/// use: a sweep carries a moment or it does not, and a volume where the first
-/// radial of a sweep disagrees with the rest of it is not a shape NEXRAD
-/// produces. Level III products have no Level II moment behind them and count
-/// zero, which is correct — nothing about them is samplable either.
-fn sweeps_carrying(
-    scan: &nexrad_model::data::Scan,
-    product: rustdar_radar::types::RadarProduct,
-) -> usize {
-    scan.sweeps()
-        .iter()
-        .filter(|sweep| {
-            sweep
-                .radials()
-                .first()
-                .is_some_and(|r| product.get_moment(r).is_some())
-        })
-        .count()
+/// A pure function of the two holders so the decision is testable without a
+/// live chunk feed. The distinction between its two answers is the load-bearing
+/// part: an overlay carrying sealed sweeps but no pattern is the mid-flight
+/// join — `chunks.rs` stands in an empty coverage pattern until the VCP
+/// message lands, and `current::resolve` correctly refuses to key a flight by
+/// another flight's table — while nothing at all is the cold-start download.
+/// Both clear themselves, and each needs its own sentence.
+fn section_source_refusal(
+    base: Option<&nexrad_model::data::Scan>,
+    overlay: Option<&nexrad_model::data::Scan>,
+) -> Option<rustdar_egui::pane::SectionUnavailable> {
+    if rustdar_radar::current::resolve(base, overlay).is_some() {
+        return None;
+    }
+    if overlay.is_some_and(|scan| !scan.sweeps().is_empty()) {
+        return Some(rustdar_egui::pane::SectionUnavailable::AwaitingCoveragePattern);
+    }
+    Some(rustdar_egui::pane::SectionUnavailable::AwaitingVolume)
 }
 
 /// Take a scan listing for `site` into `ls`'s frame list, returning the downloads
@@ -5632,11 +5645,14 @@ mod section_dispatch_tests {
 
     /// The same volume with `sweeps` sweeps in it, for the live feed's growing
     /// `Scan`. Every sweep carries reflectivity and nothing else, so it also
-    /// stands in for the surveillance-only half of a split cut.
+    /// stands in for the surveillance-only half of a split cut. Radials carry
+    /// real, distinct collection stamps because the ladder fingerprint hashes
+    /// them — a fixture stamping everything `0` would make two different
+    /// volumes' sweeps indistinguishable to the key under test.
     fn volume_of(sweeps: u8, cuts: Vec<ElevationCut>) -> Arc<Scan> {
         let radial = |elevation_number: u8| {
             Radial::new(
-                0,
+                1_760_000_000_000 + i64::from(elevation_number) * 1000,
                 0,
                 0.0,
                 1.0,
@@ -5683,6 +5699,11 @@ mod section_dispatch_tests {
         ))
     }
 
+    /// `n` copies of [`one_cut`], so a `volume_of(n, …)` keys every sweep.
+    fn cuts_for(n: u8) -> Vec<ElevationCut> {
+        (0..n).map(|_| one_cut()).collect()
+    }
+
     /// An `App` with one section pane aimed along [`line`], on a site whose
     /// volume is `scan`.
     fn app_with_section(product: RadarProduct, scan: Arc<Scan>) -> crate::app::App {
@@ -5709,7 +5730,13 @@ mod section_dispatch_tests {
             },
         );
         app.render.ensure_pane_count(1);
-        app.scan_data.insert(SITE.to_owned(), scan);
+        // Into the substrate's base holder, and deliberately **not** into
+        // `scan_data`: sections cut from the merged current volume, and a
+        // fixture that also filled the plan view's map would leave a
+        // regression to reading `scan_data` invisible — the pin these tests
+        // carry is precisely that a section works with the map's holder empty.
+        app.base_scans
+            .insert(SITE.to_owned(), (scan, volume_time()));
         app
     }
 
@@ -5721,27 +5748,54 @@ mod section_dispatch_tests {
             .expect("pane 0 is a section pane")
     }
 
-    /// A volume joined mid-scan says so, and **keeps asking**.
+    /// A volume joined mid-scan says so; a site with nothing at all says the
+    /// download is in flight; and neither writes the staleness key.
     ///
-    /// `chunks.rs` stands in an empty coverage pattern until the VCP message
-    /// lands, and `VolumeSampler::new` refuses that rather than inventing a
-    /// ladder out of the sweeps' own elevation numbers — correctly, but the
-    /// result is a blank pane in ordinary live use.
-    ///
-    /// Leaving the staleness key unwritten is the load-bearing half: the state
-    /// resolves itself on the next volume, so the pane has to be still asking
-    /// when it does. Writing the key here would make a transient condition
-    /// permanent for the life of the pane.
+    /// The reason is decided by [`section_source_refusal`], a pure function of
+    /// the two holders, and the two answers must stay distinct: an overlay
+    /// carrying sealed sweeps under `chunks.rs`' placeholder pattern resolves
+    /// itself at the next volume start, while an empty site resolves when its
+    /// first download lands — and with a base in hand there is no refusal at
+    /// all, however patternless the overlay, because the base alone is a
+    /// complete volume to cut.
     #[test]
-    fn a_volume_with_no_coverage_pattern_says_so_and_keeps_asking() {
-        let mut app = app_with_section(RadarProduct::Reflectivity, volume(Vec::new()));
+    fn the_section_refusal_tells_a_mid_scan_join_from_a_cold_start() {
+        let mid_flight = volume(Vec::new());
+        assert_eq!(
+            section_source_refusal(None, Some(&mid_flight)),
+            Some(SectionUnavailable::AwaitingCoveragePattern),
+            "a mid-scan join is a blank pane with no explanation"
+        );
+        assert_eq!(
+            section_source_refusal(None, None),
+            Some(SectionUnavailable::AwaitingVolume),
+            "an empty site must say its download is in flight"
+        );
+        let base = volume(vec![one_cut()]);
+        assert_eq!(
+            section_source_refusal(Some(&base), Some(&mid_flight)),
+            None,
+            "a base in hand is a complete volume to cut; refusing it because \
+             the overlay has no pattern yet is the wait this substrate exists \
+             to remove"
+        );
+    }
+
+    /// The transient refusals leave the pane **asking**: the state resolves
+    /// itself, so the key must not be written.
+    #[test]
+    fn a_transient_section_refusal_keeps_the_pane_asking() {
+        let mut app = app_with_section(RadarProduct::Reflectivity, volume(vec![one_cut()]));
+        // No source at all: the cold-start arm of the same refusal path the
+        // mid-flight join takes.
+        app.base_scans.clear();
 
         app.dispatch_section_renders();
 
         assert_eq!(
             state(&app).unavailable,
-            Some(SectionUnavailable::AwaitingCoveragePattern),
-            "a mid-scan join is a blank pane with no explanation"
+            Some(SectionUnavailable::AwaitingVolume),
+            "an empty site is a blank pane with no explanation"
         );
         assert_eq!(
             state(&app).rendered_for,
@@ -5819,15 +5873,20 @@ mod section_dispatch_tests {
     fn a_dispatch_for_a_pane_that_does_not_exist_refuses_instead_of_panicking() {
         let mut app = app_with_section(RadarProduct::Reflectivity, volume(vec![one_cut()]));
         let target = app.section_target_for_pane(0).expect("aimed with a volume");
-        let data = Arc::clone(app.scan_data.get(SITE).expect("the site has a volume"));
+        let data = Arc::clone(&app.base_scans.get(SITE).expect("the site has a volume").0);
         assert_eq!(app.render.pane_render.len(), 1, "precondition");
 
         let dispatched = app.render.spawn_section_render(
             7,
             &target,
-            &data,
-            35.3333,
-            -97.2778,
+            move || {
+                rustdar_radar::render_input::RenderInput::extract_volume(
+                    &data,
+                    RadarProduct::Reflectivity,
+                    35.3333,
+                    -97.2778,
+                )
+            },
             app.channels.section_sender.clone(),
             None,
         );
@@ -6272,9 +6331,10 @@ mod section_dispatch_tests {
     /// on by default — and it is the one the volume-time key does not cover.
     /// `ScanInfo::timestamp` is the *first* sweep's first radial, and on the
     /// chunk feed `sweeps[0]` is fixed for the whole volume, so the stamp is a
-    /// constant for five to six minutes while the ladder goes from one rung to
-    /// fourteen. Observed live before the fix: a map pane full of echo, a section
-    /// pane empty, and a caption reading `1 tilts` for six minutes.
+    /// constant for five to six minutes while the merged ladder refreshes rung
+    /// by rung. Observed live before the original fix: a map pane full of
+    /// echo, a section pane empty, and a caption reading `1 tilts` for six
+    /// minutes.
     ///
     /// Two preconditions carry the test. `before.volume` and `after.volume` are
     /// asserted **equal**, so a future change that makes the stamp move on the
@@ -6299,11 +6359,11 @@ mod section_dispatch_tests {
         let before = app
             .section_target_for_pane(0)
             .expect("the pane is aimed and has a volume");
-        assert_eq!(before.sweeps, 1, "the fixture volume is one sweep");
+        assert_ne!(before.ladder, 0, "the fixture volume's ladder resolves");
 
-        // The next chunks land: the `Scan` grows and nothing else does.
-        app.scan_data
-            .insert(SITE.to_owned(), volume_of(4, vec![one_cut()]));
+        // More sweeps land: the volume grows and nothing else does.
+        app.base_scans
+            .insert(SITE.to_owned(), (volume_of(4, cuts_for(4)), volume_time()));
         let after = app.section_target_for_pane(0).expect("still aimed");
 
         assert_eq!(
@@ -6311,16 +6371,15 @@ mod section_dispatch_tests {
             "precondition: the live feed's volume stamp really is frozen, so it \
              cannot be what notices the volume growing"
         );
-        assert_eq!(after.sweeps, 4);
         assert_ne!(
-            before, after,
-            "three more sweeps arrived and the pane went on showing a one-sweep \
-             section"
+            before.ladder, after.ladder,
+            "three more sweeps arrived and the key never moved, so the pane \
+             goes on showing a one-sweep section"
         );
 
-        // And the pane really re-dispatches on it: with the one-sweep key stored,
-        // the four-sweep target no longer matches and the short-circuit at the
-        // top of `dispatch_section_renders` falls through.
+        // And the pane really re-dispatches on it: with the one-sweep key
+        // stored, the four-sweep target no longer matches and the
+        // short-circuit at the top of `dispatch_section_renders` falls through.
         app.gui
             .pane_mut(0)
             .unwrap()
@@ -6329,32 +6388,118 @@ mod section_dispatch_tests {
             .rendered_for = Some(before);
         app.dispatch_section_renders();
         assert_eq!(
-            state(&app).rendered_for.as_ref().map(|t| t.sweeps),
-            Some(4),
+            state(&app).rendered_for.as_ref().map(|t| t.ladder),
+            Some(after.ladder),
             "the dispatcher short-circuited on a key cut from a quarter of the \
              volume"
         );
     }
 
-    /// Only the sweeps carrying the moment count, which is the same set
-    /// `RenderInput::extract_volume` copies into the payload the key is shared
-    /// with.
+    /// **The re-cut skip.** A seal that changes no chosen rung for the pane's
+    /// moment leaves the section key exactly where it was — and the same seal
+    /// moves the key of the moment it *does* change.
     ///
-    /// A surveillance-only half of a split cut carries reflectivity and no
-    /// velocity. Counting it for a velocity section would re-extract 15.6 MB for
-    /// a payload that came out byte-identical.
+    /// The waste this pins from the app side: a split cut's Doppler half
+    /// carries a short-range reflectivity copy, and the old sweep-count key
+    /// moved on its seal — ~6 byte-identical re-cuts per VCP-212 volume, each
+    /// a 15.6 MB walk and a render slot. The rung-choice fingerprint cannot be
+    /// moved by a seal that changes no choice; `current::tests` pin the
+    /// fingerprint itself, and this pins that the section target actually
+    /// rides it.
     #[test]
-    fn the_sweep_count_is_of_the_sweeps_that_carry_the_moment() {
-        let scan = volume_of(4, vec![one_cut()]);
-        assert_eq!(sweeps_carrying(&scan, RadarProduct::Reflectivity), 4);
+    fn a_seal_that_changes_no_chosen_rung_does_not_move_the_section_key() {
+        let surveillance_only = || {
+            Arc::new(Scan::new(
+                VolumeCoveragePattern::new(
+                    212,
+                    0,
+                    0.5,
+                    PulseWidth::Short,
+                    false,
+                    0,
+                    false,
+                    0,
+                    false,
+                    false,
+                    0,
+                    false,
+                    false,
+                    vec![one_cut(), one_cut()],
+                ),
+                vec![split_half(1, false)],
+            ))
+        };
+        let with_doppler_half = || {
+            Arc::new(Scan::new(
+                VolumeCoveragePattern::new(
+                    212,
+                    0,
+                    0.5,
+                    PulseWidth::Short,
+                    false,
+                    0,
+                    false,
+                    0,
+                    false,
+                    false,
+                    0,
+                    false,
+                    false,
+                    vec![one_cut(), one_cut()],
+                ),
+                vec![split_half(1, false), split_half(2, true)],
+            ))
+        };
+
+        let mut app = app_with_section(RadarProduct::Reflectivity, surveillance_only());
+        let before = app.section_target_for_pane(0).expect("aimed");
+        assert_ne!(before.ladder, 0, "precondition: the ladder resolves");
+
+        app.base_scans
+            .insert(SITE.to_owned(), (with_doppler_half(), volume_time()));
+        let after = app.section_target_for_pane(0).expect("still aimed");
         assert_eq!(
-            sweeps_carrying(&scan, RadarProduct::Velocity),
-            0,
-            "the fixture's radials carry reflectivity alone"
+            before, after,
+            "the Doppler half changed no reflectivity rung, and the key moved \
+             anyway: that is a byte-identical re-cut per split cut per volume"
         );
-        // A Level III product has no Level II moment behind it at all. Zero is
-        // the honest answer and it costs nothing: nothing about those products
-        // is samplable either.
-        assert_eq!(sweeps_carrying(&scan, RadarProduct::EchoTops), 0);
+
+        // The same seal is a real change for velocity — the moment it carries
+        // — and the key must move there, or the skip is a freeze.
+        app.gui.pane_mut(0).unwrap().selected_product = RadarProduct::Velocity;
+        let vel_after = app.section_target_for_pane(0).expect("aimed at velocity");
+        app.base_scans
+            .insert(SITE.to_owned(), (surveillance_only(), volume_time()));
+        let vel_before = app.section_target_for_pane(0).expect("still aimed");
+        assert_ne!(
+            vel_before.ladder, vel_after.ladder,
+            "velocity gained its first rung from that seal and the key never \
+             noticed"
+        );
+    }
+
+    /// One half of a split cut: the surveillance pass carries reflectivity
+    /// alone, the Doppler pass carries reflectivity's short-range copy plus
+    /// velocity — the shape whose seal used to force the byte-identical
+    /// re-cut.
+    fn split_half(elevation_number: u8, doppler: bool) -> Sweep {
+        let moment = || MomentData::from_fixed_point(1, 0, 250, 8, 2.0, 66.0, vec![32]);
+        let radial = Radial::new(
+            1_760_000_000_000 + i64::from(elevation_number) * 1000,
+            0,
+            0.0,
+            1.0,
+            RadialStatus::ElevationStart,
+            elevation_number,
+            0.5,
+            Some(moment()),
+            doppler.then(moment),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Sweep::new(elevation_number, vec![radial])
     }
 }

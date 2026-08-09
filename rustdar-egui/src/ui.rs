@@ -3793,7 +3793,7 @@ mod pane_slice_tests {
                 },
                 product: RadarProduct::Reflectivity,
                 line: other_line(),
-                sweeps: 9,
+                ladder: 9,
             });
             section.section = Some(std::sync::Arc::new(blank_section()));
             // And the raster, which needs a `Context` and is the reason the

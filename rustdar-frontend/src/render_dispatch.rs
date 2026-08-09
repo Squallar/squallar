@@ -400,15 +400,15 @@ pub struct RenderDispatcher {
 /// it to a velocity section would produce a picture of an empty ladder rather
 /// than an error.
 ///
-/// The sweep count is part of the key for the reason
-/// [`SectionTarget::sweeps`](rustdar_egui::pane::SectionTarget) exists: on the
-/// live chunk feed the volume time is frozen for the whole volume while the
-/// `Scan` grows sweep by sweep, so `(site, collected, product)` alone would hand
-/// a payload extracted from a one-sweep volume back to a cut of the same volume
-/// eight sweeps later. It is also why the discriminator is a *sweep count* and
-/// not a chunk counter: it is bounded by the ~14–23 sweeps of a volume rather
-/// than by its ~100 chunks, which is what keeps the 15.6 MB walk the field above
-/// exists to avoid down to a handful of times a volume.
+/// The ladder fingerprint is part of the key for the reason
+/// [`SectionTarget::ladder`](rustdar_egui::pane::SectionTarget) exists: on the
+/// live feed the volume time is frozen for the whole volume while the merged
+/// volume refreshes sweep by sweep, so `(site, collected, product)` alone
+/// would hand a payload extracted before a seal back to a cut dispatched
+/// after it. And because the fingerprint moves only when a rung's chosen
+/// sweep or the declared pattern changes, the walk this cache exists to avoid
+/// runs only when the picture will actually differ — a Doppler-half seal no
+/// longer invalidates a reflectivity payload it never changed.
 struct SectionInput {
     key: SectionInputKey,
     /// `Arc` so the cache and the job in flight can hold it at once; the job
@@ -430,9 +430,9 @@ struct SectionInputKey {
     site: String,
     collected: chrono::NaiveDateTime,
     product: RadarProduct,
-    /// How many sweeps of the volume this was extracted from carried the
-    /// product's moment — exactly the set `extract_volume` copied.
-    sweeps: usize,
+    /// The fingerprint of the ladder this payload was extracted under —
+    /// exactly the choices `extract_volume_parts` copied.
+    ladder: u64,
 }
 
 impl SectionInputKey {
@@ -442,7 +442,7 @@ impl SectionInputKey {
             site: target.volume.site.clone(),
             collected: target.volume.collected,
             product: target.product,
-            sweeps: target.sweeps,
+            ladder: target.ladder,
         }
     }
 }
@@ -1111,16 +1111,17 @@ impl RenderDispatcher {
     ///
     /// The volume payload is taken from
     /// [`section_input`](Self::section_input) when it is for this volume, moment
-    /// and site, and extracted (and cached) when it is not. See that field for
-    /// what the walk costs and why one entry is the right size.
+    /// and ladder, and produced by `extract` — the caller's walk over the
+    /// merged current volume — when it is not. See that field for what the
+    /// walk costs and why one entry is the right size; taking a closure
+    /// rather than a `&Scan` is what lets the walk read a volume that is not
+    /// one `Scan` without this module holding the app's scan state.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_section_render(
         &mut self,
         pane_idx: usize,
         target: &rustdar_egui::pane::SectionTarget,
-        data: &nexrad_model::data::Scan,
-        lat: f64,
-        lon: f64,
+        extract: impl FnOnce() -> Option<rustdar_radar::render_input::RenderInput>,
         sender: std::sync::mpsc::Sender<crate::channels::SectionResponse>,
         window: Option<WindowRef>,
     ) -> bool {
@@ -1146,9 +1147,7 @@ impl RenderDispatcher {
             .as_ref()
             .is_some_and(|cached| cached.key == wanted_key);
         if !reusable {
-            let Some(input) =
-                rustdar_radar::render_input::RenderInput::extract_volume(data, product, lat, lon)
-            else {
+            let Some(input) = extract() else {
                 // No sweep carries this moment. Not an error and not a job: the
                 // caller has taken no budget slot and marked nothing in flight,
                 // so there is nothing to unwind — unlike `spawn_level2_render`,
@@ -2864,7 +2863,7 @@ mod section_payload_cache_tests {
             .unwrap()
     }
 
-    fn target(site: &str, minute: u32, product: RadarProduct, sweeps: usize) -> SectionTarget {
+    fn target(site: &str, minute: u32, product: RadarProduct, ladder: u64) -> SectionTarget {
         SectionTarget {
             volume: VolumeStamp {
                 site: site.to_owned(),
@@ -2882,7 +2881,7 @@ mod section_payload_cache_tests {
                 },
             )
             .expect("a valid line"),
-            sweeps,
+            ladder,
         }
     }
 
@@ -2918,9 +2917,9 @@ mod section_payload_cache_tests {
     }
 
     /// Every input the payload *does* depend on invalidates it, including the
-    /// sweep count — which on the live chunk feed is the only one that moves.
+    /// ladder fingerprint — which on the live feed is the only one that moves.
     #[test]
-    fn a_payload_is_not_reused_across_volume_site_moment_or_sweep_count() {
+    fn a_payload_is_not_reused_across_volume_site_moment_or_ladder() {
         let base = target("KTLX", 30, RadarProduct::Reflectivity, 9);
         let key = SectionInputKey::of(&base);
 
@@ -2939,7 +2938,7 @@ mod section_payload_cache_tests {
             ),
             (
                 target("KTLX", 30, RadarProduct::Reflectivity, 1),
-                "the live-feed case: the same volume, eight sweeps ago",
+                "the live-feed case: the same volume, one rung-choice ago",
             ),
         ] {
             assert_ne!(SectionInputKey::of(&other), key, "{why}");

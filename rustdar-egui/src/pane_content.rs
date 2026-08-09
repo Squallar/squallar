@@ -375,42 +375,42 @@ pub struct VolumeStamp {
 /// against a map pane full of echo, and only the tilt-curve refusal made it
 /// visible at all.
 ///
-/// [`sweeps`](Self::sweeps) is the missing input: how many sweeps of the volume
-/// carried this moment when the cut was dispatched. It is counted **off the
-/// `Scan` the cut is made from**, and that is the load-bearing part of the
-/// choice rather than an implementation detail.
-///
-/// The obvious alternative — the number of distinct elevation angles the UI
-/// knows about, from `ScanInfo::product_elevations` — was tried first and is
-/// **wrong, for a reason that only shows up on the second volume of a session**.
-/// `Gui::apply_chunk_scan_info` *merges* angles into the pane's existing set and
-/// never removes one, and the set is only replaced wholesale when a volume
-/// completes. So after the first complete volume the pane already knows all
-/// fourteen of the VCP's angles, the next volume's chunks add nothing new to it,
-/// and the count is a constant for the rest of the session — reproducing the
-/// exact bug it was meant to fix, one volume later. Verified live: it grew
-/// 1 → 2 → 3 on a cold start and then sat at 16 for every volume after.
-///
-/// A sweep count off the `Scan` has none of that. It resets with the volume
-/// because the `Scan` does, and it moves for every kind of growth a section can
-/// show:
+/// [`ladder`](Self::ladder) is the missing input: the fingerprint of the tilt
+/// ladder the cut would be made from — which sweep every rung takes, under
+/// which declared pattern (`rustdar_radar::sampler::ladder_fingerprint`,
+/// computed by the App over the merged current volume). It moves for every
+/// kind of growth a section can show:
 ///
 /// * **A new elevation**, which adds a rung to the ladder.
-/// * **A SAILS repeat of an angle already in the ladder**, which does not add a
-///   rung but does change which sweep that rung is *made of* —
-///   `VolumeSampler::build` chooses newest-first — and that rung is the lowest
-///   one, which is the part of a severe-weather section most worth being current.
+/// * **A SAILS repeat of an angle already in the ladder**, which does not add
+///   a rung but does change which sweep that rung is *made of* — the sampler
+///   chooses newest-first — and that rung is the lowest one, which is the part
+///   of a severe-weather section most worth being current.
+/// * **A sealed sweep replacing the base volume's copy of its cut** on the
+///   merged substrate, which is the ordinary way every rung refreshes.
 ///
-/// It is bounded by the sweeps in a volume (~14–23), not by chunks (~100), which
-/// is what keeps `RenderDispatcher::section_input` from re-extracting the ~15 MB
-/// volume payload every few seconds. And it counts only the sweeps carrying
-/// *this* moment — precisely the set `RenderInput::extract_volume` copies — so
-/// the key and the payload cannot describe different things.
+/// And — as load-bearing as the moving — it *holds still* when the picture
+/// would not change. The key this replaces was a count of sweeps carrying the
+/// moment, and a split cut's Doppler half carries a short-range reflectivity
+/// copy: its seal moved the count while the surveillance preference kept every
+/// chosen rung exactly where it was, so ~6 of the 18–23 re-cuts per VCP-212
+/// volume produced byte-identical pictures. A fingerprint of the *choices*
+/// cannot be moved by a seal that changes no choice.
+///
+/// The obvious alternative — the number of distinct elevation angles the UI
+/// knows about, from `ScanInfo::product_elevations` — was tried before either
+/// and is **wrong, for a reason that only shows up on the second volume of a
+/// session**: `Gui::apply_chunk_scan_info` merges angles and never removes
+/// one, so after the first complete volume the count is a constant for the
+/// rest of the session. Verified live: it grew 1 → 2 → 3 on a cold start and
+/// then sat at 16 for every volume after. The fingerprint is computed off the
+/// same resolved volume the payload is extracted from, so the key and the
+/// payload cannot describe different things.
 ///
 /// It is deliberately **not** on [`VolumeStamp`], which [`VolumeTarget`] also
-/// uses: a 3D volume grid must be built from a complete volume and must not
-/// rebuild mid-flight, so widening the shared stamp would have paid for this fix
-/// with a 155 ms voxel rebuild per sweep.
+/// uses: the 3D pane keys its rebuilds on the published stamp's newest-data
+/// time, and widening the shared stamp with a per-moment ladder key would
+/// re-cut every product's section when any one moment's ladder moved.
 ///
 /// `PartialEq` is derived, floats and all, and that is deliberate: this compares
 /// a stored key against a stored key, never against a re-derived value, so
@@ -426,11 +426,12 @@ pub struct SectionTarget {
     /// structure to slice — so this is narrower than the pane's product picker.
     pub product: RadarProduct,
     pub line: SectionLine,
-    /// How many sweeps of the volume carried this moment when the cut was
-    /// dispatched. See the type's docs: this is what makes a live volume that is
-    /// still filling re-cut as it fills, and why it is counted off the `Scan`
-    /// rather than off the pane's accumulated `ScanInfo`.
-    pub sweeps: usize,
+    /// The fingerprint of the tilt ladder this cut would be made from, at
+    /// dispatch. See the type's docs: this is what makes a live volume re-cut
+    /// exactly when a rung's chosen sweep or the declared pattern changes,
+    /// and not on the seals that change neither. `0` when no ladder resolves
+    /// at all — its own honest value of the key.
+    pub ladder: u64,
 }
 
 /// Why a section pane has no picture, when it has none.
@@ -479,7 +480,14 @@ impl SectionUnavailable {
     /// in the UI.
     pub fn message(self) -> String {
         match self {
-            Self::AwaitingVolume => "Waiting for this site's volume".to_owned(),
+            // The cold-start window: a site switch fires the archive fetch
+            // immediately, so the first volume is already on its way — and
+            // once any volume has landed, a section cuts instantly from the
+            // merged current volume and this state is never seen again.
+            Self::AwaitingVolume => {
+                "Downloading this site's first volume — the section appears the moment it lands"
+                    .to_owned()
+            }
             Self::AwaitingCoveragePattern => {
                 "This volume was joined mid-scan and its coverage pattern has not arrived yet, \
                  so there is no tilt ladder to cut along. It will appear on the next volume."
@@ -1278,7 +1286,7 @@ mod tests {
             },
             product: RadarProduct::Reflectivity,
             line,
-            sweeps: 11,
+            ladder: 11,
         };
         let mut content = PaneContent::CrossSection(Box::new(CrossSectionPane {
             line: Some(line),
@@ -1362,14 +1370,14 @@ mod tests {
                 .and_hms_opt(18, minute, 0)
                 .unwrap()
         };
-        let target = |site: &str, minute: u32, sweeps: usize| SectionTarget {
+        let target = |site: &str, minute: u32, ladder: u64| SectionTarget {
             volume: VolumeStamp {
                 site: site.to_owned(),
                 collected: at(minute),
             },
             product: RadarProduct::Reflectivity,
             line,
-            sweeps,
+            ladder,
         };
 
         assert_eq!(target("KTLX", 30, 9), target("KTLX", 30, 9));
@@ -1383,15 +1391,16 @@ mod tests {
             target("KOUN", 30, 9),
             "the same volume time at another site is a different picture"
         );
-        // The live-feed arm, and the reason `sweeps` is in the key at all. The
-        // volume time here is *identical* — it is the first sweep's, and on the
-        // chunk feed that is frozen for five to six minutes while the volume
-        // fills underneath it. Without the sweep count these two keys are equal
-        // and the section cut from the first chunk stands for the whole volume.
+        // The live-feed arm, and the reason `ladder` is in the key at all.
+        // The volume time here is *identical* — it is the first sweep's, and
+        // on the feed that is frozen for five to six minutes while the merged
+        // ladder refreshes underneath it. Without the ladder fingerprint
+        // these two keys are equal and the section cut from the first chunk
+        // stands for the whole volume.
         assert_ne!(
             target("KTLX", 30, 1),
             target("KTLX", 30, 9),
-            "the same volume with eight more sweeps in it is a different section"
+            "the same volume under a changed ladder is a different section"
         );
     }
 

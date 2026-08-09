@@ -1078,6 +1078,21 @@ impl App {
         )
     }
 
+    /// The re-cut key for `site`'s current merged volume under `product` —
+    /// [`rustdar_radar::sampler::ladder_fingerprint`] over the same resolve
+    /// the section payload is extracted from, so the key and the cut cannot
+    /// describe different volumes.
+    pub(crate) fn current_ladder_fingerprint(
+        &mut self,
+        site: &str,
+        product: rustdar_radar::types::RadarProduct,
+    ) -> Option<u64> {
+        let base = self.base_scans.get(site).map(|(scan, _)| Arc::clone(scan));
+        let overlay = self.chunk_feeds.snapshot(site);
+        rustdar_radar::current::resolve(base.as_deref(), overlay.as_deref())?
+            .ladder_fingerprint(product)
+    }
+
     /// The stamp of `site`'s current merged volume: the newest data time (its
     /// identity, advanced by every sealed sweep) and the base volume's start
     /// where one contributes.
