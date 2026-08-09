@@ -398,12 +398,20 @@ impl VolumeStore {
         // it**: `share` and `begin_build` shed the pane's out-of-scope
         // entries before this can run, so under the public API there is never
         // an out-of-scope grid attached to fall back to — mutation testing
-        // confirmed removing the clause changes nothing observable. It stays
-        // because the two guards protect different things (`shed` bounds
-        // memory, this bounds what is *painted*), and a future caller that
-        // attaches without shedding would otherwise paint another site's
-        // storm under this pane's caption — the one lie the swap must never
-        // tell, recorded here rather than left as an unexplained survivor.
+        // confirmed removing *this clause alone* changes nothing observable.
+        // The scope decision itself is load-bearing one layer down, in
+        // `shed`'s `keep_old` arm, and that layer is what
+        // `an_out_of_scope_grid_never_stands_in` pins — against a held
+        // `Ready` grid, the one shape that can ever stand in. (An earlier
+        // note here implied the shed layer was already covered; it was not:
+        // with the pin's held entry a `Refused` stub, the `Ready`-match
+        // refused it before any scope decision, and a `same_scope` answering
+        // always-true survived the whole suite.) The clause stays because the
+        // two guards protect different things (`shed` bounds memory, this
+        // bounds what is *painted*), and a future caller that attaches
+        // without shedding would otherwise paint another site's storm under
+        // this pane's caption — the one lie the swap must never tell,
+        // recorded here rather than left as an unexplained survivor.
         inner
             .entries
             .iter()
@@ -1159,12 +1167,25 @@ mod tests {
     }
 
     /// The stand-in is scoped: a pane re-aimed at another **site, moment or
-    /// region** must not paint its old grid under the new target's caption.
+    /// region** must not paint its old grid under the new target's caption —
+    /// the one lie the swap must never tell: another site's storm under this
+    /// pane's caption.
+    ///
+    /// The held entry is a **`Ready` grid**, and that is what makes the pin
+    /// bite. Only a `Ready` entry can ever stand in — held as a `Refused`
+    /// stub, the fallback's own `Ready`-match refuses it before any scope
+    /// decision is reached, so a `same_scope` that answered always-true
+    /// survived the whole suite. The layer this actually exercises is
+    /// `begin_build`'s shed: `keep_old` keeps only same-scope resolved
+    /// entries, and a cross-scope `Ready` hold is exactly the case that
+    /// reaches that clause.
     #[test]
     fn an_out_of_scope_grid_never_stands_in() {
         let store = VolumeStore::new();
         let refl = target(RadarProduct::Reflectivity, 0);
-        build(&store, 0, &refl, "reflectivity");
+        assert!(!store.share(0, &refl), "the first ask owns the dispatch");
+        store.begin_build(0, &refl);
+        assert!(store.complete(&refl, ready_grid()));
 
         let velocity = target(RadarProduct::Velocity, 0);
         assert!(!store.share(0, &velocity));
