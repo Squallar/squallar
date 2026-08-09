@@ -627,16 +627,8 @@ fn draw_region_hint(
     let Some(rect) = region_screen_rect(projector, drag.centre(), drag.half_width_km()) else {
         return;
     };
-    // Through `VolumeRegion`, so the figures shown are the ones that will be
-    // resampled: it clamps the half-width to the resampler's range, and a hint
-    // reading 4 km over a box that would become 10 km is a hint that lies.
-    let Some(region) = crate::pane::VolumeRegion::new(drag.centre(), drag.half_width_km()) else {
+    let Some(text) = region_hint_text(drag.centre(), drag.half_width_km()) else {
         return;
-    };
-    let cells = rustdar_radar::voxel::default_shape().nx;
-    let text = match region.resolution_km(cells) {
-        Some(km) => format!("{:.0} km · {km:.2} km/cell", 2.0 * region.half_width_km()),
-        None => format!("{:.0} km", 2.0 * region.half_width_km()),
     };
     let galley = ui.painter().layout_no_wrap(
         text,
@@ -651,6 +643,24 @@ fn draw_region_hint(
     );
     ui.painter()
         .galley(origin, galley, egui::Color32::PLACEHOLDER);
+}
+
+/// The hint's text for a drag standing at `half_width_km` about `centre`, or
+/// `None` off Earth, where there is no box to describe.
+///
+/// Through `VolumeRegion`, so the figures shown are the ones that will be
+/// resampled: it clamps the half-width to the resampler's range, and a hint
+/// reading 4 km over a box that would become 10 km is a hint that lies.
+/// `RegionDrag::extend_to` caps the drag at the same ceiling, so today the two
+/// agree before this runs — but the hint's honesty is this routing, not that
+/// cap, and it is what the test on this function pins.
+fn region_hint_text(centre: crate::pane::GeoPoint, half_width_km: f64) -> Option<String> {
+    let region = crate::pane::VolumeRegion::new(centre, half_width_km)?;
+    let cells = rustdar_radar::voxel::default_shape().nx;
+    Some(match region.resolution_km(cells) {
+        Some(km) => format!("{:.0} km · {km:.2} km/cell", 2.0 * region.half_width_km()),
+        None => format!("{:.0} km", 2.0 * region.half_width_km()),
+    })
 }
 
 /// Render the radar image overlay, range ring, and hover tooltip (loop playback path) (loop playback path).
@@ -1913,5 +1923,36 @@ mod tests {
         assert_eq!(short_tick(4.0), "4");
         assert_eq!(short_tick(0.25), "0.2");
         assert_eq!(short_tick(-1.5), "-1.5");
+    }
+
+    /// The drag hint prints the box that will commit, not the raw drag.
+    ///
+    /// Fed a half-width far past the resampler's maximum — the raw value a
+    /// long drag would carry if `RegionDrag::extend_to`'s cap were ever lost —
+    /// the hint must read the clamped 460 km, because that is the box
+    /// `VolumeRegion::new` will commit. A hint formatted from its raw input
+    /// would read 800 km over a square that resamples 460, with a per-cell
+    /// figure flattered by the same ratio: the number the region drag exists
+    /// to show, wrong exactly when the user is at the control's stop.
+    #[test]
+    fn the_drag_hint_reads_the_clamped_width_past_the_cap() {
+        let centre = crate::pane::GeoPoint {
+            lat: 35.3,
+            lon: -97.3,
+        };
+        let max = rustdar_radar::voxel::MAX_HALF_WIDTH_KM;
+        let cells = rustdar_radar::voxel::default_shape().nx;
+        let text = region_hint_text(centre, 400.0).expect("a hint for a point on Earth");
+        assert_eq!(
+            text,
+            format!(
+                "{:.0} km · {:.2} km/cell",
+                2.0 * max,
+                2.0 * max / cells as f64,
+            ),
+            "a 400 km half-width drag must be shown as the {:.0} km box it \
+             commits, not the 800 km it painted",
+            2.0 * max,
+        );
     }
 }

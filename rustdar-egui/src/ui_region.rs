@@ -28,6 +28,12 @@
 //!   while armed should cost nothing, least of all the mode the user just turned
 //!   on. The bar is the resampler's own [`MIN_HALF_WIDTH_KM`], so the only
 //!   regions that commit are ones that will be honoured rather than clamped.
+//! * **The preview stops growing at the resampler's maximum.** The commit goes
+//!   through [`VolumeRegion::new`], which clamps the half-width to 230 km — so
+//!   an uncapped preview past that point would paint an ever-bigger square and
+//!   release the same box every time. [`RegionDrag::extend_to`] caps the drag at
+//!   the same constant, so what is drawn is what is resampled at both ends: too
+//!   big stops live under the pointer, too small is refused on release.
 //! * **The commit is applied after the pane loop.** [`PendingRegion`] is a
 //!   record, not an edit. Applying it inside the loop could grow `pane_count`
 //!   mid-frame, which changes `pane_rect` for every pane not yet drawn and
@@ -70,8 +76,10 @@ pub(crate) struct RegionDrag {
     pane_idx: usize,
     /// The box's centre, fixed on the press frame and never revised.
     centre: GeoPoint,
-    /// Half-width in kilometres as the pointer currently stands, before the
-    /// resampler's clamp. Zero until the pointer moves.
+    /// Half-width in kilometres as the pointer currently stands. Capped at the
+    /// resampler's maximum on the way in — see [`Self::extend_to`] — but *not*
+    /// held up to its minimum: a too-small drag is refused whole at commit
+    /// rather than resized. Zero until the pointer moves.
     half_width_km: f64,
 }
 
@@ -117,6 +125,16 @@ impl RegionDrag {
     /// the same refusal [`Self::begin`] makes, and it matters more here: this runs
     /// every frame, so a single laundered NaN would stick for the rest of the
     /// drag.
+    ///
+    /// **The result is capped at the resampler's maximum** —
+    /// [`MAX_HALF_WIDTH_KM`](rustdar_radar::voxel::MAX_HALF_WIDTH_KM), the same
+    /// ceiling [`VolumeRegion::new`] clamps to on commit. The preview box and its
+    /// hint read this value straight off the drag, so without the cap a long drag
+    /// would paint an ever-bigger square past 230 km and release the same box
+    /// every time — what is drawn has to be what is resampled. The *minimum* is
+    /// deliberately not applied here: a too-small drag is refused whole by
+    /// [`Self::commit`] rather than resized, so the preview honestly shows the
+    /// too-small square that is about to be discarded.
     pub(crate) fn extend_to(&mut self, corner: GeoPoint) {
         if !corner.is_on_earth() {
             return;
@@ -132,7 +150,7 @@ impl RegionDrag {
         let north = (range_km * bearing.cos()).abs();
         let half = east.max(north);
         if half.is_finite() {
-            self.half_width_km = half;
+            self.half_width_km = half.min(rustdar_radar::voxel::MAX_HALF_WIDTH_KM);
         }
     }
 
@@ -363,6 +381,51 @@ mod tests {
         );
     }
 
+    /// A drag past the resampler's maximum previews the box it will commit.
+    ///
+    /// The commit has always gone through `VolumeRegion::new`, which clamps the
+    /// half-width to [`rustdar_radar::voxel::MAX_HALF_WIDTH_KM`] — so an
+    /// uncapped drag would keep painting a bigger and bigger square past
+    /// ~230 km while releasing the same box every time. The preview reads
+    /// `half_width_km` straight off this struct, so the cap has to live in
+    /// `extend_to` for what is drawn to be what is resampled.
+    ///
+    /// The corner is ~300 km out — nowhere near the clamp value itself — so a
+    /// regression cannot pass by the chosen point coinciding with the cap.
+    #[test]
+    fn a_drag_past_the_resamplers_maximum_previews_the_box_it_commits() {
+        let centre = point(35.0, -97.0);
+        let max = rustdar_radar::voxel::MAX_HALF_WIDTH_KM;
+        let mut drag = RegionDrag::begin(0, centre).expect("a point on Earth");
+        drag.extend_to(point(centre.lat + 300.0 / KM_PER_DEGREE_LAT, centre.lon));
+        assert_eq!(
+            drag.half_width_km(),
+            max,
+            "a ~300 km drag must preview the {max} km box it will commit",
+        );
+        // Still at the stop further out: the control is wound to its end.
+        drag.extend_to(point(centre.lat + 400.0 / KM_PER_DEGREE_LAT, centre.lon));
+        assert_eq!(drag.half_width_km(), max, "the stop must hold further out");
+        // And what was previewed is exactly what commits.
+        assert_eq!(
+            drag.commit()
+                .expect("a maximal drag commits")
+                .half_width_km(),
+            max,
+            "the previewed box and the committed box must be the same box",
+        );
+        // A stop, not a ratchet: a pointer that comes back inside shrinks the
+        // box again.
+        let mut back = RegionDrag::begin(0, centre).expect("a point on Earth");
+        back.extend_to(point(centre.lat + 300.0 / KM_PER_DEGREE_LAT, centre.lon));
+        back.extend_to(point(centre.lat + 100.0 / KM_PER_DEGREE_LAT, centre.lon));
+        assert!(
+            (back.half_width_km() - 100.0).abs() < 1.0,
+            "the cap must not hold a drag that came back inside: {}",
+            back.half_width_km(),
+        );
+    }
+
     /// A press that never moves commits nothing — the mis-click case.
     #[test]
     fn a_press_with_no_drag_commits_nothing() {
@@ -406,8 +469,9 @@ mod tests {
         // Finite and nonsense, which an `is_finite` check alone would let
         // straight through: `lat: 1e9` walks a perfectly well-defined great
         // circle over nowhere and would set a half-width of millions of
-        // kilometres, clamped on commit to the 230 km maximum. The user would
-        // drag two centimetres and get the whole surveillance range.
+        // kilometres — capped by `extend_to` to the 230 km maximum. The user
+        // would drag two centimetres, watch the whole surveillance range light
+        // up, and release a box nobody asked for.
         drag.extend_to(point(1e9, -97.3));
         assert_eq!(
             drag.half_width_km(),
