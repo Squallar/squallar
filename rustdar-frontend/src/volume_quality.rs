@@ -33,6 +33,24 @@
 //! rung in from the start is the reason the raymarch is offscreen at all: a
 //! callback inside egui's own pass has no way to drop quality for a frame.
 //!
+//! # Re-measured after the voxel-locked march (2026-08-09)
+//!
+//! The march now steps one cell along the ray (up to ~2.7x the samples of the
+//! 96-step version it replaced, jittered, breaking at the box exit) and the
+//! bridge anchors the empty-skip at the palette's fade boundary. Measured on
+//! the same RTX 3090 over a dense real volume — KCRP 2017-08-26 (Harvey),
+//! 52.1% of cells occupied, `tests/volume_march_cost.rs`:
+//!
+//! | offscreen   | shaded, before -> after | unshaded, before -> after |
+//! |-------------|------------------------:|--------------------------:|
+//! | 1440 x 900  |     0.549 -> 0.454 ms   |        0.214 -> 0.250 ms  |
+//! | 720 x 450   |     0.215 -> 0.169 ms   |        0.079 -> 0.103 ms  |
+//!
+//! Shaded got *cheaper*: the fade-anchored skip stops paying seven fetches
+//! per step inside the sub-visible shell, which outweighs the extra steps.
+//! Unshaded paid the steps (+17-30%). Both remain far inside the frame at
+//! every rung, and the ladder's two levers are unchanged.
+//!
 //! # Why the selection is a pure function of two arguments
 //!
 //! `select` takes both the device class *and* the platform ceiling rather than

@@ -15,7 +15,7 @@
 //   * `textureSampleLevel` everywhere. The march breaks on a data-dependent
 //     condition, and implicit-LOD sampling under non-uniform control flow is a
 //     hard validator failure on every target.
-//   * `RAYMARCH_STEPS` is a `const` so it folds to a literal in the loop.
+//   * `RAYMARCH_STEP_CEILING` is a `const` so it folds to a literal in the loop.
 //   * one sampler per texture per pipeline.
 //   * `textureNumLevels` appears nowhere; it is gated on GLSL core 130 with no
 //     ES version at all, so it is unreachable on WebGL2 forever.
@@ -54,7 +54,7 @@ struct Volume {
     // x: extinction per kilometre at LUT alpha 1.
     // y: the palette index at or below which a cell contributes nothing.
     // z: the transmittance at which the march stops early.
-    // w: reserved, zero.
+    // w: the opacity ramp's width above y, in 0-1 index units; 0 is hard.
     transfer: vec4<f32>,
     // x: 1 to shade with the gradient, 0 to skip it. y, z, w: reserved, zero.
     flags: vec4<f32>,
@@ -102,17 +102,34 @@ fn gamma_from_linear_rgb(rgb: vec3<f32>) -> vec3<f32> {
 // The raymarch
 // ---------------------------------------------------------------------------
 
-// Samples along the ray, per pixel.
+// The most samples one ray may take, whatever the step length works out to.
 //
 // A `const` rather than a uniform, so the loop bound is a compile-time constant
-// an ES 300 driver can unroll. naga emits it as `const int RAYMARCH_STEPS = 96;`
-// and folds it where a conversion forces the issue — `f32(RAYMARCH_STEPS)`
-// becomes `96.0`. A uniform bound would compile, look identical, and hide the
-// march's cost from the driver on the target where fill rate is the whole risk.
+// — naga emits it as `const int RAYMARCH_STEP_CEILING = 512;` and folds it
+// where a conversion forces the issue. A uniform bound would compile, look
+// identical, and hide the march's cost from the driver on the target where
+// fill rate is the whole risk.
 //
-// Not a degrade rung: step count is dead linear in cost, and the two rungs that
-// buy anything are resolution (3.4x for a quarter of the pixels) and shading.
-const RAYMARCH_STEPS: i32 = 96;
+// It is a **ceiling**, not the step count: the step length is derived from the
+// voxel size below, the loop breaks at the box exit, and the ceiling only
+// matters if a grid ever outgrows it — the desktop 256 x 256 x 128 grid's
+// longest diagonal is 384 cells, under it. When a grid does outgrow it, the
+// `dt` floor in `fs_raymarch` stretches the steps to cover the span rather
+// than truncating the far side of the volume.
+const RAYMARCH_STEP_CEILING: i32 = 512;
+
+// Cells one step advances along the ray, measured in the grid's own
+// (anisotropic) cell metric.
+//
+// 1.0 is the sampling rate the data supports: the linear filter band-limits
+// the field to about one cell, so one sample per cell — decorrelated between
+// neighbouring pixels by the jitter below — resolves everything the grid
+// holds. The 96-step march this replaced took one sample per ~2.7 cells on a
+// horizontal ray and per ~15 z-cells on the shipped grid, and every surface it
+// drew carried the quantisation as terracing that crawled under camera motion
+// (measured: banding phase-locked to the screen within 2 px while the volume
+// moved 17-45 px, recording of 2026-08-09).
+const STEP_CELLS: f32 = 1.0;
 
 // Entries in the colour table. Must equal `constants::VOLUME_LUT_BYTES / 4`;
 // `the_shader_and_the_lut_constant_agree` pins that.
@@ -183,6 +200,25 @@ fn grid_at(p: vec3<f32>) -> f32 {
     return textureSampleLevel(grid_texture, grid_sampler, p, 0.0).r;
 }
 
+// Deterministic per-pixel jitter in [0, 1): Jimenez's interleaved gradient
+// noise over the fragment's framebuffer coordinate.
+//
+// The march's sample comb is offset by this fraction of a step, per pixel.
+// Without it the comb is phase-locked to the eye, and every iso-`t` shell
+// draws a contour that stays put in screen space while the volume slides
+// beneath it — the "slithering" the 2026-08-09 recording shows. The jitter
+// trades that coherent crawling for fine noise that is **static**: the hash
+// reads nothing but the pixel coordinate, so it must never be given a time
+// term — animated jitter is shimmer, which is the same artifact at one remove.
+//
+// This polynomial rather than a sin-based hash because `sin` at large
+// arguments is where mobile GLES precision goes to die; fract/dot/multiply
+// stay exact in f32 at these magnitudes.
+fn interleaved_gradient_noise(px: vec2<f32>) -> f32 {
+    let magic = vec3<f32>(0.06711056, 0.00583715, 52.9829189);
+    return fract(magic.z * fract(dot(px, magic.xy)));
+}
+
 // Diffuse shading from the central-difference gradient, in 0..1.
 //
 // Six extra fetches against the march's one, which measured 2.4x on an RTX 3090
@@ -216,19 +252,39 @@ fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
 
-    let dt = (span.y - span.x) / f32(RAYMARCH_STEPS);
+    // Cells this ray crosses per unit of `t`, in the grid's anisotropic cell
+    // metric — the same "direction inside the length" shape as
+    // `step_length_km`, for the same reason. The step is then STEP_CELLS cells
+    // *along the ray* whatever the direction: a vertical ray through the
+    // shipped grid takes ~128 samples and a horizontal one ~256, instead of
+    // both taking 96 samples of wildly different physical lengths.
+    //
+    // The floor on `dt` is the ceiling honoured from the other side: a grid
+    // whose chord exceeds RAYMARCH_STEP_CEILING cells gets the whole span in
+    // ceiling-many stretched steps rather than a volume truncated mid-box.
+    let cells_per_t = max(length(direction * volume.grid_dims.xyz), 1.0);
+    let dt = max(STEP_CELLS / cells_per_t, (span.y - span.x) / f32(RAYMARCH_STEP_CEILING));
     let segment_km = step_length_km(direction, dt);
     let shade = volume.flags.x > 0.5;
 
-    // Half a step in, so the samples are cell centres of the march rather than
-    // its fenceposts.
-    var t = span.x + 0.5 * dt;
+    // The sample comb starts a per-pixel fraction of a step past the entry —
+    // stratified sampling, with the stratum offset hashed from the pixel. The
+    // expected sample count over the jitter is exactly `span / dt`, so path
+    // integrals stay unbiased; what the jitter buys is that the residual
+    // quantisation is per-pixel noise instead of screen-space contours.
+    let jitter = interleaved_gradient_noise(in.clip_position.xy);
+    var t = span.x + jitter * dt;
     var transmittance = 1.0;
     // Premultiplied and LINEAR. The conversion to egui's gamma-space
     // premultiplied convention happens once, at the end.
     var accumulated = vec3<f32>(0.0, 0.0, 0.0);
 
-    for (var i: i32 = 0; i < RAYMARCH_STEPS; i = i + 1) {
+    for (var i: i32 = 0; i < RAYMARCH_STEP_CEILING; i = i + 1) {
+        // The step length is the voxel's, not the span's, so past the far face
+        // is a real state the loop reaches rather than one it rounds into.
+        if t >= span.y {
+            break;
+        }
         let p = eye + direction * t;
         let index = grid_at(p);
         if index > volume.transfer.y {
@@ -240,7 +296,24 @@ fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
             if shade {
                 colour = colour * shading(p);
             }
-            let absorbed = 1.0 - exp(-entry.a * volume.transfer.x * segment_km);
+            // The opacity ramp: 0 at the skip threshold, 1 at `transfer.w`
+            // index units above it, smoothstep between. It scales the optical
+            // depth rather than the accumulated alpha, so a saturating
+            // extinction still saturates — which is what keeps the mask
+            // harness's binary-alpha instrument meaningful.
+            //
+            // At `transfer.w = 0` (the uniform's default) the divisor's 1e-6
+            // floor makes the ramp reach 1 within a millionth of an index step
+            // of the threshold: the hard edge, to more precision than an
+            // R8Unorm fetch can express. The production bridge passes a real
+            // width, which is what dissolves the palette's alpha cliff into a
+            // fade — the hard shelf rims of the 2026-08-09 report — and it is
+            // a *render* of the same data, softened exactly at the boundary
+            // the palette already declares, never a reshaping of the field.
+            let rise = clamp((index - volume.transfer.y) / max(volume.transfer.w, 1e-6), 0.0, 1.0);
+            let opacity_ramp = rise * rise * (3.0 - 2.0 * rise);
+            let absorbed =
+                1.0 - exp(-entry.a * opacity_ramp * volume.transfer.x * segment_km);
             accumulated = accumulated + transmittance * absorbed * colour;
             transmittance = transmittance * (1.0 - absorbed);
             if transmittance < volume.transfer.z {

@@ -47,9 +47,16 @@
 //!    i.e. half a cell beyond the nominal cell face. Every comparison below is
 //!    therefore reported twice: against the exact planted surface, and against
 //!    that surface dilated by one cell along each axis.
-//! 2. **The fixed 96-step march.** `dt` is `(exit − entry)/96` in box units,
-//!    which on a 256-cell axis is three to four cells. Anything whose chord
-//!    along the ray is shorter than `dt` can be stepped over entirely.
+//! 2. **The jittered voxel-locked march.** `dt` is [`RAYMARCH_STEP_CELLS`]
+//!    cells along the ray (floored so [`RAYMARCH_STEP_CEILING`] steps always
+//!    span the box), and the comb starts a per-pixel hash fraction of a step
+//!    past the entry. A chord shorter than one step is therefore hit or
+//!    missed by the *pixel's own* jitter — at a silhouette tangent that is a
+//!    one-pixel-deep ring of coin flips on the analytic boundary itself,
+//!    measured below at 0.19% of a coarse-grid slab's mask and 0% of its
+//!    interior. (The fixed 96-step march this replaced missed whole *objects*
+//!    instead: a one-cell layer at 512 z-cells rendered 5.96% of its mask,
+//!    now 99.99%.)
 //!
 //! Both are measured here rather than corrected.
 #![cfg(not(target_arch = "wasm32"))]
@@ -59,7 +66,9 @@ use rustdar_egui::pane::OrbitCamera;
 use rustdar_egui::volume_view::view_for;
 use rustdar_frontend::constants::VOLUME_LUT_BYTES;
 use rustdar_frontend::egui_renderer::AttachmentConfig;
-use rustdar_frontend::volume::raymarch::VolumePipelines;
+use rustdar_frontend::volume::raymarch::{
+    RAYMARCH_STEP_CEILING, RAYMARCH_STEP_CELLS, VolumePipelines,
+};
 use rustdar_frontend::volume::uniform::VolumeUniform;
 
 // ---------------------------------------------------------------------------
@@ -340,6 +349,39 @@ fn ray_for_pixel(
     (eye, [d[0] / length, d[1] / length, d[2] / length])
 }
 
+/// The step the shader takes for this ray: [`RAYMARCH_STEP_CELLS`] cells along
+/// the ray in the grid's cell metric, floored so [`RAYMARCH_STEP_CEILING`]
+/// steps always cover the span. Mirrors `fs_raymarch` line for line.
+fn march_dt(direction: [f32; 3], cells: [u32; 3], span: f32) -> f32 {
+    let scaled = [
+        direction[0] * cells[0] as f32,
+        direction[1] * cells[1] as f32,
+        direction[2] * cells[2] as f32,
+    ];
+    let cells_per_t = (scaled[0] * scaled[0] + scaled[1] * scaled[1] + scaled[2] * scaled[2])
+        .sqrt()
+        .max(1.0);
+    (RAYMARCH_STEP_CELLS / cells_per_t).max(span / RAYMARCH_STEP_CEILING as f32)
+}
+
+/// The shader's per-pixel jitter, mirrored: Jimenez's interleaved gradient
+/// noise over the fragment's framebuffer coordinate (pixel centre, so +0.5).
+///
+/// Bitwise agreement with the GPU is *not* guaranteed — a driver may contract
+/// the multiplies into FMAs and land on the other side of a `fract` — so
+/// nothing below asserts through this to sub-step precision; it is for
+/// reporting where a pixel's first sample fell.
+///
+/// The literals are the shader's, character for character, which is the whole
+/// point of a mirror; clippy is right that f32 rounds the first one to
+/// 52.982918 either way, and textual identity with `volume.wgsl` wins.
+#[allow(clippy::excessive_precision)]
+fn ign(px: u32, py: u32) -> f32 {
+    let x = px as f32 + 0.5;
+    let y = py as f32 + 0.5;
+    (52.9829189f32 * (0.06711056f32 * x + 0.00583715f32 * y).fract()).fract()
+}
+
 /// Entry and exit parameters of an axis-aligned box, the shader's `slab_entry_exit`
 /// generalised off the unit cube. `exit <= entry` means a miss.
 fn slab(origin: [f32; 3], direction: [f32; 3], lo: [f32; 3], hi: [f32; 3]) -> (f32, f32) {
@@ -574,10 +616,13 @@ impl Metrics {
 
 /// The fraction of `expected` that `rendered` paints.
 ///
-/// The renderer may only ever *add* to a silhouette — the linear filter dilates
-/// and never erodes, and none of the objects here is thin enough for the march
-/// to step over — so this is the half of the comparison that has a hard answer
-/// rather than a tolerance.
+/// The renderer may only ever *add* to a silhouette's **interior** — the
+/// linear filter dilates and never erodes, and every chord through an interior
+/// pixel is longer than a march step. The boundary ring is the one exception:
+/// a *tangent* chord can be shorter than one step, and whether the jittered
+/// comb lands a sample in it is the pixel's own hash. So "covers the interior
+/// completely, and all but a fraction of a percent of the boundary" is the
+/// hard answer now, and the slab test asserts exactly that split.
 fn covered_fraction(rendered: &[bool], expected: &[bool]) -> f64 {
     let need = expected.iter().filter(|on| **on).count();
     let got = rendered
@@ -590,6 +635,25 @@ fn covered_fraction(rendered: &[bool], expected: &[bool]) -> f64 {
     } else {
         got as f64 / need as f64
     }
+}
+
+/// How far inside `expected` the deepest **lost** pixel sits, in Chebyshev
+/// pixels from `expected`'s boundary. Zero means every miss is on the boundary
+/// itself.
+///
+/// Only losses: overpaint is the linear filter's dilation and has its own
+/// bound (the two-cell envelope), while losses are the jittered march's — a
+/// tangent chord shorter than one step whose sample landed outside it — and
+/// those can reach exactly the boundary ring and no deeper.
+fn max_lost_distance(rendered: &[bool], expected: &[bool], size: [u32; 2]) -> f64 {
+    let distance = boundary_distance(expected, size);
+    let mut worst = 0.0f64;
+    for (at, (r, e)) in rendered.iter().zip(expected).enumerate() {
+        if *e && !*r {
+            worst = worst.max(f64::from(distance[at]));
+        }
+    }
+    worst
 }
 
 /// The fraction of `expected`'s area that `rendered` paints outside `outer`.
@@ -1048,10 +1112,27 @@ fn a_planted_slab_projects_to_its_exact_ray_cast_silhouette() {
                 100.0 * overflow_fraction(&rendered, &outer, &expected),
             );
 
+            // Coverage splits at the boundary now. A slab's extreme silhouette
+            // rows are rays whose chord through it is shorter than one march
+            // step, and whether the jittered comb samples inside that chord is
+            // the pixel's own hash — measured: the coarse grid loses 0.19% of
+            // this layer's mask, every lost pixel at Chebyshev distance 0 from
+            // the analytic boundary, and the fine grid 0.04%. The interior is
+            // still the hard claim: no *lost* pixel may sit deeper than the
+            // boundary ring. (Overpaint is the filter's dilation and keeps its
+            // own bound, the two-cell envelope below.)
             assert!(
-                covered_fraction(&rendered, &expected) > 0.999,
-                "{label} on {cells:?} lost {:.3}% of its analytic silhouette",
+                covered_fraction(&rendered, &expected) > 0.995,
+                "{label} on {cells:?} lost {:.3}% of its analytic silhouette, \
+                 more than the tangent ring can explain",
                 100.0 * (1.0 - covered_fraction(&rendered, &expected)),
+            );
+            assert!(
+                max_lost_distance(&rendered, &expected, size) <= 1.0,
+                "{label} on {cells:?} lost a pixel {:.1} px inside the analytic \
+                 mask; jitter can only reach the tangent ring, so anything \
+                 deeper means the geometry moved",
+                max_lost_distance(&rendered, &expected, size),
             );
             assert!(
                 overflow_fraction(&rendered, &outer, &expected) < 0.005,
@@ -1326,8 +1407,11 @@ fn the_silhouette_matches_the_rays_at_every_vertical_exaggeration() {
 /// kilometres from a box-space ray with the *unstretched* scale. That is the
 /// invariant, and it is what this measures: at each exaggeration the alpha at
 /// the silhouette centre is compared against `1 − exp(−A·σ·L)` where `L` is
-/// computed from the uniform's own ray and its own `box_size_km`. The 96 steps
-/// drop out exactly, because `(exp(−x/96))^96` is `exp(−x)`.
+/// computed from the uniform's own ray and its own `box_size_km`. The step
+/// count drops out in expectation: every sample's segment is `dt` and the
+/// jittered comb takes `span/dt` samples on average, so the summed optical
+/// depth telescopes to `σ·L` with a residual of at most one segment — under
+/// 0.004 of optical depth at this test's extinction.
 ///
 /// # What is *not* invariant, and why the obvious version of this test is wrong
 ///
@@ -1488,18 +1572,21 @@ fn the_linear_filter_bleeds_half_a_cell_past_a_sharp_top() {
             //
             // * the box's near face (`y = 0` for a camera due south), which is
             //   where the silhouette's top edge geometrically lies, and
-            // * the ray's **first sample**, half a march step further in, which
-            //   is the first place the shader can see anything at all.
+            // * the ray's **first sample**, this pixel's jitter fraction of a
+            //   step further in, which is the first place the shader can see
+            //   anything at all.
             //
             // The filter's threshold crossing is a statement about the second.
             // Reading the overshoot off the first would charge the filter for
-            // the march's half-step lead-in as well.
+            // the march's lead-in as well. The host `ign` may differ from the
+            // GPU's by an FMA rounding, so this is reporting, not an oracle.
             let places = |row: u32| {
                 let (origin, direction) = ray_for_pixel(&uniform, column, row, size);
                 let (entry, exit) = slab(origin, direction, [0.0; 3], [1.0; 3]);
                 let entry = entry.max(0.0);
+                let dt = march_dt(direction, cells, exit - entry);
                 let at = |t: f32| origin[2] + direction[2] * t;
-                (at(entry), at(entry + 0.5 * (exit - entry) / 96.0))
+                (at(entry), at(entry + ign(column, row) * dt))
             };
             let (face_z, first_z) = places(rendered_top);
             let at_face = f64::from(face_z - TOP);
@@ -1565,7 +1652,7 @@ fn the_linear_filter_bleeds_half_a_cell_past_a_sharp_top() {
         let (origin, direction) = ray_for_pixel(&uniform, column, top, size);
         let (entry, exit) = slab(origin, direction, [0.0; 3], [1.0; 3]);
         let entry = entry.max(0.0);
-        let t = entry + 0.5 * (exit - entry) / 96.0;
+        let t = entry + ign(column, top) * march_dt(direction, cells, exit - entry);
         let overshoot = f64::from(origin[2] + direction[2] * t - TOP);
         println!(
             "edge index {index:>3}: top row {top}, first-sample overshoot {:.3} cells \
@@ -1583,7 +1670,8 @@ fn the_linear_filter_bleeds_half_a_cell_past_a_sharp_top() {
         let (origin, direction) = ray_for_pixel(&uniform, column, row, size);
         let (entry, exit) = slab(origin, direction, [0.0; 3], [1.0; 3]);
         let entry = entry.max(0.0);
-        origin[2] + direction[2] * (entry + 0.5 * (exit - entry) / 96.0)
+        let dt = march_dt(direction, cells, exit - entry);
+        origin[2] + direction[2] * (entry + ign(column, row) * dt)
     };
     let per_row = f64::from((z_at(rows[0]) - z_at(rows[0] + 1)).abs());
     let faintest = rows[0];
@@ -1603,16 +1691,19 @@ fn the_linear_filter_bleeds_half_a_cell_past_a_sharp_top() {
     );
 }
 
-/// What the fixed 96-step march costs, as two measurements rather than an
+/// What the voxel-locked march resolves, as two measurements rather than an
 /// argument.
 ///
 /// # The step, stated in cells
 ///
-/// `dt` is `(exit − entry)/96` in box units, so on an `N`-cell axis a step is
-/// `N/96` cells when the ray crosses the cube once. At the desktop grid's 256
-/// that is between two and four cells depending on the obliquity, and anything
-/// whose chord along the ray is shorter than one step can be missed entirely.
-/// The figure is printed for every case below.
+/// `dt` is [`RAYMARCH_STEP_CELLS`] cells **along the ray** whatever the box or
+/// the camera, floored so [`RAYMARCH_STEP_CEILING`] steps always cover the
+/// span. The fixed 96-step march this replaced took `N/96` cells per step on
+/// an `N`-cell axis — two to four cells at the desktop grid — and anything
+/// whose chord was shorter than that could vanish. The figure is printed for
+/// every case below, and the depth sweep is where the difference is starkest:
+/// the 96-step march rendered **5.96%** of a one-cell layer at 512 z-cells
+/// and 3.02% at 1024; this march measures 99.99% and 99.83%.
 ///
 /// # Thin slabs
 ///
@@ -1621,8 +1712,8 @@ fn the_linear_filter_bleeds_half_a_cell_past_a_sharp_top() {
 /// slab a long chord and is the easy case; the dangerous one is looking
 /// straight down at it, where the chord is the thickness itself. Coverage is
 /// reported against the exact slab and against the one-cell dilation, because
-/// the filter widens a one-cell slab to roughly three and that is most of why
-/// it survives at all.
+/// the filter widens a one-cell slab to roughly three cells and the march
+/// samples every one of them.
 ///
 /// # Grid resolution
 ///
@@ -1633,12 +1724,12 @@ fn the_linear_filter_bleeds_half_a_cell_past_a_sharp_top() {
 ///
 /// ```text
 /// cargo test -p rustdar-frontend --test volume_silhouette \
-///     what_the_ninety_six_step_march_costs_a_thin_slab_and_a_fine_grid \
+///     what_the_voxel_locked_march_resolves_of_a_thin_slab_and_a_fine_grid \
 ///     -- --ignored --exact --nocapture
 /// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
-fn what_the_ninety_six_step_march_costs_a_thin_slab_and_a_fine_grid() {
+fn what_the_voxel_locked_march_resolves_of_a_thin_slab_and_a_fine_grid() {
     let _serialised = gpu_lock();
     let (device, queue) = device();
     let pipelines = VolumePipelines::new(&device, attachments());
@@ -1658,7 +1749,7 @@ fn what_the_ninety_six_step_march_costs_a_thin_slab_and_a_fine_grid() {
 
             let (origin, direction) = ray_for_pixel(&uniform, size[0] / 2, size[1] / 2, size);
             let (entry, exit) = slab(origin, direction, [0.0; 3], [1.0; 3]);
-            let dt = (exit - entry.max(0.0)) / 96.0;
+            let dt = march_dt(direction, cells, exit - entry.max(0.0));
             let chord = thickness as f32 * step[2] / direction[2].abs();
 
             let pixels = raymarch_once(
@@ -1704,14 +1795,16 @@ fn what_the_ninety_six_step_march_costs_a_thin_slab_and_a_fine_grid() {
         }
     }
 
-    // --- where the march actually starts losing
+    // --- the sweep the 96-step march failed
     //
-    // Nothing above loses a pixel, which is itself the finding: at 128 cells of
-    // z a one-cell layer is still three cells thick once the filter has had it,
-    // and three cells is over two steps. So the deficit is forced by resolving
-    // the *view* axis past the step count — 96 steps over one crossing of the
-    // cube is 96 samples however many cells there are — and this sweep is where
-    // the shipped grid sits relative to that cliff.
+    // A one-cell layer at ever finer z. Under the fixed-count march this was
+    // a cliff — 99.14% coverage at 256 z-cells, 5.96% at 512, 3.02% at 1024 —
+    // because 96 samples per crossing is 96 samples however many cells there
+    // are. The voxel-locked step resolves the layer at every depth: past 512
+    // z-cells the near-vertical chord outruns the ceiling and the `dt` floor
+    // stretches the step to ~2 z-cells, which the filter's ~3-cell widening
+    // still covers. The assert is the whole ladder now, not only the shipped
+    // rung.
     println!("a one-cell layer at increasing z resolution, seen near-nadir:");
     for depth in [128u32, 256, 512, 1024] {
         let cells = [64u32, 64, depth];
@@ -1722,7 +1815,7 @@ fn what_the_ninety_six_step_march_costs_a_thin_slab_and_a_fine_grid() {
         let uniform = masking_uniform(camera(225.0, 85.0, 2.5, 1.0), BOX_KM, cells, size);
         let (origin, direction) = ray_for_pixel(&uniform, size[0] / 2, size[1] / 2, size);
         let (entry, exit) = slab(origin, direction, [0.0; 3], [1.0; 3]);
-        let dt = (exit - entry.max(0.0)) / 96.0;
+        let dt = march_dt(direction, cells, exit - entry.max(0.0));
         let pixels = raymarch_once(
             &device, &queue, &pipelines, cells, &grid, &lut, &uniform, size,
         );
@@ -1739,9 +1832,10 @@ fn what_the_ninety_six_step_march_costs_a_thin_slab_and_a_fine_grid() {
             100.0 * coverage,
         );
         assert!(
-            depth > 128 || coverage > 0.999,
-            "the shipped 128 cells of z lost {:.2}% of a one-cell layer, so the \
-             margin this sweep exists to measure has already gone",
+            coverage > 0.99,
+            "a one-cell layer at {depth} z-cells lost {:.2}% of its mask; the \
+             voxel-locked step (with the ceiling's dt floor past 512) was \
+             measured at 99.8%+ on every rung of this ladder",
             100.0 * (1.0 - coverage),
         );
     }
@@ -1758,7 +1852,7 @@ fn what_the_ninety_six_step_march_costs_a_thin_slab_and_a_fine_grid() {
         let uniform = masking_uniform(camera(225.0, 25.0, 2.5, 1.0), BOX_KM, grid_cells, size);
         let (origin, direction) = ray_for_pixel(&uniform, size[0] / 2, size[1] / 2, size);
         let (entry, exit) = slab(origin, direction, [0.0; 3], [1.0; 3]);
-        let dt = (exit - entry.max(0.0)) / 96.0;
+        let dt = march_dt(direction, grid_cells, exit - entry.max(0.0));
         let pixels = raymarch_once(
             &device, &queue, &pipelines, grid_cells, &grid, &lut, &uniform, size,
         );

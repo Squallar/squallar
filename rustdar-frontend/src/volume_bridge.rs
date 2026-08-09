@@ -121,6 +121,23 @@ use crate::volume::uniform::VolumeUniform;
 /// It is a **bar**, not a repair — nothing here rewrites a colour table.
 pub const MINIMUM_FADE_INDICES: u8 = 16;
 
+/// Width of the shader's opacity ramp, in its 0-1 index units: eight palette
+/// indices.
+///
+/// The ramp starts at the palette's own fade boundary — the first index whose
+/// alpha is not zero — and reaches full palette alpha eight indices above it.
+/// Without it the boundary is an alpha cliff one Nearest-sampled LUT step
+/// wide: at an echo edge the interpolated index crosses that step inside a
+/// single voxel, so every shelf and every echo top wears a hard rim
+/// (the terraced shells of the 2026-08-09 report). Eight indices is half a
+/// [`MINIMUM_FADE_INDICES`] and, on reflectivity's 0.5 dB-per-index ramp,
+/// 4 dBZ of fade — chosen by rendering the KCRP 2017-08-26 (Harvey) volume at
+/// 4, 8 and 16: at 4 the tilt shelves keep a faint rim, at 16 the shelf
+/// structure the render is supposed to keep legible starts to blur together,
+/// and 8 has neither. It softens *presentation* only: the palette, the field
+/// and the skip threshold's position all stay the data's own.
+pub const EDGE_SOFT_WIDTH: f32 = 8.0 / 255.0;
+
 /// A voxel grid the store is holding, or the reason it could not build one.
 #[derive(Clone)]
 pub enum VolumeEntry {
@@ -401,6 +418,17 @@ impl VolumePainter for BridgeVolumePainter {
         // `fit_to_budget` can step the resolution down, and shading rides the
         // same struct.
         uniform.gradient_shading = fitted.quality.shading.is_on();
+        // The march's transfer edge, anchored at this palette's own fade
+        // boundary. `fade_band()` is the first index whose alpha is not zero,
+        // so `(band - 0.5) / 255` is exactly where a Nearest LUT fetch starts
+        // returning visible entries: below it the march can skip the sample —
+        // and its up-to-seven shading fetches — without changing a pixel. The
+        // ramp then dissolves the alpha cliff at that same boundary over
+        // [`EDGE_SOFT_WIDTH`]. `palette_refusal` has already established the
+        // band is at least [`MINIMUM_FADE_INDICES`], so the subtraction cannot
+        // go negative.
+        uniform.empty_index_threshold = (f32::from(grid.fade_band()) - 0.5) / 255.0;
+        uniform.edge_soft_width = EDGE_SOFT_WIDTH;
 
         let callback = VolumeCallback {
             pane_idx: frame.pane_idx,

@@ -318,39 +318,42 @@ fn the_webgl_and_native_gles_translations_are_byte_identical() {
     }
 }
 
-/// The march's step count reaches the GLSL as a compile-time constant.
+/// The march's step ceiling reaches the GLSL as a compile-time constant.
 ///
 /// Corrects an assumption worth writing down, because it was in the brief this
 /// work came from: naga does **not** delete constant declarations and inline
-/// them. It emits `const int RAYMARCH_STEPS = 96;` at module scope and names it
-/// in the loop bound, folding only where a conversion forces it —
-/// `f32(RAYMARCH_STEPS)` becomes the literal `96.0`. Both are compile-time
-/// constant expressions to an ES 300 driver, which is the property that
-/// matters: the loop is unrollable and the bound cannot vary per draw.
+/// them. It emits `const int RAYMARCH_STEP_CEILING = 512;` at module scope and
+/// names it in the loop bound, folding only where a conversion forces it —
+/// `f32(RAYMARCH_STEP_CEILING)` becomes the literal `512.0` inside the `dt`
+/// floor. Both are compile-time constant expressions to an ES 300 driver,
+/// which is the property that matters: the bound cannot vary per draw. (The
+/// march *breaks* at the box exit long before the ceiling on every shipped
+/// grid; the data-dependent break is legal where a data-dependent bound is
+/// not.)
 ///
-/// The failure this rules out is the step count becoming a uniform. That
-/// compiles, looks identical, and makes the march's cost invisible to the
-/// driver — on the target where fill rate is the whole risk.
+/// The failure this rules out is the ceiling becoming a uniform. That
+/// compiles, looks identical, and makes the march's worst case invisible to
+/// the driver — on the target where fill rate is the whole risk.
 #[test]
 fn the_step_count_reaches_the_glsl_as_a_compile_time_constant() {
     let glsl_source = translate(ENTRY_FS_RAYMARCH, naga::ShaderStage::Fragment, true);
     assert!(
-        glsl_source.contains("const int RAYMARCH_STEPS = 96;"),
-        "the step count is no longer a GLSL `const` at module scope"
+        glsl_source.contains("const int RAYMARCH_STEP_CEILING = 512;"),
+        "the step ceiling is no longer a GLSL `const` at module scope"
     );
     assert!(
-        !glsl_source.contains("float(RAYMARCH_STEPS)"),
+        !glsl_source.contains("float(RAYMARCH_STEP_CEILING)"),
         "the conversion to float did not fold, so the constant is reaching the \
          arithmetic through a runtime cast"
     );
     assert!(
-        glsl_source.contains("/ 96.0)"),
-        "the step size is no longer divided by the folded literal 96.0"
+        glsl_source.contains("/ 512.0)"),
+        "the dt floor is no longer divided by the folded literal 512.0"
     );
     assert!(
-        !glsl_source.contains("uniform int RAYMARCH_STEPS")
-            && !glsl_source.contains("uniform highp int RAYMARCH_STEPS"),
-        "the step count became a uniform; the loop bound would then vary per \
+        !glsl_source.contains("uniform int RAYMARCH_STEP_CEILING")
+            && !glsl_source.contains("uniform highp int RAYMARCH_STEP_CEILING"),
+        "the step ceiling became a uniform; the loop bound would then vary per \
          draw and no driver could unroll it"
     );
 }

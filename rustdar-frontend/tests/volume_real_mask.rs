@@ -93,10 +93,11 @@
 //!   returns an interpolated **index**, which the (`Nearest`-sampled) hard LUT
 //!   then reads as below-cut. The silhouette is eroded by up to half a voxel at
 //!   every boundary;
-//! * the march takes `RAYMARCH_STEPS` = 96 point samples across the slab
-//!   whatever the box is, so on a 150 km box a step is ~2 km against a 0.6 km
-//!   voxel horizontally and a 0.14 km one vertically. A feature thinner than a
-//!   step can fall between samples.
+//! * the march steps `RAYMARCH_STEP_CELLS` cells along the ray with a
+//!   deterministic per-pixel jitter of the comb's phase, so a chord shorter
+//!   than one step — a silhouette tangent — is hit or missed by the pixel's
+//!   own hash. That is a one-pixel ring of noise on the mask's boundary, not
+//!   the whole-feature loss the fixed 96-step march it replaced could show.
 //!
 //! Neither is corrected here. A harness that silently rendered something other
 //! than what ships would measure the wrong thing.
@@ -196,9 +197,15 @@ fn render_a_real_volume_mask() {
     );
 
     // The picture, at the production transfer function and the grid's own
-    // palette. Only the two transfer fields differ from the render above.
+    // palette. The transfer fields are set exactly as `volume::bridge` sets
+    // them — the fade-anchored skip threshold and the soft edge included —
+    // because "production" is the bridge's configuration, and a harness that
+    // rendered the hard-threshold instrument configuration in colour would
+    // show an edge the application does not draw.
     uniform.extinction_per_km = rustdar_frontend::volume::uniform::DEFAULT_EXTINCTION_PER_KM;
     uniform.gradient_shading = true;
+    uniform.empty_index_threshold = (f32::from(grid.fade_band()) - 0.5) / 255.0;
+    uniform.edge_soft_width = rustdar_frontend::volume::bridge::EDGE_SOFT_WIDTH;
     let colour_pixels = raymarch_once(
         &device,
         &queue,

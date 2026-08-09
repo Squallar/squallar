@@ -85,6 +85,18 @@ pub const VOLUME_SHADER_WGSL: &str = include_str!("volume.wgsl");
 /// abort.
 pub const LABEL_PREFIX: &str = "rustdar.volume";
 
+/// The march's per-ray sample ceiling, restated for hosts that mirror the
+/// shader's arithmetic (the silhouette harness casts the same rays in Rust).
+///
+/// The WGSL constant is the source of truth; this copy is pinned to the
+/// literal in the shader text by `the_step_count_is_a_constant_the_loop_bound_names`,
+/// so the two cannot drift silently.
+pub const RAYMARCH_STEP_CEILING: i32 = 512;
+
+/// Cells one march step advances along the ray, in the grid's own cell
+/// metric. Pinned to the WGSL literal like [`RAYMARCH_STEP_CEILING`].
+pub const RAYMARCH_STEP_CELLS: f32 = 1.0;
+
 /// Vertex entry point of the raymarch.
 pub const ENTRY_VS_RAYMARCH: &str = "vs_raymarch";
 /// Fragment entry point of the raymarch.
@@ -681,6 +693,24 @@ impl VolumePipelines {
         target: &OffscreenTarget,
         volume: &VolumeTextures,
     ) {
+        self.encode_raymarch_with_timestamps(encoder, target, volume, None);
+    }
+
+    /// [`Self::encode_raymarch`], with timestamp queries bracketing the pass.
+    ///
+    /// The seam `tests/volume_march_cost.rs` measures through. Passing the
+    /// writes into the one place the pass is described keeps the measured pass
+    /// and the shipped pass the same pass — a bench that re-recorded its own
+    /// copy of this descriptor would silently drift from what it claims to
+    /// time. Production always hands `None`; `RenderPassTimestampWrites` needs
+    /// `Features::TIMESTAMP_QUERY`, which the app never requests.
+    pub fn encode_raymarch_with_timestamps(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &OffscreenTarget,
+        volume: &VolumeTextures,
+        timestamp_writes: Option<wgpu::RenderPassTimestampWrites>,
+    ) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(&label("raymarch.pass")),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -693,7 +723,7 @@ impl VolumePipelines {
                 depth_slice: None,
             })],
             depth_stencil_attachment: None,
-            timestamp_writes: None,
+            timestamp_writes,
             occlusion_query_set: None,
             multiview_mask: None,
         });
@@ -1242,16 +1272,43 @@ mod tests {
         );
     }
 
-    /// The step count is a `const`, so it folds to a literal in the loop.
+    /// The step ceiling is a `const`, so it folds to a literal in the loop.
+    ///
+    /// The ceiling is the loop bound — a naga requirement, since the *real*
+    /// termination is the data-dependent break at the box exit, and a
+    /// non-constant bound plus that break is exactly the shape WebGL2 drivers
+    /// refuse. The step length itself is derived per ray from `grid_dims`, so
+    /// there is deliberately no `(span.y - span.x) / STEPS` here to pin — the
+    /// dt *floor* against the ceiling is pinned instead, because deleting it
+    /// would truncate any grid whose chord outruns the ceiling mid-box.
     #[test]
     fn the_step_count_is_a_constant_the_loop_bound_names() {
         assert!(
-            shader_code().contains("const RAYMARCH_STEPS: i32 = 96;"),
-            "the raymarch's step count is no longer a `const` literal"
+            shader_code().contains("const RAYMARCH_STEP_CEILING: i32 = 512;"),
+            "the raymarch's step ceiling is no longer a `const` literal"
         );
         assert!(
-            shader_code().contains("i < RAYMARCH_STEPS"),
+            shader_code().contains("i < RAYMARCH_STEP_CEILING"),
             "the march's loop bound is no longer the constant"
+        );
+        assert!(
+            shader_code().contains("(span.y - span.x) / f32(RAYMARCH_STEP_CEILING)"),
+            "the dt floor against the ceiling is gone; a grid whose chord \
+             exceeds the ceiling would render truncated mid-box instead of \
+             coarser"
+        );
+        assert!(
+            shader_code().contains("const STEP_CELLS: f32 = 1.0;"),
+            "the cells-per-step constant is no longer a `const` literal"
+        );
+        // The host-side restatements, against the same literals rather than
+        // against the constants themselves — pinning a constant to itself is
+        // the mistake `every_lane_lands_at_its_std140_offset` documents.
+        assert_eq!(
+            (RAYMARCH_STEP_CEILING, RAYMARCH_STEP_CELLS),
+            (512, 1.0),
+            "the Rust restatement of the march constants no longer matches \
+             the WGSL literals this test pins"
         );
     }
 

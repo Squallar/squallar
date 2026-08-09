@@ -90,6 +90,19 @@ pub const DEFAULT_EMPTY_INDEX_THRESHOLD: f32 = 0.5 / 255.0;
 /// other half of the spike's worst case.
 pub const DEFAULT_EARLY_OUT_TRANSMITTANCE: f32 = 0.004;
 
+/// Width of the opacity ramp above [`VolumeUniform::empty_index_threshold`],
+/// in the shader's 0-1 index units. **Zero here, deliberately.**
+///
+/// Zero is the hard threshold every mask-instrument test was written against:
+/// with it, a cell contributes its full palette alpha the moment the
+/// interpolated index clears the threshold, which is what makes a saturating
+/// extinction render a binary silhouette. The *production* width lives in
+/// `volume::bridge`, which anchors the threshold at the palette's own fade
+/// boundary and widens the ramp — see `EDGE_SOFT_WIDTH` there for the number
+/// and the measurement behind it. A soft default here would put a grey band on
+/// every instrument's edge instead.
+pub const DEFAULT_EDGE_SOFT_WIDTH: f32 = 0.0;
+
 /// Fraction of a lit surface's colour that survives facing away from the light.
 ///
 /// Shading multiplies colour by `ambient + (1 - ambient) * lambert`, so this is
@@ -134,6 +147,8 @@ pub struct VolumeUniform {
     pub empty_index_threshold: f32,
     /// See [`DEFAULT_EARLY_OUT_TRANSMITTANCE`].
     pub early_out_transmittance: f32,
+    /// See [`DEFAULT_EDGE_SOFT_WIDTH`]. Rides `transfer.w`.
+    pub edge_soft_width: f32,
     /// Whether to shade with the central-difference gradient. The expensive
     /// knob: seven texture fetches per step against one, measured at 2.4x.
     pub gradient_shading: bool,
@@ -156,6 +171,7 @@ impl VolumeUniform {
             extinction_per_km: DEFAULT_EXTINCTION_PER_KM,
             empty_index_threshold: DEFAULT_EMPTY_INDEX_THRESHOLD,
             early_out_transmittance: DEFAULT_EARLY_OUT_TRANSMITTANCE,
+            edge_soft_width: DEFAULT_EDGE_SOFT_WIDTH,
             gradient_shading: true,
         }
     }
@@ -190,7 +206,7 @@ impl VolumeUniform {
                 self.extinction_per_km,
                 self.empty_index_threshold,
                 self.early_out_transmittance,
-                0.0,
+                self.edge_soft_width,
             ],
         );
         write_vec4(
@@ -267,6 +283,7 @@ mod tests {
             extinction_per_km: 501.0,
             empty_index_threshold: 502.0,
             early_out_transmittance: 503.0,
+            edge_soft_width: 504.0,
             gradient_shading: true,
         }
     }
@@ -400,7 +417,7 @@ mod tests {
                 [401.0, 402.0, 403.0, 404.0],
                 "light_dir_ambient",
             ),
-            (OFFSET_TRANSFER, [501.0, 502.0, 503.0, 0.0], "transfer"),
+            (OFFSET_TRANSFER, [501.0, 502.0, 503.0, 504.0], "transfer"),
             (OFFSET_FLAGS, [1.0, 0.0, 0.0, 0.0], "flags"),
         ] {
             let lane = offset / 4;
@@ -437,7 +454,6 @@ mod tests {
             (OFFSET_EYE_IN_BOX, 3, "eye_in_box.w"),
             (OFFSET_BOX_SIZE_KM, 3, "box_size_km.w"),
             (OFFSET_GRID_DIMS, 3, "grid_dims.w"),
-            (OFFSET_TRANSFER, 3, "transfer.w"),
             (OFFSET_FLAGS, 1, "flags.y"),
             (OFFSET_FLAGS, 2, "flags.z"),
             (OFFSET_FLAGS, 3, "flags.w"),
