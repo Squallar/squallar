@@ -225,18 +225,26 @@ pub(crate) struct PendingRegion {
 ///
 /// # The rule, and why it is total
 ///
-/// In order: **re-aim** a 3D pane already sourced from this map; else **grow** the
-/// layout and make the new pane a 3D view; else re-aim the lowest-indexed 3D pane
-/// there is; else **convert** the highest-indexed pane that is not the map the
-/// region was drawn on.
+/// In order: **re-aim** a 3D pane already sourced from this map; else re-aim a
+/// **sourceless** 3D pane — one whose region was never dragged: converted from
+/// the menu, reset, or restored with a source index the layout no longer has
+/// (an ordinary restore keeps its source; `ui_config` drops only dangling
+/// ones); else **grow** the layout and make the new pane a 3D view; else
+/// re-aim the lowest-indexed 3D pane there is; else **convert** the
+/// highest-indexed pane that is not the map the region was drawn on.
 ///
 /// Every step exists to avoid a specific wrong answer. Re-aiming first is what
 /// stops a second drag on the same map opening a second 3D pane — the common case
-/// is adjusting a box, not wanting another view of it. Growing before re-aiming
-/// *some other* pane is what makes the first drag on a single-map layout produce
-/// a 3D view beside the map rather than replacing it. Converting last, and
-/// converting the *highest* index, is what keeps the map being drawn on — and the
-/// user's primary pane — for as long as there is any other pane to spend.
+/// is adjusting a box, not wanting another view of it. A sourceless pane beats
+/// growing because it is *nobody's*: a user with exactly one 3D pane that no
+/// map feeds who drags a region means "aim that one", and growing instead
+/// surprises them with a sibling — whereas a pane sourced from *another* map is
+/// that map's to re-aim, so growing still beats stealing it. Growing before
+/// re-aiming a pane some other map feeds is what makes the first drag on a
+/// single-map layout produce a 3D view beside the map rather than replacing it.
+/// Converting last, and converting the *highest* index, is what keeps the map
+/// being drawn on — and the user's primary pane — for as long as there is any
+/// other pane to spend.
 ///
 /// It is total on purpose: there is no arrangement of panes for which a drag
 /// silently does nothing. A gesture that completes and produces no visible change
@@ -266,6 +274,21 @@ pub(crate) fn destination_for(
         p.kind() == PaneKind::Volume
             && p.volume()
                 .is_some_and(|v| v.source_pane == Some(source_pane))
+    }) {
+        return Some(RegionDestination::Existing(idx));
+    }
+    // A 3D pane nobody aimed — converted from the menu, reset, or restored
+    // with a dangling source index — before growing. It is showing the default
+    // box, which the first drag is almost certainly trying to replace; a user
+    // with exactly one such pane who gets a sibling instead has two 3D views
+    // where they asked to aim one. A pane sourced from *another* map is
+    // deliberately not matched here: it is that map's to re-aim, and growing
+    // beats stealing it. The pane's *site* is no bar: the applier writes the
+    // source map's site and moment onto whatever pane this rule answers with,
+    // so a sourceless pane left on another site follows the map, rather than
+    // resampling its own radar over this map's ground.
+    if let Some(idx) = panes.iter().position(|p| {
+        p.kind() == PaneKind::Volume && p.volume().is_some_and(|v| v.source_pane.is_none())
     }) {
         return Some(RegionDestination::Existing(idx));
     }
@@ -525,7 +548,12 @@ mod tests {
     }
 
     fn volume_pane(source: Option<usize>) -> PaneState {
-        let mut pane = map_pane();
+        volume_pane_on("KTLX", source)
+    }
+
+    /// A 3D pane sitting on `site` — not necessarily the map's own.
+    fn volume_pane_on(site: &str, source: Option<usize>) -> PaneState {
+        let mut pane = PaneState::with_site(site.to_owned());
         pane.set_kind(PaneKind::Volume);
         if let Some(volume) = pane.volume_mut() {
             volume.source_pane = source;
@@ -560,6 +588,86 @@ mod tests {
         assert_eq!(
             destination_for(&panes, 0, 4),
             Some(RegionDestination::Grow(2)),
+        );
+    }
+
+    /// A sourceless 3D pane is re-aimed rather than a sibling grown.
+    ///
+    /// A pane converted from the menu, reset, or restored with a dangling
+    /// source index carries `source_pane: None` — no map feeds it — so the
+    /// sourced-from-this-map arm skips it, and without this arm the first drag
+    /// would *grow*: a user with exactly one such 3D pane who dragged a box
+    /// would get a surprise second one. Re-aiming the pane nobody owns is what
+    /// they meant.
+    ///
+    /// `max_panes` leaves room to grow on purpose: with the layout full this
+    /// case is indistinguishable from the any-3D-pane fallback, and the arm
+    /// being pinned is the one that runs *while growing is still possible*.
+    #[test]
+    fn a_sourceless_3d_pane_is_re_aimed_rather_than_a_sibling_grown() {
+        let panes = [map_pane(), volume_pane(None)];
+        assert_eq!(
+            destination_for(&panes, 0, 6),
+            Some(RegionDestination::Existing(1)),
+            "a restored 3D pane must be re-aimed, not given a sibling",
+        );
+
+        // The first *sourceless* pane, not the first 3D pane: a pane another
+        // map feeds sits at a lower index and must be passed over.
+        let panes = [map_pane(), volume_pane(Some(9)), volume_pane(None)];
+        assert_eq!(
+            destination_for(&panes, 0, 6),
+            Some(RegionDestination::Existing(2)),
+            "a pane sourced from another map is that map's to re-aim",
+        );
+
+        // And the sourced-from-this-map arm still wins over it: adjusting the
+        // box you already dragged must keep re-aiming the pane it feeds.
+        let panes = [map_pane(), volume_pane(None), volume_pane(Some(0))];
+        assert_eq!(
+            destination_for(&panes, 0, 6),
+            Some(RegionDestination::Existing(2)),
+            "the pane this map already feeds outranks a sourceless one",
+        );
+    }
+
+    /// A sourceless 3D pane on *another site* is still the one re-aimed, with
+    /// room to grow — the rule is site-blind on purpose, because the applier
+    /// re-sites whatever pane it answers with.
+    ///
+    /// This is the layout this family was missing: a KTLX map beside a
+    /// sourceless KICT pane. With the rule alone in view, "re-aim" here read as
+    /// leaving the pane resampling **KICT's** volume over a box centred on
+    /// KTLX's ground ~220 km away — an empty or sliver grid, captioned KICT.
+    /// The contract is split: this arm keeps answering `Existing` so the
+    /// re-aim stays useful across sites instead of quietly growing a sibling,
+    /// and `Gui::apply_pending_region` writes the source map's site and moment
+    /// onto the pane, exactly as the section applier does — pinned by
+    /// `a_retargeted_3d_pane_takes_the_maps_site_and_moment` in `ui`.
+    #[test]
+    fn a_sourceless_pane_on_another_site_is_still_the_one_re_aimed() {
+        let panes = [map_pane(), volume_pane_on("KICT", None)];
+        assert_eq!(
+            destination_for(&panes, 0, 6),
+            Some(RegionDestination::Existing(1)),
+            "a cross-site sourceless pane is re-aimed — the applier moves it \
+             to this map's site",
+        );
+    }
+
+    /// A 3D pane sourced from *another* map does not block growing.
+    ///
+    /// The sourceless arm matches `source_pane: None` and nothing else. Widened
+    /// to "any 3D pane before growing" it would steal a view another map is
+    /// feeding — and this is the layout that tells those two rules apart while
+    /// there is still room to grow.
+    #[test]
+    fn a_pane_sourced_from_another_map_does_not_block_growing() {
+        let panes = [map_pane(), map_pane(), volume_pane(Some(1))];
+        assert_eq!(
+            destination_for(&panes, 0, 6),
+            Some(RegionDestination::Grow(4)),
+            "another map's 3D pane must be left alone while there is room",
         );
     }
 
@@ -599,31 +707,88 @@ mod tests {
     }
 
     /// The rule is total: there is no layout on which a completed drag silently
-    /// does nothing.
+    /// does nothing — and every answer it gives is one the applier can act on.
     ///
     /// A gesture that finishes and produces no visible change is
     /// indistinguishable from one the app failed to receive, which is the worst
     /// outcome available — the user repeats it, and nothing happens again.
+    ///
+    /// Four kinds per pane rather than two, so every arm of the rule is
+    /// reached: a map, a sourceless 3D pane (the arm that re-aims a restored
+    /// pane instead of growing), one sourced from pane 0 (the
+    /// sourced-from-this-map arm whenever 0 is the source), and one sourced
+    /// from a pane index no layout here reaches (the any-3D fallback).
+    ///
+    /// The well-formedness half is what stops totality being satisfied
+    /// vacuously: `Existing` must name a 3D pane in the layout, `Grow` must ask
+    /// for exactly one more pane and only when the ceiling allows it, and
+    /// `Convert` must name a pane that exists.
+    ///
+    /// Every layout is enumerated **twice**: once with every pane on one site,
+    /// and once with sites alternating by index — and the two answers must be
+    /// the same. The rule is site-blind by contract, because siting the chosen
+    /// pane is `Gui::apply_pending_region`'s job; a rule that consulted sites
+    /// would silently change which arm fires for exactly the layouts a
+    /// single-site sweep never generates, which is how the cross-site
+    /// sourceless case went unwatched.
     #[test]
     fn every_layout_has_somewhere_to_put_a_region() {
         for max_panes in 1..=6usize {
             for count in 1..=max_panes {
-                for kinds in 0..(1u32 << count) {
-                    let panes: Vec<PaneState> = (0..count)
-                        .map(|i| {
-                            if kinds & (1 << i) == 0 {
-                                map_pane()
-                            } else {
-                                volume_pane(None)
-                            }
-                        })
-                        .collect();
+                for kinds in 0..(4u32.pow(count as u32)) {
+                    let build = |site_diverse: bool| -> Vec<PaneState> {
+                        (0..count)
+                            .map(|i| {
+                                let site = if site_diverse && i % 2 == 1 {
+                                    "KICT"
+                                } else {
+                                    "KTLX"
+                                };
+                                match (kinds >> (2 * i)) & 0b11 {
+                                    0 => PaneState::with_site(site.to_owned()),
+                                    1 => volume_pane_on(site, None),
+                                    2 => volume_pane_on(site, Some(0)),
+                                    _ => volume_pane_on(site, Some(9)),
+                                }
+                            })
+                            .collect()
+                    };
+                    let panes = build(false);
+                    let diverse = build(true);
                     for source in 0..count {
-                        assert!(
-                            destination_for(&panes, source, max_panes).is_some(),
-                            "no destination for {count} panes (kinds {kinds:b}), \
-                             source {source}, ceiling {max_panes}",
+                        let destination = destination_for(&panes, source, max_panes)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "no destination for {count} panes (kinds {kinds:b}), \
+                                     source {source}, ceiling {max_panes}",
+                                )
+                            });
+                        let context = format!(
+                            "{count} panes (kinds {kinds:b}), source {source}, \
+                             ceiling {max_panes}",
                         );
+                        assert_eq!(
+                            destination_for(&diverse, source, max_panes),
+                            Some(destination),
+                            "the rule must be site-blind — siting the pane is \
+                             the applier's job: {context}",
+                        );
+                        match destination {
+                            RegionDestination::Existing(idx) => assert!(
+                                panes.get(idx).map(PaneState::kind) == Some(PaneKind::Volume),
+                                "Existing({idx}) does not name a 3D pane: {context}",
+                            ),
+                            RegionDestination::Grow(new_count) => assert!(
+                                new_count == count + 1 && new_count <= max_panes,
+                                "Grow({new_count}) is not one new pane within the \
+                                 ceiling: {context}",
+                            ),
+                            RegionDestination::Convert(idx) => assert!(
+                                idx < count,
+                                "Convert({idx}) names a pane that does not exist: \
+                                 {context}",
+                            ),
+                        }
                     }
                 }
             }

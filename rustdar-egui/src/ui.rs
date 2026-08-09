@@ -2313,6 +2313,25 @@ impl Gui {
         let Some(pending) = self.pending_region.take() else {
             return;
         };
+        // The box means ground on the *source map's* radar, so the pane that
+        // shows it has to follow that map's site and moment — exactly as
+        // `apply_pending_section_line` writes them for a line. Without this, a
+        // sourceless pane on another site would be "re-aimed" to resample its
+        // own radar over a box centred on this map's ground: an empty or sliver
+        // grid, captioned with the wrong site. Read before the destination is
+        // resolved, as the section applier reads its source, and a source pane
+        // that vanished mid-frame drops the region rather than siting it off a
+        // pane that no longer exists.
+        let (source_site, source_scan) = match self.panes.get(pending.source_pane) {
+            Some(pane) => (pane.site.clone(), pane.scan_info.clone()),
+            None => {
+                log::warn!(
+                    "pane {} committed a 3D region and is already gone",
+                    pending.source_pane
+                );
+                return;
+            }
+        };
         let max_panes = self.layout.width.max_panes();
         let Some(destination) =
             crate::ui_region::destination_for(self.panes(), pending.source_pane, max_panes)
@@ -2340,9 +2359,18 @@ impl Gui {
         // loop, so nothing is `mem::take`n and the write lands in the vector
         // rather than in a placeholder about to be discarded.
         pane.set_kind(crate::pane::PaneKind::Volume);
+        pane.site = source_site;
+        pane.scan_info = source_scan;
         // A pane that has just been converted or grown has the default camera,
         // which is what should happen — but one that is being *re-aimed* keeps
-        // the angle the user set. Only the region and its provenance are written.
+        // the angle the user set, and its product stays its own, like the
+        // camera: a 3D pane's product is picked on the pane, where a section
+        // slices whatever its map shows. Beyond the site and moment, only the
+        // region and its provenance are written. No stale-picture clearing is
+        // needed here as it is for a section: the 3D dispatch is
+        // level-triggered off `pane.site` each frame, and the site write makes
+        // the wanted `VolumeTarget` differ from `rendered_for`, so the rebuild
+        // follows on its own.
         if let Some(volume) = pane.volume_mut() {
             volume.region = Some(pending.region);
             volume.source_pane = Some(pending.source_pane);
@@ -3769,6 +3797,84 @@ mod pane_slice_tests {
             section.unavailable, None,
             "a reason from the previous line outlived its cause"
         );
+    }
+
+    /// A minimal scan moment for `site`, distinguishable by its site name.
+    fn scan_info_for(site: &'static str) -> rustdar_radar::types::ScanInfo {
+        rustdar_radar::types::ScanInfo {
+            site: rustdar_radar::sites::RadarSite {
+                name: site,
+                lat: 35.33,
+                lon: -97.27,
+                elev: None,
+            },
+            timestamp: chrono::NaiveDate::from_ymd_opt(2026, 7, 30)
+                .unwrap()
+                .and_hms_opt(18, 30, 0)
+                .unwrap(),
+            vcp_number: 212,
+            available_products: vec![RadarProduct::Reflectivity],
+            product_elevations: std::collections::HashMap::new(),
+            status: String::new(),
+        }
+    }
+
+    /// The 3D pane a region lands in adopts the drawing map's site and moment —
+    /// the exact property the section applier pins two tests up.
+    ///
+    /// A box is resampled from a *site's* volume, so a target pane that kept its
+    /// own site would resample its own radar over the box's ground. The fixture
+    /// is the failure that found this: a KTLX map and a sourceless KICT 3D pane,
+    /// with room to grow. The destination rule re-aims the sourceless pane, and
+    /// an applier that wrote only the region would leave it sampling **KICT's**
+    /// volume over a box centred on KTLX's ground ~220 km away — an empty or
+    /// sliver grid, captioned KICT. Writing the site is what makes the re-aim
+    /// mean "show me this map's ground in 3D".
+    #[test]
+    fn a_retargeted_3d_pane_takes_the_maps_site_and_moment() {
+        let mut gui = wide(2);
+        gui.panes[0].site = "KTLX".to_owned();
+        gui.panes[0].scan_info = Some(scan_info_for("KTLX"));
+        gui.panes[1].site = "KICT".to_owned();
+        gui.panes[1].scan_info = Some(scan_info_for("KICT"));
+        gui.panes[1].set_kind(crate::pane::PaneKind::Volume);
+        // Sourceless: converted from the menu, reset, or restored with a
+        // dangling source index — no map fed it.
+        gui.panes[1].volume_mut().unwrap().source_pane = None;
+
+        let region = crate::pane::VolumeRegion::new(
+            crate::pane::GeoPoint {
+                lat: 35.3,
+                lon: -97.3,
+            },
+            40.0,
+        )
+        .expect("a fixture region must be a point on Earth");
+        gui.pending_region = Some(crate::ui_region::PendingRegion {
+            source_pane: 0,
+            region,
+        });
+        gui.apply_pending_region();
+
+        assert_eq!(
+            gui.pane_count(),
+            2,
+            "the sourceless pane must be re-aimed, not a sibling grown"
+        );
+        let pane = gui.pane(1).unwrap();
+        assert_eq!(
+            pane.site, "KTLX",
+            "the pane must follow the map the box was dragged on, or it \
+             resamples its own radar over another site's ground"
+        );
+        assert_eq!(
+            pane.scan_info.as_ref().map(|s| s.site.name),
+            Some("KTLX"),
+            "the moment must come across with the site, as a section's does"
+        );
+        let volume = pane.volume().expect("the pane is a 3D view");
+        assert_eq!(volume.region, Some(region));
+        assert_eq!(volume.source_pane, Some(0));
     }
 
     /// Escape and Android's back cancel the armed draw — last, below every
