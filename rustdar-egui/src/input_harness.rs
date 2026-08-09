@@ -6865,6 +6865,50 @@ mod tests {
     // is the first branch on which both exist. Everything below is about the
     // pair rather than about either one.
 
+    /// **The region checkbox closes the drawer on arm, exactly as the section
+    /// checkbox does.**
+    ///
+    /// On every width where the drawer is the menu it covers the map the box
+    /// has to be dragged on, so arming and leaving it open would arm a gesture
+    /// the user cannot make. Un-ticking is the asymmetric half and it is pinned
+    /// too: disarming needs no map, so the drawer stays open where the user is.
+    #[test]
+    fn the_drawers_checkbox_arms_the_region_drag_and_closes_the_drawer() {
+        let mut h = compact_with_drawer();
+        h.load_scan("KTLX");
+        assert!(!h.region_arm(), "precondition: it starts unarmed");
+
+        h.mouse_click(clickable_leaf(&h, crate::ui::REGION_ARM_LABEL).center());
+        h.frames_for(3, FRAME_DT);
+
+        assert!(h.region_arm(), "the checkbox did not arm the drag");
+        assert_eq!(
+            h.menu_leaf(crate::ui::REGION_ARM_LABEL),
+            None,
+            "the drawer stayed open over the map the box has to be dragged on"
+        );
+
+        // Re-opened, the checkbox shows the mode it turned on — which is what a
+        // user who armed it by accident needs in order to un-tick it.
+        h.set_drawer_open(true);
+        h.frames_for(2, FRAME_DT);
+        assert_eq!(
+            h.menu_leaf(crate::ui::REGION_ARM_LABEL).map(|l| l.value),
+            Some(Some(true)),
+            "the checkbox does not show the mode it just turned on"
+        );
+
+        // Un-ticking disarms and leaves the drawer where the user is: only
+        // arming needs the map underneath.
+        h.mouse_click(clickable_leaf(&h, crate::ui::REGION_ARM_LABEL).center());
+        h.frames_for(3, FRAME_DT);
+        assert!(!h.region_arm(), "the checkbox could not turn it off");
+        assert!(
+            h.menu_leaf(crate::ui::REGION_ARM_LABEL).is_some(),
+            "disarming needs no map, so it must not slam the drawer shut"
+        );
+    }
+
     /// **Arming either modal drag disarms the other, and the menu says so.**
     ///
     /// The two entries are adjacent checkboxes in the same submenu and they arm

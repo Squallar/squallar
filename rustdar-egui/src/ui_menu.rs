@@ -407,12 +407,15 @@ impl super::Gui {
                 // for — and *arming* has to un-arm the cross-section draw, which
                 // is the other modal drag on a map pane.
                 self.set_region_arm(on);
-                // Deliberately *not* closing the drawer, unlike the cross-section
-                // arm below. That asymmetry is this entry's as it shipped on
-                // `main` and is left alone here: a rebase is the wrong place to
-                // change a reviewed feature's behaviour, and the two entries being
-                // inconsistent about the drawer is a note for the follow-up queue
-                // rather than something the interaction between them forces.
+                // Closing the drawer on arm, exactly as the cross-section entry
+                // below does and for its reason: on every width where the drawer
+                // is the menu it covers the map the box has to be dragged on, so
+                // arming and leaving it open would arm a gesture the user cannot
+                // make. Only on arm — disarming needs no map, so the drawer stays
+                // where the user is.
+                if on {
+                    self.drawer_open = false;
+                }
             }
             MenuEvent::Toggled(MenuToggle::AutoPoll, on) => self.auto_poll.enabled = on,
             MenuEvent::Toggled(MenuToggle::LiveChunks, on) => self.live_chunks = on,
