@@ -564,6 +564,17 @@ mod tests {
             Some(SectionGrab::B),
             "the nearer endpoint must win when both are in radius"
         );
+        // The pan contract in **absolute points**, with nothing derived from
+        // the constants: 30 points from the A cap and 20 from the body must be
+        // a pan. The margin probes above compute their presses *from* the
+        // radii, so they follow a mutated constant wherever it goes; this one
+        // sits where the shipped numbers (14 and 8) put the boundary, and a
+        // radius grown past it fails here by turning the press into a grab.
+        assert_eq!(
+            grab_at(egui::pos2(122.36, 80.0), a, b, &track),
+            None,
+            "a press 30 points from a cap and 20 points off the body must pan"
+        );
     }
 
     /// Pan and sweep are rigid motions: translation keeps length and bearing

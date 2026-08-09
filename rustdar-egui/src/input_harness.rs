@@ -7390,6 +7390,67 @@ mod tests {
         );
     }
 
+    /// 45l. **The grab radii in absolute points: a press 30 points off a cap
+    ///      and 20 points off the body still pans.**
+    ///
+    ///      45e proves *a* pan survives, but its press sits ~107 points from
+    ///      the body and ~236 from the caps — beyond any plausible radius —
+    ///      and the unit probes compute their presses *from* the constants, so
+    ///      they follow a mutated radius wherever it goes. This press is
+    ///      absolute: close enough to the line that a radius grown to a few
+    ///      dozen points would swallow it, far enough that the shipped radii
+    ///      (14 and 8) must not. The module doc calls the radius "the whole
+    ///      contract with panning"; this is that contract observed at the
+    ///      numbers it is set at.
+    #[test]
+    fn a_press_thirty_points_off_a_cap_and_twenty_off_the_body_still_pans() {
+        let (mut h, a, b) = harness_with_committed_section();
+        let a_px = h.screen_of(0, a);
+        let b_px = h.screen_of(0, b);
+        // 20 points perpendicular off the track, at the along-track distance
+        // that puts the press exactly 30 points from the A cap:
+        // sqrt(30² − 20²) ≈ 22.4 points toward B.
+        let along = (b_px - a_px).normalized();
+        let across = egui::vec2(along.y, -along.x);
+        let start = a_px + along * (30.0f32.powi(2) - 20.0f32.powi(2)).sqrt() + across * 20.0;
+        assert!(
+            h.pane_rects()[0].contains(start),
+            "precondition: the press is inside pane 0"
+        );
+        assert!(
+            ((start - a_px).length() - 30.0).abs() < 0.1,
+            "precondition: the press sits 30 points from the A cap"
+        );
+
+        let centre_before = h.pane_center(0);
+        h.mouse_move(start);
+        h.frame();
+        h.mouse_press(start);
+        let pressed = h.frame();
+        assert!(
+            !pressed.resolved.suppress_pan,
+            "a press 30 points from the cap and 20 from the body suppressed \
+             panning: a grab radius has grown into the map's pan gesture"
+        );
+        for step in 1..=3 {
+            h.mouse_move(start + egui::vec2(30.0 * step as f32, 15.0 * step as f32));
+            h.frame();
+        }
+        h.mouse_release(start + egui::vec2(90.0, 45.0));
+        h.frames_for(2, FRAME_DT);
+
+        assert_ne!(
+            h.pane_center(0),
+            centre_before,
+            "an ordinary pan 30 points off a cap went missing"
+        );
+        assert_eq!(
+            h.section_line(1),
+            Some(SectionLine::new(a, b).expect("the fixture's line")),
+            "a pan beside the line rewrote it"
+        );
+    }
+
     /// 46. **A tap while armed is discarded, and the mode stays armed.**
     ///
     ///     A stray tap is the single most likely thing to happen right after
