@@ -124,7 +124,8 @@ pub const MINIMUM_FADE_INDICES: u8 = 16;
 /// Width of the shader's opacity ramp, in its 0-1 index units: eight palette
 /// indices.
 ///
-/// The ramp starts at the palette's own fade boundary — the first index whose
+/// The ramp starts at the palette's own fade boundary —
+/// [`empty_index_threshold_for`], half an index below the first entry whose
 /// alpha is not zero — and reaches full palette alpha eight indices above it.
 /// Without it the boundary is an alpha cliff one Nearest-sampled LUT step
 /// wide: at an echo edge the interpolated index crosses that step inside a
@@ -136,7 +137,40 @@ pub const MINIMUM_FADE_INDICES: u8 = 16;
 /// structure the render is supposed to keep legible starts to blur together,
 /// and 8 has neither. It softens *presentation* only: the palette, the field
 /// and the skip threshold's position all stay the data's own.
+///
+/// One global constant, with no per-product plumbing behind it: the queued
+/// products WP must make widening a per-product decision — a categorical
+/// palette (HHC) must never be softened at its class boundaries — and today
+/// the only guard is that HHC cannot reach this march at all, because
+/// `rustdar_radar::sampler`'s samplable gate refuses every non-moment product
+/// before a grid exists.
 pub const EDGE_SOFT_WIDTH: f32 = 8.0 / 255.0;
+
+/// The march's skip threshold for a palette whose
+/// [`VoxelGrid::fade_band`](rustdar_radar::voxel::VoxelGrid::fade_band) is
+/// `band`, in the shader's 0-1 index units.
+///
+/// `fade_band()` is a **count**: how many indices above the no-data index are
+/// still fully transparent. The first entry whose alpha is not zero is
+/// therefore `band + 1`, and a Nearest-sampled LUT fetch of an interpolated
+/// grid index `i` (in 0-1 units) returns a visible entry exactly when
+/// `i * 255 > band + 0.5` — the midpoint between the last transparent entry
+/// and the first visible one. So `(band + 0.5) / 255` is the exact boundary:
+/// below it the march can skip the sample — and its up-to-seven shading
+/// fetches — without changing a pixel, and the [`EDGE_SOFT_WIDTH`] ramp rises
+/// from the same boundary, so the first visible index fades in at about 1%
+/// opacity instead of arriving as a cliff.
+///
+/// An earlier version anchored at `(band - 0.5) / 255`, one whole index low:
+/// a one-index shell of guaranteed-transparent samples paid full fetch cost
+/// for nothing, and the ramp's foot sat below the palette's own fade boundary
+/// so the first visible index rendered at ~9% opacity. One function on
+/// purpose — the march-cost and real-mask harnesses import it, so an anchor
+/// change here cannot leave the instruments measuring a different threshold
+/// than production ships.
+pub fn empty_index_threshold_for(band: u8) -> f32 {
+    (f32::from(band) + 0.5) / 255.0
+}
 
 /// A voxel grid the store is holding, or the reason it could not build one.
 #[derive(Clone)]
@@ -419,15 +453,14 @@ impl VolumePainter for BridgeVolumePainter {
         // same struct.
         uniform.gradient_shading = fitted.quality.shading.is_on();
         // The march's transfer edge, anchored at this palette's own fade
-        // boundary. `fade_band()` is the first index whose alpha is not zero,
-        // so `(band - 0.5) / 255` is exactly where a Nearest LUT fetch starts
-        // returning visible entries: below it the march can skip the sample —
-        // and its up-to-seven shading fetches — without changing a pixel. The
-        // ramp then dissolves the alpha cliff at that same boundary over
-        // [`EDGE_SOFT_WIDTH`]. `palette_refusal` has already established the
-        // band is at least [`MINIMUM_FADE_INDICES`], so the subtraction cannot
-        // go negative.
-        uniform.empty_index_threshold = (f32::from(grid.fade_band()) - 0.5) / 255.0;
+        // boundary. `fade_band()` counts the fully transparent indices above
+        // the no-data index, so the first visible entry is `band + 1` and
+        // [`empty_index_threshold_for`] — `(band + 0.5) / 255` — is exactly
+        // where a Nearest LUT fetch starts returning visible entries: below
+        // it the march can skip the sample — and its up-to-seven shading
+        // fetches — without changing a pixel. The ramp then dissolves the
+        // alpha cliff at that same boundary over [`EDGE_SOFT_WIDTH`].
+        uniform.empty_index_threshold = empty_index_threshold_for(grid.fade_band());
         uniform.edge_soft_width = EDGE_SOFT_WIDTH;
 
         let callback = VolumeCallback {
@@ -929,6 +962,88 @@ mod tests {
             body.contains("palette_refusal(&grid)"),
             "`paint` no longer consults the palette gate, so a moment whose colour \
              table is opaque at the bottom of its ramp would render as a solid block",
+        );
+
+        // The soft-edge mechanism's two production lines. Mutation testing
+        // proved that deleting both left the entire workspace suite green:
+        // the uniform's defaults (index-0 threshold, hard edge) are a
+        // renderable configuration, so nothing downstream fails — the user
+        // simply gets the hard shelf rims and the wasted marching the
+        // 2026-08-09 work exists to remove. No behavioural test can reach
+        // `paint` with a `Ready` grid (`VoxelGrid` has no constructor outside
+        // `build_voxels`), so the lines are pinned here; the *values* they
+        // assign are behaviourally pinned by
+        // `the_skip_threshold_separates_the_last_transparent_entry_from_the_first_visible_one`
+        // and `the_soft_width_is_eight_indices_half_the_fade_bar` below, and
+        // the GPU mask instrument in `tests/volume_silhouette.rs` observes
+        // the default width staying hard.
+        assert!(
+            body.contains(
+                "uniform.empty_index_threshold = empty_index_threshold_for(grid.fade_band())"
+            ),
+            "`paint` no longer anchors the skip threshold at the palette's fade \
+             boundary, so the march reverts to skipping only index 0 — every \
+             transparent cell under the band pays full sample cost again",
+        );
+        assert!(
+            body.contains("uniform.edge_soft_width = EDGE_SOFT_WIDTH"),
+            "`paint` no longer widens the opacity ramp, so every shelf and echo \
+             top reverts to the hard one-LUT-step rim the soft edge dissolves",
+        );
+    }
+
+    /// [`empty_index_threshold_for`] sits strictly between the last fully
+    /// transparent palette entry and the first visible one, for every band.
+    ///
+    /// The behavioural half of the anchor: a Nearest-sampled LUT fetch of
+    /// entry `n` sees the index value `n / 255`, entries `0..=band` are
+    /// transparent and `band + 1` is the first visible one — so the shader's
+    /// `index > threshold` test must be false at `band / 255` and true at
+    /// `(band + 1) / 255`. The shipped off-by-one (`(band - 0.5) / 255`)
+    /// fails the first half of this: entry `band` itself cleared the
+    /// threshold, so a one-index shell of zero-alpha samples paid up to seven
+    /// fetches per step for nothing and the ramp's foot sat one index below
+    /// the palette's own fade boundary.
+    #[test]
+    fn the_skip_threshold_separates_the_last_transparent_entry_from_the_first_visible_one() {
+        for band in 0..=u8::MAX {
+            let threshold = empty_index_threshold_for(band);
+            assert!(
+                f32::from(band) / 255.0 <= threshold,
+                "at band {band} the last transparent entry clears the skip \
+                 threshold, so the march samples — and shades — cells whose \
+                 fetch is guaranteed invisible",
+            );
+            if band < u8::MAX {
+                assert!(
+                    f32::from(band) / 255.0 + 1.0 / 255.0 > threshold,
+                    "at band {band} the first visible entry is under the skip \
+                     threshold, so the march erases the bottom of the ramp",
+                );
+            }
+        }
+        // And the anchor is the midpoint, not merely inside the gap: the
+        // EDGE_SOFT_WIDTH ramp rises from it, so where it sits inside the gap
+        // decides the opacity the first visible index fades in at (~1% at the
+        // midpoint, ~9% one index lower).
+        assert_eq!(empty_index_threshold_for(64), 64.5 / 255.0);
+    }
+
+    /// The production ramp is eight indices wide — half the fade bar, and not
+    /// the uniform's hard-edged default.
+    ///
+    /// Flipping [`EDGE_SOFT_WIDTH`] to 0 is the one-character revert of the
+    /// user-visible half of the soft edge, and before this test nothing in
+    /// the workspace could see it.
+    #[test]
+    fn the_soft_width_is_eight_indices_half_the_fade_bar() {
+        // Pinning the value pins it away from zero too: a zero production
+        // width is the hard alpha cliff the soft edge exists to dissolve.
+        assert_eq!(
+            EDGE_SOFT_WIDTH,
+            f32::from(MINIMUM_FADE_INDICES) / 2.0 / 255.0,
+            "EDGE_SOFT_WIDTH is no longer eight palette indices; the 4/8/16 \
+             Harvey comparison behind the number is in its doc comment",
         );
     }
 

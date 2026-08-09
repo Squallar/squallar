@@ -751,7 +751,7 @@ const COARSE: [u32; 3] = [64, 64, 64];
 
 /// The mask really is a mask, and image rows really do run top-down.
 ///
-/// Two assumptions everything after this rests on, both checked rather than
+/// Three assumptions everything after this rests on, each checked rather than
 /// asserted in a comment:
 ///
 /// 1. **Saturation.** With [`hard_mask_lut`] and [`SATURATING_EXTINCTION`] the
@@ -763,6 +763,13 @@ const COARSE: [u32; 3] = [64, 64, 64];
 ///    in the bottom half of the box must therefore land in the bottom half of
 ///    the image; if the sign were wrong every mask comparison would still be
 ///    self-consistent and every silhouette would be upside down.
+/// 3. **The default edge width is hard.** Every uniform in this file leaves
+///    `edge_soft_width` at `DEFAULT_EDGE_SOFT_WIDTH`, whose claim is that zero
+///    keeps an instrument's edge binary — and an index-255 shape cannot check
+///    that claim, because under a saturating extinction a leaked soft width
+///    leaves a sub-saturation shell only ~0.2% of a cell wide there. The
+///    index-1 sphere is the observation: the same shell spans ~18% of a cell,
+///    so a soft default greys hundreds of boundary pixels instead of zero.
 ///
 /// ```text
 /// cargo test -p rustdar-frontend --test volume_silhouette \
@@ -848,6 +855,66 @@ fn a_hard_palette_makes_the_render_a_binary_mask_and_the_rows_run_top_down() {
         pixels.len(),
     );
     assert!(full > 0 && zero > 0, "the mask must have both phases");
+
+    // --- the default edge width really is hard, on a shape that can see it
+    //
+    // `DEFAULT_EDGE_SOFT_WIDTH` claims zero keeps every instrument's edge
+    // binary — but the index-255 sphere above cannot observe a soft default
+    // leaking in. Under saturating extinction only ramp values below ~1e-3
+    // leave a grey pixel, and at index 255 the interpolated index climbs 255
+    // index-steps per cell across the boundary, so with a leaked width of
+    // 8/255 that sub-saturation shell is ~0.2% of one cell: sub-pixel at this
+    // footprint, 0 grey pixels of 65536, and the flipped default survived the
+    // whole GPU set. At index 1 the same crossing climbs one index-step per
+    // cell, the shell spans ~18% of a cell, and the leak paints grey pixels
+    // by the hundreds along the silhouette boundary. So the low-index sphere
+    // is the shape on which the default's claim can observe its own bug.
+    //
+    // `masking_uniform` deliberately leaves `edge_soft_width` at the struct
+    // default — that is the channel every instrument in this file relies on.
+    let faint_sphere = plant_at(cells, 1, |c| {
+        let d = [c[0] - 0.5, c[1] - 0.5, c[2] - 0.5];
+        (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() < 0.3
+    });
+    let pixels = raymarch_once(
+        &device,
+        &queue,
+        &pipelines,
+        cells,
+        &faint_sphere,
+        &lut,
+        &uniform,
+        size,
+    );
+    let mut faint_grey = 0usize;
+    let mut faint_full = 0usize;
+    let mut faint_zero = 0usize;
+    for p in &pixels {
+        match p[3] {
+            0 => faint_zero += 1,
+            255 => faint_full += 1,
+            _ => faint_grey += 1,
+        }
+    }
+    println!(
+        "index-1 sphere: alpha histogram over {} px: 0 -> {faint_zero}, \
+         partial -> {faint_grey}, 255 -> {faint_full}",
+        pixels.len(),
+    );
+    assert!(
+        faint_grey == 0,
+        "{faint_grey} of {} pixels of an index-1 shape are partially \
+         transparent under a saturating extinction: a soft edge width has \
+         leaked into the instrument default. DEFAULT_EDGE_SOFT_WIDTH must \
+         stay 0 — the production width belongs to volume::bridge, and a soft \
+         default puts a grey band on every instrument's edge, exactly as its \
+         doc claims",
+        pixels.len(),
+    );
+    assert!(
+        faint_full > 0 && faint_zero > 0,
+        "the index-1 mask must have both phases"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1119,8 +1186,12 @@ fn a_planted_slab_projects_to_its_exact_ray_cast_silhouette() {
             // this layer's mask, every lost pixel at Chebyshev distance 0 from
             // the analytic boundary, and the fine grid 0.04%. The interior is
             // still the hard claim: no *lost* pixel may sit deeper than the
-            // boundary ring. (Overpaint is the filter's dilation and keeps its
-            // own bound, the two-cell envelope below.)
+            // boundary ring. Two different bounds, stated so the 1 px below is
+            // not read as the edge's total play: **losses** are the jitter's
+            // and are bounded at 1 px (the tangent ring), while **overpaint**
+            // is the linear filter's dilation and is bounded only by the
+            // two-cell envelope — about 4-5 px at the coarse grid's projected
+            // cell size here — which the overflow assertion below holds it to.
             assert!(
                 covered_fraction(&rendered, &expected) > 0.995,
                 "{label} on {cells:?} lost {:.3}% of its analytic silhouette, \

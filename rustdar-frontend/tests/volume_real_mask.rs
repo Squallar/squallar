@@ -198,13 +198,16 @@ fn render_a_real_volume_mask() {
 
     // The picture, at the production transfer function and the grid's own
     // palette. The transfer fields are set exactly as `volume::bridge` sets
-    // them — the fade-anchored skip threshold and the soft edge included —
+    // them — the fade-anchored skip threshold and the soft edge included,
+    // imported from the bridge rather than restated, so an anchor change
+    // there cannot leave this harness rendering a different threshold —
     // because "production" is the bridge's configuration, and a harness that
     // rendered the hard-threshold instrument configuration in colour would
     // show an edge the application does not draw.
     uniform.extinction_per_km = rustdar_frontend::volume::uniform::DEFAULT_EXTINCTION_PER_KM;
     uniform.gradient_shading = true;
-    uniform.empty_index_threshold = (f32::from(grid.fade_band()) - 0.5) / 255.0;
+    uniform.empty_index_threshold =
+        rustdar_frontend::volume::bridge::empty_index_threshold_for(grid.fade_band());
     uniform.edge_soft_width = rustdar_frontend::volume::bridge::EDGE_SOFT_WIDTH;
     let colour_pixels = raymarch_once(
         &device,

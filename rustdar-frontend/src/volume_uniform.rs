@@ -100,7 +100,9 @@ pub const DEFAULT_EARLY_OUT_TRANSMITTANCE: f32 = 0.004;
 /// `volume::bridge`, which anchors the threshold at the palette's own fade
 /// boundary and widens the ramp — see `EDGE_SOFT_WIDTH` there for the number
 /// and the measurement behind it. A soft default here would put a grey band on
-/// every instrument's edge instead.
+/// every instrument's edge instead — observed, not asserted: the index-1 shape
+/// in `tests/volume_silhouette.rs`'s mask-instrument test greys hundreds of
+/// boundary pixels the moment this is not zero.
 pub const DEFAULT_EDGE_SOFT_WIDTH: f32 = 0.0;
 
 /// Fraction of a lit surface's colour that survives facing away from the light.

@@ -101,10 +101,13 @@ fn measure_the_raymarch_cost_on_a_real_volume() {
             uniform.box_from_clip = view.box_from_clip;
             uniform.eye_in_box = view.eye_in_box;
             uniform.gradient_shading = shading;
-            // The bridge's own transfer edge, so the timed march is the
-            // shipped march — the fade-anchored skip changes what the empty
-            // shell costs, and that saving is production behaviour.
-            uniform.empty_index_threshold = (f32::from(grid.fade_band()) - 0.5) / 255.0;
+            // The bridge's own transfer edge, imported rather than restated,
+            // so the timed march is the shipped march — the fade-anchored
+            // skip changes what the empty shell costs, and that saving is
+            // production behaviour. An anchor change in the bridge cannot
+            // leave this instrument measuring a different threshold.
+            uniform.empty_index_threshold =
+                rustdar_frontend::volume::bridge::empty_index_threshold_for(grid.fade_band());
             uniform.edge_soft_width = rustdar_frontend::volume::bridge::EDGE_SOFT_WIDTH;
             volume.write_uniform(&queue, &uniform);
 
@@ -142,7 +145,8 @@ fn measure_the_raymarch_cost_on_a_real_volume() {
             uniform.box_from_clip = view.box_from_clip;
             uniform.eye_in_box = view.eye_in_box;
             uniform.gradient_shading = true;
-            uniform.empty_index_threshold = (f32::from(grid.fade_band()) - 0.5) / 255.0;
+            uniform.empty_index_threshold =
+                rustdar_frontend::volume::bridge::empty_index_threshold_for(grid.fade_band());
             uniform.edge_soft_width = rustdar_frontend::volume::bridge::EDGE_SOFT_WIDTH;
             volume.write_uniform(&queue, &uniform);
 
