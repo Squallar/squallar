@@ -17,6 +17,7 @@ use crate::channels::ChannelHub;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::constants::{RENDER_HEIGHT, RENDER_WIDTH};
 use crate::input::InputHandler;
+use crate::location_permission::LocationGate;
 use crate::loop_downloads::LoopDownloadManager;
 use crate::platform::{PlatformBridge, RedrawWaker};
 use crate::render_dispatch::RenderDispatcher;
@@ -368,6 +369,9 @@ pub struct App {
     /// exactly — see [`RedrawWaker`] for why a slot rather than a snapshot, and
     /// why the emptying is the load-bearing half.
     redraw_waker: RedrawWaker,
+    /// The only thing in this application that can raise a location permission
+    /// prompt. See [`crate::location_permission`].
+    location: LocationGate,
 }
 
 /// Bookkeeping for the periodic config write.
@@ -520,6 +524,37 @@ fn apply_location_hint(gui: &mut Gui, platform: &dyn PlatformBridge) -> bool {
     true
 }
 
+/// How coarse a fix may be and still be allowed to spend the provisional site.
+///
+/// **Deliberately enormous, and the number is measured rather than guessed.**
+/// The instinct is to demand a tight fix here, and it is exactly backwards: the
+/// thing this replaces is the IANA timezone guess, whose population-weighted
+/// mean error is **605 km** and which opens 61% of sampled US metro population
+/// on a radar that physically cannot see their weather. A GeoClue IP lookup —
+/// the coarsest source rustdar will ever read — measures **25 km**, and
+/// displacing every sample point by that much changed the chosen site in only
+/// **5.5%** of probes, by a median of 17 km. WSR-88D sites sit ~200 km apart;
+/// this job simply does not need precision.
+///
+/// So the gate exists to reject the absurd, not to hold a standard. 150 km is
+/// roughly where a fix stops beating the hint it would replace. Set it tight
+/// and the single largest win in the feature is silently switched off.
+const MAX_RELOCATION_ACCURACY_M: f64 = 150_000.0;
+
+/// Whether a fix reporting this accuracy may choose the opening site.
+///
+/// `None` passes. Every NMEA source reports no accuracy at all — the sentences
+/// carry HDOP, a dimensionless geometry factor, and no way to turn it into
+/// metres — and the serial path has been trusted since before this field
+/// existed. Treating absence as failure would disable the serial dongle's own
+/// upgrade, which is the one source here that is *more* accurate than the
+/// threshold, not less.
+fn fix_is_accurate_enough_to_relocate(accuracy_m: Option<f64>) -> bool {
+    // `is_none_or`, so a NaN accuracy — which no producer should emit and which
+    // compares false against everything — is rejected rather than admitted.
+    accuracy_m.is_none_or(|m| m <= MAX_RELOCATION_ACCURACY_M)
+}
+
 impl App {
     /// Build the application around a caller-supplied platform bridge.
     ///
@@ -615,6 +650,11 @@ impl App {
             manual_nav_pending: false,
             last_viewport: None,
             redraw_waker: RedrawWaker::new(),
+            // Inert until the first `poll_platform_state`, which is inside the
+            // first frame — deliberately after `set_config_dir`, so the gate
+            // finds the memo Android only learns the path to during
+            // `android_main`.
+            location: LocationGate::new(),
         };
 
         // Here, and not later, because "later" does not exist for two of the
@@ -828,12 +868,31 @@ impl App {
         dark
     }
 
-    /// Poll for platform-specific theme, GPS fix, and compass heading changes.
+    /// Poll for platform-specific theme, location, GPS fix, and compass heading
+    /// changes.
     fn poll_platform_state(&mut self) {
         if let Some(new_theme) = self.platform.poll_theme()
             && self.adopt_theme(new_theme)
         {
             notify_redraw(&self.window);
+        }
+        // Ahead of the fix poll, and that ordering is the point: this is what
+        // starts delivery in the first place, so on the frame after a grant
+        // lands the fix it produces is drained in the same pass rather than the
+        // next one.
+        let step = self
+            .location
+            .step(self.platform.as_mut(), self.gui.show_settings);
+        if step.changed {
+            self.gui
+                .set_location_state(self.location.permission(), self.location.active());
+            notify_redraw(&self.window);
+        }
+        // Consent for the position on screen has gone away. The serial reader
+        // is deliberately exempt: a dongle the user plugged in is not covered
+        // by this permission and its dot must survive a location denial.
+        if step.revoked && !self.platform.gps_active() {
+            self.gui.clear_gps_fix();
         }
         if let Some(fix) = self.platform.poll_gps_fix() {
             self.upgrade_provisional_site(&fix);
@@ -1779,9 +1838,27 @@ impl App {
         if !self.site_is_provisional {
             return;
         }
-        // An `Invalid` quality is the "no fix yet" state the map already treats
-        // as no location, and its coordinates are meaningless.
-        if !matches!(fix.fix_quality, rustdar_gps::FixQuality::Gps) {
+        // Not every fix is a statement about where the user is. `FixQuality::None`
+        // means the receiver's fix flag is clear, so its coordinates are stale;
+        // `Manual` is a position somebody typed into the dongle and `Simulation`
+        // is a canned track — both live on the serial path, both perfectly
+        // well-formed, and neither one a place. See `FixQuality::can_relocate`,
+        // which is named for *this* question rather than for whether there are
+        // coordinates in the struct.
+        //
+        // (The map itself never reads `fix_quality` at all — `ui_map.rs` draws
+        // the dot from latitude and longitude alone — so this gate is about the
+        // site choice and nothing else. An earlier version of this comment
+        // claimed the opposite, and named a variant that does not exist.)
+        if !fix.fix_quality.can_relocate() {
+            return;
+        }
+        if !fix_is_accurate_enough_to_relocate(fix.accuracy_m) {
+            log::debug!(
+                "ignoring a {:.0} km fix for the opening site; the timezone \
+                 guess it would replace is better than that",
+                fix.accuracy_m.unwrap_or_default() / 1000.0
+            );
             return;
         }
         let Some((site, dist)) =
@@ -2194,6 +2271,12 @@ impl ApplicationHandler for App {
         // query — see `handle_resized`, which catches the orientation changes
         // that never come back through here.
         self.refresh_safe_area_insets();
+
+        // A location permission can be changed in system settings while the app
+        // is in the background, and in a settled state the gate has stopped
+        // polling for it entirely — so this is the one moment a revocation made
+        // outside the app is noticed at all.
+        self.location.resumed();
     }
 
     /// Pick up a back press the platform delivered outside the input queue.
@@ -3173,6 +3256,261 @@ mod tests {
             "KDLH",
             "a second fix moved a site that was already settled"
         );
+    }
+
+    /// The OS location services all report a fused position and decline to name
+    /// the source, so none of them can honestly claim `Gps`. Requiring that
+    /// variant — as this gate used to — meant a desktop, iOS or Android network
+    /// fix drew a blue dot and never refined the site it was drawn on.
+    #[test]
+    fn an_os_fix_refines_a_guessed_site() {
+        let mut bridge = TestBridge::desktop().with_timezone("America/Chicago");
+        let fixes = bridge.gps_channel();
+        let mut app = headless(bridge);
+        assert_eq!(opening_site(&app), "KLOT");
+
+        fixes
+            .send(rustdar_gps::GpsFix {
+                // What GeoClue measured on the developer's own machine: an
+                // IP/ichnaea lookup, and comfortably good enough to choose
+                // among sites 200 km apart.
+                accuracy_m: Some(25_000.0),
+                ..rustdar_gps::GpsFix::from_device_position(46.7867, -92.1005)
+            })
+            .unwrap();
+        app.poll_platform_state();
+
+        assert_eq!(
+            opening_site(&app),
+            "KDLH",
+            "a platform location fix drew a dot and left the map on the \
+             timezone's guess"
+        );
+    }
+
+    /// A GPS simulator is a real thing on the serial path — GGA quality 8, and
+    /// quality 7 is a position somebody typed into the receiver. Both carry
+    /// well-formed coordinates and neither is a place, so neither may move the
+    /// user's radar.
+    #[test]
+    fn a_simulated_fix_does_not_move_the_radar_site() {
+        for quality in [
+            rustdar_gps::FixQuality::Simulation,
+            rustdar_gps::FixQuality::Manual,
+            rustdar_gps::FixQuality::None,
+        ] {
+            let mut bridge = TestBridge::desktop().with_timezone("America/Chicago");
+            let fixes = bridge.gps_channel();
+            let mut app = headless(bridge);
+
+            fixes
+                .send(rustdar_gps::GpsFix {
+                    fix_quality: quality,
+                    ..rustdar_gps::GpsFix::from_lat_lon(46.7867, -92.1005)
+                })
+                .unwrap();
+            app.poll_platform_state();
+
+            assert_eq!(
+                opening_site(&app),
+                "KLOT",
+                "a {quality:?} fix relocated the user's radar site"
+            );
+            assert!(
+                app.site_is_provisional,
+                "a {quality:?} fix spent the one upgrade a real fix was owed"
+            );
+        }
+    }
+
+    /// The threshold is enormous on purpose — see `MAX_RELOCATION_ACCURACY_M`,
+    /// where the measurements are — so this is about the absurd end: a fix
+    /// whose stated uncertainty is wider than the region the timezone guess
+    /// already resolved must not spend the one upgrade.
+    #[test]
+    fn a_low_accuracy_fix_does_not_spend_the_provisional_site() {
+        let mut bridge = TestBridge::desktop().with_timezone("America/Chicago");
+        let fixes = bridge.gps_channel();
+        let mut app = headless(bridge);
+
+        fixes
+            .send(rustdar_gps::GpsFix {
+                accuracy_m: Some(MAX_RELOCATION_ACCURACY_M * 2.0),
+                ..rustdar_gps::GpsFix::from_device_position(46.7867, -92.1005)
+            })
+            .unwrap();
+        app.poll_platform_state();
+
+        assert_eq!(opening_site(&app), "KLOT");
+        assert!(
+            app.site_is_provisional,
+            "a fix too coarse to use was still spent, so the good one that \
+             follows it can never refine anything"
+        );
+
+        // And the good fix that follows still works, which is the half that
+        // makes the rejection worth anything.
+        fixes
+            .send(rustdar_gps::GpsFix {
+                accuracy_m: Some(25_000.0),
+                ..rustdar_gps::GpsFix::from_device_position(46.7867, -92.1005)
+            })
+            .unwrap();
+        app.poll_platform_state();
+        assert_eq!(opening_site(&app), "KDLH");
+    }
+
+    /// The measured GeoClue number, pinned. It is an order of magnitude coarser
+    /// than a satellite fix and an order of magnitude better than it needs to
+    /// be: displacing a sample point by 25 km changed the chosen site in 5.5%
+    /// of probes. A threshold that rejected it would switch off the largest
+    /// single improvement this feature has.
+    #[test]
+    fn the_accuracy_gate_admits_a_coarse_but_usable_fix() {
+        assert!(fix_is_accurate_enough_to_relocate(Some(25_000.0)));
+        assert!(
+            fix_is_accurate_enough_to_relocate(None),
+            "the serial path reports no accuracy at all and has always been \
+             trusted"
+        );
+        assert!(!fix_is_accurate_enough_to_relocate(Some(1_000_000.0)));
+        assert!(
+            !fix_is_accurate_enough_to_relocate(Some(f64::NAN)),
+            "a NaN accuracy compares false against everything, so it has to be \
+             rejected explicitly or it slips through as 'good enough'"
+        );
+    }
+
+    // ── The location permission gate, from the App's side ───────────────
+    //
+    // `location_permission.rs` owns the state machine and tests it against a
+    // clock it controls. What belongs here is the wiring: that the gate is
+    // stepped at all, that what it observes reaches the UI, and that a
+    // revocation takes the dot with it.
+
+    /// The gate is stepped from `poll_platform_state`, and what it sees is
+    /// pushed to the `Gui` — which is the only copy the settings pane can read,
+    /// since `rustdar-egui` cannot see a `PlatformBridge`.
+    #[test]
+    fn what_the_platform_says_about_location_reaches_the_settings_pane() {
+        let bridge =
+            TestBridge::desktop().with_permission(rustdar_gps::LocationPermission::Granted);
+        let location = bridge.location_record();
+        let mut app = headless(bridge);
+        assert_eq!(
+            app.gui.location_permission(),
+            rustdar_gps::LocationPermission::Unknown,
+            "the cache starts inert, before anything has been polled"
+        );
+
+        app.poll_platform_state();
+
+        assert_eq!(
+            app.gui.location_permission(),
+            rustdar_gps::LocationPermission::Granted
+        );
+        assert!(
+            app.gui.location_active(),
+            "a grant with no stream is where every desktop process starts; \
+             something has to turn it on"
+        );
+        assert_eq!(location.requests.get(), 1);
+    }
+
+    /// Consent went away, so the position drawn under it must go too. Leaving
+    /// it is the app showing a location it has just been told it may not know.
+    #[test]
+    fn a_revoked_permission_stops_delivery_and_clears_the_dot() {
+        let bridge =
+            TestBridge::desktop().with_permission(rustdar_gps::LocationPermission::Granted);
+        let location = bridge.location_record();
+        let mut app = headless(bridge);
+        app.poll_platform_state();
+        app.gui
+            .set_gps_fix(rustdar_gps::GpsFix::from_device_position(35.25, -97.5));
+        assert!(app.gui.gps_fix().is_some());
+
+        // Revoked in system settings, with no process restart — which is what
+        // happens on every desktop OS.
+        location
+            .permission
+            .set(rustdar_gps::LocationPermission::Denied);
+        app.location.resumed();
+        app.poll_platform_state();
+
+        assert!(!location.active.get(), "the stream was left running");
+        assert!(
+            app.gui.gps_fix().is_none(),
+            "the blue dot is still on the map at a position the user has \
+             withdrawn consent for"
+        );
+    }
+
+    /// The serial dongle is not covered by this permission — it is a device the
+    /// user plugged in — so a location denial must not take its dot away.
+    #[test]
+    fn a_revoked_permission_leaves_a_serial_dongles_dot_alone() {
+        let bridge =
+            TestBridge::desktop().with_permission(rustdar_gps::LocationPermission::Granted);
+        let location = bridge.location_record();
+        let mut app = headless(bridge);
+        app.poll_platform_state();
+        app.platform.start_gps(&rustdar_gps::GpsConfig::default());
+        app.gui
+            .set_gps_fix(rustdar_gps::GpsFix::from_lat_lon(35.25, -97.5));
+
+        location
+            .permission
+            .set(rustdar_gps::LocationPermission::Denied);
+        app.location.resumed();
+        app.poll_platform_state();
+
+        assert!(
+            app.gui.gps_fix().is_some(),
+            "denying the OS location service took the serial receiver's dot \
+             off the map with it"
+        );
+    }
+
+    /// Android cannot tell "never asked" from "permanently denied" on its own —
+    /// `shouldShowRequestPermissionRationale` is `false` for both — so the memo
+    /// on this side has to tell it, and this is the wire that does.
+    #[test]
+    fn a_bridge_that_needs_the_attempt_count_is_told_it() {
+        let bridge = TestBridge::android().with_permission(rustdar_gps::LocationPermission::Prompt);
+        let location = bridge.location_record();
+        let mut app = headless(bridge);
+        // Android has no config dir until `android_main` supplies one.
+        app.platform
+            .set_config_dir(std::path::PathBuf::from("/data"));
+
+        app.poll_platform_state();
+
+        assert_eq!(
+            location.attempts.get(),
+            Some(1),
+            "the bridge was asked to prompt and never told it had been"
+        );
+    }
+
+    /// Turning location off in the settings pane stops the stream and takes the
+    /// dot with it, at the moment of the click rather than at the next poll.
+    #[test]
+    fn turning_location_off_stops_the_stream_and_clears_the_dot() {
+        let bridge =
+            TestBridge::desktop().with_permission(rustdar_gps::LocationPermission::Granted);
+        let location = bridge.location_record();
+        let mut app = headless(bridge);
+        app.poll_platform_state();
+        app.gui
+            .set_gps_fix(rustdar_gps::GpsFix::from_device_position(35.25, -97.5));
+        assert!(location.active.get());
+
+        app.handle_gui_action(GuiAction::StopLocation, None);
+
+        assert!(!location.active.get(), "the off switch did not switch off");
+        assert!(app.gui.gps_fix().is_none(), "the dot outlived the stream");
+        assert!(!app.gui.location_active(), "the pane still reads 'On.'");
     }
 
     // ── Waking the loop from a thread that is not this one ──────────────

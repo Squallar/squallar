@@ -103,6 +103,31 @@ impl PlatformBridge for WebPlatform {
         false
     }
 
+    // ── Platform location service ───────────────────────────────────────
+    //
+    // Stubs. The browser's is the one location service already wired in this
+    // repo — `geolocation::start_watch` is called unconditionally from
+    // `entry::start` — and moving it behind these three methods is its own
+    // change, because it has a question attached that the others do not: the
+    // watch's `Closure`s are currently `forget()`ten, so `clearWatch` has
+    // nothing safe to cancel, and the settings pane's new **Turn off** button
+    // makes that user-visible for the first time.
+    //
+    // `Unavailable` rather than `Unknown` in the meantime, so the gate does not
+    // poll a bridge that will not answer and the pane does not sit on
+    // "Checking…". The unconditional watch keeps working exactly as it does
+    // today; what it does not yet do is tell anybody about it.
+
+    fn location_permission(&self) -> rustdar_gps::LocationPermission {
+        rustdar_gps::LocationPermission::Unavailable
+    }
+
+    fn request_location(&mut self) -> bool {
+        false
+    }
+
+    fn stop_location(&mut self) {}
+
     fn window_attributes(
         &self,
         attributes: winit::window::WindowAttributes,

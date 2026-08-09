@@ -279,6 +279,25 @@ impl super::App {
             GuiAction::StopGps => {
                 self.platform.stop_gps();
             }
+            // Through the gate in both directions, never straight at the
+            // bridge. The gate is where the persisted memo lives and where the
+            // single `request_location` call site is; a handler that reached
+            // past it would be a second way to raise a permission dialog, with
+            // none of the guards.
+            GuiAction::RequestLocation => {
+                self.location.enable(self.platform.as_mut());
+            }
+            GuiAction::StopLocation => {
+                self.location.disable(self.platform.as_mut());
+                self.gui
+                    .set_location_state(self.location.permission(), self.location.active());
+                // The dot is fed by whatever was delivering. Nothing else will
+                // clear it — the gate has already stopped polling — so it goes
+                // here, and only when a serial dongle is not also feeding it.
+                if !self.platform.gps_active() {
+                    self.gui.clear_gps_fix();
+                }
+            }
         }
     }
 

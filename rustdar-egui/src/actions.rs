@@ -100,6 +100,23 @@ pub enum GuiAction {
     },
     /// Stop the desktop serial GPS reader.
     StopGps,
+    /// Turn the platform location service on at the user's request.
+    ///
+    /// A *gesture*, not a command: it clears the app's memory of having asked
+    /// and lets the location gate decide what that means, which on a platform
+    /// that has already refused is nothing at all. Raised by the Location
+    /// control and by `Reset to defaults`, which is the obvious way somebody
+    /// tries to get a dismissed prompt back.
+    ///
+    /// Deliberately not `StartGps`'s sibling. That one opens a serial port; this
+    /// one asks the operating system for a privilege.
+    RequestLocation,
+    /// Turn the platform location service off at the user's request.
+    ///
+    /// Stops the stream. It cannot hand the permission back — no platform
+    /// offers an app a way to do that — so the control says "turn off" rather
+    /// than anything about revoking.
+    StopLocation,
     /// Build the voxel grid a 3D pane needs, if it is not already in hand.
     ///
     /// Emitted from inside the pane's own render arm, on every frame the pane
@@ -221,6 +238,12 @@ impl std::fmt::Display for GuiAction {
             }
             GuiAction::StopGps => {
                 write!(f, "Stop GPS")
+            }
+            GuiAction::RequestLocation => {
+                write!(f, "Use the platform location service")
+            }
+            GuiAction::StopLocation => {
+                write!(f, "Stop the platform location service")
             }
             GuiAction::PrepareVolume { pane_idx, target } => {
                 write!(

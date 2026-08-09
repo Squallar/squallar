@@ -156,8 +156,12 @@ mod tests {
         assert_eq!(fix.longitude, -97.5);
     }
 
-    /// Not `GpsFix::default()`: the map treats an `Invalid` quality as "no
-    /// location" and draws nothing.
+    /// Not `GpsFix::default()`, whose quality is `FixQuality::None` — the "no
+    /// fix yet" state, whose coordinates mean nothing. The map does not read
+    /// the quality at all (`ui_map.rs` draws the dot from latitude and
+    /// longitude alone), so what a defaulted quality would break is the
+    /// *site* upgrade: `FixQuality::can_relocate` refuses it, and a browser
+    /// reading would silently stop refining the opening site.
     #[test]
     fn a_reading_counts_as_a_gps_fix() {
         let fix = fix_from_coords(35.25, -97.5, None, None, None);

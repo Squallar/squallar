@@ -363,6 +363,13 @@ fn last_known_location_with(
             satellites: None, // Not available from getLastKnownLocation
             fix_quality,
             hdop: None,
+            // `Location.getAccuracy()` would fill this in, and reading it is
+            // one more JNI call in a function that already makes eight. It is
+            // left for the Android phase, which owns this file: the only reader
+            // today treats `None` as passing, so an absent accuracy costs
+            // nothing here and a half-wired one would be a second thing to
+            // review in the wrong change.
+            accuracy_m: None,
             timestamp: None,
         });
     }

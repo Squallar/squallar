@@ -66,6 +66,11 @@ impl NmeaState {
             satellites,
             fix_quality,
             hdop,
+            // NMEA has no accuracy field. GGA and GSA give HDOP, which is a
+            // geometry factor and not metres — turning one into the other needs
+            // the receiver's UERE, which it does not report. `None` is the
+            // honest answer and every reader treats it as passing.
+            accuracy_m: None,
             timestamp,
         })
     }

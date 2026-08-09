@@ -298,6 +298,27 @@ pub struct Gui {
     map_tiles: MapTileState,
     // User's GPS fix (full data from GPS receiver or Android LocationManager)
     user_fix: Option<rustdar_gps::GpsFix>,
+    /// When [`user_fix`](Self::user_fix) arrived.
+    ///
+    /// Not `user_fix.timestamp`: that is the *receiver's* clock, it is absent
+    /// on every source but serial NMEA, and it says when the position was
+    /// measured rather than when this app last heard anything. The question the
+    /// settings pane asks — "is location on but not producing?" — is about the
+    /// second one.
+    user_fix_at: Option<web_time::Instant>,
+    /// What the OS last said about this app's access to the user's location,
+    /// pushed in by the frontend's location gate.
+    ///
+    /// Cached rather than queried because this crate cannot see a
+    /// `PlatformBridge` — it is the crate the bridge's trait depends *on* — so
+    /// a copy is the only thing available here. How fresh the copy is is the
+    /// gate's poll cadence, which tightens while `show_settings` is set for
+    /// exactly this reason.
+    location_permission: rustdar_gps::LocationPermission,
+    /// Whether the platform is currently delivering location fixes. A different
+    /// question from the permission: every desktop process starts granted and
+    /// silent.
+    location_active: bool,
     // Compass heading in degrees (0–360), from device compass sensor
     user_heading: Option<f32>,
     // Overlay data (SPC outlooks, NWS alerts, SPC discussions)
@@ -903,6 +924,9 @@ impl Gui {
             initial_zoom_set: false,
             map_tiles: MapTileState::default(),
             user_fix: None,
+            user_fix_at: None,
+            location_permission: rustdar_gps::LocationPermission::default(),
+            location_active: false,
             user_heading: None,
             overlays: OverlayRegistry::default(),
             panes: vec![PaneState::new()],
@@ -3259,11 +3283,48 @@ impl Gui {
     /// Set the user's GPS location for the blue dot indicator.
     pub fn set_gps_fix(&mut self, fix: rustdar_gps::GpsFix) {
         self.user_fix = Some(fix);
+        self.user_fix_at = Some(web_time::Instant::now());
     }
 
     /// See [`set_gps_fix`](Self::set_gps_fix).
     pub fn gps_fix(&self) -> Option<&rustdar_gps::GpsFix> {
         self.user_fix.as_ref()
+    }
+
+    /// Take the blue dot off the map.
+    ///
+    /// For the case the dot has no other answer to: the user has withdrawn
+    /// consent, or turned location off, and the last position delivered under
+    /// the old permission is still on screen. Leaving it there is worse than a
+    /// stale label — it is the app showing a position it has just been told it
+    /// may not know.
+    pub fn clear_gps_fix(&mut self) {
+        self.user_fix = None;
+        self.user_fix_at = None;
+    }
+
+    /// Cache what the platform location service is doing, for the settings
+    /// pane to render.
+    ///
+    /// Pushed in rather than queried: this crate cannot name a
+    /// `PlatformBridge`. See the fields.
+    pub fn set_location_state(
+        &mut self,
+        permission: rustdar_gps::LocationPermission,
+        active: bool,
+    ) {
+        self.location_permission = permission;
+        self.location_active = active;
+    }
+
+    /// See [`set_location_state`](Self::set_location_state).
+    pub fn location_permission(&self) -> rustdar_gps::LocationPermission {
+        self.location_permission
+    }
+
+    /// See [`set_location_state`](Self::set_location_state).
+    pub fn location_active(&self) -> bool {
+        self.location_active
     }
 
     pub fn set_user_heading(&mut self, heading: f32) {

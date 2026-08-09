@@ -16,20 +16,6 @@ const GPS_BAUD_RATES: &[u32] = &[4800, 9600, 38400, 115200];
 
 impl super::Gui {
     /// Render the settings window if `show_settings` is true.
-    ///
-    /// `actions` is only ever pushed to from the `gps-serial` section below, so
-    /// without that feature it is an untouched `&mut Vec` and both
-    /// `unused_variables` and `clippy::ptr_arg` fire. Taking `&mut [GuiAction]`
-    /// as `ptr_arg` suggests is not an option — the feature-enabled build needs
-    /// `push` — so the lints are allowed, but only in the configuration that
-    /// provokes them. `cfg_attr` rather than a bare `allow` so that if the
-    /// serial build later stops using `actions` the warning comes back.
-    ///
-    /// This is also why the lint went unnoticed: `rustdar-platform` enables
-    /// `gps-serial` only for `cfg(not(target_os = "android"))`, so host CI never
-    /// compiles the configuration that warns. It shows up only under
-    /// `cargo ndk … clippy`.
-    #[cfg_attr(not(feature = "gps-serial"), allow(unused_variables, clippy::ptr_arg))]
     pub(super) fn render_settings(&mut self, ctx: &egui::Context, actions: &mut Vec<GuiAction>) {
         if !self.show_settings {
             return;
@@ -86,6 +72,29 @@ impl super::Gui {
                     &mut self.preferences.hail_size,
                     HailSizeUnit::ALL,
                 );
+
+                ui.add_space(SETTINGS_LARGE_SPACING);
+                ui.separator();
+                ui.add_space(SETTINGS_SMALL_SPACING);
+
+                // --- Location (all platforms) ---
+                //
+                // Ungated, and above the GPS block rather than inside it,
+                // because it is a different question with a different answer on
+                // every platform:
+                //
+                //   Location — may this app know where you are, from the OS.
+                //              A privilege, granted and withdrawn in system
+                //              settings, and the only one rustdar asks for.
+                //   GPS      — open this serial port and read NMEA from it.
+                //              A device the user plugged in. No permission
+                //              anywhere, and absent from four of five targets.
+                //
+                // Written to read as two questions, not two spellings of one:
+                // "Use my location" against "Connect GPS" below.
+                ui.heading("Location");
+                ui.add_space(SETTINGS_SMALL_SPACING);
+                self.render_location_controls(ui, actions);
 
                 ui.add_space(SETTINGS_LARGE_SPACING);
                 ui.separator();
@@ -245,12 +254,103 @@ impl super::Gui {
                     self.preferences = UserPreferences::default();
                     self.gps_config = rustdar_gps::GpsConfig::default();
                     self.storm_motion_override = crate::StormMotionOverride::default();
+                    // The location memo lives outside `Gui` — it is persisted
+                    // under its own key by the frontend's gate, precisely so a
+                    // 3 s autosave timer cannot lose it — so resetting it is an
+                    // action rather than an assignment. Included because this
+                    // button is the obvious thing a user reaches for when they
+                    // want a dismissed permission prompt back, and a "reset"
+                    // that quietly kept one piece of state would be a lie.
+                    actions.push(GuiAction::RequestLocation);
                 }
             });
 
         if !open {
             self.show_settings = false;
         }
+    }
+
+    /// The body of the Location section: one line of state, at most one button,
+    /// and — on the platforms where nothing else would say so — whether a fix
+    /// has actually arrived.
+    fn render_location_controls(&self, ui: &mut egui::Ui, actions: &mut Vec<GuiAction>) {
+        use rustdar_gps::LocationPermission;
+
+        match self.location_permission {
+            // No service to grant. No control, because there is no sequence of
+            // clicks that changes this, and "open system settings" would send
+            // the user hunting for a switch that does not exist.
+            LocationPermission::Unavailable => {
+                ui.label("Not available on this platform.");
+            }
+            // The startup window every platform has. Deliberately not a button:
+            // offering one here is how the app ends up asking before the OS has
+            // said whether anyone has been asked.
+            LocationPermission::Unknown => {
+                ui.label("Checking\u{2026}");
+            }
+            // A decision, and one only the user can reverse. No button — the
+            // platform will not show a second dialog — so the only useful thing
+            // here is where to go instead.
+            LocationPermission::Denied => {
+                ui.label("Denied.");
+                ui.label(
+                    "Location for this app is turned off. It can be turned back \
+                     on in your system settings.",
+                );
+            }
+            LocationPermission::Granted if self.location_active => {
+                ui.label("On.");
+                // "Turn off", not "revoke": this stops the stream and nothing
+                // more. No platform lets an app hand a permission back.
+                if ui.button("Turn off").clicked() {
+                    actions.push(GuiAction::StopLocation);
+                }
+            }
+            // Granted-but-idle and never-asked land on the same button on
+            // purpose. From the user's side they are one thing — "start using
+            // my location" — and the difference between them is only whether a
+            // dialog appears, which the OS decides and this pane cannot promise
+            // either way.
+            LocationPermission::Prompt | LocationPermission::Granted => {
+                if ui.button("Use my location").clicked() {
+                    actions.push(GuiAction::RequestLocation);
+                }
+            }
+        }
+
+        if let Some(line) = self.location_fix_summary() {
+            ui.label(line);
+        }
+    }
+
+    /// Whether a position has actually arrived, in one line, or `None` when
+    /// there is nothing to say.
+    ///
+    /// # Why this is not the `Fix:` readout in the GPS block
+    ///
+    /// That one is inside `#[cfg(feature = "gps-serial")]`, which web, Android,
+    /// iOS and every build without a serial port do not compile. On exactly
+    /// those platforms — the ones where the OS location service is the *only*
+    /// source — the section above would otherwise say "On." beside an empty map
+    /// and explain nothing. That is also the likely Linux outcome: GeoClue can
+    /// take a while, or answer with nothing at all.
+    ///
+    /// Coarse on purpose. Seconds would tick in a window nobody is watching for
+    /// a value that changes every few minutes.
+    fn location_fix_summary(&self) -> Option<String> {
+        if !self.location_active && self.user_fix.is_none() {
+            return None;
+        }
+        let Some(at) = self.user_fix_at else {
+            return Some("Waiting for a fix\u{2026}".to_owned());
+        };
+        let minutes = at.elapsed().as_secs() / 60;
+        Some(match minutes {
+            0 => "Last fix: just now.".to_owned(),
+            1 => "Last fix: 1 minute ago.".to_owned(),
+            n => format!("Last fix: {n} minutes ago."),
+        })
     }
 }
 

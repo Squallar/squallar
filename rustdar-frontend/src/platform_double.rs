@@ -35,7 +35,8 @@
 
 use crate::platform::{PlatformBridge, RedrawWaker, drain_latest};
 use rustdar_egui::config_store::{ConfigStore, MemoryConfigStore};
-use std::cell::RefCell;
+use rustdar_gps::LocationPermission;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::Receiver;
@@ -86,6 +87,67 @@ pub(crate) type GpsRecord = Rc<RefCell<Option<rustdar_gps::GpsConfig>>>;
 /// the fixture and the assertion.
 pub(crate) type WakerRecord = Rc<RefCell<RedrawWaker>>;
 
+/// When [`TestBridge::config_store`] answers with a store.
+///
+/// Three real cases, not two: the third is the one the location memo cares
+/// about, and it used to be unreachable through this double.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StoreAvailability {
+    /// Only once a config directory has been set. Desktop and iOS derive one in
+    /// their constructors; Android is told during `android_main`.
+    WhenToldADirectory,
+    /// Always. `localStorage` needs no path and is there from the first frame,
+    /// which is why the web bridge never returns `None` for "not told where
+    /// yet".
+    Always,
+    /// Never. A browser with site data blocked, or a desktop process with no
+    /// `XDG_CONFIG_HOME`, `HOME` or `LOCALAPPDATA` — a container, a systemd
+    /// unit. Both are documented in the bridges they come from, and on both the
+    /// location permission itself works fine.
+    Never,
+}
+
+/// The location state a test shares with the bridge after `App` has taken it.
+///
+/// Every field is behind an `Rc<Cell<_>>` because that is the only way a test
+/// can still touch them: `App` owns the bridge by value from `headless` on, and
+/// the interesting moments — the user tapping Allow, revoking in system
+/// settings, the OS quietly stopping delivery on a background transition — all
+/// happen *after* that point.
+#[derive(Clone)]
+pub(crate) struct LocationRecord {
+    /// What `location_permission` answers.
+    pub(crate) permission: Rc<Cell<LocationPermission>>,
+    /// Whether the bridge is delivering.
+    pub(crate) active: Rc<Cell<bool>>,
+    /// How many times `request_location` has been called.
+    ///
+    /// A counter, not a bool: "asked twice" is the failure mode with a dialog
+    /// in it, and a bool records it as a success.
+    pub(crate) requests: Rc<Cell<usize>>,
+    /// How many times `location_permission` has been read. On Android that is a
+    /// JNI call, so the poll cadence is a cost worth asserting on.
+    pub(crate) queries: Rc<Cell<usize>>,
+    /// What `request_location` returns. `true` on every real bridge but
+    /// Android's, which is the only one that can tell.
+    pub(crate) reaches_the_os: Rc<Cell<bool>>,
+    /// What the app last told the bridge about how many times it has asked.
+    pub(crate) attempts: Rc<Cell<Option<u8>>>,
+}
+
+impl Default for LocationRecord {
+    fn default() -> Self {
+        Self {
+            permission: Rc::new(Cell::new(LocationPermission::default())),
+            active: Rc::new(Cell::new(false)),
+            requests: Rc::new(Cell::new(0)),
+            queries: Rc::new(Cell::new(0)),
+            reaches_the_os: Rc::new(Cell::new(true)),
+            attempts: Rc::new(Cell::new(None)),
+        }
+    }
+}
+
 pub(crate) struct TestBridge {
     /// `false` on iOS, where `exit()` is an App Store rejection.
     supports_exit: bool,
@@ -120,11 +182,15 @@ pub(crate) struct TestBridge {
     gps: GpsRecord,
     /// See [`WakerRecord`].
     waker: WakerRecord,
-    writes: Rc<std::cell::Cell<usize>>,
+    writes: Rc<Cell<usize>>,
+    /// See [`StoreAvailability`].
+    store_availability: StoreAvailability,
     /// What `iana_timezone` answers. `None` stands for the platforms and
     /// environments that cannot say — a container with no zone configured, or a
     /// browser too old for `Intl` — where the app must keep its own default.
     timezone: Option<String>,
+    /// See [`LocationRecord`].
+    location: LocationRecord,
 }
 
 impl TestBridge {
@@ -145,8 +211,10 @@ impl TestBridge {
             heading_receiver: None,
             gps: Rc::new(RefCell::new(None)),
             waker: Rc::new(RefCell::new(RedrawWaker::new())),
-            writes: Rc::new(std::cell::Cell::new(0)),
+            writes: Rc::new(Cell::new(0)),
+            store_availability: StoreAvailability::WhenToldADirectory,
             timezone: None,
+            location: LocationRecord::default(),
         }
     }
 
@@ -183,10 +251,73 @@ impl TestBridge {
         }
     }
 
+    /// `WebPlatform`: `localStorage` from the first frame with no directory
+    /// involved, no filesystem for the zone cache, no back handler, and an
+    /// "exit" that is only the event loop stopping.
+    pub(crate) fn web() -> Self {
+        Self {
+            store_availability: StoreAvailability::Always,
+            ..Self::bare()
+        }
+    }
+
     /// A handle on the blobs `config_store` hands out, for seeding a config
     /// before the app loads it and for reading back what the app saved.
     pub(crate) fn store(&self) -> Rc<MemoryConfigStore> {
         Rc::clone(&self.store)
+    }
+
+    /// Persist into `store` rather than into a fresh one, so a test can close
+    /// an app and open another over the same blobs — which is the only way to
+    /// exercise anything the app is supposed to remember across restarts.
+    pub(crate) fn with_store(mut self, store: Rc<MemoryConfigStore>) -> Self {
+        self.store = store;
+        self
+    }
+
+    /// Answer `config_store` with `None`, permanently.
+    ///
+    /// See [`StoreAvailability::Never`] for the two shipping configurations
+    /// this stands for.
+    pub(crate) fn without_config_store(mut self) -> Self {
+        self.store_availability = StoreAvailability::Never;
+        self
+    }
+
+    /// What `location_permission` answers to begin with.
+    pub(crate) fn with_permission(self, permission: LocationPermission) -> Self {
+        self.location.permission.set(permission);
+        self
+    }
+
+    /// Whether `request_location` reports that the ask reached the OS.
+    ///
+    /// Only Android's bridge can honestly answer `false`; the default here is
+    /// `true`, as the other four fabricate it.
+    pub(crate) fn with_request_reaching_the_os(self, reaches: bool) -> Self {
+        self.location.reaches_the_os.set(reaches);
+        self
+    }
+
+    /// See [`LocationRecord`]. Taken before the bridge is boxed into an `App`.
+    pub(crate) fn location_record(&self) -> LocationRecord {
+        self.location.clone()
+    }
+
+    /// The cell behind `location_permission`, for the tests that need the OS to
+    /// change its mind mid-session.
+    pub(crate) fn permission_cell(&self) -> Rc<Cell<LocationPermission>> {
+        Rc::clone(&self.location.permission)
+    }
+
+    /// How many times the app has called `request_location`.
+    pub(crate) fn location_requests(&self) -> usize {
+        self.location.requests.get()
+    }
+
+    /// How many times the app has read `location_permission`.
+    pub(crate) fn permission_queries(&self) -> usize {
+        self.location.queries.get()
     }
 
     /// How many times the app has written config through this bridge.
@@ -295,9 +426,15 @@ impl PlatformBridge for TestBridge {
 
     /// `None` until this platform has been told where config lives, which is
     /// what makes `App::set_config_dir` observable: before it, there is no
-    /// store to load from.
+    /// store to load from. See [`StoreAvailability`] for the two bridges that
+    /// do not work that way.
     fn config_store(&self) -> Option<Box<dyn ConfigStore>> {
-        self.config_dir.as_ref().map(|_| {
+        let available = match self.store_availability {
+            StoreAvailability::WhenToldADirectory => self.config_dir.is_some(),
+            StoreAvailability::Always => true,
+            StoreAvailability::Never => false,
+        };
+        available.then(|| {
             Box::new(SharedStore {
                 inner: Rc::clone(&self.store),
                 writes: Rc::clone(&self.writes),
@@ -355,5 +492,37 @@ impl PlatformBridge for TestBridge {
 
     fn gps_active(&self) -> bool {
         self.gps.borrow().is_some()
+    }
+
+    fn location_permission(&self) -> LocationPermission {
+        self.location.queries.set(self.location.queries.get() + 1);
+        self.location.permission.get()
+    }
+
+    /// Starts delivery, as every real bridge does — the web's `watchPosition`
+    /// is literally the same call as the prompt.
+    ///
+    /// Deliberately starts even from `Prompt`: on a platform where the ask and
+    /// the subscription are one call there is no other order available, and a
+    /// double that refused would hide the case the gate has to handle.
+    fn request_location(&mut self) -> bool {
+        self.location.requests.set(self.location.requests.get() + 1);
+        let reached = self.location.reaches_the_os.get();
+        if reached && self.location.permission.get() == LocationPermission::Granted {
+            self.location.active.set(true);
+        }
+        reached
+    }
+
+    fn stop_location(&mut self) {
+        self.location.active.set(false);
+    }
+
+    fn location_active(&self) -> bool {
+        self.location.active.get()
+    }
+
+    fn set_location_attempts(&mut self, attempts: u8) {
+        self.location.attempts.set(Some(attempts));
     }
 }

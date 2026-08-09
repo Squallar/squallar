@@ -31,6 +31,7 @@ pub mod constants;
 pub mod egui_renderer;
 pub mod input;
 pub mod location_hint;
+pub mod location_permission;
 pub mod loop_downloads;
 /// The rule behind the `mobile` cfg. Compiled only for tests — the production
 /// copy is `include!`d by `build.rs`, which runs before this crate exists.

@@ -8241,4 +8241,145 @@ mod tests {
             }
         }
     }
+
+    // ── The Location control ─────────────────────────────────────────────
+    //
+    // Asserted against painted text rather than against `Gui` state, because
+    // the claim is about what the user is *offered*. A control that reads the
+    // right permission and renders the wrong button is exactly the failure this
+    // section exists to catch, and no state assertion can see it.
+
+    /// A refusal is a decision only the user can reverse, in system settings.
+    /// Offering a button here would be offering a dialog the platform will not
+    /// show — and on the design that mapped Windows' `NotDeclaredByApp` to
+    /// `Denied`, it would have bricked that arm outright.
+    #[test]
+    fn settings_offers_no_way_to_ask_once_the_os_has_refused() {
+        let mut h = InputHarness::new();
+        h.gui_mut().show_settings = true;
+        h.gui_mut()
+            .set_location_state(rustdar_gps::LocationPermission::Prompt, false);
+        h.warm_up();
+        assert!(
+            h.painted_text_strings()
+                .iter()
+                .any(|t| t == "Use my location"),
+            "control: an unasked platform must offer the button, or the \
+             assertion below passes for free. Painted: {:?}",
+            h.painted_text_strings()
+        );
+
+        h.gui_mut()
+            .set_location_state(rustdar_gps::LocationPermission::Denied, false);
+        h.warm_up();
+
+        let painted = h.painted_text_strings();
+        assert!(
+            !painted.iter().any(|t| t == "Use my location"),
+            "the OS has refused and the pane still offers to ask it again. \
+             Painted: {painted:?}"
+        );
+        assert!(
+            painted.iter().any(|t| t.contains("system settings")),
+            "a denial with no button and no explanation is the state this \
+             whole feature exists to remove. Painted: {painted:?}"
+        );
+    }
+
+    /// The control is a window onto the OS, not a switch with a memory.
+    ///
+    /// The tempting implementation keeps a local "the user turned it on" bool
+    /// and renders from that, which goes on reading `On.` after the permission
+    /// has been revoked underneath it — the exact reason `location_active()`
+    /// is a method on the bridge rather than a field in the gate.
+    #[test]
+    fn the_location_control_follows_the_os_rather_than_a_remembered_toggle() {
+        let mut h = InputHarness::new();
+        h.gui_mut().show_settings = true;
+        h.gui_mut()
+            .set_location_state(rustdar_gps::LocationPermission::Granted, true);
+        h.warm_up();
+        let painted = h.painted_text_strings();
+        assert!(
+            painted.iter().any(|t| t == "Turn off"),
+            "a live location stream offers no way to stop it. Painted: {painted:?}"
+        );
+
+        // Revoked in system settings. Nothing in this crate was told to change
+        // its mind; the cached state simply moved underneath it.
+        h.gui_mut()
+            .set_location_state(rustdar_gps::LocationPermission::Denied, false);
+        h.warm_up();
+
+        let painted = h.painted_text_strings();
+        assert!(
+            !painted.iter().any(|t| t == "Turn off"),
+            "the permission was revoked and the pane still shows a live \
+             stream. Painted: {painted:?}"
+        );
+        assert!(
+            painted.iter().any(|t| t == "Denied."),
+            "Painted: {painted:?}"
+        );
+    }
+
+    /// A platform with no location service must not be told to go and enable
+    /// one: the advice leads nowhere and the button would do nothing.
+    #[test]
+    fn a_platform_without_location_is_told_so_and_offered_nothing() {
+        let mut h = InputHarness::new();
+        h.gui_mut().show_settings = true;
+        h.gui_mut()
+            .set_location_state(rustdar_gps::LocationPermission::Unavailable, false);
+        h.warm_up();
+
+        let painted = h.painted_text_strings();
+        assert!(
+            painted.iter().any(|t| t.contains("Not available")),
+            "Painted: {painted:?}"
+        );
+        for offered in ["Use my location", "Turn off"] {
+            assert!(
+                !painted.iter().any(|t| t == offered),
+                "a platform with no location service is offering {offered:?}. \
+                 Painted: {painted:?}"
+            );
+        }
+    }
+
+    /// The gap the ungated line closes. `Fix:`/`No GPS fix` lives inside
+    /// `#[cfg(feature = "gps-serial")]`, so on web, Android, iOS and every
+    /// build without a serial port the section would read `On.` beside an empty
+    /// map and explain nothing — which is the likely Linux outcome too, where
+    /// GeoClue can take a while or answer with nothing at all.
+    #[test]
+    fn a_granted_permission_with_no_fix_yet_says_so() {
+        let mut h = InputHarness::new();
+        h.gui_mut().show_settings = true;
+        h.gui_mut()
+            .set_location_state(rustdar_gps::LocationPermission::Granted, true);
+        h.warm_up();
+
+        let painted = h.painted_text_strings();
+        assert!(
+            painted.iter().any(|t| t.contains("Waiting for a fix")),
+            "location is on, no position has arrived, and the pane says only \
+             'On.'. Painted: {painted:?}"
+        );
+
+        h.gui_mut()
+            .set_gps_fix(rustdar_gps::GpsFix::from_device_position(35.25, -97.5));
+        h.warm_up();
+
+        let painted = h.painted_text_strings();
+        assert!(
+            !painted.iter().any(|t| t.contains("Waiting for a fix")),
+            "a fix arrived and the pane is still waiting for one. Painted: \
+             {painted:?}"
+        );
+        assert!(
+            painted.iter().any(|t| t.contains("Last fix")),
+            "Painted: {painted:?}"
+        );
+    }
 }

@@ -41,6 +41,20 @@ pub struct DesktopPlatform {
     gps_reader: Option<rustdar_gps::SerialGpsReader>,
     /// Receives GPS fixes from the serial reader thread.
     gps_fix_receiver: Option<std::sync::mpsc::Receiver<rustdar_gps::GpsFix>>,
+    /// Receives fixes from the OS location service.
+    ///
+    /// A second channel rather than a second sender into the first, because the
+    /// two sources have to be told apart: `poll_gps_fix` picks between them (see
+    /// [`os_location::prefer_fix`]) and cannot do that once they are merged.
+    ///
+    /// `None` on every target today — [`os_location`] compiles only its
+    /// `unsupported` arm, whose `start` never returns a reader. The field is
+    /// here so the drain below is written once and the providers land against a
+    /// consumer that already exists.
+    ///
+    /// [`os_location`]: crate::os_location
+    /// [`os_location::prefer_fix`]: crate::os_location::prefer_fix
+    os_fix_receiver: Option<std::sync::mpsc::Receiver<rustdar_gps::GpsFix>>,
     /// Handed to the reader thread so a fix arriving while the loop is parked
     /// gets a frame to be shown on. See [`RedrawWaker`].
     redraw_waker: RedrawWaker,
@@ -62,6 +76,7 @@ impl DesktopPlatform {
             config_dir: Self::default_config_dir(),
             gps_reader: None,
             gps_fix_receiver: None,
+            os_fix_receiver: None,
             redraw_waker: RedrawWaker::new(),
         }
     }
@@ -90,8 +105,18 @@ impl PlatformBridge for DesktopPlatform {
         None
     }
 
+    /// Drains **both** sources every time, not the first one that answers.
+    ///
+    /// Draining conditionally would leave the loser's channel filling up: the
+    /// OS provider pushes on its own schedule and nothing else empties it, so a
+    /// serial fix arriving first would build an unbounded backlog behind it
+    /// that later surfaces as minutes-old positions. See
+    /// [`prefer_fix`](crate::os_location::prefer_fix) for which one wins and
+    /// why it is not simply "serial".
     fn poll_gps_fix(&mut self) -> Option<rustdar_gps::GpsFix> {
-        self.gps_fix_receiver.as_ref().and_then(drain_latest)
+        let serial = self.gps_fix_receiver.as_ref().and_then(drain_latest);
+        let os = self.os_fix_receiver.as_ref().and_then(drain_latest);
+        crate::os_location::prefer_fix(serial, os)
     }
 
     fn poll_heading(&mut self) -> Option<f32> {
@@ -180,6 +205,32 @@ impl PlatformBridge for DesktopPlatform {
     fn gps_active(&self) -> bool {
         self.gps_reader.is_some()
     }
+
+    // ── Platform location service ───────────────────────────────────────
+    //
+    // Stubs. Linux (GeoClue2 over zbus), Windows (`AppCapability` +
+    // `Geolocator`) and macOS (`CLLocationManager`) each land here as their own
+    // piece of work, with their own dependency, their own permission mechanics
+    // and — on Linux and macOS — their own packaging: GeoClue's `Start()` fails
+    // without a `.desktop` file to resolve `DesktopId` against, and macOS needs
+    // a signed bundle or `locationd` re-prompts on every rebuild.
+    //
+    // `Unavailable` and not `Unknown` in the meantime, and the difference
+    // matters. `Unknown` means "ask again shortly", so the gate would poll a
+    // bridge that is never going to answer and the settings pane would sit on
+    // "Checking…" for the life of the process. `Unavailable` is the truth: this
+    // build has no OS location provider, the pane says so, and nothing spins.
+
+    fn location_permission(&self) -> rustdar_gps::LocationPermission {
+        rustdar_gps::LocationPermission::Unavailable
+    }
+
+    /// Nothing to ask, so nothing reached the OS.
+    fn request_location(&mut self) -> bool {
+        false
+    }
+
+    fn stop_location(&mut self) {}
 }
 
 // ── Android implementation ──────────────────────────────────────────────
@@ -200,6 +251,16 @@ pub struct AndroidPlatform {
     back_press_taker: Option<fn() -> bool>,
     zone_cache_dir: Option<std::path::PathBuf>,
     config_dir: Option<std::path::PathBuf>,
+    /// Injected by `rustdar-android`: all four are JNI calls, for the same
+    /// reason `theme_detector` is injected. `None` until they are installed —
+    /// see [`PlatformBridge::location_permission`] below for why that is
+    /// reported as `Unavailable` rather than `Unknown`.
+    location_hooks: Option<rustdar_frontend::platform::LocationHooks>,
+    /// What the app last said about how many times it has asked, kept for the
+    /// hooks to read. Android is the one platform that cannot tell "never
+    /// asked" from "permanently denied" without it — see
+    /// [`PlatformBridge::set_location_attempts`].
+    location_attempts: u8,
     /// Handed to the theme poller below, so a light/dark switch noticed on that
     /// thread gets a frame to be applied on. See [`RedrawWaker`].
     redraw_waker: RedrawWaker,
@@ -225,6 +286,8 @@ impl AndroidPlatform {
             back_press_taker: None,
             zone_cache_dir: None,
             config_dir: None,
+            location_hooks: None,
+            location_attempts: 0,
             redraw_waker: RedrawWaker::new(),
         }
     }
@@ -362,6 +425,60 @@ impl PlatformBridge for AndroidPlatform {
             }
         }
     }
+
+    // ── Platform location service ───────────────────────────────────────
+    //
+    // Everything here is a `checkSelfPermission` / `requestPermissions` /
+    // `LocationHelper` call over JNI, which needs `unsafe` and the process
+    // `JavaVM`. This crate is `#![deny(unsafe_code)]` and cannot depend on
+    // `rustdar-android` — that crate depends on this one — so the calls arrive
+    // as `fn` pointers, exactly as the theme detector does.
+
+    /// `Unavailable` until the hooks are installed, deliberately not `Unknown`.
+    ///
+    /// `Unknown` is "the platform has not answered *yet*", and the gate keeps
+    /// polling for one. A bridge with no hooks is never going to answer, so
+    /// that would be a JNI-shaped poll that never terminates and a settings
+    /// pane parked on "Checking…" for the life of the process. `android_main`
+    /// installs the hooks before `run_app`, so on a wired build this window
+    /// closes before the first frame.
+    fn location_permission(&self) -> rustdar_gps::LocationPermission {
+        match self.location_hooks {
+            Some(hooks) => (hooks.query)(),
+            None => rustdar_gps::LocationPermission::Unavailable,
+        }
+    }
+
+    fn request_location(&mut self) -> bool {
+        self.location_hooks.is_some_and(|hooks| (hooks.request)())
+    }
+
+    fn stop_location(&mut self) {
+        if let Some(hooks) = self.location_hooks {
+            (hooks.stop)();
+        }
+    }
+
+    fn location_active(&self) -> bool {
+        self.location_hooks.is_some_and(|hooks| (hooks.active)())
+    }
+
+    /// Refuses a second set, as `set_theme_detector` refuses a second detector
+    /// and for the same reason: a half-replaced set would leave the state query
+    /// and the request pointing at different implementations, which is a bug
+    /// with no symptom until somebody is standing in front of a permission
+    /// dialog that never appears.
+    fn set_location_hooks(&mut self, hooks: rustdar_frontend::platform::LocationHooks) {
+        if self.location_hooks.is_some() {
+            log::warn!("location hooks already installed; ignoring the second set");
+            return;
+        }
+        self.location_hooks = Some(hooks);
+    }
+
+    fn set_location_attempts(&mut self, attempts: u8) {
+        self.location_attempts = attempts;
+    }
 }
 
 // ── iOS implementation ──────────────────────────────────────────────────
@@ -475,6 +592,27 @@ impl PlatformBridge for IosPlatform {
     fn supports_exit(&self) -> bool {
         false
     }
+
+    /// `CLLocationManager` is the next unit of work here, alongside GPS,
+    /// compass and theme. `Unavailable` rather than `Unknown` for the reason
+    /// given on the Android arm: `Unknown` asks the gate to keep waiting for an
+    /// answer that is not coming.
+    ///
+    /// iOS is the platform where this is most nearly free — `ios/Info.plist`
+    /// already carries `NSLocationWhenInUseUsageDescription` and the staticlib
+    /// link already passes `-framework CoreLocation` — and it is still its own
+    /// change, because `IosPlatform::new()` runs before `UIApplicationMain`
+    /// and the delegate has to be constructed with a `MainThreadMarker` it
+    /// cannot obtain there.
+    fn location_permission(&self) -> rustdar_gps::LocationPermission {
+        rustdar_gps::LocationPermission::Unavailable
+    }
+
+    fn request_location(&mut self) -> bool {
+        false
+    }
+
+    fn stop_location(&mut self) {}
 }
 
 /// Create the platform-appropriate bridge.
