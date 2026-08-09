@@ -7309,11 +7309,15 @@ mod tests {
         let (mut h, line_before) = harness_with_section_pane();
         let pane = h.pane_rects()[0];
 
-        // The orientation readout: bearing (three digits, so north is 000°)
-        // and length, in the user's units — sweeping blind is the alternative.
+        // The orientation readout: bearing (three digits wrapped to 0–359,
+        // so north is 000° and never "360°") and length, in the user's units
+        // — sweeping blind is the alternative.
         let expected_readout = format!(
-            "{:03.0}\u{b0} \u{b7} {:.0}{}",
-            crate::ui_section_edit::bearing_deg(line_before).rem_euclid(360.0),
+            "{:03}\u{b0} \u{b7} {:.0}{}",
+            (crate::ui_section_edit::bearing_deg(line_before)
+                .rem_euclid(360.0)
+                .round() as u32)
+                % 360,
             rustdar_units::UserPreferences::default()
                 .distance
                 .convert_from_km(crate::ui_section_edit::length_km(line_before)),

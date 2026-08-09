@@ -185,6 +185,7 @@ pub(super) fn render_cross_section(
     let caption = lay_out_caption(
         &painter,
         pane_rect,
+        horizontal_color_scale,
         caption_lines(
             &axes,
             product,
@@ -411,12 +412,14 @@ fn render_line_controls(
     );
 
     let length_km = edit::length_km(line);
+    // Rounded before it is wrapped: a bearing of 359.7° would otherwise
+    // render "360°", and north is "000°" — three digits, one name.
+    let bearing = (edit::bearing_deg(line).rem_euclid(360.0).round() as u32) % 360;
     painter.text(
         egui::pos2(right - 4.0, top + button.y * 0.5),
         egui::Align2::RIGHT_CENTER,
         format!(
-            "{:03.0}\u{b0} \u{b7} {:.0}{}",
-            edit::bearing_deg(line).rem_euclid(360.0),
+            "{bearing:03}\u{b0} \u{b7} {:.0}{}",
             prefs.distance.convert_from_km(length_km),
             prefs.distance.suffix(),
         ),
@@ -459,8 +462,18 @@ struct SectionLayout {
 /// under the ⓘ drawn at its end — and it is held back from every line rather
 /// than only the first, because two wrap widths in one block would make the
 /// detail lines ragged against the line above them.
-fn caption_wrap_width(pane_rect: egui::Rect) -> f32 {
-    (pane_rect.width() - 8.0 - INFO_TOGGLE_RESERVE).max(1.0)
+///
+/// A **vertical** colour scale is painted down the pane's right edge, straight
+/// through the caption band, so its reserve is held back too — without it the
+/// detail text runs flush into the dBZ labels. A horizontal scale sits along
+/// the bottom edge, nowhere near the caption, and costs it nothing.
+fn caption_wrap_width(pane_rect: egui::Rect, horizontal_color_scale: bool) -> f32 {
+    let scale_reserve = if horizontal_color_scale {
+        0.0
+    } else {
+        COLOR_SCALE_RESERVE
+    };
+    (pane_rect.width() - 8.0 - INFO_TOGGLE_RESERVE - scale_reserve).max(1.0)
 }
 
 impl SectionLayout {
@@ -479,7 +492,10 @@ impl SectionLayout {
         let labelled_axes = pane_rect.height() >= LABELLED_AXES_MIN_HEIGHT;
         let caption = egui::Rect::from_min_size(
             pane_rect.min + egui::vec2(4.0, 2.0),
-            egui::vec2(caption_wrap_width(pane_rect), caption_height),
+            egui::vec2(
+                caption_wrap_width(pane_rect, horizontal_color_scale),
+                caption_height,
+            ),
         );
         let (left, bottom) = if labelled_axes {
             (HEIGHT_GUTTER, DISTANCE_GUTTER)
@@ -856,7 +872,7 @@ fn caption_lines(
         0 => (
             format!(
                 "{}  \u{2014}  no tilts: this volume carried none of this product, so \
-                 nothing below was measured",
+                 nothing below was measured{stamp}",
                 product.name(),
             ),
             visuals.error_fg_color,
@@ -866,7 +882,8 @@ fn caption_lines(
         // fault, so it says what it is in the calm colour rather than shouting.
         1 => (
             format!(
-                "{}  \u{2014}  one tilt: a single scanned surface, not a vertical profile",
+                "{}  \u{2014}  one tilt: a single scanned surface, not a vertical \
+                 profile{stamp}",
                 product.name(),
             ),
             calm,
@@ -1040,9 +1057,10 @@ fn detail_lines(
 fn lay_out_caption(
     painter: &egui::Painter,
     pane_rect: egui::Rect,
+    horizontal_color_scale: bool,
     mut lines: Vec<CaptionLine>,
 ) -> Vec<std::sync::Arc<egui::Galley>> {
-    let wrap = caption_wrap_width(pane_rect);
+    let wrap = caption_wrap_width(pane_rect, horizontal_color_scale);
     let layout_all = |lines: &[CaptionLine]| -> Vec<std::sync::Arc<egui::Galley>> {
         lines
             .iter()
@@ -1472,6 +1490,7 @@ mod tests {
             let galleys = lay_out_caption(
                 &painter,
                 rect,
+                false,
                 caption_lines(
                     &truncated,
                     RadarProduct::Reflectivity,
@@ -1504,7 +1523,7 @@ mod tests {
         ] {
             let (rows, widest, height) = measure(w, h);
             assert!(
-                widest <= caption_wrap_width(rect(w, h)) + 0.5,
+                widest <= caption_wrap_width(rect(w, h), false) + 0.5,
                 "at {w}x{h} the caption ran {widest} points wide and was clipped"
             );
             assert!(
@@ -1556,6 +1575,7 @@ mod tests {
             lay_out_caption(
                 &painter,
                 rect,
+                false,
                 caption_lines(
                     &truncated,
                     RadarProduct::Reflectivity,

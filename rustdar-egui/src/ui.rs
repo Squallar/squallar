@@ -977,11 +977,12 @@ impl Gui {
         // moves `pane_rect` for every pane. Inside the loop that would leave the
         // panes drawn after it hit-tested against rects they are no longer in.
         self.apply_pending_section_line();
-        // After the modal-draw applier so that if both somehow fired in one
-        // frame the freshly drawn line would win — though they cannot: an armed
-        // draw makes the handles inert, and beginning a handle drag requires no
-        // mode to be armed. This one can never grow the layout, so it takes no
-        // part in the ordering argument below.
+        // After the modal-draw applier, so if both somehow fired in one frame
+        // the dropped edit — the later write — would win. The case is
+        // unreachable: an armed draw makes the handles inert, and beginning a
+        // handle drag requires no mode to be armed, so the two cannot both
+        // have a gesture to commit. This one can never grow the layout, so it
+        // takes no part in the ordering argument below.
         self.apply_pending_section_edit();
         // After the kind conversion, so a region that lands on a pane the same
         // frame converted it finds a 3D pane rather than the map it used to be.
