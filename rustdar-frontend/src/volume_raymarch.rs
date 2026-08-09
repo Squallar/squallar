@@ -90,11 +90,18 @@ pub const LABEL_PREFIX: &str = "rustdar.volume";
 ///
 /// The WGSL constant is the source of truth; this copy is pinned to the
 /// literal in the shader text by `the_step_count_is_a_constant_the_loop_bound_names`,
-/// so the two cannot drift silently.
-pub const RAYMARCH_STEP_CEILING: i32 = 512;
+/// so the two cannot drift silently. 1024 because the cloud rung's half-cell
+/// step must cover the desktop grid's 384-cell diagonal — 768 steps — without
+/// falling to the stretched-dt fallback.
+pub const RAYMARCH_STEP_CEILING: i32 = 1024;
 
 /// Cells one march step advances along the ray, in the grid's own cell
-/// metric. Pinned to the WGSL literal like [`RAYMARCH_STEP_CEILING`].
+/// metric, **at the instrument default**: the value `VolumeUniform::new`
+/// writes into the step lane, which is what the silhouette harness's mirror
+/// marches at. Production may hand the shader a different step per frame
+/// (`volume::bridge::CLOUD_STEP_CELLS` halves it for the cloud rung); the
+/// uniform's default and this constant are pinned to each other by
+/// `the_step_count_is_a_constant_the_loop_bound_names`.
 pub const RAYMARCH_STEP_CELLS: f32 = 1.0;
 
 /// Vertex entry point of the raymarch.
@@ -366,7 +373,11 @@ impl VolumePipelines {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            // `Linear` between levels is what makes the reconstruction LOD a
+            // continuous knob: the shader samples at `flags.y`, and at exactly
+            // 0 the level-1 weight is exactly zero, so the instrument
+            // configuration stays the bit-exact raw field.
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
         let lut_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -582,7 +593,15 @@ impl VolumePipelines {
                 height: cells[1],
                 depth_or_array_layers: cells[2],
             },
-            mip_level_count: 1,
+            // Two levels: the raw grid, and the hand-built two-cell mean the
+            // reconstruction LOD blends towards. wgpu generates no mips; the
+            // level is computed on the CPU below, which for an 8 MiB desktop
+            // grid is a single pass over the bytes at upload time. A grid too
+            // small to halve (a 1x1x1 box, which no shape produces but the
+            // upload accepts) keeps one level — `create_texture` would refuse
+            // two, from a call with no `Result`, and the sampler clamps an
+            // out-of-range LOD to the levels that exist.
+            mip_level_count: grid_mip_levels(cells),
             sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
             format: VOLUME_TEXTURE_FORMAT,
@@ -607,6 +626,9 @@ impl VolumePipelines {
                 depth_or_array_layers: cells[2],
             },
         );
+        if grid_mip_levels(cells) > 1 {
+            upload_coarse_level(queue, &grid, cells, indices);
+        }
 
         let lut_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some(&label("lut")),
@@ -792,6 +814,87 @@ pub fn grid_bytes(cells: [u32; 3]) -> Option<usize> {
     cells
         .iter()
         .try_fold(1usize, |acc, &n| acc.checked_mul(n as usize))
+}
+
+/// Mip levels the grid texture carries: the raw field, and one hand-built
+/// two-cell mean below it for the reconstruction LOD to blend towards.
+pub const GRID_MIP_LEVELS: u32 = 2;
+
+/// Mip levels a grid of this shape can actually carry: [`GRID_MIP_LEVELS`]
+/// unless the grid is too small to halve on every axis at once — a 1x1x1
+/// grid, which no shape rung produces but the upload accepts, and for which
+/// `create_texture` would refuse a second level from a call with no `Result`.
+fn grid_mip_levels(cells: [u32; 3]) -> u32 {
+    if cells.iter().copied().max().unwrap_or(0) >= 2 {
+        GRID_MIP_LEVELS
+    } else {
+        1
+    }
+}
+
+/// Write the hand-built coarse level into the grid texture's mip 1.
+fn upload_coarse_level(queue: &wgpu::Queue, grid: &wgpu::Texture, cells: [u32; 3], indices: &[u8]) {
+    let (coarse_cells, coarse) = downsampled_grid(cells, indices);
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: grid,
+            mip_level: 1,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &coarse,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(coarse_cells[0]),
+            rows_per_image: Some(coarse_cells[1]),
+        },
+        wgpu::Extent3d {
+            width: coarse_cells[0],
+            height: coarse_cells[1],
+            depth_or_array_layers: coarse_cells[2],
+        },
+    );
+}
+
+/// The grid's mip level 1: each coarse cell is the mean of the fine cells
+/// under it, in index units.
+///
+/// Averaging *indices* is exact averaging of the physical value, because
+/// index-to-dBZ is affine — the same fact that justified `R8Unorm`'s linear
+/// filtering in the first place. Rounding is to nearest, so a lone occupied
+/// cell among eight (a spike, which is the artifact the LOD exists to
+/// dissolve) lands at an eighth of its index rather than being floored away
+/// entirely when that eighth is representable.
+///
+/// Odd extents follow wgpu's own mip arithmetic — `max(n / 2, 1)` per axis —
+/// and the fine cells under a coarse one are whatever the halved coordinate
+/// maps back onto, clamped to the fine extent, so no fine cell is read out of
+/// bounds and every coarse cell averages only cells that exist.
+fn downsampled_grid(cells: [u32; 3], indices: &[u8]) -> ([u32; 3], Vec<u8>) {
+    let coarse = cells.map(|n| (n / 2).max(1));
+    let fine = cells.map(|n| n as usize);
+    let mut out = Vec::with_capacity((coarse[0] * coarse[1] * coarse[2]) as usize);
+    for cz in 0..coarse[2] as usize {
+        for cy in 0..coarse[1] as usize {
+            for cx in 0..coarse[0] as usize {
+                let mut sum = 0u32;
+                let mut counted = 0u32;
+                for dz in 0..2 {
+                    for dy in 0..2 {
+                        for dx in 0..2 {
+                            let fx = (cx * 2 + dx).min(fine[0] - 1);
+                            let fy = (cy * 2 + dy).min(fine[1] - 1);
+                            let fz = (cz * 2 + dz).min(fine[2] - 1);
+                            sum += u32::from(indices[(fz * fine[1] + fy) * fine[0] + fx]);
+                            counted += 1;
+                        }
+                    }
+                }
+                out.push(((sum + counted / 2) / counted) as u8);
+            }
+        }
+    }
+    (coarse, out)
 }
 
 /// Entries in the colour table, which is also its texture's width.
@@ -1277,14 +1380,14 @@ mod tests {
     /// The ceiling is the loop bound — a naga requirement, since the *real*
     /// termination is the data-dependent break at the box exit, and a
     /// non-constant bound plus that break is exactly the shape WebGL2 drivers
-    /// refuse. The step length itself is derived per ray from `grid_dims`, so
+    /// refuse. The step length itself arrives per frame in `flags.z`, so
     /// there is deliberately no `(span.y - span.x) / STEPS` here to pin — the
     /// dt *floor* against the ceiling is pinned instead, because deleting it
-    /// would truncate any grid whose chord outruns the ceiling mid-box.
+    /// would truncate any span that outruns the ceiling mid-box.
     #[test]
     fn the_step_count_is_a_constant_the_loop_bound_names() {
         assert!(
-            shader_code().contains("const RAYMARCH_STEP_CEILING: i32 = 512;"),
+            shader_code().contains("const RAYMARCH_STEP_CEILING: i32 = 1024;"),
             "the raymarch's step ceiling is no longer a `const` literal"
         );
         assert!(
@@ -1293,23 +1396,91 @@ mod tests {
         );
         assert!(
             shader_code().contains("(span.y - span.x) / f32(RAYMARCH_STEP_CEILING)"),
-            "the dt floor against the ceiling is gone; a grid whose chord \
-             exceeds the ceiling would render truncated mid-box instead of \
-             coarser"
+            "the dt floor against the ceiling is gone; a span that outruns \
+             the ceiling would render truncated mid-box instead of coarser"
         );
         assert!(
-            shader_code().contains("const STEP_CELLS: f32 = 1.0;"),
-            "the cells-per-step constant is no longer a `const` literal"
+            shader_code().contains("volume.flags.z / cells_per_t"),
+            "the march no longer takes its step from the uniform's step lane"
         );
         // The host-side restatements, against the same literals rather than
         // against the constants themselves — pinning a constant to itself is
-        // the mistake `every_lane_lands_at_its_std140_offset` documents.
+        // the mistake `every_lane_lands_at_its_std140_offset` documents. The
+        // step-cells half now pins the *uniform default*, which is what the
+        // silhouette harness's mirror marches at.
         assert_eq!(
             (RAYMARCH_STEP_CEILING, RAYMARCH_STEP_CELLS),
-            (512, 1.0),
+            (1024, 1.0),
             "the Rust restatement of the march constants no longer matches \
              the WGSL literals this test pins"
         );
+        assert_eq!(
+            VolumeUniform::new([240.0, 240.0, 20.0], [128, 128, 64]).step_cells,
+            RAYMARCH_STEP_CELLS,
+            "the uniform's default step no longer matches the constant the \
+             silhouette harness mirrors, so every instrument marches a \
+             different comb than the mirror predicts"
+        );
+    }
+
+    /// The hand-built mip is the mean of each coarse cell's fine block, to
+    /// nearest, over wgpu's own mip extents.
+    ///
+    /// Three properties, each with a mutation it closes:
+    ///
+    /// * A uniform grid downsamples to itself — a stride error mixing
+    ///   neighbouring blocks cannot be seen on a uniform grid, so this is the
+    ///   control, not the test.
+    /// * A lone 255 among seven empties lands at 32, which is `259 / 8` —
+    ///   round-to-nearest. Truncation gives 31: invisible in a picture,
+    ///   but it is the difference between a spike surviving the reconstruction
+    ///   at an eighth of its strength and at 3% less than that, and the
+    ///   rounding is stated in the function's contract.
+    /// * The block that is averaged is the one under the coarse cell —
+    ///   checked with a value planted in a *different* block, which is what a
+    ///   transposed dimension order pushes into the wrong coarse cell.
+    #[test]
+    fn the_grid_mip_is_the_rounded_mean_of_each_coarse_block() {
+        // Uniform control.
+        let (coarse, bytes) = downsampled_grid([4, 4, 2], &[7u8; 32]);
+        assert_eq!(coarse, [2, 2, 1]);
+        assert_eq!(bytes, vec![7u8; 4]);
+
+        // A lone spike: fine cell (0,0,0) of a 4x4x2 grid is in coarse block
+        // (0,0,0) and nowhere else.
+        let mut fine = vec![0u8; 32];
+        fine[0] = 255;
+        let (_, bytes) = downsampled_grid([4, 4, 2], &fine);
+        assert_eq!(
+            bytes,
+            vec![32, 0, 0, 0],
+            "a lone 255 among seven empties must average to 32 (nearest), in \
+             its own coarse cell only"
+        );
+
+        // The block under coarse cell (1, 0, 0): fine x in 2..4, y in 0..2,
+        // z in 0..2. Fill exactly that block and nothing else.
+        let mut fine = vec![0u8; 32];
+        for z in 0..2 {
+            for y in 0..2 {
+                for x in 2..4 {
+                    fine[(z * 4 + y) * 4 + x] = 100;
+                }
+            }
+        }
+        let (_, bytes) = downsampled_grid([4, 4, 2], &fine);
+        assert_eq!(
+            bytes,
+            vec![0, 100, 0, 0],
+            "the filled block must land whole in coarse cell (1,0,0); anything \
+             else is a dimension-order error smearing data across the mip"
+        );
+
+        // Odd extents follow wgpu's mip arithmetic: max(n / 2, 1).
+        let (coarse, bytes) = downsampled_grid([3, 3, 3], &[9u8; 27]);
+        assert_eq!(coarse, [1, 1, 1]);
+        assert_eq!(bytes.len(), 1);
+        assert_eq!(bytes[0], 9);
     }
 
     /// The step length puts the ray direction inside the `length`.

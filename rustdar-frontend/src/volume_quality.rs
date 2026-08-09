@@ -48,8 +48,41 @@
 //!
 //! Shaded got *cheaper*: the fade-anchored skip stops paying seven fetches
 //! per step inside the sub-visible shell, which outweighs the extra steps.
-//! Unshaded paid the steps (+17-30%). Both remain far inside the frame at
-//! every rung, and the ladder's two levers are unchanged.
+//! Unshaded paid the steps (+17-30%).
+//!
+//! # Re-measured after the cloud rung (this change)
+//!
+//! [`GradientShading::On`] now selects the whole **cloud look**: gradient
+//! lighting, the mip-blended smooth reconstruction, and half-cell steps
+//! (`volume::bridge::{CLOUD_RECONSTRUCTION_LOD, CLOUD_STEP_CELLS}`). The
+//! half-cell step is the expensive part — roughly twice the samples — and it
+//! is what takes the jitter's per-step opacity residual below the eight-bit
+//! level. `Off` is unchanged: the raw trilinear field at one-cell steps, the
+//! jagged-unlit floor every instrument measures. Same RTX 3090, same
+//! harness, dense (Harvey, 45.7% occupied at this box) and sparse (KCRP
+//! 2021-08-01, 5.6%) volumes:
+//!
+//! | offscreen   | cloud, dense | cloud, sparse | floor, dense | floor, sparse |
+//! |-------------|-------------:|--------------:|-------------:|--------------:|
+//! | 1440 x 900  |     0.766 ms |      0.607 ms |     0.263 ms |      0.351 ms |
+//! | 720 x 450   |     0.249 ms |      0.206 ms |     0.105 ms |      0.146 ms |
+//!
+//! (The sparse *floor* costs more than the dense one because nothing
+//! saturates: rays cross the whole box with no early-out.)
+//!
+//! # The ladder's order: lighting degrades before resolution
+//!
+//! The degraded states run `Native+On -> Native+Off -> Half+Off ->
+//! Quarter+Off`: a device that cannot afford the top rung gives up the cloud
+//! look before it gives up pixels, and the floor is always the jagged-unlit
+//! march. On the fetch-bound model the cloud rung at native size extrapolates
+//! to 23-38 ms on an integrated GPU — not a frame — and even unshaded native
+//! (8-13 ms) crowds a frame the rest of the application also lives in, so
+//! `Integrated` lands at `Half`+`Off` (3-5 ms). The consequence worth
+//! writing down: only a discrete adapter renders the cloud look today, and
+//! that is a decision about honesty under extrapolated budgets, not a
+//! measured refusal — an integrated part that proves faster earns its rung
+//! back by measurement, the way every number in this table arrived.
 //!
 //! # Why the selection is a pure function of two arguments
 //!
@@ -116,15 +149,18 @@ impl ResolutionRung {
     }
 }
 
-/// Whether the raymarch shades with the central-difference gradient.
+/// Whether the raymarch renders the cloud look: gradient lighting plus the
+/// smoothed reconstruction plus half-cell steps, which the bridge sets as one
+/// decision.
 ///
-/// Off is not a cosmetic downgrade — it is the difference between one texture
-/// fetch per step and seven, measured at 2.4x. See the module doc.
+/// Off is not a cosmetic downgrade — it is the difference between one raw
+/// fetch per one-cell step and seven fetches per half-cell step, measured at
+/// ~2.9x on the dense volume. See the module doc's cloud-rung table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum GradientShading {
-    /// Shaded. Seven fetches per contributing step.
+    /// The cloud look. Seven fetches per contributing half-cell step.
     On,
-    /// Flat. One fetch per step.
+    /// Flat: the jagged-unlit floor, one fetch per one-cell step.
     Off,
 }
 
@@ -215,24 +251,22 @@ impl DeviceClass {
 
     /// What this class would pick with no platform ceiling over it.
     ///
-    /// The numbers behind each row are in the module doc. In short: `Discrete`
-    /// is the class the table was measured on and can afford everything;
-    /// `Integrated` is extrapolated at 12-23 ms full-size, so it takes the
-    /// resolution rung and keeps shading; `Virtual` and `Unknown` are unknown
-    /// quantities that could be either, so they take both rungs; `Software` is
-    /// known to be hopeless and takes the bottom of the ladder, where it will
-    /// at least produce a picture.
+    /// The numbers behind each row are in the module doc, and every degraded
+    /// row sits on the ladder's stated order — lighting surrendered before
+    /// resolution, jagged-unlit as the floor. In short: `Discrete` is the
+    /// class the table was measured on and affords the cloud rung;
+    /// `Integrated` extrapolates past a frame at both native rungs (cloud
+    /// 23-38 ms, even unshaded 8-13), so it holds Half and the flat march;
+    /// `Virtual` and `Unknown` are unknown quantities that could be either,
+    /// so they take the same; `Software` is known to be hopeless and takes
+    /// the bottom of the ladder, where it will at least produce a picture.
     pub fn unconstrained_quality(self) -> VolumeQuality {
         match self {
             Self::Discrete => VolumeQuality {
                 resolution: ResolutionRung::Native,
                 shading: GradientShading::On,
             },
-            Self::Integrated => VolumeQuality {
-                resolution: ResolutionRung::Half,
-                shading: GradientShading::On,
-            },
-            Self::Virtual | Self::Unknown => VolumeQuality {
+            Self::Integrated | Self::Virtual | Self::Unknown => VolumeQuality {
                 resolution: ResolutionRung::Half,
                 shading: GradientShading::Off,
             },
@@ -597,7 +631,7 @@ mod tests {
             (
                 DeviceClass::Integrated,
                 ResolutionRung::Half,
-                GradientShading::On,
+                GradientShading::Off,
             ),
             (
                 DeviceClass::Virtual,
@@ -623,6 +657,36 @@ mod tests {
                 },
                 "{class:?} no longer selects what its row documents"
             );
+        }
+    }
+
+    /// Lighting degrades before resolution: no class keeps the cloud rung
+    /// after giving up pixels.
+    ///
+    /// This is the ladder's stated order made assertable. The cloud rung is
+    /// the expensive knob (~2.9x per covered pixel), so a class that had to
+    /// coarsen its offscreen has by definition already run out of the budget
+    /// the cloud look costs — a `Half`+`On` row would be paying the premium
+    /// look into a downscaled target, which is the old `Integrated` row this
+    /// ordering retired. The floor stays jagged-unlit by the same rule.
+    #[test]
+    fn no_class_that_gave_up_resolution_keeps_the_cloud_rung() {
+        for class in [
+            DeviceClass::Discrete,
+            DeviceClass::Integrated,
+            DeviceClass::Virtual,
+            DeviceClass::Software,
+            DeviceClass::Unknown,
+        ] {
+            let chosen = class.unconstrained_quality();
+            if chosen.resolution != ResolutionRung::Native {
+                assert_eq!(
+                    chosen.shading,
+                    GradientShading::Off,
+                    "{class:?} coarsened its offscreen and kept the cloud rung; \
+                     the ladder surrenders lighting before resolution",
+                );
+            }
         }
     }
 

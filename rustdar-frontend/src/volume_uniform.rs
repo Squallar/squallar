@@ -137,6 +137,21 @@ pub struct VolumeUniform {
     pub eye_in_box: [f32; 3],
     /// The box's physical extent in kilometres.
     pub box_size_km: [f32; 3],
+    /// The camera's vertical exaggeration, `>= 1`. Rides `box_size_km.w`.
+    ///
+    /// Read by exactly one thing: the gradient shading, which takes its
+    /// normals against the *displayed* geometry so a slope drawn steep is lit
+    /// steep. Optical depth stays against the true `box_size_km` — the stretch
+    /// is a drawing convention and must never reach a measurement, which is
+    /// the same line `OrbitCamera::vertical_exaggeration` draws and the
+    /// `optical_depth_is_measured_against_the_unexaggerated_box` GPU test
+    /// pins. At 1.0 (the default) displayed and true geometry coincide.
+    ///
+    /// Never zero: the shader divides a cell extent by nothing else, and a
+    /// zero here would make every vertical difference infinite and every
+    /// normal NaN. The one production writer copies
+    /// `OrbitCamera::vertical_exaggeration`, whose floor is 1.
+    pub vertical_exaggeration: f32,
     /// Voxels along each axis.
     pub grid_dims: [u32; 3],
     /// Light direction in box space. Normalised by the shader.
@@ -154,6 +169,38 @@ pub struct VolumeUniform {
     /// Whether to shade with the central-difference gradient. The expensive
     /// knob: seven texture fetches per step against one, measured at 2.4x.
     pub gradient_shading: bool,
+    /// Cells one march step advances along the ray, in the grid's own
+    /// anisotropic cell metric. Rides `flags.z`.
+    ///
+    /// The default is 1 — one sample per cell, the rate the linear filter's
+    /// band limit supports and the value the silhouette harness's host-side
+    /// mirror marches at (`volume::raymarch::RAYMARCH_STEP_CELLS`; the two
+    /// are pinned together). The cloud rung halves it: a finer step buys no
+    /// resolution from a band-limited field, but it halves the per-step
+    /// opacity quantum, which is what takes the stratified jitter's residual
+    /// from a visible stipple to noise below the eight-bit level. Zero is
+    /// safe by construction — the shader's dt floor against the step ceiling
+    /// covers the span in ceiling-many steps rather than hanging — but no
+    /// writer produces it.
+    pub step_cells: f32,
+    /// The mip level the march reconstructs the field at, `0..=1`. Rides
+    /// `flags.y`.
+    ///
+    /// The grid texture carries one hand-built level below the raw field —
+    /// each coarse cell the mean of its eight fine ones — and the sampler
+    /// blends between the two, so this is a continuous softness knob at no
+    /// extra fetches: 0 is the raw trilinear tent, 1 is a two-cell box
+    /// convolved with a tent.
+    ///
+    /// **Zero here, deliberately**, for exactly the reason
+    /// [`DEFAULT_EDGE_SOFT_WIDTH`] is zero: the raw field is the instrument
+    /// configuration every mask harness measures against — at LOD exactly 0
+    /// the coarse level's filter weight is exactly zero — and any smoothing
+    /// moves alpha at every boundary. The production value lives in
+    /// `volume::bridge`, beside the soft width, and rides the same quality
+    /// rung as the lighting: together they are the cloud look, and the floor
+    /// rung stays the jagged-unlit raw march.
+    pub reconstruction_lod: f32,
 }
 
 impl VolumeUniform {
@@ -167,6 +214,7 @@ impl VolumeUniform {
             box_from_clip: IDENTITY,
             eye_in_box: [0.5, 0.5, 4.0],
             box_size_km,
+            vertical_exaggeration: 1.0,
             grid_dims,
             light_dir: DEFAULT_LIGHT_DIR,
             ambient: DEFAULT_AMBIENT,
@@ -175,6 +223,8 @@ impl VolumeUniform {
             early_out_transmittance: DEFAULT_EARLY_OUT_TRANSMITTANCE,
             edge_soft_width: DEFAULT_EDGE_SOFT_WIDTH,
             gradient_shading: true,
+            step_cells: 1.0,
+            reconstruction_lod: 0.0,
         }
     }
 
@@ -190,7 +240,11 @@ impl VolumeUniform {
             write_vec4(&mut out, OFFSET_BOX_FROM_CLIP + column * 16, *values);
         }
         write_vec4(&mut out, OFFSET_EYE_IN_BOX, xyz_w(self.eye_in_box, 0.0));
-        write_vec4(&mut out, OFFSET_BOX_SIZE_KM, xyz_w(self.box_size_km, 0.0));
+        write_vec4(
+            &mut out,
+            OFFSET_BOX_SIZE_KM,
+            xyz_w(self.box_size_km, self.vertical_exaggeration),
+        );
         write_vec4(
             &mut out,
             OFFSET_GRID_DIMS,
@@ -214,7 +268,12 @@ impl VolumeUniform {
         write_vec4(
             &mut out,
             OFFSET_FLAGS,
-            [f32::from(u8::from(self.gradient_shading)), 0.0, 0.0, 0.0],
+            [
+                f32::from(u8::from(self.gradient_shading)),
+                self.reconstruction_lod,
+                self.step_cells,
+                0.0,
+            ],
         );
 
         out
@@ -279,6 +338,7 @@ mod tests {
             box_from_clip: matrix,
             eye_in_box: [101.0, 102.0, 103.0],
             box_size_km: [201.0, 202.0, 203.0],
+            vertical_exaggeration: 204.0,
             grid_dims: [301, 302, 303],
             light_dir: [401.0, 402.0, 403.0],
             ambient: 404.0,
@@ -287,6 +347,8 @@ mod tests {
             early_out_transmittance: 503.0,
             edge_soft_width: 504.0,
             gradient_shading: true,
+            step_cells: 602.0,
+            reconstruction_lod: 601.0,
         }
     }
 
@@ -410,8 +472,8 @@ mod tests {
             (OFFSET_EYE_IN_BOX, [101.0, 102.0, 103.0, 0.0], "eye_in_box"),
             (
                 OFFSET_BOX_SIZE_KM,
-                [201.0, 202.0, 203.0, 0.0],
-                "box_size_km",
+                [201.0, 202.0, 203.0, 204.0],
+                "box_size_km + vertical_exaggeration",
             ),
             (OFFSET_GRID_DIMS, [301.0, 302.0, 303.0, 0.0], "grid_dims"),
             (
@@ -420,7 +482,7 @@ mod tests {
                 "light_dir_ambient",
             ),
             (OFFSET_TRANSFER, [501.0, 502.0, 503.0, 504.0], "transfer"),
-            (OFFSET_FLAGS, [1.0, 0.0, 0.0, 0.0], "flags"),
+            (OFFSET_FLAGS, [1.0, 601.0, 602.0, 0.0], "flags"),
         ] {
             let lane = offset / 4;
             assert_eq!(
@@ -454,10 +516,11 @@ mod tests {
 
         for (offset, lane_in_member, member) in [
             (OFFSET_EYE_IN_BOX, 3, "eye_in_box.w"),
-            (OFFSET_BOX_SIZE_KM, 3, "box_size_km.w"),
+            // box_size_km.w is no longer reserved: it carries the vertical
+            // exaggeration the shading lights the displayed geometry with.
+            // Neither are flags.y (the reconstruction level) nor flags.z
+            // (the march step).
             (OFFSET_GRID_DIMS, 3, "grid_dims.w"),
-            (OFFSET_FLAGS, 1, "flags.y"),
-            (OFFSET_FLAGS, 2, "flags.z"),
             (OFFSET_FLAGS, 3, "flags.w"),
         ] {
             let lane = offset / 4 + lane_in_member;
@@ -480,6 +543,34 @@ mod tests {
             include_str!("volume.wgsl").contains("volume.flags.x > 0.5"),
             "the shader no longer tests the shading flag against 0.5, so the \
              1.0/0.0 this file writes may no longer select what it selects"
+        );
+    }
+
+    /// The reconstruction LOD rides `flags.y`, and the uniform's default is
+    /// the raw field.
+    ///
+    /// The default half is the load-bearing one: 0 is the bit-exact
+    /// instrument configuration the silhouette harness measures through —
+    /// the coarse mip's filter weight is exactly zero there — and any other
+    /// default would move alpha at every boundary of every mask.
+    #[test]
+    fn the_reconstruction_lod_rides_flags_y_and_defaults_to_the_raw_field() {
+        let mut uniform = distinct();
+
+        uniform.reconstruction_lod = 0.75;
+        assert_eq!(lanes(&uniform.to_bytes())[OFFSET_FLAGS / 4 + 1], 0.75);
+
+        assert_eq!(
+            VolumeUniform::new([240.0, 240.0, 20.0], [128, 128, 64]).reconstruction_lod,
+            0.0,
+            "the uniform's default must be the raw trilinear field — the \
+             instrument configuration — with the production softness a \
+             decision in volume::bridge",
+        );
+        assert!(
+            include_str!("volume.wgsl").contains("volume.flags.y).r"),
+            "the shader no longer samples the grid at the flags.y level, so \
+             this lane has stopped selecting the reconstruction",
         );
     }
 
@@ -509,6 +600,11 @@ mod tests {
         let uniform = VolumeUniform::new([240.0, 240.0, 20.0], [128, 128, 64]);
         assert!(uniform.grid_dims.iter().all(|&n| n > 0));
         assert!(uniform.box_size_km.iter().all(|&km| km > 0.0));
+        assert!(
+            uniform.vertical_exaggeration >= 1.0,
+            "the default exaggeration must be the identity stretch, and never \
+             zero — the shading divides a cell extent by it",
+        );
         assert!(uniform.extinction_per_km > 0.0);
         assert!((0.0..1.0).contains(&uniform.early_out_transmittance));
         assert!((0.0..=1.0).contains(&uniform.ambient));

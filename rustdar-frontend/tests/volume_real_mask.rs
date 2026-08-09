@@ -168,7 +168,7 @@ fn render_a_real_volume_mask() {
     let shape = grid.shape();
     let grid_dims = [shape.nx as u32, shape.ny as u32, shape.nz as u32];
 
-    let (camera_source, box_from_clip, eye_in_box) = camera(box_size_km, size);
+    let (camera_source, box_from_clip, eye_in_box, exaggeration) = camera(box_size_km, size);
 
     let threshold: f32 = parsed("THRESH");
     let (hard_lut, cut_index) = hard_lut(&grid, threshold);
@@ -206,6 +206,9 @@ fn render_a_real_volume_mask() {
     // show an edge the application does not draw.
     uniform.extinction_per_km = rustdar_frontend::volume::uniform::DEFAULT_EXTINCTION_PER_KM;
     uniform.gradient_shading = true;
+    uniform.reconstruction_lod = rustdar_frontend::volume::bridge::CLOUD_RECONSTRUCTION_LOD;
+    uniform.step_cells = rustdar_frontend::volume::bridge::CLOUD_STEP_CELLS;
+    uniform.vertical_exaggeration = exaggeration;
     uniform.empty_index_threshold =
         rustdar_frontend::volume::bridge::empty_index_threshold_for(grid.fade_band());
     uniform.edge_soft_width = rustdar_frontend::volume::bridge::EDGE_SOFT_WIDTH;
@@ -398,8 +401,14 @@ fn hard_lut(grid: &VoxelGrid, threshold: f32) -> (Vec<u8>, u8) {
 
 // ── The camera ───────────────────────────────────────────────────────────────
 
-/// `box_from_clip` and `eye_in_box`, from `CAM` or from the orbit camera.
-fn camera(box_size_km: [f32; 3], size: [u32; 2]) -> (String, [[f32; 4]; 4], [f32; 3]) {
+/// `box_from_clip`, `eye_in_box` and the vertical exaggeration, from `CAM` or
+/// from the orbit camera.
+///
+/// The `CAM` path reports exaggeration 1.0: the file holds a finished matrix
+/// with the stretch already baked in, and there is no way to recover the knob
+/// from it. The shading is then lit against the true geometry, which is what
+/// 1.0 means.
+fn camera(box_size_km: [f32; 3], size: [u32; 2]) -> (String, [[f32; 4]; 4], [f32; 3], f32) {
     if let Ok(path) = std::env::var("CAM") {
         let text =
             std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading CAM {path}: {e}"));
@@ -430,7 +439,7 @@ fn camera(box_size_km: [f32; 3], size: [u32; 2]) -> (String, [[f32; 4]; 4], [f32
             matrix[lane / 4][lane % 4] = value;
         }
         let eye = [numbers[16], numbers[17], numbers[18]];
-        return (format!("CAM {path}"), matrix, eye);
+        return (format!("CAM {path}"), matrix, eye, 1.0);
     }
 
     let yaw = parsed_or("YAW", 225.0f32);
@@ -452,6 +461,7 @@ fn camera(box_size_km: [f32; 3], size: [u32; 2]) -> (String, [[f32; 4]; 4], [f32
         ),
         view.box_from_clip,
         view.eye_in_box,
+        camera.vertical_exaggeration(),
     )
 }
 

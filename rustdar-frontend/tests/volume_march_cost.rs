@@ -101,6 +101,15 @@ fn measure_the_raymarch_cost_on_a_real_volume() {
             uniform.box_from_clip = view.box_from_clip;
             uniform.eye_in_box = view.eye_in_box;
             uniform.gradient_shading = shading;
+            // The cloud rung is lighting plus the smoothed reconstruction, and
+            // the two ride one quality decision in the bridge — so the timed
+            // pair is the shipped pair: cloud against the raw unlit floor.
+            if shading {
+                uniform.reconstruction_lod =
+                    rustdar_frontend::volume::bridge::CLOUD_RECONSTRUCTION_LOD;
+                uniform.step_cells = rustdar_frontend::volume::bridge::CLOUD_STEP_CELLS;
+            }
+            uniform.vertical_exaggeration = camera.vertical_exaggeration();
             // The bridge's own transfer edge, imported rather than restated,
             // so the timed march is the shipped march — the fade-anchored
             // skip changes what the empty shell costs, and that saving is
@@ -145,6 +154,10 @@ fn measure_the_raymarch_cost_on_a_real_volume() {
             uniform.box_from_clip = view.box_from_clip;
             uniform.eye_in_box = view.eye_in_box;
             uniform.gradient_shading = true;
+            uniform.reconstruction_lod =
+                rustdar_frontend::volume::bridge::CLOUD_RECONSTRUCTION_LOD;
+            uniform.step_cells = rustdar_frontend::volume::bridge::CLOUD_STEP_CELLS;
+            uniform.vertical_exaggeration = camera.vertical_exaggeration();
             uniform.empty_index_threshold =
                 rustdar_frontend::volume::bridge::empty_index_threshold_for(grid.fade_band());
             uniform.edge_soft_width = rustdar_frontend::volume::bridge::EDGE_SOFT_WIDTH;

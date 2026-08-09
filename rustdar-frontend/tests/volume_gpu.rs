@@ -556,6 +556,83 @@ fn opacity_accumulates_per_kilometre_not_per_box_diagonal() {
 /// about a pixel at its edges and the viewport is not, so the boundary is two
 /// different things by design.
 ///
+/// The smoothed reconstruction really reaches the coarse level: a lone voxel
+/// paints a **wider** footprint through the cloud rung than through the raw
+/// field.
+///
+/// Two mutations this can see, and one it deliberately cannot:
+///
+/// * Deleting the mip-1 upload in `upload_volume` leaves level 1 zeroed
+///   (WebGPU zero-initialises textures), the LOD-1 render paints nothing,
+///   and the width assertion fails on an empty mask.
+/// * Writing the wrong bytes into the level — a stride or dimension error —
+///   moves or smears the footprint, which the width ratio bounds.
+/// * It cannot see the *default* leaking soft: that contract belongs to the
+///   silhouette harness's index-1 sphere, which this test leaves untouched.
+///
+/// ```text
+/// cargo test -p rustdar-frontend --test volume_gpu \
+///     the_smoothed_reconstruction_spreads_a_lone_voxel \
+///     -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
+fn the_smoothed_reconstruction_spreads_a_lone_voxel() {
+    let _serialised = gpu_lock();
+    let size = [128u32, 128];
+    let cells = [16u32, 16, 16];
+
+    let (device, queue) = device();
+    let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Bgra8Unorm));
+    pipelines.upload_quad(&queue);
+
+    // One filled cell in the middle of an empty grid — the isolated spike the
+    // reconstruction exists to dissolve.
+    let mut indices = vec![0u8; (cells[0] * cells[1] * cells[2]) as usize];
+    indices[((8 * cells[1] + 8) * cells[0] + 8) as usize] = 255;
+    // Opaque at every non-zero index, so interpolated indices between the
+    // spike and its empty neighbours stay visible and alpha is a mask.
+    let mut lut = vec![0u8; VOLUME_LUT_BYTES];
+    for entry in 1..lut.len() / 4 {
+        lut[entry * 4..entry * 4 + 4].copy_from_slice(&[255, 255, 255, 255]);
+    }
+
+    let mut uniform = VolumeUniform::new([10.0, 10.0, 10.0], cells);
+    uniform.box_from_clip = box_from_clip_down(2);
+    uniform.eye_in_box = eye_outside(2);
+    uniform.extinction_per_km = 1000.0;
+    uniform.gradient_shading = false;
+
+    let painted = |uniform: &VolumeUniform| {
+        raymarch_once(
+            &device, &queue, &pipelines, cells, &indices, &lut, uniform, size,
+        )
+        .iter()
+        .filter(|px| px[3] > 0)
+        .count()
+    };
+
+    let raw = painted(&uniform);
+    uniform.reconstruction_lod = rustdar_frontend::volume::bridge::CLOUD_RECONSTRUCTION_LOD;
+    uniform.step_cells = rustdar_frontend::volume::bridge::CLOUD_STEP_CELLS;
+    let cloud = painted(&uniform);
+    println!("lone voxel: raw field paints {raw} px, smoothed reconstruction {cloud} px");
+
+    assert!(raw > 0, "precondition: the lone voxel must paint at all");
+    assert!(
+        cloud > raw,
+        "the smoothed reconstruction painted {cloud} px against the raw \
+         field's {raw}; the coarse level is empty or never sampled, so the \
+         cloud rung is silently rendering the raw field",
+    );
+    assert!(
+        cloud < raw * 8,
+        "the smoothed reconstruction painted {cloud} px against the raw \
+         field's {raw} — more than the two-cell kernel can explain, so the \
+         coarse level's bytes are misplaced",
+    );
+}
+
 /// ```text
 /// cargo test -p rustdar-frontend --test volume_gpu \
 ///     the_blit_matches_egui_exactly_on_both_surface_formats \

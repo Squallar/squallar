@@ -146,6 +146,31 @@ pub const MINIMUM_FADE_INDICES: u8 = 16;
 /// before a grid exists.
 pub const EDGE_SOFT_WIDTH: f32 = 8.0 / 255.0;
 
+/// Cells one march step advances along the ray on the cloud rung.
+///
+/// Half the instrument default. A finer step buys no resolution — the linear
+/// filter band-limits the field to about a cell — but it halves the per-step
+/// opacity quantum, and that quantum is what the per-pixel jitter turns into
+/// visible noise: at one-cell steps over the Harvey volume each contributing
+/// step absorbed ~35% of the remaining light, so the jittered comb position
+/// moved a pixel's total opacity by whole shade steps and the deck wore an
+/// ordered stipple. At half-cell steps the residual drops below the eight-bit
+/// level and the surface reads as continuous. The cost is linear in the step
+/// count and was measured, not assumed — see the table in `volume::quality`.
+pub const CLOUD_STEP_CELLS: f32 = 0.5;
+
+/// The reconstruction level the cloud look marches the grid at, in mip units.
+///
+/// 1.0 is the full blend into the hand-built two-cell mean below the raw
+/// field — chosen by rendering the KCRP 2017-08-26 (Harvey) volume across the
+/// knob's travel: below ~0.7 the single-voxel spikes over the deck survive as
+/// hairs and the tilt shelves keep their cliff rims, and there is nothing
+/// past 1.0 to reach. It is a *render* softness, the same class of decision
+/// as [`EDGE_SOFT_WIDTH`]: the grid, the palette and the threshold anchor are
+/// untouched, and the instrument default (`VolumeUniform::new`) stays 0 — the
+/// bit-exact raw field.
+pub const CLOUD_RECONSTRUCTION_LOD: f32 = 1.0;
+
 /// The march's skip threshold for a palette whose
 /// [`VoxelGrid::fade_band`](rustdar_radar::voxel::VoxelGrid::fade_band) is
 /// `band`, in the shader's 0-1 index units.
@@ -618,10 +643,21 @@ impl VolumePainter for BridgeVolumePainter {
         );
         uniform.box_from_clip = view.box_from_clip;
         uniform.eye_in_box = view.eye_in_box;
+        // The stretch the pane is drawn at, for the shading's normals only —
+        // `OrbitCamera` floors it at 1, which is what licenses the shader to
+        // divide by it unguarded.
+        uniform.vertical_exaggeration = frame.camera.vertical_exaggeration();
         // The rung this pane actually got, not the one the adapter was offered:
         // `fit_to_budget` can step the resolution down, and shading rides the
-        // same struct.
+        // same struct. The smoothed reconstruction rides the same rung as the
+        // lighting on purpose — together they are the cloud look, and a device
+        // that cannot afford one cannot afford the other; the floor rung stays
+        // the jagged-unlit raw march.
         uniform.gradient_shading = fitted.quality.shading.is_on();
+        if fitted.quality.shading.is_on() {
+            uniform.reconstruction_lod = CLOUD_RECONSTRUCTION_LOD;
+            uniform.step_cells = CLOUD_STEP_CELLS;
+        }
         // The march's transfer edge, anchored at this palette's own fade
         // boundary. `fade_band()` counts the fully transparent indices above
         // the no-data index, so the first visible entry is `band + 1` and
@@ -1371,6 +1407,50 @@ mod tests {
             body.contains("uniform.edge_soft_width = EDGE_SOFT_WIDTH"),
             "`paint` no longer widens the opacity ramp, so every shelf and echo \
              top reverts to the hard one-LUT-step rim the soft edge dissolves",
+        );
+        // The cloud rung's two production lines, pinned for the same reason:
+        // deleting either leaves every host test green (the uniform's raw
+        // defaults are a renderable configuration) and the user gets the
+        // voxel-spiked stippled render #5 was filed about.
+        assert!(
+            body.contains("uniform.reconstruction_lod = CLOUD_RECONSTRUCTION_LOD"),
+            "`paint` no longer selects the smoothed reconstruction on the cloud \
+             rung, so single-voxel spikes and tilt-shelf cliffs return",
+        );
+        assert!(
+            body.contains("uniform.step_cells = CLOUD_STEP_CELLS"),
+            "`paint` no longer halves the march step on the cloud rung, so the \
+             jitter's per-step opacity residual returns as a visible stipple",
+        );
+    }
+
+    /// The cloud rung's two constants, by value.
+    ///
+    /// [`CLOUD_RECONSTRUCTION_LOD`] is 1.0 — the full blend into the two-cell
+    /// mean, chosen on the Harvey volume because below ~0.7 the spikes
+    /// survive as hairs, and there is no level past 1 to reach.
+    /// [`CLOUD_STEP_CELLS`] is half the instrument default of
+    /// `volume::raymarch::RAYMARCH_STEP_CELLS`, and the relation matters as
+    /// much as the number: the half-cell step exists to halve the per-step
+    /// opacity quantum, and the step ceiling (1024) was sized so that half-cell
+    /// steps still cover the desktop grid's 384-cell diagonal — raise this
+    /// without touching the ceiling and long diagonals silently fall back to
+    /// stretched steps.
+    #[test]
+    fn the_cloud_rung_marches_the_smoothed_field_at_half_cell_steps() {
+        assert_eq!(CLOUD_RECONSTRUCTION_LOD, 1.0);
+        assert_eq!(
+            CLOUD_STEP_CELLS,
+            crate::volume::raymarch::RAYMARCH_STEP_CELLS / 2.0,
+        );
+        let ceiling = crate::volume::raymarch::RAYMARCH_STEP_CEILING as f32;
+        let desktop_diagonal_cells = (256.0f32 * 256.0 + 256.0 * 256.0 + 128.0 * 128.0).sqrt();
+        assert!(
+            desktop_diagonal_cells / CLOUD_STEP_CELLS <= ceiling,
+            "the desktop grid's diagonal needs {} cloud steps against a \
+             ceiling of {ceiling}; the far corner of every diagonal view \
+             falls to stretched steps",
+            desktop_diagonal_cells / CLOUD_STEP_CELLS,
         );
     }
 

@@ -45,7 +45,12 @@ struct Volume {
     // than starting behind the viewer). An orthographic camera has no such
     // point and would need a different derivation.
     eye_in_box: vec4<f32>,
-    // xyz: the physical extent of the box in kilometres. w: reserved, zero.
+    // xyz: the physical extent of the box in kilometres. w: the camera's
+    // vertical exaggeration, >= 1 — the one place the shader is told about the
+    // stretch, and only the *shading* reads it: normals are taken against the
+    // displayed geometry, so a slope that is drawn steep is lit steep. Optical
+    // depth stays against xyz alone, which is the honest, unexaggerated
+    // kilometre.
     box_size_km: vec4<f32>,
     // xyz: the voxel counts along each axis, as floats. w: reserved, zero.
     grid_dims: vec4<f32>,
@@ -56,7 +61,19 @@ struct Volume {
     // z: the transmittance at which the march stops early.
     // w: the opacity ramp's width above y, in 0-1 index units; 0 is hard.
     transfer: vec4<f32>,
-    // x: 1 to shade with the gradient, 0 to skip it. y, z, w: reserved, zero.
+    // x: 1 to shade with the gradient, 0 to skip it.
+    // y: the reconstruction level the march samples the grid at, in mip
+    //    units: 0 is the raw trilinear field — the bit-exact instrument
+    //    configuration every mask harness runs at — and values towards 1
+    //    blend continuously into the hand-built two-cell mean below it. The
+    //    render-side softening that turns single-voxel spikes and tilt-shelf
+    //    cliffs into cloud.
+    // z: cells one step advances along the ray, in the grid's own anisotropic
+    //    cell metric. 1 is the instrument default the silhouette harness
+    //    mirrors; the cloud rung halves it, which is what takes the jitter's
+    //    per-step opacity quantum below visibility. A zero (a stale buffer)
+    //    falls to the dt floor against the ceiling rather than hanging.
+    // w: reserved, zero.
     flags: vec4<f32>,
 }
 
@@ -110,26 +127,15 @@ fn gamma_from_linear_rgb(rgb: vec3<f32>) -> vec3<f32> {
 // identical, and hide the march's cost from the driver on the target where
 // fill rate is the whole risk.
 //
-// It is a **ceiling**, not the step count: the step length is derived from the
-// voxel size below, the loop breaks at the box exit, and the ceiling only
-// matters if a grid ever outgrows it — the desktop 256 x 256 x 128 grid's
-// longest diagonal is 384 cells, under it. When a grid does outgrow it, the
-// `dt` floor in `fs_raymarch` stretches the steps to cover the span rather
-// than truncating the far side of the volume.
-const RAYMARCH_STEP_CEILING: i32 = 512;
-
-// Cells one step advances along the ray, measured in the grid's own
-// (anisotropic) cell metric.
-//
-// 1.0 is the sampling rate the data supports: the linear filter band-limits
-// the field to about one cell, so one sample per cell — decorrelated between
-// neighbouring pixels by the jitter below — resolves everything the grid
-// holds. The 96-step march this replaced took one sample per ~2.7 cells on a
-// horizontal ray and per ~15 z-cells on the shipped grid, and every surface it
-// drew carried the quantisation as terracing that crawled under camera motion
-// (measured: banding phase-locked to the screen within 2 px while the volume
-// moved 17-45 px, recording of 2026-08-09).
-const STEP_CELLS: f32 = 1.0;
+// It is a **ceiling**, not the step count: the step length arrives per-frame
+// in `flags.z`, the loop breaks at the box exit, and the ceiling only
+// matters if a span ever outruns it. 1024 rather than 512 because the cloud
+// rung marches half-cell steps and the desktop 256 x 256 x 128 grid's longest
+// diagonal is 384 cells — 768 half-cell steps, which must fit or the far
+// corner of the box would fall to the stretched-dt fallback on every diagonal
+// view. When a span does outrun it, the `dt` floor in `fs_raymarch` stretches
+// the steps to cover it rather than truncating the far side of the volume.
+const RAYMARCH_STEP_CEILING: i32 = 1024;
 
 // Entries in the colour table. Must equal `constants::VOLUME_LUT_BYTES / 4`;
 // `the_shader_and_the_lut_constant_agree` pins that.
@@ -200,6 +206,26 @@ fn grid_at(p: vec3<f32>) -> f32 {
     return textureSampleLevel(grid_texture, grid_sampler, p, 0.0).r;
 }
 
+// The field the march reads: the grid at the reconstruction level flags.y.
+//
+// The grid travels with one hand-built mip below it — each level-1 cell is
+// the mean of its eight level-0 cells, which is exact linear dBZ averaging
+// because index-to-dBZ is affine — and the sampler filters between levels, so
+// this one fetch reconstructs the field through a kernel that widens
+// continuously with flags.y: 0 is the raw trilinear tent, 1 is a two-cell
+// box convolved with a tent. That is the whole reconstruction upgrade at ONE
+// fetch per tap; the alternatives measured and rejected on fill-rate grounds
+// were a tricubic B-spline (eight taps) and a four-tap tetrahedral average
+// (which moired against the per-pixel jitter).
+//
+// This softening is *presentation*, exactly like the opacity ramp: the grid,
+// the palette and the threshold's anchor are untouched, and flags.y = 0 — the
+// uniform's default — is the bit-exact raw field every mask instrument was
+// written against (at LOD exactly 0 the level-1 weight is exactly zero).
+fn density_at(p: vec3<f32>) -> f32 {
+    return textureSampleLevel(grid_texture, grid_sampler, p, volume.flags.y).r;
+}
+
 // Deterministic per-pixel jitter in [0, 1): Jimenez's interleaved gradient
 // noise over the fragment's framebuffer coordinate.
 //
@@ -224,13 +250,44 @@ fn interleaved_gradient_noise(px: vec2<f32>) -> f32 {
 // Six extra fetches against the march's one, which measured 2.4x on an RTX 3090
 // at 1440x900 (0.774 ms against 0.325). That is the whole reason this is a
 // separately selectable rung rather than something the shader always does.
+//
+// Two decisions here are the difference between "lit voxels" and "lit cloud",
+// and both were arrived at by rendering a real convective volume (KCRP
+// 2017-08-26, the Harvey landfall) rather than by argument:
+//
+//   * The gradient is taken in the *displayed* kilometre, not in box units.
+//     Box space is the unit cube over a pancake — 160 x 160 x 18 km at the
+//     tightest default, 25.6:1 at the widest — so a difference of raw box-space
+//     samples under-weights the vertical component by the box's aspect ratio,
+//     and every echo top is lit as though it were nearly flat. Dividing each
+//     component by that axis's displayed cell size (the true cell, stretched
+//     by the exaggeration in w) makes the normal the normal of the surface
+//     the user is actually looking at.
+//
+//   * Half-Lambert (Valve's wrap term, squared) instead of a clamped cosine.
+//     A cloud has no terminator: light scatters through it, so the away side
+//     is dimmer, never cut off. `max(dot, 0)` draws a hard day/night line
+//     across every storm core, and that line lands exactly where the gradient
+//     is noisiest — it reads as a torn edge. The wrap term is monotone in the
+//     same dot product with no clamp corner, so the same geometry shades
+//     smoothly from lit to ambient.
 fn shading(p: vec3<f32>) -> f32 {
     let voxel = vec3<f32>(1.0) / volume.grid_dims.xyz;
+    // One displayed cell along each axis, in kilometres. `box_size_km.w` is
+    // the vertical exaggeration, >= 1 by the uniform's contract.
+    let cell_km = vec3<f32>(
+        volume.box_size_km.x,
+        volume.box_size_km.y,
+        volume.box_size_km.z * volume.box_size_km.w,
+    ) * voxel;
+    // Differences of the same reconstruction the march reads, so the normal
+    // belongs to the surface being drawn: raw differences over a smoothed
+    // field would light every voxel corner the smoothing just removed.
     let gradient = vec3<f32>(
-        grid_at(p + vec3<f32>(voxel.x, 0.0, 0.0)) - grid_at(p - vec3<f32>(voxel.x, 0.0, 0.0)),
-        grid_at(p + vec3<f32>(0.0, voxel.y, 0.0)) - grid_at(p - vec3<f32>(0.0, voxel.y, 0.0)),
-        grid_at(p + vec3<f32>(0.0, 0.0, voxel.z)) - grid_at(p - vec3<f32>(0.0, 0.0, voxel.z)),
-    );
+        density_at(p + vec3<f32>(voxel.x, 0.0, 0.0)) - density_at(p - vec3<f32>(voxel.x, 0.0, 0.0)),
+        density_at(p + vec3<f32>(0.0, voxel.y, 0.0)) - density_at(p - vec3<f32>(0.0, voxel.y, 0.0)),
+        density_at(p + vec3<f32>(0.0, 0.0, voxel.z)) - density_at(p - vec3<f32>(0.0, 0.0, voxel.z)),
+    ) / cell_km;
     let ambient = volume.light_dir_ambient.w;
     let magnitude = length(gradient);
     if magnitude < GRADIENT_EPSILON {
@@ -239,8 +296,8 @@ fn shading(p: vec3<f32>) -> f32 {
     // The gradient climbs towards denser cells, so the outward-facing normal is
     // its negation.
     let normal = -gradient / magnitude;
-    let lambert = max(dot(normal, normalize(volume.light_dir_ambient.xyz)), 0.0);
-    return ambient + (1.0 - ambient) * lambert;
+    let wrap = 0.5 + 0.5 * dot(normal, normalize(volume.light_dir_ambient.xyz));
+    return ambient + (1.0 - ambient) * wrap * wrap;
 }
 
 @fragment
@@ -254,16 +311,21 @@ fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
 
     // Cells this ray crosses per unit of `t`, in the grid's anisotropic cell
     // metric — the same "direction inside the length" shape as
-    // `step_length_km`, for the same reason. The step is then STEP_CELLS cells
-    // *along the ray* whatever the direction: a vertical ray through the
-    // shipped grid takes ~128 samples and a horizontal one ~256, instead of
-    // both taking 96 samples of wildly different physical lengths.
+    // `step_length_km`, for the same reason. The step is then flags.z cells
+    // *along the ray* whatever the direction: at the instrument default of 1,
+    // a vertical ray through the shipped grid takes ~128 samples and a
+    // horizontal one ~256, instead of both taking 96 samples of wildly
+    // different physical lengths. The linear filter band-limits the raw field
+    // to about one cell, so 1 resolves everything the grid holds; the cloud
+    // rung's half-cell step buys no resolution — it halves the per-step
+    // opacity quantum, which is what takes the stratified jitter's residual
+    // from a visible stipple to noise below an 8-bit level.
     //
-    // The floor on `dt` is the ceiling honoured from the other side: a grid
-    // whose chord exceeds RAYMARCH_STEP_CEILING cells gets the whole span in
-    // ceiling-many stretched steps rather than a volume truncated mid-box.
+    // The floor on `dt` is the ceiling honoured from the other side: a span
+    // that outruns RAYMARCH_STEP_CEILING steps gets covered in ceiling-many
+    // stretched steps rather than a volume truncated mid-box.
     let cells_per_t = max(length(direction * volume.grid_dims.xyz), 1.0);
-    let dt = max(STEP_CELLS / cells_per_t, (span.y - span.x) / f32(RAYMARCH_STEP_CEILING));
+    let dt = max(volume.flags.z / cells_per_t, (span.y - span.x) / f32(RAYMARCH_STEP_CEILING));
     let segment_km = step_length_km(direction, dt);
     let shade = volume.flags.x > 0.5;
 
@@ -286,7 +348,7 @@ fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
             break;
         }
         let p = eye + direction * t;
-        let index = grid_at(p);
+        let index = density_at(p);
         if index > volume.transfer.y {
             let entry = textureSampleLevel(lut_texture, lut_sampler, lut_coord(index), 0.0);
             // The table holds gamma-encoded colour, because it is produced by

@@ -322,9 +322,9 @@ fn the_webgl_and_native_gles_translations_are_byte_identical() {
 ///
 /// Corrects an assumption worth writing down, because it was in the brief this
 /// work came from: naga does **not** delete constant declarations and inline
-/// them. It emits `const int RAYMARCH_STEP_CEILING = 512;` at module scope and
+/// them. It emits `const int RAYMARCH_STEP_CEILING = 1024;` at module scope and
 /// names it in the loop bound, folding only where a conversion forces it —
-/// `f32(RAYMARCH_STEP_CEILING)` becomes the literal `512.0` inside the `dt`
+/// `f32(RAYMARCH_STEP_CEILING)` becomes the literal `1024.0` inside the `dt`
 /// floor. Both are compile-time constant expressions to an ES 300 driver,
 /// which is the property that matters: the bound cannot vary per draw. (The
 /// march *breaks* at the box exit long before the ceiling on every shipped
@@ -338,7 +338,7 @@ fn the_webgl_and_native_gles_translations_are_byte_identical() {
 fn the_step_count_reaches_the_glsl_as_a_compile_time_constant() {
     let glsl_source = translate(ENTRY_FS_RAYMARCH, naga::ShaderStage::Fragment, true);
     assert!(
-        glsl_source.contains("const int RAYMARCH_STEP_CEILING = 512;"),
+        glsl_source.contains("const int RAYMARCH_STEP_CEILING = 1024;"),
         "the step ceiling is no longer a GLSL `const` at module scope"
     );
     assert!(
@@ -347,8 +347,8 @@ fn the_step_count_reaches_the_glsl_as_a_compile_time_constant() {
          arithmetic through a runtime cast"
     );
     assert!(
-        glsl_source.contains("/ 512.0)"),
-        "the dt floor is no longer divided by the folded literal 512.0"
+        glsl_source.contains("/ 1024.0)"),
+        "the dt floor is no longer divided by the folded literal 1024.0"
     );
     assert!(
         !glsl_source.contains("uniform int RAYMARCH_STEP_CEILING")
