@@ -47,10 +47,15 @@
 -keep class com.rustdar.LocationHelper {
     public static void register(android.app.Activity);
     public static void start();
+    public static void stop();
 }
-# `start` is called from the Rust gps-location thread only after the runtime
-# location permission is granted -- which can be minutes after launch, or
-# never -- so R8 sees no caller for it any more than it does for `register`.
+# `start` is called from the Rust side only once the permission gate observes
+# the runtime location permission as granted -- which can be minutes after
+# launch, or never -- so R8 sees no caller for it any more than it does for
+# `register`. `stop` is worse off still: its only callers are the settings
+# pane's Turn off button and an observed revocation, so a build R8 analysed
+# would conclude nobody ever stops location. Both are reached by literal name
+# and signature from call_static_method.
 
 # ---------------------------------------------------------------------------
 # Rules that used to be here, and why they are not

@@ -36,9 +36,10 @@ import android.os.Looper;
  *
  * {@link #register} runs once per android_main, before any permission has been
  * granted; it only stashes what {@link #start} will need. start() arrives over
- * JNI from the Rust gps-location thread once that thread observes the runtime
- * permission as granted — minutes later, or never. Only after both does a
- * subscription have any reason to exist.
+ * JNI from the Rust permission gate once it observes the runtime permission as
+ * granted — minutes later, or never. Only after both does a subscription have
+ * any reason to exist. {@link #stop} is the other end of the same wire: the
+ * user turning location off, or a grant withdrawn in system settings.
  *
  * <h2>Lifecycle</h2>
  *
@@ -49,12 +50,13 @@ import android.os.Looper;
  * app has no reason to request.)
  */
 public final class LocationHelper {
-    // Written by register() on the android_main thread or flipped by start()
-    // on the gps-location thread; read on the UI thread. Volatile for the same
-    // happens-before reasons documented at length in CompassHelper. The
-    // subscribe/unsubscribe transitions themselves (sListener, sListening) are
-    // confined to the main thread: the lifecycle callbacks run there, and
-    // start() posts there rather than touching them directly.
+    // Written by register() on the android_main thread or flipped by
+    // start()/stop() on whichever thread the permission gate runs on; read on
+    // the UI thread. Volatile for the same happens-before reasons documented at
+    // length in CompassHelper. The subscribe/unsubscribe transitions themselves
+    // (sListener, sListening) are confined to the main thread: the lifecycle
+    // callbacks run there, and start()/stop() post there rather than touching
+    // them directly.
     private static volatile LocationManager sLocationManager;
     private static volatile Handler sMainHandler;
     /** start() has been called: a permission is granted and updates are wanted. */
@@ -116,15 +118,31 @@ public final class LocationHelper {
     }
 
     /**
-     * Begin location updates. Called over JNI from the Rust gps-location
-     * thread once it observes the runtime permission as granted; kept by name
-     * in proguard-rules.pro. Idempotent, and safe to call in any lifecycle
-     * state: the actual subscribe runs on the main thread and re-checks.
+     * Begin location updates. Called over JNI from the Rust permission gate
+     * once it observes the runtime permission as granted; kept by name in
+     * proguard-rules.pro. Idempotent, and safe to call in any lifecycle state:
+     * the actual subscribe runs on the main thread and re-checks.
      */
     public static void start() {
         sStarted = true;
         Handler h = sMainHandler;
         if (h != null) h.post(LocationHelper::startListening);
+    }
+
+    /**
+     * Drop the subscription. Called over JNI when the user turns location off
+     * in settings, or when the app observes the runtime permission revoked;
+     * kept by name in proguard-rules.pro. Idempotent, and safe in any lifecycle
+     * state for the same reason start() is.
+     *
+     * Clearing sStarted matters as much as the unsubscribe: without it the next
+     * onActivityResumed would call startListening() and quietly turn the
+     * providers back on for a user who had switched them off.
+     */
+    public static void stop() {
+        sStarted = false;
+        Handler h = sMainHandler;
+        if (h != null) h.post(LocationHelper::stopListening);
     }
 
     // Main thread only (lifecycle callbacks, or posted from start()).

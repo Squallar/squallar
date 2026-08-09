@@ -2074,6 +2074,19 @@ impl App {
         self.platform.set_theme_detector(detector);
     }
 
+    /// Install the four location calls (Android only; see
+    /// [`PlatformBridge::set_location_hooks`]).
+    ///
+    /// The entry point installs these, not `App`, for the reason every other
+    /// setter here exists: they are JNI calls that live in `rustdar-android`,
+    /// which depends on this crate and can never be called from it. Handing
+    /// them over before `run_app` is what closes the window in which
+    /// `AndroidPlatform` answers `Unavailable` for want of them — a terminal
+    /// state the gate would stop polling out of.
+    pub fn set_location_hooks(&mut self, hooks: crate::platform::LocationHooks) {
+        self.platform.set_location_hooks(hooks);
+    }
+
     /// Set a callback that takes a back press delivered outside the input
     /// queue (Android's `OnBackInvokedDispatcher`; see
     /// [`PlatformBridge::poll_back_press`]).
@@ -3284,6 +3297,43 @@ mod tests {
             opening_site(&app),
             "KDLH",
             "a platform location fix drew a dot and left the map on the \
+             timezone's guess"
+        );
+    }
+
+    /// The shape `rustdar-android` now produces from the network provider, end
+    /// to end.
+    ///
+    /// Two things about that shape changed, and only one of them is visible
+    /// here. The quality moved from `Estimated` to `Device`, which is a label
+    /// correction — `can_relocate` admits both. The accuracy moved from `None`
+    /// to whatever `Location.getAccuracy()` said, and *that* is what turns the
+    /// gate below from a formality into a judgement: until this fix every
+    /// Android reading passed unconditionally, because there was nothing to
+    /// weigh.
+    ///
+    /// 32 m is a typical Wi-Fi-assisted network fix. It refines; the absurd one
+    /// in `a_low_accuracy_fix_does_not_spend_the_provisional_site` does not, and
+    /// before this it would have.
+    #[test]
+    fn an_android_network_fix_refines_the_opening_site() {
+        let mut bridge = TestBridge::android().with_timezone("America/Chicago");
+        let fixes = bridge.gps_channel();
+        let mut app = headless(bridge);
+        assert_eq!(opening_site(&app), "KLOT");
+
+        fixes
+            .send(rustdar_gps::GpsFix {
+                accuracy_m: Some(32.0),
+                ..rustdar_gps::GpsFix::from_device_position(46.7867, -92.1005)
+            })
+            .unwrap();
+        app.poll_platform_state();
+
+        assert_eq!(
+            opening_site(&app),
+            "KDLH",
+            "an Android network fix drew a dot and left the map on the \
              timezone's guess"
         );
     }

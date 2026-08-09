@@ -21,15 +21,24 @@ const CANVAS_ID: &str = "rustdar-canvas";
 /// redraws on change. Every async completion here asks for a frame when it
 /// lands, so nothing depends on an unbidden one.
 ///
-/// That last sentence used to say every completion "ends in `notify_redraw`",
-/// and it was not true of [`geolocation::start_watch`]: its success callback
-/// pushed the fix into a channel that is drained only while rendering and
-/// stopped there, so under `Wait` a browser location update was invisible until
-/// something else drew. It now takes the app's [`RedrawWaker`], which is why the
-/// app is built first below.
+/// # What used to be here, and why it is not
 ///
-/// [`geolocation::start_watch`]: crate::geolocation::start_watch
-/// [`RedrawWaker`]: rustdar_frontend::platform::RedrawWaker
+/// This function used to open an `mpsc` channel, call `geolocation::start_watch`
+/// on it and hand the receiver to the app — three lines that between them
+/// produced the browser's location prompt **on first paint, with no user
+/// gesture**, before the page had shown the user anything at all. A refusal was
+/// logged at `info!` and reached nothing, so a denial and a device with no
+/// signal were the same empty channel forever and the app could never re-ask,
+/// explain, or offer a way back.
+///
+/// [`WebPlatform`] owns all of it now: the permission state, the query that
+/// reads it without prompting, and the watch. The prompt happens from
+/// `request_location`, which the gate in `rustdar_frontend::location_permission`
+/// reaches only from a state that licenses one — never before the browser has
+/// answered, never more than once per install unprompted, and never again after
+/// a refusal.
+///
+/// [`WebPlatform`]: crate::bridge::WebPlatform
 #[wasm_bindgen]
 pub fn start() -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
@@ -51,17 +60,12 @@ pub fn start() -> Result<(), JsValue> {
     // thread until the worker answers, and forever if it does not.
     crate::worker_port::attach();
 
+    // Nothing about location happens here. `WebPlatform::new` starts a
+    // *permission query*, which prompts nobody; `App::new` hands the bridge the
+    // waker its callbacks fire, and the watch waits for the gate. See the note
+    // above.
     let platform = crate::bridge::WebPlatform::new(canvas);
-    let mut app = rustdar_frontend::app::App::new(Box::new(platform));
-
-    // The watch is started after the app, not before it, because it needs the
-    // app's waker. There is no window behind that waker yet — the first one is
-    // created on the `resumed()` that `spawn_app` below leads to — and there
-    // does not need to be: the waker is a slot every producer shares, and
-    // `create_window` fills it for all of them at once.
-    let (fix_sender, fix_receiver) = std::sync::mpsc::channel();
-    crate::geolocation::start_watch(fix_sender, app.redraw_waker());
-    app.set_gps_fix_receiver(fix_receiver);
+    let app = rustdar_frontend::app::App::new(Box::new(platform));
 
     event_loop.spawn_app(app);
     Ok(())

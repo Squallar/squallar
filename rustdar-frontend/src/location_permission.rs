@@ -454,28 +454,38 @@ impl LocationGate {
     /// What they lose is the memory: every run asks once more. That is the
     /// correct trade — the alternative is silently disabling a working feature
     /// — and it is bounded by [`MAX_ATTEMPTS`] within each run.
-    fn resolve_store(&mut self, platform: &dyn PlatformBridge) {
+    ///
+    /// # Why the bridge is told at the end of this
+    ///
+    /// [`set_attempts`](Self::set_attempts) only pushes a value that *moved*,
+    /// so a run that loads `attempts: 1` out of the memo and is never asked
+    /// again would never tell the bridge anything, and Android would spend the
+    /// whole session believing this install had never asked. That is the
+    /// difference between reporting a permanent denial as `Denied` — no button,
+    /// honest advice — and reporting it as `Prompt`, which is a button that
+    /// raises a dialog the framework silently refuses to show. Pushed here, on
+    /// the one pass that reads the memo, so the bridge has it before the first
+    /// query.
+    fn resolve_store(&mut self, platform: &mut dyn PlatformBridge) {
         if self.store_resolved {
             return;
         }
         self.store_resolved = true;
         self.store = platform.config_store();
-        let Some(store) = self.store.as_ref() else {
-            log::debug!(
+        match self.store.as_ref().and_then(|s| s.load(LOCATION_MEMO_KEY)) {
+            Some(raw) => match serde_json::from_str::<LocationMemo>(&raw) {
+                Ok(memo) => self.memo = memo,
+                // A corrupt memo is not worth failing over, but it is worth
+                // saying: silently defaulting means silently re-prompting.
+                Err(e) => log::warn!("ignoring unreadable location memo: {e}"),
+            },
+            None if self.store.is_none() => log::debug!(
                 "no config store; location choices will be asked once per run \
                  and not remembered"
-            );
-            return;
-        };
-        let Some(raw) = store.load(LOCATION_MEMO_KEY) else {
-            return;
-        };
-        match serde_json::from_str::<LocationMemo>(&raw) {
-            Ok(memo) => self.memo = memo,
-            // A corrupt memo is not worth failing over, but it is worth saying:
-            // silently defaulting means silently re-prompting.
-            Err(e) => log::warn!("ignoring unreadable location memo: {e}"),
+            ),
+            None => {}
         }
+        platform.set_location_attempts(self.memo.attempts);
     }
 
     /// Write the memo now, not on the autosave timer.
@@ -977,6 +987,38 @@ mod tests {
         let raw = store.load(LOCATION_MEMO_KEY).expect("no memo");
         let memo: LocationMemo = serde_json::from_str(&raw).expect("unreadable memo");
         assert_eq!(memo.attempts, 0);
+    }
+
+    /// The half of the memo that has to leave this crate.
+    ///
+    /// Android cannot tell "never asked" from "permanently denied" on its own —
+    /// `shouldShowRequestPermissionRationale` is `false` at both ends — so the
+    /// persisted count is the only thing that separates them, and it is only
+    /// useful over there. [`LocationGate::set_attempts`] pushes it when it
+    /// *moves*, which covers every ask; a run that loads a spent counter and is
+    /// then correctly never asked again would push nothing at all, and that
+    /// run's bridge would spend the whole session reporting a permanent denial
+    /// as a fresh `Prompt`: a button that raises a dialog Android silently
+    /// refuses to show.
+    #[test]
+    fn a_bridge_is_told_what_this_install_has_already_asked_before_it_is_queried() {
+        let store = Rc::new(MemoryConfigStore::default());
+        store
+            .store(LOCATION_MEMO_KEY, r#"{"attempts":1,"enabled":true}"#)
+            .unwrap();
+        let mut f =
+            Fixture::new(desktop_with_store(store).with_permission(LocationPermission::Prompt));
+        let record = f.bridge.location_record();
+        assert_eq!(record.attempts.get(), None, "the fixture starts wired up");
+
+        f.step();
+
+        assert_eq!(
+            record.attempts.get(),
+            Some(1),
+            "the bridge was queried without being told this install has \
+             already asked, so Android reports a permanent denial as a prompt"
+        );
     }
 
     /// Nothing crashes, and nothing is silently treated as a decision, if the

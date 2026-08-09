@@ -444,7 +444,7 @@ impl PlatformBridge for AndroidPlatform {
     /// closes before the first frame.
     fn location_permission(&self) -> rustdar_gps::LocationPermission {
         match self.location_hooks {
-            Some(hooks) => (hooks.query)(),
+            Some(hooks) => (hooks.query)(self.location_attempts),
             None => rustdar_gps::LocationPermission::Unavailable,
         }
     }

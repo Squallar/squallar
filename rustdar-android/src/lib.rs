@@ -147,7 +147,7 @@ fn with_activity<T>(
 /// the per-provider fallback in [`last_known_location_with`]) -- so treating
 /// FINE as the only "yes" would read a user who already answered as
 /// unpermissioned and burn the bounded re-requests in
-/// [`start_location_thread`] against them.
+/// [`location_permission_status`] against them.
 fn has_location_permission() -> bool {
     use jni::objects::JValue;
     use jni::{jni_sig, jni_str};
@@ -191,7 +191,9 @@ fn has_location_permission() -> bool {
 ///
 /// `Activity.requestPermissions` goes on to `startActivityForResult` and sets
 /// `mHasCurrentPermissionsRequest` without synchronisation. The framework
-/// expects both on the UI thread; this runs on the `gps-location` thread. It is
+/// expects both on the UI thread; this runs on the winit event-loop thread,
+/// which under `android-activity` is the dedicated native thread `android_main`
+/// was started on and is not the UI thread either. It is
 /// not a `checkThread()` assertion, so it does not throw — it is simply outside
 /// what the framework guarantees, and whether the dialog appears can depend on
 /// where the Activity is in its lifecycle when the call lands.
@@ -199,7 +201,14 @@ fn has_location_permission() -> bool {
 /// **That is why the caller retries, and why the retry must not be
 /// "simplified" to a single attempt.** A `false` here is a request that did not
 /// happen; treating it as a request the user declined is exactly the bug this
-/// replaced. See the bounded loop in [`start_location_thread`].
+/// replaced. See the bounded retry in `rustdar_frontend::location_permission`,
+/// which is what the return value below feeds.
+///
+/// (Only two nouns in the paragraph above have moved since it was written: the
+/// thread the call comes in on, and where the retry lives. Every claim about
+/// the framework, and the whole of why the `bool` exists, is unchanged — the
+/// caller used to be [`start_location_thread`]'s bounded loop and is now the
+/// permission gate, and *neither* is the UI thread.)
 fn request_location_permission() -> bool {
     use jni::objects::JValue;
     use jni::{jni_sig, jni_str};
@@ -212,10 +221,9 @@ fn request_location_permission() -> bool {
         // request for ACCESS_FINE_LOCATION *alone* is silently discarded by
         // the framework: no dialog, no callback, because the user must be
         // offered the "approximate" downgrade alongside it. Each discarded
-        // call still counted against MAX_PERMISSION_REQUESTS in
-        // [`start_location_thread`], so both bounded attempts burned with the
-        // user never once asked. Both permissions are declared in the
-        // manifest.
+        // call still counted against the caller's bounded attempts, so both
+        // were burned with the user never once asked. Both permissions are
+        // declared in the manifest.
         let fine = env.new_string("android.permission.ACCESS_FINE_LOCATION")?;
         let coarse = env.new_string("android.permission.ACCESS_COARSE_LOCATION")?;
         let string_class = env.find_class(jni_str!("java/lang/String"))?;
@@ -244,6 +252,187 @@ fn request_location_permission() -> bool {
     }
 }
 
+/// Whether Android would show the permission dialog if asked right now.
+///
+/// `Activity.shouldShowRequestPermissionRationale` is API 23+ and minSdk here is
+/// 28, so it is always present. FINE **or** COARSE, matching
+/// [`has_location_permission`]: either one still showing means a dialog would
+/// appear.
+///
+/// `None` means the question could not be put at all — no `Activity` stashed
+/// yet, a failed JNI attach, or a throw — and that is a *different answer* from
+/// `Some(false)`, which is why this is not a `bool`. See
+/// [`location_permission_status`].
+///
+/// It is a binder round trip to the package manager rather than a `View` call,
+/// so calling it off the UI thread is ordinary; the hazard documented on
+/// [`request_location_permission`] does not extend to it.
+fn should_show_permission_rationale() -> Option<bool> {
+    use jni::objects::JValue;
+    use jni::{jni_sig, jni_str};
+
+    // shouldShowRequestPermissionRationale is Activity-only, like
+    // requestPermissions -- see [`JAVA`].
+    with_activity(|env, activity| -> jni::errors::Result<bool> {
+        for permission in [
+            "android.permission.ACCESS_FINE_LOCATION",
+            "android.permission.ACCESS_COARSE_LOCATION",
+        ] {
+            let perm = env.new_string(permission)?;
+            let show = env
+                .call_method(
+                    activity,
+                    jni_str!("shouldShowRequestPermissionRationale"),
+                    jni_sig!("(Ljava/lang/String;)Z"),
+                    &[JValue::from(&perm)],
+                )?
+                .z()?;
+            if show {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })
+    .and_then(|result| {
+        result
+            .inspect_err(|e| log::warn!("shouldShowRequestPermissionRationale failed: {e:?}"))
+            .ok()
+    })
+}
+
+/// What Android currently says about this app's access to the user's location.
+///
+/// Backs [`PlatformBridge::location_permission`] through [`LocationHooks`].
+/// `attempts` is what the app has told the bridge about how many times this
+/// *install* has asked; see the tri-state below for why it is needed and
+/// `PlatformBridge::set_location_attempts` for where it comes from.
+///
+/// # Android's states are three, and its API names two of them
+///
+/// `checkSelfPermission` says granted or not. `shouldShowRequestPermissionRationale`
+/// then splits "not" in two, and the split is counter-intuitive — it is `true`
+/// in the *middle* case and `false` at both ends:
+///
+/// | asked before | rationale | means | reported |
+/// |---|---|---|---|
+/// | no  | `false` | nobody has been asked | `Prompt` |
+/// | yes | `true`  | declined once; **the dialog will still show** | `Prompt` |
+/// | yes | `false` | declined twice, or "don't ask again" | `Denied` |
+///
+/// Rows 1 and 3 are indistinguishable from inside the framework, which is the
+/// entire reason `attempts` is a parameter. Collapsing them onto `Denied` would
+/// render a fresh install with no button and no way in; collapsing them onto
+/// `Prompt` would offer a button that raises a dialog Android silently refuses
+/// to show, which reads as a broken app.
+///
+/// # `Unknown` is not `Unavailable`, and this is where that matters most
+///
+/// `None` from [`should_show_permission_rationale`] means the question could not
+/// be put: no `Activity` in [`JAVA`] yet, or a JNI attach that failed. That is
+/// the state of *every* Android launch for the first frames — `android_main`
+/// stashes the context before `run_app`, but a resumed second Activity passes
+/// through it too — and it must mean "wait", not "this device has no location
+/// service". `Unavailable` is terminal: the gate stops polling, the settings
+/// pane says location is not available on this platform, and the feature is
+/// gone for the life of the process on a phone that has it.
+///
+/// [`PlatformBridge::location_permission`]: rustdar_frontend::platform::PlatformBridge::location_permission
+/// [`LocationHooks`]: rustdar_frontend::platform::LocationHooks
+fn location_permission_status(attempts: u8) -> rustdar_gps::LocationPermission {
+    if has_location_permission() {
+        return rustdar_gps::LocationPermission::Granted;
+    }
+    // `has_location_permission` folds "no" and "could not ask" into the same
+    // `false`, so the rationale call below doubles as the reachability probe. It
+    // has to: answering `Denied` from a missing Activity would be a permanent
+    // refusal recorded against a user who was never asked.
+    //
+    // Called only on the way past a `false`, so a granted permission costs one
+    // binder round trip per poll rather than two.
+    permission_from_rationale(should_show_permission_rationale(), attempts)
+}
+
+/// The decision half of [`location_permission_status`], over plain values.
+///
+/// Split out for the same reason [`provider_fix_quality`] is: everything above
+/// it is JNI and everything in it is a table, and the table is where the three
+/// mistakes live. See [`location_permission_status`] for what each row means and
+/// why `None` is [`Unknown`](rustdar_gps::LocationPermission::Unknown).
+fn permission_from_rationale(
+    rationale: Option<bool>,
+    attempts: u8,
+) -> rustdar_gps::LocationPermission {
+    use rustdar_gps::LocationPermission;
+
+    match (rationale, attempts) {
+        // Could not ask. First frames of every launch; means "wait".
+        (None, _) => LocationPermission::Unknown,
+        // Declined once. Android will still show the dialog, so this is a
+        // `Prompt` with a working button -- reporting it as `Denied` would be a
+        // regression against what this app did before it modelled permissions
+        // at all.
+        (Some(true), _) => LocationPermission::Prompt,
+        // No rationale and this install has asked: declined twice, or "don't
+        // ask again". Android will not show the dialog, so neither will we.
+        (Some(false), 1..) => LocationPermission::Denied,
+        // No rationale and never asked. A fresh install.
+        (Some(false), 0) => LocationPermission::Prompt,
+    }
+}
+
+/// Prompt if Android needs prompting, and start delivering fixes.
+///
+/// Backs [`PlatformBridge::request_location`] through [`LocationHooks`]. The
+/// two halves are one method because the gate has one question — "make location
+/// happen" — and which of the two it means is a thing only the platform knows.
+///
+/// The `bool` is the one this trait method is honest about anywhere, and both
+/// branches answer the same question: **did the call reach Java?** Neither is
+/// "did the user agree", which arrives later and is read back through
+/// [`location_permission_status`]. See [`request_location_permission`] for the
+/// threading note that makes a `false` a real and recoverable outcome rather
+/// than a user's decision — that distinction is the whole reason the gate has a
+/// second attempt.
+///
+/// [`PlatformBridge::request_location`]: rustdar_frontend::platform::PlatformBridge::request_location
+/// [`LocationHooks`]: rustdar_frontend::platform::LocationHooks
+fn request_location() -> bool {
+    if !has_location_permission() {
+        log::info!("Requesting ACCESS_FINE_LOCATION + ACCESS_COARSE_LOCATION permissions");
+        return request_location_permission();
+    }
+    start_location_updates()
+}
+
+/// Stop delivering fixes.
+///
+/// Backs [`PlatformBridge::stop_location`]. Cannot revoke the runtime
+/// permission — Android offers an app no way to give one back — so this is an
+/// off switch for the *stream*, and it is a real one: the flag stops
+/// [`start_location_thread`]'s poll from reading the provider, and
+/// `LocationHelper.stop()` drops the subscription that keeps the providers
+/// producing at all.
+///
+/// [`PlatformBridge::stop_location`]: rustdar_frontend::platform::PlatformBridge::stop_location
+fn stop_location() {
+    // Flag first: the poll thread is a different thread and may be mid-sleep,
+    // so this is what stops the *next* pass regardless of what Java does.
+    LOCATION_UPDATES_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+    stop_location_updates();
+}
+
+/// Whether Android is currently delivering fixes.
+///
+/// Backs [`PlatformBridge::location_active`]. Read on the frame path, so it is a
+/// relaxed atomic load rather than a JNI call: the flag is set only when
+/// `LocationHelper.start()` has actually reached Java, so "active" here means
+/// the subscription was established, not merely that it was asked for.
+///
+/// [`PlatformBridge::location_active`]: rustdar_frontend::platform::PlatformBridge::location_active
+fn location_active() -> bool {
+    LOCATION_UPDATES_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Try to retrieve the device's last known GPS location via `LocationManager`.
 /// Returns a [`GpsFix`] on success or `None` if unavailable.
 ///
@@ -253,6 +442,29 @@ fn request_location_permission() -> bool {
 /// the fallback when that subscription could not be established.
 fn get_last_known_location() -> Option<rustdar_gps::GpsFix> {
     with_activity(last_known_location_with).flatten()
+}
+
+/// What a `LocationManager` provider name says about the fix it produced.
+///
+/// Only `"gps"` is a satellite fix. Everything else on this platform is the
+/// network provider, which fuses Wi-Fi scans and cell towers.
+///
+/// `Device`, not `Estimated`, and the correction is about honesty rather than
+/// behaviour. `Estimated` is NMEA quality 6 -- *dead reckoning*, a receiver
+/// extrapolating from its last real fix -- which is a claim about a receiver
+/// this device does not have. `FixQuality::can_relocate` admits both, so the
+/// site upgrade is unchanged; what changes is the two words the settings pane
+/// prints beside the position, which used to be wrong.
+///
+/// Split out of [`last_known_location_with`] for the reason `fix_from_coords` is
+/// split out on the web: it is a decision, the rest of that function is nine JNI
+/// calls, and only one of the two can be checked without a device.
+fn provider_fix_quality(provider: &str) -> rustdar_gps::FixQuality {
+    if provider == "gps" {
+        rustdar_gps::FixQuality::Gps
+    } else {
+        rustdar_gps::FixQuality::Device
+    }
 }
 
 /// Body of [`get_last_known_location`], split out so it can keep using `?` on
@@ -348,11 +560,21 @@ fn last_known_location_with(
             })
             .map(|b| b as f64);
 
-        let fix_quality = if *provider == "gps" {
-            rustdar_gps::FixQuality::Gps
-        } else {
-            rustdar_gps::FixQuality::Estimated
-        };
+        // The 68% confidence radius in metres, which is what `GpsFix` wants and
+        // what `Location.getAccuracy()` documents itself as. Guarded by
+        // `hasAccuracy()` like every other optional above: a `Location` without
+        // one returns 0.0, and 0 m would read as a perfect fix rather than an
+        // absent field.
+        let accuracy_m = env
+            .call_method(&location, jni_str!("getAccuracy"), jni_sig!("()F"), &[])
+            .and_then(|v| v.f())
+            .ok()
+            .filter(|_| {
+                env.call_method(&location, jni_str!("hasAccuracy"), jni_sig!("()Z"), &[])
+                    .and_then(|v| v.z())
+                    .unwrap_or(false)
+            })
+            .map(|a| a as f64);
 
         return Some(rustdar_gps::GpsFix {
             latitude: lat,
@@ -361,15 +583,9 @@ fn last_known_location_with(
             speed_mps,
             heading_deg,
             satellites: None, // Not available from getLastKnownLocation
-            fix_quality,
+            fix_quality: provider_fix_quality(provider),
             hdop: None,
-            // `Location.getAccuracy()` would fill this in, and reading it is
-            // one more JNI call in a function that already makes eight. It is
-            // left for the Android phase, which owns this file: the only reader
-            // today treats `None` as passing, so an absent accuracy costs
-            // nothing here and a half-wired one would be a second thing to
-            // review in the wrong change.
-            accuracy_m: None,
+            accuracy_m,
             timestamp: None,
         });
     }
@@ -404,6 +620,13 @@ static LOCATION_CLASS: std::sync::OnceLock<jni::objects::Global<jni::objects::JC
 /// helper class not registered, JNI attach failure -- on its next pass instead
 /// of giving live updates up for the process. Safe to deliver more than once:
 /// `start()` is idempotent.
+///
+/// The retry is now the gate's rather than the poll thread's: the `Granted` arm
+/// calls [`request_location`] on every pass while [`location_active`] is still
+/// `false`, at ~1.3 Hz instead of every 10 s. Which is why the flag below is
+/// set from the *return value* and not unconditionally -- a start that never
+/// reached Java must leave `location_active` saying so, or nothing ever tries
+/// again.
 fn start_location_updates() -> bool {
     use jni::objects::JClass;
     use jni::{jni_sig, jni_str};
@@ -412,20 +635,73 @@ fn start_location_updates() -> bool {
         return false;
     };
 
-    with_env(|env| {
+    let started = with_env(|env| {
         let cls: &JClass<'static> = global_ref;
         env.call_static_method(cls, jni_str!("start"), jni_sig!("()V"), &[])
             .inspect_err(|e| log::warn!("LocationHelper.start() failed: {e:?}"))
             .is_ok()
     })
-    .unwrap_or(false)
+    .unwrap_or(false);
+    if started {
+        LOCATION_UPDATES_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    started
+}
+
+/// Whether `LocationHelper.start()` has been delivered and not since stopped.
+///
+/// The one piece of state the location hooks share, and it is process-wide for
+/// the same reason [`LOCATION_CLASS`] is: the hooks are bare `fn` pointers with
+/// nothing to capture, and the poll thread reads it from a third thread again.
+///
+/// Not merely a cache of what Java thinks. It is what makes the settings pane's
+/// **Turn off** button mean something: the poll below reads it before touching
+/// the provider, so a stopped stream stops producing fixes even while the
+/// runtime permission is still granted and `getLastKnownLocation` would happily
+/// keep answering.
+static LOCATION_UPDATES_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Ask LocationHelper to drop the subscription (`LocationHelper.stop()`).
+///
+/// The mirror of [`start_location_updates`], and equally idempotent. A miss is
+/// logged and otherwise ignored: [`LOCATION_UPDATES_ACTIVE`] has already been
+/// cleared by the time this runs, so the fix stream is stopped either way and
+/// what a failure costs is a subscription left open until the Activity pauses --
+/// battery, not correctness.
+fn stop_location_updates() {
+    use jni::objects::JClass;
+    use jni::{jni_sig, jni_str};
+
+    let Some(global_ref) = LOCATION_CLASS.get() else {
+        return;
+    };
+
+    with_env(|env| {
+        let cls: &JClass<'static> = global_ref;
+        let _ = env
+            .call_static_method(cls, jni_str!("stop"), jni_sig!("()V"), &[])
+            .inspect_err(|e| log::warn!("LocationHelper.stop() failed: {e:?}"));
+    });
 }
 
 /// Start a background thread that polls GPS location and sends updates
-/// through the provided channel. Also handles permission requests, and -- once
-/// a permission is granted -- switches real location updates on via
-/// [`start_location_updates`], without which the poll below can read null
-/// forever on a device where no other app is requesting location.
+/// through the provided channel.
+///
+/// # It no longer asks for anything
+///
+/// This thread used to own the permission too: a bounded `requestPermissions`
+/// loop with its own counter, firing three seconds after launch on whatever
+/// state the Activity happened to be in. All of that has moved to
+/// `rustdar_frontend::location_permission`, which is the one place in the app
+/// that may prompt, and which knows three things this thread could not -- what
+/// the OS currently says, whether this *install* has ever asked, and whether the
+/// user has turned location off. What is left here is a reader.
+///
+/// The 10 s poll stays. `getLastKnownLocation` is what actually produces every
+/// fix on this platform (`LocationHelper`'s listener is deliberately empty --
+/// its subscription existing is the point), so removing the poll would remove
+/// location, not just its permission half.
 ///
 /// # `wake`
 ///
@@ -459,53 +735,22 @@ fn start_location_thread(
             // Let the app fully initialise before doing JNI work
             std::thread::sleep(std::time::Duration::from_secs(3));
 
-            // Counts requests that *actually reached* Activity.requestPermissions,
-            // not attempts. The old code set a `permission_requested` flag after the
-            // first call whether or not anything happened, and because that call was
-            // reaching the Application rather than the Activity (see [`JAVA`]) the
-            // dialog was never shown and never retried: GPS was off for the life of
-            // the process unless the permission was granted from Settings.
-            //
-            // Bounded, because Android stops showing the dialog after the user has
-            // declined twice and silently auto-denies from then on. Retrying past
-            // that is pure noise.
-            //
-            // Retrying *up to* it is not belt-and-braces, and this is the part not
-            // to collapse back into a single call: `request_location_permission`
-            // reaches `Activity.requestPermissions` from this thread, which is not
-            // the UI thread and not a context the framework supports (see that
-            // function). The first attempt fires three seconds in and can land
-            // before the Activity is resumed. The counter only advances when the
-            // call actually got through, so a dropped attempt costs one more pass
-            // of this loop rather than the whole feature.
-            const MAX_PERMISSION_REQUESTS: u32 = 2;
-            let mut requests_made = 0u32;
-
-            // Whether `LocationHelper.start()` has been delivered. Tracked so the
-            // call is made once per grant rather than every 10 s; retried while
-            // `false` because a miss (helper class not registered, JNI attach
-            // failure) must not cost the process live updates -- the call is
-            // idempotent on the Java side.
-            let mut updates_started = false;
-
             loop {
-                if has_location_permission() {
-                    if !updates_started {
-                        updates_started = start_location_updates();
+                // Both terms, and neither is redundant. [`location_active`] is
+                // the user's switch and the gate's revocation stop -- without
+                // it, "Turn off" would leave this thread reading the provider
+                // every 10 s and the dot would keep moving. The permission check
+                // is the framework's: a grant withdrawn in system settings makes
+                // `getLastKnownLocation` throw, and there is no reason to make
+                // it throw once per poll while the gate catches up.
+                if location_active()
+                    && has_location_permission()
+                    && let Some(fix) = get_last_known_location()
+                {
+                    if sender.send(fix).is_err() {
+                        break; // channel closed
                     }
-                    if let Some(fix) = get_last_known_location() {
-                        if sender.send(fix).is_err() {
-                            break; // channel closed
-                        }
-                        wake();
-                    }
-                } else if requests_made < MAX_PERMISSION_REQUESTS {
-                    log::info!(
-                        "Requesting ACCESS_FINE_LOCATION + ACCESS_COARSE_LOCATION permissions"
-                    );
-                    if request_location_permission() {
-                        requests_made += 1;
-                    }
+                    wake();
                 }
 
                 std::thread::sleep(std::time::Duration::from_secs(10));
@@ -1247,8 +1492,9 @@ fn android_main(app: AndroidApp) {
 
             // Holds the location-update subscription that keeps the providers
             // producing fixes for the gps-location thread's poll. Registered
-            // here; actually *started* lazily from that thread, once it sees
-            // the runtime permission granted. See `start_location_updates`.
+            // here; actually *started* later, by the permission gate, once it
+            // sees the runtime permission granted. See `start_location_updates`
+            // and `request_location`.
             if let Some(cls) =
                 register_java_helper(env, &loader, &activity, "com.rustdar.LocationHelper")
             {
@@ -1337,6 +1583,24 @@ fn android_main(app: AndroidApp) {
     // light/dark switch; it also answers the initial query on the first frame.
     platform_app.set_theme_detector(detect_dark_theme);
 
+    // ...and the four location calls, for the same reason and by the same
+    // inversion: all four are JNI, and rustdar-platform (which holds the
+    // bridge) is `#![deny(unsafe_code)]` and cannot depend on this crate.
+    //
+    // All four at once, deliberately: a half-installed set has no symptom. A
+    // bridge with `query` and no `request` reports `Prompt` forever and never
+    // asks, which is indistinguishable from a user who has not been asked yet.
+    //
+    // Before `run_app`, so the window in which `AndroidPlatform` answers
+    // `Unavailable` for want of hooks closes before the first frame -- that
+    // answer is terminal, and a gate that saw it would stop polling for good.
+    platform_app.set_location_hooks(rustdar_frontend::platform::LocationHooks {
+        query: location_permission_status,
+        request: request_location,
+        stop: stop_location,
+        active: location_active,
+    });
+
     // Both threads below ask for the frame their value will be read on through
     // a handle that is *empty right now* -- the window does not exist until the
     // first `resumed()`, which is inside `run_app`. That is the whole reason it
@@ -1372,4 +1636,143 @@ fn android_main(app: AndroidApp) {
     // ref go and let the helpers degrade to their documented defaults instead
     // of calling into the corpse.
     set_java_context(None);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustdar_gps::{FixQuality, LocationPermission};
+
+    // Everything here runs on the *host*, under the `jni-typecheck` feature that
+    // widens this crate's own `cfg` (see the top of the file), so it needs
+    // `cargo test --all-features` -- a plain `cargo test --workspace` compiles
+    // none of this crate. There is no JVM, so `JAVA` is empty and every helper
+    // degrades to its documented default, which is not a limitation for two of
+    // these tests but the point of them: "no Activity yet" is a real Android
+    // state and the host reproduces it exactly.
+    //
+    // What cannot be tested here is anything that reaches Java: the permission
+    // dialog, `shouldShowRequestPermissionRationale`'s real answers, and
+    // `LocationHelper.start()`/`stop()`. Those need a device.
+
+    // ── The permission tri-state ────────────────────────────────────────
+
+    /// A fresh install has been asked nothing, and Android's API says exactly
+    /// the same thing about a permanently-denied one:
+    /// `shouldShowRequestPermissionRationale` is `false` at *both* ends. Only
+    /// the app's own attempt count separates them, which is why it is a
+    /// parameter and not a static somewhere.
+    #[test]
+    fn an_install_that_has_never_asked_is_offered_the_prompt() {
+        assert_eq!(
+            permission_from_rationale(Some(false), 0),
+            LocationPermission::Prompt
+        );
+    }
+
+    /// The middle row, and the one a `bool` would have lost. A user who
+    /// declined once still gets the dialog from Android, so reporting `Denied`
+    /// here would render the settings pane with no button and no way back — a
+    /// regression against what this app did before it modelled permissions at
+    /// all.
+    #[test]
+    fn a_user_who_declined_once_can_still_be_asked() {
+        for attempts in [0, 1, 2, u8::MAX] {
+            assert_eq!(
+                permission_from_rationale(Some(true), attempts),
+                LocationPermission::Prompt,
+                "rationale is Android saying the dialog will still show, and it \
+                 outranks anything this app remembers"
+            );
+        }
+    }
+
+    /// No rationale *and* this install has asked: declined twice, or "don't ask
+    /// again". Android silently auto-denies from here, so a button would raise
+    /// a dialog that never appears — which reads to the user as a broken app.
+    #[test]
+    fn a_permanently_denied_install_is_reported_as_denied() {
+        assert_eq!(
+            permission_from_rationale(Some(false), 1),
+            LocationPermission::Denied
+        );
+        assert_eq!(
+            permission_from_rationale(Some(false), 2),
+            LocationPermission::Denied
+        );
+    }
+
+    /// **The state of every launch's first frames**, and the one that must never
+    /// be `Unavailable`. `android_main` stashes the Activity before `run_app`,
+    /// but a JNI attach can fail and a second Activity passes through the same
+    /// window — and `Unavailable` is terminal: the gate stops polling, the
+    /// settings pane says this platform has no location service, and the
+    /// feature is gone for the life of the process on a phone that has it.
+    #[test]
+    fn a_device_with_no_activity_yet_is_unknown_rather_than_unavailable() {
+        for attempts in [0, 1, 2] {
+            assert_eq!(
+                permission_from_rationale(None, attempts),
+                LocationPermission::Unknown,
+                "a question that could not be put was answered anyway"
+            );
+        }
+    }
+
+    /// The composed path, on a host with no JVM at all — which is the same
+    /// shape as an Android process before `android_main` has stashed its
+    /// Activity: `checkSelfPermission` cannot be reached, so it reports "not
+    /// granted", and the rationale call cannot be reached either, so it reports
+    /// nothing. Any answer but `Unknown` here is a permission decision invented
+    /// out of a failed JNI attach.
+    #[test]
+    fn the_permission_query_waits_rather_than_guessing_when_java_is_unreachable() {
+        assert!(
+            java_context().is_none(),
+            "the fixture has a JVM, so this proves nothing"
+        );
+        assert_eq!(location_permission_status(0), LocationPermission::Unknown);
+        assert_eq!(location_permission_status(2), LocationPermission::Unknown);
+    }
+
+    /// Nothing is delivering until something has started it, and this flag is
+    /// what the settings pane and the 10 s poll both read. A bridge that
+    /// answered `true` here would have the gate believe delivery was already
+    /// running and never call `request_location` at all.
+    #[test]
+    fn location_is_not_active_until_updates_have_been_started() {
+        assert!(!location_active());
+    }
+
+    // ── The fix ─────────────────────────────────────────────────────────
+
+    /// `"gps"` is the one provider that really is satellites.
+    #[test]
+    fn a_gps_provider_fix_still_claims_gps() {
+        assert_eq!(provider_fix_quality("gps"), FixQuality::Gps);
+    }
+
+    /// Everything else is the network provider fusing Wi-Fi and cell towers.
+    /// `Estimated` — what this used to report — means dead reckoning in NMEA,
+    /// which is a claim about a receiver this device does not have, and the
+    /// settings pane prints the label verbatim.
+    #[test]
+    fn a_network_provider_fix_is_a_device_fix_rather_than_dead_reckoning() {
+        assert_eq!(provider_fix_quality("network"), FixQuality::Device);
+        assert_eq!(provider_fix_quality("passive"), FixQuality::Device);
+        assert_eq!(provider_fix_quality("fused"), FixQuality::Device);
+    }
+
+    /// Both qualities may refine the opening site, which is what makes the
+    /// accuracy this file now reads the thing that decides it rather than a
+    /// field nobody fills in. See `App::upgrade_provisional_site`.
+    #[test]
+    fn every_provider_this_app_reads_may_refine_the_opening_site() {
+        for provider in ["gps", "network"] {
+            assert!(
+                provider_fix_quality(provider).can_relocate(),
+                "{provider} fixes stopped being allowed to choose the radar site"
+            );
+        }
+    }
 }

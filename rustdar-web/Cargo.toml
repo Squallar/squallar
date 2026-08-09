@@ -74,6 +74,17 @@ features = [
     "PositionError",
     "PositionOptions",
     "Coordinates",
+    # The Permissions API, which is how the app learns whether it may ask for a
+    # location *without asking*. `EventTarget` is what `PermissionStatus`
+    # extends, and the `change` event on it is the only push notification the
+    # browser gives for a permission revoked mid-session — the poll cadence goes
+    # quiet once a grant is delivering, so nothing else would see it.
+    #
+    # Absent on Safari before 16.4, which is why `geolocation::WITHOUT_PERMISSIONS_API`
+    # exists and why it is `Prompt`.
+    "Permissions",
+    "PermissionStatus",
+    "EventTarget",
     # The rasterization worker (`src/worker.rs`, `src/worker_port.rs`).
     # `WorkerType` is what makes it a *module* worker, which it has to be: it
     # `import`s the ES module `wasm-pack --target web` emits.

@@ -282,7 +282,15 @@ where
 #[derive(Clone, Copy)]
 pub struct LocationHooks {
     /// Backs [`PlatformBridge::location_permission`].
-    pub query: fn() -> rustdar_gps::LocationPermission,
+    ///
+    /// The `u8` is the attempt count last handed to
+    /// [`PlatformBridge::set_location_attempts`], passed *in* rather than
+    /// stashed in a second global on the far side. Android's answer genuinely
+    /// depends on it — see that method for the tri-state — and a value the hook
+    /// reads out of its own static is a value that can be stale, that has no
+    /// compile-time obligation to be installed, and whose absence looks exactly
+    /// like "this install has never asked". As a parameter it is none of those.
+    pub query: fn(u8) -> rustdar_gps::LocationPermission,
     /// Backs [`PlatformBridge::request_location`]; see the honesty note there
     /// before believing the `bool`.
     pub request: fn() -> bool,
