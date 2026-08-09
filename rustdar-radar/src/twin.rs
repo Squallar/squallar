@@ -301,61 +301,31 @@ pub mod compare {
     }
 }
 
-/// Finding a twin against the live buckets: native, test-only.
-///
-/// Everything here pairs by **volume identity**, never by key freshness — see
-/// [`live::KEY_LOOKBACK`] for why the newest key is usually the wrong object.
+/// What remains of the live-twin rig: the full apparatus — `l3_twin`, the
+/// oracle pairing, the per-product validation harnesses — lives on branch
+/// `campaign-harness`. These two fetchers and the roster stay only because
+/// `sampler.rs`'s `live_the_ported_ladder_is_the_originals` still reads them;
+/// they leave with it once that probe moves to the harness branch too.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub mod live {
     use crate::archive;
-    use crate::level3::Level3Product;
     use crate::sources::DataSources;
     use chrono::NaiveDateTime;
     use nexrad_model::data::Scan;
 
-    /// Sites are tried in order until enough tilts line up **with a nonzero
-    /// vector**. Two things make a site unusable, and both are common:
-    /// tgftp's `sn.last` and the bucket's newest key are frequently one volume
-    /// apart, and a quiet site reports 0.0 kt, which zeroes the very term this
-    /// is validating. Long and geographically spread so a calm night over any
-    /// one region does not starve the sample.
-    ///
-    /// Shared by every live harness (SRM's tilt validation, the product
-    /// twins), so a site quarantined or retired is decided in one place.
+    /// Sites are tried in order until one yields a volume. Long and
+    /// geographically spread so a calm night over any one region does not
+    /// starve the sample. The full roster's quarantine history is recorded on
+    /// branch `campaign-harness`.
     pub const SITES: &[&str] = &[
         "KMPX", "KFSD", "KBIS", "KOAX", "KUEX", "KABR", "KTLX", "KMRX", "KTLH", "KMOB", "KSGF",
         "KPAH", "KMLB", "KMTX", "KSFX", "KMVX", "KLZK", "KSHV", "KEAX", "KDDC", "KAMA", "KFWS",
     ];
 
-    /// How many bucket objects to open looking for a particular volume and
-    /// cut, and how far from the wanted time to look — re-exported from
-    /// [`crate::level3`], which owns the pairing.
-    ///
-    /// The bucket's *newest* key will not do, above all at 0.5°: SAILS
-    /// republishes the lowest cut two to four times a volume, so the newest
-    /// `N0G` is usually a mid-volume repeat while the wanted volume is some
-    /// other cut. Taking the newest key skipped the lowest tilt at two sites
-    /// in three on the SRM harness's first run — which would have left the
-    /// tilt it validates almost never actually compared.
-    pub use crate::level3::{
-        PAIRING_CANDIDATES as KEY_LOOKBACK, PAIRING_WINDOW_MINUTES as KEY_WINDOW_MINUTES,
-    };
-
-    /// The bucket keys for `site`/`code` within [`KEY_WINDOW_MINUTES`] of
-    /// `want`, nearest first — [`crate::level3::candidate_keys`] under the name
-    /// the harnesses reach it by.
-    pub use crate::level3::candidate_keys;
-
     /// The archived Level II volume nearest `when`, as the **raw file**: the
-    /// undecoded archive plus the volume start its identifier names — the
-    /// timestamp Level III products of the same volume carry in their PDB.
-    /// Looks at the previous UTC day too, and skips the `_MDM` sidecars the
-    /// listing interleaves.
-    ///
-    /// The file form exists for the harnesses that need radial-header
-    /// parameters a decoded `Scan` does not carry (the KDP twin reads the
-    /// initial system differential phase through
-    /// [`crate::kdp::KdpParams::from_archive`]).
+    /// undecoded archive plus the volume start its identifier names. Looks at
+    /// the previous UTC day too, and skips the `_MDM` sidecars the listing
+    /// interleaves.
     pub async fn l2_archive_near(
         site: &str,
         when: NaiveDateTime,
@@ -390,165 +360,6 @@ pub mod live {
     pub async fn l2_volume_near(site: &str, when: NaiveDateTime) -> Option<(Scan, NaiveDateTime)> {
         let (file, start) = l2_archive_near(site, when).await?;
         Some((file.scan().ok()?, start))
-    }
-
-    /// The Level III object generated **from** a given Level II volume: list
-    /// the day prefix (and the previous day near midnight), walk the
-    /// candidates nearest the volume start first, and accept the first whose
-    /// PDB names that volume — start times equal within
-    /// [`crate::level3::VOLUME_MATCH_TOLERANCE_SECS`] — and, when
-    /// `elevation_number` is given, that cut.
-    ///
-    /// A thin naming of [`crate::level3::fetch_product_for_volume`]: the
-    /// pairing itself is production code, shared with the frontend's Level III
-    /// loop, so a harness and the app can never disagree about which object
-    /// belongs to a volume.
-    ///
-    /// Never the newest key: see [`KEY_LOOKBACK`].
-    pub async fn l3_twin(
-        sources: &DataSources,
-        site: &str,
-        awips_code: &str,
-        l2_volume_start: NaiveDateTime,
-        elevation_number: Option<u8>,
-    ) -> Option<Level3Product> {
-        crate::level3::fetch_product_for_volume(
-            sources,
-            site,
-            awips_code,
-            l2_volume_start,
-            crate::level3::VolumePick::Nearest {
-                cut: elevation_number,
-            },
-        )
-        .await
-    }
-
-    /// The volume's **latest** object for a product, rather than
-    /// [`l3_twin`]'s nearest-to-start one.
-    ///
-    /// The QPE products (`HHC`, `DPR`) are emitted once per volume *plus*
-    /// one intermediate per SAILS/MRLE scan, all naming the same volume
-    /// start. The end-of-volume object is the full composite; the
-    /// intermediates are partial. `l3_twin` takes the candidate nearest the
-    /// volume start, which under SAILS is an intermediate — so these
-    /// harnesses take the maximum key among the candidates that name the
-    /// volume instead.
-    pub async fn latest_l3_twin(
-        sources: &DataSources,
-        site: &str,
-        awips_code: &str,
-        l2_volume_start: NaiveDateTime,
-    ) -> Option<Level3Product> {
-        crate::level3::fetch_product_for_volume(
-            sources,
-            site,
-            awips_code,
-            l2_volume_start,
-            crate::level3::VolumePick::Latest,
-        )
-        .await
-    }
-
-    /// The pairing invariant, live: a recent KOAX volume and its EET twin
-    /// must name the same volume start.
-    ///
-    /// ```text
-    /// cargo test -p rustdar-radar --release -- --ignored --nocapture twin
-    /// ```
-    #[ignore = "hits the live S3 bucket"]
-    #[tokio::test]
-    async fn live_the_eet_twin_names_the_l2_volumes_own_start() {
-        let sources = DataSources::production();
-        let now = chrono::Utc::now().naive_utc();
-
-        let (scan, l2_start) = l2_volume_near("KOAX", now)
-            .await
-            .expect("KOAX has an archived volume within the last two days");
-        println!(
-            "L2 volume: start {l2_start}, {} sweeps, VCP {:?}",
-            scan.sweeps().len(),
-            scan.coverage_pattern_number(),
-        );
-
-        let twin = l3_twin(&sources, "KOAX", "EET", l2_start, None)
-            .await
-            .expect("an EET object generated from that volume");
-        let pdb_start = super::compare::volume_scan_started(&twin.message.pdb)
-            .expect("the EET PDB carries a volume stamp");
-        println!(
-            "EET twin: {} (product {}, elevation_number {}), PDB volume start {pdb_start}",
-            twin.stamp.key, twin.message.pdb.product_code, twin.message.pdb.elevation_number,
-        );
-
-        let skew = (pdb_start - l2_start).num_seconds();
-        println!("pairing skew: {skew} s");
-        assert!(
-            skew.abs() <= 60,
-            "the twin's PDB volume start {pdb_start} is not the L2 volume start {l2_start}",
-        );
-        assert_eq!(twin.message.pdb.product_code, 135, "EET decodes as 135");
-    }
-
-    /// The EET decode fix, live: a real product-135 object selects the
-    /// mask/scale/offset LUT, and every defined gate decodes to a height in
-    /// the ICD's 0–69 kft band — never the raw 130–199 topped levels the
-    /// scaled fallback used to report.
-    ///
-    /// ```text
-    /// cargo test -p rustdar-radar --release -- --ignored --nocapture live_eet_codec
-    /// ```
-    #[ignore = "hits the live S3 bucket"]
-    #[tokio::test]
-    async fn live_eet_codec_decodes_heights_within_the_icd_band() {
-        crate::tls::init();
-        let sources = DataSources::production();
-        let now = chrono::Utc::now().naive_utc();
-
-        // Any real EET object will do — checking the decode's range needs no
-        // volume pairing — so take the first candidate that decodes.
-        let mut found = None;
-        'sites: for &site in SITES {
-            for key in candidate_keys(&sources, site, "EET", now).await {
-                let url = sources.level3_object_url(&key);
-                let Ok(bytes) = archive::get_bytes(archive::shared_client(), url).await else {
-                    continue;
-                };
-                if let Ok(message) = nexrad_level3::decode::decode_product(&bytes) {
-                    found = Some((site, key, message));
-                    break 'sites;
-                }
-            }
-        }
-        let (site, key, message) = found.expect("some site has a recent EET object");
-        assert_eq!(message.pdb.product_code, 135);
-        println!(
-            "{site} {key}: thresholds {:?}",
-            &message.pdb.thresholds[..4]
-        );
-
-        let codec = super::compare::ValueCodec::for_message(&message)
-            .expect("the EET object carries a radial packet");
-        assert!(
-            matches!(codec, super::compare::ValueCodec::Lut(_)),
-            "product 135 must select the EET LUT, not scale/offset",
-        );
-
-        let packet = crate::srm::radial_packet(&message).expect("present per the codec");
-        let (mut defined, mut topped) = (0usize, 0usize);
-        for &gate in packet.radials.iter().flat_map(|r| r.gate_values.iter()) {
-            let v = codec.decode(gate);
-            if v.is_nan() {
-                continue;
-            }
-            assert!(
-                (0.0..=69.0).contains(&v),
-                "{site} {key}: gate level {gate} decoded to {v} kft",
-            );
-            defined += 1;
-            topped += usize::from(gate & 0x80 != 0);
-        }
-        println!("{site} {key}: {defined} defined bins decoded into 0–69 kft ({topped} topped)");
     }
 }
 

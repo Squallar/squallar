@@ -825,30 +825,30 @@ mod tests {
     /// resample each packet through its own codec at its own gate spacing,
     /// turn the published tops into bin centres, divide.
     ///
-    /// Asserted through the survey's own re-exported constructors rather than
-    /// by recomputing the arithmetic here, so the shipped product and the
+    /// Asserted through the constructors the survey's policy re-exports (the
+    /// survey itself lives on branch `campaign-harness`) rather than by
+    /// recomputing the arithmetic here, so the shipped product and the
     /// harness's reference cannot come apart: if [`compute_vild`] ever
     /// reorders, re-datums or re-resamples, this fails and the survey's
     /// verdict stops applying to what the app draws.
     #[test]
     fn the_shipped_path_is_the_surveys_reference_construction() {
         let policy = |dvl: &Level3Message, eet: &Level3Message| {
-            use crate::vil::vild_validation_policy as policy;
             let dvl_packet = crate::srm::radial_packet(dvl).expect("packet");
             let eet_packet = crate::srm::radial_packet(eet).expect("packet");
             let dvl_codec = ValueCodec::for_message(dvl).expect("codec");
             let eet_codec = ValueCodec::for_message(eet).expect("codec");
-            let dvl_field = policy::resampled_field(
+            let dvl_field = resampled_field(
                 dvl_packet,
                 compare::gate_km(&dvl.pdb, dvl_packet),
                 &dvl_codec,
             );
-            let eet_field = policy::resampled_field(
+            let eet_field = resampled_field(
                 eet_packet,
                 compare::gate_km(&eet.pdb, eet_packet),
                 &eet_codec,
             );
-            policy::density_field(&dvl_field, &policy::published_top_field(&eet_field))
+            density_field(&dvl_field, &published_top_field(&eet_field))
         };
 
         // Fields with something in every category: values either side of both
