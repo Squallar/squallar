@@ -99,7 +99,7 @@ rustdar-platform/src/main.rs	6	0
 rustdar-platform/src/network_security_config.rs	150	147
 rustdar-platform/src/platform.rs	98	0
 rustdar-platform/src/run.rs	31	0
-rustdar-radar/src/archive.rs	669	485
+rustdar-radar/src/archive.rs	669	488
 rustdar-radar/src/beam.rs	419	404
 rustdar-radar/src/chunks.rs	2016	1536
 rustdar-radar/src/dpprep.rs	1019	950
@@ -109,12 +109,12 @@ rustdar-radar/src/hca.rs	2629	1949
 rustdar-radar/src/hhc.rs	595	314
 rustdar-radar/src/kdp.rs	918	600
 rustdar-radar/src/l3_values.rs	282	281
-rustdar-radar/src/level3.rs	773	453
+rustdar-radar/src/level3.rs	773	459
 rustdar-radar/src/nrot.rs	1356	1149
 rustdar-radar/src/palette.rs	207	207
 rustdar-radar/src/render.rs	1671	1188
 rustdar-radar/src/render_input.rs	1187	1151
-rustdar-radar/src/sampler.rs	2159	2078
+rustdar-radar/src/sampler.rs	2370	2287
 rustdar-radar/src/scan.rs	244	39
 rustdar-radar/src/sites.rs	115	115
 rustdar-radar/src/sounding.rs	234	207
