@@ -237,10 +237,7 @@ pub(super) fn render_cross_section(
         if i == 0 {
             // Where the first *visual* row ends, not where the galley's widest
             // row does: the toggle sits beside the sentence it expands.
-            let first_row_width = galley
-                .rows
-                .first()
-                .map_or(0.0, |row| row.rect().width());
+            let first_row_width = galley.rows.first().map_or(0.0, |row| row.rect().width());
             first_line_end = egui::pos2(layout.caption.left() + first_row_width + 6.0, y);
         }
         painter.galley(
@@ -392,7 +389,11 @@ fn render_line_controls(
     };
 
     // Right-to-left, so on screen the row reads ◀ ▶ ↺ ↻.
-    let cw = chip("\u{21bb}", "cw", "Sweep the line clockwise about its middle");
+    let cw = chip(
+        "\u{21bb}",
+        "cw",
+        "Sweep the line clockwise about its middle",
+    );
     let ccw = chip(
         "\u{21ba}",
         "ccw",

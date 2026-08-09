@@ -123,7 +123,6 @@ pub(crate) enum SectionGrab {
     Body,
 }
 
-
 /// Where one line's grabbable geometry was drawn last frame, in screen points.
 ///
 /// Recorded from inside `Map::show` — the only place a projector exists — and
@@ -539,7 +538,12 @@ mod tests {
         // Just past the body band: a pan. One point of margin, so a radius
         // mutated bigger or smaller moves this press across the boundary.
         assert_eq!(
-            grab_at(egui::pos2(200.0, 100.0 + BODY_GRAB_RADIUS_PT + 1.0), a, b, &track),
+            grab_at(
+                egui::pos2(200.0, 100.0 + BODY_GRAB_RADIUS_PT + 1.0),
+                a,
+                b,
+                &track
+            ),
             None
         );
         // Just outside the endpoint radius, and off the body's run: a pan.
@@ -638,9 +642,10 @@ mod tests {
             "a 15 km step moved the line {step_km} km"
         );
         assert!(
-            (step_bearing - (bearing + 90.0)).rem_euclid(360.0).min(
-                (360.0 - (step_bearing - (bearing + 90.0)).rem_euclid(360.0)).abs()
-            ) < 0.1,
+            (step_bearing - (bearing + 90.0))
+                .rem_euclid(360.0)
+                .min((360.0 - (step_bearing - (bearing + 90.0)).rem_euclid(360.0)).abs())
+                < 0.1,
             "the step was not perpendicular: line bearing {bearing}, step \
              bearing {step_bearing}"
         );
@@ -675,8 +680,7 @@ mod tests {
 
         // Translate: the whole press→pointer motion, recomputed from the
         // original — so returning the pointer returns the line.
-        let mut slide =
-            SectionEditDrag::begin(0, 1, SectionGrab::Body, line(), at, press, false);
+        let mut slide = SectionEditDrag::begin(0, 1, SectionGrab::Body, line(), at, press, false);
         slide.drag_to(egui::pos2(60.0, 55.0), point(35.5, -97.2));
         let slid = slide.preview();
         assert!((length_km(slid) - length_km(line())).abs() < 0.01);
@@ -715,8 +719,7 @@ mod tests {
 
         // A sweep press on the pivot has no bearing to rotate from: refused,
         // preview kept.
-        let mut degenerate =
-            SectionEditDrag::begin(0, 1, SectionGrab::Body, line(), at, mid, true);
+        let mut degenerate = SectionEditDrag::begin(0, 1, SectionGrab::Body, line(), at, mid, true);
         degenerate.drag_to(egui::pos2(70.0, 70.0), point(mid.lat + 0.4, mid.lon));
         assert_eq!(
             degenerate.preview(),
@@ -747,7 +750,8 @@ mod tests {
         assert_eq!(committed.a(), line().a());
 
         // Overshooting B almost onto A: refused whole, not clamped.
-        let mut shrunk = SectionEditDrag::begin(0, 1, SectionGrab::B, line(), at, line().a(), false);
+        let mut shrunk =
+            SectionEditDrag::begin(0, 1, SectionGrab::B, line(), at, line().a(), false);
         let a = line().a();
         shrunk.drag_to(egui::pos2(70.0, 70.0), point(a.lat + 0.005, a.lon));
         assert!(

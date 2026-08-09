@@ -5880,7 +5880,11 @@ mod section_dispatch_tests {
             },
         )
         .expect("a valid moved line");
-        assert_ne!(moved, line(), "precondition: the drop really moved the line");
+        assert_ne!(
+            moved,
+            line(),
+            "precondition: the drop really moved the line"
+        );
         app.gui
             .pane_mut(0)
             .unwrap()

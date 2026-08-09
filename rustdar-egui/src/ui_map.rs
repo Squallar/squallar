@@ -711,9 +711,8 @@ impl super::Gui {
             return;
         }
 
-        let project = |p: crate::pane::GeoPoint| {
-            projector.project(walkers::lat_lon(p.lat, p.lon)).to_pos2()
-        };
+        let project =
+            |p: crate::pane::GeoPoint| projector.project(walkers::lat_lon(p.lat, p.lon)).to_pos2();
         // Every committed line this map owns, with its projected geometry —
         // the same polyline the track is drawn from, so what is grabbable is
         // exactly what is visible. Reading `self.panes` mid-loop is safe here
