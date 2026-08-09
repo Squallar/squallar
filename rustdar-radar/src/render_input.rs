@@ -322,6 +322,57 @@ impl RenderInput {
         )
     }
 
+    /// The reachable subset of a volume handed over as **parts** — a pattern
+    /// and an ordered sweep list — for a whole-volume request.
+    ///
+    /// This is [`extract_volume`](Self::extract_volume) for a volume that is
+    /// not one `Scan`: the current merged volume ([`crate::current`]) composes
+    /// borrowed sweeps from two volumes under one pattern, and this entry
+    /// copies the product's moment out of exactly that composition. The
+    /// `Scan`-taking constructors delegate here, so there is one extraction,
+    /// not a pair that can disagree.
+    ///
+    /// Sweep order is the caller's and it is load-bearing: the reconstructed
+    /// scan preserves it, and every newest-wins rule downstream — `find_sweep`
+    /// and the sampler's rung choice — reads "later" as "newer".
+    pub fn extract_volume_parts(
+        pattern: &VolumeCoveragePattern,
+        sweeps: &[&Sweep],
+        product: RadarProduct,
+        radar_lat: f64,
+        radar_lon: f64,
+    ) -> Option<Self> {
+        let slot = product.moment_slot()?;
+        // Only the HHC reads moments beyond its slot; everything else ships
+        // the slot moment alone.
+        let all_moments = product == RadarProduct::HydrometeorClassification;
+        let cuts = CutTable::of_pattern(pattern);
+        let sweeps = collect_sweeps(sweeps.iter().copied(), &cuts, slot, all_moments);
+        // Empty on a volume that carries the product nowhere. The renderer
+        // answers `None` for that, so this must too rather than shipping a
+        // payload that renders nothing.
+        if sweeps.is_empty() {
+            return None;
+        }
+        Some(Self {
+            product,
+            elevation: NO_ELEVATION_DEG,
+            radar_lat,
+            radar_lon,
+            // A volume payload never carries either — see
+            // [`extract_volume`](Self::extract_volume) for why.
+            storm_motion_override: None,
+            env_heights_km_msl: None,
+            vcp: pattern.pattern_number().number(),
+            declared_cut_angles_deg: pattern
+                .elevation_cuts()
+                .iter()
+                .map(ElevationCut::elevation_angle_degrees)
+                .collect(),
+            sweeps,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn extract_with(
         scan: &Scan,
@@ -332,6 +383,19 @@ impl RenderInput {
         storm_motion_override: Option<(f32, f32)>,
         env_heights_km_msl: Option<(f64, f64)>,
     ) -> Option<Self> {
+        // The volume scope is the parts extraction run over this scan's own
+        // parts — one implementation, whether the volume is one `Scan` or a
+        // merged composition.
+        if scope == Scope::Volume {
+            let sweeps: Vec<&Sweep> = scan.sweeps().iter().collect();
+            return Self::extract_volume_parts(
+                scan.coverage_pattern(),
+                &sweeps,
+                product,
+                radar_lat,
+                radar_lon,
+            );
+        }
         let elevation = scope.elevation();
         let slot = product.moment_slot()?;
         // `None` for a Level III product: no Level II moment stands behind it,
@@ -344,17 +408,16 @@ impl RenderInput {
         // a second copy of it here is how an SRV pane came to be handed a
         // volume the feed had skipped cuts of.
         //
-        // A `Scope::Volume` request widens it further, and by `||` rather than
-        // by replacing it: the six arms of `reads_whole_volume` are unchanged
-        // and still decide for every tilt-scoped request.
-        let whole_volume = scope == Scope::Volume || product.reads_whole_volume();
+        // (A `Scope::Volume` request used to widen it here by `||`; that scope
+        // now returns above, through the parts extraction.)
+        let whole_volume = product.reads_whole_volume();
 
         // Only the HHC reads moments beyond its slot; everything else ships
         // the slot moment alone.
         let all_moments = product == RadarProduct::HydrometeorClassification;
         let cuts = CutTable::of(scan);
         let sweeps = if whole_volume {
-            collect_sweeps(scan, &cuts, slot, all_moments)
+            collect_sweeps(scan.sweeps().iter(), &cuts, slot, all_moments)
         } else {
             // One sweep: whichever `find_sweep` would have chosen. Selecting
             // here, against the whole volume, is the point — the reconstructed
@@ -656,8 +719,12 @@ struct CutTable<'a> {
 
 impl<'a> CutTable<'a> {
     fn of(scan: &'a Scan) -> Self {
+        Self::of_pattern(scan.coverage_pattern())
+    }
+
+    fn of_pattern(pattern: &'a VolumeCoveragePattern) -> Self {
         Self {
-            angles: scan.coverage_pattern().elevation_cuts(),
+            angles: pattern.elevation_cuts(),
         }
     }
 
@@ -726,18 +793,17 @@ fn elevation_cut(elevation_angle_degrees: f64) -> ElevationCut {
     )
 }
 
-/// Every sweep whose first radial carries `slot`'s moment, in scan order.
+/// Every sweep whose first radial carries `slot`'s moment, in input order.
 /// With `all_moments` (the HHC), a sweep carrying *any* moment qualifies —
 /// the split-cut Doppler halves carry no differential phase but donate the
 /// velocity the classification grafts in.
-fn collect_sweeps(
-    scan: &Scan,
+fn collect_sweeps<'s>(
+    sweeps: impl Iterator<Item = &'s Sweep>,
     cuts: &CutTable<'_>,
     slot: MomentSlot,
     all_moments: bool,
 ) -> Vec<SweepData> {
-    scan.sweeps()
-        .iter()
+    sweeps
         .filter_map(|sweep| {
             let radials = sweep.radials();
             let first = radials.first()?;
@@ -1699,6 +1765,34 @@ mod tests {
             ),
             sweeps,
         )
+    }
+
+    /// The parts entry is the `Scan` entry, not a sibling of it: handing a
+    /// scan's own pattern and sweep list to [`RenderInput::extract_volume_parts`]
+    /// produces the byte-identical payload. `extract_volume` delegates, so a
+    /// drift between them means the delegation was undone and the merged path
+    /// has grown a second extraction that can disagree with the first.
+    #[test]
+    fn extract_volume_parts_matches_extract_volume_byte_for_byte() {
+        let scan = cut_table_volume();
+        for product in [RadarProduct::Reflectivity, RadarProduct::Velocity] {
+            let whole = RenderInput::extract_volume(&scan, product, LAT, LON)
+                .expect("the fixture carries the moment");
+            let sweeps: Vec<&Sweep> = scan.sweeps().iter().collect();
+            let parts = RenderInput::extract_volume_parts(
+                scan.coverage_pattern(),
+                &sweeps,
+                product,
+                LAT,
+                LON,
+            )
+            .expect("the same volume, as parts");
+            assert_eq!(
+                whole.to_bytes(),
+                parts.to_bytes(),
+                "{product:?}: the parts payload is not the scan payload",
+            );
+        }
     }
 
     /// The reconstruction carries the ladder key, and carries it *raw*.

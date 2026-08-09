@@ -135,7 +135,7 @@
 //! That is beam geometry, not a defect in the ladder, and it surfaces as
 //! [`SampleStatus::BeyondRange`] on that rung rather than as an error.
 
-use nexrad_model::data::{DataMoment, MomentData, Radial, Scan};
+use nexrad_model::data::{DataMoment, ElevationCut, MomentData, Radial, Scan, Sweep};
 
 use crate::beam;
 use crate::types::{MomentSlot, RadarProduct};
@@ -713,6 +713,180 @@ impl std::fmt::Debug for VolumeSampler<'_> {
 
 /// Point queries against a borrowed volume, for one moment.
 ///
+/// One resolved rung: the wrap-corrected cut key and the index — into the sweep
+/// list handed to [`resolve_ladder`] — of the sweep this moment takes for it.
+pub(crate) struct LadderChoice {
+    pub(crate) key: f64,
+    pub(crate) chosen: usize,
+}
+
+/// Steps 1–3 of the tilt ladder: key every sweep on its VCP cut, group by exact
+/// key, choose one sweep per group for `slot`.
+///
+/// Factored out of [`VolumeSampler::build`] so that [`ladder_fingerprint`] — the
+/// re-cut key a live pane compares frame to frame — runs the *same* choice the
+/// sampler will make, rather than a restatement of it. This campaign has paid
+/// twice for a second copy of a sampler rule drifting from the first; the
+/// factoring is the fix that cannot drift.
+///
+/// Takes `&[&Sweep]` rather than `&Scan` because the sweep list is no longer
+/// always a scan's own: the current merged volume ([`crate::current`]) composes
+/// sweeps from two volumes, and this function must key them identically either
+/// way. Group order is discovery order (the caller sorts); member order inside a
+/// group is input order, which is what "newest" means below.
+pub(crate) fn resolve_ladder(
+    cuts: &[ElevationCut],
+    sweeps: &[&Sweep],
+    slot: MomentSlot,
+) -> Result<Vec<LadderChoice>, SamplerError> {
+    // Step 1 and 2: key every sweep on its cut, then group by exact key,
+    // preserving input order inside each group so "newest" below means what it
+    // says.
+    let mut groups: Vec<(f64, Vec<usize>)> = Vec::new();
+    for (sweep_index, sweep) in sweeps.iter().enumerate() {
+        let elevation_number = sweep.elevation_number();
+        let cut_index = match usize::from(elevation_number).checked_sub(1) {
+            Some(i) if i < cuts.len() => i,
+            _ => {
+                return Err(SamplerError::ElevationNumberOutOfCutTable {
+                    sweep_index,
+                    elevation_number,
+                    cut_count: cuts.len(),
+                });
+            }
+        };
+        let mut key = cuts[cut_index].elevation_angle_degrees();
+        if !key.is_finite() {
+            return Err(SamplerError::NonFiniteCutAngle {
+                cut_index,
+                angle: key,
+            });
+        }
+        // The cut table stores a signed angle in a field this decoder
+        // hands back unsigned, so a below-horizon cut arrives as ~359.7°.
+        if key > 180.0 {
+            key -= 360.0;
+        }
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, members)) => members.push(sweep_index),
+            None => groups.push((key, vec![sweep_index])),
+        }
+    }
+
+    // Step 3: one sweep per group, per this moment.
+    let doppler = matches!(slot, MomentSlot::Velocity | MomentSlot::SpectrumWidth);
+    let mut choices: Vec<LadderChoice> = Vec::with_capacity(groups.len());
+    for (key, members) in groups {
+        let carries = |&i: &usize| -> bool {
+            sweeps[i]
+                .radials()
+                .first()
+                .is_some_and(|r| slot.read(r).is_some())
+        };
+        // Newest-first: the last cut of a SAILS repeat is the current one,
+        // and the reference display shows it too.
+        let chosen = if doppler {
+            members.iter().rev().find(|i| carries(i))
+        } else {
+            // A split cut's Doppler half repeats a short-range copy of the
+            // surveillance moments; reflectivity belongs to the
+            // surveillance half, which reaches 460 km against the Doppler
+            // half's 300. Load-bearing past ~300 km, and the same
+            // preference `render::find_sweep` already applies.
+            members
+                .iter()
+                .rev()
+                .find(|&&i| {
+                    carries(&i)
+                        && sweeps[i]
+                            .radials()
+                            .first()
+                            .is_some_and(|r| r.velocity().is_none())
+                })
+                .or_else(|| members.iter().rev().find(|i| carries(i)))
+        };
+        let Some(&chosen) = chosen else { continue };
+        choices.push(LadderChoice { key, chosen });
+    }
+    Ok(choices)
+}
+
+/// The identity of the sweeps the ladder would choose for `product` — the
+/// re-cut key for anything that draws from a whole volume.
+///
+/// Two volumes fingerprint equal exactly when, for this moment, every rung
+/// would be cut from the same measured data under the same declared pattern —
+/// in which case the picture is byte-identical and a re-cut is pure waste.
+/// The previous key was a count of sweeps *carrying* the moment, and it moved
+/// on seals that change nothing: a split cut's Doppler half carries a
+/// short-range reflectivity copy, so its seal incremented the reflectivity
+/// count while the surveillance preference kept the chosen rung exactly where
+/// it was — measured at ~6 of the 18–23 re-cuts per VCP-212 volume.
+///
+/// What is hashed, and why each part:
+/// * the **declared cut table** — the pattern's angles set the rung keys and
+///   the ladder's declared ceiling, which the section caption draws;
+/// * per chosen sweep: the **rung key**, the sweep's **elevation number**, its
+///   **radial count**, its first and last radials' **collection timestamps**,
+///   and the first radial's **gate count** for this moment. A sealed sweep is
+///   immutable, so this tuple names one sweep's data uniquely: two sweeps of
+///   the same cut collected at different times differ in their timestamps,
+///   and the same sweep re-delivered through a new snapshot hashes the same.
+///
+/// The hash is [`std::hash::DefaultHasher`]: stable within a process, which is
+/// the only place the key is ever compared. It must never be persisted.
+///
+/// `None` when no ladder can be built at all — the moment is not samplable,
+/// the pattern declares no cuts, a sweep cannot be keyed, or no rung carries
+/// the moment. The caller treats `None` as its own value of the key: "nothing
+/// to cut" is a state a pane can be aimed at.
+pub fn ladder_fingerprint(
+    pattern: &nexrad_model::data::VolumeCoveragePattern,
+    sweeps: &[&Sweep],
+    product: RadarProduct,
+) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+
+    let slot = samplable(product)?;
+    let cuts = pattern.elevation_cuts();
+    if cuts.is_empty() {
+        return None;
+    }
+    let mut choices = resolve_ladder(cuts, sweeps, slot).ok()?;
+    if choices.is_empty() {
+        return None;
+    }
+    // The ladder, not the discovery: `resolve_ladder` returns rungs in the
+    // order their first member appeared, and that order shifts when a
+    // superseded base sweep leaves the merged list even though every rung's
+    // *choice* stands. The sampler sorts its rungs by key; the fingerprint
+    // hashes the same sorted ladder, or an unchanged picture would re-cut.
+    choices.sort_by(|a, b| a.key.total_cmp(&b.key));
+
+    let mut hasher = std::hash::DefaultHasher::new();
+    cuts.len().hash(&mut hasher);
+    for cut in cuts {
+        cut.elevation_angle_degrees().to_bits().hash(&mut hasher);
+    }
+    for LadderChoice { key, chosen } in choices {
+        let sweep = sweeps[chosen];
+        let radials = sweep.radials();
+        key.to_bits().hash(&mut hasher);
+        sweep.elevation_number().hash(&mut hasher);
+        radials.len().hash(&mut hasher);
+        if let Some(first) = radials.first() {
+            first.collection_timestamp().hash(&mut hasher);
+            slot.read(first)
+                .map(|moment| moment.gate_count())
+                .hash(&mut hasher);
+        }
+        if let Some(last) = radials.last() {
+            last.collection_timestamp().hash(&mut hasher);
+        }
+    }
+    Some(hasher.finish())
+}
+
 /// Construction resolves the tilt ladder (see the module doc) and indexes each
 /// rung's radials by azimuth; it decodes no gates. Gates are decoded on demand
 /// out of `raw_values()`.
@@ -770,74 +944,13 @@ impl<'a> VolumeSampler<'a> {
             .filter(|angle| angle.is_finite())
             .fold(f64::NEG_INFINITY, f64::max);
 
-        // Step 1 and 2: key every sweep on its cut, then group by exact key,
-        // preserving volume order inside each group so "newest" below means
-        // what it says.
-        let mut groups: Vec<(f64, Vec<usize>)> = Vec::new();
-        for (sweep_index, sweep) in scan.sweeps().iter().enumerate() {
-            let elevation_number = sweep.elevation_number();
-            let cut_index = match usize::from(elevation_number).checked_sub(1) {
-                Some(i) if i < cuts.len() => i,
-                _ => {
-                    return Err(SamplerError::ElevationNumberOutOfCutTable {
-                        sweep_index,
-                        elevation_number,
-                        cut_count: cuts.len(),
-                    });
-                }
-            };
-            let mut key = cuts[cut_index].elevation_angle_degrees();
-            if !key.is_finite() {
-                return Err(SamplerError::NonFiniteCutAngle {
-                    cut_index,
-                    angle: key,
-                });
-            }
-            // The cut table stores a signed angle in a field this decoder
-            // hands back unsigned, so a below-horizon cut arrives as ~359.7°.
-            if key > 180.0 {
-                key -= 360.0;
-            }
-            match groups.iter_mut().find(|(k, _)| *k == key) {
-                Some((_, members)) => members.push(sweep_index),
-                None => groups.push((key, vec![sweep_index])),
-            }
-        }
+        // Steps 1–3, shared with [`ladder_fingerprint`] so the re-cut key can
+        // never disagree with the ladder about which sweep a rung took.
+        let sweeps: Vec<&Sweep> = scan.sweeps().iter().collect();
+        let choices = resolve_ladder(cuts, &sweeps, slot)?;
 
-        // Step 3: one sweep per group, per this moment.
-        let doppler = matches!(slot, MomentSlot::Velocity | MomentSlot::SpectrumWidth);
-        let mut rungs: Vec<Rung<'a>> = Vec::with_capacity(groups.len());
-        for (key, members) in groups {
-            let carries = |&i: &usize| -> bool {
-                scan.sweeps()[i]
-                    .radials()
-                    .first()
-                    .is_some_and(|r| slot.read(r).is_some())
-            };
-            // Newest-first: the last cut of a SAILS repeat is the current one,
-            // and the reference display shows it too.
-            let chosen = if doppler {
-                members.iter().rev().find(|i| carries(i))
-            } else {
-                // A split cut's Doppler half repeats a short-range copy of the
-                // surveillance moments; reflectivity belongs to the
-                // surveillance half, which reaches 460 km against the Doppler
-                // half's 300. Load-bearing past ~300 km, and the same
-                // preference `render::find_sweep` already applies.
-                members
-                    .iter()
-                    .rev()
-                    .find(|&&i| {
-                        carries(&i)
-                            && scan.sweeps()[i]
-                                .radials()
-                                .first()
-                                .is_some_and(|r| r.velocity().is_none())
-                    })
-                    .or_else(|| members.iter().rev().find(|i| carries(i)))
-            };
-            let Some(&chosen) = chosen else { continue };
-
+        let mut rungs: Vec<Rung<'a>> = Vec::with_capacity(choices.len());
+        for LadderChoice { key, chosen } in choices {
             let radials = scan.sweeps()[chosen].radials();
             // Step 4: the geometry is the chosen sweep's median, never the key.
             let Some(elevation_deg) = sweep_elevation_deg(radials) else {
