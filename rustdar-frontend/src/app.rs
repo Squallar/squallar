@@ -914,65 +914,54 @@ impl App {
         )));
     }
 
-    /// Build the voxel grid a 3D pane asked for, unless it is already in hand.
+    /// Dispatch the voxel build a 3D pane asked for, unless the volume is
+    /// already in hand or in flight.
     ///
-    /// # Why this is on the frame thread
+    /// The build runs through [`crate::offload::offload_job`] — a thread
+    /// natively, the render worker on wasm — never on the frame thread. It
+    /// used to run here synchronously at a measured 150–200 ms per volume,
+    /// which was tolerable when the source was an archive volume that changed
+    /// every few minutes; on the merged substrate a rebuild lands with *every
+    /// sealed sweep*, and a 150 ms hitch each 15–25 s is exactly the frame
+    /// stall the user asked to be rid of.
     ///
-    /// It should not be. `JobRequest::Voxels` exists on the worker wire and is
-    /// the only tolerable place for this on wasm, where there is exactly one
-    /// worker and no threads; this build predates that wire landing and has not
-    /// been moved onto it yet.
+    /// What stays on this thread is the extraction — the walk that copies the
+    /// product's moment out of the merged volume into the payload — which is
+    /// the same per-seal cost the section path already pays, and is logged so
+    /// the claim stays measured.
     ///
-    /// **The cost is 150–200 ms at the desktop shape, not the ~107 ms this used
-    /// to claim.** 107 was the plan's figure for the resample alone; measured
-    /// end to end on real volumes it is 155–159 ms in this build's own log line
-    /// and 158/192/197 ms in review. Either way it is a visible hitch on the
-    /// frame it lands, which is the whole reason the dedupe below exists.
+    /// # The dedupe, now that the build is asynchronous
     ///
-    /// # What moving it to the worker will take, beyond changing this function
-    ///
-    /// **The dedupe works only because the build is synchronous, and that is not
-    /// obvious from reading it.** `PrepareVolume` is level-triggered — the pane
-    /// re-asks on every frame until `rendered_for` matches — and what stops the
-    /// storm today is that `claim` returns `true` once and the entry exists
-    /// before the next frame is laid out. Post a job instead and there is no
-    /// entry while it is in flight, so `claim` keeps returning `true` and a
-    /// fresh job goes out **every frame** until the first one comes back.
-    ///
-    /// So the worker path needs one more piece of state that does not exist
-    /// here: an in-flight set keyed by target, or a `VolumeEntry::Building`
-    /// placeholder inserted at `claim` time. A `Building` entry is the better
-    /// shape of the two — it also gives the pane something honest to say while
-    /// it waits, which is currently a `lookup` miss that the painter renders as
-    /// a guess.
+    /// `PrepareVolume` is level-triggered: the pane re-asks every frame until
+    /// its `rendered_for` matches. The synchronous build's dedupe was the
+    /// result existing before the next frame; the worker path's is the
+    /// `VolumeEntry::Building` placeholder [`VolumeStore::begin_build`] opens
+    /// at dispatch — the next frame, and any second pane, finds it through
+    /// `share` and attaches instead of dispatching again. The placeholder is
+    /// also what recognises a stale reply: a build superseded by a newer
+    /// sealed sweep finds its entry gone and is dropped in `complete`.
     fn handle_prepare_volume(&mut self, pane_idx: usize, target: rustdar_egui::pane::VolumeTarget) {
         use crate::volume::bridge::VolumeEntry;
 
-        // Attaches either way. `false` means another pane already built this
-        // exact volume and moment, so this one shares it: one build, one upload.
-        if !self.volume_store.claim(pane_idx, &target) {
+        // Built, building, or refused — attach and share rather than repeat.
+        if self.volume_store.share(pane_idx, &target) {
             self.mark_volume_rendered(pane_idx, &target);
             return;
         }
 
-        // From `base_scans`, never from `scan_data`, and the difference is
-        // completeness — see the field for why. Matched on the collected time
-        // as well as the site, because a target names one volume: without it a
-        // pane that asked for 22:33Z would be handed 22:39Z the moment the
-        // next poll landed, and `mark_volume_rendered` would then record that
-        // it had built the one it asked for.
-        let Some(scan) = self
-            .base_scans
-            .get(&target.volume.site)
-            .filter(|(_, collected)| *collected == target.volume.collected)
-            .map(|(scan, _)| Arc::clone(scan))
-        else {
-            // The volume has not been decoded yet. Deliberately no entry: the
-            // pane goes on asking, and the first frame after the scan lands
-            // builds it. Storing a refusal here would be a permanent "no" to a
-            // question whose answer is about to change.
+        // The pane asks for the volume the App published; both sides compute
+        // the stamp through `current::resolve` over the same holders. A
+        // mismatch means a sweep sealed between publish and here — the pane
+        // re-asks next frame with the new stamp, and building the superseded
+        // one would be a whole resample for a picture already out of date.
+        let Some(stamp) = self.current_volume_stamp(&target.volume.site) else {
+            // No volume at all yet. Deliberately no entry: the pane goes on
+            // asking, and the first frame after data lands builds it.
             return;
         };
+        if stamp.newest != target.volume.collected {
+            return;
+        }
         let Some(site) = rustdar_radar::sites::get_radar_site(&target.volume.site) else {
             self.volume_store.insert(
                 pane_idx,
@@ -986,42 +975,137 @@ impl App {
             return;
         };
 
-        let request = voxel_request_for(&target, site.lat, site.lon);
-
         let started = web_time::Instant::now();
-        let entry = match rustdar_radar::voxel::build_voxels(&scan, &request, site.lat, site.lon) {
-            Some(grid) => {
-                log::info!(
-                    "3D volume view: built {grid:?} in {} ms",
-                    started.elapsed().as_millis(),
-                );
-                VolumeEntry::Ready(std::sync::Arc::new(grid))
-            }
-            // `build_voxels` has already logged which invariant it refused on.
-            // The live one this message is written for is a volume joined
-            // mid-flight: the scan stands in an empty coverage pattern until its
-            // VCP message arrives, and the sampler correctly declines to invent
-            // a tilt ladder for it.
-            None => VolumeEntry::Refused(format!(
-                "This volume cannot be resampled for 3D. The most likely reason is that it was \
-                 joined part-way through and its scan strategy has not arrived yet — it will \
-                 appear when the next volume completes.\n\n({} at {} UTC)",
-                target.volume.site, target.volume.collected,
-            )),
+        let Some(input) = self.extract_current_volume(&target.volume.site, target.product) else {
+            // The merged volume carries this moment nowhere — the same answer
+            // `build_voxels` would give, decided before paying for a dispatch.
+            self.volume_store.insert(
+                pane_idx,
+                target.clone(),
+                VolumeEntry::Refused(format!(
+                    "This volume carries no {} to resample for 3D.\n\n({} at {} UTC)",
+                    target.product.name(),
+                    target.volume.site,
+                    target.volume.collected,
+                )),
+            );
+            self.mark_volume_rendered(pane_idx, &target);
+            return;
         };
-
-        self.volume_store.insert(pane_idx, target.clone(), entry);
-        self.mark_volume_rendered(pane_idx, &target);
-        // After the insert, so it counts what is now held. One grid is up to
-        // 8 MiB and the bound is one per 3D pane, which is the sort of figure
-        // that should be readable in a log rather than reasoned about — see
-        // `VolumeStore::memory_bytes` for the retention path already known to
-        // hold a grid no pane is showing.
         log::info!(
-            "3D volume view: the store holds {} volume(s), {} MiB",
-            self.volume_store.live_ids().len(),
-            self.volume_store.memory_bytes() / (1024 * 1024),
+            "3D volume view: extracted the {} payload in {} ms on the frame thread",
+            target.volume.site,
+            started.elapsed().as_millis(),
         );
+
+        let request = voxel_request_for(&target, site.lat, site.lon);
+        let spawned = self.render.spawn_voxel_build(
+            &target,
+            input,
+            request,
+            self.channels.voxel_sender.clone(),
+            self.window.clone(),
+        );
+        if !spawned {
+            // Budget full. Nothing dispatched and nothing marked: the
+            // level-triggered pane asks again next frame.
+            return;
+        }
+        self.volume_store.begin_build(pane_idx, &target);
+        self.mark_volume_rendered(pane_idx, &target);
+    }
+
+    /// Take delivery of finished voxel builds.
+    ///
+    /// The result is resolved by **target**, not by pane: `complete` swaps the
+    /// store's `Building` entry for the grid and every attached pane starts
+    /// painting it on this very frame — the seamless half of the swap whose
+    /// other half is `lookup_for_pane` keeping the old grid on screen while
+    /// the build ran.
+    fn poll_voxel_results(&mut self) {
+        use crate::volume::bridge::VolumeEntry;
+
+        while let Ok(vr) = self.channels.voxel_receiver.try_recv() {
+            let entry = match vr.grid {
+                Some(grid) => VolumeEntry::Ready(std::sync::Arc::new(*grid)),
+                // `build_voxels` has already logged which invariant it refused
+                // on; the message is for the centre of the pane.
+                None => VolumeEntry::Refused(format!(
+                    "This volume could not be resampled for 3D.\n\n({} at {} UTC)",
+                    vr.target.volume.site, vr.target.volume.collected,
+                )),
+            };
+            if !self.volume_store.complete(&vr.target, entry) {
+                log::debug!(
+                    "3D volume view: dropping a build for {} at {} that nothing is waiting for",
+                    vr.target.volume.site,
+                    vr.target.volume.collected,
+                );
+                continue;
+            }
+            // After the swap, so it counts what is now held. One grid is up to
+            // 8 MiB and the bound is one per 3D pane plus one in flight, which
+            // is the sort of figure that should be readable in a log — see
+            // `VolumeStore::memory_bytes`.
+            log::info!(
+                "3D volume view: the store holds {} volume(s), {} MiB",
+                self.volume_store.live_ids().len(),
+                self.volume_store.memory_bytes() / (1024 * 1024),
+            );
+        }
+    }
+
+    /// The current merged volume's whole-volume payload for `site` and
+    /// `product`, extracted on this thread.
+    ///
+    /// One resolver call — `current::resolve` over the base and the live
+    /// snapshot — so this cannot disagree with the stamp the App publishes.
+    fn extract_current_volume(
+        &mut self,
+        site: &str,
+        product: rustdar_radar::types::RadarProduct,
+    ) -> Option<rustdar_radar::render_input::RenderInput> {
+        let radar = rustdar_radar::sites::get_radar_site(site)?;
+        let base = self.base_scans.get(site).map(|(scan, _)| Arc::clone(scan));
+        let overlay = self.chunk_feeds.snapshot(site);
+        let current = rustdar_radar::current::resolve(base.as_deref(), overlay.as_deref())?;
+        rustdar_radar::render_input::RenderInput::extract_volume_parts(
+            current.pattern(),
+            current.sweeps(),
+            product,
+            radar.lat,
+            radar.lon,
+        )
+    }
+
+    /// The stamp of `site`'s current merged volume: the newest data time (its
+    /// identity, advanced by every sealed sweep) and the base volume's start
+    /// where one contributes.
+    ///
+    /// `None` while the site has no volume at all — no base and no sealed
+    /// sweeps — which is the cold-start window the panes caption as
+    /// downloading.
+    fn current_volume_stamp(&mut self, site: &str) -> Option<rustdar_egui::CurrentVolumeStamp> {
+        let base = self
+            .base_scans
+            .get(site)
+            .map(|(scan, collected)| (Arc::clone(scan), *collected));
+        let overlay = self.chunk_feeds.snapshot(site);
+        let current = rustdar_radar::current::resolve(
+            base.as_ref().map(|(scan, _)| scan.as_ref()),
+            overlay.as_deref(),
+        )?;
+        let newest = current.newest_data_time()?;
+        // The base is named only where it contributes: after a VCP change the
+        // merge honestly drops it, and a caption naming it anyway would claim
+        // tilts the ladder no longer carries.
+        let base_started = (current.base_sweeps() > 0)
+            .then(|| base.as_ref().map(|(_, collected)| *collected))
+            .flatten();
+        Some(rustdar_egui::CurrentVolumeStamp {
+            newest,
+            base_started,
+        })
     }
 
     /// This pane is holding nothing, on the host **and** on the GPU.
@@ -1280,6 +1364,10 @@ impl App {
         self.poll_chunk_results();
         self.drive_chunk_feeds();
 
+        // Finished voxel builds land before the stamps are published, so a
+        // build and its announcement cannot straddle a frame.
+        self.poll_voxel_results();
+
         // After both drains, so the UI is told about a volume on the frame it
         // arrived rather than the frame after. A 3D pane reads this to decide
         // which volume to ask for, so a frame's delay here is a frame's delay on
@@ -1292,20 +1380,33 @@ impl App {
         }
     }
 
-    /// Tell the UI which base volume each site's whole-volume panes may build
-    /// from.
+    /// Tell the UI each site's current-volume stamp — what a whole-volume pane
+    /// may build from, and how fresh it is.
     ///
-    /// Times only — the `Scan` itself stays here, because `rustdar-egui` has no
-    /// business holding a decoded volume and the pane only needs to *name* the
-    /// one it wants. `handle_prepare_volume` looks the bytes back up under the
-    /// same key, and the two agree because this is the only writer of either.
+    /// Stamps only — the `Scan`s themselves stay here, because `rustdar-egui`
+    /// has no business holding a decoded volume and the pane only needs to
+    /// *name* the one it wants. `handle_prepare_volume` resolves the same
+    /// stamp back through `current_volume_stamp`, and the two agree because
+    /// both are one `current::resolve` over the same holders.
+    ///
+    /// Covers the union of sites with a base and sites with a live feed: a
+    /// site whose first volume is still filling has sealed sweeps and no base,
+    /// and a historic site has a base and no feed — both are buildable and
+    /// both publish.
     fn publish_base_volumes(&mut self) {
-        self.gui.set_archive_volumes(
-            self.base_scans
-                .iter()
-                .map(|(site, (_, collected))| (site.clone(), *collected))
-                .collect(),
-        );
+        let mut sites: Vec<String> = self.base_scans.keys().cloned().collect();
+        for site in self.gui.live_sites() {
+            if !sites.contains(&site) {
+                sites.push(site);
+            }
+        }
+        let mut stamps = HashMap::new();
+        for site in sites {
+            if let Some(stamp) = self.current_volume_stamp(&site) {
+                stamps.insert(site, stamp);
+            }
+        }
+        self.gui.set_current_volumes(stamps);
     }
 
     /// Drop the decoded volumes no pane is showing.
@@ -3667,6 +3768,16 @@ mod chunk_feed_precedence_tests {
     }
 
     fn send_archive(app: &App, timestamp: chrono::NaiveDateTime) {
+        send_archive_scan(app, timestamp, empty_scan());
+    }
+
+    /// [`send_archive`] with a caller-chosen scan, for assertions that need
+    /// the volume to carry a radial — a stamp only resolves off real data.
+    fn send_archive_scan(
+        app: &App,
+        timestamp: chrono::NaiveDateTime,
+        scan: nexrad_model::data::Scan,
+    ) {
         let generation = app.render.fetch_generation_for("KTLX");
         app.channels
             .scan_sender
@@ -3674,7 +3785,7 @@ mod chunk_feed_precedence_tests {
                 generation,
                 site: "KTLX".to_string(),
                 result: Ok(crate::channels::ScanData {
-                    scan: empty_scan(),
+                    scan,
                     site: "KTLX".to_string(),
                     timestamp,
                 }),
@@ -3914,6 +4025,83 @@ mod chunk_feed_precedence_tests {
     /// anyway: what is under test is whether the build was *reached*, and the
     /// arm that finds no base volume deliberately stores nothing at all so
     /// that the pane goes on asking.
+    /// A one-sweep volume whose single radial carries reflectivity and a real
+    /// collection stamp at `minute` — the smallest scan whose current-volume
+    /// stamp resolves, so a build can actually be dispatched against it.
+    fn stamped_scan(minute: u32) -> nexrad_model::data::Scan {
+        use nexrad_model::data::{
+            ChannelConfiguration, ElevationCut, MomentData, PulseWidth, Radial, RadialStatus, Scan,
+            Sweep, VolumeCoveragePattern, WaveformType,
+        };
+        let stamp_ms = at(minute).and_utc().timestamp_millis();
+        let radial = Radial::new(
+            stamp_ms,
+            1,
+            0.0,
+            1.0,
+            RadialStatus::IntermediateRadialData,
+            1,
+            0.5,
+            Some(MomentData::from_fixed_point(
+                2,
+                2125,
+                250,
+                8,
+                2.0,
+                66.0,
+                vec![100, 120],
+            )),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Scan::new(
+            VolumeCoveragePattern::new(
+                212,
+                0,
+                0.5,
+                PulseWidth::Short,
+                false,
+                0,
+                false,
+                0,
+                false,
+                false,
+                0,
+                false,
+                false,
+                vec![ElevationCut::new(
+                    0.5,
+                    ChannelConfiguration::ConstantPhase,
+                    WaveformType::CS,
+                    20.0,
+                    true,
+                    true,
+                    false,
+                    false,
+                    1,
+                    20,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    false,
+                    0,
+                    false,
+                    0,
+                    false,
+                    false,
+                )],
+            ),
+            vec![Sweep::new(1, vec![radial])],
+        )
+    }
+
     #[test]
     fn the_3d_build_reads_the_base_volume_and_not_the_live_snapshot() {
         let target = rustdar_egui::pane::VolumeTarget {
@@ -3925,36 +4113,42 @@ mod chunk_feed_precedence_tests {
             region: None,
         };
 
-        // The volume the map panes are drawing, and nothing else.
+        // The volume the map panes are drawing, and nothing else. `scan_data`
+        // is deliberately never consulted by the stamp or the extraction, so
+        // no build can be reached from it.
         let mut live_only = headless(TestBridge::desktop());
         live_only
             .scan_data
-            .insert("KTLX".to_string(), Arc::new(empty_scan()));
+            .insert("KTLX".to_string(), Arc::new(stamped_scan(10)));
         live_only.handle_prepare_volume(0, target.clone());
         assert!(
             live_only.volume_store.lookup(&target).is_none(),
-            "a volume the real-time feed assembled was handed to the resampler",
+            "a volume only the map panes hold was handed to the resampler",
         );
 
-        // The same volume, arrived from the archive.
-        let mut archived = headless(TestBridge::desktop());
-        archived
+        // The same volume, arrived as the site's base. The build is reached:
+        // a `Building` entry opens at dispatch, which is all a headless test
+        // can — and need — observe.
+        let mut based = headless(TestBridge::desktop());
+        based
             .base_scans
-            .insert("KTLX".to_string(), (Arc::new(empty_scan()), at(10)));
-        archived.handle_prepare_volume(0, target.clone());
+            .insert("KTLX".to_string(), (Arc::new(stamped_scan(10)), at(10)));
+        based.handle_prepare_volume(0, target.clone());
         assert!(
-            archived.volume_store.lookup(&target).is_some(),
-            "the 3D pane was offered an archive volume and the build never \
+            based.volume_store.lookup(&target).is_some(),
+            "the 3D pane was offered a base volume and the build never \
              reached it, so the pane waits for ever",
         );
     }
 
     /// A pane is handed the volume it named, or none.
     ///
-    /// A target names one volume. Matching on the site alone would hand a pane
-    /// that asked for 22:33Z the 22:39Z volume the moment the next poll landed —
-    /// and `mark_volume_rendered` would then record that it had built the one it
-    /// asked for, so the substitution is invisible from every direction.
+    /// A target names one volume — the published stamp. Matching on the site
+    /// alone would hand a pane that asked for the 18:10 data the 18:15 build
+    /// the moment the next sweep sealed — and `mark_volume_rendered` would
+    /// then record that it had built the one it asked for, so the
+    /// substitution is invisible from every direction. Refusing instead is
+    /// self-healing: the pane re-asks next frame with the current stamp.
     #[test]
     fn a_3d_pane_is_not_handed_a_volume_other_than_the_one_it_asked_for() {
         let target = rustdar_egui::pane::VolumeTarget {
@@ -3968,7 +4162,7 @@ mod chunk_feed_precedence_tests {
 
         let mut app = headless(TestBridge::desktop());
         app.base_scans
-            .insert("KTLX".to_string(), (Arc::new(empty_scan()), at(15)));
+            .insert("KTLX".to_string(), (Arc::new(stamped_scan(15)), at(15)));
         app.handle_prepare_volume(0, target.clone());
 
         assert!(
@@ -4031,26 +4225,35 @@ mod chunk_feed_precedence_tests {
     /// And the recorded volume reaches the pane that has to name it.
     ///
     /// The decoded `Scan` stays in the frontend; `rustdar-egui` is told only
-    /// *when*, and a 3D pane asks for a volume by that time. So a recording that
+    /// the *stamp*, and a 3D pane asks for a volume by it. So a recording that
     /// is never published is a pane that never asks — the same silent wait as
     /// never recording, one layer further out.
     #[test]
-    fn the_recorded_archive_volume_is_published_to_the_pane_that_names_it() {
+    fn the_recorded_base_volume_is_published_to_the_pane_that_names_it() {
         let mut app = app_showing(at(10));
         app.chunk_feeds.ensure("KTLX");
         assert_eq!(
-            app.gui.archive_volume_for("KTLX"),
+            app.gui.current_volume_for("KTLX"),
             None,
             "precondition: nothing published yet",
         );
 
-        send_archive(&app, at(5));
+        send_archive_scan(&app, at(5), stamped_scan(5));
         app.poll_data_channels();
 
+        let stamp = app
+            .gui
+            .current_volume_for("KTLX")
+            .expect("the app holds a base volume the 3D pane is never told about");
         assert_eq!(
-            app.gui.archive_volume_for("KTLX"),
+            stamp.newest,
+            at(5),
+            "the stamp must be the volume's own newest data time",
+        );
+        assert_eq!(
+            stamp.base_started,
             Some(at(5)),
-            "the app holds an archive volume the 3D pane is never told about",
+            "a pure base volume names itself as the base",
         );
     }
 }

@@ -187,6 +187,26 @@ pub struct TiltFreshness {
     pub data_age_secs: u64,
 }
 
+/// One site's current-volume stamp, as the App publishes it each frame.
+///
+/// Two times because a merged volume makes two distinct truthful claims and a
+/// caption must not fuse them: `newest` says when the radar last looked
+/// *anywhere* in the volume, and `base_started` says which complete volume
+/// the un-refreshed tilts still come from. Stating only the first would imply
+/// the whole volume is that fresh, which is exactly the impression the
+/// honesty devices exist to refuse.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CurrentVolumeStamp {
+    /// Collection time of the newest data in the merged volume — the identity
+    /// a 3D pane names its build by. Every sealed sweep advances it, which is
+    /// what makes the 3D view rebuild in step with the map beside it.
+    pub newest: NaiveDateTime,
+    /// When the complete base volume under the merge began, where one
+    /// contributes at all. `None` while the site's first volume is still
+    /// filling: there is no complete volume yet and the caption says so.
+    pub base_started: Option<NaiveDateTime>,
+}
+
 /// What the real-time chunk feed is doing for the pane on screen.
 ///
 /// Deliberately about *the tilt being shown* rather than about the feed's
@@ -261,10 +281,12 @@ pub struct Gui {
     notifier_endpoint: String,
     /// What the real-time feed is doing, refreshed each frame by the App.
     chunk_status: ChunkFeedStatus,
-    /// When the archive last published a volume for each site, refreshed each
-    /// frame by the App. The only volumes a 3D pane is built from — see
-    /// `App::archive_scans` for why a live one is not one of them.
-    archive_volumes: HashMap<String, NaiveDateTime>,
+    /// Each site's current-volume stamp, refreshed each frame by the App and
+    /// advanced by every sealed sweep. A 3D pane names the volume it wants by
+    /// [`CurrentVolumeStamp::newest`], which is what makes its rebuilds follow
+    /// the live feed — see `App::base_scans` and `rustdar_radar::current` for
+    /// what the stamp is a stamp *of*.
+    current_volumes: HashMap<String, CurrentVolumeStamp>,
     time_dialog: TimeDialogState,
     initial_zoom_set: bool,
     // --- Map tiles (shared across panes) ---
@@ -772,7 +794,7 @@ impl Gui {
             chunk_notifications: true,
             notifier_endpoint: crate::DEFAULT_NOTIFIER_ENDPOINT.to_string(),
             chunk_status: ChunkFeedStatus::default(),
-            archive_volumes: HashMap::new(),
+            current_volumes: HashMap::new(),
             auto_poll: AutoPollState {
                 last_fetch_time: None,
                 enabled: true,
@@ -1166,23 +1188,24 @@ impl Gui {
         &self.chunk_status
     }
 
-    /// Publish the most recent archive volume for each site — the only volumes a
-    /// 3D pane is built from.
+    /// Publish each site's current-volume stamp — the identity and freshness
+    /// of the merged volume a whole-volume pane may build from, advanced by
+    /// every sealed sweep.
     ///
     /// Pushed in by the App each frame, the same arrangement as
     /// [`Self::set_chunk_status`] and for the same reason: the decoded volumes
     /// live there, and this crate holds only their names.
-    pub fn set_archive_volumes(&mut self, volumes: HashMap<String, NaiveDateTime>) {
-        self.archive_volumes = volumes;
+    pub fn set_current_volumes(&mut self, volumes: HashMap<String, CurrentVolumeStamp>) {
+        self.current_volumes = volumes;
     }
 
-    /// When the archive last published a volume for `site`, if this build has it.
+    /// The stamp of `site`'s current volume, if this build holds one at all.
     ///
-    /// `None` is an ordinary state and the reason a 3D pane says "waiting": it is
-    /// what a site looks like before its first archive poll returns, including
-    /// while the real-time feed is already drawing a plan view beside it.
-    pub fn archive_volume_for(&self, site: &str) -> Option<NaiveDateTime> {
-        self.archive_volumes.get(site).copied()
+    /// `None` is an ordinary state and the reason a 3D pane says it is
+    /// waiting: it is what a site looks like before its first volume — archive
+    /// fetch or first sealed sweeps — has arrived.
+    pub fn current_volume_for(&self, site: &str) -> Option<CurrentVolumeStamp> {
+        self.current_volumes.get(site).copied()
     }
 
     /// The distinct sites some pane is watching live — the unit the chunk feed

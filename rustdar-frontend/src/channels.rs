@@ -84,6 +84,21 @@ pub struct SectionResponse {
     pub section: Option<Box<rustdar_radar::xsect::CrossSection>>,
 }
 
+/// Result from a background voxel build.
+///
+/// Carries the [`VolumeTarget`](rustdar_egui::pane::VolumeTarget) it was built
+/// for and no pane index at all: the store refcounts grids **by target**, so
+/// the result belongs to every pane attached to that target's `Building`
+/// entry, and `VolumeStore::complete` is what resolves them. A stale target —
+/// superseded by a newer sealed sweep while the build was in flight — finds no
+/// `Building` entry and is dropped, which is the dedupe working, not a leak.
+pub struct VoxelResponse {
+    /// What was asked for: which site, which stamp, which moment, which region.
+    pub target: rustdar_egui::pane::VolumeTarget,
+    /// `None` where the resample answered nothing.
+    pub grid: Option<Box<rustdar_radar::voxel::VoxelGrid>>,
+}
+
 /// Result from a Level III object fetch.
 ///
 /// Names the AWIPS **code** and no product. One poll fetches each code once and
@@ -300,6 +315,8 @@ pub struct ChannelHub {
     pub render_receiver: Receiver<RenderResponse>,
     pub section_sender: Sender<SectionResponse>,
     pub section_receiver: Receiver<SectionResponse>,
+    pub voxel_sender: Sender<VoxelResponse>,
+    pub voxel_receiver: Receiver<VoxelResponse>,
     pub level3_sender: Sender<Level3Response>,
     pub level3_receiver: Receiver<Level3Response>,
     pub overlay_fetch_sender: Sender<OverlayFetchResult>,
@@ -333,6 +350,7 @@ impl ChannelHub {
         let (scan_sender, scan_receiver) = std::sync::mpsc::channel();
         let (render_sender, render_receiver) = std::sync::mpsc::channel();
         let (section_sender, section_receiver) = std::sync::mpsc::channel();
+        let (voxel_sender, voxel_receiver) = std::sync::mpsc::channel();
         let (level3_sender, level3_receiver) = std::sync::mpsc::channel();
         let (overlay_fetch_sender, overlay_fetch_receiver) = std::sync::mpsc::channel();
         let (overlay_render_sender, overlay_render_receiver) = std::sync::mpsc::channel();
@@ -351,6 +369,8 @@ impl ChannelHub {
             render_receiver,
             section_sender,
             section_receiver,
+            voxel_sender,
+            voxel_receiver,
             level3_sender,
             level3_receiver,
             overlay_fetch_sender,

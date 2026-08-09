@@ -172,9 +172,18 @@ pub fn empty_index_threshold_for(band: u8) -> f32 {
     (f32::from(band) + 0.5) / 255.0
 }
 
-/// A voxel grid the store is holding, or the reason it could not build one.
+/// A voxel grid the store is holding, or the state of not holding one yet.
 #[derive(Clone)]
 pub enum VolumeEntry {
+    /// A build is in flight for this target.
+    ///
+    /// This entry **is** the dedupe for the worker path. `PrepareVolume` is
+    /// level-triggered — the pane re-asks every frame — and when the build was
+    /// synchronous, what stopped the storm was the result existing before the
+    /// next frame. A posted job leaves nothing in hand for hundreds of
+    /// milliseconds, so this placeholder stands in: a second frame, or a
+    /// second pane, finds it and attaches instead of dispatching again.
+    Building,
     /// Built. The `Arc` is shared with every callback that draws it.
     Ready(Arc<VoxelGrid>),
     /// Not built, and why — in a sentence fit for the centre of a pane.
@@ -184,7 +193,8 @@ pub enum VolumeEntry {
     /// no coverage pattern (a volume joined mid-flight, before its VCP message
     /// lands) does not acquire one, and a product with no native moment never
     /// gains one. Retrying every frame would be a 100 ms resample per frame that
-    /// fails identically each time.
+    /// fails identically each time. A *new* volume gets a new target and a
+    /// fresh answer.
     Refused(String),
 }
 
@@ -243,36 +253,92 @@ impl VolumeStore {
         }
     }
 
-    /// Whether a build is needed for `target`, and record `pane_idx` as wanting
-    /// it either way.
+    /// Attach `pane_idx` to `target`'s entry if one exists — built, building
+    /// or refused — and say whether it did.
+    ///
+    /// `true` means the pane is served: a grid is in hand, a build is already
+    /// in flight, or the volume was refused. `false` means nothing is known
+    /// about this target and the caller owns dispatching a build.
     ///
     /// The two halves are one call because they have to be atomic against each
-    /// other: a second pane asking for a volume that is already in hand must
-    /// attach without triggering a second 100 ms build.
-    pub fn claim(&self, pane_idx: usize, target: &VolumeTarget) -> bool {
+    /// other: a second pane asking for a volume that is already in hand or in
+    /// flight must attach without triggering a second build. Attaching also
+    /// sheds what the pane can no longer show — see [`StoreInner::shed`] — but
+    /// deliberately keeps a same-scope `Ready` grid when the found entry is
+    /// still `Building`: that old grid is the picture the pane goes on
+    /// painting until the new one lands, which is what makes a live rebuild a
+    /// seamless swap rather than a flash of "Building…" every sealed sweep.
+    pub fn share(&self, pane_idx: usize, target: &VolumeTarget) -> bool {
         let mut inner = self.lock();
-        // A pane holds one volume at a time. Letting go of the old one here —
-        // rather than waiting for a `ReleaseVolume` that only arrives on a kind
-        // change — is what keeps a pane that is being scrubbed through time from
-        // accumulating a grid per volume it passes.
-        inner.detach(pane_idx);
-        if let Some(found) = inner.entries.iter_mut().find(|e| &e.target == target) {
-            found.panes.push(pane_idx);
+        let Some(found) = inner.entries.iter().position(|e| &e.target == target) else {
             return false;
+        };
+        let keep_old = matches!(inner.entries[found].entry, VolumeEntry::Building);
+        inner.shed(pane_idx, target, keep_old);
+        // Re-found after the shed, which prunes entries and moves positions.
+        // The target's own entry cannot have been pruned — `shed` skips it and
+        // an entry always has at least one pane — but where it sits can shift,
+        // and indexing by the stale position was an out-of-bounds panic the
+        // store tests caught.
+        let Some(entry) = inner.entries.iter_mut().find(|e| &e.target == target) else {
+            return false;
+        };
+        if !entry.panes.contains(&pane_idx) {
+            entry.panes.push(pane_idx);
         }
         true
     }
 
-    /// Record the result of a build. `pane_idx` is attached to it.
+    /// Open a `Building` entry for `target`, attached to `pane_idx` — the
+    /// worker path's in-flight marker, opened at dispatch.
     ///
-    /// The `detach` below is **belt and braces, and no test can see it**:
-    /// production reaches here only through [`Self::claim`], which has already
-    /// detached, so deleting this line survives mutation testing. It stays
-    /// because `insert` is public and nothing in the type stops a future caller
-    /// from reaching it directly — and the failure it would then have is a pane
-    /// silently holding two volumes, 8 MiB each, released only when the pane
-    /// stops being a 3D pane. Recorded here rather than left as an unexplained
-    /// survivor in a report nobody reads next to the code.
+    /// Sheds the pane's other `Building` entry if it has one: a pane re-aimed
+    /// mid-build supersedes its own build, and the orphaned entry's absence is
+    /// what makes the stale reply drop in [`Self::complete`]. The pane's
+    /// same-scope `Ready` grid is kept — it is the picture on screen until
+    /// this build lands.
+    pub fn begin_build(&self, pane_idx: usize, target: &VolumeTarget) {
+        let mut inner = self.lock();
+        inner.shed(pane_idx, target, true);
+        let id = inner.next_id;
+        inner.next_id += 1;
+        inner.entries.push(StoredVolume {
+            id,
+            target: target.clone(),
+            entry: VolumeEntry::Building,
+            panes: vec![pane_idx],
+        });
+    }
+
+    /// Resolve `target`'s `Building` entry with what the build produced, and
+    /// say whether anything was waiting for it.
+    ///
+    /// `false` drops the result on the floor, and that is correct for both
+    /// ways it happens: the build was superseded (every pane re-aimed and the
+    /// orphaned entry was pruned) or already resolved (a duplicate reply). On
+    /// `true`, every attached pane sheds its other entries — the old grids it
+    /// was painting through the wait — which is the other half of the
+    /// seamless swap.
+    pub fn complete(&self, target: &VolumeTarget, entry: VolumeEntry) -> bool {
+        let mut inner = self.lock();
+        let Some(found) = inner
+            .entries
+            .iter()
+            .position(|e| &e.target == target && matches!(e.entry, VolumeEntry::Building))
+        else {
+            return false;
+        };
+        inner.entries[found].entry = entry;
+        let panes = inner.entries[found].panes.clone();
+        for pane in panes {
+            inner.shed(pane, target, false);
+        }
+        true
+    }
+
+    /// Record a synchronously-known result. `pane_idx` is attached to it and
+    /// holds nothing else afterwards — this is for answers that need no build,
+    /// like a refusal decided at dispatch time.
     pub fn insert(&self, pane_idx: usize, target: VolumeTarget, entry: VolumeEntry) {
         let mut inner = self.lock();
         inner.detach(pane_idx);
@@ -305,6 +371,44 @@ impl VolumeStore {
             })
     }
 
+    /// What pane `pane_idx` should paint for `target`: the target's own entry
+    /// when it is resolved, else the newest same-scope grid the pane still
+    /// holds — the old picture, painted through a rebuild.
+    ///
+    /// `None` while nothing is paintable at all, which the painter renders as
+    /// the first-build message. The fallback is scoped to the same site,
+    /// product and region on purpose: after a site or product switch the old
+    /// grid answers a question nobody is asking, and painting it with a
+    /// caption describing the new target would be the lie the swap must never
+    /// tell. Newest-first because a pane can transiently hold two resolved
+    /// grids and the later build is the newer picture.
+    pub fn lookup_for_pane(&self, pane_idx: usize, target: &VolumeTarget) -> Option<VolumeLookup> {
+        let inner = self.lock();
+        if let Some(found) = inner
+            .entries
+            .iter()
+            .find(|e| &e.target == target && !matches!(e.entry, VolumeEntry::Building))
+        {
+            return Some(VolumeLookup {
+                id: found.id,
+                entry: found.entry.clone(),
+            });
+        }
+        inner
+            .entries
+            .iter()
+            .filter(|e| {
+                e.panes.contains(&pane_idx)
+                    && same_scope(&e.target, target)
+                    && matches!(e.entry, VolumeEntry::Ready(_))
+            })
+            .max_by_key(|e| e.id)
+            .map(|e| VolumeLookup {
+                id: e.id,
+                entry: e.entry.clone(),
+            })
+    }
+
     /// Every id the store is still holding. The GPU side keeps exactly these
     /// uploads and frees the rest.
     pub fn live_ids(&self) -> Vec<u64> {
@@ -324,6 +428,7 @@ impl VolumeStore {
             .entries
             .iter()
             .map(|e| match &e.entry {
+                VolumeEntry::Building => 0,
                 VolumeEntry::Ready(grid) => grid.memory_bytes(),
                 VolumeEntry::Refused(why) => why.len(),
             })
@@ -358,6 +463,38 @@ impl StoreInner {
         }
         self.entries.retain(|e| !e.panes.is_empty());
     }
+
+    /// Detach `pane_idx` from everything it can no longer show, given that it
+    /// is now aimed at `target`.
+    ///
+    /// Always sheds out-of-scope entries (another site, product or region —
+    /// nothing there is ever painted for this target again) and the pane's
+    /// other `Building` entries (a pane supersedes its own in-flight build by
+    /// re-aiming). Sheds same-scope resolved entries too unless `keep_old`:
+    /// those are the old picture, kept exactly while a build for `target` is
+    /// (or is about to be) in flight, painted until it lands.
+    fn shed(&mut self, pane_idx: usize, target: &VolumeTarget, keep_old: bool) {
+        for entry in &mut self.entries {
+            if &entry.target == target {
+                continue;
+            }
+            let keep = keep_old
+                && same_scope(&entry.target, target)
+                && !matches!(entry.entry, VolumeEntry::Building);
+            if !keep {
+                entry.panes.retain(|&p| p != pane_idx);
+            }
+        }
+        self.entries.retain(|e| !e.panes.is_empty());
+    }
+}
+
+/// Whether two targets differ only in their volume stamp — the same site,
+/// moment and region, at two data times. The seamless swap is licensed exactly
+/// this far: an older picture of the *same question* may stand in while a
+/// newer one builds, and nothing else may.
+fn same_scope(a: &VolumeTarget, b: &VolumeTarget) -> bool {
+    a.volume.site == b.volume.site && a.product == b.product && a.region == b.region
 }
 
 /// The painter a `Gui` is handed. Turns a pane's frame state into a payload
@@ -396,7 +533,13 @@ impl VolumePainter for BridgeVolumePainter {
             return VolumePaint::Empty(why.to_owned());
         }
 
-        let Some(found) = self.store.lookup(&frame.target) else {
+        // Through the pane-scoped lookup, which is the seamless swap: while a
+        // rebuild for this target is in flight, the pane's previous grid of
+        // the same site, moment and region answers, so a live volume updating
+        // every sealed sweep repaints rather than flashing "Building…".
+        let Some(found) = self.store.lookup_for_pane(frame.pane_idx, &frame.target) else {
+            // Nothing paintable at all — the very first build, or a hard
+            // retarget with nothing old worth showing.
             return VolumePaint::Empty(format!(
                 "Building the {} volume…",
                 frame.target.product.code(),
@@ -404,6 +547,15 @@ impl VolumePainter for BridgeVolumePainter {
         };
         let grid = match found.entry {
             VolumeEntry::Ready(grid) => grid,
+            // Unreachable through `lookup_for_pane`, which never answers with
+            // a `Building` entry — but the enum says it can, so the honest
+            // fallback is the same first-build message.
+            VolumeEntry::Building => {
+                return VolumePaint::Empty(format!(
+                    "Building the {} volume…",
+                    frame.target.product.code(),
+                ));
+            }
             VolumeEntry::Refused(why) => return VolumePaint::Empty(why),
         };
 
@@ -749,6 +901,152 @@ mod tests {
         );
     }
 
+    /// Open and resolve a build the way production does: dispatch, then the
+    /// worker's reply. `Refused` because a `VoxelGrid` has no constructor
+    /// outside `build_voxels`; the store treats every resolved entry alike.
+    fn build(store: &VolumeStore, pane: usize, t: &VolumeTarget, note: &str) {
+        assert!(
+            !store.share(pane, t),
+            "precondition: nothing in hand for this target, a build follows"
+        );
+        store.begin_build(pane, t);
+        assert!(
+            store.complete(t, VolumeEntry::Refused(note.to_owned())),
+            "precondition: the entry this just opened takes the result"
+        );
+    }
+
+    /// A real, tiny grid, for the tests whose subject is what may *stand in*
+    /// on screen — only a `Ready` entry ever does, so a `Refused` stub cannot
+    /// exercise them. Built through `build_voxels` because that is the one
+    /// constructor a `VoxelGrid` has.
+    fn ready_grid() -> VolumeEntry {
+        use nexrad_model::data::{
+            MomentData, PulseWidth, Radial, RadialStatus, Scan, Sweep, VolumeCoveragePattern,
+        };
+        let sweep = |number: u8, elevation: f32| {
+            let radials = (0..8u16)
+                .map(|i| {
+                    Radial::new(
+                        1_760_000_000_000 + i64::from(i),
+                        i + 1,
+                        f32::from(i) * 45.0,
+                        45.0,
+                        RadialStatus::IntermediateRadialData,
+                        number,
+                        elevation,
+                        Some(MomentData::from_fixed_point(
+                            4,
+                            2125,
+                            250,
+                            8,
+                            2.0,
+                            66.0,
+                            vec![120, 140, 160, 180],
+                        )),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                })
+                .collect();
+            Sweep::new(number, radials)
+        };
+        let cut = |angle: f64| {
+            nexrad_model::data::ElevationCut::new(
+                angle,
+                nexrad_model::data::ChannelConfiguration::ConstantPhase,
+                nexrad_model::data::WaveformType::CS,
+                20.0,
+                true,
+                true,
+                false,
+                false,
+                1,
+                20,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                false,
+                0,
+                false,
+                0,
+                false,
+                false,
+            )
+        };
+        let scan = Scan::new(
+            VolumeCoveragePattern::new(
+                212,
+                0,
+                0.5,
+                PulseWidth::Short,
+                false,
+                0,
+                false,
+                0,
+                false,
+                false,
+                0,
+                false,
+                false,
+                vec![cut(0.5), cut(1.5)],
+            ),
+            vec![sweep(1, 0.5), sweep(2, 1.5)],
+        );
+        let request = rustdar_radar::voxel::VoxelRequest {
+            centre: (35.33, -97.27),
+            half_width_km: 40.0,
+            base_km_msl: 0.0,
+            top_km_msl: 10.0,
+            product: RadarProduct::Reflectivity,
+            shape: rustdar_radar::voxel::WASM_SHAPE,
+            values_wanted: false,
+        };
+        let grid = rustdar_radar::voxel::build_voxels(&scan, &request, 35.33, -97.27)
+            .expect("the fixture volume resamples");
+        VolumeEntry::Ready(Arc::new(grid))
+    }
+
+    /// **The worker-path dedupe.** `PrepareVolume` is level-triggered — the
+    /// pane re-asks every frame — and with the build asynchronous there is no
+    /// result in hand to stop it for hundreds of milliseconds. The `Building`
+    /// entry is what answers: the same pane's next frame, and any second pane,
+    /// attach to it instead of dispatching again.
+    #[test]
+    fn a_build_in_flight_absorbs_every_further_ask_for_its_target() {
+        let store = VolumeStore::new();
+        let t = target(RadarProduct::Reflectivity, 0);
+
+        assert!(!store.share(0, &t), "the first ask owns the dispatch");
+        store.begin_build(0, &t);
+
+        assert!(
+            store.share(0, &t),
+            "the same pane's next frame must attach, not dispatch a second build",
+        );
+        assert!(
+            store.share(1, &t),
+            "a second pane on the same target must attach, not dispatch",
+        );
+        assert_eq!(store.live_ids().len(), 1, "one target, one entry");
+
+        assert!(
+            store.complete(&t, VolumeEntry::Refused("stub".to_owned())),
+            "the one build resolves for everyone",
+        );
+        assert!(
+            !store.complete(&t, VolumeEntry::Refused("again".to_owned())),
+            "a duplicate reply has nothing to resolve and is dropped",
+        );
+    }
+
     /// Refcounting is by target: two panes on one volume share one entry, and it
     /// survives until the second lets go.
     #[test]
@@ -756,11 +1054,9 @@ mod tests {
         let store = VolumeStore::new();
         let t = target(RadarProduct::Reflectivity, 0);
 
-        assert!(store.claim(0, &t), "the first pane must trigger a build");
-        store.insert(0, t.clone(), VolumeEntry::Refused("stub".to_owned()));
-
+        build(&store, 0, &t, "stub");
         assert!(
-            !store.claim(1, &t),
+            store.share(1, &t),
             "a second pane on the same volume must not trigger a second build",
         );
         assert_eq!(store.live_ids().len(), 1, "one target, one entry");
@@ -779,35 +1075,23 @@ mod tests {
     }
 
     /// A pane moving to a volume **another pane already built** lets go of the
-    /// one it was holding.
-    ///
-    /// The path where `claim` is the only thing that can let go: it returns
-    /// `false`, so no `insert` follows and `insert`'s own detach never runs.
-    /// Without this, `claim` and `insert` each look redundant against the other
-    /// and both can be deleted one at a time with every test still green —
-    /// which is how mutation testing found this gap.
+    /// one it was holding — `share` on a resolved entry is a switch, not a
+    /// swap-in-progress, so nothing old is kept.
     #[test]
     fn a_pane_joining_a_volume_someone_else_built_drops_what_it_held() {
         let store = VolumeStore::new();
         let held = target(RadarProduct::Reflectivity, 0);
         let shared = target(RadarProduct::Velocity, 6);
 
-        // Pane 0 builds and holds one volume; pane 1 builds another.
-        store.claim(0, &held);
-        store.insert(0, held.clone(), VolumeEntry::Refused("held".to_owned()));
-        store.claim(1, &shared);
-        store.insert(1, shared.clone(), VolumeEntry::Refused("shared".to_owned()));
+        build(&store, 0, &held, "held");
+        build(&store, 1, &shared, "shared");
         assert_eq!(
             store.live_ids().len(),
             2,
             "precondition: two volumes in hand"
         );
 
-        // Pane 0 now wants the volume pane 1 already has. No build follows.
-        assert!(
-            !store.claim(0, &shared),
-            "the build is shared, not repeated"
-        );
+        assert!(store.share(0, &shared), "the build is shared, not repeated");
         assert!(
             store.lookup(&held).is_none(),
             "the volume pane 0 was holding is nobody's now and must be gone",
@@ -815,25 +1099,94 @@ mod tests {
         assert_eq!(store.live_ids().len(), 1);
     }
 
-    /// A pane that moves to another volume lets go of the old one at once.
-    ///
-    /// Without this, scrubbing a 3D pane through time accumulates one grid per
-    /// volume passed — 8 MiB each — and nothing frees them until the pane stops
-    /// being a 3D pane, which is not something a user does to reclaim memory.
+    /// **The seamless swap's ledger.** While a rebuild of the same site,
+    /// moment and region is in flight, the old grid stays attached and
+    /// answers `lookup_for_pane`; the moment the build lands, the old grid is
+    /// gone. Two entries mid-swap, one after — never an accumulation.
     #[test]
-    fn a_pane_holds_one_volume_at_a_time() {
+    fn the_old_grid_stands_in_while_its_replacement_builds_and_then_leaves() {
         let store = VolumeStore::new();
         let first = target(RadarProduct::Reflectivity, 0);
         let second = target(RadarProduct::Reflectivity, 6);
 
-        store.claim(0, &first);
-        store.insert(0, first.clone(), VolumeEntry::Refused("stub".to_owned()));
-        store.claim(0, &second);
-        store.insert(0, second.clone(), VolumeEntry::Refused("stub".to_owned()));
+        // A real grid, because only a `Ready` entry may stand in: an old
+        // *refusal* painted under a new target's caption would be a stale
+        // explanation of the wrong volume.
+        assert!(!store.share(0, &first));
+        store.begin_build(0, &first);
+        assert!(store.complete(&first, ready_grid()));
+        let old_id = store.lookup(&first).expect("resolved").id;
 
-        assert_eq!(store.live_ids().len(), 1, "the first volume must be gone");
-        assert!(store.lookup(&first).is_none());
-        assert!(store.lookup(&second).is_some());
+        assert!(!store.share(0, &second), "a new stamp needs a new build");
+        store.begin_build(0, &second);
+        assert_eq!(
+            store.live_ids().len(),
+            2,
+            "mid-swap: the old grid and the building entry coexist",
+        );
+        let standing_in = store
+            .lookup_for_pane(0, &second)
+            .expect("the old grid answers while the new one builds");
+        assert_eq!(
+            standing_in.id, old_id,
+            "what stands in must be the pane's previous grid, not the building entry",
+        );
+
+        assert!(store.complete(&second, VolumeEntry::Refused("new picture".to_owned())));
+        assert_eq!(
+            store.live_ids().len(),
+            1,
+            "the swap must retire the old grid the moment the new one lands",
+        );
+        assert!(store.lookup(&first).is_none(), "the old grid is gone");
+        assert_eq!(
+            store
+                .lookup_for_pane(0, &second)
+                .expect("the new entry answers")
+                .id,
+            store.lookup(&second).expect("stored").id,
+        );
+    }
+
+    /// The stand-in is scoped: a pane re-aimed at another **site, moment or
+    /// region** must not paint its old grid under the new target's caption.
+    #[test]
+    fn an_out_of_scope_grid_never_stands_in() {
+        let store = VolumeStore::new();
+        let refl = target(RadarProduct::Reflectivity, 0);
+        build(&store, 0, &refl, "reflectivity");
+
+        let velocity = target(RadarProduct::Velocity, 0);
+        assert!(!store.share(0, &velocity));
+        store.begin_build(0, &velocity);
+        assert!(
+            store.lookup_for_pane(0, &velocity).is_none(),
+            "a reflectivity grid must not stand in for a velocity build",
+        );
+    }
+
+    /// A pane that re-aims mid-build supersedes its own build: the orphaned
+    /// `Building` entry is gone, so the stale reply finds nothing and drops.
+    #[test]
+    fn a_superseded_builds_reply_is_dropped() {
+        let store = VolumeStore::new();
+        let first = target(RadarProduct::Reflectivity, 0);
+        let second = target(RadarProduct::Reflectivity, 6);
+
+        assert!(!store.share(0, &first));
+        store.begin_build(0, &first);
+        assert!(!store.share(0, &second));
+        store.begin_build(0, &second);
+
+        assert!(
+            !store.complete(&first, VolumeEntry::Refused("stale".to_owned())),
+            "the superseded build's reply must be dropped, not stored",
+        );
+        assert!(
+            store.complete(&second, VolumeEntry::Refused("current".to_owned())),
+            "the current build's reply must land",
+        );
+        assert_eq!(store.live_ids().len(), 1);
     }
 
     /// Ids are never reused, so a stale callback cannot address a new upload.
@@ -846,14 +1199,12 @@ mod tests {
     fn a_released_id_is_never_handed_out_again() {
         let store = VolumeStore::new();
         let first = target(RadarProduct::Reflectivity, 0);
-        store.claim(0, &first);
-        store.insert(0, first.clone(), VolumeEntry::Refused("a".to_owned()));
+        build(&store, 0, &first, "a");
         let first_id = store.lookup(&first).expect("stored").id;
         store.release(0);
 
         let second = target(RadarProduct::Velocity, 0);
-        store.claim(0, &second);
-        store.insert(0, second.clone(), VolumeEntry::Refused("b".to_owned()));
+        build(&store, 0, &second, "b");
         assert_ne!(
             store.lookup(&second).expect("stored").id,
             first_id,

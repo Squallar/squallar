@@ -1207,6 +1207,58 @@ impl RenderDispatcher {
         true
     }
 
+    /// Resample a volume into a voxel grid, away from the frame thread.
+    ///
+    /// Returns `false` when the render budget is full — the caller dispatches
+    /// nothing, opens no `Building` entry, and the level-triggered pane asks
+    /// again next frame. Taking a budget slot is what keeps the wasm worker's
+    /// FIFO honest: without it a ~150 ms resample could sit queued in front of
+    /// the plan-view render of the very sweep that triggered it.
+    ///
+    /// The reply carries the *target*, not a pane index: the store refcounts
+    /// builds by target, and `VolumeStore::complete` resolves every pane
+    /// attached to it — including panes that attached after this dispatch.
+    pub fn spawn_voxel_build(
+        &mut self,
+        target: &rustdar_egui::pane::VolumeTarget,
+        input: rustdar_radar::render_input::RenderInput,
+        request: rustdar_radar::voxel::VoxelRequest,
+        sender: std::sync::mpsc::Sender<crate::channels::VoxelResponse>,
+        window: Option<WindowRef>,
+    ) -> bool {
+        if self.renders_in_flight.load(Ordering::Relaxed) >= MAX_CONCURRENT_RENDERS {
+            return false;
+        }
+        self.renders_in_flight.fetch_add(1, Ordering::Relaxed);
+        let guard = RenderGuard(Arc::clone(&self.renders_in_flight));
+        let target = target.clone();
+        let started = web_time::Instant::now();
+
+        let job = crate::offload::Job::Described(crate::offload::JobRequest::Voxels {
+            input: Box::new(input),
+            request,
+        });
+        crate::offload::offload_job("voxels", job, move |output| {
+            let _guard = guard;
+            let grid = output.and_then(crate::offload::JobOutput::voxels);
+            // The claim the whole worker move is measured by: the resample no
+            // longer spends this time on the frame thread. Logged with the
+            // outcome so a refused build is distinguishable from a slow one.
+            log::info!(
+                "3D volume view: {} for {} in {} ms off the frame thread",
+                if grid.is_some() { "built" } else { "no grid" },
+                target.volume.site,
+                started.elapsed().as_millis(),
+            );
+            // Sent unconditionally: this message is what resolves the store's
+            // `Building` entry, and a build that never reports back leaves
+            // every attached pane painting its old grid forever.
+            let _ = sender.send(crate::channels::VoxelResponse { target, grid });
+            crate::app::notify_redraw(&window);
+        });
+        true
+    }
+
     /// Shared dispatch for both Level II and Level III renders.
     ///
     /// The tail below — the guard, the cancellation check, the send and the
