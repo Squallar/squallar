@@ -6136,6 +6136,251 @@ mod tests {
         );
     }
 
+    /// The layers panel's screen rect: everything left of the map panel.
+    ///
+    /// Derived from the map panel the frame actually laid out rather than from
+    /// the panel-width constant, so it keeps meaning "the sidebar" if the
+    /// width ever changes.
+    fn sidebar_rect(h: &InputHarness) -> egui::Rect {
+        let panel = h.map_panel_rect();
+        egui::Rect::from_min_max(
+            egui::pos2(0.0, 0.0),
+            egui::pos2(panel.left(), panel.bottom()),
+        )
+    }
+
+    /// 49. **Every pane kind's sidebar opens with the same identity line.**
+    ///
+    ///     Site code, then kind. A map pane's panel is full of content that
+    ///     describes itself; a converted pane's panel loses most of that bulk,
+    ///     and without one shared line saying what the pane *is*, the shorter
+    ///     panel reads as a different thing altogether rather than as the same
+    ///     panel showing a pane with fewer controls — which is the presentation
+    ///     bug this whole contract exists to fix. The assertion is on the full
+    ///     rendered string, so three per-kind headers that drifted apart in
+    ///     format could not keep it green.
+    #[test]
+    fn every_pane_kinds_sidebar_opens_with_the_same_identity_line() {
+        let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
+        h.load_scan("KTLX");
+        let sidebar = sidebar_rect(&h);
+
+        assert!(
+            h.text_painted_in(sidebar, "KTLX \u{b7} Map"),
+            "a map pane's sidebar must open with its identity line; painted: {:?}",
+            h.painted_text_strings_in(sidebar)
+        );
+
+        h.make_pane_volume(0);
+        h.frames_for(2, FRAME_DT);
+        assert!(
+            h.text_painted_in(sidebar, "KTLX \u{b7} 3D volume"),
+            "a 3D pane's sidebar must open with the same identity line, with \
+             its kind in it; painted: {:?}",
+            h.painted_text_strings_in(sidebar)
+        );
+
+        h.make_pane_unaimed_cross_section(0);
+        h.frames_for(2, FRAME_DT);
+        assert!(
+            h.text_painted_in(sidebar, "KTLX \u{b7} Cross-section"),
+            "a section pane's sidebar must open with the same identity line, \
+             with its kind in it; painted: {:?}",
+            h.painted_text_strings_in(sidebar)
+        );
+    }
+
+    /// 50. **The missing layer list is explained, in one line, for both
+    ///     non-map kinds — and only for them.**
+    ///
+    ///     The panel is titled "Layers", and for a 3D or section pane the
+    ///     layer tree is omitted because every entry in it is a layer drawn
+    ///     over map tiles (test 44 pins the omission). Omitted *silently*, the
+    ///     void where most of the panel used to be is what made the sidebar
+    ///     read as broken. The convention pinned here is omission plus one
+    ///     explanatory line, the same line for both kinds — and its absence on
+    ///     a map pane, where the list itself is present and the note would be
+    ///     a false claim about it.
+    #[test]
+    fn the_missing_layer_list_is_explained_for_both_non_map_kinds() {
+        for kind in [PaneKind::CrossSection, PaneKind::Volume] {
+            let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
+            h.load_scan("KTLX");
+            let sidebar = sidebar_rect(&h);
+            assert!(
+                !h.text_painted_in(sidebar, crate::ui::NON_MAP_LAYERS_NOTE),
+                "a map pane draws the layer list itself and must not also \
+                 carry the note explaining its absence"
+            );
+
+            match kind {
+                PaneKind::CrossSection => h.make_pane_unaimed_cross_section(0),
+                _ => h.make_pane_volume(0),
+            }
+            h.frames_for(2, FRAME_DT);
+            assert!(
+                h.text_painted_in(sidebar, crate::ui::NON_MAP_LAYERS_NOTE),
+                "{kind:?}: the layer list is omitted with nothing to say why, \
+                 which is what made the panel read as broken; painted: {:?}",
+                h.painted_text_strings_in(sidebar)
+            );
+        }
+    }
+
+    /// 51. **A converted pane's own controls sit inside the sidebar's shared
+    ///     structure, in its order.**
+    ///
+    ///     The contract, top to bottom, for either non-map kind: identity
+    ///     line, product picker, time navigation, the kind's own block under
+    ///     its own header, then the explained absence of the layer list. The
+    ///     assertion is on the *positions* the panel painted, not merely on
+    ///     the strings existing: a kind block rendered above the shared
+    ///     controls, or below the note, would paint every one of these strings
+    ///     and still read as a bolted-on foreign block.
+    ///
+    ///     The headers are named through the constants the panel itself
+    ///     renders, so renaming a header moves the test with it, while
+    ///     *removing* one — or demoting the section block back to nothing —
+    ///     fails on a missing anchor.
+    #[test]
+    fn kind_specific_blocks_sit_inside_the_shared_sidebar_structure() {
+        /// The y-centre of the topmost painted run containing `needle`, inside
+        /// the sidebar.
+        fn y_of(h: &InputHarness, sidebar: egui::Rect, needle: &str) -> f32 {
+            h.painted_text_rects()
+                .iter()
+                .filter(|(r, text)| sidebar.contains(r.center()) && text.contains(needle))
+                .map(|(r, _)| r.center().y)
+                .min_by(f32::total_cmp)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{needle:?} was not painted in the sidebar; painted: {:?}",
+                        h.painted_text_strings_in(sidebar)
+                    )
+                })
+        }
+
+        fn assert_descending_order(h: &InputHarness, sidebar: egui::Rect, anchors: &[&str]) {
+            let ys: Vec<(f32, &str)> = anchors.iter().map(|n| (y_of(h, sidebar, n), *n)).collect();
+            for pair in ys.windows(2) {
+                assert!(
+                    pair[0].0 < pair[1].0,
+                    "sidebar structure broken: {:?} (y={}) must sit above {:?} (y={})",
+                    pair[0].1,
+                    pair[0].0,
+                    pair[1].1,
+                    pair[1].0
+                );
+            }
+        }
+
+        let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
+        h.load_scan("KTLX");
+        let sidebar = sidebar_rect(&h);
+
+        h.make_pane_volume(0);
+        h.frames_for(2, FRAME_DT);
+        assert_descending_order(
+            &h,
+            sidebar,
+            &[
+                "KTLX \u{b7} 3D volume",
+                "Reflectivity",
+                "Step:",
+                crate::ui::VOLUME_SIDEBAR_HEADER,
+                "Reset view",
+                crate::ui::NON_MAP_LAYERS_NOTE,
+            ],
+        );
+
+        // The section pane, aimed, reports its line inside the same structure…
+        let (a, b) = section_ends();
+        h.make_pane_cross_section(0, a, b);
+        h.frames_for(2, FRAME_DT);
+        assert_descending_order(
+            &h,
+            sidebar,
+            &[
+                "KTLX \u{b7} Cross-section",
+                "Reflectivity",
+                "Step:",
+                crate::ui::SECTION_SIDEBAR_HEADER,
+                "A \u{2192} B:",
+                crate::ui::NON_MAP_LAYERS_NOTE,
+            ],
+        );
+
+        // …and unaimed it says so in the same place, rather than dropping the
+        // block and going back to reading as a stub. Through Map first:
+        // `set_kind` to the kind the pane already is keeps its content, which
+        // here would keep the line and test the aimed state twice.
+        h.gui_mut()
+            .pane_mut(0)
+            .expect("pane 0 exists")
+            .set_kind(PaneKind::Map);
+        h.make_pane_unaimed_cross_section(0);
+        h.frames_for(2, FRAME_DT);
+        assert_descending_order(
+            &h,
+            sidebar,
+            &[
+                crate::ui::SECTION_SIDEBAR_HEADER,
+                "No line drawn yet",
+                crate::ui::NON_MAP_LAYERS_NOTE,
+            ],
+        );
+    }
+
+    /// 52. **Converting the active pane keeps the sidebar's own widget ids.**
+    ///
+    ///     Test 48 pins that converting a *non-active* pane moves nothing, but
+    ///     there the panel's content never changes. Converting the **active**
+    ///     pane rebuilds the panel's kind block, and the hazard is the panel's
+    ///     own: the shared controls key their stored state — combo state, the
+    ///     panel's scroll offset — on ids derived from the panel's scope, so a
+    ///     scope re-keyed by the conversion (salting it with the kind is the
+    ///     natural mistake) turns "the user made this pane 3D" into "egui
+    ///     forgot the panel's state". Compared per name, through the ids the
+    ///     panel actually resolved, for the reason test 14 gives: rebuilding
+    ///     the expected ids from the same format strings would prove nothing.
+    #[test]
+    fn converting_the_active_pane_keeps_the_sidebars_widget_ids() {
+        fn shared_ids(h: &InputHarness) -> Vec<(&'static str, egui::Id)> {
+            h.widget_id_probes()
+                .into_iter()
+                .filter(|(name, _)| {
+                    matches!(*name, "product_sel" | "time_step_sel" | "layers_scroll")
+                })
+                .collect()
+        }
+
+        let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
+        h.load_scan("KTLX");
+        let before = shared_ids(&h);
+        assert_eq!(
+            before.len(),
+            3,
+            "precondition: all three shared controls must report ids, got {before:?}"
+        );
+
+        h.make_pane_volume(0);
+        h.frames_for(2, FRAME_DT);
+        assert_eq!(
+            shared_ids(&h),
+            before,
+            "making the active pane 3D re-keyed a shared sidebar control: \
+             everything egui remembers under the old id is silently discarded"
+        );
+
+        h.make_pane_unaimed_cross_section(0);
+        h.frames_for(2, FRAME_DT);
+        assert_eq!(
+            shared_ids(&h),
+            before,
+            "making the active pane a section re-keyed a shared sidebar control"
+        );
+    }
+
     /// 47. **Converting the active pane does not re-key the drawer menu.**
     ///
     ///     The layers panel's kind-specific block sits inside a child scope, and

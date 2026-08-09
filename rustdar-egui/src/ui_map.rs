@@ -26,6 +26,11 @@ pub(crate) const CROSS_SECTION_EMPTY_STATE: &str =
 /// cannot produce is worse than one that says so.
 pub(crate) const VOLUME_EMPTY_STATE: &str = "3D volume view unavailable";
 
+/// The header over the 3D pane's sidebar block. Icon, two spaces, name — the
+/// same shape as [`super::SECTION_SIDEBAR_HEADER`] and the overlay rows'
+/// labels, which is what keeps the block reading as part of the one panel.
+pub(crate) const VOLUME_SIDEBAR_HEADER: &str = "\u{1f4e6}  3D view";
+
 impl super::Gui {
     /// Draw every visible pane, whatever kind each one is.
     ///
@@ -1334,49 +1339,60 @@ pub(crate) fn render_volume_controls(ui: &mut egui::Ui, pane: &mut crate::pane::
     };
     ui.add_space(6.0);
     ui.separator();
-    ui.label("3D view");
+    ui.label(VOLUME_SIDEBAR_HEADER);
 
-    let mut exaggeration = volume.camera.vertical_exaggeration();
-    let response = ui.add(
-        egui::Slider::new(
-            &mut exaggeration,
-            crate::pane::MIN_VERTICAL_EXAGGERATION..=crate::pane::MAX_VERTICAL_EXAGGERATION,
-        )
-        .text("Vertical \u{d7}")
-        .fixed_decimals(1),
-    );
-    if response.changed() {
-        // Through the setter, which is the only writer and the only place the
-        // clamp and the non-finite refusal live. Writing the field would work
-        // here and would be a second copy of both.
-        volume.camera.set_vertical_exaggeration(exaggeration);
-    }
-    response.on_hover_text(
-        "Stretches the box vertically so storm structure is legible. Heights the pane reports \
-         stay in real kft MSL at every setting.",
-    );
+    // Header-then-indent, like the loop transport and the section block: the
+    // 3D knobs are one more block of the one panel, not a panel of their own.
+    // The slider sits behind a "Vertical:" label the way "Lookback:" and
+    // "Speed:" do, rather than carrying its own trailing text into a column
+    // too narrow for both.
+    ui.indent("volume_controls", |ui| {
+        let mut exaggeration = volume.camera.vertical_exaggeration();
+        ui.horizontal(|ui| {
+            ui.label("Vertical:");
+            let response = ui.add(
+                egui::Slider::new(
+                    &mut exaggeration,
+                    crate::pane::MIN_VERTICAL_EXAGGERATION
+                        ..=crate::pane::MAX_VERTICAL_EXAGGERATION,
+                )
+                .suffix("\u{d7}")
+                .fixed_decimals(1),
+            );
+            if response.changed() {
+                // Through the setter, which is the only writer and the only
+                // place the clamp and the non-finite refusal live. Writing the
+                // field would work here and would be a second copy of both.
+                volume.camera.set_vertical_exaggeration(exaggeration);
+            }
+            response.on_hover_text(
+                "Stretches the box vertically so storm structure is legible. Heights the pane \
+                 reports stay in real kft MSL at every setting.",
+            );
+        });
 
-    // Positive in the UI, inverted in storage — see `VolumePane::hide_floor`
-    // for why the stored form is the negation.
-    let mut show_floor = !volume.hide_floor;
-    if ui
-        .checkbox(&mut show_floor, "Map floor")
-        .on_hover_text(
-            "Draws the ground under the volume: the base reflectivity as the 2D map shows it, \
-             registered to the box.",
-        )
-        .changed()
-    {
-        volume.hide_floor = !show_floor;
-    }
+        // Positive in the UI, inverted in storage — see `VolumePane::hide_floor`
+        // for why the stored form is the negation.
+        let mut show_floor = !volume.hide_floor;
+        if ui
+            .checkbox(&mut show_floor, "Map floor")
+            .on_hover_text(
+                "Draws the ground under the volume: the base reflectivity as the 2D map shows \
+                 it, registered to the box.",
+            )
+            .changed()
+        {
+            volume.hide_floor = !show_floor;
+        }
 
-    if ui
-        .button("Reset view")
-        .on_hover_text("Back to the default angle, zoom, centre and region.")
-        .clicked()
-    {
-        reset_volume_view(volume);
-    }
+        if ui
+            .button("Reset view")
+            .on_hover_text("Back to the default angle, zoom, centre and region.")
+            .clicked()
+        {
+            reset_volume_view(volume);
+        }
+    });
 }
 
 /// Put a 3D pane back to the view it opened at.

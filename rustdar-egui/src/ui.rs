@@ -52,6 +52,11 @@ pub(crate) use map::VolumeArmProbe;
 /// keeping its own copy of the sentence. Same arrangement as [`DrawnMenuLeaf`].
 #[cfg(test)]
 pub(crate) use map::{CROSS_SECTION_EMPTY_STATE, VOLUME_EMPTY_STATE};
+/// The 3D block's sidebar header, for the input harness — so the test that
+/// pins the sidebar's shared structure names the header the panel really
+/// draws rather than keeping its own copy of it.
+#[cfg(test)]
+pub(crate) use map::VOLUME_SIDEBAR_HEADER;
 #[path = "ui_settings.rs"]
 mod settings;
 
@@ -668,6 +673,52 @@ impl ControlProbe {
             rect: _rect,
         });
     }
+}
+
+/// The line a 3D or section pane's sidebar shows where a map pane's layer
+/// list would be.
+///
+/// The panel is titled "Layers", so for a pane whose kind has none the honest
+/// presentations are a tree of disabled ghosts or an explained absence. The
+/// convention here — for both non-map kinds alike — is the absence: every
+/// entry in the tree is a layer drawn over map tiles, and a dozen disabled
+/// rows would bury the controls that do apply under ones that never can. One
+/// line keeps the void from reading as a broken panel.
+pub(crate) const NON_MAP_LAYERS_NOTE: &str = "Map layers apply to map panes.";
+
+/// The header over the section pane's sidebar block. Icon, two spaces, name —
+/// the same shape as the loop transport's and the overlay rows' labels.
+pub(crate) const SECTION_SIDEBAR_HEADER: &str = "\u{2702}  Cross-section";
+
+/// The identity line every pane kind's sidebar opens with: whose data this
+/// pane shows and what the pane is, e.g. `KTLX · 3D volume`.
+///
+/// One function called before the kind branch rather than a line inside each
+/// arm, so the three kinds keep one style and cannot drift into three
+/// headers. For a map pane it is close to redundant — the panel under it is
+/// full of self-describing map content — and that redundancy is the point:
+/// the same line in the same place is what makes a converted pane's shorter
+/// panel read as *this* panel showing fewer controls.
+///
+/// Reads only the `pane` it is handed: for the whole of the panel's pass the
+/// active slot in `self.panes` holds a `mem::take` placeholder that reads as
+/// a map pane on the default site.
+fn render_pane_identity(ui: &mut egui::Ui, pane: &PaneState) {
+    let kind = match pane.kind() {
+        crate::pane::PaneKind::Map => "Map",
+        crate::pane::PaneKind::CrossSection => "Cross-section",
+        crate::pane::PaneKind::Volume => "3D volume",
+    };
+    ui.label(egui::RichText::new(format!("{} \u{b7} {}", pane.site, kind)).strong());
+}
+
+/// The explained absence of the layer list, in the position the list holds on
+/// a map pane and in [`ControlItem::InfoText`]'s own style — see
+/// [`NON_MAP_LAYERS_NOTE`] for why absence rather than disabled controls.
+fn render_non_map_layers_note(ui: &mut egui::Ui) {
+    ui.add_space(6.0);
+    ui.separator();
+    ui.label(egui::RichText::new(NON_MAP_LAYERS_NOTE).small().weak());
 }
 
 /// Render a single declarative [`ControlItem`] into the UI, collecting any
@@ -1549,6 +1600,16 @@ impl Gui {
             // `self.panes[..]`, which for the whole of this pass holds a default
             // `PaneState` and therefore reads as a *map* pane whatever the real
             // one is. This is the same hazard `menu_model` has, with the same fix.
+
+            // Every kind opens with the same identity line, before the branch:
+            // the pane's site and what the pane is. A map pane's sidebar is full
+            // of content that describes itself, but a converted pane's is not,
+            // and without this line the panel below it reads as a different
+            // panel altogether rather than as the same one showing a pane with
+            // fewer controls. Shared rather than per-arm so the three kinds
+            // cannot drift into three headers.
+            render_pane_identity(ui, pane);
+
             match pane.kind() {
                 crate::pane::PaneKind::Map => {
                     self.render_radar_controls(ui, pane, combo_width, id_prefix);
@@ -1566,7 +1627,9 @@ impl Gui {
                     self.render_overlay_controls(ui, pane, actions);
                 }
                 // A section and a volume pane get the product picker and time
-                // navigation, and nothing else.
+                // navigation, then their own block in the same header-and-indent
+                // shape the map pane's blocks use, then the one line that says
+                // where the layer list went.
                 //
                 // No tilt picker: both read the whole ladder, so there is nothing
                 // to choose — see `render_radar_controls`. No loop transport: a
@@ -1575,10 +1638,14 @@ impl Gui {
                 // to feed a pane like this, so the control would enable a loop
                 // that never fills. No overlay tree: every entry in it is a layer
                 // drawn over map tiles, geo-positioned against a projector this
-                // pane does not have.
+                // pane does not have — the convention for controls like these is
+                // **omission plus [`NON_MAP_LAYERS_NOTE`]**, not a disabled
+                // ghost, applied identically to both non-map kinds.
                 crate::pane::PaneKind::CrossSection => {
                     self.render_radar_controls(ui, pane, combo_width, id_prefix);
                     self.render_time_navigation(ui, pane, id_prefix, actions);
+                    self.render_section_controls(ui, pane);
+                    render_non_map_layers_note(ui);
                 }
                 // The same two, plus the knobs that only mean something for a
                 // box being looked at from outside.
@@ -1586,6 +1653,7 @@ impl Gui {
                     self.render_radar_controls(ui, pane, combo_width, id_prefix);
                     self.render_time_navigation(ui, pane, id_prefix, actions);
                     map::render_volume_controls(ui, pane);
+                    render_non_map_layers_note(ui);
                 }
             }
         });
@@ -1605,6 +1673,58 @@ impl Gui {
             ui.checkbox(&mut self.sync_layers, "\u{1f517}  Sync Layers");
             ui.separator();
         }
+    }
+
+    /// The cross-section pane's own sidebar block: what the pane is cutting
+    /// along, in the same header-then-indent shape as every other block in the
+    /// panel — the loop transport, the 3D view's knobs — so a section pane's
+    /// sidebar reads as the normal panel showing this pane's controls rather
+    /// than as a stub with most of the panel missing.
+    ///
+    /// It states rather than steers: a line is aimed by drawing it on a map,
+    /// and a sidebar editor for its endpoints would be a second, worse way to
+    /// do the same thing. The hint names the real control by its own menu
+    /// label, so renaming the menu entry cannot strand the hint pointing at a
+    /// control that no longer exists.
+    ///
+    /// Reads only the `pane` it is handed, never `self.panes` — the caller
+    /// holds the active pane out of the vector for the whole panel pass.
+    fn render_section_controls(&self, ui: &mut egui::Ui, pane: &PaneState) {
+        ui.add_space(6.0);
+        ui.separator();
+        ui.label(SECTION_SIDEBAR_HEADER);
+        ui.indent("section_controls", |ui| {
+            match pane.cross_section().and_then(|section| section.line) {
+                Some(line) => {
+                    // The ends are named A and B because that is what the map
+                    // paints at them; the length is the same haversine the
+                    // hover readout uses rather than a second copy of it.
+                    let (_, km) = rustdar_radar::beam::site_bearing_range_km(
+                        line.a().lat,
+                        line.a().lon,
+                        line.b().lat,
+                        line.b().lon,
+                    );
+                    let unit = self.preferences.distance;
+                    ui.label(format!(
+                        "A \u{2192} B: {:.0} {}",
+                        unit.convert_from_km(km),
+                        unit.suffix()
+                    ));
+                }
+                None => {
+                    ui.label("No line drawn yet");
+                }
+            }
+            ui.label(
+                egui::RichText::new(format!(
+                    "Aim it: turn on \u{201c}{}\u{201d} and drag across a map.",
+                    ui_menu::DRAW_CROSS_SECTION_LABEL
+                ))
+                .small()
+                .weak(),
+            );
+        });
     }
 
     /// Render the radar product picker, and the tilt picker where a tilt means
