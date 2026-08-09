@@ -394,6 +394,16 @@ impl VolumeStore {
                 entry: found.entry.clone(),
             });
         }
+        // The `same_scope` clause is **belt and braces, and no test can see
+        // it**: `share` and `begin_build` shed the pane's out-of-scope
+        // entries before this can run, so under the public API there is never
+        // an out-of-scope grid attached to fall back to — mutation testing
+        // confirmed removing the clause changes nothing observable. It stays
+        // because the two guards protect different things (`shed` bounds
+        // memory, this bounds what is *painted*), and a future caller that
+        // attaches without shedding would otherwise paint another site's
+        // storm under this pane's caption — the one lie the swap must never
+        // tell, recorded here rather than left as an unexplained survivor.
         inner
             .entries
             .iter()
