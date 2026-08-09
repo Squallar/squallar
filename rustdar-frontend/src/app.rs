@@ -381,36 +381,29 @@ const AUTOSAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3)
 /// Half the east–west and north–south extent of the box a 3D pane resamples,
 /// kilometres.
 ///
-/// 80 km, chosen against two limits that pull the same way and one that does
-/// not.
+/// **The full 230 km surveillance range**, so a pane with no picked region
+/// shows the whole scan. This began life at 80 km — resolution is bought with
+/// half-width (80 km is 0.63 km per cell against 1.80 at the full range), and
+/// past ~150 km the lowest tilt is already above 3 km AGL, so the outer box is
+/// mostly cone the radar cannot see into. Both arguments are real and both
+/// lost to what the crop looked like: echo running past 80 km — most of a
+/// scan, on a squall-line day — simply vanished from the 3D picture before the
+/// edge of the plan view beside it, which reads as a resample gone wrong
+/// rather than as a curated default.
 ///
-/// **Resolution.** The grid has a fixed cell count, so half-width is bought with
-/// detail: 230 km over 256 cells is 1.80 km per cell and 150 km is 1.17 km —
-/// which is barely the 1 km cube this whole substrate replaces. 80 km is
-/// 0.63 km, a real gain, and the plan's own worked example (0.31 km at a 40 km
-/// half-width) sits at the tight end of the same trade.
-///
-/// **Data quality.** Past ~150 km the lowest tilt is already above 3 km AGL, so
-/// the outer box is mostly cone the radar cannot see into — cells the resample
-/// fills by interpolating between tilts that are kilometres apart vertically.
-///
-/// **Against them: the box is drawn at true proportions.** 160 x 160 x 18 km is
-/// still an 8.9:1 pancake, and every kilometre of half-width makes it flatter.
-/// Measured on a real KSRX volume, a 300 km box seen from a level camera is a
-/// sliver a few pixels tall; 160 km has visible relief from any angle.
-///
-/// **Now the fallback rather than the only option.** A user can drag a region on
-/// a map pane, and `VoxelRequest` has always taken a `centre` as well as a
-/// half-width so that it could. What stopped it was cost — a rebuild is
-/// **150–200 ms** on the frame thread here — and what unblocked it was making the
-/// build archive-triggered: a region pick is one deliberate commit rather than a
-/// resample per frame of a drag, so the objection was to the box *tracking* the
-/// viewport and not to the box being chosen.
+/// The resolution trade now belongs to the user: the region drag exists
+/// precisely to spend the same cells over less ground, one deliberate commit
+/// at a time (a rebuild is **150–200 ms** on the frame thread here, which is
+/// why the box never tracks the viewport), and the pane's caption prints the
+/// km-per-cell either way. The flatness objection — 460 x 460 x 18 km is a
+/// 25.6:1 pancake at true proportions — is answered by the default vertical
+/// exaggeration, which is stated on screen beside the true heights.
 ///
 /// This value is `rustdar_egui::pane::DEFAULT_HALF_WIDTH_KM` read back, not a
 /// second copy: the pane computes its own camera arithmetic against the box it
 /// believes it has, and the two disagreeing would show up as a pan that drifts
-/// against the picture.
+/// against the picture. That constant is in turn the resampler's own
+/// `MAX_HALF_WIDTH_KM`, so `build_voxels` honours it un-clamped.
 const VOLUME_HALF_WIDTH_KM: f64 = rustdar_egui::pane::DEFAULT_HALF_WIDTH_KM;
 
 /// What to resample for `target`, over the region it names or the default box

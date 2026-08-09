@@ -651,12 +651,26 @@ pub struct VolumeRegion {
 
 /// The half-width a pane starts with, kilometres.
 ///
-/// 80 km, and the reasoning is `handle_prepare_volume`'s: it is the point where
-/// the resolution gain is real (0.63 km per cell against 1.80 at the 230 km
-/// limit) but the box is not yet so tight that a storm walks out of it between
-/// volumes. It is also what the pane used before a region could be picked, so an
-/// existing user's view does not move the day the control appears.
-pub const DEFAULT_HALF_WIDTH_KM: f64 = 80.0;
+/// **The resampler's own maximum, which is the full surveillance range** —
+/// [`rustdar_radar::voxel::MAX_HALF_WIDTH_KM`] matches
+/// `rustdar_radar::types::MAX_RANGE_KM`, the 230 km the plan view's raster is
+/// drawn to. A pane with no picked region is answering "show me this site's
+/// volume", and the earlier 80 km default answered with a crop: echo past
+/// 80 km — most of a scan, on a squall-line day — was silently cut off before
+/// the edge of the picture beside it, which read as a resample that went wrong
+/// rather than as a choice.
+///
+/// The cost is resolution: 256 cells over 460 km is 1.80 km per cell against
+/// 0.63 at the old default. That trade now belongs to the user — the region
+/// drag exists precisely to spend the same cells over less ground, and the
+/// caption prints the km-per-cell either way.
+///
+/// Written as the resampler's constant rather than a copy of 230 so that
+/// [`VolumeRegion::new`] passes it through un-clamped: the caption,
+/// [`VolumePane::box_size_km`] and the resample all describe the same box, and
+/// if the resampler's ceiling ever moves, the sourceless default keeps covering
+/// the whole scan by construction.
+pub const DEFAULT_HALF_WIDTH_KM: f64 = rustdar_radar::voxel::MAX_HALF_WIDTH_KM;
 
 impl VolumeRegion {
     /// A region centred on `centre` with `half_width_km` either side, or `None`
@@ -839,16 +853,16 @@ const MAX_EYE_DISTANCE: f32 = 8.0;
 /// of the box. Some of the box is therefore under the centre of the pane at
 /// every pan, whatever the yaw, pitch or zoom.
 ///
-/// Expressed per axis rather than as a radius, because the box is a 8.9:1
-/// pancake: a spherical bound of one half-extent would either let the pivot leave
+/// Expressed per axis rather than as a radius, because the box is a pancake —
+/// 25.6:1 at the whole-scan default: a spherical bound of one half-extent would either let the pivot leave
 /// the box sideways or stop it well short of the top face.
 const MAX_PIVOT_FRACTION: f32 = 1.0;
 
 /// The vertical exaggeration a 3D pane starts at.
 ///
-/// The box is 160 km wide and 18 km tall — **8.9:1** — and at true proportions
-/// it reads as a sheet of paper rather than as a volume with storms standing in
-/// it. That is a real property of the atmosphere and the flat view is the honest
+/// The default box is 460 km wide and 18 km tall — **25.6:1** — and at true
+/// proportions it reads as a sheet of paper rather than as a volume with storms
+/// standing in it. That is a real property of the atmosphere and the flat view is the honest
 /// one, which is why the number is *shown* rather than hidden; but a view whose
 /// whole claim is that it shows vertical structure has to make the vertical
 /// structure visible, and 3 is where a supercell's overhang and a stratiform
@@ -1110,6 +1124,35 @@ mod tests {
     fn the_default_content_is_a_map() {
         assert_eq!(PaneContent::default().kind(), PaneKind::Map);
         assert_eq!(PaneKind::default(), PaneKind::Map);
+    }
+
+    /// The sourceless default box covers the whole scan.
+    ///
+    /// A 3D pane with no picked region is showing "the site's volume", and the
+    /// plan view beside it draws echo out to `MAX_RANGE_KM` — so a default
+    /// half-width under that range crops the scan: echo past the box's edge
+    /// simply vanishes from the 3D picture, which reads as a resample gone
+    /// wrong rather than as a choice. Two facts keep the default honest, and
+    /// both are pinned: it reaches the raster's edge, and the resampler passes
+    /// it through un-clamped, so the box the caption and the camera arithmetic
+    /// describe is the box that is actually built.
+    #[test]
+    #[allow(clippy::assertions_on_constants)] // the covering bound IS a constant pin
+    fn the_sourceless_default_box_covers_the_whole_scan() {
+        assert!(
+            DEFAULT_HALF_WIDTH_KM >= rustdar_radar::types::MAX_RANGE_KM,
+            "the default box must reach the scan's edge: {DEFAULT_HALF_WIDTH_KM} km \
+             of half-width against a {} km surveillance range",
+            rustdar_radar::types::MAX_RANGE_KM,
+        );
+        let region = VolumeRegion::new(point(35.3, -97.3), DEFAULT_HALF_WIDTH_KM)
+            .expect("the default half-width must be a region the resampler takes");
+        assert_eq!(
+            region.half_width_km(),
+            DEFAULT_HALF_WIDTH_KM,
+            "the resampler must honour the default un-clamped, or the pane's own \
+             camera arithmetic describes a different box than the one built",
+        );
     }
 
     /// A plan view reads one sweep; the other two read the whole ladder, and

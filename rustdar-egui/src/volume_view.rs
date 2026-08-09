@@ -55,8 +55,8 @@
 //!
 //! # Vertical exaggeration, and where it is and is not applied
 //!
-//! At true proportions the box is 160 km wide by 18 km tall — **8.9:1** — and it
-//! reads as a sheet of paper. So [`OrbitCamera::vertical_exaggeration`] stretches
+//! At true proportions the default box is 460 km wide by 18 km tall — **25.6:1**
+//! — and even a tight 40 km one is 2.2:1: either reads as a sheet of paper. So [`OrbitCamera::vertical_exaggeration`] stretches
 //! it, and it is a knob with a number on it rather than a silent constant.
 //!
 //! It is applied in exactly one place: [`exaggerated_box_km`], which every

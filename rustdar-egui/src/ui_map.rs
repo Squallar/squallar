@@ -1160,8 +1160,9 @@ const KFT_PER_KM: f64 = 3.280_84;
 ///
 /// The grid has a fixed cell count, so a tighter region buys detail instead of
 /// saving memory. That is the main reason to pick a region at all, and it is
-/// invisible unless it is written down: 0.63 km per cell at the default box
-/// against 0.16 at a 20 km one is the difference between a smear and a storm.
+/// invisible unless it is written down: 1.80 km per cell at the whole-scan
+/// default box against 0.16 at a 20 km one is the difference between a smear
+/// and a storm.
 ///
 /// A pure function of five values so that what the pane claims can be tested
 /// without a GPU, a projector or a frame.
@@ -2220,16 +2221,21 @@ mod volume_arm_tests {
     /// region.
     ///
     /// The grid's cell count is fixed, so a tighter box spends the same cells
-    /// over less ground — 0.63 km per cell at the default against 0.16 at 20 km.
-    /// That is the main reason to pick a region, and it is invisible unless it is
-    /// written down.
+    /// over less ground — 1.80 km per cell at the whole-scan default against
+    /// 0.16 at 20 km. That is the main reason to pick a region, and it is
+    /// invisible unless it is written down.
+    ///
+    /// The default's figures are pinned as literals — the full 460 km scan and
+    /// the 1.80 km cells it costs — rather than derived from the constant the
+    /// caption itself reads, so a default that drifted from covering the scan
+    /// fails here by name instead of being restated as correct.
     #[test]
     fn the_caption_reports_the_resolution_the_region_buys() {
         let wide = volume_caption("KTLX", at(33), None, None, Default::default());
         assert!(
             wide.iter()
-                .any(|l| l.contains("160 km box") && l.contains("km/cell")),
-            "the default box must report its width and resolution: {wide:?}",
+                .any(|l| l.contains("460 km box") && l.contains("1.80 km/cell")),
+            "the sourceless default must report the whole scan and its cost: {wide:?}",
         );
 
         let tight = crate::pane::VolumeRegion::new(

@@ -122,7 +122,7 @@ struct SectionLineConfig {
 /// it is derived from a volume, and rebuilding it is what opening the pane does.
 /// The *region* is here rather than derived, and that is the difference between
 /// it and the grid — it is a choice the user made with a drag, and losing it on
-/// restart would silently put a carefully aimed 20 km box back to the 160 km
+/// restart would silently put a carefully aimed 20 km box back to the 460 km
 /// default with the pane still claiming to be a 3D view of a storm.
 ///
 /// Flat `f64`s and `f32`s throughout, never the domain types, for the reason
@@ -1558,7 +1558,7 @@ mod notifier_config_tests {
     /// trip, and a corrupt one costs the region rather than the pane.
     ///
     /// The region is the one piece of 3D state a user produced by hand, and a
-    /// carefully aimed 20 km box silently coming back as the 160 km default on
+    /// carefully aimed 20 km box silently coming back as the 460 km default on
     /// restart is a feature that looks broken rather than absent.
     ///
     /// The asymmetry in the second half is deliberate and is the thing worth
