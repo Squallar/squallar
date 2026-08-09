@@ -663,6 +663,155 @@ mod tests {
         }
     }
 
+    // -- live ---------------------------------------------------------------
+    //
+    // Run with:
+    //   cargo test -p rustdar-radar --release --lib -- --ignored --nocapture current::tests::live_
+
+    /// Measure, on a real volume, every cost the merged-substrate design
+    /// weighs: the resolve itself, the fingerprint, the per-consumer
+    /// extractions and renders, the voxel resample, a section cut, and the
+    /// full-`Scan` clone a materialised merge would have paid per sealed
+    /// sweep. Numbers, not assertions — the assertions are only that each
+    /// stage runs at all.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[ignore = "hits the live nexrad archive bucket"]
+    #[tokio::test]
+    async fn live_substrate_costs_are_measured() {
+        use nexrad_model::data::DataMoment;
+        use std::time::Instant;
+
+        let site = "KTLX";
+        let radar = crate::sites::get_radar_site(site).expect("a real site");
+        let now = chrono::Utc::now().naive_utc();
+        let scan = crate::scan::get_scan(site, now).await.expect("a volume");
+
+        let gate_bytes: usize = scan
+            .sweeps()
+            .iter()
+            .flat_map(|s| s.radials())
+            .map(|r| {
+                [
+                    r.reflectivity(),
+                    r.velocity(),
+                    r.spectrum_width(),
+                    r.differential_reflectivity(),
+                    r.differential_phase(),
+                    r.correlation_coefficient(),
+                ]
+                .into_iter()
+                .flatten()
+                .map(|m| m.raw_values().len())
+                .sum::<usize>()
+            })
+            .sum();
+        println!(
+            "volume: {} sweeps, {:.1} MB of gate bytes",
+            scan.sweeps().len(),
+            gate_bytes as f64 / 1e6
+        );
+
+        let t = Instant::now();
+        let cloned = scan.clone();
+        println!(
+            "full Scan clone (the per-seal cost a materialised merge would pay): {:?}",
+            t.elapsed()
+        );
+        drop(cloned);
+
+        let t = Instant::now();
+        let current = resolve(Some(&scan), Some(&scan)).expect("resolves");
+        println!(
+            "current::resolve over two full volumes: {:?} ({} + {} sweeps)",
+            t.elapsed(),
+            current.base_sweeps(),
+            current.overlay_sweeps()
+        );
+        let t = Instant::now();
+        let newest = current.newest_data_time();
+        println!("newest_data_time: {:?} -> {newest:?}", t.elapsed());
+        let t = Instant::now();
+        let fp = current.ladder_fingerprint(RadarProduct::Reflectivity);
+        println!("ladder_fingerprint(REF): {:?} -> {fp:?}", t.elapsed());
+
+        // The section/voxel payload: what the frame thread pays per re-cut.
+        let t = Instant::now();
+        let volume_input = crate::render_input::RenderInput::extract_volume(
+            &scan,
+            RadarProduct::Reflectivity,
+            radar.lat,
+            radar.lon,
+        )
+        .expect("reflectivity everywhere");
+        let extract_ms = t.elapsed();
+        let t = Instant::now();
+        let bytes = volume_input.to_bytes();
+        println!(
+            "extract_volume(REF): {extract_ms:?}, payload {:.1} MB, to_bytes {:?}",
+            bytes.len() as f64 / 1e6,
+            t.elapsed()
+        );
+
+        // Whole-volume plan products: extraction + render, per recompute.
+        for product in [
+            RadarProduct::EchoTopsInterpolated,
+            RadarProduct::NormalizedRotation,
+            RadarProduct::StormRelativeVelocity,
+            RadarProduct::HydrometeorClassification,
+        ] {
+            let t = Instant::now();
+            let Some(input) = crate::render_input::RenderInput::extract(
+                &scan, 0.5, product, radar.lat, radar.lon, None, None,
+            ) else {
+                println!("{product:?}: no payload (moment absent)");
+                continue;
+            };
+            let extract_ms = t.elapsed();
+            let payload_mb = input.to_bytes().len() as f64 / 1e6;
+            let t = Instant::now();
+            let rendered = crate::render::render_from(&input).is_some();
+            println!(
+                "{product:?}: extract {extract_ms:?}, payload {payload_mb:.1} MB, \
+                 render {:?} (drew: {rendered})",
+                t.elapsed()
+            );
+        }
+
+        // The voxel resample at the desktop shape — the cost the worker move
+        // takes off the frame thread.
+        let request = crate::voxel::VoxelRequest {
+            centre: (radar.lat, radar.lon),
+            half_width_km: 80.0,
+            base_km_msl: crate::voxel::DEFAULT_BASE_KM_MSL,
+            top_km_msl: crate::voxel::DEFAULT_TOP_KM_MSL,
+            product: RadarProduct::Reflectivity,
+            shape: crate::voxel::DESKTOP_SHAPE,
+            values_wanted: false,
+        };
+        let t = Instant::now();
+        let grid = crate::voxel::build_voxels(&scan, &request, radar.lat, radar.lon);
+        println!(
+            "build_voxels(desktop shape): {:?} (built: {})",
+            t.elapsed(),
+            grid.is_some()
+        );
+
+        // A section cut, end to end — the worker-side render per re-cut.
+        let request = crate::xsect::SectionRequest {
+            start: (radar.lat - 0.5, radar.lon - 0.5),
+            end: (radar.lat + 0.5, radar.lon + 0.5),
+            top_km_msl: None,
+            product: RadarProduct::Reflectivity,
+        };
+        let t = Instant::now();
+        let section = crate::xsect::render_section(&scan, &request, radar.lat, radar.lon);
+        println!(
+            "render_section: {:?} (cut: {})",
+            t.elapsed(),
+            section.is_some()
+        );
+    }
+
     #[test]
     fn the_fingerprint_refuses_what_the_sampler_refuses() {
         let no_pattern = Scan::new(vcp(0, &[]), vec![sweep(1, 0.5, 1_000, true, false)]);
