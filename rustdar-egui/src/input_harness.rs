@@ -733,6 +733,20 @@ impl InputHarness {
         walkers::Projector::new(rect, memory, centre).unproject(egui::vec2(pos.x, pos.y))
     }
 
+    /// Where pane `idx` draws `ground`, on screen — [`Self::ground_at`]'s
+    /// inverse, from the same projector inputs, so a test can aim a pointer at
+    /// a section handle the way `draw_section_tracks` placed it.
+    pub(crate) fn screen_of(&self, idx: usize, ground: GeoPoint) -> egui::Pos2 {
+        let rect = self.pane_rects()[idx];
+        let memory = &self.gui.pane(idx).expect("no such pane").map_memory;
+        let centre = memory
+            .detached()
+            .unwrap_or_else(|| walkers::lat_lon(35.3333, -97.2778));
+        walkers::Projector::new(rect, memory, centre)
+            .project(walkers::lat_lon(ground.lat, ground.lon))
+            .to_pos2()
+    }
+
     /// Convert pane `idx` to a 3D volume pane, as the menu toggle will.
     pub(crate) fn make_pane_volume(&mut self, idx: usize) {
         self.gui
@@ -6790,6 +6804,308 @@ mod tests {
             zoomed.b(),
             "the release end did not move, so the zoom changed nothing about \
              what a pixel means and the assertion above proves nothing"
+        );
+    }
+
+    /// A map on pane 0 feeding a rendered section on pane 1, exactly as the
+    /// armed draw leaves the layout — the fixture every endpoint-drag test
+    /// starts from.
+    ///
+    /// Returns the line's two ends as **ground**, not pixels: the warm-up
+    /// frames let walkers settle its zoom, so a test aims at a handle by
+    /// projecting the ground through [`InputHarness::screen_of`] at use time
+    /// rather than trusting a pixel recorded before the settling.
+    fn harness_with_committed_section() -> (InputHarness, GeoPoint, GeoPoint) {
+        let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        h.set_pane_count(2);
+        h.load_scan("KTLX");
+        h.warm_up();
+        h.warm_up();
+        let pane = h.pane_rects()[0];
+        let to_geo = |pos: walkers::Position| GeoPoint {
+            lat: pos.y(),
+            lon: pos.x(),
+        };
+        let a = to_geo(h.ground_at(0, pane.center() - egui::vec2(140.0, 70.0)));
+        let b = to_geo(h.ground_at(0, pane.center() + egui::vec2(140.0, 70.0)));
+        h.make_pane_cross_section(1, a, b);
+        h.gui_mut()
+            .pane_mut(1)
+            .expect("pane 1 exists")
+            .cross_section_mut()
+            .expect("pane 1 is a section pane")
+            .source_pane = Some(0);
+        h.place_section(1, vcp_212_axes(), &vcp_212_rungs());
+        (h, a, b)
+    }
+
+    /// 45c. **Dragging an endpoint previews live and re-aims the section only
+    ///      on the drop** — the pointer's whole journey changes nothing the
+    ///      cut dispatch can see, and the release changes exactly the line.
+    ///
+    ///      The stored line *is* the drag's contribution to the section
+    ///      staleness key (`SectionTarget.line`), and the frontend dispatcher
+    ///      re-cuts precisely when that key moves — so "the line holds still
+    ///      until the drop" is this crate's half of "a drag in progress never
+    ///      triggers an extraction". A re-cut is a multi-MB walk of the merged
+    ///      volume's gate bytes; per drag frame it would be the most expensive
+    ///      thing in the app.
+    ///
+    ///      Also pinned here because they are the same gesture: the map does
+    ///      not pan while a handle is held (from the press frame, via the
+    ///      recorded handle spots), and the drop does not blank the pane —
+    ///      walking a line through a storm must not strobe the picture on
+    ///      every drop.
+    #[test]
+    fn dragging_an_endpoint_re_aims_the_section_on_drop_and_never_mid_drag() {
+        let (mut h, a, b) = harness_with_committed_section();
+        let line_before = h.section_line(1).expect("the fixture committed a line");
+        let centre_before = h.pane_center(0);
+
+        let b_px = h.screen_of(0, b);
+        let target_px = b_px + egui::vec2(-70.0, 45.0);
+        // The ground the drop should land on, computed before the drag: the
+        // map must not move under the gesture, so the answer must not either.
+        let want = h.ground_at(0, target_px);
+
+        h.mouse_move(b_px);
+        h.frame();
+        h.mouse_press(b_px);
+        let pressed = h.frame();
+        assert!(
+            pressed.resolved.suppress_pan,
+            "the press frame left the map free to pan out from under the grab"
+        );
+
+        for step in 1..=4 {
+            h.mouse_move(b_px + (target_px - b_px) * (step as f32 / 4.0));
+            h.frame();
+            assert_eq!(
+                h.section_line(1),
+                Some(line_before),
+                "the stored line moved mid-drag on step {step}: every one of \
+                 these frames is a re-cut the dispatcher will run"
+            );
+        }
+        assert_eq!(h.pane_center(0), centre_before, "the map panned mid-drag");
+
+        h.mouse_release(target_px);
+        h.frames_for(2, FRAME_DT);
+
+        let line = h.section_line(1).expect("the drop lost the line");
+        assert_ne!(line, line_before, "the drop committed nothing");
+        assert_eq!(
+            line.a(),
+            line_before.a(),
+            "grabbing B moved A: the drag is a redraw, not a handle"
+        );
+        assert!(
+            (line.b().lat - want.y()).abs() < 1e-3 && (line.b().lon - want.x()).abs() < 1e-3,
+            "B landed at {:?}, not under the drop at {want:?}",
+            line.b()
+        );
+        // A is still where the fixture put it on the ground, so the whole
+        // gesture read the projector rather than shifting pixels.
+        assert!(
+            (line.a().lat - a.lat).abs() < 1e-9,
+            "A drifted from the ground the fixture named"
+        );
+        // The old picture stands until the re-cut lands: blanking here would
+        // strobe the pane on every drop of a walk through a storm.
+        assert!(
+            h.gui_mut()
+                .pane(1)
+                .and_then(|p| p.cross_section())
+                .is_some_and(|s| s.texture.is_some() && s.section.is_some()),
+            "the drop blanked the section pane"
+        );
+    }
+
+    /// 45d. **A mid-drag zoom keeps the grabbed endpoint's ground.**
+    ///
+    ///      The drag suppresses panning but not zooming — walkers reads the
+    ///      wheel itself — so a wheel notch mid-drag is ordinary. The preview
+    ///      is geographic and the pointer is folded in only on frames it
+    ///      moved, so a zoom-only frame must change nothing: re-unprojecting a
+    ///      stationary pointer would slide the endpoint to whatever ground its
+    ///      pixel names after the zoom.
+    ///
+    ///      Same construction as the armed-draw anchor test above: two
+    ///      identical drags, one with a wheel notch before the release, must
+    ///      commit the same line — and the zooms must really differ, or the
+    ///      equality proves nothing.
+    #[test]
+    fn a_mid_drag_zoom_keeps_the_grabbed_endpoints_ground() {
+        fn drag(zoom_mid_drag: bool) -> (SectionLine, f64) {
+            let (mut h, _, b) = harness_with_committed_section();
+            let b_px = h.screen_of(0, b);
+            let target_px = b_px + egui::vec2(-70.0, 45.0);
+
+            h.mouse_move(b_px);
+            h.frame();
+            h.mouse_press(b_px);
+            h.frame();
+            h.mouse_move(target_px);
+            h.frame();
+
+            if zoom_mid_drag {
+                // At the pointer's own position, as a user zooming in on the
+                // endpoint they are placing does — so the pointer does not
+                // move, and only the ground under it changes.
+                h.wheel_notch(target_px, egui::MouseWheelUnit::Line, -3.0);
+            }
+            h.frames_for(6, FRAME_DT);
+
+            h.mouse_release(target_px);
+            h.frames_for(2, FRAME_DT);
+
+            let zoom = h.gui_mut().pane(0).expect("pane 0").map_memory.zoom();
+            (h.section_line(1).expect("the drop lost the line"), zoom)
+        }
+
+        let (plain, plain_zoom) = drag(false);
+        let (zoomed, zoomed_zoom) = drag(true);
+
+        assert!(
+            (plain_zoom - zoomed_zoom).abs() > 0.05,
+            "precondition: the wheel must really have zoomed ({plain_zoom} -> \
+             {zoomed_zoom}), or the equality below proves nothing"
+        );
+        assert_eq!(
+            plain.b(),
+            zoomed.b(),
+            "the zoom moved the grabbed endpoint: a stationary pointer is \
+             being re-unprojected through the zoomed projector"
+        );
+        assert_eq!(plain.a(), zoomed.a(), "the fixed end moved under a zoom");
+    }
+
+    /// 45e. **A press beyond the grab radius is still a pan.**
+    ///
+    ///      The handles are unarmed, so their radius is the entire contract
+    ///      with the map's primary gesture: inside it a press edits, outside
+    ///      it the map pans exactly as it did before handles existed. A radius
+    ///      that swallowed nearby presses would make every pan near a section
+    ///      line a coin flip — the exact failure the armed modes exist to
+    ///      avoid.
+    #[test]
+    fn a_press_beside_the_handles_still_pans_the_map() {
+        let (mut h, a, b) = harness_with_committed_section();
+        let a_px = h.screen_of(0, a);
+        let b_px = h.screen_of(0, b);
+        // Well off both handles and off the line's body alike.
+        let mid = a_px + (b_px - a_px) * 0.5;
+        let start = mid + egui::vec2(0.0, -120.0);
+        assert!(
+            h.pane_rects()[0].contains(start),
+            "precondition: the press is inside pane 0"
+        );
+
+        let centre_before = h.pane_center(0);
+        h.mouse_move(start);
+        h.frame();
+        h.mouse_press(start);
+        let pressed = h.frame();
+        assert!(
+            !pressed.resolved.suppress_pan,
+            "a press {:.0} points from the nearest handle suppressed panning",
+            (start - a_px).length().min((start - b_px).length())
+        );
+        for step in 1..=3 {
+            h.mouse_move(start + egui::vec2(30.0 * step as f32, 15.0 * step as f32));
+            h.frame();
+        }
+        h.mouse_release(start + egui::vec2(90.0, 45.0));
+        h.frames_for(2, FRAME_DT);
+
+        assert_ne!(
+            h.pane_center(0),
+            centre_before,
+            "an ordinary pan near a section line went missing"
+        );
+        assert_eq!(
+            h.section_line(1),
+            Some(SectionLine::new(a, b).expect("the fixture's line")),
+            "a pan rewrote the section's line"
+        );
+    }
+
+    /// 45f. **While the draw mode is armed, the handles go inert** — the same
+    ///      press that would grab B draws a fresh line instead, exactly as it
+    ///      did before handles existed.
+    ///
+    ///      One drag on one map pane cannot be two gestures. The armed mode
+    ///      was asked for last (from the menu), so it wins; the two setters
+    ///      also drop any edit drag in flight, which keeps the exclusion true
+    ///      from both directions.
+    #[test]
+    fn an_armed_draw_wins_the_press_over_a_handle() {
+        let (mut h, a, b) = harness_with_committed_section();
+        h.set_section_draw_armed(true);
+        h.warm_up();
+
+        let b_px = h.screen_of(0, b);
+        let to_px = b_px + egui::vec2(-160.0, 90.0);
+        let want_from = h.ground_at(0, b_px);
+
+        h.mouse_move(b_px);
+        h.frame();
+        h.mouse_press(b_px);
+        h.frame();
+        h.mouse_move(to_px);
+        h.frame();
+        h.mouse_release(to_px);
+        h.frames_for(2, FRAME_DT);
+
+        let line = h.section_line(1).expect("the armed draw re-aims pane 1");
+        // The armed draw's signature: the press became the *A end of a new
+        // line*. An endpoint edit would have kept A where the fixture put it.
+        assert!(
+            (line.a().lat - want_from.y()).abs() < 1e-3
+                && (line.a().lon - want_from.x()).abs() < 1e-3,
+            "the press on a handle did not start a fresh armed line: A is at \
+             {:?}, expected under the press at {want_from:?}",
+            line.a()
+        );
+        assert!(
+            (line.a().lat - a.lat).abs() > 1e-4 || (line.a().lon - a.lon).abs() > 1e-4,
+            "precondition: the fixture's A and the press ground must differ, \
+             or this cannot tell the two gestures apart"
+        );
+        assert!(
+            !h.section_draw_armed(),
+            "the armed draw did not disarm after producing its line"
+        );
+    }
+
+    /// 45g. **Escape mid-drag cancels the edit and keeps the line** — the
+    ///      same layer the armed drags sit on, because a drag in flight is the
+    ///      most immediate thing a "back out" gesture can be aimed at.
+    #[test]
+    fn escape_mid_drag_cancels_the_edit_and_keeps_the_line() {
+        let (mut h, _, b) = harness_with_committed_section();
+        let line_before = h.section_line(1).expect("the fixture committed a line");
+        let b_px = h.screen_of(0, b);
+
+        h.mouse_move(b_px);
+        h.frame();
+        h.mouse_press(b_px);
+        h.frame();
+        h.mouse_move(b_px + egui::vec2(-60.0, 30.0));
+        h.frame();
+
+        assert!(
+            h.gui_mut().dismiss_top_layer(),
+            "a drag in flight gave the back gesture nothing to dismiss"
+        );
+        h.frame();
+        h.mouse_release(b_px + egui::vec2(-80.0, 40.0));
+        h.frames_for(2, FRAME_DT);
+
+        assert_eq!(
+            h.section_line(1),
+            Some(line_before),
+            "a cancelled drag still moved the line"
         );
     }
 

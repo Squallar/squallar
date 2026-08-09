@@ -270,7 +270,34 @@ impl super::Gui {
                     } else {
                         pointer.overlay_click_pos
                     };
-                    let suppress_pan = pointer.suppress_pan || region_arm;
+                    // The third reason a map pane's pan is suppressed, and the
+                    // only unarmed one: a drag on a section handle. Two halves,
+                    // because the decision is needed *now* and the authoritative
+                    // hit-test lives inside `Map::show` where the projector is:
+                    //
+                    // * a drag already in flight on this pane owns the pointer
+                    //   until it ends, wherever the pointer wanders;
+                    // * a press landing on a handle **this frame** is caught
+                    //   against last frame's recorded handle positions
+                    //   (`Gui::section_handles`), because by the time the
+                    //   projector can confirm it, walkers has already read the
+                    //   press with panning enabled — and a press frame that
+                    //   pans is a map that slides out from under the grab.
+                    //
+                    // Deliberately not gated on `is_active`: the handles belong
+                    // to the pane, not to the focus, and the press that grabs
+                    // one is the same press `detect_active_pane_click` used to
+                    // focus the pane at the top of this frame.
+                    let section_editing = self
+                        .section_edit_drag
+                        .as_ref()
+                        .is_some_and(|d| d.map_pane == pane_idx);
+                    let handle_press = !armed_draw
+                        && !region_arm
+                        && !section_editing
+                        && self.section_handle_pressed(&ctx, pane_idx);
+                    let suppress_pan =
+                        pointer.suppress_pan || region_arm || section_editing || handle_press;
 
                     // From the same locals that feed `PaneRenderCtx` and
                     // `drag_pan_buttons` below: after the gate, after
@@ -396,6 +423,23 @@ impl super::Gui {
                                             projector,
                                             zoom,
                                             &mut render_ctx,
+                                        );
+
+                                        // Before the tracks are drawn, so the
+                                        // preview this frame paints is the one
+                                        // this frame's pointer produced. Inside
+                                        // `Map::show` for the same reason the
+                                        // armed draw is: the projector is the
+                                        // only thing that can turn a pointer
+                                        // into ground, and the handles' screen
+                                        // positions are recorded here for the
+                                        // next frame's pan-suppression call.
+                                        self.track_section_edit(
+                                            ui,
+                                            projector,
+                                            pane_idx,
+                                            pane_rect,
+                                            excluded_rects,
                                         );
 
                                         // Last, over the radar image and every
@@ -590,6 +634,188 @@ impl super::Gui {
         }
     }
 
+    /// Whether this frame's press landed on a section handle recorded last
+    /// frame — the press-frame half of the pan-suppression rule; see the call
+    /// site in `render_panes`.
+    ///
+    /// Against **last** frame's positions because the projector that could
+    /// confirm them does not exist yet this frame. One frame of staleness is
+    /// harmless for a press (a pointer about to press is not flinging the
+    /// viewport), and the worst case of a miss is one frame of pan under a
+    /// grab that the in-flight arm then suppresses.
+    fn section_handle_pressed(&self, ctx: &egui::Context, pane_idx: usize) -> bool {
+        let Some(pos) = ctx.input(|i| {
+            if i.pointer.primary_pressed() {
+                i.pointer.interact_pos()
+            } else {
+                None
+            }
+        }) else {
+            return false;
+        };
+        self.section_handles.iter().any(|h| {
+            h.map_pane == pane_idx
+                && h.pos.distance(pos) <= crate::ui_section_edit::ENDPOINT_GRAB_RADIUS_PT
+        })
+    }
+
+    /// Advance the unarmed endpoint drag on this pane by one frame, and record
+    /// where this pane's handles are for the next frame's press test.
+    ///
+    /// # Why the pointer is read raw here
+    ///
+    /// The same answer `handle_region_drag` gives: the click convention is
+    /// about *clicks*, and a drag is a press frame, a stream of moved frames
+    /// and a release frame, none of which a confirmed-tap position can
+    /// express. The dialog gate the convention enforces is applied explicitly
+    /// on the press, via [`is_pos_blocked`].
+    ///
+    /// # What each frame kind does
+    ///
+    /// * **Press** on a handle (inside this pane, not over a dialog, no drag
+    ///   already in flight) begins a drag carrying the line as it stands.
+    /// * **Moved** frames re-anchor the grabbed end to the ground under the
+    ///   pointer — and only moved frames: a zoom-only frame must not slide
+    ///   the endpoint to whatever ground its pixel names now
+    ///   ([`SectionEditDrag::pointer_moved`]).
+    /// * **Release** commits through [`SectionEditDrag::commit`] — which
+    ///   refuses an unchanged or under-length line — into
+    ///   `pending_section_edit`, applied after the pane loop. The pane's
+    ///   stored line is untouched until then, which is the whole re-cut-on-
+    ///   drop contract: the staleness key carries the line, so nothing is
+    ///   extracted while the drag is in flight.
+    /// * **A pointer that vanishes** (touch cancel, cursor leaving the
+    ///   window) drops the drag and the preview with it.
+    ///
+    /// While either armed modal drag is on, this records nothing and advances
+    /// nothing: the armed mode owns the pane's gestures, and it was asked for
+    /// last (both setters also clear any drag in flight).
+    ///
+    /// [`SectionEditDrag::commit`]: crate::ui_section_edit::SectionEditDrag::commit
+    /// [`SectionEditDrag::pointer_moved`]: crate::ui_section_edit::SectionEditDrag::pointer_moved
+    /// [`is_pos_blocked`]: super::map_overlays::is_pos_blocked
+    fn track_section_edit(
+        &mut self,
+        ui: &egui::Ui,
+        projector: &walkers::Projector,
+        pane_idx: usize,
+        pane_rect: egui::Rect,
+        excluded_rects: &[egui::Rect],
+    ) {
+        use crate::ui_section_edit::{SectionEditDrag, SectionGrab, SectionHandleSpot, grab_at};
+
+        // Re-recorded every frame, armed or not: spots left over from before a
+        // mode change would go on suppressing pans near handles that are no
+        // longer live.
+        self.section_handles.retain(|h| h.map_pane != pane_idx);
+        if self.section_draw_armed || self.region_arm {
+            return;
+        }
+
+        let project = |p: crate::pane::GeoPoint| {
+            projector.project(walkers::lat_lon(p.lat, p.lon)).to_pos2()
+        };
+        // Every committed line this map owns, with its projected ends. Reading
+        // `self.panes` mid-loop is safe here for the reason
+        // `draw_section_tracks` gives: the taken slot reads as a default map
+        // pane, which has no cross-section to offer.
+        let tracks: Vec<(usize, crate::pane::SectionLine, egui::Pos2, egui::Pos2)> = self
+            .panes()
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, other)| {
+                let section = other.cross_section()?;
+                if section.source_pane != Some(pane_idx) {
+                    return None;
+                }
+                let line = section.line?;
+                Some((idx, line, project(line.a()), project(line.b())))
+            })
+            .collect();
+        for (section_pane, _, a_px, b_px) in &tracks {
+            for (grab, pos) in [(SectionGrab::A, *a_px), (SectionGrab::B, *b_px)] {
+                self.section_handles.push(SectionHandleSpot {
+                    map_pane: pane_idx,
+                    section_pane: *section_pane,
+                    grab,
+                    pos,
+                });
+            }
+        }
+
+        let (pressed, down, released, pos) = ui.ctx().input(|i| {
+            (
+                i.pointer.primary_pressed(),
+                i.pointer.primary_down(),
+                i.pointer.primary_released(),
+                i.pointer.interact_pos(),
+            )
+        });
+        let ground = |p: egui::Pos2| {
+            let position = projector.unproject(egui::vec2(p.x, p.y));
+            crate::pane::GeoPoint {
+                lat: position.y(),
+                lon: position.x(),
+            }
+        };
+
+        // The press frame. Gated on this pane's own rect and on the dialog
+        // layer, exactly as the region drag's press is.
+        if pressed
+            && self.section_edit_drag.is_none()
+            && let Some(pos) = pos
+            && pane_rect.contains(pos)
+            && !super::map_overlays::is_pos_blocked(ui.ctx(), pos, pane_rect, excluded_rects)
+        {
+            for (section_pane, line, a_px, b_px) in &tracks {
+                if let Some(grab) = grab_at(pos, *a_px, *b_px) {
+                    self.section_edit_drag = Some(SectionEditDrag::begin(
+                        pane_idx,
+                        *section_pane,
+                        grab,
+                        *line,
+                        pos,
+                    ));
+                    break;
+                }
+            }
+        }
+
+        // Everything below belongs to *this* pane's drag only, and — like the
+        // region drag — it is not gated on the pane's rect: dragging an
+        // endpoint past a pane edge is ordinary, and stopping there would read
+        // as the gesture being dropped.
+        let Some(drag) = self
+            .section_edit_drag
+            .as_mut()
+            .filter(|d| d.map_pane == pane_idx)
+        else {
+            return;
+        };
+
+        if (down || released)
+            && let Some(pos) = pos
+            && drag.pointer_moved(pos)
+        {
+            drag.drag_to(pos, ground(pos));
+        }
+
+        if released {
+            let drag = self
+                .section_edit_drag
+                .take()
+                .expect("filtered Some above; nothing between takes it");
+            if let Some(line) = drag.commit() {
+                self.pending_section_edit = Some((drag.section_pane, line));
+            }
+        } else if !down {
+            // The pointer went away without releasing — a cancelled touch, or
+            // the cursor leaving the window. The preview dies with the drag;
+            // the pane's line was never touched.
+            self.section_edit_drag = None;
+        }
+    }
+
     /// Draw the rubber band of an in-flight draw and the ground track of every
     /// section cut from this map.
     ///
@@ -652,17 +878,30 @@ impl super::Gui {
             |p: crate::pane::GeoPoint| projector.project(walkers::lat_lon(p.lat, p.lon)).to_pos2();
 
         // Committed sections first, so a band being dragged over one is on top.
-        for other in self.panes() {
+        for (idx, other) in self.panes().iter().enumerate() {
             let Some(section) = other.cross_section() else {
                 continue;
             };
             if section.source_pane != Some(pane_idx) {
                 continue;
             }
-            let Some(line) = section.line else {
+            let Some(committed) = section.line else {
                 continue;
             };
-            paint_section_track(painter, &great_circle_track(line, project), pane_rect);
+            // An endpoint drag in flight replaces this track with its live
+            // preview — geographic, like the committed line, so a mid-drag
+            // zoom moves both together. The pane's stored line is untouched
+            // until the drop, which is what keeps the cut off this path.
+            let editing = self
+                .section_edit_drag
+                .filter(|d| d.map_pane == pane_idx && d.section_pane == idx);
+            let line = editing.map_or(committed, |d| d.preview());
+            let track = great_circle_track(line, project);
+            paint_section_track(painter, &track, pane_rect);
+            // The ends are handles now, and drawn like it: a cap that looks
+            // identical to every other map decoration is an affordance nobody
+            // finds.
+            paint_section_handles(painter, &track, pane_rect, editing.map(|d| d.grab));
         }
 
         if let Some((from, to)) = self.section_rubber_band(pane_idx) {
@@ -1347,6 +1586,47 @@ fn paint_section_track(painter: &egui::Painter, points: &[egui::Pos2], pane_rect
             label,
             egui::FontId::proportional(11.0),
             SECTION_TRACK_COLOR,
+        );
+    }
+}
+
+/// Paint the two grab handles over a track's end caps.
+///
+/// A ring around the cap rather than a bigger cap: the ring reads as "this is
+/// a control" the way a plain dot never does, and it leaves the A/B labels and
+/// the cap [`paint_section_track`] drew exactly where they were. `active` is
+/// the grabbed end of an in-flight drag, drawn heavier so the user can see
+/// which end they are holding through a busy storm.
+///
+/// The ring's radius is **visual**, deliberately smaller than
+/// [`ENDPOINT_GRAB_RADIUS_PT`](crate::ui_section_edit::ENDPOINT_GRAB_RADIUS_PT):
+/// the hit target forgives half a finger of aim, and drawing the forgiveness
+/// would bury the map under two thumbprint-sized discs.
+fn paint_section_handles(
+    painter: &egui::Painter,
+    points: &[egui::Pos2],
+    pane_rect: egui::Rect,
+    active: Option<crate::ui_section_edit::SectionGrab>,
+) {
+    use crate::ui_section_edit::SectionGrab;
+    let (Some(&a), Some(&b)) = (points.first(), points.last()) else {
+        return;
+    };
+    let painter = painter.with_clip_rect(pane_rect);
+    for (pos, grab) in [(a, SectionGrab::A), (b, SectionGrab::B)] {
+        let grabbed = active == Some(grab);
+        let ring = if grabbed { 9.0 } else { 7.0 };
+        // The same halo-under-bright trick every line on this map uses, so the
+        // ring survives both a light basemap and a 70 dBZ core.
+        painter.circle_stroke(
+            pos,
+            ring,
+            egui::Stroke::new(3.5, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 140)),
+        );
+        painter.circle_stroke(
+            pos,
+            ring,
+            egui::Stroke::new(if grabbed { 2.5 } else { 1.5 }, SECTION_TRACK_COLOR),
         );
     }
 }

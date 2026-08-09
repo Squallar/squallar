@@ -466,6 +466,40 @@ pub struct Gui {
     /// would be drawn in the right place and clicked in the wrong one, for one
     /// frame, with nothing to say so.
     pending_section_line: Option<(PaneId, crate::pane::SectionLine)>,
+    /// An endpoint drag in flight on a committed section's ground track, or
+    /// `None`.
+    ///
+    /// **Unarmed on purpose** — see `ui_section_edit`'s module doc: a handle is
+    /// a visible target and proximity is the disambiguation, so an existing
+    /// line's ends are always grabbable on the map pane that owns it. Advanced
+    /// only from inside that pane's `Map::show` ([`map`]'s
+    /// `track_section_edit`), where the projector is; cleared by both armed-drag
+    /// setters, because one drag on one map pane cannot be two gestures, and by
+    /// [`Self::dismiss_top_layer`], so Escape mid-drag means what it means
+    /// everywhere else.
+    section_edit_drag: Option<crate::ui_section_edit::SectionEditDrag>,
+    /// Where every grabbable section handle was drawn **last frame**, in screen
+    /// points.
+    ///
+    /// Written from inside `Map::show`, read by `render_panes`' pan-suppression
+    /// decision *before* it — the press frame has to suppress the pan, and the
+    /// press frame is the one frame that cannot yet ask the projector. One
+    /// frame stale by construction, which for a press is harmless: a pointer
+    /// about to press is not also flinging the viewport.
+    section_handles: Vec<crate::ui_section_edit::SectionHandleSpot>,
+    /// A dropped handle's line and the section pane it belongs to, applied
+    /// **after** the pane loop.
+    ///
+    /// Deferred for the reason every pending is
+    /// ([`pending_pane_kind`](Self::pending_pane_kind)): the drop is recorded
+    /// from inside `Map::show`, in the window where the map pane is
+    /// `mem::take`n out of the vector. Unlike
+    /// [`pending_section_line`](Self::pending_section_line) this can never grow
+    /// the layout — it re-aims a section pane that already exists — and its
+    /// applier writes the line and nothing else, so the ordinary staleness
+    /// poll is what re-cuts. One deferral shape for every writer, rather than
+    /// one careful exception.
+    pending_section_edit: Option<(PaneId, crate::pane::SectionLine)>,
     viewport_sync: bool,
     sync_layers: bool,
     // --- Radar loop settings ---
@@ -844,6 +878,9 @@ impl Gui {
             section_draw_armed: false,
             section_anchor: None,
             pending_section_line: None,
+            section_edit_drag: None,
+            section_handles: Vec::new(),
+            pending_section_edit: None,
             viewport_sync: true,
             sync_layers: true,
             loop_lookback_secs: 3600, // default 1 hour
@@ -936,6 +973,12 @@ impl Gui {
         // moves `pane_rect` for every pane. Inside the loop that would leave the
         // panes drawn after it hit-tested against rects they are no longer in.
         self.apply_pending_section_line();
+        // After the modal-draw applier so that if both somehow fired in one
+        // frame the freshly drawn line would win — though they cannot: an armed
+        // draw makes the handles inert, and beginning a handle drag requires no
+        // mode to be armed. This one can never grow the layout, so it takes no
+        // part in the ordering argument below.
+        self.apply_pending_section_edit();
         // After the kind conversion, so a region that lands on a pane the same
         // frame converted it finds a 3D pane rather than the map it used to be.
         //
@@ -1249,6 +1292,14 @@ impl Gui {
     /// instead of honouring them would strand the user — the Exit item lives
     /// *inside* the drawer.
     pub fn dismiss_top_layer(&mut self) -> bool {
+        // First, above everything painted: a handle drag in flight owns the
+        // pointer right now, which makes it the most immediate thing a "back
+        // out" gesture can be aimed at. Cancelling restores the line the drag
+        // started from — the preview was never written anywhere.
+        if self.section_edit_drag.is_some() {
+            self.section_edit_drag = None;
+            return true;
+        }
         if !self.overlays.selected_overlays.is_empty() {
             self.overlays.selected_overlays.clear();
             self.overlays.selected_overlay_page = 0;
@@ -2447,6 +2498,10 @@ impl Gui {
         if on {
             self.section_draw_armed = false;
             self.section_anchor = None;
+            // A handle drag in flight is a third gesture the same press cannot
+            // also be. Arming from the menu mid-drag is contrived but cheap to
+            // be correct about: the drag dies, the pane's line is untouched.
+            self.section_edit_drag = None;
         } else {
             self.region_drag = None;
         }
@@ -2517,6 +2572,9 @@ impl Gui {
         if armed {
             self.region_arm = false;
             self.region_drag = None;
+            // Same as `set_region_arm`: an endpoint drag cannot share a map
+            // with an armed draw, and the mode was asked for last.
+            self.section_edit_drag = None;
         } else {
             self.section_anchor = None;
         }
@@ -2618,6 +2676,45 @@ impl Gui {
             section.rendered_for = None;
         }
         self.active_pane = target;
+    }
+
+    /// Write a dropped handle's line onto the section pane it belongs to.
+    ///
+    /// Called from [`Self::ui`] after the pane loop, where every pane is back
+    /// in the vector. The write is the line and **nothing else** — no target
+    /// rule (the drop already names its pane), no growth, and deliberately no
+    /// clearing of the picture on screen:
+    ///
+    /// # Why the old picture stands until the new cut lands
+    ///
+    /// [`Self::apply_pending_section_line`] blanks the pane, because a freshly
+    /// drawn line can be across the state from the old one and a picture of
+    /// somewhere else entirely is wrong for as long as it stands. A handle
+    /// drop is an *adjustment*: the new line overlaps the old one's ground,
+    /// the user's eyes are on the track they just moved, and this drop is the
+    /// repeating step of walking a line through a storm — blanking to
+    /// "Cutting the cross-section…" on every drop would strobe the pane
+    /// exactly when the user is using it most. The stale picture stands for
+    /// the fraction of a second the re-cut takes, the same way a section of
+    /// the previous *volume* stands while its successor is cut, and the
+    /// staleness key — which carries the line — is what notices and re-cuts
+    /// without any help from here.
+    fn apply_pending_section_edit(&mut self) {
+        let Some((pane_idx, line)) = self.pending_section_edit.take() else {
+            return;
+        };
+        let Some(section) = self
+            .panes
+            .get_mut(pane_idx)
+            .and_then(|p| p.cross_section_mut())
+        else {
+            // A pane-count change or a conversion in the same frame. Dropped
+            // rather than retargeted: re-aiming a pane the user did not drag
+            // on is worse than losing an adjustment they can repeat.
+            log::warn!("pane {pane_idx} is no longer a section pane; dropping the edited line");
+            return;
+        };
+        section.line = Some(line);
     }
 
     /// The first section pane whose line was drawn on `source`.

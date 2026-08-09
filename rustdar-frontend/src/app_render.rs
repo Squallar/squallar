@@ -5815,6 +5815,92 @@ mod section_dispatch_tests {
         assert!(message.contains("next volume"), "{message}");
     }
 
+    /// **A held line dispatches nothing, and a dropped line dispatches exactly
+    /// one cut** — the dispatcher's half of the endpoint drag's
+    /// re-cut-on-drop contract.
+    ///
+    /// The egui half
+    /// (`dragging_an_endpoint_re_aims_the_section_on_drop_and_never_mid_drag`)
+    /// pins that a drag in flight never touches the pane's stored line and
+    /// that the drop writes it exactly once. This half pins what that buys:
+    /// the stored line is the staleness key's line, so any number of polls
+    /// against an unmoved line after the first cut must dispatch **nothing**
+    /// — a cut walks megabytes of gate bytes, and per-frame dispatch during a
+    /// drag is precisely what deferring the write to the drop exists to
+    /// prevent — while the drop's single write must make the very next poll
+    /// cut, or dropping a handle would do nothing until the next volume
+    /// happened along.
+    #[test]
+    fn a_dropped_line_re_cuts_once_and_a_held_line_never() {
+        let mut app = app_with_section(RadarProduct::Reflectivity, volume(vec![one_cut()]));
+
+        // The first poll after the pane was aimed: one cut in flight, the key
+        // written on dispatch.
+        app.dispatch_section_renders();
+        assert!(
+            app.render.pane_render[0].render_in_flight,
+            "precondition: the aimed pane never cut at all"
+        );
+        let first_key = state(&app)
+            .rendered_for
+            .clone()
+            .expect("the key is written on dispatch");
+        // The cut completes; the budget frees. The key stays, which is the
+        // whole staleness machine.
+        app.render.pane_render[0].render_in_flight = false;
+
+        // A drag in flight: the preview lives on the map pane and the stored
+        // line holds still, so every one of these polls is the dispatcher
+        // looking at an unmoved key. Sixty of them — a second of frames —
+        // must dispatch nothing.
+        for frame in 0..60 {
+            app.dispatch_section_renders();
+            assert!(
+                !app.render.pane_render[0].render_in_flight,
+                "poll {frame} against an unmoved line dispatched a cut: that \
+                 is a re-cut per frame for the length of every drag"
+            );
+        }
+        assert_eq!(
+            state(&app).rendered_for,
+            Some(first_key.clone()),
+            "an idle poll moved the staleness key"
+        );
+
+        // The drop: exactly the one write `Gui::apply_pending_section_edit`
+        // makes, nothing else touched.
+        let moved = SectionLine::new(
+            GeoPoint {
+                lat: 35.05,
+                lon: -97.8,
+            },
+            GeoPoint {
+                lat: 35.7,
+                lon: -96.8,
+            },
+        )
+        .expect("a valid moved line");
+        assert_ne!(moved, line(), "precondition: the drop really moved the line");
+        app.gui
+            .pane_mut(0)
+            .unwrap()
+            .cross_section_mut()
+            .unwrap()
+            .line = Some(moved);
+
+        app.dispatch_section_renders();
+        assert!(
+            app.render.pane_render[0].render_in_flight,
+            "the dropped line did not re-cut: the handle drop is inert until \
+             the next volume moves the key"
+        );
+        assert_eq!(
+            state(&app).rendered_for.as_ref().map(|t| t.line),
+            Some(moved),
+            "the new cut was dispatched for the old line"
+        );
+    }
+
     /// A product with no vertical structure says so, and **stops** asking.
     ///
     /// The mirror of the test above, and the pair is the point: nothing about
