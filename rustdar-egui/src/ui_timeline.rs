@@ -174,10 +174,17 @@ impl super::Gui {
     /// pending appliers, so no `mem::take` window is open and the active pane
     /// read out of `self.panes` is the real one — the module note explains why
     /// that ordering is the whole design.
+    ///
+    /// `phone_bar_top` is `Some` on Compact: the top edge of the bottom bar
+    /// the phone shell drew this frame. The transport then presents inline —
+    /// full inset width, sitting directly above the bar (plan §1.5) — and the
+    /// collapsed chip right-aligns above the bar instead of hugging the map's
+    /// corner. Same `Area` id either way: only the geometry is the phone's.
     pub(super) fn render_timeline(
         &mut self,
         ctx: &egui::Context,
         map_rect: egui::Rect,
+        phone_bar_top: Option<f32>,
         actions: &mut Vec<GuiAction>,
     ) {
         #[cfg(test)]
@@ -186,18 +193,21 @@ impl super::Gui {
         }
 
         if self.timeline_collapsed {
-            self.render_timeline_chip(ctx, map_rect);
+            self.render_timeline_chip(ctx, map_rect, phone_bar_top);
             return;
         }
 
-        let inner_width = (map_rect.width() - SIDE_INSET).min(MAX_INNER_WIDTH);
+        let (anchor_bottom, inner_width) = match phone_bar_top {
+            Some(bar_top) => (bar_top - CHIP_INSET, map_rect.width() - 2.0 * CHIP_INSET),
+            None => (
+                map_rect.bottom() - BOTTOM_CLEARANCE,
+                (map_rect.width() - SIDE_INSET).min(MAX_INNER_WIDTH),
+            ),
+        };
         let area = egui::Area::new(egui::Id::new("timeline"))
             .order(egui::Order::Middle)
             .pivot(egui::Align2::CENTER_BOTTOM)
-            .fixed_pos(egui::pos2(
-                map_rect.center().x,
-                map_rect.bottom() - BOTTOM_CLEARANCE,
-            ))
+            .fixed_pos(egui::pos2(map_rect.center().x, anchor_bottom))
             .show(ctx, |ui| {
                 egui::Frame::window(&ctx.global_style()).show(ui, |ui| {
                     ui.set_width(inner_width);
@@ -216,16 +226,24 @@ impl super::Gui {
         let _ = area;
     }
 
-    /// The collapsed form: a 🕐-and-timestamp chip at the map's bottom-right.
+    /// The collapsed form: a 🕐-and-timestamp chip at the map's bottom-right
+    /// — above the bottom bar on the phone, whose Live chip is the other
+    /// restore route (plan §1.5).
     ///
     /// Bottom-**right** while the transport itself is bottom-centred, so the
     /// chip does not sit where the middle of the map's bottom edge is most
     /// likely to be looked at — the whole point of collapsing.
-    fn render_timeline_chip(&mut self, ctx: &egui::Context, map_rect: egui::Rect) {
+    fn render_timeline_chip(
+        &mut self,
+        ctx: &egui::Context,
+        map_rect: egui::Rect,
+        phone_bar_top: Option<f32>,
+    ) {
+        let bottom = phone_bar_top.map_or(map_rect.bottom(), |bar_top| bar_top);
         let area = egui::Area::new(egui::Id::new("timeline_chip"))
             .order(egui::Order::Middle)
             .pivot(egui::Align2::RIGHT_BOTTOM)
-            .fixed_pos(map_rect.right_bottom() - egui::vec2(CHIP_INSET, CHIP_INSET))
+            .fixed_pos(egui::pos2(map_rect.right() - CHIP_INSET, bottom - CHIP_INSET))
             .show(ctx, |ui| {
                 egui::Frame::window(&ctx.global_style()).show(ui, |ui| {
                     let chip = ui.button(format!("\u{1f550} {}", self.active_time_label()));
@@ -244,9 +262,10 @@ impl super::Gui {
         let _ = area;
     }
 
-    /// The active pane's on-screen data time, as the timestamp chip and the
-    /// collapsed chip both print it. One function so the two cannot drift.
-    fn active_time_label(&self) -> String {
+    /// The active pane's on-screen data time, as the timestamp chip, the
+    /// collapsed chip and the bottom bar's Live chip all print it. One
+    /// function so the three cannot drift.
+    pub(super) fn active_time_label(&self) -> String {
         match self.panes[self.active_pane].data_time_on_screen() {
             Some(t) => self.preferences.timezone.format_naive_utc(t, "%H:%M:%S"),
             None => "--:--:--".to_owned(),

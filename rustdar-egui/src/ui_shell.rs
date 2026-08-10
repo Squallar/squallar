@@ -20,6 +20,12 @@
 //! drops a position covered by any layer above Background — no excluded-rect
 //! plumbing required.
 //!
+//! Below the Compact breakpoint the corner-floating pass stands down: the
+//! same flags present as pages of the phone sheet, drawn late in the frame by
+//! `ui_sheet.rs` through the same body renderers and the same take window —
+//! the shell keeps only the top bar there, and the status bar keeps nothing
+//! (its short scan summary lives in the phone top bar).
+//!
 //! # One take window for the stack and the inspector
 //!
 //! Both panels are about the active pane — the stack walks its `draw_order`
@@ -64,6 +70,30 @@ use crate::actions::GuiAction;
 use rustdar_overlays::render::overlay_state::OverlayKind;
 
 use super::{InspectorSelection, PaneState};
+
+/// Where a hosted surface goes this frame: the placement the caller decides
+/// so the body renderers never key anything on the width.
+///
+/// Two callers build these — the shell's floating pass here, and the phone
+/// sheet (`ui_sheet.rs`), which is exactly why the type exists: the stack and
+/// inspector keep one `Area` id and one internal structure whoever is
+/// positioning them, and the only thing that changes hands is this geometry.
+pub(super) struct SurfaceSlot {
+    /// Where the area's pivot corner goes.
+    pub pos: egui::Pos2,
+    pub pivot: egui::Align2,
+    /// The surface's content width.
+    pub width: f32,
+    /// Space for the whole surface, header included — each renderer charges
+    /// its own header allowance against it before capping its scroll body.
+    pub avail_height: f32,
+    /// Hosted inside the phone sheet: `Order::Foreground` (above the scrim)
+    /// and frameless (the sheet's own frame is the background). The frame
+    /// choice is id-neutral — `Frame::show` creates one child `Ui` either
+    /// way — which is what keeps the breakpoint id contract intact across
+    /// the host switch.
+    pub sheet: bool,
+}
 
 /// What the shell produced this frame.
 pub(super) struct ShellOutput {
@@ -120,11 +150,20 @@ impl super::Gui {
         // A Layer selection describes a map layer, and a pane with no map has
         // none — the stack shows it no rows to have selected one from. Snap
         // to the pane's own properties, which is what the inspector can still
-        // truthfully say about it. Before the take, off the live pane.
+        // truthfully say about it. Before the take, off the live pane — and
+        // at every width: the sheet pass below the breakpoint relies on this
+        // having run.
         if matches!(self.inspector_sel, InspectorSelection::Layer(_))
             && !self.panes[self.active_pane].is_map()
         {
             self.inspector_sel = InspectorSelection::PaneProps;
+        }
+
+        // Below the breakpoint the same flags present as sheet pages — the
+        // sheet pass late in the frame hosts the same bodies through the same
+        // take window (`ui_sheet.rs`); nothing floats at the map's corners.
+        if self.layout.width == crate::ui_layout::WidthClass::Compact {
+            return;
         }
 
         let stack_open = self.layers_panel_visible();
@@ -144,31 +183,40 @@ impl super::Gui {
             self.overlays.load_pane_configs(&pane.overlay_configs);
         }
 
-        // The rows' status lines, one per layer in the pane's own order.
-        // Radar's is the exception with a reason: the product and tilt are
-        // pane state — the radar handler holds only the layer toggle — so the
-        // line is read off the taken pane rather than asked of the registry.
-        let statuses: Vec<(OverlayKind, Option<String>)> = if stack_open && pane.is_map() {
-            pane.draw_order
-                .iter()
-                .map(|&kind| {
-                    let line = if kind == OverlayKind::Radar {
-                        radar_row_status(&pane)
-                    } else {
-                        self.overlays.status_line(kind)
-                    };
-                    (kind, line)
-                })
-                .collect()
+        let statuses: Vec<(OverlayKind, Option<String>)> = if stack_open {
+            self.stack_row_statuses(&pane)
         } else {
             Vec::new()
         };
 
         if stack_open {
-            self.render_stack(ctx, map_rect, &mut pane, &statuses, actions);
+            let slot = SurfaceSlot {
+                pos: map_rect.left_top()
+                    + egui::vec2(super::ui_stack::STACK_INSET, super::ui_stack::STACK_INSET),
+                pivot: egui::Align2::LEFT_TOP,
+                width: super::ui_stack::STACK_WIDTH,
+                avail_height: map_rect.height()
+                    - super::ui_stack::STACK_INSET
+                    - super::ui_stack::STACK_BOTTOM_CLEARANCE,
+                sheet: false,
+            };
+            self.render_stack(ctx, slot, &mut pane, &statuses, actions);
         }
         if self.insp_open {
-            self.render_inspector(ctx, map_rect, &mut pane, actions);
+            let slot = SurfaceSlot {
+                pos: map_rect.right_top()
+                    + egui::vec2(
+                        -super::ui_inspector::INSPECTOR_INSET,
+                        super::ui_inspector::INSPECTOR_INSET,
+                    ),
+                pivot: egui::Align2::RIGHT_TOP,
+                width: super::ui_inspector::INSPECTOR_WIDTH,
+                avail_height: map_rect.height()
+                    - super::ui_inspector::INSPECTOR_INSET
+                    - super::ui_inspector::INSPECTOR_BOTTOM_CLEARANCE,
+                sheet: false,
+            };
+            self.render_inspector(ctx, slot, &mut pane, actions);
         }
 
         self.panes[self.active_pane] = pane;
@@ -180,6 +228,34 @@ impl super::Gui {
         // setting called "Sync Layers". The reasoning is written out on
         // `propagate_layer_sync` itself.
         self.propagate_layer_sync();
+    }
+
+    /// The stack rows' status lines, one per layer in the pane's own order —
+    /// empty for a pane with no map, which has no rows to carry them.
+    ///
+    /// Radar's is the exception with a reason: the product and tilt are pane
+    /// state — the radar handler holds only the layer toggle — so the line
+    /// is read off the taken pane rather than asked of the registry. The
+    /// caller must have loaded the pane's configs into the registry first;
+    /// both the shell pass above and the sheet pass do.
+    pub(super) fn stack_row_statuses(
+        &self,
+        pane: &PaneState,
+    ) -> Vec<(OverlayKind, Option<String>)> {
+        if !pane.is_map() {
+            return Vec::new();
+        }
+        pane.draw_order
+            .iter()
+            .map(|&kind| {
+                let line = if kind == OverlayKind::Radar {
+                    radar_row_status(pane)
+                } else {
+                    self.overlays.status_line(kind)
+                };
+                (kind, line)
+            })
+            .collect()
     }
 }
 

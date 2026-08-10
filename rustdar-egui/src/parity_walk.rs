@@ -237,6 +237,21 @@ fn walk_menu(h: &mut InputHarness, width: WidthClass) {
 
     h.open_menu();
     for label in labels {
+        let visible = |h: &InputHarness| {
+            h.menu_leaf(label)
+                .is_some_and(|leaf| h.screen_rect().contains(leaf.rect.center()))
+        };
+        // The sheet's Menu page scrolls where the dropdown does not — work
+        // the list like a user before calling a leaf unreachable.
+        if !visible(h)
+            && width == WidthClass::Compact
+        {
+            let pos = h
+                .sheet_rect()
+                .expect("the Menu page is open, so the sheet has a rect")
+                .center();
+            h.scroll_until(pos, SCROLL_STEP, MAX_SCROLL_STEPS, visible);
+        }
         let leaf = h
             .menu_leaf(label)
             .unwrap_or_else(|| panic!("menu leaf {label:?} was never drawn on {width:?}"));

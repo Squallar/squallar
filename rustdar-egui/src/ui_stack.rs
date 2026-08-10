@@ -1,13 +1,15 @@
 //! The layer stack: one row per layer of the active pane, in draw order.
 //!
 //! One body for every shell. On Expanded it floats at the map's top-left,
-//! open by default; below the sidebar breakpoint the same body is the
-//! slide-over drawer, closed until the top bar's Layers toggle opens it —
+//! open by default; on Medium the same body is the slide-over drawer, closed
+//! until the top bar's Layers toggle opens it; on Compact it is the phone
+//! sheet's Layers page, in the slot `ui_sheet.rs` hands over —
 //! `Gui::layers_panel_visible` is the one definition of "open", exactly as it
 //! was for the panel this replaces. The area and scroll ids are the old
-//! panel's (`layers_panel`, `layers_scroll`) on purpose: egui's memory of the
-//! surface — its scroll offset above all — belongs to *the place the layers
-//! live*, not to which milestone's renderer is drawing it.
+//! panel's (`layers_panel`, `layers_scroll`) on purpose, at every one of the
+//! three hosts: egui's memory of the surface — its scroll offset above all —
+//! belongs to *the place the layers live*, not to which milestone's renderer
+//! or which width's host is drawing it.
 //!
 //! The rows walk the active pane's `draw_order` **reversed**, so the top row
 //! is drawn last — over everything — which is the reading the header's
@@ -30,21 +32,24 @@
 use crate::actions::GuiAction;
 use rustdar_overlays::render::overlay_state::OverlayKind;
 
+use super::shell::SurfaceSlot;
 use super::{InspectorSelection, PaneState};
 
 /// Width of the stack, in both its sidebar and drawer forms.
 ///
 /// One value, not two, because the panel keeps one egui id: a per-form width
 /// would make it jump when the window crossed the breakpoint, for no reason a
-/// user could see.
+/// user could see. (The phone sheet's Layers page is the exception with a
+/// reason: its slot is the sheet's own width, and the sheet is a different
+/// surface, not this panel at a third width.)
 pub(super) const STACK_WIDTH: f32 = 240.0;
 
 /// The stack's inset from the map's top-left corner.
-const STACK_INSET: f32 = 8.0;
+pub(super) const STACK_INSET: f32 = 8.0;
 
 /// What the stack leaves clear above the map's bottom edge: room for the
 /// status bar and the timeline transport floating there (plan §1.3).
-const STACK_BOTTOM_CLEARANCE: f32 = 88.0;
+pub(super) const STACK_BOTTOM_CLEARANCE: f32 = 88.0;
 
 /// What the header row and its separator cost above the scroll body — charged
 /// against the body's ceiling so the whole panel, header included, stays out
@@ -82,6 +87,9 @@ pub(crate) struct StackRowProbe {
     pub status_line: Option<String>,
     /// Whether the row was drawn as the inspector's current selection.
     pub selected: bool,
+    /// The trailing `›` chevron — drawn on the drawer and sheet hosts only
+    /// (plan §1.3), so `None` on the desktop sidebar.
+    pub chevron: Option<egui::Rect>,
 }
 
 /// What the stack drew last frame.
@@ -122,8 +130,8 @@ impl Default for StackProbe {
 }
 
 impl super::Gui {
-    /// The stack, floating at the map's top-left in whichever of its two
-    /// forms this width calls for.
+    /// The stack, in the slot its host chose — the map's top-left corner
+    /// from the shell, the sheet's body from the phone shell.
     ///
     /// `pane` is the active pane, `mem::take`n by the caller for the whole
     /// stack+inspector pass — nothing in here reads `self.panes[..]`, whose
@@ -134,14 +142,13 @@ impl super::Gui {
     pub(super) fn render_stack(
         &mut self,
         ctx: &egui::Context,
-        map_rect: egui::Rect,
+        slot: SurfaceSlot,
         pane: &mut PaneState,
         statuses: &[(OverlayKind, Option<String>)],
         actions: &mut Vec<GuiAction>,
     ) {
         let is_drawer = !self.layout.width.has_persistent_sidebar();
-        let max_body_height =
-            (map_rect.height() - STACK_INSET - STACK_BOTTOM_CLEARANCE - HEADER_ALLOWANCE).max(0.0);
+        let max_body_height = (slot.avail_height - HEADER_ALLOWANCE).max(0.0);
 
         // `Pane N (SITE)` reads off the taken pane — the live one.
         let title = format!(
@@ -156,13 +163,26 @@ impl super::Gui {
             ..StackProbe::default()
         };
 
+        // The sheet host swaps the frame and the order, never the id: the
+        // area — and every id chain hanging off it — is the same surface at
+        // every width (see `SurfaceSlot`).
+        let frame = if slot.sheet {
+            egui::Frame::NONE
+        } else {
+            egui::Frame::window(&ctx.global_style())
+        };
+        let order = if slot.sheet {
+            egui::Order::Foreground
+        } else {
+            egui::Order::Middle
+        };
         let area = egui::Area::new(egui::Id::new("layers_panel"))
-            .order(egui::Order::Middle)
-            .pivot(egui::Align2::LEFT_TOP)
-            .fixed_pos(map_rect.left_top() + egui::vec2(STACK_INSET, STACK_INSET))
+            .order(order)
+            .pivot(slot.pivot)
+            .fixed_pos(slot.pos)
             .show(ctx, |ui| {
-                egui::Frame::window(&ctx.global_style()).show(ui, |ui| {
-                    ui.set_width(STACK_WIDTH);
+                frame.show(ui, |ui| {
+                    ui.set_width(slot.width);
                     ui.horizontal(|ui| {
                         // Right-to-left so the collapse button owns the right
                         // edge and the title truncates in what is left.
@@ -330,6 +350,7 @@ impl super::Gui {
                                 down: (down.rect, row_idx < last),
                                 status_line: status.clone(),
                                 selected,
+                                chevron: None,
                             });
                         }
                         // Display row up = drawn later = towards the *end*
@@ -374,46 +395,61 @@ impl super::Gui {
                         self.set_pane_overlay_with_fetch(pane, idx, kind, !enabled, actions);
                     }
 
-                    // The name and status block: the row's click target.
-                    // Hidden layers render dimmed — weak text is the stock
-                    // theme's own dimming.
-                    ui.with_layout(
-                        egui::Layout::top_down_justified(egui::Align::LEFT),
-                        |ui| {
-                            ui.spacing_mut().item_spacing.y = 0.0;
-                            let name_text = if enabled {
-                                egui::RichText::new(name.as_str())
-                            } else {
-                                egui::RichText::new(name.as_str()).weak()
-                            };
-                            let select = ui.selectable_label(selected, name_text);
-                            let mut target = select.rect;
-                            if let Some(line) = &status {
-                                let drawn =
-                                    ui.label(egui::RichText::new(line.as_str()).small().weak());
-                                target = target.union(drawn.rect);
-                            }
+                    // A trailing `›` on the drawer and sheet hosts (plan
+                    // §1.3): there a row click *pushes* the inspector over
+                    // this list, and the chevron says so. The desktop
+                    // sidebar, where the inspector opens beside the stack,
+                    // carries none. Right-to-left so the chevron owns the
+                    // edge and the name block takes what is left — the
+                    // header's own device.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if is_drawer {
+                            let chevron =
+                                ui.label(egui::RichText::new("\u{203a}").weak());
                             #[cfg(test)]
                             if let Some(row) = probe.rows.last_mut() {
-                                row.rect = target;
+                                row.chevron = Some(chevron.rect);
                             }
                             #[cfg(not(test))]
-                            let _ = target;
-                            if select.clicked() {
-                                self.select_layer(kind);
-                                // Transitional, until M6's sheet: on the one
-                                // width where the right slide-over lands on
-                                // top of the drawer, the drawer yields — the
-                                // options the user just asked for must not
-                                // open underneath it.
-                                if is_drawer
-                                    && self.layout.width == crate::ui_layout::WidthClass::Compact
-                                {
-                                    self.drawer_open = false;
+                            let _ = chevron;
+                        }
+
+                        // The name and status block: the row's click target.
+                        // Hidden layers render dimmed — weak text is the
+                        // stock theme's own dimming.
+                        ui.with_layout(
+                            egui::Layout::top_down_justified(egui::Align::LEFT),
+                            |ui| {
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                let name_text = if enabled {
+                                    egui::RichText::new(name.as_str())
+                                } else {
+                                    egui::RichText::new(name.as_str()).weak()
+                                };
+                                let select = ui.selectable_label(selected, name_text);
+                                let mut target = select.rect;
+                                if let Some(line) = &status {
+                                    let drawn = ui
+                                        .label(egui::RichText::new(line.as_str()).small().weak());
+                                    target = target.union(drawn.rect);
                                 }
-                            }
-                        },
-                    );
+                                #[cfg(test)]
+                                if let Some(row) = probe.rows.last_mut() {
+                                    row.rect = target;
+                                }
+                                #[cfg(not(test))]
+                                let _ = target;
+                                if select.clicked() {
+                                    // The inspector opens over or beside
+                                    // this list per host; the list stays
+                                    // open beneath either way — the M3-era
+                                    // rule that closed the Compact drawer
+                                    // died with the slide-over it served.
+                                    self.select_layer(kind);
+                                }
+                            },
+                        );
+                    });
                 });
             });
         }

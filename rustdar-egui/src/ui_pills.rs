@@ -378,7 +378,13 @@ impl super::Gui {
         // On the next pass the rows are no longer new and the request
         // sticks; egui's ordinary click-to-front governs the overlap from
         // there, exactly as it does between two windows.
-        if std::mem::take(&mut self.pills_raise_pending) {
+        // Off-Compact only: below the breakpoint the panels are sheet-hosted
+        // at `Order::Foreground` (the layering note in `ui_sheet.rs`), and
+        // raising the Middle ids here would register phantom layers no frame
+        // draws.
+        if std::mem::take(&mut self.pills_raise_pending)
+            && self.layout.width != crate::ui_layout::WidthClass::Compact
+        {
             if self.layers_panel_visible() {
                 ctx.move_to_top(egui::LayerId::new(
                     egui::Order::Middle,

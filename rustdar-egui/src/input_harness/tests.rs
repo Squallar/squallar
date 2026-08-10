@@ -1973,7 +1973,11 @@ fn crossing_a_breakpoint_does_not_move_any_widget_id() {
     );
 
     // ...and across the 600pt breakpoint too, so all three widths resolve
-    // the same ids.
+    // the same ids. This is the hardest case: below 600pt the panels are
+    // sheet pages, one at a time — the settings page is on top, so the
+    // stack's ids are off screen until it is closed — but every id that IS
+    // on screen must be the id the wider hosts used, or the host switch
+    // silently orphans the state egui keyed on it.
     h.set_screen(egui::vec2(500.0, 500.0));
     h.set_drawer_open(true);
     assert_eq!(
@@ -1981,10 +1985,40 @@ fn crossing_a_breakpoint_does_not_move_any_widget_id() {
         crate::ui_layout::WidthClass::Compact,
         "precondition: the resize crossed the 600pt breakpoint"
     );
+    let compact_probes = h.widget_id_probes();
+    assert!(
+        compact_probes
+            .iter()
+            .any(|(name, _)| *name == "inspector_scroll"),
+        "precondition: the sheet's Inspector page must be up and reporting"
+    );
+    for probe in &compact_probes {
+        assert!(
+            expanded.contains(probe),
+            "{:?} resolved a different id inside the sheet than in the \
+             floating hosts — the host switch re-keyed it",
+            probe.0
+        );
+    }
+
+    // Close the settings page; the Layers page beneath comes to the top,
+    // under the same scroll id, with the offset stored behind it intact.
+    h.close_inspector();
+    let restored = h
+        .widget_id_probes()
+        .iter()
+        .find(|(name, _)| *name == "layers_scroll")
+        .expect("the sheet's Layers page must report the stack's scroll id")
+        .1;
     assert_eq!(
-        expanded,
-        h.widget_id_probes(),
-        "the compact layout must reuse the same ids as well"
+        restored, scroll_id,
+        "the sheet's Layers page keys its scroll area on a different id, so \
+         everything egui remembered under the old one is orphaned"
+    );
+    assert_eq!(
+        h.scroll_offset(scroll_id),
+        scrolled,
+        "the scroll position did not survive the 600pt host switch"
     );
 }
 
@@ -2054,15 +2088,39 @@ fn the_map_is_full_bleed_under_the_top_bar() {
                      map is not exactly the content rect minus the top bar"
                 );
 
-                // Every floating surface floats *inside* the map.
-                for (name, rect) in [
-                    ("status bar", h.status_bar().rect),
-                    ("timeline", h.timeline().rect),
-                ] {
+                // Every floating surface floats *inside* the map. The phone
+                // shell swaps the status bar for the bottom bar (and the
+                // sheet, while the drawer flag has a page open).
+                let mut floating = vec![("timeline", h.timeline().rect)];
+                if expected == crate::ui_layout::WidthClass::Compact {
+                    assert_eq!(
+                        h.status_bar().rect,
+                        egui::Rect::NOTHING,
+                        "the phone shell drew a status bar it does not have"
+                    );
+                    floating.push(("bottom bar", h.bottom_bar().rect));
+                    if let Some(sheet) = h.sheet_rect() {
+                        floating.push(("sheet", sheet));
+                    }
+                } else {
+                    floating.push(("status bar", h.status_bar().rect));
+                }
+                for (name, rect) in floating {
                     assert!(
                         panel.contains_rect(rect),
                         "{expected:?} (drawer={drawer}, insets={insets:?}): \
                          the {name} at {rect:?} is not inside the map {panel:?}"
+                    );
+                }
+                // The inline transport sits above the bottom bar, not on it.
+                if expected == crate::ui_layout::WidthClass::Compact {
+                    assert!(
+                        h.timeline().rect.bottom() <= h.bottom_bar().rect.top(),
+                        "{expected:?} (drawer={drawer}, insets={insets:?}): \
+                         the inline timeline at {:?} runs into the bottom bar \
+                         at {:?}",
+                        h.timeline().rect,
+                        h.bottom_bar().rect
                     );
                 }
                 if h.layers_panel_on_screen() {
@@ -2095,11 +2153,13 @@ fn the_map_is_full_bleed_under_the_top_bar() {
 
 // ── The menu, through the top bar's ☰ dropdown ───────────────────────
 
-/// A compact harness with the ☰ dropdown open — the phone width, driven
-/// through the same dropdown every other width gets. Compact is still the
-/// interesting fixture: it is the width with the least room for the popup
-/// and the one the old drawer-hosted menu served, so anything the dropdown
-/// strands is stranded here first.
+/// A compact harness with the menu open — the sheet's Menu page since the
+/// phone shell: `open_menu` routes through the bottom bar's Menu item down
+/// here, and the leaves come off `render_menu_drawer` over the same model
+/// the ☰ dropdown renders on the wide widths. Compact is still the
+/// interesting fixture: it is the width with the least room and the one the
+/// old drawer-hosted menu served, so anything a presentation strands is
+/// stranded here first.
 fn compact_with_menu() -> InputHarness {
     let mut h = InputHarness::with_screen(egui::vec2(420.0, 1200.0));
     assert_eq!(
@@ -2441,14 +2501,16 @@ fn a_menu_toggle_propagates_to_the_other_panes_when_sync_is_on() {
 // 19 retired (synthesis-m1): the drawer no longer hosts the menu; contract
 // 76 below holds the ☰ dropdown to carrying the whole menu at every width.
 
-/// 76. **The ☰ dropdown carries the whole menu at every width.**
+/// 76. **The menu carries the whole model at every width — the ☰ dropdown
+///     on the wide widths, the sheet's Menu page on the phone.**
 ///
-///     The top bar is the one route to Settings, Time, Exit, Refresh and
-///     every toggle, on the phone as on the desktop. The wanted labels are
-///     the model's own (`menu_model_leaf_labels`), so a new entry joins
-///     this audit by construction and a renderer that drops one fails it —
-///     naming the label and the width, since "reachable on a desktop" and
-///     "reachable on a phone" are separate claims.
+///     One route to Settings, Time, Exit, Refresh and every toggle per
+///     shell: the top bar's dropdown at ≥600pt, the bottom bar's Menu item
+///     below it. The wanted labels are the model's own
+///     (`menu_model_leaf_labels`), so a new entry joins this audit by
+///     construction and a renderer that drops one fails it — naming the
+///     label and the width, since "reachable on a desktop" and "reachable
+///     on a phone" are separate claims.
 #[test]
 fn the_app_menu_dropdown_carries_the_whole_menu_at_every_width() {
     for (size, expected) in [
@@ -2474,6 +2536,15 @@ fn the_app_menu_dropdown_carries_the_whole_menu_at_every_width() {
         );
 
         h.open_menu();
+        if expected == crate::ui_layout::WidthClass::Compact {
+            // The phone half of the contract: the whole menu is the sheet's
+            // Menu page, not a popup squeezed onto a phone.
+            assert_eq!(
+                h.sheet().page,
+                Some(crate::ui::SheetPage::Menu),
+                "the phone menu must be the sheet's Menu page"
+            );
+        }
         let drawn: Vec<&str> = h.menu_leaves().iter().map(|l| l.label).collect();
         for wanted in h.menu_leaf_labels() {
             let leaf = h.menu_leaf(wanted).unwrap_or_else(|| {
@@ -2578,6 +2649,13 @@ fn the_pane_picker_offers_fewer_panes_on_a_phone_than_on_a_desktop() {
         crate::ui_layout::WidthClass::Compact,
         "precondition"
     );
+    // The phone top bar has no segments (plan §1.2): the sheet's Layers
+    // page header carries them, so the picker is read with that page open.
+    assert!(
+        compact.pane_option_counts().is_empty(),
+        "the phone top bar drew pane segments it should not carry"
+    );
+    compact.open_layers();
     assert_eq!(
         compact.pane_option_counts(),
         (1..=MAX_PANES_DESKTOP).collect::<Vec<_>>(),
@@ -2874,9 +2952,20 @@ fn a_fresh_session_opens_the_sidebar_only_where_it_is_persistent() {
             "{expected:?}: fresh state must show the panel only where the \
              sidebar is persistent"
         );
+        // The control that answers for the panel differs by shell: the top
+        // bar's toggle on the wide widths, the bottom bar's Layers item on
+        // the phone.
+        let toggle_open = if expected == crate::ui_layout::WidthClass::Compact {
+            assert!(
+                h.bottom_bar().layers.0.is_positive(),
+                "{expected:?}: the phone shell drew no bottom-bar Layers item"
+            );
+            h.bottom_bar().layers.1
+        } else {
+            h.top_bar().layers_toggle.1
+        };
         assert_eq!(
-            h.top_bar().layers_toggle.1,
-            open,
+            toggle_open, open,
             "{expected:?}: the toggle's drawn state disagrees with the \
              panel it controls"
         );
@@ -3127,12 +3216,14 @@ fn a_dismiss_with_the_dropdown_open_closes_it_and_only_it() {
     );
 }
 
-/// 83b. **Android's back closes the dropdown with no key event at all.**
+/// 83b. **Android's back closes the menu with no key event at all.**
 ///
-///      The other route: a logical back press never enters egui's queue,
-///      so the popup's own Escape handling cannot see it and the request
-///      flag is the only thing standing between the press and a popup
-///      that stays open over whatever the press closed behind it.
+///      The other route: a logical back press never enters egui's queue.
+///      On the wide widths the popup's own Escape handling cannot see it
+///      and the request flag is what closes the dropdown; on the phone the
+///      menu is the sheet's Menu page and the chain's `menu_open` arm is
+///      the whole mechanism — this fixture is the phone, so it pins that
+///      arm.
 #[test]
 fn an_android_back_press_closes_the_dropdown_without_a_key_event() {
     let mut h = compact_with_menu();
@@ -3794,14 +3885,19 @@ fn host_insets_move_the_breakpoint_through_the_real_ui() {
 ///
 ///     Keying it on `WidthClass` gets both ends wrong: a 500pt desktop
 ///     window loses a readout it can use, a 1400pt tablet gets an empty one.
+///
+///     Since the phone shell the *host* follows the width — Compact has no
+///     status bar, so the readout lives in the phone top bar there — but
+///     whether a readout exists at all stays the modality's question alone.
 #[test]
 fn the_hover_readout_follows_the_modality_not_the_width() {
-    // A narrow *desktop* window: compact, but there is a mouse.
+    // A narrow *desktop* window: compact, but there is a mouse — the phone
+    // top bar hosts the readout.
     let mut narrow = InputHarness::with_screen(egui::vec2(500.0, 800.0));
     narrow.mouse_click(narrow.map_center());
     assert_eq!(narrow.width_class(), crate::ui_layout::WidthClass::Compact);
     assert!(
-        narrow.status_bar().hover,
+        narrow.top_bar().hover,
         "a compact window with a mouse lost its hover readout"
     );
 
@@ -3810,36 +3906,53 @@ fn the_hover_readout_follows_the_modality_not_the_width() {
     tablet.touch_tap(tablet.map_center());
     assert_eq!(tablet.width_class(), crate::ui_layout::WidthClass::Expanded);
     assert!(
-        !tablet.status_bar().hover,
+        !tablet.status_bar().hover && !tablet.top_bar().hover,
         "a touch device was given a hover readout that can never fill in"
+    );
+
+    // ...and a *touch* phone gets none either: the phone bar hosts the
+    // readout for a mouse, not for the width.
+    let mut touch_phone = InputHarness::with_screen(egui::vec2(420.0, 900.0));
+    touch_phone.touch_tap(touch_phone.map_center());
+    assert_eq!(
+        touch_phone.width_class(),
+        crate::ui_layout::WidthClass::Compact
+    );
+    assert!(
+        !touch_phone.top_bar().hover,
+        "a touch phone's top bar drew a hover readout that can never fill in"
     );
 }
 
-/// 26. **A compact bar drops the long summary and the poll chip — and the
-///     Auto-poll toggle stays reachable through the menu everywhere.**
+/// 26. **The phone top bar carries the short scan text; the long form stays
+///     on the desktop status bar — and the Auto-poll toggle stays reachable
+///     through the menu everywhere.**
 ///
-///     The half left unpinned when one flag became two: inverting `roomy`
-///     crammed both into a 420pt phone bar and stripped both from a 1400pt
-///     desktop, suite green. Asserted on the text drawn, not the flag.
+///     The compact status bar's successor claim: the phone shell draws no
+///     status bar at all, so the short scan summary the compact bar used to
+///     carry lives in the phone top bar's chip — site, time, posture glyph —
+///     while the long form (date, product count, poll chip) stays where the
+///     room is. Asserted on the text drawn, not the flag.
 ///
 ///     Since the full-bleed flip the auto-poll *checkbox* is a display
-///     chip; the toggle itself lives in the ☰ menu. The menu assertion is
-///     what keeps that a move rather than a removal.
+///     chip; the toggle itself lives in the menu. The menu assertion is
+///     what keeps that a move rather than a removal — through the sheet's
+///     Menu page on the phone, the ☰ dropdown on the desktop.
 #[test]
 fn a_compact_status_bar_drops_the_long_summary_and_the_auto_poll_box() {
     let mut phone = InputHarness::with_screen(egui::vec2(420.0, 900.0));
     phone.load_scan("KABR");
     assert_eq!(phone.width_class(), crate::ui_layout::WidthClass::Compact);
-    let compact_bar = phone.status_bar();
 
     let mut desk = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     desk.load_scan("KABR");
     assert_eq!(desk.width_class(), crate::ui_layout::WidthClass::Expanded);
     let roomy_bar = desk.status_bar();
 
-    assert!(
-        compact_bar.poll_chip.is_none(),
-        "the auto-poll chip was crammed into a compact status bar"
+    assert_eq!(
+        phone.status_bar().rect,
+        egui::Rect::NOTHING,
+        "the phone shell drew a status bar it does not have"
     );
     let (_, chip_text) = roomy_bar
         .poll_chip
@@ -3850,8 +3963,8 @@ fn a_compact_status_bar_drops_the_long_summary_and_the_auto_poll_box() {
         "the chip must name the state it shows, got {chip_text:?}"
     );
 
-    // The chip is display-only; the toggle lives in the ☰ menu — at every
-    // width, so the compact bar dropping the chip strands nothing.
+    // The chip is display-only; the toggle lives in the menu — reachable at
+    // every width, so the phone shell dropping the bar strands nothing.
     for h in [&mut phone, &mut desk] {
         h.open_menu();
         assert_eq!(
@@ -3864,11 +3977,20 @@ fn a_compact_status_bar_drops_the_long_summary_and_the_auto_poll_box() {
 
     // Both forms name the site, so the difference is the *detail*: only the
     // long form carries the date and the product count.
+    let scan_chip = phone.top_bar().scan_text;
     assert!(
-        compact_bar.scan_text.contains("KABR") && roomy_bar.scan_text.contains("KABR"),
-        "precondition: both forms should name the site, got {:?} and {:?}",
-        compact_bar.scan_text,
+        scan_chip.contains("KABR") && roomy_bar.scan_text.contains("KABR"),
+        "precondition: both forms should name the site, got {scan_chip:?} \
+         and {:?}",
         roomy_bar.scan_text
+    );
+    assert!(
+        scan_chip.contains("\u{26a1}"),
+        "the phone chip must carry the live/archive posture glyph: {scan_chip:?}"
+    );
+    assert!(
+        phone.text_painted_in(phone.top_bar().rect, &scan_chip),
+        "the chip's text must actually be painted in the top bar"
     );
     assert!(
         roomy_bar.scan_text.contains("2 products") && roomy_bar.scan_text.contains("2026-07-24"),
@@ -3876,10 +3998,8 @@ fn a_compact_status_bar_drops_the_long_summary_and_the_auto_poll_box() {
         roomy_bar.scan_text
     );
     assert!(
-        !compact_bar.scan_text.contains("products")
-            && !compact_bar.scan_text.contains("2026-07-24"),
-        "the compact bar drew the long scan summary: {:?}",
-        compact_bar.scan_text
+        !scan_chip.contains("products") && !scan_chip.contains("2026-07-24"),
+        "the phone chip drew the long scan summary: {scan_chip:?}"
     );
 }
 
@@ -4688,28 +4808,25 @@ fn day_old_data_reads_in_hours() {
         h.painted_text_strings()
     );
 
-    // A narrow bar drops the date, as the scan line beside it does, but
-    // never the age — that is the whole message.
+    // The phone has no status bar to carry the line — the timeline's age
+    // chip is where the age lives down there, and it must read on the same
+    // hour scale, or a downed site's day-old field looks minutes stale on
+    // exactly the screen most likely to be glanced at.
     let mut phone = InputHarness::with_screen(egui::vec2(420.0, 900.0));
     phone.load_scan("KTLX");
     phone.set_data_time(0, Some(written_ago(26 * 60 + 5)));
-    let compact = phone.status_bar();
-    let drawn = compact
-        .product_age_text
-        .as_deref()
-        .expect("a compact bar must still report the age");
     assert!(
-        drawn.starts_with("Data ") && drawn.contains("(26h 5m old)"),
-        "the compact form should be short and still carry the age, got \
-             {drawn:?}"
+        phone.status_bar().rect == egui::Rect::NOTHING,
+        "the phone shell drew a status bar"
+    );
+    let age = phone.timeline().age_text;
+    assert_eq!(
+        age, "26h 5m old",
+        "the phone timeline's age chip must carry the age in hours"
     );
     assert!(
-        !drawn.contains("Data:"),
-        "the compact bar drew the roomy form: {drawn:?}"
-    );
-    assert!(
-        !drawn.contains("L3") && !drawn.contains("Level III"),
-        "nor may the compact form name a datasource: {drawn:?}"
+        !age.contains("L3") && !age.contains("Level III"),
+        "nor may the chip name a datasource: {age:?}"
     );
 }
 
@@ -5294,11 +5411,32 @@ fn crossing_a_breakpoint_re_keys_nothing() {
          discarded on every resize past 600pt"
     );
 
-    // ...and the ids that key stored state are the same ids, with the
-    // state stored under them still there.
+    // ...and the ids that key stored state are the same ids. Below 600pt
+    // the panels are sheet pages, one at a time — the settings page is on
+    // top — so the comparison is per id on screen rather than list-equal.
+    let compact_probes = h.widget_id_probes();
+    assert!(
+        compact_probes
+            .iter()
+            .any(|(name, _)| *name == "inspector_scroll"),
+        "precondition: the sheet's Inspector page must be up and reporting"
+    );
+    for probe in &compact_probes {
+        assert!(
+            probes.contains(probe),
+            "{:?} moved with the layout across the 600pt host switch",
+            probe.0
+        );
+    }
+    // The stack's page beneath keeps its id and the state stored under it.
+    h.close_inspector();
     assert_eq!(
-        probes,
-        h.widget_id_probes(),
+        h.widget_id_probes()
+            .iter()
+            .find(|(name, _)| *name == "layers_scroll")
+            .expect("the Layers page must report the stack's scroll id")
+            .1,
+        scroll_id,
         "a widget id that keys stored state moved with the layout"
     );
     assert_eq!(
@@ -9780,3 +9918,685 @@ fn saving_a_preset_under_an_existing_name_replaces_it_case_insensitively() {
         .collect();
     assert_eq!(tiles.len(), 1, "exactly one tile carries the name");
 }
+
+// ── The phone shell: bottom bar and sheet ────────────────────────────
+
+/// A phone-sized harness: the Compact shell with the bottom bar and the
+/// sheet. Tall, like the drawer fixture, so sheet pages have room to lay
+/// their content out on screen.
+fn phone() -> InputHarness {
+    let h = InputHarness::with_screen(egui::vec2(420.0, 1400.0));
+    assert_eq!(
+        h.width_class(),
+        crate::ui_layout::WidthClass::Compact,
+        "precondition: the phone shell only exists below 600pt"
+    );
+    h
+}
+
+/// An overlay item whose details page is a fixed stub — how a test opens the
+/// sheet's Feature page without staging a real alert under a map click. The
+/// concrete items are `pub(crate)` to `rustdar-overlays`; the trait is not.
+#[derive(Debug)]
+struct SheetStubFeature;
+
+impl rustdar_overlays::render::overlay_state::OverlayItem for SheetStubFeature {
+    fn kind(&self) -> OverlayKind {
+        OverlayKind::NwsAlerts
+    }
+    fn popup_content(
+        &self,
+        _prefs: &rustdar_units::UserPreferences,
+    ) -> rustdar_overlays::render::overlay_state::PopupContent {
+        rustdar_overlays::render::overlay_state::PopupContent {
+            title: "Stub feature".to_owned(),
+            accent_rgb: [200, 60, 60],
+            width: 300.0,
+            sections: vec![rustdar_overlays::render::overlay_state::PopupSection::Text(
+                "stub body".to_owned(),
+            )],
+            actions: Vec::new(),
+        }
+    }
+    fn matches(&self, _other: &dyn rustdar_overlays::render::overlay_state::OverlayItem) -> bool {
+        false
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// 64. **The bottom bar's items toggle their own page and switch between
+///     pages.**
+///
+///     Tapping the item whose page is on top clears that page's flag — the
+///     sheet pops to whatever is beneath, or closes — and tapping a
+///     different item switches to its page. Pane and App are both the
+///     Inspector page and differ only in the selection they assert, so
+///     switching between them changes the body without closing the sheet.
+#[test]
+fn the_bottom_bar_toggles_its_pages_and_switches_between_them() {
+    let mut h = phone();
+    assert_eq!(h.sheet().page, None, "a fresh session's sheet is closed");
+
+    // Layers opens its page, highlighted.
+    h.mouse_click(h.bottom_bar().layers.0.center());
+    h.warm_up();
+    assert_eq!(h.sheet().page, Some(crate::ui::SheetPage::Layers));
+    assert!(h.bottom_bar().layers.1, "the open page's item must highlight");
+
+    // A different item switches pages; the Layers flag stays set beneath.
+    h.mouse_click(h.bottom_bar().pane.0.center());
+    h.warm_up();
+    assert_eq!(h.sheet().page, Some(crate::ui::SheetPage::Inspector));
+    assert_eq!(
+        h.inspector().mode,
+        Some(crate::ui::InspectorSelection::PaneProps),
+        "the Pane item must assert the pane-properties body"
+    );
+    assert!(
+        h.bottom_bar().pane.1 && !h.bottom_bar().layers.1,
+        "the highlight must follow the page on top"
+    );
+
+    // App is the same page under a different selection: the body switches,
+    // the sheet stays.
+    h.mouse_click(h.bottom_bar().app.0.center());
+    h.warm_up();
+    assert_eq!(h.sheet().page, Some(crate::ui::SheetPage::Inspector));
+    assert_eq!(
+        h.inspector().mode,
+        Some(crate::ui::InspectorSelection::AppSettings),
+        "the App item must assert the settings body"
+    );
+    assert!(
+        h.bottom_bar().app.1 && !h.bottom_bar().pane.1,
+        "same page, but the highlight follows the selection"
+    );
+
+    // The same item again closes its page — popping to the Layers page the
+    // switch left open beneath.
+    h.mouse_click(h.bottom_bar().app.0.center());
+    h.warm_up();
+    assert_eq!(
+        h.sheet().page,
+        Some(crate::ui::SheetPage::Layers),
+        "closing the top page must reveal the one beneath, not the map"
+    );
+
+    // ...and closing the last page closes the sheet.
+    h.mouse_click(h.bottom_bar().layers.0.center());
+    h.warm_up();
+    assert_eq!(h.sheet().page, None, "the last page's toggle closes the sheet");
+
+    // The Menu item follows the same toggle contract.
+    h.mouse_click(h.bottom_bar().menu.0.center());
+    h.warm_up();
+    assert_eq!(h.sheet().page, Some(crate::ui::SheetPage::Menu));
+    assert!(h.bottom_bar().menu.1);
+    h.mouse_click(h.bottom_bar().menu.0.center());
+    h.warm_up();
+    assert_eq!(h.sheet().page, None, "the Menu item's second tap closes it");
+}
+
+/// 71. **Dialogs are modals at ≥600pt and sheet pages below it — the phone
+///     never draws a modal.**
+///
+///     One flag, two presentations (plan §1.9): `catalog_open` is an
+///     `egui::Modal` on the desktop and the sheet's full-height Catalog
+///     page on the phone; `time_dialog.show` is a window there and the Time
+///     page here; a selected feature is the pager window there and the
+///     Feature page here. The modal-absence half is read off egui's own
+///     area bookkeeping: a fresh phone session that never drew the modal
+///     has no state under its id to have drawn it with.
+#[test]
+fn dialogs_are_modals_on_wide_screens_and_sheet_pages_on_the_phone() {
+    // Desktop: the catalog is a modal, and no sheet exists to host it.
+    let mut desk = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    desk.open_catalog();
+    assert_eq!(desk.sheet().page, None, "no sheet on a desktop");
+    assert!(
+        desk.area_rect(egui::Id::new("add_layer_catalog")).is_some(),
+        "the desktop catalog must be the egui Modal"
+    );
+    // Backdrop click closes — the modal's own contract.
+    desk.mouse_click(egui::pos2(40.0, 400.0));
+    desk.warm_up();
+    assert!(!desk.catalog().open, "the modal's backdrop click must close it");
+
+    // Phone: the same flag presents as the sheet's Catalog page, at forced
+    // Full extent, and the Modal is never created.
+    let mut h = phone();
+    h.open_catalog();
+    let sheet = h.sheet();
+    assert_eq!(sheet.page, Some(crate::ui::SheetPage::Catalog));
+    assert_eq!(
+        sheet.extent,
+        crate::ui::SheetExtent::Full,
+        "the catalog is a full-height page (plan §1.10)"
+    );
+    assert!(
+        h.area_rect(egui::Id::new("add_layer_catalog")).is_none(),
+        "the phone drew the catalog Modal it must never draw"
+    );
+    let sheet_rect = h.sheet_rect().expect("the sheet is open");
+    let search = h.catalog().search;
+    assert!(
+        sheet_rect.contains_rect(search),
+        "the catalog's search field at {search:?} is not inside the sheet \
+         {sheet_rect:?}"
+    );
+
+    // The scrim is the backdrop: a click above the sheet closes the top
+    // page, revealing the Layers page the catalog was opened from.
+    let above = egui::pos2(sheet_rect.center().x, sheet_rect.top() - 12.0);
+    assert!(
+        above.y > h.top_bar().rect.bottom(),
+        "precondition: the backdrop click must land on the scrim, not the bar"
+    );
+    h.mouse_click(above);
+    h.warm_up();
+    assert!(!h.catalog().open, "the scrim click must close the catalog");
+    assert_eq!(
+        h.sheet().page,
+        Some(crate::ui::SheetPage::Layers),
+        "closing the catalog must reveal the page beneath"
+    );
+
+    // The Time dialog: the timeline's timestamp opens the Time page, and
+    // the phone never draws the Set Time window.
+    h.close_layers();
+    let (stamp, _) = h.timeline().timestamp;
+    h.mouse_click(stamp.center());
+    h.warm_up();
+    assert_eq!(h.sheet().page, Some(crate::ui::SheetPage::Time));
+    assert!(
+        h.text_painted_in(h.sheet_rect().expect("open"), "Select Time"),
+        "the Time page must carry the dialog body"
+    );
+    assert!(
+        h.area_rect(egui::Id::new("Set Time")).is_none(),
+        "the phone drew the Set Time window it must never draw"
+    );
+    assert!(h.gui_mut().dismiss_top_layer(), "close the time page again");
+    h.warm_up();
+
+    // A selected feature: the Feature page, never the pager window.
+    h.gui_mut().overlays.selected_overlays = vec![std::sync::Arc::new(SheetStubFeature)];
+    h.warm_up();
+    let sheet = h.sheet();
+    assert_eq!(sheet.page, Some(crate::ui::SheetPage::Feature));
+    assert_eq!(
+        sheet.title, "Stub feature",
+        "the sheet's title row must carry the feature's own title"
+    );
+    assert!(
+        h.text_painted_in(h.sheet_rect().expect("open"), "stub body"),
+        "the Feature page must render the feature's sections"
+    );
+    assert!(
+        h.area_rect(egui::Id::new("overlay_pager_popup")).is_none(),
+        "the phone drew the pager window it must never draw"
+    );
+}
+
+/// 75. **The phone top bar shares the status bar's collapse state:
+///     collapsed, only the wordmark and the restore button remain.**
+///
+///     One field (`statusbar_collapsed`), two bars by width — §1.6's rule:
+///     the phone has no status bar, so the collapse the ◧ means lives on
+///     the bar that carries the scan text. Crossing the breakpoint carries
+///     the state across, in both directions, because it is the same state.
+#[test]
+fn the_phone_top_bar_shares_the_status_collapse_state() {
+    let mut h = phone();
+    h.load_scan("KABR");
+    let bar = h.top_bar();
+    assert!(
+        !bar.scan_text.is_empty() && bar.section_arm.0.is_positive(),
+        "precondition: the expanded phone bar carries the chip and the arms"
+    );
+
+    h.mouse_click(bar.collapse.center());
+    h.warm_up();
+    let collapsed = h.top_bar();
+    assert!(
+        collapsed.scan_text.is_empty(),
+        "the collapsed bar still carried the scan chip"
+    );
+    assert!(
+        !collapsed.section_arm.0.is_positive() && !collapsed.region_arm.0.is_positive(),
+        "the collapsed bar still drew the arm toggles"
+    );
+    assert!(
+        h.text_painted_in(collapsed.rect, "RUST"),
+        "the wordmark must survive the collapse"
+    );
+    assert!(
+        !h.text_painted_in(collapsed.rect, "KABR"),
+        "the scan text was still painted while collapsed"
+    );
+
+    // The state is the status bar's: widen past the breakpoint and the
+    // status bar comes back collapsed.
+    h.set_screen(egui::vec2(1400.0, 900.0));
+    assert!(
+        h.status_bar().collapsed,
+        "the phone bar's collapse did not reach the status bar it shares \
+         state with"
+    );
+
+    // ...and the restore crosses back the other way.
+    h.mouse_click(h.status_bar().collapse.center());
+    h.warm_up();
+    assert!(!h.status_bar().collapsed, "precondition: restored");
+    h.set_screen(egui::vec2(420.0, 1400.0));
+    assert!(
+        !h.top_bar().scan_text.is_empty(),
+        "the status bar's restore did not reach the phone bar"
+    );
+}
+
+/// **The sheet's handle snaps Half ↔ Full, and a deep drag-down dismisses**
+/// (plan §1.13): the release decides what the drag meant — past the midpoint
+/// towards Full snaps Full, back below it snaps Half, and a release more
+/// than a quarter below the Half height clears every page flag.
+#[test]
+fn the_sheet_handle_snaps_between_half_full_and_dismissal() {
+    let mut h = phone();
+    h.open_layers();
+    assert_eq!(h.sheet().extent, crate::ui::SheetExtent::Half);
+    let half_height = h.sheet_rect().expect("open").height();
+
+    // Up, well past the midpoint: Full.
+    let start = h.sheet().handle.center();
+    h.mouse_press(start);
+    h.frame_after(FRAME_DT);
+    for step in 1..=6 {
+        h.mouse_move(start - egui::vec2(0.0, 80.0 * step as f32));
+        h.frame_after(FRAME_DT);
+    }
+    h.mouse_release(start - egui::vec2(0.0, 480.0));
+    h.warm_up();
+    assert_eq!(
+        h.sheet().extent,
+        crate::ui::SheetExtent::Full,
+        "a release past the midpoint must snap to Full"
+    );
+    let full_height = h.sheet_rect().expect("still open").height();
+    assert!(
+        full_height > half_height + 100.0,
+        "Full must actually be taller: {half_height} -> {full_height}"
+    );
+
+    // Down, back below the midpoint but above the dismiss band: Half.
+    let start = h.sheet().handle.center();
+    h.mouse_press(start);
+    h.frame_after(FRAME_DT);
+    for step in 1..=6 {
+        h.mouse_move(start + egui::vec2(0.0, 80.0 * step as f32));
+        h.frame_after(FRAME_DT);
+    }
+    h.mouse_release(start + egui::vec2(0.0, 480.0));
+    h.warm_up();
+    assert_eq!(
+        h.sheet().extent,
+        crate::ui::SheetExtent::Half,
+        "a release back below the midpoint must snap to Half"
+    );
+
+    // Down again, deep into the dismiss band: the sheet goes, flags and all.
+    let start = h.sheet().handle.center();
+    h.mouse_press(start);
+    h.frame_after(FRAME_DT);
+    for step in 1..=5 {
+        h.mouse_move(start + egui::vec2(0.0, 80.0 * step as f32));
+        h.frame_after(FRAME_DT);
+    }
+    h.mouse_release(start + egui::vec2(0.0, 400.0));
+    h.warm_up();
+    assert_eq!(
+        h.sheet().page,
+        None,
+        "a deep drag-down must dismiss the sheet"
+    );
+    assert!(
+        !h.layers_panel_on_screen(),
+        "the dismissal must clear the page's flag, not just hide the sheet"
+    );
+}
+
+/// **A back press walks the phone sheet pages top-down, one visible pop per
+/// press** (plan §3.4; scope item 7): Feature → Time → Menu → Inspector →
+/// Layers → the armed drag — the projection order, driven through the same
+/// `dismiss_top_layer` entry every width shares. Below the breakpoint the
+/// dismissal *is* the projection: it pops whichever page the sheet shows on
+/// top, whatever order the flags were stacked in. The second leg builds the
+/// stack a fixed chain would mis-order — a Feature page over an open
+/// Catalog, through a real route: flags set on a wider width and carried
+/// under 600 pt by a resize (a feature tap through the scrim's map slivers
+/// builds the same state without leaving the phone) — and requires the
+/// visible page to pop first, the invisible flag to stay.
+#[test]
+fn a_back_press_walks_the_phone_sheet_pages_top_down() {
+    let mut h = phone();
+    h.set_drawer_open(true);
+    h.gui_mut().open_settings();
+    h.gui_mut().set_sheet_menu_open_for_test(true);
+    h.gui_mut().set_time_dialog_open_for_test(true);
+    h.gui_mut().overlays.selected_overlays = vec![std::sync::Arc::new(SheetStubFeature)];
+    h.set_region_arm(true);
+    h.warm_up();
+
+    let walk = |h: &mut InputHarness, expect: Option<crate::ui::SheetPage>| {
+        assert!(
+            h.gui_mut().dismiss_top_layer(),
+            "a press with pages open must be consumed"
+        );
+        h.warm_up();
+        assert_eq!(h.sheet().page, expect, "the pop was not the visible one");
+    };
+
+    assert_eq!(h.sheet().page, Some(crate::ui::SheetPage::Feature));
+    walk(&mut h, Some(crate::ui::SheetPage::Time));
+    walk(&mut h, Some(crate::ui::SheetPage::Menu));
+    walk(&mut h, Some(crate::ui::SheetPage::Inspector));
+    walk(&mut h, Some(crate::ui::SheetPage::Layers));
+    // Closing the last page closes the sheet...
+    walk(&mut h, None);
+    // ...and only then does the press reach the armed drag, then the exit.
+    assert!(h.gui_mut().dismiss_top_layer(), "the armed drag is below");
+    assert!(!h.region_arm(), "the press must disarm the region drag");
+    assert!(
+        !h.gui_mut().dismiss_top_layer(),
+        "nothing is left; the next press belongs to the exit path"
+    );
+
+    // The stacked state a fixed chain would mis-order: a Feature page over
+    // an open Catalog, built on the desktop — a feature window up, the
+    // stack's + Add layer — and carried under the breakpoint by a resize.
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.gui_mut().overlays.selected_overlays = vec![std::sync::Arc::new(SheetStubFeature)];
+    h.open_catalog();
+    h.set_screen(egui::vec2(420.0, 1400.0));
+    assert_eq!(
+        h.sheet().page,
+        Some(crate::ui::SheetPage::Feature),
+        "precondition: the projection puts the feature over the open catalog"
+    );
+    assert!(h.gui_mut().dismiss_top_layer(), "a press with pages open");
+    h.warm_up();
+    assert_eq!(
+        h.sheet().page,
+        Some(crate::ui::SheetPage::Catalog),
+        "the pop must take the visible Feature page and leave the catalog \
+         its flag — never the invisible layer first"
+    );
+    assert!(h.gui_mut().dismiss_top_layer(), "the catalog is now on top");
+    h.warm_up();
+    assert_eq!(h.sheet().page, None, "two pages, two pops, sheet closed");
+    assert!(
+        !h.gui_mut().dismiss_top_layer(),
+        "nothing invisible was left behind the two visible pops"
+    );
+
+    // The Catalog page's own pop, from the state the phone's routes produce.
+    let mut h = phone();
+    h.open_catalog();
+    assert_eq!(h.sheet().page, Some(crate::ui::SheetPage::Catalog));
+    assert!(h.gui_mut().dismiss_top_layer(), "the catalog was open");
+    h.warm_up();
+    assert_eq!(
+        h.sheet().page,
+        Some(crate::ui::SheetPage::Layers),
+        "popping the catalog must reveal the Layers page it was opened from"
+    );
+}
+
+/// **Stack rows carry a trailing › on the drawer and sheet hosts, and none
+/// on the desktop sidebar** (plan §1.3): where a row click pushes the
+/// inspector *over* the list, the chevron says so; where the inspector opens
+/// beside it, there is nothing to push.
+#[test]
+fn stack_rows_carry_a_chevron_only_in_the_drawer_and_sheet_hosts() {
+    let desk = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    let row = desk
+        .stack_row(OverlayKind::NwsAlerts)
+        .expect("the desktop sidebar is open by default");
+    assert_eq!(
+        row.chevron, None,
+        "a desktop sidebar row grew a chevron it has nothing to push for"
+    );
+
+    let mut tablet = InputHarness::with_screen(egui::vec2(800.0, 1200.0));
+    tablet.open_layers();
+    let row = tablet
+        .stack_row(OverlayKind::NwsAlerts)
+        .expect("the drawer is open");
+    assert!(
+        row.chevron.is_some_and(|c| c.is_positive()),
+        "a drawer row must carry the chevron"
+    );
+
+    let mut ph = phone();
+    ph.open_layers();
+    let row = ph
+        .stack_row(OverlayKind::NwsAlerts)
+        .expect("the sheet's Layers page is open");
+    let chevron = row.chevron.expect("a sheet row must carry the chevron");
+    assert!(
+        ph.sheet_rect().expect("open").contains(chevron.center()),
+        "the chevron must be drawn inside the sheet"
+    );
+}
+
+/// **The phone bar's hover readout never paints over the arm toggles.** The
+/// readout is the one unbounded string the bar hosts (contract 25 puts it
+/// here whenever a mouse drives), and the ⬚/╱ toggles own the right edge —
+/// so a long value must truncate at the width they left, not extend across
+/// them: the module note's overlap rule, in its truncation form.
+#[test]
+fn the_phone_hover_readout_never_paints_over_the_arm_toggles() {
+    let mut h = phone();
+    h.mouse_move(h.map_center());
+    h.warm_up();
+    assert!(
+        h.top_bar().hover,
+        "precondition: mouse modality, or the bar hosts no readout"
+    );
+
+    // A readout far wider than the whole screen, let alone the bar's run.
+    let long = format!("READOUT {}", "far too long ".repeat(40));
+    h.gui_mut().pane_mut(0).unwrap().hover_value = Some(long.clone());
+    h.frame();
+
+    let bar = h.top_bar();
+    let (readout, _) = {
+        let rects = h.painted_text_rects();
+        rects
+            .iter()
+            .find(|(_, text)| text.starts_with("READOUT"))
+            .cloned()
+            .expect("precondition: the readout must be on the glass")
+    };
+    assert!(
+        !readout.intersects(bar.region_arm.0) && !readout.intersects(bar.section_arm.0),
+        "the hover readout at {readout:?} paints over the arm toggles at \
+         {:?} / {:?}",
+        bar.region_arm.0,
+        bar.section_arm.0
+    );
+    assert!(
+        readout.right() <= bar.region_arm.0.left(),
+        "the readout must end where the toggles' run begins"
+    );
+
+    // ...and the toggles stay clickable under the same readout.
+    h.gui_mut().pane_mut(0).unwrap().hover_value = Some(long);
+    h.mouse_click(bar.region_arm.0.center());
+    h.warm_up();
+    assert!(
+        h.region_arm(),
+        "the \u{2b1a} toggle under a long readout did not take the click"
+    );
+}
+
+/// **The phone error toast sits under the top bar, clear of the arm
+/// toggles, and its ✕ dismisses** — the status bar's error contract, moved
+/// to the one chrome strip the phone keeps at the top.
+#[test]
+fn the_phone_error_toast_sits_under_the_top_bar_and_its_cross_dismisses() {
+    let mut h = phone();
+    h.gui_mut().set_error("the feed went away".to_owned());
+    h.warm_up();
+
+    let toast = h.error_toast().expect("an error must put the toast up");
+    let bar = h.top_bar();
+    assert!(
+        toast.rect.top() >= bar.rect.bottom(),
+        "the toast at {:?} must render under the docked bar at {:?}",
+        toast.rect,
+        bar.rect
+    );
+    assert!(
+        !toast.rect.intersects(bar.region_arm.0) && !toast.rect.intersects(bar.section_arm.0),
+        "the toast must not cover the arm toggles"
+    );
+    assert!(
+        h.text_painted_in(toast.rect, "the feed went away"),
+        "the toast must carry the error text"
+    );
+
+    h.mouse_click(toast.close.center());
+    h.warm_up();
+    assert!(
+        h.error_toast().is_none(),
+        "\u{2715} must clear the error and take the toast down"
+    );
+}
+
+/// **The phone error toast stays visible and dismissible while a sheet page
+/// is up.** The scrim and sheet are `Order::Foreground`; the toast rides
+/// `Order::Tooltip` above them (see `render_phone_error_toast` for why that
+/// device) — an error surface a page could bury would go unseen exactly
+/// when the user is busiest.
+#[test]
+fn the_phone_error_toast_stays_visible_and_dismissible_over_an_open_sheet() {
+    let mut h = phone();
+    h.open_catalog();
+    h.gui_mut().set_error("the feed went away".to_owned());
+    h.warm_up();
+
+    let toast = h.error_toast().expect("the toast must draw with a page open");
+    assert!(
+        toast.rect.bottom() < h.sheet_rect().expect("the page is open").top(),
+        "precondition: the toast sits in the scrim's band above the sheet, \
+         or the layering assertion below tests nothing"
+    );
+    assert_eq!(
+        h.top_layer_id_at(toast.rect.center()),
+        Some(egui::Id::new("phone_error_toast")),
+        "the toast must be the top layer where it draws — above the scrim"
+    );
+    assert!(
+        h.text_painted_in(toast.rect, "the feed went away"),
+        "the toast must carry the error text over the open page"
+    );
+
+    h.mouse_click(toast.close.center());
+    h.warm_up();
+    assert!(
+        h.error_toast().is_none(),
+        "\u{2715} must work through the scrim's band"
+    );
+    assert_eq!(
+        h.sheet().page,
+        Some(crate::ui::SheetPage::Catalog),
+        "dismissing the toast must not also dismiss the page under it"
+    );
+}
+
+/// **A release on the forced-Full Catalog page keeps the stored snap.** The
+/// page draws at Full whatever the snap says (plan §1.10), so a settle drag
+/// there decides nothing — writing Full over the user's Half would change
+/// how every later page opens. Dismiss-by-drag still works from it.
+#[test]
+fn a_release_on_the_forced_full_catalog_page_keeps_the_stored_snap() {
+    let mut h = phone();
+    h.open_layers();
+    assert_eq!(
+        h.sheet().extent,
+        crate::ui::SheetExtent::Half,
+        "precondition: the stored snap starts at Half"
+    );
+    h.open_catalog();
+    assert_eq!(
+        h.sheet().extent,
+        crate::ui::SheetExtent::Full,
+        "precondition: the Catalog page forces Full"
+    );
+
+    // A small settle drag, released well above the dismiss band — where a
+    // snap write would have recorded the forced Full.
+    let start = h.sheet().handle.center();
+    h.mouse_press(start);
+    h.frame_after(FRAME_DT);
+    for step in 1..=3 {
+        h.mouse_move(start + egui::vec2(0.0, 30.0 * step as f32));
+        h.frame_after(FRAME_DT);
+    }
+    h.mouse_release(start + egui::vec2(0.0, 90.0));
+    h.warm_up();
+    assert_eq!(
+        h.sheet().page,
+        Some(crate::ui::SheetPage::Catalog),
+        "precondition: the release was a settle, not a dismissal"
+    );
+
+    // Pop the catalog: the Layers page beneath comes back at the snap the
+    // user chose, not at the Full the forced page drew at.
+    assert!(h.gui_mut().dismiss_top_layer());
+    h.warm_up();
+    assert_eq!(h.sheet().page, Some(crate::ui::SheetPage::Layers));
+    assert_eq!(
+        h.sheet().extent,
+        crate::ui::SheetExtent::Half,
+        "the forced-Full release must not overwrite the stored snap"
+    );
+}
+
+/// **Arming ⬚/╱ from the phone top bar closes the open sheet** — the Menu
+/// page's own rule for its two arm entries, applied to the bar's route: the
+/// next thing the user does is a drag on the map the sheet is covering.
+/// Disarming closes nothing, as the dropdown's reasoning goes.
+#[test]
+fn arming_from_the_phone_top_bar_closes_the_open_sheet() {
+    let mut h = phone();
+    h.open_layers();
+    assert_eq!(h.sheet().page, Some(crate::ui::SheetPage::Layers));
+
+    let (region, armed) = h.top_bar().region_arm;
+    assert!(!armed, "precondition: the mode starts disarmed");
+    h.mouse_click(region.center());
+    h.warm_up();
+    assert!(h.region_arm(), "the tap must arm the drag");
+    assert_eq!(
+        h.sheet().page,
+        None,
+        "arming needs the map: the sheet must close with it"
+    );
+
+    // Disarming keeps whatever is up.
+    h.open_layers();
+    let (region, armed) = h.top_bar().region_arm;
+    assert!(armed, "precondition: still armed across the reopen");
+    h.mouse_click(region.center());
+    h.warm_up();
+    assert!(!h.region_arm(), "the second tap must disarm");
+    assert_eq!(
+        h.sheet().page,
+        Some(crate::ui::SheetPage::Layers),
+        "disarming closes nothing"
+    );
+}
+

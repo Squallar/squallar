@@ -86,6 +86,18 @@ pub(crate) use pills::PILL_ROW_CLEARANCE;
 /// harness.
 #[cfg(test)]
 pub(crate) use pills::{PillKind, PillPopoverProbe, PillRowProbe};
+#[path = "ui_sheet.rs"]
+mod sheet;
+/// The sheet's snap extent — `Gui` holds one as session state.
+pub(crate) use sheet::SheetExtent;
+/// The sheet-page projection, for the input harness — production code names
+/// it through `sheet::` directly.
+#[cfg(test)]
+pub(crate) use sheet::SheetPage;
+/// What the bottom bar, the sheet and the error toast drew last frame, for
+/// the input harness.
+#[cfg(test)]
+pub(crate) use sheet::{BottomBarProbe, ErrorToastProbe, SheetProbe};
 #[path = "ui_catalog.rs"]
 mod catalog;
 /// The preset shape, re-used by the config writer.
@@ -125,8 +137,13 @@ pub(crate) struct PaneOptionProbe {
 /// What the top bar drew: the rects a test drives it by, and the state each
 /// toggle was showing. Reported by the renderer, never rebuilt by a test —
 /// see [`ui_menu::DrawnMenuLeaf`] for the pattern.
+///
+/// The phone-only fields (`scan_text`, `collapse`, `hover`) stay at their
+/// defaults on the wider widths, exactly as the desktop-only fields (the ☰
+/// button, the Layers and Inspector toggles) stay at theirs on Compact —
+/// which fields are live *is* the report of which bar drew.
 #[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TopBarProbe {
     /// The rect the docked panel claimed, straight off its own response.
     pub rect: egui::Rect,
@@ -142,6 +159,15 @@ pub(crate) struct TopBarProbe {
     pub section_arm: (egui::Rect, bool),
     /// The ⚙ Inspector toggle, and whether it read as open.
     pub inspector_toggle: (egui::Rect, bool),
+    /// The phone bar's scan summary chip text, verbatim — the short form
+    /// the compact status bar used to carry.
+    pub scan_text: String,
+    /// The phone bar's ◧ collapse/restore button — the status bar's own
+    /// collapse state, applied to this bar on Compact (contract 75).
+    pub collapse: egui::Rect,
+    /// Whether the phone bar hosted the hover readout this frame (contract
+    /// 25: the readout follows the modality, not the width).
+    pub hover: bool,
 }
 
 #[cfg(test)]
@@ -155,6 +181,9 @@ impl Default for TopBarProbe {
             region_arm: (egui::Rect::NOTHING, false),
             section_arm: (egui::Rect::NOTHING, false),
             inspector_toggle: (egui::Rect::NOTHING, false),
+            scan_text: String::new(),
+            collapse: egui::Rect::NOTHING,
+            hover: false,
         }
     }
 }
@@ -822,6 +851,30 @@ pub struct Gui {
     /// egui also sees and closes on itself, and Android's back, which never
     /// enters egui's queue) converge on this one flag.
     menu_popup_close_requested: bool,
+    /// Whether the phone sheet's Menu page is open. Session-only, on the
+    /// `drawer_open` precedent — and Compact-only chrome: the ☰ Popup keeps
+    /// its own egui-managed state on the wider widths (its dismiss handling
+    /// is the pair of fields above, and the M1 fix depends on it), so this
+    /// flag drives the sheet page alone. `Gui::ui` clears it whenever the
+    /// width is not Compact, so a resize with the page open cannot strand a
+    /// flag no surface renders consuming a back press.
+    menu_open: bool,
+    /// The phone sheet's snap position. Session-only: how a session left
+    /// its sheet is not a preference.
+    sheet_extent: SheetExtent,
+    /// The sheet handle's in-flight drag travel in points, or `None` when no
+    /// drag is running — the timeline scrubber's own shape, for the same
+    /// reason: the commit happens once, on release.
+    sheet_drag: Option<f32>,
+    /// What the last frame's bottom bar drew. Only read by tests.
+    #[cfg(test)]
+    last_bottom_bar: BottomBarProbe,
+    /// What the last frame's sheet drew. Only read by tests.
+    #[cfg(test)]
+    last_sheet: SheetProbe,
+    /// What the last frame's phone error toast drew. Only read by tests.
+    #[cfg(test)]
+    last_error_toast: Option<ErrorToastProbe>,
     // Safe area insets in logical pixels (top, bottom, left, right)
     // Used on Android to avoid drawing under system bars.
     safe_area_insets: (f32, f32, f32, f32),
@@ -1421,6 +1474,15 @@ impl Gui {
             loop_frame_budget: 60,
             menu_popup_open: false,
             menu_popup_close_requested: false,
+            menu_open: false,
+            sheet_extent: SheetExtent::Half,
+            sheet_drag: None,
+            #[cfg(test)]
+            last_bottom_bar: BottomBarProbe::default(),
+            #[cfg(test)]
+            last_sheet: SheetProbe::default(),
+            #[cfg(test)]
+            last_error_toast: None,
             safe_area_insets: (0.0, 0.0, 0.0, 0.0),
             supports_exit: true,
             modality: ModalityLatch::default(),
@@ -1489,6 +1551,22 @@ impl Gui {
             self.last_click_consumed = false;
             // The double-render guard's counter; see the field.
             self.control_render_passes = 0;
+            // Per-frame records of the phone shell's bottom cluster; reset
+            // like the stack's — `page: None` is a report, not an absence.
+            self.last_bottom_bar = BottomBarProbe::default();
+            self.last_sheet = SheetProbe::default();
+            // And of its error toast — `None` is "no toast drew".
+            self.last_error_toast = None;
+        }
+
+        // The sheet's Menu page is Compact chrome; on the wider widths the ☰
+        // Popup owns the menu with its own egui-managed state. Clearing the
+        // flag whenever the width says so is what keeps a resize with the
+        // page open from stranding a flag no surface renders — which
+        // `dismiss_top_layer` would then consume a back press against,
+        // invisibly.
+        if self.layout.width != crate::ui_layout::WidthClass::Compact {
+            self.menu_open = false;
         }
 
         // Create a root Ui to host the panels. Since egui 0.35 the Context-taking
@@ -1564,15 +1642,34 @@ impl Gui {
         // frame as. See `ui_pills.rs`.
         self.render_pane_pills(ctx, shell.map_rect, &mut actions);
 
+        // The phone shell's bottom bar, before the timeline so the inline
+        // transport can position itself above the bar it just drew. Only on
+        // Compact — the wider widths keep the floating bottom-centred
+        // transport and no bar.
+        let phone_bar_top = (self.layout.width == crate::ui_layout::WidthClass::Compact)
+            .then(|| self.render_bottom_bar(ctx, shell.map_rect));
+
         // The timeline transport, after the pane loop and the appliers: every
         // `mem::take` window in the frame has closed, so it reads and writes
         // `self.panes[self.active_pane]` directly — the real pane, not a
         // placeholder. See `ui_timeline.rs`.
-        self.render_timeline(ctx, shell.map_rect, &mut actions);
+        self.render_timeline(ctx, shell.map_rect, phone_bar_top, &mut actions);
+
+        // The sheet, above everything the phone shell floats: the Layers and
+        // Inspector pages open their take window in here, so it must run
+        // after the pane loop and the appliers on the same terms as the
+        // shell's own pass — and the Catalog page's apply paths take panes
+        // themselves, so no window may already be open. See `ui_sheet.rs`.
+        if let Some(bar_top) = phone_bar_top {
+            self.render_phone_error_toast(ctx, shell.map_rect);
+            self.render_phone_sheet(ctx, shell.map_rect, bar_top, &mut actions);
+        }
 
         // Floating windows last, so they layer above the chrome and the map.
         // (Settings are no longer a window of their own: they are the
-        // inspector's App › Settings body, drawn by the shell above.)
+        // inspector's App › Settings body, drawn by the shell above.) On
+        // Compact both return without drawing — the sheet pages above are
+        // their presentation there (plan §1.9).
         self.render_overlay_popup(ctx);
 
         // The Add-layer catalog, after the feature popup so it stacks above
@@ -1878,6 +1975,13 @@ impl Gui {
     /// order is asserted rather than computed; see
     /// `a_back_press_closes_one_open_layer_at_a_time`.
     ///
+    /// Below the Compact breakpoint the asserted chain gives way to the
+    /// sheet's projection: every page flag presents as one sheet there, so
+    /// the press pops exactly the page [`Gui::top_sheet_page`] reports on
+    /// top, and only the non-page layers (the in-flight drag, the armed
+    /// modes) keep their fixed places around it. See
+    /// `a_back_press_walks_the_phone_sheet_pages_top_down`.
+    ///
     /// Deliberately not reachable from `request_exit`: the window's close
     /// button and the menu's Exit item are unambiguous, and dismissing a dialog
     /// instead of honouring them would strand the user — the Exit item lives
@@ -1909,41 +2013,82 @@ impl Gui {
             self.menu_popup_close_requested = true;
             return true;
         }
-        // The catalog, above the feature and time dialogs (plan §3.4 as
-        // amended): it is the modal opened last when it is open at all, and
-        // the frame draws it above a feature popup left open for the same
-        // reason.
-        if self.catalog_open {
-            self.catalog_open = false;
-            return true;
-        }
-        if !self.overlays.selected_overlays.is_empty() {
-            self.overlays.selected_overlays.clear();
-            self.overlays.selected_overlay_page = 0;
-            return true;
-        }
-        if self.time_dialog.show {
-            self.time_dialog.show = false;
-            return true;
-        }
-        // The inspector, below the dialogs: it is a side panel, not a modal,
-        // so anything modal over the map outranks it. Closing resets the
-        // selection to App › Settings (plan §3.4) — a dismissal is a "back
-        // out", and what the user backed out of should not lie in wait for
-        // the next open.
-        if self.insp_open {
-            self.insp_open = false;
-            self.inspector_sel = InspectorSelection::AppSettings;
-            return true;
-        }
-        // The stack, in its drawer form only — the presentation that covers
-        // the map. The Expanded sidebar is deliberately not a dismissal
-        // target: it is open by default, and an Escape with nothing else open
-        // closing it would put the sidebar between every desktop user and
-        // "Escape means leave".
-        if self.drawer_open {
-            self.drawer_open = false;
-            return true;
+        // On Compact every page flag presents as the sheet, so dismissal
+        // reads the same projection the renderer does: pop exactly the page
+        // `top_sheet_page` says is visibly on top. The fixed chain below
+        // cannot serve here, because two real routes stack the flags out of
+        // its order — flags set on a wider width and carried through a
+        // resize, and a feature tap through the map slivers the scrim leaves
+        // beside the bottom bar — and the chain would then pop a layer the
+        // projection never shows, consuming a press invisibly. One rule
+        // either side of the breakpoint: dismissal pops what is painted on
+        // top.
+        if self.layout.width == crate::ui_layout::WidthClass::Compact {
+            if let Some(page) = self.top_sheet_page() {
+                match page {
+                    sheet::SheetPage::Feature => {
+                        self.overlays.selected_overlays.clear();
+                        self.overlays.selected_overlay_page = 0;
+                    }
+                    sheet::SheetPage::Time => self.time_dialog.show = false,
+                    sheet::SheetPage::Catalog => self.catalog_open = false,
+                    sheet::SheetPage::Menu => self.menu_open = false,
+                    sheet::SheetPage::Inspector => {
+                        // The same reset the wide arm below makes: a
+                        // dismissal is a "back out", and what was backed out
+                        // of should not lie in wait for the next open.
+                        self.insp_open = false;
+                        self.inspector_sel = InspectorSelection::AppSettings;
+                    }
+                    sheet::SheetPage::Layers => self.drawer_open = false,
+                }
+                return true;
+            }
+        } else {
+            // The catalog, above the feature and time dialogs (plan §3.4 as
+            // amended): it is the modal opened last when it is open at all,
+            // and the frame draws it above a feature popup left open for the
+            // same reason.
+            if self.catalog_open {
+                self.catalog_open = false;
+                return true;
+            }
+            if !self.overlays.selected_overlays.is_empty() {
+                self.overlays.selected_overlays.clear();
+                self.overlays.selected_overlay_page = 0;
+                return true;
+            }
+            if self.time_dialog.show {
+                self.time_dialog.show = false;
+                return true;
+            }
+            // The phone sheet's Menu page has no presentation up here, and
+            // `Gui::ui` clears its flag on every wider frame — this arm only
+            // covers a press landing between a resize and the frame that
+            // normalises it.
+            if self.menu_open {
+                self.menu_open = false;
+                return true;
+            }
+            // The inspector, below the dialogs: it is a side panel, not a
+            // modal, so anything modal over the map outranks it. Closing
+            // resets the selection to App › Settings (plan §3.4) — a
+            // dismissal is a "back out", and what the user backed out of
+            // should not lie in wait for the next open.
+            if self.insp_open {
+                self.insp_open = false;
+                self.inspector_sel = InspectorSelection::AppSettings;
+                return true;
+            }
+            // The stack, in its drawer form only — the presentation that
+            // covers the map. The Expanded sidebar is deliberately not a
+            // dismissal target: it is open by default, and an Escape with
+            // nothing else open closing it would put the sidebar between
+            // every desktop user and "Escape means leave".
+            if self.drawer_open {
+                self.drawer_open = false;
+                return true;
+            }
         }
         // Last, below every painted layer, because an armed drag is a *mode*
         // rather than something on screen: whatever is drawn over the map is
@@ -1992,76 +2137,88 @@ impl Gui {
     }
 
     fn render_time_dialog(&mut self, ctx: &Context) -> Option<GuiAction> {
-        let mut action = None;
-
-        if self.time_dialog.show {
-            egui::Window::new("Set Time")
-                .collapsible(false)
-                .resizable(false)
-                .pivot(egui::Align2::CENTER_CENTER)
-                // Centred in the content rect, not the viewport: on a device
-                // with a notch or a nav bar those differ, and centring on the
-                // viewport puts the dialog partly underneath them.
-                .default_pos(self.layout.dialog_center())
-                .show(ctx, |ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.heading("Select Time");
-                        ui.add_space(10.0);
-
-                        ui.label("Date:");
-                        ui.text_edit_singleline(&mut self.time_dialog.date_string);
-
-                        ui.add_space(5.0);
-
-                        ui.label("Time:");
-                        ui.text_edit_singleline(&mut self.time_dialog.time_string);
-
-                        ui.add_space(10.0);
-
-                        if ui.button("Use Current Time").clicked() {
-                            self.radar.config.timestamp = chrono::Local::now().naive_local();
-                            self.time_dialog.date_string =
-                                self.radar.config.timestamp.format("%Y-%m-%d").to_string();
-                            self.time_dialog.time_string =
-                                self.radar.config.timestamp.format("%H:%M:%S").to_string();
-                        }
-
-                        ui.add_space(15.0);
-
-                        ui.horizontal(|ui| {
-                            if ui.button("OK").clicked() {
-                                // Try to parse the date and time strings
-                                let datetime_str = format!(
-                                    "{} {}",
-                                    self.time_dialog.date_string, self.time_dialog.time_string
-                                );
-                                if let Ok(timestamp) = chrono::NaiveDateTime::parse_from_str(
-                                    &datetime_str,
-                                    "%Y-%m-%d %H:%M:%S",
-                                ) {
-                                    self.radar.config.timestamp = timestamp;
-                                    if let Some(pane) = self.panes.get_mut(self.active_pane) {
-                                        pane.viewing_live = false;
-                                    }
-                                    action =
-                                        Some(GuiAction::FetchRadarScan(self.radar.config.clone()));
-                                }
-                                self.time_dialog.show = false;
-                            }
-
-                            if ui.button("Cancel").clicked() {
-                                // Restore the original strings from the current config
-                                self.time_dialog.date_string =
-                                    self.radar.config.timestamp.format("%Y-%m-%d").to_string();
-                                self.time_dialog.time_string =
-                                    self.radar.config.timestamp.format("%H:%M:%S").to_string();
-                                self.time_dialog.show = false;
-                            }
-                        });
-                    });
-                });
+        // On Compact the sheet's Time page is the presentation (plan §1.9) —
+        // the phone never draws this window.
+        if !self.time_dialog.show
+            || self.layout.width == crate::ui_layout::WidthClass::Compact
+        {
+            return None;
         }
 
+        let mut action = None;
+        egui::Window::new("Set Time")
+            .collapsible(false)
+            .resizable(false)
+            .pivot(egui::Align2::CENTER_CENTER)
+            // Centred in the content rect, not the viewport: on a device
+            // with a notch or a nav bar those differ, and centring on the
+            // viewport puts the dialog partly underneath them.
+            .default_pos(self.layout.dialog_center())
+            .show(ctx, |ui| {
+                action = self.render_time_dialog_body(ui);
+            });
+        action
+    }
+
+    /// The Set Time dialog's body, host-free: the window above wraps it on
+    /// the wider widths and the phone sheet's Time page hosts it verbatim,
+    /// so the two presentations cannot drift.
+    pub(super) fn render_time_dialog_body(&mut self, ui: &mut egui::Ui) -> Option<GuiAction> {
+        let mut action = None;
+        ui.vertical_centered(|ui| {
+            ui.heading("Select Time");
+            ui.add_space(10.0);
+
+            ui.label("Date:");
+            ui.text_edit_singleline(&mut self.time_dialog.date_string);
+
+            ui.add_space(5.0);
+
+            ui.label("Time:");
+            ui.text_edit_singleline(&mut self.time_dialog.time_string);
+
+            ui.add_space(10.0);
+
+            if ui.button("Use Current Time").clicked() {
+                self.radar.config.timestamp = chrono::Local::now().naive_local();
+                self.time_dialog.date_string =
+                    self.radar.config.timestamp.format("%Y-%m-%d").to_string();
+                self.time_dialog.time_string =
+                    self.radar.config.timestamp.format("%H:%M:%S").to_string();
+            }
+
+            ui.add_space(15.0);
+
+            ui.horizontal(|ui| {
+                if ui.button("OK").clicked() {
+                    // Try to parse the date and time strings
+                    let datetime_str = format!(
+                        "{} {}",
+                        self.time_dialog.date_string, self.time_dialog.time_string
+                    );
+                    if let Ok(timestamp) = chrono::NaiveDateTime::parse_from_str(
+                        &datetime_str,
+                        "%Y-%m-%d %H:%M:%S",
+                    ) {
+                        self.radar.config.timestamp = timestamp;
+                        if let Some(pane) = self.panes.get_mut(self.active_pane) {
+                            pane.viewing_live = false;
+                        }
+                        action = Some(GuiAction::FetchRadarScan(self.radar.config.clone()));
+                    }
+                    self.time_dialog.show = false;
+                }
+
+                if ui.button("Cancel").clicked() {
+                    // Restore the original strings from the current config
+                    self.time_dialog.date_string =
+                        self.radar.config.timestamp.format("%Y-%m-%d").to_string();
+                    self.time_dialog.time_string =
+                        self.radar.config.timestamp.format("%H:%M:%S").to_string();
+                    self.time_dialog.show = false;
+                }
+            });
+        });
         action
     }
 
@@ -3331,6 +3488,31 @@ impl Gui {
     #[cfg(test)]
     pub(crate) fn top_bar_for_test(&self) -> &TopBarProbe {
         &self.last_top_bar
+    }
+
+    /// What the last frame's bottom bar drew.
+    #[cfg(test)]
+    pub(crate) fn bottom_bar_for_test(&self) -> &BottomBarProbe {
+        &self.last_bottom_bar
+    }
+
+    /// What the last frame's phone sheet drew.
+    #[cfg(test)]
+    pub(crate) fn sheet_for_test(&self) -> &SheetProbe {
+        &self.last_sheet
+    }
+
+    /// What the last frame's phone error toast drew, if it drew.
+    #[cfg(test)]
+    pub(crate) fn error_toast_for_test(&self) -> Option<ErrorToastProbe> {
+        self.last_error_toast
+    }
+
+    /// Open or close the sheet's Menu page directly, for the chain tests
+    /// that build the full page stack without walking the bottom bar.
+    #[cfg(test)]
+    pub(crate) fn set_sheet_menu_open_for_test(&mut self, open: bool) {
+        self.menu_open = open;
     }
 
     /// What the last frame's layer stack drew.

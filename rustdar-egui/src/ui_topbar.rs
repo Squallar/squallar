@@ -3,17 +3,24 @@
 //!
 //! The Synthesis design's full-bleed rule is that chrome floats over the radar
 //! inside its bounds, with exactly one exception — this bar, which docks and
-//! pushes the panes down. It is the same bar at every
+//! pushes the panes down. It is one `Panel` under one id at every
 //! [`WidthClass`](crate::ui_layout::WidthClass): being unconditional is what
 //! lets crossing a breakpoint re-key nothing (see the id note in
-//! `ui_shell.rs`), and it is where the routes that used to depend on the
-//! width now live — the ☰ dropdown is the whole menu everywhere, and the
-//! Layers toggle is the one way the layers panel opens and closes.
+//! `ui_shell.rs`). What fills it splits once, at the Compact breakpoint.
 //!
-//! Left to right: wordmark · ☰ app menu · Layers toggle · pane-count and
-//! active-pane segments · (spacer) · the two armed-drag toggles · the ⚙
-//! Inspector toggle. No Set Time button — that belongs to the timeline's
-//! timestamp.
+//! The wide form, left to right: wordmark · ☰ app menu · Layers toggle ·
+//! pane-count and active-pane segments · (spacer) · the two armed-drag
+//! toggles · the ⚙ Inspector toggle. No Set Time button — that belongs to
+//! the timeline's timestamp. The ☰ dropdown is the whole menu on both wide
+//! widths, and the Layers toggle is the one way the layers panel opens and
+//! closes there.
+//!
+//! The phone form (plan §1.2) is minimal: wordmark · ◧ collapse · scan chip ·
+//! (spacer) · icon-only ⬚ and ╱ arms. The menu, Layers, Pane and App routes
+//! live in the bottom bar (`ui_sheet.rs`), and the pane segments in the
+//! sheet's Layers page header — this bar keeps only what has nowhere else
+//! honest to be: the identity, the scan at a glance, and the two modes whose
+//! whole point is being visible while armed.
 //!
 //! # The bar never overlaps itself
 //!
@@ -21,10 +28,10 @@
 //! a right-to-left run, so they own the right edge before anything else asks
 //! for room — however long the left-hand run grows, nothing can land under
 //! them. The left-hand run then lives inside an unconditionally-present
-//! horizontal `ScrollArea` (one id at every width, per the module note in
-//! `ui_shell.rs`), which clips rather than collides when even its tight form
-//! cannot fit — the graceful floor for widths below Compact's breakpoint,
-//! until M6's minimal phone bar arrives.
+//! horizontal `ScrollArea` (one id on both wide widths, per the module note
+//! in `ui_shell.rs`), which clips rather than collides when even its tight
+//! form cannot fit — the graceful floor at Medium's 600 pt edge; below that
+//! the phone form has nothing left to overlap.
 //!
 //! Above that floor the run adapts instead of scrolling: when the space the
 //! toggles left is less than what the roomy form measures, the segment labels
@@ -71,8 +78,15 @@ impl super::Gui {
     /// Draw the top bar. Runs before anything else claims space, and before
     /// any `mem::take` window opens — which is what lets the menu model read
     /// the live active pane and the segments write state directly.
+    ///
+    /// One `Panel` under one id at every width; what fills it splits at the
+    /// Compact breakpoint. The wider widths get the full run below; Compact
+    /// gets the minimal phone bar ([`Self::render_phone_top_bar_run`]) —
+    /// wordmark, scan chip, the two arm icons — because everything else the
+    /// bar carries lives in the bottom bar down there (plan §1.2).
     pub(super) fn render_top_bar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<GuiAction>) {
-        let model = self.menu_model();
+        let compact = self.layout.width == crate::ui_layout::WidthClass::Compact;
+        let model = (!compact).then(|| self.menu_model());
         let mut menu_frame = ui_menu::MenuFrame::default();
 
         #[cfg(test)]
@@ -82,54 +96,62 @@ impl super::Gui {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = ROOMY_ITEM_SPACING;
 
-                // Right-to-left, and **before** everything else, so the
-                // right-hand cluster claims its edge first: however long the
-                // left-hand run grows, it cannot lay a segment under it. The
-                // first widget added is the rightmost — Inspector at the
-                // edge, then X-sec, then Region, which reads left-to-right as
-                // Region · X-sec · Inspector.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let insp_open = self.insp_open;
-                    let inspector = ui.selectable_label(insp_open, INSPECTOR_TOGGLE_LABEL);
-                    #[cfg(test)]
-                    {
-                        probe.inspector_toggle = (inspector.rect, insp_open);
-                    }
-                    if inspector.clicked() {
-                        // A plain flip: whatever the inspector was last about
-                        // is what it reopens on — the ⟩ collapse keeps the
-                        // selection for the same reason.
-                        self.insp_open = !insp_open;
-                    }
+                if let Some(model) = &model {
+                    // Right-to-left, and **before** everything else, so the
+                    // right-hand cluster claims its edge first: however long the
+                    // left-hand run grows, it cannot lay a segment under it. The
+                    // first widget added is the rightmost — Inspector at the
+                    // edge, then X-sec, then Region, which reads left-to-right as
+                    // Region · X-sec · Inspector.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let insp_open = self.insp_open;
+                        let inspector = ui.selectable_label(insp_open, INSPECTOR_TOGGLE_LABEL);
+                        #[cfg(test)]
+                        {
+                            probe.inspector_toggle = (inspector.rect, insp_open);
+                        }
+                        if inspector.clicked() {
+                            // A plain flip: whatever the inspector was last about
+                            // is what it reopens on — the ⟩ collapse keeps the
+                            // selection for the same reason.
+                            self.insp_open = !insp_open;
+                        }
 
-                    let armed = self.section_draw_armed();
-                    let section = ui.selectable_label(armed, SECTION_TOGGLE_LABEL);
-                    #[cfg(test)]
-                    {
-                        probe.section_arm = (section.rect, armed);
-                    }
-                    if section.clicked() {
-                        // Through the setters both ways: arming un-arms the
-                        // other drag, disarming drops a half-made gesture.
-                        self.set_section_draw_armed(!armed);
-                    }
+                        let armed = self.section_draw_armed();
+                        let section = ui.selectable_label(armed, SECTION_TOGGLE_LABEL);
+                        #[cfg(test)]
+                        {
+                            probe.section_arm = (section.rect, armed);
+                        }
+                        if section.clicked() {
+                            // Through the setters both ways: arming un-arms the
+                            // other drag, disarming drops a half-made gesture.
+                            self.set_section_draw_armed(!armed);
+                        }
 
-                    let armed = self.region_arm;
-                    let region = ui.selectable_label(armed, REGION_TOGGLE_LABEL);
-                    #[cfg(test)]
-                    {
-                        probe.region_arm = (region.rect, armed);
-                    }
-                    if region.clicked() {
-                        self.set_region_arm(!armed);
-                    }
+                        let armed = self.region_arm;
+                        let region = ui.selectable_label(armed, REGION_TOGGLE_LABEL);
+                        #[cfg(test)]
+                        {
+                            probe.region_arm = (region.rect, armed);
+                        }
+                        if region.clicked() {
+                            self.set_region_arm(!armed);
+                        }
 
-                    // Everything else takes what the toggles left, reading
-                    // left-to-right again.
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        self.render_top_bar_run(ui, &model, &mut menu_frame, #[cfg(test)] &mut probe);
+                        // Everything else takes what the toggles left, reading
+                        // left-to-right again.
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            self.render_top_bar_run(ui, model, &mut menu_frame, #[cfg(test)] &mut probe);
+                        });
                     });
-                });
+                } else {
+                    self.render_phone_top_bar_run(
+                        ui,
+                        #[cfg(test)]
+                        &mut probe,
+                    );
+                }
             });
         });
 
@@ -144,6 +166,154 @@ impl super::Gui {
 
         for event in menu_frame.events {
             self.apply_menu_event(event, actions);
+        }
+    }
+
+    /// The phone bar's run (plan §1.2): wordmark · ◧ collapse · live scan
+    /// summary chip · (spacer) · icon-only ╱ and ⬚ arms. No pane segments,
+    /// no Layers or Inspector toggles, no ☰ — the bottom bar owns those
+    /// routes down here, and the sheet's Layers page carries the segments.
+    ///
+    /// The ◧ shares [`Gui::statusbar_collapsed`](super::Gui) with the status
+    /// bar the wider widths draw: the phone has no separate status bar, so
+    /// the one collapse state applies to the bar that carries the scan text
+    /// (§1.6, contract 75). Collapsed, only the wordmark and the restore
+    /// button remain.
+    ///
+    /// The hover readout hosts here when a mouse is driving — contract 25's
+    /// rule: the readout follows the modality, never the width, and this bar
+    /// is the only chrome the phone shell keeps at the top to host it.
+    fn render_phone_top_bar_run(
+        &mut self,
+        ui: &mut egui::Ui,
+        #[cfg(test)] probe: &mut super::TopBarProbe,
+    ) {
+        // The ☰ dropdown is desktop and tablet chrome: no button anchors it
+        // here, so its open-state mirror must not stay latched across a
+        // resize — `dismiss_top_layer` would consume a press against a popup
+        // that is not on screen.
+        self.menu_popup_open = false;
+        #[cfg(test)]
+        {
+            probe.pane_count_max = self.layout.width.max_panes();
+        }
+
+        let collapsed = self.statusbar_collapsed;
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if !collapsed {
+                // First added is rightmost: ╱ at the edge, then ⬚, reading
+                // left-to-right as ⬚ · ╱ — the wide bar's own order.
+                let armed = self.section_draw_armed();
+                let section = ui
+                    .selectable_label(armed, "\u{2571}")
+                    .on_hover_text("Draw cross-section");
+                #[cfg(test)]
+                {
+                    probe.section_arm = (section.rect, armed);
+                }
+                if section.clicked() {
+                    self.set_section_draw_armed(!armed);
+                    // Arming needs the map: an open sheet page is in the
+                    // drag's way, so it closes — the Menu page's own rule
+                    // for its two arm entries (`render_sheet_menu`), applied
+                    // to the bar's route. Disarming keeps whatever is up,
+                    // as the dropdown does.
+                    if !armed && self.top_sheet_page().is_some() {
+                        self.clear_sheet_pages();
+                    }
+                }
+
+                let armed = self.region_arm;
+                let region = ui
+                    .selectable_label(armed, "\u{2b1a}")
+                    .on_hover_text("Pick 3D region");
+                #[cfg(test)]
+                {
+                    probe.region_arm = (region.rect, armed);
+                }
+                if region.clicked() {
+                    self.set_region_arm(!armed);
+                    // Same terms as the ╱ above.
+                    if !armed && self.top_sheet_page().is_some() {
+                        self.clear_sheet_pages();
+                    }
+                }
+            }
+
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                render_wordmark(ui);
+
+                let collapse = ui
+                    .button(super::statusbar::COLLAPSE_LABEL)
+                    .on_hover_text(if collapsed {
+                        "Restore the top bar"
+                    } else {
+                        "Collapse the top bar"
+                    });
+                #[cfg(test)]
+                {
+                    probe.collapse = collapse.rect;
+                }
+                if collapse.clicked() {
+                    self.statusbar_collapsed = !collapsed;
+                }
+                if collapsed {
+                    return;
+                }
+
+                let scan_text = self.phone_scan_summary();
+                ui.add(egui::Label::new(scan_text.as_str()).truncate());
+                #[cfg(test)]
+                {
+                    probe.scan_text = scan_text;
+                }
+                #[cfg(not(test))]
+                let _ = scan_text;
+
+                if self.layout.modality == crate::ui_layout::PointerModality::Mouse {
+                    ui.separator();
+                    // The readout is the one unbounded string on this bar,
+                    // and a `Label` in a horizontal run extends rather than
+                    // wraps — across the ⬚/╱ toggles laid out before it.
+                    // The module note's overlap rule applies here as it does
+                    // to the wide run, in its truncation form: cap the
+                    // readout at the width the toggles left, so however long
+                    // the value grows the arms stay unobscured and
+                    // clickable.
+                    ui.scope(|ui| {
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                        super::statusbar::render_hover_info(ui, self.panes());
+                    });
+                    #[cfg(test)]
+                    {
+                        probe.hover = true;
+                    }
+                }
+            });
+        });
+    }
+
+    /// The scan chip's text: site · time · ⚡ live / ⏪ archive — the short
+    /// form the compact status bar carried before the phone shell, with the
+    /// posture glyph in place of the room it does not have. The time is the
+    /// user's own timezone preference, exactly as the status bar prints it —
+    /// no hardcoded `Z` suffix claiming UTC at a setting that may not be.
+    fn phone_scan_summary(&self) -> String {
+        let pane = self.active_pane();
+        let posture = if pane.viewing_live {
+            "\u{26a1}"
+        } else {
+            "\u{23ea}"
+        };
+        match &pane.scan_info {
+            Some(info) => format!(
+                "{} \u{b7} {} \u{b7} {posture}",
+                info.site.name,
+                self.preferences
+                    .timezone
+                    .format_naive_utc(info.timestamp, "%H:%M"),
+            ),
+            None => "No scan loaded".to_owned(),
         }
     }
 
@@ -269,7 +439,12 @@ impl super::Gui {
     ///
     /// `roomy` gates only the two captions, which is what keeps the tight form
     /// id-neutral: a label allocates no widget memory.
-    fn render_pane_segments(&mut self, ui: &mut egui::Ui, roomy: bool) {
+    ///
+    /// `pub(super)` because the phone sheet's Layers page hosts the same
+    /// segments (plan §1.3): the phone top bar has none, and copying the
+    /// renderer rather than the rules is how the hidden-while-one-pane rule
+    /// stays one rule.
+    pub(super) fn render_pane_segments(&mut self, ui: &mut egui::Ui, roomy: bool) {
         let offered = self.layout.width.max_panes();
 
         if roomy {

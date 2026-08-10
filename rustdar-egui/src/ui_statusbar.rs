@@ -1,11 +1,15 @@
-//! The floating status bar: one surface spanning the map's bottom inset.
+//! The floating status bar: one surface spanning the map's bottom inset, on
+//! the two wide widths.
 //!
 //! The docked `Panel::bottom` went with the full-bleed flip — the map now
 //! reaches the bottom of the content rect and this bar floats over it, an
-//! `egui::Area` under one constant id at every width. The content is the
-//! docked bar's, moved whole: refresh, the auto-poll state, the scan summary,
-//! the data age, the hover readout and the right-aligned error. Two things
-//! changed with the float:
+//! `egui::Area` under one constant id on both widths that draw it. Compact
+//! draws no status bar at all (plan §1.6): the phone top bar carries the
+//! short scan summary and the hover readout and shares the collapse state,
+//! and the bottom edge belongs to the timeline and the bottom bar. The
+//! content here is the docked bar's, moved whole: refresh, the auto-poll
+//! state, the scan summary, the data age, the hover readout and the
+//! right-aligned error. Two things changed with the float:
 //!
 //! * A `◧` collapse button leads the row. Collapsed, the bar shrinks to just
 //!   that button, left-anchored, so the map's bottom edge is clear.
@@ -33,26 +37,36 @@ use super::PaneState;
 /// The bar's inset from the map's left, right and bottom edges.
 const BAR_INSET: f32 = 8.0;
 
-/// The collapse/restore button's glyph.
-const COLLAPSE_LABEL: &str = "\u{25e7}";
+/// The collapse/restore button's glyph. `pub(super)` because the phone top
+/// bar shares both the state and the button that flips it (contract 75).
+pub(super) const COLLAPSE_LABEL: &str = "\u{25e7}";
 
 impl super::Gui {
-    /// The status bar along the bottom, floating over the map.
+    /// The status bar along the bottom, floating over the map — on the two
+    /// wide widths only. The phone shell has no status bar (plan §1.6): the
+    /// short scan summary lives in the phone top bar, which also hosts the
+    /// hover readout and shares the collapse state, and errors get their own
+    /// toast (`ui_sheet.rs`).
     ///
-    /// `roomy` is about horizontal space: the long scan summary and the
-    /// auto-poll chip do not fit side by side on a phone.
-    ///
-    /// The hover readout is a different question and keys on the *modality*.
-    /// There is no hover without a pointing device, so a touchscreen has
-    /// nothing to show however wide it is, and a narrow desktop window has a
-    /// mouse and should keep it.
+    /// The hover readout keys on the *modality*. There is no hover without a
+    /// pointing device, so a touchscreen has nothing to show however wide it
+    /// is, and a narrow desktop window has a mouse and should keep it — in
+    /// the top bar, since this bar is not there (contract 25's adaptation).
     pub(super) fn render_status_bar(
         &mut self,
         ctx: &egui::Context,
         map_rect: egui::Rect,
         actions: &mut Vec<GuiAction>,
     ) {
-        let roomy = self.layout.width != WidthClass::Compact;
+        if self.layout.width == WidthClass::Compact {
+            // The probe is written even for the absence: a stale report from
+            // a wider frame would claim a bar that is not on screen.
+            #[cfg(test)]
+            {
+                self.last_status_bar = super::StatusBarProbe::default();
+            }
+            return;
+        }
         let has_hover = self.layout.modality == PointerModality::Mouse;
 
         #[cfg(test)]
@@ -121,23 +135,19 @@ impl super::Gui {
 
                         ui.separator();
 
-                        if roomy {
-                            let drawn = render_auto_poll_status(
-                                ui,
-                                self.radar.fetching,
-                                &self.auto_poll,
-                                &self.chunk_status,
-                            );
-                            #[cfg(test)]
-                            {
-                                probe.poll_chip = drawn;
-                            }
-                            #[cfg(not(test))]
-                            let _ = drawn;
-                            ui.separator();
-                        } else if self.radar.fetching {
-                            ui.spinner();
+                        let drawn = render_auto_poll_status(
+                            ui,
+                            self.radar.fetching,
+                            &self.auto_poll,
+                            &self.chunk_status,
+                        );
+                        #[cfg(test)]
+                        {
+                            probe.poll_chip = drawn;
                         }
+                        #[cfg(not(test))]
+                        let _ = drawn;
+                        ui.separator();
 
                         let scan_text = render_scan_info(
                             ui,
@@ -145,7 +155,6 @@ impl super::Gui {
                                 .get(self.active_pane)
                                 .and_then(|p| p.scan_info.as_ref()),
                             &self.preferences,
-                            roomy,
                         );
                         #[cfg(test)]
                         {
@@ -162,7 +171,6 @@ impl super::Gui {
                             ui,
                             self.panes.get(self.active_pane),
                             &self.preferences,
-                            roomy,
                         );
                         #[cfg(test)]
                         {
@@ -320,29 +328,22 @@ fn render_auto_poll_status(
     Some((response.rect, label))
 }
 
-/// The scan summary. `roomy` picks the long form; a compact bar has room for
-/// the site and the time and nothing else. Returns the text it drew.
+/// The scan summary — the long form: this bar only exists on the widths with
+/// room for it, and the phone top bar's chip is the short form's successor.
+/// Returns the text it drew.
 fn render_scan_info(
     ui: &mut egui::Ui,
     scan_info: Option<&ScanInfo>,
     prefs: &UserPreferences,
-    roomy: bool,
 ) -> String {
     let text = match scan_info {
-        Some(scan_info) if roomy => format!(
+        Some(scan_info) => format!(
             "Scan: {} @ {} ({} products)",
             scan_info.site.name,
             prefs
                 .timezone
                 .format_naive_utc(scan_info.timestamp, "%Y-%m-%d %H:%M:%S"),
             scan_info.available_products.len()
-        ),
-        Some(scan_info) => format!(
-            "{} @ {}",
-            scan_info.site.name,
-            prefs
-                .timezone
-                .format_naive_utc(scan_info.timestamp, "%H:%M")
         ),
         None => "No scan loaded".to_owned(),
     };
@@ -394,23 +395,15 @@ fn render_product_age(
     ui: &mut egui::Ui,
     pane: Option<&PaneState>,
     prefs: &UserPreferences,
-    roomy: bool,
 ) -> Option<String> {
     let collected = pane?.data_time_on_screen()?;
     let age = format_product_age(chrono::Utc::now().naive_utc() - collected);
-    let text = if roomy {
-        format!(
-            "Data: {} ({age})",
-            prefs
-                .timezone
-                .format_naive_utc(collected, "%Y-%m-%d %H:%M:%S")
-        )
-    } else {
-        format!(
-            "Data {} ({age})",
-            prefs.timezone.format_naive_utc(collected, "%H:%M")
-        )
-    };
+    let text = format!(
+        "Data: {} ({age})",
+        prefs
+            .timezone
+            .format_naive_utc(collected, "%Y-%m-%d %H:%M:%S")
+    );
     ui.separator();
     ui.label(&text);
     Some(text)
@@ -421,7 +414,10 @@ fn render_product_age(
 /// Handed `Gui::panes()` — the visible slice — never the raw vector. A hidden
 /// pane is not rendered, so nothing ever clears its `hover_value` again, and
 /// scanning the full vector would surface that stale readout forever.
-fn render_hover_info(ui: &mut egui::Ui, panes: &[PaneState]) {
+///
+/// `pub(super)` because the phone top bar hosts the same readout on Compact
+/// (contract 25: the readout follows the modality, not the width).
+pub(super) fn render_hover_info(ui: &mut egui::Ui, panes: &[PaneState]) {
     let hover_info = panes.iter().find_map(|p| p.hover_value.as_ref());
     let overlay_hover = panes.iter().find_map(|p| p.overlay_hover_value.as_ref());
     if hover_info.is_some() || overlay_hover.is_some() {
@@ -437,18 +433,28 @@ fn render_hover_info(ui: &mut egui::Ui, panes: &[PaneState]) {
     }
 }
 
-fn render_error_display(ui: &mut egui::Ui, error_message: &mut Option<String>) {
+/// `pub(super)` because the phone shell's error toast (`ui_sheet.rs`) hosts
+/// the same dismissable body — the phone has no status bar row to carry it.
+/// Returns the ✕'s rect while an error is up, for the toast's probe.
+pub(super) fn render_error_display(
+    ui: &mut egui::Ui,
+    error_message: &mut Option<String>,
+) -> Option<egui::Rect> {
     let mut dismiss = false;
+    let mut close = None;
     if let Some(msg) = error_message.as_deref() {
-        if ui.button("\u{2715}").clicked() {
+        let button = ui.button("\u{2715}");
+        if button.clicked() {
             dismiss = true;
         }
+        close = Some(button.rect);
         ui.label(msg);
         ui.label("\u{274c}");
     }
     if dismiss {
         *error_message = None;
     }
+    close
 }
 
 #[cfg(test)]

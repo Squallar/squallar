@@ -8,11 +8,13 @@
 //! on only one platform.
 //!
 //! So the menu is described once as data ([`MenuNode`]), rendered by whichever
-//! presentation is hosting it — today that is the top bar's ☰ dropdown
-//! ([`render_menu_popup`]) at every width — and the resulting [`MenuEvent`]s
-//! are applied in exactly one place. A new entry is one line in
-//! [`super::Gui::menu_model`] and one arm in [`super::Gui::apply_menu_event`],
-//! and it appears in every presentation by construction.
+//! presentation is hosting it — the top bar's ☰ dropdown
+//! ([`render_menu_popup`]) on the two wide widths, the phone sheet's Menu
+//! page ([`render_menu_drawer`]) below the Compact breakpoint — and the
+//! resulting [`MenuEvent`]s are applied in exactly one place. A new entry is
+//! one line in [`super::Gui::menu_model`] and one arm in
+//! [`super::Gui::apply_menu_event`], and it appears in every presentation by
+//! construction.
 
 use crate::actions::GuiAction;
 use rustdar_overlays::render::overlay_state::OverlayKind;
@@ -214,11 +216,9 @@ pub(super) fn render_menu_popup(ui: &mut egui::Ui, nodes: &[MenuNode]) -> MenuFr
     out
 }
 
-/// Render the model as a flat vertical list, for a panel body to append.
-///
-/// Currently unwired: the top bar's dropdown is the one presentation on
-/// screen, until the phone sheet re-hosts this list as its menu page.
-#[expect(dead_code, reason = "kept for the phone sheet's menu page")]
+/// Render the model as a flat vertical list — the phone sheet's Menu page
+/// (`ui_sheet.rs`): headings over indented leaves, because a sheet page is a
+/// document the eye scans, not a dropdown the pointer sweeps.
 pub(super) fn render_menu_drawer(ui: &mut egui::Ui, nodes: &[MenuNode]) -> MenuFrame {
     let mut out = MenuFrame::default();
     for node in nodes {

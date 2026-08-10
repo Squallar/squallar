@@ -141,13 +141,18 @@ fn render_popup_sections(
 }
 
 impl super::Gui {
-    /// Render the overlay detail pager popup.
+    /// Render the overlay detail pager popup — the floating window the two
+    /// wide widths get. On Compact the sheet's Feature page hosts the same
+    /// body ([`Self::render_feature_page_body`]); the phone never draws this
+    /// window (plan §1.9).
     ///
     /// Shows the currently selected overlay item with prev/next navigation
     /// when multiple overlays are stacked. Fully generic — uses PopupContent
     /// descriptors from the overlay crate.
     pub(super) fn render_overlay_popup(&mut self, ctx: &egui::Context) {
-        if self.overlays.selected_overlays.is_empty() {
+        if self.overlays.selected_overlays.is_empty()
+            || self.layout.width == WidthClass::Compact
+        {
             return;
         }
 
@@ -192,6 +197,55 @@ impl super::Gui {
             self.overlays.selected_overlays.clear();
             self.overlays.selected_overlay_page = 0;
         }
+    }
+
+    /// The current feature page's title and accent, for the sheet's title
+    /// row — the same values the window above puts in its own title bar.
+    /// `None` only when nothing is selected, in which case there is no
+    /// Feature page to be titling.
+    pub(super) fn feature_page_heading(&self) -> Option<(String, egui::Color32)> {
+        let count = self.overlays.selected_overlays.len();
+        if count == 0 {
+            return None;
+        }
+        let page = self.overlays.selected_overlay_page.min(count - 1);
+        let current = &self.overlays.selected_overlays[page];
+        let content = self.overlays.popup_content(&**current, &self.preferences);
+        Some((
+            content.title,
+            egui::Color32::from_rgb(
+                content.accent_rgb[0],
+                content.accent_rgb[1],
+                content.accent_rgb[2],
+            ),
+        ))
+    }
+
+    /// The feature dialog's content, host-free, for the sheet's Feature page:
+    /// the overlap pager, the sections and the action buttons — the same
+    /// pieces the window assembles, over the same handling, so the two
+    /// presentations cannot mean different things. The page flag is
+    /// `selected_overlays` itself; the sheet's ✕ and the dismissal chain
+    /// clear it, so no close affordance is drawn here.
+    pub(super) fn render_feature_page_body(&mut self, ui: &mut egui::Ui) {
+        let count = self.overlays.selected_overlays.len();
+        if count == 0 {
+            return;
+        }
+        if self.overlays.selected_overlay_page >= count {
+            self.overlays.selected_overlay_page = count - 1;
+        }
+        let page = self.overlays.selected_overlay_page;
+        let current = self.overlays.selected_overlays[page].clone();
+        let content = self.overlays.popup_content(&*current, &self.preferences);
+        let layout = self.layout;
+
+        if count > 1 {
+            render_pager_nav(ui, page, count, &mut self.overlays.selected_overlay_page);
+            ui.separator();
+        }
+        let triggered = render_popup_sections(ui, &layout, &content);
+        self.handle_triggered_popup_actions(&content, &triggered, page);
     }
 
     /// Apply this frame's triggered action buttons — the **first one only**.

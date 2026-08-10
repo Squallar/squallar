@@ -501,7 +501,42 @@ impl InputHarness {
 
     /// What the last frame's top bar drew.
     pub(crate) fn top_bar(&self) -> crate::ui::TopBarProbe {
-        *self.gui.top_bar_for_test()
+        self.gui.top_bar_for_test().clone()
+    }
+
+    /// What the last frame's bottom bar drew — the phone shell's page
+    /// switcher; all-`NOTHING` on the wider widths, which draw no bar.
+    pub(crate) fn bottom_bar(&self) -> crate::ui::BottomBarProbe {
+        *self.gui.bottom_bar_for_test()
+    }
+
+    /// What the last frame's phone sheet drew.
+    pub(crate) fn sheet(&self) -> crate::ui::SheetProbe {
+        self.gui.sheet_for_test().clone()
+    }
+
+    /// The open sheet's rect, or `None` while no page is up.
+    pub(crate) fn sheet_rect(&self) -> Option<egui::Rect> {
+        let probe = self.sheet();
+        probe.page.map(|_| probe.rect)
+    }
+
+    /// What the last frame's phone error toast drew — `None` while no error
+    /// is up, or while a wider width hosts the error in the status bar.
+    pub(crate) fn error_toast(&self) -> Option<crate::ui::ErrorToastProbe> {
+        self.gui.error_toast_for_test()
+    }
+
+    /// The rect egui holds for the area under `id`, if it has ever been
+    /// shown — how a test proves a Modal or Window was (or was not) on
+    /// screen without reconstructing its geometry.
+    pub(crate) fn area_rect(&self, id: egui::Id) -> Option<egui::Rect> {
+        egui::AreaState::load(&self.ctx, id).map(|state| state.rect())
+    }
+
+    /// Whether this width presents its chrome through the phone sheet.
+    fn is_phone(&self) -> bool {
+        self.width_class() == crate::ui_layout::WidthClass::Compact
     }
 
     /// What the last frame's layer stack drew.
@@ -549,11 +584,18 @@ impl InputHarness {
     /// stack, scroll its row on screen, click it. Asserts the inspector's
     /// body arm for exactly that layer drew.
     pub(crate) fn open_layer_in_inspector(&mut self, kind: OverlayKind) {
-        // On the width where the right slide-over lands on the drawer, an
-        // inspector left open from a previous selection covers the rows.
+        // An inspector left open from a previous selection covers the rows —
+        // as the right slide-over on Medium, and as the sheet's Inspector
+        // page over its Layers page on Compact.
         self.close_inspector();
         self.open_layers();
-        let scroll_pos = egui::pos2(120.0, self.screen_rect().center().y);
+        // Scroll inside the panel wherever its host put it — the sheet's
+        // body sits in the lower half of a phone screen, so a fixed
+        // left-edge position would spin the wheel over the scrim.
+        let scroll_pos = self
+            .layers_panel_rect()
+            .expect("the stack was just opened")
+            .center();
         let found = self.scroll_until(scroll_pos, egui::vec2(0.0, -120.0), 60, |h| {
             h.stack_row(kind)
                 .is_some_and(|row| h.screen_rect().contains(row.rect.center()))
@@ -656,10 +698,27 @@ impl InputHarness {
         );
     }
 
-    /// Put the layers panel on screen the user's way: a click on the top bar's
-    /// Layers toggle. Idempotent — the toggle's probe says whether the panel is
-    /// already showing, and a second click would close it again.
+    /// Put the layers panel on screen the user's way: the top bar's Layers
+    /// toggle on the wide widths, the bottom bar's Layers item on the phone
+    /// — where the panel is the sheet's Layers page. Idempotent — each
+    /// route's own probe says whether the panel is already showing, and a
+    /// second click would close it again (the bottom bar's toggle
+    /// semantics).
     pub(crate) fn open_layers(&mut self) {
+        if self.is_phone() {
+            if self.sheet().page == Some(crate::ui::SheetPage::Layers) {
+                return;
+            }
+            let (item, _) = self.bottom_bar().layers;
+            self.mouse_click(item.center());
+            self.warm_up();
+            assert_eq!(
+                self.sheet().page,
+                Some(crate::ui::SheetPage::Layers),
+                "tapping the bottom bar's Layers item did not open the Layers page"
+            );
+            return;
+        }
         let (toggle, open) = self.top_bar().layers_toggle;
         if open {
             return;
@@ -668,13 +727,23 @@ impl InputHarness {
         self.warm_up();
     }
 
-    /// Take the layers panel off screen the user's way — the same toggle.
+    /// Take the layers panel off screen the user's way — the same toggle, or
+    /// the same bottom-bar item on the phone.
     ///
     /// Since the full-bleed flip the panel floats *over* the map's left side,
     /// so a map-interaction test whose positions land under it must close it
     /// first: a click there belongs to the panel, exactly as it does for a
     /// user.
     pub(crate) fn close_layers(&mut self) {
+        if self.is_phone() {
+            if self.sheet().page != Some(crate::ui::SheetPage::Layers) {
+                return;
+            }
+            let (item, _) = self.bottom_bar().layers;
+            self.mouse_click(item.center());
+            self.warm_up();
+            return;
+        }
         let (toggle, open) = self.top_bar().layers_toggle;
         if !open {
             return;
@@ -693,34 +762,45 @@ impl InputHarness {
             .map(|state| state.rect())
     }
 
-    /// Open the whole-menu dropdown the user's way: a click on the top bar's
-    /// ☰ button. The same route at every width. Idempotent — with the popup
-    /// already open its leaves are drawn, and a second click would close it.
+    /// Open the whole menu the user's way: a click on the top bar's ☰
+    /// button on the wide widths, a tap on the bottom bar's Menu item on the
+    /// phone — where the menu is the sheet's Menu page. Idempotent — with
+    /// the menu already open its leaves are drawn, and a second click would
+    /// close it.
     pub(crate) fn open_menu(&mut self) {
         if !self.menu_leaves().is_empty() {
             return;
         }
-        let button = self.top_bar().menu_button;
+        let button = if self.is_phone() {
+            self.bottom_bar().menu.0
+        } else {
+            self.top_bar().menu_button
+        };
         self.mouse_click(button.center());
         self.warm_up();
         assert!(
             !self.menu_leaves().is_empty(),
-            "clicking the \u{2630} button did not open the menu dropdown"
+            "clicking the menu button did not put the menu on screen"
         );
     }
 
-    /// Close the dropdown by clicking its own button again — the toggle half
-    /// of `Popup::menu`'s contract. A no-op when it is not open.
+    /// Close the menu by clicking its own button again — the toggle half of
+    /// `Popup::menu`'s contract, and of the bottom bar's (contract 64). A
+    /// no-op when it is not open.
     pub(crate) fn close_menu(&mut self) {
         if self.menu_leaves().is_empty() {
             return;
         }
-        let button = self.top_bar().menu_button;
+        let button = if self.is_phone() {
+            self.bottom_bar().menu.0
+        } else {
+            self.top_bar().menu_button
+        };
         self.mouse_click(button.center());
         self.warm_up();
         assert!(
             self.menu_leaves().is_empty(),
-            "clicking the \u{2630} button did not close the open dropdown"
+            "clicking the menu button did not close the open menu"
         );
     }
 

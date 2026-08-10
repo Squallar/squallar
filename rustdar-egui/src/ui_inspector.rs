@@ -2,10 +2,12 @@
 //! pane's properties, or the app's settings.
 //!
 //! One body set for every shell. On Expanded it floats at the map's top-right,
-//! mirroring the stack on the left; below the sidebar breakpoint the same
-//! panel is a right slide-over. Closed by default at every width — the top
-//! bar's ⚙ toggle, a stack row click and the menu's Settings… entry are the
-//! ways in, and `dismiss_top_layer` is the keyboard's way out.
+//! mirroring the stack on the left; on Medium the same panel is a right
+//! slide-over; on Compact it is the phone sheet's Inspector page, in the slot
+//! `ui_sheet.rs` hands over. Closed by default at every width — the top
+//! bar's ⚙ toggle where the bar carries one, the bottom bar's Pane and App
+//! items on the phone, a stack row click and the menu's Settings… entry are
+//! the ways in, and `dismiss_top_layer` is the keyboard's way out.
 //!
 //! The crumb row names what the body is about — `Pane 2 › NWS Alerts`,
 //! `Pane 2 › Properties`, `App › Settings` — and the body arm is dispatched on
@@ -28,18 +30,19 @@
 use crate::actions::GuiAction;
 use rustdar_overlays::render::overlay_state::OverlayKind;
 
+use super::shell::SurfaceSlot;
 use super::{InspectorSelection, PaneState, map};
 
 /// Width of the inspector, in both its floating and slide-over forms — one
 /// value for the same one-id reason as [`super::ui_stack::STACK_WIDTH`].
-const INSPECTOR_WIDTH: f32 = 300.0;
+pub(super) const INSPECTOR_WIDTH: f32 = 300.0;
 
 /// The inspector's inset from the map's top-right corner.
-const INSPECTOR_INSET: f32 = 8.0;
+pub(super) const INSPECTOR_INSET: f32 = 8.0;
 
 /// What the inspector leaves clear above the map's bottom edge — the same
 /// band the stack leaves (plan §1.4: same vertical insets).
-const INSPECTOR_BOTTOM_CLEARANCE: f32 = 88.0;
+pub(super) const INSPECTOR_BOTTOM_CLEARANCE: f32 = 88.0;
 
 /// What the crumb row and its separator cost above the scroll body.
 const HEADER_ALLOWANCE: f32 = 40.0;
@@ -114,22 +117,19 @@ impl Default for InspectorProbe {
 }
 
 impl super::Gui {
-    /// The inspector, floating at the map's top-right.
+    /// The inspector, in the slot its host chose — the map's top-right
+    /// corner from the shell, the sheet's body from the phone shell.
     ///
     /// `pane` is the active pane, `mem::take`n by the caller for the whole
     /// stack+inspector pass — nothing in here reads `self.panes[..]`.
     pub(super) fn render_inspector(
         &mut self,
         ctx: &egui::Context,
-        map_rect: egui::Rect,
+        slot: SurfaceSlot,
         pane: &mut PaneState,
         actions: &mut Vec<GuiAction>,
     ) {
-        let max_body_height = (map_rect.height()
-            - INSPECTOR_INSET
-            - INSPECTOR_BOTTOM_CLEARANCE
-            - HEADER_ALLOWANCE)
-            .max(0.0);
+        let max_body_height = (slot.avail_height - HEADER_ALLOWANCE).max(0.0);
 
         #[cfg(test)]
         let mut probe = InspectorProbe {
@@ -137,13 +137,25 @@ impl super::Gui {
             ..InspectorProbe::default()
         };
 
+        // Same swap as the stack's, for the same id reason — see
+        // `SurfaceSlot`.
+        let frame = if slot.sheet {
+            egui::Frame::NONE
+        } else {
+            egui::Frame::window(&ctx.global_style())
+        };
+        let order = if slot.sheet {
+            egui::Order::Foreground
+        } else {
+            egui::Order::Middle
+        };
         let area = egui::Area::new(egui::Id::new("inspector_panel"))
-            .order(egui::Order::Middle)
-            .pivot(egui::Align2::RIGHT_TOP)
-            .fixed_pos(map_rect.right_top() + egui::vec2(-INSPECTOR_INSET, INSPECTOR_INSET))
+            .order(order)
+            .pivot(slot.pivot)
+            .fixed_pos(slot.pos)
             .show(ctx, |ui| {
-                egui::Frame::window(&ctx.global_style()).show(ui, |ui| {
-                    ui.set_width(INSPECTOR_WIDTH);
+                frame.show(ui, |ui| {
+                    ui.set_width(slot.width);
                     self.render_inspector_crumb(
                         ui,
                         #[cfg(test)]

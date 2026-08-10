@@ -1,8 +1,10 @@
 //! The Add-layer catalog: one modal over everything, four groups, one search.
 //!
 //! Opened by the stack's two `+ Add layer` buttons (plan §1.3), presented as
-//! an [`egui::Modal`] at every width for now — M6's phone shell re-hosts it
-//! as a sheet page. The body is four groups the search filters across:
+//! an [`egui::Modal`] on the two wide widths and as the phone sheet's
+//! full-height Catalog page on Compact — one body
+//! ([`Gui::render_catalog_body`](super::Gui)), two hosts (plan §1.9). The
+//! body is four groups the search filters across:
 //! **Presets** (the compiled-in three plus the user's own, §3.11), the 12
 //! **overlays**, the 17 **radar products** and the 16 **HRRR parameters** —
 //! the real app's real options and nothing else (decision §0: no planned
@@ -254,12 +256,17 @@ fn push_overlay_fetch_once(actions: &mut Vec<GuiAction>, kind: OverlayKind, pane
 }
 
 impl super::Gui {
-    /// Draw the catalog, when it is open.
+    /// Draw the catalog, when it is open — as the centred modal the two wide
+    /// widths get. On Compact the sheet's Catalog page hosts the same body
+    /// (plan §1.9: the phone never draws a modal), so this returns without
+    /// drawing there.
     ///
     /// Runs from [`Gui::ui`](super::Gui::ui) after the pane loop and the
     /// appliers — see the module note for why that ordering is load-bearing.
     pub(super) fn render_catalog(&mut self, ctx: &egui::Context, actions: &mut Vec<GuiAction>) {
-        if !self.catalog_open {
+        if !self.catalog_open
+            || self.layout.width == crate::ui_layout::WidthClass::Compact
+        {
             return;
         }
 
@@ -274,48 +281,13 @@ impl super::Gui {
 
         let modal = egui::Modal::new(egui::Id::new("add_layer_catalog")).show(ctx, |ui| {
             ui.set_width(width);
-
-            ui.horizontal(|ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let close = ui.button(CLOSE_LABEL).on_hover_text("Close the catalog");
-                    #[cfg(test)]
-                    {
-                        probe.close = close.rect;
-                    }
-                    if close.clicked() {
-                        self.catalog_open = false;
-                    }
-
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        ui.label(egui::RichText::new("Add layer").strong());
-                        let search = ui.add_sized(
-                            egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
-                            egui::TextEdit::singleline(&mut self.catalog_query)
-                                .id_salt("catalog_search")
-                                .hint_text("Search"),
-                        );
-                        #[cfg(test)]
-                        {
-                            probe.search = search.rect;
-                        }
-                        #[cfg(not(test))]
-                        let _ = search;
-                    });
-                });
-            });
-            ui.separator();
-
-            egui::ScrollArea::vertical()
-                .id_salt("catalog_scroll")
-                .max_height(max_body)
-                .show(ui, |ui| {
-                    self.render_catalog_groups(
-                        ui,
-                        actions,
-                        #[cfg(test)]
-                        &mut probe,
-                    );
-                });
+            self.render_catalog_body(
+                ui,
+                max_body,
+                actions,
+                #[cfg(test)]
+                &mut probe,
+            );
         });
 
         if modal.backdrop_response.clicked() {
@@ -332,6 +304,70 @@ impl super::Gui {
         }
         #[cfg(not(test))]
         let _ = modal;
+    }
+
+    /// The catalog's content, host-free: header (title, search, ✕), then the
+    /// scrolling groups. The modal above and the sheet's Catalog page both
+    /// call this, so the two presentations cannot drift. `max_body` caps the
+    /// scroll — the host knows its own room.
+    pub(super) fn render_catalog_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        max_body: f32,
+        actions: &mut Vec<GuiAction>,
+        #[cfg(test)] probe: &mut CatalogProbe,
+    ) {
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let close = ui.button(CLOSE_LABEL).on_hover_text("Close the catalog");
+                #[cfg(test)]
+                {
+                    probe.close = close.rect;
+                }
+                if close.clicked() {
+                    self.catalog_open = false;
+                }
+
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new("Add layer").strong());
+                    // A deliberate exception to the id doctrine, shared with
+                    // `catalog_scroll` below and `sheet_feature_scroll`
+                    // (`ui_sheet.rs`): the salts are stable, but the parent
+                    // layer is the modal above 600 pt and the phone sheet
+                    // below it, so the ids resolve differently either side
+                    // and egui-side state — this field's cursor, the
+                    // scroll's offset — does not carry across the
+                    // breakpoint. Gui-side state (`catalog_query`) does.
+                    // Contract 14's probed set (`widget_id_probes`) excludes
+                    // all three on purpose.
+                    let search = ui.add_sized(
+                        egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
+                        egui::TextEdit::singleline(&mut self.catalog_query)
+                            .id_salt("catalog_search")
+                            .hint_text("Search"),
+                    );
+                    #[cfg(test)]
+                    {
+                        probe.search = search.rect;
+                    }
+                    #[cfg(not(test))]
+                    let _ = search;
+                });
+            });
+        });
+        ui.separator();
+
+        egui::ScrollArea::vertical()
+            .id_salt("catalog_scroll")
+            .max_height(max_body)
+            .show(ui, |ui| {
+                self.render_catalog_groups(
+                    ui,
+                    actions,
+                    #[cfg(test)]
+                    probe,
+                );
+            });
     }
 
     /// The four groups, filtered by the search. A group whose every tile the
