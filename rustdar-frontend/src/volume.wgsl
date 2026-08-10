@@ -159,6 +159,17 @@ const LUT_ENTRIES: f32 = 256.0;
 // implementation-defined and WebGL2 drivers disagree about.
 const RAY_DIRECTION_EPSILON: f32 = 1e-6;
 
+// How far under the bottom plane, in box heights, the eye travels before the
+// floor is fully gone. From above the floor is the opaque ground the box
+// stands on; from below it must not wall the volume off — the user asked for
+// exactly that — so its coverage is scaled by eye depth below the plane:
+// 1 at the plane and above (every above-plane pixel is bit-identical to the
+// pre-fade composite), 0 at this depth. A ramp rather than a hard flip so
+// orbiting through plane level dissolves the ground instead of popping it.
+// 0.08 of the box's height is ~1.4 km of the default 18 km column: gone
+// almost immediately, but never in a single frame.
+const FLOOR_BELOW_FADE: f32 = 0.08;
+
 // Below this the central difference is noise rather than a surface, and
 // normalising it would point the normal in an arbitrary direction.
 //
@@ -329,8 +340,9 @@ fn shading(p: vec3<f32>) -> f32 {
 // box's own bottom face, so a hit is always on the box boundary: for an eye
 // above the plane it coincides with the ray's box exit, and for an eye below
 // it with (or before) the entry. That dichotomy is what lets the march
-// composite the floor with one comparison instead of interleaving it into the
-// loop.
+// composite the floor with one comparison after the loop — behind the
+// accumulation from above, in front of it (faded) from below — instead of
+// interleaving it into the loop.
 fn floor_hit(eye: vec3<f32>, direction: vec3<f32>) -> f32 {
     if abs(direction.z) < RAY_DIRECTION_EPSILON {
         return -1.0;
@@ -366,15 +378,13 @@ fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
     }
 
     let floor_t = select(-1.0, floor_hit(eye, direction), volume.flags.w > 0.5);
-    // An eye under the bottom plane looking up meets the floor at (or before)
-    // its entry into the volume, so the floor is in front and the volume is
-    // wholly hidden behind it: the floor is the fragment. `span.x` rather
-    // than 0 so an inside-the-box eye — whose entry is clamped to 0 strictly
-    // above the plane — never takes this arm.
-    if floor_t >= 0.0 && floor_t <= span.x {
-        let ground = floor_colour(eye, direction, floor_t);
-        return vec4<f32>(gamma_from_linear_rgb(ground.rgb) * ground.a, ground.a);
-    }
+    // The floor's coverage: full at and above the bottom plane, fading to
+    // nothing FLOOR_BELOW_FADE under it. An eye under the plane looking up
+    // meets the floor at (or before) its entry into the volume, so a full-
+    // coverage floor there would be an opaque wall in front of the whole
+    // volume — the fade is what turns that wall transparent from below while
+    // leaving every above-plane view exactly as composited before.
+    let floor_fade = clamp(1.0 + eye.z / FLOOR_BELOW_FADE, 0.0, 1.0);
 
     // Cells this ray crosses per unit of `t`, in the grid's anisotropic cell
     // metric — the same "direction inside the length" shape as
@@ -456,12 +466,27 @@ fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
     // exit, so whatever light the march did not absorb lands on the ground
     // and composites under the accumulation — the same premultiplied algebra
     // as the volume's own samples, at the end because the plane bounds the
-    // box from below and nothing can be behind it.
+    // box from below and nothing can be behind it. Coverage is the floor's
+    // own alpha times the fade — 1 above the plane, so this arm is unchanged
+    // there.
     var transmitted = transmittance;
     if floor_t > span.x {
         let ground = floor_colour(eye, direction, floor_t);
-        accumulated = accumulated + transmittance * ground.a * ground.rgb;
-        transmitted = transmittance * (1.0 - ground.a);
+        let cover = ground.a * floor_fade;
+        accumulated = accumulated + transmittance * cover * ground.rgb;
+        transmitted = transmittance * (1.0 - cover);
+    } else if floor_t >= 0.0 && floor_fade > 0.0 {
+        // The floor in front of the volume: an eye under the plane meets it
+        // at (or before) the box entry, so the faded ground composites OVER
+        // the march — the same over operator from the other side. At fade 0
+        // this arm vanishes and the volume shows through where the wall
+        // stood; `span.x` rather than 0 in the test above so an inside-the-
+        // box eye — whose entry is clamped to 0 strictly above the plane —
+        // never takes it.
+        let ground = floor_colour(eye, direction, floor_t);
+        let cover = ground.a * floor_fade;
+        accumulated = ground.rgb * cover + accumulated * (1.0 - cover);
+        transmitted = transmitted * (1.0 - cover);
     }
 
     let alpha = 1.0 - transmitted;

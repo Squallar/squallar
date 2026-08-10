@@ -836,6 +836,104 @@ fn the_floor_and_the_volume_put_the_same_weather_in_the_same_place() {
     );
 }
 
+/// From under the box, the floor does not wall the volume off.
+///
+/// The composite draws the floor **in front** of the whole volume for an eye
+/// under the bottom plane — geometrically it is in front — but the user asked
+/// for the ground to become transparent from below, and the shader fades its
+/// coverage out over `FLOOR_BELOW_FADE` of eye depth. Two renders through an
+/// up-looking camera, one closing each half:
+///
+/// 1. A saturating slab in the box, floor on, eye well under the fade band:
+///    the slab's colour reaches the pixel — deleting the fade (coverage 1
+///    from below) walls it off with ground.
+/// 2. An empty grid, floor on, same eye: the pixel is fully transparent —
+///    compositing any residual ground from below fails here.
+///
+/// The eye-above cases are pinned by
+/// [`the_map_floor_stands_under_the_volume_and_only_when_asked`], which this
+/// change must leave bit-identical: above the plane the fade is exactly 1.
+///
+/// ```text
+/// cargo test -p rustdar-frontend --test volume_gpu \
+///     the_floor_is_transparent_from_below \
+///     -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
+fn the_floor_is_transparent_from_below() {
+    let _serialised = gpu_lock();
+    let size = [96u32, 96];
+    let cells = [16u32, 16, 16];
+    let (device, queue) = device();
+    let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Bgra8Unorm));
+    pipelines.upload_quad(&queue);
+
+    // An opaque red floor: the wall the fade must dissolve.
+    let floor_rgba: Vec<u8> = std::iter::repeat_n([255u8, 0, 0, 255], 64)
+        .flatten()
+        .collect();
+    let floor = pipelines
+        .upload_floor(&device, &queue, [8, 8], &floor_rgba)
+        .expect("a well-shaped floor uploads");
+
+    // Looking UP the z axis from under the box: the mirror of
+    // `box_from_clip_down(2)` — depth 1 unprojects one box beyond the top
+    // face, the eye sits one box under the bottom, well below the fade band.
+    let mut up = [[0.0f32; 4]; 4];
+    up[0][0] = 0.5;
+    up[1][1] = 0.5;
+    up[3][0] = 0.5;
+    up[3][1] = 0.5;
+    up[2][2] = 2.5;
+    up[3][2] = -0.5;
+    up[3][3] = 1.0;
+    let mut uniform = VolumeUniform::new([10.0, 10.0, 10.0], cells);
+    uniform.box_from_clip = up;
+    uniform.eye_in_box = [0.5, 0.5, -1.0];
+    uniform.extinction_per_km = 1000.0;
+    uniform.gradient_shading = false;
+    uniform.map_floor = true;
+
+    // 1. A saturating white slab fills the box's top half.
+    let mut slab = vec![0u8; (cells[0] * cells[1] * cells[2]) as usize];
+    for z in cells[2] / 2..cells[2] {
+        for y in 0..cells[1] {
+            for x in 0..cells[0] {
+                slab[((z * cells[1] + y) * cells[0] + x) as usize] = 255;
+            }
+        }
+    }
+    let mut lut = vec![0u8; VOLUME_LUT_BYTES];
+    for entry in 1..lut.len() / 4 {
+        lut[entry * 4..entry * 4 + 4].copy_from_slice(&[255, 255, 255, 255]);
+    }
+    let pixels = raymarch_once_with_floor(
+        &device, &queue, &pipelines, cells, &slab, &lut, &uniform, size, &floor,
+    );
+    let seen = centre(&pixels, size);
+    assert!(
+        seen.iter().take(3).all(|c| *c > 200) && seen[3] == 255,
+        "from below, the volume (saturated white) must show through the floor, \
+         got {seen:?}; an opaque ground from underneath is the wall the user \
+         reported",
+    );
+
+    // 2. Nothing in the box: nothing may paint — a residual ground fragment
+    // from below is the same wall at partial opacity.
+    let empty = vec![0u8; (cells[0] * cells[1] * cells[2]) as usize];
+    let pixels = raymarch_once_with_floor(
+        &device, &queue, &pipelines, cells, &empty, &lut, &uniform, size, &floor,
+    );
+    let seen = centre(&pixels, size);
+    assert_eq!(
+        seen,
+        [0, 0, 0, 0],
+        "an empty box viewed from below must be fully transparent with the \
+         floor toggle on",
+    );
+}
+
 /// The smoothed reconstruction really reaches the coarse level: a lone voxel
 /// paints a **wider** footprint through the cloud rung than through the raw
 /// field.
