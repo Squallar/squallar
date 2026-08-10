@@ -26,8 +26,8 @@
 //! Measured on the development machine: `AvailableAccuracyLevel = 6`
 //! (`STREET`, the ceiling this install can offer) and a real accuracy of
 //! **25 km** — an IP/ichnaea lookup, not a GPS one. That is why every fix
-//! leaves here as [`FixQuality::Device`] and carries its
-//! [`accuracy_m`](GpsFix::accuracy_m): the site-upgrade gate reads that field,
+//! leaves here as [`FixQuality::Device`](rustdar_gps::FixQuality::Device) and
+//! carries its [`accuracy_m`](GpsFix::accuracy_m): the site-upgrade gate reads that field,
 //! and a 25 km circle is comfortably good enough to pick between WSR-88D sites
 //! ~200 km apart while being useless for anything finer.
 //!
@@ -43,7 +43,7 @@ use std::collections::HashMap;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use rustdar_gps::{FixQuality, GpsConfig, GpsFix, LocationPermission};
+use rustdar_gps::{GpsConfig, GpsFix, LocationPermission};
 use zbus::blocking::{Connection, MessageIterator};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Structure, Value};
 
@@ -200,17 +200,28 @@ struct CloserState {
     closed: bool,
 }
 
+impl CloserState {
+    /// Whether a connection handed over now would ever be closed again.
+    ///
+    /// The whole start/stop race in one predicate, and the reason it is a
+    /// predicate: a test can reach this without a bus, while
+    /// [`adopt`](Closer::adopt) needs a real `Connection` to park.
+    fn accepts(&self) -> bool {
+        !self.closed
+    }
+}
+
 impl Closer {
     /// Hand the session's connection over, or learn that the reader is already
     /// gone. `false` means "stop now"; the caller still owns the connection and
     /// closes it itself.
     fn adopt(&self, conn: &Connection) -> bool {
         let mut state = self.lock();
-        if state.closed {
-            return false;
+        let open = state.accepts();
+        if open {
+            state.conn = Some(conn.clone());
         }
-        state.conn = Some(conn.clone());
-        true
+        open
     }
 
     /// Close the connection if there is one, and remember that we did.
@@ -391,72 +402,35 @@ fn watch(
                 continue;
             }
         };
-        // The stream is unfiltered — see `subscribe` — so it carries this
-        // connection's own method replies as well as every other app's geoclue
-        // traffic. Replies are dropped by type; the rest is checked against the
-        // object it claims to be about, without which another app's client
-        // stopping would read as ours stopping.
-        if message.message_type() != zbus::message::Type::Signal {
-            continue;
-        }
-        let header = message.header();
-        let member = header.member().map(|m| m.as_str());
-        let interface = header.interface().map(|i| i.as_str());
-        let path = header.path().map(|p| p.as_str());
-        let ours = path == Some(client);
-
-        match (interface, member) {
-            (Some(CLIENT_IFACE), Some("LocationUpdated")) if ours => {
-                // `(old, new)`; only the new path is worth a round trip.
-                let Ok((_, new)) = message
-                    .body()
-                    .deserialize::<(OwnedObjectPath, OwnedObjectPath)>()
-                else {
-                    log::debug!("LocationUpdated with an unexpected body");
-                    continue;
-                };
-                if last.as_ref() == Some(&new) {
+        match route(&message, client) {
+            Signal::NewLocation(path) => {
+                if !is_new(last.as_ref(), &path) {
                     continue;
                 }
-                if !publish(conn, &new, out) {
+                if !publish(conn, &path, out) {
                     return;
                 }
-                last = Some(new);
+                last = Some(path);
             }
-            (Some(PROPERTIES_IFACE), Some("PropertiesChanged")) if ours => {
-                if client_went_inactive(&message) {
-                    // The push half of the permission story. Nothing polled
-                    // would ever see this: the gate stops asking once the
-                    // answer is `Granted` and delivery is live, so on a
-                    // foreground desktop with the settings window shut this
-                    // signal is the *only* thing that knows consent was
-                    // withdrawn.
-                    log::info!("GeoClue2 stopped this client; location is no longer granted");
-                    report(LocationPermission::Denied);
-                    return;
-                }
+            Signal::Revoked => {
+                // The push half of the permission story. Nothing polled would
+                // ever see this: the gate stops asking once the answer is
+                // `Granted` and delivery is live, so on a foreground desktop
+                // with the settings window shut this signal is the *only* thing
+                // that knows consent was withdrawn.
+                log::info!("GeoClue2 stopped this client; location is no longer granted");
+                report(LocationPermission::Denied);
+                return;
             }
-            (Some(DBUS_BUS), Some("NameOwnerChanged")) if path == Some(DBUS_PATH) => {
-                if geoclue_vanished(&message) {
-                    // The daemon went away and took our client with it. Not a
-                    // decision anybody made, so not `Denied` — but delivery has
-                    // stopped and the app must stop claiming otherwise.
-                    log::warn!("the GeoClue2 service exited; location stopped");
-                    report(LocationPermission::Prompt);
-                    return;
-                }
+            Signal::ServiceGone => {
+                // The daemon went away and took our client with it. Not a
+                // decision anybody made, so not `Denied` — but delivery has
+                // stopped and the app must stop claiming otherwise.
+                log::warn!("the GeoClue2 service exited; location stopped");
+                report(LocationPermission::Prompt);
+                return;
             }
-            // Every other signal the two match rules let through — mostly other
-            // apps' geoclue clients, which is what the `ours` guard is
-            // protecting against. At `trace` because it is also the only way to
-            // confirm from outside that the rules and the filter are wired up
-            // at all.
-            _ => log::trace!(
-                "ignoring {}.{} on {}",
-                interface.unwrap_or("?"),
-                member.unwrap_or("?"),
-                path.unwrap_or("?")
-            ),
+            Signal::Ignore => {}
         }
     }
 
@@ -471,6 +445,96 @@ fn watch(
     // settings button working rather than the one that reads as a decision.
     log::warn!("the D-Bus connection ended unexpectedly; location stopped");
     report(LocationPermission::Prompt);
+}
+
+/// Whether a `Location` object is one this session has not already read.
+///
+/// GeoClue sets `Client.Location` **and** emits `LocationUpdated` for the same
+/// fix, so the property read done before the loop and the loop's first signal
+/// routinely name the same object. Each duplicate costs a `GetAll` round trip,
+/// a channel send and a full frame — the wake is the expensive part — for a
+/// position the consumer already has.
+fn is_new(last: Option<&OwnedObjectPath>, candidate: &OwnedObjectPath) -> bool {
+    last != Some(candidate)
+}
+
+/// What one message off the stream means to this session.
+#[derive(Debug, PartialEq, Eq)]
+enum Signal {
+    /// A new `Location` object to read.
+    NewLocation(OwnedObjectPath),
+    /// GeoClue stopped this client: consent has been withdrawn.
+    Revoked,
+    /// GeoClue itself released its bus name, taking the client with it.
+    ServiceGone,
+    /// Not addressed to this session.
+    Ignore,
+}
+
+/// Decide what a message means, without reading anything off the bus.
+///
+/// Split out of [`watch`] because it is the part with the interesting mistakes
+/// in it and the part a test can reach: `watch` needs a live `MessageIterator`
+/// and therefore a bus, while this takes a `Message` a test can build. Every
+/// guard below is one that failed silently in the wrong direction —
+/// mis-attributing another app's revocation to this one, or missing our own.
+///
+/// The stream it filters is **unfiltered by design** (see [`subscribe`]), so it
+/// carries this connection's own method replies and every other geoclue client
+/// on the machine. Both are rejected here: replies by message type, everything
+/// else by the object path it claims to be about.
+fn route(message: &zbus::message::Message, client: &str) -> Signal {
+    if message.message_type() != zbus::message::Type::Signal {
+        return Signal::Ignore;
+    }
+    let header = message.header();
+    let member = header.member().map(|m| m.as_str());
+    let interface = header.interface().map(|i| i.as_str());
+    let path = header.path().map(|p| p.as_str());
+    let ours = path == Some(client);
+
+    match (interface, member) {
+        (Some(CLIENT_IFACE), Some("LocationUpdated")) if ours => {
+            // `(old, new)`; only the new path is worth a round trip.
+            match message
+                .body()
+                .deserialize::<(OwnedObjectPath, OwnedObjectPath)>()
+            {
+                Ok((_, new)) => Signal::NewLocation(new),
+                Err(_) => {
+                    log::debug!("LocationUpdated with an unexpected body");
+                    Signal::Ignore
+                }
+            }
+        }
+        (Some(PROPERTIES_IFACE), Some("PropertiesChanged")) if ours => {
+            if client_went_inactive(message) {
+                Signal::Revoked
+            } else {
+                Signal::Ignore
+            }
+        }
+        (Some(DBUS_BUS), Some("NameOwnerChanged")) if path == Some(DBUS_PATH) => {
+            if geoclue_vanished(message) {
+                Signal::ServiceGone
+            } else {
+                Signal::Ignore
+            }
+        }
+        // Every other signal the two match rules let through — mostly other
+        // apps' geoclue clients, which is what the `ours` guard is protecting
+        // against. At `trace` because it is also the only way to confirm from
+        // outside that the rules and the filter are wired up at all.
+        _ => {
+            log::trace!(
+                "ignoring {}.{} on {}",
+                interface.unwrap_or("?"),
+                member.unwrap_or("?"),
+                path.unwrap_or("?")
+            );
+            Signal::Ignore
+        }
+    }
 }
 
 /// Read one `Location` object and hand the fix to the consumer. `false` when
@@ -730,33 +794,59 @@ fn explain(error: &zbus::Error) -> String {
 /// first measured working.
 fn preflight_desktop_file() {
     let file = format!("{DESKTOP_ID}.desktop");
-    let home = std::env::var_os("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share"))
-        });
-    let dirs = std::env::var("XDG_DATA_DIRS").unwrap_or_default();
-    let dirs = if dirs.is_empty() {
-        "/usr/local/share:/usr/share".to_owned()
-    } else {
-        dirs
-    };
-
-    let found = home
-        .iter()
-        .cloned()
-        .chain(dirs.split(':').filter(|d| !d.is_empty()).map(Into::into))
-        .any(|dir: std::path::PathBuf| dir.join("applications").join(&file).is_file());
-
-    if !found {
-        log::warn!(
-            "{file} is not installed under XDG_DATA_HOME or XDG_DATA_DIRS. \
-             GeoClue's Start() needs a DesktopId it can resolve, so where a \
-             location agent is registered (GNOME's shell is one) this session \
-             will be refused with AccessDenied. Install it with \
-             `make -C packaging/linux install-user`."
-        );
+    if desktop_search_path(
+        std::env::var_os("XDG_DATA_HOME"),
+        std::env::var_os("HOME"),
+        std::env::var_os("XDG_DATA_DIRS"),
+    )
+    .into_iter()
+    .any(|dir| dir.join(&file).is_file())
+    {
+        return;
     }
+    log::warn!(
+        "{file} is not installed under XDG_DATA_HOME or XDG_DATA_DIRS. \
+         GeoClue's Start() needs a DesktopId it can resolve, so where a \
+         location agent is registered (GNOME's shell is one) this session \
+         will be refused with AccessDenied. Install it with \
+         `make -C packaging/linux install-user`."
+    );
+}
+
+/// Every `applications/` directory a desktop-file lookup searches, in the order
+/// it searches them.
+///
+/// Takes the three environment values rather than reading them, which is what
+/// makes the search order testable: `std::env::set_var` is `unsafe` in this
+/// edition and unsound alongside a parallel test runner, so a function that
+/// read the environment itself could only ever be tested against whatever the
+/// machine happened to have set.
+///
+/// The rules are the XDG basedir spec's, which is what `GDesktopAppInfo`
+/// implements: `$XDG_DATA_HOME` first, defaulting to `~/.local/share`, then
+/// each entry of `$XDG_DATA_DIRS`, defaulting to `/usr/local/share:/usr/share`.
+/// An *empty* value counts as unset, not as an empty list — the spec says so,
+/// and getting it wrong means a user with `XDG_DATA_DIRS=` installed to
+/// `/usr/share` and gets told nothing is there.
+fn desktop_search_path(
+    data_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    data_dirs: Option<std::ffi::OsString>,
+) -> Vec<std::path::PathBuf> {
+    let home = data_home
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| home.map(|h| std::path::PathBuf::from(h).join(".local/share")));
+
+    let dirs = data_dirs
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "/usr/local/share:/usr/share".into());
+    let dirs = dirs.to_string_lossy().into_owned();
+
+    home.into_iter()
+        .chain(dirs.split(':').filter(|d| !d.is_empty()).map(Into::into))
+        .map(|dir: std::path::PathBuf| dir.join("applications"))
+        .collect()
 }
 
 // ── Decoding ────────────────────────────────────────────────────────────
@@ -776,12 +866,20 @@ fn fix_from_properties(props: &HashMap<String, OwnedValue>) -> Option<GpsFix> {
     let longitude = number(props, "Longitude")?;
     let accuracy_m = number(props, "Accuracy").and_then(decode_accuracy);
 
+    // `from_device_position` is what sets `FixQuality::Device`, and it stays
+    // `Device` however small `accuracy_m` turns out to be. That is not an
+    // omission: GeoClue never names its source, so a 5 m fix from a USB
+    // receiver and a 5 m fix from a very good Wi-Fi database are the same
+    // D-Bus reply. `Gps` is a claim about *where the number came from*, not
+    // about how tight it is, and promoting on accuracy would put "GPS" in the
+    // UI beside a position that came from a router lookup. The accuracy is not
+    // discarded — it travels in `accuracy_m`, which is what the
+    // provisional-site upgrade actually gates on.
     Some(GpsFix {
         altitude_m: number(props, "Altitude").and_then(decode_altitude),
         speed_mps: number(props, "Speed").and_then(decode_speed),
         heading_deg: number(props, "Heading").and_then(decode_heading),
         accuracy_m,
-        fix_quality: quality_for(accuracy_m),
         timestamp: props.get("Timestamp").and_then(decode_timestamp),
         ..GpsFix::from_device_position(latitude, longitude)
     })
@@ -790,23 +888,6 @@ fn fix_from_properties(props: &HashMap<String, OwnedValue>) -> Option<GpsFix> {
 /// One `d` property, or `None` when it is absent or not a double.
 fn number(props: &HashMap<String, OwnedValue>, name: &str) -> Option<f64> {
     f64::try_from(props.get(name)?).ok()
-}
-
-/// What quality a GeoClue fix carries — **always [`FixQuality::Device`]**,
-/// however small the accuracy circle is.
-///
-/// Not an oversight, and the accuracy argument is what makes the point worth
-/// pinning: GeoClue never names its source. A 5 m fix from a USB GPS receiver
-/// and a 5 m fix from a very good Wi-Fi database are the same D-Bus reply, and
-/// [`FixQuality::Gps`] is a claim about *where the number came from*, not about
-/// how tight it is. Promoting on accuracy would put "GPS" in the UI beside a
-/// position that came from a router lookup.
-///
-/// The accuracy is not discarded: it travels as
-/// [`GpsFix::accuracy_m`](rustdar_gps::GpsFix::accuracy_m), which is what the
-/// provisional-site upgrade actually gates on.
-fn quality_for(_accuracy_m: Option<f64>) -> FixQuality {
-    FixQuality::Device
 }
 
 /// Altitude, unless it is the documented sentinel.
@@ -889,6 +970,7 @@ fn timestamp_from_epoch(seconds: u64, micros: u64) -> Option<chrono::NaiveDateTi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustdar_gps::FixQuality;
 
     // Every test here runs with no session bus, no geoclue and no D-Bus of any
     // kind. That is not incidental: CI has none of those, and the parts of this
@@ -950,10 +1032,27 @@ mod tests {
         assert_eq!(decode_altitude(357.0), Some(357.0));
     }
 
+    /// Spelled out rather than compared against itself: every other test in
+    /// this section names the constant, so a sign flip here would pass all of
+    /// them while turning "1 m/s" into "unknown" on every fix.
+    #[test]
+    fn the_speed_and_heading_sentinel_is_the_number_the_interface_documents() {
+        assert_eq!(SPEED_HEADING_UNKNOWN, -1.0);
+    }
+
     #[test]
     fn an_unknown_speed_is_absent_rather_than_reversing() {
         assert_eq!(decode_speed(SPEED_HEADING_UNKNOWN), None);
         assert_eq!(decode_speed(-0.5), None);
+    }
+
+    /// A stationary receiver says nothing about a bearing, and
+    /// `HeadingSource::Auto` reads exactly this field to decide whether to
+    /// trust one. `Some(0.0)` and `None` are the same statement, and only one
+    /// of them stays true after a unit conversion or a comparison.
+    #[test]
+    fn a_stationary_reading_is_no_speed_rather_than_a_speed_of_zero() {
+        assert_eq!(decode_speed(0.0), None);
     }
 
     #[test]
@@ -1028,23 +1127,27 @@ mod tests {
         assert_eq!(timestamp_from_epoch(u64::MAX, 0), None);
     }
 
-    // ── Quality ─────────────────────────────────────────────────────────
-
-    /// The honesty rule, pinned because it is the one somebody will be tempted
-    /// to "improve": accuracy says how tight the circle is and says nothing at
-    /// all about whether a satellite was involved.
+    /// The wire type is `(tt)`, a struct of two `u64`s, and the two halves are
+    /// in an order nothing in the signature enforces. Decoding a real one is
+    /// the only way to find out that they were read the wrong way round.
     #[test]
-    fn even_a_five_metre_fix_is_reported_as_a_device_fix_and_not_as_gps() {
-        assert_eq!(quality_for(Some(5.0)), FixQuality::Device);
-        assert_eq!(quality_for(Some(25_000.0)), FixQuality::Device);
-        assert_eq!(quality_for(None), FixQuality::Device);
+    fn the_two_halves_of_the_wire_timestamp_are_read_in_the_documented_order() {
+        let wire = OwnedValue::try_from(zbus::zvariant::Value::from(
+            zbus::zvariant::Structure::from((1_700_000_000u64, 250_000u64)),
+        ))
+        .expect("a (tt) value");
+
+        let decoded = decode_timestamp(&wire).expect("a timestamp");
+
+        assert_eq!(decoded.and_utc().timestamp(), 1_700_000_000);
+        assert_eq!(decoded.and_utc().timestamp_subsec_nanos(), 250_000_000);
     }
 
-    /// And the variant chosen has to be one the site upgrade will act on,
-    /// otherwise the whole arm draws a dot and never refines anything.
+    /// Anything that is not a `(tt)` leaves the field empty rather than
+    /// producing an epoch-shaped lie.
     #[test]
-    fn a_device_fix_is_allowed_to_move_the_radar_site() {
-        assert!(quality_for(Some(25_000.0)).can_relocate());
+    fn a_timestamp_of_the_wrong_shape_is_absent() {
+        assert_eq!(decode_timestamp(&OwnedValue::from(17u64)), None);
     }
 
     // ── The whole reply ─────────────────────────────────────────────────
@@ -1100,6 +1203,47 @@ mod tests {
                 .expect("a position")
                 .accuracy_m
                 .is_some()
+        );
+    }
+
+    /// The honesty rule, pinned on the real path because it is the one somebody
+    /// will be tempted to "improve": accuracy says how tight the circle is and
+    /// says nothing at all about whether a satellite was involved. The variant
+    /// also has to be one the site upgrade acts on, or the whole arm draws a
+    /// dot and never refines anything.
+    #[test]
+    fn even_a_five_metre_fix_is_reported_as_a_device_fix_and_not_as_gps() {
+        let props = reply(&[
+            ("Latitude", double(35.4676)),
+            ("Longitude", double(-97.5164)),
+            ("Accuracy", double(5.0)),
+        ]);
+        let fix = fix_from_properties(&props).expect("a position");
+        assert_eq!(fix.fix_quality, FixQuality::Device);
+        assert!(fix.fix_quality.can_relocate());
+    }
+
+    /// The timestamp comes off the same reply as everything else, and a
+    /// conversion that never reaches the fix is a field that silently stays
+    /// `None` for every position this provider ever emits.
+    #[test]
+    fn the_replys_timestamp_reaches_the_fix() {
+        let stamp = OwnedValue::try_from(zbus::zvariant::Value::from(
+            zbus::zvariant::Structure::from((1_700_000_000u64, 0u64)),
+        ))
+        .expect("a (tt) value");
+        let props = reply(&[
+            ("Latitude", double(35.4676)),
+            ("Longitude", double(-97.5164)),
+            ("Accuracy", double(25_000.0)),
+            ("Timestamp", stamp),
+        ]);
+
+        let fix = fix_from_properties(&props).expect("a position");
+
+        assert_eq!(
+            fix.timestamp.map(|t| t.and_utc().timestamp()),
+            Some(1_700_000_000)
         );
     }
 
@@ -1200,7 +1344,8 @@ mod tests {
 
     // ── Revocation ──────────────────────────────────────────────────────
 
-    fn properties_changed(
+    fn properties_changed_on(
+        path: &str,
         iface: &str,
         changed: &[(&str, OwnedValue)],
         invalidated: &[&str],
@@ -1210,14 +1355,18 @@ mod tests {
             .map(|(k, v)| ((*k).to_owned(), v.clone()))
             .collect();
         let invalidated: Vec<String> = invalidated.iter().map(|s| (*s).to_owned()).collect();
-        zbus::message::Message::signal(
-            "/org/freedesktop/GeoClue2/Client/1",
-            PROPERTIES_IFACE,
-            "PropertiesChanged",
-        )
-        .expect("a path, an interface and a member")
-        .build(&(iface, changed, invalidated))
-        .expect("a well-formed body")
+        zbus::message::Message::signal(path, PROPERTIES_IFACE, "PropertiesChanged")
+            .expect("a path, an interface and a member")
+            .build(&(iface, changed, invalidated))
+            .expect("a well-formed body")
+    }
+
+    fn properties_changed(
+        iface: &str,
+        changed: &[(&str, OwnedValue)],
+        invalidated: &[&str],
+    ) -> zbus::message::Message {
+        properties_changed_on(OURS, iface, changed, invalidated)
     }
 
     /// The push signal the whole revocation story rests on. Polling cannot see
@@ -1315,6 +1464,232 @@ mod tests {
             &[("DistanceThreshold", OwnedValue::from(100u32))],
             &[],
         )));
+    }
+
+    // ── Routing ─────────────────────────────────────────────────────────
+    //
+    // The stream `route` filters is deliberately unfiltered, so these are the
+    // tests that stand between "this session" and "every geoclue client on the
+    // machine". Each guard here failed silently in one direction or the other
+    // before it existed.
+
+    const OURS: &str = "/org/freedesktop/GeoClue2/Client/1";
+    const THEIRS: &str = "/org/freedesktop/GeoClue2/Client/2";
+
+    fn location_updated(client: &str, old: &str, new: &str) -> zbus::message::Message {
+        zbus::message::Message::signal(client, CLIENT_IFACE, "LocationUpdated")
+            .expect("a path, an interface and a member")
+            .build(&(
+                OwnedObjectPath::try_from(old).expect("an object path"),
+                OwnedObjectPath::try_from(new).expect("an object path"),
+            ))
+            .expect("a well-formed body")
+    }
+
+    #[test]
+    fn our_own_location_update_is_a_new_position_to_read() {
+        let message = location_updated(OURS, "/", "/org/freedesktop/GeoClue2/Location/3");
+        assert_eq!(
+            route(&message, OURS),
+            Signal::NewLocation(
+                OwnedObjectPath::try_from("/org/freedesktop/GeoClue2/Location/3")
+                    .expect("an object path")
+            )
+        );
+    }
+
+    /// Another application's client is on the same bus, emits the same signals,
+    /// and its position is not ours to report.
+    #[test]
+    fn another_applications_location_update_is_ignored() {
+        let message = location_updated(THEIRS, "/", "/org/freedesktop/GeoClue2/Location/9");
+        assert_eq!(route(&message, OURS), Signal::Ignore);
+    }
+
+    #[test]
+    fn our_client_being_stopped_is_a_revocation() {
+        let message = properties_changed_on(
+            OURS,
+            CLIENT_IFACE,
+            &[("Active", OwnedValue::from(false))],
+            &[],
+        );
+        assert_eq!(route(&message, OURS), Signal::Revoked);
+    }
+
+    /// The worst of the mis-attributions: another app's user revoking their
+    /// permission would have turned ours off too.
+    #[test]
+    fn another_applications_client_being_stopped_is_not_our_revocation() {
+        let message = properties_changed_on(
+            THEIRS,
+            CLIENT_IFACE,
+            &[("Active", OwnedValue::from(false))],
+            &[],
+        );
+        assert_eq!(route(&message, OURS), Signal::Ignore);
+    }
+
+    #[test]
+    fn the_service_releasing_its_name_ends_the_session() {
+        assert_eq!(
+            route(&name_owner_changed(GEOCLUE_BUS, ":1.42", ""), OURS),
+            Signal::ServiceGone
+        );
+    }
+
+    #[test]
+    fn the_service_reappearing_does_not_end_the_session() {
+        assert_eq!(
+            route(&name_owner_changed(GEOCLUE_BUS, "", ":1.43"), OURS),
+            Signal::Ignore
+        );
+    }
+
+    /// Method replies to this connection's own calls arrive on the same stream
+    /// — they have no interface and no member, and a router that only matched
+    /// on those would fall through to whatever its catch-all did.
+    #[test]
+    fn this_connections_own_method_replies_are_not_signals() {
+        let call = zbus::message::Message::method_call("/", "Whatever")
+            .expect("a path and a member")
+            .build(&())
+            .expect("an empty body");
+        assert_eq!(route(&call, OURS), Signal::Ignore);
+    }
+
+    /// `NameOwnerChanged` is the bus's own announcement and only the bus object
+    /// is entitled to make it. Anything else emitting the same
+    /// interface/member pair with a convincing body is an impersonation, and
+    /// acting on it would end a perfectly live session.
+    #[test]
+    fn a_name_change_announced_by_something_other_than_the_bus_is_ignored() {
+        let impostor =
+            zbus::message::Message::signal("/somewhere/else", DBUS_BUS, "NameOwnerChanged")
+                .expect("a path, an interface and a member")
+                .build(&(GEOCLUE_BUS, ":1.42", ""))
+                .expect("a well-formed body");
+        assert_eq!(route(&impostor, OURS), Signal::Ignore);
+    }
+
+    // ── De-duplication ──────────────────────────────────────────────────
+
+    fn location(n: u32) -> OwnedObjectPath {
+        OwnedObjectPath::try_from(format!("/org/freedesktop/GeoClue2/Location/{n}"))
+            .expect("an object path")
+    }
+
+    /// GeoClue announces the same fix twice at startup — once by setting
+    /// `Client.Location`, once by signal — and each duplicate costs a round
+    /// trip and a full frame for a position the app already has.
+    #[test]
+    fn the_object_already_read_is_not_read_again() {
+        assert!(!is_new(Some(&location(3)), &location(3)));
+    }
+
+    #[test]
+    fn a_different_object_is_a_new_position() {
+        assert!(is_new(Some(&location(3)), &location(4)));
+        assert!(is_new(None, &location(3)));
+    }
+
+    // ── The desktop-file search path ────────────────────────────────────
+
+    fn search(data_home: Option<&str>, home: Option<&str>, data_dirs: Option<&str>) -> Vec<String> {
+        desktop_search_path(
+            data_home.map(Into::into),
+            home.map(Into::into),
+            data_dirs.map(Into::into),
+        )
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect()
+    }
+
+    /// The order matters as much as the membership: a per-user file must be
+    /// found even on a machine that also has a system-wide one.
+    #[test]
+    fn the_users_own_data_directory_is_searched_before_the_system_ones() {
+        assert_eq!(
+            search(Some("/home/u/.local/share"), None, Some("/usr/share")),
+            [
+                "/home/u/.local/share/applications",
+                "/usr/share/applications"
+            ]
+        );
+    }
+
+    /// `install-user` writes to `~/.local/share` and most sessions never set
+    /// `XDG_DATA_HOME`, so this fallback is the common case rather than the
+    /// exotic one.
+    #[test]
+    fn an_unset_data_home_falls_back_to_the_directory_under_home() {
+        let path = search(None, Some("/home/u"), Some("/usr/share"));
+        assert_eq!(
+            path.first().map(String::as_str),
+            Some("/home/u/.local/share/applications")
+        );
+    }
+
+    /// The spec's own rule, and the one that bites: an exported-but-empty
+    /// variable means "use the default", not "search nowhere". Reading it as an
+    /// empty list tells a user with the file in `/usr/share` that it is
+    /// missing.
+    #[test]
+    fn an_empty_environment_value_means_the_default_and_not_an_empty_list() {
+        assert_eq!(
+            search(Some(""), Some("/home/u"), Some("")),
+            [
+                "/home/u/.local/share/applications",
+                "/usr/local/share/applications",
+                "/usr/share/applications",
+            ]
+        );
+    }
+
+    /// A container with neither variable still gets the system directories,
+    /// which is where a packaged install would have put the file.
+    #[test]
+    fn a_process_with_no_environment_still_searches_the_system_directories() {
+        assert_eq!(
+            search(None, None, None),
+            ["/usr/local/share/applications", "/usr/share/applications"]
+        );
+    }
+
+    /// Trailing and doubled separators are ordinary in a hand-edited
+    /// `XDG_DATA_DIRS`, and an empty entry would otherwise become the relative
+    /// path `applications`, searched against whatever directory the app happens
+    /// to have been launched from.
+    #[test]
+    fn empty_entries_in_the_directory_list_do_not_become_relative_paths() {
+        assert_eq!(
+            search(None, None, Some("/a::/b:")),
+            ["/a/applications", "/b/applications"]
+        );
+    }
+
+    // ── Stopping ────────────────────────────────────────────────────────
+
+    /// The start/stop race: `start` returns before the thread has a connection,
+    /// so a reader dropped in that window has nothing to close. What must not
+    /// happen is the thread then parking a connection nobody will ever close —
+    /// which would leave a started GeoClue client alive for the life of the
+    /// process.
+    #[test]
+    fn a_reader_dropped_before_its_thread_connects_refuses_the_connection() {
+        let closer = Closer::default();
+        assert!(
+            closer.lock().accepts(),
+            "a fresh session must be allowed to hand its connection over"
+        );
+
+        closer.close();
+
+        assert!(
+            !closer.lock().accepts(),
+            "a connection handed over after the stop would never be closed"
+        );
     }
 
     // ── Identity ────────────────────────────────────────────────────────
