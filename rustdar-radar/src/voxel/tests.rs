@@ -2208,15 +2208,61 @@ fn the_default_transparency_profile_is_measured_per_product() {
     assert_eq!(alpha(RadarProduct::SpectrumWidth, 1.0), 0, "laminar flow");
     solid(RadarProduct::SpectrumWidth, 10.0, "turbulence");
 
-    // ZDR: rain's own background is invisible; big-drop columns and hail
-    // cores are solid on their opposite sides of it.
+    // ZDR: the quiet band is the interval the crate's own HCA leaves for
+    // ordinary rain, and it does not contain zero. This block is the
+    // regression: a profile that put a clear band on 0 dB rendered the
+    // canonical tumbling-hail signature as a hole.
+    let zdr = RadarProduct::DifferentialReflectivity;
+    use volume_alpha_profile as p;
     assert_eq!(
-        alpha(RadarProduct::DifferentialReflectivity, 0.25),
-        0,
-        "small drops"
+        (p::ZDR_RAIN_LO_DB, p::ZDR_RAIN_HI_DB),
+        (crate::hca::MIN_ZDR_BD as f32, crate::hca::MAX_ZDR_GR as f32),
+        "the quiet band must stay the HCA's own rain interval",
     );
-    solid(RadarProduct::DifferentialReflectivity, 4.0, "a ZDR column");
-    solid(RadarProduct::DifferentialReflectivity, -3.5, "a hail core");
+    assert!(
+        p::ZDR_RAIN_LO_DB > 0.0,
+        "the quiet band must not contain 0 dB: that is the hail value              ({} = {}, and high ZDR is never large hail)",
+        "hca::HSDA_MAX_ZDR",
+        crate::hca::HSDA_MAX_ZDR,
+    );
+    for (value, what) in [
+        (p::ZDR_RAIN_LO_DB, "the rain band's floor"),
+        (1.0, "moderate rain"),
+        (p::ZDR_RAIN_HI_DB, "the rain band's ceiling"),
+    ] {
+        assert_eq!(alpha(zdr, value), 0, "{what} is the volume's filler");
+    }
+    // The finding, as a number. Tumbling hail sits at ZDR ~ 0 under high
+    // Z; it must be plainly visible, not a hole and not a whisper.
+    let hail = alpha(zdr, 0.0);
+    assert!(
+        hail >= palette_alpha(zdr, 0.0) / 3,
+        "tumbling hail at 0 dB renders at {hail} of {}: a hole where the              HCA's own bounds put the signature",
+        palette_alpha(zdr, 0.0),
+    );
+    solid(zdr, p::ZDR_ICE_DB, "ice and tumbling scatterers");
+    solid(zdr, -3.5, "the negative tail");
+    solid(zdr, p::ZDR_COLUMN_DB, "a ZDR column");
+    solid(zdr, 4.0, "a big-drop core");
+    // Monotone away from the rain band in both directions, so "further
+    // from rain is more visible" holds and no interior notch hides a
+    // value between two landmarks.
+    for pair in [
+        [0.4f32, 0.2],
+        [0.2, 0.0],
+        [0.0, -0.25],
+        [2.1, 2.2],
+        [2.5, 2.8],
+    ] {
+        let (nearer, further) = (alpha(zdr, pair[0]), alpha(zdr, pair[1]));
+        assert!(
+            further >= nearer,
+            "ZDR {} is further from the rain band than {} and renders \
+                 fainter ({further} against {nearer})",
+            pair[1],
+            pair[0],
+        );
+    }
 
     // ρHV: uniform precipitation is invisible — the profile inverts,
     // because this moment's background is the TOP of its scale. Debris
@@ -2270,8 +2316,6 @@ fn the_default_transparency_profile_is_measured_per_product() {
     assert_eq!(alpha(srv, 0.0), 0, "air travelling with the storm");
     solid(srv, 30.0, "an outbound storm-relative core");
     solid(srv, -30.0, "an inbound storm-relative core");
-
-    use volume_alpha_profile as p;
 
     // NROT: the finding. The clear point is the algorithm's own
     // significance floor, not a number chosen here — NROT's palette is
@@ -2386,7 +2430,11 @@ fn the_default_transparency_profile_is_measured_per_product() {
             ("ref", 64, 180),
             ("vel", 41, 180),
             ("sw", 18, 180),
-            ("zdr", 53, 180),
+            // Was 53 on the profile that put a clear band across 0 dB.
+            // The band moved off zero and narrowed to the HCA's own rain
+            // interval, so 16 fewer entries are see-through — and the 16
+            // are the ones around the hail value.
+            ("zdr", 37, 180),
             ("phi", 255, 63),
             ("rho", 35, 180),
             // Velocity's own count, which is what sharing its band means.
@@ -2478,10 +2526,10 @@ fn the_isosurface_params_translate_the_user_threshold_per_shape() {
         "the crossing distance is 2.75 dB of ramp FROM the rain centre",
     );
     // Which is to say the default surface is the +3 dB column and the
-    // −2.5 dB tail.
+    // −2.5 dB tail, not the hail value at 0 — the profile shows that one.
     assert_eq!(
         default_iso_threshold(RadarProduct::DifferentialReflectivity),
-        volume_alpha_profile::ZDR_OPAQUE_DB - centre_db,
+        volume_alpha_profile::ZDR_COLUMN_DB - centre_db,
     );
 
     // The derived products carry their own ramps, so their thresholds

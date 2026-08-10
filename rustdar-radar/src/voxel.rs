@@ -1028,13 +1028,67 @@ mod volume_alpha_profile {
     pub const SW_CLEAR_MS: f32 = 2.0;
     pub const SW_OPAQUE_MS: f32 = 8.0;
 
-    /// Differential reflectivity diverges about rain's own background rather
-    /// than about zero: drizzle and small drops sit near +0.25 dB. Clear
-    /// within ±0.75 dB of that centre, opaque beyond ±3 dB from it — big-drop
-    /// columns on the positive side, hail and graupel cores on the negative.
+    /// Differential reflectivity's quiet band is the interval the crate's own
+    /// ORPG-derived HCA leaves for ordinary rain — and it does **not**
+    /// contain zero.
+    ///
+    /// The shipped profile centred a fully clear band on +0.25 dB and claimed
+    /// opacity beyond ±3 dB showed "hail and graupel cores on the negative".
+    /// [`crate::hca`] contradicts the second half outright: graupel is refused
+    /// above [`crate::hca::MAX_ZDR_GR`] = 2.0 dB, and `HailSize`'s hard limit
+    /// is [`crate::hca::HSDA_MAX_ZDR`] = 2.0, commented in that module as
+    /// "high ZDR is never large/giant hail". Hail is a tumbling,
+    /// near-isotropic scatterer: its signature is ZDR ≈ 0 under high Z, not
+    /// ZDR ≪ 0. A clear band over [−0.5, +1.0] reaching full opacity only
+    /// past −2.75 dB therefore rendered the canonical hail core as a **hole**
+    /// — the same pixels the volume shows where there is no data at all —
+    /// and spent the ramp on a negative tail nature seldom reaches.
+    ///
+    /// A diverging moment's boring band is near zero only when the scatterers
+    /// are *rain*. So the quiet band is put where the HCA's own class kills
+    /// say rain and nothing else lives: from [`crate::hca::MIN_ZDR_BD`] = 0.5
+    /// dB (under it a return has already been refused the big-drop class, and
+    /// [`crate::hca::MIN_ZDR_HR`] = 1.0 refuses heavy rain as well) up to
+    /// [`crate::hca::MAX_ZDR_GR`] = 2.0 (over it every ice, graupel and hail
+    /// class has been refused, and [`crate::hca::MAX_ZDR_DS`] puts dry snow
+    /// at the same bound). Inside that interval ZDR has excluded nothing and
+    /// is reporting the rain that fills a volume; outside it, either way, ZDR
+    /// has excluded a class and is carrying information.
+    ///
+    /// The two departures are not symmetric and the profile is not either.
+    /// Upward is drop size: a smooth continuum that only becomes a ZDR column
+    /// well above the rain band, so the rise runs out to [`ZDR_COLUMN_DB`].
+    /// Downward is a change of *phase* — ice, graupel, tumbling hail, and
+    /// under 0 dB even wet snow is refused ([`crate::hca::MIN_ZDR_WS`]) — and
+    /// it is loaded immediately, so the rise is finished at
+    /// [`ZDR_ICE_DB`]: rain's own floor reflected through zero. Half a
+    /// decibel of overshoot rather than stopping on 0 is what puts the
+    /// tumbling-hail value *inside* the visible region at half strength
+    /// instead of on its edge, while leaving the 0.1–0.4 dB dry snow and
+    /// small ice that fill the top of every volume faint rather than a wall.
+    ///
+    /// What this deliberately does not claim: ZDR alone cannot tell that
+    /// near-zero hail from that dry snow — `MAX_ZDR_DS` is 2.0 too, and the
+    /// discriminator is Z, which a one-moment volume does not carry. The
+    /// profile makes the region *visible*, not *hail-coloured*; the palette's
+    /// own colours still say only what the value is.
+    pub const ZDR_RAIN_LO_DB: f32 = crate::hca::MIN_ZDR_BD as f32;
+    pub const ZDR_RAIN_HI_DB: f32 = crate::hca::MAX_ZDR_GR as f32;
+    pub const ZDR_ICE_DB: f32 = -ZDR_RAIN_LO_DB;
+    pub const ZDR_COLUMN_DB: f32 = 3.0;
+
+    /// The diverging centre the **isosurface** reads for ZDR: rain's own
+    /// background, so the default surface draws both drop-size extremes.
+    ///
+    /// Not the centre of the quiet band above, and not used by the
+    /// transparency profile at all — that one is two-sided and has no single
+    /// centre. Kept separate because the near-zero hail signature is a band
+    /// *around* this centre, and no `DeviationFrom` level set can enclose a
+    /// band around its own centre: the isosurface draws big-drop columns and
+    /// the rare negative tail, and the lit volume is the instrument for the
+    /// hail value. Said here so the next reader does not mistake the two
+    /// numbers for one that drifted.
     pub const ZDR_CENTRE_DB: f32 = 0.25;
-    pub const ZDR_CLEAR_DB: f32 = 0.75;
-    pub const ZDR_OPAQUE_DB: f32 = 3.0;
 
     /// Correlation coefficient inverts the usual shape: uniform precipitation
     /// reads 0.97–1.0, and that is the background to see through. Clear above
@@ -1172,8 +1226,11 @@ pub fn iso_shape(product: RadarProduct) -> IsoShape {
 /// * Velocity / SRV 20 m/s — where the transparency profile reaches opaque:
 ///   the cores and couplets, free of ambient flow.
 /// * Spectrum width 8 m/s — the profile's turbulence edge.
-/// * ZDR 2.75 dB from the +0.25 rain centre — big-drop columns one side,
-///   hail cores the other, at ±3 dB on the scale.
+/// * ZDR 2.75 dB from the +0.25 rain centre — the big-drop column at +3 dB
+///   and the rare negative tail at −2.5. **Not** the hail signature: that one
+///   is ZDR ≈ 0, a band around this centre rather than beyond it, and a
+///   `DeviationFrom` surface cannot enclose it. The lit volume shows it
+///   ([`volume_alpha_profile::ZDR_ICE_DB`]); the isosurface does not.
 /// * ΦDP 180° — mid-turn; a cumulative site-offset moment has no principled
 ///   default, and the slider is the instrument here.
 /// * ρHV at or under 0.90 — the profile's opaque edge: the melting layer,
@@ -1186,7 +1243,7 @@ pub fn default_iso_threshold(product: RadarProduct) -> f32 {
         RadarProduct::Reflectivity => 18.0,
         RadarProduct::Velocity | RadarProduct::StormRelativeVelocity => p::VELOCITY_OPAQUE_MS,
         RadarProduct::SpectrumWidth => p::SW_OPAQUE_MS,
-        RadarProduct::DifferentialReflectivity => p::ZDR_OPAQUE_DB - p::ZDR_CENTRE_DB,
+        RadarProduct::DifferentialReflectivity => p::ZDR_COLUMN_DB - p::ZDR_CENTRE_DB,
         RadarProduct::DifferentialPhase => 180.0,
         RadarProduct::CorrelationCoefficient => p::CC_OPAQUE,
         RadarProduct::SpecificDifferentialPhase => p::KDP_OPAQUE_DEG_KM,
@@ -1284,11 +1341,16 @@ fn volume_alpha_scale(product: RadarProduct, value: f32) -> f32 {
             smoothstep(p::VELOCITY_CLEAR_MS, p::VELOCITY_OPAQUE_MS, value.abs())
         }
         RadarProduct::SpectrumWidth => smoothstep(p::SW_CLEAR_MS, p::SW_OPAQUE_MS, value),
-        RadarProduct::DifferentialReflectivity => smoothstep(
-            p::ZDR_CLEAR_DB,
-            p::ZDR_OPAQUE_DB,
-            (value - p::ZDR_CENTRE_DB).abs(),
-        ),
+        // Two-sided and asymmetric, not a deviation from one centre: the
+        // quiet band is `[ZDR_RAIN_LO_DB, ZDR_RAIN_HI_DB]` and the two ways
+        // out of it are different physics. See the profile entry.
+        RadarProduct::DifferentialReflectivity => {
+            if value < p::ZDR_RAIN_LO_DB {
+                1.0 - smoothstep(p::ZDR_ICE_DB, p::ZDR_RAIN_LO_DB, value)
+            } else {
+                smoothstep(p::ZDR_RAIN_HI_DB, p::ZDR_COLUMN_DB, value)
+            }
+        }
         RadarProduct::CorrelationCoefficient => 1.0 - smoothstep(p::CC_OPAQUE, p::CC_CLEAR, value),
         RadarProduct::DifferentialPhase => p::PHI_ALPHA,
         // The derived products, admitted by `crate::derive`. SRV shares
