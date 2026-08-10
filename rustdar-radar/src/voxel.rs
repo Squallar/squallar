@@ -1106,11 +1106,43 @@ mod volume_alpha_profile {
     /// rather than a wall.
     pub const PHI_ALPHA: f32 = 0.35;
 
-    /// Storm-relative velocity diverges about zero exactly as base velocity
-    /// does, and shares its profile: with the storm motion subtracted, the
-    /// near-zero band is air moving *with* the storm — the background — and
-    /// the couplet cores the product exists to show sit beyond ±20 m/s.
-    /// (The constants are velocity's own, reused at the profile table.)
+    /// Storm-relative velocity keeps velocity's shape and velocity's numbers
+    /// — but **not** velocity's justification, and the difference is the
+    /// whole entry.
+    ///
+    /// [`crate::srv`] computes `SRV = V + speed·cos(direction − az)`. Set `V`
+    /// to zero — air at rest over the ground — and what is left is a cosine
+    /// in azimuth of amplitude equal to the storm's own speed. So the
+    /// near-zero band of an SRV volume is *not* its background: it is the
+    /// narrow ridge of azimuths perpendicular to the motion vector, plus
+    /// whatever air happens to be travelling with the storm. Everywhere else
+    /// ambient air reads well away from zero — for a 40 kt storm, still air
+    /// 45° off the motion axis reads 14.6 m/s and this profile renders it
+    /// about 73 % opaque — so an SRV volume grows two broad opacity lobes
+    /// along the motion vector out of the vector alone.
+    ///
+    /// Those lobes are kept, deliberately. They are not an artefact of the
+    /// transfer function; they are the entire content of the subtraction.
+    /// SRV minus that ambient cosine is, term for term, base velocity, so a
+    /// profile that suppressed them would be showing V under SRV's name — and
+    /// the plan-view SRV palette colours exactly the same air for exactly the
+    /// same reason. A volume that agrees with the plan view is the honest
+    /// outcome.
+    ///
+    /// The alternative considered and rejected: widen the clear band to the
+    /// storm speed, which is the tightest band that makes still air invisible
+    /// at *every* azimuth. It fails in the direction this campaign forbids.
+    /// Perpendicular to the motion the ambient contribution is zero, so a
+    /// 10 m/s storm-relative flow there is unambiguous signal, and a band
+    /// sized for the motion axis would erase it. Lighting ambient air is a
+    /// false positive a forecaster can read past; deleting an inflow jet is
+    /// not.
+    ///
+    /// Named here rather than aliased to velocity's constants at the profile
+    /// table so that this argument is attached to SRV, and so moving one
+    /// product's band cannot silently move the other's.
+    pub const SRV_CLEAR_MS: f32 = VELOCITY_CLEAR_MS;
+    pub const SRV_OPAQUE_MS: f32 = VELOCITY_OPAQUE_MS;
     ///
     /// Normalized rotation: clear under [`crate::nrot::SIGNIFICANT`], opaque at
     /// |1.0| and beyond — the mesocyclone convention GR pins its meso class
@@ -1241,7 +1273,8 @@ pub fn default_iso_threshold(product: RadarProduct) -> f32 {
     use volume_alpha_profile as p;
     match product {
         RadarProduct::Reflectivity => 18.0,
-        RadarProduct::Velocity | RadarProduct::StormRelativeVelocity => p::VELOCITY_OPAQUE_MS,
+        RadarProduct::Velocity => p::VELOCITY_OPAQUE_MS,
+        RadarProduct::StormRelativeVelocity => p::SRV_OPAQUE_MS,
         RadarProduct::SpectrumWidth => p::SW_OPAQUE_MS,
         RadarProduct::DifferentialReflectivity => p::ZDR_COLUMN_DB - p::ZDR_CENTRE_DB,
         RadarProduct::DifferentialPhase => 180.0,
@@ -1353,11 +1386,11 @@ fn volume_alpha_scale(product: RadarProduct, value: f32) -> f32 {
         }
         RadarProduct::CorrelationCoefficient => 1.0 - smoothstep(p::CC_OPAQUE, p::CC_CLEAR, value),
         RadarProduct::DifferentialPhase => p::PHI_ALPHA,
-        // The derived products, admitted by `crate::derive`. SRV shares
-        // velocity's profile — same units, same diverging shape, same
-        // physics once the storm motion is subtracted.
+        // The derived products, admitted by `crate::derive`. SRV carries
+        // velocity's numbers under its own names and its own argument — read
+        // the profile entry before moving either.
         RadarProduct::StormRelativeVelocity => {
-            smoothstep(p::VELOCITY_CLEAR_MS, p::VELOCITY_OPAQUE_MS, value.abs())
+            smoothstep(p::SRV_CLEAR_MS, p::SRV_OPAQUE_MS, value.abs())
         }
         // Stepped, not faded, at the significance floor: NROT's palette is
         // class-structured, so the volume must go visible exactly where the

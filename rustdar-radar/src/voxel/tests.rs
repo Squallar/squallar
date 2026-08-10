@@ -2311,11 +2311,35 @@ fn the_default_transparency_profile_is_measured_per_product() {
     // Not one of these had a row here when they were admitted to every 3D
     // surface, and all three defects below shipped in that gap.
 
-    // SRV: velocity's profile, on velocity's own constants.
+    // SRV: velocity's numbers under SRV's own names, so a change to
+    // velocity's band cannot drag SRV along silently.
     let srv = RadarProduct::StormRelativeVelocity;
+    assert_eq!(
+        (p::SRV_CLEAR_MS, p::SRV_OPAQUE_MS),
+        (p::VELOCITY_CLEAR_MS, p::VELOCITY_OPAQUE_MS),
+        "SRV is velocity's profile today; changing that is a decision, \
+             not an edit",
+    );
     assert_eq!(alpha(srv, 0.0), 0, "air travelling with the storm");
     solid(srv, 30.0, "an outbound storm-relative core");
     solid(srv, -30.0, "an inbound storm-relative core");
+    // The premise the entry corrects, as arithmetic. In still air SRV is
+    // a cosine of amplitude equal to the storm speed, so the near-zero
+    // band is a ridge perpendicular to the motion, not a background. A
+    // 40 kt storm puts still air 45° off the motion axis here — kept
+    // visible on purpose: subtracting it back out would be base velocity.
+    let still_air_45 =
+        (40.0 * crate::srv::KT_TO_MS * f64::from(std::f32::consts::FRAC_1_SQRT_2)) as f32;
+    assert!(
+        (still_air_45 - 14.55).abs() < 0.05,
+        "still air 45° off a 40 kt motion reads {still_air_45} m/s",
+    );
+    let lobe = volume_alpha_scale(srv, still_air_45);
+    assert!(
+        (lobe - 0.73).abs() < 0.02,
+        "the ambient opacity lobe measures {lobe:.3}, not the ~0.73 the \
+             profile entry states",
+    );
 
     // NROT: the finding. The clear point is the algorithm's own
     // significance floor, not a number chosen here — NROT's palette is
