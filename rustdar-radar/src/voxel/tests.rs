@@ -2219,10 +2219,15 @@ fn the_default_transparency_profile_is_measured_per_product() {
         (crate::hca::MIN_ZDR_BD as f32, crate::hca::MAX_ZDR_GR as f32),
         "the quiet band must stay the HCA's own rain interval",
     );
-    assert!(
-        p::ZDR_RAIN_LO_DB > 0.0,
-        "the quiet band must not contain 0 dB: that is the hail value              ({} = {}, and high ZDR is never large hail)",
-        "hca::HSDA_MAX_ZDR",
+    // The quiet band must not contain 0 dB, because that is where a
+    // tumbling scatterer reads and `hca::HSDA_MAX_ZDR` says large hail is
+    // never above 2.0. Asserted through the table rather than through the
+    // constants, so it is a statement about what renders.
+    assert_ne!(
+        alpha(zdr, p::ZDR_TUMBLING_DB),
+        0,
+        "0 dB is inside the quiet band, and it is the hail value: \
+             hca::HSDA_MAX_ZDR is {} and high ZDR is never large hail",
         crate::hca::HSDA_MAX_ZDR,
     );
     for (value, what) in [
