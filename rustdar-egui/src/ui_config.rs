@@ -1019,7 +1019,8 @@ mod tests {
             *slot = (i / 2) as u8; // a curve no default produces
         }
         let curve = AlphaCurve::from_alphas(alphas);
-        gui.volume_alpha.set(RadarProduct::Reflectivity, curve.clone());
+        gui.volume_alpha
+            .set(RadarProduct::Reflectivity, curve.clone());
         gui.save_ui_config(&store);
 
         let mut restored = crate::Gui::new();
@@ -1101,7 +1102,11 @@ mod tests {
             0,
             "entry 0 is the no-data index and must be re-clamped on load",
         );
-        assert_eq!(velocity.alphas()[1], 9, "the rest of the curve is kept as saved");
+        assert_eq!(
+            velocity.alphas()[1],
+            9,
+            "the rest of the curve is kept as saved"
+        );
         assert_eq!(velocity.alphas()[255], 255);
     }
 

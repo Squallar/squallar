@@ -138,7 +138,11 @@ pub fn apply_stroke(alphas: &mut [u8; CURVE_LEN], from: (f32, f32), to: (f32, f3
     if ![from.0, from.1, to.0, to.1].iter().all(|v| v.is_finite()) {
         return;
     }
-    let (left, right) = if from.0 <= to.0 { (from, to) } else { (to, from) };
+    let (left, right) = if from.0 <= to.0 {
+        (from, to)
+    } else {
+        (to, from)
+    };
     let lo = (left.0.round().clamp(0.0, 255.0)) as usize;
     let hi = (right.0.round().clamp(0.0, 255.0)) as usize;
     let span = right.0 - left.0;
@@ -258,7 +262,10 @@ mod tests {
 
         let mut alphas = [0u8; CURVE_LEN];
         apply_stroke(&mut alphas, (-3.0, 1.0), (5.0, 1.0));
-        assert_eq!(alphas[0], 0, "a stroke over the left edge must not paint entry 0");
+        assert_eq!(
+            alphas[0], 0,
+            "a stroke over the left edge must not paint entry 0"
+        );
         assert!(
             alphas[1..=5].iter().all(|a| *a == 255),
             "the rest of the stroke must land: {:?}",
@@ -278,8 +285,16 @@ mod tests {
         let before = alphas;
         apply_stroke(&mut alphas, (100.0, 1.0), (110.0, 0.0));
 
-        assert_eq!(&alphas[..100], &before[..100], "left of the stroke is untouched");
-        assert_eq!(&alphas[111..], &before[111..], "right of the stroke is untouched");
+        assert_eq!(
+            &alphas[..100],
+            &before[..100],
+            "left of the stroke is untouched"
+        );
+        assert_eq!(
+            &alphas[111..],
+            &before[111..],
+            "right of the stroke is untouched"
+        );
         assert_eq!(alphas[100], 255, "the stroke's start takes its alpha");
         assert_eq!(alphas[110], 0, "the stroke's end takes its alpha");
         assert_eq!(alphas[105], 128, "the midpoint interpolates");
@@ -316,7 +331,10 @@ mod tests {
         let before = alphas;
         apply_stroke(&mut alphas, (f32::NAN, 0.5), (60.0, 0.5));
         apply_stroke(&mut alphas, (60.0, f32::INFINITY), (70.0, 0.5));
-        assert_eq!(alphas, before, "a non-finite sample must be refused, not laundered");
+        assert_eq!(
+            alphas, before,
+            "a non-finite sample must be refused, not laundered"
+        );
     }
 
     /// The curve's `fade_band` follows `VoxelGrid::fade_band`'s exact rule:

@@ -76,9 +76,7 @@ pub(crate) fn editor_ui(
     // The corner button. Drawn after the pane's own painting, so it sits over
     // the volume; egui resolves overlapping widgets to the later one, so it
     // wins the pointer over the pane-wide orbit interact.
-    let button = egui::Button::new(
-        egui::RichText::new(ALPHA_BUTTON_LABEL).size(11.0),
-    );
+    let button = egui::Button::new(egui::RichText::new(ALPHA_BUTTON_LABEL).size(11.0));
     let size = egui::vec2(88.0, 20.0);
     let rect = egui::Rect::from_min_size(
         pane_rect.right_top() + egui::vec2(-(size.x + BUTTON_MARGIN), BUTTON_MARGIN),
@@ -205,7 +203,8 @@ fn editor_contents(
             ui.ctx().data_mut(|d| d.insert_temp(anchor_id, sample));
         }
     } else {
-        ui.ctx().data_mut(|d| d.remove_temp::<(f32, f32)>(anchor_id));
+        ui.ctx()
+            .data_mut(|d| d.remove_temp::<(f32, f32)>(anchor_id));
         // A bare click paints a single index — the smallest possible region.
         if response.clicked()
             && let Some(pos) = response.interact_pointer_pos()

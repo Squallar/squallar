@@ -2189,7 +2189,8 @@ mod tests {
                      the threshold, or the ramp's foot sits a shell too low",
                 );
                 assert_ne!(
-                    uploaded[first_visible * 4 + 3], 0,
+                    uploaded[first_visible * 4 + 3],
+                    0,
                     "curve {curve:?}: the entry past the band must actually be \
                      visible in the uploaded table — the two halves of the seam \
                      have drifted apart",
@@ -2239,7 +2240,9 @@ mod tests {
             .find("impl egui_wgpu::CallbackTrait for VolumeCallback {")
             .expect("the callback impl is no longer where this test looks for it");
         let body = &source[start..];
-        let end = body.find("\n}\n").expect("the callback impl has no closing brace");
+        let end = body
+            .find("\n}\n")
+            .expect("the callback impl has no closing brace");
         let body = &body[..end];
 
         assert!(
