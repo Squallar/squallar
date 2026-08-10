@@ -207,6 +207,33 @@ struct SweepData {
     /// duplication. What travels is the input the rule reads; the rule stays
     /// where it is.
     carried_velocity: bool,
+    /// The Nyquist velocity this sweep's cut **declared**, m/s, or `None` when
+    /// the volume this payload was extracted from declared none for it.
+    ///
+    /// Message 31's Radial Data Block states where the sweep's Doppler
+    /// velocity folds; `nexrad_model::data::Radial` drops it, so it arrives
+    /// here through [`crate::nyquist::DeclaredNyquist`] rather than off the
+    /// radials, and [`RenderInput::with_declared_nyquist`] is what fills it in.
+    ///
+    /// # Why it has to cross the wire
+    ///
+    /// [`crate::sampler::VolumeSampler`] refuses to interpolate velocity
+    /// readings that straddle the fold, and it needs the limit per rung. It
+    /// has a fallback — `estimate_fold_limit`, off the largest speed the sweep
+    /// observed — so a payload without this field still guards. **That is
+    /// exactly the hazard.** The main thread would hold the declared number
+    /// and the worker's reconstructed scan would hold only the estimate, the
+    /// two are usually within a few m/s of each other, and nothing errors,
+    /// warns or renders visibly differently: the two threads would simply
+    /// classify a band of borderline pairs differently, for as long as the
+    /// difference went unnoticed. Either the number crosses or the divergence
+    /// is silent, and this is the field that makes it cross.
+    ///
+    /// `None` is honest and common: a volume decoded entirely from Message 1
+    /// has no such field to declare, and a payload extracted without a table
+    /// carries none. The worker then estimates, which is what the main thread
+    /// does for the same volume.
+    declared_nyquist_ms: Option<f64>,
     radials: Vec<RadialData>,
 }
 
@@ -503,6 +530,59 @@ impl RenderInput {
     /// adaptation defaults.
     pub fn env_heights_km_msl(&self) -> Option<(f64, f64)> {
         self.env_heights_km_msl
+    }
+
+    /// Stamp each carried sweep with the Nyquist velocity its cut declared,
+    /// looked up in `declared` by the sweep's own elevation number.
+    ///
+    /// # Why this is a second step rather than an extraction argument
+    ///
+    /// [`sweep_data`] builds a `SweepData` out of a `Sweep` and the cut table,
+    /// and everything else in the payload is derivable from those. The
+    /// declared Nyquist velocity is not: `nexrad_model::data::Radial` dropped
+    /// it at the decoder, so it can only come from a table the *caller* is
+    /// holding — [`crate::nyquist::DeclaredNyquist::from_archive`]'s, the
+    /// chunk feed's, or the merged current volume's. Threading it into
+    /// [`extract`](Self::extract), [`extract_volume`](Self::extract_volume)
+    /// and [`extract_volume_parts`](Self::extract_volume_parts) would put an
+    /// argument in three signatures — two of them already at clippy's
+    /// argument ceiling — that almost every caller would spell as "nothing",
+    /// and it would make the *absence* of a declaration the thing every test
+    /// fixture has to write out.
+    ///
+    /// So the payload extracts without it and is stamped by the callers who
+    /// hold one. Forgetting the second step degrades rather than breaks: the
+    /// sweep carries `None`, the worker estimates the fold limit, and that is
+    /// what every path did before this field existed. What must not happen is
+    /// the *asymmetric* case — one side declaring, the other estimating —
+    /// which is why the same table that feeds the sampler on this thread is
+    /// the one stamped here.
+    ///
+    /// Sweeps `declared` does not name keep whatever they had, so stamping
+    /// with an empty table is a no-op rather than an erasure.
+    #[must_use]
+    pub fn with_declared_nyquist(mut self, declared: &crate::nyquist::DeclaredNyquist) -> Self {
+        for sweep in &mut self.sweeps {
+            if let Some(ms) = declared.get(sweep.elevation_number) {
+                sweep.declared_nyquist_ms = Some(ms);
+            }
+        }
+        self
+    }
+
+    /// The declared Nyquist table this payload carries, rebuilt from its
+    /// sweeps — the reverse of [`with_declared_nyquist`](Self::with_declared_nyquist).
+    ///
+    /// [`to_scan`](Self::to_scan) cannot carry it (the model type is what
+    /// dropped it in the first place), so a worker holding a payload gets the
+    /// scan from one call and the table from this one, and pairs them in a
+    /// [`crate::nyquist::Volume`] for the sampler. Empty when no sweep carried
+    /// a declaration, which the sampler reads as "estimate every rung".
+    pub fn declared_nyquist(&self) -> crate::nyquist::DeclaredNyquist {
+        self.sweeps
+            .iter()
+            .filter_map(|s| s.declared_nyquist_ms.map(|ms| (s.elevation_number, ms)))
+            .collect()
     }
 
     /// A `Scan` holding exactly the extracted sweeps.
@@ -892,6 +972,11 @@ fn sweep_data(
         carried_velocity: radials
             .first()
             .is_some_and(|r| MomentSlot::Velocity.read(r).is_some()),
+        // Filled in afterwards by `with_declared_nyquist`, never here: the
+        // number is not on the radials — the model type dropped it — so this
+        // function, which reads a `Sweep` and nothing else, has no honest way
+        // to know it. See that method for why the two steps are separate.
+        declared_nyquist_ms: None,
         radials: radials
             .iter()
             .map(|radial| RadialData {
@@ -1055,7 +1140,15 @@ const MAGIC: [u8; 4] = *b"RDRI";
 /// the volume did — so a reconstructed scan could not tell a pattern it had
 /// flown to the top from one it had stopped a third of the way up, and every
 /// cross-section in the app is cut from a reconstructed scan.
-const FORMAT_VERSION: u16 = 7;
+/// Version 8 added the per-sweep **declared Nyquist velocity**, after the cut
+/// angle. The sampler's velocity fold guard used to estimate that limit off the
+/// data on both sides of the port, because the archive's own statement of it
+/// (Message 31's Radial Data Block) is dropped by `nexrad_model::data::Radial`.
+/// Now that the main thread reads it, a payload that did not carry it would
+/// leave the worker estimating while the main thread declared — two ladders
+/// guarding a band of borderline velocity pairs differently, with no error, no
+/// warning and no visible difference to point at.
+const FORMAT_VERSION: u16 = 8;
 
 impl RenderInput {
     /// Encode for transport. Little-endian throughout; gate blobs are copied
@@ -1102,6 +1195,13 @@ impl RenderInput {
                 Some(angle) => {
                     out.push(1);
                     out.extend_from_slice(&angle.to_le_bytes());
+                }
+            }
+            match sweep.declared_nyquist_ms {
+                None => out.push(0),
+                Some(ms) => {
+                    out.push(1);
+                    out.extend_from_slice(&ms.to_le_bytes());
                 }
             }
             out.extend_from_slice(&(sweep.radials.len() as u32).to_le_bytes());
@@ -1176,7 +1276,7 @@ impl RenderInput {
         let sweep_count = r.u32()?;
         // A sweep costs at least its own header, so this bounds the count
         // against what is actually left rather than trusting it.
-        let mut sweeps = Vec::with_capacity(r.bounded(sweep_count, 11)?);
+        let mut sweeps = Vec::with_capacity(r.bounded(sweep_count, 12)?);
         for _ in 0..sweep_count {
             let elevation_angle = r.f32()?;
             let elevation_number = r.u8()?;
@@ -1186,6 +1286,11 @@ impl RenderInput {
                 _ => return None,
             };
             let cut_angle_deg = match r.u8()? {
+                0 => None,
+                1 => Some(r.f64()?),
+                _ => return None,
+            };
+            let declared_nyquist_ms = match r.u8()? {
                 0 => None,
                 1 => Some(r.f64()?),
                 _ => return None,
@@ -1223,6 +1328,7 @@ impl RenderInput {
                 elevation_number,
                 cut_angle_deg,
                 carried_velocity,
+                declared_nyquist_ms,
                 radials,
             });
         }
@@ -1260,8 +1366,10 @@ impl RenderInput {
             .iter()
             .map(|s| {
                 // 4 elevation angle + 1 elevation number + 1 carried-velocity
-                // flag + 1 cut-angle flag (+ 8 for the angle) + 4 radial count.
-                11 + if s.cut_angle_deg.is_some() { 8 } else { 0 }
+                // flag + 1 cut-angle flag (+ 8 for the angle) + 1
+                // declared-Nyquist flag (+ 8 for the value) + 4 radial count.
+                12 + if s.cut_angle_deg.is_some() { 8 } else { 0 }
+                    + if s.declared_nyquist_ms.is_some() { 8 } else { 0 }
                     + s.radials
                         .iter()
                         .map(|r| {

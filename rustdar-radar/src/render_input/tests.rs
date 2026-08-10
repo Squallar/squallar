@@ -914,7 +914,7 @@ fn the_sentinel_elevation_is_one_no_sweep_can_carry() {
 /// one. Mirrors `xsect`'s and `voxel`'s tests of the same name.
 #[test]
 fn the_format_version_is_the_one_this_layout_ships() {
-    assert_eq!(FORMAT_VERSION, 7);
+    assert_eq!(FORMAT_VERSION, 8);
     let bytes = RenderInput::extract(
         &volume(),
         0.5,
@@ -929,7 +929,7 @@ fn the_format_version_is_the_one_this_layout_ships() {
     assert_eq!(&bytes[..4], b"RDRI", "the magic moved");
     assert_eq!(
         u16::from_le_bytes([bytes[4], bytes[5]]),
-        7,
+        8,
         "the version is not where a decoder from another build looks for it",
     );
 }
