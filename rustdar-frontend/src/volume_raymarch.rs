@@ -293,9 +293,31 @@ impl VolumePipelines {
     /// validation error at draw time, and `create_render_pipeline` returns no
     /// `Result` to notice it in.
     pub fn new(device: &wgpu::Device, egui_attachments: AttachmentConfig) -> Self {
+        Self::from_shader_source(device, egui_attachments, VOLUME_SHADER_WGSL)
+    }
+
+    /// [`VolumePipelines::new`], over WGSL handed in rather than
+    /// [`VOLUME_SHADER_WGSL`].
+    ///
+    /// The shader is compiled by wgpu at runtime from a `&str`, so a *mutated*
+    /// copy of it needs no rebuild and no second pipeline stack — only this
+    /// seam. `tests/volume_shader_mutants.rs` is the caller: it substitutes one
+    /// expression in the source, builds the pipelines here and asserts a probe
+    /// moves, which is how this repository proves its GPU tests can fail at
+    /// all. Every binding, layout, sampler and blend state below is therefore
+    /// shared with production by construction — a battery that built its own
+    /// pipelines could drift from the real ones and stop testing them.
+    ///
+    /// Public because an integration test is a separate crate. Nothing in the
+    /// application calls it; [`VolumePipelines::new`] is the entry point.
+    pub fn from_shader_source(
+        device: &wgpu::Device,
+        egui_attachments: AttachmentConfig,
+        wgsl: &str,
+    ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(&label("shader")),
-            source: wgpu::ShaderSource::Wgsl(VOLUME_SHADER_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
         });
 
         let volume_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {

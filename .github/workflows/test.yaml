@@ -80,11 +80,23 @@ jobs:
       # `--nocapture` is load-bearing. Each test binary prints the adapter it
       # got, once, and a passing test's output is otherwise discarded -- which
       # would leave no way to tell from the log whether lavapipe was really what
-      # ran.
+      # ran. It also carries volume_shader_mutants' table of every mutation and
+      # the margin its probe saw, which is the only readable record of what the
+      # battery proved on a given run.
+      #
+      # volume_shader_mutants is the guard on the other two. It substitutes one
+      # expression at a time into `volume.wgsl`, rebuilds the pipelines from the
+      # mutated string -- wgpu compiles WGSL at runtime, so no rebuild is
+      # involved -- and requires a probe to notice. Without it, every row above
+      # could be passing over a shader nobody has proved is being read: three
+      # such tests were found by hand in this campaign. Measured on both: 0.45 s
+      # on an RTX 3090 and 0.43 s on lavapipe, against the 19 s the two rows
+      # above take there. A mutant is one shader compile and one small render,
+      # and neither is what a software rasteriser is slow at.
       - name: Run the adapter-only integration tests
         run: |
           cargo test -p rustdar-frontend \
-            --test volume_gpu --test volume_silhouette \
+            --test volume_gpu --test volume_silhouette --test volume_shader_mutants \
             -- --ignored --nocapture
       # The other three `#[ignore]`d files in that directory --
       # volume_real_mask, volume_march_cost and floor_alignment -- are
