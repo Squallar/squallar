@@ -1,7 +1,7 @@
 use super::*;
 use nexrad_model::data::{
-    ChannelConfiguration, ElevationCut, PulseWidth, RadialStatus, Sweep, VolumeCoveragePattern,
-    WaveformType,
+    ChannelConfiguration, ElevationCut, PulseWidth, RadialStatus, Scan, Sweep,
+    VolumeCoveragePattern, WaveformType,
 };
 
 // ── Fixtures ────────────────────────────────────────────────────────────

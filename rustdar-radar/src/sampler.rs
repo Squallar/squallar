@@ -135,9 +135,10 @@
 //! That is beam geometry, not a defect in the ladder, and it surfaces as
 //! [`SampleStatus::BeyondRange`] on that rung rather than as an error.
 
-use nexrad_model::data::{DataMoment, ElevationCut, MomentData, Radial, Scan, Sweep};
+use nexrad_model::data::{DataMoment, ElevationCut, MomentData, Radial, Sweep};
 
 use crate::beam;
+use crate::nyquist::Volume;
 use crate::types::{MomentSlot, RadarProduct};
 use crate::volumetric::{CellStat, sweep_elevation_deg};
 
@@ -435,7 +436,9 @@ impl Blend {
         }
     }
 
-    /// Whether this moment wraps at a limit that does not reach this sampler.
+    /// Whether this moment wraps at a limit that is a property of the sweep
+    /// rather than of the quantity — so the limit has to be carried per rung
+    /// instead of living in a [`Blend`] variant.
     ///
     /// **Two moments in Level II wrap, and only one of them wraps at a
     /// constant.** Differential phase wraps at 360°, which is a property of
@@ -444,17 +447,21 @@ impl Blend {
     /// Nyquist velocity, which is a property of the *sweep's* PRF and differs
     /// from tilt to tilt inside one volume, so it cannot be an arm.
     ///
-    /// **The archive does carry that number.** Message 31's Radial Data Block
-    /// has `nyquist_velocity`, `nexrad-decode` decodes it, and
-    /// [`crate::kdp::KdpParams::from_archive`] in this crate already reaches
-    /// into a raw `nexrad_data::volume::File` for radial-header parameters, so
-    /// reading it is neither impossible nor unprecedented. What drops it is
-    /// the boundary this sampler sits behind: `nexrad_model::data::Radial`
-    /// does not carry it, the worker's reconstructed `RenderInput` is built
-    /// from model types alone, and putting the Nyquist velocity on that
-    /// boundary is a wire-format change. So the number is *measured off the
-    /// data* instead, which is what [`estimate_fold_limit`] supplies and
-    /// [`Rung::fold_limit_ms`] carries.
+    /// **The archive carries that number, and it now reaches here.** Message
+    /// 31's Radial Data Block has `nyquist_velocity`, `nexrad-decode` decodes
+    /// it, and [`crate::nyquist::DeclaredNyquist::from_archive`] reads it out
+    /// of a raw `nexrad_data::volume::File` the way
+    /// [`crate::kdp::KdpParams::from_archive`] reads the other radial-header
+    /// parameters. What used to drop it was the boundary this sampler sits
+    /// behind — `nexrad_model::data::Radial` does not carry it, and the
+    /// worker's reconstructed `RenderInput` is built from model types alone —
+    /// so the number was *measured off the data* instead. It is now carried:
+    /// [`crate::nyquist::Volume`] pairs the declared table with the scan, the
+    /// payload carries it per sweep, and [`estimate_fold_limit`] is the
+    /// fallback for a volume that declared nothing (all Message 1, or a scan
+    /// that reached here without a table). Both land in
+    /// [`Rung::fold_limit_ms`], and which one did is in
+    /// [`Rung::fold_limit_declared`].
     ///
     /// Every other moment this sampler serves is monotone over its encoding:
     /// reflectivity, spectrum width, differential reflectivity and correlation
@@ -524,15 +531,33 @@ struct Rung<'a> {
     /// median step is 0.5° whether you noticed the hole or not.
     az_step_deg: f64,
     /// The speed this rung's sweep folds at, m/s, or `None` when this moment
-    /// has no fold seam or the sweep never got near one. Measured once here
-    /// rather than per sample because it is a property of the sweep, and a
-    /// sample must not pay a pass over the whole sweep.
+    /// has no fold seam, the volume declared nothing *and* the sweep never got
+    /// near one, or the number that was found sits under
+    /// [`FOLD_LIMIT_FLOOR_MS`]. Resolved once here rather than per sample
+    /// because it is a property of the sweep, and a sample must not pay a pass
+    /// over the whole sweep.
     ///
     /// Per rung, not per volume: the Nyquist velocity follows the cut's PRF,
     /// and it genuinely differs inside one volume — measured across the six
     /// probe volumes, the low cuts fold at 22.5–31 m/s while the high cuts of
     /// the same volume fold at up to 35.5.
     fold_limit_ms: Option<f64>,
+    /// Where [`Self::fold_limit_ms`] came from: `true` for the archive's own
+    /// declaration (Message 31's Radial Data Block, carried here by
+    /// [`crate::nyquist::DeclaredNyquist`]), `false` for
+    /// [`estimate_fold_limit`]'s reading of the data.
+    ///
+    /// **Nothing in the guard reads this** — the two numbers mean the same
+    /// thing and are used identically. It exists so
+    /// [`VolumeSampler::describe`] can print the provenance, which is what
+    /// makes `a_reconstructed_render_input_scan_builds_the_identical_ladder`
+    /// able to see the failure this whole path exists to prevent: the main
+    /// thread holding the declared number, the worker's reconstructed scan not
+    /// holding it, and the two guarding differently at limits that are close
+    /// enough to leave no other symptom.
+    ///
+    /// `false` when there is no limit at all, which `describe` never prints.
+    fold_limit_declared: bool,
 }
 
 /// The tilt ladder over one ground point: every rung's beam height there and
@@ -916,13 +941,23 @@ pub struct VolumeSampler<'a> {
 }
 
 impl<'a> VolumeSampler<'a> {
-    /// Resolve `scan`'s tilt ladder for `product`.
+    /// Resolve `volume`'s tilt ladder for `product`.
     ///
     /// Fails rather than degrades — see the module doc's section on the VCP.
     /// Every error is also logged, so a caller that discards the `Result` with
     /// `.ok()` still leaves the reason somewhere.
-    pub fn new(scan: &'a Scan, product: RadarProduct) -> Result<Self, SamplerError> {
-        Self::build(scan, product).inspect_err(|e| {
+    ///
+    /// `volume` is a [`crate::nyquist::Volume`], which a bare `&Scan` converts
+    /// into: the conversion declares no Nyquist velocities, so a velocity
+    /// ladder built from one estimates every rung's fold limit off the data.
+    /// A caller that holds the archive's own declarations — the whole
+    /// production path does — passes [`crate::nyquist::Volume::new`] and gets
+    /// the declared numbers instead. See [`Rung::fold_limit_ms`].
+    pub fn new(
+        volume: impl Into<Volume<'a>>,
+        product: RadarProduct,
+    ) -> Result<Self, SamplerError> {
+        Self::build(volume.into(), product).inspect_err(|e| {
             log::warn!("volume sampler unavailable for {}: {e}", product.code());
         })
     }
@@ -937,11 +972,11 @@ impl<'a> VolumeSampler<'a> {
     /// layer is the only legitimate caller; going through [`Self::new`] with
     /// a derived product is a refusal by design, not a missing feature.
     pub(crate) fn for_derived(
-        scan: &'a Scan,
+        volume: impl Into<Volume<'a>>,
         product: RadarProduct,
         slot: MomentSlot,
     ) -> Result<Self, SamplerError> {
-        Self::build_for_slot(scan, product, slot).inspect_err(|e| {
+        Self::build_for_slot(volume.into(), product, slot).inspect_err(|e| {
             log::warn!(
                 "volume sampler unavailable for derived {}: {e}",
                 product.code()
@@ -949,21 +984,23 @@ impl<'a> VolumeSampler<'a> {
         })
     }
 
-    fn build(scan: &'a Scan, product: RadarProduct) -> Result<Self, SamplerError> {
+    fn build(volume: Volume<'a>, product: RadarProduct) -> Result<Self, SamplerError> {
         let Some(slot) = samplable(product) else {
             return Err(SamplerError::NotSamplable {
                 product,
                 reason: refusal_reason(product),
             });
         };
-        Self::build_for_slot(scan, product, slot)
+        Self::build_for_slot(volume, product, slot)
     }
 
     fn build_for_slot(
-        scan: &'a Scan,
+        volume: Volume<'a>,
         product: RadarProduct,
         slot: MomentSlot,
     ) -> Result<Self, SamplerError> {
+        let scan = volume.scan();
+        let declared = volume.declared_nyquist();
         let cuts = scan.coverage_pattern().elevation_cuts();
         if cuts.is_empty() {
             return Err(SamplerError::EmptyCoveragePattern {
@@ -994,17 +1031,48 @@ impl<'a> VolumeSampler<'a> {
 
         let mut rungs: Vec<Rung<'a>> = Vec::with_capacity(choices.len());
         for LadderChoice { key, chosen } in choices {
-            let radials = scan.sweeps()[chosen].radials();
+            let sweep = &scan.sweeps()[chosen];
+            let radials = sweep.radials();
             // Step 4: the geometry is the chosen sweep's median, never the key.
             let Some(elevation_deg) = sweep_elevation_deg(radials) else {
                 continue;
             };
             let (by_azimuth, az_step_deg) = index_azimuths(radials);
-            // One pass over this sweep, at ladder-build time. `folds_at_...`
-            // gates it so no moment without a seam pays for the pass at all.
-            let fold_limit_ms = Blend::folds_at_measured_limit(product)
-                .then(|| estimate_fold_limit(radials, slot))
-                .flatten();
+            // The declared number first, the reading of the data second.
+            //
+            // Declared wins outright rather than being reconciled: it is the
+            // RDA's statement of the waveform it flew, while the estimate is
+            // exact only for a sweep that actually folded and an
+            // **under**estimate for one that did not — and this sampler uses
+            // the number as a classification boundary, where an underestimate
+            // widens the fold hypothesis and manufactures false positives.
+            //
+            // `FOLD_LIMIT_FLOOR_MS` applies to whichever answer is used. It
+            // was written for the estimator's failure mode — a calm sweep
+            // giving a limit that ordinary noise clears — which a declaration
+            // cannot have; but no operational NEXRAD waveform has a Nyquist
+            // velocity that low either, so a declared value under the floor is
+            // a corrupt field rather than a slow one. It is dropped, and the
+            // rung falls through to the estimator, which applies the same
+            // floor and may well switch the guard off entirely. A declaration
+            // this module cannot believe must not be *more* trusted than a
+            // measurement it cannot believe.
+            //
+            // `folds_at_measured_limit` gates the estimator's pass over the
+            // sweep so no moment without a seam pays for it; the lookup is
+            // free either way, and is still behind the gate so a reflectivity
+            // rung cannot pick up a velocity cut's limit.
+            let (fold_limit_ms, fold_limit_declared) = if Blend::folds_at_measured_limit(product) {
+                match declared
+                    .get(sweep.elevation_number())
+                    .filter(|ms| *ms >= FOLD_LIMIT_FLOOR_MS)
+                {
+                    Some(ms) => (Some(ms), true),
+                    None => (estimate_fold_limit(radials, slot), false),
+                }
+            } else {
+                (None, false)
+            };
             rungs.push(Rung {
                 nominal_deg: key,
                 elevation_deg,
@@ -1012,6 +1080,7 @@ impl<'a> VolumeSampler<'a> {
                 by_azimuth,
                 az_step_deg,
                 fold_limit_ms,
+                fold_limit_declared,
             });
         }
 
@@ -1068,13 +1137,40 @@ impl<'a> VolumeSampler<'a> {
     /// So a comparison over this string is a comparison of the ladder, not of
     /// its labels. `a_reconstructed_render_input_scan_builds_the_identical_ladder`
     /// and the live harness both rest on that.
+    ///
+    /// # The fold limit and its provenance are printed for the same reason
+    ///
+    /// A rung that guards velocity appends `±<limit>d` or `±<limit>e` — `d`
+    /// for the archive's declaration, `e` for [`estimate_fold_limit`]'s
+    /// reading of the data. Both halves are load-bearing, and neither is
+    /// cosmetic:
+    ///
+    /// * the **limit** because two ladders that chose the same sweeps can
+    ///   still blend differently, and a fold limit is the only per-rung input
+    ///   to that decision the rest of this line does not name;
+    /// * the **letter** because a declared limit and an estimated one are
+    ///   usually within a few m/s of each other — the estimate *is* the
+    ///   Nyquist velocity whenever the sweep folded — so a worker that lost
+    ///   the declared table would print a nearly identical number and a string
+    ///   comparison would pass. The provenance is what makes the divergence
+    ///   visible before the numbers happen to differ.
+    ///
+    /// Nothing is appended for a rung with no limit, so every moment without a
+    /// fold seam prints exactly what it printed before.
     fn describe(&self) -> String {
         let rungs: Vec<String> = self
             .rungs
             .iter()
             .map(|r| {
+                let fold = match r.fold_limit_ms {
+                    Some(ms) => format!(
+                        " ±{ms:.2}{}",
+                        if r.fold_limit_declared { 'd' } else { 'e' },
+                    ),
+                    None => String::new(),
+                };
                 format!(
-                    "{:.4}->{:.4} {}x{}",
+                    "{:.4}->{:.4} {}x{}{fold}",
                     r.nominal_deg,
                     r.elevation_deg,
                     r.radials.len(),

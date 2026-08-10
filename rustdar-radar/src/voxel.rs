@@ -347,7 +347,6 @@
 //! is therefore a named constant the frontend's grid-spec ladder selects
 //! explicitly, alongside stepping down when a device reports less than 256.
 
-use nexrad_model::data::Scan;
 
 use crate::beam;
 use crate::palette::{get_color_for_value, get_legend_scale};
@@ -1517,8 +1516,13 @@ fn colormap_lut(product: RadarProduct, range: (f32, f32)) -> Vec<u8> {
 ///
 /// A `half_width_km` outside `[MIN_HALF_WIDTH_KM, MAX_HALF_WIDTH_KM]` is
 /// **clamped**, not refused.
-pub fn build_voxels(scan: &Scan, req: &VoxelRequest, lat: f64, lon: f64) -> Option<VoxelGrid> {
-    build_voxels_with_motion(scan, req, lat, lon, None)
+pub fn build_voxels<'a>(
+    volume: impl Into<crate::nyquist::Volume<'a>>,
+    req: &VoxelRequest,
+    lat: f64,
+    lon: f64,
+) -> Option<VoxelGrid> {
+    build_voxels_with_motion(volume, req, lat, lon, None)
 }
 
 /// [`build_voxels`] with the user's storm motion override
@@ -1526,13 +1530,15 @@ pub fn build_voxels(scan: &Scan, req: &VoxelRequest, lat: f64, lon: f64) -> Opti
 /// storm-relative velocity. Separate entry point rather than a request field
 /// so the override never rides the voxel job's wire encoding — the worker
 /// reads it off the `RenderInput`, which already carries it.
-pub fn build_voxels_with_motion(
-    scan: &Scan,
+pub fn build_voxels_with_motion<'a>(
+    volume: impl Into<crate::nyquist::Volume<'a>>,
     req: &VoxelRequest,
     lat: f64,
     lon: f64,
     storm_motion_override: Option<(f32, f32)>,
 ) -> Option<VoxelGrid> {
+    let volume = volume.into();
+    let scan = volume.scan();
     let shape = req.shape;
     if !shape.is_supported() {
         log::warn!(
@@ -1569,10 +1575,17 @@ pub fn build_voxels_with_motion(
     // under a derived label.
     let slot = crate::derive::volume_slot(req.product)?;
     let prepared = crate::derive::prepare(scan, req.product, storm_motion_override)?;
+    // The declared Nyquist table follows the scan through the derivation: it
+    // is keyed by elevation number, which `prepare` preserves, and a derived
+    // scan's rungs are the same cuts flown at the same PRFs.
+    let declared = volume.declared_nyquist();
     let sampler = match &prepared {
-        crate::derive::Prepared::Native(scan) => VolumeSampler::new(scan, req.product).ok()?,
+        crate::derive::Prepared::Native(scan) => {
+            VolumeSampler::new(crate::nyquist::Volume::new(scan, declared), req.product).ok()?
+        }
         crate::derive::Prepared::Derived(scan) => {
-            VolumeSampler::for_derived(scan, req.product, slot).ok()?
+            VolumeSampler::for_derived(crate::nyquist::Volume::new(scan, declared), req.product, slot)
+                .ok()?
         }
     };
 

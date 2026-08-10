@@ -1,7 +1,7 @@
 use super::*;
 use crate::sampler::{Sample, SampleStatus, samplable};
 use nexrad_model::data::{
-    ChannelConfiguration, ElevationCut, MomentData, PulseWidth, Radial, RadialStatus, Sweep,
+    ChannelConfiguration, ElevationCut, MomentData, PulseWidth, Radial, RadialStatus, Scan, Sweep,
     VolumeCoveragePattern, WaveformType,
 };
 

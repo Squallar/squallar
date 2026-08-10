@@ -138,7 +138,6 @@
 //!   omits — 0.2 km at 2.4° and 4.0 km at 19.5°. The section is the correct
 //!   one.
 
-use nexrad_model::data::Scan;
 
 use crate::beam;
 use crate::par::*;
@@ -632,23 +631,31 @@ impl CrossSection {
 ///
 /// Every refusal is logged, so a `None` swallowed by a `?` still leaves its
 /// reason somewhere.
-pub fn render_section(
-    scan: &Scan,
+pub fn render_section<'a>(
+    volume: impl Into<crate::nyquist::Volume<'a>>,
     req: &SectionRequest,
     lat: f64,
     lon: f64,
     storm_motion_override: Option<(f32, f32)>,
 ) -> Option<CrossSection> {
+    let volume = volume.into();
     // The derivation seam: native moments pass through as a borrow; derived
     // products are computed here, per sweep, before anything samples — so a
     // raw volume can never be sampled under a derived label (the sampler's
     // own gate still refuses that combination).
-    let prepared = crate::derive::prepare(scan, req.product, storm_motion_override)?;
+    let prepared = crate::derive::prepare(volume.scan(), req.product, storm_motion_override)?;
+    // The declared Nyquist table follows the scan through the derivation: it
+    // is keyed by elevation number, which `prepare` preserves, and a derived
+    // scan's rungs are the same cuts flown at the same PRFs.
+    let declared = volume.declared_nyquist();
     let sampler = match &prepared {
-        crate::derive::Prepared::Native(scan) => VolumeSampler::new(scan, req.product).ok()?,
+        crate::derive::Prepared::Native(scan) => {
+            VolumeSampler::new(crate::nyquist::Volume::new(scan, declared), req.product).ok()?
+        }
         crate::derive::Prepared::Derived(scan) => {
             let slot = crate::derive::derived_slot(req.product)?;
-            VolumeSampler::for_derived(scan, req.product, slot).ok()?
+            VolumeSampler::for_derived(crate::nyquist::Volume::new(scan, declared), req.product, slot)
+                .ok()?
         }
     };
     render_with_sampler(&sampler, req, lat, lon)
