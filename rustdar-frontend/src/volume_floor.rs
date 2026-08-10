@@ -1,19 +1,23 @@
 //! The map floor: the 2D pane's ground, resampled onto the 3D box's footprint.
 //!
-//! # What the floor is, and what it is so far
+//! # What the floor is
 //!
 //! GR2Analyst draws its volume standing on the 2D map — basemap, radar and
 //! labels — and that is issue #7's ask: "the floor of the 3d viewer should be
-//! the 2d map (literally, the pane content)." What ships here is the honest
-//! first cut of that: **the lowest-tilt base reflectivity, exactly as the 2D
-//! pane's own rasterizer draws it, over the dark ground colour**, registered
-//! to the box footprint. The basemap tiles and the vector overlays are
-//! deferred, and the reason is mechanical rather than aesthetic: the tile
-//! pipeline decodes straight into egui textures and keeps no CPU bytes, so
-//! compositing tiles under the radar needs either an accessor into
-//! `egui_wgpu::Renderer`'s texture map or a second decode path — both real
-//! designs, neither small, and the registration/compositing machinery built
-//! here is exactly what they would plug into.
+//! the 2d map (literally, the pane content)." [`compose_floor`] builds that
+//! composition: **the basemap tiles the 2D panes draw, the lowest-tilt base
+//! reflectivity exactly as the 2D pane's own rasterizer draws it, and the
+//! city-label tiles over both**, on the dark ground colour, registered to the
+//! box footprint. The tiles come from the panes' own [`HttpsTiles`] sources,
+//! which keep each tile's compressed bytes beside the texture for exactly
+//! this consumer — the "tile pipeline keeps no CPU bytes" blocker that
+//! deferred the first cut was rustdar's own fetch path, and was turned off at
+//! its root. The 2D panes' *vector* overlays (counties, warnings, the range
+//! ring) are still not part of the floor; they are egui shapes painted
+//! through a live `Projector`, and capturing them stays an offscreen-egui
+//! design of its own.
+//!
+//! [`HttpsTiles`]: rustdar_egui::tile_source::HttpsTiles
 //!
 //! # Registration: one projection, run backwards
 //!
@@ -27,13 +31,30 @@
 //! ```
 //!
 //! (`render::MercatorProjection::render_gate`, with `ImageBounds` supplying
-//! the Mercator span). [`resample_floor`] evaluates the same three lines for
+//! the Mercator span). [`compose_floor`] evaluates the same three lines for
 //! every floor texel — the box's own `x_range_km`/`y_range_km` are already
 //! kilometres east/north of the site, so there is no second projection to
 //! disagree with the first: the floor lands where the 2D pane would draw it
 //! because it is computed *by* the 2D pane's arithmetic. The one approximation
 //! is the raster's own (`φ = φ₀ + dy/R`, spherical), which is the codebase's
 //! standing convention (`ImageBounds`, `corners_for`).
+//!
+//! The **tiles** read through the same mapping, not a second one. The
+//! raster's x axis is linear in longitude (`ImageBounds` spans
+//! `±MAX_RANGE_KM / (111.32 cos φ₀)` degrees over the image), and
+//! substituting that span into the `px` line above gives the raster's own
+//! longitude for a floor texel:
+//!
+//! ```text
+//! λ = λ₀ + dx / (111.32 · cos φ)
+//! ```
+//!
+//! — the same `cos_correction` reappearing as algebra, not a new convention.
+//! `(λ, φ)` then indexes the slippy-tile pyramid the standard way
+//! (`x = (λ+180)/360 · 2^z`, `y = (1 − mercᵧ(φ)/π)/2 · 2^z`, the same
+//! [`mercator_y`]), so a tile pixel and a radar gate that name the same
+//! ground land on the same texel; `a_tile_pixel_and_a_radar_gate_at_the_same_
+//! ground_land_on_the_same_texel` pins that agreement through both consumers.
 //!
 //! # Refresh
 //!
@@ -106,6 +127,121 @@ pub fn resample_floor(
     x_range_km: (f64, f64),
     y_range_km: (f64, f64),
 ) -> Option<FloorImage> {
+    // The site longitude only places tiles, and there are none here.
+    compose_floor(
+        source,
+        site_lat_deg,
+        0.0,
+        x_range_km,
+        y_range_km,
+        &TileLayer::empty(),
+        &TileLayer::empty(),
+    )
+}
+
+/// One decoded map tile: its slippy-pyramid coordinates at the layer's zoom,
+/// and its straight-alpha RGBA pixels.
+pub struct DecodedTile {
+    /// Slippy x — west to east, `0..2^zoom`.
+    pub x: u32,
+    /// Slippy y — north to south, `0..2^zoom`.
+    pub y: u32,
+    /// Pixels along each edge (tiles are square; 256 for the shipped sources).
+    pub side: u32,
+    /// `side * side * 4` straight, gamma-encoded RGBA bytes, row 0 the tile's
+    /// north edge.
+    pub rgba: Vec<u8>,
+}
+
+/// A zoom level's worth of decoded tiles for one floor composite.
+pub struct TileLayer {
+    pub zoom: u8,
+    pub tiles: Vec<DecodedTile>,
+}
+
+impl TileLayer {
+    /// No tiles at all — the layer composites as nothing.
+    pub fn empty() -> Self {
+        TileLayer {
+            zoom: 0,
+            tiles: Vec::new(),
+        }
+    }
+}
+
+/// A zoom level's worth of **compressed** tiles, as gathered on the frame
+/// thread from the panes' own [`HttpsTiles`] caches — `(slippy x, slippy y,
+/// the tile's PNG bytes)`. Decoding is [`TileBytesLayer::decode`], run in the
+/// floor job's delivery rather than here, so the frame thread hands over
+/// `Arc`s and the decode cost lands where the resample's already does.
+///
+/// [`HttpsTiles`]: rustdar_egui::tile_source::HttpsTiles
+pub struct TileBytesLayer {
+    pub zoom: u8,
+    pub tiles: Vec<(u32, u32, std::sync::Arc<Vec<u8>>)>,
+}
+
+impl TileBytesLayer {
+    /// No tiles — decodes to [`TileLayer::empty`].
+    pub fn empty() -> Self {
+        TileBytesLayer {
+            zoom: 0,
+            tiles: Vec::new(),
+        }
+    }
+
+    /// Decode every tile to straight RGBA. A tile that does not decode is
+    /// dropped with a log line rather than failing the floor: the map under
+    /// the box missing one tile beats a box standing on nothing.
+    pub fn decode(&self) -> TileLayer {
+        TileLayer {
+            zoom: self.zoom,
+            tiles: self
+                .tiles
+                .iter()
+                .filter_map(|(x, y, bytes)| match image::load_from_memory(bytes) {
+                    Ok(decoded) => {
+                        let rgba = decoded.to_rgba8();
+                        let (w, h) = rgba.dimensions();
+                        if w != h || w == 0 {
+                            log::warn!("floor tile {x}/{y} is {w}x{h}, not square; dropped");
+                            return None;
+                        }
+                        Some(DecodedTile {
+                            x: *x,
+                            y: *y,
+                            side: w,
+                            rgba: rgba.into_raw(),
+                        })
+                    }
+                    Err(error) => {
+                        log::warn!("floor tile {x}/{y} failed to decode: {error}");
+                        None
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
+/// [`resample_floor`], with the 2D map's tile layers under and over the
+/// radar: ground colour, then the basemap tiles, then the radar echo, then
+/// the city-label tiles — the 2D pane's own stacking order.
+///
+/// A tile that is missing from `base`/`labels` simply contributes nothing;
+/// the ground colour (and whatever tiles are present) show instead, and the
+/// caller re-composes when more tiles land. Layers sample bilinearly within
+/// each tile, clamped at tile edges — the half-texel seam this admits is
+/// under the floor's own texel size at the zoom [`floor_tile_zoom`] picks.
+pub fn compose_floor(
+    source: &[u8],
+    site_lat_deg: f64,
+    site_lon_deg: f64,
+    x_range_km: (f64, f64),
+    y_range_km: (f64, f64),
+    base: &TileLayer,
+    labels: &TileLayer,
+) -> Option<FloorImage> {
     let max_range_km = rustdar_radar::types::MAX_RANGE_KM;
     let texels = source.len() / 4;
     let side = (texels as f64).sqrt() as usize;
@@ -115,7 +251,7 @@ pub fn resample_floor(
     if x_range_km.1 <= x_range_km.0 || y_range_km.1 <= y_range_km.0 {
         return None;
     }
-    if !site_lat_deg.is_finite() || site_lat_deg.abs() >= 89.0 {
+    if !(site_lat_deg.is_finite() && site_lon_deg.is_finite()) || site_lat_deg.abs() >= 89.0 {
         return None;
     }
 
@@ -141,18 +277,141 @@ pub fn resample_floor(
         let lat_rad = site_lat_rad + dy_km / rustdar_radar::types::EARTH_RADIUS_KM;
         let cos_correction = cos_site_lat / lat_rad.cos();
         let py = (merc_top - mercator_y(lat_rad)) * merc_scale;
+        // This row's slippy y is shared by every column: it depends only on
+        // latitude. `merc_y` is in `(-π, π)`, π at the north pole.
+        let merc_y = mercator_y(lat_rad);
         for col in 0..out_w {
             let dx_km =
                 x_range_km.0 + (col as f64 + 0.5) / out_w as f64 * (x_range_km.1 - x_range_km.0);
             let px = centre_px + dx_km * cos_correction * px_per_km;
-            let echo = bilinear(source, side, px, py);
-            rgba.extend_from_slice(&over_ground(echo));
+            // The raster's own longitude for this texel — the module doc
+            // derives this line from the `px` line above; it is the same
+            // mapping, not a second one.
+            let lon_deg = site_lon_deg + dx_km / (111.32 * lat_rad.cos());
+
+            let mut texel = [
+                f64::from(FLOOR_GROUND_RGBA[0]),
+                f64::from(FLOOR_GROUND_RGBA[1]),
+                f64::from(FLOOR_GROUND_RGBA[2]),
+            ];
+            over(&mut texel, sample_layer(base, lon_deg, merc_y));
+            over(&mut texel, bilinear(source, side, px, py));
+            over(&mut texel, sample_layer(labels, lon_deg, merc_y));
+            rgba.extend_from_slice(&[
+                texel[0].round() as u8,
+                texel[1].round() as u8,
+                texel[2].round() as u8,
+                255,
+            ]);
         }
     }
     Some(FloorImage {
         size: [out_w as u32, out_h as u32],
         rgba,
     })
+}
+
+/// `layer` sampled at a longitude and Mercator y, straight RGBA — transparent
+/// where the layer holds no tile or the tile's own pixel is transparent.
+fn sample_layer(layer: &TileLayer, lon_deg: f64, merc_y: f64) -> [f64; 4] {
+    if layer.tiles.is_empty() {
+        return [0.0; 4];
+    }
+    let n = f64::from(1u32 << layer.zoom.min(31));
+    let tile_x = (lon_deg + 180.0) / 360.0 * n;
+    let tile_y = (1.0 - merc_y / PI) / 2.0 * n;
+    for tile in &layer.tiles {
+        let fx = tile_x - f64::from(tile.x);
+        let fy = tile_y - f64::from(tile.y);
+        if !(0.0..1.0).contains(&fx) || !(0.0..1.0).contains(&fy) {
+            continue;
+        }
+        let side = tile.side as usize;
+        if side * side * 4 != tile.rgba.len() {
+            continue;
+        }
+        // Clamp the bilinear kernel inside this tile: the neighbour's edge
+        // pixels are a different allocation, and half a tile pixel of clamp
+        // at the seam is under the floor's own texel size.
+        let px = (fx * side as f64).clamp(0.5, side as f64 - 0.5);
+        let py = (fy * side as f64).clamp(0.5, side as f64 - 0.5);
+        return bilinear(&tile.rgba, side, px, py);
+    }
+    [0.0; 4]
+}
+
+/// Straight-alpha `layer` composited over opaque `under`, both gamma-encoded —
+/// the same convention every raster in this codebase composites in (egui's
+/// own, as the blit's doc lays out).
+fn over(under: &mut [f64; 3], layer: [f64; 4]) {
+    let alpha = layer[3] / 255.0;
+    for (channel, ground) in under.iter_mut().enumerate() {
+        *ground = layer[channel] * alpha + *ground * (1.0 - alpha);
+    }
+}
+
+/// The slippy zoom whose tiles resolve about one tile pixel per floor texel
+/// over this footprint, clamped to what the source can serve.
+///
+/// At `2^z · 256` pixels around the world, the footprint's longitude span
+/// covers `span/360` of that; solving for the floor's own [`FLOOR_TEXELS`]
+/// gives `z = log2(360 · FLOOR_TEXELS / (256 · span))`. The default 460 km
+/// box at mid-latitudes lands at z7 — two-and-a-bit tiles across, city
+/// labels at their native size, which is the GR look.
+pub fn floor_tile_zoom(site_lat_deg: f64, x_range_km: (f64, f64), max_zoom: u8) -> u8 {
+    let width_km = (x_range_km.1 - x_range_km.0).max(1.0);
+    let cos_lat = site_lat_deg.to_radians().cos().max(0.01);
+    let lon_span_deg = width_km / (111.32 * cos_lat);
+    let z = (360.0 * f64::from(FLOOR_TEXELS) / (256.0 * lon_span_deg)).log2();
+    (z.round().max(0.0) as u8).min(max_zoom)
+}
+
+/// Every slippy tile id at `zoom` the footprint touches, as `(x, y)` pairs —
+/// through the same corner mapping the composite samples with.
+///
+/// Longitude reach is widest at the row furthest from the equator (the
+/// `cos φ` in the mapping), so both y extremes are evaluated and the wider
+/// wins. Bounded by construction: [`floor_tile_zoom`] picks a zoom where the
+/// box is a few tiles across, and the count is clamped to an 8×8 window
+/// against a degenerate request.
+pub fn floor_tile_ids(
+    site_lat_deg: f64,
+    site_lon_deg: f64,
+    x_range_km: (f64, f64),
+    y_range_km: (f64, f64),
+    zoom: u8,
+) -> Vec<(u32, u32)> {
+    let site_lat_rad = site_lat_deg.to_radians();
+    let lat_at = |dy_km: f64| site_lat_rad + dy_km / rustdar_radar::types::EARTH_RADIUS_KM;
+    let lon_at = |dx_km: f64, lat_rad: f64| site_lon_deg + dx_km / (111.32 * lat_rad.cos());
+
+    let n = f64::from(1u32 << zoom.min(31));
+    let max_index = (1u64 << zoom.min(31)) - 1;
+    let tile_x = |lon: f64| ((lon + 180.0) / 360.0 * n).floor();
+    let tile_y = |lat_rad: f64| ((1.0 - mercator_y(lat_rad) / PI) / 2.0 * n).floor();
+
+    let (lat_s, lat_n) = (lat_at(y_range_km.0), lat_at(y_range_km.1));
+    let mut x_lo = f64::INFINITY;
+    let mut x_hi = f64::NEG_INFINITY;
+    for lat in [lat_s, lat_n] {
+        for dx in [x_range_km.0, x_range_km.1] {
+            let x = tile_x(lon_at(dx, lat));
+            x_lo = x_lo.min(x);
+            x_hi = x_hi.max(x);
+        }
+    }
+    let clamp_to = |v: f64| (v.max(0.0) as u64).min(max_index) as u32;
+    let (x_lo, x_hi) = (clamp_to(x_lo), clamp_to(x_hi));
+    // Slippy y grows southwards, so the north edge is the smaller index.
+    let (y_lo, y_hi) = (clamp_to(tile_y(lat_n)), clamp_to(tile_y(lat_s)));
+
+    let mut ids = Vec::new();
+    for y in y_lo..=y_hi.min(y_lo + 7) {
+        for x in x_lo..=x_hi.min(x_lo + 7) {
+            ids.push((x, y));
+        }
+    }
+    ids
 }
 
 /// `source` bilinearly sampled at `(px, py)`, straight RGBA. Outside the
@@ -185,20 +444,6 @@ fn bilinear(source: &[u8], side: usize, px: f64, py: f64) -> [f64; 4] {
             sample(ix, iy + 1)[channel] * (1.0 - tx) + sample(ix + 1, iy + 1)[channel] * tx;
         *slot = top * (1.0 - ty) + bottom * ty;
     }
-    out
-}
-
-/// Straight-alpha `echo` composited over the opaque ground colour, back to
-/// bytes. In gamma space, which is the convention every raster in this
-/// codebase composites in (egui's own, as the blit's doc lays out).
-fn over_ground(echo: [f64; 4]) -> [u8; 4] {
-    let alpha = echo[3] / 255.0;
-    let mut out = [0u8; 4];
-    for channel in 0..3 {
-        let ground = f64::from(FLOOR_GROUND_RGBA[channel]);
-        out[channel] = (echo[channel] * alpha + ground * (1.0 - alpha)).round() as u8;
-    }
-    out[3] = 255;
     out
 }
 
@@ -338,6 +583,163 @@ mod tests {
         assert!(
             floor.rgba.chunks_exact(4).all(|px| px[3] == 255),
             "the floor must be opaque ground everywhere",
+        );
+    }
+
+    /// One mapping, two consumers: a tile pixel and a radar gate that name
+    /// the same ground land on the same floor texel.
+    ///
+    /// The radar dot is planted through `render_gate`'s forward arithmetic
+    /// (as the Mercator-row test above does) and the tile dot through the
+    /// slippy pyramid's own forward formulas — two independent routes to the
+    /// same geographic point. If the composite ever grew a second projection
+    /// for tiles, this is where the two dots would part.
+    #[test]
+    fn a_tile_pixel_and_a_radar_gate_at_the_same_ground_land_on_the_same_texel() {
+        let side = 256;
+        let (site_lat, site_lon) = (35.0f64, -97.0f64);
+        let (dx_km, dy_km) = (100.0, 150.0);
+
+        // The radar raster's dot, through the raster's forward projection.
+        let site_lat_rad = site_lat.to_radians();
+        let lat_rad = site_lat_rad + dy_km / rustdar_radar::types::EARTH_RADIUS_KM;
+        let px_per_km = side as f64 / 460.0;
+        let px = side as f64 / 2.0 + dx_km * (site_lat_rad.cos() / lat_rad.cos()) * px_per_km;
+        let max_lat: f64 = site_lat + 230.0 / 111.32;
+        let min_lat: f64 = site_lat - 230.0 / 111.32;
+        let merc_top = mercator_y(max_lat.to_radians());
+        let merc_scale = side as f64 / (merc_top - mercator_y(min_lat.to_radians()));
+        let py = (merc_top - mercator_y(lat_rad)) * merc_scale;
+        let source = source_with_dot(side, (px as usize, py as usize));
+
+        // The tile's dot, through the slippy pyramid's forward formulas.
+        let zoom = floor_tile_zoom(site_lat, (-230.0, 230.0), 18);
+        let n = f64::from(1u32 << zoom);
+        let lon = site_lon + dx_km / (111.32 * lat_rad.cos());
+        let tile_x_f = (lon + 180.0) / 360.0 * n;
+        let tile_y_f = (1.0 - mercator_y(lat_rad) / PI) / 2.0 * n;
+        let (tile_x, tile_y) = (tile_x_f.floor(), tile_y_f.floor());
+        let tile_side = 256usize;
+        let mut tile_rgba = vec![0u8; tile_side * tile_side * 4];
+        let (dot_px, dot_py) = (
+            ((tile_x_f - tile_x) * tile_side as f64) as usize,
+            ((tile_y_f - tile_y) * tile_side as f64) as usize,
+        );
+        for row in dot_py.saturating_sub(1)..=(dot_py + 1).min(tile_side - 1) {
+            for col in dot_px.saturating_sub(1)..=(dot_px + 1).min(tile_side - 1) {
+                let at = (row * tile_side + col) * 4;
+                tile_rgba[at..at + 4].copy_from_slice(&[0, 255, 0, 255]);
+            }
+        }
+        let base = TileLayer {
+            zoom,
+            tiles: vec![DecodedTile {
+                x: tile_x as u32,
+                y: tile_y as u32,
+                side: tile_side as u32,
+                rgba: tile_rgba,
+            }],
+        };
+
+        let floor = compose_floor(
+            &source,
+            site_lat,
+            site_lon,
+            (-230.0, 230.0),
+            (-230.0, 230.0),
+            &base,
+            &TileLayer::empty(),
+        )
+        .expect("a composable floor");
+
+        let (red_col, red_row) = brightest_red(&floor);
+        let mut best_green = (0usize, 0usize, 0u8);
+        for row in 0..floor.size[1] as usize {
+            for col in 0..floor.size[0] as usize {
+                let at = (row * floor.size[0] as usize + col) * 4;
+                let greenness = floor.rgba[at + 1].saturating_sub(floor.rgba[at]);
+                if greenness > best_green.2 {
+                    best_green = (col, row, greenness);
+                }
+            }
+        }
+        assert!(best_green.2 > 100, "the tile dot never reached the floor");
+        assert!(
+            best_green.0.abs_diff(red_col) <= 2 && best_green.1.abs_diff(red_row) <= 2,
+            "the radar gate landed at ({red_col}, {red_row}) and the tile pixel \
+             for the same ground at ({}, {}) — the two consumers of the mapping \
+             have parted",
+            best_green.0,
+            best_green.1,
+        );
+    }
+
+    /// The stacking order is the 2D pane's: ground, basemap, radar, labels.
+    #[test]
+    fn the_layers_stack_ground_basemap_radar_labels() {
+        // A world-covering opaque blue basemap tile at zoom 0, and a radar
+        // dot at the site's own pixel (the floor's centre).
+        let blue_world = || TileLayer {
+            zoom: 0,
+            tiles: vec![DecodedTile {
+                x: 0,
+                y: 0,
+                side: 8,
+                rgba: [0u8, 0, 255, 255].repeat(64),
+            }],
+        };
+        let green_world = TileLayer {
+            zoom: 0,
+            tiles: vec![DecodedTile {
+                x: 0,
+                y: 0,
+                side: 8,
+                rgba: [0u8, 255, 0, 255].repeat(64),
+            }],
+        };
+        let source = source_with_dot(64, (32, 32));
+
+        // Base under radar: the dot's texel is the radar's red, the rest the
+        // basemap's blue — not the ground colour.
+        let floor = compose_floor(
+            &source,
+            35.0,
+            -97.0,
+            (-230.0, 230.0),
+            (-230.0, 230.0),
+            &blue_world(),
+            &TileLayer::empty(),
+        )
+        .expect("a composable floor");
+        let (col, row) = brightest_red(&floor);
+        let mid = FLOOR_TEXELS as usize / 2;
+        assert!(
+            col.abs_diff(mid) <= 8 && row.abs_diff(mid) <= 8,
+            "the radar dot must still land at the centre over a basemap",
+        );
+        let corner = &floor.rgba[..4];
+        assert!(
+            corner[2] > 200 && corner[0] < 50,
+            "away from the echo the basemap (blue) must show, got {corner:?}",
+        );
+
+        // Labels over radar: the same dot texel turns the label layer's
+        // green when an opaque label tile covers it.
+        let floor = compose_floor(
+            &source,
+            35.0,
+            -97.0,
+            (-230.0, 230.0),
+            (-230.0, 230.0),
+            &blue_world(),
+            &green_world,
+        )
+        .expect("a composable floor");
+        let at = (row * floor.size[0] as usize + col) * 4;
+        assert!(
+            floor.rgba[at + 1] > 200 && floor.rgba[at] < 50,
+            "an opaque label tile must paint over the radar echo, got {:?}",
+            &floor.rgba[at..at + 4],
         );
     }
 

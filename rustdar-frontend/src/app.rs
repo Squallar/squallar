@@ -338,7 +338,10 @@ pub struct App {
 
     /// Which `(site, region)` scopes have a floor render dispatched or landed
     /// for which volume stamp — the dedupe that keeps one floor per sealed
-    /// sweep when several products' builds complete for one volume.
+    /// sweep when several products' builds complete for one volume — and the
+    /// tile signature that render composited, which is what lets
+    /// [`App::recompose_floors_for_new_tiles`] notice basemap or label tiles
+    /// arriving after the floor was drawn and reopen the scope.
     ///
     /// A `Vec` with a linear scan because a `VolumeRegion` is not `Hash` and
     /// the bound is one entry per live 3D scope. Entries for scopes the store
@@ -346,6 +349,7 @@ pub struct App {
     floor_rendered: Vec<(
         (String, Option<rustdar_egui::pane::VolumeRegion>),
         chrono::NaiveDateTime,
+        u64,
     )>,
     /// Scopes owed a floor render whose last dispatch never delivered one: the
     /// budget was full at dispatch, or the render came back with no image.
@@ -1205,13 +1209,123 @@ impl App {
         }
     }
 
+    /// Gather the basemap and city-label tile bytes for a box footprint from
+    /// the panes' shared tile caches, plus the signature of what was in hand.
+    ///
+    /// Missing tiles are simply absent from the layers — this call is also
+    /// what *requests* them — and the signature is how
+    /// [`App::recompose_floors_for_new_tiles`] later notices they landed: it
+    /// folds the theme, the zoom and the resolved counts, all of which change
+    /// the picture a composite would produce.
+    fn gather_floor_tiles(
+        &mut self,
+        site_lat: f64,
+        site_lon: f64,
+        x_range_km: (f64, f64),
+        y_range_km: (f64, f64),
+    ) -> (
+        crate::volume::floor::TileBytesLayer,
+        crate::volume::floor::TileBytesLayer,
+        u64,
+    ) {
+        use crate::volume::floor::{TileBytesLayer, floor_tile_ids, floor_tile_zoom};
+
+        let empty = (TileBytesLayer::empty(), TileBytesLayer::empty(), 0);
+        let Some(ctx) = self
+            .state
+            .as_ref()
+            .map(|state| state.egui_renderer.context().clone())
+        else {
+            // Headless (the tests): no egui, no tile sources, no tiles — the
+            // composite is ground + radar, exactly the pre-tile floor.
+            return empty;
+        };
+        let is_dark = self.cached_dark_theme.unwrap_or(true);
+        let tiles = self.gui.map_tiles_mut();
+        tiles.ensure_base_tiles(is_dark, &ctx);
+        tiles.ensure_label_tiles(is_dark, &ctx);
+
+        let gather = |source: Option<&mut rustdar_egui::tile_source::HttpsTiles>| match source {
+            None => TileBytesLayer::empty(),
+            Some(source) => {
+                let zoom = floor_tile_zoom(site_lat, x_range_km, source.source_max_zoom());
+                let tiles = floor_tile_ids(site_lat, site_lon, x_range_km, y_range_km, zoom)
+                    .into_iter()
+                    .filter_map(|(x, y)| {
+                        source
+                            .raster_bytes_at(x, y, zoom)
+                            .map(|bytes| (x, y, bytes))
+                    })
+                    .collect();
+                TileBytesLayer { zoom, tiles }
+            }
+        };
+        let base = if is_dark {
+            gather(self.gui.map_tiles_mut().tiles_dark.as_mut())
+        } else {
+            gather(self.gui.map_tiles_mut().tiles_light.as_mut())
+        };
+        let labels = if is_dark {
+            gather(self.gui.map_tiles_mut().label_tiles_dark.as_mut())
+        } else {
+            gather(self.gui.map_tiles_mut().label_tiles_light.as_mut())
+        };
+
+        // Counts and zooms rather than tile ids: for a fixed scope the id set
+        // is a function of (zoom, footprint), so arrivals only ever change
+        // the counts — and a theme flip changes everything.
+        let signature = u64::from(is_dark)
+            | (u64::from(base.zoom) << 1)
+            | (u64::from(labels.zoom) << 9)
+            | ((base.tiles.len() as u64) << 17)
+            | ((labels.tiles.len() as u64) << 33);
+        (base, labels, signature)
+    }
+
+    /// Re-dispatch floors whose ground has more tiles than when they were
+    /// composited — the "tiles arrived after the floor" refresh, run every
+    /// frame beside the retry drain and free when nothing changed.
+    ///
+    /// The signature check *is* the request pump: `gather_floor_tiles` asks
+    /// the caches for every footprint tile, which both requests the missing
+    /// ones and reports the resolved count. A changed signature reopens the
+    /// scope's dedupe entry and owes it a render, and the ordinary retry path
+    /// re-composites against the scope's newest grid.
+    fn recompose_floors_for_new_tiles(&mut self) {
+        if self.floor_rendered.is_empty() {
+            return;
+        }
+        let scopes: Vec<_> = self
+            .floor_rendered
+            .iter()
+            .map(|(scope, _, sig)| (scope.clone(), *sig))
+            .collect();
+        for (scope, composed_sig) in scopes {
+            let Some((target, grid)) = self.volume_store.ready_for_scope(&scope.0, &scope.1) else {
+                continue;
+            };
+            let Some(site) = rustdar_radar::sites::get_radar_site(&target.volume.site) else {
+                continue;
+            };
+            let (_, _, sig) =
+                self.gather_floor_tiles(site.lat, site.lon, grid.x_range_km(), grid.y_range_km());
+            if sig != composed_sig {
+                self.floor_rendered.retain(|(s, _, _)| *s != scope);
+                if !self.floor_owed.contains(&scope) {
+                    self.floor_owed.push(scope);
+                }
+            }
+        }
+    }
+
     /// Dispatch a floor render for a completed build, unless this scope
     /// already has one for this stamp.
     ///
     /// The floor is the lowest-tilt **reflectivity** whatever moment the grid
     /// holds — it is the ground the 2D map shows, not a projection of the
     /// pane's product — extracted from the current merged volume the same way
-    /// every render payload is.
+    /// every render payload is, composited with the basemap and label tiles
+    /// the 2D panes share.
     fn maybe_spawn_floor_render(
         &mut self,
         target: &rustdar_egui::pane::VolumeTarget,
@@ -1224,7 +1338,7 @@ impl App {
         if self
             .floor_rendered
             .iter()
-            .any(|(s, at)| *s == scope && *at == stamp)
+            .any(|(s, at, _)| *s == scope && *at == stamp)
         {
             return;
         }
@@ -1259,13 +1373,18 @@ impl App {
             return;
         };
 
+        let (base_tiles, label_tiles, tile_sig) =
+            self.gather_floor_tiles(site.lat, site.lon, grid.x_range_km(), grid.y_range_km());
         let spawned = self.render.spawn_floor_render(
             target.volume.site.clone(),
             target.region,
             input,
             site.lat,
+            site.lon,
             grid.x_range_km(),
             grid.y_range_km(),
+            base_tiles,
+            label_tiles,
             self.channels.floor_sender.clone(),
             self.window.clone(),
         );
@@ -1285,8 +1404,8 @@ impl App {
         // would grow the list by one per site or region ever visited.
         let store = std::sync::Arc::clone(&self.volume_store);
         self.floor_rendered
-            .retain(|(s, _)| *s != scope && store.holds_scope(&s.0, &s.1));
-        self.floor_rendered.push((scope, stamp));
+            .retain(|(s, _, _)| *s != scope && store.holds_scope(&s.0, &s.1));
+        self.floor_rendered.push((scope, stamp, tile_sig));
     }
 
     /// Take delivery of finished floor renders.
@@ -1301,7 +1420,7 @@ impl App {
         while let Ok(fr) = self.channels.floor_receiver.try_recv() {
             let Some(image) = fr.image else {
                 let scope = (fr.site, fr.region);
-                self.floor_rendered.retain(|(s, _)| *s != scope);
+                self.floor_rendered.retain(|(s, _, _)| *s != scope);
                 if !self.floor_owed.contains(&scope) {
                     self.floor_owed.push(scope);
                 }
@@ -1691,6 +1810,10 @@ impl App {
         // build and its announcement cannot straddle a frame.
         self.poll_voxel_results();
         self.poll_floor_results();
+        // Before the retry drain, so a scope reopened by tiles landing this
+        // frame is re-dispatched this frame. This is also the request pump
+        // that keeps footprint tiles downloading for 3D-only sessions.
+        self.recompose_floors_for_new_tiles();
         // After the poll, so a budget slot freed by a reply this frame — or a
         // dedupe entry a `None` reply just cleared — is used this frame.
         self.retry_owed_floor_renders();
@@ -4821,7 +4944,7 @@ mod tests {
     fn a_floor_reply_with_no_image_reopens_the_dedupe_and_owes_a_retry() {
         let mut app = headless(TestBridge::desktop());
         let scope = ("KTLX".to_string(), None);
-        app.floor_rendered.push((scope.clone(), floor_stamp()));
+        app.floor_rendered.push((scope.clone(), floor_stamp(), 0));
 
         app.channels
             .floor_sender
@@ -4833,7 +4956,7 @@ mod tests {
             .unwrap();
         app.poll_floor_results();
         assert!(
-            !app.floor_rendered.iter().any(|(s, _)| *s == scope),
+            !app.floor_rendered.iter().any(|(s, _, _)| *s == scope),
             "a dispatch that delivered nothing must not stay recorded as \
              done — that is a floor missing for the volume's whole life",
         );
@@ -4846,7 +4969,7 @@ mod tests {
         // The control: a delivered floor must keep its dedupe entry — one
         // render per (scope, stamp) is the whole point of the ledger.
         app.floor_owed.clear();
-        app.floor_rendered.push((scope.clone(), floor_stamp()));
+        app.floor_rendered.push((scope.clone(), floor_stamp(), 0));
         app.channels
             .floor_sender
             .send(crate::channels::FloorResponse {
@@ -4860,7 +4983,7 @@ mod tests {
             .unwrap();
         app.poll_floor_results();
         assert!(
-            app.floor_rendered.iter().any(|(s, _)| *s == scope),
+            app.floor_rendered.iter().any(|(s, _, _)| *s == scope),
             "a delivered floor must not reopen the dedupe",
         );
         assert!(
@@ -4937,13 +5060,89 @@ mod tests {
         assert!(
             app.floor_rendered
                 .iter()
-                .any(|(s, at)| *s == scope && *at == stamp),
+                .any(|(s, at, _)| *s == scope && *at == stamp),
             "the owed retry must dispatch the floor render for the scope's \
              held grid without waiting for a build that will never come",
         );
         assert!(
             app.floor_owed.is_empty(),
             "a dispatched retry settles the debt",
+        );
+    }
+
+    /// Tiles landing after a floor was composited reopen the scope; a floor
+    /// whose tile signature still matches is left alone.
+    ///
+    /// The floor renders once per sealed sweep, but its basemap and label
+    /// tiles download on their own schedule — without this check, whichever
+    /// tiles were in hand at the first composite would be the box's ground
+    /// for the volume's whole life. Headless, `gather_floor_tiles` always
+    /// answers the empty signature, so a stored non-empty signature *is* the
+    /// "tiles changed" state and the empty one is "nothing changed".
+    #[test]
+    fn a_floor_is_recomposed_when_its_tiles_change_and_left_alone_when_not() {
+        use crate::volume::bridge::VolumeEntry;
+
+        let mut app = headless(TestBridge::desktop());
+        let stamp = floor_stamp();
+        let scan = reflectivity_scan();
+        let target = rustdar_egui::pane::VolumeTarget {
+            region: None,
+            volume: rustdar_egui::pane::VolumeStamp {
+                site: "KTLX".to_string(),
+                collected: stamp,
+            },
+            product: rustdar_radar::types::RadarProduct::Reflectivity,
+        };
+        let request = rustdar_radar::voxel::VoxelRequest {
+            centre: (35.33, -97.27),
+            half_width_km: 40.0,
+            base_km_msl: 0.0,
+            top_km_msl: 10.0,
+            product: rustdar_radar::types::RadarProduct::Reflectivity,
+            shape: rustdar_radar::voxel::WASM_SHAPE,
+            values_wanted: false,
+        };
+        let grid = Arc::new(
+            rustdar_radar::voxel::build_voxels(&scan, &request, 35.33, -97.27)
+                .expect("the fixture volume resamples"),
+        );
+        app.base_scans
+            .insert("KTLX".to_string(), (Arc::new(scan), stamp));
+        assert!(!app.volume_store.share(0, &target));
+        app.volume_store.begin_build(0, &target);
+        assert!(
+            app.volume_store
+                .complete(&target, VolumeEntry::Ready(Arc::clone(&grid)))
+        );
+        let scope = ("KTLX".to_string(), None);
+
+        // A floor composited while some tile set was in hand (signature 42),
+        // and the tiles have since changed (headless now reports 0).
+        app.floor_rendered.push((scope.clone(), stamp, 42));
+        app.recompose_floors_for_new_tiles();
+        assert!(
+            !app.floor_rendered.iter().any(|(s, _, _)| *s == scope),
+            "a changed tile signature must reopen the scope's dedupe entry",
+        );
+        assert_eq!(
+            app.floor_owed,
+            vec![scope.clone()],
+            "the reopened scope must be owed a re-composite",
+        );
+
+        // The signature matches what a composite now would use: untouched.
+        app.floor_owed.clear();
+        app.floor_rendered.clear();
+        app.floor_rendered.push((scope.clone(), stamp, 0));
+        app.recompose_floors_for_new_tiles();
+        assert!(
+            app.floor_rendered.iter().any(|(s, _, _)| *s == scope),
+            "an unchanged tile signature must leave the floor in hand",
+        );
+        assert!(
+            app.floor_owed.is_empty(),
+            "an unchanged tile signature owes nothing",
         );
     }
 }

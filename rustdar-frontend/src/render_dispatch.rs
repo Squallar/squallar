@@ -1275,11 +1275,15 @@ impl RenderDispatcher {
     /// Render a map floor for a finished voxel build, in the background.
     ///
     /// A `JobRequest::Radar` at the volume's lowest reflectivity tilt — the
-    /// exact rasterizer the 2D pane draws with — whose reply is resampled
-    /// onto the box footprint (`resample_floor`) in the job's own delivery
-    /// closure, off the frame thread natively, and sent through the floor
-    /// channel. Returns `false` when the budget is full; the caller keeps its
-    /// dedupe entry unwritten and the next completed build tries again.
+    /// exact rasterizer the 2D pane draws with — whose reply is composited
+    /// with the basemap and city-label tiles onto the box footprint
+    /// (`compose_floor`) in the job's own delivery closure, off the frame
+    /// thread natively, and sent through the floor channel. The tile bytes
+    /// arrive pre-gathered from the panes' shared caches; whichever have not
+    /// downloaded yet simply are not in the layer, and the App re-dispatches
+    /// when more land. Returns `false` when the budget is full; the caller
+    /// keeps its dedupe entry unwritten and the next completed build tries
+    /// again.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_floor_render(
         &mut self,
@@ -1287,8 +1291,11 @@ impl RenderDispatcher {
         region: Option<rustdar_egui::pane::VolumeRegion>,
         input: rustdar_radar::render_input::RenderInput,
         site_lat: f64,
+        site_lon: f64,
         x_range_km: (f64, f64),
         y_range_km: (f64, f64),
+        base_tiles: crate::volume::floor::TileBytesLayer,
+        label_tiles: crate::volume::floor::TileBytesLayer,
         sender: std::sync::mpsc::Sender<crate::channels::FloorResponse>,
         window: Option<WindowRef>,
     ) -> bool {
@@ -1306,20 +1313,25 @@ impl RenderDispatcher {
         });
         crate::offload::offload_job("floor-render", job, move |output| {
             let _guard = guard;
-            // Only the pixels travel to the resampler. The frame's
+            // Only the pixels travel to the composite. The frame's
             // `max_range_km` is the product's data reach — ~460 km for
             // super-res reflectivity — NOT the raster's half-extent, and
             // feeding it in as one was the 2× floor zoom of the 2026-08-09
-            // report; `resample_floor` now reads the raster's real geometry
-            // (`types::MAX_RANGE_KM`) at its own definition.
+            // report; `compose_floor` now reads the raster's real geometry
+            // (`types::MAX_RANGE_KM`) at its own definition. The tile decode
+            // rides this closure for the same reason the resample does: off
+            // the frame thread natively, once per floor rather than per frame.
             let image = output
                 .and_then(crate::offload::JobOutput::frame)
                 .and_then(|frame| {
-                    crate::volume::floor::resample_floor(
+                    crate::volume::floor::compose_floor(
                         &frame.image,
                         site_lat,
+                        site_lon,
                         x_range_km,
                         y_range_km,
+                        &base_tiles.decode(),
+                        &label_tiles.decode(),
                     )
                 });
             log::info!(

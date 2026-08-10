@@ -297,6 +297,16 @@ fn tile_client() -> reqwest::Client {
 
 /// A [`walkers::Tiles`] that fetches over HTTPS trusted by the operating system.
 ///
+/// One fetched tile: the texture walkers draws, and the compressed bytes it
+/// was decoded from — kept so a consumer that needs pixels on the CPU (the 3D
+/// floor's map composite) does not need a second download or a second decode
+/// path diverging from this one.
+#[derive(Clone)]
+struct CachedTile {
+    tile: Tile,
+    bytes: std::sync::Arc<Vec<u8>>,
+}
+
 /// Drop-in replacement for [`walkers::HttpTiles`]. See the module docs for what
 /// is reproduced and what deliberately differs.
 ///
@@ -309,12 +319,19 @@ pub struct HttpsTiles {
     /// Tiles by id. A `None` value means "asked for, not here yet" *and*
     /// "asked for, and it failed" — the two are deliberately indistinguishable,
     /// because both mean "do not ask again". See [`Self::request_once`].
-    cache: LruCache<TileId, Option<Tile>>,
+    ///
+    /// Each hit carries the tile's **compressed source bytes** beside the
+    /// decoded texture — ~30 KiB of PNG against the texture's 256 KiB — which
+    /// is what un-blocks the 3D floor's map composite: the tile pipeline used
+    /// to decode straight into an egui texture and keep no CPU-readable form,
+    /// and rustdar owns this fetch path precisely so decisions like that are
+    /// its own to make. See [`Self::raster_bytes_at`].
+    cache: LruCache<TileId, Option<CachedTile>>,
 
     /// Tiles the IO task should fetch.
     request_tx: Sender<TileId>,
     /// Tiles the IO task has fetched and decoded.
-    tile_rx: Receiver<(TileId, Tile)>,
+    tile_rx: Receiver<(TileId, CachedTile)>,
 
     /// Declared last so it drops last: the channels above must close first, which
     /// is what tells the fetch loop to exit.
@@ -370,8 +387,8 @@ impl HttpsTiles {
     /// texture uploads in one frame.
     fn receive_one_fetched_tile(&mut self) {
         match self.tile_rx.try_recv() {
-            Ok((tile_id, tile)) => {
-                self.cache.put(tile_id, Some(tile));
+            Ok((tile_id, cached)) => {
+                self.cache.put(tile_id, Some(cached));
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Closed) => log::error!("the tile IO task is gone"),
@@ -395,12 +412,14 @@ impl HttpsTiles {
             cache, request_tx, ..
         } = self;
 
-        let outcome =
-            cache.try_get_or_insert(tile_id, || -> Result<Option<Tile>, TrySendError<TileId>> {
+        let outcome = cache.try_get_or_insert(
+            tile_id,
+            || -> Result<Option<CachedTile>, TrySendError<TileId>> {
                 request_tx.try_send(tile_id)?;
                 log::trace!("requested tile {tile_id:?}");
                 Ok(None)
-            });
+            },
+        );
 
         match outcome {
             Ok(_) => {}
@@ -424,13 +443,44 @@ impl HttpsTiles {
         loop {
             let (ancestor, uv) = interpolate_from_lower_zoom(tile_id, zoom_candidate);
 
-            if let Some(Some(tile)) = self.cache.get(&ancestor) {
-                break Some(TilePiece::new(tile.clone(), uv));
+            if let Some(Some(cached)) = self.cache.get(&ancestor) {
+                break Some(TilePiece::new(cached.tile.clone(), uv));
             }
 
             // Out of ancestors: nothing to draw for this tile yet.
             zoom_candidate = zoom_candidate.checked_sub(1)?;
         }
+    }
+
+    /// The source's deepest zoom, so a consumer picking its own zoom level
+    /// (the 3D floor's composite) can clamp to what this source can serve.
+    pub fn source_max_zoom(&self) -> u8 {
+        self.max_zoom
+    }
+
+    /// The compressed bytes of exactly the slippy tile `(x, y)` at `zoom`,
+    /// starting a download when the tile has never been asked for.
+    ///
+    /// The 3D floor's map composite calls this — once per needed tile per
+    /// frame, the same cadence [`Tiles::at`] runs at for visible tiles — so a
+    /// 3D pane drives tile fetching even when no 2D pane is looking at the
+    /// same ground. No ancestor interpolation on purpose: the composite
+    /// resamples pixels itself and stretching a lower zoom underneath it would
+    /// bake a blur into the floor that quietly stopped refreshing; absence
+    /// here means "not yet", and the caller re-composes when the bytes land.
+    /// Primitive coordinates rather than [`TileId`] so the caller
+    /// (`rustdar-frontend`) does not need walkers in its dependency set.
+    pub fn raster_bytes_at(&mut self, x: u32, y: u32, zoom: u8) -> Option<std::sync::Arc<Vec<u8>>> {
+        self.receive_one_fetched_tile();
+        let tile_id = TileId { x, y, zoom };
+        if !tile_id_is_valid(tile_id) || tile_id.zoom > self.max_zoom {
+            return None;
+        }
+        self.request_once(tile_id);
+        self.cache
+            .get(&tile_id)
+            .and_then(|hit| hit.as_ref())
+            .map(|cached| std::sync::Arc::clone(&cached.bytes))
     }
 
     /// Tiles currently held, including pending and failed markers.
@@ -495,7 +545,7 @@ async fn fetch_one<S: TileSource>(
     client: &reqwest::Client,
     egui_ctx: &Context,
     tile_id: TileId,
-) -> Result<(TileId, Tile), String> {
+) -> Result<(TileId, CachedTile), String> {
     let url = source.tile_url(tile_id);
     log::trace!("downloading '{url}'");
 
@@ -524,7 +574,13 @@ async fn fetch_one<S: TileSource>(
     let tile = Tile::new(&body, &Style::default(), tile_id.zoom, egui_ctx)
         .map_err(|error| format!("decoding '{url}': {error}"))?;
 
-    Ok((tile_id, tile))
+    Ok((
+        tile_id,
+        CachedTile {
+            tile,
+            bytes: std::sync::Arc::new(body.to_vec()),
+        },
+    ))
 }
 
 /// Serve tile requests until [`HttpsTiles`] is dropped.
@@ -541,7 +597,7 @@ async fn fetch_continuously<S: TileSource>(
     source: S,
     client: reqwest::Client,
     mut request_rx: Receiver<TileId>,
-    mut tile_tx: Sender<(TileId, Tile)>,
+    mut tile_tx: Sender<(TileId, CachedTile)>,
     egui_ctx: Context,
 ) {
     let mut outstanding = FuturesUnordered::new();
