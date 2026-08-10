@@ -1235,7 +1235,23 @@ fn volume_pane_outcome(
         delta.pan = pan;
     }
 
-    if response.hovered() || response.dragged() {
+    // The pane-rect gate alone stopped being enough at the full-bleed flip:
+    // pane rects now run under the floating chrome (timeline, status bar,
+    // layers panel), so "the pointer is over this pane" no longer implies
+    // "the pointer is over the *map*". The topmost-layer check is the same
+    // rule `filter_dialog_blocked` applies to clicks — a position covered by
+    // any layer above `Background` belongs to that layer, and a wheel there
+    // must work the chrome, not fly the camera under it. `hovered()` already
+    // answers through egui's layer-aware hit test, so the check's own ground
+    // is the `dragged()` arm: a drag keeps this response resolving after the
+    // pointer has wandered over the chrome, and without the layer check a
+    // wheel spun there mid-orbit would still zoom the box.
+    let pointer_on_map_layer = ui.ctx().pointer_latest_pos().is_some_and(|pos| {
+        !ui.ctx()
+            .layer_id_at(pos)
+            .is_some_and(|l| l.order > egui::Order::Background)
+    });
+    if (response.hovered() || response.dragged()) && pointer_on_map_layer {
         let (pinch, scroll) = ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta.y));
         // Multiplied, not chosen between: a trackpad can deliver both in one
         // frame, and `OrbitCamera::nudge` divides the distance by the product

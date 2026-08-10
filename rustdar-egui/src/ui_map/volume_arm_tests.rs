@@ -1363,12 +1363,24 @@ fn a_committed_region_is_drawn_on_the_map_it_came_from() {
 
     // A stroked square whose two sides are within a point of each other,
     // sitting inside the source pane. Classified by geometry rather than by
-    // colour, the way `color_scale_strips` classifies its bars.
-    let square_in = |h: &mut InputHarness, pane: egui::Rect| {
+    // colour, the way `color_scale_strips` classifies its bars — and
+    // centred clear of the floating chrome, whose square icon buttons and
+    // checkboxes would otherwise count as regions on whichever pane they
+    // float over. Centre-based, like the pane test itself: a region box
+    // that merely runs *under* a panel's edge is still the map's.
+    let chrome = [
+        h.status_bar().rect,
+        h.timeline().rect,
+        h.layers_panel_rect().unwrap_or(egui::Rect::NOTHING),
+    ];
+    let square_in = move |h: &mut InputHarness, pane: egui::Rect| {
         h.painted_rects()
             .iter()
             .filter(|r| {
-                pane.contains(r.center()) && r.width() > 8.0 && (r.width() - r.height()).abs() < 1.0
+                pane.contains(r.center())
+                    && chrome.iter().all(|c| !c.contains(r.center()))
+                    && r.width() > 8.0
+                    && (r.width() - r.height()).abs() < 1.0
             })
             .count()
     };

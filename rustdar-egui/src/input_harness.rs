@@ -504,6 +504,11 @@ impl InputHarness {
         *self.gui.top_bar_for_test()
     }
 
+    /// What the last frame's timeline transport drew.
+    pub(crate) fn timeline(&self) -> crate::ui::TimelineProbe {
+        self.gui.timeline_for_test().clone()
+    }
+
     /// Put the layers panel on screen the user's way: a click on the top bar's
     /// Layers toggle. Idempotent — the toggle's probe says whether the panel is
     /// already showing, and a second click would close it again.
@@ -514,6 +519,31 @@ impl InputHarness {
         }
         self.mouse_click(toggle.center());
         self.warm_up();
+    }
+
+    /// Take the layers panel off screen the user's way — the same toggle.
+    ///
+    /// Since the full-bleed flip the panel floats *over* the map's left side,
+    /// so a map-interaction test whose positions land under it must close it
+    /// first: a click there belongs to the panel, exactly as it does for a
+    /// user.
+    pub(crate) fn close_layers(&mut self) {
+        let (toggle, open) = self.top_bar().layers_toggle;
+        if !open {
+            return;
+        }
+        self.mouse_click(toggle.center());
+        self.warm_up();
+    }
+
+    /// The floating layers panel's on-screen rect, from the area state egui
+    /// itself keeps — the same authority `layer_id_at` answers from — or
+    /// `None` while the panel is closed.
+    pub(crate) fn layers_panel_rect(&self) -> Option<egui::Rect> {
+        self.layers_panel_on_screen()
+            .then(|| egui::AreaState::load(&self.ctx, egui::Id::new("layers_panel")))
+            .flatten()
+            .map(|state| state.rect())
     }
 
     /// Open the whole-menu dropdown the user's way: a click on the top bar's

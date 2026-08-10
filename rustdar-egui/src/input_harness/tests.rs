@@ -1323,7 +1323,11 @@ fn the_wheel_rewrite_divides_by_the_zoom_factor() {
 ///    quietly recomputes it from the pane it happens to be drawing.
 #[test]
 fn every_pane_draws_its_color_scale_on_the_same_edge() {
-    let mut h = InputHarness::with_screen(egui::vec2(1080.0, 1273.0));
+    // Sized so the full-bleed map keeps the same shape the docked chrome
+    // used to leave — portrait top panes over a landscape bottom one —
+    // while staying Expanded, where the open layers panel keeps layer
+    // sync seeding the panes the split adds.
+    let mut h = InputHarness::with_screen(egui::vec2(1010.0, 1450.0));
     h.set_pane_count(3);
     h.frame();
 
@@ -1782,6 +1786,9 @@ fn a_touch_gesture_interrupted_by_a_mouse_does_not_resume_when_touch_returns() {
 fn a_touch_reaches_only_the_active_pane_but_a_click_reaches_them_all() {
     let mut h = InputHarness::new();
     h.set_pane_count(2);
+    // Pane 0's centre sits under the floating layers panel on Expanded;
+    // a click there belongs to the panel, so take it off screen first.
+    h.close_layers();
     let pos = h.pane_rects()[0].center();
     assert!(
         h.pane_rects().len() == 2 && !h.pane_rects()[1].contains(pos),
@@ -1803,6 +1810,7 @@ fn a_touch_reaches_only_the_active_pane_but_a_click_reaches_them_all() {
 
     let mut h = InputHarness::new();
     h.set_pane_count(2);
+    h.close_layers();
 
     // The release frame is the one that separates the two branches: a
     // touch release carries the synthetic `PointerButton{up}` that makes
@@ -1972,15 +1980,23 @@ fn crossing_a_breakpoint_does_not_move_any_widget_id() {
 // no rects; M5's pill contract replaces rect exclusion with layer-based
 // blocking.
 
-/// 16b. **The map keeps usable space at every breakpoint.**
+/// 16b. **The map is full-bleed: the content rect minus the top bar,
+///      exactly, at every breakpoint — and every floating surface sits
+///      inside it.**
 ///
-///      Panels claim space in call order and the map gets the remainder, so
-///      chrome that is too greedy — or ordered wrongly — squeezes the map
-///      toward zero. That rect feeds pane hit-testing, `excluded_rects` and
-///      overlay texture sizing, so a degenerate one is silent everywhere
-///      rather than obviously broken in one place.
+///      The Synthesis full-bleed rule: the top bar is the one docked
+///      chrome, and everything else floats *over* the map. The map's rect
+///      feeds pane hit-testing, `excluded_rects` and overlay texture
+///      sizing, so both failure directions are silent everywhere rather
+///      than obviously broken in one place: chrome that claims panel
+///      space again shrinks it back, and a floating surface positioned
+///      outside it is chrome floating over nothing.
+///
+///      Exact equality, not bounds: "the remainder after the top bar" is
+///      the whole contract, and a stray one-point margin is how a second
+///      docked panel starts.
 #[test]
-fn the_map_keeps_usable_space_at_every_breakpoint() {
+fn the_map_is_full_bleed_under_the_top_bar() {
     for (size, expected) in [
         (
             egui::vec2(420.0, 800.0),
@@ -2002,34 +2018,64 @@ fn the_map_keeps_usable_space_at_every_breakpoint() {
             "precondition: {size:?} should be {expected:?}"
         );
 
-        for drawer in [false, true] {
-            h.set_drawer_open(drawer);
-            let panel = h.map_panel_rect();
-            assert!(
-                panel.width() > 100.0 && panel.height() > 100.0,
-                "{expected:?} (drawer_open={drawer}): the map was squeezed to \
-                     {:?} x {:?} — the chrome claimed nearly everything",
-                panel.width(),
-                panel.height()
-            );
-            // The status bar is present at every width, so the map never
-            // gets the full height. This is what stops the bounds above
-            // passing on a frame where no chrome rendered at all.
-            assert!(
-                panel.height() < size.y,
-                "{expected:?} (drawer_open={drawer}): the map got the full \
-                     height, so the status bar claimed nothing"
+        // With and without insets: the content rect is what the map must
+        // fill, not the raw viewport.
+        for insets in [(0.0, 0.0, 0.0, 0.0), (24.0, 16.0, 6.0, 6.0)] {
+            let (top, bottom, left, right) = insets;
+            h.set_safe_area_insets(top, bottom, left, right);
+            let content = egui::Rect::from_min_max(
+                egui::pos2(left, top),
+                egui::pos2(size.x - right, size.y - bottom),
             );
 
-            // A left panel is showing exactly when the sidebar is
-            // persistent or the drawer is open; only then is the map
-            // narrower than the screen.
-            let has_left_panel = expected == crate::ui_layout::WidthClass::Expanded || drawer;
+            for drawer in [false, true] {
+                h.set_drawer_open(drawer);
+                let panel = h.map_panel_rect();
+                let top_bar = h.top_bar().rect;
+                let expected_panel = egui::Rect::from_min_max(
+                    egui::pos2(content.left(), top_bar.bottom()),
+                    content.right_bottom(),
+                );
+                assert_eq!(
+                    panel, expected_panel,
+                    "{expected:?} (drawer={drawer}, insets={insets:?}): the \
+                     map is not exactly the content rect minus the top bar"
+                );
+
+                // Every floating surface floats *inside* the map.
+                for (name, rect) in [
+                    ("status bar", h.status_bar().rect),
+                    ("timeline", h.timeline().rect),
+                ] {
+                    assert!(
+                        panel.contains_rect(rect),
+                        "{expected:?} (drawer={drawer}, insets={insets:?}): \
+                         the {name} at {rect:?} is not inside the map {panel:?}"
+                    );
+                }
+                if h.layers_panel_on_screen() {
+                    let layers = h
+                        .layers_panel_rect()
+                        .expect("the panel is on screen, so its area has a rect");
+                    assert!(
+                        panel.contains_rect(layers),
+                        "{expected:?} (drawer={drawer}, insets={insets:?}): \
+                         the layers panel at {layers:?} is not inside the \
+                         map {panel:?}"
+                    );
+                }
+            }
+
+            // Opening and closing the layers panel no longer resizes the
+            // map — the panel floats over it.
+            h.set_drawer_open(false);
+            let closed = h.map_panel_rect();
+            h.set_drawer_open(true);
             assert_eq!(
-                panel.width() < size.x,
-                has_left_panel,
-                "{expected:?} (drawer_open={drawer}): the map's width does \
-                     not agree with whether a left panel should be showing"
+                closed,
+                h.map_panel_rect(),
+                "{expected:?} (insets={insets:?}): opening the layers panel \
+                 resized the map — it has started claiming panel space again"
             );
         }
     }
@@ -2674,9 +2720,12 @@ fn the_layers_toggle_hides_and_restores_the_expanded_sidebar_with_its_state() {
         "clicking the Layers toggle did not hide the persistent sidebar"
     );
     assert!(
-        h.widget_id_probes().is_empty(),
+        !h.widget_id_probes()
+            .iter()
+            .any(|(name, _)| *name == "layers_scroll" || *name == "product_sel"),
         "the panel is gone but still reported widget ids, so something \
-         of it is still rendering"
+         of it is still rendering (the timeline's own probes remain — it \
+         is a separate surface and stays up)"
     );
     assert!(
         !h.top_bar().layers_toggle.1,
@@ -3192,11 +3241,16 @@ fn the_hover_readout_follows_the_modality_not_the_width() {
     );
 }
 
-/// 26. **A compact bar drops the long summary and the auto-poll box.**
+/// 26. **A compact bar drops the long summary and the poll chip — and the
+///     Auto-poll toggle stays reachable through the menu everywhere.**
 ///
 ///     The half left unpinned when one flag became two: inverting `roomy`
 ///     crammed both into a 420pt phone bar and stripped both from a 1400pt
 ///     desktop, suite green. Asserted on the text drawn, not the flag.
+///
+///     Since the full-bleed flip the auto-poll *checkbox* is a display
+///     chip; the toggle itself lives in the ☰ menu. The menu assertion is
+///     what keeps that a move rather than a removal.
 #[test]
 fn a_compact_status_bar_drops_the_long_summary_and_the_auto_poll_box() {
     let mut phone = InputHarness::with_screen(egui::vec2(420.0, 900.0));
@@ -3210,13 +3264,29 @@ fn a_compact_status_bar_drops_the_long_summary_and_the_auto_poll_box() {
     let roomy_bar = desk.status_bar();
 
     assert!(
-        compact_bar.auto_poll.is_none(),
-        "the auto-poll checkbox was crammed into a compact status bar"
+        compact_bar.poll_chip.is_none(),
+        "the auto-poll chip was crammed into a compact status bar"
     );
+    let (_, chip_text) = roomy_bar
+        .poll_chip
+        .clone()
+        .expect("a desktop status bar lost its auto-poll chip");
     assert!(
-        roomy_bar.auto_poll.is_some(),
-        "a desktop status bar lost its auto-poll checkbox"
+        chip_text.contains("Auto-poll"),
+        "the chip must name the state it shows, got {chip_text:?}"
     );
+
+    // The chip is display-only; the toggle lives in the ☰ menu — at every
+    // width, so the compact bar dropping the chip strands nothing.
+    for h in [&mut phone, &mut desk] {
+        h.open_menu();
+        assert_eq!(
+            h.menu_leaf("Auto-poll").map(|l| l.value),
+            Some(Some(true)),
+            "the menu must carry the Auto-poll toggle, checked while on"
+        );
+        h.close_menu();
+    }
 
     // Both forms name the site, so the difference is the *detail*: only the
     // long form carries the date and the product count.
@@ -3343,6 +3413,371 @@ fn a_looping_pane_reports_its_current_frames_time() {
     assert!(
         !drawn.contains("90 min old"),
         "the static render's time captioned the animation: {drawn:?}"
+    );
+}
+
+// ── The floating timeline transport ──────────────────────────────────
+
+/// 66. **Collapsing the transport leaves a restore chip at the map's
+///     bottom-right, and the chip restores it.**
+///
+///     Collapse that merely hid the widgets would leave their rects
+///     recorded and their clicks landing; collapse that left no chip
+///     would be a transport with no way back. Both halves are driven the
+///     user's way, through the drawn rects.
+#[test]
+fn collapsing_the_transport_leaves_a_chip_that_restores_it() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.warm_up();
+    let before = h.timeline();
+    assert!(
+        !before.collapsed && before.live.0.is_positive(),
+        "precondition: the transport starts expanded with row 1 drawn"
+    );
+
+    h.mouse_click(before.collapse.center());
+    h.warm_up();
+    let collapsed = h.timeline();
+    assert!(collapsed.collapsed, "the \u{25be} button did not collapse");
+
+    // The chip: inside the map, hugging its bottom-right corner.
+    let map = h.map_panel_rect();
+    assert!(
+        map.contains_rect(collapsed.chip),
+        "the chip at {:?} is outside the map {map:?}",
+        collapsed.chip
+    );
+    assert!(
+        map.right() - collapsed.chip.right() < 24.0 && collapsed.chip.center().x > map.center().x,
+        "the chip at {:?} is not right-aligned in {map:?}",
+        collapsed.chip
+    );
+
+    // Row 1 is really gone — no rects to click, no text on the glass.
+    assert!(
+        !collapsed.live.0.is_positive()
+            && !collapsed.scrubber.is_positive()
+            && !collapsed.step_dropdown.is_positive(),
+        "row-1 widgets were still recorded while collapsed"
+    );
+    assert!(
+        !h.painted_text_strings()
+            .iter()
+            .any(|t| t == "\u{23fa} Live"),
+        "the Live button was still painted while collapsed"
+    );
+
+    // And the chip is the way back.
+    h.mouse_click(collapsed.chip.center());
+    h.warm_up();
+    let restored = h.timeline();
+    assert!(
+        !restored.collapsed && restored.live.0.is_positive(),
+        "clicking the chip did not restore the transport"
+    );
+}
+
+/// 66b. **The status bar's ◧ collapses it to a restore button, left-
+///      anchored, and the same button brings it back.**
+#[test]
+fn collapsing_the_status_bar_leaves_only_its_restore_button() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.load_scan("KTLX");
+    let bar = h.status_bar();
+    assert!(
+        !bar.collapsed && bar.refresh.is_positive(),
+        "precondition: the bar starts expanded with its content drawn"
+    );
+
+    h.mouse_click(bar.collapse.center());
+    h.warm_up();
+    let collapsed = h.status_bar();
+    assert!(collapsed.collapsed, "the \u{25e7} button did not collapse");
+    assert!(
+        !collapsed.refresh.is_positive(),
+        "the refresh button was still drawn while collapsed"
+    );
+    assert!(
+        !h.text_painted_in(collapsed.rect, "Scan:"),
+        "the scan summary was still painted while collapsed"
+    );
+    let map = h.map_panel_rect();
+    assert!(
+        collapsed.collapse.left() - map.left() < 24.0,
+        "the restore button at {:?} is not left-anchored in {map:?}",
+        collapsed.collapse
+    );
+
+    h.mouse_click(collapsed.collapse.center());
+    h.warm_up();
+    let restored = h.status_bar();
+    assert!(
+        !restored.collapsed && restored.refresh.is_positive(),
+        "clicking the restore button did not bring the bar back"
+    );
+}
+
+/// **The timestamp chip opens the Set Time dialog** — the timeline's own
+/// route to it; the menu's Time... entry is the other, and the dialog
+/// itself is unchanged.
+#[test]
+fn the_timestamp_chip_opens_the_time_dialog() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.warm_up();
+    let (rect, text) = h.timeline().timestamp;
+    assert!(
+        text.ends_with("live"),
+        "precondition: a fresh pane's timestamp reads live, got {text:?}"
+    );
+    h.mouse_click(rect.center());
+    h.warm_up();
+    assert!(
+        h.text_painted_in(h.screen_rect(), "Select Time"),
+        "clicking the timestamp chip did not open the Set Time dialog"
+    );
+}
+
+/// **Back steps into the archive; forward is dead while live** — the
+/// navigation semantics that moved from the layers panel, driven through
+/// the timeline's drawn rects for the first time.
+#[test]
+fn back_steps_into_the_archive_and_forward_is_dead_while_live() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.load_scan("KTLX");
+
+    let t = h.timeline();
+    assert!(
+        !t.live.1,
+        "precondition: a live pane's Live button is not in the red style"
+    );
+    assert!(!t.fwd.1, "forward must be disabled while live");
+    h.mouse_click(t.fwd.0.center());
+    assert!(
+        !h.last_actions().iter().any(|a| {
+            matches!(
+                a,
+                crate::actions::GuiAction::NavigateTime { .. }
+                    | crate::actions::GuiAction::NavigateOneScan { .. }
+            )
+        }),
+        "a disabled forward button still navigated"
+    );
+
+    // Back: one default step (10 min) into the archive, dropping live.
+    h.mouse_click(h.timeline().back.center());
+    assert!(
+        h.last_actions().iter().any(|a| matches!(
+            a,
+            crate::actions::GuiAction::NavigateTime {
+                pane_idx: 0,
+                step_secs: -600,
+            }
+        )),
+        "back must step one default step backwards"
+    );
+    h.warm_up();
+    let t = h.timeline();
+    assert!(
+        !h.gui_mut().pane(0).expect("pane 0").viewing_live,
+        "back must drop the pane out of live"
+    );
+    assert!(
+        t.live.1,
+        "an archive pane's Live button must show the red not-live style"
+    );
+    assert!(t.fwd.1, "forward must come alive in the archive");
+}
+
+/// 74. **A wheel over the floating chrome zooms nothing underneath it.**
+///
+///     Pane rects run under the timeline and the status bar since the
+///     full-bleed flip, so "the pointer is over this pane" no longer
+///     implies "the pointer is over the map". Two readers could fall for
+///     it: walkers' own gate for the 2D map, and the 3D pane's globally
+///     read `zoom_delta` — the second is the one `volume_pane_outcome`'s
+///     topmost-layer check exists for. Each half has a control scroll on
+///     open map first, so a pass cannot come from zooming being broken
+///     altogether.
+#[test]
+fn a_wheel_over_the_floating_chrome_zooms_nothing_underneath() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.set_pane_count(2);
+    h.load_scan("KTLX");
+    h.make_pane_volume(1);
+    h.warm_up();
+
+    let timeline = h.timeline().rect;
+    let status_bar = h.status_bar().rect;
+    let panes = h.pane_rects();
+    let eye = |h: &mut InputHarness| {
+        h.gui_mut()
+            .pane(1)
+            .expect("pane 1 exists")
+            .volume()
+            .expect("pane 1 is a volume")
+            .camera
+            .eye_distance()
+    };
+
+    // Control: a scroll on the open volume pane moves its camera.
+    let clear_volume = egui::pos2(panes[1].center().x, panes[1].center().y);
+    assert!(
+        !h.is_floating_layer_at(clear_volume),
+        "precondition: the control point must be open map"
+    );
+    let before = eye(&mut h);
+    h.scroll_at(clear_volume, egui::vec2(0.0, 200.0));
+    h.frames_for(2, FRAME_DT);
+    assert!(
+        eye(&mut h) < before,
+        "control: a scroll on the open volume pane must zoom it"
+    );
+
+    // Over the timeline, above the same volume pane: nothing.
+    let covered = egui::pos2(
+        (panes[1].left() + 40.0).max(timeline.left() + 8.0),
+        timeline.center().y,
+    );
+    assert!(
+        timeline.contains(covered) && panes[1].contains(covered),
+        "precondition: the point is on the timeline over the volume pane"
+    );
+    let before = eye(&mut h);
+    h.scroll_at(covered, egui::vec2(0.0, 200.0));
+    h.frames_for(2, FRAME_DT);
+    assert_eq!(
+        eye(&mut h),
+        before,
+        "a wheel over the timeline flew the 3D camera under it"
+    );
+
+    // Control: a scroll on the open map pane zooms the map.
+    let clear_map = egui::pos2(panes[0].center().x + 80.0, panes[0].center().y);
+    assert!(
+        !h.is_floating_layer_at(clear_map),
+        "precondition: the map control point must be open map"
+    );
+    let before = h.frame().resolved_zoom;
+    h.scroll_at(clear_map, egui::vec2(0.0, 200.0));
+    let zoomed = h.frames_for(12, FRAME_DT).resolved_zoom;
+    assert!(
+        zoomed != before,
+        "control: a scroll on the open map pane must zoom it"
+    );
+
+    // Over the status bar, above the same map pane: nothing.
+    let covered = egui::pos2(panes[0].center().x + 80.0, status_bar.center().y);
+    assert!(
+        status_bar.contains(covered) && panes[0].contains(covered),
+        "precondition: the point is on the status bar over the map pane"
+    );
+    let before = h.frame().resolved_zoom;
+    h.scroll_at(covered, egui::vec2(0.0, 200.0));
+    let after = h.frames_for(12, FRAME_DT).resolved_zoom;
+    assert_eq!(
+        after, before,
+        "a wheel over the status bar zoomed the map under it"
+    );
+    // ...and over the timeline too.
+    let covered = egui::pos2(panes[0].right() - 80.0, timeline.center().y);
+    assert!(
+        timeline.contains(covered) && panes[0].contains(covered),
+        "precondition: the point is on the timeline over the map pane"
+    );
+    let before = h.frame().resolved_zoom;
+    h.scroll_at(covered, egui::vec2(0.0, 200.0));
+    let after = h.frames_for(12, FRAME_DT).resolved_zoom;
+    assert_eq!(
+        after, before,
+        "a wheel over the timeline zoomed the map under it"
+    );
+}
+
+/// **Scrubbing drops out of live, on release** (plan §3.7).
+///
+///     With no loop running, the scrubber spans the lookback window and
+///     commits once, on `drag_stopped`: a release inside the rail emits
+///     `NavigateTime` to the released moment and clears `viewing_live`.
+///     Nothing may fire mid-drag — every intermediate position would be a
+///     volume fetch nobody asked to wait for.
+#[test]
+fn scrubbing_the_archive_commits_once_on_release_and_drops_live() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.load_scan("KTLX");
+    assert!(
+        h.gui_mut().pane(0).expect("pane 0").viewing_live,
+        "precondition: the pane starts live"
+    );
+
+    let scrub = h.timeline().scrubber;
+    assert!(scrub.is_positive(), "precondition: the scrubber is drawn");
+    let mid = scrub.center();
+    h.mouse_move(mid);
+    h.frame();
+    h.mouse_press(mid);
+    h.frame();
+    let dragged_to = mid + egui::vec2(-30.0, 0.0);
+    h.mouse_move(dragged_to);
+    h.frame();
+    let navigated = |h: &InputHarness| {
+        h.last_actions().iter().any(|a| {
+            matches!(
+                a,
+                crate::actions::GuiAction::NavigateTime { .. }
+                    | crate::actions::GuiAction::JumpToLive { .. }
+            )
+        })
+    };
+    assert!(
+        !navigated(&h),
+        "the scrub emitted a navigation mid-drag: that is a fetch per \
+         drag frame"
+    );
+
+    h.mouse_release(dragged_to);
+    h.frame();
+    assert!(
+        h.last_actions().iter().any(|a| matches!(
+            a,
+            crate::actions::GuiAction::NavigateTime { pane_idx: 0, .. }
+        )),
+        "releasing the scrub mid-rail emitted no NavigateTime"
+    );
+    assert!(
+        !h.gui_mut().pane(0).expect("pane 0").viewing_live,
+        "the committed scrub left the pane claiming to be live"
+    );
+}
+
+/// **Scrubbing to the right end restores live** (plan §3.7).
+#[test]
+fn scrubbing_to_the_right_end_restores_live() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.load_scan("KTLX");
+    // Park the pane in the archive first, so JumpToLive has something to do.
+    h.gui_mut().pane_mut(0).expect("pane 0").viewing_live = false;
+    h.warm_up();
+
+    let scrub = h.timeline().scrubber;
+    let end = egui::pos2(scrub.right() - 1.0, scrub.center().y);
+    h.mouse_move(end);
+    h.frame();
+    h.mouse_press(end);
+    h.frame();
+    h.mouse_release(end);
+    h.frame();
+
+    assert!(
+        h.last_actions()
+            .iter()
+            .any(|a| matches!(a, crate::actions::GuiAction::JumpToLive { pane_idx: 0 })),
+        "releasing the scrub at the right end must jump back to live"
+    );
+    assert!(
+        !h.last_actions()
+            .iter()
+            .any(|a| matches!(a, crate::actions::GuiAction::NavigateTime { .. })),
+        "the right end must mean live, not an archive moment near now"
     );
 }
 
@@ -3929,12 +4364,16 @@ fn clicking_beside_a_radar_site_icon_switches_nothing() {
 ///
 ///      `is_pos_blocked`'s three conditions mask each other everywhere they
 ///      normally meet, so each has to be reached alone. This is the
-///      pane-rect one: a site icon straddling the pane's bottom edge, and
-///      two clicks 10pt apart — one on the map, one in the status bar. The
+///      pane-rect one: a site icon straddling the pane's **top** edge, and
+///      two clicks 10pt apart — one on the map, one in the top bar. The
 ///      icon's own hit-test cannot tell them apart, and neither can the
 ///      other two conditions (nothing is excluded on a wide screen, and a
 ///      panel is a background layer), so only the pane rect stands between
-///      a click on the chrome and a radar site change.
+///      a click on the chrome and a radar site change. The top edge
+///      because the top bar is the one docked chrome left: since the
+///      full-bleed flip the pane's other three edges are the screen's, and
+///      the chrome along the bottom is a floating layer — which would
+///      reach the *layer* condition, not this one.
 ///
 ///      `screen_rect.expand(100.0)` in `render_pane_map_content` is what
 ///      makes this reachable at all: sites just off the pane are still
@@ -3946,14 +4385,17 @@ fn a_click_outside_the_pane_does_not_reach_a_site_icon_straddling_its_edge() {
     h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
     h.warm_up();
 
+    // Off the pane's centre-line, so the blocked click lands on the top
+    // bar's empty stretch rather than on one of its widgets — a click
+    // that *did* something would fail this test for an unrelated reason.
     let pane = h.pane_rects()[0];
-    let edge = egui::pos2(pane.center().x, pane.bottom());
+    let edge = egui::pos2(pane.center().x + 150.0, pane.top());
     h.place_site_at(0, "KTLX", edge);
 
     // 5pt either side of the edge: both well inside an 18pt icon, so the
     // icon hit-test says yes to both.
-    let on_map = edge - egui::vec2(0.0, 5.0);
-    let off_pane = edge + egui::vec2(0.0, 5.0);
+    let on_map = edge + egui::vec2(0.0, 5.0);
+    let off_pane = edge - egui::vec2(0.0, 5.0);
     let pane = h.pane_rects()[0];
     assert!(
         pane.contains(on_map),
@@ -3963,17 +4405,17 @@ fn a_click_outside_the_pane_does_not_reach_a_site_icon_straddling_its_edge() {
     assert!(
         h.screen_rect().contains(off_pane),
         "precondition: the blocked click must still be on screen — this is \
-             a click on the chrome, not a click on nothing"
+         a click on the chrome, not a click on nothing"
     );
     assert!(
         h.map_excluded_rects().is_empty(),
         "precondition: a wide screen excludes no floating chrome, so the \
-             excluded-rect condition cannot be what blocks this"
+         excluded-rect condition cannot be what blocks this"
     );
     assert!(
         !h.is_floating_layer_at(off_pane),
-        "precondition: the status bar is a background layer, so the layer \
-             condition cannot be what blocks this either"
+        "precondition: the top bar is a background layer, so the layer \
+         condition cannot be what blocks this either"
     );
 
     h.mouse_click(on_map);
@@ -3991,7 +4433,7 @@ fn a_click_outside_the_pane_does_not_reach_a_site_icon_straddling_its_edge() {
     assert_eq!(
         site_switches(&h),
         vec![],
-        "a click in the status bar switched the radar site: the map is \
+        "a click in the top bar switched the radar site: the map is \
              hit-testing chrome"
     );
 }
@@ -4187,16 +4629,16 @@ fn a_scan_arriving_moves_no_widget_id() {
     h.gui_mut().set_fetching(true);
     h.warm_up();
     assert!(
-        h.status_bar().auto_poll.is_none(),
+        h.status_bar().poll_chip.is_none(),
         "precondition: a fetch must be in flight, so the status bar is \
-             showing the spinner rather than the auto-poll checkbox"
+         showing the spinner rather than the auto-poll chip"
     );
 
     h.clear_id_changes();
     h.load_scan("KTLX");
 
     assert!(
-        h.status_bar().auto_poll.is_some(),
+        h.status_bar().poll_chip.is_some(),
         "precondition: the scan must have cleared the fetch, or the widget \
              count in the status bar never changed and this proves nothing"
     );
@@ -4296,24 +4738,24 @@ fn an_error_on_screen_keeps_its_id_while_the_row_changes_around_it() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.gui_mut().set_error("boom".to_owned());
     // `set_error` ends the fetch, so put it back: the transition under test
-    // is the auto-poll spinner (three widgets) becoming the checkbox (one).
+    // is the auto-poll spinner (three widgets) becoming the chip (one).
     h.gui_mut().set_fetching(true);
     h.warm_up();
     assert!(
-        h.status_bar().auto_poll.is_none(),
+        h.status_bar().poll_chip.is_none(),
         "precondition: a fetch must be in flight, so the bar is showing the \
-             spinner rather than the checkbox"
+         spinner rather than the chip"
     );
     assert!(
         h.painted_text_strings().iter().any(|t| t == "boom"),
         "precondition: the error must be on screen, or the slot under test \
-             is not allocated at all"
+         is not allocated at all"
     );
 
     h.clear_id_changes();
     h.load_scan("KTLX");
     assert!(
-        h.status_bar().auto_poll.is_some(),
+        h.status_bar().poll_chip.is_some(),
         "precondition: the scan must have cleared the fetch, or nothing to \
              the left of the error changed"
     );
@@ -4842,7 +5284,7 @@ fn converting_the_active_pane_from_the_dropdown_makes_it_a_volume_pane() {
     assert_eq!(h.pane_kinds(), vec![PaneKind::Map]);
 }
 
-/// 44. **A non-map pane's layers panel keeps what applies to it and drops the
+/// 44. **A non-map pane keeps the controls that apply to it and drops the
 ///     rest.**
 ///
 ///     Four claims, each with its own failure:
@@ -4854,23 +5296,30 @@ fn converting_the_active_pane_from_the_dropdown_makes_it_a_volume_pane() {
 ///       have no product control at all, absent rather than disabled, for a
 ///       reason nothing on screen explains.
 ///     * **Time navigation**, because a section of last hour's volume is a
-///       perfectly good thing to ask for.
+///       perfectly good thing to ask for. Since the full-bleed flip it
+///       lives on the floating timeline, which stays up for every pane
+///       kind — asserted through the timeline's own probe.
 ///     * **No tilt picker.** Both non-map kinds read the whole ladder, which
 ///       is what `PaneKind::consumes_whole_volume` means, so every entry in
 ///       the combo would select the same picture.
-///     * **No loop transport and no overlay tree.** A loop frame *is* a
-///       rendered plan-view tilt and nothing now feeds one to a pane like
-///       this, so the control would enable a loop that never fills; every
-///       entry in the overlay tree is a layer drawn over map tiles against a
-///       projector this pane does not have.
+///     * **No loop, and no overlay tree.** A loop frame *is* a rendered
+///       plan-view tilt and nothing now feeds one to a pane like this. The
+///       layers panel expressed that by omitting the transport; the
+///       timeline expresses it by disabling its loop toggle — pinned here
+///       by clicking the toggle and requiring no loop action out of it,
+///       the failure a user would actually hit. The overlay tree is still
+///       the panel's: every entry in it is a layer drawn over map tiles
+///       against a projector this pane does not have.
 ///
-///     The last two are also what makes this the test that notices the branch
-///     reading `self.panes[active]` instead of the pane it was handed. That
-///     slot holds a `mem::take` placeholder for the whole of the panel's pass
-///     and therefore reads as a *map* — so a branch on it takes the map arm
-///     for a converted pane, and the only visible difference is the transport
-///     and the tree being drawn. The tilt picker would *not* reveal it: that
+///     The tree is also what makes this the test that notices the panel's
+///     kind branch reading `self.panes[active]` instead of the pane it was
+///     handed. That slot holds a `mem::take` placeholder for the whole of
+///     the panel's pass and therefore reads as a *map* — so a branch on it
+///     takes the map arm for a converted pane, and the visible difference
+///     is the tree being drawn. The tilt picker would *not* reveal it: that
 ///     is decided inside `render_radar_controls` from the pane passed down.
+///     (The timeline cannot have this bug: it runs outside every take
+///     window, which is why it may read the slot directly.)
 ///
 ///     The combos are read off the ids the panel actually resolved rather than
 ///     off the model, for the same reason `time_step_sel` is: a test rebuilding
@@ -4901,9 +5350,15 @@ fn a_non_map_pane_keeps_the_controls_that_apply_to_it_and_drops_the_rest() {
             "precondition: a map pane with a tilt on offer draws both, so the \
                  absence below is the pane's kind and not a missing scan"
         );
+        // The loop toggle answers for a map pane: clicking it emits the
+        // enable fan-out. (The harness has no App, so nothing consumes
+        // the action and the pane's own state is unchanged.)
+        h.mouse_click(h.timeline().loop_toggle.0.center());
         assert!(
-            painted(&h, "Radar Loop"),
-            "precondition: a map pane draws the loop transport"
+            h.last_actions()
+                .iter()
+                .any(|a| matches!(a, crate::actions::GuiAction::EnableLoop { .. })),
+            "precondition: a map pane's loop toggle must enable the loop"
         );
         // An entry from the middle of the overlay tree, so the check is not
         // satisfied by the first one alone. `dropdowns()` is deliberately not
@@ -4932,23 +5387,31 @@ fn a_non_map_pane_keeps_the_controls_that_apply_to_it_and_drops_the_rest() {
             combos(&h),
             vec!["product_sel"],
             "{kind:?}: either the product picker went with the map — leaving \
-                 this pane unable to be pointed at another moment — or a tilt \
-                 picker was drawn for a pane that reads every cut"
+             this pane unable to be pointed at another moment — or a tilt \
+             picker was drawn for a pane that reads every cut"
         );
+        let timeline = h.timeline();
         assert!(
-            painted(&h, "Step:"),
+            timeline.step_dropdown.is_positive() && timeline.back.is_positive(),
             "{kind:?}: time navigation went with the map, so this pane can \
-                 only ever show the live volume"
+             only ever show the live volume"
         );
+        h.mouse_click(h.timeline().loop_toggle.0.center());
         assert!(
-            !painted(&h, "Radar Loop"),
-            "{kind:?}: a loop transport was drawn for a pane nothing renders \
-                 loop frames for, so enabling it would wait for ever"
+            !h.last_actions().iter().any(|a| {
+                matches!(
+                    a,
+                    crate::actions::GuiAction::EnableLoop { .. }
+                        | crate::actions::GuiAction::DisableLoop { .. }
+                )
+            }),
+            "{kind:?}: the loop toggle armed a loop for a pane nothing \
+             renders loop frames for, so enabling it would wait for ever"
         );
         assert!(
             !painted(&h, "NWS Alerts"),
             "{kind:?}: the overlay tree was drawn for a pane with no map to \
-                 draw overlays on: {:?}",
+             draw overlays on: {:?}",
             h.painted_text_strings()
         );
     }
@@ -5039,17 +5502,14 @@ fn a_non_map_panes_product_picker_ignores_the_radar_layer_toggle() {
     );
 }
 
-/// The layers panel's screen rect: everything left of the map panel.
-///
-/// Derived from the map panel the frame actually laid out rather than from
-/// the panel-width constant, so it keeps meaning "the sidebar" if the
-/// width ever changes.
+/// The layers panel's screen rect — the floating area's own rect, from
+/// egui's area state rather than a reconstruction of the panel's position
+/// constants, so it keeps meaning "the sidebar" if the insets ever change.
+/// (Before the full-bleed flip this was "everything left of the map
+/// panel"; the map now runs edge to edge underneath the panel.)
 fn sidebar_rect(h: &InputHarness) -> egui::Rect {
-    let panel = h.map_panel_rect();
-    egui::Rect::from_min_max(
-        egui::pos2(0.0, 0.0),
-        egui::pos2(panel.left(), panel.bottom()),
-    )
+    h.layers_panel_rect()
+        .expect("the layers panel must be on screen")
 }
 
 /// 49. **Every pane kind's sidebar opens with the same identity line.**
@@ -5140,8 +5600,10 @@ fn the_missing_layer_list_is_explained_for_both_non_map_kinds() {
 ///     structure, in its order.**
 ///
 ///     The contract, top to bottom, for either non-map kind: identity
-///     line, product picker, time navigation, the kind's own block under
-///     its own header, then the explained absence of the layer list. The
+///     line, product picker, the kind's own block under its own header,
+///     then the explained absence of the layer list. (Time navigation
+///     left the panel for the floating timeline at the full-bleed flip,
+///     so it is no longer an anchor here.) The
 ///     assertion is on the *positions* the panel painted, not merely on
 ///     the strings existing: a kind block rendered above the shared
 ///     controls, or below the note, would paint every one of these strings
@@ -5203,7 +5665,6 @@ fn kind_specific_blocks_sit_inside_the_shared_sidebar_structure() {
         &[
             "KDMX \u{b7} 3D volume",
             "Reflectivity",
-            "Step:",
             crate::ui::VOLUME_SIDEBAR_HEADER,
             // "Lit volume" and "Isosurface" share this row; the label
             // anchors it (the order test wants one needle per row).
@@ -5249,7 +5710,6 @@ fn kind_specific_blocks_sit_inside_the_shared_sidebar_structure() {
         &[
             "KDMX \u{b7} Cross-section",
             "Reflectivity",
-            "Step:",
             crate::ui::SECTION_SIDEBAR_HEADER,
             "A \u{2013} B: 105 km",
             crate::ui::NON_MAP_LAYERS_NOTE,
@@ -5578,6 +6038,11 @@ fn a_rendered_sections_caption_is_calm_and_its_detail_is_one_click_away() {
     let (a, b) = section_ends();
     h.make_pane_cross_section(0, a, b);
     h.place_section(0, vcp_212_axes(), &vcp_212_rungs());
+
+    // The caption sits along the pane's top-left, which the floating
+    // layers panel now covers; close it — the user's own remedy — so the
+    // detail-toggle click reaches the caption rather than the chrome.
+    h.close_layers();
 
     let pane = h.pane_rects()[0];
     assert!(
@@ -5965,6 +6430,9 @@ fn harness_with_committed_section() -> (InputHarness, GeoPoint, GeoPoint) {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.set_pane_count(2);
     h.load_scan("KTLX");
+    // The A end of the line sits under the floating layers panel on
+    // Expanded, and a press there belongs to the panel.
+    h.close_layers();
     h.warm_up();
     h.warm_up();
     let pane = h.pane_rects()[0];

@@ -59,6 +59,12 @@ pub(crate) use map::VolumeArmProbe;
 pub(crate) use map::{CROSS_SECTION_EMPTY_STATE, VOLUME_EMPTY_STATE};
 #[path = "ui_settings.rs"]
 mod settings;
+#[path = "ui_statusbar.rs"]
+mod statusbar;
+#[path = "ui_timeline.rs"]
+mod timeline;
+#[cfg(test)]
+pub(crate) use timeline::TimelineProbe;
 #[path = "ui_topbar.rs"]
 mod topbar;
 
@@ -153,15 +159,21 @@ pub(crate) struct StatusBarProbe {
     pub scan_text: String,
     /// The Level III product age line, when one was drawn.
     pub product_age_text: Option<String>,
-    /// The auto-poll checkbox's rect, when one was drawn.
-    pub auto_poll: Option<egui::Rect>,
+    /// The auto-poll chip's rect and text, when one was drawn. The chip
+    /// replaced the checkbox with the full-bleed flip; the toggle itself
+    /// lives in the ☰ menu.
+    pub poll_chip: Option<(egui::Rect, String)>,
     /// The refresh button's rect — always drawn, so a test can click the real
     /// button rather than restating its position.
     pub refresh: egui::Rect,
+    /// The ◧ collapse button's rect — the restore button while collapsed.
+    pub collapse: egui::Rect,
+    /// Whether the bar was collapsed to its restore button this frame.
+    pub collapsed: bool,
     /// Whether the hover readout was drawn.
     pub hover: bool,
-    /// The rect the panel actually claimed, straight off its own response —
-    /// not the bottom slice of the screen worked out a second time.
+    /// The rect the floating bar actually claimed, straight off its own
+    /// response — not the bottom slice of the screen worked out a second time.
     pub rect: egui::Rect,
 }
 
@@ -171,8 +183,10 @@ impl Default for StatusBarProbe {
         Self {
             scan_text: String::new(),
             product_age_text: None,
-            auto_poll: None,
+            poll_chip: None,
             refresh: egui::Rect::NOTHING,
+            collapse: egui::Rect::NOTHING,
+            collapsed: false,
             hover: false,
             rect: egui::Rect::NOTHING,
         }
@@ -436,6 +450,10 @@ pub struct Gui {
     /// What the last frame's status bar actually drew. Only read by tests.
     #[cfg(test)]
     last_status_bar: StatusBarProbe,
+    /// What the last frame's timeline transport actually drew. Only read by
+    /// tests.
+    #[cfg(test)]
+    last_timeline: TimelineProbe,
     /// What the last frame's top bar actually drew. Only read by tests.
     #[cfg(test)]
     last_top_bar: TopBarProbe,
@@ -627,6 +645,22 @@ pub struct Gui {
     /// sidebar on a desktop must not also close the drawer the same window
     /// gets when it narrows past the breakpoint.
     stack_open: Option<bool>,
+    /// Whether the floating timeline transport is collapsed to its 🕐 chip.
+    /// Session-only, like `drawer_open`: how a session left its chrome is not
+    /// a preference.
+    timeline_collapsed: bool,
+    /// Whether the transport's second row — the loop tuning — is shown.
+    /// Session-only, on the same precedent.
+    timeline_row2: bool,
+    /// The archive scrubber's in-flight drag position, as a fraction of the
+    /// lookback window, or `None` when no drag is in flight. Remembered
+    /// across frames so the handle follows the pointer instead of snapping
+    /// back to the resting position every frame; the commit happens once, on
+    /// release — see `render_timeline_scrubber`.
+    timeline_scrub: Option<f32>,
+    /// Whether the floating status bar is collapsed to its ◧ restore button.
+    /// Session-only, on the same precedent as the timeline's collapse.
+    statusbar_collapsed: bool,
     /// Whether the top bar's ☰ dropdown was open on the last frame it drew.
     ///
     /// The dropdown's real state is egui popup memory, which this crate only
@@ -1157,6 +1191,8 @@ impl Gui {
             #[cfg(test)]
             last_status_bar: StatusBarProbe::default(),
             #[cfg(test)]
+            last_timeline: TimelineProbe::default(),
+            #[cfg(test)]
             last_top_bar: TopBarProbe::default(),
             #[cfg(test)]
             last_dropdowns: Vec::new(),
@@ -1184,6 +1220,10 @@ impl Gui {
             loop_speed_fps: 5.0,      // default 5 fps
             drawer_open: false,
             stack_open: None,
+            timeline_collapsed: false,
+            timeline_row2: false,
+            timeline_scrub: None,
+            statusbar_collapsed: false,
             menu_popup_open: false,
             menu_popup_close_requested: false,
             safe_area_insets: (0.0, 0.0, 0.0, 0.0),
@@ -1258,8 +1298,9 @@ impl Gui {
                 .max_rect(self.layout.content_rect),
         );
 
-        // Chrome first: panels claim space in call order, and what is left is
-        // the map's. See `ui_chrome.rs`.
+        // Chrome first: the docked top bar claims its space, the floating
+        // surfaces position themselves in what it left, and that remainder —
+        // `chrome.map_rect` — is the map's. See `ui_chrome.rs`.
         let chrome = self.render_chrome(&mut root_ui);
         actions.extend(chrome.actions);
 
@@ -1306,6 +1347,12 @@ impl Gui {
         // toggles rather than writing the flags, because the invariant belongs to
         // the arming rule rather than to this call order.
         self.apply_pending_region();
+
+        // The timeline transport, after the pane loop and the appliers: every
+        // `mem::take` window in the frame has closed, so it reads and writes
+        // `self.panes[self.active_pane]` directly — the real pane, not a
+        // placeholder. See `ui_timeline.rs`.
+        self.render_timeline(ctx, chrome.map_rect, &mut actions);
 
         // Floating windows last, so they layer above the chrome and the map.
         self.render_overlay_popup(ctx);
@@ -1851,15 +1898,14 @@ impl Gui {
             // cannot drift into three headers.
             render_pane_identity(ui, pane);
 
+            // Time navigation and the loop transport are not here: both moved
+            // to the floating timeline (`ui_timeline.rs`) with the full-bleed
+            // flip, where they apply to the active pane whatever its kind —
+            // the timeline expresses "no loop for a non-map pane" by disabling
+            // its toggle, where this panel expressed it by omission.
             match pane.kind() {
                 crate::pane::PaneKind::Map => {
                     self.render_radar_controls(ui, pane, combo_width, id_prefix);
-
-                    // --- Time navigation (forward/back/live) ---
-                    self.render_time_navigation(ui, pane, id_prefix, actions);
-
-                    // --- Radar loop controls ---
-                    self.render_loop_controls(ui, pane, actions);
 
                     ui.add_space(6.0);
                     ui.separator();
@@ -1867,32 +1913,27 @@ impl Gui {
                     // --- Handler-backed overlay controls (generic) ---
                     self.render_overlay_controls(ui, pane, actions);
                 }
-                // A section and a volume pane get the product picker and time
-                // navigation, then their own block in the same header-and-indent
-                // shape the map pane's blocks use, then the one line that says
-                // where the layer list went.
+                // A section and a volume pane get the product picker, then
+                // their own block in the same header-and-indent shape the map
+                // pane's blocks use, then the one line that says where the
+                // layer list went.
                 //
                 // No tilt picker: both read the whole ladder, so there is nothing
-                // to choose — see `render_radar_controls`. No loop transport: a
-                // loop frame *is* a rendered plan-view tilt, and both
-                // `loop_sync_targets` and `App::dispatch_loop_renders` now decline
-                // to feed a pane like this, so the control would enable a loop
-                // that never fills. No overlay tree: every entry in it is a layer
-                // drawn over map tiles, geo-positioned against a projector this
-                // pane does not have — the convention for controls like these is
-                // **omission plus [`NON_MAP_LAYERS_NOTE`]**, not a disabled
-                // ghost, applied identically to both non-map kinds.
+                // to choose — see `render_radar_controls`. No overlay tree: every
+                // entry in it is a layer drawn over map tiles, geo-positioned
+                // against a projector this pane does not have — the convention
+                // for controls like these is **omission plus
+                // [`NON_MAP_LAYERS_NOTE`]**, not a disabled ghost, applied
+                // identically to both non-map kinds.
                 crate::pane::PaneKind::CrossSection => {
                     self.render_radar_controls(ui, pane, combo_width, id_prefix);
-                    self.render_time_navigation(ui, pane, id_prefix, actions);
                     self.render_section_controls(ui, pane);
                     render_non_map_layers_note(ui);
                 }
-                // The same two, plus the knobs that only mean something for a
-                // box being looked at from outside.
+                // The same, plus the knobs that only mean something for a box
+                // being looked at from outside.
                 crate::pane::PaneKind::Volume => {
                     self.render_radar_controls(ui, pane, combo_width, id_prefix);
-                    self.render_time_navigation(ui, pane, id_prefix, actions);
                     map::render_volume_controls(ui, pane, &mut self.volume_iso, &self.volume_alpha);
                     render_non_map_layers_note(ui);
                 }
@@ -2089,288 +2130,6 @@ impl Gui {
         }
     }
 
-    /// Available time step options: (seconds, label). 0 = "one scan".
-    const TIME_STEP_OPTIONS: &[(i64, &str)] = &[
-        (0, "1 scan"),
-        (600, "10 min"),
-        (1800, "30 min"),
-        (3600, "1 hr"),
-        (7200, "2 hr"),
-        (21600, "6 hr"),
-        (43200, "12 hr"),
-    ];
-
-    /// Render forward / live / back navigation buttons with a time step dropdown.
-    fn render_time_navigation(
-        &mut self,
-        ui: &mut egui::Ui,
-        pane: &mut PaneState,
-        id_prefix: &str,
-        actions: &mut Vec<GuiAction>,
-    ) {
-        #[cfg(test)]
-        let probes = &mut self.widget_id_probes;
-        ui.add_space(4.0);
-
-        // Time step dropdown
-        let step_label = Self::TIME_STEP_OPTIONS
-            .iter()
-            .find(|(s, _)| *s == pane.time_step_secs)
-            .map(|(_, l)| *l)
-            .unwrap_or("10 min");
-
-        ui.horizontal(|ui| {
-            ui.label("Step:");
-            // Prefixed like the rest. It used to be bare, which was only safe
-            // because the desktop and mobile panels could never both exist.
-            let combo = egui::ComboBox::from_id_salt(format!("{id_prefix}time_step_sel"))
-                .selected_text(step_label)
-                .show_ui(ui, |ui| {
-                    for &(secs, label) in Self::TIME_STEP_OPTIONS {
-                        ui.selectable_value(&mut pane.time_step_secs, secs, label);
-                    }
-                });
-            // Report the id the combo box really resolved, rather than building
-            // a second one from the same format string: the two could disagree
-            // silently, and a test comparing reconstructions either side of a
-            // resize would then prove nothing about the state egui actually
-            // keyed on. `layers_scroll` does the same.
-            #[cfg(test)]
-            probes.push(("time_step_sel", combo.response.id));
-            #[cfg(not(test))]
-            let _ = combo;
-        });
-
-        // Navigation buttons
-        let active_pane_idx = self.active_pane;
-        ui.horizontal(|ui| {
-            // Back button
-            if ui.button("\u{25c0} Back").clicked() {
-                pane.viewing_live = false;
-                if pane.time_step_secs == 0 {
-                    actions.push(GuiAction::NavigateOneScan {
-                        pane_idx: active_pane_idx,
-                        forward: false,
-                    });
-                } else {
-                    actions.push(GuiAction::NavigateTime {
-                        pane_idx: active_pane_idx,
-                        step_secs: -pane.time_step_secs,
-                    });
-                }
-            }
-
-            // Live button — highlighted when NOT live to indicate "click to return"
-            let live_button = if pane.viewing_live {
-                egui::Button::new("\u{23fa} Live")
-            } else {
-                egui::Button::new(egui::RichText::new("\u{23fa} Live").color(egui::Color32::WHITE))
-                    .fill(egui::Color32::from_rgb(200, 50, 50))
-            };
-            if ui.add(live_button).clicked() && !pane.viewing_live {
-                actions.push(GuiAction::JumpToLive {
-                    pane_idx: active_pane_idx,
-                });
-            }
-
-            // Forward button — disabled when live
-            if ui
-                .add_enabled(!pane.viewing_live, egui::Button::new("Forward \u{25b6}"))
-                .clicked()
-            {
-                if pane.time_step_secs == 0 {
-                    actions.push(GuiAction::NavigateOneScan {
-                        pane_idx: active_pane_idx,
-                        forward: true,
-                    });
-                } else {
-                    actions.push(GuiAction::NavigateTime {
-                        pane_idx: active_pane_idx,
-                        step_secs: pane.time_step_secs,
-                    });
-                }
-            }
-        });
-    }
-
-    /// Render radar loop controls: enable/disable, lookback slider, speed slider,
-    /// transport buttons (play/pause, step, seek), and frame progress.
-    fn render_loop_controls(
-        &mut self,
-        ui: &mut egui::Ui,
-        pane: &mut PaneState,
-        actions: &mut Vec<GuiAction>,
-    ) {
-        ui.add_space(4.0);
-        let loop_active = pane.loop_state.is_active();
-
-        // Enable/disable toggle
-        let mut enabled = loop_active;
-        if ui.checkbox(&mut enabled, "\u{1f501}  Radar Loop").changed() {
-            if enabled {
-                for pane_idx in self.loop_sync_targets() {
-                    actions.push(GuiAction::EnableLoop {
-                        pane_idx,
-                        lookback_secs: self.loop_lookback_secs,
-                    });
-                }
-            } else {
-                for pane_idx in self.loop_sync_targets() {
-                    actions.push(GuiAction::DisableLoop { pane_idx });
-                }
-            }
-        }
-
-        if loop_active {
-            ui.indent("loop_controls", |ui| {
-                // Lookback duration slider
-                let mut lookback_mins = (self.loop_lookback_secs as f32 / 60.0).round();
-                ui.horizontal(|ui| {
-                    ui.label("Lookback:");
-                    if ui
-                        .add(
-                            egui::Slider::new(&mut lookback_mins, 5.0..=1440.0)
-                                .logarithmic(true)
-                                .suffix(" min")
-                                .clamping(egui::SliderClamping::Always),
-                        )
-                        .drag_stopped()
-                    {
-                        let new_secs = (lookback_mins * 60.0) as u64;
-                        if new_secs != self.loop_lookback_secs {
-                            self.loop_lookback_secs = new_secs;
-                            for pane_idx in self.loop_sync_targets() {
-                                actions.push(GuiAction::EnableLoop {
-                                    pane_idx,
-                                    lookback_secs: new_secs,
-                                });
-                            }
-                        }
-                    }
-                });
-
-                // Speed slider
-                ui.horizontal(|ui| {
-                    ui.label("Speed:");
-                    ui.add(
-                        egui::Slider::new(&mut self.loop_speed_fps, 1.0..=30.0)
-                            .suffix(" fps")
-                            .clamping(egui::SliderClamping::Always),
-                    );
-                });
-
-                {
-                    let ls = &pane.loop_state;
-                    // Frame status
-                    let rendered = ls.frames.iter().filter(|f| f.texture.is_some()).count();
-                    let total = ls.frames.len();
-                    let rendering = total > 0 && !ls.is_render_ready();
-                    if ls.is_fetching() {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label("Loading scan list...");
-                        });
-                    } else if total == 0 {
-                        ui.label("No frames found");
-                    } else {
-                        // Progress bar when rendering, plain text when done
-                        if rendering {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label(format!("Rendering {}/{}...", rendered, total));
-                            });
-                            ui.add(
-                                egui::ProgressBar::new(rendered as f32 / total as f32)
-                                    .show_percentage(),
-                            );
-                        } else {
-                            ui.label(format!("{}/{} frames rendered", rendered, total));
-                        }
-
-                        // Transport controls
-                        ui.horizontal(|ui| {
-                            // Step backward
-                            if ui
-                                .button("\u{23ee}")
-                                .on_hover_text("Previous frame")
-                                .clicked()
-                            {
-                                for pane_idx in self.loop_sync_targets() {
-                                    actions.push(GuiAction::StepLoopFrame {
-                                        pane_idx,
-                                        forward: false,
-                                    });
-                                }
-                            }
-
-                            // Play/pause
-                            let play_label = if ls.is_playing() {
-                                "\u{23f8}"
-                            } else {
-                                "\u{25b6}"
-                            };
-                            let play_hover = if ls.is_playing() {
-                                "Pause".to_string()
-                            } else if rendering {
-                                format!("Waiting for renders ({}/{})", rendered, total)
-                            } else {
-                                "Play".to_string()
-                            };
-                            let play_btn = egui::Button::new(play_label);
-                            let resp = ui
-                                .add_enabled(!rendering || ls.is_playing(), play_btn)
-                                .on_hover_text(play_hover);
-                            if resp.clicked() {
-                                for pane_idx in self.loop_sync_targets() {
-                                    actions.push(GuiAction::ToggleLoopPlayback { pane_idx });
-                                }
-                            }
-
-                            // Step forward
-                            if ui.button("\u{23ed}").on_hover_text("Next frame").clicked() {
-                                for pane_idx in self.loop_sync_targets() {
-                                    actions.push(GuiAction::StepLoopFrame {
-                                        pane_idx,
-                                        forward: true,
-                                    });
-                                }
-                            }
-                        });
-
-                        // Frame seek slider
-                        let mut frame_idx = ls.current_frame;
-                        if ui
-                            .add(
-                                egui::Slider::new(&mut frame_idx, 0..=(total - 1))
-                                    .show_value(false),
-                            )
-                            .changed()
-                        {
-                            for pane_idx in self.loop_sync_targets() {
-                                actions.push(GuiAction::SeekLoopFrame {
-                                    pane_idx,
-                                    frame_index: frame_idx,
-                                });
-                            }
-                        }
-
-                        // Current frame timestamp
-                        if let Some(frame) = ls.frames.get(ls.current_frame) {
-                            ui.label(
-                                egui::RichText::new(
-                                    self.preferences
-                                        .timezone
-                                        .format_naive_utc(frame.timestamp, "%H:%M:%S"),
-                                )
-                                .small(),
-                            );
-                        }
-                    }
-                }
-            });
-        }
-    }
-
     /// Render controls for all handler-backed overlays generically.
     ///
     /// Loads the active pane's overlay config snapshot into the handlers,
@@ -2447,14 +2206,15 @@ impl Gui {
     /// download queue serving nobody.
     ///
     /// The active pane is a target unconditionally and is deliberately **never
-    /// tested**. This runs from inside `render_loop_controls`, which the layers
-    /// panel calls while the active pane is held out by `mem::take` — so
-    /// `self.panes[self.active_pane]` is a default `PaneState`, a *map* pane
-    /// whatever the real one is. Reading `is_map()` off that slot would be
-    /// reading the placeholder, and it would agree with reality only by
-    /// coincidence (the loop control is drawn for map panes only). Including the
-    /// index without asking is correct either way: it is the pane whose own
-    /// checkbox was clicked.
+    /// tested**. The caller is now the floating timeline, which runs after
+    /// every `mem::take` window has closed, so the slot could safely be asked —
+    /// but the unconditional include stays correct and stays put: it is the
+    /// pane whose own toggle was clicked, and the timeline disables that
+    /// toggle for a non-map active pane, which is the same guarantee the old
+    /// layers-panel host expressed by omitting the control. (When this ran
+    /// from inside the panel's take window, asking the slot would have read a
+    /// default `PaneState` — a *map* pane whatever the real one was — which is
+    /// why the rule was born this way round.)
     fn loop_sync_targets(&self) -> Vec<usize> {
         if self.sync_layers && self.pane_layout.pane_count > 1 {
             (0..self.pane_layout.pane_count)
@@ -3295,6 +3055,12 @@ impl Gui {
     #[cfg(test)]
     pub(crate) fn status_bar_for_test(&self) -> &StatusBarProbe {
         &self.last_status_bar
+    }
+
+    /// What the last frame's timeline transport drew.
+    #[cfg(test)]
+    pub(crate) fn timeline_for_test(&self) -> &TimelineProbe {
+        &self.last_timeline
     }
 
     /// What the last frame's top bar drew.

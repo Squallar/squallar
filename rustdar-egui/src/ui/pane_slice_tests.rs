@@ -869,10 +869,10 @@ fn a_non_map_active_pane_is_not_the_fallback_sync_source() {
 /// download queue fetching volumes for a pane nobody is looking at.
 ///
 /// The active pane is included without being asked, which the second half
-/// below pins. This runs from `render_loop_controls`, inside the layers
-/// panel's `mem::take` window, where `self.panes[self.active_pane]` is a
-/// default `PaneState` and therefore reads as a *map* whatever the real pane
-/// is — so testing it would be testing the placeholder.
+/// below pins. The caller is now the floating timeline, outside every
+/// `mem::take` window, but the unconditional include stands: it is the
+/// pane whose own toggle was clicked, and the timeline disables that
+/// toggle for a non-map active pane — see `loop_sync_targets`' own note.
 #[test]
 fn loop_actions_skip_panes_that_draw_no_frames() {
     use crate::pane::PaneKind;
