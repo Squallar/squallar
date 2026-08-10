@@ -399,15 +399,6 @@ struct StoreInner {
     /// and it means `VolumeTarget`'s derived `PartialEq` is the only comparison
     /// needed, rather than a hand-written `Hash` that has to agree with it.
     entries: Vec<StoredVolume>,
-    /// The map floors, at most one per `(site, region)` — the floor is a
-    /// property of the ground under the box, so two panes showing two moments
-    /// of one volume stand on one floor. Pruned against the entries' scopes
-    /// on **every** path that can empty a scope — a floor landing, a pane
-    /// letting go, and a pane shedding what it re-aimed away from — so a
-    /// floor cannot outlive every pane that could stand on it. Ids come from
-    /// the same counter as the grids', so the GPU side's per-id caches
-    /// cannot collide.
-    floors: Vec<StoredFloor>,
 }
 
 struct StoredVolume {
@@ -417,13 +408,6 @@ struct StoredVolume {
     /// Which panes are holding this. Empty is impossible: the entry is dropped
     /// when the last pane lets go.
     panes: Vec<usize>,
-}
-
-struct StoredFloor {
-    id: u64,
-    site: String,
-    region: Option<rustdar_egui::pane::VolumeRegion>,
-    image: Arc<crate::volume::floor::FloorImage>,
 }
 
 /// What the store holds for one target, with the id its GPU upload is keyed by.
@@ -538,14 +522,13 @@ impl VolumeStore {
         });
     }
 
-    /// This pane is holding nothing. Drops whatever it was holding if it was the
-    /// last one, and any floor nothing stands on afterwards — the prune rides
-    /// inside `detach`, beside every other path that can empty a scope.
+    /// This pane is holding nothing. Drops whatever it was holding if it was
+    /// the last one.
     pub fn release(&self, pane_idx: usize) {
         self.lock().detach(pane_idx);
     }
 
-    /// Drop every entry (and orphaned floor) whose target names `product`.
+    /// Drop every entry whose target names `product`.
     ///
     /// For a render parameter that is not part of the target: the storm
     /// motion vector changes what an SRV grid *contains* without changing the
@@ -558,7 +541,6 @@ impl VolumeStore {
     pub fn evict_product(&self, product: rustdar_radar::types::RadarProduct) {
         let mut inner = self.lock();
         inner.entries.retain(|e| e.target.product != product);
-        inner.prune_floors();
     }
 
     /// What is in hand for `target`, if anything.
@@ -636,93 +618,6 @@ impl VolumeStore {
         self.lock().entries.iter().map(|e| e.id).collect()
     }
 
-    /// Put the floor for `(site, region)` in hand, replacing any older one.
-    ///
-    /// Dropped on the spot when no held entry has that scope — a floor that
-    /// arrived after every pane moved on answers a question nobody is asking,
-    /// and keeping it would be an unbounded cache keyed by history.
-    pub fn set_floor(
-        &self,
-        site: &str,
-        region: Option<rustdar_egui::pane::VolumeRegion>,
-        image: Arc<crate::volume::floor::FloorImage>,
-    ) {
-        let mut inner = self.lock();
-        let scoped = inner
-            .entries
-            .iter()
-            .any(|e| e.target.volume.site == site && e.target.region == region);
-        inner
-            .floors
-            .retain(|f| !(f.site == site && f.region == region));
-        if !scoped {
-            return;
-        }
-        let id = inner.next_id;
-        inner.next_id += 1;
-        inner.floors.push(StoredFloor {
-            id,
-            site: site.to_owned(),
-            region,
-            image,
-        });
-        inner.prune_floors();
-    }
-
-    /// The floor under `target`'s box, if one is in hand.
-    pub fn floor_for(
-        &self,
-        target: &VolumeTarget,
-    ) -> Option<(u64, Arc<crate::volume::floor::FloorImage>)> {
-        let inner = self.lock();
-        inner
-            .floors
-            .iter()
-            .find(|f| f.site == target.volume.site && f.region == target.region)
-            .map(|f| (f.id, Arc::clone(&f.image)))
-    }
-
-    /// Every floor id still in hand, for the GPU side's upload cache.
-    pub fn live_floor_ids(&self) -> Vec<u64> {
-        self.lock().floors.iter().map(|f| f.id).collect()
-    }
-
-    /// The newest `Ready` grid held under `(site, region)`, with its target —
-    /// what the App's floor retry re-registers a floor against when a
-    /// dispatch was refused or produced nothing. Newest by id for the same
-    /// reason `lookup_for_pane` is: a scope can transiently hold two resolved
-    /// grids mid-swap, and the later build is the ground's current footprint.
-    pub fn ready_for_scope(
-        &self,
-        site: &str,
-        region: &Option<rustdar_egui::pane::VolumeRegion>,
-    ) -> Option<(VolumeTarget, Arc<VoxelGrid>)> {
-        let inner = self.lock();
-        inner
-            .entries
-            .iter()
-            .filter(|e| e.target.volume.site == site && e.target.region == *region)
-            .filter_map(|e| match &e.entry {
-                VolumeEntry::Ready(grid) => Some((e.id, e.target.clone(), Arc::clone(grid))),
-                _ => None,
-            })
-            .max_by_key(|(id, ..)| *id)
-            .map(|(_, target, grid)| (target, grid))
-    }
-
-    /// Whether any held entry — built, building or refused — has this
-    /// `(site, region)` scope. The App's floor dedupe prunes against it.
-    pub fn holds_scope(
-        &self,
-        site: &str,
-        region: &Option<rustdar_egui::pane::VolumeRegion>,
-    ) -> bool {
-        self.lock()
-            .entries
-            .iter()
-            .any(|e| e.target.volume.site == site && e.target.region == *region)
-    }
-
     /// Host bytes the store is holding, and how many volumes that is.
     ///
     /// Reported rather than bounded, and logged on every build — because the
@@ -765,28 +660,12 @@ impl Default for VolumeStore {
 
 impl StoreInner {
     /// Detach `pane_idx` from whatever it holds, dropping entries nobody
-    /// holds — and the floors those entries were the last scope-holder of.
+    /// holds.
     fn detach(&mut self, pane_idx: usize) {
         for entry in &mut self.entries {
             entry.panes.retain(|&p| p != pane_idx);
         }
         self.entries.retain(|e| !e.panes.is_empty());
-        self.prune_floors();
-    }
-
-    /// Drop every floor whose `(site, region)` matches no held entry.
-    ///
-    /// The floors' whole lifetime rule: a floor exists exactly while some
-    /// entry — built, building or refused — shares its scope, which bounds
-    /// the memory at one ~1 MiB image per live scope with no cap constant to
-    /// tune.
-    fn prune_floors(&mut self) {
-        let entries = &self.entries;
-        self.floors.retain(|f| {
-            entries
-                .iter()
-                .any(|e| e.target.volume.site == f.site && e.target.region == f.region)
-        });
     }
 
     /// Detach `pane_idx` from everything it can no longer show, given that it
@@ -811,13 +690,6 @@ impl StoreInner {
             }
         }
         self.entries.retain(|e| !e.panes.is_empty());
-        // A shed can drop the last entry of a scope — a pane re-aimed at
-        // another site or region through `share`/`begin_build` — and the
-        // floor under that scope has to go with it, exactly as it does on
-        // `release`. Before this call, only `release` and `set_floor` pruned,
-        // so a re-aimed pane stranded its old ~1 MiB floor until the pane
-        // released or a new floor landed.
-        self.prune_floors();
     }
 }
 
@@ -1046,14 +918,32 @@ impl VolumePainter for BridgeVolumePainter {
             uniform.reconstruction_lod = 0.0;
         }
 
-        // The floor: drawn only when the pane wants it AND one is in hand.
-        // The flag and the texture travel together on purpose — a raised flag
-        // over the placeholder would composite a transparent ground, which
-        // draws nothing but claims to.
-        let floor = frame
-            .floor
-            .then(|| self.store.floor_for(&frame.target))
-            .flatten();
+        // The floor: drawn only when the pane wants it AND the map it was
+        // dragged on has told us where it is. The flag and the registration
+        // travel together on purpose — a raised flag with no affine behind it
+        // would sample the mirror through zeroed lanes, which paints the one
+        // texel at the mirror's corner across the whole ground.
+        //
+        // The *rest* of the floor's uniform cannot be filled in here: it
+        // depends on the frame's pixel size, which only `prepare` is told. So
+        // this carries the geography and `prepare` finishes the arithmetic —
+        // see `FloorSource`.
+        let floor = frame.floor.then_some(frame.source).flatten().map(|geo| {
+            let (site_lat, site_lon) = grid.site();
+            let site_points = geo.project(site_lat, site_lon);
+            FloorSource {
+                site_points: [site_points.x, site_points.y],
+                points_per_degree_lon: geo.points_per_degree_lon as f32,
+                points_per_mercator_y: geo.points_per_mercator_y as f32,
+                site_lat: site_lat as f32,
+                // The box's west and south edges as kilometres east and north
+                // of the site — its *position*, which `box_size_km` does not
+                // carry. The shader measures its reprojection from the site,
+                // so these are what turn a unit-cube coordinate into ground.
+                west_km: grid.x_range_km().0 as f32,
+                south_km: grid.y_range_km().0 as f32,
+            }
+        });
         uniform.map_floor = floor.is_some();
 
         let callback = VolumeCallback {
@@ -1067,7 +957,6 @@ impl VolumePainter for BridgeVolumePainter {
             uniform,
             offscreen_px: fitted.size,
             live_ids: self.store.live_ids(),
-            live_floor_ids: self.store.live_floor_ids(),
         };
 
         VolumePaint::Callback(paint_payload(callback))
@@ -1104,6 +993,47 @@ impl VolumePainter for BridgeVolumePainter {
 /// simplified this to `Arc::new(callback)`.
 fn paint_payload(callback: impl egui_wgpu::CallbackTrait + 'static) -> Arc<dyn Any + Send + Sync> {
     egui_wgpu::Callback::new_paint_callback(egui::Rect::ZERO, callback).callback
+}
+
+/// The floor's two uniform `vec4`s: the geography `paint` resolved, normalised
+/// against the frame this `prepare` was handed.
+///
+/// The mirror covers the whole frame, so a position in points becomes a texture
+/// coordinate by `point · pixels_per_point ÷ frame_pixels` — and the mirror's
+/// *own* size does not appear, because the reduced-resolution path halves
+/// `size_in_pixels` and `pixels_per_point` together and the quotient is
+/// unchanged.
+///
+/// `gamma_encoded` is not cosmetic and cannot be decided here: `egui_wgpu` chose
+/// its fragment entry point from the **swapchain's** format once, at
+/// `Renderer::new`, and that same pipeline is what drew the mirror. Guessing
+/// wrong gives a floor merely a little too dark or too light, with no validation
+/// error and nothing to catch it but a test that looks.
+///
+/// A free function so it can be pinned without a `wgpu::Device` — this is where
+/// a swapped axis or a lost sign would live.
+fn floor_lanes(
+    source: &FloorSource,
+    size_in_pixels: [u32; 2],
+    pixels_per_point: f32,
+    gamma_encoded: bool,
+) -> ([f32; 4], [f32; 4]) {
+    let per_point_u = pixels_per_point / size_in_pixels[0].max(1) as f32;
+    let per_point_v = pixels_per_point / size_in_pixels[1].max(1) as f32;
+    (
+        [
+            source.site_points[0] * per_point_u,
+            source.site_points[1] * per_point_v,
+            source.points_per_degree_lon * per_point_u,
+            source.points_per_mercator_y * per_point_v,
+        ],
+        [
+            source.site_lat,
+            source.west_km,
+            source.south_km,
+            if gamma_encoded { 1.0 } else { 0.0 },
+        ],
+    )
 }
 
 /// The box's physical extent in kilometres, along each axis.
@@ -1169,9 +1099,16 @@ pub struct VolumeResources {
     /// One upload per grid, keyed by the store's id. Two panes on one volume
     /// share the entry, which is the GPU half of the store's refcounting.
     uploads: HashMap<u64, VolumeUpload>,
-    /// One upload per floor, keyed by the store's floor id and retained the
-    /// same way — uploaded once when the floor lands, reused every frame.
-    floors: HashMap<u64, crate::volume::raymarch::FloorTexture>,
+    /// The pane mirror: one frame-sized copy of the 2D panes' own render,
+    /// shared by every 3D pane.
+    ///
+    /// One, not one per pane, and not one per floor: it covers the whole frame
+    /// rather than any box's footprint, so two 3D panes sourced from two
+    /// different maps each find their ground in it by sampling a different
+    /// region. `None` until the first frame that has something to mirror —
+    /// which is also the state a machine with no 3D pane stays in for ever,
+    /// paying nothing.
+    mirror: Option<crate::volume::raymarch::PaneMirror>,
 }
 
 /// One grid's GPU upload, and which Volume Alpha curve its colour table was
@@ -1203,7 +1140,7 @@ impl VolumeResources {
             pipelines,
             targets: HashMap::new(),
             uploads: HashMap::new(),
-            floors: HashMap::new(),
+            mirror: None,
         }
     }
 
@@ -1220,6 +1157,55 @@ impl VolumeResources {
         self.targets.remove(&pane_idx);
         self.uploads.retain(|id, _| live_ids.contains(id));
     }
+
+    /// The mirror this frame's pass should draw into, sized to the frame and
+    /// created or resized if it has to be.
+    ///
+    /// Hands back a **clone** of the view rather than a borrow, and that is
+    /// structural rather than lazy: the mirror pass runs inside
+    /// `EguiRenderer::end_pass_and_upload`, which needs `&mut` on the very
+    /// renderer this lives inside. `wgpu::TextureView` is a refcounted handle,
+    /// so the clone is a bump.
+    ///
+    /// `format` must have the same sRGB-ness as the swapchain — see
+    /// [`VolumePipelines::ensure_mirror`] for what goes wrong when it does
+    /// not, and note that nothing validates it.
+    pub fn ensure_mirror(
+        &mut self,
+        device: &wgpu::Device,
+        size: [u32; 2],
+        format: wgpu::TextureFormat,
+    ) -> wgpu::TextureView {
+        self.pipelines
+            .ensure_mirror(device, &mut self.mirror, size, format);
+        // Cannot be `None`: `ensure_mirror` either kept a mirror or made one.
+        // Answered rather than unwrapped because a panic here would be on the
+        // frame path, where on wasm it aborts the whole application.
+        self.mirror
+            .as_ref()
+            .map(|mirror| mirror.view().clone())
+            .unwrap_or_else(|| {
+                // Unreachable; a fresh 1×1 view is a cheaper failure than a
+                // dead application, and the pass that draws into it is
+                // harmless.
+                device
+                    .create_texture(&wgpu::TextureDescriptor {
+                        label: Some("volume.mirror.fallback"),
+                        size: wgpu::Extent3d {
+                            width: 1,
+                            height: 1,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format,
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                        view_formats: &[],
+                    })
+                    .create_view(&wgpu::TextureViewDescriptor::default())
+            })
+    }
 }
 
 /// One 3D pane's draw, for one frame.
@@ -1231,9 +1217,10 @@ struct VolumeCallback {
     pane_idx: usize,
     grid_id: u64,
     grid: Arc<VoxelGrid>,
-    /// The floor under this box, when the pane wants one and one is in hand.
-    /// `uniform.map_floor` is true exactly when this is `Some`.
-    floor: Option<(u64, Arc<crate::volume::floor::FloorImage>)>,
+    /// Where this box's ground is inside the pane mirror, when the pane wants
+    /// a floor and its source map has said where it is. `uniform.map_floor` is
+    /// true exactly when this is `Some`.
+    floor: Option<FloorSource>,
     /// The Volume Alpha curve the LUT must be uploaded through, or `None` for
     /// the grid's own table, bit-exactly. `prepare` compares this against
     /// what the upload cache holds and rewrites the 1 KiB table only on
@@ -1246,8 +1233,37 @@ struct VolumeCallback {
     /// store because `prepare` runs with no access to anything but its
     /// arguments.
     live_ids: Vec<u64>,
-    /// The same, for the floor uploads.
-    live_floor_ids: Vec<u64>,
+}
+
+/// Everything the floor's uniform lanes need that does not depend on the
+/// frame's pixel size.
+///
+/// The split is not arbitrary. The mirror covers the whole frame, so a point
+/// on the frame becomes a texture coordinate by `point · pixels_per_point ÷
+/// frame_pixels` — and `paint` is told neither of those two numbers, while
+/// `prepare` is handed both on its `ScreenDescriptor`. So the geography is
+/// resolved where the map is known and the normalisation where the frame is,
+/// and neither half guesses the other's numbers.
+///
+/// Note what cancels: the mirror's *own* size does not appear. A mirror
+/// rendered at half resolution is half as many pixels over the same frame, so
+/// the quotient is unchanged — which is exactly why the reduced-resolution
+/// path halves `size_in_pixels` and `pixels_per_point` together.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FloorSource {
+    /// Where the radar site lands on the frame, in points.
+    site_points: [f32; 2],
+    /// Points of frame x per degree of longitude east.
+    points_per_degree_lon: f32,
+    /// Points of frame y per unit of Mercator y. Negative.
+    points_per_mercator_y: f32,
+    /// The site's latitude, degrees north — the origin the shader's
+    /// reprojection measures from.
+    site_lat: f32,
+    /// The box's west edge, km east of the site.
+    west_km: f32,
+    /// The box's south edge, km north of the site.
+    south_km: f32,
 }
 
 impl egui_wgpu::CallbackTrait for VolumeCallback {
@@ -1255,7 +1271,7 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        _screen_descriptor: &egui_wgpu::ScreenDescriptor,
+        screen_descriptor: &egui_wgpu::ScreenDescriptor,
         egui_encoder: &mut wgpu::CommandEncoder,
         callback_resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
@@ -1272,11 +1288,10 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
             pipelines,
             targets,
             uploads,
-            floors,
+            mirror,
         } = resources;
 
         uploads.retain(|id, _| self.live_ids.contains(id));
-        floors.retain(|id, _| self.live_floor_ids.contains(id));
 
         let slot = targets.entry(self.pane_idx).or_default();
         pipelines.ensure_offscreen(device, slot, self.offscreen_px);
@@ -1329,25 +1344,34 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
         };
         let textures = &upload.textures;
 
-        // The floor's upload, once per floor id — the same entry discipline
-        // as the grid's, minus the refusal arm: `upload_floor` validates the
-        // byte count itself and an invalid floor simply stays unbound, with
-        // `map_floor` still set. That mismatch cannot happen from the one
-        // producer (`resample_floor` sizes its own buffer), and the symptom
-        // if it ever did would be a transparent floor, not a crash.
-        let floor_texture =
-            self.floor
-                .as_ref()
-                .and_then(|(floor_id, image)| match floors.entry(*floor_id) {
-                    std::collections::hash_map::Entry::Occupied(occupied) => {
-                        Some(&*occupied.into_mut())
-                    }
-                    std::collections::hash_map::Entry::Vacant(vacant) => pipelines
-                        .upload_floor(device, queue, image.size, &image.rgba)
-                        .map(|texture| &*vacant.insert(texture)),
-                });
+        // The floor. Nothing is uploaded here — the mirror is a render target
+        // the frame path drew into before this ran, so all that is left is to
+        // finish the uniform's two floor lanes against the frame this
+        // `prepare` was actually given.
+        //
+        // Both halves must be present or neither is used: a raised `map_floor`
+        // over the placeholder mirror composites a transparent ground, which
+        // draws nothing while claiming to.
+        let mut uniform = self.uniform;
+        let floor_texture = match (self.floor.as_ref(), mirror.as_ref()) {
+            (Some(source), Some(mirror)) => {
+                let (uv, geo) = floor_lanes(
+                    source,
+                    screen_descriptor.size_in_pixels,
+                    screen_descriptor.pixels_per_point,
+                    mirror.is_gamma_encoded(),
+                );
+                uniform.floor_uv = uv;
+                uniform.floor_geo = geo;
+                Some(mirror)
+            }
+            _ => {
+                uniform.map_floor = false;
+                None
+            }
+        };
 
-        textures.write_uniform(queue, &self.uniform);
+        textures.write_uniform(queue, &uniform);
         // Into egui's own encoder, which egui submits before its own commands —
         // so the offscreen is written before the blit reads it. The other order
         // paints the previous frame's volume, which reads as input lag.

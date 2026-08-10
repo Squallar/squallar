@@ -41,11 +41,6 @@ log = { workspace = true }
 # alongside the S3 access that produces it.
 nexrad-model = { workspace = true }
 nexrad-level3 = { workspace = true }
-# Decodes basemap/label tiles for the 3D floor's map composite
-# (`volume::floor::TileBytesLayer::decode`). The exact version walkers already
-# resolves — this adds no second copy of the decoder — and `png` only, because
-# the CartoDB sources serve PNG and nothing else reaches this decode.
-image = { version = "=0.25.10", default-features = false, features = ["png"] }
 pollster = { workspace = true }
 winit = { workspace = true }
 # Every `wgpu::` value in this crate comes through `egui_wgpu::wgpu`, the

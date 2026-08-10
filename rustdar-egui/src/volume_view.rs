@@ -124,6 +124,79 @@ const MIN_BASIS_LENGTH: f32 = 1e-6;
 /// the columns go out in order with no transpose.
 pub type Mat4 = [[f32; 4]; 4];
 
+/// Web Mercator's `y` for a latitude in radians: `ln(tan(π/4 + φ/2))`.
+fn mercator_y(lat_rad: f64) -> f64 {
+    (std::f64::consts::FRAC_PI_4 + lat_rad * 0.5).tan().ln()
+}
+
+/// Web Mercator's `y` for a latitude in **degrees**.
+///
+/// Public because the renderer on the other side of this seam has to evaluate
+/// exactly this function to turn a [`MapPaneGeo`] into texture coordinates,
+/// and a second spelling of it there is precisely the drift this seam exists
+/// to prevent.
+pub fn mercator_y_of_lat(lat_deg: f64) -> f64 {
+    mercator_y(lat_deg.to_radians())
+}
+
+/// How a 2D map pane's own render maps geography onto the frame — the affine a
+/// 3D pane needs in order to find its ground inside a copy of that render.
+///
+/// # What this is for
+///
+/// The 3D view's map floor is not a picture built for the floor. It is the
+/// **source pane's own render**, copied into an offscreen "mirror" texture and
+/// sampled by the raymarch. That makes the floor Web Mercator — whatever the
+/// 2D pane draws, in whatever projection the 2D pane draws it in — while the
+/// voxel box stays a tangent plane in kilometres east and north of the site,
+/// because beam geometry is kilometres and Mercator's scale factor varies
+/// ~6.6% across a 460 km box at mid-latitude, which would stretch storms.
+///
+/// So *something* has to carry the one conversion, and this is it: the pane's
+/// projection, reduced to the four numbers a linear reprojection needs. It is
+/// four numbers rather than a `walkers::Projector` because this seam's whole
+/// point is that the renderer gains no dependency on the map — and because the
+/// reduction is exact, not an approximation: Web Mercator's screen `x` is
+/// linear in longitude and its screen `y` is linear in Mercator `y`, so an
+/// affine in those two variables reproduces the projector everywhere on the
+/// pane, not merely near the anchor.
+///
+/// # Why an anchor rather than an origin
+///
+/// The affine is measured from the pane's own centre rather than from
+/// longitude 0 and the equator, so nothing downstream has to cancel a number
+/// near −93° against another one to land on a texture coordinate near 0.5. The
+/// quantities that reach `f32` stay small.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MapPaneGeo {
+    /// The pane's rect in **points**, in the frame's own coordinate space —
+    /// what the mirror pass clips this pane's primitives to.
+    pub rect: egui::Rect,
+    /// The anchor's latitude, degrees north.
+    pub anchor_lat: f64,
+    /// The anchor's longitude, degrees east.
+    pub anchor_lon: f64,
+    /// Where the anchor landed on the frame, in points.
+    pub anchor: egui::Pos2,
+    /// Points of screen `x` per degree of longitude east. Positive.
+    pub points_per_degree_lon: f64,
+    /// Points of screen `y` per unit of Mercator `y`. **Negative**: Mercator
+    /// `y` increases north and screen `y` increases down.
+    pub points_per_mercator_y: f64,
+}
+
+impl MapPaneGeo {
+    /// Where `(lat, lon)` lands on the frame, in points, by this affine.
+    ///
+    /// Exact rather than a local linearisation — see the type doc.
+    pub fn project(&self, lat_deg: f64, lon_deg: f64) -> egui::Pos2 {
+        let dx = (lon_deg - self.anchor_lon) * self.points_per_degree_lon;
+        let dy = (mercator_y_of_lat(lat_deg) - mercator_y_of_lat(self.anchor_lat))
+            * self.points_per_mercator_y;
+        egui::pos2(self.anchor.x + dx as f32, self.anchor.y + dy as f32)
+    }
+}
+
 /// Everything the painter is told about one 3D pane on one frame.
 ///
 /// Deliberately a record with no methods: it is the whole of the contract
@@ -148,6 +221,24 @@ pub struct VolumeFrameState {
     /// place the pane's state is read. The renderer may still draw no floor —
     /// none may be in hand yet — but it must never draw one against this.
     pub floor: bool,
+    /// The Mercator affine of the 2D pane this pane's region was dragged on,
+    /// as that pane last drew itself.
+    ///
+    /// This is the whole of the floor's registration. `None` — no
+    /// `source_pane`, or a source pane that is not a map — means the renderer
+    /// has nothing to reproject through and must draw no floor, whatever
+    /// [`Self::floor`] says.
+    ///
+    /// **"As that pane last drew itself"** is exact rather than loose: panes
+    /// render in index order, so a 3D pane sitting *before* its source in that
+    /// order reads the previous frame's affine. The mirror it samples is
+    /// always this frame's picture, so during a pan of the source map the
+    /// floor can trail the pane it mirrors by one frame's pan delta. That is
+    /// bounded by one frame and self-corrects the instant the gesture stops;
+    /// the alternative is a second layout pass over every pane purely to hoist
+    /// four numbers, which is a large cost for an artefact nobody can see at
+    /// 60 Hz.
+    pub source: Option<MapPaneGeo>,
     /// The user's Volume Alpha curve for this pane's product, or `None` for
     /// an untouched editor.
     ///

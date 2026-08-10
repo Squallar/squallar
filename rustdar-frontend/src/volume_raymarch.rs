@@ -164,16 +164,21 @@ pub const BINDING_BLIT_SAMPLER: u32 = 6;
 /// The map floor's bindings, in **group 1** of the raymarch pipeline.
 ///
 /// A group of their own because their lifetime is their own: group 0 is
-/// rebuilt with every grid upload, the floor with every floor render, and
-/// when no floor is in hand the pipelines' one-texel transparent placeholder
-/// binds here — so `encode_raymarch` always has a complete layout and the
-/// shader's floor arm is dead code until `flags.w` says otherwise.
+/// rebuilt with every grid upload, the mirror once per frame, and when no
+/// mirror is in hand the pipelines' one-texel transparent placeholder binds
+/// here — so `encode_raymarch` always has a complete layout and the shader's
+/// floor arm is dead code until `flags.w` says otherwise.
 pub const BINDING_FLOOR_TEXTURE: u32 = 0;
 /// See [`BINDING_FLOOR_TEXTURE`].
 pub const BINDING_FLOOR_SAMPLER: u32 = 1;
 
-/// The format the floor travels as: straight, gamma-encoded RGBA, exactly the
-/// bytes the 2D pane's rasters hold; the shader decodes.
+/// The format the **placeholder** mirror is created with, and nothing else.
+///
+/// A real pane mirror takes the swapchain's format instead — see
+/// [`VolumePipelines::ensure_mirror`] — because that is what decides which
+/// fragment entry point `egui_wgpu` uses and hence what encoding lands in it.
+/// The placeholder is one transparent texel that is never sampled (the shader's
+/// floor arm is dead while `flags.w` is 0), so its format only has to exist.
 pub const FLOOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 /// The format the raymarch renders into.
@@ -274,7 +279,7 @@ pub struct VolumePipelines {
     /// What binds at group 1 when no floor is in hand: one transparent texel.
     /// The raymarch's layout is total either way, and the shader's floor arm
     /// stays dead until `flags.w` turns it on.
-    empty_floor: FloorTexture,
+    empty_floor: PaneMirror,
     blit_entry_point: &'static str,
 }
 
@@ -538,7 +543,8 @@ impl VolumePipelines {
         // Created and never written: WebGPU zero-initialises textures, so the
         // placeholder is one transparent texel with no upload — and the queue
         // this constructor deliberately does not take is not needed for it.
-        let empty_floor = create_floor_texture(device, &floor_layout, &floor_sampler, [1, 1]);
+        let empty_floor =
+            create_pane_mirror(device, &floor_layout, &floor_sampler, [1, 1], FLOOR_FORMAT);
 
         Self {
             raymarch,
@@ -556,30 +562,68 @@ impl VolumePipelines {
         }
     }
 
-    /// Upload a floor image, ready to bind at group 1.
+    /// A pane mirror sized for this frame, creating or resizing it as needed.
     ///
-    /// `rgba` is straight, gamma-encoded bytes, row 0 the box footprint's
-    /// north edge — the registration `floor_colour` in the shader assumes.
-    pub fn upload_floor(
+    /// `format` must have the **same sRGB-ness as the swapchain**, because
+    /// `egui_wgpu` picks its fragment entry point from the swapchain's format
+    /// once, at `Renderer::new`, and that one pipeline is what draws into this
+    /// target. An sRGB swapchain means egui emits linear values and expects
+    /// the target to encode them; a non-sRGB one means egui emits gamma values
+    /// directly. Handing this a format that disagrees produces a floor that is
+    /// merely a little too dark or too light — no validation error, nothing
+    /// that fails a test that is not looking for it.
+    ///
+    /// Returns `true` when the texture was (re)created, which is the caller's
+    /// cue that the previous contents are gone and the mirror must be redrawn
+    /// before anything samples it.
+    pub fn ensure_mirror(
         &self,
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        mirror: &mut Option<PaneMirror>,
         size: [u32; 2],
-        rgba: &[u8],
-    ) -> Option<FloorTexture> {
+        format: wgpu::TextureFormat,
+    ) -> bool {
+        let size = [size[0].max(1), size[1].max(1)];
+        if mirror
+            .as_ref()
+            .is_some_and(|m| m.size == size && m.format == format)
+        {
+            return false;
+        }
+        *mirror = Some(create_pane_mirror(
+            device,
+            &self.floor_layout,
+            &self.floor_sampler,
+            size,
+            format,
+        ));
+        true
+    }
+
+    /// Plant `rgba` in a mirror, straight from the CPU.
+    ///
+    /// **Nothing in the frame path calls this.** Production *draws* into the
+    /// mirror — that is the entire point of the design — and this exists so the
+    /// GPU tests can bind a mirror of known colours without standing up an egui
+    /// frame, against the very same texture and bind group production uses.
+    ///
+    /// `rgba` is `size[0] * size[1] * 4` bytes in the mirror's own encoding,
+    /// premultiplied, row 0 at the top. Refuses a mismatch rather than letting
+    /// wgpu's own validation decide, so the message names the two numbers.
+    pub fn write_mirror(&self, queue: &wgpu::Queue, mirror: &PaneMirror, rgba: &[u8]) -> bool {
+        let size = mirror.size;
         let expected = (size[0] as usize)
             .checked_mul(size[1] as usize)
             .and_then(|texels| texels.checked_mul(4));
-        if size[0] == 0 || size[1] == 0 || expected != Some(rgba.len()) {
+        if expected != Some(rgba.len()) {
             log::error!(
-                "3D volume view: refusing a {size:?} floor with {} bytes",
+                "3D volume view: refusing to plant a {size:?} mirror from {} bytes",
                 rgba.len(),
             );
-            return None;
+            return false;
         }
-        let floor = create_floor_texture(device, &self.floor_layout, &self.floor_sampler, size);
         queue.write_texture(
-            floor.texture.as_image_copy(),
+            mirror.texture.as_image_copy(),
             rgba,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
@@ -592,7 +636,7 @@ impl VolumePipelines {
                 depth_or_array_layers: 1,
             },
         );
-        Some(floor)
+        true
     }
 
     /// Upload the quad. Separate from `new` because it needs a queue.
@@ -845,7 +889,7 @@ impl VolumePipelines {
         encoder: &mut wgpu::CommandEncoder,
         target: &OffscreenTarget,
         volume: &VolumeTextures,
-        floor: Option<&FloorTexture>,
+        floor: Option<&PaneMirror>,
     ) {
         self.encode_raymarch_with_timestamps(encoder, target, volume, floor, None);
     }
@@ -863,7 +907,7 @@ impl VolumePipelines {
         encoder: &mut wgpu::CommandEncoder,
         target: &OffscreenTarget,
         volume: &VolumeTextures,
-        floor: Option<&FloorTexture>,
+        floor: Option<&PaneMirror>,
         timestamp_writes: Option<wgpu::RenderPassTimestampWrites>,
     ) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -924,24 +968,81 @@ impl OffscreenTarget {
     }
 }
 
-/// A floor image on the GPU, with the bind group the raymarch reads it
-/// through at group 1.
-pub struct FloorTexture {
+/// The pane mirror on the GPU: a frame-sized copy of the 2D pane's own render,
+/// plus the bind group the raymarch reads it through at group 1.
+///
+/// One mirror serves every 3D pane. It covers the whole frame rather than any
+/// one box footprint, so two 3D panes sourced from two different maps each find
+/// their own ground in it simply by sampling a different region — which is why
+/// there is no per-pane keying here, and why nothing has to be invalidated when
+/// a pane is re-aimed.
+pub struct PaneMirror {
     texture: wgpu::Texture,
+    /// The colour attachment the mirror pass draws into.
+    view: wgpu::TextureView,
     bind_group: wgpu::BindGroup,
+    size: [u32; 2],
+    format: wgpu::TextureFormat,
 }
 
-/// A floor texture of `size` texels and its bind group. No upload: WebGPU
-/// zero-initialises, so an unwritten floor is transparent — which is exactly
-/// what the placeholder wants to be.
-fn create_floor_texture(
+impl PaneMirror {
+    /// The attachment the mirror pass draws into.
+    pub fn view(&self) -> &wgpu::TextureView {
+        &self.view
+    }
+
+    /// The mirror's size in texels.
+    pub fn size(&self) -> [u32; 2] {
+        self.size
+    }
+
+    /// Whether the mirror holds gamma-encoded texels — the value
+    /// `VolumeUniform::floor_geo`'s `w` lane carries to the shader.
+    pub fn is_gamma_encoded(&self) -> bool {
+        mirror_is_gamma_encoded(self.format)
+    }
+
+    /// The format this mirror was created with.
+    pub fn format(&self) -> wgpu::TextureFormat {
+        self.format
+    }
+
+    /// The texture itself, for tests that read it back.
+    pub fn texture(&self) -> &wgpu::Texture {
+        &self.texture
+    }
+}
+
+/// Whether a mirror in `format` holds **gamma-encoded** texels.
+///
+/// The inverse of the format's sRGB-ness, and the reasoning is one step
+/// removed from anything this module can see: `egui_wgpu` picks its fragment
+/// entry point once, at `Renderer::new`, from the **swapchain's** format —
+/// `fs_main_gamma_framebuffer` when it is not sRGB, `fs_main_linear_framebuffer`
+/// when it is. That one pipeline is what draws the mirror. So an sRGB target
+/// receives linear values (the hardware encodes them on write) and a non-sRGB
+/// target receives values egui has already gamma-encoded itself.
+///
+/// A free function rather than a method because both arms have to be pinned and
+/// a `PaneMirror` needs a `wgpu::Device` to exist, which CI rows do not have.
+/// Both arms are live: `app_state::select_surface_format` prefers a non-sRGB
+/// format only on wasm and takes `capabilities.formats[0]` natively.
+pub fn mirror_is_gamma_encoded(format: wgpu::TextureFormat) -> bool {
+    !format.is_srgb()
+}
+
+/// A mirror of `size` texels and its bind group. No upload: WebGPU
+/// zero-initialises, so an undrawn mirror is transparent — which reads as "no
+/// ground here", exactly what a floor with no pane behind it should be.
+fn create_pane_mirror(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
     size: [u32; 2],
-) -> FloorTexture {
+    format: wgpu::TextureFormat,
+) -> PaneMirror {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some(&label("floor")),
+        label: Some(&label("pane_mirror")),
         size: wgpu::Extent3d {
             width: size[0].max(1),
             height: size[1].max(1),
@@ -950,13 +1051,22 @@ fn create_floor_texture(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: FLOOR_FORMAT,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        format,
+        // `COPY_DST` is not used in production — the frame path *draws* into
+        // this target, it never writes bytes to it. It is here so a GPU test
+        // can plant a mirror of known colours through
+        // [`VolumePipelines::write_mirror`] without standing up a whole egui
+        // frame, and so that the texture those tests bind is the same texture
+        // production binds rather than a second kind that could drift from it.
+        // The flag costs nothing on any backend.
+        usage: wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some(&label("floor.bind_group")),
+        label: Some(&label("pane_mirror.bind_group")),
         layout,
         entries: &[
             wgpu::BindGroupEntry {
@@ -969,9 +1079,12 @@ fn create_floor_texture(
             },
         ],
     });
-    FloorTexture {
+    PaneMirror {
         texture,
+        view,
         bind_group,
+        size: [size[0].max(1), size[1].max(1)],
+        format,
     }
 }
 

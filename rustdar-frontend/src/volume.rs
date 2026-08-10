@@ -28,8 +28,6 @@ use crate::constants::VOLUME_GRID_CELLS;
 pub mod bridge;
 #[path = "volume_degrade.rs"]
 pub mod degrade;
-#[path = "volume_floor.rs"]
-pub mod floor;
 #[path = "volume_quality.rs"]
 pub mod quality;
 #[path = "volume_raymarch.rs"]

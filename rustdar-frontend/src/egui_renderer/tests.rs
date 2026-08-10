@@ -452,3 +452,112 @@ fn both_theme_paths_turn_label_text_selection_off() {
         }
     }
 }
+
+/// A primitive is dropped from the mirror by *clamping* its clip rect, and
+/// clamped to the source pane it belongs to when it belongs to one.
+///
+/// The whole filtering mechanism, and the reason it can be this cheap:
+/// `egui_wgpu::Renderer::render` advances its index and vertex slice iterators
+/// even when it skips a zero-size scissor (`renderer.rs:516-527`), so a
+/// primitive can be excluded without removing it from the list — no mesh is
+/// cloned and no list is rebuilt. A filter that instead dropped entries would
+/// desynchronise those iterators from the buffers `update_buffers` staged, and
+/// every primitive after the first drop would draw another one's geometry.
+#[test]
+fn the_mirror_filter_clamps_rather_than_removes() {
+    use super::clamp_to_sources;
+    let pane = egui::Rect::from_min_max(egui::pos2(100.0, 50.0), egui::pos2(500.0, 450.0));
+    let other = egui::Rect::from_min_max(egui::pos2(600.0, 50.0), egui::pos2(900.0, 450.0));
+
+    // Inside the pane: kept as it is.
+    let inside = egui::Rect::from_min_max(egui::pos2(120.0, 60.0), egui::pos2(300.0, 200.0));
+    assert_eq!(clamp_to_sources(inside, &[pane, other]), inside);
+
+    // Straddling the pane's edge: narrowed to the pane, so the part of a
+    // widget that hangs outside its map does not land on the floor.
+    let straddling = egui::Rect::from_min_max(egui::pos2(400.0, 400.0), egui::pos2(700.0, 700.0));
+    assert_eq!(
+        clamp_to_sources(straddling, &[pane]),
+        egui::Rect::from_min_max(egui::pos2(400.0, 400.0), egui::pos2(500.0, 450.0)),
+    );
+
+    // Belonging to no source — the sidebar, the top bar, another pane's
+    // chrome, a 3D pane itself. Zero size, which `render` skips.
+    let elsewhere = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(50.0, 40.0));
+    let dropped = clamp_to_sources(elsewhere, &[pane, other]);
+    assert!(
+        dropped.width() == 0.0 || dropped.height() == 0.0,
+        "a primitive outside every source pane must clamp to nothing, got {dropped:?}",
+    );
+
+    // No sources at all is the same answer, not a pass-through: an empty
+    // guest list must mirror an empty frame rather than the whole one.
+    assert!(clamp_to_sources(inside, &[]).width() == 0.0);
+}
+
+/// The mirror pass keeps the ordering that makes it correct at all.
+///
+/// Three things, none of which fails loudly when it is wrong:
+///
+///  * a **`queue.submit` between the two `update_buffers` calls**. Staging
+///    writes land at the next submit, so without one the second call overwrites
+///    the belt before the mirror pass runs and the mirror draws the wrong
+///    meshes through correct-looking geometry — a plausible picture and no
+///    validation error.
+///  * the mirror pass **before** `end_pass_and_upload`'s own `update_buffers`,
+///    because that call is what dispatches the volume callback's `prepare`, and
+///    that is what samples the mirror. After it, the floor would be one frame
+///    stale on every pan.
+///  * **callbacks swapped out** for the staging call. `render` already ignores
+///    `Primitive::Callback`, but `update_buffers` does not — leaving them in
+///    runs every `prepare` twice, and the raymarch is the most expensive thing
+///    in the frame.
+///
+/// A source probe because `render_mirror` needs a `Window`, a device and a
+/// swapchain, so no host test can call it.
+#[test]
+fn the_mirror_pass_submits_between_the_two_uploads_and_runs_before_prepare() {
+    let source = include_str!("../egui_renderer.rs");
+
+    let mirror = body_of(source, "fn render_mirror(");
+    let upload = mirror
+        .find("update_buffers(")
+        .expect("render_mirror no longer stages the geometry it draws");
+    let submit = mirror
+        .find("queue.submit(")
+        .expect("render_mirror no longer submits, so its staging never lands");
+    let pass = mirror
+        .find("begin_render_pass(")
+        .expect("render_mirror no longer opens a pass");
+    assert!(
+        upload < pass && pass < submit,
+        "render_mirror must stage, then draw, then submit — got upload at \
+         {upload}, pass at {pass}, submit at {submit}",
+    );
+    assert!(
+        mirror.contains("Primitive::Mesh(egui::epaint::Mesh::default())"),
+        "render_mirror no longer swaps callbacks out before staging, so every \
+         CallbackTrait::prepare — the volume raymarch included — now runs twice \
+         a frame",
+    );
+    assert!(
+        mirror.contains("LoadOp::Clear(wgpu::Color::TRANSPARENT)"),
+        "the mirror must clear transparent: the shader reads zero alpha as \
+         'the source pane is not showing this ground', and any other clear \
+         carpets the floor",
+    );
+
+    let outer = body_of(source, "pub fn end_pass_and_upload(");
+    let call = outer
+        .find("self.render_mirror(")
+        .expect("end_pass_and_upload no longer draws the mirror");
+    let buffers = outer
+        .find("update_buffers(")
+        .expect("end_pass_and_upload no longer calls update_buffers");
+    assert!(
+        call < buffers,
+        "the mirror pass must run before update_buffers dispatches the paint \
+         callbacks' prepare — that is what samples it. Reversed, the floor is \
+         one frame behind the pane it mirrors on every pan.",
+    );
+}

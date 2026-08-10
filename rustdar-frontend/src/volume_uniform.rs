@@ -24,7 +24,7 @@
 //!
 //! # The layout
 //!
-//! One `mat4x4<f32>` and six `vec4<f32>`: 160 bytes, all naturally 16-byte
+//! One `mat4x4<f32>` and eight `vec4<f32>`: 192 bytes, all naturally 16-byte
 //! aligned, so std140 inserts no padding of its own.
 //!
 //! | offset | member              |
@@ -36,6 +36,14 @@
 //! |    112 | `light_dir_ambient` |
 //! |    128 | `transfer`          |
 //! |    144 | `flags`             |
+//! |    160 | `floor_uv`          |
+//! |    176 | `floor_geo`         |
+//!
+//! Every lane is an `f32`, including the ones that carry counts and booleans
+//! (`grid_dims` goes out as floats, the flags as 0.0/1.0). That is a rule, not
+//! an accident: a mixed int/float block would make the offsets depend on which
+//! member a reader believed was which type, and the whole point of writing the
+//! bytes out by hand is that the offsets are assertable numbers.
 //!
 //! Lanes the shader does not read are written as **zero** rather than left to
 //! whatever was there. A uniform buffer is reused across frames, so a reserved
@@ -44,8 +52,8 @@
 
 use crate::constants::VOLUME_LUT_BYTES;
 
-/// Bytes in the uniform block. One `mat4x4<f32>` + six `vec4<f32>`.
-pub const VOLUME_UNIFORM_BYTES: usize = 160;
+/// Bytes in the uniform block. One `mat4x4<f32>` + eight `vec4<f32>`.
+pub const VOLUME_UNIFORM_BYTES: usize = 192;
 
 /// `f32` lanes in the uniform block.
 pub const VOLUME_UNIFORM_LANES: usize = VOLUME_UNIFORM_BYTES / 4;
@@ -65,6 +73,10 @@ pub const OFFSET_LIGHT_DIR_AMBIENT: usize = 112;
 pub const OFFSET_TRANSFER: usize = 128;
 /// See [`OFFSET_BOX_FROM_CLIP`].
 pub const OFFSET_FLAGS: usize = 144;
+/// See [`OFFSET_BOX_FROM_CLIP`].
+pub const OFFSET_FLOOR_UV: usize = 160;
+/// See [`OFFSET_BOX_FROM_CLIP`].
+pub const OFFSET_FLOOR_GEO: usize = 176;
 
 /// Extinction per kilometre at a palette entry whose alpha is 1.
 ///
@@ -270,6 +282,59 @@ pub struct VolumeUniform {
     /// this lane too, with its centre at the **top** of its ramp, so "at or
     /// under a bound" is the same test. Only read in isosurface mode.
     pub iso_centre: f32,
+    /// Where the box's own site sits in the pane mirror, and how fast the
+    /// mirror's texture coordinates run with geography: `(u_at_site,
+    /// v_at_site, u_per_degree_east, v_per_mercator_y)`. Rides `floor_uv`.
+    ///
+    /// # Why the floor is sampled through geography rather than through the
+    /// box
+    ///
+    /// The mirror is a **Web Mercator** picture — it is the 2D pane's own
+    /// render, copied. The box is a **tangent plane in kilometres** east and
+    /// north of the site (`build_voxels` goes polar through
+    /// `site_bearing_range_km`). Those are different projections, so mapping
+    /// the box's bottom face onto the mirror with a scale and a translate is
+    /// wrong, and wrong in a way that hides: it is exact at the centre and
+    /// grows toward the corners. On the shipped 460 km box at 41.7°N the
+    /// error is 8.5 texels of 512 across (7.6 km) — the footprint is a
+    /// *trapezoid* in longitude, 6.65% wider along its north edge than its
+    /// south, because `cos φ` varies over the box — and 4.1 texels (3.7 km)
+    /// down, from Mercator's own curvature against a floor whose rows are
+    /// linear in latitude.
+    ///
+    /// So the march reprojects per pixel instead, through the same three
+    /// lines the CPU compositor used to evaluate per texel:
+    ///
+    /// ```text
+    /// φ = φ₀ + y_km / 111.32
+    /// λ = λ₀ + x_km / (111.32 · cos φ)
+    /// (u, v) = (u₀ + (λ − λ₀)·u_per_deg,  v₀ + (mercᵧ(φ) − mercᵧ(φ₀))·v_per_merc)
+    /// ```
+    ///
+    /// Anchoring both axes at the **site** rather than at the mirror's corner
+    /// is deliberate: it keeps the quantities the shader subtracts small, so
+    /// an `f32` longitude near -93° never has to cancel against another one
+    /// to produce a texture coordinate near 0.5.
+    pub floor_uv: [f32; 4],
+    /// The geography the mirror is sampled with: `(site_latitude_degrees,
+    /// box_west_edge_km, box_south_edge_km, gamma_encoded)`. Rides
+    /// `floor_geo`.
+    ///
+    /// The two km lanes are the box's own `x_range_km.0` / `y_range_km.0` —
+    /// its west and south edges as kilometres east and north **of the site**,
+    /// which is the origin `floor_uv`'s formulas measure from. They are not
+    /// derivable from `box_size_km`, which carries extent and not position.
+    ///
+    /// `gamma_encoded` is 1.0 when the mirror holds gamma-encoded texels and
+    /// 0.0 when it holds linear ones, and it is not cosmetic. `egui_wgpu`
+    /// picks its fragment entry point from the **swapchain's** format
+    /// (`fs_main_gamma_framebuffer` when it is not sRGB, `fs_main_linear_
+    /// framebuffer` when it is), and the mirror is drawn by that same
+    /// pipeline. So what lands in the mirror depends on a format this module
+    /// never sees, and the shader has to be told rather than assume — a wrong
+    /// guess is a floor that is merely a bit too dark or too light, which is
+    /// exactly the sort of error that ships.
+    pub floor_geo: [f32; 4],
 }
 
 /// The lit-volume sentinel for [`VolumeUniform::iso_threshold`] and the
@@ -301,10 +366,15 @@ impl VolumeUniform {
             map_floor: false,
             iso_threshold: ISO_OFF,
             iso_centre: ISO_OFF,
+            // No mirror: `map_floor` is false above, so the shader never
+            // reads these. Zero rather than a plausible-looking placement,
+            // for the reason the module doc gives about unwritten lanes.
+            floor_uv: [0.0; 4],
+            floor_geo: [0.0; 4],
         }
     }
 
-    /// The 160 bytes the GPU reads, little-endian.
+    /// The 192 bytes the GPU reads, little-endian.
     ///
     /// Little-endian unconditionally: every target wgpu supports is
     /// little-endian, and `to_le_bytes` says so at the call site rather than
@@ -355,6 +425,8 @@ impl VolumeUniform {
                 f32::from(u8::from(self.map_floor)),
             ],
         );
+        write_vec4(&mut out, OFFSET_FLOOR_UV, self.floor_uv);
+        write_vec4(&mut out, OFFSET_FLOOR_GEO, self.floor_geo);
 
         out
     }

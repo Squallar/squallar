@@ -74,7 +74,12 @@
 //! * `<OUT>_mask.pgm` — binary P5, the alpha channel of the **hard-LUT** render.
 //! * `<OUT>_colour.ppm` — binary P6, the **production-LUT** render
 //!   un-premultiplied and composited over **black**.
-//! * `<OUT>_meta.txt` — the numbers behind both, also printed to stdout.
+//! * `<OUT>_floor.ppm` — binary P6, the same render again with the **map
+//!   floor** under it: the 2D rasterizer's own picture planted in a real
+//!   `PaneMirror` and reprojected onto the box's bottom face by the shader,
+//!   exactly as the frame path does it with the 2D pane's mirror. Written only
+//!   when the volume has a reflectivity tilt for the rasterizer to draw.
+//! * `<OUT>_meta.txt` — the numbers behind them, also printed to stdout.
 //!
 //! # Why the hard LUT makes the alpha channel a mask
 //!
@@ -126,7 +131,7 @@ use rustdar_egui::pane::OrbitCamera;
 use rustdar_egui::volume_view::view_for;
 use rustdar_frontend::constants::VOLUME_LUT_BYTES;
 use rustdar_frontend::egui_renderer::AttachmentConfig;
-use rustdar_frontend::volume::raymarch::VolumePipelines;
+use rustdar_frontend::volume::raymarch::{FLOOR_FORMAT, VolumePipelines};
 use rustdar_frontend::volume::uniform::VolumeUniform;
 use rustdar_radar::types::RadarProduct;
 use rustdar_radar::voxel::{DESKTOP_SHAPE, VoxelGrid, VoxelRequest, build_voxels_with_motion};
@@ -252,10 +257,19 @@ fn render_a_real_volume_mask() {
         size,
     );
 
-    // The production floor, end to end: the 2D rasterizer at the lowest
-    // reflectivity tilt, `resample_floor` onto this very grid's footprint,
-    // and the raymarch compositing the volume over it — written as a third
-    // frame beside the mask and the colour render.
+    // The production floor, as end to end as a harness with no egui frame can
+    // make it: the 2D rasterizer at the lowest reflectivity tilt planted in a
+    // real `PaneMirror`, and the raymarch reprojecting the volume's footprint
+    // into it through the same two uniform lanes the bridge fills — written as
+    // a third frame beside the mask and the colour render.
+    //
+    // The floor is no longer an image resampled onto the box's footprint. It is
+    // the 2D pane's own render, copied: a **Web Mercator** picture of the whole
+    // frame that `floor_colour` reprojects into per pixel, at each pixel's own
+    // latitude. Nothing is lost by having no pane here, because the rasterizer's
+    // output already *is* a Web Mercator picture on `ImageBounds`' grid — so it
+    // stands in for a mirror exactly, and the lanes below are read off that
+    // grid's own arithmetic rather than guessed at.
     let floor_pixels = rustdar_radar::render::find_closest_elevation(
         &scan,
         rustdar_radar::types::RadarProduct::Reflectivity,
@@ -270,27 +284,75 @@ fn render_a_real_volume_mask() {
             site_lon,
         )
     })
-    .and_then(|(image, _data_reach_km, _)| {
+    .and_then(|(mut image, _data_reach_km, _)| {
         // Not the returned `max_range_km`: that is the product's data reach,
-        // not the raster's half-extent — `resample_floor` reads the raster's
-        // real geometry from `types::MAX_RANGE_KM` itself.
-        rustdar_frontend::volume::floor::resample_floor(
-            &image,
-            site_lat,
-            grid.x_range_km(),
-            grid.y_range_km(),
-        )
-    })
-    .and_then(|floor| {
-        let texture = pipelines.upload_floor(&device, &queue, floor.size, &floor.rgba)?;
+        // and it moves with the volume. The raster's own geometry is fixed —
+        // `IMAGE_SIZE` texels square over `ImageBounds::from_radar_site`, which
+        // is `MAX_RANGE_KM` in every direction — and that geometry, not the
+        // reach, is what the lanes below have to describe.
+        let bounds = rustdar_radar::types::ImageBounds::from_radar_site(site_lat, site_lon);
+        let side = rustdar_radar::types::IMAGE_SIZE as u32;
+
+        let mut mirror = None;
+        assert!(
+            pipelines.ensure_mirror(&device, &mut mirror, [side, side], FLOOR_FORMAT),
+            "ensure_mirror declined to create a mirror where there was none",
+        );
+        let mirror = mirror?;
+
+        // egui premultiplies **after** gamma-encoding, and `floor_colour`
+        // un-premultiplies before it decodes, so the mirror's contract is
+        // premultiplied bytes. The frame path gets that for free from epaint;
+        // the rasterizer hands back straight RGBA, so the multiply has to
+        // happen here — in gamma space, which is where epaint does it — or
+        // every faded gate at the palette's transparent end composites far too
+        // bright.
+        for px in image.chunks_exact_mut(4) {
+            let alpha = u32::from(px[3]);
+            for channel in &mut px[..3] {
+                *channel = ((u32::from(*channel) * alpha + 127) / 255) as u8;
+            }
+        }
+        if !pipelines.write_mirror(&queue, &mirror, &image) {
+            return None;
+        }
+
+        // Where the site sits in that picture and how fast its texture
+        // coordinates run with geography, read straight off the rasterizer's
+        // own projection (`render::MercatorProjection`): x is linear in
+        // longitude about `IMAGE_SIZE / 2`, and y is
+        // `(mercator_y_max - mercator_y) / span` measured down from the top —
+        // hence a negative v rate, v running down while Mercator y runs north.
+        // v at the site is *not* 0.5: the bounds are symmetric in latitude and
+        // Mercator's y is not.
+        let merc_span = bounds.mercator_y_max - bounds.mercator_y_min;
+        let site_merc = (std::f64::consts::FRAC_PI_4 + site_lat.to_radians() / 2.0)
+            .tan()
+            .ln();
+        uniform.floor_uv = [
+            0.5,
+            ((bounds.mercator_y_max - site_merc) / merc_span) as f32,
+            (1.0 / (bounds.max_lon - bounds.min_lon)) as f32,
+            (-1.0 / merc_span) as f32,
+        ];
+        // The site's latitude and the box's west and south edges as kilometres
+        // east and north of it — the box's *position*, which `box_size_km`
+        // carries no trace of and which the reprojection measures from.
+        uniform.floor_geo = [
+            site_lat as f32,
+            grid.x_range_km().0 as f32,
+            grid.y_range_km().0 as f32,
+            if mirror.is_gamma_encoded() { 1.0 } else { 0.0 },
+        ];
         uniform.map_floor = true;
+
         let volume = pipelines
             .upload_volume(&device, &queue, grid_dims, grid.indices(), grid.lut())
             .expect("the grid uploads twice as readily as once");
         volume.write_uniform(&queue, &uniform);
         let target = pipelines.create_offscreen(&device, size);
         let mut encoder = device.create_command_encoder(&Default::default());
-        pipelines.encode_raymarch_with_floor(&mut encoder, &target, &volume, Some(&texture));
+        pipelines.encode_raymarch_with_floor(&mut encoder, &target, &volume, Some(&mirror));
         queue.submit(Some(encoder.finish()));
         Some(read_back(&device, &queue, target.texture(), size))
     });

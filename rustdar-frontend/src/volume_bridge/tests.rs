@@ -383,122 +383,61 @@ fn a_released_id_is_never_handed_out_again() {
     );
 }
 
-/// A floor lands only under a held scope, replaces its predecessor, and
-/// leaves when the last pane on its scope does.
+/// The floor's uniform lanes, both ways the mirror can be encoded.
 ///
-/// The lifetime rule in four asserts: scoped set sticks, unscoped set is
-/// dropped on the spot, a second set is a replacement rather than an
-/// accumulation, and release prunes. The id changing across the
-/// replacement is what lets the GPU side see a new floor arrive at all —
-/// its upload cache is keyed by id.
-#[test]
-fn a_floor_exists_exactly_while_a_pane_stands_on_its_scope() {
-    let store = VolumeStore::new();
-    let t = target(RadarProduct::Reflectivity, 0);
-    let image = || {
-        Arc::new(crate::volume::floor::FloorImage {
-            size: [1, 1],
-            rgba: vec![0, 0, 0, 255],
-        })
-    };
-
-    // Unscoped: nothing holds this site, so the floor is dropped.
-    store.set_floor("KTLX", None, image());
-    assert!(
-        store.floor_for(&t).is_none(),
-        "a floor for a scope nothing holds must be dropped, not cached",
-    );
-
-    build(&store, 0, &t, "held");
-    store.set_floor("KTLX", None, image());
-    let (first_id, _) = store.floor_for(&t).expect("a scoped floor lands");
-
-    // A region-scoped target is a different ground and must not answer.
-    let mut regioned = t.clone();
-    regioned.region = rustdar_egui::pane::VolumeRegion::new(
-        rustdar_egui::pane::GeoPoint {
-            lat: 35.3,
-            lon: -97.3,
-        },
-        40.0,
-    );
-    assert!(
-        regioned.region.is_some() && store.floor_for(&regioned).is_none(),
-        "a site-wide floor must not stand under a region box",
-    );
-
-    // Replacement, not accumulation.
-    store.set_floor("KTLX", None, image());
-    let (second_id, _) = store.floor_for(&t).expect("the replacement lands");
-    assert_ne!(second_id, first_id, "a replaced floor must get a new id");
-    assert_eq!(store.live_floor_ids().len(), 1, "one floor per scope");
-
-    // The last pane letting go takes the floor with it.
-    store.release(0);
-    assert!(store.floor_for(&t).is_none());
-    assert!(store.live_floor_ids().is_empty());
-}
-
-/// A pane re-aiming away from a scope takes the scope's floor with it —
-/// on every shed path, not only on `release`.
+/// This is the arithmetic `prepare` does and nothing else: geography in
+/// points from `paint`, the frame's own pixel size from the descriptor, out
+/// come the two `vec4`s the shader reprojects through. It is a free function
+/// precisely so it can be pinned here — the containing `prepare` needs a
+/// `wgpu::Device`, and this is where a sign or a swapped axis would live.
 ///
-/// The third unevicted-holder of this campaign, same shape as the first
-/// two: `share`, `begin_build` and `insert` all shed the pane's old
-/// entries, and until this test none of them pruned the floors, so a
-/// pane re-aimed from KTLX to another site stranded KTLX's ~1 MiB floor
-/// until the pane was *released* — which a re-aim never does. Each arm
-/// below fails against the fix reverted on its path.
+/// The gamma lane gets both arms because **both are live**:
+/// `app_state::select_surface_format` prefers a non-sRGB format only on wasm
+/// and takes `capabilities.formats[0]` natively, so a desktop build and a
+/// browser build reach opposite branches. A wrong flag is a floor merely a
+/// little too dark or too light, with no validation error anywhere.
 #[test]
-fn a_pane_reaiming_away_from_a_scope_evicts_its_floor_on_every_shed_path() {
-    let image = || {
-        Arc::new(crate::volume::floor::FloorImage {
-            size: [1, 1],
-            rgba: vec![0, 0, 0, 255],
-        })
+fn the_floor_lanes_normalise_points_against_the_frame_and_carry_the_encoding() {
+    let source = FloorSource {
+        // 400 points across a 1600-point-wide frame: a quarter in.
+        site_points: [400.0, 300.0],
+        points_per_degree_lon: 80.0,
+        // Negative, because Mercator y grows north and screen y grows down.
+        points_per_mercator_y: -5000.0,
+        site_lat: 41.7,
+        west_km: -230.0,
+        south_km: -230.0,
     };
-    let old = target(RadarProduct::Reflectivity, 0);
-    let mut elsewhere = target(RadarProduct::Reflectivity, 6);
-    elsewhere.volume.site = "KSRX".to_owned();
+    // 3200x2400 pixels at 2 points per pixel is a 1600x1200-point frame.
+    let (uv, geo) = floor_lanes(&source, [3200, 2400], 2.0, true);
 
-    // `share`: the pane joins a volume another pane already holds.
-    let store = VolumeStore::new();
-    build(&store, 0, &old, "old scope");
-    store.set_floor("KTLX", None, image());
-    build(&store, 1, &elsewhere, "the shared one");
-    assert!(store.share(0, &elsewhere), "precondition: the join happens");
-    assert!(
-        store.floor_for(&old).is_none() && store.live_floor_ids().is_empty(),
-        "pane 0 shed its KTLX entry through `share`, so the KTLX floor \
-             has no holder and must be gone",
-    );
+    // `point x pixels_per_point / frame_pixels`: 400 x 2 / 3200 = 0.25 across,
+    // 300 x 2 / 2400 = 0.25 down; 80 x 2 / 3200 = 0.05 of the mirror per degree
+    // of longitude, and -5000 x 2 / 2400 = -4.1667 per unit of Mercator y.
+    // Compared with a tolerance because the products are not representable:
+    // 80 x 2 / 3200 comes out 0.049999997.
+    for (lane, (got, want)) in [
+        "u at the site",
+        "v at the site",
+        "u per degree of longitude",
+        "v per unit of Mercator y",
+    ]
+    .into_iter()
+    .zip(uv.into_iter().zip([0.25, 0.25, 0.05, -4.166_667]))
+    {
+        assert!((got - want).abs() < 1e-5, "{lane}: got {got}, want {want}");
+    }
+    assert_eq!(geo, [41.7, -230.0, -230.0, 1.0], "geo lanes, gamma-encoded");
 
-    // `begin_build`: the pane re-aims at a scope that needs a build.
-    let store = VolumeStore::new();
-    build(&store, 0, &old, "old scope");
-    store.set_floor("KTLX", None, image());
-    assert!(!store.share(0, &elsewhere));
-    store.begin_build(0, &elsewhere);
-    assert!(
-        store.floor_for(&old).is_none() && store.live_floor_ids().is_empty(),
-        "pane 0 shed its KTLX entry through `begin_build`, so the KTLX \
-             floor must be gone",
-    );
+    // Halving the mirror halves nothing: the lanes are `point x
+    // pixels_per_point / frame_pixels`, and the reduced-resolution path
+    // halves both of those together. This is why the mirror's own size never
+    // reaches this function.
+    let (half_uv, _) = floor_lanes(&source, [1600, 1200], 1.0, true);
+    assert_eq!(half_uv, uv, "a half-resolution mirror maps identically");
 
-    // `insert`: a synchronously-known result detaches the pane from
-    // everything else.
-    let store = VolumeStore::new();
-    build(&store, 0, &old, "old scope");
-    store.set_floor("KTLX", None, image());
-    store.insert(
-        0,
-        elsewhere.clone(),
-        VolumeEntry::Refused("decided at dispatch".to_owned()),
-    );
-    assert!(
-        store.floor_for(&old).is_none() && store.live_floor_ids().is_empty(),
-        "pane 0 shed its KTLX entry through `insert`, so the KTLX floor \
-             must be gone",
-    );
+    let (_, linear) = floor_lanes(&source, [3200, 2400], 2.0, false);
+    assert_eq!(linear[3], 0.0, "an sRGB swapchain leaves the mirror linear");
 }
 
 /// Every samplable moment clears the solid-block bar, and the counts here
@@ -730,7 +669,7 @@ fn the_guards_paint_cannot_be_tested_through_are_still_in_it() {
         "`paint` no longer ties the floor flag to the floor being in hand",
     );
     assert!(
-        body.contains(".then(|| self.store.floor_for(&frame.target))"),
+        body.contains("frame.floor.then_some(frame.source).flatten()"),
         "`paint` no longer consults the pane's floor toggle before looking \
              a floor up, so the per-pane escape hatch is dead",
     );

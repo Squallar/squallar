@@ -47,6 +47,63 @@ pub struct AttachmentConfig {
     pub msaa_samples: u32,
 }
 
+/// The longest side the pane mirror is allowed, in texels.
+///
+/// The mirror has to be **frame-sized**: `egui_wgpu::Renderer::render` hardcodes
+/// `set_viewport(0, 0, size_in_pixels)` and WebGPU validates that the viewport
+/// lies within the attachment, so there is no way to scale the frame's geometry
+/// onto a smaller target without touching vertices. The one lever that does work
+/// is to halve `size_in_pixels` and `pixels_per_point` **together** —
+/// `screen_size_in_points` is their quotient, which is what egui's own vertex
+/// shader divides by, so the geometry is unaffected and only the sampling rate
+/// changes.
+///
+/// 2048 because that is the smallest `max_texture_dimension_2d` WebGPU
+/// guarantees, so a mirror at this cap allocates on every device the rest of the
+/// application already runs on. It bounds the mirror at 2048² × 4 B = 16 MiB in
+/// the worst case; see `constants::VOLUME_MIRROR_BYTES_MAX`.
+pub const MIRROR_MAX_SIDE: u32 = 2048;
+
+/// The mirror's size and the scale to draw it at, for a frame of
+/// `size_in_pixels` at `pixels_per_point`.
+///
+/// Halves both together until the longer side fits [`MIRROR_MAX_SIDE`], which
+/// is the only reduction that leaves the geometry alone — see that constant.
+/// A 4K frame therefore mirrors at 1920×1080 and a 1080p frame at its own size.
+pub fn mirror_size_for(size_in_pixels: [u32; 2], pixels_per_point: f32) -> ([u32; 2], f32) {
+    let mut size = [size_in_pixels[0].max(1), size_in_pixels[1].max(1)];
+    let mut scale = pixels_per_point;
+    while size[0].max(size[1]) > MIRROR_MAX_SIDE {
+        size = [(size[0] / 2).max(1), (size[1] / 2).max(1)];
+        scale *= 0.5;
+    }
+    (size, scale)
+}
+
+/// What the mirror pass is asked to copy, and where to put it.
+///
+/// The 3D view's map floor is not a picture built for the floor: it is the 2D
+/// pane's **own render**, drawn a second time into an offscreen texture that the
+/// raymarch samples. Every layer the pane has — tiles, the radar raster,
+/// outlooks, alerts, storm reports, lightning, METARs, the location dot, labels
+/// — lands on the floor for free and stays in step with the pane's own options
+/// by construction, because it *is* the pane's own geometry.
+pub struct MirrorRequest<'a> {
+    /// The colour attachment to draw into. Must have the same sRGB-ness as the
+    /// swapchain — `egui_wgpu` picked its fragment entry point from the
+    /// swapchain's format once, at `Renderer::new`, and that same pipeline
+    /// draws this.
+    pub view: &'a wgpu::TextureView,
+    /// The mirror's size in texels and the scale to draw at, from
+    /// [`mirror_size_for`].
+    pub size_in_pixels: [u32; 2],
+    /// See [`mirror_size_for`].
+    pub pixels_per_point: f32,
+    /// The rects, in points, whose primitives are copied. Everything outside
+    /// them is left transparent, which the shader reads as "no ground here".
+    pub source_rects: &'a [egui::Rect],
+}
+
 /// An egui pass that has been ended, tessellated and uploaded.
 ///
 /// Holding one is proof that [`EguiRenderer::end_pass_and_upload`] already ran,
@@ -130,6 +187,24 @@ impl PreparedFrame {
         let callbacks = std::mem::take(&mut self.user_command_buffers);
         queue.submit(submission_order(callbacks, encoder.finish()));
     }
+}
+
+/// A primitive's clip rect, narrowed to whichever source pane it belongs to.
+///
+/// `Rect::ZERO` for a primitive that belongs to none of them — a zero-size
+/// scissor, which `egui_wgpu::Renderer::render` skips while still advancing its
+/// buffer iterators. That is the whole filtering mechanism; see
+/// [`EguiRenderer::render_mirror`].
+///
+/// First match rather than the union, and that is not a shortcut: egui clips a
+/// pane's contents to the pane, so a primitive can only be inside one source
+/// rect. A primitive that straddles two would be chrome drawn over the panes,
+/// which the mirror wants excluded from at least one of them anyway.
+fn clamp_to_sources(clip: egui::Rect, sources: &[egui::Rect]) -> egui::Rect {
+    sources
+        .iter()
+        .find(|source| source.intersects(clip))
+        .map_or(egui::Rect::ZERO, |source| clip.intersect(*source))
 }
 
 impl EguiRenderer {
@@ -262,6 +337,7 @@ impl EguiRenderer {
         encoder: &mut CommandEncoder,
         window: &Window,
         size_in_pixels: [u32; 2],
+        mirror: Option<MirrorRequest<'_>>,
     ) -> PreparedFrame {
         let full_output = self.state.egui_ctx().end_pass();
 
@@ -288,7 +364,7 @@ impl EguiRenderer {
         };
 
         // Always render - the change detection was causing panels to blink
-        let tris = self
+        let mut tris = self
             .state
             .egui_ctx()
             .tessellate(full_output.shapes, pixels_per_point);
@@ -296,6 +372,11 @@ impl EguiRenderer {
         for (id, image_delta) in &full_output.textures_delta.set {
             self.renderer
                 .update_texture(device, queue, *id, image_delta);
+        }
+        // Before the `update_buffers` below, not after, and that ordering is
+        // the whole design — see `render_mirror`.
+        if let Some(request) = mirror {
+            self.render_mirror(device, queue, &mut tris, &request);
         }
         // `update_buffers` also dispatches every paint callback's `prepare` and
         // `finish_prepare`, and returns the command buffers they produced. The
@@ -312,6 +393,119 @@ impl EguiRenderer {
             textures_to_free: full_output.textures_delta.free,
             user_command_buffers,
             repaint_delay,
+        }
+    }
+
+    /// Draw the source panes' own geometry into the mirror, and get it onto the
+    /// GPU before anything samples it.
+    ///
+    /// # The ordering, which is the entire difficulty
+    ///
+    /// `egui_wgpu::Renderer::update_buffers` does two jobs in one call: it
+    /// stages the frame's index and vertex buffers, and *then* dispatches every
+    /// paint callback's `prepare` (`egui-wgpu-0.35.0/src/renderer.rs:1049-1074`).
+    /// The volume raymarch is encoded in one of those `prepare`s, and it samples
+    /// the mirror — so the mirror has to be finished before `prepare` runs,
+    /// while the geometry the mirror draws is staged by the very call that runs
+    /// it. Hence two calls with a submit between them:
+    ///
+    /// ```text
+    /// update_buffers(filtered, scratch encoder) -> mirror pass -> queue.submit
+    ///     -> update_buffers(whole frame, main encoder) -> draw
+    /// ```
+    ///
+    /// **That submit is load-bearing.** `queue.write_buffer`/`write_buffer_with`
+    /// data lands at the *next* submit, so without one here the second
+    /// `update_buffers` would overwrite the staging belt before the mirror pass
+    /// ever ran, and the mirror would draw the wrong meshes through
+    /// correct-looking geometry — a plausible picture, no validation error.
+    ///
+    /// # How the frame is filtered without rebuilding it
+    ///
+    /// `render` advances the index and vertex slice iterators even when it skips
+    /// a zero-size scissor (`renderer.rs:516-527`), so a primitive is dropped by
+    /// **clamping its `clip_rect`** rather than by removing it. No mesh is
+    /// cloned and no list is rebuilt; the clip rects are 16 bytes each and are
+    /// put back before the real `update_buffers` sees them.
+    ///
+    /// Callbacks are swapped for empty meshes over the same window. `render`
+    /// already ignores `Primitive::Callback` — which is what stops the volume
+    /// callback recursing into the mirror — but `update_buffers` does *not*: it
+    /// would run every `prepare` a second time, and the raymarch is the most
+    /// expensive thing in the frame. An empty mesh occupies the same one slot in
+    /// the slice iterators that a real one would, so the sequence `render` walks
+    /// stays in step.
+    fn render_mirror(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        tris: &mut [egui::ClippedPrimitive],
+        request: &MirrorRequest<'_>,
+    ) {
+        use egui::epaint::Primitive;
+
+        // Everything the window below changes, to be put back after it.
+        let saved: Vec<(egui::Rect, Option<Primitive>)> = tris
+            .iter_mut()
+            .map(|primitive| {
+                let clip = primitive.clip_rect;
+                primitive.clip_rect = clamp_to_sources(clip, request.source_rects);
+                let swapped = matches!(primitive.primitive, Primitive::Callback(_)).then(|| {
+                    std::mem::replace(
+                        &mut primitive.primitive,
+                        Primitive::Mesh(egui::epaint::Mesh::default()),
+                    )
+                });
+                (clip, swapped)
+            })
+            .collect();
+
+        let descriptor = ScreenDescriptor {
+            size_in_pixels: request.size_in_pixels,
+            pixels_per_point: request.pixels_per_point,
+        };
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("egui pane mirror"),
+        });
+        // Empty in practice — every callback was swapped out above — but
+        // carried to the submit rather than dropped, because dropping a
+        // callback's command buffers is a silent no-render and this code has
+        // made that mistake before (see `PreparedFrame::user_command_buffers`).
+        let user_command_buffers =
+            self.renderer
+                .update_buffers(device, queue, &mut encoder, tris, &descriptor);
+
+        {
+            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: request.view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        // Transparent, not black: the shader reads zero alpha
+                        // as "the source pane is not showing this ground",
+                        // and a black clear would carpet the floor instead.
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                label: Some("egui pane mirror pass"),
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            self.renderer
+                .render(&mut pass.forget_lifetime(), tris, &descriptor);
+        }
+
+        queue.submit(submission_order(user_command_buffers, encoder.finish()));
+
+        for (primitive, (clip, swapped)) in tris.iter_mut().zip(saved) {
+            primitive.clip_rect = clip;
+            if let Some(original) = swapped {
+                primitive.primitive = original;
+            }
         }
     }
 

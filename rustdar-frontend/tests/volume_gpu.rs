@@ -54,7 +54,8 @@ use egui_wgpu::wgpu;
 use rustdar_frontend::constants::VOLUME_LUT_BYTES;
 use rustdar_frontend::egui_renderer::AttachmentConfig;
 use rustdar_frontend::volume::raymarch::{
-    ENTRY_FS_BLIT_GAMMA, ENTRY_FS_BLIT_LINEAR, OffscreenTarget, VolumePipelines,
+    ENTRY_FS_BLIT_GAMMA, ENTRY_FS_BLIT_LINEAR, FLOOR_FORMAT, OffscreenTarget, PaneMirror,
+    VolumePipelines, mirror_is_gamma_encoded,
 };
 use rustdar_frontend::volume::uniform::{ISO_OFF, VolumeUniform};
 
@@ -318,7 +319,139 @@ fn raymarch_once(
     read_back(device, queue, target.texture(), size)
 }
 
-/// [`raymarch_once`], with a floor bound at group 1.
+/// The texel format every mirror below is created in.
+///
+/// [`FLOOR_FORMAT`] is what production's own placeholder mirror uses, and being
+/// `Rgba8Unorm` it takes the bytes `write_mirror` is handed in the order they
+/// were written. That is worth stating rather than assuming: these tests build
+/// their *pipelines* for a `Bgra8Unorm` swapchain, and a mirror in that format
+/// would read the very same fixture bytes as BGRA and turn every red patch
+/// below blue, with no validation error anywhere to say so.
+const MIRROR_FORMAT: wgpu::TextureFormat = FLOOR_FORMAT;
+
+/// The box side that spans exactly one degree of latitude, in kilometres —
+/// `KM_PER_DEGREE_LAT`, as `volume.wgsl` and `ImageBounds` both spell it.
+const DEGREE_BOX_KM: f32 = 111.32;
+
+/// Web Mercator's y at a latitude in degrees: `ln(tan(pi/4 + phi/2))`.
+///
+/// The projection's own definition, and line for line what the shader's
+/// `mercator_y` evaluates. Restated here rather than tabulated as a magic
+/// number so [`equatorial_floor_lanes`] is derived from the same closed form
+/// the thing under test uses — a constant copied out of a calculator would
+/// keep agreeing with a shader that had changed.
+fn mercator_y(lat_deg: f64) -> f64 {
+    (std::f64::consts::FRAC_PI_4 + lat_deg.to_radians() / 2.0)
+        .tan()
+        .ln()
+}
+
+/// The uniform's two floor lanes for a `DEGREE_BOX_KM`-square box whose site is
+/// at its centre **on the equator**, arranged so the box's footprint covers
+/// exactly the whole mirror with the mirror's row 0 along the box's north edge.
+///
+/// # Why this is arranged rather than assumed
+///
+/// The mirror is a Web Mercator picture of the whole frame, not a picture of
+/// the box, so `floor_colour` reprojects into it per pixel — out to geography
+/// in kilometres east and north of the site, and back through longitude and
+/// Mercator y, taking `cos φ` at *this pixel's* latitude. There is no longer
+/// any `(hit.x, 1 - hit.y)` texture lookup for a fixture to lean on. The
+/// orientation and registration cases below still want that simple
+/// correspondence to hold, so it is *established by the lanes* instead of
+/// assumed by the shader: on the equator `cos φ` is 1 and Mercator y is very
+/// nearly linear in latitude, and a box one degree on a side then maps onto the
+/// unit square of the mirror to within a rounding error. What those tests
+/// assert therefore becomes a check on the reprojection rather than on a
+/// texture lookup, which is strictly more than the old fixtures could say.
+///
+/// # The residual, and why it is legitimate rather than a fudge
+///
+/// `cos φ` runs from 1 at the site to 0.999962 at ±0.5°, so `u` departs from
+/// `hit.x` by at most 1.9e-5 — 1.5e-4 of a texel on an eight-texel mirror and
+/// 1.2e-3 of a texel on a sixty-four-texel one. Mercator's y is odd and cubic
+/// in latitude about the equator, so `v` departs from `1 - hit.y` by at most
+/// 2.4e-6, an order of magnitude smaller again. Both are far under the
+/// sub-texel wobble the floor's `Linear` sampler already has, and neither can
+/// move a centroid by a hundredth of the pixel bounds asserted below. The
+/// trapezoid the shader exists to correct is real on the shipped 460 km box at
+/// 41.7°N — 8.5 texels of 512 — and is deliberately absent here.
+///
+/// Returns `(floor_uv, floor_geo)`. `gamma_encoded` is the mirror's own
+/// [`PaneMirror::is_gamma_encoded`], which is what the shader is being told
+/// about the texels it is sampling.
+fn equatorial_floor_lanes(gamma_encoded: bool) -> ([f32; 4], [f32; 4]) {
+    // v grows downward through the mirror and Mercator y grows north, so the
+    // rate is negative; its magnitude is one whole mirror over the Mercator
+    // span of the box's one degree of latitude. Derived from `mercator_y`
+    // rather than written down: it comes out at -57.29505, and a reader who
+    // wants to know why *that* number should be able to see the two calls it
+    // came from.
+    let v_per_mercator_y = -1.0 / (mercator_y(0.5) - mercator_y(-0.5));
+    (
+        // u at the site, v at the site, u per degree of longitude east, v per
+        // unit of Mercator y. The site is the mirror's centre, and one degree
+        // of longitude — the box's full width at the equator — is one whole
+        // mirror across.
+        [0.5, 0.5, 1.0, v_per_mercator_y as f32],
+        // Site latitude, then the box's west and south edges as kilometres
+        // east and north of it: the site is the box's centre, so both are half
+        // a side to the negative.
+        [
+            0.0,
+            -DEGREE_BOX_KM / 2.0,
+            -DEGREE_BOX_KM / 2.0,
+            if gamma_encoded { 1.0 } else { 0.0 },
+        ],
+    )
+}
+
+/// The box extent [`equatorial_floor_lanes`] is written for.
+///
+/// Only the two horizontal axes take part in the reprojection. The vertical is
+/// left at the 10 km these tests always used, so the march's optical depth
+/// through a down- or up-looking camera — which is what every opacity assertion
+/// here turns on — is exactly what it was before the floor grew a projection.
+const fn equatorial_box_km() -> [f32; 3] {
+    [DEGREE_BOX_KM, DEGREE_BOX_KM, 10.0]
+}
+
+/// A mirror of `size` texels holding `rgba`, through the very same
+/// `ensure_mirror` texture and bind group the frame path draws into.
+///
+/// `rgba` is premultiplied, row 0 at the top, in the mirror's own encoding —
+/// which is a change from the floor image this replaced, whose bytes were
+/// straight. Every fixture below is fully opaque, and a fully opaque colour is
+/// the same four bytes premultiplied or straight, so the fixtures read as plain
+/// colours and the distinction costs nothing here. It would not be free for a
+/// translucent one.
+fn planted_mirror(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipelines: &VolumePipelines,
+    size: [u32; 2],
+    rgba: &[u8],
+) -> PaneMirror {
+    let mut mirror = None;
+    assert!(
+        pipelines.ensure_mirror(device, &mut mirror, size, MIRROR_FORMAT),
+        "ensure_mirror declined to create a mirror where there was none",
+    );
+    let mirror = mirror.expect("ensure_mirror reported a creation and left nothing behind");
+    assert_eq!(
+        mirror.size(),
+        size,
+        "the mirror is not the size it was asked for"
+    );
+    assert!(
+        pipelines.write_mirror(queue, &mirror, rgba),
+        "write_mirror refused a fixture of {} bytes for a {size:?} mirror",
+        rgba.len(),
+    );
+    mirror
+}
+
+/// [`raymarch_once`], with a pane mirror bound at group 1 for the floor.
 #[allow(clippy::too_many_arguments)]
 fn raymarch_once_with_floor(
     device: &wgpu::Device,
@@ -329,7 +462,7 @@ fn raymarch_once_with_floor(
     lut: &[u8],
     uniform: &VolumeUniform,
     size: [u32; 2],
-    floor: &rustdar_frontend::volume::raymarch::FloorTexture,
+    floor: &PaneMirror,
 ) -> Vec<[u8; 4]> {
     let volume = pipelines
         .upload_volume(device, queue, cells, indices, lut)
@@ -1128,13 +1261,18 @@ fn opacity_accumulates_per_kilometre_not_per_box_diagonal() {
 ///
 /// Four renders through one down-looking camera, each closing a mutation:
 ///
-/// 1. Floor bound but `map_floor` off: nothing paints. Removing the shader's
+/// 1. A mirror bound but `map_floor` off: nothing paints. Removing the shader's
 ///    `flags.w` gate fails here — and this is the instrument contract, since
 ///    every mask harness renders with a floor-capable pipeline now.
 /// 2. Flag on over an empty grid: the whole footprint is the floor, opaque.
 ///    Deleting the after-march composite fails here.
-/// 3. The floor's orientation: a red-north/blue-south floor renders red at
-///    the top of the image. Dropping the `1 - hit.y` flip renders it blue.
+/// 3. The floor's orientation: a red-north/blue-south mirror renders red at
+///    the top of the image. The floor is no longer *indexed* by the box, so
+///    this is the reprojection's own contract now: it is `floor_uv.w` being
+///    negative — v running down the mirror while Mercator y runs north — that
+///    keeps the map the right way up, and losing that sign renders it blue.
+///    See [`equatorial_floor_lanes`] for why the lanes make this a clean
+///    north-at-row-0 correspondence.
 /// 4. A saturating slab over the west half occludes the floor there and
 ///    leaves it visible to the east: the floor is behind the volume, not
 ///    over it.
@@ -1155,26 +1293,26 @@ fn the_map_floor_stands_under_the_volume_and_only_when_asked() {
     let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Bgra8Unorm));
     pipelines.upload_quad(&queue);
 
-    // Red top half (the box's north), blue bottom half. Opaque.
-    let floor_side = 8usize;
-    let mut floor_rgba = Vec::with_capacity(floor_side * floor_side * 4);
-    for row in 0..floor_side {
-        for _col in 0..floor_side {
-            if row < floor_side / 2 {
-                floor_rgba.extend_from_slice(&[255, 0, 0, 255]);
+    // Red top half of the mirror, blue bottom half. Opaque, so premultiplied
+    // and straight are the same four bytes.
+    let mirror_side = 8usize;
+    let mut mirror_rgba = Vec::with_capacity(mirror_side * mirror_side * 4);
+    for row in 0..mirror_side {
+        for _col in 0..mirror_side {
+            if row < mirror_side / 2 {
+                mirror_rgba.extend_from_slice(&[255, 0, 0, 255]);
             } else {
-                floor_rgba.extend_from_slice(&[0, 0, 255, 255]);
+                mirror_rgba.extend_from_slice(&[0, 0, 255, 255]);
             }
         }
     }
-    let floor = pipelines
-        .upload_floor(
-            &device,
-            &queue,
-            [floor_side as u32, floor_side as u32],
-            &floor_rgba,
-        )
-        .expect("a well-shaped floor uploads");
+    let floor = planted_mirror(
+        &device,
+        &queue,
+        &pipelines,
+        [mirror_side as u32, mirror_side as u32],
+        &mirror_rgba,
+    );
 
     let empty = vec![0u8; (cells[0] * cells[1] * cells[2]) as usize];
     let mut lut = vec![0u8; VOLUME_LUT_BYTES];
@@ -1184,11 +1322,17 @@ fn the_map_floor_stands_under_the_volume_and_only_when_asked() {
 
     // Looking down the z axis: image rows run from the box's north (top) to
     // south, columns west to east.
-    let mut uniform = VolumeUniform::new([10.0, 10.0, 10.0], cells);
+    let mut uniform = VolumeUniform::new(equatorial_box_km(), cells);
     uniform.box_from_clip = box_from_clip_down(2);
     uniform.eye_in_box = eye_outside(2);
     uniform.extinction_per_km = 1000.0;
     uniform.gradient_shading = false;
+    // The footprint over the whole mirror, north edge on row 0 — the
+    // correspondence the assertions below are written in terms of, established
+    // through the reprojection rather than assumed of it.
+    let (floor_uv, floor_geo) = equatorial_floor_lanes(floor.is_gamma_encoded());
+    uniform.floor_uv = floor_uv;
+    uniform.floor_geo = floor_geo;
 
     // 1. Bound but not asked for: the flag is the gate, not the binding.
     let pixels = raymarch_once_with_floor(
@@ -1196,7 +1340,7 @@ fn the_map_floor_stands_under_the_volume_and_only_when_asked() {
     );
     assert!(
         pixels.iter().all(|px| *px == [0, 0, 0, 0]),
-        "a floor bound at group 1 painted with map_floor off; the shader has \
+        "a mirror bound at group 1 painted with map_floor off; the shader has \
          lost its flags.w gate and every mask instrument now stands on ground",
     );
 
@@ -1211,13 +1355,14 @@ fn the_map_floor_stands_under_the_volume_and_only_when_asked() {
     assert_eq!(top[3], 255, "the floor must be opaque ground");
     assert!(
         top[0] > 200 && top[2] < 50,
-        "the box's north edge must show the floor image's row 0 (red), got \
-         {top:?}; a flipped v axis puts the map upside down",
+        "the box's north edge must reproject onto the mirror's row 0 (red), got \
+         {top:?}; a positive floor_uv.w — v running north with Mercator y — \
+         puts the map upside down",
     );
     assert!(
         bottom[2] > 200 && bottom[0] < 50,
-        "the box's south edge must show the floor image's bottom rows (blue), \
-         got {bottom:?}",
+        "the box's south edge must reproject onto the mirror's bottom rows \
+         (blue), got {bottom:?}",
     );
 
     // 4. A saturating slab over the west half: the volume composites over
@@ -1250,13 +1395,19 @@ fn the_map_floor_stands_under_the_volume_and_only_when_asked() {
 /// stands.
 ///
 /// The orientation case above is qualitative — red north, blue south. This is
-/// the quantitative seam: one voxel column and one floor patch are planted at
+/// the quantitative seam: one voxel column and one mirror patch are planted at
 /// the **same box footprint cell**, each is rendered alone through the same
 /// down-looking camera, and their screen centroids must coincide within a
 /// pixel bound. Any offset, flip or scale disagreement between the volume's
-/// texture mapping and the floor's `(hit.x, 1 - hit.y)` sampling moves one
-/// centroid and not the other: dropping the v flip alone moves the floor
-/// patch 36 px here.
+/// texture mapping and the floor's reprojection through `floor_uv`/`floor_geo`
+/// moves one centroid and not the other: flipping the sign of `floor_uv.w`
+/// alone moves the floor patch 36 px here.
+///
+/// The lanes are [`equatorial_floor_lanes`], so the mirror stands exactly over
+/// the box's footprint and the patch can be planted in mirror rows rather than
+/// in latitudes. What that buys is a *registration* instrument that is not also
+/// a projection instrument — the projection's own arithmetic is pinned on the
+/// host, per texel, in `tests/floor_alignment.rs`.
 ///
 /// ```text
 /// cargo test -p rustdar-frontend --test volume_gpu \
@@ -1292,31 +1443,34 @@ fn the_floor_and_the_volume_put_the_same_weather_in_the_same_place() {
         lut[entry * 4..entry * 4 + 4].copy_from_slice(&[0, 255, 0, 255]);
     }
 
-    // A floor patch over the same footprint: floor row 0 is the box's NORTH
-    // edge, so box y in [20/32, 21/32] is floor rows [1 - 21/32, 1 - 20/32).
-    let floor_side = 64usize;
-    let mut floor_rgba = vec![0u8; floor_side * floor_side * 4];
-    for px in floor_rgba.chunks_exact_mut(4) {
+    // A mirror patch over the same footprint. Under the lanes below the box
+    // spans the whole mirror with row 0 along its NORTH edge, so box y in
+    // [20/32, 21/32] is mirror rows [1 - 21/32, 1 - 20/32) — the same
+    // arithmetic as before, now a consequence of the reprojection rather than
+    // of a texture lookup. Opaque black elsewhere so the patch is the only red.
+    let mirror_side = 64usize;
+    let mut mirror_rgba = vec![0u8; mirror_side * mirror_side * 4];
+    for px in mirror_rgba.chunks_exact_mut(4) {
         px[3] = 255;
     }
-    let scale = floor_side as u32 / cells[0];
-    for row in (floor_side as u32 - (row_cell + 1) * scale)..(floor_side as u32 - row_cell * scale)
+    let scale = mirror_side as u32 / cells[0];
+    for row in
+        (mirror_side as u32 - (row_cell + 1) * scale)..(mirror_side as u32 - row_cell * scale)
     {
         for col in (col_cell * scale)..((col_cell + 1) * scale) {
-            let at = ((row * floor_side as u32 + col) * 4) as usize;
-            floor_rgba[at..at + 4].copy_from_slice(&[255, 0, 0, 255]);
+            let at = ((row * mirror_side as u32 + col) * 4) as usize;
+            mirror_rgba[at..at + 4].copy_from_slice(&[255, 0, 0, 255]);
         }
     }
-    let floor = pipelines
-        .upload_floor(
-            &device,
-            &queue,
-            [floor_side as u32, floor_side as u32],
-            &floor_rgba,
-        )
-        .expect("a well-shaped floor uploads");
+    let floor = planted_mirror(
+        &device,
+        &queue,
+        &pipelines,
+        [mirror_side as u32, mirror_side as u32],
+        &mirror_rgba,
+    );
 
-    let mut uniform = VolumeUniform::new([10.0, 10.0, 10.0], cells);
+    let mut uniform = VolumeUniform::new(equatorial_box_km(), cells);
     uniform.box_from_clip = box_from_clip_down(2);
     // Not `eye_outside(2)`: an eye 2.5 box-heights up gives every ray a real
     // lateral slope, and a full-height column smears across the screen by
@@ -1326,6 +1480,9 @@ fn the_floor_and_the_volume_put_the_same_weather_in_the_same_place() {
     uniform.eye_in_box = [0.5, 0.5, 200.0];
     uniform.extinction_per_km = 1000.0;
     uniform.gradient_shading = false;
+    let (floor_uv, floor_geo) = equatorial_floor_lanes(floor.is_gamma_encoded());
+    uniform.floor_uv = floor_uv;
+    uniform.floor_geo = floor_geo;
 
     // Screen centroid of the pixels `select` keeps.
     let centroid = |pixels: &[[u8; 4]], select: &dyn Fn([u8; 4]) -> bool| -> (f64, f64) {
@@ -1412,13 +1569,13 @@ fn the_floor_is_transparent_from_below() {
     let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Bgra8Unorm));
     pipelines.upload_quad(&queue);
 
-    // An opaque red floor: the wall the fade must dissolve.
-    let floor_rgba: Vec<u8> = std::iter::repeat_n([255u8, 0, 0, 255], 64)
+    // An opaque red mirror: the wall the fade must dissolve. Wall to wall, so
+    // this case says nothing about where the reprojection lands and everything
+    // about the coverage it is multiplied by — which is the point.
+    let mirror_rgba: Vec<u8> = std::iter::repeat_n([255u8, 0, 0, 255], 64)
         .flatten()
         .collect();
-    let floor = pipelines
-        .upload_floor(&device, &queue, [8, 8], &floor_rgba)
-        .expect("a well-shaped floor uploads");
+    let floor = planted_mirror(&device, &queue, &pipelines, [8, 8], &mirror_rgba);
 
     // Looking UP the z axis from under the box: the mirror of
     // `box_from_clip_down(2)` — depth 1 unprojects one box beyond the top
@@ -1431,12 +1588,15 @@ fn the_floor_is_transparent_from_below() {
     up[2][2] = 2.5;
     up[3][2] = -0.5;
     up[3][3] = 1.0;
-    let mut uniform = VolumeUniform::new([10.0, 10.0, 10.0], cells);
+    let mut uniform = VolumeUniform::new(equatorial_box_km(), cells);
     uniform.box_from_clip = up;
     uniform.eye_in_box = [0.5, 0.5, -1.0];
     uniform.extinction_per_km = 1000.0;
     uniform.gradient_shading = false;
     uniform.map_floor = true;
+    let (floor_uv, floor_geo) = equatorial_floor_lanes(floor.is_gamma_encoded());
+    uniform.floor_uv = floor_uv;
+    uniform.floor_geo = floor_geo;
 
     // 1. A saturating white slab fills the box's top half.
     let mut slab = vec![0u8; (cells[0] * cells[1] * cells[2]) as usize];
@@ -1474,6 +1634,237 @@ fn the_floor_is_transparent_from_below() {
         [0, 0, 0, 0],
         "an empty box viewed from below must be fully transparent with the \
          floor toggle on",
+    );
+}
+
+/// egui's own sRGB transfer functions, in Rust.
+///
+/// Line for line `volume.wgsl`'s `linear_from_gamma_rgb` and
+/// `gamma_from_linear_rgb`, which are themselves character for character
+/// egui's. Restated rather than approximated with a 2.2 power, because the
+/// expected values in [`the_floor_decodes_the_mirror_only_when_the_flag_says_to`]
+/// are the exact composition of the two and an approximation there would
+/// measure the approximation.
+fn linear_from_gamma(gamma: f64) -> f64 {
+    if gamma < 0.04045 {
+        gamma / 12.92
+    } else {
+        ((gamma + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// The inverse of [`linear_from_gamma`]; see there.
+fn gamma_from_linear(linear: f64) -> f64 {
+    if linear < 0.0031308 {
+        linear * 12.92
+    } else {
+        1.055 * linear.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// The mirror's encoding is a fact the shader has to be *told*, and
+/// `floor_geo.w` is what tells it.
+///
+/// Nothing else in this file can see this. `egui_wgpu` picks its fragment entry
+/// point once, from the **swapchain's** format, and that one pipeline is what
+/// draws the mirror — so whether the mirror holds gamma-encoded or linear texels
+/// depends on a format the volume code never sees, and a wrong guess yields a
+/// floor that is merely a bit too bright or too dark. No validation error, no
+/// crash, nothing to notice in a screenshot: exactly the class of defect that
+/// ships. Two renders of one mid-grey mirror, differing only in the flag:
+///
+/// 1. The flag set to what the mirror actually is — [`MIRROR_FORMAT`] is not
+///    sRGB, so its texels *are* gamma-encoded. The shader decodes them to
+///    linear, the march composites in linear, and the fragment re-encodes on
+///    the way out. Decode then encode is the identity, so the planted byte
+///    comes back unchanged.
+/// 2. The flag cleared — the lie. The gamma value is taken for linear and
+///    encoded a second time, and 128 comes back as 188.
+///
+/// Both colours of the red/blue fixtures above are fixed points of both
+/// transfer functions, which is precisely why every other floor test here is
+/// blind to this and why mid grey is the fixture.
+///
+/// ```text
+/// cargo test -p rustdar-frontend --test volume_gpu \
+///     the_floor_decodes_the_mirror_only_when_the_flag_says_to \
+///     -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
+fn the_floor_decodes_the_mirror_only_when_the_flag_says_to() {
+    let _serialised = gpu_lock();
+    let size = [64u32, 64];
+    let cells = [8u32, 8, 8];
+    let (device, queue) = device();
+    let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Bgra8Unorm));
+    pipelines.upload_quad(&queue);
+
+    // Mid grey, opaque. The alpha matters twice over: `floor_colour`
+    // un-premultiplies before it decodes, so a translucent fixture would be
+    // measuring that division as well, and this test is about one thing.
+    const GREY: u8 = 128;
+    let mirror_rgba: Vec<u8> = std::iter::repeat_n([GREY, GREY, GREY, 255], 64)
+        .flatten()
+        .collect();
+    let floor = planted_mirror(&device, &queue, &pipelines, [8, 8], &mirror_rgba);
+    assert!(
+        mirror_is_gamma_encoded(MIRROR_FORMAT) && floor.is_gamma_encoded(),
+        "this test's fixture assumes a non-sRGB mirror holds gamma-encoded \
+         texels; were MIRROR_FORMAT to become sRGB, the honest arm below would \
+         be the cleared flag and not the set one",
+    );
+
+    // Nothing in the box: the floor is the whole picture, so the byte read back
+    // is the floor's own composite and not a blend with anything.
+    let empty = vec![0u8; (cells[0] * cells[1] * cells[2]) as usize];
+    let lut = vec![0u8; VOLUME_LUT_BYTES];
+
+    let mut uniform = VolumeUniform::new(equatorial_box_km(), cells);
+    uniform.box_from_clip = box_from_clip_down(2);
+    uniform.eye_in_box = eye_outside(2);
+    uniform.gradient_shading = false;
+    uniform.map_floor = true;
+    let (floor_uv, floor_geo) = equatorial_floor_lanes(floor.is_gamma_encoded());
+    uniform.floor_uv = floor_uv;
+    uniform.floor_geo = floor_geo;
+
+    let honest = centre(
+        &raymarch_once_with_floor(
+            &device, &queue, &pipelines, cells, &empty, &lut, &uniform, size, &floor,
+        ),
+        size,
+    );
+    // The lie: the same mirror, the flag alone cleared.
+    uniform.floor_geo[3] = 0.0;
+    let doubly_encoded = centre(
+        &raymarch_once_with_floor(
+            &device, &queue, &pipelines, cells, &empty, &lut, &uniform, size, &floor,
+        ),
+        size,
+    );
+
+    let want_honest = f64::from(GREY);
+    let want_doubly_encoded = gamma_from_linear(f64::from(GREY) / 255.0) * 255.0;
+    // The oracle checked before it is used as one: decode-then-encode must be
+    // the identity, and encoding an already-encoded value must brighten it a
+    // long way. A broken oracle would otherwise pass this test on a broken
+    // shader.
+    assert!(
+        (gamma_from_linear(linear_from_gamma(f64::from(GREY) / 255.0)) * 255.0 - want_honest).abs()
+            < 0.5,
+        "the transfer functions restated here are not inverses of each other",
+    );
+    assert!(
+        want_doubly_encoded > want_honest + 40.0,
+        "mid grey encoded twice must be far brighter than mid grey; the oracle \
+         is wrong, not the shader",
+    );
+
+    for (name, seen, want) in [
+        ("with the flag set", honest, want_honest),
+        ("with the flag cleared", doubly_encoded, want_doubly_encoded),
+    ] {
+        assert_eq!(
+            seen[3], 255,
+            "an opaque mirror under an empty box must composite opaque ground \
+             {name}, got {seen:?}",
+        );
+        for channel in 0..3 {
+            assert!(
+                (f64::from(seen[channel]) - want).abs() <= 2.0,
+                "{name} the floor composited {seen:?}; channel {channel} should \
+                 be {want:.1}. Either floor_geo.w is not reaching the decode, or \
+                 the decode is not egui's",
+            );
+        }
+    }
+    assert!(
+        u16::from(doubly_encoded[0]) > u16::from(honest[0]) + 40,
+        "clearing the gamma flag over a gamma-encoded mirror must brighten the \
+         floor — {honest:?} against {doubly_encoded:?}. A shader that ignores \
+         the lane entirely renders these two identically and every real floor \
+         at the wrong brightness",
+    );
+}
+
+/// A box footprint that runs off the mirror composites nothing there, rather
+/// than smearing the mirror's border texel across the ground.
+///
+/// The mirror covers the **frame**, not the box, so a 3D pane aimed away from
+/// what its source map is showing — or simply reaching past its edge —
+/// reprojects part of its footprint outside 0..1. `floor_colour` returns
+/// transparent for that, and the alternative is not hypothetical: the floor
+/// sampler's address mode is `ClampToEdge`, so deleting the guard does not
+/// produce garbage, it produces the border texel repeated over however much of
+/// the box overran — which reads as real map. That is why the guard is a
+/// `return` and not a clamp, and it is the one thing about the mirror's finite
+/// extent no host test can observe.
+///
+/// One render of a wall-to-wall opaque mirror with `floor_uv.x` pushed a
+/// quarter of a mirror east, so `u` runs 0.25..1.25 across the box and the
+/// eastern quarter of the footprint is off the picture. The west must be
+/// ground and the east must be nothing.
+///
+/// ```text
+/// cargo test -p rustdar-frontend --test volume_gpu \
+///     the_floor_stops_at_the_mirrors_edge_rather_than_smearing_it \
+///     -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
+fn the_floor_stops_at_the_mirrors_edge_rather_than_smearing_it() {
+    let _serialised = gpu_lock();
+    let size = [128u32, 128];
+    let cells = [8u32, 8, 8];
+    let (device, queue) = device();
+    let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Bgra8Unorm));
+    pipelines.upload_quad(&queue);
+
+    // Wall to wall red: every texel of the mirror, its border included, is the
+    // colour a clamp would smear. Nothing in the fixture can make the east side
+    // transparent except the shader refusing to sample at all.
+    let mirror_rgba: Vec<u8> = std::iter::repeat_n([255u8, 0, 0, 255], 64)
+        .flatten()
+        .collect();
+    let floor = planted_mirror(&device, &queue, &pipelines, [8, 8], &mirror_rgba);
+
+    let empty = vec![0u8; (cells[0] * cells[1] * cells[2]) as usize];
+    let lut = vec![0u8; VOLUME_LUT_BYTES];
+
+    let mut uniform = VolumeUniform::new(equatorial_box_km(), cells);
+    uniform.box_from_clip = box_from_clip_down(2);
+    uniform.eye_in_box = eye_outside(2);
+    uniform.gradient_shading = false;
+    uniform.map_floor = true;
+    let (floor_uv, floor_geo) = equatorial_floor_lanes(floor.is_gamma_encoded());
+    uniform.floor_uv = floor_uv;
+    uniform.floor_geo = floor_geo;
+    // The site a quarter of a mirror east of centre. u is then 0.25 + hit.x to
+    // within the residual, so the footprint leaves the mirror at hit.x = 0.75.
+    uniform.floor_uv[0] = 0.75;
+
+    let pixels = raymarch_once_with_floor(
+        &device, &queue, &pipelines, cells, &empty, &lut, &uniform, size, &floor,
+    );
+    // Both samples on the middle row, where v is comfortably inside the mirror:
+    // hit.x = 0.25 (u = 0.5, well on) and hit.x = 0.875 (u = 1.125, well off),
+    // far enough either side of the 0.75 seam that no sampling wobble reaches
+    // them.
+    let row = size[1] / 2;
+    let west = pixels[(row * size[0] + size[0] / 4) as usize];
+    let east = pixels[(row * size[0] + 7 * size[0] / 8) as usize];
+    assert!(
+        west[0] > 200 && west[3] == 255,
+        "the part of the footprint that lands on the mirror must be ground, got \
+         {west:?}; the shifted lanes have moved the whole box off the picture",
+    );
+    assert_eq!(
+        east,
+        [0, 0, 0, 0],
+        "the part of the footprint that runs off the mirror must paint nothing, \
+         got {east:?}; the uv guard has become a clamp and the border texel is \
+         being smeared across ground the source pane is not showing",
     );
 }
 

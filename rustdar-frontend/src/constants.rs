@@ -154,12 +154,19 @@ pub const MOBILE_LOOP_TEXTURE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 pub const DESKTOP_LOOP_TEXTURE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
 /// Ceiling on the compressed tile bytes each basemap/label tile source
-/// retains for the 3D floor's map composite: `TILE_CACHE_ENTRIES` PNGs at a
-/// generous 30 KiB each — ~7.5 MiB per source, four sources at most (light
-/// and dark, base and labels), riding the same LRU slot as each tile's
-/// texture. A budget *statement* rather than an enforcement point — the
-/// bound is the cache's own entry count; this names what that bound now
-/// costs so the next memory audit does not have to rediscover it.
+/// retains beside its textures: `TILE_CACHE_ENTRIES` PNGs at a generous
+/// 30 KiB each — ~7.5 MiB per source, four sources at most (light and dark,
+/// base and labels), riding the same LRU slot as each tile's texture. A
+/// budget *statement* rather than an enforcement point — the bound is the
+/// cache's own entry count; this names what that bound costs so the next
+/// memory audit does not have to rediscover it.
+///
+/// The retention was introduced for the 3D floor's CPU map composite, which
+/// no longer exists: the floor is now the 2D pane's own render, copied (see
+/// [`VOLUME_MIRROR_BYTES_MAX`]), and nothing re-decodes a tile. The bytes and
+/// this figure are kept rather than removed in the same change that removed
+/// their consumer, because `TileSource::raster_bytes_at` is a public seam and
+/// dropping it is a separate decision from replacing the floor.
 pub const TILE_BYTES_BUDGET_PER_SOURCE_BYTES: usize =
     rustdar_egui::tile_source::TILE_CACHE_ENTRIES.get() * 30 * 1024;
 
@@ -378,6 +385,49 @@ pub const VOLUME_OFFSCREEN_BUDGET_BYTES: usize = WASM_VOLUME_OFFSCREEN_BUDGET_BY
 pub const VOLUME_OFFSCREEN_BUDGET_BYTES: usize = MOBILE_VOLUME_OFFSCREEN_BUDGET_BYTES;
 #[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
 pub const VOLUME_OFFSCREEN_BUDGET_BYTES: usize = DESKTOP_VOLUME_OFFSCREEN_BUDGET_BYTES;
+
+/// What the 3D view's map floor costs: **one** frame-sized colour target, for
+/// the whole application, worst case.
+///
+/// The floor is the 2D pane's own render, copied into an offscreen "pane
+/// mirror" that the raymarch samples. That makes its size a property of the
+/// *window*, not of any pane or any volume — and it makes it one texture rather
+/// than one per pane, per floor or per scope, because the mirror covers the
+/// whole frame and two 3D panes sourced from two different maps each find their
+/// ground in it by sampling a different region.
+///
+/// Not a cascade and not a runtime bound. There is nothing to select per target
+/// (a frame is a frame) and nothing to enforce (the size is the window's), so
+/// this is a **budget statement**: what the design costs at its ceiling, named
+/// where the next memory audit will look.
+///
+/// The ceiling is `egui_renderer::MIRROR_MAX_SIDE` squared, four bytes a texel:
+///
+/// | frame            | mirror      | bytes    |
+/// |------------------|-------------|---------:|
+/// | 1920 x 1080      | 1920 x 1080 |  7.9 MiB |
+/// | 2560 x 1440      | 1280 x 720  |  3.5 MiB |
+/// | 3840 x 2160      | 1920 x 1080 |  7.9 MiB |
+/// | 2048 x 2048 (‡)  | 2048 x 2048 | 16.0 MiB |
+///
+/// ‡ the worst case this constant names, and it is a shape rather than a
+/// monitor: the halving that fits the frame under `MIRROR_MAX_SIDE` divides
+/// both axes, so the largest mirror is the largest square that still fits.
+/// A real 4K display costs *half* what a 1440p one at native scale does,
+/// because 3840 exceeds the cap and 2560 does not.
+///
+/// It replaces a per-scope cost rather than adding to a static one: the design
+/// this supersedes composited a 512² RGBA floor for every live `(site, region)`
+/// scope — 1 MiB each, unbounded in principle by anything but the number of
+/// live scopes — plus the compressed tile bytes it re-decoded to build them.
+/// The mirror is larger in the worst case and singular, and it is only
+/// allocated at all once some pane actually asks for a floor.
+///
+/// Stated **independently of current headroom**, deliberately: the voxel
+/// texture's own format is changing under a separate work item, so a figure
+/// expressed as "what is left over" would be wrong by the time it is read.
+pub const VOLUME_MIRROR_BYTES_MAX: usize =
+    (crate::egui_renderer::MIRROR_MAX_SIDE as usize).pow(2) * 4;
 
 /// The playback rates the loop timer is willing to divide by.
 ///

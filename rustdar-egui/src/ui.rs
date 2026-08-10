@@ -491,6 +491,19 @@ pub struct Gui {
     /// Remembered color-scale bar orientation for the map panel (hysteresis, so
     /// a resize near the boundary cannot make the bars hop).
     color_scale_orientation: ColorScaleOrientation,
+    /// Each map pane's Mercator affine and rect, as of the last frame that
+    /// drew it — the registration a 3D pane's map floor is reprojected
+    /// through, and the rects the frontend clips its mirror pass to.
+    ///
+    /// Recorded inside `Map::show`, because that is the only place a
+    /// `walkers::Projector` exists. Kept across frames rather than cleared,
+    /// deliberately: a pane that is momentarily not drawn (a collapsed
+    /// divider, a hidden tab) should leave its 3D pane's floor where it was
+    /// rather than dropping it, and a stale entry costs six words of state.
+    /// Entries whose pane index no longer exists are pruned at the top of the
+    /// pane loop, so a layout that sheds panes cannot leave a 3D pane
+    /// reprojecting through a map that is gone.
+    map_pane_geo: HashMap<usize, crate::volume_view::MapPaneGeo>,
     /// The map panel rect the last frame laid its pane grid out in. Only read
     /// by tests, which need the same rects `render_panes` used.
     #[cfg(test)]
@@ -1464,6 +1477,7 @@ impl Gui {
             active_pane: 0,
             pane_layout: PaneLayout::default(),
             color_scale_orientation: ColorScaleOrientation::default(),
+            map_pane_geo: HashMap::new(),
             #[cfg(test)]
             last_map_panel_rect: egui::Rect::ZERO,
             #[cfg(test)]
@@ -2946,6 +2960,41 @@ impl Gui {
     /// read a blank pane rather than the live one.
     pub fn panes(&self) -> &[PaneState] {
         &self.panes[..self.visible_pane_count()]
+    }
+
+    /// The 2D map panes whose render some 3D pane is standing on this frame,
+    /// as rects in **points**.
+    ///
+    /// This is the mirror pass's guest list. The 3D view's map floor is the
+    /// source pane's own render copied into an offscreen texture, and the copy
+    /// is clipped to exactly these rects — so the sidebar, the top bar, the
+    /// other panes' chrome and the 3D panes themselves never land in it. A box
+    /// whose footprint reaches past its source pane's edge finds nothing
+    /// there, which is correct: that is ground the source pane is not
+    /// currently showing.
+    ///
+    /// Empty means there is nothing to mirror, and the frontend skips the pass
+    /// entirely rather than clearing a texture nobody reads.
+    pub fn mirror_source_rects(&self) -> Vec<egui::Rect> {
+        let mut rects: Vec<egui::Rect> = Vec::new();
+        for pane in self.panes() {
+            let Some(volume) = pane.volume() else {
+                continue;
+            };
+            if volume.hide_floor {
+                continue;
+            }
+            let Some(geo) = volume.source_pane.and_then(|i| self.map_pane_geo.get(&i)) else {
+                continue;
+            };
+            // Two 3D panes sourced from one map ask for one rect. Compared by
+            // value rather than deduped by pane index because the index is not
+            // carried this far and the rect is what the pass actually uses.
+            if !rects.contains(&geo.rect) {
+                rects.push(geo.rect);
+            }
+        }
+        rects
     }
 
     /// How many panes are *remembered*, including the ones the current split is

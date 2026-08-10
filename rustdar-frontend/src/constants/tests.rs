@@ -740,3 +740,51 @@ fn the_grid_dimensions_match_the_shapes_rustdar_radar_names() {
     // two places too.
     assert_eq!(VOLUME_LUT_BYTES, LUT_LEN);
 }
+
+/// The pane mirror's ceiling is the cap squared, four bytes a texel — and the
+/// cap is the one the renderer actually applies.
+///
+/// Two numbers in two crates that have to agree: `MIRROR_MAX_SIDE` is what
+/// `mirror_size_for` halves the frame down to, and `VOLUME_MIRROR_BYTES_MAX` is
+/// what the budget prose claims that costs. Spelling the product here means the
+/// documented figure cannot drift from the enforced cap — which is the failure
+/// mode a budget written as a literal always has.
+///
+/// The lower bound is the real content of the assertion: 16 MiB is a large
+/// single allocation, so a future cap raise has to come past this line rather
+/// than land as a silently bigger texture.
+#[test]
+fn the_pane_mirrors_ceiling_is_the_cap_it_is_actually_halved_to() {
+    let side = crate::egui_renderer::MIRROR_MAX_SIDE as usize;
+    assert_eq!(
+        VOLUME_MIRROR_BYTES_MAX,
+        side * side * 4,
+        "the budget figure is not the cap squared at four bytes a texel",
+    );
+    assert_eq!(
+        VOLUME_MIRROR_BYTES_MAX,
+        16 * 1024 * 1024,
+        "the mirror's worst case moved. It is one allocation for the whole \
+         application, so a change here is a change to the application's \
+         floor-on memory, not to a per-pane cost.",
+    );
+
+    // The halving is the only reduction that leaves egui's geometry alone —
+    // `screen_size_in_points` is `size_in_pixels / pixels_per_point`, so both
+    // must move together. A cap applied to one and not the other would scale
+    // the frame's vertices instead of its sampling rate.
+    let (size, scale) = crate::egui_renderer::mirror_size_for([3840, 2160], 2.0);
+    assert_eq!((size, scale), ([1920, 1080], 1.0), "a 4K frame halves once");
+    let (size, scale) = crate::egui_renderer::mirror_size_for([1920, 1080], 1.5);
+    assert_eq!(
+        (size, scale),
+        ([1920, 1080], 1.5),
+        "a frame already under the cap is mirrored at its own size",
+    );
+    let (size, _) = crate::egui_renderer::mirror_size_for([8192, 8192], 1.0);
+    assert!(
+        size[0].max(size[1]) <= crate::egui_renderer::MIRROR_MAX_SIDE
+            && size[0] * size[1] * 4 <= VOLUME_MIRROR_BYTES_MAX as u32,
+        "a frame far over the cap must halve until it fits, got {size:?}",
+    );
+}

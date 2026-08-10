@@ -45,19 +45,21 @@ fn distinct() -> VolumeUniform {
         map_floor: true,
         iso_threshold: 104.0,
         iso_centre: 304.0,
+        floor_uv: [701.0, 702.0, 703.0, 704.0],
+        floor_geo: [801.0, 802.0, 803.0, 804.0],
     }
 }
 
-/// The block is exactly 160 bytes, and the shader declares the same.
+/// The block is exactly 192 bytes, and the shader declares the same.
 ///
-/// Both halves matter: the Rust side could be 160 while the WGSL grew a
+/// Both halves matter: the Rust side could be 192 while the WGSL grew a
 /// member, and then every lane after the new one is read from the wrong
 /// place with no error at all — a uniform buffer larger than the shader's
 /// block is legal.
 #[test]
-fn the_block_is_a_mat4_and_six_vec4s_on_both_sides() {
-    assert_eq!(VOLUME_UNIFORM_BYTES, 64 + 6 * 16);
-    assert_eq!(OFFSET_FLAGS + 16, VOLUME_UNIFORM_BYTES);
+fn the_block_is_a_mat4_and_eight_vec4s_on_both_sides() {
+    assert_eq!(VOLUME_UNIFORM_BYTES, 64 + 8 * 16);
+    assert_eq!(OFFSET_FLOOR_GEO + 16, VOLUME_UNIFORM_BYTES);
 
     let source = include_str!("../volume.wgsl");
     let declaration = source
@@ -70,7 +72,7 @@ fn the_block_is_a_mat4_and_six_vec4s_on_both_sides() {
     let vec4s = declaration.matches("vec4<f32>").count();
     assert_eq!(
         (mat4s, vec4s),
-        (1, 6),
+        (1, 8),
         "volume.wgsl's uniform block is {mat4s} mat4x4 and {vec4s} vec4, \
              which is {} bytes, not the {VOLUME_UNIFORM_BYTES} this file packs. \
              A block smaller than the buffer is legal, so nothing would report \
@@ -159,8 +161,10 @@ fn every_lane_lands_at_its_std140_offset() {
             OFFSET_LIGHT_DIR_AMBIENT,
             OFFSET_TRANSFER,
             OFFSET_FLAGS,
+            OFFSET_FLOOR_UV,
+            OFFSET_FLOOR_GEO,
         ),
-        (0, 64, 80, 96, 112, 128, 144),
+        (0, 64, 80, 96, 112, 128, 144, 160, 176),
         "the std140 offsets have moved. They are the layout the WGSL's \
              `struct Volume` declares, in its declaration order, and nothing \
              else in this file can tell you they are wrong."
@@ -189,6 +193,8 @@ fn every_lane_lands_at_its_std140_offset() {
         ),
         (OFFSET_TRANSFER, [501.0, 502.0, 503.0, 504.0], "transfer"),
         (OFFSET_FLAGS, [1.0, 601.0, 602.0, 1.0], "flags"),
+        (OFFSET_FLOOR_UV, [701.0, 702.0, 703.0, 704.0], "floor_uv"),
+        (OFFSET_FLOOR_GEO, [801.0, 802.0, 803.0, 804.0], "floor_geo"),
     ] {
         let lane = offset / 4;
         assert_eq!(

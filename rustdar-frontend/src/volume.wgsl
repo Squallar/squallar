@@ -89,6 +89,21 @@ struct Volume {
     //    the instrument default — draws no floor and leaves every mask
     //    exactly as it was.
     flags: vec4<f32>,
+    // Where the box's site sits in the pane mirror and how fast the mirror's
+    // texture coordinates run with geography:
+    //   x, y: (u, v) at the site itself.
+    //   z: u per degree of longitude east.
+    //   w: v per unit of Mercator y.
+    // See `floor_colour` for why the floor is sampled through geography and
+    // not through the box.
+    floor_uv: vec4<f32>,
+    // x: site latitude, degrees.
+    // y, z: the box's west and south edges, km east/north of the site — its
+    //    position, which `box_size_km` does not carry.
+    // w: 1 when the mirror holds gamma-encoded texels, 0 when linear. Set
+    //    from the swapchain's format, because that is what picks egui's
+    //    fragment entry point and hence what lands in the mirror.
+    floor_geo: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> volume: Volume;
@@ -112,13 +127,21 @@ struct Volume {
 @group(0) @binding(3) var lut_texture: texture_2d<f32>;
 @group(0) @binding(4) var lut_sampler: sampler;
 
-// The map floor: the ground the box stands on, as the 2D pane would draw it,
-// registered to the box footprint (u across x, v down from the north edge).
-// In its own group because its lifetime is its own — group 0 is rebuilt per
-// grid upload, the floor per floor render, and a pipeline may bind a
-// placeholder here when no floor is in hand. Straight gamma-encoded RGBA,
-// opaque where there is ground; the march decodes and composites it at the
-// ray's own hit with the bottom plane.
+// The pane mirror: the 2D pane's own render, copied. Not a picture built for
+// the floor — literally the frame's egui geometry for the source pane, drawn
+// a second time into an offscreen target, so every layer the pane has (tiles,
+// the radar raster, outlooks, alerts, storm reports, lightning, METARs, the
+// location dot, labels) is on the floor for free and stays in step with the
+// pane's own options by construction.
+//
+// It is a **Web Mercator** picture covering the whole frame, not the box
+// footprint, so `floor_colour` reprojects into it rather than indexing it
+// directly. In its own group because its lifetime is its own — group 0 is
+// rebuilt per grid upload, the mirror once per frame — and a pipeline may
+// bind a placeholder here when no mirror is in hand.
+//
+// Premultiplied alpha, in whichever encoding `floor_geo.w` names; transparent
+// where the source pane painted nothing.
 @group(1) @binding(0) var floor_texture: texture_2d<f32>;
 @group(1) @binding(1) var floor_sampler: sampler;
 
@@ -634,14 +657,73 @@ fn floor_hit(eye: vec3<f32>, direction: vec3<f32>) -> f32 {
     return t;
 }
 
+// Kilometres per degree of latitude — `ImageBounds`' own constant, which is
+// the convention every other consumer of this mapping already reads with.
+const KM_PER_DEGREE_LAT: f32 = 111.32;
+
+// Web Mercator's y: `ln(tan(pi/4 + phi/2))`, the projection's definition.
+fn mercator_y(lat_rad: f32) -> f32 {
+    return log(tan(0.78539816 + lat_rad * 0.5));
+}
+
 // The floor's colour where the ray lands, linear and straight.
 //
-// v runs down from the box's north edge, which is row 0 of the floor image —
-// the same convention as every raster the 2D pane draws.
+// # Why this reprojects instead of indexing the mirror directly
+//
+// The mirror is Web Mercator; the box is a tangent plane in kilometres east
+// and north of the site. Mapping one onto the other with a scale and a
+// translate is exact at the box's centre and wrong at its corners — 7.6 km
+// across and 3.7 km down on the shipped 460 km box, because the footprint is
+// a trapezoid in longitude and because Mercator's y is not linear in
+// latitude. See `VolumeUniform::floor_uv` for the arithmetic.
+//
+// So the box position is carried out to geography and back into the mirror,
+// per pixel, through the same three lines the CPU compositor evaluated per
+// texel. `cos` is taken at **this pixel's** latitude, not the site's: taking
+// it at the site is precisely what collapses the trapezoid into a rectangle.
+//
+// Returns straight (un-premultiplied) linear RGB with the mirror's own alpha,
+// which is what the two composite arms below expect — they multiply by a
+// coverage of their own, so a premultiplied colour here would count alpha
+// twice.
 fn floor_colour(eye: vec3<f32>, direction: vec3<f32>, t: f32) -> vec4<f32> {
     let hit = eye + direction * t;
-    let sample = textureSampleLevel(floor_texture, floor_sampler, vec2<f32>(hit.x, 1.0 - hit.y), 0.0);
-    return vec4<f32>(linear_from_gamma_rgb(sample.rgb), sample.a);
+
+    let x_km = volume.floor_geo.y + hit.x * volume.box_size_km.x;
+    let y_km = volume.floor_geo.z + hit.y * volume.box_size_km.y;
+
+    let site_lat_deg = volume.floor_geo.x;
+    let lat_deg = site_lat_deg + y_km / KM_PER_DEGREE_LAT;
+    let lat_rad = radians(lat_deg);
+    let cos_lat = cos(lat_rad);
+    if abs(cos_lat) < 1e-6 {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
+    let d_lon_deg = x_km / (KM_PER_DEGREE_LAT * cos_lat);
+    let d_merc = mercator_y(lat_rad) - mercator_y(radians(site_lat_deg));
+
+    let uv = vec2<f32>(
+        volume.floor_uv.x + d_lon_deg * volume.floor_uv.z,
+        volume.floor_uv.y + d_merc * volume.floor_uv.w,
+    );
+    // Off the mirror is not "the edge texel repeated" — it is ground the
+    // source pane is not currently showing, which has no colour to report.
+    // Clamping instead would smear the pane's border across the rest of the
+    // box, which reads as real map.
+    if uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
+
+    let sample = textureSampleLevel(floor_texture, floor_sampler, uv, 0.0);
+    if sample.a <= 0.0 {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
+    // egui premultiplies *after* encoding, so un-premultiply before decoding
+    // and hand back a straight colour. When the swapchain is sRGB the mirror
+    // already holds linear texels and there is nothing to decode.
+    let straight = sample.rgb / sample.a;
+    let linear = select(straight, linear_from_gamma_rgb(straight), volume.floor_geo.w > 0.5);
+    return vec4<f32>(linear, sample.a);
 }
 
 @fragment

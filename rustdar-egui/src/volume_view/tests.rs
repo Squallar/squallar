@@ -336,6 +336,7 @@ fn the_stub_payload_is_the_kind_egui_wgpu_discards_in_silence() {
         camera: OrbitCamera::default(),
         size_px: [800, 600],
         floor: true,
+        source: None,
         alpha: None,
         view_mode: crate::pane::VolumeViewMode::LitVolume,
         iso_threshold: 18.0,
@@ -691,4 +692,69 @@ fn a_pivot_of_one_is_the_top_face_of_the_drawn_box() {
     let camera = OrbitCamera::restore(180.0, 0.0, 2.5, [0.0, 0.0, -1.0], 5.0).expect("finite");
     let in_box = to_box(pivot_km(camera, BOX_KM), exaggerated_box_km(camera, BOX_KM));
     assert!((in_box[2]).abs() < 1e-5, "got {in_box:?}");
+}
+
+/// A [`MapPaneGeo`] reproduces Web Mercator exactly, not near its anchor.
+///
+/// The seam's whole claim is that four numbers replace a `walkers::Projector`
+/// without loss: screen `x` is linear in longitude and screen `y` is linear in
+/// Mercator `y`, so an affine in those two variables is the projection's closed
+/// form rather than a local linearisation. If that were only approximately true,
+/// the 3D floor would register at the box's centre and drift at its corners —
+/// which is the exact failure the reprojection exists to remove, so it must not
+/// be reintroduced one layer up.
+///
+/// The two directions are asserted separately because a sign error in either is
+/// a floor that is mirrored rather than misplaced, and a mirrored floor at a
+/// centred anchor looks almost right.
+#[test]
+fn a_map_pane_affine_is_web_mercator_and_not_a_linearisation() {
+    use crate::volume_view::{MapPaneGeo, mercator_y_of_lat};
+
+    let geo = MapPaneGeo {
+        rect: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(800.0, 600.0)),
+        anchor_lat: 41.7,
+        anchor_lon: -93.7,
+        anchor: egui::pos2(400.0, 300.0),
+        points_per_degree_lon: 250.0,
+        // Negative: Mercator y increases north, screen y increases down.
+        points_per_mercator_y: -14_000.0,
+    };
+
+    assert_eq!(geo.project(41.7, -93.7), geo.anchor, "the anchor is fixed");
+
+    // East is right and north is up, both at the declared rate.
+    let east = geo.project(41.7, -92.7);
+    assert!(
+        (east.x - 650.0).abs() < 1e-3,
+        "a degree east is 250 points right, got {east:?}"
+    );
+    assert!(
+        (east.y - 300.0).abs() < 1e-3,
+        "a pure longitude step must not move y"
+    );
+
+    let north = geo.project(42.7, -93.7);
+    let want_y = 300.0 + (mercator_y_of_lat(42.7) - mercator_y_of_lat(41.7)) * -14_000.0;
+    assert!(
+        (f64::from(north.y) - want_y).abs() < 1e-3,
+        "got {north:?}, want y {want_y}"
+    );
+    assert!(
+        north.y < 300.0,
+        "north must be up the screen, got {north:?}"
+    );
+
+    // The non-linearity itself: a degree north of the anchor and a degree south
+    // of it are NOT the same number of points, because Mercator stretches
+    // poleward. A latitude-linear affine would make these equal, and that is
+    // the 3.7 km error this seam exists to avoid on the shipped 460 km box.
+    let up = 300.0 - north.y;
+    let down = geo.project(40.7, -93.7).y - 300.0;
+    assert!(
+        (up - down).abs() > 1.0,
+        "Mercator's rows are not evenly spaced in latitude, so a degree north \
+         ({up} points) and a degree south ({down} points) of 41.7 must differ. \
+         Equal means the affine has been rewritten in latitude.",
+    );
 }

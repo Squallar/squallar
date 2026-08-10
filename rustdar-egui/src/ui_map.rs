@@ -168,6 +168,13 @@ impl super::Gui {
                 // copies could disagree silently, leaving a dead zone at the
                 // old position and a live one under the widget.
 
+                // A layout that shed panes must not leave a 3D pane
+                // reprojecting its floor through a map pane that no longer
+                // exists — indices are reused, so a stale entry would not read
+                // as absent, it would read as *some other pane's* map. See
+                // `Gui::map_pane_geo`.
+                self.map_pane_geo.retain(|&idx, _| idx < pane_count);
+
                 for pane_idx in 0..pane_count {
                     let pane_rect = self.pane_layout.pane_rect(pane_idx, panel_rect);
                     let is_active = pane_idx == self.active_pane;
@@ -461,6 +468,19 @@ impl super::Gui {
                                             self.track_section_draw(pane_idx, gesture, projector);
                                         }
 
+                                        // The registration for any 3D pane
+                                        // whose region was dragged on this
+                                        // map. Recorded here for the same
+                                        // reason the section anchor above is:
+                                        // this is the only place a projector
+                                        // exists, and the affine it yields is
+                                        // only true of the zoom and centre
+                                        // this frame drew at.
+                                        self.map_pane_geo.insert(
+                                            pane_idx,
+                                            map_pane_geo_from(projector, pane_rect),
+                                        );
+
                                         let mut render_ctx = pane_render::PaneRenderCtx {
                                             pane_idx,
                                             pane: &mut pane,
@@ -579,6 +599,15 @@ impl super::Gui {
                             // is floating chrome over the picture and fades
                             // with the rest of it (§1.8 — the M8 addition).
                             let chrome = self.chrome_fade();
+                            // The map this pane's region was dragged on, as
+                            // that pane last drew itself — the whole of the
+                            // floor's registration. Copied out here rather
+                            // than looked up inside the arm for the same
+                            // borrow reason as the two above.
+                            let source_geo = pane
+                                .volume()
+                                .and_then(|v| v.source_pane)
+                                .and_then(|idx| self.map_pane_geo.get(&idx).copied());
                             let outcome = render_volume_pane(
                                 &mut child_ui,
                                 pane_rect,
@@ -587,6 +616,7 @@ impl super::Gui {
                                 painter.as_deref(),
                                 current_stamp,
                                 chrome,
+                                source_geo,
                                 &mut actions,
                                 &mut self.volume_alpha,
                                 &self.volume_iso,
@@ -1247,6 +1277,7 @@ fn render_volume_pane(
     painter: Option<&dyn crate::volume_view::VolumePainter>,
     current_stamp: Option<crate::ui::CurrentVolumeStamp>,
     chrome: Option<f32>,
+    source_geo: Option<crate::volume_view::MapPaneGeo>,
     actions: &mut Vec<GuiAction>,
     alpha_curves: &mut crate::volume_alpha::AlphaCurves,
     iso_thresholds: &crate::volume_iso::IsoThresholds,
@@ -1259,6 +1290,7 @@ fn render_volume_pane(
         pane,
         painter,
         current_stamp,
+        source_geo,
         actions,
         alpha_curves,
         iso_thresholds,
@@ -1316,6 +1348,7 @@ fn volume_pane_outcome(
     pane: &mut crate::pane::PaneState,
     painter: Option<&dyn crate::volume_view::VolumePainter>,
     current_stamp: Option<crate::ui::CurrentVolumeStamp>,
+    source_geo: Option<crate::volume_view::MapPaneGeo>,
     actions: &mut Vec<GuiAction>,
     alpha_curves: &crate::volume_alpha::AlphaCurves,
     iso_thresholds: &crate::volume_iso::IsoThresholds,
@@ -1517,6 +1550,7 @@ fn volume_pane_outcome(
         camera,
         size_px,
         floor,
+        source: source_geo,
         // The user's Volume Alpha curve for this product, or `None` for an
         // untouched editor — which the painter is obliged to render
         // bit-exactly through the palette's own alpha.
@@ -1720,6 +1754,62 @@ pub(crate) fn render_volume_controls(
 /// place, which reads as a control that half-works. A `source_pane` left behind
 /// is quieter still — the next region dragged on that map would re-aim this pane
 /// instead of opening one where it was dragged.
+/// Reduce a live `walkers::Projector` to the four numbers a 3D pane's map
+/// floor is reprojected through. See [`crate::volume_view::MapPaneGeo`].
+///
+/// # Why finite differences are exact here rather than approximate
+///
+/// Web Mercator's screen `x` is *linear* in longitude and its screen `y` is
+/// *linear* in Mercator `y`. So a secant taken over a whole degree is the
+/// tangent, everywhere on the pane — this is not a local linearisation that
+/// degrades toward the corners, it is the projection's closed form recovered
+/// through two evaluations of the thing that actually draws the map. Asking
+/// the projector rather than restating `256 · 2^zoom / 360` is the point: a
+/// tile size or zoom convention that changes in `walkers` changes both the map
+/// and this affine together, and cannot leave the floor registered to a
+/// convention the map no longer uses.
+///
+/// A whole degree rather than an epsilon deliberately: the projector answers in
+/// `f32`, and a small step would divide two nearly equal `f32`s.
+fn map_pane_geo_from(
+    projector: &walkers::Projector,
+    rect: egui::Rect,
+) -> crate::volume_view::MapPaneGeo {
+    use crate::volume_view::{MapPaneGeo, mercator_y_of_lat};
+
+    let centre = projector.unproject(rect.center().to_vec2());
+    let (anchor_lat, anchor_lon) = (centre.y(), centre.x());
+    let anchor = projector
+        .project(walkers::lat_lon(anchor_lat, anchor_lon))
+        .to_pos2();
+
+    // Stepped *away* from the nearer edge of each range, so neither probe
+    // crosses the antimeridian or leaves Mercator's valid latitude band —
+    // either of which would fold the secant back on itself and yield a scale
+    // that is wrong by a factor of two with no other symptom.
+    let lon_step: f64 = if anchor_lon > 0.0 { -1.0 } else { 1.0 };
+    let lat_step: f64 = if anchor_lat > 0.0 { -1.0 } else { 1.0 };
+
+    let east = projector
+        .project(walkers::lat_lon(anchor_lat, anchor_lon + lon_step))
+        .to_pos2();
+    let north = projector
+        .project(walkers::lat_lon(anchor_lat + lat_step, anchor_lon))
+        .to_pos2();
+
+    let d_merc = mercator_y_of_lat(anchor_lat + lat_step) - mercator_y_of_lat(anchor_lat);
+    MapPaneGeo {
+        rect,
+        anchor_lat,
+        anchor_lon,
+        anchor,
+        points_per_degree_lon: f64::from(east.x - anchor.x) / lon_step,
+        // `d_merc` cannot be zero: `lat_step` is ±1 and `mercator_y_of_lat` is
+        // strictly increasing, so the guard would be dead code.
+        points_per_mercator_y: f64::from(north.y - anchor.y) / d_merc,
+    }
+}
+
 pub(crate) fn reset_volume_view(volume: &mut crate::pane::VolumePane) {
     volume.camera = crate::pane::OrbitCamera::default();
     volume.region = None;

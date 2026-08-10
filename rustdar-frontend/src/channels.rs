@@ -99,23 +99,6 @@ pub struct VoxelResponse {
     pub grid: Option<Box<rustdar_radar::voxel::VoxelGrid>>,
 }
 
-/// A finished map-floor render: the 2D pane's lowest-tilt reflectivity,
-/// already resampled onto a box footprint.
-///
-/// Scoped by `(site, region)` and no pane index, for the same reason
-/// [`VoxelResponse`] carries a target: the store holds floors by scope and
-/// every pane standing on that ground reads the same one. A `None` image is a
-/// render that drew nothing — a volume with no reflectivity — and simply
-/// leaves whatever floor was in hand in hand.
-pub struct FloorResponse {
-    /// The site whose ground this is.
-    pub site: String,
-    /// The footprint it was registered to, `None` for the default box.
-    pub region: Option<rustdar_egui::pane::VolumeRegion>,
-    /// The registered floor, or `None` when nothing rendered.
-    pub image: Option<crate::volume::floor::FloorImage>,
-}
-
 /// Result from a Level III object fetch.
 ///
 /// Names the AWIPS **code** and no product. One poll fetches each code once and
@@ -334,8 +317,6 @@ pub struct ChannelHub {
     pub section_receiver: Receiver<SectionResponse>,
     pub voxel_sender: Sender<VoxelResponse>,
     pub voxel_receiver: Receiver<VoxelResponse>,
-    pub floor_sender: Sender<FloorResponse>,
-    pub floor_receiver: Receiver<FloorResponse>,
     pub level3_sender: Sender<Level3Response>,
     pub level3_receiver: Receiver<Level3Response>,
     pub overlay_fetch_sender: Sender<OverlayFetchResult>,
@@ -370,7 +351,6 @@ impl ChannelHub {
         let (render_sender, render_receiver) = std::sync::mpsc::channel();
         let (section_sender, section_receiver) = std::sync::mpsc::channel();
         let (voxel_sender, voxel_receiver) = std::sync::mpsc::channel();
-        let (floor_sender, floor_receiver) = std::sync::mpsc::channel();
         let (level3_sender, level3_receiver) = std::sync::mpsc::channel();
         let (overlay_fetch_sender, overlay_fetch_receiver) = std::sync::mpsc::channel();
         let (overlay_render_sender, overlay_render_receiver) = std::sync::mpsc::channel();
@@ -391,8 +371,6 @@ impl ChannelHub {
             section_receiver,
             voxel_sender,
             voxel_receiver,
-            floor_sender,
-            floor_receiver,
             level3_sender,
             level3_receiver,
             overlay_fetch_sender,

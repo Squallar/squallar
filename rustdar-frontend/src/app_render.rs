@@ -1299,6 +1299,41 @@ impl super::App {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
+        // The pane mirror: which 2D panes some 3D pane is standing on, and the
+        // target their render is copied into. Empty when nothing wants a floor,
+        // and then the whole pass is skipped rather than clearing a texture
+        // nobody reads.
+        //
+        // The format is the **swapchain's**, deliberately: `egui_wgpu` chose its
+        // fragment entry point from that format once, at `Renderer::new`, and
+        // the same pipeline draws the mirror. A mirror whose sRGB-ness
+        // disagreed would be a floor slightly too dark or too light, with no
+        // validation error to notice it by. `AttachmentConfig` is where that
+        // format is recorded.
+        let mirror_rects = self.gui.mirror_source_rects();
+        let mirror_target = (!mirror_rects.is_empty())
+            .then(|| {
+                let points = state.egui_renderer.context().pixels_per_point();
+                let (size, scale) = crate::egui_renderer::mirror_size_for(size_in_pixels, points);
+                let format = state.egui_renderer.attachment_config().color_format;
+                let device = state.device.clone();
+                state
+                    .egui_renderer
+                    .callback_resources_mut()
+                    .get_mut::<crate::volume::bridge::VolumeResources>()
+                    .map(|resources| (resources.ensure_mirror(&device, size, format), size, scale))
+            })
+            .flatten();
+        let mirror =
+            mirror_target
+                .as_ref()
+                .map(|(view, size, scale)| crate::egui_renderer::MirrorRequest {
+                    view,
+                    size_in_pixels: *size,
+                    pixels_per_point: *scale,
+                    source_rects: &mirror_rects,
+                });
+
         // Finish egui's pass and upload its textures, THEN ask for a surface.
         // The order is enforced by data flow, not by the order of these lines:
         // acquisition takes the finished pass as an argument. See the helper.
@@ -1310,6 +1345,7 @@ impl super::App {
                     &mut encoder,
                     window,
                     size_in_pixels,
+                    mirror,
                 )
             },
             |finished| Self::get_surface_texture(&state.surface, finished),
