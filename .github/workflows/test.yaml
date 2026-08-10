@@ -64,8 +64,33 @@ jobs:
           rustup default stable
           rustup component add llvm-tools-preview
           cargo install cargo-llvm-cov --locked --version ^0.8
+      # `--all-features` is the only reason `rustdar-android`'s tests exist
+      # here. That crate is `#![cfg(any(target_os = "android", feature =
+      # "jni-typecheck"))]`, so without the flag it compiles to an empty lib and
+      # its test binary still runs, still passes, and reports `0 tests` -- a
+      # green row that covered nothing, and green is why nobody looked. Build
+      # and Clippy have been passing `--all-features` for their own reasons the
+      # whole time, so the JNI layer was compiled and linted on every PR and
+      # never once executed. It is worth nine tests today: the permission
+      # tri-state decision table, the provider -> FixQuality mapping and
+      # activity-reachability.
+      #
+      # Cheap here in a way it is not on the cross rows in build.yaml:
+      # `jni-typecheck` is the only feature this actually adds on Linux. The
+      # workspace's other two, rustdar-gps/serial and rustdar-egui/gps-serial,
+      # rustdar-platform already enables unconditionally for
+      # `cfg(not(any(target_os = "android", target_os = "ios")))` -- which is
+      # what the libudev-dev above is for, with or without this flag.
       - name: Run tests
-        run: cargo llvm-cov --no-report
+        run: cargo llvm-cov --no-report --all-features
+      # Deliberately *not* `--all-features` below, and not an inconsistency:
+      # `report` rejects the flag outright ("invalid option '--all-features' for
+      # subcommand 'report'"), as it does `--features` and
+      # `--no-default-features`, even though `report --help` lists all three.
+      # Adding it to match the step above fails this job on the first run. It
+      # needs none of them: it re-reads the .profraw and the object files that
+      # step left in target/llvm-cov-target, so it already reports exactly what
+      # ran -- rustdar-android/src/lib.rs included.
       - name: Generate coverage reports
         if: always()
         run: |
