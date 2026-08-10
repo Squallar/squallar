@@ -12450,3 +12450,250 @@ fn the_release_frame_paints_the_dropped_section_line() {
         "the applied frame painted {after:?}, not the drop at {target_px:?}"
     );
 }
+
+// ── The transport's exact emission table (M10) ───────────────────────
+
+/// **Every transport control emits the exact payload the frontend acts
+/// on.** The M10 "time controls are inert" report taught that "some
+/// action was emitted" is too weak a pin: the break lived past emission,
+/// and the first thing its diagnosis needed was the exact variant and
+/// payload per control per state — so that table is now the contract.
+/// One realistic live fixture, every control clicked, every payload
+/// matched in full: pane index, sign, magnitude, variant selection.
+#[test]
+fn the_transport_controls_emit_the_exact_payloads_the_frontend_acts_on() {
+    use crate::actions::GuiAction;
+
+    /// The frame's navigation-shaped actions, so the assertions cannot be
+    /// satisfied by the overlay fetches that share the vector.
+    fn nav(h: &InputHarness) -> Vec<String> {
+        h.last_actions()
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a,
+                    GuiAction::NavigateTime { .. }
+                        | GuiAction::NavigateOneScan { .. }
+                        | GuiAction::JumpToLive { .. }
+                        | GuiAction::EnableLoop { .. }
+                        | GuiAction::DisableLoop { .. }
+                )
+            })
+            .map(|a| format!("{a}"))
+            .collect()
+    }
+
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.load_scan("KTLX");
+
+    // Live while live: a no-op by design — nothing to jump to.
+    h.mouse_click(h.timeline().live.0.center());
+    assert_eq!(
+        nav(&h),
+        Vec::<String>::new(),
+        "Live while already live must emit nothing"
+    );
+
+    // Back at the default 10-minute step: NavigateTime, exactly -600,
+    // exactly pane 0 — and the pane drops out of live the same frame.
+    h.mouse_click(h.timeline().back.center());
+    assert_eq!(
+        nav(&h),
+        vec!["Navigate time by -600 seconds for pane 0"],
+        "Back must step the active pane one default step into the archive"
+    );
+    assert!(
+        !h.gui_mut().pane(0).expect("pane 0").viewing_live,
+        "Back must park the pane out of live"
+    );
+    h.warm_up();
+
+    // Forward from the archive: the same step, positive.
+    h.mouse_click(h.timeline().fwd.0.center());
+    assert_eq!(
+        nav(&h),
+        vec!["Navigate time by 600 seconds for pane 0"],
+        "Forward must step the active pane one default step toward now"
+    );
+    h.warm_up();
+
+    // Live from the archive: JumpToLive for the active pane.
+    h.mouse_click(h.timeline().live.0.center());
+    assert_eq!(
+        nav(&h),
+        vec!["Jump to live for pane 0"],
+        "Live from the archive must jump exactly the active pane"
+    );
+    h.warm_up();
+
+    // The step picker rules the variant: "1 scan" flips both buttons from
+    // NavigateTime to NavigateOneScan. Picked through the real combo.
+    h.mouse_click(h.timeline().step_dropdown.center());
+    h.frame_after(FRAME_DT);
+    let entry = h
+        .painted_text_rects()
+        .into_iter()
+        .find(|(_, text)| text == "1 scan")
+        .expect("the open step combo lists '1 scan'");
+    h.mouse_click(entry.0.center());
+    assert_eq!(
+        h.gui_mut().pane(0).expect("pane 0").time_step_secs,
+        0,
+        "picking '1 scan' must write the active pane's step"
+    );
+    h.warm_up();
+    h.mouse_click(h.timeline().back.center());
+    assert_eq!(
+        nav(&h),
+        vec!["Navigate one scan (forward=false) for pane 0"],
+        "Back at '1 scan' must ask for the adjacent scan, not a time step"
+    );
+    h.warm_up();
+    h.mouse_click(h.timeline().fwd.0.center());
+    assert_eq!(
+        nav(&h),
+        vec!["Navigate one scan (forward=true) for pane 0"],
+        "Forward at '1 scan' must ask for the adjacent scan"
+    );
+    h.warm_up();
+
+    // The loop toggle: EnableLoop with the shared lookback, single pane
+    // meaning a single target.
+    h.mouse_click(h.timeline().loop_toggle.0.center());
+    assert_eq!(
+        nav(&h),
+        vec!["Enable loop for pane 0 (3600s lookback)"],
+        "the loop toggle must enable with the shared lookback"
+    );
+    // And with the loop running, the same toggle disables it — staged the
+    // way the frontend stages it, through the pane's own loop state.
+    let site = rustdar_radar::sites::get_radar_site("KTLX").expect("known site");
+    h.gui_mut().pane_mut(0).expect("pane 0").loop_state =
+        crate::pane::LoopPlaybackState::new_for_loop(3600, site);
+    h.warm_up();
+    let (rect, on) = h.timeline().loop_toggle;
+    assert!(on, "precondition: the probe reports the loop as on");
+    h.mouse_click(rect.center());
+    assert_eq!(
+        nav(&h),
+        vec!["Disable loop for pane 0"],
+        "the on toggle must disable the loop"
+    );
+}
+
+/// **The scrubber's release payload names the released moment** — not
+/// merely "some NavigateTime". The step is relative to the pane's scan
+/// time because that is what `handle_navigate_time` adds it to; this
+/// derives the expected step from the same inputs (scan time, lookback,
+/// released fraction) and holds the emission to it within the tolerance
+/// a 500-something-point rail quantises to.
+#[test]
+fn the_scrubbers_release_payload_names_the_released_moment() {
+    use crate::actions::GuiAction;
+
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.load_scan("KTLX");
+
+    let scrub = h.timeline().scrubber;
+    let frac = 0.4_f32;
+    let target = egui::pos2(scrub.left() + scrub.width() * frac, scrub.center().y);
+    let scan_time = h
+        .gui_mut()
+        .pane(0)
+        .expect("pane 0")
+        .scan_info
+        .as_ref()
+        .expect("a scan is loaded")
+        .timestamp;
+    let lookback = 3600.0_f32;
+    let expected = |now: chrono::NaiveDateTime, frac: f32| {
+        let target = now - chrono::Duration::seconds((lookback * (1.0 - frac)) as i64);
+        (target - scan_time).num_seconds()
+    };
+
+    let before = chrono::Utc::now().naive_utc();
+    h.mouse_press(scrub.center());
+    h.frame_after(FRAME_DT);
+    h.mouse_move(target);
+    h.frame_after(FRAME_DT);
+    h.mouse_release(target);
+    h.frame_after(0.05);
+    let after = chrono::Utc::now().naive_utc();
+
+    let step = h
+        .last_actions()
+        .iter()
+        .find_map(|a| match a {
+            GuiAction::NavigateTime {
+                pane_idx: 0,
+                step_secs,
+            } => Some(*step_secs),
+            _ => None,
+        })
+        .expect("releasing the scrub mid-rail must emit NavigateTime for pane 0");
+    // The slider quantises the fraction to the rail's pixels; a generous
+    // ±60 s window still rules out every sign error, every off-by-a-
+    // lookback and every absolute-vs-relative confusion.
+    let low = expected(before, frac) - 60;
+    let high = expected(after, frac) + 60;
+    assert!(
+        (low..=high).contains(&step),
+        "the released moment's step was {step}, outside [{low}, {high}] - \
+         the payload does not name the released moment"
+    );
+}
+
+// ── The loop toggle's button treatment (M10, second user test) ───────
+
+/// **The loop toggle is a real button at the bar's interact size, and its
+/// on-state is painted in the selection colour.** The second user test
+/// called the old form "super small and hard to tap": `Button::selectable`
+/// drops the frame while unselected, which left a bare text-width glyph
+/// between two framed neighbours. Pinned off the glass on both counts —
+/// the interact rect against `Spacing::interact_size`, and the painted
+/// fill against the style's `selection.bg_fill` in the on state (and
+/// against its absence in the off state).
+#[test]
+fn the_loop_toggle_is_a_real_button_with_a_visible_on_state() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.load_scan("KTLX");
+    // Fill assertions read the glass, and egui fades a fresh `Area` in over
+    // the style's animation time — `warm_up` alone never advances the clock,
+    // so the paint would stay opacity-multiplied forever. Real time first.
+    h.frames_for(5, 0.1);
+
+    let interact = h.interact_size();
+    let (rect, on) = h.timeline().loop_toggle;
+    assert!(!on, "precondition: no loop is running");
+    assert!(
+        rect.width() >= interact.x - 0.5 && rect.height() >= interact.y - 0.5,
+        "the loop toggle's interact rect {rect:?} is below the bar's \
+         minimum interact size {interact:?}"
+    );
+
+    let selection = h.selection_bg_fill();
+    assert!(
+        !h.painted_fills_within(rect, 1.0).is_empty(),
+        "the off-state toggle painted no background frame at all - the \
+         frameless selectable-label form is back"
+    );
+    assert!(
+        !h.painted_fills_within(rect, 1.0).contains(&selection),
+        "the off-state toggle is painted in the selection colour"
+    );
+
+    // Turn the loop on the way the frontend does and require the painted
+    // on-state.
+    let site = rustdar_radar::sites::get_radar_site("KTLX").expect("known site");
+    h.gui_mut().pane_mut(0).expect("pane 0").loop_state =
+        crate::pane::LoopPlaybackState::new_for_loop(3600, site);
+    h.frames_for(5, 0.1);
+    let (rect, on) = h.timeline().loop_toggle;
+    assert!(on, "the probe must report the loop as on");
+    assert!(
+        h.painted_fills_within(rect, 1.0).contains(&selection),
+        "the on-state toggle is not painted in the selection colour: \
+         fills {:?}",
+        h.painted_fills_within(rect, 1.0)
+    );
+}

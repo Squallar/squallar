@@ -123,6 +123,10 @@ pub(crate) struct InputHarness {
     /// assert on what was actually *drawn* rather than on an intermediate value
     /// — the only way to pin that a resolved decision reached the renderer.
     last_rects: Vec<egui::Rect>,
+    /// The fill colour each of [`last_rects`](Self::last_rects) was painted
+    /// with, in the same order. Separate so the many rect-only readers keep
+    /// their shape; a styling test zips the two.
+    last_rect_fills: Vec<egui::Color32>,
     /// `RawInput::max_texture_side` — what `egui_winit` is handed from
     /// `device.limits().max_texture_dimension_2d`, and what
     /// `plan_overlay_texture` reads back through `ui.ctx().input(..)`.
@@ -305,6 +309,7 @@ impl InputHarness {
             modifiers: egui::Modifiers::default(),
             screen_rect,
             last_rects: Vec::new(),
+            last_rect_fills: Vec::new(),
             max_texture_side: None,
             last_actions: Vec::new(),
             last_texts: Vec::new(),
@@ -1552,6 +1557,35 @@ impl InputHarness {
         self.warm_up();
     }
 
+    /// The style's minimum interact size, as the running context resolves it
+    /// — the floor the transport's buttons are held to.
+    pub(crate) fn interact_size(&self) -> egui::Vec2 {
+        self.ctx.global_style().spacing.interact_size
+    }
+
+    /// The style's selection background fill — the colour a
+    /// `Button::selected(true)` frames itself with, read from the same
+    /// context the frame was painted from.
+    pub(crate) fn selection_bg_fill(&self) -> egui::Color32 {
+        self.ctx.global_style().visuals.selection.bg_fill
+    }
+
+    /// The fill colours of every rect the last frame painted whose bounds sit
+    /// inside `rect` (with `slack` points of tolerance), in paint order.
+    ///
+    /// This is how a styling claim is proven off the glass rather than off
+    /// the flag that was supposed to produce it: a widget's background frame
+    /// is a filled `Shape::Rect` at (approximately) the widget's own rect,
+    /// and its colour is the style arm the renderer really took.
+    pub(crate) fn painted_fills_within(&self, rect: egui::Rect, slack: f32) -> Vec<egui::Color32> {
+        self.last_rects
+            .iter()
+            .zip(&self.last_rect_fills)
+            .filter(|(r, _)| rect.expand(slack).contains_rect(**r))
+            .map(|(_, fill)| *fill)
+            .collect()
+    }
+
     /// The color-scale legend strips painted inside `pane`, classified by the
     /// axis they were drawn along.
     ///
@@ -2015,14 +2049,14 @@ impl InputHarness {
         self.id_changes
             .extend(id_changes_between(&self.prev_widgets, &widgets));
         self.prev_widgets = widgets;
-        self.last_rects = full_output
+        (self.last_rects, self.last_rect_fills) = full_output
             .shapes
             .iter()
             .filter_map(|clipped| match &clipped.shape {
-                egui::Shape::Rect(rect_shape) => Some(rect_shape.rect),
+                egui::Shape::Rect(rect_shape) => Some((rect_shape.rect, rect_shape.fill)),
                 _ => None,
             })
-            .collect();
+            .unzip();
         self.last_texts = full_output
             .shapes
             .iter()

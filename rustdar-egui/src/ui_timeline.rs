@@ -522,7 +522,9 @@ impl super::Gui {
             text(&button_font, "\u{23f4}") + pad,
             text(&button_font, "\u{23f5}") + pad,
             70.0 + pad, // the step combo's fixed width
-            text(&button_font, "\u{221e}") + pad,
+            // The loop toggle's floor is the bar's interact size, so the
+            // measure must take the max exactly as the button does.
+            (text(&button_font, "\u{221e}") + pad).max(ui.spacing().interact_size.x),
             60.0, // the scrubber's minimum useful rail
             text(&button_font, stamp_text) + pad,
             text(&small_font, age_text),
@@ -659,10 +661,23 @@ impl super::Gui {
         // panel expressed the same rule by omitting the whole block. Read off
         // the real pane, which this renderer can do and the panel could not:
         // no take window is open here.
+        //
+        // A framed `Button` at the bar's minimum interact size, not
+        // `Button::selectable` — that constructor drops the frame while
+        // unselected, which left a bare text-width glyph (~15 pt) between two
+        // framed neighbours: visibly not a button, and the second user test
+        // called it too small to hit. `interact_size` as the floor gives it a
+        // real target on both mouse and touch, and `.selected` keeps the
+        // on-state painted in the style's selection colour.
         let is_map = self.panes[pane_idx].is_map();
         let loop_active = self.panes[pane_idx].loop_state.is_active();
         let loop_toggle = ui
-            .add_enabled(is_map, egui::Button::selectable(loop_active, "\u{221e}"))
+            .add_enabled(
+                is_map,
+                egui::Button::new("\u{221e}")
+                    .selected(loop_active)
+                    .min_size(ui.spacing().interact_size),
+            )
             .on_hover_text("Radar loop");
         #[cfg(test)]
         {

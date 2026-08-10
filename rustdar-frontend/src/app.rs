@@ -1472,7 +1472,34 @@ impl App {
                         // left alone. Once the feed retires `chunks_are_feeding`
                         // goes false and the archive is applied unconditionally,
                         // which is the whole point of the fallback.
+                        //
+                        // Two states outrank the guard, and both are the same
+                        // statement: this response is not a "latest" the feed
+                        // has already beaten, it is a *destination*.
+                        //
+                        // A pending **manual navigation** (Back, Forward, the
+                        // scrubber, an adjacent-scan step — everything that
+                        // sets `manual_nav_pending`) asked for an archive
+                        // moment on purpose. The guard reading that answer as
+                        // "stale" made the whole timeline transport inert on
+                        // any chunk-fed site whose feed had not retired by the
+                        // time the fetch landed — every navigation fetched,
+                        // arrived, and was thrown away here, which is the M10
+                        // "time controls do nothing" report. Auto-poll results
+                        // are exempt from the exemption: they really are
+                        // "latest" claims, whatever else is pending.
+                        //
+                        // And a site with **no live pane** has no live display
+                        // for the guard to protect: whatever asked for this
+                        // volume (the Set Time dialog parks its pane before
+                        // fetching) meant to look at it. This also closes the
+                        // retire race — `drive_chunk_feeds` drops a parked
+                        // site's feed a frame later, and a response draining
+                        // on exactly the click's frame used to catch the feed
+                        // still nominally up.
                         let feed_is_ahead = self.chunks_are_feeding(&site)
+                            && self.any_pane_live_for_site(&site)
+                            && !(self.manual_nav_pending && !scan_resp.is_auto_poll)
                             && fetch::latest_scan_time_for_site(self.gui.panes(), &site)
                                 .is_some_and(|shown| timestamp <= shown);
 

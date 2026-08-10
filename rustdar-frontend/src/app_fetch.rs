@@ -821,6 +821,24 @@ impl super::App {
             return;
         }
 
+        // On a site the chunk feed is serving, live is a *reattachment*, not
+        // a fetch: nothing was cached above precisely because the feed has
+        // been applying its volumes to this site's panes all along, so
+        // flipping the flag is the whole job and the feed's own cadence takes
+        // over from here. The archive fallback below would return the volume
+        // *before* the one being assembled — a walk backwards for the one
+        // click that means "newest" — and its result then races the scan
+        // drain's feed guard, which is how Live read as inert in the M10
+        // transport diagnosis. Gated on the site actually having data on
+        // screen so a feed that has not delivered yet still falls through.
+        if self.chunks_are_feeding(&pane_site)
+            && latest_scan_time_for_site(self.gui.panes(), &pane_site).is_some()
+        {
+            self.gui.clear_loading_site_for_site(&pane_site);
+            self.manual_nav_pending = false;
+            return;
+        }
+
         // No cached scan for this site — fetch latest
         let now = chrono::Local::now().naive_local();
         let mut config = self.gui.get_radar_config().clone();

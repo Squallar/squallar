@@ -673,3 +673,329 @@ fn the_recorded_base_volume_is_published_to_the_pane_that_names_it() {
         "a pure base volume names itself as the base",
     );
 }
+
+// ── Manual navigation outranks the feed guard (M10) ──────────────────
+
+/// A pane on `site` at `shown`, beside [`app_showing`]'s pane 0 — the state
+/// a second linked-off or unlinked pane is in while its sibling navigates.
+fn add_live_pane(app: &mut App, shown: chrono::NaiveDateTime) {
+    let mut two = super::tests::two_pane_app("KTLX", "KTLX");
+    std::mem::swap(&mut app.gui, &mut two.gui);
+    for idx in [0, 1] {
+        let pane = app.gui.pane_mut(idx).unwrap();
+        pane.viewing_live = true;
+        pane.scan_info = Some(rustdar_radar::types::ScanInfo {
+            site: rustdar_radar::sites::RadarSite {
+                name: "KTLX",
+                lat: 35.3,
+                lon: -97.3,
+                elev: None,
+            },
+            timestamp: shown,
+            vcp_number: 212,
+            available_products: Vec::new(),
+            product_elevations: Default::default(),
+            status: String::new(),
+        });
+    }
+    app.render.ensure_pane_count(2);
+}
+
+fn shown_stamp(app: &App) -> chrono::NaiveDateTime {
+    app.gui
+        .pane(0)
+        .unwrap()
+        .scan_info
+        .as_ref()
+        .unwrap()
+        .timestamp
+}
+
+/// The M10 "time controls are inert" root cause, pinned at its site: the
+/// feed guard read a manual navigation's answer as a stale "latest" and
+/// threw it away. Two panes on one site, the second still live so the feed
+/// never retires — Back's archive volume must still land.
+#[test]
+fn a_manual_navigation_outranks_the_feed_guard() {
+    let mut app = app_showing(at(10));
+    add_live_pane(&mut app, at(10));
+    app.chunk_feeds.ensure("KTLX");
+    assert!(app.chunks_are_feeding("KTLX"), "precondition: feed running");
+
+    app.handle_gui_action(
+        rustdar_egui::actions::GuiAction::NavigateTime {
+            pane_idx: 0,
+            step_secs: -600,
+        },
+        None,
+    );
+    assert!(
+        app.manual_nav_pending,
+        "precondition: the navigation marked itself pending"
+    );
+    send_archive(&app, at(0));
+    app.poll_data_channels();
+
+    assert_eq!(
+        shown_stamp(&app),
+        at(0),
+        "the feed guard swallowed a manual navigation's volume - the \
+         transport's Back is inert again"
+    );
+    assert!(
+        !app.manual_nav_pending,
+        "the applied navigation must clear its pending flag"
+    );
+    assert!(
+        app.scan_data.contains_key("KTLX"),
+        "the navigated volume must become the site's displayed scan"
+    );
+}
+
+/// The single-pane race arm of the same break: the response drains on the
+/// very frame the click was processed, before `drive_chunk_feeds` has had
+/// a frame to retire the now-parked site's feed. "No live pane on the
+/// site" must already disarm the guard.
+#[test]
+fn a_navigation_response_on_a_parked_site_applies_even_mid_retire() {
+    let mut app = app_showing(at(10));
+    app.chunk_feeds.ensure("KTLX");
+    assert!(app.chunks_are_feeding("KTLX"), "precondition: feed running");
+
+    app.handle_gui_action(
+        rustdar_egui::actions::GuiAction::NavigateTime {
+            pane_idx: 0,
+            step_secs: -600,
+        },
+        None,
+    );
+    assert!(
+        app.chunks_are_feeding("KTLX"),
+        "precondition: the feed has not yet retired - this is the race"
+    );
+    send_archive(&app, at(0));
+    app.poll_data_channels();
+
+    assert_eq!(
+        shown_stamp(&app),
+        at(0),
+        "a navigation on a parked site lost to a feed with no live viewer \
+         left to protect"
+    );
+}
+
+/// The exemption's own limit: an auto-poll result really is a "latest"
+/// claim, so a pending navigation must not smuggle one past the guard.
+#[test]
+fn an_auto_poll_result_stays_behind_the_guard_even_mid_navigation() {
+    let mut app = app_showing(at(10));
+    app.chunk_feeds.ensure("KTLX");
+    app.manual_nav_pending = true;
+
+    send_auto_poll_archive(&app, at(5));
+    app.poll_data_channels();
+
+    assert_eq!(
+        shown_stamp(&app),
+        at(10),
+        "an auto-poll volume walked a chunk-fed live display backwards \
+         because a navigation happened to be in flight"
+    );
+}
+
+/// Live on a chunk-fed site is a reattachment, not a fetch: the panes
+/// already hold the feed's current volume, and the archive fallback would
+/// return the volume *before* it — a walk backwards for the one click that
+/// means "newest". No fetch generation may be spent on it.
+#[test]
+fn jump_to_live_on_a_serving_feed_reattaches_without_a_fetch() {
+    let mut app = app_showing(at(10));
+    add_live_pane(&mut app, at(10));
+    app.gui.pane_mut(0).unwrap().viewing_live = false;
+    app.chunk_feeds.ensure("KTLX");
+    assert!(app.chunks_are_feeding("KTLX"), "precondition: feed running");
+    let generation = app.render.fetch_generation_for("KTLX");
+
+    app.handle_gui_action(
+        rustdar_egui::actions::GuiAction::JumpToLive { pane_idx: 0 },
+        None,
+    );
+
+    assert!(
+        app.gui.pane(0).unwrap().viewing_live,
+        "Live must reattach the pane to the feed"
+    );
+    assert_eq!(
+        app.render.fetch_generation_for("KTLX"),
+        generation,
+        "Live on a serving feed spent a fetch on data already on screen"
+    );
+    assert!(
+        !app.manual_nav_pending,
+        "a reattachment leaves nothing pending for the scan drain to settle"
+    );
+    assert!(
+        !app.gui.fetching(),
+        "a reattachment must not raise the fetch spinner"
+    );
+}
+
+/// With the site parked and its feed retired, Live still takes the archive
+/// route: cached volume if one was kept, else a real fetch — the
+/// pre-feed behaviour, unchanged.
+#[test]
+fn jump_to_live_with_the_feed_retired_still_fetches() {
+    let mut app = app_showing(at(10));
+    app.gui.pane_mut(0).unwrap().viewing_live = false;
+    assert!(!app.chunks_are_feeding("KTLX"), "precondition: no feed");
+    let generation = app.render.fetch_generation_for("KTLX");
+
+    app.handle_gui_action(
+        rustdar_egui::actions::GuiAction::JumpToLive { pane_idx: 0 },
+        None,
+    );
+
+    assert!(app.gui.pane(0).unwrap().viewing_live);
+    assert_eq!(
+        app.render.fetch_generation_for("KTLX"),
+        generation + 1,
+        "with no feed serving, Live must fetch the latest volume"
+    );
+    assert!(
+        app.manual_nav_pending,
+        "the fetch settles through the drain"
+    );
+}
+
+// ── The transport payloads, applied (M10) ────────────────────────────
+
+/// `NavigateTime`'s payload, acted on: the step is relative to the pane's
+/// own scan time, the pane parks out of live, and a fetch generation is
+/// spent on the target moment.
+#[test]
+fn navigate_time_steps_relative_to_the_panes_scan_and_parks_it() {
+    let mut app = app_showing(at(30));
+    let generation = app.render.fetch_generation_for("KTLX");
+
+    app.handle_gui_action(
+        rustdar_egui::actions::GuiAction::NavigateTime {
+            pane_idx: 0,
+            step_secs: -600,
+        },
+        None,
+    );
+
+    assert!(!app.gui.pane(0).unwrap().viewing_live);
+    assert!(app.gui.fetching());
+    assert!(app.manual_nav_pending);
+    assert_eq!(app.render.fetch_generation_for("KTLX"), generation + 1);
+    // The UI config's timestamp is the fetch target in local time — the
+    // pane's scan time stepped back, not "now minus step".
+    let expected = chrono::TimeZone::from_utc_datetime(&chrono::Local, &at(20)).naive_local();
+    assert_eq!(
+        app.gui.get_radar_config().timestamp,
+        expected,
+        "the fetch target must be the pane's scan time stepped by the payload"
+    );
+}
+
+/// `NavigateOneScan` spends a generation on the adjacent-scan lookup and
+/// marks the navigation pending; a pane with no scan yet is a silent no-op
+/// rather than a fetch for a site with no reference moment.
+#[test]
+fn navigate_one_scan_spends_a_generation_and_marks_pending() {
+    let mut app = app_showing(at(30));
+    let generation = app.render.fetch_generation_for("KTLX");
+
+    app.handle_gui_action(
+        rustdar_egui::actions::GuiAction::NavigateOneScan {
+            pane_idx: 0,
+            forward: false,
+        },
+        None,
+    );
+    assert!(app.manual_nav_pending);
+    assert!(app.gui.fetching());
+    assert_eq!(app.render.fetch_generation_for("KTLX"), generation + 1);
+
+    let mut bare = headless(TestBridge::desktop());
+    let generation = bare.render.fetch_generation_for("KTLX");
+    bare.handle_gui_action(
+        rustdar_egui::actions::GuiAction::NavigateOneScan {
+            pane_idx: 0,
+            forward: true,
+        },
+        None,
+    );
+    assert!(
+        !bare.manual_nav_pending && bare.render.fetch_generation_for("KTLX") == generation,
+        "a pane with no scan info must not spend a fetch on an adjacent-scan \
+         lookup with no reference moment"
+    );
+}
+
+/// The loop transport's per-frame payloads, acted on: toggle drives the
+/// phase state machine, step wraps at both ends, seek clamps to the frame
+/// list. These are the frontend halves of the timeline's row-2 emissions.
+#[test]
+fn the_loop_transport_payloads_drive_the_playback_state() {
+    use rustdar_egui::actions::GuiAction;
+    use rustdar_egui::pane::{LoopFrame, LoopPhase, LoopPlaybackState};
+
+    let mut app = app_showing(at(10));
+    let site = rustdar_radar::sites::get_radar_site("KTLX").unwrap();
+    {
+        let mut state = LoopPlaybackState::new_for_loop(3600, site);
+        state.phase = LoopPhase::Ready;
+        state.frames = (0..3)
+            .map(|i| LoopFrame {
+                timestamp: at(i),
+                texture: None,
+                render_in_flight: false,
+                render_failed: false,
+            })
+            .collect();
+        app.gui.pane_mut(0).unwrap().loop_state = state;
+    }
+    let phase = |app: &App| app.gui.pane(0).unwrap().loop_state.phase;
+    let frame = |app: &App| app.gui.pane(0).unwrap().loop_state.current_frame;
+
+    app.handle_gui_action(GuiAction::ToggleLoopPlayback { pane_idx: 0 }, None);
+    assert_eq!(phase(&app), LoopPhase::Playing, "Ready + toggle = Playing");
+    app.handle_gui_action(GuiAction::ToggleLoopPlayback { pane_idx: 0 }, None);
+    assert_eq!(phase(&app), LoopPhase::Paused, "Playing + toggle = Paused");
+
+    app.handle_gui_action(
+        GuiAction::StepLoopFrame {
+            pane_idx: 0,
+            forward: false,
+        },
+        None,
+    );
+    assert_eq!(frame(&app), 2, "backward from 0 wraps to the last frame");
+    app.handle_gui_action(
+        GuiAction::StepLoopFrame {
+            pane_idx: 0,
+            forward: true,
+        },
+        None,
+    );
+    assert_eq!(frame(&app), 0, "forward from the last frame wraps to 0");
+
+    app.handle_gui_action(
+        GuiAction::SeekLoopFrame {
+            pane_idx: 0,
+            frame_index: 1,
+        },
+        None,
+    );
+    assert_eq!(frame(&app), 1, "seek lands on the asked-for frame");
+    app.handle_gui_action(
+        GuiAction::SeekLoopFrame {
+            pane_idx: 0,
+            frame_index: 99,
+        },
+        None,
+    );
+    assert_eq!(frame(&app), 1, "an out-of-range seek changes nothing");
+}
