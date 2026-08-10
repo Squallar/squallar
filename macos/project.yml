@@ -1,0 +1,56 @@
+# XcodeGen spec for the rustdar macOS app — kept for local Xcode development
+# (`xcodegen generate` opens the app in Xcode). `make -C macos` does NOT use
+# Xcode: it cross-compiles in the rust-cross container (see macos/Makefile) and
+# reads only the bundle metadata below (MARKETING_VERSION,
+# CURRENT_PROJECT_VERSION, PRODUCT_BUNDLE_IDENTIFIER, MACOSX_DEPLOYMENT_TARGET),
+# which is why this file is the single source of that metadata.
+#
+# **Its own file, not a pointer at ios/project.yml.** The Makefiles read these
+# values with `sed -n "s/.*KEY: ...//p" | head -1`, which matches `KEY:` inside
+# a comment as readily as inside a setting — so a shared file would hand macOS
+# whichever line happened to come first, and the iOS one comes first for two of
+# the four keys.
+#
+# Unlike iOS there is no ObjC shell here: winit's AppKit backend calls
+# `NSApplicationMain` itself, so `rustdar-platform`'s own `main` is the
+# executable and the bundle is only metadata around it.
+name: rustdar
+options:
+  bundleIdPrefix: dev.mcswain
+  deploymentTarget:
+    macOS: "11.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    # Must equal `MACOSX_DEPLOYMENT_TARGET` in /.cargo/config.toml, which is
+    # what the *compiler* obeys. macos/Makefile fails the build if the two
+    # disagree, because the failure mode of disagreeing is a
+    # `doesNotRecognizeSelector:` on a user's Mac and nothing at all before
+    # that: `-[CLLocationManager authorizationStatus]` is macOS 11 API and
+    # rustc performs no availability checking.
+    MACOSX_DEPLOYMENT_TARGET: "11.0"
+    ONLY_ACTIVE_ARCH: "NO"
+targets:
+  rustdar:
+    type: application
+    platform: macOS
+    deploymentTarget: "11.0"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.mcswain.rustdar
+        INFOPLIST_FILE: Info.plist
+    dependencies:
+      # CLLocationManager: position. Everything else the binary needs is
+      # linked by cargo already.
+      - sdk: CoreLocation.framework
+schemes:
+  rustdar:
+    build:
+      targets:
+        rustdar: all
+    run:
+      config: Release
+    archive:
+      config: Release

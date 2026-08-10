@@ -1,0 +1,30 @@
+# Apple deployment floors.
+#
+# `-[CLLocationManager authorizationStatus]` (the *instance* property) and
+# `-locationManagerDidChangeAuthorization:` are both
+# `API_AVAILABLE(ios(14.0), macos(11.0))`, and `os_location/apple.rs` calls
+# both. Rust performs **no availability checking whatsoever**, so a build below
+# the floor is not a warning and not an error — it links cleanly and then
+# `doesNotRecognizeSelector:` at runtime, on the user's machine, with nothing
+# having said a word at any earlier stage.
+#
+# `rustc --print deployment-target` in the CI image, measured:
+#
+#   aarch64-apple-darwin    11.0   ok
+#   x86_64-apple-darwin     10.12  BELOW  <- the one this file exists for
+#   aarch64-apple-ios       10.0   BELOW
+#   aarch64-apple-ios-sim   14.0   ok
+#
+# Setting it here rather than in a CI `env:` block for two reasons. Bare
+# `cargo check` and `cargo clippy` rows pick this up, and a developer's local
+# `cargo build` does too — an `env:` in one workflow covers neither. And it
+# cannot desync from `ios/Makefile`: `[env]` does not override a variable that
+# is already set in the environment unless `force = true`, so the Makefile's
+# own `export IPHONEOS_DEPLOYMENT_TARGET=$(IOS_MIN)` still wins during a real
+# `.ipa` build, and `IOS_MIN` stays the single source of that number.
+#
+# `macos/Info.plist`'s `LSMinimumSystemVersion` and `ios/Info.plist`'s
+# `MinimumOSVersion` must agree with these.
+[env]
+MACOSX_DEPLOYMENT_TARGET = "11.0"
+IPHONEOS_DEPLOYMENT_TARGET = "14.0"

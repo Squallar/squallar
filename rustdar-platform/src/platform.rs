@@ -1,10 +1,7 @@
 //! Concrete [`PlatformBridge`] implementations. The trait lives in
 //! `rustdar-frontend`, which must never name a per-OS type.
 
-use rustdar_frontend::platform::{PlatformBridge, RedrawWaker};
-// The iOS bridge has no pollable channels yet; see the note above `IosPlatform`.
-#[cfg(not(target_os = "ios"))]
-use rustdar_frontend::platform::drain_latest;
+use rustdar_frontend::platform::{PlatformBridge, RedrawWaker, drain_latest};
 
 /// System bar insets as `(top, bottom, left, right)`. Aliased because
 /// `clippy::type_complexity` rejects the bare fn pointer in the field below.
@@ -324,20 +321,72 @@ impl DesktopPlatform {
     fn os_location_open_settings(&mut self) {}
 }
 
-/// Every other desktop target. macOS (`CLLocationManager`) lands as its own
-/// piece of work, with its own dependency, its own permission mechanics and
-/// its own packaging — it needs a signed bundle or `locationd` re-prompts on
-/// every rebuild.
+/// macOS: `CLLocationManager`, the same provider iOS reaches through
+/// [`IosPlatform`]. See [`crate::os_location`].
+#[cfg(target_os = "macos")]
+impl DesktopPlatform {
+    /// The provider's cached `CLAuthorizationStatus`, or [`Prompt`] before one
+    /// has been built.
+    ///
+    /// `Prompt` and not `Unavailable` for the un-built case, for the reason the
+    /// Linux arm gives above: `Unavailable` is terminal for the gate, so a
+    /// bridge that answered it on frame one would never ask and never be asked
+    /// again. Building a `CLLocationManager` prompts nobody, so the first
+    /// `request_location` is free to do it.
+    ///
+    /// [`Prompt`]: rustdar_gps::LocationPermission::Prompt
+    fn os_location_permission(&self) -> rustdar_gps::LocationPermission {
+        self.os_location_reader.as_ref().map_or(
+            rustdar_gps::LocationPermission::Prompt,
+            crate::os_location::OsLocationReader::permission,
+        )
+    }
+
+    /// Build the CoreLocation bridge if it is not up yet, then ask.
+    ///
+    /// The waker handed to it is the app's: this is only ever reached from a
+    /// gate step, which is many frames after `set_redraw_waker` replaced the
+    /// placeholder `new()` installed.
+    fn os_location_request(&mut self) -> bool {
+        if self.os_location_reader.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let wake = self.redraw_waker.clone();
+            self.os_location_reader = crate::os_location::OsLocationReader::start(
+                &rustdar_gps::GpsConfig::default(),
+                tx,
+                move || wake.wake(),
+            );
+            // Only keep the receiver if something is going to push into it; an
+            // open one would make `poll_gps_fix` drain a channel forever.
+            self.os_fix_receiver = self.os_location_reader.is_some().then_some(rx);
+        }
+        self.os_location_reader
+            .as_mut()
+            .is_some_and(crate::os_location::OsLocationReader::request)
+    }
+
+    /// `x-apple.systempreferences:` URLs need `NSWorkspace`, which is AppKit
+    /// and not in this crate's graph. The pane's "turn it back on in System
+    /// Settings" wording stands on its own.
+    fn os_location_settings_available(&self) -> bool {
+        false
+    }
+
+    fn os_location_open_settings(&mut self) {}
+}
+
+/// Every other desktop target — wasm32 included.
 ///
-/// `Unavailable` and not `Unknown` in the meantime, and the difference matters.
-/// `Unknown` means "ask again shortly", so the gate would poll a bridge that is
-/// never going to answer and the settings pane would sit on "Checking…" for the
-/// life of the process. `Unavailable` is the truth: this build has no OS
-/// location provider, the pane says so, and nothing spins.
+/// `Unavailable` and not `Unknown`, and the difference matters. `Unknown` means
+/// "ask again shortly", so the gate would poll a bridge that is never going to
+/// answer and the settings pane would sit on "Checking…" for the life of the
+/// process. `Unavailable` is the truth: this build has no OS location provider,
+/// the pane says so, and nothing spins.
 #[cfg(all(
     not(any(target_os = "android", target_os = "ios")),
     not(target_os = "windows"),
-    not(target_os = "linux")
+    not(target_os = "linux"),
+    not(target_os = "macos")
 ))]
 impl DesktopPlatform {
     fn os_location_permission(&self) -> rustdar_gps::LocationPermission {
@@ -756,9 +805,9 @@ impl PlatformBridge for AndroidPlatform {
 
 // ── iOS implementation ──────────────────────────────────────────────────
 //
-// Bare on purpose: GPS, compass and theme are the next unit of work, and they
-// are `None` here so they cannot confound the gate this build exists to prove
-// (that wgpu/Metal and winit's UIKit path work at all).
+// Compass and theme are still the next unit of work and are `None` here. The
+// location service is not: it is the same `os_location` provider the desktop
+// bridge uses, because CoreLocation is the same API on both.
 //
 // There is no insets querier and must not be one: egui-winit already fills
 // `RawInput::safe_area_insets` on iOS. Android's side channel works around a
@@ -772,6 +821,14 @@ pub struct IosPlatform {
     back_handler: Option<fn()>,
     zone_cache_dir: Option<std::path::PathBuf>,
     config_dir: Option<std::path::PathBuf>,
+    /// Receives fixes from CoreLocation. There is no serial reader on iOS, so
+    /// unlike the desktop bridge this is the only source and nothing has to be
+    /// chosen between.
+    os_fix_receiver: Option<std::sync::mpsc::Receiver<rustdar_gps::GpsFix>>,
+    /// See `DesktopPlatform::os_location`; the reasoning is identical, and so
+    /// is the code the two forward to.
+    os_location: Option<crate::os_location::OsLocationReader>,
+    redraw_waker: RedrawWaker,
 }
 
 #[cfg(target_os = "ios")]
@@ -788,6 +845,9 @@ impl IosPlatform {
             back_handler: None,
             zone_cache_dir: Self::sandbox_subdir("Library/Caches/rustdar/zones"),
             config_dir: Self::sandbox_subdir("Library/Application Support/rustdar"),
+            os_fix_receiver: None,
+            os_location: None,
+            redraw_waker: RedrawWaker::new(),
         }
     }
 
@@ -795,6 +855,26 @@ impl IosPlatform {
     /// `NSHomeDirectory` call and therefore no ObjC.
     fn sandbox_subdir(rel: &str) -> Option<std::path::PathBuf> {
         std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(rel))
+    }
+
+    /// Bring up CoreLocation. Same reasoning, same call, as
+    /// [`DesktopPlatform::start_os_location`].
+    ///
+    /// One thing is genuinely different and it is upstream of here: this bridge
+    /// is constructed before `UIApplicationMain` has run, so there is no
+    /// `UIApplication` and no *running* run loop when the provider is built.
+    /// Neither is required to build one — the main thread is still the main
+    /// thread — and the callbacks CoreLocation schedules are delivered once
+    /// UIKit starts spinning the loop a few milliseconds later.
+    fn start_os_location(&mut self) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let wake = self.redraw_waker.clone();
+        self.os_location = crate::os_location::OsLocationReader::start(
+            &rustdar_gps::GpsConfig::default(),
+            tx,
+            move || wake.wake(),
+        );
+        self.os_fix_receiver = self.os_location.is_some().then_some(rx);
     }
 }
 
@@ -804,8 +884,11 @@ impl PlatformBridge for IosPlatform {
         None
     }
 
+    /// One source, so no [`prefer_fix`](crate::os_location::prefer_fix): iOS
+    /// has no serial port to plug a dongle into and the `gps-serial` feature is
+    /// not compiled here at all.
     fn poll_gps_fix(&mut self) -> Option<rustdar_gps::GpsFix> {
-        None
+        self.os_fix_receiver.as_ref().and_then(drain_latest)
     }
 
     fn poll_heading(&mut self) -> Option<f32> {
@@ -866,26 +949,53 @@ impl PlatformBridge for IosPlatform {
         false
     }
 
-    /// `CLLocationManager` is the next unit of work here, alongside GPS,
-    /// compass and theme. `Unavailable` rather than `Unknown` for the reason
-    /// given on the Android arm: `Unknown` asks the gate to keep waiting for an
-    /// answer that is not coming.
-    ///
-    /// iOS is the platform where this is most nearly free — `ios/Info.plist`
-    /// already carries `NSLocationWhenInUseUsageDescription` and the staticlib
-    /// link already passes `-framework CoreLocation` — and it is still its own
-    /// change, because `IosPlatform::new()` runs before `UIApplicationMain`
-    /// and the delegate has to be constructed with a `MainThreadMarker` it
-    /// cannot obtain there.
+    /// See [`IosPlatform::start_os_location`] for why the waker's arrival is
+    /// what brings CoreLocation up.
+    fn set_redraw_waker(&mut self, waker: RedrawWaker) {
+        self.redraw_waker = waker;
+        self.start_os_location();
+    }
+
+    // ── Platform location service ───────────────────────────────────────
+    //
+    // Identical forwarding to `DesktopPlatform`'s, because it is the same
+    // provider: `os_location`'s arm table selects `apple` for both. What
+    // differs between the two platforms lives inside that file.
+
     fn location_permission(&self) -> rustdar_gps::LocationPermission {
-        rustdar_gps::LocationPermission::Unavailable
+        self.os_location.as_ref().map_or(
+            rustdar_gps::LocationPermission::Unavailable,
+            crate::os_location::OsLocationReader::permission,
+        )
     }
 
     fn request_location(&mut self) -> bool {
-        false
+        self.os_location
+            .as_mut()
+            .is_some_and(crate::os_location::OsLocationReader::request)
     }
 
-    fn stop_location(&mut self) {}
+    fn stop_location(&mut self) {
+        if let Some(reader) = self.os_location.as_mut() {
+            reader.stop();
+        }
+    }
+
+    /// Whether CoreLocation was asked to deliver — **not** whether it is
+    /// delivering.
+    ///
+    /// The gap is real and iOS-only: with no `UIBackgroundModes: location` in
+    /// `ios/Info.plist`, the OS stops delivering while the app is backgrounded
+    /// and gives no callback saying so, so this keeps reporting `true` and the
+    /// map keeps the last dot. The settings pane's fix-age line, which is timed
+    /// from arrival, is what tells the user the dot is stale. See the module
+    /// note in `os_location/apple.rs` for why the fix for that is not simply
+    /// setting `allowsBackgroundLocationUpdates`.
+    fn location_active(&self) -> bool {
+        self.os_location
+            .as_ref()
+            .is_some_and(crate::os_location::OsLocationReader::active)
+    }
 }
 
 /// Create the platform-appropriate bridge.

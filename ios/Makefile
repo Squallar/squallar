@@ -54,8 +54,9 @@ build:
 	#
 	# The framework list mirrors ios/project.yml. Nothing here is auto-linked:
 	# a link without `-framework Security` fails on SecTrustEvaluateWithError,
-	# which is rustls-platform-verifier's Apple trust path. CoreLocation is
-	# ahead of its bridge and is the one entry that is currently inert.
+	# which is rustls-platform-verifier's Apple trust path, and one without
+	# `-framework CoreLocation` fails on the CLLocationManager class reference
+	# that rustdar-platform's os_location/apple.rs emits.
 	INCMD="set -e
 	    export RUSTUP_TOOLCHAIN=\"\$${RUST_VERSION:?the rust-cross image must set RUST_VERSION}\"
 	    export IPHONEOS_DEPLOYMENT_TARGET=$(IOS_MIN)

@@ -26,6 +26,15 @@
 mod linux;
 mod unsupported;
 
+/// CoreLocation, for macOS and iOS.
+///
+/// Declared unconditionally, unlike the arm below that selects it: the half of
+/// that file which decides what a `CLAuthorizationStatus` means and which of a
+/// `CLLocation`'s components are sentinels names no Objective-C type at all,
+/// and the `cargo test` that has to run those decisions is a Linux one. The
+/// CoreLocation half carries the same `cfg` this module's Apple arm does.
+mod apple;
+
 // The arm table. Written on `target_os` and never on `unix` or `target_family`,
 // because both of those get it wrong in a way that compiles: Android *is*
 // `unix` and would take the Linux arm despite having a completely different
@@ -77,11 +86,12 @@ use self::windows as provider;
 #[cfg(target_os = "windows")]
 pub use self::windows::LocationService;
 
-/// Phase 5: one `apple.rs` with two `#[cfg]` islands — `CLLocationManager` is
-/// the same on both, but macOS constructs its bridge after `NSApplication`
-/// exists and iOS constructs it before `UIApplicationMain` has run.
+/// One `apple.rs` with two `#[cfg]` islands — `CLLocationManager` is the same
+/// on both, but macOS constructs its bridge after `NSApplication` exists and
+/// may not be running from a bundle at all, while iOS constructs it before
+/// `UIApplicationMain` has run.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-use unsupported as provider;
+use apple as provider;
 
 /// Everything else, wasm32 included.
 #[cfg(not(any(

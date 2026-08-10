@@ -66,10 +66,18 @@
     <!-- Deliberately no UIStatusBarHidden: the status bar and the notch are what
          put a non-zero top value in `RawInput::safe_area_insets`, which is the
          inset path this build exists to exercise. -->
-    <!-- Pre-wired for the CoreLocation bridge. Inert until something calls
-         `requestWhenInUseAuthorization`; iOS kills the app on the first call if
-         this key is missing, so it lives with the rest of the bundle metadata
-         rather than arriving with the code. -->
+    <!-- Read by iOS the moment `os_location/apple.rs` calls
+         `requestWhenInUseAuthorization`, which it does when the user turns
+         Location on. iOS kills the app on that call if this key is missing.
+         The macOS bundle needs `NSLocationUsageDescription` as well — that key
+         is the macOS spelling and this one does not exist there; see
+         macos/Info.plist.
+
+         No `UIBackgroundModes: location` here, deliberately. Without it the OS
+         stops delivering while the app is backgrounded and the map keeps its
+         last dot until the app returns; with it, the app would be asking for a
+         capability it has no use for and would have to justify. See the module
+         note in rustdar-platform/src/os_location/apple.rs. -->
     <key>NSLocationWhenInUseUsageDescription</key>
     <string>Rustdar shows your position and heading on the radar map.</string>
 </dict>

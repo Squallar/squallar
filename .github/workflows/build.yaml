@@ -40,14 +40,25 @@ jobs:
             target: x86_64-unknown-linux-gnu
             cmd: cargo build --workspace --all-targets --all-features --target x86_64-unknown-linux-gnu
             artifact: target/x86_64-unknown-linux-gnu/debug/rustdar-platform
+          # The artifact is a signed .app in a zip, not the bare executable.
+          # Three reasons, and none of them is polish: arm64 macOS refuses to
+          # execute an unsigned Mach-O at all, so the old `macos-aarch64`
+          # artifact was never runnable; `upload-artifact` drops the executable
+          # bit, so an unzipped .app is a folder macOS declines to open; and
+          # CoreLocation will not prompt for an executable with no bundle
+          # identifier, which is every bare binary. See `macos_arch` below.
           - name: macos-aarch64
             target: aarch64-apple-darwin
+            package: macos
+            macos_arch: aarch64
             cmd: cargo build --workspace --all-targets --all-features --target aarch64-apple-darwin
-            artifact: target/aarch64-apple-darwin/debug/rustdar-platform
+            artifact: macos/build/aarch64-apple-darwin/rustdar.app.zip
           - name: macos-x86_64
             target: x86_64-apple-darwin
+            package: macos
+            macos_arch: x86_64
             cmd: cargo build --workspace --all-targets --all-features --target x86_64-apple-darwin
-            artifact: target/x86_64-apple-darwin/debug/rustdar-platform
+            artifact: macos/build/x86_64-apple-darwin/rustdar.app.zip
           # gnullvm, not MSVC: MSVC is the one family the image does not carry.
           - name: windows-x86_64
             target: x86_64-pc-windows-gnullvm
@@ -225,6 +236,68 @@ jobs:
 
       - name: ${{ matrix.name }}
         run: ${{ matrix.cmd }}
+
+      # Neither `curl` nor `zip` is in the image — every layer that installed
+      # curl purged it in the same `RUN` — and `rcodesign` never was. The
+      # signer is pinned by version *and* by digest: a tool fetched over the
+      # wire and then trusted to sign our releases is not a tool, it is a
+      # supply chain.
+      - name: Install packaging tools
+        if: matrix.package == 'macos'
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends curl zip
+          v=0.29.0
+          base=apple-codesign-$v-x86_64-unknown-linux-musl
+          curl -fsSL -o /tmp/rcodesign.tar.gz \
+            "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F$v/$base.tar.gz"
+          echo "dbe85cedd8ee4217b64e9a0e4c2aef92ab8bcaaa41f20bde99781ff02e600002  /tmp/rcodesign.tar.gz" \
+            | sha256sum -c -
+          tar -xzf /tmp/rcodesign.tar.gz -C /tmp
+          install -m 0755 "/tmp/$base/rcodesign" /usr/local/bin/rcodesign
+          rcodesign --version
+
+      # `BIN=` rather than a second build: the row above has already compiled
+      # exactly this binary for exactly this triple.
+      #
+      # ── The secret this needs, which has to be created by hand ──
+      #
+      # `MACOS_SIGNING_P12`          base64 of a .p12 signing certificate
+      # `MACOS_SIGNING_P12_PASSWORD` its password
+      #
+      # Generate them once, on any machine with rcodesign:
+      #
+      #   rcodesign generate-self-signed-certificate \
+      #     --person-name rustdar --validity-days 3650 \
+      #     --p12-file rustdar-signing.p12 --p12-password "$PW"
+      #   base64 -w0 rustdar-signing.p12   # -> MACOS_SIGNING_P12
+      #
+      # **The same certificate must be reused for every run, forever.** macOS
+      # remembers a location grant against the app's *designated requirement*,
+      # which for a certificate-signed app pins the signing leaf. Minting a
+      # fresh keypair per run — the obvious CI-friendly thing to do — produces
+      # a new leaf, hence a new requirement, hence a new app as far as
+      # `locationd` is concerned, and the user is asked for location again on
+      # every single build. That is the exact failure this packaging exists to
+      # prevent, so it must not be automated away. `--validity-days 3650`
+      # rather than the 365 default for the same reason: an expiry is a forced
+      # rotation, and a rotation costs every user one more prompt.
+      #
+      # Until the secret exists, and on every fork pull request (which never
+      # gets secrets), macos/Makefile falls back to an **ad-hoc** signature.
+      # That still launches on arm64 — it is a real signature — but its
+      # designated requirement is the code hash, so it re-prompts on each
+      # rebuild. The Makefile says so in the log; it is a labelled fallback,
+      # not a silent one.
+      - name: Package rustdar.app
+        if: matrix.package == 'macos'
+        env:
+          MACOS_SIGNING_P12: ${{ secrets.MACOS_SIGNING_P12 }}
+          MACOS_SIGNING_P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
+        run: |
+          make -C macos IN_CONTAINER=1 ARCHIVE=1 \
+            ARCH=${{ matrix.macos_arch }} \
+            BIN=target/${{ matrix.target }}/debug/rustdar-platform
 
       - name: Upload native build
         if: matrix.artifact

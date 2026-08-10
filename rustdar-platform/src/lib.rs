@@ -11,16 +11,16 @@
 pub mod config_store;
 /// Test-only. See the module docs for why it lives in this crate.
 pub mod network_security_config;
-/// The OS location providers, behind exactly the `cfg` that selects
-/// [`platform::DesktopPlatform`].
+/// The OS location providers, behind exactly the `cfg` that selects a bridge
+/// with one: [`platform::DesktopPlatform`] or [`platform::IosPlatform`].
 ///
 /// Not unconditional. Android compiles this crate — `rustdar-android` depends
-/// on it under `cfg(target_os = "android")` — but cfgs `DesktopPlatform` out,
-/// so an ungated `os_location` there would be a module nothing references and a
-/// wall of dead-code warnings on the one target whose lint row is hardest to
-/// run. iOS is excluded for the same reason today; the Apple provider lands
-/// with `IosPlatform`'s own arm, not before it.
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+/// on it under `cfg(target_os = "android")` — but cfgs both of those bridges
+/// out and reaches its own location service over JNI from another crate
+/// entirely, so an ungated `os_location` there would be a module nothing
+/// references and a wall of dead-code warnings on the one target whose lint row
+/// is hardest to run.
+#[cfg(not(target_os = "android"))]
 pub mod os_location;
 pub mod platform;
 pub mod run;

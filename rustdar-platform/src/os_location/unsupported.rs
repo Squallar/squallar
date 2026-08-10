@@ -36,9 +36,17 @@ impl OsLocationReader {
     /// Takes the same arguments a real provider needs so that swapping one in
     /// touches only `mod.rs`. The `Sender` is dropped here, which closes the
     /// channel — exactly what the caller's drain expects from a source that
-    /// will never produce. `wake` and `report` are dropped for the same reason:
-    /// a provider that never produces a fix has no frame to ask for and no
-    /// permission change to announce.
+    /// will never produce.
+    ///
+    /// `wake` is the same third argument [`SerialGpsReader::start`] takes and
+    /// exists for the same reason: a provider delivers on a schedule the event
+    /// loop knows nothing about, and the loop parks in `ControlFlow::Wait`, so
+    /// a fix pushed into the channel is invisible until something else happens
+    /// to draw a frame. `report` is how a provider announces a permission
+    /// change nobody polled for. Both are dropped here: a provider that never
+    /// produces a fix has no frame to ask for and no permission to announce.
+    ///
+    /// [`SerialGpsReader::start`]: rustdar_gps::SerialGpsReader::start
     pub fn start(
         _config: &rustdar_gps::GpsConfig,
         _fixes: std::sync::mpsc::Sender<rustdar_gps::GpsFix>,
@@ -47,5 +55,31 @@ impl OsLocationReader {
     ) -> Option<Self> {
         log::debug!("no OS location provider is compiled for this target");
         None
+    }
+
+    // ── The rest of the provider contract ───────────────────────────────
+    //
+    // Unreachable here — `start` never hands anyone a value to call them on —
+    // and present anyway, because they are what keeps `platform.rs` free of
+    // `#[cfg(target_os = ...)]`. A bridge that had to name a target to ask for
+    // a permission would put the arm table in two places, and the second copy
+    // is the one that gets a new OS added to it wrongly.
+
+    /// What the OS says about this app's access to the user's location.
+    pub fn permission(&self) -> rustdar_gps::LocationPermission {
+        rustdar_gps::LocationPermission::Unavailable
+    }
+
+    /// Prompt if the platform needs prompting, and start delivering.
+    pub fn request(&mut self) -> bool {
+        false
+    }
+
+    /// Stop delivering. Never revokes; no platform offers that.
+    pub fn stop(&mut self) {}
+
+    /// Whether fixes are being delivered right now.
+    pub fn active(&self) -> bool {
+        false
     }
 }

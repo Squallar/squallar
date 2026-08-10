@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>$(EXECUTABLE_NAME)</string>
+    <key>CFBundleIdentifier</key>
+    <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>rustdar</string>
+    <key>CFBundleDisplayName</key>
+    <string>Rustdar</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>$(MARKETING_VERSION)</string>
+    <key>CFBundleVersion</key>
+    <string>$(CURRENT_PROJECT_VERSION)</string>
+    <!-- `LSMinimumSystemVersion`, not iOS's `MinimumOSVersion`. Kept equal to
+         MACOSX_DEPLOYMENT_TARGET in /.cargo/config.toml, which is what decides
+         the Mach-O's LC_BUILD_VERSION; macos/Makefile fails if they differ.
+         11.0 is the floor for the instance `-[CLLocationManager
+         authorizationStatus]` this app calls. -->
+    <key>LSMinimumSystemVersion</key>
+    <string>$(MACOSX_DEPLOYMENT_TARGET)</string>
+    <!-- Without this AppKit runs the process in 1x scaled mode on a Retina
+         display: the wgpu surface is created at half resolution and the map is
+         visibly soft. Nothing in the code can compensate for it. -->
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <!-- Both location keys, deliberately.
+
+         `NSLocationWhenInUseUsageDescription` is the iOS key and **does not
+         exist on macOS**; Apple's macOS documentation names
+         `NSLocationUsageDescription` and says authorization requests "fail
+         immediately if the required keys aren't present" — silently, with no
+         error at the call site, because `requestWhenInUseAuthorization`
+         returns `void`. `objc2-core-location` corroborates it, carrying
+         `#[deprecated = "Set the purpose string in Info.plist using key
+         NSLocationUsageDescription"]`.
+
+         Shipping only the iOS key is therefore a bug whose entire symptom is
+         "the dialog never appears". Shipping both costs one string and is
+         correct on every OS version either key has ever been read by. -->
+    <key>NSLocationUsageDescription</key>
+    <string>Rustdar shows your position on the radar map and picks the radar site nearest you.</string>
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>Rustdar shows your position on the radar map and picks the radar site nearest you.</string>
+    <!-- Deliberately absent, and each for a reason:
+
+         * `LSRequiresIPhoneOS`, `UIDeviceFamily`, `UILaunchScreen`,
+           `UIRequiredDeviceCapabilities`, `UISupportedInterfaceOrientations` —
+           iOS keys with no meaning here.
+         * `CFBundleSupportedPlatforms`, `DTPlatformName`, `DTSDKName` — Xcode
+           build provenance. `simctl` rejects an iOS bundle without the first,
+           which is why ios/Info.plist carries it; macOS reads none of them,
+           and writing down an SDK name this build never used would be a
+           fiction that only drifts.
+         * `CFBundleIconFile` — there is no `.icns` in the tree, and inventing
+           one from rustdar-web/icons is its own change. -->
+</dict>
+</plist>

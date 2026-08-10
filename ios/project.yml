@@ -48,7 +48,8 @@ targets:
       - sdk: CoreFoundation.framework
       # rustls-platform-verifier's Apple path (SecTrustEvaluateWithError).
       - sdk: Security.framework
-      # CLLocationManager: position and heading.
+      # CLLocationManager: position, via
+      # rustdar-platform/src/os_location/apple.rs.
       - sdk: CoreLocation.framework
 schemes:
   rustdar:

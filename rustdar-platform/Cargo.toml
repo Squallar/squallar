@@ -59,6 +59,46 @@ windows = { version = "=0.62.2", features = [
     "Foundation",
 ] }
 
+# CoreLocation, for `os_location/apple.rs`. One target block for both Apple
+# platforms because it is one provider.
+#
+# `default-features = false` is not tidiness: the defaults pull 26 `CL*`
+# modules plus `block2`, `dispatch2` and `objc2-contacts`, and the last two are
+# in neither Apple graph today. With the lists below, `objc2-core-location` is
+# the only new *compiled* package in either graph — `objc2` and
+# `objc2-foundation` are already there via `arboard`, `wgpu-hal` and
+# `objc2-ui-kit`.
+#
+# Version-pinned with `=` like every other dependency here. Note for anyone
+# reaching for the `dep-unification` check: `objc2` resolves to two versions
+# workspace-wide (0.5.2 under the older stack, 0.6.4 here), so a bare
+# `cargo tree -i objc2` answers "specification is ambiguous". Spell the version
+# — `objc2@0.6.4` — or check `objc2-core-location@0.3.2`, which is unique.
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+objc2 = { version = "=0.6.4", default-features = false, features = ["std"] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = [
+    "alloc",
+    "NSArray",
+    "NSDate",
+    "NSError",
+    "NSString",
+    "NSBundle",
+    # `NSArray::iter()` is `#[cfg(feature = "NSEnumerator")]`, so without this
+    # the `didUpdateLocations:` delegate method cannot walk its own argument.
+    # The feature is `NSEnumerator = []`: no dependencies, no new package.
+    "NSEnumerator",
+] }
+objc2-core-location = { version = "=0.3.2", default-features = false, features = [
+    "std",
+    "CLLocation",
+    "CLLocationManager",
+    "CLLocationManagerDelegate",
+    # `CLError` is the enum; `kCLErrorDomain` — which is what says an error
+    # code may be read as one — is a separate feature.
+    "CLError",
+    "CLErrorDomain",
+] }
+
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 # Android's theme is a JNI call injected by `rustdar-android`. iOS is excluded
 # because `dark-light` 2.0's iOS arm returns `Mode::Light` unconditionally *and*
