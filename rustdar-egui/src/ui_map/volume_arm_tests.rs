@@ -296,6 +296,54 @@ fn a_product_with_no_vertical_structure_is_refused_by_name() {
     );
 }
 
+/// A product the radar *derives* tilt by tilt is not refused by name — it
+/// is asked for.
+///
+/// The mirror of the test above, and the second of the three UI-facing
+/// gates that admit SRV, NROT and KDP to the vertical views. Until now
+/// none of the three had a test: all could be reverted to
+/// `sampler::samplable` — the exact pre-admission code — with every test
+/// in the workspace green, and every derived pane would refuse by name
+/// with the volume behind it perfectly able to render.
+#[test]
+fn a_derived_product_is_asked_for_rather_than_refused_by_name() {
+    use rustdar_radar::types::RadarProduct;
+    for product in [
+        RadarProduct::StormRelativeVelocity,
+        RadarProduct::NormalizedRotation,
+        RadarProduct::SpecificDifferentialPhase,
+    ] {
+        assert!(
+            rustdar_radar::sampler::samplable(product).is_none(),
+            "precondition: {} has no native moment, so this is about the \
+                 `volume_slot` gate and not about `samplable`",
+            product.name(),
+        );
+        let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
+        // Every pane: `sync_layers` propagates the active pane's product.
+        for pane in h.gui_mut().panes_mut() {
+            pane.selected_product = product;
+        }
+        h.frames_for(2, FRAME_DT);
+
+        let outcome = h.volume_arms()[0].outcome.clone();
+        assert!(
+            !outcome
+                .as_deref()
+                .is_some_and(|o| o.contains("no vertical structure")),
+            "{} is derived tilt by tilt, but the 3D pane refused it: {outcome:?}",
+            product.name(),
+        );
+        assert!(
+            h.last_actions()
+                .iter()
+                .any(|a| matches!(a, GuiAction::PrepareVolume { .. })),
+            "{} never got a grid request, so the pane refused it silently",
+            product.name(),
+        );
+    }
+}
+
 /// The pane asks for its grid until it has one, and stops the moment the
 /// host records that it does.
 ///

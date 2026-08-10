@@ -541,6 +541,44 @@ fn a_dispatch_for_a_pane_that_does_not_exist_refuses_instead_of_panicking() {
     );
 }
 
+/// A product the radar *derives* tilt by tilt gets a cut, not a refusal.
+///
+/// The third of the three UI-facing gates that admit SRV, NROT and KDP to
+/// the vertical views, and the last of them to get a test. All three could
+/// be reverted to `sampler::samplable` — the exact pre-admission code —
+/// with every test in the workspace green, and every derived section pane
+/// would answer `ProductHasNoVerticalStructure` permanently, for a volume
+/// the worker can slice perfectly well. The headline feature of the
+/// products WP had no UI-facing pin at all.
+#[test]
+fn a_section_of_a_derived_product_is_cut_rather_than_refused_by_name() {
+    for product in [
+        RadarProduct::StormRelativeVelocity,
+        RadarProduct::NormalizedRotation,
+        RadarProduct::SpecificDifferentialPhase,
+    ] {
+        assert!(
+            rustdar_radar::sampler::samplable(product).is_none(),
+            "precondition: {} has no native moment, so this is about the \
+                 `volume_slot` gate and not about `samplable`",
+            product.name(),
+        );
+        let mut app = app_with_section(product, velocity_volume(vec![one_cut()]));
+        app.dispatch_section_renders();
+        assert_eq!(
+            state(&app).unavailable,
+            None,
+            "{} is derived tilt by tilt and the section refused it",
+            product.name(),
+        );
+        assert!(
+            state(&app).rendered_for.is_some(),
+            "{} never got a cut dispatched",
+            product.name(),
+        );
+    }
+}
+
 /// Dragging the storm motion vector re-derives the cross-section.
 ///
 /// The reviewer's probe, and it failed on the shipped code with

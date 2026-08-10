@@ -137,6 +137,34 @@ pub(crate) fn editor_ui(
     volume.alpha_editor_open = open;
 }
 
+/// What the editor says when there is no table to draw a curve over.
+///
+/// Two different absences, two different sentences. A product the vertical
+/// views refuse will *never* have a table here, so telling its user to wait
+/// would be the window lying about a permanent state; a product they admit
+/// has one on the way.
+///
+/// The predicate is `derive::volume_slot`, **not** `sampler::samplable`. That
+/// difference is the whole of the derived products' admission to 3D: SRV,
+/// NROT and KDP have no native moment and would be refused by name here on
+/// the narrower predicate, while the volume behind the window rendered them
+/// perfectly well. A function rather than an `if` inside the widget so the
+/// distinction has a test — it did not, and all three gates that carry it
+/// could be reverted to `samplable` with the whole workspace green.
+fn absent_curve_message(product: rustdar_radar::types::RadarProduct) -> String {
+    if rustdar_radar::derive::volume_slot(product).is_none() {
+        format!(
+            "{} does not render in 3D, so there is no volume opacity to edit \
+             \u{2014} pick a moment the radar measures or derives tilt by tilt.",
+            product.name(),
+        )
+    } else {
+        "The volume is still building \u{2014} its palette arrives with it, and \
+         the curve is drawn over that palette."
+            .to_owned()
+    }
+}
+
 /// The window's body: header row, the curve canvas over the palette strip,
 /// and the no-data footnote.
 fn editor_contents(
@@ -159,22 +187,7 @@ fn editor_contents(
     // and stores nothing, which is what keeps it bit-exact.
     let shown = curves.get(product).or_else(|| palette_curve.clone());
     let Some(shown) = shown else {
-        // Two different absences, two different sentences. A product the
-        // vertical views refuse will *never* have a palette here, and telling
-        // its user to wait would be the window lying about a permanent state.
-        if rustdar_radar::derive::volume_slot(product).is_none() {
-            ui.label(format!(
-                "{} does not render in 3D, so there is no volume opacity to \
-                 edit \u{2014} pick a moment the radar measures or derives \
-                 tilt by tilt.",
-                product.name(),
-            ));
-        } else {
-            ui.label(
-                "The volume is still building \u{2014} its palette arrives with it, \
-                 and the curve is drawn over that palette.",
-            );
-        }
+        ui.label(absent_curve_message(product));
         return;
     };
 
@@ -374,6 +387,49 @@ mod tests {
     /// Pinned as text because the label *is* the artifact: the behaviour was
     /// never wrong, only the sentence describing it, and a sentence has no
     /// other test.
+    /// The editor admits the three derived products, and refuses only what
+    /// has no per-tilt field at all.
+    ///
+    /// One of the three UI-facing gates that let SRV, NROT and KDP into the
+    /// vertical views, and until now none of them had a test: all three could
+    /// be reverted to `sampler::samplable` — the exact pre-admission code —
+    /// with every test in the workspace green, leaving every derived pane
+    /// refusing by name. The headline feature of the products WP had no
+    /// UI-facing pin at all.
+    #[test]
+    fn the_editor_admits_the_derived_products_and_refuses_only_the_fieldless() {
+        use rustdar_radar::types::RadarProduct;
+        let refused = |p| absent_curve_message(p).contains("does not render in 3D");
+        for product in [
+            RadarProduct::StormRelativeVelocity,
+            RadarProduct::NormalizedRotation,
+            RadarProduct::SpecificDifferentialPhase,
+        ] {
+            assert!(
+                !refused(product),
+                "{} is derived tilt by tilt and renders in 3D, but the editor \
+                 refuses it by name",
+                product.name(),
+            );
+            assert!(
+                rustdar_radar::sampler::samplable(product).is_none(),
+                "precondition: {} has no native moment, so this test is about \
+                 the `volume_slot` gate and not about `samplable`",
+                product.name(),
+            );
+        }
+        // And the products with no per-tilt field at all are still refused,
+        // so the gate has not simply been opened.
+        for product in [
+            RadarProduct::HydrometeorClassification,
+            RadarProduct::VerticallyIntegratedLiquid,
+            RadarProduct::EchoTops,
+            RadarProduct::PrecipitationRate,
+        ] {
+            assert!(refused(product), "{}", product.name());
+        }
+    }
+
     #[test]
     fn the_reset_button_does_not_promise_the_palettes_own_opacity() {
         assert!(
