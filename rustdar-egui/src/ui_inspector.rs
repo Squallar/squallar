@@ -180,55 +180,55 @@ impl super::Gui {
                         body = body.vertical_scroll_offset(0.0);
                     }
                     let scroll = body.show(ui, |ui| {
-                            // One explicit id scope per body — see the module
-                            // note. `UiBuilder::id` rather than `id_salt` for
-                            // the reason the status bar's `status_error` scope
-                            // records: the explicit form takes the parent's
-                            // auto-id counter out of the children entirely.
-                            let scope = egui::UiBuilder::new()
-                                .id(ui.id().with(match self.inspector_sel {
-                                    InspectorSelection::AppSettings => "body_settings",
-                                    InspectorSelection::PaneProps => "body_pane",
-                                    InspectorSelection::Layer(_) => "body_layer",
-                                }))
-                                .layout(egui::Layout::top_down_justified(egui::Align::LEFT));
-                            ui.scope_builder(scope, |ui| match self.inspector_sel {
-                                InspectorSelection::AppSettings => {
-                                    #[cfg(test)]
-                                    {
-                                        probe.mode = Some(InspectorSelection::AppSettings);
-                                    }
-                                    self.render_settings_body(ui, pane, actions);
+                        // One explicit id scope per body — see the module
+                        // note. `UiBuilder::id` rather than `id_salt` for
+                        // the reason the status bar's `status_error` scope
+                        // records: the explicit form takes the parent's
+                        // auto-id counter out of the children entirely.
+                        let scope = egui::UiBuilder::new()
+                            .id(ui.id().with(match self.inspector_sel {
+                                InspectorSelection::AppSettings => "body_settings",
+                                InspectorSelection::PaneProps => "body_pane",
+                                InspectorSelection::Layer(_) => "body_layer",
+                            }))
+                            .layout(egui::Layout::top_down_justified(egui::Align::LEFT));
+                        ui.scope_builder(scope, |ui| match self.inspector_sel {
+                            InspectorSelection::AppSettings => {
+                                #[cfg(test)]
+                                {
+                                    probe.mode = Some(InspectorSelection::AppSettings);
                                 }
-                                InspectorSelection::PaneProps => {
-                                    #[cfg(test)]
-                                    {
-                                        probe.mode = Some(InspectorSelection::PaneProps);
-                                    }
-                                    self.render_pane_props_body(
-                                        ui,
-                                        pane,
-                                        actions,
-                                        #[cfg(test)]
-                                        &mut probe,
-                                    );
+                                self.render_settings_body(ui, pane, actions);
+                            }
+                            InspectorSelection::PaneProps => {
+                                #[cfg(test)]
+                                {
+                                    probe.mode = Some(InspectorSelection::PaneProps);
                                 }
-                                InspectorSelection::Layer(kind) => {
+                                self.render_pane_props_body(
+                                    ui,
+                                    pane,
+                                    actions,
                                     #[cfg(test)]
-                                    {
-                                        probe.mode = Some(InspectorSelection::Layer(kind));
-                                    }
-                                    self.render_layer_body(
-                                        ui,
-                                        pane,
-                                        kind,
-                                        actions,
-                                        #[cfg(test)]
-                                        &mut probe,
-                                    );
+                                    &mut probe,
+                                );
+                            }
+                            InspectorSelection::Layer(kind) => {
+                                #[cfg(test)]
+                                {
+                                    probe.mode = Some(InspectorSelection::Layer(kind));
                                 }
-                            });
+                                self.render_layer_body(
+                                    ui,
+                                    pane,
+                                    kind,
+                                    actions,
+                                    #[cfg(test)]
+                                    &mut probe,
+                                );
+                            }
                         });
+                    });
 
                     #[cfg(test)]
                     self.widget_id_probes.push(("inspector_scroll", scroll.id));
@@ -334,9 +334,7 @@ impl super::Gui {
                     #[cfg(test)]
                     {
                         probe.crumb = match self.inspector_sel {
-                            InspectorSelection::AppSettings => {
-                                "App \u{203a} Settings".to_owned()
-                            }
+                            InspectorSelection::AppSettings => "App \u{203a} Settings".to_owned(),
                             _ => format!("{pane_label} \u{203a} {tail}"),
                         };
                     }

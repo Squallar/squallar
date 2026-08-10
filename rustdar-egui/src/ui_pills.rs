@@ -308,7 +308,11 @@ pub(super) fn product_list_ui(
 /// The tilt list a product offers, current one highlighted — the same exact
 /// equality the combo's `selectable_value` used, so the two routes agree
 /// about which row reads selected.
-pub(super) fn tilt_list_ui(ui: &mut egui::Ui, elevations: &[f32], current: f32) -> PickOutcome<f32> {
+pub(super) fn tilt_list_ui(
+    ui: &mut egui::Ui,
+    elevations: &[f32],
+    current: f32,
+) -> PickOutcome<f32> {
     let mut outcome = PickOutcome::default();
     for &angle in elevations {
         outcome.row(ui, &format!("{:.1}\u{b0}", angle), angle == current, angle);

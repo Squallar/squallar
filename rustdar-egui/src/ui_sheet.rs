@@ -758,7 +758,12 @@ impl super::Gui {
     /// the dropdown's own reasoning — flipping two of them must not be three
     /// opens — except the two armed drags, which close it because the next
     /// thing the user does is a drag on the map the sheet is covering.
-    fn render_sheet_menu(&mut self, ui: &mut egui::Ui, body_max: f32, actions: &mut Vec<GuiAction>) {
+    fn render_sheet_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        body_max: f32,
+        actions: &mut Vec<GuiAction>,
+    ) {
         let model = self.menu_model();
         let menu_frame = egui::ScrollArea::vertical()
             .id_salt("sheet_menu_scroll")
@@ -766,7 +771,8 @@ impl super::Gui {
             .show(ui, |ui| ui_menu::render_menu_drawer(ui, &model))
             .inner;
         #[cfg(test)]
-        self.last_menu_leaves.extend(menu_frame.drawn.iter().copied());
+        self.last_menu_leaves
+            .extend(menu_frame.drawn.iter().copied());
 
         let mut close = false;
         for event in menu_frame.events {
@@ -874,10 +880,8 @@ impl super::Gui {
                 egui::Frame::window(&ctx.global_style())
                     .show(ui, |ui| {
                         super::fade::dim(ui, factor);
-                        ui.horizontal(|ui| {
-                            super::statusbar::render_error_display(ui, &mut shown)
-                        })
-                        .inner
+                        ui.horizontal(|ui| super::statusbar::render_error_display(ui, &mut shown))
+                            .inner
                     })
                     .inner
             });

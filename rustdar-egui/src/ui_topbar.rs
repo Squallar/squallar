@@ -142,7 +142,13 @@ impl super::Gui {
                         // Everything else takes what the toggles left, reading
                         // left-to-right again.
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            self.render_top_bar_run(ui, model, &mut menu_frame, #[cfg(test)] &mut probe);
+                            self.render_top_bar_run(
+                                ui,
+                                model,
+                                &mut menu_frame,
+                                #[cfg(test)]
+                                &mut probe,
+                            );
                         });
                     });
                 } else {
@@ -167,7 +173,8 @@ impl super::Gui {
         {
             probe.rect = panel.response.rect;
             self.last_top_bar = probe;
-            self.last_menu_leaves.extend(menu_frame.drawn.iter().copied());
+            self.last_menu_leaves
+                .extend(menu_frame.drawn.iter().copied());
         }
 
         for event in menu_frame.events {
@@ -249,13 +256,13 @@ impl super::Gui {
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 render_wordmark(ui);
 
-                let collapse = ui
-                    .button(super::statusbar::COLLAPSE_LABEL)
-                    .on_hover_text(if collapsed {
-                        "Restore the top bar"
-                    } else {
-                        "Collapse the top bar"
-                    });
+                let collapse =
+                    ui.button(super::statusbar::COLLAPSE_LABEL)
+                        .on_hover_text(if collapsed {
+                            "Restore the top bar"
+                        } else {
+                            "Collapse the top bar"
+                        });
                 #[cfg(test)]
                 {
                     probe.collapse = collapse.rect;

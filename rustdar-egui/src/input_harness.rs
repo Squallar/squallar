@@ -651,7 +651,11 @@ impl InputHarness {
 
     /// Pane `idx`'s `kind` pill — its drawn text and rect — if the last
     /// frame drew one.
-    pub(crate) fn pill(&self, idx: usize, kind: crate::ui::PillKind) -> Option<(String, egui::Rect)> {
+    pub(crate) fn pill(
+        &self,
+        idx: usize,
+        kind: crate::ui::PillKind,
+    ) -> Option<(String, egui::Rect)> {
         self.pill_row(idx)?
             .pills
             .into_iter()

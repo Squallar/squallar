@@ -249,9 +249,7 @@ fn walk_menu(h: &mut InputHarness, width: WidthClass) {
         };
         // The sheet's Menu page scrolls where the dropdown does not — work
         // the list like a user before calling a leaf unreachable.
-        if !visible(h)
-            && width == WidthClass::Compact
-        {
+        if !visible(h) && width == WidthClass::Compact {
             let pos = h
                 .sheet_rect()
                 .expect("the Menu page is open, so the sheet has a rect")

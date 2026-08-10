@@ -187,7 +187,11 @@ impl OverlayHandler for SpcOutlookHandler {
             .filter(|p| self.enabled_products.contains(p))
             .map(|p| p.to_string())
             .collect();
-        Some(format!("{} \u{b7} {}", self.selected_day, products.join(", ")))
+        Some(format!(
+            "{} \u{b7} {}",
+            self.selected_day,
+            products.join(", ")
+        ))
     }
 
     fn data_generation(&self) -> u64 {
@@ -567,7 +571,10 @@ mod tests {
                 _ => None,
             })
             .expect("the popup links to the SPC website");
-        assert_eq!(url, "https://www.spc.noaa.gov/products/outlook/day1otlk.html");
+        assert_eq!(
+            url,
+            "https://www.spc.noaa.gov/products/outlook/day1otlk.html"
+        );
     }
 
     /// Days 4–8 share one experimental SPC page, and a window the feed did

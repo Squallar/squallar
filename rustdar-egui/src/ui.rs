@@ -75,10 +75,10 @@ mod statusbar;
 mod timeline;
 #[cfg(test)]
 pub(crate) use timeline::TimelineProbe;
-#[path = "ui_topbar.rs"]
-mod topbar;
 #[path = "ui_pills.rs"]
 mod pills;
+#[path = "ui_topbar.rs"]
+mod topbar;
 /// What a pane's own top-left content leaves clear for its pill row — read
 /// by the section pane's layout and the 3D pane's caption.
 pub(crate) use pills::PILL_ROW_CLEARANCE;
@@ -2221,9 +2221,7 @@ impl Gui {
     fn render_time_dialog(&mut self, ctx: &Context) -> Option<GuiAction> {
         // On Compact the sheet's Time page is the presentation (plan §1.9) —
         // the phone never draws this window.
-        if !self.time_dialog.show
-            || self.layout.width == crate::ui_layout::WidthClass::Compact
-        {
+        if !self.time_dialog.show || self.layout.width == crate::ui_layout::WidthClass::Compact {
             return None;
         }
 
@@ -2278,10 +2276,9 @@ impl Gui {
                         "{} {}",
                         self.time_dialog.date_string, self.time_dialog.time_string
                     );
-                    if let Ok(timestamp) = chrono::NaiveDateTime::parse_from_str(
-                        &datetime_str,
-                        "%Y-%m-%d %H:%M:%S",
-                    ) {
+                    if let Ok(timestamp) =
+                        chrono::NaiveDateTime::parse_from_str(&datetime_str, "%Y-%m-%d %H:%M:%S")
+                    {
                         self.radar.config.timestamp = timestamp;
                         if let Some(pane) = self.panes.get_mut(self.active_pane) {
                             pane.viewing_live = false;
@@ -2478,8 +2475,7 @@ impl Gui {
                             // own body — for the same one-inventory reason
                             // as the product combo above.
                             let shown = combo.show_ui(ui, |ui| {
-                                pills::tilt_list_ui(ui, elevations, pane.selected_elevation)
-                                    .picked
+                                pills::tilt_list_ui(ui, elevations, pane.selected_elevation).picked
                             });
                             if let Some(Some(angle)) = shown.inner {
                                 pane.selected_elevation = angle;
@@ -2590,8 +2586,7 @@ impl Gui {
         if self.sync_layers && self.pane_layout.pane_count > 1 {
             (0..self.pane_layout.pane_count)
                 .filter(|&idx| {
-                    idx == self.active_pane
-                        || self.panes.get(idx).is_none_or(|pane| pane.time_link)
+                    idx == self.active_pane || self.panes.get(idx).is_none_or(|pane| pane.time_link)
                 })
                 .collect()
         } else {
@@ -3633,7 +3628,6 @@ impl Gui {
     pub(crate) fn click_consumed_for_test(&self) -> bool {
         self.click_consumed_frame
     }
-
 
     /// The user's saved presets, as the catalog holds them.
     #[cfg(test)]

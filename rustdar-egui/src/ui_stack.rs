@@ -368,13 +368,11 @@ impl super::Gui {
                         ui.spacing_mut().item_spacing.y = 0.0;
                         let up = ui.add_enabled(
                             row_idx > 0,
-                            egui::Button::new(egui::RichText::new("\u{25b2}").small())
-                                .frame(false),
+                            egui::Button::new(egui::RichText::new("\u{25b2}").small()).frame(false),
                         );
                         let down = ui.add_enabled(
                             row_idx < last,
-                            egui::Button::new(egui::RichText::new("\u{25bc}").small())
-                                .frame(false),
+                            egui::Button::new(egui::RichText::new("\u{25bc}").small()).frame(false),
                         );
                         #[cfg(test)]
                         {
@@ -441,8 +439,7 @@ impl super::Gui {
                     // header's own device.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if is_drawer {
-                            let chevron =
-                                ui.label(egui::RichText::new("\u{203a}").weak());
+                            let chevron = ui.label(egui::RichText::new("\u{203a}").weak());
                             #[cfg(test)]
                             if let Some(row) = probe.rows.last_mut() {
                                 row.chevron = Some(chevron.rect);
@@ -454,38 +451,35 @@ impl super::Gui {
                         // The name and status block: the row's click target.
                         // Hidden layers render dimmed — weak text is the
                         // stock theme's own dimming.
-                        ui.with_layout(
-                            egui::Layout::top_down_justified(egui::Align::LEFT),
-                            |ui| {
-                                ui.spacing_mut().item_spacing.y = 0.0;
-                                let name_text = if enabled {
-                                    egui::RichText::new(name.as_str())
-                                } else {
-                                    egui::RichText::new(name.as_str()).weak()
-                                };
-                                let select = ui.selectable_label(selected, name_text);
-                                let mut target = select.rect;
-                                if let Some(line) = &status {
-                                    let drawn = ui
-                                        .label(egui::RichText::new(line.as_str()).small().weak());
-                                    target = target.union(drawn.rect);
-                                }
-                                #[cfg(test)]
-                                if let Some(row) = probe.rows.last_mut() {
-                                    row.rect = target;
-                                }
-                                #[cfg(not(test))]
-                                let _ = target;
-                                if select.clicked() {
-                                    // The inspector opens over or beside
-                                    // this list per host; the list stays
-                                    // open beneath either way — the M3-era
-                                    // rule that closed the Compact drawer
-                                    // died with the slide-over it served.
-                                    self.select_layer(kind);
-                                }
-                            },
-                        );
+                        ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            let name_text = if enabled {
+                                egui::RichText::new(name.as_str())
+                            } else {
+                                egui::RichText::new(name.as_str()).weak()
+                            };
+                            let select = ui.selectable_label(selected, name_text);
+                            let mut target = select.rect;
+                            if let Some(line) = &status {
+                                let drawn =
+                                    ui.label(egui::RichText::new(line.as_str()).small().weak());
+                                target = target.union(drawn.rect);
+                            }
+                            #[cfg(test)]
+                            if let Some(row) = probe.rows.last_mut() {
+                                row.rect = target;
+                            }
+                            #[cfg(not(test))]
+                            let _ = target;
+                            if select.clicked() {
+                                // The inspector opens over or beside
+                                // this list per host; the list stays
+                                // open beneath either way — the M3-era
+                                // rule that closed the Compact drawer
+                                // died with the slide-over it served.
+                                self.select_layer(kind);
+                            }
+                        });
                     });
                 });
             });
@@ -505,11 +499,7 @@ impl super::Gui {
         // true, so it is the only host that says it.
         if sheet {
             ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new(SHEET_HELPER_CAPTION)
-                    .small()
-                    .weak(),
-            );
+            ui.label(egui::RichText::new(SHEET_HELPER_CAPTION).small().weak());
         }
 
         if let Some((a, b)) = swap {

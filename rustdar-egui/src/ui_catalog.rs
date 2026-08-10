@@ -264,9 +264,7 @@ impl super::Gui {
     /// Runs from [`Gui::ui`](super::Gui::ui) after the pane loop and the
     /// appliers — see the module note for why that ordering is load-bearing.
     pub(super) fn render_catalog(&mut self, ctx: &egui::Context, actions: &mut Vec<GuiAction>) {
-        if !self.catalog_open
-            || self.layout.width == crate::ui_layout::WidthClass::Compact
-        {
+        if !self.catalog_open || self.layout.width == crate::ui_layout::WidthClass::Compact {
             return;
         }
 
@@ -397,9 +395,7 @@ impl super::Gui {
             .collect();
         if !overlays.is_empty() {
             ui.add_space(6.0);
-            ui.label(
-                egui::RichText::new(format!("Overlays ({})", overlays.len())).strong(),
-            );
+            ui.label(egui::RichText::new(format!("Overlays ({})", overlays.len())).strong());
             ui.horizontal_wrapped(|ui| {
                 for kind in overlays {
                     let name = self.overlays.display_name(kind).to_owned();
@@ -427,9 +423,7 @@ impl super::Gui {
             .collect();
         if !products.is_empty() {
             ui.add_space(6.0);
-            ui.label(
-                egui::RichText::new(format!("Radar products ({})", products.len())).strong(),
-            );
+            ui.label(egui::RichText::new(format!("Radar products ({})", products.len())).strong());
             ui.horizontal_wrapped(|ui| {
                 for product in products {
                     let tile = ui.button(product.name());
@@ -456,9 +450,7 @@ impl super::Gui {
             .collect();
         if !params.is_empty() {
             ui.add_space(6.0);
-            ui.label(
-                egui::RichText::new(format!("HRRR parameters ({})", params.len())).strong(),
-            );
+            ui.label(egui::RichText::new(format!("HRRR parameters ({})", params.len())).strong());
             ui.horizontal_wrapped(|ui| {
                 for param in params {
                     let tile = ui.button(param.display_name());
@@ -535,9 +527,7 @@ impl super::Gui {
                     .button(preset.name.as_str())
                     .on_hover_text(preset_hover(preset));
                 let remove = ui
-                    .add(
-                        egui::Button::new(egui::RichText::new(CLOSE_LABEL).small()).frame(false),
-                    )
+                    .add(egui::Button::new(egui::RichText::new(CLOSE_LABEL).small()).frame(false))
                     .on_hover_text(format!("Delete \u{201c}{}\u{201d}", preset.name));
                 #[cfg(test)]
                 probe.tiles.push(CatalogTileProbe {

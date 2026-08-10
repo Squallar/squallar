@@ -248,8 +248,7 @@ impl super::Gui {
         };
         // Margins *and* the stroke, which egui 0.35 lays outside the inner
         // margin — the sheet's own containment math (`ui_sheet.rs`).
-        let inner_width =
-            outer_width - frame.inner_margin.sum().x - 2.0 * frame.stroke.width;
+        let inner_width = outer_width - frame.inner_margin.sum().x - 2.0 * frame.stroke.width;
         let area = egui::Area::new(egui::Id::new("timeline"))
             .order(egui::Order::Middle)
             .pivot(egui::Align2::CENTER_BOTTOM)
@@ -291,7 +290,10 @@ impl super::Gui {
         let area = egui::Area::new(egui::Id::new("timeline_chip"))
             .order(egui::Order::Middle)
             .pivot(egui::Align2::RIGHT_BOTTOM)
-            .fixed_pos(egui::pos2(map_rect.right() - CHIP_INSET, bottom - CHIP_INSET))
+            .fixed_pos(egui::pos2(
+                map_rect.right() - CHIP_INSET,
+                bottom - CHIP_INSET,
+            ))
             .show(ctx, |ui| {
                 egui::Frame::window(&ctx.global_style()).show(ui, |ui| {
                     super::fade::dim(ui, opacity);
@@ -496,7 +498,8 @@ impl super::Gui {
         // prove nothing about the state egui actually keyed on.
         #[cfg(test)]
         {
-            self.widget_id_probes.push(("time_step_sel", combo.response.id));
+            self.widget_id_probes
+                .push(("time_step_sel", combo.response.id));
             self.last_timeline.step_dropdown = combo.response.rect;
         }
         #[cfg(not(test))]
@@ -827,11 +830,10 @@ impl super::Gui {
 
                     // Frame seek slider — the row-1 scrubber mirrors this
                     // while the loop runs.
-                    ui.spacing_mut().slider_width =
-                        (ui.available_width() * 0.5).clamp(60.0, 240.0);
+                    ui.spacing_mut().slider_width = (ui.available_width() * 0.5).clamp(60.0, 240.0);
                     let mut frame_idx = current_frame;
-                    let seek =
-                        ui.add(egui::Slider::new(&mut frame_idx, 0..=(total - 1)).show_value(false));
+                    let seek = ui
+                        .add(egui::Slider::new(&mut frame_idx, 0..=(total - 1)).show_value(false));
                     #[cfg(test)]
                     {
                         row2.seek = seek.rect;
@@ -868,7 +870,9 @@ impl super::Gui {
                         ui.spinner();
                         ui.label(text.as_str());
                     });
-                    ui.add(egui::ProgressBar::new(rendered as f32 / total as f32).show_percentage());
+                    ui.add(
+                        egui::ProgressBar::new(rendered as f32 / total as f32).show_percentage(),
+                    );
                     #[cfg(test)]
                     {
                         row2.rendered_text = text;

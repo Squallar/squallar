@@ -81,7 +81,9 @@ fn the_time_link_round_trips_and_defaults_on() {
         .expect("just saved");
     let mut value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
     for pane in value["panes"].as_array_mut().expect("a pane list") {
-        pane.as_object_mut().expect("a pane object").remove("time_link");
+        pane.as_object_mut()
+            .expect("a pane object")
+            .remove("time_link");
     }
     let older_store = MemoryConfigStore::default();
     older_store

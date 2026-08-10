@@ -228,11 +228,14 @@ impl super::Gui {
             // Sliding out to the left: the whole panel's travel is its width
             // plus both insets, so at factor zero nothing of it remains on
             // the map.
-            let travel =
-                (1.0 - stack_slide) * (super::ui_stack::STACK_WIDTH + 2.0 * super::ui_stack::STACK_INSET);
+            let travel = (1.0 - stack_slide)
+                * (super::ui_stack::STACK_WIDTH + 2.0 * super::ui_stack::STACK_INSET);
             let slot = SurfaceSlot {
                 pos: map_rect.left_top()
-                    + egui::vec2(super::ui_stack::STACK_INSET - travel, super::ui_stack::STACK_INSET),
+                    + egui::vec2(
+                        super::ui_stack::STACK_INSET - travel,
+                        super::ui_stack::STACK_INSET,
+                    ),
                 pivot: egui::Align2::LEFT_TOP,
                 width: super::ui_stack::STACK_WIDTH,
                 avail_height: map_rect.height()
@@ -246,7 +249,8 @@ impl super::Gui {
         }
         if insp_slide > 0.0 {
             let travel = (1.0 - insp_slide)
-                * (super::ui_inspector::INSPECTOR_WIDTH + 2.0 * super::ui_inspector::INSPECTOR_INSET);
+                * (super::ui_inspector::INSPECTOR_WIDTH
+                    + 2.0 * super::ui_inspector::INSPECTOR_INSET);
             let slot = SurfaceSlot {
                 pos: map_rect.right_top()
                     + egui::vec2(

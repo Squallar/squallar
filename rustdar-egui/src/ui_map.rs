@@ -1781,8 +1781,7 @@ fn paint_volume_caption(ui: &egui::Ui, pane_rect: egui::Rect, lines: &[String]) 
     // Below the pane's pill row, not at the very corner — the row is an
     // egui layer over the pane and would cover the caption (see
     // `ui_pills::PILL_ROW_CLEARANCE`).
-    let origin =
-        pane_rect.left_top() + egui::vec2(CAPTION_MARGIN, crate::ui::PILL_ROW_CLEARANCE);
+    let origin = pane_rect.left_top() + egui::vec2(CAPTION_MARGIN, crate::ui::PILL_ROW_CLEARANCE);
     ui.painter().rect_filled(
         egui::Rect::from_min_size(origin, galley.size()).expand(4.0),
         3.0,
@@ -1879,10 +1878,8 @@ fn paint_armed_hint_chip(
     );
     let painter = ctx.layer_painter(layer).with_clip_rect(pane_rect);
     let galley = painter.layout_no_wrap(text.to_owned(), egui::FontId::proportional(13.0), color);
-    let rect = egui::Rect::from_center_size(
-        pane_rect.center(),
-        galley.size() + 2.0 * ARMED_HINT_PADDING,
-    );
+    let rect =
+        egui::Rect::from_center_size(pane_rect.center(), galley.size() + 2.0 * ARMED_HINT_PADDING);
     // The section-track halo's translucent black, as a fill.
     painter.rect_filled(
         rect,
@@ -1903,7 +1900,11 @@ fn paint_armed_hint_chip(
             ARMED_HINT_GAP,
         ));
     }
-    painter.galley(rect.min + ARMED_HINT_PADDING, galley, egui::Color32::PLACEHOLDER);
+    painter.galley(
+        rect.min + ARMED_HINT_PADDING,
+        galley,
+        egui::Color32::PLACEHOLDER,
+    );
 }
 
 /// Segments a committed ground track is drawn with.

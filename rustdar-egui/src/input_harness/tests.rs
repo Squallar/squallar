@@ -3669,7 +3669,10 @@ fn the_inspector_toggle_and_the_settings_entry_reach_the_settings_body() {
     h.mouse_click(toggle.center());
     h.warm_up();
     let inspector = h.inspector();
-    assert!(inspector.open, "the \u{2699} toggle did not open the inspector");
+    assert!(
+        inspector.open,
+        "the \u{2699} toggle did not open the inspector"
+    );
     assert_eq!(
         inspector.mode,
         Some(crate::ui::InspectorSelection::AppSettings),
@@ -3680,9 +3683,7 @@ fn the_inspector_toggle_and_the_settings_entry_reach_the_settings_body() {
         h.top_bar().inspector_toggle.1,
         "the toggle must read as open while the panel shows"
     );
-    let panel = h
-        .inspector_rect()
-        .expect("the open inspector has a rect");
+    let panel = h.inspector_rect().expect("the open inspector has a rect");
     assert!(
         h.map_panel_rect().contains_rect(panel),
         "the inspector at {panel:?} is not inside the map \
@@ -8584,7 +8585,9 @@ fn the_site_search_narrows_the_list_and_a_row_click_switches_the_site() {
         "the unfiltered list must offer the whole table"
     );
     assert!(
-        inspector.site_caption.starts_with(&format!("{total} shown")),
+        inspector
+            .site_caption
+            .starts_with(&format!("{total} shown")),
         "the caption must count what is shown; drew {:?}",
         inspector.site_caption
     );
@@ -8867,7 +8870,9 @@ fn an_overlay_tile_enables_the_layer_and_selects_it() {
     );
     assert_eq!(
         h.inspector().mode,
-        Some(crate::ui::InspectorSelection::Layer(OverlayKind::SpcOutlook)),
+        Some(crate::ui::InspectorSelection::Layer(
+            OverlayKind::SpcOutlook
+        )),
         "the enabled layer's options must be selected"
     );
 }
@@ -8972,7 +8977,10 @@ fn a_saved_preset_appears_applies_and_deletes() {
     h.mouse_click(tile.rect.center());
     h.warm_up();
 
-    assert!(!h.catalog().open, "applying a preset must close the catalog");
+    assert!(
+        !h.catalog().open,
+        "applying a preset must close the catalog"
+    );
     assert_eq!(h.pane_count(), 2, "the preset's pane count must come back");
     assert_eq!(
         h.gui_mut().pane(0).expect("pane 0").selected_product,
@@ -9049,10 +9057,7 @@ fn the_data_and_live_rows_share_state_with_the_menu_toggles() {
     // The row sits far down the settings body: scroll it on screen the way a
     // user does, let the smooth-scroll animation settle, then click the
     // checkbox by its own painted label.
-    let scroll_pos = h
-        .inspector_rect()
-        .expect("the inspector is open")
-        .center();
+    let scroll_pos = h.inspector_rect().expect("the inspector is open").center();
     let found = h.scroll_until(scroll_pos, egui::vec2(0.0, -160.0), 120, |h| {
         h.settings_row("data.auto_poll")
             .is_some_and(|row| h.screen_rect().contains(row.rect.center()))
@@ -9289,15 +9294,14 @@ fn pin_pane_controls_forces_full_opacity_and_persists() {
     h.mouse_move(egui::pos2(700.0, 12.0));
     h.frames_for(2, FRAME_DT);
     assert!(
-        !h.pill_row(0).expect("the pane draws a pill row").full_opacity,
+        !h.pill_row(0)
+            .expect("the pane draws a pill row")
+            .full_opacity,
         "precondition: unpinned and unhovered, the row idles dim"
     );
 
     h.open_settings();
-    let scroll_pos = h
-        .inspector_rect()
-        .expect("the inspector is open")
-        .center();
+    let scroll_pos = h.inspector_rect().expect("the inspector is open").center();
     let found = h.scroll_until(scroll_pos, egui::vec2(0.0, -160.0), 120, |h| {
         h.settings_row("interface.pin_controls")
             .is_some_and(|row| h.screen_rect().contains(row.rect.center()))
@@ -9382,10 +9386,7 @@ fn the_site_pill_popover_searches_and_switches() {
         site_switches(&h)
     );
     h.warm_up();
-    assert!(
-        h.pill_popover().is_none(),
-        "a pick closes the popover"
-    );
+    assert!(h.pill_popover().is_none(), "a pick closes the popover");
 }
 
 /// 73e. **The product and tilt popovers offer the combos' own lists, and a
@@ -9432,7 +9433,9 @@ fn the_product_and_tilt_pill_popovers_write_the_pane() {
 
     // -- tilt, back on reflectivity where two angles are offered --
     h.select_product(0, rustdar_radar::types::RadarProduct::Reflectivity);
-    let (_, pill) = h.pill(0, PillKind::Tilt).expect("a map pane draws a tilt pill");
+    let (_, pill) = h
+        .pill(0, PillKind::Tilt)
+        .expect("a map pane draws a tilt pill");
     h.mouse_click(pill.center());
     h.frame(); // the popup's debut frame only registers it
     let popover = h.pill_popover().expect("the popover opened");
@@ -9486,7 +9489,10 @@ fn the_link_pill_popover_toggles_the_time_link() {
         "the pick did not unlink the pane"
     );
     let (glyph, _) = h.pill(0, PillKind::Link).expect("still drawn");
-    assert_eq!(glyph, "\u{26d3}", "the pill must reflect the unlinked state");
+    assert_eq!(
+        glyph, "\u{26d3}",
+        "the pill must reflect the unlinked state"
+    );
 }
 
 /// 73g. **The kind pill's popover converts through the deferred applier —
@@ -9538,7 +9544,10 @@ fn the_kind_pill_popover_converts_next_frame_and_arms_the_unaimed_section() {
 
     // Cross-section with no line: the pick arms the draw, as the
     // inspector's segmented row does.
-    assert!(!h.section_draw_armed(), "precondition: the draw starts unarmed");
+    assert!(
+        !h.section_draw_armed(),
+        "precondition: the draw starts unarmed"
+    );
     let (_, pill) = h.pill(0, PillKind::Kind).expect("still drawn");
     h.mouse_click(pill.center());
     h.frame(); // the popup's debut frame only registers it
@@ -9695,7 +9704,10 @@ fn a_user_preset_cannot_shadow_a_builtin_name() {
         .cloned()
         .collect();
     assert_eq!(severe.len(), 1, "exactly the built-in tile remains");
-    assert!(severe[0].delete.is_none(), "and it is the undeletable built-in");
+    assert!(
+        severe[0].delete.is_none(),
+        "and it is the undeletable built-in"
+    );
 }
 
 /// **The save tile hides while the search is filtering** (§5.9 pinned rule):
@@ -9727,10 +9739,7 @@ fn the_save_tile_hides_while_searching() {
         "and the open name editor hides with it"
     );
     assert!(
-        catalog
-            .tiles
-            .iter()
-            .any(|tile| tile.label == "Severe Wx"),
+        catalog.tiles.iter().any(|tile| tile.label == "Severe Wx"),
         "control: the query still finds the built-in, so the hide is about \
          the save tile and not the group"
     );
@@ -9987,7 +9996,10 @@ fn the_bottom_bar_toggles_its_pages_and_switches_between_them() {
     h.mouse_click(h.bottom_bar().layers.0.center());
     h.warm_up();
     assert_eq!(h.sheet().page, Some(crate::ui::SheetPage::Layers));
-    assert!(h.bottom_bar().layers.1, "the open page's item must highlight");
+    assert!(
+        h.bottom_bar().layers.1,
+        "the open page's item must highlight"
+    );
 
     // A different item switches pages; the Layers flag stays set beneath.
     h.mouse_click(h.bottom_bar().pane.0.center());
@@ -10031,7 +10043,11 @@ fn the_bottom_bar_toggles_its_pages_and_switches_between_them() {
     // ...and closing the last page closes the sheet.
     h.mouse_click(h.bottom_bar().layers.0.center());
     h.warm_up();
-    assert_eq!(h.sheet().page, None, "the last page's toggle closes the sheet");
+    assert_eq!(
+        h.sheet().page,
+        None,
+        "the last page's toggle closes the sheet"
+    );
 
     // The Menu item follows the same toggle contract.
     h.mouse_click(h.bottom_bar().menu.0.center());
@@ -10066,7 +10082,10 @@ fn dialogs_are_modals_on_wide_screens_and_sheet_pages_on_the_phone() {
     // Backdrop click closes — the modal's own contract.
     desk.mouse_click(egui::pos2(40.0, 400.0));
     desk.warm_up();
-    assert!(!desk.catalog().open, "the modal's backdrop click must close it");
+    assert!(
+        !desk.catalog().open,
+        "the modal's backdrop click must close it"
+    );
 
     // Phone: the same flag presents as the sheet's Catalog page, at forced
     // Full extent, and the Modal is never created.
@@ -10491,7 +10510,9 @@ fn the_phone_error_toast_stays_visible_and_dismissible_over_an_open_sheet() {
     h.gui_mut().set_error("the feed went away".to_owned());
     h.warm_up();
 
-    let toast = h.error_toast().expect("the toast must draw with a page open");
+    let toast = h
+        .error_toast()
+        .expect("the toast must draw with a page open");
     assert!(
         toast.rect.bottom() < h.sheet_rect().expect("the page is open").top(),
         "precondition: the toast sits in the scrim's band above the sheet, \
@@ -10604,7 +10625,6 @@ fn arming_from_the_phone_top_bar_closes_the_open_sheet() {
     );
 }
 
-
 // ── The UI fade and the finalized Esc chain (M7) ─────────────────────
 
 /// Whether the floating chrome is on the glass, read off the probes the
@@ -10653,12 +10673,18 @@ fn a_qualifying_tap_fades_the_chrome_and_the_second_restores_it() {
     h.set_section_draw_armed(true);
     h.mouse_click(spot);
     h.warm_up();
-    assert!(!h.faded() && chrome_on_screen(&h), "an armed draw must not fade");
+    assert!(
+        !h.faded() && chrome_on_screen(&h),
+        "an armed draw must not fade"
+    );
     h.set_section_draw_armed(false);
     h.set_region_arm(true);
     h.mouse_click(spot);
     h.warm_up();
-    assert!(!h.faded() && chrome_on_screen(&h), "an armed region must not fade");
+    assert!(
+        !h.faded() && chrome_on_screen(&h),
+        "an armed region must not fade"
+    );
     h.set_region_arm(false);
 
     // A consumed click does not fade: the site icon answered it.
@@ -10670,7 +10696,10 @@ fn a_qualifying_tap_fades_the_chrome_and_the_second_restores_it() {
     h.mouse_click(site_spot);
     assert!(h.click_consumed(), "precondition: the icon took the click");
     h.warm_up();
-    assert!(!h.faded() && chrome_on_screen(&h), "a consumed click must not fade");
+    assert!(
+        !h.faded() && chrome_on_screen(&h),
+        "a consumed click must not fade"
+    );
 
     // The qualifying tap fades everything floating; the docked top bar
     // stays (contract 63 pins its half).
@@ -10686,7 +10715,10 @@ fn a_qualifying_tap_fades_the_chrome_and_the_second_restores_it() {
         egui::Rect::NOTHING,
         "the status bar must not render while faded"
     );
-    assert!(h.pill_rows().is_empty(), "the pill rows must not render while faded");
+    assert!(
+        h.pill_rows().is_empty(),
+        "the pill rows must not render while faded"
+    );
     assert_ne!(
         h.top_bar().rect,
         egui::Rect::NOTHING,
@@ -10714,7 +10746,10 @@ fn a_qualifying_tap_fades_the_phone_cluster_and_the_second_restores_it() {
     h.set_region_arm(true);
     h.mouse_click(spot);
     h.warm_up();
-    assert!(!h.faded() && chrome_on_screen(&h), "an armed region must not fade");
+    assert!(
+        !h.faded() && chrome_on_screen(&h),
+        "an armed region must not fade"
+    );
     h.set_region_arm(false);
 
     h.mouse_click(spot);
@@ -10734,7 +10769,10 @@ fn a_qualifying_tap_fades_the_phone_cluster_and_the_second_restores_it() {
 
     h.mouse_click(spot);
     h.warm_up();
-    assert!(!h.faded() && chrome_on_screen(&h), "the second tap restores");
+    assert!(
+        !h.faded() && chrome_on_screen(&h),
+        "the second tap restores"
+    );
 }
 
 /// 61. **Fading closes the panels and the sheet for real — state, not
@@ -10869,7 +10907,7 @@ fn the_fade_closes_the_volume_alpha_editor_for_real() {
 /// 62. **A top-bar interaction while faded unfades first, then performs —
 ///     nothing opens invisibly.**
 #[test]
-fn a_top_bar_interaction_while_faded_unfades_and_performs()  {
+fn a_top_bar_interaction_while_faded_unfades_and_performs() {
     // Wide: the ☰ opens the menu into a restored UI.
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.mouse_click(h.map_center());
@@ -10920,7 +10958,10 @@ fn a_keyboard_activation_while_faded_unfades_and_the_surface_stays() {
     h.mouse_click(h.map_center());
     h.warm_up();
     assert!(h.faded(), "precondition: faded");
-    assert!(!h.layers_panel_on_screen(), "precondition: the stack is closed");
+    assert!(
+        !h.layers_panel_on_screen(),
+        "precondition: the stack is closed"
+    );
 
     // Focus the Layers toggle under the id the bar itself keyed, then press
     // Enter: an activation with no pointer event anywhere near the bar.

@@ -150,9 +150,7 @@ impl super::Gui {
     /// when multiple overlays are stacked. Fully generic — uses PopupContent
     /// descriptors from the overlay crate.
     pub(super) fn render_overlay_popup(&mut self, ctx: &egui::Context) {
-        if self.overlays.selected_overlays.is_empty()
-            || self.layout.width == WidthClass::Compact
-        {
+        if self.overlays.selected_overlays.is_empty() || self.layout.width == WidthClass::Compact {
             return;
         }
 
