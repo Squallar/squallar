@@ -107,15 +107,18 @@ impl RadarSite {
 /// neither. Over 205 rows:
 ///
 /// * 139 sat on `site_height` within 2 ft. **None** sat on
-///   `site_height + tower_height`.
-/// * 45 TDWR rows sat within 3.2 ft of the single height their volumes
-///   report — the asymmetry is the archive truncating metres downward.
-/// * **49 rows sat on neither**, by −63 to +81 ft. KMSX was one of 49, not a
+///   `site_height + tower_height` — the one row classified that way, PACG,
+///   is 63 ft above its own volume's base and lands on the feedhorn by
+///   arithmetic accident.
+/// * All 45 TDWR rows sat within 3.2 ft of the single height their volumes
+///   report, 29 of them within 2 ft. The asymmetry — every delta positive —
+///   is the archive truncating metres downward rather than rounding.
+/// * **50 rows sat on neither**, by −63 to +81 ft. KMSX was one of 50, not a
 ///   singleton, so the six-row generalisation was wrong about the rule *and*
-///   wrong about the exception. Those 49 now carry the height their volume
-///   reports; every other row keeps the figure it had, which is the more
-///   precise of the two wherever they agree (the archive's is a whole-metre
-///   figure, this table's a whole-foot one).
+///   wrong about the exception. Forty-nine of them now carry the height their
+///   volume reports (the fiftieth is `RKSG`, below); every other row keeps the
+///   figure it had, which is the more precise of the two wherever they agree
+///   (the archive's is a whole-metre figure, this table's a whole-foot one).
 ///
 /// # What is still wrong here
 ///
