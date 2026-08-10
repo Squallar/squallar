@@ -1,16 +1,20 @@
 //! What only a real GPU can say about the volume raymarch.
 //!
 //! Everything here is `#[ignore]`d and every test carries its own invocation.
-//! CI has no GPU and is not getting one: adding `mesa-vulkan-drivers` to the
-//! workflow is a separate, last, revertable commit that nothing before it may
-//! depend on.
+//! The attribute is about *this machine*, not about CI: a checkout on a box
+//! with no working Vulkan loader must still give a green `cargo test`, so the
+//! whole file is opt-in and nobody has to own a GPU to contribute.
 //!
-//! Which means **none of this file runs in CI** — `test.yaml` runs
-//! `cargo llvm-cov --no-report --all-features` and never passes `-- --ignored`,
-//! so every test below is compiled and linted on every PR and executed only
-//! when a human types the invocation. Whatever a test here protects is
-//! protected by hand, not by the pipeline; a regression it would catch reaches
-//! `main` green.
+//! **CI opts in.** The `gpu` job in `test.yaml` installs `mesa-vulkan-drivers`,
+//! points the Vulkan loader at Mesa's lavapipe and runs this file with
+//! `-- --ignored`, so every test below is executed on every PR against a
+//! software rasteriser. Nothing here is any longer protected by hand alone.
+//!
+//! That the tests pass on llvmpipe is not incidental — it is checked, and it is
+//! the reason the job can exist on a runner with no graphics hardware. The
+//! adapter is named once per process on stderr, which is what `--nocapture` in
+//! that job is for: an adapter that quietly turned out to be a real GPU would
+//! leave the job green having tested something else entirely.
 //!
 //! Run the lot with:
 //!
@@ -98,6 +102,24 @@ fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|held| held.into_inner())
 }
 
+/// Name the adapter these tests actually got, once per process.
+///
+/// Not decoration. CI runs this file against Mesa's lavapipe, and the failure
+/// mode that would make that worthless is a silent fall back to whatever real
+/// GPU the runner turns out to have: the suite would pass and prove nothing
+/// about the software path. Under `--nocapture` this line is the receipt. It
+/// goes to stderr so it survives a passing run's captured stdout.
+fn announce(adapter: &wgpu::Adapter) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let info = adapter.get_info();
+        eprintln!(
+            "wgpu adapter: {:?} {:?} \"{}\" (driver: {} {})",
+            info.backend, info.device_type, info.name, info.driver, info.driver_info
+        );
+    });
+}
+
 /// A device, or `None` when there is no adapter to be had.
 ///
 /// Same constructor the application uses, so `WGPU_BACKEND` selects the backend
@@ -111,6 +133,7 @@ fn device() -> (wgpu::Device, wgpu::Queue) {
         compatible_surface: None,
     }))
     .expect("no wgpu adapter; these tests are ignored by default for that reason");
+    announce(&adapter);
     pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("rustdar.volume.test.device"),
         required_features: wgpu::Features::empty(),

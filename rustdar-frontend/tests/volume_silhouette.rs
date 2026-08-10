@@ -14,8 +14,11 @@
 //! against a stored image, and no bound was widened to make a case green
 //! without the residual being printed alongside it.
 //!
-//! Everything is `#[ignore]`d, for the reason `volume_gpu.rs` gives: CI has no
-//! GPU. Run the lot with:
+//! Everything is `#[ignore]`d, for the reason `volume_gpu.rs` gives: so that a
+//! checkout on a box with no working Vulkan loader still gives a green
+//! `cargo test`. CI opts back in — the `gpu` job in `test.yaml` runs this file
+//! with `-- --ignored` against Mesa's lavapipe on every PR. Run the lot
+//! yourself with:
 //!
 //! ```text
 //! cargo test -p rustdar-frontend --test volume_silhouette -- --ignored --nocapture
@@ -85,6 +88,22 @@ fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|held| held.into_inner())
 }
 
+/// Name the adapter these tests actually got, once per process.
+///
+/// Same receipt `volume_gpu.rs` prints, and for the same reason: CI runs this
+/// file on a software rasteriser, and a silent fall back to a real GPU would
+/// leave the suite green while testing nothing it was added to test.
+fn announce(adapter: &wgpu::Adapter) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let info = adapter.get_info();
+        eprintln!(
+            "wgpu adapter: {:?} {:?} \"{}\" (driver: {} {})",
+            info.backend, info.device_type, info.name, info.driver, info.driver_info
+        );
+    });
+}
+
 /// A device on whatever adapter `WGPU_BACKEND` selects.
 fn device() -> (wgpu::Device, wgpu::Queue) {
     let instance =
@@ -95,6 +114,7 @@ fn device() -> (wgpu::Device, wgpu::Queue) {
         compatible_surface: None,
     }))
     .expect("no wgpu adapter; these tests are ignored by default for that reason");
+    announce(&adapter);
     pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("rustdar.volume.silhouette.device"),
         required_features: wgpu::Features::empty(),
