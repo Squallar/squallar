@@ -1105,9 +1105,14 @@ pub struct VolumeResources {
     /// One, not one per pane, and not one per floor: it covers the whole frame
     /// rather than any box's footprint, so two 3D panes sourced from two
     /// different maps each find their ground in it by sampling a different
-    /// region. `None` until the first frame that has something to mirror —
-    /// which is also the state a machine with no 3D pane stays in for ever,
-    /// paying nothing.
+    /// region.
+    ///
+    /// `None` on every frame that has nothing to mirror, not merely until the
+    /// first frame that does: the frame path calls `release_mirror` whenever
+    /// its guest list is empty, so closing the last 3D pane gives the whole
+    /// texture back rather than holding up to 16 MiB for the session. A machine
+    /// that never opens a 3D pane never leaves `None` and pays nothing; one that
+    /// opens and closes it returns there.
     mirror: Option<crate::volume::raymarch::PaneMirror>,
 }
 
@@ -1153,9 +1158,31 @@ impl VolumeResources {
     /// last reference does. The floor uploads are pruned on the next frame's
     /// `prepare` against the store's own floor ids, which the release has
     /// already shrunk.
+    ///
+    /// The **mirror is not freed here**, and deliberately: it is one texture for
+    /// the whole application rather than a per-pane resource, so which pane just
+    /// let go says nothing about whether anyone still wants it.
+    /// [`Self::release_mirror`] is the answer to that question, and the frame
+    /// path asks it every frame.
     pub fn release_pane(&mut self, pane_idx: usize, live_ids: &[u64]) {
         self.targets.remove(&pane_idx);
         self.uploads.retain(|id, _| live_ids.contains(id));
+    }
+
+    /// Give the pane mirror back, for a frame on which nothing wants a floor.
+    ///
+    /// The mirror is up to 16 MiB (`constants::VOLUME_MIRROR_BYTES_MAX`) and it
+    /// is *not* per-pane, so nothing in [`Self::release_pane`] can decide its
+    /// fate: closing the last 3D pane frees that pane's target and, without
+    /// this, leaves the frame-sized mirror live for the rest of the session.
+    /// The frame path calls this on exactly the frames it does not call
+    /// [`Self::ensure_mirror`] on — which is the same predicate, evaluated
+    /// once, in the one place that already knows the answer.
+    ///
+    /// Idempotent, and free when there is nothing to free: the steady state for
+    /// a machine with no 3D pane is a `None` being set to `None`.
+    pub fn release_mirror(&mut self) {
+        self.mirror = None;
     }
 
     /// The mirror this frame's pass should draw into, sized to the frame and
@@ -1170,6 +1197,9 @@ impl VolumeResources {
     /// `format` must have the same sRGB-ness as the swapchain — see
     /// [`VolumePipelines::ensure_mirror`] for what goes wrong when it does
     /// not, and note that nothing validates it.
+    ///
+    /// The counterpart is [`Self::release_mirror`], which the frame path calls
+    /// on the frames this one is *not* called on.
     pub fn ensure_mirror(
         &mut self,
         device: &wgpu::Device,

@@ -161,12 +161,26 @@ pub const DESKTOP_LOOP_TEXTURE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 /// cache's own entry count; this names what that bound costs so the next
 /// memory audit does not have to rediscover it.
 ///
-/// The retention was introduced for the 3D floor's CPU map composite, which
-/// no longer exists: the floor is now the 2D pane's own render, copied (see
-/// [`VOLUME_MIRROR_BYTES_MAX`]), and nothing re-decodes a tile. The bytes and
-/// this figure are kept rather than removed in the same change that removed
-/// their consumer, because `TileSource::raster_bytes_at` is a public seam and
-/// dropping it is a separate decision from replacing the floor.
+/// # FOLLOW-UP: this budget currently has no consumer
+///
+/// The retention was introduced for the 3D floor's CPU map composite, which no
+/// longer exists: the floor is now the 2D pane's own render, copied (see
+/// [`VOLUME_MIRROR_BYTES_MAX`]), and nothing re-decodes a tile. So the ~30 MiB
+/// this names is live and read by nobody.
+///
+/// It is *stated* here rather than removed alongside its consumer because
+/// dropping it is a separate decision from replacing the floor, and because
+/// nothing warns: `rustdar_egui::tile_source::TileSource::raster_bytes_at` and
+/// `rustdar_egui::ui::Gui::map_tiles_mut` are both unreferenced now and both
+/// `pub`, so no dead-code lint fires on either. The work, when it is taken:
+///
+///  1. delete `TileSource::raster_bytes_at` and `Gui::map_tiles_mut`;
+///  2. drop `CachedTile::bytes` (`rustdar-egui/src/tile_source.rs`), which is
+///     what actually retains the compressed PNGs;
+///  3. delete this constant and its test.
+///
+/// Until then, treat this figure as a *debt* rather than a cost: it is the size
+/// of the thing step 2 gives back.
 pub const TILE_BYTES_BUDGET_PER_SOURCE_BYTES: usize =
     rustdar_egui::tile_source::TILE_CACHE_ENTRIES.get() * 30 * 1024;
 
@@ -420,8 +434,12 @@ pub const VOLUME_OFFSCREEN_BUDGET_BYTES: usize = DESKTOP_VOLUME_OFFSCREEN_BUDGET
 /// this supersedes composited a 512² RGBA floor for every live `(site, region)`
 /// scope — 1 MiB each, unbounded in principle by anything but the number of
 /// live scopes — plus the compressed tile bytes it re-decoded to build them.
-/// The mirror is larger in the worst case and singular, and it is only
-/// allocated at all once some pane actually asks for a floor.
+/// The mirror is larger in the worst case and singular, and it is held only
+/// while some pane is actually asking for a floor: the frame path allocates it
+/// on the first frame with a non-empty guest list and calls
+/// `VolumeResources::release_mirror` on every frame without one, so closing the
+/// last 3D pane returns the whole figure rather than holding it for the
+/// session. A machine that never opens one never pays it at all.
 ///
 /// Stated **independently of current headroom**, deliberately: the voxel
 /// texture's own format is changing under a separate work item, so a figure

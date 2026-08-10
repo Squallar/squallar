@@ -34,11 +34,14 @@ pub struct EguiRenderer {
 pub struct AttachmentConfig {
     /// The colour attachment's format — the swapchain's, in practice.
     ///
-    /// Note this is deliberately *not* always non-sRGB:
-    /// `app_state::select_surface_format` only prefers a non-sRGB format on
-    /// wasm32, and natively falls back to `capabilities.formats[0]`. Anything
+    /// Note this is deliberately *not* always non-sRGB.
+    /// `app_state::preferred_surface_format` prefers a non-sRGB format on
+    /// wasm32 and prefers `Bgra8Unorm` — also non-sRGB — natively, falling back
+    /// to `capabilities.formats[0]` only on an adapter that does not offer it.
+    /// So an sRGB format here is the *rare* case rather than the routine
+    /// native one, which is exactly why nothing may assume either way: anything
     /// that has to match egui's gamma convention must key off
-    /// `TextureFormat::is_srgb` on this value rather than assume either way.
+    /// `TextureFormat::is_srgb` on this value.
     pub color_format: TextureFormat,
     /// The depth-stencil attachment's format, or `None` when the pass has none.
     /// `EguiRenderer::draw` attaches no depth buffer today.

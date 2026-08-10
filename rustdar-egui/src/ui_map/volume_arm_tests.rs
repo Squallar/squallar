@@ -1493,3 +1493,156 @@ fn a_discarded_drag_leaves_no_box_behind_on_the_map() {
         "a drag that committed nothing must leave nothing drawn",
     );
 }
+
+/// Aim `idx`'s 3D pane at the map in pane `source`.
+///
+/// What a region drag does, without needing one: `ui_region` sets exactly this
+/// field, and every test below is about what happens to the *registration*
+/// afterwards rather than about how the field came to be set.
+fn source_pane(h: &mut InputHarness, idx: usize, source: Option<usize>) {
+    h.gui_mut()
+        .pane_mut(idx)
+        .expect("a pane")
+        .volume_mut()
+        .expect("a 3D pane")
+        .source_pane = source;
+}
+
+/// The mirror pass's guest list is the set of map panes some 3D pane is
+/// standing on — and nothing else.
+///
+/// The baseline for the two tests below, and the first coverage
+/// `mirror_source_rects` or `map_pane_geo` have ever had. Both of the negative
+/// cases here would pass vacuously if the positive one did not work, because
+/// "no rects" is also what a guest list that never populates says.
+#[test]
+fn the_mirror_guest_list_is_the_maps_a_3d_pane_stands_on() {
+    let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
+    source_pane(&mut h, 1, Some(0));
+    h.frames_for(2, FRAME_DT);
+
+    let rects = h.gui_mut().mirror_source_rects();
+    assert_eq!(
+        rects.len(),
+        1,
+        "one 3D pane sourced from one map should ask for that map's rect and \
+         nothing else, got {rects:?}",
+    );
+    let map_rect = rects[0];
+    assert!(
+        map_rect.width() > 0.0 && map_rect.height() > 0.0,
+        "the guest list carried a degenerate rect {map_rect:?}; the mirror pass \
+         would clip every primitive away and the floor would be blank",
+    );
+
+    // A 3D pane with no source asks for nothing: there is no affine to
+    // reproject through, so mirroring anything would be mirroring a guess.
+    source_pane(&mut h, 1, None);
+    h.frames_for(2, FRAME_DT);
+    assert!(
+        h.gui_mut().mirror_source_rects().is_empty(),
+        "a 3D pane with no source pane still put a map on the mirror's guest \
+         list",
+    );
+
+    // A pane whose floor is switched off asks for nothing either, even though
+    // its source is a perfectly good map.
+    source_pane(&mut h, 1, Some(0));
+    h.gui_mut()
+        .pane_mut(1)
+        .expect("a pane")
+        .volume_mut()
+        .expect("a 3D pane")
+        .hide_floor = true;
+    h.frames_for(2, FRAME_DT);
+    assert!(
+        h.gui_mut().mirror_source_rects().is_empty(),
+        "a 3D pane with its map floor turned off is still paying for a mirror \
+         pass it does not read",
+    );
+}
+
+/// A source pane that stops being a map stops registering the floor — the
+/// second clause of [`crate::volume_view::VolumeFrameState::source`]'s
+/// contract.
+///
+/// `map_pane_geo` is written only from the `PaneKind::Map` arm, so before this
+/// was fixed the entry simply *survived* a conversion: the pane's last map
+/// frame's affine stayed in the table for ever, keyed by an index that is now a
+/// 3D pane. Two things then go wrong together and neither recovers, because
+/// nothing ever writes that key again — the mirror pass copies the 3D pane's
+/// own chrome (its rect is still on the guest list), and the dependent pane
+/// reprojects through an affine describing a zoom and centre that left the
+/// screen. The ground becomes a frozen slab of UI.
+///
+/// Reachable from the pane-kind menu, and reachable *automatically*: on a
+/// one-pane width class `RegionDestination::Convert` converts the source pane
+/// itself, which is the case the second half of this test drives.
+#[test]
+fn a_source_pane_that_stops_being_a_map_stops_registering_the_floor() {
+    let (mut h, painter) = volume_harness(StubVolumePainter::painting());
+    source_pane(&mut h, 1, Some(0));
+    h.frames_for(2, FRAME_DT);
+    assert!(
+        last_seen(&painter).source.is_some(),
+        "the floor was never registered in the first place, so nothing below \
+         means anything",
+    );
+
+    // The conversion. Pane 0 is no longer a map; its affine describes nothing
+    // on screen.
+    h.make_pane_volume(0);
+    h.frames_for(2, FRAME_DT);
+
+    assert_eq!(
+        last_seen(&painter).source,
+        None,
+        "pane 1's floor is still reprojecting through pane 0's last map frame, \
+         and pane 0 is a 3D pane now — the affine is dead and nothing will ever \
+         write it again",
+    );
+    assert!(
+        h.gui_mut().mirror_source_rects().is_empty(),
+        "the mirror pass is still copying pane 0's rect, which now holds a 3D \
+         pane's own chrome rather than a map",
+    );
+}
+
+/// The self-sourcing case: a one-pane layout where the region drag converted
+/// the very pane it was dragged on.
+///
+/// `RegionDestination::Convert(source_pane)` is the fallback arm — see
+/// `ui_region::destination_for` — and on a one-pane width class it is the arm
+/// that fires, so the resulting 3D pane's `source_pane` points at *itself*.
+/// Split out from the test above because it is the one shape where the stale
+/// entry and the pane reading it are the same index, which is exactly where a
+/// filter that consults the pane being drawn cannot see the truth: that pane is
+/// held out of the vector by `mem::take` while its own arm runs. The prune runs
+/// before the loop for that reason.
+#[test]
+fn a_pane_that_converted_itself_does_not_stand_on_its_own_old_map() {
+    let painter = Arc::new(StubVolumePainter::painting());
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.set_pane_count(1);
+    h.load_scan("KTLX");
+    h.gui_mut().set_volume_painter(Some(painter.clone()));
+    // A frame as a map, which is what puts the affine in the table.
+    h.frames_for(2, FRAME_DT);
+    assert_eq!(h.pane_kinds(), vec![PaneKind::Map]);
+
+    h.make_pane_volume(0);
+    source_pane(&mut h, 0, Some(0));
+    h.frames_for(2, FRAME_DT);
+
+    assert_eq!(
+        last_seen(&painter).source,
+        None,
+        "the pane is standing on the map it used to be; its floor is a picture \
+         of its own chrome, registered to a view nothing is showing",
+    );
+    assert!(
+        h.gui_mut().mirror_source_rects().is_empty(),
+        "the mirror pass is copying the 3D pane's own rect into the texture \
+         that pane then samples as ground",
+    );
+}

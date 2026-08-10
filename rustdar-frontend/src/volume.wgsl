@@ -718,11 +718,29 @@ fn floor_colour(eye: vec3<f32>, direction: vec3<f32>, t: f32) -> vec4<f32> {
     if sample.a <= 0.0 {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
-    // egui premultiplies *after* encoding, so un-premultiply before decoding
-    // and hand back a straight colour. When the swapchain is sRGB the mirror
-    // already holds linear texels and there is nothing to decode.
-    let straight = sample.rgb / sample.a;
-    let linear = select(straight, linear_from_gamma_rgb(straight), volume.floor_geo.w > 0.5);
+    // egui premultiplies in GAMMA space, so the un-premultiply has to be taken
+    // in gamma space too — in **both** arms, which is the whole subtlety here.
+    //
+    // `egui-wgpu-0.35.0/src/egui.wgsl` writes, from the one pipeline that also
+    // draws the mirror:
+    //
+    //  * `fs_main_gamma_framebuffer` (non-sRGB swapchain): `gamma(C) * A`.
+    //  * `fs_main_linear_framebuffer` (sRGB swapchain):
+    //    `linear_from_gamma_rgb(gamma(C) * A)`, alpha untouched.
+    //
+    // The linear arm is *an encoding applied to an already-premultiplied gamma
+    // value*, not a premultiply performed in linear space. So the texel has to
+    // be brought back to gamma first and only then divided: dividing the linear
+    // texel by `A` and calling the result straight linear returns 0.428 where
+    // 1.0 is correct at `C = 1, A = 0.5`. Both arms therefore end in the same
+    // `linear_from_gamma_rgb(gamma_premultiplied / A)`; they differ only in
+    // whether the texel already *is* that gamma value.
+    let gamma_premultiplied = select(
+        gamma_from_linear_rgb(sample.rgb),
+        sample.rgb,
+        volume.floor_geo.w > 0.5,
+    );
+    let linear = linear_from_gamma_rgb(gamma_premultiplied / sample.a);
     return vec4<f32>(linear, sample.a);
 }
 

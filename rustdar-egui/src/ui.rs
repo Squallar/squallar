@@ -6,7 +6,7 @@ use rustdar_overlays::render::controls::{
 
 const DEFAULT_INITIAL_ZOOM: f64 = 7.0;
 
-use crate::pane::{ColorScaleOrientation, PaneId, PaneLayout, PaneState};
+use crate::pane::{ColorScaleOrientation, PaneId, PaneKind, PaneLayout, PaneState};
 use crate::tiles::MapTileState;
 use crate::ui_layout::{LayoutCtx, ModalityLatch};
 use chrono::{NaiveDateTime, Timelike};
@@ -500,9 +500,13 @@ pub struct Gui {
     /// deliberately: a pane that is momentarily not drawn (a collapsed
     /// divider, a hidden tab) should leave its 3D pane's floor where it was
     /// rather than dropping it, and a stale entry costs six words of state.
-    /// Entries whose pane index no longer exists are pruned at the top of the
-    /// pane loop, so a layout that sheds panes cannot leave a 3D pane
-    /// reprojecting through a map that is gone.
+    ///
+    /// **The invariant is that a key here is a pane that is a map right now**,
+    /// not merely a pane that was one when the affine was taken. Entries are
+    /// pruned at the top of the pane loop against both the live pane count and
+    /// the live [`crate::pane::PaneKind`], so neither a layout that sheds panes
+    /// nor a map pane converted to 3D or cross-section can leave a floor
+    /// reprojecting through geography nothing on screen still has.
     map_pane_geo: HashMap<usize, crate::volume_view::MapPaneGeo>,
     /// The map panel rect the last frame laid its pane grid out in. Only read
     /// by tests, which need the same rects `render_panes` used.
@@ -2975,16 +2979,29 @@ impl Gui {
     ///
     /// Empty means there is nothing to mirror, and the frontend skips the pass
     /// entirely rather than clearing a texture nobody reads.
+    ///
+    /// A source pane that is **not a map** contributes nothing, and the kind is
+    /// re-read from the live pane here rather than inferred from the presence
+    /// of a recorded affine. `render_panes` already drops the entry when a pane
+    /// stops being a map, so this is belt and braces — but this is a `pub`
+    /// reader the frontend calls at a point in the frame of its own choosing,
+    /// and copying a 3D pane's own chrome onto another pane's ground is not a
+    /// failure anyone would think to look for in a guest list.
     pub fn mirror_source_rects(&self) -> Vec<egui::Rect> {
+        let panes = self.panes();
         let mut rects: Vec<egui::Rect> = Vec::new();
-        for pane in self.panes() {
+        for pane in panes {
             let Some(volume) = pane.volume() else {
                 continue;
             };
             if volume.hide_floor {
                 continue;
             }
-            let Some(geo) = volume.source_pane.and_then(|i| self.map_pane_geo.get(&i)) else {
+            let Some(geo) = volume
+                .source_pane
+                .filter(|&i| panes.get(i).map(PaneState::kind) == Some(PaneKind::Map))
+                .and_then(|i| self.map_pane_geo.get(&i))
+            else {
                 continue;
             };
             // Two 3D panes sourced from one map ask for one rect. Compared by

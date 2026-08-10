@@ -1868,6 +1868,316 @@ fn the_floor_stops_at_the_mirrors_edge_rather_than_smearing_it() {
     );
 }
 
+/// Where a ray from the standard down-looking fixture camera meets the floor
+/// plane, as a box coordinate.
+///
+/// [`box_from_clip_down`] is not orthographic: it unprojects the far plane onto
+/// `z = -1` while [`eye_outside`] sits at `z = 3`, so the ray reaches `z = 0`
+/// three quarters of the way along and the footprint the image spans is the
+/// middle 0.125..0.875 of the box, not the whole of it. Every "far corner"
+/// probe in this file is therefore at 0.872, not at 1.0, and a test that
+/// predicted a value at the box's true corner would be predicting for a pixel
+/// that does not exist.
+///
+/// Restating the *camera* here is not the restatement trap: what is under test
+/// below is the reprojection from box kilometres into the mirror, and this says
+/// only which box position the probe pixel is asking about. Get it wrong and
+/// the test fails loudly rather than passing vacuously.
+fn floor_hit_of_pixel(col: u32, row: u32, size: [u32; 2]) -> (f64, f64) {
+    let ndc_x = 2.0 * (f64::from(col) + 0.5) / f64::from(size[0]) - 1.0;
+    let ndc_y = 1.0 - 2.0 * (f64::from(row) + 0.5) / f64::from(size[1]);
+    // eye.z = 3, far.z = -1, so z = 0 at 3/4 of the way; the lateral half-span
+    // of 0.5 is scaled by that same 3/4.
+    (0.5 + 0.375 * ndc_x, 0.5 + 0.375 * ndc_y)
+}
+
+/// `cos φ` is taken at **the pixel's own latitude**, not at the site's, and
+/// this is the one instrument in the tree that can tell the two apart.
+///
+/// # Why this test exists at all
+///
+/// The whole reason `floor_colour` reprojects per pixel — rather than mapping
+/// the box onto the mirror with a scale and a translate — is that the box's
+/// footprint is a *trapezoid* in longitude: a kilometre east is more degrees of
+/// longitude the further north you are. Taking `cos φ` at the site collapses
+/// that trapezoid into a rectangle, which is exactly zero error at the box
+/// centre and up to 7.6 km of east-west drift at the corners of the shipped
+/// 460 km box, growing with latitude. A forecaster registering a hook echo
+/// against a town gets it 8 km off, and this repo has already shipped a
+/// misregistration of precisely this class once.
+///
+/// Nothing else could see it. `tests/floor_alignment.rs` scores a **CPU
+/// restatement** of this function, so mutating the WGSL leaves it green; every
+/// other GPU floor fixture here sits on the equator through
+/// [`equatorial_floor_lanes`], whose own doc admits the trapezoid is
+/// "deliberately absent"; and `tests/volume_real_mask.rs` drives a real
+/// latitude but writes a PPM and asserts nothing. Changing line 544 of
+/// `volume.wgsl` to `cos(radians(site_lat_deg))` passed all three suites.
+///
+/// # The fixture
+///
+/// A 45 °N site with the box's **west and south edges on the site** — 100 km
+/// east by 400 km north — so the probe pixel is 3.1 ° of latitude away from the
+/// site and `cos φ` has moved a long way. The mirror is a red ramp that is
+/// exactly linear in `u` over the half of it the footprint uses, so the byte
+/// read back *is* a measurement of `u`, to within the ramp's own 8-bit
+/// quantisation.
+///
+/// Two assertions, and the second is what makes the first mean anything:
+///
+///  1. the read-back matches the `cos`-at-pixel prediction to within 3;
+///  2. the two predictions are more than 8 apart, so the probe is demonstrably
+///     capable of telling them apart rather than agreeing with both.
+///
+/// ```text
+/// cargo test -p rustdar-frontend --test volume_gpu \
+///     the_floor_takes_cos_at_the_pixels_latitude_not_the_sites \
+///     -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
+fn the_floor_takes_cos_at_the_pixels_latitude_not_the_sites() {
+    let _serialised = gpu_lock();
+    let size = [128u32, 128];
+    let cells = [8u32, 8, 8];
+    let (device, queue) = device();
+    let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Bgra8Unorm));
+    pipelines.upload_quad(&queue);
+
+    // The shader's own constant, and `ImageBounds`'.
+    const KM_PER_DEGREE_LAT: f64 = 111.32;
+    const SITE_LAT: f64 = 45.0;
+    // East by north. The west and south edges sit *on* the site, so `x_km` and
+    // `y_km` are the box coordinate times these — the simplest possible
+    // arithmetic on the side of the fixture, leaving the reprojection as the
+    // only interesting step.
+    const BOX_EAST_KM: f32 = 100.0;
+    const BOX_NORTH_KM: f32 = 400.0;
+    // Mirror `u` per degree of longitude. Chosen so the east edge of the
+    // footprint lands near `u = 0.94` — as far along the ramp as it can go
+    // while staying clear of the border texel, which is what maximises the gap
+    // between the two hypotheses (they differ by a *ratio* of `cos`, so the
+    // discrimination scales with how far out on the ramp the probe sits).
+    const U_PER_DEGREE_LON: f32 = 0.375;
+
+    // A red ramp, exactly linear in `u` over 0.5..1 and clamped to nothing
+    // below. Linear filtering between texels that lie on a line reproduces the
+    // line, so the sample at any `u` in that half is `(u - 0.5) * 510` to
+    // within the 8-bit rounding of the texels either side.
+    //
+    // 510 rather than 255: the footprint only ever uses the upper half of the
+    // mirror's `u`, so a ramp over that half alone has twice the sensitivity —
+    // which is what puts the two hypotheses more than 8 levels apart instead of
+    // 6. The lower half is never sampled; see the `u` bound asserted below.
+    const MIRROR_W: u32 = 256;
+    const MIRROR_H: u32 = 64;
+    let ramp = |u: f64| ((u - 0.5) * 510.0).clamp(0.0, 255.0);
+    let mut mirror_rgba = Vec::with_capacity((MIRROR_W * MIRROR_H * 4) as usize);
+    for _row in 0..MIRROR_H {
+        for col in 0..MIRROR_W {
+            let u = (f64::from(col) + 0.5) / f64::from(MIRROR_W);
+            mirror_rgba.extend_from_slice(&[ramp(u).round() as u8, 0, 0, 255]);
+        }
+    }
+    let floor = planted_mirror(
+        &device,
+        &queue,
+        &pipelines,
+        [MIRROR_W, MIRROR_H],
+        &mirror_rgba,
+    );
+
+    // `v` per unit of Mercator y: one whole mirror over the 40..50 °N span,
+    // negative because `v` runs down the picture while Mercator y runs north.
+    // Derived from `mercator_y` rather than tabulated, for the same reason
+    // `equatorial_floor_lanes` derives its own.
+    let v_per_mercator_y = -1.0 / (mercator_y(50.0) - mercator_y(40.0));
+
+    let empty = vec![0u8; (cells[0] * cells[1] * cells[2]) as usize];
+    let lut = vec![0u8; VOLUME_LUT_BYTES];
+    let mut uniform = VolumeUniform::new([BOX_EAST_KM, BOX_NORTH_KM, 10.0], cells);
+    uniform.box_from_clip = box_from_clip_down(2);
+    uniform.eye_in_box = eye_outside(2);
+    uniform.gradient_shading = false;
+    uniform.map_floor = true;
+    uniform.floor_uv = [0.5, 0.5, U_PER_DEGREE_LON, v_per_mercator_y as f32];
+    uniform.floor_geo = [
+        SITE_LAT as f32,
+        // West and south edges, as kilometres east and north of the site.
+        0.0,
+        0.0,
+        if floor.is_gamma_encoded() { 1.0 } else { 0.0 },
+    ];
+
+    // The far north-east pixel: the corner of the image, which is the corner of
+    // the *visible* footprint — see `floor_hit_of_pixel` for why that is 0.872
+    // of the box and not 1.0.
+    let (probe_col, probe_row) = (size[0] - 1, 0);
+    let (hit_x, hit_y) = floor_hit_of_pixel(probe_col, probe_row, size);
+    let x_km = hit_x * f64::from(BOX_EAST_KM);
+    let y_km = hit_y * f64::from(BOX_NORTH_KM);
+
+    // The two hypotheses, differing in one `cos` and nothing else.
+    let lat_at_pixel = SITE_LAT + y_km / KM_PER_DEGREE_LAT;
+    let predict = |cos_lat: f64| {
+        let d_lon = x_km / (KM_PER_DEGREE_LAT * cos_lat);
+        ramp(0.5 + d_lon * f64::from(U_PER_DEGREE_LON))
+    };
+    let cos_at_pixel = predict(lat_at_pixel.to_radians().cos());
+    let cos_at_site = predict(SITE_LAT.to_radians().cos());
+
+    // The probe proves itself before it is trusted: a fixture whose two
+    // hypotheses agree would pass whatever the shader did.
+    assert!(
+        (cos_at_pixel - cos_at_site).abs() > 8.0,
+        "this fixture no longer discriminates: cos-at-pixel predicts \
+         {cos_at_pixel:.1} and cos-at-site {cos_at_site:.1}, only \
+         {:.1} apart. The box, the latitude or the ramp's slope has been \
+         changed in a way that collapses the very difference under test.",
+        (cos_at_pixel - cos_at_site).abs(),
+    );
+    // And the footprint must stay on the mirror, or the guard returns
+    // transparent and both hypotheses read back as zero.
+    assert!(
+        cos_at_pixel < 255.0,
+        "the ramp saturates at the probe: `u` has run past the mirror's east \
+         edge and the measurement is a clamp, not a reprojection",
+    );
+
+    let pixels = raymarch_once_with_floor(
+        &device, &queue, &pipelines, cells, &empty, &lut, &uniform, size, &floor,
+    );
+    let probe = pixels[(probe_row * size[0] + probe_col) as usize];
+    assert_eq!(
+        probe[3], 255,
+        "the probe pixel must be opaque ground, got {probe:?}; the footprint \
+         has moved off the mirror and nothing below measures anything",
+    );
+    let read = f64::from(probe[0]);
+    assert!(
+        (read - cos_at_pixel).abs() <= 3.0,
+        "the floor read back red {read} at the box's far north-east corner. \
+         Taking `cos φ` at this pixel's own latitude predicts \
+         {cos_at_pixel:.1}; taking it at the site's predicts {cos_at_site:.1}. \
+         The shader has stopped correcting the footprint's trapezoid, which \
+         drifts the ground east-west by up to 7.6 km at the corners of the \
+         shipped box — zero at the centre, growing with latitude.",
+    );
+}
+
+/// A **translucent** mirror composites at its own alpha, in both of the two
+/// encodings egui can have written it in.
+///
+/// # What this is the only coverage of
+///
+/// Every other mirror fixture in this file is fully opaque, and a fully opaque
+/// colour is the same four bytes premultiplied or straight — so deleting
+/// `floor_colour`'s `sample.rgb / sample.a` changes nothing anywhere else, and
+/// two doc comments here say as much. The one test translucent floor content
+/// ever had died with `volume_floor.rs`. What regresses without this: SPC
+/// outlook fills, warning and watch polygons, the range ring and the palette's
+/// faded low end all composite far too bright on the floor while looking right
+/// on the 2D pane beside it.
+///
+/// # Why both encodings, and why the arithmetic is not symmetric
+///
+/// egui premultiplies in **gamma** space and only then encodes
+/// (`egui-wgpu-0.35.0/src/egui.wgsl`): the gamma entry point writes
+/// `gamma(C) * A`, the linear one writes `linear_from_gamma_rgb(gamma(C) * A)`,
+/// alpha untouched in both. So the un-premultiply has to be taken in gamma
+/// space in *both* arms — dividing the linear texel by `A` and calling the
+/// result straight linear returns 0.428 where 1.0 is correct at `C = 1`,
+/// `A = 0.5`, which is what shipped. The arms are therefore fixtures that
+/// differ only in which of those two bytes is planted and what `floor_geo.w`
+/// says; both must recover the same white.
+///
+/// Straight white at half alpha is the maximally discriminating fixture:
+/// deleting the division reads back 64 in the gamma arm and 88 in the linear
+/// one, against 128 for both when it is right.
+///
+/// ```text
+/// cargo test -p rustdar-frontend --test volume_gpu \
+///     a_translucent_mirror_composites_at_its_own_alpha \
+///     -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
+fn a_translucent_mirror_composites_at_its_own_alpha() {
+    let _serialised = gpu_lock();
+    let size = [64u32, 64];
+    let cells = [8u32, 8, 8];
+    let (device, queue) = device();
+    let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Bgra8Unorm));
+    pipelines.upload_quad(&queue);
+
+    // Straight white at half alpha.
+    const ALPHA: u8 = 128;
+    let alpha = f64::from(ALPHA) / 255.0;
+    // `gamma(C) * A` with C white, which is what egui's *gamma* entry point
+    // writes and what its linear one encodes.
+    let premultiplied_gamma = 1.0 * alpha;
+    let gamma_texel = (premultiplied_gamma * 255.0).round() as u8;
+    let linear_texel = (linear_from_gamma(premultiplied_gamma) * 255.0).round() as u8;
+    // The raymarch's own output convention is egui's: gamma-encoded and
+    // premultiplied. Recovering straight white means writing `gamma(1) * A`
+    // back out, which is the same byte the gamma arm planted.
+    let expected = f64::from(gamma_texel);
+
+    let empty = vec![0u8; (cells[0] * cells[1] * cells[2]) as usize];
+    let lut = vec![0u8; VOLUME_LUT_BYTES];
+
+    for (gamma_encoded, texel, arm) in [
+        (true, gamma_texel, "gamma (non-sRGB swapchain)"),
+        (false, linear_texel, "linear (sRGB swapchain)"),
+    ] {
+        let mirror_rgba: Vec<u8> = std::iter::repeat_n([texel, texel, texel, ALPHA], 64)
+            .flatten()
+            .collect();
+        let floor = planted_mirror(&device, &queue, &pipelines, [8, 8], &mirror_rgba);
+
+        // Nothing in the box, so the pixel read back is the floor's own
+        // composite and not a blend with a march.
+        let mut uniform = VolumeUniform::new(equatorial_box_km(), cells);
+        uniform.box_from_clip = box_from_clip_down(2);
+        uniform.eye_in_box = eye_outside(2);
+        uniform.gradient_shading = false;
+        uniform.map_floor = true;
+        let (floor_uv, mut floor_geo) = equatorial_floor_lanes(gamma_encoded);
+        uniform.floor_uv = floor_uv;
+        // The lanes take the flag as an argument, but say so here too: this
+        // fixture *lies* about the mirror's encoding in one arm, planting the
+        // bytes the other entry point would have written into the one texture
+        // format a test can make. That is the same device
+        // `the_floor_decodes_the_mirror_only_when_the_flag_says_to` uses.
+        floor_geo[3] = if gamma_encoded { 1.0 } else { 0.0 };
+        uniform.floor_geo = floor_geo;
+
+        let pixels = raymarch_once_with_floor(
+            &device, &queue, &pipelines, cells, &empty, &lut, &uniform, size, &floor,
+        );
+        let px = centre(&pixels, size);
+        assert!(
+            (f64::from(px[3]) - f64::from(ALPHA)).abs() <= 3.0,
+            "the {arm} arm put the floor down at alpha {} where the mirror's \
+             own is {ALPHA}; the floor's coverage is no longer the mirror's \
+             alpha, got {px:?}",
+            px[3],
+        );
+        for channel in 0..3 {
+            assert!(
+                (f64::from(px[channel]) - expected).abs() <= 3.0,
+                "the {arm} arm read back {px:?} where {expected} was due in \
+                 every colour channel. The mirror holds straight white at \
+                 alpha {ALPHA}, premultiplied in gamma space; recovering it \
+                 means dividing by alpha *in gamma space* and re-premultiplying \
+                 on the way out. Too dark means the un-premultiply is missing; \
+                 the linear arm reading ~88 means it is being taken in linear \
+                 space, which is a different wrong answer.",
+            );
+        }
+    }
+}
+
 /// The smoothed reconstruction really reaches the coarse level: a lone voxel
 /// paints a **wider** footprint through the cloud rung than through the raw
 /// field.

@@ -234,10 +234,17 @@ pub struct VolumeFrameState {
     /// order reads the previous frame's affine. The mirror it samples is
     /// always this frame's picture, so during a pan of the source map the
     /// floor can trail the pane it mirrors by one frame's pan delta. That is
-    /// bounded by one frame and self-corrects the instant the gesture stops;
-    /// the alternative is a second layout pass over every pane purely to hoist
-    /// four numbers, which is a large cost for an artefact nobody can see at
-    /// 60 Hz.
+    /// bounded by one frame; the alternative is a second layout pass over every
+    /// pane purely to hoist four numbers, which is a large cost for an artefact
+    /// nobody can see at 60 Hz.
+    ///
+    /// Self-correction needs a *next frame*, though, and the app returns to
+    /// `ControlFlow::Wait` when idle. A **discontinuous** jump — a site switch,
+    /// jump-to-live, a layout change — puts a whole-continent offset on that
+    /// frame rather than a pan delta, and if it is the last frame requested the
+    /// misregistration is what stays on screen. So `render_panes` asks for a
+    /// repaint whenever a map pane's freshly recorded affine differs from the
+    /// one an earlier-indexed 3D pane consumed. A steady map asks for nothing.
     pub source: Option<MapPaneGeo>,
     /// The user's Volume Alpha curve for this pane's product, or `None` for
     /// an untouched editor.

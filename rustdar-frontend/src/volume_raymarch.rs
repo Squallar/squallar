@@ -1025,8 +1025,15 @@ impl PaneMirror {
 ///
 /// A free function rather than a method because both arms have to be pinned and
 /// a `PaneMirror` needs a `wgpu::Device` to exist, which CI rows do not have.
-/// Both arms are live: `app_state::select_surface_format` prefers a non-sRGB
-/// format only on wasm and takes `capabilities.formats[0]` natively.
+///
+/// Both arms are live, but they are not equally common.
+/// `app_state::preferred_surface_format` prefers a non-sRGB format on wasm, and
+/// natively prefers `Bgra8Unorm` — also non-sRGB — falling back to
+/// `capabilities.formats[0]` only on an adapter that does not offer it. So the
+/// gamma-encoded arm is the ordinary one on both platforms, and the sRGB arm is
+/// the rare one, reached on adapters lacking `Bgra8Unorm` (Android/Vulkan
+/// notably). Rare is not unreachable, which is why both are pinned — and it is
+/// the rare arm that would otherwise ship broken, because nobody sees it.
 pub fn mirror_is_gamma_encoded(format: wgpu::TextureFormat) -> bool {
     !format.is_srgb()
 }

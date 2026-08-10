@@ -168,12 +168,36 @@ impl super::Gui {
                 // copies could disagree silently, leaving a dead zone at the
                 // old position and a live one under the widget.
 
-                // A layout that shed panes must not leave a 3D pane
-                // reprojecting its floor through a map pane that no longer
-                // exists — indices are reused, so a stale entry would not read
-                // as absent, it would read as *some other pane's* map. See
-                // `Gui::map_pane_geo`.
-                self.map_pane_geo.retain(|&idx, _| idx < pane_count);
+                // A pane that is no longer a map on screen must not leave a 3D
+                // pane reprojecting its floor through the affine it had while
+                // it was one. Two ways that happens, and neither is exotic:
+                //
+                //  * the layout sheds panes — indices are reused, so a stale
+                //    entry would not read as absent, it would read as *some
+                //    other pane's* map;
+                //  * a map pane becomes a 3D or cross-section pane, from the
+                //    pane-kind menu or automatically through
+                //    `RegionDestination::Convert`, which on a one-pane width
+                //    class converts the source pane *itself*. The entry would
+                //    otherwise survive with the last map frame's affine for
+                //    ever: the mirror would copy a 3D pane's own chrome and the
+                //    dependent pane would sample it through a dead affine, so
+                //    the ground becomes a frozen slab of UI that never
+                //    recovers.
+                //
+                // Done here rather than in the arms below because here is the
+                // one point in the frame where every pane is intact and its
+                // kind is the live one — inside the loop the pane being drawn
+                // is held out by `mem::take`. It is also *before* any pane
+                // draws, so both readers (the `source_geo` lookup in the volume
+                // arm and `Gui::mirror_source_rects`) see an already-filtered
+                // map. See `Gui::map_pane_geo` and `VolumeFrameState::source`.
+                let kinds: Vec<PaneKind> = self.panes[..pane_count]
+                    .iter()
+                    .map(crate::pane::PaneState::kind)
+                    .collect();
+                self.map_pane_geo
+                    .retain(|&idx, _| kinds.get(idx) == Some(&PaneKind::Map));
 
                 for pane_idx in 0..pane_count {
                     let pane_rect = self.pane_layout.pane_rect(pane_idx, panel_rect);
@@ -476,10 +500,36 @@ impl super::Gui {
                                         // exists, and the affine it yields is
                                         // only true of the zoom and centre
                                         // this frame drew at.
-                                        self.map_pane_geo.insert(
-                                            pane_idx,
-                                            map_pane_geo_from(projector, pane_rect),
-                                        );
+                                        let geo = map_pane_geo_from(projector, pane_rect);
+                                        // One-frame staleness, mitigated where
+                                        // it can actually be seen. Panes render
+                                        // in index order, so a 3D pane sitting
+                                        // *before* its source reads the
+                                        // previous frame's affine. During a pan
+                                        // that is one frame's pan delta and
+                                        // nobody sees it at 60 Hz. Across a
+                                        // discontinuity — a site switch,
+                                        // jump-to-live, a layout change — it is
+                                        // a whole-continent offset, and the app
+                                        // returns to `ControlFlow::Wait` when
+                                        // idle: if that jump's frame is the
+                                        // last one requested, the misregistered
+                                        // floor is what stays on screen. So ask
+                                        // for the frame that corrects it, and
+                                        // only when there is something to
+                                        // correct — an affine that moved, with
+                                        // an earlier pane actually standing on
+                                        // it. A steady map requests nothing.
+                                        if self.map_pane_geo.get(&pane_idx) != Some(&geo)
+                                            && self.panes[..pane_idx].iter().any(|p| {
+                                                p.volume().is_some_and(|v| {
+                                                    !v.hide_floor && v.source_pane == Some(pane_idx)
+                                                })
+                                            })
+                                        {
+                                            ui.ctx().request_repaint();
+                                        }
+                                        self.map_pane_geo.insert(pane_idx, geo);
 
                                         let mut render_ctx = pane_render::PaneRenderCtx {
                                             pane_idx,
@@ -1754,6 +1804,17 @@ pub(crate) fn render_volume_controls(
 /// place, which reads as a control that half-works. A `source_pane` left behind
 /// is quieter still — the next region dragged on that map would re-aim this pane
 /// instead of opening one where it was dragged.
+pub(crate) fn reset_volume_view(volume: &mut crate::pane::VolumePane) {
+    volume.camera = crate::pane::OrbitCamera::default();
+    volume.region = None;
+    volume.source_pane = None;
+    // `view_mode` stays, deliberately: the reset is for a pane that is *lost*
+    // — angle, zoom, centre, region — and the view mode is not a way to be
+    // lost, it is a choice of picture. A reset that also flipped an
+    // isosurface pane back to the lit volume would un-choose something the
+    // user chose on purpose.
+}
+
 /// Reduce a live `walkers::Projector` to the four numbers a 3D pane's map
 /// floor is reprojected through. See [`crate::volume_view::MapPaneGeo`].
 ///
@@ -1808,17 +1869,6 @@ fn map_pane_geo_from(
         // strictly increasing, so the guard would be dead code.
         points_per_mercator_y: f64::from(north.y - anchor.y) / d_merc,
     }
-}
-
-pub(crate) fn reset_volume_view(volume: &mut crate::pane::VolumePane) {
-    volume.camera = crate::pane::OrbitCamera::default();
-    volume.region = None;
-    volume.source_pane = None;
-    // `view_mode` stays, deliberately: the reset is for a pane that is *lost*
-    // — angle, zoom, centre, region — and the view mode is not a way to be
-    // lost, it is a choice of picture. A reset that also flipped an
-    // isosurface pane back to the lit volume would un-choose something the
-    // user chose on purpose.
 }
 
 /// Kilofeet per kilometre. The vertical readout is in kft MSL because that is

@@ -156,9 +156,11 @@ fn the_quad_packs_its_corners_in_draw_order() {
 
 /// sRGB targets get the decoding blit and non-sRGB ones the pass-through.
 ///
-/// This is the whole of bug #2's mitigation on the Rust side, and both arms
-/// are reachable natively — `select_surface_format` only prefers a non-sRGB
-/// format on wasm32.
+/// This is the whole of bug #2's mitigation on the Rust side, and both arms are
+/// reachable — `app_state::preferred_surface_format` prefers a non-sRGB format
+/// on wasm32 and prefers `Bgra8Unorm` natively, taking `capabilities.formats[0]`
+/// only as a fallback, so an sRGB surface is the rare case rather than the
+/// routine native one.
 #[test]
 fn the_blit_entry_point_follows_the_surfaces_srgb_ness() {
     for format in [
@@ -182,6 +184,60 @@ fn the_blit_entry_point_follows_the_surfaces_srgb_ness() {
                  pass-through blit"
         );
     }
+}
+
+/// A mirror holds gamma-encoded texels exactly when its format is **not**
+/// sRGB, over every format the swapchain can actually be.
+///
+/// The companion to the blit test above, and for the same reason: the mirror is
+/// drawn by the very pipeline whose entry point that test pins, so the two
+/// answers have to be the same fact read from the two ends. What this adds is
+/// that the fact is a property of *sRGB-ness*, not of a particular format.
+///
+/// Without it the predicate's only coverage is a fixture precondition inside an
+/// `#[ignore]`d GPU test, which exercises one arm at one format. Two mutations
+/// that would survive that and die here:
+///
+///  * dropping the negation (`format.is_srgb()`), which inverts every arm;
+///  * narrowing to one format (`format != TextureFormat::Rgba8UnormSrgb`),
+///    which is *correct* for `MIRROR_FORMAT` and for the fixture's own arm, and
+///    wrong for a `Bgra8UnormSrgb` swapchain — the one an adapter without
+///    `Bgra8Unorm` actually lands on.
+///
+/// The failure mode either way is a floor a little too dark or too light beside
+/// a 2D pane that looks right, with no validation error to notice it by.
+#[test]
+fn a_mirror_is_gamma_encoded_exactly_when_its_format_is_not_srgb() {
+    for format in [
+        wgpu::TextureFormat::Rgba8Unorm,
+        wgpu::TextureFormat::Bgra8Unorm,
+    ] {
+        assert!(
+            mirror_is_gamma_encoded(format),
+            "{format:?} is not an sRGB format, so egui's gamma entry point drew \
+             the mirror and its texels are gamma-encoded; reporting otherwise \
+             makes the shader decode a value that is already linear",
+        );
+    }
+    for format in [
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        wgpu::TextureFormat::Bgra8UnormSrgb,
+    ] {
+        assert!(
+            !mirror_is_gamma_encoded(format),
+            "{format:?} is an sRGB format, so egui's linear entry point drew the \
+             mirror and the hardware encoded on write; reporting it as \
+             gamma-encoded makes the shader decode twice",
+        );
+    }
+    // The mirror's own default format must agree with the predicate rather than
+    // be a fifth case: `ensure_mirror` is handed the swapchain's format at
+    // runtime, and `FLOOR_FORMAT` is what the GPU fixtures plant through.
+    assert_eq!(
+        mirror_is_gamma_encoded(FLOOR_FORMAT),
+        !FLOOR_FORMAT.is_srgb(),
+        "FLOOR_FORMAT has stopped agreeing with the predicate that describes it",
+    );
 }
 
 /// The offscreen is not itself an sRGB format.

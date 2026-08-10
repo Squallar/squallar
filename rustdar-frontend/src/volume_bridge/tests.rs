@@ -391,11 +391,14 @@ fn a_released_id_is_never_handed_out_again() {
 /// precisely so it can be pinned here — the containing `prepare` needs a
 /// `wgpu::Device`, and this is where a sign or a swapped axis would live.
 ///
-/// The gamma lane gets both arms because **both are live**:
-/// `app_state::select_surface_format` prefers a non-sRGB format only on wasm
-/// and takes `capabilities.formats[0]` natively, so a desktop build and a
-/// browser build reach opposite branches. A wrong flag is a floor merely a
-/// little too dark or too light, with no validation error anywhere.
+/// The gamma lane gets both arms because **both are live** — though not
+/// equally common. `app_state::preferred_surface_format` prefers a non-sRGB
+/// format on wasm and prefers `Bgra8Unorm` (also non-sRGB) natively, taking
+/// `capabilities.formats[0]` only as a fallback. The sRGB arm is therefore the
+/// rare one, reached on an adapter that does not offer `Bgra8Unorm` —
+/// Android/Vulkan notably — rather than on every desktop. A wrong flag is a
+/// floor merely a little too dark or too light, with no validation error
+/// anywhere, so the rare arm is precisely the one that would ship broken.
 #[test]
 fn the_floor_lanes_normalise_points_against_the_frame_and_carry_the_encoding() {
     let source = FloorSource {

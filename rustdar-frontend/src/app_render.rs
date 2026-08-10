@@ -1310,20 +1310,35 @@ impl super::App {
         // disagreed would be a floor slightly too dark or too light, with no
         // validation error to notice it by. `AttachmentConfig` is where that
         // format is recorded.
+        //
+        // An empty guest list does not merely skip the pass — it gives the
+        // texture back. The mirror is frame-sized and singular (up to 16 MiB;
+        // `constants::VOLUME_MIRROR_BYTES_MAX`), and `release_pane` cannot free
+        // it because no single pane owns it. This is the one place that knows
+        // whether *anybody* still wants a floor, so it is the place that
+        // answers: closing the last 3D pane must not hold the frame's worth of
+        // colour for the rest of the session.
         let mirror_rects = self.gui.mirror_source_rects();
-        let mirror_target = (!mirror_rects.is_empty())
-            .then(|| {
-                let points = state.egui_renderer.context().pixels_per_point();
-                let (size, scale) = crate::egui_renderer::mirror_size_for(size_in_pixels, points);
-                let format = state.egui_renderer.attachment_config().color_format;
-                let device = state.device.clone();
-                state
-                    .egui_renderer
-                    .callback_resources_mut()
-                    .get_mut::<crate::volume::bridge::VolumeResources>()
-                    .map(|resources| (resources.ensure_mirror(&device, size, format), size, scale))
-            })
-            .flatten();
+        let mirror_target = if mirror_rects.is_empty() {
+            if let Some(resources) = state
+                .egui_renderer
+                .callback_resources_mut()
+                .get_mut::<crate::volume::bridge::VolumeResources>()
+            {
+                resources.release_mirror();
+            }
+            None
+        } else {
+            let points = state.egui_renderer.context().pixels_per_point();
+            let (size, scale) = crate::egui_renderer::mirror_size_for(size_in_pixels, points);
+            let format = state.egui_renderer.attachment_config().color_format;
+            let device = state.device.clone();
+            state
+                .egui_renderer
+                .callback_resources_mut()
+                .get_mut::<crate::volume::bridge::VolumeResources>()
+                .map(|resources| (resources.ensure_mirror(&device, size, format), size, scale))
+        };
         let mirror =
             mirror_target
                 .as_ref()
