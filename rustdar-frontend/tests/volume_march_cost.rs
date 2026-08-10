@@ -7,8 +7,13 @@
 //! GPU timestamp queries around the raymarch pass, at the two offscreen sizes
 //! the quality ladder actually uses, with shading both on and off.
 //!
-//! It is `#[ignore]`d because CI has no GPU, and env-driven because its input
-//! is a file on someone's disk:
+//! It is `#[ignore]`d and env-driven for the same single reason: its input is a
+//! Level II file on someone's disk. That, not the absence of a GPU, is what
+//! keeps it out of CI — the `gpu` job in `test.yaml` runs the adapter-only
+//! tests on lavapipe but cannot run this one, because no such file is in this
+//! repository and radar data is not going into git. It would also want
+//! `Features::TIMESTAMP_QUERY` and a timing worth reading, neither of which a
+//! software rasteriser offers.
 //!
 //! ```text
 //! VOL=/path/to/KDMX20250314_175512_V06 \

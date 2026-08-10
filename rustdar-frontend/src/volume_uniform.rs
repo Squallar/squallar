@@ -123,7 +123,9 @@ pub const DEFAULT_LIGHT_DIR: [f32; 3] = [-0.4, -0.5, 0.77];
 /// Everything the raymarch reads that is not a texture.
 ///
 /// Deliberately plain data with no wgpu in it, so the packing is unit-testable
-/// on a machine with no GPU — which is every CI row this repository has.
+/// on a machine with no GPU — which is every CI row this repository has. The
+/// `gpu` job does render, but on a software rasteriser, and it is not where a
+/// packing bug should first be caught.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VolumeUniform {
     /// Clip space to box space, **column-major**: `box_from_clip[c][r]`.

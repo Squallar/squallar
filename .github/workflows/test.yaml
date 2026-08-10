@@ -16,6 +16,95 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  # The `#[ignore]`d wgpu tests, run against Mesa's lavapipe.
+  #
+  # They stay `#[ignore]`d in the source: a developer on a box with no working
+  # Vulkan loader must still get a green `cargo test`, so the opt-in lives here
+  # rather than in an attribute. Everything this job runs is otherwise executed
+  # only when a human types the invocation from the files' module docs, which
+  # means a regression in the raymarch reached `main` green.
+  #
+  # A separate job from `test` on purpose. That one ends in a coverage push to
+  # the branch, and a slow or flaky row must not be able to take that with it.
+  # It is also not foldable into the coverage row even if it were free:
+  # `cargo llvm-cov` drives one `cargo test` invocation, and these tests need
+  # `-- --ignored` while the rest of the workspace must not get it -- the
+  # ignored set includes tests that hit live S3 buckets and live APIs.
+  gpu:
+    name: GPU (software rasteriser)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install system deps
+        # libudev-dev for the same reason the `test` job needs it:
+        # rustdar-platform enables rustdar-gps/serial unconditionally off
+        # Android and iOS. mesa-vulkan-drivers is what carries lavapipe.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev mesa-vulkan-drivers
+      - name: Point the Vulkan loader at lavapipe
+        # Discovered rather than written out: Mesa installs the ICD manifest as
+        # `lvp_icd.x86_64.json` and some distributions drop the arch infix, and
+        # a path that is merely wrong would leave the loader with no ICD at all.
+        # That failure is at least loud -- `request_adapter` returns `None` and
+        # every test below panics on its `expect`, so a wrong path can never
+        # pass quietly -- but the glob costs nothing and spares the red run.
+        #
+        # `VK_ICD_FILENAMES` is the pre-1.3.207 spelling, set alongside for
+        # loaders older than whatever the runner image ships.
+        #
+        # WGPU_BACKEND pins the *backend*, which the ICD variables cannot do:
+        # they constrain Vulkan only, and wgpu's default is every backend the
+        # platform has. Without the pin an adapter could still be handed over by
+        # GL, and on a runner that turns out to have a real GPU this job would
+        # go green having tested the thing it was not asked about. Verified
+        # locally on a box with an RTX 3090: unset the ICD variable and the
+        # suite silently runs on the 3090 instead.
+        run: |
+          shopt -s nullglob
+          icds=(/usr/share/vulkan/icd.d/lvp_icd*.json)
+          icd=${icds[0]:?no lavapipe ICD manifest in /usr/share/vulkan/icd.d}
+          echo "Vulkan ICD: $icd"
+          {
+            echo "VK_DRIVER_FILES=$icd"
+            echo "VK_ICD_FILENAMES=$icd"
+            echo "WGPU_BACKEND=vulkan"
+          } >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: gpu
+      # No `--all-features` on either step below, and not an oversight: the only
+      # feature it adds on Linux is rustdar-android's `jni-typecheck`, which is
+      # the `test` job's reason for the flag and builds nothing this job runs.
+      #
+      # `--nocapture` is load-bearing. Each test binary prints the adapter it
+      # got, once, and a passing test's output is otherwise discarded -- which
+      # would leave no way to tell from the log whether lavapipe was really what
+      # ran.
+      - name: Run the adapter-only integration tests
+        run: |
+          cargo test -p rustdar-frontend \
+            --test volume_gpu --test volume_silhouette \
+            -- --ignored --nocapture
+      # The other three `#[ignore]`d files in that directory --
+      # volume_real_mask, volume_march_cost and floor_alignment -- are
+      # deliberately not here. Each reads a Level II volume from a path given in
+      # the environment, no such file exists in this repository, and radar data
+      # is not going into git. They remain hand-run.
+      - name: Run the adapter-only unit tests
+        # Named exactly, because this binary's ignored set also holds
+        # `live_a_poll_fetches_each_object_once`, which hits a live S3 bucket.
+        #
+        # A rename would leave `--exact` matching nothing, and the harness exits
+        # 0 on zero tests -- silently reopening exactly the hole this job was
+        # added to close. So the count is asserted rather than assumed.
+        run: |
+          cargo test -p rustdar-frontend --lib -- --ignored --nocapture --exact \
+            volume::tests::a_real_adapter_supports_the_volume_format \
+            egui_renderer::tests::a_paint_callbacks_own_command_buffer_reaches_the_queue \
+            | tee "$RUNNER_TEMP/lib-gpu.log"
+          grep -q '^test result: ok\. 2 passed' "$RUNNER_TEMP/lib-gpu.log"
+
   test:
     name: Test
     runs-on: ubuntu-24.04

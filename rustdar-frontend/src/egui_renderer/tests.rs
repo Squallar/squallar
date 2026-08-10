@@ -200,7 +200,13 @@ fn the_pass_draw_opens_matches_what_attachment_config_promises() {
 /// what `end_pass_and_upload_carries_the_callback_command_buffers` and
 /// `the_frame_path_submits_only_through_prepared_frame` pin.
 ///
-/// Needs a real adapter, so it is ignored by default. CI has no GPU:
+/// Needs a real adapter, so it is ignored by default — but CI opts in, and the
+/// `gpu` job in `test.yaml` names this test explicitly. Renaming it means
+/// editing that job; the step asserts its own test count, so a stale name fails
+/// the row rather than silently running nothing.
+///
+/// Passes on Mesa's lavapipe, which is what lets that row exist on a runner
+/// with no graphics hardware. Locally:
 ///
 /// ```text
 /// cargo test -p rustdar-frontend --lib \

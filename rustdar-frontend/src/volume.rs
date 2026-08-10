@@ -642,7 +642,13 @@ mod tests {
     /// that `R8Unorm` really is bindable and filterable under
     /// `Features::empty()`, which is the premise the whole format choice rests on.
     ///
-    /// Needs a real adapter, so it is ignored by default. CI has no GPU:
+    /// Needs a real adapter, so it is ignored by default — but CI opts in, and
+    /// the `gpu` job in `test.yaml` names this test explicitly. Renaming it
+    /// means editing that job; the step asserts its own test count, so a stale
+    /// name fails the row rather than silently running nothing.
+    ///
+    /// Passes on Mesa's lavapipe, which is what lets that row exist on a runner
+    /// with no graphics hardware. Locally:
     ///
     /// ```text
     /// cargo test -p rustdar-frontend --lib \

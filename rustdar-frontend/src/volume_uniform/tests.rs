@@ -140,8 +140,10 @@ fn every_lane_lands_at_its_std140_offset() {
     // `to_bytes` writes at, so on its own it cannot see a transposition:
     // swap `OFFSET_BOX_SIZE_KM` and `OFFSET_GRID_DIMS` and the writer and
     // the reader move together. A review proved it — all 103 host tests
-    // passed, and only the `#[ignore]`d GPU test noticed, on a machine CI
-    // does not have. The realistic route in is someone reordering `struct
+    // passed, and only the `#[ignore]`d GPU test noticed — which at the time
+    // ran nowhere but by hand. It runs in CI now, on lavapipe, but a
+    // transposition should not need a render to be caught at all.
+    // The realistic route in is someone reordering `struct
     // Volume` in the WGSL and transposing two offsets to match; the shader
     // then reads the box size out of the grid-dims slot, which is wrong
     // step lengths and wrong gradient spacing, i.e. a merely hazy volume.
