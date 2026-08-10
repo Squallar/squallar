@@ -1,6 +1,10 @@
 /target
 # The iOS cross-build's own CARGO_TARGET_DIR; see ios/Makefile.
 /target-ios
+# The macOS bundle's, likewise: `macos/Makefile` defaults `TARGET_DIR` to this
+# and builds into it whenever `BIN=` is not passed. CI always passes `BIN=`, so
+# this only ever appears in a working tree — which is exactly why it was missed.
+/target-macos
 /coverage
 /lcov.info
 # cargo-mutants writes its whole scratch build tree here, and rotates the
