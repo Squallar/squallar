@@ -5,6 +5,13 @@
 //! workflow is a separate, last, revertable commit that nothing before it may
 //! depend on.
 //!
+//! Which means **none of this file runs in CI** — `test.yaml` runs
+//! `cargo llvm-cov --no-report --all-features` and never passes `-- --ignored`,
+//! so every test below is compiled and linted on every PR and executed only
+//! when a human types the invocation. Whatever a test here protects is
+//! protected by hand, not by the pipeline; a regression it would catch reaches
+//! `main` green.
+//!
 //! Run the lot with:
 //!
 //! ```text
