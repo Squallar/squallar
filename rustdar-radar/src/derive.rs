@@ -183,7 +183,13 @@ fn derive_srv(scan: &Scan, storm_motion_override: Option<(f32, f32)>) -> Option<
     });
     // No vector, no SRV: base velocity under a storm-relative label is the
     // failure this refusal exists to prevent.
-    let motion = srv::storm_motion(profile.as_ref(), user)?;
+    let Some(motion) = srv::storm_motion(profile.as_ref(), user) else {
+        log::warn!(
+            "SRV derivation refused: no storm motion vector — no user override \
+             and no Bunkers fit from the volume's own winds"
+        );
+        return None;
+    };
 
     let sweeps: Vec<Sweep> = velocity_sweeps(scan)
         .into_iter()
@@ -243,7 +249,16 @@ fn derive_kdp(scan: &Scan) -> Option<Scan> {
         .filter_map(|sweep| {
             let radials = sweep.radials();
             radials.first()?.differential_phase()?;
-            let derived = kdp::compute_kdp(radials, &params)?;
+            let derived = kdp::compute_kdp(radials, &params);
+            if derived.is_none() {
+                log::warn!(
+                    "KDP derivation: the estimator refused a \u{3a6}DP-carrying sweep \
+                     (elevation {}, {} radials)",
+                    sweep.elevation_number(),
+                    radials.len(),
+                );
+            }
+            let derived = derived?;
             // The estimator's f32 rows, widened once for the shared encoder.
             let values: Vec<Vec<f64>> = derived
                 .values
@@ -265,9 +280,14 @@ fn derive_kdp(scan: &Scan) -> Option<Scan> {
 
 /// The derived scan, under the source volume's own coverage pattern — the
 /// ladder is resolved against the same cut table either way — or `None` when
-/// nothing derived.
+/// nothing derived. Logged, so a `None` swallowed by a `?` upstream still
+/// leaves its reason somewhere — the same rule `render_section` states.
 fn non_empty_scan(source: &Scan, sweeps: Vec<Sweep>) -> Option<Scan> {
     if sweeps.is_empty() {
+        log::warn!(
+            "derivation refused: no sweep of the volume derived (of {} sweeps present)",
+            source.sweeps().len(),
+        );
         return None;
     }
     Some(Scan::new(source.coverage_pattern().clone(), sweeps))

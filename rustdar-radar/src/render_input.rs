@@ -543,7 +543,17 @@ impl RenderInput {
         // field. Degrading to "no moments" rather than panicking keeps a
         // hand-crafted payload off a message port from taking the tab down; it
         // renders nothing, which is what such a request means anyway.
-        let slot = self.product.moment_slot();
+        //
+        // The same slot resolution `extract_volume_parts` writes through: the
+        // native slot, or a derived product's *source* slot — KDP's primary
+        // moment is ΦDP, and reading only `moment_slot` here dropped it on
+        // the floor while the extras (which exclude the slot) survived, so a
+        // KDP payload reconstructed with reflectivity and ρHV and no phase.
+        // `the_kdp_payload_round_trips_its_phase` pins the pair.
+        let slot = self
+            .product
+            .moment_slot()
+            .or_else(|| crate::derive::derived_slot(self.product));
         let sweeps = self
             .sweeps
             .iter()
@@ -1130,11 +1140,15 @@ impl RenderInput {
             return None;
         }
         let product = RadarProduct::from_wire_code(r.u16()?)?;
-        // The same refusal `extract` makes. A payload naming a Level III
-        // product has no moment any field could hold, so it could only ever
-        // render nothing; refusing it here keeps that from looking like a
-        // renderer that found no sweep.
-        product.moment_slot()?;
+        // The same refusal the extractors make: a native slot or a derived
+        // product's source slot. A payload naming a product with neither has
+        // no moment any field could hold, so it could only ever render
+        // nothing; refusing it here keeps that from looking like a renderer
+        // that found no sweep. (KDP passes through the derived arm — its
+        // primary payload is ΦDP.)
+        product
+            .moment_slot()
+            .or_else(|| crate::derive::derived_slot(product))?;
         let elevation = r.f32()?;
         let radar_lat = r.f64()?;
         let radar_lon = r.f64()?;
@@ -1705,6 +1719,88 @@ mod tests {
         let b = render_from(&other).unwrap();
         assert!(painted(&a) > 1_000);
         assert_ne!(a.0, b.0, "the vector was carried but never applied");
+    }
+
+    /// A KDP payload's primary moment — ΦDP, the derivation's *source* slot —
+    /// survives extraction and reconstruction, with the estimator's gate
+    /// moments (Z, ρHV) riding the extras.
+    ///
+    /// The reconstruction's slot resolution must mirror the extraction's:
+    /// `moment_slot()` alone is `None` for KDP, and the measured failure mode
+    /// was exactly this pair disagreeing — the extraction wrote ΦDP as the
+    /// primary payload, `to_scan` dropped it, and a live KDP volume
+    /// reconstructed with reflectivity and ρHV and no phase, refusing every
+    /// 3D build with nothing in the log.
+    #[test]
+    fn the_kdp_payload_round_trips_its_phase() {
+        let radials: Vec<Radial> = (0..RADIALS)
+            .map(|i| {
+                Radial::new(
+                    0,
+                    i as u16,
+                    i as f32 * (360.0 / RADIALS as f32),
+                    360.0 / RADIALS as f32,
+                    RadialStatus::IntermediateRadialData,
+                    1,
+                    0.5,
+                    Some(moment(REFL_SCALE, REFL_OFFSET, 150, 600)),
+                    None,
+                    None,
+                    None,
+                    // ΦDP through its own codec, a mid-scale phase.
+                    Some(moment(2.8361, 2.0, 120, 600)),
+                    // ρHV near 1: the estimator's meteorological gate.
+                    Some(moment(300.0, -60.5, 237, 600)),
+                    None,
+                )
+            })
+            .collect();
+        let scan = Scan::new(
+            VolumeCoveragePattern::new(
+                212,
+                0,
+                0.5,
+                PulseWidth::Short,
+                false,
+                0,
+                false,
+                0,
+                false,
+                false,
+                0,
+                false,
+                false,
+                vec![cut(0.5)],
+            ),
+            vec![Sweep::new(1, radials)],
+        );
+        let sweeps: Vec<&Sweep> = scan.sweeps().iter().collect();
+        let input = RenderInput::extract_volume_parts(
+            scan.coverage_pattern(),
+            &sweeps,
+            RadarProduct::SpecificDifferentialPhase,
+            LAT,
+            LON,
+            None,
+        )
+        .expect("a \u{3a6}DP-carrying volume extracts for KDP");
+
+        // Through the wire too: the worker decodes bytes, not the struct.
+        let decoded = RenderInput::from_bytes(&input.to_bytes()).expect("the payload round-trips");
+        let back = decoded.to_scan();
+        let first = &back.sweeps()[0].radials()[0];
+        assert!(
+            first.differential_phase().is_some(),
+            "the primary source moment was dropped on reconstruction",
+        );
+        assert!(
+            first.correlation_coefficient().is_some(),
+            "the estimator's \u{3c1}HV gate must ride the extras",
+        );
+        assert!(
+            first.reflectivity().is_some(),
+            "the estimator's Z gate must ride the extras",
+        );
     }
 
     /// `to_bytes` reserves exactly what it writes. Wrong by a little is only a
