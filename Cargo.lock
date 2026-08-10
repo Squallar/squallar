@@ -4154,6 +4154,7 @@ dependencies = [
 name = "rustdar-platform"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "dark-light",
  "env_logger",
  "iana-time-zone",
@@ -4165,6 +4166,7 @@ dependencies = [
  "rustdar-radar",
  "walkers",
  "winit",
+ "zbus",
 ]
 
 [[package]]

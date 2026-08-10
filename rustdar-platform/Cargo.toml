@@ -47,3 +47,21 @@ dark-light = "=2.0.0"
 # additive across the graph, so this also keeps the port picker off mobile.
 rustdar-egui = { workspace = true, features = ["gps-serial"] }
 rustdar-gps = { workspace = true, features = ["serial"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# GeoClue2 lives on the session bus and nowhere else, so `os_location/linux.rs`
+# needs a D-Bus client. Already in the graph via `dark-light -> ashpd`, which
+# resolves the same 5.18.0 -- so this adds **zero packages**.
+#
+# It is not free, though, and the plan's earlier "harmless" was an
+# overstatement. `ashpd` selects `zbus/async-io` *without* `blocking-api`;
+# taking the default features here turns that on, which recompiles `zbus` and
+# `zbus_macros` with a larger surface on the linux, `standalone`, clippy-host
+# and test rows. That is the trade being made deliberately: the whole provider
+# is written against `zbus::blocking` with no async and no executor, on a
+# thread whose entire job is to sit in a blocking `next()`.
+zbus = "=5.18.0"
+# For `GpsFix::timestamp`, which is a `chrono::NaiveDateTime` and arrives from
+# GeoClue as a `(tt)` pair of epoch seconds and microseconds. Already in the
+# graph via `rustdar-gps`; named here because this crate now converts one.
+chrono = { workspace = true }

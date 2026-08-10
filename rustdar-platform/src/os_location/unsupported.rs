@@ -36,10 +36,14 @@ impl OsLocationReader {
     /// Takes the same arguments a real provider needs so that swapping one in
     /// touches only `mod.rs`. The `Sender` is dropped here, which closes the
     /// channel — exactly what the caller's drain expects from a source that
-    /// will never produce.
+    /// will never produce. `wake` and `report` are dropped for the same reason:
+    /// a provider that never produces a fix has no frame to ask for and no
+    /// permission change to announce.
     pub fn start(
         _config: &rustdar_gps::GpsConfig,
         _fixes: std::sync::mpsc::Sender<rustdar_gps::GpsFix>,
+        _wake: impl Fn() + Send + 'static,
+        _report: impl Fn(rustdar_gps::LocationPermission) + Send + 'static,
     ) -> Option<Self> {
         log::debug!("no OS location provider is compiled for this target");
         None

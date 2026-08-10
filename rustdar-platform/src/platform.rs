@@ -47,17 +47,67 @@ pub struct DesktopPlatform {
     /// two sources have to be told apart: `poll_gps_fix` picks between them (see
     /// [`os_location::prefer_fix`]) and cannot do that once they are merged.
     ///
-    /// `None` on every target today — [`os_location`] compiles only its
-    /// `unsupported` arm, whose `start` never returns a reader. The field is
-    /// here so the drain below is written once and the providers land against a
-    /// consumer that already exists.
+    /// `None` on the targets whose [`os_location`] arm is still `unsupported`,
+    /// whose `start` never returns a reader.
     ///
     /// [`os_location`]: crate::os_location
     /// [`os_location::prefer_fix`]: crate::os_location::prefer_fix
     os_fix_receiver: Option<std::sync::mpsc::Receiver<rustdar_gps::GpsFix>>,
+    /// The running OS location subscription (dropped to stop).
+    os_location_reader: Option<crate::os_location::OsLocationReader>,
+    /// What the OS location service last said, or `None` before it has been
+    /// asked anything.
+    ///
+    /// An atomic and not a `Cell`, because it is written from whatever thread
+    /// the provider is given and read from
+    /// [`location_permission`](PlatformBridge::location_permission), which is a
+    /// `&self` getter on the frame path. That rules out a `Cell` (not `Send`),
+    /// a `Receiver` (cannot be drained through `&self`) and a `Mutex` (a lock
+    /// on the frame path). See [`encode_permission`].
+    ///
+    /// **It deliberately outlives the reader.** A revocation arrives as a
+    /// permission change *and* stops delivery, and the gate responds to
+    /// `Denied` by dropping the reader — so a state that lived inside the
+    /// reader would evaporate at exactly the moment it started to matter, the
+    /// bridge would fall back to "nobody has been asked", and the app would ask
+    /// again straight into the refusal it just received.
+    os_location_state: Option<std::sync::Arc<std::sync::atomic::AtomicU8>>,
     /// Handed to the reader thread so a fix arriving while the loop is parked
     /// gets a frame to be shown on. See [`RedrawWaker`].
     redraw_waker: RedrawWaker,
+}
+
+/// [`rustdar_gps::LocationPermission`] as one byte, for the atomic above.
+///
+/// Hand-written rather than derived, and the discriminants are pinned by the
+/// round-trip test at the bottom of this file: the enum is not `repr(u8)` and
+/// nothing in `rustdar-gps` promises its variants keep their order, so a
+/// `as u8` cast here would be a silent miscommunication the first time someone
+/// inserts a variant.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn encode_permission(permission: rustdar_gps::LocationPermission) -> u8 {
+    use rustdar_gps::LocationPermission as P;
+    match permission {
+        P::Unknown => 0,
+        P::Prompt => 1,
+        P::Granted => 2,
+        P::Denied => 3,
+        P::Unavailable => 4,
+    }
+}
+
+/// The inverse of [`encode_permission`], with anything unrecognised read as
+/// `Unknown` — the one state that neither asks nor concludes.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn decode_permission(raw: u8) -> rustdar_gps::LocationPermission {
+    use rustdar_gps::LocationPermission as P;
+    match raw {
+        1 => P::Prompt,
+        2 => P::Granted,
+        3 => P::Denied,
+        4 => P::Unavailable,
+        _ => P::Unknown,
+    }
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -77,6 +127,8 @@ impl DesktopPlatform {
             gps_reader: None,
             gps_fix_receiver: None,
             os_fix_receiver: None,
+            os_location_reader: None,
+            os_location_state: None,
             redraw_waker: RedrawWaker::new(),
         }
     }
@@ -208,29 +260,103 @@ impl PlatformBridge for DesktopPlatform {
 
     // ── Platform location service ───────────────────────────────────────
     //
-    // Stubs. Linux (GeoClue2 over zbus), Windows (`AppCapability` +
-    // `Geolocator`) and macOS (`CLLocationManager`) each land here as their own
-    // piece of work, with their own dependency, their own permission mechanics
-    // and — on Linux and macOS — their own packaging: GeoClue's `Start()` fails
-    // without a `.desktop` file to resolve `DesktopId` against, and macOS needs
-    // a signed bundle or `locationd` re-prompts on every rebuild.
-    //
-    // `Unavailable` and not `Unknown` in the meantime, and the difference
-    // matters. `Unknown` means "ask again shortly", so the gate would poll a
-    // bridge that is never going to answer and the settings pane would sit on
-    // "Checking…" for the life of the process. `Unavailable` is the truth: this
-    // build has no OS location provider, the pane says so, and nothing spins.
+    // One shape for all three desktop OSes. Everything per-OS — GeoClue2 over
+    // zbus, `AppCapability` + `Geolocator`, `CLLocationManager` — is behind
+    // `crate::os_location`, which is the entire `cfg` surface; nothing here
+    // names a target.
 
+    /// Whatever the provider last reported, or [`Prompt`] before it has been
+    /// asked anything.
+    ///
+    /// **`Prompt` and not `Unknown` for the un-asked case, deliberately.**
+    /// `Unknown` means "the platform has not answered yet, look again shortly",
+    /// and this bridge's provider does not answer *until it is started* — the
+    /// first D-Bus round trip is the first answer, and it can sit on an agent
+    /// dialog, so it cannot be made on the frame path. Reporting `Unknown`
+    /// would leave the gate waiting for an answer that only asking produces:
+    /// the settings pane would read "Checking…" forever and nothing would ever
+    /// prompt. `Prompt` is also the honest description of the state — nobody
+    /// has been asked — and the one state in which asking is legitimate.
+    ///
+    /// A target whose provider is still `unsupported` never leaves `Prompt`
+    /// silently: its `start` returns `None` and `request_location` writes
+    /// `Unavailable` below.
+    ///
+    /// [`Prompt`]: rustdar_gps::LocationPermission::Prompt
     fn location_permission(&self) -> rustdar_gps::LocationPermission {
-        rustdar_gps::LocationPermission::Unavailable
+        match &self.os_location_state {
+            Some(state) => decode_permission(state.load(std::sync::atomic::Ordering::Relaxed)),
+            None => rustdar_gps::LocationPermission::Prompt,
+        }
     }
 
-    /// Nothing to ask, so nothing reached the OS.
+    /// Start a location session, if one is not already running.
+    ///
+    /// The `bool` is the honest answer for this bridge and not much of one: it
+    /// says a provider was constructed, which on Linux is true before any of
+    /// the work that can fail has happened. See the trait's note — nothing
+    /// durable may hang off it.
     fn request_location(&mut self) -> bool {
-        false
+        if self.os_location_reader.is_some() {
+            return true;
+        }
+        let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(encode_permission(
+            rustdar_gps::LocationPermission::Unknown,
+        )));
+        self.os_location_state = Some(std::sync::Arc::clone(&state));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let wake = self.redraw_waker.clone();
+        // Both callbacks run on the provider's thread. The wake is what makes a
+        // fix visible under `ControlFlow::Wait`; the report is what makes a
+        // revocation visible at all, since the gate stops polling once the
+        // answer is `Granted` and delivery is live.
+        let reported = std::sync::Arc::clone(&state);
+        let reader = crate::os_location::OsLocationReader::start(
+            &rustdar_gps::GpsConfig::default(),
+            tx,
+            move || wake.wake(),
+            move |permission| {
+                reported.store(
+                    encode_permission(permission),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            },
+        );
+
+        match reader {
+            Some(reader) => {
+                self.os_location_reader = Some(reader);
+                self.os_fix_receiver = Some(rx);
+                log::info!("OS location session requested");
+                true
+            }
+            None => {
+                // No provider compiled for this target. `Unavailable` and not
+                // `Denied`: there is no switch anywhere that changes it, so the
+                // pane must not send the user looking for one.
+                state.store(
+                    encode_permission(rustdar_gps::LocationPermission::Unavailable),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                false
+            }
+        }
     }
 
-    fn stop_location(&mut self) {}
+    /// Stop the stream. The permission is left exactly as the provider last
+    /// reported it — this is an off switch, not a revocation, and no platform
+    /// lets an app hand a permission back.
+    fn stop_location(&mut self) {
+        if self.os_location_reader.take().is_some() {
+            log::info!("OS location session stopped");
+        }
+        self.os_fix_receiver = None;
+    }
+
+    fn location_active(&self) -> bool {
+        self.os_location_reader.is_some()
+    }
 }
 
 // ── Android implementation ──────────────────────────────────────────────
@@ -629,4 +755,67 @@ pub fn create_platform() -> AndroidPlatform {
 #[cfg(target_os = "ios")]
 pub fn create_platform() -> IosPlatform {
     IosPlatform::new()
+}
+
+#[cfg(all(test, not(any(target_os = "android", target_os = "ios"))))]
+mod tests {
+    use super::*;
+    use rustdar_gps::LocationPermission as P;
+
+    const ALL: &[P] = &[P::Unknown, P::Prompt, P::Granted, P::Denied, P::Unavailable];
+
+    /// The provider thread writes this byte and the frame path reads it, so a
+    /// mapping that is not a bijection is a permission silently turning into a
+    /// different one — most damagingly `Denied` arriving as `Granted`.
+    #[test]
+    fn every_permission_survives_the_trip_through_the_atomic() {
+        for &permission in ALL {
+            assert_eq!(decode_permission(encode_permission(permission)), permission);
+        }
+    }
+
+    /// Distinct codes, checked separately from the round trip: a collision
+    /// where two variants share a byte would still round-trip for one of them
+    /// and quietly rewrite the other.
+    #[test]
+    fn no_two_permissions_share_a_code() {
+        let mut codes: Vec<u8> = ALL.iter().map(|&p| encode_permission(p)).collect();
+        codes.sort_unstable();
+        let count = codes.len();
+        codes.dedup();
+        assert_eq!(
+            codes.len(),
+            count,
+            "two permissions encode to the same byte"
+        );
+    }
+
+    /// The atomic starts at zero, and a `AtomicU8::new(0)` that meant anything
+    /// else would have the bridge claiming an answer before one exists.
+    /// `Unknown` is the state that neither asks nor concludes, which is the
+    /// only safe thing for a value nobody has written yet to mean.
+    #[test]
+    fn an_unwritten_atomic_reads_as_unknown() {
+        assert_eq!(decode_permission(0), P::Unknown);
+        assert_eq!(encode_permission(P::Unknown), 0);
+    }
+
+    /// Nothing writes a byte outside the mapping today, but the decode is on
+    /// the frame path and a garbage value must not become a *grant*.
+    #[test]
+    fn an_unrecognised_code_reads_as_unknown_rather_than_as_a_grant() {
+        assert_eq!(decode_permission(200), P::Unknown);
+        assert_eq!(decode_permission(u8::MAX), P::Unknown);
+    }
+
+    /// A fresh bridge has asked nothing, so it must report the one state in
+    /// which asking is legitimate. `Unknown` here would park the gate waiting
+    /// for an answer that only asking can produce, and `Unavailable` would
+    /// declare a working machine incapable.
+    #[test]
+    fn a_bridge_that_has_not_asked_yet_reports_prompt() {
+        let platform = DesktopPlatform::new();
+        assert_eq!(platform.location_permission(), P::Prompt);
+        assert!(!platform.location_active());
+    }
 }

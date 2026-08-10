@@ -22,6 +22,8 @@
 //!
 //! [`SerialGpsReader::start`]: rustdar_gps::SerialGpsReader::start
 
+#[cfg(target_os = "linux")]
+mod linux;
 mod unsupported;
 
 // The arm table. Written on `target_os` and never on `unix` or `target_family`,
@@ -39,10 +41,10 @@ mod unsupported;
 // business, not this one's), so `unsupported` is the right answer there and not
 // a stub.
 
-/// Phase 3: GeoClue2 over `zbus`, on the peer-scoped connection its `Location`
-/// objects require.
+/// GeoClue2 over `zbus`, on the peer-scoped connection its `Location` objects
+/// require.
 #[cfg(target_os = "linux")]
-use unsupported as provider;
+use linux as provider;
 
 /// Phase 4: `AppCapability` for the state, `Geolocator` to prompt, an MTA
 /// worker to keep `RequestAccessAsync` off the frame thread.

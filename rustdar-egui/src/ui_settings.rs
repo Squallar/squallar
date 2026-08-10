@@ -14,6 +14,37 @@ const SETTINGS_LARGE_SPACING: f32 = 8.0;
 #[cfg(feature = "gps-serial")]
 const GPS_BAUD_RATES: &[u32] = &[4800, 9600, 38400, 115200];
 
+/// What actually leaves the machine when the user says yes, in the pane that
+/// asks.
+///
+/// The button says "Use my location" and every platform's own dialog says some
+/// variant of "allow access to your location", and none of that tells the user
+/// that finding a position may mean **sending data about their surroundings to
+/// a third party**. It routinely does: every desktop and mobile location
+/// service resolves a position from the public IP address, from the identifiers
+/// of nearby Wi-Fi access points, or both.
+///
+/// Linux names the destination because on Linux it is knowable and fixed:
+/// GeoClue's Wi-Fi backend POSTs the BSSIDs it can see to `api.beacondb.net`,
+/// and the user can turn that off in `geoclue.conf` — advice that is only
+/// useful if they know the request exists. Windows, macOS and Android send
+/// comparable data to endpoints their vendors do not publish and the user
+/// cannot configure, so naming a host there would be an invention. Web is
+/// whichever service the browser uses, which the browser chooses.
+///
+/// A `cfg` on `target_os` and not on anything else: `target_os = "android"` is
+/// distinct from `"linux"`, and wasm32 is neither, so the general sentence is
+/// what those builds get.
+#[cfg(target_os = "linux")]
+const LOCATION_EGRESS_NOTE: &str = "Approximate, from your system's location \
+    service. Finding a position sends your IP address, and — if the Wi-Fi \
+    backend is enabled — the identifiers of nearby wireless networks, to \
+    api.beacondb.net.";
+#[cfg(not(target_os = "linux"))]
+const LOCATION_EGRESS_NOTE: &str = "Approximate, from your device's location \
+    service. Finding a position may send your IP address and details of nearby \
+    wireless networks to that service's provider.";
+
 impl super::Gui {
     /// Render the settings window if `show_settings` is true.
     pub(super) fn render_settings(&mut self, ctx: &egui::Context, actions: &mut Vec<GuiAction>) {
@@ -317,6 +348,17 @@ impl super::Gui {
                     actions.push(GuiAction::RequestLocation);
                 }
             }
+        }
+
+        // Only where a location is on offer or already running. On a platform
+        // with no service, and after a refusal, there is no request to describe
+        // and the sentence would be an unprompted privacy warning about
+        // something that is not happening.
+        if matches!(
+            self.location_permission,
+            LocationPermission::Prompt | LocationPermission::Granted
+        ) {
+            ui.label(LOCATION_EGRESS_NOTE);
         }
 
         if let Some(line) = self.location_fix_summary() {
