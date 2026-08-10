@@ -1078,14 +1078,23 @@ mod volume_alpha_profile {
     /// the rain floor to [`ZDR_TUMBLING_ALPHA`] at
     /// [`ZDR_TUMBLING_DB`] — 0 dB, the tumbling-scatterer value itself and
     /// the crate's own wet-snow kill — and stays there until it climbs to
-    /// full at [`ZDR_NEGATIVE_DB`], which nature seldom reaches. The plateau
-    /// is 0.35, the same translucency [`PHI_ALPHA`] gives a moment with no
-    /// honest background band, and for the same reason: a haze with visible
-    /// interior structure. The hail signature is then plainly present at 63
-    /// of 180 where it used to be a hole, the ice and noise mass above it
-    /// tapers off toward the rain band, and the rare deep negative — the
-    /// three-body spike, the vertically aligned ice — still stands out at
-    /// full strength.
+    /// full at [`ZDR_NEGATIVE_DB`], which nature seldom reaches.
+    ///
+    /// Which half of that is measured, plainly: the **shape** is, the
+    /// **level** is not. The 68 % count above is what rules a ramp out, and
+    /// it is a count over real volumes. The plateau's height of 0.35 is
+    /// [`PHI_ALPHA`] taken by reference, and the case for reusing it is an
+    /// *analogy* — one side of one product is in the position ΦDP is in
+    /// whole, a population that has to be visible without becoming the
+    /// volume, so it gets that moment's translucency. No measurement
+    /// distinguishes 0.35 from 0.3 or 0.4 here, and none is claimed; the
+    /// test pins the plateau against `PHI_ALPHA`'s identity for exactly that
+    /// reason, rather than against a number of its own.
+    ///
+    /// The hail signature is then plainly present at 63 of 180 where it used
+    /// to be a hole, the ice and noise mass above it tapers off toward the
+    /// rain band, and the rare deep negative — the three-body spike, the
+    /// vertically aligned ice — still stands out at full strength.
     ///
     /// What this deliberately does not claim: ZDR alone cannot tell that
     /// near-zero hail from that dry snow — `MAX_ZDR_DS` is 2.0 too, and the
