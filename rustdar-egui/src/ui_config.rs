@@ -149,6 +149,16 @@ struct VolumeConfig {
     /// Which map pane the region was dragged on. Validated against the pane
     /// count on load, the same as a section's.
     source_pane: Option<usize>,
+    /// Whether this pane has turned the map floor **off**, in
+    /// [`crate::pane::VolumePane::hide_floor`]'s own inverted sense.
+    ///
+    /// Inverted on the wire as well as in memory so that `Default::default()` —
+    /// `false` — is the floor showing: a config written before this field
+    /// existed has no key, `#[serde(default)]` supplies `false`, and the pane
+    /// comes back with its floor, which is the shipped default. Storing the
+    /// positive `show_floor` instead would make every pre-existing config
+    /// restore with the floor *off*.
+    hide_floor: bool,
     /// Lit volume or isosurface. `#[serde(default)]` on the struct makes an
     /// older config a lit volume; the lenient deserializer makes a *newer*
     /// config's unknown mode a lit volume too, instead of a failed load —
@@ -210,6 +220,9 @@ impl Default for VolumeConfig {
             vertical_exaggeration: camera.vertical_exaggeration(),
             region: None,
             source_pane: None,
+            // The floor shows. Matches `VolumePane`'s derived default through
+            // the same inversion — see the field's own doc.
+            hide_floor: false,
             view_mode: crate::pane::VolumeViewMode::default(),
         }
     }
@@ -827,6 +840,7 @@ fn content_config(
                     half_width_km: region.half_width_km(),
                 }),
                 source_pane: volume.source_pane,
+                hide_floor: volume.hide_floor,
                 view_mode: volume.view_mode,
             };
             // Every float that reaches the file, not merely the three angles:
@@ -1010,9 +1024,19 @@ fn restore_content(pane_idx: usize, pc: &PaneConfig, pane_count: usize) -> PaneC
                 region,
                 source_pane,
                 rendered_for: None,
-                // Not persisted: the floor defaults on for every session, and
-                // a pane that turned it off holds that for the session only.
-                hide_floor: false,
+                // Persisted, like every other choice that changes *what the
+                // pane is a picture of*. Reopening the app is 1:1 with how it
+                // was closed, live data excepted, and a floor the user turned
+                // off coming back on is a visible difference on launch.
+                //
+                // The inversion is `VolumePane::hide_floor`'s own and is carried
+                // straight through rather than flipped here, so a config written
+                // before the field existed reads `false` through
+                // `#[serde(default)]` and keeps the shipped default: the floor
+                // shows. No finiteness filter applies — it is a `bool`, and the
+                // `null`-for-non-finite hazard the camera floats carry (see the
+                // save side) has no analogue here.
+                hide_floor: volume.hide_floor,
                 // Not persisted either — the curves are (per product, below
                 // the pane list); an open tool window is session posture.
                 alpha_editor_open: false,

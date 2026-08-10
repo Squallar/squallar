@@ -213,6 +213,78 @@ fn the_isosurface_mode_and_thresholds_survive_a_save_and_load() {
     );
 }
 
+/// A 3D pane that turned its map floor off comes back with it off.
+///
+/// The rule this serves is the codebase's standing one: reopening the app is
+/// 1:1 visually with how it was closed, live data excepted. The floor is not
+/// live data — it is a choice the user made with a checkbox — so a pane that
+/// closed without a floor and opened with one is a visible difference on
+/// launch, which is exactly what the rule forbids. `hide_floor` was
+/// hardcoded to `false` on load and commented as session state; this is the
+/// pin on that no longer being true.
+///
+/// Both directions are asserted, because a field written but never read and a
+/// field read but never written fail in opposite halves of the round trip and
+/// a one-sided test sees only one of them.
+#[test]
+fn a_hidden_map_floor_survives_a_save_and_load() {
+    use crate::pane::PaneKind;
+
+    let store = MemoryConfigStore::default();
+    let mut gui = crate::Gui::new();
+    gui.set_pane_count_for_test(2);
+    gui.pane_mut(0).unwrap().set_kind(PaneKind::Volume);
+    gui.pane_mut(1).unwrap().set_kind(PaneKind::Volume);
+    assert!(
+        !gui.pane(0).unwrap().volume().unwrap().hide_floor,
+        "precondition: a fresh 3D pane shows its floor",
+    );
+    gui.pane_mut(0).unwrap().volume_mut().unwrap().hide_floor = true;
+    gui.save_ui_config(&store);
+
+    let mut restored = crate::Gui::new();
+    assert!(restored.load_ui_config(&store));
+    assert!(
+        restored.pane(0).unwrap().volume().unwrap().hide_floor,
+        "a pane that turned the floor off must come back with it off",
+    );
+    assert!(
+        !restored.pane(1).unwrap().volume().unwrap().hide_floor,
+        "and the toggle is per pane: its neighbour keeps its floor",
+    );
+}
+
+/// A config written before `hide_floor` existed comes back with the floor
+/// **showing**.
+///
+/// This is what the wire form's inversion buys, and it is the reason the
+/// persisted field is `hide_floor` rather than a positive `show_floor`:
+/// `#[serde(default)]` supplies `false` for the missing key, and `false` is
+/// the floor showing. Stored the other way round, every config already on
+/// every user's disk would restore with the floor off — a silent, global
+/// regression on the first launch after the upgrade, and one no round-trip
+/// test would catch because a round trip never sees an absent key.
+#[test]
+fn a_config_written_before_the_floor_toggle_keeps_its_floor() {
+    let store = MemoryConfigStore::default();
+    store
+        .store(
+            UI_CONFIG_KEY,
+            r#"{
+                    "site": "KDMX",
+                    "panes": [{"kind": "Volume", "site": "KDMX", "volume": {}}]
+                }"#,
+        )
+        .expect("the memory store accepts a write");
+
+    let mut gui = crate::Gui::new();
+    assert!(gui.load_ui_config(&store));
+    assert!(
+        !gui.pane(0).unwrap().volume().unwrap().hide_floor,
+        "an absent key must mean the shipped default: the floor shows",
+    );
+}
+
 /// A view mode from a future build loads as the lit volume, and a
 /// threshold for an unknown product is dropped — the same forward
 /// tolerance the product enum has, pinned for the two new fields.
