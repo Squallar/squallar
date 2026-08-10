@@ -346,6 +346,21 @@ pub struct App {
         (String, Option<rustdar_egui::pane::VolumeRegion>),
         chrono::NaiveDateTime,
     )>,
+    /// Scopes owed a floor render whose last dispatch never delivered one: the
+    /// budget was full at dispatch, or the render came back with no image.
+    ///
+    /// This list is what makes the retry reachable **without a new build**.
+    /// Both failure paths used to lean on "the next completed build for this
+    /// scope tries again" — and on a static archive volume there is no next
+    /// build, so a floor lost to a full budget or a failed render stayed
+    /// missing for the life of the pane. Drained by
+    /// [`App::retry_owed_floor_renders`] every frame beside the poll; a drain
+    /// re-dispatches against the scope's newest `Ready` grid, drops the debt
+    /// for scopes the store no longer holds, and a still-full budget re-owes.
+    /// A retry after a `None` render is paced by the failed render itself —
+    /// the debt is only re-marked when the next reply arrives — and costs
+    /// nothing while every floor is in hand.
+    floor_owed: Vec<(String, Option<rustdar_egui::pane::VolumeRegion>)>,
 }
 
 /// Bookkeeping for the periodic config write.
@@ -580,6 +595,7 @@ impl App {
             #[cfg(test)]
             volume_extractions: std::cell::Cell::new(0),
             floor_rendered: Vec::new(),
+            floor_owed: Vec::new(),
             http_client,
             #[cfg(not(target_arch = "wasm32"))]
             tokio_runtime,
@@ -1163,8 +1179,14 @@ impl App {
             self.window.clone(),
         );
         if !spawned {
-            // Budget full: nothing recorded, the next completed build for
-            // this scope tries again.
+            // Budget full: nothing recorded in the dedupe, and the scope is
+            // owed — `retry_owed_floor_renders` re-dispatches once a slot
+            // frees, which is what keeps a static archive volume (no further
+            // builds, so no other retry path) from standing on a permanently
+            // missing floor.
+            if !self.floor_owed.contains(&scope) {
+                self.floor_owed.push(scope);
+            }
             return;
         }
         // Replace this scope's entry, and drop entries for scopes the store
@@ -1177,13 +1199,51 @@ impl App {
     }
 
     /// Take delivery of finished floor renders.
+    ///
+    /// A reply with no image clears the scope's dedupe entry and marks the
+    /// scope owed. The dedupe records "dispatched", and holding it after a
+    /// dispatch that delivered nothing turned one failed render into a floor
+    /// missing for the volume's whole life: `maybe_spawn_floor_render` would
+    /// refuse every retry at this stamp, and on a static archive volume no
+    /// new stamp ever arrives.
     fn poll_floor_results(&mut self) {
         while let Ok(fr) = self.channels.floor_receiver.try_recv() {
             let Some(image) = fr.image else {
+                let scope = (fr.site, fr.region);
+                self.floor_rendered.retain(|(s, _)| *s != scope);
+                if !self.floor_owed.contains(&scope) {
+                    self.floor_owed.push(scope);
+                }
                 continue;
             };
             self.volume_store
                 .set_floor(&fr.site, fr.region, std::sync::Arc::new(image));
+        }
+    }
+
+    /// Re-dispatch the floor renders the budget refused or a `None` reply
+    /// took back — the retry path that needs no new voxel build.
+    ///
+    /// Drains the owed list: a scope the store no longer holds a `Ready`
+    /// grid for drops its debt (a floor for it would answer a question
+    /// nobody is asking), a scope whose floor is meanwhile in hand needs
+    /// nothing, and the rest go back through `maybe_spawn_floor_render`
+    /// against the scope's newest grid — which re-owes them if the budget is
+    /// still full. Free when nothing is owed, which is every frame of an
+    /// ordinary session.
+    fn retry_owed_floor_renders(&mut self) {
+        if self.floor_owed.is_empty() {
+            return;
+        }
+        let owed = std::mem::take(&mut self.floor_owed);
+        for scope in owed {
+            let Some((target, grid)) = self.volume_store.ready_for_scope(&scope.0, &scope.1) else {
+                continue;
+            };
+            if self.volume_store.floor_for(&target).is_some() {
+                continue;
+            }
+            self.maybe_spawn_floor_render(&target, &grid);
         }
     }
 
@@ -1540,6 +1600,9 @@ impl App {
         // build and its announcement cannot straddle a frame.
         self.poll_voxel_results();
         self.poll_floor_results();
+        // After the poll, so a budget slot freed by a reply this frame — or a
+        // dedupe entry a `None` reply just cleared — is used this frame.
+        self.retry_owed_floor_renders();
 
         // After both drains, so the UI is told about a volume on the frame it
         // arrived rather than the frame after. A 3D pane reads this to decide
@@ -4096,6 +4159,245 @@ mod tests {
         assert!(
             !app.platform.gps_active(),
             "the reader kept the serial port open after being told to stop",
+        );
+    }
+
+    // ── The floor retry ledger ──────────────────────────────────────────
+    //
+    // Both floor-dispatch failure paths used to lean on "the next completed
+    // voxel build for this scope tries again" — and a static archive volume
+    // completes no further builds, so either failure left the pane standing
+    // on a permanently missing floor.
+
+    /// A tiny real reflectivity scan — the same fixture shape as
+    /// `volume::bridge`'s test `ready_grid`, duplicated here because that one
+    /// lives in another module's `#[cfg(test)]` and cannot be imported. It
+    /// exists so `extract_current_volume` and the floor render's own
+    /// extraction have real sweeps to work from.
+    fn reflectivity_scan() -> nexrad_model::data::Scan {
+        use nexrad_model::data::{
+            MomentData, PulseWidth, Radial, RadialStatus, Scan, Sweep, VolumeCoveragePattern,
+        };
+        let sweep = |number: u8, elevation: f32| {
+            let radials = (0..8u16)
+                .map(|i| {
+                    Radial::new(
+                        1_760_000_000_000 + i64::from(i),
+                        i + 1,
+                        f32::from(i) * 45.0,
+                        45.0,
+                        RadialStatus::IntermediateRadialData,
+                        number,
+                        elevation,
+                        Some(MomentData::from_fixed_point(
+                            4,
+                            2125,
+                            250,
+                            8,
+                            2.0,
+                            66.0,
+                            vec![120, 140, 160, 180],
+                        )),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                })
+                .collect();
+            Sweep::new(number, radials)
+        };
+        let cut = |angle: f64| {
+            nexrad_model::data::ElevationCut::new(
+                angle,
+                nexrad_model::data::ChannelConfiguration::ConstantPhase,
+                nexrad_model::data::WaveformType::CS,
+                20.0,
+                true,
+                true,
+                false,
+                false,
+                1,
+                20,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                false,
+                0,
+                false,
+                0,
+                false,
+                false,
+            )
+        };
+        Scan::new(
+            VolumeCoveragePattern::new(
+                212,
+                0,
+                0.5,
+                PulseWidth::Short,
+                false,
+                0,
+                false,
+                0,
+                false,
+                false,
+                0,
+                false,
+                false,
+                vec![cut(0.5), cut(1.5)],
+            ),
+            vec![sweep(1, 0.5), sweep(2, 1.5)],
+        )
+    }
+
+    fn floor_stamp() -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2024, 5, 6)
+            .unwrap()
+            .and_hms_opt(22, 0, 0)
+            .unwrap()
+    }
+
+    /// A floor reply with no image reopens the scope's dedupe entry and owes
+    /// the scope a retry; a reply **with** an image does neither.
+    ///
+    /// The first half is the F4b fix for the `None` path: `floor_rendered`
+    /// records "dispatched", and keeping it after a dispatch that delivered
+    /// nothing meant `maybe_spawn_floor_render` refused every retry at that
+    /// stamp forever. Shown failing pre-fix (the reply was dropped with a
+    /// bare `continue`): the dedupe entry survived and nothing was owed.
+    #[test]
+    fn a_floor_reply_with_no_image_reopens_the_dedupe_and_owes_a_retry() {
+        let mut app = headless(TestBridge::desktop());
+        let scope = ("KTLX".to_string(), None);
+        app.floor_rendered.push((scope.clone(), floor_stamp()));
+
+        app.channels
+            .floor_sender
+            .send(crate::channels::FloorResponse {
+                site: "KTLX".to_string(),
+                region: None,
+                image: None,
+            })
+            .unwrap();
+        app.poll_floor_results();
+        assert!(
+            !app.floor_rendered.iter().any(|(s, _)| *s == scope),
+            "a dispatch that delivered nothing must not stay recorded as \
+             done — that is a floor missing for the volume's whole life",
+        );
+        assert_eq!(
+            app.floor_owed,
+            vec![scope.clone()],
+            "the scope must be owed a retry the frame path can act on",
+        );
+
+        // The control: a delivered floor must keep its dedupe entry — one
+        // render per (scope, stamp) is the whole point of the ledger.
+        app.floor_owed.clear();
+        app.floor_rendered.push((scope.clone(), floor_stamp()));
+        app.channels
+            .floor_sender
+            .send(crate::channels::FloorResponse {
+                site: "KTLX".to_string(),
+                region: None,
+                image: Some(crate::volume::floor::FloorImage {
+                    size: [1, 1],
+                    rgba: vec![0, 0, 0, 255],
+                }),
+            })
+            .unwrap();
+        app.poll_floor_results();
+        assert!(
+            app.floor_rendered.iter().any(|(s, _)| *s == scope),
+            "a delivered floor must not reopen the dedupe",
+        );
+        assert!(
+            app.floor_owed.is_empty(),
+            "a delivered floor leaves nothing owed",
+        );
+    }
+
+    /// A floor dispatch the render budget refused is owed, and the owed
+    /// retry dispatches it later **with no voxel build in between** — the
+    /// static-archive case, where no build ever completes again.
+    ///
+    /// Shown failing pre-fix: the refusal recorded nothing anywhere, so
+    /// after the budget freed there was no path back to the dispatch short
+    /// of another completed build.
+    #[test]
+    fn a_budget_refused_floor_render_is_retried_without_a_new_build() {
+        use crate::volume::bridge::VolumeEntry;
+        use std::sync::atomic::Ordering;
+
+        let mut app = headless(TestBridge::desktop());
+        let stamp = floor_stamp();
+        let scan = reflectivity_scan();
+        let target = rustdar_egui::pane::VolumeTarget {
+            region: None,
+            volume: rustdar_egui::pane::VolumeStamp {
+                site: "KTLX".to_string(),
+                collected: stamp,
+            },
+            product: rustdar_radar::types::RadarProduct::Reflectivity,
+        };
+        let request = rustdar_radar::voxel::VoxelRequest {
+            centre: (35.33, -97.27),
+            half_width_km: 40.0,
+            base_km_msl: 0.0,
+            top_km_msl: 10.0,
+            product: rustdar_radar::types::RadarProduct::Reflectivity,
+            shape: rustdar_radar::voxel::WASM_SHAPE,
+            values_wanted: false,
+        };
+        let grid = Arc::new(
+            rustdar_radar::voxel::build_voxels(&scan, &request, 35.33, -97.27)
+                .expect("the fixture volume resamples"),
+        );
+        app.base_scans
+            .insert("KTLX".to_string(), (Arc::new(scan), stamp));
+        assert!(!app.volume_store.share(0, &target));
+        app.volume_store.begin_build(0, &target);
+        assert!(
+            app.volume_store
+                .complete(&target, VolumeEntry::Ready(Arc::clone(&grid)))
+        );
+
+        // The budget is full at dispatch time.
+        app.render
+            .renders_in_flight
+            .store(crate::constants::MAX_CONCURRENT_RENDERS, Ordering::Relaxed);
+        app.maybe_spawn_floor_render(&target, &grid);
+        let scope = ("KTLX".to_string(), None);
+        assert!(
+            app.floor_rendered.is_empty(),
+            "a refused dispatch must not be recorded as done",
+        );
+        assert_eq!(
+            app.floor_owed,
+            vec![scope.clone()],
+            "the refused scope must be owed",
+        );
+
+        // A slot frees. No build completes. The frame-path retry alone must
+        // reach the dispatch.
+        app.render.renders_in_flight.store(0, Ordering::Relaxed);
+        app.retry_owed_floor_renders();
+        assert!(
+            app.floor_rendered
+                .iter()
+                .any(|(s, at)| *s == scope && *at == stamp),
+            "the owed retry must dispatch the floor render for the scope's \
+             held grid without waiting for a build that will never come",
+        );
+        assert!(
+            app.floor_owed.is_empty(),
+            "a dispatched retry settles the debt",
         );
     }
 }

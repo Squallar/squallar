@@ -161,6 +161,15 @@ const RAY_DIRECTION_EPSILON: f32 = 1e-6;
 
 // Below this the central difference is noise rather than a surface, and
 // normalising it would point the normal in an arbitrary direction.
+//
+// The gradient it bounds is per *displayed kilometre* (`shading` divides the
+// index differences by `cell_km`), so the same field measures differently as
+// the cell size changes: this floor rescales with the grid, and 1e-6 was
+// tuned against the old unitless difference. It stays correct as a NaN guard
+// because it sits orders of magnitude under any real surface at every
+// shipped cell size — one R8 index step (1/255) across the coarsest 1.8 km
+// cell is still ~2e-3 per km — but it is a zero-detector, not a
+// surface-classifier, and must not be read as a tuned threshold.
 const GRADIENT_EPSILON: f32 = 1e-6;
 
 struct RaymarchVertex {

@@ -1639,6 +1639,14 @@ fn optical_depth_is_measured_against_the_unexaggerated_box() {
         let mut uniform =
             masking_uniform(camera(225.0, pitch, 2.5, exaggeration), BOX_KM, cells, size);
         uniform.extinction_per_km = EXTINCTION;
+        // The exaggeration lane rides `box_size_km.w`, and it must be SET for
+        // this test to guard anything: `masking_uniform` leaves it at 1.0, and
+        // with the lane at 1.0 the exact violation this test exists to catch —
+        // `step_length_km` reading the stretched extent — is a multiply by one
+        // that no measurement can see. Production writes the camera's own
+        // value here (`volume::bridge`), so the instrument does the same, and
+        // the shader's contract is that only `shading()` may read it.
+        uniform.vertical_exaggeration = exaggeration;
         assert_eq!(
             uniform.box_size_km, BOX_KM,
             "precondition: the uniform must carry the true extent"

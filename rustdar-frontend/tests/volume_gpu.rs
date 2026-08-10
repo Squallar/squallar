@@ -625,7 +625,12 @@ fn the_map_floor_stands_under_the_volume_and_only_when_asked() {
         }
     }
     let floor = pipelines
-        .upload_floor(&device, &queue, [floor_side as u32, floor_side as u32], &floor_rgba)
+        .upload_floor(
+            &device,
+            &queue,
+            [floor_side as u32, floor_side as u32],
+            &floor_rgba,
+        )
         .expect("a well-shaped floor uploads");
 
     let empty = vec![0u8; (cells[0] * cells[1] * cells[2]) as usize];

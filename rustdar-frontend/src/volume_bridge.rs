@@ -159,17 +159,87 @@ pub const EDGE_SOFT_WIDTH: f32 = 8.0 / 255.0;
 /// count and was measured, not assumed — see the table in `volume::quality`.
 pub const CLOUD_STEP_CELLS: f32 = 0.5;
 
-/// The reconstruction level the cloud look marches the grid at, in mip units.
+/// The reconstruction level the cloud look marches the grid at, in mip units
+/// — **the ceiling of the knob's travel, not what every box gets**. The level
+/// a frame actually marches at is [`cloud_reconstruction_lod_for`], which
+/// tapers this to zero as the grid's cells coarsen.
 ///
 /// 1.0 is the full blend into the hand-built two-cell mean below the raw
 /// field — chosen by rendering the KCRP 2017-08-26 (Harvey) volume across the
-/// knob's travel: below ~0.7 the single-voxel spikes over the deck survive as
-/// hairs and the tilt shelves keep their cliff rims, and there is nothing
-/// past 1.0 to reach. It is a *render* softness, the same class of decision
-/// as [`EDGE_SOFT_WIDTH`]: the grid, the palette and the threshold anchor are
-/// untouched, and the instrument default (`VolumeUniform::new`) stays 0 — the
-/// bit-exact raw field.
+/// knob's travel *at a region box*: below ~0.7 the single-voxel spikes over
+/// the deck survive as hairs and the tilt shelves keep their cliff rims, and
+/// there is nothing past 1.0 to reach. It is a *render* softness, the same
+/// class of decision as [`EDGE_SOFT_WIDTH`]: the grid, the palette and the
+/// threshold anchor are untouched, and the instrument default
+/// (`VolumeUniform::new`) stays 0 — the bit-exact raw field.
 pub const CLOUD_RECONSTRUCTION_LOD: f32 = 1.0;
+
+/// Cell size at or below which the cloud rung smooths at the full
+/// [`CLOUD_RECONSTRUCTION_LOD`], in kilometres per cell.
+///
+/// 0.65 km covers both shipped region rungs on the desktop grid — a 60 km
+/// box is 0.23 km/cell and a 160 km one 0.625 — where the two-cell kernel
+/// (≤ 1.3 km) stays inside the few-kilometre width of a real convective
+/// core, so the smoothing softens the *rendering* of a feature the grid
+/// still resolves. Measured on the Harvey eyewall (see
+/// [`cloud_reconstruction_lod_for`]).
+pub const CLOUD_SMOOTHING_FULL_CELL_KM: f32 = 0.65;
+
+/// Cell size at or above which the cloud rung smooths not at all, in
+/// kilometres per cell.
+///
+/// 1.75 km puts the default whole-volume box — 460 km over 256 cells,
+/// 1.8 km/cell — at exactly zero: there the two-cell kernel is 3.6 km, wider
+/// than the features it lands on, and the smoothing was measured *erasing*
+/// them rather than softening them (the Harvey table in
+/// [`cloud_reconstruction_lod_for`]).
+pub const CLOUD_SMOOTHING_RAW_CELL_KM: f32 = 1.75;
+
+/// The reconstruction level the cloud rung marches a grid of this cell size
+/// at: [`CLOUD_RECONSTRUCTION_LOD`] at or below
+/// [`CLOUD_SMOOTHING_FULL_CELL_KM`], zero at or above
+/// [`CLOUD_SMOOTHING_RAW_CELL_KM`], linear between. `largest_cell_km` is the
+/// grid's coarsest axis — the kilometres one cell spans, which on every
+/// shipped box is the horizontal.
+///
+/// # Why the smoothing scales with cell size
+///
+/// Smoothing is a reconstruction luxury: it is honest exactly when the data
+/// outresolves the display, so the kernel rounds off sampling artifacts of a
+/// feature the grid still holds. When the cells are coarser than the
+/// features, the same kernel averages the features *away*. Measured — KCRP
+/// 2017-08-26 04:41Z (Harvey), `volume_real_mask` hard-mask painted-pixel
+/// counts at the class cut, desktop shape, one camera (yaw 225, pitch 25,
+/// dist 2.5), centre 28.02 N −97.05 E, cloud step 0.5; Δ is against the raw
+/// field (LOD 0, step 1) at the same box:
+///
+/// | box | km/cell | LOD at 1.0 (shipped fixed) | LOD by this taper |
+/// |---|---|---|---|
+/// | 60 km | 0.23 | ≥20 dBZ −1.6%, ≥35 −6.6%, ≥50 −31% | same (taper = 1.0) |
+/// | 160 km | 0.625 | ≥20 −0.8%, ≥35 −15%, ≥50 −51% | same (taper = 1.0) |
+/// | 460 km (default) | 1.80 | ≥20 −3.2%, ≥35 **−30%**, ≥50 **−100%** (0 px) | ≥20 +1.0%, ≥35 +3.0%, ≥50 +17% of 83 px |
+///
+/// At the shipped default view the ≥50 dBZ eyewall pixels went to **zero**
+/// under the fixed LOD — the 2D pane showed a red core the 3D pane had
+/// erased — and that erasure is the kernel's, not only the old mip's
+/// no-data bias: the figures above are already through the
+/// occupancy-weighted mip (`volume::raymarch::downsampled_grid`), which
+/// recovers the data-edge classes a few percent (≥20 dBZ at the default box:
+/// −8.6% with the full-cube mean, −3.2% with the occupancy mean) but cannot
+/// save a core thinner than the kernel. The remaining region-box ≥50 losses
+/// are the kernel averaging *measured* neighbours below the cut — the
+/// honest price of the cloud look where it is still bought.
+///
+/// The knee values are the measured rungs, not a curve fit: full smoothing
+/// at the region boxes that keep the cloud look under it (the 60 km
+/// before/after renders differ in 0.8% of pixels), none at the default box
+/// the kernel erases, and a linear ramp between because nothing measured
+/// justifies a fancier shape.
+pub fn cloud_reconstruction_lod_for(largest_cell_km: f32) -> f32 {
+    let travel = CLOUD_SMOOTHING_RAW_CELL_KM - CLOUD_SMOOTHING_FULL_CELL_KM;
+    let weight = ((CLOUD_SMOOTHING_RAW_CELL_KM - largest_cell_km) / travel).clamp(0.0, 1.0);
+    CLOUD_RECONSTRUCTION_LOD * weight
+}
 
 /// The march's skip threshold for a palette whose
 /// [`VoxelGrid::fade_band`](rustdar_radar::voxel::VoxelGrid::fade_band) is
@@ -257,9 +327,11 @@ struct StoreInner {
     /// The map floors, at most one per `(site, region)` — the floor is a
     /// property of the ground under the box, so two panes showing two moments
     /// of one volume stand on one floor. Pruned against the entries' scopes
-    /// whenever one is set or a pane lets go, so a floor cannot outlive every
-    /// pane that could stand on it. Ids come from the same counter as the
-    /// grids', so the GPU side's per-id caches cannot collide.
+    /// on **every** path that can empty a scope — a floor landing, a pane
+    /// letting go, and a pane shedding what it re-aimed away from — so a
+    /// floor cannot outlive every pane that could stand on it. Ids come from
+    /// the same counter as the grids', so the GPU side's per-id caches
+    /// cannot collide.
     floors: Vec<StoredFloor>,
 }
 
@@ -392,11 +464,10 @@ impl VolumeStore {
     }
 
     /// This pane is holding nothing. Drops whatever it was holding if it was the
-    /// last one, and any floor nothing stands on afterwards.
+    /// last one, and any floor nothing stands on afterwards — the prune rides
+    /// inside `detach`, beside every other path that can empty a scope.
     pub fn release(&self, pane_idx: usize) {
-        let mut inner = self.lock();
-        inner.detach(pane_idx);
-        inner.prune_floors();
+        self.lock().detach(pane_idx);
     }
 
     /// What is in hand for `target`, if anything.
@@ -525,6 +596,29 @@ impl VolumeStore {
         self.lock().floors.iter().map(|f| f.id).collect()
     }
 
+    /// The newest `Ready` grid held under `(site, region)`, with its target —
+    /// what the App's floor retry re-registers a floor against when a
+    /// dispatch was refused or produced nothing. Newest by id for the same
+    /// reason `lookup_for_pane` is: a scope can transiently hold two resolved
+    /// grids mid-swap, and the later build is the ground's current footprint.
+    pub fn ready_for_scope(
+        &self,
+        site: &str,
+        region: &Option<rustdar_egui::pane::VolumeRegion>,
+    ) -> Option<(VolumeTarget, Arc<VoxelGrid>)> {
+        let inner = self.lock();
+        inner
+            .entries
+            .iter()
+            .filter(|e| e.target.volume.site == site && e.target.region == *region)
+            .filter_map(|e| match &e.entry {
+                VolumeEntry::Ready(grid) => Some((e.id, e.target.clone(), Arc::clone(grid))),
+                _ => None,
+            })
+            .max_by_key(|(id, ..)| *id)
+            .map(|(_, target, grid)| (target, grid))
+    }
+
     /// Whether any held entry — built, building or refused — has this
     /// `(site, region)` scope. The App's floor dedupe prunes against it.
     pub fn holds_scope(
@@ -579,12 +673,14 @@ impl Default for VolumeStore {
 }
 
 impl StoreInner {
-    /// Detach `pane_idx` from whatever it holds, dropping entries nobody holds.
+    /// Detach `pane_idx` from whatever it holds, dropping entries nobody
+    /// holds — and the floors those entries were the last scope-holder of.
     fn detach(&mut self, pane_idx: usize) {
         for entry in &mut self.entries {
             entry.panes.retain(|&p| p != pane_idx);
         }
         self.entries.retain(|e| !e.panes.is_empty());
+        self.prune_floors();
     }
 
     /// Drop every floor whose `(site, region)` matches no held entry.
@@ -595,12 +691,11 @@ impl StoreInner {
     /// tune.
     fn prune_floors(&mut self) {
         let entries = &self.entries;
-        self.floors
-            .retain(|f| {
-                entries
-                    .iter()
-                    .any(|e| e.target.volume.site == f.site && e.target.region == f.region)
-            });
+        self.floors.retain(|f| {
+            entries
+                .iter()
+                .any(|e| e.target.volume.site == f.site && e.target.region == f.region)
+        });
     }
 
     /// Detach `pane_idx` from everything it can no longer show, given that it
@@ -625,6 +720,13 @@ impl StoreInner {
             }
         }
         self.entries.retain(|e| !e.panes.is_empty());
+        // A shed can drop the last entry of a scope — a pane re-aimed at
+        // another site or region through `share`/`begin_build` — and the
+        // floor under that scope has to go with it, exactly as it does on
+        // `release`. Before this call, only `release` and `set_floor` pruned,
+        // so a re-aimed pane stranded its old ~1 MiB floor until the pane
+        // released or a new floor landed.
+        self.prune_floors();
     }
 }
 
@@ -748,10 +850,14 @@ impl VolumePainter for BridgeVolumePainter {
         // same struct. The smoothed reconstruction rides the same rung as the
         // lighting on purpose — together they are the cloud look, and a device
         // that cannot afford one cannot afford the other; the floor rung stays
-        // the jagged-unlit raw march.
+        // the jagged-unlit raw march. The reconstruction level is per-frame
+        // from this grid's own cell size: full smoothing where the data
+        // outresolves the display, none where the kernel would be wider than
+        // the features — see `cloud_reconstruction_lod_for` for the Harvey
+        // measurement behind the taper.
         uniform.gradient_shading = fitted.quality.shading.is_on();
         if fitted.quality.shading.is_on() {
-            uniform.reconstruction_lod = CLOUD_RECONSTRUCTION_LOD;
+            uniform.reconstruction_lod = cloud_reconstruction_lod_for(largest_cell_km(&uniform));
             uniform.step_cells = CLOUD_STEP_CELLS;
         }
         // The march's transfer edge, anchored at this palette's own fade
@@ -817,6 +923,18 @@ fn box_size_km(grid: &VoxelGrid) -> [f32; 3] {
     let (y0, y1) = grid.y_range_km();
     let (z0, z1) = grid.z_range_km_msl();
     [(x1 - x0) as f32, (y1 - y0) as f32, (z1 - z0) as f32]
+}
+
+/// The grid's coarsest cell in kilometres — the axis extent over that axis'
+/// cell count, maximised over the three axes. This is what
+/// [`cloud_reconstruction_lod_for`] scales the smoothing by; on every shipped
+/// box the horizontal axes are the coarse ones (the vertical is ~0.14 km).
+/// Off the uniform rather than the grid so the value fed to the taper is
+/// bit-identical to the extent and dims the same uniform hands the shader.
+fn largest_cell_km(uniform: &VolumeUniform) -> f32 {
+    (0..3)
+        .map(|axis| uniform.box_size_km[axis] / uniform.grid_dims[axis].max(1) as f32)
+        .fold(0.0f32, f32::max)
 }
 
 /// Why this moment cannot be drawn as a volume, or `None` if it can.
@@ -985,16 +1103,17 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
         // `map_floor` still set. That mismatch cannot happen from the one
         // producer (`resample_floor` sizes its own buffer), and the symptom
         // if it ever did would be a transparent floor, not a crash.
-        let floor_texture = self.floor.as_ref().and_then(|(floor_id, image)| {
-            match floors.entry(*floor_id) {
-                std::collections::hash_map::Entry::Occupied(occupied) => {
-                    Some(&*occupied.into_mut())
-                }
-                std::collections::hash_map::Entry::Vacant(vacant) => pipelines
-                    .upload_floor(device, queue, image.size, &image.rgba)
-                    .map(|texture| &*vacant.insert(texture)),
-            }
-        });
+        let floor_texture =
+            self.floor
+                .as_ref()
+                .and_then(|(floor_id, image)| match floors.entry(*floor_id) {
+                    std::collections::hash_map::Entry::Occupied(occupied) => {
+                        Some(&*occupied.into_mut())
+                    }
+                    std::collections::hash_map::Entry::Vacant(vacant) => pipelines
+                        .upload_floor(device, queue, image.size, &image.rgba)
+                        .map(|texture| &*vacant.insert(texture)),
+                });
 
         textures.write_uniform(queue, &self.uniform);
         // Into egui's own encoder, which egui submits before its own commands —
@@ -1473,6 +1592,68 @@ mod tests {
         assert!(store.live_floor_ids().is_empty());
     }
 
+    /// A pane re-aiming away from a scope takes the scope's floor with it —
+    /// on every shed path, not only on `release`.
+    ///
+    /// The third unevicted-holder of this campaign, same shape as the first
+    /// two: `share`, `begin_build` and `insert` all shed the pane's old
+    /// entries, and until this test none of them pruned the floors, so a
+    /// pane re-aimed from KTLX to another site stranded KTLX's ~1 MiB floor
+    /// until the pane was *released* — which a re-aim never does. Each arm
+    /// below fails against the fix reverted on its path.
+    #[test]
+    fn a_pane_reaiming_away_from_a_scope_evicts_its_floor_on_every_shed_path() {
+        let image = || {
+            Arc::new(crate::volume::floor::FloorImage {
+                size: [1, 1],
+                rgba: vec![0, 0, 0, 255],
+            })
+        };
+        let old = target(RadarProduct::Reflectivity, 0);
+        let mut elsewhere = target(RadarProduct::Reflectivity, 6);
+        elsewhere.volume.site = "KSRX".to_owned();
+
+        // `share`: the pane joins a volume another pane already holds.
+        let store = VolumeStore::new();
+        build(&store, 0, &old, "old scope");
+        store.set_floor("KTLX", None, image());
+        build(&store, 1, &elsewhere, "the shared one");
+        assert!(store.share(0, &elsewhere), "precondition: the join happens");
+        assert!(
+            store.floor_for(&old).is_none() && store.live_floor_ids().is_empty(),
+            "pane 0 shed its KTLX entry through `share`, so the KTLX floor \
+             has no holder and must be gone",
+        );
+
+        // `begin_build`: the pane re-aims at a scope that needs a build.
+        let store = VolumeStore::new();
+        build(&store, 0, &old, "old scope");
+        store.set_floor("KTLX", None, image());
+        assert!(!store.share(0, &elsewhere));
+        store.begin_build(0, &elsewhere);
+        assert!(
+            store.floor_for(&old).is_none() && store.live_floor_ids().is_empty(),
+            "pane 0 shed its KTLX entry through `begin_build`, so the KTLX \
+             floor must be gone",
+        );
+
+        // `insert`: a synchronously-known result detaches the pane from
+        // everything else.
+        let store = VolumeStore::new();
+        build(&store, 0, &old, "old scope");
+        store.set_floor("KTLX", None, image());
+        store.insert(
+            0,
+            elsewhere.clone(),
+            VolumeEntry::Refused("decided at dispatch".to_owned()),
+        );
+        assert!(
+            store.floor_for(&old).is_none() && store.live_floor_ids().is_empty(),
+            "pane 0 shed its KTLX entry through `insert`, so the KTLX floor \
+             must be gone",
+        );
+    }
+
     /// Exactly one of the six samplable moments clears the fade bar today, and
     /// the bands here are `rustdar_radar::voxel`'s own measurements.
     ///
@@ -1607,9 +1788,14 @@ mod tests {
         // defaults are a renderable configuration) and the user gets the
         // voxel-spiked stippled render #5 was filed about.
         assert!(
-            body.contains("uniform.reconstruction_lod = CLOUD_RECONSTRUCTION_LOD"),
-            "`paint` no longer selects the smoothed reconstruction on the cloud \
-             rung, so single-voxel spikes and tilt-shelf cliffs return",
+            body.contains(
+                "uniform.reconstruction_lod = cloud_reconstruction_lod_for(largest_cell_km"
+            ),
+            "`paint` no longer selects the cell-size-tapered smoothed \
+             reconstruction on the cloud rung: a fixed LOD erases coarse-grid \
+             cores (the Harvey table in `cloud_reconstruction_lod_for`), and \
+             no LOD at all brings the single-voxel spikes and tilt-shelf \
+             cliffs back",
         );
         assert!(
             body.contains("uniform.step_cells = CLOUD_STEP_CELLS"),
@@ -1658,6 +1844,50 @@ mod tests {
              ceiling of {ceiling}; the far corner of every diagonal view \
              falls to stretched steps",
             desktop_diagonal_cells / CLOUD_STEP_CELLS,
+        );
+    }
+
+    /// The cloud smoothing is a function of cell size: full at the region
+    /// rungs, **zero at the default whole-volume box**, monotone between.
+    ///
+    /// The zero half is the data-honesty pin. A fixed LOD of 1.0 at the
+    /// default box's 1.8 km cells was measured erasing the Harvey eyewall —
+    /// −41% of the ≥50 dBZ mask, −81% of ≥30 dBZ — while the 2D pane showed
+    /// the red core (the table in [`cloud_reconstruction_lod_for`]).
+    /// Restoring the fixed LOD fails the third assert; inverting the taper
+    /// (smoothing the coarse grid instead of the fine) fails the first.
+    #[test]
+    fn the_cloud_smoothing_tapers_with_cell_size_and_spares_the_default_box() {
+        // The desktop region rungs: 60 km and 160 km boxes over 256 cells.
+        for cell_km in [60.0 / 256.0, 160.0 / 256.0] {
+            assert_eq!(
+                cloud_reconstruction_lod_for(cell_km),
+                CLOUD_RECONSTRUCTION_LOD,
+                "a {cell_km:.3} km/cell region box must get the full cloud \
+                 smoothing — its cells outresolve the features",
+            );
+        }
+        // Between the knees the taper is a real intermediate value, so a
+        // future box between the rungs degrades rather than jumps.
+        let mid = cloud_reconstruction_lod_for(1.2);
+        assert!(
+            mid > 0.0 && mid < CLOUD_RECONSTRUCTION_LOD,
+            "the taper must pass through intermediate levels, got {mid}",
+        );
+        // The default whole-volume box: 460 km over 256 cells, 1.797 km/cell,
+        // computed through the same helper `paint` feeds the taper.
+        let uniform = VolumeUniform::new([460.0, 460.0, 18.0], [256, 256, 128]);
+        let default_cell = largest_cell_km(&uniform);
+        assert!(
+            (1.75..1.85).contains(&default_cell),
+            "the default box's coarsest cell moved: {default_cell} km",
+        );
+        assert_eq!(
+            cloud_reconstruction_lod_for(default_cell),
+            0.0,
+            "the default whole-volume box must march the raw field: at \
+             1.8 km cells the two-cell kernel is wider than the cores it \
+             lands on, and the smoothing erases them (measured, Harvey)",
         );
     }
 

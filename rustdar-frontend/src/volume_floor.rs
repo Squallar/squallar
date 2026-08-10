@@ -130,7 +130,8 @@ pub fn resample_floor(
     let mut rgba = Vec::with_capacity(out_w * out_h * 4);
     for row in 0..out_h {
         // Row 0 is the footprint's north edge.
-        let dy_km = y_range_km.1 - (row as f64 + 0.5) / out_h as f64 * (y_range_km.1 - y_range_km.0);
+        let dy_km =
+            y_range_km.1 - (row as f64 + 0.5) / out_h as f64 * (y_range_km.1 - y_range_km.0);
         let lat_rad = site_lat_rad + dy_km / rustdar_radar::types::EARTH_RADIUS_KM;
         let cos_correction = cos_site_lat / lat_rad.cos();
         let py = (merc_top - mercator_y(lat_rad)) * merc_scale;
@@ -222,7 +223,10 @@ mod tests {
                 }
             }
         }
-        assert!(best_red > FLOOR_GROUND_RGBA[0], "no echo landed on the floor");
+        assert!(
+            best_red > FLOOR_GROUND_RGBA[0],
+            "no echo landed on the floor"
+        );
         best
     }
 

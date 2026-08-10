@@ -154,8 +154,7 @@ fn measure_the_raymarch_cost_on_a_real_volume() {
             uniform.box_from_clip = view.box_from_clip;
             uniform.eye_in_box = view.eye_in_box;
             uniform.gradient_shading = true;
-            uniform.reconstruction_lod =
-                rustdar_frontend::volume::bridge::CLOUD_RECONSTRUCTION_LOD;
+            uniform.reconstruction_lod = rustdar_frontend::volume::bridge::CLOUD_RECONSTRUCTION_LOD;
             uniform.step_cells = rustdar_frontend::volume::bridge::CLOUD_STEP_CELLS;
             uniform.vertical_exaggeration = camera.vertical_exaggeration();
             uniform.empty_index_threshold =

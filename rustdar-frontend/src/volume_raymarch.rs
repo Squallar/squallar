@@ -1029,14 +1029,33 @@ fn upload_coarse_level(queue: &wgpu::Queue, grid: &wgpu::Texture, cells: [u32; 3
 }
 
 /// The grid's mip level 1: each coarse cell is the mean of the fine cells
-/// under it, in index units.
+/// **with data** under it, in index units — no-data cells (index 0) are
+/// excluded from the mean, and a block with no data at all stays index 0.
 ///
 /// Averaging *indices* is exact averaging of the physical value, because
 /// index-to-dBZ is affine — the same fact that justified `R8Unorm`'s linear
-/// filtering in the first place. Rounding is to nearest, so a lone occupied
-/// cell among eight (a spike, which is the artifact the LOD exists to
-/// dissolve) lands at an eighth of its index rather than being floored away
-/// entirely when that eighth is representable.
+/// filtering in the first place. Rounding is to nearest.
+///
+/// # Why the mean is occupancy-weighted, and what that makes the mip
+///
+/// Index 0 is the **no-data** value, not a measurement of zero. The first
+/// version of this mip averaged it in anyway, and the result was measured on
+/// the KCRP 2017-08-26 (Harvey) volume: at the default 460 km box (1.8 km
+/// cells) the eyewall's data is one or two cells wide, so every coarse cell
+/// was mostly "not measured" folded in as the bottom of the dBZ ramp, and at
+/// the shipped LOD the ≥50 dBZ classes lost 41% of their pixels and the
+/// ≥30 dBZ classes 81% — the 2D pane showed a red core the 3D pane had
+/// erased. Excluding index 0 keeps a data cell's value at the data's edge;
+/// what fades there is only the trilinear blend into genuinely empty coarse
+/// cells, which is the alpha falloff the smoothing exists to provide.
+///
+/// The stated semantics, precisely: a fetch at an LOD between the levels
+/// interpolates the raw field with this one, so the reconstruction is no
+/// longer an exact mean **of the full cube** — it is the exact affine-dBZ
+/// mean of the cells that were measured, dilated by at most the two-cell
+/// kernel into cells that were not. Presentation over untouched data, like
+/// every knob on this rung: level 0 is bit-exact, and LOD 0 — the instrument
+/// default — never reads this level at all.
 ///
 /// Odd extents follow wgpu's own mip arithmetic — `max(n / 2, 1)` per axis —
 /// and the fine cells under a coarse one are whatever the halved coordinate
@@ -1050,19 +1069,26 @@ fn downsampled_grid(cells: [u32; 3], indices: &[u8]) -> ([u32; 3], Vec<u8>) {
         for cy in 0..coarse[1] as usize {
             for cx in 0..coarse[0] as usize {
                 let mut sum = 0u32;
-                let mut counted = 0u32;
+                let mut occupied = 0u32;
                 for dz in 0..2 {
                     for dy in 0..2 {
                         for dx in 0..2 {
                             let fx = (cx * 2 + dx).min(fine[0] - 1);
                             let fy = (cy * 2 + dy).min(fine[1] - 1);
                             let fz = (cz * 2 + dz).min(fine[2] - 1);
-                            sum += u32::from(indices[(fz * fine[1] + fy) * fine[0] + fx]);
-                            counted += 1;
+                            let index = indices[(fz * fine[1] + fy) * fine[0] + fx];
+                            if index != 0 {
+                                sum += u32::from(index);
+                                occupied += 1;
+                            }
                         }
                     }
                 }
-                out.push(((sum + counted / 2) / counted) as u8);
+                out.push(
+                    (sum + occupied / 2)
+                        .checked_div(occupied)
+                        .map_or(0, |mean| mean as u8),
+                );
             }
         }
     }
@@ -1597,39 +1623,61 @@ mod tests {
         );
     }
 
-    /// The hand-built mip is the mean of each coarse cell's fine block, to
-    /// nearest, over wgpu's own mip extents.
+    /// The hand-built mip is the occupancy-weighted mean of each coarse
+    /// cell's fine block — no-data zeros excluded — to nearest, over wgpu's
+    /// own mip extents.
     ///
-    /// Three properties, each with a mutation it closes:
+    /// Four properties, each with a mutation it closes:
     ///
     /// * A uniform grid downsamples to itself — a stride error mixing
     ///   neighbouring blocks cannot be seen on a uniform grid, so this is the
     ///   control, not the test.
-    /// * A lone 255 among seven empties lands at 32, which is `259 / 8` —
-    ///   round-to-nearest. Truncation gives 31: invisible in a picture,
-    ///   but it is the difference between a spike surviving the reconstruction
-    ///   at an eighth of its strength and at 3% less than that, and the
-    ///   rounding is stated in the function's contract.
+    /// * **A lone 255 among seven empties stays 255.** This is the
+    ///   data-honesty half of the contract: index 0 is *no data*, not a
+    ///   measurement of zero, and the first version of this mip averaged it
+    ///   in — a lone measured cell landed at 32, and on the Harvey volume at
+    ///   the default box's 1.8 km cells the whole eyewall core averaged
+    ///   itself below its own colour classes (−41% of ≥50 dBZ pixels, −81%
+    ///   of ≥30 dBZ). Reverting to the full-cube mean fails here at 32 ≠ 255.
+    /// * A mixed block averages only its measured cells, to nearest: two
+    ///   cells at 100 and 105 among six empties land at 103 (`205/2` rounded
+    ///   up), not at the full-cube 26. Truncation gives 102.
     /// * The block that is averaged is the one under the coarse cell —
     ///   checked with a value planted in a *different* block, which is what a
     ///   transposed dimension order pushes into the wrong coarse cell.
     #[test]
-    fn the_grid_mip_is_the_rounded_mean_of_each_coarse_block() {
-        // Uniform control.
+    fn the_grid_mip_is_the_rounded_mean_of_each_coarse_blocks_measured_cells() {
+        // Uniform control — and the all-empty block, which must stay no-data
+        // rather than divide by zero.
         let (coarse, bytes) = downsampled_grid([4, 4, 2], &[7u8; 32]);
         assert_eq!(coarse, [2, 2, 1]);
         assert_eq!(bytes, vec![7u8; 4]);
+        let (_, bytes) = downsampled_grid([4, 4, 2], &[0u8; 32]);
+        assert_eq!(bytes, vec![0u8; 4], "an unmeasured block must stay no-data");
 
-        // A lone spike: fine cell (0,0,0) of a 4x4x2 grid is in coarse block
-        // (0,0,0) and nowhere else.
+        // A lone measured cell: fine cell (0,0,0) of a 4x4x2 grid is in
+        // coarse block (0,0,0) and nowhere else, and it keeps its own value.
         let mut fine = vec![0u8; 32];
         fine[0] = 255;
         let (_, bytes) = downsampled_grid([4, 4, 2], &fine);
         assert_eq!(
             bytes,
-            vec![32, 0, 0, 0],
-            "a lone 255 among seven empties must average to 32 (nearest), in \
-             its own coarse cell only"
+            vec![255, 0, 0, 0],
+            "a lone measured 255 must keep its value in its own coarse cell; \
+             32 is the full-cube mean that erased the Harvey core at coarse \
+             cell sizes, and anything in another cell is a stride error"
+        );
+
+        // A mixed block: the measured cells' own mean, round-to-nearest.
+        let mut fine = vec![0u8; 32];
+        fine[0] = 100;
+        fine[1] = 105;
+        let (_, bytes) = downsampled_grid([4, 4, 2], &fine);
+        assert_eq!(
+            bytes,
+            vec![103, 0, 0, 0],
+            "two measured cells among six empties must average to their own \
+             rounded mean (103), not the full-cube 26 and not truncation's 102"
         );
 
         // The block under coarse cell (1, 0, 0): fine x in 2..4, y in 0..2,

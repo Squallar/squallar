@@ -35,6 +35,8 @@
 //! | `EXAG` | no | `3.0` | Fallback vertical exaggeration. |
 //! | `SIZE` | no | `1200x900` | Output size, `WxH` pixels. |
 //! | `EXTINCTION` | no | `800.0` | Extinction per km for the **mask** render. |
+//! | `MASK_LOD` | no | `0.0` | Reconstruction level for the **mask** render — 0 is the raw-field instrument; the cloud rung's level turns the mask into a class-coverage measurement of the reconstruction. |
+//! | `MASK_STEP` | no | `1.0` | March step for the **mask** render, in cells. |
 //! | `OUT` | yes | — | Output path prefix; the three files below are written under it. |
 //!
 //! `.gz` volumes are **not** supported and are refused with a message rather
@@ -180,11 +182,19 @@ fn render_a_real_volume_mask() {
 
     // The mask. Opaque-or-nothing palette, extinction high enough that one
     // kilometre saturates, and no shading — see the module doc.
+    //
+    // `MASK_LOD` and `MASK_STEP` (defaults 0 and 1: the instrument
+    // configuration) march the mask at another reconstruction level and step
+    // — the knobs the coarse-grid class-count measurement turns: the same
+    // hard cut rendered at LOD 0 and at the cloud rung's level is exactly
+    // "how much of the ≥THRESH region does the reconstruction still paint".
     let mut uniform = VolumeUniform::new(box_size_km, grid_dims);
     uniform.box_from_clip = box_from_clip;
     uniform.eye_in_box = eye_in_box;
     uniform.extinction_per_km = extinction;
     uniform.gradient_shading = false;
+    uniform.reconstruction_lod = parsed_or("MASK_LOD", 0.0f32);
+    uniform.step_cells = parsed_or("MASK_STEP", 1.0f32);
     let mask_pixels = raymarch_once(
         &device,
         &queue,
@@ -206,7 +216,15 @@ fn render_a_real_volume_mask() {
     // show an edge the application does not draw.
     uniform.extinction_per_km = rustdar_frontend::volume::uniform::DEFAULT_EXTINCTION_PER_KM;
     uniform.gradient_shading = true;
-    uniform.reconstruction_lod = rustdar_frontend::volume::bridge::CLOUD_RECONSTRUCTION_LOD;
+    // The bridge's own cell-size taper, not the ceiling constant: production
+    // marches a grid this coarse at exactly this level, and a harness pinned
+    // to the ceiling would render the default box through a smoothing the
+    // application no longer applies there.
+    let largest_cell_km = (0..3)
+        .map(|axis| box_size_km[axis] / grid_dims[axis] as f32)
+        .fold(0.0f32, f32::max);
+    uniform.reconstruction_lod =
+        rustdar_frontend::volume::bridge::cloud_reconstruction_lod_for(largest_cell_km);
     uniform.step_cells = rustdar_frontend::volume::bridge::CLOUD_STEP_CELLS;
     uniform.vertical_exaggeration = exaggeration;
     uniform.empty_index_threshold =
@@ -310,6 +328,8 @@ fn render_a_real_volume_mask() {
          size_px           {} x {}\n\
          extinction_mask   {extinction} per km\n\
          extinction_colour {} per km (production default)\n\
+         mask_lod          {} at {} cells/step\n\
+         colour_lod        {:.4} at {} cells/step (bridge taper for {largest_cell_km:.4} km cells)\n\
          mask_pixels       {masked} of {} ({:.4} %)\n\
          mask_pixels_a128  {masked_solid}\n\
          colour_background black\n",
@@ -338,6 +358,10 @@ fn render_a_real_volume_mask() {
         size[0],
         size[1],
         rustdar_frontend::volume::uniform::DEFAULT_EXTINCTION_PER_KM,
+        parsed_or("MASK_LOD", 0.0f32),
+        parsed_or("MASK_STEP", 1.0f32),
+        uniform.reconstruction_lod,
+        uniform.step_cells,
         mask.len(),
         100.0 * masked as f64 / mask.len() as f64,
     );
