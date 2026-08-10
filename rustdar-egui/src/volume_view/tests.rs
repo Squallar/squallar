@@ -770,23 +770,23 @@ fn a_map_pane_affine_is_web_mercator_and_not_a_linearisation() {
 /// two screen pixels, which is what "the basemap, roads and place labels all go
 /// soft" is.
 ///
-/// The figures are the user's framing: KFDX at 33.98 N, a 460 km box, 18 km
+/// The figures are the user's framing: KFDX at 34.635 N, a 460 km box, 18 km
 /// tall at 3x vertical exaggeration, in a 900-point-tall pane.
 #[test]
 fn the_reported_framing_asks_for_more_than_one_mirror_texel_a_pixel() {
     let camera = OrbitCamera::restore(225.0, 20.0, 1.0, [0.0; 3], 3.0)
         .expect("the reported camera is a legal one");
     // A source pane showing the 460 km box across about 900 points, expressed
-    // the way `MapPaneGeo` carries it: points per degree of longitude at 33.98.
+    // the way `MapPaneGeo` carries it: points per degree of longitude at 34.635.
     let points_per_km = 900.0 / 460.0;
-    let points_per_degree_lon = points_per_km * 111.319_49 * 33.98_f64.to_radians().cos();
+    let points_per_degree_lon = points_per_km * 111.319_49 * 34.635_f64.to_radians().cos();
 
     let magnification = floor_magnification(
         camera,
         [460.0, 460.0, 18.0],
         900.0,
         points_per_degree_lon,
-        33.98,
+        34.635,
     )
     .expect("a real framing must produce a demand");
     assert!(
