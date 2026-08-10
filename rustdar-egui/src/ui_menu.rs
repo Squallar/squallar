@@ -146,7 +146,7 @@ pub(super) enum MenuEvent {
 /// really handed, and where the widget landed so a test can click it for real.
 ///
 /// Reported by the renderer, not rebuilt by a test from the model — for the
-/// same reason `ChromeOutput::excluded_rects` is an output of the chrome.
+/// same reason `ShellOutput::excluded_rects` is an output of the chrome.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct DrawnMenuLeaf {
@@ -392,7 +392,11 @@ impl super::Gui {
                 self.drawer_open = false;
             }
             MenuEvent::Invoked(MenuAction::OpenSettings) => {
-                self.show_settings = true;
+                // The inspector's App › Settings body — there is no settings
+                // window any more. The drawer still yields: on a narrow width
+                // it covers most of the screen the user just asked to look
+                // elsewhere on.
+                self.open_settings();
                 self.drawer_open = false;
             }
             MenuEvent::Toggled(MenuToggle::Overlay(kind), on) => {
@@ -534,9 +538,12 @@ mod tests {
             .collect();
         overlays.sort();
         format!(
-            "settings={} time={} drawer={} auto_poll={} live_chunks={} notify={} \
-             kind={:?} pending_kind={:?} region_arm={} armed={} overlays={overlays:?}",
-            gui.show_settings,
+            "settings={} insp={} sel={:?} time={} drawer={} auto_poll={} live_chunks={} \
+             notify={} kind={:?} pending_kind={:?} region_arm={} armed={} \
+             overlays={overlays:?}",
+            gui.settings_visible(),
+            gui.insp_open,
+            gui.inspector_sel,
             gui.time_dialog.show,
             gui.drawer_open,
             gui.auto_poll.enabled,
@@ -787,7 +794,8 @@ mod tests {
     fn a_back_press_closes_one_open_layer_at_a_time() {
         let mut gui = Gui::new();
         gui.drawer_open = true;
-        gui.show_settings = true;
+        // A non-default selection, so the reset-on-dismiss is observable.
+        gui.select_layer(OverlayKind::NwsAlerts);
         gui.time_dialog.show = true;
         gui.overlays.selected_overlays = vec![std::sync::Arc::new(StubOverlayItem)];
         gui.overlays.selected_overlay_page = 0;
@@ -798,21 +806,27 @@ mod tests {
             "the overlay pager did not close"
         );
         assert!(
-            gui.show_settings && gui.time_dialog.show && gui.drawer_open,
+            gui.insp_open && gui.time_dialog.show && gui.drawer_open,
             "closing the pager took a layer under it with it: {}",
-            state_fingerprint(&gui)
-        );
-
-        assert!(gui.dismiss_top_layer(), "the settings window was open");
-        assert!(!gui.show_settings, "settings did not close");
-        assert!(
-            gui.time_dialog.show && gui.drawer_open,
-            "one press closed more than one layer: {}",
             state_fingerprint(&gui)
         );
 
         assert!(gui.dismiss_top_layer(), "the time dialog was open");
         assert!(!gui.time_dialog.show, "the time dialog did not close");
+        assert!(
+            gui.insp_open && gui.drawer_open,
+            "one press closed more than one layer: {}",
+            state_fingerprint(&gui)
+        );
+
+        assert!(gui.dismiss_top_layer(), "the inspector was open");
+        assert!(!gui.insp_open, "the inspector did not close");
+        assert_eq!(
+            gui.inspector_sel,
+            crate::ui::InspectorSelection::AppSettings,
+            "a dismissal must reset the selection to App \u{203a} Settings \
+             (plan \u{a7}3.4), not leave the layer lying in wait"
+        );
         assert!(gui.drawer_open, "the drawer went with it");
 
         assert!(gui.dismiss_top_layer(), "the drawer was open");

@@ -44,7 +44,7 @@
 //! # Why the fat variants are boxed
 //!
 //! `PaneState` is `std::mem::take`n once per pane per frame — six sites do it
-//! (`ui_map.rs`, `ui_chrome.rs`, and four in `ui.rs`) — so its size is on the
+//! (`ui_map.rs`, `ui_shell.rs`, and four in `ui.rs`) — so its size is on the
 //! hot path. Boxing [`CrossSectionPane`] and [`VolumePane`] keeps
 //! `size_of::<PaneContent>()` at one pointer plus the tag, which keeps a map
 //! pane costing what it costs today however much state the other two kinds

@@ -150,6 +150,18 @@ impl OverlayHandler for StormReportsHandler {
         self.enabled
     }
 
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
+    /// E.g. `"27 reports"` — today's filtered report count.
+    fn status_line(&self) -> Option<String> {
+        if !self.enabled {
+            return None;
+        }
+        Some(format!("{} reports", self.state.data.len()))
+    }
+
     fn data_generation(&self) -> u64 {
         self.state.data_generation
     }

@@ -16,8 +16,18 @@ use rustdar_radar::types::{RadarProduct, ScanInfo};
 use rustdar_units::UserPreferences;
 use std::collections::HashMap;
 
-#[path = "ui_chrome.rs"]
-mod chrome;
+#[path = "ui_shell.rs"]
+mod shell;
+#[path = "ui_stack.rs"]
+mod ui_stack;
+/// What the stack drew last frame, for the input harness.
+#[cfg(test)]
+pub(crate) use ui_stack::{StackProbe, StackRowProbe};
+#[path = "ui_inspector.rs"]
+mod ui_inspector;
+/// What the inspector drew last frame, for the input harness.
+#[cfg(test)]
+pub(crate) use ui_inspector::InspectorProbe;
 #[path = "ui_config.rs"]
 mod config;
 #[path = "ui_map_overlays.rs"]
@@ -114,6 +124,8 @@ pub(crate) struct TopBarProbe {
     pub region_arm: (egui::Rect, bool),
     /// The X-sec arm toggle, and whether it read as armed.
     pub section_arm: (egui::Rect, bool),
+    /// The ⚙ Inspector toggle, and whether it read as open.
+    pub inspector_toggle: (egui::Rect, bool),
 }
 
 #[cfg(test)]
@@ -126,6 +138,7 @@ impl Default for TopBarProbe {
             pane_count_max: 0,
             region_arm: (egui::Rect::NOTHING, false),
             section_arm: (egui::Rect::NOTHING, false),
+            inspector_toggle: (egui::Rect::NOTHING, false),
         }
     }
 }
@@ -191,6 +204,24 @@ impl Default for StatusBarProbe {
             rect: egui::Rect::NOTHING,
         }
     }
+}
+
+/// What the inspector's body is about: the app's settings, the active pane's
+/// own properties, or one layer's options.
+///
+/// One selection for every width — the session state the crumb row renders
+/// and the three body arms dispatch on. `AppSettings` is the default and the
+/// state `✕` deselect returns to: it is the one body that is never about the
+/// active pane, so it is the one that can never be wrong about it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InspectorSelection {
+    /// The app's own settings — units, location, GPS, storm motion.
+    AppSettings,
+    /// The active pane's properties: kind, product, tilt, sync, and the
+    /// kind-specific block.
+    PaneProps,
+    /// One layer's options, hosted by `render_overlay_controls_one`.
+    Layer(OverlayKind),
 }
 
 /// Radar fetch lifecycle state.
@@ -378,8 +409,8 @@ pub struct Gui {
     /// Cached rather than queried because this crate cannot see a
     /// `PlatformBridge` — it is the crate the bridge's trait depends *on* — so
     /// a copy is the only thing available here. How fresh the copy is is the
-    /// gate's poll cadence, which tightens while `show_settings` is set for
-    /// exactly this reason.
+    /// gate's poll cadence, which tightens while [`Gui::settings_visible`]
+    /// answers true for exactly this reason.
     location_permission: rustdar_gps::LocationPermission,
     /// Whether the platform is currently delivering location fixes. A different
     /// question from the permission: every desktop process starts granted and
@@ -457,6 +488,22 @@ pub struct Gui {
     /// What the last frame's top bar actually drew. Only read by tests.
     #[cfg(test)]
     last_top_bar: TopBarProbe,
+    /// What the last frame's layer stack actually drew. Only read by tests.
+    #[cfg(test)]
+    last_stack: StackProbe,
+    /// What the last frame's inspector actually drew. Only read by tests —
+    /// see [`InspectorProbe`] for why `mode` is written inside the body arms.
+    #[cfg(test)]
+    last_inspector: InspectorProbe,
+    /// How many times handler `ControlItem`s were rendered this frame.
+    ///
+    /// The double-render guard: each render is a load→mutate→save round trip
+    /// over the active pane's `overlay_configs`, so two passes in one frame
+    /// fight over the handlers' state — the entanglement the plan's §3.8
+    /// makes `render_overlay_controls_one` the only host to prevent. The
+    /// harness asserts ≤ 1 after every frame.
+    #[cfg(test)]
+    control_render_passes: u32,
     /// Every handler dropdown the last frame drew, with the text its collapsed
     /// box showed. Only read by tests — see [`DrawnDropdown`].
     #[cfg(test)]
@@ -484,29 +531,29 @@ pub struct Gui {
     /// # Why the write is deferred, and what that is and is not protecting
     ///
     /// Two production paths hold a `PaneState` out of `Gui::panes` with
-    /// `std::mem::take` for the whole of a pass — `render_layers_panel` takes the
-    /// active pane, and `render_panes` takes each pane in turn — leaving a default
-    /// `PaneState` in the slot. A `self.panes[idx].set_kind(..)` inside either
-    /// window writes the **placeholder**, and the real pane going back afterwards
-    /// discards it: no panic, no warning, and a control that will not stay set.
+    /// `std::mem::take` for the whole of a pass — the shell's stack+inspector
+    /// pass takes the active pane (`ui_shell.rs`), and `render_panes` takes
+    /// each pane in turn — leaving a default `PaneState` in the slot. A
+    /// `self.panes[idx].set_kind(..)` inside either window writes the
+    /// **placeholder**, and the real pane going back afterwards discards it:
+    /// no panic, no warning, and a control that will not stay set.
     ///
-    /// **Today's menu dispatcher is not inside either window, and it is worth
-    /// being exact about that rather than leaving a scarier map behind.**
-    /// `render_layers_panel` takes the pane at `ui_chrome.rs:363` and puts it back
-    /// at `:425`; `apply_menu_event` is not called until `:438`, with the real pane
-    /// in the vector. The other dispatch site, `render_menu_bar_panel`, takes no
-    /// pane at all. So a direct write from the volume toggle would in fact work
-    /// today, and swapping this machinery out for one fails no behavioural test.
+    /// **The menu dispatcher is not inside either window** — `render_top_bar`
+    /// takes no pane at all, so a direct write from the volume toggle would in
+    /// fact work today. The inspector's kind segmented control, though, runs
+    /// from *inside* the shell's take, where the same direct write is
+    /// silently discarded — which is why every kind writer goes through
+    /// [`Self::request_pane_kind`], one rule for all of them.
     ///
-    /// It is still the right shape, for two reasons that are about the future
-    /// rather than the present. The writers WP-G adds — an armed section drag
-    /// resolving to a line, and the retarget rule that follows from it — run from
-    /// **inside** `render_panes`' per-pane take, where the hazard is live and
-    /// silent. And the ordering an interaction needs is the same one the pane count
-    /// needs: growing it mid-loop moves the rects of panes the loop has not
-    /// reached, desynchronising them from the ones `detect_active_pane_click`
-    /// hit-tested this frame. One deferral point, applied at
-    /// [`Self::apply_pending_pane_kind`] after the pane loop, serves both.
+    /// It is the right shape for one reason more. The writers WP-G adds — an
+    /// armed section drag resolving to a line, and the retarget rule that
+    /// follows from it — run from **inside** `render_panes`' per-pane take,
+    /// where the hazard is live and silent. And the ordering an interaction
+    /// needs is the same one the pane count needs: growing it mid-loop moves
+    /// the rects of panes the loop has not reached, desynchronising them from
+    /// the ones `detect_active_pane_click` hit-tested this frame. One
+    /// deferral point, applied at [`Self::apply_pending_pane_kind`] after the
+    /// pane loop, serves both.
     ///
     /// The cost is one frame of latency in the current path: the dispatcher records
     /// during chrome, and the conversion lands after `render_panes` — the same
@@ -645,6 +692,23 @@ pub struct Gui {
     /// sidebar on a desktop must not also close the drawer the same window
     /// gets when it narrows past the breakpoint.
     stack_open: Option<bool>,
+    /// Whether the inspector panel is open. Session-only, on the same
+    /// precedent as `drawer_open`: closed by default at every width, opened
+    /// by the top bar's ⚙ toggle, a stack row click ([`Self::select_layer`]),
+    /// or the menu's Settings… entry.
+    insp_open: bool,
+    /// One-shot: the next inspector frame starts its body scrolled to the
+    /// top. Set by every selection change, because the three bodies share one
+    /// scroll area — its offset is the *panel's* memory, and carrying a deep
+    /// settings scroll into a freshly selected layer's options would open
+    /// them somewhere in the middle.
+    insp_scroll_reset: bool,
+    /// What the inspector's body is about while it is open — and what it will
+    /// be about when next opened. Session-only, defaults to
+    /// [`InspectorSelection::AppSettings`]; a dismissal resets it there (see
+    /// [`Self::dismiss_top_layer`]), while the ⟩ collapse deliberately keeps
+    /// it, because a collapse is not a deselection.
+    inspector_sel: InspectorSelection,
     /// Whether the floating timeline transport is collapsed to its 🕐 chip.
     /// Session-only, like `drawer_open`: how a session left its chrome is not
     /// a preference.
@@ -693,8 +757,6 @@ pub struct Gui {
     interaction: InteractionState,
     /// User unit and timezone preferences.
     pub preferences: UserPreferences,
-    /// Whether the settings panel is open.
-    pub show_settings: bool,
     /// GPS configuration (port, baud, heading source).
     pub gps_config: rustdar_gps::GpsConfig,
     /// Storm motion the user typed in, overriding the RPG's SCIT average on
@@ -773,11 +835,14 @@ impl Default for Gui {
     }
 }
 
-/// The order the layers panel renders each handler's controls in.
+/// Every handler with controls, in the audit's canonical order.
 ///
-/// `pub(crate)` for the parity walk, which derives its inventory from the same
-/// list the renderer iterates — a copy in the test would go on passing after a
-/// handler was dropped from this one.
+/// Production no longer iterates this: the stack's rows walk the active
+/// pane's own `draw_order`, and the inspector renders one selected handler.
+/// It remains the parity walk's inventory — the list of handlers whose every
+/// control must be reachable — which is why it is test-only now rather than
+/// deleted: a handler dropped from it would silently leave the audit.
+#[cfg(test)]
 pub(crate) const OVERLAY_CONTROL_ORDER: &[OverlayKind] = &[
     OverlayKind::Radar,
     OverlayKind::ModelData,
@@ -1131,6 +1196,22 @@ fn render_control_item(
     }
 }
 
+/// Whether `item` is one of a handler's *master* controls — its heading, or
+/// its whole-layer `enabled` toggle — which the inspector expresses as the
+/// crumb and the "Show <layer>" toggle instead of rendering the handler's
+/// copies.
+///
+/// One predicate, two callers: `render_overlay_controls_one` skips these and
+/// the parity walk excludes them from its inventory. A copy in either place
+/// would let the renderer and the audit disagree about what "every control"
+/// means.
+pub(crate) fn is_master_control(item: &ControlItem) -> bool {
+    matches!(
+        item,
+        ControlItem::Heading { .. } | ControlItem::Toggle { id: "enabled", .. }
+    )
+}
+
 impl Gui {
     pub fn new() -> Self {
         let radar_config = RadarConfig::default();
@@ -1195,6 +1276,12 @@ impl Gui {
             #[cfg(test)]
             last_top_bar: TopBarProbe::default(),
             #[cfg(test)]
+            last_stack: StackProbe::default(),
+            #[cfg(test)]
+            last_inspector: InspectorProbe::default(),
+            #[cfg(test)]
+            control_render_passes: 0,
+            #[cfg(test)]
             last_dropdowns: Vec::new(),
             #[cfg(test)]
             last_control_items: Vec::new(),
@@ -1220,6 +1307,9 @@ impl Gui {
             loop_speed_fps: 5.0,      // default 5 fps
             drawer_open: false,
             stack_open: None,
+            insp_open: false,
+            insp_scroll_reset: false,
+            inspector_sel: InspectorSelection::AppSettings,
             timeline_collapsed: false,
             timeline_row2: false,
             timeline_scrub: None,
@@ -1232,7 +1322,6 @@ impl Gui {
             layout: LayoutCtx::default(),
             interaction: InteractionState::default(),
             preferences: UserPreferences::default(),
-            show_settings: false,
             gps_config: rustdar_gps::GpsConfig::default(),
             storm_motion_override: StormMotionOverride::default(),
             volume_painter: None,
@@ -1280,6 +1369,14 @@ impl Gui {
             // entry would report a button press that did not happen this frame.
             self.last_popup_triggered.clear();
             self.last_popup_handled.clear();
+            // Per-frame records of the stack and inspector; a stale probe
+            // would report a panel that is no longer on screen. Reset rather
+            // than cleared, like the timeline's — `open: false` is a report,
+            // not an absence.
+            self.last_stack = StackProbe::default();
+            self.last_inspector = InspectorProbe::default();
+            // The double-render guard's counter; see the field.
+            self.control_render_passes = 0;
         }
 
         // Create a root Ui to host the panels. Since egui 0.35 the Context-taking
@@ -1298,17 +1395,18 @@ impl Gui {
                 .max_rect(self.layout.content_rect),
         );
 
-        // Chrome first: the docked top bar claims its space, the floating
-        // surfaces position themselves in what it left, and that remainder —
-        // `chrome.map_rect` — is the map's. See `ui_chrome.rs`.
-        let chrome = self.render_chrome(&mut root_ui);
-        actions.extend(chrome.actions);
+        // The shell first: the docked top bar claims its space, the floating
+        // surfaces — status bar, layer stack, inspector — position themselves
+        // in what it left, and that remainder — `shell.map_rect` — is the
+        // map's. See `ui_shell.rs`.
+        let shell = self.render_shell(&mut root_ui);
+        actions.extend(shell.actions);
 
         if let Some(action) = self.render_time_dialog(ctx) {
             actions.push(action);
         }
 
-        actions.extend(self.render_panes(&mut root_ui, &chrome.excluded_rects));
+        actions.extend(self.render_panes(&mut root_ui, &shell.excluded_rects));
 
         // After the pane loop, and therefore after every `mem::take` window in
         // the frame has closed. See the `pending_pane_kind` field for why
@@ -1352,11 +1450,12 @@ impl Gui {
         // `mem::take` window in the frame has closed, so it reads and writes
         // `self.panes[self.active_pane]` directly — the real pane, not a
         // placeholder. See `ui_timeline.rs`.
-        self.render_timeline(ctx, chrome.map_rect, &mut actions);
+        self.render_timeline(ctx, shell.map_rect, &mut actions);
 
         // Floating windows last, so they layer above the chrome and the map.
+        // (Settings are no longer a window of their own: they are the
+        // inspector's App › Settings body, drawn by the shell above.)
         self.render_overlay_popup(ctx);
-        self.render_settings(ctx, &mut actions);
 
         // Ensure the handler state reflects the active pane's config at frame
         // end, so any deferred actions (FetchOverlay, etc.) processed after the
@@ -1647,11 +1746,12 @@ impl Gui {
     /// Ordered topmost first — whatever is painted over everything else is
     /// what a press is aimed at — and exactly one layer closes per press.
     ///
-    /// Not derived from the order `ui` calls them in, which is time dialog,
-    /// then popup, then settings. The popup and the settings window are both
-    /// `Order::Foreground`, so egui stacks them by area recency rather than by
-    /// call order, and the time dialog sits below both. This order is asserted
-    /// rather than computed; see `a_back_press_closes_one_open_layer_at_a_time`.
+    /// Not derived from the order `ui` calls them in, which is shell (stack
+    /// and inspector included), then time dialog, then popup. The popup is
+    /// `Order::Foreground`, so egui stacks it above the `Order::Middle`
+    /// panels whatever the call order, and the time dialog sits between. This
+    /// order is asserted rather than computed; see
+    /// `a_back_press_closes_one_open_layer_at_a_time`.
     ///
     /// Deliberately not reachable from `request_exit`: the window's close
     /// button and the menu's Exit item are unambiguous, and dismissing a dialog
@@ -1689,14 +1789,25 @@ impl Gui {
             self.overlays.selected_overlay_page = 0;
             return true;
         }
-        if self.show_settings {
-            self.show_settings = false;
-            return true;
-        }
         if self.time_dialog.show {
             self.time_dialog.show = false;
             return true;
         }
+        // The inspector, below the dialogs: it is a side panel, not a modal,
+        // so anything modal over the map outranks it. Closing resets the
+        // selection to App › Settings (plan §3.4) — a dismissal is a "back
+        // out", and what the user backed out of should not lie in wait for
+        // the next open.
+        if self.insp_open {
+            self.insp_open = false;
+            self.inspector_sel = InspectorSelection::AppSettings;
+            return true;
+        }
+        // The stack, in its drawer form only — the presentation that covers
+        // the map. The Expanded sidebar is deliberately not a dismissal
+        // target: it is open by default, and an Escape with nothing else open
+        // closing it would put the sidebar between every desktop user and
+        // "Escape means leave".
         if self.drawer_open {
             self.drawer_open = false;
             return true;
@@ -1835,128 +1946,6 @@ impl Gui {
         }
     }
 
-    /// Render the layer controls shared by desktop and mobile panels.
-    ///
-    /// Covers: radar product/elevation, radar loop, SPC outlooks, SPC discussions,
-    /// NWS alerts, city labels, radar sites, and viewport sync toggles.
-    ///
-    /// # The kind-specific block goes in one child scope
-    ///
-    /// Which controls make sense depends on what the pane *is*, so the block that
-    /// draws them sits inside a single `scope_builder` — and that, rather than the
-    /// id form, is the load-bearing part. `Ui::new_child` folds the parent's
-    /// `next_auto_id_salt` into every child's registered id, so drawn straight
-    /// onto this `Ui` the two branches would advance that counter by different
-    /// amounts: a map pane draws a loop transport and the whole overlay tree, a
-    /// volume pane draws neither. **Everything after them would then come back
-    /// under new ids the moment a pane was converted.** The drawer used to
-    /// append the whole menu there — which is why the scope was first built —
-    /// and though the menu now lives in the top bar's dropdown, the guarantee
-    /// stays: whatever the panel next grows below this block inherits it. One
-    /// child scope advances the counter by exactly one whichever branch ran;
-    /// `converting_a_pane_moves_no_widget_id` holds the observable half.
-    ///
-    /// The scope's id is [`egui::UiBuilder::id`] rather than `id_salt`, and what
-    /// that buys is independence from *what precedes it*. `id` is the one form
-    /// taking `IdSource::Explicit`, which makes the child's `unique_id` equal its
-    /// `stable_id`; `id_salt` leaves `unique_id` folded together with the parent's
-    /// `next_auto_id_salt`, and hence seeds this scope's own auto-id counter from
-    /// it — so anything the panel ever draws above this call would move the
-    /// counter at this position, and only the explicit form keeps this scope's
-    /// children out of that. It is the same reason `ui_chrome.rs`'s `status_error`
-    /// note records for choosing it there.
-    ///
-    /// It is **defence rather than a fix for a live difference**, worth stating so
-    /// nobody reads more into it: mutating `id` into `id_salt` fails no test. Note
-    /// that this is *not* because the two produce the same id — they do not, since
-    /// `Id::with` wraps its argument in a second `IdSalt::new`, so an `id_salt`
-    /// scope's `stable_id` hashes the salt twice and lands somewhere else entirely.
-    /// It is because nothing in here is keyed to a *particular* value: the two
-    /// combo boxes and the time-step picker key off `stable_id`, which both forms
-    /// keep stable across a conversion, and stability is all they need.
-    fn render_layer_controls(
-        &mut self,
-        ui: &mut egui::Ui,
-        pane: &mut PaneState,
-        combo_width: f32,
-        id_prefix: &str,
-        actions: &mut Vec<GuiAction>,
-    ) {
-        let kind_scope = egui::UiBuilder::new().id(ui.id().with("pane_kind_controls"));
-        ui.scope_builder(kind_scope, |ui| {
-            // On `pane`, the value the caller took out of the vector — never
-            // `self.panes[..]`, which for the whole of this pass holds a default
-            // `PaneState` and therefore reads as a *map* pane whatever the real
-            // one is. This is the same hazard `menu_model` has, with the same fix.
-
-            // Every kind opens with the same identity line, before the branch:
-            // the pane's site and what the pane is. A map pane's sidebar is full
-            // of content that describes itself, but a converted pane's is not,
-            // and without this line the panel below it reads as a different
-            // panel altogether rather than as the same one showing a pane with
-            // fewer controls. Shared rather than per-arm so the three kinds
-            // cannot drift into three headers.
-            render_pane_identity(ui, pane);
-
-            // Time navigation and the loop transport are not here: both moved
-            // to the floating timeline (`ui_timeline.rs`) with the full-bleed
-            // flip, where they apply to the active pane whatever its kind —
-            // the timeline expresses "no loop for a non-map pane" by disabling
-            // its toggle, where this panel expressed it by omission.
-            match pane.kind() {
-                crate::pane::PaneKind::Map => {
-                    self.render_radar_controls(ui, pane, combo_width, id_prefix);
-
-                    ui.add_space(6.0);
-                    ui.separator();
-
-                    // --- Handler-backed overlay controls (generic) ---
-                    self.render_overlay_controls(ui, pane, actions);
-                }
-                // A section and a volume pane get the product picker, then
-                // their own block in the same header-and-indent shape the map
-                // pane's blocks use, then the one line that says where the
-                // layer list went.
-                //
-                // No tilt picker: both read the whole ladder, so there is nothing
-                // to choose — see `render_radar_controls`. No overlay tree: every
-                // entry in it is a layer drawn over map tiles, geo-positioned
-                // against a projector this pane does not have — the convention
-                // for controls like these is **omission plus
-                // [`NON_MAP_LAYERS_NOTE`]**, not a disabled ghost, applied
-                // identically to both non-map kinds.
-                crate::pane::PaneKind::CrossSection => {
-                    self.render_radar_controls(ui, pane, combo_width, id_prefix);
-                    self.render_section_controls(ui, pane);
-                    render_non_map_layers_note(ui);
-                }
-                // The same, plus the knobs that only mean something for a box
-                // being looked at from outside.
-                crate::pane::PaneKind::Volume => {
-                    self.render_radar_controls(ui, pane, combo_width, id_prefix);
-                    map::render_volume_controls(ui, pane, &mut self.volume_iso, &self.volume_alpha);
-                    render_non_map_layers_note(ui);
-                }
-            }
-        });
-
-        ui.add_space(6.0);
-        ui.separator();
-
-        // --- Viewport sync ---
-        //
-        // Outside the kind scope: both settings are properties of the *layout*
-        // rather than of the active pane, and they stay meaningful with a non-map
-        // pane on screen — `sync_layers` still converges site, product and time
-        // across every pane, and `sync_viewports` still holds the map panes
-        // together while leaving this one alone.
-        if self.pane_layout.pane_count > 1 {
-            ui.checkbox(&mut self.viewport_sync, "\u{1f517}  Sync Viewports");
-            ui.checkbox(&mut self.sync_layers, "\u{1f517}  Sync Layers");
-            ui.separator();
-        }
-    }
-
     /// The cross-section pane's own sidebar block: what the pane is cutting
     /// along, in the same header-then-indent shape as every other block in the
     /// panel — the loop transport, the 3D view's knobs — so a section pane's
@@ -2014,7 +2003,13 @@ impl Gui {
 
     /// Render the radar product picker, and the tilt picker where a tilt means
     /// anything.
-    fn render_radar_controls(
+    ///
+    /// Hosted by the inspector's Pane-properties body — the only caller since
+    /// the stack/inspector split — but kept here beside the identity line and
+    /// the section block it shares the panel with. The combo salts keep the
+    /// `layers_` prefix they have always had, so the widget state egui stores
+    /// under them survived the move.
+    pub(super) fn render_radar_controls(
         &mut self,
         ui: &mut egui::Ui,
         pane: &mut PaneState,
@@ -2130,18 +2125,38 @@ impl Gui {
         }
     }
 
-    /// Render controls for all handler-backed overlays generically.
+    /// Render **one** handler's controls — the only place handler
+    /// [`ControlItem`]s render, hosted by the inspector's layer body.
     ///
-    /// Loads the active pane's overlay config snapshot into the handlers,
-    /// renders each handler's controls, applies updates, then saves the
-    /// resulting config back to the pane. This makes every sub-control
-    /// (categories, day, products, etc.) per-pane when Sync Layers is off.
-    fn render_overlay_controls(
+    /// The round trip is the old 12-kind loop's, for one kind: load the
+    /// active pane's config snapshot into the handlers, render the tree,
+    /// apply updates, honour Fetch effects, then save the (possibly mutated)
+    /// handler state back to the pane. This is what makes every sub-control
+    /// (categories, day, products, etc.) per-pane when Sync Layers is off —
+    /// and why there must be exactly one such pass per frame: each pass ends
+    /// by overwriting the pane's configs with the handlers' state, so a
+    /// second pass would save over the first's writes with whatever it had
+    /// loaded before them. The `control_render_passes` counter holds the
+    /// suite to that.
+    ///
+    /// The handler's own [`is_master_control`] items — its heading and its
+    /// master `enabled` toggle — are skipped: the inspector's crumb names the
+    /// layer and its "Show <layer>" toggle is the master, so rendering the
+    /// handler's copies would put two of each on screen with only one wired
+    /// to [`Self::select_layer`]'s discipline. The parity walk excludes them
+    /// through the same predicate, so the two cannot drift.
+    pub(super) fn render_overlay_controls_one(
         &mut self,
         ui: &mut egui::Ui,
         pane: &mut PaneState,
+        kind: OverlayKind,
         actions: &mut Vec<GuiAction>,
     ) {
+        #[cfg(test)]
+        {
+            self.control_render_passes += 1;
+        }
+
         // Load this pane's config snapshot into the handlers.
         if !pane.overlay_configs.is_empty() {
             self.overlays.load_pane_configs(&pane.overlay_configs);
@@ -2153,16 +2168,9 @@ impl Gui {
         let mut updates: Vec<(OverlayKind, ControlUpdate)> = Vec::new();
         let mut probe = ControlProbe::default();
 
-        for (i, &kind) in OVERLAY_CONTROL_ORDER.iter().enumerate() {
-            if i > 0 {
-                ui.add_space(6.0);
-                ui.separator();
-            }
-            let controls = self.overlays.controls(kind, &ctx);
-
-            for item in &controls {
-                render_control_item(ui, kind, item, &mut updates, &mut probe);
-            }
+        let controls = self.overlays.controls(kind, &ctx);
+        for item in controls.iter().filter(|item| !is_master_control(item)) {
+            render_control_item(ui, kind, item, &mut updates, &mut probe);
         }
 
         #[cfg(test)]
@@ -2227,25 +2235,76 @@ impl Gui {
         }
     }
 
-    /// Turn an overlay on or off for the active pane, the way the layers panel
-    /// does.
+    /// Turn an overlay on or off for `pane` — **both halves**, which is the
+    /// whole discipline.
     ///
-    /// Both halves must be written: `render_layer_controls` reloads the
-    /// handlers from `overlay_configs` every frame and saves the enabled map
-    /// back over `enabled_overlays`, so a change that never reached the config
-    /// is undone on the next frame.
-    fn set_active_pane_overlay(&mut self, kind: OverlayKind, on: bool) {
-        let configs = self.panes[self.active_pane].overlay_configs.clone();
-        if !configs.is_empty() {
-            self.overlays.load_pane_configs(&configs);
+    /// `render_overlay_controls_one` reloads the handlers from
+    /// `overlay_configs` every frame and saves the enabled map back over
+    /// `enabled_overlays`, so a change that never reached the config is
+    /// undone on the next frame. Everything that flips a layer goes through
+    /// here: [`Self::set_active_pane_overlay`] for callers outside a take
+    /// window, and the stack's eye / the inspector's Show-toggle directly,
+    /// with the pane they hold `mem::take`n out of the vector — where
+    /// indexing `self.panes` would write the placeholder and lose the click.
+    ///
+    /// An associated function rather than a method so it can borrow the
+    /// registry while the caller holds the taken pane.
+    pub(super) fn write_pane_overlay(
+        overlays: &mut OverlayRegistry,
+        pane: &mut PaneState,
+        kind: OverlayKind,
+        on: bool,
+    ) {
+        if !pane.overlay_configs.is_empty() {
+            overlays.load_pane_configs(&pane.overlay_configs);
         }
-        self.overlays.set_enabled(kind, on);
+        overlays.set_enabled(kind, on);
+        pane.overlay_configs = overlays.save_pane_configs();
+        pane.enabled_overlays = overlays.save_enabled_map();
+    }
 
-        let configs = self.overlays.save_pane_configs();
-        let enabled = self.overlays.save_enabled_map();
-        let pane = &mut self.panes[self.active_pane];
-        pane.overlay_configs = configs;
-        pane.enabled_overlays = enabled;
+    /// [`Self::write_pane_overlay`] aimed at the active pane, for callers
+    /// outside every `mem::take` window — the menu dispatcher, today.
+    fn set_active_pane_overlay(&mut self, kind: OverlayKind, on: bool) {
+        let mut pane = std::mem::take(&mut self.panes[self.active_pane]);
+        Self::write_pane_overlay(&mut self.overlays, &mut pane, kind, on);
+        self.panes[self.active_pane] = pane;
+    }
+
+    /// Select `kind`'s options in the inspector and make sure it is open —
+    /// what a stack row click means (plan §3.8).
+    pub(super) fn select_layer(&mut self, kind: OverlayKind) {
+        self.insp_scroll_reset = self.inspector_sel != InspectorSelection::Layer(kind);
+        self.inspector_sel = InspectorSelection::Layer(kind);
+        self.insp_open = true;
+    }
+
+    /// Select the active pane's properties in the inspector and make sure it
+    /// is open — the stack header's click, and the inspector crumb's `Pane N`
+    /// segment. (Interim routes: M5's pane pills take this over.)
+    pub(super) fn select_pane_props(&mut self) {
+        self.insp_scroll_reset = self.inspector_sel != InspectorSelection::PaneProps;
+        self.inspector_sel = InspectorSelection::PaneProps;
+        self.insp_open = true;
+    }
+
+    /// Open the inspector on the App › Settings body — what the menu's
+    /// Settings… entry does, and the state a `✕` deselect returns to.
+    pub fn open_settings(&mut self) {
+        self.insp_scroll_reset = self.inspector_sel != InspectorSelection::AppSettings;
+        self.inspector_sel = InspectorSelection::AppSettings;
+        self.insp_open = true;
+    }
+
+    /// Whether the settings body is on screen: the inspector is open and
+    /// showing App › Settings.
+    ///
+    /// The successor to the old `show_settings` field, and the one thing the
+    /// frontend still reads: the location-permission gate polls faster while
+    /// this is true, so the pane that renders the permission is looking at a
+    /// fresh copy of it.
+    pub fn settings_visible(&self) -> bool {
+        self.insp_open && self.inspector_sel == InspectorSelection::AppSettings
     }
 
     /// Propagate layer settings from the active pane to all others (when sync is enabled).
@@ -3069,6 +3128,33 @@ impl Gui {
         &self.last_top_bar
     }
 
+    /// What the last frame's layer stack drew.
+    #[cfg(test)]
+    pub(crate) fn stack_for_test(&self) -> &StackProbe {
+        &self.last_stack
+    }
+
+    /// What the last frame's inspector drew.
+    #[cfg(test)]
+    pub(crate) fn inspector_for_test(&self) -> &InspectorProbe {
+        &self.last_inspector
+    }
+
+    /// How many handler-control passes the last frame ran. The harness holds
+    /// this to at most one after every frame — see the field.
+    #[cfg(test)]
+    pub(crate) fn control_render_passes_for_test(&self) -> u32 {
+        self.control_render_passes
+    }
+
+    /// Open or close the Set Time dialog directly, for fixtures that need a
+    /// centred floating dialog over the map — the settings window used to be
+    /// the convenient one, and it is a side panel now.
+    #[cfg(test)]
+    pub(crate) fn set_time_dialog_open_for_test(&mut self, open: bool) {
+        self.time_dialog.show = open;
+    }
+
     /// Which pane is currently active.
     #[cfg(test)]
     pub(crate) fn active_pane_index_for_test(&self) -> PaneId {
@@ -3082,8 +3168,8 @@ impl Gui {
     }
 
     /// Set one pane's overlay state, writing the config as well as the enabled
-    /// map — `render_layer_controls` reloads the handlers from the config every
-    /// frame, so a write to `enabled_overlays` alone is undone immediately.
+    /// map — `render_overlay_controls_one` reloads the handlers from the config
+    /// every frame it runs, so a write to `enabled_overlays` alone is undone.
     #[cfg(test)]
     pub(crate) fn set_overlay_on_pane_for_test(&mut self, idx: usize, kind: OverlayKind, on: bool) {
         let configs = self.panes[idx].overlay_configs.clone();

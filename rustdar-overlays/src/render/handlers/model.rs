@@ -57,6 +57,15 @@ impl OverlayHandler for ModelDataHandler {
         self.enabled = enabled;
     }
 
+    /// The selected parameter's own name — which field of the model this
+    /// layer is currently a picture of.
+    fn status_line(&self) -> Option<String> {
+        if !self.enabled {
+            return None;
+        }
+        Some(self.selected_param.display_name().to_owned())
+    }
+
     fn data_generation(&self) -> u64 {
         self.state.data_generation
     }

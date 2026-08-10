@@ -5,10 +5,6 @@ use rustdar_units::{
     TimezonePreference, UnitLabel, UserPreferences,
 };
 
-/// Width of the settings window when there is room for a fixed-width one.
-/// Narrower screens get a full-bleed window instead — see
-/// [`crate::ui_layout::LayoutCtx::dialog_width`].
-const SETTINGS_POPUP_ROOMY_WIDTH: f32 = 340.0;
 const SETTINGS_SMALL_SPACING: f32 = 4.0;
 const SETTINGS_LARGE_SPACING: f32 = 8.0;
 #[cfg(feature = "gps-serial")]
@@ -142,56 +138,36 @@ fn section_break(ui: &mut egui::Ui) {
 }
 
 impl super::Gui {
-    /// Render the settings window if `show_settings` is true.
+    /// The settings content — the inspector's App › Settings body.
+    ///
+    /// The `egui::Window` this used to wrap itself in is gone: the inspector
+    /// hosts the body, `Gui::settings_visible` says when it is on screen, and
+    /// the menu's Settings… entry opens the inspector on it. The content is
+    /// exactly what the window held.
     ///
     /// The body is [`SETTINGS_ROWS`] driven through [`Self::render_settings_row`]
     /// — data plus a match, not a hand-written sequence — so the parity walk's
-    /// inventory and the drawn window cannot drift apart.
-    pub(super) fn render_settings(&mut self, ctx: &egui::Context, actions: &mut Vec<GuiAction>) {
-        if !self.show_settings {
-            return;
-        }
-
-        let popup_width = self.layout.dialog_width(SETTINGS_POPUP_ROOMY_WIDTH);
-
-        let mut open = true;
-        egui::Window::new("Settings")
-            .id(egui::Id::new("settings_window"))
-            .open(&mut open)
-            .order(egui::Order::Foreground)
-            .collapsible(false)
-            .resizable(true)
-            // Outer width since egui 0.35 (#7725) — content is 14px narrower at
-            // the stock theme. See the note in `ui_popups.rs`; same reasoning,
-            // deliberately not compensated.
-            .default_width(popup_width)
-            .pivot(egui::Align2::CENTER_CENTER)
-            .default_pos(self.layout.dialog_center())
-            .show(ctx, |ui| {
-                for &row in SETTINGS_ROWS {
-                    #[cfg(test)]
-                    let row_top = ui.cursor().top();
-                    let drawn = self.render_settings_row(ui, row, actions);
-                    // The rect is read off the cursor rather than off a
-                    // wrapping scope, because a scope would change every
-                    // row's widget ids for the probe's convenience.
-                    #[cfg(test)]
-                    if drawn {
-                        self.last_settings_rows.push(DrawnSettingsRow {
-                            id: row,
-                            rect: egui::Rect::from_x_y_ranges(
-                                ui.max_rect().x_range(),
-                                row_top..=ui.cursor().top(),
-                            ),
-                        });
-                    }
-                    #[cfg(not(test))]
-                    let _ = drawn;
-                }
-            });
-
-        if !open {
-            self.show_settings = false;
+    /// inventory and the drawn body cannot drift apart.
+    pub(super) fn render_settings_body(&mut self, ui: &mut egui::Ui, actions: &mut Vec<GuiAction>) {
+        for &row in SETTINGS_ROWS {
+            #[cfg(test)]
+            let row_top = ui.cursor().top();
+            let drawn = self.render_settings_row(ui, row, actions);
+            // The rect is read off the cursor rather than off a
+            // wrapping scope, because a scope would change every
+            // row's widget ids for the probe's convenience.
+            #[cfg(test)]
+            if drawn {
+                self.last_settings_rows.push(DrawnSettingsRow {
+                    id: row,
+                    rect: egui::Rect::from_x_y_ranges(
+                        ui.max_rect().x_range(),
+                        row_top..=ui.cursor().top(),
+                    ),
+                });
+            }
+            #[cfg(not(test))]
+            let _ = drawn;
         }
     }
 

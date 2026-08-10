@@ -890,7 +890,7 @@ impl App {
         // next one.
         let step = self
             .location
-            .step(self.platform.as_mut(), self.gui.show_settings);
+            .step(self.platform.as_mut(), self.gui.settings_visible());
         if step.changed {
             self.gui
                 .set_location_state(self.location.permission(), self.location.active());

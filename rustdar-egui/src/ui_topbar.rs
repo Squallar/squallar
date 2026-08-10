@@ -6,14 +6,14 @@
 //! pushes the panes down. It is the same bar at every
 //! [`WidthClass`](crate::ui_layout::WidthClass): being unconditional is what
 //! lets crossing a breakpoint re-key nothing (see the id note in
-//! `ui_chrome.rs`), and it is where the routes that used to depend on the
+//! `ui_shell.rs`), and it is where the routes that used to depend on the
 //! width now live — the ☰ dropdown is the whole menu everywhere, and the
 //! Layers toggle is the one way the layers panel opens and closes.
 //!
 //! Left to right: wordmark · ☰ app menu · Layers toggle · pane-count and
-//! active-pane segments · (spacer) · the two armed-drag toggles. No Set Time
-//! button — that belongs to the timeline's timestamp — and no Inspector
-//! toggle yet.
+//! active-pane segments · (spacer) · the two armed-drag toggles · the ⚙
+//! Inspector toggle. No Set Time button — that belongs to the timeline's
+//! timestamp.
 //!
 //! # The bar never overlaps itself
 //!
@@ -22,7 +22,7 @@
 //! for room — however long the left-hand run grows, nothing can land under
 //! them. The left-hand run then lives inside an unconditionally-present
 //! horizontal `ScrollArea` (one id at every width, per the module note in
-//! `ui_chrome.rs`), which clips rather than collides when even its tight form
+//! `ui_shell.rs`), which clips rather than collides when even its tight form
 //! cannot fit — the graceful floor for widths below Compact's breakpoint,
 //! until M6's minimal phone bar arrives.
 //!
@@ -47,6 +47,9 @@ const LAYERS_TOGGLE_LABEL: &str = "\u{25a4} Layers";
 const REGION_TOGGLE_LABEL: &str = "\u{2b1a} Region";
 /// The cross-section arm toggle, on the same terms as the region one.
 const SECTION_TOGGLE_LABEL: &str = "\u{2571} X-sec";
+/// The inspector toggle. Selected-state styled while the inspector is open —
+/// the mirror of [`LAYERS_TOGGLE_LABEL`] for the right-hand panel.
+const INSPECTOR_TOGGLE_LABEL: &str = "\u{2699} Inspector";
 
 /// The pane-count segments' caption, drawn only in the roomy form.
 const PANES_LABEL: &str = "Panes:";
@@ -79,13 +82,26 @@ impl super::Gui {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = ROOMY_ITEM_SPACING;
 
-                // Right-to-left, and **before** everything else, so the two
-                // armed-drag toggles claim the right edge first: however long
-                // the left-hand run grows, it cannot lay a segment under
-                // them. The first widget added is the rightmost — X-sec at
-                // the edge with Region to its left, which reads left-to-right
-                // as Region · X-sec.
+                // Right-to-left, and **before** everything else, so the
+                // right-hand cluster claims its edge first: however long the
+                // left-hand run grows, it cannot lay a segment under it. The
+                // first widget added is the rightmost — Inspector at the
+                // edge, then X-sec, then Region, which reads left-to-right as
+                // Region · X-sec · Inspector.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let insp_open = self.insp_open;
+                    let inspector = ui.selectable_label(insp_open, INSPECTOR_TOGGLE_LABEL);
+                    #[cfg(test)]
+                    {
+                        probe.inspector_toggle = (inspector.rect, insp_open);
+                    }
+                    if inspector.clicked() {
+                        // A plain flip: whatever the inspector was last about
+                        // is what it reopens on — the ⟩ collapse keeps the
+                        // selection for the same reason.
+                        self.insp_open = !insp_open;
+                    }
+
                     let armed = self.section_draw_armed();
                     let section = ui.selectable_label(armed, SECTION_TOGGLE_LABEL);
                     #[cfg(test)]

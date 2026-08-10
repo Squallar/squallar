@@ -147,7 +147,7 @@ impl super::Gui {
                 // own. Clicks there must not become overlay polygon hit-tests.
                 // The list is empty since the top bar replaced the hamburger,
                 // but the plumbing stays warm for the next painted-in-pane
-                // chrome — see `ChromeOutput::excluded_rects`.
+                // chrome — see `ShellOutput::excluded_rects`.
                 //
                 // Supplied by the chrome that drew them rather than rebuilt
                 // here from a second copy of its position constants — the two
@@ -359,7 +359,7 @@ impl super::Gui {
                     // pane was `mem::take`n above, so its slot holds a default
                     // `PaneState` — a *map* pane, whatever this one is — for the
                     // whole of this block. That is the same hazard `menu_model`
-                    // has in `ui_chrome.rs`, and it has the same fix: read the
+                    // has in `ui_shell.rs`'s pass, and it has the same fix: read the
                     // value you took, never the slot you took it from. It fails
                     // silently in the direction that looks like it works, which
                     // is why `last_pane_content` records what each arm actually

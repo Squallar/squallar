@@ -100,6 +100,43 @@ impl OverlayHandler for SpcOutlookHandler {
         !self.enabled_products.is_empty()
     }
 
+    /// The master toggle over a layer whose "enabled" is really a product
+    /// set — the same arrangement, and the same accepted forgetting, as
+    /// `NwsAlertHandler::set_enabled`. On restores the selected day's
+    /// *first* product, which is Categorical where the day publishes one and
+    /// Probabilistic where that is all there is — the entry a user starting
+    /// from nothing would tick.
+    fn set_enabled(&mut self, enabled: bool) {
+        if enabled {
+            if self.enabled_products.is_empty()
+                && let Some(&first) = self.selected_day.products().first()
+            {
+                self.enabled_products.insert(first);
+                self.config_generation = self.config_generation.wrapping_add(1);
+            }
+        } else if !self.enabled_products.is_empty() {
+            self.enabled_products.clear();
+            self.config_generation = self.config_generation.wrapping_add(1);
+        }
+    }
+
+    /// E.g. `"Day 1 · Categorical, Tornado"`. The products are named in the
+    /// day's own publication order, not the `HashSet`'s, so the line cannot
+    /// jitter between frames.
+    fn status_line(&self) -> Option<String> {
+        if !self.is_enabled() {
+            return None;
+        }
+        let products: Vec<String> = self
+            .selected_day
+            .products()
+            .iter()
+            .filter(|p| self.enabled_products.contains(p))
+            .map(|p| p.to_string())
+            .collect();
+        Some(format!("{} \u{b7} {}", self.selected_day, products.join(", ")))
+    }
+
     fn data_generation(&self) -> u64 {
         self.combined_generation()
     }
@@ -383,5 +420,54 @@ impl OverlayHandler for SpcOutlookHandler {
         {
             self.enabled_products = products;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The master toggle restores the *selected day's* first product, not a
+    /// hardcoded Categorical: days 4-8 publish only Probabilistic, and a
+    /// master that inserted a product the day has no endpoint for would show
+    /// an enabled layer that can never fetch anything.
+    #[test]
+    fn the_master_toggle_restores_a_product_the_day_actually_publishes() {
+        let mut handler = SpcOutlookHandler::new();
+        assert!(!handler.is_enabled(), "precondition: outlooks default off");
+
+        handler.set_enabled(true);
+        assert_eq!(
+            handler.enabled_products.iter().copied().collect::<Vec<_>>(),
+            vec![OutlookProduct::Categorical],
+            "day 1's first product is Categorical"
+        );
+
+        handler.set_enabled(false);
+        assert!(!handler.is_enabled());
+
+        handler.selected_day = OutlookDay::Day5;
+        handler.set_enabled(true);
+        assert_eq!(
+            handler.enabled_products.iter().copied().collect::<Vec<_>>(),
+            vec![OutlookProduct::Probabilistic],
+            "day 5 publishes only the probabilistic product"
+        );
+    }
+
+    /// `"Day N · <products>"`, in the day's own publication order — the
+    /// status line under the stack's SPC Outlooks row.
+    #[test]
+    fn the_status_line_names_the_day_and_its_enabled_products() {
+        let mut handler = SpcOutlookHandler::new();
+        assert_eq!(handler.status_line(), None, "off means no line");
+
+        handler.enabled_products.insert(OutlookProduct::Tornado);
+        handler.enabled_products.insert(OutlookProduct::Categorical);
+        assert_eq!(
+            handler.status_line().as_deref(),
+            Some("Day 1 \u{b7} Categorical, Tornado"),
+            "publication order, not set-iteration order"
+        );
     }
 }

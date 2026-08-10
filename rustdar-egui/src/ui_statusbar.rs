@@ -17,7 +17,7 @@
 //!
 //! # Ids do not depend on the breakpoint
 //!
-//! The same discipline as everywhere else in the chrome (see `ui_chrome.rs`):
+//! The same discipline as everywhere else in the chrome (see `ui_shell.rs`):
 //! one area id at every width, `roomy` gating only which *form* of the text
 //! draws, and the error slot pinned to the row's right edge under an explicit
 //! [`egui::UiBuilder::id`] — the full reasoning for that device is on the

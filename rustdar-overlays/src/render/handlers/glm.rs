@@ -424,6 +424,20 @@ impl OverlayHandler for GlmHandler {
         self.enabled = enabled;
     }
 
+    /// E.g. `"312 flashes · 10 min"`: what is in the window, and how wide the
+    /// window is. The count is whatever the window holds right now — it is
+    /// the number the map is drawing, not a promise about the feed.
+    fn status_line(&self) -> Option<String> {
+        if !self.enabled {
+            return None;
+        }
+        Some(format!(
+            "{} flashes \u{b7} {:.0} min",
+            self.state.data.len(),
+            self.time_window_secs / SECS_PER_MIN,
+        ))
+    }
+
     fn data_generation(&self) -> u64 {
         self.state.data_generation
     }

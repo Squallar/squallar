@@ -223,6 +223,18 @@ impl OverlayHandler for MetarHandler {
         self.enabled
     }
 
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
+    /// E.g. `"148 stations"` — how many observations the map is placing.
+    fn status_line(&self) -> Option<String> {
+        if !self.enabled {
+            return None;
+        }
+        Some(format!("{} stations", self.state.data.len()))
+    }
+
     fn data_generation(&self) -> u64 {
         self.state.data_generation
     }

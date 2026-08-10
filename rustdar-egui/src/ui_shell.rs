@@ -1,0 +1,205 @@
+//! The shell pass: the docked top bar, then the floating surfaces around the
+//! full-bleed map.
+//!
+//! # One docked panel; everything else floats
+//!
+//! The Synthesis design's full-bleed rule is that the map fills everything
+//! under the top bar and all other chrome floats over it, inside its bounds.
+//! So exactly one `Panel` claims space here — the top bar (`ui_topbar.rs`) —
+//! and what is left of the root `Ui` **is** the map's `CentralPanel`, edge to
+//! edge. That remainder is captured once, as [`ShellOutput::map_rect`], and
+//! every floating surface positions itself from it: the status bar along the
+//! bottom inset (`ui_statusbar.rs`), the layer stack at top-left
+//! (`ui_stack.rs`), the inspector at top-right (`ui_inspector.rs`), and the
+//! timeline transport the frame draws later, after the pane loop
+//! (`ui_timeline.rs`).
+//!
+//! The floating surfaces are `egui::Area`s above `Order::Background`, which is
+//! what keeps the map from reacting underneath them: every map click resolver
+//! runs through `filter_dialog_blocked`/`is_pos_blocked`, whose layer check
+//! drops a position covered by any layer above Background — no excluded-rect
+//! plumbing required.
+//!
+//! # One take window for the stack and the inspector
+//!
+//! Both panels are about the active pane — the stack walks its `draw_order`
+//! and flips its layers, the inspector edits its product, kind and per-layer
+//! configs — and several of the renderers they host need `&mut PaneState`
+//! beside `&mut self`. So the pass holds the active pane out of the vector
+//! with `std::mem::take`, **once, around both panels**: everything either
+//! panel needs of the pane reads and writes the taken value, and nothing
+//! inside the window may read `self.panes[..]`, whose active slot holds a
+//! default placeholder until the restore. The menu model is built before any
+//! take (by the top bar), the stack's row status lines are built from the
+//! taken pane against a registry demonstrably loaded with its configs, and
+//! [`Gui::write_pane_overlay`] is how the eye and Show toggles write both
+//! halves without touching the vector. The restore is followed by
+//! `propagate_layer_sync`, so a reorder, a toggle or an edited config fans
+//! out to the synced panes the same frame.
+//!
+//! # Ids do not depend on the breakpoint
+//!
+//! Every area, panel and combo-box id prefix uses one constant id regardless
+//! of which presentation is on screen. egui keys widget memory — combo state,
+//! scroll offsets, panel sizes — on those ids, so keying any of them on the
+//! layout would silently reset the user's UI state every time the window
+//! crossed a breakpoint. The two pre-rebuild files had exactly that hazard
+//! latent in them: `"d_"`/`"m_"` control prefixes and
+//! `layers_panel`/`mobile_layers_panel` could never collide only because the
+//! two files were never compiled together.
+//!
+//! The full-bleed flip also *strengthened* the positional-id story. egui's
+//! `Ui::new_child` computes `unique_id = stable_id.with(parent's
+//! next_auto_id_salt)` (`egui-0.35.0/src/ui.rs:255`), so the root `Ui`'s
+//! auto-id counter folds into every panel's registered id — which is why a
+//! panel that appears or vanishes with the width would re-key everything shown
+//! after it. With the status bar, stack and inspector all floating `Area`s
+//! (whose ids are their own roots, not children of the root `Ui`), the top bar
+//! is the only thing that advances that counter at all, and it is drawn at
+//! every width. `crossing_a_breakpoint_re_keys_nothing` pins the whole claim,
+//! and `crossing_a_breakpoint_does_not_move_any_widget_id` pins the
+//! stored-state half of it.
+
+use crate::actions::GuiAction;
+use rustdar_overlays::render::overlay_state::OverlayKind;
+
+use super::{InspectorSelection, PaneState};
+
+/// What the shell produced this frame.
+pub(super) struct ShellOutput {
+    pub actions: Vec<GuiAction>,
+    /// Screen rects of floating chrome drawn *over* the map, which map click
+    /// handling must not treat as map clicks.
+    ///
+    /// This is an **output** of the shell rather than something the map
+    /// reconstructs — only the code that draws a floating thing knows where it
+    /// is. Empty in practice since the hamburger went: everything left either
+    /// claims panel space or is an egui layer above `Background`, which the
+    /// layer half of `is_pos_blocked` catches with no plumbing. The mechanism
+    /// stays because painted-in-pane chrome has no layer to be caught by, and
+    /// the next thing painted over a pane will need it again.
+    pub excluded_rects: Vec<egui::Rect>,
+    /// What the top bar left of the content rect — the rect the map's
+    /// `CentralPanel` will fill, captured here so the floating surfaces (and
+    /// the timeline, drawn after the pane loop) can position against it
+    /// without re-deriving the top bar's height.
+    pub map_rect: egui::Rect,
+}
+
+impl super::Gui {
+    /// Draw all the chrome around the map: the one docked panel first, then
+    /// the floating surfaces positioned in what it left.
+    pub(super) fn render_shell(&mut self, ui: &mut egui::Ui) -> ShellOutput {
+        let mut actions = Vec::new();
+
+        self.render_top_bar(ui, &mut actions);
+
+        // Everything the top bar did not claim is the map's — the full-bleed
+        // rect every floating surface positions itself in.
+        let map_rect = ui.available_rect_before_wrap();
+
+        self.render_status_bar(ui.ctx(), map_rect, &mut actions);
+
+        self.render_stack_and_inspector(ui.ctx(), map_rect, &mut actions);
+
+        ShellOutput {
+            actions,
+            excluded_rects: Vec::new(),
+            map_rect,
+        }
+    }
+
+    /// The stack and the inspector, around the one take window — see the
+    /// module note for the discipline this pass keeps.
+    fn render_stack_and_inspector(
+        &mut self,
+        ctx: &egui::Context,
+        map_rect: egui::Rect,
+        actions: &mut Vec<GuiAction>,
+    ) {
+        // A Layer selection describes a map layer, and a pane with no map has
+        // none — the stack shows it no rows to have selected one from. Snap
+        // to the pane's own properties, which is what the inspector can still
+        // truthfully say about it. Before the take, off the live pane.
+        if matches!(self.inspector_sel, InspectorSelection::Layer(_))
+            && !self.panes[self.active_pane].is_map()
+        {
+            self.inspector_sel = InspectorSelection::PaneProps;
+        }
+
+        let stack_open = self.layers_panel_visible();
+        if !stack_open && !self.insp_open {
+            return;
+        }
+
+        let mut pane = std::mem::take(&mut self.panes[self.active_pane]);
+
+        // The registry must hold *this* pane's configs before anything asks a
+        // handler about itself — the status lines below, and the layer body's
+        // round trip, both read handler state as "the active pane's". The
+        // frame-end reload in `Gui::ui` usually guarantees it already, but an
+        // active-pane switch earlier this same frame (the top bar's segments)
+        // would leave the previous pane's configs loaded.
+        if !pane.overlay_configs.is_empty() {
+            self.overlays.load_pane_configs(&pane.overlay_configs);
+        }
+
+        // The rows' status lines, one per layer in the pane's own order.
+        // Radar's is the exception with a reason: the product and tilt are
+        // pane state — the radar handler holds only the layer toggle — so the
+        // line is read off the taken pane rather than asked of the registry.
+        let statuses: Vec<(OverlayKind, Option<String>)> = if stack_open && pane.is_map() {
+            pane.draw_order
+                .iter()
+                .map(|&kind| {
+                    let line = if kind == OverlayKind::Radar {
+                        radar_row_status(&pane)
+                    } else {
+                        self.overlays.status_line(kind)
+                    };
+                    (kind, line)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        if stack_open {
+            self.render_stack(ctx, map_rect, &mut pane, &statuses, actions);
+        }
+        if self.insp_open {
+            self.render_inspector(ctx, map_rect, &mut pane, actions);
+        }
+
+        self.panes[self.active_pane] = pane;
+        // After the restore, so the source it copies from is the real pane
+        // rather than the `mem::take` placeholder. It deliberately does
+        // **not** copy `content`: a pane's kind is how this pane presents the
+        // shared subject, not part of the subject, and propagating it would
+        // convert every sibling the moment one pane became a 3D view — from a
+        // setting called "Sync Layers". The reasoning is written out on
+        // `propagate_layer_sync` itself.
+        self.propagate_layer_sync();
+    }
+}
+
+/// The Radar row's status line: what picture this pane's radar layer is —
+/// product code and tilt, e.g. `REF · 0.5°`.
+///
+/// The tilt is the *snapped* angle where a scan is loaded — the one the pane
+/// is actually rendering — falling back to the raw selection before any scan
+/// arrives. `None` while the layer is hidden: the dimmed row carries no line,
+/// like every other layer's. `code()` is the fetch path's lowercase spelling,
+/// uppercased here because the row is a display, not a URL.
+fn radar_row_status(pane: &PaneState) -> Option<String> {
+    if !pane.is_overlay_enabled(OverlayKind::Radar) {
+        return None;
+    }
+    let (product, tilt) = pane
+        .get_rendering_params()
+        .unwrap_or((pane.selected_product, pane.selected_elevation));
+    Some(format!(
+        "{} \u{b7} {tilt:.1}\u{b0}",
+        product.code().to_uppercase()
+    ))
+}

@@ -11,11 +11,18 @@
 //! never reconstructs what "should" have been painted.
 //!
 //! Each width class is walked through the chrome a user of that width gets:
-//! the top bar's Layers toggle opens the layers panel — sidebar on Expanded,
-//! drawer elsewhere — and its ☰ button opens the one menu dropdown every
-//! width shares. `ScrollArea`s lay content out beyond the viewport, so an
-//! item is only counted once its probe's rect centre is inside the screen —
+//! the top bar's Layers toggle opens the layer stack — sidebar on Expanded,
+//! drawer elsewhere — each stack row opens its layer's options in the
+//! inspector, the ☰ button opens the one menu dropdown every width shares,
+//! and its Settings… entry opens the inspector's App › Settings body.
+//! `ScrollArea`s lay content out beyond the viewport, so an item is only
+//! counted once its probe's rect centre is inside the screen —
 //! [`InputHarness::scroll_until`] does the scrolling a user would.
+//!
+//! A handler's heading and its master `enabled` toggle are excluded from the
+//! control inventory through [`is_master_control`] — the renderer's own
+//! predicate — because the inspector expresses them as the crumb and the
+//! "Show <layer>" toggle; the walk asserts that toggle drew instead.
 //!
 //! Assertion failures name the missing label *and* the width class, because
 //! "reachable on desktop" and "reachable on a phone" are separate claims and
@@ -25,7 +32,9 @@
 //! [`ControlItem`]: rustdar_overlays::render::controls::ControlItem
 
 use crate::input_harness::InputHarness;
-use crate::ui::{DrawnControlItem, DrawnControlKind, OVERLAY_CONTROL_ORDER, SETTINGS_ROWS};
+use crate::ui::{
+    DrawnControlItem, DrawnControlKind, OVERLAY_CONTROL_ORDER, SETTINGS_ROWS, is_master_control,
+};
 use crate::ui_layout::WidthClass;
 use rustdar_overlays::render::controls::ControlItem;
 use rustdar_overlays::render::overlay_state::OverlayKind;
@@ -39,20 +48,12 @@ const SCROLL_STEP: egui::Vec2 = egui::vec2(0.0, -160.0);
 /// points tall at most.
 const MAX_SCROLL_STEPS: usize = 120;
 
-/// Where the walk points the wheel to scroll the layers panel/drawer: inside
-/// the panel (240pt wide in both forms), clear of its edge.
-fn panel_scroll_pos(h: &InputHarness) -> egui::Pos2 {
-    egui::pos2(120.0, h.screen_rect().center().y)
-}
-
-/// Scroll the panel back to its top, so a walk always starts from the same
-/// place however far a previous phase scrolled it.
-fn scroll_panel_to_top(h: &mut InputHarness) {
-    let pos = panel_scroll_pos(h);
-    for _ in 0..6 {
-        h.scroll_at(pos, egui::vec2(0.0, 4000.0));
-        h.frame_after(1.0 / 60.0);
-    }
+/// Where the walk points the wheel to scroll the inspector: inside its own
+/// area, from egui's authority on where that is.
+fn inspector_scroll_pos(h: &InputHarness) -> egui::Pos2 {
+    h.inspector_rect()
+        .expect("the inspector must be on screen to be scrolled")
+        .center()
 }
 
 /// Whether an item's probe was recorded with its centre on screen — the walk's
@@ -90,7 +91,8 @@ fn matches(
     item.handler == Some(handler) && item.kind == kind && item.label == label
 }
 
-/// Scroll until `label` is drawn on screen, and fail naming it if it never is.
+/// Scroll the inspector until `label` is drawn on screen, and fail naming it
+/// if it never is.
 fn assert_control_reachable(
     h: &mut InputHarness,
     width: WidthClass,
@@ -98,7 +100,7 @@ fn assert_control_reachable(
     kind: DrawnControlKind,
     label: &str,
 ) {
-    let pos = panel_scroll_pos(h);
+    let pos = inspector_scroll_pos(h);
     let found = h.scroll_until(pos, SCROLL_STEP, MAX_SCROLL_STEPS, |h| {
         control_on_screen(h, handler, kind, label)
     });
@@ -134,7 +136,7 @@ fn assert_control_tree(
     handler: OverlayKind,
     items: &[ControlItem],
 ) {
-    for item in items {
+    for item in items.iter().filter(|item| !is_master_control(item)) {
         match item {
             ControlItem::ButtonRow { buttons } => {
                 for button in buttons {
@@ -193,10 +195,9 @@ fn control_label(item: &ControlItem) -> &str {
     }
 }
 
-/// Every handler's every control, reachable in the layers panel.
+/// Every handler's every control, reachable through its stack row and the
+/// inspector's layer body.
 fn walk_layer_controls(h: &mut InputHarness, width: WidthClass) {
-    h.open_layers();
-    scroll_panel_to_top(h);
     for &handler in OVERLAY_CONTROL_ORDER {
         let model = h.control_item_model(handler);
         assert!(
@@ -204,8 +205,20 @@ fn walk_layer_controls(h: &mut InputHarness, width: WidthClass) {
             "{handler:?} offers no controls at all on {width:?} — the \
              inventory itself is broken, not the chrome"
         );
+        // The user's route: the stack row. Handles the drawer, the scroll to
+        // the row, and asserts the layer body's own arm drew.
+        h.open_layer_in_inspector(handler);
+        // The master controls the tree filter excludes render as the crumb
+        // and the Show toggle — assert the toggle really drew, so excluding
+        // them from the inventory cannot quietly orphan a layer's on/off.
+        assert!(
+            h.inspector().master.is_some(),
+            "{handler:?}'s layer body drew no Show toggle on {width:?}"
+        );
         assert_control_tree(h, width, handler, &model);
     }
+    // Leave nothing open over the next phase's clicks.
+    h.close_inspector();
 }
 
 /// Every menu leaf, drawn inside the viewport by the one ☰ dropdown.
@@ -272,7 +285,8 @@ fn walk_time_dialog(h: &mut InputHarness, width: WidthClass) {
     );
 }
 
-/// Every settings row, reachable through the menu's Settings... entry.
+/// Every settings row, reachable through the menu's Settings... entry — the
+/// inspector's App › Settings body, whose scroll the walk works like a user.
 fn walk_settings(h: &mut InputHarness, width: WidthClass) {
     h.open_settings();
     for &row in SETTINGS_ROWS {
@@ -281,15 +295,14 @@ fn walk_settings(h: &mut InputHarness, width: WidthClass) {
             // the widgets out, so there is nothing to have drawn.
             continue;
         }
-        let drawn = h
-            .settings_row(row)
-            .unwrap_or_else(|| panic!("settings row {row:?} was never drawn on {width:?}"));
+        let pos = inspector_scroll_pos(h);
+        let found = h.scroll_until(pos, SCROLL_STEP, MAX_SCROLL_STEPS, |h| {
+            h.settings_row(row)
+                .is_some_and(|drawn| h.screen_rect().contains(drawn.rect.center()))
+        });
         assert!(
-            h.screen_rect().contains(drawn.rect.center()),
-            "settings row {row:?} was drawn at {:?}, outside the {width:?} \
-             viewport {:?}",
-            drawn.rect,
-            h.screen_rect()
+            found,
+            "settings row {row:?} was never drawn on screen on {width:?}"
         );
     }
 }

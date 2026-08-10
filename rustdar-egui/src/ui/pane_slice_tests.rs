@@ -111,10 +111,12 @@ fn viewport_sync_never_outruns_the_pane_vector() {
 ///
 /// Read the `std::mem::take` below as the load-bearing part of the fixture
 /// rather than as scene-setting. Today's menu dispatch is **outside** both
-/// windows — `render_layers_panel` restores the pane at `ui_chrome.rs:425` and
-/// dispatches at `:438`, and `render_menu_bar_panel` takes no pane — so a
-/// direct write from `apply_menu_event` would pass every behavioural test in
-/// the suite, this one included, if this one did not hold the pane out by hand.
+/// windows — the top bar takes no pane, and the shell's stack+inspector take
+/// opens only after it has dispatched — so a direct write from
+/// `apply_menu_event` would pass every behavioural test in the suite, this
+/// one included, if this one did not hold the pane out by hand. (The
+/// inspector's kind segmented control, by contrast, dispatches from *inside*
+/// that take, which is this deferral earning its keep in production.)
 ///
 /// That makes this a test of the *mechanism* and not of user-visible
 /// behaviour, which is a thing worth saying out loud: it is here because

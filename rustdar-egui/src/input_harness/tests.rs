@@ -1484,13 +1484,13 @@ fn the_mehs_colour_bar_paints_the_users_hail_size_unit() {
 #[test]
 fn tap_on_floating_dialog_is_filtered_out() {
     let mut h = InputHarness::new();
-    h.gui_mut().show_settings = true;
+    h.gui_mut().set_time_dialog_open_for_test(true);
     h.warm_up();
 
     let pos = h.screen_center();
     assert!(
         h.is_floating_layer_at(pos),
-        "precondition: the settings dialog must cover the viewport centre"
+        "precondition: the time dialog must cover the viewport centre"
     );
     assert!(
         h.map_center().distance(pos) < 200.0,
@@ -1514,7 +1514,7 @@ fn tap_on_floating_dialog_is_filtered_out() {
     assert_eq!(settled.touch.overlay_click_pos, None);
 
     // Sanity: with the dialog closed, the same position is clickable again.
-    h.gui_mut().show_settings = false;
+    h.gui_mut().set_time_dialog_open_for_test(false);
     h.warm_up();
     assert!(!h.is_floating_layer_at(pos));
     let clicked = h.mouse_click(pos);
@@ -1537,7 +1537,7 @@ fn tap_confirmed_under_a_dialog_is_filtered_out() {
     assert_eq!(tapped.touch.overlay_click_pos, None, "still deferred");
 
     // A dialog opens over the tap position before the window closes.
-    h.gui_mut().show_settings = true;
+    h.gui_mut().set_time_dialog_open_for_test(true);
     h.frame_after(FRAME_DT);
     assert!(
         h.is_floating_layer_at(pos),
@@ -1555,7 +1555,7 @@ fn tap_confirmed_under_a_dialog_is_filtered_out() {
     // Sanity: the identical sequence without the dialog does deliver the
     // tap, so the assertion above is about the gate and not about the tap
     // being swallowed somewhere else.
-    h.gui_mut().show_settings = false;
+    h.gui_mut().set_time_dialog_open_for_test(false);
     h.warm_up();
     h.touch_tap(pos);
     let confirmed = h.frame_after(AFTER_DOUBLE_TAP_TIMEOUT);
@@ -1845,7 +1845,7 @@ fn a_touch_reaches_only_the_active_pane_but_a_click_reaches_them_all() {
 /// `Gui::active_pane` resolves the slot as `self.panes[self.active_pane]`, so
 /// an index the layout drew a cell for but the vector never grew to reach is
 /// not a pane that quietly goes unpainted — it is a panic waiting for the next
-/// reader, and `render_layers_panel`'s `mem::take` is one of them. The skew is
+/// reader, and the shell's stack+inspector `mem::take` is one of them. The skew is
 /// built by hand because no production writer can produce it: both grow the
 /// vector before assigning the layout. See `Gui::claim_pane_count_for_test`.
 #[test]
@@ -1890,7 +1890,9 @@ fn a_click_on_a_cell_no_pane_occupies_leaves_the_active_pane_alone() {
 ///     for a layout-keyed `Id` however that keying was introduced.
 #[test]
 fn crossing_a_breakpoint_does_not_move_any_widget_id() {
-    let mut h = InputHarness::with_screen(egui::vec2(1200.0, 800.0));
+    // Short enough that the stack's rows genuinely overflow their scroll
+    // area — on a taller window there is no offset to lose.
+    let mut h = InputHarness::with_screen(egui::vec2(1200.0, 500.0));
     // The drawer is what shows the panel below the sidebar breakpoint;
     // opening it up front means the panel is on screen for both runs.
     h.set_drawer_open(true);
@@ -1940,7 +1942,7 @@ fn crossing_a_breakpoint_does_not_move_any_widget_id() {
              the probed id, got {scrolled:?}"
     );
 
-    h.set_screen(egui::vec2(800.0, 800.0));
+    h.set_screen(egui::vec2(800.0, 500.0));
     h.set_drawer_open(true);
     assert_eq!(
         h.width_class(),
@@ -1962,7 +1964,7 @@ fn crossing_a_breakpoint_does_not_move_any_widget_id() {
 
     // ...and across the 600pt breakpoint too, so all three widths resolve
     // the same ids.
-    h.set_screen(egui::vec2(500.0, 800.0));
+    h.set_screen(egui::vec2(500.0, 500.0));
     h.set_drawer_open(true);
     assert_eq!(
         h.width_class(),
@@ -2383,7 +2385,7 @@ fn a_menu_toggle_loads_the_active_panes_config_before_saving_it() {
 ///
 ///     Driven on Medium with the drawer shut — the menu is always on
 ///     screen behind ☰, and this is a width where the layers panel is not.
-///     With the panel up, `render_layers_panel` calls
+///     With the panel up, the shell's stack+inspector pass calls
 ///     `propagate_layer_sync` itself every frame and masks the arm: a
 ///     panel-open version of this test passes with the call deleted.
 #[test]
@@ -2683,9 +2685,9 @@ fn the_pane_picker_offers_fewer_panes_on_a_phone_than_on_a_desktop() {
 ///     identical and silently cost the user their place in the list.
 #[test]
 fn the_layers_toggle_hides_and_restores_the_expanded_sidebar_with_its_state() {
-    // Short enough that the layer controls genuinely overflow their
+    // Short enough that the stack's rows genuinely overflow their
     // scroll area — on a taller window there is no offset to preserve.
-    let mut h = InputHarness::with_screen(egui::vec2(1200.0, 800.0));
+    let mut h = InputHarness::with_screen(egui::vec2(1200.0, 500.0));
     assert_eq!(
         h.width_class(),
         crate::ui_layout::WidthClass::Expanded,
@@ -3144,6 +3146,568 @@ fn an_android_back_press_closes_the_dropdown_without_a_key_event() {
     assert!(
         !h.gui_mut().dismiss_top_layer(),
         "the popup press left something else consumed as well"
+    );
+}
+
+// ── The layer stack and the inspector ────────────────────────────────
+
+/// A two-pane Expanded harness with pane 1 made active the user's way — a
+/// click on that pane — so the stack and inspector demonstrably describe
+/// the pane the user is working in, not pane 0.
+fn expanded_with_pane_1_active() -> InputHarness {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.set_pane_count(2);
+    // Clear of the stack on the left and the chrome bands.
+    let target = h.pane_rects()[1].center();
+    h.mouse_click(target);
+    h.warm_up();
+    assert_eq!(
+        h.active_pane_index(),
+        1,
+        "precondition: clicking pane 1 must make it active, or this fixture \
+             is testing pane 0 twice"
+    );
+    h
+}
+
+/// 84. **The stack's rows read and write the live active pane, not pane 0.**
+///
+///     Contract 27's claim, ported to the new pass: the stack renders from
+///     the pane the shell `mem::take`s, so a stack that read the placeholder
+///     — or indexed `panes[0]` — would draw every eye from the wrong pane
+///     and write every click to it. Sync is off so the panes can disagree;
+///     `CityLabels` is the witness kind for the write half, exactly as in
+///     contract 27: `serialize_state` carries `enabled`, so a snapshot taken
+///     against the wrong pane's config silently rewrites every *other*
+///     kind's flag.
+#[test]
+fn the_stacks_rows_read_and_write_the_active_pane_not_pane_zero() {
+    let mut h = expanded_with_pane_1_active();
+    h.set_sync_layers(false);
+    h.set_overlay_on_pane(0, OverlayKind::RadarSites, false);
+    h.set_overlay_on_pane(0, OverlayKind::CityLabels, false);
+    h.set_overlay_on_pane(1, OverlayKind::RadarSites, true);
+    h.set_overlay_on_pane(1, OverlayKind::CityLabels, true);
+    h.warm_up();
+
+    // The read half: the eye shows pane 1's state.
+    let row = h
+        .stack_row(OverlayKind::RadarSites)
+        .expect("the stack must draw a RadarSites row");
+    assert!(
+        row.eye_on,
+        "the eye drew pane 0's state while pane 1 is active"
+    );
+
+    // The write half: clicking it writes pane 1, and only the toggled kind.
+    h.mouse_click(row.eye.center());
+    h.frames_for(5, FRAME_DT);
+    assert!(
+        !h.overlay_enabled_on(1, OverlayKind::RadarSites),
+        "the eye did not reach the active pane"
+    );
+    assert!(
+        !h.overlay_enabled_on(0, OverlayKind::RadarSites),
+        "the eye wrote to pane 0, which is not the active pane"
+    );
+    assert!(
+        h.overlay_enabled_on(1, OverlayKind::CityLabels),
+        "toggling radar sites on pane 1 also turned its city labels off: \
+             the config was read from the wrong pane"
+    );
+    assert!(
+        !h.overlay_enabled_on(0, OverlayKind::CityLabels),
+        "pane 0's city labels changed, though it is not the active pane"
+    );
+}
+
+/// 85. **The eye turns a layer off, and it stays off — and back on.**
+///
+///     Contract 18's watched-frames claim, ported to the eye: a toggle that
+///     reached `enabled_overlays` but not `overlay_configs` is undone the
+///     next time the handlers reload from the config, so asserting straight
+///     after the click passes while the user's change evaporates. Both
+///     directions, so this cannot pass by the click being read as an
+///     unconditional "off".
+#[test]
+fn the_eye_toggles_a_layer_both_ways_and_it_sticks() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
+    h.warm_up();
+    assert!(h.overlay_enabled(OverlayKind::RadarSites), "precondition");
+
+    let row = h.stack_row(OverlayKind::RadarSites).expect("row drawn");
+    assert!(row.eye_on, "the eye must draw the live state");
+    h.mouse_click(row.eye.center());
+    for frame in 0..5 {
+        h.frame_after(FRAME_DT);
+        assert!(
+            !h.overlay_enabled(OverlayKind::RadarSites),
+            "the overlay came back on {} frame(s) after the eye click: the \
+                 toggle reached `enabled_overlays` but not `overlay_configs`",
+            frame + 1
+        );
+    }
+    assert!(
+        !h.stack_row(OverlayKind::RadarSites).expect("row").eye_on,
+        "the layer is off but the eye still draws it on"
+    );
+
+    let row = h.stack_row(OverlayKind::RadarSites).expect("row");
+    h.mouse_click(row.eye.center());
+    h.frames_for(5, FRAME_DT);
+    assert!(
+        h.overlay_enabled(OverlayKind::RadarSites),
+        "the eye did not turn the layer back on"
+    );
+}
+
+/// 86. **The inspector's Show toggle is the eye's equal: both ways, and it
+///     sticks.**
+///
+///     The layer body's master toggle goes through the same
+///     `write_pane_overlay` discipline as the eye, from inside the same
+///     take window — this holds it there. Also pins that the master shows
+///     the live state, through the probe's handed-value convention.
+#[test]
+fn the_inspectors_show_toggle_toggles_both_ways_and_it_sticks() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
+    h.warm_up();
+    h.open_layer_in_inspector(OverlayKind::RadarSites);
+
+    let (master, on) = h.inspector().master.expect("the layer body's toggle");
+    assert!(on, "the Show toggle must draw the live state");
+    h.mouse_click(master.center());
+    for frame in 0..5 {
+        h.frame_after(FRAME_DT);
+        assert!(
+            !h.overlay_enabled(OverlayKind::RadarSites),
+            "the overlay came back on {} frame(s) after the Show click",
+            frame + 1
+        );
+    }
+
+    let (master, on) = h.inspector().master.expect("still drawn");
+    assert!(!on, "the layer is off but the Show toggle still draws on");
+    h.mouse_click(master.center());
+    h.frames_for(5, FRAME_DT);
+    assert!(
+        h.overlay_enabled(OverlayKind::RadarSites),
+        "the Show toggle did not turn the layer back on"
+    );
+}
+
+/// 87. **An eye toggle saves the active pane's *own* overlay config.**
+///
+///     Contract 29's claim, ported to the eye. `render_pane_map_content`
+///     loads each pane's config as it draws it, so at the end of a frame
+///     the handlers hold the *last-drawn* pane's settings — and
+///     `serialize_state` carries `enabled`, so a snapshot taken against the
+///     wrong pane's config silently rewrites every other kind's flag on the
+///     active pane. Three separate things keep the handlers correct at the
+///     moment of the write: the frame-end reload in `Gui::ui`, the shell's
+///     pre-take load, and the load inside `write_pane_overlay` itself. Any
+///     alone is sufficient — so no single one is killable — but removing
+///     all three fails here, and this is the test that names the failure.
+#[test]
+fn an_eye_toggle_loads_the_active_panes_config_before_saving_it() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.set_pane_count(2);
+    h.set_sync_layers(false);
+    assert_eq!(
+        h.active_pane_index(),
+        0,
+        "precondition: pane 0 active, so the *last drawn* pane 1 is the one \
+             whose config could be left in the handlers"
+    );
+
+    h.set_overlay_on_pane(0, OverlayKind::CityLabels, true);
+    h.set_overlay_on_pane(1, OverlayKind::CityLabels, false);
+    h.set_overlay_on_pane(0, OverlayKind::RadarSites, false);
+    h.warm_up();
+
+    let row = h.stack_row(OverlayKind::RadarSites).expect("row drawn");
+    h.mouse_click(row.eye.center());
+    h.frames_for(5, FRAME_DT);
+
+    assert!(
+        h.overlay_enabled_on(0, OverlayKind::RadarSites),
+        "precondition: the eye must have taken effect"
+    );
+    assert!(
+        h.overlay_enabled_on(0, OverlayKind::CityLabels),
+        "the active pane's city labels were overwritten by pane 1's config: \
+             the handlers were saved without loading the active pane first"
+    );
+}
+
+/// 88. **An eye toggle propagates to the other panes when sync is on.**
+///
+///     Contract 28's claim, ported to the eye: the shell's pass ends with
+///     `propagate_layer_sync` after the pane goes back, and this is what
+///     makes a layer flipped on one pane a layer flipped on all of them.
+#[test]
+fn an_eye_toggle_propagates_to_the_other_panes_when_sync_is_on() {
+    let mut h = expanded_with_pane_1_active();
+    assert!(h.sync_layers(), "precondition: layer sync defaults on");
+    h.set_overlay_on_pane(0, OverlayKind::RadarSites, false);
+    h.set_overlay_on_pane(1, OverlayKind::RadarSites, false);
+    h.warm_up();
+
+    let row = h.stack_row(OverlayKind::RadarSites).expect("row drawn");
+    h.mouse_click(row.eye.center());
+    h.frames_for(5, FRAME_DT);
+
+    assert!(
+        h.overlay_enabled_on(1, OverlayKind::RadarSites),
+        "precondition: the active pane must have taken the toggle"
+    );
+    assert!(
+        h.overlay_enabled_on(0, OverlayKind::RadarSites),
+        "the toggle did not propagate to the other pane, though layer sync \
+             is on"
+    );
+}
+
+/// 94. **Turning a dataless layer on fetches it, eye and Show toggle alike.**
+///
+///     SPC outlooks are the layer that makes this a contract rather than a
+///     nicety: the handler never auto-polls, so an enable that emitted no
+///     `FetchOverlay` would leave an enabled layer that stays blank forever.
+///     The layer's own sub-toggles ask for the fetch through their
+///     `ControlEffect`; the master routes bypass them, so they carry the
+///     rule themselves.
+#[test]
+fn enabling_a_dataless_layer_fetches_it() {
+    // The eye.
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    let row = h.stack_row(OverlayKind::SpcOutlook).expect("row drawn");
+    assert!(!row.eye_on, "precondition: outlooks default off");
+    h.mouse_click(row.eye.center());
+    assert!(
+        h.last_actions().iter().any(|a| matches!(
+            a,
+            crate::actions::GuiAction::FetchOverlay {
+                kind: OverlayKind::SpcOutlook,
+                ..
+            }
+        )),
+        "the eye enabled a layer with no data and no auto-poll, and nothing \
+             will ever fetch it"
+    );
+
+    // The Show toggle.
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.open_layer_in_inspector(OverlayKind::SpcOutlook);
+    let (master, on) = h.inspector().master.expect("the layer body's toggle");
+    assert!(!on, "precondition: outlooks default off");
+    h.mouse_click(master.center());
+    assert!(
+        h.last_actions().iter().any(|a| matches!(
+            a,
+            crate::actions::GuiAction::FetchOverlay {
+                kind: OverlayKind::SpcOutlook,
+                ..
+            }
+        )),
+        "the Show toggle enabled a dataless layer without fetching it"
+    );
+}
+
+/// 68. **The ▲▼ buttons really reorder the draw order — permuted, bounded,
+///     persisted, redrawn.**
+///
+///     `PaneState::draw_order` has been persisted per pane since multi-pane
+///     landed, with no UI able to change it; the stack's reorder buttons are
+///     that UI, and each of the four claims has its own silent failure:
+///     a ▲ that swaps the wrong neighbours (the display list is the draw
+///     order *reversed*, so the index arithmetic is exactly the thing to
+///     pin), an end button that wraps instead of disabling, a reorder that
+///     evaporates on restart because it never reached the config, and rows
+///     that keep their old positions because the renderer iterated a copy.
+#[test]
+fn the_reorder_buttons_permute_the_draw_order_and_it_persists() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    let before = h.gui_mut().pane(0).expect("pane 0").draw_order.clone();
+    let n = before.len();
+    assert!(n >= 3, "precondition: a real layer list");
+
+    // The ends are disabled: the top row cannot move up, the bottom cannot
+    // move down — and a click there does nothing rather than wrapping.
+    let rows = h.stack().rows;
+    assert_eq!(rows.len(), n, "one row per layer");
+    assert!(!rows[0].up.1, "the top row's \u{25b2} must be disabled");
+    assert!(rows[0].down.1, "the top row's \u{25bc} must be enabled");
+    assert!(
+        !rows[n - 1].down.1,
+        "the bottom row's \u{25bc} must be disabled"
+    );
+    h.mouse_click(rows[0].up.0.center());
+    h.frames_for(2, FRAME_DT);
+    assert_eq!(
+        h.gui_mut().pane(0).expect("pane 0").draw_order,
+        before,
+        "clicking a disabled \u{25b2} still permuted the order"
+    );
+
+    // ▲ on the second row: drawn later, i.e. towards the *end* of
+    // `draw_order` — the top row is the last-drawn layer.
+    let second = rows[1].kind;
+    h.mouse_click(rows[1].up.0.center());
+    h.frames_for(2, FRAME_DT);
+    let mut expected = before.clone();
+    expected.swap(n - 1, n - 2);
+    assert_eq!(
+        h.gui_mut().pane(0).expect("pane 0").draw_order,
+        expected,
+        "\u{25b2} on the second row must swap the draw order's last two \
+             entries"
+    );
+
+    // The rows re-render in the new order, from the mutated field.
+    let rows = h.stack().rows;
+    assert_eq!(
+        rows[0].kind, second,
+        "the promoted layer's row did not move to the top"
+    );
+
+    // ▼ undoes it, so the wiring is symmetric.
+    h.mouse_click(rows[0].down.0.center());
+    h.frames_for(2, FRAME_DT);
+    assert_eq!(
+        h.gui_mut().pane(0).expect("pane 0").draw_order,
+        before,
+        "\u{25bc} on the promoted row must put the order back"
+    );
+
+    // And the change survives the config round trip: reorder again, save,
+    // and load into a fresh session.
+    let rows = h.stack().rows;
+    h.mouse_click(rows[1].up.0.center());
+    h.frames_for(2, FRAME_DT);
+    let reordered = h.gui_mut().pane(0).expect("pane 0").draw_order.clone();
+    assert_ne!(reordered, before, "precondition: a real reorder to persist");
+
+    let store = crate::config_store::MemoryConfigStore::default();
+    h.gui_mut().save_ui_config(&store);
+    let mut fresh = crate::Gui::new();
+    assert!(fresh.load_ui_config(&store), "the saved config must load");
+    assert_eq!(
+        fresh.pane(0).expect("pane 0").draw_order,
+        reordered,
+        "the reorder did not survive the ui_config round trip"
+    );
+}
+
+/// 89. **A stack row click selects that layer in the inspector, which opens
+///     itself.**
+///
+///     The row is the route to a layer's options (plan §3.8): the click
+///     must auto-open a closed inspector and land on *that* layer's body —
+///     asserted through the probe's `mode`, which the body arm writes as a
+///     literal, so a mis-wired dispatch cannot fake it. The crumb is the
+///     user-visible half of the same claim, and `✕` deselect is the way
+///     back to App › Settings.
+#[test]
+fn a_stack_row_click_opens_that_layers_options_in_the_inspector() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    assert!(
+        !h.inspector().open,
+        "precondition: the inspector starts closed"
+    );
+
+    let row = h.stack_row(OverlayKind::NwsAlerts).expect("row drawn");
+    h.mouse_click(row.rect.center());
+    h.warm_up();
+
+    let inspector = h.inspector();
+    assert!(inspector.open, "the row click did not open the inspector");
+    assert_eq!(
+        inspector.mode,
+        Some(crate::ui::InspectorSelection::Layer(OverlayKind::NwsAlerts)),
+        "the inspector opened on something other than the clicked layer"
+    );
+    assert_eq!(
+        inspector.crumb, "Pane 1 \u{203a} NWS Alerts",
+        "the crumb does not name the selection"
+    );
+    assert!(
+        h.stack_row(OverlayKind::NwsAlerts)
+            .expect("row still drawn")
+            .selected,
+        "the selected layer's row must draw selected"
+    );
+
+    // ✕ returns to App › Settings without closing the panel.
+    h.mouse_click(inspector.deselect.center());
+    h.warm_up();
+    let inspector = h.inspector();
+    assert!(inspector.open, "deselecting must not close the inspector");
+    assert_eq!(
+        inspector.mode,
+        Some(crate::ui::InspectorSelection::AppSettings),
+        "\u{2715} must return to App \u{203a} Settings"
+    );
+}
+
+/// 90. **The ⚙ toggle and the menu's Settings… entry both reach the
+///     settings body.**
+///
+///     The toggle mirrors the Layers toggle for the right-hand panel; the
+///     menu entry lands on App › Settings specifically. Both asserted
+///     through the body-arm probe, and the panel itself must float inside
+///     the map like every other surface.
+#[test]
+fn the_inspector_toggle_and_the_settings_entry_reach_the_settings_body() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    let (toggle, open) = h.top_bar().inspector_toggle;
+    assert!(!open, "precondition: the inspector starts closed");
+
+    h.mouse_click(toggle.center());
+    h.warm_up();
+    let inspector = h.inspector();
+    assert!(inspector.open, "the \u{2699} toggle did not open the inspector");
+    assert_eq!(
+        inspector.mode,
+        Some(crate::ui::InspectorSelection::AppSettings),
+        "a fresh session's inspector must open on App \u{203a} Settings"
+    );
+    assert_eq!(inspector.crumb, "App \u{203a} Settings");
+    assert!(
+        h.top_bar().inspector_toggle.1,
+        "the toggle must read as open while the panel shows"
+    );
+    let panel = h
+        .inspector_rect()
+        .expect("the open inspector has a rect");
+    assert!(
+        h.map_panel_rect().contains_rect(panel),
+        "the inspector at {panel:?} is not inside the map \
+             {:?} — it must float over the map like every other surface",
+        h.map_panel_rect()
+    );
+
+    h.mouse_click(h.top_bar().inspector_toggle.0.center());
+    h.warm_up();
+    assert!(
+        !h.inspector().open,
+        "a second \u{2699} click did not close the inspector"
+    );
+
+    // The menu route: Settings… opens the same body.
+    h.open_settings();
+    assert_eq!(
+        h.inspector().mode,
+        Some(crate::ui::InspectorSelection::AppSettings),
+        "the menu's Settings\u{2026} entry did not land on the settings body"
+    );
+    assert!(
+        h.settings_row("units.timezone").is_some(),
+        "the settings body drew no rows"
+    );
+}
+
+/// 91. **The double-render counter really counts.**
+///
+///     The harness holds `control_render_passes` to at most one after every
+///     frame, which is vacuous if nothing increments it — this is the
+///     canary: a frame with a layer body on screen counts exactly one pass,
+///     and a frame without one counts none.
+#[test]
+fn the_control_pass_counter_counts_the_layer_body() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    assert_eq!(
+        h.gui_mut().control_render_passes_for_test(),
+        0,
+        "no layer body is open, so no pass should have run"
+    );
+
+    h.open_layer_in_inspector(OverlayKind::NwsAlerts);
+    assert_eq!(
+        h.gui_mut().control_render_passes_for_test(),
+        1,
+        "the open layer body must count exactly one pass per frame"
+    );
+
+    h.close_inspector();
+    assert_eq!(
+        h.gui_mut().control_render_passes_for_test(),
+        0,
+        "the closed inspector still ran a control pass"
+    );
+}
+
+/// 92. **The auto-poll chip's off state reads `⏸ Auto-poll off`, and its
+///     hover names the way back.** (Plan §5.9's carried pin.)
+///
+///     The chip replaced the checkbox at the full-bleed flip, so the off
+///     position — which the checkbox used to show by itself — has to stay
+///     readable off the chip, and the hover has to say where the toggle
+///     went, or the user who turned polling off has nothing to find it by.
+#[test]
+fn the_auto_poll_chip_pins_its_off_text_and_hover() {
+    let mut h = InputHarness::new();
+    h.open_menu();
+    h.mouse_click(clickable_leaf(&h, "Auto-poll").center());
+    h.close_menu();
+    h.warm_up();
+
+    let (chip, text) = h
+        .status_bar()
+        .poll_chip
+        .expect("the chip must be drawn while nothing is fetching");
+    assert_eq!(
+        text, "\u{23f8} Auto-poll off",
+        "the chip's off state must say so"
+    );
+
+    // The hover: where the toggle went.
+    h.mouse_move(chip.center());
+    h.frames_for(12, 0.1);
+    assert!(
+        h.painted_text_strings()
+            .iter()
+            .any(|t| t.contains("Toggle auto-poll from the \u{2630} menu")),
+        "hovering the off chip must say where the toggle lives; painted: {:?}",
+        h.painted_text_strings()
+    );
+}
+
+/// 93. **A shrunk window does not cap the stack forever.** (Plan §5.9's
+///     carried finding.)
+///
+///     `Area::default_size` applies only while the stored `AreaState` size
+///     is `None`, so after frame 1 the committed size becomes the sizing
+///     ceiling — and a `ScrollArea` fills what it is offered, so the old
+///     panel came back from a shrink stuck at its smallest-ever height.
+///     The stack sizes its body from the map every frame instead; this
+///     drives the shrink-then-grow and requires the height back.
+#[test]
+fn the_stack_regains_its_height_after_a_shrink_and_regrow() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    let before = h.stack().rect.height();
+    assert!(
+        before > 300.0,
+        "precondition: the full-height stack must be tall, got {before}"
+    );
+
+    // Shrink far enough that the body's per-frame ceiling clamps it…
+    h.set_screen(egui::vec2(1400.0, 300.0));
+    let shrunk = h.stack().rect.height();
+    assert!(
+        shrunk < before / 2.0,
+        "precondition: the shrink must really clamp the stack, got {shrunk}"
+    );
+
+    // …and back. The old panel stayed at `shrunk` forever.
+    h.set_screen(egui::vec2(1400.0, 900.0));
+    let regrown = h.stack().rect.height();
+    assert!(
+        (regrown - before).abs() < 1.0,
+        "the stack came back {regrown} tall after shrinking to {shrunk}; \
+             it was {before} — the committed area size has become the ceiling \
+             again"
     );
 }
 
@@ -3797,6 +4361,8 @@ fn a_product_whose_tilts_have_not_arrived_keeps_its_tilt_picker() {
 
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.load_scan("KTLX");
+    // The pickers live in the inspector's Pane-properties body now.
+    h.open_pane_props();
     {
         let pane = h.gui_mut().pane_mut(0).unwrap();
         pane.set_overlay_enabled(OverlayKind::Radar, true);
@@ -4480,11 +5046,11 @@ fn a_dialog_over_a_site_icon_suppresses_its_hover_readout() {
         h.painted_text_strings()
     );
 
-    h.gui_mut().show_settings = true;
+    h.gui_mut().set_time_dialog_open_for_test(true);
     h.warm_up();
     assert!(
         h.is_floating_layer_at(target),
-        "precondition: the settings dialog must cover the icon"
+        "precondition: the time dialog must cover the icon"
     );
 
     h.mouse_move(target);
@@ -4513,93 +5079,99 @@ fn a_dialog_over_a_site_icon_suppresses_its_hover_readout() {
 ///     rect, so a probe reporting a value the widget never received fails.
 #[test]
 fn a_dropdown_shows_its_option_label_not_the_raw_value() {
-    let mut h = compact_with_layers_drawer();
-    for kind in [OverlayKind::ModelData, OverlayKind::Lightning] {
-        h.set_overlay_on_pane(0, kind, true);
-    }
-
-    // Every dropdown on screen, whichever handler produced it.
-    let drawn = h.dropdowns();
-    assert!(
-        drawn.len() >= 2,
-        "precondition: Model Data and GLM must both be offering a dropdown, \
-             got {drawn:?}"
-    );
-
-    for dropdown in &drawn {
-        let (options, selected) = h
-            .dropdown_model(&dropdown.label)
-            .unwrap_or_else(|| panic!("no handler offers a {:?} dropdown", dropdown.label));
-        let expected = options
-            .iter()
-            .find(|(value, _)| *value == selected)
-            .map(|(_, display)| display.clone())
-            .unwrap_or_else(|| {
-                panic!(
-                    "the {:?} dropdown's selected value {selected:?} is not \
-                         among the options it offers: {options:?}",
-                    dropdown.label
-                )
-            });
-        assert_eq!(
-            dropdown.selected_text, expected,
-            "the {:?} dropdown's collapsed box disagrees with the label its \
-                 own list puts against {selected:?}",
-            dropdown.label
-        );
-        assert!(
-            h.text_painted_in(dropdown.rect, &dropdown.selected_text),
-            "the {:?} dropdown reported {:?} but egui painted no such text \
-                 inside {:?}",
-            dropdown.label,
-            dropdown.selected_text,
-            dropdown.rect
-        );
-    }
-
-    // …and the list the box opens is the other half of the claim. Assert on
-    // the labels it *paints*, so that "both halves use one formatter" is
-    // checked against two rendered results rather than one rendered result
-    // and one reading of the model.
-    for dropdown in &drawn {
+    // Per handler, through the inspector's layer body — the one place a
+    // handler's dropdowns render since the stack/inspector split.
+    for host in [OverlayKind::ModelData, OverlayKind::Lightning] {
         let mut h = compact_with_layers_drawer();
-        for kind in [OverlayKind::ModelData, OverlayKind::Lightning] {
-            h.set_overlay_on_pane(0, kind, true);
-        }
-        let (options, _) = h.dropdown_model(&dropdown.label).expect("still offered");
+        h.set_overlay_on_pane(0, host, true);
+        h.open_layer_in_inspector(host);
+
+        // Every dropdown on screen — the layer body's, by construction.
+        let drawn = h.dropdowns();
         assert!(
-            h.screen_rect().contains(dropdown.rect.center()),
-            "the {:?} dropdown was laid out at {:?}, off the {:?} viewport, \
-                 so the click below would open nothing",
-            dropdown.label,
-            dropdown.rect,
-            h.screen_rect()
+            !drawn.is_empty(),
+            "precondition: {host:?} must be offering a dropdown, got none"
         );
 
-        h.mouse_click(dropdown.rect.center());
-        h.warm_up();
-
-        let painted = h.painted_text_strings();
-        // The list scrolls, so only the options that fit are laid out —
-        // hence "the ones on screen are labels", not "all of them are".
-        let labels_shown = options
-            .iter()
-            .filter(|(_, display)| painted.contains(display))
-            .count();
-        assert!(
-            labels_shown >= 2,
-            "the {:?} list opened but painted fewer than two of its own \
-                 option labels, so the check below has nothing to bite on; it \
-                 painted {painted:?}",
-            dropdown.label
-        );
-        for (value, display) in &options {
-            assert!(
-                value == display || !painted.contains(value),
-                "the open {:?} list painted the raw option id {value:?} \
-                     where its label is {display:?}",
+        for dropdown in &drawn {
+            let (options, selected) = h
+                .dropdown_model(&dropdown.label)
+                .unwrap_or_else(|| panic!("no handler offers a {:?} dropdown", dropdown.label));
+            let expected = options
+                .iter()
+                .find(|(value, _)| *value == selected)
+                .map(|(_, display)| display.clone())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the {:?} dropdown's selected value {selected:?} is not \
+                             among the options it offers: {options:?}",
+                        dropdown.label
+                    )
+                });
+            assert_eq!(
+                dropdown.selected_text, expected,
+                "the {:?} dropdown's collapsed box disagrees with the label its \
+                     own list puts against {selected:?}",
                 dropdown.label
             );
+            assert!(
+                h.text_painted_in(dropdown.rect, &dropdown.selected_text),
+                "the {:?} dropdown reported {:?} but egui painted no such text \
+                     inside {:?}",
+                dropdown.label,
+                dropdown.selected_text,
+                dropdown.rect
+            );
+        }
+
+        // …and the list the box opens is the other half of the claim. Assert
+        // on the labels it *paints*, so that "both halves use one formatter"
+        // is checked against two rendered results rather than one rendered
+        // result and one reading of the model.
+        for dropdown in &drawn {
+            let mut h = compact_with_layers_drawer();
+            h.set_overlay_on_pane(0, host, true);
+            h.open_layer_in_inspector(host);
+            let (options, _) = h.dropdown_model(&dropdown.label).expect("still offered");
+            let dropdown = h
+                .dropdowns()
+                .into_iter()
+                .find(|d| d.label == dropdown.label)
+                .expect("the fresh harness draws the same dropdown");
+            assert!(
+                h.screen_rect().contains(dropdown.rect.center()),
+                "the {:?} dropdown was laid out at {:?}, off the {:?} viewport, \
+                     so the click below would open nothing",
+                dropdown.label,
+                dropdown.rect,
+                h.screen_rect()
+            );
+
+            h.mouse_click(dropdown.rect.center());
+            h.warm_up();
+
+            let painted = h.painted_text_strings();
+            // The list scrolls, so only the options that fit are laid out —
+            // hence "the ones on screen are labels", not "all of them are".
+            let labels_shown = options
+                .iter()
+                .filter(|(_, display)| painted.contains(display))
+                .count();
+            assert!(
+                labels_shown >= 2,
+                "the {:?} list opened but painted fewer than two of its own \
+                     option labels, so the check below has nothing to bite on; it \
+                     painted {painted:?}",
+                dropdown.label
+            );
+            for (value, display) in &options {
+                assert!(
+                    value == display || !painted.contains(value),
+                    "the open {:?} list painted the raw option id {value:?} \
+                         where its label is {display:?}",
+                    dropdown.label
+                );
+            }
         }
     }
 }
@@ -5311,24 +5883,24 @@ fn converting_the_active_pane_from_the_dropdown_makes_it_a_volume_pane() {
 ///       the panel's: every entry in it is a layer drawn over map tiles
 ///       against a projector this pane does not have.
 ///
-///     The tree is also what makes this the test that notices the panel's
-///     kind branch reading `self.panes[active]` instead of the pane it was
-///     handed. That slot holds a `mem::take` placeholder for the whole of
-///     the panel's pass and therefore reads as a *map* — so a branch on it
-///     takes the map arm for a converted pane, and the visible difference
-///     is the tree being drawn. The tilt picker would *not* reveal it: that
+///     The rows are also what makes this the test that notices the stack
+///     reading `self.panes[active]` instead of the pane it was handed. That
+///     slot holds a `mem::take` placeholder for the whole of the shell's
+///     pass and therefore reads as a *map* — so a body drawn from it would
+///     keep the rows for a converted pane, and the visible difference is
+///     the rows being drawn. The tilt picker would *not* reveal it: that
 ///     is decided inside `render_radar_controls` from the pane passed down.
 ///     (The timeline cannot have this bug: it runs outside every take
 ///     window, which is why it may read the slot directly.)
 ///
-///     The combos are read off the ids the panel actually resolved rather than
+///     The combos are read off the ids the body actually resolved rather than
 ///     off the model, for the same reason `time_step_sel` is: a test rebuilding
-///     the expected id from the same format string could agree with a panel
+///     the expected id from the same format string could agree with a body
 ///     that drew neither control.
 #[test]
 fn a_non_map_pane_keeps_the_controls_that_apply_to_it_and_drops_the_rest() {
-    /// Which of the layers panel's radar combos the last frame resolved an id
-    /// for — the panel's own report, not a reconstruction of it.
+    /// Which of the radar combos the last frame resolved an id for — the
+    /// inspector's own report, not a reconstruction of it.
     fn combos(h: &InputHarness) -> Vec<&'static str> {
         h.widget_id_probes()
             .into_iter()
@@ -5336,14 +5908,12 @@ fn a_non_map_pane_keeps_the_controls_that_apply_to_it_and_drops_the_rest() {
             .filter(|name| *name == "product_sel" || *name == "elev_sel")
             .collect()
     }
-    fn painted(h: &InputHarness, needle: &str) -> bool {
-        h.painted_text_strings().iter().any(|t| t.contains(needle))
-    }
 
     for kind in [PaneKind::CrossSection, PaneKind::Volume] {
         let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
         h.load_scan("KTLX");
         h.offer_product(0, rustdar_radar::types::RadarProduct::Reflectivity, 0.5);
+        h.open_pane_props();
         assert_eq!(
             combos(&h),
             vec!["product_sel", "elev_sel"],
@@ -5360,13 +5930,11 @@ fn a_non_map_pane_keeps_the_controls_that_apply_to_it_and_drops_the_rest() {
                 .any(|a| matches!(a, crate::actions::GuiAction::EnableLoop { .. })),
             "precondition: a map pane's loop toggle must enable the loop"
         );
-        // An entry from the middle of the overlay tree, so the check is not
-        // satisfied by the first one alone. `dropdowns()` is deliberately not
-        // used: in the default state no handler offers one, so it is empty for
-        // a map pane too and would pass for the wrong reason.
+        // A row from the middle of the stack, so the check is not satisfied
+        // by the first one alone.
         assert!(
-            painted(&h, "NWS Alerts"),
-            "precondition: a map pane draws the overlay tree"
+            h.stack_row(OverlayKind::NwsAlerts).is_some(),
+            "precondition: a map pane's stack draws the layer rows"
         );
 
         match kind {
@@ -5409,10 +5977,10 @@ fn a_non_map_pane_keeps_the_controls_that_apply_to_it_and_drops_the_rest() {
              renders loop frames for, so enabling it would wait for ever"
         );
         assert!(
-            !painted(&h, "NWS Alerts"),
-            "{kind:?}: the overlay tree was drawn for a pane with no map to \
-             draw overlays on: {:?}",
-            h.painted_text_strings()
+            h.stack().rows.is_empty(),
+            "{kind:?}: layer rows were drawn for a pane with no map to draw \
+             overlays on: {:?}",
+            h.stack().rows
         );
     }
 }
@@ -5478,6 +6046,8 @@ fn a_pane_with_no_map_stops_the_label_tiles_downloading() {
 fn a_non_map_panes_product_picker_ignores_the_radar_layer_toggle() {
     let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
     h.load_scan("KTLX");
+    // The picker lives in the inspector's Pane-properties body now.
+    h.open_pane_props();
     h.set_overlay_on_pane(0, OverlayKind::Radar, false);
     h.frames_for(2, FRAME_DT);
 
@@ -5502,29 +6072,34 @@ fn a_non_map_panes_product_picker_ignores_the_radar_layer_toggle() {
     );
 }
 
-/// The layers panel's screen rect — the floating area's own rect, from
-/// egui's area state rather than a reconstruction of the panel's position
-/// constants, so it keeps meaning "the sidebar" if the insets ever change.
-/// (Before the full-bleed flip this was "everything left of the map
-/// panel"; the map now runs edge to edge underneath the panel.)
+/// The stack's screen rect — the floating area's own rect, from egui's area
+/// state rather than a reconstruction of the panel's position constants, so
+/// it keeps meaning "the layer stack" if the insets ever change.
 fn sidebar_rect(h: &InputHarness) -> egui::Rect {
     h.layers_panel_rect()
-        .expect("the layers panel must be on screen")
+        .expect("the layer stack must be on screen")
 }
 
-/// 49. **Every pane kind's sidebar opens with the same identity line.**
+/// The inspector's screen rect, on the same terms as [`sidebar_rect`].
+fn inspector_rect(h: &InputHarness) -> egui::Rect {
+    h.inspector_rect().expect("the inspector must be on screen")
+}
+
+/// 49. **Every pane kind's Pane-properties body opens with the same identity
+///     line.**
 ///
-///     Site code, then kind. A map pane's panel is full of content that
-///     describes itself; a converted pane's panel loses most of that bulk,
+///     Site code, then kind. A map pane's properties body is full of content
+///     that describes itself; a converted pane's loses most of that bulk,
 ///     and without one shared line saying what the pane *is*, the shorter
-///     panel reads as a different thing altogether rather than as the same
-///     panel showing a pane with fewer controls — which is the presentation
-///     bug this whole contract exists to fix. The assertion is on the full
-///     rendered string, so three per-kind headers that drifted apart in
-///     format could not keep it green.
+///     body reads as a different thing altogether rather than as the same
+///     body showing a pane with fewer controls — the presentation bug this
+///     whole contract exists to fix, carried from the old sidebar into the
+///     inspector. The assertion is on the full rendered string, so three
+///     per-kind headers that drifted apart in format could not keep it
+///     green.
 ///
 ///     The fixture site is KDMX, deliberately **not** the default KTLX:
-///     for the whole panel pass the active slot in `self.panes` holds a
+///     for the whole shell pass the active slot in `self.panes` holds a
 ///     `mem::take` placeholder whose site *is* the default, so on a
 ///     default-site fixture an identity line that read its site through
 ///     the placeholder would paint the right string for the wrong reason.
@@ -5532,30 +6107,32 @@ fn sidebar_rect(h: &InputHarness) -> egui::Rect {
 fn every_pane_kinds_sidebar_opens_with_the_same_identity_line() {
     let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
     h.load_scan("KDMX");
-    let sidebar = sidebar_rect(&h);
+    h.open_pane_props();
+    let inspector = inspector_rect(&h);
 
     assert!(
-        h.text_painted_in(sidebar, "KDMX \u{b7} Map"),
-        "a map pane's sidebar must open with its identity line; painted: {:?}",
-        h.painted_text_strings_in(sidebar)
+        h.text_painted_in(inspector, "KDMX \u{b7} Map"),
+        "a map pane's properties body must open with its identity line; \
+             painted: {:?}",
+        h.painted_text_strings_in(inspector)
     );
 
     h.make_pane_volume(0);
     h.frames_for(2, FRAME_DT);
     assert!(
-        h.text_painted_in(sidebar, "KDMX \u{b7} 3D volume"),
-        "a 3D pane's sidebar must open with the same identity line, with \
-             its kind in it; painted: {:?}",
-        h.painted_text_strings_in(sidebar)
+        h.text_painted_in(inspector, "KDMX \u{b7} 3D volume"),
+        "a 3D pane's properties body must open with the same identity line, \
+             with its kind in it; painted: {:?}",
+        h.painted_text_strings_in(inspector)
     );
 
     h.make_pane_unaimed_cross_section(0);
     h.frames_for(2, FRAME_DT);
     assert!(
-        h.text_painted_in(sidebar, "KDMX \u{b7} Cross-section"),
-        "a section pane's sidebar must open with the same identity line, \
-             with its kind in it; painted: {:?}",
-        h.painted_text_strings_in(sidebar)
+        h.text_painted_in(inspector, "KDMX \u{b7} Cross-section"),
+        "a section pane's properties body must open with the same identity \
+             line, with its kind in it; painted: {:?}",
+        h.painted_text_strings_in(inspector)
     );
 }
 
@@ -5596,20 +6173,20 @@ fn the_missing_layer_list_is_explained_for_both_non_map_kinds() {
     }
 }
 
-/// 51. **A converted pane's own controls sit inside the sidebar's shared
-///     structure, in its order.**
+/// 51. **A converted pane's own controls sit inside the Pane-properties
+///     body's shared structure, in its order.**
 ///
 ///     The contract, top to bottom, for either non-map kind: identity
-///     line, product picker, the kind's own block under its own header,
-///     then the explained absence of the layer list. (Time navigation
-///     left the panel for the floating timeline at the full-bleed flip,
-///     so it is no longer an anchor here.) The
-///     assertion is on the *positions* the panel painted, not merely on
+///     line, product picker, then the kind's own block under its own
+///     header. (The explained absence of the layer list moved with the
+///     list itself — it is the stack's, pinned by test 50; time navigation
+///     left for the floating timeline at the full-bleed flip.) The
+///     assertion is on the *positions* the body painted, not merely on
 ///     the strings existing: a kind block rendered above the shared
-///     controls, or below the note, would paint every one of these strings
-///     and still read as a bolted-on foreign block.
+///     controls would paint every one of these strings and still read as
+///     a bolted-on foreign block.
 ///
-///     The headers are named through the constants the panel itself
+///     The headers are named through the constants the body itself
 ///     renders, so renaming a header moves the test with it, while
 ///     *removing* one — or demoting the section block back to nothing —
 ///     fails on a missing anchor.
@@ -5655,13 +6232,16 @@ fn kind_specific_blocks_sit_inside_the_shared_sidebar_structure() {
 
     let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
     h.load_scan("KDMX");
-    let sidebar = sidebar_rect(&h);
+    h.open_pane_props();
 
     h.make_pane_volume(0);
     h.frames_for(2, FRAME_DT);
+    // `inspector_rect` is re-read after every conversion: the panel
+    // shrink-wraps to its body, so the previous kind's rect can be shorter
+    // than the next kind's content.
     assert_descending_order(
         &h,
-        sidebar,
+        inspector_rect(&h),
         &[
             "KDMX \u{b7} 3D volume",
             "Reflectivity",
@@ -5670,7 +6250,6 @@ fn kind_specific_blocks_sit_inside_the_shared_sidebar_structure() {
             // anchors it (the order test wants one needle per row).
             "Mode:",
             "Reset view",
-            crate::ui::NON_MAP_LAYERS_NOTE,
         ],
     );
 
@@ -5690,7 +6269,7 @@ fn kind_specific_blocks_sit_inside_the_shared_sidebar_structure() {
     h.frames_for(2, FRAME_DT);
     assert_descending_order(
         &h,
-        sidebar,
+        inspector_rect(&h),
         &[
             crate::ui::VOLUME_SIDEBAR_HEADER,
             "Mode:",
@@ -5706,13 +6285,12 @@ fn kind_specific_blocks_sit_inside_the_shared_sidebar_structure() {
     h.frames_for(2, FRAME_DT);
     assert_descending_order(
         &h,
-        sidebar,
+        inspector_rect(&h),
         &[
             "KDMX \u{b7} Cross-section",
             "Reflectivity",
             crate::ui::SECTION_SIDEBAR_HEADER,
             "A \u{2013} B: 105 km",
-            crate::ui::NON_MAP_LAYERS_NOTE,
         ],
     );
 
@@ -5728,43 +6306,54 @@ fn kind_specific_blocks_sit_inside_the_shared_sidebar_structure() {
     h.frames_for(2, FRAME_DT);
     assert_descending_order(
         &h,
-        sidebar,
-        &[
-            crate::ui::SECTION_SIDEBAR_HEADER,
-            "No line drawn yet",
-            crate::ui::NON_MAP_LAYERS_NOTE,
-        ],
+        inspector_rect(&h),
+        &[crate::ui::SECTION_SIDEBAR_HEADER, "No line drawn yet"],
+    );
+
+    // The explained absence of the layer list is the *stack's* — beside
+    // this body, not inside it: the rows it explains are the stack's rows.
+    assert!(
+        h.text_painted_in(sidebar_rect(&h), crate::ui::NON_MAP_LAYERS_NOTE),
+        "the stack must carry the layer-list note for a converted pane"
     );
 }
 
-/// 52. **Converting the active pane keeps the sidebar's own widget ids.**
+/// 52. **Converting the active pane keeps the panels' own widget ids.**
 ///
 ///     Test 48 pins that converting a *non-active* pane moves nothing, but
-///     there the panel's content never changes. Converting the **active**
-///     pane rebuilds the panel's kind block, and the hazard is the panel's
-///     own: the shared controls key their stored state — combo state, the
-///     panel's scroll offset — on ids derived from the panel's scope, so a
-///     scope re-keyed by the conversion (salting it with the kind is the
-///     natural mistake) turns "the user made this pane 3D" into "egui
-///     forgot the panel's state". Compared per name, through the ids the
-///     panel actually resolved, for the reason test 14 gives: rebuilding
-///     the expected ids from the same format strings would prove nothing.
+///     there the panels' content never changes. Converting the **active**
+///     pane rebuilds the inspector's kind block and swaps the stack's rows
+///     for the note, and the hazard is the panels' own: the shared controls
+///     key their stored state — combo state, both scroll offsets — on ids
+///     derived from each panel's scope, so a scope re-keyed by the
+///     conversion (salting it with the kind is the natural mistake) turns
+///     "the user made this pane 3D" into "egui forgot the panel's state".
+///     Compared per name, through the ids the panels actually resolved, for
+///     the reason test 14 gives: rebuilding the expected ids from the same
+///     format strings would prove nothing.
 #[test]
 fn converting_the_active_pane_keeps_the_sidebars_widget_ids() {
     fn shared_ids(h: &InputHarness) -> Vec<(&'static str, egui::Id)> {
         h.widget_id_probes()
             .into_iter()
-            .filter(|(name, _)| matches!(*name, "product_sel" | "time_step_sel" | "layers_scroll"))
+            .filter(|(name, _)| {
+                matches!(
+                    *name,
+                    "product_sel" | "time_step_sel" | "layers_scroll" | "inspector_scroll"
+                )
+            })
             .collect()
     }
 
     let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
     h.load_scan("KTLX");
+    // The product combo lives in the inspector's Pane-properties body.
+    h.open_pane_props();
     let before = shared_ids(&h);
     assert_eq!(
         before.len(),
-        3,
-        "precondition: all three shared controls must report ids, got {before:?}"
+        4,
+        "precondition: all four shared controls must report ids, got {before:?}"
     );
 
     h.make_pane_volume(0);
@@ -5789,7 +6378,7 @@ fn converting_the_active_pane_keeps_the_sidebars_widget_ids() {
 // there is nothing below the kind block for a conversion to re-key — the
 // menu lives in the top bar's popup, above every take window. Tests 48 and
 // 52 hold what remains of the claim; the kind-scope's rationale is on
-// `render_layer_controls`.
+// `render_pane_props_body`.
 
 /// 48. **Converting a pane must not move any widget's egui `Id`.**
 ///
@@ -5809,7 +6398,7 @@ fn converting_the_active_pane_keeps_the_sidebars_widget_ids() {
 ///
 ///     The mechanism it is a net for: `Ui::new_child` folds the parent's
 ///     auto-id counter into every child's unique id — an `id_salt` moves only
-///     the *stable* id, as `ui_chrome.rs`'s note on the 600pt breakpoint
+///     the *stable* id, as `ui_shell.rs`'s module note on the breakpoint
 ///     records — so an arm that stopped building the shared child `Ui`, or
 ///     built an extra one, re-keys every pane the loop reaches **after** it
 ///     while leaving their rects exactly where they were.
@@ -5830,10 +6419,9 @@ fn converting_the_active_pane_keeps_the_sidebars_widget_ids() {
 ///     pane re-keys *itself* and needs no later pane to reveal it.
 #[test]
 fn converting_a_pane_moves_no_widget_id() {
-    // Short enough that the layers panel's content overflows and there is
-    // a real scroll offset to lose — with the pane picker moved to the top
-    // bar the panel fits a 900pt window without scrolling.
-    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 700.0));
+    // Short enough that the stack's rows overflow and there is a real
+    // scroll offset to lose — the row list fits anything much taller.
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 500.0));
     h.set_pane_count(3);
     h.load_scan("KTLX");
 
@@ -7591,7 +8179,7 @@ fn an_armed_section_drag_leaves_no_region_behind_and_the_converse() {
 #[test]
 fn settings_offers_no_way_to_ask_once_the_os_has_refused() {
     let mut h = InputHarness::new();
-    h.gui_mut().show_settings = true;
+    h.open_settings();
     h.gui_mut()
         .set_location_state(rustdar_gps::LocationPermission::Prompt, false);
     h.warm_up();
@@ -7635,7 +8223,7 @@ fn settings_offers_no_way_to_ask_once_the_os_has_refused() {
 #[test]
 fn the_location_control_follows_the_os_rather_than_a_remembered_toggle() {
     let mut h = InputHarness::new();
-    h.gui_mut().show_settings = true;
+    h.open_settings();
     h.gui_mut()
         .set_location_state(rustdar_gps::LocationPermission::Granted, true);
     h.warm_up();
@@ -7668,7 +8256,7 @@ fn the_location_control_follows_the_os_rather_than_a_remembered_toggle() {
 #[test]
 fn a_platform_without_location_is_told_so_and_offered_nothing() {
     let mut h = InputHarness::new();
-    h.gui_mut().show_settings = true;
+    h.open_settings();
     h.gui_mut()
         .set_location_state(rustdar_gps::LocationPermission::Unavailable, false);
     h.warm_up();
@@ -7701,7 +8289,7 @@ fn a_denial_offers_the_system_settings_page_only_where_there_is_one() {
     const BUTTON: &str = "Open location settings";
 
     let mut h = InputHarness::new();
-    h.gui_mut().show_settings = true;
+    h.open_settings();
     h.gui_mut()
         .set_location_state(rustdar_gps::LocationPermission::Denied, false);
     h.warm_up();
@@ -7756,7 +8344,7 @@ fn a_denial_offers_the_system_settings_page_only_where_there_is_one() {
 #[test]
 fn a_linux_refusal_names_the_setting_that_would_undo_it() {
     let mut h = InputHarness::new();
-    h.gui_mut().show_settings = true;
+    h.open_settings();
     h.gui_mut()
         .set_location_state(rustdar_gps::LocationPermission::Denied, false);
     h.warm_up();
@@ -7780,7 +8368,7 @@ fn a_linux_refusal_names_the_setting_that_would_undo_it() {
 #[test]
 fn a_granted_permission_with_no_fix_yet_says_so() {
     let mut h = InputHarness::new();
-    h.gui_mut().show_settings = true;
+    h.open_settings();
     h.gui_mut()
         .set_location_state(rustdar_gps::LocationPermission::Granted, true);
     h.warm_up();

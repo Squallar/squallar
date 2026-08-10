@@ -504,6 +504,84 @@ impl InputHarness {
         *self.gui.top_bar_for_test()
     }
 
+    /// What the last frame's layer stack drew.
+    pub(crate) fn stack(&self) -> crate::ui::StackProbe {
+        self.gui.stack_for_test().clone()
+    }
+
+    /// The stack row drawn for `kind`, if the last frame drew one.
+    pub(crate) fn stack_row(&self, kind: OverlayKind) -> Option<crate::ui::StackRowProbe> {
+        self.stack().rows.into_iter().find(|row| row.kind == kind)
+    }
+
+    /// What the last frame's inspector drew.
+    pub(crate) fn inspector(&self) -> crate::ui::InspectorProbe {
+        self.gui.inspector_for_test().clone()
+    }
+
+    /// The floating inspector's on-screen rect, from the area state egui
+    /// itself keeps — the same authority [`Self::layers_panel_rect`] answers
+    /// from — or `None` while it is closed.
+    pub(crate) fn inspector_rect(&self) -> Option<egui::Rect> {
+        self.inspector()
+            .open
+            .then(|| egui::AreaState::load(&self.ctx, egui::Id::new("inspector_panel")))
+            .flatten()
+            .map(|state| state.rect())
+    }
+
+    /// Close the inspector the user's way — its own ⟩ collapse button, so the
+    /// selection survives for the next open. A no-op when it is closed.
+    pub(crate) fn close_inspector(&mut self) {
+        let probe = self.inspector();
+        if !probe.open {
+            return;
+        }
+        self.mouse_click(probe.collapse.center());
+        self.warm_up();
+        assert!(
+            !self.inspector().open,
+            "clicking \u{27e9} did not close the inspector"
+        );
+    }
+
+    /// Select `kind`'s options in the inspector the user's way: open the
+    /// stack, scroll its row on screen, click it. Asserts the inspector's
+    /// body arm for exactly that layer drew.
+    pub(crate) fn open_layer_in_inspector(&mut self, kind: OverlayKind) {
+        // On the width where the right slide-over lands on the drawer, an
+        // inspector left open from a previous selection covers the rows.
+        self.close_inspector();
+        self.open_layers();
+        let scroll_pos = egui::pos2(120.0, self.screen_rect().center().y);
+        let found = self.scroll_until(scroll_pos, egui::vec2(0.0, -120.0), 60, |h| {
+            h.stack_row(kind)
+                .is_some_and(|row| h.screen_rect().contains(row.rect.center()))
+        });
+        assert!(found, "the stack never drew a row for {kind:?} on screen");
+        let row = self.stack_row(kind).expect("the row was just found");
+        self.mouse_click(row.rect.center());
+        self.warm_up();
+        assert_eq!(
+            self.inspector().mode,
+            Some(crate::ui::InspectorSelection::Layer(kind)),
+            "clicking {kind:?}'s row did not put its layer body on screen"
+        );
+    }
+
+    /// Select the active pane's properties the user's way: the stack header.
+    pub(crate) fn open_pane_props(&mut self) {
+        self.open_layers();
+        let header = self.stack().header;
+        self.mouse_click(header.center());
+        self.warm_up();
+        assert_eq!(
+            self.inspector().mode,
+            Some(crate::ui::InspectorSelection::PaneProps),
+            "clicking the stack header did not open Pane properties"
+        );
+    }
+
     /// What the last frame's timeline transport drew.
     pub(crate) fn timeline(&self) -> crate::ui::TimelineProbe {
         self.gui.timeline_for_test().clone()
@@ -585,8 +663,8 @@ impl InputHarness {
             .any(|(name, _)| *name == "layers_scroll")
     }
 
-    /// Open the settings window the way a user does: through the ☰ dropdown's
-    /// "Settings..." entry.
+    /// Open the settings the way a user does: through the ☰ dropdown's
+    /// "Settings..." entry, which opens the inspector on App › Settings.
     pub(crate) fn open_settings(&mut self) {
         self.open_menu();
         let leaf = self
@@ -601,8 +679,8 @@ impl InputHarness {
         self.mouse_click(leaf.rect.center());
         self.warm_up();
         assert!(
-            self.gui.show_settings,
-            "clicking Settings... did not open the settings window"
+            self.gui.settings_visible(),
+            "clicking Settings... did not open the inspector's settings body"
         );
     }
 
@@ -1654,6 +1732,18 @@ impl InputHarness {
         // The real UI, panels, dialogs and map panes included. `render_panes`
         // resolves each pane's pointer state on the way through and records it.
         self.last_actions = self.gui.ui(&ctx);
+
+        // The double-render guard, enforced on every frame any test runs:
+        // each handler-control pass ends by saving the handlers' state over
+        // the active pane's configs, so a second pass in one frame would save
+        // over the first's writes. See `Gui::control_render_passes`.
+        assert!(
+            self.gui.control_render_passes_for_test() <= 1,
+            "handler ControlItems rendered {} times in one frame; each pass \
+             is a load→mutate→save round trip over the active pane's overlay \
+             configs, and two of them fight",
+            self.gui.control_render_passes_for_test()
+        );
 
         // `mouse` and `touch` drive each pipeline directly, bypassing the gate,
         // so a test can say what a given pipeline *would* have done. They are

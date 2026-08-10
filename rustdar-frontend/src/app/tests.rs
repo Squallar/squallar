@@ -265,22 +265,22 @@ fn minimising_bridge() -> TestBridge {
 /// handler is always installed, so it always said yes — the UI was never
 /// consulted and one press with the drawer open went straight to minimise.
 ///
-/// Opens the settings window rather than the drawer only because
-/// `show_settings` is the dismissible state this crate can reach.
-/// `dismiss_top_layer`'s own coverage of the drawer, and of the one-layer-
-/// per-press rule, is in `rustdar-egui`'s `ui_menu` tests.
+/// Opens the settings (the inspector's App › Settings body) rather than the
+/// drawer only because `open_settings` is the dismissible state this crate
+/// can reach. `dismiss_top_layer`'s own coverage of the drawer, and of the
+/// one-layer-per-press rule, is in `rustdar-egui`'s `ui_menu` tests.
 #[test]
 fn back_closes_what_is_open_before_it_minimises() {
     let mut gui = Gui::new();
     let platform = minimising_bridge();
-    gui.show_settings = true;
+    gui.open_settings();
 
     assert_eq!(
         App::resolve_back_press(&mut gui, &platform),
         BackPress::Dismissed,
         "the first press left the app with a window still open"
     );
-    assert!(!gui.show_settings, "the window is still open");
+    assert!(!gui.settings_visible(), "the settings body is still open");
 
     assert_eq!(
         App::resolve_back_press(&mut gui, &platform),
@@ -628,7 +628,7 @@ fn no_bridge_invents_a_back_press() {
 fn escape_with_nothing_open_still_exits() {
     let mut gui = Gui::new();
     let platform = TestBridge::desktop();
-    gui.show_settings = true;
+    gui.open_settings();
 
     assert_eq!(
         App::resolve_back_press(&mut gui, &platform),

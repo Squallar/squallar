@@ -142,6 +142,59 @@ impl OverlayHandler for NwsAlertHandler {
         !self.enabled_categories.is_empty()
     }
 
+    /// The master toggle over a layer whose "enabled" is really a category
+    /// set. Off clears the set; on restores the default three **only when the
+    /// set is empty**, so flipping the master off and on loses the user's
+    /// subset — accepted, because remembering it would be a shadow copy of
+    /// `enabled_categories` that persistence and the category toggles would
+    /// both have to keep honest.
+    fn set_enabled(&mut self, enabled: bool) {
+        let was = self.is_enabled();
+        if enabled {
+            if self.enabled_categories.is_empty() {
+                self.enabled_categories.insert(AlertCategory::Warning);
+                self.enabled_categories.insert(AlertCategory::Watch);
+                self.enabled_categories.insert(AlertCategory::Advisory);
+            }
+        } else {
+            self.enabled_categories.clear();
+        }
+        // The drawn set changed, so cached textures must know — the same bump
+        // the per-category toggles make in `apply_control`.
+        if was != self.is_enabled() {
+            self.state.data_generation = self.state.data_generation.wrapping_add(1);
+        }
+    }
+
+    /// E.g. `"3 shown · W/Wa/Adv"`: how many alerts would draw, and which
+    /// categories are letting them. Counted directly rather than through
+    /// `clickable_items`, which clones every feature polygon per call.
+    fn status_line(&self) -> Option<String> {
+        if !self.is_enabled() {
+            return None;
+        }
+        let shown = self
+            .state
+            .data
+            .iter()
+            .filter(|item| {
+                self.enabled_categories.contains(&item.alert.category)
+                    && !self.hidden_alerts.contains(&item.alert.id)
+            })
+            .count();
+        let mut cats = Vec::new();
+        for (category, short) in [
+            (AlertCategory::Warning, "W"),
+            (AlertCategory::Watch, "Wa"),
+            (AlertCategory::Advisory, "Adv"),
+        ] {
+            if self.enabled_categories.contains(&category) {
+                cats.push(short);
+            }
+        }
+        Some(format!("{shown} shown \u{b7} {}", cats.join("/")))
+    }
+
     fn data_generation(&self) -> u64 {
         self.state.data_generation
     }
@@ -523,6 +576,68 @@ mod tests {
             handler.content_signature(),
             b_only,
             "disabling the category must move it",
+        );
+    }
+
+    /// The status line counts what would *draw* — category-filtered and
+    /// hide-filtered — and names the categories letting it, so the row under
+    /// "NWS Alerts" reads as the map's own state rather than the feed's.
+    #[test]
+    fn the_status_line_counts_the_drawn_set_and_names_the_categories() {
+        let mut handler = handler_with(vec![
+            alert("a", "Tornado Warning"),
+            alert("b", "Severe Thunderstorm Warning"),
+        ]);
+        assert_eq!(
+            handler.status_line().as_deref(),
+            Some("2 shown \u{b7} W/Wa/Adv")
+        );
+
+        handler.hidden_alerts.insert("b".to_string());
+        assert_eq!(
+            handler.status_line().as_deref(),
+            Some("1 shown \u{b7} W/Wa/Adv"),
+            "a hidden alert is not shown, so it must not be counted as shown"
+        );
+
+        handler.enabled_categories.remove(&AlertCategory::Advisory);
+        handler.enabled_categories.remove(&AlertCategory::Watch);
+        assert_eq!(handler.status_line().as_deref(), Some("1 shown \u{b7} W"));
+
+        handler.enabled_categories.clear();
+        assert_eq!(
+            handler.status_line(),
+            None,
+            "a disabled layer's dimmed row carries no status line"
+        );
+    }
+
+    /// The master toggle round-trips through the category set: off clears it,
+    /// on restores the defaults — and on over a *partial* set leaves the
+    /// user's subset alone, because the layer is already on.
+    #[test]
+    fn the_master_toggle_clears_and_restores_the_category_set() {
+        let mut handler = NwsAlertHandler::new();
+        assert!(handler.is_enabled(), "precondition: defaults on");
+
+        handler.set_enabled(false);
+        assert!(!handler.is_enabled());
+        assert!(handler.enabled_categories.is_empty());
+
+        handler.set_enabled(true);
+        assert!(handler.is_enabled());
+        assert_eq!(
+            handler.enabled_categories.len(),
+            3,
+            "on from nothing restores all three categories"
+        );
+
+        handler.enabled_categories.remove(&AlertCategory::Advisory);
+        handler.set_enabled(true);
+        assert_eq!(
+            handler.enabled_categories.len(),
+            2,
+            "on over a live subset must not widen the user's selection"
         );
     }
 

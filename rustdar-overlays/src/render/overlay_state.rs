@@ -167,6 +167,20 @@ pub trait OverlayHandler: Send {
     /// Meaningful only for simple toggle handlers.
     fn set_enabled(&mut self, _enabled: bool) {}
 
+    /// One line of live status for the layer stack's row — `"3 shown · W/Wa"`,
+    /// `"Day 1 · Categorical"` — or `None` for a handler with nothing worth
+    /// saying, which renders as a row with no line under it rather than as a
+    /// placeholder.
+    ///
+    /// Read-only and cheap: derived from state the handler already holds,
+    /// called every frame the stack is on screen, never a reason to fetch or
+    /// to clone data. A disabled handler returns `None` — its row is already
+    /// dimmed, and a status line describing what a hidden layer would show
+    /// reads as the layer being on.
+    fn status_line(&self) -> Option<String> {
+        None
+    }
+
     // ── Fetching ──────────────────────────────────────────────────────
 
     fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask> {
@@ -451,6 +465,12 @@ impl OverlayRegistry {
         if let Some(h) = self.handler_mut(kind) {
             h.set_enabled(enabled);
         }
+    }
+
+    /// [`OverlayHandler::status_line`] for `kind`; `None` for a kind with no
+    /// handler.
+    pub fn status_line(&self, kind: OverlayKind) -> Option<String> {
+        self.handler(kind).and_then(|h| h.status_line())
     }
 
     pub fn clickable_items(&self, kind: OverlayKind) -> Vec<ClickableItem> {
