@@ -114,8 +114,43 @@ impl OverlayHandler for SpcDiscussionHandler {
         self.enabled
     }
 
+    // A simple toggle handler, like `sites` and `labels`: without this
+    // override, `set_active_pane_overlay`'s `set_enabled` is a silent no-op
+    // for MDs and the saved config keeps the old value.
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
     fn data_generation(&self) -> u64 {
         self.state.data_generation
+    }
+
+    /// What this handler would draw, not what it fetched: an order-free fold
+    /// over the numbers of the MDs that would paint — those with a polygon,
+    /// the same filter [`clickable_items`] applies — and `0` while the
+    /// toggle is off. SPC discussions poll every two minutes and mostly
+    /// return the same set, and a floor recomposed on every poll is a floor
+    /// recomposed for nothing; the signature moves exactly when an MD
+    /// issues, expires, or the checkbox flips.
+    ///
+    /// [`clickable_items`]: SpcDiscussionHandler::clickable_items
+    fn content_signature(&self) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        if !self.enabled {
+            return 0;
+        }
+        let mut folded = 0u64;
+        let mut visible = 0u64;
+        for item in &self.state.data {
+            if item.md.polygon.is_empty() {
+                continue;
+            }
+            let mut hasher = DefaultHasher::new();
+            item.md.number.hash(&mut hasher);
+            folded ^= hasher.finish();
+            visible += 1;
+        }
+        folded ^ visible.rotate_left(32)
     }
 
     fn has_data(&self) -> bool {
@@ -314,5 +349,111 @@ impl OverlayHandler for SpcDiscussionHandler {
         if let Some(enabled) = value.get("enabled").and_then(|v| v.as_bool()) {
             self.enabled = enabled;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spc::colors::{md_fill_color, md_stroke_color};
+    use crate::spc::discussion::MdType;
+    use crate::types::HatchPattern;
+
+    /// A minimal convective MD with a polygon, identified by `number`.
+    fn md(number: u32) -> SpcDiscussion {
+        let md_type = MdType::Convective;
+        let polygon = vec![vec![(35.0, -97.0), (35.5, -97.0), (35.5, -96.5)]];
+        let feature = crate::types::OverlayFeature::new(
+            vec![polygon.clone()],
+            md_fill_color(&md_type),
+            md_stroke_color(&md_type),
+            format!("MD {number}"),
+            String::new(),
+            HatchPattern::None,
+        );
+        SpcDiscussion {
+            number,
+            title: format!("Mesoscale Discussion #{number:04}"),
+            text: String::new(),
+            link: String::new(),
+            md_type,
+            polygon,
+            feature,
+            concerning: None,
+        }
+    }
+
+    fn handler_with(mds: Vec<SpcDiscussion>) -> SpcDiscussionHandler {
+        let mut handler = SpcDiscussionHandler::new();
+        handler.apply_fetch_result(Box::new(SpcDiscussionFetchResult(Ok(mds))));
+        handler
+    }
+
+    /// The signature names the **set**, not the fetch: MDs poll every two
+    /// minutes, and a refetch returning the same discussions must keep the
+    /// signature — which `data_generation`, bumped on every `set_data`,
+    /// cannot do. Swap the body for `self.data_generation()` and this test
+    /// fails on the second fetch.
+    #[test]
+    fn a_refetch_of_the_same_discussion_set_keeps_the_signature() {
+        let mut handler = handler_with(vec![md(101), md(102)]);
+        let first = handler.content_signature();
+        handler.apply_fetch_result(Box::new(SpcDiscussionFetchResult(Ok(vec![
+            md(101),
+            md(102),
+        ]))));
+        assert_ne!(
+            handler.data_generation(),
+            1,
+            "the fixture must have refetched",
+        );
+        assert_eq!(
+            handler.content_signature(),
+            first,
+            "an unchanged MD set must keep its signature across a refetch",
+        );
+    }
+
+    /// Every change to what would draw moves the signature: an MD issuing,
+    /// one expiring, and the checkbox flipping off (the floor follows the
+    /// handler's global toggle, and `clickable_items` does not read it).
+    #[test]
+    fn every_change_to_the_drawn_set_moves_the_signature() {
+        let mut handler = handler_with(vec![md(101)]);
+        let one = handler.content_signature();
+
+        handler.apply_fetch_result(Box::new(SpcDiscussionFetchResult(Ok(vec![
+            md(101),
+            md(102),
+        ]))));
+        let two = handler.content_signature();
+        assert_ne!(one, two, "an MD issuing must move the signature");
+
+        handler.apply_fetch_result(Box::new(SpcDiscussionFetchResult(Ok(vec![md(102)]))));
+        assert_ne!(
+            handler.content_signature(),
+            two,
+            "an MD expiring must move the signature",
+        );
+
+        handler.set_enabled(false);
+        assert_eq!(
+            handler.content_signature(),
+            0,
+            "the toggle off must zero the signature — the floor would draw nothing",
+        );
+    }
+
+    /// A set fold, not a sequence fold: the fetch order of the same MDs is
+    /// not a picture change.
+    #[test]
+    fn the_signature_is_a_set_signature_not_a_sequence_signature() {
+        let forward = handler_with(vec![md(101), md(102), md(103)]);
+        let reversed = handler_with(vec![md(103), md(102), md(101)]);
+        assert_eq!(
+            forward.content_signature(),
+            reversed.content_signature(),
+            "the same MDs in another order draw the same picture",
+        );
     }
 }

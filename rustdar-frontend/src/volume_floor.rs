@@ -34,9 +34,14 @@
 //!   a 256-gon at [`rustdar_radar::types::MAX_RANGE_KM`] kilometres from the
 //!   site, its vertices produced by the mapping's own forward lines and drawn
 //!   through the same consumer every polygon uses.
-//! * **NWS warning/watch/advisory polygons** — over the radar and the ring,
-//!   under the city labels, exactly the pane's order; fill and stroke from
-//!   `alert_color`, the standard colours. The "county lines" the 2D pane
+//! * **SPC Mesoscale Discussion polygons** — over the radar and the ring,
+//!   under the alerts: the pane's own slot for `SpcDiscussions` in
+//!   `OverlayKind::all`. Exterior-ring fill and stroke in
+//!   `md_fill_color`/`md_stroke_color`, the colours the pane's
+//!   `rasterize_spc_discussions` paints.
+//! * **NWS warning/watch/advisory polygons** — over the radar, the ring and
+//!   the discussions, under the city labels, exactly the pane's order; fill
+//!   and stroke from `alert_color`, the standard colours. The "county lines" the 2D pane
 //!   shows are these same polygons: rustdar's watch/advisory geometry is
 //!   county/zone-shaped (see `features.md`), and no separate county-boundary
 //!   vector layer exists — the basemap tiles carry the administrative lines
@@ -137,7 +142,7 @@ pub const RANGE_RING_RGBA: [u8; 4] = [150, 150, 150, 80];
 ///
 /// Exterior ring only, because that is exactly what the pane draws:
 /// `draw_feature` builds its path from `polygon.first()` and ignores holes,
-/// for outlooks and alerts both. A closing duplicate vertex (GeoJSON's
+/// for outlooks, MDs and alerts alike. A closing duplicate vertex (GeoJSON's
 /// `last == first`) is tolerated and stripped at draw time.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FloorShape {
@@ -155,9 +160,10 @@ pub struct FloorShape {
 pub struct FloorVectors {
     /// Drawn under the radar echo: the SPC outlook polygons.
     pub under_radar: Vec<FloorShape>,
-    /// Drawn over the radar echo (and over the ring), under the city labels:
-    /// the NWS warning/watch/advisory polygons, in fetch order — later
-    /// alerts blend over earlier ones, as the pane's rasterizer iterates.
+    /// Drawn over the radar echo (and over the ring), under the city labels,
+    /// in the pane's own draw order: the SPC Mesoscale Discussion polygons
+    /// first, then the NWS warning/watch/advisory polygons — later shapes
+    /// blend over earlier ones, as the pane's rasterizers iterate.
     pub over_radar: Vec<FloorShape>,
     /// Whether to draw the 230 km range ring. The production composite
     /// always does — the pane always does; the flag exists so the plain
@@ -631,9 +637,11 @@ fn rasterize_shape_layer(shapes: &[FloorShape], f: &FloorFootprint) -> Option<Ve
     painted.then_some(buffer)
 }
 
-/// The pane's `scaled_stroke_width` rule at floor scale: ~2 texels, thinned
-/// for a shape smaller than 40 texels so a small polygon is not swallowed by
-/// its own outline, floored at 1 so it never vanishes.
+/// An approximation of the pane's `scaled_stroke_width` rule at floor scale,
+/// not its numbers: the pane thins by `min_dim / 40` from a per-layer base
+/// (1.5 px for alerts, 2.0 for MDs) down to a 0.5 px floor; the floor uses
+/// the one base of 2 texels for every shape, floored at 1 because a
+/// sub-texel stroke on this lattice would vanish entirely.
 fn stroke_width_texels(min_c: f64, max_c: f64, min_r: f64, max_r: f64) -> usize {
     let min_dim = (max_c - min_c).min(max_r - min_r).max(0.0);
     ((min_dim / 40.0 * 2.0).clamp(1.0, 2.0)).round() as usize
@@ -648,8 +656,11 @@ fn min_max(values: impl Iterator<Item = f64>) -> (f64, f64) {
 
 /// Even-odd scanline fill over texel centres: texel `(row, col)` paints when
 /// a horizontal ray at `y = row` crosses the ring's edges an odd number of
-/// times left of `x = col` — the same rule `point_in_polygon` answers with,
-/// evaluated a row at a time.
+/// times left of `x = col` — the *click* rule (`point_in_polygon`'s ray
+/// cast), evaluated a row at a time. The pane **paints** with tiny-skia's
+/// `FillRule::Winding` (nonzero), not this rule; on a simple ring the two
+/// fill identically, and they diverge only on a self-intersecting exterior,
+/// which valid outlook, MD and alert geometry does not produce.
 fn fill_even_odd(
     vertices: &[(f64, f64)],
     f: &FloorFootprint,

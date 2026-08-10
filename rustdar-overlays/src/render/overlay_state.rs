@@ -399,8 +399,22 @@ impl OverlayRegistry {
     /// production ingest path instead of growing a parallel setter.
     ///
     /// [`apply_fetch_result`]: OverlayRegistry::apply_fetch_result
+    #[doc(hidden)]
     pub fn nws_alerts_payload(alerts: Vec<crate::nws::alert::NwsAlert>) -> FetchPayload {
         Box::new(super::handlers::alert::NwsAlertFetchResult(Ok(alerts)))
+    }
+
+    /// The SPC Mesoscale Discussion fetch payload for a known MD list — the
+    /// same seam as [`nws_alerts_payload`], for the same reason.
+    ///
+    /// [`nws_alerts_payload`]: OverlayRegistry::nws_alerts_payload
+    #[doc(hidden)]
+    pub fn spc_discussions_payload(
+        discussions: Vec<crate::spc::discussion::SpcDiscussion>,
+    ) -> FetchPayload {
+        Box::new(super::handlers::discussion::SpcDiscussionFetchResult(Ok(
+            discussions,
+        )))
     }
 
     pub fn has_data(&self, kind: OverlayKind) -> bool {

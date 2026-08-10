@@ -1248,11 +1248,12 @@ impl App {
         // and the recompose tests drive the warning set through it.
         let vector_sig = {
             use rustdar_overlays::render::overlay_state::OverlayKind;
-            self.gui
-                .overlays
-                .content_signature(OverlayKind::NwsAlerts)
-                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                ^ self.gui.overlays.content_signature(OverlayKind::SpcOutlook)
+            // Distinct odd multipliers per layer, so two layers changing in
+            // step cannot cancel out of the xor.
+            let sig = |kind| self.gui.overlays.content_signature(kind);
+            sig(OverlayKind::NwsAlerts).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                ^ sig(OverlayKind::SpcDiscussions).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+                ^ sig(OverlayKind::SpcOutlook)
         };
 
         let empty = (
@@ -1314,8 +1315,9 @@ impl App {
     /// The pane's vector overlays as floor geometry, gathered from the
     /// overlay registry through the same `clickable_items` filter the pane's
     /// rasterizers apply (category toggles, hidden alerts, the selected SPC
-    /// day and products) — global handler state, never per-pane toggles,
-    /// per the floor's documented contract on its own checkbox.
+    /// day and products, the Mesoscale Discussion checkbox) — global handler
+    /// state, never per-pane toggles, per the floor's documented contract on
+    /// its own checkbox.
     ///
     /// Clones the features, so it is called at floor **dispatch**, once per
     /// sealed sweep or reopen — the per-frame signature check reads
@@ -1344,9 +1346,26 @@ impl App {
                 })
                 .collect()
         };
+        // A layer gathers only while its handler is enabled: the MD handler
+        // keeps its items through its own toggle (`clickable_items` does not
+        // read `enabled`), and a floor drawing what the pane's checkbox
+        // turned off everywhere would break the documented contract. For
+        // alerts and outlooks the gate is a no-op — their "off" is an empty
+        // category/product set, which empties `clickable_items` itself.
+        let layer = |kind: OverlayKind| {
+            if self.gui.overlays.is_enabled(kind) {
+                shapes(self.gui.overlays.clickable_items(kind))
+            } else {
+                Vec::new()
+            }
+        };
+        // Over the radar in the pane's own order (`OverlayKind::all`):
+        // Mesoscale Discussions first, the alert polygons blended over them.
+        let mut over_radar = layer(OverlayKind::SpcDiscussions);
+        over_radar.extend(layer(OverlayKind::NwsAlerts));
         crate::volume::floor::FloorVectors {
-            under_radar: shapes(self.gui.overlays.clickable_items(OverlayKind::SpcOutlook)),
-            over_radar: shapes(self.gui.overlays.clickable_items(OverlayKind::NwsAlerts)),
+            under_radar: layer(OverlayKind::SpcOutlook),
+            over_radar,
             range_ring: true,
         }
     }
@@ -5374,6 +5393,99 @@ mod tests {
             !app.floor_rendered.iter().any(|(s, _, _)| *s == scope),
             "a warning expiring must reopen the scope — the floor in hand \
              still shows it",
+        );
+
+        // ── The Mesoscale Discussion layer rides the same signature ──────
+        // Settle the expiry debt, then an MD issues over the site: the same
+        // reopen through the same drain, through the production ingest.
+        let discussion = |number: u32| {
+            use rustdar_overlays::spc::colors::{md_fill_color, md_stroke_color};
+            use rustdar_overlays::spc::discussion::{MdType, SpcDiscussion};
+            use rustdar_overlays::types::{HatchPattern, OverlayFeature};
+            let md_type = MdType::Convective;
+            let polygon = vec![vec![(35.0, -97.6), (35.8, -97.6), (35.8, -96.9)]];
+            SpcDiscussion {
+                number,
+                title: format!("Mesoscale Discussion #{number:04}"),
+                text: String::new(),
+                link: String::new(),
+                md_type,
+                polygon: polygon.clone(),
+                feature: OverlayFeature::new(
+                    vec![polygon],
+                    md_fill_color(&md_type),
+                    md_stroke_color(&md_type),
+                    format!("MD {number}"),
+                    String::new(),
+                    HatchPattern::None,
+                ),
+                concerning: None,
+            }
+        };
+        let apply_md = |app: &mut App, mds| {
+            use rustdar_overlays::render::overlay_state::{
+                OverlayFetchResult, OverlayKind, OverlayRegistry,
+            };
+            app.gui.overlays.apply_fetch_result(OverlayFetchResult {
+                kind: OverlayKind::SpcDiscussions,
+                data: OverlayRegistry::spc_discussions_payload(mds),
+            });
+        };
+        app.retry_owed_floor_renders();
+        apply_md(&mut app, vec![discussion(101)]);
+        app.recompose_floors_for_new_tiles();
+        assert!(
+            !app.floor_rendered.iter().any(|(s, _, _)| *s == scope),
+            "an MD issuing must reopen the scope — the floor in hand shows \
+             no discussion polygon (this is where a signature that does not \
+             fold `SpcDiscussions` dies)",
+        );
+        app.retry_owed_floor_renders();
+
+        // The next poll returns the SAME MD set: nothing reopens. (This is
+        // where the MD handler's `data_generation` as its signature dies.)
+        apply_md(&mut app, vec![discussion(101)]);
+        app.recompose_floors_for_new_tiles();
+        assert!(
+            app.floor_rendered.iter().any(|(s, _, _)| *s == scope),
+            "a poll returning the same MD set must not reopen the scope",
+        );
+
+        // The planted MD reaches the gather at its slot in the pane's draw
+        // order (`OverlayKind::all`): over the radar, under the alerts —
+        // drawn first, so the alert blends over it. (This is where omitting
+        // the MD layer from the gather dies.)
+        apply(&mut app, vec![warning("w1")]);
+        let vectors = app.gather_floor_vectors();
+        assert_eq!(
+            vectors.over_radar.len(),
+            2,
+            "the MD and the warning must both reach the over-radar layer",
+        );
+        assert_eq!(
+            vectors.over_radar[0].fill_rgba,
+            [255, 180, 50, 60],
+            "the MD (convective fill) draws first — over the radar, under \
+             the alerts, the pane's slot for SpcDiscussions",
+        );
+        assert_eq!(
+            vectors.over_radar[1].fill_rgba,
+            [255, 0, 0, 80],
+            "the warning's fill blends over the MD's, as the pane draws them",
+        );
+
+        // The MD checkbox is global handler state, which the floor follows:
+        // off, the layer gathers nothing.
+        {
+            use rustdar_overlays::render::overlay_state::OverlayKind;
+            app.gui
+                .overlays
+                .set_enabled(OverlayKind::SpcDiscussions, false);
+        }
+        assert_eq!(
+            app.gather_floor_vectors().over_radar.len(),
+            1,
+            "a disabled MD handler must put nothing on the floor",
         );
     }
 }

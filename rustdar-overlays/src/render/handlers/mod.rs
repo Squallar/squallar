@@ -1,6 +1,6 @@
 pub(crate) mod alert;
 mod colorscale;
-mod discussion;
+pub(crate) mod discussion;
 mod glm;
 mod labels;
 mod location;
