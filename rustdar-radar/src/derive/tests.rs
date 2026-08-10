@@ -255,6 +255,71 @@ fn srv_subtracts_the_override_motion_radial_by_radial() {
     );
 }
 
+/// Each derived codec spans exactly the range its product declares —
+/// asserted against the span, not against the encoder that wrote it.
+///
+/// Every other test of a derived field in this module decodes through the
+/// same `codec()` that `synth_sweep` encoded with, so the pair is
+/// self-inverting: swapping NROT's codec for velocity's (2, 129) — a
+/// sixteen-fold coarsening, and a different zero — changes the raw bytes
+/// and the decode together and the whole workspace stays green. The field
+/// would then be quantised to 0.5 unitless per code, against a palette
+/// whose entire weak class is 0.75 wide.
+///
+/// This pin has no encoder in it. The codec is a claim about what raw
+/// codes 2 and 255 *mean*, and the claim is checked against the numbers
+/// the module doc and `voxel::data_levels_for` state independently. The
+/// second half of the loop — that the voxel ramp agrees with these spans
+/// — is
+/// `the_derived_products_resample_their_own_field_not_the_raw_one`'s
+/// `value_range` assertions.
+#[test]
+fn each_derived_codec_spans_exactly_the_range_its_product_declares() {
+    for (product, lo, hi, why) in [
+        (
+            RadarProduct::StormRelativeVelocity,
+            -63.5,
+            63.0,
+            "velocity's own span: same units, same resolution",
+        ),
+        (
+            RadarProduct::NormalizedRotation,
+            -4.0,
+            4.0,
+            "unitless, GR's meso class near |1| with headroom for extremes",
+        ),
+        (
+            RadarProduct::SpecificDifferentialPhase,
+            f64::from(kdp::KDP_MIN_DISPLAY),
+            f64::from(kdp::KDP_MAX_DISPLAY),
+            "the estimator's own display clamp",
+        ),
+    ] {
+        let (scale, offset) = codec(product);
+        let decode = |raw: f64| (raw - f64::from(offset)) / f64::from(scale);
+        assert!(
+            (decode(2.0) - lo).abs() < 1e-3,
+            "{}: raw code 2 means {}, not the declared {lo} ({why})",
+            product.code(),
+            decode(2.0),
+        );
+        assert!(
+            (decode(255.0) - hi).abs() < 1e-3,
+            "{}: raw code 255 means {}, not the declared {hi} ({why})",
+            product.code(),
+            decode(255.0),
+        );
+        // And the no-data code is outside the span in the direction the
+        // ramp puts it, so a zero byte can never decode to a value.
+        assert!(
+            decode(0.0) < lo,
+            "{}: the no-data code 0 decodes to {}, inside the span",
+            product.code(),
+            decode(0.0),
+        );
+    }
+}
+
 /// SRV with neither an override nor a usable wind fit refuses: base
 /// velocity under a storm-relative label is the failure the refusal
 /// exists to prevent.

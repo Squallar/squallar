@@ -26,7 +26,8 @@
 //! | `HALF_KM` | no | `80.0` | Region half-width, km. `build_voxels` clamps to [10, 230]. |
 //! | `BASE_KM` | no | `0.0` | Box base, km MSL. |
 //! | `TOP_KM` | no | `18.0` | Box top, km MSL. |
-//! | `PRODUCT` | no | `BR` | Moment: `BR`/`REF`, `BV`/`VEL`, `SW`, `ZDR`, `PHI`, `RHO`/`CC`. |
+//! | `PRODUCT` | no | `BR` | Product: the six moments `BR`/`REF`, `BV`/`VEL`, `SW`, `ZDR`, `PHI`, `RHO`/`CC`, or the three derivations `SRV`, `NROT`, `KDP`. |
+//! | `MOTION` | no | — | Storm motion override for `SRV`, as `speed_kt,direction_from_deg`. Without it SRV uses the volume's own Bunkers fit, and refuses if there is none. |
 //! | `THRESH` | yes | — | The mask's cut, in the moment's own units (dBZ for `BR`). |
 //! | `CAM` | no | — | Path to a text file of 19 whitespace-separated `f32`s. |
 //! | `YAW` | no | `225.0` | Fallback camera yaw, degrees — used only without `CAM`. |
@@ -121,7 +122,7 @@ use rustdar_frontend::egui_renderer::AttachmentConfig;
 use rustdar_frontend::volume::raymarch::VolumePipelines;
 use rustdar_frontend::volume::uniform::VolumeUniform;
 use rustdar_radar::types::RadarProduct;
-use rustdar_radar::voxel::{DESKTOP_SHAPE, VoxelGrid, VoxelRequest, build_voxels};
+use rustdar_radar::voxel::{DESKTOP_SHAPE, VoxelGrid, VoxelRequest, build_voxels_with_motion};
 
 /// Build a real volume, render it twice, and write a mask, a picture and the
 /// numbers behind both.
@@ -155,15 +156,18 @@ fn render_a_real_volume_mask() {
         // at this shape.
         values_wanted: false,
     };
-    let grid = build_voxels(&scan, &request, site_lat, site_lon).unwrap_or_else(|| {
-        panic!(
-            "build_voxels refused: product {} at {:?}, base {} km, top {} km",
-            product.code(),
-            request.centre,
-            request.base_km_msl,
-            request.top_km_msl,
-        )
-    });
+    let motion = motion_from_env(product);
+    let grid = build_voxels_with_motion(&scan, &request, site_lat, site_lon, motion)
+        .unwrap_or_else(|| {
+            panic!(
+                "build_voxels refused: product {} at {:?}, base {} km, top {} km, \
+                 motion {motion:?}",
+                product.code(),
+                request.centre,
+                request.base_km_msl,
+                request.top_km_msl,
+            )
+        });
 
     let size = size_from_env();
     let box_size_km = box_size_km(&grid);
@@ -722,22 +726,127 @@ where
     }
 }
 
-/// `PRODUCT`, restricted to what `rustdar_radar::sampler::samplable` accepts —
-/// anything else makes `build_voxels` return `None` with no explanation here.
+/// `PRODUCT`, restricted to what `rustdar_radar::derive::volume_slot` accepts
+/// — anything else makes `build_voxels` return `None` with no explanation here.
+///
+/// `volume_slot`, not `samplable`. The narrower predicate is what this parser
+/// used to enforce, and it refused exactly the three products the no-data
+/// reconstruction fix was built for: the measurement that fix rests on —
+/// "NROT's LUT is opaque green over indices ~64-90 and every boundary between
+/// sub-threshold data and empty air interpolates through it" — could not be
+/// re-run through this harness at all, because it panicked on `PRODUCT=NROT`.
+/// A harness that cannot be pointed at the case it exists for is not an
+/// instrument.
 fn product_from_env() -> RadarProduct {
-    let raw = std::env::var("PRODUCT").unwrap_or_else(|_| "BR".to_owned());
-    match raw.trim().to_ascii_uppercase().as_str() {
+    product_from_name(&std::env::var("PRODUCT").unwrap_or_else(|_| "BR".to_owned()))
+}
+
+/// [`product_from_env`]'s parse, without the environment.
+///
+/// Split out so the accepted set has a test. It did not: every spelling here
+/// was reachable only by running the `#[ignore]`d harness with a real archive,
+/// so the three products that were *missing* were missing silently — the whole
+/// point of a parser being that the failure is a panic at the door rather than
+/// a `None` three frames later.
+fn product_from_name(raw: &str) -> RadarProduct {
+    let product = match raw.trim().to_ascii_uppercase().as_str() {
         "BR" | "REF" | "REFLECTIVITY" => RadarProduct::Reflectivity,
         "BV" | "VEL" | "VELOCITY" => RadarProduct::Velocity,
         "SW" | "SPECTRUMWIDTH" => RadarProduct::SpectrumWidth,
         "ZDR" => RadarProduct::DifferentialReflectivity,
         "PHI" | "PHIDP" => RadarProduct::DifferentialPhase,
         "RHO" | "CC" => RadarProduct::CorrelationCoefficient,
+        "SRV" | "STORMRELATIVEVELOCITY" => RadarProduct::StormRelativeVelocity,
+        "NROT" | "ROTATION" => RadarProduct::NormalizedRotation,
+        "KDP" => RadarProduct::SpecificDifferentialPhase,
         other => panic!(
-            "PRODUCT={other} is not a moment a volume can be resampled from; \
-             use BR, BV, SW, ZDR, PHI or CC"
+            "PRODUCT={other} is not a product a volume can be built from; \
+             use BR, BV, SW, ZDR, PHI, RHO, SRV, NROT or KDP"
         ),
+    };
+    // Read rather than restated: the parser's accepted set is exactly the
+    // predicate every vertical view gates on, so widening one widens the
+    // other and a product admitted here that the builder refuses is a
+    // contradiction this catches at the door.
+    assert!(
+        rustdar_radar::derive::volume_slot(product).is_some(),
+        "PRODUCT={raw} names {}, which `derive::volume_slot` refuses \u{2014} \
+         build_voxels would answer None with no explanation here",
+        product.code(),
+    );
+    product
+}
+
+/// The harness can be pointed at every product the vertical views render —
+/// which for the three derived ones it could not be at all.
+///
+/// `product_from_name` panicked on anything but BR/BV/SW/ZDR/PHI/CC, so the
+/// two products the no-data reconstruction fix was *built for* were
+/// unreachable from the instrument that measured it. The measurement that fix
+/// rests on — NROT's opaque green over indices ~64-90, painted by
+/// interpolation across the no-data boundary — could not be re-run.
+///
+/// Not `#[ignore]`d: it needs no archive and no GPU, and an ignored test is
+/// how the gap survived.
+#[test]
+fn the_harness_accepts_every_product_the_vertical_views_render() {
+    for (name, want) in [
+        ("BR", RadarProduct::Reflectivity),
+        ("ref", RadarProduct::Reflectivity),
+        ("BV", RadarProduct::Velocity),
+        ("SW", RadarProduct::SpectrumWidth),
+        ("ZDR", RadarProduct::DifferentialReflectivity),
+        ("PHI", RadarProduct::DifferentialPhase),
+        ("CC", RadarProduct::CorrelationCoefficient),
+        ("SRV", RadarProduct::StormRelativeVelocity),
+        ("nrot", RadarProduct::NormalizedRotation),
+        ("KDP", RadarProduct::SpecificDifferentialPhase),
+    ] {
+        assert_eq!(product_from_name(name), want, "PRODUCT={name}");
     }
+    // Every product the vertical views admit has a spelling here, so a
+    // widening of that set cannot leave the harness unable to see it.
+    for product in rustdar_radar::types::RadarProduct::all() {
+        if rustdar_radar::derive::volume_slot(*product).is_none() {
+            continue;
+        }
+        assert_eq!(
+            product_from_name(product.code()),
+            *product,
+            "{} renders in the vertical views and the harness cannot be \
+             pointed at it by its own product code",
+            product.code(),
+        );
+    }
+}
+
+/// `MOTION`, the storm motion override SRV derives with, as
+/// `speed_kt,direction_from_deg`.
+///
+/// `None` for every other product, and for SRV without the variable — which
+/// leaves the derivation on the volume's own Bunkers fit, exactly as the app
+/// does with the override switch off.
+fn motion_from_env(product: RadarProduct) -> Option<(f32, f32)> {
+    if product != RadarProduct::StormRelativeVelocity {
+        return None;
+    }
+    let raw = std::env::var("MOTION").ok()?;
+    let (speed, direction) = raw
+        .trim()
+        .split_once(',')
+        .unwrap_or_else(|| panic!("MOTION={raw:?} is not speed_kt,direction_deg"));
+    let parse = |field: &str| -> f32 {
+        field
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("MOTION={raw:?}: {field:?} is not an f32: {e}"))
+    };
+    let pair = (parse(speed), parse(direction));
+    assert!(
+        pair.0.is_finite() && pair.1.is_finite(),
+        "MOTION={raw:?} is not a finite vector",
+    );
+    Some(pair)
 }
 
 /// `SIZE`, as `WxH`.
