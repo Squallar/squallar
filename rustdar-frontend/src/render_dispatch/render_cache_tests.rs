@@ -1,0 +1,299 @@
+use super::*;
+
+fn key(site: &str, elevation_tenths: i32) -> RenderCacheKey {
+    (
+        site.to_string(),
+        RadarProduct::Reflectivity,
+        RenderView::PlanView,
+        elevation_tenths,
+    )
+}
+
+/// A distinguishable entry — `max_range_km` doubles as the identity so a test
+/// can tell which render it got back.
+fn output(range: f64) -> CachedRenderOutput {
+    CachedRenderOutput {
+        image_data: Arc::new(Vec::new()),
+        max_range_km: range,
+        value_data: Arc::new(Vec::new()),
+    }
+}
+
+/// The bound the cache exists for. Before this it was a bare `HashMap` that only
+/// `reset_panes*` ever shrank, so cycling products grew it without limit at
+/// ~32 MiB per entry.
+#[test]
+fn inserting_past_capacity_evicts_instead_of_growing() {
+    let mut cache = RenderCache::new(3);
+    for i in 0..10 {
+        cache.insert(key("KTLX", i), output(i as f64));
+    }
+    assert_eq!(cache.entry_count(), 3, "capacity must bound the cache");
+    // The three newest survived; everything older is gone.
+    assert!(cache.get(&key("KTLX", 9)).is_some());
+    assert!(cache.get(&key("KTLX", 8)).is_some());
+    assert!(cache.get(&key("KTLX", 7)).is_some());
+    assert!(cache.get(&key("KTLX", 6)).is_none());
+    assert!(cache.get(&key("KTLX", 0)).is_none());
+}
+
+/// Least *recently used*, not least recently inserted. A pane that keeps reading
+/// its entry must not lose it to one nobody has touched since it was written.
+#[test]
+fn a_read_protects_an_entry_from_eviction() {
+    let mut cache = RenderCache::new(3);
+    cache.insert(key("KTLX", 0), output(0.0));
+    cache.insert(key("KTLX", 1), output(1.0));
+    cache.insert(key("KTLX", 2), output(2.0));
+
+    // Touch the oldest, making the *second* oldest the eviction candidate.
+    assert!(cache.get(&key("KTLX", 0)).is_some());
+    cache.insert(key("KTLX", 3), output(3.0));
+
+    assert!(
+        cache.get(&key("KTLX", 0)).is_some(),
+        "the read should have saved it"
+    );
+    assert!(
+        cache.get(&key("KTLX", 1)).is_none(),
+        "untouched since insert, so it goes"
+    );
+    assert_eq!(cache.entry_count(), 3);
+}
+
+/// Re-inserting an existing key replaces the value and refreshes its position,
+/// rather than queueing the key a second time and corrupting the eviction order.
+#[test]
+fn reinserting_a_key_replaces_it_without_duplicating_it() {
+    let mut cache = RenderCache::new(2);
+    cache.insert(key("KTLX", 0), output(0.0));
+    cache.insert(key("KTLX", 1), output(1.0));
+    cache.insert(key("KTLX", 0), output(99.0));
+
+    assert_eq!(cache.entry_count(), 2, "a replacement is not a new entry");
+    assert_eq!(cache.recency_order(), vec![key("KTLX", 1), key("KTLX", 0)]);
+    assert_eq!(cache.get(&key("KTLX", 0)).unwrap().max_range_km, 99.0);
+
+    // With `0` refreshed, `1` is now the oldest and is what a third insert evicts.
+    cache.insert(key("KTLX", 2), output(2.0));
+    assert!(cache.get(&key("KTLX", 1)).is_none());
+    assert!(cache.get(&key("KTLX", 0)).is_some());
+}
+
+/// `reset_panes_for_site` drops one site's entries. The recency queue has to lose
+/// them too, or it later evicts a key that is no longer in the map while the real
+/// oldest entry survives.
+#[test]
+fn retain_drops_keys_from_the_recency_queue_as_well() {
+    let mut cache = RenderCache::new(4);
+    cache.insert(key("KTLX", 0), output(0.0));
+    cache.insert(key("KOUN", 1), output(1.0));
+    cache.insert(key("KTLX", 2), output(2.0));
+
+    cache.retain(|(site, _, _, _)| site != "KTLX");
+
+    assert_eq!(cache.entry_count(), 1);
+    assert_eq!(cache.recency_order(), vec![key("KOUN", 1)]);
+
+    // Fill past capacity; KOUN is the oldest real entry and must be the one to go.
+    for i in 10..14 {
+        cache.insert(key("KDDC", i), output(i as f64));
+    }
+    assert_eq!(cache.entry_count(), 4);
+    assert!(cache.get(&key("KOUN", 1)).is_none());
+    assert!(cache.get(&key("KDDC", 13)).is_some());
+}
+
+#[test]
+fn clear_empties_both_halves() {
+    let mut cache = RenderCache::new(4);
+    cache.insert(key("KTLX", 0), output(0.0));
+    cache.insert(key("KTLX", 1), output(1.0));
+    cache.clear();
+    assert_eq!(cache.entry_count(), 0);
+    assert!(cache.recency_order().is_empty());
+}
+
+/// A zero capacity would evict every entry on the way in, silently disabling the
+/// cross-pane sharing the cache exists for.
+#[test]
+fn capacity_is_floored_at_one() {
+    let mut cache = RenderCache::new(0);
+    cache.insert(key("KTLX", 0), output(0.0));
+    assert_eq!(cache.entry_count(), 1);
+    assert!(cache.get(&key("KTLX", 0)).is_some());
+}
+
+/// The cache the dispatcher actually builds must hold every pane that can be on
+/// screen at once, or the panes evict each other and every layout change
+/// re-renders.
+///
+/// Asserted by filling a real `RenderDispatcher` rather than by comparing
+/// `MAX_RENDER_CACHE_ENTRIES` against the pane limit. Those two constants can
+/// both be right while the dispatcher hands `RenderCache::new` something else
+/// entirely — a comparison of constants observes the *intent*, and this is the
+/// one place the intent is wired up.
+#[test]
+fn the_dispatchers_own_cache_holds_every_pane_on_screen() {
+    let max_panes = if cfg!(target_os = "android") {
+        rustdar_egui::pane::MAX_PANES_MOBILE
+    } else {
+        rustdar_egui::pane::MAX_PANES_DESKTOP
+    };
+    let sites: Vec<String> = (0..max_panes).map(|i| format!("SITE{i}")).collect();
+    assert!(
+        MAX_RENDER_CACHE_ENTRIES >= sites.len(),
+        "precondition: the bound itself is too small — {MAX_RENDER_CACHE_ENTRIES} \
+             entries for {} panes",
+        sites.len()
+    );
+
+    // A full screen of panes, each on its own site *and each a different
+    // view*, cycling so a mixed screen is what is measured. The view axis
+    // was the open question when it was added: a pane still wants exactly
+    // one entry whatever it shows, so `capacity >= pane_count` is still the
+    // whole invariant — what the axis removed is the *wrong* sharing
+    // between a plan view and a section of the same product, not headroom.
+    // Asserting it over mixed views is what says so.
+    let views = RenderView::all();
+    let view_of = |i: usize| views[i % views.len()];
+
+    let mut dispatcher = RenderDispatcher::new();
+    for (i, site) in sites.iter().enumerate() {
+        dispatcher.cache_render(
+            site,
+            RadarProduct::Reflectivity,
+            view_of(i),
+            0.5,
+            output(i as f64),
+        );
+    }
+
+    // A full screen of panes, each on its own site: none may have evicted another.
+    for (i, site) in sites.iter().enumerate() {
+        let hit = dispatcher.get_cached_render(site, RadarProduct::Reflectivity, view_of(i), 0.5);
+        let Some(hit) = hit else {
+            panic!(
+                "{site} was evicted with only {} panes' worth cached",
+                sites.len()
+            );
+        };
+        assert_eq!(
+            hit.max_range_km, i as f64,
+            "{site} came back as another pane's render"
+        );
+    }
+}
+
+/// The collision the view axis exists to stop: one site, one product, one
+/// elevation, two views.
+///
+/// Without the axis the second `cache_render` overwrites the first and the
+/// plan-view pane is handed the section's buffers — which is not a wrong
+/// picture but `ColorImage::from_rgba_unmultiplied`'s `assert_eq!` on the
+/// main thread, live in release, aborting the whole app under wasm.
+#[test]
+fn two_views_of_one_product_do_not_share_an_entry() {
+    let mut d = RenderDispatcher::new();
+    d.cache_render(
+        "KTLX",
+        RadarProduct::Reflectivity,
+        RenderView::PlanView,
+        0.5,
+        output(1.0),
+    );
+    d.cache_render(
+        "KTLX",
+        RadarProduct::Reflectivity,
+        RenderView::CrossSection,
+        0.5,
+        output(2.0),
+    );
+    assert_eq!(
+        d.get_cached_render(
+            "KTLX",
+            RadarProduct::Reflectivity,
+            RenderView::PlanView,
+            0.5
+        )
+        .map(|c| c.max_range_km),
+        Some(1.0),
+        "the section overwrote the plan view",
+    );
+    assert_eq!(
+        d.get_cached_render(
+            "KTLX",
+            RadarProduct::Reflectivity,
+            RenderView::CrossSection,
+            0.5,
+        )
+        .map(|c| c.max_range_km),
+        Some(2.0),
+    );
+}
+
+/// A vertical view has no elevation, so every tilt selection maps to one
+/// entry — and that is only safe because the *view* is what keeps it apart
+/// from a real 0.0° plan render, which no `i32` sentinel could have done.
+#[test]
+fn a_vertical_view_ignores_the_elevation_and_still_misses_the_plan_view() {
+    let mut d = RenderDispatcher::new();
+    d.cache_render(
+        "KTLX",
+        RadarProduct::Reflectivity,
+        RenderView::CrossSection,
+        3.4,
+        output(7.0),
+    );
+    assert_eq!(
+        d.get_cached_render(
+            "KTLX",
+            RadarProduct::Reflectivity,
+            RenderView::CrossSection,
+            19.5,
+        )
+        .map(|c| c.max_range_km),
+        Some(7.0),
+        "a section was keyed by a tilt it does not have",
+    );
+    assert!(
+        d.get_cached_render(
+            "KTLX",
+            RadarProduct::Reflectivity,
+            RenderView::PlanView,
+            0.0,
+        )
+        .is_none(),
+        "the section's viewless elevation slot collided with a real 0.0 plan render",
+    );
+}
+
+/// The whole-volume predicate is the `||` of its two named halves, for
+/// every (view, product) pair there is — so neither half can be dropped and
+/// no third copy can grow.
+#[test]
+fn the_whole_volume_predicate_is_both_halves() {
+    let mut saw_view_only = false;
+    for &view in RenderView::all() {
+        for &product in RadarProduct::all() {
+            assert_eq!(
+                needs_whole_volume(view, product),
+                view.reads_whole_volume() || product.reads_whole_volume(),
+            );
+            // The pair the product half alone gets wrong: a section of a
+            // one-sweep product.
+            if view.reads_whole_volume() && !product.reads_whole_volume() {
+                assert!(needs_whole_volume(view, product));
+                saw_view_only = true;
+            }
+        }
+    }
+    assert!(
+        saw_view_only,
+        "no (view, product) pair needs the volume for the view's sake alone,              so this says nothing about why both halves are asked",
+    );
+    assert!(
+        !needs_whole_volume(RenderView::PlanView, RadarProduct::Reflectivity),
+        "the predicate answers true for everything, which is safe and vacuous",
+    );
+}
