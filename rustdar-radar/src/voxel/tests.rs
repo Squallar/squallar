@@ -2234,14 +2234,37 @@ fn the_default_transparency_profile_is_measured_per_product() {
     }
     // The finding, as a number. Tumbling hail sits at ZDR ~ 0 under high
     // Z; it must be plainly visible, not a hole and not a whisper.
-    let hail = alpha(zdr, 0.0);
+    let hail = alpha(zdr, p::ZDR_TUMBLING_DB);
     assert!(
-        hail >= palette_alpha(zdr, 0.0) / 3,
-        "tumbling hail at 0 dB renders at {hail} of {}: a hole where the              HCA's own bounds put the signature",
-        palette_alpha(zdr, 0.0),
+        hail >= palette_alpha(zdr, p::ZDR_TUMBLING_DB) / 3,
+        "tumbling hail at 0 dB renders at {hail} of {}: a hole where the \
+             HCA's own bounds put the signature",
+        palette_alpha(zdr, p::ZDR_TUMBLING_DB),
     );
-    solid(zdr, p::ZDR_ICE_DB, "ice and tumbling scatterers");
-    solid(zdr, -3.5, "the negative tail");
+    // …and a plateau, not a ramp to full. Measured over four volumes,
+    // ZDR in [−0.5, +0.5] is 68 % of every data voxel in the box: a low
+    // side that reached full opacity drew 91 % of the volume at a mean
+    // alpha of 110 of 180, which is a wall, and a wall is the other way
+    // of telling the user nothing.
+    assert_eq!(
+        p::ZDR_TUMBLING_ALPHA,
+        p::PHI_ALPHA,
+        "the plateau is the translucency this module already argues for a \
+             moment with no honest background band",
+    );
+    let ceiling = palette_alpha(zdr, p::ZDR_TUMBLING_DB) / 2;
+    assert!(
+        hail <= ceiling,
+        "tumbling hail at 0 dB renders at {hail}, over the {ceiling} that \
+             keeps the 68 % of a volume sharing its band a haze rather than a \
+             wall",
+    );
+    assert!(
+        alpha(zdr, -1.5) > hail,
+        "the plateau must still climb toward the deep negative tail",
+    );
+    solid(zdr, p::ZDR_NEGATIVE_DB, "the deep negative tail");
+    solid(zdr, -3.5, "a three-body spike");
     solid(zdr, p::ZDR_COLUMN_DB, "a ZDR column");
     solid(zdr, 4.0, "a big-drop core");
     // Monotone away from the rain band in both directions, so "further
@@ -2251,6 +2274,7 @@ fn the_default_transparency_profile_is_measured_per_product() {
         [0.4f32, 0.2],
         [0.2, 0.0],
         [0.0, -0.25],
+        [-1.0, -2.0],
         [2.1, 2.2],
         [2.5, 2.8],
     ] {
@@ -2456,9 +2480,11 @@ fn the_default_transparency_profile_is_measured_per_product() {
             ("sw", 18, 180),
             // Was 53 on the profile that put a clear band across 0 dB.
             // The band moved off zero and narrowed to the HCA's own rain
-            // interval, so 16 fewer entries are see-through — and the 16
-            // are the ones around the hail value.
-            ("zdr", 37, 180),
+            // interval, so 11 fewer entries are see-through — and the 11
+            // are the ones around the hail value. The rest of the low
+            // side is a plateau at ΦDP's translucency, which is over the
+            // see-through bar without being a wall.
+            ("zdr", 42, 180),
             ("phi", 255, 63),
             ("rho", 35, 180),
             // Velocity's own count, which is what sharing its band means.

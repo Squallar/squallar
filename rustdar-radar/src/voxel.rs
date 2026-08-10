@@ -1055,26 +1055,49 @@ mod volume_alpha_profile {
     /// is reporting the rain that fills a volume; outside it, either way, ZDR
     /// has excluded a class and is carrying information.
     ///
-    /// The two departures are not symmetric and the profile is not either.
+    /// The two departures are not symmetric and the profile is not either,
+    /// and the asymmetry is a measurement rather than a preference.
+    ///
     /// Upward is drop size: a smooth continuum that only becomes a ZDR column
-    /// well above the rain band, so the rise runs out to [`ZDR_COLUMN_DB`].
+    /// well above the rain band, so the rise runs out to [`ZDR_COLUMN_DB`]
+    /// and reaches the palette's full alpha there.
+    ///
     /// Downward is a change of *phase* — ice, graupel, tumbling hail, and
-    /// under 0 dB even wet snow is refused ([`crate::hca::MIN_ZDR_WS`]) — and
-    /// it is loaded immediately, so the rise is finished at
-    /// [`ZDR_ICE_DB`]: rain's own floor reflected through zero. Half a
-    /// decibel of overshoot rather than stopping on 0 is what puts the
-    /// tumbling-hail value *inside* the visible region at half strength
-    /// instead of on its edge, while leaving the 0.1–0.4 dB dry snow and
-    /// small ice that fill the top of every volume faint rather than a wall.
+    /// under 0 dB even wet snow is refused ([`crate::hca::MIN_ZDR_WS`]) — but
+    /// it is emphatically **not** rare, and that is the thing to get right.
+    /// Counted over four volumes (KFTG 2023-06-22, KLWX 2018-03-02, KDMX
+    /// 2025-03-14, KTLX 2019-07-15), ZDR in [−0.5, +0.5] is **68 % of every
+    /// data voxel in the box** — noise at long range and the dry snow and
+    /// small ice that fill the top of any volume, sharing the band with the
+    /// hail signature and indistinguishable from it without Z. A profile that
+    /// simply ramped this side to full opacity drew 91 % of the volume at a
+    /// mean alpha of 110 of 180. That is a wall, and a wall is the other way
+    /// of telling the user nothing.
+    ///
+    /// So the low side is a **plateau, not a ramp**. It rises from clear at
+    /// the rain floor to [`ZDR_TUMBLING_ALPHA`] at
+    /// [`ZDR_TUMBLING_DB`] — 0 dB, the tumbling-scatterer value itself and
+    /// the crate's own wet-snow kill — and stays there until it climbs to
+    /// full at [`ZDR_NEGATIVE_DB`], which nature seldom reaches. The plateau
+    /// is 0.35, the same translucency [`PHI_ALPHA`] gives a moment with no
+    /// honest background band, and for the same reason: a haze with visible
+    /// interior structure. The hail signature is then plainly present at 63
+    /// of 180 where it used to be a hole, the ice and noise mass above it
+    /// tapers off toward the rain band, and the rare deep negative — the
+    /// three-body spike, the vertically aligned ice — still stands out at
+    /// full strength.
     ///
     /// What this deliberately does not claim: ZDR alone cannot tell that
     /// near-zero hail from that dry snow — `MAX_ZDR_DS` is 2.0 too, and the
     /// discriminator is Z, which a one-moment volume does not carry. The
     /// profile makes the region *visible*, not *hail-coloured*; the palette's
-    /// own colours still say only what the value is.
+    /// own colours still say only what the value is, and the plateau is what
+    /// keeps the volume from asserting more than the moment knows.
     pub const ZDR_RAIN_LO_DB: f32 = crate::hca::MIN_ZDR_BD as f32;
     pub const ZDR_RAIN_HI_DB: f32 = crate::hca::MAX_ZDR_GR as f32;
-    pub const ZDR_ICE_DB: f32 = -ZDR_RAIN_LO_DB;
+    pub const ZDR_TUMBLING_DB: f32 = crate::hca::MIN_ZDR_WS as f32;
+    pub const ZDR_TUMBLING_ALPHA: f32 = PHI_ALPHA;
+    pub const ZDR_NEGATIVE_DB: f32 = -3.0;
     pub const ZDR_COLUMN_DB: f32 = 3.0;
 
     /// The diverging centre the **isosurface** reads for ZDR: rain's own
@@ -1262,7 +1285,7 @@ pub fn iso_shape(product: RadarProduct) -> IsoShape {
 ///   and the rare negative tail at −2.5. **Not** the hail signature: that one
 ///   is ZDR ≈ 0, a band around this centre rather than beyond it, and a
 ///   `DeviationFrom` surface cannot enclose it. The lit volume shows it
-///   ([`volume_alpha_profile::ZDR_ICE_DB`]); the isosurface does not.
+///   ([`volume_alpha_profile::ZDR_TUMBLING_ALPHA`]); the isosurface does not.
 /// * ΦDP 180° — mid-turn; a cumulative site-offset moment has no principled
 ///   default, and the slider is the instrument here.
 /// * ρHV at or under 0.90 — the profile's opaque edge: the melting layer,
@@ -1378,10 +1401,17 @@ fn volume_alpha_scale(product: RadarProduct, value: f32) -> f32 {
         // quiet band is `[ZDR_RAIN_LO_DB, ZDR_RAIN_HI_DB]` and the two ways
         // out of it are different physics. See the profile entry.
         RadarProduct::DifferentialReflectivity => {
-            if value < p::ZDR_RAIN_LO_DB {
-                1.0 - smoothstep(p::ZDR_ICE_DB, p::ZDR_RAIN_LO_DB, value)
-            } else {
+            if value >= p::ZDR_RAIN_LO_DB {
                 smoothstep(p::ZDR_RAIN_HI_DB, p::ZDR_COLUMN_DB, value)
+            } else {
+                // The plateau: up to the tumbling value, then held there
+                // until the deep negative tail earns full strength.
+                let toward_tumbling =
+                    1.0 - smoothstep(p::ZDR_TUMBLING_DB, p::ZDR_RAIN_LO_DB, value);
+                let deep = 1.0 - smoothstep(p::ZDR_NEGATIVE_DB, p::ZDR_TUMBLING_DB, value);
+                (1.0 - p::ZDR_TUMBLING_ALPHA)
+                    .mul_add(deep, p::ZDR_TUMBLING_ALPHA * toward_tumbling)
+                    .min(1.0)
             }
         }
         RadarProduct::CorrelationCoefficient => 1.0 - smoothstep(p::CC_OPAQUE, p::CC_CLEAR, value),
