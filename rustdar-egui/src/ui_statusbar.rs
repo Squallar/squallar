@@ -272,8 +272,9 @@ impl super::Gui {
             });
 
         // The bar's real rect this frame, for the collapsed time chip to
-        // anchor above (`ui_timeline.rs` — the chip must never overlay this
-        // bar). The chip draws later the same frame, so the rect is current.
+        // anchor above when it would otherwise land on it (`ui_timeline.rs`
+        // — the chip must never overlay this bar). The chip draws later the
+        // same frame, so the rect is current.
         self.statusbar_rect = Some(area.response.rect);
 
         #[cfg(test)]

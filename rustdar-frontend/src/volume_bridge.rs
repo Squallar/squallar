@@ -852,7 +852,7 @@ impl VolumePainter for BridgeVolumePainter {
             // Nothing paintable at all — the very first build, or a hard
             // retarget with nothing old worth showing.
             return VolumePaint::Empty(format!(
-                "Building the {} volume…",
+                "Building the {} volume...",
                 frame.target.product.code(),
             ));
         };
@@ -863,7 +863,7 @@ impl VolumePainter for BridgeVolumePainter {
             // fallback is the same first-build message.
             VolumeEntry::Building => {
                 return VolumePaint::Empty(format!(
-                    "Building the {} volume…",
+                    "Building the {} volume...",
                     frame.target.product.code(),
                 ));
             }
@@ -1070,7 +1070,7 @@ fn palette_refusal_for(see_through: u16, moment: &str) -> Option<String> {
     Some(format!(
         "{moment} cannot be drawn as a volume.\n\nIts colour table is opaque across its whole \
          scale, so every measured cell would paint at full strength and the render would be a \
-         solid block, not a picture. A volume needs a see-through part of its scale — its \
+         solid block, not a picture. A volume needs a see-through part of its scale - its \
          product's transparency profile is missing or has regressed.",
     ))
 }

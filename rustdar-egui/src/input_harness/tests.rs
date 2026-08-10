@@ -11547,7 +11547,10 @@ fn the_time_chip_falls_back_to_a_map_panes_time_on_a_non_map_pane() {
 /// M8-8/9. **The collapsed chip sits above the bottom-edge bars and lays out
 /// on one line.** Anchored off the bars' real rects — the floating status
 /// bar on the wide widths, the bottom bar on the phone — and sized to its
-/// text, so the time can never fold into a vertical column.
+/// text, so the time can never fold into a vertical column. The lift is
+/// earned, not reflexive: a status bar collapsed to its restore button
+/// leaves the corner open map, and the chip drops back to the map's bottom
+/// edge (M8.1).
 #[test]
 fn the_collapsed_chip_clears_the_bars_and_never_wraps() {
     // Wide: above the floating status bar.
@@ -11565,6 +11568,29 @@ fn the_collapsed_chip_clears_the_bars_and_never_wraps() {
     assert!(
         !chip.intersects(bar) && chip.bottom() <= bar.top(),
         "the chip ({chip:?}) overlays the status bar ({bar:?})"
+    );
+    assert_single_line_chip(&h, chip);
+
+    // Wide, the status bar collapsed to its left-anchored restore button:
+    // the chip still keeps clear of it, but from the map's own bottom edge —
+    // not floated a button-height above open map (the M8.1 finding).
+    h.mouse_click(h.status_bar().collapse.center());
+    h.warm_up();
+    let chip = h.timeline().chip;
+    let bar = h.status_bar().rect;
+    assert!(
+        bar.width() < 100.0,
+        "precondition: the bar is down to its restore button, got {bar:?}"
+    );
+    assert!(
+        !chip.intersects(bar),
+        "the chip ({chip:?}) overlays the collapsed bar ({bar:?})"
+    );
+    let map = h.map_panel_rect();
+    assert!(
+        map.bottom() - chip.bottom() < 24.0,
+        "the chip ({chip:?}) floats above open map instead of hugging the \
+         bottom of {map:?}"
     );
     assert_single_line_chip(&h, chip);
 

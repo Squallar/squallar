@@ -2216,7 +2216,7 @@ fn accept_scan_listing(
             .map(|i| scans[i * (total - 1) / (MAX_LOOP_FRAMES - 1).max(1)].clone())
             .collect();
         log::info!(
-            "Loop: sampled {} → {} frames for {}",
+            "Loop: sampled {} down to {} frames for {}",
             total,
             MAX_LOOP_FRAMES,
             site

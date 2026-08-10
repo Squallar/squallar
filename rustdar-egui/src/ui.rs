@@ -816,7 +816,9 @@ pub struct Gui {
     /// bar is on screen (Compact, or fully faded). Written by
     /// `render_status_bar` before the timeline pass reads it: the collapsed
     /// time chip anchors above the bar's real top edge rather than a guessed
-    /// constant (the M8 chip-overlap fix).
+    /// constant (the M8 chip-overlap fix) — and only when it would otherwise
+    /// land on the bar, since a bar collapsed to its restore button leaves
+    /// the corner open map (M8.1).
     statusbar_rect: Option<egui::Rect>,
     /// Whether the Add-layer catalog is open. Session-only, like every other
     /// open-surface flag; opened by the stack's two `+ Add layer` buttons and

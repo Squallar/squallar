@@ -14,11 +14,12 @@
 //!   a test holds each entry against the real font tables
 //!   (`epaint::text::Fonts::has_glyph` over `FontDefinitions::default()`) —
 //!   an entry the fonts do not carry fails the build, so tofu cannot ship.
-//! * A second test scans the crate's UI sources (and the overlay handlers'
-//!   display strings) and requires every non-ASCII char in every string
-//!   literal to be on the allowlist — [`ICON_GLYPHS`] plus [`TEXT_GLYPHS`] —
-//!   so a new icon or a fancy typographic char cannot be introduced without
-//!   registering it here, where the font check will judge it.
+//! * A second test scans the crate's UI sources (and the sibling crates'
+//!   display strings — the overlay handlers' and the frontend's) and
+//!   requires every non-ASCII char in every string literal to be on the
+//!   allowlist — [`ICON_GLYPHS`] plus [`TEXT_GLYPHS`] — so a new icon or a
+//!   fancy typographic char cannot be introduced without registering it
+//!   here, where the font check will judge it.
 //!
 //! # The prose rules (user decision, M8)
 //!
@@ -55,9 +56,12 @@ pub(crate) const ICON_GLYPHS: &[(char, &str)] = &[
         '\u{23f7}',
         "reorder down (stack rows); collapse downward (timeline)",
     ),
-    ('\u{23ee}', "previous loop frame"),
+    (
+        '\u{23ee}',
+        "previous loop frame; archive posture (phone scan chip)",
+    ),
     ('\u{23ed}', "next loop frame"),
-    ('\u{23f8}', "pause; auto-poll off; archive posture"),
+    ('\u{23f8}', "pause (transport); auto-poll off"),
     (
         '\u{23fa}',
         "Live (timeline, bottom bar, poll chip, live posture)",
@@ -75,7 +79,11 @@ pub(crate) const ICON_GLYPHS: &[(char, &str)] = &[
     ('\u{1f441}', "layer visibility eye (stack rows)"),
     ('\u{26d3}', "linked to shared time (pills, sync checkboxes)"),
     ('\u{2297}', "unlinked from shared time (pills)"),
-    ('\u{d7}', "close / deselect / dismiss"),
+    (
+        '\u{d7}',
+        "close / deselect / dismiss (icon); times in grid sizes and \
+         vertical exaggeration (text)",
+    ),
     ('\u{2039}', "collapse the stack leftward"),
     (
         '\u{203a}',
@@ -95,14 +103,14 @@ pub(crate) const MONO_ICON_GLYPHS: &[(char, &str)] = &[(
 
 /// Non-icon, non-ASCII chars UI text may carry: units and symbols with no
 /// ASCII spelling worth the loss. Verified against the proportional family
-/// like the icons.
+/// like the icons. A char with both roles is registered once: `×` lives in
+/// [`ICON_GLYPHS`], where its text use is documented beside its icon one.
 pub(crate) const TEXT_GLYPHS: &[(char, &str)] = &[
     ('\u{b0}', "degrees"),
     ('\u{b2}', "squared (km²)"),
     ('\u{b1}', "plus-minus (iso thresholds)"),
     ('\u{2265}', "at least (iso thresholds)"),
     ('\u{2264}', "at most (iso thresholds)"),
-    ('\u{d7}', "times (grid sizes, vertical exaggeration)"),
     ('\u{b5}', "micro (µs offsets)"),
     ('\u{a9}', "copyright (basemap attribution)"),
 ];
@@ -143,12 +151,18 @@ mod tests {
         }
     }
 
-    /// The inventory is a set: a duplicated entry would make one row of the
-    /// table dead weight and a removal look safe when it is not.
+    /// The inventory is a set — across all three tables: a duplicated entry
+    /// would make one row dead weight and a removal look safe when it is
+    /// not. A char with both an icon and a text role (`×`) gets one entry
+    /// documenting both, not one per table.
     #[test]
     fn the_glyph_inventory_has_no_duplicate_entries() {
         let mut seen = std::collections::BTreeSet::new();
-        for &(c, _) in ICON_GLYPHS.iter().chain(MONO_ICON_GLYPHS) {
+        for &(c, _) in ICON_GLYPHS
+            .iter()
+            .chain(MONO_ICON_GLYPHS)
+            .chain(TEXT_GLYPHS)
+        {
             assert!(seen.insert(c), "U+{:04X} is registered twice", c as u32);
         }
     }
@@ -223,15 +237,30 @@ mod tests {
                 }
                 '\'' => {
                     // A char literal ('x', '\n', '\u{..}') or a lifetime.
-                    // Skipped either way; what matters is that a '"' inside a
-                    // char literal must not open a string.
+                    // Char literals are scanned like strings — a `'…'` pushed
+                    // into a `String` is display text the string pass never
+                    // sees — and a '"' inside one must not open a string.
                     if bytes.get(i + 1) == Some(&'\\') {
+                        if bytes.get(i + 2) == Some(&'u') && bytes.get(i + 3) == Some(&'{') {
+                            let mut cp = 0u32;
+                            let mut j = i + 4;
+                            while j < bytes.len() && bytes[j] != '}' {
+                                cp = cp * 16 + bytes[j].to_digit(16).expect("hex escape");
+                                j += 1;
+                            }
+                            if let Some(c) = char::from_u32(cp) {
+                                out.push(c.to_string());
+                            }
+                        }
+                        // Skip to the close whatever the escape was; the
+                        // non-`\u` escapes all resolve to ASCII.
                         let mut j = i + 2;
                         while j < bytes.len() && bytes[j] != '\'' {
                             j += 1;
                         }
                         i = j + 1;
                     } else if bytes.get(i + 2) == Some(&'\'') {
+                        out.push(bytes[i + 1].to_string());
                         i += 3;
                     } else {
                         i += 1; // a lifetime
@@ -273,30 +302,40 @@ mod tests {
         out
     }
 
-    /// Where the file's `#[cfg(test)] mod` tail begins, if it has one. The UI
-    /// sources keep their test modules last, so cutting there drops assertion
-    /// messages — which are prose for developers, not UI text — from the scan.
+    /// Where the file's `#[cfg(test)] mod { .. }` tail begins, if it has one.
+    /// The UI sources keep their inline test modules last, so cutting there
+    /// drops assertion messages — which are prose for developers, not UI
+    /// text — from the scan. Only a mod with an inline `{` body cuts: a
+    /// bodiless `#[cfg(test)] mod tests;` merely names a sibling file, which
+    /// the walk already skips by name, and cutting at the declaration would
+    /// unscan everything after it — most of `glm/mod.rs`, once.
     fn find_test_mod(src: &str) -> Option<usize> {
         let mut from = 0;
         while let Some(rel) = src[from..].find("#[cfg(test)]") {
             let at = from + rel;
             let tail = src[at + "#[cfg(test)]".len()..].trim_start();
-            if tail.starts_with("mod ") {
-                return Some(at);
+            if let Some(decl) = tail.strip_prefix("mod ") {
+                let after_name = decl.trim_start_matches(|c: char| c.is_alphanumeric() || c == '_');
+                if after_name.trim_start().starts_with('{') {
+                    return Some(at);
+                }
             }
             from = at + 1;
         }
         None
     }
 
-    /// The UI sources under scan: this crate's `src/` and the overlay crate's
-    /// display strings (status lines, control labels, popup text and the
-    /// fetch errors the toast presents). Test files carry developer prose and
-    /// are skipped by name.
+    /// The UI sources under scan: this crate's `src/` and the sibling crates
+    /// whose strings reach the screen — the overlay crate's display strings
+    /// (status lines, control labels, popup text and the fetch errors the
+    /// toast presents) and the frontend crate's, whose `VolumePaint::Empty`
+    /// prose is the 3D pane's on-screen empty state. Test files carry
+    /// developer prose and are skipped by name.
     fn scanned_sources() -> Vec<std::path::PathBuf> {
         let mut roots = vec![
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"),
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../rustdar-overlays/src"),
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../rustdar-frontend/src"),
         ];
         let mut files = Vec::new();
         while let Some(dir) = roots.pop() {
@@ -359,9 +398,11 @@ mod tests {
         );
     }
 
-    /// The scanner itself: literals are found, comments and `\u{..}` escapes
-    /// are handled, and the test-module tail is cut. A broken scanner passes
-    /// the scan vacuously, so it gets its own pin.
+    /// The scanner itself: literals are found — char literals included, in
+    /// both spellings — comments and `\u{..}` escapes are handled, a bodiless
+    /// test-mod *declaration* does not end the scan, and the inline
+    /// test-module tail is cut. A broken scanner passes the scan vacuously,
+    /// so it gets its own pin.
     #[test]
     fn the_literal_scanner_reads_what_rust_would() {
         let src = r##"
@@ -371,9 +412,14 @@ const A: &str = "em—dash";
 const B: &str = "esc\u{2014}aped";
 const C: char = '"';
 const D: &str = "after the char literal";
+const E: char = '…';
+const F: char = '\u{2026}';
+#[cfg(test)]
+mod declared;
+const G: &str = "after the bodiless declaration";
 #[cfg(test)]
 mod tests {
-    const E: &str = "test—prose is not scanned";
+    const H: &str = "test—prose is not scanned";
 }
 "##;
         let found = string_literals(src);
@@ -382,7 +428,11 @@ mod tests {
             vec![
                 "em\u{2014}dash",
                 "esc\u{2014}aped",
-                "after the char literal"
+                "\"",
+                "after the char literal",
+                "\u{2026}",
+                "\u{2026}",
+                "after the bodiless declaration",
             ]
         );
     }

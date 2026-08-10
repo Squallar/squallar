@@ -420,9 +420,25 @@ impl super::Gui {
 
                 // Hover and selection read as the whole row, in the stock
                 // theme's own selectable visuals — painted first, so the
-                // content draws over the highlight.
-                if selected || row.hovered() || row.has_focus() {
-                    let visuals = ui.style().interact_selectable(&row, selected);
+                // content draws over the highlight. The hover read is
+                // `contains_pointer`, not `hovered`: the eye and the reorder
+                // pair sit on top of this rect and take `hovered` with them,
+                // blinking the highlight off as the pointer crosses. The
+                // union read is for the highlight only — clicks keep egui's
+                // later-registration precedence untouched.
+                let hovered = row.contains_pointer();
+                if selected || hovered || row.has_focus() {
+                    let mut visuals = if hovered {
+                        ui.style().visuals.widgets.hovered
+                    } else {
+                        ui.style().interact_selectable(&row, selected)
+                    };
+                    if selected {
+                        // `interact_selectable`'s own override, re-applied on
+                        // the hovered branch so selection paints one fill
+                        // wherever the pointer is inside the row.
+                        visuals.weak_bg_fill = ui.visuals().selection.bg_fill;
+                    }
                     ui.painter().rect(
                         row_rect,
                         visuals.corner_radius,

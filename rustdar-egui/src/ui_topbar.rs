@@ -343,11 +343,14 @@ impl super::Gui {
         });
     }
 
-    /// The scan chip's text: site, time and a ⏺ live / ⏸ archive posture
+    /// The scan chip's text: site, time and a ⏺ live / ⏮ archive posture
     /// glyph — the short form the compact status bar carried before the
     /// phone shell, with the posture glyph in place of the room it does not
-    /// have. `⏺`/`⏸` are the timeline's own live and paused glyphs (the
-    /// demo's `⚡`/`⏪` have no glyph in egui's bundled fonts). The time is
+    /// have. `⏺` is the timeline's own live glyph; `⏮` is its
+    /// previous-frame glyph, borrowed because it reads as "past" where a
+    /// bare `⏸` read as "app paused" (the M8.1 finding — pause keeps its
+    /// transport and auto-poll uses, where the context carries it). The
+    /// demo's `⚡`/`⏪` have no glyph in egui's bundled fonts. The time is
     /// the user's own timezone preference, exactly as the status bar prints
     /// it — no hardcoded `Z` suffix claiming UTC at a setting that may not
     /// be.
@@ -356,7 +359,7 @@ impl super::Gui {
         let posture = if pane.viewing_live {
             "\u{23fa}"
         } else {
-            "\u{23f8}"
+            "\u{23ee}"
         };
         match &pane.scan_info {
             Some(info) => format!(

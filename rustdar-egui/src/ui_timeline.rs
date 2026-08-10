@@ -295,10 +295,34 @@ impl super::Gui {
     ) {
         // The bar above which the chip sits: the phone's bottom bar, or the
         // wide widths' floating status bar (its top edge as drawn earlier
-        // this same frame — `Gui::statusbar_rect`). With neither on screen
-        // the map's own bottom edge is the anchor.
+        // this same frame — `Gui::statusbar_rect`) — the status bar only
+        // when the chip would actually land on it: collapsed, that bar is a
+        // small left-anchored restore button, and lifting the right-hugging
+        // chip a button-height above open map floated it for nothing (the
+        // M8.1 finding). The would-be rect comes from the chip area's own
+        // last-frame size — never a guessed constant — and a first frame
+        // with no size yet assumes the overlap, which costs it only the
+        // lift. With neither bar on screen the map's own bottom edge is the
+        // anchor.
+        let would_land_on = |bar: egui::Rect| {
+            let Some(size) = ctx
+                .memory(|m| m.area_rect(egui::Id::new("timeline_chip")))
+                .map(|r| r.size())
+            else {
+                return true;
+            };
+            let corner = egui::pos2(
+                map_rect.right() - CHIP_INSET,
+                map_rect.bottom() - CHIP_INSET,
+            );
+            egui::Rect::from_min_size(corner - size, size).intersects(bar)
+        };
         let bottom = phone_bar_top
-            .or(self.statusbar_rect.map(|bar| bar.top()))
+            .or_else(|| {
+                self.statusbar_rect
+                    .filter(|&bar| would_land_on(bar))
+                    .map(|bar| bar.top())
+            })
             .unwrap_or(map_rect.bottom());
         let area = egui::Area::new(egui::Id::new("timeline_chip"))
             .order(egui::Order::Middle)

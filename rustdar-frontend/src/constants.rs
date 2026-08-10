@@ -435,7 +435,7 @@ const _: () = const {
             VOLUME_GRID_CELLS[axis] <= WEBGL2_MAX_TEXTURE_DIMENSION_3D,
             "a voxel grid axis exceeds the 3D texture size WebGL2 guarantees, so \
              a phone browser reporting exactly the guarantee could not allocate \
-             it — and the failure would be a validation error inside a callback, \
+             it - and the failure would be a validation error inside a callback, \
              where there is no Result to check"
         );
         axis += 1;

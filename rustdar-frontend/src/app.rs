@@ -101,7 +101,7 @@ const _: () = {
                 copy, but rendering goes through egui-wgpu's; split, they configure nothing.",
         note = "egui-wgpu pins a wgpu major, so wgpu cannot move alone: bump egui, \
                 egui-wgpu, egui-winit, walkers and wgpu together, and expect walkers to \
-                gate it — it pins an exact egui minor. `cargo tree -i wgpu` lists the \
+                gate it - it pins an exact egui minor. `cargo tree -i wgpu` lists the \
                 copies that are in the graph now."
     )]
     trait IsOurWgpu {}
@@ -152,7 +152,7 @@ const _: () = {
     #[cfg(target_arch = "wasm32")]
     assert!(
         enabled.contains(::wgpu::Backends::GL),
-        "no WebGL2 backend compiled in — wgpu's `webgl` feature is off. Note \
+        "no WebGL2 backend compiled in - wgpu's `webgl` feature is off. Note \
          that `gles` does not cover the browser. See the wasm32 target section \
          of this crate's Cargo.toml."
     );
@@ -2566,7 +2566,7 @@ impl ApplicationHandler for App {
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
-        log::info!("App suspended — clearing graphics state");
+        log::info!("App suspended - clearing graphics state");
         // Save config on suspend — on Android this is the only reliable save
         // point before the system may kill the process.
         if let Some(store) = self.platform.config_store() {
