@@ -14,6 +14,27 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  # `cargo fmt --all -- --check`, which nothing enforced until now.
+  #
+  # Its absence was not theoretical: `main` accumulated 68 unformatted hunks
+  # across 16 files and no row ever went red, because Build, Clippy and Test
+  # between them never ran rustfmt. Kept as its own job rather than a step on
+  # `clippy` below: that one autofixes and can push, so a formatting failure
+  # there would be entangled with a commit-back path this check has no business
+  # touching. This one only ever reads.
+  fmt:
+    name: Format
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # `rustup show` installs the toolchain rust-toolchain.toml pins, which is
+      # what makes this reproducible: rustfmt's output is version-dependent, so
+      # a check running some other rustfmt would disagree with a developer's.
+      - name: Install Rust
+        run: rustup show
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
   clippy:
     name: Clippy
     runs-on: ubuntu-24.04
