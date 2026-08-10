@@ -376,11 +376,13 @@ const MINI_LKTP: f64 = -40.0;
 
 // ── hca.alg fleet defaults ───────────────────────────────────────────────────
 //
-// The five ZDR class kills below are `pub`: `voxel::volume_alpha_profile`
+// The five ZDR class kills below are `pub(crate)`: `voxel::volume_alpha_profile`
 // takes the 3D transparency profile's quiet band for ZDR from them by
 // reference, because the band where ZDR discriminates nothing is exactly the
-// interval this algorithm leaves open for rain. Everything else here stays
-// private to the classifier.
+// interval this algorithm leaves open for rain. `hca` is a `pub mod`, so
+// `pub` would have published them as crate API for a consumer that lives one
+// module over; `pub(crate)` is the reach they actually need. Everything else
+// here stays private to the classifier.
 
 const MIN_V_GC: f64 = 1.0;
 const MAX_Z_RA: f64 = 50.0;
@@ -389,24 +391,24 @@ const MIN_PHIDP_RA: f64 = 100.0;
 const MIN_Z_RH: f64 = 30.0;
 const MIN_Z_HR: f64 = 30.0;
 /// Heavy rain is refused under this ZDR.
-pub const MIN_ZDR_HR: f64 = 1.0;
+pub(crate) const MIN_ZDR_HR: f64 = 1.0;
 const MAX_Z_IC: f64 = 40.0;
 const MIN_Z_GR: f64 = 10.0;
 const MAX_Z_GR: f64 = 60.0;
 /// Graupel is refused over this ZDR.
-pub const MAX_ZDR_GR: f64 = 2.0;
+pub(crate) const MAX_ZDR_GR: f64 = 2.0;
 const MIN_Z_BD: f64 = 15.0;
 /// Big drops are refused under this ZDR.
-pub const MIN_ZDR_BD: f64 = 0.5;
+pub(crate) const MIN_ZDR_BD: f64 = 0.5;
 // B21: `min_Z_WS` is "no longer used per CCR NA15-00181" — the Z leg of the
 // WS kill is commented out of `hca_allowedHydroClass.c`; only ZDR remains.
 /// Wet snow is refused under this ZDR — the last liquid-bearing class to go
 /// as ZDR falls through zero.
-pub const MIN_ZDR_WS: f64 = 0.0;
+pub(crate) const MIN_ZDR_WS: f64 = 0.0;
 const MAX_RHOHV_BI: f64 = 0.97;
 const MAX_Z_BI: f64 = 35.0;
 /// Dry snow is refused over this ZDR.
-pub const MAX_ZDR_DS: f64 = 2.0;
+pub(crate) const MAX_ZDR_DS: f64 = 2.0;
 const MIN_AGG: f64 = 0.4;
 const MIN_DIF_AGG: f64 = 0.001;
 const MIN_SNR: f64 = 5.0;
@@ -729,11 +731,12 @@ const EXT_GH: f32 = 120.0;
 /// fleet defaults stand in when no environmental value is available.
 pub const DEFAULT_HEIGHT_TW0_KM_MSL: f64 = 10.0 * 0.3048;
 pub const DEFAULT_HEIGHT_TW_M25_KM_MSL: f64 = 22.0 * 0.3048;
-/// `HailSize.cpp`'s hard bounds. `HSDA_MAX_ZDR` is `pub` for the same reason
-/// the ZDR class kills above are: it is the hard ceiling that makes "hail is a
-/// near-zero ZDR signature" a statement of this crate's own algorithm rather
-/// than of received wisdom.
-pub const HSDA_MAX_ZDR: f64 = 2.0;
+/// `HailSize.cpp`'s hard bounds. `HSDA_MAX_ZDR` is `pub(crate)` for the same
+/// reason the ZDR class kills above are: it is the hard ceiling that makes
+/// "hail is a near-zero ZDR signature" a statement of this crate's own
+/// algorithm rather than of received wisdom, and `voxel` is the only thing
+/// outside this module that needs to say so.
+pub(crate) const HSDA_MAX_ZDR: f64 = 2.0;
 const HSDA_MIN_ZDR: f64 = -7.75;
 const HSDA_MIN_RHO: f64 = 0.0;
 const HSDA_MAX_Z: f64 = 100.0;
