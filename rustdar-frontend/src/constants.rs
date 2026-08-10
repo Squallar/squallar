@@ -112,6 +112,32 @@ pub const MOBILE_MAX_LOOP_FRAMES: usize = 20;
 /// The desktop arm. See [`MAX_LOOP_FRAMES`].
 pub const DESKTOP_MAX_LOOP_FRAMES: usize = 60;
 
+/// How many cross-section loop frames may be *dispatched* in one frame.
+///
+/// # Why the loop path needs a cap the plan-view path does not
+///
+/// Cutting a section frame needs a whole-volume payload, and building one
+/// (`RenderInput::extract_volume_parts`) runs on the frame thread: the job wire
+/// carries a `RenderInput`, not a `Scan`, and on wasm the volume is only
+/// reachable from the main thread at all. That is not new — the live section
+/// pane has always paid it, once per volume — but a loop wants it once per
+/// *frame*, and without a cap a desktop dispatch pass would run
+/// [`MAX_CONCURRENT_RENDERS`] of them back to back on the frame that starts the
+/// loop.
+///
+/// One, measured: on a real VCP-212 reflectivity volume the extraction is
+/// ~1.0 ms and the rasterization it feeds is ~6.1 ms. At one per frame the
+/// frame thread pays roughly what a single live re-cut already costs it, the
+/// expensive half is on the worker, and a full desktop render set of 30 frames
+/// is dispatched over 30 frames — half a second at 60 fps, during which the
+/// pane shows every frame that has landed rather than blocking on the batch.
+///
+/// It is deliberately not a per-target cascade. The number is chosen against
+/// the *frame budget*, which is 16.7 ms everywhere, rather than against a device
+/// class's memory; and wasm's `MAX_CONCURRENT_RENDERS` of 1 already imposes the
+/// same limit there by another route.
+pub const MAX_LOOP_SECTION_CUTS_PER_FRAME: usize = 1;
+
 /// Ceiling on what one pane's loop textures may occupy, in bytes.
 ///
 /// Not a runtime check — nothing measures against it. It is the budget the
@@ -125,11 +151,72 @@ pub const DESKTOP_MAX_LOOP_FRAMES: usize = 60;
 /// *holds* and the frames that are *textured* are different numbers. Budgeting on
 /// `MAX_LOOP_FRAMES` alone overstates desktop by 2x.
 ///
+/// A loop frame's size depends on which kind of pane is animating it, and both
+/// kinds are budgeted here because both are *per pane*: a section pane's loop
+/// costs what its own row says, and a screen holding one of each costs the sum
+/// of two rows, exactly as two map panes have always cost two of the first.
+///
+/// A plan-view frame is an `IMAGE_SIZE²` RGBA raster:
+///
 /// | target  | held | textured | frame size | total   | budget  |
 /// |---------|-----:|---------:|-----------:|--------:|--------:|
 /// | desktop |   60 |       30 |     16 MiB | 480 MiB | 512 MiB |
 /// | mobile  |   20 |       12 |     16 MiB | 192 MiB | 256 MiB |
 /// | wasm32  |   12 |        8 |      4 MiB |  32 MiB |  48 MiB |
+///
+/// A cross-section frame is `SECTION_WIDTH × SECTION_HEIGHT`, and
+/// `rustdar_radar::xsect` defines those as `IMAGE_SIZE` by `IMAGE_SIZE / 2` — so
+/// it is **exactly half** a plan-view frame on every target, by construction
+/// rather than by coincidence, and a section loop can never be the binding case:
+///
+/// | target  | held | textured | frame size | total   | budget  |
+/// |---------|-----:|---------:|-----------:|--------:|--------:|
+/// | desktop |   60 |       30 |      8 MiB | 240 MiB | 512 MiB |
+/// | mobile  |   20 |       12 |      8 MiB |  96 MiB | 256 MiB |
+/// | wasm32  |   12 |        8 |      2 MiB |  16 MiB |  48 MiB |
+///
+/// Section frames carry no value or status plane — those are ~10 MB apiece and
+/// serve only the hover readout, which goes quiet under a loop for the same
+/// reason a plan-view loop's does. See `rustdar_egui::pane::SectionImageData`.
+///
+/// **A 3D volume pane is absent from both tables because it does not loop
+/// *yet*** ([`rustdar_egui::pane::PaneKind::can_loop`]) — and the reason is
+/// scope, not memory. The line to score it against is *this* one, not
+/// [`VOLUME_TEXTURE_BUDGET_BYTES`], which bounds one live grid ("one pane shows
+/// one volume") and is no more the right ceiling for a 3D loop than it would be
+/// for a section loop. Against the loop budget, using the per-grid figures
+/// [`VOLUME_TEXTURE_BUDGET_BYTES`] tabulates:
+///
+/// | target  | frames | 3D texture | total    | budget  |          |
+/// |---------|-------:|-----------:|---------:|--------:|----------|
+/// | wasm32  |      8 |  4.501 MiB |   36 MiB |  48 MiB | fits     |
+/// | mobile  |     12 | 15.189 MiB |  182 MiB | 256 MiB | fits     |
+/// | desktop |     30 | 36.001 MiB | 1080 MiB | 512 MiB | 2.1x over|
+/// | desktop |     14 | 36.001 MiB |  504 MiB | 512 MiB | fits     |
+///
+/// So two of the three arms fit at today's full grid, and desktop fits at 14
+/// frames. Measured on a real device (RTX 3090 and lavapipe, seven consecutive
+/// VCP-212 volumes): every one of those sets allocates, and marching a
+/// *different* resident grid each frame costs **+2% on a discrete GPU and +4%
+/// on the software rasteriser** over marching one — because swapping which
+/// volume is drawn is a `set_bind_group` and a 192-byte uniform write, not an
+/// upload. A resident-grid loop therefore costs nothing to orbit; what it costs
+/// is a one-time progressive build, 14 × (89 ms resample + 51 ms upload) ≈
+/// 1.9 s on desktop, which is the same shape as the section loop's 0.5 s.
+///
+/// What keeps it out of *this* change is the work above the GPU layer, which is
+/// a work package of its own: `VolumeStore` can only be held by a pane holding
+/// one target, `App::handle_prepare_volume` refuses any volume time that is not
+/// the newest, and the voxel build has no pacing budget. None of that is a
+/// memory argument and none of it is written down as one here any more.
+///
+/// Two things a 3D loop would have to settle that the two kinds above do not:
+/// its frame list must equal its **resident** set rather than holding more and
+/// re-texturing as the playhead walks — re-entering the window costs ~140 ms
+/// against a 200 ms interval at [`DEFAULT_LOOP_SPEED_FPS`] — and the storm
+/// motion vector, which `StormMotionOverride::sample` reads live from a
+/// `DragValue`, would have to commit on release, because every drag frame
+/// evicts the whole set.
 ///
 /// wasm32's is the tight one: the whole linear memory is capped at 4 GiB, and the
 /// loop is only one of several things competing for it.

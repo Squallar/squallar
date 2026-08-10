@@ -862,22 +862,29 @@ fn a_non_map_active_pane_is_not_the_fallback_sync_source() {
     );
 }
 
-/// Loop actions never target a pane that draws no plan-view frames.
+/// Loop actions target every pane that can animate, and only those.
 ///
-/// A loop frame *is* a rendered plan-view tilt, and
-/// `App::dispatch_loop_renders` skips panes with no plan view — so a
-/// non-map pane in this list would be put into `is_active()` with a frame
-/// list nothing ever fills: a loop transport stuck at "waiting", and a
-/// download queue fetching volumes for a pane nobody is looking at.
+/// A pane in this list that nothing renders frames for would be put into
+/// `is_active()` with a frame list nothing ever fills: a loop transport stuck
+/// at "waiting", and a download queue fetching volumes for a pane nobody is
+/// looking at. A pane *missing* from it that could animate is simply a feature
+/// that does not work.
+///
+/// The classification is `PaneState::can_loop`, and the three non-map rows
+/// below are the whole of it: an **aimed** cross-section pane animates a
+/// sequence of vertical slices and belongs in the fan-out; an **unaimed** one
+/// has no line and so nothing to cut; a 3D volume pane is raymarched live from
+/// the eye and has no cacheable frame at all.
 ///
 /// The active pane is included without being asked, which the second half
 /// below pins. The caller is now the floating timeline, outside every
 /// `mem::take` window, but the unconditional include stands: it is the
 /// pane whose own toggle was clicked, and the timeline disables that
-/// toggle for a non-map active pane — see `loop_sync_targets`' own note.
+/// toggle for an active pane that cannot loop — see `loop_sync_targets`' own
+/// note.
 #[test]
 fn loop_actions_skip_panes_that_draw_no_frames() {
-    use crate::pane::PaneKind;
+    use crate::pane::{GeoPoint, PaneKind, SectionLine};
 
     let mut gui = Gui::new();
     gui.set_pane_count_for_test(4);
@@ -885,7 +892,33 @@ fn loop_actions_skip_panes_that_draw_no_frames() {
     gui.pane_mut(1).unwrap().set_kind(PaneKind::CrossSection);
     gui.pane_mut(2).unwrap().set_kind(PaneKind::Volume);
 
-    assert_eq!(gui.loop_sync_targets(), vec![0, 3]);
+    assert_eq!(
+        gui.loop_sync_targets(),
+        vec![0, 3],
+        "an unaimed section pane is not a loop target: it has no line, so its \
+         frames could never be cut and the batch would never settle"
+    );
+
+    // Aim it, and it joins the fan-out — a section loop is a first-class
+    // participant, not a pane the machinery routes around.
+    gui.pane_mut(1).unwrap().cross_section_mut().unwrap().line = SectionLine::new(
+        GeoPoint {
+            lat: 35.0,
+            lon: -98.0,
+        },
+        GeoPoint {
+            lat: 36.0,
+            lon: -97.0,
+        },
+    );
+    assert_eq!(
+        gui.loop_sync_targets(),
+        vec![0, 1, 3],
+        "an aimed section pane was left out of the loop fan-out, so enabling \
+         the loop animates every pane beside it and not this one"
+    );
+    // The volume pane stays out however the rest of the layout changes.
+    assert!(!gui.loop_sync_targets().contains(&2));
 
     // Sync off narrows to the active pane, whatever kind it is: it is the
     // pane whose own checkbox was clicked.
@@ -897,7 +930,7 @@ fn loop_actions_skip_panes_that_draw_no_frames() {
     // though its slot says it is not a map — because the index is included
     // rather than tested.
     gui.sync_layers = true;
-    assert_eq!(gui.loop_sync_targets(), vec![0, 2, 3]);
+    assert_eq!(gui.loop_sync_targets(), vec![0, 1, 2, 3]);
 }
 
 /// The graphics-state reset reaches panes of every kind, including the ones

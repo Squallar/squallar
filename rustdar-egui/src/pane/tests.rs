@@ -195,7 +195,13 @@ fn ts(minute: u32) -> NaiveDateTime {
 
 /// A 1x1 texture handle. `egui::Context` allocates textures through its own
 /// texture manager, so this needs no window, GPU, or renderer.
-fn dummy_texture(ctx: &egui::Context) -> RadarImageData {
+fn dummy_texture(ctx: &egui::Context) -> LoopFrameImage {
+    LoopFrameImage::PlanView(dummy_plan_view(ctx))
+}
+
+/// The plan-view picture inside [`dummy_texture`], for the tests that read its
+/// fields rather than only whether a frame has one.
+fn dummy_plan_view(ctx: &egui::Context) -> RadarImageData {
     let image = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[255, 255, 255, 255]);
     RadarImageData {
         texture: ctx.load_texture("test", image, egui::TextureOptions::NEAREST),
@@ -224,12 +230,12 @@ fn loop_with_frames(count: usize, current_frame: usize) -> LoopPlaybackState {
 }
 
 fn loop_for_site(site: &RadarSite, count: usize, current_frame: usize) -> LoopPlaybackState {
-    let mut state = LoopPlaybackState::new_for_loop(3600, site);
+    let mut state = LoopPlaybackState::new_for_loop(3600, site, RenderView::PlanView);
     state.phase = LoopPhase::Rendering;
     state.frames = (0..count)
         .map(|i| LoopFrame {
             timestamp: ts(i as u32),
-            texture: None,
+            image: None,
             render_in_flight: false,
             render_failed: false,
         })
@@ -290,7 +296,7 @@ fn starved_frames_block_readiness() {
     let ctx = egui::Context::default();
     let mut state = loop_with_frames(4, 0);
     // One frame rendered; the rest never got a slot, so nothing is in flight.
-    state.frames[0].texture = Some(dummy_texture(&ctx));
+    state.frames[0].image = Some(dummy_texture(&ctx));
 
     assert!(
         !state.frames.iter().any(|f| f.render_in_flight),
@@ -307,7 +313,7 @@ fn fully_rendered_batch_is_settled() {
     let ctx = egui::Context::default();
     let mut state = loop_with_frames(4, 0);
     for frame in &mut state.frames {
-        frame.texture = Some(dummy_texture(&ctx));
+        frame.image = Some(dummy_texture(&ctx));
     }
     assert!(state.render_set_settled(12, all_scans_available));
 }
@@ -316,8 +322,8 @@ fn fully_rendered_batch_is_settled() {
 fn in_flight_frames_block_readiness() {
     let ctx = egui::Context::default();
     let mut state = loop_with_frames(3, 0);
-    state.frames[0].texture = Some(dummy_texture(&ctx));
-    state.frames[1].texture = Some(dummy_texture(&ctx));
+    state.frames[0].image = Some(dummy_texture(&ctx));
+    state.frames[1].image = Some(dummy_texture(&ctx));
     state.frames[2].render_in_flight = true;
     assert!(!state.render_set_settled(12, all_scans_available));
 }
@@ -328,7 +334,7 @@ fn in_flight_frames_block_readiness() {
 fn undownloaded_frames_do_not_block_readiness() {
     let ctx = egui::Context::default();
     let mut state = loop_with_frames(3, 0);
-    state.frames[0].texture = Some(dummy_texture(&ctx));
+    state.frames[0].image = Some(dummy_texture(&ctx));
     let downloaded = state.frames[0].timestamp;
     assert!(state.render_set_settled(12, |f| f.timestamp == downloaded));
 }
@@ -339,7 +345,7 @@ fn undownloaded_frames_do_not_block_readiness() {
 fn failed_frames_do_not_block_readiness() {
     let ctx = egui::Context::default();
     let mut state = loop_with_frames(3, 0);
-    state.frames[0].texture = Some(dummy_texture(&ctx));
+    state.frames[0].image = Some(dummy_texture(&ctx));
     state.frames[1].render_failed = true;
     state.frames[2].render_failed = true;
     assert!(state.render_set_settled(12, all_scans_available));
@@ -361,13 +367,13 @@ fn retarget_keeps_frames_when_the_selection_is_unchanged() {
     let ctx = egui::Context::default();
     let mut state = loop_with_frames(3, 0);
     state.retarget_renders(RadarProduct::Reflectivity, 0.5);
-    state.frames[0].texture = Some(dummy_texture(&ctx));
+    state.frames[0].image = Some(dummy_texture(&ctx));
 
     assert!(!state.retarget_renders(RadarProduct::Reflectivity, 0.5));
-    assert!(state.frames[0].texture.is_some());
+    assert!(state.frames[0].image.is_some());
     // Elevation jitter below the tolerance used elsewhere is not a change.
     assert!(!state.retarget_renders(RadarProduct::Reflectivity, 0.505));
-    assert!(state.frames[0].texture.is_some());
+    assert!(state.frames[0].image.is_some());
 }
 
 /// `texture` and `render_failed` are both judgements about one product at one
@@ -380,7 +386,7 @@ fn retarget_discards_frame_state_that_judged_the_old_product() {
     let ctx = egui::Context::default();
     let mut state = loop_with_frames(4, 0);
     state.retarget_renders(RadarProduct::Velocity, 0.5);
-    state.frames[0].texture = Some(dummy_texture(&ctx));
+    state.frames[0].image = Some(dummy_texture(&ctx));
     // Retired because their scans carry no Velocity sweep. Readiness counts
     // retired frames as settled (see `failed_frames_do_not_block_readiness`),
     // so left alone these would animate as permanent holes under any product.
@@ -390,7 +396,7 @@ fn retarget_discards_frame_state_that_judged_the_old_product() {
     state.frames[3].render_in_flight = true;
 
     assert!(state.retarget_renders(RadarProduct::Reflectivity, 0.5));
-    assert!(state.frames.iter().all(|f| f.texture.is_none()));
+    assert!(state.frames.iter().all(|f| f.image.is_none()));
     assert!(state.frames.iter().all(|f| !f.render_failed));
     // In-flight renders are un-marked so their old-product results are rejected
     // on arrival rather than painted onto a retargeted frame.
@@ -405,10 +411,10 @@ fn retarget_reacts_to_an_elevation_change() {
     let ctx = egui::Context::default();
     let mut state = loop_with_frames(3, 0);
     state.retarget_renders(RadarProduct::Reflectivity, 0.5);
-    state.frames[0].texture = Some(dummy_texture(&ctx));
+    state.frames[0].image = Some(dummy_texture(&ctx));
 
     assert!(state.retarget_renders(RadarProduct::Reflectivity, 1.5));
-    assert!(state.frames[0].texture.is_none());
+    assert!(state.frames[0].image.is_none());
     let retargeted = state.rendered_for.as_ref().expect("target adopted");
     assert!(retargeted.matches(&target(SITE, RadarProduct::Reflectivity, 1.5)));
 }
@@ -504,7 +510,7 @@ fn a_sibling_on_another_site_does_not_accept_the_broadcast() {
 #[test]
 fn a_loop_takes_its_code_and_its_coordinates_from_one_site() {
     let koun = site("KOUN", 35.23, -97.46);
-    let state = LoopPlaybackState::new_for_loop(3600, &koun);
+    let state = LoopPlaybackState::new_for_loop(3600, &koun, RenderView::PlanView);
 
     assert_eq!(state.site, koun.name);
     assert_eq!(state.site_lat, koun.lat);
@@ -519,7 +525,7 @@ fn a_donor_on_another_site_is_not_offered() {
     let ctx = egui::Context::default();
     let mut donor = loop_with_frames(3, 0);
     donor.retarget_renders(RadarProduct::Reflectivity, 0.5);
-    donor.frames[0].texture = Some(dummy_texture(&ctx));
+    donor.frames[0].image = Some(dummy_texture(&ctx));
     let frame_ts = donor.frames[0].timestamp;
 
     assert_eq!(
@@ -543,7 +549,7 @@ fn donor_and_broadcast_agree_on_who_may_serve_a_frame() {
     let ctx = egui::Context::default();
     let mut donor = loop_with_frames(3, 0);
     donor.retarget_renders(RadarProduct::Reflectivity, 0.5);
-    donor.frames[1].texture = Some(dummy_texture(&ctx));
+    donor.frames[1].image = Some(dummy_texture(&ctx));
     let frame_ts = donor.frames[1].timestamp;
 
     let same_site = loop_with_frames(3, 0);
@@ -606,7 +612,7 @@ fn an_untextured_frame_is_not_donatable() {
     assert_eq!(donor.frame_donatable_to(frame_ts, &current), None);
 
     donor.frames[0].render_in_flight = false;
-    donor.frames[0].texture = Some(dummy_texture(&ctx));
+    donor.frames[0].image = Some(dummy_texture(&ctx));
     assert_eq!(donor.frame_donatable_to(frame_ts, &current), Some(0));
 }
 
@@ -624,7 +630,7 @@ fn a_textured_frame_does_not_accept_a_broadcast() {
         state.frame_accepting_broadcast(frame_ts, &current, same_sweep()),
         Some(0)
     );
-    state.frames[0].texture = Some(dummy_texture(&ctx));
+    state.frames[0].image = Some(dummy_texture(&ctx));
     assert_eq!(
         state.frame_accepting_broadcast(frame_ts, &current, same_sweep()),
         None
@@ -752,7 +758,7 @@ fn an_inactive_loop_takes_nothing_from_any_path() {
     let current = target(SITE, RadarProduct::Reflectivity, 0.5);
     let frame_ts = state.frames[0].timestamp;
     state.frames[0].render_in_flight = true;
-    state.frames[1].texture = Some(dummy_texture(&ctx));
+    state.frames[1].image = Some(dummy_texture(&ctx));
     let textured_ts = state.frames[1].timestamp;
 
     // Precondition: everything is accepted while the loop is active.
@@ -811,7 +817,7 @@ fn the_broadcast_accessor_hands_back_the_frame_that_was_chosen() {
     // may take a broadcast is the *second*, not the one a plain lookup would reach.
     let shared = state.frames[0].timestamp;
     state.frames[2].timestamp = shared;
-    state.frames[0].texture = Some(dummy_texture(&ctx));
+    state.frames[0].image = Some(dummy_texture(&ctx));
 
     assert_eq!(
         state.frames.iter().position(|f| f.timestamp == shared),
@@ -826,9 +832,9 @@ fn the_broadcast_accessor_hands_back_the_frame_that_was_chosen() {
     let frame = state
         .frame_accepting_broadcast_mut(shared, &current, same_sweep())
         .expect("frame handed back");
-    frame.texture = Some(dummy_texture(&ctx));
+    frame.image = Some(dummy_texture(&ctx));
     assert!(
-        state.frames[2].texture.is_some(),
+        state.frames[2].image.is_some(),
         "frame 2 received the texture"
     );
     assert_eq!(
@@ -883,7 +889,7 @@ fn eviction_keeps_exactly_the_render_set() {
     let ctx = egui::Context::default();
     let mut state = loop_with_frames(10, 4);
     for frame in &mut state.frames {
-        frame.texture = Some(dummy_texture(&ctx));
+        frame.image = Some(dummy_texture(&ctx));
     }
 
     state.evict_textures_outside_render_set(3);
@@ -892,7 +898,7 @@ fn eviction_keeps_exactly_the_render_set() {
         .frames
         .iter()
         .enumerate()
-        .filter(|(_, f)| f.texture.is_some())
+        .filter(|(_, f)| f.image.is_some())
         .map(|(i, _)| i)
         .collect();
     assert_eq!(
@@ -952,7 +958,7 @@ fn results_for_frames_not_awaiting_one_are_rejected() {
 
     // Never dispatched, or already satisfied by a sibling pane's broadcast.
     assert_eq!(state.frame_awaiting_render_result(frame_ts, &current), None);
-    state.frames[0].texture = Some(dummy_texture(&ctx));
+    state.frames[0].image = Some(dummy_texture(&ctx));
     assert_eq!(state.frame_awaiting_render_result(frame_ts, &current), None);
 
     // A timestamp that is not in the frame list at all (list rebuilt since dispatch).
@@ -969,14 +975,14 @@ fn eviction_drops_textured_frames_outside_the_render_set() {
     let ctx = egui::Context::default();
     let mut state = loop_with_frames(10, 0);
     for idx in [2, 3, 4, 5] {
-        state.frames[idx].texture = Some(dummy_texture(&ctx));
+        state.frames[idx].image = Some(dummy_texture(&ctx));
     }
     assert_eq!(state.render_set_indices(3), vec![0, 1, 9]);
 
     state.evict_textures_outside_render_set(3);
 
     assert!(
-        state.frames.iter().all(|f| f.texture.is_none()),
+        state.frames.iter().all(|f| f.image.is_none()),
         "none of the textured frames were in the render set"
     );
 }
@@ -986,13 +992,13 @@ fn eviction_is_a_noop_within_budget() {
     let ctx = egui::Context::default();
     let mut state = loop_with_frames(10, 0);
     // Textured, but deliberately far from the playhead and outside the render set.
-    state.frames[5].texture = Some(dummy_texture(&ctx));
-    state.frames[6].texture = Some(dummy_texture(&ctx));
+    state.frames[5].image = Some(dummy_texture(&ctx));
+    state.frames[6].image = Some(dummy_texture(&ctx));
 
     state.evict_textures_outside_render_set(3);
 
-    assert!(state.frames[5].texture.is_some());
-    assert!(state.frames[6].texture.is_some());
+    assert!(state.frames[5].image.is_some());
+    assert!(state.frames[6].image.is_some());
 }
 
 /// Frames outside the budgeted window around the playhead are never rendered,
@@ -1002,7 +1008,7 @@ fn frames_outside_the_render_set_do_not_block_readiness() {
     let ctx = egui::Context::default();
     let mut state = loop_with_frames(10, 0);
     for &idx in &state.render_set_indices(3) {
-        state.frames[idx].texture = Some(dummy_texture(&ctx));
+        state.frames[idx].image = Some(dummy_texture(&ctx));
     }
     assert!(state.render_set_settled(3, all_scans_available));
     assert!(

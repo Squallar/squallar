@@ -31,6 +31,33 @@ impl Arm {
         self.image_size * self.image_size * 4
     }
 
+    /// Bytes one **cross-section** loop frame's texture occupies: RGBA at
+    /// `SECTION_WIDTH × SECTION_HEIGHT`.
+    ///
+    /// Derived from `rustdar_radar::xsect`'s own constants rather than written
+    /// as `image_size² × 2`, so that the halving this relies on is read from the
+    /// definition instead of restated beside it. Section loop frames carry no
+    /// value or status plane, for the reason plan-view frames carry no value
+    /// grid — see `rustdar_egui::pane::SectionImageData`.
+    ///
+    /// The section raster's width is `IMAGE_SIZE`, which is a `cfg`-selected
+    /// constant, so it is reconstructed from this arm's `image_size` to keep
+    /// every row checkable from one host build — the reason `arms()` exists.
+    fn section_frame_bytes(&self) -> usize {
+        let width = self.image_size;
+        let height = self.image_size / 2;
+        assert_eq!(
+            (
+                rustdar_radar::xsect::SECTION_WIDTH,
+                rustdar_radar::xsect::SECTION_HEIGHT
+            ),
+            (IMAGE_SIZE, IMAGE_SIZE / 2),
+            "the section raster is no longer IMAGE_SIZE by IMAGE_SIZE/2, so the \
+             per-arm reconstruction above no longer describes it",
+        );
+        width * height * 4
+    }
+
     /// Frames that hold a texture at once. `evict_textures_outside_render_set`
     /// runs every dispatch with `MAX_LOOP_RENDER_BUDGET`, so a loop of
     /// `MAX_LOOP_FRAMES` keeps only the render set textured.
@@ -114,6 +141,70 @@ fn loop_frames_fit_the_target_texture_budget() {
             arm.image_size,
             total / (1024 * 1024),
             arm.loop_budget / (1024 * 1024),
+        );
+    }
+}
+
+/// The **section** row of the same table, executed.
+///
+/// A cross-section loop is budgeted separately because the budget is per pane
+/// and a screen can hold one of each — so this is not a second claim about the
+/// same memory, it is the claim about a second pane's.
+#[test]
+fn section_loop_frames_fit_the_target_texture_budget() {
+    for arm in arms() {
+        let total = arm.textured_frames() * arm.section_frame_bytes();
+        assert!(
+            total <= arm.loop_budget,
+            "{}: {} textured section frames x {} B = {} MiB, over the {} MiB budget",
+            arm.name,
+            arm.textured_frames(),
+            arm.section_frame_bytes(),
+            total / (1024 * 1024),
+            arm.loop_budget / (1024 * 1024),
+        );
+    }
+}
+
+/// A section loop can never be the binding case, and that is a property of the
+/// raster's shape rather than of the numbers chosen for it.
+///
+/// `SECTION_HEIGHT` is `IMAGE_SIZE / 2` against `SECTION_WIDTH`'s `IMAGE_SIZE`,
+/// so a section frame is exactly half a plan-view frame on every target. Pinned
+/// so that a future change to the section raster's aspect has to come here and
+/// re-argue the budget rather than quietly making a section loop the largest
+/// thing on the screen.
+#[test]
+fn a_section_loop_frame_is_half_a_plan_view_one() {
+    for arm in arms() {
+        assert_eq!(
+            arm.section_frame_bytes() * 2,
+            arm.loop_frame_bytes(),
+            "{}: a section loop frame is no longer half a plan-view one, so the \
+             section rows of the LOOP_TEXTURE_BUDGET_BYTES table are wrong",
+            arm.name,
+        );
+    }
+}
+
+/// The pacing cap is a real cap: at least one cut per pass, and fewer than the
+/// concurrent render budget on every arm.
+///
+/// The lower bound is what makes a section loop progress at all; the upper is
+/// the whole point of the constant, since a cap at or above
+/// `MAX_CONCURRENT_RENDERS` would let a dispatch pass run every extraction it
+/// could start back to back on one frame — which is the hitch the cap exists to
+/// prevent. See [`MAX_LOOP_SECTION_CUTS_PER_FRAME`].
+#[test]
+fn the_section_cut_cap_paces_rather_than_stalls() {
+    const { assert!(MAX_LOOP_SECTION_CUTS_PER_FRAME >= 1) };
+    for arm in arms() {
+        assert!(
+            MAX_LOOP_SECTION_CUTS_PER_FRAME <= arm.concurrent_renders,
+            "{}: the per-frame cut cap ({MAX_LOOP_SECTION_CUTS_PER_FRAME}) is \
+             above the concurrent render budget ({}), so it caps nothing",
+            arm.name,
+            arm.concurrent_renders,
         );
     }
 }

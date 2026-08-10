@@ -1249,6 +1249,163 @@ pub(super) fn latest_scan_time_for_site(
         .max()
 }
 
+impl super::App {
+    /// Cut one cross-section loop frame, off the frame thread, and reply on
+    /// `loop_section_sender`.
+    ///
+    /// The section counterpart of [`Self::spawn_loop_frame_render`], and it
+    /// keeps every one of that function's contracts:
+    ///
+    /// * **It takes a slot from the one shared render budget** and returns
+    ///   [`SectionDispatch::Busy`] without spending anything if none is free. A
+    ///   caller that marked the frame in flight anyway would never see a
+    ///   response — nothing would clear the flag — and the frame would stay
+    ///   blank for the life of the loop. The three-way answer is
+    ///   [`SectionDispatch`]'s own, and for its reason: "the budget is full, ask
+    ///   again" and "this volume has nothing to cut, retire the frame" are
+    ///   different instructions to the caller and used to be one `false`.
+    ///
+    /// [`SectionDispatch`]: crate::render_dispatch::SectionDispatch
+    /// [`SectionDispatch::Busy`]: crate::render_dispatch::SectionDispatch::Busy
+    /// * **One send site for both outcomes**, so [`ladder`] and the key describe
+    ///   the cut that was *dispatched* and stay true of a reply carrying no
+    ///   raster.
+    /// * **The raster is converted to egui's layout in `deliver`**, so the RGBA
+    ///   buffer and its `Color32` copy — 8 MiB apiece natively — never coexist
+    ///   in the channel.
+    ///
+    /// # What runs where
+    ///
+    /// `extract_volume_parts` runs here, on the frame thread, and the
+    /// rasterization runs on the worker. That is the same split the live section
+    /// pane has always used (`RenderDispatcher::spawn_section_render` calls its
+    /// `extract` closure inline for the same reason: on wasm the volume is only
+    /// reachable from the main thread, and the job wire carries a `RenderInput`,
+    /// not a `Scan`). What is new is the *count*, and that is why the caller
+    /// dispatches at most [`crate::constants::MAX_LOOP_SECTION_CUTS_PER_FRAME`]
+    /// of these per frame: measured on a real VCP-212 volume the extraction is
+    /// ~1.0 ms and the rasterization ~6.1 ms, so the frame thread pays about
+    /// what one live re-cut already costs it and the expensive half is off it
+    /// entirely. Without that cap a desktop dispatch pass would run six
+    /// extractions back to back on the frame that starts the loop.
+    ///
+    /// [`ladder`]: crate::channels::LoopSectionResponse::ladder
+    pub(super) fn spawn_loop_section_render(
+        &self,
+        req: crate::app::render::LoopSectionRequest,
+        scan: std::sync::Arc<nexrad_model::data::Scan>,
+    ) -> crate::render_dispatch::SectionDispatch {
+        use crate::render_dispatch::SectionDispatch;
+        // Destructured rather than taken as eight parameters, and the plan is
+        // what supplies them: the ladder the staleness test resolved, the key
+        // the frames are cut for and the coordinates the loop's geometry was
+        // captured at all belong to one decision made in `dispatch_loop_renders`.
+        // Loose arguments of the same types — two `f64`s and a `u64` — are
+        // exactly the shape a caller gets wrong silently.
+        let crate::app::render::LoopSectionRequest {
+            pane_idx,
+            frame_idx: _,
+            timestamp,
+            target,
+            key,
+            ladder,
+            site_lat: lat,
+            site_lon: lon,
+        } = req;
+        let current = self.render.renders_in_flight.load(Ordering::Relaxed);
+        if current >= MAX_CONCURRENT_RENDERS {
+            return SectionDispatch::Busy;
+        }
+
+        let product = target.product;
+        // Read off the dispatcher, never from the caller, so the vector a frame
+        // is *keyed* on cannot differ from the one it is derived with — the
+        // rule `SectionInputKey::of` states and the reason `SectionLoopKey`
+        // carries it at all.
+        let motion = (product == rustdar_radar::types::RadarProduct::StormRelativeVelocity)
+            .then(|| self.render.storm_motion_override_kt())
+            .flatten();
+        debug_assert_eq!(
+            key,
+            rustdar_egui::pane::SectionLoopKey::new(key.line, motion),
+            "the frame's key must name the vector the extraction is about to use",
+        );
+
+        let sweeps: Vec<&nexrad_model::data::Sweep> = scan.sweeps().iter().collect();
+        let Some(input) = rustdar_radar::render_input::RenderInput::extract_volume_parts(
+            scan.coverage_pattern(),
+            &sweeps,
+            product,
+            lat,
+            lon,
+            motion,
+        ) else {
+            // This volume carries no field to cut under this product. Nothing
+            // was spawned and no slot was taken, so the caller retires the frame
+            // rather than waiting on a reply that will never come.
+            return SectionDispatch::NoPayload;
+        };
+
+        self.render
+            .renders_in_flight
+            .fetch_add(1, Ordering::Relaxed);
+        let guard = RenderGuard(std::sync::Arc::clone(&self.render.renders_in_flight));
+
+        let request = rustdar_radar::xsect::SectionRequest {
+            start: (key.line.a().lat, key.line.a().lon),
+            end: (key.line.b().lat, key.line.b().lon),
+            top_km_msl: None,
+            product,
+        };
+        let job = crate::offload::Job::Described(crate::offload::JobRequest::Section {
+            input: Box::new(input),
+            request,
+        });
+        let sender = self.channels.loop_section_sender.clone();
+        let window = self.window.clone();
+        crate::offload::offload_job("loop-section", job, move |output| {
+            let _guard = guard;
+            // An output of another kind is `None`, which takes the same
+            // "nothing to draw" path a refused cut does. This consumer is
+            // shaped for a `SECTION_WIDTH × SECTION_HEIGHT` raster and must
+            // never be handed a plan view's — see `JobOutput::section`.
+            let cut = output.and_then(crate::offload::JobOutput::section);
+            let (image, axes, tilt_elevations_deg) = match cut {
+                Some(cut) => match loop_section_image(cut.image()) {
+                    Some(image) => (
+                        Some(image),
+                        Some(*cut.axes()),
+                        cut.tilt_elevations_deg().to_vec(),
+                    ),
+                    None => {
+                        log::error!(
+                            "Loop section for pane {pane_idx} produced {} bytes, expected {}",
+                            cut.image().len(),
+                            rustdar_radar::xsect::SECTION_WIDTH
+                                * rustdar_radar::xsect::SECTION_HEIGHT
+                                * 4
+                        );
+                        (None, None, Vec::new())
+                    }
+                },
+                None => (None, None, Vec::new()),
+            };
+            let _ = sender.send(crate::channels::LoopSectionResponse {
+                pane_idx,
+                timestamp,
+                target,
+                key,
+                ladder,
+                image,
+                axes,
+                tilt_elevations_deg,
+            });
+            super::notify_redraw(&window);
+        });
+        SectionDispatch::Dispatched
+    }
+}
+
 /// Convert a renderer RGBA buffer into egui's pixel layout, or `None` if it is not
 /// the `IMAGE_SIZE²` image the renderer is supposed to produce.
 ///
@@ -1265,6 +1422,26 @@ fn loop_frame_image(rgba: &[u8]) -> Option<egui::ColorImage> {
     }
     Some(egui::ColorImage::from_rgba_unmultiplied(
         [IMAGE_SIZE, IMAGE_SIZE],
+        rgba,
+    ))
+}
+
+/// [`loop_frame_image`] for a cross-section raster, against the section's own
+/// `SECTION_WIDTH × SECTION_HEIGHT` shape.
+///
+/// A separate function rather than a length parameter on the one above, because
+/// the whole point of both is that the shape is a *constant of the view* and not
+/// something a caller supplies: a caller free to pass a length is a caller free
+/// to pass the other view's, and `ColorImage::from_rgba_unmultiplied` would then
+/// assert on the worker with the frame left in flight for ever. The two
+/// constants are named at the two call sites and nowhere else.
+fn loop_section_image(rgba: &[u8]) -> Option<egui::ColorImage> {
+    use rustdar_radar::xsect::{SECTION_HEIGHT, SECTION_WIDTH};
+    if rgba.len() != SECTION_WIDTH * SECTION_HEIGHT * 4 {
+        return None;
+    }
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        [SECTION_WIDTH, SECTION_HEIGHT],
         rgba,
     ))
 }
@@ -1314,8 +1491,20 @@ fn begin_loop_for_pane(
     // loop this call is replacing. The scan cache is global and deliberately kept.
     loop_mgr.remove_pending(pane_idx);
 
-    panes[pane_idx].loop_state =
-        rustdar_egui::pane::LoopPlaybackState::new_for_loop(lookback_secs, &radar_site);
+    // The view comes off the pane's own kind. A pane that cannot loop at all is
+    // refused above this by `Gui::loop_sync_targets` and the timeline's own
+    // gate; if one reached here anyway it would build a loop whose frames every
+    // predicate refuses, which is a spinner that never finishes — so it is
+    // refused here too, where the kind is in hand.
+    let kind = panes[pane_idx].kind();
+    if !kind.can_loop() {
+        return None;
+    }
+    panes[pane_idx].loop_state = rustdar_egui::pane::LoopPlaybackState::new_for_loop(
+        lookback_secs,
+        &radar_site,
+        kind.render_view(),
+    );
 
     Some(LoopScanRequest {
         site: radar_site.name.to_string(),
@@ -1384,7 +1573,7 @@ fn append_polled_frame(
         insert_pos,
         LoopFrame {
             timestamp,
-            texture: None,
+            image: None,
             render_in_flight: false,
             render_failed: false,
         },

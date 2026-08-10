@@ -1,6 +1,7 @@
 use crate::constants::{
     DEFAULT_LOOP_SPEED_FPS, MAX_CONCURRENT_LOOP_DOWNLOADS, MAX_CONCURRENT_RENDERS, MAX_LOOP_FRAMES,
-    MAX_LOOP_RENDER_BUDGET, MAX_LOOP_SPEED_FPS, MIN_LOOP_SPEED_FPS,
+    MAX_LOOP_RENDER_BUDGET, MAX_LOOP_SECTION_CUTS_PER_FRAME, MAX_LOOP_SPEED_FPS,
+    MIN_LOOP_SPEED_FPS,
 };
 use crate::loop_downloads::{
     FramePlan, L3FrameState, LoopFrameData, PendingDownloads, PendingL3Pairings,
@@ -167,6 +168,7 @@ impl super::App {
         self.poll_loop_l3_list_results();
         self.poll_loop_l3_fetch_results();
         self.poll_loop_render_results(&ctx);
+        self.poll_loop_section_results(&ctx);
         self.advance_loop_playback();
         self.dispatch_pane_renders(&ctx);
         self.dispatch_section_renders();
@@ -1795,7 +1797,9 @@ impl super::App {
                     // pane holding this texture agrees about what it depicts and
                     // where it sits. The receiver's own `site_lat`/`site_lon` are
                     // never consulted here — see `LoopRenderResponse::site_lat`.
-                    sframe.texture = Some(rendered_image(&rr, &texture));
+                    sframe.image = Some(rustdar_egui::pane::LoopFrameImage::PlanView(
+                        rendered_image(&rr, &texture),
+                    ));
                 }
             }
         }
@@ -1843,13 +1847,13 @@ impl super::App {
 
     /// Start loop playback for panes that are ready, synchronizing when sync_layers is on.
     ///
-    /// # Why a pane with no plan view is not merely skipped but must be
+    /// # Why a pane that cannot loop is not merely skipped but must be
     ///
     /// The sync rule below is "hold every looping pane until all of them are
     /// ready", and a pane whose frames nothing renders can never become ready —
     /// `dispatch_loop_renders` neither fills its frames nor marks them failed. So
-    /// one such pane in `not_ready_panes`, with Sync Layers on, stops **every map
-    /// pane's** loop from ever starting. The symptom is in the other panes, which
+    /// one such pane in `not_ready_panes`, with Sync Layers on, stops **every
+    /// other looping pane's** loop from ever starting. The symptom is in the other panes, which
     /// is what makes it the worst of these: a deadlock introduced by the very
     /// filter that protects the render path.
     ///
@@ -1866,7 +1870,7 @@ impl super::App {
         let mut ready_panes: Vec<usize> = Vec::new();
         let mut not_ready_panes: Vec<usize> = Vec::new();
         for idx in 0..pane_count {
-            if self.gui.pane_has_no_plan_view(idx) {
+            if self.gui.pane_cannot_loop(idx) {
                 continue;
             }
             let Some(pane) = self.gui.pane(idx) else {
@@ -1934,7 +1938,7 @@ impl super::App {
                 let num_frames = ls.frames.len();
                 for offset in 1..=num_frames {
                     let candidate = (ls.current_frame + offset) % num_frames;
-                    if ls.frames[candidate].texture.is_some() {
+                    if ls.frames[candidate].image.is_some() {
                         ls.current_frame = candidate;
                         break;
                     }
@@ -1946,14 +1950,21 @@ impl super::App {
     /// Dispatch renders for loop frames around the playhead that have
     /// downloaded scan data but no rendered texture yet.
     ///
-    /// Both loops below skip panes with no plan view
-    /// ([`Gui::pane_has_no_plan_view`](rustdar_egui::Gui::pane_has_no_plan_view)).
-    /// A loop frame *is* a rendered plan-view tilt, so there is nothing to
-    /// dispatch for a section or a volume pane and nothing to clone into one —
-    /// and the first loop's replan would otherwise start a download queue for a
-    /// pane nobody is drawing. `loop_sync_targets` keeps such a pane out of the
-    /// enable action in the first place; this is the other half, for the pane
-    /// that was converted while its loop was already running.
+    /// Both loops below skip panes that cannot loop
+    /// ([`Gui::pane_cannot_loop`](rustdar_egui::Gui::pane_cannot_loop)) — today
+    /// the 3D volume, whose picture is raymarched from the eye and so cannot be
+    /// cached per frame. There is nothing to dispatch for such a pane and
+    /// nothing to clone into one, and the first loop's replan would otherwise
+    /// start a download queue for a pane nobody is drawing. `loop_sync_targets`
+    /// keeps it out of the enable action in the first place; this is the other
+    /// half, for the pane that was converted while its loop was already running.
+    ///
+    /// The predicate is deliberately **not** `pane_has_no_plan_view`, which is
+    /// what it was while a loop frame could only be a plan-view tilt. A
+    /// cross-section pane has no plan view *and* loops, and the second pass
+    /// below branches on the loop's own
+    /// [`view`](rustdar_egui::pane::LoopPlaybackState::view) to decide which
+    /// kind of picture each of its frames wants.
     ///
     /// The first pass also finishes the teardown `PaneState::set_kind` starts.
     /// That setter clears a converted pane's `loop_state`, which is the half a
@@ -1967,12 +1978,17 @@ impl super::App {
         // bytes nothing is fetching. Collected here and acted on below, because
         // re-deriving a queue needs `loop_mgr` while the pane is borrowed.
         let mut replan: Vec<(usize, rustdar_radar::types::RadarProduct)> = Vec::new();
+        // Read once, outside the pane loop, so every section loop retargeted in
+        // this pass is keyed to the same vector the cuts it is about to dispatch
+        // will be derived with — the rule `SectionInputKey::of` states, applied
+        // across panes instead of within one dispatch.
+        let motion_override = self.render.storm_motion_override_kt();
         for pane_idx in 0..self.gui.pane_count() {
-            if self.gui.pane_has_no_plan_view(pane_idx) {
+            if self.gui.pane_cannot_loop(pane_idx) {
                 // The host-side half of the loop teardown. Without it the pane's
                 // queue outlives its loop and goes on spending the *shared*
                 // download budget on volumes nobody will draw, starving the live
-                // map panes beside it.
+                // panes beside it.
                 self.loop_mgr.remove_pending(pane_idx);
                 continue;
             }
@@ -1981,6 +1997,19 @@ impl super::App {
             };
             let product = pane.selected_product;
             let elevation = pane.selected_elevation;
+            // The section half of the key, for a section loop: the line the
+            // frames are cut along and the vector they are derived with. `None`
+            // for a plan-view loop, and `None` for a section pane that has lost
+            // its line — which counts as a change and discards the frames, the
+            // safe direction.
+            let section_key = pane.cross_section().and_then(|s| s.line).map(|line| {
+                rustdar_egui::pane::SectionLoopKey::new(
+                    line,
+                    (product == rustdar_radar::types::RadarProduct::StormRelativeVelocity)
+                        .then_some(motion_override)
+                        .flatten(),
+                )
+            });
             let ls = &mut pane.loop_state;
             if !ls.is_active() || ls.frames.is_empty() {
                 continue;
@@ -1989,8 +2018,11 @@ impl super::App {
             // The pane's product/elevation combo boxes write straight through, so
             // pick the change up here: every texture depicts the old product and
             // every render_failed flag judged the old product. Invalidating leaves
-            // nothing to evict.
-            if ls.retarget_renders(product, elevation) {
+            // nothing to evict. The section half moves for the same kind of
+            // reason and is discarded by the same call — a redrawn line or an
+            // edited storm motion vector makes every frame a picture of
+            // something else.
+            if ls.retarget_renders_for(product, elevation, section_key) {
                 log::debug!(
                     "Loop: pane {} retargeted to {:?} at {:.1}°, re-rendering all frames",
                     pane_idx,
@@ -2038,8 +2070,13 @@ impl super::App {
         let sync = self.gui.is_sync_layers();
         let pane_count = self.gui.pane_count();
 
+        // Cross-section cuts to dispatch, and the running count that paces them.
+        // The cap is across *panes*, not per pane, because what it protects is
+        // the frame thread — see `MAX_LOOP_SECTION_CUTS_PER_FRAME`.
+        let mut to_cut: Vec<LoopSectionRequest> = Vec::new();
+
         for pane_idx in 0..pane_count {
-            if self.gui.pane_has_no_plan_view(pane_idx) {
+            if self.gui.pane_cannot_loop(pane_idx) {
                 continue;
             }
             let Some(pane) = self.gui.pane(pane_idx) else {
@@ -2064,9 +2101,110 @@ impl super::App {
             // cannot drift apart (see `LoopPlaybackState::render_set_settled`).
             let indices = ls.render_set_indices(MAX_LOOP_RENDER_BUDGET);
 
+            // A section loop wants a different picture per frame and identifies
+            // it with different things, so it plans separately. The branch is on
+            // the *loop's* view rather than on the pane's kind because that is
+            // the value every acceptance test downstream compares against, and
+            // two ways of asking one question is how they come to disagree.
+            if ls.view == rustdar_radar::types::RenderView::CrossSection {
+                let Some(key) = ls.section_key.clone() else {
+                    // A section loop with no line has nothing to cut and its
+                    // volumes download perfectly well, so nothing would ever
+                    // settle the batch and the loop would sit in `Rendering` for
+                    // the session. `PaneState::can_loop` keeps this unreachable
+                    // by refusing to start such a loop at all; retiring the
+                    // frames here is the second line, and it routes into the
+                    // existing "no frame can be rendered" path that switches the
+                    // loop off with a warning.
+                    for &idx in &indices {
+                        to_mark_failed.push((pane_idx, idx));
+                    }
+                    continue;
+                };
+                for &idx in &indices {
+                    let frame = &ls.frames[idx];
+                    if frame.render_in_flight || frame.render_failed {
+                        continue;
+                    }
+                    // The ladder this frame's own scan resolves *now*. Both the
+                    // staleness test and the cut are keyed on it, so they cannot
+                    // disagree about which ladder the picture is of.
+                    let ladder = match frame_section(&self.loop_mgr, &target, frame.timestamp) {
+                        FrameSection::At(ladder) => ladder,
+                        FrameSection::Unrenderable => {
+                            to_mark_failed.push((pane_idx, idx));
+                            continue;
+                        }
+                        FrameSection::Pending => continue,
+                    };
+                    // A frame already cut from *this* ladder is done. One cut
+                    // from a different one is stale and re-cut: the newest
+                    // frame's volume is re-cached under the same
+                    // `(site, timestamp)` key as more of it seals, so a section
+                    // cut from a two-rung ladder can otherwise stand at the head
+                    // of a loop while the real volume grows to fourteen. This is
+                    // the same fingerprint, and the same reasoning, as
+                    // `SectionTarget::ladder` on the live pane — reused rather
+                    // than a second notion of section staleness.
+                    if frame
+                        .image
+                        .as_ref()
+                        .and_then(rustdar_egui::pane::LoopFrameImage::section)
+                        .is_some_and(|cut| cut.ladder == ladder)
+                    {
+                        continue;
+                    }
+
+                    // Take a sibling's raster instead of cutting, on the same
+                    // terms the plan-view path donates on: same target, same key,
+                    // and — standing in for the snapped sweep a section has no
+                    // equivalent of — the same ladder.
+                    if sync
+                        && let Some((src_pane, src_frame)) = find_section_donor(
+                            (0..pane_count)
+                                .filter_map(|i| self.gui.pane(i).map(|p| (i, &p.loop_state))),
+                            pane_idx,
+                            frame.timestamp,
+                            &target,
+                            &key,
+                            ladder,
+                        )
+                    {
+                        to_clone.push(LoopCloneRequest {
+                            dest_pane: pane_idx,
+                            dest_frame: idx,
+                            src_pane,
+                            src_frame,
+                        });
+                        continue;
+                    }
+
+                    if to_cut.len() >= MAX_LOOP_SECTION_CUTS_PER_FRAME {
+                        // Out of frame-thread budget for this pass. Left alone,
+                        // not retired: the next pass asks again, and the pane
+                        // goes on showing whatever has already landed.
+                        break;
+                    }
+                    if sync && section_already_queued(&to_cut, frame.timestamp, &target, &key) {
+                        continue;
+                    }
+                    to_cut.push(LoopSectionRequest {
+                        pane_idx,
+                        frame_idx: idx,
+                        timestamp: frame.timestamp,
+                        target: target.clone(),
+                        key: key.clone(),
+                        ladder,
+                        site_lat,
+                        site_lon,
+                    });
+                }
+                continue;
+            }
+
             for &idx in &indices {
                 let frame = &ls.frames[idx];
-                if frame.texture.is_some() || frame.render_in_flight || frame.render_failed {
+                if frame.image.is_some() || frame.render_in_flight || frame.render_failed {
                     continue;
                 }
 
@@ -2148,16 +2286,16 @@ impl super::App {
                 let Some(sframe) = src.loop_state.frames.get(req.src_frame) else {
                     continue;
                 };
-                let Some(tex) = sframe.texture.clone() else {
+                let Some(image) = sframe.image.clone() else {
                     continue;
                 };
-                tex
+                image
             };
             let Some(dest) = self.gui.pane_mut(req.dest_pane) else {
                 continue;
             };
             if let Some(dframe) = dest.loop_state.frames.get_mut(req.dest_frame) {
-                dframe.texture = Some(cloned);
+                dframe.image = Some(cloned);
             }
         }
 
@@ -2195,6 +2333,117 @@ impl super::App {
 
             if spawned && let Some(pane) = self.gui.pane_mut(req.pane_idx) {
                 pane.loop_state.frames[req.frame_idx].render_in_flight = true;
+            }
+        }
+
+        // Cut the queued sections. Same three rules as the loop above: the
+        // budget is re-read before every spawn because it is shared with static
+        // renders, the frame is marked in flight only if a job was actually
+        // started, and missing data is a skipped frame the next pass retries.
+        for req in to_cut {
+            if self.render.renders_in_flight.load(Ordering::Relaxed) >= MAX_CONCURRENT_RENDERS {
+                break;
+            }
+            let Some(LoopFrameData::Volume(scan)) =
+                frame_data(&self.loop_mgr, &req.target, req.timestamp)
+            else {
+                // A section is cut from a volume. A loop whose product reads
+                // Level III objects instead reaches here with `Products`, and
+                // there is no vertical structure in one to slice — the frame is
+                // retired, and `settle_loop_phase` switches a loop whose frames
+                // are all retired off.
+                if let Some(pane) = self.gui.pane_mut(req.pane_idx)
+                    && let Some(frame) = pane.loop_state.frames.get_mut(req.frame_idx)
+                {
+                    frame.render_failed = true;
+                }
+                continue;
+            };
+            let (pane_idx, frame_idx) = (req.pane_idx, req.frame_idx);
+            match self.spawn_loop_section_render(req, scan) {
+                crate::render_dispatch::SectionDispatch::Dispatched => {
+                    if let Some(pane) = self.gui.pane_mut(pane_idx)
+                        && let Some(frame) = pane.loop_state.frames.get_mut(frame_idx)
+                    {
+                        frame.render_in_flight = true;
+                    }
+                }
+                // Nothing was taken and nothing is wrong: ask again next frame.
+                crate::render_dispatch::SectionDispatch::Busy => {}
+                // This volume carries no field to cut under this product. Retire
+                // the frame so the dispatcher stops retrying it and readiness
+                // stops waiting on it — the same answer `FrameSweep::Unrenderable`
+                // gets on the plan-view path.
+                crate::render_dispatch::SectionDispatch::NoPayload => {
+                    if let Some(pane) = self.gui.pane_mut(pane_idx)
+                        && let Some(frame) = pane.loop_state.frames.get_mut(frame_idx)
+                    {
+                        frame.render_failed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Poll for finished cross-section loop cuts and upload their rasters.
+    ///
+    /// The section counterpart of [`Self::poll_loop_render_results`], with the
+    /// same two steps in the same order: vet-and-place through
+    /// [`accept_section_result`], then — under Sync Layers — offer the finished
+    /// raster to every sibling section loop cut for the same thing.
+    fn poll_loop_section_results(&mut self, ctx: &egui::Context) {
+        while let Ok(mut sr) = self.channels.loop_section_receiver.try_recv() {
+            let origin_pane = sr.pane_idx;
+            let Some(pane) = self.gui.pane_mut(origin_pane) else {
+                continue;
+            };
+
+            let counter = &mut self.texture_counter;
+            let Some(placed) =
+                accept_section_result(&mut pane.loop_state, &mut sr, |color_image| {
+                    *counter += 1;
+                    ctx.load_texture(
+                        format!("loop_section_{counter}"),
+                        color_image,
+                        egui::TextureOptions::NEAREST,
+                    )
+                })
+            else {
+                continue;
+            };
+
+            if !self.gui.is_sync_layers() {
+                continue;
+            }
+            for sibling_idx in 0..self.gui.pane_count() {
+                if sibling_idx == origin_pane || self.gui.pane_cannot_loop(sibling_idx) {
+                    continue;
+                }
+                // The receiver's own half of the ladder comparison, resolved from
+                // the receiver's own scan and never filled in from the reply —
+                // the same discipline `own_sweep` enforces on the plan-view side,
+                // where taking the sender's value would compare it to itself.
+                let own_ladder = match frame_section(&self.loop_mgr, &sr.target, sr.timestamp) {
+                    FrameSection::At(ladder) => Some(ladder),
+                    FrameSection::Unrenderable | FrameSection::Pending => None,
+                };
+                let Some(sibling) = self.gui.pane_mut(sibling_idx) else {
+                    continue;
+                };
+                let Some(sframe) = sibling.loop_state.frame_accepting_section_broadcast_mut(
+                    sr.timestamp,
+                    &sr.target,
+                    &sr.key,
+                    sr.ladder,
+                    own_ladder,
+                ) else {
+                    continue;
+                };
+                // Its own cut, if any, is now redundant: same key, same ladder,
+                // same volume means the same raster, so its reply is dropped on
+                // arrival by the target check.
+                sframe.render_in_flight = false;
+                sframe.image = Some(rustdar_egui::pane::LoopFrameImage::Section(placed.clone()));
             }
         }
     }
@@ -2309,7 +2558,7 @@ fn accept_scan_listing(
         .iter()
         .map(|(ts, _id)| rustdar_egui::pane::LoopFrame {
             timestamp: *ts,
-            texture: None,
+            image: None,
             render_in_flight: false,
             render_failed: false,
         })
@@ -2358,7 +2607,7 @@ fn settle_loop_phase(
     if !loop_batch_settled(loop_mgr, ls, budget) || !loop_mgr.is_pane_done(pane_idx) {
         return false;
     }
-    if ls.frames.iter().any(|f| f.texture.is_some()) {
+    if ls.frames.iter().any(|f| f.image.is_some()) {
         ls.phase = rustdar_egui::pane::LoopPhase::Ready;
         return false;
     }
@@ -2439,8 +2688,50 @@ fn accept_render_result(
     };
 
     let texture = upload(color_image);
-    frame.texture = Some(rendered_image(rr, &texture));
+    frame.image = Some(rustdar_egui::pane::LoopFrameImage::PlanView(
+        rendered_image(rr, &texture),
+    ));
     Some(texture)
+}
+
+/// [`accept_render_result`] for a finished cross-section cut.
+///
+/// Same shape and same contract: one resolved frame, vetted and filled in one
+/// step, with `upload` run only once both checks have passed so a refused reply
+/// costs no GPU texture. The vet is
+/// [`LoopPlaybackState::frame_awaiting_section_result_mut`], which tests the
+/// loop's view as well as both halves of the key — a plan-view loop and a
+/// section loop on one site, product and elevation produce `RenderTarget`s that
+/// `matches` calls equal, and without the view test one would place the other's
+/// raster.
+///
+/// `sr` is taken by `&mut` so the raster and the tilt list can be `take`n rather
+/// than the whole reply moved, leaving `&sr` available to the broadcast below —
+/// the same reason [`accept_render_result`] does it.
+fn accept_section_result(
+    ls: &mut rustdar_egui::pane::LoopPlaybackState,
+    sr: &mut crate::channels::LoopSectionResponse,
+    upload: impl FnOnce(egui::ColorImage) -> egui::TextureHandle,
+) -> Option<rustdar_egui::pane::SectionImageData> {
+    let frame = ls.frame_awaiting_section_result_mut(sr.timestamp, &sr.target, &sr.key)?;
+    frame.render_in_flight = false;
+
+    // The axes travel with the raster and are `None` exactly when it is, so a
+    // reply carrying one without the other is a bug upstream rather than a
+    // frame to draw with the previous frame's scales.
+    let (Some(color_image), Some(axes)) = (sr.image.take(), sr.axes) else {
+        frame.render_failed = true;
+        return None;
+    };
+
+    let image = rustdar_egui::pane::SectionImageData {
+        texture: upload(color_image),
+        axes,
+        tilt_elevations_deg: std::mem::take(&mut sr.tilt_elevations_deg),
+        ladder: sr.ladder,
+    };
+    frame.image = Some(rustdar_egui::pane::LoopFrameImage::Section(image.clone()));
+    Some(image)
 }
 
 /// Record a finished download: clear its in-flight mark and cache the scan.
@@ -2660,6 +2951,120 @@ fn loop_batch_settled(
     })
 }
 
+/// What one frame's own volume makes of a section loop's line.
+///
+/// The section counterpart of [`FrameSweep`], and it answers the same three
+/// questions — renderable, gap, or waiting — because every caller downstream
+/// needs exactly those three. What it carries in the renderable arm differs:
+/// a plan view carries the sweep its scan snapped the selection to, and a
+/// section, which cuts across every tilt, carries the fingerprint of the ladder
+/// it would cut along.
+enum FrameSection {
+    /// The ladder fingerprint this frame would be cut from.
+    At(u64),
+    /// The volume is here and carries nothing to cut under this product.
+    /// Terminal.
+    Unrenderable,
+    /// The volume has not arrived yet.
+    Pending,
+}
+
+/// The ladder frame `timestamp` of a section loop keyed to `target` would be cut
+/// from.
+///
+/// [`rustdar_radar::sampler::ladder_fingerprint`] over the frame's **own** cached
+/// volume, which is the same function the live section pane's staleness key uses
+/// over the merged current volume — one notion of "which cut is each rung made
+/// of", asked of two different volumes. Walks sweep metadata only, so it costs
+/// nothing to ask once per frame per dispatch pass.
+///
+/// `target.site` is where the loop's geometry came from and so the only site
+/// whose data may be cut with it, exactly as in [`frame_data`].
+fn frame_section(
+    loop_mgr: &crate::loop_downloads::LoopDownloadManager,
+    target: &RenderTarget,
+    timestamp: chrono::NaiveDateTime,
+) -> FrameSection {
+    let Some(scan) = loop_mgr.get_cached(&target.site, &timestamp) else {
+        return FrameSection::Pending;
+    };
+    let sweeps: Vec<&nexrad_model::data::Sweep> = scan.sweeps().iter().collect();
+    match rustdar_radar::sampler::ladder_fingerprint(
+        scan.coverage_pattern(),
+        &sweeps,
+        target.product,
+    ) {
+        Some(ladder) => FrameSection::At(ladder),
+        None => FrameSection::Unrenderable,
+    }
+}
+
+/// A cross-section loop frame the dispatcher intends to cut.
+///
+/// Also what `App::spawn_loop_section_render` is handed, whole: every field is
+/// part of one decision this dispatcher made, and passing them loose would put
+/// two `f64`s and a `u64` next to each other in a call signature.
+pub(crate) struct LoopSectionRequest {
+    pub(crate) pane_idx: usize,
+    pub(crate) frame_idx: usize,
+    pub(crate) timestamp: chrono::NaiveDateTime,
+    /// The site/product half of the key this cut is for.
+    pub(crate) target: RenderTarget,
+    /// The line/storm-motion half.
+    pub(crate) key: rustdar_egui::pane::SectionLoopKey,
+    /// The ladder this frame's own volume resolves, resolved once during
+    /// planning and carried through so the staleness test, the donor search and
+    /// the dispatch stamp all read the one value.
+    pub(crate) ladder: u64,
+    pub(crate) site_lat: f64,
+    pub(crate) site_lon: f64,
+}
+
+/// A section frame another pane's loop can donate to `receiver`, as
+/// `(pane, frame)`.
+///
+/// [`find_donor`] for sections. `target`, `key` and `wanted_ladder` are the
+/// **receiver's**, for the reason that one gives: asking each candidate about
+/// its own key would compare it to itself.
+fn find_section_donor<'a>(
+    loops: impl IntoIterator<Item = (usize, &'a rustdar_egui::pane::LoopPlaybackState)>,
+    receiver: usize,
+    timestamp: chrono::NaiveDateTime,
+    target: &RenderTarget,
+    key: &rustdar_egui::pane::SectionLoopKey,
+    wanted_ladder: u64,
+) -> Option<(usize, usize)> {
+    loops
+        .into_iter()
+        .filter(|&(idx, _)| idx != receiver)
+        .find_map(|(idx, ls)| {
+            Some((
+                idx,
+                ls.section_frame_donatable_to(timestamp, target, key, wanted_ladder)?,
+            ))
+        })
+}
+
+/// Whether a cut for this frame and key is already queued in this dispatch pass.
+///
+/// [`render_already_queued`] for sections, and it weighs exactly what
+/// [`LoopPlaybackState::frame_accepting_section_broadcast`] weighs — suppression
+/// is a promise of acceptance, so a term in one and not the other is a frame
+/// served by neither. The ladder is not a term because two loops sharing one
+/// `(site, timestamp)` cache entry share one volume and so one ladder, which is
+/// the same argument [`LoopPlaybackState::frame_donatable_to`] makes about the
+/// snapped sweep.
+fn section_already_queued(
+    queued: &[LoopSectionRequest],
+    timestamp: chrono::NaiveDateTime,
+    target: &RenderTarget,
+    key: &rustdar_egui::pane::SectionLoopKey,
+) -> bool {
+    queued
+        .iter()
+        .any(|r| r.timestamp == timestamp && r.target.matches(target) && &r.key == key)
+}
+
 /// A loop frame render the dispatcher intends to spawn.
 struct LoopRenderRequest {
     pane_idx: usize,
@@ -2780,6 +3185,11 @@ mod level3_poll_tests;
 #[path = "app_render/loop_dispatch_tests.rs"]
 #[cfg(test)]
 mod loop_dispatch_tests;
+
+/// The cross-section loop's dispatch, placement and frame-thread pacing.
+#[path = "app_render/loop_section_tests.rs"]
+#[cfg(test)]
+mod loop_section_tests;
 
 /// What the loop timer does with a playback speed no slider could have set.
 #[path = "app_render/loop_interval_tests.rs"]

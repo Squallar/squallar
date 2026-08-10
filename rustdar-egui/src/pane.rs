@@ -2,7 +2,7 @@ use crate::overlay_cache::OverlayTextureCache;
 use chrono::NaiveDateTime;
 use rustdar_overlays::render::overlay_state::OverlayKind;
 use rustdar_radar::sites::RadarSite;
-use rustdar_radar::types::{RadarProduct, ScanInfo};
+use rustdar_radar::types::{RadarProduct, RenderView, ScanInfo};
 use std::collections::HashMap;
 use std::sync::Arc;
 use walkers::MapMemory;
@@ -36,12 +36,117 @@ pub struct RadarImageData {
     pub value_data: Arc<Vec<f32>>,
 }
 
+/// Holds a rendered cross-section raster and the little that has to travel with
+/// it for the pane to draw honest axes over it.
+///
+/// The counterpart of [`RadarImageData`] for a section loop, and it carries the
+/// same amount of truth: what the picture is *of*, so the frame beneath the
+/// pointer and the frame on the glass cannot describe different volumes.
+///
+/// # What it deliberately does not carry
+///
+/// The `CrossSection` behind the raster is ~18 MB natively — an RGBA plane, an
+/// `f32` value plane and a status plane — and only the value and status planes
+/// serve the hover readout. Retaining them per frame would cost
+/// `MAX_LOOP_RENDER_BUDGET` × 18 MB (540 MB on desktop) to answer a question
+/// nobody can ask of a moving picture. So a section loop frame drops them, and
+/// the pane's hover readout goes quiet while a loop runs — exactly as a plan-view
+/// loop frame's does, which carries an empty `value_data` for the same reason
+/// (see `App::rendered_image`).
+///
+/// [`axes`](Self::axes) and [`tilt_elevations_deg`](Self::tilt_elevations_deg)
+/// are kept because they are *labels on this picture*: the height and distance
+/// scales, and the tilt ladder drawn over it. A few dozen floats, and without
+/// them a loop would animate the raster under the previous frame's axes.
+#[derive(Clone)]
+pub struct SectionImageData {
+    pub texture: egui::TextureHandle,
+    /// The height/distance scales this raster was cut against.
+    pub axes: rustdar_radar::xsect::SectionAxes,
+    /// Where the ladder's rungs are, in degrees of beam elevation.
+    pub tilt_elevations_deg: Vec<f64>,
+    /// The fingerprint of the tilt ladder this frame was cut from, from
+    /// [`rustdar_radar::sampler::ladder_fingerprint`].
+    ///
+    /// **The one thing that can change under a loop frame.** A frame's scan is
+    /// normally immutable once downloaded, which is what makes a loop frame's
+    /// picture permanent — but the newest frame is not: the live poll re-caches
+    /// its volume under the same `(site, timestamp)` key as more of it seals, so
+    /// a section cut from a two-rung ladder can sit at the head of a loop while
+    /// the real volume grows to fourteen.
+    ///
+    /// This is the *same* notion of section staleness the live pane already
+    /// uses — `SectionTarget::ladder` — reused rather than reinvented, and for
+    /// the identical reason: it moves when a rung's chosen sweep or the declared
+    /// pattern moves, and holds still for the seals that change neither.
+    pub ladder: u64,
+}
+
+/// A finished loop frame's picture, in whichever shape its pane draws.
+///
+/// # Why the two shapes are one field
+///
+/// Everything about the loop machinery that is *not* the picture — the render
+/// set, the eviction, the readiness settle, the playhead's skip-to-the-next-
+/// textured-frame — asks only "does this frame have an image yet?". Keeping the
+/// two kinds in two `Option` fields would make that question ambiguous and give
+/// a frame a state where both are set, which is a frame depicting two volumes.
+/// One field has neither problem, and the arms are what force every consumer to
+/// say which shape it means.
+///
+/// That is the loop path's half of the axis [`RenderCacheKey`]'s doc describes:
+/// a plan view and a section of the same product at the same site are the same
+/// `(site, product, elevation)` and completely different pictures. On the static
+/// path they would collide in an LRU; here they would collide in a **broadcast**
+/// — see [`LoopPlaybackState::view`].
+///
+/// [`RenderCacheKey`]: https://docs.rs/rustdar-frontend
+#[derive(Clone)]
+pub enum LoopFrameImage {
+    /// An `IMAGE_SIZE²` plan-view raster, positioned by the site's coordinates.
+    PlanView(RadarImageData),
+    /// A `SECTION_WIDTH × SECTION_HEIGHT` vertical slice along the loop's line.
+    Section(SectionImageData),
+}
+
+impl LoopFrameImage {
+    /// Which view this picture is, so a consumer that holds one can be checked
+    /// against the loop it is about to be placed in.
+    pub fn view(&self) -> RenderView {
+        match self {
+            Self::PlanView(_) => RenderView::PlanView,
+            Self::Section(_) => RenderView::CrossSection,
+        }
+    }
+
+    /// The plan-view image, or `None` if this frame is a section.
+    pub fn plan_view(&self) -> Option<&RadarImageData> {
+        match self {
+            Self::PlanView(image) => Some(image),
+            Self::Section(_) => None,
+        }
+    }
+
+    /// The section image, or `None` if this frame is a plan view.
+    pub fn section(&self) -> Option<&SectionImageData> {
+        match self {
+            Self::Section(image) => Some(image),
+            Self::PlanView(_) => None,
+        }
+    }
+}
+
 /// A single rendered frame in a radar loop.
 pub struct LoopFrame {
     /// UTC timestamp of this scan.
     pub timestamp: NaiveDateTime,
-    /// Rendered texture, `None` if not yet rendered or evicted.
-    pub texture: Option<RadarImageData>,
+    /// Rendered picture, `None` if not yet rendered or evicted.
+    ///
+    /// Named for what it is rather than for the texture inside it: a section
+    /// frame carries axes and a ladder fingerprint beside its handle, and the
+    /// consumers that ask whether a frame is drawn must not have to know which
+    /// kind they are looking at to ask.
+    pub image: Option<LoopFrameImage>,
     /// True while a background render is in progress for this frame.
     pub render_in_flight: bool,
     /// True once a render for this frame has been attempted and produced nothing
@@ -123,6 +228,62 @@ impl RenderTarget {
     /// Whether two targets name the same image.
     pub fn matches(&self, other: &RenderTarget) -> bool {
         self.matches_parts(&other.site, other.product, other.elevation)
+    }
+}
+
+/// What a **section** loop's frames were cut for, beyond what
+/// [`RenderTarget`] already says.
+///
+/// The two together are one key split across two fields, and they are written
+/// by one function ([`LoopPlaybackState::retarget_renders_for`]) precisely so
+/// they cannot disagree. The split exists because every pre-existing loop site
+/// reads the plan-view half and none of them should have to learn about this
+/// one.
+///
+/// # Both fields are things a picture depends on and a `RenderTarget` cannot say
+///
+/// * **The line.** A section is a slice along two geographic endpoints. Redraw
+///   the line and every frame in the loop is a picture of somewhere else — the
+///   exact counterpart of changing the product on a plan-view loop, which
+///   `retarget_renders` already discards every frame for.
+/// * **The storm motion vector.** A storm-relative section is not a slice of a
+///   measured moment: the derivation runs on the way out of the volume, so the
+///   picture *is* a function of the vector. This is the same field, for the same
+///   reason, as `render_dispatch::SectionInputKey::storm_motion` — which exists
+///   because leaving it out shipped the previous vector's field to the worker
+///   and redrew the section visibly wrong, with nothing saying so. A loop keyed
+///   on time alone would reintroduce that bug once per frame instead of once.
+///
+/// Bits rather than `f32`s, exactly as `SectionInputKey` stores them, so the
+/// comparison is reflexive: a NaN vector would never equal itself and every
+/// frame of the loop would be re-cut on every dispatch pass, for ever, with a
+/// hot CPU as the only symptom.
+///
+/// `PartialEq` is derived and compares a stored key against a stored key, never
+/// against a re-derived value. That is only safe because
+/// [`SectionLine::new`](crate::pane::SectionLine::new) refuses non-finite
+/// endpoints.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SectionLoopKey {
+    /// The line every frame is cut along.
+    pub line: SectionLine,
+    /// The storm motion vector the frames were derived with, as raw bits, and
+    /// `None` for every product that does not read one.
+    pub storm_motion: Option<(u32, u32)>,
+}
+
+impl SectionLoopKey {
+    /// The key for `line` under the storm motion vector `motion`, in the same
+    /// `(speed_kt, direction_from_deg)` form the extraction is handed.
+    ///
+    /// The `to_bits` conversion lives here rather than at the call sites for the
+    /// reason `SectionInputKey::of` gives: a second copy of it is a second
+    /// chance to compare `f32`s that are not reflexive.
+    pub fn new(line: SectionLine, motion: Option<(f32, f32)>) -> Self {
+        Self {
+            line,
+            storm_motion: motion.map(|(speed, direction)| (speed.to_bits(), direction.to_bits())),
+        }
     }
 }
 
@@ -217,6 +378,39 @@ pub struct LoopPlaybackState {
     /// supplies the rest, and the sweep it snaps the selection to is not in here.
     /// See [`RenderTarget`].
     pub rendered_for: Option<RenderTarget>,
+    /// Which kind of picture this loop's frames are, fixed for the life of the
+    /// state by the pane kind that started it.
+    ///
+    /// # This is the loop path's view axis, and it is a safety field
+    ///
+    /// [`RenderTarget`] is `(site, product, elevation)` with **no view term**,
+    /// and that was complete while a loop frame could only ever be a plan-view
+    /// tilt. It is not complete now: a section pane and a map pane on the same
+    /// site, product and elevation produce two `RenderTarget`s that
+    /// [`RenderTarget::matches`] says are the same — and the loop-frame
+    /// broadcast in `App::poll_loop_render_results` hands one pane's finished
+    /// texture to every sibling whose loop `is_rendered_for` the result's
+    /// target. Without this field a 2048² plan view is placed into a section
+    /// pane's frame list, and the pane animates a map where a vertical slice
+    /// should be, with every caption and axis around it describing the section.
+    ///
+    /// So the acceptance, donation and result-placement predicates all test it
+    /// — and each tests it against the *result's* view, not against the
+    /// receiving pane's kind, because a pane and a result can both be sections
+    /// and still disagree about which. That is the same lesson `RenderCacheKey`
+    /// learnt on the static path, where the collision is a wrong-shaped buffer
+    /// handed to `ColorImage::from_rgba_unmultiplied`'s `assert_eq!` on the main
+    /// thread rather than a wrong picture.
+    ///
+    /// [`RenderView::PlanView`] for a loop built before the field existed and
+    /// for [`LoopPlaybackState::new`], which is the inactive state.
+    pub view: RenderView,
+    /// The section half of the render key, or `None` for a plan-view loop.
+    ///
+    /// See [`SectionLoopKey`] for what is in it and why. Written only by
+    /// [`Self::retarget_renders_for`], alongside [`Self::rendered_for`], so the
+    /// two halves of the key cannot describe different pictures.
+    pub section_key: Option<SectionLoopKey>,
 }
 
 /// Per-pane state: each pane independently selects a radar product,
@@ -333,6 +527,8 @@ impl LoopPlaybackState {
             site_lat: 0.0,
             site_lon: 0.0,
             rendered_for: None,
+            view: RenderView::PlanView,
+            section_key: None,
         }
     }
 
@@ -343,7 +539,14 @@ impl LoopPlaybackState {
     /// frames are actually projected with, so they have to describe the same site. As
     /// separate parameters a caller could pass the pane's site code alongside another
     /// site's coordinates, and every later comparison would be exact and wrong.
-    pub fn new_for_loop(lookback_secs: u64, site: &RadarSite) -> Self {
+    ///
+    /// `view` is the pane kind's [`PaneKind::render_view`], captured once here
+    /// rather than re-derived at each consumer. A pane cannot change kind under
+    /// a running loop — [`PaneState::set_content`] tears the loop down for a kind
+    /// that cannot animate, and rebuilds it for one that can — so this is fixed
+    /// for the life of the state, exactly like [`Self::site`]. See
+    /// [`Self::view`] for what it protects.
+    pub fn new_for_loop(lookback_secs: u64, site: &RadarSite, view: RenderView) -> Self {
         Self {
             phase: LoopPhase::FetchingScanList,
             current_frame: 0,
@@ -354,6 +557,8 @@ impl LoopPlaybackState {
             site_lat: site.lat,
             site_lon: site.lon,
             rendered_for: None,
+            view,
+            section_key: None,
         }
     }
 
@@ -419,12 +624,16 @@ impl LoopPlaybackState {
     /// this timestamp in flight?" paired with a caller fetching "the frame with this
     /// timestamp" is two lookups that are free to disagree, and the frame the
     /// predicate cleared would then stay marked in flight forever.
+    /// - The result is a **plan view and this loop is not** (or the reverse).
+    ///   [`RenderTarget`] carries no view term, so a section loop and a map loop
+    ///   on one site, product and elevation produce targets that `matches` calls
+    ///   equal. See [`Self::view`].
     pub fn frame_awaiting_render_result(
         &self,
         timestamp: NaiveDateTime,
         target: &RenderTarget,
     ) -> Option<usize> {
-        if !self.is_active() || !self.is_rendered_for(target) {
+        if self.view != RenderView::PlanView || !self.is_active() || !self.is_rendered_for(target) {
             return None;
         }
         self.frames
@@ -470,18 +679,27 @@ impl LoopPlaybackState {
     ///
     /// Only untextured frames qualify — a frame that already has an image is not
     /// improved by an identical one, and overwriting it would churn texture handles.
+    ///
+    /// The [`view`](Self::view) test is first and is the one that is not about
+    /// tilts at all: the incoming image is a plan-view raster, and a section
+    /// loop whose target happens to match would otherwise animate a map inside a
+    /// vertical slice's axes.
     pub fn frame_accepting_broadcast(
         &self,
         timestamp: NaiveDateTime,
         target: &RenderTarget,
         sweep: BroadcastSweep,
     ) -> Option<usize> {
-        if !self.is_active() || !self.is_rendered_for(target) || !sweep.agrees() {
+        if self.view != RenderView::PlanView
+            || !self.is_active()
+            || !self.is_rendered_for(target)
+            || !sweep.agrees()
+        {
             return None;
         }
         self.frames
             .iter()
-            .position(|f| f.timestamp == timestamp && f.texture.is_none())
+            .position(|f| f.timestamp == timestamp && f.image.is_none())
     }
 
     /// [`Self::frame_accepting_broadcast`] as a mutable borrow of the frame itself,
@@ -513,17 +731,150 @@ impl LoopPlaybackState {
     /// that pass this test are on one site and so share one `(site, timestamp)` cache
     /// entry, which is what makes their scans, and therefore their snapped sweeps, the
     /// same to begin with.
+    ///
+    /// The [`view`](Self::view) test is the same one acceptance applies, and for
+    /// the same reason — this is the *before* half of the pair, so if the two
+    /// disagreed the dispatcher would suppress a pane's own render on the
+    /// promise of a donation the placement path then refuses.
     pub fn frame_donatable_to(
         &self,
         timestamp: NaiveDateTime,
         target: &RenderTarget,
     ) -> Option<usize> {
-        if !self.is_active() || !self.is_rendered_for(target) {
+        if self.view != RenderView::PlanView || !self.is_active() || !self.is_rendered_for(target) {
+            return None;
+        }
+        self.frames.iter().position(|f| {
+            f.timestamp == timestamp && f.image.as_ref().is_some_and(|i| i.plan_view().is_some())
+        })
+    }
+
+    /// Whether this loop's frames are cut for `target` **and** `key` — the
+    /// section counterpart of [`Self::is_rendered_for`].
+    ///
+    /// Both halves, always, because they are one key: `rendered_for` carries the
+    /// site and product a section was cut under and `section_key` carries the
+    /// line and the storm motion vector, and a frame that agrees on one half and
+    /// not the other is a picture of a different slice.
+    pub fn is_cut_for(&self, target: &RenderTarget, key: &SectionLoopKey) -> bool {
+        self.is_rendered_for(target) && self.section_key.as_ref() == Some(key)
+    }
+
+    /// The index of the frame awaiting a **section** result for
+    /// `timestamp`/`target`/`key`, or `None` if this loop is not owed one.
+    ///
+    /// [`Self::frame_awaiting_render_result`] for sections, with the same
+    /// contract and the same view guard read the other way round. It exists as a
+    /// separate function rather than a parameter on that one because the two
+    /// take different keys — a plan-view result is identified by a snapped sweep
+    /// and a section result by a line and a motion vector — and a single
+    /// function taking both would have to accept `None` for whichever half did
+    /// not apply, which is a signature that lets a caller pass neither.
+    pub fn frame_awaiting_section_result(
+        &self,
+        timestamp: NaiveDateTime,
+        target: &RenderTarget,
+        key: &SectionLoopKey,
+    ) -> Option<usize> {
+        if self.view != RenderView::CrossSection
+            || !self.is_active()
+            || !self.is_cut_for(target, key)
+        {
             return None;
         }
         self.frames
             .iter()
-            .position(|f| f.timestamp == timestamp && f.texture.is_some())
+            .position(|f| f.timestamp == timestamp && f.render_in_flight)
+    }
+
+    /// [`Self::frame_awaiting_section_result`] as a mutable borrow of the frame,
+    /// for the reason [`Self::frame_awaiting_render_result_mut`] gives.
+    pub fn frame_awaiting_section_result_mut(
+        &mut self,
+        timestamp: NaiveDateTime,
+        target: &RenderTarget,
+        key: &SectionLoopKey,
+    ) -> Option<&mut LoopFrame> {
+        let idx = self.frame_awaiting_section_result(timestamp, target, key)?;
+        Some(&mut self.frames[idx])
+    }
+
+    /// The index of the frame that should receive a **section** raster finished
+    /// by another pane, or `None` if this loop cannot use it.
+    ///
+    /// The section form of [`Self::frame_accepting_broadcast`]. It takes no
+    /// sweep, and the asymmetry is not an oversight: a plan view is one tilt out
+    /// of a volume, so two loops agreeing on the selection can still snap it to
+    /// different sweeps — a section is cut across *every* tilt, so there is no
+    /// snapping to disagree about. What replaces it is `ladder`, the fingerprint
+    /// of the ladder the incoming raster was cut from, which must match the
+    /// ladder this loop's own scan for the frame resolves to. Two loops sharing
+    /// one `(site, timestamp)` cache entry share one scan and so one ladder;
+    /// the test is here because the newest frame's scan can be re-cached as more
+    /// of the volume seals, and a raster cut from the two-rung version must not
+    /// be handed to a loop that is about to cut the fourteen-rung one.
+    pub fn frame_accepting_section_broadcast(
+        &self,
+        timestamp: NaiveDateTime,
+        target: &RenderTarget,
+        key: &SectionLoopKey,
+        ladder: u64,
+        own_ladder: Option<u64>,
+    ) -> Option<usize> {
+        if self.view != RenderView::CrossSection
+            || !self.is_active()
+            || !self.is_cut_for(target, key)
+            || own_ladder != Some(ladder)
+        {
+            return None;
+        }
+        self.frames
+            .iter()
+            .position(|f| f.timestamp == timestamp && f.image.is_none())
+    }
+
+    /// [`Self::frame_accepting_section_broadcast`] as a mutable borrow.
+    pub fn frame_accepting_section_broadcast_mut(
+        &mut self,
+        timestamp: NaiveDateTime,
+        target: &RenderTarget,
+        key: &SectionLoopKey,
+        ladder: u64,
+        own_ladder: Option<u64>,
+    ) -> Option<&mut LoopFrame> {
+        let idx =
+            self.frame_accepting_section_broadcast(timestamp, target, key, ladder, own_ladder)?;
+        Some(&mut self.frames[idx])
+    }
+
+    /// The index of a **section** frame this loop can hand to a pane keyed to
+    /// `target`/`key`, letting that pane skip a cut it would otherwise dispatch.
+    ///
+    /// The mirror of [`Self::frame_accepting_section_broadcast`], applying the
+    /// same tests for the reason [`Self::frame_donatable_to`] gives — a donation
+    /// suppresses a render, so the two halves must weigh the same things. The
+    /// ladder comes off the candidate frame's own picture rather than from the
+    /// caller, because that is what a donation actually copies.
+    pub fn section_frame_donatable_to(
+        &self,
+        timestamp: NaiveDateTime,
+        target: &RenderTarget,
+        key: &SectionLoopKey,
+        wanted_ladder: u64,
+    ) -> Option<usize> {
+        if self.view != RenderView::CrossSection
+            || !self.is_active()
+            || !self.is_cut_for(target, key)
+        {
+            return None;
+        }
+        self.frames.iter().position(|f| {
+            f.timestamp == timestamp
+                && f.image
+                    .as_ref()
+                    .and_then(LoopFrameImage::section)
+                    .is_some_and(|s| s.ladder == wanted_ladder)
+        })
     }
 
     /// Point the loop's frame renders at `product`/`elevation`, discarding every
@@ -548,12 +899,33 @@ impl LoopPlaybackState {
     /// own `site`, which is fixed for the life of a `LoopPlaybackState`. A pane that
     /// changes site gets a whole new loop state rather than a retarget.
     pub fn retarget_renders(&mut self, product: RadarProduct, elevation: f32) -> bool {
+        self.retarget_renders_for(product, elevation, None)
+    }
+
+    /// [`Self::retarget_renders`] including the section half of the key.
+    ///
+    /// **The only writer of either half**, which is what makes them one key
+    /// rather than two fields that can disagree: a caller cannot move the line
+    /// without the frames keyed to the old one being discarded, because there is
+    /// no way to write [`Self::section_key`] that does not come through here.
+    ///
+    /// `section` is `None` for a plan-view loop and `Some` for a section loop.
+    /// Passing `None` on a section loop would therefore *also* count as a
+    /// change and discard every frame — which is the safe direction, and is what
+    /// a caller that has lost the line should get.
+    pub fn retarget_renders_for(
+        &mut self,
+        product: RadarProduct,
+        elevation: f32,
+        section: Option<SectionLoopKey>,
+    ) -> bool {
         // Runs for every looping pane every frame, and almost always finds no change,
         // so ask before building a target rather than allocating one to throw away.
         if self
             .rendered_for
             .as_ref()
             .is_some_and(|t| t.matches_parts(&self.site, product, elevation))
+            && self.section_key == section
         {
             return false;
         }
@@ -561,12 +933,13 @@ impl LoopPlaybackState {
         // Nothing to discard before the first dispatch — frames start blank.
         let had_previous_target = self.rendered_for.is_some();
         self.rendered_for = Some(RenderTarget::new(self.site.clone(), product, elevation));
+        self.section_key = section;
         if !had_previous_target {
             return false;
         }
 
         for frame in &mut self.frames {
-            frame.texture = None;
+            frame.image = None;
             frame.render_in_flight = false;
             frame.render_failed = false;
         }
@@ -580,14 +953,14 @@ impl LoopPlaybackState {
     /// check: an eviction rule that disagreed with the dispatcher could drop the
     /// texture of a frame that is about to be re-rendered, churning renders forever.
     pub fn evict_textures_outside_render_set(&mut self, budget: usize) {
-        let textured = self.frames.iter().filter(|f| f.texture.is_some()).count();
+        let textured = self.frames.iter().filter(|f| f.image.is_some()).count();
         if textured <= budget {
             return;
         }
         let keep = self.render_set_indices(budget);
         for (idx, frame) in self.frames.iter_mut().enumerate() {
             if !keep.contains(&idx) {
-                frame.texture = None;
+                frame.image = None;
             }
         }
     }
@@ -644,7 +1017,7 @@ impl LoopPlaybackState {
     ) -> bool {
         self.render_set_indices(budget).into_iter().all(|idx| {
             let frame = &self.frames[idx];
-            frame.texture.is_some()
+            frame.image.is_some()
                 || (!frame.render_in_flight && (frame.render_failed || !scan_available(frame)))
         })
     }
@@ -701,6 +1074,29 @@ impl PaneState {
     /// render dispatch, the sibling texture broadcast, loop synchronisation.
     pub fn is_map(&self) -> bool {
         matches!(self.content, PaneContent::Map)
+    }
+
+    /// Whether this pane can animate a sequence of past volumes.
+    ///
+    /// [`PaneKind::can_loop`] is where the classification by kind lives; this
+    /// adds the one thing a kind cannot answer.
+    ///
+    /// # A section pane must be aimed before it can loop
+    ///
+    /// A cross-section is cut along a line, and until the user has drawn one
+    /// there is nothing for a frame to be a picture *of*. A loop enabled in that
+    /// state would fill with frames nothing can cut, and because their volumes
+    /// have downloaded perfectly well, `render_set_settled` would never call the
+    /// batch settled: the loop would sit in `Rendering` for the session, with
+    /// the transport showing `0/n` and no way to tell that the fix is to draw a
+    /// line. Refusing here — where the timeline's toggle and
+    /// `Gui::loop_sync_targets` both read it — is what keeps that state
+    /// unreachable, and the pane's own empty state already says what to do.
+    ///
+    /// `is_none_or` rather than a match on the kind: a map pane has no section
+    /// state and answers on its kind alone.
+    pub fn can_loop(&self) -> bool {
+        self.kind().can_loop() && self.cross_section().is_none_or(|s| s.line.is_some())
     }
 
     /// This pane's cross-section state, or `None` if it is not a section pane.
@@ -794,19 +1190,53 @@ impl PaneState {
     /// The one writer of `content` that enforces what a kind change implies, so
     /// every route to a non-map pane — the menu, a restored config, a test
     /// fixture — arrives with the same invariants. See [`Self::set_kind`].
+    /// # Why a *kind change* tears the loop down, not just a change to a kind
+    /// that cannot loop
+    ///
+    /// A loop's frames are pictures of one shape, and
+    /// [`LoopPlaybackState::view`] is the field that says which. Converting a
+    /// looping map pane into a section pane leaves a frame list full of
+    /// `IMAGE_SIZE` square plan-view rasters under a state that now claims to be
+    /// a section — every acceptance and donation predicate would refuse them,
+    /// which is the point of that field, so nothing would be *drawn* wrongly;
+    /// but the pane would animate a list of frames nothing can fill and hold
+    /// `MAX_LOOP_RENDER_BUDGET` textures alive to do it.
+    ///
+    /// So the rule is the wider one: any kind change resets the loop, and a kind
+    /// that cannot loop at all resets it as well — the second clause covers the
+    /// path where a caller replaces one `Volume` content with another.
     pub fn set_content(&mut self, content: PaneContent) {
+        let previous = self.kind();
         self.content = content;
-        if !self.is_map() {
+        if self.kind() != previous || !self.kind().can_loop() {
             self.loop_state = LoopPlaybackState::new();
         }
     }
 
     /// The currently active radar image (from loop frame or static render).
     pub fn active_image(&self) -> Option<&RadarImageData> {
+        self.active_loop_image().and_then(LoopFrameImage::plan_view)
+    }
+
+    /// The playing frame's cross-section raster, or `None` when this pane is not
+    /// animating a section.
+    ///
+    /// The section counterpart of [`Self::active_image`], and separate from it
+    /// for the reason [`LoopFrameImage`] exists: the two are different shapes
+    /// with different labels around them, and a caller that asked for "the
+    /// image" without saying which would draw a plan view into a section's axes.
+    pub fn active_section_image(&self) -> Option<&SectionImageData> {
+        self.active_loop_image().and_then(LoopFrameImage::section)
+    }
+
+    /// Whichever picture the loop's playhead is on, before it is narrowed to a
+    /// kind. One lookup, so the two accessors above cannot walk to different
+    /// frames.
+    fn active_loop_image(&self) -> Option<&LoopFrameImage> {
         self.loop_state
             .frames
             .get(self.loop_state.current_frame)
-            .and_then(|f| f.texture.as_ref())
+            .and_then(|f| f.image.as_ref())
     }
 
     /// When the data behind the image *currently on screen* was collected.
@@ -1232,6 +1662,10 @@ fn drag_divider(
 
 #[cfg(test)]
 mod render_params_tests;
+
+/// The section loop's identity and the plan-view/section collision it closes.
+#[cfg(test)]
+mod section_loop_tests;
 
 #[cfg(test)]
 mod tests;

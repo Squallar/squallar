@@ -954,12 +954,13 @@ fn the_loop_transport_payloads_drive_the_playback_state() {
     let mut app = app_showing(at(10));
     let site = rustdar_radar::sites::get_radar_site("KTLX").unwrap();
     {
-        let mut state = LoopPlaybackState::new_for_loop(3600, site);
+        let mut state =
+            LoopPlaybackState::new_for_loop(3600, site, rustdar_radar::types::RenderView::PlanView);
         state.phase = LoopPhase::Ready;
         state.frames = (0..3)
             .map(|i| LoopFrame {
                 timestamp: at(i),
-                texture: None,
+                image: None,
                 render_in_flight: false,
                 render_failed: false,
             })

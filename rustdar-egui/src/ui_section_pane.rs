@@ -150,34 +150,67 @@ pub(super) fn render_cross_section(
     let product = pane.selected_product;
     let site = pane.scan_info.as_ref().map(|s| (s.site.lat, s.site.lon));
 
-    let Some(state) = pane.cross_section() else {
-        return;
-    };
-    let Some(line) = state.line else {
-        paint_centered(ui, pane_rect, super::CROSS_SECTION_EMPTY_STATE);
-        return;
-    };
-    let (Some(section), Some(texture)) = (state.section.clone(), state.texture.clone()) else {
-        // Nothing rendered. Either a stated reason, or a cut in flight — and
-        // the two must not look alike: "waiting" that will never end is the
-        // worst state a pane can be in, because there is nothing to do about it
-        // and no way to tell.
-        let message = state.unavailable.map_or_else(
-            || "Cutting the cross-section...".to_owned(),
-            |u| u.message(),
-        );
-        paint_centered(ui, pane_rect, &message);
-        return;
+    // Which picture is on the glass, and what labels it. Under an active loop
+    // that is the playhead's frame — its own raster, its own axes, its own
+    // ladder and its own volume time — and *not* the live cut, which is a
+    // different volume with a different ladder. The two are read through one
+    // `else` so a loop that is still filling its first frame falls back to the
+    // same in-flight message a cold live pane shows, rather than to a blank.
+    let looping = pane.loop_state.is_active();
+    let (state, line) = {
+        let Some(state) = pane.cross_section() else {
+            return;
+        };
+        let Some(line) = state.line else {
+            paint_centered(ui, pane_rect, super::CROSS_SECTION_EMPTY_STATE);
+            return;
+        };
+        (state, line)
     };
     let unavailable = state.unavailable;
     let detail_open = state.detail_open;
+    let live = (state.section.clone(), state.texture.clone());
     // The volume the picture on screen was actually cut from — not the pane's
     // `scan_info`, which follows the feed and can already name the *next*
     // volume while this raster is still of the last one. The caption describes
     // the picture, so its time has to be the picture's.
-    let collected = state.rendered_for.as_ref().map(|t| t.volume.collected);
+    let live_collected = state.rendered_for.as_ref().map(|t| t.volume.collected);
 
-    let axes = *section.axes();
+    // `section` is the hover source and is `None` for every loop frame: the
+    // value and status planes are ~10 MB apiece and a loop holds up to
+    // `MAX_LOOP_RENDER_BUDGET` frames, so they are dropped on the way in. A
+    // plan-view loop frame drops its value grid for the same reason, and the
+    // hover readout goes quiet in both — see `pane::SectionImageData`.
+    let (section, texture, axes, tilts, collected) = if looping {
+        let Some(frame) = pane.active_section_image().cloned() else {
+            paint_centered(ui, pane_rect, "Cutting the cross-section...");
+            return;
+        };
+        let collected = pane.data_time_on_screen();
+        (
+            None,
+            frame.texture,
+            frame.axes,
+            frame.tilt_elevations_deg,
+            collected,
+        )
+    } else {
+        let (Some(section), Some(texture)) = live else {
+            // Nothing rendered. Either a stated reason, or a cut in flight — and
+            // the two must not look alike: "waiting" that will never end is the
+            // worst state a pane can be in, because there is nothing to do about it
+            // and no way to tell.
+            let message = state.unavailable.map_or_else(
+                || "Cutting the cross-section...".to_owned(),
+                |u| u.message(),
+            );
+            paint_centered(ui, pane_rect, &message);
+            return;
+        };
+        let axes = *section.axes();
+        let tilts = section.tilt_elevations_deg().to_vec();
+        (Some(section), texture, axes, tilts, live_collected)
+    };
 
     let painter = ui.painter().with_clip_rect(pane_rect);
     // The caption is laid out before the layout is computed, because the layout
@@ -225,7 +258,7 @@ pub(super) fn render_cross_section(
             (line.b().lat, line.b().lon),
             site_lat,
             site_lon,
-            section.tilt_elevations_deg(),
+            &tilts,
         );
     }
     painter.rect_stroke(
@@ -302,10 +335,16 @@ pub(super) fn render_cross_section(
         state.line = Some(new_line);
     }
 
+    // `section` is `None` for every loop frame, so a looping pane reports no
+    // hover value at all rather than the *previous* still cut's — which is what
+    // reading the live `section` here would do, and would be a readout of one
+    // volume under a picture of another. A plan-view loop is quiet for the same
+    // reason.
     if let Some(pos) = ui.ctx().pointer_hover_pos()
         && pane_rect.contains(pos)
+        && let Some(section) = section.as_deref()
     {
-        pane.hover_value = hover_readout(&section, &layout, pos, product, prefs);
+        pane.hover_value = hover_readout(section, &layout, pos, product, prefs);
     }
 }
 

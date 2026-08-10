@@ -61,7 +61,11 @@ fn pane_showing(site: RadarSite, timestamp: NaiveDateTime) -> PaneState {
 /// A pane with an active loop on `site`, holding frames at the given minutes.
 fn pane_looping_on(site: RadarSite, lookback_secs: u64, frames: &[u32]) -> PaneState {
     let mut pane = PaneState::with_site(site.name.to_string());
-    pane.loop_state = LoopPlaybackState::new_for_loop(lookback_secs, &site);
+    pane.loop_state = LoopPlaybackState::new_for_loop(
+        lookback_secs,
+        &site,
+        rustdar_radar::types::RenderView::PlanView,
+    );
     for &minute in frames {
         append_polled_frame(&mut pane.loop_state, site.name, ts(minute));
     }

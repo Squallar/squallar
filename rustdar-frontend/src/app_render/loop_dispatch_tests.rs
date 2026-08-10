@@ -95,12 +95,13 @@ fn loop_on(ctx: &egui::Context, site: &'static str, textured: &[usize]) -> LoopP
             lon: -97.0,
             heights: None,
         },
+        rustdar_radar::types::RenderView::PlanView,
     );
     ls.phase = LoopPhase::Rendering;
     ls.frames = (0..3)
         .map(|i| LoopFrame {
             timestamp: ts(i),
-            texture: None,
+            image: None,
             render_in_flight: false,
             render_failed: false,
         })
@@ -108,13 +109,15 @@ fn loop_on(ctx: &egui::Context, site: &'static str, textured: &[usize]) -> LoopP
     ls.retarget_renders(RadarProduct::Reflectivity, 0.5);
     for &i in textured {
         let image = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[255, 255, 255, 255]);
-        ls.frames[i].texture = Some(rustdar_egui::pane::RadarImageData {
-            texture: ctx.load_texture("test", image, egui::TextureOptions::NEAREST),
-            lat: 35.0,
-            lon: -97.0,
-            max_range_km: 100.0,
-            value_data: Arc::new(Vec::new()),
-        });
+        ls.frames[i].image = Some(rustdar_egui::pane::LoopFrameImage::PlanView(
+            rustdar_egui::pane::RadarImageData {
+                texture: ctx.load_texture("test", image, egui::TextureOptions::NEAREST),
+                lat: 35.0,
+                lon: -97.0,
+                max_range_km: 100.0,
+                value_data: Arc::new(Vec::new()),
+            },
+        ));
     }
     ls
 }
@@ -531,7 +534,11 @@ fn a_rendered_frame_is_placed_where_the_render_actually_drew_it() {
     let texture = accept_render_result(&mut ls, &mut rr, |_| dummy_texture(&ctx))
         .expect("the loop is awaiting this result");
 
-    let image = ls.frames[1].texture.as_ref().expect("the frame was filled");
+    let image = ls.frames[1]
+        .image
+        .as_ref()
+        .and_then(rustdar_egui::pane::LoopFrameImage::plan_view)
+        .expect("the frame was filled with a plan view");
     assert_eq!(
         image.lat, rr.site_lat,
         "the latitude the image was projected around"
@@ -571,7 +578,7 @@ fn a_refused_result_is_never_uploaded() {
         "a result for another elevation is not this loop's"
     );
     assert_eq!(uploads, 0, "and nothing was uploaded for it");
-    assert!(ls.frames[1].texture.is_none());
+    assert!(ls.frames[1].image.is_none());
     assert!(
         stale.image.is_some(),
         "and its pixels were not taken off the response"
@@ -601,7 +608,7 @@ fn a_failed_render_retires_its_frame_without_a_texture() {
     assert_eq!(uploads, 0, "a failed render uploads nothing");
     assert!(ls.frames[1].render_failed, "the frame is retired");
     assert!(!ls.frames[1].render_in_flight, "and released");
-    assert!(ls.frames[1].texture.is_none());
+    assert!(ls.frames[1].image.is_none());
 }
 
 /// A finished download is filed under the site it was fetched from, which the

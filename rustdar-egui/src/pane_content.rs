@@ -130,6 +130,51 @@ impl PaneKind {
         self.render_view().reads_whole_volume()
     }
 
+    /// Whether a pane of this kind can animate a sequence of past volumes.
+    ///
+    /// A loop is a sequence of *rendered pictures*, one per volume, held as
+    /// textures — so the question is not "does this kind draw radar" but "can
+    /// one volume's worth of this kind be reduced to a picture that stays
+    /// correct while it sits in a list". Two of the three can:
+    ///
+    /// * A plan view is an `IMAGE_SIZE²` raster of one tilt, positioned by the
+    ///   site's coordinates. Nothing about the pane changes what it depicts.
+    /// * A cross-section is a `SECTION_WIDTH × SECTION_HEIGHT` raster of one
+    ///   line through one volume. The line is part of the loop's identity
+    ///   (`crate::pane::SectionLoopKey`); moving it re-cuts every frame, exactly
+    ///   as moving the product does for a plan view.
+    /// * A **3D volume does not yet**, and the reason is scope rather than
+    ///   impossibility. Its picture is raymarched live from a
+    ///   `VOLUME_GRID_CELLS` texture every frame, so a cached *image* would be
+    ///   specific to the eye and orbiting would invalidate every frame at once
+    ///   — but that rules out one design, not the feature. Holding the grids
+    ///   **resident** and swapping which one is marched costs a
+    ///   `set_bind_group` per playback step (measured: +2% on a discrete GPU,
+    ///   +4% on a software rasteriser), and against
+    ///   `LOOP_TEXTURE_BUDGET_BYTES` — the budget that bounds what a *loop*
+    ///   costs, rather than `VOLUME_TEXTURE_BUDGET_BYTES`, which bounds one
+    ///   live grid — wasm32 and mobile fit at today's full grid and desktop
+    ///   fits at 14 frames. See that constant's table. What is missing is the
+    ///   work above the GPU layer: a store a loop can hold a *set* of grids in,
+    ///   a build path that accepts a volume time that is not the newest, and a
+    ///   pacing budget for the resample.
+    ///
+    /// Exhaustive on purpose, like [`Self::render_view`]: a fourth kind must be
+    /// classified here rather than defaulting into — or out of — the loop
+    /// machinery. The direction matters, because the two mistakes are not
+    /// symmetric. A kind wrongly excluded is a missing feature; a kind wrongly
+    /// included is a pane whose frames nothing renders, which under Sync Layers
+    /// holds **every other pane's** loop back for ever. That asymmetry is why
+    /// `Volume` answers `false` here today: not because the answer is settled,
+    /// but because flipping it before the store and the build path can serve it
+    /// is the expensive mistake rather than the cheap one.
+    pub fn can_loop(self) -> bool {
+        match self {
+            Self::Map | Self::CrossSection => true,
+            Self::Volume => false,
+        }
+    }
+
     /// What a render dispatched for a pane of this kind produces.
     ///
     /// The single pane-kind → view table, and the only place the mapping lives.

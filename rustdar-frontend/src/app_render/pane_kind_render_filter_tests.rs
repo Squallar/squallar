@@ -51,6 +51,23 @@ fn point_at_site(app: &mut crate::app::App, pane_idx: usize) {
     );
 }
 
+/// The line an aimed section pane is cut along. Two distinct points on Earth is
+/// all `SectionLine::new` asks, and all any of these tests needs — none of them
+/// reaches a rasterizer.
+fn section_line() -> rustdar_egui::pane::SectionLine {
+    rustdar_egui::pane::SectionLine::new(
+        rustdar_egui::pane::GeoPoint {
+            lat: 35.0,
+            lon: -98.0,
+        },
+        rustdar_egui::pane::GeoPoint {
+            lat: 36.0,
+            lon: -97.0,
+        },
+    )
+    .expect("two distinct points on Earth")
+}
+
 /// Finished pixels, full size: `ColorImage::from_rgba_unmultiplied` checks
 /// the buffer against the dimensions it is handed, in a bare `assert_eq!`
 /// that is live in release and on the main thread.
@@ -243,13 +260,14 @@ fn active_loop(timestamps: &[chrono::NaiveDateTime]) -> LoopPlaybackState {
             lon: -97.27,
             heights: None,
         },
+        rustdar_radar::types::RenderView::PlanView,
     );
     ls.phase = LoopPhase::Rendering;
     ls.frames = timestamps
         .iter()
         .map(|&timestamp| LoopFrame {
             timestamp,
-            texture: None,
+            image: None,
             render_in_flight: false,
             render_failed: false,
         })
@@ -265,15 +283,22 @@ fn active_loop(timestamps: &[chrono::NaiveDateTime]) -> LoopPlaybackState {
     ls
 }
 
-/// `dispatch_loop_renders`' **first** pass skips a pane with no plan view.
+/// `dispatch_loop_renders`' **first** pass skips a pane that cannot loop, and
+/// **only** a pane that cannot loop.
 ///
 /// That pass's job is to notice the pane's product moving and re-key the whole
 /// frame list to it, which also queues a fresh download plan — for a pane
 /// nobody draws, a download queue serving nobody. So the observable is
-/// `rendered_for`: it must move for a map pane and must not move for a
-/// non-map one.
+/// `rendered_for`: it must move for a pane that animates and must not move for
+/// one that does not.
+///
+/// The classification is [`Gui::pane_cannot_loop`], **not**
+/// `pane_has_no_plan_view`, which is what it was while a loop frame could only
+/// be a plan-view tilt. The three rows below are the whole of the difference:
+/// an aimed cross-section pane has no plan view and *does* animate, an unaimed
+/// one has nothing to cut, and a 3D volume cannot cache a frame at all.
 #[test]
-fn the_first_loop_dispatch_pass_skips_a_pane_with_no_plan_view() {
+fn the_first_loop_dispatch_pass_skips_only_the_panes_that_cannot_loop() {
     let moved_to = RadarProduct::Velocity;
     assert!(
         !moved_to.is_level3() && !PRODUCT.is_level3(),
@@ -281,20 +306,39 @@ fn the_first_loop_dispatch_pass_skips_a_pane_with_no_plan_view() {
              retarget triggers starts a download this test does not serve"
     );
 
-    for (kind, expected) in [
-        (PaneKind::Map, Some((moved_to, 0.0))),
-        (PaneKind::CrossSection, Some((PRODUCT, TILT))),
-        (PaneKind::Volume, Some((PRODUCT, TILT))),
+    for (label, kind, aimed, expected) in [
+        ("map", PaneKind::Map, false, Some((moved_to, 0.0))),
+        // Aimed: a section loop is a first-class participant, so its target
+        // moves with the product exactly as a map's does.
+        (
+            "aimed section",
+            PaneKind::CrossSection,
+            true,
+            Some((moved_to, 0.0)),
+        ),
+        // Unaimed: nothing to cut, so it is not a loop participant at all.
+        (
+            "unaimed section",
+            PaneKind::CrossSection,
+            false,
+            Some((PRODUCT, TILT)),
+        ),
+        ("volume", PaneKind::Volume, false, Some((PRODUCT, TILT))),
     ] {
         let mut app = app_on_site();
         {
             let pane = app.gui.pane_mut(0).unwrap();
-            // Converted *first*, because `set_kind` tears a loop down — the
-            // root fix for the stuck-loop family. Planting the loop afterwards
-            // is what leaves the state this filter is about, and it is
-            // reachable: `loop_state` is a public field, and the setter is
-            // not the only route to a non-map pane.
+            // Converted *first*, because `set_content` tears a loop down on
+            // any kind change — the root fix for the stuck-loop family.
+            // Planting the loop afterwards is what leaves the state this
+            // filter is about, and it is reachable: `loop_state` is a public
+            // field, and the setter is not the only route to another kind.
             pane.set_kind(kind);
+            if aimed {
+                pane.cross_section_mut()
+                    .expect("only a section pane is aimed")
+                    .line = Some(section_line());
+            }
             pane.loop_state = active_loop(&[volume_time()]);
             pane.selected_product = moved_to;
             pane.selected_elevation = 0.0;
@@ -312,26 +356,30 @@ fn the_first_loop_dispatch_pass_skips_a_pane_with_no_plan_view() {
             .map(|target| (target.product, target.elevation));
         assert_eq!(
             keyed, expected,
-            "{kind:?}: the loop's render target moved for a pane whose frames \
+            "{label}: the loop's render target moved for a pane whose frames \
                  nobody draws — or failed to move for one whose frames are drawn"
         );
     }
 }
 
-/// `dispatch_loop_renders`' **second** pass skips a pane with no plan view.
+/// `dispatch_loop_renders`' **second** pass skips a pane that cannot loop, and
+/// examines every pane that can — through the branch its own view names.
 ///
-/// That pass is the one which plans renders and clones siblings' textures.
-/// The observable is `render_failed`, which it sets on a frame whose own
-/// volume carries no sweep for the selected product: a scan with no sweeps at
-/// all makes `find_closest_elevation` answer `None`, so a map pane's frame is
-/// retired and a non-map pane's frame is never examined. No render thread and
-/// no real volume are involved.
+/// That pass is the one which plans renders and clones siblings' textures. The
+/// observable is `render_failed`, which it sets on a frame whose own volume
+/// carries nothing for the selection. A scan with no sweeps at all makes
+/// `find_closest_elevation` answer `None` on the plan-view branch and
+/// `ladder_fingerprint` answer `None` on the section branch, so a frame is
+/// retired on both — which is the point: an aimed section pane's frames are
+/// *judged*, where before this work they were never looked at. No render
+/// thread and no real volume are involved.
 #[test]
-fn the_second_loop_dispatch_pass_skips_a_pane_with_no_plan_view() {
-    for (kind, expected_failed) in [
-        (PaneKind::Map, true),
-        (PaneKind::CrossSection, false),
-        (PaneKind::Volume, false),
+fn the_second_loop_dispatch_pass_judges_every_pane_that_can_loop() {
+    for (label, kind, aimed, expected_failed) in [
+        ("map", PaneKind::Map, false, true),
+        ("aimed section", PaneKind::CrossSection, true, true),
+        ("unaimed section", PaneKind::CrossSection, false, false),
+        ("volume", PaneKind::Volume, false, false),
     ] {
         let mut app = app_on_site();
         app.loop_mgr = LoopDownloadManager::new();
@@ -343,7 +391,20 @@ fn the_second_loop_dispatch_pass_skips_a_pane_with_no_plan_view() {
             let pane = app.gui.pane_mut(0).unwrap();
             // Converted first; see the note in the test above.
             pane.set_kind(kind);
+            if aimed {
+                pane.cross_section_mut()
+                    .expect("only a section pane is aimed")
+                    .line = Some(section_line());
+            }
             pane.loop_state = active_loop(&[volume_time()]);
+            if aimed {
+                // A section loop is planned on its own view. The state is
+                // planted directly here for the same reason the loop itself
+                // is: this test is about the dispatch filter, not about the
+                // enable path that would normally set it.
+                app.gui.pane_mut(0).unwrap().loop_state.view =
+                    rustdar_radar::types::RenderView::CrossSection;
+            }
         }
 
         app.dispatch_loop_renders();
@@ -351,7 +412,7 @@ fn the_second_loop_dispatch_pass_skips_a_pane_with_no_plan_view() {
         assert_eq!(
             app.gui.pane(0).unwrap().loop_state.frames[0].render_failed,
             expected_failed,
-            "{kind:?}: the second dispatch pass judged a frame belonging to a \
+            "{label}: the second dispatch pass judged a frame belonging to a \
                  pane it must not have looked at — or skipped one it must have"
         );
     }
@@ -431,7 +492,7 @@ fn a_pane_with_no_plan_view_cannot_hold_another_panes_loop_back() {
 fn the_loop_frame_broadcast_skips_a_pane_with_no_plan_view() {
     let textured = |app: &mut crate::app::App, idx: usize| {
         app.gui.pane(idx).unwrap().loop_state.frames[0]
-            .texture
+            .image
             .is_some()
     };
 

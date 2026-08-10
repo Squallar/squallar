@@ -2663,19 +2663,24 @@ impl Gui {
     /// [`Self::time_sync_targets`] narrowed to the panes a loop can feed —
     /// the fan-out for every loop action.
     ///
-    /// Panes with no plan view are left out. A loop is a sequence of rendered
-    /// plan-view tilts, and `dispatch_loop_renders` no longer feeds a non-map
-    /// pane — so enabling the loop with sync on would otherwise put every
-    /// section and volume pane into `is_active()` with a frame list nothing ever
-    /// fills, which is a spinner in the loop transport that never finishes and a
-    /// download queue serving nobody.
+    /// Panes that cannot loop are left out ([`PaneKind::can_loop`]), which today
+    /// means 3D volume panes. A loop is a sequence of rendered pictures and
+    /// `dispatch_loop_renders` feeds only the kinds that have one — so enabling
+    /// the loop with sync on would otherwise put every volume pane into
+    /// `is_active()` with a frame list nothing ever fills, which is a spinner in
+    /// the loop transport that never finishes and a download queue serving
+    /// nobody.
+    ///
+    /// It was `is_map` until cross-sections learned to loop, and widening it was
+    /// the *whole* of the change here: the narrowing has always been about which
+    /// panes something renders frames for, never about which panes draw a map.
     ///
     /// The active pane is a target unconditionally and is deliberately **never
     /// tested**. The caller is now the floating timeline, which runs after
     /// every `mem::take` window has closed, so the slot could safely be asked —
     /// but the unconditional include stays correct and stays put: it is the
     /// pane whose own toggle was clicked, and the timeline disables that
-    /// toggle for a non-map active pane, which is the same guarantee the old
+    /// toggle for an active pane that cannot loop, which is the same guarantee the old
     /// layers-panel host expressed by omitting the control. (When this ran
     /// from inside the panel's take window, asking the slot would have read a
     /// default `PaneState` — a *map* pane whatever the real one was — which is
@@ -2684,7 +2689,7 @@ impl Gui {
         self.time_sync_targets()
             .into_iter()
             .filter(|&idx| {
-                idx == self.active_pane || self.panes.get(idx).is_none_or(PaneState::is_map)
+                idx == self.active_pane || self.panes.get(idx).is_none_or(PaneState::can_loop)
             })
             .collect()
     }
@@ -3573,6 +3578,29 @@ impl Gui {
         self.pane(idx).is_some_and(|pane| !pane.is_map())
     }
 
+    /// Whether pane `idx` is a pane the **loop** machinery must skip: it exists,
+    /// and its kind has no picture a loop can hold ([`PaneKind::can_loop`]).
+    ///
+    /// The sibling of [`Self::pane_has_no_plan_view`], and the distinction
+    /// between them is the whole reason both exist. That one asks "does this
+    /// pane draw an `IMAGE_SIZE` square raster of one tilt?" and gates the
+    /// plan-view dispatch, the static sibling broadcast and the suspend/resume
+    /// restore. This one asks "can a sequence of this pane's pictures be
+    /// animated?" and gates the loop dispatch, the loop-frame broadcast, the
+    /// readiness settle and the playback start. A cross-section pane answers
+    /// *yes* to the first question's negation and *no* to this one's: it has no
+    /// plan view and it can loop, and collapsing the two would either stop it
+    /// looping or hand it a plan-view raster.
+    ///
+    /// Written in the negative, and an index past the end answers `false`, for
+    /// exactly the reasons the sibling gives — each caller keeps its own
+    /// out-of-range handling rather than having a second question folded in.
+    ///
+    /// The `mem::take` caveat on [`Self::pane`] applies in full.
+    pub fn pane_cannot_loop(&self, idx: PaneId) -> bool {
+        self.pane(idx).is_some_and(|pane| !pane.can_loop())
+    }
+
     /// Whether pane `idx` needs every cut of its site's volume rather than the
     /// one tilt it has selected, because of *what kind of pane it is*.
     ///
@@ -4183,7 +4211,7 @@ impl Gui {
             // The frame list and scan cache survive, so dispatch_loop_renders()
             // will re-upload textures automatically.
             for frame in &mut pane.loop_state.frames {
-                frame.texture = None;
+                frame.image = None;
                 frame.render_in_flight = false;
             }
             // Clear overlay texture caches — handles become invalid when the

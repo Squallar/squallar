@@ -106,6 +106,7 @@ fn the_data_time_on_screen_follows_the_loop_when_one_is_running() {
             lon: -97.27,
             heights: None,
         },
+        RenderView::PlanView,
     );
     assert_eq!(
         pane.data_time_on_screen(),
@@ -115,7 +116,7 @@ fn the_data_time_on_screen_follows_the_loop_when_one_is_running() {
 
     pane.loop_state.frames = vec![LoopFrame {
         timestamp: frame,
-        texture: None,
+        image: None,
         render_in_flight: false,
         render_failed: false,
     }];

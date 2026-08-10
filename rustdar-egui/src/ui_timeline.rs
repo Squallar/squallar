@@ -363,7 +363,7 @@ impl super::Gui {
     /// with the fallback that keeps a non-map active pane honest (the
     /// first-run `--:--:--` finding): the active pane's on-screen time,
     /// else the static [`PaneState::data_time`] it carries whatever its
-    /// kind, else the freshest visible **map** pane's on-screen time. The
+    /// kind, else the freshest visible pane's on-screen time. The
     /// live/archive flag travels with whichever pane supplied the time, so
     /// the annotation describes the time actually shown.
     ///
@@ -373,9 +373,13 @@ impl super::Gui {
         if let Some(t) = active.data_time_on_screen().or(active.data_time) {
             return (Some(t), active.viewing_live);
         }
+        // Every kind, not only maps. `data_time_on_screen` answers for all of
+        // them — the playing frame's own volume time under an active loop, the
+        // static `data_time` otherwise — and since a cross-section pane can
+        // animate, a layout of nothing but section panes had no time source at
+        // all and printed `--:--:--` over a running loop.
         self.panes()
             .iter()
-            .filter(|pane| pane.is_map())
             .filter_map(|pane| pane.data_time_on_screen().map(|t| (t, pane.viewing_live)))
             .max_by_key(|&(t, _)| t)
             .map_or((None, active.viewing_live), |(t, live)| (Some(t), live))
@@ -655,12 +659,14 @@ impl super::Gui {
             self.panes[pane_idx].time_step_secs = new_step;
         }
 
-        // The loop toggle. Enabled for map panes only: a loop frame is a
-        // rendered plan-view tilt and nothing feeds one to a section or a
-        // volume pane, so enabling it there would wait for ever — the layers
-        // panel expressed the same rule by omitting the whole block. Read off
-        // the real pane, which this renderer can do and the panel could not:
-        // no take window is open here.
+        // The loop toggle. Enabled for the kinds that have a picture a loop can
+        // hold — map and cross-section panes — and disabled for the 3D volume,
+        // whose picture is raymarched live from the eye and so cannot be cached
+        // per frame. See `PaneKind::can_loop`; `Gui::loop_sync_targets` applies
+        // the same rule to the fan-out, and the two have to agree or a pane is
+        // enabled here and dropped there. Read off the real pane, which this
+        // renderer can do and the old layers panel could not: no take window is
+        // open here.
         //
         // A framed `Button` at the bar's minimum interact size, not
         // `Button::selectable` — that constructor drops the frame while
@@ -669,11 +675,11 @@ impl super::Gui {
         // called it too small to hit. `interact_size` as the floor gives it a
         // real target on both mouse and touch, and `.selected` keeps the
         // on-state painted in the style's selection colour.
-        let is_map = self.panes[pane_idx].is_map();
+        let can_loop = self.panes[pane_idx].can_loop();
         let loop_active = self.panes[pane_idx].loop_state.is_active();
         let loop_toggle = ui
             .add_enabled(
-                is_map,
+                can_loop,
                 egui::Button::new("\u{221e}")
                     .selected(loop_active)
                     .min_size(ui.spacing().interact_size),
@@ -921,7 +927,7 @@ impl super::Gui {
 
         if loop_active {
             let ls = &self.panes[pane_idx].loop_state;
-            let rendered = ls.frames.iter().filter(|f| f.texture.is_some()).count();
+            let rendered = ls.frames.iter().filter(|f| f.image.is_some()).count();
             let total = ls.frames.len();
             let rendering = total > 0 && !ls.is_render_ready();
             let playing = ls.is_playing();

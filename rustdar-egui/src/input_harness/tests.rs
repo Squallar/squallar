@@ -4339,10 +4339,11 @@ fn a_looping_pane_reports_its_current_frames_time() {
         pane.loop_state = crate::pane::LoopPlaybackState::new_for_loop(
             600,
             rustdar_radar::sites::get_radar_site("KTLX").unwrap(),
+            rustdar_radar::types::RenderView::PlanView,
         );
         pane.loop_state.frames = vec![crate::pane::LoopFrame {
             timestamp: frame_time,
-            texture: None,
+            image: None,
             render_in_flight: false,
             render_failed: false,
         }];
@@ -5020,7 +5021,11 @@ fn nothing_is_said_where_there_is_no_stale_image() {
     let site = rustdar_radar::sites::get_radar_site("KTLX").expect("a real radar");
     {
         let pane = looping.gui_mut().pane_mut(0).unwrap();
-        pane.loop_state = crate::pane::LoopPlaybackState::new_for_loop(600, site);
+        pane.loop_state = crate::pane::LoopPlaybackState::new_for_loop(
+            600,
+            site,
+            rustdar_radar::types::RenderView::PlanView,
+        );
     }
     looping.select_product(0, RadarProduct::EchoTops);
     assert!(
@@ -6287,14 +6292,18 @@ fn converting_the_active_pane_from_the_dropdown_makes_it_a_volume_pane() {
 ///     * **No tilt picker.** Both non-map kinds read the whole ladder, which
 ///       is what `PaneKind::consumes_whole_volume` means, so every entry in
 ///       the combo would select the same picture.
-///     * **No loop, and no overlay tree.** A loop frame *is* a rendered
-///       plan-view tilt and nothing now feeds one to a pane like this. The
-///       layers panel expressed that by omitting the transport; the
-///       timeline expresses it by disabling its loop toggle — pinned here
-///       by clicking the toggle and requiring no loop action out of it,
-///       the failure a user would actually hit. The overlay tree is still
-///       the panel's: every entry in it is a layer drawn over map tiles
-///       against a projector this pane does not have.
+///     * **A loop for the section, none for the volume, and no overlay tree
+///       for either.** A cross-section can be animated — its picture is a
+///       raster of one line through one volume, which is exactly the kind of
+///       thing a loop frame is — so its toggle arms a loop like a map's. A
+///       3D volume cannot: its picture is raymarched live from the eye, so a
+///       cached frame would be camera-specific and orbiting would invalidate
+///       the whole loop at once. `PaneKind::can_loop` is where that split
+///       lives, and it is pinned here by clicking the toggle and requiring
+///       the loop action out of one kind and not the other — the failure a
+///       user would actually hit. The overlay tree is still the panel's for
+///       both: every entry in it is a layer drawn over map tiles against a
+///       projector neither pane has.
 ///
 ///     The rows are also what makes this the test that notices the stack
 ///     reading `self.panes[active]` instead of the pane it was handed. That
@@ -6378,17 +6387,29 @@ fn a_non_map_pane_keeps_the_controls_that_apply_to_it_and_drops_the_rest() {
              only ever show the live volume"
         );
         h.mouse_click(h.timeline().loop_toggle.0.center());
-        assert!(
-            !h.last_actions().iter().any(|a| {
-                matches!(
-                    a,
-                    crate::actions::GuiAction::EnableLoop { .. }
-                        | crate::actions::GuiAction::DisableLoop { .. }
-                )
-            }),
-            "{kind:?}: the loop toggle armed a loop for a pane nothing \
-             renders loop frames for, so enabling it would wait for ever"
-        );
+        let armed = h.last_actions().iter().any(|a| {
+            matches!(
+                a,
+                crate::actions::GuiAction::EnableLoop { .. }
+                    | crate::actions::GuiAction::DisableLoop { .. }
+            )
+        });
+        match kind {
+            // A section pane is a loop participant: its frames are rasters of
+            // the line it is aimed along, one per volume.
+            PaneKind::CrossSection => assert!(
+                armed,
+                "CrossSection: the loop toggle did nothing, so a section pane \
+                 cannot be animated even though every frame of one is a picture"
+            ),
+            // A volume pane is not, and the toggle must say so rather than
+            // arming a loop nothing renders frames for.
+            _ => assert!(
+                !armed,
+                "{kind:?}: the loop toggle armed a loop for a pane nothing \
+                 renders loop frames for, so enabling it would wait for ever"
+            ),
+        }
         assert!(
             h.stack().rows.is_empty(),
             "{kind:?}: layer rows were drawn for a pane with no map to draw \
@@ -11893,10 +11914,11 @@ fn the_loop_and_archive_scrubbers_resolve_distinct_ids() {
         pane.loop_state = crate::pane::LoopPlaybackState::new_for_loop(
             600,
             rustdar_radar::sites::get_radar_site("KTLX").unwrap(),
+            rustdar_radar::types::RenderView::PlanView,
         );
         pane.loop_state.frames = vec![crate::pane::LoopFrame {
             timestamp: chrono::Utc::now().naive_utc(),
-            texture: None,
+            image: None,
             render_in_flight: false,
             render_failed: false,
         }];
@@ -12719,7 +12741,11 @@ fn the_transport_controls_emit_the_exact_payloads_the_frontend_acts_on() {
     // way the frontend stages it, through the pane's own loop state.
     let site = rustdar_radar::sites::get_radar_site("KTLX").expect("known site");
     h.gui_mut().pane_mut(0).expect("pane 0").loop_state =
-        crate::pane::LoopPlaybackState::new_for_loop(3600, site);
+        crate::pane::LoopPlaybackState::new_for_loop(
+            3600,
+            site,
+            rustdar_radar::types::RenderView::PlanView,
+        );
     h.warm_up();
     let (rect, on) = h.timeline().loop_toggle;
     assert!(on, "precondition: the probe reports the loop as on");
@@ -12836,7 +12862,11 @@ fn the_loop_toggle_is_a_real_button_with_a_visible_on_state() {
     // on-state.
     let site = rustdar_radar::sites::get_radar_site("KTLX").expect("known site");
     h.gui_mut().pane_mut(0).expect("pane 0").loop_state =
-        crate::pane::LoopPlaybackState::new_for_loop(3600, site);
+        crate::pane::LoopPlaybackState::new_for_loop(
+            3600,
+            site,
+            rustdar_radar::types::RenderView::PlanView,
+        );
     h.frames_for(5, 0.1);
     let (rect, on) = h.timeline().loop_toggle;
     assert!(on, "the probe must report the loop as on");

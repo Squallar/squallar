@@ -104,12 +104,13 @@ fn loop_for(product: RadarProduct, n: u32) -> LoopPlaybackState {
             lon: -97.27,
             heights: None,
         },
+        rustdar_radar::types::RenderView::PlanView,
     );
     ls.phase = LoopPhase::Rendering;
     ls.frames = (0..n)
         .map(|i| LoopFrame {
             timestamp: ts(i),
-            texture: None,
+            image: None,
             render_in_flight: false,
             render_failed: false,
         })
@@ -423,8 +424,8 @@ fn a_level3_loops_batch_settles_on_its_pairings_not_on_volumes() {
 
     // One rendered, one gap, one rendered: the batch settles and the loop is
     // promoted rather than abandoned — the gap is not held against it.
-    ls.frames[0].texture = Some(image());
-    ls.frames[2].texture = Some(image());
+    ls.frames[0].image = Some(rustdar_egui::pane::LoopFrameImage::PlanView(image()));
+    ls.frames[2].image = Some(rustdar_egui::pane::LoopFrameImage::PlanView(image()));
     mgr.cache_l3_product(SITE, code, ts(1), None);
     ls.frames[1].render_failed = true;
     assert!(loop_batch_settled(&mgr, &ls, MAX_LOOP_RENDER_BUDGET));

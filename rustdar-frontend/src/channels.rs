@@ -273,6 +273,53 @@ pub struct LoopRenderResponse {
     pub max_range_km: f64,
 }
 
+/// Result from cutting a single cross-section loop frame.
+///
+/// The section counterpart of [`LoopRenderResponse`], and a separate type rather
+/// than a variant of it because the two identify their pictures with different
+/// things: a plan-view frame is pinned by the sweep its own scan snapped the
+/// selection to, and a section frame by the line, the storm motion vector and
+/// the tilt ladder it was cut from. A shared type would have to carry both sets
+/// with half of each unused, and every receiver would have to check which half
+/// applied — which is exactly the reading that lets a plan-view raster into a
+/// section pane's frame list.
+pub struct LoopSectionResponse {
+    pub pane_idx: usize,
+    pub timestamp: NaiveDateTime,
+    /// The site/product half of the key this cut was dispatched for. Compared
+    /// against `LoopPlaybackState::rendered_for` on arrival.
+    pub target: RenderTarget,
+    /// The line/storm-motion half. Compared against
+    /// `LoopPlaybackState::section_key` on arrival, and both halves must match
+    /// — see `LoopPlaybackState::is_cut_for`.
+    pub key: rustdar_egui::pane::SectionLoopKey,
+    /// The fingerprint of the tilt ladder this raster was actually cut from,
+    /// from `rustdar_radar::sampler::ladder_fingerprint` over the frame's own
+    /// scan at dispatch.
+    ///
+    /// Set unconditionally, on the failure path too, for the reason
+    /// [`LoopRenderResponse::snapped`] is: it describes the cut that was
+    /// dispatched, and there is one send site to set it from.
+    pub ladder: u64,
+    /// The finished raster, already in egui's pixel layout, or `None` when this
+    /// volume carried nothing to cut.
+    ///
+    /// Converted before the send for the reason
+    /// [`LoopRenderResponse::image`] gives — a `SECTION_WIDTH × SECTION_HEIGHT`
+    /// RGBA buffer and its `Color32` copy are 8 MiB apiece natively and never
+    /// coexist in the channel.
+    pub image: Option<egui::ColorImage>,
+    /// The height and distance scales the raster was cut against, and where the
+    /// ladder's rungs are. Travel with the picture because they are labels *on*
+    /// it: without them a loop would animate each frame's raster under the
+    /// previous frame's axes.
+    ///
+    /// `None` exactly when [`Self::image`] is.
+    pub axes: Option<rustdar_radar::xsect::SectionAxes>,
+    /// See [`Self::axes`].
+    pub tilt_elevations_deg: Vec<f64>,
+}
+
 /// One round of a site's real-time chunk feed.
 ///
 /// Deliberately **not** a variant of [`ScanResponse`]. That type's drain bakes in
@@ -340,6 +387,8 @@ pub struct ChannelHub {
     pub loop_l3_fetch_receiver: Receiver<LoopL3FetchResponse>,
     pub loop_render_sender: Sender<LoopRenderResponse>,
     pub loop_render_receiver: Receiver<LoopRenderResponse>,
+    pub loop_section_sender: Sender<LoopSectionResponse>,
+    pub loop_section_receiver: Receiver<LoopSectionResponse>,
     pub chunk_sender: Sender<ChunkResponse>,
     pub chunk_receiver: Receiver<ChunkResponse>,
     pub sounding_sender: Sender<SoundingResponse>,
@@ -366,6 +415,7 @@ impl ChannelHub {
         let (loop_l3_list_sender, loop_l3_list_receiver) = std::sync::mpsc::channel();
         let (loop_l3_fetch_sender, loop_l3_fetch_receiver) = std::sync::mpsc::channel();
         let (loop_render_sender, loop_render_receiver) = std::sync::mpsc::channel();
+        let (loop_section_sender, loop_section_receiver) = std::sync::mpsc::channel();
         let (sounding_sender, sounding_receiver) = std::sync::mpsc::channel();
         let (chunk_sender, chunk_receiver) = std::sync::mpsc::channel();
 
@@ -394,6 +444,8 @@ impl ChannelHub {
             loop_l3_fetch_receiver,
             loop_render_sender,
             loop_render_receiver,
+            loop_section_sender,
+            loop_section_receiver,
             chunk_sender,
             chunk_receiver,
             sounding_sender,
