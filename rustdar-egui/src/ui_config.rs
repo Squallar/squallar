@@ -1076,9 +1076,11 @@ fn reconcile_draw_order(saved: &[OverlayKind]) -> Vec<OverlayKind> {
 #[path = "ui_config/live_chunks_config_tests.rs"]
 #[cfg(test)]
 mod live_chunks_config_tests;
+
 #[path = "ui_config/notifier_config_tests.rs"]
 #[cfg(test)]
 mod notifier_config_tests;
+
 #[path = "ui_config/tests.rs"]
 #[cfg(test)]
 mod tests;

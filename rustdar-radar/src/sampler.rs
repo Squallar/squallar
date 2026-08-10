@@ -1365,7 +1365,7 @@ fn azimuth_bracket(rung: &Rung<'_>, azimuth: f64) -> Option<(usize, usize, f64)>
 fn gate_bracket(moment: &MomentData, slant_km: f64) -> (Sample, Sample, f64) {
     // A zero gate interval is not guarded separately: `gate_interval_km` is a
     // `u16` of metres so it cannot be negative, and dividing by zero lands on
-    // an infinity or a `NaN` that the finiteness test below already refuses.
+    // an infinity or a `NaN` that the finiteness test already refuses.
     // A second guard would be an unreachable branch, and an unreachable branch
     // is one nothing can pin.
     let x = (slant_km - moment.first_gate_range_km()) / moment.gate_interval_km();

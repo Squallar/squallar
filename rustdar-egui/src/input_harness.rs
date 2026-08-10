@@ -689,7 +689,7 @@ impl InputHarness {
     /// Arm or disarm the cross-section draw.
     ///
     /// The menu entry's own end-to-end click has its own test; this is for the
-    /// pointer tests below, whose subject is the drag rather than the checkbox.
+    /// pointer tests, whose subject is the drag rather than the checkbox.
     pub(crate) fn set_section_draw_armed(&mut self, armed: bool) {
         self.gui.set_section_draw_armed(armed);
     }

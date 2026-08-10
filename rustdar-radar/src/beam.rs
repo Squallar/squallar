@@ -299,7 +299,7 @@ pub fn great_circle_point(a: (f64, f64), b: (f64, f64), t: f64) -> (f64, f64) {
     // `√(1 − hav)` turns even one ulp into `sin d ≈ 2e-8`, and two into
     // `≈ 3e-8` — eight orders above `f64::EPSILON`. So `sin d == 0.0` catches
     // **0** of the 3602, `|sin d| < f64::EPSILON` catches the 2922 that landed
-    // on 1.0 and misses all 680 that did not, and only the `hav` test below
+    // on 1.0 and misses all 680 that did not, and only the `hav` test
     // catches every one. What leaks returns `(0.0, 0.0)` — null island, a real
     // place in the Gulf of Guinea — which is the failure mode this guard exists
     // to prevent.

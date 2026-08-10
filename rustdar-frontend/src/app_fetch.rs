@@ -1380,9 +1380,11 @@ fn append_polled_frame(
 #[path = "app_fetch/local_time_tests.rs"]
 #[cfg(test)]
 mod local_time_tests;
+
 #[path = "app_fetch/loop_frame_image_tests.rs"]
 #[cfg(test)]
 mod loop_frame_image_tests;
+
 #[path = "app_fetch/loop_pane_tests.rs"]
 #[cfg(test)]
 mod loop_pane_tests;

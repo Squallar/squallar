@@ -277,7 +277,7 @@ impl OverlayTextureCache {
 /// # `false` implies containment
 ///
 /// Measuring the band rather than assuming it buys a guarantee stronger than the
-/// tests below check, and it holds by construction rather than by fixture. Per axis,
+/// tests check, and it holds by construction rather than by fixture. Per axis,
 /// write `D = tex_range - view_range` and `m = h·D/2` with
 /// `h = 1 - PAN_REBUILD_THRESHOLD`. Returning `false` requires both
 /// `view_min >= tex_min + m` and `view_max <= tex_max - m`; subtracting gives
@@ -433,5 +433,6 @@ pub fn current_quantized_zoom(zoom: f64) -> i32 {
 
 #[cfg(test)]
 mod geo_click_tests;
+
 #[cfg(test)]
 mod texture_budget_tests;

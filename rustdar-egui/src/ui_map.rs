@@ -1886,6 +1886,7 @@ pub(super) fn compute_hover_info_raw(
 #[path = "ui_map/tests.rs"]
 #[cfg(test)]
 mod tests;
+
 #[path = "ui_map/volume_arm_tests.rs"]
 #[cfg(test)]
 mod volume_arm_tests;

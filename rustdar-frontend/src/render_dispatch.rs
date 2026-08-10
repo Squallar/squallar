@@ -1436,9 +1436,12 @@ impl RenderDispatcher {
 
 #[cfg(test)]
 mod level3_dispatch_tests;
+
 #[cfg(test)]
 mod render_cache_tests;
+
 #[cfg(test)]
 mod render_invalidation_tests;
+
 #[cfg(test)]
 mod section_payload_cache_tests;

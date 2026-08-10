@@ -1018,7 +1018,7 @@ impl VolumePainter for BridgeVolumePainter {
 /// boxed trait object inside the `Arc`. `rustdar-egui` supplies the real rect
 /// when it constructs its own `PaintCallback`.
 ///
-/// Generic over the callback so the test below can exercise the wrapper without
+/// Generic over the callback so the tests can exercise the wrapper without
 /// a `VoxelGrid` — which has no constructor outside `build_voxels` and would
 /// need a synthetic `Scan` to obtain. That `VolumeCallback` itself satisfies
 /// `CallbackTrait` is proven by this function's one production call site

@@ -3578,7 +3578,9 @@ impl Gui {
 
 #[cfg(test)]
 mod chunk_scan_info_tests;
+
 #[cfg(test)]
 mod pane_slice_tests;
+
 #[cfg(test)]
 mod storm_motion_override_tests;

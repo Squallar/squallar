@@ -509,9 +509,11 @@ impl super::App {
 #[path = "app_chunks/selection_tests.rs"]
 #[cfg(test)]
 mod selection_tests;
+
 #[path = "app_chunks/tests.rs"]
 #[cfg(test)]
 mod tests;
+
 #[path = "app_chunks/volume_close_tests.rs"]
 #[cfg(test)]
 mod volume_close_tests;

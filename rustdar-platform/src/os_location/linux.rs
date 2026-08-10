@@ -98,12 +98,12 @@ use super::{OsLocationProvider, OsLocationSink};
 // unsandboxed caller with `xdp_app_info_is_host` and asks for no app id at
 // all, so nothing in this provider has one to declare. The `.desktop` file is
 // still shipped and still matters — for the launcher, the icon, window
-// grouping and a future Flatpak — and the tests at the bottom still pin its
+// grouping and a future Flatpak — and the tests still pin its
 // contents; see `packaging/linux/README.md`.
 
 /// Altitude's "unknown" sentinel, the minimum double value, which `ashpd`
 /// spells `-f64::MAX` and this file spells [`f64::MIN`]. They are the same
-/// number; only one of them is checkable by eye, and a test below pins that
+/// number; only one of them is checkable by eye, and a test pins that
 /// they have not drifted apart.
 const ALTITUDE_UNKNOWN: f64 = f64::MIN;
 

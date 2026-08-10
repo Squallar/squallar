@@ -2639,9 +2639,11 @@ fn render_already_queued(
 #[path = "app_render/frame_build_order_tests.rs"]
 #[cfg(test)]
 mod frame_build_order_tests;
+
 #[path = "app_render/frame_order_tests.rs"]
 #[cfg(test)]
 mod frame_order_tests;
+
 /// What `poll_level3_results` does with a channel holding more than one answer.
 ///
 /// Built on `stamping_tests`' fixtures: an `App` with one pane on a real radar,
@@ -2649,13 +2651,16 @@ mod frame_order_tests;
 #[path = "app_render/level3_poll_tests.rs"]
 #[cfg(test)]
 mod level3_poll_tests;
+
 #[path = "app_render/loop_dispatch_tests.rs"]
 #[cfg(test)]
 mod loop_dispatch_tests;
+
 /// What the loop timer does with a playback speed no slider could have set.
 #[path = "app_render/loop_interval_tests.rs"]
 #[cfg(test)]
 mod loop_interval_tests;
+
 /// The Level III half of the loop: pairing a bucket object to each frame's volume,
 /// what a gap does, and what happens when a pane retargets across the datasource
 /// line mid-loop.
@@ -2668,6 +2673,7 @@ mod loop_interval_tests;
 #[path = "app_render/loop_level3_tests.rs"]
 #[cfg(test)]
 mod loop_level3_tests;
+
 /// The plan-view render pipeline against a pane that has no plan view.
 ///
 /// Four production loops dispatch, cache or broadcast a full-size plan-view
@@ -2686,6 +2692,7 @@ mod loop_level3_tests;
 #[path = "app_render/pane_kind_render_filter_tests.rs"]
 #[cfg(test)]
 mod pane_kind_render_filter_tests;
+
 /// A restored image describes itself too.
 ///
 /// `restore_cached_render` is the one path that puts a radar texture on screen
@@ -2702,6 +2709,7 @@ mod pane_kind_render_filter_tests;
 #[path = "app_render/restore_describes_its_image_tests.rs"]
 #[cfg(test)]
 mod restore_describes_its_image_tests;
+
 /// What a section pane is told when it cannot be cut, and when the picture on
 /// screen has stopped being the truth.
 ///
@@ -2713,12 +2721,14 @@ mod restore_describes_its_image_tests;
 #[path = "app_render/section_dispatch_tests.rs"]
 #[cfg(test)]
 mod section_dispatch_tests;
+
 /// What `poll_level3_results` does with sounding responses: the same drain and
 /// fetch-generation gate as everything else on it, plus the keep-on-failure
 /// rule that makes the TTL retry loop safe.
 #[path = "app_render/sounding_poll_tests.rs"]
 #[cfg(test)]
 mod sounding_poll_tests;
+
 /// What `apply_render_to_pane` does with a finished image beyond placing it.
 ///
 /// Reached by building an `App` — see `app::tests::headless` — with the

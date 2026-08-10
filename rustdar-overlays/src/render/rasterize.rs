@@ -1108,9 +1108,12 @@ pub fn rasterize_model_data(
 
 #[cfg(test)]
 mod glm_energy_tests;
+
 #[cfg(test)]
 pub(crate) mod lambert_fixture;
+
 #[cfg(test)]
 mod model_nan_tests;
+
 #[cfg(test)]
 mod projection_window_tests;
