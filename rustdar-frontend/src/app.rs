@@ -1334,16 +1334,13 @@ impl App {
                     let (fill_rgba, stroke_rgba) = (feature.fill_rgba, feature.stroke_rgba);
                     // The exterior ring of each polygon — exactly the part
                     // the pane's `draw_feature` fills and strokes.
-                    feature
-                        .polygons
-                        .into_iter()
-                        .filter_map(move |mut polygon| {
-                            (!polygon.is_empty()).then(|| crate::volume::floor::FloorShape {
-                                ring: polygon.swap_remove(0),
-                                fill_rgba,
-                                stroke_rgba,
-                            })
+                    feature.polygons.into_iter().filter_map(move |mut polygon| {
+                        (!polygon.is_empty()).then(|| crate::volume::floor::FloorShape {
+                            ring: polygon.swap_remove(0),
+                            fill_rgba,
+                            stroke_rgba,
                         })
+                    })
                 })
                 .collect()
         };
@@ -5337,7 +5334,10 @@ mod tests {
             "the warning-driven reopen must re-dispatch through the same \
              drain the tile reopen uses",
         );
-        assert!(app.floor_owed.is_empty(), "the re-dispatch settles the debt");
+        assert!(
+            app.floor_owed.is_empty(),
+            "the re-dispatch settles the debt"
+        );
 
         // The gathered vectors carry the warning to the composite, over the
         // radar where the pane stacks alerts.

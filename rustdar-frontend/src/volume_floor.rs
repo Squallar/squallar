@@ -616,9 +616,16 @@ fn rasterize_shape_layer(shapes: &[FloorShape], f: &FloorFootprint) -> Option<Ve
         }
         if shape.stroke_rgba[3] > 0 {
             let width = stroke_width_texels(min_c, max_c, min_r, max_r);
-            stroke_ring(&vertices, width, f, &mut stamps, stroke_stamp, |row, col| {
-                blend_texel(&mut buffer, f.out_w, row, col, shape.stroke_rgba);
-            });
+            stroke_ring(
+                &vertices,
+                width,
+                f,
+                &mut stamps,
+                stroke_stamp,
+                |row, col| {
+                    blend_texel(&mut buffer, f.out_w, row, col, shape.stroke_rgba);
+                },
+            );
         }
     }
     painted.then_some(buffer)
@@ -773,10 +780,7 @@ fn clip_segment(
             return None;
         }
     }
-    Some((
-        (x0 + dx * t0, y0 + dy * t0),
-        (x0 + dx * t1, y0 + dy * t1),
-    ))
+    Some(((x0 + dx * t0, y0 + dy * t0), (x0 + dx * t1, y0 + dy * t1)))
 }
 
 /// Source-over of straight-alpha `rgba` onto the straight-alpha `buffer`
@@ -793,8 +797,7 @@ fn blend_texel(buffer: &mut [u8], out_w: usize, row: usize, col: usize, rgba: [u
     for channel in 0..3 {
         let src = f64::from(rgba[channel]);
         let dst = f64::from(buffer[at + channel]);
-        buffer[at + channel] =
-            ((src * src_a + dst * dst_a * (1.0 - src_a)) / out_a).round() as u8;
+        buffer[at + channel] = ((src * src_a + dst * dst_a * (1.0 - src_a)) / out_a).round() as u8;
     }
     buffer[at + 3] = (out_a * 255.0).round() as u8;
 }
@@ -1162,7 +1165,8 @@ mod tests {
         for row in 0..floor.size[1] as usize {
             for col in 0..floor.size[0] as usize {
                 let at = (row * floor.size[0] as usize + col) * 4;
-                let blueness = floor.rgba[at + 2].saturating_sub(floor.rgba[at].max(floor.rgba[at + 1]));
+                let blueness =
+                    floor.rgba[at + 2].saturating_sub(floor.rgba[at].max(floor.rgba[at + 1]));
                 if blueness > 100 {
                     cluster.push((col, row));
                 }
@@ -1240,11 +1244,8 @@ mod tests {
     #[test]
     fn a_tile_pixel_and_a_radar_gate_at_the_same_ground_land_on_the_same_texel() {
         for (dx_km, dy_km) in [(100.0, 150.0), (-200.0, -190.0)] {
-            let ((red_col, red_row), (green_col, green_row)) =
-                tile_and_gate_texels(dx_km, dy_km);
-            let apart = green_col
-                .abs_diff(red_col)
-                .max(green_row.abs_diff(red_row));
+            let ((red_col, red_row), (green_col, green_row)) = tile_and_gate_texels(dx_km, dy_km);
+            let apart = green_col.abs_diff(red_col).max(green_row.abs_diff(red_row));
             assert!(
                 apart <= 2,
                 "at ({dx_km}, {dy_km}) km the radar gate and the tile pixel \
