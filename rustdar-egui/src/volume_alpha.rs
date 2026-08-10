@@ -75,9 +75,16 @@ impl AlphaCurve {
         Self(Arc::new(alphas))
     }
 
-    /// The palette's own alpha channel as a curve — what an untouched editor
+    /// A grid table's alpha channel as a curve — what an untouched editor
     /// shows, and what a first stroke starts from. `None` unless `lut` is the
     /// exact 1024 bytes a `VoxelGrid::lut()` hands over.
+    ///
+    /// Those bytes are the plan-view palette's alpha **times the product's 3D
+    /// transparency profile**, not the palette's alpha. The distinction is not
+    /// pedantry: for ρHV at 0.99 the palette says 180 and the grid table says
+    /// 0, because uniform precipitation is exactly what that profile exists to
+    /// see through. Anything in this module that says "the palette's alpha"
+    /// means these bytes.
     pub fn from_palette(lut: &[u8]) -> Option<Self> {
         if lut.len() != CURVE_LEN * 4 {
             return None;
@@ -170,7 +177,9 @@ pub fn apply_stroke(alphas: &mut [u8; CURVE_LEN], from: (f32, f32), to: (f32, f3
 /// Keyed by product from day one: only reflectivity renders in 3D today, but
 /// the products WP is next and a curve drawn for one moment must never apply
 /// to another. Absence is the meaningful default — a product with no entry
-/// renders through its palette's own alpha, bit-exactly.
+/// renders through its grid table's own alpha, bit-exactly — the palette's
+/// alpha through the product's 3D transparency profile; see
+/// [`AlphaCurve::from_palette`].
 #[derive(Default)]
 pub struct AlphaCurves {
     curves: HashMap<RadarProduct, AlphaCurve>,
@@ -189,7 +198,9 @@ impl AlphaCurves {
         self.curves.insert(product, curve);
     }
 
-    /// Forget `product`'s curve — the reset, back to the palette's own alpha.
+    /// Forget `product`'s curve — the reset, back to the grid table's own
+    /// alpha. See [`AlphaCurve::from_palette`] for why that is not the same
+    /// thing as the palette's.
     pub fn reset(&mut self, product: RadarProduct) {
         self.curves.remove(&product);
     }
@@ -221,11 +232,11 @@ mod tests {
         lut
     }
 
-    /// The seeded default is the palette's own alpha, entry for entry — which
-    /// is what makes "open the editor and touch nothing" a no-op by
+    /// The seeded default is the grid table's own alpha, entry for entry —
+    /// which is what makes "open the editor and touch nothing" a no-op by
     /// construction rather than by luck.
     #[test]
-    fn the_default_curve_is_the_palettes_own_alpha() {
+    fn the_default_curve_is_the_grid_tables_own_alpha() {
         let lut = reflectivity_shaped_lut();
         let curve = AlphaCurve::from_palette(&lut).expect("a 1024-byte palette seeds");
         for (i, (alpha, entry)) in curve.alphas().iter().zip(lut.chunks_exact(4)).enumerate() {

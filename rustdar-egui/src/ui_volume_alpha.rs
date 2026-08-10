@@ -19,8 +19,22 @@
 //! Edits apply **live**: every frame of the drag writes the store the next
 //! frame's `VolumeFrameState` reads, and the frontend re-uploads the 1 KiB
 //! LUT only when the bytes changed. Right-click on the canvas, or the Reset
-//! button, forgets the product's curve entirely — which restores the
-//! palette's own alpha bit-exactly, because "no curve" is the bit-exact state.
+//! button, forgets the product's curve entirely — which restores the **grid's
+//! own table** bit-exactly, because "no curve" is the bit-exact state.
+//!
+//! # What reset actually restores
+//!
+//! Not "the palette's opacity". The bytes a `VoxelGrid` hands over are the
+//! plan-view palette's alpha already multiplied by the product's 3D
+//! transparency profile (`rustdar_radar::voxel::volume_alpha_profile`), so a
+//! value the map paints solid can come back invisible here: the palette's
+//! alpha for ρHV at 0.99 is 180, and the grid table's is 0, because uniform
+//! precipitation is what that profile exists to see through. The button and
+//! its hover say so. What makes the reset safe anyway is that
+//! `volume_bridge::effective_lut` *replaces* the alpha channel rather than
+//! multiplying into it, so the profile is a recoverable default and not a
+//! floor the user can never climb back to — and the canvas below the button
+//! draws the table, so the truth is on screen either way.
 //!
 //! # Index 0
 //!
@@ -36,6 +50,17 @@ use crate::volume_alpha::{AlphaCurve, AlphaCurves, CURVE_LEN, apply_stroke};
 /// The pane-corner button's label. Named here so the input harness can find
 /// the button the same way the menu labels are found.
 pub(crate) const ALPHA_BUTTON_LABEL: &str = "Volume alpha";
+
+/// The reset button's label.
+///
+/// It read "Reset to palette" and the hover said "render through the
+/// palette's own opacity again", which stopped being true when the
+/// per-product 3D transparency profiles landed after the editor: reset
+/// restores the *grid* table, which is the palette's alpha times the profile.
+/// For ρHV at 0.99 the palette's own opacity is 180 and what reset gives is 0.
+/// Named as a constant so the wording has one home and the test that pins it
+/// cannot drift from the button.
+pub(crate) const RESET_LABEL: &str = "Reset to the 3D default";
 
 /// Inset of the button from the pane's top-right corner, points. Mirrors the
 /// caption's margin in the opposite corner.
@@ -128,9 +153,10 @@ fn editor_contents(
     let palette = target.and_then(|t| painter.and_then(|p| p.palette(pane_idx, t)));
     let palette_curve = palette.as_deref().and_then(AlphaCurve::from_palette);
 
-    // What the canvas shows: the user's curve, else the palette's own alpha.
-    // An untouched editor therefore *shows* exactly what renders — and stores
-    // nothing, which is what keeps it bit-exact.
+    // What the canvas shows: the user's curve, else the grid table's own
+    // alpha — palette times profile, the very bytes the volume is drawn
+    // through. An untouched editor therefore *shows* exactly what renders —
+    // and stores nothing, which is what keeps it bit-exact.
     let shown = curves.get(product).or_else(|| palette_curve.clone());
     let Some(shown) = shown else {
         // Two different absences, two different sentences. A product the
@@ -154,12 +180,13 @@ fn editor_contents(
 
     ui.horizontal(|ui| {
         if ui
-            .add_enabled(
-                curves.is_edited(product),
-                egui::Button::new("Reset to palette"),
-            )
+            .add_enabled(curves.is_edited(product), egui::Button::new(RESET_LABEL))
             .on_hover_text(
-                "Forget the drawn curve and render through the palette's own opacity again.",
+                "Forget the drawn curve and render through this product's default volume \
+                 opacity again \u{2014} the plan-view palette's alpha shaped by the product's \
+                 own 3D transparency profile. That is not the plan view's opacity: a value \
+                 the map paints solid can be see-through here, which is what makes a storm's \
+                 interior visible.",
             )
             .clicked()
         {
@@ -256,7 +283,7 @@ fn curve_point(curve_rect: egui::Rect, pos: egui::Pos2) -> (f32, f32) {
     (index, alpha)
 }
 
-/// Draw the dark canvas, the palette strip, the palette's own alpha as a
+/// Draw the dark canvas, the palette strip, the grid table's own alpha as a
 /// reference line while an edit diverges from it, and the shown curve.
 fn paint_editor(
     canvas: &egui::Painter,
@@ -315,7 +342,7 @@ fn paint_editor(
             .collect()
     };
 
-    // The palette's own alpha as a faint reference under an edited curve, so
+    // The grid table's own alpha as a faint reference under an edited curve, so
     // "how far am I from the default" is visible while dragging.
     if let Some(reference) = palette_reference {
         canvas.add(egui::Shape::line(
@@ -327,4 +354,37 @@ fn paint_editor(
         polyline(shown),
         egui::Stroke::new(1.5, egui::Color32::WHITE),
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The reset button must not promise the palette's opacity.
+    ///
+    /// It read "Reset to palette", hover "render through the palette's own
+    /// opacity again". That was true when the editor landed and stopped being
+    /// true when the per-product 3D transparency profiles landed after it:
+    /// what reset restores is `VoxelGrid::lut()`, which is the palette's alpha
+    /// **times** the profile. For ρHV the palette's own opacity at 0.99 is 180
+    /// and what the button gives is 0 — not merely different, but the
+    /// difference between a solid wall and nothing at all, on the one product
+    /// whose profile exists to see through uniform rain.
+    ///
+    /// Pinned as text because the label *is* the artifact: the behaviour was
+    /// never wrong, only the sentence describing it, and a sentence has no
+    /// other test.
+    #[test]
+    fn the_reset_button_does_not_promise_the_palettes_own_opacity() {
+        assert!(
+            !RESET_LABEL.to_ascii_lowercase().contains("palette"),
+            "the reset button reads {RESET_LABEL:?}, which promises the plan \
+             view's opacity and delivers the 3D profile's",
+        );
+        assert!(
+            RESET_LABEL.to_ascii_lowercase().contains("default"),
+            "the reset button reads {RESET_LABEL:?}, which does not say what \
+             it restores",
+        );
+    }
 }
