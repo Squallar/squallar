@@ -25,6 +25,8 @@ rustdar-gps = { workspace = true }
 # `default-tls` (= platform verifier + aws-lc-rs) and undo the aws-lc-sys removal.
 reqwest = { workspace = true, features = ["json"] }
 chrono = { workspace = true }
+# The volume grid's texel encoder writes `Rg16Float`; see the workspace note.
+half = { workspace = true }
 egui = { workspace = true }
 # Defaults are off at the workspace level, because egui-wgpu's `default` set
 # contains `wgpu/default` -- and that contains `webgpu`, which this build must

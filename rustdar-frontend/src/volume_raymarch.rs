@@ -318,7 +318,7 @@ impl VolumePipelines {
                     binding: BINDING_GRID_TEXTURE,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        // Filterable is the stated reason `Rg8Unorm` was
+                        // Filterable is the stated reason `Rg16Float` was
                         // chosen: index-to-dBZ is affine, so hardware filtering
                         // within data is exactly linear dBZ interpolation — and
                         // the coverage-premultiplied reconstruction needs the
@@ -1152,8 +1152,15 @@ impl VolumeTextures {
 }
 
 /// Bytes one cell of [`VOLUME_TEXTURE_FORMAT`] occupies: the premultiplied
-/// index and the coverage beside it.
-pub const GRID_BYTES_PER_CELL: u32 = 2;
+/// index and the coverage beside it, a half float each.
+///
+/// Two bytes a channel rather than one is not headroom. See
+/// [`VOLUME_TEXTURE_FORMAT`] for why an eight-bit channel makes `R̄ / Ḡ`
+/// wrong at an echo edge on any sampler that filters `unorm` in fixed point.
+pub const GRID_BYTES_PER_CELL: u32 = 4;
+
+/// Bytes one channel of [`VOLUME_TEXTURE_FORMAT`] occupies.
+const GRID_BYTES_PER_CHANNEL: usize = 2;
 
 /// Cells a grid of this shape holds, or `None` if the product overflows —
 /// which is also the length of the one-byte-per-cell index plane a caller
@@ -1222,19 +1229,33 @@ fn coarse_cells(cells: [u32; 3]) -> [u32; 3] {
 /// binary_coverage` pins it.
 ///
 /// One pass over the plane, at grid-upload time — once per built volume, not
-/// per frame. On the desktop shape that is 8 MiB read and 16 MiB written in the
+/// per frame. On the desktop shape that is 8 MiB read and 32 MiB written in the
 /// same `prepare` that already walks the same bytes to build the coarse level.
 fn coverage_premultiplied(indices: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(indices.len() * GRID_BYTES_PER_CELL as usize);
     for &index in indices {
-        out.push(index);
-        out.push(if index == rustdar_radar::voxel::NO_DATA_INDEX {
-            0
-        } else {
-            u8::MAX
-        });
+        let covered = index != rustdar_radar::voxel::NO_DATA_INDEX;
+        // `index` is already `coverage x index` in byte units: coverage is
+        // binary and the only index it zeroes is 0 itself.
+        push_channel(&mut out, f32::from(index) / 255.0);
+        push_channel(&mut out, if covered { 1.0 } else { 0.0 });
     }
     out
+}
+
+/// Append one [`VOLUME_TEXTURE_FORMAT`] channel to a texel plane.
+///
+/// Little endian, which is what `write_texture` wants on every target this
+/// builds for — WebGPU's texel byte order is the format's own, and no
+/// big-endian target is in the matrix.
+fn push_channel(out: &mut Vec<u8>, value: f32) {
+    out.extend_from_slice(&half::f16::from_f32(value).to_le_bytes());
+}
+
+/// Read one [`VOLUME_TEXTURE_FORMAT`] channel back out of a texel plane.
+fn read_channel(plane: &[u8], at: usize) -> f32 {
+    let bytes = [plane[at], plane[at + 1]];
+    half::f16::from_le_bytes(bytes).to_f32()
 }
 
 /// Write the hand-built coarse level into the grid texture's mip 1.
@@ -1291,37 +1312,34 @@ fn upload_coarse_level(
 /// So the coarse level is now strictly more informative than the level it
 /// replaces, and the code is a mean.
 ///
-/// Rounding stays to nearest, on the premultiplied channel. Averaging indices
-/// is exact averaging of the physical value because index↔value is affine —
-/// the same fact that justified the format's linear filtering in the first
-/// place.
+/// The mean is taken in `f32` and stored back as the format's half float.
+/// Averaging indices is exact averaging of the physical value because
+/// index↔value is affine — the same fact that justified the format's linear
+/// filtering in the first place.
 ///
-/// # The identity is exact in ℝ and quantised in u8
+/// # The identity is exact in ℝ and quantised in binary16
 ///
-/// It is **not** exactly the occupancy mean once stored, and that is worth
-/// naming because it runs the other way from every other claim here: on sparse
-/// blocks this level is *lossier* than the `round(Σ x / n)` it replaces. Both
-/// channels round to u8 before the shader divides, and the divisor is not `n`
-/// but `round₈(255 n)`, which steps in units of 255/8 ≈ 31.9. So what the
-/// shader reconstructs is `255 · round₈(Σ x) / round₈(255 n)`, not `Σ x / n`.
+/// It is not *exactly* the occupancy mean once stored, because both channels
+/// round to the texel format before the shader divides. What the shader
+/// reconstructs is `half(Σ c x / 8) / half(Σ c / 8)`, not `Σ c x / Σ c`.
 ///
-/// The bound over every reachable `(n, Σ x)` is **under 4 index units** — worst
-/// at `n = 1, x = 4`, which stores `(1, 32)` and reconstructs to 7.97 — against
-/// the old hand-written mean's ±0.5. The colour consequence is negligible,
-/// because the ramp is affine and four index units is a fraction of one palette
-/// band, and it only bites where a coarse block is nearly empty. But it is a
-/// real loss the old code did not have.
+/// Both roundings are **relative** — half an ulp of the value itself, i.e.
+/// 2⁻¹¹ — so the quotient's error is bounded by 2⁻¹⁰ of full scale whatever
+/// the block's occupancy, which is **a quarter of one index unit**. The
+/// convex-hull invariant `field_at` states therefore survives this level to
+/// that tolerance, and the sparse blocks are no worse than the dense ones.
 ///
-/// It also breaks, at this level only, the convex-hull invariant `field_at`
-/// states: a single measured cell at index 1, 2 or 3 rounds `Σ x` to `R̄ = 0`
-/// while `Ḡ = 32`, so the block reconstructs to index **0** — outside the hull
-/// of the one value it holds — at coverage 0.125, which is above the shader's
-/// `COVERAGE_SKIP` and so is a sample the lit volume does take. Four cells at
-/// index 1 land the other way, at 1.99. The hull statement is exact of the
-/// *filter* and of level 0; at level 1 it holds to the same sub-4-index
-/// tolerance and no better.
-/// `the_grid_mip_is_the_rounded_mean_of_each_coarse_blocks_measured_cells`
-/// pins the bound.
+/// This is the same property that made [`VOLUME_TEXTURE_FORMAT`] a float
+/// format, arriving here for the same reason. Under the `Rg8Unorm` this
+/// replaced the divisor was not `n` but `round₈(255 n)`, stepping in units of
+/// 255/8 ≈ 31.9, and the bound was **4 index units** — worst at `n = 1,
+/// x = 4`, which stored `(1, 32)` and reconstructed to 7.97 — with the hull
+/// broken outright on sparse blocks: a single measured cell at index 1, 2 or 3
+/// rounded `Σ x` to `R̄ = 0` while `Ḡ = 32`, so the block reconstructed to
+/// index **0**, outside the hull of the one value it held, at a coverage the
+/// lit volume does sample.
+/// `the_grid_mip_is_the_mean_of_each_coarse_blocks_measured_cells` pins the
+/// bound.
 ///
 /// The stated semantics, precisely: a fetch at an LOD between the levels
 /// interpolates the raw field with this one, so the reconstruction is the
@@ -1346,7 +1364,7 @@ fn downsampled_grid(cells: [u32; 3], premultiplied: &[u8]) -> ([u32; 3], Vec<u8>
     for cz in 0..coarse[2] as usize {
         for cy in 0..coarse[1] as usize {
             for cx in 0..coarse[0] as usize {
-                let mut sum = [0u32; GRID_BYTES_PER_CELL as usize];
+                let mut sum = [0.0f32; 2];
                 for dz in 0..2 {
                     for dy in 0..2 {
                         for dx in 0..2 {
@@ -1355,13 +1373,16 @@ fn downsampled_grid(cells: [u32; 3], premultiplied: &[u8]) -> ([u32; 3], Vec<u8>
                             let fz = (cz * 2 + dz).min(fine[2] - 1);
                             let at = ((fz * fine[1] + fy) * fine[0] + fx) * stride;
                             for (channel, total) in sum.iter_mut().enumerate() {
-                                *total += u32::from(premultiplied[at + channel]);
+                                *total += read_channel(
+                                    premultiplied,
+                                    at + channel * GRID_BYTES_PER_CHANNEL,
+                                );
                             }
                         }
                     }
                 }
                 for total in sum {
-                    out.push(((total + 4) / 8) as u8);
+                    push_channel(&mut out, total / 8.0);
                 }
             }
         }

@@ -2915,8 +2915,8 @@ fn the_length_prefixes_are_where_the_tests_think_they_are() {
 ///
 /// # Why the coverage-premultiplied texture did NOT bump it
 ///
-/// `rustdar-frontend` now uploads the grid as `Rg8Unorm` with
-/// `R = coverage x index` and `G = coverage`, and doubling a texture is the
+/// `rustdar-frontend` now uploads the grid as `Rg16Float` with
+/// `R = coverage x index` and `G = coverage`, and quadrupling a texture is the
 /// shape of change that usually earns a bump. This one does not, because
 /// **not one byte of this payload changed, in layout or in meaning**:
 /// coverage is exactly `index != NO_DATA_INDEX` (pinned by
@@ -3457,7 +3457,7 @@ fn the_capacity_guard_refuses_a_length_the_buffer_cannot_hold() {
 /// Coverage is **exactly** `index != NO_DATA_INDEX`, for every product — the
 /// premise the renderer's coverage-premultiplied texture rests on.
 ///
-/// `rustdar-frontend` uploads this grid as `Rg8Unorm` with `R = coverage x
+/// `rustdar-frontend` uploads this grid as `Rg16Float` with `R = coverage x
 /// index` and `G = coverage`, and it synthesises that second channel at upload
 /// time from the index plane alone rather than carrying it on the wire. That is
 /// only lossless if no measurement can encode as index 0 and no absence can

@@ -108,7 +108,7 @@ struct Volume {
 
 @group(0) @binding(0) var<uniform> volume: Volume;
 
-// The voxel grid: `Rg8Unorm`, **coverage-premultiplied**, sampled `Linear` on
+// The voxel grid: `Rg16Float`, **coverage-premultiplied**, sampled `Linear` on
 // both channels.
 //
 //   R = coverage x index      G = coverage
@@ -307,8 +307,13 @@ const COVERAGE_FLOOR: f32 = 0.5;
 // through the mean, and the reconstruction rung exists to soften spikes rather
 // than to delete them.
 //
-// 1/255 is one stored quantum of the coverage channel — less coverage than a
-// single texel can hold. It is a fill-rate floor and not a claim of
+// 1/255 is one step of the palette the index channel carries — a coverage
+// finer than the field it weights can resolve. (It used to be one stored
+// quantum of the coverage channel as well; the channel is a half float now and
+// has no such floor, which is what made the reconstruction adapter-independent
+// and is argued at `volume::VOLUME_TEXTURE_FORMAT`. The skip's own value did
+// not move with it, because what it is for did not.) It is a fill-rate floor
+// and not a claim of
 // invisibility: at DEFAULT_EXTINCTION_PER_KM over a several-kilometre segment a
 // sample at exactly this coverage absorbs on the order of a couple of percent
 // (~5 levels of 255 across a ~5 km segment), which is one or two eight-bit
@@ -401,6 +406,22 @@ fn lut_coord(index: f32) -> vec2<f32> {
 // synthetic fixture that reproduces them, `coverage_reconstruction_never_paints
 // _a_band_the_data_does_not_occupy`, whose control render paints 6267 pixels of
 // a band the data never occupies against 122 honest ones.
+//
+// The hull statement is about the filter's arithmetic, and it holds only as
+// far as the filter's *precision* does — which is why the texture is a float
+// format rather than the `Rg8Unorm` this began as. A sampler may compute a
+// filtered `unorm` result in the source format's own fixed point, and real
+// ones do; the error on each channel is then ABSOLUTE, up to one quantum, and
+// this division turns that into an index error of `2q / G_bar`. At full
+// coverage that is nothing. One cell out from an echo edge, where G_bar is a
+// few 255ths, it is the whole palette — which is exactly the shell this
+// reconstruction exists to be honest about. Measured on lavapipe with
+// `Rg8Unorm`: a lone data index of 147 reconstructed to 51-85 through the
+// shell, back inside the green under-band; a stored index of 1 reconstructed
+// to 0 for every coverage under a half, because `c/255` rounds away. A float
+// channel's error is relative instead, so it does not know how small G_bar
+// is, and the reconstruction is identical on a software rasteriser and on an
+// RTX 3090 to four decimals. See `volume::VOLUME_TEXTURE_FORMAT`.
 //
 // A legitimate index 0 would still work — it adds 0 to R and 1 to G, so it is
 // counted **as a zero** rather than as an absence — though the encoding does

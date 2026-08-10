@@ -4106,6 +4106,7 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "ewebsock",
+ "half",
  "log",
  "naga",
  "nexrad-level3",

@@ -69,7 +69,7 @@
 //!
 //! The clean fix it named — "a second channel saying *this cell has data*" —
 //! is what the volume texture now carries. `VOLUME_TEXTURE_FORMAT` is
-//! `Rg8Unorm` holding `R = coverage × index`, `G = coverage`; the shader
+//! `Rg16Float` holding `R = coverage × index`, `G = coverage`; the shader
 //! filters both `Linear` and reconstructs `index = R̄ / Ḡ`, the
 //! coverage-weighted mean over covered texels alone. Air contributes 0 to
 //! numerator and denominator alike, so it cannot drag a boundary sample

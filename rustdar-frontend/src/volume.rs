@@ -40,31 +40,88 @@ pub use degrade::VolumeSupport;
 /// The texel format a voxel grid is uploaded as: **coverage-premultiplied**
 /// palette indices.
 ///
-/// `R = coverage × index`, `G = coverage`, one byte each, where coverage is 1
-/// for a measured cell and 0 for empty air. The march samples both channels
-/// `Linear` and reconstructs `index = R̄ / Ḡ`, which is the coverage-weighted
-/// mean over the covered texels alone — air contributes 0 to numerator and
-/// denominator alike, so it drops out of the average instead of taking part in
-/// it as a value. See `volume.wgsl`'s `field_at`, and
+/// `R = coverage × index`, `G = coverage`, one **half float** each, where
+/// coverage is 1 for a measured cell and 0 for empty air. The march samples
+/// both channels `Linear` and reconstructs `index = R̄ / Ḡ`, which is the
+/// coverage-weighted mean over the covered texels alone — air contributes 0 to
+/// numerator and denominator alike, so it drops out of the average instead of
+/// taking part in it as a value. See `volume.wgsl`'s `field_at`, and
 /// `rustdar_radar::voxel`'s module doc for what that retired.
 ///
-/// Two properties are load-bearing and neither survives changing this format
-/// casually, which is why [`format_shortfall`] checks for both:
+/// Three properties are load-bearing and none survives changing this format
+/// casually. [`format_shortfall`] checks the first at runtime; the third is
+/// why this is a float format and not the `Rg8Unorm` it began as.
 ///
 /// * **Filterable under `Features::empty()`.** The whole design rests on the
 ///   hardware doing the two filtered means under one set of weights.
-///   `Rg8Unorm` carries `FILTERABLE` on the GLES3/WebGL2 downlevel path —
-///   `RG8` is in ES 3.0's required *texture-filterable* colour formats
-///   (Table 3.13), including for `TEXTURE_3D` — where `R32Float` would need
-///   `FLOAT32_FILTERABLE`.
+///   `Rg16Float` carries `FILTERABLE` on the GLES3/WebGL2 downlevel path —
+///   `RG16F` is texture-filterable in ES 3.0 (Table 3.13), including for
+///   `TEXTURE_3D`, and wgpu's GL backend reports it unconditionally
+///   (`wgpu-hal` 29 `gles/adapter.rs`: `Tf::Rg16Float => filterable | ...`)
+///   — where `R32Float` would need `FLOAT32_FILTERABLE`.
 /// * **Affine index↔value.** Filtering *within* data is then exactly linear
 ///   interpolation of the physical value, which is what makes the ratio a
 ///   meaningful reconstruction rather than a blend of labels.
+/// * **Filter error that scales with the sample, not with the format.** This
+///   is the one that costs the second byte per channel, and it is not a
+///   refinement — an eight-bit format makes the reconstruction *wrong*, not
+///   merely coarse.
 ///
-/// The cost of the second channel is one byte per cell — still one texture
-/// fetch per march step, and the memory is budgeted in
-/// `constants::VOLUME_TEXTURE_BUDGET_BYTES`.
-pub const VOLUME_TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg8Unorm;
+/// # Why `Rg8Unorm` cannot carry this reconstruction
+///
+/// A sampler is permitted to compute a filtered `unorm` result in the source
+/// format's own fixed point, and real ones do: Mesa's lavapipe returns `R̄`
+/// and `Ḡ` rounded to exact multiples of 1/255, and 8-bit filtering is the
+/// norm on the GLES3 hardware this format was picked to serve. The error is
+/// then **absolute** — up to one 1/255 quantum on each channel — while the
+/// reconstruction divides by `Ḡ`, so it arrives at the index multiplied by
+/// `1/Ḡ`:
+///
+/// ```text
+/// |Δindex|  ≤  (q + index·q) / Ḡ  ≤  2q / Ḡ,   q = 1/255
+/// ```
+///
+/// At full coverage that is invisible. One cell out from an echo edge, where
+/// `Ḡ` is a few 255ths, it is the whole palette — and the shell around every
+/// echo is exactly where this feature exists to be honest. Measured on
+/// lavapipe against a 4-texel fixture, sampled directly with no march in the
+/// way:
+///
+/// | stored index | `Ḡ` | `Rg8Unorm` reconstructs | `Rg16Float` reconstructs |
+/// |-------------:|------:|------------------------:|-------------------------:|
+/// |          147 |  1/255 |                     255 |                   147.05 |
+/// |          147 |  3/255 |                     170 |                   147.05 |
+/// |           64 |  3/255 |                      85 |                    64.00 |
+/// |           64 |  5/255 |                      51 |                    64.00 |
+/// |            1 | <1/2   |                       0 |                     1.00 |
+///
+/// The 147 and 64 rows are the KLOT NROT green arcs coming straight back: a
+/// volume whose only data index is 147 reconstructs to 51-85 in the boundary
+/// shell, which is inside an under-band the field never occupied. The index-1
+/// row is worse in a quieter way — `R̄ = c/255` rounds to **zero** for every
+/// coverage under a half, so a faint echo's premultiplied channel underflows
+/// outright, the shell reconstructs to the no-data index, and the silhouette's
+/// reach starts depending on the stored value again. That is the precise
+/// defect premultiplication retired.
+///
+/// No shader arithmetic recovers this. The sampler has already destroyed the
+/// information by the time `field_at` sees it; `max(Ḡ, ε)` guards a division
+/// by zero and nothing else, and a coverage floor can only choose how much of
+/// the shell to discard, not make the discarded part honest.
+///
+/// A float format fixes it because float quantisation is **relative**: `Δ R̄ /
+/// R̄` and `Δ Ḡ / Ḡ` are both bounded by half an ulp whatever the magnitude,
+/// so the quotient's error is bounded by an ulp and does not know how small
+/// `Ḡ` is. `Rg16Float`'s 11-bit significand puts the reconstructed index
+/// within ~0.25 of a palette entry at *every* coverage — measured identical to
+/// four decimal places on an RTX 3090 and on lavapipe, which is the whole
+/// point.
+///
+/// The cost is two bytes per cell rather than one — still one texture fetch
+/// per march step, and the memory is budgeted in
+/// `constants::VOLUME_TEXTURE_BUDGET_BYTES`, whose three arms were doubled to
+/// take it.
+pub const VOLUME_TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg16Float;
 
 /// The environment variable that turns the volume view off natively.
 ///
@@ -239,7 +296,7 @@ pub(crate) fn limits_shortfall(limits: &wgpu::Limits) -> Option<String> {
 ///
 /// Both halves are load-bearing and neither is implied by the other.
 /// `TEXTURE_BINDING` is what makes the grid samplable at all. `FILTERABLE` is
-/// the *stated reason* `Rg8Unorm` was chosen over `R32Float`, and without it a
+/// the *stated reason* `Rg16Float` was chosen over `R32Float`, and without it a
 /// `Linear` sampler is a validation error rather than a fallback to `Nearest` —
 /// so a device that cannot filter it is not a device that renders a blockier
 /// volume, it is a device that renders nothing. It is also the premise the
@@ -443,7 +500,7 @@ mod tests {
 
     /// The two format-feature halves refuse independently.
     ///
-    /// `FILTERABLE` in particular: it is the stated reason `Rg8Unorm` was chosen,
+    /// `FILTERABLE` in particular: it is the stated reason `Rg16Float` was chosen,
     /// and a device without it cannot use a `Linear` sampler at all — so treating
     /// it as optional would produce a validation error rather than a blockier
     /// volume.
@@ -660,7 +717,7 @@ mod tests {
     /// The probe's two halves are unit-tested against synthetic limits above;
     /// what only a device can show is that `get_texture_format_features` and
     /// `on_uncaptured_error` behave as assumed on real hardware — in particular
-    /// that `Rg8Unorm` really is bindable and filterable under
+    /// that `Rg16Float` really is bindable and filterable under
     /// `Features::empty()`, which is the premise the whole format choice — and
     /// with it the coverage-premultiplied reconstruction — rests on.
     ///
@@ -695,7 +752,7 @@ mod tests {
             format_shortfall(&features),
             None,
             "a real adapter cannot bind or filter {VOLUME_TEXTURE_FORMAT:?}, \
-             which is the premise the Rg8Unorm choice rests on. Features: \
+             which is the premise the Rg16Float choice rests on. Features: \
              {features:?}"
         );
 

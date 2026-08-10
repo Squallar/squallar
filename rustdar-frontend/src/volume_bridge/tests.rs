@@ -651,7 +651,7 @@ fn the_guards_paint_cannot_be_tested_through_are_still_in_it() {
     // `if !rustdar_radar::voxel::no_data_blends_at_ramp_bottom(...)` and
     // pinned the reconstruction to nearest for the seven products whose
     // ramp bottom is a real value — honest, and blocky. The volume texture
-    // is coverage-premultiplied `Rg8Unorm` now (`volume::VOLUME_TEXTURE_FORMAT`),
+    // is coverage-premultiplied `Rg16Float` now (`volume::VOLUME_TEXTURE_FORMAT`),
     // so a filtered sample beside empty air reconstructs inside the convex
     // hull of the stored indices for every product and there is nothing left
     // to override. Reinstating a per-product reconstruction decision here

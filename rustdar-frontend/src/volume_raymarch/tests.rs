@@ -475,50 +475,81 @@ fn the_step_count_is_a_constant_the_loop_bound_names() {
 ///   mixing neighbouring blocks cannot be seen on a uniform grid, so this
 ///   is the control, not the test.
 /// * **A lone 255 among seven empties reconstructs to 255.** The
-///   data-honesty half: the coarse texel is `(32, 32)` — an eighth of
-///   each — and `32/32` is 255/255 in unorm, the lone cell's own value.
-///   The old full-cube mean landed at 32 and is what erased the core.
+///   data-honesty half: the coarse texel is `(1/8, 1/8)` — an eighth of
+///   each — and their ratio is 1, the lone cell's own value. The old
+///   full-cube mean landed at 32 and is what erased the core.
 /// * A mixed block reconstructs to its measured cells' own mean: 100 and
-///   105 among six empties store `(26, 64)`, which reconstructs near their
-///   102.5 rather than near the full-cube 26. The assertion is anchored on
-///   102.5 — the contract — with the quantisation tolerance stated, not on
-///   the 103.594 this implementation happens to produce; see below.
-/// * **The quantisation bound.** Both channels round to u8 before the
-///   shader divides and the divisor steps in units of 255/8, so the stored
-///   ratio is not the occupancy mean exactly. The error is under 4 index
-///   units over every reachable `(n, Σx)` and worst at a single measured
-///   cell — `n = 1, x = 4` stores `(1, 32)` and reads back 7.97. Pinning
-///   the bound rather than the sample keeps the test honest about which of
-///   the two numbers is the promise.
+///   105 among six empties store `(205/2040, 1/4)`, which reconstructs to
+///   their 102.5 rather than to the full-cube 25.6. The assertion is
+///   anchored on 102.5 — the contract — with the quantisation tolerance
+///   stated, not on whatever this implementation happens to produce.
+/// * **The quantisation bound.** Both channels round to the texel format
+///   before the shader divides, so the stored ratio is not the occupancy
+///   mean exactly. Binary16 rounds *relatively*, at half an ulp of an
+///   11-bit significand, and the coverage channel's `n/8` is exact in it —
+///   so the error is bounded by `2⁻¹¹ x 255` index units over every
+///   reachable `(n, Σx)`, wherever the block sits between empty and full.
+///   Pinning the derived bound rather than the sample keeps the test honest
+///   about which of the two numbers is the promise. Under the `Rg8Unorm`
+///   this format replaced the same bound was 4 index units, worst on the
+///   sparse blocks, and it broke the hull outright below index 4.
 /// * The block that is averaged is the one under the coarse cell —
 ///   checked with a value planted in a *different* block, which is what a
 ///   transposed dimension order pushes into the wrong coarse cell.
 /// * An all-empty block stays `(0, 0)`: no data, and zero coverage, which
 ///   is what keeps the shader's floored divisor from inventing an index.
 #[test]
-fn the_grid_mip_is_the_rounded_mean_of_each_coarse_blocks_measured_cells() {
+fn the_grid_mip_is_the_mean_of_each_coarse_blocks_measured_cells() {
     /// The grid's own index plane, widened the way `upload_volume` widens
     /// it — through the production function, so this cannot drift from it.
     fn premultiplied(indices: &[u8]) -> Vec<u8> {
         super::coverage_premultiplied(indices)
     }
+    /// One texel of a packed plane, as `(R, G)`, through the production
+    /// decoder — so a channel-order or stride error shows up here too.
+    fn texel(plane: &[u8], at: usize) -> (f32, f32) {
+        let cell = at * GRID_BYTES_PER_CELL as usize;
+        (
+            super::read_channel(plane, cell),
+            super::read_channel(plane, cell + 2),
+        )
+    }
     /// The shader's reconstruction, in the host's arithmetic: `R_bar` over
     /// `G_bar`, back in 0..=255 index units.
-    fn reconstructed(texel: [u8; 2]) -> Option<f32> {
-        (texel[1] != 0).then(|| f32::from(texel[0]) / f32::from(texel[1]) * 255.0)
+    fn reconstructed(plane: &[u8], at: usize) -> Option<f32> {
+        let (r, g) = texel(plane, at);
+        (g != 0.0).then(|| r / g * 255.0)
     }
+    /// Half an ulp of binary16's 11-bit significand, in index units. The
+    /// coverage channel is exact — every reachable value is `n/8` — so this
+    /// is the whole of the mip's reconstruction error. See
+    /// `downsampled_grid`'s doc.
+    const MIP_QUANTISATION_TOLERANCE: f32 = 255.0 / 2048.0;
 
     // Uniform control — every cell covered, so the coarse level is the same
     // value at full coverage.
     let (coarse, bytes) = downsampled_grid([4, 4, 2], &premultiplied(&[7u8; 32]));
     assert_eq!(coarse, [2, 2, 1]);
-    assert_eq!(bytes, vec![7, 255, 7, 255, 7, 255, 7, 255]);
+    assert_eq!(bytes.len(), 4 * GRID_BYTES_PER_CELL as usize);
+    for at in 0..4 {
+        assert_eq!(texel(&bytes, at).1, 1.0, "every cell is covered");
+        let index = reconstructed(&bytes, at).expect("covered");
+        assert!(
+            (index - 7.0).abs() < MIP_QUANTISATION_TOLERANCE,
+            "a uniform grid must downsample to itself; coarse cell {at} \
+             reconstructs to {index}, not 7",
+        );
+    }
 
     // The all-empty block: no data and no coverage. Nothing divides by zero
     // here or in the shader, whose divisor is floored.
     let (_, bytes) = downsampled_grid([4, 4, 2], &premultiplied(&[0u8; 32]));
-    assert_eq!(bytes, vec![0u8; 8], "an unmeasured block must stay no-data");
-    assert_eq!(reconstructed([bytes[0], bytes[1]]), None);
+    assert_eq!(
+        bytes,
+        vec![0u8; 4 * GRID_BYTES_PER_CELL as usize],
+        "an unmeasured block must stay no-data"
+    );
+    assert_eq!(reconstructed(&bytes, 0), None);
 
     // A lone measured cell: fine cell (0,0,0) of a 4x4x2 grid is in
     // coarse block (0,0,0) and nowhere else, and it keeps its own value.
@@ -526,43 +557,50 @@ fn the_grid_mip_is_the_rounded_mean_of_each_coarse_blocks_measured_cells() {
     fine[0] = 255;
     let (_, bytes) = downsampled_grid([4, 4, 2], &premultiplied(&fine));
     assert_eq!(
-        &bytes[..2],
-        &[32, 32],
-        "an eighth of 255 in both channels; anything else is a stride error"
+        texel(&bytes, 0),
+        (0.125, 0.125),
+        "an eighth of full scale in both channels; anything else is a \
+         stride error"
     );
     assert_eq!(
-        reconstructed([bytes[0], bytes[1]]),
+        reconstructed(&bytes, 0),
         Some(255.0),
-        "a lone measured 255 must reconstruct to its own value; 32 is the \
-             full-cube mean that erased the Harvey core at coarse cell sizes"
+        "a lone measured 255 must reconstruct to its own value; the 32 an \
+         eighth of it would give is the full-cube mean that erased the \
+         Harvey core at coarse cell sizes"
     );
-    assert_eq!(&bytes[2..], &[0u8; 6], "it must not reach another block");
+    assert_eq!(
+        &bytes[GRID_BYTES_PER_CELL as usize..],
+        &vec![0u8; 3 * GRID_BYTES_PER_CELL as usize][..],
+        "it must not reach another block"
+    );
 
     // A mixed block: the measured cells' own mean. Anchored on the CONTRACT
     // — the true mean of {100, 105} — with the quantisation tolerance, not
     // on whatever this implementation's rounding lands at.
-    const MIP_QUANTISATION_TOLERANCE: f32 = 4.0;
     let mut fine = vec![0u8; 32];
     fine[0] = 100;
     fine[1] = 105;
     let (_, bytes) = downsampled_grid([4, 4, 2], &premultiplied(&fine));
-    assert_eq!(&bytes[..2], &[26, 64]);
-    let index = reconstructed([bytes[0], bytes[1]]).expect("the block is covered");
+    assert_eq!(texel(&bytes, 0).1, 0.25, "two of eight cells are covered");
+    let index = reconstructed(&bytes, 0).expect("the block is covered");
     assert!(
         (index - 102.5).abs() < MIP_QUANTISATION_TOLERANCE,
         "two measured cells among six empties must reconstruct to their own \
-             mean of 102.5 (got {index}), not the full-cube 26",
+         mean of 102.5 (got {index}), not the full-cube 25.6",
     );
 
-    // The bound itself, over every reachable block: `round8(sum) / round8(255n)`
-    // against the true mean. Under 4 index units, worst at one measured cell.
-    let round8 = |total: u32| ((total + 4) / 8) as u8;
+    // The bound itself, over every reachable block: what the shader really
+    // divides, against the true occupancy mean.
     let mut worst = 0.0f32;
     let mut worst_at = (0u32, 0u32);
     for n in 1..=8u32 {
-        let divisor = f32::from(round8(255 * n));
         for sum in 0..=255 * n {
-            let error = f32::from(round8(sum)) / divisor * 255.0 - sum as f32 / n as f32;
+            let plane = [
+                half::f16::from_f32(sum as f32 / 255.0 / 8.0),
+                half::f16::from_f32(n as f32 / 8.0),
+            ];
+            let error = plane[0].to_f32() / plane[1].to_f32() * 255.0 - sum as f32 / n as f32;
             if error.abs() > worst {
                 worst = error.abs();
                 worst_at = (n, sum);
@@ -572,18 +610,18 @@ fn the_grid_mip_is_the_rounded_mean_of_each_coarse_blocks_measured_cells() {
     assert!(
         worst < MIP_QUANTISATION_TOLERANCE,
         "the mip's worst reconstruction error is {worst} index units at \
-             (n, sum) = {worst_at:?}, over the {MIP_QUANTISATION_TOLERANCE} the \
-             doc promises — the coarse level has stopped being the occupancy \
-             mean to the tolerance the callers were told",
+         (n, sum) = {worst_at:?}, over the {MIP_QUANTISATION_TOLERANCE} \
+         half an ulp of binary16 allows — the coarse level has stopped being \
+         the occupancy mean to the tolerance the callers were told",
     );
-    // The old hand-written `round(sum / n)` was exact to +-0.5, so this bound
-    // is a real regression on sparse blocks and is stated as one rather than
-    // hidden behind a loose assertion.
+    // Not exact, and stated as inexact rather than left to look exact: the
+    // channels are 11-bit significands, so a bound of zero here would be a
+    // test that cannot fail rather than a tighter promise.
     assert!(
-        worst > 0.5,
-        "the quantised reconstruction is now as tight as the hand mean it \
-             replaced; `downsampled_grid`'s doc claims otherwise and one of \
-             the two is wrong",
+        worst > 0.0,
+        "the mip now reconstructs the occupancy mean exactly, which binary16 \
+         cannot do — `downsampled_grid` is no longer storing what its doc \
+         says, or this loop stopped reaching the sparse blocks",
     );
 
     // The block under coarse cell (1, 0, 0): fine x in 2..4, y in 0..2,
@@ -597,51 +635,95 @@ fn the_grid_mip_is_the_rounded_mean_of_each_coarse_blocks_measured_cells() {
         }
     }
     let (_, bytes) = downsampled_grid([4, 4, 2], &premultiplied(&fine));
-    assert_eq!(
-        bytes,
-        vec![0, 0, 100, 255, 0, 0, 0, 0],
-        "the filled block must land whole in coarse cell (1,0,0); anything \
-             else is a dimension-order error smearing data across the mip"
-    );
+    for at in 0..4 {
+        let covered = at == 1;
+        assert_eq!(
+            texel(&bytes, at).1,
+            f32::from(u8::from(covered)),
+            "the filled block must land whole in coarse cell (1,0,0); \
+             anything else is a dimension-order error smearing data across \
+             the mip"
+        );
+        if covered {
+            let index = reconstructed(&bytes, at).expect("covered");
+            assert!((index - 100.0).abs() < MIP_QUANTISATION_TOLERANCE);
+        }
+    }
 
     // Odd extents follow wgpu's mip arithmetic: max(n / 2, 1). The clamp
     // counts a fine cell more than once — in BOTH channels, so the ratio,
     // and with it the reconstructed index, is untouched.
     let (coarse, bytes) = downsampled_grid([3, 3, 3], &premultiplied(&[9u8; 27]));
     assert_eq!(coarse, [1, 1, 1]);
-    assert_eq!(bytes, vec![9, 255]);
-    assert_eq!(reconstructed([bytes[0], bytes[1]]), Some(9.0));
+    assert_eq!(bytes.len(), GRID_BYTES_PER_CELL as usize);
+    assert_eq!(texel(&bytes, 0).1, 1.0);
+    let index = reconstructed(&bytes, 0).expect("covered");
+    assert!((index - 9.0).abs() < MIP_QUANTISATION_TOLERANCE);
 }
 
-/// The premultiplied plane is the index byte and a binary coverage beside
-/// it — the texture's whole contract, in one place.
+/// The premultiplied plane is the index and a binary coverage beside it —
+/// the texture's whole contract, in one place.
 ///
 /// Coverage is `index != NO_DATA_INDEX` and nothing else, which is what
 /// licenses the wire format to carry one byte per cell:
 /// `rustdar_radar::voxel::ramp_index` clamps every finite measurement to
 /// `1..=255`, so the second channel is a function of the first and storing
 /// it would be redundancy rather than information.
+///
+/// The **precision** half is checked here too, and it is not decoration.
+/// `volume::VOLUME_TEXTURE_FORMAT` is a float format precisely so that the
+/// error on each channel scales with that channel's own value rather than
+/// with the format's full scale — the march divides `R̄` by `Ḡ`, so an
+/// absolute error becomes a `1/Ḡ` error in the palette index and the shell
+/// around every echo paints bands the data never held. Storing index 1 as
+/// `1/255` to a *relative* half-ulp is what that property looks like at the
+/// encoder, and the assertion below fails for every fixed-point channel
+/// width: an eight-bit one carries 1/255 to a relative 1/2, not 2⁻¹¹.
 #[test]
 fn the_premultiplied_plane_is_index_and_a_binary_coverage() {
+    /// Half an ulp of binary16's 11-bit significand, as a relative error.
+    const HALF_ULP: f32 = 1.0 / 2048.0;
+
     let indices: Vec<u8> = (0..=255u8).collect();
     let plane = super::coverage_premultiplied(&indices);
     assert_eq!(plane.len(), indices.len() * GRID_BYTES_PER_CELL as usize);
-    for (index, pair) in indices.iter().zip(plane.chunks_exact(2)) {
-        assert_eq!(
-            pair[0], *index,
-            "R must be coverage x index, and index 0 \
-             is the only one coverage zeroes — which leaves the byte itself"
+    for (index, texel) in indices
+        .iter()
+        .zip(plane.chunks_exact(GRID_BYTES_PER_CELL as usize))
+    {
+        let stored = super::read_channel(texel, 0);
+        let wanted = f32::from(*index) / 255.0;
+        assert!(
+            (stored - wanted).abs() <= wanted * HALF_ULP,
+            "R must be coverage x index — and index 0 is the only one \
+             coverage zeroes, which leaves the index itself. Index {index} \
+             is {wanted}, stored as {stored}, further off than the relative \
+             half-ulp {HALF_ULP} the format promises; a fixed-point channel \
+             fails this at the faint end, which is where the reconstruction \
+             breaks",
         );
         assert_eq!(
-            pair[1],
+            super::read_channel(texel, 2),
             if *index == rustdar_radar::voxel::NO_DATA_INDEX {
-                0
+                0.0
             } else {
-                u8::MAX
+                1.0
             },
             "coverage at index {index} is not binary on the no-data test",
         );
     }
+    // The faintest measurable echo, called out because it is the value an
+    // eight-bit channel loses first once the filter has weighted it: `1/255`
+    // scaled by any coverage under a half rounds to zero, the shell around
+    // the echo reconstructs to the no-data index, and the silhouette's reach
+    // starts reading the stored value again.
+    let faintest = super::read_channel(&plane, GRID_BYTES_PER_CELL as usize);
+    assert!(
+        faintest > 0.0 && (faintest * 255.0 - 1.0).abs() < 0.01,
+        "index 1 stores {faintest}, which is not 1/255 — the faintest echo \
+         the encoder can be handed has to survive the channel, or every \
+         boundary around it reconstructs as air",
+    );
 }
 
 /// The step length puts the ray direction inside the `length`.
@@ -792,7 +874,7 @@ fn the_transfer_functions_match_eguis_own() {
     }
 }
 
-/// Grid byte counts — one byte per cell on the wire, two in the texture,
+/// Grid byte counts — one byte per cell on the wire, four in the texture,
 /// plus the coarse level — including the overflow the multiplication can hit.
 ///
 /// The three figures are deliberately separate. `cell_count` is what
@@ -801,23 +883,23 @@ fn the_transfer_functions_match_eguis_own() {
 /// budget in `constants` is a claim about. Collapsing any two of them was
 /// how the coarse level came to be missing from the budget entirely.
 #[test]
-fn a_grids_byte_count_is_two_per_cell_and_the_budget_counts_the_mip() {
+fn a_grids_byte_count_is_four_per_cell_and_the_budget_counts_the_mip() {
     assert_eq!(cell_count([256, 256, 128]), Some(8 * 1024 * 1024));
-    assert_eq!(grid_bytes([256, 256, 128]), Some(16 * 1024 * 1024));
+    assert_eq!(grid_bytes([256, 256, 128]), Some(32 * 1024 * 1024));
     assert_eq!(
         grid_bytes_with_mips([256, 256, 128]),
-        Some(18 * 1024 * 1024),
-        "the desktop grid is 16 MiB of premultiplied cells over a 2 MiB \
+        Some(36 * 1024 * 1024),
+        "the desktop grid is 32 MiB of premultiplied cells over a 4 MiB \
              coarse level, which is the figure the budget table states"
     );
-    assert_eq!(grid_bytes([128, 128, 64]), Some(2 * 1024 * 1024));
+    assert_eq!(grid_bytes([128, 128, 64]), Some(4 * 1024 * 1024));
     assert_eq!(
         grid_bytes_with_mips([128, 128, 64]),
-        Some(2 * 1024 * 1024 + 256 * 1024)
+        Some(4 * 1024 * 1024 + 512 * 1024)
     );
     // Too small to halve on any axis: one level, so the two figures agree.
-    assert_eq!(grid_bytes([1, 1, 1]), Some(2));
-    assert_eq!(grid_bytes_with_mips([1, 1, 1]), Some(2));
+    assert_eq!(grid_bytes([1, 1, 1]), Some(4));
+    assert_eq!(grid_bytes_with_mips([1, 1, 1]), Some(4));
     for overflowing in [cell_count, grid_bytes, grid_bytes_with_mips] {
         assert_eq!(
             overflowing([u32::MAX, u32::MAX, u32::MAX]),

@@ -281,38 +281,45 @@ pub const WEBGL2_MAX_TEXTURE_DIMENSION_3D: u32 =
 /// keeps it snug.
 ///
 /// One pane shows one volume, so the figure is one grid texture plus its LUT.
-/// The grid is [`crate::volume::VOLUME_TEXTURE_FORMAT`] — `Rg8Unorm`,
-/// **two** bytes a cell: `R = coverage × index`, `G = coverage` — and it
-/// carries `volume::raymarch::GRID_MIP_LEVELS` levels, the raw field and the
-/// hand-built box mean below it:
+/// The grid is [`crate::volume::VOLUME_TEXTURE_FORMAT`] — `Rg16Float`,
+/// **four** bytes a cell: `R = coverage × index`, `G = coverage`, a half float
+/// each — and it carries `volume::raymarch::GRID_MIP_LEVELS` levels, the raw
+/// field and the hand-built box mean below it:
 ///
 /// | target  | grid        | mip 0     | mip 1     | + LUT      | budget |
 /// |---------|-------------|----------:|----------:|-----------:|-------:|
-/// | desktop | 256x256x128 |    16 MiB |     2 MiB | 18.001 MiB | 24 MiB |
-/// | mobile  | 192x192x96  |  6.75 MiB | 0.844 MiB |  7.595 MiB | 10 MiB |
-/// | wasm32  | 128x128x64  |     2 MiB |  0.25 MiB |  2.251 MiB |  3 MiB |
+/// | desktop | 256x256x128 |    32 MiB |     4 MiB | 36.001 MiB | 48 MiB |
+/// | mobile  | 192x192x96  |  13.5 MiB | 1.688 MiB | 15.189 MiB | 20 MiB |
+/// | wasm32  | 128x128x64  |     4 MiB |   0.5 MiB |  4.501 MiB |  6 MiB |
 ///
 /// Every arm keeps ~1.33x headroom, which is deliberate: enough for the
 /// alignment and driver overhead a real 3D texture allocation carries, not
 /// enough to hide a doubled axis.
 ///
-/// # What the coverage channel cost, arm by arm
+/// # What the half-float channels cost, arm by arm
 ///
-/// The second channel doubled mip 0 and mip 1 alike (8 → 16 MiB desktop,
-/// 1 → 2 MiB wasm32), and the mip level — which the previous budget did not
-/// count at all, letting it ride in the headroom — is now named. Against the
-/// old ceilings that is desktop 9 → 18 MiB against 12, mobile 3.80 → 7.59
-/// against 5, wasm32 1.13 → 2.25 against 1.5: **no arm's old budget absorbs
-/// it**, so all three ceilings move, in the same 1.33x proportion.
+/// Widening each channel from a byte to a half float doubled mip 0 and mip 1
+/// alike (16 → 32 MiB desktop, 2 → 4 MiB wasm32), so every arm's ceiling
+/// doubles with it: desktop 24 → 48 MiB, mobile 10 → 20, wasm32 3 → 6, the
+/// same ~1.33x headroom kept throughout.
+///
+/// The width is not slack. `Rg8Unorm` filters `R̄` and `Ḡ` with an
+/// **absolute** error of up to one 1/255 quantum on real samplers, and the
+/// march's reconstruction divides by `Ḡ` — so at an echo edge, where `Ḡ` is a
+/// few 255ths, the error arrives at the palette index multiplied by 255 and
+/// the shell around every echo paints bands the data never held. A float
+/// channel's error is relative instead, which is the whole reason for the
+/// second byte; [`crate::volume::VOLUME_TEXTURE_FORMAT`] carries the
+/// measurement and the derivation.
 ///
 /// The wasm32 arm is the one worth arguing rather than asserting, because it
-/// is the tight target. +1.5 MiB, and it is **not** linear memory: a WebGL2
+/// is the tight target. +2.25 MiB, and it is **not** linear memory: a WebGL2
 /// 3D texture lives in the GPU's own allocation, and what crosses linear
 /// memory is the one-byte-per-cell index plane the worker built (unchanged at
 /// 1 MiB — coverage is exactly `index != 0`, so it is synthesised at upload
-/// and never travels) plus the transient staging copy of the 2 MiB
+/// and never travels) plus the transient staging copy of the 4 MiB
 /// premultiplied plane. For scale, the same target budgets 48 MiB for loop
-/// textures, so this is a 3% move against the largest thing on the page and
+/// textures, so this is a 5% move against the largest thing on the page and
 /// no grid-spec change is needed: every axis stays at or under the
 /// [`WEBGL2_MAX_TEXTURE_DIMENSION_3D`] guarantee and no shape shrinks.
 ///
@@ -336,11 +343,11 @@ pub const VOLUME_TEXTURE_BUDGET_BYTES: usize = MOBILE_VOLUME_TEXTURE_BUDGET_BYTE
 pub const VOLUME_TEXTURE_BUDGET_BYTES: usize = DESKTOP_VOLUME_TEXTURE_BUDGET_BYTES;
 
 /// The wasm32 arm of [`VOLUME_TEXTURE_BUDGET_BYTES`].
-pub const WASM_VOLUME_TEXTURE_BUDGET_BYTES: usize = 3 * 1024 * 1024;
+pub const WASM_VOLUME_TEXTURE_BUDGET_BYTES: usize = 6 * 1024 * 1024;
 /// The mobile arm. See [`VOLUME_TEXTURE_BUDGET_BYTES`].
-pub const MOBILE_VOLUME_TEXTURE_BUDGET_BYTES: usize = 10 * 1024 * 1024;
+pub const MOBILE_VOLUME_TEXTURE_BUDGET_BYTES: usize = 20 * 1024 * 1024;
 /// The desktop arm. See [`VOLUME_TEXTURE_BUDGET_BYTES`].
-pub const DESKTOP_VOLUME_TEXTURE_BUDGET_BYTES: usize = 24 * 1024 * 1024;
+pub const DESKTOP_VOLUME_TEXTURE_BUDGET_BYTES: usize = 48 * 1024 * 1024;
 
 /// The largest pane, in physical pixels, the offscreen budget is sized for.
 ///

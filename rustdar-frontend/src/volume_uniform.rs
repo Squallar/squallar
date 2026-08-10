@@ -251,7 +251,7 @@ pub struct VolumeUniform {
     /// **Never negative.** A negative value used to be a sentinel selecting a
     /// nearest-neighbour snap, for the seven products whose no-data boundary a
     /// plain `R8Unorm` filter could not be trusted across. The volume texture
-    /// is coverage-premultiplied `Rg8Unorm` now, so a filtered sample beside
+    /// is coverage-premultiplied `Rg16Float` now, so a filtered sample beside
     /// empty air can no longer be dragged anywhere the data was not; all nine
     /// products take one path and the sentinel is gone with the split.
     pub reconstruction_lod: f32,

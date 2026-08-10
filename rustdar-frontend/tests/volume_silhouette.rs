@@ -42,7 +42,7 @@
 //!
 //! # The two systematic residuals, named in advance
 //!
-//! 1. **Linear-filter bleed.** The grid is `Rg8Unorm` sampled `Linear` and
+//! 1. **Linear-filter bleed.** The grid is `Rg16Float` sampled `Linear` and
 //!    coverage-premultiplied, so what sets the reach is the interpolated
 //!    *coverage*, not the interpolated index. A cell contributes where coverage
 //!    reaches the shader's `COVERAGE_SKIP` = 1/255; the reconstructed index

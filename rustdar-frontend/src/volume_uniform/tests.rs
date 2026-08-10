@@ -291,7 +291,7 @@ fn the_reconstruction_lod_rides_flags_y_and_defaults_to_the_raw_field() {
 /// This lane used to carry a negative sentinel selecting a
 /// nearest-neighbour snap, for the seven products whose no-data boundary a
 /// plain `R8Unorm` filter could not be trusted across. The texture is
-/// coverage-premultiplied `Rg8Unorm` now: the shader divides the
+/// coverage-premultiplied `Rg16Float` now: the shader divides the
 /// premultiplied index by the coverage, so a filtered sample beside air
 /// lands inside the convex hull of the stored indices and every product
 /// takes the one filtering path. Both halves are asserted because either

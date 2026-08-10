@@ -38,6 +38,17 @@ web-time = "=1.1.0"
 wgpu = { version = "=29.0.4", default-features = false }
 winit = "=0.30.13"
 
+# IEEE 754 binary16, for the volume grid's texel encoder.
+# `volume::VOLUME_TEXTURE_FORMAT` is `Rg16Float` and the host has to write its
+# bytes; Rust's own `f16` is still nightly-only.
+#
+# Adds no package and no build time: naga already pulls this exact version in
+# through wgpu-core, so every target that compiles `rustdar-frontend` was
+# already compiling it. Pinned like the rest, and `default-features = false`
+# keeps `std`'s float-formatting arm out — the encoder needs the conversions
+# and nothing else.
+half = { version = "=2.7.1", default-features = false }
+
 # A **dev**-only, direct handle on the shader compiler wgpu already contains,
 # pinned to the exact version wgpu-29.0.4 resolves. `rustdar-frontend`'s
 # `tests/volume_shader.rs` translates the volume raymarch to GLSL ES 300 with

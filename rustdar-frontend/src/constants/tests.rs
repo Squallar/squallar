@@ -39,7 +39,7 @@ impl Arm {
     }
 
     /// Bytes one pane's 3D volume texture occupies: every mip level of the
-    /// grid at `crate::volume::VOLUME_TEXTURE_FORMAT`'s two bytes a cell, plus
+    /// grid at `crate::volume::VOLUME_TEXTURE_FORMAT`'s four bytes a cell, plus
     /// the RGBA table those cells index.
     ///
     /// Read from `volume::raymarch::grid_bytes_with_mips` rather than
@@ -47,11 +47,13 @@ impl Arm {
     /// path actually allocates by — including the coarse level, which the
     /// earlier hand-written product silently left out of the budget entirely.
     ///
-    /// Two bytes per cell is not an assumption to be tidied away: the format is
-    /// `Rg8Unorm` because the march reconstructs `R̄ / Ḡ` from a
-    /// coverage-premultiplied index and a coverage channel, and because
-    /// `Rg8Unorm` is *filterable* under `Features::empty()` where `R32Float` is
-    /// not.
+    /// Four bytes per cell is not an assumption to be tidied away: the format
+    /// is `Rg16Float` because the march reconstructs `R̄ / Ḡ` from a
+    /// coverage-premultiplied index and a coverage channel — which needs a
+    /// filter error that scales with the sample rather than with the format,
+    /// or the quotient is wrong by the whole palette at an echo edge — and
+    /// because `Rg16Float` is *filterable* under `Features::empty()` where
+    /// `R32Float` is not.
     fn volume_bytes(&self) -> usize {
         crate::volume::raymarch::grid_bytes_with_mips(self.grid)
             .expect("a shipped grid shape cannot overflow")
@@ -198,9 +200,9 @@ fn the_volume_budget_is_not_slack_enough_to_hide_a_doubling() {
 fn the_documented_per_class_figures_are_what_the_arms_actually_say() {
     let expected = [
         // name, image, concurrent, held, textured, loop budget MiB, volume budget B
-        ("wasm32", 1024, 1, 12, 8, 48, 3 * 1024 * 1024),
-        ("mobile", 2048, 3, 20, 12, 256, 10 * 1024 * 1024),
-        ("desktop", 2048, 6, 60, 30, 512, 24 * 1024 * 1024),
+        ("wasm32", 1024, 1, 12, 8, 48, 6 * 1024 * 1024),
+        ("mobile", 2048, 3, 20, 12, 256, 20 * 1024 * 1024),
+        ("desktop", 2048, 6, 60, 30, 512, 48 * 1024 * 1024),
     ];
     for (arm, (name, image, concurrent, held, textured, loop_mib, volume)) in
         arms().into_iter().zip(expected)

@@ -98,7 +98,7 @@
 //! rather than this harness's:
 //!
 //! * the grid texture's sampler is `Linear` over a coverage-premultiplied
-//!   `Rg8Unorm` grid, so a fetch straddling an echo edge returns a real
+//!   `Rg16Float` grid, so a fetch straddling an echo edge returns a real
 //!   neighbouring **index** — never one the field does not hold — at a
 //!   *coverage* below 1, and the march scales its optical depth by that
 //!   coverage. At the production extinction that is a soft edge one voxel

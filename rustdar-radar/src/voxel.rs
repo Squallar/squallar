@@ -239,7 +239,7 @@
 //! is the paragraph that made the palette's fade band the renderer's only
 //! defence at a data/no-data boundary.
 //!
-//! `rustdar-frontend`'s raymarch uploads this grid as **`Rg8Unorm`**, not
+//! `rustdar-frontend`'s raymarch uploads this grid as **`Rg16Float`**, not
 //! `R8Unorm`: `R = coverage × index`, `G = coverage`, where coverage is 1 for
 //! a cell whose index is not [`NO_DATA_INDEX`] and 0 for one whose is. Both
 //! channels are filtered `Linear` in hardware and the shader reconstructs
@@ -1684,9 +1684,11 @@ const MAGIC: [u8; 4] = *b"RDVX";
 /// **Whenever a renderer change tempts a bump, read
 /// `the_format_version_is_the_one_this_layout_ships` first.** It records which
 /// changes oblige one and which do not, and why the frontend's
-/// coverage-premultiplied `Rg8Unorm` volume texture — a doubling of the GPU
-/// grid — did not: coverage is `index != NO_DATA_INDEX`, synthesised at upload,
-/// so not one byte here changed in layout or in meaning. The obligation is on
+/// coverage-premultiplied `Rg16Float` volume texture — a quadrupling of the
+/// GPU grid, over two changes — did not: coverage is `index != NO_DATA_INDEX`,
+/// synthesised at upload, and the half-float widening that followed is a
+/// property of the sampler's arithmetic, so not one byte here changed in
+/// layout or in meaning. The obligation is on
 /// the bytes, not on what reads them.
 const FORMAT_VERSION: u16 = 1;
 
