@@ -230,7 +230,9 @@ mod corelocation {
     // macOS only, and so is its one use below.
     #[cfg(target_os = "macos")]
     use objc2_foundation::NSBundle;
-    use rustdar_gps::{GpsConfig, GpsFix, LocationPermission};
+    use rustdar_gps::{GpsFix, LocationPermission};
+
+    use super::super::{OsLocationProvider, OsLocationSink, RedrawWake, ReportPermission};
 
     /// The raw constants the decoding half is written against really are the
     /// ones this SDK ships. A renumbering in a future `objc2-core-location`
@@ -266,12 +268,17 @@ mod corelocation {
         /// loop, but winit parks in `ControlFlow::Wait` and a run-loop source
         /// firing produces no `RedrawRequested` on its own — so without this a
         /// fix sits in the channel until something else happens to draw.
-        wake: Box<dyn Fn()>,
-        /// Last thing the OS said, updated from the authorisation callback.
-        /// Cached rather than re-queried because `location_permission()` is a
-        /// frame-path getter that is contractually not allowed to make a round
-        /// trip, and because the callback is a genuine push — an out-of-app
-        /// revocation reaches us without anyone polling for it.
+        wake: RedrawWake,
+        /// Publishes an authorisation change into the bridge's atomic.
+        ///
+        /// `locationManagerDidChangeAuthorization:` is a genuine push — a
+        /// revocation made in System Settings with rustdar in the foreground
+        /// reaches us without anyone polling for it — and this is where that
+        /// becomes a permission the settings pane can render.
+        report: ReportPermission,
+        /// Last thing the OS said. A local copy of what `report` published,
+        /// kept because [`sync_updates`] and [`OsLocationReader::request`] both
+        /// branch on it and neither can read the bridge's atomic from here.
         permission: Cell<LocationPermission>,
         /// Whether the app has asked for delivery. Distinct from `updating`:
         /// this survives a denial, so a later grant resumes without the user
@@ -287,6 +294,7 @@ mod corelocation {
         fn set_permission(&self, permission: LocationPermission) {
             if self.permission.replace(permission) != permission {
                 log::info!("CoreLocation authorization is now {permission:?}");
+                (self.report)(permission);
                 (self.wake)();
             }
         }
@@ -461,7 +469,7 @@ mod corelocation {
         shared: Rc<Shared>,
     }
 
-    impl OsLocationReader {
+    impl OsLocationProvider for OsLocationReader {
         /// Bring up CoreLocation without asking the user anything.
         ///
         /// Constructing a `CLLocationManager` and giving it a delegate does not
@@ -473,11 +481,12 @@ mod corelocation {
         ///
         /// `None` means this process cannot use CoreLocation at all, which is
         /// not the same as "the user said no".
-        pub fn start(
-            _config: &GpsConfig,
-            fixes: Sender<GpsFix>,
-            wake: impl Fn() + Send + 'static,
-        ) -> Option<Self> {
+        fn start(sink: OsLocationSink) -> Option<Self> {
+            let OsLocationSink {
+                fixes,
+                wake,
+                report,
+            } = sink;
             let Some(mtm) = MainThreadMarker::new() else {
                 // Nothing in this crate constructs a bridge off the main
                 // thread, so this is a wiring bug rather than a condition.
@@ -506,7 +515,8 @@ mod corelocation {
 
             let shared = Rc::new(Shared {
                 fixes,
-                wake: Box::new(wake),
+                wake,
+                report,
                 permission: Cell::new(LocationPermission::Unknown),
                 wants_updates: Cell::new(false),
                 updating: Cell::new(false),
@@ -539,22 +549,21 @@ mod corelocation {
             // SAFETY: the instance property; see the callback for the
             // deployment-target note.
             let status = unsafe { manager.authorizationStatus() };
-            shared.permission.set(permission_from_status(status.0));
-            log::info!(
-                "CoreLocation provider ready; authorization is {:?}",
-                shared.permission.get()
-            );
+            let initial = permission_from_status(status.0);
+            shared.permission.set(initial);
+            // Reported unconditionally, not through `set_permission`: the
+            // bridge's atomic starts at `Unknown`, and a returning user whose
+            // status really is `NotDetermined` would otherwise see no report at
+            // all — leaving the pane on "Checking…" until something else
+            // changed. This is the initial report the contract asks for.
+            (shared.report)(initial);
+            log::info!("CoreLocation provider ready; authorization is {initial:?}");
 
             Some(Self {
                 manager,
                 _delegate: delegate,
                 shared,
             })
-        }
-
-        /// What the OS last said. Cheap: a `Cell` read.
-        pub fn permission(&self) -> LocationPermission {
-            self.shared.permission.get()
         }
 
         /// Prompt if the user has never been asked, and start delivering.
@@ -564,9 +573,9 @@ mod corelocation {
         /// silently. `false` here means only that there was nothing to ask —
         /// the user has already refused — which is the one case this side can
         /// be sure of.
-        pub fn request(&mut self) -> bool {
+        fn request(&mut self) -> bool {
             self.shared.wants_updates.set(true);
-            match self.permission() {
+            match self.shared.permission.get() {
                 LocationPermission::Prompt | LocationPermission::Unknown => {
                     // SAFETY: no compile-time preconditions. The runtime one —
                     // an Info.plist usage string — is checked by the OS, which
@@ -587,8 +596,11 @@ mod corelocation {
             }
         }
 
-        /// Stop delivering. Does not, and cannot, give the permission back.
-        pub fn stop(&mut self) {
+        /// Stop delivering. Does not, and cannot, give the permission back — and
+        /// deliberately leaves the manager and its delegate alive, so a change
+        /// made in System Settings while delivery is off still reaches
+        /// `locationManagerDidChangeAuthorization:`.
+        fn stop(&mut self) {
             self.shared.wants_updates.set(false);
             sync_updates(&self.manager, &self.shared);
         }
@@ -597,7 +609,7 @@ mod corelocation {
         ///
         /// Not "a fix arrived recently": see the module note on iOS
         /// backgrounding for the one case where those differ.
-        pub fn active(&self) -> bool {
+        fn active(&self) -> bool {
             self.shared.updating.get()
         }
     }

@@ -111,9 +111,10 @@ rustdar-egui = { workspace = true, features = ["gps-serial"] }
 rustdar-gps = { workspace = true, features = ["serial"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# GeoClue2 lives on the session bus and nowhere else, so `os_location/linux.rs`
-# needs a D-Bus client. Already in the graph via `dark-light -> ashpd`, which
-# resolves the same 5.18.0 -- so this adds **zero packages**.
+# GeoClue2 is reached over D-Bus -- on the *system* bus, which is where it ships
+# its `.service` file; see the note in `os_location/linux.rs`. Already in the
+# graph via `dark-light -> ashpd`, which resolves the same 5.18.0 -- so this adds
+# **zero packages**.
 #
 # It is not free, though, and the plan's earlier "harmless" was an
 # overstatement. `ashpd` selects `zbus/async-io` *without* `blocking-api`;

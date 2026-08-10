@@ -43,9 +43,11 @@ use std::collections::HashMap;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use rustdar_gps::{GpsConfig, GpsFix, LocationPermission};
+use rustdar_gps::{GpsFix, LocationPermission};
 use zbus::blocking::{Connection, MessageIterator};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Structure, Value};
+
+use super::{OsLocationProvider, OsLocationSink};
 
 /// The bus name, object paths and interfaces this provider speaks.
 const GEOCLUE_BUS: &str = "org.freedesktop.GeoClue2";
@@ -90,13 +92,31 @@ const DBUS_PATH: &str = "/org/freedesktop/DBus";
 
 // ── The reader ──────────────────────────────────────────────────────────
 
+/// The GeoClue2 provider: a sink to talk back through, and a session when one
+/// is running.
+///
+/// The two-phase split the contract asks for falls out of this file's own
+/// constraints rather than being imposed on it. Bringing the provider up cannot
+/// connect to anything, because `Start()` is four calls further on and can sit
+/// on an agent dialog for as long as the user takes; so [`start`] does nothing
+/// but say [`Prompt`] and wait to be asked, and everything real happens in
+/// [`request`], on the thread [`Session`] owns.
+///
+/// [`start`]: OsLocationProvider::start
+/// [`request`]: OsLocationProvider::request
+/// [`Prompt`]: rustdar_gps::LocationPermission::Prompt
+pub struct OsLocationReader {
+    /// Cloned into each session. Cheap: a `Sender` and two `Arc`s.
+    sink: OsLocationSink,
+    session: Option<Session>,
+}
+
 /// A running GeoClue2 session, stopped by dropping it.
 ///
-/// Same shape as [`SerialGpsReader`]: a constructor that returns `None` when
-/// there is nothing to read, and a value whose drop is the off switch.
+/// Same shape as [`SerialGpsReader`]: a value whose drop is the off switch.
 ///
 /// [`SerialGpsReader`]: rustdar_gps::SerialGpsReader
-pub struct OsLocationReader {
+struct Session {
     /// Dropping (or sending on) this tells the session thread the stop was
     /// deliberate. It is *not* what unblocks it — see [`Closer`] — but it is
     /// what lets the thread tell "the app asked" from "the bus went away",
@@ -106,64 +126,78 @@ pub struct OsLocationReader {
     closer: Arc<Closer>,
 }
 
-impl OsLocationReader {
-    /// Start a GeoClue2 session on its own thread.
-    ///
+impl OsLocationProvider for OsLocationReader {
     /// Always `Some` on Linux, and deliberately so: nothing that can fail is
-    /// attempted here. The system bus connect, `GetClient`, the `.desktop`
-    /// preflight and `Start()` all run on the spawned thread, because the last
-    /// of those can sit on an agent dialog for as long as the user takes to
-    /// answer it. A `None` here would mean "we know there is no service", and
-    /// this side cannot know that without making the very call it must not
-    /// make.
+    /// attempted here, because nothing that could fail may be attempted here.
+    /// A `None` would mean "we know there is no service", and this side cannot
+    /// know that without making the very call it must not make.
     ///
-    /// # `wake`
+    /// The initial report is [`Prompt`](LocationPermission::Prompt) and it is
+    /// made synchronously, on the caller's thread, before this returns. Nobody
+    /// has been asked, which is the honest description, and it is the one state
+    /// in which asking is legitimate — `Unknown` would leave the gate waiting
+    /// for an answer that only asking can produce, and the settings pane would
+    /// read "Checking…" for the life of the process.
+    fn start(sink: OsLocationSink) -> Option<Self> {
+        (sink.report)(LocationPermission::Prompt);
+        Some(Self {
+            sink,
+            session: None,
+        })
+    }
+
+    /// Open a GeoClue2 session on a thread of its own.
     ///
-    /// The frontend's event loop runs on `ControlFlow::Wait` and drains the fix
-    /// channel only while drawing a frame, so a fix pushed from this thread
-    /// while the app is idle is invisible until something unrelated happens to
-    /// draw one — with auto-refresh off, possibly never. Same parameter, same
-    /// reason, as `SerialGpsReader::start`.
+    /// The system bus connect, `GetClient`, the `.desktop` preflight and
+    /// `Start()` all run on the spawned thread, because the last of those can
+    /// sit on an agent dialog for as long as the user takes to answer it — on
+    /// the frame thread that is the unbounded freeze `AUDIT.md` P0-2 was.
     ///
-    /// # `report`
-    ///
-    /// How a permission change gets back to the bridge, and it is the half of
-    /// this provider that closes a hole polling cannot. `Granted && active` is
-    /// a terminal state for the gate, so a revocation made outside the app —
-    /// the agent turning us off, the session ending — is *never* observed by
-    /// asking. GeoClue tells us instead, by setting `Client.Active` false, and
-    /// this callback is how that becomes a non-granted permission in the UI.
-    pub fn start(
-        _config: &GpsConfig,
-        fixes: mpsc::Sender<GpsFix>,
-        wake: impl Fn() + Send + 'static,
-        report: impl Fn(LocationPermission) + Send + 'static,
-    ) -> Option<Self> {
+    /// `true` unconditionally: the thread was spawned, which is all this side
+    /// can know. Every answer that matters arrives later, through
+    /// [`OsLocationSink::report`].
+    fn request(&mut self) -> bool {
+        if self.session.is_some() {
+            return true;
+        }
+
         let (stop_tx, stop_rx) = mpsc::channel();
         let closer = Arc::new(Closer::default());
         let thread_closer = Arc::clone(&closer);
+        let sink = self.sink.clone();
 
         std::thread::Builder::new()
             .name("os-location-geoclue".into())
             .spawn(move || {
                 preflight_desktop_file();
-                let out = Consumer {
-                    fixes: &fixes,
-                    wake: &wake,
-                    report: &report,
-                };
-                run_session(&thread_closer, &stop_rx, &out);
+                run_session(&thread_closer, &stop_rx, &sink);
             })
             .expect("failed to spawn os-location-geoclue thread");
 
-        Some(Self {
+        self.session = Some(Session {
             stop_signal: stop_tx,
             closer,
-        })
+        });
+        true
+    }
+
+    /// End the session. The permission the bridge holds is untouched — this is
+    /// an off switch for the stream, and GeoClue has no way to hand a grant
+    /// back even if it were one.
+    ///
+    /// A later [`request`](Self::request) opens a fresh session with a fresh
+    /// [`Closer`], which is why the one being dropped here is allowed to latch
+    /// closed permanently.
+    fn stop(&mut self) {
+        self.session = None;
+    }
+
+    fn active(&self) -> bool {
+        self.session.is_some()
     }
 }
 
-impl Drop for OsLocationReader {
+impl Drop for Session {
     /// Stop the session, in the one order that makes the reason legible.
     ///
     /// The stop message goes first so that by the time the signal iterator
@@ -266,28 +300,18 @@ fn should_stop(stop_rx: &mpsc::Receiver<()>) -> bool {
 
 // ── The session ─────────────────────────────────────────────────────────
 
-/// The three things the session says to the rest of the app: a fix, a request
-/// for the frame that will show it, and a change of permission.
-///
-/// Bundled rather than passed as three parameters because they travel together
-/// through every layer of the session and are never used apart — and because a
-/// signal loop needs a connection, a client, a stop channel and a
-/// de-duplication cursor as well, which is more arguments than clippy will sit
-/// still for.
-struct Consumer<'a, W: Fn(), R: Fn(LocationPermission)> {
-    fixes: &'a mpsc::Sender<GpsFix>,
-    wake: &'a W,
-    report: &'a R,
-}
-
 /// Connect, claim a client, start it, and forward every location it reports
-/// until the reader is dropped or the bus goes away.
-fn run_session(
-    closer: &Closer,
-    stop_rx: &mpsc::Receiver<()>,
-    out: &Consumer<'_, impl Fn(), impl Fn(LocationPermission)>,
-) {
-    let report = out.report;
+/// until the session is stopped or the bus goes away.
+///
+/// The three things this says back to the app — a fix, a request for the frame
+/// that will show it, a change of permission — arrive bundled as an
+/// [`OsLocationSink`], which is the contract's whole parameter list. They
+/// travel together through every layer here and are never used apart, and a
+/// signal loop needs a connection, a client, a stop channel and a
+/// de-duplication cursor as well: more arguments than clippy will sit still
+/// for.
+fn run_session(closer: &Closer, stop_rx: &mpsc::Receiver<()>, out: &OsLocationSink) {
+    let report = &out.report;
     // The **system** bus, and this is not a detail to get wrong: geoclue ships
     // `/usr/share/dbus-1/system-services/org.freedesktop.GeoClue2.service` and
     // nothing under `services/`, so a session-bus connection answers
@@ -391,9 +415,9 @@ fn watch(
     client: &str,
     mut last: Option<OwnedObjectPath>,
     stop_rx: &mpsc::Receiver<()>,
-    out: &Consumer<'_, impl Fn(), impl Fn(LocationPermission)>,
+    out: &OsLocationSink,
 ) {
-    let report = out.report;
+    let report = &out.report;
     for message in signals {
         let message = match message {
             Ok(message) => message,
@@ -539,11 +563,7 @@ fn route(message: &zbus::message::Message, client: &str) -> Signal {
 
 /// Read one `Location` object and hand the fix to the consumer. `false` when
 /// the consumer is gone and the session should stop.
-fn publish(
-    conn: &Connection,
-    path: &OwnedObjectPath,
-    out: &Consumer<'_, impl Fn(), impl Fn(LocationPermission)>,
-) -> bool {
+fn publish(conn: &Connection, path: &OwnedObjectPath, out: &OsLocationSink) -> bool {
     let props = match location_properties(conn, path) {
         Ok(props) => props,
         Err(e) => {
@@ -1689,6 +1709,50 @@ mod tests {
         assert!(
             !closer.lock().accepts(),
             "a connection handed over after the stop would never be closed"
+        );
+    }
+
+    // ── The contract's first phase ──────────────────────────────────────
+
+    /// Bringing the provider up connects to nothing, delivers nothing, and
+    /// reports [`LocationPermission::Prompt`] before it returns.
+    ///
+    /// `Prompt` and not `Unknown`, and the difference is the whole reason the
+    /// contract asks for an initial report at all: `Unknown` means "the
+    /// platform has not answered yet, look again shortly", and this provider
+    /// does not answer until it is started — the first D-Bus round trip is the
+    /// first answer and it can sit on an agent dialog. Reporting `Unknown`
+    /// would leave the settings pane on "Checking…" for the life of the
+    /// process with nothing ever prompting.
+    ///
+    /// Synchronously, on the caller's thread: a report made from a spawned
+    /// thread would race the first frame, and the first frame is what decides
+    /// whether the pane offers a button.
+    #[test]
+    fn bringing_the_provider_up_says_prompt_and_starts_no_session() {
+        let (fixes, _receiver) = mpsc::channel();
+        let reported = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&reported);
+
+        let reader = OsLocationReader::start(OsLocationSink {
+            fixes,
+            wake: Arc::new(|| unreachable!("nothing has been delivered to wake for")),
+            report: Arc::new(move |permission| {
+                seen.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(permission);
+            }),
+        })
+        .expect("this arm always has a provider; it cannot know otherwise");
+
+        assert_eq!(
+            *reported.lock().unwrap_or_else(PoisonError::into_inner),
+            vec![LocationPermission::Prompt],
+            "the initial report is what the gate's first frame reads"
+        );
+        assert!(
+            !reader.active(),
+            "bringing the provider up must not open a session"
         );
     }
 

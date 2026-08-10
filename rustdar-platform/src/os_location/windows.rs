@@ -33,7 +33,8 @@
 //! would be a UI freeze bounded only by how long the user takes to read it — the
 //! P0 hang this project has already had once. Every WinRT call in this file
 //! happens on one worker thread instead, and the only thing that crosses back to
-//! the frame path is an `i32` in an atomic.
+//! the frame path is one byte in an atomic — written by the contract's `report`
+//! callback, never read by anything here.
 //!
 //! # Why one worker thread and not several
 //!
@@ -395,7 +396,7 @@ pub fn position_status_label(status: i32) -> &'static str {
 // ── The live WinRT half ─────────────────────────────────────────────────
 
 #[cfg(target_os = "windows")]
-pub use live::{LocationService, OsLocationReader};
+pub use live::OsLocationReader;
 
 #[cfg(target_os = "windows")]
 mod live {
@@ -404,7 +405,7 @@ mod live {
     use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
     use std::time::Duration;
 
-    use rustdar_gps::{GpsFix, LocationPermission};
+    use rustdar_gps::GpsFix;
     // `::windows`, because this module's own parent is called `windows` too.
     use ::windows::Devices::Geolocation::{
         Geolocator, PositionAccuracy, PositionChangedEventArgs, StatusChangedEventArgs,
@@ -416,6 +417,7 @@ mod live {
     use ::windows::System::Launcher;
     use ::windows::core::HSTRING;
 
+    use super::super::{OsLocationProvider, OsLocationSink, RedrawWake, ReportPermission};
     use super::{
         LOCATION_CAPABILITY, LOCATION_SETTINGS_URI, SLOT_UNAVAILABLE, SLOT_UNKNOWN,
         permission_from_request_result, permission_from_slot, position_status_label,
@@ -484,65 +486,91 @@ mod live {
     /// hundred metres cannot change which radar site is nearest.
     const MOVEMENT_THRESHOLD_M: f64 = 100.0;
 
-    /// Wakes the event loop so a fix that arrived while it was parked gets a
-    /// frame to be drawn on. Boxed so it can ride the command channel.
-    type Wake = Box<dyn Fn() + Send + 'static>;
-
     /// Work for the WinRT thread. Everything here is something that must not
     /// happen on the frame thread.
     enum Command {
         /// Raise the system prompt, if this build of Windows has one.
         RequestAccess,
         /// Subscribe `PositionChanged` and start pushing fixes.
-        StartDelivery { fixes: Sender<GpsFix>, wake: Wake },
-        /// Unsubscribe. Sent by [`OsLocationReader`]'s `Drop`.
+        StartDelivery {
+            fixes: Sender<GpsFix>,
+            wake: RedrawWake,
+        },
+        /// Unsubscribe.
         StopDelivery,
         /// Open the machine-wide location switch in Settings.
         OpenSettings,
     }
 
-    /// The permission half of the Windows arm: a live `AppCapability`
-    /// subscription that the bridge owns for the life of the process.
+    /// The latest `AppCapabilityAccessStatus`, or one of the two sentinels, plus
+    /// the callback that publishes every change of it.
     ///
-    /// Separate from [`OsLocationReader`] because the two have different
-    /// lifetimes. Permission state has to be readable *before* anything starts —
-    /// that is what decides whether to ask at all — and has to keep being
-    /// readable after the user turns delivery off, so that a revocation made in
-    /// Settings is still noticed. Delivery comes and goes.
-    pub struct LocationService {
-        /// The latest `AppCapabilityAccessStatus`, or one of the two sentinels.
-        ///
-        /// An atomic and not a channel: [`permission`](Self::permission) is a
-        /// `&self` getter on the frame path, an `mpsc::Receiver` cannot be
-        /// drained through a shared reference, and a `Mutex` would put a lock on
-        /// the hot path for a value that is one `i32` wide.
-        /// `AppCapabilityAccessStatus` is `#[repr(transparent)] struct(pub i32)`,
-        /// so the encoding is free.
-        ///
-        /// `Relaxed` throughout: nothing else is published alongside it, so
-        /// there is no ordering for an acquire/release pair to establish.
-        slot: Arc<AtomicI32>,
+    /// The `i32` and the `report` are one value and not two because they must
+    /// never be written apart. Four places set this status — the first
+    /// `CheckAccess`, the poll, the `AccessChanged` push, the answer to
+    /// `RequestAccessAsync` — and a fifth will be added one day. Any of them
+    /// that stored the integer and forgot to call `report` would leave the
+    /// settings pane showing a permission the OS no longer agrees with, silently
+    /// and for the life of the process. [`store`](Self::store) is the only way
+    /// to write it, so there is nothing to forget.
+    ///
+    /// An atomic and not a `Cell`: it is written from the worker, from an RPC
+    /// thread inside the `AccessChanged` handler, and read back by
+    /// [`slot_after_check_failure`](super::slot_after_check_failure) on the
+    /// worker. `Relaxed` throughout — nothing else is published alongside it, so
+    /// there is no ordering for an acquire/release pair to establish.
+    struct Slot {
+        status: AtomicI32,
+        report: ReportPermission,
+    }
+
+    impl Slot {
+        fn store(&self, status: i32) {
+            self.status.store(status, Ordering::Relaxed);
+            (self.report)(permission_from_slot(status));
+        }
+
+        fn load(&self) -> i32 {
+            self.status.load(Ordering::Relaxed)
+        }
+    }
+
+    /// The Windows provider: an `AppCapability` watcher that runs for the life
+    /// of the process, and a `Geolocator` subscription that comes and goes.
+    ///
+    /// The two lifetimes are why the contract has two phases. Permission state
+    /// has to be readable *before* anything starts — that is what decides
+    /// whether to ask at all — and has to keep being watched after the user
+    /// turns delivery off, so that a revocation made in Settings is still
+    /// noticed. Delivery is the part that stops.
+    pub struct OsLocationReader {
         /// Dropping this is what stops the worker — a disconnected channel ends
         /// its `recv_timeout` — so nothing needs an explicit shutdown command.
         commands: Sender<Command>,
+        /// Cloned into each `StartDelivery`; the fix channel and the waker
+        /// outlive any one subscription.
+        sink: OsLocationSink,
+        /// Whether a `StartDelivery` is outstanding. Not read back off the
+        /// worker: a round trip to answer `location_active()` would put a
+        /// channel handshake on the frame path.
+        delivering: bool,
     }
 
-    impl LocationService {
-        /// Start the worker and begin watching the capability.
+    impl OsLocationProvider for OsLocationReader {
+        /// Start the worker and begin watching the capability. Prompts nobody:
+        /// `CheckAccess` is a read.
         ///
-        /// Returns immediately. The first `CheckAccess` has not happened yet, so
-        /// [`permission`](Self::permission) answers
-        /// [`Unknown`](LocationPermission::Unknown) for a moment — which the
+        /// Returns immediately, and the first `CheckAccess` has not happened
+        /// yet, so the bridge's permission stays
+        /// [`Unknown`](rustdar_gps::LocationPermission::Unknown) for a moment — which the
         /// gate is built to wait through, and is why `Unknown` is a state at
-        /// all.
-        ///
-        /// `start`, not `new`, and not because of the `new_without_default`
-        /// lint: this spawns a thread and subscribes to an OS event, so a
-        /// `Default` impl would put both behind the one constructor everybody
-        /// reads as free and inert. It is the same verb `SerialGpsReader` and
-        /// [`OsLocationReader`] use, for the same reason.
-        pub fn start() -> Self {
-            let slot = Arc::new(AtomicI32::new(SLOT_UNKNOWN));
+        /// all. This is the one arm that deliberately leaves the initial report
+        /// unmade.
+        fn start(sink: OsLocationSink) -> Option<Self> {
+            let slot = Arc::new(Slot {
+                status: AtomicI32::new(SLOT_UNKNOWN),
+                report: Arc::clone(&sink.report),
+            });
             let (commands, inbox) = channel();
 
             let worker_slot = Arc::clone(&slot);
@@ -554,75 +582,76 @@ mod live {
                 // second chance coming, so the pane should say so rather than
                 // wait.
                 log::error!("could not start the Windows location worker: {e}");
-                slot.store(SLOT_UNAVAILABLE, Ordering::Relaxed);
+                slot.store(SLOT_UNAVAILABLE);
             }
 
-            Self { slot, commands }
-        }
-
-        /// One relaxed atomic load and a `match`. Cheap by contract — this is
-        /// called from `poll_platform_state`.
-        pub fn permission(&self) -> LocationPermission {
-            permission_from_slot(self.slot.load(Ordering::Relaxed))
-        }
-
-        /// Queue the system prompt.
-        ///
-        /// The `bool` says the command reached the worker, and nothing more —
-        /// see `PlatformBridge::request_location`, which documents why this
-        /// value may not be persisted. Whether a dialog appears is up to the
-        /// Windows build, and whether the user answers it is up to them; both
-        /// arrive later, in the slot.
-        pub fn request_access(&self) -> bool {
-            self.commands.send(Command::RequestAccess).is_ok()
-        }
-
-        /// Subscribe to positions. `None` if the worker is gone.
-        ///
-        /// Optimistic by necessity: the `Geolocator` is constructed on the
-        /// worker, because a delegate must be registered on the thread that owns
-        /// the apartment, so whether it succeeded is not knowable here without
-        /// blocking — which is the one thing this file exists to avoid. A
-        /// failure shows up as a log line and no fixes.
-        pub fn start_delivery(
-            &self,
-            fixes: Sender<GpsFix>,
-            wake: impl Fn() + Send + 'static,
-        ) -> Option<OsLocationReader> {
-            self.commands
-                .send(Command::StartDelivery {
-                    fixes,
-                    wake: Box::new(wake),
-                })
-                .ok()?;
-            Some(OsLocationReader {
-                commands: self.commands.clone(),
+            Some(Self {
+                commands,
+                sink,
+                delivering: false,
             })
         }
 
-        /// Open the machine-wide location switch. See [`LOCATION_SETTINGS_URI`].
-        pub fn open_settings(&self) -> bool {
-            self.commands.send(Command::OpenSettings).is_ok()
+        /// Subscribe first, then ask.
+        ///
+        /// Both, and in that order, because they are one user-visible act. The
+        /// gate calls this in two situations — never asked, and granted but not
+        /// delivering — and neither would be served by a method that did only
+        /// half of it. Subscribing before the answer arrives is deliberate: a
+        /// `Geolocator` with no permission simply reports no positions, and
+        /// having the subscription already in place is what makes a grant
+        /// produce a fix immediately rather than a poll interval later.
+        ///
+        /// The `bool` says the request reached the worker. It cannot say more —
+        /// whether a dialog appears is up to the Windows build, and whether it
+        /// is answered is up to the user.
+        fn request(&mut self) -> bool {
+            if !self.delivering {
+                // Optimistic by necessity: the `Geolocator` is constructed on
+                // the worker, because a delegate must be registered on the
+                // thread that owns the apartment, so whether it succeeded is not
+                // knowable here without blocking — the one thing this file
+                // exists to avoid. A failure shows up as a log line and no
+                // fixes.
+                self.delivering = self
+                    .commands
+                    .send(Command::StartDelivery {
+                        fixes: self.sink.fixes.clone(),
+                        wake: Arc::clone(&self.sink.wake),
+                    })
+                    .is_ok();
+                if self.delivering {
+                    log::info!("Windows location delivery requested");
+                } else {
+                    log::warn!("the OS location worker is gone; no fixes will arrive");
+                }
+            }
+            self.commands.send(Command::RequestAccess).is_ok()
         }
-    }
 
-    /// A live `PositionChanged` subscription, stopped by dropping it.
-    ///
-    /// The same shape as `SerialGpsReader`, which is what lets `DesktopPlatform`
-    /// hold one of each and drain one channel apiece. Its constructor is
-    /// [`LocationService::start_delivery`] rather than an associated `start`,
-    /// because the `Geolocator` has to be built on the worker that already owns
-    /// the apartment and the capability subscription — a second thread would be
-    /// a second apartment for no benefit.
-    pub struct OsLocationReader {
-        commands: Sender<Command>,
-    }
-
-    impl Drop for OsLocationReader {
-        fn drop(&mut self) {
+        /// Unsubscribe, leaving the capability watcher running.
+        fn stop(&mut self) {
             // Best effort. A dead worker has already dropped its `Geolocator`,
             // which unsubscribes on its own.
             let _ = self.commands.send(Command::StopDelivery);
+            self.delivering = false;
+        }
+
+        fn active(&self) -> bool {
+            self.delivering
+        }
+
+        /// `ms-settings:privacy-location` is a documented URI that
+        /// `Launcher::LaunchUriAsync` opens with no HWND, no spawned process and
+        /// no console flash. See [`LOCATION_SETTINGS_URI`].
+        fn settings_available() -> bool {
+            true
+        }
+
+        fn open_settings(&mut self) {
+            if self.commands.send(Command::OpenSettings).is_err() {
+                log::warn!("the OS location worker is gone; cannot open system settings");
+            }
         }
     }
 
@@ -631,7 +660,7 @@ mod live {
     /// Exists for its `Drop`: the tokens have to be handed back to the
     /// `Geolocator` they came from, and tying that to a value means the worker
     /// cannot forget on any of the paths that end delivery (an explicit stop,
-    /// a dropped `LocationService`, a worker exiting on channel disconnect).
+    /// a dropped [`OsLocationReader`], a worker exiting on channel disconnect).
     struct Delivery {
         geolocator: Geolocator,
         position_token: i64,
@@ -658,7 +687,7 @@ mod live {
     /// activation. That is load-bearing twice over: blocking on a future is only
     /// safe in an MTA, and event completions reach an MTA object on an RPC
     /// thread with no message pump to run.
-    fn worker(slot: &Arc<AtomicI32>, commands: &Receiver<Command>) {
+    fn worker(slot: &Arc<Slot>, commands: &Receiver<Command>) {
         let capability = match AppCapability::Create(&HSTRING::from(LOCATION_CAPABILITY)) {
             Ok(capability) => capability,
             Err(e) => {
@@ -672,7 +701,7 @@ mod live {
                      (0x{:08X}: {e}); location is unavailable on this machine",
                     e.code().0
                 );
-                slot.store(SLOT_UNAVAILABLE, Ordering::Relaxed);
+                slot.store(SLOT_UNAVAILABLE);
                 return;
             }
         };
@@ -698,7 +727,7 @@ mod live {
                 Ok(Command::StopDelivery) => delivery = None,
                 Ok(Command::OpenSettings) => open_settings(),
                 Err(RecvTimeoutError::Timeout) => {}
-                // The `LocationService` was dropped: the process is going away.
+                // The `OsLocationReader` was dropped: the process is going away.
                 Err(RecvTimeoutError::Disconnected) => break,
             }
         }
@@ -712,7 +741,7 @@ mod live {
 
     /// The push half. Without it, a permission revoked in Settings while
     /// rustdar is in the foreground is invisible — see the module note.
-    fn subscribe_access_changed(capability: &AppCapability, slot: &Arc<AtomicI32>) -> Option<i64> {
+    fn subscribe_access_changed(capability: &AppCapability, slot: &Arc<Slot>) -> Option<i64> {
         let slot = Arc::clone(slot);
         // Constructed and registered here, on the worker: `TypedEventHandler`
         // is `!Send`, so it could not have been built anywhere else and handed
@@ -721,13 +750,17 @@ mod live {
             move |sender, _args| {
                 // Runs on an RPC thread. The event carries no status, so the
                 // capability has to be re-read; `AppCapability` is `Send + Sync`
-                // and agile, so reading it from here is fine.
+                // and agile, so reading it from here is fine. `Slot::store`
+                // pushes the change into the bridge from this thread too, which
+                // is what makes a revocation made in Settings visible at all —
+                // the gate stops polling once the answer is `Granted` and
+                // delivery is live.
                 let status = sender.ok()?.CheckAccess()?;
                 log::info!(
                     "Windows location access changed to {:?}",
                     permission_from_slot(status.0)
                 );
-                slot.store(status.0, Ordering::Relaxed);
+                slot.store(status.0);
                 Ok(())
             },
         );
@@ -750,24 +783,23 @@ mod live {
     /// failure here is not allowed to be sticky *or* destructive.
     ///
     /// [`slot_after_check_failure`]: super::slot_after_check_failure
-    fn check_access(capability: &AppCapability, slot: &AtomicI32, consecutive_failures: &mut u8) {
+    fn check_access(capability: &AppCapability, slot: &Slot, consecutive_failures: &mut u8) {
         match capability.CheckAccess() {
             Ok(status) => {
                 *consecutive_failures = 0;
-                slot.store(status.0, Ordering::Relaxed);
+                slot.store(status.0);
             }
             Err(e) => {
                 *consecutive_failures = consecutive_failures.saturating_add(1);
                 log::debug!("Windows CheckAccess failed ({consecutive_failures} in a row): {e}");
-                if let Some(value) = super::slot_after_check_failure(
-                    slot.load(Ordering::Relaxed),
-                    *consecutive_failures,
-                ) {
+                if let Some(value) =
+                    super::slot_after_check_failure(slot.load(), *consecutive_failures)
+                {
                     log::warn!(
                         "Windows CheckAccess has failed {consecutive_failures} times \
                          with no answer yet; offering to ask rather than waiting further"
                     );
-                    slot.store(value, Ordering::Relaxed);
+                    slot.store(value);
                 }
             }
         }
@@ -775,7 +807,7 @@ mod live {
 
     /// Blocks — on a human, if this build of Windows shows the prompt. That is
     /// exactly why it is here and not on the frame thread.
-    fn request_access(slot: &AtomicI32) {
+    fn request_access(slot: &Slot) {
         match Geolocator::RequestAccessAsync().and_then(|request| request.join()) {
             Ok(status) => {
                 log::info!(
@@ -783,7 +815,7 @@ mod live {
                     permission_from_request_result(status.0)
                 );
                 if let Some(value) = super::slot_after_request(status.0) {
-                    slot.store(value, Ordering::Relaxed);
+                    slot.store(value);
                 }
             }
             // Deliberately no retry. A failed ask is a failed ask; the gate's
@@ -793,9 +825,9 @@ mod live {
         }
     }
 
-    /// Build the `Geolocator` and subscribe. Runs on the worker; see
-    /// [`LocationService::start_delivery`].
-    fn start_delivery(fixes: Sender<GpsFix>, wake: Wake) -> Option<Delivery> {
+    /// Build the `Geolocator` and subscribe. Runs on the worker, because a
+    /// delegate has to be registered on the thread that owns the apartment.
+    fn start_delivery(fixes: Sender<GpsFix>, wake: RedrawWake) -> Option<Delivery> {
         let geolocator = match Geolocator::new() {
             Ok(geolocator) => geolocator,
             Err(e) => {

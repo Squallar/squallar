@@ -1,24 +1,27 @@
-//! The seam between `DesktopPlatform` and whatever location service the OS
+//! The seam between the platform bridges and whatever location service the OS
 //! offers.
 //!
-//! Windows has `Geolocator` and `AppCapability`, macOS has `CLLocationManager`,
-//! Linux has GeoClue2 — first-class services rustdar has never asked. Each gets
-//! a private module here exposing one type, `OsLocationReader`, with the same
-//! shape as [`SerialGpsReader::start`]: a constructor that returns `None` when
-//! there is nothing to read, and a value that stops when it is dropped. That
-//! symmetry is the point — the consumer side already knows how to hold one of
-//! those, and `DesktopPlatform` ends up with two identical-looking readers
-//! feeding one channel drain.
+//! Windows has `Geolocator` and `AppCapability`, Apple has `CLLocationManager`,
+//! Linux has GeoClue2 — first-class services rustdar had never asked. Each gets
+//! a private module here exposing one type, `OsLocationReader`, implementing one
+//! trait, [`OsLocationProvider`]. That trait is the contract, it is declared
+//! once, and the compiler checks every arm against it.
 //!
 //! **This module is the entire `cfg` surface.** Nothing outside it names a
-//! target, and no provider file carries a `cfg` of its own. A per-OS `cfg`
-//! spread across call sites is how a build ends up compiling two providers, or
-//! none, on a target nobody tested.
+//! target, and no provider file carries a `cfg` naming a *different* target than
+//! the arm that selects it. A per-OS `cfg` spread across call sites is how a
+//! build ends up compiling two providers, or none, on a target nobody tested.
 //!
-//! Only `unsupported` exists today; the real providers are separate pieces of
-//! work with their own dependencies, their own permission mechanics and, in two
-//! cases, their own packaging. The arms are written out anyway so that landing
-//! one is a one-line change here rather than a redesign.
+//! Landing a provider touches this file, the provider's own file, and that
+//! target's dependency block in `rustdar-platform/Cargo.toml`. **Nothing else**
+//! — not `platform.rs`, not `lib.rs`. The three providers that landed here each
+//! discovered independently that the older wording ("a one-line change here")
+//! was false, because the older contract was not one contract: each of them had
+//! to add a parameter `unsupported` did not take, and each therefore had to
+//! reach into `platform.rs` to call it. [`OsLocationProvider`] is what makes the
+//! claim true, and the claim is checkable: every `target_os` left in
+//! `platform.rs` says which *bridge* exists, and not one of them says anything
+//! about how that bridge does location.
 //!
 //! [`SerialGpsReader::start`]: rustdar_gps::SerialGpsReader::start
 
@@ -55,8 +58,8 @@ mod apple;
 #[cfg(target_os = "linux")]
 use linux as provider;
 
-/// Phase 4: `AppCapability` for the state, `Geolocator` to prompt, an MTA
-/// worker to keep `RequestAccessAsync` off the frame thread.
+/// `AppCapability` for the state, `Geolocator` to prompt, an MTA worker to keep
+/// `RequestAccessAsync` off the frame thread.
 ///
 /// Compiled under `test` as well as on Windows, and that is not a convenience.
 /// The half of that file worth testing is pure — which `AppCapabilityAccessStatus`
@@ -73,18 +76,6 @@ mod windows;
 /// name — uniform paths would find both and refuse to choose.
 #[cfg(target_os = "windows")]
 use self::windows as provider;
-
-/// The permission half of the Windows arm, which `OsLocationReader` is not.
-///
-/// Deliberately outside the shared provider surface below. The two have
-/// different lifetimes: a reader is a subscription that comes and goes with the
-/// user's "Turn off" button, whereas the capability watcher has to be running
-/// *before* anything starts — it is what decides whether starting is even
-/// allowed — and has to keep running afterwards so a revocation made in Settings
-/// is still noticed. Every arm answers `location_permission` from its own
-/// mechanism, and there is nothing common to name until more than one exists.
-#[cfg(target_os = "windows")]
-pub use self::windows::LocationService;
 
 /// One `apple.rs` with two `#[cfg]` islands — `CLLocationManager` is the same
 /// on both, but macOS constructs its bridge after `NSApplication` exists and
@@ -103,6 +94,144 @@ use apple as provider;
 use unsupported as provider;
 
 pub use provider::OsLocationReader;
+
+// ── The provider contract ───────────────────────────────────────────────
+
+/// Asks the event loop for a frame, so that something a provider pushed while
+/// the loop was parked is actually seen.
+///
+/// `Arc<dyn …>` and not `impl Fn`, because two providers hand it to more than
+/// one place: Linux clones it into every session thread it starts, Windows
+/// clones it into every `StartDelivery` command. `Send + Sync` is what
+/// `RedrawWaker` already guarantees — `rustdar-frontend` pins that with a
+/// `const` assertion — so requiring it here costs nothing and is what makes the
+/// clone legal.
+pub type RedrawWake = std::sync::Arc<dyn Fn() + Send + Sync + 'static>;
+
+/// Announces a permission the app did not ask for.
+pub type ReportPermission =
+    std::sync::Arc<dyn Fn(rustdar_gps::LocationPermission) + Send + Sync + 'static>;
+
+/// The three ways a provider talks back to the app, and the only three.
+///
+/// One struct rather than three parameters because they travel together through
+/// every layer of every provider and are never used apart — Linux had already
+/// bundled exactly these into a private `Consumer` before this trait existed —
+/// and because a fourth thing, if one is ever needed, is then a field rather
+/// than a fourth edit to four arms.
+///
+/// `Clone` is load-bearing: a provider that can be stopped and started again
+/// needs to hand a fresh copy to each session it runs.
+#[derive(Clone)]
+pub struct OsLocationSink {
+    /// Where fixes go. `DesktopPlatform` drains this alongside the serial
+    /// reader's and picks between them; see [`prefer_fix`].
+    pub fixes: std::sync::mpsc::Sender<rustdar_gps::GpsFix>,
+    /// See [`RedrawWake`].
+    pub wake: RedrawWake,
+    /// See [`ReportPermission`] and the note on [`OsLocationProvider::start`].
+    pub report: ReportPermission,
+}
+
+/// One shape for every arm of the table above.
+///
+/// # Why this is a trait and not a convention
+///
+/// It used to be a convention: `unsupported.rs` carried a signature and each
+/// provider was expected to match it. Three providers landed and none of them
+/// did — Linux needed a permission callback, Apple needed a waker and four more
+/// methods, Windows needed a waker and routed around the mismatch with a
+/// differently-shaped constructor of its own. Nothing caught any of that,
+/// because nothing was comparing them. A trait is compared by the compiler.
+///
+/// # Why the parameter is not a `GpsConfig`
+///
+/// The old signature took one, inherited from [`SerialGpsReader::start`], whose
+/// job it is to open a serial port. `GpsConfig` carries a port name, a baud
+/// rate and a heading source: three settings for a piece of hardware the user
+/// plugged in. A GeoClue client, a WinRT `Geolocator` and a `CLLocationManager`
+/// have none of those and can use none of them — every provider that landed
+/// ignored the argument, and one of them said so in a doc comment. What a
+/// location session actually needs is somewhere to put a fix, a way to ask for
+/// the frame that will show it, and a way to say the permission changed. That
+/// is [`OsLocationSink`], and it is the whole parameter list.
+///
+/// # The two phases, and why there are two
+///
+/// [`start`](Self::start) brings the provider up. It **must not prompt and must
+/// not deliver**: it runs once, from `set_redraw_waker`, before the first frame.
+/// [`request`](Self::request) is the user-visible act — prompt if the platform
+/// prompts, then deliver.
+///
+/// Splitting them is what lets all three providers keep the behaviour they were
+/// each built for. Windows' `AppCapability` watcher and Apple's
+/// `locationManagerDidChangeAuthorization:` have to be live *before* anything is
+/// asked, because they are what answers "may we?", and have to stay live *after*
+/// delivery stops, or a revocation made in system settings is never noticed.
+/// Linux's `Start()` can sit on an agent dialog for as long as the user takes,
+/// so it cannot be part of bringing the provider up at all. One phase would have
+/// forced two of the three to lie.
+///
+/// # The permission lives in the bridge, not in here
+///
+/// Providers **push** through [`OsLocationSink::report`]; nothing asks them.
+/// There is no `permission()` on this trait, and that is deliberate: the gate
+/// answers `Denied` by calling `stop_location`, so any state kept inside the
+/// value being stopped evaporates at exactly the moment it starts to matter.
+/// `DesktopPlatform` holds one atomic that outlives every session, and
+/// `report` is what writes it.
+///
+/// A provider is expected to report its true initial state during `start`, or to
+/// leave it deliberately at [`Unknown`] — the one state that neither asks nor
+/// concludes — when it genuinely does not know yet. Linux reports [`Prompt`]
+/// (nobody has been asked, and asking is the only way to find out); Apple
+/// reports the real `CLAuthorizationStatus`, which it can read synchronously;
+/// Windows leaves it `Unknown` until its worker's first `CheckAccess`, which is
+/// what the settings pane's "Checking…" exists for.
+///
+/// [`SerialGpsReader::start`]: rustdar_gps::SerialGpsReader::start
+/// [`Unknown`]: rustdar_gps::LocationPermission::Unknown
+/// [`Prompt`]: rustdar_gps::LocationPermission::Prompt
+pub trait OsLocationProvider: Sized {
+    /// Bring the provider up, prompting nobody and delivering nothing.
+    ///
+    /// `None` means this build or this machine has no location service to
+    /// subscribe to — which is not the same as the user having said no, and the
+    /// bridge renders it as [`Unavailable`] rather than as a refusal.
+    ///
+    /// [`Unavailable`]: rustdar_gps::LocationPermission::Unavailable
+    fn start(sink: OsLocationSink) -> Option<Self>;
+
+    /// Prompt if the platform needs prompting, and start delivering.
+    ///
+    /// The `bool` is the hint `PlatformBridge::request_location` documents, and
+    /// nothing durable may hang off it: two of the three platforms cannot tell
+    /// whether the ask reached a human.
+    fn request(&mut self) -> bool;
+
+    /// Stop delivering. Never revokes — no platform offers an app a way to hand
+    /// a permission back — and never tears down the permission watcher, which
+    /// is the thing that would notice a change made while delivery is off.
+    fn stop(&mut self);
+
+    /// Whether fixes are being delivered right now. Not "granted": those are
+    /// different states and the settings pane shows both.
+    fn active(&self) -> bool;
+
+    /// Whether this platform has a location settings page worth offering.
+    ///
+    /// An associated function and not a method, because it is a property of the
+    /// build rather than of any state — and because `App::new` asks it once,
+    /// before `set_redraw_waker` has run, so at a point where no provider has
+    /// been constructed yet. A `&self` answer would be `false` on Windows
+    /// forever, which is a button that never appears.
+    fn settings_available() -> bool {
+        false
+    }
+
+    /// Open the system location settings. Fire and forget; must not block.
+    fn open_settings(&mut self) {}
+}
 
 /// Choose between a fix from the serial reader and one from the OS.
 ///
