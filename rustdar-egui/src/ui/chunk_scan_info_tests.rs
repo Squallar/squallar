@@ -8,7 +8,7 @@ fn site() -> RadarSite {
         name: "KTLX",
         lat: 35.3,
         lon: -97.3,
-        elev: None,
+        heights: None,
     }
 }
 

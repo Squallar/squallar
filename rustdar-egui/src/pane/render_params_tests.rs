@@ -10,7 +10,7 @@ fn pane_listing(products: &[(RadarProduct, &[f32])]) -> PaneState {
             name: "KTLX",
             lat: 35.33,
             lon: -97.27,
-            elev: None,
+            heights: None,
         },
         timestamp: chrono::NaiveDate::from_ymd_opt(2026, 7, 26)
             .unwrap()
@@ -104,7 +104,7 @@ fn the_data_time_on_screen_follows_the_loop_when_one_is_running() {
             name: "KTLX",
             lat: 35.33,
             lon: -97.27,
-            elev: None,
+            heights: None,
         },
     );
     assert_eq!(

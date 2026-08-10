@@ -27,12 +27,18 @@ const REFL_OFFSET: f32 = 66.0;
 const FIRST_GATE_M: u16 = 2125;
 const GATE_M: u16 = 250;
 
-/// KTLX, whose elevation `eet::radar_height_ft_near` reports as 1213 ft.
+/// KTLX, whose feedhorn `eet::radar_height_ft_near` reports as 1275 ft.
 const SITE: (f64, f64) = (35.3333, -97.2778);
-/// The conversion is written out rather than taken from [`FT_TO_KM`], so
-/// that an edit to the module's factor fails here instead of moving the
-/// expected value along with the measured one.
-const SITE_ELEV_KM: f64 = 1213.0 * 0.000_304_8;
+/// The **feedhorn**, 1213 ft of ground plus a 62 ft tower.
+///
+/// It was the 1213 before the section named a datum, which put the height
+/// axis a whole tower low — every beam height on it is measured above the
+/// antenna, not above the ground the antenna stands on. Written out rather
+/// than taken from [`FT_TO_KM`] so that an edit to the module's factor fails
+/// here instead of moving the expected value along with the measured one,
+/// and written as the sum so that switching the render back to
+/// `Datum::SiteBase` fails this file rather than passing quietly.
+const SITE_ELEV_KM: f64 = (1213.0 + 62.0) * 0.000_304_8;
 
 /// Raw code for a range-folded gate. Not a magic 1: the sampler's decoder
 /// reads it as [`SampleStatus::RangeFolded`] and this is the only way to

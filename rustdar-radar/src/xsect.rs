@@ -62,9 +62,12 @@
 //! never does — so the default never clips real data. MSL rather than
 //! above-radar because that is the datum a sounding, a flight level and a
 //! melting-layer height are all quoted in; a section is read *against* those.
-//! The site elevation comes from [`crate::eet::radar_height_ft_near`], the same
-//! source `render::render_hhc_to_image` uses for the same datum, so a section
-//! and the environmental heights drawn beside it share one ground.
+//! The site height comes from [`crate::eet::radar_height_ft_near`] on
+//! [`crate::sites::Datum::Feedhorn`] — the antenna, not the ground the tower
+//! stands on — which is the same source and the same datum
+//! `render::render_hhc_to_image` uses, so a section and the environmental
+//! heights drawn beside it share one origin. It was the ground until the
+//! datum became a word in the call, which put this axis a tower low.
 //!
 //! Note the two are not the same coordinate: [`crate::beam`] measures heights
 //! **above the antenna**, so every row height crosses that boundary exactly
@@ -159,7 +162,7 @@ pub const SECTION_HEIGHT: usize = types::IMAGE_SIZE / 2;
 /// default rather than a guess.
 pub const DEFAULT_AXIS_HEIGHT_KM: f64 = 20.0;
 
-/// Feet to kilometres, for the site elevation
+/// Feet to kilometres, for the feedhorn height
 /// [`crate::eet::radar_height_ft_near`] reports. The same factor
 /// `render::render_hhc_to_image` and `hail::FT_TO_KM` use.
 const FT_TO_KM: f64 = 0.0003048;
@@ -712,7 +715,11 @@ fn render_with_sampler(
         return None;
     }
 
-    let base_km_msl = crate::eet::radar_height_ft_near(lat, lon) * FT_TO_KM;
+    // The feedhorn: every height on this axis is a beam height, and `beam`
+    // measures those above the antenna, not above the ground the tower
+    // stands on.
+    let base_km_msl =
+        crate::eet::radar_height_ft_near(lat, lon, crate::sites::Datum::Feedhorn) * FT_TO_KM;
     let top_km_msl = req
         .top_km_msl
         .unwrap_or(base_km_msl + DEFAULT_AXIS_HEIGHT_KM);

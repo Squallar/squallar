@@ -36,9 +36,13 @@ const REFL_OFFSET: f32 = 66.0;
 const FIRST_GATE_M: u16 = 2125;
 const GATE_M: u16 = 250;
 
-/// KTLX, whose elevation `eet`'s own test pins at 1213 ft.
+/// KTLX, whose feedhorn `eet`'s own test pins at 1275 ft.
 const SITE: (f64, f64) = (35.33306, -97.2775);
-const SITE_ELEV_FT: f64 = 1213.0;
+/// The **feedhorn**, 1213 ft of ground plus a 62 ft tower — the datum the
+/// grid subtracts, because the beam heights it places are measured above the
+/// antenna. Written as the sum so that switching the builder back to
+/// `Datum::SiteBase` fails here rather than passing quietly.
+const SITE_ELEV_FT: f64 = 1213.0 + 62.0;
 
 fn encode_refl(dbz: f64) -> u8 {
     ((dbz * f64::from(REFL_SCALE) + f64::from(REFL_OFFSET)).round() as i64).clamp(2, 255) as u8
@@ -842,7 +846,8 @@ fn cell_centres_sit_at_the_half_step() {
 /// The vertical axis is MSL and the site's own elevation is subtracted
 /// exactly once.
 ///
-/// KTLX stands at 1213 ft — 0.3697 km — which is 7 rows of this grid. A
+/// KTLX's feedhorn stands at 1275 ft — 0.3886 km — which is 7 rows of this
+/// grid. A
 /// builder that skipped the subtraction, or applied it with the wrong
 /// sign, moves the lowest row with data by 7 or 14 rows.
 #[test]

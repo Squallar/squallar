@@ -93,7 +93,7 @@ fn loop_on(ctx: &egui::Context, site: &'static str, textured: &[usize]) -> LoopP
             name: site,
             lat: 35.0,
             lon: -97.0,
-            elev: None,
+            heights: None,
         },
     );
     ls.phase = LoopPhase::Rendering;

@@ -252,7 +252,9 @@ pub fn mehs_mm(shi: f64) -> f64 {
 }
 
 /// [`EnvHeights`] (km **MSL**, from Open-Meteo) resolved to km **ARL**
-/// against the radar's height in feet MSL — `a31599.ftn`'s conversion,
+/// against the radar's height in feet MSL — *above radar level* meaning above
+/// the antenna, so `radar_height_ft` is the feedhorn and not the ground under
+/// the tower. `a31599.ftn`'s conversion,
 /// including its clamp of negative ARL heights to 0 (a freezing level below
 /// the radar reads as *at* the radar, not underground).
 pub fn env_arl_km(env: &EnvHeights, radar_height_ft: f64) -> (f64, f64) {
@@ -335,9 +337,11 @@ fn layer_shi(dbz: f64, bottom_km: f64, top_km: f64, h0_km: f64, hm20_km: f64) ->
 /// `env` is the per-site environmental sounding; **`None` means there is no
 /// field** — the products are undefined without an environment, and the
 /// render seam treats that as "nothing to draw", never as a zero-filled
-/// grid. `radar_height_ft` is the site height above MSL in feet
-/// ([`crate::eet::radar_height_ft_near`] on the render path), the datum that
-/// converts the MSL sounding heights to the beam's ARL coordinate.
+/// grid. `radar_height_ft` is the **feedhorn** height above MSL in feet
+/// ([`crate::eet::radar_height_ft_near`] on
+/// [`crate::sites::Datum::Feedhorn`] on the render path), the datum that
+/// converts the MSL sounding heights to the beam's ARL coordinate — ARL is
+/// above the antenna, and the ground under the tower is 30–115 ft lower.
 pub fn compute_hail(
     scan: &Scan,
     env: Option<&EnvHeights>,

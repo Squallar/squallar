@@ -536,7 +536,7 @@ fn scan_info_for(site: &'static str) -> rustdar_radar::types::ScanInfo {
             name: site,
             lat: 35.33,
             lon: -97.27,
-            elev: None,
+            heights: None,
         },
         timestamp: chrono::NaiveDate::from_ymd_opt(2026, 7, 30)
             .unwrap()

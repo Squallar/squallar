@@ -215,7 +215,7 @@ fn site(name: &'static str, lat: f64, lon: f64) -> RadarSite {
         name,
         lat,
         lon,
-        elev: None,
+        heights: None,
     }
 }
 

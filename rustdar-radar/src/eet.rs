@@ -102,6 +102,7 @@
 //! papered over: do not lower the bar, and do not calibrate further
 //! heuristics against a single twin volume.
 
+use crate::sites::Datum;
 use crate::types::RadarProduct;
 use crate::volumetric::{CellStat, DedupPolicy, RANGE_BINS, VolumeCube};
 use nexrad_model::data::Scan;
@@ -172,7 +173,9 @@ struct TiltView<'a> {
 
 /// Compute Enhanced Echo Tops from a Level II volume, per the rules in the
 /// module doc. `radar_height_ft` is the radar height above MSL in feet — the
-/// value the twin's PDB carries, or [`radar_height_ft_near`] for a render.
+/// value the twin's PDB carries, or [`radar_height_ft_near`] on
+/// [`Datum::Feedhorn`] for a render. The feedhorn, because every height this
+/// adds it to is measured above the antenna.
 pub fn compute_eet(scan: &Scan, radar_height_ft: f64) -> EetGrid {
     let cube = VolumeCube::build_with_stats(
         scan,
@@ -247,8 +250,17 @@ pub fn compute_eet(scan: &Scan, radar_height_ft: f64) -> EetGrid {
     }
 }
 
-/// Radar height above MSL, in feet, of the site nearest a lat/lon — for the
-/// render path, which knows only the coordinates.
+/// Height above MSL, in feet, of the site nearest a lat/lon, on `datum` — for
+/// the render path, which knows only the coordinates.
+///
+/// # Why the caller names a datum
+///
+/// A site has two heights 30–115 ft apart, the ground and the feedhorn, and
+/// this used to return one number without saying which. Everything here is
+/// added to a beam height, and [`crate::beam`] measures heights above the
+/// **antenna**, so the answer every current caller wants is
+/// [`Datum::Feedhorn`]. Naming it is the point: the old signature let a
+/// caller inherit the ground silently and be a whole tower low.
 ///
 /// # Why the nearest site rather than the named one
 ///
@@ -261,30 +273,32 @@ pub fn compute_eet(scan: &Scan, radar_height_ft: f64) -> EetGrid {
 /// resolves to the site the caller meant, exactly, and the nearest-neighbour
 /// search is an indirection rather than a guess.
 ///
-/// # Sites the table has no elevation for
+/// # Sites the table cannot answer for
 ///
-/// Rows without one are **skipped**, not selected and then unwrapped to zero.
-/// That distinction is the whole point: `and_then(|s| s.elev)` on the nearest
-/// row meant an elevation-less site short-circuited the entire lookup to 0 ft
-/// — sea level, which is a perfectly plausible reading for a coastal site and
-/// was a 292 ft error at KLWX. Skipping degrades instead to a genuine
-/// neighbour's elevation, wrong by the terrain between them rather than by the
-/// whole height of the site.
+/// Rows that do not record `datum` are **skipped**, not selected and then
+/// unwrapped to zero. That distinction is the whole point: picking the
+/// nearest row and *then* asking it for a height meant a row that could not
+/// answer short-circuited the entire lookup to 0 ft — sea level, which is a
+/// perfectly plausible reading for a coastal site and was a 292 ft error at
+/// KLWX. Skipping degrades instead to a genuine neighbour's height, wrong by
+/// the terrain between them rather than by the whole height of the site.
 ///
-/// No shipped row is elevation-less (`every_site_records_an_elevation` pins
-/// that), so this is a guard against a future row, not a live path. An empty
-/// table still yields 0 ft, having nothing else to say.
-pub fn radar_height_ft_near(lat: f64, lon: f64) -> f64 {
+/// No shipped row fails to answer [`Datum::Feedhorn`]
+/// (`every_site_answers_the_feedhorn_datum` pins that). Forty-six rows
+/// genuinely cannot answer [`Datum::SiteBase`] — the TDWRs and `LPLA`, whose
+/// volumes report a single height — and for those this returns a neighbour's
+/// ground, which is why no render path asks for that datum. An empty table
+/// still yields 0 ft, having nothing else to say.
+pub fn radar_height_ft_near(lat: f64, lon: f64, datum: Datum) -> f64 {
     crate::sites::RADARS
         .iter()
-        .filter(|s| s.elev.is_some())
-        .min_by(|a, b| {
+        .filter_map(|s| s.height_ft(datum).map(|ft| (s, ft)))
+        .min_by(|(a, _), (b, _)| {
             let da = (a.lat - lat).powi(2) + (a.lon - lon).powi(2);
             let db = (b.lat - lat).powi(2) + (b.lon - lon).powi(2);
             da.total_cmp(&db)
         })
-        .and_then(|s| s.elev)
-        .map_or(0.0, f64::from)
+        .map_or(0.0, |(_, ft)| f64::from(ft))
 }
 
 #[cfg(test)]
@@ -525,89 +539,100 @@ mod tests {
         assert_eq!(encode_level(0.0, true), 130);
     }
 
-    /// The render path's site lookup: the nearest site's elevation.
+    /// The render path's site lookup: the nearest site, on the datum asked
+    /// for.
+    ///
+    /// Both datums are pinned at the same coordinate, because a lookup that
+    /// answered the same number for either would mean the parameter is
+    /// decorative. KTLX's ground is 1213 ft and its feedhorn 1275.
     #[test]
     fn radar_height_lookup_finds_the_nearest_site() {
-        // KTLX's own coordinates give KTLX's elevation.
-        assert_eq!(radar_height_ft_near(35.33306, -97.2775), 1213.0);
+        // KTLX's own coordinates give KTLX's heights.
+        assert_eq!(
+            radar_height_ft_near(35.33306, -97.2775, Datum::SiteBase),
+            1213.0
+        );
+        assert_eq!(
+            radar_height_ft_near(35.33306, -97.2775, Datum::Feedhorn),
+            1275.0
+        );
         // A point nudged off-site still lands on it.
-        assert_eq!(radar_height_ft_near(35.4, -97.2), 1213.0);
+        assert_eq!(radar_height_ft_near(35.4, -97.2, Datum::Feedhorn), 1275.0);
     }
 
-    /// A site whose row records no elevation must not drag the lookup down to
+    /// A row that cannot answer the datum must not drag the lookup down to
     /// sea level.
     ///
     /// This is the shape of the KLWX defect. `radar_height_ft_near` used to
-    /// pick the nearest row and *then* `and_then(|s| s.elev)`, so standing on
-    /// an elevation-less site returned 0 ft rather than anything about the
+    /// pick the nearest row and *then* reach for its elevation, so standing
+    /// on a row that had none returned 0 ft rather than anything about the
     /// terrain — and 0 ft is indistinguishable from a real answer, several
     /// rows of the table being under 20 ft.
     ///
-    /// The table now records every site, so this reaches for the guard the
-    /// only way left: it asserts the *property* that no coordinate anywhere in
-    /// the table's footprint returns exactly zero. Under the old
-    /// `and_then`-after-`min_by` that failed at each of the six unrecorded
-    /// sites; under the filter it cannot fail while
-    /// `every_site_records_an_elevation` holds, and if a future row arrives
-    /// without an elevation it still cannot, because the row is skipped.
+    /// The hole survived the move to two datums: a row can now record a
+    /// height and still be unable to answer the datum a caller names. So this
+    /// asserts the property on **both** datums — no coordinate anywhere in the
+    /// table's footprint returns exactly zero — which is the version that
+    /// fails if a future row records only a base and a feedhorn caller stands
+    /// on it.
     #[test]
-    fn an_elevationless_row_never_answers_with_sea_level() {
+    fn a_row_that_cannot_answer_never_reports_sea_level() {
         // The precondition that makes "exactly 0 ft" a usable sentinel: no row
-        // is genuinely at sea level, the lowest being KBYX at 8 ft. A future
+        // is genuinely at sea level, the lowest being KBYX at 87 ft. A future
         // row at exactly 0 would make this test wrong rather than the code, so
         // it fails here first and says so.
         let lowest = crate::sites::RADARS
             .iter()
-            .filter_map(|s| s.elev)
+            .filter_map(|s| s.height_ft(Datum::Feedhorn))
             .min()
             .expect("the table is not empty");
         assert!(
             lowest > 0,
             "a site now records {lowest} ft, so 0 ft no longer means \
-             'no elevation' and this test needs a different sentinel",
+             'no height' and this test needs a different sentinel",
         );
 
-        for site in crate::sites::RADARS.iter() {
-            let ft = radar_height_ft_near(site.lat, site.lon);
-            assert_ne!(
-                ft, 0.0,
-                "{} at ({}, {}) resolved to sea level",
-                site.name, site.lat, site.lon,
-            );
+        for datum in [Datum::SiteBase, Datum::Feedhorn] {
+            for site in crate::sites::RADARS.iter() {
+                let ft = radar_height_ft_near(site.lat, site.lon, datum);
+                assert_ne!(
+                    ft, 0.0,
+                    "{} at ({}, {}) resolved to sea level on {datum:?}",
+                    site.name, site.lat, site.lon,
+                );
+            }
         }
     }
 
-    /// The six sites the table shipped with no elevation, pinned by value.
+    /// The six sites the table once shipped with no elevation, pinned by
+    /// value on both datums.
     ///
-    /// These are `site_height` — the base — in metres: KDGX 151, KFSX 2261,
-    /// KRTX 492, KSRX 200, KVWX 156, KLWX 89. Converted at 0.3048 m/ft and
-    /// rounded, which is the datum and the precision every other row in the
-    /// table already uses (see [`crate::sites::RadarSite::elev`] for what was
-    /// measured about that datum and what was not).
-    ///
-    /// **Only KLWX has been read back out of a Level II volume here** — 89 m
-    /// in `KLWX20180302_115347_V06`'s Volume Data Block, which is the 292 ft
-    /// below. The other five had no volume available to this host, so their
-    /// metre figures are transcribed rather than measured, and a transcription
-    /// error in any of them would not be caught by this test or any other in
-    /// the crate. That is the standing gap, not a claim of verification.
+    /// Their bases are `site_height` in metres — KDGX 151, KFSX 2261,
+    /// KRTX 492, KSRX 200, KVWX 156, KLWX 89 — and all six have now been read
+    /// back out of a real volume by `site_elev_probe`, which closes the gap
+    /// this test used to record: only KLWX had been measured, and a
+    /// transcription error in the other five would have gone unseen.
     ///
     /// KLWX is the one the cross-section campaign caught: it anchored a
     /// section 89 m low, and 89 m is four and a half rows of a 1024-row raster
     /// over a 20 km axis.
     #[test]
     fn the_six_formerly_unrecorded_sites_carry_their_measured_elevation() {
-        for (name, ft) in [
-            ("KDGX", 495),
-            ("KFSX", 7418),
-            ("KRTX", 1614),
-            ("KSRX", 656),
-            ("KVWX", 512),
-            ("KLWX", 292),
+        for (name, base_ft, feedhorn_ft) in [
+            ("KDGX", 495, 607),
+            ("KFSX", 7418, 7513),
+            ("KRTX", 1614, 1726),
+            ("KSRX", 656, 735),
+            ("KVWX", 512, 624),
+            ("KLWX", 292, 404),
         ] {
             let site = crate::sites::get_radar_site(name).expect("in the table");
-            assert_eq!(site.elev, Some(ft), "{name}");
-            assert_eq!(radar_height_ft_near(site.lat, site.lon), f64::from(ft));
+            assert_eq!(site.height_ft(Datum::SiteBase), Some(base_ft), "{name}");
+            assert_eq!(site.height_ft(Datum::Feedhorn), Some(feedhorn_ft), "{name}");
+            assert_eq!(
+                radar_height_ft_near(site.lat, site.lon, Datum::Feedhorn),
+                f64::from(feedhorn_ft),
+            );
         }
     }
 }

@@ -30,7 +30,7 @@ pub(super) fn show_on(
             name: "KTLX",
             lat: 35.3,
             lon: -97.3,
-            elev: None,
+            heights: None,
         },
         timestamp: chrono::NaiveDate::from_ymd_opt(2026, 7, 28)
             .unwrap()

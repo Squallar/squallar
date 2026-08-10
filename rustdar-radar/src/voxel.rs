@@ -49,9 +49,12 @@
 //!
 //! `z` is **MSL**, because a 3D scene shares one vertical datum with terrain
 //! and with every other overlay. The sampler's heights are above the antenna,
-//! so the site's elevation is subtracted once per grid — via
-//! [`crate::eet::radar_height_ft_near`] and the same `* 0.0003048` spelling
-//! `render.rs` uses for `radar_km_msl`.
+//! so the site's **feedhorn** height is subtracted once per grid — via
+//! [`crate::eet::radar_height_ft_near`] on
+//! [`crate::sites::Datum::Feedhorn`], and the same `* 0.0003048` spelling
+//! `render.rs` uses for `radar_km_msl`. The antenna is what the heights are
+//! above; the ground under the tower is 30–115 ft lower and was what this
+//! subtracted before the datum was named.
 //!
 //! There is no extrapolation anywhere. A cell under the lowest beam, over the
 //! highest, past the last gate or outside every radial is
@@ -1606,7 +1609,8 @@ pub fn build_voxels_with_motion<'a>(
     let z_range_km_msl = (req.base_km_msl, req.top_km_msl);
 
     // The same spelling `render.rs` uses for `radar_km_msl`.
-    let site_km_msl = crate::eet::radar_height_ft_near(lat, lon) * 0.0003048;
+    let site_km_msl =
+        crate::eet::radar_height_ft_near(lat, lon, crate::sites::Datum::Feedhorn) * 0.0003048;
 
     let value_range = value_range_for_product(req.product, slot);
     let lut = colormap_lut(req.product, value_range);

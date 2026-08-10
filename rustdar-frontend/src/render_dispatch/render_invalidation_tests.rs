@@ -351,7 +351,7 @@ fn gui_on_tilt(
             name: "KOUN",
             lat: 35.2,
             lon: -97.4,
-            elev: None,
+            heights: None,
         },
         timestamp: chrono::NaiveDate::from_ymd_opt(2026, 7, 28)
             .unwrap()

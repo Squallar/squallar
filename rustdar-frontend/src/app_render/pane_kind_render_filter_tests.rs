@@ -241,7 +241,7 @@ fn active_loop(timestamps: &[chrono::NaiveDateTime]) -> LoopPlaybackState {
             name: SITE,
             lat: 35.33,
             lon: -97.27,
-            elev: None,
+            heights: None,
         },
     );
     ls.phase = LoopPhase::Rendering;

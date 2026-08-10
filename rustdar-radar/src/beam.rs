@@ -135,7 +135,10 @@ pub const HALF_POWER_BEAMWIDTH_DEG: f64 = 0.95;
 ///
 /// The vertical coordinate every drawn product in this crate shares. Heights
 /// are **above the antenna**, not above MSL; a caller wanting MSL adds the
-/// site height itself (see [`crate::eet::radar_height_ft_near`]).
+/// site's feedhorn height itself — [`crate::eet::radar_height_ft_near`] on
+/// [`crate::sites::Datum::Feedhorn`], which is the antenna. Adding the ground
+/// under the tower instead lands a whole tower low, which is why that lookup
+/// makes the caller name which one it means.
 #[inline]
 pub fn height_km(slant_range_km: f64, elev_deg: f64) -> f64 {
     // Transcribed character-for-character from the `volumetric::beam_height_km`

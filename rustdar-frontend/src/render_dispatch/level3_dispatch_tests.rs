@@ -401,7 +401,7 @@ fn pane_with_volume(site: &str) -> rustdar_egui::pane::PaneState {
                 name: "KMPX",
                 lat: 44.849,
                 lon: -93.565,
-                elev: None,
+                heights: None,
             }),
         timestamp: volume_time(),
         vcp_number: 212,

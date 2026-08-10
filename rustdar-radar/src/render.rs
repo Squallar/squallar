@@ -1019,7 +1019,8 @@ pub fn render_hail_to_image(
         hm20c_km_msl,
         fetched_at: chrono::Utc::now(),
     };
-    let radar_height_ft = crate::eet::radar_height_ft_near(radar_lat, radar_lon);
+    let radar_height_ft =
+        crate::eet::radar_height_ft_near(radar_lat, radar_lon, crate::sites::Datum::Feedhorn);
     let grids = crate::hail::compute_hail(scan, Some(&env), radar_height_ft)?;
     const MM_PER_IN: f32 = 25.4;
     let (grid, unit_scale) = match product {
@@ -1073,7 +1074,9 @@ pub fn render_hhc_to_image(
     radar_lon: f64,
     env_heights_km_msl: Option<(f64, f64)>,
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
-    let radar_km_msl = crate::eet::radar_height_ft_near(radar_lat, radar_lon) * 0.0003048;
+    let radar_km_msl =
+        crate::eet::radar_height_ft_near(radar_lat, radar_lon, crate::sites::Datum::Feedhorn)
+            * 0.0003048;
     let params = crate::kdp::KdpParams {
         isdp_est_deg: crate::kdp::estimate_volume_isdp(scan),
         ..crate::kdp::KdpParams::render_fallback()

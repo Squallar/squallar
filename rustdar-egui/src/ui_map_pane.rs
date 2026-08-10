@@ -971,7 +971,10 @@ fn handle_radar_site_interactions(
             && !is_pos_blocked(ui.ctx(), pos, pane_rect, excluded_rects)
         {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            let elev_str = match radar_site.elev {
+            // The feedhorn, not the ground: it is the figure a published
+            // station record quotes as the radar's elevation, so it is the
+            // one a reader can check this tooltip against.
+            let elev_str = match radar_site.height_ft(rustdar_radar::sites::Datum::Feedhorn) {
                 Some(e) => {
                     let converted = prefs.height.convert_from_feet(e as f32);
                     format!("{:.0} {}", converted, prefs.height.suffix())
