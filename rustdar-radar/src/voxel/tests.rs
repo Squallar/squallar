@@ -2257,12 +2257,17 @@ fn the_default_transparency_profile_is_measured_per_product() {
         "the plateau is the translucency this module already argues for a \
              moment with no honest background band",
     );
+    // Strict, and the strictness is the whole point of the assertion. The
+    // rejected ramped profile — `1 - smoothstep(-RAIN_LO, RAIN_LO, value)`
+    // on the low side — lands on exactly half the palette's alpha at 0 dB,
+    // 90 of 180, so `<=` admits the very shape this bound exists to
+    // refuse. Half is the wall, not the last value under it.
     let ceiling = palette_alpha(zdr, p::ZDR_TUMBLING_DB) / 2;
     assert!(
-        hail <= ceiling,
-        "tumbling hail at 0 dB renders at {hail}, over the {ceiling} that \
-             keeps the 68 % of a volume sharing its band a haze rather than a \
-             wall",
+        hail < ceiling,
+        "tumbling hail at 0 dB renders at {hail}, at or over the {ceiling} \
+             that keeps the 68 % of a volume sharing its band a haze rather \
+             than a wall",
     );
     assert!(
         alpha(zdr, -1.5) > hail,
