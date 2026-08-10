@@ -1203,7 +1203,7 @@ mod volume_alpha_profile {
     /// product's band cannot silently move the other's.
     pub const SRV_CLEAR_MS: f32 = VELOCITY_CLEAR_MS;
     pub const SRV_OPAQUE_MS: f32 = VELOCITY_OPAQUE_MS;
-    ///
+
     /// Normalized rotation: clear under [`crate::nrot::SIGNIFICANT`], opaque at
     /// |1.0| and beyond — the mesocyclone convention GR pins its meso class
     /// to. A rotation volume is then a pair of standing columns where
