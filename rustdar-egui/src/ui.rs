@@ -77,6 +77,13 @@ mod timeline;
 pub(crate) use timeline::TimelineProbe;
 #[path = "ui_topbar.rs"]
 mod topbar;
+#[path = "ui_catalog.rs"]
+mod catalog;
+/// The preset shape, re-used by the config writer.
+pub(crate) use catalog::PresetConfig;
+/// What the catalog drew last frame, for the input harness.
+#[cfg(test)]
+pub(crate) use catalog::{CatalogGroup, CatalogProbe, CatalogTileProbe};
 
 /// The sentence the settings pane puts under a refusal, for the same reason and
 /// on the same terms as the two empty states above: where a refusal is undone
@@ -495,6 +502,10 @@ pub struct Gui {
     /// see [`InspectorProbe`] for why `mode` is written inside the body arms.
     #[cfg(test)]
     last_inspector: InspectorProbe,
+    /// What the last frame's Add-layer catalog actually drew. Only read by
+    /// tests.
+    #[cfg(test)]
+    last_catalog: CatalogProbe,
     /// How many times handler `ControlItem`s were rendered this frame.
     ///
     /// The double-render guard: each render is a load→mutate→save round trip
@@ -725,6 +736,32 @@ pub struct Gui {
     /// Whether the floating status bar is collapsed to its ◧ restore button.
     /// Session-only, on the same precedent as the timeline's collapse.
     statusbar_collapsed: bool,
+    /// Whether the Add-layer catalog is open. Session-only, like every other
+    /// open-surface flag; opened by the stack's two `+ Add layer` buttons and
+    /// closed by applying a tile, the `✕`, the backdrop, or
+    /// [`Self::dismiss_top_layer`].
+    catalog_open: bool,
+    /// The catalog's search text. Session-only: a filter is a gesture in
+    /// progress, not a preference.
+    catalog_query: String,
+    /// The name being typed into the catalog's "Save current view…" tile,
+    /// and whether that inline editor is showing. Session-only, same terms.
+    catalog_save_name: String,
+    /// See [`Self::catalog_save_name`].
+    catalog_saving: bool,
+    /// The inspector site list's search text. Session-only, same terms as
+    /// [`Self::catalog_query`].
+    site_query: String,
+    /// The user's saved presets (§3.11). Persisted; the built-ins are
+    /// compiled in beside them (`catalog::builtin_presets`) and never saved.
+    presets: Vec<PresetConfig>,
+    /// This build's loop frame cap, pushed in by the frontend from
+    /// `constants::MAX_LOOP_FRAMES` — this crate cannot read that table (the
+    /// dependency points the other way), and the timeline's row-2 caption
+    /// wants to state the platform's real budget rather than a guess.
+    /// Defaults to the desktop arm's value, which is what every headless
+    /// test is.
+    loop_frame_budget: usize,
     /// Whether the top bar's ☰ dropdown was open on the last frame it drew.
     ///
     /// The dropdown's real state is egui popup memory, which this crate only
@@ -790,8 +827,12 @@ pub struct Gui {
 /// A storm motion vector the user may substitute for the RPG's.
 ///
 /// The two numbers persist while the override is switched off so that toggling
-/// it does not lose what was typed.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// it does not lose what was typed — and they persist across sessions too
+/// (`UiConfig`), which closed the audit's known gap. `#[serde(default)]` on
+/// the struct keeps a config written before any one field existed loading;
+/// the writer guards the floats finite (see `ui_config_json`).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct StormMotionOverride {
     pub enabled: bool,
     /// Knots.
@@ -1280,6 +1321,8 @@ impl Gui {
             #[cfg(test)]
             last_inspector: InspectorProbe::default(),
             #[cfg(test)]
+            last_catalog: CatalogProbe::default(),
+            #[cfg(test)]
             control_render_passes: 0,
             #[cfg(test)]
             last_dropdowns: Vec::new(),
@@ -1314,6 +1357,15 @@ impl Gui {
             timeline_row2: false,
             timeline_scrub: None,
             statusbar_collapsed: false,
+            catalog_open: false,
+            catalog_query: String::new(),
+            catalog_save_name: String::new(),
+            catalog_saving: false,
+            site_query: String::new(),
+            presets: Vec::new(),
+            // The desktop arm of `constants::MAX_LOOP_FRAMES`; the frontend
+            // pushes the real target's value at startup.
+            loop_frame_budget: 60,
             menu_popup_open: false,
             menu_popup_close_requested: false,
             safe_area_insets: (0.0, 0.0, 0.0, 0.0),
@@ -1375,6 +1427,7 @@ impl Gui {
             // not an absence.
             self.last_stack = StackProbe::default();
             self.last_inspector = InspectorProbe::default();
+            self.last_catalog = CatalogProbe::default();
             // The double-render guard's counter; see the field.
             self.control_render_passes = 0;
         }
@@ -1456,6 +1509,13 @@ impl Gui {
         // (Settings are no longer a window of their own: they are the
         // inspector's App › Settings body, drawn by the shell above.)
         self.render_overlay_popup(ctx);
+
+        // The Add-layer catalog, after the feature popup so it stacks above
+        // one left open — matching `dismiss_top_layer`, which closes the
+        // catalog first. Also after the appliers on its own account: applying
+        // a preset writes pane kinds directly and can grow the pane count,
+        // both of which are only safe once every take window has closed.
+        self.render_catalog(ctx, &mut actions);
 
         // Ensure the handler state reflects the active pane's config at frame
         // end, so any deferred actions (FetchOverlay, etc.) processed after the
@@ -1782,6 +1842,14 @@ impl Gui {
         if self.menu_popup_open {
             self.menu_popup_open = false;
             self.menu_popup_close_requested = true;
+            return true;
+        }
+        // The catalog, above the feature and time dialogs (plan §3.4 as
+        // amended): it is the modal opened last when it is open at all, and
+        // the frame draws it above a feature popup left open for the same
+        // reason.
+        if self.catalog_open {
+            self.catalog_open = false;
             return true;
         }
         if !self.overlays.selected_overlays.is_empty() {
@@ -2202,9 +2270,30 @@ impl Gui {
         pane.enabled_overlays = self.overlays.save_enabled_map();
     }
 
-    /// Return the pane indices that loop actions should target.
-    /// When `sync_layers` is on and there are multiple panes, returns all pane indices;
-    /// otherwise returns only the active pane.
+    /// The pane indices shared time fans out over: the active pane, plus —
+    /// with Sync Layers on and more than one pane — every visible pane whose
+    /// [`PaneState::time_link`] is still on (plan §3.7).
+    ///
+    /// The active pane is a target unconditionally, its own flag unread: it
+    /// is the pane whose control was operated, and "the pane I am driving
+    /// does not respond" is not a reading of unlink anyone means. Unlink says
+    /// *don't drag me along* — the exclusion is from the fan-out, not from
+    /// being driven directly.
+    fn time_sync_targets(&self) -> Vec<usize> {
+        if self.sync_layers && self.pane_layout.pane_count > 1 {
+            (0..self.pane_layout.pane_count)
+                .filter(|&idx| {
+                    idx == self.active_pane
+                        || self.panes.get(idx).is_none_or(|pane| pane.time_link)
+                })
+                .collect()
+        } else {
+            vec![self.active_pane]
+        }
+    }
+
+    /// [`Self::time_sync_targets`] narrowed to the panes a loop can feed —
+    /// the fan-out for every loop action.
     ///
     /// Panes with no plan view are left out. A loop is a sequence of rendered
     /// plan-view tilts, and `dispatch_loop_renders` no longer feeds a non-map
@@ -2224,15 +2313,12 @@ impl Gui {
     /// default `PaneState` — a *map* pane whatever the real one was — which is
     /// why the rule was born this way round.)
     fn loop_sync_targets(&self) -> Vec<usize> {
-        if self.sync_layers && self.pane_layout.pane_count > 1 {
-            (0..self.pane_layout.pane_count)
-                .filter(|&idx| {
-                    idx == self.active_pane || self.panes.get(idx).is_none_or(PaneState::is_map)
-                })
-                .collect()
-        } else {
-            vec![self.active_pane]
-        }
+        self.time_sync_targets()
+            .into_iter()
+            .filter(|&idx| {
+                idx == self.active_pane || self.panes.get(idx).is_none_or(PaneState::is_map)
+            })
+            .collect()
     }
 
     /// Turn an overlay on or off for `pane` — **both halves**, which is the
@@ -2261,6 +2347,42 @@ impl Gui {
         overlays.set_enabled(kind, on);
         pane.overlay_configs = overlays.save_pane_configs();
         pane.enabled_overlays = overlays.save_enabled_map();
+    }
+
+    /// [`Self::write_pane_overlay`] plus the enable-fetch rule, in one place
+    /// for its three callers — the stack's eye, the inspector's Show toggle
+    /// and the catalog's tiles.
+    ///
+    /// The rule: a layer turned on with nothing to draw yet fetches now
+    /// rather than waiting out an auto-poll interval — the same effect its
+    /// own sub-toggles ask for, and the only route for a layer (SPC
+    /// outlooks) that never auto-polls. `pane` is the caller's — taken or
+    /// not — and `pane_idx` is the index the fetch is attributed to, because
+    /// two of the callers hold the pane out of the vector where `active_pane`
+    /// cannot be assumed to be it (the preset applier walks every pane).
+    ///
+    /// One fetch per kind per frame: a second enable of the same kind in the
+    /// same batch (a preset enabling it on every pane) finds the first's
+    /// action already queued and does not queue another — the handlers are
+    /// global, so one fetch serves every pane.
+    pub(super) fn set_pane_overlay_with_fetch(
+        &mut self,
+        pane: &mut PaneState,
+        pane_idx: usize,
+        kind: OverlayKind,
+        on: bool,
+        actions: &mut Vec<GuiAction>,
+    ) {
+        Self::write_pane_overlay(&mut self.overlays, pane, kind, on);
+        if on
+            && !self.overlays.has_data(kind)
+            && !self.overlays.is_fetching(kind)
+            && !actions
+                .iter()
+                .any(|a| matches!(a, GuiAction::FetchOverlay { kind: k, .. } if *k == kind))
+        {
+            actions.push(GuiAction::FetchOverlay { kind, pane_idx });
+        }
     }
 
     /// [`Self::write_pane_overlay`] aimed at the active pane, for callers
@@ -2334,6 +2456,15 @@ impl Gui {
     /// whole-volume pane has no tilt. It is inert there rather than wrong, and
     /// keeping it means a pane converted back to a map lands on the tilt its
     /// siblings are showing instead of on whatever it held before.
+    ///
+    /// # `viewing_live` and `time_step_secs` honour the pane's time-link
+    ///
+    /// The two time fields fan out only to panes whose
+    /// [`PaneState::time_link`] is on (plan §3.7): unlink means *frozen*, and
+    /// a sync pass that dragged an unlinked pane back to live would undo the
+    /// freeze from a setting that is about layers. Every other field still
+    /// converges unconditionally — an unlinked pane is parked in time, not
+    /// exempt from the layout.
     fn propagate_layer_sync(&mut self) {
         if !self.sync_layers || self.pane_layout.pane_count <= 1 {
             return;
@@ -2358,8 +2489,11 @@ impl Gui {
             }
             p.site = active_site.clone();
             p.scan_info = active_scan_info.clone();
-            p.viewing_live = active_viewing_live;
-            p.time_step_secs = active_time_step_secs;
+            // The one gated pair — see the method note.
+            if p.time_link {
+                p.viewing_live = active_viewing_live;
+                p.time_step_secs = active_time_step_secs;
+            }
             p.draw_order = active_draw_order.clone();
             p.enabled_overlays = active_enabled_overlays.clone();
             p.overlay_configs = active_overlay_configs.clone();
@@ -3140,6 +3274,18 @@ impl Gui {
         &self.last_inspector
     }
 
+    /// What the last frame's Add-layer catalog drew.
+    #[cfg(test)]
+    pub(crate) fn catalog_for_test(&self) -> &CatalogProbe {
+        &self.last_catalog
+    }
+
+    /// The user's saved presets, as the catalog holds them.
+    #[cfg(test)]
+    pub(crate) fn presets_for_test(&self) -> &[PresetConfig] {
+        &self.presets
+    }
+
     /// How many handler-control passes the last frame ran. The harness holds
     /// this to at most one after every frame — see the field.
     #[cfg(test)]
@@ -3385,6 +3531,15 @@ impl Gui {
     /// See [`set_supports_exit`](Self::set_supports_exit).
     pub fn supports_exit(&self) -> bool {
         self.supports_exit
+    }
+
+    /// Tell the UI this build's loop frame cap (`constants::MAX_LOOP_FRAMES`),
+    /// so the timeline's row-2 caption states the platform's real budget.
+    /// Pushed in like [`set_supports_exit`](Self::set_supports_exit) and for
+    /// the same reason: the constant lives in a crate that depends on this
+    /// one.
+    pub fn set_loop_frame_budget(&mut self, frames: usize) {
+        self.loop_frame_budget = frames;
     }
 
     /// Set the user's GPS location for the blue dot indicator.

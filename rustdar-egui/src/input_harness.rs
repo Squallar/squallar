@@ -587,6 +587,44 @@ impl InputHarness {
         self.gui.timeline_for_test().clone()
     }
 
+    /// What the last frame's Add-layer catalog drew.
+    pub(crate) fn catalog(&self) -> crate::ui::CatalogProbe {
+        self.gui.catalog_for_test().clone()
+    }
+
+    /// The catalog tile drawn under `label` in `group`, if the last frame
+    /// drew one.
+    pub(crate) fn catalog_tile(
+        &self,
+        group: crate::ui::CatalogGroup,
+        label: &str,
+    ) -> Option<crate::ui::CatalogTileProbe> {
+        self.catalog()
+            .tiles
+            .into_iter()
+            .find(|tile| tile.group == group && tile.label == label)
+    }
+
+    /// Open the Add-layer catalog the user's way: the stack's top
+    /// `+ Add layer` button. Asserts it really opened.
+    pub(crate) fn open_catalog(&mut self) {
+        if self.catalog().open {
+            return;
+        }
+        self.open_layers();
+        let add = self.stack().add_top;
+        assert!(
+            add.is_positive(),
+            "the stack drew no Add-layer button to open the catalog with"
+        );
+        self.mouse_click(add.center());
+        self.warm_up();
+        assert!(
+            self.catalog().open,
+            "clicking + Add layer did not open the catalog"
+        );
+    }
+
     /// Put the layers panel on screen the user's way: a click on the top bar's
     /// Layers toggle. Idempotent — the toggle's probe says whether the panel is
     /// already showing, and a second click would close it again.
@@ -1675,6 +1713,25 @@ impl InputHarness {
     /// held across a gesture really is. Pass `Modifiers::default()` to let go.
     pub(crate) fn set_modifiers(&mut self, modifiers: egui::Modifiers) {
         self.modifiers = modifiers;
+    }
+
+    /// Type `text` into whatever widget holds keyboard focus, as the
+    /// integrations deliver committed text — the way a test fills a focused
+    /// `TextEdit` (clicking one focuses it; egui does that itself).
+    pub(crate) fn type_text(&mut self, text: &str) {
+        self.events.push(egui::Event::Text(text.to_owned()));
+        self.frame_after(FRAME_DT);
+    }
+
+    /// Give keyboard focus to the widget behind `id`, as tabbing to it would.
+    ///
+    /// For the widgets a click does not focus — egui's `Slider` reads its
+    /// arrow keys only `if response.has_focus()`, and only `TextEdit`
+    /// requests focus from a click. The id must come from a probe the
+    /// renderer reported, so the focus lands on the widget egui really keyed.
+    pub(crate) fn focus_widget(&mut self, id: egui::Id) {
+        self.ctx.memory_mut(|mem| mem.request_focus(id));
+        self.frame_after(FRAME_DT);
     }
 
     /// One press-and-release of `key` in the next frame's `RawInput`, as the

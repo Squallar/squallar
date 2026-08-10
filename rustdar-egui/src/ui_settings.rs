@@ -113,7 +113,15 @@ pub(crate) const SETTINGS_ROWS: &[&str] = &[
     "storm.override",
     "storm.speed",
     "storm.direction",
+    "advanced.notifier",
+    "data.auto_poll",
+    "data.live_chunks",
+    "data.push",
+    "data.refresh",
+    "about.version",
+    "about.platform",
     "reset",
+    "about.exit",
 ];
 
 /// One settings row the window actually drew: which [`SETTINGS_ROWS`] id it
@@ -148,11 +156,22 @@ impl super::Gui {
     /// The body is [`SETTINGS_ROWS`] driven through [`Self::render_settings_row`]
     /// — data plus a match, not a hand-written sequence — so the parity walk's
     /// inventory and the drawn body cannot drift apart.
-    pub(super) fn render_settings_body(&mut self, ui: &mut egui::Ui, actions: &mut Vec<GuiAction>) {
+    ///
+    /// `pane` is the active pane the inspector's pass holds `mem::take`n out
+    /// of the vector — passed through because the Data & live refresh must
+    /// build its fetch config from the *live* pane's site, and
+    /// `active_pane_fetch_config` inside this window would read the
+    /// placeholder's default site instead.
+    pub(super) fn render_settings_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        pane: &crate::pane::PaneState,
+        actions: &mut Vec<GuiAction>,
+    ) {
         for &row in SETTINGS_ROWS {
             #[cfg(test)]
             let row_top = ui.cursor().top();
-            let drawn = self.render_settings_row(ui, row, actions);
+            let drawn = self.render_settings_row(ui, row, pane, actions);
             // The rect is read off the cursor rather than off a
             // wrapping scope, because a scope would change every
             // row's widget ids for the probe's convenience.
@@ -173,7 +192,9 @@ impl super::Gui {
 
     /// Draw one row of [`SETTINGS_ROWS`]. Returns whether anything was drawn,
     /// which is `false` only for a row this build compiles out (the GPS rows
-    /// without the `gps-serial` feature).
+    /// without the `gps-serial` feature) or this platform withholds (the Exit
+    /// row where [`Gui::supports_exit`](super::Gui::supports_exit) says no —
+    /// the same gate that drops the menu's Exit entry).
     ///
     /// A row owns the group chrome that *precedes* it, so the sequence the
     /// loop produces is exactly the hand-written one this replaced: the
@@ -185,6 +206,7 @@ impl super::Gui {
         &mut self,
         ui: &mut egui::Ui,
         id: &str,
+        pane: &crate::pane::PaneState,
         actions: &mut Vec<GuiAction>,
     ) -> bool {
         match id {
@@ -435,8 +457,88 @@ impl super::Gui {
                 });
                 true
             }
-            "reset" => {
+            // --- Advanced ---
+            //
+            // The formerly hidden setting: state and persistence have existed
+            // since the notifier shipped (`Gui::notifier_endpoint`), with no
+            // UI over them until this row.
+            "advanced.notifier" => {
                 section_break(ui);
+                ui.heading("Advanced");
+                ui.add_space(SETTINGS_SMALL_SPACING);
+                ui.label("Notifier endpoint:");
+                // The raw field, not the trimmed accessor: the accessor's
+                // empty-means-default rule belongs to the *reader*, and a box
+                // that rewrote itself mid-edit would fight the user's typing.
+                // The hint shows what empty falls back to.
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.notifier_endpoint)
+                        .font(egui::TextStyle::Monospace)
+                        .hint_text(crate::DEFAULT_NOTIFIER_ENDPOINT),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "WebSocket chunk-notify URL. Empty uses the built-in default.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                true
+            }
+            // --- Data & live ---
+            //
+            // The same three flags the ☰ menu's toggles write — one field
+            // each, two routes, no copy to drift. The labels are the menu's
+            // own, so the two surfaces visibly describe one setting.
+            "data.auto_poll" => {
+                section_break(ui);
+                ui.heading("Data & live");
+                ui.add_space(SETTINGS_SMALL_SPACING);
+                ui.checkbox(&mut self.auto_poll.enabled, "Auto-poll");
+                true
+            }
+            "data.live_chunks" => {
+                ui.checkbox(&mut self.live_chunks, "Live: real-time chunks");
+                true
+            }
+            "data.push" => {
+                ui.checkbox(&mut self.chunk_notifications, "Live: push notifications");
+                true
+            }
+            "data.refresh" => {
+                ui.add_space(SETTINGS_SMALL_SPACING);
+                let refresh =
+                    ui.add_enabled(!self.radar.fetching, egui::Button::new("Refresh radar"));
+                if refresh.clicked() {
+                    // The *taken* pane's site: `active_pane_fetch_config`
+                    // would read the placeholder in the vector — see
+                    // `render_settings_body`.
+                    let mut config = self.radar.config.clone();
+                    config.site = pane.site.clone();
+                    actions.push(GuiAction::FetchRadarScan(config));
+                }
+                true
+            }
+            // --- About ---
+            "about.version" => {
+                section_break(ui);
+                ui.heading("About");
+                ui.add_space(SETTINGS_SMALL_SPACING);
+                ui.label(concat!("rustdar ", env!("CARGO_PKG_VERSION")));
+                true
+            }
+            "about.platform" => {
+                ui.label(
+                    egui::RichText::new(
+                        "Runs on Linux, macOS, Windows, the web, Android, iOS and BSD.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                true
+            }
+            "reset" => {
+                ui.add_space(SETTINGS_SMALL_SPACING);
                 if ui.button("Reset to defaults").clicked() {
                     self.preferences = UserPreferences::default();
                     self.gps_config = rustdar_gps::GpsConfig::default();
@@ -449,6 +551,19 @@ impl super::Gui {
                     // want a dismissed permission prompt back, and a "reset"
                     // that quietly kept one piece of state would be a lie.
                     actions.push(GuiAction::RequestLocation);
+                }
+                true
+            }
+            // Withheld, not disabled, where the platform cannot quit — the
+            // same runtime gate as the menu's Exit entry, and the same
+            // reasoning: a button that does nothing is worse than no button.
+            "about.exit" => {
+                if !self.supports_exit {
+                    return false;
+                }
+                ui.add_space(SETTINGS_SMALL_SPACING);
+                if ui.button("Exit").clicked() {
+                    actions.push(GuiAction::Exit);
                 }
                 true
             }

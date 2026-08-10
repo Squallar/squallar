@@ -37,6 +37,12 @@ struct PaneConfig {
     /// Time step size in seconds (0 = single scan mode).
     #[serde(default = "default_time_step")]
     time_step_secs: i64,
+    /// Whether this pane follows shared time (plan §3.7). Defaults **true**:
+    /// a config written before the field existed described panes that all
+    /// behaved as linked, and a downgrade dropping the field degrades to
+    /// exactly that.
+    #[serde(default = "default_true")]
+    time_link: bool,
     /// Visual stacking order for all map layers (bottom to top).
     #[serde(default = "OverlayKind::default_draw_order")]
     draw_order: Vec<OverlayKind>,
@@ -236,6 +242,10 @@ fn default_time_step() -> i64 {
     600
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl Default for PaneConfig {
     fn default() -> Self {
         let layers = LayerKind::all()
@@ -260,6 +270,7 @@ impl Default for PaneConfig {
             spc_day: OutlookDay::Day1,
             site: String::new(),
             time_step_secs: 600,
+            time_link: true,
             draw_order: OverlayKind::default_draw_order(),
             enabled_overlays: HashMap::new(),
             overlay_configs: HashMap::new(),
@@ -306,6 +317,15 @@ struct UiConfig {
     /// GPS configuration (serial port, baud, heading source).
     #[serde(default)]
     gps_config: rustdar_gps::GpsConfig,
+    /// The user's storm-motion override — the audit's known persistence gap,
+    /// closed here. `#[serde(default)]` makes an older config load as
+    /// "override off, default vector", which is what those sessions were.
+    #[serde(default)]
+    storm_motion_override: super::StormMotionOverride,
+    /// The user's saved presets (§3.11). Built-ins are compiled in and never
+    /// written here; an older config simply has none.
+    #[serde(default)]
+    presets: Vec<super::PresetConfig>,
     /// The user's Volume Alpha curves, one entry per *edited* product.
     ///
     /// A list of exceptions rather than a curve per product, because absence
@@ -370,7 +390,7 @@ struct VolumeAlphaConfig {
 /// used to propagate up and fail the *entire* config load. One product name
 /// from a newer build would cost the user their site, layout and curves,
 /// permanently, because the autosave then rewrites the file from defaults.
-fn product_or_default<'de, D>(deserializer: D) -> Result<RadarProduct, D::Error>
+pub(crate) fn product_or_default<'de, D>(deserializer: D) -> Result<RadarProduct, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -428,6 +448,8 @@ impl Default for UiConfig {
             preferences: UserPreferences::default(),
             overlay_states: serde_json::Map::new(),
             gps_config: rustdar_gps::GpsConfig::default(),
+            storm_motion_override: super::StormMotionOverride::default(),
+            presets: Vec::new(),
             volume_alpha: Vec::new(),
             volume_iso: Vec::new(),
         }
@@ -508,6 +530,7 @@ impl super::Gui {
                     spc_day: OutlookDay::Day1,
                     site: pane.site.clone(),
                     time_step_secs: pane.time_step_secs,
+                    time_link: pane.time_link,
                     draw_order: pane.draw_order.clone(),
                     enabled_overlays: pane.enabled_overlays.clone(),
                     overlay_configs: pane.overlay_configs.clone(),
@@ -543,6 +566,49 @@ impl super::Gui {
             preferences: self.preferences.clone(),
             overlay_states: self.overlays.serialize_handler_states(),
             gps_config: self.gps_config.clone(),
+            // The same NaN guard every persisted float gets (see the note on
+            // this function): `DragValue` parses "nan", and one non-finite
+            // number costs the whole file on the *next* load.
+            storm_motion_override: {
+                let motion = self.storm_motion_override;
+                let default = super::StormMotionOverride::default();
+                super::StormMotionOverride {
+                    enabled: motion.enabled,
+                    speed_kt: if motion.speed_kt.is_finite() {
+                        motion.speed_kt
+                    } else {
+                        default.speed_kt
+                    },
+                    direction_deg: if motion.direction_deg.is_finite() {
+                        motion.direction_deg
+                    } else {
+                        default.direction_deg
+                    },
+                }
+            },
+            // The elevations go through the same finiteness door; the capture
+            // path already filters, so this guards only hand-poked state.
+            presets: self
+                .presets
+                .iter()
+                .map(|preset| super::PresetConfig {
+                    name: preset.name.clone(),
+                    pane_count: preset.pane_count,
+                    panes: preset
+                        .panes
+                        .iter()
+                        .map(|pane| super::catalog::PresetPane {
+                            product: pane.product,
+                            elevation: if pane.elevation.is_finite() {
+                                pane.elevation
+                            } else {
+                                0.0
+                            },
+                        })
+                        .collect(),
+                    overlays: preset.overlays.clone(),
+                })
+                .collect(),
             volume_alpha: {
                 // Sorted by product code so the autosave's "has anything
                 // changed?" string comparison cannot be defeated by
@@ -645,6 +711,8 @@ impl super::Gui {
         self.loop_speed_fps = config.loop_speed_fps;
         self.preferences = config.preferences;
         self.gps_config = config.gps_config;
+        self.storm_motion_override = config.storm_motion_override;
+        self.presets = config.presets;
 
         // The Volume Alpha curves. Replaced wholesale rather than merged —
         // the store starts empty and a load is the session's beginning — and
@@ -709,6 +777,7 @@ impl super::Gui {
                 pane.site = config.site.clone();
             }
             pane.time_step_secs = pc.time_step_secs;
+            pane.time_link = pc.time_link;
             // Capture the first pane's legacy Radar toggle for migration.
             if legacy_radar_enabled.is_none()
                 && let Some(&enabled) = pc.layers.get(&LayerKind::Radar)
@@ -1104,6 +1173,14 @@ mod live_chunks_config_tests;
 #[path = "ui_config/notifier_config_tests.rs"]
 #[cfg(test)]
 mod notifier_config_tests;
+
+#[path = "ui_config/storm_motion_config_tests.rs"]
+#[cfg(test)]
+mod storm_motion_config_tests;
+
+#[path = "ui_config/presets_config_tests.rs"]
+#[cfg(test)]
+mod presets_config_tests;
 
 #[path = "ui_config/tests.rs"]
 #[cfg(test)]

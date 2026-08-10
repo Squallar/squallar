@@ -41,7 +41,7 @@ impl OverlayItem for AlertItem {
             sections.push(PopupSection::Heading(headline.clone()));
         }
 
-        sections.push(PopupSection::KeyValueGrid(vec![
+        let mut grid = vec![
             ("Areas".into(), alert.area_desc.clone()),
             ("Issued by".into(), alert.sender_name.clone()),
             (
@@ -52,7 +52,24 @@ impl OverlayItem for AlertItem {
                 "Expires".into(),
                 prefs.timezone.format_rfc3339(&alert.expires),
             ),
-        ]));
+            // The CAP triple, parsed since the beginning and never shown
+            // until now. `Debug` is the variant name — the CAP vocabulary
+            // itself ("Severe", "Immediate", "Observed") — and an alert whose
+            // value the parser did not recognise honestly reads "Unknown".
+            ("Severity".into(), format!("{:?}", alert.severity)),
+            ("Urgency".into(), format!("{:?}", alert.urgency)),
+            ("Certainty".into(), format!("{:?}", alert.certainty)),
+        ];
+        // Onset and ends are optional in the feed; a row is added only where
+        // the alert carries one — unlike the CAP triple, which every alert
+        // has, absence here is the alert's own shape rather than a gap.
+        if let Some(onset) = &alert.onset {
+            grid.push(("Onset".into(), prefs.timezone.format_rfc3339(onset)));
+        }
+        if let Some(ends) = &alert.ends {
+            grid.push(("Ends".into(), prefs.timezone.format_rfc3339(ends)));
+        }
+        sections.push(PopupSection::KeyValueGrid(grid));
 
         sections.push(PopupSection::Separator);
 
@@ -638,6 +655,54 @@ mod tests {
             handler.enabled_categories.len(),
             2,
             "on over a live subset must not widen the user's selection"
+        );
+    }
+
+    /// The popup's grid carries the CAP severity/urgency/certainty triple —
+    /// parsed since the beginning, displayed only now — and the optional
+    /// onset/ends rows exactly where the alert carries them.
+    #[test]
+    fn the_popup_grid_carries_the_cap_triple_and_the_optional_times() {
+        let mut with_times = alert("a", "Tornado Warning");
+        with_times.onset = Some("2026-08-10T18:00:00-05:00".to_string());
+        with_times.ends = Some("2026-08-10T19:30:00-05:00".to_string());
+        let prefs = rustdar_units::UserPreferences::default();
+
+        let grid = |alert: &NwsAlert| -> Vec<(String, String)> {
+            AlertItem {
+                alert: alert.clone(),
+            }
+            .popup_content(&prefs)
+            .sections
+            .iter()
+            .find_map(|s| match s {
+                PopupSection::KeyValueGrid(rows) => Some(rows.clone()),
+                _ => None,
+            })
+            .expect("the alert popup carries a key-value grid")
+        };
+
+        let rows = grid(&with_times);
+        let value = |key: &str| {
+            rows.iter()
+                .find(|(k, _)| k == key)
+                .unwrap_or_else(|| panic!("the grid has no {key:?} row"))
+                .1
+                .clone()
+        };
+        assert_eq!(value("Severity"), "Severe");
+        assert_eq!(value("Urgency"), "Immediate");
+        assert_eq!(value("Certainty"), "Observed");
+        assert!(!value("Onset").is_empty());
+        assert!(!value("Ends").is_empty());
+
+        // An alert without onset/ends draws no row for them: absence is the
+        // alert's own shape, not a blank.
+        let bare = grid(&alert("b", "Tornado Warning"));
+        assert!(bare.iter().all(|(k, _)| k != "Onset" && k != "Ends"));
+        assert!(
+            bare.iter().any(|(k, _)| k == "Severity"),
+            "the CAP triple is unconditional — every alert has one"
         );
     }
 

@@ -260,6 +260,16 @@ pub struct PaneState {
     pub viewing_live: bool,
     /// Time navigation step size in seconds (0 = single scan mode).
     pub time_step_secs: i64,
+    /// Whether this pane follows shared time (plan §3.7). Persisted; default
+    /// **true** — every pane before the field existed behaved as linked.
+    ///
+    /// Off means frozen: the pane is left out of
+    /// [`Gui::time_sync_targets`](crate::Gui), so the loop fan-out skips it
+    /// and `propagate_layer_sync` leaves its `viewing_live`/`time_step_secs`
+    /// alone. It is deliberately *not* consulted by the site-wide scan
+    /// delivery (`set_scan_info_for_site`): the volume a site holds is shared
+    /// state, and what this flag freezes is the pane's own time posture.
+    pub time_link: bool,
     pub hover_value: Option<String>,
     /// Hover tooltip text from overlay handlers (e.g. model data CIN value).
     pub overlay_hover_value: Option<String>,
@@ -657,6 +667,7 @@ impl PaneState {
             selected_elevation: 0.0,
             viewing_live: true,
             time_step_secs: 600,
+            time_link: true,
             hover_value: None,
             overlay_hover_value: None,
             last_hover_pos: None,

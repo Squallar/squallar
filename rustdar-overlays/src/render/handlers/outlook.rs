@@ -23,6 +23,33 @@ pub(crate) struct SpcOutlookFetchResult {
 #[derive(Debug)]
 pub(crate) struct OutlookItem {
     pub label: String,
+    /// Which outlook the clicked feature came from — the popup's subject.
+    pub day: OutlookDay,
+    pub product: OutlookProduct,
+    /// The outlook's own validity window, as parsed from the feed. `None`
+    /// where the feed did not carry one; the grid says "Unknown" rather than
+    /// omitting the row, so a missing time reads as the feed's gap and not as
+    /// a shorter dialog.
+    pub valid: Option<chrono::NaiveDateTime>,
+    pub expire: Option<chrono::NaiveDateTime>,
+}
+
+/// The SPC page that shows `day`'s outlook — the popup's "Open on SPC
+/// website" target.
+///
+/// A *website* link for a person, not a data fetch, so it does not route
+/// through `DataSources::spc_base` (that table exists to keep fetch origins
+/// browser-reachable; a link opens in the browser by definition). Days 1–3
+/// each have their own page; days 4–8 share one experimental page.
+fn outlook_page_url(day: OutlookDay) -> String {
+    if day.is_extended() {
+        "https://www.spc.noaa.gov/products/exper/day4-8/".to_owned()
+    } else {
+        format!(
+            "https://www.spc.noaa.gov/products/outlook/day{}otlk.html",
+            day.label()
+        )
+    }
 }
 
 impl OverlayItem for OutlookItem {
@@ -30,21 +57,47 @@ impl OverlayItem for OutlookItem {
         OverlayKind::SpcOutlook
     }
 
-    fn popup_content(&self, _prefs: &rustdar_units::UserPreferences) -> PopupContent {
+    fn popup_content(&self, prefs: &rustdar_units::UserPreferences) -> PopupContent {
+        // `None` prints as a word, not as absence — see the field note.
+        let time = |t: Option<chrono::NaiveDateTime>| match t {
+            Some(t) => prefs.timezone.format_naive_utc(t, "%b %d %Y %H:%M"),
+            None => "Unknown".to_owned(),
+        };
         PopupContent {
-            title: format!("SPC Outlook: {}", self.label),
+            title: format!("SPC Day {} {} Outlook", self.day.label(), self.product),
             accent_rgb: [200, 200, 100],
             width: 300.0,
-            sections: vec![PopupSection::Text("Outlook detail coming soon.".into())],
+            sections: vec![
+                // The clicked feature's own label — the risk category or
+                // probability band the user actually clicked on.
+                PopupSection::Heading(self.label.clone()),
+                PopupSection::KeyValueGrid(vec![
+                    ("Day".into(), self.day.to_string()),
+                    ("Product".into(), self.product.to_string()),
+                    ("Valid".into(), time(self.valid)),
+                    ("Expires".into(), time(self.expire)),
+                ]),
+                PopupSection::Separator,
+                PopupSection::Link {
+                    label: "Open on SPC website".into(),
+                    url: outlook_page_url(self.day),
+                },
+            ],
             actions: Vec::new(),
         }
     }
 
     fn matches(&self, other: &dyn OverlayItem) -> bool {
+        // Day and product joined the identity with the real popup content: a
+        // "5%" band exists in Tornado and Wind alike, and keeping one open
+        // across a refetch must re-find *this* product's band, not whichever
+        // same-labelled band lists first.
         other
             .as_any()
             .downcast_ref::<OutlookItem>()
-            .is_some_and(|o| o.label == self.label)
+            .is_some_and(|o| {
+                o.label == self.label && o.day == self.day && o.product == self.product
+            })
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -174,6 +227,10 @@ impl OverlayHandler for SpcOutlookHandler {
                     label: None,
                     item: Arc::new(OutlookItem {
                         label: feature.label.clone(),
+                        day,
+                        product,
+                        valid: outlook.valid,
+                        expire: outlook.expire,
                     }) as Arc<dyn OverlayItem>,
                 });
             }
@@ -210,7 +267,8 @@ impl OverlayHandler for SpcOutlookHandler {
     }
 
     fn retain_selections(&self, _selections: &mut Vec<Arc<dyn OverlayItem>>) {
-        // Nothing to prune: outlook items match on label, not on a data ID.
+        // Nothing to prune: outlook items match on day, product and label,
+        // not on a data ID.
     }
 
     fn prepare_rasterize(&self, ctx: &RasterizeContext) -> Option<RasterizeFn> {
@@ -453,6 +511,108 @@ mod tests {
             vec![OutlookProduct::Probabilistic],
             "day 5 publishes only the probabilistic product"
         );
+    }
+
+    /// The popup names the outlook, states its window and links to SPC —
+    /// this used to be a literal "coming soon" stub.
+    #[test]
+    fn the_popup_states_the_outlooks_window_and_links_to_spc() {
+        let item = OutlookItem {
+            label: "SLGT".into(),
+            day: OutlookDay::Day1,
+            product: OutlookProduct::Categorical,
+            valid: chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
+                .and_then(|d| d.and_hms_opt(12, 0, 0)),
+            expire: chrono::NaiveDate::from_ymd_opt(2026, 8, 11)
+                .and_then(|d| d.and_hms_opt(12, 0, 0)),
+        };
+        // Pinned to UTC so the asserted dates cannot shift with the machine's
+        // own timezone.
+        let prefs = rustdar_units::UserPreferences {
+            timezone: rustdar_units::TimezonePreference::Utc,
+            ..Default::default()
+        };
+        let content = item.popup_content(&prefs);
+        assert_eq!(content.title, "SPC Day 1 Categorical Outlook");
+
+        let grid = content
+            .sections
+            .iter()
+            .find_map(|s| match s {
+                PopupSection::KeyValueGrid(rows) => Some(rows.clone()),
+                _ => None,
+            })
+            .expect("the popup carries a key-value grid");
+        let row = |key: &str| {
+            grid.iter()
+                .find(|(k, _)| k == key)
+                .unwrap_or_else(|| panic!("the grid has no {key:?} row"))
+                .1
+                .clone()
+        };
+        assert_eq!(row("Day"), "Day 1");
+        assert_eq!(row("Product"), "Categorical");
+        assert!(
+            row("Valid").starts_with("Aug 10 2026"),
+            "the valid time must be the parsed field, got {:?}",
+            row("Valid"),
+        );
+        assert!(row("Expires").starts_with("Aug 11 2026"));
+
+        let url = content
+            .sections
+            .iter()
+            .find_map(|s| match s {
+                PopupSection::Link { url, .. } => Some(url.clone()),
+                _ => None,
+            })
+            .expect("the popup links to the SPC website");
+        assert_eq!(url, "https://www.spc.noaa.gov/products/outlook/day1otlk.html");
+    }
+
+    /// Days 4–8 share one experimental SPC page, and a window the feed did
+    /// not carry prints as a word rather than vanishing.
+    #[test]
+    fn an_extended_day_links_to_the_shared_page_and_owns_its_gaps() {
+        let item = OutlookItem {
+            label: "15%".into(),
+            day: OutlookDay::Day5,
+            product: OutlookProduct::Probabilistic,
+            valid: None,
+            expire: None,
+        };
+        let prefs = rustdar_units::UserPreferences::default();
+        let content = item.popup_content(&prefs);
+        assert_eq!(content.title, "SPC Day 5 Probabilistic Outlook");
+        assert!(content.sections.iter().any(|s| matches!(
+            s,
+            PopupSection::Link { url, .. }
+                if url == "https://www.spc.noaa.gov/products/exper/day4-8/"
+        )));
+        assert!(
+            content.sections.iter().any(|s| matches!(
+                s,
+                PopupSection::KeyValueGrid(rows)
+                    if rows.iter().any(|(k, v)| k == "Valid" && v == "Unknown")
+            )),
+            "a missing window must read as the feed's gap, not as a shorter dialog"
+        );
+    }
+
+    /// The identity a kept-open popup re-finds across a refetch is the
+    /// product's own band: a "5%" in Tornado is not the "5%" in Wind.
+    #[test]
+    fn a_band_matches_only_its_own_days_product() {
+        let band = |product: OutlookProduct| OutlookItem {
+            label: "5%".into(),
+            day: OutlookDay::Day1,
+            product,
+            valid: None,
+            expire: None,
+        };
+        let tornado = band(OutlookProduct::Tornado);
+        assert!(tornado.matches(&band(OutlookProduct::Tornado)));
+        assert!(!tornado.matches(&band(OutlookProduct::Wind)));
     }
 
     /// `"Day N · <products>"`, in the day's own publication order — the

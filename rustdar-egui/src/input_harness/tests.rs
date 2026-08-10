@@ -1896,6 +1896,11 @@ fn crossing_a_breakpoint_does_not_move_any_widget_id() {
     // The drawer is what shows the panel below the sidebar breakpoint;
     // opening it up front means the panel is on screen for both runs.
     h.set_drawer_open(true);
+    // The inspector too, so its ids join the compared set (M3 review) —
+    // `insp_open` is session state, so it stays open across every resize
+    // below.
+    h.gui_mut().open_settings();
+    h.warm_up();
 
     assert_eq!(
         h.width_class(),
@@ -1907,6 +1912,11 @@ fn crossing_a_breakpoint_does_not_move_any_widget_id() {
         !expanded.is_empty(),
         "precondition: the panel must have reported some ids, or this test \
              compares two empty lists and passes for free"
+    );
+    assert!(
+        expanded.iter().any(|(name, _)| *name == "inspector_scroll"),
+        "precondition: the open inspector must report its scroll id, so the \
+             comparison really covers the inspector's ids too"
     );
 
     // Every probed id must be one egui actually knows. Without this a
@@ -5240,6 +5250,9 @@ fn crossing_a_breakpoint_re_keys_nothing() {
     // either, so the layers panel is the drawer both times.
     let mut h = InputHarness::with_screen(egui::vec2(750.0, 600.0));
     h.set_drawer_open(true);
+    // The inspector joins the crossing too (M3 review): its ids are part of
+    // "nothing", and egui's bookkeeping only sees what is on screen.
+    h.gui_mut().open_settings();
     h.load_scan("KTLX");
     assert_eq!(
         h.width_class(),
@@ -6108,6 +6121,14 @@ fn every_pane_kinds_sidebar_opens_with_the_same_identity_line() {
     let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
     h.load_scan("KDMX");
     h.open_pane_props();
+    // The crumb itself, asserted as the string a user reads (M3 review) —
+    // `open_pane_props` already pinned the mode probe, which is the arm and
+    // not the text.
+    assert_eq!(
+        h.inspector().crumb,
+        "Pane 1 \u{203a} Properties",
+        "the crumb must name the pane-props body"
+    );
     let inspector = inspector_rect(&h);
 
     assert!(
@@ -8393,5 +8414,562 @@ fn a_granted_permission_with_no_fix_yet_says_so() {
     assert!(
         painted.iter().any(|t| t.contains("Last fix")),
         "Painted: {painted:?}"
+    );
+}
+
+// ── M4: site search, time links, the catalog and presets ────────────────
+
+/// 69. **The site search narrows the list, highlights the current site, and
+///     a row click switches the pane's site.**
+///
+///     The inspector's Pane-properties body is the first *list* route to a
+///     site — the map's clickable icons were the only picker before — and a
+///     row click must mean exactly what an icon click means: the same
+///     `SwitchRadarSite`, aimed at the active pane. The count caption is
+///     computed from the compiled-in table, so it is asserted against the
+///     table too rather than as a literal.
+#[test]
+fn the_site_search_narrows_the_list_and_a_row_click_switches_the_site() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.open_pane_props();
+
+    let inspector = h.inspector();
+    let total = rustdar_radar::sites::RADARS.len();
+    assert_eq!(
+        inspector.site_rows.len(),
+        total,
+        "the unfiltered list must offer the whole table"
+    );
+    assert!(
+        inspector.site_caption.starts_with(&format!("{total} shown")),
+        "the caption must count what is shown; drew {:?}",
+        inspector.site_caption
+    );
+    let highlighted: Vec<&str> = inspector
+        .site_rows
+        .iter()
+        .filter(|(_, _, current)| *current)
+        .map(|(code, _, _)| code.as_str())
+        .collect();
+    assert_eq!(
+        highlighted,
+        vec!["KTLX"],
+        "exactly the pane's current site is highlighted"
+    );
+
+    // Type a query — lowercase on purpose; the codes are uppercase.
+    h.mouse_click(inspector.site_search.center());
+    h.type_text("kmkx");
+    h.warm_up();
+    let inspector = h.inspector();
+    assert_eq!(
+        inspector
+            .site_rows
+            .iter()
+            .map(|(code, _, _)| code.as_str())
+            .collect::<Vec<_>>(),
+        vec!["KMKX"],
+        "the filter must narrow to the match"
+    );
+    assert!(
+        inspector.site_caption.starts_with("1 shown"),
+        "the caption must follow the filter; drew {:?}",
+        inspector.site_caption
+    );
+
+    // The click emits the map-icon path's own action.
+    h.mouse_click(inspector.site_rows[0].1.center());
+    assert!(
+        h.last_actions().iter().any(|a| matches!(
+            a,
+            crate::actions::GuiAction::SwitchRadarSite { site, pane_idx: 0 } if site == "KMKX"
+        )),
+        "clicking the row did not emit SwitchRadarSite for the active pane"
+    );
+}
+
+/// 70. **An unlinked pane is excluded from shared time — the loop fan-out
+///     and the sync pass's time pair — and the link checkbox reflects and
+///     toggles.**
+///
+///     The checkbox lives in the Pane-properties sync section and writes the
+///     *taken* pane; the fan-out reads `time_sync_targets`, so the loop
+///     actions name exactly the linked map panes; and
+///     `propagate_layer_sync` leaves an unlinked pane's `viewing_live` and
+///     `time_step_secs` alone while still converging everything else.
+#[test]
+fn an_unlinked_pane_is_excluded_from_shared_nav_and_loop_fan_out() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.set_pane_count(3);
+    h.load_scan("KTLX");
+
+    // The checkbox reflects the stored state and toggles it.
+    h.open_pane_props();
+    let (link, on) = h
+        .inspector()
+        .time_link
+        .expect("a multi-pane layout draws the link checkbox");
+    assert!(on, "a fresh pane starts linked");
+    h.mouse_click(link.center());
+    h.warm_up();
+    assert!(
+        !h.gui_mut().pane(0).expect("pane 0").time_link,
+        "the click must unlink the pane"
+    );
+    let (link, on) = h.inspector().time_link.expect("still drawn");
+    assert!(!on, "the checkbox must reflect the stored state");
+    h.mouse_click(link.center());
+    h.warm_up();
+    assert!(
+        h.gui_mut().pane(0).expect("pane 0").time_link,
+        "a second click must relink it"
+    );
+
+    // Unlink pane 1; panes 0 and 2 stay linked.
+    h.gui_mut().pane_mut(1).expect("pane 1").time_link = false;
+    h.warm_up();
+
+    // The loop fan-out skips it.
+    h.mouse_click(h.timeline().loop_toggle.0.center());
+    let targets: Vec<usize> = h
+        .last_actions()
+        .iter()
+        .filter_map(|a| match a {
+            crate::actions::GuiAction::EnableLoop { pane_idx, .. } => Some(*pane_idx),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        targets,
+        vec![0, 2],
+        "the loop must fan out over the linked panes and only them"
+    );
+
+    // The sync pass leaves the frozen pane's time posture alone while the
+    // linked pane converges. Everything else still syncs — the site here.
+    {
+        let gui = h.gui_mut();
+        gui.pane_mut(1).expect("pane 1").viewing_live = false;
+        gui.pane_mut(1).expect("pane 1").time_step_secs = 0;
+        gui.pane_mut(2).expect("pane 2").viewing_live = false;
+    }
+    h.warm_up();
+    let gui = h.gui_mut();
+    assert!(
+        gui.pane(2).expect("pane 2").viewing_live,
+        "the linked pane must be dragged back to the active pane's live state"
+    );
+    assert!(
+        !gui.pane(1).expect("pane 1").viewing_live,
+        "the unlinked pane must stay frozen"
+    );
+    assert_eq!(
+        gui.pane(1).expect("pane 1").time_step_secs,
+        0,
+        "the unlinked pane's step must stay its own"
+    );
+    assert_eq!(
+        gui.pane(1).expect("pane 1").site,
+        "KTLX",
+        "unlink is about time: every other synced field still converges"
+    );
+}
+
+/// **A keyboard nudge on the archive scrubber commits** (§5.9 carried
+/// finding: `changed()` without a drag used to store the position and wait
+/// for a release that never comes).
+///
+/// egui's slider reads its arrow keys only while focused, and only a
+/// `TextEdit` takes focus from a click — so focus is granted through the
+/// id the renderer reported, as tabbing to the slider would.
+#[test]
+fn a_keyboard_nudge_on_the_archive_scrubber_commits() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.load_scan("KTLX");
+    // Parked in the archive, so a nudge is an archive step rather than a
+    // jump back to live from the rail's right end.
+    h.gui_mut().pane_mut(0).expect("pane 0").viewing_live = false;
+    h.warm_up();
+
+    let scrubber_id = h
+        .widget_id_probes()
+        .into_iter()
+        .find(|(name, _)| *name == "timeline_scrubber")
+        .expect("the scrubber must report its id")
+        .1;
+    h.focus_widget(scrubber_id);
+
+    // Several presses in one frame: each is one rail point, and the commit
+    // threshold near the right end must be cleanly crossed.
+    for _ in 0..20 {
+        h.key_press(egui::Key::ArrowLeft);
+    }
+    h.frame();
+
+    assert!(
+        h.last_actions().iter().any(|a| matches!(
+            a,
+            crate::actions::GuiAction::NavigateTime { pane_idx: 0, .. }
+        )),
+        "the keyboard nudge must commit a navigation, not park an in-flight \
+         drag position forever; actions: none matching NavigateTime"
+    );
+}
+
+/// 67a. **The catalog's search filters every group, and a product tile aims
+///      the active pane.**
+///
+///      A product tile means "show me this picture": it sets the pane's
+///      product (resetting the tilt, as the combo does), turns the Radar
+///      layer on, selects the Radar layer in the inspector, and closes the
+///      catalog.
+#[test]
+fn the_catalog_search_filters_and_a_product_tile_aims_the_active_pane() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.open_catalog();
+
+    let catalog = h.catalog();
+    for group in [
+        crate::ui::CatalogGroup::Presets,
+        crate::ui::CatalogGroup::Overlays,
+        crate::ui::CatalogGroup::Products,
+        crate::ui::CatalogGroup::Hrrr,
+    ] {
+        assert!(
+            catalog.tiles.iter().any(|tile| tile.group == group),
+            "{group:?} drew no tiles on the unfiltered view"
+        );
+    }
+    let unfiltered = catalog.tiles.len();
+
+    h.mouse_click(catalog.search.center());
+    h.type_text("spectrum");
+    h.warm_up();
+    let filtered = h.catalog().tiles;
+    assert!(
+        !filtered.is_empty() && filtered.len() < unfiltered,
+        "the query must narrow the catalog ({} of {unfiltered} left)",
+        filtered.len()
+    );
+    assert!(
+        filtered
+            .iter()
+            .all(|tile| tile.label.to_lowercase().contains("spectrum")),
+        "a tile that does not match survived the filter: {filtered:?}"
+    );
+
+    let tile = h
+        .catalog_tile(crate::ui::CatalogGroup::Products, "Spectrum Width")
+        .expect("the product tile survives its own name as the query");
+    h.mouse_click(tile.rect.center());
+    h.warm_up();
+
+    assert!(!h.catalog().open, "applying a tile must close the catalog");
+    let pane = h.gui_mut().pane(0).expect("pane 0");
+    assert_eq!(
+        pane.selected_product,
+        rustdar_radar::types::RadarProduct::SpectrumWidth,
+        "the tile did not set the active pane's product"
+    );
+    assert_eq!(
+        pane.selected_elevation, 0.0,
+        "the old product's tilt must not survive the switch"
+    );
+    assert!(
+        h.overlay_enabled_on(0, OverlayKind::Radar),
+        "a product under a hidden radar layer is a click that did nothing"
+    );
+    assert_eq!(
+        h.inspector().mode,
+        Some(crate::ui::InspectorSelection::Layer(OverlayKind::Radar)),
+        "the Radar layer's options must be selected"
+    );
+}
+
+/// 67b. **An overlay tile enables the layer — with the shared enable-fetch
+///      rule — selects it, and closes the catalog.**
+///
+///      SPC outlooks are the layer that makes the fetch half a contract: off
+///      by default and never auto-polled, so without the queued fetch the
+///      tile would enable a layer that never draws anything.
+#[test]
+fn an_overlay_tile_enables_the_layer_and_selects_it() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    assert!(
+        !h.overlay_enabled_on(0, OverlayKind::SpcOutlook),
+        "precondition: outlooks start off, so the tile has something to do"
+    );
+
+    h.open_catalog();
+    let tile = h
+        .catalog_tile(crate::ui::CatalogGroup::Overlays, "SPC Outlooks")
+        .expect("the overlays group offers SPC Outlooks");
+    h.mouse_click(tile.rect.center());
+    assert!(
+        h.last_actions().iter().any(|a| matches!(
+            a,
+            crate::actions::GuiAction::FetchOverlay {
+                kind: OverlayKind::SpcOutlook,
+                pane_idx: 0
+            }
+        )),
+        "enabling a dataless, never-polled layer must queue its first fetch"
+    );
+    h.warm_up();
+
+    assert!(!h.catalog().open, "applying a tile must close the catalog");
+    assert!(
+        h.overlay_enabled_on(0, OverlayKind::SpcOutlook),
+        "the tile did not enable the layer"
+    );
+    assert_eq!(
+        h.inspector().mode,
+        Some(crate::ui::InspectorSelection::Layer(OverlayKind::SpcOutlook)),
+        "the enabled layer's options must be selected"
+    );
+}
+
+/// 67c. **An HRRR tile enables the model layer and sets the parameter
+///      through the handler's own control route.**
+#[test]
+fn an_hrrr_tile_enables_the_model_layer_and_sets_the_parameter() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.open_catalog();
+
+    let tile = h
+        .catalog_tile(crate::ui::CatalogGroup::Hrrr, "Surface-Based CAPE")
+        .expect("the HRRR group offers the parameter");
+    h.mouse_click(tile.rect.center());
+    assert!(
+        h.last_actions().iter().any(|a| matches!(
+            a,
+            crate::actions::GuiAction::FetchOverlay {
+                kind: OverlayKind::ModelData,
+                ..
+            }
+        )),
+        "an uncached parameter must ask for its data"
+    );
+    h.warm_up();
+
+    assert!(!h.catalog().open);
+    assert!(
+        h.overlay_enabled_on(0, OverlayKind::ModelData),
+        "the tile did not enable the model layer"
+    );
+    assert_eq!(
+        h.inspector().mode,
+        Some(crate::ui::InspectorSelection::Layer(OverlayKind::ModelData)),
+        "the model layer's options must be selected"
+    );
+    // The parameter landed in the handler the inspector now shows: the
+    // dropdown's own model says so.
+    let (_, selected) = h
+        .dropdown_model("Parameter")
+        .expect("the model layer's body offers the parameter dropdown");
+    assert_eq!(
+        selected, "sbcape",
+        "the tile's parameter must be the one selected"
+    );
+}
+
+/// **Presets: saving captures the view, the tile appears, applying
+/// reproduces the capture, deleting removes it** (§3.11).
+#[test]
+fn a_saved_preset_appears_applies_and_deletes() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.load_scan("KTLX");
+    // Sync off, so what apply writes per pane is what this test observes —
+    // not what the sync pass copied a frame later.
+    h.set_sync_layers(false);
+
+    // A distinctive view: two panes, velocity on the first, storm reports on.
+    h.set_pane_count(2);
+    h.gui_mut().pane_mut(0).expect("pane 0").selected_product =
+        rustdar_radar::types::RadarProduct::Velocity;
+    h.set_overlay_on_pane(0, OverlayKind::StormReports, true);
+    h.warm_up();
+
+    // Save it under a name.
+    h.open_catalog();
+    h.mouse_click(h.catalog().save_tile.center());
+    h.warm_up();
+    let field = h.catalog().save_field.expect("the name editor opens");
+    h.mouse_click(field.center());
+    h.type_text("Chase day");
+    h.warm_up();
+    let save = h.catalog().save_button.expect("the Save button is drawn");
+    h.mouse_click(save.center());
+    h.warm_up();
+
+    let tile = h
+        .catalog_tile(crate::ui::CatalogGroup::Presets, "Chase day")
+        .expect("the saved preset must appear as a tile");
+    assert!(
+        tile.delete.is_some(),
+        "a user tile carries its delete button"
+    );
+    assert!(
+        h.catalog_tile(crate::ui::CatalogGroup::Presets, "Severe Wx")
+            .expect("the built-ins stay")
+            .delete
+            .is_none(),
+        "a built-in tile must offer no delete"
+    );
+
+    // Wreck the view, then apply: the capture must come back.
+    h.set_pane_count(1);
+    h.gui_mut().pane_mut(0).expect("pane 0").selected_product =
+        rustdar_radar::types::RadarProduct::Reflectivity;
+    h.set_overlay_on_pane(0, OverlayKind::StormReports, false);
+    h.warm_up();
+    let tile = h
+        .catalog_tile(crate::ui::CatalogGroup::Presets, "Chase day")
+        .expect("still offered");
+    h.mouse_click(tile.rect.center());
+    h.warm_up();
+
+    assert!(!h.catalog().open, "applying a preset must close the catalog");
+    assert_eq!(h.pane_count(), 2, "the preset's pane count must come back");
+    assert_eq!(
+        h.gui_mut().pane(0).expect("pane 0").selected_product,
+        rustdar_radar::types::RadarProduct::Velocity,
+        "the preset's per-pane product must come back"
+    );
+    assert!(
+        h.overlay_enabled_on(0, OverlayKind::StormReports)
+            && h.overlay_enabled_on(1, OverlayKind::StormReports),
+        "the preset's overlay set must land on every pane"
+    );
+
+    // Delete removes the tile and the stored preset.
+    h.open_catalog();
+    let tile = h
+        .catalog_tile(crate::ui::CatalogGroup::Presets, "Chase day")
+        .expect("still offered");
+    h.mouse_click(tile.delete.expect("a user tile").center());
+    h.warm_up();
+    assert!(
+        h.catalog_tile(crate::ui::CatalogGroup::Presets, "Chase day")
+            .is_none(),
+        "the deleted preset must vanish from the catalog"
+    );
+    assert!(
+        h.gui_mut().presets_for_test().is_empty(),
+        "and from the store the config writer persists"
+    );
+}
+
+/// **Escape closes the catalog before anything beneath it** — the §3.4 slot,
+/// as amended: after the ☰ dropdown, before the feature and time dialogs.
+#[test]
+fn a_back_press_closes_the_catalog_first() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.open_catalog();
+    h.gui_mut().set_time_dialog_open_for_test(true);
+    h.warm_up();
+
+    assert!(h.gui_mut().dismiss_top_layer(), "something was open");
+    h.warm_up();
+    assert!(
+        !h.catalog().open,
+        "the first dismissal must take the catalog"
+    );
+
+    assert!(h.gui_mut().dismiss_top_layer(), "the dialog is still open");
+    h.warm_up();
+    // The second dismissal reached the layer beneath — the time dialog.
+    assert!(
+        !h.text_painted_in(h.screen_rect(), "Select Time"),
+        "the second dismissal must take the time dialog"
+    );
+}
+
+/// **The Data & live rows and the ☰ menu toggles read one field** — flipping
+/// either side moves the other, because there is only one thing to move.
+///
+/// The state is observed through `ui_config_json`, which serialises the flag
+/// itself — `is_auto_poll_active` cannot see it, because overlay auto-polls
+/// keep that answer true regardless.
+#[test]
+fn the_data_and_live_rows_share_state_with_the_menu_toggles() {
+    fn radar_auto_poll(h: &mut InputHarness) -> bool {
+        let json = h.gui_mut().ui_config_json().expect("serialises");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("parses");
+        value["auto_poll"].as_bool().expect("a bool")
+    }
+
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.open_settings();
+    assert!(radar_auto_poll(&mut h), "precondition: auto-poll starts on");
+
+    // The row sits far down the settings body: scroll it on screen the way a
+    // user does, let the smooth-scroll animation settle, then click the
+    // checkbox by its own painted label.
+    let scroll_pos = h
+        .inspector_rect()
+        .expect("the inspector is open")
+        .center();
+    let found = h.scroll_until(scroll_pos, egui::vec2(0.0, -160.0), 120, |h| {
+        h.settings_row("data.auto_poll")
+            .is_some_and(|row| h.screen_rect().contains(row.rect.center()))
+    });
+    assert!(found, "the auto-poll row never scrolled on screen");
+    h.warm_up();
+    let label = h
+        .painted_text_rects()
+        .into_iter()
+        .find(|(_, text)| text == "Auto-poll")
+        .expect("the checkbox label is painted")
+        .0;
+    h.mouse_click(label.center());
+    h.warm_up();
+    assert!(
+        !radar_auto_poll(&mut h),
+        "the settings checkbox must write the flag the menu reads"
+    );
+
+    // The menu's toggle shows the same state — one field, two routes...
+    h.open_menu();
+    let leaf = h.menu_leaf("Auto-poll").expect("the menu still offers it");
+    assert_eq!(
+        leaf.value,
+        Some(false),
+        "the menu's checkbox must reflect the settings row's write"
+    );
+
+    // ...and writes it too: flipping it back through the menu is what the
+    // settings row reads next frame.
+    h.mouse_click(leaf.rect.center());
+    h.warm_up();
+    assert!(
+        radar_auto_poll(&mut h),
+        "the menu toggle must write the same field back"
+    );
+}
+
+/// **Row 2's closing caption states this platform's frame budget and the
+/// unlink hint** (§5.9 carried into M4) — the number is the frontend's push
+/// (`set_loop_frame_budget`), never a guess from the width.
+#[test]
+fn the_timeline_row2_caption_states_the_pushed_frame_budget() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    // A deliberately non-default budget, so a caption printing the default
+    // could not pass by coincidence.
+    h.gui_mut().set_loop_frame_budget(12);
+    h.mouse_click(h.timeline().expander.center());
+    h.warm_up();
+
+    let row2 = h.timeline().row2.expect("the expander must open row 2");
+    assert!(
+        row2.caption.contains("up to 12 frames"),
+        "the caption must state the pushed budget; drew {:?}",
+        row2.caption
+    );
+    assert!(
+        row2.caption.contains("Follows shared time"),
+        "the caption must carry the per-pane unlink hint, by the checkbox's \
+         own name; drew {:?}",
+        row2.caption
     );
 }

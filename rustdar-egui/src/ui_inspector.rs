@@ -59,6 +59,11 @@ const COMBO_BOX_WIDTH: f32 = 150.0;
 /// belongs to the control, not to which panel is hosting it.
 const LAYER_CONTROL_ID_PREFIX: &str = "layers_";
 
+/// The site list's height: enough rows to scan, small enough that the rest
+/// of the Pane-properties body stays in reach without scrolling past 200
+/// sites.
+const SITE_LIST_HEIGHT: f32 = 150.0;
+
 /// What the inspector drew last frame, as it was drawn.
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
@@ -80,6 +85,18 @@ pub(crate) struct InspectorProbe {
     /// The layer body's "Show <layer>" master toggle, and the state it was
     /// drawn showing.
     pub master: Option<(egui::Rect, bool)>,
+    /// The pane-props body's site search field.
+    pub site_search: egui::Rect,
+    /// The site rows the pane-props body drew, filtered as drawn: the site
+    /// code, where the row landed, and whether it was highlighted as the
+    /// pane's current site.
+    pub site_rows: Vec<(String, egui::Rect, bool)>,
+    /// The site list's count caption, verbatim.
+    pub site_caption: String,
+    /// The sync section's "Follows shared time" checkbox and the state it was
+    /// drawn showing — `None` on a single-pane layout, which has no shared
+    /// time to follow.
+    pub time_link: Option<(egui::Rect, bool)>,
 }
 
 #[cfg(test)]
@@ -93,6 +110,10 @@ impl Default for InspectorProbe {
             open: false,
             mode: None,
             master: None,
+            site_search: egui::Rect::NOTHING,
+            site_rows: Vec::new(),
+            site_caption: String::new(),
+            time_link: None,
         }
     }
 }
@@ -165,14 +186,20 @@ impl super::Gui {
                                     {
                                         probe.mode = Some(InspectorSelection::AppSettings);
                                     }
-                                    self.render_settings_body(ui, actions);
+                                    self.render_settings_body(ui, pane, actions);
                                 }
                                 InspectorSelection::PaneProps => {
                                     #[cfg(test)]
                                     {
                                         probe.mode = Some(InspectorSelection::PaneProps);
                                     }
-                                    self.render_pane_props_body(ui, pane);
+                                    self.render_pane_props_body(
+                                        ui,
+                                        pane,
+                                        actions,
+                                        #[cfg(test)]
+                                        &mut probe,
+                                    );
                                 }
                                 InspectorSelection::Layer(kind) => {
                                     #[cfg(test)]
@@ -320,15 +347,11 @@ impl super::Gui {
             probe.master = Some((master.rect, was_on));
         }
         if master.changed() {
-            // Both halves, on the taken pane — see `write_pane_overlay`.
-            Self::write_pane_overlay(&mut self.overlays, pane, kind, on);
-            // The same enable-fetch rule as the stack's eye.
-            if on && !self.overlays.has_data(kind) && !self.overlays.is_fetching(kind) {
-                actions.push(GuiAction::FetchOverlay {
-                    kind,
-                    pane_idx: self.active_pane,
-                });
-            }
+            // Both halves on the taken pane, plus the enable-fetch rule —
+            // the one helper this toggle, the stack's eye and the catalog's
+            // tiles share.
+            let idx = self.active_pane;
+            self.set_pane_overlay_with_fetch(pane, idx, kind, on, actions);
         }
         ui.add_space(4.0);
         ui.separator();
@@ -351,7 +374,13 @@ impl super::Gui {
     /// children out of that entirely. Defence, not a fix for a live
     /// difference — the block is currently last — on the same terms the old
     /// layers panel recorded at length.
-    fn render_pane_props_body(&mut self, ui: &mut egui::Ui, pane: &mut PaneState) {
+    fn render_pane_props_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        pane: &mut PaneState,
+        actions: &mut Vec<GuiAction>,
+        #[cfg(test)] probe: &mut InspectorProbe,
+    ) {
         super::render_pane_identity(ui, pane);
         ui.add_space(4.0);
 
@@ -384,6 +413,15 @@ impl super::Gui {
         });
         ui.add_space(4.0);
 
+        self.render_site_search(
+            ui,
+            pane,
+            actions,
+            #[cfg(test)]
+            probe,
+        );
+        ui.add_space(4.0);
+
         self.render_radar_controls(ui, pane, COMBO_BOX_WIDTH, LAYER_CONTROL_ID_PREFIX);
 
         // --- Sync ---
@@ -399,6 +437,23 @@ impl super::Gui {
             ui.separator();
             ui.checkbox(&mut self.viewport_sync, "\u{1f517}  Sync Viewports");
             ui.checkbox(&mut self.sync_layers, "\u{1f517}  Sync Layers");
+            // Per-pane, unlike the two layout-wide toggles above: off means
+            // this pane is *frozen* — left out of the loop fan-out and of
+            // `propagate_layer_sync`'s time pair. Written on the taken pane,
+            // where every write in this body lands.
+            #[cfg(test)]
+            let link_was = pane.time_link;
+            let link = ui
+                .checkbox(&mut pane.time_link, "\u{1f517}  Follows shared time")
+                .on_hover_text("Off freezes this pane: shared time navigation and the loop leave it alone");
+            #[cfg(test)]
+            {
+                // The state the checkbox was handed, not the one the click
+                // produced — the `DrawnMenuLeaf` discipline.
+                probe.time_link = Some((link.rect, link_was));
+            }
+            #[cfg(not(test))]
+            let _ = link;
         }
 
         // The kind-specific block, last, in its one scope — see the method
@@ -412,6 +467,103 @@ impl super::Gui {
             crate::pane::PaneKind::Volume => {
                 map::render_volume_controls(ui, pane, &mut self.volume_iso, &self.volume_alpha);
             }
+        });
+    }
+
+    /// The radar-site search: a filter box over the full compiled-in table
+    /// and a scrolling list of what survives it, the pane's current site
+    /// highlighted (plan §1.4 — the first *list* route to a site; the map's
+    /// clickable icons were the only picker before this).
+    ///
+    /// A row click emits the same [`GuiAction::SwitchRadarSite`] the map icon
+    /// emits, with the same in-flight marker on the pane, so the two routes
+    /// cannot mean different things.
+    fn render_site_search(
+        &mut self,
+        ui: &mut egui::Ui,
+        pane: &mut PaneState,
+        actions: &mut Vec<GuiAction>,
+        #[cfg(test)] probe: &mut InspectorProbe,
+    ) {
+        use rustdar_radar::sites::RADARS;
+
+        // One explicit-id child scope for the whole block: the row count
+        // below follows the filter, so without it every widget drawn after
+        // this block would re-key each time the query changed — the same
+        // device, for the same reason, as the kind scope at the body's
+        // bottom.
+        let scope = egui::UiBuilder::new().id(ui.id().with("site_search"));
+        ui.scope_builder(scope, |ui| {
+            let search = ui.add(
+                egui::TextEdit::singleline(&mut self.site_query)
+                    .id_salt("site_query")
+                    .hint_text("Search radar sites"),
+            );
+            #[cfg(test)]
+            {
+                probe.site_search = search.rect;
+            }
+            #[cfg(not(test))]
+            let _ = search;
+
+            // The codes are the table's names; uppercased so a lowercase
+            // query still finds them.
+            let query = self.site_query.trim().to_uppercase();
+            let shown: Vec<&rustdar_radar::sites::RadarSite> = RADARS
+                .iter()
+                .filter(|site| query.is_empty() || site.name.contains(query.as_str()))
+                .collect();
+
+            // Computed from the table, not restated: the split is the
+            // caption's claim, and a hardcoded count would outlive an edit.
+            let total = RADARS.len();
+            let tdwr = RADARS.iter().filter(|site| site.is_tdwr()).count();
+            let caption = format!(
+                "{} shown \u{b7} {} sites ({} NEXRAD + {} TDWR)",
+                shown.len(),
+                total,
+                total - tdwr,
+                tdwr
+            );
+            ui.label(egui::RichText::new(caption.as_str()).small().weak());
+            #[cfg(test)]
+            {
+                probe.site_caption = caption;
+            }
+            #[cfg(not(test))]
+            let _ = caption;
+
+            egui::ScrollArea::vertical()
+                .id_salt("site_list")
+                .max_height(SITE_LIST_HEIGHT)
+                .show(ui, |ui| {
+                    for site in shown {
+                        let current = pane.site == site.name;
+                        // TDWRs are marked in the row: they are pickable —
+                        // the map icons allow them too — but the Level II
+                        // archive has nothing for them, and the caption's
+                        // split deserves to be visible per row.
+                        let label = if site.is_tdwr() {
+                            format!("{} \u{b7} TDWR", site.name)
+                        } else {
+                            site.name.to_owned()
+                        };
+                        let row = ui.selectable_label(current, label.as_str());
+                        #[cfg(test)]
+                        probe
+                            .site_rows
+                            .push((site.name.to_owned(), row.rect, current));
+                        if row.clicked() && !current {
+                            pane.loading_site = Some(site.name.to_owned());
+                            pane.radar_sites_render_gen =
+                                pane.radar_sites_render_gen.wrapping_add(1);
+                            actions.push(GuiAction::SwitchRadarSite {
+                                site: site.name.to_owned(),
+                                pane_idx: self.active_pane,
+                            });
+                        }
+                    }
+                });
         });
     }
 }

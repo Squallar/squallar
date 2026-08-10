@@ -15,9 +15,10 @@
 //! Row 1 is always on while the transport is expanded: Live · back / forward ·
 //! step picker · loop toggle · scrubber · timestamp (opens the Set Time
 //! dialog) · age chip · `⋯` (row 2) · `▾` (collapse). Row 2 adds the loop
-//! tuning: lookback, speed, the frame transport, the seek slider and the
-//! render progress. Collapsed, the whole transport becomes a small 🕐 chip at
-//! the map's bottom-right corner; clicking it restores.
+//! tuning: lookback, speed, the frame transport, the seek slider, the render
+//! progress, and a closing caption stating this platform's frame budget and
+//! the per-pane unlink hint. Collapsed, the whole transport becomes a small
+//! 🕐 chip at the map's bottom-right corner; clicking it restores.
 //!
 //! # Ids do not depend on the width — or on the data
 //!
@@ -144,6 +145,9 @@ pub(crate) struct TimelineRow2Probe {
     pub frame_text: String,
     /// The "n/m frames rendered" (or "Rendering n/m...") line, as drawn.
     pub rendered_text: String,
+    /// The row's closing caption — the platform's frame budget and the
+    /// per-pane unlink hint — as drawn.
+    pub caption: String,
 }
 
 #[cfg(test)]
@@ -158,6 +162,7 @@ impl Default for TimelineRow2Probe {
             seek: egui::Rect::NOTHING,
             frame_text: String::new(),
             rendered_text: String::new(),
+            caption: String::new(),
         }
     }
 }
@@ -534,11 +539,27 @@ impl super::Gui {
         let scrub = ui.add(egui::Slider::new(&mut frac, 0.0..=1.0).show_value(false));
         #[cfg(test)]
         {
+            // Reported like `time_step_sel`, so the keyboard test can put
+            // real focus behind the id egui actually keyed the slider on.
+            self.widget_id_probes.push(("timeline_scrubber", scrub.id));
             self.last_timeline.scrubber = scrub.rect;
         }
-        if scrub.dragged() || scrub.changed() {
+        if scrub.drag_stopped() {
+            // A release commits once — checked first, because the release
+            // frame can report `changed` too and must not commit twice.
+            self.timeline_scrub = None;
+            self.commit_archive_scrub(frac, lookback_secs, actions);
+        } else if scrub.dragged() {
             self.timeline_scrub = Some(frac);
-        } else if !scrub.drag_stopped() {
+        } else if scrub.changed() {
+            // Changed with no drag in flight: a keyboard nudge on the
+            // focused slider (§5.9 carried finding — this used to store the
+            // position and wait for a release that never comes). There is
+            // nothing to wait out, so it commits now, exactly as the loop
+            // form's seek does.
+            self.timeline_scrub = None;
+            self.commit_archive_scrub(frac, lookback_secs, actions);
+        } else {
             // No drag this frame and no release to commit: whatever position
             // was remembered belongs to a gesture that ended without a
             // release — a cancelled touch reports no `drag_stopped`, ever —
@@ -547,27 +568,36 @@ impl super::Gui {
             // cancel.
             self.timeline_scrub = None;
         }
-        if scrub.drag_stopped() {
-            self.timeline_scrub = None;
-            if frac >= SCRUB_LIVE_THRESHOLD {
-                actions.push(GuiAction::JumpToLive { pane_idx });
-            } else if let Some(scan_time) = self.panes[pane_idx]
-                .scan_info
-                .as_ref()
-                .map(|info| info.timestamp)
-            {
-                // `NavigateTime` steps relative to the pane's scan time, so
-                // the released absolute moment becomes a step from there.
-                let now = chrono::Utc::now().naive_utc();
-                let target =
-                    now - chrono::Duration::seconds((lookback_secs * (1.0 - frac)) as i64);
-                let step_secs = (target - scan_time).num_seconds();
-                self.panes[pane_idx].viewing_live = false;
-                actions.push(GuiAction::NavigateTime {
-                    pane_idx,
-                    step_secs,
-                });
-            }
+    }
+
+    /// Commit a scrub position: the right end means live, anywhere else means
+    /// the archive moment that fraction of the lookback window names. One
+    /// function for the release and the keyboard nudge, so the two routes
+    /// cannot drift.
+    fn commit_archive_scrub(
+        &mut self,
+        frac: f32,
+        lookback_secs: f32,
+        actions: &mut Vec<GuiAction>,
+    ) {
+        let pane_idx = self.active_pane;
+        if frac >= SCRUB_LIVE_THRESHOLD {
+            actions.push(GuiAction::JumpToLive { pane_idx });
+        } else if let Some(scan_time) = self.panes[pane_idx]
+            .scan_info
+            .as_ref()
+            .map(|info| info.timestamp)
+        {
+            // `NavigateTime` steps relative to the pane's scan time, so
+            // the committed absolute moment becomes a step from there.
+            let now = chrono::Utc::now().naive_utc();
+            let target = now - chrono::Duration::seconds((lookback_secs * (1.0 - frac)) as i64);
+            let step_secs = (target - scan_time).num_seconds();
+            self.panes[pane_idx].viewing_live = false;
+            actions.push(GuiAction::NavigateTime {
+                pane_idx,
+                step_secs,
+            });
         }
     }
 
@@ -766,6 +796,24 @@ impl super::Gui {
                 }
             }
         }
+
+        // The closing caption (plan §1.5): what this platform's loops can
+        // hold, and the escape hatch from shared time. The budget is the
+        // running build's own, pushed in by the frontend
+        // (`set_loop_frame_budget`) — not a guess from the width, which a
+        // 1400 pt Android tablet would get wrong.
+        let caption = format!(
+            "Loops keep up to {} frames on this platform \u{b7} a pane with \
+             \u{201c}Follows shared time\u{201d} off stays frozen",
+            self.loop_frame_budget
+        );
+        ui.label(egui::RichText::new(caption.as_str()).small().weak());
+        #[cfg(test)]
+        {
+            row2.caption = caption;
+        }
+        #[cfg(not(test))]
+        let _ = caption;
 
         #[cfg(test)]
         {

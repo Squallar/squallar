@@ -605,6 +605,10 @@ impl App {
 
         let mut gui = Gui::new();
         gui.set_supports_exit(platform.supports_exit());
+        // This build's loop frame cap, so the timeline's caption states the
+        // platform's real budget — the constant lives in this crate and the
+        // UI crate cannot see it.
+        gui.set_loop_frame_budget(crate::constants::MAX_LOOP_FRAMES);
         // Once, here, and not at the gate's cadence: whether a platform has a
         // location settings page is a property of the build. The permission it
         // sits beside changes; this does not.

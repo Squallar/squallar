@@ -54,6 +54,11 @@ const HEADER_ALLOWANCE: f32 = 40.0;
 /// The collapse button's glyph: the panel slides out to the left.
 const COLLAPSE_LABEL: &str = "\u{27e8}";
 
+/// The Add-layer buttons' label — one button above the rows and one below
+/// (plan §1.3), both opening the catalog: the list can be taller than the
+/// panel, and "add" is wanted at whichever end the scroll left the user.
+const ADD_LAYER_LABEL: &str = "+ Add layer";
+
 /// One row the stack actually drew, as it was drawn. Reported by the
 /// renderer, never rebuilt by a test — see `ui_menu::DrawnMenuLeaf` for the
 /// pattern.
@@ -91,6 +96,11 @@ pub(crate) struct StackProbe {
     pub collapse: egui::Rect,
     /// Whether the stack was on screen this frame.
     pub open: bool,
+    /// The `+ Add layer` button above the rows — [`egui::Rect::NOTHING`] for
+    /// a pane with no map, which has no rows to add to.
+    pub add_top: egui::Rect,
+    /// The `+ Add layer` button below the rows, on the same terms.
+    pub add_bottom: egui::Rect,
     /// The rows, top row first — draw order reversed.
     pub rows: Vec<StackRowProbe>,
 }
@@ -103,6 +113,8 @@ impl Default for StackProbe {
             header: egui::Rect::NOTHING,
             collapse: egui::Rect::NOTHING,
             open: false,
+            add_top: egui::Rect::NOTHING,
+            add_bottom: egui::Rect::NOTHING,
             rows: Vec::new(),
         }
     }
@@ -115,8 +127,9 @@ impl super::Gui {
     /// `pane` is the active pane, `mem::take`n by the caller for the whole
     /// stack+inspector pass — nothing in here reads `self.panes[..]`, whose
     /// active slot holds a default placeholder until the caller restores it.
-    /// `statuses` is built by the caller *before* the take, while the
-    /// registry demonstrably holds this pane's configs.
+    /// `statuses` is built by the caller from the *taken* pane — the live
+    /// one — against a registry it has demonstrably loaded with that pane's
+    /// configs (see `ui_shell.rs`).
     pub(super) fn render_stack(
         &mut self,
         ctx: &egui::Context,
@@ -254,10 +267,20 @@ impl super::Gui {
         // Every row is a layer drawn over map tiles, so a pane with no map
         // has no rows — the same omission-plus-one-line convention the old
         // panel used, for the same reason: a dozen disabled rows would bury
-        // the fact that nothing here can apply.
+        // the fact that nothing here can apply. No Add-layer buttons either:
+        // the catalog adds map layers, and this pane has no map to add to.
         if !pane.is_map() {
             super::render_non_map_layers_note(ui);
             return;
+        }
+
+        let add_top = ui.button(ADD_LAYER_LABEL);
+        #[cfg(test)]
+        {
+            probe.add_top = add_top.rect;
+        }
+        if add_top.clicked() {
+            self.catalog_open = true;
         }
 
         // Top row = drawn last. The swap is recorded and applied after the
@@ -342,21 +365,11 @@ impl super::Gui {
                         row.eye = eye.rect;
                     }
                     if eye.clicked() {
-                        Self::write_pane_overlay(&mut self.overlays, pane, kind, !enabled);
-                        // A layer turned on with nothing to draw yet fetches
-                        // now rather than waiting out an auto-poll interval —
-                        // the same effect its own sub-toggles ask for, and
-                        // the only route for a layer (SPC outlooks) that
-                        // never auto-polls.
-                        if !enabled
-                            && !self.overlays.has_data(kind)
-                            && !self.overlays.is_fetching(kind)
-                        {
-                            actions.push(GuiAction::FetchOverlay {
-                                kind,
-                                pane_idx: self.active_pane,
-                            });
-                        }
+                        // Both halves plus the enable-fetch rule, through the
+                        // one helper the inspector's Show toggle and the
+                        // catalog's tiles share.
+                        let idx = self.active_pane;
+                        self.set_pane_overlay_with_fetch(pane, idx, kind, !enabled, actions);
                     }
 
                     // The name and status block: the row's click target.
@@ -401,6 +414,15 @@ impl super::Gui {
                     );
                 });
             });
+        }
+
+        let add_bottom = ui.button(ADD_LAYER_LABEL);
+        #[cfg(test)]
+        {
+            probe.add_bottom = add_bottom.rect;
+        }
+        if add_bottom.clicked() {
+            self.catalog_open = true;
         }
 
         if let Some((a, b)) = swap {
