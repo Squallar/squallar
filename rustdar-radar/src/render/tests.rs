@@ -809,3 +809,27 @@ fn find_closest_elevation_snaps_to_the_flown_tilt() {
     assert_eq!(find_closest_elevation(&scan, PRODUCT, 0.5), Some(0.4));
     assert_eq!(find_closest_elevation(&scan, PRODUCT, 0.8), Some(0.8));
 }
+
+/// The hail and HCA render paths anchor on the feedhorn, not the ground.
+///
+/// Both add their site height to a beam height, and `beam` measures those
+/// above the antenna, so the ground under the tower is the wrong datum by a
+/// whole tower — 62 ft at KTLX, 114 ft at the tallest. Neither render path
+/// has a test that would see that shift in its output, so this pins the
+/// lookup itself: written as the two numbers so that a switch back to
+/// `Datum::SiteBase` fails here rather than passing quietly.
+#[test]
+fn the_render_paths_site_height_is_the_feedhorn() {
+    // KTLX: 1213 ft of ground under a 62 ft tower.
+    const KTLX: (f64, f64) = (35.33306, -97.2775);
+    assert_eq!(
+        super::render_site_height_ft(KTLX.0, KTLX.1),
+        1213.0 + 62.0,
+        "the feedhorn",
+    );
+    assert_ne!(
+        super::render_site_height_ft(KTLX.0, KTLX.1),
+        1213.0,
+        "the ground under the tower is not the datum a beam height is above",
+    );
+}

@@ -991,6 +991,23 @@ pub fn render_derived_vild_to_image(
     Some(output)
 }
 
+/// The site height every render path anchors its MSL heights on: the
+/// **feedhorn**, not the ground under the tower.
+///
+/// One function rather than the call repeated at each site, because the two
+/// call sites here spelled the conversion two different ways and would have
+/// drifted apart the first time one of them was edited. [`crate::beam`]
+/// measures every height above the antenna, so the feedhorn is the datum that
+/// makes those heights MSL; the ground is 30–115 ft lower and was what both
+/// call sites silently used before [`crate::sites::Datum`] existed.
+///
+/// Pinned by `the_render_paths_site_height_is_the_feedhorn`, which is the
+/// only thing standing between this and a silent revert: neither hail nor
+/// HCA has a render-level test that would notice a tower's worth of shift.
+fn render_site_height_ft(lat: f64, lon: f64) -> f64 {
+    crate::eet::radar_height_ft_near(lat, lon, crate::sites::Datum::Feedhorn)
+}
+
 /// Render one of the derived hail products ([`crate::hail`]): POSH in %,
 /// or MEHS converted from the field's mm into **inches** — the palette's,
 /// legend's and hover's unit — on a 1° × 1 km polar grid. Tilt-independent:
@@ -1019,8 +1036,7 @@ pub fn render_hail_to_image(
         hm20c_km_msl,
         fetched_at: chrono::Utc::now(),
     };
-    let radar_height_ft =
-        crate::eet::radar_height_ft_near(radar_lat, radar_lon, crate::sites::Datum::Feedhorn);
+    let radar_height_ft = render_site_height_ft(radar_lat, radar_lon);
     let grids = crate::hail::compute_hail(scan, Some(&env), radar_height_ft)?;
     const MM_PER_IN: f32 = 25.4;
     let (grid, unit_scale) = match product {
@@ -1074,9 +1090,7 @@ pub fn render_hhc_to_image(
     radar_lon: f64,
     env_heights_km_msl: Option<(f64, f64)>,
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
-    let radar_km_msl =
-        crate::eet::radar_height_ft_near(radar_lat, radar_lon, crate::sites::Datum::Feedhorn)
-            * 0.0003048;
+    let radar_km_msl = render_site_height_ft(radar_lat, radar_lon) * 0.0003048;
     let params = crate::kdp::KdpParams {
         isdp_est_deg: crate::kdp::estimate_volume_isdp(scan),
         ..crate::kdp::KdpParams::render_fallback()
