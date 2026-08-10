@@ -313,9 +313,12 @@ impl VolumePipelines {
                     binding: BINDING_GRID_TEXTURE,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        // Filterable is the stated reason `R8Unorm` was chosen:
-                        // index-to-dBZ is affine, so hardware filtering within
-                        // data is exactly linear dBZ interpolation.
+                        // Filterable is the stated reason `Rg8Unorm` was
+                        // chosen: index-to-dBZ is affine, so hardware filtering
+                        // within data is exactly linear dBZ interpolation — and
+                        // the coverage-premultiplied reconstruction needs the
+                        // hardware to take both channels' means under one set
+                        // of weights.
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
                         view_dimension: wgpu::TextureViewDimension::D3,
                         multisampled: false,
@@ -673,7 +676,14 @@ impl VolumePipelines {
     /// Upload a voxel grid and its colour table, and make the buffer the
     /// raymarch reads its camera from.
     ///
-    /// `indices` is one byte per cell in x-fastest, then y, then z order.
+    /// `indices` is one byte per cell in x-fastest, then y, then z order — the
+    /// grid's own plane, with 0 meaning no data. It is widened here into the
+    /// [`VOLUME_TEXTURE_FORMAT`] two-channel plane by
+    /// [`coverage_premultiplied`]; the host grid stays one byte per cell,
+    /// because coverage is exactly `index != 0` and storing it twice would
+    /// double the worker payload and the host residency to carry no
+    /// information.
+    ///
     /// `lut` is [`VOLUME_LUT_BYTES`] of straight (non-premultiplied),
     /// gamma-encoded RGBA — what `get_color_for_value` produces.
     pub fn upload_volume(
@@ -698,8 +708,9 @@ impl VolumePipelines {
             },
             // Two levels: the raw grid, and the hand-built two-cell mean the
             // reconstruction LOD blends towards. wgpu generates no mips; the
-            // level is computed on the CPU below, which for an 8 MiB desktop
-            // grid is a single pass over the bytes at upload time. A grid too
+            // level is computed on the CPU below, which for the desktop
+            // shape's 16 MiB premultiplied plane is a single pass over the
+            // bytes at upload time. A grid too
             // small to halve (a 1x1x1 box, which no shape produces but the
             // upload accepts) keeps one level — `create_texture` would refuse
             // two, from a call with no `Result`, and the sampler clamps an
@@ -711,16 +722,17 @@ impl VolumePipelines {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
+        let premultiplied = coverage_premultiplied(indices);
         queue.write_texture(
             grid.as_image_copy(),
-            indices,
+            &premultiplied,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 // No 256-byte row padding: `write_texture` repacks internally to
                 // the backend's `buffer_copy_pitch`, which is 4 on GLES. But
                 // `rows_per_image` MUST be `Some` when depth exceeds 1, or every
                 // slice after the first is copied from the wrong offset.
-                bytes_per_row: Some(cells[0]),
+                bytes_per_row: Some(cells[0] * GRID_BYTES_PER_CELL),
                 rows_per_image: Some(cells[1]),
             },
             wgpu::Extent3d {
@@ -730,7 +742,7 @@ impl VolumePipelines {
             },
         );
         if grid_mip_levels(cells) > 1 {
-            upload_coarse_level(queue, &grid, cells, indices);
+            upload_coarse_level(queue, &grid, cells, &premultiplied);
         }
 
         let lut_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -970,7 +982,7 @@ pub struct VolumeTextures {
     bind_group: wgpu::BindGroup,
     /// The palette's own texture, kept so the table can be rewritten in place
     /// — the Volume Alpha editor changes 1 KiB of alpha without touching the
-    /// 8 MiB grid beside it, and the bind group keeps pointing at this same
+    /// 16 MiB grid beside it, and the bind group keeps pointing at this same
     /// texture across the write.
     lut_texture: wgpu::Texture,
 }
@@ -1019,11 +1031,41 @@ impl VolumeTextures {
     }
 }
 
-/// Bytes an `R8Unorm` grid of this shape occupies, or `None` if it overflows.
-pub fn grid_bytes(cells: [u32; 3]) -> Option<usize> {
+/// Bytes one cell of [`VOLUME_TEXTURE_FORMAT`] occupies: the premultiplied
+/// index and the coverage beside it.
+pub const GRID_BYTES_PER_CELL: u32 = 2;
+
+/// Cells a grid of this shape holds, or `None` if the product overflows —
+/// which is also the length of the one-byte-per-cell index plane a caller
+/// hands [`VolumePipelines::upload_volume`].
+pub fn cell_count(cells: [u32; 3]) -> Option<usize> {
     cells
         .iter()
         .try_fold(1usize, |acc, &n| acc.checked_mul(n as usize))
+}
+
+/// Bytes a [`VOLUME_TEXTURE_FORMAT`] grid of this shape occupies at **mip 0**,
+/// or `None` if it overflows. See [`grid_bytes_with_mips`] for what the
+/// allocation actually costs.
+pub fn grid_bytes(cells: [u32; 3]) -> Option<usize> {
+    cell_count(cells)?.checked_mul(GRID_BYTES_PER_CELL as usize)
+}
+
+/// Bytes the grid texture really costs: every level [`grid_mip_levels`] gives
+/// it, at [`GRID_BYTES_PER_CELL`] a cell.
+///
+/// Separate from [`grid_bytes`] because the two answer different questions —
+/// `grid_bytes` sizes the upload buffer for one level, this sizes the
+/// allocation — and because the memory budget in `constants` is a claim about
+/// the allocation. Before the coverage channel landed the budget quietly
+/// counted mip 0 alone and the coarse level rode in the headroom; now both are
+/// named.
+pub fn grid_bytes_with_mips(cells: [u32; 3]) -> Option<usize> {
+    let mut total = grid_bytes(cells)?;
+    if grid_mip_levels(cells) > 1 {
+        total = total.checked_add(grid_bytes(coarse_cells(cells))?)?;
+    }
+    Some(total)
 }
 
 /// Mip levels the grid texture carries: the raw field, and one hand-built
@@ -1042,9 +1084,50 @@ fn grid_mip_levels(cells: [u32; 3]) -> u32 {
     }
 }
 
+/// wgpu's own mip arithmetic: `max(n / 2, 1)` per axis.
+fn coarse_cells(cells: [u32; 3]) -> [u32; 3] {
+    cells.map(|n| (n / 2).max(1))
+}
+
+/// The grid's own index plane widened into [`VOLUME_TEXTURE_FORMAT`]:
+/// `R = coverage × index`, `G = coverage`, coverage being 1 exactly where the
+/// index is not `rustdar_radar::voxel::NO_DATA_INDEX`.
+///
+/// Premultiplication is trivial here because coverage is binary and index 0 is
+/// unreachable for a measurement (`ramp_index` clamps every finite value to
+/// `1..=255`), so `coverage × index` **is** the index and the whole function is
+/// "the byte, then 255 or 0". Written out anyway rather than folded into the
+/// caller: it is the one place the texture's contract is expressed, the mip
+/// below reads the same layout, and `the_premultiplied_plane_is_index_and_a_
+/// binary_coverage` pins it.
+///
+/// One pass over the plane, at grid-upload time — once per built volume, not
+/// per frame. On the desktop shape that is 8 MiB read and 16 MiB written in the
+/// same `prepare` that already walks the same bytes to build the coarse level.
+fn coverage_premultiplied(indices: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(indices.len() * GRID_BYTES_PER_CELL as usize);
+    for &index in indices {
+        out.push(index);
+        out.push(if index == rustdar_radar::voxel::NO_DATA_INDEX {
+            0
+        } else {
+            u8::MAX
+        });
+    }
+    out
+}
+
 /// Write the hand-built coarse level into the grid texture's mip 1.
-fn upload_coarse_level(queue: &wgpu::Queue, grid: &wgpu::Texture, cells: [u32; 3], indices: &[u8]) {
-    let (coarse_cells, coarse) = downsampled_grid(cells, indices);
+///
+/// `premultiplied` is the level-0 plane [`coverage_premultiplied`] produced,
+/// not the grid's own indices.
+fn upload_coarse_level(
+    queue: &wgpu::Queue,
+    grid: &wgpu::Texture,
+    cells: [u32; 3],
+    premultiplied: &[u8],
+) {
+    let (coarse_cells, coarse) = downsampled_grid(cells, premultiplied);
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
             texture: grid,
@@ -1055,7 +1138,7 @@ fn upload_coarse_level(queue: &wgpu::Queue, grid: &wgpu::Texture, cells: [u32; 3
         &coarse,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(coarse_cells[0]),
+            bytes_per_row: Some(coarse_cells[0] * GRID_BYTES_PER_CELL),
             rows_per_image: Some(coarse_cells[1]),
         },
         wgpu::Extent3d {
@@ -1066,67 +1149,100 @@ fn upload_coarse_level(queue: &wgpu::Queue, grid: &wgpu::Texture, cells: [u32; 3
     );
 }
 
-/// The grid's mip level 1: each coarse cell is the mean of the fine cells
-/// **with data** under it, in index units — no-data cells (index 0) are
-/// excluded from the mean, and a block with no data at all stays index 0.
+/// The grid's mip level 1: **the plain box mean of both channels**, over all
+/// eight fine cells under each coarse one, no special case anywhere.
 ///
-/// Averaging *indices* is exact averaging of the physical value, because
-/// index-to-dBZ is affine — the same fact that justified `R8Unorm`'s linear
-/// filtering in the first place. Rounding is to nearest.
+/// # Why the special case is gone, rather than merely moved
 ///
-/// # Why the mean is occupancy-weighted, and what that makes the mip
+/// This used to exclude the no-data index from the mean by hand, and it had to
+/// — a naive mean folded "not measured" in as the bottom of the dBZ ramp, and
+/// on the KCRP 2017-08-26 (Harvey) volume at the default 460 km box (1.8 km
+/// cells) that erased the eyewall: the ≥50 dBZ classes lost 41% of their pixels
+/// and the ≥30 dBZ classes 81%, with the 2D pane showing a red core the 3D pane
+/// had painted away.
 ///
-/// Index 0 is the **no-data** value, not a measurement of zero. The first
-/// version of this mip averaged it in anyway, and the result was measured on
-/// the KCRP 2017-08-26 (Harvey) volume: at the default 460 km box (1.8 km
-/// cells) the eyewall's data is one or two cells wide, so every coarse cell
-/// was mostly "not measured" folded in as the bottom of the dBZ ramp, and at
-/// the shipped LOD the ≥50 dBZ classes lost 41% of their pixels and the
-/// ≥30 dBZ classes 81% — the 2D pane showed a red core the 3D pane had
-/// erased. Excluding index 0 keeps a data cell's value at the data's edge;
-/// what fades there is only the trilinear blend into genuinely empty coarse
-/// cells, which is the alpha falloff the smoothing exists to provide.
+/// Coverage premultiplication makes the occupancy weighting **fall out of the
+/// arithmetic**. Write the fine cells as `(c_i · x_i, c_i)`. The box mean of
+/// the two channels is `(Σ c_i x_i / 8, Σ c_i / 8)`, and the shader's
+/// reconstruction divides one by the other: `R̄ / Ḡ = Σ c_i x_i / Σ c_i` — the
+/// occupancy mean the hand-written version computed, with no branch — and the
+/// coarse texel *additionally* carries `Σ c_i / 8`, the block's real occupancy,
+/// which the old one-channel level had no room for and therefore threw away.
+/// So the coarse level is now strictly more informative than the level it
+/// replaces, and the code is a mean.
+///
+/// Rounding stays to nearest, on the premultiplied channel. Averaging indices
+/// is exact averaging of the physical value because index↔value is affine —
+/// the same fact that justified the format's linear filtering in the first
+/// place.
+///
+/// # The identity is exact in ℝ and quantised in u8
+///
+/// It is **not** exactly the occupancy mean once stored, and that is worth
+/// naming because it runs the other way from every other claim here: on sparse
+/// blocks this level is *lossier* than the `round(Σ x / n)` it replaces. Both
+/// channels round to u8 before the shader divides, and the divisor is not `n`
+/// but `round₈(255 n)`, which steps in units of 255/8 ≈ 31.9. So what the
+/// shader reconstructs is `255 · round₈(Σ x) / round₈(255 n)`, not `Σ x / n`.
+///
+/// The bound over every reachable `(n, Σ x)` is **under 4 index units** — worst
+/// at `n = 1, x = 4`, which stores `(1, 32)` and reconstructs to 7.97 — against
+/// the old hand-written mean's ±0.5. The colour consequence is negligible,
+/// because the ramp is affine and four index units is a fraction of one palette
+/// band, and it only bites where a coarse block is nearly empty. But it is a
+/// real loss the old code did not have.
+///
+/// It also breaks, at this level only, the convex-hull invariant `field_at`
+/// states: a single measured cell at index 1, 2 or 3 rounds `Σ x` to `R̄ = 0`
+/// while `Ḡ = 32`, so the block reconstructs to index **0** — outside the hull
+/// of the one value it holds — at coverage 0.125, which is above the shader's
+/// `COVERAGE_SKIP` and so is a sample the lit volume does take. Four cells at
+/// index 1 land the other way, at 1.99. The hull statement is exact of the
+/// *filter* and of level 0; at level 1 it holds to the same sub-4-index
+/// tolerance and no better.
+/// `the_grid_mip_is_the_rounded_mean_of_each_coarse_blocks_measured_cells`
+/// pins the bound.
 ///
 /// The stated semantics, precisely: a fetch at an LOD between the levels
-/// interpolates the raw field with this one, so the reconstruction is no
-/// longer an exact mean **of the full cube** — it is the exact affine-dBZ
-/// mean of the cells that were measured, dilated by at most the two-cell
-/// kernel into cells that were not. Presentation over untouched data, like
-/// every knob on this rung: level 0 is bit-exact, and LOD 0 — the instrument
-/// default — never reads this level at all.
+/// interpolates the raw field with this one, so the reconstruction is the
+/// affine mean of the cells that were measured — to the tolerance above —
+/// dilated by at most the two-cell kernel into cells that were not, with the
+/// dilation's alpha now scaled by the coarse occupancy rather than left to the
+/// palette. Presentation over untouched data, like every knob on this rung:
+/// level 0 is bit-exact, and LOD 0 — the instrument default — never reads this
+/// level at all.
 ///
-/// Odd extents follow wgpu's own mip arithmetic — `max(n / 2, 1)` per axis —
-/// and the fine cells under a coarse one are whatever the halved coordinate
-/// maps back onto, clamped to the fine extent, so no fine cell is read out of
-/// bounds and every coarse cell averages only cells that exist.
-fn downsampled_grid(cells: [u32; 3], indices: &[u8]) -> ([u32; 3], Vec<u8>) {
-    let coarse = cells.map(|n| (n / 2).max(1));
+/// Odd extents follow wgpu's own mip arithmetic ([`coarse_cells`]), and the
+/// fine cells under a coarse one are whatever the halved coordinate maps back
+/// onto, clamped to the fine extent, so no fine cell is read out of bounds and
+/// every coarse cell averages only cells that exist. A clamped extent means the
+/// same fine cell is counted twice, in both channels alike, which leaves the
+/// ratio — and so the reconstructed index — unchanged.
+fn downsampled_grid(cells: [u32; 3], premultiplied: &[u8]) -> ([u32; 3], Vec<u8>) {
+    let coarse = coarse_cells(cells);
     let fine = cells.map(|n| n as usize);
-    let mut out = Vec::with_capacity((coarse[0] * coarse[1] * coarse[2]) as usize);
+    let stride = GRID_BYTES_PER_CELL as usize;
+    let mut out = Vec::with_capacity((coarse[0] * coarse[1] * coarse[2]) as usize * stride);
     for cz in 0..coarse[2] as usize {
         for cy in 0..coarse[1] as usize {
             for cx in 0..coarse[0] as usize {
-                let mut sum = 0u32;
-                let mut occupied = 0u32;
+                let mut sum = [0u32; GRID_BYTES_PER_CELL as usize];
                 for dz in 0..2 {
                     for dy in 0..2 {
                         for dx in 0..2 {
                             let fx = (cx * 2 + dx).min(fine[0] - 1);
                             let fy = (cy * 2 + dy).min(fine[1] - 1);
                             let fz = (cz * 2 + dz).min(fine[2] - 1);
-                            let index = indices[(fz * fine[1] + fy) * fine[0] + fx];
-                            if index != 0 {
-                                sum += u32::from(index);
-                                occupied += 1;
+                            let at = ((fz * fine[1] + fy) * fine[0] + fx) * stride;
+                            for (channel, total) in sum.iter_mut().enumerate() {
+                                *total += u32::from(premultiplied[at + channel]);
                             }
                         }
                     }
                 }
-                out.push(
-                    (sum + occupied / 2)
-                        .checked_div(occupied)
-                        .map_or(0, |mean| mean as u8),
-                );
+                for total in sum {
+                    out.push(((total + 4) / 8) as u8);
+                }
             }
         }
     }
@@ -1171,10 +1287,15 @@ fn offscreen_needs_rebuild(held: Option<[u32; 2]>, wanted: [u32; 2]) -> bool {
 /// validation error, and with too many it silently ignores the tail — so an
 /// off-by-one grid would upload a plausible volume shifted by a slice.
 fn upload_refusal(cells: [u32; 3], indices_len: usize, lut_len: usize) -> Option<String> {
+    // Against the **cell count**, not [`grid_bytes`]: the caller hands over the
+    // grid's own one-byte-per-cell index plane, and the second channel is
+    // synthesised here. Comparing against the texture's two-byte figure would
+    // refuse every correct grid.
+    //
     // `?` here would be exactly backwards: a cell count that overflows `usize`
     // is the strongest reason to refuse, and returning `None` for it would
     // report the grid as acceptable.
-    let Some(expected) = grid_bytes(cells) else {
+    let Some(expected) = cell_count(cells) else {
         return Some(format!(
             "refusing a {cells:?} grid: its cell count overflows"
         ));

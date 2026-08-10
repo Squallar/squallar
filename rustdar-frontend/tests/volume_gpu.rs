@@ -56,7 +56,7 @@ use rustdar_frontend::egui_renderer::AttachmentConfig;
 use rustdar_frontend::volume::raymarch::{
     ENTRY_FS_BLIT_GAMMA, ENTRY_FS_BLIT_LINEAR, OffscreenTarget, VolumePipelines,
 };
-use rustdar_frontend::volume::uniform::{ISO_OFF, NEAREST_RECONSTRUCTION, VolumeUniform};
+use rustdar_frontend::volume::uniform::{ISO_OFF, VolumeUniform};
 
 /// Open a pass that clears to opaque black, which is what `EguiRenderer::draw`
 /// does.
@@ -800,6 +800,234 @@ fn a_diverging_isosurface_draws_both_lobes_of_its_own_field() {
     }
 }
 
+/// The isosurface excludes unmeasured air — the one contract
+/// `COVERAGE_FLOOR` exists for, and the one nothing measured.
+///
+/// `iso_hit_test`'s coverage term had no test at all: deleting it outright, or
+/// dropping `COVERAGE_FLOOR` from 0.5 to 0.0, passed the entire suite — 13/13
+/// here, 10/10 silhouette, 151/151 lib. The reason is that every isosurface
+/// fixture in this file is *fully covered* ([`slab_ramp`] fills every cell), so
+/// no iso test contained a single no-data cell and the term was never reached.
+///
+/// What the term prevents is stated in the shader and is worst for exactly the
+/// products that most need an isosurface. `field_at` of an all-air fetch is
+/// index 0 by the floored divisor, and `iso_field` folds that against the
+/// diverging centre, so:
+///
+/// * for a velocity-like product whose centre sits mid-ramp, air reads as a
+///   deviation of the whole half-ramp — a strong inbound crossing at the very
+///   first sample, which shrink-wraps the surface onto the *coverage cone* and
+///   hides the couplet inside it; and
+/// * for ρHV, whose centre sits at the **top** of its ramp, index 0 is the
+///   single most extreme value the field can produce — the largest possible
+///   hit, from the absence of data.
+///
+/// Both directions are rendered here. Each fixture puts two slabs of no-data
+/// air between the eye and the data, so a march without the coverage term takes
+/// its hit in the air at index 0 and the grey ramp reads back 0, while the
+/// honest surface reads back the index where the deviation actually reaches the
+/// threshold. The two are ~90 and ~190 grey levels apart, so neither mutation
+/// can survive as a tolerance argument.
+///
+/// ```text
+/// cargo test -p rustdar-frontend --test volume_gpu \
+///     an_isosurface_excludes_unmeasured_air \
+///     -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
+fn an_isosurface_excludes_unmeasured_air() {
+    let _serialised = gpu_lock();
+    let size = [64, 64];
+    let lut = grey_ramp_lut();
+
+    let (device, queue) = device();
+    let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Bgra8Unorm));
+    pipelines.upload_quad(&queue);
+
+    // `slab_ramp`'s slab 0 is met LAST, so the two zeros at the end of each
+    // level list are the air the ray enters through. Slab 3 holds the centre
+    // exactly, so no ramp can cross at the air/data interface itself.
+    for (levels, shape, expected) in [
+        (
+            // A velocity-like couplet: centre mid-ramp, data falling away from
+            // it. |0 - 128| = 128 is nearly four times the threshold.
+            [68u8, 88, 108, 128, 0, 0],
+            "a diverging centre mid-ramp",
+            94i32,
+        ),
+        (
+            // ρHV's shape: the centre at the top of the ramp, so air is the
+            // most extreme reading the fold can return — |0 - 250| = 250.
+            [160u8, 200, 230, 250, 0, 0],
+            "a centre at the top of its ramp",
+            190,
+        ),
+    ] {
+        let centre = levels[3];
+        let deviation = centre - u8::try_from(expected).expect("in range");
+        let (cells, indices) = slab_ramp(&levels);
+        let mut uniform = iso_uniform(cells);
+        uniform.iso_centre = f32::from(centre) / 255.0;
+        uniform.iso_threshold = f32::from(deviation) / 255.0;
+
+        let pixels = raymarch_once(
+            &device, &queue, &pipelines, cells, &indices, &lut, &uniform, size,
+        );
+        // `grey_span` asserts opacity, which is the first half of the claim:
+        // an air test that rejected too much would paint nothing at all.
+        let (lo, hi) = grey_span(&pixels, size);
+        let level = i32::from(lo) + (i32::from(hi) - i32::from(lo)) / 2;
+        println!(
+            "{shape}: surface at index {level} (span [{lo}, {hi}]); \
+             air would read {}",
+            0,
+        );
+        assert!(
+            (level - expected).abs() <= 5,
+            "{shape}: the surface is drawn at index {level} (span [{lo}, \
+             {hi}]), where |value \u{2212} {centre}| reaches {deviation} at \
+             {expected}",
+        );
+        assert!(
+            level > 20,
+            "{shape}: the surface is drawn at index {level}, which is the \
+             no-data index the two air slabs in front of the data hold. \
+             `iso_hit_test` is taking its hit in unmeasured air: either the \
+             coverage term is gone or COVERAGE_FLOOR has stopped excluding \
+             air, and every diverging product's surface has collapsed onto \
+             the coverage cone",
+        );
+    }
+}
+
+/// The isosurface keeps features narrower than the smoothing kernel — at the
+/// rung the region boxes actually ship.
+///
+/// This is the measurement behind `volume::bridge`'s isosurface exemption, and
+/// the reason the exemption is a line of code rather than a comment.
+/// `cloud_reconstruction_lod_for` returns the full `CLOUD_RECONSTRUCTION_LOD`
+/// for every cell size at or under 0.65 km, which is **both** shipped region
+/// rungs (a 60 km box is 0.23 km/cell, a 160 km one 0.625). At that level a
+/// lone measured voxel is an eighth of its coarse texel — coverage 32/255 =
+/// 0.125 — and a one-cell sheet is half of one, coverage 128/255 = 0.502. The
+/// shader's `COVERAGE_FLOOR` cut of 0.5 deletes the first outright and all but
+/// deletes the second.
+///
+/// Both fixtures are shapes a forecaster looks for: the lone voxel is a narrow
+/// hail core or an updraft tip, the one-cell sheet a bright band or a TDS
+/// shell. Losing them from the 3D surface while the 2D pane and the lit volume
+/// both still show them is the "3D erased a core the 2D pane shows" failure the
+/// occupancy mip and the LOD taper were both added to close.
+///
+/// So the isosurface marches the raw field, and this test pins both halves:
+/// the shipped configuration keeps the features, and the smoothed level is
+/// measured erasing them rather than left as an assertion in a comment. If the
+/// second assertion ever fails, the erasure has stopped being real and
+/// `volume::bridge`'s reasoning needs rewriting rather than relaxing.
+///
+/// ```text
+/// cargo test -p rustdar-frontend --test volume_gpu \
+///     an_isosurface_at_the_shipped_rung_keeps_its_sub_kernel_features \
+///     -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
+fn an_isosurface_at_the_shipped_rung_keeps_its_sub_kernel_features() {
+    let _serialised = gpu_lock();
+    let size = [128u32, 128];
+    let cells = [16u32, 16, 16];
+    let lut = grey_ramp_lut();
+
+    let (device, queue) = device();
+    let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Bgra8Unorm));
+    pipelines.upload_quad(&queue);
+
+    let empty = vec![0u8; (cells[0] * cells[1] * cells[2]) as usize];
+    // One measured cell in the middle of empty air.
+    let mut lone_voxel = empty.clone();
+    lone_voxel[((8 * cells[1] + 8) * cells[0] + 8) as usize] = 255;
+    // One measured slab, one cell thick, spanning the whole horizontal extent
+    // — the bright band's shape, and the fill the eye of `eye_outside(2)` sees
+    // across the entire frame.
+    let mut sheet = empty;
+    let plane = (cells[0] * cells[1]) as usize;
+    sheet[8 * plane..9 * plane].fill(255);
+
+    // The shipped isosurface configuration: the cloud rung's step density,
+    // which the bridge does send, and the raw reconstruction, which is the
+    // exemption under test.
+    let mut uniform = iso_uniform(cells);
+    uniform.iso_centre = ISO_OFF;
+    uniform.iso_threshold = 100.0 / 255.0;
+    uniform.step_cells = rustdar_frontend::volume::bridge::CLOUD_STEP_CELLS;
+
+    let painted = |indices: &[u8], uniform: &VolumeUniform| {
+        raymarch_once(
+            &device, &queue, &pipelines, cells, indices, &lut, uniform, size,
+        )
+        .iter()
+        .filter(|px| px[3] > 0)
+        .count()
+    };
+
+    let raw = (painted(&lone_voxel, &uniform), painted(&sheet, &uniform));
+    uniform.reconstruction_lod = rustdar_frontend::volume::bridge::CLOUD_RECONSTRUCTION_LOD;
+    let smoothed = (painted(&lone_voxel, &uniform), painted(&sheet, &uniform));
+    println!(
+        "isosurface at threshold 100/255, {}x{} px:\n  \
+         lone voxel:   LOD 0 {} px, LOD {} {} px\n  \
+         1-cell sheet: LOD 0 {} px, LOD {} {} px",
+        size[0],
+        size[1],
+        raw.0,
+        rustdar_frontend::volume::bridge::CLOUD_RECONSTRUCTION_LOD,
+        smoothed.0,
+        raw.1,
+        rustdar_frontend::volume::bridge::CLOUD_RECONSTRUCTION_LOD,
+        smoothed.1,
+    );
+
+    assert!(
+        raw.0 > 0,
+        "the shipped isosurface configuration paints nothing for a lone \
+         measured voxel: a narrow hail core or updraft tip is absent from the \
+         3D surface while the 2D pane shows it",
+    );
+    assert!(
+        raw.1 > 0,
+        "the shipped isosurface configuration paints nothing for a one-cell \
+         sheet: a bright band or TDS shell is absent from the 3D surface",
+    );
+    assert!(
+        raw.1 > raw.0 * 4,
+        "the one-cell sheet ({} px) is not substantially larger than the lone \
+         voxel ({} px), so the sheet fixture is not spanning the frame and \
+         the erasure measurement below has nothing to bite on",
+        raw.1,
+        raw.0,
+    );
+    // The erasure the exemption exists for, measured rather than argued.
+    assert_eq!(
+        smoothed.0, 0,
+        "at the region rungs' reconstruction level a lone measured voxel now \
+         survives the {} coverage cut ({} px). That is the premise \
+         `volume::bridge`'s isosurface exemption rests on, so if it has \
+         changed the exemption's reasoning must be rewritten — not the \
+         assertion relaxed",
+        0.5, smoothed.0,
+    );
+    assert!(
+        smoothed.1 * 4 < raw.1,
+        "at the region rungs' reconstruction level the one-cell sheet keeps \
+         {} px of its {} — the 0.502 coverage of a half-filled coarse texel \
+         is no longer being cut by the 0.5 floor, so `volume::bridge`'s \
+         isosurface exemption is resting on a premise that has changed",
+        smoothed.1,
+        raw.1,
+    );
+}
+
 /// Opacity is per kilometre travelled, not per box diagonal.
 ///
 /// Spike 0a's first bug, as the property it actually breaks. On a
@@ -1326,56 +1554,88 @@ fn the_smoothed_reconstruction_spreads_a_lone_voxel() {
     );
 }
 
-/// Nearest reconstruction never paints a palette band the data does not
-/// occupy — the boundary-honesty contract behind the KLOT NROT green arcs.
+/// The coverage-premultiplied reconstruction never paints a palette band the
+/// data does not occupy — the boundary-honesty contract behind the KLOT NROT
+/// green arcs, now discharged by the texture rather than by a nearest march.
 ///
 /// The fixture is the defect's shape in miniature: a small block whose only
 /// data index is 147 (blue), over a LUT whose entries 1..=120 are opaque
 /// green — the stand-in for NROT's anticyclonic band, which really does sit
-/// under its cyclonic data on the one index ramp. A filtering reconstruction
+/// under its cyclonic data on the one index ramp. A plain `R8Unorm` tent
 /// interpolates *indices*, so every sample in the one-cell shell between the
 /// block and empty air reads some index in (0, 147) and paints the green the
-/// field never contained; measured on KLOT 2026-08-10, a volume with 0–2
-/// honest green voxels rendered broad green arcs exactly this way. With
-/// [`NEAREST_RECONSTRUCTION`] every fetch is a stored index: the block may
-/// only ever paint its own blue.
+/// field never contained; measured on KLOT 2026-08-10, a volume with 0-2
+/// honest green voxels rendered broad green arcs exactly this way.
 ///
-/// The trilinear half is the mechanism's demonstration, kept in the test so
-/// the green-free assertion cannot pass vacuously: at LOD 0 the tent must
-/// paint green boundary pixels, or the fixture has stopped exercising the
-/// boundary at all. (Trilinear stays correct for the products whose ramp
-/// bottom is transparent air — that decision is
-/// `rustdar_radar::voxel::no_data_blends_at_ramp_bottom`, pinned host-side.)
+/// With `R = coverage x index`, `G = coverage` and `index = R_bar / G_bar`,
+/// air contributes 0 to both sums and drops out of the mean, so every sample
+/// in that shell reconstructs to 147 exactly. The block may only ever paint
+/// its own blue — **at the same LOD 0 trilinear filter the old path painted
+/// green at**, which is the difference between this and the nearest march it
+/// replaces.
+///
+/// # The control, and why it is not optional
+///
+/// A green-free render proves nothing on its own: a camera that missed the
+/// boundary, or a march that never sampled the shell, would produce the same
+/// zero. So the same fixture is rendered a second time with every air cell
+/// replaced by [`CONTROL_AIR`] — a real index, so coverage is 1 everywhere and
+/// the tent blends it against 147 straight through the green run. That render
+/// **must** be green. It is the old defect reproduced through this very shader
+/// with coverage removed as the only variable, so it pins that the geometry,
+/// the camera and the march do reach the interpolation shell.
+///
+/// [`CONTROL_AIR`]'s own LUT entry is **transparent**, and that is the whole
+/// design of the control rather than an accident of it. With an opaque entry
+/// the outer air layer saturates on the first sample at this fixture's
+/// extinction and the render is uniformly green without the march ever
+/// reaching the data block — deleting the block from the control fixture
+/// changed nothing, so the control was inert, green by construction, and
+/// asserting on it pinned nothing. Transparent air makes the *only* possible
+/// green the interpolation shell between index 1 and index 147, which is the
+/// property the control claims. The opaque green run therefore starts at entry
+/// 2.
 ///
 /// ```text
 /// cargo test -p rustdar-frontend --test volume_gpu \
-///     nearest_reconstruction_never_paints_a_band_the_data_does_not_occupy \
+///     coverage_reconstruction_never_paints_a_band_the_data_does_not_occupy \
 ///     -- --ignored --exact --nocapture
 /// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
-fn nearest_reconstruction_never_paints_a_band_the_data_does_not_occupy() {
+fn coverage_reconstruction_never_paints_a_band_the_data_does_not_occupy() {
     let _serialised = gpu_lock();
     let size = [128u32, 128];
     let cells = [8u32, 8, 8];
     const DATA: u8 = 147;
+    /// The air replacement in the control: a real index below the green
+    /// band, so coverage is 1 everywhere and the tent has a band to sweep.
+    ///
+    /// Its own LUT entry is transparent — see the doc comment. An opaque one
+    /// saturates the outer layer and the control never reaches the data.
+    const CONTROL_AIR: u8 = 1;
 
     let (device, queue) = device();
     let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Bgra8Unorm));
     pipelines.upload_quad(&queue);
 
     // A 2x2x2 block in the middle of empty air, every face a no-data boundary.
-    let mut indices = vec![0u8; (cells[0] * cells[1] * cells[2]) as usize];
-    for z in 3..5u32 {
-        for y in 3..5u32 {
-            for x in 3..5u32 {
-                indices[((z * cells[1] + y) * cells[0] + x) as usize] = DATA;
+    let block = |air: u8| {
+        let mut indices = vec![air; (cells[0] * cells[1] * cells[2]) as usize];
+        for z in 3..5u32 {
+            for y in 3..5u32 {
+                for x in 3..5u32 {
+                    indices[((z * cells[1] + y) * cells[0] + x) as usize] = DATA;
+                }
             }
         }
-    }
+        indices
+    };
     // The band under the data: opaque green, like NROT's anticyclonic run.
+    // It starts at 2, not at 1: entry `CONTROL_AIR` stays transparent so the
+    // control's air layer cannot saturate before the march reaches the shell.
     let mut lut = vec![0u8; VOLUME_LUT_BYTES];
-    for entry in 1..=120usize {
+    for entry in usize::from(CONTROL_AIR) + 1..=120usize {
         lut[entry * 4..entry * 4 + 4].copy_from_slice(&[0, 255, 0, 255]);
     }
     let at = usize::from(DATA) * 4;
@@ -1387,9 +1647,9 @@ fn nearest_reconstruction_never_paints_a_band_the_data_does_not_occupy() {
     uniform.extinction_per_km = 1000.0;
     uniform.gradient_shading = false;
 
-    let census = |uniform: &VolumeUniform| {
+    let census = |indices: &[u8], uniform: &VolumeUniform| {
         let pixels = raymarch_once(
-            &device, &queue, &pipelines, cells, &indices, &lut, uniform, size,
+            &device, &queue, &pipelines, cells, indices, &lut, uniform, size,
         );
         let green = pixels
             .iter()
@@ -1402,30 +1662,30 @@ fn nearest_reconstruction_never_paints_a_band_the_data_does_not_occupy() {
         (green, blue)
     };
 
-    let (tent_green, tent_blue) = census(&uniform);
-    uniform.reconstruction_lod = NEAREST_RECONSTRUCTION;
-    let (nearest_green, nearest_blue) = census(&uniform);
+    let (green, blue) = census(&block(0), &uniform);
+    let (control_green, control_blue) = census(&block(CONTROL_AIR), &uniform);
     println!(
-        "trilinear: {tent_green} green px / {tent_blue} blue px; \
-         nearest: {nearest_green} green px / {nearest_blue} blue px"
+        "coverage: {green} green px / {blue} blue px; \
+         all-covered control: {control_green} green px / {control_blue} blue px"
     );
 
     assert!(
-        tent_green > 0,
-        "precondition: the trilinear tent no longer paints the under-band at \
-         the no-data boundary, so this fixture has stopped exercising the \
-         boundary and the nearest assertion below is vacuous",
+        control_green > 0,
+        "precondition: with coverage 1 everywhere the tent no longer paints \
+         the under-band between index {CONTROL_AIR} and index {DATA}, so this \
+         fixture has stopped exercising the interpolation shell and the \
+         green-free assertion below is vacuous",
     );
     assert!(
-        nearest_blue > 0,
-        "nearest reconstruction erased the data itself — the block must still \
+        blue > 0,
+        "the reconstruction erased the data itself — the block must still \
          paint its own colour",
     );
     assert_eq!(
-        nearest_green, 0,
-        "nearest reconstruction painted {nearest_green} green pixels from a \
-         volume whose only data index is blue: the march is still filtering \
-         across the no-data boundary, which is the KLOT NROT green-arc defect",
+        green, 0,
+        "the march painted {green} green pixels from a volume whose only data \
+         index is blue: a filtered sample is being dragged across the no-data \
+         boundary again, which is the KLOT NROT green-arc defect",
     );
 }
 

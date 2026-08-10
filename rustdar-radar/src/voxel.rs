@@ -229,6 +229,42 @@
 //! This is the table's *own* filter. The **volume texture** is always
 //! `Linear`; that is reason 1 above and it is not negotiable per product.
 //!
+//! # What the renderer does with the no-data boundary, and what it no longer
+//! needs from this encoding
+//!
+//! Everything above about the *bottom-of-ramp* decision still stands as an
+//! encoding decision — index 0 must sit one quantisation step below the
+//! moment's floor so that no measurement is indistinguishable from an absence,
+//! and the out-of-band alternative clamps real values. What no longer stands
+//! is the paragraph that made the palette's fade band the renderer's only
+//! defence at a data/no-data boundary.
+//!
+//! `rustdar-frontend`'s raymarch uploads this grid as **`Rg8Unorm`**, not
+//! `R8Unorm`: `R = coverage × index`, `G = coverage`, where coverage is 1 for
+//! a cell whose index is not [`NO_DATA_INDEX`] and 0 for one whose is. Both
+//! channels are filtered `Linear` in hardware and the shader reconstructs
+//! `index = R̄ / Ḡ`, which is the coverage-weighted mean **over covered
+//! texels only** — empty air contributes 0 to numerator and denominator
+//! alike, so it drops out of the average rather than participating in it as a
+//! value. The reconstructed index therefore always lies in the convex hull of
+//! the *stored* indices around the sample, for every product, and `Ḡ` is
+//! itself the emptiness test.
+//!
+//! The consequence for this module: the "the renderer has to supply the fade
+//! itself, because five of the six palettes have none" note in the WP-I
+//! paragraph above is **obsolete**. So is the per-product
+//! blend-or-march-nearest table that lived here as
+//! `no_data_blends_at_ramp_bottom`: all nine renderable products take one
+//! reconstruction path now, because the boundary problem it worked around
+//! cannot arise. [`VoxelGrid::fade_band`] survives for a different job — it
+//! is where the *palette's own* transparent run ends, which is what the
+//! march's skip threshold and soft-edge ramp anchor on, and that is a
+//! statement about the table rather than about no-data.
+//!
+//! One thing this does **not** change: the CPU-side readers (the section
+//! pane, `index_at`, `value_at`) sample without any filter at all, so the
+//! encoding they see is exactly the one described above.
+//!
 //! # Declared quantisation
 //!
 //! `value_range` starts from `get_legend_scale(product).{min_value, max_value}`
@@ -1354,69 +1390,6 @@ pub fn default_iso_threshold(product: RadarProduct) -> f32 {
     }
 }
 
-/// Whether the raymarch may reconstruct this product's field with a filter
-/// that blends data cells into no-data cells — that is, whether index 0 (the
-/// no-data value AND the bottom of the affine index ramp) is an honest
-/// stand-in for "no echo".
-///
-/// The GPU samples the index texture with a trilinear tent, and index↔value
-/// is affine, so interpolation **between data cells** is exactly value-space
-/// reconstruction — honest for every product. The dishonesty is confined to
-/// the no-data boundary: a filtered sample there is dragged toward index 0,
-/// which the LUT reads as the ramp's *bottom value*. For reflectivity that is
-/// "below the weakest echo" — physically what no-echo means, and the descent
-/// crosses only the palette's own fade band. For a diverging or inverted ramp
-/// the bottom is an extreme *signed* value, and the descent crosses palette
-/// bands the data never occupied.
-///
-/// Measured, KLOT 2026-08-10 03:14–03:45Z (the tornado-warned line the WP's
-/// live NROT verification flagged as "broader than its own section"): the
-/// derived NROT field held **0–2 voxels** in the cyclonic 1.0–1.5 band per
-/// desktop grid, yet the lit volume painted broad green arcs. The green was
-/// not data: NROT's LUT is opaque green over indices ~64–90 (anticyclonic
-/// 1.0–2.4), its fade band is 0 (the ramp bottom is opaque), and every
-/// boundary between the ~200 000 sub-threshold data cells and empty air
-/// interpolates straight through that band. The section pane samples on the
-/// CPU without index filtering, which is why it showed the sparse truth.
-/// The same mechanism paints inbound-velocity rims on outbound lobes (BV,
-/// SRV), hail-blue skirts on rain columns (ZDR), and debris-coloured shells
-/// around ordinary precipitation (ρHV — a manufactured TDS is the worst lie
-/// on this list).
-///
-/// `false` sends the march to nearest-neighbour reconstruction
-/// (`volume::uniform::NEAREST_RECONSTRUCTION`): blocky, but every sample is a
-/// stored index. Exhaustive with no wildcard, like every table here: a newly
-/// admitted product must have its boundary behaviour argued, not inherited.
-pub fn no_data_blends_at_ramp_bottom(product: RadarProduct) -> bool {
-    match product {
-        // Sequential ramps whose bottom is a transparent "nothing here":
-        // filtering into no-data reads as the field fading below detection.
-        RadarProduct::Reflectivity | RadarProduct::SpectrumWidth => true,
-        // Diverging ramps: index 0 is the strongest inbound / most negative
-        // extreme, not an absence.
-        RadarProduct::Velocity
-        | RadarProduct::StormRelativeVelocity
-        | RadarProduct::NormalizedRotation
-        | RadarProduct::DifferentialReflectivity
-        | RadarProduct::SpecificDifferentialPhase => false,
-        // Inverted (background at the top) and flat-alpha ramps: the bottom
-        // is a real, visible signal — low ρHV is debris, low ΦDP a real
-        // phase — never an absence.
-        RadarProduct::CorrelationCoefficient | RadarProduct::DifferentialPhase => false,
-        // Unreachable today (`crate::derive::volume_slot` refuses them before
-        // a grid exists). `false` so an admission without an argument here
-        // gets the honest-but-blocky reconstruction, never the blending one.
-        RadarProduct::EchoTops
-        | RadarProduct::EchoTopsInterpolated
-        | RadarProduct::VerticallyIntegratedLiquid
-        | RadarProduct::VilDensity
-        | RadarProduct::ProbabilityOfSevereHail
-        | RadarProduct::MaxExpectedHailSize
-        | RadarProduct::HydrometeorClassification
-        | RadarProduct::PrecipitationRate => false,
-    }
-}
-
 /// The default 3D alpha multiplier for `product` at `value` — the per-product
 /// transparency profile the volume table ships with (constants and rationale
 /// in [`volume_alpha_profile`]).
@@ -1707,6 +1680,14 @@ const MAGIC: [u8; 4] = *b"RDVX";
 /// Bumped whenever the layout below changes. The two ends of a worker boundary
 /// can be different builds — see `rustdar-web`'s build-token handshake — so a
 /// mismatch has to be a clean `None`, not a misparse.
+///
+/// **Whenever a renderer change tempts a bump, read
+/// `the_format_version_is_the_one_this_layout_ships` first.** It records which
+/// changes oblige one and which do not, and why the frontend's
+/// coverage-premultiplied `Rg8Unorm` volume texture — a doubling of the GPU
+/// grid — did not: coverage is `index != NO_DATA_INDEX`, synthesised at upload,
+/// so not one byte here changed in layout or in meaning. The obligation is on
+/// the bytes, not on what reads them.
 const FORMAT_VERSION: u16 = 1;
 
 impl VoxelGrid {

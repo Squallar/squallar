@@ -39,14 +39,34 @@ pub mod uniform;
 
 pub use degrade::VolumeSupport;
 
-/// The texel format a voxel grid is uploaded as.
+/// The texel format a voxel grid is uploaded as: **coverage-premultiplied**
+/// palette indices.
 ///
-/// `R8Unorm` holds a palette index per cell. Chosen because it is **filterable**
-/// under `Features::empty()` — `R32Float` is not without `FLOAT32_FILTERABLE` —
-/// and because index-to-dBZ is affine, so hardware filtering *within* data is
-/// exactly linear dBZ interpolation. Both properties are what the probe checks
-/// for below, and neither survives changing this format casually.
-pub const VOLUME_TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
+/// `R = coverage × index`, `G = coverage`, one byte each, where coverage is 1
+/// for a measured cell and 0 for empty air. The march samples both channels
+/// `Linear` and reconstructs `index = R̄ / Ḡ`, which is the coverage-weighted
+/// mean over the covered texels alone — air contributes 0 to numerator and
+/// denominator alike, so it drops out of the average instead of taking part in
+/// it as a value. See `volume.wgsl`'s `field_at`, and
+/// `rustdar_radar::voxel`'s module doc for what that retired.
+///
+/// Two properties are load-bearing and neither survives changing this format
+/// casually, which is why [`format_shortfall`] checks for both:
+///
+/// * **Filterable under `Features::empty()`.** The whole design rests on the
+///   hardware doing the two filtered means under one set of weights.
+///   `Rg8Unorm` carries `FILTERABLE` on the GLES3/WebGL2 downlevel path —
+///   `RG8` is in ES 3.0's required *texture-filterable* colour formats
+///   (Table 3.13), including for `TEXTURE_3D` — where `R32Float` would need
+///   `FLOAT32_FILTERABLE`.
+/// * **Affine index↔value.** Filtering *within* data is then exactly linear
+///   interpolation of the physical value, which is what makes the ratio a
+///   meaningful reconstruction rather than a blend of labels.
+///
+/// The cost of the second channel is one byte per cell — still one texture
+/// fetch per march step, and the memory is budgeted in
+/// `constants::VOLUME_TEXTURE_BUDGET_BYTES`.
+pub const VOLUME_TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg8Unorm;
 
 /// The environment variable that turns the volume view off natively.
 ///
@@ -221,17 +241,20 @@ pub(crate) fn limits_shortfall(limits: &wgpu::Limits) -> Option<String> {
 ///
 /// Both halves are load-bearing and neither is implied by the other.
 /// `TEXTURE_BINDING` is what makes the grid samplable at all. `FILTERABLE` is
-/// the *stated reason* `R8Unorm` was chosen over `R32Float`, and without it a
+/// the *stated reason* `Rg8Unorm` was chosen over `R32Float`, and without it a
 /// `Linear` sampler is a validation error rather than a fallback to `Nearest` —
 /// so a device that cannot filter it is not a device that renders a blockier
-/// volume, it is a device that renders nothing.
+/// volume, it is a device that renders nothing. It is also the premise the
+/// coverage-premultiplied reconstruction rests on outright: `R̄ / Ḡ` is
+/// meaningless without the hardware taking both means under one set of
+/// weights.
 fn format_shortfall(features: &wgpu::TextureFormatFeatures) -> Option<String> {
     if !features
         .allowed_usages
         .contains(wgpu::TextureUsages::TEXTURE_BINDING)
     {
         return Some(
-            "The 3D volume view needs to sample a single-channel texture: this \
+            "The 3D volume view needs to sample a two-channel texture: this \
              graphics device cannot bind one."
                 .to_owned(),
         );
@@ -242,7 +265,7 @@ fn format_shortfall(features: &wgpu::TextureFormatFeatures) -> Option<String> {
     {
         return Some(
             "The 3D volume view needs smooth interpolation between radar cells: \
-             this graphics device cannot filter a single-channel texture."
+             this graphics device cannot filter a two-channel texture."
                 .to_owned(),
         );
     }
@@ -422,7 +445,7 @@ mod tests {
 
     /// The two format-feature halves refuse independently.
     ///
-    /// `FILTERABLE` in particular: it is the stated reason `R8Unorm` was chosen,
+    /// `FILTERABLE` in particular: it is the stated reason `Rg8Unorm` was chosen,
     /// and a device without it cannot use a `Linear` sampler at all — so treating
     /// it as optional would produce a validation error rather than a blockier
     /// volume.
@@ -639,8 +662,9 @@ mod tests {
     /// The probe's two halves are unit-tested against synthetic limits above;
     /// what only a device can show is that `get_texture_format_features` and
     /// `on_uncaptured_error` behave as assumed on real hardware — in particular
-    /// that `R8Unorm` really is bindable and filterable under
-    /// `Features::empty()`, which is the premise the whole format choice rests on.
+    /// that `Rg8Unorm` really is bindable and filterable under
+    /// `Features::empty()`, which is the premise the whole format choice — and
+    /// with it the coverage-premultiplied reconstruction — rests on.
     ///
     /// Needs a real adapter, so it is ignored by default — but CI opts in, and
     /// the `gpu` job in `test.yaml` names this test explicitly. Renaming it
@@ -673,7 +697,7 @@ mod tests {
             format_shortfall(&features),
             None,
             "a real adapter cannot bind or filter {VOLUME_TEXTURE_FORMAT:?}, \
-             which is the premise the R8Unorm choice rests on. Features: \
+             which is the premise the Rg8Unorm choice rests on. Features: \
              {features:?}"
         );
 

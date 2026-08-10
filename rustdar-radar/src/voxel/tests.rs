@@ -2889,10 +2889,14 @@ fn the_length_prefixes_are_where_the_tests_think_they_are() {
 /// one build and passes whatever the constant says; the constant is only
 /// load-bearing *between* builds.
 ///
-/// Between builds is where it is the only defence. `rustdar-web`'s
-/// page/worker handshake is `build_token = version/PROTOCOL_VERSION/
-/// GITHUB_SHA`, and `GITHUB_SHA` is absent outside CI, so it degrades to
-/// `…/dev` and a stale worker shares a token with a fresh page. `RDVX` has
+/// Between builds is where it is the only defence — **in a dev build**.
+/// `rustdar-web`'s page/worker handshake is `build_token =
+/// version/PROTOCOL_VERSION/GITHUB_SHA`, and `GITHUB_SHA` is absent outside
+/// CI, so locally it degrades to `…/dev` and a stale worker shares a token
+/// with a fresh page. In a deployed build the SHA differs across the deploy
+/// boundary, the tokens disagree, and `worker_port::handle_message` terminates
+/// the worker at the HELLO handshake — before any payload is exchanged, so
+/// this constant is never reached. `RDVX` has
 /// never been bumped, so the exposure is the *first* bump being forgotten:
 /// a layout change that reorders two same-width fields — the three `f64`
 /// axis ranges, or `site` against them — round-trips perfectly through its
@@ -2908,6 +2912,36 @@ fn the_length_prefixes_are_where_the_tests_think_they_are() {
 /// Byte 4 is where the version starts because [`to_bytes`](VoxelGrid::to_bytes)
 /// writes [`MAGIC`] and then it — the same reading [`SHAPE_AT`] is built
 /// on. Mirrors `render_input`'s and `xsect`'s tests of the same name.
+///
+/// # Why the coverage-premultiplied texture did NOT bump it
+///
+/// `rustdar-frontend` now uploads the grid as `Rg8Unorm` with
+/// `R = coverage x index` and `G = coverage`, and doubling a texture is the
+/// shape of change that usually earns a bump. This one does not, because
+/// **not one byte of this payload changed, in layout or in meaning**:
+/// coverage is exactly `index != NO_DATA_INDEX` (pinned by
+/// `coverage_is_exactly_whether_the_index_is_the_no_data_one`), so the
+/// second channel is a function of the first, and it is synthesised at
+/// upload time by `volume::raymarch::coverage_premultiplied` rather than
+/// carried. Putting it on the wire would double the worker transfer and the
+/// host residency — 8 MiB to 16 MiB at [`DESKTOP_SHAPE`] — to move no
+/// information.
+///
+/// So old and new payloads are not merely unconfusable, they are
+/// *identical*, and both decode correctly under both renderers. A bump here
+/// would be a pure cost, and the cost is a **dev-build** one: the build-token
+/// handshake degrades to `…/dev` outside CI, so there a stale worker does
+/// share a token with a fresh page and reaches this decode, and a gratuitous
+/// bump would make that pair drop every reply — a pane stuck on "Building
+/// the … volume…" until the developer reloads — in exchange for refusing
+/// payloads that are correct. (In a deployed build the SHA differs and the
+/// mismatched worker is already terminated at HELLO, so a bump would cost
+/// nothing there and buy nothing either.)
+///
+/// The bump obligation is unchanged for anything that touches the bytes:
+/// if coverage ever stops being derivable from the index (a non-binary
+/// coverage from sub-cell occupancy, say, which would have to be carried),
+/// that is a layout change and it bumps.
 #[test]
 fn the_format_version_is_the_one_this_layout_ships() {
     assert_eq!(FORMAT_VERSION, 1);
@@ -2917,6 +2951,16 @@ fn the_format_version_is_the_one_this_layout_ships() {
         u16::from_le_bytes([bytes[4], bytes[5]]),
         1,
         "the version is not where a decoder from another build looks for it",
+    );
+    // The claim above, executed: the payload's index plane is one byte per
+    // cell, so a build that started carrying a coverage plane would grow it
+    // and would have to bump.
+    let grid = wire_fixture();
+    assert_eq!(
+        grid.indices().len(),
+        grid.shape().cells(),
+        "the payload carries more than one byte per cell — a coverage plane \
+         on the wire is a layout change and must bump FORMAT_VERSION",
     );
 }
 
@@ -3410,47 +3454,53 @@ fn the_capacity_guard_refuses_a_length_the_buffer_cannot_hold() {
     assert_eq!(Reader::new(&bytes).bounded(u32::MAX, usize::MAX), None);
 }
 
-/// The boundary-reconstruction table: only the two sequential moments
-/// whose ramp bottom is a transparent "nothing here" may be filtered into
-/// no-data; everything else — diverging, inverted, flat and unadmitted —
-/// must march nearest.
+/// Coverage is **exactly** `index != NO_DATA_INDEX`, for every product — the
+/// premise the renderer's coverage-premultiplied texture rests on.
 ///
-/// Pinned as the full census rather than spot checks, for the same reason
-/// the profile table is: flipping any single product (the mutation that
-/// matters — `NormalizedRotation => true` is a one-word edit that brings
-/// the KLOT green arcs back) changes this list.
+/// `rustdar-frontend` uploads this grid as `Rg8Unorm` with `R = coverage x
+/// index` and `G = coverage`, and it synthesises that second channel at upload
+/// time from the index plane alone rather than carrying it on the wire. That is
+/// only lossless if no measurement can encode as index 0 and no absence can
+/// encode as anything else — which is exactly what
+/// `no_measurement_encodes_as_the_no_data_index` and the `NaN` arm of
+/// `ramp_index` say, read here from the renderer's side of the contract.
+///
+/// This replaces `only_the_bottom_transparent_sequential_ramps_may_blend_into_no_data`,
+/// which pinned the per-product blend-or-march-nearest census that
+/// `no_data_blends_at_ramp_bottom` held. That table is gone: with coverage in
+/// the texture a filtered sample beside empty air lands inside the convex hull
+/// of the stored indices around it, for every product, so there is no longer a
+/// per-product decision to pin.
 #[test]
-fn only_the_bottom_transparent_sequential_ramps_may_blend_into_no_data() {
-    use RadarProduct::*;
-    let blending: Vec<RadarProduct> = RadarProduct::all()
-        .iter()
-        .copied()
-        .filter(|p| no_data_blends_at_ramp_bottom(*p))
-        .collect();
-    assert_eq!(
-        blending,
-        vec![Reflectivity, SpectrumWidth],
-        "the blending set changed: an addition needs the boundary-honesty \
-             argument `no_data_blends_at_ramp_bottom` documents (index 0 is \
-             both no-data and the ramp's bottom value — blending is only \
-             honest where those coincide physically)",
-    );
-    // The load-bearing negatives, by name: the products whose ramp bottom
-    // is an extreme signed value or a real signal, where a filtered
-    // no-data boundary paints palette bands the data never occupied.
-    for product in [
-        Velocity,
-        StormRelativeVelocity,
-        NormalizedRotation,
-        DifferentialReflectivity,
-        SpecificDifferentialPhase,
-        CorrelationCoefficient,
-        DifferentialPhase,
-    ] {
-        assert!(
-            !no_data_blends_at_ramp_bottom(product),
-            "{product:?} must march nearest: its ramp bottom is a real \
-                 value, so a blended no-data boundary manufactures data",
-        );
+fn coverage_is_exactly_whether_the_index_is_the_no_data_one() {
+    for product in RadarProduct::all() {
+        let Some(slot) = crate::derive::volume_slot(*product) else {
+            continue;
+        };
+        let range = value_range_for_product(*product, slot);
+        // An absence is index 0 and nothing else is.
+        for absent in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(
+                ramp_index(range, absent),
+                NO_DATA_INDEX,
+                "{}: {absent} does not encode as no-data, so coverage 0 would \
+                 lose a cell the grid says is empty",
+                product.code(),
+            );
+        }
+        // And no finite measurement anywhere on or beyond the ramp does, so
+        // coverage 1 never lands on a cell the grid says is empty.
+        let (lo, hi) = range;
+        let span = f64::from(hi) - f64::from(lo);
+        for step in 0..=512 {
+            let value = (f64::from(lo) + span * f64::from(step) / 256.0) as f32;
+            assert_ne!(
+                ramp_index(range, value),
+                NO_DATA_INDEX,
+                "{}: {value} encodes as the no-data index, so the renderer \
+                 would give a measured cell coverage 0",
+                product.code(),
+            );
+        }
     }
 }

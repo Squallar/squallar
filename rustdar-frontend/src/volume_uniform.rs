@@ -77,10 +77,21 @@ pub const DEFAULT_EXTINCTION_PER_KM: f32 = 1.0;
 
 /// Palette indices at or below which a cell is skipped entirely.
 ///
-/// Index 0 is the bottom of the affine ramp *and* the no-data value (WP-C), so
-/// this is the half-texel that selects exactly index 0. Raising it trades
-/// faint returns for fill rate; setting it below zero disables the skip, which
-/// is how the spike measured the un-skipped worst case.
+/// **The palette's own transparent run, not an emptiness test.** Empty air is
+/// excluded by the reconstructed *coverage* (`volume.wgsl`'s `COVERAGE_FLOOR`),
+/// which is a property of the measurement rather than of the table, so this
+/// lane's whole job is the run of fully transparent entries at the bottom of
+/// the ramp: below it a sample's LUT entry absorbs nothing, so the march can
+/// skip it and its up-to-seven shading fetches without changing a pixel.
+///
+/// The default is the half-texel that selects exactly index 0 — which a
+/// covered sample can no longer reconstruct to, since `R̄ / Ḡ` lies in the
+/// convex hull of stored indices and `ramp_index` clamps every measurement to
+/// `1..=255`, so at the default this lane skips nothing and costs nothing.
+/// The production value comes from the effective fade band
+/// (`volume::bridge::empty_index_threshold_for`). Raising it trades faint
+/// returns for fill rate; setting it below zero disables the skip, which is
+/// how the spike measured the un-skipped worst case.
 pub const DEFAULT_EMPTY_INDEX_THRESHOLD: f32 = 0.5 / 255.0;
 
 /// Transmittance below which the march stops.
@@ -195,15 +206,18 @@ pub struct VolumeUniform {
     /// over the placeholder would compositate a transparent ground, which is
     /// a no-op but a lie about what was drawn.
     pub map_floor: bool,
-    /// The mip level the march reconstructs the field at, `0..=1`, or
-    /// [`NEAREST_RECONSTRUCTION`] (negative) for nearest-neighbour
-    /// reconstruction. Rides `flags.y`.
+    /// The mip level the march reconstructs the field at, `0..=1`. Rides
+    /// `flags.y`.
     ///
     /// The grid texture carries one hand-built level below the raw field —
-    /// each coarse cell the mean of its eight fine ones — and the sampler
-    /// blends between the two, so this is a continuous softness knob at no
-    /// extra fetches: 0 is the raw trilinear tent, 1 is a two-cell box
-    /// convolved with a tent.
+    /// each coarse texel the box mean of its eight fine ones, in both
+    /// channels, which under the shader's `R̄ / Ḡ` reconstruction is the
+    /// occupancy-weighted mean of the index, to under 4 index units (both
+    /// channels quantise to u8 before the shader divides, and the divisor
+    /// steps in units of 255/8; see `volume::raymarch::downsampled_grid`) —
+    /// and the sampler blends between the two, so this is a continuous
+    /// softness knob at no extra fetches: 0 is the raw trilinear tent, 1 is a
+    /// two-cell box convolved with a tent.
     ///
     /// **Zero here, deliberately**, for exactly the reason
     /// [`DEFAULT_EDGE_SOFT_WIDTH`] is zero: the raw field is the instrument
@@ -214,13 +228,20 @@ pub struct VolumeUniform {
     /// rung as the lighting: together they are the cloud look, and the floor
     /// rung stays the jagged-unlit raw march.
     ///
-    /// Negative selects nearest — the sample point snaps to its cell's
-    /// centre, where the tent's weights collapse onto the stored index — for
-    /// the products whose no-data boundary a filter may not blend across
-    /// (`rustdar_radar::voxel::no_data_blends_at_ramp_bottom`; the bridge
-    /// makes the per-product decision). A sign sentinel rather than a new
-    /// lane, like the isosurface pair: the block has no reserved lanes left,
-    /// and every non-negative value keeps its existing meaning.
+    /// **The isosurface march is always 0**, on every rung. The knob is a
+    /// presentation softness for an *integrated* field; an isosurface is a
+    /// level set, so smoothing the field moves the surface rather than
+    /// softening its rendering, and `volume.wgsl`'s `COVERAGE_FLOOR` is a
+    /// statement about the raw tent that erases sub-kernel features at any
+    /// level above it. `volume::bridge`'s isosurface branch holds the
+    /// reasoning and the measurement.
+    ///
+    /// **Never negative.** A negative value used to be a sentinel selecting a
+    /// nearest-neighbour snap, for the seven products whose no-data boundary a
+    /// plain `R8Unorm` filter could not be trusted across. The volume texture
+    /// is coverage-premultiplied `Rg8Unorm` now, so a filtered sample beside
+    /// empty air can no longer be dragged anywhere the data was not; all nine
+    /// products take one path and the sentinel is gone with the split.
     pub reconstruction_lod: f32,
     /// The isosurface threshold in the shader's 0-1 index units, or negative
     /// for the lit-volume march. Rides `eye_in_box.w`, one of the two lanes
@@ -254,20 +275,6 @@ pub struct VolumeUniform {
 /// The lit-volume sentinel for [`VolumeUniform::iso_threshold`] and the
 /// sequential sentinel for [`VolumeUniform::iso_centre`].
 pub const ISO_OFF: f32 = -1.0;
-
-/// The nearest-neighbour sentinel for [`VolumeUniform::reconstruction_lod`]:
-/// any negative value selects it in the shader, and this is the one every
-/// writer uses.
-///
-/// Nearest exists for the products where the trilinear tent is a lie at the
-/// no-data boundary: index 0 is both "no data" and the bottom of the affine
-/// value ramp, so a filtered sample beside empty air is dragged through
-/// palette bands the data never occupied — the KLOT 2026-08-10 NROT arcs
-/// painted anticyclonic green from a field with almost no rotation at all
-/// (the measurement lives at `no_data_blends_at_ramp_bottom` in
-/// `rustdar-radar`). Snapping the sample to its cell's centre makes every
-/// fetch a stored index: blocky, but never manufactured.
-pub const NEAREST_RECONSTRUCTION: f32 = -1.0;
 
 impl VolumeUniform {
     /// A uniform with the defaults above, an identity transform and no camera.

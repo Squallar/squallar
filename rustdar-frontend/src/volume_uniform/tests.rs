@@ -279,34 +279,48 @@ fn the_reconstruction_lod_rides_flags_y_and_defaults_to_the_raw_field() {
     );
 }
 
-/// The nearest sentinel is negative — never a valid mip level — and the
-/// shader selects nearest on the lane's sign.
+/// There is no nearest sentinel any more, and the shader has no sign
+/// branch to select one with.
 ///
-/// Negative, like the isosurface pair's sentinels and for the same
-/// reason: every non-negative value is a real configuration (0 is the
-/// raw tent, 1 the full mip blend, fractions the taper), so only the
-/// sign is free to carry the mode. The source scan is the pairing half:
-/// a sentinel nothing tests for selects nothing.
+/// This lane used to carry a negative sentinel selecting a
+/// nearest-neighbour snap, for the seven products whose no-data boundary a
+/// plain `R8Unorm` filter could not be trusted across. The texture is
+/// coverage-premultiplied `Rg8Unorm` now: the shader divides the
+/// premultiplied index by the coverage, so a filtered sample beside air
+/// lands inside the convex hull of the stored indices and every product
+/// takes the one filtering path. Both halves are asserted because either
+/// alone would pass while the other regressed — a reinstated branch with no
+/// writer is dead code, and a reinstated writer with no branch silently
+/// samples at a negative LOD.
 #[test]
-fn the_nearest_sentinel_is_negative_and_the_shader_tests_the_sign() {
-    let mut uniform = distinct();
-    uniform.reconstruction_lod = NEAREST_RECONSTRUCTION;
-    let packed = lanes(&uniform.to_bytes())[OFFSET_FLAGS / 4 + 1];
+fn no_negative_reconstruction_sentinel_survives_in_the_lane_or_the_shader() {
+    let shader = include_str!("../volume.wgsl");
     assert!(
-        packed < 0.0,
-        "the nearest sentinel must arrive negative on the flags.y lane — \
-             every non-negative reconstruction_lod is a real filtering \
-             configuration, so only the sign is free to carry the mode",
-    );
-    assert_eq!(
-        packed, NEAREST_RECONSTRUCTION,
-        "the sentinel must ride flags.y unchanged",
+        !shader.contains("volume.flags.y < 0.0"),
+        "the shader branches on flags.y's sign again: the nearest path is \
+             back, and with it the per-product reconstruction split the \
+             coverage channel retired",
     );
     assert!(
-        include_str!("../volume.wgsl").contains("volume.flags.y < 0.0"),
-        "the shader no longer branches on flags.y's sign, so the nearest \
-             sentinel selects nothing and the no-blend products are filtered \
-             across their no-data boundaries again",
+        shader.contains("texel.r / max(texel.g, COVERAGE_EPSILON)"),
+        "the shader no longer reconstructs the index as premultiplied over \
+             coverage, which is the whole of the honesty argument",
+    );
+    // And nothing in the crate writes a negative level into the lane.
+    let uniform = VolumeUniform::new([1.0, 1.0, 1.0], [2, 2, 2]);
+    assert!(uniform.reconstruction_lod >= 0.0);
+    assert!(
+        crate::volume::bridge::CLOUD_RECONSTRUCTION_LOD >= 0.0
+            && (0..=40)
+                .map(
+                    |tenths| crate::volume::bridge::cloud_reconstruction_lod_for(
+                        tenths as f32 / 10.0
+                    )
+                )
+                .all(|lod| lod >= 0.0),
+        "a production writer produced a negative reconstruction level, which \
+             the shader would now sample the grid at rather than treat as a \
+             mode",
     );
 }
 
@@ -384,7 +398,8 @@ fn the_default_light_comes_from_above_and_over_the_left_shoulder() {
 /// The empty-cell threshold selects index 0 and nothing else.
 ///
 /// The shader skips a cell when `index > threshold` is false, and an
-/// `R8Unorm` fetch of palette entry `n` returns `n / 255`. So the threshold
+/// An eight-bit unorm fetch of palette entry `n` returns `n / 255`. So the
+/// threshold
 /// has to sit strictly between 0 and 1/255 — and it has to be *stated* as
 /// that rather than as a small number, because WP-C's whole no-data
 /// decision is that index 0 is the bottom of the ramp.

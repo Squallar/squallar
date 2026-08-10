@@ -3,7 +3,7 @@
 //! # Why there are rungs at all, and why these two
 //!
 //! Spike 0a measured the offscreen raymarch on an RTX 3090 over Vulkan: 96
-//! steps, a 256^3 `R8Unorm` grid, empty-cell skip and early-out on, gradient
+//! steps, a 256^3 `Rg8Unorm` grid, empty-cell skip and early-out on, gradient
 //! shading on.
 //!
 //! | offscreen   | gpu ms |

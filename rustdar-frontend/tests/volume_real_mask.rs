@@ -92,10 +92,17 @@
 //! `{value >= THRESH}`, and both are the production pipeline's own behaviour
 //! rather than this harness's:
 //!
-//! * the grid texture's sampler is `Linear`, so a fetch straddling an echo edge
-//!   returns an interpolated **index**, which the (`Nearest`-sampled) hard LUT
-//!   then reads as below-cut. The silhouette is eroded by up to half a voxel at
-//!   every boundary;
+//! * the grid texture's sampler is `Linear` over a coverage-premultiplied
+//!   `Rg8Unorm` grid, so a fetch straddling an echo edge returns a real
+//!   neighbouring **index** — never one the field does not hold — at a
+//!   *coverage* below 1, and the march scales its optical depth by that
+//!   coverage. At the production extinction that is a soft edge one voxel
+//!   wide; at this harness's saturating `EXTINCTION` both ends of the ramp
+//!   saturate, so the silhouette instead runs out to the first air texel's
+//!   centre — **dilated** by up to half a voxel rather than eroded by up to
+//!   half a voxel as the pre-coverage `R8Unorm` path was. The total optical
+//!   depth is the hard field's either way (the tent is a partition of unity);
+//!   what the saturating instrument sees is where that depth was spread to;
 //! * the march steps `RAYMARCH_STEP_CELLS` cells along the ray with a
 //!   deterministic per-pixel jitter of the comb's phase, so a chord shorter
 //!   than one step — a silhouette tangent — is hit or missed by the pixel's
@@ -382,6 +389,309 @@ fn render_a_real_volume_mask() {
             String::new()
         },
     );
+}
+
+// ── The acceptance measurement ───────────────────────────────────────────────
+
+/// Two numbers about the reconstruction, on a real volume: how much of what it
+/// paints is **fabricated**, and how **blocky** what it paints is.
+///
+/// Both are rendered through the production raymarch at a camera the
+/// environment names, so the comparison between two builds is a comparison of
+/// reconstructions and of nothing else. Run it on this build and on the build
+/// before it with the same environment; the difference is the answer.
+///
+/// # Honest: the sub-data band census
+///
+/// The fabrication mechanism the coverage channel exists to remove is
+/// specific: a plain `R8Unorm` `Linear` fetch at a data/air boundary blends a
+/// real index `x` against the no-data index 0, so it returns indices in
+/// `(0, x)` — palette bands **below** everything the field actually holds. For
+/// a sequential ramp whose bottom is transparent that fades out; for a
+/// diverging, inverted or flat one it paints, and paints a class the data
+/// never occupied (the KLOT 2026-08-10 NROT arcs).
+///
+/// So the census is: find the band at the bottom of the ramp that the data
+/// essentially does not occupy, and count the pixels the render paints in it.
+///
+/// * `q` is the largest index such that at most `BAND_FRACTION` of the grid's
+///   measured cells sit at or below it. Sized from the data rather than
+///   written down, so it means the same thing for every product and every
+///   volume.
+/// * The census render uses a hard LUT — opaque white on `1..=q`, transparent
+///   everywhere else — at `EXTINCTION` per km, so one sample in the band
+///   saturates a pixel and the alpha channel is a **coverage of the band**,
+///   not an opacity.
+/// * `band_px` is therefore "pixels showing a class at most `BAND_FRACTION` of
+///   the data occupies". The honest floor is not zero — some cells really are
+///   down there — which is why the complementary `data_px` is printed beside
+///   it and why the comparison is against another build, not against a
+///   constant.
+///
+/// A coverage-premultiplied reconstruction cannot exceed the honest floor at
+/// all: `R̄ / Ḡ` is a weighted mean of the stored indices around the sample, so
+/// it lies in their convex hull and no boundary sample can reach below the
+/// smallest index near it.
+///
+/// # Smooth: two metrics, both on the production colour render
+///
+/// * **Step density.** Among 4-adjacent pixel pairs that are both painted, the
+///   fraction whose 8-bit luminance differs by at least `STEP_LEVELS`. A
+///   nearest-neighbour march reconstructs a piecewise-constant field, so its
+///   render is plateaus separated by cell-face cliffs and this number is high;
+///   a filtered reconstruction varies gradually and it is low. This is the
+///   metric that sees *interior* blockiness, which is most of what "blocky"
+///   means here.
+/// * **Silhouette roughness.** `perimeter / sqrt(area)` of the painted mask,
+///   with perimeter counted as 4-adjacent painted/unpainted pairs. Scale-free,
+///   and a staircased outline has a longer perimeter than a smooth one round
+///   the same area, so lower is smoother. It sees the *outline* rather than
+///   the interior, which is the half the step density cannot.
+///
+/// Neither is a threshold anything asserts — this is an instrument, like the
+/// file it lives in. It prints, and a human or a diff compares.
+///
+/// ```text
+/// VOL=… CENTRE_LAT=… CENTRE_LON=… THRESH=20 OUT=/tmp/rd PRODUCT=NROT \
+/// cargo test -p rustdar-frontend --test volume_real_mask -- --ignored \
+///     measure_boundary_honesty_and_smoothness --nocapture
+/// ```
+///
+/// Extra environment beyond the module doc's:
+///
+/// | variable | default | meaning |
+/// |---|---|---|
+/// | `BAND_FRACTION` | `0.001` | Fraction of measured cells the sub-data band may contain. |
+/// | `STEP_LEVELS` | `8` | Luminance difference counted as a visible step. |
+/// | `CENSUS_LOD` | `0.0` | Reconstruction level for the census render. |
+/// | `COLOUR_LOD` | bridge taper | Reconstruction level for the smoothness render. Set `-1` on a build that still has the nearest sentinel to measure the shipped blocky path. |
+#[test]
+#[ignore = "needs a real wgpu adapter and a Level II file on disk; see the doc comment"]
+fn measure_boundary_honesty_and_smoothness() {
+    let volume_path = std::path::PathBuf::from(required("VOL"));
+    let scan = scan_from_archive(&volume_path);
+    let (site_name, site_lat, site_lon) = site_of(&volume_path);
+
+    let product = product_from_env();
+    let request = VoxelRequest {
+        centre: (parsed("CENTRE_LAT"), parsed("CENTRE_LON")),
+        half_width_km: parsed_or("HALF_KM", 80.0),
+        base_km_msl: parsed_or("BASE_KM", 0.0),
+        top_km_msl: parsed_or("TOP_KM", 18.0),
+        product,
+        shape: DESKTOP_SHAPE,
+        values_wanted: false,
+    };
+    let motion = motion_from_env(product);
+    let grid = build_voxels_with_motion(&scan, &request, site_lat, site_lon, motion)
+        .unwrap_or_else(|| panic!("build_voxels refused {}", product.code()));
+
+    let size = size_from_env();
+    let box_size_km = box_size_km(&grid);
+    let shape = grid.shape();
+    let grid_dims = [shape.nx as u32, shape.ny as u32, shape.nz as u32];
+    let (camera_source, box_from_clip, eye_in_box, exaggeration) = camera(box_size_km, size);
+
+    // The sub-data band, sized from this grid's own histogram.
+    let mut histogram = [0u64; 256];
+    for &index in grid.indices() {
+        histogram[index as usize] += 1;
+    }
+    let measured: u64 = histogram[1..].iter().sum();
+    assert!(measured > 0, "the grid holds no data at all");
+    let band_fraction: f64 = parsed_or("BAND_FRACTION", 0.001f64);
+    let allowed = (measured as f64 * band_fraction) as u64;
+    let mut running = 0u64;
+    let mut band_top = 0usize;
+    for (index, count) in histogram.iter().enumerate().skip(1) {
+        running += count;
+        if running > allowed {
+            break;
+        }
+        band_top = index;
+    }
+    // Forced, for a product whose ramp bottom the data genuinely occupies —
+    // ZDR's does, so its automatic band is empty and the census would be
+    // vacuous. A forced band is a *claim* about the physics ("no precipitation
+    // cell is this far below the rain band"), which is why it is an override
+    // rather than a fallback.
+    band_top = parsed_or("BAND_TOP", band_top);
+    let in_band: u64 = histogram[1..=band_top.max(1)].iter().sum();
+    print!("MEASURE histogram_low=");
+    for count in histogram.iter().take(16).skip(1) {
+        print!("{count} ");
+    }
+    println!();
+
+    let (device, queue) = device();
+    let pipelines = VolumePipelines::new(&device, attachments());
+    pipelines.upload_quad(&queue);
+
+    let mut uniform = VolumeUniform::new(box_size_km, grid_dims);
+    uniform.box_from_clip = box_from_clip;
+    uniform.eye_in_box = eye_in_box;
+    uniform.vertical_exaggeration = exaggeration;
+    uniform.extinction_per_km = parsed_or("EXTINCTION", 800.0f32);
+    uniform.gradient_shading = false;
+    uniform.reconstruction_lod = parsed_or("CENSUS_LOD", 0.0f32);
+    uniform.step_cells = 1.0;
+
+    // Opaque on a run of indices, transparent elsewhere: one sample inside the
+    // run saturates the pixel, so alpha is that run's coverage.
+    let run_lut = |lo: usize, hi: usize| {
+        let mut lut = vec![0u8; VOLUME_LUT_BYTES];
+        for entry in lo..=hi {
+            lut[entry * 4..entry * 4 + 4].copy_from_slice(&[255, 255, 255, 255]);
+        }
+        lut
+    };
+    let painted = |lut: &[u8], uniform: &VolumeUniform| {
+        raymarch_once(
+            &device,
+            &queue,
+            &pipelines,
+            grid_dims,
+            grid.indices(),
+            lut,
+            uniform,
+            size,
+        )
+        .iter()
+        .filter(|px| px[3] > 0)
+        .count()
+    };
+
+    let band_px = if band_top >= 1 {
+        painted(&run_lut(1, band_top), &uniform)
+    } else {
+        0
+    };
+    let data_px = painted(&run_lut(band_top + 1, 255), &uniform);
+
+    // The smoothness render: the production transfer function and the grid's
+    // own palette, exactly as `render_a_real_volume_mask` sets it.
+    let largest_cell_km = (0..3)
+        .map(|axis| box_size_km[axis] / grid_dims[axis] as f32)
+        .fold(0.0f32, f32::max);
+    uniform.extinction_per_km = rustdar_frontend::volume::uniform::DEFAULT_EXTINCTION_PER_KM;
+    uniform.gradient_shading = true;
+    uniform.reconstruction_lod = parsed_or(
+        "COLOUR_LOD",
+        rustdar_frontend::volume::bridge::cloud_reconstruction_lod_for(largest_cell_km),
+    );
+    uniform.step_cells = rustdar_frontend::volume::bridge::CLOUD_STEP_CELLS;
+    uniform.empty_index_threshold =
+        rustdar_frontend::volume::bridge::empty_index_threshold_for(grid.fade_band());
+    uniform.edge_soft_width = rustdar_frontend::volume::bridge::EDGE_SOFT_WIDTH;
+    let colour = raymarch_once(
+        &device,
+        &queue,
+        &pipelines,
+        grid_dims,
+        grid.indices(),
+        grid.lut(),
+        &uniform,
+        size,
+    );
+
+    let step_levels: u32 = parsed_or("STEP_LEVELS", 8u32);
+    let (step_density, adjacent, steps) = step_density(&colour, size, step_levels);
+    let (roughness, area, perimeter) = silhouette_roughness(&colour, size);
+
+    println!(
+        "MEASURE product={} site={site_name} volume={} camera={camera_source}\n\
+         MEASURE band_top={band_top} band_fraction={band_fraction} \
+         cells_measured={measured} cells_in_band={in_band} \
+         ({:.4}% of measured)\n\
+         MEASURE census_lod={} band_px={band_px} data_px={data_px} \
+         band_over_data={:.5}\n\
+         MEASURE colour_lod={} step_density={step_density:.5} \
+         (steps={steps} of adjacent={adjacent}, at >= {step_levels} levels) \
+         roughness={roughness:.4} (perimeter={perimeter} area={area})",
+        product.code(),
+        volume_path.display(),
+        100.0 * in_band as f64 / measured as f64,
+        parsed_or("CENSUS_LOD", 0.0f32),
+        if data_px == 0 {
+            0.0
+        } else {
+            band_px as f64 / data_px as f64
+        },
+        uniform.reconstruction_lod,
+    );
+}
+
+/// Perceived luminance of a premultiplied-over-black pixel, 0..=255.
+fn luminance(px: [u8; 4]) -> i32 {
+    (2 * i32::from(px[0]) + 5 * i32::from(px[1]) + i32::from(px[2])) / 8
+}
+
+/// The fraction of 4-adjacent painted pairs whose luminance differs by at
+/// least `levels` — the interior-blockiness metric. Returns
+/// `(fraction, adjacent_pairs, stepped_pairs)`.
+fn step_density(pixels: &[[u8; 4]], size: [u32; 2], levels: u32) -> (f64, u64, u64) {
+    let (w, h) = (size[0] as usize, size[1] as usize);
+    let mut adjacent = 0u64;
+    let mut steps = 0u64;
+    let mut consider = |a: [u8; 4], b: [u8; 4]| {
+        if a[3] == 0 || b[3] == 0 {
+            return;
+        }
+        adjacent += 1;
+        if (luminance(a) - luminance(b)).unsigned_abs() >= levels {
+            steps += 1;
+        }
+    };
+    for row in 0..h {
+        for column in 0..w {
+            let here = pixels[row * w + column];
+            if column + 1 < w {
+                consider(here, pixels[row * w + column + 1]);
+            }
+            if row + 1 < h {
+                consider(here, pixels[(row + 1) * w + column]);
+            }
+        }
+    }
+    let fraction = if adjacent == 0 {
+        0.0
+    } else {
+        steps as f64 / adjacent as f64
+    };
+    (fraction, adjacent, steps)
+}
+
+/// `perimeter / sqrt(area)` of the painted mask — scale-free, and higher for a
+/// staircased outline than for a smooth one round the same area. Returns
+/// `(roughness, area, perimeter)`.
+fn silhouette_roughness(pixels: &[[u8; 4]], size: [u32; 2]) -> (f64, u64, u64) {
+    let (w, h) = (size[0] as usize, size[1] as usize);
+    let painted = |row: usize, column: usize| pixels[row * w + column][3] > 0;
+    let mut area = 0u64;
+    let mut perimeter = 0u64;
+    for row in 0..h {
+        for column in 0..w {
+            if !painted(row, column) {
+                continue;
+            }
+            area += 1;
+            // Off the image counts as unpainted, so a mask running off the
+            // edge is not credited with a free straight side.
+            for (dr, dc) in [(0i64, 1i64), (0, -1), (1, 0), (-1, 0)] {
+                let (r, c) = (row as i64 + dr, column as i64 + dc);
+                let outside = r < 0 || c < 0 || r >= h as i64 || c >= w as i64;
+                if outside || !painted(r as usize, c as usize) {
+                    perimeter += 1;
+                }
+            }
+        }
+    }
+    let roughness = if area == 0 {
+        0.0
+    } else {
+        perimeter as f64 / (area as f64).sqrt()
+    };
+    (roughness, area, perimeter)
 }
 
 // ── The volume ───────────────────────────────────────────────────────────────

@@ -42,14 +42,24 @@
 //!
 //! # The two systematic residuals, named in advance
 //!
-//! 1. **Linear-filter bleed.** The grid is `R8Unorm` sampled `Linear`, and a
-//!    cell contributes when its interpolated index exceeds `0.5/255`. Between a
-//!    filled cell (index 255) and an empty neighbour the interpolant only falls
-//!    under that threshold at 99.8% of the way across, so the *field* extends
-//!    very nearly a full cell beyond the outermost filled cell **centre** —
-//!    i.e. half a cell beyond the nominal cell face. Every comparison below is
-//!    therefore reported twice: against the exact planted surface, and against
-//!    that surface dilated by one cell along each axis.
+//! 1. **Linear-filter bleed.** The grid is `Rg8Unorm` sampled `Linear` and
+//!    coverage-premultiplied, so what sets the reach is the interpolated
+//!    *coverage*, not the interpolated index. A cell contributes where coverage
+//!    reaches the shader's `COVERAGE_SKIP` = 1/255; the reconstructed index
+//!    gates nothing, because `R̄ / Ḡ` stays inside the convex hull of the
+//!    stored data and so never falls toward the no-data index at all. Coverage
+//!    runs from 1 at the outermost filled cell's **centre** to 0 at its empty
+//!    neighbour's centre, and 1/255 of that tent is essentially its whole
+//!    support — so the field extends very nearly a full cell past that centre,
+//!    i.e. half a cell past the nominal cell face.
+//!
+//!    The observable difference from the old path is that the reach no longer
+//!    depends on the stored value. An index-1 sphere and an index-255 sphere
+//!    now paint **bit-identically** — 5936 px each — where the `R8Unorm` index
+//!    gate gave 5434 against 5960, a faint echo reaching less far than a bright
+//!    one through the same geometry. Every comparison below is still reported
+//!    twice: against the exact planted surface, and against that surface
+//!    dilated by one cell along each axis.
 //! 2. **The jittered voxel-locked march.** `dt` is [`RAYMARCH_STEP_CELLS`]
 //!    cells along the ray (floored so [`RAYMARCH_STEP_CEILING`] steps always
 //!    span the box), and the comb starts a per-pixel hash fraction of a step
@@ -934,6 +944,23 @@ fn a_hard_palette_makes_the_render_a_binary_mask_and_the_rows_run_top_down() {
     assert!(
         faint_full > 0 && faint_zero > 0,
         "the index-1 mask must have both phases"
+    );
+    // --- and the two spheres are the SAME mask, which is residual #1's claim
+    //
+    // The module doc says the reach is set by interpolated *coverage* and not
+    // by the interpolated index. That has an executable consequence the old
+    // `R8Unorm` path could not satisfy: the index-1 sphere and the index-255
+    // sphere are the same planted geometry, so under a value-independent reach
+    // they must paint the same number of pixels — not nearly, exactly. On the
+    // index gate they did not (5434 against 5960 here: a faint echo reached
+    // less far than a bright one through identical geometry), and that
+    // discrepancy is what premultiplication removed.
+    assert_eq!(
+        faint_full, full,
+        "an index-1 sphere paints {faint_full} px and an index-255 sphere \
+         {full} px of the SAME planted geometry: the silhouette's reach is \
+         reading the stored value, which is the `R8Unorm` index gate's \
+         behaviour and not the coverage tent's",
     );
 }
 
@@ -1835,15 +1862,24 @@ fn the_linear_filter_bleeds_half_a_cell_past_a_sharp_top() {
         }
     }
 
-    // --- the edge moves with the *value* at the edge, not only with the cell
+    // --- the edge does NOT move with the value at the edge
     //
-    // The skip is `index > 0.5/255` on the **interpolated** index, so between a
-    // filled cell of index `n` and an empty neighbour the crossing is `1 −
-    // 0.5/n` of the way across. That is 0.998 of a cell for a saturated return
-    // and 0.5 of one for the faintest, so the same planted surface has two
-    // different silhouettes depending on how strong its edge is. Measured here
-    // rather than argued, because the consequence — a storm's outline creeping
-    // outward as its edge intensity rises — is not something a screenshot shows.
+    // This used to be the opposite measurement, and it was the right one for
+    // the path it was written against: the skip was `index > 0.5/255` on the
+    // **interpolated index**, so between a filled cell of index `n` and an
+    // empty neighbour the crossing sat `1 − 0.5/n` of the way across — 0.998
+    // of a cell for a saturated return, 0.5 of one for the faintest. The same
+    // planted surface had two different silhouettes depending on how strong
+    // its edge was, and a storm's outline crept outward as its edge intensity
+    // rose.
+    //
+    // Under the coverage-premultiplied grid the gate is on the interpolated
+    // *coverage* and the stored value does not enter the reach at all, so this
+    // now measures that the four silhouettes are the **same row**. Kept as a
+    // measurement rather than deleted with the defect: it is the sharpest
+    // statement of what premultiplication bought, it is what residual #1 in
+    // the module doc claims, and it fails loudly if any future gate starts
+    // reading the index again.
     let cells = FINE;
     let box_km = [40.0f32, 40.0, 20.0];
     let uniform = masking_uniform(camera(180.0, 0.0, 1.6, 1.0), box_km, cells, size);
@@ -1886,17 +1922,20 @@ fn the_linear_filter_bleeds_half_a_cell_past_a_sharp_top() {
     let faintest = rows[0];
     let strongest = *rows.last().expect("four rows");
     println!(
-        "the silhouette's top edge moves {} px outward between a faint (index 1) \
-         and a saturated (index 255) return on the very same planted surface; \
-         the 0.498-of-a-cell difference between their threshold crossings \
-         predicts {:.1} px",
+        "the silhouette's top edge moves {} px between a faint (index 1) and a \
+         saturated (index 255) return on the very same planted surface; the \
+         old index gate's 0.498-of-a-cell crossing difference predicted \
+         {:.1} px, and coverage predicts 0",
         i64::from(faintest) - i64::from(strongest),
         0.498 / f64::from(cells[2]) / per_row,
     );
     assert!(
-        rows.windows(2).all(|pair| pair[1] <= pair[0]),
-        "the edge must move outward, never inward, as the return at it gets \
-         stronger: top rows {rows:?} for indices 1, 8, 64, 255"
+        rows.iter().all(|row| *row == rows[0]),
+        "the silhouette's top edge sits at rows {rows:?} for indices 1, 8, 64, \
+         255 of the same planted surface: the reach is reading the stored \
+         value. Under a coverage gate it cannot — coverage is 1 at every \
+         filled cell whatever its index — so this is the `R8Unorm` index \
+         gate's behaviour back in the shader"
     );
 }
 

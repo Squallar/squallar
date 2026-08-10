@@ -63,7 +63,11 @@ struct Volume {
     // xyz: unit light direction in box space. w: the ambient term, 0..1.
     light_dir_ambient: vec4<f32>,
     // x: extinction per kilometre at LUT alpha 1.
-    // y: the palette index at or below which a cell contributes nothing.
+    // y: the palette index at or below which a cell contributes nothing —
+    //    the PALETTE's own transparent run, not an emptiness test. Air is
+    //    excluded by coverage, which is a property of the measurement rather
+    //    than of the table (COVERAGE_SKIP for the lit volume, COVERAGE_FLOOR
+    //    for the isosurface's binary hit test).
     // z: the transmittance at which the march stops early.
     // w: the opacity ramp's width above y, in 0-1 index units; 0 is hard.
     transfer: vec4<f32>,
@@ -73,7 +77,8 @@ struct Volume {
     //    configuration every mask harness runs at — and values towards 1
     //    blend continuously into the hand-built two-cell mean below it. The
     //    render-side softening that turns single-voxel spikes and tilt-shelf
-    //    cliffs into cloud.
+    //    cliffs into cloud. Never negative: the sentinel that used to select
+    //    a nearest-neighbour snap went with the per-product split.
     // z: cells one step advances along the ray, in the grid's own anisotropic
     //    cell metric. 1 is the instrument default the silhouette harness
     //    mirrors; the cloud rung halves it, which is what takes the jitter's
@@ -88,9 +93,16 @@ struct Volume {
 
 @group(0) @binding(0) var<uniform> volume: Volume;
 
-// The voxel grid: `R8Unorm` palette indices, sampled `Linear`. Filtering
-// *within* data is exactly linear dBZ interpolation because index-to-dBZ is
-// affine, which is the stated reason for the format.
+// The voxel grid: `Rg8Unorm`, **coverage-premultiplied**, sampled `Linear` on
+// both channels.
+//
+//   R = coverage x index      G = coverage
+//
+// where coverage is 1 for a cell the radar measured and 0 for empty air. The
+// march reconstructs `index = R_bar / G_bar` — the coverage-weighted mean over
+// the covered texels alone, because air contributes 0 to BOTH the numerator
+// and the denominator and so drops out of the average instead of taking part
+// in it as a value. See `field_at`.
 @group(0) @binding(1) var grid_texture: texture_3d<f32>;
 @group(0) @binding(2) var grid_sampler: sampler;
 
@@ -202,9 +214,92 @@ const GRADIENT_EPSILON: f32 = 1e-6;
 // Bisection steps refining an isosurface hit between the sample that crossed
 // and the one before it. A `const` bound for the same naga reason as
 // RAYMARCH_STEP_CEILING. Eight halvings of one march step place the surface
-// to under 1/256 of a step — finer than the R8Unorm field can express — so
+// to under 1/256 of a step — finer than the eight-bit index can express — so
 // the per-pixel jitter's one-step start offset stops wobbling the surface.
 const ISO_REFINE_STEPS: i32 = 8;
+
+// Reconstructed coverage at or above which a sample is INSIDE the data, for
+// the one decision that has to be binary: the isosurface's hit test.
+//
+// 0.5 rather than any other number because it is the *nearest-neighbour
+// decision boundary*: along an axis the trilinear coverage field's half level
+// set is exactly the midpoint between the last covered texel centre and the
+// first uncovered one, so a sample above it sits in the cell of a texel that
+// holds data and one below it in the cell of a texel that does not. An
+// isosurface is a level set — a point is on one side or the other — so it gets
+// a surface with the same *reach* as an honest nearest march, and one that is
+// smooth rather than a staircase of cube faces.
+//
+// That equivalence is exact in 1-D and only approximate in 3-D, where the tent
+// is the product of three axis weights: at u = v = w = 0.49 from a lone covered
+// texel, trilinear coverage is 0.51^3 = 0.133, well under the cut, while
+// nearest says inside. The corners of a lone texel's cell are therefore clipped
+// — 0.5 is a rounded nearest march, not a bit-exact one, and the smooth surface
+// is what it is chosen for.
+//
+// # It is a level-0 constant, and the isosurface marches at level 0
+//
+// Everything above is a statement about the RAW trilinear tent. At
+// reconstruction level 1 the coverage field is a two-cell box convolved with
+// that tent, and 0.5 stops meaning anything about texel cells: a lone measured
+// voxel is an eighth of its coarse texel and reconstructs to coverage
+// 32/255 = 0.125, a one-cell sheet to 128/255 = 0.502, so a `>= 0.5` cut
+// deletes the first outright and all but destroys the second. This is the same
+// erasure COVERAGE_SKIP refuses for the lit volume, arriving at the same
+// features through the gate.
+//
+// So `volume::bridge` sends `reconstruction_lod = 0` on the isosurface branch
+// — the smoothing rung is a presentation knob, and presentation is not what a
+// level set of the data is — and this cut is only ever applied to the field the
+// claim above is about. `an_isosurface_at_the_shipped_rung_keeps_its_sub_
+// kernel_features` measures both rungs and pins it.
+//
+// **The lit volume does not use it**, and that is deliberate rather than an
+// omission — see COVERAGE_SKIP.
+const COVERAGE_FLOOR: f32 = 0.5;
+
+// Coverage below which the LIT VOLUME skips a sample outright.
+//
+// A fill-rate and precision floor, **not** a decision about where the data is,
+// because for an integrated quantity there is no such decision to make: the
+// march accumulates optical depth along a ray, coverage is the fraction of a
+// sample's reconstruction footprint that was measured, and weighting the
+// optical depth by it is the partial-volume answer. The trilinear tent is a
+// partition of unity, so the coverage field integrates to exactly the hard
+// field's volume: the weighting REDISTRIBUTES an edge voxel's opacity across
+// the reconstruction footprint rather than adding any, which is what a
+// band-limited reconstruction of a hard edge is. (That conservation is of
+// `coverage x extinction`, so it is exact in the LUT's alpha only where the
+// alpha is constant across the indices the edge sweeps; where the ramp's alpha
+// varies the reconstruction still redistributes rather than invents, but the
+// integral is the alpha-weighted one, not the hard field's.)
+//
+// A COVERAGE_FLOOR-style cut here would instead destroy optical depth, and
+// above reconstruction level 0 it destroys whole features: a lone measured
+// voxel occupies an eighth of its coarse texel, so at the cloud rung's level
+// its coverage is 0.125 everywhere and a 0.5 cut erases it outright —
+// measured, `the_smoothed_reconstruction_spreads_a_lone_voxel` went from 43
+// painted pixels to 0. That is the same class of erasure as the naive mip's
+// (-90% of top-class pixels at 160 km), arriving through the gate instead of
+// through the mean, and the reconstruction rung exists to soften spikes rather
+// than to delete them.
+//
+// 1/255 is one stored quantum of the coverage channel — less coverage than a
+// single texel can hold. It is a fill-rate floor and not a claim of
+// invisibility: at DEFAULT_EXTINCTION_PER_KM over a several-kilometre segment a
+// sample at exactly this coverage absorbs on the order of a couple of percent
+// (~5 levels of 255 across a ~5 km segment), which is one or two eight-bit
+// steps in the pixel behind it, not none. What licenses the skip is that the
+// samples it drops are the outermost tail of the reconstruction tent, where the
+// alternative to a small error is the whole march paying for footprints that
+// are almost entirely air.
+const COVERAGE_SKIP: f32 = 1.0 / 255.0;
+
+// Divisor floor for the coverage reconstruction, far under COVERAGE_SKIP so it
+// can only ever be reached by a sample that is about to be discarded. It exists
+// so an all-air fetch — R = G = 0 exactly — yields index 0 rather than a NaN
+// that would poison the comparisons downstream.
+const COVERAGE_EPSILON: f32 = 1e-6;
 
 struct RaymarchVertex {
     @builtin(position) clip_position: vec4<f32>,
@@ -252,50 +347,80 @@ fn step_length_km(rd: vec3<f32>, dt: f32) -> f32 {
     return length(rd * dt * volume.box_size_km.xyz);
 }
 
-// The texel centre of palette entry `index`, where `index` is the 0-1 value an
-// `R8Unorm` fetch returns.
+// The texel centre of palette entry `index`, where `index` is the 0-1 value
+// `field_at` reconstructs — the same units an eight-bit unorm fetch returns.
 fn lut_coord(index: f32) -> vec2<f32> {
     return vec2<f32>((index * (LUT_ENTRIES - 1.0) + 0.5) / LUT_ENTRIES, 0.5);
 }
 
-fn grid_at(p: vec3<f32>) -> f32 {
-    return textureSampleLevel(grid_texture, grid_sampler, p, 0.0).r;
-}
-
-// The field the march reads: the grid at the reconstruction level flags.y.
+// The field the march reads: `x` is the reconstructed palette index, `y` the
+// reconstructed coverage, both at the level flags.y, from ONE texture fetch.
 //
-// The grid travels with one hand-built mip below it — each level-1 cell is
-// the mean of its eight level-0 cells, which is exact linear dBZ averaging
-// because index-to-dBZ is affine — and the sampler filters between levels, so
-// this one fetch reconstructs the field through a kernel that widens
-// continuously with flags.y: 0 is the raw trilinear tent, 1 is a two-cell
-// box convolved with a tent. That is the whole reconstruction upgrade at ONE
-// fetch per tap; the alternatives measured and rejected on fill-rate grounds
-// were a tricubic B-spline (eight taps) and a four-tap tetrahedral average
-// (which moired against the per-pixel jitter).
+// # The reconstruction
+//
+// The texture holds `R = coverage x index`, `G = coverage`. Hardware `Linear`
+// filtering returns the tent-weighted means `R_bar` and `G_bar` of the same
+// eight (or, between levels, sixteen) texels under the same weights, so
+//
+//     R_bar / G_bar  =  sum(w_i c_i x_i) / sum(w_i c_i)
+//
+// which is the coverage-weighted mean of the index over the **covered** texels
+// alone. Empty air has c = 0 and contributes nothing to either sum, so it
+// cannot drag the result anywhere: the reconstructed index always lies inside
+// the convex hull of the stored indices that surround the sample, for every
+// product, whatever shape its palette ramp has. That is the whole point of the
+// premultiplication, and it is what retires the per-product
+// nearest-versus-blend split this shader used to carry — under which the seven
+// diverging, inverted and flat-ramped products marched nearest and looked
+// blocky, because a plain `R8Unorm` blend against the no-data index 0 swept
+// through every intervening palette band and manufactured structure. The shape
+// of the defect is the KLOT 2026-08-10 NROT arcs; the number is the 8^3
+// synthetic fixture that reproduces them, `coverage_reconstruction_never_paints
+// _a_band_the_data_does_not_occupy`, whose control render paints 6267 pixels of
+// a band the data never occupies against 122 honest ones.
+//
+// A legitimate index 0 would still work — it adds 0 to R and 1 to G, so it is
+// counted **as a zero** rather than as an absence — though the encoding does
+// not produce one: `rustdar_radar::voxel::ramp_index` clamps every finite
+// measurement to 1..=255.
+//
+// # The level
+//
+// The grid travels with one hand-built mip below it — each level-1 texel the
+// plain box mean of its eight level-0 texels **in both channels**, which under
+// the ratio above is exactly the occupancy-weighted mean of the index and the
+// occupancy itself — and the sampler filters between levels, so this one fetch
+// reconstructs the field through a kernel that widens continuously with
+// flags.y: 0 is the raw trilinear tent, 1 is a two-cell box convolved with a
+// tent. The alternatives measured and rejected on fill-rate grounds were a
+// tricubic B-spline (eight taps) and a four-tap tetrahedral average (which
+// moired against the per-pixel jitter).
 //
 // This softening is *presentation*, exactly like the opacity ramp: the grid,
 // the palette and the threshold's anchor are untouched, and flags.y = 0 — the
 // uniform's default — is the bit-exact raw field every mask instrument was
 // written against (at LOD exactly 0 the level-1 weight is exactly zero).
+// flags.y is never negative any more; the sentinel that used to select a
+// nearest snap is gone with the split it served.
+fn field_at(p: vec3<f32>) -> vec2<f32> {
+    let texel = textureSampleLevel(grid_texture, grid_sampler, p, volume.flags.y).rg;
+    // No `select`: an all-air fetch is R = G = 0 exactly, so the floored
+    // divisor returns index 0 for it, and every covered fetch has G well above
+    // the floor by the time the sample is used at all.
+    return vec2<f32>(texel.r / max(texel.g, COVERAGE_EPSILON), texel.g);
+}
+
+// The premultiplied channel on its own — `coverage x index` — which is what
+// the lit volume's gradient is taken of.
 //
-// A NEGATIVE flags.y is the nearest-reconstruction sentinel
-// (`uniform::NEAREST_RECONSTRUCTION`). Filtering is only honest where
-// index 0 — no-data AND the bottom of the affine value ramp — physically
-// means "below the weakest thing the ramp shows": for every other product a
-// filtered sample beside empty air is dragged through palette bands the data
-// never occupied (NROT's opaque anticyclonic green under its cyclonic data
-// was the live failure). The snap collapses the tent's weights onto the
-// sample's own cell centre, so every fetch returns a stored index — the same
-// one fetch per tap, through the same Linear sampler (a second sampler per
-// texture is barred on the GLES 3.0 path). The bridge decides per product:
-// `no_data_blends_at_ramp_bottom` in `rustdar_radar::voxel` holds the table
-// and the measurement.
-fn density_at(p: vec3<f32>) -> f32 {
-    if volume.flags.y < 0.0 {
-        let snapped = (floor(p * volume.grid_dims.xyz) + 0.5) / volume.grid_dims.xyz;
-        return textureSampleLevel(grid_texture, grid_sampler, snapped, 0.0).r;
-    }
+// **Not** the reconstructed index. Inside the data coverage is 1 and the two
+// are identical, so nothing about interior shading changes; at an echo edge
+// the premultiplied channel falls continuously to zero while the reconstructed
+// index does not (it stays a real mean of real neighbours right up to the
+// cut), so this is the one that has a gradient there at all — and it points
+// out of the data, which is the normal of the surface being drawn. One fetch,
+// like the field it comes from.
+fn shading_field(p: vec3<f32>) -> f32 {
     return textureSampleLevel(grid_texture, grid_sampler, p, volume.flags.y).r;
 }
 
@@ -353,13 +478,18 @@ fn shading(p: vec3<f32>) -> f32 {
         volume.box_size_km.y,
         volume.box_size_km.z * volume.box_size_km.w,
     ) * voxel;
-    // Differences of the same reconstruction the march reads, so the normal
-    // belongs to the surface being drawn: raw differences over a smoothed
-    // field would light every voxel corner the smoothing just removed.
+    // Differences of the same reconstruction the march reads, at the same
+    // level, so the normal belongs to the surface being drawn: raw differences
+    // over a smoothed field would light every voxel corner the smoothing just
+    // removed. Of the *premultiplied* channel — see `shading_field` for why
+    // that and not the reconstructed index.
     let gradient = vec3<f32>(
-        density_at(p + vec3<f32>(voxel.x, 0.0, 0.0)) - density_at(p - vec3<f32>(voxel.x, 0.0, 0.0)),
-        density_at(p + vec3<f32>(0.0, voxel.y, 0.0)) - density_at(p - vec3<f32>(0.0, voxel.y, 0.0)),
-        density_at(p + vec3<f32>(0.0, 0.0, voxel.z)) - density_at(p - vec3<f32>(0.0, 0.0, voxel.z)),
+        shading_field(p + vec3<f32>(voxel.x, 0.0, 0.0))
+            - shading_field(p - vec3<f32>(voxel.x, 0.0, 0.0)),
+        shading_field(p + vec3<f32>(0.0, voxel.y, 0.0))
+            - shading_field(p - vec3<f32>(0.0, voxel.y, 0.0)),
+        shading_field(p + vec3<f32>(0.0, 0.0, voxel.z))
+            - shading_field(p - vec3<f32>(0.0, 0.0, voxel.z)),
     ) / cell_km;
     let ambient = volume.light_dir_ambient.w;
     let magnitude = length(gradient);
@@ -393,12 +523,19 @@ fn iso_field(index: f32) -> f32 {
     return select(index, abs(index - volume.grid_dims.w), volume.grid_dims.w >= 0.0);
 }
 
-// Whether the field at `index` is at or beyond the iso threshold. The
-// `transfer.y` term excludes unmeasured air: without it a diverging centre
-// would read the no-data index 0 as a strong inbound crossing and shrink-wrap
-// the whole coverage cone.
-fn iso_hit_test(index: f32) -> bool {
-    return index > volume.transfer.y && iso_field(index) >= volume.eye_in_box.w;
+// Whether the field at `sample` — (index, coverage), as `field_at` returns it
+// — is at or beyond the iso threshold.
+//
+// The coverage term excludes unmeasured air, and it is what the old
+// `index > transfer.y` term was standing in for: without an air test a
+// diverging centre reads the no-data index 0 as a strong inbound crossing and
+// shrink-wraps the whole coverage cone, and for ρHV — whose centre sits at the
+// *top* of its ramp — index 0 is the most extreme "hit" the field can produce.
+// Coverage says the same thing directly, for every product, and it says it
+// without borrowing the palette's fade band, which is a statement about the
+// table rather than about no-data.
+fn iso_hit_test(sample: vec2<f32>) -> bool {
+    return sample.y >= COVERAGE_FLOOR && iso_field(sample.x) >= volume.eye_in_box.w;
 }
 
 // The crossing parameter between a sample outside the surface at `t_lo` and
@@ -408,13 +545,29 @@ fn refine_iso_hit(eye: vec3<f32>, direction: vec3<f32>, t_lo_in: f32, t_hi_in: f
     var hi = t_hi_in;
     for (var i: i32 = 0; i < ISO_REFINE_STEPS; i = i + 1) {
         let mid = 0.5 * (lo + hi);
-        if iso_hit_test(density_at(eye + direction * mid)) {
+        if iso_hit_test(field_at(eye + direction * mid)) {
             hi = mid;
         } else {
             lo = mid;
         }
     }
     return hi;
+}
+
+// The isosurface's own level-set function at `p`, coverage-premultiplied:
+// `iso_field(index) x coverage`.
+//
+// The coverage factor is the same move `shading_field` makes one level down,
+// for the same reason. `iso_field` of an air sample is meaningless — for ρHV,
+// whose centre is at the top of the ramp, it is the largest value the function
+// takes — so an unweighted difference across the data boundary would point the
+// normal into the air rather than out of it. Multiplying by coverage sends air
+// to zero, which reads as "far outside the surface" for every product, and
+// inside the data coverage is 1 so the level set is exactly the one
+// `iso_hit_test` uses.
+fn iso_shading_field(p: vec3<f32>) -> f32 {
+    let sample = field_at(p);
+    return iso_field(sample.x) * sample.y;
 }
 
 // `shading`, over the isosurface's own field: the normal must belong to the
@@ -430,12 +583,12 @@ fn iso_shading(p: vec3<f32>) -> f32 {
         volume.box_size_km.z * volume.box_size_km.w,
     ) * voxel;
     let gradient = vec3<f32>(
-        iso_field(density_at(p + vec3<f32>(voxel.x, 0.0, 0.0)))
-            - iso_field(density_at(p - vec3<f32>(voxel.x, 0.0, 0.0))),
-        iso_field(density_at(p + vec3<f32>(0.0, voxel.y, 0.0)))
-            - iso_field(density_at(p - vec3<f32>(0.0, voxel.y, 0.0))),
-        iso_field(density_at(p + vec3<f32>(0.0, 0.0, voxel.z)))
-            - iso_field(density_at(p - vec3<f32>(0.0, 0.0, voxel.z))),
+        iso_shading_field(p + vec3<f32>(voxel.x, 0.0, 0.0))
+            - iso_shading_field(p - vec3<f32>(voxel.x, 0.0, 0.0)),
+        iso_shading_field(p + vec3<f32>(0.0, voxel.y, 0.0))
+            - iso_shading_field(p - vec3<f32>(0.0, voxel.y, 0.0)),
+        iso_shading_field(p + vec3<f32>(0.0, 0.0, voxel.z))
+            - iso_shading_field(p - vec3<f32>(0.0, 0.0, voxel.z)),
     ) / cell_km;
     let ambient = volume.light_dir_ambient.w;
     let magnitude = length(gradient);
@@ -451,7 +604,7 @@ fn iso_shading(p: vec3<f32>) -> f32 {
 // the value there, always gradient-lit — an unlit opaque surface is a
 // silhouette, so the isosurface shades on every quality rung.
 fn iso_surface_colour(p: vec3<f32>) -> vec3<f32> {
-    let index = density_at(p);
+    let index = field_at(p).x;
     let entry = textureSampleLevel(lut_texture, lut_sampler, lut_coord(index), 0.0);
     return linear_from_gamma_rgb(entry.rgb) * iso_shading(p);
 }
@@ -550,7 +703,9 @@ fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
             break;
         }
         let p = eye + direction * t;
-        let index = density_at(p);
+        let sample = field_at(p);
+        let index = sample.x;
+        let coverage = sample.y;
         if iso {
             // First crossing wins: refine it between this sample and the
             // last, paint it opaque and lit, and the march is over. The
@@ -558,14 +713,14 @@ fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
             // zero transmittance, so ground behind it stays hidden and
             // ground beside it stays visible, which is what puts the
             // isosurface ON the map floor rather than over it.
-            if iso_hit_test(index) {
+            if iso_hit_test(sample) {
                 let hit_t = refine_iso_hit(eye, direction, max(t - dt, span.x), t);
                 let colour = iso_surface_colour(eye + direction * hit_t);
                 accumulated = accumulated + transmittance * colour;
                 transmittance = 0.0;
                 break;
             }
-        } else if index > volume.transfer.y {
+        } else if coverage >= COVERAGE_SKIP && index > volume.transfer.y {
             let entry = textureSampleLevel(lut_texture, lut_sampler, lut_coord(index), 0.0);
             // The table holds gamma-encoded colour, because it is produced by
             // the same `get_color_for_value` the 2D products paint with.
@@ -583,15 +738,24 @@ fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
             // At `transfer.w = 0` (the uniform's default) the divisor's 1e-6
             // floor makes the ramp reach 1 within a millionth of an index step
             // of the threshold: the hard edge, to more precision than an
-            // R8Unorm fetch can express. The production bridge passes a real
+            // eight-bit index can express. The production bridge passes a real
             // width, which is what dissolves the palette's alpha cliff into a
             // fade — the hard shelf rims of the 2026-08-09 report — and it is
             // a *render* of the same data, softened exactly at the boundary
             // the palette already declares, never a reshaping of the field.
             let rise = clamp((index - volume.transfer.y) / max(volume.transfer.w, 1e-6), 0.0, 1.0);
             let opacity_ramp = rise * rise * (3.0 - 2.0 * rise);
+            // Coverage scales the OPTICAL DEPTH, which is the same weighting
+            // the reconstruction uses, applied to absorption: a sample whose
+            // footprint is 60% measured absorbs 60% of what a fully measured
+            // one would. It is 1 everywhere inside the data, so nothing in the
+            // interior moves; across the outermost voxel it falls smoothly to
+            // 0, which is what turns the silhouette from a step in alpha into
+            // a ramp — and because the tent is a partition of unity the total
+            // optical depth along a ray is the hard field's own, redistributed
+            // rather than added to. See COVERAGE_SKIP.
             let absorbed =
-                1.0 - exp(-entry.a * opacity_ramp * volume.transfer.x * segment_km);
+                1.0 - exp(-entry.a * opacity_ramp * coverage * volume.transfer.x * segment_km);
             accumulated = accumulated + transmittance * absorbed * colour;
             transmittance = transmittance * (1.0 - absorbed);
             if transmittance < volume.transfer.z {

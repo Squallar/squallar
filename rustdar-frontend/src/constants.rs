@@ -231,7 +231,7 @@ pub const VOLUME_GRID_CELLS: [u32; 3] = DESKTOP_VOLUME_GRID_CELLS;
 
 /// Bytes in the colour lookup table that travels with a voxel grid.
 ///
-/// The grid holds one-byte palette indices, so the table is the 256 RGBA entries
+/// The grid holds palette indices, so the table is the 256 RGBA entries
 /// they index — 1 KiB, on every target. It carries **alpha**, which is what makes
 /// the per-product transparency floors the raymarcher's transfer function for
 /// free, so it cannot be dropped to three bytes per entry.
@@ -259,17 +259,41 @@ pub const WEBGL2_MAX_TEXTURE_DIMENSION_3D: u32 =
 /// enforces it and `the_volume_budget_is_not_slack_enough_to_hide_a_doubling`
 /// keeps it snug.
 ///
-/// One pane shows one volume, so the figure is one `R8Unorm` grid plus its LUT:
+/// One pane shows one volume, so the figure is one grid texture plus its LUT.
+/// The grid is [`crate::volume::VOLUME_TEXTURE_FORMAT`] — `Rg8Unorm`,
+/// **two** bytes a cell: `R = coverage × index`, `G = coverage` — and it
+/// carries `volume::raymarch::GRID_MIP_LEVELS` levels, the raw field and the
+/// hand-built box mean below it:
 ///
-/// | target  | grid          | grid bytes | + LUT     | budget    |
-/// |---------|---------------|-----------:|----------:|----------:|
-/// | desktop | 256x256x128   |      8 MiB |  8.001 MiB|    12 MiB |
-/// | mobile  | 192x192x96    |  3.375 MiB |  3.376 MiB|     5 MiB |
-/// | wasm32  | 128x128x64    |      1 MiB |  1.001 MiB|   1.5 MiB |
+/// | target  | grid        | mip 0     | mip 1     | + LUT      | budget |
+/// |---------|-------------|----------:|----------:|-----------:|-------:|
+/// | desktop | 256x256x128 |    16 MiB |     2 MiB | 18.001 MiB | 24 MiB |
+/// | mobile  | 192x192x96  |  6.75 MiB | 0.844 MiB |  7.595 MiB | 10 MiB |
+/// | wasm32  | 128x128x64  |     2 MiB |  0.25 MiB |  2.251 MiB |  3 MiB |
 ///
-/// Every arm keeps ~1.5x headroom, which is deliberate: enough for the alignment
-/// and driver overhead a real 3D texture allocation carries, not enough to hide
-/// a doubled axis.
+/// Every arm keeps ~1.33x headroom, which is deliberate: enough for the
+/// alignment and driver overhead a real 3D texture allocation carries, not
+/// enough to hide a doubled axis.
+///
+/// # What the coverage channel cost, arm by arm
+///
+/// The second channel doubled mip 0 and mip 1 alike (8 → 16 MiB desktop,
+/// 1 → 2 MiB wasm32), and the mip level — which the previous budget did not
+/// count at all, letting it ride in the headroom — is now named. Against the
+/// old ceilings that is desktop 9 → 18 MiB against 12, mobile 3.80 → 7.59
+/// against 5, wasm32 1.13 → 2.25 against 1.5: **no arm's old budget absorbs
+/// it**, so all three ceilings move, in the same 1.33x proportion.
+///
+/// The wasm32 arm is the one worth arguing rather than asserting, because it
+/// is the tight target. +1.5 MiB, and it is **not** linear memory: a WebGL2
+/// 3D texture lives in the GPU's own allocation, and what crosses linear
+/// memory is the one-byte-per-cell index plane the worker built (unchanged at
+/// 1 MiB — coverage is exactly `index != 0`, so it is synthesised at upload
+/// and never travels) plus the transient staging copy of the 2 MiB
+/// premultiplied plane. For scale, the same target budgets 48 MiB for loop
+/// textures, so this is a 3% move against the largest thing on the page and
+/// no grid-spec change is needed: every axis stays at or under the
+/// [`WEBGL2_MAX_TEXTURE_DIMENSION_3D`] guarantee and no shape shrinks.
 ///
 /// **This budgets the volume texture only.** The pane-sized `Rgba8Unorm`
 /// offscreen target the raymarch renders into is a separate cost, and it has
@@ -291,11 +315,11 @@ pub const VOLUME_TEXTURE_BUDGET_BYTES: usize = MOBILE_VOLUME_TEXTURE_BUDGET_BYTE
 pub const VOLUME_TEXTURE_BUDGET_BYTES: usize = DESKTOP_VOLUME_TEXTURE_BUDGET_BYTES;
 
 /// The wasm32 arm of [`VOLUME_TEXTURE_BUDGET_BYTES`].
-pub const WASM_VOLUME_TEXTURE_BUDGET_BYTES: usize = 1536 * 1024;
+pub const WASM_VOLUME_TEXTURE_BUDGET_BYTES: usize = 3 * 1024 * 1024;
 /// The mobile arm. See [`VOLUME_TEXTURE_BUDGET_BYTES`].
-pub const MOBILE_VOLUME_TEXTURE_BUDGET_BYTES: usize = 5 * 1024 * 1024;
+pub const MOBILE_VOLUME_TEXTURE_BUDGET_BYTES: usize = 10 * 1024 * 1024;
 /// The desktop arm. See [`VOLUME_TEXTURE_BUDGET_BYTES`].
-pub const DESKTOP_VOLUME_TEXTURE_BUDGET_BYTES: usize = 12 * 1024 * 1024;
+pub const DESKTOP_VOLUME_TEXTURE_BUDGET_BYTES: usize = 24 * 1024 * 1024;
 
 /// The largest pane, in physical pixels, the offscreen budget is sized for.
 ///

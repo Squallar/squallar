@@ -683,34 +683,44 @@ fn the_guards_paint_cannot_be_tested_through_are_still_in_it() {
         "`paint` no longer halves the march step on the cloud rung, so the \
              jitter's per-step opacity residual returns as a visible stipple",
     );
-    // The boundary-honesty override, same untestable-through-`paint`
-    // class, and it must sit AFTER the rung block: nearest is not a
-    // quality decision but an honesty one, so a product on the no-blend
-    // list marches nearest on every rung. Deleting it leaves every host
-    // test green and brings back the KLOT NROT green arcs — a lit volume
-    // painting anticyclonic-band colours at every data/no-data boundary
-    // of a field with almost no rotation in it (the measurement lives at
-    // `no_data_blends_at_ramp_bottom`).
-    {
-        let rung = body
-            .find("uniform.step_cells = CLOUD_STEP_CELLS")
-            .expect("asserted present above");
-        assert!(
-            body[rung..].contains(
-                "if !rustdar_radar::voxel::no_data_blends_at_ramp_bottom(grid.product())"
-            ),
-            "`paint` no longer consults the boundary-honesty table after \
-                 the rung block, so a diverging product's no-data boundary is \
-                 filtered through palette bands its data never occupied",
-        );
-        assert!(
-            body[rung..].contains("uniform.reconstruction_lod = NEAREST_RECONSTRUCTION"),
-            "`paint` no longer selects nearest reconstruction for the \
-                 no-blend products — the trilinear tent at the no-data \
-                 boundary manufactures the very colours the products WP's \
-                 honesty invariant exists to prevent",
-        );
-    }
+    // And the isosurface's exemption from it, pinned here for the same
+    // reason: no host test can reach `paint` with a `Ready` grid, and the
+    // failure is invisible in every other suite — the line's absence passed
+    // 13/13 volume_gpu, 10/10 silhouette and 151/151 lib while deleting a
+    // lone measured voxel from the 3D surface outright at the shipped region
+    // rung. The measurement lives in
+    // `an_isosurface_at_the_shipped_rung_keeps_its_sub_kernel_features`.
+    let isosurface_arm = body
+        .split_once("VolumeViewMode::Isosurface")
+        .map(|(_, rest)| rest)
+        .unwrap_or_default();
+    assert!(
+        isosurface_arm.contains("uniform.reconstruction_lod = 0.0"),
+        "`paint` marches the isosurface at the cloud rung's smoothed \
+             reconstruction. An isosurface is a level set of the field, so the \
+             smoothing moves the surface rather than softening its rendering, \
+             and `volume.wgsl`'s COVERAGE_FLOOR of 0.5 is a statement about \
+             the RAW tent: above level 0 a lone measured voxel reconstructs to \
+             coverage 0.125 and a one-cell sheet to 0.502, and the cut erases \
+             them. Both shipped region rungs take the full LOD",
+    );
+    // The boundary-honesty override that used to sit here is GONE, and its
+    // absence is asserted rather than merely un-tested. It read
+    // `if !rustdar_radar::voxel::no_data_blends_at_ramp_bottom(...)` and
+    // pinned the reconstruction to nearest for the seven products whose
+    // ramp bottom is a real value — honest, and blocky. The volume texture
+    // is coverage-premultiplied `Rg8Unorm` now (`volume::VOLUME_TEXTURE_FORMAT`),
+    // so a filtered sample beside empty air reconstructs inside the convex
+    // hull of the stored indices for every product and there is nothing left
+    // to override. Reinstating a per-product reconstruction decision here
+    // would be a silent regression back to a blocky march for seven of the
+    // nine, so it fails.
+    assert!(
+        !body.contains("no_data_blends_at_ramp_bottom") && !body.contains("NEAREST"),
+        "`paint` makes a per-product reconstruction decision again: the \
+             coverage channel retired that split, and re-adding it sends \
+             seven of the nine products back to a nearest march",
+    );
     // The floor's flag-and-texture pairing: the flag must be exactly
     // "a floor is in hand and the pane asked", or the shader composites
     // a ground nobody bound (a transparent no-op that claims to draw) or

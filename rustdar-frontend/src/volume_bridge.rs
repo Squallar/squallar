@@ -57,12 +57,33 @@
 //! curve: a curve cannot un-refuse a table (nor re-refuse one — a user who
 //! paints their curve opaque gets the block they drew, on purpose).
 //!
-//! One thing this deliberately is *not*: a fix for the *interpolation* half
-//! of the story. The volume texture is sampled `Linear`, so a fetch at a
-//! data/no-data boundary still sweeps the bottom of the ramp inside one
-//! voxel; the profiles make that sweep land at reduced or zero alpha, but the
-//! clean fix remains a second channel saying "this cell has data" — a format
-//! change, not a transfer function.
+//! # The interpolation half of the story, and the second channel that fixed it
+//!
+//! This module's doc used to end by naming what the transfer function could
+//! not repair: the volume texture was sampled `Linear` over `R8Unorm` palette
+//! indices, so a fetch at a data/no-data boundary swept the bottom of the ramp
+//! inside one voxel — for the two sequential moments harmlessly, and for the
+//! other seven straight through palette bands the data never occupied. The
+//! shipped mitigation was a per-product table that sent those seven to a
+//! nearest-neighbour march: honest, and blocky.
+//!
+//! The clean fix it named — "a second channel saying *this cell has data*" —
+//! is what the volume texture now carries. `VOLUME_TEXTURE_FORMAT` is
+//! `Rg8Unorm` holding `R = coverage × index`, `G = coverage`; the shader
+//! filters both `Linear` and reconstructs `index = R̄ / Ḡ`, the
+//! coverage-weighted mean over covered texels alone. Air contributes 0 to
+//! numerator and denominator alike, so it cannot drag a boundary sample
+//! anywhere — the reconstruction lands inside the convex hull of the stored
+//! indices around it, for every product. The per-product table and the nearest
+//! path are both gone: all nine products take one reconstruction, and this
+//! module no longer makes a per-product decision about it at all.
+//!
+//! What survives here is exactly the transfer-function half above: the
+//! profiles, the refusal gate, the fade-anchored skip threshold and
+//! [`EDGE_SOFT_WIDTH`]. Those are statements about the *palette*, and coverage
+//! is a statement about the *measurement*; they were only ever entangled
+//! because the palette's fade band was standing in for a mask the texture did
+//! not carry.
 
 use std::any::Any;
 use std::borrow::Cow;
@@ -79,7 +100,7 @@ use crate::egui_renderer::AttachmentConfig;
 use crate::volume::VolumeSupport;
 use crate::volume::quality::VolumeQuality;
 use crate::volume::raymarch::{OffscreenTarget, VolumePipelines, VolumeTextures};
-use crate::volume::uniform::{NEAREST_RECONSTRUCTION, VolumeUniform};
+use crate::volume::uniform::VolumeUniform;
 
 /// The fewest see-through entries a grid's table may have, anywhere on its
 /// ramp, before this renderer refuses to draw a volume through it.
@@ -924,21 +945,12 @@ impl VolumePainter for BridgeVolumePainter {
         // from this grid's own cell size: full smoothing where the data
         // outresolves the display, none where the kernel would be wider than
         // the features — see `cloud_reconstruction_lod_for` for the Harvey
-        // measurement behind the taper.
+        // measurement behind the taper. The isosurface branch below takes the
+        // level back to 0 for itself; see the reasoning there.
         uniform.gradient_shading = fitted.quality.shading.is_on();
         if fitted.quality.shading.is_on() {
             uniform.reconstruction_lod = cloud_reconstruction_lod_for(largest_cell_km(&uniform));
             uniform.step_cells = CLOUD_STEP_CELLS;
-        }
-        // After the rung, unconditionally: for the products whose ramp bottom
-        // is a real value rather than an absence, every filtering
-        // reconstruction — the raw trilinear tent as much as the cloud
-        // rung's mip blend — drags boundary samples through palette bands
-        // the data never occupied (the KLOT NROT arcs; measurement at
-        // `no_data_blends_at_ramp_bottom`). Those march nearest on every
-        // rung.
-        if !rustdar_radar::voxel::no_data_blends_at_ramp_bottom(grid.product()) {
-            uniform.reconstruction_lod = NEAREST_RECONSTRUCTION;
         }
         // The march's transfer edge, anchored at the **effective** fade
         // boundary: the palette's own unless a Volume Alpha curve is applied,
@@ -957,16 +969,81 @@ impl VolumePainter for BridgeVolumePainter {
 
         // The view mode. In isosurface mode the two formerly-reserved lanes
         // carry the crossing parameters, translated against this grid's own
-        // ramp so the surface sits exactly where the ramp puts the value —
-        // and the skip threshold drops back to the index-0 default: the
-        // isosurface reads the DATA, so neither the palette's fade band nor
-        // the user's Volume Alpha curve may move where the surface sits.
-        // (The sidebar says the same to the user when a curve is active.)
+        // ramp so the surface sits exactly where the ramp puts the value.
+        //
+        // The skip threshold drops back to the index-0 default for tidiness
+        // rather than for effect: the shader reads `transfer.y` only in the
+        // lit arm, so on this branch the lane is never fetched at all. What
+        // the assignment does is keep the uniform *honest* — a struct dumped
+        // in a capture, or read by an instrument, says index 0 rather than
+        // carrying a fade band that has no bearing on where this pane's
+        // surface sits. The property it stands for is real and is enforced by
+        // the shader's shape: the isosurface reads the DATA, so neither the
+        // palette's fade band nor the user's Volume Alpha curve can move the
+        // surface. (The sidebar says the same to the user when a curve is
+        // active.)
+        //
+        // # Why the isosurface marches the RAW field
+        //
+        // The smoothed reconstruction is a *presentation* knob — that is
+        // exactly [`CLOUD_RECONSTRUCTION_LOD`]'s stated contract, and it holds
+        // for the lit volume, where the level widens a reconstruction kernel
+        // and the march integrates whatever comes out. It does **not** hold
+        // here. An isosurface is a level set of the field: smoothing the field
+        // moves the surface, so on this path the knob stops being a render
+        // softness and becomes a reshaping of the object being drawn.
+        //
+        // And it erases. `volume.wgsl`'s `COVERAGE_FLOOR` is 0.5 because 0.5
+        // is the nearest-neighbour decision boundary *of the raw trilinear
+        // tent* — a level-0 statement, and the only level at which it is one.
+        // At level 1 the coverage field is a two-cell box convolved with that
+        // tent, so a lone measured voxel reconstructs to coverage 0.125 and a
+        // one-cell sheet to 0.502, and a `>= 0.5` cut deletes them. Measured
+        // by `an_isosurface_at_the_shipped_rung_keeps_its_sub_kernel_features`
+        // — sequential isosurface at threshold 100/255, 128 x 128 px, one
+        // camera, same fixtures at both levels:
+        //
+        //   lone voxel:    level 0    74 px    level 1      0 px
+        //   1-cell sheet:  level 0 16384 px    level 1    782 px  (-95%)
+        //
+        // Both shipped region rungs take level 1 from the taper above, so that
+        // is a narrow hail core, a TDS shell, an updraft tip or a bright-band
+        // sheet vanishing from the 3D surface while the 2D pane and the lit
+        // volume both still show it — the erasure class the mip work and the
+        // taper were themselves added to close. It is a regression rather than
+        // a pre-existing loss: on `main` at 3b41eb64, same fixtures and camera,
+        // the smoothing GREW the lone voxel (128 px at level 0 to 591 at level
+        // 1) and left the sheet whole at 16384.
+        //
+        // Scaling the cut with the level was the alternative and is worse: any
+        // cut that survives a lone voxel is at or under 0.125, which abandons
+        // the nearest-neighbour reading the constant is chosen for, and it
+        // would make the surface's reach a function of the *quality rung* — a
+        // level set of data that moves when a device steps down. Level 0
+        // instead makes `COVERAGE_FLOOR`'s contract true rather than
+        // aspirational, and costs nothing in smoothness: the raw tent is
+        // continuous and `refine_iso_hit` bisects to under 1/256 of a step, so
+        // the surface is smooth rather than a staircase of cube faces, which
+        // is the whole claim.
+        //
+        // What it does cost, stated rather than buried: a lone voxel draws at
+        // 74 px where `main` drew 591. Most of that gap is the smoothing
+        // dilating a one-cell feature across its whole coarse texel — surface
+        // painted where nothing was measured, which for an *opaque* surface is
+        // a claim about a core's size rather than the haze it reads as in the
+        // lit volume. The remainder (74 against main's 128 at level 0) is the
+        // 3-D corner clipping `COVERAGE_FLOOR` documents: a rounded nearest
+        // reach instead of the old index gate's near-full cube. Both are the
+        // design; erasure was not.
+        //
+        // `step_cells` is untouched — that is march density, not
+        // reconstruction, and a finer comb only helps the crossing be found.
         if frame.view_mode == rustdar_egui::pane::VolumeViewMode::Isosurface {
             let (centre, threshold) = grid.iso_uniform_params(frame.iso_threshold);
             uniform.iso_centre = centre;
             uniform.iso_threshold = threshold;
             uniform.empty_index_threshold = empty_index_threshold_for(0);
+            uniform.reconstruction_lod = 0.0;
         }
 
         // The floor: drawn only when the pane wants it AND one is in hand.
@@ -1102,7 +1179,7 @@ pub struct VolumeResources {
 ///
 /// The curve is the staleness key for the 1 KiB LUT alone: the grid beside it
 /// never changes for a given store id, so an edit rewrites the table in place
-/// (`VolumeTextures::write_lut`) instead of re-uploading 8 MiB of indices.
+/// (`VolumeTextures::write_lut`) instead of re-uploading 16 MiB of texels.
 /// Compared every frame, rewritten only on change — `AlphaCurve`'s equality
 /// takes the `Arc` pointer fast path, so the steady-state cost of an open
 /// editor is one pointer comparison per pane per frame.
@@ -1215,7 +1292,7 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
                 let upload = occupied.into_mut();
                 // The Volume Alpha seam's steady state: rewrite the 1 KiB
                 // table only when the curve actually changed — a pointer
-                // comparison almost every frame — and leave the 8 MiB grid
+                // comparison almost every frame — and leave the 16 MiB grid
                 // untouched always. `effective_lut` with `None` is the grid's
                 // own bytes, so clearing a curve restores the palette
                 // bit-exactly through the very same path that applied it.
