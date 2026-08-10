@@ -24,7 +24,7 @@ jobs:
     name: ${{ matrix.name }}
     runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/usa-reddragon/rust-cross:1.97.1
+      image: ghcr.io/usa-reddragon/rust-cross:1.97.1@sha256:433d3e61c46c6dea2e0bb0bc450fe34415d9769f6d801ab1f2e2ebbdbcf50c28
     defaults:
       run:
         shell: bash

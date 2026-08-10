@@ -68,7 +68,7 @@ SHELL := bash
 ROOT := $(realpath $(CURDIR)/..)
 
 # Digest-pinned to the same image the CI matrix uses.
-IMAGE ?= ghcr.io/usa-reddragon/rust-cross:1.97.1
+IMAGE ?= ghcr.io/usa-reddragon/rust-cross:1.97.1@sha256:433d3e61c46c6dea2e0bb0bc450fe34415d9769f6d801ab1f2e2ebbdbcf50c28
 # Named volume for the crate cache, so a rebuild does not re-download the index.
 CARGO_VOL ?= rustdar-xcross-cargo
 # arm64 by default: it is what every Mac sold since 2020 is, and the one arch
