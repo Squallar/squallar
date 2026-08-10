@@ -493,8 +493,9 @@ static PRECIP_RATE: ColorScale = &(
 /// name for the palette's own first visible class, taken by reference from
 /// the algorithm that produces the field.
 ///
-/// `as f32` of an `f64` 0.25 is exact — it is a power of two over four — so
-/// no rounding sits between the despeckle's `>=` and this `<`.
+/// `as f32` of an `f64` 0.25 is exact — 0.25 is 2⁻², a power of two, and
+/// every power of two in `f64`'s exponent range is representable in `f32` —
+/// so no rounding sits between the despeckle's `>=` and this `<`.
 const NROT_FIRST_CLASS: f32 = crate::nrot::SIGNIFICANT as f32;
 
 /// NROT cyclonic / positive rotation (unitless)
