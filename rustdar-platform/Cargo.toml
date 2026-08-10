@@ -123,7 +123,7 @@ rustdar-gps = { workspace = true, features = ["serial"] }
 # and test rows. That is the trade being made deliberately: the whole provider
 # is written against `zbus::blocking` with no async and no executor, on a
 # thread whose entire job is to sit in a blocking `next()`.
-zbus = "=5.18.0"
+zbus = "=5.19.0"
 # For `GpsFix::timestamp`, which is a `chrono::NaiveDateTime` and arrives from
 # GeoClue as a `(tt)` pair of epoch seconds and microseconds. Already in the
 # graph via `rustdar-gps`; named here because this crate now converts one.
