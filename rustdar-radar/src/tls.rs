@@ -354,8 +354,13 @@ mod tests {
         // literals, so today they do not appear in this module's own source —
         // but that is an accident of formatting, not a property, and `cargo fmt`
         // could end it without a word.
+        //
+        // Cut on the `#[cfg]` rather than the `mod tests {` it guards: the
+        // attribute is what survives the test body moving to its own file,
+        // where the `mod tests {` line does not. `cfg(all(test` appears exactly
+        // once in this file, so the cut lands in the same place either way.
         let (code, _) = source
-            .split_once("\nmod tests {")
+            .split_once("\n#[cfg(all(test")
             .expect("tls.rs no longer has a test module");
         let needle = format!("{cfg}\n{signature}");
         // Exactly one definition, checked before it is read: two would mean the
