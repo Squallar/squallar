@@ -52,9 +52,24 @@ const NROT_LIMIT: f64 = 5.0;
 /// painting starts. Measured provenance: branch `campaign-harness`.
 const MIN_RANGE_NM: f64 = 6.75;
 
-/// Blank painted clusters (8-connected runs of |NROT| ≥ 0.25) smaller than
-/// this many bins. Empirical, chosen to match the reference's painted
-/// density. Measured provenance: branch `campaign-harness`.
+/// The magnitude at which this algorithm considers a bin **painted** — the
+/// significance floor of the whole product, and the one number every consumer
+/// of an NROT field has to agree with.
+///
+/// It is the threshold [`despeckle_nrot`] runs its 8-connected components
+/// over: a bin under it is not part of any cluster, is never counted toward
+/// [`DESPECKLE_MIN_BINS`], and survives only as a value nothing downstream is
+/// meant to draw attention to. The 2D palette starts its first colour class
+/// here too (`palette::NROT_CYCLONIC`'s "weak: slate…" stop), and the 3D
+/// transparency profile takes its clear point from this constant by reference
+/// (`voxel::volume_alpha_profile::NROT_CLEAR`) — so the value the algorithm
+/// calls significant, the value the plan view first colours and the value the
+/// volume first makes visible are one number and cannot drift apart.
+pub const SIGNIFICANT: f64 = 0.25;
+
+/// Blank painted clusters (8-connected runs of |NROT| ≥ [`SIGNIFICANT`])
+/// smaller than this many bins. Empirical, chosen to match the reference's
+/// painted density. Measured provenance: branch `campaign-harness`.
 const DESPECKLE_MIN_BINS: usize = 4;
 
 /// A velocity sweep as a dense azimuth × range grid. NaN marks missing data.
@@ -91,8 +106,8 @@ pub fn compute_nrot_grid_with_profile(
 }
 
 /// Blank painted clusters smaller than `min_bins`: 8-connected components of
-/// |NROT| ≥ 0.25 (either sign — a tiny dipole is still speckle). Azimuth
-/// wraps; range does not.
+/// |NROT| ≥ [`SIGNIFICANT`] (either sign — a tiny dipole is still speckle).
+/// Azimuth wraps; range does not.
 fn despeckle_nrot(grid: &mut [Vec<f64>], min_bins: usize) {
     let num_radials = grid.len();
     if num_radials == 0 {
@@ -101,7 +116,7 @@ fn despeckle_nrot(grid: &mut [Vec<f64>], min_bins: usize) {
     let gate_count = grid[0].len();
     let painted = |g: &[Vec<f64>], i: usize, j: usize| {
         let v = g[i][j];
-        !v.is_nan() && v.abs() >= 0.25
+        !v.is_nan() && v.abs() >= SIGNIFICANT
     };
     let mut seen = vec![false; num_radials * gate_count];
     let mut stack = Vec::new();

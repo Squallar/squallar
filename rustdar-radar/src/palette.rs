@@ -158,8 +158,13 @@ fn velocity_lookup(velocity_ms: f32) -> (u8, u8, u8, u8) {
 }
 
 /// Positive NROT is cyclonic, negative anticyclonic.
+///
+/// Nothing under [`nrot::SIGNIFICANT`](crate::nrot::SIGNIFICANT) is painted at
+/// all — the same floor the algorithm's own despeckle counts clusters over —
+/// so the first visible class of this palette *is* that constant, and the
+/// tables below start their first stop on it.
 fn nrot_lookup(nrot: f32) -> (u8, u8, u8, u8) {
-    if nrot.is_nan() || nrot.is_infinite() || nrot.abs() < 0.25 {
+    if nrot.is_nan() || nrot.is_infinite() || nrot.abs() < NROT_FIRST_CLASS {
         return (0, 0, 0, 0);
     }
     let (r, g, b) = if nrot > 0.0 {
@@ -484,12 +489,20 @@ static PRECIP_RATE: ColorScale = &(
     true,
 );
 
+/// The NROT tables' first stop, and the cut in [`nrot_lookup`] above: one
+/// name for the palette's own first visible class, taken by reference from
+/// the algorithm that produces the field.
+///
+/// `as f32` of an `f64` 0.25 is exact — it is a power of two over four — so
+/// no rounding sits between the despeckle's `>=` and this `<`.
+const NROT_FIRST_CLASS: f32 = crate::nrot::SIGNIFICANT as f32;
+
 /// NROT cyclonic / positive rotation (unitless)
 static NROT_CYCLONIC: ColorScale = &(
     &[
-        (0.25, (64, 64, 128)), // weak: slate...
-        (0.999, (0, 0, 255)),  // ...to blue
-        (1.0, (0, 192, 0)),    // significant: green...
+        (NROT_FIRST_CLASS, (64, 64, 128)), // weak: slate...
+        (0.999, (0, 0, 255)),              // ...to blue
+        (1.0, (0, 192, 0)),                // significant: green...
         (1.499, (64, 255, 64)),
         (1.5, (192, 192, 64)), // strong: olive to yellow
         (1.999, (255, 255, 0)),
@@ -505,7 +518,7 @@ static NROT_CYCLONIC: ColorScale = &(
 /// NROT anticyclonic / negative rotation (thresholds = abs values)
 static NROT_ANTICYCLONIC: ColorScale = &(
     &[
-        (0.25, (48, 96, 64)), // weak: dim green...
+        (NROT_FIRST_CLASS, (48, 96, 64)), // weak: dim green...
         (0.999, (96, 192, 128)),
         (1.0, (0, 160, 0)), // significant: green,
         (2.0, (0, 255, 0)), // brightening and then solid

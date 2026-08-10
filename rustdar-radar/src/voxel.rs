@@ -1058,12 +1058,46 @@ mod volume_alpha_profile {
     /// the couplet cores the product exists to show sit beyond ±20 m/s.
     /// (The constants are velocity's own, reused at the profile table.)
     ///
-    /// Normalized rotation: clear under |0.4| (the shear noise floor — the
-    /// 2D palette's own first visible class), opaque at |1.0| and beyond,
-    /// the mesocyclone convention GR pins its meso class to. A rotation
-    /// volume is then a pair of standing columns where couplets stack.
-    pub const NROT_CLEAR: f32 = 0.4;
+    /// Normalized rotation: clear under [`crate::nrot::SIGNIFICANT`], opaque at
+    /// |1.0| and beyond — the mesocyclone convention GR pins its meso class
+    /// to. A rotation volume is then a pair of standing columns where
+    /// couplets stack.
+    ///
+    /// The clear point is taken **by reference** from the algorithm rather
+    /// than chosen here, and that is the whole point of the constant. NROT's
+    /// palette is class-structured by construction — the `.999`/`.499` stop
+    /// trick spells out weak / significant / strong / very strong / extreme —
+    /// so any clear point above the first class does not soften a gradient,
+    /// it *relocates a class boundary*: everything the algorithm painted
+    /// "weak" is moved into "nothing". A shipped 0.4 did exactly that,
+    /// pushing the nothing→weak edge to ≈0.43 on the smoothstep and rendering
+    /// 8 033 of the 8 039 voxels a real tornado-warned volume painted at a
+    /// mean alpha of 2–4 out of 180: a forecaster saw rotation in the plan
+    /// view and in the section, and an empty box in 3D.
+    ///
+    /// So the number belongs to `nrot`, not to this table. Both halves of the
+    /// old justification were also false as written: the palette's first
+    /// visible class is that constant, not 0.4, and the algorithm's own
+    /// significance floor — what `despeckle_nrot` counts a bin as painted at
+    /// — is that same constant.
+    ///
+    /// Aligning the constant alone is not enough, and this is the second half
+    /// of the fix. A smoothstep leaving 0 at the clear point puts the bottom
+    /// of the *weak class* at alpha 0.005 of the palette's 180 — which rounds
+    /// to zero for the first several ramp indices, so the class boundary
+    /// merely moves from 0.43 to about 0.27 and most of the class is still
+    /// erased. For a gradient moment that would be a fade; for a
+    /// class-structured one it is the same relocation in miniature. So the
+    /// profile **steps where the palette steps**: nothing under the
+    /// significance floor is drawn at all, everything at or over it starts at
+    /// [`NROT_WEAK_ALPHA`] of the palette's own alpha, and the smoothstep
+    /// ramps from there to full strength at the meso convention. A quarter is
+    /// plainly visible against an empty box and plainly subordinate to a
+    /// couplet at full strength; what it is not is a value the algorithm
+    /// painted and the volume did not draw.
+    pub const NROT_CLEAR: f32 = crate::nrot::SIGNIFICANT as f32;
     pub const NROT_OPAQUE: f32 = 1.0;
+    pub const NROT_WEAK_ALPHA: f32 = 0.25;
 
     /// Specific differential phase is sequential like reflectivity: clear
     /// under 0.25 °/km (drizzle and noise — below the estimator's own
@@ -1263,7 +1297,22 @@ fn volume_alpha_scale(product: RadarProduct, value: f32) -> f32 {
         RadarProduct::StormRelativeVelocity => {
             smoothstep(p::VELOCITY_CLEAR_MS, p::VELOCITY_OPAQUE_MS, value.abs())
         }
-        RadarProduct::NormalizedRotation => smoothstep(p::NROT_CLEAR, p::NROT_OPAQUE, value.abs()),
+        // Stepped, not faded, at the significance floor: NROT's palette is
+        // class-structured, so the volume must go visible exactly where the
+        // plan view does. See the profile entry.
+        RadarProduct::NormalizedRotation => {
+            let magnitude = value.abs();
+            if magnitude < p::NROT_CLEAR {
+                0.0
+            } else {
+                (1.0 - p::NROT_WEAK_ALPHA)
+                    .mul_add(
+                        smoothstep(p::NROT_CLEAR, p::NROT_OPAQUE, magnitude),
+                        p::NROT_WEAK_ALPHA,
+                    )
+                    .min(1.0)
+            }
+        }
         RadarProduct::SpecificDifferentialPhase => {
             smoothstep(p::KDP_CLEAR_DEG_KM, p::KDP_OPAQUE_DEG_KM, value)
         }

@@ -389,6 +389,11 @@ const SLOTS: [MomentSlot; 6] = [
 ];
 
 /// The products those moments belong to, in the same order.
+///
+/// Use this **only** where the loop is about a Level II *moment* — an
+/// encoding, a slot, a wire codec. Anything that is about a *product* —
+/// a table, a profile, an isosurface, a round trip — must loop over
+/// [`VOLUME_PRODUCTS`], which is three entries longer.
 const SAMPLABLE: [RadarProduct; 6] = [
     RadarProduct::Reflectivity,
     RadarProduct::Velocity,
@@ -397,6 +402,91 @@ const SAMPLABLE: [RadarProduct; 6] = [
     RadarProduct::DifferentialPhase,
     RadarProduct::CorrelationCoefficient,
 ];
+
+/// The three products the vertical views **derive** rather than sample.
+const DERIVED: [RadarProduct; 3] = [
+    RadarProduct::StormRelativeVelocity,
+    RadarProduct::NormalizedRotation,
+    RadarProduct::SpecificDifferentialPhase,
+];
+
+/// Every product a voxel grid can be built for: the six native moments
+/// then the three derivations.
+///
+/// This constant exists because of the exact defect it now closes. The
+/// commit that admitted SRV, NROT and KDP to every 3D surface — LUT
+/// profile, isosurface shape, isosurface default, cache keys, UI gates —
+/// left every product loop in this module at the six natives, so three
+/// products shipped with no table coverage, no profile coverage and no
+/// isosurface coverage whatsoever. NROT then shipped rendering 8 033 of
+/// 8 039 painted voxels at alpha 2–4 of 180, and nothing went red.
+/// [`the_product_loops_cover_every_product_the_vertical_views_admit`]
+/// makes the next such admission fail here before it can ship.
+const VOLUME_PRODUCTS: [RadarProduct; 9] = [
+    RadarProduct::Reflectivity,
+    RadarProduct::Velocity,
+    RadarProduct::SpectrumWidth,
+    RadarProduct::DifferentialReflectivity,
+    RadarProduct::DifferentialPhase,
+    RadarProduct::CorrelationCoefficient,
+    RadarProduct::StormRelativeVelocity,
+    RadarProduct::NormalizedRotation,
+    RadarProduct::SpecificDifferentialPhase,
+];
+
+/// The ramp a product's colour table is built over, keyed by **product**
+/// — which is what [`build_voxels`] itself does.
+///
+/// The old spelling, `value_range_for(samplable(product).unwrap())`, could
+/// not answer for a derivation at all: it panics on all three, and two of
+/// them carry their own spans ([`data_levels_for`]) rather than their
+/// source slot's. NROT borrows the velocity slot and spans ±4 unitless
+/// where velocity spans ±63.5 m/s; a test that reached for the slot's
+/// range would be measuring a table nothing builds.
+fn ramp_of(product: RadarProduct) -> (f32, f32) {
+    value_range_for_product(product, crate::derive::volume_slot(product).unwrap())
+}
+
+/// The product loops in this module cover **everything** the vertical
+/// views admit — the guard that makes widening the product set impossible
+/// to do quietly.
+///
+/// `derive::volume_slot` is the single predicate every vertical view gates
+/// on (the 3D pane, the section pane, the volume-alpha editor, the grid
+/// builder itself). If a product joins that set without joining
+/// [`VOLUME_PRODUCTS`], it renders in the app and is exercised by nothing
+/// here, which is precisely the state SRV, NROT and KDP shipped in.
+#[test]
+fn the_product_loops_cover_every_product_the_vertical_views_admit() {
+    let admitted: Vec<RadarProduct> = RadarProduct::all()
+        .iter()
+        .copied()
+        .filter(|p| crate::derive::volume_slot(*p).is_some())
+        .collect();
+    let mut covered = VOLUME_PRODUCTS.to_vec();
+    covered.sort_by_key(|p| p.code());
+    let mut want = admitted.clone();
+    want.sort_by_key(|p| p.code());
+    assert_eq!(
+        covered, want,
+        "VOLUME_PRODUCTS is not the set `derive::volume_slot` admits; a \
+             product that renders in a vertical view is covered by no product \
+             loop in this module",
+    );
+    // And the two halves really are a partition, so `SAMPLABLE` cannot be
+    // quietly re-pointed at the whole set and the distinction lost.
+    for product in SAMPLABLE {
+        assert!(samplable(product).is_some(), "{}", product.name());
+    }
+    for product in DERIVED {
+        assert!(
+            samplable(product).is_none() && crate::derive::volume_slot(product).is_some(),
+            "{} is not a derivation",
+            product.name(),
+        );
+    }
+    assert_eq!(SAMPLABLE.len() + DERIVED.len(), VOLUME_PRODUCTS.len());
+}
 
 // ── Shapes, budget and the target default ───────────────────────────────
 
@@ -1532,14 +1622,18 @@ fn the_declared_steps_are_measured() {
 
 // ── The colour table ────────────────────────────────────────────────────
 
-/// All six moments build, all six carry a full table, and all six come
-/// back with data in them — the end-to-end check the single-moment
+/// All nine products build, all nine carry a full table, and all nine
+/// come back with data in them — the end-to-end check the single-moment
 /// fixtures cannot make.
+///
+/// Nine, not six: the three derivations run through `derive::prepare`
+/// inside `build_voxels`, so a derivation that stopped producing a field
+/// would surface here as an empty grid rather than in the app.
 #[test]
-fn every_samplable_moment_builds_a_populated_grid_and_a_full_table() {
+fn every_volume_product_builds_a_populated_grid_and_a_full_table() {
     assert_eq!(LUT_LEN, 1024);
     let scan = six_moment_scan();
-    for product in SAMPLABLE {
+    for product in VOLUME_PRODUCTS {
         let req = VoxelRequest {
             product,
             half_width_km: 40.0,
@@ -1580,8 +1674,8 @@ fn every_samplable_moment_builds_a_populated_grid_and_a_full_table() {
 /// the entire outside of the volume.
 #[test]
 fn the_no_data_entry_is_transparent_for_every_product() {
-    for product in SAMPLABLE {
-        let range = value_range_for(samplable(product).unwrap());
+    for product in VOLUME_PRODUCTS {
+        let range = ramp_of(product);
         let lut = colormap_lut(product, range);
         assert_eq!(
             &lut[0..4],
@@ -1661,8 +1755,8 @@ fn the_table_is_the_palette_function_not_its_stops() {
     //    verbatim, the alpha scaled by the product's own 3D transparency
     //    profile — and by nothing else, so the profile can only ever make
     //    an entry *more* transparent than its plan-view colour.
-    for product in SAMPLABLE {
-        let range = value_range_for(samplable(product).unwrap());
+    for product in VOLUME_PRODUCTS {
+        let range = ramp_of(product);
         let lut = colormap_lut(product, range);
         for index in 1..=255u8 {
             let value = ramp_value(range, index);
@@ -1690,7 +1784,7 @@ fn the_table_is_the_palette_function_not_its_stops() {
 #[test]
 fn the_table_filter_is_nearest_only_for_a_non_gradient_scale() {
     let scan = six_moment_scan();
-    for product in SAMPLABLE {
+    for product in VOLUME_PRODUCTS {
         let req = VoxelRequest {
             product,
             ..request(ODD)
@@ -2002,7 +2096,7 @@ fn the_half_edge_costs_of_both_encodings_are_measured_per_moment() {
 fn the_fade_band_is_measured_per_product() {
     let scan = six_moment_scan();
     let mut measured = Vec::new();
-    for product in SAMPLABLE {
+    for product in VOLUME_PRODUCTS {
         let req = VoxelRequest {
             product,
             ..request(ODD)
@@ -2027,6 +2121,15 @@ fn the_fade_band_is_measured_per_product() {
             ("phi", 0),
             // Bottom = lowest ρHV, the most non-meteorological: opaque.
             ("rho", 0),
+            // Bottom = −63.5 m/s of storm-relative inbound: opaque, for
+            // velocity's reason.
+            ("srv", 0),
+            // Bottom = −4, an extreme anticyclonic couplet: opaque.
+            ("nrot", 0),
+            // 0 … 0.25 °/km, under the estimator's own significance —
+            // KDP's span starts below zero, so the band covers the
+            // negative half of the display clamp as well.
+            ("kdp", 50),
         ],
         "the fade band per product",
     );
@@ -2065,7 +2168,7 @@ fn the_fade_band_is_measured_per_product() {
 #[test]
 fn the_default_transparency_profile_is_measured_per_product() {
     let alpha = |product: RadarProduct, value: f32| {
-        let range = value_range_for(samplable(product).unwrap());
+        let range = ramp_of(product);
         let lut = colormap_lut(product, range);
         lut[usize::from(ramp_index(range, value)) * 4 + 3]
     };
@@ -2073,7 +2176,7 @@ fn the_default_transparency_profile_is_measured_per_product() {
     // 2D palettes are themselves translucent in places, and the profile
     // may only scale them down, never up.
     let palette_alpha = |product: RadarProduct, value: f32| {
-        let range = value_range_for(samplable(product).unwrap());
+        let range = ramp_of(product);
         get_color_for_value(product, ramp_value(range, ramp_index(range, value))).3
     };
     let solid = |product: RadarProduct, value: f32, what: &str| {
@@ -2157,6 +2260,86 @@ fn the_default_transparency_profile_is_measured_per_product() {
         "…but visible everywhere it is measured: no value band is favoured",
     );
 
+    // ── The three derived products ──────────────────────────────────
+    //
+    // Not one of these had a row here when they were admitted to every 3D
+    // surface, and all three defects below shipped in that gap.
+
+    // SRV: velocity's profile, on velocity's own constants.
+    let srv = RadarProduct::StormRelativeVelocity;
+    assert_eq!(alpha(srv, 0.0), 0, "air travelling with the storm");
+    solid(srv, 30.0, "an outbound storm-relative core");
+    solid(srv, -30.0, "an inbound storm-relative core");
+
+    use volume_alpha_profile as p;
+
+    // NROT: the finding. The clear point is the algorithm's own
+    // significance floor, not a number chosen here — NROT's palette is
+    // class-structured, so a higher clear point relocates the
+    // nothing→weak class boundary instead of softening a gradient.
+    let nrot = RadarProduct::NormalizedRotation;
+    assert_eq!(
+        p::NROT_CLEAR,
+        crate::nrot::SIGNIFICANT as f32,
+        "the volume must go visible exactly where the algorithm calls a \
+             bin painted and the palette gives it its first colour",
+    );
+    assert_eq!(alpha(nrot, 0.0), 0, "no rotation");
+    assert_eq!(alpha(nrot, 0.2), 0, "under the significance floor");
+    // The contract, stated exactly: the volume goes visible on precisely
+    // the ramp entries the plan view paints, and on no others. This is
+    // the assertion the shipped profile failed — 8 033 of the 8 039
+    // voxels a real tornado-warned volume painted came back at alpha 2–4
+    // of 180, six of them visible — and it is stronger than the constant
+    // it pins, because a smoothstep starting at 0 rounds the first
+    // several entries of the weak class back to invisible even with the
+    // clear point correct.
+    {
+        let range = ramp_of(nrot);
+        let lut = colormap_lut(nrot, range);
+        let mut painted_and_drawn = 0usize;
+        for index in 1..=255u8 {
+            let value = ramp_value(range, index);
+            let plan = get_color_for_value(nrot, value).3;
+            let volume = lut[usize::from(index) * 4 + 3];
+            assert_eq!(
+                volume > 0,
+                plan > 0,
+                "NROT index {index} ({value:.4}): the plan view paints it \
+                     at {plan} and the volume draws it at {volume}",
+            );
+            if plan > 0 {
+                painted_and_drawn += 1;
+                assert!(
+                    f32::from(volume) >= f32::from(plan) * p::NROT_WEAK_ALPHA - 1.0,
+                    "NROT index {index} ({value:.4}) draws at {volume} of \
+                         {plan}, under the weak class's own floor",
+                );
+            }
+        }
+        assert!(
+            painted_and_drawn > 200,
+            "precondition: only {painted_and_drawn} of 255 NROT entries \
+                 are painted at all, so the agreement above is vacuous",
+        );
+    }
+    solid(nrot, 1.0, "the mesocyclone convention");
+    solid(nrot, -1.0, "an anticyclonic couplet");
+    solid(nrot, 2.5, "an extreme couplet");
+
+    // KDP: sequential like reflectivity, clear under the estimator's own
+    // significance and opaque in the heavy-rain shafts.
+    let kdp = RadarProduct::SpecificDifferentialPhase;
+    assert_eq!(alpha(kdp, 0.0), 0, "no differential phase gradient");
+    assert_eq!(alpha(kdp, 0.2), 0, "drizzle and noise");
+    solid(kdp, p::KDP_OPAQUE_DEG_KM, "a heavy rain shaft");
+    solid(kdp, 4.0, "a rain core");
+    let kdp_mid = alpha(kdp, 0.8);
+    assert!(
+        kdp_mid > 0 && kdp_mid < palette_alpha(kdp, 0.8),
+        "moderate KDP fades rather than steps: {kdp_mid}",
+    );
+
     // Reflectivity: bit-exact identity with the palette — the reference
     // look every other profile is measured against.
     {
@@ -2182,7 +2365,7 @@ fn the_default_transparency_profile_is_measured_per_product() {
     // to be a wall.
     let scan = six_moment_scan();
     let mut measured = Vec::new();
-    for product in SAMPLABLE {
+    for product in VOLUME_PRODUCTS {
         let req = VoxelRequest {
             product,
             ..request(ODD)
@@ -2206,6 +2389,15 @@ fn the_default_transparency_profile_is_measured_per_product() {
             ("zdr", 53, 180),
             ("phi", 255, 63),
             ("rho", 35, 180),
+            // Velocity's own count, which is what sharing its band means.
+            ("srv", 41, 180),
+            // Only the unpainted core of the ramp: |NROT| under the
+            // algorithm's significance floor, on a ±4 span. Everything
+            // outside it starts at the weak class's quarter alpha, which
+            // is over the see-through ceiling, so the count is the
+            // unpainted band and nothing else.
+            ("nrot", 27, 180),
+            ("kdp", 60, 180),
         ],
         "see-through data entries and max data alpha, per product",
     );
@@ -2261,6 +2453,99 @@ fn the_isosurface_params_translate_the_user_threshold_per_shape() {
         f32::from(255 - rho.value_to_index(0.90)) / 255.0,
         "the crossing distance reaches down to the bound",
     );
+
+    // Diverging about a centre that is NOT zero — the case velocity
+    // cannot test, because dropping the `centre +` term from the
+    // translation passes every assertion above. ZDR is the only product
+    // with a non-zero diverging centre, so this is the whole coverage of
+    // that term: at +0.25 dB the slider would otherwise sit a quarter of
+    // a decibel off the surface it draws.
+    let zdr = grid(RadarProduct::DifferentialReflectivity);
+    let centre_db = volume_alpha_profile::ZDR_CENTRE_DB;
+    assert_ne!(centre_db, 0.0, "precondition: ZDR's centre is off zero");
+    let (centre, threshold) = zdr.iso_uniform_params(2.75);
+    let c = zdr.value_to_index(centre_db);
+    assert_eq!(centre, f32::from(c) / 255.0, "centred on rain's own ZDR");
+    assert_ne!(
+        centre,
+        f32::from(zdr.value_to_index(0.0)) / 255.0,
+        "a centre read as 0 dB rather than the profile's would pass every \
+             velocity assertion above",
+    );
+    assert_eq!(
+        threshold,
+        f32::from(zdr.value_to_index(centre_db + 2.75) - c) / 255.0,
+        "the crossing distance is 2.75 dB of ramp FROM the rain centre",
+    );
+    // Which is to say the default surface is the +3 dB column and the
+    // −2.5 dB tail.
+    assert_eq!(
+        default_iso_threshold(RadarProduct::DifferentialReflectivity),
+        volume_alpha_profile::ZDR_OPAQUE_DB - centre_db,
+    );
+
+    // The derived products carry their own ramps, so their thresholds
+    // must be read through those and not through the source moment's.
+    // NROT spans ±4 unitless where the velocity slot it borrows spans
+    // ±63.5 m/s: a translation that reached for the slot would put the
+    // meso surface sixteen times too low on the ramp.
+    let nrot = grid(RadarProduct::NormalizedRotation);
+    let (centre, threshold) = nrot.iso_uniform_params(1.0);
+    let c = nrot.value_to_index(0.0);
+    assert_eq!(centre, f32::from(c) / 255.0, "centred on no rotation");
+    assert_eq!(
+        threshold,
+        f32::from(nrot.value_to_index(1.0) - c) / 255.0,
+        "the crossing distance is |NROT| = 1 of ramp",
+    );
+    assert_eq!(
+        nrot.value_range(),
+        value_range_for_product(RadarProduct::NormalizedRotation, MomentSlot::Velocity,)
+    );
+    assert!(
+        threshold > 0.1,
+        "|NROT| = 1 is an eighth of a ±4 ramp; {threshold} says the \
+             surface was translated through velocity's ±63.5 span",
+    );
+    // SRV keeps velocity's ramp and velocity's centre; KDP is sequential
+    // on its own display clamp.
+    let srv = grid(RadarProduct::StormRelativeVelocity);
+    assert_eq!(srv.value_range(), vel.value_range());
+    assert_eq!(srv.iso_uniform_params(20.0), vel.iso_uniform_params(20.0));
+    let kdp = grid(RadarProduct::SpecificDifferentialPhase);
+    let (centre, threshold) = kdp.iso_uniform_params(1.5);
+    assert!(centre < 0.0, "KDP is sequential");
+    assert_eq!(threshold, f32::from(kdp.value_to_index(1.5)) / 255.0);
+
+    // Every product's shape and default agree with the grid the builder
+    // actually produced — the loop the derived three were never in.
+    for product in VOLUME_PRODUCTS {
+        let g = grid(product);
+        let default = default_iso_threshold(product);
+        let (centre, threshold) = g.iso_uniform_params(default);
+        assert!(
+            threshold.is_finite() && (0.0..=1.0).contains(&threshold),
+            "{}: default threshold {default} translates to {threshold}",
+            product.name(),
+        );
+        match iso_shape(product) {
+            IsoShape::Sequential => assert!(centre < 0.0, "{}", product.name()),
+            IsoShape::DeviationFrom { centre: at } => assert_eq!(
+                centre,
+                f32::from(g.value_to_index(at)) / 255.0,
+                "{}",
+                product.name(),
+            ),
+            IsoShape::AtOrBelow => assert_eq!(centre, 1.0, "{}", product.name()),
+        }
+        // Non-finite input takes the argued default, for every product.
+        assert_eq!(
+            g.iso_uniform_params(f32::NAN),
+            (centre, threshold),
+            "{}: a NaN threshold must fall back, not poison the uniform",
+            product.name(),
+        );
+    }
 
     // Non-finite input: the argued default, not a NaN in a uniform lane.
     let (_, fallback) = refl.iso_uniform_params(f32::NAN);
@@ -2344,7 +2629,7 @@ fn the_velocity_fold_guard_rides_into_the_voxel_grid() {
 #[test]
 fn the_wrapping_moment_is_named_and_its_seam_error_is_measured() {
     let scan = six_moment_scan();
-    for product in SAMPLABLE {
+    for product in VOLUME_PRODUCTS {
         let req = VoxelRequest {
             product,
             ..request(ODD)
@@ -2521,8 +2806,8 @@ fn the_format_version_is_the_one_this_layout_ships() {
     );
 }
 
-/// A real grid survives the wire, for every moment, with and without the
-/// value plane.
+/// A real grid survives the wire, for every product — derivations
+/// included — with and without the value plane.
 ///
 /// This is what [`VoxelGrid`]'s hand-written `PartialEq` was written for:
 /// the value plane is `NaN` wherever the radar did not reach, which on a
@@ -2532,7 +2817,7 @@ fn the_format_version_is_the_one_this_layout_ships() {
 #[test]
 fn a_grid_round_trips_through_its_wire_form() {
     let scan = six_moment_scan();
-    for product in SAMPLABLE {
+    for product in VOLUME_PRODUCTS {
         for values_wanted in [true, false] {
             let req = VoxelRequest {
                 product,
