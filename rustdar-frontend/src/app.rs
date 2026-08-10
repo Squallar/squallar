@@ -1214,9 +1214,12 @@ impl App {
     ///
     /// Missing tiles are simply absent from the layers — this call is also
     /// what *requests* them — and the signature is how
-    /// [`App::recompose_floors_for_new_tiles`] later notices they landed: it
-    /// folds the theme, the zoom and the resolved counts, all of which change
-    /// the picture a composite would produce.
+    /// [`App::recompose_floors_for_new_tiles`] later notices the picture a
+    /// composite would produce has changed: it folds the theme, the zoom and
+    /// the resolved counts, **and the vector overlays' content signatures**
+    /// — the warning set above all, which changes mid-session as warnings
+    /// issue and expire. One signature, one reopen mechanism: tiles landing
+    /// and warnings changing travel the same drain.
     fn gather_floor_tiles(
         &mut self,
         site_lat: f64,
@@ -1230,14 +1233,40 @@ impl App {
     ) {
         use crate::volume::floor::{TileBytesLayer, floor_tile_ids, floor_tile_zoom};
 
-        let empty = (TileBytesLayer::empty(), TileBytesLayer::empty(), 0);
+        /// One opaque token out of the tile bits and the vector signature —
+        /// hashed rather than bit-packed together, because the tile packing
+        /// already spends 49 of the 64 bits.
+        fn fold_floor_signature(tile_bits: u64, vector_sig: u64) -> u64 {
+            use std::hash::{DefaultHasher, Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            (tile_bits, vector_sig).hash(&mut hasher);
+            hasher.finish()
+        }
+
+        // The vector layers' share of the signature. Computed before the
+        // headless bail-out: the overlay registry exists without a window,
+        // and the recompose tests drive the warning set through it.
+        let vector_sig = {
+            use rustdar_overlays::render::overlay_state::OverlayKind;
+            self.gui
+                .overlays
+                .content_signature(OverlayKind::NwsAlerts)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                ^ self.gui.overlays.content_signature(OverlayKind::SpcOutlook)
+        };
+
+        let empty = (
+            TileBytesLayer::empty(),
+            TileBytesLayer::empty(),
+            fold_floor_signature(0, vector_sig),
+        );
         let Some(ctx) = self
             .state
             .as_ref()
             .map(|state| state.egui_renderer.context().clone())
         else {
             // Headless (the tests): no egui, no tile sources, no tiles — the
-            // composite is ground + radar, exactly the pre-tile floor.
+            // composite is ground + radar + whatever vectors are in hand.
             return empty;
         };
         let is_dark = self.cached_dark_theme.unwrap_or(true);
@@ -1274,23 +1303,69 @@ impl App {
         // Counts and zooms rather than tile ids: for a fixed scope the id set
         // is a function of (zoom, footprint), so arrivals only ever change
         // the counts — and a theme flip changes everything.
-        let signature = u64::from(is_dark)
+        let tile_bits = u64::from(is_dark)
             | (u64::from(base.zoom) << 1)
             | (u64::from(labels.zoom) << 9)
             | ((base.tiles.len() as u64) << 17)
             | ((labels.tiles.len() as u64) << 33);
-        (base, labels, signature)
+        (base, labels, fold_floor_signature(tile_bits, vector_sig))
     }
 
-    /// Re-dispatch floors whose ground has more tiles than when they were
-    /// composited — the "tiles arrived after the floor" refresh, run every
+    /// The pane's vector overlays as floor geometry, gathered from the
+    /// overlay registry through the same `clickable_items` filter the pane's
+    /// rasterizers apply (category toggles, hidden alerts, the selected SPC
+    /// day and products) — global handler state, never per-pane toggles,
+    /// per the floor's documented contract on its own checkbox.
+    ///
+    /// Clones the features, so it is called at floor **dispatch**, once per
+    /// sealed sweep or reopen — the per-frame signature check reads
+    /// [`OverlayRegistry::content_signature`] instead, which clones nothing.
+    ///
+    /// [`OverlayRegistry::content_signature`]:
+    ///     rustdar_overlays::render::overlay_state::OverlayRegistry::content_signature
+    fn gather_floor_vectors(&self) -> crate::volume::floor::FloorVectors {
+        use rustdar_overlays::render::overlay_state::{ClickableItem, OverlayKind};
+
+        let shapes = |items: Vec<ClickableItem>| -> Vec<crate::volume::floor::FloorShape> {
+            items
+                .into_iter()
+                .flat_map(|item| item.features)
+                .flat_map(|feature| {
+                    let (fill_rgba, stroke_rgba) = (feature.fill_rgba, feature.stroke_rgba);
+                    // The exterior ring of each polygon — exactly the part
+                    // the pane's `draw_feature` fills and strokes.
+                    feature
+                        .polygons
+                        .into_iter()
+                        .filter_map(move |mut polygon| {
+                            (!polygon.is_empty()).then(|| crate::volume::floor::FloorShape {
+                                ring: polygon.swap_remove(0),
+                                fill_rgba,
+                                stroke_rgba,
+                            })
+                        })
+                })
+                .collect()
+        };
+        crate::volume::floor::FloorVectors {
+            under_radar: shapes(self.gui.overlays.clickable_items(OverlayKind::SpcOutlook)),
+            over_radar: shapes(self.gui.overlays.clickable_items(OverlayKind::NwsAlerts)),
+            range_ring: true,
+        }
+    }
+
+    /// Re-dispatch floors whose picture inputs changed since they were
+    /// composited — tiles arriving after the floor, **and the warning set
+    /// moving** (a warning issued, expired, hidden mid-session) — run every
     /// frame beside the retry drain and free when nothing changed.
     ///
     /// The signature check *is* the request pump: `gather_floor_tiles` asks
     /// the caches for every footprint tile, which both requests the missing
-    /// ones and reports the resolved count. A changed signature reopens the
-    /// scope's dedupe entry and owes it a render, and the ordinary retry path
-    /// re-composites against the scope's newest grid.
+    /// ones and reports the resolved count, and folds the overlay content
+    /// signatures in. A changed signature reopens the scope's dedupe entry
+    /// and owes it a render, and the ordinary retry path re-composites
+    /// against the scope's newest grid with the vectors gathered fresh at
+    /// dispatch.
     fn recompose_floors_for_new_tiles(&mut self) {
         if self.floor_rendered.is_empty() {
             return;
@@ -1375,6 +1450,7 @@ impl App {
 
         let (base_tiles, label_tiles, tile_sig) =
             self.gather_floor_tiles(site.lat, site.lon, grid.x_range_km(), grid.y_range_km());
+        let vectors = self.gather_floor_vectors();
         let spawned = self.render.spawn_floor_render(
             target.volume.site.clone(),
             target.region,
@@ -1385,6 +1461,7 @@ impl App {
             grid.y_range_km(),
             base_tiles,
             label_tiles,
+            vectors,
             self.channels.floor_sender.clone(),
             self.window.clone(),
         );
@@ -5082,15 +5159,20 @@ mod tests {
         );
     }
 
-    /// Tiles landing after a floor was composited reopen the scope; a floor
-    /// whose tile signature still matches is left alone.
+    /// The floor's picture inputs changing after it was composited reopen
+    /// the scope — tiles landing, and the **warning set** moving — while a
+    /// floor whose signature still matches is left alone. One signature,
+    /// one drain: the warning choreography below runs through exactly the
+    /// mechanism the tile half does.
     ///
     /// The floor renders once per sealed sweep, but its basemap and label
-    /// tiles download on their own schedule — without this check, whichever
-    /// tiles were in hand at the first composite would be the box's ground
-    /// for the volume's whole life. Headless, `gather_floor_tiles` always
-    /// answers the empty signature, so a stored non-empty signature *is* the
-    /// "tiles changed" state and the empty one is "nothing changed".
+    /// tiles download on their own schedule and warnings issue and expire
+    /// on the NWS's — without this check, whatever was in hand at the first
+    /// composite would be the box's ground for the volume's whole life.
+    /// Headless, `gather_floor_tiles` has no tiles, so its signature moves
+    /// only with the overlay content — which is what the second half
+    /// drives, through the production ingest path
+    /// (`OverlayRegistry::apply_fetch_result`).
     #[test]
     fn a_floor_is_recomposed_when_its_tiles_change_and_left_alone_when_not() {
         use crate::volume::bridge::VolumeEntry;
@@ -5173,17 +5255,125 @@ mod tests {
         );
 
         // The signature matches what a composite now would use: untouched.
+        let site = rustdar_radar::sites::get_radar_site("KTLX").expect("a known site");
+        let current_sig = |app: &mut App| {
+            let (_, _, sig) =
+                app.gather_floor_tiles(site.lat, site.lon, grid.x_range_km(), grid.y_range_km());
+            sig
+        };
         app.floor_owed.clear();
         app.floor_rendered.clear();
-        app.floor_rendered.push((scope.clone(), stamp, 0));
+        let quiet_sig = current_sig(&mut app);
+        app.floor_rendered.push((scope.clone(), stamp, quiet_sig));
         app.recompose_floors_for_new_tiles();
         assert!(
             app.floor_rendered.iter().any(|(s, _, _)| *s == scope),
-            "an unchanged tile signature must leave the floor in hand",
+            "an unchanged signature must leave the floor in hand",
         );
         assert!(
             app.floor_owed.is_empty(),
-            "an unchanged tile signature owes nothing",
+            "an unchanged signature owes nothing",
+        );
+
+        // ── The warning set is part of the same signature ────────────────
+        // A tornado warning issues mid-session. No new tiles, no new build:
+        // the same recompose + drain must reopen the scope and re-dispatch.
+        let warning = |id: &str| {
+            use rustdar_overlays::nws::alert::{AlertCategory, NwsAlert};
+            use rustdar_overlays::types::{HatchPattern, OverlayFeature};
+            NwsAlert {
+                id: id.to_string(),
+                event: "Tornado Warning".to_string(),
+                category: AlertCategory::Warning,
+                severity: "Extreme".parse().unwrap(),
+                urgency: "Immediate".parse().unwrap(),
+                certainty: "Observed".parse().unwrap(),
+                headline: None,
+                description: String::new(),
+                instruction: None,
+                area_desc: String::new(),
+                sender_name: String::new(),
+                effective: String::new(),
+                expires: String::new(),
+                onset: None,
+                ends: None,
+                affected_zones: Vec::new(),
+                features: vec![OverlayFeature::new(
+                    vec![vec![vec![(35.5, -97.5), (35.9, -97.5), (35.9, -97.0)]]],
+                    [255, 0, 0, 80],
+                    [255, 0, 0, 255],
+                    "Tornado Warning".to_string(),
+                    String::new(),
+                    HatchPattern::None,
+                )],
+            }
+        };
+        let apply = |app: &mut App, alerts| {
+            use rustdar_overlays::render::overlay_state::{
+                OverlayFetchResult, OverlayKind, OverlayRegistry,
+            };
+            app.gui.overlays.apply_fetch_result(OverlayFetchResult {
+                kind: OverlayKind::NwsAlerts,
+                data: OverlayRegistry::nws_alerts_payload(alerts),
+            });
+        };
+        apply(&mut app, vec![warning("w1")]);
+        app.recompose_floors_for_new_tiles();
+        assert!(
+            !app.floor_rendered.iter().any(|(s, _, _)| *s == scope),
+            "a warning issuing must reopen the scope's dedupe entry — the \
+             floor in hand shows a storm with no warning on it",
+        );
+        assert_eq!(
+            app.floor_owed,
+            vec![scope.clone()],
+            "the reopened scope must be owed a re-composite",
+        );
+        app.retry_owed_floor_renders();
+        assert!(
+            app.floor_rendered
+                .iter()
+                .any(|(s, at, _)| *s == scope && *at == stamp),
+            "the warning-driven reopen must re-dispatch through the same \
+             drain the tile reopen uses",
+        );
+        assert!(app.floor_owed.is_empty(), "the re-dispatch settles the debt");
+
+        // The gathered vectors carry the warning to the composite, over the
+        // radar where the pane stacks alerts.
+        let vectors = app.gather_floor_vectors();
+        assert_eq!(
+            vectors.over_radar.len(),
+            1,
+            "the issued warning must reach the floor's over-radar layer",
+        );
+        assert!(
+            vectors.range_ring && vectors.under_radar.is_empty(),
+            "the ring always rides; no outlook data means no under-radar shapes",
+        );
+
+        // The next poll returns the SAME warning set: the signature names
+        // the set, not the fetch, so nothing reopens — a floor recomposed
+        // every two-minute poll is a floor recomposed for nothing. (This is
+        // where a signature built on `data_generation` dies.)
+        apply(&mut app, vec![warning("w1")]);
+        app.recompose_floors_for_new_tiles();
+        assert!(
+            app.floor_rendered.iter().any(|(s, _, _)| *s == scope),
+            "a poll returning the same warning set must not reopen the scope",
+        );
+        assert!(
+            app.floor_owed.is_empty(),
+            "a poll returning the same warning set owes nothing",
+        );
+
+        // The warning expires out of the feed: reopened again.
+        apply(&mut app, Vec::new());
+        app.recompose_floors_for_new_tiles();
+        assert!(
+            !app.floor_rendered.iter().any(|(s, _, _)| *s == scope),
+            "a warning expiring must reopen the scope — the floor in hand \
+             still shows it",
         );
     }
 }

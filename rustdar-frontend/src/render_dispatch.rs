@@ -1276,14 +1276,16 @@ impl RenderDispatcher {
     ///
     /// A `JobRequest::Radar` at the volume's lowest reflectivity tilt — the
     /// exact rasterizer the 2D pane draws with — whose reply is composited
-    /// with the basemap and city-label tiles onto the box footprint
-    /// (`compose_floor`) in the job's own delivery closure, off the frame
-    /// thread natively, and sent through the floor channel. The tile bytes
-    /// arrive pre-gathered from the panes' shared caches; whichever have not
-    /// downloaded yet simply are not in the layer, and the App re-dispatches
-    /// when more land. Returns `false` when the budget is full; the caller
-    /// keeps its dedupe entry unwritten and the next completed build tries
-    /// again.
+    /// with the basemap and city-label tiles *and the panes' vector
+    /// overlays* onto the box footprint (`compose_floor`) in the job's own
+    /// delivery closure, off the frame thread natively, and sent through the
+    /// floor channel. The tile bytes arrive pre-gathered from the panes'
+    /// shared caches; whichever have not downloaded yet simply are not in
+    /// the layer, and the App re-dispatches when more land — as it does when
+    /// the warning set changes, `vectors` being a snapshot gathered on the
+    /// frame thread at dispatch. Returns `false` when the budget is full;
+    /// the caller keeps its dedupe entry unwritten and the next completed
+    /// build tries again.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_floor_render(
         &mut self,
@@ -1296,6 +1298,7 @@ impl RenderDispatcher {
         y_range_km: (f64, f64),
         base_tiles: crate::volume::floor::TileBytesLayer,
         label_tiles: crate::volume::floor::TileBytesLayer,
+        vectors: crate::volume::floor::FloorVectors,
         sender: std::sync::mpsc::Sender<crate::channels::FloorResponse>,
         window: Option<WindowRef>,
     ) -> bool {
@@ -1345,6 +1348,7 @@ impl RenderDispatcher {
                         y_range_km,
                         &base_tiles.decode(),
                         &label_tiles.decode(),
+                        &vectors,
                     )
                 });
             log::info!(
