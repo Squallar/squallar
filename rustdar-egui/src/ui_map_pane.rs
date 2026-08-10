@@ -49,6 +49,13 @@ pub(super) struct PaneRenderCtx<'a> {
     /// click occurred this frame. On desktop this comes from egui's `any_click()`;
     /// on Android from the deferred single-tap detector.
     pub overlay_click_pos: Option<egui::Pos2>,
+    /// Set by every handler that **acts** on
+    /// [`overlay_click_pos`](Self::overlay_click_pos) — an overlay feature
+    /// hit, a radar-site icon click. One flag for the whole frame's pane
+    /// loop, owned by `render_panes`: M7's fade trigger is a click nothing
+    /// consumed, and this is the consumption half of it. See the CONVENTION
+    /// comment in `ui_map.rs`.
+    pub click_consumed: &'a mut bool,
     /// User unit and timezone preferences.
     pub preferences: &'a UserPreferences,
     /// Everything the 3D region drag needs. See [`RegionCtx`].
@@ -319,6 +326,9 @@ pub(super) fn render_pane_map_content(
         if !selected.is_empty() {
             ctx.overlays.selected_overlays = selected;
             ctx.overlays.selected_overlay_page = 0;
+            // A feature answered this frame's click — the consumption half
+            // of M7's fade trigger (see `PaneRenderCtx::click_consumed`).
+            *ctx.click_consumed = true;
         }
 
         // --- Check overlay hover values (model data, etc.) ---
@@ -539,7 +549,7 @@ fn handle_region_drag(ui: &egui::Ui, projector: &walkers::Projector, ctx: &mut P
         projector,
         drag.centre(),
         drag.half_width_km(),
-        egui::Color32::from_rgb(255, 220, 120),
+        crate::ui_region::REGION_ARM_COLOR,
         true,
     );
     draw_region_hint(ui, projector, drag);
@@ -643,7 +653,7 @@ fn draw_region_hint(
     ui.painter().rect_filled(
         egui::Rect::from_min_size(origin, galley.size()).expand(3.0),
         2.0,
-        egui::Color32::from_rgb(255, 220, 120),
+        crate::ui_region::REGION_ARM_COLOR,
     );
     ui.painter()
         .galley(origin, galley, egui::Color32::PLACEHOLDER);
@@ -850,6 +860,7 @@ fn handle_radar_site_interactions(
         overlay_click_pos,
         pane_rect,
         excluded_rects,
+        click_consumed,
         ..
     } = ctx;
     let pane_idx = *pane_idx;
@@ -903,6 +914,9 @@ fn handle_radar_site_interactions(
                 site: radar_site.name.to_string(),
                 pane_idx,
             });
+            // An icon answered this frame's click — the consumption half of
+            // M7's fade trigger (see `PaneRenderCtx::click_consumed`).
+            **click_consumed = true;
         }
 
         if let Some(pos) = hover_pos
@@ -1137,8 +1151,12 @@ fn format_legend_value(product: RadarProduct, value: f32, prefs: &UserPreference
 /// Font size of the pending-render notice. The color scale's title size, so the
 /// notice reads as part of the same chrome rather than as an alert.
 const PENDING_FONT_SIZE: f32 = 12.0;
-/// Gap between the notice and the pane's top edge.
-const PENDING_TOP_MARGIN: f32 = 6.0;
+/// Gap between the notice and the pane's top edge. Below the pane's pill
+/// row, not at the very top — the row is an egui layer over the pane and
+/// wraps to the pane's width, so on a narrow pane a top-hugging plate would
+/// sit under it (see `ui_pills::PILL_ROW_CLEARANCE`, the same offset the
+/// left-anchored captions keep).
+const PENDING_TOP_MARGIN: f32 = crate::ui::PILL_ROW_CLEARANCE;
 /// Padding inside the notice's backing plate.
 const PENDING_PADDING: egui::Vec2 = egui::vec2(8.0, 3.0);
 

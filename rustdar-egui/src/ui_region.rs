@@ -62,6 +62,13 @@ use crate::pane::{GeoPoint, PaneKind, PaneState, VolumeRegion};
 /// of preview edge, and never a kilometre of grid.
 const KM_PER_DEGREE_LAT: f64 = 111.32;
 
+/// The armed region interaction's yellow: the box in flight, the resolution
+/// hint over its top edge, and the active pane's armed hint chip all paint in
+/// this one colour — so the chip advertises exactly the box the drag will
+/// draw. (The *committed* box drawn back on the map is deliberately not this
+/// colour: it is a record, not the gesture.)
+pub(crate) const REGION_ARM_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 220, 120);
+
 /// A region drag in flight.
 ///
 /// Geographic, for the reason the module doc gives. Held on the `Gui` rather than

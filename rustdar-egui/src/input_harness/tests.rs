@@ -4715,8 +4715,9 @@ fn day_old_data_reads_in_hours() {
 
 // 16 retired (synthesis-m1): `excluded_rects` is unconditionally empty
 // since the hamburger went, so "a wide screen excludes nothing" held for
-// every screen and pinned nothing. M5's pill-row contract (73) replaces
-// rect exclusion with layer-based assertions.
+// every screen and pinned nothing. M5's pill-row contract (73) replaced
+// rect exclusion with layer-based assertions — see
+// `a_pill_click_never_reaches_the_map_and_its_popover_anchors`.
 
 // ── Overlay texture budget ───────────────────────────────────────────
 
@@ -8915,7 +8916,17 @@ fn the_data_and_live_rows_share_state_with_the_menu_toggles() {
             .is_some_and(|row| h.screen_rect().contains(row.rect.center()))
     });
     assert!(found, "the auto-poll row never scrolled on screen");
-    h.warm_up();
+    // The row's probe rect is recorded even while the scroll clip still
+    // hides the widget, so drain the smooth-scroll animation with real time
+    // and nudge until the checkbox itself is painted before clicking it.
+    h.frames_for(10, 0.05);
+    let found = h.scroll_until(scroll_pos, egui::vec2(0.0, -40.0), 40, |h| {
+        h.painted_text_rects()
+            .iter()
+            .any(|(_, text)| text == "Auto-poll")
+    });
+    assert!(found, "the Auto-poll checkbox never became visible");
+    h.frames_for(10, 0.05);
     let label = h
         .painted_text_rects()
         .into_iter()
@@ -8972,4 +8983,800 @@ fn the_timeline_row2_caption_states_the_pushed_frame_budget() {
          own name; drew {:?}",
         row2.caption
     );
+}
+
+// ── M5: pane pills, popovers and the armed hint ─────────────────────────
+
+use crate::ui::PillKind;
+
+/// A wide two-pane harness with the layers panel closed, so pane 0's pill
+/// row is not under the floating stack — the state every pill test drives
+/// from.
+fn pill_harness() -> InputHarness {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.set_pane_count(2);
+    h.close_layers();
+    h
+}
+
+/// 73a. **A click on a pill is never a map click — and its popover opens
+///      anchored to the pill.**
+///
+///      Layer-based, per plan §3.3's resolution: the pills are egui `Area`s
+///      above `Order::Background`, so the click gate every map resolver runs
+///      (`filter_dialog_blocked` / `is_pos_blocked`) drops the position with
+///      no excluded-rect plumbing. Staged with a radar-site icon placed
+///      exactly under the site pill: without the layer the click would
+///      switch the site, and with it the only thing that may happen is the
+///      pill's own activate plus its popover.
+#[test]
+fn a_pill_click_never_reaches_the_map_and_its_popover_anchors() {
+    let mut h = pill_harness();
+    h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
+    h.warm_up();
+
+    // Pane 1 active, so the pill's own activate is observable.
+    h.mouse_click(h.pane_rects()[1].center());
+    assert_eq!(h.active_pane_index(), 1, "precondition: pane 1 is active");
+
+    let (text, pill) = h.pill(0, PillKind::Site).expect("pane 0 draws a site pill");
+    assert_eq!(text, "KTLX", "the pill names the pane's site");
+    h.place_site_at(0, "KTLX", pill.center());
+    assert!(
+        h.is_floating_layer_at(pill.center()),
+        "precondition: the pill row is a floating layer over the map — that \
+         is the whole blocking mechanism under test"
+    );
+
+    let outcome = h.mouse_click(pill.center());
+    assert_eq!(
+        site_switches(&h),
+        vec![],
+        "the icon under the pill answered a click the pill row should have \
+         blocked"
+    );
+    assert!(
+        outcome.resolved.overlay_click_pos.is_none(),
+        "the click still reached the map's resolved pointer frame"
+    );
+    assert!(
+        !h.click_consumed(),
+        "nothing on the map may consume a click that never reached it"
+    );
+    assert_eq!(
+        h.active_pane_index(),
+        0,
+        "the pill's own activate is the one side effect a pill click has"
+    );
+
+    let popover = h.pill_popover().expect("the site pill's popover opened");
+    assert_eq!((popover.pane_idx, popover.pill), (0, PillKind::Site));
+    // Anchored to its pill: directly under it, horizontally overlapping.
+    assert!(
+        (popover.rect.top() - pill.bottom()).abs() < 24.0
+            && popover.rect.left() < pill.right()
+            && pill.left() < popover.rect.right(),
+        "the popover is not anchored to its pill: pill {pill:?}, popover {:?}",
+        popover.rect
+    );
+    assert!(
+        popover.search.is_some(),
+        "the site popover leads with its search field"
+    );
+}
+
+/// 73b. **A dim row still hit-tests: on touch the first tap reveals and is
+///      swallowed, the second acts — and a confirmed map tap elsewhere puts
+///      the row back to sleep.**
+///
+///      Opacity is `Ui::set_opacity`, painting only — that is what makes a
+///      dim row reachable at all. The swallowed tap must have *no* pill
+///      effect: no popover, no activation. The reveal is per pane and ends
+///      with the gesture that means "I am working the map again".
+#[test]
+fn a_dim_rows_first_touch_tap_reveals_and_swallows() {
+    let mut h = pill_harness();
+
+    // Latch touch modality with a tap on the map of pane 1 — which also
+    // makes pane 1 active, so pane 0's row has an activation to swallow.
+    h.touch_tap(h.pane_rects()[1].center());
+    h.frames_for(10, 0.05);
+    assert_eq!(h.active_pane_index(), 1, "precondition: pane 1 is active");
+
+    let row = h.pill_row(0).expect("pane 0 draws a pill row");
+    assert!(
+        !row.full_opacity,
+        "precondition: with no pointer hover on touch, the row idles dim"
+    );
+
+    let (_, pill) = h.pill(0, PillKind::Site).expect("the site pill is drawn");
+    h.touch_tap(pill.center());
+    h.frames_for(10, 0.05);
+
+    assert!(
+        h.pill_row(0).expect("still drawn").full_opacity,
+        "the first tap on a dim row must reveal it"
+    );
+    assert!(
+        h.pill_popover().is_none(),
+        "the revealing tap is swallowed: no popover may open on it"
+    );
+    assert_eq!(
+        h.active_pane_index(),
+        1,
+        "the revealing tap is swallowed: it must not activate the pane either"
+    );
+
+    // The second tap acts: popover open, pane active.
+    let (_, pill) = h.pill(0, PillKind::Site).expect("still drawn");
+    h.touch_tap(pill.center());
+    h.frames_for(2, 0.05);
+    assert_eq!(h.active_pane_index(), 0, "the second tap activates");
+    let popover = h.pill_popover().expect("the second tap opens the popover");
+    assert_eq!((popover.pane_idx, popover.pill), (0, PillKind::Site));
+
+    // Close the popover with a tap on pane 0's own map, far from the row —
+    // a confirmed map tap, which also ends the reveal.
+    let map_spot = h.pane_rects()[0].center();
+    h.touch_tap(map_spot);
+    h.frames_for(12, 0.05);
+    assert!(
+        h.pill_popover().is_none(),
+        "a tap outside the popover closes it"
+    );
+    assert!(
+        !h.pill_row(0).expect("still drawn").full_opacity,
+        "a confirmed map tap elsewhere must put the revealed row back to sleep"
+    );
+}
+
+/// 73c. **"Pin pane controls" forces the rows to full opacity — through the
+///      real settings row, and persisted.**
+///
+///      Driven the user's way: the Interface section's checkbox in the
+///      inspector's App › Settings body. The parity walk covers the row's
+///      presence; this pins what it does and that `ui_config_json` carries
+///      it.
+#[test]
+fn pin_pane_controls_forces_full_opacity_and_persists() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.close_layers();
+
+    // Control: pointer parked on the top bar — outside every pane — leaves
+    // the row dim.
+    h.mouse_move(egui::pos2(700.0, 12.0));
+    h.frames_for(2, FRAME_DT);
+    assert!(
+        !h.pill_row(0).expect("the pane draws a pill row").full_opacity,
+        "precondition: unpinned and unhovered, the row idles dim"
+    );
+
+    h.open_settings();
+    let scroll_pos = h
+        .inspector_rect()
+        .expect("the inspector is open")
+        .center();
+    let found = h.scroll_until(scroll_pos, egui::vec2(0.0, -160.0), 120, |h| {
+        h.settings_row("interface.pin_controls")
+            .is_some_and(|row| h.screen_rect().contains(row.rect.center()))
+    });
+    assert!(found, "the Interface row never scrolled on screen");
+    // Drain the smooth-scroll animation with real time and require the
+    // painted checkbox itself — the row's probe rect is recorded even while
+    // the scroll clip still hides the widget.
+    h.frames_for(10, 0.05);
+    let found = h.scroll_until(scroll_pos, egui::vec2(0.0, -40.0), 40, |h| {
+        h.painted_text_rects()
+            .iter()
+            .any(|(_, text)| text == "Pin pane controls")
+    });
+    assert!(found, "the Pin pane controls checkbox never became visible");
+    h.frames_for(10, 0.05);
+    let label = h
+        .painted_text_rects()
+        .into_iter()
+        .find(|(_, text)| text == "Pin pane controls")
+        .expect("the checkbox label is painted")
+        .0;
+    h.mouse_click(label.center());
+    h.close_inspector();
+
+    h.mouse_move(egui::pos2(700.0, 12.0));
+    h.frames_for(2, FRAME_DT);
+    assert!(
+        h.pill_row(0).expect("still drawn").full_opacity,
+        "pinned, the row must draw at full opacity with no hover at all"
+    );
+
+    // Persisted, so the preference survives the session.
+    let json = h.gui_mut().ui_config_json().expect("serialises");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("parses");
+    assert_eq!(
+        value["pin_pane_controls"].as_bool(),
+        Some(true),
+        "the pin must be written to the config"
+    );
+}
+
+/// 73d. **The site pill's popover searches the one site list and a pick
+///      emits the map icon's own `SwitchRadarSite`.**
+#[test]
+fn the_site_pill_popover_searches_and_switches() {
+    let mut h = pill_harness();
+
+    let (_, pill) = h.pill(0, PillKind::Site).expect("the site pill is drawn");
+    h.mouse_click(pill.center());
+    // The popup's debut frame only registers it; its widgets are clickable
+    // from the next frame — the same "areas need a frame" rule the whole
+    // harness warms up for.
+    h.frame();
+    let popover = h.pill_popover().expect("the popover opened");
+    let search = popover.search.expect("with its search field");
+    assert_eq!(
+        popover.rows.len(),
+        rustdar_radar::sites::RADARS.len(),
+        "unfiltered, the popover offers the whole table — the inspector's \
+         own list"
+    );
+
+    h.mouse_click(search.center());
+    h.type_text("kmkx");
+    h.warm_up();
+    let popover = h.pill_popover().expect("still open");
+    assert_eq!(
+        popover
+            .rows
+            .iter()
+            .map(|(code, _, _)| code.as_str())
+            .collect::<Vec<_>>(),
+        vec!["KMKX"],
+        "the filter must narrow to the match"
+    );
+
+    h.mouse_click(popover.rows[0].1.center());
+    assert!(
+        site_switches(&h).contains(&("KMKX".to_owned(), 0)),
+        "the pick did not emit SwitchRadarSite for the pill's pane; got {:?}",
+        site_switches(&h)
+    );
+    h.warm_up();
+    assert!(
+        h.pill_popover().is_none(),
+        "a pick closes the popover"
+    );
+}
+
+/// 73e. **The product and tilt popovers offer the combos' own lists, and a
+///      pick writes the pane — with the product pick resetting the tilt.**
+#[test]
+fn the_product_and_tilt_pill_popovers_write_the_pane() {
+    let mut h = pill_harness();
+    h.load_scan("KTLX");
+    h.offer_product(0, rustdar_radar::types::RadarProduct::Reflectivity, 0.5);
+    h.offer_product(0, rustdar_radar::types::RadarProduct::Reflectivity, 1.5);
+    h.close_layers();
+
+    // -- product --
+    let (code, pill) = h.pill(0, PillKind::Product).expect("a product pill");
+    assert_eq!(code, "REF", "the pill shows the product code");
+    h.gui_mut().pane_mut(0).expect("pane 0").selected_elevation = 1.5;
+    h.mouse_click(pill.center());
+    h.frame(); // the popup's debut frame only registers it
+    let popover = h.pill_popover().expect("the popover opened");
+    assert_eq!(
+        popover
+            .rows
+            .iter()
+            .map(|(label, _, _)| label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Reflectivity", "Velocity"],
+        "the popover offers the scan's own products — the combo's list"
+    );
+    let velocity = popover.rows[1].1;
+    h.mouse_click(velocity.center());
+    h.warm_up();
+    {
+        let pane = h.gui_mut().pane(0).expect("pane 0");
+        assert_eq!(
+            pane.selected_product,
+            rustdar_radar::types::RadarProduct::Velocity,
+            "the pick did not set the pane's product"
+        );
+        assert_eq!(
+            pane.selected_elevation, 0.0,
+            "the old product's tilt must not survive the switch"
+        );
+    }
+
+    // -- tilt, back on reflectivity where two angles are offered --
+    h.select_product(0, rustdar_radar::types::RadarProduct::Reflectivity);
+    let (_, pill) = h.pill(0, PillKind::Tilt).expect("a map pane draws a tilt pill");
+    h.mouse_click(pill.center());
+    h.frame(); // the popup's debut frame only registers it
+    let popover = h.pill_popover().expect("the popover opened");
+    assert_eq!(
+        popover
+            .rows
+            .iter()
+            .map(|(label, _, _)| label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["0.5\u{b0}", "1.5\u{b0}"],
+        "the popover offers the product's own tilts — the combo's list"
+    );
+    h.mouse_click(popover.rows[1].1.center());
+    h.warm_up();
+    assert_eq!(
+        h.gui_mut().pane(0).expect("pane 0").selected_elevation,
+        1.5,
+        "the pick did not set the pane's tilt"
+    );
+}
+
+/// 73f. **The link pill's popover toggles the pane's time link, and its
+///      caption is the honest unlink sentence the inspector shares.**
+#[test]
+fn the_link_pill_popover_toggles_the_time_link() {
+    let mut h = pill_harness();
+
+    let (glyph, pill) = h.pill(0, PillKind::Link).expect("a link pill");
+    assert_eq!(glyph, "\u{1f517}", "a fresh pane reads linked");
+    h.mouse_click(pill.center());
+    h.frame(); // the popup's debut frame only registers it
+    let popover = h.pill_popover().expect("the popover opened");
+    assert_eq!(popover.rows.len(), 2, "the follow / unlink pair");
+    assert!(
+        popover.rows[0].2 && !popover.rows[1].2,
+        "the linked state must read selected"
+    );
+    // The shared honesty sentence — `ui_pills::UNLINK_NOTE`, the inspector
+    // checkbox's own hover — is on screen with the choice.
+    assert!(
+        h.painted_text_strings()
+            .iter()
+            .any(|t| t.contains("still follows new scans")),
+        "the popover must carry the honest unlink caption"
+    );
+
+    h.mouse_click(popover.rows[1].1.center());
+    h.warm_up();
+    assert!(
+        !h.gui_mut().pane(0).expect("pane 0").time_link,
+        "the pick did not unlink the pane"
+    );
+    let (glyph, _) = h.pill(0, PillKind::Link).expect("still drawn");
+    assert_eq!(glyph, "\u{26d3}", "the pill must reflect the unlinked state");
+}
+
+/// 73g. **The kind pill's popover converts through the deferred applier —
+///      pending on the pick frame, converted the next — and choosing an
+///      unaimed cross-section arms the draw, matching the inspector.**
+#[test]
+fn the_kind_pill_popover_converts_next_frame_and_arms_the_unaimed_section() {
+    let mut h = pill_harness();
+
+    let (label, pill) = h.pill(0, PillKind::Kind).expect("a kind pill");
+    assert_eq!(label, "Map");
+    h.mouse_click(pill.center());
+    h.frame(); // the popup's debut frame only registers it
+    let popover = h.pill_popover().expect("the popover opened");
+    assert_eq!(
+        popover
+            .rows
+            .iter()
+            .map(|(label, _, _)| label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Map", "3D Volume", "Cross-section"],
+        "the popover offers the inspector's own three kinds"
+    );
+
+    // 3D Volume: recorded as pending on the pick frame, applied the next.
+    h.mouse_click(popover.rows[1].1.center());
+    assert_eq!(
+        h.gui_mut().pending_pane_kind_for_test(),
+        Some((0, PaneKind::Volume)),
+        "the pick must go through the deferred applier"
+    );
+    assert_eq!(
+        h.pane_kinds()[0],
+        PaneKind::Map,
+        "…and not convert mid-frame"
+    );
+    h.frame();
+    assert_eq!(
+        h.pane_kinds()[0],
+        PaneKind::Volume,
+        "the applier must convert on the next frame"
+    );
+    let (label, _) = h.pill(0, PillKind::Kind).expect("still drawn");
+    assert_eq!(label, "3D Volume", "the pill must follow the conversion");
+    assert!(
+        h.pill(0, PillKind::Tilt).is_none(),
+        "a non-map pane offers no tilt pill"
+    );
+
+    // Cross-section with no line: the pick arms the draw, as the
+    // inspector's segmented row does.
+    assert!(!h.section_draw_armed(), "precondition: the draw starts unarmed");
+    let (_, pill) = h.pill(0, PillKind::Kind).expect("still drawn");
+    h.mouse_click(pill.center());
+    h.frame(); // the popup's debut frame only registers it
+    let popover = h.pill_popover().expect("the popover opened");
+    h.mouse_click(popover.rows[2].1.center());
+    h.warm_up();
+    assert_eq!(h.pane_kinds()[0], PaneKind::CrossSection);
+    assert!(
+        h.section_draw_armed(),
+        "choosing an unaimed cross-section must arm the draw"
+    );
+}
+
+/// **The armed-tool hint chip sits on the active map pane, and only there.**
+///
+/// While Region or X-sec is armed, the active map pane paints the centred
+/// dashed chip naming the drag — painter only, so it is asserted through
+/// the painted text. It follows the active pane, swaps wording with the
+/// armed mode, and vanishes with the arm — and a non-map active pane gets
+/// none, because the drag it explains only exists on a map.
+#[test]
+fn the_armed_hint_chip_follows_the_active_map_pane() {
+    let mut h = pill_harness();
+    let panes = h.pane_rects();
+
+    // Arm the region drag the user's way: the top bar toggle.
+    let (region_toggle, armed) = h.top_bar().region_arm;
+    assert!(!armed, "precondition: the region drag starts unarmed");
+    h.mouse_click(region_toggle.center());
+    h.warm_up();
+
+    let hint = crate::ui::map::region_arm_hint();
+    assert!(
+        h.text_painted_in(panes[0], &hint),
+        "the active map pane must paint the region hint; painted {:?}",
+        h.painted_text_strings_in(panes[0])
+    );
+    assert!(
+        !h.text_painted_in(panes[1], &hint),
+        "an inactive pane must not paint the chip"
+    );
+
+    // The chip follows the active pane.
+    h.mouse_click(panes[1].center());
+    h.warm_up();
+    assert!(!h.text_painted_in(panes[0], &hint));
+    assert!(h.text_painted_in(panes[1], &hint));
+
+    // Arming the section swaps the wording — the two arms are mutually
+    // exclusive, so exactly one chip text exists at a time.
+    let (section_toggle, _) = h.top_bar().section_arm;
+    h.mouse_click(section_toggle.center());
+    h.warm_up();
+    assert!(
+        h.text_painted_in(panes[1], crate::ui::map::SECTION_ARM_HINT),
+        "the section arm must paint its own hint"
+    );
+    assert!(
+        !h.text_painted_in(panes[1], &hint),
+        "the region hint must go with the region arm"
+    );
+
+    // Disarming takes the chip with it.
+    let (section_toggle, _) = h.top_bar().section_arm;
+    h.mouse_click(section_toggle.center());
+    h.warm_up();
+    assert!(
+        !h.text_painted_in(panes[1], crate::ui::map::SECTION_ARM_HINT),
+        "the chip must vanish when the arm does"
+    );
+
+    // A non-map active pane paints none: the drag the chip explains needs a
+    // projector, and the pane has none.
+    h.make_pane_volume(1);
+    h.mouse_click(region_toggle.center());
+    h.warm_up();
+    assert!(
+        !h.text_painted_in(panes[1], &hint),
+        "a volume pane must not promise a drag it cannot host"
+    );
+}
+
+/// **The `click_consumed` probe: a feature that answers a map click sets it;
+/// a click on bare map does not.**
+///
+/// The consumption half of M7's fade trigger, plumbed now so every consumer
+/// inherits the convention — asserted through the radar-site icon, the
+/// consumer a test can stage without overlay data.
+#[test]
+fn a_consumed_map_click_reports_itself_and_a_bare_one_does_not() {
+    let mut h = InputHarness::new();
+    h.close_layers();
+    h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
+    h.warm_up();
+
+    let pane = h.pane_rects()[0];
+    let spot = egui::pos2(pane.center().x + 150.0, pane.center().y);
+    h.place_site_at(0, "KTLX", spot);
+    h.mouse_click(spot);
+    assert!(
+        site_switches(&h).contains(&("KTLX".to_owned(), 0)),
+        "control: the icon really is under the click — without this the \
+         assertion below is vacuous"
+    );
+    assert!(
+        h.click_consumed(),
+        "a site icon that answered the click must report the consumption"
+    );
+
+    h.set_overlay_on_pane(0, OverlayKind::RadarSites, false);
+    h.mouse_click(spot);
+    assert_eq!(site_switches(&h), vec![], "control: nothing answers now");
+    assert!(
+        !h.click_consumed(),
+        "a click that fell through to the bare map must not read as consumed"
+    );
+}
+
+/// **Saving a user preset under a built-in's name is refused, with the
+/// reason inline** (§5.9 carried from the M4 review).
+///
+/// A user "Severe Wx" would put two identical tiles on screen with only one
+/// deletable. The refusal disables Save and says why; nothing is stored.
+#[test]
+fn a_user_preset_cannot_shadow_a_builtin_name() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.open_catalog();
+    h.mouse_click(h.catalog().save_tile.center());
+    h.warm_up();
+    let field = h.catalog().save_field.expect("the name editor opens");
+    h.mouse_click(field.center());
+    h.type_text("Severe Wx");
+    h.warm_up();
+
+    assert!(
+        h.painted_text_strings()
+            .iter()
+            .any(|t| t.contains("is a built-in preset")),
+        "the refusal must be explained inline; painted {:?}",
+        h.painted_text_strings()
+    );
+    let save = h.catalog().save_button.expect("the Save button is drawn");
+    h.mouse_click(save.center());
+    h.warm_up();
+    assert!(
+        h.gui_mut().presets_for_test().is_empty(),
+        "the shadowing preset must not be stored"
+    );
+    let severe: Vec<_> = h
+        .catalog()
+        .tiles
+        .iter()
+        .filter(|tile| tile.label == "Severe Wx")
+        .cloned()
+        .collect();
+    assert_eq!(severe.len(), 1, "exactly the built-in tile remains");
+    assert!(severe[0].delete.is_none(), "and it is the undeletable built-in");
+}
+
+/// **The save tile hides while the search is filtering** (§5.9 pinned rule):
+/// the search is for finding tiles, and a save offer matching the query
+/// would be the one tile that is not a result. The open name editor hides
+/// with it.
+#[test]
+fn the_save_tile_hides_while_searching() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.open_catalog();
+    assert!(
+        h.catalog().save_tile.is_positive(),
+        "precondition: the unfiltered view offers the save tile"
+    );
+    h.mouse_click(h.catalog().save_tile.center());
+    h.warm_up();
+    assert!(h.catalog().save_field.is_some(), "the editor opened");
+
+    h.mouse_click(h.catalog().search.center());
+    h.type_text("sev");
+    h.warm_up();
+    let catalog = h.catalog();
+    assert!(
+        !catalog.save_tile.is_positive(),
+        "the save tile must hide while a query filters"
+    );
+    assert!(
+        catalog.save_field.is_none(),
+        "and the open name editor hides with it"
+    );
+    assert!(
+        catalog
+            .tiles
+            .iter()
+            .any(|tile| tile.label == "Severe Wx"),
+        "control: the query still finds the built-in, so the hide is about \
+         the save tile and not the group"
+    );
+}
+
+/// **Applying a preset queues at most one fetch per overlay kind** (§5.9
+/// pinned rule): the handlers are global, so one fetch serves every pane
+/// the preset enabled a layer on — four panes must not mean four downloads.
+#[test]
+fn a_preset_apply_queues_one_fetch_per_kind() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.open_catalog();
+    let tile = h
+        .catalog_tile(crate::ui::CatalogGroup::Presets, "Severe Wx")
+        .expect("the built-in is offered");
+    h.mouse_click(tile.rect.center());
+
+    let mut fetched: Vec<OverlayKind> = Vec::new();
+    for action in h.last_actions() {
+        if let GuiAction::FetchOverlay { kind, .. } = action {
+            assert!(
+                !fetched.contains(kind),
+                "{kind:?} was fetched twice by one preset apply"
+            );
+            fetched.push(*kind);
+        }
+    }
+    assert!(
+        fetched.contains(&OverlayKind::SpcOutlook),
+        "control: the preset enables a dataless, never-polled layer, so \
+         exactly one fetch for it must be queued; got {fetched:?}"
+    );
+    assert_eq!(h.pane_count(), 4, "control: the preset really fanned out");
+}
+
+/// **A mid-session pane growth leaves the open stack above every pill row.**
+///
+/// egui auto-tops every area on its debut frame (`!visible_last_frame`), so
+/// the rows a pane-count growth debuts — the top bar's Panes segment here;
+/// a preset apply and a drawn section line grow the grid the same way —
+/// would land above the open panels if the pills pass' raise were a spent
+/// one-shot, and stay there until the user happened to click the panel. The
+/// pass re-arms its deferred raise on every debut instead (`ui_pills.rs`'s
+/// stacking note). Asserted through `layer_id_at` — the authority every
+/// click resolver consults — at points where the stack and a row really
+/// overlap.
+#[test]
+fn a_pane_growth_keeps_the_open_stack_above_the_pill_rows() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.set_pane_count(2);
+    h.open_layers();
+    h.warm_up();
+    let stack = h.layers_panel_rect().expect("the stack is open");
+    let row0 = h.pill_row(0).expect("pane 0 draws a pill row").rect;
+    let startup = stack.intersect(row0);
+    assert!(
+        startup.is_positive(),
+        "precondition: the stack floats across pane 0's corner"
+    );
+    assert_eq!(
+        h.top_layer_id_at(startup.center()),
+        Some(egui::Id::new("layers_panel")),
+        "control: the startup raise already holds the stack above row 0"
+    );
+
+    // Grow the grid under the open stack, the user's way.
+    let four = h
+        .pane_options()
+        .iter()
+        .find(|o| o.count == 4)
+        .expect("the Panes segment offers 4")
+        .rect;
+    h.mouse_click(four.center());
+    h.warm_up();
+    assert_eq!(h.pane_count(), 4, "precondition: the grid really grew");
+
+    // Re-read rather than reused: the growth reflows nothing about the
+    // stack today, but the claim is about where it stands *now*.
+    let stack = h.layers_panel_rect().expect("the stack is still open");
+    for row in h.pill_rows() {
+        let overlap = stack.intersect(row.rect);
+        if !overlap.is_positive() {
+            continue;
+        }
+        assert_eq!(
+            h.top_layer_id_at(overlap.center()),
+            Some(egui::Id::new("layers_panel")),
+            "pane {}'s pill row surfaced above the open stack",
+            row.pane_idx
+        );
+    }
+    // The loop must not have passed vacuously: the debuting bottom-left
+    // pane's row lands under the stack's lower half in this layout.
+    let row2 = h.pill_row(2).expect("pane 2 draws a pill row").rect;
+    assert!(
+        stack.intersect(row2).is_positive(),
+        "precondition: pane 2's debuting row overlaps the stack — without \
+         this the loop above asserted nothing about a debut"
+    );
+}
+
+/// **The same growth leaves the open inspector above the debuting row.**
+///
+/// The stack test's twin for the other panel the debut would sink: at
+/// 1020pt — barely Expanded — the inspector's left edge reaches past the
+/// map's midline, so the second pane's debuting row lands under it.
+#[test]
+fn a_pane_growth_keeps_the_open_inspector_above_the_pill_rows() {
+    let mut h = InputHarness::with_screen(egui::vec2(1020.0, 900.0));
+    h.set_pane_count(1);
+    h.open_settings();
+    h.warm_up();
+
+    let two = h
+        .pane_options()
+        .iter()
+        .find(|o| o.count == 2)
+        .expect("the Panes segment offers 2")
+        .rect;
+    h.mouse_click(two.center());
+    h.warm_up();
+    assert_eq!(h.pane_count(), 2, "precondition: the grid really grew");
+
+    let insp = h.inspector_rect().expect("the inspector stayed open");
+    let row1 = h.pill_row(1).expect("pane 1 draws a pill row").rect;
+    let overlap = insp.intersect(row1);
+    assert!(
+        overlap.is_positive(),
+        "precondition: pane 1's debuting row overlaps the inspector — \
+         without this the assertion below says nothing"
+    );
+    assert_eq!(
+        h.top_layer_id_at(overlap.center()),
+        Some(egui::Id::new("inspector_panel")),
+        "pane 1's pill row surfaced above the open inspector"
+    );
+}
+
+/// **Saving under an existing user preset's name replaces it, whatever the
+/// casing** — the same case-insensitivity the built-in refusal keeps, and
+/// for the same reason: "storm" and "Storm" would be two tiles a glance
+/// cannot tell apart. The replacement takes the newly typed casing.
+#[test]
+fn saving_a_preset_under_an_existing_name_replaces_it_case_insensitively() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    let save = |h: &mut InputHarness, name: &str| {
+        h.open_catalog();
+        if h.catalog().save_field.is_none() {
+            h.mouse_click(h.catalog().save_tile.center());
+            h.warm_up();
+        }
+        let field = h.catalog().save_field.expect("the name editor opens");
+        h.mouse_click(field.center());
+        h.type_text(name);
+        h.warm_up();
+        let button = h.catalog().save_button.expect("the Save button is drawn");
+        h.mouse_click(button.center());
+        h.warm_up();
+    };
+
+    save(&mut h, "storm");
+    assert_eq!(
+        h.gui_mut()
+            .presets_for_test()
+            .iter()
+            .map(|p| p.name.clone())
+            .collect::<Vec<_>>(),
+        vec!["storm".to_owned()],
+        "precondition: the first save stored one preset"
+    );
+
+    save(&mut h, "Storm");
+    assert_eq!(
+        h.gui_mut()
+            .presets_for_test()
+            .iter()
+            .map(|p| p.name.clone())
+            .collect::<Vec<_>>(),
+        vec!["Storm".to_owned()],
+        "resaving under the same name in another case must replace, not \
+         duplicate \u{2014} and the tile takes the newly typed casing"
+    );
+    let tiles: Vec<_> = h
+        .catalog()
+        .tiles
+        .iter()
+        .filter(|tile| tile.label.eq_ignore_ascii_case("storm"))
+        .cloned()
+        .collect();
+    assert_eq!(tiles.len(), 1, "exactly one tile carries the name");
 }

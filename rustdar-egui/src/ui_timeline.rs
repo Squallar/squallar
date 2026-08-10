@@ -801,10 +801,14 @@ impl super::Gui {
         // hold, and the escape hatch from shared time. The budget is the
         // running build's own, pushed in by the frontend
         // (`set_loop_frame_budget`) — not a guess from the width, which a
-        // 1400 pt Android tablet would get wrong.
+        // 1400 pt Android tablet would get wrong. "Sits out", not "stays
+        // frozen": scan delivery is site-keyed and ignores the link, so a
+        // live unlinked pane still follows new scans — the checkbox's own
+        // hover (`ui_pills::UNLINK_NOTE`) spells the full claim out.
         let caption = format!(
             "Loops keep up to {} frames on this platform \u{b7} a pane with \
-             \u{201c}Follows shared time\u{201d} off stays frozen",
+             \u{201c}Follows shared time\u{201d} off sits out the loop and \
+             shared navigation",
             self.loop_frame_budget
         );
         ui.label(egui::RichText::new(caption.as_str()).small().weak());

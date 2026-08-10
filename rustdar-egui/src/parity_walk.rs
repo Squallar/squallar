@@ -307,6 +307,31 @@ fn walk_settings(h: &mut InputHarness, width: WidthClass) {
     }
 }
 
+/// Every visible pane carries its pill row (M5): presence, at every width.
+/// Deliberately not a per-option leg — every option behind the pills is the
+/// inspector's own inventory through the shared pickers (`ui_pills.rs`'s
+/// module note), so the walk's existing inspector legs already audit them;
+/// what only the pills can lose is the rows themselves.
+fn walk_pills(h: &mut InputHarness, width: WidthClass) {
+    let panes = h.pane_rects();
+    assert!(!panes.is_empty(), "a layout always has a pane on {width:?}");
+    for (idx, pane) in panes.iter().enumerate() {
+        let row = h
+            .pill_row(idx)
+            .unwrap_or_else(|| panic!("pane {idx} drew no pill row on {width:?}"));
+        assert!(
+            pane.contains(row.rect.min),
+            "pane {idx}'s pill row sits outside its pane on {width:?}: \
+             row {:?}, pane {pane:?}",
+            row.rect
+        );
+        assert!(
+            !row.pills.is_empty(),
+            "pane {idx}'s pill row drew no pills on {width:?}"
+        );
+    }
+}
+
 /// The whole walk for one screen: layer controls through the layers panel,
 /// then the menu, the time dialog and the settings window through the ☰
 /// dropdown — the same routes at every width.
@@ -322,6 +347,7 @@ fn walk_every_option(size: egui::Vec2, expect: WidthClass) {
     walk_menu(&mut h, expect);
     walk_time_dialog(&mut h, expect);
     walk_settings(&mut h, expect);
+    walk_pills(&mut h, expect);
 }
 
 #[test]

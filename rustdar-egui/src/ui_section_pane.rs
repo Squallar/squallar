@@ -490,8 +490,11 @@ impl SectionLayout {
     /// whichever edge the bar took, or the bar lands on top of the section.
     fn new(pane_rect: egui::Rect, caption_height: f32, horizontal_color_scale: bool) -> Self {
         let labelled_axes = pane_rect.height() >= LABELLED_AXES_MIN_HEIGHT;
+        // Below the pane's pill row, not at the very corner: the row is an
+        // egui layer over the pane, so a caption under it would be covered
+        // and its ⓘ toggle unclickable (see `ui_pills::PILL_ROW_CLEARANCE`).
         let caption = egui::Rect::from_min_size(
-            pane_rect.min + egui::vec2(4.0, 2.0),
+            pane_rect.min + egui::vec2(4.0, crate::ui::PILL_ROW_CLEARANCE),
             egui::vec2(
                 caption_wrap_width(pane_rect, horizontal_color_scale),
                 caption_height,

@@ -322,6 +322,11 @@ struct UiConfig {
     /// "override off, default vector", which is what those sessions were.
     #[serde(default)]
     storm_motion_override: super::StormMotionOverride,
+    /// Whether the pane pill rows render at full opacity unconditionally —
+    /// the Interface section's "Pin pane controls". `#[serde(default)]`
+    /// loads an older config as unpinned, which is what those sessions were.
+    #[serde(default)]
+    pin_pane_controls: bool,
     /// The user's saved presets (§3.11). Built-ins are compiled in and never
     /// written here; an older config simply has none.
     #[serde(default)]
@@ -449,6 +454,7 @@ impl Default for UiConfig {
             overlay_states: serde_json::Map::new(),
             gps_config: rustdar_gps::GpsConfig::default(),
             storm_motion_override: super::StormMotionOverride::default(),
+            pin_pane_controls: false,
             presets: Vec::new(),
             volume_alpha: Vec::new(),
             volume_iso: Vec::new(),
@@ -586,6 +592,7 @@ impl super::Gui {
                     },
                 }
             },
+            pin_pane_controls: self.pin_pane_controls,
             // The elevations go through the same finiteness door; the capture
             // path already filters, so this guards only hand-poked state.
             presets: self
@@ -712,6 +719,7 @@ impl super::Gui {
         self.preferences = config.preferences;
         self.gps_config = config.gps_config;
         self.storm_motion_override = config.storm_motion_override;
+        self.pin_pane_controls = config.pin_pane_controls;
         self.presets = config.presets;
 
         // The Volume Alpha curves. Replaced wholesale rather than merged —

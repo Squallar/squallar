@@ -105,6 +105,7 @@ pub(crate) const SETTINGS_ROWS: &[&str] = &[
     "units.height",
     "units.precip_rate",
     "units.hail_size",
+    "interface.pin_controls",
     "location",
     "gps.port",
     "gps.baud",
@@ -262,6 +263,26 @@ impl super::Gui {
                     "Hail size",
                     &mut self.preferences.hail_size,
                     HailSizeUnit::ALL,
+                );
+                true
+            }
+            // --- Interface ---
+            //
+            // Landed at M5 with the pills themselves, deliberately not as an
+            // M4 placeholder row (the no-SOON rule; recorded in plan §5.9).
+            "interface.pin_controls" => {
+                section_break(ui);
+                ui.heading("Interface");
+                ui.add_space(SETTINGS_SMALL_SPACING);
+                ui.checkbox(&mut self.pin_pane_controls, "Pin pane controls");
+                ui.label(
+                    egui::RichText::new(
+                        "Unpinned, each pane's pill row idles translucent and \
+                         wakes when the pointer is over the pane \u{2014} or, \
+                         on touch, on a first tap.",
+                    )
+                    .small()
+                    .weak(),
                 );
                 true
             }

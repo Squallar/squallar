@@ -77,6 +77,15 @@ mod timeline;
 pub(crate) use timeline::TimelineProbe;
 #[path = "ui_topbar.rs"]
 mod topbar;
+#[path = "ui_pills.rs"]
+mod pills;
+/// What a pane's own top-left content leaves clear for its pill row — read
+/// by the section pane's layout and the 3D pane's caption.
+pub(crate) use pills::PILL_ROW_CLEARANCE;
+/// What the pill rows and their popovers drew last frame, for the input
+/// harness.
+#[cfg(test)]
+pub(crate) use pills::{PillKind, PillPopoverProbe, PillRowProbe};
 #[path = "ui_catalog.rs"]
 mod catalog;
 /// The preset shape, re-used by the config writer.
@@ -506,6 +515,20 @@ pub struct Gui {
     /// tests.
     #[cfg(test)]
     last_catalog: CatalogProbe,
+    /// What the last frame's pill rows actually drew, in pane order. Only
+    /// read by tests.
+    #[cfg(test)]
+    last_pills: Vec<pills::PillRowProbe>,
+    /// The pill popover the last frame drew, if one was open. Only read by
+    /// tests.
+    #[cfg(test)]
+    last_pill_popover: Option<pills::PillPopoverProbe>,
+    /// Whether some feature consumed the last frame's map click — the probe
+    /// half of the `click_consumed` plumbing M7's fade will read. Only read
+    /// by tests; production keeps the flag local to `render_panes` until the
+    /// fade exists to consult it.
+    #[cfg(test)]
+    last_click_consumed: bool,
     /// How many times handler `ControlItem`s were rendered this frame.
     ///
     /// The double-render guard: each render is a load→mutate→save round trip
@@ -749,9 +772,29 @@ pub struct Gui {
     catalog_save_name: String,
     /// See [`Self::catalog_save_name`].
     catalog_saving: bool,
-    /// The inspector site list's search text. Session-only, same terms as
-    /// [`Self::catalog_query`].
+    /// The site list's search text — the inspector body and the site pill's
+    /// popover filter through the one field, as they render the one list.
+    /// Session-only, same terms as [`Self::catalog_query`].
     site_query: String,
+    /// The pane whose pill row a first touch tap revealed, if any.
+    /// Session-only: a reveal is a gesture in progress, not a preference.
+    /// Cleared where the gestures that end it are resolved — a map click
+    /// that switches panes, or a confirmed map tap (`ui_map.rs`).
+    pill_revealed: Option<PaneId>,
+    /// How many pill rows the previous pills pass drew. The rows' areas are
+    /// keyed on contiguous `0..pane_count`, so this count *is* the set of
+    /// rows on screen last frame — and a pass drawing past it is a debut,
+    /// which egui auto-tops. Session-only bookkeeping.
+    pills_drawn_last_frame: usize,
+    /// A panel raise owed to the next pills pass — armed by every rows'
+    /// debut (startup, and any mid-session pane growth), performed one frame
+    /// later; see `ui_pills.rs`'s module note on stacking for why the raise
+    /// cannot happen on the debut frame itself. Session-only bookkeeping.
+    pills_raise_pending: bool,
+    /// Whether the pane pill rows render at full opacity unconditionally.
+    /// Persisted (`UiConfig::pin_pane_controls`); the settings body's
+    /// Interface section is the one writer.
+    pin_pane_controls: bool,
     /// The user's saved presets (§3.11). Persisted; the built-ins are
     /// compiled in beside them (`catalog::builtin_presets`) and never saved.
     presets: Vec<PresetConfig>,
@@ -1323,6 +1366,12 @@ impl Gui {
             #[cfg(test)]
             last_catalog: CatalogProbe::default(),
             #[cfg(test)]
+            last_pills: Vec::new(),
+            #[cfg(test)]
+            last_pill_popover: None,
+            #[cfg(test)]
+            last_click_consumed: false,
+            #[cfg(test)]
             control_render_passes: 0,
             #[cfg(test)]
             last_dropdowns: Vec::new(),
@@ -1362,6 +1411,10 @@ impl Gui {
             catalog_save_name: String::new(),
             catalog_saving: false,
             site_query: String::new(),
+            pill_revealed: None,
+            pills_drawn_last_frame: 0,
+            pills_raise_pending: false,
+            pin_pane_controls: false,
             presets: Vec::new(),
             // The desktop arm of `constants::MAX_LOOP_FRAMES`; the frontend
             // pushes the real target's value at startup.
@@ -1428,6 +1481,12 @@ impl Gui {
             self.last_stack = StackProbe::default();
             self.last_inspector = InspectorProbe::default();
             self.last_catalog = CatalogProbe::default();
+            // Per-frame records of the pill rows and their popover; a stale
+            // entry would report a row for a pane no longer on screen.
+            self.last_pills.clear();
+            self.last_pill_popover = None;
+            // Per-frame record of the pane loop's click consumption.
+            self.last_click_consumed = false;
             // The double-render guard's counter; see the field.
             self.control_render_passes = 0;
         }
@@ -1498,6 +1557,12 @@ impl Gui {
         // toggles rather than writing the flags, because the invariant belongs to
         // the arming rule rather than to this call order.
         self.apply_pending_region();
+
+        // The pill rows, after the pane loop and the appliers: outside every
+        // `mem::take` window, so a popover pick writes real panes, and after
+        // the kind appliers so a row states the kind its pane ended the
+        // frame as. See `ui_pills.rs`.
+        self.render_pane_pills(ctx, shell.map_rect, &mut actions);
 
         // The timeline transport, after the pane loop and the appliers: every
         // `mem::take` window in the frame has closed, so it reads and writes
@@ -2108,23 +2173,27 @@ impl Gui {
             ui.indent(format!("{id_prefix}radar_controls"), |ui| {
                 if let Some(scan_info) = &pane.scan_info {
                     let prev_product = pane.selected_product;
+                    // The combo's body is the shared product list — the same
+                    // function the product pill's popover renders — so the
+                    // two routes offer one inventory by construction
+                    // (`ui_pills.rs`'s module note).
                     let product_combo =
                         egui::ComboBox::from_id_salt(format!("{id_prefix}product_sel"))
                             .selected_text(pane.selected_product.name())
                             .width(combo_width)
                             .show_ui(ui, |ui| {
-                                for product in &scan_info.available_products {
-                                    ui.selectable_value(
-                                        &mut pane.selected_product,
-                                        *product,
-                                        product.name(),
-                                    );
-                                }
+                                pills::product_list_ui(
+                                    ui,
+                                    &scan_info.available_products,
+                                    pane.selected_product,
+                                )
+                                .picked
                             });
+                    if let Some(Some(picked)) = product_combo.inner {
+                        pane.selected_product = picked;
+                    }
                     #[cfg(test)]
                     probes.push(("product_sel", product_combo.response.id));
-                    #[cfg(not(test))]
-                    let _ = product_combo;
                     if prev_product != pane.selected_product {
                         pane.selected_elevation = 0.0;
                     }
@@ -2166,18 +2235,17 @@ impl Gui {
                                 .on_hover_text("Waiting for this product's data");
                             id
                         } else {
-                            combo
-                                .show_ui(ui, |ui| {
-                                    for angle in elevations.iter() {
-                                        ui.selectable_value(
-                                            &mut pane.selected_elevation,
-                                            *angle,
-                                            format!("{:.1}\u{b0}", angle),
-                                        );
-                                    }
-                                })
-                                .response
-                                .id
+                            // The shared tilt list — the tilt pill popover's
+                            // own body — for the same one-inventory reason
+                            // as the product combo above.
+                            let shown = combo.show_ui(ui, |ui| {
+                                pills::tilt_list_ui(ui, elevations, pane.selected_elevation)
+                                    .picked
+                            });
+                            if let Some(Some(angle)) = shown.inner {
+                                pane.selected_elevation = angle;
+                            }
+                            shown.response.id
                         };
                         // Both branches, so the probe reports the control existing
                         // rather than the elevation list happening to be populated.
@@ -2403,7 +2471,10 @@ impl Gui {
 
     /// Select the active pane's properties in the inspector and make sure it
     /// is open — the stack header's click, and the inspector crumb's `Pane N`
-    /// segment. (Interim routes: M5's pane pills take this over.)
+    /// segment. The pills are the primary pane-properties route now (each
+    /// pill *is* one of the properties; the pane-number pill activates, the
+    /// kind pill converts) — these two stay as harmless secondary ways into
+    /// the inspector body that shows them all at once.
     pub(super) fn select_pane_props(&mut self) {
         self.insp_scroll_reset = self.inspector_sel != InspectorSelection::PaneProps;
         self.inspector_sel = InspectorSelection::PaneProps;
@@ -3279,6 +3350,26 @@ impl Gui {
     pub(crate) fn catalog_for_test(&self) -> &CatalogProbe {
         &self.last_catalog
     }
+
+    /// What the last frame's pill rows drew, in pane order.
+    #[cfg(test)]
+    pub(crate) fn pill_rows_for_test(&self) -> &[pills::PillRowProbe] {
+        &self.last_pills
+    }
+
+    /// The pill popover the last frame drew, if one was open.
+    #[cfg(test)]
+    pub(crate) fn pill_popover_for_test(&self) -> Option<&pills::PillPopoverProbe> {
+        self.last_pill_popover.as_ref()
+    }
+
+    /// Whether some feature consumed the last frame's map click — see the
+    /// `last_click_consumed` field.
+    #[cfg(test)]
+    pub(crate) fn click_consumed_for_test(&self) -> bool {
+        self.last_click_consumed
+    }
+
 
     /// The user's saved presets, as the catalog holds them.
     #[cfg(test)]

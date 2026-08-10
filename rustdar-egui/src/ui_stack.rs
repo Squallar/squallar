@@ -90,7 +90,8 @@ pub(crate) struct StackRowProbe {
 pub(crate) struct StackProbe {
     /// The floating area's whole rect, off its own response.
     pub rect: egui::Rect,
-    /// The header title — the interim route to Pane properties.
+    /// The header title — a secondary route to Pane properties (the pills
+    /// are the primary one).
     pub header: egui::Rect,
     /// The ⟨ collapse button.
     pub collapse: egui::Rect,
@@ -200,10 +201,11 @@ impl super::Gui {
                                     {
                                         probe.header = header.rect;
                                     }
-                                    // The interim route to Pane properties,
-                                    // for every pane kind — the header names
-                                    // the pane, so clicking it selects the
-                                    // pane. M5's pills take this over.
+                                    // A route to Pane properties, for every
+                                    // pane kind — the header names the pane,
+                                    // so clicking it selects the pane. The
+                                    // pills are the primary route now; this
+                                    // stays as the panel's own way in.
                                     if header.clicked() {
                                         self.select_pane_props();
                                     }

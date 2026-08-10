@@ -59,11 +59,6 @@ const COMBO_BOX_WIDTH: f32 = 150.0;
 /// belongs to the control, not to which panel is hosting it.
 const LAYER_CONTROL_ID_PREFIX: &str = "layers_";
 
-/// The site list's height: enough rows to scan, small enough that the rest
-/// of the Pane-properties body stays in reach without scrolling past 200
-/// sites.
-const SITE_LIST_HEIGHT: f32 = 150.0;
-
 /// What the inspector drew last frame, as it was drawn.
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
@@ -292,8 +287,10 @@ impl super::Gui {
                             "Properties".to_owned()
                         }
                         InspectorSelection::Layer(kind) => {
-                            // The `Pane N` segment is the interim route to
-                            // Pane properties — M5's pills take this over.
+                            // The `Pane N` segment opens Pane properties.
+                            // The pills are the primary route to the pane's
+                            // properties now; this stays as the in-crumb way
+                            // to the body that shows them all at once.
                             let seg = ui
                                 .selectable_label(
                                     false,
@@ -385,32 +382,22 @@ impl super::Gui {
         ui.add_space(4.0);
 
         // The kind segmented control — the same three targets the ☰ menu and
-        // the armed drags reach, in one row. Through `request_pane_kind`,
-        // **not** `set_kind`: this runs inside the shell's take window, where
-        // a direct write lands on the placeholder in the vector and is
-        // silently discarded (see `pending_pane_kind`).
+        // the armed drags reach, in one row. The shared picker body
+        // (`ui_pills::kind_list_ui`) and the shared chooser
+        // (`Gui::pick_pane_kind`) are the kind pill popover's own, so the
+        // two routes offer and mean the same things by construction. Through
+        // `request_pane_kind` inside the chooser, **not** `set_kind`: this
+        // runs inside the shell's take window, where a direct write lands on
+        // the placeholder in the vector and is silently discarded (see
+        // `pending_pane_kind`).
         let current = pane.kind();
-        ui.horizontal(|ui| {
-            for (kind, label) in [
-                (crate::pane::PaneKind::Map, "Map"),
-                (crate::pane::PaneKind::Volume, "3D Volume"),
-                (crate::pane::PaneKind::CrossSection, "Cross-section"),
-            ] {
-                let selected = current == kind;
-                if ui.selectable_label(selected, label).clicked() && !selected {
-                    self.request_pane_kind(self.active_pane, kind);
-                    // A section pane with no line is a pane waiting to be
-                    // aimed, so choosing the kind arms the draw — the same
-                    // gesture the menu's "Draw cross-section" entry arms,
-                    // saving the trip back to the menu.
-                    if kind == crate::pane::PaneKind::CrossSection
-                        && pane.cross_section().and_then(|s| s.line).is_none()
-                    {
-                        self.set_section_draw_armed(true);
-                    }
-                }
-            }
-        });
+        let picked = ui
+            .horizontal(|ui| super::pills::kind_list_ui(ui, current).picked)
+            .inner;
+        if let Some(kind) = picked {
+            let line_absent = pane.cross_section().and_then(|s| s.line).is_none();
+            self.pick_pane_kind(self.active_pane, kind, line_absent);
+        }
         ui.add_space(4.0);
 
         self.render_site_search(
@@ -445,7 +432,10 @@ impl super::Gui {
             let link_was = pane.time_link;
             let link = ui
                 .checkbox(&mut pane.time_link, "\u{1f517}  Follows shared time")
-                .on_hover_text("Off freezes this pane: shared time navigation and the loop leave it alone");
+                // The pill popover's own sentence, shared so the two routes
+                // cannot describe unlinking differently — and careful about
+                // "frozen"; see `ui_pills::UNLINK_NOTE`.
+                .on_hover_text(super::pills::UNLINK_NOTE);
             #[cfg(test)]
             {
                 // The state the checkbox was handed, not the one the click
@@ -475,9 +465,12 @@ impl super::Gui {
     /// highlighted (plan §1.4 — the first *list* route to a site; the map's
     /// clickable icons were the only picker before this).
     ///
-    /// A row click emits the same [`GuiAction::SwitchRadarSite`] the map icon
-    /// emits, with the same in-flight marker on the pane, so the two routes
-    /// cannot mean different things.
+    /// The list itself is the shared [`super::pills::site_list_ui`] — the
+    /// site pill popover renders the same function over the same
+    /// `site_query`, so the two routes are one inventory by construction. A
+    /// row click emits the same [`GuiAction::SwitchRadarSite`] the map icon
+    /// emits, with the same in-flight marker on the pane, so the routes
+    /// cannot mean different things either.
     fn render_site_search(
         &mut self,
         ui: &mut egui::Ui,
@@ -485,8 +478,6 @@ impl super::Gui {
         actions: &mut Vec<GuiAction>,
         #[cfg(test)] probe: &mut InspectorProbe,
     ) {
-        use rustdar_radar::sites::RADARS;
-
         // One explicit-id child scope for the whole block: the row count
         // below follows the filter, so without it every widget drawn after
         // this block would re-key each time the query changed — the same
@@ -506,64 +497,20 @@ impl super::Gui {
             #[cfg(not(test))]
             let _ = search;
 
-            // The codes are the table's names; uppercased so a lowercase
-            // query still finds them.
-            let query = self.site_query.trim().to_uppercase();
-            let shown: Vec<&rustdar_radar::sites::RadarSite> = RADARS
-                .iter()
-                .filter(|site| query.is_empty() || site.name.contains(query.as_str()))
-                .collect();
-
-            // Computed from the table, not restated: the split is the
-            // caption's claim, and a hardcoded count would outlive an edit.
-            let total = RADARS.len();
-            let tdwr = RADARS.iter().filter(|site| site.is_tdwr()).count();
-            let caption = format!(
-                "{} shown \u{b7} {} sites ({} NEXRAD + {} TDWR)",
-                shown.len(),
-                total,
-                total - tdwr,
-                tdwr
-            );
-            ui.label(egui::RichText::new(caption.as_str()).small().weak());
+            let outcome = super::pills::site_list_ui(ui, &self.site_query, &pane.site);
             #[cfg(test)]
             {
-                probe.site_caption = caption;
+                probe.site_caption = outcome.caption.clone();
+                probe.site_rows = outcome.rows.clone();
             }
-            #[cfg(not(test))]
-            let _ = caption;
-
-            egui::ScrollArea::vertical()
-                .id_salt("site_list")
-                .max_height(SITE_LIST_HEIGHT)
-                .show(ui, |ui| {
-                    for site in shown {
-                        let current = pane.site == site.name;
-                        // TDWRs are marked in the row: they are pickable —
-                        // the map icons allow them too — but the Level II
-                        // archive has nothing for them, and the caption's
-                        // split deserves to be visible per row.
-                        let label = if site.is_tdwr() {
-                            format!("{} \u{b7} TDWR", site.name)
-                        } else {
-                            site.name.to_owned()
-                        };
-                        let row = ui.selectable_label(current, label.as_str());
-                        #[cfg(test)]
-                        probe
-                            .site_rows
-                            .push((site.name.to_owned(), row.rect, current));
-                        if row.clicked() && !current {
-                            pane.loading_site = Some(site.name.to_owned());
-                            pane.radar_sites_render_gen =
-                                pane.radar_sites_render_gen.wrapping_add(1);
-                            actions.push(GuiAction::SwitchRadarSite {
-                                site: site.name.to_owned(),
-                                pane_idx: self.active_pane,
-                            });
-                        }
-                    }
+            if let Some(picked) = outcome.picked {
+                pane.loading_site = Some(picked.clone());
+                pane.radar_sites_render_gen = pane.radar_sites_render_gen.wrapping_add(1);
+                actions.push(GuiAction::SwitchRadarSite {
+                    site: picked,
+                    pane_idx: self.active_pane,
                 });
+            }
         });
     }
 }

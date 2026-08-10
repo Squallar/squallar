@@ -143,6 +143,14 @@ impl super::Gui {
 
                 let pointer_available = self.dismiss_overlay_popups(ui.ctx());
 
+                // Whether some feature consumed this frame's confirmed map
+                // click — an overlay polygon hit, a radar-site icon. One flag
+                // for the whole pane loop, threaded through `PaneRenderCtx`:
+                // M7's fade trigger is "an unconsumed click on the
+                // already-active pane", and this is the consumption half of
+                // it. Nothing reads it yet beyond the probe.
+                let mut click_consumed = false;
+
                 // Rects of chrome painted over the map with no layer of its
                 // own. Clicks there must not become overlay polygon hit-tests.
                 // The list is empty since the top bar replaced the hamburger,
@@ -213,6 +221,12 @@ impl super::Gui {
                     // CONVENTION: New map click handlers MUST use overlay_click_pos from
                     // PaneRenderCtx — never read raw click events via ctx.input() for
                     // map-level interactions, as that bypasses dialog blocking.
+                    // And every handler that ACTS on overlay_click_pos MUST set
+                    // `*ctx.click_consumed = true` when it does, so M7's fade can
+                    // tell a click a feature answered from one that fell through
+                    // to the bare map. Current consumers: the overlay feature
+                    // hit-testing (where `selected_overlays` is pushed) and the
+                    // radar-site icon clicks, both in `ui_map_pane.rs`.
                     //
                     // While the cross-section draw is armed, the active *map*
                     // pane resolves through the line detector instead — a third
@@ -281,6 +295,15 @@ impl super::Gui {
                     } else {
                         pointer.overlay_click_pos
                     };
+                    // A confirmed map tap puts a touch-revealed pill row
+                    // back to sleep: the reveal was granted for a glance at
+                    // this pane's controls, and a tap that reached the map
+                    // is the user working the map again. A tap on the row
+                    // itself never gets here — the pills are an egui layer,
+                    // and the click gate above already dropped it.
+                    if overlay_click_pos.is_some() {
+                        self.pill_revealed = None;
+                    }
                     // The third reason a map pane's pan is suppressed, and the
                     // only unarmed one: a drag on a section handle. Two halves,
                     // because the decision is needed *now* and the authoritative
@@ -420,6 +443,7 @@ impl super::Gui {
                                             excluded_rects: excluded_rects.to_vec(),
                                             long_press_pos: pointer.long_press_pos,
                                             overlay_click_pos,
+                                            click_consumed: &mut click_consumed,
                                             preferences: &self.preferences,
                                             region: pane_render::RegionCtx {
                                                 armed: region_arm,
@@ -521,6 +545,35 @@ impl super::Gui {
                         }
                     }
 
+                    // The armed-tool hint chip (plan §1.7): while a modal
+                    // drag is armed, the active map pane says what the drag
+                    // will do — centred, painted, non-interactive, in the
+                    // armed mode's own colours. Only the active map pane: it
+                    // is the pane the arm's gesture is aimed at, and a chip
+                    // on every pane would read as five armed modes. Painted
+                    // on its own sub-layer, like the pending-render notice,
+                    // so nothing drawn later in the pane can cover it.
+                    if is_active && matches!(pane.kind(), PaneKind::Map) {
+                        if region_arm {
+                            paint_armed_hint_chip(
+                                &ctx,
+                                pane_idx,
+                                pane_rect,
+                                &region_arm_hint(),
+                                // The armed region drag's own box colour.
+                                crate::ui_region::REGION_ARM_COLOR,
+                            );
+                        } else if self.section_draw_armed() {
+                            paint_armed_hint_chip(
+                                &ctx,
+                                pane_idx,
+                                pane_rect,
+                                SECTION_ARM_HINT,
+                                SECTION_TRACK_COLOR,
+                            );
+                        }
+                    }
+
                     // Restore map_memory and pane
                     pane.map_memory = map_memory;
                     self.panes[pane_idx] = pane;
@@ -529,6 +582,15 @@ impl super::Gui {
                         draw_pane_border(ui, pane_rect, is_active);
                     }
                 } // end pane loop
+
+                // What the loop's consumers decided, for the harness — the
+                // fade itself is M7's.
+                #[cfg(test)]
+                {
+                    self.last_click_consumed = click_consumed;
+                }
+                #[cfg(not(test))]
+                let _ = click_consumed;
 
                 // Handle divider dragging on a foreground layer so they
                 // take priority over map panning in the overlap zone.
@@ -975,6 +1037,10 @@ impl super::Gui {
                 let rect = self.pane_layout.pane_rect(idx, panel_rect);
                 if rect.contains(pos) && idx != self.active_pane {
                     self.active_pane = idx;
+                    // A pane switch ends a touch reveal: the revealed row
+                    // belonged to the pane the user has just left for
+                    // another.
+                    self.pill_revealed = None;
                     break;
                 }
             }
@@ -1671,7 +1737,11 @@ fn paint_volume_caption(ui: &egui::Ui, pane_rect: egui::Rect, lines: &[String]) 
         egui::Color32::from_rgb(235, 235, 235),
         pane_rect.width() - 2.0 * CAPTION_MARGIN,
     );
-    let origin = pane_rect.left_top() + egui::vec2(CAPTION_MARGIN, CAPTION_MARGIN);
+    // Below the pane's pill row, not at the very corner — the row is an
+    // egui layer over the pane and would cover the caption (see
+    // `ui_pills::PILL_ROW_CLEARANCE`).
+    let origin =
+        pane_rect.left_top() + egui::vec2(CAPTION_MARGIN, crate::ui::PILL_ROW_CLEARANCE);
     ui.painter().rect_filled(
         egui::Rect::from_min_size(origin, galley.size()).expand(4.0),
         3.0,
@@ -1718,6 +1788,82 @@ fn paint_pane_empty_state(ui: &mut egui::Ui, pane_rect: egui::Rect, text: &str) 
 /// hazard colour or a muted grey, and the radar image underneath spans the whole
 /// spectrum. A track has to stay findable over a 70 dBZ core.
 const SECTION_TRACK_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 214, 10);
+
+/// What the armed cross-section draw's hint chip says.
+pub(crate) const SECTION_ARM_HINT: &str = "Drag A\u{2013}B to draw cross-section";
+
+/// What the armed region drag's hint chip says: the gesture, then the box
+/// sizes the resampler will actually honour — computed from the same
+/// constants `VolumeRegion::new` clamps by and `box_size_km` falls back to,
+/// so the chip cannot state sizes the drag will not deliver.
+pub(crate) fn region_arm_hint() -> String {
+    format!(
+        "Drag to pick 3D region \u{b7} box {:.0}\u{2013}{:.0} km (default {:.0} km)",
+        2.0 * rustdar_radar::voxel::MIN_HALF_WIDTH_KM,
+        2.0 * rustdar_radar::voxel::MAX_HALF_WIDTH_KM,
+        2.0 * crate::pane::DEFAULT_HALF_WIDTH_KM,
+    )
+}
+
+/// Padding between the hint chip's text and its dashed border, each axis.
+const ARMED_HINT_PADDING: egui::Vec2 = egui::vec2(12.0, 8.0);
+
+/// Dash and gap of the chip's border, points.
+const ARMED_HINT_DASH: f32 = 6.0;
+const ARMED_HINT_GAP: f32 = 4.0;
+
+/// Paint the armed-tool hint chip: a centred, non-interactive dashed-border
+/// chip naming the drag the armed mode is waiting for.
+///
+/// Painter only — no widget: the chip explains a gesture, and a widget here
+/// would both consume one of the pane's auto-ids and sit in the very spot
+/// the drag it describes starts in. The colours are the armed modes' own —
+/// the region drag's box yellow or [`SECTION_TRACK_COLOR`] — over the same
+/// translucent black the section track's halo uses, so the chip reads over
+/// any radar core without adding a colour the map does not already have.
+///
+/// On its own sub-layer (the pending-render notice's arrangement), clipped
+/// to the pane, so a pane's later drawing cannot cover it and it cannot leak
+/// into the pane next door.
+fn paint_armed_hint_chip(
+    ctx: &egui::Context,
+    pane_idx: usize,
+    pane_rect: egui::Rect,
+    text: &str,
+    color: egui::Color32,
+) {
+    let layer = egui::LayerId::new(
+        egui::Order::Background,
+        egui::Id::new(("armed_hint_chip", pane_idx)),
+    );
+    let painter = ctx.layer_painter(layer).with_clip_rect(pane_rect);
+    let galley = painter.layout_no_wrap(text.to_owned(), egui::FontId::proportional(13.0), color);
+    let rect = egui::Rect::from_center_size(
+        pane_rect.center(),
+        galley.size() + 2.0 * ARMED_HINT_PADDING,
+    );
+    // The section-track halo's translucent black, as a fill.
+    painter.rect_filled(
+        rect,
+        4.0,
+        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 140),
+    );
+    let stroke = egui::Stroke::new(1.0, color);
+    for (a, b) in [
+        (rect.left_top(), rect.right_top()),
+        (rect.right_top(), rect.right_bottom()),
+        (rect.right_bottom(), rect.left_bottom()),
+        (rect.left_bottom(), rect.left_top()),
+    ] {
+        painter.extend(egui::Shape::dashed_line(
+            &[a, b],
+            stroke,
+            ARMED_HINT_DASH,
+            ARMED_HINT_GAP,
+        ));
+    }
+    painter.galley(rect.min + ARMED_HINT_PADDING, galley, egui::Color32::PLACEHOLDER);
+}
 
 /// Segments a committed ground track is drawn with.
 ///

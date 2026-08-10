@@ -587,6 +587,37 @@ impl InputHarness {
         self.gui.timeline_for_test().clone()
     }
 
+    /// What the last frame's pill rows drew, in pane order.
+    pub(crate) fn pill_rows(&self) -> Vec<crate::ui::PillRowProbe> {
+        self.gui.pill_rows_for_test().to_vec()
+    }
+
+    /// Pane `idx`'s pill row, if the last frame drew one.
+    pub(crate) fn pill_row(&self, idx: usize) -> Option<crate::ui::PillRowProbe> {
+        self.pill_rows().into_iter().find(|row| row.pane_idx == idx)
+    }
+
+    /// Pane `idx`'s `kind` pill — its drawn text and rect — if the last
+    /// frame drew one.
+    pub(crate) fn pill(&self, idx: usize, kind: crate::ui::PillKind) -> Option<(String, egui::Rect)> {
+        self.pill_row(idx)?
+            .pills
+            .into_iter()
+            .find(|(k, _, _)| *k == kind)
+            .map(|(_, text, rect)| (text, rect))
+    }
+
+    /// The pill popover the last frame drew, if one was open.
+    pub(crate) fn pill_popover(&self) -> Option<crate::ui::PillPopoverProbe> {
+        self.gui.pill_popover_for_test().cloned()
+    }
+
+    /// Whether some feature consumed the last frame's map click — the
+    /// `click_consumed` probe M7's fade will stand on.
+    pub(crate) fn click_consumed(&self) -> bool {
+        self.gui.click_consumed_for_test()
+    }
+
     /// What the last frame's Add-layer catalog drew.
     pub(crate) fn catalog(&self) -> crate::ui::CatalogProbe {
         self.gui.catalog_for_test().clone()
@@ -1443,6 +1474,13 @@ impl InputHarness {
         self.ctx
             .layer_id_at(pos)
             .is_some_and(|l| l.order > egui::Order::Background)
+    }
+
+    /// The id of the topmost egui layer at `pos`, if any — the same authority
+    /// [`Self::is_floating_layer_at`] consults, exposed whole so a test can
+    /// name *which* surface owns a point where two floating things overlap.
+    pub(crate) fn top_layer_id_at(&self, pos: egui::Pos2) -> Option<egui::Id> {
+        self.ctx.layer_id_at(pos).map(|layer| layer.id)
     }
 
     /// Current map zoom.

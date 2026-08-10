@@ -530,6 +530,16 @@ impl super::Gui {
         });
 
         if self.catalog_saving && offer_save {
+            // A name a built-in already owns is refused, with the reason
+            // inline: a user preset named "Severe Wx" would put two
+            // identical tiles on screen with only one deletable, and the
+            // built-ins cannot be replaced the way a user's own are.
+            // Case-insensitive, because "severe wx" would make two tiles a
+            // glance cannot tell apart either.
+            let name = self.catalog_save_name.trim().to_owned();
+            let shadows_builtin = builtin_presets()
+                .iter()
+                .any(|p| p.name.eq_ignore_ascii_case(&name));
             ui.horizontal(|ui| {
                 ui.label("Name:");
                 let field = ui.add(
@@ -537,8 +547,10 @@ impl super::Gui {
                         .id_salt("preset_name")
                         .desired_width(160.0),
                 );
-                let name = self.catalog_save_name.trim().to_owned();
-                let save = ui.add_enabled(!name.is_empty(), egui::Button::new("Save"));
+                let save = ui.add_enabled(
+                    !name.is_empty() && !shadows_builtin,
+                    egui::Button::new("Save"),
+                );
                 #[cfg(test)]
                 {
                     probe.save_field = Some(field.rect);
@@ -550,9 +562,16 @@ impl super::Gui {
                     let preset = self.capture_preset(name.clone());
                     // Saving under an existing user preset's name replaces
                     // it: two tiles with one name would be two buttons the
-                    // user cannot tell apart.
-                    if let Some(existing) =
-                        self.presets.iter_mut().find(|p| p.name == name)
+                    // user cannot tell apart. Case-insensitive, on the same
+                    // reasoning as the built-in refusal above — "storm" and
+                    // "Storm" are two tiles a glance cannot tell apart — and
+                    // the replacement takes the newly typed casing. Built-in
+                    // names never get this far — the refusal disables Save
+                    // for them.
+                    if let Some(existing) = self
+                        .presets
+                        .iter_mut()
+                        .find(|p| p.name.eq_ignore_ascii_case(&name))
                     {
                         *existing = preset;
                     } else {
@@ -562,6 +581,15 @@ impl super::Gui {
                     self.catalog_save_name.clear();
                 }
             });
+            if shadows_builtin {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "\u{201c}{name}\u{201d} is a built-in preset \u{2014} pick another name"
+                    ))
+                    .small()
+                    .weak(),
+                );
+            }
         }
 
         if let Some(i) = delete {
