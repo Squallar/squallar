@@ -45,7 +45,7 @@ use rustdar_frontend::egui_renderer::AttachmentConfig;
 use rustdar_frontend::volume::raymarch::{
     ENTRY_FS_BLIT_GAMMA, ENTRY_FS_BLIT_LINEAR, OffscreenTarget, VolumePipelines,
 };
-use rustdar_frontend::volume::uniform::{NEAREST_RECONSTRUCTION, VolumeUniform};
+use rustdar_frontend::volume::uniform::{ISO_OFF, NEAREST_RECONSTRUCTION, VolumeUniform};
 
 /// Open a pass that clears to opaque black, which is what `EguiRenderer::draw`
 /// does.
@@ -581,6 +581,193 @@ fn an_isosurface_paints_an_opaque_lit_surface_from_the_data_alone() {
         [0, 0, 0, 0],
         "a threshold above every value in the grid still painted a surface",
     );
+}
+
+/// A grey ramp table: entry `i` is the colour `(i, i, i)`, opaque.
+///
+/// With [`VolumeUniform::ambient`] at 1 the isosurface's half-Lambert wrap
+/// collapses to exactly 1, so a pixel's grey level *is* the palette index the
+/// surface was found at, to within the 8-bit round trip. That is what turns
+/// "where did the surface land" into something a test can read off a pixel.
+fn grey_ramp_lut() -> Vec<u8> {
+    let mut lut = vec![0u8; VOLUME_LUT_BYTES];
+    for (i, entry) in lut.chunks_exact_mut(4).enumerate() {
+        let level = i as u8;
+        entry.copy_from_slice(&[level, level, level, 255]);
+    }
+    // Entry 0 is the no-data index and is transparent in every real table.
+    lut[0..4].copy_from_slice(&[0, 0, 0, 0]);
+    lut
+}
+
+/// An `8 x 8 x nz` grid whose index depends only on the slab: `levels[k]` is
+/// the value of every cell in slab `k`.
+///
+/// The eye of [`eye_outside`]`(2)` is above the box, so a ray descends through
+/// slab `nz-1` first and slab 0 last.
+fn slab_ramp(levels: &[u8]) -> ([u32; 3], Vec<u8>) {
+    let cells = [8u32, 8, levels.len() as u32];
+    let mut indices = Vec::with_capacity((cells[0] * cells[1] * cells[2]) as usize);
+    for level in levels {
+        indices.extend(std::iter::repeat_n(*level, (cells[0] * cells[1]) as usize));
+    }
+    (cells, indices)
+}
+
+/// A uniform ready for an isosurface measurement: ambient light only, so
+/// shading is exactly 1, and no index band skipped.
+fn iso_uniform(cells: [u32; 3]) -> VolumeUniform {
+    let mut uniform = VolumeUniform::new([10.0, 10.0, 10.0], cells);
+    uniform.box_from_clip = box_from_clip_down(2);
+    uniform.eye_in_box = eye_outside(2);
+    uniform.ambient = 1.0;
+    uniform.empty_index_threshold = 0.5 / 255.0;
+    uniform
+}
+
+/// Every grey level in the middle of the image, as `(min, max)`.
+fn grey_span(pixels: &[[u8; 4]], size: [u32; 2]) -> (u8, u8) {
+    let (mut lo, mut hi) = (u8::MAX, u8::MIN);
+    for y in size[1] / 4..size[1] * 3 / 4 {
+        for x in size[0] / 4..size[0] * 3 / 4 {
+            let p = pixels[(y * size[0] + x) as usize];
+            assert_eq!(p[3], 255, "the isosurface must be opaque at ({x}, {y})");
+            lo = lo.min(p[0]);
+            hi = hi.max(p[0]);
+        }
+    }
+    (lo, hi)
+}
+
+/// The isosurface sits where the value crosses the threshold, not where the
+/// sample comb happened to notice — which is what `refine_iso_hit`'s bisection
+/// is for, and what the one shipped isosurface test could not see.
+///
+/// That test fills the box uniformly, so its only crossing is the box's own
+/// entry face and `refine_iso_hit` is handed a degenerate interval: replacing
+/// its whole body with `return t_hi_in` passed 149/149 host, 11/11 GPU and
+/// 10/10 silhouette tests.
+///
+/// The fixture here is a graded field — four slabs whose index rises along the
+/// ray — read through a grey ramp table under ambient-only light, so a pixel's
+/// grey level *is* the index the surface was found at. Two things then follow,
+/// and each is a different half of the bug:
+///
+/// * the level equals the threshold, because that is where the field crosses
+///   it; and
+/// * every pixel agrees, because the sample comb is **jittered per pixel**
+///   (`interleaved_gradient_noise`), so an unrefined hit lands wherever that
+///   pixel's stratum fell and the surface comes back as speckle spanning a
+///   whole slab of index.
+///
+/// ```text
+/// cargo test -p rustdar-frontend --test volume_gpu \
+///     an_isosurface_sits_where_the_value_crosses_not_where_the_comb_noticed \
+///     -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
+fn an_isosurface_sits_where_the_value_crosses_not_where_the_comb_noticed() {
+    let _serialised = gpu_lock();
+    let size = [64, 64];
+    // Slab 3 is met first (index 40) and slab 0 last (index 208): 56 index
+    // units per slab, which is the amplitude of the speckle an unrefined hit
+    // would produce.
+    let (cells, indices) = slab_ramp(&[208, 152, 96, 40]);
+    let lut = grey_ramp_lut();
+
+    let (device, queue) = device();
+    let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Bgra8Unorm));
+    pipelines.upload_quad(&queue);
+
+    let mut uniform = iso_uniform(cells);
+    uniform.iso_centre = ISO_OFF;
+    // A threshold three tenths of the way from slab 2's 96 to slab 1's 152, so
+    // the crossing sits well inside a step and cannot coincide with the comb.
+    const THRESHOLD: u8 = 113;
+    uniform.iso_threshold = f32::from(THRESHOLD) / 255.0;
+
+    let pixels = raymarch_once(
+        &device, &queue, &pipelines, cells, &indices, &lut, &uniform, size,
+    );
+    let (lo, hi) = grey_span(&pixels, size);
+    assert!(
+        u32::from(hi) - u32::from(lo) <= 4,
+        "the surface came back as speckle spanning [{lo}, {hi}] of grey: the \
+         hit was taken at whatever jittered sample noticed the crossing, not \
+         at the crossing",
+    );
+    let level = i32::from(lo) + (i32::from(hi) - i32::from(lo)) / 2;
+    assert!(
+        (level - i32::from(THRESHOLD)).abs() <= 4,
+        "the surface is drawn at index {level}, where the field crosses the \
+         threshold at {THRESHOLD}",
+    );
+}
+
+/// A diverging isosurface is the level set of the **deviation** from its
+/// centre, so it draws both lobes — which is what `iso_field`'s fold is for,
+/// and what nothing measured.
+///
+/// Deleting that fold (`return index`) turned every diverging surface into a
+/// sequential one and passed the whole suite: the only isosurface test filled
+/// its box uniformly and set `iso_centre` to the sequential sentinel, so the
+/// fold was never taken.
+///
+/// Both fixtures start at the centre index at the box's near face and ramp
+/// *away* from it, one downward and one upward. Under the fold each finds its
+/// own lobe, at its own index, on its own side. Without it both collapse to
+/// "the first index over the threshold", which on either ramp is the very
+/// first sample — the centre value itself.
+///
+/// ```text
+/// cargo test -p rustdar-frontend --test volume_gpu \
+///     a_diverging_isosurface_draws_both_lobes_of_its_own_field \
+///     -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
+fn a_diverging_isosurface_draws_both_lobes_of_its_own_field() {
+    let _serialised = gpu_lock();
+    let size = [64, 64];
+    const CENTRE: u8 = 128;
+    const DEVIATION: u8 = 34;
+    let lut = grey_ramp_lut();
+
+    let (device, queue) = device();
+    let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Bgra8Unorm));
+    pipelines.upload_quad(&queue);
+
+    // Slab 3 is met first and holds the centre exactly, so neither ramp can
+    // cross at the box's entry face — the degenerate hit the shipped test
+    // takes.
+    for (levels, lobe, expected) in [
+        ([68u8, 88, 108, CENTRE], "the low lobe", CENTRE - DEVIATION),
+        ([188, 168, 148, CENTRE], "the high lobe", CENTRE + DEVIATION),
+    ] {
+        let (cells, indices) = slab_ramp(&levels);
+        let mut uniform = iso_uniform(cells);
+        uniform.iso_centre = f32::from(CENTRE) / 255.0;
+        uniform.iso_threshold = f32::from(DEVIATION) / 255.0;
+
+        let pixels = raymarch_once(
+            &device, &queue, &pipelines, cells, &indices, &lut, &uniform, size,
+        );
+        let (lo, hi) = grey_span(&pixels, size);
+        let level = i32::from(lo) + (i32::from(hi) - i32::from(lo)) / 2;
+        assert!(
+            (level - i32::from(expected)).abs() <= 5,
+            "{lobe}: the surface is drawn at index {level} (span [{lo}, {hi}]), \
+             where |value \u{2212} {CENTRE}| reaches {DEVIATION} at {expected}. \
+             An index read straight through would put it at {CENTRE}.",
+        );
+        assert!(
+            (level - i32::from(CENTRE)).abs() > 10,
+            "{lobe}: the surface sits on the centre index itself, which is \
+             where a threshold read against the raw index rather than against \
+             the deviation would put it",
+        );
+    }
 }
 
 /// Opacity is per kilometre travelled, not per box diagonal.

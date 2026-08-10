@@ -600,7 +600,7 @@ fn a_storm_motion_edit_re_derives_the_cross_section() {
     // edit path, so the staleness key is cleared the way a real drag
     // clears it — the half that already worked, and the half that made
     // this bug invisible.
-    let mut drag = |app: &mut crate::app::App, speed: f32, direction: f32, enabled: bool| {
+    let drag = |app: &mut crate::app::App, speed: f32, direction: f32, enabled: bool| {
         app.gui.storm_motion_override = rustdar_egui::StormMotionOverride {
             enabled,
             speed_kt: speed,
