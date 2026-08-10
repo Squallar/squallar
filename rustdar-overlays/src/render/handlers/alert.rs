@@ -146,6 +146,34 @@ impl OverlayHandler for NwsAlertHandler {
         self.state.data_generation
     }
 
+    /// The **warning-set** signature: a fold over the ids of the alerts that
+    /// would draw — category-enabled and not hidden — rather than the fetch
+    /// counter. NWS alerts auto-poll every two minutes and the active set is
+    /// usually unchanged, so a consumer keyed on [`data_generation`] would
+    /// re-render on every poll for nothing; this token moves exactly when
+    /// the drawn set moves (a warning issued, expired, hidden, or a whole
+    /// category toggled off). XOR of per-id hashes, so it is order-free the
+    /// way a set is; ids are unique within a response, and an alert whose
+    /// geometry changes upstream arrives under a fresh id.
+    ///
+    /// [`data_generation`]: OverlayHandler::data_generation
+    fn content_signature(&self) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut folded = 0u64;
+        let mut visible = 0u64;
+        for item in &self.state.data {
+            if self.enabled_categories.contains(&item.alert.category)
+                && !self.hidden_alerts.contains(&item.alert.id)
+            {
+                let mut hasher = DefaultHasher::new();
+                item.alert.id.hash(&mut hasher);
+                folded ^= hasher.finish();
+                visible += 1;
+            }
+        }
+        folded ^ visible.rotate_left(32)
+    }
+
     fn has_data(&self) -> bool {
         !self.state.data.is_empty()
     }
@@ -380,5 +408,136 @@ impl OverlayHandler for NwsAlertHandler {
         {
             self.enabled_categories = cats;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{HatchPattern, OverlayFeature};
+
+    /// A minimal alert with geometry, identified by `id`.
+    fn alert(id: &str, event: &str) -> NwsAlert {
+        let polygons = vec![vec![vec![(35.0, -97.0), (35.5, -97.0), (35.5, -96.5)]]];
+        let (fill, stroke) = crate::nws::colors::alert_color(event);
+        NwsAlert {
+            id: id.to_string(),
+            event: event.to_string(),
+            category: AlertCategory::from_event(event),
+            severity: "Severe".parse().unwrap(),
+            urgency: "Immediate".parse().unwrap(),
+            certainty: "Observed".parse().unwrap(),
+            headline: None,
+            description: String::new(),
+            instruction: None,
+            area_desc: String::new(),
+            sender_name: String::new(),
+            effective: String::new(),
+            expires: String::new(),
+            onset: None,
+            ends: None,
+            affected_zones: Vec::new(),
+            features: vec![OverlayFeature::new(
+                polygons,
+                fill,
+                stroke,
+                event.to_string(),
+                String::new(),
+                HatchPattern::None,
+            )],
+        }
+    }
+
+    fn handler_with(alerts: Vec<NwsAlert>) -> NwsAlertHandler {
+        let mut handler = NwsAlertHandler::new();
+        handler.apply_fetch_result(Box::new(NwsAlertFetchResult(Ok(alerts))));
+        handler
+    }
+
+    /// The signature names the **set**, not the fetch: a refetch returning
+    /// the same warning ids must keep it, which is exactly what
+    /// `data_generation` — bumped on every `set_data` — cannot do. This is
+    /// the mutation the method exists to be different from: swap the body
+    /// for `self.data_generation()` and this test fails on the second
+    /// fetch.
+    #[test]
+    fn a_refetch_of_the_same_warning_set_keeps_the_signature() {
+        let mut handler = handler_with(vec![alert("a", "Tornado Warning")]);
+        let first = handler.content_signature();
+        let generation_before = handler.data_generation();
+        handler.apply_fetch_result(Box::new(NwsAlertFetchResult(Ok(vec![alert(
+            "a",
+            "Tornado Warning",
+        )]))));
+        assert_ne!(
+            handler.data_generation(),
+            generation_before,
+            "fixture: the refetch really did bump the generation",
+        );
+        assert_eq!(
+            handler.content_signature(),
+            first,
+            "an unchanged warning set across a poll must keep its signature",
+        );
+    }
+
+    /// Every way the drawn set can change moves the signature: a new
+    /// warning, an expiry, a hide, a category turned off.
+    #[test]
+    fn every_change_to_the_drawn_set_moves_the_signature() {
+        let mut handler = handler_with(vec![alert("a", "Tornado Warning")]);
+        let one_warning = handler.content_signature();
+
+        // A second warning issues mid-session.
+        handler.apply_fetch_result(Box::new(NwsAlertFetchResult(Ok(vec![
+            alert("a", "Tornado Warning"),
+            alert("b", "Severe Thunderstorm Warning"),
+        ]))));
+        let two_warnings = handler.content_signature();
+        assert_ne!(two_warnings, one_warning, "a new warning must move it");
+
+        // The first expires out of the feed.
+        handler.apply_fetch_result(Box::new(NwsAlertFetchResult(Ok(vec![alert(
+            "b",
+            "Severe Thunderstorm Warning",
+        )]))));
+        let b_only = handler.content_signature();
+        assert_ne!(b_only, two_warnings, "an expiry must move it");
+        assert_ne!(
+            b_only, one_warning,
+            "a different single warning is a different set",
+        );
+
+        // The user hides the survivor.
+        handler.hidden_alerts.insert("b".to_string());
+        assert_ne!(
+            handler.content_signature(),
+            b_only,
+            "hiding an alert must move it",
+        );
+        handler.hidden_alerts.clear();
+
+        // The whole category goes off.
+        handler.enabled_categories.remove(&AlertCategory::Warning);
+        assert_ne!(
+            handler.content_signature(),
+            b_only,
+            "disabling the category must move it",
+        );
+    }
+
+    /// The fold is order-free: the same set in another order is the same
+    /// signature — feed order is not part of what gets drawn.
+    #[test]
+    fn the_signature_is_a_set_signature_not_a_sequence_signature() {
+        let forward = handler_with(vec![
+            alert("a", "Tornado Warning"),
+            alert("b", "Flash Flood Warning"),
+        ]);
+        let backward = handler_with(vec![
+            alert("b", "Flash Flood Warning"),
+            alert("a", "Tornado Warning"),
+        ]);
+        assert_eq!(forward.content_signature(), backward.content_signature());
     }
 }

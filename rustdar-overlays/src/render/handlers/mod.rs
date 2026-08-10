@@ -1,4 +1,4 @@
-mod alert;
+pub(crate) mod alert;
 mod colorscale;
 mod discussion;
 mod glm;

@@ -127,6 +127,21 @@ pub trait OverlayHandler: Send {
     /// Bumped on every data replacement; drives texture cache invalidation.
     fn data_generation(&self) -> u64;
 
+    /// A cheap token for **what this handler would draw**: consumers that
+    /// re-render only when the picture changes (the 3D floor's composite)
+    /// compare it across frames. Unlike [`data_generation`], a refetch that
+    /// returns the same content should keep it stable where the handler can
+    /// tell — NWS alerts poll every two minutes and mostly return the same
+    /// warning set, and a floor recomposed on every poll is a floor
+    /// recomposed for nothing. The default is `data_generation`, correct for
+    /// every handler that cannot tell (it may only over-refresh, never
+    /// under-refresh). Called every frame, so it must not clone data.
+    ///
+    /// [`data_generation`]: OverlayHandler::data_generation
+    fn content_signature(&self) -> u64 {
+        self.data_generation()
+    }
+
     fn has_data(&self) -> bool;
 
     fn is_fetching(&self) -> bool;
@@ -370,6 +385,22 @@ impl OverlayRegistry {
 
     pub fn data_generation(&self, kind: OverlayKind) -> u64 {
         self.handler(kind).map_or(0, |h| h.data_generation())
+    }
+
+    /// [`OverlayHandler::content_signature`] for `kind`; `0` for a kind with
+    /// no handler.
+    pub fn content_signature(&self, kind: OverlayKind) -> u64 {
+        self.handler(kind).map_or(0, |h| h.content_signature())
+    }
+
+    /// The NWS alert fetch payload for a known alert list, exactly as the
+    /// network fetch would deliver it to [`apply_fetch_result`]. Public so a
+    /// host (or its tests) can feed a chosen warning set through the one
+    /// production ingest path instead of growing a parallel setter.
+    ///
+    /// [`apply_fetch_result`]: OverlayRegistry::apply_fetch_result
+    pub fn nws_alerts_payload(alerts: Vec<crate::nws::alert::NwsAlert>) -> FetchPayload {
+        Box::new(super::handlers::alert::NwsAlertFetchResult(Ok(alerts)))
     }
 
     pub fn has_data(&self, kind: OverlayKind) -> bool {
