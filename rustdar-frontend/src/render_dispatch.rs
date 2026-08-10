@@ -1306,12 +1306,17 @@ impl RenderDispatcher {
         });
         crate::offload::offload_job("floor-render", job, move |output| {
             let _guard = guard;
+            // Only the pixels travel to the resampler. The frame's
+            // `max_range_km` is the product's data reach — ~460 km for
+            // super-res reflectivity — NOT the raster's half-extent, and
+            // feeding it in as one was the 2× floor zoom of the 2026-08-09
+            // report; `resample_floor` now reads the raster's real geometry
+            // (`types::MAX_RANGE_KM`) at its own definition.
             let image = output
                 .and_then(crate::offload::JobOutput::frame)
                 .and_then(|frame| {
                     crate::volume::floor::resample_floor(
                         &frame.image,
-                        frame.max_range_km,
                         site_lat,
                         x_range_km,
                         y_range_km,

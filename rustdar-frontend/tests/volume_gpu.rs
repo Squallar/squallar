@@ -703,6 +703,139 @@ fn the_map_floor_stands_under_the_volume_and_only_when_asked() {
     );
 }
 
+/// The floor and the volume agree, to the pixel, about where the weather
+/// stands.
+///
+/// The orientation case above is qualitative — red north, blue south. This is
+/// the quantitative seam: one voxel column and one floor patch are planted at
+/// the **same box footprint cell**, each is rendered alone through the same
+/// down-looking camera, and their screen centroids must coincide within a
+/// pixel bound. Any offset, flip or scale disagreement between the volume's
+/// texture mapping and the floor's `(hit.x, 1 - hit.y)` sampling moves one
+/// centroid and not the other: dropping the v flip alone moves the floor
+/// patch 36 px here.
+///
+/// ```text
+/// cargo test -p rustdar-frontend --test volume_gpu \
+///     the_floor_and_the_volume_put_the_same_weather_in_the_same_place \
+///     -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
+fn the_floor_and_the_volume_put_the_same_weather_in_the_same_place() {
+    let _serialised = gpu_lock();
+    let size = [128u32, 128];
+    let cells = [32u32, 32, 32];
+    let (device, queue) = device();
+    let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Bgra8Unorm));
+    pipelines.upload_quad(&queue);
+
+    // The planted cell: (24, 20) of 32 — off-centre on both axes and off the
+    // diagonal, so every flip and every axis swap moves it.
+    let (col_cell, row_cell) = (24u32, 20u32);
+
+    // A full-height voxel column at that cell.
+    let mut column = vec![0u8; (cells[0] * cells[1] * cells[2]) as usize];
+    for z in 0..cells[2] {
+        column[((z * cells[1] + row_cell) * cells[0] + col_cell) as usize] = 255;
+    }
+    // Green at every data index, not just 255: the grid is sampled `Linear`,
+    // so rays off the column's exact centre read interpolated indices, and a
+    // single-entry palette would paint only the centre line. The half-cell
+    // bleed this admits is symmetric about the column, which is what a
+    // centroid instrument needs.
+    let mut lut = vec![0u8; VOLUME_LUT_BYTES];
+    for entry in 1..lut.len() / 4 {
+        lut[entry * 4..entry * 4 + 4].copy_from_slice(&[0, 255, 0, 255]);
+    }
+
+    // A floor patch over the same footprint: floor row 0 is the box's NORTH
+    // edge, so box y in [20/32, 21/32] is floor rows [1 - 21/32, 1 - 20/32).
+    let floor_side = 64usize;
+    let mut floor_rgba = vec![0u8; floor_side * floor_side * 4];
+    for px in floor_rgba.chunks_exact_mut(4) {
+        px[3] = 255;
+    }
+    let scale = floor_side as u32 / cells[0];
+    for row in (floor_side as u32 - (row_cell + 1) * scale)..(floor_side as u32 - row_cell * scale)
+    {
+        for col in (col_cell * scale)..((col_cell + 1) * scale) {
+            let at = ((row * floor_side as u32 + col) * 4) as usize;
+            floor_rgba[at..at + 4].copy_from_slice(&[255, 0, 0, 255]);
+        }
+    }
+    let floor = pipelines
+        .upload_floor(
+            &device,
+            &queue,
+            [floor_side as u32, floor_side as u32],
+            &floor_rgba,
+        )
+        .expect("a well-shaped floor uploads");
+
+    let mut uniform = VolumeUniform::new([10.0, 10.0, 10.0], cells);
+    uniform.box_from_clip = box_from_clip_down(2);
+    // Not `eye_outside(2)`: an eye 2.5 box-heights up gives every ray a real
+    // lateral slope, and a full-height column smears across the screen by
+    // parallax — a position instrument needs parallel rays. An eye 200 boxes
+    // up through the same far plane is orthographic to under a tenth of a
+    // pixel at this size.
+    uniform.eye_in_box = [0.5, 0.5, 200.0];
+    uniform.extinction_per_km = 1000.0;
+    uniform.gradient_shading = false;
+
+    // Screen centroid of the pixels `select` keeps.
+    let centroid = |pixels: &[[u8; 4]], select: &dyn Fn([u8; 4]) -> bool| -> (f64, f64) {
+        let mut n = 0usize;
+        let (mut sx, mut sy) = (0.0, 0.0);
+        for (i, px) in pixels.iter().enumerate() {
+            if select(*px) {
+                n += 1;
+                sx += (i % size[0] as usize) as f64;
+                sy += (i / size[0] as usize) as f64;
+            }
+        }
+        assert!(n > 0, "nothing painted; a broken fixture");
+        (sx / n as f64, sy / n as f64)
+    };
+
+    // The volume alone.
+    let pixels = raymarch_once_with_floor(
+        &device, &queue, &pipelines, cells, &column, &lut, &uniform, size, &floor,
+    );
+    let volume_at = centroid(&pixels, &|px| px[1] > 100 && px[0] < 100);
+
+    // The floor alone, under an empty grid.
+    uniform.map_floor = true;
+    let empty = vec![0u8; (cells[0] * cells[1] * cells[2]) as usize];
+    let pixels = raymarch_once_with_floor(
+        &device, &queue, &pipelines, cells, &empty, &lut, &uniform, size, &floor,
+    );
+    let floor_at = centroid(&pixels, &|px| px[0] > 100 && px[2] < 100);
+
+    // Where the geometry says both stand: the cell centre, through the
+    // down-camera's screen mapping (col = x·W, row = (1 − y)·H).
+    let want = (
+        (f64::from(col_cell) + 0.5) / f64::from(cells[0]) * f64::from(size[0]),
+        (1.0 - (f64::from(row_cell) + 0.5) / f64::from(cells[1])) * f64::from(size[1]),
+    );
+    for (name, (cx, cy)) in [("volume", volume_at), ("floor", floor_at)] {
+        assert!(
+            (cx - want.0).abs() < 3.0 && (cy - want.1).abs() < 3.0,
+            "the {name} put the planted cell at ({cx:.1}, {cy:.1}), the geometry \
+             says ({:.1}, {:.1})",
+            want.0,
+            want.1,
+        );
+    }
+    let (dx, dy) = (floor_at.0 - volume_at.0, floor_at.1 - volume_at.1);
+    assert!(
+        dx.abs() < 2.0 && dy.abs() < 2.0,
+        "floor and volume disagree by ({dx:.2}, {dy:.2}) px about where the same \
+         cell stands — the registration seam has moved",
+    );
+}
+
 /// The smoothed reconstruction really reaches the coarse level: a lone voxel
 /// paints a **wider** footprint through the cloud rung than through the raw
 /// field.

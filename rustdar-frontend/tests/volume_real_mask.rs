@@ -259,10 +259,12 @@ fn render_a_real_volume_mask() {
             site_lon,
         )
     })
-    .and_then(|(image, max_range_km, _)| {
+    .and_then(|(image, _data_reach_km, _)| {
+        // Not the returned `max_range_km`: that is the product's data reach,
+        // not the raster's half-extent — `resample_floor` reads the raster's
+        // real geometry from `types::MAX_RANGE_KM` itself.
         rustdar_frontend::volume::floor::resample_floor(
             &image,
-            max_range_km,
             site_lat,
             grid.x_range_km(),
             grid.y_range_km(),

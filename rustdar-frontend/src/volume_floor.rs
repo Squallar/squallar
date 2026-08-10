@@ -79,8 +79,17 @@ fn mercator_y(lat_rad: f64) -> f64 {
 ///
 /// * `source` — the raster's RGBA bytes, a square image as
 ///   `render_radar_to_image` produces: linear in longitude and Mercator y,
-///   `±max_range_km` about the site.
-/// * `max_range_km` — the raster's half-extent, from the same render.
+///   **`±MAX_RANGE_KM` about the site** — the raster's half-extent is
+///   [`rustdar_radar::types::MAX_RANGE_KM`], read directly below rather than
+///   taken as a parameter. `ImageBounds::from_radar_site` builds every raster
+///   at that constant unconditionally, and the render's *returned*
+///   `max_range_km` is a different number — the product's **data reach**
+///   (super-res reflectivity gates run to ~460 km), kept for the range ring
+///   and the hover readout. Feeding that reach in as the half-extent halves
+///   the sampler's pixels-per-km and zooms the floor in 2×, which is exactly
+///   the shipped bug the 2026-08-09 report's screenshot shows: strong cores
+///   drawn at twice their true distance from the site, under an empty sky.
+///   With the constant read at the definition, no caller can repeat it.
 /// * `site_lat_deg` — the site's latitude; the raster's projection constants
 ///   derive from it and nothing needs the longitude, because the box's x is
 ///   already kilometres east of the site.
@@ -93,17 +102,14 @@ fn mercator_y(lat_rad: f64) -> f64 {
 /// rather than clamped for the usual reason: every arm below divides.
 pub fn resample_floor(
     source: &[u8],
-    max_range_km: f64,
     site_lat_deg: f64,
     x_range_km: (f64, f64),
     y_range_km: (f64, f64),
 ) -> Option<FloorImage> {
+    let max_range_km = rustdar_radar::types::MAX_RANGE_KM;
     let texels = source.len() / 4;
     let side = (texels as f64).sqrt() as usize;
     if side == 0 || side * side * 4 != source.len() {
-        return None;
-    }
-    if !(max_range_km.is_finite() && max_range_km > 0.0) {
         return None;
     }
     if x_range_km.1 <= x_range_km.0 || y_range_km.1 <= y_range_km.0 {
@@ -238,7 +244,7 @@ mod tests {
     fn the_sites_pixel_lands_in_the_middle_of_a_site_centred_floor() {
         let side = 64;
         let source = source_with_dot(side, (32, 32));
-        let floor = resample_floor(&source, 230.0, 35.0, (-230.0, 230.0), (-230.0, 230.0))
+        let floor = resample_floor(&source, 35.0, (-230.0, 230.0), (-230.0, 230.0))
             .expect("a resamplable floor");
         let (col, row) = brightest_red(&floor);
         let mid = FLOOR_TEXELS as usize / 2;
@@ -274,7 +280,7 @@ mod tests {
         let py = (merc_top - mercator_y(lat_rad)) * merc_scale;
 
         let source = source_with_dot(side, (px as usize, py as usize));
-        let floor = resample_floor(&source, 230.0, 35.0, (-230.0, 230.0), (-230.0, 230.0))
+        let floor = resample_floor(&source, 35.0, (-230.0, 230.0), (-230.0, 230.0))
             .expect("a resamplable floor");
         let (col, row) = brightest_red(&floor);
 
@@ -310,7 +316,7 @@ mod tests {
 
         let source = source_with_dot(side, (px as usize, py as usize));
         // A 80 km-wide box centred on the dot's (100, 150) km offset.
-        let floor = resample_floor(&source, 230.0, 35.0, (60.0, 140.0), (110.0, 190.0))
+        let floor = resample_floor(&source, 35.0, (60.0, 140.0), (110.0, 190.0))
             .expect("a resamplable floor");
         let (col, row) = brightest_red(&floor);
         let mid = FLOOR_TEXELS as usize / 2;
@@ -326,7 +332,7 @@ mod tests {
     #[test]
     fn bare_ground_is_the_ground_colour_and_opaque() {
         let source = vec![0u8; 64 * 64 * 4];
-        let floor = resample_floor(&source, 230.0, 35.0, (-230.0, 230.0), (-230.0, 230.0))
+        let floor = resample_floor(&source, 35.0, (-230.0, 230.0), (-230.0, 230.0))
             .expect("a resamplable floor");
         assert_eq!(&floor.rgba[..4], &FLOOR_GROUND_RGBA);
         assert!(
@@ -340,14 +346,15 @@ mod tests {
     fn a_floor_that_cannot_be_registered_is_refused() {
         let source = vec![0u8; 64 * 64 * 4];
         // Not a square image.
-        assert!(resample_floor(&source[..60], 230.0, 35.0, (-1.0, 1.0), (-1.0, 1.0)).is_none());
+        assert!(resample_floor(&source[..60], 35.0, (-1.0, 1.0), (-1.0, 1.0)).is_none());
         // Degenerate ranges and range order.
-        assert!(resample_floor(&source, 230.0, 35.0, (1.0, 1.0), (-1.0, 1.0)).is_none());
-        assert!(resample_floor(&source, 230.0, 35.0, (-1.0, 1.0), (1.0, -1.0)).is_none());
-        // A max range that divides by zero or is meaningless.
-        assert!(resample_floor(&source, 0.0, 35.0, (-1.0, 1.0), (-1.0, 1.0)).is_none());
-        assert!(resample_floor(&source, f64::NAN, 35.0, (-1.0, 1.0), (-1.0, 1.0)).is_none());
-        // A pole, where cos(lat) reaches zero.
-        assert!(resample_floor(&source, 230.0, 90.0, (-1.0, 1.0), (-1.0, 1.0)).is_none());
+        assert!(resample_floor(&source, 35.0, (1.0, 1.0), (-1.0, 1.0)).is_none());
+        assert!(resample_floor(&source, 35.0, (-1.0, 1.0), (1.0, -1.0)).is_none());
+        // A latitude with no finite Mercator row, and a pole, where cos(lat)
+        // reaches zero. The raster's half-extent is no longer an input at
+        // all — it is the projection's own constant — so there is no wrong
+        // extent left to refuse.
+        assert!(resample_floor(&source, f64::NAN, (-1.0, 1.0), (-1.0, 1.0)).is_none());
+        assert!(resample_floor(&source, 90.0, (-1.0, 1.0), (-1.0, 1.0)).is_none());
     }
 }
