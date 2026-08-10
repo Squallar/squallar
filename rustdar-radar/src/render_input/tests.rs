@@ -465,6 +465,70 @@ fn the_encoded_length_estimate_is_exact() {
         );
         assert_eq!(input.encoded_len(), input.to_bytes().len());
     }
+
+    // And both branches of the declared Nyquist velocity, for the same
+    // reason: every payload above writes the one-byte absent form, so an
+    // estimate that had forgotten the field's value entirely would match all
+    // of them.
+    let stamped = RenderInput::extract_volume(&scan, RadarProduct::Reflectivity, LAT, LON)
+        .unwrap()
+        .with_declared_nyquist(&[(1, 26.42)].into_iter().collect());
+    assert!(
+        stamped
+            .sweeps
+            .iter()
+            .any(|s| s.declared_nyquist_ms.is_some()),
+        "precondition: no sweep took the declaration, so the present form is \
+         not being measured",
+    );
+    assert_eq!(stamped.encoded_len(), stamped.to_bytes().len());
+}
+
+/// The declared Nyquist velocity survives the wire, per sweep and by
+/// elevation number.
+///
+/// It is the one field on this payload that no renderer reads and no
+/// reconstruction can recover: `to_scan` rebuilds `nexrad_model` types, and
+/// the model type having no room for this number is the whole reason the
+/// field exists. So a codec that dropped it would break nothing visible —
+/// the worker would fall back to estimating its velocity fold limits, which
+/// is what it did before version 8, while the thread that extracted the
+/// payload used the archive's own numbers.
+#[test]
+fn the_declared_nyquist_survives_the_wire_per_sweep() {
+    let scan = cut_table_volume();
+    let declared: crate::nyquist::DeclaredNyquist = [(1, 26.42), (2, 31.05)].into_iter().collect();
+    let input = RenderInput::extract_volume(&scan, RadarProduct::Reflectivity, LAT, LON)
+        .unwrap()
+        .with_declared_nyquist(&declared);
+    let carried = input.declared_nyquist();
+    assert!(
+        !carried.is_empty(),
+        "precondition: the fixture's sweeps take none of the declarations, \
+         so this test would pass on a codec that dropped the field",
+    );
+
+    let decoded = RenderInput::from_bytes(&input.to_bytes()).expect("the payload round-trips");
+    assert_eq!(
+        decoded.declared_nyquist().iter().collect::<Vec<_>>(),
+        carried.iter().collect::<Vec<_>>(),
+        "the declared Nyquist velocities did not cross the wire",
+    );
+    // Per sweep, not merely present somewhere: a codec that wrote one
+    // sweep's value against every sweep would pass a whole-table
+    // comparison on a volume whose cuts all fold at the same speed.
+    assert_eq!(
+        decoded
+            .sweeps
+            .iter()
+            .map(|s| (s.elevation_number, s.declared_nyquist_ms))
+            .collect::<Vec<_>>(),
+        input
+            .sweeps
+            .iter()
+            .map(|s| (s.elevation_number, s.declared_nyquist_ms))
+            .collect::<Vec<_>>(),
+    );
 }
 
 /// One elevation cut, angle only — the reconstruction's own

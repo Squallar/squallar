@@ -685,6 +685,107 @@ fn sails_volume() -> Scan {
     )
 }
 
+/// What [`sails_volume`]'s cuts declare their Nyquist velocities to be,
+/// keyed the way the archive keys them: by elevation number.
+///
+/// Every value is deliberately **far from what `estimate_fold_limit` would
+/// read off the same sweep** — the fixture's velocity sweeps are constant
+/// fields at 7, 9, 11 and 13 m/s — so a rung that fell back to the estimate
+/// prints a different number rather than a coincidentally equal one. Real
+/// volumes are not so kind: a sweep that folded at all gives an estimate
+/// equal to its Nyquist velocity, which is exactly why the ladder line
+/// carries the provenance letter as well as the number.
+fn sails_declared_nyquist() -> crate::nyquist::DeclaredNyquist {
+    [(1, 11.94), (4, 26.42), (5, 31.05), (6, 26.42)]
+        .into_iter()
+        .collect()
+}
+
+/// The declared number wins where it exists, and the ladder line says so.
+///
+/// The pin for the one thing
+/// `a_reconstructed_render_input_scan_builds_the_identical_ladder` cannot
+/// see: a guard that ignored the declared table entirely would estimate on
+/// *both* sides of the port and the two lines would still match. This
+/// asserts the limits are the declared ones and not the fixture's own
+/// speeds.
+#[test]
+fn a_declared_nyquist_replaces_the_estimated_fold_limit() {
+    let scan = sails_volume();
+    let declared = sails_declared_nyquist();
+
+    let estimated =
+        VolumeSampler::new(&scan, RadarProduct::Velocity).expect("the velocity ladder builds");
+    let stated = VolumeSampler::new(Volume::new(&scan, &declared), RadarProduct::Velocity)
+        .expect("the velocity ladder builds");
+
+    let estimated_line = format!("{estimated:?}");
+    let stated_line = format!("{stated:?}");
+    // precondition: without a table the guard reads the fixture's own
+    // speeds, and the calm below-horizon rung is under the floor, so its
+    // guard is off entirely.
+    assert!(
+        estimated_line.contains("\u{b1}13.00e") && estimated_line.contains("\u{b1}11.00e"),
+        "precondition: the estimator is not reading the fixture's speeds: {estimated_line}"
+    );
+    assert!(
+        !estimated_line.contains("-0.2800 360x40 \u{b1}"),
+        "precondition: the calm rung already had an estimated limit, so a \
+         declaration would not be switching a guard on here: {estimated_line}"
+    );
+
+    assert!(
+        stated_line.contains("\u{b1}26.42d")
+            && stated_line.contains("\u{b1}31.05d")
+            && stated_line.contains("\u{b1}11.94d"),
+        "the declared Nyquist velocity did not reach the guard: {stated_line}"
+    );
+    // No rung took the estimator: a provenance letter is the last character
+    // of a rung's entry, so an estimated one shows as `e,` or `e]`.
+    assert!(
+        !stated_line.contains("e,") && !stated_line.contains("e]"),
+        "a rung the table names still estimated: {stated_line}"
+    );
+}
+
+/// A cut the table does not name still estimates, and a cut it names with a
+/// number this module cannot believe estimates too.
+///
+/// The two absences the fallback exists for. The first is an all-Message-1
+/// volume, or any scan that reached the sampler without a table; the second
+/// is a declared value under [`FOLD_LIMIT_FLOOR_MS`], which is a corrupt
+/// field rather than a slow waveform — no operational NEXRAD VCP flies one
+/// — and must not be trusted further than a measurement this module would
+/// refuse.
+#[test]
+fn an_undeclared_or_unbelievable_cut_falls_back_to_the_estimate() {
+    let scan = sails_volume();
+    // Cut 5 declared believably; cut 6 declared at 3 m/s, which no waveform
+    // flies; cut 1 not named at all.
+    let partial: crate::nyquist::DeclaredNyquist = [(5, 31.05), (6, 3.0)].into_iter().collect();
+
+    let sampler = VolumeSampler::new(Volume::new(&scan, &partial), RadarProduct::Velocity)
+        .expect("the velocity ladder builds");
+    let line = format!("{sampler:?}");
+    assert!(
+        line.contains("\u{b1}31.05d"),
+        "the one believable declaration did not reach the guard: {line}"
+    );
+    assert!(
+        line.contains("\u{b1}13.00e"),
+        "the 3 m/s declaration was believed rather than dropped for the \
+         estimate: {line}"
+    );
+    // The undeclared cut is the fixture's calm 7 m/s sweep, whose estimate
+    // is itself under the floor \u{2014} so the honest answer for that rung is no
+    // limit at all, and the ladder line says nothing about it.
+    assert!(
+        !line.contains("-0.2800 360x40 \u{b1}"),
+        "an undeclared cut whose estimate is under the floor came back with \
+         a limit anyway: {line}"
+    );
+}
+
 /// The ladder a worker builds from a reconstructed payload is the ladder
 /// the main thread built — **identically**, not approximately.
 ///
@@ -704,19 +805,27 @@ fn sails_volume() -> Scan {
 #[test]
 fn a_reconstructed_render_input_scan_builds_the_identical_ladder() {
     let scan = sails_volume();
+    let declared = sails_declared_nyquist();
     for product in [RadarProduct::Reflectivity, RadarProduct::Velocity] {
-        let original = VolumeSampler::new(&scan, product).expect("the fixture's own ladder builds");
+        let original = VolumeSampler::new(Volume::new(&scan, &declared), product)
+            .expect("the fixture's own ladder builds");
 
         let input = crate::render_input::RenderInput::extract_volume(&scan, product, 35.33, -97.27)
-            .expect("the fixture carries the moment");
-        // Through the bytes, not just through `to_scan`: the cut angles and
-        // the elevation numbers have to survive the wire, and a worker
-        // holds bytes rather than a `RenderInput`.
+            .expect("the fixture carries the moment")
+            .with_declared_nyquist(&declared);
+        // Through the bytes, not just through `to_scan`: the cut angles, the
+        // elevation numbers and the declared Nyquist velocities all have to
+        // survive the wire, and a worker holds bytes rather than a
+        // `RenderInput`.
         let decoded = crate::render_input::RenderInput::from_bytes(&input.to_bytes())
             .expect("the payload round-trips");
         let reconstructed = decoded.to_scan();
+        // Exactly what `offload::execute` does on the far side: the scan and
+        // the table are lifted out separately, because the model type the
+        // scan is made of is what dropped the table in the first place.
+        let ported_declared = decoded.declared_nyquist();
 
-        let ported = VolumeSampler::new(&reconstructed, product)
+        let ported = VolumeSampler::new(Volume::new(&reconstructed, &ported_declared), product)
             .expect("the reconstructed scan's ladder builds");
 
         assert_eq!(
@@ -724,6 +833,17 @@ fn a_reconstructed_render_input_scan_builds_the_identical_ladder() {
             format!("{original:?}"),
             "{product:?}: the worker's ladder is not the main thread's",
         );
+        // precondition: for velocity the line under comparison actually
+        // *says* something about the fold limit, and says it came from the
+        // declaration. Without this the assertion above would go on passing
+        // if the guard quietly stopped reading the declared table on both
+        // sides at once.
+        if product == RadarProduct::Velocity {
+            assert!(
+                format!("{original:?}").contains("±26.42d"),
+                "precondition: the declared fold limit is not in the ladder                  line, so this comparison cannot see it diverge: {original:?}",
+            );
+        }
         // precondition: the fixture is not so simple that any rule agrees.
         assert!(
             original.tilt_count() >= 3,
