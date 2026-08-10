@@ -417,6 +417,31 @@ struct SectionInput {
     input: Arc<rustdar_radar::render_input::RenderInput>,
 }
 
+/// What a section dispatch did — three answers, because two of them used to
+/// be one.
+///
+/// [`Busy`](Self::Busy) and [`NoPayload`](Self::NoPayload) were both `false`,
+/// and the caller's reading of `false` is "take no budget, write no staleness
+/// key, ask again next frame". That is right for a full budget and wrong for a
+/// volume that carries nothing to cut: the pane re-asked on every frame and
+/// painted "Cutting the cross-section…" for as long as the volume stood. A
+/// permanent wait is the worst state a pane can be in — it looks like progress
+/// and there is nothing to do about it — and this codebase shipped that exact
+/// bug once before and fixed it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SectionDispatch {
+    /// A cut is in flight. The caller writes the staleness key.
+    Dispatched,
+    /// The render budget is full, or the pane index is out of range. Nothing
+    /// was taken and nothing is wrong: ask again next frame, key unwritten.
+    Busy,
+    /// This volume carries no field to cut under this product — no sweep
+    /// holds the moment, or the derivation refused it. The caller names the
+    /// state and *does* write the key: the key carries the volume stamp and
+    /// the ladder, so the next volume asks again on its own.
+    NoPayload,
+}
+
 /// What a cached section payload is a payload *of*.
 ///
 /// A struct with a derived `PartialEq` rather than a chain of `&&`s at the reuse
@@ -1153,11 +1178,12 @@ impl RenderDispatcher {
 
     /// Cut a vertical cross-section for a section pane, in the background.
     ///
-    /// Returns `false` when the render budget is full, which is the caller's cue
-    /// to leave the pane's staleness key alone and try again next frame. Native
-    /// builds have several slots; **wasm has exactly one, with no preemption**,
-    /// so on the platform where this matters most a section queues behind
-    /// whatever plan view is already rendering rather than displacing it.
+    /// See [`SectionDispatch`] for the three answers and why "the budget is
+    /// full" and "this volume has nothing to cut" must not be the same one.
+    /// Native builds have several slots; **wasm has exactly one, with no
+    /// preemption**, so on the platform where this matters most a section
+    /// queues behind whatever plan view is already rendering rather than
+    /// displacing it.
     ///
     /// The volume payload is taken from
     /// [`section_input`](Self::section_input) when it is for this volume, moment
@@ -1174,7 +1200,7 @@ impl RenderDispatcher {
         extract: impl FnOnce() -> Option<rustdar_radar::render_input::RenderInput>,
         sender: std::sync::mpsc::Sender<crate::channels::SectionResponse>,
         window: Option<WindowRef>,
-    ) -> bool {
+    ) -> SectionDispatch {
         // Bounds-checked once, here, rather than left to the two `pane_render`
         // indexes further down. It cannot be out of range today — the only
         // caller reaches this through `pane_render.get(pane_idx)` two lines
@@ -1184,10 +1210,10 @@ impl RenderDispatcher {
         // is the same contract as a full budget: nothing has been taken, no
         // staleness key is written, and the pane asks again next frame.
         if pane_idx >= self.pane_render.len() {
-            return false;
+            return SectionDispatch::Busy;
         }
         if self.renders_in_flight.load(Ordering::Relaxed) >= MAX_CONCURRENT_RENDERS {
-            return false;
+            return SectionDispatch::Busy;
         }
 
         let product = target.product;
@@ -1210,12 +1236,15 @@ impl RenderDispatcher {
             .is_some_and(|cached| cached.key == wanted_key);
         if !reusable {
             let Some(input) = extract() else {
-                // No sweep carries this moment. Not an error and not a job: the
-                // caller has taken no budget slot and marked nothing in flight,
-                // so there is nothing to unwind — unlike `spawn_level2_render`,
-                // which dispatches `renders_nothing` precisely because it has.
+                // No sweep carries this moment, or the derivation refused.
+                // Not an error and not a job: the caller has taken no budget
+                // slot and marked nothing in flight, so there is nothing to
+                // unwind — unlike `spawn_level2_render`, which dispatches
+                // `renders_nothing` precisely because it has. It IS a state
+                // with a name, though, and saying so is what keeps the pane
+                // from waiting forever.
                 log::info!("no volume payload for a {product:?} section");
-                return false;
+                return SectionDispatch::NoPayload;
             };
             self.section_input = Some(SectionInput {
                 key: wanted_key,
@@ -1224,7 +1253,7 @@ impl RenderDispatcher {
         }
         // Always `Some`: either it was reusable or it was just written.
         let Some(cached) = self.section_input.as_ref() else {
-            return false;
+            return SectionDispatch::Busy;
         };
 
         let request = rustdar_radar::xsect::SectionRequest {
@@ -1265,7 +1294,7 @@ impl RenderDispatcher {
             crate::app::notify_redraw(&window);
         });
         self.pane_render[pane_idx].render_in_flight = true;
-        true
+        SectionDispatch::Dispatched
     }
 
     /// Whether a render slot is free right now — the caller's pre-flight for

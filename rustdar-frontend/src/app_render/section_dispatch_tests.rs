@@ -530,7 +530,11 @@ fn a_dispatch_for_a_pane_that_does_not_exist_refuses_instead_of_panicking() {
         None,
     );
 
-    assert!(!dispatched, "a pane that does not exist got a cut");
+    assert_eq!(
+        dispatched,
+        crate::render_dispatch::SectionDispatch::Busy,
+        "a pane that does not exist got a cut",
+    );
     assert_eq!(
         app.render
             .renders_in_flight
@@ -538,6 +542,58 @@ fn a_dispatch_for_a_pane_that_does_not_exist_refuses_instead_of_panicking() {
         0,
         "the refusal took a render slot with it, so the budget is short by \
              one for the life of the process"
+    );
+}
+
+/// A volume that carries nothing to cut is **told so**, not left waiting.
+///
+/// The dispatcher's "no payload" answer used to be the same `false` as "the
+/// render budget is full", and the caller's reading of `false` is "write no
+/// staleness key, ask again next frame". So a section pane on a volume with
+/// no such moment re-dispatched on every frame and painted "Cutting the
+/// cross-section…" for as long as the volume stood: a permanent wait, which
+/// the pane's own doc calls the worst state a pane can be in, and which
+/// this codebase shipped once before and fixed.
+///
+/// The fixture is storm-relative velocity over a reflectivity-only volume:
+/// no velocity anywhere, so `extract_volume_parts` answers `None` — the
+/// same answer a refused derivation gives.
+#[test]
+fn a_volume_with_nothing_to_cut_is_named_rather_than_waited_on() {
+    let mut app = app_with_section(RadarProduct::StormRelativeVelocity, volume(vec![one_cut()]));
+    app.dispatch_section_renders();
+
+    assert_eq!(
+        state(&app).unavailable,
+        Some(SectionUnavailable::ProductMissingFromVolume(
+            RadarProduct::StormRelativeVelocity
+        )),
+        "the pane is waiting on a cut that can never come",
+    );
+    assert!(
+        state(&app).rendered_for.is_some(),
+        "without the staleness key the pane re-dispatches every frame — a \
+             busy loop whose only symptom is a warm machine",
+    );
+    // And the message is a sentence, not a spinner.
+    let message = state(&app).unavailable.expect("named").message();
+    assert!(
+        message.contains("carries no"),
+        "the state has a name but no explanation: {message:?}",
+    );
+
+    // The key carries the volume stamp, so a volume that *does* carry
+    // velocity asks again rather than inheriting the refusal.
+    app.base_scans.insert(
+        SITE.to_owned(),
+        (velocity_volume(vec![one_cut()]), volume_time()),
+    );
+    app.render.pane_render[0].render_in_flight = false;
+    app.dispatch_section_renders();
+    assert_eq!(
+        state(&app).unavailable,
+        None,
+        "the refusal outlived the volume it was about",
     );
 }
 

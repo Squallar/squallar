@@ -14,6 +14,16 @@ const SETTINGS_LARGE_SPACING: f32 = 8.0;
 #[cfg(feature = "gps-serial")]
 const GPS_BAUD_RATES: &[u32] = &[4800, 9600, 38400, 115200];
 
+/// The storm motion override switch's label.
+///
+/// It read "Override average storm motion", which named the RPG's own SCIT
+/// average from the `N0S` Product Description Block — a source that left the
+/// app with the five Level III SRM fetches. There is no RPG average to
+/// override any more: with the switch off, storm-relative velocity is derived
+/// from the Bunkers right-mover fitted to the volume's own winds. Named here
+/// so the wording has one home and a test can pin it.
+pub(crate) const STORM_MOTION_OVERRIDE_LABEL: &str = "Override the storm motion vector";
+
 /// What actually leaves the machine when the user says yes, in the pane that
 /// asks.
 ///
@@ -280,14 +290,25 @@ impl super::Gui {
 
                 // --- Storm motion (storm-relative velocity) ---
                 //
-                // Off by default: the RPG's own SCIT average is in the N0S
-                // Product Description Block and is the vector the RPG itself
-                // fitted for this volume. An override replaces it on all four
-                // tilts at once — every one of them is derived.
+                // Off by default, and what "off" means changed. The label
+                // read "Override average storm motion", naming the RPG's own
+                // SCIT average from the N0S Product Description Block — a
+                // source that left with the five Level III SRM fetches. With
+                // the switch off, storm-relative velocity now uses the
+                // Bunkers right-mover `rustdar_radar::srv::volume_wind_profile`
+                // fits from the volume's own winds; there is no RPG vector to
+                // override any more. An override replaces it everywhere at
+                // once: every storm-relative tilt, the 3D volume and the
+                // cross-section are all derived from it.
                 ui.heading("Storm motion");
                 ui.add_space(SETTINGS_SMALL_SPACING);
                 let motion = &mut self.storm_motion_override;
-                ui.checkbox(&mut motion.enabled, "Override average storm motion");
+                ui.checkbox(&mut motion.enabled, STORM_MOTION_OVERRIDE_LABEL)
+                    .on_hover_text(
+                        "Off, storm-relative velocity uses the Bunkers right-mover fitted \
+                         from this volume's own winds. On, it uses the vector below \
+                         \u{2014} in the plan view, the 3D volume and the cross-section alike.",
+                    );
                 ui.add_enabled_ui(motion.enabled, |ui| {
                     ui.horizontal(|ui| {
                         ui.label("Speed:");
@@ -542,5 +563,34 @@ mod tests {
     fn an_unplugged_port_is_still_named() {
         assert_eq!(gps_port_label(&ports(), Some("/dev/ttyS9")), "/dev/ttyS9");
         assert_eq!(gps_port_label(&[], None), "Auto-detect");
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::*;
+
+    /// The storm motion switch must not name a source the app no longer has.
+    ///
+    /// It read "Override **average** storm motion" — the RPG's own SCIT
+    /// average, carried in the `N0S` Product Description Block, which left
+    /// with the five Level III SRM fetches. With the switch off there is no
+    /// average to override: storm-relative velocity is derived from the
+    /// Bunkers right-mover fitted to the volume's own winds. A control that
+    /// names a vanished source tells the user their override is replacing
+    /// something the app is not using.
+    #[test]
+    fn the_storm_motion_switch_does_not_name_an_rpg_average() {
+        let label = STORM_MOTION_OVERRIDE_LABEL.to_ascii_lowercase();
+        assert!(
+            !label.contains("average"),
+            "the switch reads {STORM_MOTION_OVERRIDE_LABEL:?}, naming the RPG \
+             SCIT average that left with the Level III SRM fetches",
+        );
+        assert!(
+            label.contains("storm motion"),
+            "the switch reads {STORM_MOTION_OVERRIDE_LABEL:?}, which does not \
+             say what it overrides",
+        );
     }
 }

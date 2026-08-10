@@ -469,6 +469,26 @@ pub enum SectionUnavailable {
     /// distinct from "not yet": a section that will never appear must not look
     /// like one that is on its way.
     RenderFailed,
+    /// **This volume** carries nothing to cut under the pane's product: no
+    /// sweep holds the moment, or the derivation refused it — above all
+    /// storm-relative velocity with no motion vector from either the override
+    /// or the volume's own winds.
+    ///
+    /// Not the same refusal as
+    /// [`ProductHasNoVerticalStructure`](Self::ProductHasNoVerticalStructure),
+    /// which is a property of the *product* and permanent. This one is a
+    /// property of the volume and resolves when a volume carrying the moment
+    /// arrives, which is why the staleness key it is written with carries the
+    /// volume stamp.
+    ///
+    /// It exists because without it this state had no name and no message.
+    /// The dispatcher's "no payload" answer was indistinguishable from "the
+    /// render budget is full", so the pane wrote no staleness key, re-asked on
+    /// every frame, and painted "Cutting the cross-section…" for as long as
+    /// the volume stood — a permanent wait, which this codebase shipped once
+    /// before and fixed, and which the pane's own doc calls the worst state a
+    /// pane can be in.
+    ProductMissingFromVolume(RadarProduct),
 }
 
 impl SectionUnavailable {
@@ -499,6 +519,12 @@ impl SectionUnavailable {
                 product.name()
             ),
             Self::RenderFailed => "The cross-section could not be cut from this volume".to_owned(),
+            Self::ProductMissingFromVolume(product) => format!(
+                "This volume carries no {} to cut \u{2014} the section appears as soon as one \
+                 that does arrives. Storm-relative velocity also needs a motion vector, from \
+                 the volume's own winds or the override.",
+                product.name()
+            ),
         }
     }
 }

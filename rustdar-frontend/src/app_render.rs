@@ -878,25 +878,55 @@ impl super::App {
                     motion,
                 )
             };
-            if self.render.spawn_section_render(
+            match self.render.spawn_section_render(
                 pane_idx,
                 &target,
                 extract,
                 self.channels.section_sender.clone(),
                 self.window.clone(),
-            ) && let Some(section) = self
-                .gui
-                .pane_mut(pane_idx)
-                .and_then(|p| p.cross_section_mut())
-            {
-                // Written on **dispatch**, not on arrival. A cut that answers
-                // nothing would otherwise never write it, and the pane would
-                // re-dispatch the same failing cut on every frame for as long as
-                // the volume stood — a busy loop whose only symptom is a warm
-                // machine. `poll_section_results` matches the reply against this
-                // key, so a superseded cut still cannot land.
-                section.rendered_for = Some(target);
-                section.unavailable = None;
+            ) {
+                // Nothing taken, nothing said: the budget frees up on its own
+                // and the pane asks again next frame.
+                crate::render_dispatch::SectionDispatch::Busy => {}
+                crate::render_dispatch::SectionDispatch::NoPayload => {
+                    // This volume carries nothing to cut under this product.
+                    // The key **is** written, and that is the fix: without a
+                    // name for this state it was indistinguishable from a full
+                    // budget, so the pane re-asked every frame and painted
+                    // "Cutting the cross-section…" for as long as the volume
+                    // stood. The key carries the volume stamp and the ladder,
+                    // so the next volume asks again on its own.
+                    self.mark_section_unavailable(
+                        pane_idx,
+                        rustdar_egui::pane::SectionUnavailable::ProductMissingFromVolume(
+                            target.product,
+                        ),
+                    );
+                    if let Some(section) = self
+                        .gui
+                        .pane_mut(pane_idx)
+                        .and_then(|p| p.cross_section_mut())
+                    {
+                        section.rendered_for = Some(target);
+                    }
+                }
+                crate::render_dispatch::SectionDispatch::Dispatched => {
+                    if let Some(section) = self
+                        .gui
+                        .pane_mut(pane_idx)
+                        .and_then(|p| p.cross_section_mut())
+                    {
+                        // Written on **dispatch**, not on arrival. A cut that
+                        // answers nothing would otherwise never write it, and
+                        // the pane would re-dispatch the same failing cut on
+                        // every frame for as long as the volume stood — a busy
+                        // loop whose only symptom is a warm machine.
+                        // `poll_section_results` matches the reply against this
+                        // key, so a superseded cut still cannot land.
+                        section.rendered_for = Some(target);
+                        section.unavailable = None;
+                    }
+                }
             }
         }
     }
