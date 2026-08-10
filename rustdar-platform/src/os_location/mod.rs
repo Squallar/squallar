@@ -2,7 +2,8 @@
 //! offers.
 //!
 //! Windows has `Geolocator` and `AppCapability`, Apple has `CLLocationManager`,
-//! Linux has GeoClue2 — first-class services rustdar had never asked. Each gets
+//! Linux has xdg-desktop-portal — first-class services rustdar had never asked.
+//! Each gets
 //! a private module here exposing one type, `OsLocationReader`, implementing one
 //! trait, [`OsLocationProvider`]. That trait is the contract, it is declared
 //! once, and the compiler checks every arm against it.
@@ -53,8 +54,9 @@ mod apple;
 // business, not this one's), so `unsupported` is the right answer there and not
 // a stub.
 
-/// GeoClue2 over `zbus`, on the peer-scoped connection its `Location` objects
-/// require.
+/// `org.freedesktop.portal.Location` over `ashpd`, on a thread that drives its
+/// futures itself. Never GeoClue directly: the portal's `disable-location` is a
+/// user preference, and going around it is going around the user.
 #[cfg(target_os = "linux")]
 use linux as provider;
 
@@ -149,7 +151,7 @@ pub struct OsLocationSink {
 /// The old signature took one, inherited from [`SerialGpsReader::start`], whose
 /// job it is to open a serial port. `GpsConfig` carries a port name, a baud
 /// rate and a heading source: three settings for a piece of hardware the user
-/// plugged in. A GeoClue client, a WinRT `Geolocator` and a `CLLocationManager`
+/// plugged in. A portal session, a WinRT `Geolocator` and a `CLLocationManager`
 /// have none of those and can use none of them — every provider that landed
 /// ignored the argument, and one of them said so in a doc comment. What a
 /// location session actually needs is somewhere to put a fix, a way to ask for

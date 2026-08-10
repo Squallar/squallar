@@ -4,7 +4,8 @@
 //! user plugged in and pointed us at; a platform location service is a
 //! privilege the OS grants and can withdraw. Every platform rustdar runs on has
 //! the second concept — Windows `AppCapability`, macOS/iOS `CLAuthorizationStatus`,
-//! Android runtime permissions, the browser's Permissions API, GeoClue2's agent
+//! Android runtime permissions, the browser's Permissions API, the freedesktop
+//! location portal
 //! — and until this existed the app modelled none of them, so on three of five
 //! platforms "denied" was indistinguishable from "no signal" and the UI could
 //! never explain why the map had no blue dot.

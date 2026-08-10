@@ -24,13 +24,14 @@ const GPS_BAUD_RATES: &[u32] = &[4800, 9600, 38400, 115200];
 /// service resolves a position from the public IP address, from the identifiers
 /// of nearby Wi-Fi access points, or both.
 ///
-/// Linux names the destination because on Linux it is knowable and fixed:
-/// GeoClue's Wi-Fi backend POSTs the BSSIDs it can see to `api.beacondb.net`,
-/// and the user can turn that off in `geoclue.conf` — advice that is only
-/// useful if they know the request exists. Windows, macOS and Android send
-/// comparable data to endpoints their vendors do not publish and the user
-/// cannot configure, so naming a host there would be an invention. Web is
-/// whichever service the browser uses, which the browser chooses.
+/// Linux names the destination because on Linux it is knowable and fixed: the
+/// portal that answers rustdar proxies to GeoClue, whose Wi-Fi backend POSTs
+/// the BSSIDs it can see to `api.beacondb.net`, and the user can turn that off
+/// in `geoclue.conf` — advice that is only useful if they know the request
+/// exists. Windows, macOS and Android send comparable data to endpoints their
+/// vendors do not publish and the user cannot configure, so naming a host there
+/// would be an invention. Web is whichever service the browser uses, which the
+/// browser chooses.
 ///
 /// A `cfg` on `target_os` and not on anything else: `target_os = "android"` is
 /// distinct from `"linux"`, and wasm32 is neither, so the general sentence is
@@ -44,6 +45,40 @@ const LOCATION_EGRESS_NOTE: &str = "Approximate, from your system's location \
 const LOCATION_EGRESS_NOTE: &str = "Approximate, from your device's location \
     service. Finding a position may send your IP address and details of nearby \
     wireless networks to that service's provider.";
+
+/// Where a user actually goes to undo a refusal, in the pane that reports one.
+///
+/// "It can be turned back on in your system settings" is true wherever the
+/// platform has a location page, and on Linux it is not: what refuses rustdar
+/// is xdg-desktop-portal's `disable-location`, and the backend that implements
+/// it — `xdg-desktop-portal-gtk`, which almost every desktop installs for its
+/// file chooser — answers that property from the GSettings key
+/// `org.gnome.system.location enabled`. That key **defaults to false** and has
+/// a UI only on GNOME. So on a stock KDE, Sway or Hyprland machine the generic
+/// sentence points at a page that does not exist, for a switch that is already
+/// the reason nothing works.
+///
+/// Naming the command is the honest answer, and it is also why
+/// `OsLocationReader::settings_available()` is `false` on Linux: there is a
+/// thing to *type*, not a page to open, and a button that launched GNOME's
+/// control centre on Plasma would be a worse lie than no button.
+///
+/// Same `cfg` axis as [`LOCATION_EGRESS_NOTE`], for the same reason: Android is
+/// not `linux` and wasm32 is neither.
+/// `pub(crate)` so `input_harness` can assert the pane paints *this* — the
+/// property worth testing is "a refusal is explained", and a test that spelled
+/// the sentence out again would only pin whichever platform ran it.
+#[cfg(target_os = "linux")]
+pub(crate) const LOCATION_DENIED_NOTE: &str = "Your desktop's location switch \
+    is off, so the portal refused. GNOME has this under Settings \u{203a} \
+    Privacy; most other desktops have no page for it, and this works \
+    everywhere:\n\
+    \n\
+    gsettings set org.gnome.system.location enabled true";
+/// See the Linux arm above.
+#[cfg(not(target_os = "linux"))]
+pub(crate) const LOCATION_DENIED_NOTE: &str = "Location for this app is turned \
+    off. It can be turned back on in your system settings.";
 
 impl super::Gui {
     /// Render the settings window if `show_settings` is true.
@@ -322,13 +357,11 @@ impl super::Gui {
             }
             // A decision, and one only the user can reverse. No button — the
             // platform will not show a second dialog — so the only useful thing
-            // here is where to go instead.
+            // here is where to go instead, and on one platform "where" is a
+            // command rather than a page. See [`LOCATION_DENIED_NOTE`].
             LocationPermission::Denied => {
                 ui.label("Denied.");
-                ui.label(
-                    "Location for this app is turned off. It can be turned back \
-                     on in your system settings.",
-                );
+                ui.label(LOCATION_DENIED_NOTE);
                 // A shortcut to the page, not a second way to ask — and only on
                 // a platform that has one. "Open", not "Allow": a machine-wide
                 // policy can leave that toggle greyed out, and this button
@@ -383,8 +416,8 @@ impl super::Gui {
     /// iOS and every build without a serial port do not compile. On exactly
     /// those platforms — the ones where the OS location service is the *only*
     /// source — the section above would otherwise say "On." beside an empty map
-    /// and explain nothing. That is also the likely Linux outcome: GeoClue can
-    /// take a while, or answer with nothing at all.
+    /// and explain nothing. That is also the likely Linux outcome: the portal
+    /// can take a while, or answer with nothing at all.
     ///
     /// Coarse on purpose. Seconds would tick in a window nobody is watching for
     /// a value that changes every few minutes.

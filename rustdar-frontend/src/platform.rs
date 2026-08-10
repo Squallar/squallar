@@ -543,7 +543,7 @@ pub trait PlatformBridge {
     /// Mirrors [`gps_active`](Self::gps_active), and exists for the same reason
     /// the UI reads that rather than a local flag: "granted" and "delivering"
     /// are different states, a bridge can stop delivering without anything in
-    /// this crate asking it to (iOS backgrounds, a GeoClue client dies), and a
+    /// this crate asking it to (iOS backgrounds, a portal session closes), and a
     /// gate-local bool would go on claiming otherwise.
     ///
     /// Defaulted `false`: a bridge with no location service is never

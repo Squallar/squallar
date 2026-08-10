@@ -19,7 +19,8 @@ pub enum FixQuality {
     /// A platform location service that fused satellites, Wi-Fi and cell towers
     /// and declined to say which won.
     ///
-    /// Windows `Geolocator`, macOS/iOS `CLLocationManager`, Linux GeoClue2 and
+    /// Windows `Geolocator`, macOS/iOS `CLLocationManager`, Linux's location portal
+    /// and
     /// Android's fused provider all answer this way. Neither existing variant
     /// fits: `Gps` claims a satellite fix, which is a lie the moment the
     /// position came from an IP lookup, and `Estimated` means *dead reckoning*

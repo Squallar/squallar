@@ -1,33 +1,75 @@
 # Linux desktop integration
 
-Two files and a Makefile. They exist so that **"Use my location" can work**, not
-so that rustdar appears in a menu — the menu entry is a side effect.
+Two files and a Makefile: a `.desktop` entry and three icon sizes. They give
+rustdar a launcher entry, an icon, a window that groups under that entry, and
+the identity a Flatpak would need.
 
-## Why a `.desktop` file is required
+## What this is *not* for any more
 
-rustdar's Linux location provider talks to [GeoClue2] on the session bus.
-GeoClue refuses `org.freedesktop.GeoClue2.Client.Start()` unless the client has
-first set the `DesktopId` property, and where a **location agent** is registered
-— GNOME's `gnome-shell` registers one, and geoclue ships a demo agent — that
-agent resolves the id to `<DesktopId>.desktop` through `GDesktopAppInfo` so it
-can put a name and an icon in front of the user before answering.
+An earlier version of this file said the `.desktop` entry was **required for
+location**. It is not, and the reason is worth writing down because it is the
+same reason the provider was rewritten.
 
-So with no file installed, on a desktop with an agent, the call fails with a
-bare `org.freedesktop.DBus.Error.AccessDenied` and nothing anywhere says why.
-The app checks for the file before it makes the call and logs this instead:
+rustdar used to talk to [GeoClue2] directly. GeoClue refuses
+`org.freedesktop.GeoClue2.Client.Start()` unless the client has set a
+`DesktopId`, and where a location agent is registered that agent resolves the id
+to `<DesktopId>.desktop` to find a name and an icon to show the user — so
+without the file installed, the call failed with a bare `AccessDenied`.
 
-```
-dev.mcswain.rustdar.desktop is not installed under XDG_DATA_HOME or
-XDG_DATA_DIRS. ... Install it with `make -C packaging/linux install-user`.
-```
+rustdar now uses **`org.freedesktop.portal.Location`** and nothing else. The
+portal identifies an unsandboxed caller with `xdp_app_info_is_host`, which
+grants `GCLUE_ACCURACY_LEVEL_EXACT` with **no prompt and no app id at all** —
+the portal then talks to GeoClue under its own identity. So on a normal
+non-Flatpak install, location works with none of these files installed, and
+installing them changes nothing about it.
 
-The app does **not** install the file itself. Writing into a user's
-`applications/` directory to obtain a permission is exactly the kind of thing an
-app should be asked to do rather than do quietly, and on installs with no agent
-registered the file is genuinely unnecessary — that is the configuration this
-provider was first measured working in.
+Why the change, given the direct path worked: `org.freedesktop.impl.portal.Lockdown`
+carries a `disable-location` property that desktops bind to their own location
+switch. Reading GeoClue directly means never seeing it — answering a question
+the user has already answered, and answering it the other way. It also means
+never working inside a Flatpak, where there is no system bus to reach.
 
 [GeoClue2]: https://gitlab.freedesktop.org/geoclue/geoclue
+
+## Read this first: location is off by default on most desktops
+
+`xdg-desktop-portal-gtk` — which almost every desktop installs, if only for its
+file chooser — implements `Lockdown` by reading the GSettings key
+**`org.gnome.system.location enabled`**. That key **defaults to `false`**, and
+GNOME is the only desktop with a UI for it.
+
+So on a stock KDE, Sway or Hyprland machine, the very first "Use my location"
+is refused before a session is even created:
+
+```text
+org.freedesktop.portal.Error.NotAllowed: Location services disabled
+```
+
+rustdar reports that as **Denied** — a decision, reversible, not a missing
+service — and the settings pane names the fix, because "check your system
+settings" would point at a page that does not exist. From a terminal:
+
+```sh
+gsettings get org.gnome.system.location enabled     # false on a stock install
+gsettings set org.gnome.system.location enabled true
+```
+
+It takes effect immediately; nothing needs restarting. On GNOME the same switch
+is Settings → Privacy → Location.
+
+To confirm what the portal backend is actually reporting:
+
+```sh
+busctl --user get-property org.freedesktop.impl.portal.desktop.gtk \
+    /org/freedesktop/portal/desktop \
+    org.freedesktop.impl.portal.Lockdown disable-location
+```
+
+`b false` means location is permitted.
+
+If a portals **frontend** is missing entirely — no `xdg-desktop-portal`, or no
+backend implementing `Location` — rustdar reports **Unavailable** instead, and
+offers nothing, because there is no switch to turn on.
 
 ## Installing
 
@@ -58,7 +100,7 @@ could have written, including the binary.
 
 | field | value | why it is that value |
 |---|---|---|
-| file name | `dev.mcswain.rustdar.desktop` | The basename **is** the `DesktopId`. It matches `ios/project.yml`'s bundle id and the Android `applicationId`, and `os_location/linux.rs`'s `DESKTOP_ID` — a test pins those two together. |
+| file name | `dev.mcswain.rustdar.desktop` | The basename is the application id. It matches `ios/project.yml`'s bundle id and the Android `applicationId`, and a test in `os_location/linux.rs` compiles this file in by that exact path, so renaming it fails the build. |
 | `Icon=` | `dev.mcswain.rustdar` | A bare identifier, not a path. The icon theme spec resolves it against the installed `hicolor` sizes; a path would pin one size and defeat the lookup. |
 | `StartupWMClass=` | `rustdar-platform` | See below. |
 | `Exec=` | `rustdar-platform` | The binary this repo builds. Rename it and `StartupWMClass` has to change with it. |
@@ -93,14 +135,15 @@ with no reader and a second identity to keep correct.
 
 ## Network egress — read this before enabling location
 
-GeoClue is the thing that finds the position; rustdar only asks it to. **How**
-it finds one is geoclue's own configuration, and one of its methods sends data
-off the machine:
+**This has not changed, and the portal does not change it.** The portal does not
+find positions itself: it proxies to the same GeoClue daemon, so everything
+GeoClue does to answer, it still does. **How** it finds a position is geoclue's
+own configuration, and one of its methods sends data off the machine:
 
 * **IP-based lookup** — geoclue asks a geolocation service about the public IP
   address the request arrives from. This is what produced the measurement this
-  provider was built against: **25 km accuracy**, `AvailableAccuracyLevel = 6`
-  (`STREET`), on a machine with no Wi-Fi.
+  provider was built against: **25 km accuracy**, reported by geoclue as
+  `GeoIP (ichnaea)`, on a machine with no Wi-Fi in use.
 * **Wi-Fi lookup** — geoclue scans for nearby access points and **POSTs their
   BSSIDs (MAC addresses) to `https://api.beacondb.net/v1/geolocate`**. That is a
   list of your neighbours' routers, sent to a third party, in exchange for a
@@ -125,6 +168,44 @@ ls ~/.local/share/applications/dev.mcswain.rustdar.desktop
 gio info ~/.local/share/applications/dev.mcswain.rustdar.desktop   # optional
 ```
 
-Then run the app with `RUST_LOG=rustdar_platform_lib=debug` and look for
-`GeoClue2 location session started as dev.mcswain.rustdar`. If the preflight
-warning appears instead, the file is not where the agent searches.
+Then run the app with `RUST_LOG=rustdar_platform_lib=debug` and press "Use my
+location". A working session logs:
+
+```text
+portal location session started
+OS location fix: 35.4689, -97.5195 (±25000 m) from GeoIP (ichnaea)
+```
+
+A refusal names the key instead:
+
+```text
+the location portal refused a session: … The desktop's location switch is off.
+xdg-desktop-portal-gtk reads it from the GSettings key
+`org.gnome.system.location enabled` …
+```
+
+Note that none of that depends on the files this directory installs.
+
+## One failure mode that looks like a rustdar bug and is not
+
+If the portal answers with response code 2 — rustdar logs "the portal accepted
+the request and could not carry it out" and stays retryable — check the portal's
+own log:
+
+```sh
+journalctl --user -u xdg-desktop-portal.service --since -5min
+```
+
+`Starting GeoClue client failed: … Geolocation disabled for UID 1000` with the
+lockdown key already `true` means the portal is holding a GeoClue client whose
+cached view of the geoclue **agent** went stale, which is what happens when the
+agent (`geoclue-demo-agent`, or your desktop's own) restarts underneath a
+long-lived portal. Restarting the portal rebuilds it:
+
+```sh
+systemctl --user restart xdg-desktop-portal.service
+```
+
+This was observed on the development machine and is a portal/geoclue
+interaction; rustdar has no part in it beyond reporting the failure honestly and
+letting the user try again.

@@ -79,7 +79,7 @@ struct OsLocation {
     /// What the provider last reported.
     ///
     /// An atomic and not a `Cell`, because it is written from whatever thread
-    /// the provider is given — a GeoClue session thread, a WinRT RPC thread,
+    /// the provider is given — a portal session thread, a WinRT RPC thread,
     /// the main run loop — and read from
     /// [`location_permission`](PlatformBridge::location_permission), which is a
     /// `&self` getter on the frame path. That rules out a `Cell` (not `Send`),
@@ -418,7 +418,7 @@ impl PlatformBridge for DesktopPlatform {
     // ── Platform location service ───────────────────────────────────────
     //
     // Six one-line forwards to [`OsLocation`], and not one of them names a
-    // target. Everything per-OS — GeoClue2 over zbus, `AppCapability` +
+    // target. Everything per-OS — the location portal over ashpd, `AppCapability` +
     // `Geolocator`, `CLLocationManager` — is behind `crate::os_location`, which
     // is the entire `cfg` surface, and every arm of it implements the same
     // trait.

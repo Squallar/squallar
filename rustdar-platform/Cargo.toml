@@ -111,20 +111,50 @@ rustdar-egui = { workspace = true, features = ["gps-serial"] }
 rustdar-gps = { workspace = true, features = ["serial"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# GeoClue2 is reached over D-Bus -- on the *system* bus, which is where it ships
-# its `.service` file; see the note in `os_location/linux.rs`. Already in the
-# graph via `dark-light -> ashpd`, which resolves the same 5.18.0 -- so this adds
-# **zero packages**.
+# `org.freedesktop.portal.Location`, for `os_location/linux.rs`. **Zero new
+# packages**: `dark-light` already puts ashpd 0.10.3 in this graph, and this
+# crate's `zbus` is reached through ashpd's own re-export rather than named
+# again here.
 #
-# It is not free, though, and the plan's earlier "harmless" was an
-# overstatement. `ashpd` selects `zbus/async-io` *without* `blocking-api`;
-# taking the default features here turns that on, which recompiles `zbus` and
+# The features are not tidiness, they are the whole reason this line is
+# spelled out. `dark-light` asks for exactly `default-features = false,
+# features = ["async-std"]`, and matching it is load-bearing: ashpd's default
+# feature is `tokio`, which selects `zbus/tokio` *and* pulls `dep:tokio`.
+# Features are additive across the graph, so taking the default here would
+# union `zbus/tokio` into every Linux row -- recompiling `zbus` and
 # `zbus_macros` with a larger surface on the linux, `standalone`, clippy-host
-# and test rows. That is the trade being made deliberately: the whole provider
-# is written against `zbus::blocking` with no async and no executor, on a
-# thread whose entire job is to sit in a blocking `next()`.
-zbus = "=5.19.0"
+# and test rows, and adding a tokio runtime to a crate that starts no runtime.
+# `async-std` selects `zbus/async-io`, which is what is already compiled.
+#
+# Measured, with `cargo tree -p rustdar-platform --target
+# x86_64-unknown-linux-gnu -e normal -f "{p} {f}"`: the graph is 437 packages
+# before and after with an identical set, and zbus's own features **shrink**
+# from `…,blocking,blocking-api,default,url` to `…,blocking,url`. Naming zbus
+# directly is what used to turn `blocking-api` on; this provider is async and
+# does not need it, so dropping the direct dependency hands that back.
+#
+# That also retires the `zbus = "=…"` pin this block used to carry, and the
+# Renovate PRs that bumped it: nothing here constrains zbus any more, so it
+# resolves to whatever `ashpd` asks for.
+#
+# NB the feature is named for async-std and does not pull it: it is
+# `zbus/async-io` plus `async-fs`, `async-net` and `futures-util/io`. The
+# provider drives its own futures with `futures_lite::future::block_on`; the
+# `async-io` reactor those calls need starts itself on first use.
+ashpd = { version = "=0.10.3", default-features = false, features = [
+    "async-std",
+] }
+# `block_on` and `StreamExt::next` for the session thread, and `oneshot` for
+# the cancellation the thread parks on. Both are already in this graph --
+# futures-lite via `ashpd -> zbus/async-io -> async-io`, futures-channel as a
+# direct dependency of `ashpd` -- and each resolves to exactly one version, so
+# naming them adds **zero packages** and no second version constraint.
+#
+# Neither is an executor. `block_on` parks the calling thread on one future;
+# nothing here spawns.
+futures-lite = "=2.6.1"
+futures-channel = "=0.3.33"
 # For `GpsFix::timestamp`, which is a `chrono::NaiveDateTime` and arrives from
-# GeoClue as a `(tt)` pair of epoch seconds and microseconds. Already in the
-# graph via `rustdar-gps`; named here because this crate now converts one.
+# the portal as epoch seconds. Already in the graph via `rustdar-gps`; named
+# here because this crate now converts one.
 chrono = { workspace = true }

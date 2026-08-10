@@ -8249,10 +8249,10 @@ mod tests {
     // right permission and renders the wrong button is exactly the failure this
     // section exists to catch, and no state assertion can see it.
 
-    /// A refusal is a decision only the user can reverse, in system settings.
-    /// Offering a button here would be offering a dialog the platform will not
-    /// show — and on the design that mapped Windows' `NotDeclaredByApp` to
-    /// `Denied`, it would have bricked that arm outright.
+    /// A refusal is a decision only the user can reverse, wherever their
+    /// platform keeps it. Offering a button here would be offering a dialog the
+    /// platform will not show — and on the design that mapped Windows'
+    /// `NotDeclaredByApp` to `Denied`, it would have bricked that arm outright.
     #[test]
     fn settings_offers_no_way_to_ask_once_the_os_has_refused() {
         let mut h = InputHarness::new();
@@ -8279,8 +8279,13 @@ mod tests {
             "the OS has refused and the pane still offers to ask it again. \
              Painted: {painted:?}"
         );
+        // The constant rather than a phrase: where a refusal is undone differs
+        // by platform — Windows has a Settings page, Linux has a GSettings key
+        // and no page at all — so a literal here would only ever pin whichever
+        // one CI happened to run. What must hold everywhere is that the arm
+        // renders the explanation beside the word.
         assert!(
-            painted.iter().any(|t| t.contains("system settings")),
+            painted.iter().any(|t| t == crate::ui::LOCATION_DENIED_NOTE),
             "a denial with no button and no explanation is the state this \
              whole feature exists to remove. Painted: {painted:?}"
         );
@@ -8401,11 +8406,42 @@ mod tests {
         }
     }
 
+    /// A refusal has to say something a user can act on, and on Linux the
+    /// generic sentence cannot: the switch that refused is
+    /// xdg-desktop-portal's `disable-location`, `xdg-desktop-portal-gtk`
+    /// answers it from `org.gnome.system.location enabled`, that key defaults
+    /// to **false**, and no desktop except GNOME has a page for it. So the one
+    /// arm with no settings button is also the one arm that must name the
+    /// command — otherwise the default state of a stock KDE machine reads
+    /// "Denied. …check your system settings" and there is nothing there.
+    ///
+    /// `cfg`'d rather than asserted both ways, because the copy is `cfg`'d: on
+    /// every other platform "your system settings" is a real place.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_linux_refusal_names_the_setting_that_would_undo_it() {
+        let mut h = InputHarness::new();
+        h.gui_mut().show_settings = true;
+        h.gui_mut()
+            .set_location_state(rustdar_gps::LocationPermission::Denied, false);
+        h.warm_up();
+
+        let painted = h.painted_text_strings();
+        let advice = painted
+            .iter()
+            .find(|t| t.contains("gsettings"))
+            .unwrap_or_else(|| panic!("no advice a user could follow. Painted: {painted:?}"));
+        assert!(
+            advice.contains("org.gnome.system.location enabled true"),
+            "the advice does not name the key or its value: {advice:?}"
+        );
+    }
+
     /// The gap the ungated line closes. `Fix:`/`No GPS fix` lives inside
     /// `#[cfg(feature = "gps-serial")]`, so on web, Android, iOS and every
     /// build without a serial port the section would read `On.` beside an empty
     /// map and explain nothing — which is the likely Linux outcome too, where
-    /// GeoClue can take a while or answer with nothing at all.
+    /// the portal can take a while or answer with nothing at all.
     #[test]
     fn a_granted_permission_with_no_fix_yet_says_so() {
         let mut h = InputHarness::new();

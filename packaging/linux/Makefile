@@ -1,11 +1,12 @@
 # Desktop integration for the Linux build.
 #
-# This exists because of a permission, not because of a menu entry. GeoClue2
-# refuses `Client.Start()` unless the client has set `DesktopId`, and a
-# registered location agent (GNOME's shell is one) resolves that id to
-# `<DesktopId>.desktop` through `GDesktopAppInfo` to find the name and icon it
-# shows the user. Without the file installed somewhere the agent looks, the app
-# gets a bare `AccessDenied` and nothing to say about it.
+# This is a menu entry, an icon and an application id -- and it used to be a
+# permission too. GeoClue2 refused `Client.Start()` without a `DesktopId` a
+# registered agent could resolve, so the app could not ask for a location until
+# this file was installed. That is over: rustdar asks
+# `org.freedesktop.portal.Location` instead, and the portal grants an
+# unsandboxed caller with no app id at all. Location now works with none of
+# this installed. See README.md.
 #
 #   make install-user                            # ~/.local/share, no root
 #   sudo make install                            # /usr/local/share
@@ -56,8 +57,8 @@ install:
 	@echo "installed $(DESKTOP) under $(DATADIR)"
 
 # The same thing into the per-user data directory -- what `$XDG_DATA_HOME`
-# names, and the first place `GDesktopAppInfo` looks. No root, and it is the
-# form the app's own preflight warning suggests.
+# names, and the first place a desktop-file lookup searches. No root, and it
+# takes effect for the current session immediately.
 install-user:
 	$(MAKE) --no-print-directory install \
 	    DATADIR="$${XDG_DATA_HOME:-$$HOME/.local/share}" \

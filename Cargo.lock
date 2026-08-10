@@ -4164,9 +4164,12 @@ dependencies = [
 name = "rustdar-platform"
 version = "0.1.0"
 dependencies = [
+ "ashpd",
  "chrono",
  "dark-light",
  "env_logger",
+ "futures-channel",
+ "futures-lite",
  "iana-time-zone",
  "log",
  "objc2 0.6.4",
@@ -4180,7 +4183,6 @@ dependencies = [
  "walkers",
  "windows",
  "winit",
- "zbus",
 ]
 
 [[package]]

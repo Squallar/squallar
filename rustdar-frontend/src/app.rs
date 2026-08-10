@@ -530,7 +530,7 @@ fn apply_location_hint(gui: &mut Gui, platform: &dyn PlatformBridge) -> bool {
 /// The instinct is to demand a tight fix here, and it is exactly backwards: the
 /// thing this replaces is the IANA timezone guess, whose population-weighted
 /// mean error is **605 km** and which opens 61% of sampled US metro population
-/// on a radar that physically cannot see their weather. A GeoClue IP lookup —
+/// on a radar that physically cannot see their weather. A portal IP lookup —
 /// the coarsest source rustdar will ever read — measures **25 km**, and
 /// displacing every sample point by that much changed the chosen site in only
 /// **5.5%** of probes, by a median of 17 km. WSR-88D sites sit ~200 km apart;
@@ -3288,7 +3288,7 @@ mod tests {
 
         fixes
             .send(rustdar_gps::GpsFix {
-                // What GeoClue measured on the developer's own machine: an
+                // What the location portal measured on the developer's own machine: an
                 // IP/ichnaea lookup, and comfortably good enough to choose
                 // among sites 200 km apart.
                 accuracy_m: Some(25_000.0),
@@ -3414,7 +3414,7 @@ mod tests {
         assert_eq!(opening_site(&app), "KDLH");
     }
 
-    /// The measured GeoClue number, pinned. It is an order of magnitude coarser
+    /// The measured portal number, pinned. It is an order of magnitude coarser
     /// than a satellite fix and an order of magnitude better than it needs to
     /// be: displacing a sample point by 25 km changed the chosen site in 5.5%
     /// of probes. A threshold that rejected it would switch off the largest

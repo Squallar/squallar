@@ -60,6 +60,13 @@ pub(crate) use map::{CROSS_SECTION_EMPTY_STATE, VOLUME_EMPTY_STATE};
 #[path = "ui_settings.rs"]
 mod settings;
 
+/// The sentence the settings pane puts under a refusal, for the same reason and
+/// on the same terms as the two empty states above: where a refusal is undone
+/// is `cfg`'d per platform, so a harness test that spelled it out would only
+/// ever pin whichever row ran it.
+#[cfg(test)]
+pub(crate) use settings::LOCATION_DENIED_NOTE;
+
 use crate::ui_input::InteractionState;
 
 /// One pane-count button the picker drew, as it was drawn. See
