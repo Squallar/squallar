@@ -6302,8 +6302,37 @@ mod tests {
                 "Reflectivity",
                 "Step:",
                 crate::ui::VOLUME_SIDEBAR_HEADER,
+                // "Lit volume" and "Isosurface" share this row; the label
+                // anchors it (the order test wants one needle per row).
+                "Mode:",
                 "Reset view",
                 crate::ui::NON_MAP_LAYERS_NOTE,
+            ],
+        );
+
+        // Isosurface mode reveals its threshold slider — labelled with the
+        // product's own comparison — and, with an alpha curve drawn, the
+        // honest word that the surface reads the data rather than the curve.
+        h.gui_mut()
+            .pane_mut(0)
+            .expect("pane 0 exists")
+            .volume_mut()
+            .expect("pane 0 is a 3D pane")
+            .view_mode = crate::pane::VolumeViewMode::Isosurface;
+        h.gui_mut().volume_alpha.set(
+            rustdar_radar::types::RadarProduct::Reflectivity,
+            crate::volume_alpha::AlphaCurve::from_alphas([7u8; crate::volume_alpha::CURVE_LEN]),
+        );
+        h.frames_for(2, FRAME_DT);
+        assert_descending_order(
+            &h,
+            sidebar,
+            &[
+                crate::ui::VOLUME_SIDEBAR_HEADER,
+                "Mode:",
+                "\u{2265}:",
+                "applies to the lit volume only",
+                "Reset view",
             ],
         );
 

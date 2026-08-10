@@ -595,7 +595,11 @@ pub struct Gui {
     /// [`crate::volume_alpha`]: absence means "render through the palette's
     /// own alpha, bit-exactly", which is why this is a store of exceptions
     /// rather than a curve per product.
-    volume_alpha: crate::volume_alpha::AlphaCurves,
+    pub(crate) volume_alpha: crate::volume_alpha::AlphaCurves,
+    /// The user's isosurface thresholds, one per edited product. See
+    /// [`crate::volume_iso`]: absence means the argued per-product default,
+    /// so this too is a store of exceptions.
+    pub(crate) volume_iso: crate::volume_iso::IsoThresholds,
 }
 
 /// A storm motion vector the user may substitute for the RPG's.
@@ -997,6 +1001,7 @@ impl Gui {
             storm_motion_override: StormMotionOverride::default(),
             volume_painter: None,
             volume_alpha: crate::volume_alpha::AlphaCurves::default(),
+            volume_iso: crate::volume_iso::IsoThresholds::default(),
         };
         gui.initialize_pane_enabled();
         gui
@@ -1698,7 +1703,7 @@ impl Gui {
                 crate::pane::PaneKind::Volume => {
                     self.render_radar_controls(ui, pane, combo_width, id_prefix);
                     self.render_time_navigation(ui, pane, id_prefix, actions);
-                    map::render_volume_controls(ui, pane);
+                    map::render_volume_controls(ui, pane, &mut self.volume_iso, &self.volume_alpha);
                     render_non_map_layers_note(ui);
                 }
             }

@@ -133,10 +133,22 @@ fn editor_contents(
     // nothing, which is what keeps it bit-exact.
     let shown = curves.get(product).or_else(|| palette_curve.clone());
     let Some(shown) = shown else {
-        ui.label(
-            "The volume is still building \u{2014} its palette arrives with it, \
-             and the curve is drawn over that palette.",
-        );
+        // Two different absences, two different sentences. A product the
+        // vertical views refuse will *never* have a palette here, and telling
+        // its user to wait would be the window lying about a permanent state.
+        if rustdar_radar::derive::volume_slot(product).is_none() {
+            ui.label(format!(
+                "{} does not render in 3D, so there is no volume opacity to \
+                 edit \u{2014} pick a moment the radar measures or derives \
+                 tilt by tilt.",
+                product.name(),
+            ));
+        } else {
+            ui.label(
+                "The volume is still building \u{2014} its palette arrives with it, \
+                 and the curve is drawn over that palette.",
+            );
+        }
         return;
     };
 

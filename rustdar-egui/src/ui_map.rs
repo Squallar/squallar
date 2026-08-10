@@ -508,6 +508,7 @@ impl super::Gui {
                                 current_stamp,
                                 &mut actions,
                                 &mut self.volume_alpha,
+                                &self.volume_iso,
                             );
                             #[cfg(test)]
                             self.last_volume_arms
@@ -1084,6 +1085,7 @@ fn render_volume_pane(
     current_stamp: Option<crate::ui::CurrentVolumeStamp>,
     actions: &mut Vec<GuiAction>,
     alpha_curves: &mut crate::volume_alpha::AlphaCurves,
+    iso_thresholds: &crate::volume_iso::IsoThresholds,
 ) -> Option<String> {
     let outcome = volume_pane_outcome(
         ui,
@@ -1094,6 +1096,7 @@ fn render_volume_pane(
         current_stamp,
         actions,
         alpha_curves,
+        iso_thresholds,
     );
     if let Some(why) = outcome.empty.as_deref() {
         paint_pane_empty_state(ui, pane_rect, why);
@@ -1146,6 +1149,7 @@ fn volume_pane_outcome(
     current_stamp: Option<crate::ui::CurrentVolumeStamp>,
     actions: &mut Vec<GuiAction>,
     alpha_curves: &crate::volume_alpha::AlphaCurves,
+    iso_thresholds: &crate::volume_iso::IsoThresholds,
 ) -> VolumeOutcome {
     use crate::pane::{OrbitDelta, VolumeStamp, VolumeTarget};
     use crate::volume_view::{VolumeFrameState, VolumePaint};
@@ -1156,7 +1160,9 @@ fn volume_pane_outcome(
     // measure it against a camera the user has not seen yet.
     //
     // Answered rather than unwrapped for the reason the `volume_mut` below gives.
-    let Some((camera_before, box_size_km)) = pane.volume().map(|v| (v.camera, v.box_size_km()))
+    let Some((camera_before, box_size_km, view_mode)) = pane
+        .volume()
+        .map(|v| (v.camera, v.box_size_km(), v.view_mode))
     else {
         return VolumeOutcome::empty_state(VOLUME_EMPTY_STATE.to_owned());
     };
@@ -1330,6 +1336,8 @@ fn volume_pane_outcome(
         // untouched editor — which the painter is obliged to render
         // bit-exactly through the palette's own alpha.
         alpha: alpha_curves.get(product),
+        view_mode,
+        iso_threshold: iso_thresholds.get(product),
     }) {
         VolumePaint::Callback(callback) => {
             // Hand-constructed, because `egui_wgpu::Callback` has a private
@@ -1386,7 +1394,13 @@ fn volume_pane_outcome(
 /// A free function rather than a `Gui` method because it touches nothing but the
 /// pane it is handed — and the pane it is handed is the one the caller
 /// `mem::take`n, which is the only correct thing to read during the UI pass.
-pub(crate) fn render_volume_controls(ui: &mut egui::Ui, pane: &mut crate::pane::PaneState) {
+pub(crate) fn render_volume_controls(
+    ui: &mut egui::Ui,
+    pane: &mut crate::pane::PaneState,
+    iso_thresholds: &mut crate::volume_iso::IsoThresholds,
+    alpha_curves: &crate::volume_alpha::AlphaCurves,
+) {
+    let product = pane.selected_product;
     let Some(volume) = pane.volume_mut() else {
         return;
     };
@@ -1422,6 +1436,62 @@ pub(crate) fn render_volume_controls(ui: &mut egui::Ui, pane: &mut crate::pane::
                  reports stay in real kft MSL at every setting.",
             );
         });
+
+        // The view mode: GR2Analyst's own pair, as a two-way radio. The mode
+        // is per pane (a posture of this picture, persisted with the pane);
+        // the threshold is per product (a judgement about a moment's scale,
+        // shared by every pane showing it — the alpha curves' arrangement).
+        ui.horizontal(|ui| {
+            ui.label("Mode:");
+            ui.radio_value(
+                &mut volume.view_mode,
+                crate::pane::VolumeViewMode::LitVolume,
+                "Lit volume",
+            )
+            .on_hover_text("The translucent accumulation: cloud shaped by the product's transparency profile and your Volume Alpha curve.");
+            ui.radio_value(
+                &mut volume.view_mode,
+                crate::pane::VolumeViewMode::Isosurface,
+                "Isosurface",
+            )
+            .on_hover_text("One opaque, lit surface at the threshold below — the shell of everything at or beyond it.");
+        });
+        if volume.view_mode == crate::pane::VolumeViewMode::Isosurface {
+            let (prefix, suffix) = crate::volume_iso::slider_labels(product);
+            let mut threshold = iso_thresholds.get(product);
+            ui.horizontal(|ui| {
+                ui.label(format!("{prefix}:"));
+                let response = ui.add(
+                    egui::Slider::new(&mut threshold, crate::volume_iso::slider_range(product))
+                        .suffix(suffix)
+                        .fixed_decimals(if *crate::volume_iso::slider_range(product).end() <= 4.0 {
+                            2
+                        } else {
+                            0
+                        }),
+                );
+                if response.changed() {
+                    iso_thresholds.set(product, threshold);
+                }
+                response.on_hover_text(format!(
+                    "Where {}'s surface sits. Per product — every 3D pane showing this \
+                     product shares it.",
+                    product.name(),
+                ));
+            });
+            // The honest word about the other control: the surface reads the
+            // data, so a drawn curve changes nothing in this mode.
+            if alpha_curves.is_edited(product) {
+                ui.label(
+                    egui::RichText::new(
+                        "The isosurface reads the data itself; your Volume Alpha curve \
+                         applies to the lit volume only.",
+                    )
+                    .small()
+                    .weak(),
+                );
+            }
+        }
 
         // Positive in the UI, inverted in storage — see `VolumePane::hide_floor`
         // for why the stored form is the negation.
@@ -1468,6 +1538,11 @@ pub(crate) fn reset_volume_view(volume: &mut crate::pane::VolumePane) {
     volume.camera = crate::pane::OrbitCamera::default();
     volume.region = None;
     volume.source_pane = None;
+    // `view_mode` stays, deliberately: the reset is for a pane that is *lost*
+    // — angle, zoom, centre, region — and the view mode is not a way to be
+    // lost, it is a choice of picture. A reset that also flipped an
+    // isosurface pane back to the lit volume would un-choose something the
+    // user chose on purpose.
 }
 
 /// Kilofeet per kilometre. The vertical readout is in kft MSL because that is

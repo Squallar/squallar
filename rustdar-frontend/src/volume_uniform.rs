@@ -211,7 +211,38 @@ pub struct VolumeUniform {
     /// rung as the lighting: together they are the cloud look, and the floor
     /// rung stays the jagged-unlit raw march.
     pub reconstruction_lod: f32,
+    /// The isosurface threshold in the shader's 0-1 index units, or negative
+    /// for the lit-volume march. Rides `eye_in_box.w`, one of the two lanes
+    /// that were reserved-zero before the view-mode work.
+    ///
+    /// Negative — not zero — is the lit-volume sentinel, because an index-0
+    /// threshold is a real configuration ("the surface of any data at all").
+    /// [`ISO_OFF`] is the sentinel every writer uses.
+    ///
+    /// In isosurface mode the march paints the first crossing of the
+    /// threshold as an opaque, gradient-lit surface and stops. The threshold
+    /// reads the **data** (the interpolated palette index), never the LUT's
+    /// alpha — a Volume Alpha curve restyles the lit volume and leaves the
+    /// isosurface where the values put it, which the UI says in as many
+    /// words.
+    pub iso_threshold: f32,
+    /// The centre index a **diverging** product's isosurface measures its
+    /// threshold from, in 0-1 index units, or negative for a sequential
+    /// product whose threshold reads the index directly. Rides `grid_dims.w`,
+    /// the other formerly-reserved lane.
+    ///
+    /// A diverging moment's interesting surfaces sit on *both* sides of its
+    /// background — a velocity couplet is an inbound lobe and an outbound
+    /// lobe — so its crossing test is `|index − centre| >= threshold`, which
+    /// renders both lobes, each wearing its own palette colour. ρHV rides
+    /// this lane too, with its centre at the **top** of its ramp, so "at or
+    /// under a bound" is the same test. Only read in isosurface mode.
+    pub iso_centre: f32,
 }
+
+/// The lit-volume sentinel for [`VolumeUniform::iso_threshold`] and the
+/// sequential sentinel for [`VolumeUniform::iso_centre`].
+pub const ISO_OFF: f32 = -1.0;
 
 impl VolumeUniform {
     /// A uniform with the defaults above, an identity transform and no camera.
@@ -236,6 +267,8 @@ impl VolumeUniform {
             step_cells: 1.0,
             reconstruction_lod: 0.0,
             map_floor: false,
+            iso_threshold: ISO_OFF,
+            iso_centre: ISO_OFF,
         }
     }
 
@@ -250,7 +283,11 @@ impl VolumeUniform {
         for (column, values) in self.box_from_clip.iter().enumerate() {
             write_vec4(&mut out, OFFSET_BOX_FROM_CLIP + column * 16, *values);
         }
-        write_vec4(&mut out, OFFSET_EYE_IN_BOX, xyz_w(self.eye_in_box, 0.0));
+        write_vec4(
+            &mut out,
+            OFFSET_EYE_IN_BOX,
+            xyz_w(self.eye_in_box, self.iso_threshold),
+        );
         write_vec4(
             &mut out,
             OFFSET_BOX_SIZE_KM,
@@ -259,7 +296,7 @@ impl VolumeUniform {
         write_vec4(
             &mut out,
             OFFSET_GRID_DIMS,
-            xyz_w(self.grid_dims.map(|n| n as f32), 0.0),
+            xyz_w(self.grid_dims.map(|n| n as f32), self.iso_centre),
         );
         write_vec4(
             &mut out,
@@ -361,6 +398,8 @@ mod tests {
             step_cells: 602.0,
             reconstruction_lod: 601.0,
             map_floor: true,
+            iso_threshold: 104.0,
+            iso_centre: 304.0,
         }
     }
 
@@ -481,13 +520,21 @@ mod tests {
         );
 
         for (offset, expected, member) in [
-            (OFFSET_EYE_IN_BOX, [101.0, 102.0, 103.0, 0.0], "eye_in_box"),
+            (
+                OFFSET_EYE_IN_BOX,
+                [101.0, 102.0, 103.0, 104.0],
+                "eye_in_box + iso_threshold",
+            ),
             (
                 OFFSET_BOX_SIZE_KM,
                 [201.0, 202.0, 203.0, 204.0],
                 "box_size_km + vertical_exaggeration",
             ),
-            (OFFSET_GRID_DIMS, [301.0, 302.0, 303.0, 0.0], "grid_dims"),
+            (
+                OFFSET_GRID_DIMS,
+                [301.0, 302.0, 303.0, 304.0],
+                "grid_dims + iso_centre",
+            ),
             (
                 OFFSET_LIGHT_DIR_AMBIENT,
                 [401.0, 402.0, 403.0, 404.0],
@@ -505,37 +552,38 @@ mod tests {
         }
     }
 
-    /// Reserved lanes come out as zero, from a uniform whose every other lane
-    /// is not.
+    /// The block has no reserved lanes left, and the last two to go — the
+    /// isosurface pair — default to the negative sentinels that select the
+    /// lit-volume march.
     ///
-    /// What this establishes is a property of the **bytes**, not of the writer.
-    /// `to_bytes` starts from `[0u8; VOLUME_UNIFORM_BYTES]`, so "written as
-    /// zero" and "never written" are indistinguishable from outside it, and an
-    /// earlier version of this comment claimed to start from a non-zero block
-    /// when it did not. The distinction does not exist in the output, and the
-    /// output is what the GPU reads — which is the thing that matters: the
-    /// uniform buffer is reused every frame, and `queue.write_buffer` overwrites
-    /// all 160 bytes, so a lane that is zero here is zero on the device rather
-    /// than holding the previous frame's value.
+    /// This test is the free-lane registry's tombstone: `eye_in_box.w` and
+    /// `grid_dims.w` were the two reserved-zero lanes (after `box_size_km.w`
+    /// and the three upper flags lanes took the exaggeration, the
+    /// reconstruction level, the march step and the floor switch), and the
+    /// view-mode work took both — `iso_threshold` and `iso_centre`. A seventh
+    /// member is now a 176-byte block and a WGSL struct change, on both
+    /// sides, with every layout test above moving together.
     ///
-    /// It is not vacuous: every *other* lane of `distinct()` is a large,
-    /// unique number, so a `to_bytes` that shifted or mis-strided its writes
-    /// would land one of them in a reserved slot.
+    /// The sentinel half matters most: negative — not zero — selects the lit
+    /// volume, because an index-0 threshold is a real isosurface
+    /// configuration ("the surface of any data"). A default of 0.0 here would
+    /// put every existing pane into isosurface mode at the no-data boundary.
     #[test]
-    fn reserved_lanes_are_written_as_zero() {
-        let bytes = distinct().to_bytes();
-        let packed = lanes(&bytes);
-
-        for (offset, lane_in_member, member) in [
-            (OFFSET_EYE_IN_BOX, 3, "eye_in_box.w"),
-            // box_size_km.w and the three upper flags lanes are no longer
-            // reserved: they carry the vertical exaggeration, the
-            // reconstruction level, the march step and the floor switch.
-            (OFFSET_GRID_DIMS, 3, "grid_dims.w"),
-        ] {
-            let lane = offset / 4 + lane_in_member;
-            assert_eq!(packed[lane], 0.0, "`{member}` is not written as zero");
-        }
+    fn the_iso_lanes_default_to_the_lit_volume_sentinels() {
+        let uniform = VolumeUniform::new([240.0, 240.0, 20.0], [128, 128, 64]);
+        assert!(
+            uniform.iso_threshold < 0.0 && uniform.iso_centre < 0.0,
+            "the default must be the lit volume, selected by a negative \
+             sentinel — zero is a real threshold",
+        );
+        let packed = lanes(&uniform.to_bytes());
+        assert_eq!(packed[OFFSET_EYE_IN_BOX / 4 + 3], ISO_OFF);
+        assert_eq!(packed[OFFSET_GRID_DIMS / 4 + 3], ISO_OFF);
+        assert!(
+            include_str!("volume.wgsl").contains("volume.eye_in_box.w >= 0.0"),
+            "the shader no longer selects the isosurface march on the \
+             threshold lane's sign, so the sentinel selects nothing",
+        );
     }
 
     /// The shading flag is 1.0 or 0.0, and the shader's threshold sits between.

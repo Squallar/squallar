@@ -812,6 +812,41 @@ impl VoxelGrid {
             .count() as u16
     }
 
+    /// The isosurface uniform pair `(centre, threshold)` for a user-facing
+    /// threshold in the product's own units, both in the shader's 0-1 index
+    /// space.
+    ///
+    /// `centre` is negative for a sequential product (the shader then reads
+    /// the index directly) and the diverging centre's index otherwise;
+    /// `threshold` is the crossing distance in index units. The translation
+    /// runs through [`Self::value_to_index`], so the surface sits exactly
+    /// where the ramp puts the value — the same quantisation the lit volume
+    /// paints through. The user value's shape per product is
+    /// [`iso_shape`]; non-finite input falls back to
+    /// [`default_iso_threshold`], the same refusal every persisted float
+    /// gets.
+    pub fn iso_uniform_params(&self, user_threshold: f32) -> (f32, f32) {
+        let user = if user_threshold.is_finite() {
+            user_threshold
+        } else {
+            default_iso_threshold(self.product)
+        };
+        let norm = |index: u8| f32::from(index) / 255.0;
+        match iso_shape(self.product) {
+            IsoShape::Sequential => (-1.0, norm(self.value_to_index(user))),
+            IsoShape::DeviationFrom { centre } => {
+                let c = self.value_to_index(centre);
+                let at = self.value_to_index(centre + user.abs());
+                (norm(c), norm(at.saturating_sub(c).max(1)))
+            }
+            IsoShape::AtOrBelow => {
+                let top = 255u8;
+                let at = self.value_to_index(user);
+                (norm(top), norm(top.saturating_sub(at).max(1)))
+            }
+        }
+    }
+
     /// The offset of cell `(x, y, z)` in [`indices`](Self::indices) and
     /// [`values`](Self::values). `None` outside the grid.
     pub fn cell_offset(&self, x: usize, y: usize, z: usize) -> Option<usize> {
@@ -1042,6 +1077,95 @@ mod volume_alpha_profile {
 fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
     let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
+}
+
+/// How a product's isosurface threshold reads its scale — the per-product
+/// twin of the transparency profile above, for the other view mode.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum IsoShape {
+    /// The surface of `value >= threshold`: the sequential products, whose
+    /// interesting side is up-scale.
+    Sequential,
+    /// The surface of `|value − centre| >= threshold`: the diverging
+    /// products, whose interesting surfaces sit on *both* sides of their
+    /// background — a velocity couplet is an inbound lobe and an outbound
+    /// lobe, and an isosurface that drew only one would be half a picture.
+    DeviationFrom { centre: f32 },
+    /// The surface of `value <= threshold`: ρHV, whose background is the top
+    /// of its scale. Implemented as a deviation from the ramp top, so the
+    /// shader has one diverging test.
+    AtOrBelow,
+}
+
+/// The isosurface shape per product. Same exhaustiveness rule as
+/// [`volume_alpha_scale`]: a new product cannot inherit a shape.
+pub fn iso_shape(product: RadarProduct) -> IsoShape {
+    use volume_alpha_profile as p;
+    match product {
+        RadarProduct::Reflectivity
+        | RadarProduct::SpectrumWidth
+        | RadarProduct::DifferentialPhase
+        | RadarProduct::SpecificDifferentialPhase => IsoShape::Sequential,
+        RadarProduct::Velocity
+        | RadarProduct::StormRelativeVelocity
+        | RadarProduct::NormalizedRotation => IsoShape::DeviationFrom { centre: 0.0 },
+        RadarProduct::DifferentialReflectivity => IsoShape::DeviationFrom {
+            centre: p::ZDR_CENTRE_DB,
+        },
+        RadarProduct::CorrelationCoefficient => IsoShape::AtOrBelow,
+        // Not renderable in 3D at all (`crate::derive::volume_slot`); the
+        // shape is never read, and Sequential is the least surprising
+        // answer if one is ever admitted without updating this table —
+        // which the exhaustive match makes a compile error for new variants.
+        RadarProduct::EchoTops
+        | RadarProduct::EchoTopsInterpolated
+        | RadarProduct::VerticallyIntegratedLiquid
+        | RadarProduct::VilDensity
+        | RadarProduct::ProbabilityOfSevereHail
+        | RadarProduct::MaxExpectedHailSize
+        | RadarProduct::HydrometeorClassification
+        | RadarProduct::PrecipitationRate => IsoShape::Sequential,
+    }
+}
+
+/// The default isosurface threshold per product, in the units
+/// [`iso_shape`] gives the slider: a value for the sequential products, a
+/// deviation for the diverging ones, a bound for ρHV.
+///
+/// * Reflectivity 18 dBZ — the class boundary GR2Analyst's isosurface
+///   defaults near: the outline of precipitation proper, above clear-air
+///   returns.
+/// * Velocity / SRV 20 m/s — where the transparency profile reaches opaque:
+///   the cores and couplets, free of ambient flow.
+/// * Spectrum width 8 m/s — the profile's turbulence edge.
+/// * ZDR 2.75 dB from the +0.25 rain centre — big-drop columns one side,
+///   hail cores the other, at ±3 dB on the scale.
+/// * ΦDP 180° — mid-turn; a cumulative site-offset moment has no principled
+///   default, and the slider is the instrument here.
+/// * ρHV at or under 0.90 — the profile's opaque edge: the melting layer,
+///   debris and non-meteorological surfaces.
+/// * KDP 1.5 °/km — the profile's opaque edge: heavy-rain shafts.
+/// * NROT 1.0 — the mesocyclone convention GR pins its meso class to.
+pub fn default_iso_threshold(product: RadarProduct) -> f32 {
+    use volume_alpha_profile as p;
+    match product {
+        RadarProduct::Reflectivity => 18.0,
+        RadarProduct::Velocity | RadarProduct::StormRelativeVelocity => p::VELOCITY_OPAQUE_MS,
+        RadarProduct::SpectrumWidth => p::SW_OPAQUE_MS,
+        RadarProduct::DifferentialReflectivity => p::ZDR_OPAQUE_DB - p::ZDR_CENTRE_DB,
+        RadarProduct::DifferentialPhase => 180.0,
+        RadarProduct::CorrelationCoefficient => p::CC_OPAQUE,
+        RadarProduct::SpecificDifferentialPhase => p::KDP_OPAQUE_DEG_KM,
+        RadarProduct::NormalizedRotation => p::NROT_OPAQUE,
+        RadarProduct::EchoTops
+        | RadarProduct::EchoTopsInterpolated
+        | RadarProduct::VerticallyIntegratedLiquid
+        | RadarProduct::VilDensity
+        | RadarProduct::ProbabilityOfSevereHail
+        | RadarProduct::MaxExpectedHailSize
+        | RadarProduct::HydrometeorClassification
+        | RadarProduct::PrecipitationRate => 0.0,
+    }
 }
 
 /// The default 3D alpha multiplier for `product` at `value` — the per-product
@@ -3822,6 +3946,66 @@ mod tests {
                 ("rho", 35, 180),
             ],
             "see-through data entries and max data alpha, per product",
+        );
+    }
+
+    /// The isosurface parameters translate the user's product-unit threshold
+    /// through each shape — sequential, diverging, at-or-below — against the
+    /// grid's own ramp, and a non-finite threshold falls back to the argued
+    /// default instead of poisoning the uniform.
+    #[test]
+    fn the_isosurface_params_translate_the_user_threshold_per_shape() {
+        let scan = six_moment_scan();
+        let grid = |product| {
+            let req = VoxelRequest {
+                product,
+                ..request(ODD)
+            };
+            build_voxels(&scan, &req, SITE.0, SITE.1).unwrap()
+        };
+
+        // Sequential: reflectivity at 18 dBZ — no centre, the threshold is
+        // the value's own index.
+        let refl = grid(RadarProduct::Reflectivity);
+        let (centre, threshold) = refl.iso_uniform_params(18.0);
+        assert!(centre < 0.0, "a sequential product has no diverging centre");
+        assert_eq!(
+            threshold,
+            f32::from(refl.value_to_index(18.0)) / 255.0,
+            "the surface sits exactly where the ramp puts 18 dBZ",
+        );
+
+        // Diverging: velocity at ±20 m/s — centre at 0 m/s, threshold the
+        // index distance to +20, so both lobes render.
+        let vel = grid(RadarProduct::Velocity);
+        let (centre, threshold) = vel.iso_uniform_params(20.0);
+        let c = vel.value_to_index(0.0);
+        assert_eq!(centre, f32::from(c) / 255.0, "centred on calm air");
+        assert_eq!(
+            threshold,
+            f32::from(vel.value_to_index(20.0) - c) / 255.0,
+            "the crossing distance is 20 m/s of ramp",
+        );
+        // A negative deviation is the same surface: the shape is |v|.
+        assert_eq!(vel.iso_uniform_params(-20.0), (centre, threshold));
+
+        // At-or-below: ρHV at 0.90 — centre at the ramp top, so "at or
+        // under the bound" is the same diverging test.
+        let rho = grid(RadarProduct::CorrelationCoefficient);
+        let (centre, threshold) = rho.iso_uniform_params(0.90);
+        assert_eq!(centre, 1.0, "centred on the ramp top");
+        assert_eq!(
+            threshold,
+            f32::from(255 - rho.value_to_index(0.90)) / 255.0,
+            "the crossing distance reaches down to the bound",
+        );
+
+        // Non-finite input: the argued default, not a NaN in a uniform lane.
+        let (_, fallback) = refl.iso_uniform_params(f32::NAN);
+        assert_eq!(
+            fallback,
+            f32::from(refl.value_to_index(default_iso_threshold(RadarProduct::Reflectivity)))
+                / 255.0,
         );
     }
 

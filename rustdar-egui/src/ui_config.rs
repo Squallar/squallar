@@ -149,6 +149,31 @@ struct VolumeConfig {
     /// Which map pane the region was dragged on. Validated against the pane
     /// count on load, the same as a section's.
     source_pane: Option<usize>,
+    /// Lit volume or isosurface. `#[serde(default)]` on the struct makes an
+    /// older config a lit volume; the lenient deserializer makes a *newer*
+    /// config's unknown mode a lit volume too, instead of a failed load —
+    /// the same forward tolerance the product enum has.
+    #[serde(deserialize_with = "view_mode_or_default")]
+    view_mode: crate::pane::VolumeViewMode,
+}
+
+/// Deserialize a [`crate::pane::VolumeViewMode`], falling back to the default
+/// (lit volume) when the name is unknown — see [`product_or_default`] for the
+/// class of failure this closes.
+fn view_mode_or_default<'de, D>(deserializer: D) -> Result<crate::pane::VolumeViewMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match crate::pane::VolumeViewMode::deserialize(&value) {
+        Ok(mode) => Ok(mode),
+        Err(_) => {
+            log::warn!(
+                "config names a 3D view mode this build does not know ({value}); using the lit volume"
+            );
+            Ok(crate::pane::VolumeViewMode::default())
+        }
+    }
 }
 
 /// A picked region, as persisted.
@@ -185,6 +210,7 @@ impl Default for VolumeConfig {
             vertical_exaggeration: camera.vertical_exaggeration(),
             region: None,
             source_pane: None,
+            view_mode: crate::pane::VolumeViewMode::default(),
         }
     }
 }
@@ -275,6 +301,25 @@ struct UiConfig {
     /// loads as "nothing edited" through the container's `#[serde(default)]`.
     #[serde(default)]
     volume_alpha: Vec<VolumeAlphaConfig>,
+    /// The user's isosurface thresholds, one entry per *edited* product —
+    /// the same store-of-exceptions arrangement as `volume_alpha`, for the
+    /// same reason: absence means the argued per-product default, and an old
+    /// config without this field loads as "nothing edited".
+    #[serde(default)]
+    volume_iso: Vec<VolumeIsoConfig>,
+}
+
+/// One product's persisted isosurface threshold.
+#[derive(Serialize, Deserialize)]
+struct VolumeIsoConfig {
+    /// `None` for a product this build does not know; the entry is dropped
+    /// on load, exactly as a Volume Alpha curve's is.
+    #[serde(default, deserialize_with = "known_product_or_none")]
+    product: Option<RadarProduct>,
+    /// In the product's own units. Validated finite on load —
+    /// `IsoThresholds::set` refuses non-finite values, the same door every
+    /// persisted float goes through.
+    threshold: f32,
 }
 
 /// One product's persisted Volume Alpha curve.
@@ -371,6 +416,7 @@ impl Default for UiConfig {
             overlay_states: serde_json::Map::new(),
             gps_config: rustdar_gps::GpsConfig::default(),
             volume_alpha: Vec::new(),
+            volume_iso: Vec::new(),
         }
     }
 }
@@ -499,6 +545,21 @@ impl super::Gui {
                 curves.sort_by_key(|c| c.product.map(|p| p.code()));
                 curves
             },
+            volume_iso: {
+                // Sorted for the same autosave-comparison reason as the
+                // curves; non-finite thresholds cannot exist in the store
+                // (`IsoThresholds::set` refuses them), so no filter here.
+                let mut thresholds: Vec<VolumeIsoConfig> = self
+                    .volume_iso
+                    .entries()
+                    .map(|(product, threshold)| VolumeIsoConfig {
+                        product: Some(product),
+                        threshold,
+                    })
+                    .collect();
+                thresholds.sort_by_key(|c| c.product.map(|p| p.code()));
+                thresholds
+            },
         };
         match serde_json::to_string_pretty(&config) {
             Ok(json) => Some(json),
@@ -601,6 +662,18 @@ impl super::Gui {
                 product,
                 crate::volume_alpha::AlphaCurve::from_alphas(alphas),
             );
+        }
+
+        // The isosurface thresholds, replaced wholesale for the same reason.
+        // A `None` product (unknown name) is dropped; a non-finite threshold
+        // is refused by `set` itself, the same door every persisted float
+        // goes through.
+        self.volume_iso = crate::volume_iso::IsoThresholds::default();
+        for entry in config.volume_iso {
+            let Some(product) = entry.product else {
+                continue;
+            };
+            self.volume_iso.set(product, entry.threshold);
         }
 
         // Restore per-pane state.
@@ -754,6 +827,7 @@ fn content_config(
                     half_width_km: region.half_width_km(),
                 }),
                 source_pane: volume.source_pane,
+                view_mode: volume.view_mode,
             };
             // Every float that reaches the file, not merely the three angles:
             // `serde_json` writes a non-finite `f32` as `null`, which comes back
@@ -942,6 +1016,7 @@ fn restore_content(pane_idx: usize, pc: &PaneConfig, pane_count: usize) -> PaneC
                 // Not persisted either — the curves are (per product, below
                 // the pane list); an open tool window is session posture.
                 alpha_editor_open: false,
+                view_mode: volume.view_mode,
             }))
         }
     }
@@ -1174,6 +1249,94 @@ mod tests {
             "the rest of the curve is kept as saved"
         );
         assert_eq!(velocity.alphas()[255], 255);
+    }
+
+    /// A 3D pane's view mode and the per-product isosurface thresholds
+    /// survive the round trip; an untouched product comes back untouched.
+    ///
+    /// The untouched half is the exceptions-store pin, exactly as the alpha
+    /// curves': absence means the argued default, and a load that filled
+    /// every product with an entry would survive the value assertions and
+    /// still break "re-arguing a default reaches everyone who never moved
+    /// it".
+    #[test]
+    fn the_isosurface_mode_and_thresholds_survive_a_save_and_load() {
+        use crate::pane::{PaneKind, VolumeViewMode};
+        use rustdar_radar::types::RadarProduct;
+
+        let store = MemoryConfigStore::default();
+        let mut gui = crate::Gui::new();
+        gui.pane_mut(0).unwrap().set_kind(PaneKind::Volume);
+        gui.pane_mut(0).unwrap().volume_mut().unwrap().view_mode = VolumeViewMode::Isosurface;
+        gui.volume_iso.set(RadarProduct::Velocity, 35.0);
+        assert_ne!(
+            rustdar_radar::voxel::default_iso_threshold(RadarProduct::Velocity),
+            35.0,
+            "precondition: the saved threshold must differ from the default",
+        );
+        gui.save_ui_config(&store);
+
+        let mut restored = crate::Gui::new();
+        assert!(restored.load_ui_config(&store));
+        assert_eq!(
+            restored.pane(0).unwrap().volume().unwrap().view_mode,
+            VolumeViewMode::Isosurface,
+            "a pane set to isosurface must come back one",
+        );
+        assert_eq!(restored.volume_iso.get(RadarProduct::Velocity), 35.0);
+        assert!(
+            !restored.volume_iso.is_edited(RadarProduct::Reflectivity),
+            "an untouched product must come back at the argued default",
+        );
+    }
+
+    /// A view mode from a future build loads as the lit volume, and a
+    /// threshold for an unknown product is dropped — the same forward
+    /// tolerance the product enum has, pinned for the two new fields.
+    #[test]
+    fn an_unknown_view_mode_or_iso_product_does_not_poison_the_load() {
+        use crate::pane::VolumeViewMode;
+        use rustdar_radar::types::RadarProduct;
+
+        let store = MemoryConfigStore::default();
+        store
+            .store(
+                UI_CONFIG_KEY,
+                r#"{
+                    "site": "KDMX",
+                    "panes": [{
+                        "kind": "Volume",
+                        "site": "KDMX",
+                        "volume": {"view_mode": "HolographicSlices"}
+                    }],
+                    "volume_iso": [
+                        {"product": "TornadoProbability", "threshold": 5.0},
+                        {"product": "Velocity", "threshold": 30.0}
+                    ]
+                }"#,
+            )
+            .expect("the memory store accepts a write");
+
+        let mut gui = crate::Gui::new();
+        assert!(
+            gui.load_ui_config(&store),
+            "an unknown view mode or product name must not fail the load",
+        );
+        assert_eq!(
+            gui.pane(0).unwrap().volume().unwrap().view_mode,
+            VolumeViewMode::LitVolume,
+            "an unknown mode falls back to the lit volume",
+        );
+        assert_eq!(
+            gui.volume_iso.get(RadarProduct::Velocity),
+            30.0,
+            "the entry beside the unknown one still loads",
+        );
+        assert_eq!(
+            gui.volume_iso.entries().count(),
+            1,
+            "the unknown product's threshold is dropped, never reassigned",
+        );
     }
 
     /// A config naming a product this build does not know still loads.

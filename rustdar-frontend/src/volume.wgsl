@@ -38,9 +38,12 @@ struct Volume {
     // (box_from_world * world_from_view * view_from_clip), never by inverting a
     // general 4x4.
     box_from_clip: mat4x4<f32>,
-    // xyz: the camera position in box space. w: reserved, written as zero.
+    // xyz: the camera position in box space. w: the isosurface threshold in
+    // 0-1 index units, or negative for the lit-volume march — negative, not
+    // zero, because an index-0 threshold is a real configuration ("the
+    // surface of any data").
     //
-    // This is the *perspective* eye. Rays are cast from it, which is what makes
+    // xyz is the *perspective* eye. Rays are cast from it, which is what makes
     // a camera inside the box behave (the entry parameter clamps to zero rather
     // than starting behind the viewer). An orthographic camera has no such
     // point and would need a different derivation.
@@ -52,7 +55,10 @@ struct Volume {
     // depth stays against xyz alone, which is the honest, unexaggerated
     // kilometre.
     box_size_km: vec4<f32>,
-    // xyz: the voxel counts along each axis, as floats. w: reserved, zero.
+    // xyz: the voxel counts along each axis, as floats. w: the centre index
+    // a diverging product's isosurface measures its threshold from, in 0-1
+    // index units, or negative for a sequential product whose threshold
+    // reads the index directly. Only read in isosurface mode.
     grid_dims: vec4<f32>,
     // xyz: unit light direction in box space. w: the ambient term, 0..1.
     light_dir_ambient: vec4<f32>,
@@ -192,6 +198,13 @@ const FLOOR_BELOW_FADE: f32 = 0.08;
 // cell is still ~2e-3 per km — but it is a zero-detector, not a
 // surface-classifier, and must not be read as a tuned threshold.
 const GRADIENT_EPSILON: f32 = 1e-6;
+
+// Bisection steps refining an isosurface hit between the sample that crossed
+// and the one before it. A `const` bound for the same naga reason as
+// RAYMARCH_STEP_CEILING. Eight halvings of one march step place the surface
+// to under 1/256 of a step — finer than the R8Unorm field can express — so
+// the per-pixel jitter's one-step start offset stops wobbling the surface.
+const ISO_REFINE_STEPS: i32 = 8;
 
 struct RaymarchVertex {
     @builtin(position) clip_position: vec4<f32>,
@@ -343,6 +356,89 @@ fn shading(p: vec3<f32>) -> f32 {
     return ambient + (1.0 - ambient) * wrap * wrap;
 }
 
+// ---------------------------------------------------------------------------
+// The isosurface
+// ---------------------------------------------------------------------------
+//
+// A per-pane view mode beside the lit volume: instead of accumulating alpha,
+// the march finds the first crossing of a threshold, refines it by bisection
+// and paints it as one opaque, gradient-lit surface. Selected by the sign of
+// `eye_in_box.w` (the threshold; negative = lit volume). The threshold reads
+// the DATA — the interpolated palette index — never the LUT's alpha, so a
+// Volume Alpha curve restyles the lit volume and leaves the isosurface where
+// the values put it.
+
+// The scalar field the isosurface is a level set of: the index itself for a
+// sequential product, the distance from the diverging centre (`grid_dims.w`)
+// for a diverging one — which renders BOTH lobes of a velocity couplet, each
+// wearing its own palette colour.
+fn iso_field(index: f32) -> f32 {
+    return select(index, abs(index - volume.grid_dims.w), volume.grid_dims.w >= 0.0);
+}
+
+// Whether the field at `index` is at or beyond the iso threshold. The
+// `transfer.y` term excludes unmeasured air: without it a diverging centre
+// would read the no-data index 0 as a strong inbound crossing and shrink-wrap
+// the whole coverage cone.
+fn iso_hit_test(index: f32) -> bool {
+    return index > volume.transfer.y && iso_field(index) >= volume.eye_in_box.w;
+}
+
+// The crossing parameter between a sample outside the surface at `t_lo` and
+// one inside at `t_hi`, by ISO_REFINE_STEPS halvings.
+fn refine_iso_hit(eye: vec3<f32>, direction: vec3<f32>, t_lo_in: f32, t_hi_in: f32) -> f32 {
+    var lo = t_lo_in;
+    var hi = t_hi_in;
+    for (var i: i32 = 0; i < ISO_REFINE_STEPS; i = i + 1) {
+        let mid = 0.5 * (lo + hi);
+        if iso_hit_test(density_at(eye + direction * mid)) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    return hi;
+}
+
+// `shading`, over the isosurface's own field: the normal must belong to the
+// level set being drawn, and for a diverging product that set's gradient is
+// not the density's — on the inbound lobe the density *falls* toward the
+// core, so a density normal would light the surface from inside. Same six
+// fetches, same displayed-kilometre metric, same half-Lambert wrap.
+fn iso_shading(p: vec3<f32>) -> f32 {
+    let voxel = vec3<f32>(1.0) / volume.grid_dims.xyz;
+    let cell_km = vec3<f32>(
+        volume.box_size_km.x,
+        volume.box_size_km.y,
+        volume.box_size_km.z * volume.box_size_km.w,
+    ) * voxel;
+    let gradient = vec3<f32>(
+        iso_field(density_at(p + vec3<f32>(voxel.x, 0.0, 0.0)))
+            - iso_field(density_at(p - vec3<f32>(voxel.x, 0.0, 0.0))),
+        iso_field(density_at(p + vec3<f32>(0.0, voxel.y, 0.0)))
+            - iso_field(density_at(p - vec3<f32>(0.0, voxel.y, 0.0))),
+        iso_field(density_at(p + vec3<f32>(0.0, 0.0, voxel.z)))
+            - iso_field(density_at(p - vec3<f32>(0.0, 0.0, voxel.z))),
+    ) / cell_km;
+    let ambient = volume.light_dir_ambient.w;
+    let magnitude = length(gradient);
+    if magnitude < GRADIENT_EPSILON {
+        return 1.0;
+    }
+    let normal = -gradient / magnitude;
+    let wrap = 0.5 + 0.5 * dot(normal, normalize(volume.light_dir_ambient.xyz));
+    return ambient + (1.0 - ambient) * wrap * wrap;
+}
+
+// The lit, linear colour of the isosurface at `p`: the palette's colour for
+// the value there, always gradient-lit — an unlit opaque surface is a
+// silhouette, so the isosurface shades on every quality rung.
+fn iso_surface_colour(p: vec3<f32>) -> vec3<f32> {
+    let index = density_at(p);
+    let entry = textureSampleLevel(lut_texture, lut_sampler, lut_coord(index), 0.0);
+    return linear_from_gamma_rgb(entry.rgb) * iso_shading(p);
+}
+
 // Where this ray meets the box's bottom face, or a negative number for a ray
 // that never does.
 //
@@ -415,6 +511,8 @@ fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
     let dt = max(volume.flags.z / cells_per_t, (span.y - span.x) / f32(RAYMARCH_STEP_CEILING));
     let segment_km = step_length_km(direction, dt);
     let shade = volume.flags.x > 0.5;
+    // The view mode, selected by the threshold lane's sign — see the uniform.
+    let iso = volume.eye_in_box.w >= 0.0;
 
     // The sample comb starts a per-pixel fraction of a step past the entry —
     // stratified sampling, with the stratum offset hashed from the pixel. The
@@ -436,7 +534,21 @@ fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
         }
         let p = eye + direction * t;
         let index = density_at(p);
-        if index > volume.transfer.y {
+        if iso {
+            // First crossing wins: refine it between this sample and the
+            // last, paint it opaque and lit, and the march is over. The
+            // floor arm below still composites — an opaque surface leaves
+            // zero transmittance, so ground behind it stays hidden and
+            // ground beside it stays visible, which is what puts the
+            // isosurface ON the map floor rather than over it.
+            if iso_hit_test(index) {
+                let hit_t = refine_iso_hit(eye, direction, max(t - dt, span.x), t);
+                let colour = iso_surface_colour(eye + direction * hit_t);
+                accumulated = accumulated + transmittance * colour;
+                transmittance = 0.0;
+                break;
+            }
+        } else if index > volume.transfer.y {
             let entry = textureSampleLevel(lut_texture, lut_sampler, lut_coord(index), 0.0);
             // The table holds gamma-encoded colour, because it is produced by
             // the same `get_color_for_value` the 2D products paint with.

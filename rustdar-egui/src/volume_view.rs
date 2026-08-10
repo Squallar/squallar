@@ -158,6 +158,18 @@ pub struct VolumeFrameState {
     /// palette's — and to re-anchor the march's skip threshold at the curve's
     /// own fade boundary rather than the palette's.
     pub alpha: Option<crate::volume_alpha::AlphaCurve>,
+    /// How the pane draws its volume: the lit accumulation or an isosurface.
+    ///
+    /// A *drawing* property, which is why it rides the frame and not the
+    /// [`VolumeTarget`]: the target keys what is sampled, and toggling the
+    /// mode must not rebuild an 8 MiB grid — the same doctrine that keeps the
+    /// camera off the target.
+    pub view_mode: crate::pane::VolumeViewMode,
+    /// The isosurface threshold for this pane's product, in the product's own
+    /// units ([`rustdar_radar::voxel::iso_shape`] says what the number
+    /// means). Read only in isosurface mode; the renderer translates it into
+    /// index space against the grid's own ramp.
+    pub iso_threshold: f32,
 }
 
 /// What the painter answered.
@@ -942,6 +954,8 @@ mod tests {
             size_px: [800, 600],
             floor: true,
             alpha: None,
+            view_mode: crate::pane::VolumeViewMode::LitVolume,
+            iso_threshold: 18.0,
         };
         let VolumePaint::Callback(payload) = painter.paint(&frame) else {
             panic!("the painting stub must paint");

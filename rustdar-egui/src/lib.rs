@@ -11,6 +11,7 @@ pub(crate) mod ui_layout;
 pub(crate) mod ui_region;
 pub(crate) mod ui_section_edit;
 pub mod volume_alpha;
+pub mod volume_iso;
 pub mod volume_view;
 
 #[cfg(test)]

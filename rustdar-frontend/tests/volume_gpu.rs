@@ -485,6 +485,104 @@ fn a_uniform_grid_paints_its_palette_colour() {
     );
 }
 
+/// The isosurface mode paints one opaque, lit surface at the threshold, and
+/// it reads the DATA, not the table's alpha.
+///
+/// The discriminating fixture: the filled grid's palette entry has **zero
+/// alpha**. The lit volume renders it as nothing at all — every absorbed
+/// contribution is scaled by the entry's alpha — while the isosurface must
+/// still paint an opaque, lit version of the entry's colour, because its
+/// threshold reads the interpolated index and its surface is opaque by
+/// construction. That is the "threshold reads the data, not the curve"
+/// doctrine, run on the GPU: a Volume Alpha curve (which rewrites exactly
+/// this alpha channel) can strip the lit volume to nothing and the
+/// isosurface must not move.
+///
+/// Lighting is asserted as a bound, not a value: the surface colour is the
+/// entry's times the half-Lambert wrap, which lives in
+/// `[ambient, 1] = [0.35, 1]` of the decoded colour.
+///
+/// ```text
+/// cargo test -p rustdar-frontend --test volume_gpu \
+///     an_isosurface_paints_an_opaque_lit_surface_from_the_data_alone \
+///     -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
+fn an_isosurface_paints_an_opaque_lit_surface_from_the_data_alone() {
+    let _serialised = gpu_lock();
+    const INDEX: u8 = 200;
+    // Zero alpha on purpose — see the doc comment.
+    const COLOUR: [u8; 4] = [200, 60, 30, 0];
+    let size = [64, 64];
+    let cells = [8u32, 8, 8];
+
+    let (device, queue) = device();
+    let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Bgra8Unorm));
+    pipelines.upload_quad(&queue);
+
+    let mut uniform = VolumeUniform::new([10.0, 10.0, 10.0], cells);
+    uniform.box_from_clip = box_from_clip_down(2);
+    uniform.eye_in_box = eye_outside(2);
+    uniform.extinction_per_km = 1.0;
+
+    let filled = vec![INDEX; (cells[0] * cells[1] * cells[2]) as usize];
+    let lut = palette(INDEX, COLOUR);
+
+    // Lit volume over a zero-alpha entry: nothing at all.
+    uniform.iso_threshold = rustdar_frontend::volume::uniform::ISO_OFF;
+    let pixels = raymarch_once(
+        &device, &queue, &pipelines, cells, &filled, &lut, &uniform, size,
+    );
+    assert_eq!(
+        centre(&pixels, size),
+        [0, 0, 0, 0],
+        "the lit volume painted a zero-alpha entry; the discriminator is dead",
+    );
+
+    // Isosurface at a threshold under the filled index: an opaque, lit
+    // surface, whatever the table's alpha says.
+    uniform.iso_threshold = 150.0 / 255.0;
+    uniform.iso_centre = -1.0;
+    let pixels = raymarch_once(
+        &device, &queue, &pipelines, cells, &filled, &lut, &uniform, size,
+    );
+    let painted = centre(&pixels, size);
+    assert_eq!(
+        painted[3], 255,
+        "an isosurface hit must be fully opaque, got alpha {}",
+        painted[3],
+    );
+    for channel in 0..3 {
+        let full = f64::from(COLOUR[channel]);
+        let got = f64::from(painted[channel]);
+        // Gamma-space bound of the linear [0.35, 1] lighting window, with a
+        // couple of counts of slack for the 8-bit round trips.
+        let floor = 255.0
+            * (full / 255.0f64)
+                .powf(2.2)
+                .mul_add(0.33, 0.0)
+                .powf(1.0 / 2.2)
+            - 3.0;
+        assert!(
+            got >= floor.max(0.0) && got <= full + 3.0,
+            "channel {channel} came back {got} against the entry's {full}: \
+             outside the lit window [{floor:.0}, {full}]",
+        );
+    }
+
+    // And a threshold above the filled index finds no surface at all.
+    uniform.iso_threshold = 220.0 / 255.0;
+    let pixels = raymarch_once(
+        &device, &queue, &pipelines, cells, &filled, &lut, &uniform, size,
+    );
+    assert_eq!(
+        centre(&pixels, size),
+        [0, 0, 0, 0],
+        "a threshold above every value in the grid still painted a surface",
+    );
+}
+
 /// Opacity is per kilometre travelled, not per box diagonal.
 ///
 /// Spike 0a's first bug, as the property it actually breaks. On a

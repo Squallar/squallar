@@ -790,6 +790,31 @@ pub struct VolumePane {
     /// would be a window full of "waiting" on every launch. Default `false`
     /// keeps the derived `Default` honest.
     pub alpha_editor_open: bool,
+    /// How this pane draws its volume: the lit accumulation or an isosurface.
+    ///
+    /// Persisted (a pane set to isosurface should come back one), unlike the
+    /// camera-adjacent session state around it, because it changes *what kind
+    /// of picture* the pane is, not merely how the current one is posed. The
+    /// per-product thresholds live on `Gui`, beside the alpha curves and for
+    /// the same reason: a threshold drawn for one product must never apply to
+    /// another.
+    pub view_mode: VolumeViewMode,
+}
+
+/// How a 3D pane draws its volume.
+///
+/// `Default` is the lit volume — today's render, and what every config from
+/// before this enum existed loads as through `#[serde(default)]`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VolumeViewMode {
+    /// The alpha-accumulating raymarch: translucent cloud, shaped by the
+    /// product's transparency profile and the user's Volume Alpha curve.
+    #[default]
+    LitVolume,
+    /// The first crossing of a per-product threshold, drawn as one opaque,
+    /// gradient-lit surface — GR2Analyst's other view mode. The threshold
+    /// reads the data, never the alpha curve.
+    Isosurface,
 }
 
 impl VolumePane {

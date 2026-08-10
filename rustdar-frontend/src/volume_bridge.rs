@@ -945,6 +945,20 @@ impl VolumePainter for BridgeVolumePainter {
             empty_index_threshold_for(effective_fade_band(grid.fade_band(), frame.alpha.as_ref()));
         uniform.edge_soft_width = EDGE_SOFT_WIDTH;
 
+        // The view mode. In isosurface mode the two formerly-reserved lanes
+        // carry the crossing parameters, translated against this grid's own
+        // ramp so the surface sits exactly where the ramp puts the value —
+        // and the skip threshold drops back to the index-0 default: the
+        // isosurface reads the DATA, so neither the palette's fade band nor
+        // the user's Volume Alpha curve may move where the surface sits.
+        // (The sidebar says the same to the user when a curve is active.)
+        if frame.view_mode == rustdar_egui::pane::VolumeViewMode::Isosurface {
+            let (centre, threshold) = grid.iso_uniform_params(frame.iso_threshold);
+            uniform.iso_centre = centre;
+            uniform.iso_threshold = threshold;
+            uniform.empty_index_threshold = empty_index_threshold_for(0);
+        }
+
         // The floor: drawn only when the pane wants it AND one is in hand.
         // The flag and the texture travel together on purpose — a raised flag
         // over the placeholder would composite a transparent ground, which
@@ -1993,6 +2007,24 @@ mod tests {
             body.contains(".then(|| self.store.floor_for(&frame.target))"),
             "`paint` no longer consults the pane's floor toggle before looking \
              a floor up, so the per-pane escape hatch is dead",
+        );
+
+        // The isosurface wiring, same untestable-through-`paint` class: the
+        // lanes must be translated against the grid's own ramp, and the skip
+        // threshold must drop to the index-0 default — the surface reads the
+        // data, so neither the palette's band nor a Volume Alpha curve may
+        // move it. Deleting the whole `if` leaves every host test green and
+        // every isosurface pane silently painting the lit volume.
+        assert!(
+            body.contains("grid.iso_uniform_params(frame.iso_threshold)"),
+            "`paint` no longer translates the isosurface threshold against \
+             the grid's ramp",
+        );
+        assert!(
+            body.contains("uniform.empty_index_threshold = empty_index_threshold_for(0)"),
+            "`paint` no longer pins the isosurface's skip threshold to the \
+             no-data index — a Volume Alpha curve could then move where the \
+             surface sits, which the UI promises it cannot",
         );
     }
 
