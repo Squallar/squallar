@@ -162,7 +162,7 @@ pub(super) fn render_cross_section(
         // worst state a pane can be in, because there is nothing to do about it
         // and no way to tell.
         let message = state.unavailable.map_or_else(
-            || "Cutting the cross-section\u{2026}".to_owned(),
+            || "Cutting the cross-section...".to_owned(),
             |u| u.message(),
         );
         paint_centered(ui, pane_rect, &message);
@@ -258,14 +258,16 @@ pub(super) fn render_cross_section(
     } else {
         ui.visuals().weak_text_color()
     };
-    // `ℹ` (U+2139) rather than the prettier `ⓘ` (U+24D8): egui's bundled
-    // fonts carry a glyph for the former (NotoEmoji) and none for the latter,
-    // and a tofu box is not an affordance.
+    // `ℹ` (U+2139) rather than the prettier `ⓘ` (U+24D8), and painted in the
+    // **monospace** family on purpose: of egui's bundled fonts only Hack
+    // carries the glyph — the proportional family has neither char, and a
+    // tofu box is not an affordance. The M8 glyph audit (`ui_glyphs.rs`)
+    // verifies exactly this pairing, in `MONO_ICON_GLYPHS`.
     let glyph_rect = painter.text(
         first_line_end,
         egui::Align2::LEFT_TOP,
         "\u{2139}",
-        egui::FontId::proportional(12.0),
+        egui::FontId::monospace(12.0),
         toggle_color,
     );
     let response = ui
@@ -274,7 +276,7 @@ pub(super) fn render_cross_section(
             ui.id().with("section_detail_toggle"),
             egui::Sense::click(),
         )
-        .on_hover_text("What this picture is \u{2014} and what it is not");
+        .on_hover_text("What this picture is - and what it is not");
     if response.clicked()
         && let Some(state) = pane.cross_section_mut()
     {
@@ -401,14 +403,14 @@ fn render_line_controls(
         "Sweep the line counter-clockwise about its middle",
     );
     let pan_right = chip(
-        "\u{25b6}",
+        "\u{23f5}",
         "pan_right",
-        "Slide the line to the right of its A\u{2192}B direction",
+        "Slide the line to the right of its A-to-B direction",
     );
     let pan_left = chip(
-        "\u{25c0}",
+        "\u{23f4}",
         "pan_left",
-        "Slide the line to the left of its A\u{2192}B direction",
+        "Slide the line to the left of its A-to-B direction",
     );
 
     let length_km = edit::length_km(line);
@@ -419,7 +421,7 @@ fn render_line_controls(
         egui::pos2(right - 4.0, top + button.y * 0.5),
         egui::Align2::RIGHT_CENTER,
         format!(
-            "{bearing:03}\u{b0} \u{b7} {:.0}{}",
+            "{bearing:03}\u{b0} - {:.0}{}",
             prefs.distance.convert_from_km(length_km),
             prefs.distance.suffix(),
         ),
@@ -865,7 +867,7 @@ fn caption_lines(
     // is the third thing the default line owes — a section is cut once per
     // volume and a storm outruns one in minutes.
     let stamp = collected.map_or_else(String::new, |t| {
-        format!("  \u{b7}  {}", prefs.timezone.format_naive_utc(t, "%H:%M"))
+        format!("  -  {}", prefs.timezone.format_naive_utc(t, "%H:%M"))
     });
 
     let (headline, headline_color) = match axes.tilt_count {
@@ -874,7 +876,7 @@ fn caption_lines(
         // amount of waiting on *this* volume changes that.
         0 => (
             format!(
-                "{}  \u{2014}  no tilts: this volume carried none of this product, so \
+                "{} - no tilts: this volume carried none of this product, so \
                  nothing below was measured{stamp}",
                 product.name(),
             ),
@@ -885,7 +887,7 @@ fn caption_lines(
         // fault, so it says what it is in the calm colour rather than shouting.
         1 => (
             format!(
-                "{}  \u{2014}  one tilt: a single scanned surface, not a vertical \
+                "{} - one tilt: a single scanned surface, not a vertical \
                  profile{stamp}",
                 product.name(),
             ),
@@ -898,7 +900,7 @@ fn caption_lines(
         // this one stopped against it, is the ⓘ detail's to explain.
         rungs => (
             format!(
-                "{}  \u{2014}  {rungs} tilts to {:.1}\u{b0}{stamp}",
+                "{} - {rungs} tilts to {:.1}\u{b0}{stamp}",
                 product.name(),
                 axes.top_tilt_deg,
             ),
@@ -925,7 +927,7 @@ fn caption_lines(
         let broken = matches!(reason, crate::pane::SectionUnavailable::RenderFailed);
         lines.push(CaptionLine {
             text: if broken {
-                format!("\u{26a0} {}", reason.message())
+                format!("! {}", reason.message())
             } else {
                 reason.message()
             },
@@ -978,7 +980,7 @@ fn detail_lines(
     if axes.tilt_count >= 2 && !ladder_reaches_pattern_top(axes) {
         let mut text = format!(
             "The radar scanned to {:.1}\u{b0} this volume, of the {:.1}\u{b0} its pattern \
-             can reach \u{2014} air above the top dotted curve was not sampled. That is \
+             can reach - air above the top dotted curve was not sampled. That is \
              ordinary: scans often stop climbing once storm tops sit below the remaining \
              tilts, and the picture fills in if more arrive.",
             axes.top_tilt_deg, axes.top_declared_cut_deg,
@@ -996,7 +998,7 @@ fn detail_lines(
                 rustdar_units::HeightUnit::Meters => ceiling_km_msl,
             };
             text.push_str(&format!(
-                " The picture's ceiling is \u{2248}{:.0} {} MSL at the far end of the line.",
+                " The picture's ceiling is ~{:.0} {} MSL at the far end of the line.",
                 ceiling_shown,
                 prefs.height.kilo_suffix(),
             ));
@@ -1007,10 +1009,10 @@ fn detail_lines(
     if axes.tilt_count >= 2 {
         let widest_gap_km = axes.widest_tilt_gap_deg.to_radians() * axes.coverage_ground_range_km;
         push(format!(
-            "Data exists along the dotted curves \u{2014} one per tilt \u{2014} and the \
+            "Data exists along the dotted curves - one per tilt - and the \
              picture between them is interpolated: layer depth and echo tops are set by \
              the tilt spacing, not measured. The widest step here is {:.1}\u{b0}, \
-             \u{2248}{:.0}{} at {:.0}{}.",
+             ~{:.0}{} at {:.0}{}.",
             axes.widest_tilt_gap_deg,
             prefs.distance.convert_from_km(widest_gap_km),
             prefs.distance.suffix(),
@@ -1183,7 +1185,7 @@ fn describe_missing(status: SampleStatus, ladder_reaches_top: bool) -> &'static 
         SampleStatus::BelowLowestBeam => "below the lowest beam",
         SampleStatus::AboveVolume if ladder_reaches_top => "above the volume (cone of silence)",
         SampleStatus::AboveVolume => {
-            "above the highest tilt this volume flew \u{2014} not the cone of silence: the \
+            "above the highest tilt this volume flew - not the cone of silence: the \
              scan ended below its pattern's top"
         }
         SampleStatus::BeyondRange => "beyond this tilt's range",

@@ -14,11 +14,11 @@
 //!
 //! Row 1 is always on while the transport is expanded: Live · back / forward ·
 //! step picker · loop toggle · scrubber · timestamp (opens the Set Time
-//! dialog) · age chip · `⋯` (row 2) · `▾` (collapse). Row 2 adds the loop
+//! dialog) · age chip · `...` (row 2) · `⏷` (collapse). Row 2 adds the loop
 //! tuning: lookback, speed, the frame transport, the seek slider, the render
 //! progress, and a closing caption stating this platform's frame budget and
 //! the per-pane unlink hint. Collapsed, the whole transport becomes a small
-//! 🕐 chip at the map's bottom-right corner; clicking it restores.
+//! ⏱ chip at the map's bottom-right corner; clicking it restores.
 //!
 //! # Ids do not depend on the width — or on the data
 //!
@@ -87,9 +87,9 @@ pub(crate) struct TimelineProbe {
     pub chip: egui::Rect,
     /// The Live button, and whether it was drawn in the red not-live style.
     pub live: (egui::Rect, bool),
-    /// The back (◀) button.
+    /// The back (⏴) button.
     pub back: egui::Rect,
-    /// The forward (▶) button, and whether it was enabled.
+    /// The forward (⏵) button, and whether it was enabled.
     pub fwd: (egui::Rect, bool),
     /// The step picker's collapsed combo box.
     pub step_dropdown: egui::Rect,
@@ -101,9 +101,9 @@ pub(crate) struct TimelineProbe {
     pub timestamp: (egui::Rect, String),
     /// The age chip's text — empty when there is no data time to age.
     pub age_text: String,
-    /// The `⋯` row-2 expander.
+    /// The `...` row-2 expander.
     pub expander: egui::Rect,
-    /// The `▾` collapse button.
+    /// The `⏷` collapse button.
     pub collapse: egui::Rect,
     /// Row 2, when it was drawn.
     pub row2: Option<TimelineRow2Probe>,
@@ -272,13 +272,20 @@ impl super::Gui {
         let _ = area;
     }
 
-    /// The collapsed form: a 🕐-and-timestamp chip at the map's bottom-right
+    /// The collapsed form: a ⏱-and-timestamp chip at the map's bottom-right
     /// — above the bottom bar on the phone, whose Live chip is the other
-    /// restore route (plan §1.5).
+    /// restore route (plan §1.5), and above the floating status bar on the
+    /// wider widths: both bars own the bottom edge, and a chip anchored to
+    /// the map's corner sat on top of them (the first-run finding). The
+    /// offsets come from the bars' real rects this frame, never a guessed
+    /// constant.
     ///
     /// Bottom-**right** while the transport itself is bottom-centred, so the
     /// chip does not sit where the middle of the map's bottom edge is most
-    /// likely to be looked at — the whole point of collapsing.
+    /// likely to be looked at — the whole point of collapsing. One line,
+    /// always: the area is sized to the text (`TextWrapMode::Extend`), so a
+    /// stale narrow area rect cannot fold the time into a column (the other
+    /// first-run finding).
     fn render_timeline_chip(
         &mut self,
         ctx: &egui::Context,
@@ -286,7 +293,13 @@ impl super::Gui {
         phone_bar_top: Option<f32>,
         opacity: f32,
     ) {
-        let bottom = phone_bar_top.map_or(map_rect.bottom(), |bar_top| bar_top);
+        // The bar above which the chip sits: the phone's bottom bar, or the
+        // wide widths' floating status bar (its top edge as drawn earlier
+        // this same frame — `Gui::statusbar_rect`). With neither on screen
+        // the map's own bottom edge is the anchor.
+        let bottom = phone_bar_top
+            .or(self.statusbar_rect.map(|bar| bar.top()))
+            .unwrap_or(map_rect.bottom());
         let area = egui::Area::new(egui::Id::new("timeline_chip"))
             .order(egui::Order::Middle)
             .pivot(egui::Align2::RIGHT_BOTTOM)
@@ -297,7 +310,13 @@ impl super::Gui {
             .show(ctx, |ui| {
                 egui::Frame::window(&ctx.global_style()).show(ui, |ui| {
                     super::fade::dim(ui, opacity);
-                    let chip = ui.button(format!("\u{1f550} {}", self.active_time_label()));
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                    let (_, live) = self.chip_time_source();
+                    let chip = ui.button(format!(
+                        "\u{23f1} {} - {}",
+                        self.active_time_label(),
+                        if live { "live" } else { "archive" }
+                    ));
                     if chip.clicked() {
                         self.timeline_collapsed = false;
                     }
@@ -313,11 +332,33 @@ impl super::Gui {
         let _ = area;
     }
 
-    /// The active pane's on-screen data time, as the timestamp chip, the
+    /// The time the chips describe, and whether its source pane is live —
+    /// with the fallback that keeps a non-map active pane honest (the
+    /// first-run `--:--:--` finding): the active pane's on-screen time,
+    /// else the static [`PaneState::data_time`] it carries whatever its
+    /// kind, else the freshest visible **map** pane's on-screen time. The
+    /// live/archive flag travels with whichever pane supplied the time, so
+    /// the annotation describes the time actually shown.
+    ///
+    /// `(None, ..)` only when genuinely nothing is loaded anywhere.
+    pub(super) fn chip_time_source(&self) -> (Option<chrono::NaiveDateTime>, bool) {
+        let active = &self.panes[self.active_pane];
+        if let Some(t) = active.data_time_on_screen().or(active.data_time) {
+            return (Some(t), active.viewing_live);
+        }
+        self.panes()
+            .iter()
+            .filter(|pane| pane.is_map())
+            .filter_map(|pane| pane.data_time_on_screen().map(|t| (t, pane.viewing_live)))
+            .max_by_key(|&(t, _)| t)
+            .map_or((None, active.viewing_live), |(t, live)| (Some(t), live))
+    }
+
+    /// The time of [`Self::chip_time_source`], as the timestamp button, the
     /// collapsed chip and the bottom bar's Live chip all print it. One
     /// function so the three cannot drift.
     pub(super) fn active_time_label(&self) -> String {
-        match self.panes[self.active_pane].data_time_on_screen() {
+        match self.chip_time_source().0 {
             Some(t) => self.preferences.timezone.format_naive_utc(t, "%H:%M:%S"),
             None => "--:--:--".to_owned(),
         }
@@ -330,13 +371,12 @@ impl super::Gui {
     /// and hands every spare point to the scrubber. The left-hand run's scope
     /// carries an explicit id — see the module note on why.
     fn render_timeline_row1(&mut self, ui: &mut egui::Ui, actions: &mut Vec<GuiAction>) {
-        let pane_idx = self.active_pane;
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // First added is rightmost: ▾ at the edge, then ⋯, the age
+                // First added is rightmost: ⏷ at the edge, then ..., the age
                 // chip and the timestamp, reading left-to-right as
-                // timestamp · age · ⋯ · ▾.
-                let collapse = ui.button("\u{25be}").on_hover_text("Collapse the timeline");
+                // timestamp · age · ... · ⏷.
+                let collapse = ui.button("\u{23f7}").on_hover_text("Collapse the timeline");
                 #[cfg(test)]
                 {
                     self.last_timeline.collapse = collapse.rect;
@@ -346,7 +386,7 @@ impl super::Gui {
                 }
 
                 let expander = ui
-                    .selectable_label(self.timeline_row2, "\u{22ef}")
+                    .selectable_label(self.timeline_row2, "...")
                     .on_hover_text("Loop settings");
                 #[cfg(test)]
                 {
@@ -359,9 +399,11 @@ impl super::Gui {
                 // The age chip and the timestamp are drawn even when there is
                 // nothing to say — placeholder text, not absence — so data
                 // arriving cannot change this run's widget count and re-key
-                // everything drawn after it (see the module note).
-                let age_text = self.panes[pane_idx]
-                    .data_time_on_screen()
+                // everything drawn after it (see the module note). Both read
+                // the shared time source, fallback included, so a non-map
+                // active pane ages and stamps the time actually shown.
+                let (source_time, source_live) = self.chip_time_source();
+                let age_text = source_time
                     .map(|collected| {
                         super::statusbar::format_product_age(
                             chrono::Utc::now().naive_utc() - collected,
@@ -376,11 +418,10 @@ impl super::Gui {
                 #[cfg(not(test))]
                 let _ = age_text;
 
-                let viewing_live = self.panes[pane_idx].viewing_live;
                 let stamp_text = format!(
-                    "{} \u{b7} {}",
+                    "{} - {}",
                     self.active_time_label(),
-                    if viewing_live { "live" } else { "archive" }
+                    if source_live { "live" } else { "archive" }
                 );
                 let stamp = ui
                     .button(stamp_text.as_str())
@@ -433,7 +474,7 @@ impl super::Gui {
         // Back: drop out of live and step backwards by the step picker's
         // choice — one scan, or a fixed span.
         let step_secs = self.panes[pane_idx].time_step_secs;
-        let back = ui.button("\u{25c0}").on_hover_text("Back one step");
+        let back = ui.button("\u{23f4}").on_hover_text("Back one step");
         #[cfg(test)]
         {
             self.last_timeline.back = back.rect;
@@ -455,7 +496,7 @@ impl super::Gui {
 
         // Forward — disabled while live, since there is nothing ahead of now.
         let fwd = ui
-            .add_enabled(!viewing_live, egui::Button::new("\u{25b6}"))
+            .add_enabled(!viewing_live, egui::Button::new("\u{23f5}"))
             .on_hover_text("Forward one step");
         #[cfg(test)]
         {
@@ -517,7 +558,7 @@ impl super::Gui {
         let is_map = self.panes[pane_idx].is_map();
         let loop_active = self.panes[pane_idx].loop_state.is_active();
         let loop_toggle = ui
-            .add_enabled(is_map, egui::Button::selectable(loop_active, "\u{1f501}"))
+            .add_enabled(is_map, egui::Button::selectable(loop_active, "\u{221e}"))
             .on_hover_text("Radar loop");
         #[cfg(test)]
         {
@@ -792,7 +833,7 @@ impl super::Gui {
                     }
 
                     // Play/pause
-                    let play_label = if playing { "\u{23f8}" } else { "\u{25b6}" };
+                    let play_label = if playing { "\u{23f8}" } else { "\u{23f5}" };
                     let play_hover = if playing {
                         "Pause".to_owned()
                     } else if rendering {
@@ -901,9 +942,9 @@ impl super::Gui {
         // live unlinked pane still follows new scans — the checkbox's own
         // hover (`ui_pills::UNLINK_NOTE`) spells the full claim out.
         let caption = format!(
-            "Loops keep up to {} frames on this platform \u{b7} a pane with \
-             \u{201c}Follows shared time\u{201d} off sits out the loop and \
-             shared navigation",
+            "Loops keep up to {} frames on this platform - a pane with \
+             \"Follows shared time\" off sits out the loop and shared \
+             navigation",
             self.loop_frame_budget
         );
         ui.label(egui::RichText::new(caption.as_str()).small().weak());

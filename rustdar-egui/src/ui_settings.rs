@@ -44,8 +44,8 @@ pub(crate) const STORM_MOTION_OVERRIDE_LABEL: &str = "Override the storm motion 
 /// what those builds get.
 #[cfg(target_os = "linux")]
 const LOCATION_EGRESS_NOTE: &str = "Approximate, from your system's location \
-    service. Finding a position sends your IP address, and — if the Wi-Fi \
-    backend is enabled — the identifiers of nearby wireless networks, to \
+    service. Finding a position sends your IP address, and - if the Wi-Fi \
+    backend is enabled - the identifiers of nearby wireless networks, to \
     api.beacondb.net.";
 #[cfg(not(target_os = "linux"))]
 const LOCATION_EGRESS_NOTE: &str = "Approximate, from your device's location \
@@ -278,7 +278,7 @@ impl super::Gui {
                 ui.label(
                     egui::RichText::new(
                         "Unpinned, each pane's pill row idles translucent and \
-                         wakes when the pointer is over the pane \u{2014} or, \
+                         wakes when the pointer is over the pane - or, \
                          on touch, on a first tap.",
                     )
                     .small()
@@ -441,7 +441,7 @@ impl super::Gui {
                 .on_hover_text(
                     "Off, storm-relative velocity uses the Bunkers right-mover fitted \
                      from this volume's own winds. On, it uses the vector below \
-                     \u{2014} in the plan view, the 3D volume and the cross-section alike.",
+                     - in the plan view, the 3D volume and the cross-section alike.",
                 );
                 true
             }
@@ -611,7 +611,7 @@ impl super::Gui {
             // offering one here is how the app ends up asking before the OS has
             // said whether anyone has been asked.
             LocationPermission::Unknown => {
-                ui.label("Checking\u{2026}");
+                ui.label("Checking...");
             }
             // A decision, and one only the user can reverse. No button — the
             // platform will not show a second dialog — so the only useful thing
@@ -684,7 +684,7 @@ impl super::Gui {
             return None;
         }
         let Some(at) = self.user_fix_at else {
-            return Some("Waiting for a fix\u{2026}".to_owned());
+            return Some("Waiting for a fix...".to_owned());
         };
         let minutes = at.elapsed().as_secs() / 60;
         Some(match minutes {

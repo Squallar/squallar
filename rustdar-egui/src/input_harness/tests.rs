@@ -3987,7 +3987,7 @@ fn a_compact_status_bar_drops_the_long_summary_and_the_auto_poll_box() {
         roomy_bar.scan_text
     );
     assert!(
-        scan_chip.contains("\u{26a1}"),
+        scan_chip.contains("\u{23fa}"),
         "the phone chip must carry the live/archive posture glyph: {scan_chip:?}"
     );
     assert!(
@@ -5367,8 +5367,12 @@ fn a_scan_arriving_moves_no_widget_id() {
 #[test]
 fn crossing_a_breakpoint_re_keys_nothing() {
     // Either side of 600pt, and narrow enough to have no sidebar on
-    // either, so the layers panel is the drawer both times.
-    let mut h = InputHarness::with_screen(egui::vec2(750.0, 600.0));
+    // either, so the layers panel is the drawer both times. Short on
+    // purpose: the drawer's body must overflow its slot, or the scrolled
+    // offset this test carries across the breakpoint would be zero and the
+    // claim empty (the M8 full-row rework left the rows tighter than the
+    // old two-button stack, so a 600pt-tall drawer no longer scrolls).
+    let mut h = InputHarness::with_screen(egui::vec2(750.0, 480.0));
     h.set_drawer_open(true);
     // The inspector joins the crossing too (M3 review): its ids are part of
     // "nothing", and egui's bookkeeping only sees what is on screen.
@@ -5388,7 +5392,7 @@ fn crossing_a_breakpoint_re_keys_nothing() {
         .find(|(name, _)| *name == "layers_scroll")
         .expect("precondition: the scroll area must report an id")
         .1;
-    h.scroll_at(egui::pos2(80.0, 400.0), egui::vec2(0.0, -120.0));
+    h.scroll_at(egui::pos2(80.0, 300.0), egui::vec2(0.0, -120.0));
     h.frames_for(3, FRAME_DT);
     let scrolled = h.scroll_offset(scroll_id);
     assert!(
@@ -5397,7 +5401,7 @@ fn crossing_a_breakpoint_re_keys_nothing() {
     );
 
     h.clear_id_changes();
-    h.set_screen(egui::vec2(550.0, 600.0));
+    h.set_screen(egui::vec2(550.0, 480.0));
     h.set_drawer_open(true);
     assert_eq!(
         h.width_class(),
@@ -6273,7 +6277,7 @@ fn every_pane_kinds_sidebar_opens_with_the_same_identity_line() {
     let inspector = inspector_rect(&h);
 
     assert!(
-        h.text_painted_in(inspector, "KDMX \u{b7} Map"),
+        h.text_painted_in(inspector, "KDMX - Map"),
         "a map pane's properties body must open with its identity line; \
              painted: {:?}",
         h.painted_text_strings_in(inspector)
@@ -6282,7 +6286,7 @@ fn every_pane_kinds_sidebar_opens_with_the_same_identity_line() {
     h.make_pane_volume(0);
     h.frames_for(2, FRAME_DT);
     assert!(
-        h.text_painted_in(inspector, "KDMX \u{b7} 3D volume"),
+        h.text_painted_in(inspector, "KDMX - 3D volume"),
         "a 3D pane's properties body must open with the same identity line, \
              with its kind in it; painted: {:?}",
         h.painted_text_strings_in(inspector)
@@ -6291,7 +6295,7 @@ fn every_pane_kinds_sidebar_opens_with_the_same_identity_line() {
     h.make_pane_unaimed_cross_section(0);
     h.frames_for(2, FRAME_DT);
     assert!(
-        h.text_painted_in(inspector, "KDMX \u{b7} Cross-section"),
+        h.text_painted_in(inspector, "KDMX - Cross-section"),
         "a section pane's properties body must open with the same identity \
              line, with its kind in it; painted: {:?}",
         h.painted_text_strings_in(inspector)
@@ -6405,7 +6409,7 @@ fn kind_specific_blocks_sit_inside_the_shared_sidebar_structure() {
         &h,
         inspector_rect(&h),
         &[
-            "KDMX \u{b7} 3D volume",
+            "KDMX - 3D volume",
             "Reflectivity",
             crate::ui::VOLUME_SIDEBAR_HEADER,
             // "Lit volume" and "Isosurface" share this row; the label
@@ -6449,10 +6453,10 @@ fn kind_specific_blocks_sit_inside_the_shared_sidebar_structure() {
         &h,
         inspector_rect(&h),
         &[
-            "KDMX \u{b7} Cross-section",
+            "KDMX - Cross-section",
             "Reflectivity",
             crate::ui::SECTION_SIDEBAR_HEADER,
-            "A \u{2013} B: 105 km",
+            "A - B: 105 km",
         ],
     );
 
@@ -7665,7 +7669,7 @@ fn a_pan_step_on_the_section_pane_slides_the_line_and_keeps_the_picture() {
     // so north is 000° and never "360°") and length, in the user's units
     // — sweeping blind is the alternative.
     let expected_readout = format!(
-        "{:03}\u{b0} \u{b7} {:.0}{}",
+        "{:03}\u{b0} - {:.0}{}",
         (crate::ui_section_edit::bearing_deg(line_before)
             .rem_euclid(360.0)
             .round() as u32)
@@ -7682,7 +7686,7 @@ fn a_pan_step_on_the_section_pane_slides_the_line_and_keeps_the_picture() {
         h.painted_text_strings_in(pane)
     );
 
-    h.mouse_click(chip_rect(&h, pane, "\u{25c0}").center());
+    h.mouse_click(chip_rect(&h, pane, "\u{23f4}").center());
     h.frame();
 
     let line = h.section_line(0).expect("the step lost the line");
@@ -9464,7 +9468,7 @@ fn the_link_pill_popover_toggles_the_time_link() {
     let mut h = pill_harness();
 
     let (glyph, pill) = h.pill(0, PillKind::Link).expect("a link pill");
-    assert_eq!(glyph, "\u{1f517}", "a fresh pane reads linked");
+    assert_eq!(glyph, "\u{26d3}", "a fresh pane reads linked");
     h.mouse_click(pill.center());
     h.frame(); // the popup's debut frame only registers it
     let popover = h.pill_popover().expect("the popover opened");
@@ -9490,7 +9494,7 @@ fn the_link_pill_popover_toggles_the_time_link() {
     );
     let (glyph, _) = h.pill(0, PillKind::Link).expect("still drawn");
     assert_eq!(
-        glyph, "\u{26d3}",
+        glyph, "\u{2297}",
         "the pill must reflect the unlinked state"
     );
 }
@@ -11405,5 +11409,397 @@ fn the_error_surface_stays_visible_while_faded() {
     assert!(
         h.error_toast().is_some(),
         "the fade must not take the error with it"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M8: the first-run fixes, each pinned headlessly. The glyph inventory and
+// the UI-string allowlist live in `ui_glyphs.rs`; the selectable-labels rule
+// is pinned at its frontend site. Everything else is here.
+// ---------------------------------------------------------------------------
+
+/// M8-3. **The top bar has breathing room at every width.** The floor is the
+/// bar's own stated one — the vertical margins plus one interact row — so
+/// dropping either constant back to the cramped strip fails by name here.
+/// The full-bleed contract test above already holds the map to whatever
+/// height the bar really claims.
+#[test]
+fn the_top_bar_has_breathing_room_at_every_width() {
+    for size in [
+        egui::vec2(420.0, 800.0),
+        egui::vec2(800.0, 800.0),
+        egui::vec2(1400.0, 900.0),
+    ] {
+        let h = InputHarness::with_screen(size);
+        let bar = h.top_bar().rect;
+        assert!(
+            bar.height() >= crate::ui::MIN_BAR_HEIGHT,
+            "at {size:?} the top bar is {}pt tall, under its own floor of {}",
+            bar.height(),
+            crate::ui::MIN_BAR_HEIGHT,
+        );
+    }
+}
+
+/// M8-6. **A non-map pane's stack body is the explained absence plus the one
+/// action that applies.** No layer rows and no Add-layer buttons (correct —
+/// there is no map to layer), but the body must offer the caption and a
+/// `Pane properties...` button that opens the inspector where the pane's
+/// real controls live — not read as a broken panel.
+#[test]
+fn a_non_map_stack_body_offers_the_caption_and_pane_properties() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.make_pane_volume(0);
+    h.open_layers();
+
+    let stack = h.stack();
+    assert!(stack.rows.is_empty(), "a 3D pane has no layer rows");
+    assert_eq!(
+        stack.add_top,
+        egui::Rect::NOTHING,
+        "no Add-layer button: the catalog adds map layers"
+    );
+    assert_ne!(
+        stack.non_map_note,
+        egui::Rect::NOTHING,
+        "the explained absence was not drawn"
+    );
+    assert!(
+        h.text_painted_in(stack.rect, crate::ui::NON_MAP_LAYERS_NOTE),
+        "the caption's text never reached the glass"
+    );
+    assert_ne!(
+        stack.props_button,
+        egui::Rect::NOTHING,
+        "the Pane properties... button was not drawn"
+    );
+
+    h.mouse_click(stack.props_button.center());
+    h.warm_up();
+    assert_eq!(
+        h.inspector().mode,
+        Some(crate::ui::InspectorSelection::PaneProps),
+        "the button must open the inspector on Pane properties"
+    );
+}
+
+/// M8-7. **The time chip and timestamp fall back to a real time on a non-map
+/// pane.** The active pane's on-screen time, else its own static
+/// `data_time`, else the freshest visible map pane's — with the live/archive
+/// annotation following whichever pane supplied the time. `--:--:--` only
+/// when genuinely nothing is loaded.
+#[test]
+fn the_time_chip_falls_back_to_a_map_panes_time_on_a_non_map_pane() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    assert!(
+        h.timeline().timestamp.1.contains("--:--:--"),
+        "precondition: a fresh session has no data time anywhere"
+    );
+
+    h.set_pane_count(2);
+    h.make_pane_volume(1);
+    // Pane 0 (a map) has data on screen, parked in the archive; pane 1 (3D)
+    // has none of its own.
+    let t = chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
+        .unwrap()
+        .and_hms_opt(11, 11, 18)
+        .unwrap();
+    {
+        let pane0 = h.gui_mut().pane_mut(0).expect("pane 0 exists");
+        pane0.data_time = Some(t);
+        pane0.viewing_live = false;
+    }
+    // Make the 3D pane the active one, the user's way.
+    h.mouse_click(h.pane_rects()[1].center());
+    h.warm_up();
+    assert_eq!(h.active_pane_index(), 1, "precondition: pane 1 is active");
+
+    let expected_time = h
+        .gui_mut()
+        .preferences
+        .timezone
+        .format_naive_utc(t, "%H:%M:%S");
+    let stamp = h.timeline().timestamp.1.clone();
+    assert!(
+        stamp.contains(&expected_time),
+        "the timestamp button reads {stamp:?}, not the map pane's {expected_time}"
+    );
+    assert!(
+        stamp.contains("archive"),
+        "the annotation must describe the fallback source (an archive-parked \
+         map pane), got {stamp:?}"
+    );
+
+    // The collapsed chip prints the same fallback.
+    h.mouse_click(h.timeline().collapse.center());
+    h.warm_up();
+    let chip = h.timeline().chip;
+    assert!(
+        h.text_painted_in(chip, &expected_time),
+        "the collapsed chip does not show the fallback time"
+    );
+    assert!(
+        !h.text_painted_in(chip, "--:--:--"),
+        "the chip shows --:--:-- with a loaded map pane on screen"
+    );
+}
+
+/// M8-8/9. **The collapsed chip sits above the bottom-edge bars and lays out
+/// on one line.** Anchored off the bars' real rects — the floating status
+/// bar on the wide widths, the bottom bar on the phone — and sized to its
+/// text, so the time can never fold into a vertical column.
+#[test]
+fn the_collapsed_chip_clears_the_bars_and_never_wraps() {
+    // Wide: above the floating status bar.
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.mouse_click(h.timeline().collapse.center());
+    h.warm_up();
+    let chip = h.timeline().chip;
+    let bar = h.status_bar().rect;
+    assert_ne!(chip, egui::Rect::NOTHING, "precondition: the chip is up");
+    assert_ne!(
+        bar,
+        egui::Rect::NOTHING,
+        "precondition: the status bar is up"
+    );
+    assert!(
+        !chip.intersects(bar) && chip.bottom() <= bar.top(),
+        "the chip ({chip:?}) overlays the status bar ({bar:?})"
+    );
+    assert_single_line_chip(&h, chip);
+
+    // Phone: above the bottom bar.
+    let mut h = InputHarness::with_screen(egui::vec2(420.0, 800.0));
+    h.mouse_click(h.timeline().collapse.center());
+    h.warm_up();
+    let chip = h.timeline().chip;
+    let bar = h.bottom_bar().rect;
+    assert_ne!(chip, egui::Rect::NOTHING, "precondition: the chip is up");
+    assert_ne!(
+        bar,
+        egui::Rect::NOTHING,
+        "precondition: the bottom bar is up"
+    );
+    assert!(
+        !chip.intersects(bar) && chip.bottom() <= bar.top(),
+        "the chip ({chip:?}) overlays the bottom bar ({bar:?})"
+    );
+    assert_single_line_chip(&h, chip);
+}
+
+/// The chip's one-line claim, asserted on the glass: wider than tall, and
+/// its whole label painted as a single text row.
+fn assert_single_line_chip(h: &InputHarness, chip: egui::Rect) {
+    assert!(
+        chip.width() > chip.height(),
+        "the chip is taller than wide ({chip:?}) - the wrapped-column bug"
+    );
+    let label = h
+        .painted_text_rects()
+        .into_iter()
+        .find(|(rect, text)| chip.contains(rect.center()) && text.contains(":"))
+        .expect("the chip painted no time text");
+    assert!(
+        label.0.height() < 22.0,
+        "the chip's label wrapped: its galley is {}pt tall for {:?}",
+        label.0.height(),
+        label.1,
+    );
+}
+
+/// M8-10. **A layer row is a full-width, comfortably tall click target.**
+/// Every row spans the panel's inner width at 28pt or more, and a click far
+/// from the label text — the row's right end, where only empty row used to
+/// be — selects the layer.
+#[test]
+fn layer_rows_are_full_width_click_targets() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.open_layers();
+    let stack = h.stack();
+    assert!(
+        stack.rows.len() >= 10,
+        "precondition: the stack draws the layer inventory"
+    );
+    let panel_width = stack.rect.width();
+    for row in &stack.rows {
+        assert!(
+            row.rect.height() >= 27.5,
+            "{:?}'s row is only {}pt tall",
+            row.kind,
+            row.rect.height()
+        );
+        assert!(
+            row.rect.width() >= 0.8 * panel_width,
+            "{:?}'s row is {}pt wide in a {}pt panel - a text-width target",
+            row.kind,
+            row.rect.width(),
+            panel_width
+        );
+    }
+
+    let radar = h
+        .stack_row(OverlayKind::Radar)
+        .expect("the Radar row is drawn");
+    let far_right = egui::pos2(radar.rect.right() - 6.0, radar.rect.center().y);
+    h.mouse_click(far_right);
+    h.warm_up();
+    assert_eq!(
+        h.inspector().mode,
+        Some(crate::ui::InspectorSelection::Layer(OverlayKind::Radar)),
+        "a click at the row's right end must select the layer"
+    );
+
+    // The buttons layered on the row keep their own precedence: the eye
+    // click toggles visibility rather than re-selecting.
+    let row = h.stack_row(OverlayKind::CityLabels).expect("row drawn");
+    let was_on = row.eye_on;
+    h.mouse_click(row.eye.center());
+    h.warm_up();
+    assert_eq!(
+        h.overlay_enabled(OverlayKind::CityLabels),
+        !was_on,
+        "the eye stopped toggling under the full-width row"
+    );
+    assert_ne!(
+        h.inspector().mode,
+        Some(crate::ui::InspectorSelection::Layer(
+            OverlayKind::CityLabels
+        )),
+        "the eye click leaked into a row selection"
+    );
+}
+
+/// M8-11. **The fade hides the 3D pane's Volume Alpha corner button.** It is
+/// floating chrome over the picture: hidden for real while faded — not
+/// drawn, so input-transparent — and back after (the contract-61 family).
+#[test]
+fn the_fade_hides_the_volume_alpha_button_and_restores_it() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.set_pane_count(2);
+    h.make_pane_volume(1);
+    assert!(
+        h.alpha_buttons().iter().any(|&(idx, _)| idx == 1),
+        "precondition: the 3D pane draws its corner button"
+    );
+
+    let spot = h.pane_rects()[0].center();
+    h.mouse_click(spot);
+    h.warm_up();
+    assert!(h.faded(), "precondition: the bare-map click fades");
+    assert!(
+        h.alpha_buttons().is_empty(),
+        "the corner button must not render while faded"
+    );
+    assert!(
+        !h.text_painted_in(
+            h.screen_rect(),
+            crate::ui::map::volume_alpha_editor::ALPHA_BUTTON_LABEL
+        ),
+        "the button's label survives on the glass while faded"
+    );
+
+    h.mouse_click(spot);
+    h.warm_up();
+    assert!(!h.faded(), "precondition: the second tap restores");
+    assert!(
+        h.alpha_buttons().iter().any(|&(idx, _)| idx == 1),
+        "the corner button must return on the unfade"
+    );
+}
+
+/// M8-12. **The active-pane border shows all four edges at every grid
+/// position.** The stroke paints inside the pane rect, inside the map's
+/// content rect — with the outside stroke it shipped with, the outer edges
+/// were clipped away entirely (the top-left pane showed no border at all)
+/// and only inter-pane edges survived.
+#[test]
+fn every_pane_border_lies_inside_its_pane_at_every_position() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.set_pane_count(6);
+    h.close_layers();
+    let map = h.map_panel_rect();
+
+    for target in 0..6 {
+        if h.active_pane_index() != target {
+            // The user's route: the first click on an inactive pane
+            // activates it (and never fades).
+            h.mouse_click(h.pane_rects()[target].center());
+            h.warm_up();
+        }
+        assert_eq!(h.active_pane_index(), target, "activation failed");
+        assert!(!h.faded(), "activation must not fade");
+
+        let borders = h.pane_borders();
+        assert_eq!(borders.len(), 6, "every pane draws its border");
+        let rects = h.pane_rects();
+        for &(idx, painted, active) in &borders {
+            assert_eq!(
+                active,
+                idx == target,
+                "pane {idx}'s border misreports the active highlight"
+            );
+            assert!(
+                rects[idx].contains_rect(painted) && map.contains_rect(painted),
+                "pane {idx}'s border ({painted:?}) leaks outside its pane \
+                 ({:?}) or the map ({map:?}) - the clipped-edges bug",
+                rects[idx],
+            );
+        }
+    }
+}
+
+/// M8-13. **The release frame of a handle drag paints the dropped line,
+/// never the stale pre-drag one.** The drop records a pending edit that the
+/// applier consumes after the pane loop, so without the bridge the release
+/// frame painted the old committed geometry - a visible pop-back. (The gap
+/// predates the Synthesis rebuild; the drag machinery always committed
+/// through the deferred applier.)
+#[test]
+fn the_release_frame_paints_the_dropped_section_line() {
+    let (mut h, _a, b) = harness_with_committed_section();
+
+    let b_px = h.screen_of(0, b);
+    let target_px = b_px + egui::vec2(-70.0, 45.0);
+    h.mouse_move(b_px);
+    h.frame();
+    h.mouse_press(b_px);
+    h.frame();
+    for step in 1..=4 {
+        h.mouse_move(b_px + (target_px - b_px) * (step as f32 / 4.0));
+        h.frame();
+    }
+
+    let painted_b = |h: &InputHarness| -> egui::Pos2 {
+        let tracks = h.section_tracks();
+        let &(_, _, a_end, b_end) = tracks
+            .iter()
+            .find(|&&(map_pane, section_pane, ..)| map_pane == 0 && section_pane == 1)
+            .expect("the map pane paints its section track");
+        // The moved end is whichever cap sits nearer the grab.
+        if (a_end - target_px).length() < (b_end - target_px).length() {
+            a_end
+        } else {
+            b_end
+        }
+    };
+
+    h.mouse_release(target_px);
+    h.frame();
+    let on_release = painted_b(&h);
+    assert!(
+        (on_release - target_px).length() < 8.0,
+        "the release frame painted the line's end at {on_release:?}, not the \
+         drop at {target_px:?} - the pop-back"
+    );
+    assert!(
+        (on_release - b_px).length() > 20.0,
+        "the release frame still painted the pre-drag end at {on_release:?}"
+    );
+
+    h.frame();
+    let after = painted_b(&h);
+    assert!(
+        (after - target_px).length() < 8.0,
+        "the applied frame painted {after:?}, not the drop at {target_px:?}"
     );
 }

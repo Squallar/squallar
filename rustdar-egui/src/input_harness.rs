@@ -1214,6 +1214,23 @@ impl InputHarness {
         self.gui.status_bar_for_test().clone()
     }
 
+    /// The pane borders the last frame painted: pane index, the stroke's
+    /// painted bounds, and whether it was the active highlight.
+    pub(crate) fn pane_borders(&self) -> Vec<(usize, egui::Rect, bool)> {
+        self.gui.pane_borders_for_test().to_vec()
+    }
+
+    /// The section tracks the last frame painted over map panes: map pane,
+    /// section pane, and the painted A and B endpoints.
+    pub(crate) fn section_tracks(&self) -> Vec<(usize, usize, egui::Pos2, egui::Pos2)> {
+        self.gui.section_tracks_for_test().to_vec()
+    }
+
+    /// The Volume Alpha corner buttons the last frame drew, per pane.
+    pub(crate) fn alpha_buttons(&self) -> Vec<(usize, egui::Rect)> {
+        self.gui.alpha_buttons_for_test().to_vec()
+    }
+
     /// Deliver a scan for `site`, through the host's own delivery path.
     ///
     /// `Gui::set_scan_info_for_site` is what the app calls when a fetch

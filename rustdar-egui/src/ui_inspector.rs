@@ -47,11 +47,15 @@ pub(super) const INSPECTOR_BOTTOM_CLEARANCE: f32 = 88.0;
 /// What the crumb row and its separator cost above the scroll body.
 const HEADER_ALLOWANCE: f32 = 40.0;
 
-/// The collapse button's glyph: the panel slides out to the right.
-const COLLAPSE_LABEL: &str = "\u{27e9}";
+/// The collapse button's glyph: the panel slides out to the right. `›`
+/// rather than the demo's `⟩`, which egui's bundled fonts do not carry (see
+/// `ui_glyphs.rs`) — and the crumb's own separator, which is the direction
+/// the panel leaves in.
+const COLLAPSE_LABEL: &str = "\u{203a}";
 
-/// The deselect button's glyph — back to App › Settings.
-const DESELECT_LABEL: &str = "\u{2715}";
+/// The deselect button's glyph — back to App › Settings. `×`, not the
+/// uncarried `✕`, on the same grounds as the collapse.
+const DESELECT_LABEL: &str = "\u{d7}";
 
 /// Width of combo boxes inside the inspector — the layers panel's old value,
 /// kept with the `layers_` salts so the combos' stored state moved intact.
@@ -70,10 +74,10 @@ pub(crate) struct InspectorProbe {
     pub rect: egui::Rect,
     /// The crumb row's text, e.g. `Pane 2 › Properties`.
     pub crumb: String,
-    /// The `✕` deselect button — [`egui::Rect::NOTHING`] on the App ›
+    /// The `×` deselect button — [`egui::Rect::NOTHING`] on the App ›
     /// Settings body, which has nothing to deselect.
     pub deselect: egui::Rect,
-    /// The `⟩` collapse button.
+    /// The `›` collapse button.
     pub collapse: egui::Rect,
     /// Whether the inspector was on screen this frame.
     pub open: bool,
@@ -248,10 +252,10 @@ impl super::Gui {
 
     /// The crumb row: where the body's subject is named, and where it is
     /// changed. The crumb draws in every host — it is the selection, not a
-    /// header — but the ⟩ collapse hides in the sheet host, where the
-    /// sheet's own ✕ and the back-chain already close the page and a second
+    /// header — but the › collapse hides in the sheet host, where the
+    /// sheet's own × and the back-chain already close the page and a second
     /// close control would be a back button by another name (§1.13; M7's
-    /// sheet-header polish). The crumb's ✕-deselect stays everywhere: it
+    /// sheet-header polish). The crumb's ×-deselect stays everywhere: it
     /// changes the selection, not the navigation.
     fn render_inspector_crumb(
         &mut self,
@@ -445,8 +449,10 @@ impl super::Gui {
         if self.pane_layout.pane_count > 1 {
             ui.add_space(6.0);
             ui.separator();
-            ui.checkbox(&mut self.viewport_sync, "\u{1f517}  Sync Viewports");
-            ui.checkbox(&mut self.sync_layers, "\u{1f517}  Sync Layers");
+            // `⛓` — the pills' own linked glyph; the demo's `🔗` has no
+            // glyph in egui's bundled fonts (see `ui_glyphs.rs`).
+            ui.checkbox(&mut self.viewport_sync, "\u{26d3}  Sync Viewports");
+            ui.checkbox(&mut self.sync_layers, "\u{26d3}  Sync Layers");
             // Per-pane, unlike the two layout-wide toggles above: off means
             // this pane is *frozen* — left out of the loop fan-out and of
             // `propagate_layer_sync`'s time pair. Written on the taken pane,
@@ -454,7 +460,7 @@ impl super::Gui {
             #[cfg(test)]
             let link_was = pane.time_link;
             let link = ui
-                .checkbox(&mut pane.time_link, "\u{1f517}  Follows shared time")
+                .checkbox(&mut pane.time_link, "\u{26d3}  Follows shared time")
                 // The pill popover's own sentence, shared so the two routes
                 // cannot describe unlinking differently — and careful about
                 // "frozen"; see `ui_pills::UNLINK_NOTE`.

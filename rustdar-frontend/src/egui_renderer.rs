@@ -335,14 +335,33 @@ impl EguiRenderer {
     pub fn apply_theme(&mut self, use_dark: bool) {
         if self.applied_visuals_dark != Some(use_dark) {
             self.applied_visuals_dark = Some(use_dark);
-            let visuals = if use_dark {
-                egui::Visuals::dark()
-            } else {
-                egui::Visuals::light()
-            };
-            self.context().set_visuals(visuals);
+            apply_theme_to_context(self.context(), use_dark);
         }
     }
+}
+
+/// The theme as one context-level application: the palette, plus the style
+/// rules that must hold under both palettes.
+///
+/// `selectable_labels` goes off here because rustdar's labels are readouts,
+/// not documents: a map drag that ends over the chrome left label text
+/// highlighted as though selected (the M8 first-run finding), and nothing in
+/// the app wants label text selected — `TextEdit` fields keep their own
+/// selection regardless of this flag. `all_styles_mut` writes the rule into
+/// both of egui's per-theme styles, so a later visuals flip cannot resurrect
+/// it.
+///
+/// A free function over the `Context` rather than a renderer method so a host
+/// test can drive it against a bare context — the renderer itself needs a
+/// wgpu device no host test has.
+pub fn apply_theme_to_context(ctx: &egui::Context, use_dark: bool) {
+    let visuals = if use_dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
+    ctx.set_visuals(visuals);
+    ctx.all_styles_mut(|style| style.interaction.selectable_labels = false);
 }
 
 #[cfg(test)]

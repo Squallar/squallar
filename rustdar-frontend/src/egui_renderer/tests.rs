@@ -419,3 +419,35 @@ fn the_wheel_rewrite_is_gated_on_wasm32_and_nothing_else() {
              guard; found {guard:?}"
     );
 }
+
+/// Both theme paths turn label text-selection off, and keep it off.
+///
+/// A map drag whose release lands over the chrome left labels highlighted as
+/// though selected (the M8 first-run finding). The rule is applied at the one
+/// site that applies visuals, through `all_styles_mut`, so it must hold under
+/// either palette and survive a theme flip — which is exactly what is driven
+/// here, against a bare context, since labels in this app are never meant to
+/// be text-selected. `TextEdit` selection is egui-internal and unaffected by
+/// the flag.
+#[test]
+fn both_theme_paths_turn_label_text_selection_off() {
+    for order in [[true, false], [false, true]] {
+        let ctx = egui::Context::default();
+        for use_dark in order {
+            super::apply_theme_to_context(&ctx, use_dark);
+            assert_eq!(
+                ctx.global_style().visuals.dark_mode,
+                use_dark,
+                "the palette half of apply_theme stopped applying"
+            );
+            for theme in [egui::Theme::Dark, egui::Theme::Light] {
+                assert!(
+                    !ctx.style_of(theme).interaction.selectable_labels,
+                    "labels are text-selectable in the {theme:?} style after \
+                     applying the {} theme (flip order {order:?})",
+                    if use_dark { "dark" } else { "light" },
+                );
+            }
+        }
+    }
+}

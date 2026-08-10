@@ -65,7 +65,7 @@ impl OverlayItem for StormReportItem {
             format!("{} UTC", report.time)
         };
         let mut sections = vec![PopupSection::Text(format!(
-            "{formatted_time} — {}, {} {}",
+            "{formatted_time} - {}, {} {}",
             report.location, report.county, report.state
         ))];
         if let Some(mag) = report.magnitude {
@@ -272,9 +272,9 @@ impl OverlayHandler for StormReportsHandler {
     fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
         let count = self.state.data.len();
         let label = if count == 0 {
-            "\u{26a1}  SPC Storm Reports".to_string()
+            "SPC Storm Reports".to_string()
         } else {
-            format!("\u{26a1}  SPC Storm Reports ({count})")
+            format!("SPC Storm Reports ({count})")
         };
 
         let mut items = vec![ControlItem::Toggle {
@@ -287,14 +287,14 @@ impl OverlayHandler for StormReportsHandler {
             items.push(ControlItem::ButtonRow {
                 buttons: vec![ControlButton {
                     id: "refresh",
-                    label: "\u{1f504} Refresh".into(),
+                    label: "\u{21bb} Refresh".into(),
                     enabled: !self.state.fetching,
                     highlight: false,
                 }],
             });
             if self.state.fetching {
                 items.push(ControlItem::InfoText {
-                    text: "Fetching\u{2026}".into(),
+                    text: "Fetching...".into(),
                 });
             }
             if let Some(t) = self.state.fetch_time {

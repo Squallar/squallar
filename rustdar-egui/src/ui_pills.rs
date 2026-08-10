@@ -87,14 +87,16 @@ const LINK_POPOVER_WIDTH: f32 = 260.0;
 /// reach without scrolling past 200 sites.
 const SITE_LIST_HEIGHT: f32 = 150.0;
 
-/// The linked state's popover row.
-const LINK_OPTION: &str = "\u{1f517}  Follow shared timeline";
+/// The linked state's popover row. `⛓` — chains are the *linked* state
+/// here; the demo's `🔗` has no glyph in egui's bundled fonts (see
+/// `ui_glyphs.rs`).
+const LINK_OPTION: &str = "\u{26d3}  Follow shared timeline";
 
 /// The unlinked state's popover row. "Keep this pane's own time", not
 /// "freeze": scan delivery is site-keyed and ignores the link, so a live
 /// unlinked pane still follows new scans — the reliable freeze is the loop
 /// exclusion plus the pane's own time posture ([`UNLINK_NOTE`]).
-const UNLINK_OPTION: &str = "\u{26d3}  Unlink \u{2014} keep this pane's own time";
+const UNLINK_OPTION: &str = "\u{2297}  Unlink - keep this pane's own time";
 
 /// What unlinking really does — one sentence for the popover's caption and
 /// the inspector checkbox's hover, so the two routes cannot describe the
@@ -245,7 +247,7 @@ pub(super) fn site_list_ui(ui: &mut egui::Ui, query: &str, current: &str) -> Sit
     let total = RADARS.len();
     let tdwr = RADARS.iter().filter(|site| site.is_tdwr()).count();
     let caption = format!(
-        "{} shown \u{b7} {} sites ({} NEXRAD + {} TDWR)",
+        "{} shown - {} sites ({} NEXRAD + {} TDWR)",
         shown.len(),
         total,
         total - tdwr,
@@ -274,7 +276,7 @@ pub(super) fn site_list_ui(ui: &mut egui::Ui, query: &str, current: &str) -> Sit
                 // nothing for them, and the caption's split deserves to be
                 // visible per row.
                 let label = if site.is_tdwr() {
-                    format!("{} \u{b7} TDWR", site.name)
+                    format!("{} - TDWR", site.name)
                 } else {
                     site.name.to_owned()
                 };
@@ -582,11 +584,13 @@ impl super::Gui {
 
                     // -- time link --
                     if offer_link {
-                        let glyph = if time_link { "\u{1f517}" } else { "\u{26d3}" };
+                        // ⛓ linked / ⊗ unlinked — the popover rows' own
+                        // glyphs, so the pill and its menu agree.
+                        let glyph = if time_link { "\u{26d3}" } else { "\u{2297}" };
                         let pill = ui.button(glyph).on_hover_text(if time_link {
                             "Follows shared time"
                         } else {
-                            "Unlinked \u{2014} keeps its own time"
+                            "Unlinked - keeps its own time"
                         });
                         #[cfg(test)]
                         probe

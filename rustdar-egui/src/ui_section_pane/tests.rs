@@ -600,7 +600,7 @@ fn a_ladder_that_stopped_short_stays_calm_and_explains_on_request() {
         "precondition: this ceiling is on the chart"
     );
     let kft = format!(
-        "\u{2248}{:.0} {} MSL",
+        "~{:.0} {} MSL",
         ceiling_km * KM_TO_KFT,
         prefs.height.kilo_suffix()
     );
@@ -749,10 +749,10 @@ fn red_is_reserved_for_broken_states() {
             "{reason:?} has the wrong styling: {}",
             status.text
         );
-        // The warning glyph follows the same rule: a ⚠ on a routine state
-        // is the old alarm back in miniature.
+        // The warning glyph follows the same rule: a leading "!" on a
+        // routine state is the old alarm back in miniature.
         assert_eq!(
-            status.text.starts_with('\u{26a0}'),
+            status.text.starts_with('!'),
             broken,
             "{reason:?} carries the wrong glyph: {}",
             status.text

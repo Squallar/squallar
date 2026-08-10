@@ -59,7 +59,7 @@ impl OverlayHandler for CityLabelsHandler {
     fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
         vec![ControlItem::Toggle {
             id: "enabled",
-            label: "\u{1f3f7}  City Labels".to_string(),
+            label: "City Labels".to_string(),
             enabled: self.enabled,
         }]
     }

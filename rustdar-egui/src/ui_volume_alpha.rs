@@ -91,10 +91,22 @@ pub(crate) fn editor_ui(
     pane: &mut crate::pane::PaneState,
     painter: Option<&dyn crate::volume_view::VolumePainter>,
     target: Option<&crate::pane::VolumeTarget>,
+    chrome: Option<f32>,
     curves: &mut AlphaCurves,
+    #[cfg(test)] probe: &mut Vec<(usize, egui::Rect)>,
 ) {
     let product = pane.selected_product;
     let Some(volume) = pane.volume_mut() else {
+        return;
+    };
+
+    // The UI fade (§1.8): the corner button is floating chrome over the
+    // picture, exactly like the pills, so fully faded it does not render at
+    // all — the absence is the input transparency — and it returns on the
+    // unfade like the rest. The editor window needs no gate of its own: the
+    // fade closes it for real (`Gui::fade_close_all`), and an open editor
+    // found under a fade unfades the frame (`enforce_fade_invariants`).
+    let Some(chrome) = chrome else {
         return;
     };
 
@@ -107,10 +119,23 @@ pub(crate) fn editor_ui(
         pane_rect.right_top() + egui::vec2(-(size.x + BUTTON_MARGIN), BUTTON_MARGIN),
         size,
     );
-    if ui
-        .put(rect, button)
+    #[cfg(test)]
+    probe.push((pane_idx, rect));
+    let drawn = ui
+        .scope(|ui| {
+            // A transitioning button dims with the chrome and is dead to
+            // input meanwhile — the standing `fade::dim` contract, inlined
+            // because this module sits outside the `ui` module tree.
+            if chrome < 1.0 {
+                ui.multiply_opacity(chrome);
+                ui.disable();
+            }
+            ui.put(rect, button)
+        })
+        .inner;
+    if drawn
         .on_hover_text(
-            "Redraw the volume's opacity over the value scale — GR2Analyst's Volume Alpha. \
+            "Redraw the volume's opacity over the value scale - GR2Analyst's Volume Alpha. \
              Drag on the curve to strip or restore a range of values.",
         )
         .clicked()
@@ -125,7 +150,7 @@ pub(crate) fn editor_ui(
     // the title tracks the product — so switching moments re-labels the same
     // window instead of scattering one per product across the screen.
     let mut open = true;
-    egui::Window::new(format!("Volume Alpha \u{2014} {}", product.name()))
+    egui::Window::new(format!("Volume Alpha - {}", product.name()))
         .id(egui::Id::new(("volume_alpha_editor", pane_idx)))
         .open(&mut open)
         .default_width(460.0)
@@ -155,12 +180,12 @@ fn absent_curve_message(product: rustdar_radar::types::RadarProduct) -> String {
     if rustdar_radar::derive::volume_slot(product).is_none() {
         format!(
             "{} does not render in 3D, so there is no volume opacity to edit \
-             \u{2014} pick a moment the radar measures or derives tilt by tilt.",
+             - pick a moment the radar measures or derives tilt by tilt.",
             product.name(),
         )
     } else {
-        "The volume is still building \u{2014} its palette arrives with it, and \
-         the curve is drawn over that palette."
+        "The volume is still building - its palette arrives with it, and the \
+         curve is drawn over that palette."
             .to_owned()
     }
 }
@@ -196,7 +221,7 @@ fn editor_contents(
             .add_enabled(curves.is_edited(product), egui::Button::new(RESET_LABEL))
             .on_hover_text(
                 "Forget the drawn curve and render through this product's default volume \
-                 opacity again \u{2014} the plan-view palette's alpha shaped by the product's \
+                 opacity again - the plan-view palette's alpha shaped by the product's \
                  own 3D transparency profile. That is not the plan view's opacity: a value \
                  the map paints solid can be see-through here, which is what makes a storm's \
                  interior visible.",

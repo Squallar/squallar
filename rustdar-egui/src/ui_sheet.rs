@@ -84,14 +84,16 @@ const CATALOG_HEADER_ALLOWANCE: f32 = 48.0;
 /// so the two presentations of "a dialog is open" read the same.
 const SCRIM_COLOR: egui::Color32 = egui::Color32::from_black_alpha(100);
 
-/// The bottom bar's four page items.
+/// The bottom bar's four page items. The Layers glyph matches the top
+/// bar's toggle and the Pane glyph is a carried 2×2 grid — the demo's `▤`
+/// and `▦` have no glyph in egui's bundled fonts (see `ui_glyphs.rs`).
 const MENU_ITEM_LABEL: &str = "\u{2630} Menu";
-const LAYERS_ITEM_LABEL: &str = "\u{25a4} Layers";
-const PANE_ITEM_LABEL: &str = "\u{25a6} Pane";
+const LAYERS_ITEM_LABEL: &str = "\u{25a3} Layers";
+const PANE_ITEM_LABEL: &str = "\u{229e} Pane";
 const APP_ITEM_LABEL: &str = "\u{2699} App";
 
-/// The close button's glyph — the same ✕ the inspector's deselect uses.
-const CLOSE_LABEL: &str = "\u{2715}";
+/// The close button's glyph — the same × the inspector's deselect uses.
+const CLOSE_LABEL: &str = "\u{d7}";
 
 /// Which page the sheet is showing — derived, never stored. See the module
 /// note: this is a reading of the shared open-surface flags, in the fixed
@@ -165,7 +167,7 @@ pub(crate) struct SheetProbe {
     pub page: Option<SheetPage>,
     /// The title row's text, verbatim.
     pub title: String,
-    /// The ✕ close button — clears every page flag.
+    /// The × close button — clears every page flag.
     pub close: egui::Rect,
     /// The drag handle's hit strip.
     pub handle: egui::Rect,
@@ -196,7 +198,7 @@ impl Default for SheetProbe {
 pub(crate) struct ErrorToastProbe {
     /// The toast area's whole rect.
     pub rect: egui::Rect,
-    /// The ✕ that clears the error — the status bar's own dismiss.
+    /// The × that clears the error — the status bar's own dismiss.
     pub close: egui::Rect,
 }
 
@@ -226,7 +228,7 @@ impl super::Gui {
         None
     }
 
-    /// Clear every page flag — what the ✕ and a drag-down dismissal mean:
+    /// Clear every page flag — what the × and a drag-down dismissal mean:
     /// the whole sheet goes, not one page. The inspector's selection resets
     /// on the same terms as `dismiss_top_layer`'s inspector arm: this is a
     /// dismissal, and what was backed out of should not lie in wait.
@@ -303,7 +305,7 @@ impl super::Gui {
                             let chip_text = if live {
                                 "\u{23fa} Live".to_owned()
                             } else {
-                                format!("\u{1f550} {}", self.active_time_label())
+                                format!("\u{23f1} {}", self.active_time_label())
                             };
                             let chip = ui
                                 .selectable_label(expanded, chip_text)
@@ -368,7 +370,7 @@ impl super::Gui {
                                             // A same-item close is a collapse,
                                             // not a dismissal: the selection
                                             // stays for the next open, as the
-                                            // crumb's ⟩ keeps it.
+                                            // crumb's › keeps it.
                                             self.insp_open = false;
                                         } else {
                                             self.clear_sheet_dialogs();
@@ -609,7 +611,7 @@ impl super::Gui {
                         self.sheet_drag = None;
                     }
 
-                    // Title row: page title, ✕ clears every page flag.
+                    // Title row: page title, × clears every page flag.
                     ui.horizontal(|ui| {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let close = ui.button(CLOSE_LABEL).on_hover_text("Close the sheet");

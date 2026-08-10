@@ -32,7 +32,7 @@ pub(crate) const VOLUME_EMPTY_STATE: &str = "3D volume view unavailable";
 /// The header over the 3D pane's sidebar block. Icon, two spaces, name — the
 /// same shape as [`super::SECTION_SIDEBAR_HEADER`] and the overlay rows'
 /// labels, which is what keeps the block reading as part of the one panel.
-pub(crate) const VOLUME_SIDEBAR_HEADER: &str = "\u{1f4e6}  3D view";
+pub(crate) const VOLUME_SIDEBAR_HEADER: &str = "\u{26f6}  3D view";
 
 impl super::Gui {
     /// Draw every visible pane, whatever kind each one is.
@@ -558,6 +558,11 @@ impl super::Gui {
                             // reason: both want `&self` across a body that also
                             // wants `&mut self`, and both are cheap to copy out.
                             let current_stamp = self.current_volume_for(&pane.site);
+                            // The fade factor, read once for the pane-borne
+                            // chrome inside: the Volume Alpha corner button
+                            // is floating chrome over the picture and fades
+                            // with the rest of it (§1.8 — the M8 addition).
+                            let chrome = self.chrome_fade();
                             let outcome = render_volume_pane(
                                 &mut child_ui,
                                 pane_rect,
@@ -565,9 +570,12 @@ impl super::Gui {
                                 &mut pane,
                                 painter.as_deref(),
                                 current_stamp,
+                                chrome,
                                 &mut actions,
                                 &mut self.volume_alpha,
                                 &self.volume_iso,
+                                #[cfg(test)]
+                                &mut self.last_alpha_buttons,
                             );
                             #[cfg(test)]
                             self.last_volume_arms
@@ -611,7 +619,11 @@ impl super::Gui {
                     self.panes[pane_idx] = pane;
 
                     if pane_count > 1 {
-                        draw_pane_border(ui, pane_rect, is_active);
+                        let painted = draw_pane_border(ui, pane_rect, is_active);
+                        #[cfg(test)]
+                        self.last_pane_borders.push((pane_idx, painted, is_active));
+                        #[cfg(not(test))]
+                        let _ = painted;
                     }
                 } // end pane loop
 
@@ -984,7 +996,7 @@ impl super::Gui {
     /// map pane by construction: this runs inside `Map::show`, which only the map
     /// arm reaches. A section pane can never be the one held out.
     fn draw_section_tracks(
-        &self,
+        &mut self,
         ui: &egui::Ui,
         projector: &walkers::Projector,
         pane_idx: usize,
@@ -993,6 +1005,9 @@ impl super::Gui {
         let painter = ui.painter();
         let project =
             |p: crate::pane::GeoPoint| projector.project(walkers::lat_lon(p.lat, p.lon)).to_pos2();
+
+        #[cfg(test)]
+        let mut painted: Vec<(usize, usize, egui::Pos2, egui::Pos2)> = Vec::new();
 
         // Committed sections first, so a band being dragged over one is on top.
         for (idx, other) in self.panes().iter().enumerate() {
@@ -1009,12 +1024,31 @@ impl super::Gui {
             // preview — geographic, like the committed line, so a mid-drag
             // zoom moves both together. The pane's stored line is untouched
             // until the drop, which is what keeps the cut off this path.
+            //
+            // On the release frame neither exists yet: the drag was taken
+            // and committed into `pending_section_edit`, and the applier
+            // that writes it to the pane runs after this loop (`Gui::ui`).
+            // Painting the pending line bridges that frame — without it the
+            // release frame painted the stale pre-drag `committed`, a
+            // visible pop-back before the applier's write landed (the M8
+            // first-run finding; the gap predates the Synthesis rebuild).
             let editing = self
                 .section_edit_drag
                 .filter(|d| d.map_pane == pane_idx && d.section_pane == idx);
-            let line = editing.map_or(committed, |d| d.preview());
+            let dropped = self
+                .pending_section_edit
+                .filter(|&(pane, _)| pane == idx)
+                .map(|(_, line)| line);
+            let line = editing
+                .map(|d| d.preview())
+                .or(dropped)
+                .unwrap_or(committed);
             let track = great_circle_track(line, project);
             paint_section_track(painter, &track, pane_rect);
+            #[cfg(test)]
+            if let (Some(&a), Some(&b)) = (track.first(), track.last()) {
+                painted.push((pane_idx, idx, a, b));
+            }
             // The ends are handles now, and drawn like it: a cap that looks
             // identical to every other map decoration is an affordance nobody
             // finds.
@@ -1024,6 +1058,9 @@ impl super::Gui {
         if let Some((from, to)) = self.section_rubber_band(pane_idx) {
             paint_section_track(painter, &[from, to], pane_rect);
         }
+
+        #[cfg(test)]
+        self.last_section_tracks.extend(painted);
     }
 
     /// Detect which pane was clicked and make it the active pane.
@@ -1193,9 +1230,11 @@ fn render_volume_pane(
     pane: &mut crate::pane::PaneState,
     painter: Option<&dyn crate::volume_view::VolumePainter>,
     current_stamp: Option<crate::ui::CurrentVolumeStamp>,
+    chrome: Option<f32>,
     actions: &mut Vec<GuiAction>,
     alpha_curves: &mut crate::volume_alpha::AlphaCurves,
     iso_thresholds: &crate::volume_iso::IsoThresholds,
+    #[cfg(test)] alpha_buttons: &mut Vec<(usize, egui::Rect)>,
 ) -> Option<String> {
     let outcome = volume_pane_outcome(
         ui,
@@ -1214,7 +1253,8 @@ fn render_volume_pane(
     // The Volume Alpha editor, after the pane's own painting so its button and
     // window sit over the picture. It needs the target the arm just resolved —
     // the palette it shows is the grid's own, looked up by that target — and
-    // the product, which the curves are keyed by.
+    // the product, which the curves are keyed by. `chrome` is the frame's
+    // fade: the button is floating chrome and hides with the rest (§1.8).
     volume_alpha_editor::editor_ui(
         ui,
         pane_rect,
@@ -1222,7 +1262,10 @@ fn render_volume_pane(
         pane,
         painter,
         outcome.target.as_ref(),
+        chrome,
         alpha_curves,
+        #[cfg(test)]
+        alpha_buttons,
     );
     outcome.empty
 }
@@ -1414,7 +1457,7 @@ fn volume_pane_outcome(
         // site switch fires the archive fetch immediately), so this is the one
         // state where waiting is the truth.
         return VolumeOutcome::empty_state(format!(
-            "Downloading the first {site_code} volume…\n\nThe 3D view builds the moment it \
+            "Downloading the first {site_code} volume...\n\nThe 3D view builds the moment it \
              lands, then updates tilt by tilt as new sweeps arrive.",
         ));
     };
@@ -1424,7 +1467,7 @@ fn volume_pane_outcome(
     // which kind of field the pane needs.
     if rustdar_radar::derive::volume_slot(product).is_none() {
         return VolumeOutcome::empty_state(format!(
-            "{} has no vertical structure to render in 3D — pick a moment the radar measures \
+            "{} has no vertical structure to render in 3D - pick a moment the radar measures \
              or derives tilt by tilt",
             product.name(),
         ));
@@ -1580,7 +1623,7 @@ pub(crate) fn render_volume_controls(
                 crate::pane::VolumeViewMode::Isosurface,
                 "Isosurface",
             )
-            .on_hover_text("One opaque, lit surface at the threshold below — the shell of everything at or beyond it.");
+            .on_hover_text("One opaque, lit surface at the threshold below - the shell of everything at or beyond it.");
         });
         if volume.view_mode == crate::pane::VolumeViewMode::Isosurface {
             let (prefix, suffix) = crate::volume_iso::slider_labels(product);
@@ -1600,7 +1643,7 @@ pub(crate) fn render_volume_controls(
                     iso_thresholds.set(product, threshold);
                 }
                 response.on_hover_text(format!(
-                    "Where {}'s surface sits. Per product — every 3D pane showing this \
+                    "Where {}'s surface sits. Per product - every 3D pane showing this \
                      product shares it.",
                     product.name(),
                 ));
@@ -1629,7 +1672,7 @@ pub(crate) fn render_volume_controls(
                  reflectivity as the 2D map shows it, the range ring, mesoscale discussion, \
                  warning and watch polygons, and city labels, registered to the box. \
                  Warnings and discussions refresh on the floor as they issue and expire. \
-                 Always the full composition — the map panes' layer toggles do not apply to \
+                 Always the full composition - the map panes' layer toggles do not apply to \
                  it, the same way they do not apply to this pane's volume.",
             )
             .changed()
@@ -1716,7 +1759,7 @@ fn volume_caption(
     camera: crate::pane::OrbitCamera,
 ) -> Vec<String> {
     let mut lines = vec![format!(
-        "{site} volume · newest data {}Z",
+        "{site} volume - newest data {}Z",
         newest.format("%H:%M")
     )];
 
@@ -1724,13 +1767,13 @@ fn volume_caption(
         Some(base) => lines.push(format!("base volume {}Z", base.format("%H:%M"))),
         // No complete volume yet: the ladder is only what the current flight
         // has sealed, and the picture must not read as a full atmosphere.
-        None => lines.push("no complete volume yet — showing the tilts flown so far".to_owned()),
+        None => lines.push("no complete volume yet - showing the tilts flown so far".to_owned()),
     }
 
     let base = rustdar_radar::voxel::DEFAULT_BASE_KM_MSL * KFT_PER_KM;
     let top = rustdar_radar::voxel::DEFAULT_TOP_KM_MSL * KFT_PER_KM;
     lines.push(format!(
-        "{base:.0}–{top:.0} kft MSL · vertical exaggeration {:.1}×",
+        "{base:.0}-{top:.0} kft MSL - vertical exaggeration {:.1}×",
         camera.vertical_exaggeration(),
     ));
 
@@ -1750,7 +1793,7 @@ fn volume_caption(
         )
         .resolution_km(cells);
     match resolution {
-        Some(km) => lines.push(format!("{:.0} km box · {km:.2} km/cell", 2.0 * half_width)),
+        Some(km) => lines.push(format!("{:.0} km box - {km:.2} km/cell", 2.0 * half_width)),
         // A zero cell count is impossible for every named shape, and a caption is
         // not the place to fail over it.
         None => lines.push(format!("{:.0} km box", 2.0 * half_width)),
@@ -1830,7 +1873,7 @@ fn paint_pane_empty_state(ui: &mut egui::Ui, pane_rect: egui::Rect, text: &str) 
 const SECTION_TRACK_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 214, 10);
 
 /// What the armed cross-section draw's hint chip says.
-pub(crate) const SECTION_ARM_HINT: &str = "Drag A\u{2013}B to draw cross-section";
+pub(crate) const SECTION_ARM_HINT: &str = "Drag A-B to draw cross-section";
 
 /// What the armed region drag's hint chip says: the gesture, then the box
 /// sizes the resampler will actually honour — computed from the same
@@ -1838,7 +1881,7 @@ pub(crate) const SECTION_ARM_HINT: &str = "Drag A\u{2013}B to draw cross-section
 /// so the chip cannot state sizes the drag will not deliver.
 pub(crate) fn region_arm_hint() -> String {
     format!(
-        "Drag to pick 3D region \u{b7} box {:.0}\u{2013}{:.0} km (default {:.0} km)",
+        "Drag to pick 3D region - box {:.0}-{:.0} km (default {:.0} km)",
         2.0 * rustdar_radar::voxel::MIN_HALF_WIDTH_KM,
         2.0 * rustdar_radar::voxel::MAX_HALF_WIDTH_KM,
         2.0 * crate::pane::DEFAULT_HALF_WIDTH_KM,
@@ -2013,20 +2056,38 @@ fn paint_section_handles(
     }
 }
 
-/// Draw a border around a pane rect, highlighted when active.
-fn draw_pane_border(ui: &mut egui::Ui, pane_rect: egui::Rect, is_active: bool) {
+/// Draw a border around a pane rect, highlighted when active. Returns the
+/// painted stroke's bounds, for the M8 containment pin.
+///
+/// `StrokeKind::Inside`, deliberately: the pane rects tile the map content
+/// rect edge to edge since the full-bleed flip, so an outside stroke lay
+/// entirely in the neighbouring pane or beyond the content rect — clipped
+/// away on every outer edge, overpainted by later panes on the inner ones,
+/// which left the active highlight visible only where an adjacent pane's gap
+/// happened to show it (the first-run finding: the top-left pane showed no
+/// border at all). Inside the rect, every pane shows all four edges at every
+/// grid position, painted after the pane's own content so nothing covers it.
+fn draw_pane_border(ui: &mut egui::Ui, pane_rect: egui::Rect, is_active: bool) -> egui::Rect {
     let border_color = if is_active {
         egui::Color32::from_rgb(60, 140, 255)
     } else {
         egui::Color32::from_rgba_unmultiplied(128, 128, 128, 100)
     };
     let stroke_width = if is_active { 2.0 } else { 1.0 };
+    let kind = egui::StrokeKind::Inside;
     ui.painter().rect_stroke(
         pane_rect,
         0.0,
         egui::Stroke::new(stroke_width, border_color),
-        egui::StrokeKind::Outside,
+        kind,
     );
+    // The painted bounds follow from the kind the stroke was really drawn
+    // with, so the probe cannot claim containment the paint call breaks.
+    match kind {
+        egui::StrokeKind::Inside => pane_rect,
+        egui::StrokeKind::Middle => pane_rect.expand(stroke_width / 2.0),
+        egui::StrokeKind::Outside => pane_rect.expand(stroke_width),
+    }
 }
 
 /// Context for computing hover info from radar value data.

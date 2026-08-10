@@ -291,14 +291,14 @@ impl super::Gui {
 fn render_pager_nav(ui: &mut egui::Ui, page: usize, count: usize, current_page: &mut usize) {
     ui.horizontal(|ui| {
         if ui
-            .add_enabled(page > 0, egui::Button::new("\u{25c0}"))
+            .add_enabled(page > 0, egui::Button::new("\u{23f4}"))
             .clicked()
         {
             *current_page = page.saturating_sub(1);
         }
         ui.label(format!("{} / {}", page + 1, count));
         if ui
-            .add_enabled(page + 1 < count, egui::Button::new("\u{25b6}"))
+            .add_enabled(page + 1 < count, egui::Button::new("\u{23f5}"))
             .clicked()
         {
             *current_page = page + 1;

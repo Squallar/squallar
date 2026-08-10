@@ -672,7 +672,7 @@ fn region_hint_text(centre: crate::pane::GeoPoint, half_width_km: f64) -> Option
     let region = crate::pane::VolumeRegion::new(centre, half_width_km)?;
     let cells = rustdar_radar::voxel::default_shape().nx;
     Some(match region.resolution_km(cells) {
-        Some(km) => format!("{:.0} km · {km:.2} km/cell", 2.0 * region.half_width_km()),
+        Some(km) => format!("{:.0} km - {km:.2} km/cell", 2.0 * region.half_width_km()),
         None => format!("{:.0} km", 2.0 * region.half_width_km()),
     })
 }
@@ -1968,7 +1968,7 @@ mod tests {
         assert_eq!(
             text,
             format!(
-                "{:.0} km · {:.2} km/cell",
+                "{:.0} km - {:.2} km/cell",
                 2.0 * max,
                 2.0 * max / cells as f64,
             ),

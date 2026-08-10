@@ -60,7 +60,7 @@ impl OverlayHandler for RadarHandler {
     fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
         vec![ControlItem::Toggle {
             id: "enabled",
-            label: "\u{1f6f0}  Radar".to_string(),
+            label: "Radar".to_string(),
             enabled: self.enabled,
         }]
     }

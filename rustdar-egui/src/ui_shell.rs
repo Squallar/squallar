@@ -310,7 +310,7 @@ impl super::Gui {
 }
 
 /// The Radar row's status line: what picture this pane's radar layer is —
-/// product code and tilt, e.g. `REF · 0.5°`.
+/// product code and tilt, e.g. `REF - 0.5°`.
 ///
 /// The tilt is the *snapped* angle where a scan is loaded — the one the pane
 /// is actually rendering — falling back to the raw selection before any scan
@@ -325,7 +325,7 @@ fn radar_row_status(pane: &PaneState) -> Option<String> {
         .get_rendering_params()
         .unwrap_or((pane.selected_product, pane.selected_elevation));
     Some(format!(
-        "{} \u{b7} {tilt:.1}\u{b0}",
+        "{} - {tilt:.1}\u{b0}",
         product.code().to_uppercase()
     ))
 }

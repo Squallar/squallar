@@ -75,10 +75,14 @@ mod statusbar;
 mod timeline;
 #[cfg(test)]
 pub(crate) use timeline::TimelineProbe;
-#[path = "ui_pills.rs"]
-mod pills;
 #[path = "ui_topbar.rs"]
 mod topbar;
+/// The top bar's layout floor — margins plus one interact row — for the M8
+/// breathing-room pin.
+#[cfg(test)]
+pub(crate) use topbar::MIN_BAR_HEIGHT;
+#[path = "ui_pills.rs"]
+mod pills;
 /// What a pane's own top-left content leaves clear for its pill row — read
 /// by the section pane's layout and the 3D pane's caption.
 pub(crate) use pills::PILL_ROW_CLEARANCE;
@@ -529,6 +533,22 @@ pub struct Gui {
     /// stopping at the call site.
     #[cfg(test)]
     last_map_excluded_rects: Vec<egui::Rect>,
+    /// The pane borders the last frame painted: pane index, the stroke's
+    /// painted bounds, and whether it was the active highlight. Only read by
+    /// tests — the M8 pin that every border lies inside its pane, at every
+    /// grid position (the outside-stroke bug clipped the outer edges away).
+    #[cfg(test)]
+    last_pane_borders: Vec<(usize, egui::Rect, bool)>,
+    /// The section tracks the last frame painted over map panes: map pane,
+    /// section pane, and the painted A and B endpoints. Only read by tests —
+    /// the M8 pin that the release frame of a handle drag paints the dropped
+    /// geometry, never the stale pre-drag line.
+    #[cfg(test)]
+    last_section_tracks: Vec<(usize, usize, egui::Pos2, egui::Pos2)>,
+    /// The Volume Alpha corner buttons the last frame drew, per pane. Only
+    /// read by tests — the M8 pin that the fade hides pane-borne chrome too.
+    #[cfg(test)]
+    last_alpha_buttons: Vec<(usize, egui::Rect)>,
     /// What the last frame's status bar actually drew. Only read by tests.
     #[cfg(test)]
     last_status_bar: StatusBarProbe,
@@ -789,9 +809,15 @@ pub struct Gui {
     /// back to the resting position every frame; the commit happens once, on
     /// release — see `render_timeline_scrubber`.
     timeline_scrub: Option<f32>,
-    /// Whether the floating status bar is collapsed to its ◧ restore button.
+    /// Whether the floating status bar is collapsed to its ⏵ restore button.
     /// Session-only, on the same precedent as the timeline's collapse.
     statusbar_collapsed: bool,
+    /// The floating status bar's rect as drawn this frame, `None` while no
+    /// bar is on screen (Compact, or fully faded). Written by
+    /// `render_status_bar` before the timeline pass reads it: the collapsed
+    /// time chip anchors above the bar's real top edge rather than a guessed
+    /// constant (the M8 chip-overlap fix).
+    statusbar_rect: Option<egui::Rect>,
     /// Whether the Add-layer catalog is open. Session-only, like every other
     /// open-surface flag; opened by the stack's two `+ Add layer` buttons and
     /// closed by applying a tile, the `✕`, the backdrop, or
@@ -1162,8 +1188,11 @@ impl ControlProbe {
 pub(crate) const NON_MAP_LAYERS_NOTE: &str = "Map layers apply to map panes.";
 
 /// The header over the section pane's sidebar block. Icon, two spaces, name —
-/// the same shape as the loop transport's and the overlay rows' labels.
-pub(crate) const SECTION_SIDEBAR_HEADER: &str = "\u{2702}  Cross-section";
+/// the same shape as the loop transport's and the overlay rows' labels. The
+/// icon is the top bar's own X-sec diagonal (`∕`): the demo's `✂` has no
+/// glyph in egui's bundled fonts (see `ui_glyphs.rs`), and sharing the arm
+/// toggle's glyph teaches which mode draws this pane's line.
+pub(crate) const SECTION_SIDEBAR_HEADER: &str = "\u{2215}  Cross-section";
 
 /// The identity line every pane kind's sidebar opens with: whose data this
 /// pane shows and what the pane is, e.g. `KTLX · 3D volume`.
@@ -1184,16 +1213,7 @@ fn render_pane_identity(ui: &mut egui::Ui, pane: &PaneState) {
         crate::pane::PaneKind::CrossSection => "Cross-section",
         crate::pane::PaneKind::Volume => "3D volume",
     };
-    ui.label(egui::RichText::new(format!("{} \u{b7} {}", pane.site, kind)).strong());
-}
-
-/// The explained absence of the layer list, in the position the list holds on
-/// a map pane and in [`ControlItem::InfoText`]'s own style — see
-/// [`NON_MAP_LAYERS_NOTE`] for why absence rather than disabled controls.
-fn render_non_map_layers_note(ui: &mut egui::Ui) {
-    ui.add_space(6.0);
-    ui.separator();
-    ui.label(egui::RichText::new(NON_MAP_LAYERS_NOTE).small().weak());
+    ui.label(egui::RichText::new(format!("{} - {}", pane.site, kind)).strong());
 }
 
 /// Render a single declarative [`ControlItem`] into the UI, collecting any
@@ -1449,6 +1469,12 @@ impl Gui {
             #[cfg(test)]
             last_map_excluded_rects: Vec::new(),
             #[cfg(test)]
+            last_pane_borders: Vec::new(),
+            #[cfg(test)]
+            last_section_tracks: Vec::new(),
+            #[cfg(test)]
+            last_alpha_buttons: Vec::new(),
+            #[cfg(test)]
             last_status_bar: StatusBarProbe::default(),
             #[cfg(test)]
             last_timeline: TimelineProbe::default(),
@@ -1500,6 +1526,7 @@ impl Gui {
             timeline_row2: false,
             timeline_scrub: None,
             statusbar_collapsed: false,
+            statusbar_rect: None,
             catalog_open: false,
             catalog_query: String::new(),
             catalog_save_name: String::new(),
@@ -1569,6 +1596,12 @@ impl Gui {
             // Same reason as the line above: a per-frame record of the pane
             // loop, so a leftover entry would report a 3D arm that did not run.
             self.last_volume_arms.clear();
+            // Per-frame paint records of the pane loop, on the same terms:
+            // the borders, the section tracks and the Volume Alpha corner
+            // buttons are all re-painted (or legitimately absent) each frame.
+            self.last_pane_borders.clear();
+            self.last_section_tracks.clear();
+            self.last_alpha_buttons.clear();
             // Cleared like the rest: the picker redraws from the top bar every
             // frame, and appending over a stale list would report every button
             // twice.
@@ -2338,10 +2371,9 @@ impl Gui {
                 Some(line) => {
                     // The ends are named A and B because that is what the map
                     // paints at them; the length is the same haversine the
-                    // hover readout uses rather than a second copy of it. An
-                    // en dash, not an arrow: U+2192 has no glyph in the app's
-                    // font and renders as tofu, where the volume caption's
-                    // "0–59 kft MSL" shows the dash rendering fine.
+                    // hover readout uses rather than a second copy of it.
+                    // ASCII prose throughout — the M8 glyph rules in
+                    // `ui_glyphs.rs`.
                     let (_, km) = rustdar_radar::beam::site_bearing_range_km(
                         line.a().lat,
                         line.a().lon,
@@ -2350,7 +2382,7 @@ impl Gui {
                     );
                     let unit = self.preferences.distance;
                     ui.label(format!(
-                        "A \u{2013} B: {:.0} {}",
+                        "A - B: {:.0} {}",
                         unit.convert_from_km(km),
                         unit.suffix()
                     ));
@@ -2361,7 +2393,7 @@ impl Gui {
             }
             ui.label(
                 egui::RichText::new(format!(
-                    "Aim it: turn on \u{201c}{}\u{201d} and drag across a map.",
+                    "Aim it: turn on \"{}\" and drag across a map.",
                     ui_menu::DRAW_CROSS_SECTION_LABEL
                 ))
                 .small()
@@ -3398,6 +3430,26 @@ impl Gui {
     #[cfg(test)]
     pub(crate) fn volume_arms_for_test(&self) -> &[VolumeArmProbe] {
         &self.last_volume_arms
+    }
+
+    /// The pane borders the last frame painted: pane index, the stroke's
+    /// painted bounds, and whether it was the active highlight.
+    #[cfg(test)]
+    pub(crate) fn pane_borders_for_test(&self) -> &[(usize, egui::Rect, bool)] {
+        &self.last_pane_borders
+    }
+
+    /// The section tracks the last frame painted: map pane, section pane,
+    /// and the painted A and B endpoints.
+    #[cfg(test)]
+    pub(crate) fn section_tracks_for_test(&self) -> &[(usize, usize, egui::Pos2, egui::Pos2)] {
+        &self.last_section_tracks
+    }
+
+    /// The Volume Alpha corner buttons the last frame drew, per pane.
+    #[cfg(test)]
+    pub(crate) fn alpha_buttons_for_test(&self) -> &[(usize, egui::Rect)] {
+        &self.last_alpha_buttons
     }
 
     /// Whether pane `idx` is a pane the **plan-view** pipeline must skip: it

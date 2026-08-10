@@ -150,7 +150,7 @@ impl OverlayItem for MetarItem {
         let title = if ob.name == ob.station_id {
             ob.station_id.clone()
         } else {
-            format!("{} — {}", ob.station_id, ob.name)
+            format!("{} - {}", ob.station_id, ob.name)
         };
 
         PopupContent {
@@ -355,9 +355,9 @@ impl OverlayHandler for MetarHandler {
     fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
         let count = self.state.data.len();
         let label = if count == 0 {
-            "\u{1f321}  METAR".to_string()
+            "METAR".to_string()
         } else {
-            format!("\u{1f321}  METAR ({count})")
+            format!("METAR ({count})")
         };
 
         let mut items = vec![ControlItem::Toggle {
@@ -370,14 +370,14 @@ impl OverlayHandler for MetarHandler {
             items.push(ControlItem::ButtonRow {
                 buttons: vec![ControlButton {
                     id: "refresh",
-                    label: "\u{1f504} Refresh".into(),
+                    label: "\u{21bb} Refresh".into(),
                     enabled: !self.state.fetching,
                     highlight: false,
                 }],
             });
             if self.state.fetching {
                 items.push(ControlItem::InfoText {
-                    text: "Fetching\u{2026}".into(),
+                    text: "Fetching...".into(),
                 });
             }
             if let Some(t) = self.state.fetch_time {

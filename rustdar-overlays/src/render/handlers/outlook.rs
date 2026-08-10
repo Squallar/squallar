@@ -173,7 +173,7 @@ impl OverlayHandler for SpcOutlookHandler {
         }
     }
 
-    /// E.g. `"Day 1 · Categorical, Tornado"`. The products are named in the
+    /// E.g. `"Day 1 - Categorical, Tornado"`. The products are named in the
     /// day's own publication order, not the `HashSet`'s, so the line cannot
     /// jitter between frames.
     fn status_line(&self) -> Option<String> {
@@ -187,11 +187,7 @@ impl OverlayHandler for SpcOutlookHandler {
             .filter(|p| self.enabled_products.contains(p))
             .map(|p| p.to_string())
             .collect();
-        Some(format!(
-            "{} \u{b7} {}",
-            self.selected_day,
-            products.join(", ")
-        ))
+        Some(format!("{} - {}", self.selected_day, products.join(", ")))
     }
 
     fn data_generation(&self) -> u64 {
@@ -342,7 +338,7 @@ impl OverlayHandler for SpcOutlookHandler {
 
     fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
         let mut items = vec![ControlItem::Heading {
-            text: "\u{26c8}  SPC Outlooks".into(),
+            text: "SPC Outlooks".into(),
         }];
 
         let buttons: Vec<ControlButton> = OutlookDay::all()
@@ -388,14 +384,14 @@ impl OverlayHandler for SpcOutlookHandler {
             items.push(ControlItem::ButtonRow {
                 buttons: vec![ControlButton {
                     id: "refresh",
-                    label: "\u{1f504} Refresh".into(),
+                    label: "\u{21bb} Refresh".into(),
                     enabled: !self.state.fetching,
                     highlight: false,
                 }],
             });
             if self.state.fetching {
                 items.push(ControlItem::InfoText {
-                    text: "Fetching\u{2026}".into(),
+                    text: "Fetching...".into(),
                 });
             }
         }
@@ -633,7 +629,7 @@ mod tests {
         handler.enabled_products.insert(OutlookProduct::Categorical);
         assert_eq!(
             handler.status_line().as_deref(),
-            Some("Day 1 \u{b7} Categorical, Tornado"),
+            Some("Day 1 - Categorical, Tornado"),
             "publication order, not set-iteration order"
         );
     }

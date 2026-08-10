@@ -183,7 +183,7 @@ impl OverlayHandler for NwsAlertHandler {
         }
     }
 
-    /// E.g. `"3 shown · W/Wa/Adv"`: how many alerts would draw, and which
+    /// E.g. `"3 shown - W/Wa/Adv"`: how many alerts would draw, and which
     /// categories are letting them. Counted directly rather than through
     /// `clickable_items`, which clones every feature polygon per call.
     fn status_line(&self) -> Option<String> {
@@ -209,7 +209,7 @@ impl OverlayHandler for NwsAlertHandler {
                 cats.push(short);
             }
         }
-        Some(format!("{shown} shown \u{b7} {}", cats.join("/")))
+        Some(format!("{shown} shown - {}", cats.join("/")))
     }
 
     fn data_generation(&self) -> u64 {
@@ -379,11 +379,11 @@ impl OverlayHandler for NwsAlertHandler {
     fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
         let mut items = vec![
             ControlItem::Heading {
-                text: "\u{26a0}  NWS Alerts".into(),
+                text: "NWS Alerts".into(),
             },
             ControlItem::Toggle {
                 id: "warnings",
-                label: "\u{26a0}  Warnings".into(),
+                label: "Warnings".into(),
                 enabled: self.enabled_categories.contains(&AlertCategory::Warning),
             },
             ControlItem::Toggle {
@@ -402,14 +402,14 @@ impl OverlayHandler for NwsAlertHandler {
             items.push(ControlItem::ButtonRow {
                 buttons: vec![ControlButton {
                     id: "refresh",
-                    label: "\u{1f504} Refresh".into(),
+                    label: "\u{21bb} Refresh".into(),
                     enabled: !self.state.fetching,
                     highlight: false,
                 }],
             });
             if self.state.fetching {
                 items.push(ControlItem::InfoText {
-                    text: "Fetching\u{2026}".into(),
+                    text: "Fetching...".into(),
                 });
             }
             if self.has_data() {
@@ -605,21 +605,18 @@ mod tests {
             alert("a", "Tornado Warning"),
             alert("b", "Severe Thunderstorm Warning"),
         ]);
-        assert_eq!(
-            handler.status_line().as_deref(),
-            Some("2 shown \u{b7} W/Wa/Adv")
-        );
+        assert_eq!(handler.status_line().as_deref(), Some("2 shown - W/Wa/Adv"));
 
         handler.hidden_alerts.insert("b".to_string());
         assert_eq!(
             handler.status_line().as_deref(),
-            Some("1 shown \u{b7} W/Wa/Adv"),
+            Some("1 shown - W/Wa/Adv"),
             "a hidden alert is not shown, so it must not be counted as shown"
         );
 
         handler.enabled_categories.remove(&AlertCategory::Advisory);
         handler.enabled_categories.remove(&AlertCategory::Watch);
-        assert_eq!(handler.status_line().as_deref(), Some("1 shown \u{b7} W"));
+        assert_eq!(handler.status_line().as_deref(), Some("1 shown - W"));
 
         handler.enabled_categories.clear();
         assert_eq!(

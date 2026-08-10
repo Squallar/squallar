@@ -235,7 +235,7 @@ pub async fn fetch_current_metars(
 
     if rejected_total > 0 {
         log::warn!(
-            "METAR: {rejected_total} present-but-unparseable cell(s) — a schema \
+            "METAR: {rejected_total} present-but-unparseable cell(s) - a schema \
              or unit change upstream?"
         );
     }

@@ -58,7 +58,7 @@ impl OverlayHandler for UserLocationHandler {
     fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
         vec![ControlItem::Toggle {
             id: "enabled",
-            label: "\u{1f4cd}  My Location".to_string(),
+            label: "My Location".to_string(),
             enabled: self.enabled,
         }]
     }

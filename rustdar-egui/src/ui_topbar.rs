@@ -15,8 +15,8 @@
 //! widths, and the Layers toggle is the one way the layers panel opens and
 //! closes there.
 //!
-//! The phone form (plan §1.2) is minimal: wordmark · ◧ collapse · scan chip ·
-//! (spacer) · icon-only ⬚ and ╱ arms. The menu, Layers, Pane and App routes
+//! The phone form (plan §1.2) is minimal: wordmark · ⏴ collapse · scan chip ·
+//! (spacer) · icon-only ⛶ and ∕ arms. The menu, Layers, Pane and App routes
 //! live in the bottom bar (`ui_sheet.rs`), and the pane segments in the
 //! sheet's Layers page header — this bar keeps only what has nowhere else
 //! honest to be: the identity, the scan at a glance, and the two modes whose
@@ -47,13 +47,20 @@ use crate::actions::GuiAction;
 /// The app-menu button's glyph — the whole menu lives behind it.
 const MENU_BUTTON_LABEL: &str = "\u{2630}";
 /// The layers-panel toggle. Selected-state styled while the panel is open.
-const LAYERS_TOGGLE_LABEL: &str = "\u{25a4} Layers";
+/// `▣`, not the demo's `▤`: every icon char here is drawn from the inventory
+/// `ui_glyphs.rs` verifies against egui's bundled fonts, and `▤` has no glyph
+/// in them — it shipped as a tofu box.
+const LAYERS_TOGGLE_LABEL: &str = "\u{25a3} Layers";
 /// The 3D-region arm toggle. The label names the subject; the menu entry of
 /// the same mode ([`ui_menu::REGION_ARM_LABEL`]) carries the longer teaching
-/// phrase — a bar has room for a word, a menu for a sentence.
-const REGION_TOGGLE_LABEL: &str = "\u{2b1a} Region";
-/// The cross-section arm toggle, on the same terms as the region one.
-const SECTION_TOGGLE_LABEL: &str = "\u{2571} X-sec";
+/// phrase — a bar has room for a word, a menu for a sentence. `⛶` (a carried
+/// selection-corners glyph) rather than the demo's uncarried `⬚`, and the
+/// same glyph heads the inspector's 3D block: the drag this arms is how that
+/// view is aimed.
+const REGION_TOGGLE_LABEL: &str = "\u{26f6} Region";
+/// The cross-section arm toggle, on the same terms as the region one. `∕`
+/// (division slash — a carried diagonal) rather than the uncarried `╱`.
+const SECTION_TOGGLE_LABEL: &str = "\u{2215} X-sec";
 /// The inspector toggle. Selected-state styled while the inspector is open —
 /// the mirror of [`LAYERS_TOGGLE_LABEL`] for the right-hand panel.
 const INSPECTOR_TOGGLE_LABEL: &str = "\u{2699} Inspector";
@@ -74,6 +81,20 @@ const TIGHT_BUTTON_PADDING: f32 = 2.0;
 /// own `spacing`.
 const SEPARATOR_WIDTH: f32 = 6.0;
 
+/// The bar's vertical inner margin, each side. The stock panel frame's 2 pt
+/// left the bar a cramped strip (the first-run finding); this is layout, not
+/// theme — the frame keeps the stock panel fill and stroke.
+const VERTICAL_MARGIN: i8 = 7;
+/// The interact height the bar's widgets lay out at — a comfortable button
+/// height in place of egui's 18 pt default, for the same finding. Width is
+/// egui's own default; only the height changes.
+const INTERACT_HEIGHT: f32 = 26.0;
+/// What the two constants above promise together: the bar can never be
+/// thinner than the margins plus one interact row. The height pin asserts
+/// this floor at every width, so the breathing room cannot regress.
+#[cfg(test)]
+pub(crate) const MIN_BAR_HEIGHT: f32 = 2.0 * VERTICAL_MARGIN as f32 + INTERACT_HEIGHT;
+
 impl super::Gui {
     /// Draw the top bar. Runs before anything else claims space, and before
     /// any `mem::take` window opens — which is what lets the menu model read
@@ -92,7 +113,19 @@ impl super::Gui {
         #[cfg(test)]
         let mut probe = super::TopBarProbe::default();
 
-        let panel = egui::Panel::top("top_bar").show(ui, |ui| {
+        // The stock panel frame with a real vertical margin, and a taller
+        // interact height for everything in the bar — the first-run fix for a
+        // bar that read as a cramped strip. Layout only: fill, stroke and
+        // fonts are the stock theme's.
+        let frame =
+            egui::Frame::side_top_panel(&ui.ctx().global_style()).inner_margin(egui::Margin {
+                left: 8,
+                right: 8,
+                top: VERTICAL_MARGIN,
+                bottom: VERTICAL_MARGIN,
+            });
+        let panel = egui::Panel::top("top_bar").frame(frame).show(ui, |ui| {
+            ui.spacing_mut().interact_size.y = INTERACT_HEIGHT;
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = ROOMY_ITEM_SPACING;
 
@@ -182,12 +215,12 @@ impl super::Gui {
         }
     }
 
-    /// The phone bar's run (plan §1.2): wordmark · ◧ collapse · live scan
-    /// summary chip · (spacer) · icon-only ╱ and ⬚ arms. No pane segments,
+    /// The phone bar's run (plan §1.2): wordmark · ⏴ collapse · live scan
+    /// summary chip · (spacer) · icon-only ∕ and ⛶ arms. No pane segments,
     /// no Layers or Inspector toggles, no ☰ — the bottom bar owns those
     /// routes down here, and the sheet's Layers page carries the segments.
     ///
-    /// The ◧ shares [`Gui::statusbar_collapsed`](super::Gui) with the status
+    /// The collapse shares [`Gui::statusbar_collapsed`](super::Gui) with the status
     /// bar the wider widths draw: the phone has no separate status bar, so
     /// the one collapse state applies to the bar that carries the scan text
     /// (§1.6, contract 75). Collapsed, only the wordmark and the restore
@@ -214,11 +247,11 @@ impl super::Gui {
         let collapsed = self.statusbar_collapsed;
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if !collapsed {
-                // First added is rightmost: ╱ at the edge, then ⬚, reading
-                // left-to-right as ⬚ · ╱ — the wide bar's own order.
+                // First added is rightmost: ∕ at the edge, then ⛶, reading
+                // left-to-right as ⛶ · ∕ — the wide bar's own order.
                 let armed = self.section_draw_armed();
                 let section = ui
-                    .selectable_label(armed, "\u{2571}")
+                    .selectable_label(armed, "\u{2215}")
                     .on_hover_text("Draw cross-section");
                 #[cfg(test)]
                 {
@@ -238,7 +271,7 @@ impl super::Gui {
 
                 let armed = self.region_arm;
                 let region = ui
-                    .selectable_label(armed, "\u{2b1a}")
+                    .selectable_label(armed, "\u{26f6}")
                     .on_hover_text("Pick 3D region");
                 #[cfg(test)]
                 {
@@ -256,13 +289,17 @@ impl super::Gui {
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 render_wordmark(ui);
 
-                let collapse =
-                    ui.button(super::statusbar::COLLAPSE_LABEL)
-                        .on_hover_text(if collapsed {
-                            "Restore the top bar"
-                        } else {
-                            "Collapse the top bar"
-                        });
+                let collapse = ui
+                    .button(if collapsed {
+                        super::statusbar::RESTORE_LABEL
+                    } else {
+                        super::statusbar::COLLAPSE_LABEL
+                    })
+                    .on_hover_text(if collapsed {
+                        "Restore the top bar"
+                    } else {
+                        "Collapse the top bar"
+                    });
                 #[cfg(test)]
                 {
                     probe.collapse = collapse.rect;
@@ -288,11 +325,11 @@ impl super::Gui {
                     // The readout is the one unbounded string on this bar,
                     // and a `Label` in a horizontal run extends rather than
                     // wraps — across the ⬚/╱ toggles laid out before it.
-                    // The module note's overlap rule applies here as it does
-                    // to the wide run, in its truncation form: cap the
-                    // readout at the width the toggles left, so however long
-                    // the value grows the arms stay unobscured and
-                    // clickable.
+                    // The module note's overlap rule applies here as it
+                    // does to the wide run, in its truncation form: cap
+                    // the readout at the width the arm toggles left, so
+                    // however long the value grows the arms stay
+                    // unobscured and clickable.
                     ui.scope(|ui| {
                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                         super::statusbar::render_hover_info(ui, self.panes());
@@ -306,21 +343,24 @@ impl super::Gui {
         });
     }
 
-    /// The scan chip's text: site · time · ⚡ live / ⏪ archive — the short
-    /// form the compact status bar carried before the phone shell, with the
-    /// posture glyph in place of the room it does not have. The time is the
-    /// user's own timezone preference, exactly as the status bar prints it —
-    /// no hardcoded `Z` suffix claiming UTC at a setting that may not be.
+    /// The scan chip's text: site, time and a ⏺ live / ⏸ archive posture
+    /// glyph — the short form the compact status bar carried before the
+    /// phone shell, with the posture glyph in place of the room it does not
+    /// have. `⏺`/`⏸` are the timeline's own live and paused glyphs (the
+    /// demo's `⚡`/`⏪` have no glyph in egui's bundled fonts). The time is
+    /// the user's own timezone preference, exactly as the status bar prints
+    /// it — no hardcoded `Z` suffix claiming UTC at a setting that may not
+    /// be.
     fn phone_scan_summary(&self) -> String {
         let pane = self.active_pane();
         let posture = if pane.viewing_live {
-            "\u{26a1}"
+            "\u{23fa}"
         } else {
-            "\u{23ea}"
+            "\u{23f8}"
         };
         match &pane.scan_info {
             Some(info) => format!(
-                "{} \u{b7} {} \u{b7} {posture}",
+                "{} - {} {posture}",
                 info.site.name,
                 self.preferences
                     .timezone

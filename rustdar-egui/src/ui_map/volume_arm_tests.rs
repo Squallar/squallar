@@ -646,7 +646,7 @@ fn the_height_the_pane_reports_is_real_at_every_exaggeration() {
             .unwrap_or_else(|| panic!("no height line at {ex}x in {lines:?}"))
             .clone();
         assert!(
-            height.starts_with("0–59 kft MSL"),
+            height.starts_with("0-59 kft MSL"),
             "the height must be the box's true extent, not the drawn one: {height:?}",
         );
         assert!(
@@ -656,7 +656,7 @@ fn the_height_the_pane_reports_is_real_at_every_exaggeration() {
         seen.push(height);
     }
     assert_eq!(
-        seen.iter().filter(|h| h.starts_with("0–59")).count(),
+        seen.iter().filter(|h| h.starts_with("0-59")).count(),
         3,
         "every setting must report the same real height: {seen:?}",
     );

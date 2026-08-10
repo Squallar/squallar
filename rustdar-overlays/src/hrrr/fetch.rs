@@ -206,7 +206,7 @@ fn check_point_count(computed: usize, declared: usize) -> Result<(), String> {
 fn exactly_one_submessage(count: usize) -> Result<(), String> {
     if count != 1 {
         return Err(format!(
-            "expected exactly one GRIB2 submessage, found {count} — the byte \
+            "expected exactly one GRIB2 submessage, found {count} - the byte \
              range does not delimit a single record",
         ));
     }

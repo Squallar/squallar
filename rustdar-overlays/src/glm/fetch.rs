@@ -999,7 +999,7 @@ fn warn_missing_variable_once(name: &'static str) {
     warn_once(
         missing_variable_key(name),
         &format!(
-            "GLM: variable '{name}' is absent from the L2 LCFA file — the product \
+            "GLM: variable '{name}' is absent from the L2 LCFA file - the product \
              schema has changed and this field can no longer be read"
         ),
     );
@@ -1137,7 +1137,7 @@ fn unit_multiplier(
             &format!(
                 "GLM {sat}: {name} declares units {units:?}, which rustdar cannot convert \
              to {canonical}; reporting the field as unknown. This is an upstream \
-             product change — the conversion table in `glm::fetch` needs the new \
+             product change - the conversion table in `glm::fetch` needs the new \
              spelling."
             ),
         );

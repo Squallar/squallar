@@ -11,8 +11,8 @@
 //! state, the scan summary, the data age, the hover readout and the
 //! right-aligned error. Two things changed with the float:
 //!
-//! * A `◧` collapse button leads the row. Collapsed, the bar shrinks to just
-//!   that button, left-anchored, so the map's bottom edge is clear.
+//! * A `⏴` collapse button leads the row. Collapsed, the bar shrinks to just
+//!   a `⏵` restore button, left-anchored, so the map's bottom edge is clear.
 //! * The auto-poll **checkbox** became a display **chip**. A floating bar
 //!   reads more than it is worked, and the toggle itself still lives where
 //!   every other toggle lives — the ☰ menu's Auto-poll entry — so nothing
@@ -37,9 +37,13 @@ use super::{PaneState, fade};
 /// The bar's inset from the map's left, right and bottom edges.
 const BAR_INSET: f32 = 8.0;
 
-/// The collapse/restore button's glyph. `pub(super)` because the phone top
-/// bar shares both the state and the button that flips it (contract 75).
-pub(super) const COLLAPSE_LABEL: &str = "\u{25e7}";
+/// The collapse button's glyph: the bar shrinks leftward to just a button.
+/// `⏴`/`⏵` rather than the demo's `◧`, which egui's bundled fonts do not
+/// carry (see `ui_glyphs.rs`). `pub(super)` because the phone top bar shares
+/// both the state and the button that flips it (contract 75).
+pub(super) const COLLAPSE_LABEL: &str = "\u{23f4}";
+/// The restore button's glyph — the collapse's mirror, on the same terms.
+pub(super) const RESTORE_LABEL: &str = "\u{23f5}";
 
 impl super::Gui {
     /// The status bar along the bottom, floating over the map — on the two
@@ -58,6 +62,10 @@ impl super::Gui {
         map_rect: egui::Rect,
         actions: &mut Vec<GuiAction>,
     ) {
+        // Written for the absences below too: the collapsed time chip anchors
+        // above this rect (`ui_timeline.rs`), and a stale rect from a wider
+        // or unfaded frame would hold the chip up over open map.
+        self.statusbar_rect = None;
         if self.layout.width == WidthClass::Compact {
             // The probe is written even for the absence: a stale report from
             // a wider frame would claim a bar that is not on screen.
@@ -123,7 +131,7 @@ impl super::Gui {
                         // is still in flight.
                         fade::dim(ui, restore_factor);
                         let restore = ui
-                            .button(COLLAPSE_LABEL)
+                            .button(RESTORE_LABEL)
                             .on_hover_text("Restore the status bar");
                         #[cfg(test)]
                         {
@@ -157,7 +165,7 @@ impl super::Gui {
 
                         let refresh_button = ui.add_enabled(
                             !self.radar.fetching,
-                            egui::Button::new("\u{1f504}").frame(false),
+                            egui::Button::new("\u{21bb}").frame(false),
                         );
                         #[cfg(test)]
                         {
@@ -263,6 +271,11 @@ impl super::Gui {
                 });
             });
 
+        // The bar's real rect this frame, for the collapsed time chip to
+        // anchor above (`ui_timeline.rs` — the chip must never overlay this
+        // bar). The chip draws later the same frame, so the rect is current.
+        self.statusbar_rect = Some(area.response.rect);
+
         #[cfg(test)]
         {
             probe.rect = area.response.rect;
@@ -309,7 +322,7 @@ fn render_auto_poll_status(
     chunks: &super::ChunkFeedStatus,
 ) -> Option<(egui::Rect, String)> {
     if fetching {
-        ui.label("\u{1f504}");
+        ui.label("\u{21bb}");
         ui.label("Downloading");
         ui.spinner();
         return None;
@@ -326,17 +339,19 @@ fn render_auto_poll_status(
         // assembled while the user's own tilt is still minutes old — and it is
         // operator jargon besides. The archive countdown is left out because
         // that poll is suppressed while a feed runs, so showing it would be a
-        // countdown to something that will not fire.
+        // countdown to something that will not fire. `⏺` is the timeline's own
+        // live glyph (the demo's `⚡` has no glyph in the bundled fonts), and
+        // the retired state leads with a plain `!` on the same grounds.
         match chunks.tilt {
             Some(tilt) => format!(
-                "\u{26a1} Live - {:.1}\u{b0} {}",
+                "\u{23fa} Live - {:.1}\u{b0} {}",
                 tilt.elevation,
                 describe_age(tilt.data_age_secs)
             ),
-            None => "\u{26a1} Live - waiting for this tilt".to_owned(),
+            None => "\u{23fa} Live - waiting for this tilt".to_owned(),
         }
     } else if chunks.retired {
-        format!("\u{26a0} Live - real-time unavailable, {archive}")
+        format!("! Live - real-time unavailable, {archive}")
     } else if !auto_poll.enabled {
         "\u{23f8} Auto-poll off".to_owned()
     } else {
@@ -459,7 +474,7 @@ pub(super) fn render_hover_info(ui: &mut egui::Ui, panes: &[PaneState]) {
     let hover_info = panes.iter().find_map(|p| p.hover_value.as_ref());
     let overlay_hover = panes.iter().find_map(|p| p.overlay_hover_value.as_ref());
     if hover_info.is_some() || overlay_hover.is_some() {
-        ui.label("\u{1f4cd}");
+        ui.label("\u{2316}");
         if let Some(info) = hover_info {
             ui.label(info);
         }
@@ -473,7 +488,7 @@ pub(super) fn render_hover_info(ui: &mut egui::Ui, panes: &[PaneState]) {
 
 /// `pub(super)` because the phone shell's error toast (`ui_sheet.rs`) hosts
 /// the same dismissable body — the phone has no status bar row to carry it.
-/// Returns the ✕'s rect while an error is up, for the toast's probe.
+/// Returns the ×'s rect while an error is up, for the toast's probe.
 pub(super) fn render_error_display(
     ui: &mut egui::Ui,
     error_message: &mut Option<String>,
@@ -481,13 +496,12 @@ pub(super) fn render_error_display(
     let mut dismiss = false;
     let mut close = None;
     if let Some(msg) = error_message.as_deref() {
-        let button = ui.button("\u{2715}");
+        let button = ui.button("\u{d7}");
         if button.clicked() {
             dismiss = true;
         }
         close = Some(button.rect);
         ui.label(msg);
-        ui.label("\u{274c}");
     }
     if dismiss {
         *error_message = None;

@@ -47,13 +47,13 @@ const CATALOG_WIDTH: f32 = 520.0;
 /// modal stays inside the content rect.
 const HEADER_ALLOWANCE: f32 = 160.0;
 
-/// The close button's glyph — the same ✕ the inspector's deselect uses.
-const CLOSE_LABEL: &str = "\u{2715}";
+/// The close button's glyph — the same × the inspector's deselect uses.
+const CLOSE_LABEL: &str = "\u{d7}";
 
 /// The save tile's label. Drawn only while the search box is empty: the
 /// search is for *finding* tiles, and a save offer matching the query "save"
 /// would be the one tile that is not a result.
-const SAVE_TILE_LABEL: &str = "\u{ff0b} Save current view\u{2026}";
+const SAVE_TILE_LABEL: &str = "+ Save current view...";
 
 /// One saved multi-pane setup (plan §3.11): how many panes, what each shows,
 /// and which overlays the layout runs with.
@@ -194,7 +194,7 @@ pub(crate) struct CatalogTileProbe {
     pub group: CatalogGroup,
     pub label: String,
     pub rect: egui::Rect,
-    /// The ✕ delete button beside a *user* preset tile — `None` on every
+    /// The × delete button beside a *user* preset tile — `None` on every
     /// other tile, built-ins included: deleting a compiled-in preset is not
     /// on offer.
     pub delete: Option<egui::Rect>,
@@ -210,7 +210,7 @@ pub(crate) struct CatalogProbe {
     pub rect: egui::Rect,
     /// The search field.
     pub search: egui::Rect,
-    /// The ✕ close button.
+    /// The × close button.
     pub close: egui::Rect,
     /// The "Save current view…" tile — [`egui::Rect::NOTHING`] while the
     /// search hides it.
@@ -528,7 +528,7 @@ impl super::Gui {
                     .on_hover_text(preset_hover(preset));
                 let remove = ui
                     .add(egui::Button::new(egui::RichText::new(CLOSE_LABEL).small()).frame(false))
-                    .on_hover_text(format!("Delete \u{201c}{}\u{201d}", preset.name));
+                    .on_hover_text(format!("Delete \"{}\"", preset.name));
                 #[cfg(test)]
                 probe.tiles.push(CatalogTileProbe {
                     group: CatalogGroup::Presets,
@@ -610,7 +610,7 @@ impl super::Gui {
             if shadows_builtin {
                 ui.label(
                     egui::RichText::new(format!(
-                        "\u{201c}{name}\u{201d} is a built-in preset \u{2014} pick another name"
+                        "\"{name}\" is a built-in preset - pick another name"
                     ))
                     .small()
                     .weak(),
@@ -781,6 +781,6 @@ fn preset_hover(preset: &PresetConfig) -> String {
         "{} pane{}: {}",
         preset.pane_count,
         if preset.pane_count == 1 { "" } else { "s" },
-        products.join(" \u{b7} ")
+        products.join(" - ")
     )
 }

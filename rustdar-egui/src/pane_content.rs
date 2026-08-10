@@ -505,7 +505,7 @@ impl SectionUnavailable {
             // once any volume has landed, a section cuts instantly from the
             // merged current volume and this state is never seen again.
             Self::AwaitingVolume => {
-                "Downloading this site's first volume — the section appears the moment it lands"
+                "Downloading this site's first volume - the section appears the moment it lands"
                     .to_owned()
             }
             Self::AwaitingCoveragePattern => {
@@ -514,13 +514,13 @@ impl SectionUnavailable {
                     .to_owned()
             }
             Self::ProductHasNoVerticalStructure(product) => format!(
-                "{} has no vertical structure to slice — pick a moment the radar measures \
+                "{} has no vertical structure to slice - pick a moment the radar measures \
                  tilt by tilt",
                 product.name()
             ),
             Self::RenderFailed => "The cross-section could not be cut from this volume".to_owned(),
             Self::ProductMissingFromVolume(product) => format!(
-                "This volume carries no {} to cut \u{2014} the section appears as soon as one \
+                "This volume carries no {} to cut - the section appears as soon as one \
                  that does arrives. Storm-relative velocity also needs a motion vector, from \
                  the volume's own winds or the override.",
                 product.name()

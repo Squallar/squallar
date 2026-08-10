@@ -64,7 +64,7 @@ impl OverlayItem for GlmFlashItem {
         }
 
         let sections = vec![
-            PopupSection::Text(format!("{time_str} — {}", f.satellite.display_name())),
+            PopupSection::Text(format!("{time_str} - {}", f.satellite.display_name())),
             PopupSection::KeyValueGrid(grid),
         ];
 
@@ -245,7 +245,7 @@ impl GlmHandler {
             if !known {
                 log::warn!(
                     "GLM: the {} layer from {} stopped parsing while the granules \
-                     themselves are fine — that layer is now empty on the map, the \
+                     themselves are fine - that layer is now empty on the map, the \
                      others are unaffected. First error: {}",
                     failure.level.display_name(),
                     failure.satellite.display_name(),
@@ -269,7 +269,7 @@ impl GlmHandler {
                 .any(|&(s, l)| s == previous.satellite && l == previous.level);
             if looked {
                 log::info!(
-                    "GLM: the {} layer from {} is parsing again — recovered",
+                    "GLM: the {} layer from {} is parsing again - recovered",
                     previous.level.display_name(),
                     previous.satellite.display_name(),
                 );
@@ -295,7 +295,7 @@ impl GlmHandler {
                 .any(|d| d.satellite == feed.satellite)
             {
                 log::warn!(
-                    "GLM: {} feed is dead — bucket '{}' returned no objects at all under \
+                    "GLM: {} feed is dead - bucket '{}' returned no objects at all under \
                      prefixes [{}]. Not a quiet sky: the files themselves are absent \
                      (satellite rotated out of this slot?).",
                     feed.satellite.display_name(),
@@ -316,7 +316,7 @@ impl GlmHandler {
             }
             if queried.contains(&previous.satellite) {
                 log::info!(
-                    "GLM: {} feed recovered — bucket '{}' is returning objects again",
+                    "GLM: {} feed recovered - bucket '{}' is returning objects again",
                     previous.satellite.display_name(),
                     previous.bucket,
                 );
@@ -350,7 +350,7 @@ impl GlmHandler {
         if health != state.health {
             match (&failures, health) {
                 (Some(f), FailureHealth::Total) => log::warn!(
-                    "GLM: all {} files in the window {} ({}) — the map is blank despite a \
+                    "GLM: all {} files in the window {} ({}) - the map is blank despite a \
                      healthy S3 listing. First error: {}",
                     f.in_window,
                     kind.noun(),
@@ -366,7 +366,7 @@ impl GlmHandler {
                 ),
                 (_, FailureHealth::Ok) => {
                     log::info!(
-                        "GLM: files {} again — recovered",
+                        "GLM: files {} again - recovered",
                         match kind {
                             FailureKind::Parse => "are parsing",
                             FailureKind::Transport => "are downloading",
@@ -432,7 +432,7 @@ impl OverlayHandler for GlmHandler {
             return None;
         }
         Some(format!(
-            "{} flashes \u{b7} {:.0} min",
+            "{} flashes - {:.0} min",
             self.state.data.len(),
             self.time_window_secs / SECS_PER_MIN,
         ))
@@ -582,9 +582,9 @@ impl OverlayHandler for GlmHandler {
     fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
         let count = self.state.data.len();
         let label = if count == 0 {
-            "\u{26a1}  GLM Lightning".to_string()
+            "GLM Lightning".to_string()
         } else {
-            format!("\u{26a1}  GLM Lightning ({count})")
+            format!("GLM Lightning ({count})")
         };
 
         let mut items = vec![ControlItem::Toggle {
@@ -637,7 +637,7 @@ impl OverlayHandler for GlmHandler {
             items.push(ControlItem::ButtonRow {
                 buttons: vec![ControlButton {
                     id: "refresh",
-                    label: "\u{1f504} Refresh".into(),
+                    label: "\u{21bb} Refresh".into(),
                     enabled: !self.state.fetching,
                     highlight: false,
                 }],
@@ -645,7 +645,7 @@ impl OverlayHandler for GlmHandler {
 
             if self.state.fetching {
                 items.push(ControlItem::InfoText {
-                    text: "Fetching\u{2026}".into(),
+                    text: "Fetching...".into(),
                 });
             }
             if let Some(t) = self.state.fetch_time {
@@ -674,7 +674,7 @@ impl OverlayHandler for GlmHandler {
             {
                 items.push(ControlItem::InfoText {
                     text: format!(
-                        "\u{26a0} No data from {}: bucket '{}' is empty",
+                        "! No data from {}: bucket '{}' is empty",
                         feed.satellite.display_name(),
                         feed.bucket,
                     ),
@@ -695,18 +695,13 @@ impl OverlayHandler for GlmHandler {
                 let Some(f) = &state.detail else { continue };
                 let text = if f.is_total() {
                     format!(
-                        "\u{26a0} All {} files in the window {} ({})",
+                        "! All {} files in the window {} ({})",
                         f.in_window,
                         kind.noun(),
                         kind.total_hint(),
                     )
                 } else {
-                    format!(
-                        "\u{26a0} {}/{} files {}",
-                        f.failed,
-                        f.in_window,
-                        kind.noun(),
-                    )
+                    format!("! {}/{} files {}", f.failed, f.in_window, kind.noun(),)
                 };
                 items.push(ControlItem::InfoText { text });
             }
@@ -728,7 +723,7 @@ impl OverlayHandler for GlmHandler {
             {
                 items.push(ControlItem::InfoText {
                     text: format!(
-                        "\u{26a0} {} unavailable from {} (product change?)",
+                        "! {} unavailable from {} (product change?)",
                         failure.level.display_name(),
                         failure.satellite.display_name(),
                     ),

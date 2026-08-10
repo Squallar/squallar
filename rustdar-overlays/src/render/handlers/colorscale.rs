@@ -59,7 +59,7 @@ impl OverlayHandler for ColorScaleHandler {
     fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
         vec![ControlItem::Toggle {
             id: "enabled",
-            label: "\u{1f3a8}  Color Scale".to_string(),
+            label: "Color Scale".to_string(),
             enabled: self.enabled,
         }]
     }

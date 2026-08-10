@@ -282,9 +282,9 @@ impl OverlayHandler for SpcDiscussionHandler {
     fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
         let count = self.state.data.len();
         let label = if count == 0 {
-            "\u{1f4cb}  Mesoscale Disc.".to_string()
+            "Mesoscale Disc.".to_string()
         } else {
-            format!("\u{1f4cb}  Mesoscale Disc. ({count})")
+            format!("Mesoscale Disc. ({count})")
         };
 
         let mut items = vec![ControlItem::Toggle {
@@ -297,14 +297,14 @@ impl OverlayHandler for SpcDiscussionHandler {
             items.push(ControlItem::ButtonRow {
                 buttons: vec![ControlButton {
                     id: "refresh",
-                    label: "\u{1f504} Refresh".into(),
+                    label: "\u{21bb} Refresh".into(),
                     enabled: !self.state.fetching,
                     highlight: false,
                 }],
             });
             if self.state.fetching {
                 items.push(ControlItem::InfoText {
-                    text: "Fetching\u{2026}".into(),
+                    text: "Fetching...".into(),
                 });
             }
             if let Some(t) = self.state.fetch_time {

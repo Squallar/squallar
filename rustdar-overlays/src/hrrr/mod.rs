@@ -148,7 +148,7 @@ impl ModelParameter {
             ModelParameter::Dewpoint2m => "DPT",
             ModelParameter::Visibility => "VIS",
             ModelParameter::BulkShear6km => {
-                panic!("BulkShear6km is composite — use composite_parts()")
+                panic!("BulkShear6km is composite - use composite_parts()")
             }
         }
     }
@@ -180,7 +180,7 @@ impl ModelParameter {
             ModelParameter::PrecipitableWater => "entire atmosphere (considered as a single layer)",
             ModelParameter::Temperature2m | ModelParameter::Dewpoint2m => "2 m above ground",
             ModelParameter::BulkShear6km => {
-                panic!("BulkShear6km is composite — use composite_parts()")
+                panic!("BulkShear6km is composite - use composite_parts()")
             }
         }
     }
@@ -1074,14 +1074,14 @@ impl HrrrGridData {
         }
         let name = self.parameter.short_name();
         Some(match self.value_range {
-            None => format!("\u{26a0} {name}: no usable values in the grid"),
+            None => format!("! {name}: no usable values in the grid"),
             Some((lo, hi)) if lo == hi => format!(
-                "\u{26a0} {name} is uniformly {} across all {} points - nothing to draw",
+                "! {name} is uniformly {} across all {} points - nothing to draw",
                 self.parameter.format_magnitude(lo),
                 self.values.len(),
             ),
             Some((lo, hi)) => format!(
-                "\u{26a0} {name} never reaches the lowest colour threshold (range {} to {}) - nothing to draw",
+                "! {name} never reaches the lowest colour threshold (range {} to {}) - nothing to draw",
                 self.parameter.format_magnitude(lo),
                 self.parameter.format_magnitude(hi),
             ),

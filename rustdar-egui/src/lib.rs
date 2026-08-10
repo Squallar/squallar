@@ -20,6 +20,11 @@ mod input_harness;
 #[cfg(test)]
 mod parity_walk;
 
+/// The chrome's glyph inventory and the coverage tests over egui's bundled
+/// fonts — test-only, because the inventory exists to be asserted against.
+#[cfg(test)]
+mod ui_glyphs;
+
 pub const DEFAULT_NOTIFIER_ENDPOINT: &str = "wss://nexrad-aws-notifier.mcswain.dev";
 
 pub use ui::{ChunkFeedStatus, CurrentVolumeStamp, Gui, StormMotionOverride, TiltFreshness};

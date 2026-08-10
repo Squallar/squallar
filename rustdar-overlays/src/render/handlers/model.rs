@@ -214,15 +214,12 @@ impl OverlayHandler for ModelDataHandler {
         // with the run time alone reads as an analysis valid now.
         let label = match grid {
             Some(g) if g.forecast_hour > 0 => format!(
-                "\u{1f321}\u{fe0f}  Model Data ({} F{:02})",
+                "Model Data ({} F{:02})",
                 g.valid_time().format("%H:%Mz"),
                 g.forecast_hour,
             ),
-            Some(g) => format!(
-                "\u{1f321}\u{fe0f}  Model Data ({})",
-                g.ref_time.format("%H:%Mz")
-            ),
-            None => "\u{1f321}\u{fe0f}  Model Data".to_string(),
+            Some(g) => format!("Model Data ({})", g.ref_time.format("%H:%Mz")),
+            None => "Model Data".to_string(),
         };
 
         let mut items = vec![ControlItem::Toggle {
@@ -245,7 +242,7 @@ impl OverlayHandler for ModelDataHandler {
             items.push(ControlItem::ButtonRow {
                 buttons: vec![ControlButton {
                     id: "refresh",
-                    label: "\u{1f504} Refresh".into(),
+                    label: "\u{21bb} Refresh".into(),
                     enabled: !self.state.fetching,
                     highlight: false,
                 }],
@@ -253,7 +250,7 @@ impl OverlayHandler for ModelDataHandler {
 
             if self.state.fetching {
                 items.push(ControlItem::InfoText {
-                    text: "Fetching\u{2026}".into(),
+                    text: "Fetching...".into(),
                 });
             }
             if let Some(t) = self.state.fetch_time {
@@ -270,7 +267,7 @@ impl OverlayHandler for ModelDataHandler {
             // nothing. Neither reads as "broken".
             if let Some(err) = &self.last_error {
                 items.push(ControlItem::InfoText {
-                    text: format!("\u{26a0} {err}"),
+                    text: format!("! {err}"),
                 });
             }
 
@@ -280,7 +277,7 @@ impl OverlayHandler for ModelDataHandler {
                 if grid.forecast_hour > 0 && self.selected_param.is_windowed() {
                     items.push(ControlItem::InfoText {
                         text: format!(
-                            "\u{2139} Maximum over {}\u{2013}{}, not an analysis field",
+                            "Maximum over {}-{}, not an analysis field",
                             grid.ref_time.format("%H:%Mz"),
                             grid.valid_time().format("%H:%Mz"),
                         ),

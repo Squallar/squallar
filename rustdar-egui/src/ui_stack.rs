@@ -13,7 +13,7 @@
 //!
 //! The rows walk the active pane's `draw_order` **reversed**, so the top row
 //! is drawn last — over everything — which is the reading the header's
-//! tooltip teaches. The ▲▼ buttons swap neighbours in that same `draw_order`,
+//! tooltip teaches. The ⏶⏷ buttons swap neighbours in that same `draw_order`,
 //! which closes a long-standing gap: the order has been persisted per pane
 //! since multi-pane landed, and this is the first UI that can change it.
 //!
@@ -56,20 +56,33 @@ pub(super) const STACK_BOTTOM_CLEARANCE: f32 = 88.0;
 /// of the bottom clearance band.
 const HEADER_ALLOWANCE: f32 = 40.0;
 
-/// The collapse button's glyph: the panel slides out to the left.
-const COLLAPSE_LABEL: &str = "\u{27e8}";
+/// The collapse button's glyph: the panel slides out to the left. `‹` rather
+/// than the demo's `⟨`, which egui's bundled fonts do not carry (see
+/// `ui_glyphs.rs`).
+const COLLAPSE_LABEL: &str = "\u{2039}";
 
 /// The Add-layer buttons' label — one button above the rows and one below
 /// (plan §1.3), both opening the catalog: the list can be taller than the
 /// panel, and "add" is wanted at whichever end the scroll left the user.
 const ADD_LAYER_LABEL: &str = "+ Add layer";
 
+/// The non-map body's route to where the pane's real controls live (plan
+/// §1.4): a pane with no map has no layer rows, and a panel that were only
+/// the explanatory caption read as broken — this button is the body's one
+/// action, and it opens the inspector on Pane properties.
+const PANE_PROPS_BUTTON_LABEL: &str = "Pane properties...";
+
+/// A row's minimum height — the whole row is the click target (the M8
+/// full-row fix), so it lays out at a comfortable hit height even when the
+/// handler offers no status line under the name.
+const MIN_ROW_HEIGHT: f32 = 28.0;
+
 /// The phone Layers page's helper caption (plan §1.3) — the demo's "same
 /// stack as desktop" one-liner, in this app's own words. Sheet host only:
 /// on the wider widths the panel *is* visibly the desktop's, and the line
 /// would restate the screen.
 const SHEET_HELPER_CAPTION: &str = "The same layer stack as on a desktop: \
-    rows select a layer, \u{1f441} hides it, \u{25b2}\u{25bc} set what draws \
+    rows select a layer, \u{1f441} hides it, \u{23f6}\u{23f7} set what draws \
     over what.";
 
 /// One row the stack actually drew, as it was drawn. Reported by the
@@ -80,16 +93,17 @@ const SHEET_HELPER_CAPTION: &str = "The same layer stack as on a desktop: \
 pub(crate) struct StackRowProbe {
     /// The layer this row is for.
     pub kind: OverlayKind,
-    /// The row's click target — the name (and status) block that selects the
-    /// layer in the inspector.
+    /// The row's click target — the **whole row**, full panel width (the M8
+    /// full-row fix): clicking anywhere on it that is not one of the buttons
+    /// below selects the layer in the inspector.
     pub rect: egui::Rect,
     /// The 👁 visibility eye.
     pub eye: egui::Rect,
     /// The enabled state the eye was drawn showing.
     pub eye_on: bool,
-    /// The ▲ reorder button, and whether it was enabled.
+    /// The ⏶ reorder button, and whether it was enabled.
     pub up: (egui::Rect, bool),
-    /// The ▼ reorder button, and whether it was enabled.
+    /// The ⏷ reorder button, and whether it was enabled.
     pub down: (egui::Rect, bool),
     /// The status line under the name, when the handler offered one.
     pub status_line: Option<String>,
@@ -109,7 +123,7 @@ pub(crate) struct StackProbe {
     /// The header title — a secondary route to Pane properties (the pills
     /// are the primary one).
     pub header: egui::Rect,
-    /// The ⟨ collapse button.
+    /// The ‹ collapse button.
     pub collapse: egui::Rect,
     /// Whether the stack was on screen this frame.
     pub open: bool,
@@ -120,6 +134,11 @@ pub(crate) struct StackProbe {
     pub add_bottom: egui::Rect,
     /// The rows, top row first — draw order reversed.
     pub rows: Vec<StackRowProbe>,
+    /// The non-map body's caption — [`egui::Rect::NOTHING`] on a map pane,
+    /// whose body is the rows above.
+    pub non_map_note: egui::Rect,
+    /// The non-map body's `Pane properties...` button, on the same terms.
+    pub props_button: egui::Rect,
 }
 
 #[cfg(test)]
@@ -133,6 +152,8 @@ impl Default for StackProbe {
             add_top: egui::Rect::NOTHING,
             add_bottom: egui::Rect::NOTHING,
             rows: Vec::new(),
+            non_map_note: egui::Rect::NOTHING,
+            props_button: egui::Rect::NOTHING,
         }
     }
 }
@@ -166,11 +187,7 @@ impl super::Gui {
         };
 
         // `Pane N (SITE)` reads off the taken pane — the live one.
-        let title = format!(
-            "Layers \u{2014} Pane {} ({})",
-            self.active_pane + 1,
-            pane.site
-        );
+        let title = format!("Layers - Pane {} ({})", self.active_pane + 1, pane.site);
 
         #[cfg(test)]
         let mut probe = StackProbe {
@@ -203,7 +220,7 @@ impl super::Gui {
                     }
                     ui.set_width(slot.width);
                     // The sheet host draws no header row: the sheet's title
-                    // row is the single header there (title + ✕), and the ⟨
+                    // row is the single header there (title + ×), and the ‹
                     // collapse would shadow the back-chain that already
                     // closes the page (§1.13's no-back-buttons rule; M7's
                     // sheet-header polish). The wider hosts keep both.
@@ -328,8 +345,29 @@ impl super::Gui {
         // panel used, for the same reason: a dozen disabled rows would bury
         // the fact that nothing here can apply. No Add-layer buttons either:
         // the catalog adds map layers, and this pane has no map to add to.
+        // What the body has instead (the M8 fix — a bare one-liner read as a
+        // broken panel): the explained absence as a padded caption, and the
+        // one action that *does* apply — the pane's own properties, where a
+        // 3D or section pane's real controls live.
         if !pane.is_map() {
-            super::render_non_map_layers_note(ui);
+            ui.add_space(6.0);
+            let note = ui.label(
+                egui::RichText::new(super::NON_MAP_LAYERS_NOTE)
+                    .small()
+                    .weak(),
+            );
+            ui.add_space(6.0);
+            let props = ui.button(PANE_PROPS_BUTTON_LABEL);
+            #[cfg(test)]
+            {
+                probe.non_map_note = note.rect;
+                probe.props_button = props.rect;
+            }
+            #[cfg(not(test))]
+            let _ = note;
+            if props.clicked() {
+                self.select_pane_props();
+            }
             return;
         }
 
@@ -362,126 +400,166 @@ impl super::Gui {
                     .find(|(k, _)| *k == kind)
                     .and_then(|(_, line)| line.clone());
 
-                ui.horizontal(|ui| {
-                    // The reorder pair, disabled at the ends.
-                    ui.vertical(|ui| {
+                // The whole row is the click target (the M8 full-row fix):
+                // the full panel width at a comfortable height, allocated
+                // with its own click sense **before** the row's buttons —
+                // egui resolves an overlap to the later registration, so the
+                // reorder pair and the eye, drawn after inside this rect,
+                // keep their own clicks by sitting on top. Sized from the
+                // real text styles so a themed font cannot clip the block.
+                let row_height = (ui.text_style_height(&egui::TextStyle::Body)
+                    + status
+                        .as_ref()
+                        .map_or(0.0, |_| ui.text_style_height(&egui::TextStyle::Small))
+                    + 6.0)
+                    .max(MIN_ROW_HEIGHT);
+                let (row_rect, row) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), row_height),
+                    egui::Sense::click(),
+                );
+
+                // Hover and selection read as the whole row, in the stock
+                // theme's own selectable visuals — painted first, so the
+                // content draws over the highlight.
+                if selected || row.hovered() || row.has_focus() {
+                    let visuals = ui.style().interact_selectable(&row, selected);
+                    ui.painter().rect(
+                        row_rect,
+                        visuals.corner_radius,
+                        visuals.weak_bg_fill,
+                        visuals.bg_stroke,
+                        egui::StrokeKind::Inside,
+                    );
+                }
+
+                let mut row_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(row_rect)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                let ui = &mut row_ui;
+
+                // The reorder pair, disabled at the ends.
+                let (up, down) = ui
+                    .vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
+                        // Sized to their small text, not the interact
+                        // height: two default-height buttons would outgrow
+                        // the row they sit in.
+                        ui.spacing_mut().interact_size.y = 0.0;
                         let up = ui.add_enabled(
                             row_idx > 0,
-                            egui::Button::new(egui::RichText::new("\u{25b2}").small()).frame(false),
+                            egui::Button::new(egui::RichText::new("\u{23f6}").small()).frame(false),
                         );
                         let down = ui.add_enabled(
                             row_idx < last,
-                            egui::Button::new(egui::RichText::new("\u{25bc}").small()).frame(false),
+                            egui::Button::new(egui::RichText::new("\u{23f7}").small()).frame(false),
+                        );
+                        (up, down)
+                    })
+                    .inner;
+                // Display row up = drawn later = towards the *end* of
+                // `draw_order`.
+                let n = order.len();
+                if up.clicked() {
+                    swap = Some((n - 1 - row_idx, n - row_idx));
+                }
+                if down.clicked() {
+                    swap = Some((n - 2 - row_idx, n - 1 - row_idx));
+                }
+
+                // The 👁 eye. Both halves through `write_pane_overlay`,
+                // on the *taken* pane — `set_active_pane_overlay` would
+                // write the placeholder in the vector.
+                let eye_text = if enabled {
+                    egui::RichText::new("\u{1f441}")
+                } else {
+                    egui::RichText::new("-").weak()
+                };
+                let eye = ui
+                    .add(
+                        egui::Button::new(eye_text)
+                            .frame(false)
+                            .min_size(egui::vec2(20.0, 0.0)),
+                    )
+                    .on_hover_text(if enabled {
+                        format!("Hide {name}")
+                    } else {
+                        format!("Show {name}")
+                    });
+                if eye.clicked() {
+                    // Both halves plus the enable-fetch rule, through the
+                    // one helper the inspector's Show toggle and the
+                    // catalog's tiles share.
+                    let idx = self.active_pane;
+                    self.set_pane_overlay_with_fetch(pane, idx, kind, !enabled, actions);
+                }
+
+                // A trailing `›` on the drawer and sheet hosts (plan §1.3):
+                // there a row click *pushes* the inspector over this list,
+                // and the chevron says so. The desktop sidebar, where the
+                // inspector opens beside the stack, carries none.
+                // Right-to-left so the chevron owns the edge and the name
+                // block takes what is left — the header's own device. The
+                // labels are explicitly non-selectable and carry no sense of
+                // their own: a click on the text *is* a click on the row.
+                #[cfg(test)]
+                let mut chevron_rect = None;
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if is_drawer {
+                        let chevron = ui.add(
+                            egui::Label::new(egui::RichText::new("\u{203a}").weak())
+                                .selectable(false),
                         );
                         #[cfg(test)]
                         {
-                            probe.rows.push(StackRowProbe {
-                                kind,
-                                rect: egui::Rect::NOTHING,
-                                eye: egui::Rect::NOTHING,
-                                eye_on: enabled,
-                                up: (up.rect, row_idx > 0),
-                                down: (down.rect, row_idx < last),
-                                status_line: status.clone(),
-                                selected,
-                                chevron: None,
-                            });
+                            chevron_rect = Some(chevron.rect);
                         }
-                        // Display row up = drawn later = towards the *end*
-                        // of `draw_order`.
-                        let n = order.len();
-                        if up.clicked() {
-                            swap = Some((n - 1 - row_idx, n - row_idx));
-                        }
-                        if down.clicked() {
-                            swap = Some((n - 2 - row_idx, n - 1 - row_idx));
-                        }
-                    });
+                        #[cfg(not(test))]
+                        let _ = chevron;
+                    }
 
-                    // The 👁 eye. Both halves through `write_pane_overlay`,
-                    // on the *taken* pane — `set_active_pane_overlay` would
-                    // write the placeholder in the vector.
-                    let eye_text = if enabled {
-                        egui::RichText::new("\u{1f441}")
-                    } else {
-                        egui::RichText::new("\u{2013}").weak()
-                    };
-                    let eye = ui
-                        .add(
-                            egui::Button::new(eye_text)
-                                .frame(false)
-                                .min_size(egui::vec2(20.0, 0.0)),
-                        )
-                        .on_hover_text(if enabled {
-                            format!("Hide {name}")
+                    // The name and status block. Hidden layers render
+                    // dimmed — weak text is the stock theme's own dimming.
+                    // The selection highlight is the row's, painted above.
+                    ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        let name_text = if enabled {
+                            egui::RichText::new(name.as_str())
                         } else {
-                            format!("Show {name}")
-                        });
-                    #[cfg(test)]
-                    if let Some(row) = probe.rows.last_mut() {
-                        row.eye = eye.rect;
-                    }
-                    if eye.clicked() {
-                        // Both halves plus the enable-fetch rule, through the
-                        // one helper the inspector's Show toggle and the
-                        // catalog's tiles share.
-                        let idx = self.active_pane;
-                        self.set_pane_overlay_with_fetch(pane, idx, kind, !enabled, actions);
-                    }
-
-                    // A trailing `›` on the drawer and sheet hosts (plan
-                    // §1.3): there a row click *pushes* the inspector over
-                    // this list, and the chevron says so. The desktop
-                    // sidebar, where the inspector opens beside the stack,
-                    // carries none. Right-to-left so the chevron owns the
-                    // edge and the name block takes what is left — the
-                    // header's own device.
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if is_drawer {
-                            let chevron = ui.label(egui::RichText::new("\u{203a}").weak());
-                            #[cfg(test)]
-                            if let Some(row) = probe.rows.last_mut() {
-                                row.chevron = Some(chevron.rect);
-                            }
-                            #[cfg(not(test))]
-                            let _ = chevron;
+                            egui::RichText::new(name.as_str()).weak()
+                        };
+                        ui.add(egui::Label::new(name_text).selectable(false).truncate());
+                        if let Some(line) = &status {
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(line.as_str()).small().weak())
+                                    .selectable(false)
+                                    .truncate(),
+                            );
                         }
-
-                        // The name and status block: the row's click target.
-                        // Hidden layers render dimmed — weak text is the
-                        // stock theme's own dimming.
-                        ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
-                            ui.spacing_mut().item_spacing.y = 0.0;
-                            let name_text = if enabled {
-                                egui::RichText::new(name.as_str())
-                            } else {
-                                egui::RichText::new(name.as_str()).weak()
-                            };
-                            let select = ui.selectable_label(selected, name_text);
-                            let mut target = select.rect;
-                            if let Some(line) = &status {
-                                let drawn =
-                                    ui.label(egui::RichText::new(line.as_str()).small().weak());
-                                target = target.union(drawn.rect);
-                            }
-                            #[cfg(test)]
-                            if let Some(row) = probe.rows.last_mut() {
-                                row.rect = target;
-                            }
-                            #[cfg(not(test))]
-                            let _ = target;
-                            if select.clicked() {
-                                // The inspector opens over or beside
-                                // this list per host; the list stays
-                                // open beneath either way — the M3-era
-                                // rule that closed the Compact drawer
-                                // died with the slide-over it served.
-                                self.select_layer(kind);
-                            }
-                        });
                     });
                 });
+
+                #[cfg(test)]
+                probe.rows.push(StackRowProbe {
+                    kind,
+                    rect: row_rect,
+                    eye: eye.rect,
+                    eye_on: enabled,
+                    up: (up.rect, row_idx > 0),
+                    down: (down.rect, row_idx < last),
+                    status_line: status.clone(),
+                    selected,
+                    chevron: chevron_rect,
+                });
+
+                if row.clicked() {
+                    // The inspector opens over or beside this list per host;
+                    // the list stays open beneath either way — the M3-era
+                    // rule that closed the Compact drawer died with the
+                    // slide-over it served.
+                    self.select_layer(kind);
+                }
             });
         }
 
