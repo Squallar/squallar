@@ -16,6 +16,7 @@
         "egui",
         "egui-winit",
         "egui-wgpu",
+        "naga",
         "walkers",
         "wgpu"
       ]
