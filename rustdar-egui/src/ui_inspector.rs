@@ -155,9 +155,14 @@ impl super::Gui {
             .fixed_pos(slot.pos)
             .show(ctx, |ui| {
                 frame.show(ui, |ui| {
+                    super::fade::dim(ui, slot.opacity);
+                    if !slot.interactive {
+                        ui.disable();
+                    }
                     ui.set_width(slot.width);
                     self.render_inspector_crumb(
                         ui,
+                        slot.sheet,
                         #[cfg(test)]
                         &mut probe,
                     );
@@ -242,26 +247,34 @@ impl super::Gui {
     }
 
     /// The crumb row: where the body's subject is named, and where it is
-    /// changed.
+    /// changed. The crumb draws in every host — it is the selection, not a
+    /// header — but the ⟩ collapse hides in the sheet host, where the
+    /// sheet's own ✕ and the back-chain already close the page and a second
+    /// close control would be a back button by another name (§1.13; M7's
+    /// sheet-header polish). The crumb's ✕-deselect stays everywhere: it
+    /// changes the selection, not the navigation.
     fn render_inspector_crumb(
         &mut self,
         ui: &mut egui::Ui,
+        sheet: bool,
         #[cfg(test)] probe: &mut InspectorProbe,
     ) {
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let collapse = ui
-                    .button(COLLAPSE_LABEL)
-                    .on_hover_text("Collapse the inspector");
-                #[cfg(test)]
-                {
-                    probe.collapse = collapse.rect;
-                }
-                if collapse.clicked() {
-                    // A collapse is not a deselection: the selection stays,
-                    // so reopening returns to it. Escape resets — see
-                    // `dismiss_top_layer`.
-                    self.insp_open = false;
+                if !sheet {
+                    let collapse = ui
+                        .button(COLLAPSE_LABEL)
+                        .on_hover_text("Collapse the inspector");
+                    #[cfg(test)]
+                    {
+                        probe.collapse = collapse.rect;
+                    }
+                    if collapse.clicked() {
+                        // A collapse is not a deselection: the selection
+                        // stays, so reopening returns to it. Escape resets —
+                        // see `dismiss_top_layer`.
+                        self.insp_open = false;
+                    }
                 }
 
                 // Nothing to deselect on App › Settings — it is what

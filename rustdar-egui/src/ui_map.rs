@@ -146,10 +146,16 @@ impl super::Gui {
                 // Whether some feature consumed this frame's confirmed map
                 // click — an overlay polygon hit, a radar-site icon. One flag
                 // for the whole pane loop, threaded through `PaneRenderCtx`:
-                // M7's fade trigger is "an unconsumed click on the
+                // the fade trigger is "an unconsumed click on the
                 // already-active pane", and this is the consumption half of
-                // it. Nothing reads it yet beyond the probe.
+                // it (`ui_fade.rs`).
                 let mut click_consumed = false;
+                // ...and the rest of the fade sentence, recorded pane by pane
+                // below: a confirmed click on the already-active *map* pane
+                // that no dialog outranks. Folded with the consumption
+                // verdict after the loop — consumption is decided by the
+                // handlers that run after the candidate is spotted.
+                let mut fade_candidate = false;
 
                 // Rects of chrome painted over the map with no layer of its
                 // own. Clicks there must not become overlay polygon hit-tests.
@@ -222,9 +228,9 @@ impl super::Gui {
                     // PaneRenderCtx — never read raw click events via ctx.input() for
                     // map-level interactions, as that bypasses dialog blocking.
                     // And every handler that ACTS on overlay_click_pos MUST set
-                    // `*ctx.click_consumed = true` when it does, so M7's fade can
-                    // tell a click a feature answered from one that fell through
-                    // to the bare map. Current consumers: the overlay feature
+                    // `*ctx.click_consumed = true` when it does, so the fade
+                    // (`ui_fade.rs`) can tell a click a feature answered from one
+                    // that fell through to the bare map. Current consumers: the overlay feature
                     // hit-testing (where `selected_overlays` is pushed) and the
                     // radar-site icon clicks, both in `ui_map_pane.rs`.
                     //
@@ -332,6 +338,32 @@ impl super::Gui {
                         && self.section_handle_pressed(&ctx, pane_idx);
                     let suppress_pan =
                         pointer.suppress_pan || region_arm || section_editing || handle_press;
+
+                    // The fade gesture (plan §1.8, `ui_fade.rs`): a confirmed
+                    // click on the already-active map pane's own rect. The
+                    // resolvers upstream have already made it a *click* (drags
+                    // discarded) off every floating layer, and the armed
+                    // modes never deliver one (`region_arm` clears it above,
+                    // the armed-draw resolver never reports one) — the
+                    // remaining conditions are spelled here: the pane is
+                    // active and was active before this press
+                    // (`fade_gesture_allowed` checks the press record), the
+                    // click is inside this pane, no section-handle gesture
+                    // owns it, no feature popup was up to be dismissed by it
+                    // (`pointer_available`), and no dialog outranks it.
+                    // Map panes only: the fade is a gesture on the *map*
+                    // (§1.8's wording), and a click on a 3D or section pane
+                    // is that pane's own business.
+                    if is_active
+                        && pointer_available
+                        && matches!(pane.kind(), PaneKind::Map)
+                        && !section_editing
+                        && !handle_press
+                        && self.fade_gesture_allowed()
+                        && overlay_click_pos.is_some_and(|pos| pane_rect.contains(pos))
+                    {
+                        fade_candidate = true;
+                    }
 
                     // From the same locals that feed `PaneRenderCtx` and
                     // `drag_pan_buttons` below: after the gate, after
@@ -583,14 +615,12 @@ impl super::Gui {
                     }
                 } // end pane loop
 
-                // What the loop's consumers decided, for the harness — the
-                // fade itself is M7's.
-                #[cfg(test)]
-                {
-                    self.last_click_consumed = click_consumed;
-                }
-                #[cfg(not(test))]
-                let _ = click_consumed;
+                // What the loop's consumers decided, folded into the fade
+                // verdict: a click a feature answered is not a fade gesture,
+                // and the consumption flag itself is what a consumed click
+                // *while* faded unfades on (`Gui::apply_fade_toggle`).
+                self.click_consumed_frame = click_consumed;
+                self.fade_candidate = fade_candidate && !click_consumed;
 
                 // Handle divider dragging on a foreground layer so they
                 // take priority over map panning in the overlap zone.
@@ -1015,34 +1045,45 @@ impl super::Gui {
     /// this type, and because a click is the one path that turns the skew from a
     /// pane nobody updates into a crash.
     fn detect_active_pane_click(&mut self, ctx: &egui::Context, panel_rect: egui::Rect) {
-        let pane_count = self.visible_pane_count();
-        if pane_count <= 1 {
-            return;
-        }
-        if let Some(pos) = ctx.input(|i| {
+        let Some(pos) = ctx.input(|i| {
             if i.pointer.primary_pressed() {
                 i.pointer.interact_pos()
             } else {
                 None
             }
-        }) {
-            // Don't switch panes when the click lands on a floating dialog or popup.
-            if ctx
-                .layer_id_at(pos)
-                .is_some_and(|l| l.order > egui::Order::Background)
-            {
-                return;
-            }
-            for idx in 0..pane_count {
-                let rect = self.pane_layout.pane_rect(idx, panel_rect);
-                if rect.contains(pos) && idx != self.active_pane {
-                    self.active_pane = idx;
-                    // A pane switch ends a touch reveal: the revealed row
-                    // belonged to the pane the user has just left for
-                    // another.
-                    self.pill_revealed = None;
-                    break;
-                }
+        }) else {
+            return;
+        };
+        // A fresh press starts a fresh record: whether *this* press is the
+        // one that activates its pane, and whether it landed with a popup
+        // open, are what the fade trigger asks later, when the press has
+        // become a click (`ui_fade.rs` — the first click on an inactive pane
+        // only activates, and a click that dismissed a popover dismissed).
+        // The popup state must be read *now*: egui closes the popup on this
+        // very click, so by the confirm frame the evidence is gone.
+        self.press_switched_pane = false;
+        self.press_popup_open = egui::Popup::is_any_open(ctx);
+        // Don't switch panes when the click lands on a floating dialog or popup.
+        if ctx
+            .layer_id_at(pos)
+            .is_some_and(|l| l.order > egui::Order::Background)
+        {
+            return;
+        }
+        let pane_count = self.visible_pane_count();
+        if pane_count <= 1 {
+            return;
+        }
+        for idx in 0..pane_count {
+            let rect = self.pane_layout.pane_rect(idx, panel_rect);
+            if rect.contains(pos) && idx != self.active_pane {
+                self.active_pane = idx;
+                self.press_switched_pane = true;
+                // A pane switch ends a touch reveal: the revealed row
+                // belonged to the pane the user has just left for
+                // another.
+                self.pill_revealed = None;
+                break;
             }
         }
     }

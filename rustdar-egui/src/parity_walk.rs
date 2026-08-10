@@ -14,7 +14,10 @@
 //! the top bar's Layers toggle opens the layer stack — sidebar on Expanded,
 //! drawer elsewhere — each stack row opens its layer's options in the
 //! inspector, the ☰ button opens the one menu dropdown every width shares,
-//! and its Settings… entry opens the inspector's App › Settings body.
+//! its Settings… entry opens the inspector's App › Settings body, and the
+//! stack's `+ Add layer` opens the catalog — the modal above 600 pt, the
+//! sheet's Catalog page below it — whose every tile the walk scrolls on
+//! screen.
 //! `ScrollArea`s lay content out beyond the viewport, so an item is only
 //! counted once its probe's rect centre is inside the screen —
 //! [`InputHarness::scroll_until`] does the scrolling a user would.
@@ -33,11 +36,14 @@
 
 use crate::input_harness::InputHarness;
 use crate::ui::{
-    DrawnControlItem, DrawnControlKind, OVERLAY_CONTROL_ORDER, SETTINGS_ROWS, is_master_control,
+    CatalogGroup, DrawnControlItem, DrawnControlKind, OVERLAY_CONTROL_ORDER, SETTINGS_ROWS,
+    builtin_presets, is_master_control,
 };
 use crate::ui_layout::WidthClass;
+use rustdar_overlays::hrrr::ModelParameter;
 use rustdar_overlays::render::controls::ControlItem;
 use rustdar_overlays::render::overlay_state::OverlayKind;
+use rustdar_radar::types::RadarProduct;
 
 /// One wheel step of the walk's scrolling. Small enough that nothing can jump
 /// clean across the shortest screen under test between two frames.
@@ -322,6 +328,67 @@ fn walk_settings(h: &mut InputHarness, width: WidthClass) {
     }
 }
 
+/// Every catalog entry, drawn and reachable through each shell's own route —
+/// the modal above 600 pt, the sheet's Catalog page below it (M7's leg).
+///
+/// The inventories are the models the renderer itself draws from: the
+/// compiled-in presets table, `OverlayKind::all()` under the registry's
+/// display names, `RadarProduct::all()` and `ModelParameter::all()` — never a
+/// restated name list, so a new product or parameter joins the audit by
+/// construction. User presets are deliberately absent: a fresh session has
+/// none, and their tiles share the built-ins' code path. The user-preset
+/// tiles and the Save tile are instead covered by the dedicated preset suite
+/// (`a_saved_preset_appears_applies_and_deletes` and its neighbours), once
+/// rather than per width — they render inside the same host this walk just
+/// scrolled end to end, so a second per-width pass would re-walk the same
+/// code for no new claim.
+fn walk_catalog(h: &mut InputHarness, width: WidthClass) {
+    let mut inventory: Vec<(CatalogGroup, String)> = Vec::new();
+    for preset in builtin_presets() {
+        inventory.push((CatalogGroup::Presets, preset.name));
+    }
+    for &kind in OverlayKind::all() {
+        inventory.push((
+            CatalogGroup::Overlays,
+            h.overlay_display_name(kind).to_owned(),
+        ));
+    }
+    for product in RadarProduct::all() {
+        inventory.push((CatalogGroup::Products, product.name().to_owned()));
+    }
+    for param in ModelParameter::all() {
+        inventory.push((CatalogGroup::Hrrr, param.display_name().to_owned()));
+    }
+
+    h.open_catalog();
+    // Where the wheel points: the sheet on the phone, the modal elsewhere —
+    // each host's own scrolling surface.
+    let scroll_pos = if width == WidthClass::Compact {
+        h.sheet_rect()
+            .expect("the Catalog page is open, so the sheet has a rect")
+            .center()
+    } else {
+        h.catalog().rect.center()
+    };
+    for (group, label) in inventory {
+        let found = h.scroll_until(scroll_pos, SCROLL_STEP, MAX_SCROLL_STEPS, |h| {
+            h.catalog_tile(group, &label)
+                .is_some_and(|tile| h.screen_rect().contains(tile.rect.center()))
+        });
+        assert!(
+            found,
+            "catalog tile {label:?} ({group:?}) was never drawn on screen on \
+             {width:?} — the model offers it but the catalog never showed it"
+        );
+    }
+    // Closed again so the next phase's clicks cannot land on the host.
+    assert!(
+        h.gui_mut().dismiss_top_layer(),
+        "the catalog was open, so a back press must close it"
+    );
+    h.warm_up();
+}
+
 /// Every visible pane carries its pill row (M5): presence, at every width.
 /// Deliberately not a per-option leg — every option behind the pills is the
 /// inspector's own inventory through the shared pickers (`ui_pills.rs`'s
@@ -362,6 +429,7 @@ fn walk_every_option(size: egui::Vec2, expect: WidthClass) {
     walk_menu(&mut h, expect);
     walk_time_dialog(&mut h, expect);
     walk_settings(&mut h, expect);
+    walk_catalog(&mut h, expect);
     walk_pills(&mut h, expect);
 }
 

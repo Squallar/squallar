@@ -923,10 +923,16 @@ impl TouchGestures {
         self.double_tap.update(ctx, input, map_memory, pane_rect);
         let is_zoom_dragging = self.double_tap.is_zooming();
 
+        // Chrome-filtered like the tap below (§5.9): a long press is a map
+        // gesture — it raises the value tooltip — and a hold that starts on
+        // the floating timeline or a pill row is a hold on *that* control,
+        // not a request to read the field under it. The filter runs on the
+        // held position each frame, the same gate the click goes through,
+        // so the two gestures cannot disagree about what counts as chrome.
         let long_press_pos = if is_zoom_dragging {
             None
         } else {
-            self.long_press.update(input)
+            filter_dialog_blocked(ctx, self.long_press.update(input))
         };
 
         let overlay_click_pos = filter_dialog_blocked(ctx, self.double_tap.take_confirmed_tap());

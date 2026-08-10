@@ -32,7 +32,7 @@ use crate::ui_layout::{PointerModality, WidthClass};
 use rustdar_radar::types::ScanInfo;
 use rustdar_units::UserPreferences;
 
-use super::PaneState;
+use super::{PaneState, fade};
 
 /// The bar's inset from the map's left, right and bottom edges.
 const BAR_INSET: f32 = 8.0;
@@ -67,6 +67,36 @@ impl super::Gui {
             }
             return;
         }
+        // The fade (§1.8): a fully faded bar does not render at all — that
+        // absence is what makes it input-transparent — and a transitioning
+        // one draws dimmed and dead (`fade::dim`). The error display inside
+        // it goes with it; while fully faded the toast presentation carries
+        // the error instead (see `Gui::ui`).
+        let Some(fade) = self.chrome_fade() else {
+            #[cfg(test)]
+            {
+                self.last_status_bar = super::StatusBarProbe::default();
+            }
+            return;
+        };
+        // The collapse animates as a cross-form fade (§3.3): the full row
+        // dims out over the restore button rather than vanishing between two
+        // frames. Zero-time under test — see `ui_fade::anim_time`.
+        let expanded_factor = ctx.animate_bool_with_time(
+            egui::Id::new("statusbar_expanded"),
+            !self.statusbar_collapsed,
+            super::fade::anim_time(),
+        );
+        // The restore chip's incoming half — the timeline's two-factor shape,
+        // run in sequence rather than in parallel because one frame hosts
+        // both forms here: seeded at zero while the full row (or its remnant)
+        // is up, so the chip fades in from the frame the remnant clears
+        // instead of popping. Instant under test, like every factor.
+        let restore_factor = ctx.animate_bool_with_time(
+            egui::Id::new("statusbar_restore"),
+            expanded_factor <= 0.0,
+            super::fade::anim_time(),
+        );
         let has_hover = self.layout.modality == PointerModality::Mouse;
 
         #[cfg(test)]
@@ -85,10 +115,13 @@ impl super::Gui {
             ))
             .show(ctx, |ui| {
                 frame.show(ui, |ui| {
-                    if self.statusbar_collapsed {
+                    fade::dim(ui, fade);
+                    if expanded_factor <= 0.0 {
                         // The restore button alone, left-anchored: the whole
                         // point of collapsing is that the rest of the bottom
-                        // edge is map.
+                        // edge is map. Dimmed (and dead) while its own fade-in
+                        // is still in flight.
+                        fade::dim(ui, restore_factor);
                         let restore = ui
                             .button(COLLAPSE_LABEL)
                             .on_hover_text("Restore the status bar");
@@ -100,6 +133,11 @@ impl super::Gui {
                             self.statusbar_collapsed = false;
                         }
                         return;
+                    }
+                    if self.statusbar_collapsed {
+                        // The closing remnant: the full row, dimming out and
+                        // already dead — the collapse has happened in state.
+                        fade::dim(ui, expanded_factor.min(0.99));
                     }
 
                     ui.set_width(inner_width);

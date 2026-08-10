@@ -565,18 +565,28 @@ impl InputHarness {
             .map(|state| state.rect())
     }
 
-    /// Close the inspector the user's way — its own ⟩ collapse button, so the
-    /// selection survives for the next open. A no-op when it is closed.
+    /// Close the inspector the user's way — its own ⟩ collapse button on the
+    /// hosts that draw one. The sheet host draws none (M7's sheet-header
+    /// polish: the back-chain is the close there), so on Compact this walks
+    /// the same back press a phone user would; the page beneath survives
+    /// either way. A no-op when it is closed.
     pub(crate) fn close_inspector(&mut self) {
         let probe = self.inspector();
         if !probe.open {
             return;
         }
-        self.mouse_click(probe.collapse.center());
+        if probe.collapse == egui::Rect::NOTHING {
+            assert!(
+                self.gui.dismiss_top_layer(),
+                "the inspector page was open, so a back press must pop it"
+            );
+        } else {
+            self.mouse_click(probe.collapse.center());
+        }
         self.warm_up();
         assert!(
             !self.inspector().open,
-            "clicking \u{27e9} did not close the inspector"
+            "closing the inspector did not close it"
         );
     }
 
@@ -655,9 +665,15 @@ impl InputHarness {
     }
 
     /// Whether some feature consumed the last frame's map click — the
-    /// `click_consumed` probe M7's fade will stand on.
+    /// consumption half of the fade trigger.
     pub(crate) fn click_consumed(&self) -> bool {
         self.gui.click_consumed_for_test()
+    }
+
+    /// Whether the UI is faded (plan §1.8) — the state the fade contracts
+    /// assert beside the probes' drawn/not-drawn evidence.
+    pub(crate) fn faded(&self) -> bool {
+        self.gui.ui_faded_for_test()
     }
 
     /// What the last frame's Add-layer catalog drew.
@@ -918,6 +934,12 @@ impl InputHarness {
         self.last_texts
             .iter()
             .any(|(r, text)| rect.contains(r.center()) && text.contains(needle))
+    }
+
+    /// The display name the registry gives `kind` — what the stack rows and
+    /// the catalog's overlay tiles both print.
+    pub(crate) fn overlay_display_name(&self, kind: OverlayKind) -> &str {
+        self.gui.overlays.display_name(kind)
     }
 
     /// Whether the **live** active pane has `kind` on — the state the menu

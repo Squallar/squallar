@@ -93,6 +93,16 @@ pub(super) struct SurfaceSlot {
     /// way — which is what keeps the breakpoint id contract intact across
     /// the host switch.
     pub sheet: bool,
+    /// The opacity the host wants the surface painted at — `1.0` at rest,
+    /// less during a fade or a host's own transition. Anything below `1.0`
+    /// also disables the contents (`fade::dim`): a transitioning surface
+    /// must never catch a click.
+    pub opacity: f32,
+    /// Whether the surface may interact at all this frame — `false` for a
+    /// closing remnant the host is still animating out: its state says
+    /// closed, so its widgets must already be dead whatever the opacity
+    /// still shows.
+    pub interactive: bool,
 }
 
 /// What the shell produced this frame.
@@ -166,8 +176,33 @@ impl super::Gui {
             return;
         }
 
+        // The fade rule is total (§1.8): the fade closes both panels for
+        // real, so this gate is moot in the steady state — it exists for the
+        // fade-out transition, whose closing remnants dim with the rest of
+        // the chrome, and as the stated rule should anything ever render
+        // here while faded.
+        let Some(fade) = self.chrome_fade() else {
+            return;
+        };
+
+        // The slide animations (§3.3): each panel's open flag drives a
+        // factor, and a closing panel renders as a non-interactive remnant
+        // sliding off its own edge until the factor reaches zero. Under
+        // `cfg(test)` the time is zero and the factors snap — see
+        // `ui_fade::anim_time`.
         let stack_open = self.layers_panel_visible();
-        if !stack_open && !self.insp_open {
+        let insp_open = self.insp_open;
+        let stack_slide = ctx.animate_bool_with_time(
+            egui::Id::new("stack_slide"),
+            stack_open,
+            super::fade::anim_time(),
+        );
+        let insp_slide = ctx.animate_bool_with_time(
+            egui::Id::new("inspector_slide"),
+            insp_open,
+            super::fade::anim_time(),
+        );
+        if stack_slide <= 0.0 && insp_slide <= 0.0 {
             return;
         }
 
@@ -183,30 +218,39 @@ impl super::Gui {
             self.overlays.load_pane_configs(&pane.overlay_configs);
         }
 
-        let statuses: Vec<(OverlayKind, Option<String>)> = if stack_open {
+        let statuses: Vec<(OverlayKind, Option<String>)> = if stack_slide > 0.0 {
             self.stack_row_statuses(&pane)
         } else {
             Vec::new()
         };
 
-        if stack_open {
+        if stack_slide > 0.0 {
+            // Sliding out to the left: the whole panel's travel is its width
+            // plus both insets, so at factor zero nothing of it remains on
+            // the map.
+            let travel =
+                (1.0 - stack_slide) * (super::ui_stack::STACK_WIDTH + 2.0 * super::ui_stack::STACK_INSET);
             let slot = SurfaceSlot {
                 pos: map_rect.left_top()
-                    + egui::vec2(super::ui_stack::STACK_INSET, super::ui_stack::STACK_INSET),
+                    + egui::vec2(super::ui_stack::STACK_INSET - travel, super::ui_stack::STACK_INSET),
                 pivot: egui::Align2::LEFT_TOP,
                 width: super::ui_stack::STACK_WIDTH,
                 avail_height: map_rect.height()
                     - super::ui_stack::STACK_INSET
                     - super::ui_stack::STACK_BOTTOM_CLEARANCE,
                 sheet: false,
+                opacity: fade,
+                interactive: stack_open,
             };
             self.render_stack(ctx, slot, &mut pane, &statuses, actions);
         }
-        if self.insp_open {
+        if insp_slide > 0.0 {
+            let travel = (1.0 - insp_slide)
+                * (super::ui_inspector::INSPECTOR_WIDTH + 2.0 * super::ui_inspector::INSPECTOR_INSET);
             let slot = SurfaceSlot {
                 pos: map_rect.right_top()
                     + egui::vec2(
-                        -super::ui_inspector::INSPECTOR_INSET,
+                        -super::ui_inspector::INSPECTOR_INSET + travel,
                         super::ui_inspector::INSPECTOR_INSET,
                     ),
                 pivot: egui::Align2::RIGHT_TOP,
@@ -215,6 +259,8 @@ impl super::Gui {
                     - super::ui_inspector::INSPECTOR_INSET
                     - super::ui_inspector::INSPECTOR_BOTTOM_CLEARANCE,
                 sheet: false,
+                opacity: fade,
+                interactive: insp_open,
             };
             self.render_inspector(ctx, slot, &mut pane, actions);
         }

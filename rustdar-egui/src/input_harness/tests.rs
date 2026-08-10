@@ -1479,8 +1479,9 @@ fn the_mehs_colour_bar_paints_the_users_hail_size_unit() {
     }
 }
 
-/// 7. A tap that lands on a floating dialog is filtered out by the
-///    dialog-blocking gate — for both the mouse and the touch path.
+/// 53. A tap that lands on a floating dialog is filtered out by the
+///     dialog-blocking gate — for both the mouse and the touch path.
+///     (Renumbered from a colliding 7 — the gesture suite owns that block.)
 #[test]
 fn tap_on_floating_dialog_is_filtered_out() {
     let mut h = InputHarness::new();
@@ -1521,7 +1522,7 @@ fn tap_on_floating_dialog_is_filtered_out() {
     assert_eq!(clicked.mouse.overlay_click_pos, Some(pos));
 }
 
-/// 7b. A touch tap is deferred by 0.4s, so a dialog can open *during* the
+/// 53b. A touch tap is deferred by 0.4s, so a dialog can open *during* the
 ///     deferral. The tap was legitimately on the map when it happened, so
 ///     the detector's own on-release check passes it through, and only
 ///     `filter_dialog_blocked` can stop it from punching through the dialog
@@ -6632,8 +6633,8 @@ fn converting_a_pane_moves_no_widget_id() {
     );
 }
 
-/// 44. **The menu checkbox arms the draw, and a drag on a map becomes a
-///     section.**
+/// 54. **The menu checkbox arms the draw, and a drag on a map becomes a
+///     section.** (Renumbered from a colliding 44.)
 ///
 ///     Through the dropdown's own checkbox, which is where the mode is
 ///     armed and — just as importantly — where it is turned off again: a
@@ -6682,7 +6683,8 @@ fn the_menus_checkbox_arms_the_cross_section_draw() {
     );
 }
 
-/// 45. **An armed drag on a map becomes a section aimed where it was drawn.**
+/// 55. **An armed drag on a map becomes a section aimed where it was drawn.**
+///     (Renumbered from a colliding 45.)
 ///
 ///     Through the real pointer pipeline, `render_panes`' resolution and the
 ///     deferred apply.
@@ -6763,9 +6765,9 @@ fn an_armed_drag_on_a_map_becomes_a_cross_section_aimed_where_it_was_drawn() {
     );
 }
 
-/// 46. **A rendered section's caption is calm by default, and the honesty
+/// 56. **A rendered section's caption is calm by default, and the honesty
 ///     detail is one click away — reachable, in the user's words, and
-///     closable again.**
+///     closable again.** (Renumbered from a colliding 46.)
 ///
 ///     The redesign's whole contract, end to end. The old caption painted
 ///     the ladder warning and the registration caveat on every ordinary
@@ -7913,7 +7915,8 @@ fn arming_the_section_draw_clears_a_handle_drag_in_flight() {
     );
 }
 
-/// 46. **A tap while armed is discarded, and the mode stays armed.**
+/// 57. **A tap while armed is discarded, and the mode stays armed.**
+///     (Renumbered from a colliding 46.)
 ///
 ///     A stray tap is the single most likely thing to happen right after
 ///     arming — it is how a user checks which pane they are on. Turning it
@@ -7964,9 +7967,9 @@ fn a_tap_while_armed_draws_nothing_and_leaves_the_mode_armed() {
     );
 }
 
-/// 47. **While armed, a press on a map fires no overlay click and the map
+/// 58. **While armed, a press on a map fires no overlay click and the map
 ///     does not pan** — for every pane the frame resolves, not just the one
-///     the line is on.
+///     the line is on. (Renumbered from a colliding 47.)
 ///
 ///     `ArmedSectionFrame` makes both properties of the returned value
 ///     rather than rules each caller remembers, and this reads them back out
@@ -8011,7 +8014,8 @@ fn an_armed_press_suppresses_panning_and_fires_no_overlay_click() {
     h.frames_for(2, FRAME_DT);
 }
 
-/// 48. **A pane that is not a map ignores the armed mode entirely.**
+/// 59. **A pane that is not a map ignores the armed mode entirely.**
+///     (Renumbered from a colliding 48.)
 ///
 ///     A line is aimed with a projector and a section pane has none, so
 ///     arming the mode with one active leaves it exactly as it was — and in
@@ -9620,8 +9624,8 @@ fn the_armed_hint_chip_follows_the_active_map_pane() {
 /// **The `click_consumed` probe: a feature that answers a map click sets it;
 /// a click on bare map does not.**
 ///
-/// The consumption half of M7's fade trigger, plumbed now so every consumer
-/// inherits the convention — asserted through the radar-site icon, the
+/// The consumption half of the fade trigger (`ui_fade.rs`), plumbed so
+/// every consumer inherits the convention — asserted through the radar-site icon, the
 /// consumer a test can stage without overlay data.
 #[test]
 fn a_consumed_map_click_reports_itself_and_a_bare_one_does_not() {
@@ -10600,3 +10604,765 @@ fn arming_from_the_phone_top_bar_closes_the_open_sheet() {
     );
 }
 
+
+// ── The UI fade and the finalized Esc chain (M7) ─────────────────────
+
+/// Whether the floating chrome is on the glass, read off the probes the
+/// renderers write — the timeline and the status bar on the wide widths, the
+/// timeline and the bottom bar on the phone. One reader for every fade
+/// contract, so "faded" and "restored" are the same claim throughout.
+fn chrome_on_screen(h: &InputHarness) -> bool {
+    let timeline = h.timeline();
+    let timeline_drawn = timeline.rect != egui::Rect::NOTHING || timeline.collapsed;
+    if h.width_class() == crate::ui_layout::WidthClass::Compact {
+        timeline_drawn && h.bottom_bar().rect != egui::Rect::NOTHING
+    } else {
+        timeline_drawn && h.status_bar().rect != egui::Rect::NOTHING
+    }
+}
+
+/// 60. **A qualifying tap fades all the floating chrome; the second restores
+///     it; a drag, a consumed click and an armed tool do not fade.**
+///
+///     The trigger sentence of §1.8, condition by condition, on the width
+///     with the most chrome to lose. The qualifying click is a confirmed
+///     click (not a drag) on the already-active pane's bare map — no feature
+///     or site under it, no armed drag owning the gesture.
+#[test]
+fn a_qualifying_tap_fades_the_chrome_and_the_second_restores_it() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    let spot = h.map_center();
+    assert!(
+        chrome_on_screen(&h) && !h.pill_rows().is_empty(),
+        "precondition: the chrome is up"
+    );
+
+    // A drag does not fade: ≥ the click threshold of movement makes the
+    // gesture a pan, and a pan is map work.
+    h.mouse_press(spot);
+    for i in 1..=4 {
+        h.mouse_move(spot + egui::vec2(8.0 * i as f32, 0.0));
+        h.frame_after(FRAME_DT);
+    }
+    h.mouse_release(spot + egui::vec2(32.0, 0.0));
+    h.warm_up();
+    assert!(!h.faded() && chrome_on_screen(&h), "a drag must not fade");
+
+    // An armed tool does not fade: the click is the tool's (a discarded
+    // too-short gesture), whichever tool is armed.
+    h.set_section_draw_armed(true);
+    h.mouse_click(spot);
+    h.warm_up();
+    assert!(!h.faded() && chrome_on_screen(&h), "an armed draw must not fade");
+    h.set_section_draw_armed(false);
+    h.set_region_arm(true);
+    h.mouse_click(spot);
+    h.warm_up();
+    assert!(!h.faded() && chrome_on_screen(&h), "an armed region must not fade");
+    h.set_region_arm(false);
+
+    // A consumed click does not fade: the site icon answered it.
+    h.close_layers();
+    h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
+    h.warm_up();
+    let site_spot = egui::pos2(spot.x - 150.0, spot.y);
+    h.place_site_at(0, "KTLX", site_spot);
+    h.mouse_click(site_spot);
+    assert!(h.click_consumed(), "precondition: the icon took the click");
+    h.warm_up();
+    assert!(!h.faded() && chrome_on_screen(&h), "a consumed click must not fade");
+
+    // The qualifying tap fades everything floating; the docked top bar
+    // stays (contract 63 pins its half).
+    h.mouse_click(spot);
+    h.warm_up();
+    assert!(h.faded(), "the bare-map click must fade");
+    assert!(
+        h.timeline().rect == egui::Rect::NOTHING && h.timeline().chip == egui::Rect::NOTHING,
+        "the timeline must not render while faded"
+    );
+    assert_eq!(
+        h.status_bar().rect,
+        egui::Rect::NOTHING,
+        "the status bar must not render while faded"
+    );
+    assert!(h.pill_rows().is_empty(), "the pill rows must not render while faded");
+    assert_ne!(
+        h.top_bar().rect,
+        egui::Rect::NOTHING,
+        "the docked top bar never fades"
+    );
+
+    // The second qualifying tap restores.
+    h.mouse_click(spot);
+    h.warm_up();
+    assert!(!h.faded(), "the second tap must restore");
+    assert!(
+        chrome_on_screen(&h) && !h.pill_rows().is_empty(),
+        "the chrome must be back"
+    );
+}
+
+/// 60b. **The same trigger on the phone: the bottom cluster fades and the
+///      second tap restores it — and an armed tool still does not fade.**
+#[test]
+fn a_qualifying_tap_fades_the_phone_cluster_and_the_second_restores_it() {
+    let mut h = phone();
+    let spot = h.pane_rects()[0].center();
+    assert!(chrome_on_screen(&h), "precondition: the cluster is up");
+
+    h.set_region_arm(true);
+    h.mouse_click(spot);
+    h.warm_up();
+    assert!(!h.faded() && chrome_on_screen(&h), "an armed region must not fade");
+    h.set_region_arm(false);
+
+    h.mouse_click(spot);
+    h.warm_up();
+    assert!(h.faded(), "the bare-map tap must fade");
+    assert_eq!(
+        h.bottom_bar().rect,
+        egui::Rect::NOTHING,
+        "the bottom bar must not render while faded"
+    );
+    assert_eq!(
+        h.timeline().rect,
+        egui::Rect::NOTHING,
+        "the inline transport must not render while faded"
+    );
+    assert_ne!(h.top_bar().rect, egui::Rect::NOTHING, "the top bar stays");
+
+    h.mouse_click(spot);
+    h.warm_up();
+    assert!(!h.faded() && chrome_on_screen(&h), "the second tap restores");
+}
+
+/// 61. **Fading closes the panels and the sheet for real — state, not
+///     paint — and unfading reopens nothing.**
+///
+///     The state half is read through `dismiss_top_layer`: while faded the
+///     only consumable layer is the fade itself, and after it nothing is
+///     left — an invisible open panel would answer the second press.
+#[test]
+fn fading_closes_the_panels_for_real_and_unfading_reopens_nothing() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.gui_mut().open_settings();
+    h.warm_up();
+    assert!(
+        h.layers_panel_on_screen() && h.inspector().open,
+        "precondition: both panels open"
+    );
+
+    h.mouse_click(h.map_center());
+    h.warm_up();
+    assert!(h.faded(), "the click beside the panels must fade");
+    assert!(
+        !h.layers_panel_on_screen() && !h.inspector().open,
+        "the fade must close both panels"
+    );
+    // State, not paint: the fade is the one consumable layer, and nothing
+    // hides beneath it.
+    assert!(h.gui_mut().dismiss_top_layer(), "the fade itself");
+    assert!(
+        !h.gui_mut().dismiss_top_layer(),
+        "something stayed open invisibly under the fade"
+    );
+    h.warm_up();
+
+    // Unfading reopens nothing: the panels stay closed until asked for.
+    assert!(
+        !h.layers_panel_on_screen() && !h.inspector().open,
+        "unfading must not reopen the panels"
+    );
+    assert!(chrome_on_screen(&h), "the unconditional chrome is back");
+}
+
+/// 61b. **On the phone the fade closes the sheet for real — through the map
+///      sliver the scrim leaves beside the bottom bar.**
+///
+///      The scrim covers the map above the sheet, so the one place a map tap
+///      can land with a page open is the sliver band by the bottom bar
+///      (`ui_sheet.rs`'s own note). That tap is the fade gesture: pages
+///      closed in state, cluster gone, nothing left under the fade.
+#[test]
+fn a_sliver_tap_fades_and_closes_the_sheet_for_real() {
+    let mut h = phone();
+    h.open_layers();
+    let sheet_bottom = h.sheet_rect().expect("the Layers page is open").bottom();
+    let bar_top = h.bottom_bar().rect.top();
+    assert!(
+        sheet_bottom < bar_top,
+        "precondition: a sliver exists between the sheet and the bar"
+    );
+    let sliver = egui::pos2(
+        h.pane_rects()[0].left() + 3.0,
+        (sheet_bottom + bar_top) / 2.0,
+    );
+    assert!(
+        !h.is_floating_layer_at(sliver),
+        "precondition: the sliver is bare map, not scrim or bar"
+    );
+
+    h.mouse_click(sliver);
+    h.warm_up();
+    assert!(h.faded(), "the sliver tap must fade");
+    assert_eq!(h.sheet().page, None, "the sheet must close in state");
+    assert!(h.gui_mut().dismiss_top_layer(), "the fade itself");
+    assert!(
+        !h.gui_mut().dismiss_top_layer(),
+        "a page flag survived the fade invisibly"
+    );
+}
+
+/// 61c. **The fade closes the Volume Alpha editor for real — per-pane
+///      floating chrome, on the same terms as the panels (§1.8) — and
+///      unfading does not reopen it.**
+#[test]
+fn the_fade_closes_the_volume_alpha_editor_for_real() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.set_pane_count(2);
+    h.make_pane_volume(1);
+
+    // Open the editor through its own corner button on the 3D pane.
+    let button = h
+        .painted_text_rects()
+        .into_iter()
+        .find(|(_, text)| text.contains("Volume alpha"))
+        .expect("the 3D pane draws its Volume alpha corner button")
+        .0;
+    h.mouse_click(button.center());
+    h.warm_up();
+    let editor_open = |h: &mut InputHarness| {
+        h.gui_mut()
+            .pane(1)
+            .expect("pane 1 exists")
+            .volume()
+            .expect("pane 1 is a 3D pane")
+            .alpha_editor_open
+    };
+    assert!(editor_open(&mut h), "precondition: the editor is open");
+
+    // The qualifying fade tap on the active map pane: the first click on
+    // pane 0 only activates it (§1.8), the second fades.
+    let spot = h.pane_rects()[0].center();
+    h.mouse_click(spot);
+    h.warm_up();
+    h.mouse_click(spot);
+    h.warm_up();
+    assert!(h.faded(), "the bare-map tap must fade");
+    assert!(
+        !editor_open(&mut h),
+        "the fade must close the editor for real — state, not paint"
+    );
+    assert!(
+        !h.text_painted_in(h.screen_rect(), "Volume Alpha"),
+        "no editor window survives on the glass"
+    );
+
+    // Unfading reopens nothing, the editor included.
+    h.mouse_click(spot);
+    h.warm_up();
+    assert!(!h.faded(), "the second tap restores");
+    assert!(!editor_open(&mut h), "unfading must not reopen the editor");
+}
+
+/// 62. **A top-bar interaction while faded unfades first, then performs —
+///     nothing opens invisibly.**
+#[test]
+fn a_top_bar_interaction_while_faded_unfades_and_performs()  {
+    // Wide: the ☰ opens the menu into a restored UI.
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.mouse_click(h.map_center());
+    h.warm_up();
+    assert!(h.faded(), "precondition: faded");
+
+    h.mouse_click(h.top_bar().menu_button.center());
+    h.warm_up();
+    assert!(!h.faded(), "the bar press must clear the fade");
+    assert!(
+        !h.menu_leaves().is_empty(),
+        "the click must still perform: the menu opens, visible"
+    );
+    assert!(chrome_on_screen(&h), "the chrome returns with it");
+
+    // Phone: the ◧ collapse unfades and collapses.
+    let mut h = phone();
+    h.mouse_click(h.pane_rects()[0].center());
+    h.warm_up();
+    assert!(h.faded(), "precondition: faded");
+
+    h.mouse_click(h.top_bar().collapse.center());
+    h.warm_up();
+    assert!(!h.faded(), "the bar press must clear the fade");
+    assert!(
+        h.top_bar().scan_text.is_empty(),
+        "the click must still perform: the bar collapses to its wordmark"
+    );
+    assert_ne!(
+        h.bottom_bar().rect,
+        egui::Rect::NOTHING,
+        "the bottom cluster returns with the unfade"
+    );
+}
+
+/// 62b. **A keyboard activation while faded unfades too — one frame later,
+///      through the invariant's repair, and the surface it opened stays.**
+///
+///      egui's Tab-focus plus Enter activates a bar control with no pointer
+///      event, so the spatial unfade guard never sees it (`ui_fade.rs`). The
+///      frame-top invariant catches the opened surface and repairs by
+///      unfading — the §3.6 answer, one frame late — rather than re-closing,
+///      which would make the toggle read as dead to exactly the user who
+///      cannot aim a pointer at it.
+#[test]
+fn a_keyboard_activation_while_faded_unfades_and_the_surface_stays() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.mouse_click(h.map_center());
+    h.warm_up();
+    assert!(h.faded(), "precondition: faded");
+    assert!(!h.layers_panel_on_screen(), "precondition: the stack is closed");
+
+    // Focus the Layers toggle under the id the bar itself keyed, then press
+    // Enter: an activation with no pointer event anywhere near the bar.
+    let toggle = h
+        .widget_id_probes()
+        .iter()
+        .find(|(name, _)| *name == "layers_toggle")
+        .expect("the top bar reports its Layers toggle id")
+        .1;
+    h.focus_widget(toggle);
+    assert!(h.faded(), "focus alone opens nothing and must not unfade");
+
+    h.key_press(egui::Key::Enter);
+    h.frame_after(FRAME_DT); // the activation frame: the stack opens in state
+    h.frame_after(FRAME_DT); // the repair frame: the invariant unfades
+    assert!(!h.faded(), "the keyboard activation must unfade");
+    assert!(
+        h.layers_panel_on_screen(),
+        "and the stack it opened must be on screen, not re-closed"
+    );
+    h.warm_up();
+    assert!(
+        !h.faded() && h.layers_panel_on_screen() && chrome_on_screen(&h),
+        "the repair holds: chrome back, stack open, nothing flapping"
+    );
+}
+
+/// 63. **The top bar stays present and interactive while faded — the docked
+///     exception to §1.8's "fade all chrome".**
+#[test]
+fn the_top_bar_stays_present_and_interactive_while_faded() {
+    // Wide: a pane-count segment still takes its click.
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.mouse_click(h.map_center());
+    h.warm_up();
+    assert!(h.faded(), "precondition: faded");
+    assert_ne!(h.top_bar().rect, egui::Rect::NOTHING, "the bar is drawn");
+
+    let two = h
+        .pane_options()
+        .into_iter()
+        .find(|option| option.count == 2)
+        .expect("the segments are drawn while faded");
+    h.mouse_click(two.rect.center());
+    h.warm_up();
+    assert_eq!(h.pane_count(), 2, "the segment performed");
+    assert!(!h.faded(), "and the press cleared the fade first");
+
+    // Phone: the ╱ arm still takes its tap.
+    let mut h = phone();
+    h.mouse_click(h.pane_rects()[0].center());
+    h.warm_up();
+    assert!(h.faded(), "precondition: faded");
+    assert_ne!(h.top_bar().rect, egui::Rect::NOTHING, "the bar is drawn");
+
+    h.mouse_click(h.top_bar().section_arm.0.center());
+    h.warm_up();
+    assert!(h.section_draw_armed(), "the arm performed");
+    assert!(!h.faded(), "and the press cleared the fade first");
+}
+
+/// 65. **The full Esc/back order, fade included: fade → catalog → feature →
+///     time → inspector → drawer → armed drag, one layer per press.**
+///
+///     The ☰ dropdown's place at the chain's head is contract 83's own
+///     claim (its route cannot be stacked under the catalog's modal
+///     backdrop); the in-flight handle drag above everything is the section
+///     suite's. This walks everything between, on the width whose stack
+///     form (the drawer) is an Esc target, with the fade at its head — and
+///     the fade leg runs first, because fading *closes* the very layers the
+///     walk stacks.
+#[test]
+fn a_back_press_walks_the_full_wide_chain_in_order() {
+    let mut h = InputHarness::with_screen(egui::vec2(800.0, 1200.0));
+    assert_eq!(h.width_class(), crate::ui_layout::WidthClass::Medium);
+
+    // The fade head: Esc while faded restores the UI and consumes the press.
+    h.mouse_click(h.map_center());
+    h.warm_up();
+    assert!(h.faded(), "precondition: faded");
+    assert!(h.gui_mut().dismiss_top_layer(), "the press unfades");
+    assert!(!h.faded());
+    h.warm_up();
+    assert!(chrome_on_screen(&h), "Esc means restore my UI");
+
+    // The stack under the fade, deepest first.
+    h.set_region_arm(true);
+    h.set_drawer_open(true);
+    h.gui_mut().open_settings();
+    h.gui_mut().set_time_dialog_open_for_test(true);
+    h.gui_mut().overlays.selected_overlays = vec![std::sync::Arc::new(SheetStubFeature)];
+    h.gui_mut().set_catalog_open_for_test(true);
+    h.warm_up();
+
+    assert!(h.gui_mut().dismiss_top_layer(), "the catalog is on top");
+    h.warm_up();
+    assert!(!h.catalog().open, "press 1 closes the catalog");
+
+    assert!(h.gui_mut().dismiss_top_layer(), "the feature is next");
+    h.warm_up();
+    assert!(
+        h.gui_mut().overlays.selected_overlays.is_empty(),
+        "press 2 closes the feature popup"
+    );
+
+    assert!(h.gui_mut().dismiss_top_layer(), "the time dialog is next");
+    h.warm_up();
+    assert!(
+        !h.text_painted_in(h.screen_rect(), "Select Time"),
+        "press 3 closes the time dialog"
+    );
+
+    assert!(h.gui_mut().dismiss_top_layer(), "the inspector is next");
+    h.warm_up();
+    assert!(!h.inspector().open, "press 4 closes the inspector");
+
+    assert!(h.gui_mut().dismiss_top_layer(), "the drawer is next");
+    h.warm_up();
+    assert!(!h.layers_panel_on_screen(), "press 5 closes the drawer");
+
+    assert!(h.gui_mut().dismiss_top_layer(), "the armed drag is last");
+    assert!(!h.region_arm(), "press 6 disarms");
+
+    assert!(
+        !h.gui_mut().dismiss_top_layer(),
+        "press 7 falls through to the exit path"
+    );
+}
+
+/// 65b. **The Compact chain keeps its projection-first order with the fade
+///      at its head** — the fade leg, then the sheet walk of
+///      `a_back_press_walks_the_phone_sheet_pages_top_down`, abbreviated to
+///      the seam this contract adds.
+#[test]
+fn a_back_press_on_the_phone_unfades_then_walks_the_projection() {
+    let mut h = phone();
+    h.mouse_click(h.pane_rects()[0].center());
+    h.warm_up();
+    assert!(h.faded(), "precondition: faded");
+    assert!(h.gui_mut().dismiss_top_layer(), "the press unfades");
+    assert!(!h.faded());
+    h.warm_up();
+    assert!(chrome_on_screen(&h), "back means restore my UI");
+
+    // The projection resumes beneath: pages pop top-down as ever.
+    h.set_drawer_open(true);
+    h.gui_mut().open_settings();
+    h.warm_up();
+    assert_eq!(h.sheet().page, Some(crate::ui::SheetPage::Inspector));
+    assert!(h.gui_mut().dismiss_top_layer());
+    h.warm_up();
+    assert_eq!(h.sheet().page, Some(crate::ui::SheetPage::Layers));
+    assert!(h.gui_mut().dismiss_top_layer());
+    h.warm_up();
+    assert_eq!(h.sheet().page, None);
+    assert!(!h.gui_mut().dismiss_top_layer(), "nothing is left");
+}
+
+/// **A click that dismisses an open popover does not fade** — the popup was
+/// what the click was aimed at (egui closes it on the click outside), and
+/// the evidence is recorded at press time because the popup is gone by the
+/// confirm frame.
+#[test]
+fn a_click_that_dismisses_a_popover_does_not_fade() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.close_layers();
+    let (_, pill) = h
+        .pill(0, crate::ui::PillKind::Site)
+        .expect("the site pill is drawn");
+    h.mouse_click(pill.center());
+    h.warm_up();
+    assert!(
+        h.pill_popover().is_some(),
+        "precondition: the popover is open"
+    );
+
+    h.mouse_click(h.map_center());
+    h.warm_up();
+    assert!(h.pill_popover().is_none(), "the click closes the popover");
+    assert!(
+        !h.faded() && chrome_on_screen(&h),
+        "and that is all it does: the dismissal is not a fade gesture"
+    );
+
+    // The next bare click, with nothing open, does fade.
+    h.mouse_click(h.map_center());
+    h.warm_up();
+    assert!(h.faded(), "the follow-up click is the fade gesture");
+}
+
+/// **A first click on an inactive pane only activates — the fade needs a
+/// click on the *already*-active pane** (§1.8).
+#[test]
+fn a_click_that_activates_a_pane_does_not_fade() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.set_pane_count(2);
+    h.close_layers();
+    let panes = h.pane_rects();
+    assert_eq!(h.active_pane_index(), 0, "precondition: pane 0 active");
+
+    h.mouse_click(panes[1].center());
+    h.warm_up();
+    assert_eq!(h.active_pane_index(), 1, "the click activated pane 1");
+    assert!(
+        !h.faded() && chrome_on_screen(&h),
+        "activation must be all it did"
+    );
+
+    // The same spot again — now the already-active pane — fades.
+    h.mouse_click(panes[1].center());
+    h.warm_up();
+    assert!(h.faded(), "the second click on the now-active pane fades");
+}
+
+/// **A feature click while faded unfades — its dialog must not open into an
+/// invisible UI** (the consumed-click refinement in `ui_fade.rs`).
+#[test]
+fn a_consumed_click_while_faded_unfades() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.close_layers();
+    h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
+    h.warm_up();
+    let spot = h.map_center();
+    // Park the icon away from the centre first — the default view has the
+    // pane's own site under the centre, and the fading click below must be
+    // a bare-map click.
+    let site_spot = egui::pos2(spot.x - 150.0, spot.y);
+    h.place_site_at(0, "KTLX", site_spot);
+    h.mouse_click(spot);
+    h.warm_up();
+    assert!(h.faded(), "precondition: faded");
+
+    h.mouse_click(site_spot);
+    assert!(h.click_consumed(), "precondition: the icon took the click");
+    h.warm_up();
+    assert!(
+        !h.faded() && chrome_on_screen(&h),
+        "the map's own answer belongs in a working UI"
+    );
+}
+
+/// **A touch long-press starting on floating chrome does not raise the map
+/// tooltip** (§5.9: `long_press_pos` is chrome-filtered like the click).
+///
+/// Driven through the shipped `TouchGestures::update`, whose output the
+/// harness's parallel touch probe is. The control half holds the same press
+/// on bare map, so the filter — not a dead detector — is what the assertion
+/// sees.
+#[test]
+fn a_long_press_on_floating_chrome_raises_no_map_tooltip() {
+    let mut h = InputHarness::new();
+
+    // Control: a still hold on bare map is a long press.
+    let map_spot = h.map_center();
+    h.mouse_press(map_spot);
+    let held = h.frames_for(10, 0.1);
+    assert_eq!(
+        held.touch.long_press_pos,
+        Some(map_spot),
+        "control: the detector works on bare map"
+    );
+    h.mouse_release(map_spot);
+    h.frames_for(3, 0.3);
+
+    // The same hold on the floating timeline is a hold on the timeline.
+    let chrome_spot = h.timeline().rect.center();
+    assert!(
+        h.is_floating_layer_at(chrome_spot),
+        "precondition: the spot is floating chrome"
+    );
+    h.mouse_press(chrome_spot);
+    let held = h.frames_for(10, 0.1);
+    assert_eq!(
+        held.touch.long_press_pos, None,
+        "a hold on chrome must not become a map long press"
+    );
+    h.mouse_release(chrome_spot);
+}
+
+/// **The loop and archive scrubbers resolve distinct widget ids** (§5.9's
+/// same-auto-id-slot corner): the two forms share one row slot, so without
+/// distinct ids a loop landing mid-drag would hand an archive drag to the
+/// frame-seek slider — same id, new meaning.
+#[test]
+fn the_loop_and_archive_scrubbers_resolve_distinct_ids() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    let archive_id = h
+        .widget_id_probes()
+        .into_iter()
+        .find(|(name, _)| *name == "timeline_scrubber")
+        .expect("the archive form reports its id")
+        .1;
+
+    {
+        let pane = h.gui_mut().pane_mut(0).unwrap();
+        pane.loop_state = crate::pane::LoopPlaybackState::new_for_loop(
+            600,
+            rustdar_radar::sites::get_radar_site("KTLX").unwrap(),
+        );
+        pane.loop_state.frames = vec![crate::pane::LoopFrame {
+            timestamp: chrono::Utc::now().naive_utc(),
+            texture: None,
+            render_in_flight: false,
+            render_failed: false,
+        }];
+        pane.loop_state.current_frame = 0;
+    }
+    h.warm_up();
+    let loop_id = h
+        .widget_id_probes()
+        .into_iter()
+        .find(|(name, _)| *name == "timeline_scrubber_loop")
+        .expect("the loop form reports its id")
+        .1;
+
+    assert_ne!(
+        archive_id, loop_id,
+        "the two scrubber forms share an id: a mid-drag form flip would \
+         carry the drag across meanings"
+    );
+}
+
+/// **The transport's stated width is its outer width** (§1.5's
+/// `min(880, full − 24)`, the §5.9 bookkeeping fix): the surface on the
+/// glass, frame included, lands on the formula — not the formula plus the
+/// frame's margins.
+#[test]
+fn the_transport_outer_width_is_the_stated_formula() {
+    // Narrow enough that `full − 24` is the binding arm.
+    let h = InputHarness::with_screen(egui::vec2(800.0, 1200.0));
+    let map = h.map_panel_rect();
+    let expected = (map.width() - 24.0).min(880.0);
+    let drawn = h.timeline().rect.width();
+    assert!(
+        (drawn - expected).abs() < 1.0,
+        "the transport drew {drawn} pt wide; §1.5 states {expected} pt"
+    );
+
+    // ...and wide enough that 880 binds.
+    let h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    let drawn = h.timeline().rect.width();
+    assert!(
+        (drawn - 880.0).abs() < 1.0,
+        "the transport drew {drawn} pt wide; §1.5 caps it at 880"
+    );
+}
+
+/// **The sheet host draws no duplicate headers** (M7's sheet-header polish):
+/// the sheet's title row is the single header — the stack's own header row
+/// and ⟨ do not render there, the inspector's crumb keeps its ✕-deselect
+/// (selection, not navigation) but drops its ⟩ — while the wider hosts keep
+/// all of it.
+#[test]
+fn the_sheet_host_draws_no_duplicate_headers() {
+    let mut h = phone();
+    h.open_layers();
+    let stack = h.stack();
+    assert!(stack.open, "precondition: the Layers page hosts the stack");
+    assert_eq!(
+        stack.header,
+        egui::Rect::NOTHING,
+        "the stack's own header must not draw under the sheet's title row"
+    );
+    assert_eq!(
+        stack.collapse,
+        egui::Rect::NOTHING,
+        "the ⟨ collapse is the back-chain's job in the sheet"
+    );
+    assert!(
+        h.text_painted_in(
+            h.sheet_rect().expect("open"),
+            "The same layer stack as on a desktop"
+        ),
+        "the Layers page must carry the §1.3 helper caption"
+    );
+
+    // The inspector page: crumb yes, ⟩ no, ✕-deselect yes.
+    h.open_layer_in_inspector(OverlayKind::NwsAlerts);
+    let insp = h.inspector();
+    assert_eq!(
+        insp.collapse,
+        egui::Rect::NOTHING,
+        "the ⟩ collapse is the back-chain's job in the sheet"
+    );
+    assert_ne!(
+        insp.deselect,
+        egui::Rect::NOTHING,
+        "the crumb's ✕-deselect stays: it is selection, not navigation"
+    );
+
+    // The wider hosts keep both header rows whole.
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.gui_mut().open_settings();
+    h.warm_up();
+    assert_ne!(h.stack().header, egui::Rect::NOTHING);
+    assert_ne!(h.stack().collapse, egui::Rect::NOTHING);
+    assert_ne!(h.inspector().collapse, egui::Rect::NOTHING);
+    assert!(
+        !h.text_painted_in(h.screen_rect(), "The same layer stack as on a desktop"),
+        "the helper caption is the phone page's alone"
+    );
+}
+
+/// **The error surface outranks the fade** — the deliberate §1.8 refinement
+/// recorded in `ui_fade.rs`: an error one accidental tap could hide is an
+/// error unseen. On the wide widths the error normally rides in the status
+/// bar, which fades — so while faded the toast presentation carries it; on
+/// the phone the toast simply stays.
+#[test]
+fn the_error_surface_stays_visible_while_faded() {
+    // Wide: the status bar goes, the toast carries the error.
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.gui_mut().set_error("the feed went away".to_owned());
+    h.warm_up();
+    assert!(
+        h.error_toast().is_none(),
+        "precondition: unfaded, the status bar hosts the error and no toast \
+         draws"
+    );
+
+    h.mouse_click(h.map_center());
+    h.warm_up();
+    assert!(h.faded(), "precondition: faded");
+    assert_eq!(h.status_bar().rect, egui::Rect::NOTHING, "the bar is faded");
+    let toast = h.error_toast().expect("the toast must carry the error");
+    h.mouse_click(toast.close.center());
+    h.warm_up();
+    assert!(
+        h.error_toast().is_none(),
+        "the toast's \u{2715} must dismiss the error while faded"
+    );
+
+    // Phone: the toast stays up through the fade.
+    let mut h = phone();
+    h.gui_mut().set_error("the feed went away".to_owned());
+    h.warm_up();
+    assert!(h.error_toast().is_some(), "precondition: the toast is up");
+    h.mouse_click(h.pane_rects()[0].center());
+    h.warm_up();
+    assert!(h.faded(), "precondition: faded");
+    assert!(
+        h.error_toast().is_some(),
+        "the fade must not take the error with it"
+    );
+}

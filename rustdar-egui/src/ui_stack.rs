@@ -64,6 +64,14 @@ const COLLAPSE_LABEL: &str = "\u{27e8}";
 /// panel, and "add" is wanted at whichever end the scroll left the user.
 const ADD_LAYER_LABEL: &str = "+ Add layer";
 
+/// The phone Layers page's helper caption (plan §1.3) — the demo's "same
+/// stack as desktop" one-liner, in this app's own words. Sheet host only:
+/// on the wider widths the panel *is* visibly the desktop's, and the line
+/// would restate the screen.
+const SHEET_HELPER_CAPTION: &str = "The same layer stack as on a desktop: \
+    rows select a layer, \u{1f441} hides it, \u{25b2}\u{25bc} set what draws \
+    over what.";
+
 /// One row the stack actually drew, as it was drawn. Reported by the
 /// renderer, never rebuilt by a test — see `ui_menu::DrawnMenuLeaf` for the
 /// pattern.
@@ -148,7 +156,14 @@ impl super::Gui {
         actions: &mut Vec<GuiAction>,
     ) {
         let is_drawer = !self.layout.width.has_persistent_sidebar();
-        let max_body_height = (slot.avail_height - HEADER_ALLOWANCE).max(0.0);
+        // The sheet host draws no header of its own here — the sheet's title
+        // row is the single header (plan §1.13 as polished in M7) — so the
+        // whole slot is the body's.
+        let max_body_height = if slot.sheet {
+            slot.avail_height.max(0.0)
+        } else {
+            (slot.avail_height - HEADER_ALLOWANCE).max(0.0)
+        };
 
         // `Pane N (SITE)` reads off the taken pane — the live one.
         let title = format!(
@@ -182,58 +197,76 @@ impl super::Gui {
             .fixed_pos(slot.pos)
             .show(ctx, |ui| {
                 frame.show(ui, |ui| {
+                    super::fade::dim(ui, slot.opacity);
+                    if !slot.interactive {
+                        ui.disable();
+                    }
                     ui.set_width(slot.width);
-                    ui.horizontal(|ui| {
-                        // Right-to-left so the collapse button owns the right
-                        // edge and the title truncates in what is left.
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let collapse = ui
-                                .button(COLLAPSE_LABEL)
-                                .on_hover_text("Collapse the layer stack");
-                            #[cfg(test)]
-                            {
-                                probe.collapse = collapse.rect;
-                            }
-                            if collapse.clicked() {
-                                // The same split the top bar's Layers toggle
-                                // writes through: an explicit choice over the
-                                // Expanded default, the drawer flag elsewhere.
-                                if self.layout.width.has_persistent_sidebar() {
-                                    self.stack_open = Some(false);
-                                } else {
-                                    self.drawer_open = false;
-                                }
-                            }
-
+                    // The sheet host draws no header row: the sheet's title
+                    // row is the single header there (title + ✕), and the ⟨
+                    // collapse would shadow the back-chain that already
+                    // closes the page (§1.13's no-back-buttons rule; M7's
+                    // sheet-header polish). The wider hosts keep both.
+                    if !slot.sheet {
+                        ui.horizontal(|ui| {
+                            // Right-to-left so the collapse button owns the
+                            // right edge and the title truncates in what is
+                            // left.
                             ui.with_layout(
-                                egui::Layout::left_to_right(egui::Align::Center),
+                                egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    let header = ui
-                                        .add(
-                                            egui::Label::new(
-                                                egui::RichText::new(title.as_str()).strong(),
-                                            )
-                                            .truncate()
-                                            .sense(egui::Sense::click()),
-                                        )
-                                        .on_hover_text("Layer order: top = drawn last");
+                                    let collapse = ui
+                                        .button(COLLAPSE_LABEL)
+                                        .on_hover_text("Collapse the layer stack");
                                     #[cfg(test)]
                                     {
-                                        probe.header = header.rect;
+                                        probe.collapse = collapse.rect;
                                     }
-                                    // A route to Pane properties, for every
-                                    // pane kind — the header names the pane,
-                                    // so clicking it selects the pane. The
-                                    // pills are the primary route now; this
-                                    // stays as the panel's own way in.
-                                    if header.clicked() {
-                                        self.select_pane_props();
+                                    if collapse.clicked() {
+                                        // The same split the top bar's Layers
+                                        // toggle writes through: an explicit
+                                        // choice over the Expanded default,
+                                        // the drawer flag elsewhere.
+                                        if self.layout.width.has_persistent_sidebar() {
+                                            self.stack_open = Some(false);
+                                        } else {
+                                            self.drawer_open = false;
+                                        }
                                     }
+
+                                    ui.with_layout(
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            let header = ui
+                                                .add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(title.as_str())
+                                                            .strong(),
+                                                    )
+                                                    .truncate()
+                                                    .sense(egui::Sense::click()),
+                                                )
+                                                .on_hover_text("Layer order: top = drawn last");
+                                            #[cfg(test)]
+                                            {
+                                                probe.header = header.rect;
+                                            }
+                                            // A route to Pane properties, for
+                                            // every pane kind — the header
+                                            // names the pane, so clicking it
+                                            // selects the pane. The pills are
+                                            // the primary route now; this
+                                            // stays as the panel's own way in.
+                                            if header.clicked() {
+                                                self.select_pane_props();
+                                            }
+                                        },
+                                    );
                                 },
                             );
                         });
-                    });
-                    ui.separator();
+                        ui.separator();
+                    }
 
                     // An explicit salt rather than egui's positional auto-id:
                     // the scroll offset must survive edits to the header, and
@@ -248,6 +281,7 @@ impl super::Gui {
                             self.render_stack_rows(
                                 ui,
                                 is_drawer,
+                                slot.sheet,
                                 pane,
                                 statuses,
                                 actions,
@@ -276,11 +310,14 @@ impl super::Gui {
     }
 
     /// The scroll body: one row per layer for a map pane, the explained
-    /// absence for a pane with no map.
+    /// absence for a pane with no map. `sheet` is the phone-sheet host,
+    /// which alone appends the helper caption under the rows (plan §1.3).
+    #[allow(clippy::too_many_arguments)]
     fn render_stack_rows(
         &mut self,
         ui: &mut egui::Ui,
         is_drawer: bool,
+        sheet: bool,
         pane: &mut PaneState,
         statuses: &[(OverlayKind, Option<String>)],
         actions: &mut Vec<GuiAction>,
@@ -461,6 +498,18 @@ impl super::Gui {
         }
         if add_bottom.clicked() {
             self.catalog_open = true;
+        }
+
+        // The phone page's one-line orientation (plan §1.3): the sheet is
+        // the only host where "this is the desktop's panel" is not visibly
+        // true, so it is the only host that says it.
+        if sheet {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(SHEET_HELPER_CAPTION)
+                    .small()
+                    .weak(),
+            );
         }
 
         if let Some((a, b)) = swap {

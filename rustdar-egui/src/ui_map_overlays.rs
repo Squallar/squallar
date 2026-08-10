@@ -260,10 +260,12 @@ mod tests {
     ///
     /// They mask each other in the app, which is why this is claimed here
     /// rather than only through the UI: the excluded-rect arm has no producer
-    /// at all since the top bar replaced the hamburger (the chrome's list is
-    /// unconditionally empty until M5's pills need it again), and a click on
-    /// a dialog is already stripped upstream by
-    /// `ui_input::filter_dialog_blocked` before this ever sees it. Each row
+    /// at all — the top bar replaced the hamburger, and M5's pills shipped as
+    /// egui `Area`s (§3.3) that block through the floating-layer check, not
+    /// through rects — so the chrome's list stays empty by design, kept for
+    /// any future chrome painted *into* a pane and for this probe's
+    /// continuity. A click on a dialog is likewise already stripped upstream
+    /// by `ui_input::filter_dialog_blocked` before this ever sees it. Each row
     /// below satisfies exactly one condition, so it fails if and only if that
     /// one stops doing its job.
     ///

@@ -59,8 +59,9 @@ use crate::pane::{PaneId, PaneKind};
 use crate::ui_layout::PointerModality;
 use rustdar_radar::types::RadarProduct;
 
-/// The row's idle opacity. Instant switch to 1.0 when revealed — the
-/// animations are M7's one coherent polish pass (plan §5.9).
+/// The row's idle opacity. The reveal animates between this and 1.0
+/// (`Gui::render_pill_row`'s `animate_bool_with_time`; instant under test —
+/// `ui_fade::anim_time`).
 const PILL_IDLE_OPACITY: f32 = 0.35;
 
 /// The row's inset from its pane's top-left corner, both axes.
@@ -362,10 +363,18 @@ impl super::Gui {
         map_rect: egui::Rect,
         actions: &mut Vec<GuiAction>,
     ) {
+        // The fade (§1.8): fully faded rows do not render — the absence is
+        // the input transparency — and a transition renders dimmed and dead.
+        let Some(chrome) = self.chrome_fade() else {
+            // The bookkeeping below still owes the panels a raise when the
+            // rows return, so the drawn count records the truth: nothing.
+            self.pills_drawn_last_frame = 0;
+            return;
+        };
         let pane_count = self.visible_pane_count();
         for idx in 0..pane_count {
             let pane_rect = self.pane_layout.pane_rect(idx, map_rect);
-            self.render_pill_row(ctx, idx, pane_rect, actions);
+            self.render_pill_row(ctx, idx, pane_rect, chrome, actions);
         }
 
         // The deferred panel raise — see the module note. egui auto-tops
@@ -407,12 +416,14 @@ impl super::Gui {
         self.pills_drawn_last_frame = pane_count;
     }
 
-    /// One pane's pill row and whichever of its popovers is open.
+    /// One pane's pill row and whichever of its popovers is open. `chrome`
+    /// is the frame's fade opacity (`Gui::chrome_fade`).
     fn render_pill_row(
         &mut self,
         ctx: &egui::Context,
         idx: PaneId,
         pane_rect: egui::Rect,
+        chrome: f32,
         actions: &mut Vec<GuiAction>,
     ) {
         // Everything the row states, read before any closure borrows self.
@@ -470,13 +481,27 @@ impl super::Gui {
             full_opacity: full,
         };
 
+        // The reveal animates between idle and full opacity (§3.3) — the
+        // instant switch it replaces read as a flash. Per-pane id, zero-time
+        // under test (`ui_fade::anim_time`).
+        let reveal = ctx.animate_bool_with_time(
+            egui::Id::new(("pill_reveal", idx)),
+            full,
+            super::fade::anim_time(),
+        );
+        let row_opacity = egui::lerp(PILL_IDLE_OPACITY..=1.0, reveal) * chrome;
+
         let area = egui::Area::new(egui::Id::new(("pane_pills", idx)))
             .order(egui::Order::Middle)
             .fixed_pos(pane_rect.min + egui::vec2(PILL_INSET, PILL_INSET))
             .show(ctx, |ui| {
                 // Painting only: a dim row still hit-tests, which is what
-                // the hover- and tap-reveal stand on.
-                ui.set_opacity(if full { 1.0 } else { PILL_IDLE_OPACITY });
+                // the hover- and tap-reveal stand on. The fade is the
+                // exception (`fade::dim`): a fading row is also dying.
+                ui.set_opacity(row_opacity);
+                if chrome < 1.0 {
+                    ui.disable();
+                }
                 ui.set_max_width((pane_rect.width() - 2.0 * PILL_INSET).max(40.0));
                 ui.horizontal_wrapped(|ui| {
                     // Every pill click below goes through one rule: a tap on

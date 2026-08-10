@@ -266,6 +266,19 @@ impl super::Gui {
         #[cfg(test)]
         let mut probe = BottomBarProbe::default();
 
+        // The fade (§1.8): the phone bottom cluster fades with the rest of
+        // the floating chrome. Fully faded it does not render at all; the
+        // returned "top" is the map's bottom edge, and nothing anchored on it
+        // renders either (the inline transport and the sheet are gated on the
+        // same fade, and the sheet's pages are closed while faded).
+        let Some(fade) = self.chrome_fade() else {
+            #[cfg(test)]
+            {
+                self.last_bottom_bar = probe;
+            }
+            return map_rect.bottom();
+        };
+
         let page = self.top_sheet_page();
         let frame = egui::Frame::window(&ctx.global_style());
         let inner_width = map_rect.width() - 2.0 * BAR_INSET - frame.inner_margin.sum().x;
@@ -279,6 +292,7 @@ impl super::Gui {
             ))
             .show(ctx, |ui| {
                 frame.show(ui, |ui| {
+                    super::fade::dim(ui, fade);
                     ui.set_width(inner_width);
                     ui.horizontal(|ui| {
                         // Right-to-left first, so the chip owns the right
@@ -412,12 +426,39 @@ impl super::Gui {
         bar_top: f32,
         actions: &mut Vec<GuiAction>,
     ) {
-        let Some(page) = self.top_sheet_page() else {
+        // The rise and fall (§3.3): the open state animates, and the fall
+        // keeps rendering the page the flags just closed — remembered in
+        // `sheet_last_page`, dead to input — until the slide is off screen.
+        // Under test the factor snaps and only real pages ever render.
+        let open = self.top_sheet_page();
+        let open_factor = ctx.animate_bool_with_time(
+            egui::Id::new("sheet_open"),
+            open.is_some(),
+            super::fade::anim_time(),
+        );
+        if open.is_some() {
+            self.sheet_last_page = open;
+        }
+        let falling = open.is_none();
+        let Some(page) = open.or(if open_factor > 0.0 {
+            self.sheet_last_page
+        } else {
+            None
+        }) else {
             // No page, no drag: a gesture cannot outlive the surface it was
             // adjusting.
             self.sheet_drag = None;
             return;
         };
+        // The fade closes the pages; the falling remnant then dims with the
+        // rest of the chrome, and fully faded nothing renders at all.
+        let Some(fade) = self.chrome_fade() else {
+            self.sheet_drag = None;
+            return;
+        };
+        if falling {
+            self.sheet_drag = None;
+        }
 
         let sheet_bottom = bar_top - SHEET_GAP;
         let avail = (sheet_bottom - map_rect.top() - SHEET_GAP).max(MIN_SHEET_HEIGHT);
@@ -440,6 +481,11 @@ impl super::Gui {
             egui::pos2(map_rect.left(), sheet_bottom - height),
             egui::pos2(map_rect.right(), sheet_bottom),
         );
+        // The slide itself: at factor zero the surface has travelled its own
+        // height down past the bottom edge (it stops rendering there); in
+        // between, the whole cluster — scrim rect and hosted body included —
+        // follows this one rect.
+        let sheet_rect = sheet_rect.translate(egui::vec2(0.0, (1.0 - open_factor) * height));
 
         // The scrim, over what the sheet leaves uncovered above it — not
         // over the bottom bar, which is the way between pages (§1.13). The
@@ -452,13 +498,21 @@ impl super::Gui {
         // never an invisible flag beneath it.
         let scrim_rect =
             egui::Rect::from_min_max(map_rect.min, egui::pos2(map_rect.right(), sheet_rect.top()));
+        // A falling scrim thins with the slide and takes no clicks: the
+        // pages are already closed, and a dead scrim eating the tap that
+        // dismissed it would read as a stuck UI.
+        let scrim_color = SCRIM_COLOR.gamma_multiply(open_factor * fade);
+        let scrim_sense = if falling {
+            egui::Sense::hover()
+        } else {
+            egui::Sense::click()
+        };
         let scrim = egui::Area::new(egui::Id::new("sheet_scrim"))
             .order(egui::Order::Foreground)
             .fixed_pos(scrim_rect.min)
             .show(ctx, |ui| {
-                let (rect, response) =
-                    ui.allocate_exact_size(scrim_rect.size(), egui::Sense::click());
-                ui.painter().rect_filled(rect, 0.0, SCRIM_COLOR);
+                let (rect, response) = ui.allocate_exact_size(scrim_rect.size(), scrim_sense);
+                ui.painter().rect_filled(rect, 0.0, scrim_color);
                 if response.clicked() {
                     // The backdrop half of the dismissal contract (§1.9):
                     // one layer per click, through the same chain a key
@@ -517,6 +571,13 @@ impl super::Gui {
             .fixed_pos(sheet_rect.min)
             .show(ctx, |ui| {
                 frame.show(ui, |ui| {
+                    super::fade::dim(ui, fade);
+                    if falling {
+                        // The fall is a slide, not a dim — but the falling
+                        // remnant is already closed in state, so its widgets
+                        // are dead whatever the slide still shows.
+                        ui.disable();
+                    }
                     ui.set_width(sheet_rect.width() - margin.x);
                     ui.set_min_height(height - margin.y);
 
@@ -596,6 +657,8 @@ impl super::Gui {
                                 width: sheet_rect.width() - 2.0 * BODY_INSET,
                                 avail_height: body_max,
                                 sheet: true,
+                                opacity: fade,
+                                interactive: !falling,
                             });
                         }
                         SheetPage::Menu => {
@@ -723,7 +786,8 @@ impl super::Gui {
     }
 
     /// Snap the released sheet to Full, Half, or gone — the release decides
-    /// what the drag meant, and nothing animates between (M7's pass).
+    /// what the drag meant; a "gone" release falls through the sheet's own
+    /// close animation like every other dismissal.
     ///
     /// `forced_full` is the Catalog page: it draws at Full whatever the
     /// stored snap says, so a release there can still mean "dismiss" but
@@ -746,10 +810,50 @@ impl super::Gui {
     /// status bar's own dismissable body. The phone shell has no status bar
     /// to host the error slot, and an error a phone user cannot see is the
     /// worst of the options.
-    pub(super) fn render_phone_error_toast(&mut self, ctx: &egui::Context, map_rect: egui::Rect) {
-        if self.radar.error_message.is_none() {
+    ///
+    /// Also the wide widths' error surface **while faded** (`Gui::ui`): the
+    /// status bar that normally hosts the error fades with the chrome, and
+    /// the error outranks the fade — the deliberate §1.8 refinement recorded
+    /// in `ui_fade.rs`. One area id at every width, per the id contract.
+    ///
+    /// `carries` is whether this toast is the error's presenter right now —
+    /// always on the phone, only while faded on the wide widths, where the
+    /// status bar otherwise hosts the error. Passed rather than gated at the
+    /// call site so the rise and fall below tick every frame: the toast
+    /// fades in and out like every other surface (§3.3), and the fall keeps
+    /// rendering the message the state just dropped — remembered in
+    /// `toast_last_error`, dead to input (`fade::dim`) — until it is gone.
+    /// Under test the factor snaps and only a carried, live error renders.
+    pub(super) fn render_phone_error_toast(
+        &mut self,
+        ctx: &egui::Context,
+        map_rect: egui::Rect,
+        carries: bool,
+    ) {
+        let present = carries && self.radar.error_message.is_some();
+        let factor = ctx.animate_bool_with_time(
+            egui::Id::new("error_toast_open"),
+            present,
+            super::fade::anim_time(),
+        );
+        if present {
+            self.toast_last_error = self.radar.error_message.clone();
+        }
+        if factor <= 0.0 {
+            // Fully off screen: forget the remnant so a much later fall can
+            // never resurrect a long-dismissed message.
+            self.toast_last_error = None;
             return;
         }
+        // What the banner shows: the live message, or the fall's remembered
+        // one. The remnant copy is what `render_error_display` mutates on the
+        // (unreachable — the ui is disabled) dismiss, so the real state is
+        // only ever written back from its own live copy.
+        let mut shown = if present {
+            self.radar.error_message.clone()
+        } else {
+            self.toast_last_error.clone()
+        };
         // `Order::Tooltip`, so the toast reads over the sheet cluster: the
         // scrim, sheet and hosted bodies are all `Order::Foreground`, and an
         // error banner under a scrim is an error the user can neither see
@@ -769,16 +873,17 @@ impl super::Gui {
             .show(ctx, |ui| {
                 egui::Frame::window(&ctx.global_style())
                     .show(ui, |ui| {
+                        super::fade::dim(ui, factor);
                         ui.horizontal(|ui| {
-                            super::statusbar::render_error_display(
-                                ui,
-                                &mut self.radar.error_message,
-                            )
+                            super::statusbar::render_error_display(ui, &mut shown)
                         })
                         .inner
                     })
                     .inner
             });
+        if present {
+            self.radar.error_message = shown;
+        }
         #[cfg(test)]
         {
             self.last_error_toast = area.inner.map(|close| ErrorToastProbe {

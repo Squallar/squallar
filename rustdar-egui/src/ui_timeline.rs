@@ -53,8 +53,11 @@ pub(super) const TIME_STEP_OPTIONS: &[(i64, &str)] = &[
 /// clear of the status bar spanning the bottom inset below it.
 const BOTTOM_CLEARANCE: f32 = 44.0;
 
-/// The transport's widest inner form.
-const MAX_INNER_WIDTH: f32 = 880.0;
+/// The transport's widest form, **outer edge to outer edge** — §1.5's
+/// `min(880, full − 24)` is a claim about the surface on the glass, frame
+/// included, so the frame's own margins are subtracted before the content is
+/// sized (the status bar's margin math; the §5.9 bookkeeping fix).
+const MAX_OUTER_WIDTH: f32 = 880.0;
 
 /// What the transport leaves free at the sides on a narrow screen.
 const SIDE_INSET: f32 = 24.0;
@@ -192,24 +195,68 @@ impl super::Gui {
             self.last_timeline = TimelineProbe::default();
         }
 
-        if self.timeline_collapsed {
-            self.render_timeline_chip(ctx, map_rect, phone_bar_top);
+        // The fade (§1.8): fully faded, neither form renders — the absence is
+        // the input transparency — and a transition renders dimmed and dead.
+        let Some(chrome) = self.chrome_fade() else {
+            return;
+        };
+
+        // The collapse animates as a cross-fade between the two forms
+        // (§3.3): each has its own factor, and during the swap both render —
+        // the incoming one live, the outgoing one as a dead remnant. Under
+        // test the time is zero and exactly one form draws per frame.
+        let expanded_factor = ctx.animate_bool_with_time(
+            egui::Id::new("timeline_expanded"),
+            !self.timeline_collapsed,
+            super::fade::anim_time(),
+        );
+        let chip_factor = ctx.animate_bool_with_time(
+            egui::Id::new("timeline_chip"),
+            self.timeline_collapsed,
+            super::fade::anim_time(),
+        );
+
+        if chip_factor > 0.0 {
+            let opacity = if self.timeline_collapsed {
+                chrome
+            } else {
+                (chrome * chip_factor).min(0.99)
+            };
+            self.render_timeline_chip(ctx, map_rect, phone_bar_top, opacity);
+        }
+        if expanded_factor <= 0.0 {
             return;
         }
+        let opacity = if self.timeline_collapsed {
+            (chrome * expanded_factor).min(0.99)
+        } else {
+            chrome
+        };
 
-        let (anchor_bottom, inner_width) = match phone_bar_top {
+        let frame = egui::Frame::window(&ctx.global_style());
+        // `min(880, full − 24)` is the **outer** width (§1.5); the phone's
+        // inline form spans the full inset width on the same terms as the
+        // bottom bar below it. Either way the frame's margins come out
+        // before the content is sized, so the surface lands exactly on the
+        // stated width — the status bar's own margin math.
+        let (anchor_bottom, outer_width) = match phone_bar_top {
             Some(bar_top) => (bar_top - CHIP_INSET, map_rect.width() - 2.0 * CHIP_INSET),
             None => (
                 map_rect.bottom() - BOTTOM_CLEARANCE,
-                (map_rect.width() - SIDE_INSET).min(MAX_INNER_WIDTH),
+                (map_rect.width() - SIDE_INSET).min(MAX_OUTER_WIDTH),
             ),
         };
+        // Margins *and* the stroke, which egui 0.35 lays outside the inner
+        // margin — the sheet's own containment math (`ui_sheet.rs`).
+        let inner_width =
+            outer_width - frame.inner_margin.sum().x - 2.0 * frame.stroke.width;
         let area = egui::Area::new(egui::Id::new("timeline"))
             .order(egui::Order::Middle)
             .pivot(egui::Align2::CENTER_BOTTOM)
             .fixed_pos(egui::pos2(map_rect.center().x, anchor_bottom))
             .show(ctx, |ui| {
-                egui::Frame::window(&ctx.global_style()).show(ui, |ui| {
+                frame.show(ui, |ui| {
+                    super::fade::dim(ui, opacity);
                     ui.set_width(inner_width);
                     self.render_timeline_row1(ui, actions);
                     if self.timeline_row2 {
@@ -238,6 +285,7 @@ impl super::Gui {
         ctx: &egui::Context,
         map_rect: egui::Rect,
         phone_bar_top: Option<f32>,
+        opacity: f32,
     ) {
         let bottom = phone_bar_top.map_or(map_rect.bottom(), |bar_top| bar_top);
         let area = egui::Area::new(egui::Id::new("timeline_chip"))
@@ -246,6 +294,7 @@ impl super::Gui {
             .fixed_pos(egui::pos2(map_rect.right() - CHIP_INSET, bottom - CHIP_INSET))
             .show(ctx, |ui| {
                 egui::Frame::window(&ctx.global_style()).show(ui, |ui| {
+                    super::fade::dim(ui, opacity);
                     let chip = ui.button(format!("\u{1f550} {}", self.active_time_label()));
                     if chip.clicked() {
                         self.timeline_collapsed = false;
@@ -518,21 +567,38 @@ impl super::Gui {
             .filter(|&total| total > 0);
 
         if let Some(total) = loop_frames {
-            // Loop form: seek frames live.
-            let mut frame_idx = self.panes[pane_idx].loop_state.current_frame;
-            let seek = ui.add(egui::Slider::new(&mut frame_idx, 0..=(total - 1)).show_value(false));
+            // Loop form: seek frames live. Under its own id scope, distinct
+            // from the archive form's below (§5.9): the two forms share this
+            // auto-id slot, so without the salts a loop landing mid-drag
+            // would hand the archive drag to the seek slider — same id, new
+            // meaning — and the release would commit a frame index as an
+            // archive moment.
+            let seek = ui
+                .push_id("scrub_loop", |ui| {
+                    let mut frame_idx = self.panes[pane_idx].loop_state.current_frame;
+                    let seek = ui
+                        .add(egui::Slider::new(&mut frame_idx, 0..=(total - 1)).show_value(false));
+                    if seek.changed() {
+                        for pane_idx in self.loop_sync_targets() {
+                            actions.push(GuiAction::SeekLoopFrame {
+                                pane_idx,
+                                frame_index: frame_idx,
+                            });
+                        }
+                    }
+                    seek
+                })
+                .inner;
             #[cfg(test)]
             {
+                // Reported beside the archive form's, so the distinct-id
+                // claim is a comparison of the ids egui really used.
+                self.widget_id_probes
+                    .push(("timeline_scrubber_loop", seek.id));
                 self.last_timeline.scrubber = seek.rect;
             }
-            if seek.changed() {
-                for pane_idx in self.loop_sync_targets() {
-                    actions.push(GuiAction::SeekLoopFrame {
-                        pane_idx,
-                        frame_index: frame_idx,
-                    });
-                }
-            }
+            #[cfg(not(test))]
+            let _ = seek;
             return;
         }
 
@@ -555,7 +621,13 @@ impl super::Gui {
             }
         };
         let mut frac = self.timeline_scrub.unwrap_or(resting);
-        let scrub = ui.add(egui::Slider::new(&mut frac, 0.0..=1.0).show_value(false));
+        // The archive form's own id scope — the pair of the loop form's
+        // above, so a mid-drag form flip can never carry a drag across.
+        let scrub = ui
+            .push_id("scrub_archive", |ui| {
+                ui.add(egui::Slider::new(&mut frac, 0.0..=1.0).show_value(false))
+            })
+            .inner;
         #[cfg(test)]
         {
             // Reported like `time_step_sel`, so the keyboard test can put

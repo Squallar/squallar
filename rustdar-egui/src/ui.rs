@@ -86,6 +86,8 @@ pub(crate) use pills::PILL_ROW_CLEARANCE;
 /// harness.
 #[cfg(test)]
 pub(crate) use pills::{PillKind, PillPopoverProbe, PillRowProbe};
+#[path = "ui_fade.rs"]
+mod fade;
 #[path = "ui_sheet.rs"]
 mod sheet;
 /// The sheet's snap extent — `Gui` holds one as session state.
@@ -102,6 +104,10 @@ pub(crate) use sheet::{BottomBarProbe, ErrorToastProbe, SheetProbe};
 mod catalog;
 /// The preset shape, re-used by the config writer.
 pub(crate) use catalog::PresetConfig;
+/// The compiled-in presets, for the parity walk — the catalog leg's Presets
+/// inventory is the table the renderer draws, not a restated name list.
+#[cfg(test)]
+pub(crate) use catalog::builtin_presets;
 /// What the catalog drew last frame, for the input harness.
 #[cfg(test)]
 pub(crate) use catalog::{CatalogGroup, CatalogProbe, CatalogTileProbe};
@@ -552,12 +558,10 @@ pub struct Gui {
     /// tests.
     #[cfg(test)]
     last_pill_popover: Option<pills::PillPopoverProbe>,
-    /// Whether some feature consumed the last frame's map click — the probe
-    /// half of the `click_consumed` plumbing M7's fade will read. Only read
-    /// by tests; production keeps the flag local to `render_panes` until the
-    /// fade exists to consult it.
-    #[cfg(test)]
-    last_click_consumed: bool,
+    /// Whether some feature consumed this frame's map click — written by the
+    /// pane loop, read by [`Self::apply_fade_toggle`] (a consumed click while
+    /// faded unfades; see `ui_fade.rs`) and by the harness's probe.
+    click_consumed_frame: bool,
     /// How many times handler `ControlItem`s were rendered this frame.
     ///
     /// The double-render guard: each render is a load→mutate→save round trip
@@ -824,6 +828,44 @@ pub struct Gui {
     /// Persisted (`UiConfig::pin_pane_controls`); the settings body's
     /// Interface section is the one writer.
     pin_pane_controls: bool,
+    /// Whether the floating chrome is faded away (plan §1.8) — the map-first
+    /// state one qualifying click enters and the next one leaves. Session-only
+    /// like every open-surface flag: hiding the UI is a gesture, not a
+    /// preference. Everything about it lives in `ui_fade.rs`.
+    ui_faded: bool,
+    /// The pane loop's verdict that this frame's click qualifies as the fade
+    /// gesture — recorded in `render_panes` (which alone knows the click's
+    /// pane, kind and consumption), resolved by [`Self::apply_fade_toggle`]
+    /// after the pending appliers. One-shot per frame.
+    fade_candidate: bool,
+    /// Whether the most recent primary press was the one that switched the
+    /// active pane — written by `detect_active_pane_click` on every press,
+    /// read by the fade trigger so a first click on an inactive pane only
+    /// activates it (§1.8). Session-only bookkeeping.
+    press_switched_pane: bool,
+    /// Whether an egui popup — a pill popover, the ☰ dropdown, an open combo
+    /// — was open when the most recent primary press landed. Written beside
+    /// [`Self::press_switched_pane`], read by the fade trigger: a click
+    /// whose press found a popup open is that popup's dismissal (egui closes
+    /// it on the click outside), not a fade gesture. Recorded at press time
+    /// because by the time the click confirms — the release, or a touch
+    /// tap's deferral later — the popup has already closed and the frame
+    /// can no longer see what the press was aimed at.
+    press_popup_open: bool,
+    /// This frame's shared chrome opacity, resolved once at frame top by
+    /// [`Self::enforce_fade_invariants`] from the fade animation: `1.0` fully
+    /// present, `0.0` fully faded (surfaces skip rendering), in between a
+    /// non-interactive transition. See `ui_fade.rs`.
+    fade_factor: f32,
+    /// The page the sheet last showed — what the sheet's fall animation
+    /// renders after the flags have already closed (`ui_sheet.rs`); never
+    /// read while a page is open. Session-only bookkeeping.
+    sheet_last_page: Option<sheet::SheetPage>,
+    /// The message the error toast last showed — what the toast's fade-out
+    /// renders after the error has already cleared (`ui_sheet.rs`), on the
+    /// same terms as [`Self::sheet_last_page`]; never read while an error is
+    /// up. Session-only bookkeeping.
+    toast_last_error: Option<String>,
     /// The user's saved presets (§3.11). Persisted; the built-ins are
     /// compiled in beside them (`catalog::builtin_presets`) and never saved.
     presets: Vec<PresetConfig>,
@@ -1422,8 +1464,7 @@ impl Gui {
             last_pills: Vec::new(),
             #[cfg(test)]
             last_pill_popover: None,
-            #[cfg(test)]
-            last_click_consumed: false,
+            click_consumed_frame: false,
             #[cfg(test)]
             control_render_passes: 0,
             #[cfg(test)]
@@ -1468,6 +1509,13 @@ impl Gui {
             pills_drawn_last_frame: 0,
             pills_raise_pending: false,
             pin_pane_controls: false,
+            ui_faded: false,
+            fade_candidate: false,
+            press_switched_pane: false,
+            press_popup_open: false,
+            fade_factor: 1.0,
+            sheet_last_page: None,
+            toast_last_error: None,
             presets: Vec::new(),
             // The desktop arm of `constants::MAX_LOOP_FRAMES`; the frontend
             // pushes the real target's value at startup.
@@ -1547,8 +1595,6 @@ impl Gui {
             // entry would report a row for a pane no longer on screen.
             self.last_pills.clear();
             self.last_pill_popover = None;
-            // Per-frame record of the pane loop's click consumption.
-            self.last_click_consumed = false;
             // The double-render guard's counter; see the field.
             self.control_render_passes = 0;
             // Per-frame records of the phone shell's bottom cluster; reset
@@ -1568,6 +1614,12 @@ impl Gui {
         if self.layout.width != crate::ui_layout::WidthClass::Compact {
             self.menu_open = false;
         }
+
+        // The fade's frame-top pass: while faded nothing may be open — a
+        // surface found open means the user acted through a route the
+        // pointer guards cannot see, and the repair is to unfade — and the
+        // frame's shared chrome opacity resolves here, once. See `ui_fade.rs`.
+        self.enforce_fade_invariants(ctx);
 
         // Create a root Ui to host the panels. Since egui 0.35 the Context-taking
         // `Panel::show` is gone and panels are Ui-scoped only, so this root Ui is
@@ -1636,6 +1688,11 @@ impl Gui {
         // the arming rule rather than to this call order.
         self.apply_pending_region();
 
+        // The fade toggle, after the appliers like every other loop-recorded
+        // intent: it needs the pane loop's final consumption verdict, and the
+        // surfaces drawn below read the state it settles. See `ui_fade.rs`.
+        self.apply_fade_toggle(ctx);
+
         // The pill rows, after the pane loop and the appliers: outside every
         // `mem::take` window, so a popover pick writes real panes, and after
         // the kind appliers so a row states the kind its pane ended the
@@ -1661,8 +1718,16 @@ impl Gui {
         // shell's own pass — and the Catalog page's apply paths take panes
         // themselves, so no window may already be open. See `ui_sheet.rs`.
         if let Some(bar_top) = phone_bar_top {
-            self.render_phone_error_toast(ctx, shell.map_rect);
+            self.render_phone_error_toast(ctx, shell.map_rect, true);
             self.render_phone_sheet(ctx, shell.map_rect, bar_top, &mut actions);
+        } else {
+            // The error surface outranks the fade (the deliberate §1.8
+            // refinement in `ui_fade.rs`): the wide widths normally carry the
+            // error inside the status bar, which is faded — so while faded
+            // the phone's own toast presentation carries it instead. Called
+            // unconditionally so its rise and fall animate through the
+            // fade/unfade handoff; unfaded it presents nothing.
+            self.render_phone_error_toast(ctx, shell.map_rect, self.ui_faded);
         }
 
         // Floating windows last, so they layer above the chrome and the map.
@@ -1967,6 +2032,9 @@ impl Gui {
     ///
     /// Ordered topmost first — whatever is painted over everything else is
     /// what a press is aimed at — and exactly one layer closes per press.
+    /// The full order (contract 65): the in-flight handle drag → the fade →
+    /// the ☰ dropdown → catalog → feature → time → menu → inspector → the
+    /// stack's drawer form → the armed drags.
     ///
     /// Not derived from the order `ui` calls them in, which is shell (stack
     /// and inspector included), then time dialog, then popup. The popup is
@@ -1993,6 +2061,20 @@ impl Gui {
         // started from — the preview was never written anywhere.
         if self.section_edit_drag.is_some() {
             self.section_edit_drag = None;
+            return true;
+        }
+        // The fade, next: while faded the invariant holds nothing else open
+        // (`enforce_fade_invariants`), so a back press can only mean "restore
+        // my UI" — the same reading every top-bar interaction gives it
+        // (§3.6's unfade-before-acting), and consistent with the chain's
+        // rule: the press is aimed at the most immediate state the user is
+        // in. Only the handle drag outranks it, because a drag in flight can
+        // exist *while* faded — the map stays interactive — and it owns the
+        // pointer right now. The armed modes cannot coexist with the fade
+        // (arming routes unfade first; an armed click never fades), so their
+        // place below is never contested.
+        if self.ui_faded {
+            self.ui_faded = false;
             return true;
         }
         // The ☰ dropdown, above every dialog: it is `Order::Foreground` and
@@ -3546,10 +3628,10 @@ impl Gui {
     }
 
     /// Whether some feature consumed the last frame's map click — see the
-    /// `last_click_consumed` field.
+    /// `click_consumed_frame` field.
     #[cfg(test)]
     pub(crate) fn click_consumed_for_test(&self) -> bool {
-        self.last_click_consumed
+        self.click_consumed_frame
     }
 
 
@@ -3572,6 +3654,15 @@ impl Gui {
     #[cfg(test)]
     pub(crate) fn set_time_dialog_open_for_test(&mut self, open: bool) {
         self.time_dialog.show = open;
+    }
+
+    /// Open or close the Add-layer catalog directly, for fixtures stacking
+    /// layers the UI routes cannot stack — the Esc-chain walk opens it under
+    /// a feature popup and a time dialog, whose windows would swallow the
+    /// clicks the UI route needs.
+    #[cfg(test)]
+    pub(crate) fn set_catalog_open_for_test(&mut self, open: bool) {
+        self.catalog_open = open;
     }
 
     /// Which pane is currently active.

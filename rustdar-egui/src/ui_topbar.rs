@@ -155,14 +155,20 @@ impl super::Gui {
             });
         });
 
+        // The unfade-before-acting choke point (§3.6, `ui_fade.rs`): a press
+        // on the bar while faded clears the fade before the shell draws the
+        // floating chrome, so whatever the press performs — this frame's
+        // handlers above have already run it — lands in a visible UI. After
+        // the panel so the rect is this frame's true one; before the menu
+        // dispatch below, which is the last of the bar's acting.
+        self.clear_fade_on_top_bar_press(ui.ctx(), panel.response.rect);
+
         #[cfg(test)]
         {
             probe.rect = panel.response.rect;
             self.last_top_bar = probe;
             self.last_menu_leaves.extend(menu_frame.drawn.iter().copied());
         }
-        #[cfg(not(test))]
-        let _ = panel;
 
         for event in menu_frame.events {
             self.apply_menu_event(event, actions);
@@ -406,6 +412,9 @@ impl super::Gui {
                     #[cfg(test)]
                     {
                         probe.layers_toggle = (layers.rect, layers_open);
+                        // The toggle's real egui id, so the keyboard tests can
+                        // focus the widget egui keyed rather than a guess.
+                        self.widget_id_probes.push(("layers_toggle", layers.id));
                     }
                     if layers.clicked() {
                         // On Expanded the toggle writes the explicit choice over

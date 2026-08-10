@@ -52,8 +52,8 @@ pub(super) struct PaneRenderCtx<'a> {
     /// Set by every handler that **acts** on
     /// [`overlay_click_pos`](Self::overlay_click_pos) — an overlay feature
     /// hit, a radar-site icon click. One flag for the whole frame's pane
-    /// loop, owned by `render_panes`: M7's fade trigger is a click nothing
-    /// consumed, and this is the consumption half of it. See the CONVENTION
+    /// loop, owned by `render_panes`: the fade trigger (`ui_fade.rs`) is a
+    /// click nothing consumed, and this is the consumption half of it. See the CONVENTION
     /// comment in `ui_map.rs`.
     pub click_consumed: &'a mut bool,
     /// User unit and timezone preferences.
@@ -327,7 +327,7 @@ pub(super) fn render_pane_map_content(
             ctx.overlays.selected_overlays = selected;
             ctx.overlays.selected_overlay_page = 0;
             // A feature answered this frame's click — the consumption half
-            // of M7's fade trigger (see `PaneRenderCtx::click_consumed`).
+            // of the fade trigger (see `PaneRenderCtx::click_consumed`).
             *ctx.click_consumed = true;
         }
 
@@ -915,7 +915,7 @@ fn handle_radar_site_interactions(
                 pane_idx,
             });
             // An icon answered this frame's click — the consumption half of
-            // M7's fade trigger (see `PaneRenderCtx::click_consumed`).
+            // the fade trigger (see `PaneRenderCtx::click_consumed`).
             **click_consumed = true;
         }
 
