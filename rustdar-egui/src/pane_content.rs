@@ -782,6 +782,14 @@ pub struct VolumePane {
     /// downstream reads [`crate::volume_view::VolumeFrameState::floor`],
     /// which is the positive form.
     pub hide_floor: bool,
+    /// Whether this pane's Volume Alpha editor window is open.
+    ///
+    /// Session state, not persisted: the *curves* the editor draws are the
+    /// durable thing (per product, in the UI config); an open tool window is
+    /// a posture, and restoring it over a pane whose volume has not built yet
+    /// would be a window full of "waiting" on every launch. Default `false`
+    /// keeps the derived `Default` honest.
+    pub alpha_editor_open: bool,
 }
 
 impl VolumePane {

@@ -91,11 +91,13 @@
 //!   crosses the boundary — a format change, not a transfer function.
 
 use std::any::Any;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use egui_wgpu::wgpu;
 use rustdar_egui::pane::VolumeTarget;
+use rustdar_egui::volume_alpha::AlphaCurve;
 use rustdar_egui::volume_view::{VolumeFrameState, VolumePaint, VolumePainter, view_for};
 use rustdar_radar::voxel::VoxelGrid;
 
@@ -265,6 +267,79 @@ pub fn cloud_reconstruction_lod_for(largest_cell_km: f32) -> f32 {
 /// than production ships.
 pub fn empty_index_threshold_for(band: u8) -> f32 {
     (f32::from(band) + 0.5) / 255.0
+}
+
+/// The fade band the march should anchor on: the palette's own, unless the
+/// user has drawn a Volume Alpha curve — then the **curve's**.
+///
+/// # The fade-anchor decision, in full
+///
+/// The skip threshold and the soft-edge ramp both anchor at
+/// [`empty_index_threshold_for`] of this band, and the band must describe the
+/// alpha the march will actually fetch — which, with a curve applied, is the
+/// curve and not the palette. Anchoring on the palette while rendering
+/// through the curve fails in both directions at once:
+///
+/// * A user who **strips the low end** (the canonical Volume Alpha gesture —
+///   erase the sub-30 dBZ haze) raises the first visible entry far above the
+///   palette's band. The palette-anchored march would sample — and shade, up
+///   to seven fetches per step — every cell in the stripped shell, paying
+///   full cost for guaranteed-zero alpha; and the soft ramp's foot would sit
+///   dozens of indices below the first visible entry, so the new visible
+///   bottom would arrive as the hard cliff the ramp exists to dissolve.
+/// * A user who **paints alpha into the palette's fade band** lowers the
+///   first visible entry below the palette's band. The palette-anchored
+///   march would *skip* those samples: visible data, silently erased —
+///   the one thing a skip threshold must never do.
+///
+/// So the threshold follows the effective curve, exactly:
+/// [`AlphaCurve::fade_band`] mirrors [`VoxelGrid::fade_band`]'s rule entry
+/// for entry, and the separation property — the threshold sits strictly
+/// between the last transparent entry and the first visible one — holds for
+/// every curve by the same arithmetic the palette case is pinned by. Zero-
+/// alpha runs *above* the first visible entry are not skipped, only unlit
+/// (`entry.a = 0` absorbs nothing): conservative, correct, and the cost the
+/// user asked for. An all-transparent curve yields band 255, a threshold
+/// above every representable index, and an honestly empty pane — no
+/// division anywhere on the path (the ramp's divisor is the constant
+/// [`EDGE_SOFT_WIDTH`], floored at `1e-6` in the shader).
+///
+/// The **refusal gate** ([`palette_refusal`]) deliberately stays on the
+/// palette's band: it is a statement about the product's palette design —
+/// "this table was built for a plan view" — not about the session's curve. A
+/// refused moment never reaches the LUT seam, so a curve cannot un-refuse
+/// velocity; and a reflectivity curve that paints the low end cannot refuse
+/// the user out of their own product mid-edit. The instrument path is
+/// untouched by construction: `VolumeUniform::new`'s defaults and the
+/// GPU-test uploads never see a frame state, which is the only carrier a
+/// curve has.
+pub fn effective_fade_band(palette_band: u8, curve: Option<&AlphaCurve>) -> u8 {
+    curve.map_or(palette_band, AlphaCurve::fade_band)
+}
+
+/// The colour table as the GPU should hold it: the grid's own bytes, with the
+/// alpha channel replaced by the user's curve when one exists.
+///
+/// `None` borrows the input unchanged — **bit-exact by construction**, which
+/// is the untouched editor's whole contract: not "an equal copy" but the very
+/// bytes `VoxelGrid::lut()` handed over, so no rewrite of this function can
+/// drift the no-curve path away from the palette. `Some` copies once and
+/// touches only every fourth byte: colours are the palette's at every entry,
+/// alpha is the curve's, and entry 0 is forced transparent a third time here
+/// (after the curve's constructor and the stroke's re-clamp) because this is
+/// the last line before the bytes leave the CPU.
+pub fn effective_lut<'a>(base: &'a [u8], curve: Option<&AlphaCurve>) -> Cow<'a, [u8]> {
+    let Some(curve) = curve else {
+        return Cow::Borrowed(base);
+    };
+    let mut out = base.to_vec();
+    for (entry, alpha) in out.chunks_exact_mut(4).zip(curve.alphas()) {
+        entry[3] = *alpha;
+    }
+    if let Some(no_data) = out.get_mut(3) {
+        *no_data = 0;
+    }
+    Cow::Owned(out)
 }
 
 /// A voxel grid the store is holding, or the state of not holding one yet.
@@ -860,15 +935,19 @@ impl VolumePainter for BridgeVolumePainter {
             uniform.reconstruction_lod = cloud_reconstruction_lod_for(largest_cell_km(&uniform));
             uniform.step_cells = CLOUD_STEP_CELLS;
         }
-        // The march's transfer edge, anchored at this palette's own fade
-        // boundary. `fade_band()` counts the fully transparent indices above
-        // the no-data index, so the first visible entry is `band + 1` and
-        // [`empty_index_threshold_for`] — `(band + 0.5) / 255` — is exactly
-        // where a Nearest LUT fetch starts returning visible entries: below
-        // it the march can skip the sample — and its up-to-seven shading
-        // fetches — without changing a pixel. The ramp then dissolves the
-        // alpha cliff at that same boundary over [`EDGE_SOFT_WIDTH`].
-        uniform.empty_index_threshold = empty_index_threshold_for(grid.fade_band());
+        // The march's transfer edge, anchored at the **effective** fade
+        // boundary: the palette's own unless a Volume Alpha curve is applied,
+        // then the curve's — [`effective_fade_band`] holds the whole decision
+        // and its reasoning. Either way the band counts the fully transparent
+        // indices above the no-data index, so the first visible entry is
+        // `band + 1` and [`empty_index_threshold_for`] — `(band + 0.5) / 255`
+        // — is exactly where a Nearest LUT fetch of the *uploaded* table
+        // starts returning visible entries: below it the march can skip the
+        // sample — and its up-to-seven shading fetches — without changing a
+        // pixel. The ramp then dissolves the alpha cliff at that same
+        // boundary over [`EDGE_SOFT_WIDTH`].
+        uniform.empty_index_threshold =
+            empty_index_threshold_for(effective_fade_band(grid.fade_band(), frame.alpha.as_ref()));
         uniform.edge_soft_width = EDGE_SOFT_WIDTH;
 
         // The floor: drawn only when the pane wants it AND one is in hand.
@@ -886,6 +965,9 @@ impl VolumePainter for BridgeVolumePainter {
             grid_id: found.id,
             grid,
             floor,
+            // The Volume Alpha curve rides to `prepare`, which owns the LUT
+            // upload — the one seam the curve is applied at.
+            alpha: frame.alpha.clone(),
             uniform,
             offscreen_px: fitted.size,
             live_ids: self.store.live_ids(),
@@ -893,6 +975,17 @@ impl VolumePainter for BridgeVolumePainter {
         };
 
         VolumePaint::Callback(paint_payload(callback))
+    }
+
+    /// The grid's own colour table, for the Volume Alpha editor's palette
+    /// strip and default curve — through the same pane-scoped lookup `paint`
+    /// draws by, so the editor always shows the table the pane is actually
+    /// rendering through, stand-in grid and all.
+    fn palette(&self, pane_idx: usize, target: &VolumeTarget) -> Option<Vec<u8>> {
+        match self.store.lookup_for_pane(pane_idx, target)?.entry {
+            VolumeEntry::Ready(grid) => Some(grid.lut().to_vec()),
+            VolumeEntry::Building | VolumeEntry::Refused(_) => None,
+        }
     }
 }
 
@@ -978,10 +1071,26 @@ pub struct VolumeResources {
     targets: HashMap<usize, Option<OffscreenTarget>>,
     /// One upload per grid, keyed by the store's id. Two panes on one volume
     /// share the entry, which is the GPU half of the store's refcounting.
-    uploads: HashMap<u64, VolumeTextures>,
+    uploads: HashMap<u64, VolumeUpload>,
     /// One upload per floor, keyed by the store's floor id and retained the
     /// same way — uploaded once when the floor lands, reused every frame.
     floors: HashMap<u64, crate::volume::raymarch::FloorTexture>,
+}
+
+/// One grid's GPU upload, and which Volume Alpha curve its colour table was
+/// written through.
+///
+/// The curve is the staleness key for the 1 KiB LUT alone: the grid beside it
+/// never changes for a given store id, so an edit rewrites the table in place
+/// (`VolumeTextures::write_lut`) instead of re-uploading 8 MiB of indices.
+/// Compared every frame, rewritten only on change — `AlphaCurve`'s equality
+/// takes the `Arc` pointer fast path, so the steady-state cost of an open
+/// editor is one pointer comparison per pane per frame.
+struct VolumeUpload {
+    textures: VolumeTextures,
+    /// The curve the uploaded table reflects — `None` for the grid's own
+    /// palette, which is the bit-exact untouched-editor state.
+    applied_alpha: Option<AlphaCurve>,
 }
 
 impl VolumeResources {
@@ -1028,6 +1137,11 @@ struct VolumeCallback {
     /// The floor under this box, when the pane wants one and one is in hand.
     /// `uniform.map_floor` is true exactly when this is `Some`.
     floor: Option<(u64, Arc<crate::volume::floor::FloorImage>)>,
+    /// The Volume Alpha curve the LUT must be uploaded through, or `None` for
+    /// the grid's own table, bit-exactly. `prepare` compares this against
+    /// what the upload cache holds and rewrites the 1 KiB table only on
+    /// change — never per unchanged frame.
+    alpha: Option<AlphaCurve>,
     uniform: VolumeUniform,
     offscreen_px: [u32; 2],
     /// Every grid the store still holds, so `prepare` can free the uploads for
@@ -1076,8 +1190,23 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
         // Through the entry API rather than `contains_key` + `insert`, which is
         // one hash lookup instead of two — and the upload is refusable, so this
         // is a `match` on the entry rather than `or_insert_with`.
-        let textures = match uploads.entry(self.grid_id) {
-            std::collections::hash_map::Entry::Occupied(occupied) => occupied.into_mut(),
+        let upload = match uploads.entry(self.grid_id) {
+            std::collections::hash_map::Entry::Occupied(occupied) => {
+                let upload = occupied.into_mut();
+                // The Volume Alpha seam's steady state: rewrite the 1 KiB
+                // table only when the curve actually changed — a pointer
+                // comparison almost every frame — and leave the 8 MiB grid
+                // untouched always. `effective_lut` with `None` is the grid's
+                // own bytes, so clearing a curve restores the palette
+                // bit-exactly through the very same path that applied it.
+                if upload.applied_alpha != self.alpha {
+                    upload
+                        .textures
+                        .write_lut(queue, &effective_lut(self.grid.lut(), self.alpha.as_ref()));
+                    upload.applied_alpha = self.alpha.clone();
+                }
+                upload
+            }
             std::collections::hash_map::Entry::Vacant(vacant) => {
                 let shape = self.grid.shape();
                 let Some(textures) = pipelines.upload_volume(
@@ -1085,17 +1214,23 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
                     queue,
                     [shape.nx as u32, shape.ny as u32, shape.nz as u32],
                     self.grid.indices(),
-                    // Straight from the grid: the table travels inside it, and
-                    // nothing here rewrites it. See the module doc.
-                    self.grid.lut(),
+                    // The grid's own table, through the one seam a user curve
+                    // may rewrite its alpha at — `effective_lut` borrows the
+                    // grid's bytes untouched when there is no curve. See the
+                    // module doc.
+                    &effective_lut(self.grid.lut(), self.alpha.as_ref()),
                 ) else {
                     // `upload_volume` has already logged which invariant it
                     // refused on. Nothing to add, and nothing to draw.
                     return Vec::new();
                 };
-                vacant.insert(textures)
+                vacant.insert(VolumeUpload {
+                    textures,
+                    applied_alpha: self.alpha.clone(),
+                })
             }
         };
+        let textures = &upload.textures;
 
         // The floor's upload, once per floor id — the same entry discipline
         // as the grid's, minus the refusal arm: `upload_floor` validates the
@@ -1225,6 +1360,18 @@ mod tests {
             store.complete(t, VolumeEntry::Refused(note.to_owned())),
             "precondition: the entry this just opened takes the result"
         );
+    }
+
+    /// A 1024-byte palette with `band` fully transparent entries above the
+    /// no-data index — the alpha shape `fade_band` measures — and colour
+    /// channels that vary per entry so a channel-order mistake cannot pass.
+    fn fade_lut(band: usize) -> Vec<u8> {
+        let mut lut = Vec::with_capacity(256 * 4);
+        for i in 0..256usize {
+            let alpha = if i <= band { 0 } else { 180 };
+            lut.extend_from_slice(&[i as u8, 200u8.wrapping_sub(i as u8), 37, alpha]);
+        }
+        lut
     }
 
     /// A real, tiny grid, for the tests whose subject is what may *stand in*
@@ -1772,11 +1919,14 @@ mod tests {
         // the default width staying hard.
         assert!(
             body.contains(
-                "uniform.empty_index_threshold = empty_index_threshold_for(grid.fade_band())"
+                "empty_index_threshold_for(effective_fade_band(grid.fade_band(), frame.alpha.as_ref()))"
             ),
-            "`paint` no longer anchors the skip threshold at the palette's fade \
-             boundary, so the march reverts to skipping only index 0 — every \
-             transparent cell under the band pays full sample cost again",
+            "`paint` no longer anchors the skip threshold at the EFFECTIVE fade \
+             boundary — the palette's band through `effective_fade_band`, or the \
+             user's Volume Alpha curve's when one is applied. Anchoring on the \
+             palette alone erases the bottom of a curve that paints into the \
+             band and pays full sample cost through a curve that strips it; \
+             anchoring on nothing reverts to skipping only index 0",
         );
         assert!(
             body.contains("uniform.edge_soft_width = EDGE_SOFT_WIDTH"),
@@ -1926,6 +2076,186 @@ mod tests {
         // decides the opacity the first visible index fades in at (~1% at the
         // midpoint, ~9% one index lower).
         assert_eq!(empty_index_threshold_for(64), 64.5 / 255.0);
+    }
+
+    /// **The untouched Volume Alpha editor is bit-exact, by construction.**
+    ///
+    /// With no curve, [`effective_lut`] must answer with the grid's own bytes
+    /// — the same allocation, not an equal copy — because "borrowed" is the
+    /// one shape no alpha rewrite can quietly pass through. The mutation this
+    /// exists to kill is any unconditional transform at the upload seam (a
+    /// constant 0.5 alpha, a re-derived table): every one of them turns the
+    /// borrow into an owned buffer or moves the bytes, and this test dies.
+    #[test]
+    fn an_untouched_editor_uploads_the_grids_own_bytes() {
+        let lut = fade_lut(64);
+        let out = effective_lut(&lut, None);
+        assert!(
+            matches!(out, Cow::Borrowed(_)),
+            "no curve must mean the grid's own bytes travel to the GPU, not a rewrite",
+        );
+        assert!(
+            std::ptr::eq(out.as_ptr(), lut.as_ptr()),
+            "the borrowed table must be the very slice the grid handed over",
+        );
+        assert_eq!(&*out, &lut[..], "and byte-identical, trivially");
+    }
+
+    /// A curve replaces the LUT's alpha channel and nothing else: colours are
+    /// the palette's at every entry, alpha is the curve's, and entry 0 stays
+    /// transparent whatever anyone claims.
+    #[test]
+    fn a_curve_replaces_only_the_alpha_channel() {
+        use rustdar_egui::volume_alpha::{AlphaCurve, CURVE_LEN};
+
+        let lut = fade_lut(64);
+        let mut alphas = [0u8; CURVE_LEN];
+        for (i, slot) in alphas.iter_mut().enumerate() {
+            *slot = (255 - i) as u8; // a curve unlike any palette's
+        }
+        let curve = AlphaCurve::from_alphas(alphas);
+        let out = effective_lut(&lut, Some(&curve));
+
+        for (i, (got, want)) in out.chunks_exact(4).zip(lut.chunks_exact(4)).enumerate() {
+            assert_eq!(
+                got[..3],
+                want[..3],
+                "entry {i}: the colour channels must stay the palette's",
+            );
+            let expected = if i == 0 { 0 } else { curve.alphas()[i] };
+            assert_eq!(got[3], expected, "entry {i}: the alpha must be the curve's");
+        }
+    }
+
+    /// **The skip threshold follows the effective curve, exactly.**
+    ///
+    /// For every curve, the threshold [`effective_fade_band`] anchors must
+    /// separate the last transparent entry of the **uploaded** table from its
+    /// first visible one — the march may never skip visible data and never
+    /// pay for a guaranteed-transparent shell at the ramp's foot. Checked
+    /// against [`effective_lut`]'s actual output rather than against the
+    /// curve, so the two halves of the seam (what is uploaded, what is
+    /// anchored) are pinned to agree with *each other*: mutating either one —
+    /// anchoring on the palette band while a curve strips the low end, or
+    /// uploading a curve the anchor ignores — breaks the agreement and fails
+    /// here by name.
+    #[test]
+    fn the_skip_threshold_follows_the_effective_curve() {
+        use rustdar_egui::volume_alpha::{AlphaCurve, CURVE_LEN};
+
+        let palette = fade_lut(64);
+        let palette_band = 64u8;
+
+        // The canonical gesture (strip the low end to 120), its inverse
+        // (paint alpha into the palette's fade band), an untouched editor,
+        // and the extremes: everything transparent, everything opaque.
+        let curves: Vec<Option<AlphaCurve>> = vec![
+            None,
+            Some(AlphaCurve::from_alphas({
+                let mut a = [0u8; CURVE_LEN];
+                a[120..].fill(200);
+                a
+            })),
+            Some(AlphaCurve::from_alphas({
+                let mut a = [0u8; CURVE_LEN];
+                a[1..].fill(30);
+                a
+            })),
+            Some(AlphaCurve::from_alphas([0u8; CURVE_LEN])),
+            Some(AlphaCurve::from_alphas([255u8; CURVE_LEN])),
+        ];
+
+        for curve in &curves {
+            let band = effective_fade_band(palette_band, curve.as_ref());
+            let threshold = empty_index_threshold_for(band);
+            let uploaded = effective_lut(&palette, curve.as_ref());
+
+            for (i, entry) in uploaded.chunks_exact(4).enumerate() {
+                let index_value = i as f32 / 255.0;
+                if index_value <= threshold {
+                    assert_eq!(
+                        entry[3], 0,
+                        "curve {curve:?}: entry {i} is under the skip threshold \
+                         but visible in the uploaded table — the march would \
+                         erase it",
+                    );
+                }
+            }
+            if band < u8::MAX {
+                let first_visible = usize::from(band) + 1;
+                assert!(
+                    first_visible as f32 / 255.0 > threshold,
+                    "curve {curve:?}: the first entry past the band must clear \
+                     the threshold, or the ramp's foot sits a shell too low",
+                );
+                assert_ne!(
+                    uploaded[first_visible * 4 + 3], 0,
+                    "curve {curve:?}: the entry past the band must actually be \
+                     visible in the uploaded table — the two halves of the seam \
+                     have drifted apart",
+                );
+            } else {
+                // The all-transparent curve: the threshold sits above every
+                // representable index, so the march samples nothing — an
+                // honestly empty pane, with no division anywhere on the path.
+                assert!(
+                    threshold > 1.0,
+                    "an all-transparent curve must put the threshold above \
+                     every index the grid can encode",
+                );
+            }
+        }
+
+        // And by value, the two directions the doc names: stripping to 120
+        // raises the anchor to 119.5/255; painting index 1 drops it to 0.5/255.
+        assert_eq!(
+            effective_fade_band(palette_band, curves[1].as_ref()),
+            119,
+            "stripping the low end must raise the effective band",
+        );
+        assert_eq!(
+            effective_fade_band(palette_band, curves[2].as_ref()),
+            0,
+            "painting into the palette's fade band must lower it",
+        );
+        assert_eq!(
+            effective_fade_band(palette_band, None),
+            palette_band,
+            "no curve must mean the palette's own band, untouched",
+        );
+    }
+
+    /// The curve is applied in `prepare` and only through the staleness
+    /// comparison — the same source-scan arrangement as the painter's guards,
+    /// and for the same reason: `prepare` needs a `wgpu::Device`, so no host
+    /// test can reach it. Mutation testing on the *behavioural* seam is what
+    /// pins the values ([`effective_lut`], [`effective_fade_band`] above);
+    /// this pins that `prepare` still consults them, and that the rewrite is
+    /// gated on the curve actually changing rather than issued per frame.
+    #[test]
+    fn prepare_applies_the_curve_through_the_staleness_gate() {
+        let source = include_str!("volume_bridge.rs");
+        let start = source
+            .find("impl egui_wgpu::CallbackTrait for VolumeCallback {")
+            .expect("the callback impl is no longer where this test looks for it");
+        let body = &source[start..];
+        let end = body.find("\n}\n").expect("the callback impl has no closing brace");
+        let body = &body[..end];
+
+        assert!(
+            body.contains("if upload.applied_alpha != self.alpha {"),
+            "the LUT rewrite is no longer gated on the curve changing — either \
+             an edit stopped applying to an already-uploaded grid, or the 1 KiB \
+             table is being rewritten every frame",
+        );
+        assert!(
+            body.matches("effective_lut(self.grid.lut(), self.alpha.as_ref())")
+                .count()
+                >= 2,
+            "both upload paths — first upload and in-place rewrite — must build \
+             the table through `effective_lut`, or one of them ships the wrong \
+             alpha",
+        );
     }
 
     /// The production ramp is eight indices wide — half the fade bar, and not

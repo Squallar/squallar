@@ -11,6 +11,9 @@ mod pane_render;
 #[path = "ui_section_pane.rs"]
 pub(crate) mod section_render;
 
+#[path = "ui_volume_alpha.rs"]
+pub(crate) mod volume_alpha_editor;
+
 /// What a cross-section pane says while it has nothing to show.
 ///
 /// Deliberately an instruction rather than an apology: a section pane with no
@@ -504,6 +507,7 @@ impl super::Gui {
                                 painter.as_deref(),
                                 current_stamp,
                                 &mut actions,
+                                &mut self.volume_alpha,
                             );
                             #[cfg(test)]
                             self.last_volume_arms
@@ -1070,6 +1074,7 @@ pub(crate) struct VolumeArmProbe {
 /// `hovered() || dragged()` gate a pinch over a map pane would orbit every 3D
 /// pane on screen at once, which is the sort of thing that gets reported as
 /// "the 3D view moves on its own".
+#[allow(clippy::too_many_arguments)]
 fn render_volume_pane(
     ui: &mut egui::Ui,
     pane_rect: egui::Rect,
@@ -1078,6 +1083,7 @@ fn render_volume_pane(
     painter: Option<&dyn crate::volume_view::VolumePainter>,
     current_stamp: Option<crate::ui::CurrentVolumeStamp>,
     actions: &mut Vec<GuiAction>,
+    alpha_curves: &mut crate::volume_alpha::AlphaCurves,
 ) -> Option<String> {
     let outcome = volume_pane_outcome(
         ui,
@@ -1087,16 +1093,50 @@ fn render_volume_pane(
         painter,
         current_stamp,
         actions,
+        alpha_curves,
     );
-    if let Some(why) = outcome.as_deref() {
+    if let Some(why) = outcome.empty.as_deref() {
         paint_pane_empty_state(ui, pane_rect, why);
     }
-    outcome
+    // The Volume Alpha editor, after the pane's own painting so its button and
+    // window sit over the picture. It needs the target the arm just resolved —
+    // the palette it shows is the grid's own, looked up by that target — and
+    // the product, which the curves are keyed by.
+    volume_alpha_editor::editor_ui(
+        ui,
+        pane_rect,
+        pane_idx,
+        pane,
+        painter,
+        outcome.target.as_ref(),
+        alpha_curves,
+    );
+    outcome.empty
+}
+
+/// What the 3D arm resolved for one pane on one frame: the empty-state reason
+/// if there was one, and the target it aimed at if it got far enough to name
+/// one. The target is what the Volume Alpha editor looks the palette up by —
+/// re-deriving it there would be a second copy of the stamp-and-region logic
+/// that could drift from this one.
+struct VolumeOutcome {
+    empty: Option<String>,
+    target: Option<crate::pane::VolumeTarget>,
+}
+
+impl VolumeOutcome {
+    fn empty_state(why: String) -> Self {
+        Self {
+            empty: Some(why),
+            target: None,
+        }
+    }
 }
 
 /// The 3D arm's decision, with the painting left to its caller so that every
 /// path out of it is a `return` of a reason rather than a `return` plus a call
 /// somebody can forget to make.
+#[allow(clippy::too_many_arguments)]
 fn volume_pane_outcome(
     ui: &mut egui::Ui,
     pane_rect: egui::Rect,
@@ -1105,7 +1145,8 @@ fn volume_pane_outcome(
     painter: Option<&dyn crate::volume_view::VolumePainter>,
     current_stamp: Option<crate::ui::CurrentVolumeStamp>,
     actions: &mut Vec<GuiAction>,
-) -> Option<String> {
+    alpha_curves: &crate::volume_alpha::AlphaCurves,
+) -> VolumeOutcome {
     use crate::pane::{OrbitDelta, VolumeStamp, VolumeTarget};
     use crate::volume_view::{VolumeFrameState, VolumePaint};
 
@@ -1117,7 +1158,7 @@ fn volume_pane_outcome(
     // Answered rather than unwrapped for the reason the `volume_mut` below gives.
     let Some((camera_before, box_size_km)) = pane.volume().map(|v| (v.camera, v.box_size_km()))
     else {
-        return Some(VOLUME_EMPTY_STATE.to_owned());
+        return VolumeOutcome::empty_state(VOLUME_EMPTY_STATE.to_owned());
     };
 
     // The gesture first, and unconditionally: the camera is the pane's own
@@ -1222,7 +1263,7 @@ fn volume_pane_outcome(
     // `PaneState` and is the sort of thing a future caller invokes from
     // somewhere else.
     let Some(volume) = pane.volume_mut() else {
-        return Some(VOLUME_EMPTY_STATE.to_owned());
+        return VolumeOutcome::empty_state(VOLUME_EMPTY_STATE.to_owned());
     };
     volume.camera.nudge(delta);
     let camera = volume.camera;
@@ -1233,20 +1274,20 @@ fn volume_pane_outcome(
     // Everything below is a reason there is no picture, in the order the user
     // can act on them.
     let Some(painter) = painter else {
-        return Some(VOLUME_EMPTY_STATE.to_owned());
+        return VolumeOutcome::empty_state(VOLUME_EMPTY_STATE.to_owned());
     };
     let Some((volume_stamp, base_started)) = stamp else {
         // No volume at all yet — the cold-start window between choosing a site
         // and its first data landing. The download is already in flight (a
         // site switch fires the archive fetch immediately), so this is the one
         // state where waiting is the truth.
-        return Some(format!(
+        return VolumeOutcome::empty_state(format!(
             "Downloading the first {site_code} volume…\n\nThe 3D view builds the moment it \
              lands, then updates tilt by tilt as new sweeps arrive.",
         ));
     };
     if rustdar_radar::sampler::samplable(product).is_none() {
-        return Some(format!(
+        return VolumeOutcome::empty_state(format!(
             "{} has no vertical structure to render in 3D — pick a moment the radar measures \
              directly",
             product.name(),
@@ -1275,12 +1316,16 @@ fn volume_pane_outcome(
         (pane_rect.height() * pixels_per_point).round().max(1.0) as u32,
     ];
 
-    match painter.paint(&VolumeFrameState {
+    let empty = match painter.paint(&VolumeFrameState {
         pane_idx,
-        target,
+        target: target.clone(),
         camera,
         size_px,
         floor,
+        // The user's Volume Alpha curve for this product, or `None` for an
+        // untouched editor — which the painter is obliged to render
+        // bit-exactly through the palette's own alpha.
+        alpha: alpha_curves.get(product),
     }) {
         VolumePaint::Callback(callback) => {
             // Hand-constructed, because `egui_wgpu::Callback` has a private
@@ -1304,6 +1349,10 @@ fn volume_pane_outcome(
             None
         }
         VolumePaint::Empty(why) => Some(why),
+    };
+    VolumeOutcome {
+        empty,
+        target: Some(target),
     }
 }
 
@@ -2123,6 +2172,65 @@ mod volume_arm_tests {
             "the grid must be asked for against the published stamp, not the displayed time",
         );
         assert_eq!(frame.target.volume.site, "KTLX");
+    }
+
+    /// **The Volume Alpha curve rides the frame, and only when one exists.**
+    ///
+    /// Both halves are load-bearing. An untouched editor must send `None` —
+    /// that is the painter's licence to upload the grid's own LUT bit-exactly,
+    /// and a frame that carried a synthesised default curve instead would take
+    /// that licence away for every user who never opened the editor. An edited
+    /// product must send exactly the stored curve, keyed by the *pane's*
+    /// product — the storm answering the drag is this one field arriving.
+    #[test]
+    fn the_alpha_curve_rides_the_frame_only_when_one_is_stored() {
+        use crate::volume_alpha::{AlphaCurve, CURVE_LEN};
+
+        let (mut h, painter) = volume_harness(StubVolumePainter::painting());
+        assert_eq!(
+            last_seen(&painter).alpha,
+            None,
+            "an untouched editor must hand the painter no curve at all",
+        );
+
+        let mut alphas = [0u8; CURVE_LEN];
+        alphas[128..].fill(255);
+        let curve = AlphaCurve::from_alphas(alphas);
+        let product = h.gui_mut().pane(1).expect("pane 1").selected_product;
+        h.gui_mut().volume_alpha.set(product, curve.clone());
+        h.frames_for(1, FRAME_DT);
+        assert_eq!(
+            last_seen(&painter).alpha,
+            Some(curve),
+            "the stored curve for the pane's product must ride the frame",
+        );
+
+        h.gui_mut().volume_alpha.reset(product);
+        h.frames_for(1, FRAME_DT);
+        assert_eq!(
+            last_seen(&painter).alpha,
+            None,
+            "a reset must restore the bit-exact no-curve state, not a copy of the default",
+        );
+    }
+
+    /// The Volume Alpha button is on the 3D pane — the editor's only door.
+    ///
+    /// Asserted through the painted text because that is what a user can see:
+    /// a button constructed but clipped, layered under the raymarch, or
+    /// simply never reached by `render_volume_pane` all fail here identically.
+    #[test]
+    fn the_volume_alpha_button_is_painted_on_a_3d_pane() {
+        let (h, _painter) = volume_harness(StubVolumePainter::painting());
+        let pane_rect = h.pane_rects()[1];
+        let texts = h.painted_text_strings_in(pane_rect);
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains(crate::ui::map::volume_alpha_editor::ALPHA_BUTTON_LABEL)),
+            "the Volume alpha button must be painted inside the 3D pane; painted \
+             texts were {texts:?}",
+        );
     }
 
     /// A moment the radar does not measure directly is refused by name, before

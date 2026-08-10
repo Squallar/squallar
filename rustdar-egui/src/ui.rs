@@ -555,6 +555,11 @@ pub struct Gui {
     /// web, asynchronously. A `Gui` that could not be built until a device
     /// existed would be a `Gui` no test could build at all.
     volume_painter: Option<std::sync::Arc<dyn crate::volume_view::VolumePainter>>,
+    /// The user's Volume Alpha curves, one per edited product. See
+    /// [`crate::volume_alpha`]: absence means "render through the palette's
+    /// own alpha, bit-exactly", which is why this is a store of exceptions
+    /// rather than a curve per product.
+    volume_alpha: crate::volume_alpha::AlphaCurves,
 }
 
 /// A storm motion vector the user may substitute for the RPG's.
@@ -951,6 +956,7 @@ impl Gui {
             gps_config: rustdar_gps::GpsConfig::default(),
             storm_motion_override: StormMotionOverride::default(),
             volume_painter: None,
+            volume_alpha: crate::volume_alpha::AlphaCurves::default(),
         };
         gui.initialize_pane_enabled();
         gui

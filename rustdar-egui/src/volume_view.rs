@@ -148,6 +148,16 @@ pub struct VolumeFrameState {
     /// place the pane's state is read. The renderer may still draw no floor —
     /// none may be in hand yet — but it must never draw one against this.
     pub floor: bool,
+    /// The user's Volume Alpha curve for this pane's product, or `None` for
+    /// an untouched editor.
+    ///
+    /// `None` is a contract, not a shorthand: it obliges the renderer to
+    /// upload the grid's own LUT **bit-exactly**, so a user who never opens
+    /// the editor renders exactly what the palette says. `Some` obliges it to
+    /// replace the LUT's alpha channel with the curve — colours stay the
+    /// palette's — and to re-anchor the march's skip threshold at the curve's
+    /// own fade boundary rather than the palette's.
+    pub alpha: Option<crate::volume_alpha::AlphaCurve>,
 }
 
 /// What the painter answered.
@@ -174,6 +184,24 @@ pub enum VolumePaint {
 pub trait VolumePainter: Send + Sync {
     /// Produce this frame's payload for one pane, or say why there is none.
     fn paint(&self, frame: &VolumeFrameState) -> VolumePaint;
+
+    /// The palette the pane's grid carries — 1024 bytes of straight RGBA, one
+    /// entry per index — or `None` while no grid is in hand.
+    ///
+    /// This is the Volume Alpha editor's one window into the renderer: the
+    /// palette strip it draws, and the alpha channel it seeds an untouched
+    /// curve from, are the **grid's own table**, read through the same
+    /// pane-scoped lookup `paint` uses. Reading it anywhere else — a second
+    /// copy of the colour tables in the UI crate — would be a copy to keep in
+    /// step, and the day they disagreed the editor would show a curve over one
+    /// palette while the volume rendered through another.
+    ///
+    /// Defaulted to `None` so a painter that cannot answer (the test stub, a
+    /// future headless painter) is an editor that says "waiting for the
+    /// volume" rather than a build break.
+    fn palette(&self, _pane_idx: usize, _target: &VolumeTarget) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 /// The two things the raymarch's uniform block needs from the camera.
@@ -913,6 +941,7 @@ mod tests {
             camera: OrbitCamera::default(),
             size_px: [800, 600],
             floor: true,
+            alpha: None,
         };
         let VolumePaint::Callback(payload) = painter.paint(&frame) else {
             panic!("the painting stub must paint");

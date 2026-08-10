@@ -802,6 +802,7 @@ impl VolumePipelines {
             cells,
             uniform,
             bind_group,
+            lut_texture,
         })
     }
 
@@ -967,6 +968,11 @@ pub struct VolumeTextures {
     cells: [u32; 3],
     uniform: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    /// The palette's own texture, kept so the table can be rewritten in place
+    /// — the Volume Alpha editor changes 1 KiB of alpha without touching the
+    /// 8 MiB grid beside it, and the bind group keeps pointing at this same
+    /// texture across the write.
+    lut_texture: wgpu::Texture,
 }
 
 impl VolumeTextures {
@@ -978,6 +984,38 @@ impl VolumeTextures {
     /// Point the raymarch's camera somewhere.
     pub fn write_uniform(&self, queue: &wgpu::Queue, uniform: &VolumeUniform) {
         queue.write_buffer(&self.uniform, 0, &uniform.to_bytes());
+    }
+
+    /// Replace the colour table in place — the Volume Alpha path, called only
+    /// when the effective table actually changed, never per frame.
+    ///
+    /// The same validation as the upload's: a table that is not exactly
+    /// [`VOLUME_LUT_BYTES`] is refused with a log line rather than handed to
+    /// `write_texture`, whose size mismatch would be a validation error
+    /// raised on a queue with no `Result` to return it through.
+    pub fn write_lut(&self, queue: &wgpu::Queue, lut: &[u8]) {
+        if lut.len() != VOLUME_LUT_BYTES {
+            log::error!(
+                "3D volume view: refusing a {}-byte colour table rewrite (expected {})",
+                lut.len(),
+                VOLUME_LUT_BYTES,
+            );
+            return;
+        }
+        queue.write_texture(
+            self.lut_texture.as_image_copy(),
+            lut,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(VOLUME_LUT_BYTES as u32),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: lut_texel_count(),
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
     }
 }
 

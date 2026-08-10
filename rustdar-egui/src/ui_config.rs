@@ -262,6 +262,33 @@ struct UiConfig {
     /// GPS configuration (serial port, baud, heading source).
     #[serde(default)]
     gps_config: rustdar_gps::GpsConfig,
+    /// The user's Volume Alpha curves, one entry per *edited* product.
+    ///
+    /// A list of exceptions rather than a curve per product, because absence
+    /// is the meaningful default: a product with no entry renders through its
+    /// palette's own alpha bit-exactly, and an old config without this field
+    /// loads as "nothing edited" through the container's `#[serde(default)]`.
+    #[serde(default)]
+    volume_alpha: Vec<VolumeAlphaConfig>,
+}
+
+/// One product's persisted Volume Alpha curve.
+///
+/// The alphas are stored as the same 256 bytes the LUT's alpha channel holds
+/// — **deliberately not floats**. The finiteness filter every persisted float
+/// goes through (see [`content_config`]) exists because `serde_json` writes a
+/// NaN as `null` and the next load loses the whole file; a `u8` has no
+/// non-finite values, so this encoding closes that class of loss by
+/// construction instead of by filter. It is also exact: the render quantises
+/// alpha to these bytes anyway, so nothing finer would survive the round trip.
+#[derive(Serialize, Deserialize)]
+struct VolumeAlphaConfig {
+    product: RadarProduct,
+    /// Exactly [`crate::volume_alpha::CURVE_LEN`] alphas, entry 0 first.
+    /// Validated on load — a wrong length is dropped with a warning, and
+    /// entry 0 is re-clamped to transparent by `AlphaCurve::from_alphas`, so
+    /// a hand-edited file cannot make the no-data index visible.
+    alpha: Vec<u8>,
 }
 
 impl Default for UiConfig {
@@ -283,6 +310,7 @@ impl Default for UiConfig {
             preferences: UserPreferences::default(),
             overlay_states: serde_json::Map::new(),
             gps_config: rustdar_gps::GpsConfig::default(),
+            volume_alpha: Vec::new(),
         }
     }
 }
@@ -396,6 +424,21 @@ impl super::Gui {
             preferences: self.preferences.clone(),
             overlay_states: self.overlays.serialize_handler_states(),
             gps_config: self.gps_config.clone(),
+            volume_alpha: {
+                // Sorted by product code so the autosave's "has anything
+                // changed?" string comparison cannot be defeated by
+                // `HashMap` iteration order.
+                let mut curves: Vec<VolumeAlphaConfig> = self
+                    .volume_alpha
+                    .entries()
+                    .map(|(product, curve)| VolumeAlphaConfig {
+                        product,
+                        alpha: curve.alphas().to_vec(),
+                    })
+                    .collect();
+                curves.sort_by_key(|c| c.product.code());
+                curves
+            },
         };
         match serde_json::to_string_pretty(&config) {
             Ok(json) => Some(json),
@@ -468,6 +511,31 @@ impl super::Gui {
         self.loop_speed_fps = config.loop_speed_fps;
         self.preferences = config.preferences;
         self.gps_config = config.gps_config;
+
+        // The Volume Alpha curves. Replaced wholesale rather than merged —
+        // the store starts empty and a load is the session's beginning — and
+        // validated entry by entry: a curve of the wrong length is a config
+        // from a different format (or a hand edit) and is dropped with its
+        // name in the log, not truncated into a curve the user never drew.
+        // An old config simply has no entries, which is the untouched,
+        // bit-exact state.
+        self.volume_alpha = crate::volume_alpha::AlphaCurves::default();
+        for entry in config.volume_alpha {
+            let Ok(alphas) = <[u8; crate::volume_alpha::CURVE_LEN]>::try_from(entry.alpha) else {
+                log::warn!(
+                    "the saved Volume Alpha curve for {} is not {} entries; dropping it",
+                    entry.product.name(),
+                    crate::volume_alpha::CURVE_LEN,
+                );
+                continue;
+            };
+            // `from_alphas` re-clamps entry 0, so a hand-edited file cannot
+            // make the no-data index visible.
+            self.volume_alpha.set(
+                entry.product,
+                crate::volume_alpha::AlphaCurve::from_alphas(alphas),
+            );
+        }
 
         // Restore per-pane state.
         // Migrate legacy per-pane Radar toggle from old `layers` map to the
@@ -805,6 +873,9 @@ fn restore_content(pane_idx: usize, pc: &PaneConfig, pane_count: usize) -> PaneC
                 // Not persisted: the floor defaults on for every session, and
                 // a pane that turned it off holds that for the session only.
                 hide_floor: false,
+                // Not persisted either — the curves are (per product, below
+                // the pane list); an open tool window is session posture.
+                alpha_editor_open: false,
             }))
         }
     }
@@ -926,6 +997,112 @@ mod tests {
             Some(nudged),
             "the pane came back as a 3D view aimed somewhere else"
         );
+    }
+
+    /// A drawn Volume Alpha curve survives the round trip, per product, and an
+    /// untouched product comes back untouched.
+    ///
+    /// The untouched half is the bit-exactness pin at the persistence layer: a
+    /// product with no entry must load with no entry, because "no entry" is
+    /// what licenses the renderer to upload the palette's own LUT unmodified.
+    /// A load that filled every product with a synthesised default curve would
+    /// round-trip every *assertion about values* here and still break that.
+    #[test]
+    fn volume_alpha_curves_survive_a_save_and_load() {
+        use crate::volume_alpha::{AlphaCurve, CURVE_LEN};
+        use rustdar_radar::types::RadarProduct;
+
+        let store = MemoryConfigStore::default();
+        let mut gui = crate::Gui::new();
+        let mut alphas = [0u8; CURVE_LEN];
+        for (i, slot) in alphas.iter_mut().enumerate() {
+            *slot = (i / 2) as u8; // a curve no default produces
+        }
+        let curve = AlphaCurve::from_alphas(alphas);
+        gui.volume_alpha.set(RadarProduct::Reflectivity, curve.clone());
+        gui.save_ui_config(&store);
+
+        let mut restored = crate::Gui::new();
+        assert!(restored.load_ui_config(&store));
+        assert_eq!(
+            restored.volume_alpha.get(RadarProduct::Reflectivity),
+            Some(curve),
+            "the drawn curve must come back exactly",
+        );
+        assert_eq!(
+            restored.volume_alpha.get(RadarProduct::Velocity),
+            None,
+            "a product the user never edited must come back with no curve at all",
+        );
+    }
+
+    /// A config written before Volume Alpha existed loads with every editor
+    /// untouched — the field defaults to empty, and empty means bit-exact.
+    #[test]
+    fn an_old_config_without_volume_alpha_loads_with_every_editor_untouched() {
+        use rustdar_radar::types::RadarProduct;
+
+        let store = MemoryConfigStore::default();
+        // A minimal pre-feature config: every field the format has ever had is
+        // `#[serde(default)]`-covered, so `{}` is exactly what an old file
+        // looks like to the new deserializer.
+        store
+            .store(UI_CONFIG_KEY, "{}")
+            .expect("the memory store accepts a write");
+
+        let mut gui = crate::Gui::new();
+        assert!(gui.load_ui_config(&store), "an old config still loads");
+        assert!(
+            !gui.volume_alpha.is_edited(RadarProduct::Reflectivity),
+            "an old config must not conjure a curve for any product",
+        );
+    }
+
+    /// A hand-edited or version-skewed curve cannot poison the load: a wrong
+    /// length is dropped by name, and a curve claiming a visible no-data index
+    /// is re-clamped on the way in.
+    ///
+    /// The re-clamp half is the config-side door of the index-0 invariant —
+    /// the editor and the stroke both enforce it live, and this is the one
+    /// writer that bypasses them.
+    #[test]
+    fn a_hostile_volume_alpha_entry_is_dropped_or_reclamped_never_trusted() {
+        use rustdar_radar::types::RadarProduct;
+
+        let store = MemoryConfigStore::default();
+        // Entry one: three alphas where 256 are required. Entry two: a full
+        // curve whose entry 0 claims opaque no-data.
+        let mut full: Vec<String> = vec!["255".to_owned(); 256];
+        full[1] = "9".to_owned();
+        let json = format!(
+            r#"{{"volume_alpha":[
+                {{"product":"Reflectivity","alpha":[1,2,3]}},
+                {{"product":"Velocity","alpha":[{}]}}
+            ]}}"#,
+            full.join(","),
+        );
+        store
+            .store(UI_CONFIG_KEY, &json)
+            .expect("the memory store accepts a write");
+
+        let mut gui = crate::Gui::new();
+        assert!(gui.load_ui_config(&store), "the rest of the config loads");
+        assert_eq!(
+            gui.volume_alpha.get(RadarProduct::Reflectivity),
+            None,
+            "a wrong-length curve must be dropped, not padded or truncated",
+        );
+        let velocity = gui
+            .volume_alpha
+            .get(RadarProduct::Velocity)
+            .expect("a well-sized curve loads");
+        assert_eq!(
+            velocity.alphas()[0],
+            0,
+            "entry 0 is the no-data index and must be re-clamped on load",
+        );
+        assert_eq!(velocity.alphas()[1], 9, "the rest of the curve is kept as saved");
+        assert_eq!(velocity.alphas()[255], 255);
     }
 
     /// A cross-section pane's line and source survive the round trip.
