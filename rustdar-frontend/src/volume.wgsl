@@ -164,10 +164,20 @@ const RAY_DIRECTION_EPSILON: f32 = 1e-6;
 // stands on; from below it must not wall the volume off — the user asked for
 // exactly that — so its coverage is scaled by eye depth below the plane:
 // 1 at the plane and above (every above-plane pixel is bit-identical to the
-// pre-fade composite), 0 at this depth. A ramp rather than a hard flip so
-// orbiting through plane level dissolves the ground instead of popping it.
-// 0.08 of the box's height is ~1.4 km of the default 18 km column: gone
-// almost immediately, but never in a single frame.
+// pre-fade composite), 0 at this depth — ~1.4 km of the default 18 km
+// column, so the wall never persists: steady-state below is fully
+// transparent, and the descent dissolves it over the first FLOOR_BELOW_FADE
+// of eye depth rather than in a single step.
+//
+// What this is NOT: a pop-free crossing. Coverage is continuous in eye depth
+// (1 on both sides of the plane), but the composite's *order* switches at
+// the crossing — behind the accumulation from above, in front of it from
+// below — so a pixel where the volume occludes the floor can jump on the
+// crossing frame, at up to full coverage. The band was still put entirely
+// BELOW the plane on purpose: a band reaching above it would thin the
+// resting ground out of every low-angle above-plane view — a permanent cost
+// to the GR-solid floor — to soften a transient the descent already
+// dissolves in under a band-width of travel.
 const FLOOR_BELOW_FADE: f32 = 0.08;
 
 // Below this the central difference is noise rather than a surface, and

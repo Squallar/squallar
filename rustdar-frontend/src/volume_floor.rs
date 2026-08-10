@@ -586,19 +586,13 @@ mod tests {
         );
     }
 
-    /// One mapping, two consumers: a tile pixel and a radar gate that name
-    /// the same ground land on the same floor texel.
-    ///
-    /// The radar dot is planted through `render_gate`'s forward arithmetic
-    /// (as the Mercator-row test above does) and the tile dot through the
-    /// slippy pyramid's own forward formulas — two independent routes to the
-    /// same geographic point. If the composite ever grew a second projection
-    /// for tiles, this is where the two dots would part.
-    #[test]
-    fn a_tile_pixel_and_a_radar_gate_at_the_same_ground_land_on_the_same_texel() {
+    /// Plant the same geographic point `(dx_km, dy_km)` east/north of a
+    /// 35 N site as a radar-raster dot AND a tile-pixel dot — two
+    /// independent forward routes — compose, and return how far apart the
+    /// two dots landed on the floor, in texels.
+    fn tile_vs_gate_disagreement(dx_km: f64, dy_km: f64) -> usize {
         let side = 256;
         let (site_lat, site_lon) = (35.0f64, -97.0f64);
-        let (dx_km, dy_km) = (100.0, 150.0);
 
         // The radar raster's dot, through the raster's forward projection.
         let site_lat_rad = site_lat.to_radians();
@@ -664,14 +658,39 @@ mod tests {
             }
         }
         assert!(best_green.2 > 100, "the tile dot never reached the floor");
-        assert!(
-            best_green.0.abs_diff(red_col) <= 2 && best_green.1.abs_diff(red_row) <= 2,
-            "the radar gate landed at ({red_col}, {red_row}) and the tile pixel \
-             for the same ground at ({}, {}) — the two consumers of the mapping \
-             have parted",
-            best_green.0,
-            best_green.1,
-        );
+        best_green
+            .0
+            .abs_diff(red_col)
+            .max(best_green.1.abs_diff(red_row))
+    }
+
+    /// One mapping, two consumers: a tile pixel and a radar gate that name
+    /// the same ground land on the same floor texel — probed mid-box AND at
+    /// the box's far corner.
+    ///
+    /// The radar dot is planted through `render_gate`'s forward arithmetic
+    /// (as the Mercator-row test above does) and the tile dot through the
+    /// slippy pyramid's own forward formulas — two independent routes to the
+    /// same geographic point. If the composite ever grew a second projection
+    /// for tiles, this is where the two dots would part.
+    ///
+    /// The corner probe is not decoration: the mapping's `cos φ` is the
+    /// *row's* latitude, and the plausible second-projection error — reading
+    /// the site's `cos φ₀` instead — grows with distance from the site's
+    /// parallel. At (100, 150) km it drifts under 2 texels and the mid-box
+    /// probe alone would let it live; at (−200, −190) km it reaches ~5
+    /// texels and dies here.
+    #[test]
+    fn a_tile_pixel_and_a_radar_gate_at_the_same_ground_land_on_the_same_texel() {
+        for (dx_km, dy_km) in [(100.0, 150.0), (-200.0, -190.0)] {
+            let apart = tile_vs_gate_disagreement(dx_km, dy_km);
+            assert!(
+                apart <= 2,
+                "at ({dx_km}, {dy_km}) km the radar gate and the tile pixel \
+                 for the same ground landed {apart} texels apart — the two \
+                 consumers of the mapping have parted",
+            );
+        }
     }
 
     /// The stacking order is the 2D pane's: ground, basemap, radar, labels.

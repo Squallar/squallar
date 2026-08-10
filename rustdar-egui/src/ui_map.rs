@@ -1425,8 +1425,10 @@ pub(crate) fn render_volume_controls(ui: &mut egui::Ui, pane: &mut crate::pane::
         if ui
             .checkbox(&mut show_floor, "Map floor")
             .on_hover_text(
-                "Draws the ground under the volume: the base reflectivity as the 2D map shows \
-                 it, registered to the box.",
+                "Draws the ground under the volume: the basemap, the base reflectivity as the \
+                 2D map shows it, and city labels, registered to the box. Always the full \
+                 composition — the map panes' layer toggles do not apply to it, the same way \
+                 they do not apply to this pane's volume.",
             )
             .changed()
         {

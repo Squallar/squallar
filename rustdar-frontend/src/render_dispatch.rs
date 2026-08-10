@@ -1321,6 +1321,19 @@ impl RenderDispatcher {
             // (`types::MAX_RANGE_KM`) at its own definition. The tile decode
             // rides this closure for the same reason the resample does: off
             // the frame thread natively, once per floor rather than per frame.
+            //
+            // On wasm, `deliver` runs on the main thread, so the decode +
+            // composite land there as a bounded hitch: the whole floor job
+            // measured 59 ms on desktop release (raster render included), so
+            // the closure's share is a fraction of that and wasm's is that
+            // fraction times a browser factor — tens of milliseconds, once
+            // per sealed sweep (15–25 s) or tile-arrival burst, never per
+            // frame. Moving the composite *into* the worker job was
+            // considered and declined for now: the tile bytes would have to
+            // ride the job request over the message port, a versioned wire
+            // change to the job framing, bought against a hitch of this
+            // size and cadence. If a real device shows it, that is the
+            // design to reach for.
             let image = output
                 .and_then(crate::offload::JobOutput::frame)
                 .and_then(|frame| {

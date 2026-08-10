@@ -1431,16 +1431,27 @@ impl App {
         }
     }
 
-    /// Re-dispatch the floor renders the budget refused or a `None` reply
-    /// took back — the retry path that needs no new voxel build.
+    /// Re-dispatch the floor renders the budget refused, a `None` reply took
+    /// back, or a tile arrival made stale — the retry path that needs no new
+    /// voxel build.
     ///
     /// Drains the owed list: a scope the store no longer holds a `Ready`
     /// grid for drops its debt (a floor for it would answer a question
-    /// nobody is asking), a scope whose floor is meanwhile in hand needs
-    /// nothing, and the rest go back through `maybe_spawn_floor_render`
-    /// against the scope's newest grid — which re-owes them if the budget is
-    /// still full. Free when nothing is owed, which is every frame of an
-    /// ordinary session.
+    /// nobody is asking), a scope whose **current** floor is meanwhile in
+    /// hand needs nothing, and the rest go back through
+    /// `maybe_spawn_floor_render` against the scope's newest grid — which
+    /// re-owes them if the budget is still full. Free when nothing is owed,
+    /// which is every frame of an ordinary session.
+    ///
+    /// "Current" is the dedupe ledger's word, not the store's: a floor in
+    /// hand whose `floor_rendered` entry has been withdrawn — by
+    /// [`App::recompose_floors_for_new_tiles`] when tiles landed after it
+    /// was composited, or by a `None` reply to a refresh — is a **stale**
+    /// picture standing in for a better one, and skipping the scope because
+    /// the store answers `Some` was exactly the leak that kept a static
+    /// archive volume on a tile-less floor forever: the recompose reopened
+    /// the scope every frame and this drain dropped the debt every frame,
+    /// and with no further builds no other path ever re-dispatched.
     fn retry_owed_floor_renders(&mut self) {
         if self.floor_owed.is_empty() {
             return;
@@ -1450,7 +1461,8 @@ impl App {
             let Some((target, grid)) = self.volume_store.ready_for_scope(&scope.0, &scope.1) else {
                 continue;
             };
-            if self.volume_store.floor_for(&target).is_some() {
+            let current = self.floor_rendered.iter().any(|(s, _, _)| *s == scope);
+            if current && self.volume_store.floor_for(&target).is_some() {
                 continue;
             }
             self.maybe_spawn_floor_render(&target, &grid);
@@ -5118,7 +5130,19 @@ mod tests {
         let scope = ("KTLX".to_string(), None);
 
         // A floor composited while some tile set was in hand (signature 42),
-        // and the tiles have since changed (headless now reports 0).
+        // and the tiles have since changed (headless now reports 0). The
+        // stale floor is IN HAND — that is the bug's precondition: the drain
+        // used to read the store's `Some` as "nothing to do", so the reopened
+        // debt was dropped on the very next line of the frame, every frame,
+        // and a static archive volume kept its tile-less floor forever.
+        app.volume_store.set_floor(
+            "KTLX",
+            None,
+            Arc::new(crate::volume::floor::FloorImage {
+                size: [1, 1],
+                rgba: vec![0, 0, 0, 255],
+            }),
+        );
         app.floor_rendered.push((scope.clone(), stamp, 42));
         app.recompose_floors_for_new_tiles();
         assert!(
@@ -5129,6 +5153,23 @@ mod tests {
             app.floor_owed,
             vec![scope.clone()],
             "the reopened scope must be owed a re-composite",
+        );
+
+        // Through the drain to the actual dispatch: with a render slot free,
+        // the STALE floor in hand must not satisfy the retry — the whole
+        // debt exists because that floor is the wrong picture.
+        app.retry_owed_floor_renders();
+        assert!(
+            app.floor_rendered
+                .iter()
+                .any(|(s, at, _)| *s == scope && *at == stamp),
+            "the reopened scope must re-dispatch through the drain — a stale \
+             floor in hand satisfying the floor-in-hand guard is the leak \
+             that starved static volumes of their tiles",
+        );
+        assert!(
+            app.floor_owed.is_empty(),
+            "a dispatched re-composite settles the debt",
         );
 
         // The signature matches what a composite now would use: untouched.

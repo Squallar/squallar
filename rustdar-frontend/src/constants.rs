@@ -153,6 +153,16 @@ pub const MOBILE_LOOP_TEXTURE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 /// The desktop arm. See [`LOOP_TEXTURE_BUDGET_BYTES`].
 pub const DESKTOP_LOOP_TEXTURE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
+/// Ceiling on the compressed tile bytes each basemap/label tile source
+/// retains for the 3D floor's map composite: `TILE_CACHE_ENTRIES` PNGs at a
+/// generous 30 KiB each — ~7.5 MiB per source, four sources at most (light
+/// and dark, base and labels), riding the same LRU slot as each tile's
+/// texture. A budget *statement* rather than an enforcement point — the
+/// bound is the cache's own entry count; this names what that bound now
+/// costs so the next memory audit does not have to rediscover it.
+pub const TILE_BYTES_BUDGET_PER_SOURCE_BYTES: usize =
+    rustdar_egui::tile_source::TILE_CACHE_ENTRIES.get() * 30 * 1024;
+
 /// Maximum number of entries kept in `RenderDispatcher::render_cache`.
 ///
 /// The cache exists so panes showing the same site/product/elevation share one
