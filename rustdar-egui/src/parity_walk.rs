@@ -201,10 +201,27 @@ fn control_label(item: &ControlItem) -> &str {
     }
 }
 
+/// The representative handler the walk runs with its layer **hidden**: the
+/// richest gated-history tree (dropdown, slider, level toggles, refresh),
+/// so its leg proves reachability does not depend on visibility — the eye
+/// hides pixels, never options (the M9.1 user report). Explicitly disabled
+/// rather than trusting the handler's default, so a default flip cannot
+/// silently retire the coverage; the overlays crate's controls-parity test
+/// pins the model half of the same rule for all twelve kinds.
+const HIDDEN_WALK_HANDLER: OverlayKind = OverlayKind::Lightning;
+
 /// Every handler's every control, reachable through its stack row and the
 /// inspector's layer body.
 fn walk_layer_controls(h: &mut InputHarness, width: WidthClass) {
+    h.set_overlay_on_pane(0, HIDDEN_WALK_HANDLER, false);
     for &handler in OVERLAY_CONTROL_ORDER {
+        if handler == HIDDEN_WALK_HANDLER {
+            assert!(
+                !h.overlay_enabled_on(0, handler),
+                "precondition: {handler:?} walks its leg hidden, and nothing \
+                 on the way to its row may have re-enabled it"
+            );
+        }
         let model = h.control_item_model(handler);
         assert!(
             !model.is_empty(),

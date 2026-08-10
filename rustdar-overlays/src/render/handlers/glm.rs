@@ -593,142 +593,145 @@ impl OverlayHandler for GlmHandler {
             enabled: self.enabled,
         }];
 
-        if self.enabled {
-            items.push(ControlItem::Dropdown {
-                id: "satellite",
-                label: "Satellite".into(),
-                options: vec![
-                    ("east".into(), "GOES-19 (East)".into()),
-                    ("west".into(), "GOES-18 (West)".into()),
-                    ("both".into(), "Both".into()),
-                ],
-                selected: self.satellite.as_str().into(),
+        // Ungated on enabled (the every-option rule, M9.1): a hidden
+        // layer's options stay visible and editable - edits take effect
+        // when the eye shows it again - Refresh still fetches (nothing
+        // on the fetch path reads enabled), and the status lines keep
+        // reporting.
+        items.push(ControlItem::Dropdown {
+            id: "satellite",
+            label: "Satellite".into(),
+            options: vec![
+                ("east".into(), "GOES-19 (East)".into()),
+                ("west".into(), "GOES-18 (West)".into()),
+                ("both".into(), "Both".into()),
+            ],
+            selected: self.satellite.as_str().into(),
+        });
+
+        // Time window slider, in minutes. The minimum is load-bearing —
+        // see GLM_MIN_TIME_WINDOW_SECS before lowering it.
+        let mins = self.time_window_secs / SECS_PER_MIN;
+        items.push(ControlItem::Slider {
+            id: "time_window",
+            label: "Time Window".into(),
+            min: GLM_MIN_TIME_WINDOW_SECS / SECS_PER_MIN,
+            max: GLM_MAX_TIME_WINDOW_SECS / SECS_PER_MIN,
+            value: mins,
+            logarithmic: true,
+            format: "{:.0} min".into(),
+        });
+
+        items.push(ControlItem::Toggle {
+            id: "show_events",
+            label: "Events (highest density)".to_string(),
+            enabled: self.show_events,
+        });
+        items.push(ControlItem::Toggle {
+            id: "show_groups",
+            label: "Groups (medium density)".to_string(),
+            enabled: self.show_groups,
+        });
+        items.push(ControlItem::Toggle {
+            id: "show_flashes",
+            label: "Flashes (lowest density)".to_string(),
+            enabled: self.show_flashes,
+        });
+
+        items.push(ControlItem::ButtonRow {
+            buttons: vec![ControlButton {
+                id: "refresh",
+                label: "\u{21bb} Refresh".into(),
+                enabled: !self.state.fetching,
+                highlight: false,
+            }],
+        });
+
+        if self.state.fetching {
+            items.push(ControlItem::InfoText {
+                text: "Fetching...".into(),
             });
+        }
+        if let Some(t) = self.state.fetch_time {
+            let secs = t.elapsed().as_secs();
+            let text = if secs < 60 {
+                format!("Updated {secs}s ago")
+            } else {
+                format!("Updated {}m ago", secs / 60)
+            };
+            items.push(ControlItem::InfoText { text });
+        }
 
-            // Time window slider, in minutes. The minimum is load-bearing —
-            // see GLM_MIN_TIME_WINDOW_SECS before lowering it.
-            let mins = self.time_window_secs / SECS_PER_MIN;
-            items.push(ControlItem::Slider {
-                id: "time_window",
-                label: "Time Window".into(),
-                min: GLM_MIN_TIME_WINDOW_SECS / SECS_PER_MIN,
-                max: GLM_MAX_TIME_WINDOW_SECS / SECS_PER_MIN,
-                value: mins,
-                logarithmic: true,
-                format: "{:.0} min".into(),
+        // An empty map with no explanation has three causes that look
+        // identical on screen. Logs alone did not get one of them noticed
+        // for a year, so each is stated where the toggle lives.
+
+        // Cause 1: the files were never published. Only satellites the
+        // current selection queries — `dead_feeds` remembers deselected
+        // ones so they do not read as recovered, but showing those is
+        // stale.
+        let selected = self.satellite.to_satellites();
+        for feed in self
+            .dead_feeds
+            .iter()
+            .filter(|f| selected.contains(&f.satellite))
+        {
+            items.push(ControlItem::InfoText {
+                text: format!(
+                    "! No data from {}: bucket '{}' is empty",
+                    feed.satellite.display_name(),
+                    feed.bucket,
+                ),
             });
+        }
 
-            items.push(ControlItem::Toggle {
-                id: "show_events",
-                label: "Events (highest density)".to_string(),
-                enabled: self.show_events,
+        // Cause 2: the files were published but would not download or would
+        // not parse. The S3 listing is healthy in both cases, and the two
+        // are reported separately because they indict different things.
+        //
+        // Both can show at once, but two *totals* cannot: each file yields
+        // exactly one FileError, so the counts partition the failures and
+        // at most one can equal `in_window`.
+        for (kind, state) in [
+            (FailureKind::Parse, &self.parse),
+            (FailureKind::Transport, &self.transport),
+        ] {
+            let Some(f) = &state.detail else { continue };
+            let text = if f.is_total() {
+                format!(
+                    "! All {} files in the window {} ({})",
+                    f.in_window,
+                    kind.noun(),
+                    kind.total_hint(),
+                )
+            } else {
+                format!("! {}/{} files {}", f.failed, f.in_window, kind.noun(),)
+            };
+            items.push(ControlItem::InfoText { text });
+        }
+
+        // Cause 3: the files are fine and one *layer* inside them is not.
+        // The granule parsed, so it is not a failed file, and the listing
+        // is healthy, so it is not a dead feed.
+        //
+        // Filtered on *both* selection dimensions: `level_failures`
+        // remembers verdicts it could not re-examine, and `clear_cache()`
+        // on a level toggle guarantees a deselected layer is never
+        // re-evaluated, so nothing else would ever take the notice down.
+        let selected = self.satellite.to_satellites();
+        let levels = self.active_levels();
+        for failure in self
+            .level_failures
+            .iter()
+            .filter(|f| selected.contains(&f.satellite) && levels.contains(&f.level))
+        {
+            items.push(ControlItem::InfoText {
+                text: format!(
+                    "! {} unavailable from {} (product change?)",
+                    failure.level.display_name(),
+                    failure.satellite.display_name(),
+                ),
             });
-            items.push(ControlItem::Toggle {
-                id: "show_groups",
-                label: "Groups (medium density)".to_string(),
-                enabled: self.show_groups,
-            });
-            items.push(ControlItem::Toggle {
-                id: "show_flashes",
-                label: "Flashes (lowest density)".to_string(),
-                enabled: self.show_flashes,
-            });
-
-            items.push(ControlItem::ButtonRow {
-                buttons: vec![ControlButton {
-                    id: "refresh",
-                    label: "\u{21bb} Refresh".into(),
-                    enabled: !self.state.fetching,
-                    highlight: false,
-                }],
-            });
-
-            if self.state.fetching {
-                items.push(ControlItem::InfoText {
-                    text: "Fetching...".into(),
-                });
-            }
-            if let Some(t) = self.state.fetch_time {
-                let secs = t.elapsed().as_secs();
-                let text = if secs < 60 {
-                    format!("Updated {secs}s ago")
-                } else {
-                    format!("Updated {}m ago", secs / 60)
-                };
-                items.push(ControlItem::InfoText { text });
-            }
-
-            // An empty map with no explanation has three causes that look
-            // identical on screen. Logs alone did not get one of them noticed
-            // for a year, so each is stated where the toggle lives.
-
-            // Cause 1: the files were never published. Only satellites the
-            // current selection queries — `dead_feeds` remembers deselected
-            // ones so they do not read as recovered, but showing those is
-            // stale.
-            let selected = self.satellite.to_satellites();
-            for feed in self
-                .dead_feeds
-                .iter()
-                .filter(|f| selected.contains(&f.satellite))
-            {
-                items.push(ControlItem::InfoText {
-                    text: format!(
-                        "! No data from {}: bucket '{}' is empty",
-                        feed.satellite.display_name(),
-                        feed.bucket,
-                    ),
-                });
-            }
-
-            // Cause 2: the files were published but would not download or would
-            // not parse. The S3 listing is healthy in both cases, and the two
-            // are reported separately because they indict different things.
-            //
-            // Both can show at once, but two *totals* cannot: each file yields
-            // exactly one FileError, so the counts partition the failures and
-            // at most one can equal `in_window`.
-            for (kind, state) in [
-                (FailureKind::Parse, &self.parse),
-                (FailureKind::Transport, &self.transport),
-            ] {
-                let Some(f) = &state.detail else { continue };
-                let text = if f.is_total() {
-                    format!(
-                        "! All {} files in the window {} ({})",
-                        f.in_window,
-                        kind.noun(),
-                        kind.total_hint(),
-                    )
-                } else {
-                    format!("! {}/{} files {}", f.failed, f.in_window, kind.noun(),)
-                };
-                items.push(ControlItem::InfoText { text });
-            }
-
-            // Cause 3: the files are fine and one *layer* inside them is not.
-            // The granule parsed, so it is not a failed file, and the listing
-            // is healthy, so it is not a dead feed.
-            //
-            // Filtered on *both* selection dimensions: `level_failures`
-            // remembers verdicts it could not re-examine, and `clear_cache()`
-            // on a level toggle guarantees a deselected layer is never
-            // re-evaluated, so nothing else would ever take the notice down.
-            let selected = self.satellite.to_satellites();
-            let levels = self.active_levels();
-            for failure in self
-                .level_failures
-                .iter()
-                .filter(|f| selected.contains(&f.satellite) && levels.contains(&f.level))
-            {
-                items.push(ControlItem::InfoText {
-                    text: format!(
-                        "! {} unavailable from {} (product change?)",
-                        failure.level.display_name(),
-                        failure.satellite.display_name(),
-                    ),
-                });
-            }
         }
 
         items

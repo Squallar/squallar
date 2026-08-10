@@ -61,12 +61,20 @@ pub(super) struct PaneRenderCtx<'a> {
     /// Everything the 3D region drag needs. See [`RegionCtx`].
     pub region: RegionCtx<'a>,
     /// The kinds this pane dispatched, in the order they painted, with the
-    /// egui layer each one painted into. The layer is the honest half: the
-    /// sequence alone restates the loop, but two kinds on *different* layers
-    /// composite in `GraphicLayers::drain`'s order — same-`Order` non-area
-    /// layers drain in hash order, egui's own "safety net" — not in this
-    /// sequence, which is exactly how the old color-scale sub-layer ignored
-    /// `draw_order`. One paint list is what makes the sequence the truth.
+    /// egui layer each **arm** painted into. The layer is the honest half:
+    /// the sequence alone restates the loop, but two kinds on *different*
+    /// layers composite in `GraphicLayers::drain`'s order — same-`Order`
+    /// non-area layers drain in hash order, egui's own "safety net" — not in
+    /// this sequence, which is exactly how the old color-scale sub-layer
+    /// ignored `draw_order`. One paint list is what makes the sequence the
+    /// truth.
+    ///
+    /// What the layer record covers, exactly: the arm's *own* painter — the
+    /// loop's `ui.painter()` default, overwritten by an arm that constructs
+    /// another (the ColorScale arm does). That is the seam the old bug lived
+    /// on, and the seam contract 95 pins. Below it the record is on honour:
+    /// a paint helper that built its own layer painter *internally* would
+    /// not be reflected here, and no test claims otherwise.
     #[cfg(test)]
     pub paint_order: Vec<(OverlayKind, egui::LayerId)>,
 }
@@ -174,10 +182,12 @@ pub(super) fn render_pane_map_content(
             }
             // Every arm below paints through `ui.painter()` — the pane's own
             // paint list — so submission order IS `draw_order`. The layer is
-            // recorded per arm (an arm that builds its own painter overwrites
-            // the default) so a kind quietly moved onto a sub-layer fails the
-            // paint-order pin rather than silently leaving the stacking to
-            // egui's hash-order layer drain.
+            // recorded per arm, from the arm's own painter (one that builds
+            // another overwrites the default), so an *arm* moved onto a
+            // sub-layer fails the paint-order pin rather than silently
+            // leaving its stacking to egui's hash-order layer drain. The
+            // record stops at the arm seam — a helper's internal painter is
+            // not reflected; see `PaneRenderCtx::paint_order`.
             #[cfg(test)]
             let mut painted_layer = ui.painter().layer_id();
             match kind {

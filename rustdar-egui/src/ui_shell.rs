@@ -400,28 +400,163 @@ mod chrome_frame_tests {
         );
     }
 
+    /// `src` with comments, string literals and char literals blanked, so
+    /// the scan below only ever matches *code* — a doc comment or an
+    /// assertion message mentioning `Frame::window(` must not trip it.
+    /// Nested block comments, escapes, raw strings and the `'"'` char
+    /// literal are handled on the same terms as the glyph scanner
+    /// (`ui_glyphs.rs`), whose directory walk this test mirrors too.
+    fn code_only(src: &str) -> String {
+        let chars: Vec<char> = src.chars().collect();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0;
+        while i < chars.len() {
+            match chars[i] {
+                '/' if chars.get(i + 1) == Some(&'/') => {
+                    while i < chars.len() && chars[i] != '\n' {
+                        i += 1;
+                    }
+                }
+                '/' if chars.get(i + 1) == Some(&'*') => {
+                    let mut depth = 1;
+                    i += 2;
+                    while i < chars.len() && depth > 0 {
+                        if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                            depth += 1;
+                            i += 2;
+                        } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                            depth -= 1;
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+                'r' if matches!(chars.get(i + 1), Some(&'"' | &'#')) => {
+                    // A raw string opener, or just an `r` before a `#`.
+                    let mut hashes = 0;
+                    let mut j = i + 1;
+                    while chars.get(j) == Some(&'#') {
+                        hashes += 1;
+                        j += 1;
+                    }
+                    if chars.get(j) == Some(&'"') {
+                        j += 1;
+                        while j < chars.len() {
+                            if chars[j] == '"'
+                                && (0..hashes).all(|k| chars.get(j + 1 + k) == Some(&'#'))
+                            {
+                                j += 1 + hashes;
+                                break;
+                            }
+                            j += 1;
+                        }
+                        i = j;
+                    } else {
+                        out.push('r');
+                        i += 1;
+                    }
+                }
+                '"' => {
+                    i += 1;
+                    while i < chars.len() {
+                        match chars[i] {
+                            '\\' => i += 2,
+                            '"' => {
+                                i += 1;
+                                break;
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                }
+                '\'' => {
+                    // A char literal is blanked; a lifetime's quote passes.
+                    if chars.get(i + 1) == Some(&'\\') {
+                        i += 2;
+                        while i < chars.len() && chars[i] != '\'' {
+                            i += 1;
+                        }
+                        i += 1;
+                    } else if chars.get(i + 2) == Some(&'\'') {
+                        i += 3;
+                    } else {
+                        out.push('\'');
+                        i += 1;
+                    }
+                }
+                c => {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
     /// Every persistent floating surface frames through [`chrome_frame`]:
-    /// a direct `Frame::window` in the chrome files is a shadowed frame
-    /// waiting to ship. The dialogs, popovers and menus keep their shadows
-    /// deliberately (they are transient) and live in other files.
+    /// a direct `Frame::window` in shipping UI code is a shadowed frame
+    /// waiting to ship. Self-maintaining (the M9 review retired a fixed
+    /// five-file list a new chrome file would have escaped): every `.rs`
+    /// under this crate's `src/` is walked, except test-named files —
+    /// developer code on the glyph scan's own terms — and `ui_shell.rs`
+    /// itself, where [`chrome_frame`] is built *from* the stock frame and
+    /// the test above compares against it. The transient surfaces (dialogs,
+    /// popovers, menus) keep their shadows deliberately, but they do so
+    /// through `egui::Window`, which frames itself — nothing shipping needs
+    /// a direct `Frame::window(`, and a legitimate future exception earns
+    /// an explicit exemption here, with its reason.
     #[test]
     fn the_persistent_chrome_only_frames_through_chrome_frame() {
-        for file in [
-            "ui_stack.rs",
-            "ui_inspector.rs",
-            "ui_timeline.rs",
-            "ui_statusbar.rs",
-            "ui_sheet.rs",
-        ] {
-            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("src")
-                .join(file);
-            let src = std::fs::read_to_string(&path).expect("chrome source must be readable");
-            assert!(
-                !src.contains("Frame::window("),
-                "{file} builds a shadowed window frame directly - frame the \
-                 surface through shell::chrome_frame instead"
-            );
+        let mut roots = vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
+        let mut scanned = 0usize;
+        while let Some(dir) = roots.pop() {
+            for entry in std::fs::read_dir(&dir).expect("source dir must be readable") {
+                let path = entry.expect("dir entry").path();
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if path.is_dir() {
+                    roots.push(path);
+                } else if name.ends_with(".rs") && name != "ui_shell.rs" && !name.contains("test") {
+                    let src =
+                        std::fs::read_to_string(&path).expect("chrome source must be readable");
+                    scanned += 1;
+                    assert!(
+                        !code_only(&src).contains("Frame::window("),
+                        "{name} builds a shadowed window frame directly - frame \
+                         the surface through shell::chrome_frame instead, or \
+                         exempt the file here saying why"
+                    );
+                }
+            }
         }
+        assert!(
+            scanned > 30,
+            "the scan visited only {scanned} sources - the walk is broken, \
+             not the tree"
+        );
+    }
+
+    /// The stripper itself: a broken one passes the scan vacuously, so the
+    /// false-positive vectors it exists for — comments, strings, raw
+    /// strings — and the code it must still see are each pinned.
+    #[test]
+    fn the_chrome_scan_reads_code_and_skips_prose() {
+        let src = r##"
+// a Frame::window( mention in a comment
+/* and /* nested */ Frame::window( in a block */
+const A: &str = "Frame::window( in a string";
+const B: &str = r#"Frame::window( in a raw string"#;
+const C: char = '"';
+const D: &str = "after the char literal: Frame::window(";
+"##;
+        assert!(
+            !code_only(src).contains("Frame::window("),
+            "prose tripped the scan: {:?}",
+            code_only(src)
+        );
+        assert!(
+            code_only("let f = egui::Frame::window(&style);").contains("Frame::window("),
+            "real code must still be seen"
+        );
     }
 }

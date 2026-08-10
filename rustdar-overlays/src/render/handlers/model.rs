@@ -228,66 +228,69 @@ impl OverlayHandler for ModelDataHandler {
             enabled: self.enabled,
         }];
 
-        if self.enabled {
-            items.push(ControlItem::Dropdown {
-                id: "parameter",
-                label: "Parameter".into(),
-                options: ModelParameter::all()
-                    .iter()
-                    .map(|p| (p.as_str().into(), p.display_name().into()))
-                    .collect(),
-                selected: self.selected_param.as_str().into(),
-            });
+        // Ungated on enabled (the every-option rule, M9.1): a hidden
+        // layer's options stay visible and editable - edits take effect
+        // when the eye shows it again - Refresh still fetches (nothing
+        // on the fetch path reads enabled), and the status lines keep
+        // reporting.
+        items.push(ControlItem::Dropdown {
+            id: "parameter",
+            label: "Parameter".into(),
+            options: ModelParameter::all()
+                .iter()
+                .map(|p| (p.as_str().into(), p.display_name().into()))
+                .collect(),
+            selected: self.selected_param.as_str().into(),
+        });
 
-            items.push(ControlItem::ButtonRow {
-                buttons: vec![ControlButton {
-                    id: "refresh",
-                    label: "\u{21bb} Refresh".into(),
-                    enabled: !self.state.fetching,
-                    highlight: false,
-                }],
-            });
+        items.push(ControlItem::ButtonRow {
+            buttons: vec![ControlButton {
+                id: "refresh",
+                label: "\u{21bb} Refresh".into(),
+                enabled: !self.state.fetching,
+                highlight: false,
+            }],
+        });
 
-            if self.state.fetching {
+        if self.state.fetching {
+            items.push(ControlItem::InfoText {
+                text: "Fetching...".into(),
+            });
+        }
+        if let Some(t) = self.state.fetch_time {
+            let secs = t.elapsed().as_secs();
+            let text = if secs < 60 {
+                format!("Updated {secs}s ago")
+            } else {
+                format!("Updated {}m ago", secs / 60)
+            };
+            items.push(ControlItem::InfoText { text });
+        }
+
+        // A failed fetch leaves the previous parameter's grid on screen, or
+        // nothing. Neither reads as "broken".
+        if let Some(err) = &self.last_error {
+            items.push(ControlItem::InfoText {
+                text: format!("! {err}"),
+            });
+        }
+
+        if let Some(grid) = self.cached_grids.get(&self.selected_param) {
+            // Windowed fields are maxima over a period, not instantaneous
+            // readings; "UH2-5 at 04:00z" alone reads as a snapshot.
+            if grid.forecast_hour > 0 && self.selected_param.is_windowed() {
                 items.push(ControlItem::InfoText {
-                    text: "Fetching...".into(),
+                    text: format!(
+                        "Maximum over {}-{}, not an analysis field",
+                        grid.ref_time.format("%H:%Mz"),
+                        grid.valid_time().format("%H:%Mz"),
+                    ),
                 });
             }
-            if let Some(t) = self.state.fetch_time {
-                let secs = t.elapsed().as_secs();
-                let text = if secs < 60 {
-                    format!("Updated {secs}s ago")
-                } else {
-                    format!("Updated {}m ago", secs / 60)
-                };
-                items.push(ControlItem::InfoText { text });
-            }
 
-            // A failed fetch leaves the previous parameter's grid on screen, or
-            // nothing. Neither reads as "broken".
-            if let Some(err) = &self.last_error {
-                items.push(ControlItem::InfoText {
-                    text: format!("! {err}"),
-                });
-            }
-
-            if let Some(grid) = self.cached_grids.get(&self.selected_param) {
-                // Windowed fields are maxima over a period, not instantaneous
-                // readings; "UH2-5 at 04:00z" alone reads as a snapshot.
-                if grid.forecast_hour > 0 && self.selected_param.is_windowed() {
-                    items.push(ControlItem::InfoText {
-                        text: format!(
-                            "Maximum over {}-{}, not an analysis field",
-                            grid.ref_time.format("%H:%Mz"),
-                            grid.valid_time().format("%H:%Mz"),
-                        ),
-                    });
-                }
-
-                // A grid can fetch and decode perfectly and still paint nothing.
-                if let Some(notice) = grid.blank_notice() {
-                    items.push(ControlItem::InfoText { text: notice });
-                }
+            // A grid can fetch and decode perfectly and still paint nothing.
+            if let Some(notice) = grid.blank_notice() {
+                items.push(ControlItem::InfoText { text: notice });
             }
         }
 

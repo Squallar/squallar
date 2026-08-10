@@ -743,3 +743,65 @@ pub enum PopupActionKind {
     /// NWS alerts only.
     HideFromMap,
 }
+
+#[cfg(test)]
+mod controls_parity_tests {
+    use super::*;
+    use crate::render::controls::{ControlItem, PaneControlContext};
+
+    /// A control's identity, stripped of its live values. The *set of
+    /// options offered* is what must not depend on state; a toggle's
+    /// checked-ness, a dropdown's selection and a slider's value
+    /// legitimately do.
+    fn shape(item: &ControlItem) -> String {
+        match item {
+            ControlItem::Toggle { id, label, .. } => format!("toggle:{id}:{label}"),
+            ControlItem::Dropdown { id, label, .. } => format!("dropdown:{id}:{label}"),
+            ControlItem::Slider { id, label, .. } => format!("slider:{id}:{label}"),
+            ControlItem::ButtonRow { buttons } => {
+                let ids: Vec<&str> = buttons.iter().map(|b| b.id).collect();
+                format!("buttons:{}", ids.join(","))
+            }
+            ControlItem::InfoText { text } => format!("info:{text}"),
+            ControlItem::Heading { text } => format!("heading:{text}"),
+            ControlItem::Section { label, items, .. } => {
+                let children: Vec<String> = items.iter().map(shape).collect();
+                format!("section:{label}[{}]", children.join(";"))
+            }
+            ControlItem::Separator => "separator".into(),
+        }
+    }
+
+    /// Every handler offers the identical control tree hidden and shown —
+    /// the every-option rule: the stack row's eye hides *pixels*, never
+    /// options. A handler whose disabled tree shrank stranded its
+    /// sub-options exactly when a user goes looking for why a layer is off
+    /// or what it will show once on (the M9.1 user report), so each of the
+    /// twelve is pinned by name.
+    #[test]
+    fn every_handlers_control_tree_is_identical_hidden_and_shown() {
+        let mut registry = OverlayRegistry::default();
+        let kinds: Vec<OverlayKind> = registry.handlers().map(|h| h.kind()).collect();
+        assert_eq!(
+            kinds.len(),
+            12,
+            "the registry carries all twelve handlers - the walk below \
+             must cover every one"
+        );
+        let ctx = PaneControlContext {
+            pane_idx: 0,
+            pane_state: None,
+        };
+        for kind in kinds {
+            registry.set_enabled(kind, true);
+            let shown: Vec<String> = registry.controls(kind, &ctx).iter().map(shape).collect();
+            registry.set_enabled(kind, false);
+            let hidden: Vec<String> = registry.controls(kind, &ctx).iter().map(shape).collect();
+            assert_eq!(
+                shown, hidden,
+                "{kind:?} offers a different option set hidden than shown - \
+                 the eye must change pixels, never the options"
+            );
+        }
+    }
+}

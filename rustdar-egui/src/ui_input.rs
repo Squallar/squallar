@@ -673,7 +673,17 @@ impl LongPressDetector {
             return None;
         }
 
-        // Cancel if finger moved too far (only before activation)
+        // Cancel if finger moved too far (only before activation). The
+        // cancel clears the press, not the gesture: the pointer is still
+        // down, so the next frame re-arms at wherever it is now. A pan
+        // that *pauses* ≥ [`LONG_PRESS_DURATION_S`] mid-drag therefore
+        // grows the hold and the popup takes the pan's remainder —
+        // deliberate, and the touch pipeline's own behaviour (pan, rest,
+        // read the value); the Compact mouse opt-in inherits it as part
+        // of "a hold is a hold" (M9-17's caveat names both this and the
+        // resting-start case). A movement-total gate would fork what a
+        // hold means between the two pointers, for a case a user spells
+        // on purpose.
         if (pos - self.press_pos).length() > LONG_PRESS_MAX_MOVE_PX {
             self.press_start = None;
             return None;
@@ -988,7 +998,13 @@ impl InteractionState {
     /// long-press detector steals the pan from a mouse that rests ≥0.8 s
     /// before dragging (the modality gate's own finding, below), and on the
     /// wide widths — where the status bar carries a live readout — that
-    /// cost buys nothing.
+    /// cost buys nothing. The same trade mid-gesture: a pan *paused* ≥0.8 s
+    /// with the button still held re-arms the hold — the detector's
+    /// movement cancel clears the press and the held button re-arms it next
+    /// frame — so the popup takes the pan's remainder. Touch parity on
+    /// purpose: a finger that pans then rests gets the value popup the same
+    /// way, and [`LongPressDetector::update`]'s cancel branch says why a
+    /// movement-total gate is not the better trade.
     pub(crate) fn resolve_active(
         &mut self,
         ctx: &egui::Context,

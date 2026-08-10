@@ -366,29 +366,32 @@ impl OverlayHandler for MetarHandler {
             enabled: self.enabled,
         }];
 
-        if self.enabled {
-            items.push(ControlItem::ButtonRow {
-                buttons: vec![ControlButton {
-                    id: "refresh",
-                    label: "\u{21bb} Refresh".into(),
-                    enabled: !self.state.fetching,
-                    highlight: false,
-                }],
+        // Ungated on enabled (the every-option rule, M9.1): a hidden
+        // layer's options stay visible and editable - edits take effect
+        // when the eye shows it again - Refresh still fetches (nothing
+        // on the fetch path reads enabled), and the status lines keep
+        // reporting.
+        items.push(ControlItem::ButtonRow {
+            buttons: vec![ControlButton {
+                id: "refresh",
+                label: "\u{21bb} Refresh".into(),
+                enabled: !self.state.fetching,
+                highlight: false,
+            }],
+        });
+        if self.state.fetching {
+            items.push(ControlItem::InfoText {
+                text: "Fetching...".into(),
             });
-            if self.state.fetching {
-                items.push(ControlItem::InfoText {
-                    text: "Fetching...".into(),
-                });
-            }
-            if let Some(t) = self.state.fetch_time {
-                let secs = t.elapsed().as_secs();
-                let text = if secs < 60 {
-                    format!("Updated {secs}s ago")
-                } else {
-                    format!("Updated {}m ago", secs / 60)
-                };
-                items.push(ControlItem::InfoText { text });
-            }
+        }
+        if let Some(t) = self.state.fetch_time {
+            let secs = t.elapsed().as_secs();
+            let text = if secs < 60 {
+                format!("Updated {secs}s ago")
+            } else {
+                format!("Updated {}m ago", secs / 60)
+            };
+            items.push(ControlItem::InfoText { text });
         }
 
         items

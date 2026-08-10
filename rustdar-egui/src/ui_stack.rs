@@ -678,7 +678,16 @@ impl super::Gui {
             self.stack_drag = None;
             return;
         };
-        let Some(pointer) = ui.ctx().pointer_latest_pos() else {
+        // `interact_pos`, not `latest_pos`: egui-winit ends a touch with
+        // `PointerButton{up}` **and** `PointerGone` in one frame's batch (the
+        // harness's event-fidelity table), and `PointerGone` clears
+        // `latest_pos` — read that here and every touch drag springs back on
+        // the very frame it should land. `interact_pos` survives the frame it
+        // went gone on (egui clears it on the next pass), so the release still
+        // knows where the finger was; a pointer that *stays* gone — mouse
+        // out the window, cancelled touch — reads `None` here a frame later
+        // and cancels just the same.
+        let Some(pointer) = ui.ctx().pointer_interact_pos() else {
             self.stack_drag = None;
             return;
         };

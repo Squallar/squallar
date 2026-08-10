@@ -3547,6 +3547,67 @@ fn drag_stack_row(h: &mut InputHarness, kind: OverlayKind, to: egui::Pos2) {
     h.frames_for(2, FRAME_DT);
 }
 
+/// [`drag_stack_row`] by touch: the same grip, through the egui-winit touch
+/// sequence — whose *release* frame batches `PointerButton{up}` with
+/// `PointerGone` (the harness's event-fidelity table), the pair that clears
+/// egui's `latest_pos` before the drag resolver runs.
+fn touch_drag_stack_row(h: &mut InputHarness, kind: OverlayKind, to: egui::Pos2) {
+    let handle = h
+        .stack_row(kind)
+        .unwrap_or_else(|| panic!("{kind:?}'s row is drawn"))
+        .handle;
+    assert_ne!(handle, egui::Rect::NOTHING, "{kind:?}'s row has a grip");
+    let from = handle.center();
+    h.touch_start(from);
+    h.frame_after(FRAME_DT);
+    h.touch_move(egui::pos2(from.x, (from.y + to.y) / 2.0));
+    h.frame_after(FRAME_DT);
+    h.touch_move(to);
+    h.frame_after(FRAME_DT);
+    h.touch_end(to);
+    h.frames_for(2, FRAME_DT);
+}
+
+/// 68c. **The same grip drag lands by touch.**
+///
+///     The release is where touch differs from the mouse and the mouse leg
+///     cannot cover it: egui-winit ends a touch with `PointerButton{up}`
+///     **and** `PointerGone` in one frame's batch, and `PointerGone` clears
+///     egui's `latest_pos` — so a drag resolver reading `latest_pos` sees
+///     `None` on the landing frame, cancels, and the row springs back with
+///     nothing written (the M9 review's finding; the resolver reads
+///     `interact_pos`, which survives the frame it went gone on). Driven
+///     through the full touch sequence; the permutation assertion is the
+///     mouse leg's.
+#[test]
+fn a_touch_drag_on_the_grip_lands_the_reorder() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    let before = h.gui_mut().pane(0).expect("pane 0").draw_order.clone();
+    let n = before.len();
+    assert!(n >= 2, "precondition: a real layer list");
+    let rows = h.stack().rows;
+    let second = rows[1].kind;
+    let above_top = egui::pos2(rows[0].rect.center().x, rows[0].rect.top() - 4.0);
+
+    touch_drag_stack_row(&mut h, second, above_top);
+
+    let mut expected = before.clone();
+    expected.swap(n - 1, n - 2);
+    assert_eq!(
+        h.gui_mut().pane(0).expect("pane 0").draw_order,
+        expected,
+        "the touch release must land the reorder - a resolver that reads \
+         latest_pos loses the landing position to the release batch's \
+         PointerGone and springs the row back"
+    );
+    // And the rows really re-render in the landed order.
+    assert_eq!(
+        h.stack().rows[0].kind,
+        second,
+        "the touch-promoted layer's row did not move to the top"
+    );
+}
+
 /// 68. **Dragging a row by its grip really reorders the draw order —
 ///     permuted, persisted, redrawn.**
 ///
@@ -3681,10 +3742,13 @@ fn city_labels_dragged_above_the_color_scale_paint_after_it() {
 ///     `GraphicLayers::drain`'s hash-order safety net, not in submission
 ///     order. Two claims, each with its own silent failure: the dispatched
 ///     sequence equals the pane's enabled `draw_order` (a fixed-pass renderer
-///     restores itself here), and every kind paints into the *same* egui
-///     layer (a kind quietly moved onto a sub-layer passes the sequence half
-///     while egui stacks it wherever the hash lands — the exact old bug,
-///     which this half verified-failed on).
+///     restores itself here), and every *arm* paints into the same egui
+///     layer — recorded from the arm's own painter, so an arm-level
+///     sub-layer switch (the exact old bug, which this half verified-failed
+///     on) passes the sequence half while egui stacks it wherever the hash
+///     lands, and fails here. Exactly that much: a sub-layer built deep
+///     inside a paint *helper* is beyond the probe's sight and stays on the
+///     helpers' honour — see `PaneRenderCtx::paint_order`.
 #[test]
 fn the_pane_paints_every_enabled_kind_in_draw_order_on_one_paint_list() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -4064,7 +4128,12 @@ fn the_hover_readout_follows_the_modality_not_the_width() {
 ///     reachable with a mouse there: a held primary button is the mouse's
 ///     spelling of the hold. Driven with real held frames; the wide widths
 ///     deliberately keep the pure mouse path (the long-press detector
-///     steals the pan from a resting mouse, and they have a live readout).
+///     steals the pan from a resting mouse — and from a pan *paused* ≥0.8 s
+///     mid-drag, button held, since the movement cancel re-arms under a
+///     still-held button — and they have a live readout). The paused-pan
+///     steal is Compact's on purpose too: touch parity, a finger that pans
+///     then rests gets the value popup the same way (`resolve_active`'s
+///     caveat).
 #[test]
 fn a_compact_mouse_press_and_hold_raises_the_value_popup() {
     let mut h = InputHarness::with_screen(egui::vec2(420.0, 900.0));

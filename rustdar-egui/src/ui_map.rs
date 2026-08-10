@@ -2069,9 +2069,15 @@ const ARMED_HINT_GAP: f32 = 4.0;
 /// translucent black the section track's halo uses, so the chip reads over
 /// any radar core without adding a colour the map does not already have.
 ///
-/// On its own sub-layer (the pending-render notice's arrangement), clipped
-/// to the pane, so a pane's later drawing cannot cover it and it cannot leak
-/// into the pane next door.
+/// On its own `Order::Background` sub-layer, clipped to the pane, so a
+/// pane's later drawing cannot cover it and it cannot leak into the pane
+/// next door. The "over the pane" half is deterministic, not hash luck:
+/// egui registers the background layer as an *area* every frame, and
+/// `GraphicLayers::drain` renders registered layers first within an order —
+/// a same-order layer nobody registered, like this one, drains in the
+/// safety-net pass after them. Hash order decides only *among* safety-net
+/// layers, and the per-pane ids here paint disjoint rects, so that order
+/// can never show.
 fn paint_armed_hint_chip(
     ctx: &egui::Context,
     pane_idx: usize,
