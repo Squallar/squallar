@@ -1,4 +1,4 @@
-//! One menu model, two renderers, one dispatcher.
+//! One menu model, its renderers, one dispatcher.
 //!
 //! The menu used to exist twice: as a real `MenuBar` in `ui_desktop.rs`, and
 //! hand-rolled again as a "Controls" block of buttons inside `ui_mobile.rs`'s
@@ -8,11 +8,11 @@
 //! on only one platform.
 //!
 //! So the menu is described once as data ([`MenuNode`]), rendered by whichever
-//! of the two presentations the current [`WidthClass`](crate::ui_layout::WidthClass)
-//! calls for, and the resulting [`MenuEvent`]s are applied in exactly one
-//! place. A new entry is one line in [`super::Gui::menu_model`] and one arm in
-//! [`super::Gui::apply_menu_event`], and it appears in both presentations by
-//! construction.
+//! presentation is hosting it — today that is the top bar's ☰ dropdown
+//! ([`render_menu_popup`]) at every width — and the resulting [`MenuEvent`]s
+//! are applied in exactly one place. A new entry is one line in
+//! [`super::Gui::menu_model`] and one arm in [`super::Gui::apply_menu_event`],
+//! and it appears in every presentation by construction.
 
 use crate::actions::GuiAction;
 use rustdar_overlays::render::overlay_state::OverlayKind;
@@ -190,37 +190,35 @@ impl MenuFrame {
     }
 }
 
-/// Render the model as a horizontal menu bar with drop-downs.
+/// Render the model as one flat dropdown list, for the top bar's ☰ popup.
 ///
-/// Used when there is room for one — see `WidthClass::has_menu_bar`.
-pub(super) fn render_menu_bar(ui: &mut egui::Ui, nodes: &[MenuNode]) -> MenuFrame {
+/// The whole menu at every width, in one column: each submenu becomes a run of
+/// its leaves, with a separator between runs rather than a heading over each —
+/// the popup is small enough that the grouping reads off the rules alone.
+pub(super) fn render_menu_popup(ui: &mut egui::Ui, nodes: &[MenuNode]) -> MenuFrame {
     let mut out = MenuFrame::default();
-    egui::MenuBar::new().ui(ui, |ui| {
-        for node in nodes {
-            match node {
-                MenuNode::Submenu { label, children } => {
-                    let header = ui
-                        .menu_button(*label, |ui| {
-                            render_menu_items(ui, children, &mut out, true);
-                        })
-                        .response;
-                    // The header's own rect, so a test can open the drop-down
-                    // the way a user does instead of reaching into egui memory.
-                    out.record(label, None, &header);
+    for (i, node) in nodes.iter().enumerate() {
+        match node {
+            MenuNode::Submenu { children, .. } => {
+                if i > 0 {
+                    ui.separator();
                 }
-                // A top-level leaf is unusual but has to render *somewhere*, or
-                // adding one would silently drop it from this presentation only
-                // — which is the failure this module exists to remove.
-                _ => render_menu_items(ui, std::slice::from_ref(node), &mut out, true),
+                render_menu_items(ui, children, &mut out, true);
             }
+            // A top-level leaf is unusual but has to render *somewhere*, or
+            // adding one would silently drop it from this presentation only
+            // — which is the failure this module exists to remove.
+            _ => render_menu_items(ui, std::slice::from_ref(node), &mut out, true),
         }
-    });
+    }
     out
 }
 
-/// Render the model as a flat vertical list, for the slide-out drawer.
+/// Render the model as a flat vertical list, for a panel body to append.
 ///
-/// Used when there is no menu bar, and reached through the hamburger.
+/// Currently unwired: the top bar's dropdown is the one presentation on
+/// screen, until the phone sheet re-hosts this list as its menu page.
+#[expect(dead_code, reason = "kept for the phone sheet's menu page")]
 pub(super) fn render_menu_drawer(ui: &mut egui::Ui, nodes: &[MenuNode]) -> MenuFrame {
     let mut out = MenuFrame::default();
     for node in nodes {
@@ -305,10 +303,11 @@ impl super::Gui {
                 children: vec![
                     // First, because it decides what the entries under it even
                     // apply to. `pane` is `self.active_pane()`, which is why
-                    // `render_layers_panel` builds this model *before* it takes
-                    // the active pane out of the vector: inside that window the
-                    // slot holds a default `PaneState`, so this would read `Map`
-                    // for a volume pane and draw the box unchecked.
+                    // every host builds this model *outside* the frame's
+                    // `mem::take` windows — `render_top_bar` runs before any
+                    // pane is taken. Inside such a window the slot holds a
+                    // default `PaneState`, so this would read `Map` for a
+                    // volume pane and draw the box unchecked.
                     MenuNode::Toggle {
                         label: VOLUME_PANE_LABEL,
                         toggle: MenuToggle::VolumePane,
@@ -387,8 +386,9 @@ impl super::Gui {
             }
             MenuEvent::Invoked(MenuAction::OpenTimeDialog) => {
                 self.time_dialog.show = true;
-                // Close the drawer so the dialog is not hidden behind it. A
-                // no-op when the drawer is not the current presentation.
+                // Close the layers drawer so the dialog is not hidden behind
+                // it. A no-op when the drawer is closed or not this width's
+                // presentation.
                 self.drawer_open = false;
             }
             MenuEvent::Invoked(MenuAction::OpenSettings) => {
@@ -407,12 +407,13 @@ impl super::Gui {
                 // for — and *arming* has to un-arm the cross-section draw, which
                 // is the other modal drag on a map pane.
                 self.set_region_arm(on);
-                // Closing the drawer on arm, exactly as the cross-section entry
-                // below does and for its reason: on every width where the drawer
-                // is the menu it covers the map the box has to be dragged on, so
-                // arming and leaving it open would arm a gesture the user cannot
-                // make. Only on arm — disarming needs no map, so the drawer stays
-                // where the user is.
+                // Closing the layers drawer on arm, exactly as the
+                // cross-section entry below does and for its reason: on a
+                // narrow width the drawer covers the map the box has to be
+                // dragged on, so arming and leaving it open would arm a
+                // gesture the user cannot make. Only on arm — disarming needs
+                // no map, so the drawer stays where the user is. The ☰
+                // dropdown closes itself on arm too; see `render_top_bar`.
                 if on {
                     self.drawer_open = false;
                 }
@@ -424,9 +425,7 @@ impl super::Gui {
                 // Recorded rather than written, through the one route the UI has.
                 //
                 // Not because this dispatcher is inside a `mem::take` window — it
-                // is not. `render_layers_panel` puts the active pane back at
-                // `ui_chrome.rs:425` and only then dispatches at `:438`, and
-                // `render_menu_bar_panel` takes no pane at all, so a direct
+                // is not. `render_top_bar` takes no pane at all, so a direct
                 // `self.panes[self.active_pane].set_kind(..)` here would work
                 // today. It goes through `request_pane_kind` so that every writer
                 // of a pane's kind obeys one rule, including the ones WP-G adds
@@ -448,10 +447,11 @@ impl super::Gui {
                 // setter exists because *disarming* has to drop a half-drawn
                 // anchor, which a bare assignment would leave behind.
                 self.set_section_draw_armed(on);
-                // Closing the drawer is the point of the entry, not a courtesy:
-                // on every width where the drawer is the menu it covers the map
-                // the line has to be drawn on, so arming the mode and leaving it
-                // open would arm a gesture the user cannot make.
+                // Closing the layers drawer is the point, not a courtesy: on a
+                // narrow width it covers the map the line has to be drawn on,
+                // so arming the mode and leaving it open would arm a gesture
+                // the user cannot make. The ☰ dropdown closes itself on arm
+                // for the same reason; see `render_top_bar`.
                 if on {
                     self.drawer_open = false;
                 }

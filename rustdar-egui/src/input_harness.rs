@@ -338,7 +338,9 @@ impl InputHarness {
         self.gui.widget_id_probes().to_vec()
     }
 
-    /// Open or close the layers drawer, as tapping the hamburger does.
+    /// Open or close the layers drawer directly — the state the top bar's
+    /// Layers toggle writes below the sidebar breakpoint. For the user's route
+    /// see [`Self::open_layers`].
     pub(crate) fn set_drawer_open(&mut self, open: bool) {
         self.gui.set_drawer_open(open);
         self.warm_up();
@@ -402,11 +404,6 @@ impl InputHarness {
             phase: egui::TouchPhase::Move,
             modifiers: egui::Modifiers::default(),
         });
-    }
-
-    /// The floating-chrome rects the last frame excluded from map clicks.
-    pub(crate) fn excluded_rects(&self) -> Vec<egui::Rect> {
-        self.gui.excluded_rects_for_test().to_vec()
     }
 
     /// Every menu leaf the last frame's chrome actually drew, whichever
@@ -502,81 +499,66 @@ impl InputHarness {
         false
     }
 
-    /// Put the layers panel on screen the user's way: a no-op where it is
-    /// persistent (Expanded), otherwise a click on the hamburger. Idempotent —
-    /// with the drawer already open there is no hamburger drawn to click.
+    /// What the last frame's top bar drew.
+    pub(crate) fn top_bar(&self) -> crate::ui::TopBarProbe {
+        *self.gui.top_bar_for_test()
+    }
+
+    /// Put the layers panel on screen the user's way: a click on the top bar's
+    /// Layers toggle. Idempotent — the toggle's probe says whether the panel is
+    /// already showing, and a second click would close it again.
     pub(crate) fn open_layers(&mut self) {
-        if self.width_class().has_persistent_sidebar() {
+        let (toggle, open) = self.top_bar().layers_toggle;
+        if open {
             return;
         }
-        // The hamburger's rect is the chrome's one excluded rect; when the
-        // drawer is open the button is not drawn and there is nothing to do.
-        if let Some(rect) = self.excluded_rects().first().copied() {
-            self.mouse_click(rect.center());
-            self.warm_up();
-        }
-    }
-
-    /// Open the whole-menu presentation the user's way. On Compact that is a
-    /// click on the hamburger — the drawer is the menu there. On Medium and
-    /// Expanded the menu bar is already on screen, and each drop-down opens
-    /// through [`Self::open_menu_group`].
-    pub(crate) fn open_menu(&mut self) {
-        if !self.width_class().has_menu_bar() {
-            self.open_layers();
-        }
-    }
-
-    /// Open the menu-bar drop-down under `label`, as clicking its header does.
-    /// Only meaningful where the menu bar is the presentation — the drawer
-    /// shows every group at once. Idempotent: a click on an already-open
-    /// header would *close* the drop-down, so one that is showing its leaves
-    /// is left alone.
-    pub(crate) fn open_menu_group(&mut self, label: &str) {
-        assert!(
-            self.width_class().has_menu_bar(),
-            "open_menu_group needs the menu-bar presentation; on Compact the \
-             drawer is the menu and open_menu is the route"
-        );
-        let already_open = self
-            .menu_groups()
-            .into_iter()
-            .find(|(group, _)| *group == label)
-            .and_then(|(_, leaves)| leaves.first().copied())
-            .is_some_and(|first_leaf| self.menu_leaf(first_leaf).is_some());
-        if already_open {
-            return;
-        }
-        let header = self
-            .menu_leaf(label)
-            .unwrap_or_else(|| panic!("the menu bar did not draw a {label:?} header"));
-        self.mouse_click(header.rect.center());
+        self.mouse_click(toggle.center());
         self.warm_up();
     }
 
-    /// Open the settings window the way a user does: through the menu's
-    /// "Settings..." entry, in whichever presentation this width gives the
-    /// menu.
+    /// Open the whole-menu dropdown the user's way: a click on the top bar's
+    /// ☰ button. The same route at every width. Idempotent — with the popup
+    /// already open its leaves are drawn, and a second click would close it.
+    pub(crate) fn open_menu(&mut self) {
+        if !self.menu_leaves().is_empty() {
+            return;
+        }
+        let button = self.top_bar().menu_button;
+        self.mouse_click(button.center());
+        self.warm_up();
+        assert!(
+            !self.menu_leaves().is_empty(),
+            "clicking the \u{2630} button did not open the menu dropdown"
+        );
+    }
+
+    /// Close the dropdown by clicking its own button again — the toggle half
+    /// of `Popup::menu`'s contract. A no-op when it is not open.
+    pub(crate) fn close_menu(&mut self) {
+        if self.menu_leaves().is_empty() {
+            return;
+        }
+        let button = self.top_bar().menu_button;
+        self.mouse_click(button.center());
+        self.warm_up();
+        assert!(
+            self.menu_leaves().is_empty(),
+            "clicking the \u{2630} button did not close the open dropdown"
+        );
+    }
+
+    /// Whether the last frame drew the layers panel, in either form — read off
+    /// the panel's own id probes rather than off the flags that decide it.
+    pub(crate) fn layers_panel_on_screen(&self) -> bool {
+        self.widget_id_probes()
+            .iter()
+            .any(|(name, _)| *name == "layers_scroll")
+    }
+
+    /// Open the settings window the way a user does: through the ☰ dropdown's
+    /// "Settings..." entry.
     pub(crate) fn open_settings(&mut self) {
         self.open_menu();
-        if self.width_class().has_menu_bar() {
-            self.open_menu_group("View");
-        } else {
-            // The drawer lays the menu out at the bottom of a long scroll, so
-            // the entry usually starts off screen.
-            let leaf = self
-                .menu_leaf("Settings...")
-                .expect("the drawer did not draw the Settings... entry");
-            let pos = egui::pos2(leaf.rect.center().x, self.screen_rect().center().y);
-            let found = self.scroll_until(pos, egui::vec2(0.0, -200.0), 200, |h| {
-                h.menu_leaf("Settings...")
-                    .is_some_and(|l| h.screen_rect().contains(l.rect.center()))
-            });
-            assert!(
-                found,
-                "could not scroll the drawer far enough to reach Settings..."
-            );
-        }
         let leaf = self
             .menu_leaf("Settings...")
             .expect("the menu did not draw the Settings... entry");
@@ -1585,6 +1567,27 @@ impl InputHarness {
     /// held across a gesture really is. Pass `Modifiers::default()` to let go.
     pub(crate) fn set_modifiers(&mut self, modifiers: egui::Modifiers) {
         self.modifiers = modifiers;
+    }
+
+    /// One press-and-release of `key` in the next frame's `RawInput`, as the
+    /// desktop integrations deliver a quick tap. Android's back never takes
+    /// this route — it is a logical event with no egui key behind it — which
+    /// is exactly the difference the dismissal tests need both sides of.
+    pub(crate) fn key_press(&mut self, key: egui::Key) {
+        self.events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        self.events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
     }
 
     /// A quick mouse click (press + release), spread over two frames.

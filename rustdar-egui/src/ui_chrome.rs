@@ -1,4 +1,4 @@
-//! The one UI chrome: menu bar, status bar, layers panel and hamburger.
+//! The one UI chrome: top bar, status bar and layers panel.
 //!
 //! This replaces `ui_desktop.rs` and `ui_mobile.rs`, which were selected by
 //! `cfg(target_os = "android")` and could therefore never both exist in one
@@ -11,10 +11,9 @@
 //! map's `CentralPanel`. That rect feeds pane hit-testing, `excluded_rects`
 //! and overlay texture sizing, so the order below is not cosmetic:
 //!
-//! 1. menu bar (top)
+//! 1. top bar (top) — see `ui_topbar.rs`
 //! 2. status bar (bottom)
 //! 3. layers panel (left)
-//! 4. hamburger — a floating `Area`, claims no space
 //!
 //! # Ids do not depend on the breakpoint
 //!
@@ -26,47 +25,19 @@
 //! them: `"d_"`/`"m_"` control prefixes and `layers_panel`/`mobile_layers_panel`
 //! could never collide only because the two files were never compiled together.
 //!
-//! ## …but the status bar's *positional* id does, and that is fine
-//!
-//! Crossing 600pt makes the menu-bar panel appear or vanish, which advances the
-//! root `Ui`'s auto-id counter one step more or less before the status bar is
-//! shown. egui's `Ui::new_child` computes `unique_id = stable_id.with(parent's
-//! next_auto_id_salt)` (`egui-0.35.0/src/ui.rs:255`), so that counter folds into
-//! every child scope's registered id **regardless of salting** — `Panel` builds
-//! its `Ui` with `id_salt`, which moves only `stable_id`. So the status-bar
-//! panel, and the widgets whose auto-ids run off its counter, come back under
-//! new ids on the far side of the breakpoint, and egui's debug check reports two
-//! rects in the bar as `changed id between passes`.
-//!
-//! **Decision: leave it.** It costs no widget state, and there is no fix here
-//! that is not worse:
-//!
-//! * `unique_id` is documented by egui as deliberately non-stable — "it can
-//!   change if new widgets are added or removed prior to this one… should
-//!   therefore only be used for transient interactions (clicks etc), not for
-//!   storing state over time" (`ui.rs:346`). Everything that *does* persist —
-//!   `ScrollArea`, `ComboBox`, panel sizes — keys on `make_persistent_id`, i.e.
-//!   `Ui::id()`, i.e. `stable_id`, which does not move. That is what
-//!   `crossing_a_breakpoint_does_not_move_any_widget_id` checks, and it is green
-//!   for real reasons, not because the check is shadowed.
-//! * Nothing in this bar stores anything under an auto-id anyway: the refresh
-//!   button and the separators are stateless, and the auto-poll checkbox writes
-//!   to `AutoPollState`. The worst observable cost is a tooltip or a half-made
-//!   click on the refresh button being dropped on the single frame of a resize —
-//!   which needs the pointer to be holding that button while the window is
-//!   being resized.
-//! * Making it stable would mean keeping the counter identical either side,
-//!   i.e. allocating a menu-bar scope that draws nothing below 600pt. That is
-//!   precisely the always-allocated empty child `Ui` removed from
-//!   `render_status_bar` below, and the pattern egui's own check flags. `Panel`
-//!   offers no explicit-id form (`UiBuilder::id` exists, `Panel` does not use
-//!   it), so the alternative is patching egui.
-//!
-//! `crossing_the_menu_bar_breakpoint_re_keys_only_the_status_bar` holds the
-//! *extent* of this: the shift must stay inside the status bar, where nothing is
-//! stored, and the ids that key stored state must not move.
+//! The panels' *positional* ids hold too, and that is no accident. egui's
+//! `Ui::new_child` computes `unique_id = stable_id.with(parent's
+//! next_auto_id_salt)` (`egui-0.35.0/src/ui.rs:255`), so the root `Ui`'s
+//! auto-id counter folds into every panel's registered id **regardless of
+//! salting** — which is why a panel that appears or vanishes with the width
+//! would re-key everything shown after it. The menu-bar panel used to do
+//! exactly that at 600pt, re-keying the status bar on every crossing; its
+//! replacement, the top bar, is drawn at every width, so nothing above the
+//! status bar is conditional and the counter is the same on both sides of
+//! every breakpoint. `crossing_a_breakpoint_re_keys_nothing` pins the whole
+//! claim, and `crossing_a_breakpoint_does_not_move_any_widget_id` pins the
+//! stored-state half of it.
 
-use super::ui_menu;
 use crate::actions::GuiAction;
 use crate::ui_layout::{PointerModality, WidthClass};
 use rustdar_radar::types::ScanInfo;
@@ -89,11 +60,6 @@ const COMBO_BOX_WIDTH: f32 = 150.0;
 /// Deliberately one constant and not a per-layout string: see the module note.
 const LAYER_CONTROL_ID_PREFIX: &str = "layers_";
 
-/// Size of the floating hamburger button.
-const HAMBURGER_SIZE: f32 = 48.0;
-/// Where the hamburger sits inside the content rect.
-const HAMBURGER_INSET: egui::Vec2 = egui::vec2(12.0, 12.0);
-
 /// What the chrome produced this frame.
 pub(super) struct ChromeOutput {
     pub actions: Vec<GuiAction>,
@@ -101,11 +67,12 @@ pub(super) struct ChromeOutput {
     /// handling must not treat as map clicks.
     ///
     /// This is an **output** of the chrome rather than something the map
-    /// reconstructs. `ui_map.rs` used to rebuild the hamburger's rect from a
-    /// copy of its position and size constants, so the two could disagree
-    /// silently — moving the button would have left a dead zone at the old
-    /// place and a live one under the new. Only the code that draws the button
-    /// knows where it is.
+    /// reconstructs — only the code that draws a floating thing knows where it
+    /// is. Empty in practice since the hamburger went: everything left either
+    /// claims panel space or is an egui layer above `Background`, which the
+    /// layer half of `is_pos_blocked` catches with no plumbing. The mechanism
+    /// stays because painted-in-pane chrome has no layer to be caught by, and
+    /// the next thing painted over a pane will need it again.
     pub excluded_rects: Vec<egui::Rect>,
 }
 
@@ -114,89 +81,20 @@ impl super::Gui {
     /// their space.
     pub(super) fn render_chrome(&mut self, ui: &mut egui::Ui) -> ChromeOutput {
         let mut actions = Vec::new();
-        let width = self.layout.width;
 
-        if width.has_menu_bar() {
-            self.render_menu_bar_panel(ui, &mut actions);
-        }
-
+        self.render_top_bar(ui, &mut actions);
         self.render_status_bar(ui, &mut actions);
 
-        // The layers panel is either always there or reached through the
-        // hamburger. `has_persistent_sidebar` and `has_hamburger` are exact
-        // complements, so there is always exactly one way in.
-        let show_panel = width.has_persistent_sidebar() || self.drawer_open;
-        if show_panel {
+        // Persistent-by-default sidebar on Expanded, drawer elsewhere; the top
+        // bar's Layers toggle is the one way in and out on every width.
+        if self.layers_panel_visible() {
             self.render_layers_panel(ui, &mut actions);
-        }
-
-        let mut excluded_rects = Vec::new();
-        if width.has_hamburger() && !self.drawer_open {
-            excluded_rects.push(self.render_hamburger(ui.ctx()));
         }
 
         ChromeOutput {
             actions,
-            excluded_rects,
+            excluded_rects: Vec::new(),
         }
-    }
-
-    fn render_menu_bar_panel(&mut self, ui: &mut egui::Ui, actions: &mut Vec<GuiAction>) {
-        let model = self.menu_model();
-        let mut frame = ui_menu::MenuFrame::default();
-        egui::Panel::top("menubar_container").show(ui, |ui| {
-            frame = ui_menu::render_menu_bar(ui, &model);
-        });
-
-        #[cfg(test)]
-        self.last_menu_leaves.extend(frame.drawn.iter().copied());
-
-        for event in frame.events {
-            self.apply_menu_event(event, actions);
-        }
-    }
-
-    /// The floating button that opens the layers drawer.
-    ///
-    /// Returns its rect, which becomes an excluded rect so a tap on the button
-    /// is never also a tap on the map underneath.
-    fn render_hamburger(&mut self, ctx: &egui::Context) -> egui::Rect {
-        // Positioned inside the *content* rect, so it clears the notch and the
-        // status bar without any manual inset arithmetic.
-        let pos = self.layout.content_rect.min + HAMBURGER_INSET;
-
-        // The rect returned is the one `allocate_exact_size` actually handed
-        // out, not a second guess at it from the same constants. Recomputing it
-        // is the hazard this whole return value exists to remove.
-        let drawn = egui::Area::new(egui::Id::new("layers_hamburger"))
-            .order(egui::Order::Middle)
-            .fixed_pos(pos)
-            .interactable(true)
-            .show(ctx, |ui| {
-                let (rect, response) =
-                    ui.allocate_exact_size(egui::Vec2::splat(HAMBURGER_SIZE), egui::Sense::click());
-                let bg_color = if ui.style().visuals.dark_mode {
-                    egui::Color32::from_rgba_unmultiplied(40, 40, 40, 220)
-                } else {
-                    egui::Color32::from_rgba_unmultiplied(240, 240, 240, 230)
-                };
-                ui.painter().rect_filled(rect, 8.0, bg_color);
-                ui.painter().text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "\u{2630}",
-                    egui::FontId::proportional(26.0),
-                    ui.style().visuals.text_color(),
-                );
-                (rect, response.clicked())
-            })
-            .inner;
-
-        let (rect, clicked) = drawn;
-        if clicked {
-            self.drawer_open = true;
-        }
-        rect
     }
 
     /// The status bar along the bottom.
@@ -345,23 +243,12 @@ impl super::Gui {
     /// The layers panel, in whichever of its two forms this width calls for.
     ///
     /// The body is identical either way; only the header differs, because the
-    /// drawer needs a way to close itself and the persistent sidebar does not.
+    /// drawer covers the map and wants a close button where the user already
+    /// is — the sidebar's way out is the top bar's Layers toggle.
     fn render_layers_panel(&mut self, ui: &mut egui::Ui, actions: &mut Vec<GuiAction>) {
         let is_drawer = !self.layout.width.has_persistent_sidebar();
-        let show_menu_in_panel = !self.layout.width.has_menu_bar();
-
-        // Built before the pane is taken, as `render_menu_bar_panel` does:
-        // `menu_model` reads `self.active_pane()`, and inside the closure that
-        // is `mem::take`'s default, whose `enabled_overlays` is empty. Every
-        // toggle would render unchecked and emit `Toggled(kind, true)`.
-        let menu_model = if show_menu_in_panel {
-            Some(self.menu_model())
-        } else {
-            None
-        };
 
         let mut pane = std::mem::take(&mut self.panes[self.active_pane]);
-        let mut menu_frame = ui_menu::MenuFrame::default();
 
         egui::Panel::left("layers_panel")
             .default_size(LAYERS_PANEL_WIDTH)
@@ -393,7 +280,6 @@ impl super::Gui {
                 let scroll = egui::ScrollArea::vertical()
                     .id_salt("layers_scroll")
                     .show(ui, |ui| {
-                        self.render_pane_selector(ui, &mut pane);
                         self.render_layer_controls(
                             ui,
                             &mut pane,
@@ -401,15 +287,6 @@ impl super::Gui {
                             LAYER_CONTROL_ID_PREFIX,
                             actions,
                         );
-
-                        // With no menu bar on screen, the menu lives here — the
-                        // same model, rendered as a list. This is what used to be
-                        // `ui_mobile.rs`'s hand-rolled "Controls" block.
-                        if let Some(model) = menu_model.as_ref() {
-                            ui.add_space(10.0);
-                            ui.separator();
-                            menu_frame = ui_menu::render_menu_drawer(ui, model);
-                        }
                     });
 
                 // Report the id egui really used, rather than reconstructing
@@ -430,14 +307,6 @@ impl super::Gui {
         // the moment one pane became a 3D view — from a setting called "Sync
         // Layers". The reasoning is written out on `propagate_layer_sync` itself.
         self.propagate_layer_sync();
-
-        #[cfg(test)]
-        self.last_menu_leaves
-            .extend(menu_frame.drawn.iter().copied());
-
-        for event in menu_frame.events {
-            self.apply_menu_event(event, actions);
-        }
     }
 }
 

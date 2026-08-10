@@ -143,13 +143,16 @@ impl super::Gui {
 
                 let pointer_available = self.dismiss_overlay_popups(ui.ctx());
 
-                // Rects of floating chrome drawn over the map (the hamburger).
-                // Clicks there must not become overlay polygon hit-tests.
+                // Rects of chrome painted over the map with no layer of its
+                // own. Clicks there must not become overlay polygon hit-tests.
+                // The list is empty since the top bar replaced the hamburger,
+                // but the plumbing stays warm for the next painted-in-pane
+                // chrome — see `ChromeOutput::excluded_rects`.
                 //
                 // Supplied by the chrome that drew them rather than rebuilt
                 // here from a second copy of its position constants — the two
                 // copies could disagree silently, leaving a dead zone at the
-                // old position and a live one under the button.
+                // old position and a live one under the widget.
 
                 for pane_idx in 0..pane_count {
                     let pane_rect = self.pane_layout.pane_rect(pane_idx, panel_rect);

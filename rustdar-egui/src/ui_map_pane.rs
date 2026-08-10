@@ -34,9 +34,13 @@ pub(super) struct PaneRenderCtx<'a> {
     /// panel by `ColorScaleOrientation`, so every pane agrees.
     pub horizontal_color_scale: bool,
     pub pointer_available: bool,
-    /// Floating chrome drawn over the map (the hamburger). Clicks there are
-    /// not map clicks. Map content that is itself clickable does **not**
-    /// belong here — see `site_icon_rects` in `render_pane_map_content`.
+    /// Rects of chrome painted over the map with no egui layer of its own.
+    /// Clicks there are not map clicks. Empty since the top bar replaced the
+    /// hamburger — everything left is a panel or a floating layer, which
+    /// `is_pos_blocked` catches without plumbing — but the mechanism stays for
+    /// the next painted-in-pane chrome (see `ChromeOutput::excluded_rects`).
+    /// Map content that is itself clickable does **not** belong here — see
+    /// `site_icon_rects` in `render_pane_map_content`.
     pub excluded_rects: Vec<egui::Rect>,
     /// Screen position of an active long-press (for the radar value tooltip),
     /// or `None`. Only the touch pipeline ever produces one.

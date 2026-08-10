@@ -203,7 +203,8 @@ impl super::Gui {
     /// loop produces is exactly the hand-written one this replaced: the
     /// [`section_break`] between two groups belongs to the first row of the
     /// later group — except around the feature-gated GPS block, where the
-    /// break lands on whichever row follows it on this build.
+    /// break is carried as a trailing one by the row *before* the gap, so it
+    /// is drawn whichever of the gated rows this build compiles in.
     fn render_settings_row(
         &mut self,
         ui: &mut egui::Ui,

@@ -26,7 +26,9 @@ pub(super) struct OverlayDrawContext<'a> {
 ///
 /// Three conditions trigger blocking:
 /// 1. `pos` is outside the map pane rect (sidebar, status bar, etc.)
-/// 2. `pos` falls on an explicitly excluded rect (e.g. hamburger button)
+/// 2. `pos` falls on an explicitly excluded rect — chrome painted over a pane
+///    with no layer of its own; none exists since the top bar replaced the
+///    hamburger, but the check stays for the next one
 /// 3. `pos` is on an egui layer with order > `Background` (open dialog or popup window)
 ///
 /// **Convention for new handlers:** pass every candidate click/hover position
@@ -257,9 +259,10 @@ mod tests {
     /// Each of the three conditions must block **on its own**.
     ///
     /// They mask each other in the app, which is why this is claimed here
-    /// rather than only through the UI: the hamburger is both an excluded rect
-    /// *and* a floating layer, so deleting either check leaves a tap on it
-    /// still caught, and a click on a dialog is already stripped upstream by
+    /// rather than only through the UI: the excluded-rect arm has no producer
+    /// at all since the top bar replaced the hamburger (the chrome's list is
+    /// unconditionally empty until M5's pills need it again), and a click on
+    /// a dialog is already stripped upstream by
     /// `ui_input::filter_dialog_blocked` before this ever sees it. Each row
     /// below satisfies exactly one condition, so it fails if and only if that
     /// one stops doing its job.

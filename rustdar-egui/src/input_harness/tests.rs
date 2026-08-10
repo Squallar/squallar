@@ -1952,8 +1952,8 @@ fn crossing_a_breakpoint_does_not_move_any_widget_id() {
         "the scroll position must survive the resize"
     );
 
-    // ...and across the 600pt breakpoint too, where the menu bar goes away
-    // and the panel header is the only chrome left above the controls.
+    // ...and across the 600pt breakpoint too, so all three widths resolve
+    // the same ids.
     h.set_screen(egui::vec2(500.0, 800.0));
     h.set_drawer_open(true);
     assert_eq!(
@@ -1968,69 +1968,9 @@ fn crossing_a_breakpoint_does_not_move_any_widget_id() {
     );
 }
 
-/// 15. **The hamburger's rect is reported by the code that draws it.**
-///
-///     A tap on the button must not also be a tap on the map underneath.
-///     `ui_map.rs` used to rebuild this rect from its own copy of the
-///     position constants, which could disagree with the button silently.
-#[test]
-fn the_hamburger_excludes_its_own_rect_from_map_clicks() {
-    let mut h = InputHarness::with_screen(egui::vec2(500.0, 800.0));
-    assert_eq!(
-        h.width_class(),
-        crate::ui_layout::WidthClass::Compact,
-        "precondition: a compact screen has a hamburger and no sidebar"
-    );
-
-    let rects = h.excluded_rects();
-    assert_eq!(
-        rects.len(),
-        1,
-        "precondition: exactly the hamburger should be excluded, got {rects:?}"
-    );
-    let button = rects[0];
-
-    // The rect must be where the button was actually painted, not merely
-    // non-empty: a stale copy of the constants would still produce a rect.
-    assert!(
-        h.painted_rects().iter().any(|r| {
-            (r.center() - button.center()).length() < 1.0 && r.width() == button.width()
-        }),
-        "the excluded rect does not match any painted rect — it was \
-             reconstructed rather than reported"
-    );
-
-    // The chrome reporting a rect is only half of it: the map has to be
-    // handed it. `render_panes(&mut root_ui, &[])` leaves every assertion
-    // above true and the button transparent to clicks.
-    assert_eq!(
-        h.map_excluded_rects(),
-        rects,
-        "the chrome's rects never reached render_panes, so nothing downstream \
-             can exclude the button from a map click"
-    );
-
-    // ...and the button is on a layer above the map, which is the *other*
-    // half of `is_pos_blocked`. Each half masks the other: with only one
-    // mutated the tap is still caught, and with both it falls through to
-    // the map. So each is claimed separately.
-    assert!(
-        h.is_floating_layer_at(button.center()),
-        "the hamburger dropped to a background layer: `is_pos_blocked`'s \
-             layer check no longer sees it"
-    );
-
-    // With the drawer open the button is gone, and so is its exclusion.
-    h.set_drawer_open(true);
-    assert!(
-        h.excluded_rects().is_empty(),
-        "an open drawer replaces the button, so nothing should be excluded"
-    );
-    assert!(
-        h.map_excluded_rects().is_empty(),
-        "and the map must be told so too"
-    );
-}
+// 15 retired (synthesis-m1): the hamburger is gone and the chrome excludes
+// no rects; M5's pill contract replaces rect exclusion with layer-based
+// blocking.
 
 /// 16b. **The map keeps usable space at every breakpoint.**
 ///
@@ -2095,17 +2035,33 @@ fn the_map_keeps_usable_space_at_every_breakpoint() {
     }
 }
 
-// ── The menu, in whichever presentation is on screen ─────────────────
+// ── The menu, through the top bar's ☰ dropdown ───────────────────────
 
-/// A compact harness with the drawer open — the phone layout, and the only
-/// width that renders the menu as a drawer list.
+/// A compact harness with the ☰ dropdown open — the phone width, driven
+/// through the same dropdown every other width gets. Compact is still the
+/// interesting fixture: it is the width with the least room for the popup
+/// and the one the old drawer-hosted menu served, so anything the dropdown
+/// strands is stranded here first.
+fn compact_with_menu() -> InputHarness {
+    let mut h = InputHarness::with_screen(egui::vec2(420.0, 1200.0));
+    assert_eq!(
+        h.width_class(),
+        crate::ui_layout::WidthClass::Compact,
+        "precondition: the fixture is about the narrowest width class"
+    );
+    h.open_menu();
+    h
+}
+
+/// A compact harness with the layers drawer open — the narrow form of the
+/// layers panel, for tests about the controls it hosts.
 ///
-/// Tall rather than phone-shaped on purpose: the drawer's menu sits below
-/// the layer controls inside a `ScrollArea`, so on an 800pt screen it lays
-/// out past the bottom edge and a synthetic click at its rect would land on
-/// nothing at all — passing every "the overlay did not change" assertion
-/// for the wrong reason. Only the *width* decides the presentation.
-fn compact_with_drawer() -> InputHarness {
+/// Tall rather than phone-shaped on purpose: the controls sit inside a
+/// `ScrollArea`, so on an 800pt screen the lower ones lay out past the
+/// bottom edge and a synthetic click at their rect would land on nothing
+/// at all — passing every "nothing changed" assertion for the wrong
+/// reason. Only the *width* decides the presentation.
+fn compact_with_layers_drawer() -> InputHarness {
     let mut h = InputHarness::with_screen(egui::vec2(420.0, 1200.0));
     assert_eq!(
         h.width_class(),
@@ -2132,16 +2088,18 @@ fn clickable_leaf(h: &InputHarness, label: &str) -> egui::Rect {
     leaf.rect
 }
 
-/// 17. **The drawer's checkboxes show the live pane's state.**
+/// 17. **The dropdown's checkboxes show the live pane's state.**
 ///
-///     Building the model inside the panel closure handed every overlay
-///     toggle the `mem::take`n pane's empty `enabled_overlays`, so the box
-///     rendered unchecked and each click emitted `Toggled(kind, true)`.
-///     Auto-poll escaped it by living on `self`, which is why the model's
-///     own unit tests stayed green.
+///     Building the model inside a `mem::take` window hands every overlay
+///     toggle the taken pane's empty `enabled_overlays`, so the box
+///     renders unchecked and each click emits `Toggled(kind, true)` — the
+///     drawer-hosted menu had exactly that bug once. The top bar builds
+///     the model before any pane is taken; this holds it to that.
+///     Auto-poll escapes either way by living on `self`, which is why the
+///     model's own unit tests could never catch it.
 #[test]
-fn the_drawer_checkboxes_show_the_live_pane_not_a_default_one() {
-    let mut h = compact_with_drawer();
+fn the_dropdown_checkboxes_show_the_live_pane_not_a_default_one() {
+    let mut h = compact_with_menu();
     h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
     h.warm_up();
 
@@ -2151,14 +2109,14 @@ fn the_drawer_checkboxes_show_the_live_pane_not_a_default_one() {
     );
 
     let drawn = h.menu_leaf("Show radar sites").expect(
-        "precondition: the compact drawer must draw the overlay toggles, \
-             or there is no checkbox to be wrong about",
+        "precondition: the open dropdown must draw the overlay toggles, \
+         or there is no checkbox to be wrong about",
     );
     assert_eq!(
         drawn.value,
         Some(true),
-        "the drawer drew the checkbox from a default pane, not the live \
-             one: it renders unchecked and every click turns the overlay *on*",
+        "the dropdown drew the checkbox from a default pane, not the live \
+         one: it renders unchecked and every click turns the overlay *on*",
     );
 
     // Auto-poll is the control that never broke — asserting it alone would
@@ -2171,16 +2129,19 @@ fn the_drawer_checkboxes_show_the_live_pane_not_a_default_one() {
     );
 }
 
-/// 18. **A checkbox in the drawer turns the overlay off, and it stays off.**
+/// 18. **A checkbox in the dropdown turns the overlay off, and it stays
+///     off.**
 ///
 ///     The watched frames are the point: `apply_menu_event` used to write
 ///     `enabled_overlays` only, and the layers panel reloaded the config
 ///     over it on the next frame. Asserting straight after the click
 ///     passes; the user, who sees the frame after, never got the change.
-///     Also pins that `render_menu_drawer`'s events reach the dispatcher.
+///     Also pins that `render_menu_popup`'s events reach the dispatcher,
+///     and that a click inside the popup does not close it — the close
+///     behavior is click-outside, so flipping two toggles is one open.
 #[test]
-fn clicking_a_drawer_checkbox_toggles_the_overlay_both_ways() {
-    let mut h = compact_with_drawer();
+fn clicking_a_dropdown_checkbox_toggles_the_overlay_both_ways() {
+    let mut h = compact_with_menu();
     h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
     h.warm_up();
     assert!(h.overlay_enabled(OverlayKind::RadarSites), "precondition");
@@ -2188,7 +2149,7 @@ fn clicking_a_drawer_checkbox_toggles_the_overlay_both_ways() {
     h.mouse_click(clickable_leaf(&h, "Show radar sites").center());
     assert!(
         !h.overlay_enabled(OverlayKind::RadarSites),
-        "clicking a checked box left the overlay on — the drawer can turn \
+        "clicking a checked box left the overlay on — the dropdown can turn \
              an overlay on but never off"
     );
 
@@ -2227,18 +2188,18 @@ fn clicking_a_drawer_checkbox_toggles_the_overlay_both_ways() {
     assert_eq!(
         h.menu_leaf("Show radar sites").map(|l| l.value),
         Some(Some(true)),
-        "the pane is on but the drawer still draws the box unchecked"
+        "the pane is on but the dropdown still draws the box unchecked"
     );
 }
 
-/// A compact drawer harness split into two panes, with pane 1 made active
-/// the way a user does it — by tapping that pane on the map.
-fn compact_drawer_with_pane_1_active() -> InputHarness {
+/// A compact dropdown harness split into two panes, with pane 1 made
+/// active the way a user does it — by tapping that pane on the map.
+fn compact_menu_with_pane_1_active() -> InputHarness {
     let mut h = InputHarness::with_screen(egui::vec2(420.0, 1200.0));
     h.set_pane_count(2);
 
-    // Tap pane 1 with the drawer shut, so the map has the full width and
-    // the two pane rects are unambiguous.
+    // Tap pane 1 before opening the menu, so the popup cannot be what the
+    // tap lands on and the two pane rects are unambiguous.
     let target = h.pane_rects()[1].center();
     h.mouse_click(target);
     h.warm_up();
@@ -2249,7 +2210,7 @@ fn compact_drawer_with_pane_1_active() -> InputHarness {
              is testing pane 0 twice"
     );
 
-    h.set_drawer_open(true);
+    h.open_menu();
     h
 }
 
@@ -2262,7 +2223,7 @@ fn compact_drawer_with_pane_1_active() -> InputHarness {
 ///     with it on it copies the write back and hides the bug.
 #[test]
 fn the_menu_reads_and_writes_the_active_pane_not_pane_zero() {
-    let mut h = compact_drawer_with_pane_1_active();
+    let mut h = compact_menu_with_pane_1_active();
     h.set_sync_layers(false);
 
     // The panes must disagree about **two** kinds, not one.
@@ -2353,12 +2314,11 @@ fn a_menu_toggle_loads_the_active_panes_config_before_saving_it() {
     h.set_overlay_on_pane(0, OverlayKind::RadarSites, false);
     h.warm_up();
     assert!(
-        h.pane_options().is_empty(),
+        !h.layers_panel_on_screen(),
         "precondition: no layers panel, or its reload masks this"
     );
 
-    h.mouse_click(clickable_leaf(&h, "View").center());
-    h.frames_for(2, FRAME_DT);
+    h.open_menu();
     h.mouse_click(clickable_leaf(&h, "Show radar sites").center());
     h.frames_for(5, FRAME_DT);
 
@@ -2375,18 +2335,18 @@ fn a_menu_toggle_loads_the_active_panes_config_before_saving_it() {
 
 /// 28. **A menu toggle propagates to the other panes when sync is on.**
 ///
-///     Driven on Medium with the drawer shut — the only layout where the
-///     menu is on screen and the layers panel is not. Anywhere else
-///     `render_layers_panel` calls `propagate_layer_sync` itself every
-///     frame and masks the arm: a compact-drawer version of this test
-///     passes with the call deleted.
+///     Driven on Medium with the drawer shut — the menu is always on
+///     screen behind ☰, and this is a width where the layers panel is not.
+///     With the panel up, `render_layers_panel` calls
+///     `propagate_layer_sync` itself every frame and masks the arm: a
+///     panel-open version of this test passes with the call deleted.
 #[test]
 fn a_menu_toggle_propagates_to_the_other_panes_when_sync_is_on() {
     let mut h = InputHarness::with_screen(egui::vec2(800.0, 900.0));
     assert_eq!(
         h.width_class(),
         crate::ui_layout::WidthClass::Medium,
-        "precondition: Medium is menubar-yes, sidebar-no"
+        "precondition: Medium keeps the layers panel closed by default"
     );
     h.set_pane_count(2);
     h.mouse_click(h.pane_rects()[1].center());
@@ -2395,7 +2355,7 @@ fn a_menu_toggle_propagates_to_the_other_panes_when_sync_is_on() {
 
     assert!(h.sync_layers(), "precondition: layer sync is on by default");
     assert!(
-        h.pane_options().is_empty(),
+        !h.layers_panel_on_screen(),
         "precondition: the layers panel must NOT be on screen, or its own \
              `propagate_layer_sync` masks the arm under test"
     );
@@ -2404,9 +2364,8 @@ fn a_menu_toggle_propagates_to_the_other_panes_when_sync_is_on() {
     h.set_overlay_on_pane(1, OverlayKind::RadarSites, false);
     h.warm_up();
 
-    // Through the menu bar: open "View", then tick the box.
-    h.mouse_click(clickable_leaf(&h, "View").center());
-    h.frames_for(2, FRAME_DT);
+    // Through the dropdown: open ☰, then tick the box.
+    h.open_menu();
     h.mouse_click(clickable_leaf(&h, "Show radar sites").center());
     h.frames_for(5, FRAME_DT);
 
@@ -2421,43 +2380,70 @@ fn a_menu_toggle_propagates_to_the_other_panes_when_sync_is_on() {
     );
 }
 
-/// 19. **The compact drawer carries the whole menu.**
-///
-///     Below 600pt there is no menu bar, so the drawer is the only route to
-///     Settings, Time, Exit, Refresh and every toggle. Disconnecting it —
-///     `show_menu_in_panel = false`, or a renderer that draws nothing —
-///     strands all of them behind nothing at all.
-#[test]
-fn the_compact_drawer_is_the_only_route_to_the_whole_menu() {
-    let h = compact_with_drawer();
-    let labels: Vec<&str> = h.menu_leaves().iter().map(|l| l.label).collect();
+// 19 retired (synthesis-m1): the drawer no longer hosts the menu; contract
+// 76 below holds the ☰ dropdown to carrying the whole menu at every width.
 
-    for wanted in [
-        "Refresh Radar",
-        "Exit",
-        crate::ui::VOLUME_PANE_LABEL,
-        "Show radar sites",
-        "Show city labels",
-        "Auto-poll",
-        "Time...",
-        "Settings...",
+/// 76. **The ☰ dropdown carries the whole menu at every width.**
+///
+///     The top bar is the one route to Settings, Time, Exit, Refresh and
+///     every toggle, on the phone as on the desktop. The wanted labels are
+///     the model's own (`menu_model_leaf_labels`), so a new entry joins
+///     this audit by construction and a renderer that drops one fails it —
+///     naming the label and the width, since "reachable on a desktop" and
+///     "reachable on a phone" are separate claims.
+#[test]
+fn the_app_menu_dropdown_carries_the_whole_menu_at_every_width() {
+    for (size, expected) in [
+        (
+            egui::vec2(420.0, 1200.0),
+            crate::ui_layout::WidthClass::Compact,
+        ),
+        (
+            egui::vec2(800.0, 1200.0),
+            crate::ui_layout::WidthClass::Medium,
+        ),
+        (
+            egui::vec2(1400.0, 900.0),
+            crate::ui_layout::WidthClass::Expanded,
+        ),
     ] {
+        let mut h = InputHarness::with_screen(size);
+        assert_eq!(h.width_class(), expected, "precondition: {size:?}");
         assert!(
-            labels.contains(&wanted),
-            "compact has no menu bar, so {wanted:?} is unreachable — drew {labels:?}"
+            h.menu_leaves().is_empty(),
+            "{expected:?}: the menu drew itself before the \u{2630} button \
+             was ever clicked"
         );
+
+        h.open_menu();
+        let drawn: Vec<&str> = h.menu_leaves().iter().map(|l| l.label).collect();
+        for wanted in h.menu_leaf_labels() {
+            let leaf = h.menu_leaf(wanted).unwrap_or_else(|| {
+                panic!(
+                    "{expected:?}: the dropdown never drew {wanted:?} — \
+                     drew {drawn:?}"
+                )
+            });
+            assert!(
+                h.screen_rect().contains(leaf.rect.center()),
+                "{expected:?}: {wanted:?} was drawn at {:?}, outside the \
+                 viewport {:?}",
+                leaf.rect,
+                h.screen_rect()
+            );
+        }
     }
 }
 
-/// 20. **Invoking a command from the drawer really dispatches it.**
+/// 20. **Invoking a command from the dropdown really dispatches it.**
 ///
 ///     A click on "Exit" has to become a `GuiAction::Exit`. `Exit` and
 ///     `RefreshRadar` dispatch to a one-line arm, so a test that only walks
 ///     the model and calls `apply_menu_event` proves nothing about them:
 ///     an exhaustive `match` already guarantees the arm exists.
 #[test]
-fn a_command_invoked_from_the_drawer_reaches_the_dispatcher() {
-    let mut h = compact_with_drawer();
+fn a_command_invoked_from_the_dropdown_reaches_the_dispatcher() {
+    let mut h = compact_with_menu();
     let exit = clickable_leaf(&h, "Exit");
 
     h.mouse_click(exit.center());
@@ -2465,43 +2451,42 @@ fn a_command_invoked_from_the_drawer_reaches_the_dispatcher() {
         h.last_actions()
             .iter()
             .any(|a| matches!(a, crate::actions::GuiAction::Exit)),
-        "clicking Exit in the drawer emitted no Exit action ({} actions in all)",
+        "clicking Exit in the dropdown emitted no Exit action ({} actions in all)",
         h.last_actions().len()
     );
 }
 
-/// 21. **The menu bar's events reach the dispatcher too.**
+/// 21. **The dropdown's events reach the dispatcher on a desktop too.**
 ///
-///     The other presentation, driven the way a user drives it: click the
-///     "View" header to open the drop-down, then click the checkbox inside
-///     it. Nothing here reaches into egui's menu memory.
+///     The widest width, driven the way a user drives it: click ☰ to open
+///     the dropdown, then click the checkbox inside it. Nothing here
+///     reaches into egui's popup memory — and the layers sidebar is open
+///     at this width, so this is also the width where a half-written
+///     toggle would be reverted by the panel's per-frame reload.
 #[test]
-fn a_toggle_flipped_in_the_menu_bar_reaches_the_dispatcher() {
+fn a_toggle_flipped_in_the_dropdown_reaches_the_dispatcher() {
     let mut h = InputHarness::with_screen(egui::vec2(1200.0, 800.0));
     assert_eq!(
         h.width_class(),
         crate::ui_layout::WidthClass::Expanded,
-        "precondition: a menu bar needs 600pt or more"
+        "precondition: the widest class, with the sidebar up"
     );
     h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
     h.warm_up();
     assert!(h.overlay_enabled(OverlayKind::RadarSites), "precondition");
 
-    let view = clickable_leaf(&h, "View");
-    h.mouse_click(view.center());
-    h.frames_for(2, FRAME_DT);
-
+    h.open_menu();
     assert_eq!(
         h.menu_leaf("Show radar sites").map(|l| l.value),
         Some(Some(true)),
-        "the open drop-down must draw the toggle, from the live pane"
+        "the open dropdown must draw the toggle, from the live pane"
     );
 
     h.mouse_click(clickable_leaf(&h, "Show radar sites").center());
     h.frames_for(5, FRAME_DT);
     assert!(
         !h.overlay_enabled(OverlayKind::RadarSites),
-        "the menu bar's toggle never reached apply_menu_event, or was \
+        "the dropdown's toggle never reached apply_menu_event, or was \
              reverted by the layers panel on a later frame"
     );
 }
@@ -2512,12 +2497,24 @@ fn a_toggle_flipped_in_the_menu_bar_reaches_the_dispatcher() {
 ///     right code. The values were pinned as constants, but nothing checked
 ///     the picker consulted the width class at all. The other half — a wide
 ///     layout surviving a load on a phone — is pinned in `ui_config.rs`.
+///
+///     The top bar draws the full row of buttons at every width and
+///     disables the ones past the offer, so "narrows" is now a claim about
+///     the enabled subset — and about a disabled button really refusing
+///     the click.
 #[test]
 fn the_pane_picker_offers_fewer_panes_on_a_phone_than_on_a_desktop() {
     use crate::pane::{MAX_PANES_DESKTOP, MAX_PANES_MOBILE};
 
+    let enabled_counts = |h: &InputHarness| -> Vec<usize> {
+        h.pane_options()
+            .iter()
+            .filter(|o| o.enabled)
+            .map(|o| o.count)
+            .collect()
+    };
+
     let mut compact = InputHarness::with_screen(egui::vec2(420.0, 1200.0));
-    compact.set_drawer_open(true);
     assert_eq!(
         compact.width_class(),
         crate::ui_layout::WidthClass::Compact,
@@ -2525,8 +2522,14 @@ fn the_pane_picker_offers_fewer_panes_on_a_phone_than_on_a_desktop() {
     );
     assert_eq!(
         compact.pane_option_counts(),
+        (1..=MAX_PANES_DESKTOP).collect::<Vec<_>>(),
+        "the full row must be drawn — the counts past the offer read as \
+         disabled, not as absent"
+    );
+    assert_eq!(
+        enabled_counts(&compact),
         (1..=MAX_PANES_MOBILE).collect::<Vec<_>>(),
-        "the picker offered the desktop range on a phone"
+        "the picker offered the desktop range enabled on a phone"
     );
 
     let mut expanded = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -2536,7 +2539,7 @@ fn the_pane_picker_offers_fewer_panes_on_a_phone_than_on_a_desktop() {
         "precondition"
     );
     assert_eq!(
-        expanded.pane_option_counts(),
+        enabled_counts(&expanded),
         (1..=MAX_PANES_DESKTOP).collect::<Vec<_>>(),
         "the picker narrowed a desktop to the phone range"
     );
@@ -2545,9 +2548,42 @@ fn the_pane_picker_offers_fewer_panes_on_a_phone_than_on_a_desktop() {
     // clippy would fold to `true` — and a precondition that is true by
     // construction is not one.
     assert!(
-        compact.pane_option_counts().len() < expanded.pane_option_counts().len(),
+        enabled_counts(&compact).len() < enabled_counts(&expanded).len(),
         "precondition: the two ranges must differ, or both assertions above \
              are satisfied by one constant"
+    );
+
+    // The probe's own statement of the offer must be the enabled subset
+    // the bar really drew — the counts are contiguous from 1, so the
+    // subset's size *is* its ceiling. This is what M6's phone sheet header
+    // will read, and a probe that merely restated the constant would let
+    // the two drift apart unseen.
+    assert_eq!(
+        compact.top_bar().pane_count_max,
+        enabled_counts(&compact).len(),
+        "the compact probe's pane_count_max disagrees with the enabled \
+         buttons on screen"
+    );
+    assert_eq!(
+        expanded.top_bar().pane_count_max,
+        enabled_counts(&expanded).len(),
+        "the expanded probe's pane_count_max disagrees with the enabled \
+         buttons on screen"
+    );
+
+    // A disabled button is drawn but refuses the click — the difference
+    // between "disabled" and "decorative".
+    let six = compact
+        .pane_options()
+        .iter()
+        .find(|o| o.count == MAX_PANES_DESKTOP)
+        .expect("the full row includes the absolute maximum")
+        .rect;
+    compact.mouse_click(six.center());
+    compact.warm_up();
+    assert!(
+        compact.pane_count() <= MAX_PANES_MOBILE,
+        "clicking a disabled pane-count button split the layout anyway"
     );
 
     // The buttons must be real: exactly one reads as selected, and it is
@@ -2588,6 +2624,480 @@ fn the_pane_picker_offers_fewer_panes_on_a_phone_than_on_a_desktop() {
     );
 }
 
+// ── The top bar's own controls ───────────────────────────────────────
+
+/// 77. **The Layers toggle hides and restores the Expanded sidebar with
+///     its state intact.**
+///
+///     The `stack_open` contract, driven the user's way: a click on the
+///     really-drawn toggle, never the setter. The restore half is the one
+///     that carries weight — the panel must come back under the same
+///     `layers_scroll` id with the same offset stored behind it, because
+///     a toggle that rebuilt the panel under a fresh id would look
+///     identical and silently cost the user their place in the list.
+#[test]
+fn the_layers_toggle_hides_and_restores_the_expanded_sidebar_with_its_state() {
+    // Short enough that the layer controls genuinely overflow their
+    // scroll area — on a taller window there is no offset to preserve.
+    let mut h = InputHarness::with_screen(egui::vec2(1200.0, 800.0));
+    assert_eq!(
+        h.width_class(),
+        crate::ui_layout::WidthClass::Expanded,
+        "precondition: the width with a persistent sidebar"
+    );
+    assert!(
+        h.layers_panel_on_screen(),
+        "precondition: the sidebar is the shell default on Expanded"
+    );
+
+    // Real state behind a real id, so "intact" is a claim about something.
+    let scroll_id = h
+        .widget_id_probes()
+        .iter()
+        .find(|(name, _)| *name == "layers_scroll")
+        .expect("precondition: the panel must report its scroll id")
+        .1;
+    h.scroll_at(egui::pos2(80.0, 400.0), egui::vec2(0.0, -120.0));
+    h.frames_for(3, FRAME_DT);
+    let scrolled = h.scroll_offset(scroll_id);
+    assert!(
+        scrolled.is_some_and(|o| o.y > 0.0),
+        "precondition: the panel must really have scrolled, got {scrolled:?}"
+    );
+
+    let (toggle, open) = h.top_bar().layers_toggle;
+    assert!(open, "the toggle must read as open while the panel shows");
+    h.mouse_click(toggle.center());
+    h.warm_up();
+    assert!(
+        !h.layers_panel_on_screen(),
+        "clicking the Layers toggle did not hide the persistent sidebar"
+    );
+    assert!(
+        h.widget_id_probes().is_empty(),
+        "the panel is gone but still reported widget ids, so something \
+         of it is still rendering"
+    );
+    assert!(
+        !h.top_bar().layers_toggle.1,
+        "the toggle still reads as open with the panel hidden"
+    );
+
+    h.mouse_click(h.top_bar().layers_toggle.0.center());
+    h.warm_up();
+    assert!(
+        h.layers_panel_on_screen(),
+        "a second click did not bring the sidebar back"
+    );
+    let restored_id = h
+        .widget_id_probes()
+        .iter()
+        .find(|(name, _)| *name == "layers_scroll")
+        .expect("the restored panel must report its scroll id")
+        .1;
+    assert_eq!(
+        restored_id, scroll_id,
+        "the restored panel keys its scroll area on a different id, so \
+         everything egui remembered under the old one is orphaned"
+    );
+    assert_eq!(
+        h.scroll_offset(scroll_id),
+        scrolled,
+        "the scroll position did not survive the round trip"
+    );
+}
+
+/// 78. **An explicit sidebar choice neither leaks into the drawer nor
+///     expires at the breakpoint.**
+///
+///     `stack_open` and `drawer_open` answer at different widths and
+///     remember independently — that is the whole reason they are two
+///     fields. Closing the Expanded sidebar, crossing to Medium, working
+///     the drawer there and coming back must find the explicit
+///     `Some(false)` still standing; a widened `drawer_open` would fail
+///     one direction or the other.
+#[test]
+fn an_explicit_sidebar_choice_survives_the_breakpoint_without_leaking() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    assert_eq!(h.width_class(), crate::ui_layout::WidthClass::Expanded);
+    assert!(
+        h.layers_panel_on_screen(),
+        "precondition: the shell default"
+    );
+
+    // The explicit choice: close the sidebar.
+    h.mouse_click(h.top_bar().layers_toggle.0.center());
+    h.warm_up();
+    assert!(!h.layers_panel_on_screen(), "precondition: closed by hand");
+
+    // Below the breakpoint the drawer governs, and it starts closed —
+    // not because the sidebar was closed, but because it always does.
+    h.set_screen(egui::vec2(800.0, 900.0));
+    assert_eq!(
+        h.width_class(),
+        crate::ui_layout::WidthClass::Medium,
+        "precondition: crossed below the sidebar breakpoint"
+    );
+    assert!(
+        !h.layers_panel_on_screen(),
+        "the drawer must start closed on Medium"
+    );
+
+    // The same toggle opens and closes the drawer, unencumbered by the
+    // sidebar's `Some(false)`.
+    h.mouse_click(h.top_bar().layers_toggle.0.center());
+    h.warm_up();
+    assert!(
+        h.layers_panel_on_screen(),
+        "the sidebar's explicit close leaked into the drawer: the toggle \
+         could not open it on Medium"
+    );
+    h.mouse_click(h.top_bar().layers_toggle.0.center());
+    h.warm_up();
+    assert!(
+        !h.layers_panel_on_screen(),
+        "the drawer did not close again"
+    );
+
+    // Back on Expanded, the explicit choice is still in force — working
+    // the drawer must not have expired it.
+    h.set_screen(egui::vec2(1400.0, 900.0));
+    assert_eq!(h.width_class(), crate::ui_layout::WidthClass::Expanded);
+    assert!(
+        !h.layers_panel_on_screen(),
+        "crossing the breakpoint and back reopened a sidebar the user \
+         explicitly closed"
+    );
+
+    // ...and it is a choice, not a latch: the toggle still reopens it.
+    h.mouse_click(h.top_bar().layers_toggle.0.center());
+    h.warm_up();
+    assert!(
+        h.layers_panel_on_screen(),
+        "the toggle could not reopen the sidebar after the round trip"
+    );
+}
+
+/// 79. **A fresh session opens the layers panel only where it is
+///     persistent.**
+///
+///     The `None` default of `stack_open`, observed at every width: the
+///     sidebar up on Expanded with nothing having asked for it, and the
+///     drawer down on Medium and Compact — with the toggle's drawn state
+///     agreeing, since a toggle that read open over a closed drawer would
+///     invert its first click.
+#[test]
+fn a_fresh_session_opens_the_sidebar_only_where_it_is_persistent() {
+    for (size, expected, open) in [
+        (
+            egui::vec2(1400.0, 900.0),
+            crate::ui_layout::WidthClass::Expanded,
+            true,
+        ),
+        (
+            egui::vec2(800.0, 900.0),
+            crate::ui_layout::WidthClass::Medium,
+            false,
+        ),
+        (
+            egui::vec2(420.0, 900.0),
+            crate::ui_layout::WidthClass::Compact,
+            false,
+        ),
+    ] {
+        let h = InputHarness::with_screen(size);
+        assert_eq!(h.width_class(), expected, "precondition: {size:?}");
+        assert_eq!(
+            h.layers_panel_on_screen(),
+            open,
+            "{expected:?}: fresh state must show the panel only where the \
+             sidebar is persistent"
+        );
+        assert_eq!(
+            h.top_bar().layers_toggle.1,
+            open,
+            "{expected:?}: the toggle's drawn state disagrees with the \
+             panel it controls"
+        );
+    }
+}
+
+/// 80. **The bar's arm toggles arm, swap and disarm through real clicks.**
+///
+///     The end-to-end route the probe fields exist for: a click on the
+///     drawn Region toggle arms the drag and the next frame's probe shows
+///     it on; a click on X-sec swaps the arms — the mutual exclusion via
+///     the *bar*, not just the menu path that `set_region_arm`'s own tests
+///     cover; a second click on the armed toggle disarms.
+#[test]
+fn the_bars_arm_toggles_arm_swap_and_disarm_through_real_clicks() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    let (region, on) = h.top_bar().region_arm;
+    assert!(!on, "precondition: nothing armed in a fresh session");
+    assert!(
+        !h.top_bar().section_arm.1,
+        "precondition: nor the section draw"
+    );
+
+    h.mouse_click(region.center());
+    h.warm_up();
+    assert!(
+        h.region_arm(),
+        "clicking the bar's Region toggle did not arm"
+    );
+    assert!(
+        h.top_bar().region_arm.1,
+        "the drag is armed but the toggle does not show it"
+    );
+
+    // The swap: arming the other drag through the bar un-arms this one.
+    h.mouse_click(h.top_bar().section_arm.0.center());
+    h.warm_up();
+    assert!(
+        h.section_draw_armed(),
+        "clicking the bar's X-sec toggle did not arm the draw"
+    );
+    assert!(
+        !h.region_arm(),
+        "the region drag stayed armed beside the section draw: the bar's \
+         clicks bypass the mutual exclusion the setters carry"
+    );
+    assert_eq!(
+        (h.top_bar().section_arm.1, h.top_bar().region_arm.1),
+        (true, false),
+        "the two toggles do not show the swap"
+    );
+
+    // And off again, from the bar.
+    h.mouse_click(h.top_bar().section_arm.0.center());
+    h.warm_up();
+    assert!(
+        !h.section_draw_armed() && !h.region_arm(),
+        "a second click on the armed toggle did not disarm"
+    );
+}
+
+/// 81. **Arming from the bar closes the open ☰ dropdown.**
+///
+///     The bar-click sibling of the in-menu rule (`render_top_bar`'s
+///     `close_kind`): the next thing the user does is a drag on the map,
+///     and an open menu is in its way. The bar's toggle is outside the
+///     popup, so this is the `CloseOnClickOutside` half — the click both
+///     arms and closes, and neither eats the other.
+#[test]
+fn arming_from_the_bar_closes_the_open_dropdown() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.open_menu();
+    assert!(
+        !h.menu_leaves().is_empty(),
+        "precondition: the dropdown is open"
+    );
+
+    let (region, _) = h.top_bar().region_arm;
+    assert!(
+        !h.is_floating_layer_at(region.center()),
+        "precondition: the toggle must not sit under the open popup, or \
+         the click below lands on the popup instead"
+    );
+
+    h.mouse_click(region.center());
+    h.frame_after(FRAME_DT);
+    assert!(
+        h.menu_leaves().is_empty(),
+        "the dropdown stayed open over the armed drag"
+    );
+    assert!(
+        h.region_arm(),
+        "closing the dropdown ate the click that was also an arm"
+    );
+}
+
+/// 82. **The bar never overlaps itself at Medium's narrowest width.**
+///
+///     600pt with six panes is the worst case the docked bar must simply
+///     absorb: the roomy run would overrun the width, and before the arms
+///     claimed the right edge first the right-to-left toggles were laid
+///     out in whatever sliver was left — overlapping the segments, or
+///     degenerate. Asserted on the drawn rects: everything inside the
+///     bar's own rect, no segment under an arm, no painted label under an
+///     arm, and the arms still taking clicks.
+#[test]
+fn the_bar_never_overlaps_at_mediums_narrowest_width() {
+    let mut h = InputHarness::with_screen(egui::vec2(600.0, 900.0));
+    assert_eq!(
+        h.width_class(),
+        crate::ui_layout::WidthClass::Medium,
+        "precondition: 600pt is Medium's floor"
+    );
+    h.set_pane_count(crate::pane::MAX_PANES_DESKTOP);
+    assert_eq!(
+        h.pane_count(),
+        crate::pane::MAX_PANES_DESKTOP,
+        "precondition: the widest segment row the bar can be asked for"
+    );
+
+    // The captions are the first thing the squeeze gives up — their
+    // absence here is how a test can see the tight form really engaged,
+    // rather than the roomy one happening to fit a wider font's luck.
+    assert!(
+        h.painted_text_strings()
+            .iter()
+            .all(|t| t != "Panes:" && t != "Pane:"),
+        "the bar kept its captions at a width they cannot fit"
+    );
+    // ...and the contrast that keeps that from passing vacuously: a roomy
+    // desktop draws them.
+    let wide = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    assert!(
+        wide.painted_text_strings().iter().any(|t| t == "Panes:"),
+        "a 1400pt bar dropped its captions, so the adaptive decision is \
+         stuck tight and the assertion above says nothing"
+    );
+
+    let probe = h.top_bar();
+    let bar = probe.rect.expand(0.5);
+    let arms = [probe.region_arm.0, probe.section_arm.0];
+    for (name, rect) in [
+        ("the \u{2630} button", probe.menu_button),
+        ("the Layers toggle", probe.layers_toggle.0),
+        ("the Region toggle", probe.region_arm.0),
+        ("the X-sec toggle", probe.section_arm.0),
+    ] {
+        assert!(
+            bar.contains_rect(rect),
+            "{name} at {rect:?} leaked out of the bar {bar:?}"
+        );
+    }
+
+    for option in h.pane_options() {
+        assert!(
+            bar.contains_rect(option.rect),
+            "pane-count button {} at {:?} leaked out of the bar {bar:?}",
+            option.count,
+            option.rect
+        );
+        for arm in arms {
+            assert!(
+                !option.rect.intersects(arm),
+                "pane-count button {} at {:?} lies under the arm toggle at \
+                 {arm:?}",
+                option.count,
+                option.rect
+            );
+        }
+    }
+
+    // Every text the bar painted — which reaches the probe-less widgets,
+    // the active-pane selector above all — must stay clear of the arms
+    // too. The arms' own labels are exempted by their centre.
+    for (rect, text) in h.painted_text_rects() {
+        if !probe.rect.intersects(rect) || arms.iter().any(|a| a.contains(rect.center())) {
+            continue;
+        }
+        for arm in arms {
+            assert!(
+                !rect.intersects(arm),
+                "{text:?} at {rect:?} was painted under the arm toggle at \
+                 {arm:?}"
+            );
+        }
+    }
+
+    // Squeezed, not sacrificed: the toggles still take their clicks.
+    h.mouse_click(probe.region_arm.0.center());
+    h.warm_up();
+    assert!(
+        h.region_arm(),
+        "the Region toggle stopped responding at the squeezed width"
+    );
+    h.mouse_click(h.top_bar().section_arm.0.center());
+    h.warm_up();
+    assert!(
+        h.section_draw_armed() && !h.region_arm(),
+        "the X-sec toggle stopped responding at the squeezed width"
+    );
+}
+
+/// 83. **A dismiss with the ☰ dropdown open closes it, and only it.**
+///
+///     Escape's real shape: egui's `Popup` closes itself on the Escape
+///     *it* sees, and the frontend independently resolves the same press
+///     through `dismiss_top_layer` — so without the popup at the chain's
+///     head, one press closed the popup *and* the layer beneath it. Both
+///     halves are driven here exactly as they ship: the dismiss first,
+///     the key event in the following frame's input.
+#[test]
+fn a_dismiss_with_the_dropdown_open_closes_it_and_only_it() {
+    let mut h = InputHarness::with_screen(egui::vec2(800.0, 1200.0));
+    assert_eq!(
+        h.width_class(),
+        crate::ui_layout::WidthClass::Medium,
+        "precondition: a width where the drawer is the layer beneath"
+    );
+    h.set_drawer_open(true);
+    h.open_menu();
+    assert!(
+        h.layers_panel_on_screen() && !h.menu_leaves().is_empty(),
+        "precondition: drawer and dropdown both open"
+    );
+
+    assert!(
+        h.gui_mut().dismiss_top_layer(),
+        "the press must be consumed against the open dropdown"
+    );
+    h.key_press(egui::Key::Escape);
+    h.warm_up();
+    assert!(
+        h.menu_leaves().is_empty(),
+        "the dropdown survived the press"
+    );
+    assert!(
+        h.layers_panel_on_screen(),
+        "one press took the drawer under the popup with it — egui's own \
+         close and the consumed dismiss are not converging on one layer"
+    );
+
+    // The second press is the drawer's.
+    assert!(h.gui_mut().dismiss_top_layer(), "the drawer was still open");
+    h.warm_up();
+    assert!(
+        !h.layers_panel_on_screen(),
+        "the second press did not close the drawer"
+    );
+}
+
+/// 83b. **Android's back closes the dropdown with no key event at all.**
+///
+///      The other route: a logical back press never enters egui's queue,
+///      so the popup's own Escape handling cannot see it and the request
+///      flag is the only thing standing between the press and a popup
+///      that stays open over whatever the press closed behind it.
+#[test]
+fn an_android_back_press_closes_the_dropdown_without_a_key_event() {
+    let mut h = compact_with_menu();
+    assert!(
+        !h.menu_leaves().is_empty(),
+        "precondition: the dropdown is open"
+    );
+
+    assert!(
+        h.gui_mut().dismiss_top_layer(),
+        "the press must be consumed against the open dropdown"
+    );
+    h.frames_for(2, FRAME_DT);
+    assert!(
+        h.menu_leaves().is_empty(),
+        "the popup stayed open behind a back press egui never saw"
+    );
+
+    // Only the popup was open, so the next press must fall through to
+    // the exit path — one layer per press, counted exactly.
+    assert!(
+        !h.gui_mut().dismiss_top_layer(),
+        "the popup press left something else consumed as well"
+    );
+}
+
 /// 23. **Host safe-area insets reach the chrome.**
 ///
 ///     `set_safe_area_insets` -> `LayoutCtx::resolve` -> the root `Ui`'s
@@ -2618,21 +3128,21 @@ fn host_safe_area_insets_inset_the_chrome() {
         "bottom inset ignored"
     );
 
-    // The hamburger is positioned from `content_rect` too, so it must have
-    // moved clear of the notch rather than staying in the screen corner.
+    // The top bar is laid out inside `content_rect` too, so on a phone it
+    // must sit below the notch rather than under the system bars.
     let mut h = InputHarness::with_screen(egui::vec2(420.0, 1000.0));
     assert_eq!(
         h.width_class(),
         crate::ui_layout::WidthClass::Compact,
-        "precondition: only a compact layout draws a hamburger"
+        "precondition: the narrowest class gets the same docked bar"
     );
-    let bare = h.excluded_rects()[0];
+    let bare = h.top_bar().rect;
     h.set_safe_area_insets(TOP, 0.0, LEFT, 0.0);
-    let inset = h.excluded_rects()[0];
+    let inset = h.top_bar().rect;
     assert_eq!(
         (inset.left() - bare.left(), inset.top() - bare.top()),
         (LEFT, TOP),
-        "the hamburger ignored the insets and stayed under the system bars"
+        "the top bar ignored the insets and stayed under the system bars"
     );
 }
 
@@ -3192,18 +3702,10 @@ fn day_old_data_reads_in_hours() {
     );
 }
 
-/// 16. A wide screen has a persistent sidebar and therefore no hamburger,
-///     so nothing is excluded — the complement of the test above.
-#[test]
-fn a_wide_screen_has_no_floating_chrome_to_exclude() {
-    let h = InputHarness::with_screen(egui::vec2(1200.0, 800.0));
-    assert_eq!(h.width_class(), crate::ui_layout::WidthClass::Expanded);
-    assert!(
-        h.excluded_rects().is_empty(),
-        "a persistent sidebar claims panel space rather than floating over \
-             the map, so it excludes nothing"
-    );
-}
+// 16 retired (synthesis-m1): `excluded_rects` is unconditionally empty
+// since the hamburger went, so "a wide screen excludes nothing" held for
+// every screen and pinned nothing. M5's pill-row contract (73) replaces
+// rect exclusion with layer-based assertions.
 
 // ── Overlay texture budget ───────────────────────────────────────────
 
@@ -3569,7 +4071,7 @@ fn a_dialog_over_a_site_icon_suppresses_its_hover_readout() {
 ///     rect, so a probe reporting a value the widget never received fails.
 #[test]
 fn a_dropdown_shows_its_option_label_not_the_raw_value() {
-    let mut h = compact_with_drawer();
+    let mut h = compact_with_layers_drawer();
     for kind in [OverlayKind::ModelData, OverlayKind::Lightning] {
         h.set_overlay_on_pane(0, kind, true);
     }
@@ -3618,7 +4120,7 @@ fn a_dropdown_shows_its_option_label_not_the_raw_value() {
     // checked against two rendered results rather than one rendered result
     // and one reading of the model.
     for dropdown in &drawn {
-        let mut h = compact_with_drawer();
+        let mut h = compact_with_layers_drawer();
         for kind in [OverlayKind::ModelData, OverlayKind::Lightning] {
             h.set_overlay_on_pane(0, kind, true);
         }
@@ -3706,35 +4208,29 @@ fn a_scan_arriving_moves_no_widget_id() {
     );
 }
 
-/// 34b. **Crossing 600pt re-keys the status bar, and nothing else.**
+/// 34b. **Crossing a breakpoint re-keys nothing.**
 ///
-///      The menu bar going away advances the root `Ui`'s auto-id counter
-///      one step less, and `Ui::new_child` folds that counter into every
-///      child scope's `unique_id` — `id_salt` moves only the *stable* id —
-///      so the status-bar panel and the widgets keyed off its counter come
-///      back under new ids on the far side. **This is deliberate and
-///      costs nothing**; see the "Ids do not depend on the breakpoint"
-///      note in `ui_chrome.rs` for why, and why there is no fix that is
-///      not worse.
-///
-///      What this pins is the *extent* of it. egui's own widget
-///      bookkeeping says which rects moved, so if the shift ever reaches a
-///      widget outside the status bar — where something does store state
-///      across frames — this
-///      fails rather than being noticed by someone re-deriving the whole
-///      mechanism a third time. If it fails because the list came back
-///      empty, the shift is gone and the note in `ui_chrome.rs` can go
-///      with it.
+///      The strengthening the top bar bought. The menu-bar panel used to
+///      appear and vanish at 600pt, advancing the root `Ui`'s auto-id
+///      counter one step more or less before the status bar — and
+///      `Ui::new_child` folds that counter into every child scope's
+///      `unique_id`, `id_salt` moving only the *stable* id, so the whole
+///      status bar came back under new ids on the far side. The old form
+///      of this test could only hold the *extent* of that shift. With the
+///      top bar drawn at every width nothing above the status bar is
+///      conditional, so the claim is now total: egui's own per-pass widget
+///      bookkeeping must see no rect come back under a different id.
 #[test]
-fn crossing_the_menu_bar_breakpoint_re_keys_only_the_status_bar() {
-    // Above 600pt, and narrow enough to have no sidebar either side of the
-    // crossing, so the layers panel is the drawer both times.
+fn crossing_a_breakpoint_re_keys_nothing() {
+    // Either side of 600pt, and narrow enough to have no sidebar on
+    // either, so the layers panel is the drawer both times.
     let mut h = InputHarness::with_screen(egui::vec2(750.0, 600.0));
     h.set_drawer_open(true);
     h.load_scan("KTLX");
-    assert!(
-        h.width_class().has_menu_bar(),
-        "precondition: start above the menu-bar breakpoint"
+    assert_eq!(
+        h.width_class(),
+        crate::ui_layout::WidthClass::Medium,
+        "precondition: start above the 600pt breakpoint"
     );
 
     // Real stored state behind a real widget id, so "nothing was lost" is
@@ -3762,25 +4258,16 @@ fn crossing_the_menu_bar_breakpoint_re_keys_only_the_status_bar() {
         "precondition: the resize crossed the 600pt breakpoint"
     );
 
-    let moved = h.id_changes().to_vec();
-    assert!(
-        !moved.is_empty(),
-        "no widget id moved across the breakpoint at all — if that is a \
-             fix rather than a probe that stopped reading, delete this test \
-             and the note in `ui_chrome.rs` with it"
+    assert_eq!(
+        h.id_changes(),
+        &[] as &[egui::Rect],
+        "a widget rect came back under a different id across the \
+         breakpoint: everything egui remembers under the old id is \
+         discarded on every resize past 600pt"
     );
-    let bar = h.status_bar().rect;
-    for rect in &moved {
-        assert!(
-            bar.contains_rect(*rect),
-            "a widget outside the status bar ({rect:?}) changed id across \
-                 the breakpoint; the bar is {bar:?}. Everything egui remembers \
-                 under that id is discarded on every resize past 600pt"
-        );
-    }
 
-    // ...and it cost nothing: the ids that key stored state are the same
-    // ids, and the state stored under them is still there.
+    // ...and the ids that key stored state are the same ids, with the
+    // state stored under them still there.
     assert_eq!(
         probes,
         h.widget_id_probes(),
@@ -3910,7 +4397,8 @@ fn a_pane_added_by_the_picker_still_shows_radar_with_layer_sync_off() {
     assert_eq!(
         h.width_class(),
         crate::ui_layout::WidthClass::Expanded,
-        "precondition: the picker only draws where the layers panel is up"
+        "precondition: an arbitrary width — the picker is in the top bar \
+         at all of them"
     );
     h.set_sync_layers(false);
     assert!(
@@ -3958,14 +4446,15 @@ fn fetched_site(actions: &[crate::actions::GuiAction]) -> Option<String> {
 ///     sync on or off — so with per-pane sites a Refresh that clones the
 ///     config verbatim can fetch a site the active pane never showed.
 ///     Both entry points, driven the way a user reaches them: the status
-///     bar's button and the File menu's item.
+///     bar's button and the ☰ dropdown's item.
 #[test]
 fn refresh_fetches_the_active_panes_site_not_the_global_one() {
     let mut h = InputHarness::with_screen(egui::vec2(800.0, 900.0));
     assert_eq!(
         h.width_class(),
         crate::ui_layout::WidthClass::Medium,
-        "precondition: the menu-bar presentation of Refresh must be on screen"
+        "precondition: an arbitrary width — the dropdown is the same at all \
+         of them"
     );
 
     // Some other pane switched sites last: the global config points away
@@ -3987,8 +4476,7 @@ fn refresh_fetches_the_active_panes_site_not_the_global_one() {
         "the status-bar Refresh fetched the global site, not the active pane's"
     );
 
-    h.mouse_click(clickable_leaf(&h, "File").center());
-    h.frames_for(2, FRAME_DT);
+    h.open_menu();
     h.mouse_click(clickable_leaf(&h, "Refresh Radar").center());
     assert_eq!(
         fetched_site(h.last_actions()).as_deref(),
@@ -4288,25 +4776,24 @@ fn a_non_map_pane_paints_its_empty_state() {
     }
 }
 
-/// 43. **Converting the active pane from the drawer really converts it.**
+/// 43. **Converting the active pane from the dropdown really converts it.**
 ///
 ///     The end-to-end version of
 ///     `a_pane_kind_request_survives_the_pane_being_held_out_of_the_vector`,
-///     driven by a real click through the real presentation. It matters
-///     because the drawer's menu is rendered from *inside*
-///     `render_layers_panel`, which holds the active pane out of the vector
-///     with `mem::take` for the whole of the panel's body — so the obvious
-///     `self.panes[self.active_pane].set_kind(..)` in the dispatcher writes a
-///     placeholder that is discarded a moment later, and the checkbox simply
-///     never sticks.
+///     driven by a real click through the real presentation. The dispatcher
+///     records the conversion rather than writing it, and the deferred
+///     applier runs after the pane loop's own `mem::take` window — the
+///     obvious `self.panes[self.active_pane].set_kind(..)` shape has been
+///     silently discarded from inside such a window before, and this is
+///     what keeps the checkbox sticking whatever hosts the menu.
 ///
 ///     Asserted all the way to the glass: the pane's kind, the arm that
 ///     actually drew it, the copy on screen, and the checkbox reading back the
 ///     new state on the following frame. The last of those is what a user sees
 ///     first, and it is the one a half-wired conversion would fail.
 #[test]
-fn converting_the_active_pane_from_the_drawer_makes_it_a_volume_pane() {
-    let mut h = compact_with_drawer();
+fn converting_the_active_pane_from_the_dropdown_makes_it_a_volume_pane() {
+    let mut h = compact_with_menu();
     h.load_scan("KTLX");
     assert_eq!(
         h.pane_kinds(),
@@ -4316,7 +4803,7 @@ fn converting_the_active_pane_from_the_drawer_makes_it_a_volume_pane() {
     assert_eq!(
         h.menu_leaf(crate::ui::VOLUME_PANE_LABEL).map(|l| l.value),
         Some(Some(false)),
-        "precondition: the drawer must draw the toggle, unchecked"
+        "precondition: the dropdown must draw the toggle, unchecked"
     );
 
     h.mouse_click(clickable_leaf(&h, crate::ui::VOLUME_PANE_LABEL).center());
@@ -4838,66 +5325,11 @@ fn converting_the_active_pane_keeps_the_sidebars_widget_ids() {
     );
 }
 
-/// 47. **Converting the active pane does not re-key the drawer menu.**
-///
-///     The layers panel's kind-specific block sits inside a child scope, and
-///     this is why. `Ui::new_child` folds the parent's `next_auto_id_salt` into
-///     every child's registered id, so two branches allocating different
-///     numbers of widgets — a map pane draws a loop transport and the whole
-///     overlay tree, a volume pane draws neither — shift the id of
-///     **everything drawn after them**. Below them, in the drawer, is the menu,
-///     which at every width without a menu bar is the only route to Exit and
-///     Settings. Any child scope fixes that, because a scope advances the
-///     parent's counter by exactly one however much it draws inside itself; the
-///     explicit `UiBuilder::id` the panel uses is for a different and weaker
-///     reason, set out on `render_layer_controls`.
-///
-///     [`converting_a_pane_moves_no_widget_id`] cannot see this: it converts a
-///     *non-active* pane, so the panel's content does not change, and the
-///     harness's id-change probe matches widgets **by rect** — a shift that
-///     also moves the rects reads as new widgets rather than as re-keyed ones.
-///     So the ids are compared directly, per label, which is what
-///     `DrawnMenuLeaf::id` exists for.
-///
-///     Verified by mutation, and only in one direction: with the scope
-///     **removed** and the branch drawn straight onto the panel's `Ui`, every id
-///     below it moves and this fails. Replacing it with a bare `ui.scope` does
-///     *not* fail, and should not — all three forms advance the parent's counter
-///     by one, so it is the scope that is load-bearing here and not the id it
-///     was built with.
-#[test]
-fn converting_the_active_pane_does_not_re_key_the_drawer_menu() {
-    let mut h = compact_with_drawer();
-    h.load_scan("KTLX");
-
-    let ids_by_label = |h: &InputHarness| -> Vec<(&'static str, egui::Id)> {
-        h.menu_leaves().iter().map(|l| (l.label, l.id)).collect()
-    };
-
-    let before = ids_by_label(&h);
-    assert!(
-        before.len() >= 6,
-        "precondition: the drawer must really be drawing the menu, found {}",
-        before.len()
-    );
-
-    h.mouse_click(clickable_leaf(&h, crate::ui::VOLUME_PANE_LABEL).center());
-    h.frames_for(3, FRAME_DT);
-    assert_eq!(
-        h.pane_kinds(),
-        vec![PaneKind::Volume],
-        "precondition: the conversion must have happened, or the panel above \
-             the menu never changed and nothing was at risk"
-    );
-
-    assert_eq!(
-        ids_by_label(&h),
-        before,
-        "converting the active pane re-keyed the menu underneath it: egui \
-             discards everything it remembers under those ids, and on a phone \
-             this menu is the only way to reach the rest of the app"
-    );
-}
+// 47 retired (synthesis-m1): the drawer no longer appends the menu, so
+// there is nothing below the kind block for a conversion to re-key — the
+// menu lives in the top bar's popup, above every take window. Tests 48 and
+// 52 hold what remains of the claim; the kind-scope's rationale is on
+// `render_layer_controls`.
 
 /// 48. **Converting a pane must not move any widget's egui `Id`.**
 ///
@@ -4938,7 +5370,10 @@ fn converting_the_active_pane_does_not_re_key_the_drawer_menu() {
 ///     pane re-keys *itself* and needs no later pane to reveal it.
 #[test]
 fn converting_a_pane_moves_no_widget_id() {
-    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    // Short enough that the layers panel's content overflows and there is
+    // a real scroll offset to lose — with the pane picker moved to the top
+    // bar the panel fits a 900pt window without scrolling.
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 700.0));
     h.set_pane_count(3);
     h.load_scan("KTLX");
 
@@ -4992,39 +5427,37 @@ fn converting_a_pane_moves_no_widget_id() {
 /// 44. **The menu checkbox arms the draw, and a drag on a map becomes a
 ///     section.**
 ///
-///     Through the drawer's own checkbox, which is where the mode is armed
-///     and — just as importantly — where it is turned off again: a mode
-///     whose state is invisible is a map that has mysteriously stopped
-///     panning.
+///     Through the dropdown's own checkbox, which is where the mode is
+///     armed and — just as importantly — where it is turned off again: a
+///     mode whose state is invisible is a map that has mysteriously
+///     stopped panning.
 #[test]
-fn the_drawers_checkbox_arms_the_cross_section_draw() {
-    let mut h = compact_with_drawer();
+fn the_menus_checkbox_arms_the_cross_section_draw() {
+    let mut h = compact_with_menu();
     h.load_scan("KTLX");
     assert!(!h.section_draw_armed(), "precondition: it starts unarmed");
     assert_eq!(
         h.menu_leaf(crate::ui::DRAW_CROSS_SECTION_LABEL)
             .map(|l| l.value),
         Some(Some(false)),
-        "precondition: the drawer must draw the toggle, unchecked"
+        "precondition: the dropdown must draw the toggle, unchecked"
     );
 
     h.mouse_click(clickable_leaf(&h, crate::ui::DRAW_CROSS_SECTION_LABEL).center());
     h.frames_for(3, FRAME_DT);
 
     assert!(h.section_draw_armed(), "the checkbox did not arm the draw");
-    // Arming closes the drawer, and must: at every width where the drawer
-    // *is* the menu it covers the whole map, so leaving it open would arm a
-    // gesture the user has nowhere to make.
+    // Arming closes the dropdown, and must: the next thing the user does
+    // is a drag on the map, and an open menu is in its way.
     assert_eq!(
         h.menu_leaf(crate::ui::DRAW_CROSS_SECTION_LABEL),
         None,
-        "the drawer stayed open over the map the line has to be drawn on"
+        "the dropdown stayed open over the map the line has to be drawn on"
     );
 
     // Re-opened, the checkbox shows the mode it turned on — which is what a
     // user who armed it by accident needs in order to un-tick it.
-    h.set_drawer_open(true);
-    h.frames_for(2, FRAME_DT);
+    h.open_menu();
     assert_eq!(
         h.menu_leaf(crate::ui::DRAW_CROSS_SECTION_LABEL)
             .map(|l| l.value),
@@ -6405,16 +6838,16 @@ fn arming_the_draw_changes_nothing_for_a_pane_with_no_map() {
 // is the first branch on which both exist. Everything below is about the
 // pair rather than about either one.
 
-/// **The region checkbox closes the drawer on arm, exactly as the section
-/// checkbox does.**
+/// **The region checkbox closes the dropdown on arm, exactly as the
+/// section checkbox does.**
 ///
-/// On every width where the drawer is the menu it covers the map the box
-/// has to be dragged on, so arming and leaving it open would arm a gesture
-/// the user cannot make. Un-ticking is the asymmetric half and it is pinned
-/// too: disarming needs no map, so the drawer stays open where the user is.
+/// The next thing the user does after arming is a drag on the map, and an
+/// open menu is in its way. Un-ticking is the asymmetric half and it is
+/// pinned too: disarming needs no map, so the menu stays open where the
+/// user is.
 #[test]
-fn the_drawers_checkbox_arms_the_region_drag_and_closes_the_drawer() {
-    let mut h = compact_with_drawer();
+fn the_menus_checkbox_arms_the_region_drag_and_closes_the_dropdown() {
+    let mut h = compact_with_menu();
     h.load_scan("KTLX");
     assert!(!h.region_arm(), "precondition: it starts unarmed");
 
@@ -6425,27 +6858,26 @@ fn the_drawers_checkbox_arms_the_region_drag_and_closes_the_drawer() {
     assert_eq!(
         h.menu_leaf(crate::ui::REGION_ARM_LABEL),
         None,
-        "the drawer stayed open over the map the box has to be dragged on"
+        "the dropdown stayed open over the map the box has to be dragged on"
     );
 
     // Re-opened, the checkbox shows the mode it turned on — which is what a
     // user who armed it by accident needs in order to un-tick it.
-    h.set_drawer_open(true);
-    h.frames_for(2, FRAME_DT);
+    h.open_menu();
     assert_eq!(
         h.menu_leaf(crate::ui::REGION_ARM_LABEL).map(|l| l.value),
         Some(Some(true)),
         "the checkbox does not show the mode it just turned on"
     );
 
-    // Un-ticking disarms and leaves the drawer where the user is: only
+    // Un-ticking disarms and leaves the dropdown where the user is: only
     // arming needs the map underneath.
     h.mouse_click(clickable_leaf(&h, crate::ui::REGION_ARM_LABEL).center());
     h.frames_for(3, FRAME_DT);
     assert!(!h.region_arm(), "the checkbox could not turn it off");
     assert!(
         h.menu_leaf(crate::ui::REGION_ARM_LABEL).is_some(),
-        "disarming needs no map, so it must not slam the drawer shut"
+        "disarming needs no map, so it must not slam the dropdown shut"
     );
 }
 
@@ -6455,24 +6887,24 @@ fn the_drawers_checkbox_arms_the_region_drag_and_closes_the_drawer() {
 /// the same gesture — press, move, release, on a map pane. With both on, one
 /// drag would have to mean two things at once, so exactly one may be armed.
 ///
-/// Driven through the drawer's own checkboxes rather than through the
+/// Driven through the dropdown's own checkboxes rather than through the
 /// setters, because the claim is about what a user sees: the box that
 /// un-ticked itself has to *read* as un-ticked, or the mode they think they
 /// are in is not the one a drag will do. A rule enforced only in the setter
 /// would leave two ticked boxes on screen and one working gesture.
 #[test]
 fn arming_either_modal_drag_un_ticks_the_other_in_the_menu() {
-    let mut h = compact_with_drawer();
+    let mut h = compact_with_menu();
     h.load_scan("KTLX");
     assert!(!h.section_draw_armed() && !h.region_arm(), "both start off");
 
-    // Region first, then section.
+    // Region first, then section. Arming closes the dropdown each time,
+    // so each step re-opens it the user's way.
     h.mouse_click(clickable_leaf(&h, crate::ui::REGION_ARM_LABEL).center());
     h.frames_for(3, FRAME_DT);
     assert!(h.region_arm(), "the region checkbox did not arm the drag");
 
-    h.set_drawer_open(true);
-    h.frames_for(2, FRAME_DT);
+    h.open_menu();
     h.mouse_click(clickable_leaf(&h, crate::ui::DRAW_CROSS_SECTION_LABEL).center());
     h.frames_for(3, FRAME_DT);
     assert!(h.section_draw_armed(), "the section checkbox did not arm");
@@ -6481,8 +6913,7 @@ fn arming_either_modal_drag_un_ticks_the_other_in_the_menu() {
         "both drags are armed: one press would anchor a line and start a box"
     );
 
-    h.set_drawer_open(true);
-    h.frames_for(2, FRAME_DT);
+    h.open_menu();
     assert_eq!(
         h.menu_leaf(crate::ui::REGION_ARM_LABEL).map(|l| l.value),
         Some(Some(false)),
@@ -6505,8 +6936,7 @@ fn arming_either_modal_drag_un_ticks_the_other_in_the_menu() {
         "arming the region drag left the section draw armed"
     );
 
-    h.set_drawer_open(true);
-    h.frames_for(2, FRAME_DT);
+    h.open_menu();
     assert_eq!(
         h.menu_leaf(crate::ui::DRAW_CROSS_SECTION_LABEL)
             .map(|l| l.value),

@@ -11,11 +11,11 @@
 //! never reconstructs what "should" have been painted.
 //!
 //! Each width class is walked through the chrome a user of that width gets:
-//! the hamburger and drawer on Compact, the menu bar and drawer on Medium, the
-//! menu bar and persistent sidebar on Expanded. `ScrollArea`s lay content out
-//! beyond the viewport, so an item is only counted once its probe's rect
-//! centre is inside the screen — [`InputHarness::scroll_until`] does the
-//! scrolling a user would.
+//! the top bar's Layers toggle opens the layers panel — sidebar on Expanded,
+//! drawer elsewhere — and its ☰ button opens the one menu dropdown every
+//! width shares. `ScrollArea`s lay content out beyond the viewport, so an
+//! item is only counted once its probe's rect centre is inside the screen —
+//! [`InputHarness::scroll_until`] does the scrolling a user would.
 //!
 //! Assertion failures name the missing label *and* the width class, because
 //! "reachable on desktop" and "reachable on a phone" are separate claims and
@@ -208,7 +208,7 @@ fn walk_layer_controls(h: &mut InputHarness, width: WidthClass) {
     }
 }
 
-/// Every menu leaf, reachable through this width's menu presentation.
+/// Every menu leaf, drawn inside the viewport by the one ☰ dropdown.
 fn walk_menu(h: &mut InputHarness, width: WidthClass) {
     let labels = h.menu_leaf_labels();
     let groups = h.menu_groups();
@@ -218,59 +218,30 @@ fn walk_menu(h: &mut InputHarness, width: WidthClass) {
         .collect();
     assert_eq!(
         grouped, labels,
-        "a menu entry sits outside every submenu on {width:?}; the group walk \
-         below would silently skip it"
+        "a menu entry sits outside every submenu on {width:?}; the popup \
+         renders it, but the model's own grouping has stopped covering it"
     );
 
-    if width == WidthClass::Compact {
-        // The drawer is the menu: one flat list at the bottom of the panel's
-        // scroll, walked top to bottom.
-        h.open_menu();
-        for label in labels {
-            let pos = panel_scroll_pos(h);
-            let found = h.scroll_until(pos, SCROLL_STEP, MAX_SCROLL_STEPS, |h| {
-                h.menu_leaf(label)
-                    .is_some_and(|leaf| h.screen_rect().contains(leaf.rect.center()))
-            });
-            assert!(
-                found,
-                "menu leaf {label:?} was never drawn on screen on {width:?}"
-            );
-        }
-    } else {
-        // The menu bar: open each drop-down and hold every leaf under it to
-        // having been drawn inside the viewport.
-        for (group, leaves) in groups {
-            h.open_menu_group(group);
-            for label in leaves {
-                let leaf = h.menu_leaf(label).unwrap_or_else(|| {
-                    panic!("menu leaf {label:?} was not drawn under the {group:?} drop-down on {width:?}")
-                });
-                assert!(
-                    h.screen_rect().contains(leaf.rect.center()),
-                    "menu leaf {label:?} was drawn at {:?}, outside the \
-                     {width:?} viewport {:?}",
-                    leaf.rect,
-                    h.screen_rect()
-                );
-            }
-        }
+    h.open_menu();
+    for label in labels {
+        let leaf = h
+            .menu_leaf(label)
+            .unwrap_or_else(|| panic!("menu leaf {label:?} was never drawn on {width:?}"));
+        assert!(
+            h.screen_rect().contains(leaf.rect.center()),
+            "menu leaf {label:?} was drawn at {:?}, outside the {width:?} \
+             viewport {:?}",
+            leaf.rect,
+            h.screen_rect()
+        );
     }
+    // Closed again so the next phase's clicks cannot land on the popup.
+    h.close_menu();
 }
 
 /// The Set Time dialog, reachable through the menu, with both fields drawn.
 fn walk_time_dialog(h: &mut InputHarness, width: WidthClass) {
-    if width == WidthClass::Compact {
-        h.open_menu();
-        let pos = panel_scroll_pos(h);
-        let found = h.scroll_until(pos, SCROLL_STEP, MAX_SCROLL_STEPS, |h| {
-            h.menu_leaf("Time...")
-                .is_some_and(|leaf| h.screen_rect().contains(leaf.rect.center()))
-        });
-        assert!(found, "could not scroll the drawer to Time... on {width:?}");
-    } else {
-        h.open_menu_group("View");
-    }
+    h.open_menu();
     let leaf = h
         .menu_leaf("Time...")
         .unwrap_or_else(|| panic!("the menu did not draw Time... on {width:?}"));
@@ -323,9 +294,9 @@ fn walk_settings(h: &mut InputHarness, width: WidthClass) {
     }
 }
 
-/// The whole walk for one screen. The phase order matters on Compact, where
-/// the drawer hosts both the layer controls and the menu: the layer walk
-/// scrolls down from the top and the menu walk carries on below it.
+/// The whole walk for one screen: layer controls through the layers panel,
+/// then the menu, the time dialog and the settings window through the ☰
+/// dropdown — the same routes at every width.
 fn walk_every_option(size: egui::Vec2, expect: WidthClass) {
     let mut h = InputHarness::with_screen(size);
     assert_eq!(

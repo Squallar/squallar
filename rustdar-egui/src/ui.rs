@@ -59,6 +59,8 @@ pub(crate) use map::VolumeArmProbe;
 pub(crate) use map::{CROSS_SECTION_EMPTY_STATE, VOLUME_EMPTY_STATE};
 #[path = "ui_settings.rs"]
 mod settings;
+#[path = "ui_topbar.rs"]
+mod topbar;
 
 /// The sentence the settings pane puts under a refusal, for the same reason and
 /// on the same terms as the two empty states above: where a refusal is undone
@@ -81,7 +83,45 @@ use crate::ui_input::InteractionState;
 pub(crate) struct PaneOptionProbe {
     pub count: usize,
     pub selected: bool,
+    /// Whether the button could be clicked. The top bar draws every count up
+    /// to the absolute maximum and disables the ones past this width's offer,
+    /// so "the picker narrows on a phone" is now a claim about this flag.
+    pub enabled: bool,
     pub rect: egui::Rect,
+}
+
+/// What the top bar drew: the rects a test drives it by, and the state each
+/// toggle was showing. Reported by the renderer, never rebuilt by a test —
+/// see [`ui_menu::DrawnMenuLeaf`] for the pattern.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct TopBarProbe {
+    /// The rect the docked panel claimed, straight off its own response.
+    pub rect: egui::Rect,
+    /// The ☰ button that opens the whole-menu dropdown.
+    pub menu_button: egui::Rect,
+    /// The Layers toggle, and whether it read as open.
+    pub layers_toggle: (egui::Rect, bool),
+    /// The largest pane count offered *enabled* at this width.
+    pub pane_count_max: usize,
+    /// The Region arm toggle, and whether it read as armed.
+    pub region_arm: (egui::Rect, bool),
+    /// The X-sec arm toggle, and whether it read as armed.
+    pub section_arm: (egui::Rect, bool),
+}
+
+#[cfg(test)]
+impl Default for TopBarProbe {
+    fn default() -> Self {
+        Self {
+            rect: egui::Rect::NOTHING,
+            menu_button: egui::Rect::NOTHING,
+            layers_toggle: (egui::Rect::NOTHING, false),
+            pane_count_max: 0,
+            region_arm: (egui::Rect::NOTHING, false),
+            section_arm: (egui::Rect::NOTHING, false),
+        }
+    }
 }
 
 /// Which render arm ran for one pane, recorded **inside the arm itself**.
@@ -360,10 +400,6 @@ pub struct Gui {
     /// egui keyed on it.
     #[cfg(test)]
     widget_id_probes: Vec<(&'static str, egui::Id)>,
-    /// The floating-chrome rects the last frame's chrome reported. Only read by
-    /// tests, which check they match what was painted.
-    #[cfg(test)]
-    last_excluded_rects: Vec<egui::Rect>,
     /// Every menu leaf the last frame actually drew — whichever of the two
     /// presentations was on screen — with the bool each checkbox was really
     /// handed and the rect it landed in. Only read by tests, which need the
@@ -400,6 +436,9 @@ pub struct Gui {
     /// What the last frame's status bar actually drew. Only read by tests.
     #[cfg(test)]
     last_status_bar: StatusBarProbe,
+    /// What the last frame's top bar actually drew. Only read by tests.
+    #[cfg(test)]
+    last_top_bar: TopBarProbe,
     /// Every handler dropdown the last frame drew, with the text its collapsed
     /// box showed. Only read by tests — see [`DrawnDropdown`].
     #[cfg(test)]
@@ -578,6 +617,33 @@ pub struct Gui {
     /// Whether the slide-out layers drawer is open. Only consulted when the
     /// layout has no persistent sidebar.
     drawer_open: bool,
+    /// The user's explicit say over the Expanded layers sidebar, from the top
+    /// bar's Layers toggle. `None` is the shell default — open where the
+    /// sidebar is persistent — and, like `drawer_open`, it is deliberately
+    /// session-only: how a session left its panels is not a preference.
+    ///
+    /// A separate field rather than a widened `drawer_open` because the two
+    /// answer at different widths and remember independently: closing the
+    /// sidebar on a desktop must not also close the drawer the same window
+    /// gets when it narrows past the breakpoint.
+    stack_open: Option<bool>,
+    /// Whether the top bar's ☰ dropdown was open on the last frame it drew.
+    ///
+    /// The dropdown's real state is egui popup memory, which this crate only
+    /// touches mid-frame — but [`Self::dismiss_top_layer`] runs *between*
+    /// frames, from the frontend's input handling, so it needs last frame's
+    /// answer mirrored somewhere it can reach. Written every frame by
+    /// `render_top_bar`, from the popup's own id.
+    menu_popup_open: bool,
+    /// A dismiss was consumed against the open dropdown; the top bar honours
+    /// this (and clears it) by force-closing the popup before next showing it.
+    ///
+    /// A request rather than a direct write because the popup's memory is
+    /// keyed on a widget id that only exists mid-frame — see
+    /// `render_top_bar_run`, where the two dismissal routes (Escape, which
+    /// egui also sees and closes on itself, and Android's back, which never
+    /// enters egui's queue) converge on this one flag.
+    menu_popup_close_requested: bool,
     // Safe area insets in logical pixels (top, bottom, left, right)
     // Used on Android to avoid drawing under system bars.
     safe_area_insets: (f32, f32, f32, f32),
@@ -1077,8 +1143,6 @@ impl Gui {
             #[cfg(test)]
             widget_id_probes: Vec::new(),
             #[cfg(test)]
-            last_excluded_rects: Vec::new(),
-            #[cfg(test)]
             last_menu_leaves: Vec::new(),
             #[cfg(test)]
             last_pane_pointers: Vec::new(),
@@ -1092,6 +1156,8 @@ impl Gui {
             last_map_excluded_rects: Vec::new(),
             #[cfg(test)]
             last_status_bar: StatusBarProbe::default(),
+            #[cfg(test)]
+            last_top_bar: TopBarProbe::default(),
             #[cfg(test)]
             last_dropdowns: Vec::new(),
             #[cfg(test)]
@@ -1117,6 +1183,9 @@ impl Gui {
             loop_lookback_secs: 3600, // default 1 hour
             loop_speed_fps: 5.0,      // default 5 fps
             drawer_open: false,
+            stack_open: None,
+            menu_popup_open: false,
+            menu_popup_close_requested: false,
             safe_area_insets: (0.0, 0.0, 0.0, 0.0),
             supports_exit: true,
             modality: ModalityLatch::default(),
@@ -1156,13 +1225,12 @@ impl Gui {
             // Same reason as the line above: a per-frame record of the pane
             // loop, so a leftover entry would report a 3D arm that did not run.
             self.last_volume_arms.clear();
-            // Cleared like the rest: the picker only draws when the layers
-            // panel is on screen, so a stale value would report buttons that
-            // are not there — a compact layout with the drawer shut offers
-            // nothing at all.
+            // Cleared like the rest: the picker redraws from the top bar every
+            // frame, and appending over a stale list would report every button
+            // twice.
             self.last_pane_options.clear();
-            // Same reason: the handler dropdowns only exist while the panel is
-            // on screen.
+            // The handler dropdowns only exist while the layers panel is on
+            // screen, so a stale entry would report widgets that are not there.
             self.last_dropdowns.clear();
             // And its generalisation, for the same reason.
             self.last_control_items.clear();
@@ -1194,10 +1262,6 @@ impl Gui {
         // the map's. See `ui_chrome.rs`.
         let chrome = self.render_chrome(&mut root_ui);
         actions.extend(chrome.actions);
-        #[cfg(test)]
-        {
-            self.last_excluded_rects = chrome.excluded_rects.clone();
-        }
 
         if let Some(action) = self.render_time_dialog(ctx) {
             actions.push(action);
@@ -1257,6 +1321,19 @@ impl Gui {
         }
 
         actions
+    }
+
+    /// The read-side context handlers are asked for their controls with, aimed
+    /// at the active pane.
+    ///
+    /// One constructor for the renderer and the test accessors alike, so the
+    /// model a test asks a handler for is built exactly as the renderer builds
+    /// it — the two diverging is how an inventory drifts from the glass.
+    fn active_pane_control_context(&self) -> PaneControlContext<'_> {
+        PaneControlContext {
+            pane_idx: self.active_pane,
+            pane_state: None,
+        }
     }
 
     /// The config a radar fetch on the active pane's behalf must use: the
@@ -1517,8 +1594,8 @@ impl Gui {
     ///
     /// What Escape and Android's back both mean: back out of the thing I am
     /// in. Only when this returns `false` is the press a request to leave the
-    /// app — which is why the drawer used to cost a whole launch on a phone,
-    /// where the drawer *is* the menu at every width the Fold 7 reaches.
+    /// app — which is why a stray press with something open used to cost a
+    /// whole relaunch on a phone, back going straight to minimise.
     ///
     /// Ordered topmost first — whatever is painted over everything else is
     /// what a press is aimed at — and exactly one layer closes per press.
@@ -1532,7 +1609,7 @@ impl Gui {
     /// Deliberately not reachable from `request_exit`: the window's close
     /// button and the menu's Exit item are unambiguous, and dismissing a dialog
     /// instead of honouring them would strand the user — the Exit item lives
-    /// *inside* the drawer.
+    /// *inside* the ☰ dropdown this function closes first.
     pub fn dismiss_top_layer(&mut self) -> bool {
         // First, above everything painted: a handle drag in flight owns the
         // pointer right now, which makes it the most immediate thing a "back
@@ -1540,6 +1617,24 @@ impl Gui {
         // started from — the preview was never written anywhere.
         if self.section_edit_drag.is_some() {
             self.section_edit_drag = None;
+            return true;
+        }
+        // The ☰ dropdown, above every dialog: it is `Order::Foreground` and
+        // opened last, and it is the head of the plan's Esc chain (§3.4).
+        //
+        // egui's `Popup` closes itself on the Escape *it* sees, but that
+        // covers one of this function's three routes. The frontend resolves
+        // the same Escape press here independently, and without this layer
+        // that resolution fell through to whatever sat beneath the popup —
+        // two layers on one press. Android's back is worse: a logical event
+        // that never enters egui's queue at all, so the popup would have
+        // stayed open over a drawer this function closed behind it. Consuming
+        // the press here and letting `render_top_bar_run` honour the request
+        // makes all three routes close the popup, and the popup only — the
+        // Escape egui also saw closes it twice over, idempotently.
+        if self.menu_popup_open {
+            self.menu_popup_open = false;
+            self.menu_popup_close_requested = true;
             return true;
         }
         if !self.overlays.selected_overlays.is_empty() {
@@ -1560,9 +1655,9 @@ impl Gui {
             return true;
         }
         // Last, below every painted layer, because an armed drag is a *mode*
-        // rather than something on screen: whatever is drawn over the map is what
-        // a press is aimed at, and the drawer in particular is where the mode was
-        // armed.
+        // rather than something on screen: whatever is drawn over the map is
+        // what a press is aimed at, and the ☰ dropdown in particular is one of
+        // the two places the mode is armed from.
         //
         // Being here at all is what makes an armed drag cancellable by the two
         // gestures that mean "back out" everywhere else — and on Android it is
@@ -1679,58 +1774,18 @@ impl Gui {
         action
     }
 
-    /// Render pane count buttons and active-pane selector.
+    /// Whether the layers panel is on screen this frame, in either form.
     ///
-    /// Shared by desktop and mobile layers panels. The caller must pass the
-    /// currently-taken `pane` by mutable reference so this method can swap
-    /// it back into `self.panes` when the active pane changes.
-    fn render_pane_selector(&mut self, ui: &mut egui::Ui, pane: &mut PaneState) {
-        let max_panes = self.layout.width.max_panes();
-        ui.horizontal(|ui| {
-            ui.label("Panes:");
-            for count in 1..=max_panes {
-                let button =
-                    ui.selectable_label(self.pane_layout.pane_count == count, format!("{count}"));
-                // The button that was drawn: which count, whether it read as
-                // selected, and where it landed so a test can click it. A probe
-                // built from `max_panes` instead would be a restatement of the
-                // line above and could not see the loop at all.
-                #[cfg(test)]
-                self.last_pane_options.push(PaneOptionProbe {
-                    count,
-                    selected: self.pane_layout.pane_count == count,
-                    rect: button.rect,
-                });
-                if button.clicked() && self.pane_layout.pane_count != count {
-                    // The pane goes back into the vector first: `set_pane_count`
-                    // seeds the new panes from the *active* one, and a
-                    // `mem::take`n slot would seed them from a default.
-                    self.panes[self.active_pane] = std::mem::take(pane);
-                    // The answer is ignored here and only here: the picker's
-                    // counts come from the width class's own list, so the clamp
-                    // in `PaneLayout::for_count` can never bite.
-                    let _ = self.set_pane_count(count);
-                    *pane = std::mem::take(&mut self.panes[self.active_pane]);
-                }
-            }
-        });
-        if self.pane_layout.pane_count > 1 {
-            ui.horizontal(|ui| {
-                ui.label("Pane:");
-                for i in 0..self.pane_layout.pane_count {
-                    if ui
-                        .selectable_label(self.active_pane == i, format!("{}", i + 1))
-                        .clicked()
-                        && self.active_pane != i
-                    {
-                        self.panes[self.active_pane] = std::mem::take(pane);
-                        self.active_pane = i;
-                        *pane = std::mem::take(&mut self.panes[i]);
-                    }
-                }
-            });
+    /// One question with two answers by width: on Expanded the panel is the
+    /// sidebar, open unless [`Self::stack_open`] says otherwise; elsewhere it
+    /// is the drawer, closed unless opened. The top bar's Layers toggle reads
+    /// and writes through this split, so it is the one definition of "open".
+    pub(super) fn layers_panel_visible(&self) -> bool {
+        if self.layout.width.has_persistent_sidebar() {
+            self.stack_open.unwrap_or(true)
+        } else {
+            self.drawer_open
         }
-        ui.separator();
     }
 
     /// Render the layer controls shared by desktop and mobile panels.
@@ -1747,20 +1802,20 @@ impl Gui {
     /// onto this `Ui` the two branches would advance that counter by different
     /// amounts: a map pane draws a loop transport and the whole overlay tree, a
     /// volume pane draws neither. **Everything after them would then come back
-    /// under new ids the moment a pane was converted**, including the drawer menu
-    /// below, which at every width without a menu bar is the only route to Exit
-    /// and Settings. One child scope advances the counter by exactly one whichever
-    /// branch ran. Pinned by
-    /// `converting_the_active_pane_does_not_re_key_the_drawer_menu`.
+    /// under new ids the moment a pane was converted.** The drawer used to
+    /// append the whole menu there — which is why the scope was first built —
+    /// and though the menu now lives in the top bar's dropdown, the guarantee
+    /// stays: whatever the panel next grows below this block inherits it. One
+    /// child scope advances the counter by exactly one whichever branch ran;
+    /// `converting_a_pane_moves_no_widget_id` holds the observable half.
     ///
     /// The scope's id is [`egui::UiBuilder::id`] rather than `id_salt`, and what
     /// that buys is independence from *what precedes it*. `id` is the one form
     /// taking `IdSource::Explicit`, which makes the child's `unique_id` equal its
     /// `stable_id`; `id_salt` leaves `unique_id` folded together with the parent's
     /// `next_auto_id_salt`, and hence seeds this scope's own auto-id counter from
-    /// it. `render_pane_selector` above draws a button per offered pane count plus
-    /// a second row once the layout is split, so the counter at this position moves
-    /// whenever the pane count does — and only the explicit form keeps this scope's
+    /// it — so anything the panel ever draws above this call would move the
+    /// counter at this position, and only the explicit form keeps this scope's
     /// children out of that. It is the same reason `ui_chrome.rs`'s `status_error`
     /// note records for choosing it there.
     ///
@@ -2333,10 +2388,7 @@ impl Gui {
             self.overlays.load_pane_configs(&pane.overlay_configs);
         }
 
-        let ctx = PaneControlContext {
-            pane_idx: self.active_pane,
-            pane_state: None,
-        };
+        let ctx = self.active_pane_control_context();
 
         // Render controls and collect updates.
         let mut updates: Vec<(OverlayKind, ControlUpdate)> = Vec::new();
@@ -3160,12 +3212,6 @@ impl Gui {
         self.last_map_panel_rect
     }
 
-    /// The floating-chrome rects the last frame excluded from map clicks.
-    #[cfg(test)]
-    pub(crate) fn excluded_rects_for_test(&self) -> &[egui::Rect] {
-        &self.last_excluded_rects
-    }
-
     /// The egui `Id`s the last frame's layers panel resolved.
     #[cfg(test)]
     pub(crate) fn widget_id_probes(&self) -> &[(&'static str, egui::Id)] {
@@ -3251,6 +3297,12 @@ impl Gui {
         &self.last_status_bar
     }
 
+    /// What the last frame's top bar drew.
+    #[cfg(test)]
+    pub(crate) fn top_bar_for_test(&self) -> &TopBarProbe {
+        &self.last_top_bar
+    }
+
     /// Which pane is currently active.
     #[cfg(test)]
     pub(crate) fn active_pane_index_for_test(&self) -> PaneId {
@@ -3280,7 +3332,8 @@ impl Gui {
         pane.enabled_overlays = enabled;
     }
 
-    /// Open or close the layers drawer, as the hamburger does.
+    /// Open or close the layers drawer, as the top bar's Layers toggle does
+    /// below the sidebar breakpoint.
     #[cfg(test)]
     pub(crate) fn set_drawer_open(&mut self, open: bool) {
         self.drawer_open = open;
@@ -3305,10 +3358,7 @@ impl Gui {
     /// for one dropdown.
     #[cfg(test)]
     pub(crate) fn control_item_model_for_test(&self, kind: OverlayKind) -> Vec<ControlItem> {
-        let ctx = PaneControlContext {
-            pane_idx: self.active_pane,
-            pane_state: None,
-        };
+        let ctx = self.active_pane_control_context();
         self.overlays.controls(kind, &ctx)
     }
 
@@ -3338,10 +3388,7 @@ impl Gui {
         &self,
         label: &str,
     ) -> Option<(Vec<(String, String)>, String)> {
-        let ctx = PaneControlContext {
-            pane_idx: self.active_pane,
-            pane_state: None,
-        };
+        let ctx = self.active_pane_control_context();
         fn find(items: &[ControlItem], label: &str) -> Option<(Vec<(String, String)>, String)> {
             for item in items {
                 match item {

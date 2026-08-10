@@ -31,11 +31,11 @@ const COMPACT_DIALOG_MIN_WIDTH: f32 = 200.0;
 /// decision about whether to show the sidebar).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WidthClass {
-    /// Phone-sized. Hamburger + drawer, full-bleed dialogs.
+    /// Phone-sized. The layers panel is a drawer; dialogs are full-bleed.
     Compact,
-    /// Small window or tablet. Menubar, but the layers panel is still a drawer.
+    /// Small window or tablet. The layers panel is still a drawer.
     Medium,
-    /// Desktop-sized. Menubar and a persistent layers sidebar.
+    /// Desktop-sized. The layers panel is a sidebar, open by default.
     Expanded,
 }
 
@@ -63,24 +63,14 @@ impl WidthClass {
         }
     }
 
-    /// Whether a persistent menu bar is shown along the top.
-    pub(crate) fn has_menu_bar(self) -> bool {
-        self != Self::Compact
-    }
-
-    /// Whether the layers panel is always on screen, as opposed to a drawer
-    /// the user opens.
+    /// Whether the layers panel takes its sidebar form — open by default and
+    /// claiming panel space — as opposed to the drawer a narrower width gets.
+    ///
+    /// A default, not a mandate: the top bar's Layers toggle opens and closes
+    /// the panel at every width, so on Expanded this only says what the panel
+    /// is until the user says otherwise (see `Gui::stack_open`).
     pub(crate) fn has_persistent_sidebar(self) -> bool {
         self == Self::Expanded
-    }
-
-    /// Whether a hamburger button is drawn to open the layers drawer.
-    ///
-    /// The exact complement of [`Self::has_persistent_sidebar`]: the drawer
-    /// needs an opener precisely when the sidebar is not already there, and a
-    /// layout with neither would strand every layer control behind nothing.
-    pub(crate) fn has_hamburger(self) -> bool {
-        !self.has_persistent_sidebar()
     }
 
     /// The largest pane count any device may hold, used when *loading* a config.
@@ -433,33 +423,14 @@ mod tests {
         assert_eq!(WidthClass::from_width(1000.0), WidthClass::Expanded);
     }
 
-    /// The chrome decisions are what the width class exists for, and each one
-    /// has to differ from at least one neighbour or the class is not carrying
-    /// its weight.
+    /// The chrome decision the width class still owns: which form the layers
+    /// panel defaults to. Only the widest class gets the sidebar — the top bar
+    /// carries everything else identically at every width.
     #[test]
     fn each_width_class_picks_a_different_chrome() {
-        assert!(!WidthClass::Compact.has_menu_bar());
-        assert!(WidthClass::Medium.has_menu_bar());
-        assert!(WidthClass::Expanded.has_menu_bar());
-
         assert!(!WidthClass::Compact.has_persistent_sidebar());
         assert!(!WidthClass::Medium.has_persistent_sidebar());
         assert!(WidthClass::Expanded.has_persistent_sidebar());
-
-        // The hamburger is exactly where the sidebar is not: a layout with
-        // neither strands every layer control behind nothing, and one with
-        // both wastes a button.
-        for class in [
-            WidthClass::Compact,
-            WidthClass::Medium,
-            WidthClass::Expanded,
-        ] {
-            assert_ne!(
-                class.has_hamburger(),
-                class.has_persistent_sidebar(),
-                "{class:?}: a drawer with no opener, or an opener with no drawer"
-            );
-        }
     }
 
     /// The pane picker narrows on a phone, and the two roomier classes agree —
