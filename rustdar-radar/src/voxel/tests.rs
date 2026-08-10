@@ -2219,17 +2219,6 @@ fn the_default_transparency_profile_is_measured_per_product() {
         (crate::hca::MIN_ZDR_BD as f32, crate::hca::MAX_ZDR_GR as f32),
         "the quiet band must stay the HCA's own rain interval",
     );
-    // The quiet band must not contain 0 dB, because that is where a
-    // tumbling scatterer reads and `hca::HSDA_MAX_ZDR` says large hail is
-    // never above 2.0. Asserted through the table rather than through the
-    // constants, so it is a statement about what renders.
-    assert_ne!(
-        alpha(zdr, p::ZDR_TUMBLING_DB),
-        0,
-        "0 dB is inside the quiet band, and it is the hail value: \
-             hca::HSDA_MAX_ZDR is {} and high ZDR is never large hail",
-        crate::hca::HSDA_MAX_ZDR,
-    );
     for (value, what) in [
         (p::ZDR_RAIN_LO_DB, "the rain band's floor"),
         (1.0, "moderate rain"),
@@ -2237,14 +2226,20 @@ fn the_default_transparency_profile_is_measured_per_product() {
     ] {
         assert_eq!(alpha(zdr, value), 0, "{what} is the volume's filler");
     }
-    // The finding, as a number. Tumbling hail sits at ZDR ~ 0 under high
-    // Z; it must be plainly visible, not a hole and not a whisper.
+    // The finding, as a number, and it is asserted through the table
+    // rather than through the constants so that it is a statement about
+    // what renders. Tumbling hail sits at ZDR ~ 0 under high Z —
+    // `hca::HSDA_MAX_ZDR` is 2.0 and high ZDR is never large hail — so 0 dB
+    // must be plainly visible, not a hole and not a whisper. A bound of
+    // zero would be subsumed by this one; a third of the palette's alpha is
+    // the claim worth making.
     let hail = alpha(zdr, p::ZDR_TUMBLING_DB);
     assert!(
         hail >= palette_alpha(zdr, p::ZDR_TUMBLING_DB) / 3,
         "tumbling hail at 0 dB renders at {hail} of {}: a hole where the \
-             HCA's own bounds put the signature",
+             HCA's own bounds (HSDA_MAX_ZDR = {}) put the signature",
         palette_alpha(zdr, p::ZDR_TUMBLING_DB),
+        crate::hca::HSDA_MAX_ZDR,
     );
     // …and a plateau, not a ramp to full. Measured over four volumes,
     // ZDR in [−0.5, +0.5] is 68 % of every data voxel in the box: a low
