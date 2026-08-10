@@ -612,6 +612,14 @@ impl InputHarness {
         });
         assert!(found, "the stack never drew a row for {kind:?} on screen");
         let row = self.stack_row(kind).expect("the row was just found");
+        // The row's eye is the layer's one visibility switch since the Show
+        // toggle's de-dup (contract 86) — asserted on the route every caller
+        // takes, so no walk can reach a layer body whose on/off went missing.
+        assert_ne!(
+            row.eye,
+            egui::Rect::NOTHING,
+            "{kind:?}'s row carries no visibility eye"
+        );
         self.mouse_click(row.rect.center());
         self.warm_up();
         assert_eq!(
@@ -1229,6 +1237,12 @@ impl InputHarness {
     /// The Volume Alpha corner buttons the last frame drew, per pane.
     pub(crate) fn alpha_buttons(&self) -> Vec<(usize, egui::Rect)> {
         self.gui.alpha_buttons_for_test().to_vec()
+    }
+
+    /// Pane `idx`'s dispatched kinds in paint order, with the layer each
+    /// painted into — the draw-order pin's read side.
+    pub(crate) fn paint_order(&self, idx: usize) -> Vec<(OverlayKind, egui::LayerId)> {
+        self.gui.paint_order_for_test(idx)
     }
 
     /// Deliver a scan for `site`, through the host's own delivery path.

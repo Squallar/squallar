@@ -60,6 +60,15 @@ pub(super) struct PaneRenderCtx<'a> {
     pub preferences: &'a UserPreferences,
     /// Everything the 3D region drag needs. See [`RegionCtx`].
     pub region: RegionCtx<'a>,
+    /// The kinds this pane dispatched, in the order they painted, with the
+    /// egui layer each one painted into. The layer is the honest half: the
+    /// sequence alone restates the loop, but two kinds on *different* layers
+    /// composite in `GraphicLayers::drain`'s order — same-`Order` non-area
+    /// layers drain in hash order, egui's own "safety net" — not in this
+    /// sequence, which is exactly how the old color-scale sub-layer ignored
+    /// `draw_order`. One paint list is what makes the sequence the truth.
+    #[cfg(test)]
+    pub paint_order: Vec<(OverlayKind, egui::LayerId)>,
 }
 
 /// The region drag's slice of a pane's render context.
@@ -151,12 +160,26 @@ pub(super) fn render_pane_map_content(
         );
 
         let mut selected: Vec<Arc<dyn OverlayItem>> = Vec::new();
+        // The stale-image notice, deferred out of the Radar arm's position:
+        // it must read over every overlay drawn after the radar, and with the
+        // whole pane on one paint list "over everything" means "submitted
+        // after the loop" — not a sub-layer, whose compositing order against
+        // the pane's list is egui's hash-order safety net (see `paint_order`).
+        let mut pending_notice: Option<(RadarProduct, f32)> = None;
 
         let draw_order: Vec<OverlayKind> = ctx.pane.draw_order.clone();
         for &kind in &draw_order {
             if !ctx.pane.is_overlay_enabled(kind) {
                 continue;
             }
+            // Every arm below paints through `ui.painter()` — the pane's own
+            // paint list — so submission order IS `draw_order`. The layer is
+            // recorded per arm (an arm that builds its own painter overwrites
+            // the default) so a kind quietly moved onto a sub-layer fails the
+            // paint-order pin rather than silently leaving the stacking to
+            // egui's hash-order layer drain.
+            #[cfg(test)]
+            let mut painted_layer = ui.painter().layer_id();
             match kind {
                 // Radar image layer — special handling for loop playback
                 OverlayKind::Radar => {
@@ -217,29 +240,18 @@ pub(super) fn render_pane_map_content(
 
                     // The pixels above are not the selection every other label on
                     // this pane is already describing — say which product they
-                    // are. Inside the Radar arm, so it appears only while the
-                    // radar layer is actually on screen and only for a pane that
-                    // has an image to disown; on its own layer, so an overlay
-                    // drawn later in `draw_order` cannot paint over the notice.
+                    // are. Decided inside the Radar arm, so it appears only while
+                    // the radar layer is actually on screen and only for a pane
+                    // that has an image to disown; *painted after the loop*, so
+                    // an overlay drawn later in `draw_order` cannot paint over
+                    // the notice — deferred submission on the pane's own paint
+                    // list, not a sub-layer (see `PaneRenderCtx::paint_order`).
                     //
                     // Not branched on the datasource, and it must never be: this
                     // is the same call for a Level II and a Level III product,
                     // and `PaneState::stale_image_on_screen` answers from the
                     // same texture metadata either way.
-                    if let Some((on_screen, elevation)) = ctx.pane.stale_image_on_screen() {
-                        let layer = egui::LayerId::new(
-                            egui::Order::Background,
-                            ui.id().with("pending_render"),
-                        );
-                        let mut notice_painter = ui.ctx().layer_painter(layer);
-                        notice_painter.set_clip_rect(ctx.pane_rect);
-                        draw_pending_render_notice(
-                            &notice_painter,
-                            ctx.pane_rect,
-                            on_screen,
-                            elevation,
-                        );
-                    }
+                    pending_notice = ctx.pane.stale_image_on_screen();
                 }
                 // City label tiles — walkers tile layer
                 OverlayKind::CityLabels => {
@@ -272,24 +284,32 @@ pub(super) fn render_pane_map_content(
                         );
                     }
                 }
-                // Color scale legend (screen-space HUD).
-                // Draw on a foreground layer so overlay textures can never
-                // paint over the bars regardless of egui shape batching.
+                // Color scale legend (screen-space HUD) — painted through the
+                // pane's own paint list at this loop position, like every
+                // other kind, so `draw_order` genuinely places it: the old
+                // dedicated sub-layer composited in `GraphicLayers::drain`'s
+                // hash order regardless of the loop, which is why moving City
+                // Labels above the Color Scale used to change nothing. Within
+                // one paint list submission order is paint order — egui
+                // batches without reordering — so "later in `draw_order`"
+                // now means "on top" for the bars exactly as it does for a
+                // texture.
                 OverlayKind::ColorScale => {
-                    let fg_layer =
-                        egui::LayerId::new(egui::Order::Background, ui.id().with("color_scale"));
-                    let mut fg_painter = ui.ctx().layer_painter(fg_layer);
-                    fg_painter.set_clip_rect(ctx.pane_rect);
+                    let painter = ui.painter().with_clip_rect(ctx.pane_rect);
+                    #[cfg(test)]
+                    {
+                        painted_layer = painter.layer_id();
+                    }
                     let pane_rect = ui.max_rect();
                     render_color_scale(
-                        &fg_painter,
+                        &painter,
                         pane_rect,
                         ctx.horizontal_color_scale,
                         ctx.pane,
                         ctx.preferences,
                     );
                     render_overlay_color_scales(
-                        &fg_painter,
+                        &painter,
                         pane_rect,
                         ctx.horizontal_color_scale,
                         ctx.pane,
@@ -321,6 +341,23 @@ pub(super) fn render_pane_map_content(
                     _ => {}
                 },
             }
+            #[cfg(test)]
+            ctx.paint_order.push((kind, painted_layer));
+        }
+
+        // The deferred stale-image notice, submitted after every kind so
+        // nothing in `draw_order` can paint over it — see the Radar arm.
+        if let Some((on_screen, elevation)) = pending_notice {
+            let notice_painter = ui.painter().with_clip_rect(ctx.pane_rect);
+            draw_pending_render_notice(
+                &notice_painter,
+                ctx.pane_rect,
+                // The pill row's measured clearance, not the one-row
+                // constant: a narrow pane wraps the row (M9-18).
+                crate::ui::pills::pill_row_clearance(ui.ctx(), ctx.pane_idx),
+                on_screen,
+                elevation,
+            );
         }
 
         if !selected.is_empty() {
@@ -1151,12 +1188,6 @@ fn format_legend_value(product: RadarProduct, value: f32, prefs: &UserPreference
 /// Font size of the pending-render notice. The color scale's title size, so the
 /// notice reads as part of the same chrome rather than as an alert.
 const PENDING_FONT_SIZE: f32 = 12.0;
-/// Gap between the notice and the pane's top edge. Below the pane's pill
-/// row, not at the very top — the row is an egui layer over the pane and
-/// wraps to the pane's width, so on a narrow pane a top-hugging plate would
-/// sit under it (see `ui_pills::PILL_ROW_CLEARANCE`, the same offset the
-/// left-anchored captions keep).
-const PENDING_TOP_MARGIN: f32 = crate::ui::PILL_ROW_CLEARANCE;
 /// Padding inside the notice's backing plate.
 const PENDING_PADDING: egui::Vec2 = egui::vec2(8.0, 3.0);
 
@@ -1193,6 +1224,7 @@ fn pending_render_notice(product: RadarProduct, elevation: f32) -> String {
 fn draw_pending_render_notice(
     painter: &egui::Painter,
     pane_rect: egui::Rect,
+    top_margin: f32,
     product: RadarProduct,
     elevation: f32,
 ) {
@@ -1207,7 +1239,7 @@ fn draw_pending_render_notice(
     let plate = egui::Rect::from_center_size(
         egui::pos2(
             pane_rect.center().x,
-            pane_rect.top() + PENDING_TOP_MARGIN + galley.size().y / 2.0 + PENDING_PADDING.y,
+            pane_rect.top() + top_margin + galley.size().y / 2.0 + PENDING_PADDING.y,
         ),
         galley.size() + PENDING_PADDING * 2.0,
     );

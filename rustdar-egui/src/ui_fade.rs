@@ -253,10 +253,11 @@ impl super::Gui {
     ///
     /// The dialog checks look redundant with the layer filter — the catalog
     /// modal's backdrop and the sheet's scrim already swallow most clicks —
-    /// and are kept anyway: the Set Time window covers only its own rect, and
-    /// the scrim leaves map slivers beside the bottom bar (`ui_sheet.rs`'s
-    /// own note), so "a dialog is up" cannot be read off the layer the click
-    /// landed on.
+    /// and are kept anyway: the Set Time window covers only its own rect, so
+    /// "a dialog is up" cannot be read off the layer the click landed on.
+    /// (The map slivers the scrim used to leave beside the bottom bar died
+    /// with the full-bleed flush cluster — contract 61b — but the check's
+    /// reasoning never rested on them.)
     pub(super) fn fade_gesture_allowed(&self) -> bool {
         !self.press_switched_pane
             && !self.press_popup_open

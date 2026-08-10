@@ -356,6 +356,7 @@ impl super::Gui {
         ui.separator();
 
         egui::ScrollArea::vertical()
+            .scroll_source(super::shell::panel_scroll_source())
             .id_salt("catalog_scroll")
             .max_height(max_body)
             .show(ui, |ui| {

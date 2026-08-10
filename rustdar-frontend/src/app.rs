@@ -308,6 +308,15 @@ pub struct App {
     /// overlay; `metar::networks::DEFAULT_VIEWPORT` covers that window.
     last_viewport: Option<rustdar_overlays::types::GeoBounds>,
     autosave: AutosaveState,
+    /// When egui next wants a frame, from a timed repaint request
+    /// (`request_repaint_after` — a cursor blink, a tooltip delay). `None`
+    /// while nothing is scheduled. Written by [`App::handle_redraw`] from the
+    /// frame's own `repaint_delay` ([`repaint_action`]), spent in
+    /// [`App::about_to_wait`], which also folds the remaining wait into the
+    /// loop's control flow so a parked loop actually wakes for it. Zero-delay
+    /// requests — animations — never land here: they ask for the redraw on
+    /// the spot.
+    egui_repaint_at: Option<web_time::Instant>,
     /// Whether the current site was guessed from the timezone rather than chosen.
     ///
     /// A guessed site is the one thing a location fix is allowed to overwrite.
@@ -416,11 +425,11 @@ struct AutosaveState {
     /// Deliberately coarse — it is set by *any* window event, most of which
     /// change nothing. Its only job is to distinguish "this session has seen
     /// activity" from "this tab has been sitting untouched", so that
-    /// [`schedule_autosave_wakeup`] does not keep an idle app awake. A false
+    /// [`schedule_wakeup`] does not keep an idle app awake. A false
     /// positive costs one serialization; the string compare then finds nothing
     /// to write.
     ///
-    /// [`schedule_autosave_wakeup`]: App::schedule_autosave_wakeup
+    /// [`schedule_wakeup`]: App::schedule_wakeup
     touched: bool,
 }
 
@@ -431,6 +440,50 @@ struct AutosaveState {
 /// is closed. Three seconds keeps a pan-and-zoom durable at human timescales
 /// while staying far below the rate at which anything here is edited.
 const AUTOSAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// What a frame's egui repaint request means for the loop. See
+/// [`repaint_action`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RepaintAction {
+    /// Ask for the next frame immediately — an animation is mid-flight.
+    Now,
+    /// Wake and repaint after this long — a timed request (cursor blink).
+    After(std::time::Duration),
+    /// Nothing asked; the loop may park until something happens.
+    Idle,
+}
+
+/// The ceiling past which a "timed" repaint request is read as "never":
+/// egui reports `Duration::MAX` when nothing asked, and anything on the
+/// scale of a minute or more is indistinguishable from idle for a loop
+/// every real input wakes anyway.
+const MAX_SCHEDULED_REPAINT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Classify a frame's `repaint_delay` (see `PreparedFrame::repaint_delay`).
+///
+/// The root cause of the second user test's "panel close shudders, then
+/// vanishes": the app runs on `ControlFlow::Wait` and *nothing read this
+/// value*, so `egui::Context::animate_bool_with_time` — which requests a
+/// zero-delay repaint on every frame it interpolates — animated only on the
+/// frames the user's own input events produced. A click's press, release
+/// and stray move made ~3 frames; the slide then froze mid-travel until the
+/// next input repainted whatever end state it had reached.
+///
+/// Zero means "now": `handle_redraw` requests the redraw on the spot, so an
+/// animation renders at the display's own cadence until egui stops asking.
+/// A finite delay schedules a wake instead — requesting an immediate frame
+/// for a 500 ms cursor blink would busy-loop the app at frame rate, since
+/// the blink re-requests itself on every paint. `Duration::MAX` (and
+/// anything past [`MAX_SCHEDULED_REPAINT`]) is idle.
+pub(crate) fn repaint_action(delay: std::time::Duration) -> RepaintAction {
+    if delay == std::time::Duration::ZERO {
+        RepaintAction::Now
+    } else if delay <= MAX_SCHEDULED_REPAINT {
+        RepaintAction::After(delay)
+    } else {
+        RepaintAction::Idle
+    }
+}
 
 /// Half the east–west and north–south extent of the box a 3D pane resamples,
 /// kilometres.
@@ -644,6 +697,7 @@ impl App {
                 last_written: None,
                 touched: false,
             },
+            egui_repaint_at: None,
             site_is_provisional,
             volume_store: std::sync::Arc::new(crate::volume::bridge::VolumeStore::new()),
             #[cfg(test)]
@@ -814,7 +868,7 @@ impl App {
         }
 
         let (screen_descriptor, gui_actions) = self.setup_egui_frame();
-        self.present_frame(screen_descriptor);
+        let repaint_delay = self.present_frame(screen_descriptor);
         self.process_gui_actions(gui_actions);
 
         // Request redraw only when there is pending background work or auto-poll is active
@@ -829,6 +883,23 @@ impl App {
             || self.chunk_notify.reconnect_pending()
         {
             notify_redraw(&self.window);
+        }
+
+        // egui's own repaint request — the animation fix (see
+        // `repaint_action`): an immediate ask repaints now, a timed one
+        // schedules a wake `about_to_wait` spends, and idle clears any
+        // stale schedule so a parked loop stays parked.
+        match repaint_action(repaint_delay) {
+            RepaintAction::Now => {
+                self.egui_repaint_at = None;
+                notify_redraw(&self.window);
+            }
+            RepaintAction::After(delay) => {
+                self.egui_repaint_at = Some(web_time::Instant::now() + delay);
+            }
+            RepaintAction::Idle => {
+                self.egui_repaint_at = None;
+            }
         }
     }
 
@@ -2151,14 +2222,15 @@ impl App {
     /// cost `ControlFlow::Wait` was chosen to avoid in the first place.
     ///
     /// [`about_to_wait`]: App::about_to_wait
-    fn schedule_autosave_wakeup(&self, event_loop: &ActiveEventLoop) {
-        event_loop.set_control_flow(self.autosave_control_flow());
+    fn schedule_wakeup(&self, event_loop: &ActiveEventLoop) {
+        event_loop.set_control_flow(self.wakeup_control_flow());
     }
 
     /// The state the loop should be left in, given what the autosave still
-    /// owes.
+    /// owes and when egui next wants a timed repaint — whichever comes
+    /// first.
     ///
-    /// Split out of [`schedule_autosave_wakeup`] so the whole decision is
+    /// Split out of [`schedule_wakeup`] so the whole decision is
     /// reachable from a test: an `ActiveEventLoop` cannot be had outside a
     /// running winit loop, so a function that takes one can only ever be read
     /// as source.
@@ -2171,8 +2243,15 @@ impl App {
     /// subsequent iteration compute a zero timeout, wake immediately, and find
     /// the same expired deadline. Measured on X11 at winit 0.30.13, that is
     /// ~164,000 iterations per second on a full core, forever.
-    fn autosave_control_flow(&self) -> ControlFlow {
-        match self.autosave_delay() {
+    fn wakeup_control_flow(&self) -> ControlFlow {
+        let egui_delay = self
+            .egui_repaint_at
+            .map(|at| at.saturating_duration_since(web_time::Instant::now()));
+        let delay = match (self.autosave_delay(), egui_delay) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        match delay {
             // `wait_duration` rather than `WaitUntil`: winit's `Instant` is
             // `std::time`'s natively and `web_time`'s on wasm, so no single
             // instant value typechecks for both targets. A duration does, and
@@ -2187,12 +2266,12 @@ impl App {
     /// `None` when nothing is owed and it may sleep until something happens.
     ///
     /// A duration rather than the deadline it was computed from, for the same
-    /// reason [`autosave_control_flow`] builds its `WaitUntil` out of one: an
+    /// reason [`wakeup_control_flow`] builds its `WaitUntil` out of one: an
     /// instant here would be `std::time`'s on three platforms and `web_time`'s
     /// on the fourth, and a test naming either could only be written for half
     /// the targets it is meant to hold for.
     ///
-    /// [`autosave_control_flow`]: App::autosave_control_flow
+    /// [`wakeup_control_flow`]: App::wakeup_control_flow
     fn autosave_delay(&self) -> Option<std::time::Duration> {
         if !self.autosave.touched {
             return None;
@@ -2550,6 +2629,17 @@ impl ApplicationHandler for App {
         if self.platform.poll_back_press() {
             self.back_out(event_loop);
         }
+        // A due timed repaint (`request_repaint_after` — see
+        // `repaint_action`) is spent as a redraw request: this is the one
+        // callback the wake-up timer reaches, and the frame itself must go
+        // through `RedrawRequested` like every other frame.
+        if self
+            .egui_repaint_at
+            .is_some_and(|at| web_time::Instant::now() >= at)
+        {
+            self.egui_repaint_at = None;
+            notify_redraw(&self.window);
+        }
         // The save the wake-up below is scheduled for, spent here rather than on
         // a frame. A `WaitUntil` deadline expiring dispatches `new_events` and
         // then this — and nothing else. It never delivers `RedrawRequested`, so
@@ -2562,7 +2652,7 @@ impl ApplicationHandler for App {
         // present — to write a few hundred bytes of JSON on a timer whose entire
         // premise is that the app is otherwise asleep.
         self.autosave_config(false);
-        self.schedule_autosave_wakeup(event_loop);
+        self.schedule_wakeup(event_loop);
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {

@@ -1358,7 +1358,7 @@ fn owes_a_save_from(app: &mut App, ago: std::time::Duration) {
 /// was already working.
 fn wake_on_the_timer(app: &mut App) -> ControlFlow {
     app.autosave_config(false);
-    app.autosave_control_flow()
+    app.wakeup_control_flow()
 }
 
 /// A wake-up asked for and granted has to end in the write it was asked
@@ -1396,7 +1396,7 @@ fn a_timed_wakeup_actually_saves_the_change_it_was_scheduled_for() {
 /// `a_back_press_from_the_platform_reaches_the_funnel_too` is.
 ///
 /// The behavioural tests either side of this one drive `autosave_config`
-/// and `autosave_control_flow` themselves, which says nothing about
+/// and `wakeup_control_flow` themselves, which says nothing about
 /// whether the event loop ever reaches them. Drop the call and they all
 /// stay green while the timer goes back to waking for nothing.
 #[test]
@@ -1409,7 +1409,7 @@ fn the_autosave_wakeup_is_spent_on_a_save_not_only_on_a_reschedule() {
              {body}"
     );
     assert!(
-        body.contains("self.schedule_autosave_wakeup("),
+        body.contains("self.schedule_wakeup("),
         "about_to_wait no longer re-arms, so one missed interval ends the \
              autosave for the life of the process: {body}"
     );
@@ -1464,7 +1464,7 @@ fn a_change_inside_the_interval_still_arms_a_timer_for_the_rest_of_it() {
         "the re-arm is not the remainder of the interval: {delay:?}"
     );
     assert!(
-        matches!(app.autosave_control_flow(), ControlFlow::WaitUntil(_)),
+        matches!(app.wakeup_control_flow(), ControlFlow::WaitUntil(_)),
         "the delay is owed but the loop is not being woken to spend it"
     );
 }
@@ -1481,7 +1481,7 @@ fn an_untouched_app_is_left_free_to_sleep() {
     );
 
     assert_eq!(
-        app.autosave_control_flow(),
+        app.wakeup_control_flow(),
         ControlFlow::Wait,
         "an idle app is being woken on a timer for a change nobody made"
     );
@@ -2825,4 +2825,72 @@ fn a_floor_is_recomposed_when_its_tiles_change_and_left_alone_when_not() {
         1,
         "a disabled MD handler must put nothing on the floor",
     );
+}
+
+// ── egui repaint plumbing (the M9 animation fix) ─────────────────────────
+
+/// The classification the loop acts on: zero-delay requests (animations)
+/// repaint immediately, timed ones (cursor blink) schedule a wake, and
+/// egui's `Duration::MAX` idle marker — or anything indistinguishable from
+/// it — leaves the loop parked. The middle arm must never collapse into
+/// `Now`: a 500 ms blink re-requests itself on every paint, so an immediate
+/// redraw for it is a busy loop at frame rate.
+#[test]
+fn a_repaint_delay_maps_to_now_a_schedule_or_idle() {
+    use std::time::Duration;
+    assert_eq!(repaint_action(Duration::ZERO), RepaintAction::Now);
+    assert_eq!(
+        repaint_action(Duration::from_millis(500)),
+        RepaintAction::After(Duration::from_millis(500))
+    );
+    assert_eq!(repaint_action(Duration::MAX), RepaintAction::Idle);
+    assert_eq!(
+        repaint_action(Duration::from_secs(3600)),
+        RepaintAction::Idle,
+        "an hour-scale request is idle for a loop every input wakes anyway"
+    );
+}
+
+/// The contract the fix stands on: a mid-flight `animate_bool_with_time`
+/// puts a zero `repaint_delay` on the root viewport's output — the value
+/// `end_pass_and_upload` now carries out and `handle_redraw` spends. If
+/// egui ever stopped reporting animations this way, the panel slides would
+/// quietly go back to advancing only on input frames (the "close shudders,
+/// then vanishes" finding), and this is the test that names it.
+#[test]
+fn a_mid_flight_animation_requests_an_immediate_repaint() {
+    let ctx = egui::Context::default();
+    let raw = || egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(800.0, 600.0),
+        )),
+        ..Default::default()
+    };
+    // Seed the animation at `false`, then flip the target: the second pass
+    // is mid-interpolation for a 0.2 s animation.
+    ctx.begin_pass(raw());
+    let _ = ctx.animate_bool_with_time(egui::Id::new("m9_anim"), false, 0.2);
+    let _ = ctx.end_pass();
+    ctx.begin_pass(raw());
+    let value = ctx.animate_bool_with_time(egui::Id::new("m9_anim"), true, 0.2);
+    let animating = ctx.end_pass();
+
+    assert!(
+        (0.0..1.0).contains(&value),
+        "precondition: the animation is mid-flight, got {value}"
+    );
+    let delay = animating
+        .viewport_output
+        .get(&egui::viewport::ViewportId::ROOT)
+        .map(|v| v.repaint_delay)
+        .expect("the root viewport reports");
+    assert_eq!(
+        delay,
+        std::time::Duration::ZERO,
+        "egui no longer requests an immediate repaint mid-animation - the \
+         chrome slides will only advance on input frames"
+    );
+    // (The settled side — no repaint request once the animation ends — is
+    // real-clock timing and lives with `repaint_action`'s own mapping pins.)
 }

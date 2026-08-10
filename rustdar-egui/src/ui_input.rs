@@ -980,10 +980,20 @@ impl InteractionState {
     ///
     /// `map_memory` is the active pane's viewport; the zoom-drag gesture writes
     /// to it directly.
+    /// `compact` opts the **mouse** path into the press-and-hold value popup
+    /// (M9-17): a Compact window has no status-bar readout — the phone top
+    /// bar dropped its truncating copy — so the long-press tooltip the touch
+    /// pipeline raises is the value readout there, and a held primary button
+    /// is the mouse's spelling of the hold. Compact only, deliberately: the
+    /// long-press detector steals the pan from a mouse that rests ≥0.8 s
+    /// before dragging (the modality gate's own finding, below), and on the
+    /// wide widths — where the status bar carries a live readout — that
+    /// cost buys nothing.
     pub(crate) fn resolve_active(
         &mut self,
         ctx: &egui::Context,
         modality: crate::ui_layout::PointerModality,
+        compact: bool,
         map_memory: &mut walkers::MapMemory,
         pane_rect: egui::Rect,
     ) -> MapPointerFrame {
@@ -993,7 +1003,19 @@ impl InteractionState {
 
         match modality {
             PointerModality::Touch => self.gestures.update(ctx, map_memory, pane_rect),
-            PointerModality::Mouse => MapPointerFrame::from_mouse(ctx),
+            PointerModality::Mouse => {
+                let mut frame = MapPointerFrame::from_mouse(ctx);
+                if compact {
+                    // The same detector, the same chrome filter, the same
+                    // pan suppression the touch pipeline applies — a hold
+                    // is a hold whichever pointer spells it.
+                    let input = self.gestures.tracker.read(ctx);
+                    let held = filter_dialog_blocked(ctx, self.gestures.long_press.update(input));
+                    frame.suppress_pan |= held.is_some();
+                    frame.long_press_pos = held;
+                }
+                frame
+            }
         }
     }
 

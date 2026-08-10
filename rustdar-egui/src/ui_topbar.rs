@@ -65,10 +65,17 @@ const SECTION_TOGGLE_LABEL: &str = "\u{2215} X-sec";
 /// the mirror of [`LAYERS_TOGGLE_LABEL`] for the right-hand panel.
 const INSPECTOR_TOGGLE_LABEL: &str = "\u{2699} Inspector";
 
-/// The pane-count segments' caption, drawn only in the roomy form.
+/// The pane-count segments' caption in the roomy form.
 const PANES_LABEL: &str = "Panes:";
-/// The active-pane segments' caption, likewise roomy-only.
+/// The active-pane segments' caption, likewise.
 const PANE_LABEL: &str = "Pane:";
+/// The tight form's abbreviated captions — small text, no colon. The tight
+/// form used to drop the captions whole, which left two unlabeled number
+/// runs ("1..6 1..6") nobody could tell apart (the second user test); the
+/// squeeze now keeps a compact word on each group and lets the scroll
+/// wrapper absorb what genuinely does not fit.
+const PANES_TIGHT_LABEL: &str = "Panes";
+const PANE_TIGHT_LABEL: &str = "Pane";
 
 /// Item spacing in the roomy form — and the unit [`roomy_run_width`] charges
 /// per element, so the measure and the layout cannot drift apart.
@@ -226,9 +233,11 @@ impl super::Gui {
     /// (§1.6, contract 75). Collapsed, only the wordmark and the restore
     /// button remain.
     ///
-    /// The hover readout hosts here when a mouse is driving — contract 25's
-    /// rule: the readout follows the modality, never the width, and this bar
-    /// is the only chrome the phone shell keeps at the top to host it.
+    /// No hover readout (M9-17, revising contract 25's hosting half): the
+    /// truncated copy this bar carried was useless at phone widths, so the
+    /// Compact value readout is the press-and-hold popup for mouse and touch
+    /// alike. Whether a *hover* readout exists anywhere is still the
+    /// modality's question — on the wide widths the status bar keeps it.
     fn render_phone_top_bar_run(
         &mut self,
         ui: &mut egui::Ui,
@@ -320,25 +329,13 @@ impl super::Gui {
                 #[cfg(not(test))]
                 let _ = scan_text;
 
-                if self.layout.modality == crate::ui_layout::PointerModality::Mouse {
-                    ui.separator();
-                    // The readout is the one unbounded string on this bar,
-                    // and a `Label` in a horizontal run extends rather than
-                    // wraps — across the ⬚/╱ toggles laid out before it.
-                    // The module note's overlap rule applies here as it
-                    // does to the wide run, in its truncation form: cap
-                    // the readout at the width the arm toggles left, so
-                    // however long the value grows the arms stay
-                    // unobscured and clickable.
-                    ui.scope(|ui| {
-                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-                        super::statusbar::render_hover_info(ui, self.panes());
-                    });
-                    #[cfg(test)]
-                    {
-                        probe.hover = true;
-                    }
-                }
+                // No hover readout here (M9-17): the truncating copy this
+                // bar used to carry was useless at phone widths, and the
+                // value readout on Compact is the press-and-hold popup —
+                // the touch pipeline's long-press tooltip, which a mouse
+                // reaches through the same hold (`ui_input::resolve_active`
+                // opts the Compact mouse path in). The wide widths keep the
+                // status bar's live readout, still modality-keyed.
             });
         });
     }
@@ -391,6 +388,7 @@ impl super::Gui {
         // piece of this bar — and bar-less: it exists to *clip* an overrun
         // into something scrollable rather than to advertise scrolling.
         egui::ScrollArea::horizontal()
+            .scroll_source(super::shell::panel_scroll_source())
             .id_salt("top_bar_scroll")
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
             .show(ui, |ui| {
@@ -496,8 +494,10 @@ impl super::Gui {
     /// shorter row. The config clamp deliberately does not narrow with it; see
     /// [`WidthClass::max_panes_absolute`](crate::ui_layout::WidthClass::max_panes_absolute).
     ///
-    /// `roomy` gates only the two captions, which is what keeps the tight form
-    /// id-neutral: a label allocates no widget memory.
+    /// `roomy` picks each caption's form — the full spelling, or the compact
+    /// small-text one (M9-19: the tight form must not leave the two number
+    /// runs unlabeled) — which keeps the flip id-neutral either way: a label
+    /// allocates no widget memory.
     ///
     /// `pub(super)` because the phone sheet's Layers page hosts the same
     /// segments (plan §1.3): the phone top bar has none, and copying the
@@ -508,6 +508,8 @@ impl super::Gui {
 
         if roomy {
             ui.label(PANES_LABEL);
+        } else {
+            ui.label(egui::RichText::new(PANES_TIGHT_LABEL).small().weak());
         }
         for count in 1..=crate::ui_layout::WidthClass::max_panes_absolute() {
             let selected = self.pane_layout.pane_count == count;
@@ -540,6 +542,8 @@ impl super::Gui {
         if self.pane_layout.pane_count > 1 {
             if roomy {
                 ui.label(PANE_LABEL);
+            } else {
+                ui.label(egui::RichText::new(PANE_TIGHT_LABEL).small().weak());
             }
             for i in 0..self.pane_layout.pane_count {
                 let selected = self.active_pane == i;

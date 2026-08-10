@@ -72,7 +72,24 @@ const PILL_INSET: f32 = 8.0;
 /// (with its clickable ⓘ) and the 3D pane's caption both start below this —
 /// content under the row would be covered, and the ⓘ in particular would be
 /// unclickable, since the row is an egui layer above the pane.
+///
+/// One row's worth — the floor. A narrow pane wraps its pill row to two or
+/// more lines (`horizontal_wrapped`), so the honest clearance is measured:
+/// see [`pill_row_clearance`], which every caption site reads instead of
+/// this constant directly (the second user test's pane-6 collision).
 pub(crate) const PILL_ROW_CLEARANCE: f32 = 40.0;
+
+/// The clearance pane `idx`'s own top-left content must keep this frame:
+/// the pill row's *measured* height — its area rect as of the last frame,
+/// which egui remembers — plus the inset and a gap, floored at the one-row
+/// [`PILL_ROW_CLEARANCE`]. One frame stale by construction (the pane draws
+/// before the pills pass), which for a wrap decision is harmless: a pane's
+/// width changes reflow both within a frame of each other.
+pub(crate) fn pill_row_clearance(ctx: &egui::Context, idx: PaneId) -> f32 {
+    ctx.memory(|m| m.area_rect(egui::Id::new(("pane_pills", idx))))
+        .map(|rect| rect.height() + PILL_INSET + 6.0)
+        .map_or(PILL_ROW_CLEARANCE, |h| h.max(PILL_ROW_CLEARANCE))
+}
 
 /// The site popover's minimum width — room for the search field and the
 /// `XXXX · TDWR` rows without wrapping.
@@ -87,16 +104,23 @@ const LINK_POPOVER_WIDTH: f32 = 260.0;
 /// reach without scrolling past 200 sites.
 const SITE_LIST_HEIGHT: f32 = 150.0;
 
-/// The linked state's popover row. `⛓` — chains are the *linked* state
-/// here; the demo's `🔗` has no glyph in egui's bundled fonts (see
-/// `ui_glyphs.rs`).
-const LINK_OPTION: &str = "\u{26d3}  Follow shared timeline";
+/// The Sync pill's text while this pane follows shared time. Plain text —
+/// the old `⛓` rendered like a DNA helix (the second user test), and the
+/// demo's `🔗` has no glyph in egui's bundled fonts (see `ui_glyphs.rs`).
+const SYNC_PILL_LINKED: &str = "Sync";
 
-/// The unlinked state's popover row. "Keep this pane's own time", not
-/// "freeze": scan delivery is site-keyed and ignores the link, so a live
-/// unlinked pane still follows new scans — the reliable freeze is the loop
-/// exclusion plus the pane's own time posture ([`UNLINK_NOTE`]).
-const UNLINK_OPTION: &str = "\u{2297}  Unlink - keep this pane's own time";
+/// The Sync pill's text while this pane's time is unlinked — the `⊗` marks
+/// the one per-pane state distinctly on the map, so a pane sitting out
+/// shared time says so at a glance.
+const SYNC_PILL_UNLINKED: &str = "\u{2297} Sync";
+
+/// The Sync popover's three toggles (the second user test's three-way
+/// popover): the two global layout toggles and this pane's own time link,
+/// under honest labels. "Sync time" is per-pane; the caption under it —
+/// [`UNLINK_NOTE`] — says exactly what off means.
+const SYNC_LAYERS_OPTION: &str = "Sync layers";
+const SYNC_VIEWPORT_OPTION: &str = "Sync viewport";
+const SYNC_TIME_OPTION: &str = "Sync time - this pane";
 
 /// What unlinking really does — one sentence for the popover's caption and
 /// the inspector checkbox's hover, so the two routes cannot describe the
@@ -266,6 +290,7 @@ pub(super) fn site_list_ui(ui: &mut egui::Ui, query: &str, current: &str) -> Sit
     let _ = caption;
 
     egui::ScrollArea::vertical()
+        .scroll_source(super::shell::panel_scroll_source())
         .id_salt("site_list")
         .max_height(SITE_LIST_HEIGHT)
         .show(ui, |ui| {
@@ -330,15 +355,6 @@ pub(super) fn kind_list_ui(ui: &mut egui::Ui, current: PaneKind) -> PickOutcome<
     for (kind, label) in PANE_KIND_OPTIONS {
         outcome.row(ui, label, kind == current, kind);
     }
-    outcome
-}
-
-/// The follow / unlink pair, the current state highlighted. Returns the new
-/// link state on a pick.
-fn link_list_ui(ui: &mut egui::Ui, linked: bool) -> PickOutcome<bool> {
-    let mut outcome = PickOutcome::default();
-    outcome.row(ui, LINK_OPTION, linked, true);
-    outcome.row(ui, UNLINK_OPTION, !linked, false);
     outcome
 }
 
@@ -582,20 +598,25 @@ impl super::Gui {
                         }
                     }
 
-                    // -- time link --
+                    // -- sync --
                     if offer_link {
-                        // ⛓ linked / ⊗ unlinked — the popover rows' own
-                        // glyphs, so the pill and its menu agree.
-                        let glyph = if time_link { "\u{26d3}" } else { "\u{2297}" };
-                        let pill = ui.button(glyph).on_hover_text(if time_link {
-                            "Follows shared time"
+                        // Text, with the ⊗ marking an unlinked-time pane
+                        // distinctly (the second user test: the old ⛓ read
+                        // as a DNA helix).
+                        let label = if time_link {
+                            SYNC_PILL_LINKED
                         } else {
-                            "Unlinked - keeps its own time"
+                            SYNC_PILL_UNLINKED
+                        };
+                        let pill = ui.button(label).on_hover_text(if time_link {
+                            "Sync options"
+                        } else {
+                            "Sync options - this pane's time is unlinked"
                         });
                         #[cfg(test)]
                         probe
                             .pills
-                            .push((PillKind::Link, glyph.to_owned(), pill.rect));
+                            .push((PillKind::Link, label.to_owned(), pill.rect));
                         if pill.clicked() {
                             if swallow {
                                 self.pill_revealed = Some(idx);
@@ -604,7 +625,7 @@ impl super::Gui {
                             }
                         }
                         if !swallow {
-                            self.link_pill_popover(&pill, idx, time_link);
+                            self.sync_pill_popover(&pill, idx, time_link);
                         }
                     }
 
@@ -773,16 +794,58 @@ impl super::Gui {
         self.record_popover_rect(&shown);
     }
 
-    /// The link popover: the follow / unlink pair over [`UNLINK_NOTE`] —
-    /// the honest description of what unlinking does.
-    fn link_pill_popover(&mut self, pill: &egui::Response, idx: PaneId, linked: bool) {
+    /// The Sync popover (the second user test's three-way): "Sync layers"
+    /// and "Sync viewport" flip the two global layout toggles — the same
+    /// state the inspector's Pane-properties sync section writes, kept there
+    /// as the alternate route — and "Sync time" flips this pane's own
+    /// [`crate::pane::PaneState::time_link`], over [`UNLINK_NOTE`], the
+    /// honest description of what off means. Checkboxes that keep the
+    /// popover up: flipping two of them must not be two opens (the ☰
+    /// dropdown's own reasoning).
+    fn sync_pill_popover(&mut self, pill: &egui::Response, idx: PaneId, linked: bool) {
         let shown = egui::Popup::menu(pill)
             .id(pill_popup_id(idx, PillKind::Link))
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show(|ui| {
                 ui.set_max_width(LINK_POPOVER_WIDTH);
-                let outcome = link_list_ui(ui, linked);
+                #[cfg(test)]
+                let mut rows: Vec<(String, egui::Rect, bool)> = Vec::new();
+
+                let mut sync_layers = self.sync_layers;
+                let row = ui.checkbox(&mut sync_layers, SYNC_LAYERS_OPTION);
+                #[cfg(test)]
+                rows.push((SYNC_LAYERS_OPTION.to_owned(), row.rect, self.sync_layers));
+                if row.changed() {
+                    self.sync_layers = sync_layers;
+                    // Turning the convergence on converges now, not on the
+                    // next frame that happens to run a panel pass.
+                    self.propagate_layer_sync();
+                }
+
+                let mut viewport_sync = self.viewport_sync;
+                let row = ui.checkbox(&mut viewport_sync, SYNC_VIEWPORT_OPTION);
+                #[cfg(test)]
+                rows.push((
+                    SYNC_VIEWPORT_OPTION.to_owned(),
+                    row.rect,
+                    self.viewport_sync,
+                ));
+                if row.changed() {
+                    self.viewport_sync = viewport_sync;
+                }
+
+                let mut link = linked;
+                let row = ui
+                    .checkbox(&mut link, SYNC_TIME_OPTION)
+                    .on_hover_text(UNLINK_NOTE);
+                #[cfg(test)]
+                rows.push((SYNC_TIME_OPTION.to_owned(), row.rect, linked));
+                if row.changed() {
+                    self.active_pane = idx;
+                    self.panes[idx].time_link = link;
+                }
                 ui.label(egui::RichText::new(UNLINK_NOTE).small().weak());
+
                 #[cfg(test)]
                 {
                     self.last_pill_popover = Some(PillPopoverProbe {
@@ -790,13 +853,8 @@ impl super::Gui {
                         pill: PillKind::Link,
                         rect: egui::Rect::NOTHING,
                         search: None,
-                        rows: outcome.rows.clone(),
+                        rows,
                     });
-                }
-                if let Some(link) = outcome.picked {
-                    self.active_pane = idx;
-                    self.panes[idx].time_link = link;
-                    ui.close_kind(egui::UiKind::Menu);
                 }
             });
         self.record_popover_rect(&shown);
@@ -846,5 +904,46 @@ impl super::Gui {
         {
             probe.rect = inner.response.rect;
         }
+    }
+}
+
+#[cfg(test)]
+mod clearance_tests {
+    use super::{PILL_ROW_CLEARANCE, pill_row_clearance};
+
+    /// The clearance follows the row's measured height: a wrapped two-line
+    /// row widens it past the one-row floor, a missing row falls back to
+    /// the floor. This is the mechanism behind M9-18's collision fix — the
+    /// fixed constant put the section caption under a wrapped row's second
+    /// line on narrow panes.
+    #[test]
+    fn a_wrapped_pill_row_widens_the_clearance_and_absence_floors_it() {
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            });
+            egui::Area::new(egui::Id::new(("pane_pills", 0usize)))
+                .fixed_pos(egui::pos2(8.0, 8.0))
+                .show(&ctx, |ui| {
+                    // A two-line row's worth of height.
+                    ui.allocate_exact_size(egui::vec2(200.0, 56.0), egui::Sense::hover());
+                });
+            let _ = ctx.end_pass();
+        }
+        let measured = pill_row_clearance(&ctx, 0);
+        assert!(
+            measured >= 56.0 + super::PILL_INSET,
+            "a 56pt row must widen the clearance past the floor, got {measured}"
+        );
+        assert_eq!(
+            pill_row_clearance(&ctx, 1),
+            PILL_ROW_CLEARANCE,
+            "a pane with no measured row keeps the one-row floor"
+        );
     }
 }

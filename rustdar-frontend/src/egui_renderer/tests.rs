@@ -326,6 +326,7 @@ fn a_paint_callbacks_own_command_buffer_reaches_the_queue() {
         screen_descriptor,
         textures_to_free: Vec::new(),
         user_command_buffers,
+        repaint_delay: std::time::Duration::MAX,
     };
     frame.submit(&queue, encoder);
 

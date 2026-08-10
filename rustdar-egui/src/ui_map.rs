@@ -259,6 +259,7 @@ impl super::Gui {
                             self.interaction.resolve_active(
                                 &ctx,
                                 modality,
+                                self.layout.width == crate::ui_layout::WidthClass::Compact,
                                 &mut map_memory,
                                 pane_rect,
                             ),
@@ -483,6 +484,8 @@ impl super::Gui {
                                                 pending: &mut self.pending_region,
                                                 committed: &committed_regions,
                                             },
+                                            #[cfg(test)]
+                                            paint_order: Vec::new(),
                                         };
 
                                         pane_render::render_pane_map_content(
@@ -491,6 +494,16 @@ impl super::Gui {
                                             zoom,
                                             &mut render_ctx,
                                         );
+
+                                        // The pane's paint-order record, for
+                                        // the draw-order pin — taken after the
+                                        // content pass so it reports what this
+                                        // frame really dispatched.
+                                        #[cfg(test)]
+                                        self.last_paint_order.push((
+                                            pane_idx,
+                                            std::mem::take(&mut render_ctx.paint_order),
+                                        ));
 
                                         // Before the tracks are drawn, so the
                                         // preview this frame paints is the one
@@ -527,10 +540,13 @@ impl super::Gui {
                         // fabricated picture ships.
                         PaneKind::CrossSection => {
                             self.record_pane_content(pane_idx, PaneKind::CrossSection, pane_rect);
+                            let top_clearance =
+                                crate::ui::pills::pill_row_clearance(child_ui.ctx(), pane_idx);
                             section_render::render_cross_section(
                                 &mut child_ui,
                                 &mut pane,
                                 pane_rect,
+                                top_clearance,
                                 horizontal_color_scale,
                                 &self.preferences,
                             );
@@ -1525,6 +1541,7 @@ fn volume_pane_outcome(
             paint_volume_caption(
                 ui,
                 pane_rect,
+                crate::ui::pills::pill_row_clearance(ui.ctx(), pane_idx),
                 &volume_caption(&site_code, collected, base_started, region, camera),
             );
             None
@@ -1811,7 +1828,12 @@ const CAPTION_MARGIN: f32 = 8.0;
 /// is unreadable, and a drop shadow only halves the problem. Painted rather than
 /// laid out as widgets for the reason `paint_pane_empty_state` gives — a caption
 /// is not interactive, and widgets here would consume the pane's auto-ids.
-fn paint_volume_caption(ui: &egui::Ui, pane_rect: egui::Rect, lines: &[String]) {
+fn paint_volume_caption(
+    ui: &egui::Ui,
+    pane_rect: egui::Rect,
+    top_clearance: f32,
+    lines: &[String],
+) {
     if lines.is_empty() {
         return;
     }
@@ -1822,9 +1844,11 @@ fn paint_volume_caption(ui: &egui::Ui, pane_rect: egui::Rect, lines: &[String]) 
         pane_rect.width() - 2.0 * CAPTION_MARGIN,
     );
     // Below the pane's pill row, not at the very corner — the row is an
-    // egui layer over the pane and would cover the caption (see
-    // `ui_pills::PILL_ROW_CLEARANCE`).
-    let origin = pane_rect.left_top() + egui::vec2(CAPTION_MARGIN, crate::ui::PILL_ROW_CLEARANCE);
+    // egui layer over the pane and would cover the caption. The clearance
+    // is the row's *measured* height (`ui_pills::pill_row_clearance`): a
+    // narrow pane wraps the row, and a fixed one-row offset put this
+    // caption under the second line (the second user test's pane-6 find).
+    let origin = pane_rect.left_top() + egui::vec2(CAPTION_MARGIN, top_clearance);
     ui.painter().rect_filled(
         egui::Rect::from_min_size(origin, galley.size()).expand(4.0),
         3.0,
@@ -1920,7 +1944,16 @@ fn paint_armed_hint_chip(
         egui::Id::new(("armed_hint_chip", pane_idx)),
     );
     let painter = ctx.layer_painter(layer).with_clip_rect(pane_rect);
-    let galley = painter.layout_no_wrap(text.to_owned(), egui::FontId::proportional(13.0), color);
+    // Wrapped to the pane, never clipped mid-word: a six-way split's pane is
+    // narrower than the region hint's one-line form, and a hint truncated to
+    // "box 20-460 km (d..." tells the user nothing (the second user test).
+    let wrap_width = (pane_rect.width() - 2.0 * ARMED_HINT_PADDING.x - 2.0 * 16.0).max(40.0);
+    let galley = painter.layout(
+        text.to_owned(),
+        egui::FontId::proportional(13.0),
+        color,
+        wrap_width,
+    );
     let rect =
         egui::Rect::from_center_size(pane_rect.center(), galley.size() + 2.0 * ARMED_HINT_PADDING);
     // The section-track halo's translucent black, as a fill.

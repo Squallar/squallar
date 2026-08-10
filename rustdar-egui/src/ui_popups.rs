@@ -106,6 +106,7 @@ fn render_popup_sections(
                 max_height,
             } => {
                 egui::ScrollArea::vertical()
+                    .scroll_source(super::shell::panel_scroll_source())
                     .max_height(*max_height)
                     .show(ui, |ui| {
                         let rt = if *monospace {

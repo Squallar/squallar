@@ -58,6 +58,21 @@ pub struct PreparedFrame {
     screen_descriptor: ScreenDescriptor,
     /// Textures egui retired this frame.
     textures_to_free: Vec<egui::TextureId>,
+    /// How soon egui asked to be painted again — the root viewport's
+    /// `repaint_delay` off `FullOutput::viewport_output`. `Duration::ZERO`
+    /// while an animation is in flight (`animate_bool_with_time` calls
+    /// `request_repaint` every frame it interpolates), a finite delay for a
+    /// timed request (`request_repaint_after` — the text cursor's blink),
+    /// and `Duration::MAX` when nothing asked.
+    ///
+    /// This field exists because dropping it — which this code did until the
+    /// second user test's "panel close shudders" finding — means the app
+    /// loop, which runs on `ControlFlow::Wait`, never learns egui wants
+    /// another frame: an open/close animation advanced only on the frames
+    /// the click's own events happened to produce (press, release, a stray
+    /// move — the reported ~3 frames) and then froze until the next input.
+    /// Honoured by `App::handle_redraw` via [`crate::app::repaint_action`].
+    repaint_delay: std::time::Duration,
     /// Command buffers egui collected from this frame's paint callbacks.
     ///
     /// `egui_wgpu::Renderer::update_buffers` returns whatever every
@@ -92,6 +107,11 @@ impl PreparedFrame {
     /// Textures egui retired this frame, to be freed once the GPU is done.
     pub fn textures_to_free(&self) -> &[egui::TextureId] {
         &self.textures_to_free
+    }
+
+    /// How soon egui asked to be painted again. See the field.
+    pub fn repaint_delay(&self) -> std::time::Duration {
+        self.repaint_delay
     }
 
     /// Submit every command buffer this frame recorded, egui's included.
@@ -245,6 +265,15 @@ impl EguiRenderer {
     ) -> PreparedFrame {
         let full_output = self.state.egui_ctx().end_pass();
 
+        // The root viewport's repaint request, taken before the output is
+        // dismembered: this is the one channel through which egui says an
+        // animation is mid-flight (see `PreparedFrame::repaint_delay`).
+        let repaint_delay = full_output
+            .viewport_output
+            .get(&egui::viewport::ViewportId::ROOT)
+            .map(|out| out.repaint_delay)
+            .unwrap_or(std::time::Duration::MAX);
+
         // Handle platform output more carefully to avoid animation loops
         self.state
             .handle_platform_output(window, full_output.platform_output);
@@ -282,6 +311,7 @@ impl EguiRenderer {
             // resources still referenced by the recorded render pass.
             textures_to_free: full_output.textures_delta.free,
             user_command_buffers,
+            repaint_delay,
         }
     }
 

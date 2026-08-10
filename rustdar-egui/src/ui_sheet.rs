@@ -50,12 +50,20 @@ use crate::actions::GuiAction;
 use super::shell::SurfaceSlot;
 use super::{InspectorSelection, ui_menu};
 
-/// The bottom bar's inset from the map's left, right and bottom edges — the
-/// status bar's own value, for the bar that replaces it down here.
-const BAR_INSET: f32 = 8.0;
+/// The error toast's inset from the map's top edge — the old bar inset,
+/// which the bar itself no longer keeps: the second user test's direction is
+/// a **full-bleed** bottom bar, touching the left, right and bottom edges.
+const TOAST_INSET: f32 = 8.0;
 
-/// The gap between the sheet's bottom edge and the bottom bar's top.
-const SHEET_GAP: f32 = 8.0;
+/// The sheet's clearance from the map's *top* edge. The gap between the
+/// sheet's bottom and the bar died with the bar's insets (the same user
+/// direction): the sheet sits flush on the bar.
+const SHEET_TOP_GAP: f32 = 8.0;
+
+/// Inside padding of a bar item, each side.
+const BAR_ITEM_PADDING: egui::Vec2 = egui::vec2(10.0, 4.0);
+/// Vertical gap between a bar item's icon and its label.
+const BAR_ITEM_GAP: f32 = 2.0;
 
 /// The sheet's two snap heights, as fractions of the map (plan §1.13).
 const SHEET_HALF_FRACTION: f32 = 0.5;
@@ -68,6 +76,12 @@ const SHEET_DISMISS_FRACTION: f32 = 0.75;
 /// The floor a mid-drag sheet cannot shrink under: enough to keep the handle
 /// and the title on screen until the release decides what the drag meant.
 const MIN_SHEET_HEIGHT: f32 = 96.0;
+
+/// The Layers page's own floor: its header carries the Panes/Pane segments
+/// row the phone top bar does not (plan §1.3), and a sheet small enough to
+/// cut that row off is a sheet that hid the pane controls (the second user
+/// test). Handle + title + segments + separator + margins, with slack.
+const LAYERS_MIN_SHEET_HEIGHT: f32 = 148.0;
 
 /// The drag handle's hit strip, and the painted bar inside it.
 const HANDLE_HEIGHT: f32 = 16.0;
@@ -84,16 +98,90 @@ const CATALOG_HEADER_ALLOWANCE: f32 = 48.0;
 /// so the two presentations of "a dialog is open" read the same.
 const SCRIM_COLOR: egui::Color32 = egui::Color32::from_black_alpha(100);
 
-/// The bottom bar's four page items. The Layers glyph matches the top
+/// The bottom bar's four page items, icon above label (the demo's vertical
+/// stack, per the second user test). The Layers glyph matches the top
 /// bar's toggle and the Pane glyph is a carried 2×2 grid — the demo's `▤`
 /// and `▦` have no glyph in egui's bundled fonts (see `ui_glyphs.rs`).
-const MENU_ITEM_LABEL: &str = "\u{2630} Menu";
-const LAYERS_ITEM_LABEL: &str = "\u{25a3} Layers";
-const PANE_ITEM_LABEL: &str = "\u{229e} Pane";
-const APP_ITEM_LABEL: &str = "\u{2699} App";
+const MENU_ITEM: (&str, &str) = ("\u{2630}", "Menu");
+const LAYERS_ITEM: (&str, &str) = ("\u{25a3}", "Layers");
+const PANE_ITEM: (&str, &str) = ("\u{229e}", "Pane");
+const APP_ITEM: (&str, &str) = ("\u{2699}", "App");
 
 /// The close button's glyph — the same × the inspector's deselect uses.
 const CLOSE_LABEL: &str = "\u{d7}";
+
+/// One drawn bottom-bar item: the whole click target, and where its icon
+/// and label landed (the icon-above-label pin reads them).
+struct BarItemDraw {
+    response: egui::Response,
+    /// Read by the icon-above-label pin's probe only.
+    #[cfg_attr(not(test), allow(dead_code))]
+    icon: egui::Rect,
+    /// See [`Self::icon`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    label: egui::Rect,
+}
+
+/// A bar item: icon above label, one click target (plan §1.13 as revised by
+/// the second user test — the demo's vertical stack). Painted rather than a
+/// `selectable_label`, because a label lays its text on one line; the
+/// selected and hovered fills are the stock selectable visuals, so the item
+/// reads exactly like the row it replaces.
+fn bar_item(ui: &mut egui::Ui, selected: bool, (icon, label): (&str, &str)) -> BarItemDraw {
+    let icon_font = egui::TextStyle::Button.resolve(ui.style());
+    let label_font = egui::TextStyle::Small.resolve(ui.style());
+    let icon_galley =
+        ui.painter()
+            .layout_no_wrap(icon.to_owned(), icon_font, egui::Color32::PLACEHOLDER);
+    let label_galley =
+        ui.painter()
+            .layout_no_wrap(label.to_owned(), label_font, egui::Color32::PLACEHOLDER);
+    let size = egui::vec2(
+        icon_galley.size().x.max(label_galley.size().x) + 2.0 * BAR_ITEM_PADDING.x,
+        icon_galley.size().y + BAR_ITEM_GAP + label_galley.size().y + 2.0 * BAR_ITEM_PADDING.y,
+    );
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+
+    let visuals = ui.style().interact_selectable(&response, selected);
+    if selected || response.hovered() || response.has_focus() {
+        let mut visuals = visuals;
+        if selected {
+            visuals.weak_bg_fill = ui.visuals().selection.bg_fill;
+        }
+        ui.painter().rect(
+            rect,
+            visuals.corner_radius,
+            visuals.weak_bg_fill,
+            visuals.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    let icon_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            rect.center().x - icon_galley.size().x / 2.0,
+            rect.top() + BAR_ITEM_PADDING.y,
+        ),
+        icon_galley.size(),
+    );
+    let label_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            rect.center().x - label_galley.size().x / 2.0,
+            icon_rect.bottom() + BAR_ITEM_GAP,
+        ),
+        label_galley.size(),
+    );
+    ui.painter()
+        .galley(icon_rect.min, icon_galley, visuals.text_color());
+    ui.painter()
+        .galley(label_rect.min, label_galley, visuals.text_color());
+
+    BarItemDraw {
+        response,
+        icon: icon_rect,
+        label: label_rect,
+    }
+}
 
 /// Which page the sheet is showing — derived, never stored. See the module
 /// note: this is a reading of the shared open-surface flags, in the fixed
@@ -138,8 +226,12 @@ pub(crate) struct BottomBarProbe {
     pub layers: (egui::Rect, bool),
     pub pane: (egui::Rect, bool),
     pub app: (egui::Rect, bool),
+    /// Each item's icon and label rects as painted, bar order
+    /// [menu, layers, pane, app] — the icon-above-label pin's read side.
+    pub icon_label: [(egui::Rect, egui::Rect); 4],
     /// The Live/timestamp chip, and whether the inline transport was
-    /// expanded when it drew.
+    /// expanded when it drew. [`egui::Rect::NOTHING`] when the bar had no
+    /// room for it — the chip hides rather than overlap the items.
     pub live_chip: (egui::Rect, bool),
 }
 
@@ -152,6 +244,7 @@ impl Default for BottomBarProbe {
             layers: (egui::Rect::NOTHING, false),
             pane: (egui::Rect::NOTHING, false),
             app: (egui::Rect::NOTHING, false),
+            icon_label: [(egui::Rect::NOTHING, egui::Rect::NOTHING); 4],
             live_chip: (egui::Rect::NOTHING, false),
         }
     }
@@ -256,14 +349,30 @@ impl super::Gui {
         self.catalog_open = false;
     }
 
+    /// A bar item's switch step: the dialogs above and every *other* bar
+    /// page yield, so the bar's four pages are mutually exclusive (contract
+    /// 64 as revised — no stacking from the bar). The inspector's selection
+    /// is left alone: a switch is not a dismissal, and the crumb keeps what
+    /// it was about for the next open.
+    fn switch_to_bar_page(&mut self) {
+        self.clear_sheet_dialogs();
+        self.menu_open = false;
+        self.insp_open = false;
+        self.drawer_open = false;
+    }
+
     /// The floating bottom bar (plan §1.13). Returns the bar's top edge, so
     /// the inline timeline and the sheet can sit above it.
     ///
-    /// Toggle semantics: tapping the item whose page is currently on top
-    /// clears that page's flag — the sheet pops to whatever is beneath, or
-    /// closes — and tapping a different item switches to its page. The Pane
-    /// and App items are both the Inspector page and differ only in the
-    /// selection they assert, so "same item" for them means "same body".
+    /// Toggle semantics (revised by the second user test — contract 64):
+    /// tapping a different item **switches** to its page, clearing every
+    /// other bar page's flag — the bar never stacks its own pages, so a
+    /// close cannot fall through to a page the user left minutes ago — and
+    /// tapping the item of the page currently shown **closes the sheet
+    /// entirely**. The dialog pages (Feature, Time, Catalog) still stack
+    /// above by their own routes; only the four bar pages are exclusive.
+    /// The Pane and App items are both the Inspector page and differ only in
+    /// the selection they assert, so "same item" for them means "same body".
     pub(super) fn render_bottom_bar(&mut self, ctx: &egui::Context, map_rect: egui::Rect) -> f32 {
         #[cfg(test)]
         let mut probe = BottomBarProbe::default();
@@ -282,122 +391,138 @@ impl super::Gui {
         };
 
         let page = self.top_sheet_page();
-        let frame = egui::Frame::window(&ctx.global_style());
-        let inner_width = map_rect.width() - 2.0 * BAR_INSET - frame.inner_margin.sum().x;
+        // Full-bleed (the second user test's direction): the bar spans the
+        // whole width and touches the bottom edge — no insets, no gap, and
+        // square bottom corners; the stock rounding stays on top only.
+        let mut frame = super::shell::chrome_frame(&ctx.global_style());
+        frame.corner_radius.sw = 0;
+        frame.corner_radius.se = 0;
+        frame.outer_margin = egui::Margin::ZERO;
+        let inner_width = map_rect.width() - frame.inner_margin.sum().x - 2.0 * frame.stroke.width;
 
         let area = egui::Area::new(egui::Id::new("bottom_bar"))
             .order(egui::Order::Middle)
             .pivot(egui::Align2::LEFT_BOTTOM)
-            .fixed_pos(egui::pos2(
-                map_rect.left() + BAR_INSET,
-                map_rect.bottom() - BAR_INSET,
-            ))
+            .fixed_pos(map_rect.left_bottom())
             .show(ctx, |ui| {
                 frame.show(ui, |ui| {
                     super::fade::dim(ui, fade);
                     ui.set_width(inner_width);
                     ui.horizontal(|ui| {
-                        // Right-to-left first, so the chip owns the right
-                        // edge — the top bar's own device.
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let expanded = !self.timeline_collapsed;
-                            let live = self.panes[self.active_pane].viewing_live;
-                            let chip_text = if live {
-                                "\u{23fa} Live".to_owned()
+                        // The items first, fixed-size, left to right; the
+                        // chip takes the right edge only if the items left
+                        // it room — it hides rather than overlap them (the
+                        // second user test's bleed-through screenshot).
+                        //
+                        // Each item: a tap on the page already shown closes
+                        // the sheet whole (`clear_sheet_pages`); a tap on
+                        // anything else switches, through the exclusive
+                        // step (`switch_to_bar_page`) — contract 64.
+                        let on = page == Some(SheetPage::Menu);
+                        let item = bar_item(ui, on, MENU_ITEM);
+                        #[cfg(test)]
+                        {
+                            probe.menu = (item.response.rect, on);
+                            probe.icon_label[0] = (item.icon, item.label);
+                        }
+                        if item.response.clicked() {
+                            if on {
+                                self.clear_sheet_pages();
                             } else {
-                                format!("\u{23f1} {}", self.active_time_label())
-                            };
-                            let chip = ui
-                                .selectable_label(expanded, chip_text)
-                                .on_hover_text("Show or hide the timeline");
-                            #[cfg(test)]
-                            {
-                                probe.live_chip = (chip.rect, expanded);
+                                self.switch_to_bar_page();
+                                self.menu_open = true;
                             }
-                            if chip.clicked() {
-                                self.timeline_collapsed = expanded;
-                            }
+                        }
 
+                        let on = page == Some(SheetPage::Layers);
+                        let item = bar_item(ui, on, LAYERS_ITEM);
+                        #[cfg(test)]
+                        {
+                            probe.layers = (item.response.rect, on);
+                            probe.icon_label[1] = (item.icon, item.label);
+                        }
+                        if item.response.clicked() {
+                            if on {
+                                self.clear_sheet_pages();
+                            } else {
+                                self.switch_to_bar_page();
+                                self.drawer_open = true;
+                            }
+                        }
+
+                        let on = page == Some(SheetPage::Inspector)
+                            && self.inspector_sel == InspectorSelection::PaneProps;
+                        let item = bar_item(ui, on, PANE_ITEM);
+                        #[cfg(test)]
+                        {
+                            probe.pane = (item.response.rect, on);
+                            probe.icon_label[2] = (item.icon, item.label);
+                        }
+                        if item.response.clicked() {
+                            if on {
+                                self.clear_sheet_pages();
+                            } else {
+                                self.switch_to_bar_page();
+                                self.select_pane_props();
+                            }
+                        }
+
+                        let on = page == Some(SheetPage::Inspector)
+                            && self.inspector_sel == InspectorSelection::AppSettings;
+                        let item = bar_item(ui, on, APP_ITEM);
+                        #[cfg(test)]
+                        {
+                            probe.app = (item.response.rect, on);
+                            probe.icon_label[3] = (item.icon, item.label);
+                        }
+                        if item.response.clicked() {
+                            if on {
+                                self.clear_sheet_pages();
+                            } else {
+                                self.switch_to_bar_page();
+                                self.open_settings();
+                            }
+                        }
+
+                        // The Live/timestamp chip, right-aligned in what is
+                        // left — or absent when even its own width does not
+                        // fit there.
+                        let expanded = !self.timeline_collapsed;
+                        let live = self.panes[self.active_pane].viewing_live;
+                        let chip_text = if live {
+                            "\u{23fa} Live".to_owned()
+                        } else {
+                            format!("\u{23f1} {}", self.active_time_label())
+                        };
+                        let chip_font = egui::TextStyle::Button.resolve(ui.style());
+                        let chip_width = ui
+                            .painter()
+                            .layout_no_wrap(
+                                chip_text.clone(),
+                                chip_font,
+                                egui::Color32::PLACEHOLDER,
+                            )
+                            .size()
+                            .x
+                            + 2.0 * ui.spacing().button_padding.x
+                            + ui.spacing().item_spacing.x;
+                        if ui.available_width() >= chip_width {
                             ui.with_layout(
-                                egui::Layout::left_to_right(egui::Align::Center),
+                                egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    let on = page == Some(SheetPage::Menu);
-                                    let item = ui.selectable_label(on, MENU_ITEM_LABEL);
+                                    let chip = ui
+                                        .selectable_label(expanded, chip_text)
+                                        .on_hover_text("Show or hide the timeline");
                                     #[cfg(test)]
                                     {
-                                        probe.menu = (item.rect, on);
+                                        probe.live_chip = (chip.rect, expanded);
                                     }
-                                    if item.clicked() {
-                                        if on {
-                                            self.menu_open = false;
-                                        } else {
-                                            self.clear_sheet_dialogs();
-                                            self.menu_open = true;
-                                        }
-                                    }
-
-                                    let on = page == Some(SheetPage::Layers);
-                                    let item = ui.selectable_label(on, LAYERS_ITEM_LABEL);
-                                    #[cfg(test)]
-                                    {
-                                        probe.layers = (item.rect, on);
-                                    }
-                                    if item.clicked() {
-                                        if on {
-                                            self.drawer_open = false;
-                                        } else {
-                                            // The pages that outrank Layers
-                                            // all yield — the Inspector
-                                            // included, or the switch would
-                                            // set a flag under a page that
-                                            // keeps covering it.
-                                            self.clear_sheet_dialogs();
-                                            self.menu_open = false;
-                                            self.insp_open = false;
-                                            self.drawer_open = true;
-                                        }
-                                    }
-
-                                    let on = page == Some(SheetPage::Inspector)
-                                        && self.inspector_sel == InspectorSelection::PaneProps;
-                                    let item = ui.selectable_label(on, PANE_ITEM_LABEL);
-                                    #[cfg(test)]
-                                    {
-                                        probe.pane = (item.rect, on);
-                                    }
-                                    if item.clicked() {
-                                        if on {
-                                            // A same-item close is a collapse,
-                                            // not a dismissal: the selection
-                                            // stays for the next open, as the
-                                            // crumb's › keeps it.
-                                            self.insp_open = false;
-                                        } else {
-                                            self.clear_sheet_dialogs();
-                                            self.menu_open = false;
-                                            self.select_pane_props();
-                                        }
-                                    }
-
-                                    let on = page == Some(SheetPage::Inspector)
-                                        && self.inspector_sel == InspectorSelection::AppSettings;
-                                    let item = ui.selectable_label(on, APP_ITEM_LABEL);
-                                    #[cfg(test)]
-                                    {
-                                        probe.app = (item.rect, on);
-                                    }
-                                    if item.clicked() {
-                                        if on {
-                                            self.insp_open = false;
-                                        } else {
-                                            self.clear_sheet_dialogs();
-                                            self.menu_open = false;
-                                            self.open_settings();
-                                        }
+                                    if chip.clicked() {
+                                        self.timeline_collapsed = expanded;
                                     }
                                 },
                             );
-                        });
+                        }
                     });
                 });
             });
@@ -462,8 +587,17 @@ impl super::Gui {
             self.sheet_drag = None;
         }
 
-        let sheet_bottom = bar_top - SHEET_GAP;
-        let avail = (sheet_bottom - map_rect.top() - SHEET_GAP).max(MIN_SHEET_HEIGHT);
+        // Flush on the bar — the gap died with the bar's insets (the second
+        // user test's direction).
+        let sheet_bottom = bar_top;
+        // The Layers page's floor covers its segments header too — a sheet
+        // that cannot cut the pane controls off however far it is dragged.
+        let min_height = if page == SheetPage::Layers {
+            LAYERS_MIN_SHEET_HEIGHT
+        } else {
+            MIN_SHEET_HEIGHT
+        };
+        let avail = (sheet_bottom - map_rect.top() - SHEET_TOP_GAP).max(min_height);
         let half = (map_rect.height() * SHEET_HALF_FRACTION).min(avail);
         let full = (map_rect.height() * SHEET_FULL_FRACTION).min(avail);
         // The catalog is a full-height page (plan §1.10): its groups are the
@@ -478,7 +612,8 @@ impl super::Gui {
             SheetExtent::Half => half,
             SheetExtent::Full => full,
         };
-        let height = (base - self.sheet_drag.unwrap_or(0.0)).clamp(MIN_SHEET_HEIGHT, full);
+        let height =
+            (base - self.sheet_drag.unwrap_or(0.0)).clamp(min_height, full.max(min_height));
         let sheet_rect = egui::Rect::from_min_max(
             egui::pos2(map_rect.left(), sheet_bottom - height),
             egui::pos2(map_rect.right(), sheet_bottom),
@@ -490,14 +625,13 @@ impl super::Gui {
         let sheet_rect = sheet_rect.translate(egui::vec2(0.0, (1.0 - open_factor) * height));
 
         // The scrim, over what the sheet leaves uncovered above it — not
-        // over the bottom bar, which is the way between pages (§1.13). The
-        // gap under the sheet and the bar's own margins are just as
-        // uncovered: map slivers a tap passes through to, features included.
-        // Intended — sealing them would cost the bar its full-bleed margins
-        // — and safe, because dismissal on Compact is projection-first
-        // (`dismiss_top_layer`): a feature picked up through a sliver stacks
-        // *over* the open page, and the next back press pops exactly that,
-        // never an invisible flag beneath it.
+        // over the bottom bar, which is the way between pages (§1.13). With
+        // the sheet flush on the full-bleed bar (the second user test's
+        // direction) the cluster is sealed: no bare-map sliver remains below
+        // the scrim for a tap to slip through while a page is open —
+        // contract 61b pins the geometry. Dismissal on Compact stays
+        // projection-first (`dismiss_top_layer`) regardless, because flags
+        // can still stack out of the bar's order through a resize.
         let scrim_rect =
             egui::Rect::from_min_max(map_rect.min, egui::pos2(map_rect.right(), sheet_rect.top()));
         // A falling scrim thins with the slide and takes no clicks: the
@@ -552,7 +686,7 @@ impl super::Gui {
             probe.title = title.clone();
         }
 
-        let mut frame = egui::Frame::window(&ctx.global_style());
+        let mut frame = super::shell::chrome_frame(&ctx.global_style());
         frame.corner_radius = egui::CornerRadius {
             nw: 12,
             ne: 12,
@@ -703,6 +837,7 @@ impl super::Gui {
                             // (`widget_id_probes`) excludes all three on
                             // purpose.
                             egui::ScrollArea::vertical()
+                                .scroll_source(super::shell::panel_scroll_source())
                                 .id_salt("sheet_feature_scroll")
                                 .max_height(body_max)
                                 .show(ui, |ui| {
@@ -768,6 +903,7 @@ impl super::Gui {
     ) {
         let model = self.menu_model();
         let menu_frame = egui::ScrollArea::vertical()
+            .scroll_source(super::shell::panel_scroll_source())
             .id_salt("sheet_menu_scroll")
             .max_height(body_max)
             .show(ui, |ui| ui_menu::render_menu_drawer(ui, &model))
@@ -877,9 +1013,12 @@ impl super::Gui {
         let area = egui::Area::new(egui::Id::new("phone_error_toast"))
             .order(egui::Order::Tooltip)
             .pivot(egui::Align2::CENTER_TOP)
-            .fixed_pos(egui::pos2(map_rect.center().x, map_rect.top() + BAR_INSET))
+            .fixed_pos(egui::pos2(
+                map_rect.center().x,
+                map_rect.top() + TOAST_INSET,
+            ))
             .show(ctx, |ui| {
-                egui::Frame::window(&ctx.global_style())
+                super::shell::chrome_frame(&ctx.global_style())
                     .show(ui, |ui| {
                         super::fade::dim(ui, factor);
                         ui.horizontal(|ui| super::statusbar::render_error_display(ui, &mut shown))

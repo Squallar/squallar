@@ -51,11 +51,7 @@ pub(crate) const ICON_GLYPHS: &[(char, &str)] = &[
     ),
     ('\u{23f4}', "back one step; collapse toward the left edge"),
     ('\u{23f5}', "forward / play; restore from the left edge"),
-    ('\u{23f6}', "reorder up (stack rows)"),
-    (
-        '\u{23f7}',
-        "reorder down (stack rows); collapse downward (timeline)",
-    ),
+    ('\u{23f7}', "collapse downward (timeline)"),
     (
         '\u{23ee}',
         "previous loop frame; archive posture (phone scan chip)",
@@ -77,8 +73,7 @@ pub(crate) const ICON_GLYPHS: &[(char, &str)] = &[
         "refresh (status bar, layer bodies); rotate the line clockwise",
     ),
     ('\u{1f441}', "layer visibility eye (stack rows)"),
-    ('\u{26d3}', "linked to shared time (pills, sync checkboxes)"),
-    ('\u{2297}', "unlinked from shared time (pills)"),
+    ('\u{2297}', "unlinked from shared time (the Sync pill)"),
     (
         '\u{d7}',
         "close / deselect / dismiss (icon); times in grid sizes and \

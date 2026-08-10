@@ -71,6 +71,42 @@ use rustdar_overlays::render::overlay_state::OverlayKind;
 
 use super::{InspectorSelection, PaneState};
 
+/// The one frame every persistent floating surface draws in: the stock
+/// window frame with the drop shadow removed.
+///
+/// The second user test's finding: the timeline's window shadow cast onto
+/// the status bar floating under it, and every stacked pair of chrome
+/// surfaces (transport over status bar, sheet over bottom bar, chip over
+/// either) repeats the smudge. The persistent chrome — stack, inspector,
+/// timeline and its chip, status bar, bottom bar, sheet, error toast — is
+/// furniture, not a transient surface asserting elevation, so it draws flat;
+/// fill, stroke and rounding stay the stock theme's. Popovers, menus,
+/// tooltips and the modal dialogs deliberately keep their shadows: they are
+/// transient, and the shadow is how they read as *over* the furniture.
+///
+/// A source-scan test holds the chrome files to this constructor, so a new
+/// surface cannot quietly ship the shadowed frame.
+pub(crate) fn chrome_frame(style: &egui::Style) -> egui::Frame {
+    egui::Frame::window(style).shadow(egui::Shadow::NONE)
+}
+
+/// The scroll sources every panel `ScrollArea` accepts: the stock set plus
+/// **mouse** drag-to-scroll.
+///
+/// egui 0.35's default is `DragScroll::OnTouch` — content drags scroll only
+/// where a touch screen is detected — so on a desktop, click-dragging a
+/// panel body did nothing (the second user test). `Always` extends the same
+/// gesture to the mouse; widgets that sense their own drags (sliders, the
+/// stack's reorder grip, the sheet handle) still win theirs, because the
+/// scroll area's catch-all interact registers before its content and egui
+/// resolves the overlap to the later registration.
+pub(crate) fn panel_scroll_source() -> egui::scroll_area::ScrollSource {
+    egui::scroll_area::ScrollSource {
+        drag: egui::scroll_area::DragScroll::Always,
+        ..Default::default()
+    }
+}
+
 /// Where a hosted surface goes this frame: the placement the caller decides
 /// so the body renderers never key anything on the width.
 ///
@@ -310,14 +346,15 @@ impl super::Gui {
 }
 
 /// The Radar row's status line: what picture this pane's radar layer is —
-/// product code and tilt, e.g. `REF - 0.5°`.
+/// product code and tilt, e.g. `REF - 0.5°`. `pub(super)` because the
+/// inspector's Radar layer body states the same line (`ui_inspector.rs`).
 ///
 /// The tilt is the *snapped* angle where a scan is loaded — the one the pane
 /// is actually rendering — falling back to the raw selection before any scan
 /// arrives. `None` while the layer is hidden: the dimmed row carries no line,
 /// like every other layer's. `code()` is the fetch path's lowercase spelling,
 /// uppercased here because the row is a display, not a URL.
-fn radar_row_status(pane: &PaneState) -> Option<String> {
+pub(super) fn radar_row_status(pane: &PaneState) -> Option<String> {
     if !pane.is_overlay_enabled(OverlayKind::Radar) {
         return None;
     }
@@ -328,4 +365,63 @@ fn radar_row_status(pane: &PaneState) -> Option<String> {
         "{} - {tilt:.1}\u{b0}",
         product.code().to_uppercase()
     ))
+}
+
+#[cfg(test)]
+mod chrome_frame_tests {
+    use super::chrome_frame;
+
+    /// The persistent chrome's frame is the stock window frame minus the
+    /// shadow — nothing else moves, so the theme contract holds.
+    #[test]
+    fn the_chrome_frame_is_the_stock_window_frame_without_its_shadow() {
+        let style = egui::Style::default();
+        let frame = chrome_frame(&style);
+        let stock = egui::Frame::window(&style);
+        assert_eq!(
+            frame.shadow,
+            egui::Shadow::NONE,
+            "the chrome frame must cast no shadow - the timeline's smudge on \
+             the status bar is the finding this pins"
+        );
+        assert_eq!(frame.fill, stock.fill, "the fill is the stock theme's");
+        assert_eq!(
+            frame.stroke, stock.stroke,
+            "the stroke is the stock theme's"
+        );
+        assert_eq!(
+            frame.corner_radius, stock.corner_radius,
+            "the rounding is the stock theme's"
+        );
+        assert_eq!(
+            frame.inner_margin, stock.inner_margin,
+            "the margins are the stock theme's - the surfaces' own margin \
+             math depends on them"
+        );
+    }
+
+    /// Every persistent floating surface frames through [`chrome_frame`]:
+    /// a direct `Frame::window` in the chrome files is a shadowed frame
+    /// waiting to ship. The dialogs, popovers and menus keep their shadows
+    /// deliberately (they are transient) and live in other files.
+    #[test]
+    fn the_persistent_chrome_only_frames_through_chrome_frame() {
+        for file in [
+            "ui_stack.rs",
+            "ui_inspector.rs",
+            "ui_timeline.rs",
+            "ui_statusbar.rs",
+            "ui_sheet.rs",
+        ] {
+            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join(file);
+            let src = std::fs::read_to_string(&path).expect("chrome source must be readable");
+            assert!(
+                !src.contains("Frame::window("),
+                "{file} builds a shadowed window frame directly - frame the \
+                 surface through shell::chrome_frame instead"
+            );
+        }
+    }
 }

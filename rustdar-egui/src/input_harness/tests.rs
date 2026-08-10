@@ -3087,17 +3087,26 @@ fn the_bar_never_overlaps_at_mediums_narrowest_width() {
         "precondition: the widest segment row the bar can be asked for"
     );
 
-    // The captions are the first thing the squeeze gives up — their
-    // absence here is how a test can see the tight form really engaged,
-    // rather than the roomy one happening to fit a wider font's luck.
+    // The squeeze swaps the roomy captions for the compact ones — never
+    // for nothing: the tight form used to drop them whole, leaving two
+    // unlabeled number runs nobody could tell apart (the second user test,
+    // M9-19). The roomy spelling's absence is how a test sees the tight
+    // form really engaged; the compact spelling's presence is the label
+    // guarantee itself.
     assert!(
         h.painted_text_strings()
             .iter()
             .all(|t| t != "Panes:" && t != "Pane:"),
-        "the bar kept its captions at a width they cannot fit"
+        "the bar kept its roomy captions at a width they cannot fit"
+    );
+    assert!(
+        h.painted_text_strings().iter().any(|t| t == "Panes")
+            && h.painted_text_strings().iter().any(|t| t == "Pane"),
+        "the tight bar dropped its compact captions - two unlabeled number \
+         runs are the second user test's exact finding"
     );
     // ...and the contrast that keeps that from passing vacuously: a roomy
-    // desktop draws them.
+    // desktop draws the full spellings.
     let wide = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     assert!(
         wide.painted_text_strings().iter().any(|t| t == "Panes:"),
@@ -3364,39 +3373,56 @@ fn the_eye_toggles_a_layer_both_ways_and_it_sticks() {
     );
 }
 
-/// 86. **The inspector's Show toggle is the eye's equal: both ways, and it
-///     sticks.**
+/// 86. **The layer body carries no master toggle: the stack row's eye owns
+///     visibility.**
 ///
-///     The layer body's master toggle goes through the same
-///     `write_pane_overlay` discipline as the eye, from inside the same
-///     take window — this holds it there. Also pins that the master shows
-///     the live state, through the probe's handed-value convention.
+///     The second user test's de-dup: the body's "Show <layer>" checkbox
+///     duplicated the eye in the same context and is gone — contract 85
+///     holds the eye to the job, and this holds the body to not growing the
+///     duplicate back. Asserted off the painted text, since no probe field
+///     exists to have recorded a control that must not draw. The Radar body
+///     — the one whose handler owns nothing but the master — states its
+///     picture and points at Pane properties instead of standing empty.
 #[test]
-fn the_inspectors_show_toggle_toggles_both_ways_and_it_sticks() {
+fn the_layer_body_carries_no_master_toggle() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
     h.warm_up();
-    h.open_layer_in_inspector(OverlayKind::RadarSites);
 
-    let (master, on) = h.inspector().master.expect("the layer body's toggle");
-    assert!(on, "the Show toggle must draw the live state");
-    h.mouse_click(master.center());
-    for frame in 0..5 {
-        h.frame_after(FRAME_DT);
+    for kind in [
+        OverlayKind::RadarSites,
+        OverlayKind::ColorScale,
+        OverlayKind::Radar,
+    ] {
+        h.open_layer_in_inspector(kind);
+        let rect = h.inspector_rect().expect("the inspector is open");
+        let name = h.overlay_display_name(kind).to_owned();
         assert!(
-            !h.overlay_enabled(OverlayKind::RadarSites),
-            "the overlay came back on {} frame(s) after the Show click",
-            frame + 1
+            !h.text_painted_in(rect, &format!("Show {name}")),
+            "{kind:?}'s layer body drew a \"Show {name}\" master toggle - \
+             the stack row's eye owns visibility"
         );
     }
 
-    let (master, on) = h.inspector().master.expect("still drawn");
-    assert!(!on, "the layer is off but the Show toggle still draws on");
-    h.mouse_click(master.center());
-    h.frames_for(5, FRAME_DT);
+    // The Radar body's non-empty replacement: the route to where product
+    // and tilt actually live.
+    let rect = h.inspector_rect().expect("the Radar body is open");
     assert!(
-        h.overlay_enabled(OverlayKind::RadarSites),
-        "the Show toggle did not turn the layer back on"
+        h.text_painted_in(rect, "Pane properties..."),
+        "the Radar body must point at Pane properties rather than stand empty"
+    );
+    let button = h
+        .painted_text_rects()
+        .into_iter()
+        .find(|(r, text)| text == "Pane properties..." && rect.contains(r.center()))
+        .expect("the button was just painted")
+        .0;
+    h.mouse_click(button.center());
+    h.warm_up();
+    assert_eq!(
+        h.inspector().mode,
+        Some(crate::ui::InspectorSelection::PaneProps),
+        "the Radar body's button must open Pane properties"
     );
 }
 
@@ -3472,17 +3498,17 @@ fn an_eye_toggle_propagates_to_the_other_panes_when_sync_is_on() {
     );
 }
 
-/// 94. **Turning a dataless layer on fetches it, eye and Show toggle alike.**
+/// 94. **Turning a dataless layer on fetches it.**
 ///
 ///     SPC outlooks are the layer that makes this a contract rather than a
 ///     nicety: the handler never auto-polls, so an enable that emitted no
 ///     `FetchOverlay` would leave an enabled layer that stays blank forever.
 ///     The layer's own sub-toggles ask for the fetch through their
-///     `ControlEffect`; the master routes bypass them, so they carry the
-///     rule themselves.
+///     `ControlEffect`; the eye — the master route since the Show toggle's
+///     de-dup (contract 86) — bypasses them, so it carries the rule itself.
+///     The catalog tile route shares the same helper and its own pin.
 #[test]
 fn enabling_a_dataless_layer_fetches_it() {
-    // The eye.
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     let row = h.stack_row(OverlayKind::SpcOutlook).expect("row drawn");
     assert!(!row.eye_on, "precondition: outlooks default off");
@@ -3498,73 +3524,63 @@ fn enabling_a_dataless_layer_fetches_it() {
         "the eye enabled a layer with no data and no auto-poll, and nothing \
              will ever fetch it"
     );
-
-    // The Show toggle.
-    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
-    h.open_layer_in_inspector(OverlayKind::SpcOutlook);
-    let (master, on) = h.inspector().master.expect("the layer body's toggle");
-    assert!(!on, "precondition: outlooks default off");
-    h.mouse_click(master.center());
-    assert!(
-        h.last_actions().iter().any(|a| matches!(
-            a,
-            crate::actions::GuiAction::FetchOverlay {
-                kind: OverlayKind::SpcOutlook,
-                ..
-            }
-        )),
-        "the Show toggle enabled a dataless layer without fetching it"
-    );
 }
 
-/// 68. **The ▲▼ buttons really reorder the draw order — permuted, bounded,
-///     persisted, redrawn.**
+/// Drag one stack row's grip from its own centre to `to`, through the real
+/// press-move-release sequence the drag machinery sees.
+fn drag_stack_row(h: &mut InputHarness, kind: OverlayKind, to: egui::Pos2) {
+    let handle = h
+        .stack_row(kind)
+        .unwrap_or_else(|| panic!("{kind:?}'s row is drawn"))
+        .handle;
+    assert_ne!(handle, egui::Rect::NOTHING, "{kind:?}'s row has a grip");
+    let from = handle.center();
+    h.mouse_press(from);
+    h.frame_after(FRAME_DT);
+    // Two moves, so the gesture has an in-flight frame with the lift and
+    // the insertion marker up before the release lands the row.
+    h.mouse_move(egui::pos2(from.x, (from.y + to.y) / 2.0));
+    h.frame_after(FRAME_DT);
+    h.mouse_move(to);
+    h.frame_after(FRAME_DT);
+    h.mouse_release(to);
+    h.frames_for(2, FRAME_DT);
+}
+
+/// 68. **Dragging a row by its grip really reorders the draw order —
+///     permuted, persisted, redrawn.**
 ///
 ///     `PaneState::draw_order` has been persisted per pane since multi-pane
-///     landed, with no UI able to change it; the stack's reorder buttons are
-///     that UI, and each of the four claims has its own silent failure:
-///     a ▲ that swaps the wrong neighbours (the display list is the draw
-///     order *reversed*, so the index arithmetic is exactly the thing to
-///     pin), an end button that wraps instead of disabling, a reorder that
-///     evaporates on restart because it never reached the config, and rows
-///     that keep their old positions because the renderer iterated a copy.
+///     landed; the grip drag is the UI that changes it (the ⏶⏷ buttons it
+///     replaces were too small on a desktop and unusable on touch — the
+///     second user test). Each claim has its own silent failure: a drop that
+///     lands on the wrong neighbour (the display list is the draw order
+///     *reversed*, so the slot arithmetic is exactly the thing to pin), a
+///     reorder that evaporates on restart because it never reached the
+///     config, and rows that keep their old positions because the renderer
+///     iterated a copy. Driven through real press-move-release sequences,
+///     never a state poke.
 #[test]
-fn the_reorder_buttons_permute_the_draw_order_and_it_persists() {
+fn dragging_a_row_by_its_grip_permutes_the_draw_order_and_it_persists() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     let before = h.gui_mut().pane(0).expect("pane 0").draw_order.clone();
     let n = before.len();
     assert!(n >= 3, "precondition: a real layer list");
-
-    // The ends are disabled: the top row cannot move up, the bottom cannot
-    // move down — and a click there does nothing rather than wrapping.
     let rows = h.stack().rows;
     assert_eq!(rows.len(), n, "one row per layer");
-    assert!(!rows[0].up.1, "the top row's \u{25b2} must be disabled");
-    assert!(rows[0].down.1, "the top row's \u{25bc} must be enabled");
-    assert!(
-        !rows[n - 1].down.1,
-        "the bottom row's \u{25bc} must be disabled"
-    );
-    h.mouse_click(rows[0].up.0.center());
-    h.frames_for(2, FRAME_DT);
-    assert_eq!(
-        h.gui_mut().pane(0).expect("pane 0").draw_order,
-        before,
-        "clicking a disabled \u{25b2} still permuted the order"
-    );
 
-    // ▲ on the second row: drawn later, i.e. towards the *end* of
-    // `draw_order` — the top row is the last-drawn layer.
+    // Drag the second row above the first: drawn later, i.e. towards the
+    // *end* of `draw_order` — the top row is the last-drawn layer.
     let second = rows[1].kind;
-    h.mouse_click(rows[1].up.0.center());
-    h.frames_for(2, FRAME_DT);
+    let above_top = egui::pos2(rows[0].rect.center().x, rows[0].rect.top() - 4.0);
+    drag_stack_row(&mut h, second, above_top);
     let mut expected = before.clone();
     expected.swap(n - 1, n - 2);
     assert_eq!(
         h.gui_mut().pane(0).expect("pane 0").draw_order,
         expected,
-        "\u{25b2} on the second row must swap the draw order's last two \
-             entries"
+        "dropping the second row above the top one must swap the draw \
+         order's last two entries"
     );
 
     // The rows re-render in the new order, from the mutated field.
@@ -3574,23 +3590,33 @@ fn the_reorder_buttons_permute_the_draw_order_and_it_persists() {
         "the promoted layer's row did not move to the top"
     );
 
-    // ▼ undoes it, so the wiring is symmetric.
-    h.mouse_click(rows[0].down.0.center());
-    h.frames_for(2, FRAME_DT);
+    // Dragging it back down one slot undoes it, so the drop arithmetic is
+    // symmetric.
+    let below_second = egui::pos2(rows[1].rect.center().x, rows[1].rect.bottom() - 2.0);
+    drag_stack_row(&mut h, second, below_second);
     assert_eq!(
         h.gui_mut().pane(0).expect("pane 0").draw_order,
         before,
-        "\u{25bc} on the promoted row must put the order back"
+        "dragging the promoted row back down must put the order back"
     );
 
-    // And the change survives the config round trip: reorder again, save,
-    // and load into a fresh session.
-    let rows = h.stack().rows;
-    h.mouse_click(rows[1].up.0.center());
-    h.frames_for(2, FRAME_DT);
+    // A drop past the bottom lands the row last-in-display — first-drawn.
+    let top = h.stack().rows[0].kind;
+    let below_last = {
+        let rows = h.stack().rows;
+        egui::pos2(rows[n - 1].rect.center().x, rows[n - 1].rect.bottom() + 4.0)
+    };
+    drag_stack_row(&mut h, top, below_last);
+    assert_eq!(
+        h.gui_mut().pane(0).expect("pane 0").draw_order[0],
+        top,
+        "a drop below the last row must make the layer the first drawn"
+    );
+
+    // And the change survives the config round trip: save, and load into a
+    // fresh session.
     let reordered = h.gui_mut().pane(0).expect("pane 0").draw_order.clone();
     assert_ne!(reordered, before, "precondition: a real reorder to persist");
-
     let store = crate::config_store::MemoryConfigStore::default();
     h.gui_mut().save_ui_config(&store);
     let mut fresh = crate::Gui::new();
@@ -3600,6 +3626,102 @@ fn the_reorder_buttons_permute_the_draw_order_and_it_persists() {
         reordered,
         "the reorder did not survive the ui_config round trip"
     );
+}
+
+/// 68b. **The user's exact case: City Labels dragged above the Color Scale
+///     changes what paints over what.**
+///
+///     The end-to-end of contracts 68 and 95 together: the drag permutes
+///     `draw_order`, and the pane's paint sequence — the one the paint-order
+///     probe records off the real dispatch — moves with it. On the old fixed
+///     pass this was exactly the reorder that changed nothing on the glass.
+#[test]
+fn city_labels_dragged_above_the_color_scale_paint_after_it() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.gui_mut().enable_overlay_for_test(OverlayKind::CityLabels);
+    h.gui_mut().enable_overlay_for_test(OverlayKind::ColorScale);
+    h.warm_up();
+
+    let paint_pos = |h: &InputHarness, kind: OverlayKind| -> usize {
+        h.paint_order(0)
+            .iter()
+            .position(|&(k, _)| k == kind)
+            .unwrap_or_else(|| panic!("{kind:?} was not dispatched"))
+    };
+    // The default order paints City Labels before the Color Scale.
+    let labels_before = paint_pos(&h, OverlayKind::CityLabels);
+    let scale_before = paint_pos(&h, OverlayKind::ColorScale);
+    assert!(
+        labels_before < scale_before,
+        "precondition: the default draw order paints the scale over the labels"
+    );
+
+    // Drag the City Labels row above the Color Scale row.
+    let scale_row = h
+        .stack_row(OverlayKind::ColorScale)
+        .expect("the Color Scale row is drawn");
+    let above_scale = egui::pos2(scale_row.rect.center().x, scale_row.rect.top() - 4.0);
+    drag_stack_row(&mut h, OverlayKind::CityLabels, above_scale);
+    h.warm_up();
+
+    assert!(
+        paint_pos(&h, OverlayKind::CityLabels) > paint_pos(&h, OverlayKind::ColorScale),
+        "City Labels moved above the Color Scale in the stack, but the pane \
+         still paints them under it - the reorder changed nothing, which is \
+         the second user test's exact report"
+    );
+}
+
+/// 95. **The pane paints every enabled kind at its `draw_order` position, on
+///     one paint list.**
+///
+///     The second user test's meaty finding: moving City Labels above the
+///     Color Scale changed nothing, because the scale painted on a dedicated
+///     sub-layer — and same-`Order` non-area layers composite in
+///     `GraphicLayers::drain`'s hash-order safety net, not in submission
+///     order. Two claims, each with its own silent failure: the dispatched
+///     sequence equals the pane's enabled `draw_order` (a fixed-pass renderer
+///     restores itself here), and every kind paints into the *same* egui
+///     layer (a kind quietly moved onto a sub-layer passes the sequence half
+///     while egui stacks it wherever the hash lands — the exact old bug,
+///     which this half verified-failed on).
+#[test]
+fn the_pane_paints_every_enabled_kind_in_draw_order_on_one_paint_list() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.gui_mut().enable_overlay_for_test(OverlayKind::CityLabels);
+    h.gui_mut().enable_overlay_for_test(OverlayKind::ColorScale);
+    h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
+    h.warm_up();
+
+    let expected: Vec<OverlayKind> = {
+        let order = h.gui_mut().pane(0).expect("pane 0").draw_order.clone();
+        order
+            .into_iter()
+            .filter(|&kind| h.overlay_enabled_on(0, kind))
+            .collect()
+    };
+    assert!(
+        expected.contains(&OverlayKind::CityLabels) && expected.contains(&OverlayKind::ColorScale),
+        "precondition: the two kinds of the user's case are enabled and ordered"
+    );
+
+    let order = h.paint_order(0);
+    assert!(!order.is_empty(), "the map pane recorded no paint order");
+    let kinds: Vec<OverlayKind> = order.iter().map(|&(kind, _)| kind).collect();
+    assert_eq!(
+        kinds, expected,
+        "the pane's paint sequence is not its enabled draw_order"
+    );
+
+    let (first_kind, first_layer) = order[0];
+    for &(kind, layer) in &order {
+        assert_eq!(
+            layer, first_layer,
+            "{kind:?} paints on its own layer while {first_kind:?} paints on \
+             the pane's - their stacking is then egui's hash-order layer \
+             drain, not draw_order"
+        );
+    }
 }
 
 /// 89. **A stack row click selects that layer in the inspector, which opens
@@ -3883,24 +4005,34 @@ fn host_insets_move_the_breakpoint_through_the_real_ui() {
     );
 }
 
-/// 25. **The hover readout follows the pointer, not the window width.**
+/// 25. **The hover readout follows the pointer, not the window width — and
+///     Compact has none at all (M9-17's revision).**
 ///
-///     Keying it on `WidthClass` gets both ends wrong: a 500pt desktop
-///     window loses a readout it can use, a 1400pt tablet gets an empty one.
-///
-///     Since the phone shell the *host* follows the width — Compact has no
-///     status bar, so the readout lives in the phone top bar there — but
-///     whether a readout exists at all stays the modality's question alone.
+///     Keying the *existence* of a hover readout on `WidthClass` gets both
+///     wide ends wrong: a touch tablet would get an empty readout, a mouse
+///     desktop would lose one it can use. The Compact half changed in the
+///     second user test: the phone top bar's truncating copy was useless,
+///     so Compact hosts **no** bar readout for any modality — the value
+///     readout there is the press-and-hold popup (M9-17's own pin), which
+///     mouse and touch both reach.
 #[test]
 fn the_hover_readout_follows_the_modality_not_the_width() {
-    // A narrow *desktop* window: compact, but there is a mouse — the phone
-    // top bar hosts the readout.
+    // A narrow *desktop* window: the bar readout is gone (the popup is the
+    // route), and nothing truncated is left on the bar.
     let mut narrow = InputHarness::with_screen(egui::vec2(500.0, 800.0));
     narrow.mouse_click(narrow.map_center());
     assert_eq!(narrow.width_class(), crate::ui_layout::WidthClass::Compact);
     assert!(
-        narrow.top_bar().hover,
-        "a compact window with a mouse lost its hover readout"
+        !narrow.top_bar().hover,
+        "the Compact top bar still hosts the truncating readout M9-17 removed"
+    );
+
+    // A wide *mouse* window keeps the live status-bar readout.
+    let mut wide = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    wide.mouse_click(wide.map_center());
+    assert!(
+        wide.status_bar().hover,
+        "a wide mouse window lost its status-bar readout"
     );
 
     // A wide *touch* device: roomy, but nothing can hover.
@@ -3912,8 +4044,7 @@ fn the_hover_readout_follows_the_modality_not_the_width() {
         "a touch device was given a hover readout that can never fill in"
     );
 
-    // ...and a *touch* phone gets none either: the phone bar hosts the
-    // readout for a mouse, not for the width.
+    // ...and a *touch* phone gets none either.
     let mut touch_phone = InputHarness::with_screen(egui::vec2(420.0, 900.0));
     touch_phone.touch_tap(touch_phone.map_center());
     assert_eq!(
@@ -3924,6 +4055,58 @@ fn the_hover_readout_follows_the_modality_not_the_width() {
         !touch_phone.top_bar().hover,
         "a touch phone's top bar drew a hover readout that can never fill in"
     );
+}
+
+/// M9-17. **On Compact a mouse press-and-hold raises the value popup.**
+///
+///     The Compact bar readout is gone (contract 25's revision), so the
+///     long-press tooltip — the touch pipeline's value popup — must be
+///     reachable with a mouse there: a held primary button is the mouse's
+///     spelling of the hold. Driven with real held frames; the wide widths
+///     deliberately keep the pure mouse path (the long-press detector
+///     steals the pan from a resting mouse, and they have a live readout).
+#[test]
+fn a_compact_mouse_press_and_hold_raises_the_value_popup() {
+    let mut h = InputHarness::with_screen(egui::vec2(420.0, 900.0));
+    h.load_scan("KTLX");
+    let spot = h.pane_rects()[0].center();
+    h.place_radar_image(0, rustdar_radar::types::RadarProduct::Reflectivity, 0.5);
+    h.warm_up();
+
+    h.mouse_press(spot);
+    let pressed = h.frame_after(FRAME_DT);
+    assert_eq!(
+        pressed.resolved.long_press_pos, None,
+        "not held long enough yet"
+    );
+    let held = h.frames_for(10, 0.1);
+    assert_eq!(
+        held.resolved.long_press_pos,
+        Some(spot),
+        "a Compact mouse hold must resolve as the long press"
+    );
+    assert!(
+        h.painted_text_strings()
+            .iter()
+            .any(|t| t.contains("dBZ") || t == "No data"),
+        "the hold did not raise the value popup; painted {:?}",
+        h.painted_text_strings()
+    );
+    h.mouse_release(spot);
+    h.warm_up();
+
+    // The wide widths keep the pure mouse path: the same hold resolves no
+    // long press at 1400pt.
+    let mut wide = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    wide.load_scan("KTLX");
+    let spot = wide.pane_rects()[0].center();
+    wide.mouse_press(spot);
+    let held = wide.frames_for(10, 0.1);
+    assert_eq!(
+        held.resolved.long_press_pos, None,
+        "a wide mouse window must not grow the long-press (it steals the pan)"
+    );
+    wide.mouse_release(spot);
 }
 
 /// 26. **The phone top bar carries the short scan text; the long form stays
@@ -4810,10 +4993,12 @@ fn day_old_data_reads_in_hours() {
         h.painted_text_strings()
     );
 
-    // The phone has no status bar to carry the line — the timeline's age
-    // chip is where the age lives down there, and it must read on the same
-    // hour scale, or a downed site's day-old field looks minutes stale on
-    // exactly the screen most likely to be glanced at.
+    // The phone has no status bar to carry the line, and the narrow
+    // transport dropped the age chip outright (M9-10 — the demo's narrow
+    // behaviour, at the user's direction). What the phone still states is
+    // the posture: the timestamp button says the moment on screen and calls
+    // it archive, so a downed site's day-old field is at least not claimed
+    // live. The hour-scale age itself is a wide-width statement now.
     let mut phone = InputHarness::with_screen(egui::vec2(420.0, 900.0));
     phone.load_scan("KTLX");
     phone.set_data_time(0, Some(written_ago(26 * 60 + 5)));
@@ -4821,14 +5006,15 @@ fn day_old_data_reads_in_hours() {
         phone.status_bar().rect == egui::Rect::NOTHING,
         "the phone shell drew a status bar"
     );
-    let age = phone.timeline().age_text;
-    assert_eq!(
-        age, "26h 5m old",
-        "the phone timeline's age chip must carry the age in hours"
+    let t = phone.timeline();
+    assert!(
+        t.age_text.is_empty(),
+        "the narrow transport dropped its age chip (M9-10), got {:?}",
+        t.age_text
     );
     assert!(
-        !age.contains("L3") && !age.contains("Level III"),
-        "nor may the chip name a datasource: {age:?}"
+        !t.timestamp.1.is_empty(),
+        "with the age chip gone the timestamp is the moment's one statement"
     );
 }
 
@@ -9129,9 +9315,9 @@ fn the_timeline_row2_caption_states_the_pushed_frame_budget() {
         row2.caption
     );
     assert!(
-        row2.caption.contains("Follows shared time"),
-        "the caption must carry the per-pane unlink hint, by the checkbox's \
-         own name; drew {:?}",
+        row2.caption.contains("\"Sync time\""),
+        "the caption must carry the per-pane unlink hint, by the toggle's \
+         own name (the Sync popover's and the inspector checkbox's); drew {:?}",
         row2.caption
     );
 }
@@ -9461,21 +9647,35 @@ fn the_product_and_tilt_pill_popovers_write_the_pane() {
     );
 }
 
-/// 73f. **The link pill's popover toggles the pane's time link, and its
-///      caption is the honest unlink sentence the inspector shares.**
+/// 73f. **The Sync pill's popover is the three-way: each toggle flips its
+///      real state, and the honest unlink sentence rides with it.**
+///
+///      The second user test replaced the ⛓ link pill (it rendered like a
+///      DNA helix) with a text pill opening a three-toggle popover: "Sync
+///      layers" is the global `sync_layers`, "Sync viewport" the global
+///      `viewport_sync`, "Sync time" this pane's own `time_link` — the
+///      current semantics, with `UNLINK_NOTE` on screen. Each flip is
+///      asserted against the real field, from the popover, through real
+///      clicks; the pill's own text marks the unlinked-time state
+///      distinctly.
 #[test]
-fn the_link_pill_popover_toggles_the_time_link() {
+fn the_sync_pill_popover_flips_all_three_real_states() {
     let mut h = pill_harness();
+    assert!(h.sync_layers(), "precondition: layer sync defaults on");
 
-    let (glyph, pill) = h.pill(0, PillKind::Link).expect("a link pill");
-    assert_eq!(glyph, "\u{26d3}", "a fresh pane reads linked");
+    let (label, pill) = h.pill(0, PillKind::Link).expect("a Sync pill");
+    assert_eq!(label, "Sync", "a fresh pane's pill reads plain Sync");
     h.mouse_click(pill.center());
     h.frame(); // the popup's debut frame only registers it
     let popover = h.pill_popover().expect("the popover opened");
-    assert_eq!(popover.rows.len(), 2, "the follow / unlink pair");
-    assert!(
-        popover.rows[0].2 && !popover.rows[1].2,
-        "the linked state must read selected"
+    assert_eq!(
+        popover
+            .rows
+            .iter()
+            .map(|(label, _, _)| label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Sync layers", "Sync viewport", "Sync time - this pane"],
+        "the three-way popover's honest labels"
     );
     // The shared honesty sentence — `ui_pills::UNLINK_NOTE`, the inspector
     // checkbox's own hover — is on screen with the choice.
@@ -9486,16 +9686,37 @@ fn the_link_pill_popover_toggles_the_time_link() {
         "the popover must carry the honest unlink caption"
     );
 
+    // Sync layers: flips the global toggle, popover stays up.
+    h.mouse_click(popover.rows[0].1.center());
+    h.frame();
+    assert!(
+        !h.sync_layers(),
+        "the Sync layers toggle did not flip the global sync_layers"
+    );
+
+    // Sync viewport: the global viewport sync.
+    let viewport_before = h.gui_mut().viewport_sync_for_test();
+    let popover = h.pill_popover().expect("the popover stays up for toggles");
     h.mouse_click(popover.rows[1].1.center());
+    h.frame();
+    assert_eq!(
+        h.gui_mut().viewport_sync_for_test(),
+        !viewport_before,
+        "the Sync viewport toggle did not flip the global viewport_sync"
+    );
+
+    // Sync time: this pane's own link.
+    let popover = h.pill_popover().expect("still up");
+    h.mouse_click(popover.rows[2].1.center());
     h.warm_up();
     assert!(
         !h.gui_mut().pane(0).expect("pane 0").time_link,
-        "the pick did not unlink the pane"
+        "the Sync time toggle did not unlink the pane"
     );
-    let (glyph, _) = h.pill(0, PillKind::Link).expect("still drawn");
+    let (label, _) = h.pill(0, PillKind::Link).expect("still drawn");
     assert_eq!(
-        glyph, "\u{2297}",
-        "the pill must reflect the unlinked state"
+        label, "\u{2297} Sync",
+        "the pill must mark the unlinked-time state distinctly"
     );
 }
 
@@ -9983,16 +10204,20 @@ impl rustdar_overlays::render::overlay_state::OverlayItem for SheetStubFeature {
     }
 }
 
-/// 64. **The bottom bar's items toggle their own page and switch between
-///     pages.**
+/// 64. **A bar item tap switches to its page; the shown page's item closes
+///     the sheet whole.**
 ///
-///     Tapping the item whose page is on top clears that page's flag — the
-///     sheet pops to whatever is beneath, or closes — and tapping a
-///     different item switches to its page. Pane and App are both the
-///     Inspector page and differ only in the selection they assert, so
-///     switching between them changes the body without closing the sheet.
+///     Revised by the second user test, whose report is authoritative: the
+///     old projection-pop semantics stacked the bar's pages, so Layers →
+///     Pane → Pane-again *revealed Layers* — a basic element behaving
+///     wrongly. The bar never stacks its own four pages now: a switch
+///     clears every other bar page's flag, and the shown page's item
+///     closes the sheet entirely. Pane and App are both the Inspector page
+///     and differ only in the selection they assert, so switching between
+///     them changes the body without closing the sheet — and "same item"
+///     for them means "same body".
 #[test]
-fn the_bottom_bar_toggles_its_pages_and_switches_between_them() {
+fn a_bar_item_switches_pages_and_the_shown_pages_item_closes_the_sheet() {
     let mut h = phone();
     assert_eq!(h.sheet().page, None, "a fresh session's sheet is closed");
 
@@ -10005,7 +10230,7 @@ fn the_bottom_bar_toggles_its_pages_and_switches_between_them() {
         "the open page's item must highlight"
     );
 
-    // A different item switches pages; the Layers flag stays set beneath.
+    // A different item switches pages — exclusively, no stacking.
     h.mouse_click(h.bottom_bar().pane.0.center());
     h.warm_up();
     assert_eq!(h.sheet().page, Some(crate::ui::SheetPage::Inspector));
@@ -10019,8 +10244,21 @@ fn the_bottom_bar_toggles_its_pages_and_switches_between_them() {
         "the highlight must follow the page on top"
     );
 
-    // App is the same page under a different selection: the body switches,
-    // the sheet stays.
+    // The user's exact sequence: the Pane item again closes the SHEET —
+    // never the stale Layers page the old stacking fell through to.
+    h.mouse_click(h.bottom_bar().pane.0.center());
+    h.warm_up();
+    assert_eq!(
+        h.sheet().page,
+        None,
+        "the shown page's item must close the sheet whole - falling through \
+         to the Layers page is the second user test's exact bug"
+    );
+
+    // App is the same page as Pane under a different selection: the body
+    // switches, the sheet stays.
+    h.mouse_click(h.bottom_bar().pane.0.center());
+    h.warm_up();
     h.mouse_click(h.bottom_bar().app.0.center());
     h.warm_up();
     assert_eq!(h.sheet().page, Some(crate::ui::SheetPage::Inspector));
@@ -10034,33 +10272,243 @@ fn the_bottom_bar_toggles_its_pages_and_switches_between_them() {
         "same page, but the highlight follows the selection"
     );
 
-    // The same item again closes its page — popping to the Layers page the
-    // switch left open beneath.
+    // And the App item again closes the sheet, straight to the map.
     h.mouse_click(h.bottom_bar().app.0.center());
+    h.warm_up();
+    assert_eq!(h.sheet().page, None, "the App item's second tap closes it");
+
+    // The Menu item follows the same contract.
+    h.mouse_click(h.bottom_bar().menu.0.center());
+    h.warm_up();
+    assert_eq!(h.sheet().page, Some(crate::ui::SheetPage::Menu));
+    assert!(h.bottom_bar().menu.1);
+    h.mouse_click(h.bottom_bar().layers.0.center());
     h.warm_up();
     assert_eq!(
         h.sheet().page,
         Some(crate::ui::SheetPage::Layers),
-        "closing the top page must reveal the one beneath, not the map"
+        "Menu to Layers is a switch"
     );
-
-    // ...and closing the last page closes the sheet.
     h.mouse_click(h.bottom_bar().layers.0.center());
     h.warm_up();
     assert_eq!(
         h.sheet().page,
         None,
-        "the last page's toggle closes the sheet"
+        "the Layers item's second tap closes it"
+    );
+}
+
+/// M9-9. **Bar items stack their icon above their label.**
+///
+///     The demo's vertical stack, per the second user test: each of the four
+///     items paints its glyph on top and its name under it, both centred in
+///     the one click target — a side-by-side layout passes none of these.
+#[test]
+fn bar_items_stack_icon_above_label() {
+    let mut h = phone();
+    h.warm_up();
+    let bar = h.bottom_bar();
+    for (which, (icon, label)) in ["Menu", "Layers", "Pane", "App"].iter().zip(bar.icon_label) {
+        assert_ne!(icon, egui::Rect::NOTHING, "{which} drew no icon");
+        assert_ne!(label, egui::Rect::NOTHING, "{which} drew no label");
+        assert!(
+            label.top() >= icon.bottom() - 0.5,
+            "{which}'s label at {label:?} is not below its icon at {icon:?}"
+        );
+        assert!(
+            (label.center().x - icon.center().x).abs() <= 1.5,
+            "{which}'s label and icon are not stacked on one centre line"
+        );
+    }
+    // The stacks live inside their own item's click target.
+    for (which, (item, (icon, label))) in ["Menu", "Layers", "Pane", "App"].iter().zip(
+        [bar.menu, bar.layers, bar.pane, bar.app]
+            .into_iter()
+            .zip(bar.icon_label),
+    ) {
+        assert!(
+            item.0.contains_rect(icon) && item.0.contains_rect(label),
+            "{which}'s stack leaks outside its click target"
+        );
+    }
+}
+
+/// M9-12. **The inline transport sits flush on the bar, full width.**
+///
+///     The 8pt gap between the transport and the bottom bar died with the
+///     bar's insets (the second user test: "no gap above the bar").
+#[test]
+fn the_inline_transport_sits_flush_on_the_bar() {
+    let mut h = phone();
+    h.warm_up();
+    let bar = h.bottom_bar().rect;
+    let timeline = h.timeline();
+    assert!(
+        !timeline.collapsed,
+        "precondition: the phone transport opens expanded"
+    );
+    assert!(
+        (timeline.rect.bottom() - bar.top()).abs() <= 0.5,
+        "the transport at {:?} does not sit flush on the bar at {bar:?}",
+        timeline.rect
+    );
+    let map = h.map_panel_rect();
+    assert!(
+        (timeline.rect.left() - map.left()).abs() <= 0.5
+            && (map.right() - timeline.rect.right()).abs() <= 0.5,
+        "the inline transport must span the full width like the bar under it"
+    );
+}
+
+/// M9-15. **The Layers page's segments header survives the smallest sheet.**
+///
+///     The phone top bar carries no pane segments; the Layers page's header
+///     is where they live (plan §1.3) — and the second user test found a
+///     small sheet cutting them off. The page's height floor now covers its
+///     header, so mid-drag at the floor every segment button still lies
+///     inside the sheet.
+#[test]
+fn the_sheet_keeps_the_layers_page_segments_at_its_smallest() {
+    let mut h = phone();
+    h.set_pane_count(2);
+    h.open_layers();
+    let handle = h.sheet().handle;
+    let map = h.map_panel_rect();
+    let near_bottom = egui::pos2(handle.center().x, map.bottom() - 10.0);
+
+    // Drag the handle to the very bottom and hold: the sheet is clamped at
+    // its floor, mid-drag, which is where the cut-off used to happen.
+    h.mouse_press(handle.center());
+    h.frame_after(FRAME_DT);
+    h.mouse_move(egui::pos2(handle.center().x, handle.center().y + 60.0));
+    h.frame_after(FRAME_DT);
+    h.mouse_move(near_bottom);
+    h.frame_after(FRAME_DT);
+
+    let sheet = h.sheet_rect().expect("mid-drag the sheet is still up");
+    let options = h.pane_options();
+    assert!(
+        !options.is_empty(),
+        "the Layers page must draw its segments header"
+    );
+    for opt in options {
+        assert!(
+            sheet.contains_rect(opt.rect),
+            "segment button {} at {:?} is cut off by the {sheet:?} sheet at \
+             its floor",
+            opt.count,
+            opt.rect
+        );
+    }
+    h.mouse_release(near_bottom);
+    h.warm_up();
+}
+
+/// M9-10. **The narrow transport never overlaps itself: essentials on row
+///     one, the scrubber on its own full-width row, the age chip dropped.**
+///
+///     The second user test's screenshot shows the 420pt row mangled into
+///     "1 10 min 00∞ liv" — every element drawn over its neighbour. The
+///     narrow form is pinned by geometry: all drawn row-1 controls pairwise
+///     disjoint, the scrubber strictly below every one of them and nearly
+///     the transport's full width, and the age chip absent.
+#[test]
+fn the_narrow_transport_puts_the_scrubber_on_its_own_row_and_nothing_overlaps() {
+    let mut h = phone();
+    h.load_scan("KMKX");
+    h.warm_up();
+    let t = h.timeline();
+    assert!(!t.collapsed, "precondition: the transport is expanded");
+
+    let row1: Vec<(&str, egui::Rect)> = vec![
+        ("Live", t.live.0),
+        ("back", t.back),
+        ("fwd", t.fwd.0),
+        ("step", t.step_dropdown),
+        ("loop", t.loop_toggle.0),
+        ("timestamp", t.timestamp.0),
+        ("expander", t.expander),
+        ("collapse", t.collapse),
+    ];
+    for (i, &(name_a, a)) in row1.iter().enumerate() {
+        assert_ne!(a, egui::Rect::NOTHING, "{name_a} was not drawn");
+        for &(name_b, b) in &row1[i + 1..] {
+            assert!(
+                a.intersect(b).size().min_elem() <= 0.0,
+                "{name_a} at {a:?} overlaps {name_b} at {b:?} on the narrow \
+                 transport - the mangled-row bug"
+            );
+        }
+    }
+
+    // The scrubber: its own row, below everything, nearly full width.
+    let scrubber = t.scrubber;
+    let row1_bottom = row1
+        .iter()
+        .map(|&(_, r)| r.bottom())
+        .fold(f32::MIN, f32::max);
+    assert!(
+        scrubber.top() >= row1_bottom - 0.5,
+        "the scrubber at {scrubber:?} does not sit on its own row below the \
+         controls (row 1 bottom {row1_bottom})"
+    );
+    assert!(
+        scrubber.width() >= 0.8 * t.rect.width(),
+        "the scrubber's own row should hand it nearly the transport's width"
     );
 
-    // The Menu item follows the same toggle contract.
-    h.mouse_click(h.bottom_bar().menu.0.center());
-    h.warm_up();
-    assert_eq!(h.sheet().page, Some(crate::ui::SheetPage::Menu));
-    assert!(h.bottom_bar().menu.1);
-    h.mouse_click(h.bottom_bar().menu.0.center());
-    h.warm_up();
-    assert_eq!(h.sheet().page, None, "the Menu item's second tap closes it");
+    // The age chip is dropped at narrow widths (the demo behaviour).
+    assert!(
+        t.age_text.is_empty(),
+        "the narrow transport still draws the age chip: {:?}",
+        t.age_text
+    );
+
+    // The wide form keeps the age chip.
+    let mut wide = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    wide.load_scan("KMKX");
+    wide.set_data_time(0, Some(written_ago(5)));
+    let t = wide.timeline();
+    assert!(
+        !t.age_text.is_empty(),
+        "the wide transport must keep the age chip"
+    );
+}
+
+/// M9-16. **The Live/timestamp chip never intersects the bar's items.**
+///
+///     The second user test's screenshot: the chip bled across the Pane and
+///     App buttons at narrow widths. The chip now takes only the space the
+///     items left — and hides when even that is not enough — so at every
+///     width it is either absent or disjoint from all four items. Driven at
+///     the standard phone width and at a very narrow one, and in the archive
+///     posture, whose timestamp text is the chip's widest form.
+#[test]
+fn the_live_chip_never_intersects_the_bar_items() {
+    for width in [420.0, 330.0] {
+        let mut h = InputHarness::with_screen(egui::vec2(width, 900.0));
+        // Archive posture: the chip carries a full timestamp.
+        h.load_scan("KMKX");
+        h.gui_mut().active_pane_mut().viewing_live = false;
+        h.warm_up();
+        let bar = h.bottom_bar();
+        let (chip, _) = bar.live_chip;
+        if chip == egui::Rect::NOTHING {
+            // Hidden for lack of room — the allowed narrow answer.
+            continue;
+        }
+        for (which, item) in ["Menu", "Layers", "Pane", "App"]
+            .iter()
+            .zip([bar.menu, bar.layers, bar.pane, bar.app])
+        {
+            assert!(
+                chip.intersect(item.0).size().min_elem() <= 0.0,
+                "the chip at {chip:?} bleeds into {which} at {:?} on a \
+                 {width}pt screen",
+                item.0
+            );
+        }
+    }
 }
 
 /// 71. **Dialogs are modals at ≥600pt and sheet pages below it — the phone
@@ -10417,56 +10865,12 @@ fn stack_rows_carry_a_chevron_only_in_the_drawer_and_sheet_hosts() {
     );
 }
 
-/// **The phone bar's hover readout never paints over the arm toggles.** The
-/// readout is the one unbounded string the bar hosts (contract 25 puts it
-/// here whenever a mouse drives), and the ⬚/╱ toggles own the right edge —
-/// so a long value must truncate at the width they left, not extend across
-/// them: the module note's overlap rule, in its truncation form.
-#[test]
-fn the_phone_hover_readout_never_paints_over_the_arm_toggles() {
-    let mut h = phone();
-    h.mouse_move(h.map_center());
-    h.warm_up();
-    assert!(
-        h.top_bar().hover,
-        "precondition: mouse modality, or the bar hosts no readout"
-    );
-
-    // A readout far wider than the whole screen, let alone the bar's run.
-    let long = format!("READOUT {}", "far too long ".repeat(40));
-    h.gui_mut().pane_mut(0).unwrap().hover_value = Some(long.clone());
-    h.frame();
-
-    let bar = h.top_bar();
-    let (readout, _) = {
-        let rects = h.painted_text_rects();
-        rects
-            .iter()
-            .find(|(_, text)| text.starts_with("READOUT"))
-            .cloned()
-            .expect("precondition: the readout must be on the glass")
-    };
-    assert!(
-        !readout.intersects(bar.region_arm.0) && !readout.intersects(bar.section_arm.0),
-        "the hover readout at {readout:?} paints over the arm toggles at \
-         {:?} / {:?}",
-        bar.region_arm.0,
-        bar.section_arm.0
-    );
-    assert!(
-        readout.right() <= bar.region_arm.0.left(),
-        "the readout must end where the toggles' run begins"
-    );
-
-    // ...and the toggles stay clickable under the same readout.
-    h.gui_mut().pane_mut(0).unwrap().hover_value = Some(long);
-    h.mouse_click(bar.region_arm.0.center());
-    h.warm_up();
-    assert!(
-        h.region_arm(),
-        "the \u{2b1a} toggle under a long readout did not take the click"
-    );
-}
+// `the_phone_hover_readout_never_paints_over_the_arm_toggles` retired
+// (synthesis-m9): the phone bar's hover readout is gone — M9-17 removed the
+// truncating copy and made the press-and-hold popup the Compact value
+// readout (its own pin, plus contract 25's revision). The overlap it
+// guarded cannot recur without the readout, and contract 82's
+// painted-text-under-arm sweep still covers the bar's other strings.
 
 /// **The phone error toast sits under the top bar, clear of the arm
 /// toggles, and its ✕ dismisses** — the status bar's error contract, moved
@@ -10819,40 +11223,46 @@ fn fading_closes_the_panels_for_real_and_unfading_reopens_nothing() {
     assert!(chrome_on_screen(&h), "the unconditional chrome is back");
 }
 
-/// 61b. **On the phone the fade closes the sheet for real — through the map
-///      sliver the scrim leaves beside the bottom bar.**
+/// 61b. **The phone bottom cluster is edge-flush and seals the map while a
+///      page is open** — the full-bleed direction of the second user test,
+///      which retired the sliver band this contract used to fade through.
 ///
-///      The scrim covers the map above the sheet, so the one place a map tap
-///      can land with a page open is the sliver band by the bottom bar
-///      (`ui_sheet.rs`'s own note). That tap is the fade gesture: pages
-///      closed in state, cluster gone, nothing left under the fade.
+///      Three geometric claims, each its own regression: the bar spans the
+///      full width and touches the bottom edge (no side or bottom insets),
+///      the open sheet sits flush on the bar's top (the 8pt gap died), and
+///      the scrim covers what the sheet leaves above — so no bare-map
+///      sliver exists below the scrim for a tap to slip through while a
+///      page is up. (The fade-closes-everything claims live in 61 and the
+///      invariants suite; the sliver route to them died with the sliver.)
 #[test]
-fn a_sliver_tap_fades_and_closes_the_sheet_for_real() {
+fn the_phone_bottom_cluster_is_edge_flush_and_seals_the_map() {
     let mut h = phone();
     h.open_layers();
-    let sheet_bottom = h.sheet_rect().expect("the Layers page is open").bottom();
-    let bar_top = h.bottom_bar().rect.top();
+    let map = h.map_panel_rect();
+    let bar = h.bottom_bar().rect;
     assert!(
-        sheet_bottom < bar_top,
-        "precondition: a sliver exists between the sheet and the bar"
-    );
-    let sliver = egui::pos2(
-        h.pane_rects()[0].left() + 3.0,
-        (sheet_bottom + bar_top) / 2.0,
+        (bar.left() - map.left()).abs() <= 0.5 && (map.right() - bar.right()).abs() <= 0.5,
+        "the bar must span the full width: bar {bar:?} in map {map:?}"
     );
     assert!(
-        !h.is_floating_layer_at(sliver),
-        "precondition: the sliver is bare map, not scrim or bar"
+        (map.bottom() - bar.bottom()).abs() <= 0.5,
+        "the bar must touch the bottom edge: bar {bar:?} in map {map:?}"
     );
 
-    h.mouse_click(sliver);
-    h.warm_up();
-    assert!(h.faded(), "the sliver tap must fade");
-    assert_eq!(h.sheet().page, None, "the sheet must close in state");
-    assert!(h.gui_mut().dismiss_top_layer(), "the fade itself");
+    let sheet = h.sheet_rect().expect("the Layers page is open");
     assert!(
-        !h.gui_mut().dismiss_top_layer(),
-        "a page flag survived the fade invisibly"
+        (sheet.bottom() - bar.top()).abs() <= 0.5,
+        "the sheet must sit flush on the bar: sheet bottom {} vs bar top {}",
+        sheet.bottom(),
+        bar.top()
+    );
+
+    // The scrim seals everything above the sheet: any point between the map
+    // top and the sheet's top edge is a floating layer, never bare map.
+    let above = egui::pos2(map.left() + 3.0, (map.top() + sheet.top()) / 2.0);
+    assert!(
+        h.is_floating_layer_at(above),
+        "the scrim must cover the map above the sheet"
     );
 }
 
@@ -11693,6 +12103,148 @@ fn layer_rows_are_full_width_click_targets() {
         )),
         "the eye click leaked into a row selection"
     );
+}
+
+/// M9-18. **In-pane text stays inside its pane and clear of the pill row.**
+///
+///     The second user test's pane-6 screenshots: the armed-region hint
+///     clipped mid-word at the pane edge, and the section caption collided
+///     with a pill row that had wrapped to two lines (the fixed one-row
+///     clearance assumed it never would). Driven on a six-pane grid whose
+///     panes are narrow enough to matter: the hint chip's text must lie
+///     inside its pane, and every painted text is either fully inside a
+///     pill row's rect (it is a pill) or fully disjoint from it — a partial
+///     overlap is exactly the collision.
+#[test]
+fn in_pane_text_stays_inside_its_pane_and_clear_of_the_pill_rows() {
+    let mut h = InputHarness::with_screen(egui::vec2(1000.0, 900.0));
+    h.set_pane_count(6);
+    h.load_scan("KTLX");
+    h.make_pane_cross_section(
+        4,
+        crate::pane::GeoPoint {
+            lat: 35.1,
+            lon: -97.6,
+        },
+        crate::pane::GeoPoint {
+            lat: 35.5,
+            lon: -97.0,
+        },
+    );
+    // The stack floats over pane 0's corner by design; close it so the only
+    // things over the pill rows are the rows themselves.
+    h.close_layers();
+    h.set_region_arm(true);
+    h.warm_up();
+
+    // The armed hint chip wraps to its pane rather than clipping mid-word.
+    let panes = h.pane_rects();
+    let hints: Vec<(egui::Rect, String)> = h
+        .painted_text_rects()
+        .into_iter()
+        .filter(|(_, text)| text.contains("Drag to pick 3D region"))
+        .collect();
+    assert!(!hints.is_empty(), "the armed mode paints its hint chip");
+    for (rect, text) in hints {
+        assert!(
+            panes
+                .iter()
+                .any(|pane| pane.expand(1.0).contains_rect(rect)),
+            "the hint {text:?} at {rect:?} runs outside every pane - the \
+             clipped-mid-word bug"
+        );
+    }
+
+    // Nothing partially overlaps a pill row: fully inside (a pill's own
+    // label) or fully clear (a caption that kept its measured clearance).
+    for row in h.pill_rows() {
+        for (rect, text) in h.painted_text_rects() {
+            if rect.intersects(row.rect) && !row.rect.expand(1.0).contains_rect(rect) {
+                panic!(
+                    "{text:?} at {rect:?} collides with pane {}'s pill row at \
+                     {:?} - the wrapped-row clearance failure",
+                    row.pane_idx, row.rect
+                );
+            }
+        }
+    }
+}
+
+/// M9-13. **A mouse click-drag on a panel body scrolls it.**
+///
+///     egui 0.35's `DragScroll::OnTouch` default made content drags
+///     touch-only, so on a desktop, click-dragging inside a panel scrolled
+///     nothing (the second user test). The panels opt into `Always`; driven
+///     here with a real mouse press-move-release on a stack row's *body* —
+///     which senses clicks, not drags, so the scroll area receives the
+///     gesture — against a window short enough that the list overflows.
+///     The reorder grip keeps its own drag (contract 68 pins that side).
+#[test]
+fn a_mouse_drag_on_a_panel_body_scrolls_it() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 420.0));
+    h.warm_up();
+    let scroll_id = h
+        .widget_id_probes()
+        .iter()
+        .find(|(name, _)| *name == "layers_scroll")
+        .expect("the stack's scroll area reports its id")
+        .1;
+    let before = h.scroll_offset(scroll_id).unwrap_or_default().y;
+
+    // Drag upward on a row's text block — body, not grip, not eye.
+    let row = h.stack().rows[1].clone();
+    let start = row.name.center();
+    h.mouse_press(start);
+    h.frame_after(FRAME_DT);
+    h.mouse_move(start - egui::vec2(0.0, 40.0));
+    h.frame_after(FRAME_DT);
+    h.mouse_move(start - egui::vec2(0.0, 90.0));
+    h.frame_after(FRAME_DT);
+    let after = h.scroll_offset(scroll_id).unwrap_or_default().y;
+    assert!(
+        after > before + 20.0,
+        "a mouse drag on the row body moved the offset only {before} to \
+         {after} - drag-to-scroll is still touch-only"
+    );
+    h.mouse_release(start - egui::vec2(0.0, 90.0));
+    h.warm_up();
+
+    // The aborted click did not select the row.
+    assert_ne!(
+        h.inspector().mode,
+        Some(crate::ui::InspectorSelection::Layer(row.kind)),
+        "the scroll drag leaked into a row selection"
+    );
+}
+
+/// M9-1. **A row's text block sits vertically centred in its row.**
+///
+///     The ≥28pt full-row target left the name and status anchored to the
+///     row's top — a nested top-down child flows from the top whatever the
+///     parent's cross-align says — and the second user test read it as
+///     mis-set type. The block now centres itself; this holds it there, for
+///     the status-carrying rows and the name-only ones alike (the two have
+///     different block heights, so one passing does not imply the other).
+#[test]
+fn stack_row_text_is_vertically_centred() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.warm_up();
+    let rows = h.stack().rows;
+    assert!(rows.len() >= 10, "precondition: the stack draws its rows");
+    assert!(
+        rows.iter().any(|row| row.status_line.is_some())
+            && rows.iter().any(|row| row.status_line.is_none()),
+        "precondition: both block shapes are on screen"
+    );
+    for row in rows {
+        assert_ne!(row.name, egui::Rect::NOTHING, "{:?} drew no text", row.kind);
+        let off = (row.name.center().y - row.rect.center().y).abs();
+        assert!(
+            off <= 1.5,
+            "{:?}'s text block sits {off:.1}pt off its row's vertical centre",
+            row.kind
+        );
+    }
 }
 
 /// M8-11. **The fade hides the 3D pane's Volume Alpha corner button.** It is

@@ -40,7 +40,7 @@ const VCP_212: [f64; 14] = [
 #[test]
 fn the_top_of_the_axis_is_the_top_of_the_plot() {
     let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
-    let layout = SectionLayout::new(rect, ONE_LINE, false);
+    let layout = SectionLayout::new(rect, crate::ui::PILL_ROW_CLEARANCE, ONE_LINE, false);
     let axes = axes();
 
     assert_eq!(
@@ -69,7 +69,7 @@ fn the_top_of_the_axis_is_the_top_of_the_plot() {
 #[test]
 fn a_degenerate_axis_maps_to_the_edges_rather_than_to_nan() {
     let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
-    let layout = SectionLayout::new(rect, ONE_LINE, false);
+    let layout = SectionLayout::new(rect, crate::ui::PILL_ROW_CLEARANCE, ONE_LINE, false);
     let flat = SectionAxes {
         length_km: 0.0,
         top_km_msl: 0.4,
@@ -185,13 +185,31 @@ fn air_the_antenna_never_reached_is_not_called_the_cone_of_silence() {
 fn a_short_pane_drops_the_second_caption_line_and_keeps_a_picture() {
     let rect = |w: f32, h: f32| egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(w, h));
 
-    assert!(SectionLayout::new(rect(600.0, 400.0), TWO_LINES, false).labelled_axes);
+    assert!(
+        SectionLayout::new(
+            rect(600.0, 400.0),
+            crate::ui::PILL_ROW_CLEARANCE,
+            TWO_LINES,
+            false
+        )
+        .labelled_axes
+    );
 
-    let short = SectionLayout::new(rect(600.0, 200.0), ONE_LINE, false);
+    let short = SectionLayout::new(
+        rect(600.0, 200.0),
+        crate::ui::PILL_ROW_CLEARANCE,
+        ONE_LINE,
+        false,
+    );
     assert!(short.labelled_axes);
     assert!(short.plot.height() > 0.0);
 
-    let tiny = SectionLayout::new(rect(300.0, 110.0), ONE_LINE, false);
+    let tiny = SectionLayout::new(
+        rect(300.0, 110.0),
+        crate::ui::PILL_ROW_CLEARANCE,
+        ONE_LINE,
+        false,
+    );
     assert!(!tiny.labelled_axes, "no room for labels at 110 points");
     assert!(
         tiny.plot.left() < tiny.plot.right(),
@@ -211,7 +229,7 @@ fn a_short_pane_drops_the_second_caption_line_and_keeps_a_picture() {
 fn the_axis_unit_label_has_room_above_the_plot() {
     let rect = |h: f32| egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(600.0, h));
 
-    let labelled = SectionLayout::new(rect(400.0), ONE_LINE, false);
+    let labelled = SectionLayout::new(rect(400.0), crate::ui::PILL_ROW_CLEARANCE, ONE_LINE, false);
     assert!(labelled.labelled_axes, "precondition");
     // 10 pt text bottom-aligned two points above the plot: its top sits at
     // `plot.top() - 2 - height`, which has to clear the caption.
@@ -224,7 +242,7 @@ fn the_axis_unit_label_has_room_above_the_plot() {
     );
 
     // And a pane with no axis labels does not pay for a label it never draws.
-    let bare = SectionLayout::new(rect(110.0), ONE_LINE, false);
+    let bare = SectionLayout::new(rect(110.0), crate::ui::PILL_ROW_CLEARANCE, ONE_LINE, false);
     assert!(!bare.labelled_axes, "precondition");
     assert!(
         bare.plot.top() - bare.caption.bottom() < AXIS_UNIT_HEADROOM,
@@ -307,7 +325,7 @@ fn the_caption_wraps_and_the_layout_pays_for_the_rows_it_takes() {
             height <= h * CAPTION_MAX_HEIGHT_FRACTION,
             "at {w}x{h} the caption ate {height} points of the pane"
         );
-        let layout = SectionLayout::new(rect(w, h), height, false);
+        let layout = SectionLayout::new(rect(w, h), crate::ui::PILL_ROW_CLEARANCE, height, false);
         assert!(
             layout.plot.top() >= layout.caption.top() + height,
             "at {w}x{h} the plot starts inside the {rows}-row caption above it"
@@ -786,7 +804,7 @@ fn red_is_reserved_for_broken_states() {
 #[test]
 fn a_real_tilt_ladder_draws_and_fans_apart_with_range() {
     let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 500.0));
-    let layout = SectionLayout::new(rect, ONE_LINE, false);
+    let layout = SectionLayout::new(rect, crate::ui::PILL_ROW_CLEARANCE, ONE_LINE, false);
     // KTLX, and a line running away from it, so the ground range along the
     // section really does change.
     let (site_lat, site_lon) = (35.3333, -97.2778);
@@ -849,8 +867,8 @@ fn a_real_tilt_ladder_draws_and_fans_apart_with_range() {
 #[test]
 fn a_status_line_takes_room_from_the_picture_not_from_the_warning() {
     let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(600.0, 400.0));
-    let without = SectionLayout::new(rect, ONE_LINE, false);
-    let with = SectionLayout::new(rect, TWO_LINES, false);
+    let without = SectionLayout::new(rect, crate::ui::PILL_ROW_CLEARANCE, ONE_LINE, false);
+    let with = SectionLayout::new(rect, crate::ui::PILL_ROW_CLEARANCE, TWO_LINES, false);
     assert!(with.caption.height() > without.caption.height());
     assert!(with.plot.top() > without.plot.top());
     assert!(with.plot.height() < without.plot.height());
@@ -866,8 +884,8 @@ fn a_status_line_takes_room_from_the_picture_not_from_the_warning() {
 #[test]
 fn the_plot_leaves_room_for_whichever_edge_the_colour_bar_took() {
     let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 500.0));
-    let vertical = SectionLayout::new(rect, ONE_LINE, false);
-    let horizontal = SectionLayout::new(rect, ONE_LINE, true);
+    let vertical = SectionLayout::new(rect, crate::ui::PILL_ROW_CLEARANCE, ONE_LINE, false);
+    let horizontal = SectionLayout::new(rect, crate::ui::PILL_ROW_CLEARANCE, ONE_LINE, true);
 
     assert!(
         rect.right() - vertical.plot.right() >= COLOR_SCALE_RESERVE,

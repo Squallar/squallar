@@ -85,6 +85,7 @@ pub(crate) use topbar::MIN_BAR_HEIGHT;
 mod pills;
 /// What a pane's own top-left content leaves clear for its pill row — read
 /// by the section pane's layout and the 3D pane's caption.
+#[cfg(test)]
 pub(crate) use pills::PILL_ROW_CLEARANCE;
 /// What the pill rows and their popovers drew last frame, for the input
 /// harness.
@@ -549,6 +550,11 @@ pub struct Gui {
     /// read by tests — the M8 pin that the fade hides pane-borne chrome too.
     #[cfg(test)]
     last_alpha_buttons: Vec<(usize, egui::Rect)>,
+    /// Each map pane's dispatched kinds in paint order, with the layer each
+    /// painted into. Only read by tests — the draw-order pin; see
+    /// `PaneRenderCtx::paint_order` for why the layer is the honest half.
+    #[cfg(test)]
+    last_paint_order: Vec<(usize, Vec<(OverlayKind, egui::LayerId)>)>,
     /// What the last frame's status bar actually drew. Only read by tests.
     #[cfg(test)]
     last_status_bar: StatusBarProbe,
@@ -837,6 +843,10 @@ pub struct Gui {
     /// popover filter through the one field, as they render the one list.
     /// Session-only, same terms as [`Self::catalog_query`].
     site_query: String,
+    /// The stack row being drag-reordered by its grip, if one is in flight.
+    /// Session-only: a drag is a gesture, not a preference. The permute
+    /// happens once, on release — see `ui_stack.rs`'s reorder note.
+    stack_drag: Option<OverlayKind>,
     /// The pane whose pill row a first touch tap revealed, if any.
     /// Session-only: a reveal is a gesture in progress, not a preference.
     /// Cleared where the gestures that end it are resolved — a map click
@@ -1477,6 +1487,8 @@ impl Gui {
             #[cfg(test)]
             last_alpha_buttons: Vec::new(),
             #[cfg(test)]
+            last_paint_order: Vec::new(),
+            #[cfg(test)]
             last_status_bar: StatusBarProbe::default(),
             #[cfg(test)]
             last_timeline: TimelineProbe::default(),
@@ -1534,6 +1546,7 @@ impl Gui {
             catalog_save_name: String::new(),
             catalog_saving: false,
             site_query: String::new(),
+            stack_drag: None,
             pill_revealed: None,
             pills_drawn_last_frame: 0,
             pills_raise_pending: false,
@@ -1604,6 +1617,7 @@ impl Gui {
             self.last_pane_borders.clear();
             self.last_section_tracks.clear();
             self.last_alpha_buttons.clear();
+            self.last_paint_order.clear();
             // Cleared like the rest: the picker redraws from the top bar every
             // frame, and appending over a stale list would report every button
             // twice.
@@ -2133,10 +2147,10 @@ impl Gui {
         // On Compact every page flag presents as the sheet, so dismissal
         // reads the same projection the renderer does: pop exactly the page
         // `top_sheet_page` says is visibly on top. The fixed chain below
-        // cannot serve here, because two real routes stack the flags out of
-        // its order — flags set on a wider width and carried through a
-        // resize, and a feature tap through the map slivers the scrim leaves
-        // beside the bottom bar — and the chain would then pop a layer the
+        // cannot serve here, because flags can stack out of its order —
+        // flags set on a wider width and carried through a resize (the bar's
+        // own pages are exclusive since contract 64's revision, but a
+        // resize is not the bar) — and the chain would then pop a layer the
         // projection never shows, consuming a press invisibly. One rule
         // either side of the breakpoint: dismissal pops what is painted on
         // top.
@@ -3448,6 +3462,17 @@ impl Gui {
         &self.last_section_tracks
     }
 
+    /// Pane `idx`'s dispatched kinds in paint order, with the layer each
+    /// painted into — the draw-order pin's read side.
+    #[cfg(test)]
+    pub(crate) fn paint_order_for_test(&self, idx: usize) -> Vec<(OverlayKind, egui::LayerId)> {
+        self.last_paint_order
+            .iter()
+            .find(|(pane, _)| *pane == idx)
+            .map(|(_, order)| order.clone())
+            .unwrap_or_default()
+    }
+
     /// The Volume Alpha corner buttons the last frame drew, per pane.
     #[cfg(test)]
     pub(crate) fn alpha_buttons_for_test(&self) -> &[(usize, egui::Rect)] {
@@ -3723,6 +3748,12 @@ impl Gui {
     #[cfg(test)]
     pub(crate) fn set_sync_layers_for_test(&mut self, on: bool) {
         self.sync_layers = on;
+    }
+
+    /// The global viewport-sync toggle, for the Sync popover's pin.
+    #[cfg(test)]
+    pub(crate) fn viewport_sync_for_test(&self) -> bool {
+        self.viewport_sync
     }
 
     /// Set one pane's overlay state, writing the config as well as the enabled

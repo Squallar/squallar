@@ -84,9 +84,6 @@ pub(crate) struct InspectorProbe {
     /// Which body arm actually drew, written by that arm as a literal — the
     /// [`super::PaneContentProbe`] pattern, so a mis-wired arm cannot fake it.
     pub mode: Option<InspectorSelection>,
-    /// The layer body's "Show <layer>" master toggle, and the state it was
-    /// drawn showing.
-    pub master: Option<(egui::Rect, bool)>,
     /// The pane-props body's site search field.
     pub site_search: egui::Rect,
     /// The site rows the pane-props body drew, filtered as drawn: the site
@@ -111,7 +108,6 @@ impl Default for InspectorProbe {
             collapse: egui::Rect::NOTHING,
             open: false,
             mode: None,
-            master: None,
             site_search: egui::Rect::NOTHING,
             site_rows: Vec::new(),
             site_caption: String::new(),
@@ -146,7 +142,7 @@ impl super::Gui {
         let frame = if slot.sheet {
             egui::Frame::NONE
         } else {
-            egui::Frame::window(&ctx.global_style())
+            super::shell::chrome_frame(&ctx.global_style())
         };
         let order = if slot.sheet {
             egui::Order::Foreground
@@ -173,6 +169,7 @@ impl super::Gui {
                     ui.separator();
 
                     let mut body = egui::ScrollArea::vertical()
+                        .scroll_source(super::shell::panel_scroll_source())
                         .id_salt("inspector_scroll")
                         .max_height(max_body_height)
                         .min_scrolled_height(max_body_height);
@@ -222,14 +219,7 @@ impl super::Gui {
                                 {
                                     probe.mode = Some(InspectorSelection::Layer(kind));
                                 }
-                                self.render_layer_body(
-                                    ui,
-                                    pane,
-                                    kind,
-                                    actions,
-                                    #[cfg(test)]
-                                    &mut probe,
-                                );
+                                self.render_layer_body(ui, pane, kind, actions);
                             }
                         });
                     });
@@ -349,36 +339,44 @@ impl super::Gui {
         });
     }
 
-    /// The layer body: the master "Show <layer>" toggle, then the handler's
-    /// own controls through the one host they have.
+    /// The layer body: the handler's own controls, through the one host they
+    /// have. Visibility is the stack row's 👁 eye alone — the "Show <layer>"
+    /// master toggle this body used to open with duplicated the eye in the
+    /// same context and is gone (the second user test's de-dup), and the
+    /// separator under it — the stray line at the body's bottom whenever a
+    /// layer had no further controls — went with it.
     fn render_layer_body(
         &mut self,
         ui: &mut egui::Ui,
         pane: &mut PaneState,
         kind: OverlayKind,
         actions: &mut Vec<GuiAction>,
-        #[cfg(test)] probe: &mut InspectorProbe,
     ) {
-        let name = self.overlays.display_name(kind).to_owned();
-        let mut on = pane.is_overlay_enabled(kind);
-        #[cfg(test)]
-        let was_on = on;
-        let master = ui.checkbox(&mut on, format!("Show {name}"));
-        #[cfg(test)]
-        {
-            // The state the checkbox was *handed*, not the one the click
-            // produced — the same discipline as `DrawnMenuLeaf`.
-            probe.master = Some((master.rect, was_on));
+        // The Radar handler owns nothing but the master toggle, so its body
+        // would be empty. What it says instead: which picture the layer is —
+        // the stack row's own status line — and where the product and tilt
+        // controls live, because they are pane properties (the pills and the
+        // Pane-properties body own them; a copy here was the duplication the
+        // second user test called out).
+        if kind == OverlayKind::Radar {
+            if let Some(status) = super::shell::radar_row_status(pane) {
+                ui.label(status);
+                ui.add_space(4.0);
+            }
+            ui.label(
+                egui::RichText::new(
+                    "Product and tilt are pane properties - set them from the \
+                     pane's pills or in Pane properties.",
+                )
+                .small()
+                .weak(),
+            );
+            ui.add_space(6.0);
+            if ui.button("Pane properties...").clicked() {
+                self.select_pane_props();
+            }
+            return;
         }
-        if master.changed() {
-            // Both halves on the taken pane, plus the enable-fetch rule —
-            // the one helper this toggle, the stack's eye and the catalog's
-            // tiles share.
-            let idx = self.active_pane;
-            self.set_pane_overlay_with_fetch(pane, idx, kind, on, actions);
-        }
-        ui.add_space(4.0);
-        ui.separator();
 
         self.render_overlay_controls_one(ui, pane, kind, actions);
     }
@@ -449,10 +447,12 @@ impl super::Gui {
         if self.pane_layout.pane_count > 1 {
             ui.add_space(6.0);
             ui.separator();
-            // `⛓` — the pills' own linked glyph; the demo's `🔗` has no
-            // glyph in egui's bundled fonts (see `ui_glyphs.rs`).
-            ui.checkbox(&mut self.viewport_sync, "\u{26d3}  Sync Viewports");
-            ui.checkbox(&mut self.sync_layers, "\u{26d3}  Sync Layers");
+            // Plain-text labels, matching the Sync pill popover's — the two
+            // routes are one wording (the old `⛓` prefix read as a DNA
+            // helix; the second user test). This section stays as the
+            // popover's alternate access path, cross-shell parity included.
+            ui.checkbox(&mut self.viewport_sync, "Sync viewport");
+            ui.checkbox(&mut self.sync_layers, "Sync layers");
             // Per-pane, unlike the two layout-wide toggles above: off means
             // this pane is *frozen* — left out of the loop fan-out and of
             // `propagate_layer_sync`'s time pair. Written on the taken pane,
@@ -460,7 +460,7 @@ impl super::Gui {
             #[cfg(test)]
             let link_was = pane.time_link;
             let link = ui
-                .checkbox(&mut pane.time_link, "\u{26d3}  Follows shared time")
+                .checkbox(&mut pane.time_link, "Sync time - this pane")
                 // The pill popover's own sentence, shared so the two routes
                 // cannot describe unlinking differently — and careful about
                 // "frozen"; see `ui_pills::UNLINK_NOTE`.

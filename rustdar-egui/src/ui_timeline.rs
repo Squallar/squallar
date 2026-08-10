@@ -233,14 +233,17 @@ impl super::Gui {
             chrome
         };
 
-        let frame = egui::Frame::window(&ctx.global_style());
+        let frame = super::shell::chrome_frame(&ctx.global_style());
         // `min(880, full − 24)` is the **outer** width (§1.5); the phone's
         // inline form spans the full inset width on the same terms as the
         // bottom bar below it. Either way the frame's margins come out
         // before the content is sized, so the surface lands exactly on the
         // stated width — the status bar's own margin math.
+        // The phone's inline form sits flush on the bottom bar, full width —
+        // the 8pt gap and side insets died with the bar's own (the second
+        // user test's direction; the bar is full-bleed now).
         let (anchor_bottom, outer_width) = match phone_bar_top {
-            Some(bar_top) => (bar_top - CHIP_INSET, map_rect.width() - 2.0 * CHIP_INSET),
+            Some(bar_top) => (bar_top, map_rect.width()),
             None => (
                 map_rect.bottom() - BOTTOM_CLEARANCE,
                 (map_rect.width() - SIDE_INSET).min(MAX_OUTER_WIDTH),
@@ -332,7 +335,7 @@ impl super::Gui {
                 bottom - CHIP_INSET,
             ))
             .show(ctx, |ui| {
-                egui::Frame::window(&ctx.global_style()).show(ui, |ui| {
+                super::shell::chrome_frame(&ctx.global_style()).show(ui, |ui| {
                     super::fade::dim(ui, opacity);
                     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                     let (_, live) = self.chip_time_source();
@@ -394,7 +397,37 @@ impl super::Gui {
     /// right-to-left run first, then the navigation cluster takes what is left
     /// and hands every spare point to the scrubber. The left-hand run's scope
     /// carries an explicit id — see the module note on why.
+    ///
+    /// # The narrow form
+    ///
+    /// At phone widths the single row cannot hold everything — the second
+    /// user test's screenshot shows the run mangled into overlap — so when
+    /// the measured essentials do not fit ([`Self::timeline_row1_fits`]) the
+    /// row keeps the essentials only: the age chip is dropped (the demo's
+    /// narrow behaviour; the collapsed chip and status surfaces still age
+    /// the data) and the scrubber moves to its **own full-width row** below.
+    /// The scrubber renders under one explicit host id either way
+    /// ([`Self::render_timeline_scrubber_scope`]), so which row hosts it
+    /// never re-keys a drag in flight or the breakpoint id contract.
     fn render_timeline_row1(&mut self, ui: &mut egui::Ui, actions: &mut Vec<GuiAction>) {
+        // The trailing chips' texts, computed before layout so the narrow
+        // decision can measure the real galleys. Both read the shared time
+        // source, fallback included, so a non-map active pane ages and
+        // stamps the time actually shown.
+        let (source_time, source_live) = self.chip_time_source();
+        let age_text = source_time
+            .map(|collected| {
+                super::statusbar::format_product_age(chrono::Utc::now().naive_utc() - collected)
+            })
+            .unwrap_or_default();
+        let stamp_text = format!(
+            "{} - {}",
+            self.active_time_label(),
+            if source_live { "live" } else { "archive" }
+        );
+
+        let narrow = !self.timeline_row1_fits(ui, &stamp_text, &age_text);
+
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // First added is rightmost: ⏷ at the edge, then ..., the age
@@ -420,33 +453,21 @@ impl super::Gui {
                     self.timeline_row2 = !self.timeline_row2;
                 }
 
-                // The age chip and the timestamp are drawn even when there is
-                // nothing to say — placeholder text, not absence — so data
-                // arriving cannot change this run's widget count and re-key
-                // everything drawn after it (see the module note). Both read
-                // the shared time source, fallback included, so a non-map
-                // active pane ages and stamps the time actually shown.
-                let (source_time, source_live) = self.chip_time_source();
-                let age_text = source_time
-                    .map(|collected| {
-                        super::statusbar::format_product_age(
-                            chrono::Utc::now().naive_utc() - collected,
-                        )
-                    })
-                    .unwrap_or_default();
-                ui.label(egui::RichText::new(age_text.as_str()).small().weak());
+                // The age chip is drawn even when there is nothing to say —
+                // placeholder text, not absence — so data arriving cannot
+                // change this run's widget count and re-key everything drawn
+                // after it (see the module note). The narrow form drops it
+                // whole: an element the row cannot afford, not a data state.
+                if !narrow {
+                    ui.label(egui::RichText::new(age_text.as_str()).small().weak());
+                }
                 #[cfg(test)]
                 {
-                    self.last_timeline.age_text = age_text;
+                    self.last_timeline.age_text = if narrow { String::new() } else { age_text };
                 }
                 #[cfg(not(test))]
                 let _ = age_text;
 
-                let stamp_text = format!(
-                    "{} - {}",
-                    self.active_time_label(),
-                    if source_live { "live" } else { "archive" }
-                );
                 let stamp = ui
                     .button(stamp_text.as_str())
                     .on_hover_text("Set the time to view");
@@ -466,15 +487,74 @@ impl super::Gui {
                     .id(ui.id().with("timeline_nav"))
                     .layout(egui::Layout::left_to_right(egui::Align::Center));
                 ui.scope_builder(nav_scope, |ui| {
-                    self.render_timeline_nav(ui, actions);
+                    self.render_timeline_nav(ui, actions, !narrow);
                 });
             });
+        });
+
+        // The narrow form's own scrubber row: every spare point of the
+        // transport's width, under the same host id as the inline placement.
+        if narrow {
+            ui.horizontal(|ui| {
+                self.render_timeline_scrubber_scope(ui, actions);
+            });
+        }
+    }
+
+    /// Whether row 1's one-row form fits `avail`: the essentials, the two
+    /// trailing chips and a usable scrubber, measured from the real galleys
+    /// at the real style — the top bar's own device (`roomy_run_width`), so
+    /// no width constant can drift from the fonts. Deliberately generous on
+    /// the spacing side: the tie flips to the two-row form, which degrades
+    /// gracefully, where the one-row form overlaps.
+    fn timeline_row1_fits(&self, ui: &egui::Ui, stamp_text: &str, age_text: &str) -> bool {
+        let button_font = egui::TextStyle::Button.resolve(ui.style());
+        let small_font = egui::TextStyle::Small.resolve(ui.style());
+        let text = |font: &egui::FontId, s: &str| -> f32 {
+            ui.painter()
+                .layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::PLACEHOLDER)
+                .size()
+                .x
+        };
+        let pad = 2.0 * ui.spacing().button_padding.x;
+        let widths = [
+            text(&button_font, "\u{23fa} Live") + pad,
+            text(&button_font, "\u{23f4}") + pad,
+            text(&button_font, "\u{23f5}") + pad,
+            70.0 + pad, // the step combo's fixed width
+            text(&button_font, "\u{221e}") + pad,
+            60.0, // the scrubber's minimum useful rail
+            text(&button_font, stamp_text) + pad,
+            text(&small_font, age_text),
+            text(&button_font, "...") + pad,
+            text(&button_font, "\u{23f7}") + pad,
+        ];
+        let needed =
+            widths.iter().sum::<f32>() + ui.spacing().item_spacing.x * (widths.len() + 1) as f32;
+        ui.available_width() >= needed
+    }
+
+    /// The scrubber, under one explicit host id whichever row hosts it —
+    /// `UiBuilder::id` makes the scope's id independent of its parent, so
+    /// the wide form (inline in the nav cluster) and the narrow form (its
+    /// own row) key the slider identically and a mid-resize drag survives.
+    fn render_timeline_scrubber_scope(&mut self, ui: &mut egui::Ui, actions: &mut Vec<GuiAction>) {
+        let scope = egui::UiBuilder::new()
+            .id(egui::Id::new("timeline_scrubber_host"))
+            .layout(egui::Layout::left_to_right(egui::Align::Center));
+        ui.scope_builder(scope, |ui| {
+            self.render_timeline_scrubber(ui, actions);
         });
     }
 
     /// The navigation cluster: Live, back/forward, the step picker, the loop
-    /// toggle and the scrubber.
-    fn render_timeline_nav(&mut self, ui: &mut egui::Ui, actions: &mut Vec<GuiAction>) {
+    /// toggle and — in the roomy form — the scrubber.
+    fn render_timeline_nav(
+        &mut self,
+        ui: &mut egui::Ui,
+        actions: &mut Vec<GuiAction>,
+        with_scrubber: bool,
+    ) {
         let pane_idx = self.active_pane;
         let viewing_live = self.panes[pane_idx].viewing_live;
 
@@ -603,7 +683,9 @@ impl super::Gui {
             }
         }
 
-        self.render_timeline_scrubber(ui, actions);
+        if with_scrubber {
+            self.render_timeline_scrubber_scope(ui, actions);
+        }
     }
 
     /// The scrubber (plan §3.7) — one slider, two meanings.
@@ -967,8 +1049,7 @@ impl super::Gui {
         // hover (`ui_pills::UNLINK_NOTE`) spells the full claim out.
         let caption = format!(
             "Loops keep up to {} frames on this platform - a pane with \
-             \"Follows shared time\" off sits out the loop and shared \
-             navigation",
+             \"Sync time\" off sits out the loop and shared navigation",
             self.loop_frame_budget
         );
         ui.label(egui::RichText::new(caption.as_str()).small().weak());

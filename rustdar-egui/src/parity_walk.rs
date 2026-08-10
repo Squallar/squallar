@@ -212,15 +212,13 @@ fn walk_layer_controls(h: &mut InputHarness, width: WidthClass) {
              inventory itself is broken, not the chrome"
         );
         // The user's route: the stack row. Handles the drawer, the scroll to
-        // the row, and asserts the layer body's own arm drew.
+        // the row, and asserts the layer body's own arm drew. The master
+        // controls the tree filter excludes render as the crumb and the
+        // stack row's 👁 eye — the layer's one on/off since the Show
+        // toggle's de-dup (contract 86) — and the helper asserts the eye on
+        // the very row it clicks, so excluding them from the inventory
+        // cannot quietly orphan a layer's on/off.
         h.open_layer_in_inspector(handler);
-        // The master controls the tree filter excludes render as the crumb
-        // and the Show toggle — assert the toggle really drew, so excluding
-        // them from the inventory cannot quietly orphan a layer's on/off.
-        assert!(
-            h.inspector().master.is_some(),
-            "{handler:?}'s layer body drew no Show toggle on {width:?}"
-        );
         assert_control_tree(h, width, handler, &model);
     }
     // Leave nothing open over the next phase's clicks.

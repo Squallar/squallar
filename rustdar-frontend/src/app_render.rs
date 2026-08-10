@@ -1285,7 +1285,13 @@ impl super::App {
         }
     }
 
-    pub(super) fn present_frame(&mut self, size_in_pixels: [u32; 2]) {
+    /// Returns how soon egui asked to be painted again — the frame's
+    /// `repaint_delay`, which `handle_redraw` turns into an immediate
+    /// redraw or a scheduled wake (the second user test's animation fix;
+    /// see `PreparedFrame::repaint_delay`). Returned from every exit,
+    /// the skipped-surface ones included: the pass ended either way, and
+    /// an animation must not stall because one frame lost its surface.
+    pub(super) fn present_frame(&mut self, size_in_pixels: [u32; 2]) -> std::time::Duration {
         let state = self.state.as_mut().unwrap();
         let window = self.window.as_ref().unwrap();
 
@@ -1308,6 +1314,7 @@ impl super::App {
             },
             |finished| Self::get_surface_texture(&state.surface, finished),
         );
+        let repaint_delay = frame.repaint_delay();
 
         let surface_texture = match status {
             SurfaceStatus::Ready(texture) => texture,
@@ -1356,7 +1363,7 @@ impl super::App {
                     self.gui.clear_graphics_state();
                     self.state = None;
                 }
-                return;
+                return repaint_delay;
             }
         };
 
@@ -1371,6 +1378,7 @@ impl super::App {
         frame.submit(&state.queue, encoder);
         state.egui_renderer.free_textures(frame.textures_to_free());
         surface_texture.present();
+        repaint_delay
     }
 
     /// Poll for loop scan listing results. Populates the pane's frame list

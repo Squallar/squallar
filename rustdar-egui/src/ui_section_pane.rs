@@ -141,6 +141,7 @@ pub(super) fn render_cross_section(
     ui: &mut egui::Ui,
     pane: &mut PaneState,
     pane_rect: egui::Rect,
+    top_clearance: f32,
     horizontal_color_scale: bool,
     prefs: &UserPreferences,
 ) {
@@ -197,7 +198,12 @@ pub(super) fn render_cross_section(
         ),
     );
     let caption_height = caption.iter().map(|g| g.rect.height()).sum();
-    let layout = SectionLayout::new(pane_rect, caption_height, horizontal_color_scale);
+    let layout = SectionLayout::new(
+        pane_rect,
+        top_clearance,
+        caption_height,
+        horizontal_color_scale,
+    );
 
     painter.rect_filled(pane_rect, 0.0, ui.visuals().extreme_bg_color);
     painter.image(
@@ -490,13 +496,18 @@ impl SectionLayout {
     /// something read back afterwards: the colour bar is painted straight onto
     /// the pane rect by `render_color_scale`, so the plot has to leave room on
     /// whichever edge the bar took, or the bar lands on top of the section.
-    fn new(pane_rect: egui::Rect, caption_height: f32, horizontal_color_scale: bool) -> Self {
+    fn new(
+        pane_rect: egui::Rect,
+        top_clearance: f32,
+        caption_height: f32,
+        horizontal_color_scale: bool,
+    ) -> Self {
         let labelled_axes = pane_rect.height() >= LABELLED_AXES_MIN_HEIGHT;
         // Below the pane's pill row, not at the very corner: the row is an
         // egui layer over the pane, so a caption under it would be covered
         // and its ⓘ toggle unclickable (see `ui_pills::PILL_ROW_CLEARANCE`).
         let caption = egui::Rect::from_min_size(
-            pane_rect.min + egui::vec2(4.0, crate::ui::PILL_ROW_CLEARANCE),
+            pane_rect.min + egui::vec2(4.0, top_clearance),
             egui::vec2(
                 caption_wrap_width(pane_rect, horizontal_color_scale),
                 caption_height,

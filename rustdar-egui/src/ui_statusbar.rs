@@ -110,7 +110,7 @@ impl super::Gui {
         #[cfg(test)]
         let mut probe = super::StatusBarProbe::default();
 
-        let frame = egui::Frame::window(&ctx.global_style());
+        let frame = super::shell::chrome_frame(&ctx.global_style());
         let margin = frame.inner_margin;
         let inner_width = map_rect.width() - 2.0 * BAR_INSET - margin.sum().x;
 
