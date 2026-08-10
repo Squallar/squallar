@@ -1,0 +1,1136 @@
+use super::*;
+
+/// Only groups and flashes carry area coverage in the L2 LCFA product.
+#[test]
+fn only_group_and_flash_levels_declare_an_area_variable() {
+    assert_eq!(FLASH_VARS.area, Some("flash_area"));
+    assert_eq!(GROUP_VARS.area, Some("group_area"));
+    assert_eq!(
+        EVENT_VARS.area, None,
+        "the GLM L2 LCFA product has no `event_area` variable"
+    );
+}
+
+/// Every flash-level variable, so tests can omit "all of them".
+const FLASH_LEVEL_VARS: [&str; 5] = [
+    "flash_lat",
+    "flash_lon",
+    "flash_energy",
+    "flash_area",
+    "flash_time_offset_of_first_event",
+];
+
+/// The error a missing variable must produce, verbatim.
+fn absent_variable_error(name: &str) -> String {
+    format!("GLM file has no '{name}' variable (product schema change?)")
+}
+
+/// The error a short column must produce, verbatim.
+fn length_mismatch_error(name: &str, len: usize, reference: &str, count: usize) -> String {
+    format!("GLM variable length mismatch: '{name}' has {len} values but '{reference}' has {count}")
+}
+
+#[derive(Default)]
+struct Fixture<'a> {
+    /// Variables to leave out entirely, simulating a schema change.
+    omit: &'a [&'a str],
+    /// Variable to write against a deliberately shorter dimension,
+    /// simulating a corrupt or restructured file.
+    short: Option<&'a str>,
+}
+
+/// Build a minimal in-memory GLM-shaped NetCDF4 file: flashes carry an
+/// area variable, events deliberately do not (mirroring the real product).
+///
+/// Writes plain unpacked `f32` in canonical units: the subject here is
+/// *column presence*, not CF packing, which `glm::tests` covers against
+/// packed shorts. `units` is still declared — an undeclared unit is
+/// reported as unknown.
+fn synthetic_glm_file(spec: Fixture<'_>) -> Vec<u8> {
+    let mut file = hdf5_pure::FileBuilder::new();
+    file.set_attr(
+        "time_coverage_start",
+        hdf5_pure::AttrValue::String("2026-07-24T12:00:00.0Z".into()),
+    );
+
+    {
+        let mut put = |name: &str, values: &[f32]| {
+            if spec.omit.contains(&name) {
+                return;
+            }
+            // A "short" column is one element instead of two: the length
+            // *is* the data here, so there are no dimensions to mismatch.
+            let values = if spec.short == Some(name) {
+                &values[..1]
+            } else {
+                values
+            };
+            let var = file.create_dataset(name);
+            var.with_f32_data(values);
+            // Only the two unit-converted fields need a `units` attribute.
+            let units = match name {
+                n if n.ends_with("_area") => Some("km2"),
+                n if n.ends_with("_energy") => Some("J"),
+                _ => None,
+            };
+            if let Some(u) = units {
+                var.set_attr("units", hdf5_pure::AttrValue::String(u.into()));
+            }
+        };
+
+        put("flash_lat", &[35.0, 36.0]);
+        put("flash_lon", &[-97.0, -98.0]);
+        put("flash_energy", &[1.0e-14, 2.0e-14]);
+        put("flash_area", &[128.0, 256.0]);
+        put("flash_time_offset_of_first_event", &[1.0, 2.0]);
+
+        put("event_lat", &[35.5, 36.5]);
+        put("event_lon", &[-97.5, -98.5]);
+        put("event_energy", &[3.0e-15, 4.0e-15]);
+        put("event_time_offset", &[3.0, 4.0]);
+        // Note: no `event_area` — that is the point of the fixture.
+    }
+
+    file.finish().expect("write fixture")
+}
+
+/// Records only, for tests that do not care about level failures.
+fn parse_records(
+    bytes: &[u8],
+    satellite: GlmSatellite,
+    levels: &[GlmDataLevel],
+) -> Result<Vec<GlmFlash>, String> {
+    parse_glm_netcdf(bytes, satellite, levels).map(|p| p.records)
+}
+
+fn parse_flashes(bytes: &[u8]) -> Result<Vec<GlmFlash>, String> {
+    parse_glm_netcdf(bytes, GlmSatellite::GoesEast, &[GlmDataLevel::Flash]).map(|p| p.records)
+}
+
+#[test]
+fn flash_level_reports_area_and_event_level_reports_none() {
+    let bytes = synthetic_glm_file(Fixture::default());
+
+    let flashes = parse_flashes(&bytes).expect("parse flash level");
+    assert_eq!(flashes.len(), 2);
+    // Pins that the right column was read, in order, without pinning the
+    // fixture's own scale: area = [128, 256] has a ratio of exactly 2,
+    // which lat [35, 36] and lon [-97, -98] do not, and which a pure
+    // scaling preserves (`flash_area` has add_offset = 0 in the product).
+    // The `> 1.0` floor excludes the ~1e-14 energy column.
+    let areas: Vec<f32> = flashes
+        .iter()
+        .map(|f| f.area.expect("flash area"))
+        .collect();
+    assert!(
+        (areas[1] / areas[0] - 2.0).abs() < 1e-3,
+        "area column should track the file's values, got {areas:?}"
+    );
+    assert!(areas.iter().all(|a| *a > 1.0), "got {areas:?}");
+
+    let events = parse_records(&bytes, GlmSatellite::GoesEast, &[GlmDataLevel::Event])
+        .expect("parse event level");
+    assert_eq!(events.len(), 2);
+    // Fails if events fall back to Some(0.0), rendered as "Area: 0.0 km²".
+    assert!(
+        events.iter().all(|e| e.area.is_none()),
+        "events must not report a fabricated area"
+    );
+    // The rest of the event record must still parse.
+    assert!((events[0].lat - 35.5).abs() < 1e-4);
+    assert!((events[0].lon - (-97.5)).abs() < 1e-4);
+}
+
+/// A required variable disappearing from the product must fail the parse,
+/// not quietly yield zeros or an empty result set.
+///
+/// Verbatim, not `contains`: with the required-variable gate removed the
+/// downstream length check also errors, and its message interpolates both
+/// the offending name and `vars.lat`, so the two gates shadow each other.
+#[test]
+fn missing_required_variable_is_an_error_not_a_silent_default() {
+    for missing in [
+        "flash_lat",
+        "flash_lon",
+        "flash_energy",
+        "flash_time_offset_of_first_event",
+    ] {
+        let bytes = synthetic_glm_file(Fixture {
+            omit: &[missing],
+            ..Default::default()
+        });
+        let err = parse_flashes(&bytes).expect_err(
+            "a missing required variable must surface, not read back as an empty column",
+        );
+        assert_eq!(err, absent_variable_error(missing));
+    }
+}
+
+/// The case only the required-variable gate can catch: with every column
+/// equally absent there is no length mismatch to trip the downstream check.
+/// Fails if an absent variable reads back as an empty column, which parses
+/// cleanly into zero records — a blank map reported as success.
+#[test]
+fn a_whole_level_vanishing_is_an_error_not_zero_records() {
+    let bytes = synthetic_glm_file(Fixture {
+        omit: &FLASH_LEVEL_VARS,
+        ..Default::default()
+    });
+    let err = parse_flashes(&bytes)
+        .expect_err("an entirely absent level must not read as 'no lightning'");
+    assert_eq!(err, absent_variable_error("flash_lat"));
+}
+
+/// Only the time variable is omitted, so the other columns stay equally
+/// sized and no length mismatch can mask the gate. The verbatim assertion
+/// proves which gate fired.
+#[test]
+fn a_missing_time_variable_alone_is_an_error() {
+    let bytes = synthetic_glm_file(Fixture {
+        omit: &["flash_time_offset_of_first_event"],
+        ..Default::default()
+    });
+    let err = parse_flashes(&bytes).expect_err("absent time variable must surface");
+    assert_eq!(
+        err,
+        absent_variable_error("flash_time_offset_of_first_event")
+    );
+}
+
+/// Fails if energy falls back to 0.0, which the rasterizer turns into
+/// `0f32.log10()` = -inf and draws as a minimum-size bolt — total data loss
+/// that looks like a normal render.
+#[test]
+fn missing_energy_does_not_default_to_zero() {
+    let bytes = synthetic_glm_file(Fixture {
+        omit: &["flash_energy"],
+        ..Default::default()
+    });
+    let err = parse_flashes(&bytes).expect_err("absent energy must surface");
+    assert_eq!(err, absent_variable_error("flash_energy"));
+}
+
+/// A separate gate from the required-variable one: a *present but short*
+/// variable is corruption, and indexing past it would panic.
+#[test]
+fn a_short_required_column_is_rejected() {
+    for short in [
+        "flash_lon",
+        "flash_energy",
+        "flash_time_offset_of_first_event",
+    ] {
+        let bytes = synthetic_glm_file(Fixture {
+            short: Some(short),
+            ..Default::default()
+        });
+        let err =
+            parse_flashes(&bytes).expect_err("a short column must be rejected, not indexed past");
+        assert_eq!(err, length_mismatch_error(short, 1, "flash_lat", 2));
+    }
+}
+
+/// Every per-file error must survive the batch partition, in the right
+/// bucket. Fails if errors are discarded into a log line, which is what
+/// made a total parse failure read as "Updated 0s ago".
+#[test]
+fn batch_partition_keeps_every_error_and_separates_the_kinds() {
+    let outcome = BatchOutcome::from_results(vec![
+        Ok((
+            "a.nc".into(),
+            GranuleParse {
+                records: Vec::new(),
+                level_failures: Vec::new(),
+            },
+        )),
+        Err(FileError::Parse("b.nc: bad variable".into())),
+        Err(FileError::Transport("c.nc: HTTP status error: 503".into())),
+        Err(FileError::Parse("d.nc: bad variable".into())),
+    ]);
+    assert_eq!(outcome.entries.len(), 1);
+    assert_eq!(
+        outcome.parse_errors,
+        vec!["b.nc: bad variable", "d.nc: bad variable"]
+    );
+    assert_eq!(
+        outcome.transport_errors,
+        vec!["c.nc: HTTP status error: 503"],
+        "a 503 is a network problem and must never be counted as a parse failure"
+    );
+}
+
+/// A schema change hits every granule in the window identically, so the
+/// same broken level in twenty files is one report — but two *different*
+/// broken levels are two, and collapsing them would hide a layer.
+#[test]
+fn batch_partition_dedups_level_failures_per_level_not_per_file() {
+    let both_broken = || {
+        vec![
+            level_failure(GlmSatellite::GoesEast, GlmDataLevel::Flash),
+            level_failure(GlmSatellite::GoesEast, GlmDataLevel::Group),
+        ]
+    };
+    let outcome = BatchOutcome::from_results(vec![
+        Ok((
+            "a.nc".into(),
+            GranuleParse {
+                records: Vec::new(),
+                level_failures: both_broken(),
+            },
+        )),
+        Ok((
+            "b.nc".into(),
+            GranuleParse {
+                records: Vec::new(),
+                level_failures: both_broken(),
+            },
+        )),
+        Ok((
+            "c.nc".into(),
+            GranuleParse {
+                records: Vec::new(),
+                level_failures: both_broken(),
+            },
+        )),
+    ]);
+
+    assert_eq!(
+        outcome.level_failures.len(),
+        2,
+        "three files reporting the same two broken levels is two reports, got {:?}",
+        outcome.level_failures,
+    );
+    for level in [GlmDataLevel::Flash, GlmDataLevel::Group] {
+        assert!(
+            outcome.level_failures.iter().any(|f| f.level == level),
+            "{level:?} must survive dedup, got {:?}",
+            outcome.level_failures,
+        );
+    }
+}
+
+/// Fails if the accumulator drops any bucket — invisible from the async
+/// fetch that calls it.
+#[test]
+fn the_accumulator_forwards_every_bucket() {
+    let mut acc = PollAccumulator::default();
+    acc.absorb(
+        GlmSatellite::GoesWest,
+        &[GlmDataLevel::Group, GlmDataLevel::Flash],
+        BatchOutcome {
+            entries: vec![("a.nc".into(), Vec::new())],
+            parse_errors: vec!["p".into()],
+            transport_errors: vec!["t".into()],
+            level_failures: vec![level_failure(GlmSatellite::GoesWest, GlmDataLevel::Flash)],
+        },
+    );
+
+    assert_eq!(acc.entries.len(), 1);
+    assert_eq!(acc.parse_errors, vec!["p"]);
+    assert_eq!(acc.transport_errors, vec!["t"]);
+    assert_eq!(
+        acc.level_failures.len(),
+        1,
+        "the level bucket must not be dropped"
+    );
+    assert_eq!(
+        acc.evaluated_levels,
+        vec![
+            (GlmSatellite::GoesWest, GlmDataLevel::Group),
+            (GlmSatellite::GoesWest, GlmDataLevel::Flash),
+        ],
+        "a granule that parsed is evidence about every level it was asked for"
+    );
+}
+
+/// ...but only a granule that actually parsed is evidence: treating a batch
+/// where every file failed as evidence announces a recovery on an outage.
+#[test]
+fn a_batch_that_parsed_nothing_is_not_evidence() {
+    let mut acc = PollAccumulator::default();
+    acc.absorb(
+        GlmSatellite::GoesEast,
+        &[GlmDataLevel::Flash],
+        BatchOutcome {
+            entries: Vec::new(),
+            parse_errors: vec!["every file failed".into()],
+            transport_errors: Vec::new(),
+            level_failures: Vec::new(),
+        },
+    );
+    assert!(
+        acc.evaluated_levels.is_empty(),
+        "a batch with no successful parse cannot vouch for any level"
+    );
+}
+
+/// The failure denominator counts the whole window, not this poll's
+/// downloads. Fails if the two are conflated, which makes one corrupt
+/// granule read as "1/1 — everything failed" after a few ticks.
+#[test]
+fn poll_plan_separates_window_size_from_work_to_do() {
+    let keys: Vec<String> = (0..12).map(|i| format!("k{i}.nc")).collect();
+
+    // Empty granules: the steady state a quiet sky produces, which must
+    // read as "already downloaded".
+    let mut cache = GlmCache::default();
+    for key in keys.iter().take(9) {
+        cache.insert(key.clone(), t0(), Vec::new());
+    }
+
+    let mut tally = PollTally::default();
+    let new_keys = plan_downloads(&keys, &cache, &mut tally);
+    assert_eq!(
+        tally.in_window, 12,
+        "the window still contains every listed file, cached or not"
+    );
+    assert_eq!(new_keys.len(), 3, "only the uncached ones need downloading");
+
+    // The tally accumulates across satellites rather than being overwritten.
+    let other: Vec<String> = (0..4).map(|i| format!("w{i}.nc")).collect();
+    plan_downloads(&other, &GlmCache::default(), &mut tally);
+    assert_eq!(tally.in_window, 16);
+
+    // The pathological steady state: everything cached but one straggler,
+    // which is what a 20 s poll against 20 s granules looks like.
+    let mut cache = GlmCache::default();
+    for key in keys.iter().take(11) {
+        cache.insert(key.clone(), t0(), Vec::new());
+    }
+    let mut tally = PollTally::default();
+    let new_keys = plan_downloads(&keys, &cache, &mut tally);
+    assert_eq!(new_keys.len(), 1);
+    let report =
+        summarize_failures(tally.in_window, vec!["k11.nc: boom".into()]).expect("one failure");
+    assert!(
+        !report.is_total(),
+        "one straggler failing must never read as a total outage, got {report:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Retention: `GlmCache::evict_before` and `flashes_in_window`. Every way
+// of getting these wrong renders identically — a quiet sky.
+// ---------------------------------------------------------------------
+
+/// An arbitrary but fixed instant to hang the retention tests off, so they
+/// never consult the wall clock.
+fn t0() -> NaiveDateTime {
+    chrono::NaiveDate::from_ymd_opt(2026, 7, 24)
+        .unwrap()
+        .and_hms_opt(12, 0, 0)
+        .unwrap()
+}
+
+/// A wall clock that shares no instant with any fixture S3 key.
+///
+/// `t0()` is 2026-07-24 = day of year 205, the same day the
+/// `..._s2026205....nc` fixture keys encode, so passing it as `now` makes
+/// "dated from the key" and "dated from the wall clock" indistinguishable.
+/// Any fixture feeding a `now` alongside a real key must use this.
+fn wall_clock_unlike_keys() -> NaiveDateTime {
+    t0() + TimeDelta::hours(3) + TimeDelta::minutes(7)
+}
+
+/// A flash whose only interesting property is when it happened.
+fn flash_at(time: NaiveDateTime) -> GlmFlash {
+    GlmFlash {
+        lat: 38.967,
+        lon: -82.1,
+        energy: Some(1.0e-14),
+        area: Some(278.65),
+        time,
+        satellite: GlmSatellite::GoesEast,
+        level: GlmDataLevel::Flash,
+    }
+}
+
+/// Cache keys sorted, so assertions on "what is left" are order-stable.
+fn cached_keys(cache: &GlmCache) -> Vec<String> {
+    let mut keys: Vec<String> = cache.entries.keys().cloned().collect();
+    keys.sort();
+    keys
+}
+
+/// Cache a granule that parsed to at least one record, dating it the way S3
+/// does: a granule is keyed by the *start* of the ~20 s span it covers, so
+/// its records land at or after that instant.
+///
+/// A granule with no records has no start to derive, so those fixtures must
+/// state one explicitly through [`GlmCache::insert`].
+fn cache_granule(cache: &mut GlmCache, key: &str, flashes: Vec<GlmFlash>) {
+    let start = flashes
+        .iter()
+        .map(|f| f.time)
+        .min()
+        .expect("use GlmCache::insert directly for a granule that parsed to nothing");
+    cache.insert(key.to_string(), start, flashes);
+}
+
+/// `cutoff` is *inclusive*: a granule whose newest flash lands exactly on
+/// the edge would otherwise be evicted and immediately re-downloaded.
+///
+/// The tick either side is one millisecond because GLM times unpack through
+/// a `0.0003814756 s` scale factor — sub-second is the real resolution here,
+/// not a contrived epsilon.
+#[test]
+fn evict_before_keeps_a_granule_sitting_exactly_on_the_cutoff() {
+    let cutoff = t0();
+    let mut cache = GlmCache::default();
+    cache_granule(&mut cache, "exactly_at.nc", vec![flash_at(cutoff)]);
+    cache_granule(
+        &mut cache,
+        "one_tick_before.nc",
+        vec![flash_at(cutoff - TimeDelta::milliseconds(1))],
+    );
+    cache_granule(
+        &mut cache,
+        "one_tick_after.nc",
+        vec![flash_at(cutoff + TimeDelta::milliseconds(1))],
+    );
+
+    cache.evict_before(cutoff);
+
+    assert_eq!(
+        cached_keys(&cache),
+        vec!["exactly_at.nc".to_string(), "one_tick_after.nc".to_string()],
+        "the cutoff is inclusive: only the granule strictly before it goes"
+    );
+}
+
+/// Eviction is per *granule*, not per flash. A granule spans ~20 s, so the
+/// newest-but-one file straddles the cutoff on essentially every poll;
+/// tightening this to "all flashes in window" evicts and re-downloads a
+/// live file every tick.
+#[test]
+fn evict_before_keeps_a_granule_that_straddles_the_cutoff() {
+    let cutoff = t0();
+    let stale = cutoff - TimeDelta::seconds(10);
+    let fresh = cutoff + TimeDelta::seconds(10);
+
+    let mut cache = GlmCache::default();
+    cache_granule(
+        &mut cache,
+        "straddles.nc",
+        vec![flash_at(stale), flash_at(fresh)],
+    );
+
+    cache.evict_before(cutoff);
+
+    assert_eq!(cached_keys(&cache), vec!["straddles.nc".to_string()]);
+    let times: Vec<NaiveDateTime> = cache.all_flashes().map(|f| f.time).collect();
+    assert_eq!(
+        times.len(),
+        2,
+        "the granule is kept intact; trimming individual flashes here would \
+             mean re-downloading the file to get them back, and is not this \
+             stage's job"
+    );
+    assert!(times.contains(&stale) && times.contains(&fresh));
+}
+
+/// The two ends of the range, and the degenerate case in between. A no-op
+/// eviction grows the cache without bound; a clear-everything eviction
+/// re-downloads the whole window every poll.
+#[test]
+fn evict_before_handles_an_empty_cache_and_both_extremes() {
+    // Empty cache: must not panic, must stay empty.
+    let mut empty = GlmCache::default();
+    empty.evict_before(t0());
+    assert_eq!(empty.all_flashes().count(), 0);
+    assert!(cached_keys(&empty).is_empty());
+
+    // Everything is stale.
+    let mut cache = GlmCache::default();
+    for i in 1..=3 {
+        cache_granule(
+            &mut cache,
+            &format!("old{i}.nc"),
+            vec![flash_at(t0() - TimeDelta::minutes(i))],
+        );
+    }
+    cache.evict_before(t0());
+    assert!(
+        cached_keys(&cache).is_empty(),
+        "an eviction that keeps stale granules is a cache that grows forever"
+    );
+
+    // Nothing is stale.
+    let mut cache = GlmCache::default();
+    for i in 1..=3 {
+        cache_granule(
+            &mut cache,
+            &format!("new{i}.nc"),
+            vec![flash_at(t0() + TimeDelta::minutes(i))],
+        );
+    }
+    cache.evict_before(t0());
+    assert_eq!(
+        cached_keys(&cache).len(),
+        3,
+        "an eviction that clears live granules re-downloads the whole window \
+             every poll"
+    );
+}
+
+/// A granule that parsed to *zero* records is aged by its own start time.
+///
+/// Fails if eviction goes back to a predicate over the flashes, which
+/// evicts every empty granule immediately: at the 30-minute maximum window
+/// that re-fetched roughly 90 granules × ~250 KB ≈ 22 MB every 20 s.
+#[test]
+fn evict_before_ages_an_empty_granule_by_its_own_start_time() {
+    let start = t0();
+    let mut cache = GlmCache::default();
+    cache.insert("quiet.nc".into(), start, Vec::new());
+
+    // A cutoff far behind the granule: an empty granule inside the window
+    // is downloaded data, and must survive exactly like a populated one.
+    cache.evict_before(start - TimeDelta::days(365));
+    assert!(
+        cache.contains_key("quiet.nc"),
+        "an empty parse is a successful download; evicting it here is what \
+             re-fetched the whole listing window every poll"
+    );
+
+    // ...and it is not immortal either: past its own start it goes, on the
+    // same schedule a populated granule would.
+    cache.evict_before(start + TimeDelta::milliseconds(1));
+    assert!(
+        !cache.contains_key("quiet.nc"),
+        "an empty granule that never expires is the opposite bug: a cache \
+             that grows without bound"
+    );
+}
+
+/// An empty granule ages out on *exactly* the same schedule as a populated
+/// one covering the same instant — retention must not be bought by making
+/// quiet granules special.
+#[test]
+fn an_empty_granule_ages_out_on_the_same_schedule_as_a_populated_one() {
+    let start = t0();
+    let tick = TimeDelta::milliseconds(1);
+
+    for cutoff in [start - tick, start, start + tick] {
+        let mut cache = GlmCache::default();
+        cache.insert("quiet.nc".into(), start, Vec::new());
+        cache_granule(&mut cache, "busy.nc", vec![flash_at(start)]);
+
+        cache.evict_before(cutoff);
+
+        assert_eq!(
+            cache.contains_key("quiet.nc"),
+            cache.contains_key("busy.nc"),
+            "at cutoff {cutoff} the empty granule and the populated one that \
+                 covers the same instant disagreed: quiet={}, busy={}",
+            cache.contains_key("quiet.nc"),
+            cache.contains_key("busy.nc"),
+        );
+    }
+}
+
+/// End to end: cache → evict → plan. Both halves are needed — eviction is
+/// what drops the entry and `plan_downloads` is what re-queues it — so
+/// pinning either alone leaves the re-fetch loop reachable.
+#[test]
+fn a_quiet_granule_is_downloaded_once_not_once_per_poll() {
+    // A real GLM key, so the granule is dated the way production dates it.
+    let key = "GLM-L2-LCFA/2026/205/12/\
+                   OR_GLM-L2-LCFA_G19_s20262051200000_e20262051200200_c20262051200214.nc";
+    let start = parse_filename_start_time(key).expect("fixture key must be datable");
+    let listing = vec![key.to_string()];
+
+    // Poll 1: nothing cached, so it is queued and downloaded. It parses to
+    // no records — a quiet 20 s over the ocean.
+    let mut cache = GlmCache::default();
+    let mut tally = PollTally::default();
+    assert_eq!(
+        plan_downloads(&listing, &cache, &mut tally).len(),
+        1,
+        "an uncached granule must be downloaded once"
+    );
+    // `now` is nowhere near the key's own time — see
+    // `wall_clock_unlike_keys`.
+    cache.insert(
+        key.to_string(),
+        granule_start_of(key, wall_clock_unlike_keys()),
+        Vec::new(),
+    );
+
+    // Polls 2..n, still inside the window: the listing keeps offering it and
+    // the cache must keep answering "already have it" (~250 KB per miss).
+    for poll in 1..=5 {
+        let cutoff = start - TimeDelta::minutes(30) + TimeDelta::seconds(20 * poll);
+        cache.evict_before(cutoff);
+        let mut tally = PollTally::default();
+        assert!(
+            plan_downloads(&listing, &cache, &mut tally).is_empty(),
+            "poll {poll}: a granule already downloaded and found empty was \
+                 re-queued — this is the every-poll re-fetch, back"
+        );
+        assert_eq!(
+            tally.in_window, 1,
+            "it is still in the window, just not new work"
+        );
+    }
+
+    // Past the cutoff it leaves, like any other granule. It is out of the
+    // listing by then too, so nothing re-queues it.
+    cache.evict_before(start + TimeDelta::milliseconds(1));
+    assert!(
+        !cache.contains_key(key),
+        "a stale empty granule must be evicted, or the cache never shrinks"
+    );
+}
+
+/// Every granule a poll parsed reaches the cache, empty ones included:
+/// dropping them here makes `plan_downloads` re-queue them every poll.
+#[test]
+fn cache_granules_keeps_the_empty_ones_too() {
+    let busy = "GLM-L2-LCFA/2026/205/12/\
+                    OR_GLM-L2-LCFA_G19_s20262051200000_e20262051200200_c20262051200214.nc";
+    let quiet = "GLM-L2-LCFA/2026/205/12/\
+                     OR_GLM-L2-LCFA_G19_s20262051200200_e20262051200400_c20262051200414.nc";
+    // Not `t0()`: see `wall_clock_unlike_keys`.
+    let now = wall_clock_unlike_keys();
+
+    let mut cache = GlmCache::default();
+    cache_granules(
+        &mut cache,
+        vec![
+            (busy.to_string(), vec![flash_at(t0())]),
+            (quiet.to_string(), Vec::new()),
+        ],
+        now,
+    );
+
+    assert!(cache.contains_key(busy));
+    assert!(
+        cache.contains_key(quiet),
+        "a granule that downloaded and parsed to nothing is still downloaded"
+    );
+
+    // And it is dated from its key, not from `now`.
+    cache.evict_before(
+        parse_filename_start_time(quiet).expect("fixture key") + TimeDelta::milliseconds(1),
+    );
+    assert!(
+        !cache.contains_key(quiet),
+        "the empty granule ages by its own start time"
+    );
+}
+
+/// The fallback in [`granule_start_of`] is unreachable for anything a poll
+/// listed, and must stay bounded rather than become either bug it replaced.
+#[test]
+fn granule_start_comes_from_the_key_and_falls_back_to_now() {
+    // Not `t0()`: see `wall_clock_unlike_keys`.
+    let now = wall_clock_unlike_keys();
+    let key = "GLM-L2-LCFA/2026/205/12/\
+                   OR_GLM-L2-LCFA_G19_s20262051200000_e20262051200200_c20262051200214.nc";
+    assert_eq!(
+        granule_start_of(key, now),
+        chrono::NaiveDate::from_yo_opt(2026, 205)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap(),
+        "a listed key carries its own start time; `now` must not be reached"
+    );
+
+    assert_eq!(
+        granule_start_of("not-a-glm-key.nc", now),
+        now,
+        "an undatable granule expires one window from now — never instantly \
+             (re-fetched every poll) and never not at all (unbounded cache)"
+    );
+}
+
+/// Both window bounds are inclusive and both are load-bearing: losing the
+/// lower one shows hours-old bolts inside a retained granule, losing the
+/// upper one publishes flashes stamped after the poll's own instant.
+#[test]
+fn the_window_filter_includes_both_bounds() {
+    let cutoff = t0();
+    let now = cutoff + TimeDelta::minutes(5);
+    let tick = TimeDelta::milliseconds(1);
+
+    let mut cache = GlmCache::default();
+    cache_granule(
+        &mut cache,
+        "spread.nc",
+        vec![
+            flash_at(cutoff - tick),
+            flash_at(cutoff),
+            flash_at(cutoff + TimeDelta::minutes(2)),
+            flash_at(now),
+            flash_at(now + tick),
+        ],
+    );
+
+    let mut got: Vec<NaiveDateTime> =
+        flashes_in_window(&cache, &[GlmSatellite::GoesEast], cutoff, now)
+            .into_iter()
+            .map(|f| f.time)
+            .collect();
+    got.sort();
+
+    assert_eq!(
+        got,
+        vec![cutoff, cutoff + TimeDelta::minutes(2), now],
+        "both ends are inclusive and nothing outside them survives"
+    );
+}
+
+/// A flash from the other bird, for the satellite-selection tests.
+fn west_flash_at(time: NaiveDateTime) -> GlmFlash {
+    GlmFlash {
+        satellite: GlmSatellite::GoesWest,
+        ..flash_at(time)
+    }
+}
+
+/// "Both" → "East" must stop GOES-West's cached flashes rendering *now*,
+/// not once they age out of the (up to 30-minute) window — and must not
+/// cost the cache: re-selecting West restores its flashes instantly, with
+/// no re-download.
+#[test]
+fn deselecting_a_satellite_hides_its_cached_flashes_without_evicting_them() {
+    let cutoff = t0();
+    let now = cutoff + TimeDelta::minutes(5);
+    let t = cutoff + TimeDelta::minutes(2);
+
+    let mut cache = GlmCache::default();
+    cache_granule(&mut cache, "east.nc", vec![flash_at(t)]);
+    cache_granule(&mut cache, "west.nc", vec![west_flash_at(t)]);
+
+    // Control: with both selected, both birds render.
+    let both = [GlmSatellite::GoesEast, GlmSatellite::GoesWest];
+    assert_eq!(flashes_in_window(&cache, &both, cutoff, now).len(), 2);
+
+    // "Both" → "East": the in-window West flash disappears from the poll.
+    let east_only = flashes_in_window(&cache, &[GlmSatellite::GoesEast], cutoff, now);
+    assert!(
+        east_only
+            .iter()
+            .all(|f| f.satellite == GlmSatellite::GoesEast),
+        "a deselected bird's cached flashes must not render"
+    );
+    assert_eq!(east_only.len(), 1, "the East flash still renders");
+
+    // ...but the West granule was hidden, not evicted: re-selection needs
+    // nothing from the network.
+    assert!(
+        cache.contains_key("west.nc"),
+        "deselection filters the poll output; evicting here would make \
+             re-selection re-download the whole window"
+    );
+    assert_eq!(
+        flashes_in_window(&cache, &both, cutoff, now).len(),
+        2,
+        "re-selecting the bird restores its flashes straight from cache"
+    );
+}
+
+/// An NTP step backwards (or a resume with a stale RTC) puts `now` behind
+/// flashes already cached. They must be hidden from the poll and nothing
+/// more — still cached, so they reappear without a re-download when the
+/// clock recovers.
+#[test]
+fn a_backwards_clock_hides_flashes_without_losing_them() {
+    let window = TimeDelta::minutes(5);
+    let ahead = t0() + TimeDelta::minutes(3);
+
+    let mut cache = GlmCache::default();
+    cache_granule(
+        &mut cache,
+        "granule.nc",
+        vec![flash_at(t0()), flash_at(ahead)],
+    );
+
+    // The clock steps back: `now` lands between the two cached flashes.
+    let now = t0() + TimeDelta::minutes(1);
+    let cutoff = now - window;
+    cache.evict_before(cutoff);
+
+    assert!(
+        cache.contains_key("granule.nc"),
+        "a backwards clock must not evict data it has not caught up to yet"
+    );
+    let during: Vec<NaiveDateTime> =
+        flashes_in_window(&cache, &[GlmSatellite::GoesEast], cutoff, now)
+            .into_iter()
+            .map(|f| f.time)
+            .collect();
+    assert_eq!(
+        during,
+        vec![t0()],
+        "the flash stamped after `now` is withheld, not published"
+    );
+
+    // The clock catches up. Nothing had to be fetched again.
+    let now = ahead + TimeDelta::minutes(1);
+    let cutoff = now - window;
+    cache.evict_before(cutoff);
+    let mut after: Vec<NaiveDateTime> =
+        flashes_in_window(&cache, &[GlmSatellite::GoesEast], cutoff, now)
+            .into_iter()
+            .map(|f| f.time)
+            .collect();
+    after.sort();
+    assert_eq!(
+        after,
+        vec![t0(), ahead],
+        "both flashes were held in the cache the whole time"
+    );
+}
+
+fn level_failure(satellite: GlmSatellite, level: GlmDataLevel) -> LevelFailure {
+    LevelFailure {
+        satellite,
+        level,
+        sample_error: format!("{level:?} broke"),
+    }
+}
+
+/// Every bucket must land in its own field: swapping two makes every 503
+/// read as "product change?", dropping the level bucket makes a broken
+/// layer silent.
+#[test]
+fn build_outcome_binds_each_bucket_to_its_own_field() {
+    let tally = PollTally { in_window: 12 };
+    let acc = PollAccumulator {
+        parse_errors: vec!["a.nc: GLM file has no 'flash_lat' variable".into()],
+        transport_errors: vec!["b.nc: HTTP status error: 503".into()],
+        level_failures: vec![level_failure(GlmSatellite::GoesWest, GlmDataLevel::Flash)],
+        // A *superset* of the failures: Group was evaluated and found
+        // healthy. Identical sets would let `evaluated_levels` be derived
+        // from `level_failures`, giving a layer that can never clear.
+        evaluated_levels: vec![
+            (GlmSatellite::GoesWest, GlmDataLevel::Flash),
+            (GlmSatellite::GoesWest, GlmDataLevel::Group),
+        ],
+        ..Default::default()
+    };
+    let outcome = build_outcome(
+        Vec::new(),
+        Vec::new(),
+        vec![GlmSatellite::GoesEast],
+        &tally,
+        acc,
+    );
+
+    assert_eq!(
+        outcome.parse_failures.expect("parse failures").sample_error,
+        "a.nc: GLM file has no 'flash_lat' variable",
+    );
+    assert_eq!(
+        outcome
+            .transport_failures
+            .expect("transport failures")
+            .sample_error,
+        "b.nc: HTTP status error: 503",
+    );
+    assert_eq!(outcome.queried, vec![GlmSatellite::GoesEast]);
+
+    // Carried through untouched: not summarised into a file count.
+    assert_eq!(
+        outcome.level_failures,
+        vec![level_failure(GlmSatellite::GoesWest, GlmDataLevel::Flash)],
+    );
+    assert_eq!(
+        outcome.evaluated_levels,
+        vec![
+            (GlmSatellite::GoesWest, GlmDataLevel::Flash),
+            (GlmSatellite::GoesWest, GlmDataLevel::Group),
+        ],
+        "the evidence set must survive independently of the failures, or \
+             every quiet poll reads as a recovery"
+    );
+}
+
+/// A level failure is not a file failure. Routing it through
+/// `summarize_failures` would announce "N/M files failed to parse" while the
+/// other layers are still drawing.
+#[test]
+fn build_outcome_keeps_level_failures_out_of_the_file_counts() {
+    let tally = PollTally { in_window: 9 };
+    let acc = PollAccumulator {
+        level_failures: vec![level_failure(GlmSatellite::GoesEast, GlmDataLevel::Group)],
+        ..Default::default()
+    };
+    let outcome = build_outcome(Vec::new(), Vec::new(), Vec::new(), &tally, acc);
+
+    assert!(outcome.parse_failures.is_none(), "no *file* failed");
+    assert!(outcome.transport_failures.is_none());
+    assert_eq!(outcome.level_failures.len(), 1);
+}
+
+/// Both kinds share the window as their denominator, and an empty bucket
+/// stays `None` rather than reporting a zero-failure failure.
+#[test]
+fn build_outcome_leaves_an_empty_bucket_unreported() {
+    let tally = PollTally { in_window: 14 };
+    let acc = PollAccumulator {
+        parse_errors: vec!["a.nc: boom".into()],
+        ..Default::default()
+    };
+    let outcome = build_outcome(Vec::new(), Vec::new(), Vec::new(), &tally, acc);
+
+    assert_eq!(
+        outcome.parse_failures.expect("parse failures").in_window,
+        14
+    );
+    assert!(
+        outcome.transport_failures.is_none(),
+        "nothing failed to download, so there is nothing to report"
+    );
+}
+
+/// Bytes that arrived but are not the product are a *parse* failure. Tagging
+/// them Transport would point the user at their network for a product
+/// problem.
+#[test]
+fn garbage_bytes_are_a_parse_failure_not_a_transport_failure() {
+    let err = parse_downloaded_file(
+        b"this is not a netcdf file",
+        GlmSatellite::GoesEast,
+        &[GlmDataLevel::Flash],
+    )
+    .expect_err("garbage must not parse");
+
+    assert!(
+        matches!(err, FileError::Parse(_)),
+        "expected a parse failure, got {err:?}"
+    );
+}
+
+/// A valid granule still parses through the classified wrapper.
+#[test]
+fn a_good_granule_parses_through_the_classified_stage() {
+    let bytes = synthetic_glm_file(Fixture::default());
+    let flashes = parse_downloaded_file(&bytes, GlmSatellite::GoesEast, &[GlmDataLevel::Flash])
+        .expect("fixture should parse");
+    assert_eq!(flashes.records.len(), 2);
+    assert!(flashes.level_failures.is_empty());
+}
+
+/// A download that never lands is a *transport* failure, all the way out
+/// through `download_and_parse_one`.
+///
+/// Hermetic: loopback port 1 (`tcpmux`) is not listening, so the connection
+/// is refused immediately.
+#[test]
+fn an_unreachable_host_is_a_transport_failure() {
+    // `reqwest` is pinned to `rustls-no-provider`, so `build()` panics with
+    // "No provider set" unless a crypto provider is installed first.
+    // `tls::client` is not used because it sets `https_only`, and the
+    // cleartext loopback URL below is the point of the test.
+    rustdar_radar::tls::init();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .expect("client");
+
+    let err = runtime
+        .block_on(download_and_parse_one(
+            &client,
+            "http://127.0.0.1:1/nonexistent.nc",
+            GlmSatellite::GoesEast,
+            &[GlmDataLevel::Flash],
+        ))
+        .expect_err("nothing listens on loopback port 1");
+
+    assert!(
+        matches!(err, FileError::Transport(_)),
+        "a refused connection must not be reported as a product problem, got {err:?}"
+    );
+}
+
+#[test]
+fn summarize_failures_reports_none_when_everything_worked() {
+    assert!(summarize_failures(12, Vec::new()).is_none());
+}
+
+/// The total/partial distinction drives both the log severity and the panel
+/// wording.
+#[test]
+fn summarize_failures_distinguishes_total_from_partial() {
+    let partial = summarize_failures(12, vec!["a".into(), "b".into()]).expect("failures present");
+    assert_eq!((partial.failed, partial.in_window), (2, 12));
+    assert!(!partial.is_total());
+    assert_eq!(
+        partial.sample_error, "a",
+        "should keep the first error as the sample"
+    );
+
+    let total =
+        summarize_failures(3, vec!["a".into(), "b".into(), "c".into()]).expect("failures present");
+    assert!(total.is_total(), "every file in the window failed");
+}
+
+fn all_failed(in_window: usize) -> FetchFailures {
+    let errors: Vec<String> = (0..in_window).map(|i| format!("f{i}: boom")).collect();
+    summarize_failures(in_window, errors).expect("failures present")
+}
+
+/// The floor, asserted against literals rather than
+/// `MIN_FILES_FOR_TOTAL_VERDICT`: a loop over `1..CONST` is empty when the
+/// constant is 1 and passes vacuously.
+#[test]
+fn total_verdict_needs_more_than_one_file() {
+    assert!(
+        !all_failed(1).is_total(),
+        "a single-file window is too small a sample to call systematic"
+    );
+    assert!(
+        all_failed(2).is_total(),
+        "two files is the smallest honest verdict, and is what a 60 s window holds"
+    );
+    assert!(all_failed(3).is_total());
+    assert!(all_failed(14).is_total(), "the default 300 s window");
+}
+
+/// The floor must not swallow the case it exists for: one bad granule among
+/// several is partial, at every window size.
+#[test]
+fn one_bad_granule_is_never_a_total_failure() {
+    for in_window in [2usize, 5, 14, 89] {
+        let report =
+            summarize_failures(in_window, vec!["f0: boom".into()]).expect("failures present");
+        assert!(
+            !report.is_total(),
+            "1 of {in_window} failing is a bad granule, not a product change"
+        );
+    }
+}
+
+/// A short *optional* column degrades instead of failing the file, and must
+/// not hand back a half-length area column.
+#[test]
+fn a_short_area_column_degrades_to_no_area() {
+    let bytes = synthetic_glm_file(Fixture {
+        short: Some("flash_area"),
+        ..Default::default()
+    });
+    let flashes = parse_flashes(&bytes).expect("a short area must not fail the file");
+    assert_eq!(flashes.len(), 2);
+    assert!(flashes.iter().all(|f| f.area.is_none()));
+}
+
+/// Losing the one optional column degrades the popup, not the whole overlay.
+#[test]
+fn missing_optional_area_degrades_without_failing_the_file() {
+    let bytes = synthetic_glm_file(Fixture {
+        omit: &["flash_area"],
+        ..Default::default()
+    });
+    let flashes = parse_flashes(&bytes).expect("a missing area must not blank the whole overlay");
+    assert_eq!(flashes.len(), 2);
+    assert!(flashes.iter().all(|f| f.area.is_none()));
+    // Position and energy are untouched.
+    assert!((flashes[0].lat - 35.0).abs() < 1e-4);
+    assert!(flashes[0].energy.is_some_and(|e| e > 0.0));
+}
