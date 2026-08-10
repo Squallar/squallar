@@ -12,6 +12,7 @@ pub mod kdp;
 pub(crate) mod l3_values;
 pub mod level3;
 pub mod nrot;
+pub mod nyquist;
 mod palette;
 pub(crate) mod par;
 pub mod render;
