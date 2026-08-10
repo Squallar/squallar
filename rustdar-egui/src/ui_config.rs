@@ -21,6 +21,11 @@ use crate::ui_layout::WidthClass;
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 struct PaneConfig {
+    /// Tolerant of product names this build does not know: a config written by
+    /// a later version must not poison the whole load (see
+    /// [`product_or_default`]). The pane falls back to Reflectivity — the same
+    /// product a fresh pane starts on — and the rest of the file survives.
+    #[serde(deserialize_with = "product_or_default")]
     selected_product: RadarProduct,
     selected_elevation: f32,
     /// Layer kind → enabled flag.
@@ -283,12 +288,67 @@ struct UiConfig {
 /// alpha to these bytes anyway, so nothing finer would survive the round trip.
 #[derive(Serialize, Deserialize)]
 struct VolumeAlphaConfig {
-    product: RadarProduct,
+    /// `None` when the saved name is a product this build does not know — the
+    /// entry is then dropped on load with a log line, because a curve drawn
+    /// for one product must never be applied to another (see
+    /// [`known_product_or_none`]). Saves always write `Some`, which serializes
+    /// as the bare product name, so the on-disk format is unchanged.
+    #[serde(default, deserialize_with = "known_product_or_none")]
+    product: Option<RadarProduct>,
     /// Exactly [`crate::volume_alpha::CURVE_LEN`] alphas, entry 0 first.
     /// Validated on load — a wrong length is dropped with a warning, and
     /// entry 0 is re-clamped to transparent by `AlphaCurve::from_alphas`, so
     /// a hand-edited file cannot make the no-data index visible.
     alpha: Vec<u8>,
+}
+
+/// Deserialize a [`RadarProduct`], falling back to the default product when
+/// the name is unknown.
+///
+/// `RadarProduct` is the one enum on the config wire without a tolerance
+/// story: `PaneKind` falls back to `Map`, unknown `OverlayKind`s are filtered
+/// out, and the worker wire's `from_wire_code` returns `None` — but a bare
+/// `#[derive(Deserialize)]` enum fails on an unknown variant, and that error
+/// used to propagate up and fail the *entire* config load. One product name
+/// from a newer build would cost the user their site, layout and curves,
+/// permanently, because the autosave then rewrites the file from defaults.
+fn product_or_default<'de, D>(deserializer: D) -> Result<RadarProduct, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match RadarProduct::deserialize(&value) {
+        Ok(product) => Ok(product),
+        Err(_) => {
+            log::warn!(
+                "config names a product this build does not know ({value}); \
+                 falling back to {}",
+                RadarProduct::Reflectivity.name(),
+            );
+            Ok(RadarProduct::Reflectivity)
+        }
+    }
+}
+
+/// Deserialize a [`RadarProduct`] as `None` when the name is unknown, so the
+/// caller can drop the entry it keys rather than misassign it.
+///
+/// The distinction from [`product_or_default`] matters: a pane with an unknown
+/// product can honestly show the default product, but an alpha curve saved for
+/// an unknown product must not be *reassigned* — applied to Reflectivity it
+/// would silently change what the user sees, which is worse than losing it.
+fn known_product_or_none<'de, D>(deserializer: D) -> Result<Option<RadarProduct>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match RadarProduct::deserialize(&value) {
+        Ok(product) => Ok(Some(product)),
+        Err(_) => {
+            log::warn!("dropping a config entry keyed by an unknown product ({value})");
+            Ok(None)
+        }
+    }
 }
 
 impl Default for UiConfig {
@@ -432,11 +492,11 @@ impl super::Gui {
                     .volume_alpha
                     .entries()
                     .map(|(product, curve)| VolumeAlphaConfig {
-                        product,
+                        product: Some(product),
                         alpha: curve.alphas().to_vec(),
                     })
                     .collect();
-                curves.sort_by_key(|c| c.product.code());
+                curves.sort_by_key(|c| c.product.map(|p| p.code()));
                 curves
             },
         };
@@ -521,10 +581,16 @@ impl super::Gui {
         // bit-exact state.
         self.volume_alpha = crate::volume_alpha::AlphaCurves::default();
         for entry in config.volume_alpha {
+            // `None` is a product name this build does not know — already
+            // logged by the deserializer; the curve is dropped rather than
+            // applied to a product the user never drew it for.
+            let Some(product) = entry.product else {
+                continue;
+            };
             let Ok(alphas) = <[u8; crate::volume_alpha::CURVE_LEN]>::try_from(entry.alpha) else {
                 log::warn!(
                     "the saved Volume Alpha curve for {} is not {} entries; dropping it",
-                    entry.product.name(),
+                    product.name(),
                     crate::volume_alpha::CURVE_LEN,
                 );
                 continue;
@@ -532,7 +598,7 @@ impl super::Gui {
             // `from_alphas` re-clamps entry 0, so a hand-edited file cannot
             // make the no-data index visible.
             self.volume_alpha.set(
-                entry.product,
+                product,
                 crate::volume_alpha::AlphaCurve::from_alphas(alphas),
             );
         }
@@ -1108,6 +1174,88 @@ mod tests {
             "the rest of the curve is kept as saved"
         );
         assert_eq!(velocity.alphas()[255], 255);
+    }
+
+    /// A config naming a product this build does not know still loads.
+    ///
+    /// The products WP multiplies the entries in saved configs, so the failure
+    /// this pins is a *forward*-compatibility one: a config written by a later
+    /// build (or the same build with a product since renamed) must not fail
+    /// the whole load — which would cost the user their site, layout and
+    /// curves permanently, because the autosave then rewrites the file from
+    /// defaults. The pane falls back to the default product; everything else
+    /// in the file survives. The fixture site is deliberately not the KTLX
+    /// default, so "the site survived" cannot pass by the default masking a
+    /// failed load.
+    #[test]
+    fn a_config_naming_a_product_from_the_future_still_loads() {
+        use rustdar_radar::types::RadarProduct;
+
+        let store = MemoryConfigStore::default();
+        store
+            .store(
+                UI_CONFIG_KEY,
+                r#"{
+                    "site": "KDMX",
+                    "loop_lookback_secs": 7200,
+                    "panes": [{"selected_product": "TornadoProbability", "site": "KDMX"}]
+                }"#,
+            )
+            .expect("the memory store accepts a write");
+
+        let mut gui = crate::Gui::new();
+        assert!(
+            gui.load_ui_config(&store),
+            "one unknown product name must not fail the whole config load",
+        );
+        assert_eq!(
+            gui.pane(0).unwrap().selected_product,
+            RadarProduct::Reflectivity,
+            "the unknown product falls back to the default product",
+        );
+        assert_eq!(
+            gui.loop_lookback_secs, 7200,
+            "the rest of the file must survive the unknown product",
+        );
+    }
+
+    /// An alpha curve saved for an unknown product is dropped, never
+    /// reassigned to a product this build knows.
+    ///
+    /// Falling back to a default here — the way the pane's product picker does
+    /// — would be wrong in kind, not just in degree: the curve would silently
+    /// restyle a product the user never drew it for. The entry beside it must
+    /// still load, pinning that the drop is per-entry rather than the whole
+    /// list.
+    #[test]
+    fn an_alpha_curve_for_an_unknown_product_is_dropped_not_reassigned() {
+        use rustdar_radar::types::RadarProduct;
+
+        let store = MemoryConfigStore::default();
+        let full: Vec<String> = vec!["128".to_owned(); 256];
+        let json = format!(
+            r#"{{"volume_alpha":[
+                {{"product":"TornadoProbability","alpha":[{alphas}]}},
+                {{"product":"Velocity","alpha":[{alphas}]}}
+            ]}}"#,
+            alphas = full.join(","),
+        );
+        store
+            .store(UI_CONFIG_KEY, &json)
+            .expect("the memory store accepts a write");
+
+        let mut gui = crate::Gui::new();
+        assert!(gui.load_ui_config(&store), "the rest of the config loads");
+        assert_eq!(
+            gui.volume_alpha.entries().count(),
+            1,
+            "exactly the known product's curve loads — the unknown one is \
+             dropped, not remapped onto some default product",
+        );
+        assert!(
+            gui.volume_alpha.get(RadarProduct::Velocity).is_some(),
+            "the entry beside the unknown one still loads",
+        );
     }
 
     /// A cross-section pane's line and source survive the round trip.
