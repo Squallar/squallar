@@ -53,7 +53,16 @@ pub struct DesktopPlatform {
     /// [`os_location`]: crate::os_location
     /// [`os_location::prefer_fix`]: crate::os_location::prefer_fix
     os_fix_receiver: Option<std::sync::mpsc::Receiver<rustdar_gps::GpsFix>>,
-    /// The running OS location subscription (dropped to stop).
+    /// The live subscription to the OS location service, dropped to stop.
+    ///
+    /// Also the answer to [`PlatformBridge::location_active`], which is why it
+    /// is here and not a bool: "granted" and "delivering" are different states,
+    /// and a separate flag is a second thing to keep in step with the reader
+    /// that is actually producing.
+    ///
+    /// `None` on every target whose provider has not landed — `unsupported`'s
+    /// reader is never constructed — and `None` on the ones that have until the
+    /// user, or the gate, asks for a position.
     os_location_reader: Option<crate::os_location::OsLocationReader>,
     /// What the OS location service last said, or `None` before it has been
     /// asked anything.
@@ -72,6 +81,17 @@ pub struct DesktopPlatform {
     /// bridge would fall back to "nobody has been asked", and the app would ask
     /// again straight into the refusal it just received.
     os_location_state: Option<std::sync::Arc<std::sync::atomic::AtomicU8>>,
+    /// Windows: the `AppCapability` watcher behind
+    /// [`PlatformBridge::location_permission`].
+    ///
+    /// Constructed with the bridge rather than with the reader above, and that
+    /// ordering is the design. The permission has to be readable *before*
+    /// anything starts — it is what decides whether starting is allowed — and
+    /// has to stay readable after the user turns delivery off, or a permission
+    /// revoked in Settings would never be noticed. It owns a worker thread; see
+    /// [`crate::os_location::LocationService`].
+    #[cfg(target_os = "windows")]
+    os_location: crate::os_location::LocationService,
     /// Handed to the reader thread so a fix arriving while the loop is parked
     /// gets a frame to be shown on. See [`RedrawWaker`].
     redraw_waker: RedrawWaker,
@@ -129,6 +149,8 @@ impl DesktopPlatform {
             os_fix_receiver: None,
             os_location_reader: None,
             os_location_state: None,
+            #[cfg(target_os = "windows")]
+            os_location: crate::os_location::LocationService::start(),
             redraw_waker: RedrawWaker::new(),
         }
     }
@@ -148,6 +170,190 @@ impl DesktopPlatform {
             .ok()?;
         Some(std::path::PathBuf::from(base).join("rustdar").join("zones"))
     }
+}
+
+// ── Platform location service: the per-OS half ──────────────────────────
+//
+// One `cfg` pair, so that the `PlatformBridge` impl below reads the same on
+// every desktop target and the difference between them is in exactly one place.
+// Each provider that lands takes itself out of the `not(...)` arm; until all
+// three have, the arm is what a desktop with no provider compiled answers.
+//
+// Only the four calls that genuinely differ are here. `stop_location` and
+// `location_active` are not: both are about `os_location_reader`, which is the
+// same field whoever filled it, and duplicating them per target would be two
+// more places for a provider to forget to clear the dot.
+
+/// Windows: `AppCapability` for the state, `Geolocator` to prompt and deliver.
+/// See [`crate::os_location`].
+#[cfg(target_os = "windows")]
+impl DesktopPlatform {
+    fn os_location_permission(&self) -> rustdar_gps::LocationPermission {
+        self.os_location.permission()
+    }
+
+    /// Subscribe first, then ask.
+    ///
+    /// Both, and in that order, because they are one user-visible act. The gate
+    /// calls this in two situations — never asked, and granted but not
+    /// delivering — and neither would be served by a method that did only half
+    /// of it. Subscribing before the answer arrives is deliberate: a
+    /// `Geolocator` with no permission simply reports no positions, and having
+    /// the subscription already in place is what makes a grant produce a fix
+    /// immediately rather than a poll interval later.
+    ///
+    /// The `bool` says the request reached the worker. It cannot say more —
+    /// whether a dialog appears is up to the Windows build, and whether it is
+    /// answered is up to the user — which is why `PlatformBridge` documents
+    /// that nothing durable may hang off it.
+    fn os_location_request(&mut self) -> bool {
+        if self.os_location_reader.is_none() {
+            let (fixes, receiver) = std::sync::mpsc::channel();
+            let wake = self.redraw_waker.clone();
+            match self.os_location.start_delivery(fixes, move || wake.wake()) {
+                Some(reader) => {
+                    self.os_location_reader = Some(reader);
+                    self.os_fix_receiver = Some(receiver);
+                    log::info!("OS location delivery started");
+                }
+                None => log::warn!("the OS location worker is gone; no fixes will arrive"),
+            }
+        }
+        self.os_location.request_access()
+    }
+
+    fn os_location_settings_available(&self) -> bool {
+        true
+    }
+
+    fn os_location_open_settings(&mut self) {
+        if !self.os_location.open_settings() {
+            log::warn!("the OS location worker is gone; cannot open system settings");
+        }
+    }
+}
+
+/// Linux: GeoClue2 over `zbus`, on a connection the session thread owns.
+/// See [`crate::os_location`].
+#[cfg(target_os = "linux")]
+impl DesktopPlatform {
+    /// Whatever the provider last reported, or [`Prompt`] before it has been
+    /// asked anything.
+    ///
+    /// **`Prompt` and not `Unknown` for the un-asked case, deliberately.**
+    /// `Unknown` means "the platform has not answered yet, look again shortly",
+    /// and this arm's provider does not answer *until it is started* — the
+    /// first D-Bus round trip is the first answer, and it can sit on an agent
+    /// dialog, so it cannot be made on the frame path. Reporting `Unknown`
+    /// would leave the gate waiting for an answer that only asking produces:
+    /// the settings pane would read "Checking…" forever and nothing would ever
+    /// prompt. `Prompt` is also the honest description of the state — nobody
+    /// has been asked — and the one state in which asking is legitimate.
+    ///
+    /// [`Prompt`]: rustdar_gps::LocationPermission::Prompt
+    fn os_location_permission(&self) -> rustdar_gps::LocationPermission {
+        match &self.os_location_state {
+            Some(state) => decode_permission(state.load(std::sync::atomic::Ordering::Relaxed)),
+            None => rustdar_gps::LocationPermission::Prompt,
+        }
+    }
+
+    /// Start a location session, if one is not already running.
+    ///
+    /// The `bool` is the honest answer for this bridge and not much of one: it
+    /// says a provider was constructed, which on Linux is true before any of
+    /// the work that can fail has happened. See the trait's note — nothing
+    /// durable may hang off it.
+    fn os_location_request(&mut self) -> bool {
+        if self.os_location_reader.is_some() {
+            return true;
+        }
+        let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(encode_permission(
+            rustdar_gps::LocationPermission::Unknown,
+        )));
+        self.os_location_state = Some(std::sync::Arc::clone(&state));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let wake = self.redraw_waker.clone();
+        // Both callbacks run on the provider's thread. The wake is what makes a
+        // fix visible under `ControlFlow::Wait`; the report is what makes a
+        // revocation visible at all, since the gate stops polling once the
+        // answer is `Granted` and delivery is live.
+        let reported = std::sync::Arc::clone(&state);
+        let reader = crate::os_location::OsLocationReader::start(
+            &rustdar_gps::GpsConfig::default(),
+            tx,
+            move || wake.wake(),
+            move |permission| {
+                reported.store(
+                    encode_permission(permission),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            },
+        );
+
+        match reader {
+            Some(reader) => {
+                self.os_location_reader = Some(reader);
+                self.os_fix_receiver = Some(rx);
+                log::info!("OS location session requested");
+                true
+            }
+            None => {
+                // No provider compiled for this target. `Unavailable` and not
+                // `Denied`: there is no switch anywhere that changes it, so the
+                // pane must not send the user looking for one.
+                state.store(
+                    encode_permission(rustdar_gps::LocationPermission::Unavailable),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                false
+            }
+        }
+    }
+
+    /// No page to offer. GeoClue's permission is a property of the `.desktop`
+    /// file and of the agent's own policy, not of a settings pane any desktop
+    /// environment agrees on, so the button would be one that does nothing on
+    /// most installs. `packaging/linux/README.md` is where the fix is written
+    /// down instead.
+    fn os_location_settings_available(&self) -> bool {
+        false
+    }
+
+    fn os_location_open_settings(&mut self) {}
+}
+
+/// Every other desktop target. macOS (`CLLocationManager`) lands as its own
+/// piece of work, with its own dependency, its own permission mechanics and
+/// its own packaging — it needs a signed bundle or `locationd` re-prompts on
+/// every rebuild.
+///
+/// `Unavailable` and not `Unknown` in the meantime, and the difference matters.
+/// `Unknown` means "ask again shortly", so the gate would poll a bridge that is
+/// never going to answer and the settings pane would sit on "Checking…" for the
+/// life of the process. `Unavailable` is the truth: this build has no OS
+/// location provider, the pane says so, and nothing spins.
+#[cfg(all(
+    not(any(target_os = "android", target_os = "ios")),
+    not(target_os = "windows"),
+    not(target_os = "linux")
+))]
+impl DesktopPlatform {
+    fn os_location_permission(&self) -> rustdar_gps::LocationPermission {
+        rustdar_gps::LocationPermission::Unavailable
+    }
+
+    /// Nothing to ask, so nothing reached the OS.
+    fn os_location_request(&mut self) -> bool {
+        false
+    }
+
+    fn os_location_settings_available(&self) -> bool {
+        false
+    }
+
+    fn os_location_open_settings(&mut self) {}
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -260,102 +466,43 @@ impl PlatformBridge for DesktopPlatform {
 
     // ── Platform location service ───────────────────────────────────────
     //
-    // One shape for all three desktop OSes. Everything per-OS — GeoClue2 over
-    // zbus, `AppCapability` + `Geolocator`, `CLLocationManager` — is behind
-    // `crate::os_location`, which is the entire `cfg` surface; nothing here
-    // names a target.
+    // Every per-target decision is in the `cfg` set above this `impl`, so what
+    // is left here is the part that is the same everywhere.
 
-    /// Whatever the provider last reported, or [`Prompt`] before it has been
-    /// asked anything.
-    ///
-    /// **`Prompt` and not `Unknown` for the un-asked case, deliberately.**
-    /// `Unknown` means "the platform has not answered yet, look again shortly",
-    /// and this bridge's provider does not answer *until it is started* — the
-    /// first D-Bus round trip is the first answer, and it can sit on an agent
-    /// dialog, so it cannot be made on the frame path. Reporting `Unknown`
-    /// would leave the gate waiting for an answer that only asking produces:
-    /// the settings pane would read "Checking…" forever and nothing would ever
-    /// prompt. `Prompt` is also the honest description of the state — nobody
-    /// has been asked — and the one state in which asking is legitimate.
-    ///
-    /// A target whose provider is still `unsupported` never leaves `Prompt`
-    /// silently: its `start` returns `None` and `request_location` writes
-    /// `Unavailable` below.
-    ///
-    /// [`Prompt`]: rustdar_gps::LocationPermission::Prompt
     fn location_permission(&self) -> rustdar_gps::LocationPermission {
-        match &self.os_location_state {
-            Some(state) => decode_permission(state.load(std::sync::atomic::Ordering::Relaxed)),
-            None => rustdar_gps::LocationPermission::Prompt,
-        }
+        self.os_location_permission()
     }
 
-    /// Start a location session, if one is not already running.
-    ///
-    /// The `bool` is the honest answer for this bridge and not much of one: it
-    /// says a provider was constructed, which on Linux is true before any of
-    /// the work that can fail has happened. See the trait's note — nothing
-    /// durable may hang off it.
     fn request_location(&mut self) -> bool {
-        if self.os_location_reader.is_some() {
-            return true;
-        }
-        let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(encode_permission(
-            rustdar_gps::LocationPermission::Unknown,
-        )));
-        self.os_location_state = Some(std::sync::Arc::clone(&state));
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        let wake = self.redraw_waker.clone();
-        // Both callbacks run on the provider's thread. The wake is what makes a
-        // fix visible under `ControlFlow::Wait`; the report is what makes a
-        // revocation visible at all, since the gate stops polling once the
-        // answer is `Granted` and delivery is live.
-        let reported = std::sync::Arc::clone(&state);
-        let reader = crate::os_location::OsLocationReader::start(
-            &rustdar_gps::GpsConfig::default(),
-            tx,
-            move || wake.wake(),
-            move |permission| {
-                reported.store(
-                    encode_permission(permission),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-            },
-        );
-
-        match reader {
-            Some(reader) => {
-                self.os_location_reader = Some(reader);
-                self.os_fix_receiver = Some(rx);
-                log::info!("OS location session requested");
-                true
-            }
-            None => {
-                // No provider compiled for this target. `Unavailable` and not
-                // `Denied`: there is no switch anywhere that changes it, so the
-                // pane must not send the user looking for one.
-                state.store(
-                    encode_permission(rustdar_gps::LocationPermission::Unavailable),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                false
-            }
-        }
+        self.os_location_request()
     }
 
-    /// Stop the stream. The permission is left exactly as the provider last
-    /// reported it — this is an off switch, not a revocation, and no platform
-    /// lets an app hand a permission back.
+    /// Drops the subscription and the channel behind it. The permission is left
+    /// exactly as the provider last reported it.
+    ///
+    /// Not a revocation — no platform lets an app hand a permission back — and
+    /// not conditional on which provider filled the field. This is also the path
+    /// a *revoked* permission takes, which is why it must actually release the
+    /// receiver: leaving a drained-but-live channel in place would let a fix
+    /// already in flight land on the map after consent was withdrawn.
     fn stop_location(&mut self) {
         if self.os_location_reader.take().is_some() {
-            log::info!("OS location session stopped");
+            log::info!("OS location delivery stopped");
         }
         self.os_fix_receiver = None;
     }
 
+    /// The reader itself, rather than a flag beside it. See the field.
     fn location_active(&self) -> bool {
         self.os_location_reader.is_some()
+    }
+
+    fn location_settings_available(&self) -> bool {
+        self.os_location_settings_available()
+    }
+
+    fn open_location_settings(&mut self) {
+        self.os_location_open_settings();
     }
 }
 

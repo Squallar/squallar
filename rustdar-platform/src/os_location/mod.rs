@@ -48,8 +48,34 @@ use linux as provider;
 
 /// Phase 4: `AppCapability` for the state, `Geolocator` to prompt, an MTA
 /// worker to keep `RequestAccessAsync` off the frame thread.
+///
+/// Compiled under `test` as well as on Windows, and that is not a convenience.
+/// The half of that file worth testing is pure — which `AppCapabilityAccessStatus`
+/// means "ask", which `PositionSource` is a satellite, how a null `IReference`
+/// decodes — and every one of those failures is silent on a device: a wrong arm
+/// renders the wrong control or the wrong fix quality and throws nothing. CI has
+/// no Windows runner to run tests on, so the mapping is written against plain
+/// `i32`s, pinned to the real bindings by `const` assertions that only a Windows
+/// build evaluates, and exercised on the Linux host that `cargo test` runs on.
+#[cfg(any(target_os = "windows", test))]
+mod windows;
+
+/// `self::`, because a bare `windows` here is ambiguous with the crate of that
+/// name — uniform paths would find both and refuse to choose.
 #[cfg(target_os = "windows")]
-use unsupported as provider;
+use self::windows as provider;
+
+/// The permission half of the Windows arm, which `OsLocationReader` is not.
+///
+/// Deliberately outside the shared provider surface below. The two have
+/// different lifetimes: a reader is a subscription that comes and goes with the
+/// user's "Turn off" button, whereas the capability watcher has to be running
+/// *before* anything starts — it is what decides whether starting is even
+/// allowed — and has to keep running afterwards so a revocation made in Settings
+/// is still noticed. Every arm answers `location_permission` from its own
+/// mechanism, and there is nothing common to name until more than one exists.
+#[cfg(target_os = "windows")]
+pub use self::windows::LocationService;
 
 /// Phase 5: one `apple.rs` with two `#[cfg]` islands — `CLLocationManager` is
 /// the same on both, but macOS constructs its bridge after `NSApplication`

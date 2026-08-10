@@ -37,6 +37,28 @@ env_logger = "=0.11.11"
 rustdar-radar = { workspace = true }
 walkers = { workspace = true }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+# The OS location provider in `src/os_location/windows.rs`.
+#
+# All four features are load-bearing: `Devices_Geolocation` alone fails to
+# compile with `could not find 'Security' in 'windows'` and `unresolved import
+# 'windows::System'`. `Foundation` is implied by each of the other three, and is
+# named anyway as documentation of what `TypedEventHandler` and `Uri` come from.
+# Do NOT add `default-features = false` — it drops the `std` plumbing the
+# generated bindings need.
+#
+# Zero new *packages*: `wgpu-hal -> gpu-allocator` and `walkers -> cacache`
+# already put `windows 0.62` in the graph, so this only widens which namespaces
+# are generated. Verified to compile *and link* for `x86_64-pc-windows-gnullvm`;
+# `windows-link` declares every extern `kind = "raw-dylib"` and the 0.62 graph
+# has no `windows-targets` import-lib crates, so gnullvm has no `.lib` to miss.
+windows = { version = "=0.62.2", features = [
+    "Devices_Geolocation",
+    "Security_Authorization_AppCapabilityAccess",
+    "System",
+    "Foundation",
+] }
+
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 # Android's theme is a JNI call injected by `rustdar-android`. iOS is excluded
 # because `dark-light` 2.0's iOS arm returns `Mode::Light` unconditionally *and*

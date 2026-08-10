@@ -319,6 +319,14 @@ pub struct Gui {
     /// question from the permission: every desktop process starts granted and
     /// silent.
     location_active: bool,
+    /// Whether this platform has a location settings page to offer.
+    ///
+    /// Pushed once at startup rather than with the two fields above, because it
+    /// is a property of the build and not of the permission — it cannot change
+    /// while the app runs, and nothing is served by re-asking it at the gate's
+    /// cadence. `false` by default, so a bridge that has not been asked renders
+    /// no button rather than one that does nothing.
+    location_settings_available: bool,
     // Compass heading in degrees (0–360), from device compass sensor
     user_heading: Option<f32>,
     // Overlay data (SPC outlooks, NWS alerts, SPC discussions)
@@ -927,6 +935,7 @@ impl Gui {
             user_fix_at: None,
             location_permission: rustdar_gps::LocationPermission::default(),
             location_active: false,
+            location_settings_available: false,
             user_heading: None,
             overlays: OverlayRegistry::default(),
             panes: vec![PaneState::new()],
@@ -3325,6 +3334,20 @@ impl Gui {
     /// See [`set_location_state`](Self::set_location_state).
     pub fn location_active(&self) -> bool {
         self.location_active
+    }
+
+    /// Cache whether this platform has a location settings page to offer.
+    ///
+    /// Separate from [`set_location_state`](Self::set_location_state) because
+    /// it is answered once, at startup: the permission changes, the platform
+    /// does not.
+    pub fn set_location_settings_available(&mut self, available: bool) {
+        self.location_settings_available = available;
+    }
+
+    /// See [`set_location_settings_available`](Self::set_location_settings_available).
+    pub fn location_settings_available(&self) -> bool {
+        self.location_settings_available
     }
 
     pub fn set_user_heading(&mut self, heading: f32) {

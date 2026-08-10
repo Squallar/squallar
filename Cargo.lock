@@ -4165,6 +4165,7 @@ dependencies = [
  "rustdar-gps",
  "rustdar-radar",
  "walkers",
+ "windows",
  "winit",
  "zbus",
 ]

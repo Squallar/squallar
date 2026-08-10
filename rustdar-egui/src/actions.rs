@@ -117,6 +117,14 @@ pub enum GuiAction {
     /// offers an app a way to do that — so the control says "turn off" rather
     /// than anything about revoking.
     StopLocation,
+    /// Open the system location settings page.
+    ///
+    /// The only thing on offer in the `Denied` state, and only on a platform
+    /// that has such a page. It is not a way to ask again — nothing this app
+    /// does can reverse a refusal — it is a shortcut to the place where the
+    /// user can, and it is raised from a click so it can never be mistaken for
+    /// the app opening Settings on its own.
+    OpenLocationSettings,
     /// Build the voxel grid a 3D pane needs, if it is not already in hand.
     ///
     /// Emitted from inside the pane's own render arm, on every frame the pane
@@ -244,6 +252,9 @@ impl std::fmt::Display for GuiAction {
             }
             GuiAction::StopLocation => {
                 write!(f, "Stop the platform location service")
+            }
+            GuiAction::OpenLocationSettings => {
+                write!(f, "Open the system location settings")
             }
             GuiAction::PrepareVolume { pane_idx, target } => {
                 write!(

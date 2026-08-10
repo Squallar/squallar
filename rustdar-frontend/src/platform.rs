@@ -552,6 +552,42 @@ pub trait PlatformBridge {
         false
     }
 
+    /// Whether this platform has a location settings page worth offering to
+    /// open.
+    ///
+    /// Asked once, at startup, and cached by the UI — the answer is a property
+    /// of the build, not of the permission state. Defaulted `false`, because
+    /// "there is a page" is a narrower claim than it sounds and the wrong answer
+    /// is a button that does nothing:
+    ///
+    /// * **Windows** answers `true`. `ms-settings:privacy-location` is a
+    ///   documented URI that `Launcher::LaunchUriAsync` opens with no HWND, no
+    ///   spawned process and no console flash.
+    /// * The **browser** has no such thing at all — permission lives in chrome
+    ///   the page cannot reach, and every browser puts it somewhere different.
+    /// * **Android** has one, but reaching it means an `Intent` with the app's
+    ///   own package URI, so it belongs with the rest of that bridge's JNI
+    ///   hooks rather than here.
+    ///
+    /// Only ever surfaced in the `Denied` state. Everywhere else there is
+    /// something better to offer — a button that asks, or nothing to fix.
+    fn location_settings_available(&self) -> bool {
+        false
+    }
+
+    /// Open the system location settings.
+    ///
+    /// Fire and forget, and deliberately not `-> bool`: the honest answer is
+    /// not knowable synchronously on the one platform that implements it, and
+    /// there is nothing the caller would do with a failure that the log line
+    /// does not already do better. Must not block — on Windows the launch goes
+    /// through the same worker thread the permission calls do.
+    ///
+    /// It is not a promise that Settings helps. A machine-wide policy can grey
+    /// the toggle out; the pane's wording says where to look, not what will be
+    /// there.
+    fn open_location_settings(&mut self) {}
+
     /// Install the four location calls (Android only, no-op elsewhere).
     ///
     /// See [`LocationHooks`] for why they arrive together and why they are

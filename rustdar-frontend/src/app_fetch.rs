@@ -298,6 +298,13 @@ impl super::App {
                     self.gui.clear_gps_fix();
                 }
             }
+            // Straight at the bridge, and this is the one location action that
+            // legitimately is. The gate exists to guard the single call that can
+            // raise a permission dialog; opening a settings page raises nothing,
+            // changes no state this crate owns, and has nothing to remember.
+            GuiAction::OpenLocationSettings => {
+                self.platform.open_location_settings();
+            }
         }
     }
 

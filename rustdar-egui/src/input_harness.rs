@@ -8347,6 +8347,60 @@ mod tests {
         }
     }
 
+    /// The one thing worth offering after a refusal — and only where there is
+    /// somewhere to send the user.
+    ///
+    /// Both halves are failures with no symptom. A button on a platform with no
+    /// settings page reads as "click here to fix this" and opens nothing; the
+    /// same button beside a *granted* permission invites the user into Settings
+    /// to solve a problem they do not have. It is Windows that has the page —
+    /// `ms-settings:privacy-location` — and the browser that has nothing of the
+    /// kind.
+    #[test]
+    fn a_denial_offers_the_system_settings_page_only_where_there_is_one() {
+        const BUTTON: &str = "Open location settings";
+
+        let mut h = InputHarness::new();
+        h.gui_mut().show_settings = true;
+        h.gui_mut()
+            .set_location_state(rustdar_gps::LocationPermission::Denied, false);
+        h.warm_up();
+
+        let painted = h.painted_text_strings();
+        assert!(
+            !painted.iter().any(|t| t == BUTTON),
+            "a platform that never claimed to have a settings page is offering \
+             to open one. Painted: {painted:?}"
+        );
+
+        h.gui_mut().set_location_settings_available(true);
+        h.warm_up();
+
+        let painted = h.painted_text_strings();
+        assert!(
+            painted.iter().any(|t| t == BUTTON),
+            "the OS refused, there is a page to send the user to, and the pane \
+             does not offer it. Painted: {painted:?}"
+        );
+
+        // Every other state has something better on offer, or nothing to fix.
+        for state in [
+            rustdar_gps::LocationPermission::Granted,
+            rustdar_gps::LocationPermission::Prompt,
+            rustdar_gps::LocationPermission::Unknown,
+            rustdar_gps::LocationPermission::Unavailable,
+        ] {
+            h.gui_mut().set_location_state(state, false);
+            h.warm_up();
+            let painted = h.painted_text_strings();
+            assert!(
+                !painted.iter().any(|t| t == BUTTON),
+                "{state:?} is offering the remediation for a refusal. \
+                 Painted: {painted:?}"
+            );
+        }
+    }
+
     /// The gap the ungated line closes. `Fix:`/`No GPS fix` lives inside
     /// `#[cfg(feature = "gps-serial")]`, so on web, Android, iOS and every
     /// build without a serial port the section would read `On.` beside an empty

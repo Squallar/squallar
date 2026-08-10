@@ -601,6 +601,10 @@ impl App {
 
         let mut gui = Gui::new();
         gui.set_supports_exit(platform.supports_exit());
+        // Once, here, and not at the gate's cadence: whether a platform has a
+        // location settings page is a property of the build. The permission it
+        // sits beside changes; this does not.
+        gui.set_location_settings_available(platform.location_settings_available());
         let restored = platform
             .config_store()
             .is_some_and(|store| gui.load_ui_config(store.as_ref()));

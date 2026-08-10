@@ -329,6 +329,14 @@ impl super::Gui {
                     "Location for this app is turned off. It can be turned back \
                      on in your system settings.",
                 );
+                // A shortcut to the page, not a second way to ask — and only on
+                // a platform that has one. "Open", not "Allow": a machine-wide
+                // policy can leave that toggle greyed out, and this button
+                // cannot promise what the user will find.
+                if self.location_settings_available && ui.button("Open location settings").clicked()
+                {
+                    actions.push(GuiAction::OpenLocationSettings);
+                }
             }
             LocationPermission::Granted if self.location_active => {
                 ui.label("On.");
