@@ -66,6 +66,11 @@ mod settings;
 /// ever pin whichever row ran it.
 #[cfg(test)]
 pub(crate) use settings::LOCATION_DENIED_NOTE;
+/// The settings window's row table and its drawn-row probe, for the parity
+/// walk — the inventory it asserts is the table the renderer iterates, so a
+/// row cannot be dropped from one without the other noticing.
+#[cfg(test)]
+pub(crate) use settings::{DrawnSettingsRow, SETTINGS_ROWS};
 
 use crate::ui_input::InteractionState;
 
@@ -399,6 +404,24 @@ pub struct Gui {
     /// box showed. Only read by tests — see [`DrawnDropdown`].
     #[cfg(test)]
     last_dropdowns: Vec<DrawnDropdown>,
+    /// Every control item the last frame's layers panel drew, whatever its
+    /// shape — the generalisation of the field above. Only read by tests; see
+    /// [`DrawnControlItem`].
+    #[cfg(test)]
+    last_control_items: Vec<DrawnControlItem>,
+    /// Every settings row the last frame's settings window drew. Only read by
+    /// tests — see [`settings::DrawnSettingsRow`].
+    #[cfg(test)]
+    last_settings_rows: Vec<settings::DrawnSettingsRow>,
+    /// The action-button indices the last frame's detail popup reported as
+    /// triggered, and the ones it actually handled. Only read by tests, which
+    /// hold the second to at most one entry per frame — see the note on the
+    /// handling in `ui_popups.rs`.
+    #[cfg(test)]
+    last_popup_triggered: Vec<usize>,
+    /// See [`last_popup_triggered`](Self::last_popup_triggered).
+    #[cfg(test)]
+    last_popup_handled: Vec<usize>,
     /// A pane the user has asked to convert, applied once the UI pass is over.
     ///
     /// # Why the write is deferred, and what that is and is not protecting
@@ -651,7 +674,11 @@ impl Default for Gui {
 }
 
 /// The order the layers panel renders each handler's controls in.
-const OVERLAY_CONTROL_ORDER: &[OverlayKind] = &[
+///
+/// `pub(crate)` for the parity walk, which derives its inventory from the same
+/// list the renderer iterates — a copy in the test would go on passing after a
+/// handler was dropped from this one.
+pub(crate) const OVERLAY_CONTROL_ORDER: &[OverlayKind] = &[
     OverlayKind::Radar,
     OverlayKind::ModelData,
     OverlayKind::SpcOutlook,
@@ -693,12 +720,52 @@ pub(crate) struct DrawnDropdown {
     pub rect: egui::Rect,
 }
 
+/// The widget shape a [`ControlItem`] rendered as.
+///
+/// Coarser than the model on purpose — a `ButtonRow` records one entry per
+/// button, a `Separator` records nothing — because what a test needs is to name
+/// the thing it expects on screen, not to reconstruct the tree.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DrawnControlKind {
+    Checkbox,
+    Slider,
+    Button,
+    InfoText,
+    Heading,
+    Dropdown,
+    Section,
+}
+
+/// One control a handler's tree actually drew — the generalisation of
+/// [`DrawnDropdown`] to every [`ControlItem`] shape: which handler's pass drew
+/// it, what it read as, and where it landed so a test can scroll to it and
+/// click it.
+///
+/// Reported by the renderer, like [`ui_menu::DrawnMenuLeaf`], rather than
+/// rebuilt by a test from the [`ControlItem`] — a test that walked the model
+/// itself would agree with a renderer that had stopped drawing part of it.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DrawnControlItem {
+    /// The handler whose tree this item came from. `Some` for every item the
+    /// current renderer draws; an `Option` so a control drawn outside any
+    /// handler's tree can share the probe when one exists.
+    pub handler: Option<OverlayKind>,
+    pub label: String,
+    pub kind: DrawnControlKind,
+    pub rect: egui::Rect,
+}
+
 /// What one pass over a control tree drew. A no-op outside tests, like
 /// [`ui_menu::MenuFrame`].
 #[derive(Default)]
 pub(crate) struct ControlProbe {
     #[cfg(test)]
     pub drawn: Vec<DrawnDropdown>,
+    /// Every item drawn, whatever its shape. See [`DrawnControlItem`].
+    #[cfg(test)]
+    pub items: Vec<DrawnControlItem>,
 }
 
 impl ControlProbe {
@@ -716,6 +783,25 @@ impl ControlProbe {
             label: _label.to_owned(),
             selected_text: _selected_text.to_owned(),
             rect: _rect,
+        });
+    }
+
+    /// Record one drawn item. Test-only, so the call sites are gated too —
+    /// unlike [`Self::record_dropdown`] this takes a test-only type.
+    #[cfg(test)]
+    #[inline]
+    fn record_item(
+        &mut self,
+        handler: OverlayKind,
+        kind: DrawnControlKind,
+        label: &str,
+        rect: egui::Rect,
+    ) {
+        self.items.push(DrawnControlItem {
+            handler: Some(handler),
+            label: label.to_owned(),
+            kind,
+            rect,
         });
     }
 }
@@ -778,7 +864,10 @@ fn render_control_item(
     match item {
         ControlItem::Toggle { id, label, enabled } => {
             let mut value = *enabled;
-            if ui.checkbox(&mut value, label.as_str()).changed() {
+            let response = ui.checkbox(&mut value, label.as_str());
+            #[cfg(test)]
+            probe.record_item(kind, DrawnControlKind::Checkbox, label, response.rect);
+            if response.changed() {
                 updates.push((
                     kind,
                     ControlUpdate {
@@ -789,26 +878,34 @@ fn render_control_item(
             }
         }
         ControlItem::Heading { text } => {
-            ui.label(text.as_str());
+            let response = ui.label(text.as_str());
+            #[cfg(test)]
+            probe.record_item(kind, DrawnControlKind::Heading, text, response.rect);
+            #[cfg(not(test))]
+            let _ = response;
         }
         ControlItem::InfoText { text } => {
-            ui.label(egui::RichText::new(text.as_str()).small().weak());
+            let response = ui.label(egui::RichText::new(text.as_str()).small().weak());
+            #[cfg(test)]
+            probe.record_item(kind, DrawnControlKind::InfoText, text, response.rect);
+            #[cfg(not(test))]
+            let _ = response;
         }
         ControlItem::ButtonRow { buttons } => {
             let any_highlighted = buttons.iter().any(|b| b.highlight);
             ui.horizontal_wrapped(|ui| {
                 for btn in buttons {
-                    let clicked = if any_highlighted {
+                    let response = if any_highlighted {
                         ui.add_enabled(
                             btn.enabled,
                             egui::Button::new(btn.label.as_str()).selected(btn.highlight),
                         )
-                        .clicked()
                     } else {
                         ui.add_enabled(btn.enabled, egui::Button::new(btn.label.as_str()))
-                            .clicked()
                     };
-                    if clicked {
+                    #[cfg(test)]
+                    probe.record_item(kind, DrawnControlKind::Button, &btn.label, response.rect);
+                    if response.clicked() {
                         updates.push((
                             kind,
                             ControlUpdate {
@@ -846,6 +943,8 @@ fn render_control_item(
                         }
                     });
                 probe.record_dropdown(id, label, &shown, combo.response.rect);
+                #[cfg(test)]
+                probe.record_item(kind, DrawnControlKind::Dropdown, label, combo.response.rect);
             });
             if sel != original {
                 updates.push((
@@ -868,7 +967,7 @@ fn render_control_item(
         } => {
             let mut val = *value;
             let original = val;
-            ui.horizontal(|ui| {
+            let row = ui.horizontal(|ui| {
                 ui.label(label.as_str());
                 let mut slider = egui::Slider::new(&mut val, *min..=*max);
                 if *logarithmic {
@@ -876,6 +975,10 @@ fn render_control_item(
                 }
                 ui.add(slider);
             });
+            #[cfg(test)]
+            probe.record_item(kind, DrawnControlKind::Slider, label, row.response.rect);
+            #[cfg(not(test))]
+            let _ = row;
             if (val - original).abs() > f64::EPSILON {
                 updates.push((
                     kind,
@@ -893,20 +996,36 @@ fn render_control_item(
             items,
         } => {
             if *collapsible {
-                egui::CollapsingHeader::new(label.as_str())
+                let collapsing = egui::CollapsingHeader::new(label.as_str())
                     .default_open(*expanded)
                     .show(ui, |ui| {
                         for child in items {
                             render_control_item(ui, kind, child, updates, probe);
                         }
                     });
+                // The header's own rect, so a test can open a collapsed
+                // section the way a user does — the children record
+                // themselves only on a frame the body actually drew.
+                #[cfg(test)]
+                probe.record_item(
+                    kind,
+                    DrawnControlKind::Section,
+                    label,
+                    collapsing.header_response.rect,
+                );
+                #[cfg(not(test))]
+                let _ = collapsing;
             } else {
-                ui.group(|ui| {
+                let group = ui.group(|ui| {
                     ui.label(egui::RichText::new(label.as_str()).strong());
                     for child in items {
                         render_control_item(ui, kind, child, updates, probe);
                     }
                 });
+                #[cfg(test)]
+                probe.record_item(kind, DrawnControlKind::Section, label, group.response.rect);
+                #[cfg(not(test))]
+                let _ = group;
             }
         }
     }
@@ -975,6 +1094,14 @@ impl Gui {
             last_status_bar: StatusBarProbe::default(),
             #[cfg(test)]
             last_dropdowns: Vec::new(),
+            #[cfg(test)]
+            last_control_items: Vec::new(),
+            #[cfg(test)]
+            last_settings_rows: Vec::new(),
+            #[cfg(test)]
+            last_popup_triggered: Vec::new(),
+            #[cfg(test)]
+            last_popup_handled: Vec::new(),
             pending_pane_kind: None,
             region_arm: false,
             region_drag: None,
@@ -1037,6 +1164,14 @@ impl Gui {
             // Same reason: the handler dropdowns only exist while the panel is
             // on screen.
             self.last_dropdowns.clear();
+            // And its generalisation, for the same reason.
+            self.last_control_items.clear();
+            // Likewise: the settings rows only exist while the window is open.
+            self.last_settings_rows.clear();
+            // Per-frame records of the popup's action handling; a leftover
+            // entry would report a button press that did not happen this frame.
+            self.last_popup_triggered.clear();
+            self.last_popup_handled.clear();
         }
 
         // Create a root Ui to host the panels. Since egui 0.35 the Context-taking
@@ -2220,7 +2355,10 @@ impl Gui {
         }
 
         #[cfg(test)]
-        self.last_dropdowns.extend(probe.drawn.iter().cloned());
+        {
+            self.last_dropdowns.extend(probe.drawn.iter().cloned());
+            self.last_control_items.extend(probe.items.iter().cloned());
+        }
         #[cfg(not(test))]
         let _ = probe;
 
@@ -3152,6 +3290,44 @@ impl Gui {
     #[cfg(test)]
     pub(crate) fn dropdowns_for_test(&self) -> &[DrawnDropdown] {
         &self.last_dropdowns
+    }
+
+    /// Every control item the last frame drew, whatever its shape. See
+    /// [`DrawnControlItem`].
+    #[cfg(test)]
+    pub(crate) fn control_items_for_test(&self) -> &[DrawnControlItem] {
+        &self.last_control_items
+    }
+
+    /// The [`ControlItem`] tree `kind`'s handler is currently offering — the
+    /// *model* behind the [`DrawnControlItem`]s, asked of the handler rather
+    /// than of the renderer, exactly as [`Self::dropdown_model_for_test`] asks
+    /// for one dropdown.
+    #[cfg(test)]
+    pub(crate) fn control_item_model_for_test(&self, kind: OverlayKind) -> Vec<ControlItem> {
+        let ctx = PaneControlContext {
+            pane_idx: self.active_pane,
+            pane_state: None,
+        };
+        self.overlays.controls(kind, &ctx)
+    }
+
+    /// Every settings row the last frame drew. See
+    /// [`settings::DrawnSettingsRow`].
+    #[cfg(test)]
+    pub(crate) fn settings_rows_for_test(&self) -> &[settings::DrawnSettingsRow] {
+        &self.last_settings_rows
+    }
+
+    /// What the last frame's detail popup did with its action buttons:
+    /// `(triggered, handled)` indices. See the note on the handling in
+    /// `ui_popups.rs` for why the second must hold at most one entry.
+    #[cfg(test)]
+    pub(crate) fn popup_actions_for_test(&self) -> (Vec<usize>, Vec<usize>) {
+        (
+            self.last_popup_triggered.clone(),
+            self.last_popup_handled.clone(),
+        )
     }
 
     /// The `(options, selected)` a handler is currently offering under `label`

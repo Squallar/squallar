@@ -17,6 +17,9 @@ pub mod volume_view;
 #[cfg(test)]
 mod input_harness;
 
+#[cfg(test)]
+mod parity_walk;
+
 pub const DEFAULT_NOTIFIER_ENDPOINT: &str = "wss://nexrad-aws-notifier.mcswain.dev";
 
 pub use ui::{ChunkFeedStatus, CurrentVolumeStamp, Gui, StormMotionOverride, TiltFreshness};

@@ -431,6 +431,169 @@ impl InputHarness {
         self.gui.dropdown_model_for_test(label)
     }
 
+    /// Every control item the last frame's layers panel drew, whatever its
+    /// shape. See [`crate::ui::DrawnControlItem`].
+    pub(crate) fn control_items(&self) -> Vec<crate::ui::DrawnControlItem> {
+        self.gui.control_items_for_test().to_vec()
+    }
+
+    /// The control tree `kind`'s handler currently offers — the model behind
+    /// [`Self::control_items`], asked of the handler rather than the renderer.
+    pub(crate) fn control_item_model(
+        &self,
+        kind: OverlayKind,
+    ) -> Vec<rustdar_overlays::render::controls::ControlItem> {
+        self.gui.control_item_model_for_test(kind)
+    }
+
+    /// Every settings row the last frame drew. See
+    /// [`crate::ui::DrawnSettingsRow`].
+    pub(crate) fn settings_rows(&self) -> Vec<crate::ui::DrawnSettingsRow> {
+        self.gui.settings_rows_for_test().to_vec()
+    }
+
+    /// The settings row drawn under `id`, if the last frame drew one.
+    pub(crate) fn settings_row(&self, id: &str) -> Option<crate::ui::DrawnSettingsRow> {
+        self.settings_rows().into_iter().find(|row| row.id == id)
+    }
+
+    /// Every leaf label the menu model currently offers, flattened. The
+    /// inventory half of the parity walk's menu audit; the drawn half is
+    /// [`Self::menu_leaves`].
+    pub(crate) fn menu_leaf_labels(&self) -> Vec<&'static str> {
+        self.gui.menu_model_leaf_labels()
+    }
+
+    /// The menu model's top-level groups with their leaf labels, for walking
+    /// the menu-bar presentation one drop-down at a time.
+    pub(crate) fn menu_groups(&self) -> Vec<(&'static str, Vec<&'static str>)> {
+        self.gui.menu_model_groups()
+    }
+
+    // --- scripted user routes ------------------------------------------------
+    //
+    // Shared by the parity walk and any test that wants to arrive somewhere
+    // the way a user does, rather than by poking state. Each one drives the
+    // real chrome: real clicks on really-drawn rects, never a setter.
+
+    /// Scroll at `pos` in `step` increments until `pred` passes, or give up
+    /// after `max_steps` frames. Returns whether the predicate ever passed.
+    ///
+    /// The bound is the point: a `ScrollArea` lays content out beyond the
+    /// viewport (and may cull it), so "keep scrolling until it shows up" has
+    /// to terminate when the thing is genuinely absent rather than spin.
+    pub(crate) fn scroll_until(
+        &mut self,
+        pos: egui::Pos2,
+        step: egui::Vec2,
+        max_steps: usize,
+        mut pred: impl FnMut(&Self) -> bool,
+    ) -> bool {
+        if pred(self) {
+            return true;
+        }
+        for _ in 0..max_steps {
+            self.scroll_at(pos, step);
+            self.frame_after(FRAME_DT);
+            if pred(self) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Put the layers panel on screen the user's way: a no-op where it is
+    /// persistent (Expanded), otherwise a click on the hamburger. Idempotent —
+    /// with the drawer already open there is no hamburger drawn to click.
+    pub(crate) fn open_layers(&mut self) {
+        if self.width_class().has_persistent_sidebar() {
+            return;
+        }
+        // The hamburger's rect is the chrome's one excluded rect; when the
+        // drawer is open the button is not drawn and there is nothing to do.
+        if let Some(rect) = self.excluded_rects().first().copied() {
+            self.mouse_click(rect.center());
+            self.warm_up();
+        }
+    }
+
+    /// Open the whole-menu presentation the user's way. On Compact that is a
+    /// click on the hamburger — the drawer is the menu there. On Medium and
+    /// Expanded the menu bar is already on screen, and each drop-down opens
+    /// through [`Self::open_menu_group`].
+    pub(crate) fn open_menu(&mut self) {
+        if !self.width_class().has_menu_bar() {
+            self.open_layers();
+        }
+    }
+
+    /// Open the menu-bar drop-down under `label`, as clicking its header does.
+    /// Only meaningful where the menu bar is the presentation — the drawer
+    /// shows every group at once. Idempotent: a click on an already-open
+    /// header would *close* the drop-down, so one that is showing its leaves
+    /// is left alone.
+    pub(crate) fn open_menu_group(&mut self, label: &str) {
+        assert!(
+            self.width_class().has_menu_bar(),
+            "open_menu_group needs the menu-bar presentation; on Compact the \
+             drawer is the menu and open_menu is the route"
+        );
+        let already_open = self
+            .menu_groups()
+            .into_iter()
+            .find(|(group, _)| *group == label)
+            .and_then(|(_, leaves)| leaves.first().copied())
+            .is_some_and(|first_leaf| self.menu_leaf(first_leaf).is_some());
+        if already_open {
+            return;
+        }
+        let header = self
+            .menu_leaf(label)
+            .unwrap_or_else(|| panic!("the menu bar did not draw a {label:?} header"));
+        self.mouse_click(header.rect.center());
+        self.warm_up();
+    }
+
+    /// Open the settings window the way a user does: through the menu's
+    /// "Settings..." entry, in whichever presentation this width gives the
+    /// menu.
+    pub(crate) fn open_settings(&mut self) {
+        self.open_menu();
+        if self.width_class().has_menu_bar() {
+            self.open_menu_group("View");
+        } else {
+            // The drawer lays the menu out at the bottom of a long scroll, so
+            // the entry usually starts off screen.
+            let leaf = self
+                .menu_leaf("Settings...")
+                .expect("the drawer did not draw the Settings... entry");
+            let pos = egui::pos2(leaf.rect.center().x, self.screen_rect().center().y);
+            let found = self.scroll_until(pos, egui::vec2(0.0, -200.0), 200, |h| {
+                h.menu_leaf("Settings...")
+                    .is_some_and(|l| h.screen_rect().contains(l.rect.center()))
+            });
+            assert!(
+                found,
+                "could not scroll the drawer far enough to reach Settings..."
+            );
+        }
+        let leaf = self
+            .menu_leaf("Settings...")
+            .expect("the menu did not draw the Settings... entry");
+        assert!(
+            self.screen_rect().contains(leaf.rect.center()),
+            "Settings... was drawn at {:?}, outside the {:?} viewport",
+            leaf.rect,
+            self.screen_rect()
+        );
+        self.mouse_click(leaf.rect.center());
+        self.warm_up();
+        assert!(
+            self.gui.show_settings,
+            "clicking Settings... did not open the settings window"
+        );
+    }
+
     /// Every text run the last frame painted, without its rect.
     pub(crate) fn painted_text_strings(&self) -> Vec<String> {
         self.last_texts

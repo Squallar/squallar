@@ -460,6 +460,50 @@ impl super::Gui {
     }
 }
 
+/// Collect every leaf label under `nodes`, submenus flattened, in model order.
+#[cfg(test)]
+fn collect_leaf_labels(nodes: &[MenuNode], out: &mut Vec<&'static str>) {
+    for node in nodes {
+        match node {
+            MenuNode::Submenu { children, .. } => collect_leaf_labels(children, out),
+            MenuNode::Item { label, .. } | MenuNode::Toggle { label, .. } => out.push(label),
+            MenuNode::Separator => {}
+        }
+    }
+}
+
+#[cfg(test)]
+impl super::Gui {
+    /// Every leaf label the menu model currently offers, submenus flattened —
+    /// the inventory the parity walk asserts against the drawn
+    /// [`DrawnMenuLeaf`]s, derived from the model so a new entry joins the
+    /// audit by construction.
+    pub(crate) fn menu_model_leaf_labels(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        collect_leaf_labels(&self.menu_model(), &mut out);
+        out
+    }
+
+    /// The model's top-level groups: each submenu header with the leaf labels
+    /// under it, in model order — how the menu-bar presentation has to be
+    /// walked, one drop-down at a time. A top-level leaf outside any submenu
+    /// would not appear here; the parity walk cross-checks this flattening
+    /// against [`Self::menu_model_leaf_labels`] so one could not slip past it.
+    pub(crate) fn menu_model_groups(&self) -> Vec<(&'static str, Vec<&'static str>)> {
+        self.menu_model()
+            .iter()
+            .filter_map(|node| match node {
+                MenuNode::Submenu { label, children } => {
+                    let mut leaves = Vec::new();
+                    collect_leaf_labels(children, &mut leaves);
+                    Some((*label, leaves))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
