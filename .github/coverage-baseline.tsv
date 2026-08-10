@@ -7,7 +7,7 @@ nexrad-level3/src/model/radial.rs	8	4
 rustdar-android/src/lib.rs	576	84
 rustdar-egui/src/actions.rs	60	8
 rustdar-egui/src/config_store.rs	11	11
-rustdar-egui/src/input_harness.rs	4069	4000
+rustdar-egui/src/input_harness.rs	4083	4014
 rustdar-egui/src/overlay_cache.rs	421	402
 rustdar-egui/src/pane.rs	1079	1067
 rustdar-egui/src/pane_content.rs	466	451
@@ -104,8 +104,8 @@ rustdar-platform/src/config_store.rs	72	67
 rustdar-platform/src/main.rs	6	0
 rustdar-platform/src/network_security_config.rs	150	147
 rustdar-platform/src/os_location/apple.rs	119	119
-rustdar-platform/src/os_location/linux.rs	823	582
-rustdar-platform/src/os_location/mod.rs	45	41
+rustdar-platform/src/os_location/linux.rs	503	375
+rustdar-platform/src/os_location/mod.rs	45	44
 rustdar-platform/src/os_location/unsupported.rs	11	0
 rustdar-platform/src/os_location/windows.rs	233	233
 rustdar-platform/src/platform.rs	236	122
