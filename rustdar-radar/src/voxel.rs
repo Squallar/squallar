@@ -1100,8 +1100,36 @@ mod volume_alpha_profile {
     pub const ZDR_NEGATIVE_DB: f32 = -3.0;
     pub const ZDR_COLUMN_DB: f32 = 3.0;
 
-    /// The diverging centre the **isosurface** reads for ZDR: rain's own
-    /// background, so the default surface draws both drop-size extremes.
+    /// The diverging centre the **isosurface** reads for ZDR — and, alone
+    /// among the ZDR constants here, a display choice rather than a
+    /// derivation. It is a bare literal because it derives from nothing;
+    /// dressing it as a `crate::hca::…` reference would be the same false
+    /// rationale this campaign exists to remove.
+    ///
+    /// 0.25 dB is where the shipped profile put its clear band, and it
+    /// predates the rain-band argument above. That argument does not reach
+    /// it, and it is deliberately **not** moved onto the HCA interval. The
+    /// quiet band answers "which ZDR values discriminate nothing", which is
+    /// a transparency question the classifier's own class kills settle; this
+    /// constant answers "where does a `DeviationFrom` level set take its
+    /// origin", which is a framing question the classifier has no opinion
+    /// on.
+    ///
+    /// Holding it is not free of consequence, so the consequence is stated.
+    /// [`default_iso_threshold`] is `ZDR_COLUMN_DB - ZDR_CENTRE_DB` = 2.75
+    /// dB, which puts the default surface's positive lobe exactly on
+    /// [`ZDR_COLUMN_DB`] — the same +3 dB the transparency profile above
+    /// reaches full alpha at — and its negative lobe at −2.5. Re-centring on
+    /// the rain band's midpoint of 1.25 dB moves that surface either way it
+    /// is then read: hold the 2.75 dB span and the lobes go to +4.0 and
+    /// −1.5, neither a landmark this module names; hold the
+    /// `ZDR_COLUMN_DB -` derivation and the span shrinks to 1.75 dB, putting
+    /// the negative lobe at −0.5 dB, inside the near-zero band the paragraph
+    /// below says an isosurface is the wrong instrument for. Either is a
+    /// user-visible change to what the default ZDR surface draws, and nothing
+    /// has been measured that says the moved pair reads better. Until
+    /// something has, this stays where it is, and the test pins both lobes so
+    /// that a later move is a deliberate one.
     ///
     /// Not the centre of the quiet band above, and not used by the
     /// transparency profile at all — that one is two-sided and has no single
@@ -1281,9 +1309,11 @@ pub fn iso_shape(product: RadarProduct) -> IsoShape {
 /// * Velocity / SRV 20 m/s — where the transparency profile reaches opaque:
 ///   the cores and couplets, free of ambient flow.
 /// * Spectrum width 8 m/s — the profile's turbulence edge.
-/// * ZDR 2.75 dB from the +0.25 rain centre — the big-drop column at +3 dB
-///   and the rare negative tail at −2.5. **Not** the hail signature: that one
-///   is ZDR ≈ 0, a band around this centre rather than beyond it, and a
+/// * ZDR 2.75 dB from the +0.25 dB display centre
+///   ([`volume_alpha_profile::ZDR_CENTRE_DB`], a framing choice and not the
+///   rain band's midpoint) — the big-drop column at +3 dB and the rare
+///   negative tail at −2.5. **Not** the hail signature: that one is ZDR ≈ 0,
+///   a band around this centre rather than beyond it, and a
 ///   `DeviationFrom` surface cannot enclose it. The lit volume shows it
 ///   ([`volume_alpha_profile::ZDR_TUMBLING_ALPHA`]); the isosurface does not.
 /// * ΦDP 180° — mid-turn; a cumulative site-offset moment has no principled

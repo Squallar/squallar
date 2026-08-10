@@ -2568,7 +2568,11 @@ fn the_isosurface_params_translate_the_user_threshold_per_shape() {
     assert_ne!(centre_db, 0.0, "precondition: ZDR's centre is off zero");
     let (centre, threshold) = zdr.iso_uniform_params(2.75);
     let c = zdr.value_to_index(centre_db);
-    assert_eq!(centre, f32::from(c) / 255.0, "centred on rain's own ZDR");
+    assert_eq!(
+        centre,
+        f32::from(c) / 255.0,
+        "centred on the profile's declared ZDR centre",
+    );
     assert_ne!(
         centre,
         f32::from(zdr.value_to_index(0.0)) / 255.0,
@@ -2578,13 +2582,20 @@ fn the_isosurface_params_translate_the_user_threshold_per_shape() {
     assert_eq!(
         threshold,
         f32::from(zdr.value_to_index(centre_db + 2.75) - c) / 255.0,
-        "the crossing distance is 2.75 dB of ramp FROM the rain centre",
+        "the crossing distance is 2.75 dB of ramp FROM the declared centre",
     );
     // Which is to say the default surface is the +3 dB column and the
     // −2.5 dB tail, not the hail value at 0 — the profile shows that one.
+    let default_db = default_iso_threshold(RadarProduct::DifferentialReflectivity);
+    assert_eq!(default_db, volume_alpha_profile::ZDR_COLUMN_DB - centre_db);
+    // The two lobes as the numbers a user sees, so that moving the centre
+    // is a change to this pair and not a silent one. The centre is a
+    // display choice, argued as such where it is declared; this is what
+    // holding it at 0.25 dB draws.
     assert_eq!(
-        default_iso_threshold(RadarProduct::DifferentialReflectivity),
-        volume_alpha_profile::ZDR_COLUMN_DB - centre_db,
+        (centre_db + default_db, centre_db - default_db),
+        (3.0, -2.5),
+        "the default ZDR surface's positive and negative lobes",
     );
 
     // The derived products carry their own ramps, so their thresholds
