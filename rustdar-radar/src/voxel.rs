@@ -315,7 +315,7 @@ use nexrad_model::data::Scan;
 
 use crate::beam;
 use crate::palette::{get_color_for_value, get_legend_scale};
-use crate::sampler::{Column, VolumeSampler, samplable};
+use crate::sampler::{Column, VolumeSampler};
 use crate::types::{MomentSlot, RadarProduct};
 
 /// The palette index meaning "the radar did not measure anything here", and
@@ -916,6 +916,29 @@ fn data_levels(slot: MomentSlot) -> (f32, f32) {
     }
 }
 
+/// [`data_levels`], with the derived products' own ranges layered over the
+/// slot's.
+///
+/// A derived product borrows a native moment's *slot* but not its units:
+/// NROT is unitless rotation in a velocity slot, KDP is °/km in a ΦDP slot —
+/// encoded into the slot's ramp they would read as nonsense (±4 rotation
+/// squeezed into ±63.5 m/s is half an index of signal). SRV keeps velocity's
+/// range: same units, same symmetric-about-zero palette. The ranges here
+/// match `derive`'s codecs exactly — raw 2..=255 and index 1..=255 both span
+/// `[lo, hi]`.
+fn data_levels_for(product: RadarProduct, slot: MomentSlot) -> (f32, f32) {
+    match product {
+        // Unitless; GR pins the meso class near |1|, ±4 keeps extreme
+        // couplets on scale at 0.031 resolution.
+        RadarProduct::NormalizedRotation => (-4.0, 4.0),
+        // The estimator's own display clamp.
+        RadarProduct::SpecificDifferentialPhase => {
+            (crate::kdp::KDP_MIN_DISPLAY, crate::kdp::KDP_MAX_DISPLAY)
+        }
+        _ => data_levels(slot),
+    }
+}
+
 /// The full ramp: [`data_levels`] with index 0 placed one step below index 1.
 ///
 /// The 255 data indices span `[lo, hi]`, so one step is `(hi − lo)/254` and
@@ -925,6 +948,19 @@ fn value_range_for(slot: MomentSlot) -> (f32, f32) {
     let (lo, hi) = data_levels(slot);
     let step = (f64::from(hi) - f64::from(lo)) / 254.0;
     ((f64::from(lo) - step) as f32, hi)
+}
+
+/// [`value_range_for`] keyed by product first — the derived products carry
+/// their own ranges (see [`data_levels_for`]).
+fn value_range_for_product(product: RadarProduct, slot: MomentSlot) -> (f32, f32) {
+    match product {
+        RadarProduct::NormalizedRotation | RadarProduct::SpecificDifferentialPhase => {
+            let (lo, hi) = data_levels_for(product, slot);
+            let step = (f64::from(hi) - f64::from(lo)) / 254.0;
+            ((f64::from(lo) - step) as f32, hi)
+        }
+        _ => value_range_for(slot),
+    }
 }
 
 /// Where a moment's default 3D transparency starts and ends, in the moment's
@@ -980,6 +1016,26 @@ mod volume_alpha_profile {
     /// ~35 % alpha the field reads as a haze with visible interior structure
     /// rather than a wall.
     pub const PHI_ALPHA: f32 = 0.35;
+
+    /// Storm-relative velocity diverges about zero exactly as base velocity
+    /// does, and shares its profile: with the storm motion subtracted, the
+    /// near-zero band is air moving *with* the storm — the background — and
+    /// the couplet cores the product exists to show sit beyond ±20 m/s.
+    /// (The constants are velocity's own, reused at the profile table.)
+    ///
+    /// Normalized rotation: clear under |0.4| (the shear noise floor — the
+    /// 2D palette's own first visible class), opaque at |1.0| and beyond,
+    /// the mesocyclone convention GR pins its meso class to. A rotation
+    /// volume is then a pair of standing columns where couplets stack.
+    pub const NROT_CLEAR: f32 = 0.4;
+    pub const NROT_OPAQUE: f32 = 1.0;
+
+    /// Specific differential phase is sequential like reflectivity: clear
+    /// under 0.25 °/km (drizzle and noise — below the estimator's own
+    /// significance), opaque by 1.5 °/km, where heavy rain cores and
+    /// hail-with-rain shafts live.
+    pub const KDP_CLEAR_DEG_KM: f32 = 0.25;
+    pub const KDP_OPAQUE_DEG_KM: f32 = 1.5;
 }
 
 /// `x` mapped smoothly from 0 at `edge0` to 1 at `edge1`, clamped.
@@ -1000,7 +1056,6 @@ fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
 /// product must have its transparency argued, not inherited — above all a
 /// categorical palette, which must never be softened at all.
 fn volume_alpha_scale(product: RadarProduct, value: f32) -> f32 {
-
     use volume_alpha_profile as p;
     match product {
         RadarProduct::Reflectivity => 1.0,
@@ -1015,23 +1070,31 @@ fn volume_alpha_scale(product: RadarProduct, value: f32) -> f32 {
         ),
         RadarProduct::CorrelationCoefficient => 1.0 - smoothstep(p::CC_OPAQUE, p::CC_CLEAR, value),
         RadarProduct::DifferentialPhase => p::PHI_ALPHA,
-        // Unreachable today: `crate::sampler::samplable` refuses everything
+        // The derived products, admitted by `crate::derive`. SRV shares
+        // velocity's profile — same units, same diverging shape, same
+        // physics once the storm motion is subtracted.
+        RadarProduct::StormRelativeVelocity => {
+            smoothstep(p::VELOCITY_CLEAR_MS, p::VELOCITY_OPAQUE_MS, value.abs())
+        }
+        RadarProduct::NormalizedRotation => smoothstep(p::NROT_CLEAR, p::NROT_OPAQUE, value.abs()),
+        RadarProduct::SpecificDifferentialPhase => {
+            smoothstep(p::KDP_CLEAR_DEG_KM, p::KDP_OPAQUE_DEG_KM, value)
+        }
+        // Unreachable today: `crate::derive::volume_slot` refuses everything
         // below before a table is built. Spelled out rather than wildcarded so
         // a new `RadarProduct` variant fails to compile until it is classified
-        // here, and so the arm anyone widening `samplable` must move a product
-        // out of is this one — with its transparency argued, not inherited.
-        // Above all the categorical classification must never be softened.
-        RadarProduct::StormRelativeVelocity
-        | RadarProduct::SpecificDifferentialPhase
-        | RadarProduct::EchoTops
+        // here, and so the arm anyone widening the vertical-view product set
+        // must move a product out of is this one — with its transparency
+        // argued, not inherited. Above all the categorical classification
+        // must never be softened.
+        RadarProduct::EchoTops
         | RadarProduct::EchoTopsInterpolated
         | RadarProduct::VerticallyIntegratedLiquid
         | RadarProduct::VilDensity
         | RadarProduct::ProbabilityOfSevereHail
         | RadarProduct::MaxExpectedHailSize
         | RadarProduct::HydrometeorClassification
-        | RadarProduct::PrecipitationRate
-        | RadarProduct::NormalizedRotation => 1.0,
+        | RadarProduct::PrecipitationRate => 1.0,
     }
 }
 
@@ -1082,6 +1145,21 @@ fn colormap_lut(product: RadarProduct, range: (f32, f32)) -> Vec<u8> {
 /// A `half_width_km` outside `[MIN_HALF_WIDTH_KM, MAX_HALF_WIDTH_KM]` is
 /// **clamped**, not refused.
 pub fn build_voxels(scan: &Scan, req: &VoxelRequest, lat: f64, lon: f64) -> Option<VoxelGrid> {
+    build_voxels_with_motion(scan, req, lat, lon, None)
+}
+
+/// [`build_voxels`] with the user's storm motion override
+/// `(speed_kt, direction_from_deg)`, read only when the product is
+/// storm-relative velocity. Separate entry point rather than a request field
+/// so the override never rides the voxel job's wire encoding — the worker
+/// reads it off the `RenderInput`, which already carries it.
+pub fn build_voxels_with_motion(
+    scan: &Scan,
+    req: &VoxelRequest,
+    lat: f64,
+    lon: f64,
+    storm_motion_override: Option<(f32, f32)>,
+) -> Option<VoxelGrid> {
     let shape = req.shape;
     if !shape.is_supported() {
         log::warn!(
@@ -1112,8 +1190,18 @@ pub fn build_voxels(scan: &Scan, req: &VoxelRequest, lat: f64, lon: f64) -> Opti
         return None;
     }
 
-    let slot = samplable(req.product)?;
-    let sampler = VolumeSampler::new(scan, req.product).ok()?;
+    // The derivation seam, shared with `xsect::render_section`: native
+    // moments pass through as a borrow; SRV/NROT/KDP are computed per sweep
+    // here, before anything samples, so a raw volume can never be resampled
+    // under a derived label.
+    let slot = crate::derive::volume_slot(req.product)?;
+    let prepared = crate::derive::prepare(scan, req.product, storm_motion_override)?;
+    let sampler = match &prepared {
+        crate::derive::Prepared::Native(scan) => VolumeSampler::new(scan, req.product).ok()?,
+        crate::derive::Prepared::Derived(scan) => {
+            VolumeSampler::for_derived(scan, req.product, slot).ok()?
+        }
+    };
 
     let half = req
         .half_width_km
@@ -1133,7 +1221,7 @@ pub fn build_voxels(scan: &Scan, req: &VoxelRequest, lat: f64, lon: f64) -> Opti
     // The same spelling `render.rs` uses for `radar_km_msl`.
     let site_km_msl = crate::eet::radar_height_ft_near(lat, lon) * 0.0003048;
 
-    let value_range = value_range_for(slot);
+    let value_range = value_range_for_product(req.product, slot);
     let lut = colormap_lut(req.product, value_range);
 
     let (nx, ny, nz) = (shape.nx, shape.ny, shape.nz);
@@ -1318,10 +1406,10 @@ impl VoxelGrid {
         }
         let product = RadarProduct::from_wire_code(r.u16()?)?;
         // The same refusal `build_voxels` makes. A payload naming a product
-        // with no native moment has no ramp `value_range` could have come
-        // from, so its indices would decode to numbers in units nothing
-        // measures.
-        let slot = samplable(product)?;
+        // with neither a native moment nor a derivation has no ramp
+        // `value_range` could have come from, so its indices would decode to
+        // numbers in units nothing measures.
+        let slot = crate::derive::volume_slot(product)?;
 
         let shape = VoxelShape {
             nx: r.u32()? as usize,
@@ -1380,7 +1468,7 @@ impl VoxelGrid {
         // looks like weather, and is a different field. Recomputed and compared
         // rather than trusted, which is `JobRequest`'s rule for the product
         // appearing twice, applied one level down.
-        if value_range != value_range_for(slot) {
+        if value_range != value_range_for_product(product, slot) {
             return None;
         }
 
@@ -1519,7 +1607,7 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sampler::{Sample, SampleStatus};
+    use crate::sampler::{Sample, SampleStatus, samplable};
     use nexrad_model::data::{
         ChannelConfiguration, ElevationCut, MomentData, PulseWidth, Radial, RadialStatus, Sweep,
         VolumeCoveragePattern, WaveformType,
@@ -2021,6 +2109,13 @@ mod tests {
 
     // ── Refusals ────────────────────────────────────────────────────────────
 
+    /// Two refusal kinds, distinguished on purpose. The integrals and the
+    /// classification have **no per-tilt field at all** — `derive::volume_slot`
+    /// refuses them on any volume. The derived products (SRV, NROT, KDP) have
+    /// one, but this fixture is reflectivity-only, so their derivation finds
+    /// no source moment and refuses **this volume** — the same products build
+    /// real grids on a velocity/ΦDP-carrying volume, which
+    /// `derive::tests::a_derived_voxel_grid_resamples_the_derived_field` pins.
     #[test]
     fn a_product_with_no_native_moment_is_refused() {
         let scan = scan_of(&|_, _| Some(40.0));
@@ -2028,9 +2123,6 @@ mod tests {
             RadarProduct::VerticallyIntegratedLiquid,
             RadarProduct::EchoTops,
             RadarProduct::HydrometeorClassification,
-            RadarProduct::NormalizedRotation,
-            RadarProduct::StormRelativeVelocity,
-            RadarProduct::SpecificDifferentialPhase,
             RadarProduct::VilDensity,
         ] {
             let req = VoxelRequest {
@@ -2040,7 +2132,23 @@ mod tests {
             assert_eq!(
                 build_voxels(&scan, &req, SITE.0, SITE.1),
                 None,
-                "{} has no Level II moment to resample",
+                "{} has no per-tilt field to resample, on any volume",
+                product.name(),
+            );
+        }
+        for product in [
+            RadarProduct::NormalizedRotation,
+            RadarProduct::StormRelativeVelocity,
+            RadarProduct::SpecificDifferentialPhase,
+        ] {
+            let req = VoxelRequest {
+                product,
+                ..request(ODD)
+            };
+            assert_eq!(
+                build_voxels(&scan, &req, SITE.0, SITE.1),
+                None,
+                "{} derives from a moment this volume does not carry",
                 product.name(),
             );
         }

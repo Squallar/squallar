@@ -2,6 +2,7 @@ pub mod archive;
 pub mod beam;
 pub mod chunks;
 pub mod current;
+pub mod derive;
 pub(crate) mod dpprep;
 pub mod eet;
 pub mod hail;

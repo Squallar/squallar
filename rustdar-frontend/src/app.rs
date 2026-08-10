@@ -1585,6 +1585,9 @@ impl App {
             product,
             radar.lat,
             radar.lon,
+            // The user's storm motion vector, for the worker-side SRV
+            // derivation; the extraction keeps it only on an SRV payload.
+            self.render.storm_motion_override_kt(),
         )
     }
 

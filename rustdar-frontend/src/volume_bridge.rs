@@ -524,6 +524,22 @@ impl VolumeStore {
         self.lock().detach(pane_idx);
     }
 
+    /// Drop every entry (and orphaned floor) whose target names `product`.
+    ///
+    /// For a render parameter that is not part of the target: the storm
+    /// motion vector changes what an SRV grid *contains* without changing the
+    /// `VolumeTarget` that keys it, so an override edit must evict here or
+    /// every SRV pane keeps painting the old vector's field for the rest of
+    /// the volume. The plan-view cache has the same rule
+    /// (`RenderDispatcher::set_storm_motion_override`); this is its 3D
+    /// counterpart. Panes re-ask through the level-triggered `PrepareVolume`
+    /// once their `rendered_for` is cleared, which the caller does.
+    pub fn evict_product(&self, product: rustdar_radar::types::RadarProduct) {
+        let mut inner = self.lock();
+        inner.entries.retain(|e| e.target.product != product);
+        inner.prune_floors();
+    }
+
     /// What is in hand for `target`, if anything.
     pub fn lookup(&self, target: &VolumeTarget) -> Option<VolumeLookup> {
         let inner = self.lock();

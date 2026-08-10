@@ -1286,10 +1286,14 @@ fn volume_pane_outcome(
              lands, then updates tilt by tilt as new sweeps arrive.",
         ));
     };
-    if rustdar_radar::sampler::samplable(product).is_none() {
+    // `volume_slot`, not `samplable`: the derived products (SRV, NROT, KDP)
+    // render through the worker-side derivation layer, so only the products
+    // with no per-tilt field at all are refused here — and the message says
+    // which kind of field the pane needs.
+    if rustdar_radar::derive::volume_slot(product).is_none() {
         return VolumeOutcome::empty_state(format!(
             "{} has no vertical structure to render in 3D — pick a moment the radar measures \
-             directly",
+             or derives tilt by tilt",
             product.name(),
         ));
     }

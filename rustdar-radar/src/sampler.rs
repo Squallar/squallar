@@ -344,11 +344,14 @@ pub enum SamplerError {
 ///   vertical section of one would draw the same number at every height and
 ///   look like a measurement.
 ///
-/// The two velocity *derivations* are refused for a third reason: NROT and SRM
-/// /SRV are computed per sweep from a whole volume's wind fit, so sampling
-/// them means deriving them first. That is a later work package's problem, not
-/// a silent one — they are refused rather than quietly served from raw
-/// velocity, which would look right and be a different field.
+/// The *derivations* (NROT, SRV, KDP) are refused **here** for a third
+/// reason: they are computed per sweep, so sampling them means deriving them
+/// first — refused rather than quietly served from raw velocity, which would
+/// look right and be a different field. That derivation now exists:
+/// [`crate::derive::prepare`] computes them into synthetic scans, and
+/// [`crate::derive::volume_slot`] is the predicate the vertical views gate
+/// on. This function stays the **raw-scan** gate, which is exactly why the
+/// derived products stay out of it.
 pub fn samplable(product: RadarProduct) -> Option<MomentSlot> {
     match product {
         RadarProduct::Reflectivity => Some(MomentSlot::Reflectivity),
@@ -379,9 +382,15 @@ fn refusal_reason(product: RadarProduct) -> &'static str {
         }
         RadarProduct::NormalizedRotation | RadarProduct::StormRelativeVelocity => {
             "it is derived per sweep from a volume wind fit, so it has to be \
-             computed before it can be sampled"
+             computed before it can be sampled — crate::derive::prepare is \
+             that computation, and the door the vertical views go through"
         }
-        RadarProduct::SpecificDifferentialPhase | RadarProduct::PrecipitationRate => {
+        RadarProduct::SpecificDifferentialPhase => {
+            "it is derived per sweep from differential phase, so it has to be \
+             computed before it can be sampled — crate::derive::prepare is \
+             that computation, and the door the vertical views go through"
+        }
+        RadarProduct::PrecipitationRate => {
             "it is derived rather than measured, and no Level II moment carries it"
         }
         _ => "no Level II moment stands behind it",
@@ -847,7 +856,12 @@ pub fn ladder_fingerprint(
 ) -> Option<u64> {
     use std::hash::{Hash, Hasher};
 
-    let slot = samplable(product)?;
+    // `volume_slot`, not `samplable`: a derived product's ladder is its
+    // source moment's ladder (SRV and NROT climb the velocity cuts, KDP the
+    // ΦDP cuts), and the re-cut key has to see the same ladder the worker's
+    // derived sampler resolves or a section would never re-cut — or always
+    // re-cut — on a derived product.
+    let slot = crate::derive::volume_slot(product)?;
     let cuts = pattern.elevation_cuts();
     if cuts.is_empty() {
         return None;
@@ -913,6 +927,28 @@ impl<'a> VolumeSampler<'a> {
         })
     }
 
+    /// Resolve a **derived** scan's ladder for `product`, reading `slot`.
+    ///
+    /// The bypass [`crate::derive`] needs and nothing else may use:
+    /// [`samplable`] refuses the derived products precisely so a raw volume
+    /// can never be sampled under a derived label — this constructor exists
+    /// for a scan whose `slot` moment [`crate::derive::prepare`] has already
+    /// rewritten with the derived field. `pub(crate)` because the derivation
+    /// layer is the only legitimate caller; going through [`Self::new`] with
+    /// a derived product is a refusal by design, not a missing feature.
+    pub(crate) fn for_derived(
+        scan: &'a Scan,
+        product: RadarProduct,
+        slot: MomentSlot,
+    ) -> Result<Self, SamplerError> {
+        Self::build_for_slot(scan, product, slot).inspect_err(|e| {
+            log::warn!(
+                "volume sampler unavailable for derived {}: {e}",
+                product.code()
+            );
+        })
+    }
+
     fn build(scan: &'a Scan, product: RadarProduct) -> Result<Self, SamplerError> {
         let Some(slot) = samplable(product) else {
             return Err(SamplerError::NotSamplable {
@@ -920,7 +956,14 @@ impl<'a> VolumeSampler<'a> {
                 reason: refusal_reason(product),
             });
         };
+        Self::build_for_slot(scan, product, slot)
+    }
 
+    fn build_for_slot(
+        scan: &'a Scan,
+        product: RadarProduct,
+        slot: MomentSlot,
+    ) -> Result<Self, SamplerError> {
         let cuts = scan.coverage_pattern().elevation_cuts();
         if cuts.is_empty() {
             return Err(SamplerError::EmptyCoveragePattern {

@@ -293,12 +293,14 @@ impl RenderInput {
     ///
     /// The arguments [`extract`](Self::extract) takes and this one does not are
     /// the ones that mean nothing here. There is no elevation because there is
-    /// no tilt: a section cuts across all of them. There is no storm motion
-    /// override and no environment because the only products that read either
-    /// are ones [`crate::sampler::samplable`] refuses outright — the two
-    /// velocity derivations, the hail pair and the classification — so carrying
-    /// them would make a section payload's bytes depend on caches no section
-    /// can consult.
+    /// no tilt: a section cuts across all of them. There is no environment
+    /// because the only products that read one — the hail pair and the
+    /// classification — are ones [`crate::derive::volume_slot`] refuses, so
+    /// carrying it would make a section payload's bytes depend on caches no
+    /// section can consult. The storm motion override *is* carried, since the
+    /// vertical views derive SRV ([`crate::derive`]); this entry passes
+    /// `None`, and [`extract_volume_parts`](Self::extract_volume_parts) is the
+    /// door that takes a real one.
     ///
     /// The stored elevation is [`NO_ELEVATION_DEG`], which is what makes this
     /// safe to hand to a frame consumer by mistake: `render_from` runs
@@ -341,11 +343,22 @@ impl RenderInput {
         product: RadarProduct,
         radar_lat: f64,
         radar_lon: f64,
+        storm_motion_override: Option<(f32, f32)>,
     ) -> Option<Self> {
-        let slot = product.moment_slot()?;
-        // Only the HHC reads moments beyond its slot; everything else ships
-        // the slot moment alone.
-        let all_moments = product == RadarProduct::HydrometeorClassification;
+        // The slot the vertical views sample through: the native moment, or a
+        // derived product's *source* moment — SRV and NROT ride the velocity
+        // planes and KDP the ΦDP planes to the worker, which derives there
+        // (`crate::derive`).
+        let slot = product
+            .moment_slot()
+            .or_else(|| crate::derive::derived_slot(product))?;
+        // The HHC reads moments beyond its slot; so does the KDP derivation,
+        // whose estimator gates on Z and ρHV. Everything else ships the slot
+        // moment alone.
+        let all_moments = matches!(
+            product,
+            RadarProduct::HydrometeorClassification | RadarProduct::SpecificDifferentialPhase
+        );
         let cuts = CutTable::of_pattern(pattern);
         let sweeps = collect_sweeps(sweeps.iter().copied(), &cuts, slot, all_moments);
         // Empty on a volume that carries the product nowhere. The renderer
@@ -359,9 +372,13 @@ impl RenderInput {
             elevation: NO_ELEVATION_DEG,
             radar_lat,
             radar_lon,
-            // A volume payload never carries either — see
-            // [`extract_volume`](Self::extract_volume) for why.
-            storm_motion_override: None,
+            // Carried for exactly the one product whose derivation reads it,
+            // so no other product's payload bytes depend on the storm-motion
+            // cache — the byte-identity rule `env_heights_km_msl` follows
+            // below, applied here too.
+            storm_motion_override: (product == RadarProduct::StormRelativeVelocity)
+                .then_some(storm_motion_override)
+                .flatten(),
             env_heights_km_msl: None,
             vcp: pattern.pattern_number().number(),
             declared_cut_angles_deg: pattern
@@ -394,6 +411,7 @@ impl RenderInput {
                 product,
                 radar_lat,
                 radar_lon,
+                storm_motion_override,
             );
         }
         let elevation = scope.elevation();
@@ -1785,6 +1803,7 @@ mod tests {
                 product,
                 LAT,
                 LON,
+                None,
             )
             .expect("the same volume, as parts");
             assert_eq!(

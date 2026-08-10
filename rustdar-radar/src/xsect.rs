@@ -199,9 +199,11 @@ pub struct SectionRequest {
     /// Top of the height axis, km MSL. `None` takes the site's elevation plus
     /// [`DEFAULT_AXIS_HEIGHT_KM`], which clears the whole volume.
     pub top_km_msl: Option<f64>,
-    /// The moment to section. Anything [`crate::sampler::samplable`] refuses —
-    /// the hybrid classification, the column integrals, the velocity
-    /// derivations — makes [`render_section`] return `None`.
+    /// The moment to section. Anything [`crate::derive::volume_slot`] refuses
+    /// — the hybrid classification, the column integrals, the precipitation
+    /// rate — makes [`render_section`] return `None`; the velocity and phase
+    /// derivations (SRV, NROT, KDP) are computed per sweep by
+    /// [`crate::derive::prepare`] before sampling.
     pub product: RadarProduct,
 }
 
@@ -615,11 +617,18 @@ impl CrossSection {
 /// * a line of zero length (the two endpoints are the same place);
 /// * a `top_km_msl` that is not above the site's elevation, which names no
 ///   axis at all;
-/// * a product [`crate::sampler::samplable`] refuses, or a volume
+/// * a product [`crate::derive::volume_slot`] refuses (no native moment and
+///   no derivation), a derivation that cannot run ([`crate::derive::prepare`]
+///   — above all SRV with no storm motion vector), or a volume
 ///   [`VolumeSampler::new`] refuses — most importantly one whose coverage
 ///   pattern is the empty placeholder a worker's reconstructed scan carries,
 ///   which would otherwise build a *different tilt ladder* from the main
 ///   thread's with no error anywhere.
+///
+/// `storm_motion_override` is the user's `(speed_kt, direction_from_deg)`
+/// vector, read only when `req.product` is storm-relative velocity — the
+/// same pair the plan-view SRV render receives, threaded from the
+/// `RenderInput` by the worker's job handler.
 ///
 /// Every refusal is logged, so a `None` swallowed by a `?` still leaves its
 /// reason somewhere.
@@ -628,8 +637,20 @@ pub fn render_section(
     req: &SectionRequest,
     lat: f64,
     lon: f64,
+    storm_motion_override: Option<(f32, f32)>,
 ) -> Option<CrossSection> {
-    let sampler = VolumeSampler::new(scan, req.product).ok()?;
+    // The derivation seam: native moments pass through as a borrow; derived
+    // products are computed here, per sweep, before anything samples — so a
+    // raw volume can never be sampled under a derived label (the sampler's
+    // own gate still refuses that combination).
+    let prepared = crate::derive::prepare(scan, req.product, storm_motion_override)?;
+    let sampler = match &prepared {
+        crate::derive::Prepared::Native(scan) => VolumeSampler::new(scan, req.product).ok()?,
+        crate::derive::Prepared::Derived(scan) => {
+            let slot = crate::derive::derived_slot(req.product)?;
+            VolumeSampler::for_derived(scan, req.product, slot).ok()?
+        }
+    };
     render_with_sampler(&sampler, req, lat, lon)
 }
 
@@ -1397,7 +1418,7 @@ mod tests {
     /// `column_distance_km(c)` exactly.
     fn radial_section(scan: &Scan, bearing_deg: f64, length_km: f64) -> CrossSection {
         let req = request(SITE, point_at(bearing_deg, length_km));
-        render_section(scan, &req, SITE.0, SITE.1).expect("a radial section renders")
+        render_section(scan, &req, SITE.0, SITE.1, None).expect("a radial section renders")
     }
 
     fn status_at(section: &CrossSection, col: usize, row: usize) -> SampleStatus {
@@ -1716,7 +1737,7 @@ mod tests {
         // radial, so the azimuth changes down the raster and a track measured
         // as a straight lat/lon lerp would drift off it.
         let req = request(point_at(310.0, 40.0), point_at(65.0, 190.0));
-        let section = render_section(&scan, &req, SITE.0, SITE.1).unwrap();
+        let section = render_section(&scan, &req, SITE.0, SITE.1, None).unwrap();
         let axes = *section.axes();
         let sampler = VolumeSampler::new(&scan, RadarProduct::Reflectivity).unwrap();
 
@@ -2327,6 +2348,7 @@ mod tests {
             &request(point_at(5.0, 120.0), point_at(35.0, 150.0)),
             SITE.0,
             SITE.1,
+            None,
         )
         .unwrap();
         assert_eq!(far.axes().cone_of_silence_km, 0.0);
@@ -2338,7 +2360,7 @@ mod tests {
     fn the_cone_extent_follows_the_axis_the_caller_asked_for() {
         let scan = scan_with(&|_az, _slant| Gate::Dbz(35.0));
         let end = point_at(5.0, 120.0);
-        let tall = render_section(&scan, &request(SITE, end), SITE.0, SITE.1).unwrap();
+        let tall = render_section(&scan, &request(SITE, end), SITE.0, SITE.1, None).unwrap();
 
         let low = render_section(
             &scan,
@@ -2348,6 +2370,7 @@ mod tests {
             },
             SITE.0,
             SITE.1,
+            None,
         )
         .unwrap();
 
@@ -2375,7 +2398,7 @@ mod tests {
         let scan = scan_with(&|az, slant| Gate::Dbz(20.0 + az / 36.0 + slant / 50.0));
         // Straight through the site: 100 km out on 20°, 100 km out on 200°.
         let req = request(point_at(200.0, 100.0), point_at(20.0, 100.0));
-        let section = render_section(&scan, &req, SITE.0, SITE.1).unwrap();
+        let section = render_section(&scan, &req, SITE.0, SITE.1, None).unwrap();
         let axes = *section.axes();
 
         // Ground ranges along the line, recomputed the way the renderer does.
@@ -2489,7 +2512,7 @@ mod tests {
     fn the_blind_guard_holds_where_the_first_gate_starts_at_the_antenna() {
         let scan = scan_with_first_gate(&|az, _slant| Gate::Dbz(20.0 + az / 12.0), 0);
         let req = request(point_at(200.0, 40.0), point_at(20.0, 40.0));
-        let section = render_section(&scan, &req, SITE.0, SITE.1).unwrap();
+        let section = render_section(&scan, &req, SITE.0, SITE.1, None).unwrap();
         let axes = *section.axes();
 
         let col = (0..SECTION_WIDTH)
@@ -2931,15 +2954,22 @@ mod tests {
         let end = point_at(45.0, 100.0);
 
         assert!(
-            render_section(&scan, &request(SITE, SITE), SITE.0, SITE.1).is_none(),
+            render_section(&scan, &request(SITE, SITE), SITE.0, SITE.1, None).is_none(),
             "a zero-length line rendered",
         );
         assert!(
-            render_section(&scan, &request((f64::NAN, -97.0), end), SITE.0, SITE.1).is_none(),
+            render_section(
+                &scan,
+                &request((f64::NAN, -97.0), end),
+                SITE.0,
+                SITE.1,
+                None
+            )
+            .is_none(),
             "a non-finite endpoint rendered",
         );
         assert!(
-            render_section(&scan, &request(SITE, end), f64::INFINITY, SITE.1).is_none(),
+            render_section(&scan, &request(SITE, end), f64::INFINITY, SITE.1, None).is_none(),
             "a non-finite site rendered",
         );
         for top in [
@@ -2957,6 +2987,7 @@ mod tests {
                     },
                     SITE.0,
                     SITE.1,
+                    None
                 )
                 .is_none(),
                 "a top of {top:?} km MSL rendered",
@@ -2973,6 +3004,7 @@ mod tests {
                 },
                 SITE.0,
                 SITE.1,
+                None
             )
             .is_some(),
         );
@@ -2989,13 +3021,14 @@ mod tests {
                 },
                 SITE.0,
                 SITE.1,
+                None
             )
             .is_none(),
             "a column integral was sectioned",
         );
         let placeholder = Scan::new(vcp(&[]), scan.sweeps().to_vec());
         assert!(
-            render_section(&placeholder, &request(SITE, end), SITE.0, SITE.1).is_none(),
+            render_section(&placeholder, &request(SITE, end), SITE.0, SITE.1, None).is_none(),
             "a scan with an empty cut table rendered, so a worker would build \
              a different ladder than the main thread with no error",
         );
@@ -3012,7 +3045,8 @@ mod tests {
             (point_at(90.0, 400.0), point_at(270.0, 400.0)),
             (point_at(10.0, 0.2), point_at(190.0, 0.2)),
         ] {
-            let section = render_section(&scan, &request(start, end), SITE.0, SITE.1).unwrap();
+            let section =
+                render_section(&scan, &request(start, end), SITE.0, SITE.1, None).unwrap();
             let a = section.axes();
             for (name, v) in [
                 ("length_km", a.length_km),
@@ -3055,6 +3089,7 @@ mod tests {
             &request(point_at(0.0, 800.0), point_at(90.0, 800.0)),
             SITE.0,
             SITE.1,
+            None,
         )
         .unwrap();
         assert!(
@@ -3699,6 +3734,7 @@ mod tests {
             &request(point_at(0.0, 800.0), point_at(90.0, 800.0)),
             SITE.0,
             SITE.1,
+            None,
         )
         .expect("a section well outside the volume still renders");
         let shallow = render_section(
@@ -3709,6 +3745,7 @@ mod tests {
             },
             SITE.0,
             SITE.1,
+            None,
         )
         .expect("a low axis renders");
 
@@ -3773,6 +3810,7 @@ mod tests {
             &request(point_at(0.0, 800.0), point_at(90.0, 800.0)),
             SITE.0,
             SITE.1,
+            None,
         )
         .unwrap();
         assert_eq!(blank.encoded_len(), blank.to_bytes().len());

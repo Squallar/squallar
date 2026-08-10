@@ -628,18 +628,23 @@ pub fn execute(request: &JobRequest) -> JobResult {
         // is the same shape the `Radar` arm has: one renderer, run wherever the
         // job landed, rather than a worker-side reimplementation that could
         // come to disagree with the main thread's.
+        // The storm motion override rides the `RenderInput` — the lane the
+        // plan-view SRV render already uses — and is threaded here into the
+        // derivation seam both vertical renderers share.
         JobRequest::Section { input, request } => rustdar_radar::xsect::render_section(
             &input.to_scan(),
             request,
             input.radar_lat(),
             input.radar_lon(),
+            input.storm_motion_override(),
         )
         .map(|section| JobOutput::Section(Box::new(section))),
-        JobRequest::Voxels { input, request } => rustdar_radar::voxel::build_voxels(
+        JobRequest::Voxels { input, request } => rustdar_radar::voxel::build_voxels_with_motion(
             &input.to_scan(),
             request,
             input.radar_lat(),
             input.radar_lon(),
+            input.storm_motion_override(),
         )
         .map(|grid| JobOutput::Voxels(Box::new(grid))),
     }

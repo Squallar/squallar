@@ -598,7 +598,31 @@ impl super::App {
         // Editing the vector changes nothing else about a pane, so the derived
         // storm-relative tilts have to be invalidated explicitly.
         let storm_motion = self.gui.storm_motion_override.sample();
-        self.render.set_storm_motion_override(storm_motion);
+        if self.render.set_storm_motion_override(storm_motion) {
+            // The vertical views' counterpart of the plan-view invalidation
+            // the setter just did: an SRV grid or section is derived *with*
+            // the vector, but the vector is not part of the target that keys
+            // it — without this, an override edit leaves every SRV volume and
+            // section painting the old vector's field until the next volume.
+            self.volume_store
+                .evict_product(rustdar_radar::types::RadarProduct::StormRelativeVelocity);
+            for pane_idx in 0..self.gui.pane_count() {
+                let Some(pane) = self.gui.pane_mut(pane_idx) else {
+                    continue;
+                };
+                if pane.selected_product
+                    != rustdar_radar::types::RadarProduct::StormRelativeVelocity
+                {
+                    continue;
+                }
+                if let Some(volume) = pane.volume_mut() {
+                    volume.rendered_for = None;
+                }
+                if let Some(section) = pane.cross_section_mut() {
+                    section.rendered_for = None;
+                }
+            }
+        }
         for pane_idx in 0..self.gui.pane_count() {
             // Ahead of the rendering-params branch, not inside it. A pane with
             // no plan view still has a product and an elevation selected —
@@ -791,7 +815,12 @@ impl super::App {
                 self.mark_section_unavailable(pane_idx, reason);
                 continue;
             }
-            if rustdar_radar::sampler::samplable(target.product).is_none() {
+            // `volume_slot`, not `samplable`: the derived products (SRV,
+            // NROT, KDP) slice through the worker-side derivation layer
+            // (`rustdar_radar::derive`), so only the products with no
+            // per-tilt field at all — the hybrid classification, the column
+            // integrals, the precipitation rate — are refused here.
+            if rustdar_radar::derive::volume_slot(target.product).is_none() {
                 // Permanent for this product, so the key *is* written: nothing
                 // about this volume will make a column integral sliceable, and
                 // re-asking every frame would be a busy loop with no output.
@@ -816,6 +845,10 @@ impl super::App {
             // its payload cache misses — the closure owns the `Arc`s and
             // resolves the same merge the refusal check above cleared.
             let product = target.product;
+            // Captured before the closure: the user's storm motion vector,
+            // for the worker-side SRV derivation. The extraction keeps it
+            // only on an SRV payload.
+            let motion = self.render.storm_motion_override_kt();
             let extract = move || {
                 let current = rustdar_radar::current::resolve(base.as_deref(), overlay.as_deref())?;
                 rustdar_radar::render_input::RenderInput::extract_volume_parts(
@@ -824,6 +857,7 @@ impl super::App {
                     product,
                     lat,
                     lon,
+                    motion,
                 )
             };
             if self.render.spawn_section_render(
@@ -5934,6 +5968,85 @@ mod section_dispatch_tests {
         let message =
             SectionUnavailable::ProductHasNoVerticalStructure(RadarProduct::EchoTops).message();
         assert!(message.contains(RadarProduct::EchoTops.name()), "{message}");
+    }
+
+    /// An edit to the storm motion override invalidates the SRV vertical
+    /// views: the section's staleness key is cleared and the 3D store's SRV
+    /// entries are evicted, so both re-derive with the new vector.
+    ///
+    /// The vector is a render *parameter*, not part of any target — without
+    /// this, an SRV volume and section keep painting the old vector's field
+    /// until the next volume rolls, silently. The plan-view invalidation
+    /// lives in `RenderDispatcher::set_storm_motion_override`; this pins its
+    /// vertical counterpart, and that an unchanged vector invalidates
+    /// nothing.
+    #[test]
+    fn an_override_edit_invalidates_the_srv_vertical_views() {
+        let mut app =
+            app_with_section(RadarProduct::StormRelativeVelocity, volume(vec![one_cut()]));
+        let stale_section = rustdar_egui::pane::SectionTarget {
+            volume: rustdar_egui::pane::VolumeStamp {
+                site: SITE.to_owned(),
+                collected: volume_time(),
+            },
+            product: RadarProduct::StormRelativeVelocity,
+            line: line(),
+            ladder: 7,
+        };
+        let srv_target = rustdar_egui::pane::VolumeTarget {
+            volume: rustdar_egui::pane::VolumeStamp {
+                site: SITE.to_owned(),
+                collected: volume_time(),
+            },
+            product: RadarProduct::StormRelativeVelocity,
+            region: None,
+        };
+        let arm = |app: &mut crate::app::App| {
+            app.gui
+                .pane_mut(0)
+                .unwrap()
+                .cross_section_mut()
+                .unwrap()
+                .rendered_for = Some(stale_section.clone());
+            app.volume_store.insert(
+                0,
+                srv_target.clone(),
+                crate::volume::bridge::VolumeEntry::Refused("the old vector's".into()),
+            );
+        };
+        arm(&mut app);
+        assert!(
+            app.volume_store.lookup(&srv_target).is_some(),
+            "precondition: the store holds an SRV entry",
+        );
+
+        // Flipping the override on is a vector change.
+        app.gui.storm_motion_override.enabled = true;
+        let ctx = egui::Context::default();
+        app.dispatch_pane_renders(&ctx);
+
+        assert_eq!(
+            state(&app).rendered_for,
+            None,
+            "the section must forget its cut and re-derive with the new vector",
+        );
+        assert!(
+            app.volume_store.lookup(&srv_target).is_none(),
+            "the store must evict the SRV grid derived with the old vector",
+        );
+
+        // Re-armed with the vector unchanged: nothing is invalidated, or
+        // every SRV pane would rebuild every frame.
+        arm(&mut app);
+        app.dispatch_pane_renders(&ctx);
+        assert!(
+            state(&app).rendered_for.is_some(),
+            "an unchanged vector must not invalidate the section",
+        );
+        assert!(
+            app.volume_store.lookup(&srv_target).is_some(),
+            "an unchanged vector must not evict the grid",
+        );
     }
 
     /// A pane with no volume yet is waiting, not broken.

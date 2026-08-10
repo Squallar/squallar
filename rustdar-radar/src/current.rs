@@ -647,6 +647,7 @@ mod tests {
                 product,
                 35.33,
                 -97.27,
+                None,
             )
             .expect("the merge carries the moment");
             let decoded = crate::render_input::RenderInput::from_bytes(&input.to_bytes())
@@ -804,7 +805,7 @@ mod tests {
             product: RadarProduct::Reflectivity,
         };
         let t = Instant::now();
-        let section = crate::xsect::render_section(&scan, &request, radar.lat, radar.lon);
+        let section = crate::xsect::render_section(&scan, &request, radar.lat, radar.lon, None);
         println!(
             "render_section: {:?} (cut: {})",
             t.elapsed(),
