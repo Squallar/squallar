@@ -255,7 +255,21 @@ pub struct App {
     /// Bounded by the same `evict_unshown_scans` pass as `scan_data`, and
     /// often sharing an allocation with it: at a volume boundary both maps
     /// hold the same `Arc` until the next sweep seals.
-    base_scans: HashMap<String, (Arc<nexrad_model::data::Scan>, chrono::NaiveDateTime)>,
+    /// `(volume, what its cuts declared, when its first radial was collected)`.
+    ///
+    /// The declared Nyquist table rides here rather than inside the `Scan`
+    /// because `nexrad_model::data::Radial` has no field for it — see
+    /// [`rustdar_radar::nyquist`]. It is what the section and 3D payloads are
+    /// stamped with, and without it the worker would guard the velocity fold
+    /// seam on an estimate while this thread had the archive's own number.
+    base_scans: HashMap<
+        String,
+        (
+            Arc<nexrad_model::data::Scan>,
+            Arc<rustdar_radar::nyquist::DeclaredNyquist>,
+            chrono::NaiveDateTime,
+        ),
+    >,
     input: InputHandler,
     channels: ChannelHub,
     render: RenderDispatcher,
@@ -1258,9 +1272,18 @@ impl App {
         self.volume_extractions
             .set(self.volume_extractions.get() + 1);
         let radar = rustdar_radar::sites::get_radar_site(site)?;
-        let base = self.base_scans.get(site).map(|(scan, _)| Arc::clone(scan));
+        let base = self
+            .base_scans
+            .get(site)
+            .map(|(scan, declared, _)| (Arc::clone(scan), Arc::clone(declared)));
         let overlay = self.chunk_feeds.snapshot(site);
-        let current = rustdar_radar::current::resolve(base.as_deref(), overlay.as_deref())?;
+        let current = rustdar_radar::current::resolve(
+            base.as_ref()
+                .map(|(scan, declared)| rustdar_radar::nyquist::Volume::new(scan, declared)),
+            overlay
+                .as_ref()
+                .map(|live| rustdar_radar::nyquist::Volume::new(&live.scan, &live.declared)),
+        )?;
         rustdar_radar::render_input::RenderInput::extract_volume_parts(
             current.pattern(),
             current.sweeps(),
@@ -1271,6 +1294,12 @@ impl App {
             // derivation; the extraction keeps it only on an SRV payload.
             self.render.storm_motion_override_kt(),
         )
+        // Stamped with the same table the merge resolved, so the worker's
+        // velocity fold guard reads the limits this thread would have read.
+        // Dropping this line is not a compile error and not a visible one: the
+        // worker would fall back to estimating, and the two threads would part
+        // company on a band of borderline pairs with nothing to point at.
+        .map(|input| input.with_declared_nyquist(current.declared_nyquist()))
     }
 
     /// The re-cut key for `site`'s current merged volume under `product` —
@@ -1282,10 +1311,19 @@ impl App {
         site: &str,
         product: rustdar_radar::types::RadarProduct,
     ) -> Option<u64> {
-        let base = self.base_scans.get(site).map(|(scan, _)| Arc::clone(scan));
+        let base = self
+            .base_scans
+            .get(site)
+            .map(|(scan, declared, _)| (Arc::clone(scan), Arc::clone(declared)));
         let overlay = self.chunk_feeds.snapshot(site);
-        rustdar_radar::current::resolve(base.as_deref(), overlay.as_deref())?
-            .ladder_fingerprint(product)
+        rustdar_radar::current::resolve(
+            base.as_ref()
+                .map(|(scan, declared)| rustdar_radar::nyquist::Volume::new(scan, declared)),
+            overlay
+                .as_ref()
+                .map(|live| rustdar_radar::nyquist::Volume::new(&live.scan, &live.declared)),
+        )?
+        .ladder_fingerprint(product)
     }
 
     /// The stamp of `site`'s current merged volume: the newest data time (its
@@ -1299,18 +1337,23 @@ impl App {
         let base = self
             .base_scans
             .get(site)
-            .map(|(scan, collected)| (Arc::clone(scan), *collected));
+            .map(|(scan, declared, collected)| {
+                (Arc::clone(scan), Arc::clone(declared), *collected)
+            });
         let overlay = self.chunk_feeds.snapshot(site);
         let current = rustdar_radar::current::resolve(
-            base.as_ref().map(|(scan, _)| scan.as_ref()),
-            overlay.as_deref(),
+            base.as_ref()
+                .map(|(scan, declared, _)| rustdar_radar::nyquist::Volume::new(scan, declared)),
+            overlay
+                .as_ref()
+                .map(|live| rustdar_radar::nyquist::Volume::new(&live.scan, &live.declared)),
         )?;
         let newest = current.newest_data_time()?;
         // The base is named only where it contributes: after a VCP change the
         // merge honestly drops it, and a caption naming it anyway would claim
         // tilts the ladder no longer carries.
         let base_started = (current.base_sweeps() > 0)
-            .then(|| base.as_ref().map(|(_, collected)| *collected))
+            .then(|| base.as_ref().map(|(_, _, collected)| *collected))
             .flatten();
         Some(rustdar_egui::CurrentVolumeStamp {
             newest,
@@ -1456,6 +1499,10 @@ impl App {
                         let site = scan_data.site;
                         let timestamp = scan_data.timestamp;
                         let scan_arc = Arc::new(scan_data.scan);
+                        // What the archive declared each cut's Nyquist velocity
+                        // to be, held beside the volume for as long as it is the
+                        // merge base. It cannot ride inside the `Scan`.
+                        let declared_nyquist = Arc::new(scan_data.declared_nyquist);
 
                         // An archive volume for a site the chunk feed has already
                         // moved past.
@@ -1543,10 +1590,16 @@ impl App {
                         let advances_the_base = self
                             .base_scans
                             .get(&site)
-                            .is_none_or(|(_, held)| scan_info.timestamp > *held);
+                            .is_none_or(|(_, _, held)| scan_info.timestamp > *held);
                         if advances_the_base || !feed_is_ahead {
-                            self.base_scans
-                                .insert(site.clone(), (Arc::clone(&scan_arc), scan_info.timestamp));
+                            self.base_scans.insert(
+                                site.clone(),
+                                (
+                                    Arc::clone(&scan_arc),
+                                    Arc::clone(&declared_nyquist),
+                                    scan_info.timestamp,
+                                ),
+                            );
                         }
 
                         // When auto-poll delivers a new scan, check if any pane

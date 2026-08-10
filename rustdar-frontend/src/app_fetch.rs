@@ -91,7 +91,8 @@ impl super::App {
                 Ok(data) => {
                     log::info!("Fetched scan: {} @ {}", site, timestamp);
                     Ok(ScanData {
-                        scan: data,
+                        scan: data.scan,
+                        declared_nyquist: data.declared_nyquist,
                         site: site.clone(),
                         timestamp,
                     })
@@ -360,7 +361,8 @@ impl super::App {
                                 generation,
                                 site: site.clone(),
                                 result: Ok(crate::channels::ScanData {
-                                    scan: data,
+                                    scan: data.scan,
+                                    declared_nyquist: data.declared_nyquist,
                                     site,
                                     timestamp,
                                 }),
@@ -763,7 +765,8 @@ impl super::App {
                     generation,
                     site: site.clone(),
                     result: Ok(crate::channels::ScanData {
-                        scan: data,
+                        scan: data.scan,
+                        declared_nyquist: data.declared_nyquist,
                         site,
                         timestamp,
                     }),
@@ -867,7 +870,13 @@ impl super::App {
             self.channels.loop_scan_download_sender.clone(),
             async move {
                 let scan = match scan::download_scan(identifier).await {
-                    Ok(scan_data) => Some(std::sync::Arc::new(scan_data)),
+                    // The declared Nyquist table is dropped here on purpose: a
+                    // loop frame is a plan-view raster, and nothing on that
+                    // path interpolates across a fold seam. Only the
+                    // whole-volume readers — sections and the 3D resample,
+                    // which build from `base_scans` and the live feed — carry
+                    // it. See `rustdar_radar::nyquist`.
+                    Ok(decoded) => Some(std::sync::Arc::new(decoded.scan)),
                     Err(e) => {
                         log::error!(
                             "Loop scan download failed for pane {} ({} @ {}): {:?}",

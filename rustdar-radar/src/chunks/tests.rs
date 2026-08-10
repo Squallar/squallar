@@ -407,6 +407,7 @@ fn golden_chunks() -> Vec<(u16, ChunkKind, ChunkContents)> {
         ChunkContents {
             radials: Vec::new(),
             coverage_pattern: Some(crate::volumetric::tests::vcp()),
+            ..Default::default()
         },
     )];
 
@@ -437,6 +438,7 @@ fn golden_chunks() -> Vec<(u16, ChunkKind, ChunkContents)> {
                 ChunkContents {
                     radials: group.to_vec(),
                     coverage_pattern: None,
+                    ..Default::default()
                 },
             ));
             sequence += 1;
@@ -812,6 +814,7 @@ fn narrow_volume(selection: &CutSelection) -> VolumeAssembler {
         ChunkContents {
             radials: Vec::new(),
             coverage_pattern: Some(vcp),
+            ..Default::default()
         },
     );
 
@@ -847,6 +850,7 @@ fn narrow_volume(selection: &CutSelection) -> VolumeAssembler {
                 ChunkContents {
                     radials: group.to_vec(),
                     coverage_pattern: None,
+                    ..Default::default()
                 },
             );
             sequence += 1;
@@ -889,6 +893,7 @@ fn narrow_volume(selection: &CutSelection) -> VolumeAssembler {
         ChunkContents {
             radials: tail,
             coverage_pattern: None,
+            ..Default::default()
         },
     );
     a
@@ -1566,6 +1571,7 @@ fn a_selective_volume_completes_on_the_cuts_it_asked_for() {
         ChunkContents {
             radials: Vec::new(),
             coverage_pattern: Some(vcp),
+            ..Default::default()
         },
     );
     assert!(!a.is_volume_complete(), "nothing has been assembled yet");
@@ -1592,6 +1598,7 @@ fn a_selective_volume_completes_on_the_cuts_it_asked_for() {
             ChunkContents {
                 radials: group.to_vec(),
                 coverage_pattern: None,
+                ..Default::default()
             },
         );
     }
@@ -1625,6 +1632,7 @@ fn a_volume_with_a_hole_is_incomplete_when_everything_was_asked_for() {
         ChunkContents {
             radials: Vec::new(),
             coverage_pattern: Some(crate::volumetric::tests::vcp()),
+            ..Default::default()
         },
     );
 
@@ -1664,6 +1672,7 @@ fn a_volume_with_a_hole_is_incomplete_when_everything_was_asked_for() {
                 ChunkContents {
                     radials: group.to_vec(),
                     coverage_pattern: None,
+                    ..Default::default()
                 },
             );
             sequence += 1;
@@ -1692,6 +1701,7 @@ fn widening_the_selection_makes_the_skipped_chunks_wanted_again() {
         ChunkContents {
             radials: Vec::new(),
             coverage_pattern: Some(vcp),
+            ..Default::default()
         },
     );
 

@@ -101,6 +101,7 @@ fn closing_round_of(sweeps: u8, whole: bool) -> PollOutcome {
         closed: Some(ClosedVolume {
             progress: complete(sweeps, whole),
             scan: Some(volume(sweeps)),
+            declared_nyquist: Default::default(),
         }),
         rolled_to: Some(vol(43)),
         ..Default::default()
@@ -365,7 +366,7 @@ fn a_whole_closed_volume_becomes_the_merge_base() {
     let based = app
         .base_scans
         .get("KTLX")
-        .map(|(scan, _)| scan.sweeps().len());
+        .map(|(scan, _, _)| scan.sweeps().len());
     assert_eq!(
         based,
         Some(5),

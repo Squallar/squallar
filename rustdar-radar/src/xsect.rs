@@ -138,7 +138,6 @@
 //!   omits — 0.2 km at 2.4° and 4.0 km at 19.5°. The section is the correct
 //!   one.
 
-
 use crate::beam;
 use crate::par::*;
 use crate::sampler::{Column, Sample, SampleStatus, VolumeSampler};
@@ -654,8 +653,12 @@ pub fn render_section<'a>(
         }
         crate::derive::Prepared::Derived(scan) => {
             let slot = crate::derive::derived_slot(req.product)?;
-            VolumeSampler::for_derived(crate::nyquist::Volume::new(scan, declared), req.product, slot)
-                .ok()?
+            VolumeSampler::for_derived(
+                crate::nyquist::Volume::new(scan, declared),
+                req.product,
+                slot,
+            )
+            .ok()?
         }
     };
     render_with_sampler(&sampler, req, lat, lon)

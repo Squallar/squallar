@@ -272,6 +272,18 @@ pub struct ChunkContents {
     pub radials: Vec<Radial>,
     /// Present on the start chunk, which is the only one carrying message 5.
     pub coverage_pattern: Option<VolumeCoveragePattern>,
+    /// Each cut's declared Nyquist velocity, read off Message 31's Radial Data
+    /// Block as the radials go past.
+    ///
+    /// Read here rather than recovered later because here is the last place it
+    /// exists: `into_radial` builds a `nexrad_model::data::Radial`, which has
+    /// no field for it, so a chunk that has been turned into radials has
+    /// forgotten what it declared. The velocity fold guard in
+    /// [`crate::sampler`] is the consumer — see [`crate::nyquist`].
+    ///
+    /// Empty for a Message 1 chunk: the legacy message declares no Nyquist
+    /// velocity at all, and that is an absence, not a decode failure.
+    pub declared_nyquist: crate::nyquist::DeclaredNyquist,
 }
 
 /// Decode one chunk's bytes.
@@ -333,6 +345,16 @@ fn ingest_record(name: &str, record: volume::Record<'_>, out: &mut ChunkContents
     for message in record.messages().map_err(decode)? {
         match message.into_contents() {
             MessageContents::DigitalRadarData(m) => {
+                // Before `into_radial`, which is where the number is lost: the
+                // model type has no field for it. First radial of a cut wins,
+                // which `declare` enforces; within a sweep the PRF is constant.
+                if let Some(block) = m.radial_data_block() {
+                    out.declared_nyquist.declare(
+                        m.header().elevation_number(),
+                        // Hundredths of a metre per second on the wire.
+                        f64::from(block.nyquist_velocity_raw()) * 0.01,
+                    );
+                }
                 out.radials
                     .push(m.into_radial().map_err(|e| decode(e.into()))?);
             }
@@ -787,6 +809,9 @@ pub struct VolumeAssembler {
     closed: bool,
     /// Invalidated whenever a cut seals. See [`Self::snapshot`].
     cached: Option<std::sync::Arc<nexrad_model::data::Scan>>,
+    /// Every cut's declared Nyquist velocity, accumulated across the chunks as
+    /// they arrive. See [`Self::declared_nyquist`].
+    declared_nyquist: crate::nyquist::DeclaredNyquist,
 }
 
 impl VolumeAssembler {
@@ -805,6 +830,7 @@ impl VolumeAssembler {
             late_radials_dropped: 0,
             closed: false,
             cached: None,
+            declared_nyquist: crate::nyquist::DeclaredNyquist::empty(),
         }
     }
 
@@ -859,6 +885,15 @@ impl VolumeAssembler {
             let vcp = self.coverage_pattern.insert(vcp);
             self.chunk_map = ElevationChunkMap::from_coverage_pattern(vcp);
             outcome.learned_coverage_pattern = true;
+        }
+
+        // Accumulated whatever else this chunk turns out to be. A cut arrives
+        // across several chunks and its declaration is repeated on every
+        // radial, so the first chunk to mention a cut is the one that names it
+        // and the rest are no-ops; a chunk refused above never reaches here,
+        // so a stale volume's numbers cannot leak into this one's table.
+        for (elevation_number, ms) in contents.declared_nyquist.iter() {
+            self.declared_nyquist.declare(elevation_number, ms);
         }
 
         let mut touched: Vec<u8> = Vec::new();
@@ -1162,6 +1197,23 @@ impl VolumeAssembler {
         self.cached = Some(std::sync::Arc::clone(&scan));
         scan
     }
+
+    /// Every cut's declared Nyquist velocity, as far as the chunks so far have
+    /// said — the number [`Self::snapshot`]'s `Scan` cannot carry, because
+    /// `nexrad_model::data::Radial` has no field for it.
+    ///
+    /// Covers cuts that are still open as well as sealed ones: the declaration
+    /// arrives on the cut's first radial, long before its last. That is
+    /// harmless — a reader looks the table up by the elevation number of a
+    /// sweep it already holds, so an entry for a cut no snapshot carries is
+    /// never consulted — and it means a cut is declared from the moment it
+    /// seals rather than one chunk later.
+    ///
+    /// Empty for a volume assembled entirely from Message 1, which declares no
+    /// Nyquist velocity; readers then estimate. See [`crate::nyquist`].
+    pub fn declared_nyquist(&self) -> &crate::nyquist::DeclaredNyquist {
+        &self.declared_nyquist
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1252,6 +1304,16 @@ pub struct ClosedVolume {
     /// cut. So building one unconditionally paid the full copy in precisely the
     /// case every consumer throws it away.
     pub scan: Option<std::sync::Arc<nexrad_model::data::Scan>>,
+    /// What the closed volume's cuts declared their Nyquist velocities to be —
+    /// the number [`Self::scan`] cannot carry, because
+    /// `nexrad_model::data::Radial` has no field for it.
+    ///
+    /// Always present, unlike [`Self::scan`]: it is a handful of `f64`s, so
+    /// there is nothing to save by withholding it, and a consumer that adopts
+    /// the closed volume as its merge base needs the pair or its sections
+    /// guard on estimated fold limits. Empty for a Message 1 volume, which
+    /// declares no Nyquist velocity at all.
+    pub declared_nyquist: crate::nyquist::DeclaredNyquist,
 }
 
 /// Summarised rather than derived, and not because of the gate bytes: those live
@@ -1385,6 +1447,17 @@ impl ChunkPoller {
         self.current.as_mut().map(VolumeAssembler::snapshot)
     }
 
+    /// What the volume being assembled declared its cuts' Nyquist velocities
+    /// to be — the number [`Self::snapshot`]'s `Scan` cannot carry. `None`
+    /// before the first chunk, and empty for a Message 1 volume.
+    ///
+    /// See [`VolumeAssembler::declared_nyquist`]; a caller pairs the two into
+    /// a [`crate::nyquist::Volume`] so the velocity fold guard reads the
+    /// declaration rather than estimating.
+    pub fn declared_nyquist(&self) -> Option<&crate::nyquist::DeclaredNyquist> {
+        self.current.as_ref().map(VolumeAssembler::declared_nyquist)
+    }
+
     /// Advisory delay before the next [`Self::poll`]. Advisory because this crate
     /// has no timer on wasm — the caller owns the clock.
     pub fn suggested_interval(&self) -> std::time::Duration {
@@ -1474,8 +1547,13 @@ impl ChunkPoller {
             // `snapshot`'s own sealed-only filter, so these two lines commute —
             // this is the readable order, not a load-bearing one.
             let progress = current.close();
+            let declared_nyquist = current.declared_nyquist().clone();
             let scan = progress.volume_complete.then(|| current.snapshot());
-            ClosedVolume { progress, scan }
+            ClosedVolume {
+                progress,
+                scan,
+                declared_nyquist,
+            }
         });
         let mut next = VolumeAssembler::new(self.site.clone(), to);
         next.set_selection(self.selection.clone());

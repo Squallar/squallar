@@ -37,6 +37,20 @@ pub enum Retirement {
     Stalled,
 }
 
+/// The in-flight volume as a consumer sees it: the sealed sweeps, and what
+/// their cuts declared their Nyquist velocities to be.
+///
+/// The two travel together because `nexrad_model::data::Scan` cannot hold the
+/// second — see [`rustdar_radar::nyquist`] — and every consumer that resolves
+/// the merged current volume needs both or guards differently from the thread
+/// that extracted its payload. `Arc` on each half because the assembler hands
+/// its snapshot out by refcount and the bridge below clones per frame.
+#[derive(Clone)]
+pub struct LiveVolume {
+    pub scan: std::sync::Arc<nexrad_model::data::Scan>,
+    pub declared: std::sync::Arc<rustdar_radar::nyquist::DeclaredNyquist>,
+}
+
 /// One site's feed.
 pub struct SiteFeed {
     /// `None` only while a round is in flight — the poller travels with the
@@ -56,7 +70,12 @@ pub struct SiteFeed {
     /// exactly the waste its fingerprint exists to prevent. An `Arc` clone
     /// of the assembler's own cached snapshot, so the bridge costs a
     /// refcount, not a copy.
-    last_snapshot: Option<std::sync::Arc<nexrad_model::data::Scan>>,
+    /// Paired with the declared Nyquist table the `Scan` cannot carry, because
+    /// the bridge has to serve the *same* pair the poller would: a bridged
+    /// frame that dropped the table would put the section worker on estimated
+    /// fold limits for the ~0.1–1 s of every round, and back on declared ones
+    /// after — a guard that changes its mind at the poll cadence.
+    last_snapshot: Option<LiveVolume>,
     in_flight: bool,
     consecutive_errors: u32,
     last_progress: web_time::Instant,
@@ -349,14 +368,21 @@ impl ChunkFeedManager {
     /// forward: overlay sweeps supersede base cuts by list order, not by
     /// time, so a dead flight's low tilts would be served under a caption
     /// whose newest time reads the newer base.
-    pub fn snapshot(&mut self, site: &str) -> Option<std::sync::Arc<nexrad_model::data::Scan>> {
+    pub fn snapshot(&mut self, site: &str) -> Option<LiveVolume> {
         let feed = self.feeds.get_mut(site)?;
         if feed.retired.is_some() {
             return None;
         }
         match feed.poller.as_mut() {
             Some(poller) => {
-                let snapshot = poller.snapshot();
+                // The table is read before `snapshot` takes the poller
+                // mutably, and both describe the same assembler state.
+                let declared = poller
+                    .declared_nyquist()
+                    .cloned()
+                    .map(std::sync::Arc::new)
+                    .unwrap_or_default();
+                let snapshot = poller.snapshot().map(|scan| LiveVolume { scan, declared });
                 // Refreshed here — the one place the poller's answer passes —
                 // so the bridge below can only ever serve what some frame
                 // already saw.
@@ -432,7 +458,10 @@ impl ChunkFeedManager {
         scan: std::sync::Arc<nexrad_model::data::Scan>,
     ) {
         if let Some(feed) = self.feeds.get_mut(site) {
-            feed.last_snapshot = Some(scan);
+            feed.last_snapshot = Some(LiveVolume {
+                scan,
+                declared: Default::default(),
+            });
             feed.poller = None;
             feed.in_flight = true;
         }

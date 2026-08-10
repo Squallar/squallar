@@ -207,7 +207,7 @@ fn app_with_section(product: RadarProduct, scan: Arc<Scan>) -> crate::app::App {
     // regression to reading `scan_data` invisible — the pin these tests
     // carry is precisely that a section works with the map's holder empty.
     app.base_scans
-        .insert(SITE.to_owned(), (scan, volume_time()));
+        .insert(SITE.to_owned(), (scan, Default::default(), volume_time()));
     app
 }
 
@@ -586,7 +586,11 @@ fn a_volume_with_nothing_to_cut_is_named_rather_than_waited_on() {
     // velocity asks again rather than inheriting the refusal.
     app.base_scans.insert(
         SITE.to_owned(),
-        (velocity_volume(vec![one_cut()]), volume_time()),
+        (
+            velocity_volume(vec![one_cut()]),
+            Default::default(),
+            volume_time(),
+        ),
     );
     app.render.pane_render[0].render_in_flight = false;
     app.dispatch_section_renders();
@@ -1155,8 +1159,10 @@ fn a_live_volume_that_is_still_filling_re_cuts_as_it_fills() {
     assert_ne!(before.ladder, 0, "the fixture volume's ladder resolves");
 
     // More sweeps land: the volume grows and nothing else does.
-    app.base_scans
-        .insert(SITE.to_owned(), (volume_of(4, cuts_for(4)), volume_time()));
+    app.base_scans.insert(
+        SITE.to_owned(),
+        (volume_of(4, cuts_for(4)), Default::default(), volume_time()),
+    );
     let after = app.section_target_for_pane(0).expect("still aimed");
 
     assert_eq!(
@@ -1248,8 +1254,10 @@ fn a_seal_that_changes_no_chosen_rung_does_not_move_the_section_key() {
     let before = app.section_target_for_pane(0).expect("aimed");
     assert_ne!(before.ladder, 0, "precondition: the ladder resolves");
 
-    app.base_scans
-        .insert(SITE.to_owned(), (with_doppler_half(), volume_time()));
+    app.base_scans.insert(
+        SITE.to_owned(),
+        (with_doppler_half(), Default::default(), volume_time()),
+    );
     let after = app.section_target_for_pane(0).expect("still aimed");
     assert_eq!(
         before, after,
@@ -1261,8 +1269,10 @@ fn a_seal_that_changes_no_chosen_rung_does_not_move_the_section_key() {
     // — and the key must move there, or the skip is a freeze.
     app.gui.pane_mut(0).unwrap().selected_product = RadarProduct::Velocity;
     let vel_after = app.section_target_for_pane(0).expect("aimed at velocity");
-    app.base_scans
-        .insert(SITE.to_owned(), (surveillance_only(), volume_time()));
+    app.base_scans.insert(
+        SITE.to_owned(),
+        (surveillance_only(), Default::default(), volume_time()),
+    );
     let vel_before = app.section_target_for_pane(0).expect("still aimed");
     assert_ne!(
         vel_before.ladder, vel_after.ladder,

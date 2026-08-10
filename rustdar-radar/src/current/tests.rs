@@ -2,7 +2,8 @@ use super::*;
 use crate::sampler::{LadderChoice, resolve_ladder};
 use crate::types::{MomentSlot, RadarProduct};
 use nexrad_model::data::{
-    ChannelConfiguration, ElevationCut, MomentData, PulseWidth, Radial, RadialStatus, WaveformType,
+    ChannelConfiguration, ElevationCut, MomentData, PulseWidth, Radial, RadialStatus, Scan,
+    WaveformType,
 };
 
 fn cut(angle_deg: f64) -> ElevationCut {
@@ -165,7 +166,8 @@ fn chosen_stamp(current: &CurrentVolume<'_>, slot: MomentSlot, key: f64) -> i64 
 fn an_overlay_sweep_supersedes_the_base_sweep_of_its_cut() {
     let base = base_volume(0);
     let overlay = overlay_volume(0, 2);
-    let current = resolve(Some(&base), Some(&overlay)).expect("both volumes exist");
+    let current =
+        resolve(Some((&base).into()), Some((&overlay).into())).expect("both volumes exist");
 
     // Cuts 1 and 2 sealed in the overlay, so the base's are out; the
     // base's other six fill the ladder, and the overlay's two follow.
@@ -201,7 +203,8 @@ fn an_overlay_sweep_supersedes_the_base_sweep_of_its_cut() {
 fn the_ladder_prefers_the_overlay_sweep_over_the_base_sails_repeat() {
     let base = base_volume(0);
     let overlay = overlay_volume(0, 1); // the 0.5° surveillance half only
-    let current = resolve(Some(&base), Some(&overlay)).expect("both volumes exist");
+    let current =
+        resolve(Some((&base).into()), Some((&overlay).into())).expect("both volumes exist");
 
     // Reflectivity at 0.5°: the overlay's surveillance sweep, not the
     // base's SAILS surveillance repeat (cut 6) and not any Doppler half.
@@ -216,7 +219,8 @@ fn the_ladder_prefers_the_overlay_sweep_over_the_base_sails_repeat() {
 
     // Once the overlay's Doppler half seals, it takes the rung over.
     let overlay2 = overlay_volume(0, 2);
-    let current2 = resolve(Some(&base), Some(&overlay2)).expect("both volumes exist");
+    let current2 =
+        resolve(Some((&base).into()), Some((&overlay2).into())).expect("both volumes exist");
     let vel2 = chosen_stamp(&current2, MomentSlot::Velocity, 0.5);
     assert_eq!(vel2, 62_000, "the overlay's cut-2 sweep takes velocity");
 }
@@ -234,7 +238,8 @@ fn a_vcp_change_drops_the_base_rather_than_mixing_two_geometries() {
             sweep(2, 1.3, 61_000, true, false),
         ],
     );
-    let current = resolve(Some(&base), Some(&overlay)).expect("both volumes exist");
+    let current =
+        resolve(Some((&base).into()), Some((&overlay).into())).expect("both volumes exist");
     assert_eq!(current.base_sweeps(), 0, "no base sweep keys onto VCP 35");
     assert_eq!(current.sweeps().len(), 2);
     assert_eq!(
@@ -258,7 +263,8 @@ fn an_adaptive_tilt_move_drops_only_the_moved_cuts() {
     moved[5] = 0.4;
     moved[6] = 0.4;
     let overlay = Scan::new(vcp(212, &moved), vec![sweep(1, 0.4, 60_000, true, false)]);
-    let current = resolve(Some(&base), Some(&overlay)).expect("both volumes exist");
+    let current =
+        resolve(Some((&base).into()), Some((&overlay).into())).expect("both volumes exist");
     let numbers: Vec<u8> = current
         .sweeps()
         .iter()
@@ -278,7 +284,7 @@ fn an_adaptive_tilt_move_drops_only_the_moved_cuts() {
 fn an_overlay_without_its_pattern_contributes_nothing() {
     let base = base_volume(0);
     let overlay = Scan::new(vcp(0, &[]), vec![sweep(1, 0.5, 60_000, true, false)]);
-    let current = resolve(Some(&base), Some(&overlay)).expect("the base exists");
+    let current = resolve(Some((&base).into()), Some((&overlay).into())).expect("the base exists");
     assert_eq!(current.base_sweeps(), 8);
     assert_eq!(current.overlay_sweeps(), 0);
     assert_eq!(
@@ -293,11 +299,11 @@ fn resolve_covers_every_absence() {
     let base = base_volume(0);
     let overlay = overlay_volume(0, 2);
 
-    let base_only = resolve(Some(&base), None).expect("base alone resolves");
+    let base_only = resolve(Some((&base).into()), None).expect("base alone resolves");
     assert_eq!(base_only.base_sweeps(), 8);
     assert_eq!(base_only.overlay_sweeps(), 0);
 
-    let overlay_only = resolve(None, Some(&overlay)).expect("overlay alone resolves");
+    let overlay_only = resolve(None, Some((&overlay).into())).expect("overlay alone resolves");
     assert_eq!(overlay_only.base_sweeps(), 0);
     assert_eq!(overlay_only.overlay_sweeps(), 2);
 
@@ -308,7 +314,8 @@ fn resolve_covers_every_absence() {
 fn the_newest_data_time_is_the_overlay_seal_not_the_base() {
     let base = base_volume(0);
     let overlay = overlay_volume(0, 2);
-    let current = resolve(Some(&base), Some(&overlay)).expect("both volumes exist");
+    let current =
+        resolve(Some((&base).into()), Some((&overlay).into())).expect("both volumes exist");
     let newest = current.newest_data_time().expect("radials carry stamps");
     // The overlay's cut-2 sweep's last radial: 60_000 + 2000 + 11 ms.
     assert_eq!(
@@ -331,8 +338,8 @@ fn a_doppler_half_seal_leaves_the_reflectivity_fingerprint_alone() {
     let base = base_volume(0);
     let one_sealed = overlay_volume(0, 1);
     let two_sealed = overlay_volume(0, 2);
-    let before = resolve(Some(&base), Some(&one_sealed)).expect("resolves");
-    let after = resolve(Some(&base), Some(&two_sealed)).expect("resolves");
+    let before = resolve(Some((&base).into()), Some((&one_sealed).into())).expect("resolves");
+    let after = resolve(Some((&base).into()), Some((&two_sealed).into())).expect("resolves");
 
     let refl_before = before.ladder_fingerprint(RadarProduct::Reflectivity);
     let refl_after = after.ladder_fingerprint(RadarProduct::Reflectivity);
@@ -356,8 +363,8 @@ fn a_surveillance_seal_moves_the_reflectivity_fingerprint() {
     let base = base_volume(0);
     let two_sealed = overlay_volume(0, 2);
     let three_sealed = overlay_volume(0, 3);
-    let before = resolve(Some(&base), Some(&two_sealed)).expect("resolves");
-    let after = resolve(Some(&base), Some(&three_sealed)).expect("resolves");
+    let before = resolve(Some((&base).into()), Some((&two_sealed).into())).expect("resolves");
+    let after = resolve(Some((&base).into()), Some((&three_sealed).into())).expect("resolves");
     assert_ne!(
         before.ladder_fingerprint(RadarProduct::Reflectivity),
         after.ladder_fingerprint(RadarProduct::Reflectivity),
@@ -374,8 +381,8 @@ fn the_fingerprint_is_stable_across_a_snapshot_rebuild() {
     let base = base_volume(0);
     let overlay_a = overlay_volume(0, 2);
     let overlay_b = overlay_volume(0, 2);
-    let a = resolve(Some(&base), Some(&overlay_a)).expect("resolves");
-    let b = resolve(Some(&base), Some(&overlay_b)).expect("resolves");
+    let a = resolve(Some((&base).into()), Some((&overlay_a).into())).expect("resolves");
+    let b = resolve(Some((&base).into()), Some((&overlay_b).into())).expect("resolves");
     assert_eq!(
         a.ladder_fingerprint(RadarProduct::Reflectivity),
         b.ladder_fingerprint(RadarProduct::Reflectivity)
@@ -390,8 +397,8 @@ fn a_pattern_change_moves_the_fingerprint_even_with_the_same_sweeps() {
     let sweeps = vec![sweep(1, 0.5, 1_000, true, false)];
     let flown = Scan::new(vcp(212, &[0.5, 1.8]), sweeps.clone());
     let taller = Scan::new(vcp(212, &[0.5, 1.8, 6.4]), sweeps);
-    let a = resolve(None, Some(&flown)).expect("resolves");
-    let b = resolve(None, Some(&taller)).expect("resolves");
+    let a = resolve(None, Some((&flown).into())).expect("resolves");
+    let b = resolve(None, Some((&taller).into())).expect("resolves");
     assert_ne!(
         a.ladder_fingerprint(RadarProduct::Reflectivity),
         b.ladder_fingerprint(RadarProduct::Reflectivity),
@@ -409,7 +416,8 @@ fn a_pattern_change_moves_the_fingerprint_even_with_the_same_sweeps() {
 fn a_merged_payload_ports_the_ladder_it_resolved() {
     let base = base_volume(0);
     let overlay = overlay_volume(0, 2);
-    let current = resolve(Some(&base), Some(&overlay)).expect("both volumes exist");
+    let current =
+        resolve(Some((&base).into()), Some((&overlay).into())).expect("both volumes exist");
 
     // Materialised the expensive way — the way production never does —
     // purely so the sampler can read the merge directly for comparison.
@@ -473,7 +481,11 @@ async fn live_substrate_costs_are_measured() {
     let site = "KTLX";
     let radar = crate::sites::get_radar_site(site).expect("a real site");
     let now = chrono::Utc::now().naive_utc();
-    let scan = crate::scan::get_scan(site, now).await.expect("a volume");
+    let crate::scan::DecodedScan {
+        scan,
+        declared_nyquist,
+    } = crate::scan::get_scan(site, now).await.expect("a volume");
+    println!("declared Nyquist velocities: {:?}", declared_nyquist);
 
     let gate_bytes: usize = scan
         .sweeps()
@@ -509,7 +521,7 @@ async fn live_substrate_costs_are_measured() {
     drop(cloned);
 
     let t = Instant::now();
-    let current = resolve(Some(&scan), Some(&scan)).expect("resolves");
+    let current = resolve(Some((&scan).into()), Some((&scan).into())).expect("resolves");
     println!(
         "current::resolve over two full volumes: {:?} ({} + {} sweeps)",
         t.elapsed(),
@@ -604,14 +616,14 @@ async fn live_substrate_costs_are_measured() {
 #[test]
 fn the_fingerprint_refuses_what_the_sampler_refuses() {
     let no_pattern = Scan::new(vcp(0, &[]), vec![sweep(1, 0.5, 1_000, true, false)]);
-    let current = resolve(None, Some(&no_pattern));
+    let current = resolve(None, Some((&no_pattern).into()));
     assert!(
         current.is_none(),
         "an overlay with no pattern and no base resolves to nothing"
     );
 
     let base = base_volume(0);
-    let current = resolve(Some(&base), None).expect("resolves");
+    let current = resolve(Some((&base).into()), None).expect("resolves");
     assert!(
         current
             .ladder_fingerprint(RadarProduct::VerticallyIntegratedLiquid)

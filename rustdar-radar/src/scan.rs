@@ -18,6 +18,39 @@ pub enum ScanError {
 
 pub type Result<T> = std::result::Result<T, ScanError>;
 
+/// A decoded archive volume, and the per-cut numbers the decode drops.
+///
+/// `nexrad_data::volume::File::scan()` builds a `nexrad_model::data::Scan`, and
+/// the model's `Radial` has no field for Message 31's declared Nyquist
+/// velocity — so the moment a download becomes a `Scan`, where each cut folds
+/// is gone. The velocity fold guard in [`crate::sampler`] needs it, and by the
+/// time anything reaches the guard the raw file is long dropped.
+///
+/// So every entry point here hands back both, read from the same bytes in the
+/// same call. `declared_nyquist` is empty rather than absent for a volume that
+/// declared nothing — an all-Message-1 archive, which has no such field —
+/// and readers estimate for the cuts it does not name. See [`crate::nyquist`].
+pub struct DecodedScan {
+    pub scan: Scan,
+    pub declared_nyquist: crate::nyquist::DeclaredNyquist,
+}
+
+/// Decode a downloaded volume into its `Scan` and its declared Nyquist table.
+///
+/// Two passes over the file: `scan()`'s, and
+/// [`crate::nyquist::DeclaredNyquist::from_archive`]'s raw walk for the fields
+/// the model type does not keep. The second is the price of reading a
+/// radial-header parameter through a model that has no room for it — the same
+/// price [`crate::kdp::KdpParams::from_archive`] pays for the calibration
+/// constants — and it is paid once per volume, off the frame thread, against a
+/// download that already cost a network round trip.
+fn decoded(file: &nexrad_data::volume::File) -> Result<DecodedScan> {
+    Ok(DecodedScan {
+        scan: file.scan()?,
+        declared_nyquist: crate::nyquist::DeclaredNyquist::from_archive(file),
+    })
+}
+
 // `crate::archive`'s two network entry points, shadowed so that every call site
 // below routes through `tls::init()` without having to know about TLS. Now
 // belt-and-braces: `crate::archive` builds its client through `tls::client`,
@@ -86,7 +119,7 @@ pub async fn check_latest_scan(
     Ok(latest_time.map(|t| effective_date.and_time(t)))
 }
 
-pub async fn get_scan(site: &str, timestamp: NaiveDateTime) -> Result<Scan> {
+pub async fn get_scan(site: &str, timestamp: NaiveDateTime) -> Result<DecodedScan> {
     let date = timestamp.date();
     let Some((metas, effective_date)) = list_files_with_fallback(site, &date).await? else {
         return Err(ScanError::NoScan(
@@ -169,8 +202,7 @@ pub async fn get_scan(site: &str, timestamp: NaiveDateTime) -> Result<Scan> {
 
     log::info!("Data file size (bytes): {}", downloaded_file.data().len());
 
-    let scan = downloaded_file.scan()?;
-    Ok(scan)
+    decoded(&downloaded_file)
 }
 
 /// Fetch the latest scan if it is newer than `current_timestamp`. One
@@ -179,7 +211,7 @@ pub async fn check_and_fetch_latest(
     site: &str,
     date: &chrono::NaiveDate,
     current_timestamp: Option<NaiveDateTime>,
-) -> Result<Option<(Scan, NaiveDateTime)>> {
+) -> Result<Option<(DecodedScan, NaiveDateTime)>> {
     let Some((metas, effective_date)) = list_files_with_fallback(site, date).await? else {
         return Ok(None);
     };
@@ -213,8 +245,7 @@ pub async fn check_and_fetch_latest(
 
     log::info!("Fetching newer scan: {}", latest_meta.name());
     let downloaded_file = download_file(latest_meta.clone()).await?;
-    let scan = downloaded_file.scan()?;
-    Ok(Some((scan, latest_dt)))
+    Ok(Some((decoded(&downloaded_file)?, latest_dt)))
 }
 
 /// Scans within a time range, sorted oldest-first. One S3 LIST per date in the
@@ -251,11 +282,10 @@ pub async fn list_scans_for_range(
     Ok(results)
 }
 
-pub async fn download_scan(identifier: Identifier) -> Result<Scan> {
+pub async fn download_scan(identifier: Identifier) -> Result<DecodedScan> {
     log::info!("Downloading scan \"{}\"...", identifier.name());
     let downloaded_file = download_file(identifier).await?;
-    let scan = downloaded_file.scan()?;
-    Ok(scan)
+    decoded(&downloaded_file)
 }
 
 /// The scan adjacent to `current_timestamp`, strictly after it when `forward`
@@ -265,7 +295,7 @@ pub async fn get_adjacent_scan(
     site: &str,
     current_timestamp: NaiveDateTime,
     forward: bool,
-) -> Result<(Scan, NaiveDateTime)> {
+) -> Result<(DecodedScan, NaiveDateTime)> {
     let date = current_timestamp.date();
 
     let mut all: Vec<(NaiveDateTime, Identifier)> = Vec::new();
@@ -320,8 +350,7 @@ pub async fn get_adjacent_scan(
 
     let ts = *ts;
     let downloaded = download_file(ident.clone()).await?;
-    let scan = downloaded.scan()?;
-    Ok((scan, ts))
+    Ok((decoded(&downloaded)?, ts))
 }
 
 // ---------------------------------------------------------------------------

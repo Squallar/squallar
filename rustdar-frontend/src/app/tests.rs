@@ -1860,7 +1860,11 @@ fn a_volume_no_pane_is_showing_is_dropped() {
             .insert(site.to_string(), Arc::new(empty_scan()));
         app.base_scans.insert(
             site.to_string(),
-            (Arc::new(empty_scan()), scan_info_for(site).timestamp),
+            (
+                Arc::new(empty_scan()),
+                Default::default(),
+                scan_info_for(site).timestamp,
+            ),
         );
         app.latest_cached_scans.insert(
             site.to_string(),
@@ -1927,7 +1931,11 @@ fn the_volume_a_switching_pane_is_still_drawing_survives() {
         .insert("KTLX".to_string(), Arc::new(empty_scan()));
     app.base_scans.insert(
         "KTLX".to_string(),
-        (Arc::new(empty_scan()), scan_info_for("KTLX").timestamp),
+        (
+            Arc::new(empty_scan()),
+            Default::default(),
+            scan_info_for("KTLX").timestamp,
+        ),
     );
 
     app.evict_unshown_scans();
@@ -1973,6 +1981,7 @@ fn a_discarded_scan_result_still_takes_down_the_wait_it_belonged_to() {
             site: "KTLX".to_string(),
             result: Ok(crate::channels::ScanData {
                 scan: empty_scan(),
+                declared_nyquist: Default::default(),
                 site: "KTLX".to_string(),
                 timestamp: chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
                     .unwrap()

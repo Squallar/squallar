@@ -331,10 +331,10 @@ impl super::App {
                 if outcome.sealed_elevations.is_empty() {
                     return;
                 }
-                let Some(scan) = self.chunk_feeds.snapshot(site) else {
+                let Some(live) = self.chunk_feeds.snapshot(site) else {
                     return;
                 };
-                (scan, outcome.sealed_elevations.as_slice())
+                (live.scan, outcome.sealed_elevations.as_slice())
             }
         };
         if scan.sweeps().is_empty() {
@@ -367,8 +367,18 @@ impl super::App {
             // reason: the base outlives this round, and a base missing cuts
             // would put a plausible, short ladder under every consumer.
             if closed.progress.whole_volume_complete {
-                self.base_scans
-                    .insert(site.to_string(), (Arc::clone(&scan), timestamp));
+                // The closed volume's own declarations travel with it: this
+                // base is what every section and 3D payload is cut from until
+                // the next volume closes, and a base without them puts the
+                // worker's velocity fold guard back on estimates.
+                self.base_scans.insert(
+                    site.to_string(),
+                    (
+                        Arc::clone(&scan),
+                        Arc::new(closed.declared_nyquist.clone()),
+                        timestamp,
+                    ),
+                );
             }
             // The volume is now exactly what the archive would have published,
             // so the steady state matches it — including the Level III refetch

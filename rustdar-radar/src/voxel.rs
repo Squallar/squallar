@@ -347,7 +347,6 @@
 //! is therefore a named constant the frontend's grid-spec ladder selects
 //! explicitly, alongside stepping down when a device reports less than 256.
 
-
 use crate::beam;
 use crate::palette::{get_color_for_value, get_legend_scale};
 use crate::sampler::{Column, VolumeSampler};
@@ -1583,10 +1582,12 @@ pub fn build_voxels_with_motion<'a>(
         crate::derive::Prepared::Native(scan) => {
             VolumeSampler::new(crate::nyquist::Volume::new(scan, declared), req.product).ok()?
         }
-        crate::derive::Prepared::Derived(scan) => {
-            VolumeSampler::for_derived(crate::nyquist::Volume::new(scan, declared), req.product, slot)
-                .ok()?
-        }
+        crate::derive::Prepared::Derived(scan) => VolumeSampler::for_derived(
+            crate::nyquist::Volume::new(scan, declared),
+            req.product,
+            slot,
+        )
+        .ok()?,
     };
 
     let half = req

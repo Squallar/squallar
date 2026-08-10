@@ -1369,7 +1369,11 @@ impl RenderInput {
                 // flag + 1 cut-angle flag (+ 8 for the angle) + 1
                 // declared-Nyquist flag (+ 8 for the value) + 4 radial count.
                 12 + if s.cut_angle_deg.is_some() { 8 } else { 0 }
-                    + if s.declared_nyquist_ms.is_some() { 8 } else { 0 }
+                    + if s.declared_nyquist_ms.is_some() {
+                        8
+                    } else {
+                        0
+                    }
                     + s.radials
                         .iter()
                         .map(|r| {

@@ -123,7 +123,22 @@ impl DeclaredNyquist {
     /// adaptive-PRF reselect, which is exactly when it matters.
     pub fn overlay(&mut self, newer: &Self) {
         for (elevation_number, ms) in newer.iter() {
-            self.by_elevation.insert(elevation_number, ms);
+            self.set(elevation_number, ms);
+        }
+    }
+
+    /// [`Self::declare`]'s last-wins twin: replace whatever this table held
+    /// for `elevation_number`.
+    ///
+    /// `pub(crate)` because the only caller that legitimately overwrites is
+    /// [`crate::current::resolve`]'s merge, where a later sweep is by
+    /// construction the newer statement of its cut. Everywhere else the
+    /// first-wins rule is what keeps a table from depending on how far a walk
+    /// happened to get, so this is not part of the public surface.
+    pub(crate) fn set(&mut self, elevation_number: u8, metres_per_second: f64) {
+        if metres_per_second.is_finite() {
+            self.by_elevation
+                .insert(elevation_number, metres_per_second);
         }
     }
 

@@ -55,8 +55,9 @@
 //! merged keying is exact, and where they differ at all, admission would put
 //! a sweep on a rung its own volume never declared.
 
-use nexrad_model::data::{Scan, Sweep, VolumeCoveragePattern};
+use nexrad_model::data::{Sweep, VolumeCoveragePattern};
 
+use crate::nyquist::{DeclaredNyquist, Volume};
 use crate::types::RadarProduct;
 
 /// A site's current volume, resolved as borrows: the pattern that keys it and
@@ -75,6 +76,13 @@ pub struct CurrentVolume<'a> {
     /// rest; the split is what a caption needs to say how much of the picture
     /// is the current flight's.
     base_sweeps: usize,
+    /// What each served cut declared its Nyquist velocity to be, merged from
+    /// the two source volumes by [`merge_declared`].
+    ///
+    /// Owned rather than borrowed, unlike everything else here: it is a
+    /// handful of `f64`s, and there is no single existing table to point at —
+    /// the merged volume's is the *composition* of two.
+    declared_nyquist: DeclaredNyquist,
 }
 
 impl<'a> CurrentVolume<'a> {
@@ -99,6 +107,19 @@ impl<'a> CurrentVolume<'a> {
     /// How many sweeps the current flight contributed.
     pub fn overlay_sweeps(&self) -> usize {
         self.sweeps.len() - self.base_sweeps
+    }
+
+    /// Each served cut's declared Nyquist velocity — the number
+    /// [`crate::sampler::VolumeSampler`]'s velocity fold guard prefers to its
+    /// own estimate, and the one a `Scan` cannot carry.
+    ///
+    /// Pass it to [`crate::render_input::RenderInput::with_declared_nyquist`]
+    /// alongside the payload extracted from [`Self::pattern`] and
+    /// [`Self::sweeps`], so the worker guards on the same limits this thread
+    /// would. Empty when neither source volume declared anything, which every
+    /// reader treats as "estimate".
+    pub fn declared_nyquist(&self) -> &DeclaredNyquist {
+        &self.declared_nyquist
     }
 
     /// The collection time of the newest radial in the merged volume — the
@@ -136,14 +157,18 @@ impl<'a> CurrentVolume<'a> {
 /// neither exists: the site has no volume at all yet.
 ///
 /// The admission rule is the module doc's; this is its one implementation.
-pub fn resolve<'a>(base: Option<&'a Scan>, overlay: Option<&'a Scan>) -> Option<CurrentVolume<'a>> {
+pub fn resolve<'a>(
+    base: Option<Volume<'a>>,
+    overlay: Option<Volume<'a>>,
+) -> Option<CurrentVolume<'a>> {
     // An overlay whose pattern has no cuts cannot key its own sweeps — the
     // mid-flight-join state. It contributes nothing rather than borrowing the
     // base's table for a flight whose plan is unknown.
-    let overlay = overlay.filter(|scan| !scan.coverage_pattern().elevation_cuts().is_empty());
+    let overlay = overlay.filter(|v| !v.scan().coverage_pattern().elevation_cuts().is_empty());
 
     match (base, overlay) {
-        (Some(base), Some(overlay)) => {
+        (Some(base_volume), Some(overlay_volume)) => {
+            let (base, overlay) = (base_volume.scan(), overlay_volume.scan());
             let base_cuts = base.coverage_pattern().elevation_cuts();
             let overlay_cuts = overlay.coverage_pattern().elevation_cuts();
             // Elevation numbers the overlay has sealed: those cuts are
@@ -178,26 +203,88 @@ pub fn resolve<'a>(base: Option<&'a Scan>, overlay: Option<&'a Scan>) -> Option<
                     .iter()
                     .filter(|s| keyable(overlay_cuts.len(), s)),
             );
+            let declared_nyquist = merge_declared(
+                &sweeps,
+                base_sweeps,
+                base_volume.declared_nyquist(),
+                overlay_volume.declared_nyquist(),
+            );
             Some(CurrentVolume {
                 pattern: overlay.coverage_pattern(),
                 sweeps,
                 base_sweeps,
+                declared_nyquist,
             })
         }
-        (Some(base), None) => Some(CurrentVolume {
-            pattern: base.coverage_pattern(),
-            sweeps: base.sweeps().iter().collect(),
-            base_sweeps: base.sweeps().len(),
-        }),
+        (Some(base), None) => {
+            let sweeps: Vec<&Sweep> = base.scan().sweeps().iter().collect();
+            let base_sweeps = sweeps.len();
+            let declared_nyquist = merge_declared(
+                &sweeps,
+                base_sweeps,
+                base.declared_nyquist(),
+                &DeclaredNyquist::empty(),
+            );
+            Some(CurrentVolume {
+                pattern: base.scan().coverage_pattern(),
+                sweeps,
+                base_sweeps,
+                declared_nyquist,
+            })
+        }
         // No base yet: the overlay stands alone, exactly as the growing live
         // volume always has. Its ladder is short and the captions say so.
-        (None, Some(overlay)) => Some(CurrentVolume {
-            pattern: overlay.coverage_pattern(),
-            sweeps: overlay.sweeps().iter().collect(),
-            base_sweeps: 0,
-        }),
+        (None, Some(overlay)) => {
+            let sweeps: Vec<&Sweep> = overlay.scan().sweeps().iter().collect();
+            let declared_nyquist = merge_declared(
+                &sweeps,
+                0,
+                &DeclaredNyquist::empty(),
+                overlay.declared_nyquist(),
+            );
+            Some(CurrentVolume {
+                pattern: overlay.scan().coverage_pattern(),
+                sweeps,
+                base_sweeps: 0,
+                declared_nyquist,
+            })
+        }
         (None, None) => None,
     }
+}
+
+/// The merged volume's declared Nyquist table, built from the **sweeps it
+/// actually serves** rather than by overlaying the two volumes' whole tables.
+///
+/// The distinction is the point. Both source tables can name cuts their
+/// volume's sweeps do not appear on — the live assembler declares a cut from
+/// its first radial, chunks before it seals — and overlaying them wholesale
+/// would let the in-flight volume's number key a rung the *base's* sweep is
+/// serving. Where the two volumes fly the same PRF that is a no-op; where an
+/// adaptive reselect or a VCP change moved it, it is the guard reading one
+/// sweep's fold limit off another sweep's waveform. So each sweep contributes
+/// its own volume's declaration and nothing else does.
+///
+/// `sweeps[..base_sweeps]` are the admitted base sweeps and the rest are the
+/// overlay's, which is the order [`resolve`] builds and [`CurrentVolume`]
+/// documents.
+fn merge_declared(
+    sweeps: &[&Sweep],
+    base_sweeps: usize,
+    base: &DeclaredNyquist,
+    overlay: &DeclaredNyquist,
+) -> DeclaredNyquist {
+    let mut out = DeclaredNyquist::empty();
+    for (index, sweep) in sweeps.iter().enumerate() {
+        let source = if index < base_sweeps { base } else { overlay };
+        if let Some(ms) = source.get(sweep.elevation_number()) {
+            // Later sweeps supersede earlier ones on the same cut — the
+            // newest-wins rule the whole merge is ordered by — so this is
+            // `set` rather than the first-wins `declare`.
+            out.set(sweep.elevation_number(), ms);
+        }
+    }
+    out
 }
 
 /// Whether `sweep`'s elevation number indexes a table of `cut_count` cuts.

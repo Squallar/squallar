@@ -48,6 +48,7 @@ fn send_archive_scan(app: &App, timestamp: chrono::NaiveDateTime, scan: nexrad_m
             site: "KTLX".to_string(),
             result: Ok(crate::channels::ScanData {
                 scan,
+                declared_nyquist: Default::default(),
                 site: "KTLX".to_string(),
                 timestamp,
             }),
@@ -67,6 +68,7 @@ fn send_auto_poll_archive(app: &App, timestamp: chrono::NaiveDateTime) {
             site: "KTLX".to_string(),
             result: Ok(crate::channels::ScanData {
                 scan: empty_scan(),
+                declared_nyquist: Default::default(),
                 site: "KTLX".to_string(),
                 timestamp,
             }),
@@ -421,9 +423,10 @@ fn the_3d_build_reads_the_base_volume_and_not_the_live_snapshot() {
     // a `Building` entry opens at dispatch, which is all a headless test
     // can — and need — observe.
     let mut based = headless(TestBridge::desktop());
-    based
-        .base_scans
-        .insert("KTLX".to_string(), (Arc::new(stamped_scan(10)), at(10)));
+    based.base_scans.insert(
+        "KTLX".to_string(),
+        (Arc::new(stamped_scan(10)), Default::default(), at(10)),
+    );
     based.handle_prepare_volume(0, target.clone());
     assert!(
         based.volume_store.lookup(&target).is_some(),
@@ -456,8 +459,10 @@ fn a_full_budget_refuses_the_3d_ask_before_paying_the_extraction() {
         region: None,
     };
     let mut app = headless(TestBridge::desktop());
-    app.base_scans
-        .insert("KTLX".to_string(), (Arc::new(stamped_scan(10)), at(10)));
+    app.base_scans.insert(
+        "KTLX".to_string(),
+        (Arc::new(stamped_scan(10)), Default::default(), at(10)),
+    );
 
     // Every slot is taken. Several frames of the level-triggered ask
     // arrive, as they do while a render is in flight.
@@ -521,8 +526,10 @@ fn a_3d_pane_is_not_handed_a_volume_other_than_the_one_it_asked_for() {
     };
 
     let mut app = headless(TestBridge::desktop());
-    app.base_scans
-        .insert("KTLX".to_string(), (Arc::new(stamped_scan(15)), at(15)));
+    app.base_scans.insert(
+        "KTLX".to_string(),
+        (Arc::new(stamped_scan(15)), Default::default(), at(15)),
+    );
     app.handle_prepare_volume(0, target.clone());
 
     assert!(
@@ -542,7 +549,7 @@ fn a_3d_pane_is_not_handed_a_volume_other_than_the_one_it_asked_for() {
 /// which stopped reaching its arm fails rather than passes vacuously.
 #[test]
 fn every_archive_path_offers_its_volume_to_the_3d_pane() {
-    let collected = |app: &App| app.base_scans.get("KTLX").map(|(_, at)| *at);
+    let collected = |app: &App| app.base_scans.get("KTLX").map(|(_, _, at)| *at);
 
     // 1. The arm that displays it.
     let mut shown = app_showing(at(10));
@@ -597,12 +604,14 @@ fn every_archive_path_offers_its_volume_to_the_3d_pane() {
 /// the display would cut newer data under the navigated caption.
 #[test]
 fn a_refresh_in_the_pre_publication_window_does_not_walk_the_base_back() {
-    let based = |app: &App| app.base_scans.get("KTLX").map(|(_, at)| *at);
+    let based = |app: &App| app.base_scans.get("KTLX").map(|(_, _, at)| *at);
     let mut app = app_showing(at(10));
     app.chunk_feeds.ensure("KTLX");
     // The feed's whole closed volume is already the merge base.
-    app.base_scans
-        .insert("KTLX".to_string(), (Arc::new(stamped_scan(10)), at(10)));
+    app.base_scans.insert(
+        "KTLX".to_string(),
+        (Arc::new(stamped_scan(10)), Default::default(), at(10)),
+    );
 
     // A manual Refresh in the window: the archive answers the previous
     // volume.

@@ -28,8 +28,10 @@ fn a_round_in_flight_does_not_take_the_snapshot_with_it() {
     let volume = stub_volume();
     let mut mgr = ChunkFeedManager::new();
     mgr.ensure("KICT");
-    mgr.feeds.get_mut("KICT").expect("ensured").last_snapshot =
-        Some(std::sync::Arc::clone(&volume));
+    mgr.feeds.get_mut("KICT").expect("ensured").last_snapshot = Some(LiveVolume {
+        scan: std::sync::Arc::clone(&volume),
+        declared: Default::default(),
+    });
 
     mgr.force_due("KICT");
     let poller = mgr.take_for_round("KICT").expect("the poller leaves");
@@ -37,7 +39,7 @@ fn a_round_in_flight_does_not_take_the_snapshot_with_it() {
         .snapshot("KICT")
         .expect("the volume vanished for the duration of the round");
     assert!(
-        std::sync::Arc::ptr_eq(&held, &volume),
+        std::sync::Arc::ptr_eq(&held.scan, &volume),
         "the bridge must serve the very volume the last frame resolved",
     );
 
@@ -102,8 +104,10 @@ fn a_retired_feed_serves_no_snapshot() {
     let volume = stub_volume();
     let mut mgr = ChunkFeedManager::new();
     mgr.ensure("KICT");
-    mgr.feeds.get_mut("KICT").expect("ensured").last_snapshot =
-        Some(std::sync::Arc::clone(&volume));
+    mgr.feeds.get_mut("KICT").expect("ensured").last_snapshot = Some(LiveVolume {
+        scan: std::sync::Arc::clone(&volume),
+        declared: Default::default(),
+    });
     mgr.force_due("KICT");
     let _poller = mgr.take_for_round("KICT").expect("the poller leaves");
     assert!(
@@ -128,7 +132,10 @@ fn a_retired_feed_serves_no_snapshot() {
 fn retirement_drops_the_bridge_copy_and_recovery_starts_fresh() {
     let mut mgr = ChunkFeedManager::new();
     mgr.ensure("KICT");
-    mgr.feeds.get_mut("KICT").expect("ensured").last_snapshot = Some(stub_volume());
+    mgr.feeds.get_mut("KICT").expect("ensured").last_snapshot = Some(LiveVolume {
+        scan: stub_volume(),
+        declared: Default::default(),
+    });
 
     mgr.force_stall("KICT");
     let poller = take(&mut mgr, "KICT");

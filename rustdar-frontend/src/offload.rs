@@ -631,22 +631,34 @@ pub fn execute(request: &JobRequest) -> JobResult {
         // The storm motion override rides the `RenderInput` — the lane the
         // plan-view SRV render already uses — and is threaded here into the
         // derivation seam both vertical renderers share.
-        JobRequest::Section { input, request } => rustdar_radar::xsect::render_section(
-            &input.to_scan(),
-            request,
-            input.radar_lat(),
-            input.radar_lon(),
-            input.storm_motion_override(),
-        )
-        .map(|section| JobOutput::Section(Box::new(section))),
-        JobRequest::Voxels { input, request } => rustdar_radar::voxel::build_voxels_with_motion(
-            &input.to_scan(),
-            request,
-            input.radar_lat(),
-            input.radar_lon(),
-            input.storm_motion_override(),
-        )
-        .map(|grid| JobOutput::Voxels(Box::new(grid))),
+        //
+        // So does the declared Nyquist table, and it has to be lifted back out
+        // separately: `to_scan` rebuilds model types, and the model type is
+        // precisely what dropped the number. Pairing the two here is what
+        // keeps this thread's velocity fold guard on the same limits the
+        // thread that extracted the payload used.
+        JobRequest::Section { input, request } => {
+            let (scan, declared) = (input.to_scan(), input.declared_nyquist());
+            rustdar_radar::xsect::render_section(
+                rustdar_radar::nyquist::Volume::new(&scan, &declared),
+                request,
+                input.radar_lat(),
+                input.radar_lon(),
+                input.storm_motion_override(),
+            )
+            .map(|section| JobOutput::Section(Box::new(section)))
+        }
+        JobRequest::Voxels { input, request } => {
+            let (scan, declared) = (input.to_scan(), input.declared_nyquist());
+            rustdar_radar::voxel::build_voxels_with_motion(
+                rustdar_radar::nyquist::Volume::new(&scan, &declared),
+                request,
+                input.radar_lat(),
+                input.radar_lon(),
+                input.storm_motion_override(),
+            )
+            .map(|grid| JobOutput::Voxels(Box::new(grid)))
+        }
     }
 }
 

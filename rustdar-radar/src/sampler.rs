@@ -953,10 +953,7 @@ impl<'a> VolumeSampler<'a> {
     /// A caller that holds the archive's own declarations — the whole
     /// production path does — passes [`crate::nyquist::Volume::new`] and gets
     /// the declared numbers instead. See [`Rung::fold_limit_ms`].
-    pub fn new(
-        volume: impl Into<Volume<'a>>,
-        product: RadarProduct,
-    ) -> Result<Self, SamplerError> {
+    pub fn new(volume: impl Into<Volume<'a>>, product: RadarProduct) -> Result<Self, SamplerError> {
         Self::build(volume.into(), product).inspect_err(|e| {
             log::warn!("volume sampler unavailable for {}: {e}", product.code());
         })
@@ -1163,10 +1160,9 @@ impl<'a> VolumeSampler<'a> {
             .iter()
             .map(|r| {
                 let fold = match r.fold_limit_ms {
-                    Some(ms) => format!(
-                        " ±{ms:.2}{}",
-                        if r.fold_limit_declared { 'd' } else { 'e' },
-                    ),
+                    Some(ms) => {
+                        format!(" ±{ms:.2}{}", if r.fold_limit_declared { 'd' } else { 'e' },)
+                    }
                     None => String::new(),
                 };
                 format!(

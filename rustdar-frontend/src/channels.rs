@@ -13,6 +13,13 @@ use std::sync::mpsc::{Receiver, Sender};
 /// Successful scan data returned from a background fetch.
 pub struct ScanData {
     pub scan: Scan,
+    /// What the volume's cuts declared their Nyquist velocities to be.
+    ///
+    /// Carried beside the `Scan` rather than in it because the model type has
+    /// no field for it — see [`rustdar_radar::nyquist`] — and dropping it here
+    /// would leave the section worker estimating velocity fold limits that the
+    /// archive stated outright, with no symptom to notice.
+    pub declared_nyquist: rustdar_radar::nyquist::DeclaredNyquist,
     pub site: String,
     pub timestamp: NaiveDateTime,
 }

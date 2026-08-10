@@ -817,7 +817,7 @@ impl super::App {
             let base = self
                 .base_scans
                 .get(site.as_str())
-                .map(|(scan, _)| Arc::clone(scan));
+                .map(|(scan, declared, _)| (Arc::clone(scan), Arc::clone(declared)));
             let overlay = self.chunk_feeds.snapshot(site.as_str());
 
             // The two refusals that have to be *named* rather than left as a
@@ -825,7 +825,10 @@ impl super::App {
             // are properties of the volume and the product rather than of the
             // cut — dispatching would burn a render slot to be told the same
             // thing, and on wasm there is only one slot.
-            if let Some(reason) = section_source_refusal(base.as_deref(), overlay.as_deref()) {
+            if let Some(reason) = section_source_refusal(
+                base.as_ref().map(|(scan, _)| scan.as_ref()),
+                overlay.as_ref().map(|live| live.scan.as_ref()),
+            ) {
                 // Both reasons resolve themselves — the mid-flight pattern
                 // arrives with the next volume start, the first download is
                 // already in flight — so the key is *not* written: the pane
@@ -868,7 +871,14 @@ impl super::App {
             // only on an SRV payload.
             let motion = self.render.storm_motion_override_kt();
             let extract = move || {
-                let current = rustdar_radar::current::resolve(base.as_deref(), overlay.as_deref())?;
+                let current = rustdar_radar::current::resolve(
+                    base.as_ref().map(|(scan, declared)| {
+                        rustdar_radar::nyquist::Volume::new(scan, declared)
+                    }),
+                    overlay.as_ref().map(|live| {
+                        rustdar_radar::nyquist::Volume::new(&live.scan, &live.declared)
+                    }),
+                )?;
                 rustdar_radar::render_input::RenderInput::extract_volume_parts(
                     current.pattern(),
                     current.sweeps(),
@@ -877,6 +887,10 @@ impl super::App {
                     lon,
                     motion,
                 )
+                // The same stamp `App::extract_current_volume` applies, and for
+                // the same reason: without it this payload's worker estimates
+                // the velocity fold limits the merge just declared.
+                .map(|input| input.with_declared_nyquist(current.declared_nyquist()))
             };
             match self.render.spawn_section_render(
                 pane_idx,
@@ -2200,7 +2214,11 @@ fn section_source_refusal(
     base: Option<&nexrad_model::data::Scan>,
     overlay: Option<&nexrad_model::data::Scan>,
 ) -> Option<rustdar_egui::pane::SectionUnavailable> {
-    if rustdar_radar::current::resolve(base, overlay).is_some() {
+    // The declared Nyquist tables are irrelevant to *whether* a merge resolves
+    // — the admission rule reads cut angles and elevation numbers only — so
+    // this asks the question with empty ones rather than threading tables into
+    // a pure predicate about coverage.
+    if rustdar_radar::current::resolve(base.map(Into::into), overlay.map(Into::into)).is_some() {
         return None;
     }
     if overlay.is_some_and(|scan| !scan.sweeps().is_empty()) {
