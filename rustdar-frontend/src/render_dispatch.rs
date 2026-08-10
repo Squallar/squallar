@@ -379,8 +379,8 @@ pub struct RenderDispatcher {
     /// a section pane want another cut re-uses the same volume and the same
     /// moment — moving the line, a second section pane cut from the same map,
     /// a line redrawn because the first one missed the storm — so a single entry
-    /// keyed on `(site, volume time, product)` catches all of it, and a second
-    /// entry would only ever hold a volume nothing on screen is looking at.
+    /// keyed on [`SectionInputKey`] catches all of it, and a second entry
+    /// would only ever hold a volume nothing on screen is looking at.
     ///
     /// The dominant protection is upstream of this and is a property of the
     /// interaction rather than of a cache: sections are re-cut **on commit**,
@@ -433,16 +433,53 @@ struct SectionInputKey {
     /// The fingerprint of the ladder this payload was extracted under —
     /// exactly the choices `extract_volume_parts` copied.
     ladder: u64,
+    /// The storm motion vector the payload was **derived** with, as raw bits,
+    /// and `None` for every product that does not read one.
+    ///
+    /// This field is the fix for a silent wrong-field. A storm-relative
+    /// section is not a slice of a measured moment: `extract_volume_parts`
+    /// runs the SRV derivation on the way out, so the payload *is* a function
+    /// of the vector. Without the vector in the key, an override edit left
+    /// `reusable` true, `extract()` unrun and the previous vector's field
+    /// shipped to the worker — while the plan view and the 3D volume both
+    /// re-derived correctly, because their invalidations do cover it. The
+    /// user dragged the vector and watched the section visibly redraw showing
+    /// the old one, for up to a whole volume, with nothing saying so.
+    ///
+    /// In the key rather than as an eviction in
+    /// [`set_storm_motion_override`](RenderDispatcher::set_storm_motion_override),
+    /// which is the other place it could go. Two reasons. The payload cache
+    /// holds exactly one entry, so an eviction would throw away a
+    /// *reflectivity* payload the vector never touched and charge the next
+    /// cut a 15.6 MB re-walk for an edit that could not have changed it. And
+    /// identity is what this struct is for: its doc above is the promise that
+    /// a thing the payload depends on cannot be left out of the comparison,
+    /// and the vector is such a thing.
+    ///
+    /// Bits rather than `f32`s so the comparison is reflexive. A NaN vector
+    /// would never equal itself, and the consequence would not be a wrong
+    /// picture but a re-extraction of the whole volume on every frame the
+    /// section stood — the quiet kind of failure this file already carries
+    /// two notes about.
+    storm_motion: Option<(u32, u32)>,
 }
 
 impl SectionInputKey {
-    /// The key a payload would have to carry to serve `target`.
-    fn of(target: &rustdar_egui::pane::SectionTarget) -> Self {
+    /// The key a payload would have to carry to serve `target` under the
+    /// storm motion vector `motion`.
+    ///
+    /// `motion` is the same `(speed_kt, direction_from_deg)` pair
+    /// [`RenderDispatcher::storm_motion_override_kt`] hands the extraction —
+    /// read from the dispatcher's own field at the call site, never taken
+    /// from the caller, so the vector a payload is keyed on cannot differ
+    /// from the vector it was derived with.
+    fn of(target: &rustdar_egui::pane::SectionTarget, motion: Option<(f32, f32)>) -> Self {
         Self {
             site: target.volume.site.clone(),
             collected: target.volume.collected,
             product: target.product,
             ladder: target.ladder,
+            storm_motion: motion.map(|(speed, direction)| (speed.to_bits(), direction.to_bits())),
         }
     }
 }
@@ -1101,6 +1138,19 @@ impl RenderDispatcher {
         self.spawn_render(pane_idx, product, elevation, sender, window, job);
     }
 
+    /// The storm motion vector the cached section payload will be **derived**
+    /// with, or `None` if no payload is cached.
+    ///
+    /// The one observable that distinguishes "the section re-derived" from
+    /// "the section redrew the previous vector's field", which are otherwise
+    /// the same picture arriving at the same time.
+    #[cfg(test)]
+    pub(crate) fn section_payload_motion(&self) -> Option<Option<(f32, f32)>> {
+        self.section_input
+            .as_ref()
+            .map(|cached| cached.input.storm_motion_override())
+    }
+
     /// Cut a vertical cross-section for a section pane, in the background.
     ///
     /// Returns `false` when the render budget is full, which is the caller's cue
@@ -1141,7 +1191,19 @@ impl RenderDispatcher {
         }
 
         let product = target.product;
-        let wanted_key = SectionInputKey::of(target);
+        // Read here, off the dispatcher's own field, for the reason
+        // `spawn_level2_render` reads it here rather than taking it as an
+        // argument: `dispatch_section_renders` has no test callers, so a
+        // vector merely forwarded from there would be untested by
+        // construction. The `then` gate is the same one the plan-view path
+        // uses — only the storm-relative product's payload is a function of
+        // the vector, and keying the other eight on it would re-walk 15.6 MB
+        // of gates every time the user nudged a vector they were not looking
+        // through.
+        let motion = (product == RadarProduct::StormRelativeVelocity)
+            .then(|| self.storm_motion_override_kt())
+            .flatten();
+        let wanted_key = SectionInputKey::of(target, motion);
         let reusable = self
             .section_input
             .as_ref()

@@ -39,7 +39,7 @@ fn target(site: &str, minute: u32, product: RadarProduct, ladder: u64) -> Sectio
 #[test]
 fn a_payload_is_reused_for_another_line_through_the_same_volume() {
     let base = target("KTLX", 30, RadarProduct::Reflectivity, 9);
-    let key = SectionInputKey::of(&base);
+    let key = SectionInputKey::of(&base, None);
 
     let mut elsewhere = base.clone();
     elsewhere.line = SectionLine::new(
@@ -55,7 +55,7 @@ fn a_payload_is_reused_for_another_line_through_the_same_volume() {
     .expect("a valid line");
     assert_ne!(elsewhere, base, "precondition: the line really moved");
     assert_eq!(
-        SectionInputKey::of(&elsewhere),
+        SectionInputKey::of(&elsewhere, None),
         key,
         "a redrawn line re-extracted the whole volume"
     );
@@ -66,7 +66,7 @@ fn a_payload_is_reused_for_another_line_through_the_same_volume() {
 #[test]
 fn a_payload_is_not_reused_across_volume_site_moment_or_ladder() {
     let base = target("KTLX", 30, RadarProduct::Reflectivity, 9);
-    let key = SectionInputKey::of(&base);
+    let key = SectionInputKey::of(&base, None);
 
     for (other, why) in [
         (
@@ -86,6 +86,53 @@ fn a_payload_is_not_reused_across_volume_site_moment_or_ladder() {
             "the live-feed case: the same volume, one rung-choice ago",
         ),
     ] {
-        assert_ne!(SectionInputKey::of(&other), key, "{why}");
+        assert_ne!(SectionInputKey::of(&other, None), key, "{why}");
     }
+}
+
+/// The storm motion vector is part of a storm-relative payload's identity,
+/// and of nothing else's.
+///
+/// An SRV section is not a slice of a measured moment: the derivation runs
+/// on the payload, so two vectors are two payloads. Without this the reuse
+/// test passed, `extract()` never ran, and the job shipped the previous
+/// vector's field — a *silent wrong field*, which is the failure mode this
+/// whole struct exists to make impossible.
+///
+/// The other half is as load-bearing as the first: the eight products that
+/// do not read a vector must keep their payload across an edit, or every
+/// nudge of a vector nobody is looking through costs a 15.6 MB re-walk of
+/// the volume.
+#[test]
+fn the_storm_motion_vector_is_part_of_a_storm_relative_payloads_identity() {
+    let srv = target("KTLX", 30, RadarProduct::StormRelativeVelocity, 9);
+    let slow = SectionInputKey::of(&srv, Some((20.0, 240.0)));
+    let fast = SectionInputKey::of(&srv, Some((60.0, 90.0)));
+    assert_ne!(slow, fast, "the section would ship the old vector's field");
+    assert_ne!(
+        slow,
+        SectionInputKey::of(&srv, None),
+        "an override cleared back to the volume's own Bunkers fit is also \
+             a different field",
+    );
+    assert_eq!(
+        slow,
+        SectionInputKey::of(&srv, Some((20.0, 240.0))),
+        "the same vector must reuse, or a section re-walks the volume on \
+             every frame",
+    );
+
+    // Reflexive on a NaN vector: unequal-to-itself would not draw the
+    // wrong picture, it would re-extract 15.6 MB every frame the section
+    // stood.
+    let nan = SectionInputKey::of(&srv, Some((f32::NAN, f32::NAN)));
+    assert_eq!(nan, SectionInputKey::of(&srv, Some((f32::NAN, f32::NAN))));
+
+    // And the products that do not read a vector are not keyed on one —
+    // which is why this belongs in the key and not in an eviction.
+    let refl = target("KTLX", 30, RadarProduct::Reflectivity, 9);
+    assert_eq!(
+        SectionInputKey::of(&refl, None),
+        SectionInputKey::of(&refl, None),
+    );
 }

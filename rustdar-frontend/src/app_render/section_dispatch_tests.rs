@@ -122,6 +122,54 @@ fn volume_of(sweeps: u8, cuts: Vec<ElevationCut>) -> Arc<Scan> {
     ))
 }
 
+/// [`volume_of`] with the velocity moment filled instead of reflectivity —
+/// what a storm-relative section has to be cut from.
+fn velocity_volume(cuts: Vec<ElevationCut>) -> Arc<Scan> {
+    let radial = Radial::new(
+        1_760_000_000_000,
+        0,
+        0.0,
+        1.0,
+        RadialStatus::ElevationStart,
+        1,
+        0.5,
+        None,
+        Some(MomentData::from_fixed_point(
+            1,
+            0,
+            250,
+            8,
+            2.0,
+            129.0,
+            vec![200],
+        )),
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    Arc::new(Scan::new(
+        VolumeCoveragePattern::new(
+            if cuts.is_empty() { 0 } else { 212 },
+            0,
+            0.5,
+            PulseWidth::Short,
+            false,
+            0,
+            false,
+            0,
+            false,
+            false,
+            0,
+            false,
+            false,
+            cuts,
+        ),
+        vec![Sweep::new(1, vec![radial])],
+    ))
+}
+
 /// `n` copies of [`one_cut`], so a `volume_of(n, …)` keys every sweep.
 fn cuts_for(n: u8) -> Vec<ElevationCut> {
     (0..n).map(|_| one_cut()).collect()
@@ -491,6 +539,66 @@ fn a_dispatch_for_a_pane_that_does_not_exist_refuses_instead_of_panicking() {
         "the refusal took a render slot with it, so the budget is short by \
              one for the life of the process"
     );
+}
+
+/// Dragging the storm motion vector re-derives the cross-section.
+///
+/// The reviewer's probe, and it failed on the shipped code with
+/// `left: Some((20.0, 240.0)), right: Some((60.0, 90.0))`. The payload
+/// cache keyed on `(site, collected, product, ladder)`, so an override
+/// edit — which clears the pane's staleness key but not the payload —
+/// left `reusable` true, skipped `extract()` and shipped the previous
+/// vector's field. On screen the section visibly redrew showing the old
+/// vector, for up to a whole volume, while the plan view and the 3D
+/// volume re-derived correctly: a silent wrong field, and the worst kind,
+/// because the redraw is the user's evidence that it worked.
+#[test]
+fn a_storm_motion_edit_re_derives_the_cross_section() {
+    let mut app = app_with_section(
+        RadarProduct::StormRelativeVelocity,
+        velocity_volume(vec![one_cut()]),
+    );
+    // Driven through the settings panel's own state and the app's own
+    // edit path, so the staleness key is cleared the way a real drag
+    // clears it — the half that already worked, and the half that made
+    // this bug invisible.
+    let mut drag = |app: &mut crate::app::App, speed: f32, direction: f32, enabled: bool| {
+        app.gui.storm_motion_override = rustdar_egui::StormMotionOverride {
+            enabled,
+            speed_kt: speed,
+            direction_deg: direction,
+        };
+        assert!(app.apply_storm_motion_override(), "the vector must move");
+        // The previous cut has landed. A section pane with a cut in
+        // flight does not re-dispatch, which in the app is the arrival
+        // that clears this and in a test has to be said out loud.
+        app.render.pane_render[0].render_in_flight = false;
+        app.dispatch_section_renders();
+        assert!(
+            state(app).rendered_for.is_some(),
+            "the cut was never dispatched, so the assertion below is \
+                 about a payload nothing asked for",
+        );
+    };
+
+    drag(&mut app, 20.0, 240.0, true);
+    assert_eq!(
+        app.render.section_payload_motion(),
+        Some(Some((20.0, 240.0))),
+        "precondition: the first cut carries the vector in force",
+    );
+
+    drag(&mut app, 60.0, 90.0, true);
+    assert_eq!(
+        app.render.section_payload_motion(),
+        Some(Some((60.0, 90.0))),
+        "the section redrew from the previous vector's field",
+    );
+
+    // Clearing the override back to the volume's own Bunkers fit is the
+    // same edit in the other direction, and was equally invisible.
+    drag(&mut app, 60.0, 90.0, false);
+    assert_eq!(app.render.section_payload_motion(), Some(None));
 }
 
 /// A cut of the right shape and no content, for the receive path.

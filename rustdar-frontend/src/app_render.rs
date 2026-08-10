@@ -593,36 +593,54 @@ impl super::App {
         }
     }
 
-    /// Check all panes for needed background renders and spawn render threads.
-    fn dispatch_pane_renders(&mut self, ctx: &egui::Context) {
+    /// Apply the storm motion override the settings panel holds, and if it
+    /// moved, invalidate everything derived with the old vector.
+    ///
+    /// Returns whether the vector changed. A method rather than a block inside
+    /// [`Self::dispatch_pane_renders`] because it is the whole edit path — the
+    /// widget's own state in, three invalidations out — and the only way to
+    /// test it end to end is to be able to call it. `dispatch_pane_renders`
+    /// takes an `egui::Context` and does eleven other things.
+    fn apply_storm_motion_override(&mut self) -> bool {
         // Editing the vector changes nothing else about a pane, so the derived
         // storm-relative tilts have to be invalidated explicitly.
         let storm_motion = self.gui.storm_motion_override.sample();
-        if self.render.set_storm_motion_override(storm_motion) {
-            // The vertical views' counterpart of the plan-view invalidation
-            // the setter just did: an SRV grid or section is derived *with*
-            // the vector, but the vector is not part of the target that keys
-            // it — without this, an override edit leaves every SRV volume and
-            // section painting the old vector's field until the next volume.
-            self.volume_store
-                .evict_product(rustdar_radar::types::RadarProduct::StormRelativeVelocity);
-            for pane_idx in 0..self.gui.pane_count() {
-                let Some(pane) = self.gui.pane_mut(pane_idx) else {
-                    continue;
-                };
-                if pane.selected_product
-                    != rustdar_radar::types::RadarProduct::StormRelativeVelocity
-                {
-                    continue;
-                }
-                if let Some(volume) = pane.volume_mut() {
-                    volume.rendered_for = None;
-                }
-                if let Some(section) = pane.cross_section_mut() {
-                    section.rendered_for = None;
-                }
+        if !self.render.set_storm_motion_override(storm_motion) {
+            return false;
+        }
+        // The vertical views' counterpart of the plan-view invalidation the
+        // setter just did: an SRV grid or section is derived *with* the
+        // vector, but the vector is not part of the target that keys it —
+        // without this, an override edit leaves every SRV volume and section
+        // painting the old vector's field until the next volume.
+        //
+        // Clearing a section pane's staleness key is necessary and was never
+        // sufficient. The dispatcher's own payload cache is keyed separately,
+        // and until the vector joined that key too a cleared staleness key
+        // simply re-dispatched the *same payload* — see
+        // `render_dispatch::SectionInputKey::storm_motion`.
+        self.volume_store
+            .evict_product(rustdar_radar::types::RadarProduct::StormRelativeVelocity);
+        for pane_idx in 0..self.gui.pane_count() {
+            let Some(pane) = self.gui.pane_mut(pane_idx) else {
+                continue;
+            };
+            if pane.selected_product != rustdar_radar::types::RadarProduct::StormRelativeVelocity {
+                continue;
+            }
+            if let Some(volume) = pane.volume_mut() {
+                volume.rendered_for = None;
+            }
+            if let Some(section) = pane.cross_section_mut() {
+                section.rendered_for = None;
             }
         }
+        true
+    }
+
+    /// Check all panes for needed background renders and spawn render threads.
+    fn dispatch_pane_renders(&mut self, ctx: &egui::Context) {
+        self.apply_storm_motion_override();
         for pane_idx in 0..self.gui.pane_count() {
             // Ahead of the rendering-params branch, not inside it. A pane with
             // no plan view still has a product and an elevation selected —
