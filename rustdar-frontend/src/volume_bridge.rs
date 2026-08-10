@@ -22,73 +22,47 @@
 //! therefore is, and the one thing that cannot — that the payload downcasts —
 //! has its own test here, in the only crate that can name both types.
 //!
-//! # The transfer function, and why five of the six moments are refused
+//! # The transfer function: per-product profiles, and the gate that remains
 //!
-//! `VoxelGrid::fade_band()` reports how many indices above the no-data index are
-//! still fully transparent. Measured, it is **64 for reflectivity and 0 for
-//! every other moment** — velocity, spectrum width, ZDR, ΦDP and ρHV — because
-//! only reflectivity's palette has a transparency floor above the ramp's bottom.
+//! This module once refused five of the six samplable moments, because a
+//! volume drawn through a palette designed for a plan view — where opacity
+//! carries no meaning, since nothing is behind anything — saturates into a
+//! solid block. That was rendered, not predicted: at 80 km half-width on
+//! KSRX, 2026-07-30 22:33Z, reflectivity resolved into convective cells
+//! standing above a stratiform sheet, and velocity — the same volume,
+//! 677 933 cells with data — filled the pane with opaque green edge to edge.
+//! Only reflectivity's palette had a transparency floor (a 64-index fade
+//! band); the other five measured 0 and were refused by that number.
 //!
-//! Zero is not merely "no fade", and the consequence is larger than it looks.
-//! The volume texture is sampled `Linear`, so **every** boundary between a cell
-//! with data and a cell without one interpolates across the whole bottom of the
-//! ramp inside one voxel. Where that bottom is opaque, the interpolation paints.
-//! A volume is mostly empty — a real KSRX velocity grid is 8% filled — so
-//! "everywhere a ray passes near data" is very nearly the entire coverage cone,
-//! and the accumulated result is a solid block of whatever colour sits low on
-//! the ramp.
+//! The products WP made the five presentation judgements that refusal
+//! deferred: every samplable moment's voxel table now ships a **per-product
+//! transparency profile**, built into the grid's own LUT by
+//! `rustdar_radar::voxel`'s `volume_alpha_scale` and documented there,
+//! constant by constant. The judgements are shaped to each moment's physics
+//! rather than forced onto the bottom of its ramp — the earlier measurement
+//! that a forced 64-index bottom fade left velocity "still unusable — a
+//! speckled disc" stands, and is exactly why velocity's see-through band is
+//! its *middle* (calm air), ρHV's is its *top* (uniform precipitation), and
+//! ΦDP's is a flat translucency over its whole site-offset, range-cumulative
+//! scale.
 //!
-//! That is not a prediction. It was rendered: at 80 km half-width on KSRX,
-//! 2026-07-30 22:33Z, reflectivity resolved into individual convective cells
-//! standing above a stratiform sheet, and velocity — the same volume, 677 933
-//! cells with data — filled the pane with opaque green from edge to edge.
+//! What remains here is a **gate, not a repair**: [`palette_refusal_for`]
+//! refuses a grid whose table has fewer than [`MINIMUM_FADE_INDICES`]
+//! see-through entries *anywhere on its ramp*
+//! (`VoxelGrid::see_through_indices`). With the profiles shipped, every
+//! samplable moment clears it — the gate's remaining job is to catch the
+//! regression where a palette or profile change ships a wall-to-wall opaque
+//! table again, and to say why the render would be a block rather than
+//! painting one. It reads the grid's own table, never the user's Volume Alpha
+//! curve: a curve cannot un-refuse a table (nor re-refuse one — a user who
+//! paints their curve opaque gets the block they drew, on purpose).
 //!
-//! **A short forced fade at the bottom of the table does not fix it, and the
-//! first version of this module was wrong to say it did.** The artefact is the
-//! whole sweep from index 0 to the neighbour's value, not its bottom; a band of
-//! `n` indices hides `n/255` of it. Widening the band far enough to matter would
-//! erase the measurements the band covers — and for velocity, ZDR and ΦDP the
-//! bottom of the ramp is a real measurement, not a floor.
-//!
-//! So the decision is a **gate, not a repair**: a moment whose palette does not
-//! fade at the bottom of its ramp is not rendered in 3D, and the pane says why.
-//! Only reflectivity clears it today, which is also the moment GR2Analyst's 3D
-//! view is built around.
-//!
-//! # The fade width is a proxy, and the property it stands in for is different
-//!
-//! Read [`MINIMUM_FADE_INDICES`] as a number to tune and you will tune the wrong
-//! thing. Review measured what a wider forced fade actually does to velocity, at
-//! the same 64 indices reflectivity has: **still unusable** — a speckled disc
-//! rather than a solid one. At 128 structure finally appears, and only the
-//! *outbound* half of it, because half the scale has been deleted.
-//!
-//! So the property that matters is not "how many transparent entries are
-//! there". It is **whether the low end of the ramp is unimportant**. It is for
-//! reflectivity, whose ramp bottom is sub-noise dBZ; it is not for velocity,
-//! whose ramp bottom is the strongest inbound flow the radar can encode. The
-//! fade width is a usable proxy *only because the six palettes measure 64 and
-//! 0* — every threshold in `1..=64` selects the same single moment.
-//!
-//! A hypothetical palette with a 20-index fade over a meaningful low end would
-//! clear this gate and paint a block anyway. If one appears, the fix is a
-//! per-moment statement of which end of the scale carries no information — not
-//! a bigger constant here.
-//!
-//! Two things this deliberately is *not*:
-//!
-//! * It is not a claim that the other five cannot be rendered. It is a claim
-//!   that they cannot be rendered **through a palette designed for a plan view**,
-//!   where opacity carries no meaning because nothing is behind anything. Giving
-//!   each moment its own opacity profile — transparent near 0 m/s and opaque at
-//!   the extremes for velocity, transparent near ρHV 1.0 and opaque below it —
-//!   is a real design and a good one. It is also five separate presentation
-//!   judgements with no oracle in this work package, and the campaign has an
-//!   oracle: WP-K compares against GR. Guessing here would put five tuned
-//!   constants in front of that comparison rather than behind it.
-//! * It is not the encoding's fault alone. The clean fix for the *interpolation*
-//!   half is a second channel saying "this cell has data", so the filter never
-//!   crosses the boundary — a format change, not a transfer function.
+//! One thing this deliberately is *not*: a fix for the *interpolation* half
+//! of the story. The volume texture is sampled `Linear`, so a fetch at a
+//! data/no-data boundary still sweeps the bottom of the ramp inside one
+//! voxel; the profiles make that sweep land at reduced or zero alpha, but the
+//! clean fix remains a second channel saying "this cell has data" — a format
+//! change, not a transfer function.
 
 use std::any::Any;
 use std::borrow::Cow;
@@ -107,18 +81,23 @@ use crate::volume::quality::VolumeQuality;
 use crate::volume::raymarch::{OffscreenTarget, VolumePipelines, VolumeTextures};
 use crate::volume::uniform::VolumeUniform;
 
-/// The narrowest transparent run at the bottom of a palette that this renderer
-/// will draw a volume through.
+/// The fewest see-through entries a grid's table may have, anywhere on its
+/// ramp, before this renderer refuses to draw a volume through it.
 ///
-/// **A proxy for a property this number cannot express, not a tuning knob** —
-/// the module doc says which property and why a wider value does not buy what it
-/// looks like it buys. In short: every threshold in `1..=64` selects exactly
-/// reflectivity, because the six palettes measure 64 and 0 and nothing between;
-/// and a *forced* fade of 64 on velocity was measured and is still unusable.
+/// Compared against `VoxelGrid::see_through_indices` — the count of data
+/// entries at or under a quarter opacity, wherever they sit — because since
+/// the per-product profiles landed the see-through band is mid-ramp for a
+/// diverging moment and top-of-ramp for ρHV; the *bottom*-run measurement
+/// (`fade_band`) still anchors the march's skip threshold, which really is
+/// about the bottom.
 ///
-/// 16 rather than 1 so that a palette with a token one- or two-entry floor
+/// 16 rather than 1 so that a table with a token one- or two-entry floor
 /// cannot clear a `> 0` test; 16 rather than 64 so that the value is not
 /// mistaken for reflectivity's own band, which it has no relationship to.
+/// Every shipped profile clears it by at least 2× (the measured table lives
+/// with `the_default_transparency_profile_is_measured_per_product` in
+/// `rustdar_radar::voxel`), so a failure here is a regression in a palette or
+/// profile, not a tuning problem.
 ///
 /// It is a **bar**, not a repair — nothing here rewrites a colour table.
 pub const MINIMUM_FADE_INDICES: u8 = 16;
@@ -1032,26 +1011,27 @@ fn largest_cell_km(uniform: &VolumeUniform) -> f32 {
 
 /// Why this moment cannot be drawn as a volume, or `None` if it can.
 ///
-/// The whole transfer-function decision, in one predicate over one measured
-/// number. See the module doc for what was rendered to arrive at it.
+/// The solid-block regression bar, in one predicate over one measured number.
+/// See the module doc for what was rendered to arrive at it. Since the
+/// per-product profiles landed every samplable moment clears it; a refusal
+/// here means a palette or profile change shipped a wall-to-wall opaque
+/// table.
 fn palette_refusal(grid: &VoxelGrid) -> Option<String> {
-    palette_refusal_for(grid.fade_band(), grid.product().name())
+    palette_refusal_for(grid.see_through_indices(), grid.product().name())
 }
 
 /// [`palette_refusal`] over the two things it actually reads, so the decision is
 /// testable without a `VoxelGrid` — which has no constructor outside
 /// `build_voxels` and would need a synthetic `Scan` to obtain.
-fn palette_refusal_for(band: u8, moment: &str) -> Option<String> {
-    if band >= MINIMUM_FADE_INDICES {
+fn palette_refusal_for(see_through: u16, moment: &str) -> Option<String> {
+    if see_through >= u16::from(MINIMUM_FADE_INDICES) {
         return None;
     }
     Some(format!(
-        "{moment} cannot be drawn as a volume yet.\n\nIts colour table is opaque at the bottom of its \
-         scale, so every boundary between measured and unmeasured air paints — and a volume is \
-         mostly unmeasured air. The result is a solid block, not a picture. Reflectivity's table \
-         fades over the lowest quarter of its scale, which is why it renders.\n\nGiving each \
-         moment its own opacity profile is the fix, and it is a presentation decision that wants \
-         comparing against GR2Analyst rather than guessing.",
+        "{moment} cannot be drawn as a volume.\n\nIts colour table is opaque across its whole \
+         scale, so every measured cell would paint at full strength and the render would be a \
+         solid block, not a picture. A volume needs a see-through part of its scale — its \
+         product's transparency profile is missing or has regressed.",
     ))
 }
 
@@ -1801,35 +1781,64 @@ mod tests {
         );
     }
 
-    /// Exactly one of the six samplable moments clears the fade bar today, and
-    /// the bands here are `rustdar_radar::voxel`'s own measurements.
+    /// Every samplable moment clears the solid-block bar, and the counts here
+    /// are `rustdar_radar::voxel`'s own measurements — the deliberate flip of
+    /// the original `only_reflectivity_clears_the_fade_bar`, whose doc said a
+    /// widened set "is a decision someone should make on purpose rather than
+    /// discover". The products WP made it: each moment's transparency profile
+    /// is argued at `volume_alpha_scale`, measured by
+    /// `the_default_transparency_profile_is_measured_per_product` upstream,
+    /// and admitted here.
     ///
-    /// Written as literals rather than by rebuilding six grids, and that is the
-    /// point: `the_fade_band_is_measured_per_product` upstream pins what the
-    /// palettes produce, and this pins what this renderer *does* about it. If a
-    /// palette gains a transparency floor, the upstream test changes and this one
-    /// stays green — which is correct, because the moment would then start
-    /// rendering, and that is a decision someone should make on purpose rather
-    /// than discover.
+    /// Written as literals rather than by rebuilding six grids, and that is
+    /// the point: the upstream test pins what the tables produce, and this
+    /// pins what this renderer *does* about it.
     #[test]
-    fn only_reflectivity_clears_the_fade_bar() {
+    fn every_samplable_moments_default_table_clears_the_gate() {
         let measured = [
-            ("Reflectivity", 64u8),
-            ("Velocity", 0),
-            ("Spectrum Width", 0),
-            ("Differential Reflectivity", 0),
-            ("Differential Phase", 0),
-            ("Correlation Coefficient", 0),
+            ("Reflectivity", 64u16),
+            ("Velocity", 41),
+            ("Spectrum Width", 18),
+            ("Differential Reflectivity", 53),
+            ("Differential Phase", 255),
+            ("Correlation Coefficient", 35),
         ];
-        let drawable: Vec<&str> = measured
+        let refused: Vec<&str> = measured
             .iter()
-            .filter(|(moment, band)| palette_refusal_for(*band, moment).is_none())
+            .filter(|(moment, see_through)| palette_refusal_for(*see_through, moment).is_some())
             .map(|(moment, _)| *moment)
             .collect();
         assert_eq!(
-            drawable,
-            vec!["Reflectivity"],
-            "the set of moments this renderer will draw as a volume changed",
+            refused,
+            Vec::<&str>::new(),
+            "a samplable moment stopped clearing the solid-block bar",
+        );
+        // The bar still has teeth: a wall-to-wall opaque table is refused.
+        assert!(
+            palette_refusal_for(0, "Anything").is_some(),
+            "an all-opaque table must still be refused",
+        );
+        // And a bar's-edge clearance is called out: spectrum width is the one
+        // narrow profile (its clear band is honestly small — laminar flow is
+        // a thin slice of its scale); everything else clears by 2x or more,
+        // and a profile change eroding that should be renegotiated here.
+        for (moment, see_through) in measured {
+            assert!(
+                see_through >= 2 * u16::from(MINIMUM_FADE_INDICES) || moment == "Spectrum Width",
+                "{moment} clears the bar by less than 2x: {see_through}",
+            );
+        }
+        // The production wiring reads the see-through measure, not the bottom
+        // run: velocity's fade_band is honestly 0 (its ramp bottom is the
+        // strongest inbound air), so a gate on the bottom run would refuse it
+        // in production with every literal above still green. Source-scanned
+        // for the same reason as
+        // `the_guards_paint_cannot_be_tested_through_are_still_in_it`: no
+        // test here can build a `VoxelGrid`.
+        assert!(
+            include_str!("volume_bridge.rs")
+                .contains("palette_refusal_for(grid.see_through_indices(), grid.product().name())"),
+            "palette_refusal no longer reads the see-through measure",
         );
     }
 
@@ -1850,8 +1859,12 @@ mod tests {
             "the reason must name the property that caused it: {why}",
         );
         assert!(
-            why.contains("Reflectivity"),
-            "the message must say which moment does work: {why}",
+            why.contains("solid block"),
+            "the reason must say what the render would degenerate into: {why}",
+        );
+        assert!(
+            why.contains("profile"),
+            "the message must point at the thing that regressed: {why}",
         );
     }
 
@@ -2279,14 +2292,15 @@ mod tests {
         );
     }
 
-    /// The bar is inclusive, and a palette one index short of it is refused.
+    /// The bar is inclusive, and a table one index short of it is refused.
     ///
-    /// Both halves matter. Written as `>` the whole set would flip on a palette
+    /// Both halves matter. Written as `>` the whole set would flip on a table
     /// sitting exactly at 16; written as `>=` on the wrong side, a 15-index
-    /// token floor would pass and paint the block this gate exists to stop.
+    /// token see-through region would pass and paint the block this gate
+    /// exists to stop.
     #[test]
     fn the_fade_bar_is_inclusive_and_bites_one_index_below_it() {
-        assert!(palette_refusal_for(MINIMUM_FADE_INDICES, "x").is_none());
-        assert!(palette_refusal_for(MINIMUM_FADE_INDICES - 1, "x").is_some());
+        assert!(palette_refusal_for(u16::from(MINIMUM_FADE_INDICES), "x").is_none());
+        assert!(palette_refusal_for(u16::from(MINIMUM_FADE_INDICES) - 1, "x").is_some());
     }
 }

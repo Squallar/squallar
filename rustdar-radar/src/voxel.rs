@@ -326,6 +326,15 @@ pub const NO_DATA_INDEX: u8 = 0;
 /// Bytes in [`VoxelGrid::lut`]: 256 entries × RGBA.
 pub const LUT_LEN: usize = 256 * 4;
 
+/// The alpha at or under which a table entry counts as **see-through** for
+/// [`VoxelGrid::see_through_indices`] — a quarter opacity.
+///
+/// At or under this, several voxels of depth stay visible behind an entry at
+/// the renderer's default extinction, so a run of such entries reads as haze
+/// rather than wall. A quarter of the *full* alpha scale, not of the palettes'
+/// own 180 ceiling, so the measure keeps meaning if a palette's ceiling moves.
+pub const SEE_THROUGH_ALPHA_CEILING: u8 = 64;
+
 /// The largest any axis may be: the `GL_MAX_3D_TEXTURE_SIZE` GLES 3.0
 /// guarantees. Not the largest any *device* allows — the largest every device
 /// must allow.
@@ -782,6 +791,27 @@ impl VoxelGrid {
         }
     }
 
+    /// How many of the 255 **data** entries are see-through — at or under
+    /// [`SEE_THROUGH_ALPHA_CEILING`] — wherever they sit on the ramp.
+    ///
+    /// The generalisation of [`Self::fade_band`] that the per-product
+    /// transparency profiles need: velocity's see-through band is its *middle*
+    /// (calm air), ρHV's is its *top* (uniform precipitation), and ΦDP's is
+    /// its whole ramp at a flat low alpha — a bottom-run measurement reads 0
+    /// for all three even when most of the ramp is see-through. "At or under
+    /// a quarter opacity" rather than "exactly zero" because a fade's shoulder
+    /// and a flat translucency both read as haze rather than wall, which is
+    /// the property the renderer's solid-block gate actually needs; `fade_band`
+    /// remains the march's skip-threshold anchor, which really is about the
+    /// bottom of the ramp.
+    pub fn see_through_indices(&self) -> u16 {
+        self.lut
+            .chunks_exact(4)
+            .skip(1)
+            .filter(|entry| entry[3] <= SEE_THROUGH_ALPHA_CEILING)
+            .count() as u16
+    }
+
     /// The offset of cell `(x, y, z)` in [`indices`](Self::indices) and
     /// [`values`](Self::values). `None` outside the grid.
     pub fn cell_offset(&self, x: usize, y: usize, z: usize) -> Option<usize> {
@@ -897,12 +927,125 @@ fn value_range_for(slot: MomentSlot) -> (f32, f32) {
     ((f64::from(lo) - step) as f32, hi)
 }
 
+/// Where a moment's default 3D transparency starts and ends, in the moment's
+/// own units. Each row is the WP-I transfer-function decision the module doc
+/// deferred, made per product and written down here so a test can pin it and a
+/// reviewer can argue with it.
+///
+/// The clear edge is where the volume becomes fully transparent; the opaque
+/// edge is where it reaches the palette's own alpha. Between them the alpha
+/// rises smoothly. The 2D palettes are untouched — this shapes only the voxel
+/// table, and it only ever *multiplies* the palette's alpha, so nothing here
+/// can make a value more opaque than its plan-view colour.
+mod volume_alpha_profile {
+    /// Velocity (and, by the same physics, storm-relative velocity when it is
+    /// admitted): the palette is diverging, so the uninteresting band is the
+    /// **middle** — near-zero radial velocity, which fills most of any volume
+    /// because ambient flow is everywhere — not the bottom of the ramp, which
+    /// is the strongest inbound air and must stay opaque. Clear inside
+    /// ±4 m/s (ambient drift and noise), fully opaque by ±20 m/s, the range
+    /// where cores and couplets live. GR2Analyst's velocity volumes read the
+    /// same way: the storm-scale wind structure stands free of the ambient
+    /// field.
+    pub const VELOCITY_CLEAR_MS: f32 = 4.0;
+    pub const VELOCITY_OPAQUE_MS: f32 = 20.0;
+
+    /// Spectrum width is sequential and its floor really is uninteresting:
+    /// low width is laminar flow or pure noise. Clear below 2 m/s, opaque by
+    /// 8 m/s — the band where turbulence, shear and mesocyclone interiors
+    /// report.
+    pub const SW_CLEAR_MS: f32 = 2.0;
+    pub const SW_OPAQUE_MS: f32 = 8.0;
+
+    /// Differential reflectivity diverges about rain's own background rather
+    /// than about zero: drizzle and small drops sit near +0.25 dB. Clear
+    /// within ±0.75 dB of that centre, opaque beyond ±3 dB from it — big-drop
+    /// columns on the positive side, hail and graupel cores on the negative.
+    pub const ZDR_CENTRE_DB: f32 = 0.25;
+    pub const ZDR_CLEAR_DB: f32 = 0.75;
+    pub const ZDR_OPAQUE_DB: f32 = 3.0;
+
+    /// Correlation coefficient inverts the usual shape: uniform precipitation
+    /// reads 0.97–1.0, and that is the background to see through. Clear above
+    /// 0.97, opaque below 0.90 — the melting layer, debris and
+    /// non-meteorological scatterers. A tornado debris signature is a low-ρHV
+    /// column, and this profile is what makes it a column instead of a wall.
+    pub const CC_OPAQUE: f32 = 0.90;
+    pub const CC_CLEAR: f32 = 0.97;
+
+    /// Differential phase gets a flat translucency instead of a value band,
+    /// because no value band of ΦDP is honestly "background": the moment is
+    /// cumulative along the ray and offset by a per-site system phase, so a
+    /// fixed clear band would hide different physics at different sites. At
+    /// ~35 % alpha the field reads as a haze with visible interior structure
+    /// rather than a wall.
+    pub const PHI_ALPHA: f32 = 0.35;
+}
+
+/// `x` mapped smoothly from 0 at `edge0` to 1 at `edge1`, clamped.
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// The default 3D alpha multiplier for `product` at `value` — the per-product
+/// transparency profile the volume table ships with (constants and rationale
+/// in [`volume_alpha_profile`]).
+///
+/// `1.0` for reflectivity **deliberately**: its palette already fades over the
+/// lowest quarter of its scale, that fade is the reference look every other
+/// profile is measured against, and identity keeps every pre-WP reflectivity
+/// grid bit-exact. The match is exhaustive over the samplable moments with no
+/// wildcard, for the same reason `data_levels` has none: a newly admitted
+/// product must have its transparency argued, not inherited — above all a
+/// categorical palette, which must never be softened at all.
+fn volume_alpha_scale(product: RadarProduct, value: f32) -> f32 {
+
+    use volume_alpha_profile as p;
+    match product {
+        RadarProduct::Reflectivity => 1.0,
+        RadarProduct::Velocity => {
+            smoothstep(p::VELOCITY_CLEAR_MS, p::VELOCITY_OPAQUE_MS, value.abs())
+        }
+        RadarProduct::SpectrumWidth => smoothstep(p::SW_CLEAR_MS, p::SW_OPAQUE_MS, value),
+        RadarProduct::DifferentialReflectivity => smoothstep(
+            p::ZDR_CLEAR_DB,
+            p::ZDR_OPAQUE_DB,
+            (value - p::ZDR_CENTRE_DB).abs(),
+        ),
+        RadarProduct::CorrelationCoefficient => 1.0 - smoothstep(p::CC_OPAQUE, p::CC_CLEAR, value),
+        RadarProduct::DifferentialPhase => p::PHI_ALPHA,
+        // Unreachable today: `crate::sampler::samplable` refuses everything
+        // below before a table is built. Spelled out rather than wildcarded so
+        // a new `RadarProduct` variant fails to compile until it is classified
+        // here, and so the arm anyone widening `samplable` must move a product
+        // out of is this one — with its transparency argued, not inherited.
+        // Above all the categorical classification must never be softened.
+        RadarProduct::StormRelativeVelocity
+        | RadarProduct::SpecificDifferentialPhase
+        | RadarProduct::EchoTops
+        | RadarProduct::EchoTopsInterpolated
+        | RadarProduct::VerticallyIntegratedLiquid
+        | RadarProduct::VilDensity
+        | RadarProduct::ProbabilityOfSevereHail
+        | RadarProduct::MaxExpectedHailSize
+        | RadarProduct::HydrometeorClassification
+        | RadarProduct::PrecipitationRate
+        | RadarProduct::NormalizedRotation => 1.0,
+    }
+}
+
 /// The 256-entry RGBA table for a product over a ramp, entry 0 forced fully
 /// transparent.
 ///
 /// Built by **calling** `get_color_for_value`, never by reading
 /// `LegendScale::thresholds` — see the module doc for the four things that
-/// would break.
+/// would break. The alpha channel is the palette's own, scaled by the
+/// product's [`volume_alpha_scale`] profile — the WP-I decision the module doc
+/// deferred: the five moments whose palettes are opaque at every finite value
+/// get their see-through band here, each shaped to its own physics rather
+/// than by a forced run at the bottom, because a diverging palette's
+/// uninteresting band is its middle and ρHV's is its **top**.
 fn colormap_lut(product: RadarProduct, range: (f32, f32)) -> Vec<u8> {
     let mut lut = Vec::with_capacity(LUT_LEN);
     // Entry 0 is the no-data entry. Forced rather than taken from the palette
@@ -912,7 +1055,9 @@ fn colormap_lut(product: RadarProduct, range: (f32, f32)) -> Vec<u8> {
     // whole outside of the volume.
     lut.extend_from_slice(&[0, 0, 0, 0]);
     for index in 1..=255u8 {
-        let (r, g, b, a) = get_color_for_value(product, ramp_value(range, index));
+        let value = ramp_value(range, index);
+        let (r, g, b, a) = get_color_for_value(product, value);
+        let a = (f32::from(a) * volume_alpha_scale(product, value)).round() as u8;
         lut.extend_from_slice(&[r, g, b, a]);
     }
     lut
@@ -1471,6 +1616,59 @@ mod tests {
                         bytes,
                     )),
                     None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            })
+            .collect();
+        Sweep::new(elevation_number, radials)
+    }
+
+    /// One velocity sweep over `field`, m/s through the (2, 129) codec —
+    /// the fixture for the fold-guard test, shaped like [`refl_sweep`].
+    fn vel_sweep(
+        elevation_number: u8,
+        elevation_deg: f32,
+        azimuths: &[f32],
+        n_gates: usize,
+        field: Field<'_>,
+    ) -> Sweep {
+        const VEL_SCALE: f32 = 2.0;
+        const VEL_OFFSET: f32 = 129.0;
+        let spacing = 360.0 / azimuths.len() as f32;
+        let radials = azimuths
+            .iter()
+            .enumerate()
+            .map(|(i, &az)| {
+                let bytes: Vec<u8> = (0..n_gates)
+                    .map(|j| match field(f64::from(az), gate_slant_km(j)) {
+                        None => 0,
+                        Some(v) => ((v * f64::from(VEL_SCALE) + f64::from(VEL_OFFSET)).round()
+                            as i64)
+                            .clamp(2, 255) as u8,
+                    })
+                    .collect();
+                Radial::new(
+                    0,
+                    i as u16,
+                    az,
+                    spacing,
+                    RadialStatus::IntermediateRadialData,
+                    elevation_number,
+                    elevation_deg,
+                    None,
+                    Some(MomentData::from_fixed_point(
+                        bytes.len() as u16,
+                        FIRST_GATE_M,
+                        GATE_M,
+                        8,
+                        VEL_SCALE,
+                        VEL_OFFSET,
+                        bytes,
+                    )),
                     None,
                     None,
                     None,
@@ -2965,17 +3163,28 @@ mod tests {
             &vel[outbound..outbound + 4],
         );
 
-        // 4. Every entry is exactly the function's answer.
+        // 4. Every entry is exactly the function's answer: the colour
+        //    verbatim, the alpha scaled by the product's own 3D transparency
+        //    profile — and by nothing else, so the profile can only ever make
+        //    an entry *more* transparent than its plan-view colour.
         for product in SAMPLABLE {
             let range = value_range_for(samplable(product).unwrap());
             let lut = colormap_lut(product, range);
             for index in 1..=255u8 {
-                let (r, g, b, a) = get_color_for_value(product, ramp_value(range, index));
+                let value = ramp_value(range, index);
+                let (r, g, b, a) = get_color_for_value(product, value);
+                let scaled = (f32::from(a) * volume_alpha_scale(product, value)).round() as u8;
                 let at = usize::from(index) * 4;
                 assert_eq!(
                     &lut[at..at + 4],
-                    &[r, g, b, a],
+                    &[r, g, b, scaled],
                     "{} entry {index}",
+                    product.name(),
+                );
+                assert!(
+                    lut[at + 3] <= a,
+                    "{} entry {index}: the 3D profile must never exceed the \
+                     palette's own alpha",
                     product.name(),
                 );
             }
@@ -3256,38 +3465,45 @@ mod tests {
             "half-edge fetch, shipped vs out-of-band, per moment",
         );
 
-        // Both are fully opaque for all five non-fading moments, which is the
-        // point: neither encoding fades there, so the difference is only
-        // *which* wrong colour gets painted.
+        // When this table was first measured, all five non-reflectivity
+        // moments were fully opaque at every data entry — the half-edge fetch
+        // painted at full strength, and the measurement's conclusion was that
+        // WP-I had to supply the fade itself. It now has: every moment's table
+        // carries either a transparent band (shaped to its own physics by
+        // `volume_alpha_scale`) or a flat translucency (ΦDP), so the wrong
+        // colours tabulated above land at reduced or zero alpha wherever the
+        // profile says the value is background.
         for (slot, product) in SLOTS.iter().zip(SAMPLABLE) {
             if product == RadarProduct::Reflectivity {
                 continue;
             }
             let range = value_range_for(*slot);
             let lut = colormap_lut(product, range);
-            assert_eq!(
-                lut.chunks_exact(4)
-                    .skip(1)
-                    .filter(|entry| entry[3] == 0)
-                    .count(),
-                0,
-                "{} has no transparent data entry to fade into, so WP-I must \
-                 supply the fade itself",
+            let see_through = lut
+                .chunks_exact(4)
+                .skip(1)
+                .filter(|entry| entry[3] <= SEE_THROUGH_ALPHA_CEILING)
+                .count();
+            assert!(
+                see_through >= 16,
+                "{}: only {see_through} see-through entries — the solid-block \
+                 failure the profiles exist to prevent",
                 product.name(),
             );
         }
     }
 
-    /// How wide the fade actually is, per product — the number that says
-    /// whether the boundary fades or steps.
+    /// How wide the **bottom** fade is, per product — the number that anchors
+    /// the march's skip threshold.
     ///
-    /// **Recorded, not asserted to be large.** Only reflectivity's palette has
-    /// a transparency floor above the ramp's bottom, so only reflectivity gets
-    /// a real band; the other five step from opaque to absent in one
-    /// quantisation level, and no encoding choice available here changes that,
-    /// because their transfer functions have no transparent region to fade
-    /// into. Reflectivity is the product 3D volume rendering is for, which is
-    /// why the decision still pays.
+    /// **Recorded, not asserted to be large**, because since the per-product
+    /// transparency profiles landed this is no longer the number that decides
+    /// drawability — [`VoxelGrid::clear_indices`] is. A diverging moment's
+    /// see-through band sits mid-ramp, so its bottom band is honestly 0: the
+    /// ramp's bottom is its saturated extreme and must stay opaque. Only the
+    /// two moments whose *floor* is background — reflectivity (palette's own
+    /// quarter-ramp fade) and spectrum width (the profile's laminar-flow
+    /// fade) — have one.
     #[test]
     fn the_fade_band_is_measured_per_product() {
         let scan = six_moment_scan();
@@ -3305,10 +3521,17 @@ mod tests {
             vec![
                 // −32.5 … −0.5 dBZ is transparent: a quarter of the ramp.
                 ("ref", 64),
+                // The ramp's bottom is −64 m/s, the strongest inbound air —
+                // velocity's see-through band is mid-ramp, measured by
+                // `the_default_transparency_profile_is_measured_per_product`.
                 ("vel", 0),
-                ("sw", 0),
+                // 0 … 2 m/s: the profile's laminar-flow floor.
+                ("sw", 9),
+                // Bottom = −7.9 dB, a saturated hail extreme: opaque.
                 ("zdr", 0),
+                // Flat translucency, no transparent band at all.
                 ("phi", 0),
+                // Bottom = lowest ρHV, the most non-meteorological: opaque.
                 ("rho", 0),
             ],
             "the fade band per product",
@@ -3336,6 +3559,230 @@ mod tests {
         let mut clear = hand_built(None);
         clear.lut = vec![0; LUT_LEN];
         assert_eq!(clear.fade_band(), u8::MAX);
+    }
+
+    /// The per-product 3D transparency profile, pinned at physical landmarks.
+    ///
+    /// Each row is a rationale made testable: the value named is *why* the
+    /// profile has its shape, so a change to any constant in
+    /// `volume_alpha_profile` fails here with the physics in the message
+    /// rather than as an index diff. The last block is the drawability
+    /// measurement the renderer's solid-block gate reads.
+    #[test]
+    fn the_default_transparency_profile_is_measured_per_product() {
+        let alpha = |product: RadarProduct, value: f32| {
+            let range = value_range_for(samplable(product).unwrap());
+            let lut = colormap_lut(product, range);
+            lut[usize::from(ramp_index(range, value)) * 4 + 3]
+        };
+        // "Solid" means the palette's own plan-view alpha, verbatim — several
+        // 2D palettes are themselves translucent in places, and the profile
+        // may only scale them down, never up.
+        let palette_alpha = |product: RadarProduct, value: f32| {
+            let range = value_range_for(samplable(product).unwrap());
+            get_color_for_value(product, ramp_value(range, ramp_index(range, value))).3
+        };
+        let solid = |product: RadarProduct, value: f32, what: &str| {
+            assert_eq!(
+                alpha(product, value),
+                palette_alpha(product, value),
+                "{what}: full plan-view strength",
+            );
+            assert!(alpha(product, value) > 0, "{what}: visible at all");
+        };
+
+        // Velocity: calm air is invisible, cores are solid — in both signs.
+        assert_eq!(alpha(RadarProduct::Velocity, 0.0), 0, "calm air");
+        assert_eq!(alpha(RadarProduct::Velocity, 3.5), 0, "ambient drift");
+        assert_eq!(
+            alpha(RadarProduct::Velocity, -3.5),
+            0,
+            "ambient drift, inbound"
+        );
+        solid(RadarProduct::Velocity, 30.0, "an outbound core");
+        solid(RadarProduct::Velocity, -30.0, "an inbound core");
+        let mid = alpha(RadarProduct::Velocity, 10.0);
+        assert!(
+            mid > 0 && mid < palette_alpha(RadarProduct::Velocity, 10.0),
+            "the fade between drift and core is a fade, not a step: {mid}",
+        );
+
+        // Spectrum width: laminar flow is invisible, turbulence is solid.
+        assert_eq!(alpha(RadarProduct::SpectrumWidth, 1.0), 0, "laminar flow");
+        solid(RadarProduct::SpectrumWidth, 10.0, "turbulence");
+
+        // ZDR: rain's own background is invisible; big-drop columns and hail
+        // cores are solid on their opposite sides of it.
+        assert_eq!(
+            alpha(RadarProduct::DifferentialReflectivity, 0.25),
+            0,
+            "small drops"
+        );
+        solid(RadarProduct::DifferentialReflectivity, 4.0, "a ZDR column");
+        solid(RadarProduct::DifferentialReflectivity, -3.5, "a hail core");
+
+        // ρHV: uniform precipitation is invisible — the profile inverts,
+        // because this moment's background is the TOP of its scale. Debris
+        // reads solid at the palette's own (translucent) strength.
+        assert_eq!(
+            alpha(RadarProduct::CorrelationCoefficient, 1.0),
+            0,
+            "pure rain"
+        );
+        assert_eq!(alpha(RadarProduct::CorrelationCoefficient, 0.99), 0, "rain");
+        let (r, g, b, debris_2d) = get_color_for_value(RadarProduct::CorrelationCoefficient, 0.5);
+        let _ = (r, g, b);
+        assert_eq!(
+            alpha(RadarProduct::CorrelationCoefficient, 0.5),
+            debris_2d,
+            "a debris signature keeps its full plan-view alpha",
+        );
+        assert!(
+            alpha(RadarProduct::CorrelationCoefficient, 0.85)
+                > alpha(RadarProduct::CorrelationCoefficient, 0.95),
+            "alpha must rise as ρHV falls away from rain",
+        );
+
+        // ΦDP: flat translucency — a cumulative, site-offset moment has no
+        // honest background band, so no value is favoured over another.
+        let phi_alphas: Vec<u8> = {
+            let range = value_range_for(MomentSlot::DifferentialPhase);
+            colormap_lut(RadarProduct::DifferentialPhase, range)
+                .chunks_exact(4)
+                .skip(1)
+                .map(|e| e[3])
+                .collect()
+        };
+        let phi_max = *phi_alphas.iter().max().unwrap();
+        assert!(
+            phi_max <= 128,
+            "ΦDP must stay translucent everywhere: max alpha {phi_max}",
+        );
+        assert!(
+            phi_alphas.iter().all(|a| *a > 0),
+            "…but visible everywhere it is measured: no value band is favoured",
+        );
+
+        // Reflectivity: bit-exact identity with the palette — the reference
+        // look every other profile is measured against.
+        {
+            let range = value_range_for(MomentSlot::Reflectivity);
+            let lut = colormap_lut(RadarProduct::Reflectivity, range);
+            for index in 1..=255u8 {
+                let (_, _, _, a) =
+                    get_color_for_value(RadarProduct::Reflectivity, ramp_value(range, index));
+                assert_eq!(
+                    lut[usize::from(index) * 4 + 3],
+                    a,
+                    "reflectivity entry {index}"
+                );
+            }
+        }
+
+        // The drawability number the solid-block gate reads, per product, and
+        // the tables' alpha ceiling for context. Every palette's plan-view
+        // maximum is 180 — the radar layer's own translucency convention — so
+        // 180 is also the ceiling here; ΦDP's 63 is that ceiling times its
+        // flat 0.35, which puts its whole 255-entry ramp under the
+        // see-through bar: translucent everywhere is the other honest way not
+        // to be a wall.
+        let scan = six_moment_scan();
+        let mut measured = Vec::new();
+        for product in SAMPLABLE {
+            let req = VoxelRequest {
+                product,
+                ..request(ODD)
+            };
+            let grid = build_voxels(&scan, &req, SITE.0, SITE.1).unwrap();
+            let max_alpha = grid
+                .lut()
+                .chunks_exact(4)
+                .skip(1)
+                .map(|e| e[3])
+                .max()
+                .unwrap();
+            measured.push((product.code(), grid.see_through_indices(), max_alpha));
+        }
+        assert_eq!(
+            measured,
+            vec![
+                ("ref", 64, 180),
+                ("vel", 41, 180),
+                ("sw", 18, 180),
+                ("zdr", 53, 180),
+                ("phi", 255, 63),
+                ("rho", 35, 180),
+            ],
+            "see-through data entries and max data alpha, per product",
+        );
+    }
+
+    /// The sampler's velocity fold guard rides into the voxel grid unchanged.
+    ///
+    /// A field folding at ±24.5 m/s with a hard seam: without the guard,
+    /// blends across the seam invent every speed between the endpoints —
+    /// including calm air — and the voxel grid stores the inventions. The
+    /// guard (armed per rung by `Blend::folds_at_measured_limit`, applied
+    /// across gates and across tilts) answers with one endpoint or the other,
+    /// so **every** valued cell must read exactly ±24.5. The grid samples
+    /// through `Column::at_height_km` with no fold logic of its own, which is
+    /// what this pins: nobody may give the voxel path its own sampling that
+    /// forgets the guard.
+    #[test]
+    fn the_velocity_fold_guard_rides_into_the_voxel_grid() {
+        let seam_km = 10.0;
+        let field: Field<'_> = &move |_az, slant| Some(if slant < seam_km { 24.5 } else { -24.5 });
+        let scan = Scan::new(
+            vcp(&[0.5, 4.5]),
+            vec![
+                vel_sweep(
+                    2,
+                    HIGH_DEG,
+                    &wrapped_azimuths(360, 211.0),
+                    HIGH_GATES,
+                    field,
+                ),
+                vel_sweep(1, LOW_DEG, &wrapped_azimuths(720, 293.5), LOW_GATES, field),
+            ],
+        );
+        let req = VoxelRequest {
+            product: RadarProduct::Velocity,
+            half_width_km: 20.0,
+            top_km_msl: 4.0,
+            shape: VoxelShape {
+                nx: 64,
+                ny: 64,
+                nz: 16,
+            },
+            ..request(ODD)
+        };
+        let grid = build_voxels(&scan, &req, SITE.0, SITE.1).expect("velocity builds");
+
+        let (mut inbound, mut outbound) = (0usize, 0usize);
+        for z in 0..16 {
+            for y in 0..64 {
+                for x in 0..64 {
+                    let Some(v) = grid.value_at(x, y, z).filter(|v| v.is_finite()) else {
+                        continue;
+                    };
+                    assert!(
+                        v == 24.5 || v == -24.5,
+                        "cell ({x},{y},{z}) reads {v} m/s across a seam whose two \
+                         sides measured only ±24.5 — a blend crossed the fold",
+                    );
+                    if v > 0.0 {
+                        outbound += 1;
+                    } else {
+                        inbound += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            inbound > 100 && outbound > 100,
+            "precondition: both sides of the seam must be in the grid \
+             (inbound {inbound}, outbound {outbound}), or nothing straddled",
+        );
     }
 
     /// Differential phase is circular, so the two ends of its ramp are the
