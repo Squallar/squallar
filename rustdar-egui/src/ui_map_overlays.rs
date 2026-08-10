@@ -154,18 +154,51 @@ impl<'a> OverlayDrawContext<'a> {
     }
 }
 
-/// Draw label-only map tiles on top of the radar overlay.
+/// Draw one slippy-map tile layer through the pane's own projector.
 ///
-/// Uses the same slippy-map tile grid that walkers uses internally so the
-/// labels align pixel-perfectly with the base map. Only tiles that intersect
-/// the current viewport are fetched / drawn.
-pub(super) fn draw_label_tiles_overlay(
+/// Every raster tile layer the map pane has — the basemap and the labels —
+/// goes through here, at the same tile grid, so the two cannot drift apart and
+/// a zoom bias applied to one is applied to both. Only tiles that intersect the
+/// current viewport are fetched or drawn.
+///
+/// # Why this rather than walkers' own tile pass
+///
+/// `walkers::Map` draws a tile layer at `zoom.round()` and offers no way to ask
+/// for another level: the one lever that looks like it — `Tiles::tile_size` —
+/// can only ever *subtract* from the level (`mercator.rs:50` computes
+/// `(size/256).log2() as u8`, which saturates to 0 below 1), and lying about it
+/// would desynchronise the tile grid from `Projector::project`, which is
+/// hard-coded to 256. So the tile grid is drawn here, from the projector, where
+/// the level is a free parameter — which is what `zoom_bias` needs it to be.
+///
+/// This is the pass the label layer has always used, and its "aligns
+/// pixel-perfectly with the base map" was a statement about *this* arithmetic
+/// agreeing with walkers'. The basemap now goes through it too, so the claim is
+/// no longer something to keep true across two implementations.
+///
+/// # `zoom_bias`
+///
+/// How many slippy levels deeper than the pane's own zoom to fetch. `0` is what
+/// every pane draws that is not under a 3D floor; `1` is what a pane under a
+/// magnified floor draws, so the mirror has real detail to sample rather than
+/// an interpolation of the level the pane would have used. Each level is four
+/// times the tiles, which is why `egui_renderer::mirror::MIRROR_SCALE_MAX` caps
+/// the bias at 1 against `tile_source::TILE_CACHE_ENTRIES`.
+///
+/// A biased tile that has not arrived yet costs nothing visible:
+/// `HttpsTiles::at` interpolates from whatever coarser level it already holds,
+/// so the pane degrades to the detail it has rather than flashing empty while
+/// the fetches land.
+pub(super) fn draw_tile_layer(
     ui: &egui::Ui,
     projector: &walkers::Projector,
     zoom: f64,
     tiles: &mut HttpsTiles,
+    zoom_bias: u8,
 ) {
-    let tile_zoom = zoom.round() as u8;
+    let tile_zoom = (zoom.round() as u8)
+        .saturating_add(zoom_bias)
+        .min(tiles.source_max_zoom());
     let n = 2u32.pow(tile_zoom as u32);
     if n == 0 {
         return;

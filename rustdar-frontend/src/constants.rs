@@ -666,20 +666,56 @@ pub const VOLUME_OFFSCREEN_BUDGET_BYTES: usize = DESKTOP_VOLUME_OFFSCREEN_BUDGET
 /// this is a **budget statement**: what the design costs at its ceiling, named
 /// where the next memory audit will look.
 ///
-/// The ceiling is `egui_renderer::MIRROR_MAX_SIDE` squared, four bytes a texel:
+/// # Why this is now a cascade, and a real bound
 ///
-/// | frame            | mirror      | bytes    |
-/// |------------------|-------------|---------:|
-/// | 1920 x 1080      | 1920 x 1080 |  7.9 MiB |
-/// | 2560 x 1440      | 1280 x 720  |  3.5 MiB |
-/// | 3840 x 2160      | 1920 x 1080 |  7.9 MiB |
-/// | 2048 x 2048 (‡)  | 2048 x 2048 | 16.0 MiB |
+/// It was one figure — the guaranteed texture cap squared — because the mirror
+/// was always the frame's own size and the only question was how far a large
+/// frame had to be halved. It is three figures now because the mirror is drawn
+/// at a **rung** keyed to the 3D camera's distance (`egui_renderer::mirror`): a
+/// low, close camera magnifies the floor it samples, and the answer to that is
+/// more texels, which is memory, which differs per target. This constant is
+/// what `MirrorLimits::for_device` holds the rung to, so it is *enforced*
+/// rather than merely stated — unlike [`LOOP_TEXTURE_BUDGET_BYTES`] and
+/// [`VOLUME_TEXTURE_BUDGET_BYTES`], and like [`VOLUME_OFFSCREEN_BUDGET_BYTES`].
 ///
-/// ‡ the worst case this constant names, and it is a shape rather than a
-/// monitor: the halving that fits the frame under `MIRROR_MAX_SIDE` divides
-/// both axes, so the largest mirror is the largest square that still fits.
-/// A real 4K display costs *half* what a 1440p one at native scale does,
-/// because 3840 exceeds the cap and 2560 does not.
+/// # The arithmetic, per target, four bytes a texel
+///
+/// `mirror_plan` scales the frame by the rung and then halves both axes until
+/// the result fits **both** this budget and the device's own
+/// `max_texture_dimension_2d`. So each row below is what a frame of that shape
+/// actually gets, not what it asks for:
+///
+/// | target  | frame       | rung | mirror      | bytes    | budget |
+/// |---------|-------------|-----:|-------------|---------:|-------:|
+/// | desktop | 1920 x 1080 |   2x | 3840 x 2160 | 31.6 MiB | 64 MiB |
+/// | desktop | 2560 x 1440 |   2x | 5120 x 2880 | 56.2 MiB | 64 MiB |
+/// | desktop | 3840 x 2160 |   1x | 3840 x 2160 | 31.6 MiB | 64 MiB |
+/// | mobile  | 2400 x 1080 |   1x | 2400 x 1080 |  9.9 MiB | 16 MiB |
+/// | wasm32  | 2560 x 1440 | 0.5x | 1280 x  720 |  3.5 MiB | 16 MiB |
+/// | wasm32  | 2048 x 2048 |   1x | 2048 x 2048 | 16.0 MiB | 16 MiB |
+///
+/// Three things that table says out loud, because each is a decision:
+///
+/// * **Desktop gains at 4K.** The old single cap halved a 3840-wide frame to
+///   1920 because 3840 exceeded 2048 — so the largest displays got the
+///   *softest* floors. `MirrorLimits::for_device` now raises the side cap to
+///   the adapter's own limit (8192 or more on any desktop), and 31.6 MiB is
+///   inside the budget, so a 4K frame is mirrored at 4K.
+/// * **Desktop supersamples below 4K, and that is what 64 MiB buys.** 56.2 MiB
+///   at 1440p is the tight row; 64 MiB clears it with the ~1.14x margin a real
+///   allocation's alignment wants and not enough to hide another doubling.
+///   Rung 4 would be 225 MiB at 1440p, refused here and separately capped by
+///   `MIRROR_SCALE_MAX` for a reason that is about the tile cache rather than
+///   about memory.
+/// * **Mobile and wasm32 get no rung at all, deliberately.** 16 MiB is exactly
+///   the old ceiling, so neither arm's floor-on memory moves by a byte. On
+///   wasm32 the side cap binds first anyway — `downlevel_webgl2_defaults`
+///   guarantees only 2048, and 2048² is 16 MiB — so the budget and the device
+///   agree there. On mobile the budget is what refuses the rung: a phone frame
+///   at 2x is 39.6 MiB, beside a 5 MiB volume texture and a 5 MiB offscreen.
+///   Both degrade through `MirrorPlan::is_degraded`, and the tile zoom bias is
+///   taken from the rung that was *applied*, so a target that cannot show the
+///   detail does not fetch it either.
 ///
 /// It replaces a per-scope cost rather than adding to a static one: the design
 /// this supersedes composited a 512² RGBA floor for every live `(site, region)`
@@ -695,8 +731,27 @@ pub const VOLUME_OFFSCREEN_BUDGET_BYTES: usize = DESKTOP_VOLUME_OFFSCREEN_BUDGET
 /// Stated **independently of current headroom**, deliberately: the voxel
 /// texture's own format is changing under a separate work item, so a figure
 /// expressed as "what is left over" would be wrong by the time it is read.
-pub const VOLUME_MIRROR_BYTES_MAX: usize =
+///
+/// Named outside the cascade, the shape [`WASM_VOLUME_GRID_CELLS`] documents
+/// and for the reason it gives: this workspace runs `cargo test` on one arm, so
+/// the other two are only reachable from a test if they have names.
+#[cfg(target_arch = "wasm32")]
+pub const VOLUME_MIRROR_BYTES_MAX: usize = WASM_VOLUME_MIRROR_BYTES_MAX;
+/// See the wasm32 arm above.
+#[cfg(all(not(target_arch = "wasm32"), mobile))]
+pub const VOLUME_MIRROR_BYTES_MAX: usize = MOBILE_VOLUME_MIRROR_BYTES_MAX;
+/// See the wasm32 arm above.
+#[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
+pub const VOLUME_MIRROR_BYTES_MAX: usize = DESKTOP_VOLUME_MIRROR_BYTES_MAX;
+
+/// The wasm32 arm of [`VOLUME_MIRROR_BYTES_MAX`]: the guaranteed side cap
+/// squared, four bytes a texel — the figure the whole constant used to be.
+pub const WASM_VOLUME_MIRROR_BYTES_MAX: usize =
     (crate::egui_renderer::MIRROR_MAX_SIDE as usize).pow(2) * 4;
+/// The mobile arm. See [`VOLUME_MIRROR_BYTES_MAX`].
+pub const MOBILE_VOLUME_MIRROR_BYTES_MAX: usize = WASM_VOLUME_MIRROR_BYTES_MAX;
+/// The desktop arm. See [`VOLUME_MIRROR_BYTES_MAX`].
+pub const DESKTOP_VOLUME_MIRROR_BYTES_MAX: usize = 64 * 1024 * 1024;
 
 /// The playback rates the loop timer is willing to divide by.
 ///

@@ -194,6 +194,23 @@ pub struct App {
     state: Option<app_state::AppState>,
     window: Option<WindowRef>,
     gui: Gui,
+    /// The same painter [`Gui`] was handed, kept so the frame path can take its
+    /// floor-magnification demand.
+    ///
+    /// `Gui` holds it as an `Arc<dyn VolumePainter>` and the demand is not on
+    /// that trait — deliberately, because it is a *renderer* concern that the
+    /// headless UI crate has no business knowing about. A second `Arc` to the
+    /// concrete painter is the cheapest way to keep the seam narrow: one
+    /// pointer, no downcast, and nothing added to the trait every test double
+    /// would then have to implement.
+    ///
+    /// `None` until the renderer is built, and replaced wholesale whenever it
+    /// is rebuilt, so it can never point at a painter `Gui` is no longer using.
+    volume_painter: Option<Arc<crate::volume::bridge::BridgeVolumePainter>>,
+    /// The rung the pane mirror is drawn at, and the hysteresis that governs
+    /// when it may move. One per application, because the mirror is one texture
+    /// for the whole application. See `egui_renderer::mirror`.
+    mirror_rungs: crate::egui_renderer::MirrorRungs,
     /// The decoded Level II volume each pane's static render draws from, by site.
     ///
     /// # Retention
@@ -682,6 +699,8 @@ impl App {
             state: None,
             window: None,
             gui,
+            volume_painter: None,
+            mirror_rungs: crate::egui_renderer::MirrorRungs::default(),
             scan_data: std::collections::HashMap::new(),
             base_scans: HashMap::new(),
             input,
@@ -1115,13 +1134,13 @@ impl App {
                 .insert(resources);
         }
 
-        self.gui.set_volume_painter(Some(std::sync::Arc::new(
-            crate::volume::bridge::BridgeVolumePainter::new(
-                self.volume_store.clone(),
-                quality,
-                state.volume_support.clone(),
-            ),
-        )));
+        let painter = std::sync::Arc::new(crate::volume::bridge::BridgeVolumePainter::new(
+            self.volume_store.clone(),
+            quality,
+            state.volume_support.clone(),
+        ));
+        self.volume_painter = Some(painter.clone());
+        self.gui.set_volume_painter(Some(painter));
     }
 
     /// Dispatch the voxel build a 3D pane asked for, unless the volume is

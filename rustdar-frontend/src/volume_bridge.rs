@@ -957,7 +957,41 @@ pub struct BridgeVolumePainter {
     /// halfway through a session degrades the pane rather than being remembered
     /// only until the next restart.
     probed: VolumeSupport,
+    /// The largest floor magnification any pane reported since this was last
+    /// taken — what the adaptive mirror rung is chosen from.
+    ///
+    /// # Why it is recorded here rather than computed where the mirror is sized
+    ///
+    /// The mirror is planned in `app_render::present_frame`, after the egui pass
+    /// has been built, and by then nothing knows a pane's box: the extent comes
+    /// off the `VoxelGrid`, which only the store can resolve, through the same
+    /// pane-scoped lookup `paint` already does. Recomputing it there would mean
+    /// a second lookup per pane per frame, against a store whose answer can have
+    /// changed — so the number is taken at the one moment the grid, the camera
+    /// and the source pane's affine are all in hand together.
+    ///
+    /// Interior mutability because [`VolumePainter::paint`] takes `&self`: the
+    /// painter is the seam's read-only side by design, and widening it to
+    /// `&mut self` to carry one `f32` would put a mutable borrow of the renderer
+    /// through the whole UI pass.
+    ///
+    /// An atomic rather than a `Cell` because `VolumePainter` is `Send + Sync`,
+    /// and rather than a `Mutex` because a poisoned lock in the frame path is a
+    /// panic on every subsequent frame — a heavy failure mode for one `f32` that
+    /// is only ever written from the pane loop. [`NO_FLOOR_DEMAND`] is the
+    /// sentinel for "no pane asked for a floor this frame", which
+    /// `MirrorRungs::observe` treats as "hold the rung" rather than "want rung
+    /// 1"; see there for why that distinction is worth naming at all.
+    floor_demand: std::sync::atomic::AtomicU32,
 }
+
+/// The bit pattern [`BridgeVolumePainter::floor_demand`] holds when no pane
+/// asked for a floor.
+///
+/// A quiet NaN, which no real demand can collide with: `floor_magnification`
+/// answers `None` rather than a NaN, and `record_floor_demand` only ever stores
+/// what it returned.
+const NO_FLOOR_DEMAND: u32 = u32::MAX;
 
 impl BridgeVolumePainter {
     pub fn new(store: Arc<VolumeStore>, quality: VolumeQuality, probed: VolumeSupport) -> Self {
@@ -965,7 +999,38 @@ impl BridgeVolumePainter {
             store,
             quality,
             probed,
+            floor_demand: std::sync::atomic::AtomicU32::new(NO_FLOOR_DEMAND),
         }
+    }
+
+    /// The frame's floor magnification demand, clearing it for the next frame.
+    ///
+    /// Taken rather than read so a frame in which no pane painted — the window
+    /// between a surface loss and the rebuild, say — cannot leave a stale
+    /// demand standing.
+    pub fn take_floor_demand(&self) -> Option<f32> {
+        let bits = self
+            .floor_demand
+            .swap(NO_FLOOR_DEMAND, std::sync::atomic::Ordering::Relaxed);
+        (bits != NO_FLOOR_DEMAND).then(|| f32::from_bits(bits))
+    }
+
+    /// Fold one pane's magnification into the frame's demand, keeping the
+    /// largest.
+    ///
+    /// The largest, because the mirror is **one texture for the whole
+    /// application**: two 3D panes on two different maps both find their ground
+    /// in it, so a rung chosen for the average would leave the closer camera
+    /// exactly as soft as it was.
+    fn record_floor_demand(&self, magnification: f32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let seen = self.floor_demand.load(Relaxed);
+        let folded = if seen == NO_FLOOR_DEMAND {
+            magnification
+        } else {
+            f32::from_bits(seen).max(magnification)
+        };
+        self.floor_demand.store(folded.to_bits(), Relaxed);
     }
 }
 
@@ -1188,6 +1253,22 @@ impl VolumePainter for BridgeVolumePainter {
         });
         uniform.map_floor = floor.is_some();
 
+        // What the adaptive mirror rung is chosen from. Recorded only when a
+        // floor is actually resolved, so a pane with the floor hidden — or one
+        // whose source map has not said where it is — asks for no texels.
+        if let Some(geo) = floor.is_some().then_some(frame.source).flatten() {
+            let (site_lat, _) = grid.site();
+            if let Some(magnification) = rustdar_egui::volume_view::floor_magnification(
+                frame.camera,
+                uniform.box_size_km,
+                frame.size_px[1] as f32 / frame.pixels_per_point.max(f32::MIN_POSITIVE),
+                geo.points_per_degree_lon,
+                site_lat,
+            ) {
+                self.record_floor_demand(magnification);
+            }
+        }
+
         let callback = VolumeCallback {
             pane_idx: frame.pane_idx,
             grid_id: found.id,
@@ -1352,7 +1433,8 @@ pub struct VolumeResources {
     /// `None` on every frame that has nothing to mirror, not merely until the
     /// first frame that does: the frame path calls `release_mirror` whenever
     /// its guest list is empty, so closing the last 3D pane gives the whole
-    /// texture back rather than holding up to 16 MiB for the session. A machine
+    /// texture back rather than holding up to 64 MiB on desktop — 16 MiB on web
+    /// and mobile — for the session. A machine
     /// that never opens a 3D pane never leaves `None` and pays nothing; one that
     /// opens and closes it returns there.
     mirror: Option<crate::volume::raymarch::PaneMirror>,
@@ -1413,7 +1495,8 @@ impl VolumeResources {
 
     /// Give the pane mirror back, for a frame on which nothing wants a floor.
     ///
-    /// The mirror is up to 16 MiB (`constants::VOLUME_MIRROR_BYTES_MAX`) and it
+    /// The mirror is up to 64 MiB on desktop, 16 MiB on web and mobile
+    /// (`constants::VOLUME_MIRROR_BYTES_MAX`), and it
     /// is *not* per-pane, so nothing in [`Self::release_pane`] can decide its
     /// fate: closing the last 3D pane frees that pane's target and, without
     /// this, leaves the frame-sized mirror live for the rest of the session.

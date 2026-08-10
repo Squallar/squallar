@@ -1,3 +1,4 @@
+use super::map_overlays::draw_tile_layer;
 use crate::actions::GuiAction;
 use crate::pane::PaneKind;
 use rustdar_overlays::render::overlay_state::OverlayKind;
@@ -103,6 +104,12 @@ impl super::Gui {
         // gives: inside the take a pane's slot holds a default map pane, so a 3D
         // pane's region read from `self.panes[..]` mid-loop would be `None`.
         let region_arm = self.region_arm;
+        // Per-pane, before the loop's `mem::take`, for the reason `region_arm`
+        // gives: inside the take a pane's slot is a default map pane, and the
+        // bias is decided by which *other* pane is standing on this one.
+        let tile_zoom_biases: Vec<u8> = (0..pane_count)
+            .map(|idx| self.tile_zoom_bias_for_pane(idx))
+            .collect();
         let committed_regions: Vec<(usize, crate::pane::VolumeRegion)> = self
             .panes()
             .iter()
@@ -454,9 +461,19 @@ impl super::Gui {
                     match pane.kind() {
                         PaneKind::Map => {
                             self.record_pane_content(pane_idx, PaneKind::Map, pane_rect);
+                            let tile_zoom_bias =
+                                tile_zoom_biases.get(pane_idx).copied().unwrap_or(0);
                             if let Some(tiles) = tiles_owned.as_mut() {
+                                // The basemap is **not** handed to walkers as a
+                                // layer. `walkers::Map` draws a layer at
+                                // `zoom.round()` and has no lever for another
+                                // level, so the basemap is drawn inside the
+                                // closure through `draw_tile_layer` — the same
+                                // projector-driven pass the label layer has
+                                // always used, where the level is a parameter.
+                                // See that function for why `Tiles::tile_size`
+                                // is not that lever.
                                 Map::new(None, &mut map_memory, center)
-                                    .with_layer(tiles, 1.0)
                                     // `zoom_with_ctrl(false)` is what puts us on walkers'
                                     // raw-scroll zoom path, and walkers 0.55 changed that
                                     // path's frame-time multiplier from
@@ -481,6 +498,13 @@ impl super::Gui {
                                     })
                                     .show(&mut child_ui, |ui, _response, projector, memory| {
                                         let zoom = memory.zoom();
+
+                                        // The basemap, first thing in the
+                                        // closure so everything below still
+                                        // draws over it — the place in the
+                                        // layer order walkers' own tile pass
+                                        // occupied.
+                                        draw_tile_layer(ui, projector, zoom, tiles, tile_zoom_bias);
 
                                         // Inside `Map::show`, because this is
                                         // the only place a projector exists —
@@ -539,6 +563,7 @@ impl super::Gui {
                                             user_heading,
                                             user_fix: user_fix.clone(),
                                             label_tiles: &mut label_tiles,
+                                            tile_zoom_bias,
                                             actions: &mut actions,
                                             pane_rect,
                                             horizontal_color_scale,
@@ -1622,6 +1647,7 @@ fn volume_pane_outcome(
         target: target.clone(),
         camera,
         size_px,
+        pixels_per_point,
         floor,
         source: source_geo,
         // The user's Volume Alpha curve for this product, or `None` for an

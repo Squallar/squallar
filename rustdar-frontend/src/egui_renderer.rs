@@ -50,38 +50,17 @@ pub struct AttachmentConfig {
     pub msaa_samples: u32,
 }
 
-/// The longest side the pane mirror is allowed, in texels.
+/// How large the mirror is drawn, and how often that is allowed to change.
 ///
-/// The mirror has to be **frame-sized**: `egui_wgpu::Renderer::render` hardcodes
-/// `set_viewport(0, 0, size_in_pixels)` and WebGPU validates that the viewport
-/// lies within the attachment, so there is no way to scale the frame's geometry
-/// onto a smaller target without touching vertices. The one lever that does work
-/// is to halve `size_in_pixels` and `pixels_per_point` **together** —
-/// `screen_size_in_points` is their quotient, which is what egui's own vertex
-/// shader divides by, so the geometry is unaffected and only the sampling rate
-/// changes.
-///
-/// 2048 because that is the smallest `max_texture_dimension_2d` WebGPU
-/// guarantees, so a mirror at this cap allocates on every device the rest of the
-/// application already runs on. It bounds the mirror at 2048² × 4 B = 16 MiB in
-/// the worst case; see `constants::VOLUME_MIRROR_BYTES_MAX`.
-pub const MIRROR_MAX_SIDE: u32 = 2048;
+/// Its own module because the decision grew from "halve until it fits" into a
+/// rung keyed to the 3D camera, with a hysteresis and a dwell — none of which
+/// has anything to do with the pass below that draws it.
+mod mirror;
 
-/// The mirror's size and the scale to draw it at, for a frame of
-/// `size_in_pixels` at `pixels_per_point`.
-///
-/// Halves both together until the longer side fits [`MIRROR_MAX_SIDE`], which
-/// is the only reduction that leaves the geometry alone — see that constant.
-/// A 4K frame therefore mirrors at 1920×1080 and a 1080p frame at its own size.
-pub fn mirror_size_for(size_in_pixels: [u32; 2], pixels_per_point: f32) -> ([u32; 2], f32) {
-    let mut size = [size_in_pixels[0].max(1), size_in_pixels[1].max(1)];
-    let mut scale = pixels_per_point;
-    while size[0].max(size[1]) > MIRROR_MAX_SIDE {
-        size = [(size[0] / 2).max(1), (size[1] / 2).max(1)];
-        scale *= 0.5;
-    }
-    (size, scale)
-}
+pub use mirror::{
+    MIRROR_MAX_SIDE, MIRROR_RUNG_DWELL_FRAMES, MIRROR_RUNG_HYSTERESIS, MIRROR_SCALE_MAX,
+    MirrorLimits, MirrorPlan, MirrorRungs, mirror_plan, mirror_size_for, wanted_scale_for,
+};
 
 /// What the mirror pass is asked to copy, and where to put it.
 ///

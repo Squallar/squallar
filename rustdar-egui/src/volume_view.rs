@@ -215,6 +215,15 @@ pub struct VolumeFrameState {
     pub camera: OrbitCamera,
     /// The pane's size in physical pixels, before any quality rung is applied.
     pub size_px: [u32; 2],
+    /// The scale [`Self::size_px`] was measured at, so the pane's size in
+    /// *points* is recoverable.
+    ///
+    /// Carried because the two densities [`floor_magnification`] compares live
+    /// in different units — the pane's is pixels, the source map's affine is
+    /// points — and the adaptive mirror rung is exactly their ratio. Without
+    /// this the painter would have to guess a scale factor, and the guess would
+    /// be wrong on every display the developer does not own.
+    pub pixels_per_point: f32,
     /// Whether this pane wants the map floor drawn under the volume.
     ///
     /// The positive form of `VolumePane::hide_floor`, resolved at the one
@@ -399,6 +408,86 @@ fn half_diagonal(box_size_km: [f32; 3]) -> f32 {
         + box_size_km[1] * box_size_km[1]
         + box_size_km[2] * box_size_km[2])
         .sqrt()
+}
+
+/// Kilometres per degree of longitude at the equator, WGS84.
+///
+/// Only ever divided by, and only ever with `cos(latitude)` beside it, so it is
+/// a scale rather than a distance: [`floor_magnification`] wants the pane's
+/// points-per-kilometre and the pane's affine is expressed per *degree*.
+const KM_PER_DEGREE_LON_AT_EQUATOR: f64 = 111.319_49;
+
+/// How much the 3D view magnifies the ground it samples out of the pane mirror,
+/// at the pivot's own depth. Dimensionless; 1.0 means one mirror texel per
+/// screen pixel and nothing is being stretched.
+///
+/// This is the number the adaptive mirror rung is chosen from, and it is a
+/// *ratio of two point densities* rather than of two pixel densities — which is
+/// what makes it independent of the window's `pixels_per_point`. The mirror is
+/// drawn at the frame's own scale times a rung, and the frame is presented at
+/// that same scale, so the device's DPI appears identically on both sides and
+/// cancels. What is left is exactly "how many rungs are missing".
+///
+/// # The two densities
+///
+/// The 3D side is the perspective one: the vertical field of view spans
+/// `2 · d · tan(fov/2)` kilometres across the pane's height at distance `d`, and
+/// `d` is the camera's eye distance in half-diagonals of the **exaggerated**
+/// box — the same unit every other function here measures the camera in, which
+/// is what makes this number track the framing rather than the knob. Turning
+/// the exaggeration up lengthens the diagonal and backs the eye off to keep the
+/// box filling the same fraction of the pane, and the ground it sees genuinely
+/// widens by that much: the magnification falls, correctly, and on a wide box
+/// (460 km across, 18 km tall) it falls by well under a percent because the
+/// vertical axis contributes almost nothing to the diagonal.
+///
+/// The 2D side is the source pane's own affine, [`MapPaneGeo`], reduced from
+/// points per degree of longitude to points per kilometre at the site's
+/// latitude. Web Mercator is conformal, so that one scale is correct along both
+/// axes at that latitude, and the site is where the box is anchored.
+///
+/// # Why the pivot's depth and not the nearest ground
+///
+/// The floor is a plane seen in perspective, so its magnification varies from
+/// the bottom of the pane to the horizon without bound — there is no single
+/// right answer, and sizing for the worst pixel would ask for a mirror no target
+/// can allocate on any frame with a low camera. The pivot is what the user
+/// aimed at and what every other framing decision here is measured against, so
+/// it is the depth whose sharpness the rung is spent on.
+///
+/// Returns `None` for a pane with no height and for a source pane whose affine
+/// is degenerate, both of which are "there is nothing to size a mirror for"
+/// rather than "size it as large as possible".
+pub fn floor_magnification(
+    camera: OrbitCamera,
+    box_size_km: [f32; 3],
+    pane_height_points: f32,
+    points_per_degree_lon: f64,
+    site_lat_deg: f64,
+) -> Option<f32> {
+    if pane_height_points <= 0.0
+        || !pane_height_points.is_finite()
+        || !points_per_degree_lon.is_finite()
+    {
+        return None;
+    }
+    let stretched = exaggerated_box_km(camera, box_size_km);
+    let distance_km = camera.eye_distance() * half_diagonal(stretched);
+    if distance_km <= 0.0 || !distance_km.is_finite() {
+        return None;
+    }
+    let km_per_point_3d =
+        2.0 * distance_km * (0.5 * FOV_Y_DEG.to_radians()).tan() / pane_height_points;
+    if km_per_point_3d <= 0.0 || !km_per_point_3d.is_finite() {
+        return None;
+    }
+    let km_per_degree_lon = KM_PER_DEGREE_LON_AT_EQUATOR * site_lat_deg.to_radians().cos();
+    let points_per_km_2d = points_per_degree_lon.abs() / km_per_degree_lon;
+    if points_per_km_2d <= 0.0 || !points_per_km_2d.is_finite() {
+        return None;
+    }
+    let magnification = 1.0 / (km_per_point_3d * points_per_km_2d as f32);
+    magnification.is_finite().then_some(magnification)
 }
 
 /// Where the camera is aimed, in world kilometres relative to the box's centre.

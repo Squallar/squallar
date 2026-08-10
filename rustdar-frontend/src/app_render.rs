@@ -1356,13 +1356,22 @@ impl super::App {
         // format is recorded.
         //
         // An empty guest list does not merely skip the pass — it gives the
-        // texture back. The mirror is frame-sized and singular (up to 16 MiB;
+        // texture back. The mirror is frame-sized and singular (up to 64 MiB on
+        // desktop, 16 MiB on web and mobile;
         // `constants::VOLUME_MIRROR_BYTES_MAX`), and `release_pane` cannot free
         // it because no single pane owns it. This is the one place that knows
         // whether *anybody* still wants a floor, so it is the place that
         // answers: closing the last 3D pane must not hold the frame's worth of
         // colour for the rest of the session.
         let mirror_rects = self.gui.mirror_source_rects();
+        // How much the 3D panes on this frame are stretching the ground they
+        // sample, folded into the rung the mirror is drawn at. Taken even when
+        // nothing wants a mirror, so the demand cannot survive into a frame it
+        // was not measured on.
+        let demand = self
+            .volume_painter
+            .as_ref()
+            .and_then(|painter| painter.take_floor_demand());
         let mirror_target = if mirror_rects.is_empty() {
             if let Some(resources) = state
                 .egui_renderer
@@ -1374,22 +1383,41 @@ impl super::App {
             None
         } else {
             let points = state.egui_renderer.context().pixels_per_point();
-            let (size, scale) = crate::egui_renderer::mirror_size_for(size_in_pixels, points);
+            let plan = self.mirror_rungs.observe(
+                demand,
+                size_in_pixels,
+                points,
+                crate::egui_renderer::MirrorLimits::for_device(
+                    state.device.limits().max_texture_dimension_2d,
+                ),
+            );
             let format = state.egui_renderer.attachment_config().color_format;
             let device = state.device.clone();
             state
                 .egui_renderer
                 .callback_resources_mut()
                 .get_mut::<crate::volume::bridge::VolumeResources>()
-                .map(|resources| (resources.ensure_mirror(&device, size, format), size, scale))
+                .map(|resources| {
+                    (
+                        resources.ensure_mirror(&device, plan.size_in_pixels, format),
+                        plan,
+                    )
+                })
         };
+        // Next frame's tiles, from the rung this frame's mirror was actually
+        // sized to — the ordering `MirrorRungs::tile_zoom_bias` documents. A
+        // rung with no matching tile bias buys interpolation rather than
+        // detail, and a bias with no rung buys four times the fetches for
+        // nothing, so the two are set from the same plan or not at all.
+        self.gui
+            .set_floor_tile_zoom_bias(self.mirror_rungs.tile_zoom_bias());
         let mirror =
             mirror_target
                 .as_ref()
-                .map(|(view, size, scale)| crate::egui_renderer::MirrorRequest {
+                .map(|(view, plan)| crate::egui_renderer::MirrorRequest {
                     view,
-                    size_in_pixels: *size,
-                    pixels_per_point: *scale,
+                    size_in_pixels: plan.size_in_pixels,
+                    pixels_per_point: plan.pixels_per_point,
                     source_rects: &mirror_rects,
                 });
 

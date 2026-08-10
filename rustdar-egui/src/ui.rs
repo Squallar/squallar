@@ -508,6 +508,15 @@ pub struct Gui {
     /// nor a map pane converted to 3D or cross-section can leave a floor
     /// reprojecting through geography nothing on screen still has.
     map_pane_geo: HashMap<usize, crate::volume_view::MapPaneGeo>,
+    /// How many slippy zoom levels deeper a **floor-source** map pane should
+    /// fetch its raster tiles, from the renderer's last mirror plan.
+    ///
+    /// Set by the frontend, which is the only side that knows how much the 3D
+    /// camera is magnifying the ground and how many texels the mirror could
+    /// afford — see `egui_renderer::mirror`. Zero for every pane nothing is
+    /// standing on, so a layout with no 3D view fetches exactly the tiles it
+    /// always did.
+    floor_tile_zoom_bias: u8,
     /// The map panel rect the last frame laid its pane grid out in. Only read
     /// by tests, which need the same rects `render_panes` used.
     #[cfg(test)]
@@ -1497,6 +1506,7 @@ impl Gui {
             pane_layout: PaneLayout::default(),
             color_scale_orientation: ColorScaleOrientation::default(),
             map_pane_geo: HashMap::new(),
+            floor_tile_zoom_bias: 0,
             #[cfg(test)]
             last_map_panel_rect: egui::Rect::ZERO,
             #[cfg(test)]
@@ -3042,6 +3052,70 @@ impl Gui {
             }
         }
         rects
+    }
+
+    /// Tell the UI how much extra tile detail the 3D floor can actually show.
+    ///
+    /// The renderer's side of the same decision that sizes the pane mirror: a
+    /// rung with no matching tile bias buys interpolation rather than detail,
+    /// and a bias with no rung buys four times the fetches for nothing. Both
+    /// come off one `MirrorPlan`, so they cannot disagree.
+    pub fn set_floor_tile_zoom_bias(&mut self, bias: u8) {
+        self.floor_tile_zoom_bias = bias;
+    }
+
+    /// The tile zoom bias for one map pane: the frame's bias if some 3D pane is
+    /// standing on it, zero otherwise.
+    ///
+    /// Per-pane rather than global on purpose. The extra detail is only ever
+    /// looked at through a floor, so a second map pane with no 3D view over it
+    /// would pay four times the fetches — against the one
+    /// `tile_source::TILE_CACHE_ENTRIES` LRU both panes share — for a picture
+    /// the user is already seeing at its native scale.
+    pub(crate) fn tile_zoom_bias_for_pane(&self, pane_idx: usize) -> u8 {
+        if self.floor_tile_zoom_bias == 0 || !self.is_floor_source(pane_idx) {
+            return 0;
+        }
+        if self.floor_tile_working_set(self.floor_tile_zoom_bias)
+            > crate::tile_source::TILE_CACHE_ENTRIES.get()
+        {
+            return 0;
+        }
+        self.floor_tile_zoom_bias
+    }
+
+    /// Whether some 3D pane is standing on this map pane's render.
+    fn is_floor_source(&self, pane_idx: usize) -> bool {
+        self.panes().iter().any(|pane| {
+            pane.volume()
+                .is_some_and(|volume| !volume.hide_floor && volume.source_pane == Some(pane_idx))
+        })
+    }
+
+    /// How many tiles every floor-source pane together would keep resident at
+    /// `bias`, across the raster layers each of them draws.
+    ///
+    /// Summed over panes rather than checked per pane because
+    /// `tile_source::TILE_CACHE_ENTRIES` is **one** LRU for the whole
+    /// application: two source panes that each fit it individually still evict
+    /// each other. This is what stops a bias being taken on a frame where it
+    /// would thrash — a large window, or a split with two 3D views on two
+    /// different maps.
+    fn floor_tile_working_set(&self, bias: u8) -> usize {
+        self.panes()
+            .iter()
+            .enumerate()
+            .filter(|(idx, pane)| pane.is_map() && self.is_floor_source(*idx))
+            .map(|(idx, pane)| {
+                // The basemap always, the label tiles only when the layer is on.
+                let layers = 1 + usize::from(pane.is_overlay_enabled(OverlayKind::CityLabels));
+                let rect = self
+                    .map_pane_geo
+                    .get(&idx)
+                    .map_or(egui::Rect::ZERO, |geo| geo.rect);
+                crate::tiles::tiles_resident_for(rect, bias, layers)
+            })
+            .sum()
     }
 
     /// How many panes are *remembered*, including the ones the current split is

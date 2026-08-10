@@ -335,6 +335,7 @@ fn the_stub_payload_is_the_kind_egui_wgpu_discards_in_silence() {
         },
         camera: OrbitCamera::default(),
         size_px: [800, 600],
+        pixels_per_point: 1.0,
         floor: true,
         source: None,
         alpha: None,
@@ -756,5 +757,94 @@ fn a_map_pane_affine_is_web_mercator_and_not_a_linearisation() {
         "Mercator's rows are not evenly spaced in latitude, so a degree north \
          ({up} points) and a degree south ({down} points) of 41.7 must differ. \
          Equal means the affine has been rewritten in latitude.",
+    );
+}
+
+/// The 460 km box the user reported the soft floor on, at a camera close enough
+/// to see it, asks for more texels than the mirror is drawn with.
+///
+/// This is the whole premise of adaptive mirror resolution stated as a number.
+/// The source pane is showing the box across its width — about two points to
+/// the kilometre — while the 3D pane at this distance puts nearly four points on
+/// the same kilometre. Every mirror texel is therefore stretched across about
+/// two screen pixels, which is what "the basemap, roads and place labels all go
+/// soft" is.
+///
+/// The figures are the user's framing: KFDX at 33.98 N, a 460 km box, 18 km
+/// tall at 3x vertical exaggeration, in a 900-point-tall pane.
+#[test]
+fn the_reported_framing_asks_for_more_than_one_mirror_texel_a_pixel() {
+    let camera = OrbitCamera::restore(225.0, 20.0, 1.0, [0.0; 3], 3.0)
+        .expect("the reported camera is a legal one");
+    // A source pane showing the 460 km box across about 900 points, expressed
+    // the way `MapPaneGeo` carries it: points per degree of longitude at 33.98.
+    let points_per_km = 900.0 / 460.0;
+    let points_per_degree_lon = points_per_km * 111.319_49 * 33.98_f64.to_radians().cos();
+
+    let magnification = floor_magnification(
+        camera,
+        [460.0, 460.0, 18.0],
+        900.0,
+        points_per_degree_lon,
+        33.98,
+    )
+    .expect("a real framing must produce a demand");
+    assert!(
+        magnification > 1.0,
+        "the reported framing magnifies the floor by {magnification}x, so a \
+         mirror at the frame's own density has nothing left to give",
+    );
+    assert!(
+        magnification < 4.0,
+        "{magnification}x is outside the regime the rungs were sized for; \
+         re-derive `MIRROR_SCALE_MAX` before widening this",
+    );
+}
+
+/// Backing the camera off reduces the demand, and the relationship is the
+/// reciprocal one perspective implies.
+///
+/// Not a tautology worth skipping: the sign is the whole of whether the rung
+/// helps or hurts, and a sign error here would spend the largest mirror on the
+/// most zoomed-*out* view — where the floor is already minified and nothing
+/// could be gained.
+#[test]
+fn the_demand_falls_as_the_reciprocal_of_the_eye_distance() {
+    let box_km = [460.0, 460.0, 18.0];
+    let near = OrbitCamera::restore(225.0, 20.0, 1.0, [0.0; 3], 3.0).unwrap();
+    let far = OrbitCamera::restore(225.0, 20.0, 2.0, [0.0; 3], 3.0).unwrap();
+
+    let near = floor_magnification(near, box_km, 900.0, 4000.0, 35.0).unwrap();
+    let far = floor_magnification(far, box_km, 900.0, 4000.0, 35.0).unwrap();
+    assert!(near > far, "a closer eye must ask for more texels");
+    assert!(
+        (near / far - 2.0).abs() < 1e-3,
+        "halving the eye distance must double the demand, got {near} and {far}",
+    );
+}
+
+/// A degenerate pane or a degenerate affine asks for nothing rather than for
+/// everything.
+///
+/// The direction matters: an unanswerable question that returned a large number
+/// would allocate the largest mirror the target allows, on a frame that has
+/// nothing to draw into it.
+#[test]
+fn a_degenerate_framing_asks_for_no_texels_at_all() {
+    let camera = OrbitCamera::default();
+    let box_km = [460.0, 460.0, 18.0];
+    assert_eq!(floor_magnification(camera, box_km, 0.0, 4000.0, 35.0), None);
+    assert_eq!(
+        floor_magnification(camera, box_km, f32::NAN, 4000.0, 35.0),
+        None
+    );
+    assert_eq!(floor_magnification(camera, box_km, 900.0, 0.0, 35.0), None);
+    assert_eq!(
+        floor_magnification(camera, box_km, 900.0, f64::NAN, 35.0),
+        None
+    );
+    assert_eq!(
+        floor_magnification(camera, [0.0, 0.0, 0.0], 900.0, 4000.0, 35.0),
+        None
     );
 }

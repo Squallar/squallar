@@ -16,7 +16,7 @@ use rustdar_radar::sites::RADARS;
 use rustdar_radar::types::{ImageBounds, MAX_RANGE_KM, RadarProduct};
 use rustdar_radar::{get_color_for_value, get_legend_scale};
 
-use super::super::map_overlays::{OverlayDrawContext, draw_label_tiles_overlay, is_pos_blocked};
+use super::super::map_overlays::{OverlayDrawContext, draw_tile_layer, is_pos_blocked};
 
 /// Shared references needed for rendering a single pane's map content.
 pub(super) struct PaneRenderCtx<'a> {
@@ -27,6 +27,14 @@ pub(super) struct PaneRenderCtx<'a> {
     pub user_heading: Option<f32>,
     pub user_fix: Option<rustdar_gps::GpsFix>,
     pub label_tiles: &'a mut Option<HttpsTiles>,
+    /// How many slippy zoom levels deeper than this pane's own zoom its raster
+    /// tile layers should fetch — see
+    /// [`draw_tile_layer`](super::super::map_overlays::draw_tile_layer).
+    ///
+    /// Non-zero only for a pane some 3D pane is standing on, and only while the
+    /// mirror was actually sized to show the extra detail. Resolved once per
+    /// pane by `Gui::tile_zoom_bias_for_pane`.
+    pub tile_zoom_bias: u8,
     pub actions: &'a mut Vec<GuiAction>,
     pub pane_rect: egui::Rect,
     /// Whether this frame's color scale bars run along the bottom edge
@@ -263,10 +271,12 @@ pub(super) fn render_pane_map_content(
                     // same texture metadata either way.
                     pending_notice = ctx.pane.stale_image_on_screen();
                 }
-                // City label tiles — walkers tile layer
+                // City label tiles — the same projector-driven tile pass the
+                // basemap goes through, at the same bias, so the names sit on
+                // the roads they name at every level.
                 OverlayKind::CityLabels => {
                     if let Some(ltiles) = ctx.label_tiles.as_mut() {
-                        draw_label_tiles_overlay(ui, projector, zoom, ltiles);
+                        draw_tile_layer(ui, projector, zoom, ltiles, ctx.tile_zoom_bias);
                     }
                 }
                 // Radar sites: texture + per-frame interactions (text labels, clicks)

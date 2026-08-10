@@ -664,6 +664,11 @@ fn every_cfg_arm_selects_the_constant_named_for_its_device_class() {
         // The 3D loop's two cascades, landed with it.
         "MAX_LOOP_VOLUME_FRAMES",
         "APP_TEXTURE_BUDGET_BYTES",
+        // Lifted into three arms when the pane mirror gained an adaptive rung:
+        // the ceiling stopped being "the guaranteed texture cap squared" (one
+        // figure, true everywhere) and became a per-target decision about how
+        // much supersampling a 3D floor is worth.
+        "VOLUME_MIRROR_BYTES_MAX",
     ];
 
     // Cascades that still spell their arms as literals, and so cannot be
@@ -1028,35 +1033,100 @@ fn the_grid_dimensions_match_the_shapes_rustdar_radar_names() {
 /// The pane mirror's ceiling is the cap squared, four bytes a texel — and the
 /// cap is the one the renderer actually applies.
 ///
-/// Two numbers in two crates that have to agree: `MIRROR_MAX_SIDE` is what
-/// `mirror_size_for` halves the frame down to, and `VOLUME_MIRROR_BYTES_MAX` is
-/// what the budget prose claims that costs. Spelling the product here means the
-/// documented figure cannot drift from the enforced cap — which is the failure
-/// mode a budget written as a literal always has.
+/// Three numbers that have to agree across two crates: `MIRROR_MAX_SIDE` is the
+/// side cap the fit falls back to, `VOLUME_MIRROR_BYTES_MAX`'s arms are what the
+/// budget prose claims a mirror costs, and `mirror_plan` is what enforces both.
+/// Spelling the products here means the documented figures cannot drift from the
+/// enforced ones — the failure mode a budget written as a literal always has.
 ///
-/// The lower bound is the real content of the assertion: 16 MiB is a large
-/// single allocation, so a future cap raise has to come past this line rather
-/// than land as a silently bigger texture.
+/// The lower bounds are the real content: these are single allocations for the
+/// whole application, so a future raise has to come past this line rather than
+/// land as a silently bigger texture.
 #[test]
 fn the_pane_mirrors_ceiling_is_the_cap_it_is_actually_halved_to() {
     let side = crate::egui_renderer::MIRROR_MAX_SIDE as usize;
     assert_eq!(
-        VOLUME_MIRROR_BYTES_MAX,
+        WASM_VOLUME_MIRROR_BYTES_MAX,
         side * side * 4,
-        "the budget figure is not the cap squared at four bytes a texel",
+        "the wasm32 budget is not the guaranteed cap squared at four bytes a texel",
     );
     assert_eq!(
-        VOLUME_MIRROR_BYTES_MAX,
+        WASM_VOLUME_MIRROR_BYTES_MAX,
         16 * 1024 * 1024,
-        "the mirror's worst case moved. It is one allocation for the whole \
-         application, so a change here is a change to the application's \
+        "the wasm32 mirror's worst case moved. WebGL2 guarantees only a 2048 \
+         side, so this arm is pinned by the device as well as by the budget.",
+    );
+    assert_eq!(
+        MOBILE_VOLUME_MIRROR_BYTES_MAX, WASM_VOLUME_MIRROR_BYTES_MAX,
+        "mobile is held to the same 16 MiB the pre-adaptive design cost, so \
+         landing the rung moved no phone's floor-on memory",
+    );
+    assert_eq!(
+        DESKTOP_VOLUME_MIRROR_BYTES_MAX,
+        64 * 1024 * 1024,
+        "the desktop mirror's worst case moved. It is one allocation for the \
+         whole application, so a change here is a change to the application's \
          floor-on memory, not to a per-pane cost.",
     );
 
-    // The halving is the only reduction that leaves egui's geometry alone —
+    // The tight row of the desktop table: 1440p at the top rung. If this stops
+    // fitting, the prose's headroom claim is wrong.
+    let bytes = |w: usize, h: usize| w * h * 4;
+    assert!(
+        bytes(5120, 2880) <= DESKTOP_VOLUME_MIRROR_BYTES_MAX,
+        "1440p at rung 2 no longer fits the desktop budget",
+    );
+    assert!(
+        bytes(3840 * 4, 2160 * 4) > DESKTOP_VOLUME_MIRROR_BYTES_MAX,
+        "the desktop budget is slack enough to hide a rung-4 4K mirror",
+    );
+
+    // The scale is the only reduction that leaves egui's geometry alone —
     // `screen_size_in_points` is `size_in_pixels / pixels_per_point`, so both
     // must move together. A cap applied to one and not the other would scale
-    // the frame's vertices instead of its sampling rate.
+    // the frame's vertices instead of its sampling rate. That argument is about
+    // a quotient, so it is direction-free: the rows below check it upwards too.
+    let desktop = crate::egui_renderer::MirrorLimits {
+        max_side: 8192,
+        max_bytes: DESKTOP_VOLUME_MIRROR_BYTES_MAX,
+    };
+    let plan = crate::egui_renderer::mirror_plan([1920, 1080], 1.5, 2.0, desktop);
+    assert_eq!(
+        (plan.size_in_pixels, plan.pixels_per_point),
+        ([3840, 2160], 3.0),
+        "a desktop 1080p frame asked for rung 2 must get it, both halves moved",
+    );
+    assert!(!plan.is_degraded() && plan.tile_zoom_bias() == 1);
+    let plan = crate::egui_renderer::mirror_plan([3840, 2160], 2.0, 2.0, desktop);
+    assert_eq!(
+        (
+            plan.size_in_pixels,
+            plan.pixels_per_point,
+            plan.applied_scale
+        ),
+        ([3840, 2160], 2.0, 1.0),
+        "a 4K frame cannot afford rung 2 and falls back to its own size — an \
+         improvement on the old cap, which halved it to 1920x1080",
+    );
+    assert!(
+        plan.is_degraded() && plan.tile_zoom_bias() == 0,
+        "a degraded plan must not go on fetching a slippy level it cannot show",
+    );
+
+    // The wasm32 arm, where the device's own guarantee binds before the budget.
+    let web = crate::egui_renderer::MirrorLimits {
+        max_side: crate::egui_renderer::MIRROR_MAX_SIDE,
+        max_bytes: WASM_VOLUME_MIRROR_BYTES_MAX,
+    };
+    let plan = crate::egui_renderer::mirror_plan([2560, 1440], 2.0, 2.0, web);
+    assert_eq!(
+        (plan.size_in_pixels, plan.applied_scale),
+        ([1280, 720], 0.5),
+        "the WebGL2 floor still halves a 1440p frame twice, rung or no rung",
+    );
+    assert!(plan.is_degraded() && plan.tile_zoom_bias() == 0);
+
+    // The pre-adaptive helper, unchanged for every frame with no 3D pane on it.
     let (size, scale) = crate::egui_renderer::mirror_size_for([3840, 2160], 2.0);
     assert_eq!((size, scale), ([1920, 1080], 1.0), "a 4K frame halves once");
     let (size, scale) = crate::egui_renderer::mirror_size_for([1920, 1080], 1.5);
@@ -1068,7 +1138,7 @@ fn the_pane_mirrors_ceiling_is_the_cap_it_is_actually_halved_to() {
     let (size, _) = crate::egui_renderer::mirror_size_for([8192, 8192], 1.0);
     assert!(
         size[0].max(size[1]) <= crate::egui_renderer::MIRROR_MAX_SIDE
-            && size[0] * size[1] * 4 <= VOLUME_MIRROR_BYTES_MAX as u32,
+            && size[0] * size[1] * 4 <= WASM_VOLUME_MIRROR_BYTES_MAX as u32,
         "a frame far over the cap must halve until it fits, got {size:?}",
     );
 }

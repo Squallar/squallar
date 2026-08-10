@@ -208,3 +208,37 @@ impl MapTileState {
         self.current_theme_is_dark = !self.current_theme_is_dark;
     }
 }
+
+/// The side of one slippy tile in **points**, at zoom bias 0.
+///
+/// 256 is the tile grid's own unit and is hard-coded inside `walkers`'
+/// projector (`mercator.rs`'s `TILE_SIZE`), which is why a tile source cannot
+/// change it without desynchronising the raster from `Projector::project`. See
+/// `draw_tile_layer`.
+pub const TILE_SIDE_POINTS: f32 = 256.0;
+
+/// How many tiles a rect keeps resident, at a zoom bias, across `layers` raster
+/// layers.
+///
+/// The `+ 1` on each axis is the tile the rect straddles at each edge: a pane
+/// whose width is an exact multiple of the tile side still overlaps one more
+/// column unless it happens to start on a tile boundary, and it never does.
+///
+/// # What it is for
+///
+/// `tile_source::TILE_CACHE_ENTRIES` is a single LRU shared by every pane and
+/// every layer, and each zoom bias level costs four times the tiles. A bias
+/// applied to a working set larger than the LRU does not merely fail to help —
+/// it evicts the tiles still being drawn, on every frame, so the fetcher never
+/// settles and the pane flickers between levels. So the bias is only taken when
+/// this fits, which makes it a computed decision rather than an argument about a
+/// hypothetical pane size.
+pub fn tiles_resident_for(rect: egui::Rect, zoom_bias: u8, layers: usize) -> usize {
+    let side = TILE_SIDE_POINTS / 2f32.powi(i32::from(zoom_bias));
+    if side <= 0.0 || !rect.width().is_finite() || !rect.height().is_finite() {
+        return 0;
+    }
+    let across = (rect.width().max(0.0) / side).ceil() as usize + 1;
+    let down = (rect.height().max(0.0) / side).ceil() as usize + 1;
+    across.saturating_mul(down).saturating_mul(layers)
+}
