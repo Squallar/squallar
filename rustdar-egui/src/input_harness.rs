@@ -6159,14 +6159,20 @@ mod tests {
     ///     bug this whole contract exists to fix. The assertion is on the full
     ///     rendered string, so three per-kind headers that drifted apart in
     ///     format could not keep it green.
+    ///
+    ///     The fixture site is KDMX, deliberately **not** the default KTLX:
+    ///     for the whole panel pass the active slot in `self.panes` holds a
+    ///     `mem::take` placeholder whose site *is* the default, so on a
+    ///     default-site fixture an identity line that read its site through
+    ///     the placeholder would paint the right string for the wrong reason.
     #[test]
     fn every_pane_kinds_sidebar_opens_with_the_same_identity_line() {
         let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
-        h.load_scan("KTLX");
+        h.load_scan("KDMX");
         let sidebar = sidebar_rect(&h);
 
         assert!(
-            h.text_painted_in(sidebar, "KTLX \u{b7} Map"),
+            h.text_painted_in(sidebar, "KDMX \u{b7} Map"),
             "a map pane's sidebar must open with its identity line; painted: {:?}",
             h.painted_text_strings_in(sidebar)
         );
@@ -6174,7 +6180,7 @@ mod tests {
         h.make_pane_volume(0);
         h.frames_for(2, FRAME_DT);
         assert!(
-            h.text_painted_in(sidebar, "KTLX \u{b7} 3D volume"),
+            h.text_painted_in(sidebar, "KDMX \u{b7} 3D volume"),
             "a 3D pane's sidebar must open with the same identity line, with \
              its kind in it; painted: {:?}",
             h.painted_text_strings_in(sidebar)
@@ -6183,7 +6189,7 @@ mod tests {
         h.make_pane_unaimed_cross_section(0);
         h.frames_for(2, FRAME_DT);
         assert!(
-            h.text_painted_in(sidebar, "KTLX \u{b7} Cross-section"),
+            h.text_painted_in(sidebar, "KDMX \u{b7} Cross-section"),
             "a section pane's sidebar must open with the same identity line, \
              with its kind in it; painted: {:?}",
             h.painted_text_strings_in(sidebar)
@@ -6242,6 +6248,14 @@ mod tests {
     ///     renders, so renaming a header moves the test with it, while
     ///     *removing* one — or demoting the section block back to nothing —
     ///     fails on a missing anchor.
+    ///
+    ///     KDMX rather than the default KTLX for the reason test 49 gives:
+    ///     the `mem::take` placeholder in the active slot carries the default
+    ///     site, and only a non-default fixture makes the identity line's
+    ///     site half observable. The section anchor pins the painted length
+    ///     too: [`section_ends`]'s line is 105.46 km by the same haversine
+    ///     the readout quotes, `{:.0}` in the default kilometres, so a
+    ///     readout scaled or converted wrongly misses the anchor.
     #[test]
     fn kind_specific_blocks_sit_inside_the_shared_sidebar_structure() {
         /// The y-centre of the topmost painted run containing `needle`, inside
@@ -6275,7 +6289,7 @@ mod tests {
         }
 
         let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
-        h.load_scan("KTLX");
+        h.load_scan("KDMX");
         let sidebar = sidebar_rect(&h);
 
         h.make_pane_volume(0);
@@ -6284,7 +6298,7 @@ mod tests {
             &h,
             sidebar,
             &[
-                "KTLX \u{b7} 3D volume",
+                "KDMX \u{b7} 3D volume",
                 "Reflectivity",
                 "Step:",
                 crate::ui::VOLUME_SIDEBAR_HEADER,
@@ -6301,11 +6315,11 @@ mod tests {
             &h,
             sidebar,
             &[
-                "KTLX \u{b7} Cross-section",
+                "KDMX \u{b7} Cross-section",
                 "Reflectivity",
                 "Step:",
                 crate::ui::SECTION_SIDEBAR_HEADER,
-                "A \u{2013} B:",
+                "A \u{2013} B: 105 km",
                 crate::ui::NON_MAP_LAYERS_NOTE,
             ],
         );
