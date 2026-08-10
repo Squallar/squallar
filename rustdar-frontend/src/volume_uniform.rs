@@ -193,8 +193,9 @@ pub struct VolumeUniform {
     /// over the placeholder would compositate a transparent ground, which is
     /// a no-op but a lie about what was drawn.
     pub map_floor: bool,
-    /// The mip level the march reconstructs the field at, `0..=1`. Rides
-    /// `flags.y`.
+    /// The mip level the march reconstructs the field at, `0..=1`, or
+    /// [`NEAREST_RECONSTRUCTION`] (negative) for nearest-neighbour
+    /// reconstruction. Rides `flags.y`.
     ///
     /// The grid texture carries one hand-built level below the raw field —
     /// each coarse cell the mean of its eight fine ones — and the sampler
@@ -210,6 +211,14 @@ pub struct VolumeUniform {
     /// `volume::bridge`, beside the soft width, and rides the same quality
     /// rung as the lighting: together they are the cloud look, and the floor
     /// rung stays the jagged-unlit raw march.
+    ///
+    /// Negative selects nearest — the sample point snaps to its cell's
+    /// centre, where the tent's weights collapse onto the stored index — for
+    /// the products whose no-data boundary a filter may not blend across
+    /// (`rustdar_radar::voxel::no_data_blends_at_ramp_bottom`; the bridge
+    /// makes the per-product decision). A sign sentinel rather than a new
+    /// lane, like the isosurface pair: the block has no reserved lanes left,
+    /// and every non-negative value keeps its existing meaning.
     pub reconstruction_lod: f32,
     /// The isosurface threshold in the shader's 0-1 index units, or negative
     /// for the lit-volume march. Rides `eye_in_box.w`, one of the two lanes
@@ -243,6 +252,20 @@ pub struct VolumeUniform {
 /// The lit-volume sentinel for [`VolumeUniform::iso_threshold`] and the
 /// sequential sentinel for [`VolumeUniform::iso_centre`].
 pub const ISO_OFF: f32 = -1.0;
+
+/// The nearest-neighbour sentinel for [`VolumeUniform::reconstruction_lod`]:
+/// any negative value selects it in the shader, and this is the one every
+/// writer uses.
+///
+/// Nearest exists for the products where the trilinear tent is a lie at the
+/// no-data boundary: index 0 is both "no data" and the bottom of the affine
+/// value ramp, so a filtered sample beside empty air is dragged through
+/// palette bands the data never occupied — the KLOT 2026-08-10 NROT arcs
+/// painted anticyclonic green from a field with almost no rotation at all
+/// (the measurement lives at `no_data_blends_at_ramp_bottom` in
+/// `rustdar-radar`). Snapping the sample to its cell's centre makes every
+/// fetch a stored index: blocky, but never manufactured.
+pub const NEAREST_RECONSTRUCTION: f32 = -1.0;
 
 impl VolumeUniform {
     /// A uniform with the defaults above, an identity transform and no camera.
@@ -629,6 +652,37 @@ mod tests {
             include_str!("volume.wgsl").contains("volume.flags.y).r"),
             "the shader no longer samples the grid at the flags.y level, so \
              this lane has stopped selecting the reconstruction",
+        );
+    }
+
+    /// The nearest sentinel is negative — never a valid mip level — and the
+    /// shader selects nearest on the lane's sign.
+    ///
+    /// Negative, like the isosurface pair's sentinels and for the same
+    /// reason: every non-negative value is a real configuration (0 is the
+    /// raw tent, 1 the full mip blend, fractions the taper), so only the
+    /// sign is free to carry the mode. The source scan is the pairing half:
+    /// a sentinel nothing tests for selects nothing.
+    #[test]
+    fn the_nearest_sentinel_is_negative_and_the_shader_tests_the_sign() {
+        let mut uniform = distinct();
+        uniform.reconstruction_lod = NEAREST_RECONSTRUCTION;
+        let packed = lanes(&uniform.to_bytes())[OFFSET_FLAGS / 4 + 1];
+        assert!(
+            packed < 0.0,
+            "the nearest sentinel must arrive negative on the flags.y lane — \
+             every non-negative reconstruction_lod is a real filtering \
+             configuration, so only the sign is free to carry the mode",
+        );
+        assert_eq!(
+            packed, NEAREST_RECONSTRUCTION,
+            "the sentinel must ride flags.y unchanged",
+        );
+        assert!(
+            include_str!("volume.wgsl").contains("volume.flags.y < 0.0"),
+            "the shader no longer branches on flags.y's sign, so the nearest \
+             sentinel selects nothing and the no-blend products are filtered \
+             across their no-data boundaries again",
         );
     }
 

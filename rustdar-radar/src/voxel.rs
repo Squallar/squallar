@@ -1168,6 +1168,69 @@ pub fn default_iso_threshold(product: RadarProduct) -> f32 {
     }
 }
 
+/// Whether the raymarch may reconstruct this product's field with a filter
+/// that blends data cells into no-data cells — that is, whether index 0 (the
+/// no-data value AND the bottom of the affine index ramp) is an honest
+/// stand-in for "no echo".
+///
+/// The GPU samples the index texture with a trilinear tent, and index↔value
+/// is affine, so interpolation **between data cells** is exactly value-space
+/// reconstruction — honest for every product. The dishonesty is confined to
+/// the no-data boundary: a filtered sample there is dragged toward index 0,
+/// which the LUT reads as the ramp's *bottom value*. For reflectivity that is
+/// "below the weakest echo" — physically what no-echo means, and the descent
+/// crosses only the palette's own fade band. For a diverging or inverted ramp
+/// the bottom is an extreme *signed* value, and the descent crosses palette
+/// bands the data never occupied.
+///
+/// Measured, KLOT 2026-08-10 03:14–03:45Z (the tornado-warned line the WP's
+/// live NROT verification flagged as "broader than its own section"): the
+/// derived NROT field held **0–2 voxels** in the cyclonic 1.0–1.5 band per
+/// desktop grid, yet the lit volume painted broad green arcs. The green was
+/// not data: NROT's LUT is opaque green over indices ~64–90 (anticyclonic
+/// 1.0–2.4), its fade band is 0 (the ramp bottom is opaque), and every
+/// boundary between the ~200 000 sub-threshold data cells and empty air
+/// interpolates straight through that band. The section pane samples on the
+/// CPU without index filtering, which is why it showed the sparse truth.
+/// The same mechanism paints inbound-velocity rims on outbound lobes (BV,
+/// SRV), hail-blue skirts on rain columns (ZDR), and debris-coloured shells
+/// around ordinary precipitation (ρHV — a manufactured TDS is the worst lie
+/// on this list).
+///
+/// `false` sends the march to nearest-neighbour reconstruction
+/// (`volume::uniform::NEAREST_RECONSTRUCTION`): blocky, but every sample is a
+/// stored index. Exhaustive with no wildcard, like every table here: a newly
+/// admitted product must have its boundary behaviour argued, not inherited.
+pub fn no_data_blends_at_ramp_bottom(product: RadarProduct) -> bool {
+    match product {
+        // Sequential ramps whose bottom is a transparent "nothing here":
+        // filtering into no-data reads as the field fading below detection.
+        RadarProduct::Reflectivity | RadarProduct::SpectrumWidth => true,
+        // Diverging ramps: index 0 is the strongest inbound / most negative
+        // extreme, not an absence.
+        RadarProduct::Velocity
+        | RadarProduct::StormRelativeVelocity
+        | RadarProduct::NormalizedRotation
+        | RadarProduct::DifferentialReflectivity
+        | RadarProduct::SpecificDifferentialPhase => false,
+        // Inverted (background at the top) and flat-alpha ramps: the bottom
+        // is a real, visible signal — low ρHV is debris, low ΦDP a real
+        // phase — never an absence.
+        RadarProduct::CorrelationCoefficient | RadarProduct::DifferentialPhase => false,
+        // Unreachable today (`crate::derive::volume_slot` refuses them before
+        // a grid exists). `false` so an admission without an argument here
+        // gets the honest-but-blocky reconstruction, never the blending one.
+        RadarProduct::EchoTops
+        | RadarProduct::EchoTopsInterpolated
+        | RadarProduct::VerticallyIntegratedLiquid
+        | RadarProduct::VilDensity
+        | RadarProduct::ProbabilityOfSevereHail
+        | RadarProduct::MaxExpectedHailSize
+        | RadarProduct::HydrometeorClassification
+        | RadarProduct::PrecipitationRate => false,
+    }
+}
+
 /// The default 3D alpha multiplier for `product` at `value` — the per-product
 /// transparency profile the volume table ships with (constants and rationale
 /// in [`volume_alpha_profile`]).
@@ -4750,5 +4813,50 @@ mod tests {
 
         // And the multiply cannot overflow into a pass.
         assert_eq!(Reader::new(&bytes).bounded(u32::MAX, usize::MAX), None);
+    }
+
+    /// The boundary-reconstruction table: only the two sequential moments
+    /// whose ramp bottom is a transparent "nothing here" may be filtered into
+    /// no-data; everything else — diverging, inverted, flat and unadmitted —
+    /// must march nearest.
+    ///
+    /// Pinned as the full census rather than spot checks, for the same reason
+    /// the profile table is: flipping any single product (the mutation that
+    /// matters — `NormalizedRotation => true` is a one-word edit that brings
+    /// the KLOT green arcs back) changes this list.
+    #[test]
+    fn only_the_bottom_transparent_sequential_ramps_may_blend_into_no_data() {
+        use RadarProduct::*;
+        let blending: Vec<RadarProduct> = RadarProduct::all()
+            .iter()
+            .copied()
+            .filter(|p| no_data_blends_at_ramp_bottom(*p))
+            .collect();
+        assert_eq!(
+            blending,
+            vec![Reflectivity, SpectrumWidth],
+            "the blending set changed: an addition needs the boundary-honesty \
+             argument `no_data_blends_at_ramp_bottom` documents (index 0 is \
+             both no-data and the ramp's bottom value — blending is only \
+             honest where those coincide physically)",
+        );
+        // The load-bearing negatives, by name: the products whose ramp bottom
+        // is an extreme signed value or a real signal, where a filtered
+        // no-data boundary paints palette bands the data never occupied.
+        for product in [
+            Velocity,
+            StormRelativeVelocity,
+            NormalizedRotation,
+            DifferentialReflectivity,
+            SpecificDifferentialPhase,
+            CorrelationCoefficient,
+            DifferentialPhase,
+        ] {
+            assert!(
+                !no_data_blends_at_ramp_bottom(product),
+                "{product:?} must march nearest: its ramp bottom is a real \
+                 value, so a blended no-data boundary manufactures data",
+            );
+        }
     }
 }

@@ -278,7 +278,24 @@ fn grid_at(p: vec3<f32>) -> f32 {
 // the palette and the threshold's anchor are untouched, and flags.y = 0 — the
 // uniform's default — is the bit-exact raw field every mask instrument was
 // written against (at LOD exactly 0 the level-1 weight is exactly zero).
+//
+// A NEGATIVE flags.y is the nearest-reconstruction sentinel
+// (`uniform::NEAREST_RECONSTRUCTION`). Filtering is only honest where
+// index 0 — no-data AND the bottom of the affine value ramp — physically
+// means "below the weakest thing the ramp shows": for every other product a
+// filtered sample beside empty air is dragged through palette bands the data
+// never occupied (NROT's opaque anticyclonic green under its cyclonic data
+// was the live failure). The snap collapses the tent's weights onto the
+// sample's own cell centre, so every fetch returns a stored index — the same
+// one fetch per tap, through the same Linear sampler (a second sampler per
+// texture is barred on the GLES 3.0 path). The bridge decides per product:
+// `no_data_blends_at_ramp_bottom` in `rustdar_radar::voxel` holds the table
+// and the measurement.
 fn density_at(p: vec3<f32>) -> f32 {
+    if volume.flags.y < 0.0 {
+        let snapped = (floor(p * volume.grid_dims.xyz) + 0.5) / volume.grid_dims.xyz;
+        return textureSampleLevel(grid_texture, grid_sampler, snapped, 0.0).r;
+    }
     return textureSampleLevel(grid_texture, grid_sampler, p, volume.flags.y).r;
 }
 

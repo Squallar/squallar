@@ -79,7 +79,7 @@ use crate::egui_renderer::AttachmentConfig;
 use crate::volume::VolumeSupport;
 use crate::volume::quality::VolumeQuality;
 use crate::volume::raymarch::{OffscreenTarget, VolumePipelines, VolumeTextures};
-use crate::volume::uniform::VolumeUniform;
+use crate::volume::uniform::{NEAREST_RECONSTRUCTION, VolumeUniform};
 
 /// The fewest see-through entries a grid's table may have, anywhere on its
 /// ramp, before this renderer refuses to draw a volume through it.
@@ -929,6 +929,16 @@ impl VolumePainter for BridgeVolumePainter {
         if fitted.quality.shading.is_on() {
             uniform.reconstruction_lod = cloud_reconstruction_lod_for(largest_cell_km(&uniform));
             uniform.step_cells = CLOUD_STEP_CELLS;
+        }
+        // After the rung, unconditionally: for the products whose ramp bottom
+        // is a real value rather than an absence, every filtering
+        // reconstruction — the raw trilinear tent as much as the cloud
+        // rung's mip blend — drags boundary samples through palette bands
+        // the data never occupied (the KLOT NROT arcs; measurement at
+        // `no_data_blends_at_ramp_bottom`). Those march nearest on every
+        // rung.
+        if !rustdar_radar::voxel::no_data_blends_at_ramp_bottom(grid.product()) {
+            uniform.reconstruction_lod = NEAREST_RECONSTRUCTION;
         }
         // The march's transfer edge, anchored at the **effective** fade
         // boundary: the palette's own unless a Volume Alpha curve is applied,
@@ -1995,6 +2005,34 @@ mod tests {
             "`paint` no longer halves the march step on the cloud rung, so the \
              jitter's per-step opacity residual returns as a visible stipple",
         );
+        // The boundary-honesty override, same untestable-through-`paint`
+        // class, and it must sit AFTER the rung block: nearest is not a
+        // quality decision but an honesty one, so a product on the no-blend
+        // list marches nearest on every rung. Deleting it leaves every host
+        // test green and brings back the KLOT NROT green arcs — a lit volume
+        // painting anticyclonic-band colours at every data/no-data boundary
+        // of a field with almost no rotation in it (the measurement lives at
+        // `no_data_blends_at_ramp_bottom`).
+        {
+            let rung = body
+                .find("uniform.step_cells = CLOUD_STEP_CELLS")
+                .expect("asserted present above");
+            assert!(
+                body[rung..].contains(
+                    "if !rustdar_radar::voxel::no_data_blends_at_ramp_bottom(grid.product())"
+                ),
+                "`paint` no longer consults the boundary-honesty table after \
+                 the rung block, so a diverging product's no-data boundary is \
+                 filtered through palette bands its data never occupied",
+            );
+            assert!(
+                body[rung..].contains("uniform.reconstruction_lod = NEAREST_RECONSTRUCTION"),
+                "`paint` no longer selects nearest reconstruction for the \
+                 no-blend products — the trilinear tent at the no-data \
+                 boundary manufactures the very colours the products WP's \
+                 honesty invariant exists to prevent",
+            );
+        }
         // The floor's flag-and-texture pairing: the flag must be exactly
         // "a floor is in hand and the pane asked", or the shader composites
         // a ground nobody bound (a transparent no-op that claims to draw) or

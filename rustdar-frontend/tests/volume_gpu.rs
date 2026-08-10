@@ -45,7 +45,7 @@ use rustdar_frontend::egui_renderer::AttachmentConfig;
 use rustdar_frontend::volume::raymarch::{
     ENTRY_FS_BLIT_GAMMA, ENTRY_FS_BLIT_LINEAR, OffscreenTarget, VolumePipelines,
 };
-use rustdar_frontend::volume::uniform::VolumeUniform;
+use rustdar_frontend::volume::uniform::{NEAREST_RECONSTRUCTION, VolumeUniform};
 
 /// Open a pass that clears to opaque black, which is what `EguiRenderer::draw`
 /// does.
@@ -1106,6 +1106,109 @@ fn the_smoothed_reconstruction_spreads_a_lone_voxel() {
         "the smoothed reconstruction painted {cloud} px against the raw \
          field's {raw} — more than the two-cell kernel can explain, so the \
          coarse level's bytes are misplaced",
+    );
+}
+
+/// Nearest reconstruction never paints a palette band the data does not
+/// occupy — the boundary-honesty contract behind the KLOT NROT green arcs.
+///
+/// The fixture is the defect's shape in miniature: a small block whose only
+/// data index is 147 (blue), over a LUT whose entries 1..=120 are opaque
+/// green — the stand-in for NROT's anticyclonic band, which really does sit
+/// under its cyclonic data on the one index ramp. A filtering reconstruction
+/// interpolates *indices*, so every sample in the one-cell shell between the
+/// block and empty air reads some index in (0, 147) and paints the green the
+/// field never contained; measured on KLOT 2026-08-10, a volume with 0–2
+/// honest green voxels rendered broad green arcs exactly this way. With
+/// [`NEAREST_RECONSTRUCTION`] every fetch is a stored index: the block may
+/// only ever paint its own blue.
+///
+/// The trilinear half is the mechanism's demonstration, kept in the test so
+/// the green-free assertion cannot pass vacuously: at LOD 0 the tent must
+/// paint green boundary pixels, or the fixture has stopped exercising the
+/// boundary at all. (Trilinear stays correct for the products whose ramp
+/// bottom is transparent air — that decision is
+/// `rustdar_radar::voxel::no_data_blends_at_ramp_bottom`, pinned host-side.)
+///
+/// ```text
+/// cargo test -p rustdar-frontend --test volume_gpu \
+///     nearest_reconstruction_never_paints_a_band_the_data_does_not_occupy \
+///     -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
+fn nearest_reconstruction_never_paints_a_band_the_data_does_not_occupy() {
+    let _serialised = gpu_lock();
+    let size = [128u32, 128];
+    let cells = [8u32, 8, 8];
+    const DATA: u8 = 147;
+
+    let (device, queue) = device();
+    let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Bgra8Unorm));
+    pipelines.upload_quad(&queue);
+
+    // A 2x2x2 block in the middle of empty air, every face a no-data boundary.
+    let mut indices = vec![0u8; (cells[0] * cells[1] * cells[2]) as usize];
+    for z in 3..5u32 {
+        for y in 3..5u32 {
+            for x in 3..5u32 {
+                indices[((z * cells[1] + y) * cells[0] + x) as usize] = DATA;
+            }
+        }
+    }
+    // The band under the data: opaque green, like NROT's anticyclonic run.
+    let mut lut = vec![0u8; VOLUME_LUT_BYTES];
+    for entry in 1..=120usize {
+        lut[entry * 4..entry * 4 + 4].copy_from_slice(&[0, 255, 0, 255]);
+    }
+    let at = usize::from(DATA) * 4;
+    lut[at..at + 4].copy_from_slice(&[0, 0, 255, 255]);
+
+    let mut uniform = VolumeUniform::new([10.0, 10.0, 10.0], cells);
+    uniform.box_from_clip = box_from_clip_down(2);
+    uniform.eye_in_box = eye_outside(2);
+    uniform.extinction_per_km = 1000.0;
+    uniform.gradient_shading = false;
+
+    let census = |uniform: &VolumeUniform| {
+        let pixels = raymarch_once(
+            &device, &queue, &pipelines, cells, &indices, &lut, uniform, size,
+        );
+        let green = pixels
+            .iter()
+            .filter(|px| px[3] > 0 && px[1] > px[0] && px[1] > px[2])
+            .count();
+        let blue = pixels
+            .iter()
+            .filter(|px| px[3] > 0 && px[2] > px[0] && px[2] > px[1])
+            .count();
+        (green, blue)
+    };
+
+    let (tent_green, tent_blue) = census(&uniform);
+    uniform.reconstruction_lod = NEAREST_RECONSTRUCTION;
+    let (nearest_green, nearest_blue) = census(&uniform);
+    println!(
+        "trilinear: {tent_green} green px / {tent_blue} blue px; \
+         nearest: {nearest_green} green px / {nearest_blue} blue px"
+    );
+
+    assert!(
+        tent_green > 0,
+        "precondition: the trilinear tent no longer paints the under-band at \
+         the no-data boundary, so this fixture has stopped exercising the \
+         boundary and the nearest assertion below is vacuous",
+    );
+    assert!(
+        nearest_blue > 0,
+        "nearest reconstruction erased the data itself — the block must still \
+         paint its own colour",
+    );
+    assert_eq!(
+        nearest_green, 0,
+        "nearest reconstruction painted {nearest_green} green pixels from a \
+         volume whose only data index is blue: the march is still filtering \
+         across the no-data boundary, which is the KLOT NROT green-arc defect",
     );
 }
 
