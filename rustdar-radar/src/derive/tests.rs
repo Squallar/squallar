@@ -240,7 +240,7 @@ fn srv_subtracts_the_override_motion_radial_by_radial() {
     let speed_ms = f64::from(speed_kt) * 0.514444;
     let direction: f32 = 240.0;
     let prepared = prepare(
-        &scan,
+        (&scan).into(),
         RadarProduct::StormRelativeVelocity,
         Some((speed_kt, direction)),
     )
@@ -348,7 +348,7 @@ fn each_derived_codec_spans_exactly_the_range_its_product_declares() {
 fn srv_with_no_motion_vector_refuses() {
     // No velocity anywhere: no wind fit, and (no override) no vector.
     let scan = scan_with(&|_, _| (Some(40.0), None, None, Some(0.99)));
-    assert!(prepare(&scan, RadarProduct::StormRelativeVelocity, None).is_none());
+    assert!(prepare((&scan).into(), RadarProduct::StormRelativeVelocity, None).is_none());
 }
 
 /// NROT is the rotation pipeline's output, not relabelled velocity: on a
@@ -357,8 +357,8 @@ fn srv_with_no_motion_vector_refuses() {
 #[test]
 fn nrot_is_rotation_not_relabelled_velocity() {
     let scan = scan_with(&|_, _| (Some(40.0), Some(15.0), None, Some(0.99)));
-    let prepared =
-        prepare(&scan, RadarProduct::NormalizedRotation, None).expect("a velocity volume derives");
+    let prepared = prepare((&scan).into(), RadarProduct::NormalizedRotation, None)
+        .expect("a velocity volume derives");
     let Prepared::Derived(derived) = prepared else {
         panic!("NROT must be derived, never served from the raw scan");
     };
@@ -513,8 +513,12 @@ fn a_derived_voxel_grid_resamples_the_derived_field() {
 #[test]
 fn kdp_is_the_phase_derivative_not_relabelled_phase() {
     let scan = scan_with(&|_, slant| (Some(45.0), None, Some(10.0 + 1.0 * slant), Some(0.99)));
-    let prepared = prepare(&scan, RadarProduct::SpecificDifferentialPhase, None)
-        .expect("a ΦDP volume derives");
+    let prepared = prepare(
+        (&scan).into(),
+        RadarProduct::SpecificDifferentialPhase,
+        None,
+    )
+    .expect("a ΦDP volume derives");
     let Prepared::Derived(derived) = prepared else {
         panic!("KDP must be derived, never served from the raw scan");
     };
@@ -592,8 +596,11 @@ fn a_derived_sweep_keeps_the_clock_of_the_tilt_it_was_computed_from() {
         RadarProduct::NormalizedRotation,
         RadarProduct::SpecificDifferentialPhase,
     ] {
-        // A motion vector for SRV; the other two read none.
-        let prepared = prepare(&scan, product, Some((30.0, 240.0)))
+        // A motion vector for SRV; the other two read none. The volume states
+        // no Nyquist limit, so the dealias each derivation runs estimates one
+        // — which is what this fixture had before the declaration crossed the
+        // boundary, and the clocks it checks do not depend on it.
+        let prepared = prepare((&scan).into(), product, Some((30.0, 240.0)))
             .unwrap_or_else(|| panic!("{product:?} derives from this fixture"));
         let derived = match &prepared {
             Prepared::Derived(scan) => scan,
@@ -661,7 +668,7 @@ fn arc_sweep(n: usize, step_deg: f32) -> Sweep {
 fn a_derived_radial_declares_the_step_its_own_grid_sits_at() {
     for (n, step, expected) in [(360usize, 1.0f32, 1.0f32), (72, 0.5, 0.5)] {
         let scan = Scan::new(vcp(&[0.5]), vec![arc_sweep(n, step)]);
-        let prepared = prepare(&scan, RadarProduct::NormalizedRotation, None)
+        let prepared = prepare((&scan).into(), RadarProduct::NormalizedRotation, None)
             .expect("a velocity volume derives NROT");
         let Prepared::Derived(derived) = prepared else {
             panic!("NROT must be derived, never served from the raw scan");

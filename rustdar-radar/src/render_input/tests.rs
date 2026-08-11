@@ -1,5 +1,5 @@
 use super::*;
-use crate::render::{render_from, render_radar_to_image_full};
+use crate::render::{SweepRender, render_from, render_radar_to_image_full};
 
 const LAT: f64 = 35.3333;
 const LON: f64 = -97.2778;
@@ -121,19 +121,22 @@ fn every_moment_tilt(elevation: f32, number: u8) -> Sweep {
 /// `f32::NAN != f32::NAN`, and the grid is NaN wherever no gate claimed the
 /// pixel — which is most of it — so a naive compare would pass on two
 /// entirely blank renders.
-fn assert_same_frame(
-    left: &(Vec<u8>, f64, Vec<f32>),
-    right: &(Vec<u8>, f64, Vec<f32>),
-    what: &str,
-) {
-    assert_eq!(left.0, right.0, "{what}: RGBA differs");
-    assert_eq!(left.1, right.1, "{what}: max range differs");
+fn assert_same_frame(left: &SweepRender, right: &SweepRender, what: &str) {
+    assert_eq!(left.image, right.image, "{what}: RGBA differs");
     assert_eq!(
-        left.2.len(),
-        right.2.len(),
+        left.max_range_km, right.max_range_km,
+        "{what}: max range differs"
+    );
+    assert_eq!(
+        left.nyquist_ms, right.nyquist_ms,
+        "{what}: declared Nyquist differs"
+    );
+    assert_eq!(
+        left.values.len(),
+        right.values.len(),
         "{what}: value grid length differs"
     );
-    for (i, (a, b)) in left.2.iter().zip(&right.2).enumerate() {
+    for (i, (a, b)) in left.values.iter().zip(&right.values).enumerate() {
         assert!(
             a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan()),
             "{what}: value {i} differs: {a} vs {b}"
@@ -141,8 +144,8 @@ fn assert_same_frame(
     }
 }
 
-fn painted(frame: &(Vec<u8>, f64, Vec<f32>)) -> usize {
-    frame.0.chunks_exact(4).filter(|px| px[3] != 0).count()
+fn painted(frame: &SweepRender) -> usize {
+    frame.image.chunks_exact(4).filter(|px| px[3] != 0).count()
 }
 
 /// The storm motion override a storm-relative render carries, for the
@@ -179,9 +182,17 @@ fn render_from_an_extracted_payload_matches_the_scan_path() {
     ] {
         let over = override_for(product);
         let env = env_for(product);
-        let direct =
-            crate::render::render_radar_to_image_full(&scan, 0.5, product, LAT, LON, over, env)
-                .unwrap();
+        let direct = crate::render::render_radar_to_image_full(
+            &scan,
+            0.5,
+            product,
+            LAT,
+            LON,
+            over,
+            env,
+            &crate::nyquist::DeclaredNyquist::empty(),
+        )
+        .unwrap();
         let input = RenderInput::extract(&scan, 0.5, product, LAT, LON, over, env).unwrap();
         let viaformat = render_from(&input).unwrap();
 
@@ -249,9 +260,17 @@ fn a_sweep_that_opened_off_its_tilt_still_renders_after_the_port() {
     );
     let product = RadarProduct::Reflectivity;
 
-    let direct =
-        crate::render::render_radar_to_image_full(&scan, 0.4, product, LAT, LON, None, None)
-            .expect("the scan path draws the cut this volume flew");
+    let direct = crate::render::render_radar_to_image_full(
+        &scan,
+        0.4,
+        product,
+        LAT,
+        LON,
+        None,
+        None,
+        &crate::nyquist::DeclaredNyquist::empty(),
+    )
+    .expect("the scan path draws the cut this volume flew");
     let input = RenderInput::extract(&scan, 0.4, product, LAT, LON, None, None)
         .expect("the payload extracts that same cut");
     assert!(
@@ -351,7 +370,7 @@ fn srv_extracts_the_velocity_volume_and_honours_the_override() {
     let a = render_from(&input).unwrap();
     let b = render_from(&other).unwrap();
     assert!(painted(&a) > 1_000);
-    assert_ne!(a.0, b.0, "the vector was carried but never applied");
+    assert_ne!(a.image, b.image, "the vector was carried but never applied");
 }
 
 /// A KDP payload's primary moment — ΦDP, the derivation's *source* slot —
@@ -1145,8 +1164,17 @@ fn a_product_with_no_level_two_moment_extracts_nothing() {
         RenderInput::extract(&scan, 0.5, RadarProduct::EchoTops, LAT, LON, None, None).is_none()
     );
     assert!(
-        render_radar_to_image_full(&scan, 0.5, RadarProduct::EchoTops, LAT, LON, None, None)
-            .is_none(),
+        render_radar_to_image_full(
+            &scan,
+            0.5,
+            RadarProduct::EchoTops,
+            LAT,
+            LON,
+            None,
+            None,
+            &crate::nyquist::DeclaredNyquist::empty()
+        )
+        .is_none(),
         "the payload and the renderer must refuse the same requests"
     );
 }
@@ -1169,8 +1197,17 @@ fn hail_without_an_environment_renders_nothing_on_both_paths() {
             "{product:?} rendered without an environment"
         );
         assert!(
-            crate::render::render_radar_to_image_full(&scan, 0.5, product, LAT, LON, None, None,)
-                .is_none(),
+            crate::render::render_radar_to_image_full(
+                &scan,
+                0.5,
+                product,
+                LAT,
+                LON,
+                None,
+                None,
+                &crate::nyquist::DeclaredNyquist::empty()
+            )
+            .is_none(),
             "{product:?}: the payload and the renderer must refuse alike"
         );
 

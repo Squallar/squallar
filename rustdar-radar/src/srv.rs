@@ -183,6 +183,12 @@ pub struct VelocityGrid {
 }
 
 impl VelocityGrid {
+    /// The sweep view [`WindProfileBuilder`] reads.
+    ///
+    /// `declared_nyquist_ms` is `None` and that is not an omission: the VAD fit
+    /// never unfolds anything — it trims folded samples out of each layer
+    /// statistically — so it has no use for a fold limit, and handing it one
+    /// would suggest it did.
     fn sweep(&self) -> VelocitySweep<'_> {
         VelocitySweep {
             vel_grid: &self.values,
@@ -190,6 +196,7 @@ impl VelocityGrid {
             gate_count: self.gate_count,
             first_gate_range_km: self.first_gate_range_km,
             gate_interval_km: self.gate_interval_km,
+            declared_nyquist_ms: None,
         }
     }
 }
@@ -232,10 +239,16 @@ pub fn velocity_grid(radials: &[Radial]) -> Option<VelocityGrid> {
 
 /// One sweep's velocity, dealiased for display: the Coverage profile,
 /// **no median filter** — see the module docs for both choices.
+///
+/// `declared_nyquist_ms` is what this cut declared its velocity folds at, from
+/// [`crate::nyquist::DeclaredNyquist`]; `None` leaves the dealiaser to estimate
+/// the limit off the sweep, which is what it did for every caller before the
+/// declaration crossed the model boundary.
 pub fn dealiased_grid(
     radials: &[Radial],
     elevation_deg: f64,
     profile: Option<&WindProfile>,
+    declared_nyquist_ms: Option<f64>,
 ) -> Option<VelocityGrid> {
     let mut grid = velocity_grid(radials)?;
     let sweep_view = VelocitySweep {
@@ -244,6 +257,7 @@ pub fn dealiased_grid(
         gate_count: grid.gate_count,
         first_gate_range_km: grid.first_gate_range_km,
         gate_interval_km: grid.gate_interval_km,
+        declared_nyquist_ms,
     };
     crate::nrot::dealias(
         &mut grid.values,
@@ -281,8 +295,9 @@ pub fn compute_srv_grid(
     elevation_deg: f64,
     profile: Option<&WindProfile>,
     motion: &SrvMotion,
+    declared_nyquist_ms: Option<f64>,
 ) -> Option<VelocityGrid> {
-    let mut grid = dealiased_grid(radials, elevation_deg, profile)?;
+    let mut grid = dealiased_grid(radials, elevation_deg, profile, declared_nyquist_ms)?;
     apply_storm_motion(&mut grid, motion);
     Some(grid)
 }

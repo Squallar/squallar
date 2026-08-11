@@ -567,9 +567,9 @@ impl RenderBuffers {
     /// `get_mut` rather than a `swap`: rasterization is over by the time this
     /// runs and taking `self` by value proves it, so the drain is a plain load
     /// and store per cell rather than 4 M locked read-modify-writes.
-    fn into_output(self, extent_km: f64) -> (Vec<u8>, f64, Vec<f32>) {
+    fn into_output(self, extent_km: f64) -> SweepRender {
         let Self { mut cells, product } = self;
-        let value_data: Vec<f32> = cells
+        let mut value_data: Vec<f32> = cells
             .iter_mut()
             .map(|a| match std::mem::replace(a.get_mut(), Self::EMPTY) {
                 Self::EMPTY => f32::NAN,
@@ -580,16 +580,60 @@ impl RenderBuffers {
         let mut image = vec![0u8; value_data.len() * 4];
         image
             .par_chunks_mut(4 * Self::COLOR_CHUNK)
-            .zip(value_data.par_chunks(Self::COLOR_CHUNK))
+            .zip(value_data.par_chunks_mut(Self::COLOR_CHUNK))
             .for_each(|(px, vals)| {
-                for (px, &v) in px.chunks_exact_mut(4).zip(vals) {
+                for (px, v) in px.chunks_exact_mut(4).zip(vals) {
                     if !v.is_nan() {
-                        let c = get_color_for_value(product, v);
+                        let c = get_color_for_value(product, *v);
                         px.copy_from_slice(&[c.0, c.1, c.2, c.3]);
                     }
                 }
             });
-        (image, extent_km, value_data)
+        SweepRender {
+            image,
+            max_range_km: extent_km,
+            values: value_data,
+            // Set by the sweep paths that know one; see the field.
+            nyquist_ms: None,
+        }
+    }
+}
+
+/// One finished plan-view raster.
+///
+/// A named struct because the third thing this used to be a tuple of was the
+/// extent, the fourth is the fold limit, and a reader at a call site three
+/// crates away has no way to tell a `f64` extent from a `f64` Nyquist velocity.
+/// Every render path in this module answers with one of these, including the
+/// Level III and volume products, so a consumer has one shape to handle rather
+/// than one per pipeline.
+pub struct SweepRender {
+    /// RGBA, `side²` pixels; the side is derivable from the length and
+    /// deliberately not restated (see `crate::types::raster_side_px`).
+    pub image: Vec<u8>,
+    /// The half-width the raster was **projected** at, km — where its corners
+    /// go on the ground, not how far the data reached. See
+    /// [`render_with_projection`].
+    pub max_range_km: f64,
+    /// Per-pixel values, `f32::NAN` where nothing was painted.
+    pub values: Vec<f32>,
+    /// Where the rendered sweep's cut declared its velocity folds, m/s.
+    ///
+    /// A property of the **sweep**, not of the product drawn from it, so every
+    /// per-tilt Level II render reports it and the volume products (echo tops,
+    /// the hail pair, the hybrid classification) and every Level III product
+    /// report `None` — there is no one cut behind those to have declared
+    /// anything. `None` also where the volume itself declared nothing, which is
+    /// every Message 1 volume and every payload that reached the renderer
+    /// without a table.
+    pub nyquist_ms: Option<f64>,
+}
+
+impl SweepRender {
+    /// Stamp the fold limit of the sweep this raster was drawn from.
+    fn declaring(mut self, nyquist_ms: Option<f64>) -> Self {
+        self.nyquist_ms = nyquist_ms;
+        self
     }
 }
 
@@ -945,7 +989,7 @@ fn render_with_projection(
     side_ceiling_px: usize,
     label: &str,
     fill: impl FnOnce(&MercatorProjection, &RenderBuffers),
-) -> (Vec<u8>, f64, Vec<f32>) {
+) -> SweepRender {
     let extent_km = types::plan_view_extent_km(reach_km);
     let side_px = types::raster_side_px(extent_km, side_ceiling_px);
     let bounds = types::ImageBounds::from_radar_site(radar_lat, radar_lon, extent_km);
@@ -954,16 +998,16 @@ fn render_with_projection(
 
     fill(&proj, &bufs);
 
-    let (image, extent_km, value_data) = bufs.into_output(extent_km);
+    let output = bufs.into_output(extent_km);
     log::info!(
         "{} rendering complete: data reaches {:.1}km, projected at ±{:.1}km \
          onto {side_px}² px ({:.2} px/km)",
         label,
         reach_km,
-        extent_km,
+        output.max_range_km,
         proj.px_per_km,
     );
-    (image, extent_km, value_data)
+    output
 }
 
 // ── Public rendering functions ───────────────────────────────────────────────
@@ -978,16 +1022,20 @@ fn render_with_projection(
 // caller who wanted the floor's behaviour cannot get anything else.
 //
 
-/// Render radar data to an image projected for geographic display. Returns
-/// `(RGBA pixels, max_range_km, per-pixel values)`; a value is `f32::NAN` where
-/// there is no data.
+/// Render radar data to an image projected for geographic display; see
+/// [`SweepRender`] for what comes back.
+///
+/// The volume declares nothing, so the velocity products' dealiaser estimates
+/// its fold limit off the sweep and [`SweepRender::nyquist_ms`] is `None` — the
+/// answer for a caller holding only model types, which is every caller of this
+/// short form. [`render_radar_to_image_full`] takes the table.
 pub fn render_radar_to_image(
     data: &Scan,
     elevation_angle: f32,
     product: types::RadarProduct,
     radar_lat: f64,
     radar_lon: f64,
-) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+) -> Option<SweepRender> {
     render_radar_to_image_full(
         data,
         elevation_angle,
@@ -996,6 +1044,7 @@ pub fn render_radar_to_image(
         radar_lon,
         None,
         None,
+        &crate::nyquist::DeclaredNyquist::empty(),
     )
 }
 
@@ -1010,7 +1059,7 @@ pub fn render_radar_to_image(
 /// It reconstructs a `Scan` and runs the ordinary renderer, so there is one
 /// rasterizer rather than two that could disagree about a pixel; see
 /// [`crate::render_input`] for why the reconstruction is exact.
-pub fn render_from(input: &crate::render_input::RenderInput) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+pub fn render_from(input: &crate::render_input::RenderInput) -> Option<SweepRender> {
     render_from_sized(input, types::IMAGE_SIZE)
 }
 
@@ -1021,7 +1070,12 @@ pub fn render_from(input: &crate::render_input::RenderInput) -> Option<(Vec<u8>,
 pub fn render_from_sized(
     input: &crate::render_input::RenderInput,
     side_ceiling_px: usize,
-) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+) -> Option<SweepRender> {
+    // Lifted back out separately because `to_scan` rebuilds model types and the
+    // model type is precisely what drops the number. The payload has carried it
+    // per sweep since the sampler needed it for the vertical views — the same
+    // field, read by the path that draws the plan view, so a worker and the
+    // main thread unfold a velocity sweep around the same limit.
     render_radar_to_image_full_sized(
         &input.to_scan(),
         input.elevation(),
@@ -1030,6 +1084,7 @@ pub fn render_from_sized(
         input.radar_lon(),
         input.storm_motion_override(),
         input.env_heights_km_msl(),
+        &input.declared_nyquist(),
         side_ceiling_px,
     )
 }
@@ -1051,6 +1106,14 @@ pub fn render_from_sized(
 /// ([`build_wind_profile`]). The RPG's NVW product used to be an alternate
 /// source, until the local VAD fit was validated against the RPG's own
 /// dealiased velocity and the fetch dropped.
+///
+/// `declared_nyquist` is what each cut said about where its velocity folds
+/// ([`crate::nyquist::DeclaredNyquist`]). NROT and SRV dealias, and this is the
+/// interval they fold around; the sweep's own value also comes back in
+/// [`SweepRender::nyquist_ms`]. Pass an empty table for a volume that declared
+/// nothing and the dealiaser estimates, which is what every path here did
+/// before the declaration crossed the model boundary.
+#[allow(clippy::too_many_arguments)]
 pub fn render_radar_to_image_full(
     data: &Scan,
     elevation_angle: f32,
@@ -1059,7 +1122,8 @@ pub fn render_radar_to_image_full(
     radar_lon: f64,
     storm_motion_override: Option<(f32, f32)>,
     env_heights_km_msl: Option<(f64, f64)>,
-) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+    declared_nyquist: &crate::nyquist::DeclaredNyquist,
+) -> Option<SweepRender> {
     render_radar_to_image_full_sized(
         data,
         elevation_angle,
@@ -1068,6 +1132,7 @@ pub fn render_radar_to_image_full(
         radar_lon,
         storm_motion_override,
         env_heights_km_msl,
+        declared_nyquist,
         types::IMAGE_SIZE,
     )
 }
@@ -1083,8 +1148,9 @@ pub fn render_radar_to_image_full_sized(
     radar_lon: f64,
     storm_motion_override: Option<(f32, f32)>,
     env_heights_km_msl: Option<(f64, f64)>,
+    declared_nyquist: &crate::nyquist::DeclaredNyquist,
     side_ceiling_px: usize,
-) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+) -> Option<SweepRender> {
     if product == types::RadarProduct::EchoTopsInterpolated {
         return render_echo_tops_interp_to_image(data, radar_lat, radar_lon, side_ceiling_px);
     }
@@ -1113,10 +1179,25 @@ pub fn render_radar_to_image_full_sized(
         );
     }
 
-    let radials = find_sweep(data, product, elevation_angle)?;
+    // The owner and not just its radials: the declared Nyquist table is keyed
+    // by the RDA's `elevation_number`, and a `Sweep` is where that number is
+    // authoritative. A radial carries one too and in every producer here they
+    // agree, but `find_sweep_owner` exists precisely because "they agree in the
+    // producers we have" is a claim about data — and reading the wrong cut's
+    // number would fold this sweep around another sweep's PRF.
+    let owner = find_sweep_owner(data, product, elevation_angle)?;
+    let radials = owner.radials();
+    let nyquist_ms = declared_nyquist.get(owner.elevation_number());
 
     if product == types::RadarProduct::NormalizedRotation {
-        return render_nrot_to_image(data, radials, radar_lat, radar_lon, side_ceiling_px);
+        return render_nrot_to_image(
+            data,
+            radials,
+            radar_lat,
+            radar_lon,
+            nyquist_ms,
+            side_ceiling_px,
+        );
     }
 
     if product == types::RadarProduct::StormRelativeVelocity {
@@ -1126,6 +1207,7 @@ pub fn render_radar_to_image_full_sized(
             radar_lat,
             radar_lon,
             storm_motion_override,
+            nyquist_ms,
             side_ceiling_px,
         );
     }
@@ -1224,7 +1306,7 @@ pub fn render_radar_to_image_full_sized(
                 });
         },
     );
-    Some(output)
+    Some(output.declaring(nyquist_ms))
 }
 
 /// Render NROT (Normalized Rotation): azimuthal shear derived from Level II
@@ -1235,8 +1317,9 @@ fn render_nrot_to_image(
     radials: &[Radial],
     radar_lat: f64,
     radar_lon: f64,
+    declared_nyquist_ms: Option<f64>,
     side_ceiling_px: usize,
-) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+) -> Option<SweepRender> {
     let num_radials = radials.len();
     if num_radials < 3 {
         return None;
@@ -1269,6 +1352,7 @@ fn render_nrot_to_image(
             gate_count: vg.gate_count,
             first_gate_range_km: vg.first_gate_range_km,
             gate_interval_km: vg.gate_interval_km,
+            declared_nyquist_ms,
         },
         elevation_deg,
         profile.as_ref(),
@@ -1320,7 +1404,7 @@ fn render_nrot_to_image(
             });
         },
     );
-    Some(output)
+    Some(output.declaring(declared_nyquist_ms))
 }
 
 /// Render storm-relative velocity derived locally from Level II: the sweep's
@@ -1340,8 +1424,9 @@ fn render_srv_to_image(
     radar_lat: f64,
     radar_lon: f64,
     storm_motion_override: Option<(f32, f32)>,
+    declared_nyquist_ms: Option<f64>,
     side_ceiling_px: usize,
-) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+) -> Option<SweepRender> {
     if radials.len() < 3 {
         return None;
     }
@@ -1360,7 +1445,13 @@ fn render_srv_to_image(
         motion.direction_deg,
         motion.source,
     );
-    let grid = crate::srv::compute_srv_grid(radials, elevation_deg, profile.as_ref(), &motion)?;
+    let grid = crate::srv::compute_srv_grid(
+        radials,
+        elevation_deg,
+        profile.as_ref(),
+        &motion,
+        declared_nyquist_ms,
+    )?;
 
     // As in NROT: the dealiaser above keeps the first radial's angle, this is
     // where the finished field is *placed*.
@@ -1400,7 +1491,7 @@ fn render_srv_to_image(
             });
         },
     );
-    Some(output)
+    Some(output.declaring(declared_nyquist_ms))
 }
 
 /// Velocity as a 2D grid (azimuth × range).
@@ -1433,6 +1524,8 @@ fn build_wind_profile(scan: &Scan) -> Option<crate::nrot::WindProfile> {
                 gate_count: vg.gate_count,
                 first_gate_range_km: vg.first_gate_range_km,
                 gate_interval_km: vg.gate_interval_km,
+                // The VAD fit unfolds nothing — see `VelocityGrid::sweep`.
+                declared_nyquist_ms: None,
             },
             first.elevation_angle_degrees() as f64,
         );
@@ -1485,7 +1578,7 @@ pub fn render_echo_tops_interp_to_image(
     radar_lat: f64,
     radar_lon: f64,
     side_ceiling_px: usize,
-) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+) -> Option<SweepRender> {
     let grid = crate::volumetric::compute_echo_tops(scan);
     let max_range = grid.range_bins as f64;
     let output = render_with_projection(
@@ -1533,7 +1626,7 @@ pub fn render_derived_vild_to_image(
     eet: &nexrad_level3::model::Level3Message,
     radar_lat: f64,
     radar_lon: f64,
-) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+) -> Option<SweepRender> {
     render_derived_vild_to_image_sized(dvl, eet, radar_lat, radar_lon, types::IMAGE_SIZE)
 }
 
@@ -1550,7 +1643,7 @@ pub fn render_derived_vild_to_image_sized(
     radar_lat: f64,
     radar_lon: f64,
     side_ceiling_px: usize,
-) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+) -> Option<SweepRender> {
     let grid = match crate::vild::compute_vild(dvl, eet) {
         Ok(grid) => grid,
         Err(refusal) => {
@@ -1635,7 +1728,7 @@ pub fn render_hail_to_image(
     radar_lon: f64,
     env_heights_km_msl: Option<(f64, f64)>,
     side_ceiling_px: usize,
-) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+) -> Option<SweepRender> {
     let Some((h0c_km_msl, hm20c_km_msl)) = env_heights_km_msl else {
         log::info!("{product:?}: no environmental heights — nothing to render");
         return None;
@@ -1721,7 +1814,7 @@ pub fn render_hhc_to_image(
     radar_lon: f64,
     env_heights_km_msl: Option<(f64, f64)>,
     side_ceiling_px: usize,
-) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+) -> Option<SweepRender> {
     let radar_km_msl = render_site_height_ft(radar_lat, radar_lon) * 0.0003048;
     let params = crate::kdp::KdpParams {
         isdp_est_deg: crate::kdp::estimate_volume_isdp(scan),
@@ -1812,7 +1905,7 @@ pub fn render_derived_kdp_to_image(
     radar_lon: f64,
     params: &crate::kdp::KdpParams,
     side_ceiling_px: usize,
-) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+) -> Option<SweepRender> {
     let radials = find_sweep(
         scan,
         types::RadarProduct::DifferentialPhase,
@@ -1883,7 +1976,7 @@ pub fn render_level3_radial_to_image(
     offset: f32,
     lut: Option<&[f32]>,
     side_ceiling_px: usize,
-) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+) -> Option<SweepRender> {
     render_level3_radial_with_gate_km(
         radial_packet,
         radial_packet.gate_interval_km(),
@@ -1939,7 +2032,7 @@ fn render_level3_radial_with_gate_km(
     offset: f32,
     lut: Option<&[f32]>,
     side_ceiling_px: usize,
-) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+) -> Option<SweepRender> {
     if radial_packet.radials.is_empty() {
         return None;
     }
@@ -2009,7 +2102,7 @@ pub fn render_derived_srm_to_image(
     radar_lat: f64,
     radar_lon: f64,
     side_ceiling_px: usize,
-) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+) -> Option<SweepRender> {
     render_level3_radial_to_image(
         &derived.packet,
         types::RadarProduct::StormRelativeVelocity,
@@ -2030,7 +2123,7 @@ pub fn render_level3_message_to_image(
     product: types::RadarProduct,
     radar_lat: f64,
     radar_lon: f64,
-) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+) -> Option<SweepRender> {
     render_level3_message_to_image_sized(l3_msg, product, radar_lat, radar_lon, types::IMAGE_SIZE)
 }
 
@@ -2047,7 +2140,7 @@ pub fn render_level3_message_to_image_sized(
     radar_lat: f64,
     radar_lon: f64,
     side_ceiling_px: usize,
-) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+) -> Option<SweepRender> {
     use nexrad_level3::model::DataPacket;
 
     let radial_packet = l3_msg.symbology.as_ref().and_then(|sym| {

@@ -1172,7 +1172,11 @@ fn mirror_from_field(
 /// app reads it back off the buffer: it is a function of how far the sweep
 /// reached, which is a property of the volume on disk and not of this file.
 fn pane_raster(input: &rustdar_radar::render_input::RenderInput) -> Option<(Vec<u8>, usize, f64)> {
-    let (image, extent_km, _values) = rustdar_radar::render::render_from_sized(
+    let rustdar_radar::render::SweepRender {
+        image,
+        max_range_km: extent_km,
+        ..
+    } = rustdar_radar::render::render_from_sized(
         input,
         rustdar_frontend::constants::LONG_RANGE_IMAGE_SIZE,
     )?;

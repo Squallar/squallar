@@ -19,7 +19,11 @@ fn gated_render() -> (mpsc::Sender<()>, crate::offload::Job) {
         crate::offload::Job::Opaque(Box::new(move || {
             held.recv().expect("every gated render is released");
             Some(crate::offload::JobOutput::Frame(
-                (Vec::new(), 230.0, Vec::new()).into(),
+                crate::offload::RenderedFrame {
+                    image: Vec::new(),
+                    max_range_km: 230.0,
+                    values: Vec::new(),
+                },
             ))
         })),
     )

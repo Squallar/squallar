@@ -486,10 +486,17 @@ impl Blend {
 /// is merely calm. No operational NEXRAD waveform has a Nyquist velocity this
 /// low, so below it the guard is switched off rather than trusted.
 ///
-/// `crate::nrot::dealias_with_knobs` abandons dealiasing under the same 8 m/s
-/// on the same reasoning about the same estimator, and the two numbers mean
-/// the same thing; they are deliberately equal.
-const FOLD_LIMIT_FLOOR_MS: f64 = 8.0;
+/// It bounds the **declared** limit too, wherever one exists, on the other
+/// half of the same reasoning: no operational waveform folds below 8 m/s, so a
+/// declaration under it is a mis-decoded field rather than a very slow radar,
+/// and the estimate is the better of two poor answers.
+///
+/// `pub(crate)` because `crate::nrot::fold_limit_ms` chooses the same way for
+/// the pass that *removes* folds, and this guard is the one that refuses to
+/// interpolate across them. One floor: two copies could drift, and the drift
+/// would show up as a section and a plan view taking different views of the
+/// same pair of gates, with nothing anywhere reporting a disagreement.
+pub(crate) const FOLD_LIMIT_FLOOR_MS: f64 = 8.0;
 
 /// One rung of the tilt ladder: the sweep that won its cut, indexed for random
 /// access.

@@ -113,10 +113,10 @@ const SMALL_SIDE: usize = 1024;
 /// painted, and `NaN != NaN` would make a plain comparison of two correct
 /// results fail.
 fn render_at(p: &RadialPacket, side_ceiling_px: usize) -> (Vec<u8>, Vec<u32>) {
-    let (image, _, values) =
+    let out =
         render_level3_radial_to_image(p, PRODUCT, LAT, LON, SCALE, OFFSET, None, side_ceiling_px)
             .expect("the packet renders");
-    (image, values.iter().map(|v| v.to_bits()).collect())
+    (out.image, out.values.iter().map(|v| v.to_bits()).collect())
 }
 
 /// [`render_at`] at the base raster side, which is what every assertion of

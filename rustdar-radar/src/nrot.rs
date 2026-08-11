@@ -80,6 +80,22 @@ pub struct VelocitySweep<'a> {
     pub gate_count: usize,
     pub first_gate_range_km: f64,
     pub gate_interval_km: f64,
+    /// Where this sweep's cut **declared** its velocity folds, m/s, or `None`
+    /// when the volume declared nothing for it.
+    ///
+    /// Read by [`dealias_with_knobs`] and by nothing else in this module: it is
+    /// the interval every fold decision is a multiple of, and
+    /// [`estimate_nyquist`] is what stands in when it is absent. A
+    /// [`WindProfileBuilder`] sweep leaves it `None` on purpose — the VAD fit
+    /// trims folded samples statistically and has no use for a limit.
+    ///
+    /// The number comes off Message 31's Radial Data Block by way of
+    /// [`crate::nyquist::DeclaredNyquist`], which is also what
+    /// [`crate::sampler::VolumeSampler`] guards its velocity interpolation on.
+    /// The two reading one table is the point: a section and a plan view that
+    /// disagree about where a sweep folds disagree about which of its gates are
+    /// one datum.
+    pub declared_nyquist_ms: Option<f64>,
 }
 
 /// How this sweep's rows sit in azimuth: the step every stencil's
@@ -541,11 +557,24 @@ impl WindProfileBuilder {
     }
 }
 
-/// The Nyquist velocity is not carried through `nexrad_model::data::Radial`,
-/// but it doesn't need to be: folded data always contains values at the fold
-/// limit, so when aliasing occurred at all, max |v| *is* the Nyquist velocity.
-/// When it didn't, the estimate is low but the field is continuous and no
-/// region boundary exists to unfold.
+/// The fold limit read **off the data**: the largest speed the sweep observed.
+///
+/// The fallback, not the answer. `nexrad_model::data::Radial` drops the RDA's
+/// declared Nyquist velocity, so for a long time this was the only number
+/// available; [`crate::nyquist::DeclaredNyquist`] now carries the declaration
+/// past the model boundary and [`fold_limit_ms`] prefers it wherever a volume
+/// made one. This still stands in for a volume that declared nothing — every
+/// Message 1 volume (the legacy message has no such field), every fixture, and
+/// any caller holding only model types.
+///
+/// It is exact when the sweep folded at all, because folded data reaches the
+/// limit by construction, and an **under**estimate when it did not. The
+/// underestimate is what makes it a fallback rather than a peer: on a calm
+/// sector whose fastest gate is 6 m/s it returns 6, and 2·6 m/s then becomes
+/// the interval every fold decision below is a multiple of — so ordinary shear
+/// across a 12 m/s step reads as a fold and comes back unfolded by a step that
+/// was never there. [`crate::sampler::FOLD_LIMIT_FLOOR_MS`] is the floor that
+/// stops the worst of it; the declaration removes the failure mode outright.
 fn estimate_nyquist(vel_grid: &[Vec<f64>]) -> f64 {
     vel_grid
         .iter()
@@ -1970,6 +1999,37 @@ pub(crate) fn dealias(
     )
 }
 
+/// The fold limit this sweep is dealiased against, m/s: what the RDA declared,
+/// or what the data shows when it declared nothing. `None` abandons the pass.
+///
+/// **Declared wins, above the floor.** The declaration is a property of the
+/// waveform — the PRF the cut was flown at — and it is right whether or not the
+/// sweep happened to fold, which is exactly where [`estimate_nyquist`] is
+/// wrong. TDWR is where the difference stops being academic: its Nyquist
+/// velocity is around 20–30 m/s against the WSR-88D's ~64, so its Doppler cuts
+/// fold routinely, and a calm sector of one of them estimates a limit far
+/// below the real one and then unfolds honest gradients into shear that was
+/// never in the air.
+///
+/// [`crate::sampler::FOLD_LIMIT_FLOOR_MS`] bounds both, and it is the sampler's
+/// own constant rather than a second copy of the number: the guard that refuses
+/// to interpolate across a fold and the pass that removes one are answering the
+/// same question about the same sweep, and two floors that could drift apart
+/// would let a section and a plan view take different views of the same gate. A
+/// declaration under the floor is refused rather than trusted — no operational
+/// waveform folds that low, so such a value is a mis-decode, and the estimate
+/// is the better of two poor answers.
+fn fold_limit_ms(sweep: &VelocitySweep, vel_grid: &[Vec<f64>]) -> Option<f64> {
+    let floor = crate::sampler::FOLD_LIMIT_FLOOR_MS;
+    match sweep.declared_nyquist_ms {
+        Some(declared) if declared >= floor => Some(declared),
+        _ => {
+            let estimated = estimate_nyquist(vel_grid);
+            (estimated >= floor).then_some(estimated)
+        }
+    }
+}
+
 pub(crate) fn dealias_with_knobs(
     vel_grid: &mut [Vec<f64>],
     sweep: &VelocitySweep,
@@ -1977,10 +2037,9 @@ pub(crate) fn dealias_with_knobs(
     profile: Option<&WindProfile>,
     knobs: DealiasKnobs,
 ) {
-    let nyquist = estimate_nyquist(vel_grid);
-    if nyquist < 8.0 {
+    let Some(nyquist) = fold_limit_ms(sweep, vel_grid) else {
         return;
-    }
+    };
     let interval = 2.0 * nyquist;
     let n = vel_grid.len();
     let gc = sweep.gate_count;
@@ -2610,9 +2669,14 @@ mod tests {
             gate_count,
             first_gate_range_km: 2.125,
             gate_interval_km: 0.25,
+            declared_nyquist_ms: None,
         }
     }
 
+    /// The fixtures declare nothing, so every existing expectation below is
+    /// measured against [`estimate_nyquist`] exactly as it always was;
+    /// `declaring` is how the two tests that are *about* the declaration state
+    /// one.
     fn sweep<'a>(grid: &'a [Vec<f64>], azimuths: &'a [f64], gates: usize) -> VelocitySweep<'a> {
         VelocitySweep {
             vel_grid: grid,
@@ -2620,6 +2684,7 @@ mod tests {
             gate_count: gates,
             first_gate_range_km: 0.25,
             gate_interval_km: 0.25,
+            declared_nyquist_ms: None,
         }
     }
 
@@ -3028,6 +3093,121 @@ mod tests {
             None,
             DealiasProfile::NoFalseShear,
         );
+        assert_eq!(grid, orig);
+    }
+
+    /// A gust front is 11 m/s in and 11 m/s out across one line, and the
+    /// declared limit is what tells that from a fold.
+    ///
+    /// The fixture is the shape a TDWR exists to see: half the rotation
+    /// inbound at 11 m/s, half outbound at 11 m/s, nothing else. Nothing in it
+    /// is folded — a TPIT Doppler cut declares around 22 m/s and the fastest
+    /// gate here is half of that.
+    ///
+    /// [`estimate_nyquist`] reads the fastest gate, so it answers **11**, and
+    /// the post-pass censor then blanks any bin more than
+    /// [`CENSOR_VNY_FRAC`]·Vny — 13.6 m/s — from a 4-neighbour. The two rows
+    /// facing each other across the line stand 22 m/s apart, which under that
+    /// limit is a fold wall no pass could have placed, so the censor erases
+    /// them: 160 bins of the strongest convergence in the sweep, in a field
+    /// with no fold anywhere in it. Told the 22.4 m/s the cut was flown at, the
+    /// same wall sits inside a 27.8 m/s censor and stands.
+    ///
+    /// The `None` arm is not scaffolding — it is what every reader of this
+    /// module did before the declaration crossed the model boundary, and it is
+    /// what a Message 1 volume still gets.
+    #[test]
+    fn a_declared_limit_keeps_a_shear_line_the_estimate_censors_as_a_fold() {
+        const DECLARED_MS: f64 = 22.4;
+        let n = 72;
+        let gates = 40;
+        let azimuths = ring_azimuths(n);
+        let orig: Vec<Vec<f64>> = (0..n)
+            .map(|i| vec![if i < n / 2 { 11.0 } else { -11.0 }; gates])
+            .collect();
+
+        let run = |declared: Option<f64>| {
+            let mut grid = orig.clone();
+            let vg = grid.clone();
+            let mut sweep = sweep_for(&vg, &azimuths, gates);
+            sweep.declared_nyquist_ms = declared;
+            dealias(&mut grid, &sweep, 0.5, None, DealiasProfile::NoFalseShear);
+            grid
+        };
+
+        let declared = run(Some(DECLARED_MS));
+        assert_eq!(
+            declared, orig,
+            "the declared limit leaves a 22 m/s shear line exactly where it was",
+        );
+
+        let estimated = run(None);
+        for row in [0usize, n / 2 - 1, n / 2, n - 1] {
+            assert!(
+                estimated[row].iter().all(|v| v.is_nan()),
+                "row {row} faces the line and the 11 m/s estimate censors it",
+            );
+        }
+        assert_eq!(
+            estimated.iter().flatten().filter(|v| v.is_nan()).count(),
+            4 * gates,
+            "only the four rows either side of the two lines are erased",
+        );
+    }
+
+    /// A declaration under [`crate::sampler::FOLD_LIMIT_FLOOR_MS`] is a
+    /// mis-decoded field, not a very slow radar: no operational waveform folds
+    /// at 3 m/s. It is refused and the estimate stands, which on
+    /// [`a_declared_limit_keeps_a_shear_line_the_estimate_censors_as_a_fold`]'s
+    /// fixture is the arm that erases the line.
+    #[test]
+    fn a_declaration_below_the_floor_falls_back_to_the_estimate() {
+        let n = 72;
+        let gates = 40;
+        let azimuths = ring_azimuths(n);
+        let orig: Vec<Vec<f64>> = (0..n)
+            .map(|i| vec![if i < n / 2 { 11.0 } else { -11.0 }; gates])
+            .collect();
+        let vg = orig.clone();
+        let mut sweep = sweep_for(&vg, &azimuths, gates);
+
+        sweep.declared_nyquist_ms = Some(3.0);
+        assert_eq!(
+            fold_limit_ms(&sweep, &orig),
+            Some(11.0),
+            "a sub-floor declaration is refused and the estimate answers",
+        );
+        sweep.declared_nyquist_ms = Some(crate::sampler::FOLD_LIMIT_FLOOR_MS);
+        assert_eq!(
+            fold_limit_ms(&sweep, &orig),
+            Some(crate::sampler::FOLD_LIMIT_FLOOR_MS),
+            "the floor itself is believed",
+        );
+
+        let mut grid = orig.clone();
+        sweep.declared_nyquist_ms = Some(3.0);
+        dealias(&mut grid, &sweep, 0.5, None, DealiasProfile::NoFalseShear);
+        assert!(
+            grid[0].iter().all(|v| v.is_nan()),
+            "the sub-floor arm censors exactly as the estimate does",
+        );
+    }
+
+    /// A sweep too slow for even the estimate abandons the pass outright,
+    /// declaration or none: the field is returned untouched.
+    #[test]
+    fn a_sweep_under_the_floor_with_no_declaration_is_left_alone() {
+        let n = 72;
+        let gates = 40;
+        let azimuths = ring_azimuths(n);
+        let orig: Vec<Vec<f64>> = (0..n)
+            .map(|i| vec![if i < n / 2 { 3.0 } else { -3.0 }; gates])
+            .collect();
+        let vg = orig.clone();
+        let sweep = sweep_for(&vg, &azimuths, gates);
+        assert_eq!(fold_limit_ms(&sweep, &orig), None);
+        let mut grid = orig.clone();
+        dealias(&mut grid, &sweep, 0.5, None, DealiasProfile::NoFalseShear);
         assert_eq!(grid, orig);
     }
 

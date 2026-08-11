@@ -254,12 +254,15 @@ pub struct RenderedFrame {
 /// sweep. Callers treat it as the failure the renderer already meant by it.
 pub type JobResult = Option<JobOutput>;
 
-impl From<(Vec<u8>, f64, Vec<f32>)> for RenderedFrame {
-    fn from((image, max_range_km, values): (Vec<u8>, f64, Vec<f32>)) -> Self {
+impl From<rustdar_radar::render::SweepRender> for RenderedFrame {
+    /// The renderer's own answer, minus the fold limit it reports: nothing on
+    /// this port carries that yet, and dropping it here rather than at each
+    /// arm keeps the three rasterizing arms writing one conversion.
+    fn from(render: rustdar_radar::render::SweepRender) -> Self {
         Self {
-            image,
-            max_range_km,
-            values,
+            image: render.image,
+            max_range_km: render.max_range_km,
+            values: render.values,
         }
     }
 }
@@ -674,19 +677,17 @@ pub fn execute(request: &JobRequest) -> JobResult {
             input,
             values_wanted,
             ..
-        } => rustdar_radar::render::render_from_sized(input, side_ceiling_px).map(
-            |(image, max_range_km, values)| {
-                JobOutput::Frame(RenderedFrame {
-                    image,
-                    max_range_km,
-                    // Dropped rather than never produced: the grid is what the
-                    // rasterizer writes into, and the texture is derived from
-                    // it. Clearing it here costs nothing and keeps the
-                    // renderer's output the one thing it has always been.
-                    values: if *values_wanted { values } else { Vec::new() },
-                })
-            },
-        ),
+        } => rustdar_radar::render::render_from_sized(input, side_ceiling_px).map(|render| {
+            let mut frame = RenderedFrame::from(render);
+            if !*values_wanted {
+                // Dropped rather than never produced: the grid is what the
+                // rasterizer writes into, and the texture is derived from it.
+                // Clearing it here costs nothing and keeps the renderer's
+                // output the one thing it has always been.
+                frame.values = Vec::new();
+            }
+            JobOutput::Frame(frame)
+        }),
         JobRequest::Level3 {
             bytes,
             product,

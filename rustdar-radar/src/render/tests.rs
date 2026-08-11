@@ -60,7 +60,7 @@ fn packet(silence: Option<usize>) -> RadialPacket {
 }
 
 fn render(p: &RadialPacket) -> (Vec<u8>, Vec<f32>) {
-    let (image, _, values) =
+    let SweepRender { image, values, .. } =
         render_level3_radial_to_image(p, PRODUCT, LAT, LON, SCALE, OFFSET, None, types::IMAGE_SIZE)
             .unwrap();
     (image, values)
@@ -334,7 +334,8 @@ fn l2_scan(gates: &[u8], velocity: bool) -> Scan {
 
 fn render_l2(gates: &[u8], product: types::RadarProduct) -> (Vec<u8>, Vec<f32>) {
     let scan = l2_scan(gates, product != types::RadarProduct::Reflectivity);
-    let (image, _, values) = render_radar_to_image(&scan, L2_ELEVATION, product, LAT, LON).unwrap();
+    let SweepRender { image, values, .. } =
+        render_radar_to_image(&scan, L2_ELEVATION, product, LAT, LON).unwrap();
     (image, values)
 }
 
@@ -490,7 +491,7 @@ fn nrot_sector(n_radials: usize, step_deg: f32) -> Scan {
 #[test]
 fn nrot_colour_comes_from_the_nrot_palette() {
     let scan = nrot_scan(360);
-    let (image, _, values) = render_radar_to_image(
+    let SweepRender { image, values, .. } = render_radar_to_image(
         &scan,
         L2_ELEVATION,
         types::RadarProduct::NormalizedRotation,
@@ -529,7 +530,7 @@ fn nrot_colour_comes_from_the_nrot_palette() {
 fn nrot_render_is_deterministic() {
     let scan = nrot_scan(360);
     let once = || {
-        let (image, _, values) = render_radar_to_image(
+        let SweepRender { image, values, .. } = render_radar_to_image(
             &scan,
             L2_ELEVATION,
             types::RadarProduct::NormalizedRotation,
@@ -574,7 +575,8 @@ fn nrot_render_is_deterministic() {
 #[test]
 fn a_sparse_sweep_leaves_holes_not_chord_triangles() {
     let scan = l2_sweep(&[200; 4], &[0.0, 90.0, 180.0, 270.0], 0.5, false);
-    let (_, _, values) = render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, LAT, LON).unwrap();
+    let SweepRender { values, .. } =
+        render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, LAT, LON).unwrap();
 
     assert_probes(
         &values,
@@ -624,7 +626,7 @@ fn an_out_of_order_sweep_still_paints() {
         let scan = l2_sweep(&g, &az, 1.0, false);
         render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, LAT, LON)
             .unwrap()
-            .2
+            .values
     };
 
     let up = render(true);
@@ -674,7 +676,7 @@ fn declared_spacing_drives_the_wedge_width() {
         let scan = l2_sweep(&[200; 180], &azimuths, declared, false);
         render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, LAT, LON)
             .unwrap()
-            .2
+            .values
     };
 
     let midpoints = [(1.0, 50.0), (3.0, 50.0), (181.0, 50.0)];
@@ -703,7 +705,8 @@ fn declared_spacing_drives_the_wedge_width() {
 fn a_lying_declaration_is_clamped_to_the_sweeps_median() {
     let azimuths: Vec<f32> = (0..=400).map(|i| i as f32 * 0.5).collect();
     let scan = l2_sweep(&vec![200; azimuths.len()], &azimuths, 45.0, false);
-    let (_, _, values) = render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, LAT, LON).unwrap();
+    let SweepRender { values, .. } =
+        render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, LAT, LON).unwrap();
 
     assert_probes(
         &values,
@@ -728,7 +731,8 @@ fn a_lying_declaration_is_clamped_to_the_sweeps_median() {
 #[test]
 fn a_sweep_with_no_declaration_is_capped_at_a_sane_wedge() {
     let scan = l2_sweep(&[200, 200], &[0.0, 10.0], 0.0, false);
-    let (_, _, values) = render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, LAT, LON).unwrap();
+    let SweepRender { values, .. } =
+        render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, LAT, LON).unwrap();
 
     assert_probes(
         &values,
@@ -876,8 +880,11 @@ fn painted_ranges_km(values: &[f32], extent_km: f64) -> Vec<f64> {
 fn a_tdwr_long_range_sweep_is_projected_at_its_own_reach() {
     const BEACON_KM: f64 = 400.2; // gate 1334's centre
     let scan = tdwr_long_range_sweep(BEACON_KM);
-    let (_, extent_km, values) =
-        render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, LAT, LON).unwrap();
+    let SweepRender {
+        max_range_km: extent_km,
+        values,
+        ..
+    } = render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, LAT, LON).unwrap();
 
     assert!(
         (extent_km - tdwr_ground_reach_km()).abs() < 1e-9,
@@ -1082,7 +1089,11 @@ fn a_45_degree_sweep_lands_at_the_same_ground_range_in_2d_and_3d() {
     let scan = tilted_beacon_sweep(ELEV, GATE_KM, 600, SLANT_KM, 2);
 
     // ── The plan view ──
-    let (_, extent_km, values) = render_radar_to_image(&scan, ELEV, PRODUCT, LAT, LON).unwrap();
+    let SweepRender {
+        max_range_km: extent_km,
+        values,
+        ..
+    } = render_radar_to_image(&scan, ELEV, PRODUCT, LAT, LON).unwrap();
     let px_per_km = types::IMAGE_SIZE as f64 / (2.0 * extent_km);
 
     assert!(
@@ -1158,7 +1169,11 @@ fn a_tdwr_steep_tilt_renders_at_half_its_slant_range() {
     const GATE_KM: f64 = 0.15;
     let scan = tilted_beacon_sweep(ELEV, GATE_KM, 592, SLANT_KM, 3);
 
-    let (_, extent_km, values) = render_radar_to_image(&scan, ELEV, PRODUCT, LAT, LON).unwrap();
+    let SweepRender {
+        max_range_km: extent_km,
+        values,
+        ..
+    } = render_radar_to_image(&scan, ELEV, PRODUCT, LAT, LON).unwrap();
     let (near, far, centre) = ring_bounds_km(&values, extent_km);
 
     assert!(
@@ -1187,7 +1202,10 @@ fn a_tdwr_steep_tilt_renders_at_half_its_slant_range() {
 fn a_frame_is_sized_by_the_ground_its_sweep_covers() {
     const ELEV: f32 = 0.2637;
     let scan = tilted_beacon_sweep(ELEV, TDWR_GATE_KM, TDWR_GATES, 400.2, TDWR_BEACON_GATES);
-    let (_, extent_km, _) = render_radar_to_image(&scan, ELEV, PRODUCT, LAT, LON).unwrap();
+    let SweepRender {
+        max_range_km: extent_km,
+        ..
+    } = render_radar_to_image(&scan, ELEV, PRODUCT, LAT, LON).unwrap();
 
     let expected = 417.0 * f64::from(ELEV).to_radians().cos();
     assert!(
@@ -1214,7 +1232,11 @@ fn a_low_tilt_beacon_moves_less_than_a_pixel() {
     const ELEV: f32 = 0.5;
     const SLANT_KM: f64 = 200.0;
     let scan = tilted_beacon_sweep(ELEV, 0.25, 900, SLANT_KM, 2);
-    let (_, extent_km, values) = render_radar_to_image(&scan, ELEV, PRODUCT, LAT, LON).unwrap();
+    let SweepRender {
+        max_range_km: extent_km,
+        values,
+        ..
+    } = render_radar_to_image(&scan, ELEV, PRODUCT, LAT, LON).unwrap();
 
     let (_, _, centre) = ring_bounds_km(&values, extent_km);
     let px_per_km = types::IMAGE_SIZE as f64 / (2.0 * extent_km);
@@ -1239,8 +1261,11 @@ fn a_low_tilt_beacon_moves_less_than_a_pixel() {
 fn a_sweep_inside_the_floor_is_drawn_at_the_floor() {
     let azimuths: Vec<f32> = (0..360).map(|i| i as f32).collect();
     let scan = l2_sweep(&[200; 360], &azimuths, 1.0, false);
-    let (_, extent_km, values) =
-        render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, LAT, LON).unwrap();
+    let SweepRender {
+        max_range_km: extent_km,
+        values,
+        ..
+    } = render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, LAT, LON).unwrap();
 
     assert_eq!(
         extent_km,
@@ -1286,8 +1311,11 @@ fn nothing_is_painted_outside_the_extent_a_render_declares() {
         ),
         (tdwr_long_range_sweep(400.2), "a 417 km TDWR cut"),
     ] {
-        let (_, extent_km, values) =
-            render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, LAT, LON).unwrap();
+        let SweepRender {
+            max_range_km: extent_km,
+            values,
+            ..
+        } = render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, LAT, LON).unwrap();
         let ranges = painted_ranges_km(&values, extent_km);
         assert!(!ranges.is_empty(), "{why} painted nothing");
 
@@ -1312,7 +1340,7 @@ fn nothing_is_painted_outside_the_extent_a_render_declares() {
 #[test]
 fn nrot_does_not_smear_past_its_sector() {
     let scan = nrot_sector(72, 0.5);
-    let (_, _, values) = render_radar_to_image(
+    let SweepRender { values, .. } = render_radar_to_image(
         &scan,
         L2_ELEVATION,
         types::RadarProduct::NormalizedRotation,
@@ -1528,7 +1556,10 @@ fn message_path_prefers_the_pdb_gate_spacing_over_the_packets() {
     const ICD_BINS: usize = 1200;
     const PACKET_BINS: usize = 460;
 
-    let (_, extent_km, _) = render_level3_message_to_image(
+    let SweepRender {
+        max_range_km: extent_km,
+        ..
+    } = render_level3_message_to_image(
         &message_with_lying_scale_factor(163, ICD_BINS),
         types::RadarProduct::SpecificDifferentialPhase,
         LAT,
@@ -1541,7 +1572,10 @@ fn message_path_prefers_the_pdb_gate_spacing_over_the_packets() {
              from {ICD_BINS} gates"
     );
 
-    let (_, extent_km, _) = render_level3_message_to_image(
+    let SweepRender {
+        max_range_km: extent_km,
+        ..
+    } = render_level3_message_to_image(
         &message_with_lying_scale_factor(94, PACKET_BINS),
         PRODUCT,
         LAT,
@@ -1897,31 +1931,31 @@ fn the_hybrid_classification_changes_with_the_environmental_heights() {
     let painted = |grid: &[f32]| grid.iter().filter(|v| !v.is_nan()).count();
     let all_of = |grid: &[f32], class: f32| grid.iter().filter(|v| **v == class).count();
 
-    let cells = painted(&defaults.2);
+    let cells = painted(&defaults.values);
     assert!(
         cells > 0,
         "the fixture painted nothing, so it proves nothing"
     );
     assert_eq!(
-        painted(&sounding.2),
+        painted(&sounding.values),
         cells,
         "both environments must classify the same disc — a difference in \
          *coverage* would confound the difference in class",
     );
     assert_eq!(
-        all_of(&defaults.2, RA),
+        all_of(&defaults.values, RA),
         cells,
         "with the adaptation defaults the melting layer sits above the beam \
          and the whole disc is rain",
     );
     assert_eq!(
-        all_of(&sounding.2, DS),
+        all_of(&sounding.values, DS),
         cells,
         "with the sounding's 0.8 km freezing level the beam climbs out of the \
          melting layer and the whole disc is dry snow",
     );
     assert_ne!(
-        defaults.0, sounding.0,
+        defaults.image, sounding.image,
         "and the rasterized pixels differ too, which is what a pane shows",
     );
 }
@@ -1951,8 +1985,17 @@ fn a_render_inside_the_floor_ignores_the_long_range_ceiling_entirely() {
     let azimuths: Vec<f32> = (0..360).map(|i| i as f32).collect();
     let scan = l2_sweep(&[200; 360], &azimuths, 1.0, false);
 
-    let base = render_radar_to_image_full(&scan, L2_ELEVATION, PRODUCT, LAT, LON, None, None)
-        .expect("the fixture renders");
+    let base = render_radar_to_image_full(
+        &scan,
+        L2_ELEVATION,
+        PRODUCT,
+        LAT,
+        LON,
+        None,
+        None,
+        &crate::nyquist::DeclaredNyquist::empty(),
+    )
+    .expect("the fixture renders");
     let offered = render_radar_to_image_full_sized(
         &scan,
         L2_ELEVATION,
@@ -1961,27 +2004,31 @@ fn a_render_inside_the_floor_ignores_the_long_range_ceiling_entirely() {
         LON,
         None,
         None,
+        &crate::nyquist::DeclaredNyquist::empty(),
         LONG_RANGE_SIDE,
     )
     .expect("the fixture renders at the long-range ceiling too");
 
     assert_eq!(
-        base.1, offered.1,
+        base.max_range_km, offered.max_range_km,
         "a 150 km sweep must project at the floor under either ceiling",
     );
     assert_eq!(
-        base.0.len(),
+        base.image.len(),
         types::IMAGE_SIZE * types::IMAGE_SIZE * 4,
         "the floor's raster is the base size",
     );
-    assert_eq!(base.0, offered.0, "the image moved under an unused ceiling");
+    assert_eq!(
+        base.image, offered.image,
+        "the image moved under an unused ceiling"
+    );
     // `NaN` is most of a value grid, and `NaN != NaN`, so the bits are what is
     // compared — a grid full of quiet NaNs would otherwise never be equal to
     // itself and this assertion would be vacuous.
     let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
     assert_eq!(
-        bits(&base.2),
-        bits(&offered.2),
+        bits(&base.values),
+        bits(&offered.values),
         "the value grid moved under an unused ceiling",
     );
 }
@@ -1997,7 +2044,12 @@ fn a_render_inside_the_floor_ignores_the_long_range_ceiling_entirely() {
 fn a_tdwr_long_range_sweep_takes_the_long_range_raster() {
     const BEACON_KM: f64 = 400.2; // gate 1334's centre
     let scan = tdwr_long_range_sweep(BEACON_KM);
-    let (image, extent_km, values) = render_radar_to_image_full_sized(
+    let SweepRender {
+        image,
+        max_range_km: extent_km,
+        values,
+        ..
+    } = render_radar_to_image_full_sized(
         &scan,
         L2_ELEVATION,
         PRODUCT,
@@ -2005,6 +2057,7 @@ fn a_tdwr_long_range_sweep_takes_the_long_range_raster() {
         LON,
         None,
         None,
+        &crate::nyquist::DeclaredNyquist::empty(),
         LONG_RANGE_SIDE,
     )
     .expect("the fixture renders");
@@ -2126,9 +2179,23 @@ fn the_long_range_raster_keeps_the_floors_km_per_pixel() {
 fn a_ceiling_under_the_base_size_renders_a_leaner_picture_of_the_same_ground() {
     const LEAN: usize = 1024;
     let scan = tdwr_long_range_sweep(400.2);
-    let (image, extent_km, values) =
-        render_radar_to_image_full_sized(&scan, L2_ELEVATION, PRODUCT, LAT, LON, None, None, LEAN)
-            .expect("the fixture renders");
+    let SweepRender {
+        image,
+        max_range_km: extent_km,
+        values,
+        ..
+    } = render_radar_to_image_full_sized(
+        &scan,
+        L2_ELEVATION,
+        PRODUCT,
+        LAT,
+        LON,
+        None,
+        None,
+        &crate::nyquist::DeclaredNyquist::empty(),
+        LEAN,
+    )
+    .expect("the fixture renders");
 
     assert_eq!(image.len(), LEAN * LEAN * 4);
     assert_eq!(values.len(), LEAN * LEAN);

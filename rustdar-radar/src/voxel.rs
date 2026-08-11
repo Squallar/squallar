@@ -1564,7 +1564,6 @@ pub fn build_voxels_with_motion<'a>(
     storm_motion_override: Option<(f32, f32)>,
 ) -> Option<VoxelGrid> {
     let volume = volume.into();
-    let scan = volume.scan();
     let shape = req.shape;
     if !shape.is_supported() {
         log::warn!(
@@ -1600,10 +1599,13 @@ pub fn build_voxels_with_motion<'a>(
     // here, before anything samples, so a raw volume can never be resampled
     // under a derived label.
     let slot = crate::derive::volume_slot(req.product)?;
-    let prepared = crate::derive::prepare(scan, req.product, storm_motion_override)?;
+    let prepared = crate::derive::prepare(volume, req.product, storm_motion_override)?;
     // The declared Nyquist table follows the scan through the derivation: it
     // is keyed by elevation number, which `prepare` preserves, and a derived
-    // scan's rungs are the same cuts flown at the same PRFs.
+    // scan's rungs are the same cuts flown at the same PRFs. `prepare` reads
+    // the same table on the way in — SRV and NROT unfold around the limit each
+    // cut declared — so the field that arrives here was built against the
+    // limits this sampler is about to guard on.
     let declared = volume.declared_nyquist();
     let sampler = match &prepared {
         crate::derive::Prepared::Native(scan) => {

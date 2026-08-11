@@ -356,7 +356,7 @@ fn the_display_dealias_keeps_isolated_pockets_the_nrot_posture_drops() {
         })
         .collect();
 
-    let grid = dealiased_grid(&radials, 0.5, None).expect("velocity present");
+    let grid = dealiased_grid(&radials, 0.5, None, None).expect("velocity present");
     assert!(
         (grid.values[30][37] - 20.0).abs() < 1e-6,
         "Coverage keeps the unreached pocket: {}",
@@ -399,7 +399,7 @@ fn compute_srv_derives_a_full_sweep() {
         direction_deg: 0.0,
         source: StormMotionSource::UserOverride,
     };
-    let grid = compute_srv_grid(&radials, 0.5, None, &motion).expect("velocity present");
+    let grid = compute_srv_grid(&radials, 0.5, None, &motion, None).expect("velocity present");
     assert_eq!(grid.gate_count, 40);
     assert!((grid.first_gate_range_km - 2.125).abs() < 1e-9);
     assert!((grid.gate_interval_km - 0.25).abs() < 1e-9);

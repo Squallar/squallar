@@ -135,34 +135,54 @@ fn codec(product: RadarProduct) -> (f32, f32) {
     }
 }
 
-/// Prepare `scan` for sampling under `product`: pass a native moment through,
+/// Prepare a volume for sampling under `product`: pass a native moment through,
 /// derive a derived one, refuse (`None`) what cannot be derived — a product
 /// with no per-tilt field, a volume without the source moment, or SRV with no
 /// storm motion vector from either the user or the volume's own wind fit.
 ///
+/// A [`crate::nyquist::Volume`] and not a bare `Scan`, for the reason that type
+/// exists: SRV and NROT both **dealias**, and the limit they fold around is the
+/// one each cut declared, which the model type drops. Both callers
+/// ([`crate::xsect::render_section`] and [`crate::voxel::build_voxels`]) already
+/// hold the pairing — they pass it straight on to the sampler — so this asks
+/// for what they have rather than for the half of it that would silently make
+/// the vertical views dealias on different limits from the guard that samples
+/// them.
+///
 /// `storm_motion_override` is the user's `(speed_kt, direction_from_deg)`
 /// vector, read only by SRV — the same pair the plan-view SRV path carries.
 pub fn prepare<'s>(
-    scan: &'s Scan,
+    volume: crate::nyquist::Volume<'s>,
     product: RadarProduct,
     storm_motion_override: Option<(f32, f32)>,
 ) -> Option<Prepared<'s>> {
     if crate::sampler::samplable(product).is_some() {
-        return Some(Prepared::Native(scan));
+        return Some(Prepared::Native(volume.scan()));
     }
     let derived = match product {
-        RadarProduct::StormRelativeVelocity => derive_srv(scan, storm_motion_override)?,
-        RadarProduct::NormalizedRotation => derive_nrot(scan)?,
-        RadarProduct::SpecificDifferentialPhase => derive_kdp(scan)?,
+        RadarProduct::StormRelativeVelocity => derive_srv(volume, storm_motion_override)?,
+        RadarProduct::NormalizedRotation => derive_nrot(volume)?,
+        RadarProduct::SpecificDifferentialPhase => derive_kdp(volume.scan())?,
         _ => return None,
     };
     Some(Prepared::Derived(Box::new(derived)))
 }
 
-/// Every velocity-carrying sweep of `scan` with its decoded grid, in scan
-/// order — the shared walk SRV and NROT derive over.
-fn velocity_sweeps(scan: &Scan) -> Vec<(&Sweep, f64, srv::VelocityGrid)> {
-    scan.sweeps()
+/// Every velocity-carrying sweep of the volume with its decoded grid and the
+/// fold limit its cut declared, in scan order — the shared walk SRV and NROT
+/// derive over.
+///
+/// The declaration is looked up here, by `elevation_number`, because that is
+/// the key [`crate::nyquist::DeclaredNyquist`] is written under and the one
+/// thing about a sweep that survives every hop the table takes. `None` for a
+/// cut the volume did not name, which both derivations pass on to the
+/// dealiaser as "estimate it".
+fn velocity_sweeps(
+    volume: crate::nyquist::Volume<'_>,
+) -> Vec<(&Sweep, f64, srv::VelocityGrid, Option<f64>)> {
+    volume
+        .scan()
+        .sweeps()
         .iter()
         .filter_map(|sweep| {
             let radials = sweep.radials();
@@ -171,12 +191,21 @@ fn velocity_sweeps(scan: &Scan) -> Vec<(&Sweep, f64, srv::VelocityGrid)> {
                 return None;
             }
             let grid = srv::velocity_grid(radials)?;
-            Some((sweep, f64::from(first.elevation_angle_degrees()), grid))
+            Some((
+                sweep,
+                f64::from(first.elevation_angle_degrees()),
+                grid,
+                volume.declared_nyquist().get(sweep.elevation_number()),
+            ))
         })
         .collect()
 }
 
-fn derive_srv(scan: &Scan, storm_motion_override: Option<(f32, f32)>) -> Option<Scan> {
+fn derive_srv(
+    volume: crate::nyquist::Volume<'_>,
+    storm_motion_override: Option<(f32, f32)>,
+) -> Option<Scan> {
+    let scan = volume.scan();
     let profile = srv::volume_wind_profile(scan);
     let user = storm_motion_override.and_then(|(speed_kt, direction_deg)| {
         srv::SrvMotion::user_override(speed_kt, direction_deg)
@@ -191,11 +220,16 @@ fn derive_srv(scan: &Scan, storm_motion_override: Option<(f32, f32)>) -> Option<
         return None;
     };
 
-    let sweeps: Vec<Sweep> = velocity_sweeps(scan)
+    let sweeps: Vec<Sweep> = velocity_sweeps(volume)
         .into_iter()
-        .filter_map(|(sweep, elevation_deg, _)| {
-            let grid =
-                srv::compute_srv_grid(sweep.radials(), elevation_deg, profile.as_ref(), &motion)?;
+        .filter_map(|(sweep, elevation_deg, _, declared_nyquist_ms)| {
+            let grid = srv::compute_srv_grid(
+                sweep.radials(),
+                elevation_deg,
+                profile.as_ref(),
+                &motion,
+                declared_nyquist_ms,
+            )?;
             Some(synth_sweep(
                 sweep,
                 &grid.values,
@@ -209,11 +243,12 @@ fn derive_srv(scan: &Scan, storm_motion_override: Option<(f32, f32)>) -> Option<
     non_empty_scan(scan, sweeps)
 }
 
-fn derive_nrot(scan: &Scan) -> Option<Scan> {
+fn derive_nrot(volume: crate::nyquist::Volume<'_>) -> Option<Scan> {
+    let scan = volume.scan();
     let profile = srv::volume_wind_profile(scan);
-    let sweeps: Vec<Sweep> = velocity_sweeps(scan)
+    let sweeps: Vec<Sweep> = velocity_sweeps(volume)
         .into_iter()
-        .map(|(sweep, elevation_deg, grid)| {
+        .map(|(sweep, elevation_deg, grid, declared_nyquist_ms)| {
             let values = nrot::compute_nrot_grid_with_profile(
                 &nrot::VelocitySweep {
                     vel_grid: &grid.values,
@@ -221,6 +256,7 @@ fn derive_nrot(scan: &Scan) -> Option<Scan> {
                     gate_count: grid.gate_count,
                     first_gate_range_km: grid.first_gate_range_km,
                     gate_interval_km: grid.gate_interval_km,
+                    declared_nyquist_ms,
                 },
                 elevation_deg,
                 profile.as_ref(),
