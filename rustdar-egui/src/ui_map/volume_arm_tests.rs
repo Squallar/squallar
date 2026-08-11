@@ -1548,3 +1548,70 @@ fn the_reset_returns_the_pivot_as_well_as_the_angles_and_keeps_the_view_mode() {
          be lost — flipping it back would un-choose something the user chose",
     );
 }
+
+/// **The box a 3D pane resamples is its own viewport, through the real render
+/// arm.**
+///
+/// The end-to-end half of `ui_region`'s unit tests: those measure the
+/// derivation, this measures that the pane *uses* it. Between them sits the
+/// whole arm — the floor strip, the `mem::take`n pane, the publish onto
+/// `VolumePane::viewport_box` — and the failure this catches is a derivation
+/// that is perfectly correct and wired to nothing, which is what a pane looked
+/// like for one iteration of this change.
+///
+/// Zooming is asserted to *move* the box, not merely to produce one. A pane
+/// that answered the same 460 km whatever its viewport showed is exactly the
+/// state before this change, and it is the state in which a zoomed-in pane
+/// stands its volume on a floor that stops a quarter of the way across.
+#[test]
+fn a_3d_panes_box_follows_its_own_viewport() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.load_scan("KTLX");
+    h.make_pane_volume(0);
+    h.warm_up();
+
+    let box_at = |h: &mut InputHarness| {
+        h.gui_mut()
+            .pane(0)
+            .expect("pane 0")
+            .volume()
+            .expect("a pane in the 3D render mode")
+            .viewport_box
+            .expect("the arm must publish the box it measured")
+            .half_width_km()
+    };
+
+    // Wide open: the viewport shows more ground than the resampler will
+    // honour, so the box stops at its ceiling — the whole scan, cropping
+    // nothing, which is what a pane that has not been aimed should show.
+    let wide = box_at(&mut h);
+    assert_eq!(
+        wide,
+        rustdar_radar::voxel::MAX_HALF_WIDTH_KM,
+        "a pane at the default zoom sees past the resampler's ceiling, so its \
+         box must sit on it",
+    );
+
+    // Zoomed in, the way a user frames a storm.
+    h.gui_mut()
+        .pane_mut(0)
+        .expect("pane 0")
+        .map_memory
+        .set_zoom(11.0)
+        .expect("11 is inside walkers' range");
+    h.warm_up();
+
+    let tight = box_at(&mut h);
+    assert!(
+        tight < wide,
+        "zooming the pane in must tighten its box: {tight} km against {wide} km. \
+         A box that ignores the viewport is one the pane's own floor cannot cover.",
+    );
+    // Not merely smaller — small enough that the grid's fixed cell count buys
+    // real detail, which is the entire reason a region control ever existed.
+    assert!(
+        tight < 0.25 * wide,
+        "four zoom steps bought only {tight} km against {wide} km; the box is \
+         not tracking the viewport, it is being nudged by something else",
+    );
+}
