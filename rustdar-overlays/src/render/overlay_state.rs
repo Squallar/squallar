@@ -385,6 +385,22 @@ pub struct OverlayRegistry {
     /// Populated by map clicks; paged through in the popup.
     pub selected_overlays: Vec<Arc<dyn OverlayItem>>,
     pub selected_overlay_page: usize,
+    /// The config value each handler was last loaded from, for the handlers
+    /// whose state has not moved since — the dirty half of
+    /// [`load_pane_configs`], which every pane calls on every frame.
+    ///
+    /// An entry means "this handler holds exactly what deserializing that
+    /// value would give it", so the load is a no-op and can be skipped. Every
+    /// route that can move a handler's state removes its entry
+    /// ([`forget_loaded_config`]), so the skip is only ever taken where
+    /// re-deserializing would have changed nothing — the reload discipline
+    /// (`Gui::write_pane_overlay`: a change that never reached the config is
+    /// undone next frame) is preserved exactly, because a change that *did*
+    /// happen always cleared its entry first.
+    ///
+    /// [`load_pane_configs`]: OverlayRegistry::load_pane_configs
+    /// [`forget_loaded_config`]: OverlayRegistry::forget_loaded_config
+    loaded_configs: std::collections::HashMap<OverlayKind, serde_json::Value>,
 }
 
 impl Default for OverlayRegistry {
@@ -393,6 +409,7 @@ impl Default for OverlayRegistry {
             handlers: super::handlers::create_handlers(),
             selected_overlays: Vec::new(),
             selected_overlay_page: 0,
+            loaded_configs: std::collections::HashMap::new(),
         }
     }
 }
@@ -406,12 +423,25 @@ impl OverlayRegistry {
     }
 
     fn handler_mut(&mut self, kind: OverlayKind) -> Option<&mut dyn OverlayHandler> {
+        self.forget_loaded_config(kind);
         for handler in &mut self.handlers {
             if handler.kind() == kind {
                 return Some(&mut **handler);
             }
         }
         None
+    }
+
+    /// Drop `kind`'s "already loaded" note, so the next
+    /// [`load_pane_configs`](OverlayRegistry::load_pane_configs) re-applies
+    /// its config rather than skipping it.
+    ///
+    /// Called from the one place every mutable handler borrow comes through
+    /// ([`handler_mut`](OverlayRegistry::handler_mut)), so it cannot be
+    /// forgotten by a new mutator: whatever a caller does with the borrow, the
+    /// note is already gone.
+    fn forget_loaded_config(&mut self, kind: OverlayKind) {
+        self.loaded_configs.remove(&kind);
     }
 
     pub fn handlers(&self) -> impl Iterator<Item = &dyn OverlayHandler> {
@@ -539,6 +569,14 @@ impl OverlayRegistry {
     /// Re-runs `retain_selections` afterwards, since the data just changed.
     pub fn apply_fetch_result(&mut self, result: OverlayFetchResult) {
         let kind = result.kind;
+        // The one mutation route that reaches a handler without going through
+        // `handler_mut` — it indexes, so that `retain_selections` can borrow
+        // `selected_overlays` beside it. No shipped handler's
+        // `apply_fetch_result` moves what `serialize_state` reports, so this
+        // is belt-and-braces rather than a fix for a live bug; it is here so
+        // "a handler's state moved ⇒ its note is gone" holds by construction
+        // instead of by auditing twelve `apply_fetch_result` bodies.
+        self.forget_loaded_config(kind);
         if let Some(idx) = self.handlers.iter().position(|h| h.kind() == kind) {
             self.handlers[idx].apply_fetch_result(result.data);
             self.handlers[idx].retain_selections(&mut self.selected_overlays);
@@ -607,14 +645,35 @@ impl OverlayRegistry {
     }
 
     /// Handlers absent from `configs` keep their current state.
+    ///
+    /// Every map pane calls this on every frame, for all twelve handlers, so
+    /// the body has to be free when nothing changed: it used to deep-clone a
+    /// `serde_json::Value` per handler and hand it to `deserialize_state`,
+    /// which for two of them cloned again and rebuilt a `HashSet` through
+    /// `serde_json::from_value` — config-changed-only work running at frame
+    /// rate. A handler still holding what a value would give it is skipped by
+    /// comparing against [`loaded_configs`], which allocates nothing.
+    ///
+    /// [`loaded_configs`]: OverlayRegistry::loaded_configs
     pub fn load_pane_configs(
         &mut self,
         configs: &std::collections::HashMap<OverlayKind, serde_json::Value>,
     ) {
-        for h in &mut self.handlers {
-            if let Some(val) = configs.get(&h.kind()) {
-                h.deserialize_state(val.clone());
+        let Self {
+            handlers,
+            loaded_configs,
+            ..
+        } = self;
+        for h in handlers {
+            let kind = h.kind();
+            let Some(val) = configs.get(&kind) else {
+                continue;
+            };
+            if loaded_configs.get(&kind).is_some_and(|seen| seen == val) {
+                continue;
             }
+            h.deserialize_state(val.clone());
+            loaded_configs.insert(kind, val.clone());
         }
     }
 
@@ -670,6 +729,9 @@ impl OverlayRegistry {
         &mut self,
         states: &serde_json::Map<String, serde_json::Value>,
     ) {
+        // A second source of handler state: whatever a pane config last put
+        // there is no longer what the handlers hold.
+        self.loaded_configs.clear();
         for h in &mut self.handlers {
             let key = format!("{:?}", h.kind());
             if let Some(val) = states.get(&key) {
@@ -777,6 +839,112 @@ pub struct PopupAction {
 pub enum PopupActionKind {
     /// NWS alerts only.
     HideFromMap,
+}
+
+#[cfg(test)]
+mod pane_config_tests {
+    use super::*;
+
+    /// The pane config for "MDs off, everything else as built".
+    fn mds_off(registry: &mut OverlayRegistry) -> std::collections::HashMap<OverlayKind, Value> {
+        registry.set_enabled(OverlayKind::SpcDiscussions, false);
+        let configs = registry.save_pane_configs();
+        registry.set_enabled(OverlayKind::SpcDiscussions, true);
+        configs
+    }
+
+    use serde_json::Value;
+
+    /// A load applies, and a second load of the same map leaves the same
+    /// answer — the skip is not allowed to be visible.
+    #[test]
+    fn loading_a_config_twice_lands_where_loading_it_once_did() {
+        let mut registry = OverlayRegistry::default();
+        let configs = mds_off(&mut registry);
+        assert!(
+            registry.is_enabled(OverlayKind::SpcDiscussions),
+            "fixture: the handler is on, so the config has something to do",
+        );
+
+        registry.load_pane_configs(&configs);
+        assert!(
+            !registry.is_enabled(OverlayKind::SpcDiscussions),
+            "the first load must apply the config",
+        );
+
+        // The frame-rate case: the same map, again, with nothing having
+        // happened in between.
+        registry.load_pane_configs(&configs);
+        assert!(
+            !registry.is_enabled(OverlayKind::SpcDiscussions),
+            "a repeat load changed the answer",
+        );
+    }
+
+    /// The reload discipline survives the skip: a handler change that never
+    /// reached the config is still undone by the next load.
+    ///
+    /// This is the one thing the "already loaded" note could have broken —
+    /// skip a load whose handler has since moved and the change sticks
+    /// forever, which is precisely the bug `Gui::write_pane_overlay`'s
+    /// both-halves rule exists to prevent. Every mutable handler borrow drops
+    /// the note, so there is no route to a stale skip; the two below are the
+    /// routes the app actually takes.
+    #[test]
+    fn a_handler_change_outside_the_config_is_still_undone_by_the_next_load() {
+        let mut registry = OverlayRegistry::default();
+        let configs = mds_off(&mut registry);
+        registry.load_pane_configs(&configs);
+        assert!(!registry.is_enabled(OverlayKind::SpcDiscussions));
+
+        // Route 1: the registry's own setter — the layer-stack eye's half
+        // that forgot to write the config.
+        registry.set_enabled(OverlayKind::SpcDiscussions, true);
+        registry.load_pane_configs(&configs);
+        assert!(
+            !registry.is_enabled(OverlayKind::SpcDiscussions),
+            "a `set_enabled` that never reached the config survived the \
+             reload — the skip went stale",
+        );
+
+        // Route 2: a raw mutable handler borrow, which anything may take and
+        // do anything with.
+        registry
+            .get_handler_mut(OverlayKind::SpcDiscussions)
+            .expect("the MD handler is registered")
+            .set_enabled(true);
+        registry.load_pane_configs(&configs);
+        assert!(
+            !registry.is_enabled(OverlayKind::SpcDiscussions),
+            "a change made through `get_handler_mut` survived the reload",
+        );
+    }
+
+    /// Two panes with different configs both get theirs, in either order —
+    /// the note is per handler and per value, not "the last map I saw".
+    #[test]
+    fn alternating_two_panes_configs_gives_each_pane_its_own() {
+        let mut registry = OverlayRegistry::default();
+        let off = mds_off(&mut registry);
+        let on = registry.save_pane_configs();
+        assert!(
+            registry.is_enabled(OverlayKind::SpcDiscussions),
+            "fixture: the two configs differ",
+        );
+
+        for _ in 0..3 {
+            registry.load_pane_configs(&off);
+            assert!(
+                !registry.is_enabled(OverlayKind::SpcDiscussions),
+                "the off pane did not get its config",
+            );
+            registry.load_pane_configs(&on);
+            assert!(
+                registry.is_enabled(OverlayKind::SpcDiscussions),
+                "the on pane did not get its config",
+            );
+        }
+    }
 }
 
 #[cfg(test)]
