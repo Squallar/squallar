@@ -99,9 +99,35 @@ reqwest = { version = "=0.13.4", default-features = false, features = [
 
 rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std"] }
 
-# Only optimize dependencies (not workspace code) to preserve debuggability
+# File and line in every frame, and nothing beyond it. A backtrace, a panic
+# location and a `#[track_caller]` frame are all line-table lookups, so each
+# one still names a source position exactly as before; what leaves is the
+# variable and type description, which is only read by a debugger somebody has
+# attached on purpose.
+#
+# Not a rounding error, and the reason this is worth a setting:
+# `target/debug/rustdar-platform` was 604,417,120 bytes, of which 538,194,467
+# was DWARF and 25,730,465 was `.text`. Nine tenths of the file described a
+# program that is one twentieth of it. With line tables the same binary is
+# 234,889,824 bytes.
+[profile.dev]
+debug = "line-tables-only"
+
+# Only optimize dependencies (not workspace code) to preserve debuggability.
+# Stepping through this workspace's own crates has to keep working; nobody
+# debugs a dev build by stepping into wgpu.
+#
+# `2` and not `"s"`, because that sentence says debuggability and says nothing
+# about size. `"s"` asks LLVM to give up speed for bytes — a trade this
+# override was never making, since a dependency here is compiled to be *run*
+# during development and `target/` is under no size budget. `2` is the same
+# pass pipeline at the inlining and vectorization thresholds that make it fast.
+# It is not a compile-time regression either: with both settings in place a
+# cold dev build of `rustdar-platform` — all 449 crates — went 44.6 s to 38.4 s,
+# because the debug info that no longer has to be emitted and linked costs more
+# than the extra optimization does.
 [profile.dev.package."*"]
-opt-level = "s"
+opt-level = 2
 
 [profile.release]
 strip = true
