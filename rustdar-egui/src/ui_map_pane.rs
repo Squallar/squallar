@@ -2303,7 +2303,10 @@ mod tests {
         // one's walk, at the same place.
         let before = walked(seeded.rows());
         let after = walked(bigger.rows());
-        assert!(!before.is_empty(), "the seed must produce some visible sites");
+        assert!(
+            !before.is_empty(),
+            "the seed must produce some visible sites"
+        );
         for (old, new) in before.iter().zip(after.iter()) {
             assert_eq!(
                 old.site.name, new.site.name,

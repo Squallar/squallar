@@ -2839,11 +2839,7 @@ mod nearest_tests {
     fn a_repeated_identifier_files_one_row() {
         let table = build_table([(UNSEEDED, REMOTE), (UNSEEDED, REMOTE)]);
         assert_eq!(
-            table
-                .rows()
-                .iter()
-                .filter(|r| r.name == UNSEEDED)
-                .count(),
+            table.rows().iter().filter(|r| r.name == UNSEEDED).count(),
             1,
         );
     }

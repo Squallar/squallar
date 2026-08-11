@@ -2846,7 +2846,9 @@ fn a_learned_radar_the_seed_never_had_is_in_the_table_before_the_first_frame() {
     assert_eq!(row.name, SITE, "it carries its own ICAO, not UNKNOWN");
     assert_eq!((row.lat, row.lon), (-34.0, -144.0));
     assert!(
-        rustdar_radar::sites::radars().iter().any(|r| r.name == SITE),
+        rustdar_radar::sites::radars()
+            .iter()
+            .any(|r| r.name == SITE),
         "and the walk the map and the site list both do reaches it",
     );
 }
