@@ -169,8 +169,6 @@ pub(crate) struct TopBarProbe {
     pub layers_toggle: (egui::Rect, bool),
     /// The largest pane count offered *enabled* at this width.
     pub pane_count_max: usize,
-    /// The Region arm toggle, and whether it read as armed.
-    pub region_arm: (egui::Rect, bool),
     /// The X-sec arm toggle, and whether it read as armed.
     pub section_arm: (egui::Rect, bool),
     /// The ⚙ Inspector toggle, and whether it read as open.
@@ -194,7 +192,6 @@ impl Default for TopBarProbe {
             menu_button: egui::Rect::NOTHING,
             layers_toggle: (egui::Rect::NOTHING, false),
             pane_count_max: 0,
-            region_arm: (egui::Rect::NOTHING, false),
             section_arm: (egui::Rect::NOTHING, false),
             inspector_toggle: (egui::Rect::NOTHING, false),
             scan_text: String::new(),
@@ -210,7 +207,7 @@ impl Default for TopBarProbe {
 /// `render_panes`' single kind branch, so a test reading it back proves nothing
 /// about the branch: a mis-wired arm, or an arm reading the kind off the
 /// `mem::take`n slot instead of the taken value, agrees with it perfectly. Each
-/// arm writes its own kind as a literal, so what this reports is the arm that
+/// arm writes its own view as a literal, so what this reports is the arm that
 /// actually drew — the one thing a wrong branch cannot fake.
 ///
 /// The rect comes along because "which arm ran" and "where it drew" are the two
@@ -220,8 +217,13 @@ impl Default for TopBarProbe {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PaneContentProbe {
     pub pane_idx: usize,
-    /// The kind the arm that ran is *for*, written by that arm.
-    pub kind: crate::pane::PaneKind,
+    /// The view the arm that ran is *for*, written by that arm.
+    ///
+    /// A `RenderView` rather than a `PaneKind`, because the branch it reports
+    /// on is a three-way one and two of the three are the same pane kind: a
+    /// probe in the vocabulary of kinds could not tell a plan-view arm from a
+    /// volume arm, which is exactly the mis-wiring it exists to catch.
+    pub view: rustdar_radar::types::RenderView,
     pub rect: egui::Rect,
 }
 
@@ -722,7 +724,7 @@ pub struct Gui {
     /// fact work today. The inspector's kind segmented control, though, runs
     /// from *inside* the shell's take, where the same direct write is
     /// silently discarded — which is why every kind writer goes through
-    /// [`Self::request_pane_kind`], one rule for all of them.
+    /// [`Self::request_pane_view`], one rule for all of them.
     ///
     /// It is the right shape for one reason more. The writers WP-G adds — an
     /// armed section drag resolving to a line, and the retarget rule that
@@ -731,7 +733,7 @@ pub struct Gui {
     /// needs is the same one the pane count needs: growing it mid-loop moves
     /// the rects of panes the loop has not reached, desynchronising them from
     /// the ones `detect_active_pane_click` hit-tested this frame. One
-    /// deferral point, applied at [`Self::apply_pending_pane_kind`] after the
+    /// deferral point, applied at [`Self::apply_pending_pane_view`] after the
     /// pane loop, serves both.
     ///
     /// The cost is one frame of latency in the current path: the dispatcher records
@@ -747,37 +749,14 @@ pub struct Gui {
     /// `a_pane_kind_request_survives_the_pane_being_held_out_of_the_vector`, which
     /// builds the take window by hand precisely because no production caller
     /// currently provides one.
-    pending_pane_kind: Option<(PaneId, crate::pane::PaneKind)>,
-    /// Whether the "pick a 3D region" mode is armed.
     ///
-    /// While it is, a drag on a map pane draws the box a 3D pane resamples
-    /// instead of panning the map — see `ui_region`. A successful commit
-    /// disarms it ([`Self::apply_pending_region`]), exactly as the section draw
-    /// disarms on drawing its line: the mode's job is done, and leaving it on
-    /// would turn the next pan into a second box. A discarded mis-drag leaves
-    /// it armed — a stray tap must not silently throw away the intent the user
-    /// just expressed — and the menu it was armed from can always turn it off.
-    /// [`Self::dismiss_top_layer`] also cancels it, so Escape and Android's back
-    /// button mean here what they mean everywhere else — the same layer the
-    /// cross-section draw sits on, and for the same reason.
-    ///
-    /// **Never on at the same time as [`section_draw_armed`](Self::section_draw_armed).**
-    /// Both are armed modal drags on a map pane, and one drag cannot be two
-    /// gestures — see [`Self::set_region_arm`].
-    region_arm: bool,
-    /// The region drag in flight, if any.
-    ///
-    /// Here rather than on the pane because it is a property of the gesture. It
-    /// is written from inside `Map::show`, which is the only place a `Projector`
-    /// exists and therefore the only place a pointer position can be turned into
-    /// the ground it is over.
-    region_drag: Option<crate::ui_region::RegionDrag>,
-    /// A committed region waiting for the pane loop to end.
-    ///
-    /// The same deferral, and the same reason, as
-    /// [`pending_pane_kind`](Self::pending_pane_kind): applying it can grow the
-    /// pane count, which changes `pane_rect` for every pane not yet drawn.
-    pending_region: Option<crate::ui_region::PendingRegion>,
+    /// A [`RenderView`](rustdar_radar::types::RenderView) rather than a
+    /// `PaneKind`, because what the user picks from the pane menu is a
+    /// *picture*: plan view, 3D volume, cross-section. Two of those three are
+    /// the same kind of pane in different render modes, so a kind alone could
+    /// not carry the request — and a pair of `(kind, Option<render>)` would make
+    /// "cross-section in the volume render mode" expressible for no reason.
+    pending_pane_view: Option<(PaneId, rustdar_radar::types::RenderView)>,
     /// Whether the cross-section draw is **armed**: the next drag on a map pane
     /// is a section line rather than a pan.
     ///
@@ -794,9 +773,12 @@ pub struct Gui {
     /// was turned on; and [`Self::dismiss_top_layer`] cancels it, so Escape and
     /// Android's back button both mean what they mean everywhere else.
     ///
-    /// **Never on at the same time as [`region_arm`](Self::region_arm).** Both
-    /// are armed modal drags on a map pane, and one drag cannot be two gestures —
-    /// see [`Self::set_section_draw_armed`].
+    /// The only armed modal drag left on a map pane. It had a sibling — a
+    /// "pick a 3D region" mode whose drag drew the box a 3D pane resampled —
+    /// and the two had to be kept mutually exclusive, because one press cannot
+    /// be two gestures. That mode is gone: a 3D view's box is now the pane's
+    /// own viewport, so there is nothing left to aim and nothing left to
+    /// exclude.
     section_draw_armed: bool,
     /// The in-flight draw: where it started, on which pane, and where the
     /// pointer is now.
@@ -804,7 +786,7 @@ pub struct Gui {
     /// A finished line and the map pane it was drawn on, applied **after** the
     /// pane loop.
     ///
-    /// Deferred for the reason [`pending_pane_kind`](Self::pending_pane_kind) is,
+    /// Deferred for the reason [`pending_pane_view`](Self::pending_pane_view) is,
     /// and one reason more that is specific to this writer. Applying a line can
     /// *grow the pane count*, and `PaneLayout::pane_rect` is a function of it —
     /// so a mid-loop growth silently moves the rects of every pane the loop has
@@ -842,7 +824,7 @@ pub struct Gui {
     /// **after** the pane loop.
     ///
     /// Deferred for the reason every pending is
-    /// ([`pending_pane_kind`](Self::pending_pane_kind)): the drop is recorded
+    /// ([`pending_pane_view`](Self::pending_pane_view)): the drop is recorded
     /// from inside `Map::show`, in the window where the map pane is
     /// `mem::take`n out of the vector. Unlike
     /// [`pending_section_line`](Self::pending_section_line) this can never grow
@@ -1340,10 +1322,10 @@ pub(crate) const SECTION_SIDEBAR_HEADER: &str = "\u{2215}  Cross-section";
 /// active slot in `self.panes` holds a `mem::take` placeholder that reads as
 /// a map pane on the default site.
 fn render_pane_identity(ui: &mut egui::Ui, pane: &PaneState) {
-    let kind = match pane.kind() {
-        crate::pane::PaneKind::Map => "Map",
-        crate::pane::PaneKind::CrossSection => "Cross-section",
-        crate::pane::PaneKind::Volume => "3D volume",
+    let kind = match pane.render_view() {
+        rustdar_radar::types::RenderView::PlanView => "Map",
+        rustdar_radar::types::RenderView::CrossSection => "Cross-section",
+        rustdar_radar::types::RenderView::Volume => "3D volume",
     };
     ui.label(egui::RichText::new(format!("{} - {}", pane.site, kind)).strong());
 }
@@ -1640,10 +1622,7 @@ impl Gui {
             last_popup_triggered: Vec::new(),
             #[cfg(test)]
             last_popup_handled: Vec::new(),
-            pending_pane_kind: None,
-            region_arm: false,
-            region_drag: None,
-            pending_region: None,
+            pending_pane_view: None,
             section_draw_armed: false,
             section_anchor: None,
             pending_section_line: None,
@@ -1832,10 +1811,10 @@ impl Gui {
         actions.extend(self.render_panes(&mut root_ui, &shell.excluded_rects));
 
         // After the pane loop, and therefore after every `mem::take` window in
-        // the frame has closed. See the `pending_pane_kind` field for why
+        // the frame has closed. See the `pending_pane_view` field for why
         // converting a pane cannot be a direct write from the dispatcher that
         // asked for it.
-        self.apply_pending_pane_kind(&mut actions);
+        self.apply_pending_pane_view(&mut actions);
         // Same window, and one thing more: this can grow `pane_count`, which
         // moves `pane_rect` for every pane. Inside the loop that would leave the
         // panes drawn after it hit-tested against rects they are no longer in.
@@ -1867,7 +1846,6 @@ impl Gui {
         // `two_appliers_never_both_have_something_to_apply`, which drives the two
         // toggles rather than writing the flags, because the invariant belongs to
         // the arming rule rather than to this call order.
-        self.apply_pending_region();
 
         // The fade toggle, after the appliers like every other loop-recorded
         // intent: it needs the pane loop's final consumption verdict, and the
@@ -2363,17 +2341,8 @@ impl Gui {
         // what stops the back button from exiting the app while a mode is on,
         // which is the reading of a back press least likely to be what was meant.
         //
-        // **One layer for both modes, not two.** They are mutually exclusive (see
-        // `Gui::set_region_arm`), so at most one of these ever fires and giving
-        // them separate layers would only invite a reader to wonder which order
-        // they are in. A back press cancels whichever armed drag is on, and there
-        // is never more than one.
         if self.section_draw_armed {
             self.set_section_draw_armed(false);
-            return true;
-        }
-        if self.region_arm {
-            self.set_region_arm(false);
             return true;
         }
         false
@@ -2574,10 +2543,11 @@ impl Gui {
             return;
         }
         // A whole-volume pane has no tilt to pick: it reads the entire ladder,
-        // which is what `PaneKind::consumes_whole_volume` means, so every entry in
+        // which is what `RenderView::reads_whole_volume` means, so every entry in
         // the combo would select the same picture. `selected_elevation` stays on
-        // the pane, inert, so converting back to a map restores the tilt it had.
-        let offer_tilt = !pane.kind().consumes_whole_volume();
+        // the pane, inert, so going back to the plan view restores the tilt it
+        // had.
+        let offer_tilt = !pane.render_view().reads_whole_volume();
         // Reported the way `time_step_sel` is, and for the same reason: a test
         // rebuilding these ids from the same format strings could agree with a
         // panel that drew neither control. *Which* of the two appear is how a test
@@ -3271,25 +3241,30 @@ impl Gui {
         self.panes.get_mut(idx)
     }
 
-    /// Ask for pane `pane_idx` to become `kind`, taking effect at the end of the
+    /// Ask for pane `pane_idx` to show `view`, taking effect at the end of the
     /// frame.
     ///
-    /// **The only route by which the UI may change a pane's kind.**
-    /// `PaneState::set_kind` is the mechanism and stays reachable for the config
-    /// loader and for test fixtures; nothing drawing a frame calls it, because two
-    /// UI paths hold the pane it would write out of the vector as a `mem::take`
-    /// placeholder about to be thrown away. The menu dispatcher, as it happens, is
-    /// *not* inside either window today — a direct write from it would work — so
-    /// this is one rule for both dispatch and the writers WP-G adds inside
-    /// `render_panes`' take, rather than a fix for a live bug on this path. The
-    /// [`pending_pane_kind`](Self::pending_pane_kind) field lays out which is
+    /// **The only route by which the UI may change what a pane draws.**
+    /// `PaneState::set_kind` and `PaneState::set_map_render` are the mechanisms
+    /// and stay reachable for the config loader and for test fixtures; nothing
+    /// drawing a frame calls them, because two UI paths hold the pane they would
+    /// write out of the vector as a `mem::take` placeholder about to be thrown
+    /// away. The menu dispatcher, as it happens, is *not* inside either window
+    /// today — a direct write from it would work — so this is one rule for both
+    /// dispatch and the writers inside `render_panes`' take, rather than a fix
+    /// for a live bug on this path. The
+    /// [`pending_pane_view`](Self::pending_pane_view) field lays out which is
     /// which.
     ///
     /// Out-of-range indices are recorded and dropped on application rather than
     /// refused here, so a caller inside the UI pass never has to know whether the
     /// vector currently holds the pane it is drawing.
-    pub(crate) fn request_pane_kind(&mut self, pane_idx: PaneId, kind: crate::pane::PaneKind) {
-        self.pending_pane_kind = Some((pane_idx, kind));
+    pub(crate) fn request_pane_view(
+        &mut self,
+        pane_idx: PaneId,
+        view: rustdar_radar::types::RenderView,
+    ) {
+        self.pending_pane_view = Some((pane_idx, view));
     }
 
     /// Grow or shrink the layout to `count` panes, seeding any new ones, and
@@ -3336,147 +3311,6 @@ impl Gui {
         self.pane_layout.pane_count == count
     }
 
-    /// Aim a 3D pane at the region the frame committed, if any.
-    ///
-    /// Called from [`Self::ui`] after the pane loop and after
-    /// [`Self::apply_pending_pane_kind`], where every pane is back in the vector
-    /// and growing the count is safe. `ui_region::destination_for` holds the
-    /// decision about *which* pane and the reasoning for it; this is only the
-    /// edit.
-    fn apply_pending_region(&mut self) {
-        let Some(pending) = self.pending_region.take() else {
-            return;
-        };
-        // Disarmed by committing, exactly as the section draw disarms on
-        // drawing its line (`track_section_draw`): the mode's job is done, and
-        // leaving it on would turn the user's next pan into a second box. A
-        // too-small drag never reaches here — it is discarded on release and
-        // the mode stays armed, so a mis-click still costs nothing.
-        //
-        // Through the setter, not a field write: `set_region_arm` is one of the
-        // two chokepoints the modes' mutual exclusion lives in, and it is also
-        // what drops a drag in flight. Disarming here moves `region_arm`, which
-        // is how the menu's checkbox visibly un-ticks itself.
-        self.set_region_arm(false);
-        // The box means ground on the *source map's* radar, so the pane that
-        // shows it has to follow that map's site and moment — exactly as
-        // `apply_pending_section_line` writes them for a line. Without this, a
-        // sourceless pane on another site would be "re-aimed" to resample its
-        // own radar over a box centred on this map's ground: an empty or sliver
-        // grid, captioned with the wrong site. Read before the destination is
-        // resolved, as the section applier reads its source, and a source pane
-        // that vanished mid-frame drops the region rather than siting it off a
-        // pane that no longer exists.
-        let (source_site, source_scan) = match self.panes.get(pending.source_pane) {
-            Some(pane) => (pane.site.clone(), pane.scan_info.clone()),
-            None => {
-                log::warn!(
-                    "pane {} committed a 3D region and is already gone",
-                    pending.source_pane
-                );
-                return;
-            }
-        };
-        let max_panes = self.layout.width.max_panes();
-        let Some(destination) =
-            crate::ui_region::destination_for(self.panes(), pending.source_pane, max_panes)
-        else {
-            log::warn!("no pane to put a 3D region on; dropping it");
-            return;
-        };
-        let pane_idx = match destination {
-            crate::ui_region::RegionDestination::Existing(idx) => idx,
-            crate::ui_region::RegionDestination::Grow(count) => {
-                if !self.set_pane_count(count) {
-                    log::warn!("the layout refused to grow to {count}; dropping a 3D region");
-                    return;
-                }
-                count - 1
-            }
-            crate::ui_region::RegionDestination::Convert(idx) => idx,
-        };
-        let Some(pane) = self.panes.get_mut(pane_idx) else {
-            log::warn!("pane {pane_idx} is gone; not aiming a 3D region at it");
-            return;
-        };
-        // Idempotent when it is already a 3D view, and the direct call is safe
-        // here for the reason `request_pane_kind` names: this runs after the pane
-        // loop, so nothing is `mem::take`n and the write lands in the vector
-        // rather than in a placeholder about to be discarded.
-        pane.set_kind(crate::pane::PaneKind::Volume);
-        pane.site = source_site;
-        pane.scan_info = source_scan;
-        // A pane that has just been converted or grown has the default camera,
-        // which is what should happen — but one that is being *re-aimed* keeps
-        // the angle the user set, and its product stays its own, like the
-        // camera: a 3D pane's product is picked on the pane, where a section
-        // slices whatever its map shows. Beyond the site and moment, only the
-        // region and its provenance are written. No stale-picture clearing is
-        // needed here as it is for a section: the 3D dispatch is
-        // level-triggered off `pane.site` each frame, and the site write makes
-        // the wanted `VolumeTarget` differ from `rendered_for`, so the rebuild
-        // follows on its own.
-        if let Some(volume) = pane.volume_mut() {
-            volume.region = Some(pending.region);
-            volume.source_pane = Some(pending.source_pane);
-        }
-        // The pane the region was drawn *from* stays active. A region drag is an
-        // instruction about another pane, not a request to go and look at it, and
-        // stealing focus mid-gesture is how a user loses the map they were
-        // working on.
-    }
-
-    /// Arm or disarm the region drag.
-    ///
-    /// Disarming throws away any drag in flight rather than committing it: a user
-    /// who reaches for the menu with the button still down is cancelling, and a
-    /// box that appeared because of it would be one nobody asked for.
-    ///
-    /// # Arming this disarms the cross-section draw
-    ///
-    /// The two are the only armed modal drags on a map pane, and they are spelled
-    /// identically — press, move, release, on the same pane, with the same button
-    /// or the same finger. With both on, one drag would have to mean two things:
-    /// the section pipeline would anchor a line while `handle_region_drag` read
-    /// the same press raw and started a box, and the release would commit both. A
-    /// single gesture would then grow the layout twice, and in a full layout the
-    /// second applier's last resort is the pane the first one just filled — so one
-    /// of the two completed gestures would visibly produce nothing.
-    ///
-    /// Turning the other off is the only rule that keeps the menu honest, because
-    /// both entries are checkboxes: whichever the user ticked last is the one
-    /// showing ticked, and it is the one a drag will do. Silently ignoring the
-    /// second arm, or refusing it, would leave a ticked box that does nothing.
-    ///
-    /// Written as a direct field write rather than as a call to
-    /// [`Self::set_section_draw_armed`], so the two setters cannot recurse into
-    /// each other.
-    pub(crate) fn set_region_arm(&mut self, on: bool) {
-        self.region_arm = on;
-        if on {
-            self.section_draw_armed = false;
-            self.section_anchor = None;
-            // A handle drag in flight is a third gesture the same press cannot
-            // also be. Arming from the menu mid-drag is contrived but cheap to
-            // be correct about: the drag dies, the pane's line is untouched.
-            self.section_edit_drag = None;
-        } else {
-            self.region_drag = None;
-        }
-    }
-
-    /// [`Self::set_region_arm`] under the name the region tests already use.
-    #[cfg(test)]
-    pub(crate) fn set_region_arm_for_test(&mut self, on: bool) {
-        self.set_region_arm(on);
-    }
-
-    /// Whether the region drag is armed.
-    #[cfg(test)]
-    pub(crate) fn region_arm_for_test(&self) -> bool {
-        self.region_arm
-    }
-
     /// The in-flight section handle drag, if any — the state both armed-drag
     /// setters must clear, and the tests' way of watching them do it.
     #[cfg(test)]
@@ -3486,36 +3320,42 @@ impl Gui {
         self.section_edit_drag
     }
 
-    /// Apply the pane conversion the frame asked for, if any.
+    /// Apply the view change the frame asked for, if any.
     ///
     /// Called from [`Self::ui`] after the pane loop, where every pane is back in
-    /// the vector. Converting a pane keeps everything about what it is looking
-    /// at — see `PaneState::set_kind` — so there is nothing else to carry across.
-    fn apply_pending_pane_kind(&mut self, actions: &mut Vec<GuiAction>) {
-        let Some((pane_idx, kind)) = self.pending_pane_kind.take() else {
+    /// the vector. Changing what a pane draws keeps everything about what it is
+    /// looking *at* — see `PaneState::set_view` — so there is nothing else to
+    /// carry across.
+    fn apply_pending_pane_view(&mut self, actions: &mut Vec<GuiAction>) {
+        let Some((pane_idx, view)) = self.pending_pane_view.take() else {
             return;
         };
         match self.panes.get_mut(pane_idx) {
             Some(pane) => {
-                // Before the conversion, because after it the pane no longer
-                // remembers it was a 3D view. A voxel grid is 1–8 MiB of host
-                // memory plus a GPU texture, refcounted by the volume it was
+                // Before the change, because after it the pane no longer
+                // remembers it was drawing a volume. A voxel grid is 1–8 MiB of
+                // host memory plus a GPU texture, refcounted by the volume it was
                 // built from, and this is the only moment a pane can stop
                 // needing one without anything else noticing: the pane is still
                 // on screen, still on the same site, still live. Nothing else in
                 // the frame is going to come back and ask.
-                if pane.kind() == crate::pane::PaneKind::Volume
-                    && kind != crate::pane::PaneKind::Volume
+                //
+                // Keyed on the render *view* rather than the pane kind, because
+                // leaving 3D for the plan view no longer changes the kind — and
+                // a pane that quietly kept an 8 MiB grid it had stopped drawing
+                // is exactly the leak this call exists to close.
+                if pane.render_view() == rustdar_radar::types::RenderView::Volume
+                    && view != rustdar_radar::types::RenderView::Volume
                 {
                     actions.push(GuiAction::ReleaseVolume { pane_idx });
                 }
-                pane.set_kind(kind);
+                pane.set_view(view);
             }
             // A pane the layout no longer holds, which a pane-count change in the
             // same frame can produce. Dropped rather than clamped to another
-            // index: converting a pane the user did not point at is worse than
-            // converting none.
-            None => log::warn!("pane {pane_idx} is gone; not converting it to {kind:?}"),
+            // index: changing a pane the user did not point at is worse than
+            // changing none.
+            None => log::warn!("pane {pane_idx} is gone; not switching it to {view:?}"),
         }
     }
 
@@ -3530,17 +3370,11 @@ impl Gui {
     /// mode it belongs to is off, and leaving it would make re-arming resume a
     /// drag the user abandoned minutes ago.
     ///
-    /// Arming it disarms the 3D region drag, and drops any box in flight, for the
-    /// reason [`Self::set_region_arm`] gives at length: one drag on one map pane
-    /// cannot be both a section line and a region box. Direct field writes rather
-    /// than a call to that setter, so the two cannot recurse into each other.
     pub fn set_section_draw_armed(&mut self, armed: bool) {
         self.section_draw_armed = armed;
         if armed {
-            self.region_arm = false;
-            self.region_drag = None;
-            // Same as `set_region_arm`: an endpoint drag cannot share a map
-            // with an armed draw, and the mode was asked for last.
+            // An endpoint drag cannot share a map with an armed draw, and the
+            // mode was asked for last.
             self.section_edit_drag = None;
         } else {
             self.section_anchor = None;
@@ -3714,15 +3548,17 @@ impl Gui {
             .find(|&idx| idx != source)
     }
 
-    /// The pane conversion this frame recorded and has not applied yet.
+    /// The view change this frame recorded and has not applied yet.
     ///
     /// Read by `ui_menu`'s dispatcher fingerprint, which has to be able to see
     /// that the toggle's arm did something: recording the request *is* what that
     /// arm does, and applying it is a separate step with its own test. Nothing in
     /// production reads it — the applier takes the field directly.
     #[cfg(test)]
-    pub(crate) fn pending_pane_kind_for_test(&self) -> Option<(PaneId, crate::pane::PaneKind)> {
-        self.pending_pane_kind
+    pub(crate) fn pending_pane_view_for_test(
+        &self,
+    ) -> Option<(PaneId, rustdar_radar::types::RenderView)> {
+        self.pending_pane_view
     }
 
     /// What the 3D arm decided for each volume pane on the last frame.
@@ -3852,7 +3688,7 @@ impl Gui {
     /// nothing.
     pub fn pane_consumes_whole_volume(&self, idx: PaneId) -> bool {
         self.pane(idx)
-            .is_some_and(|pane| pane.kind().consumes_whole_volume())
+            .is_some_and(|pane| pane.render_view().reads_whole_volume())
     }
 
     /// Get the rendering params for a specific pane.
@@ -3933,21 +3769,21 @@ impl Gui {
 
     /// Record that the arm for `kind` drew pane `pane_idx` into `rect`.
     ///
-    /// Called from inside each arm of `render_panes`' kind branch, with the
-    /// kind written out as a literal there rather than passed down from the
+    /// Called from inside each arm of `render_panes`' render branch, with the
+    /// view written out as a literal there rather than passed down from the
     /// branch's subject — that literal is the whole reason the probe can catch a
     /// mis-wired arm. A no-op outside tests, like `ControlProbe::record_dropdown`.
     #[inline]
     pub(super) fn record_pane_content(
         &mut self,
         _pane_idx: usize,
-        _kind: crate::pane::PaneKind,
+        _view: rustdar_radar::types::RenderView,
         _rect: egui::Rect,
     ) {
         #[cfg(test)]
         self.last_pane_content.push(PaneContentProbe {
             pane_idx: _pane_idx,
-            kind: _kind,
+            view: _view,
             rect: _rect,
         });
     }

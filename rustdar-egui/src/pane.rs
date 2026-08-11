@@ -16,9 +16,9 @@ mod content;
 // not about them being different things.
 pub use content::{
     CrossSectionPane, DEFAULT_HALF_WIDTH_KM, DEFAULT_VERTICAL_EXAGGERATION, GeoPoint,
-    MAX_VERTICAL_EXAGGERATION, MIN_VERTICAL_EXAGGERATION, OrbitCamera, OrbitDelta, PaneContent,
-    PaneKind, SectionLine, SectionTarget, SectionUnavailable, VolumePane, VolumeRegion,
-    VolumeStamp, VolumeTarget, VolumeViewMode,
+    MAX_VERTICAL_EXAGGERATION, MIN_VERTICAL_EXAGGERATION, MapPane, MapRender, OrbitCamera,
+    OrbitDelta, PaneContent, PaneKind, SectionLine, SectionTarget, SectionUnavailable, VolumePane,
+    VolumeRegion, VolumeStamp, VolumeTarget, VolumeViewMode, box_size_km,
 };
 
 const DEFAULT_PANE_ZOOM: f64 = 4.0;
@@ -1243,7 +1243,7 @@ impl PaneState {
             loop_state: LoopPlaybackState::new(),
             loading_site: None,
             radar_sites_render_gen: 0,
-            content: PaneContent::Map,
+            content: PaneContent::Map(Box::default()),
         }
     }
 
@@ -1256,18 +1256,44 @@ impl PaneState {
         self.content.kind()
     }
 
-    /// Whether this is the plan-view map pane every pane used to be.
+    /// What a render dispatched for this pane produces.
     ///
-    /// The predicate the all-panes loops that are *only* about maps filter on —
-    /// render dispatch, the sibling texture broadcast, loop synchronisation.
+    /// The three-way answer, where [`Self::kind`] is the two-way one: a map
+    /// pane in the 3D render mode is still a `Map`, and asking its kind would
+    /// not say so. Every predicate that used to compare against a `Volume`
+    /// *kind* compares against [`RenderView::Volume`] here, which is the same
+    /// question asked of the thing that actually differs.
+    ///
+    /// Carries the same `mem::take` warning [`Self::kind`] does, and rather more
+    /// sharply: a taken pane's slot holds `PaneContent::default()`, which is a
+    /// plan-view map, so this answers `PlanView` for whatever the real pane was.
+    pub fn render_view(&self) -> rustdar_radar::types::RenderView {
+        self.content.render_view()
+    }
+
+    /// Whether this pane is drawing the plan view every pane used to be.
+    ///
+    /// The predicate the all-panes loops that are *only* about the flat map
+    /// filter on — render dispatch, the sibling texture broadcast, loop
+    /// synchronisation.
+    ///
+    /// **A map pane in the 3D render mode answers `false`**, which is the same
+    /// answer a 3D *pane* gave before the two collapsed. It is a question about
+    /// the picture, not about the kind: a raymarched pane has no plan-view
+    /// raster to dispatch, donate or synchronise.
     pub fn is_map(&self) -> bool {
-        matches!(self.content, PaneContent::Map)
+        self.render_view() == rustdar_radar::types::RenderView::PlanView
+    }
+
+    /// This pane's render mode, if it is a map pane at all.
+    pub fn map_render(&self) -> Option<MapRender> {
+        self.map().map(|map| map.render)
     }
 
     /// Whether this pane can animate a sequence of past volumes.
     ///
-    /// [`PaneKind::can_loop`] is where the classification by kind lives; this
-    /// adds the one thing a kind cannot answer.
+    /// [`RenderView::can_loop`] is where the classification by view lives; this
+    /// adds the one thing a view cannot answer.
     ///
     /// # A section pane must be aimed before it can loop
     ///
@@ -1284,7 +1310,7 @@ impl PaneState {
     /// `is_none_or` rather than a match on the kind: a map pane has no section
     /// state and answers on its kind alone.
     pub fn can_loop(&self) -> bool {
-        self.kind().can_loop() && self.cross_section().is_none_or(|s| s.line.is_some())
+        self.render_view().can_loop() && self.cross_section().is_none_or(|s| s.line.is_some())
     }
 
     /// This pane's cross-section state, or `None` if it is not a section pane.
@@ -1303,20 +1329,74 @@ impl PaneState {
         }
     }
 
-    /// This pane's 3D volume state, or `None` if it is not a volume pane.
-    pub fn volume(&self) -> Option<&VolumePane> {
+    /// This pane's map state, or `None` if it is a cross-section pane.
+    ///
+    /// Answers for **either** render mode, which is what separates it from
+    /// [`Self::volume`]: the config writer and the mode toggle need a plan-view
+    /// pane's 3D state, precisely because it is kept across the switch.
+    pub fn map(&self) -> Option<&MapPane> {
         match &self.content {
-            PaneContent::Volume(volume) => Some(volume),
-            _ => None,
+            PaneContent::Map(map) => Some(map),
+            PaneContent::CrossSection(_) => None,
         }
+    }
+
+    /// [`Self::map`], mutably.
+    pub fn map_mut(&mut self) -> Option<&mut MapPane> {
+        match &mut self.content {
+            PaneContent::Map(map) => Some(map),
+            PaneContent::CrossSection(_) => None,
+        }
+    }
+
+    /// This pane's 3D volume state, or `None` unless it is *currently drawing*
+    /// the volume.
+    ///
+    /// Gated on the render mode, not merely on the pane being a map, so that
+    /// every caller that used to mean "is this a 3D pane, and if so its state"
+    /// keeps meaning exactly that. A plan-view pane's retained camera is
+    /// deliberately out of reach here — reachable through [`Self::map`], which
+    /// is the accessor that says it does not care what is being drawn.
+    pub fn volume(&self) -> Option<&VolumePane> {
+        self.map()
+            .filter(|map| map.render == MapRender::Volume)
+            .map(|map| &map.volume)
     }
 
     /// [`Self::volume`], mutably.
     pub fn volume_mut(&mut self) -> Option<&mut VolumePane> {
-        match &mut self.content {
-            PaneContent::Volume(volume) => Some(volume),
-            _ => None,
+        self.map_mut()
+            .filter(|map| map.render == MapRender::Volume)
+            .map(|map| &mut map.volume)
+    }
+
+    /// Draw this map pane's ground in `render` from now on, keeping everything
+    /// about *what it is looking at* — and keeping the other mode's state, so
+    /// that switching back returns the same picture.
+    ///
+    /// The render-mode counterpart of [`Self::set_kind`], and it tears the loop
+    /// down for the same reason: a loop's frames are pictures of one shape, and
+    /// the shape is the [`RenderView`](rustdar_radar::types::RenderView).
+    /// Flipping a looping plan-view pane into 3D would leave a list of
+    /// `IMAGE_SIZE` square rasters under a state that now wants voxel grids.
+    ///
+    /// Does nothing at all for the mode the pane is already in, on
+    /// [`Self::set_kind`]'s reasoning: re-selecting the current mode from a
+    /// menu must not throw away a camera the user spent a while aiming.
+    ///
+    /// Answers whether the pane was a map at all. A cross-section pane has no
+    /// render mode, and silently doing nothing would let a caller believe it
+    /// had switched one.
+    pub fn set_map_render(&mut self, render: MapRender) -> bool {
+        let Some(map) = self.map_mut() else {
+            return false;
+        };
+        if map.render == render {
+            return true;
         }
+        map.render = render;
+        self.loop_state = LoopPlaybackState::new();
+        true
     }
 
     /// Convert this pane to `kind`, keeping everything about *what it is looking
@@ -1372,6 +1452,37 @@ impl PaneState {
         self.set_content(PaneContent::for_kind(kind));
     }
 
+    /// Make this pane draw `view`, whichever combination of kind and render
+    /// mode that takes.
+    ///
+    /// The one entry point the UI uses, because a `RenderView` is exactly what
+    /// the pane menu offers — plan view, 3D volume, cross-section — and the
+    /// caller should not have to know that two of those three are the same kind
+    /// of pane. [`Self::set_kind`] and [`Self::set_map_render`] are the halves,
+    /// and both are idempotent, so asking for the view a pane already shows
+    /// does nothing at all: neither its camera nor its drawn line is thrown
+    /// away by re-selecting the mode it is in.
+    ///
+    /// The order matters. `set_kind` runs first so that a cross-section pane
+    /// becoming a 3D view is a map pane *before* the mode is written; going the
+    /// other way, `set_map_render` simply finds no map pane and answers `false`,
+    /// which is correct — a section has no render mode.
+    pub fn set_view(&mut self, view: rustdar_radar::types::RenderView) {
+        use rustdar_radar::types::RenderView;
+        match view {
+            RenderView::PlanView | RenderView::Volume => {
+                self.set_kind(PaneKind::Map);
+                let render = if view == RenderView::Volume {
+                    MapRender::Volume
+                } else {
+                    MapRender::Plan
+                };
+                self.set_map_render(render);
+            }
+            RenderView::CrossSection => self.set_kind(PaneKind::CrossSection),
+        }
+    }
+
     /// Replace this pane's per-kind content wholesale, as the config loader does
     /// when it has both the kind and the state in hand.
     ///
@@ -1390,13 +1501,19 @@ impl PaneState {
     /// but the pane would animate a list of frames nothing can fill and hold
     /// `MAX_LOOP_RENDER_BUDGET` textures alive to do it.
     ///
-    /// So the rule is the wider one: any kind change resets the loop, and a kind
-    /// that cannot loop at all resets it as well — the second clause covers the
-    /// path where a caller replaces one `Volume` content with another.
+    /// So the rule is the wider one: any change to the **render view** resets
+    /// the loop, and a view that cannot loop at all resets it as well — the
+    /// second clause covers the path where a caller replaces one content with
+    /// another of the same view.
+    ///
+    /// The view rather than the kind, because a map pane has two of them: a
+    /// config that restores a pane straight into the 3D mode changes the shape
+    /// of a frame without changing the kind, and comparing kinds would leave the
+    /// old shape's frames in place.
     pub fn set_content(&mut self, content: PaneContent) {
-        let previous = self.kind();
+        let previous = self.render_view();
         self.content = content;
-        if self.kind() != previous || !self.kind().can_loop() {
+        if self.render_view() != previous || !self.render_view().can_loop() {
             self.loop_state = LoopPlaybackState::new();
         }
     }

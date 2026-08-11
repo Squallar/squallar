@@ -55,9 +55,9 @@
 //! inventory to render.
 
 use crate::actions::GuiAction;
-use crate::pane::{PaneId, PaneKind};
+use crate::pane::PaneId;
 use crate::ui_layout::PointerModality;
-use rustdar_radar::types::RadarProduct;
+use rustdar_radar::types::{RadarProduct, RenderView};
 
 /// The row's idle opacity. The reveal animates between this and 1.0
 /// (`Gui::render_pill_row`'s `animate_bool_with_time`; instant under test —
@@ -171,12 +171,17 @@ const MATCH_ALL_NOTE: &str = "Copy this pane's zoom and centre to every map \
 const RELINK_ALL_NOTE: &str = "Copy this view to every map pane and turn \
     viewport, layer and time sync back on for every pane.";
 
-/// The three pane kinds as the pickers offer them — the inspector's
-/// segmented row and the kind popover render this one table.
-const PANE_KIND_OPTIONS: [(PaneKind, &str); 3] = [
-    (PaneKind::Map, "Map"),
-    (PaneKind::Volume, "3D Volume"),
-    (PaneKind::CrossSection, "Cross-section"),
+/// The three pictures a pane can show, as the pickers offer them — the
+/// inspector's segmented row and the pane-view popover render this one table.
+///
+/// Keyed on [`RenderView`] rather than on `PaneKind`, because what a user picks
+/// here is a *picture*. Two of these three are the same kind of pane in
+/// different render modes, and a picker in the vocabulary of kinds could not
+/// tell them apart.
+const PANE_VIEW_OPTIONS: [(RenderView, &str); 3] = [
+    (RenderView::PlanView, "Map"),
+    (RenderView::Volume, "3D Volume"),
+    (RenderView::CrossSection, "Cross-section"),
 ];
 
 /// Which pill of a row something is — the popover ids salt on this, and the
@@ -389,13 +394,13 @@ pub(super) fn tilt_list_ui(
     outcome
 }
 
-/// The three pane kinds, current one highlighted — [`PANE_KIND_OPTIONS`]
+/// The three pane views, current one highlighted — [`PANE_VIEW_OPTIONS`]
 /// rendered wherever the caller's layout puts the rows (the inspector lays
 /// them in a horizontal run, the popover stacks them).
-pub(super) fn kind_list_ui(ui: &mut egui::Ui, current: PaneKind) -> PickOutcome<PaneKind> {
+pub(super) fn kind_list_ui(ui: &mut egui::Ui, current: RenderView) -> PickOutcome<RenderView> {
     let mut outcome = PickOutcome::default();
-    for (kind, label) in PANE_KIND_OPTIONS {
-        outcome.row(ui, label, kind == current, kind);
+    for (view, label) in PANE_VIEW_OPTIONS {
+        outcome.row(ui, label, view == current, view);
     }
     outcome
 }
@@ -512,16 +517,17 @@ fn sync_pill_hover(viewport_link: bool, layer_link: bool, time_link: bool) -> St
 }
 
 impl super::Gui {
-    /// Ask for pane `idx` to become `kind` the pickers' way: through the
+    /// Ask for pane `idx` to show `view` the pickers' way: through the
     /// deferred applier, arming the cross-section draw when the pane has no
     /// line to show yet — the same gesture the menu's "Draw cross-section"
     /// entry arms, saving the trip back to the menu.
     ///
-    /// One function for the inspector's segmented row and the kind popover,
-    /// so the two routes cannot drift about what choosing a kind means.
-    pub(super) fn pick_pane_kind(&mut self, idx: PaneId, kind: PaneKind, line_absent: bool) {
-        self.request_pane_kind(idx, kind);
-        if kind == PaneKind::CrossSection && line_absent {
+    /// One function for the inspector's segmented row and the pane-view
+    /// popover, so the two routes cannot drift about what choosing a view
+    /// means.
+    pub(super) fn pick_pane_kind(&mut self, idx: PaneId, view: RenderView, line_absent: bool) {
+        self.request_pane_view(idx, view);
+        if view == RenderView::CrossSection && line_absent {
             self.set_section_draw_armed(true);
         }
     }
@@ -609,7 +615,7 @@ impl super::Gui {
                 .unwrap_or((pane.selected_product, pane.selected_elevation));
             (
                 pane.site.clone(),
-                pane.kind(),
+                pane.render_view(),
                 pane.selected_product,
                 (pane.viewport_link, pane.layer_link, pane.time_link),
                 pane.cross_section().and_then(|s| s.line).is_none(),
@@ -624,7 +630,7 @@ impl super::Gui {
                     .unwrap_or_default(),
             )
         };
-        let is_map = kind == PaneKind::Map;
+        let is_map = kind == RenderView::PlanView;
         // The same gate the inspector's checkbox keeps: with one pane there
         // is no shared time to follow, so the pill would be an option the
         // inspector does not express.
@@ -787,11 +793,11 @@ impl super::Gui {
 
                     // -- kind --
                     let label = match kind {
-                        PaneKind::Map => "Map",
-                        PaneKind::Volume => "3D Volume",
-                        PaneKind::CrossSection => "X-section",
+                        RenderView::PlanView => "Map",
+                        RenderView::Volume => "3D Volume",
+                        RenderView::CrossSection => "X-section",
                     };
-                    let pill = ui.button(label).on_hover_text("Pane kind");
+                    let pill = ui.button(label).on_hover_text("Pane view");
                     #[cfg(test)]
                     probe
                         .pills
@@ -1003,7 +1009,7 @@ impl super::Gui {
         &mut self,
         pill: &egui::Response,
         idx: PaneId,
-        current: PaneKind,
+        current: RenderView,
         line_absent: bool,
     ) {
         let shown = egui::Popup::menu(pill)
@@ -1021,9 +1027,9 @@ impl super::Gui {
                         rows: outcome.rows.clone(),
                     });
                 }
-                if let Some(kind) = outcome.picked {
+                if let Some(view) = outcome.picked {
                     self.active_pane = idx;
-                    self.pick_pane_kind(idx, kind, line_absent);
+                    self.pick_pane_kind(idx, view, line_absent);
                     ui.close_kind(egui::UiKind::Menu);
                 }
             });

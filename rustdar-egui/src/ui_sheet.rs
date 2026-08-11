@@ -893,8 +893,8 @@ impl super::Gui {
     /// its dormancy for exactly this host. Commands close the sheet (the
     /// thing they opened is what the user wants to see); toggles keep it up,
     /// the dropdown's own reasoning — flipping two of them must not be three
-    /// opens — except the two armed drags, which close it because the next
-    /// thing the user does is a drag on the map the sheet is covering.
+    /// opens — except the armed draw, which closes it because the next thing
+    /// the user does is a drag on the map the sheet is covering.
     fn render_sheet_menu(
         &mut self,
         ui: &mut egui::Ui,
@@ -918,7 +918,7 @@ impl super::Gui {
                 || matches!(
                     event,
                     ui_menu::MenuEvent::Toggled(
-                        ui_menu::MenuToggle::RegionArm | ui_menu::MenuToggle::DrawCrossSection,
+                        ui_menu::MenuToggle::DrawCrossSection,
                         true,
                     )
                 );

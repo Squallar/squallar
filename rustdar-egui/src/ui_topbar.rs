@@ -51,15 +51,10 @@ const MENU_BUTTON_LABEL: &str = "\u{2630}";
 /// `ui_glyphs.rs` verifies against egui's bundled fonts, and `▤` has no glyph
 /// in them — it shipped as a tofu box.
 const LAYERS_TOGGLE_LABEL: &str = "\u{25a3} Layers";
-/// The 3D-region arm toggle. The label names the subject; the menu entry of
-/// the same mode ([`ui_menu::REGION_ARM_LABEL`]) carries the longer teaching
-/// phrase — a bar has room for a word, a menu for a sentence. `⛶` (a carried
-/// selection-corners glyph) rather than the demo's uncarried `⬚`, and the
-/// same glyph heads the inspector's 3D block: the drag this arms is how that
-/// view is aimed.
-const REGION_TOGGLE_LABEL: &str = "\u{26f6} Region";
-/// The cross-section arm toggle, on the same terms as the region one. `∕`
-/// (division slash — a carried diagonal) rather than the uncarried `╱`.
+/// The cross-section arm toggle. The label names the subject; the menu entry
+/// of the same mode carries the longer teaching phrase — a bar has room for a
+/// word, a menu for a sentence. `∕` (division slash — a carried diagonal)
+/// rather than the uncarried `╱`.
 const SECTION_TOGGLE_LABEL: &str = "\u{2215} X-sec";
 /// The inspector toggle. Selected-state styled while the inspector is open —
 /// the mirror of [`LAYERS_TOGGLE_LABEL`] for the right-hand panel.
@@ -164,19 +159,9 @@ impl super::Gui {
                             probe.section_arm = (section.rect, armed);
                         }
                         if section.clicked() {
-                            // Through the setters both ways: arming un-arms the
-                            // other drag, disarming drops a half-made gesture.
+                            // Through the setter: disarming drops a half-made
+                            // gesture rather than committing it.
                             self.set_section_draw_armed(!armed);
-                        }
-
-                        let armed = self.region_arm;
-                        let region = ui.selectable_label(armed, REGION_TOGGLE_LABEL);
-                        #[cfg(test)]
-                        {
-                            probe.region_arm = (region.rect, armed);
-                        }
-                        if region.clicked() {
-                            self.set_region_arm(!armed);
                         }
 
                         // Everything else takes what the toggles left, reading
@@ -273,22 +258,6 @@ impl super::Gui {
                     // for its two arm entries (`render_sheet_menu`), applied
                     // to the bar's route. Disarming keeps whatever is up,
                     // as the dropdown does.
-                    if !armed && self.top_sheet_page().is_some() {
-                        self.clear_sheet_pages();
-                    }
-                }
-
-                let armed = self.region_arm;
-                let region = ui
-                    .selectable_label(armed, "\u{26f6}")
-                    .on_hover_text("Pick 3D region");
-                #[cfg(test)]
-                {
-                    probe.region_arm = (region.rect, armed);
-                }
-                if region.clicked() {
-                    self.set_region_arm(!armed);
-                    // Same terms as the ╱ above.
                     if !armed && self.top_sheet_page().is_some() {
                         self.clear_sheet_pages();
                     }
@@ -435,8 +404,7 @@ impl super::Gui {
                                 matches!(
                                     event,
                                     ui_menu::MenuEvent::Toggled(
-                                        ui_menu::MenuToggle::RegionArm
-                                            | ui_menu::MenuToggle::DrawCrossSection,
+                                        ui_menu::MenuToggle::DrawCrossSection,
                                         true,
                                     )
                                 )

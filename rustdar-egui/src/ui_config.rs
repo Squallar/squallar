@@ -12,8 +12,8 @@ use rustdar_units::UserPreferences;
 use super::PaneLayout;
 use super::PaneState;
 use crate::pane::{
-    CrossSectionPane, GeoPoint, OrbitCamera, PaneContent, PaneKind, SectionLine, VolumePane,
-    VolumeRegion,
+    CrossSectionPane, GeoPoint, MapPane, MapRender, OrbitCamera, PaneContent, SectionLine,
+    VolumePane,
 };
 use crate::ui_layout::WidthClass;
 
@@ -81,15 +81,24 @@ struct PaneConfig {
     /// pane changes site.
     #[serde(default)]
     center: Option<(f64, f64)>,
-    /// What kind of pane this is: a plan-view map, a vertical cross-section or a
-    /// 3D volume view.
+    /// What kind of pane this is: a patch of ground, or a vertical
+    /// cross-section through one.
     ///
-    /// `PaneKind::default()` is `Map`, so a config written before pane kinds
-    /// existed loads as a screen full of maps — which is what it was. A kind
-    /// this build does not *know* falls back the same way rather than failing
-    /// the load — see [`kind_or_default`].
+    /// `PaneKindConfig::default()` is `Map`, so a config written before pane
+    /// kinds existed loads as a screen full of maps — which is what it was. A
+    /// kind this build does not *know* falls back the same way rather than
+    /// failing the load — see [`kind_or_default`].
     #[serde(default, deserialize_with = "kind_or_default")]
-    kind: PaneKind,
+    kind: PaneKindConfig,
+    /// How a map pane draws its ground: the plan view or the 3D volume.
+    ///
+    /// Separate from [`Self::kind`] because it is a separate question — the
+    /// pane is the same place either way. Absent from every config written
+    /// while 3D was a pane *kind*, and `#[serde(default)]` makes that absence
+    /// the plan view; what carries those panes into the 3D mode instead is
+    /// `kind: "Volume"`. See [`PaneKindConfig::Volume`].
+    #[serde(default, deserialize_with = "render_or_default")]
+    render: MapRender,
     /// A cross-section pane's own state, present only when [`Self::kind`] is
     /// `CrossSection`.
     ///
@@ -100,10 +109,42 @@ struct PaneConfig {
     /// pane and falls back to `Map`.
     #[serde(default)]
     cross_section: Option<CrossSectionConfig>,
-    /// A 3D pane's own state, present only when [`Self::kind`] is `Volume`. Same
-    /// arrangement as [`Self::cross_section`].
+    /// A map pane's 3D state, present when it is not the default one.
+    ///
+    /// Written for a pane in **either** render mode, unlike
+    /// [`Self::cross_section`], because a plan-view pane keeps the camera it
+    /// had in 3D and flipping back to 3D must return the same view — across a
+    /// restart as well as within a session. Absent means "the default camera",
+    /// which is what a pane that has never been in 3D has.
     #[serde(default)]
     volume: Option<VolumeConfig>,
+}
+
+/// A pane kind, as it appears on the wire.
+///
+/// Its own enum rather than [`PaneKind`] because the wire has to keep reading a
+/// name the program no longer has. Serializing goes the other way: only the two
+/// live variants are ever written, so a file round-trips into the current
+/// vocabulary the first time it is saved.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PaneKindConfig {
+    #[default]
+    Map,
+    CrossSection,
+    /// Written by builds in which a 3D view was a pane kind of its own.
+    ///
+    /// Loads as a **map pane in the 3D render mode**, which is the same picture
+    /// the file was describing — the pane was always looking at a patch of
+    /// ground, and the collapse only changed where that fact is recorded.
+    /// Dropping it to a plan view instead would be a silent downgrade of the
+    /// user's layout on first launch after an update; failing the load, which
+    /// is what an unknown variant did before `kind_or_default`, would lose the
+    /// whole file.
+    ///
+    /// Never written. There is no way back to a 3D pane kind, so a config saved
+    /// by this build names `Map` with `render: "Volume"`, and this variant is
+    /// read-only from here on.
+    Volume,
 }
 
 /// A cross-section pane, as persisted.
@@ -163,11 +204,6 @@ struct VolumeConfig {
     /// [`OrbitCamera::pivot`](crate::pane::OrbitCamera::pivot).
     pivot: [f32; 3],
     vertical_exaggeration: f32,
-    /// The picked region, or `None` for the default box about the site.
-    region: Option<VolumeRegionConfig>,
-    /// Which map pane the region was dragged on. Validated against the pane
-    /// count on load, the same as a section's.
-    source_pane: Option<usize>,
     /// Whether this pane has turned the map floor **off**, in
     /// [`crate::pane::VolumePane::hide_floor`]'s own inverted sense.
     ///
@@ -205,17 +241,25 @@ where
     }
 }
 
-/// A picked region, as persisted.
-///
-/// Two flat `f64`s and a third, rather than a `VolumeRegion`, because
-/// `VolumeRegion`'s fields are private and its constructor is the validation —
-/// exactly the arrangement [`SectionLineConfig`] has and for the same reason.
-#[derive(Serialize, Deserialize, Default, Clone, Copy)]
-#[serde(default)]
-struct VolumeRegionConfig {
-    centre_lat: f64,
-    centre_lon: f64,
-    half_width_km: f64,
+impl VolumeConfig {
+    /// Whether this says anything a freshly opened pane does not already say.
+    ///
+    /// The gate on writing a `volume` block at all. Field-by-field against
+    /// [`Self::default`] rather than a `PartialEq` derive, because the floats
+    /// here are compared for *equality with a constant this program produced*,
+    /// which is the one comparison of `f32`s that is exact — and a derive would
+    /// invite the same comparison to be used on two values that had been
+    /// arithmetic.
+    fn differs_from_default(&self) -> bool {
+        let default = Self::default();
+        self.yaw_deg != default.yaw_deg
+            || self.pitch_deg != default.pitch_deg
+            || self.eye_distance != default.eye_distance
+            || self.pivot != default.pivot
+            || self.vertical_exaggeration != default.vertical_exaggeration
+            || self.hide_floor != default.hide_floor
+            || self.view_mode != default.view_mode
+    }
 }
 
 impl Default for VolumeConfig {
@@ -237,8 +281,6 @@ impl Default for VolumeConfig {
             eye_distance: camera.eye_distance(),
             pivot: camera.pivot(),
             vertical_exaggeration: camera.vertical_exaggeration(),
-            region: None,
-            source_pane: None,
             // The floor shows. Matches `VolumePane`'s derived default through
             // the same inversion — see the field's own doc.
             hide_floor: false,
@@ -291,7 +333,8 @@ impl Default for PaneConfig {
             overlay_configs: HashMap::new(),
             zoom: None,
             center: None,
-            kind: PaneKind::Map,
+            kind: PaneKindConfig::Map,
+            render: MapRender::Plan,
             cross_section: None,
             volume: None,
         }
@@ -444,8 +487,8 @@ where
     }
 }
 
-/// Deserialize a [`PaneKind`], falling back to `Map` when the name is one this
-/// build does not know.
+/// Deserialize a [`PaneKindConfig`], falling back to `Map` when the name is one
+/// this build does not know.
 ///
 /// The same class of loss [`product_or_default`] closes, on the field that is
 /// most likely to grow a variant next: pane kinds are what this application is
@@ -454,26 +497,56 @@ where
 /// setting — because `serde` refuses an unknown unit variant and `load_ui_config`
 /// has one `Result` for the whole file.
 ///
+/// It is what a kind *removed* by a later build goes through too, and that is
+/// the direction this refactor exercised: `"Volume"` is still a name
+/// [`PaneKindConfig`] knows, deliberately, so it lands on a real variant here
+/// rather than on this fallback and keeps its 3D view. A name that reaches the
+/// fallback is one nothing in this build has ever written.
+///
 /// `Map` rather than "drop the pane", because a pane is a position in a layout:
 /// dropping it would renumber every pane after it and silently move the user's
 /// windows around. A pane whose kind is unreadable is still a pane, and a map is
-/// what every pane starts as. The kind-specific state (`cross_section`,
-/// `volume`) is then a mismatch, which `restore_content` already treats as a
-/// corrupt pane and falls back to `Map` for — so the fallback lands in a state
-/// the loader already knows how to make consistent.
-fn kind_or_default<'de, D>(deserializer: D) -> Result<PaneKind, D::Error>
+/// what every pane starts as. The kind-specific state (`cross_section`) is then
+/// a mismatch, which `restore_content` already treats as a corrupt pane and
+/// falls back to `Map` for — so the fallback lands in a state the loader already
+/// knows how to make consistent.
+fn kind_or_default<'de, D>(deserializer: D) -> Result<PaneKindConfig, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let value = serde_json::Value::deserialize(deserializer)?;
-    match PaneKind::deserialize(&value) {
+    match PaneKindConfig::deserialize(&value) {
         Ok(kind) => Ok(kind),
         Err(_) => {
             log::warn!(
                 "config names a pane kind this build does not know ({value}); \
                  falling back to a map pane"
             );
-            Ok(PaneKind::Map)
+            Ok(PaneKindConfig::Map)
+        }
+    }
+}
+
+/// Deserialize a [`MapRender`], falling back to the plan view when the name is
+/// one this build does not know.
+///
+/// [`kind_or_default`]'s argument, one field over: a render mode from a later
+/// build must cost the pane its picture, not the user their whole config. The
+/// plan view is the safe landing because it is what every map pane can always
+/// draw.
+fn render_or_default<'de, D>(deserializer: D) -> Result<MapRender, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match MapRender::deserialize(&value) {
+        Ok(render) => Ok(render),
+        Err(_) => {
+            log::warn!(
+                "config names a map render mode this build does not know ({value}); \
+                 falling back to the plan view"
+            );
+            Ok(MapRender::default())
         }
     }
 }
@@ -586,9 +659,10 @@ impl super::Gui {
             .iter()
             .map(|pane| {
                 // Filtered, not written out and hoped for: see `content_config`.
-                let (kind, cross_section, volume) = content_config(pane);
+                let (kind, render, cross_section, volume) = content_config(pane);
                 PaneConfig {
                     kind,
+                    render,
                     cross_section,
                     volume,
                     selected_product: pane.selected_product,
@@ -961,9 +1035,57 @@ impl super::Gui {
 /// broken rather than as simple.
 fn content_config(
     pane: &PaneState,
-) -> (PaneKind, Option<CrossSectionConfig>, Option<VolumeConfig>) {
+) -> (
+    PaneKindConfig,
+    MapRender,
+    Option<CrossSectionConfig>,
+    Option<VolumeConfig>,
+) {
+    /// What a pane that could not be saved as itself is written as: a plain
+    /// plan-view map with no sub-config.
+    const AS_MAP: (
+        PaneKindConfig,
+        MapRender,
+        Option<CrossSectionConfig>,
+        Option<VolumeConfig>,
+    ) = (PaneKindConfig::Map, MapRender::Plan, None, None);
+
     match &pane.content {
-        PaneContent::Map => (PaneKind::Map, None, None),
+        PaneContent::Map(map) => {
+            let camera = map.volume.camera;
+            let config = VolumeConfig {
+                yaw_deg: camera.yaw_deg(),
+                pitch_deg: camera.pitch_deg(),
+                eye_distance: camera.eye_distance(),
+                pivot: camera.pivot(),
+                vertical_exaggeration: camera.vertical_exaggeration(),
+                hide_floor: map.volume.hide_floor,
+                view_mode: map.volume.view_mode,
+            };
+            // Every float that reaches the file, not merely the three angles:
+            // `serde_json` writes a non-finite `f32` as `null`, which comes back
+            // through `#[serde(default)]` as the *default* rather than as an
+            // error — so a NaN pivot would be laundered into a centred one and a
+            // NaN exaggeration into 3×, and the pane would silently move. The
+            // constructors make this unreachable today; it is here because the
+            // failure is a silent one and the check is four comparisons.
+            if !config.yaw_deg.is_finite()
+                || !config.pitch_deg.is_finite()
+                || !config.eye_distance.is_finite()
+                || !config.pivot.iter().all(|p| p.is_finite())
+                || !config.vertical_exaggeration.is_finite()
+            {
+                log::warn!("a map pane's 3D camera is not finite; saving it as a plain map");
+                return AS_MAP;
+            }
+            // Omitted when it says nothing a fresh pane does not already say.
+            // A pane that has never been in 3D therefore writes exactly the file
+            // it wrote before this state existed, and a pane that has keeps its
+            // camera whichever mode it is currently in — which is what makes
+            // flipping back to 3D after a restart return the same view.
+            let volume = (config.differs_from_default()).then_some(config);
+            (PaneKindConfig::Map, map.render, None, volume)
+        }
         PaneContent::CrossSection(section) => {
             let line = section.line.map(|line| SectionLineConfig {
                 a_lat: line.a().lat,
@@ -979,10 +1101,11 @@ fn content_config(
             });
             if !finite {
                 log::warn!("a section pane's endpoints are not finite; saving it as a map");
-                return (PaneKind::Map, None, None);
+                return AS_MAP;
             }
             (
-                PaneKind::CrossSection,
+                PaneKindConfig::CrossSection,
+                MapRender::Plan,
                 Some(CrossSectionConfig {
                     line,
                     source_pane: section.source_pane,
@@ -990,47 +1113,71 @@ fn content_config(
                 None,
             )
         }
-        PaneContent::Volume(volume) => {
-            let camera = volume.camera;
-            let config = VolumeConfig {
-                yaw_deg: camera.yaw_deg(),
-                pitch_deg: camera.pitch_deg(),
-                eye_distance: camera.eye_distance(),
-                pivot: camera.pivot(),
-                vertical_exaggeration: camera.vertical_exaggeration(),
-                region: volume.region.map(|region| VolumeRegionConfig {
-                    centre_lat: region.centre().lat,
-                    centre_lon: region.centre().lon,
-                    half_width_km: region.half_width_km(),
-                }),
-                source_pane: volume.source_pane,
-                hide_floor: volume.hide_floor,
-                view_mode: volume.view_mode,
-            };
-            // Every float that reaches the file, not merely the three angles:
-            // `serde_json` writes a non-finite `f32` as `null`, which comes back
-            // through `#[serde(default)]` as the *default* rather than as an
-            // error — so a NaN pivot would be laundered into a centred one and a
-            // NaN exaggeration into 3×, and the pane would silently move. The
-            // constructors make this unreachable today; it is here because the
-            // failure is a silent one and the check is four comparisons.
-            if !config.yaw_deg.is_finite()
-                || !config.pitch_deg.is_finite()
-                || !config.eye_distance.is_finite()
-                || !config.pivot.iter().all(|p| p.is_finite())
-                || !config.vertical_exaggeration.is_finite()
-                || !config.region.is_none_or(|r| {
-                    r.centre_lat.is_finite()
-                        && r.centre_lon.is_finite()
-                        && r.half_width_km.is_finite()
-                })
-            {
-                log::warn!("a 3D pane's camera is not finite; saving it as a map");
-                return (PaneKind::Map, None, None);
-            }
-            (PaneKind::Volume, None, Some(config))
-        }
     }
+}
+
+/// Restore a map pane in `render`, with whatever 3D state the file carries.
+///
+/// # Why a bad camera costs the mode and not the pane
+///
+/// A pane with an unreadable camera still knows where it is looking — its site,
+/// its viewport and its product are all flat fields that loaded perfectly well.
+/// So the honest repair is to show it flat, which is a picture, rather than to
+/// discard the pane, which is a hole in the user's layout. That is the whole
+/// difference the collapse makes here: while 3D was a pane *kind*, a bad camera
+/// left nothing for the pane to be and it had to become a map; now falling back
+/// to the plan view **is** the same pane.
+fn restore_map(pane_idx: usize, pc: &PaneConfig, render: MapRender) -> PaneContent {
+    let Some(saved) = pc.volume.as_ref() else {
+        // No 3D state at all. Ordinary for a pane that has never been in the
+        // mode, and for every config written before it existed — the camera is
+        // then the default one, which is what a pane opens with.
+        return PaneContent::Map(Box::new(MapPane {
+            render,
+            volume: VolumePane::default(),
+        }));
+    };
+    // `OrbitCamera::restore` is the gate: it refuses non-finite angles outright
+    // and wraps or clamps merely out-of-range ones, so a restored camera can
+    // never hold a value `nudge` would not produce.
+    let Some(camera) = OrbitCamera::restore(
+        saved.yaw_deg,
+        saved.pitch_deg,
+        saved.eye_distance,
+        saved.pivot,
+        saved.vertical_exaggeration,
+    ) else {
+        log::warn!(
+            "pane {pane_idx}'s saved 3D camera is not finite; loading it as a plain plan view"
+        );
+        return PaneContent::default();
+    };
+    PaneContent::Map(Box::new(MapPane {
+        render,
+        volume: VolumePane {
+            camera,
+            // A restored pane holds nothing built, so `rendered_for: None` is
+            // what makes the dispatcher resample against whatever volume the
+            // pane's site loads.
+            rendered_for: None,
+            // Persisted, like every other choice that changes *what the pane is
+            // a picture of*. Reopening the app is 1:1 with how it was closed,
+            // live data excepted, and a floor the user turned off coming back
+            // on is a visible difference on launch.
+            //
+            // The inversion is `VolumePane::hide_floor`'s own and is carried
+            // straight through rather than flipped here, so a config written
+            // before the field existed reads `false` through `#[serde(default)]`
+            // and keeps the shipped default: the floor shows. No finiteness
+            // filter applies — it is a `bool`, and the `null`-for-non-finite
+            // hazard the camera floats carry has no analogue here.
+            hide_floor: saved.hide_floor,
+            // Not persisted — the curves are (per product, below the pane
+            // list); an open tool window is session posture.
+            alpha_editor_open: false,
+            view_mode: saved.view_mode,
+        },
+    }))
 }
 
 /// The pane content a saved [`PaneConfig`] describes, or `Map` where it describes
@@ -1057,8 +1204,14 @@ fn content_config(
 /// converted it themselves and forgotten.
 fn restore_content(pane_idx: usize, pc: &PaneConfig, pane_count: usize) -> PaneContent {
     match pc.kind {
-        PaneKind::Map => PaneContent::Map,
-        PaneKind::CrossSection => {
+        // `render` says which of the two pictures, and `volume` — absent for a
+        // pane that has never been in 3D — says how the 3D one is posed.
+        PaneKindConfig::Map => restore_map(pane_idx, pc, pc.render),
+        // A build in which 3D was a pane kind of its own wrote no `render` key
+        // at all, so the mode has to come from the kind. Same pane, same
+        // ground, same camera: only where the fact is written has changed.
+        PaneKindConfig::Volume => restore_map(pane_idx, pc, MapRender::Volume),
+        PaneKindConfig::CrossSection => {
             // A kind with no sub-config. Not merely missing state: it says the
             // file was written by something that did not agree with itself, and a
             // section pane invented here would have no line and no source.
@@ -1066,7 +1219,7 @@ fn restore_content(pane_idx: usize, pc: &PaneConfig, pane_count: usize) -> PaneC
                 log::warn!(
                     "pane {pane_idx} is a cross-section with no section state; loading it as a map"
                 );
-                return PaneContent::Map;
+                return PaneContent::default();
             };
             // `None` is the ordinary state of a pane converted but not yet aimed,
             // and must not be confused with a line that failed to load.
@@ -1092,7 +1245,7 @@ fn restore_content(pane_idx: usize, pc: &PaneConfig, pane_count: usize) -> PaneC
                             "pane {pane_idx}'s saved section line is not a line that can be cut; \
                              loading it as a map"
                         );
-                        return PaneContent::Map;
+                        return PaneContent::default();
                     }
                     restored
                 }
@@ -1121,90 +1274,6 @@ fn restore_content(pane_idx: usize, pc: &PaneConfig, pane_count: usize) -> PaneC
                 // pane's site loads, and `unavailable: None` is what stops a
                 // reason from a previous session outliving its cause.
                 ..Default::default()
-            }))
-        }
-        PaneKind::Volume => {
-            let Some(volume) = pc.volume.as_ref() else {
-                log::warn!("pane {pane_idx} is a 3D view with no camera; loading it as a map");
-                return PaneContent::Map;
-            };
-            // `OrbitCamera::restore` is the gate: it refuses non-finite angles
-            // outright and wraps or clamps merely out-of-range ones, so a restored
-            // camera can never hold a value `nudge` would not produce.
-            let Some(camera) = OrbitCamera::restore(
-                volume.yaw_deg,
-                volume.pitch_deg,
-                volume.eye_distance,
-                volume.pivot,
-                volume.vertical_exaggeration,
-            ) else {
-                log::warn!("pane {pane_idx}'s saved camera is not finite; loading it as a map");
-                return PaneContent::Map;
-            };
-            // Through `VolumeRegion::new`, which is where an off-Earth or
-            // non-finite centre is refused and a half-width past the resampler's
-            // limits is wound back to them — rather than re-deriving those checks
-            // here, where they would be a second copy free to disagree.
-            //
-            // A region that does not survive that gate costs the *region* and not
-            // the pane, which is the opposite of the camera above. The difference
-            // is what each one is: a pane with no camera has no view at all, but a
-            // pane with no region has a perfectly good default box about its site
-            // — so dropping to that is strictly better than dropping to a map.
-            let region = match volume.region {
-                None => None,
-                Some(saved) => {
-                    let restored = VolumeRegion::new(
-                        GeoPoint {
-                            lat: saved.centre_lat,
-                            lon: saved.centre_lon,
-                        },
-                        saved.half_width_km,
-                    );
-                    if restored.is_none() {
-                        log::warn!(
-                            "pane {pane_idx}'s saved 3D region is not a patch of ground that can \
-                             be resampled; falling back to the default box about the site"
-                        );
-                    }
-                    restored
-                }
-            };
-            // The same bound a section's source pane gets, and dropped rather
-            // than clamped for the same reason: a layout saved wider than the one
-            // being restored brings back an index that now names a different pane.
-            let source_pane = volume.source_pane.filter(|idx| {
-                let inside = *idx < pane_count;
-                if !inside {
-                    log::warn!(
-                        "pane {pane_idx}'s 3D region was dragged on pane {idx}, which this layout \
-                         does not have; forgetting where it came from"
-                    );
-                }
-                inside
-            });
-            PaneContent::Volume(Box::new(VolumePane {
-                camera,
-                region,
-                source_pane,
-                rendered_for: None,
-                // Persisted, like every other choice that changes *what the
-                // pane is a picture of*. Reopening the app is 1:1 with how it
-                // was closed, live data excepted, and a floor the user turned
-                // off coming back on is a visible difference on launch.
-                //
-                // The inversion is `VolumePane::hide_floor`'s own and is carried
-                // straight through rather than flipped here, so a config written
-                // before the field existed reads `false` through
-                // `#[serde(default)]` and keeps the shipped default: the floor
-                // shows. No finiteness filter applies — it is a `bool`, and the
-                // `null`-for-non-finite hazard the camera floats carry (see the
-                // save side) has no analogue here.
-                hide_floor: volume.hide_floor,
-                // Not persisted either — the curves are (per product, below
-                // the pane list); an open tool window is session posture.
-                alpha_editor_open: false,
-                view_mode: volume.view_mode,
             }))
         }
     }

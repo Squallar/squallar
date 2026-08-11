@@ -26,15 +26,6 @@ use rustdar_overlays::render::overlay_state::OverlayKind;
 /// would go on passing after the entry was renamed out from under it.
 pub(crate) const VOLUME_PANE_LABEL: &str = "3D volume view";
 
-/// The label on the region-drag toggle.
-///
-/// Names the gesture rather than the mode ("Pick…" and where to drag, not
-/// "Region mode"), because the one thing a user has to learn from it is that a
-/// *drag on a map pane* is what does the picking — there is nothing on the 3D
-/// pane itself to try, and that is exactly the discovery problem this feature
-/// exists to fix.
-pub(crate) const REGION_ARM_LABEL: &str = "Pick 3D region (drag on a map)";
-
 /// The label on the cross-section arming toggle.
 ///
 /// Phrased as the gesture it arms rather than as the pane it produces, because
@@ -64,34 +55,21 @@ pub(super) enum MenuToggle {
     /// Subscribe to the push-notification service so a chunk is fetched the
     /// moment it exists rather than on the next poll.
     ChunkNotifications,
-    /// Make the active pane a 3D volume view, or turn it back into a map.
+    /// Draw the active pane's ground in 3D, or go back to the plan view.
     ///
     /// A checkbox rather than a command, and per pane rather than global,
-    /// because that is what it is: the pane either is a volume view or it is
-    /// not, and the state has to be visible or a user who converted a pane by
-    /// accident has nothing to un-tick. Unticking it returns the pane to a map,
-    /// which is also the only route out of a section pane restored from a config
-    /// — two clicks rather than one, but never a trap.
+    /// because that is what it is: the pane either is drawing its volume or it
+    /// is not, and the state has to be visible or a user who switched a pane by
+    /// accident has nothing to un-tick. Unticking it returns the pane to its
+    /// plan view — the *same* pane, keeping its site, its viewport and the
+    /// camera it will come back to — which is also the only route out of a
+    /// section pane restored from a config.
     ///
     /// The companion entry, [`MenuToggle::DrawCrossSection`], is deliberately
     /// *not* the same shape: it arms a gesture rather than converting the pane
     /// under the cursor, because which pane a section lands in is decided by
     /// where the line is drawn.
     VolumePane,
-    /// Arm the region drag: while it is on, a drag on a **map** pane draws the
-    /// patch of ground a 3D pane resamples instead of panning the map.
-    ///
-    /// A checkbox rather than a command for the same reason `VolumePane` is one:
-    /// it is a mode, it changes what dragging does, and a mode a user cannot see
-    /// is a mouse that has stopped working. Committing a box disarms it — the
-    /// checkbox un-ticks itself, see `Gui::region_arm` — while a discarded
-    /// mis-drag leaves it armed, so this and a back press are the ways out of a
-    /// mode that has not yet done its job.
-    ///
-    /// Ticking it un-ticks [`DrawCrossSection`](Self::DrawCrossSection), which is
-    /// the other armed drag on a map pane: one drag cannot be two gestures. See
-    /// `Gui::set_region_arm`.
-    RegionArm,
     /// Arm the cross-section draw: the next drag on a map pane becomes a
     /// vertical slice instead of a pan.
     ///
@@ -110,9 +88,6 @@ pub(super) enum MenuToggle {
     /// because the pane it applies to is not knowable when it is ticked: the
     /// user arms the mode and *then* chooses a map to draw on, and choosing it is
     /// the same press that starts the line.
-    ///
-    /// Ticking it un-ticks [`RegionArm`](Self::RegionArm), for the reason that
-    /// entry gives.
     DrawCrossSection,
 }
 
@@ -311,24 +286,12 @@ impl super::Gui {
                     MenuNode::Toggle {
                         label: VOLUME_PANE_LABEL,
                         toggle: MenuToggle::VolumePane,
-                        value: pane.kind() == crate::pane::PaneKind::Volume,
+                        value: pane.render_view()
+                            == rustdar_radar::types::RenderView::Volume,
                     },
-                    // Directly under the entry that makes a pane a 3D view,
-                    // because it is the other half of setting one up: the first
-                    // says *that* you want one, this says *where* it looks.
-                    MenuNode::Toggle {
-                        label: REGION_ARM_LABEL,
-                        toggle: MenuToggle::RegionArm,
-                        value: self.region_arm,
-                    },
-                    // Beside it, and read off the *global* flag rather than off
-                    // `pane`: it arms a gesture, and which pane the gesture ends
-                    // up aiming is decided by where the line is drawn.
-                    //
-                    // The two armed drags are adjacent on purpose. They are
-                    // mutually exclusive — ticking either un-ticks the other, see
-                    // `Gui::set_region_arm` — and a user only reads that off the
-                    // menu if the box that un-ticked itself is the one next door.
+                    // Read off the *global* flag rather than off `pane`: it arms
+                    // a gesture, and which pane the gesture ends up aiming is
+                    // decided by where the line is drawn.
                     MenuNode::Toggle {
                         label: DRAW_CROSS_SECTION_LABEL,
                         toggle: MenuToggle::DrawCrossSection,
@@ -403,25 +366,6 @@ impl super::Gui {
                 self.set_active_pane_overlay(kind, on);
                 self.propagate_layer_sync();
             }
-            MenuEvent::Toggled(MenuToggle::RegionArm, on) => {
-                // Through the setter, not a bare assignment. Disarming mid-drag
-                // has to throw the drag away rather than commit it — a user who
-                // reaches for the menu with the button still down is cancelling,
-                // and a box that appeared because of it would be one nobody asked
-                // for — and *arming* has to un-arm the cross-section draw, which
-                // is the other modal drag on a map pane.
-                self.set_region_arm(on);
-                // Closing the layers drawer on arm, exactly as the
-                // cross-section entry below does and for its reason: on a
-                // narrow width the drawer covers the map the box has to be
-                // dragged on, so arming and leaving it open would arm a
-                // gesture the user cannot make. Only on arm — disarming needs
-                // no map, so the drawer stays where the user is. The ☰
-                // dropdown closes itself on arm too; see `render_top_bar`.
-                if on {
-                    self.drawer_open = false;
-                }
-            }
             MenuEvent::Toggled(MenuToggle::AutoPoll, on) => self.auto_poll.enabled = on,
             MenuEvent::Toggled(MenuToggle::LiveChunks, on) => self.live_chunks = on,
             MenuEvent::Toggled(MenuToggle::ChunkNotifications, on) => self.chunk_notifications = on,
@@ -430,18 +374,23 @@ impl super::Gui {
                 //
                 // Not because this dispatcher is inside a `mem::take` window — it
                 // is not. `render_top_bar` takes no pane at all, so a direct
-                // `self.panes[self.active_pane].set_kind(..)` here would work
-                // today. It goes through `request_pane_kind` so that every writer
-                // of a pane's kind obeys one rule, including the ones WP-G adds
-                // inside `render_panes`' per-pane take, where the same direct
-                // write is silently discarded. See the `pending_pane_kind` field
-                // on `Gui` for both halves and for the one-frame cost.
-                self.request_pane_kind(
+                // `self.panes[self.active_pane].set_view(..)` here would work
+                // today. It goes through `request_pane_view` so that every writer
+                // of what a pane draws obeys one rule, including the ones inside
+                // `render_panes`' per-pane take, where the same direct write is
+                // silently discarded. See the `pending_pane_view` field on `Gui`
+                // for both halves and for the one-frame cost.
+                //
+                // Unticking asks for the **plan view**, which is the same pane
+                // rather than a different one: a 3D view is a render mode now, so
+                // turning it off keeps the site, the viewport and the camera it
+                // will come back to.
+                self.request_pane_view(
                     self.active_pane,
                     if on {
-                        crate::pane::PaneKind::Volume
+                        rustdar_radar::types::RenderView::Volume
                     } else {
-                        crate::pane::PaneKind::Map
+                        rustdar_radar::types::RenderView::PlanView
                     },
                 );
             }
@@ -539,7 +488,7 @@ mod tests {
         overlays.sort();
         format!(
             "settings={} insp={} sel={:?} time={} drawer={} auto_poll={} live_chunks={} \
-             notify={} kind={:?} pending_kind={:?} region_arm={} armed={} \
+             notify={} view={:?} pending_view={:?} armed={} \
              overlays={overlays:?}",
             gui.settings_visible(),
             gui.insp_open,
@@ -549,25 +498,21 @@ mod tests {
             gui.auto_poll.enabled,
             gui.live_chunks,
             gui.chunk_notifications,
-            gui.active_pane().kind(),
-            // Both halves, because a pane conversion is deliberately a two-step
+            gui.active_pane().render_view(),
+            // Both halves, because a pane view change is deliberately a two-step
             // operation. Recording the request is the whole of what the
             // dispatcher's arm does — applying it is a separate step, deferred to
-            // after the pane loop for reasons set out on the `pending_pane_kind`
-            // field — so a fingerprint holding only the *applied* kind would report
+            // after the pane loop for reasons set out on the `pending_pane_view`
+            // field — so a fingerprint holding only the *applied* view would report
             // the arm as a no-op and `every_menu_entry_has_a_dispatcher_arm` would
             // fail for a toggle that works. That the request survives being
             // recorded while a pane is held out of the vector is its own test, in
             // `ui.rs`.
-            gui.pending_pane_kind_for_test(),
-            gui.region_arm,
-            // Both armed drags, and separately. Each is a mode with no other
-            // observable — neither converts a pane until a gesture completes — so
-            // without them their toggles' arms would read as no-ops and
-            // `every_menu_entry_has_a_dispatcher_arm` would fail for two entries
-            // that work. Separately rather than as one "is anything armed" flag
-            // because they are mutually exclusive: arming one turns the other off,
-            // and a single flag would report that swap as no change at all.
+            gui.pending_pane_view_for_test(),
+            // The armed draw is a mode with no other observable — it converts
+            // nothing until a gesture completes — so without it the toggle's arm
+            // would read as a no-op and `every_menu_entry_has_a_dispatcher_arm`
+            // would fail for an entry that works.
             gui.section_draw_armed(),
         )
     }

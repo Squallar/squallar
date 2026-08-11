@@ -412,17 +412,17 @@ impl super::Gui {
         // (`ui_pills::kind_list_ui`) and the shared chooser
         // (`Gui::pick_pane_kind`) are the kind pill popover's own, so the
         // two routes offer and mean the same things by construction. Through
-        // `request_pane_kind` inside the chooser, **not** `set_kind`: this
+        // `request_pane_view` inside the chooser, **not** `set_view`: this
         // runs inside the shell's take window, where a direct write lands on
         // the placeholder in the vector and is silently discarded (see
-        // `pending_pane_kind`).
-        let current = pane.kind();
+        // `pending_pane_view`).
+        let current = pane.render_view();
         let picked = ui
             .horizontal(|ui| super::pills::kind_list_ui(ui, current).picked)
             .inner;
-        if let Some(kind) = picked {
+        if let Some(view) = picked {
             let line_absent = pane.cross_section().and_then(|s| s.line).is_none();
-            self.pick_pane_kind(self.active_pane, kind, line_absent);
+            self.pick_pane_kind(self.active_pane, view, line_absent);
         }
         ui.add_space(4.0);
 
@@ -464,12 +464,12 @@ impl super::Gui {
         // The kind-specific block, last, in its one scope — see the method
         // note.
         let kind_scope = egui::UiBuilder::new().id(ui.id().with("pane_kind_controls"));
-        ui.scope_builder(kind_scope, |ui| match pane.kind() {
-            crate::pane::PaneKind::Map => {}
-            crate::pane::PaneKind::CrossSection => {
+        ui.scope_builder(kind_scope, |ui| match pane.render_view() {
+            rustdar_radar::types::RenderView::PlanView => {}
+            rustdar_radar::types::RenderView::CrossSection => {
                 self.render_section_controls(ui, pane);
             }
-            crate::pane::PaneKind::Volume => {
+            rustdar_radar::types::RenderView::Volume => {
                 map::render_volume_controls(ui, pane, &mut self.volume_iso, &self.volume_alpha);
             }
         });

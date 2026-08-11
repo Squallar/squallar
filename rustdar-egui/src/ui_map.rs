@@ -3,7 +3,7 @@ use crate::actions::GuiAction;
 use crate::pane::PaneKind;
 use rustdar_overlays::render::overlay_state::OverlayKind;
 use rustdar_radar::beam;
-use rustdar_radar::types::{IMAGE_SIZE, RadarProduct};
+use rustdar_radar::types::{IMAGE_SIZE, RadarProduct, RenderView};
 use rustdar_units::UserPreferences;
 
 #[path = "ui_map_pane.rs"]
@@ -100,23 +100,11 @@ impl super::Gui {
         // Resolved once for the frame, before the pane loop: every pane must
         // agree about what is pointing at the screen.
         let modality = self.layout.modality;
-        // Read before the loop's `mem::take`, for the reason the kind branch
-        // gives: inside the take a pane's slot holds a default map pane, so a 3D
-        // pane's region read from `self.panes[..]` mid-loop would be `None`.
-        let region_arm = self.region_arm;
-        // Per-pane, before the loop's `mem::take`, for the reason `region_arm`
-        // gives: inside the take a pane's slot is a default map pane, and the
-        // bias is decided by which *other* pane is standing on this one.
+        // Per-pane, before the loop's `mem::take`, for the reason the render
+        // branch gives: inside the take a pane's slot is a default map pane, and
+        // the bias is decided by which *other* pane is standing on this one.
         let tile_zoom_biases: Vec<u8> = (0..pane_count)
             .map(|idx| self.tile_zoom_bias_for_pane(idx))
-            .collect();
-        let committed_regions: Vec<(usize, crate::pane::VolumeRegion)> = self
-            .panes()
-            .iter()
-            .filter_map(|p| {
-                let volume = p.volume()?;
-                Some((volume.source_pane?, volume.region?))
-            })
             .collect();
 
         egui::CentralPanel::default()
@@ -321,39 +309,15 @@ impl super::Gui {
                         (self.interaction.resolve_inactive(&ctx, modality), None)
                     };
 
-                    // Both gated on the armed mode, and both **unconditionally**
-                    // rather than only while a drag is in flight.
-                    //
-                    // A press that is going to become a region drag is
-                    // indistinguishable from one that is going to become a pan
-                    // until the pointer moves, and by then the map has already
-                    // slid under the anchor. The same holds for the click: a
-                    // press-and-release inside a radar site's icon while armed is
-                    // a discarded too-small region, not a request to switch site.
-                    //
-                    // # The two armed modes never overlap here
-                    //
-                    // `region_arm` and `armed_draw` gate the same two fields, and
-                    // this composes with the block above rather than fighting it:
-                    // `ArmedSectionFrame` has already set `suppress_pan` and
-                    // cleared `overlay_click_pos`, so an armed *section* frame
-                    // passes through unchanged, and the `||` cannot un-suppress
-                    // anything. It is not merely that the two agree, though — they
-                    // are mutually exclusive at the source. Arming either mode
-                    // disarms the other (`Gui::set_region_arm`), because one drag
-                    // on one map pane cannot be both a line and a box: the section
-                    // pipeline would anchor a line while `handle_region_drag`,
-                    // which reads the pointer raw inside `Map::show`, started a
-                    // box from the same press, and the release would commit both.
-                    // The two gates below are therefore never *both* the reason a
-                    // field is cleared, and only one of `pending_section_line` and
-                    // `pending_region` can be recorded in a frame — which is what
-                    // `Gui::ui`'s two appliers rely on.
-                    let overlay_click_pos = if region_arm {
-                        None
-                    } else {
-                        pointer.overlay_click_pos
-                    };
+                    // The armed cross-section draw is the only modal drag left
+                    // on a map pane; `ArmedSectionFrame` above has already
+                    // suppressed the pan and cleared the click for it, so
+                    // nothing more is gated here. A second mode used to sit
+                    // beside it — the 3D region drag — and the two had to be
+                    // held mutually exclusive because one press cannot be both a
+                    // line and a box. A 3D view's box is now the pane's own
+                    // viewport, so there is no second gesture to exclude.
+                    let overlay_click_pos = pointer.overlay_click_pos;
                     // A confirmed map tap puts a touch-revealed pill row
                     // back to sleep: the reveal was granted for a glance at
                     // this pane's controls, and a tap that reached the map
@@ -386,18 +350,16 @@ impl super::Gui {
                         .as_ref()
                         .is_some_and(|d| d.map_pane == pane_idx);
                     let handle_press = !armed_draw
-                        && !region_arm
                         && !section_editing
                         && self.section_handle_pressed(&ctx, pane_idx);
-                    let suppress_pan =
-                        pointer.suppress_pan || region_arm || section_editing || handle_press;
+                    let suppress_pan = pointer.suppress_pan || section_editing || handle_press;
 
                     // The fade gesture (plan §1.8, `ui_fade.rs`): a confirmed
                     // click on the already-active map pane's own rect. The
                     // resolvers upstream have already made it a *click* (drags
                     // discarded) off every floating layer, and the armed
-                    // modes never deliver one (`region_arm` clears it above,
-                    // the armed-draw resolver never reports one) — the
+                    // armed draw never delivers one (its resolver never
+                    // reports a click) — the
                     // remaining conditions are spelled here: the pane is
                     // active and was active before this press
                     // (`fade_gesture_allowed` checks the press record), the
@@ -472,9 +434,9 @@ impl super::Gui {
                     // silently in the direction that looks like it works, which
                     // is why `last_pane_content` records what each arm actually
                     // drew rather than what the branch was handed.
-                    match pane.kind() {
-                        PaneKind::Map => {
-                            self.record_pane_content(pane_idx, PaneKind::Map, pane_rect);
+                    match pane.render_view() {
+                        RenderView::PlanView => {
+                            self.record_pane_content(pane_idx, RenderView::PlanView, pane_rect);
                             let tile_zoom_bias =
                                 tile_zoom_biases.get(pane_idx).copied().unwrap_or(0);
                             if let Some(tiles) = tiles_owned.as_mut() {
@@ -552,12 +514,6 @@ impl super::Gui {
                                             overlay_click_pos,
                                             click_consumed: &mut click_consumed,
                                             preferences: &self.preferences,
-                                            region: pane_render::RegionCtx {
-                                                armed: region_arm,
-                                                drag: &mut self.region_drag,
-                                                pending: &mut self.pending_region,
-                                                committed: &committed_regions,
-                                            },
                                             #[cfg(test)]
                                             paint_order: Vec::new(),
                                         };
@@ -612,8 +568,8 @@ impl super::Gui {
                         // sampler behind either one yet, and a pane that draws
                         // *something* while there is nothing to draw is how a
                         // fabricated picture ships.
-                        PaneKind::CrossSection => {
-                            self.record_pane_content(pane_idx, PaneKind::CrossSection, pane_rect);
+                        RenderView::CrossSection => {
+                            self.record_pane_content(pane_idx, RenderView::CrossSection, pane_rect);
                             let top_clearance =
                                 crate::ui::pills::pill_row_clearance(child_ui.ctx(), pane_idx);
                             section_render::render_cross_section(
@@ -636,8 +592,8 @@ impl super::Gui {
                                 &self.preferences,
                             );
                         }
-                        PaneKind::Volume => {
-                            self.record_pane_content(pane_idx, PaneKind::Volume, pane_rect);
+                        RenderView::Volume => {
+                            self.record_pane_content(pane_idx, RenderView::Volume, pane_rect);
                             // The pane's own map, drawn where only the mirror
                             // can see it. This is the floor: not a second map,
                             // not a synthetic projector and not a borrowed
@@ -673,9 +629,21 @@ impl super::Gui {
                                     user_location,
                                     user_heading,
                                     user_fix: user_fix.clone(),
-                                    committed_regions: &committed_regions,
                                     actions: &mut actions,
                                 },
+                            );
+                            // The box, measured off the very viewport the floor
+                            // above was just drawn through — same rect, same
+                            // `map_memory`, same centre. That is what makes the
+                            // floor cover the box by construction rather than by
+                            // two things happening to agree, and it is the whole
+                            // point of the region being the viewport. Measured
+                            // *after* the strip so it reads the memory
+                            // `Map::show` has settled this frame.
+                            let region = crate::ui_region::region_for_viewport(
+                                pane_rect,
+                                &map_memory,
+                                center,
                             );
                             // Cloned rather than borrowed: `record_pane_content`
                             // above and the probe below both want `&mut self`,
@@ -702,6 +670,7 @@ impl super::Gui {
                                 chrome,
                                 source_geo,
                                 mirror_size_points,
+                                region,
                                 &mut actions,
                                 &mut self.volume_alpha,
                                 &self.volume_iso,
@@ -738,25 +707,14 @@ impl super::Gui {
                     // on every pane would read as five armed modes. Painted
                     // on its own sub-layer, like the pending-render notice,
                     // so nothing drawn later in the pane can cover it.
-                    if is_active && matches!(pane.kind(), PaneKind::Map) {
-                        if region_arm {
-                            paint_armed_hint_chip(
-                                &ctx,
-                                pane_idx,
-                                pane_rect,
-                                &region_arm_hint(),
-                                // The armed region drag's own box colour.
-                                crate::ui_region::REGION_ARM_COLOR,
-                            );
-                        } else if self.section_draw_armed() {
-                            paint_armed_hint_chip(
-                                &ctx,
-                                pane_idx,
-                                pane_rect,
-                                SECTION_ARM_HINT,
-                                SECTION_TRACK_COLOR,
-                            );
-                        }
+                    if is_active && pane.is_map() && self.section_draw_armed() {
+                        paint_armed_hint_chip(
+                            &ctx,
+                            pane_idx,
+                            pane_rect,
+                            SECTION_ARM_HINT,
+                            SECTION_TRACK_COLOR,
+                        );
                     }
 
                     // Restore map_memory and pane
@@ -925,7 +883,7 @@ impl super::Gui {
     ///
     /// # Why the pointer is read raw here
     ///
-    /// The same answer `handle_region_drag` gives: the click convention is
+    /// The click convention is
     /// about *clicks*, and a drag is a press frame, a stream of moved frames
     /// and a release frame, none of which a confirmed-tap position can
     /// express. The dialog gate the convention enforces is applied explicitly
@@ -969,7 +927,7 @@ impl super::Gui {
         // mode change would go on suppressing pans near handles that are no
         // longer live.
         self.section_handles.retain(|z| z.map_pane != pane_idx);
-        if self.section_draw_armed || self.region_arm {
+        if self.section_draw_armed {
             return;
         }
 
@@ -1029,7 +987,7 @@ impl super::Gui {
         };
 
         // The press frame. Gated on this pane's own rect and on the dialog
-        // layer, exactly as the region drag's press is. Shift at the press
+        // layer. Shift at the press
         // picks the body drag's verb — sweep about the midpoint instead of
         // translate — and is latched into the drag: see
         // `SectionEditDrag::begin`.
@@ -1056,7 +1014,7 @@ impl super::Gui {
         }
 
         // Everything below belongs to *this* pane's drag only, and — like the
-        // region drag — it is not gated on the pane's rect: dragging an
+        // drag — it is not gated on the pane's rect: dragging an
         // endpoint past a pane edge is ordinary, and stopping there would read
         // as the gesture being dropped.
         let Some(drag) = self
@@ -1334,7 +1292,7 @@ impl super::Gui {
     /// map cannot swallow the drag the orbit camera wants, structurally rather
     /// than by a flag someone has to remember to set. What is passed as empty
     /// here is the state a *second* live map would otherwise share with the
-    /// first: a region drag in flight, a click to consume, a long-press.
+    /// first: a click to consume, a long-press.
     /// Sharing those would let an off-screen map answer a gesture aimed at
     /// something on screen.
     #[allow(clippy::too_many_lines)]
@@ -1356,7 +1314,6 @@ impl super::Gui {
             user_location,
             user_heading,
             user_fix,
-            committed_regions,
             actions,
         } = floor;
         use walkers::Map;
@@ -1378,11 +1335,11 @@ impl super::Gui {
         );
         strip_ui.set_clip_rect(strip);
 
-        // The three pieces of pointer state a live map pane owns, given to
-        // this one as fresh locals so the strip cannot reach the real ones.
+        // The one piece of pointer state a live map pane owns, given to this
+        // one as a fresh local so the strip cannot reach the real one: a click
+        // to consume. Sharing it would let an off-screen map answer a gesture
+        // aimed at something on screen.
         let mut strip_click_consumed = false;
-        let mut strip_region_drag = None;
-        let mut strip_pending_region = None;
 
         Map::new(None, map_memory, center)
             // Every input lever walkers has, off. See the doc comment: the
@@ -1429,12 +1386,6 @@ impl super::Gui {
                     overlay_click_pos: None,
                     click_consumed: &mut strip_click_consumed,
                     preferences: &self.preferences,
-                    region: pane_render::RegionCtx {
-                        armed: false,
-                        drag: &mut strip_region_drag,
-                        pending: &mut strip_pending_region,
-                        committed: committed_regions,
-                    },
                     #[cfg(test)]
                     paint_order: Vec::new(),
                 };
@@ -1541,7 +1492,6 @@ struct FloorStripCtx<'a> {
     user_location: Option<(f64, f64)>,
     user_heading: Option<f32>,
     user_fix: Option<rustdar_gps::GpsFix>,
-    committed_regions: &'a [(usize, crate::pane::VolumeRegion)],
     actions: &'a mut Vec<GuiAction>,
 }
 
@@ -1627,6 +1577,7 @@ fn render_volume_pane(
     chrome: Option<f32>,
     source_geo: Option<crate::volume_view::MapPaneGeo>,
     mirror_size_points: egui::Vec2,
+    region: Option<crate::pane::VolumeRegion>,
     actions: &mut Vec<GuiAction>,
     alpha_curves: &mut crate::volume_alpha::AlphaCurves,
     iso_thresholds: &crate::volume_iso::IsoThresholds,
@@ -1641,6 +1592,7 @@ fn render_volume_pane(
         current_stamp,
         source_geo,
         mirror_size_points,
+        region,
         actions,
         alpha_curves,
         iso_thresholds,
@@ -1700,6 +1652,7 @@ fn volume_pane_outcome(
     current_stamp: Option<crate::ui::CurrentVolumeStamp>,
     source_geo: Option<crate::volume_view::MapPaneGeo>,
     mirror_size_points: egui::Vec2,
+    region: Option<crate::pane::VolumeRegion>,
     actions: &mut Vec<GuiAction>,
     alpha_curves: &crate::volume_alpha::AlphaCurves,
     iso_thresholds: &crate::volume_iso::IsoThresholds,
@@ -1713,10 +1666,8 @@ fn volume_pane_outcome(
     // measure it against a camera the user has not seen yet.
     //
     // Answered rather than unwrapped for the reason the `volume_mut` below gives.
-    let Some((camera_before, box_size_km, view_mode)) = pane
-        .volume()
-        .map(|v| (v.camera, v.box_size_km(), v.view_mode))
-    else {
+    let box_size_km = crate::pane::box_size_km(region);
+    let Some((camera_before, view_mode)) = pane.volume().map(|v| (v.camera, v.view_mode)) else {
         return VolumeOutcome::empty_state(VOLUME_EMPTY_STATE.to_owned());
     };
 
@@ -1881,7 +1832,6 @@ fn volume_pane_outcome(
     };
     volume.camera.nudge(delta);
     let camera = volume.camera;
-    let region = volume.region;
     let floor = !volume.hide_floor;
     let already_rendered = volume.rendered_for.clone();
 
@@ -2159,18 +2109,18 @@ pub(crate) fn render_volume_controls(
 /// **It returns the region as well as the camera**, and the pivot as well as the
 /// angles. Both are easy to leave out and both fail the same way: a reset that
 /// visibly changes something and leaves the pane still looking at the wrong
-/// place, which reads as a control that half-works. A `source_pane` left behind
-/// is quieter still — the next region dragged on that map would re-aim this pane
-/// instead of opening one where it was dragged.
+/// place, which reads as a control that half-works.
+///
+/// **The box is deliberately not reset**, because it is no longer something
+/// this pane holds: it is the pane's viewport, and the way back to a wider box
+/// is to zoom the map out. Resetting it here would mean silently moving the
+/// user's map, which is a bigger edit than the button offers.
 pub(crate) fn reset_volume_view(volume: &mut crate::pane::VolumePane) {
     volume.camera = crate::pane::OrbitCamera::default();
-    volume.region = None;
-    volume.source_pane = None;
     // `view_mode` stays, deliberately: the reset is for a pane that is *lost*
-    // — angle, zoom, centre, region — and the view mode is not a way to be
-    // lost, it is a choice of picture. A reset that also flipped an
-    // isosurface pane back to the lit volume would un-choose something the
-    // user chose on purpose.
+    // — angle, zoom, centre — and the view mode is not a way to be lost, it is
+    // a choice of picture. A reset that also flipped an isosurface pane back to
+    // the lit volume would un-choose something the user chose on purpose.
 }
 
 /// Where each 3D pane draws its own map so that **only the mirror can see it**,
@@ -2463,19 +2413,6 @@ const SECTION_TRACK_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 214, 10)
 
 /// What the armed cross-section draw's hint chip says.
 pub(crate) const SECTION_ARM_HINT: &str = "Drag A-B to draw cross-section";
-
-/// What the armed region drag's hint chip says: the gesture, then the box
-/// sizes the resampler will actually honour — computed from the same
-/// constants `VolumeRegion::new` clamps by and `box_size_km` falls back to,
-/// so the chip cannot state sizes the drag will not deliver.
-pub(crate) fn region_arm_hint() -> String {
-    format!(
-        "Drag to pick 3D region - box {:.0}-{:.0} km (default {:.0} km)",
-        2.0 * rustdar_radar::voxel::MIN_HALF_WIDTH_KM,
-        2.0 * rustdar_radar::voxel::MAX_HALF_WIDTH_KM,
-        2.0 * crate::pane::DEFAULT_HALF_WIDTH_KM,
-    )
-}
 
 /// Padding between the hint chip's text and its dashed border, each axis.
 const ARMED_HINT_PADDING: egui::Vec2 = egui::vec2(12.0, 8.0);

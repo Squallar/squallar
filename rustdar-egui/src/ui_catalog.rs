@@ -644,10 +644,10 @@ impl super::Gui {
     fn catalog_apply_product(&mut self, product: RadarProduct) {
         let idx = self.active_pane;
         if !self.panes[idx].is_map() {
-            // Through the deferred applier like every other kind writer: the
+            // Through the deferred applier like every other view writer: the
             // direct write would be safe *here*, but one rule for all of them
             // costs only a frame.
-            self.request_pane_kind(idx, crate::pane::PaneKind::Map);
+            self.request_pane_view(idx, rustdar_radar::types::RenderView::PlanView);
         }
         // A product tile means "show me this picture", so the Radar layer
         // turns on with it — a product under a hidden radar layer is a click
@@ -755,11 +755,11 @@ impl super::Gui {
         let count = self.pane_layout.pane_count;
 
         for idx in 0..count {
-            if self.panes[idx].kind() == crate::pane::PaneKind::Volume {
+            if self.panes[idx].render_view() == rustdar_radar::types::RenderView::Volume {
                 actions.push(GuiAction::ReleaseVolume { pane_idx: idx });
             }
             let pane = &mut self.panes[idx];
-            pane.set_kind(crate::pane::PaneKind::Map);
+            pane.set_view(rustdar_radar::types::RenderView::PlanView);
             if let Some(pp) = preset.panes.get(idx) {
                 pane.selected_product = pp.product;
                 pane.selected_elevation = pp.elevation;

@@ -442,12 +442,15 @@ impl MomentSlot {
 /// different buffers, and nothing in a buffer says which it is.
 ///
 /// It lives here, in the crate both the frontend and the UI depend on, so
-/// `rustdar_egui`'s `PaneKind` can map *into* it without either of those crates
-/// having to name the other. `PaneKind` is what a pane is; this is what a
-/// render produced. They are one-to-one today, and separate anyway: a pane is a
-/// place on screen with state and a lifetime, and a `RenderView` is a fact
-/// about a buffer that outlives the pane that asked for it — it is what a
-/// cached render is keyed by.
+/// `rustdar_egui`'s `PaneContent` can map *into* it without either of those
+/// crates having to name the other. A pane *kind* is what a pane is; this is
+/// what a render produced, and the two are deliberately **not** one-to-one: a
+/// map pane produces a `PlanView` or a `Volume` depending on its render mode,
+/// which is exactly what makes 3D an alternative rendering of a pane rather
+/// than another kind of pane. A pane is a place on screen with state and a
+/// lifetime; a `RenderView` is a fact about a buffer that outlives the pane
+/// that asked for it — it is what a cached render is keyed by, and it is
+/// therefore also what looping and whole-volume reads are classified against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RenderView {
     /// The plan-view raster every render produced before cross-sections
@@ -486,6 +489,52 @@ impl RenderView {
             // by beam height; a raymarch reads a grid resampled from every cut.
             // Both are vertical structure, which one sweep does not have.
             Self::CrossSection | Self::Volume => true,
+        }
+    }
+
+    /// Whether a pane producing this view can animate a sequence of past
+    /// volumes.
+    ///
+    /// A loop is a sequence of *rendered pictures*, one per volume, held as
+    /// textures — so the question is not "does this view draw radar" but "can
+    /// one volume's worth of it be reduced to a picture that stays correct
+    /// while it sits in a list". All three can:
+    ///
+    /// * A plan view is an `IMAGE_SIZE²` raster of one tilt, positioned by the
+    ///   site's coordinates. Nothing about the pane changes what it depicts.
+    /// * A cross-section is a [`crate::xsect::SECTION_WIDTH`] ×
+    ///   [`crate::xsect::SECTION_HEIGHT`] raster of one line through one
+    ///   volume. The line is part of the loop's identity, exactly as the
+    ///   product is for a plan view.
+    /// * A **3D volume** can too, and its frame is the one that is not a
+    ///   picture. The picture is raymarched live from the eye every frame, so a
+    ///   cached *image* would be specific to the camera and one orbit would
+    ///   invalidate the whole loop at once. What it caches instead is the
+    ///   **input**: each frame is a resident 3D texture and the march swaps
+    ///   which one it samples, at a measured +0.01 ms (+2%) on a discrete GPU
+    ///   and +0.31–0.78 ms (+3–4%) on a software rasteriser. So orbiting a
+    ///   resident loop costs nothing, and a frame's identity is a volume target
+    ///   rather than a raster.
+    ///
+    /// **Classified against the view rather than the pane kind**, because the
+    /// answer is a property of what a frame *is*, and a map pane produces two
+    /// different kinds of frame depending on its render mode. Asking the kind
+    /// would give one answer for both.
+    ///
+    /// Exhaustive on purpose, like [`Self::reads_whole_volume`]: a fourth view
+    /// must be classified here rather than defaulting into — or out of — the
+    /// loop machinery. The direction matters, because the two mistakes are not
+    /// symmetric. A view wrongly excluded is a missing feature; a view wrongly
+    /// included is a pane whose frames nothing renders, which under Sync Layers
+    /// holds **every other pane's** loop back for ever. That asymmetry is why
+    /// `Volume` answered `false` until three things existed: a store a holder
+    /// can own a *set* of grids in, a build path that accepts a volume time
+    /// that is not the newest, and a pacing budget for the resample. All three
+    /// do now, which is what changed the answer — the claim was never that the
+    /// memory did not fit.
+    pub fn can_loop(self) -> bool {
+        match self {
+            Self::PlanView | Self::CrossSection | Self::Volume => true,
         }
     }
 
