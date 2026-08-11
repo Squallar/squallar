@@ -348,6 +348,24 @@ pub struct App {
     /// requests — animations — never land here: they ask for the redraw on
     /// the spot.
     egui_repaint_at: Option<web_time::Instant>,
+    /// When an auto-poll timer next needs a frame, or `None` while none of
+    /// them do.
+    ///
+    /// The same arrangement as [`Self::egui_repaint_at`] and for the same
+    /// reason: written by [`App::handle_redraw`] from
+    /// [`auto_poll_delay`](Self::auto_poll_delay) — which folds the radar
+    /// poll, the overlay refreshes, the status bar's countdown and the chunk
+    /// feed's next round — then folded into the loop's control flow so it
+    /// actually wakes for it, and spent in [`App::about_to_wait`] as a redraw
+    /// request. Every one of those is checked inside the egui pass, so unlike
+    /// the autosave none of it can be serviced off a bare iteration.
+    ///
+    /// This field is the whole fix. The end-of-frame re-arm used to include
+    /// `gui.is_auto_poll_active()`, which goes true on frame one of the
+    /// default configuration and never goes false again — so the app asked for
+    /// a redraw at the end of every frame, forever, at whatever rate the
+    /// display could deliver, to service a poll that fires once a minute.
+    auto_poll_at: Option<web_time::Instant>,
     /// Whether the current site was guessed from the timezone rather than chosen.
     ///
     /// A guessed site is the one thing a location fix is allowed to overwrite.
@@ -440,6 +458,14 @@ struct AutosaveState {
 /// is closed. Three seconds keeps a pan-and-zoom durable at human timescales
 /// while staying far below the rate at which anything here is edited.
 const AUTOSAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The shortest sleep [`App::auto_poll_delay`] will ask for.
+///
+/// Only ever reached by a timer that has saturated to zero, which means the
+/// frame that just ran did not consume the poll it was due. One second is the
+/// rate the status bar's countdown already ticks at, so a retry on this floor
+/// costs at most what an app with its status bar up already spends.
+const MIN_WAKE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// What a frame's egui repaint request means for the loop. See
 /// [`repaint_action`].
@@ -720,6 +746,7 @@ impl App {
                 touched: false,
             },
             egui_repaint_at: None,
+            auto_poll_at: None,
             site_is_provisional,
             volume_store: std::sync::Arc::new(crate::volume::bridge::VolumeStore::new()),
             #[cfg(test)]
@@ -891,19 +918,38 @@ impl App {
         let repaint_delay = self.present_frame(screen_descriptor);
         self.process_gui_actions(gui_actions);
 
-        // Request redraw only when there is pending background work or auto-poll is active
+        // Request redraw only while there is pending background work.
+        //
+        // Every term here is something that finishes: a render, a loop frame, a
+        // chunk round, a socket that comes back up. Auto-poll used to be one of
+        // them and is not, because it never finishes — see
+        // [`Self::auto_poll_at`], which schedules its wake instead.
         if self.render.any_render_in_flight()
-            || self.gui.is_auto_poll_active()
             || self.gui.any_loop_active()
             || self.chunk_feeds.any_in_flight()
             // A down socket reconnects from `sync_sites`, which only runs on a
             // frame. Without this term the retry would depend on something else
             // happening to keep the loop awake, so turning auto-poll off with the
             // notifier unreachable would strand it permanently.
-            || self.chunk_notify.reconnect_pending()
+            //
+            // The *handshake* only. The backoff half of this used to be here
+            // too, and it does not finish: the notifier's retry doubles to a
+            // five-minute ceiling and never gives up, so anyone who cannot
+            // reach the service at all held the loop at refresh rate for the
+            // whole session. It is scheduled instead, through
+            // `ChunkNotifier::next_retry_delay`.
+            || self.chunk_notify.handshake_pending()
         {
             notify_redraw(&self.window);
         }
+
+        // What auto-poll owes a frame for, as of the frame just drawn.
+        // Recomputed every frame rather than accumulated, so a change that
+        // ends the obligation — the last live pane going historic, the status
+        // bar collapsing — takes the wake down with it.
+        self.auto_poll_at = self
+            .auto_poll_delay()
+            .map(|delay| web_time::Instant::now() + delay);
 
         // egui's own repaint request — the animation fix (see
         // `repaint_action`): an immediate ask repaints now, a timed one
@@ -2088,8 +2134,8 @@ impl App {
     }
 
     /// The state the loop should be left in, given what the autosave still
-    /// owes and when egui next wants a timed repaint — whichever comes
-    /// first.
+    /// owes, when egui next wants a timed repaint, and when auto-poll next
+    /// needs a frame — whichever comes first.
     ///
     /// Split out of [`schedule_wakeup`] so the whole decision is
     /// reachable from a test: an `ActiveEventLoop` cannot be had outside a
@@ -2105,13 +2151,16 @@ impl App {
     /// the same expired deadline. Measured on X11 at winit 0.30.13, that is
     /// ~164,000 iterations per second on a full core, forever.
     fn wakeup_control_flow(&self) -> ControlFlow {
-        let egui_delay = self
-            .egui_repaint_at
-            .map(|at| at.saturating_duration_since(web_time::Instant::now()));
-        let delay = match (self.autosave_delay(), egui_delay) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
+        let now = web_time::Instant::now();
+        let until = |at: Option<web_time::Instant>| at.map(|at| at.saturating_duration_since(now));
+        let delay = [
+            self.autosave_delay(),
+            until(self.egui_repaint_at),
+            until(self.auto_poll_at),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         match delay {
             // `wait_duration` rather than `WaitUntil`: winit's `Instant` is
             // `std::time`'s natively and `web_time`'s on wasm, so no single
@@ -2143,6 +2192,68 @@ impl App {
             .map(|last| last + AUTOSAVE_INTERVAL)
             .unwrap_or_else(web_time::Instant::now);
         Some(deadline.saturating_duration_since(web_time::Instant::now()))
+    }
+
+    /// How long the loop may sleep before one of the app's timers next needs a
+    /// **frame**, or `None` when none of them do and it may sleep until
+    /// something happens.
+    ///
+    /// [`autosave_delay`](Self::autosave_delay)'s counterpart, and split out
+    /// for the same reason: this is the whole decision, reachable from a test.
+    /// Unlike the autosave, none of this can be spent off a bare iteration —
+    /// every one of these timers is checked from inside the frame.
+    ///
+    /// Four obligations, folded because they are spent the same way:
+    ///
+    /// * [`Gui::auto_poll_delay`] — when the radar archive poll or an
+    ///   overlay's refresh is next due, on the order of a minute.
+    /// * [`Gui::status_tick_delay`] — when the status bar's auto-poll chip
+    ///   next prints a different number, typically at 1 Hz, and only while
+    ///   that chip is on screen. Usually the soonest by a wide margin, and the
+    ///   difference between an app that draws once a second and one that draws
+    ///   once a minute.
+    /// * [`ChunkFeedManager::next_round_delay`] — when a live site's chunk
+    ///   feed next wants a round, every five to ten seconds. This one is not
+    ///   optional: rounds are dispatched from a frame, and they used to ride
+    ///   on the unconditional re-arm that auto-poll kept true.
+    /// * [`ChunkNotifier::next_retry_delay`] — when a notification socket's
+    ///   backoff is up, five seconds to five minutes out. Also not optional,
+    ///   and for a sharper reason: that backoff never gives up, so re-arming
+    ///   on it — which is what the frame loop did — is a permanent spinner for
+    ///   anyone who cannot reach the notifier at all.
+    ///
+    /// A zero becomes [`MIN_WAKE`] rather than a zero-length sleep. A term
+    /// reads zero only when the frame that just ran did not consume something
+    /// it was due, and re-arming at zero would spin the loop rather than retry
+    /// — the same failure an expired `WaitUntil` produces, measured at ~164,000
+    /// iterations per second (see [`wakeup_control_flow`]). The countdown term
+    /// is never zero by construction, so the sub-second precision that keeps
+    /// it honest survives this.
+    ///
+    /// One term with a floor it can sit on: an overlay handler whose
+    /// `create_fetch_tasks` returns nothing leaves `overlay_poll_delay` at
+    /// zero for good, because `App::fetch_overlay` returns before
+    /// `set_fetching` when there are no tasks to run. That is a 1 Hz retry
+    /// rather than the display-rate one it used to be, and it is bounded by
+    /// this floor rather than by anything the handler does — worth fixing at
+    /// the handler seam, not here.
+    ///
+    /// [`Gui::auto_poll_delay`]: rustdar_egui::Gui::auto_poll_delay
+    /// [`Gui::status_tick_delay`]: rustdar_egui::Gui::status_tick_delay
+    /// [`ChunkFeedManager::next_round_delay`]: crate::chunk_feed::ChunkFeedManager::next_round_delay
+    /// [`ChunkNotifier::next_retry_delay`]: crate::chunk_notify::ChunkNotifier::next_retry_delay
+    /// [`wakeup_control_flow`]: App::wakeup_control_flow
+    fn auto_poll_delay(&self) -> Option<std::time::Duration> {
+        [
+            self.gui.auto_poll_delay(),
+            self.gui.status_tick_delay(),
+            self.chunk_feeds.next_round_delay(),
+            self.chunk_notify.next_retry_delay(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .map(|delay| if delay.is_zero() { MIN_WAKE } else { delay })
     }
 
     /// Request application exit - handles both GUI and keyboard exit requests
@@ -2499,6 +2610,23 @@ impl ApplicationHandler for App {
             .is_some_and(|at| web_time::Instant::now() >= at)
         {
             self.egui_repaint_at = None;
+            notify_redraw(&self.window);
+        }
+        // A due auto-poll, spent the same way and deliberately *not* the way
+        // the autosave below is. `check_auto_polls` runs inside the egui pass,
+        // so this obligation can only be discharged by a real frame; there is
+        // no cheap direct call to make instead.
+        //
+        // Cleared as it is spent, so the redraw is asked for once. The frame
+        // it produces recomputes the deadline from scratch
+        // (`handle_redraw`) — which is what bounds the retry when a poll
+        // somehow cannot be consumed: the next deadline is at least
+        // `MIN_WAKE` away rather than immediately due again.
+        if self
+            .auto_poll_at
+            .is_some_and(|at| web_time::Instant::now() >= at)
+        {
+            self.auto_poll_at = None;
             notify_redraw(&self.window);
         }
         // The save the wake-up below is scheduled for, spent here rather than on

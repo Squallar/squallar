@@ -457,6 +457,16 @@ impl super::App {
 
         let tasks = self.gui.overlays.create_fetch_tasks(kind, &config);
         if tasks.is_empty() {
+            // Leaves the layer permanently due: nothing is set fetching and no
+            // result will arrive to stamp `fetch_time`, so
+            // `Gui::overlay_poll_delay` answers zero on every following frame.
+            // `App::auto_poll_delay`'s floor holds that at one frame a second
+            // rather than one per refresh — which is where it used to sit — but
+            // the retry is still a retry of something that cannot succeed. The
+            // fix belongs at this seam (a handler that cannot build a task
+            // should be able to say so, and be believed) rather than in the
+            // schedule; see `MetarHandler::create_fetch_tasks`, whose empty
+            // return is a client that failed to build.
             return;
         }
 

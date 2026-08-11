@@ -122,6 +122,37 @@ impl SiteFeed {
             Some(last) => now.duration_since(last) >= poller.suggested_interval(),
         }
     }
+
+    /// How long until this feed next wants a frame, or `None` when it does not
+    /// want one at all.
+    ///
+    /// The scheduling half of [`Self::should_poll`], and it has to agree with
+    /// it: the event loop sleeps on this answer, so a round it does not
+    /// account for is a round that never happens. The two disagree in exactly
+    /// one place, and deliberately — a retired feed never polls, but
+    /// [`ChunkFeedManager::ensure`] rebuilds it once [`RETRY_AFTER`] is up, so
+    /// the wake belongs to the retirement rather than to the poll.
+    ///
+    /// A round in flight wants nothing: it is holding the loop awake through
+    /// [`ChunkFeedManager::any_in_flight`], and its completion asks for a
+    /// frame of its own.
+    fn next_round_delay(&self, now: web_time::Instant) -> Option<std::time::Duration> {
+        if self.in_flight {
+            return None;
+        }
+        if let Some((_, at)) = self.retired {
+            return Some(RETRY_AFTER.saturating_sub(now.duration_since(at)));
+        }
+        let poller = self.poller.as_ref()?;
+        let Some(last) = self.last_poll else {
+            return Some(std::time::Duration::ZERO);
+        };
+        Some(
+            poller
+                .suggested_interval()
+                .saturating_sub(now.duration_since(last)),
+        )
+    }
 }
 
 /// Elevation in tenths of a degree, so two angles that round to the same tilt
@@ -159,6 +190,27 @@ impl ChunkFeedManager {
     /// Sites with a round in flight, for the redraw re-arm.
     pub fn any_in_flight(&self) -> bool {
         self.feeds.values().any(|f| f.in_flight)
+    }
+
+    /// How long until some feed next wants a round, or `None` when none of
+    /// them will without something else happening first.
+    ///
+    /// Rounds are dispatched from [`App::drive_chunk_feeds`], which only runs
+    /// on a frame, so this is what gets the frame there. It used to come free:
+    /// the frame loop re-armed unconditionally while auto-poll was on, which
+    /// it always was, so a five-second cadence rode on a sixty-per-second one.
+    ///
+    /// No live-site or enabled gate needed, because the map already carries
+    /// both — `drive_chunk_feeds` calls `retain_live` every frame, with an
+    /// empty list when the setting is off.
+    ///
+    /// [`App::drive_chunk_feeds`]: crate::app::App
+    pub fn next_round_delay(&self) -> Option<std::time::Duration> {
+        let now = web_time::Instant::now();
+        self.feeds
+            .values()
+            .filter_map(|feed| feed.next_round_delay(now))
+            .min()
     }
 
     /// Whether this site is currently fed by chunks — the test

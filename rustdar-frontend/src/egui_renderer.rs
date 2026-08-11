@@ -189,6 +189,39 @@ fn clamp_to_sources(clip: egui::Rect, sources: &[egui::Rect]) -> egui::Rect {
         .map_or(egui::Rect::ZERO, |source| clip.intersect(*source))
 }
 
+/// Make `ctx.request_repaint()` reach the event loop.
+///
+/// egui's own answer to "something off-frame changed, draw again" is
+/// [`egui::Context::request_repaint`], and on its own that call reaches winit
+/// through **nothing at all**: it sets a flag the next `begin_pass` reads, and
+/// a loop parked on `ControlFlow::Wait` never gets there. The one channel out
+/// is this callback, and until it was installed the workspace had two callers
+/// relying on a wake that did not exist — `tile_source`'s tile arrival (whose
+/// own module doc names the symptom: "without which a fetched tile would not
+/// appear until some unrelated input woke the UI") and `ui_map`'s. They worked
+/// only because the frame loop happened to be re-arming unconditionally, and
+/// stopped working the moment it stopped.
+///
+/// Installed at the one place a `Context` is made, rather than at each caller,
+/// because the loop now sleeps for real: every future `request_repaint` from a
+/// background thread is a wake this closes in advance.
+///
+/// **Only a zero delay wakes.** A timed request — `request_repaint_after`, a
+/// tooltip's dwell, a cursor blink — is already carried out of the frame by
+/// `FullOutput`'s `repaint_delay` and scheduled by
+/// [`repaint_action`](crate::app::repaint_action), and honouring it here as
+/// well would turn every such request into an immediate redraw: egui re-asks
+/// on each pass, so the "wait half a second" would become a frame per frame,
+/// forever. The one thing this drops is an off-frame *timed* request, which
+/// nothing makes and which has no meaning without a frame to schedule it from.
+pub(crate) fn install_repaint_wake(ctx: &Context, wake: impl Fn() + Send + Sync + 'static) {
+    ctx.set_request_repaint_callback(move |info| {
+        if info.delay.is_zero() {
+            wake();
+        }
+    });
+}
+
 impl EguiRenderer {
     pub fn context(&self) -> &Context {
         self.state.egui_ctx()
@@ -199,9 +232,16 @@ impl EguiRenderer {
         output_color_format: TextureFormat,
         output_depth_format: Option<TextureFormat>,
         msaa_samples: u32,
-        window: &Window,
+        window: &crate::WindowRef,
     ) -> EguiRenderer {
         let egui_context = Context::default();
+        // See `install_repaint_wake`. The window is held by the closure for as
+        // long as this context lives, which is exactly as long as the renderer
+        // that owns it — `suspended` drops both together.
+        let held = Some(window.clone());
+        install_repaint_wake(&egui_context, move || {
+            crate::app::notify_redraw(&held);
+        });
 
         // Query the device's actual texture size limit
         let max_texture_side = device.limits().max_texture_dimension_2d as usize;

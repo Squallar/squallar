@@ -16,6 +16,90 @@ fn body_of(source: &'static str, signature: &str) -> &'static str {
         .unwrap_or_else(|| panic!("`{signature}` is no longer a method there"))
 }
 
+/// **`ctx.request_repaint()` from a background thread has to reach winit.**
+///
+/// egui's request is a flag the next `begin_pass` reads; on a loop parked in
+/// `ControlFlow::Wait` there is no next `begin_pass`, and the callback
+/// installed here is the only channel out. Two callers already depended on it
+/// — the tile fetcher and the map — and neither was reached, because nothing
+/// in the workspace had ever called `set_request_repaint_callback`. It did not
+/// show, because the frame loop was re-arming a redraw unconditionally; the
+/// moment that stopped, a fetched map tile would sit in its channel until the
+/// user happened to move the mouse.
+///
+/// Driven from another thread, which is where the tile fetcher calls from and
+/// what the `Send + Sync` bound on the callback is for.
+#[test]
+fn an_off_frame_repaint_request_reaches_the_event_loop() {
+    let ctx = egui::Context::default();
+    let woke = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = std::sync::Arc::clone(&woke);
+    super::install_repaint_wake(&ctx, move || {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+
+    let asking = ctx.clone();
+    std::thread::spawn(move || asking.request_repaint())
+        .join()
+        .expect("the requesting thread panicked");
+
+    assert_eq!(
+        woke.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a repaint asked for off-frame woke nothing, so whatever asked for it \
+             is waiting for an unrelated event to draw its result"
+    );
+}
+
+/// …and a *timed* request must not, or every dwell becomes a busy loop.
+///
+/// `request_repaint_after` is already carried out of the frame by
+/// `FullOutput`'s `repaint_delay` and scheduled by `repaint_action`. Waking
+/// immediately here as well would draw at once, and egui re-asks on every
+/// pass — so a tooltip's half-second dwell would become a frame per frame for
+/// as long as the pointer rests, which is the exact failure the auto-poll
+/// re-arm was just cured of.
+#[test]
+fn a_timed_repaint_request_is_left_to_the_frames_own_schedule() {
+    let ctx = egui::Context::default();
+    let woke = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = std::sync::Arc::clone(&woke);
+    super::install_repaint_wake(&ctx, move || {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+
+    ctx.request_repaint_after(std::time::Duration::from_secs(1));
+
+    assert_eq!(
+        woke.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a request to repaint in a second was spent as a request to repaint \
+             now"
+    );
+}
+
+/// The wiring itself: the one place a `Context` is built has to install it,
+/// and what it installs has to be the redraw request.
+///
+/// A source probe because `EguiRenderer::new` needs a real `Window` — the
+/// same reason `attachment_config_is_built_from_new_s_own_parameters` is one.
+/// The behavioural tests above drive `install_repaint_wake` directly and stay
+/// green with nothing calling it.
+#[test]
+fn the_renderer_installs_that_wake_on_the_context_it_builds() {
+    let body = body_of(include_str!("../egui_renderer.rs"), "    pub fn new(");
+    assert!(
+        body.contains("install_repaint_wake(&egui_context"),
+        "the context is built without a repaint wake, so every off-frame \
+             `ctx.request_repaint()` in the app is a no-op: {body}"
+    );
+    assert!(
+        body.contains("notify_redraw("),
+        "the wake no longer ends in a redraw request, so it produces a loop \
+             iteration rather than the frame egui asked for: {body}"
+    );
+}
+
 /// The callbacks' command buffers must precede egui's own.
 ///
 /// A callback's `prepare` records the work its `paint` then reads inside

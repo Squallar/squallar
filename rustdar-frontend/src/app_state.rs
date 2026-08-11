@@ -1,5 +1,4 @@
 use egui_wgpu::wgpu;
-use winit::window::Window;
 
 use crate::egui_renderer;
 use crate::volume;
@@ -128,7 +127,10 @@ impl AppState {
     pub async fn new(
         instance: &wgpu::Instance,
         surface: wgpu::Surface<'static>,
-        window: &Window,
+        // The `Arc`, not a bare `&Window`: `EguiRenderer::new` keeps a handle
+        // so egui's own repaint requests can reach the event loop — see
+        // `egui_renderer::install_repaint_wake`.
+        window: &crate::WindowRef,
         width: u32,
         height: u32,
     ) -> Self {

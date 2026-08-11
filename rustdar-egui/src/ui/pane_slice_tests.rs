@@ -746,6 +746,47 @@ fn overlay_polling_skips_panes_with_no_map_but_keeps_their_toggles() {
     assert_eq!(gui.first_pane_with_overlay_enabled(kind), Some(0));
 }
 
+/// A loop on a pane the layout no longer shows is not "active": it is
+/// stranded, and saying otherwise pins the event loop at loop frame rate for
+/// the life of the process.
+///
+/// The same slice discipline as `is_any_pane_live` and
+/// `any_pane_has_overlay_enabled`, and the consequence is the sharpest of the
+/// three. `advance_loop_playback` walks `0..pane_count`, so a loop left
+/// playing on a hidden pane is one nothing advances and no transport is drawn
+/// to stop — it answers this predicate forever, the frontend re-arms an
+/// unconditional redraw on it forever, and the animation never moves a frame.
+/// Its textures go with it: thirty rendered tilts at 16 MiB apiece, held past
+/// every eviction path.
+///
+/// Splitting back down is the whole premise — `set_pane_count` only ever grows
+/// the vector, so the pane and its loop are still there to be found.
+#[test]
+fn a_loop_on_a_hidden_pane_stops_holding_the_event_loop_awake() {
+    use crate::pane::LoopPhase;
+
+    let mut gui = Gui::new();
+    gui.set_pane_count_for_test(2);
+    gui.pane_mut(1).unwrap().loop_state.phase = LoopPhase::Playing;
+    assert!(
+        gui.any_loop_active(),
+        "precondition: a loop is playing on a pane that is on screen"
+    );
+
+    gui.set_pane_count_for_test(1);
+
+    assert!(
+        gui.pane(1).unwrap().loop_state.is_active(),
+        "precondition: the hidden pane kept its loop, which is what makes \
+             this worth guarding"
+    );
+    assert!(
+        !gui.any_loop_active(),
+        "a loop on a pane no frame draws is holding the event loop at loop \
+             frame rate, for an animation nothing advances"
+    );
+}
+
 /// A pane with no map neither drives the shared viewport nor follows it.
 ///
 /// This is the all-panes site that goes live the instant a non-map pane can

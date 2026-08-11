@@ -4525,6 +4525,77 @@ fn collapsing_the_status_bar_leaves_only_its_restore_button() {
     );
 }
 
+/// **A countdown on screen buys itself a frame a second, and nothing else
+/// buys one at all.**
+///
+/// The `archive {n}s` chip is the only thing in the app that changes with no
+/// input behind it, so it is the only thing an idle app owes a frame to. The
+/// app used to draw at the display's refresh rate to keep it moving — 60 to
+/// 144 frames for each of the 60 numbers it prints — because the re-arm that
+/// kept it moving was `is_auto_poll_active()`, an unconditional yes.
+///
+/// Both halves are asserted off the same state, one frame apart in
+/// configuration only: the bar drawn, and the bar collapsed to its restore
+/// button. The poll timer is identical across the two, so a tick derived from
+/// the timer rather than from what was *drawn* passes the first and fails the
+/// second.
+#[test]
+fn the_status_bar_countdown_pays_for_its_own_frames_and_nothing_else_does() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.load_scan("KTLX");
+
+    let chip = h
+        .status_bar()
+        .poll_chip
+        .expect("precondition: the scan cleared the fetch, so the chip is up");
+    assert!(
+        chip.1.contains("archive "),
+        "precondition: the chip is printing the archive countdown, got {:?}",
+        chip.1
+    );
+
+    let tick = h
+        .gui_mut()
+        .status_tick_delay()
+        .expect("a countdown on screen is owed the frame that advances it");
+    assert!(
+        !tick.is_zero() && tick <= std::time::Duration::from_secs(1),
+        "the countdown asked for a {tick:?} wake: a second is how fast it \
+             moves, and anything shorter is the repaint loop back again"
+    );
+
+    // Collapsed, the countdown is not on screen — and nothing is owed for it,
+    // though the timer behind it is still running.
+    let collapse = h.status_bar().collapse;
+    h.mouse_click(collapse.center());
+    h.warm_up();
+    assert!(
+        h.status_bar().collapsed,
+        "precondition: the bar collapsed to its restore button"
+    );
+    assert_eq!(
+        h.gui_mut().status_tick_delay(),
+        None,
+        "a countdown nobody can see is still holding the event loop awake \
+             once a second"
+    );
+}
+
+/// The phone shell draws no status bar at all (plan §1.6), so it owes no
+/// frames to a chip it never drew — the same claim as above, reached by the
+/// other route into the absence.
+#[test]
+fn a_phone_owes_no_frames_to_a_status_bar_it_never_draws() {
+    let mut h = InputHarness::with_screen(egui::vec2(400.0, 800.0));
+    h.load_scan("KTLX");
+    assert!(
+        h.status_bar().poll_chip.is_none(),
+        "precondition: Compact draws no status bar"
+    );
+
+    assert_eq!(h.gui_mut().status_tick_delay(), None);
+}
+
 /// **The timestamp chip opens the Set Time dialog** — the timeline's own
 /// route to it; the menu's Time... entry is the other, and the dialog
 /// itself is unchanged.
@@ -9550,8 +9621,8 @@ fn a_back_press_closes_the_catalog_first() {
 /// either side moves the other, because there is only one thing to move.
 ///
 /// The state is observed through `ui_config_json`, which serialises the flag
-/// itself — `is_auto_poll_active` cannot see it, because overlay auto-polls
-/// keep that answer true regardless.
+/// itself — `auto_poll_delay` cannot see it, because an enabled layer's own
+/// refresh keeps that answer non-`None` regardless.
 #[test]
 fn the_data_and_live_rows_share_state_with_the_menu_toggles() {
     fn radar_auto_poll(h: &mut InputHarness) -> bool {

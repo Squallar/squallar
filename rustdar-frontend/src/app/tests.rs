@@ -1487,6 +1487,299 @@ fn an_untouched_app_is_left_free_to_sleep() {
     );
 }
 
+// ── Auto-poll scheduling ────────────────────────────────────────────
+
+/// The bug this section exists for, stated where the loop is left in a
+/// state: the end-of-frame re-arm used to include
+/// `self.gui.is_auto_poll_active()`, which is `enabled &&
+/// initial_fetch_done` — true from the first frame of the default
+/// configuration and never false again. Every frame therefore asked for
+/// another, so the app rendered at 60, 120 or 144 Hz for the life of the
+/// process, with no user input and nothing in flight, to service a poll
+/// that fires once a minute.
+///
+/// The re-arm must now hold only things that *finish*. A term that is
+/// permanently true is a repaint loop however it is spelled.
+#[test]
+fn the_frame_re_arm_holds_only_work_that_finishes() {
+    let body = fn_body("fn handle_redraw(");
+    let start = body
+        .find("if self.render.any_render_in_flight()")
+        .expect("the end-of-frame re-arm is gone from handle_redraw");
+    let arm = &body[start
+        ..start
+            + body[start..]
+                .find("notify_redraw(")
+                .expect("the re-arm no longer ends in a redraw request")];
+    assert!(
+        !arm.contains("is_auto_poll_active"),
+        "the re-arm asks for another frame whenever a poll timer is running, \
+             which is always: {arm}"
+    );
+    assert!(
+        !arm.contains("auto_poll"),
+        "an auto-poll term is back in the unconditional re-arm; it belongs in \
+             the scheduled wake (`auto_poll_at`): {arm}"
+    );
+    // The terms that do belong: each one ends, and its ending asks for the
+    // frame that notices.
+    for kept in [
+        "any_render_in_flight",
+        "any_loop_active",
+        "chunk_feeds.any_in_flight",
+        // The handshake, which times out; not the backoff, which does not.
+        // `a_down_socket_is_retried_regardless_of_other_activity` holds that
+        // distinction and the schedule the other half moved to.
+        "chunk_notify.handshake_pending",
+    ] {
+        assert!(
+            arm.contains(kept),
+            "the re-arm dropped `{kept}`, so that work now depends on \
+                 something unrelated waking the loop: {arm}"
+        );
+    }
+    assert!(
+        body.contains("self.auto_poll_at ="),
+        "the frame no longer records when auto-poll next needs one, so the \
+             loop sleeps through every poll: {body}"
+    );
+}
+
+/// A poll is checked inside the egui pass, so its wake-up has to end in a
+/// real frame. The autosave's wake deliberately does not — it is spent
+/// directly in `about_to_wait` — and copying that shape here would wake
+/// the loop for an iteration that polls nothing.
+///
+/// A source probe for the same reason
+/// `the_autosave_wakeup_is_spent_on_a_save_not_only_on_a_reschedule` is:
+/// `about_to_wait` takes an `ActiveEventLoop`.
+#[test]
+fn the_auto_poll_wakeup_is_spent_on_a_frame() {
+    let body = fn_body("fn about_to_wait(");
+    let at = |needle: &str| {
+        body.find(needle)
+            .unwrap_or_else(|| panic!("{needle} is gone from about_to_wait: {body}"))
+    };
+    assert!(
+        at("self.auto_poll_at = None") < at("self.schedule_wakeup("),
+        "the auto-poll deadline is not spent before the loop is re-armed on \
+             it, so an expired one is re-armed at a zero delay every \
+             iteration: {body}"
+    );
+    let spend = &body[at("self.auto_poll_at = None")..];
+    assert!(
+        spend.starts_with("self.auto_poll_at = None;\n            notify_redraw("),
+        "the auto-poll wake-up no longer ends in a redraw request, so the \
+             frame that would run `check_auto_polls` never happens: {spend}"
+    );
+}
+
+/// An owed poll is a timer, not a repaint — the whole shape of the fix.
+#[test]
+fn an_owed_poll_leaves_the_loop_on_a_timer() {
+    let mut app = headless(TestBridge::desktop());
+    let owed = std::time::Duration::from_secs(42);
+    app.auto_poll_at = Some(web_time::Instant::now() + owed);
+
+    let ControlFlow::WaitUntil(until) = app.wakeup_control_flow() else {
+        panic!(
+            "a poll due in {owed:?} left the loop free to sleep indefinitely, \
+                 so it will not fire until something unrelated happens"
+        );
+    };
+    let delay = until.saturating_duration_since(web_time::Instant::now());
+    assert!(
+        delay > owed - std::time::Duration::from_secs(1) && delay <= owed,
+        "the loop was woken for {delay:?} against a poll owed in {owed:?}"
+    );
+}
+
+/// …and a spent one lets it sleep again. `set_control_flow` is sticky and a
+/// `WaitUntil` is compared against the clock afresh every iteration, so a
+/// deadline left behind after it passes is a zero timeout forever — the
+/// same ~164,000 iterations per second the autosave's expired deadline
+/// produced.
+#[test]
+fn a_spent_poll_wakeup_lets_the_loop_sleep_again() {
+    let mut app = headless(TestBridge::desktop());
+    app.auto_poll_at = Some(web_time::Instant::now() - std::time::Duration::from_secs(1));
+
+    // What `about_to_wait` does with a deadline that has passed.
+    app.auto_poll_at = None;
+
+    assert_eq!(
+        app.wakeup_control_flow(),
+        ControlFlow::Wait,
+        "the loop was left on an expired WaitUntil, which is a zero timeout \
+             on every following iteration"
+    );
+}
+
+/// Silence every other term, so what `auto_poll_delay` answers can only have
+/// come from the one under test.
+///
+/// This is not scene-setting. A fresh `Gui` opens with layers that refresh on
+/// timers of their own, and a layer that has never been fetched is due *now*
+/// — so `auto_poll_delay` is `Some(MIN_WAKE)` whatever else is or is not in
+/// the fold, and a test asserting that value alone passes with a term
+/// deleted. Measured: dropping `self.chunk_feeds.next_round_delay()` from
+/// `auto_poll_delay` left the entire workspace green.
+///
+/// The radar term is already `None` here — `AutoPollState::poll_delay` needs
+/// a `last_fetch_time`, and only a frame writes one — and so is the status
+/// bar's, which a headless app never draws. Both are asserted rather than
+/// assumed, so a change that gives either an opinion fails here instead of
+/// quietly making the tests below vacuous again.
+fn silence_the_other_timers(app: &mut App) {
+    for idx in 0..app.gui.remembered_pane_count() {
+        let pane = app.gui.pane_mut(idx).expect("a remembered pane");
+        for &kind in OverlayKind::all() {
+            pane.enabled_overlays.insert(kind, false);
+        }
+    }
+    assert_eq!(
+        app.gui.auto_poll_delay(),
+        None,
+        "the GUI still owes a poll, so this fixture cannot attribute what \
+             `auto_poll_delay` answers to the chunk feed"
+    );
+    assert_eq!(
+        app.gui.status_tick_delay(),
+        None,
+        "a headless app drew no status bar, yet something is owed for one"
+    );
+}
+
+/// The chunk feed's five-second round is a timer checked on a frame, and it
+/// used to ride on the auto-poll re-arm keeping frames coming at 60 Hz.
+/// Taking that away without scheduling for it would strand every live site
+/// between rounds — the feed would stop, silently, and the site would fall
+/// back to archive volumes minutes old.
+///
+/// Asserted through `App::auto_poll_delay` at every step rather than through
+/// `ChunkFeedManager::next_round_delay`, because the defect this guards is
+/// the *wiring*: a `next_round_delay` that is correct and not folded into the
+/// wake is exactly as stranding as one that is wrong.
+#[test]
+fn a_chunk_feed_between_rounds_still_gets_its_frame() {
+    let mut app = headless(TestBridge::desktop());
+    silence_the_other_timers(&mut app);
+    app.chunk_feeds.ensure("KTLX");
+
+    assert_eq!(
+        app.auto_poll_delay(),
+        Some(MIN_WAKE),
+        "a feed with no round yet is due now, and a zero-length sleep \
+             re-armed every iteration is a busy loop, not a wake"
+    );
+
+    let poller = app
+        .chunk_feeds
+        .take_for_round("KTLX")
+        .expect("the first round is available immediately");
+    assert_eq!(
+        app.auto_poll_delay(),
+        None,
+        "a round in flight is already holding the loop awake through \
+             `any_in_flight`; scheduling for it as well would wake it twice"
+    );
+
+    app.chunk_feeds.finish_round(
+        "KTLX",
+        poller,
+        &Ok(rustdar_radar::chunks::PollOutcome::default()),
+    );
+    let delay = app
+        .auto_poll_delay()
+        .expect("a feed between rounds owes itself another one");
+    assert!(
+        !delay.is_zero() && delay <= rustdar_radar::chunks::QUIET_INTERVAL,
+        "the next round is scheduled {delay:?} out, which is not this feed's \
+             own cadence"
+    );
+    // The same answer, not merely a plausible one — both are read off a live
+    // clock, so they agree to within the microseconds between the two calls.
+    let asked = app
+        .chunk_feeds
+        .next_round_delay()
+        .expect("the feed still owes itself a round");
+    assert!(
+        delay.abs_diff(asked) < std::time::Duration::from_millis(50),
+        "the loop will sleep {delay:?} against the {asked:?} the feed asked \
+             for, so the wake is coming from something else"
+    );
+}
+
+/// A notification socket waiting out its backoff is scheduled for, not spun
+/// on.
+///
+/// This was the app's last unconditional spinner and the sharpest remaining
+/// case of the bug this branch is about. The backoff doubles from 5 s to a
+/// 300 s ceiling and never gives up — deliberately, because a service down
+/// for an hour is what it exists to survive — so on a machine that cannot
+/// reach the notifier at all (offline, a restrictive network) the boolean the
+/// frame loop re-armed on was true for the entire session, and the app drew at
+/// the display's refresh rate for as long as it ran.
+///
+/// Driven through `App::auto_poll_delay` rather than the notifier's own
+/// accessor, because the defect is the wiring; `chunk_notify`'s own tests own
+/// the arithmetic, where the backoff constants are in scope.
+#[test]
+fn a_notifier_backoff_is_slept_through_rather_than_spun_on() {
+    use crate::chunk_notify::Feed;
+
+    // Loopback on a closed port: `ewebsock` opens a socket that will never
+    // finish its handshake, which is the state a blocked network leaves.
+    const ENDPOINT: &str = "wss://127.0.0.1:1";
+    let sites = ["KTLX".to_string()];
+
+    let mut app = headless(TestBridge::desktop());
+    silence_the_other_timers(&mut app);
+    app.chunk_notify
+        .sync_sites(&sites, &Feed::ALL, ENDPOINT, || {});
+    assert!(
+        app.chunk_notify.handshake_pending(),
+        "precondition: a handshake is in flight, which the re-arm carries"
+    );
+    assert_eq!(
+        app.auto_poll_delay(),
+        None,
+        "a handshake still inside its timeout is being scheduled for as well \
+             as re-armed on, so the loop wakes twice for one socket"
+    );
+
+    // Past `CONNECT_TIMEOUT`: the next sync tears the socket down and the
+    // wait becomes a backoff.
+    for feed in Feed::ALL {
+        app.chunk_notify
+            .backdate_handshake("KTLX", feed, std::time::Duration::from_secs(120));
+    }
+    app.chunk_notify
+        .sync_sites(&sites, &Feed::ALL, ENDPOINT, || {});
+    assert!(
+        !app.chunk_notify.handshake_pending(),
+        "precondition: the handshake timed out, so nothing re-arms for it now"
+    );
+
+    let delay = app
+        .auto_poll_delay()
+        .expect("a socket waiting out a backoff must still be retried");
+    assert!(
+        !delay.is_zero(),
+        "the backoff was scheduled as a zero-length sleep, which is the spin \
+             it was supposed to replace"
+    );
+
+    // And it goes quiet with the site, rather than outliving it.
+    app.chunk_notify
+        .sync_sites(&[], &Feed::ALL, ENDPOINT, || {});
+    assert_eq!(
+        app.auto_poll_delay(),
+        None,
+        "a retired site's backoff is still waking the app"
+    );
+}
+
 /// Set by the back handler the app installs, so a test can see it *ran*
 /// rather than merely being held somewhere.
 static BACK_PRESS_REACHED_THE_HANDLER: AtomicBool = AtomicBool::new(false);

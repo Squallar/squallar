@@ -330,11 +330,58 @@ impl AutoPollState {
             .map(|t| self.interval_secs.saturating_sub(t.elapsed().as_secs()))
     }
 
-    /// Whether auto-poll has started (initial fetch done) and is enabled.
-    pub fn is_active(&self) -> bool {
-        self.enabled && self.initial_fetch_done
+    /// How long the event loop may sleep before [`should_poll`] would answer
+    /// yes, or `None` when there is no timer to run out.
+    ///
+    /// The scheduling half of [`should_poll`], and it must agree with it
+    /// exactly or the wake it grants is spent on a frame that polls nothing.
+    /// `should_poll` compares whole seconds — `elapsed().as_secs() >=
+    /// interval_secs` — which for an integer interval is the same test as
+    /// `elapsed >= interval`, so this subtraction is neither early nor late.
+    ///
+    /// [`should_poll`]: Self::should_poll
+    pub fn poll_delay(&self) -> Option<std::time::Duration> {
+        if !self.enabled {
+            return None;
+        }
+        let elapsed = self.last_fetch_time?.elapsed();
+        Some(std::time::Duration::from_secs(self.interval_secs).saturating_sub(elapsed))
+    }
+
+    /// How long until the countdown the status bar prints changes, or `None`
+    /// when the number on screen has stopped moving.
+    ///
+    /// The status bar renders `time_until_next` as `archive {n}s`, which is a
+    /// whole second of `elapsed` — so the frame it needs is not "soon", it is
+    /// the instant `elapsed` crosses the next second boundary. Anything faster
+    /// redraws the same string; anything slower drops a number out of the
+    /// count.
+    ///
+    /// `None` once the count bottoms out at zero. `time_until_next` saturates,
+    /// so a poll that cannot fire — no pane viewing live — leaves `archive 0s`
+    /// on screen indefinitely, and a tick scheduled for a string that will
+    /// never change again is exactly the repaint this whole path exists to
+    /// stop.
+    ///
+    /// [`time_until_next`]: Self::time_until_next
+    pub fn countdown_tick_delay(&self) -> Option<std::time::Duration> {
+        if !self.enabled {
+            return None;
+        }
+        let elapsed = self.last_fetch_time?.elapsed();
+        if elapsed.as_secs() >= self.interval_secs {
+            return None;
+        }
+        // Strictly positive by construction — `subsec_nanos` is below a
+        // second — so this term can never schedule a zero-length sleep.
+        Some(std::time::Duration::from_nanos(u64::from(
+            NANOS_PER_SEC - elapsed.subsec_nanos(),
+        )))
     }
 }
+
+/// One second, for [`AutoPollState::countdown_tick_delay`]'s remainder.
+const NANOS_PER_SEC: u32 = 1_000_000_000;
 
 /// How fresh the tilt on screen is.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -860,6 +907,22 @@ pub struct Gui {
     /// land on the bar, since a bar collapsed to its restore button leaves
     /// the corner open map (M8.1).
     statusbar_rect: Option<egui::Rect>,
+    /// How long until the text the status bar's auto-poll chip drew this frame
+    /// would read differently, or `None` when nothing it drew restates the
+    /// clock.
+    ///
+    /// That chip is the only thing in the app that changes with no input
+    /// behind it — the `archive {n}s` countdown, and the age of the tilt a
+    /// live feed last delivered — so it is the only thing that can oblige an
+    /// otherwise idle app to draw again. The interval is decided by the code
+    /// that writes the string, which is the only place that knows *which*
+    /// string it wrote: a second for a count of seconds, a minute for a count
+    /// of minutes, nothing at all for a number that has stopped moving.
+    ///
+    /// Written by `render_status_bar` for every outcome including the absences
+    /// — Compact, faded out, collapsed, or a spinner in the chip's place — and
+    /// read by [`Self::status_tick_delay`].
+    status_bar_tick: Option<std::time::Duration>,
     /// Whether the Add-layer catalog is open. Session-only, like every other
     /// open-surface flag; opened by the stack's two `+ Add layer` buttons and
     /// closed by applying a tile, the `✕`, the backdrop, or
@@ -1590,6 +1653,7 @@ impl Gui {
             timeline_scrub: None,
             statusbar_collapsed: false,
             statusbar_rect: None,
+            status_bar_tick: None,
             catalog_open: false,
             catalog_query: String::new(),
             catalog_save_name: String::new(),
@@ -4376,24 +4440,107 @@ impl Gui {
         self.panes.get(pane_idx).and_then(|p| p.scan_info.as_ref())
     }
 
-    /// Whether auto-poll is active and the event loop should keep waking
-    pub fn is_auto_poll_active(&self) -> bool {
-        self.auto_poll.is_active()
-            || OverlayKind::all().iter().any(|&kind| {
-                self.overlays.auto_poll_interval(kind).is_some()
-                    && self.any_pane_has_overlay_enabled(kind)
-            })
+    /// How long the event loop may sleep before some auto-poll timer next
+    /// needs a **frame**, or `None` when nothing is polling and it may sleep
+    /// until something happens.
+    ///
+    /// This replaced an `is_auto_poll_active` predicate, and the shape is the
+    /// whole point. That predicate answered "is a timer running" — `enabled &&
+    /// initial_fetch_done`, plus any enabled layer with an interval — and its
+    /// one caller re-armed an unconditional redraw with it at the end of every
+    /// frame. `initial_fetch_done` goes true on frame one and is never
+    /// cleared, so from the first frame of the default configuration the
+    /// answer was permanently yes: request redraw, draw, request redraw, at
+    /// display refresh rate for the life of the process, to service a poll
+    /// that fires once a minute.
+    ///
+    /// A duration instead, folded into the loop's `ControlFlow` — so the app
+    /// sleeps until the poll is actually due. Every term is gated on the poll
+    /// *firing*, not merely on a timer existing, because a wake granted for a
+    /// frame that polls nothing is the busy loop back again:
+    ///
+    /// * the radar poll needs a live pane and no fetch in flight, which is
+    ///   exactly what [`check_auto_polls`](Self::check_auto_polls) requires;
+    /// * an overlay needs a pane that can draw it and no fetch in flight.
+    ///
+    /// Zero means "due now, and the next frame will take it". The frame that
+    /// just ran normally consumes what it was due, so this reads zero only
+    /// where something refused it — `create_fetch_tasks` declining to build a
+    /// task leaves an overlay permanently due — and the caller is responsible
+    /// for not turning that into a zero-length sleep re-armed every iteration.
+    pub fn auto_poll_delay(&self) -> Option<std::time::Duration> {
+        let radar = if self.is_any_pane_live() && !self.radar.fetching {
+            self.auto_poll.poll_delay()
+        } else {
+            None
+        };
+        let overlays = OverlayKind::all()
+            .iter()
+            .filter_map(|&kind| self.overlay_poll_delay(kind))
+            .min();
+        [radar, overlays].into_iter().flatten().min()
     }
 
-    /// Whether any pane has a loop that is playing or has in-flight work.
+    /// When one overlay's auto-refresh is next due, on the same terms as
+    /// [`Self::auto_poll_delay`]. `None` when this layer does not auto-poll,
+    /// when no pane on screen can draw it, or when its fetch is already in
+    /// flight.
+    fn overlay_poll_delay(&self, kind: OverlayKind) -> Option<std::time::Duration> {
+        let interval = self.overlays.auto_poll_interval(kind)?;
+        if !self.any_pane_has_overlay_enabled(kind) || self.overlays.is_fetching(kind) {
+            return None;
+        }
+        // Never fetched: due now, and the frame this schedules will take it.
+        let Some(fetched) = self.overlays.fetch_time(kind) else {
+            return Some(std::time::Duration::ZERO);
+        };
+        Some(std::time::Duration::from_secs(interval).saturating_sub(fetched.elapsed()))
+    }
+
+    /// How long until the status bar's own text would read differently, or
+    /// `None` when nothing on screen is restating the clock.
+    ///
+    /// Kept apart from [`Self::auto_poll_delay`] because it is a *display*
+    /// obligation rather than a poll: the chip counts down whether or not the
+    /// poll it counts towards can fire, and it stops mattering the instant the
+    /// bar is off screen. Both end up in the same wake, but conflating them
+    /// would let the bar's presence decide when data is fetched.
+    ///
+    /// This is last frame's reading rather than a fresh derivation of it —
+    /// see [`status_bar_tick`](Self::status_bar_tick). What the bar drew is a
+    /// fact; re-deriving it would mean a second copy of the width class, the
+    /// chrome fade, the collapse and the chip's own three-valued state, which
+    /// is four places to fall out of step with the one that draws. Nothing
+    /// changes any of them without an event, and an event produces a frame
+    /// that writes it again.
+    pub fn status_tick_delay(&self) -> Option<std::time::Duration> {
+        self.status_bar_tick
+    }
+
+    /// Whether any pane **on screen** has a loop that is playing or has
+    /// in-flight work.
+    ///
+    /// Bounded by the layout's count like its siblings
+    /// [`is_any_pane_live`](Self::is_any_pane_live) and
+    /// [`any_pane_has_overlay_enabled`](Self::any_pane_has_overlay_enabled),
+    /// and for a sharper reason than tidiness: splitting to fewer panes leaves
+    /// the extra `PaneState`s in the vector, and `advance_loop_playback` walks
+    /// `0..pane_count`. So a loop playing on a pane that is then hidden is one
+    /// nothing advances and nothing can stop — it answered yes here for the
+    /// life of the process, holding the event loop at loop frame rate for an
+    /// animation that never moves, with its frame textures beyond the reach of
+    /// eviction.
     pub fn any_loop_active(&self) -> bool {
-        self.panes.iter().any(|p| {
-            let ls = &p.loop_state;
-            ls.is_active()
-                && (ls.is_playing()
-                    || ls.is_fetching()
-                    || ls.frames.iter().any(|f| f.render_in_flight))
-        })
+        self.panes
+            .iter()
+            .take(self.pane_layout.pane_count)
+            .any(|p| {
+                let ls = &p.loop_state;
+                ls.is_active()
+                    && (ls.is_playing()
+                        || ls.is_fetching()
+                        || ls.frames.iter().any(|f| f.render_in_flight))
+            })
     }
 
     pub fn clear_graphics_state(&mut self) {
@@ -4624,3 +4771,6 @@ mod pane_slice_tests;
 
 #[cfg(test)]
 mod storm_motion_override_tests;
+
+#[cfg(test)]
+mod wake_schedule_tests;

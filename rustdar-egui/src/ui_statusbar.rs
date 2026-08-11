@@ -66,6 +66,12 @@ impl super::Gui {
         // above this rect (`ui_timeline.rs`), and a stale rect from a wider
         // or unfaded frame would hold the chip up over open map.
         self.statusbar_rect = None;
+        // Same discipline, for the same kind of reason: a tick left behind by
+        // a frame that drew the countdown would keep an app with no status bar
+        // on screen repainting once a second forever
+        // (`Gui::status_tick_delay`). Set again below only where the chip
+        // really draws a number that moves.
+        self.status_bar_tick = None;
         if self.layout.width == WidthClass::Compact {
             // The probe is written even for the absence: a stale report from
             // a wider frame would claim a bar that is not on screen.
@@ -187,9 +193,10 @@ impl super::Gui {
                             &self.auto_poll,
                             &self.chunk_status,
                         );
+                        self.status_bar_tick = drawn.as_ref().and_then(|&(_, _, tick)| tick);
                         #[cfg(test)]
                         {
-                            probe.poll_chip = drawn;
+                            probe.poll_chip = drawn.map(|(rect, label, _)| (rect, label));
                         }
                         #[cfg(not(test))]
                         let _ = drawn;
@@ -301,9 +308,38 @@ fn describe_age(secs: u64) -> String {
     }
 }
 
+/// How often [`describe_age`] would print something new at this age.
+///
+/// The unit it is about to switch to, in other words — a second while it
+/// counts seconds, a minute once it counts minutes. The event loop sleeps on
+/// this (`Gui::status_tick_delay`), so getting it wrong either freezes the
+/// readout or repaints sixty times per number.
+///
+/// "just now" covers the first ten seconds and does not change within them,
+/// but it is asked for a second anyway: the phase of the underlying clock is
+/// not knowable from a whole-second age, so nine repaints once per tilt is the
+/// price of never being a second late with the first real number.
+fn age_tick(secs: u64) -> std::time::Duration {
+    if secs < 90 {
+        std::time::Duration::from_secs(1)
+    } else {
+        std::time::Duration::from_secs(60)
+    }
+}
+
 /// The auto-poll chip: what the polling machinery is doing, in one glanceable
-/// state. Returns the chip's rect and text when one was drawn — while a fetch
-/// is running there is a spinner instead.
+/// state. Returns the chip's rect, its text, and how long until that text
+/// would read differently — while a fetch is running there is a spinner
+/// instead and nothing is returned at all.
+///
+/// That third value is what makes the chip the status bar's one moving part
+/// with no input behind it, and so the one thing that can oblige an idle app
+/// to draw again — see
+/// [`Gui::status_tick_delay`](super::Gui::status_tick_delay). It is decided
+/// here, beside the string it describes, because only this function knows
+/// which of the four labels below it wrote: an archive countdown ticking
+/// towards a poll, a tilt age climbing away from one, or a fixed phrase that
+/// will read the same in an hour.
 ///
 /// A display chip rather than the checkbox it used to be: the toggle lives in
 /// the ☰ menu (`Auto-poll`), beside every other toggle, and a floating bar is
@@ -321,7 +357,7 @@ fn render_auto_poll_status(
     fetching: bool,
     auto_poll: &super::AutoPollState,
     chunks: &super::ChunkFeedStatus,
-) -> Option<(egui::Rect, String)> {
+) -> Option<(egui::Rect, String, Option<std::time::Duration>)> {
     if fetching {
         ui.label("\u{21bb}");
         ui.label("Downloading");
@@ -329,10 +365,18 @@ fn render_auto_poll_status(
         return None;
     }
 
-    let archive = match auto_poll.time_until_next() {
-        Some(remaining) if auto_poll.enabled => format!("archive {remaining}s"),
-        _ => "archive off".to_owned(),
+    // The tick travels with the string. `countdown_tick_delay` is the archive
+    // fragment's own — phase-locked to the poll timer, and `None` once the
+    // count has bottomed out at zero and stopped moving — and each branch
+    // below either takes that fragment or replaces the tick with its own.
+    let (archive, archive_tick) = match auto_poll.time_until_next() {
+        Some(remaining) if auto_poll.enabled => (
+            format!("archive {remaining}s"),
+            auto_poll.countdown_tick_delay(),
+        ),
+        _ => ("archive off".to_owned(), None),
     };
+    let mut tick = archive_tick;
 
     let label = if chunks.feeding {
         // About the tilt on screen, not the feed's progress through the volume.
@@ -344,16 +388,25 @@ fn render_auto_poll_status(
         // live glyph (the demo's `⚡` has no glyph in the bundled fonts), and
         // the retired state leads with a plain `!` on the same grounds.
         match chunks.tilt {
-            Some(tilt) => format!(
-                "\u{23fa} Live - {:.1}\u{b0} {}",
-                tilt.elevation,
-                describe_age(tilt.data_age_secs)
-            ),
-            None => "\u{23fa} Live - waiting for this tilt".to_owned(),
+            Some(tilt) => {
+                // The archive countdown is gone from this label, and the age
+                // that replaced it moves on its own clock.
+                tick = Some(age_tick(tilt.data_age_secs));
+                format!(
+                    "\u{23fa} Live - {:.1}\u{b0} {}",
+                    tilt.elevation,
+                    describe_age(tilt.data_age_secs)
+                )
+            }
+            None => {
+                tick = None;
+                "\u{23fa} Live - waiting for this tilt".to_owned()
+            }
         }
     } else if chunks.retired {
         format!("! Live - real-time unavailable, {archive}")
     } else if !auto_poll.enabled {
+        tick = None;
         "\u{23f8} Auto-poll off".to_owned()
     } else {
         format!("Auto-poll ({archive})")
@@ -379,7 +432,7 @@ fn render_auto_poll_status(
     } else {
         response.on_hover_text("Toggle auto-poll from the \u{2630} menu")
     };
-    Some((response.rect, label))
+    Some((response.rect, label, tick))
 }
 
 /// The scan summary — the long form: this bar only exists on the widths with

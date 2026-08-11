@@ -285,15 +285,47 @@ impl ChunkNotifier {
         }
     }
 
-    /// Whether some subscription still owes an attempt — waiting out a backoff,
-    /// or mid-handshake.
+    /// Whether a handshake is in flight, so the frame loop must keep coming
+    /// until it resolves or times out.
     ///
-    /// The frame loop reads this to decide whether to re-arm. Reconnection runs
-    /// from [`Self::sync_sites`], so without a term of its own it would inherit
-    /// whatever unrelated work happened to be keeping frames coming: turn
-    /// auto-poll off with the socket down and it would never be retried.
-    pub fn reconnect_pending(&self) -> bool {
-        !self.backoff.is_empty() || self.subs.values().any(|s| s.state == LinkState::Connecting)
+    /// Reconnection runs from [`Self::sync_sites`], which only runs on a frame,
+    /// so without a term of its own it would inherit whatever unrelated work
+    /// happened to be keeping frames coming: turn auto-poll off with the socket
+    /// down and it would never be retried.
+    ///
+    /// This half is an *unconditional* re-arm and stays one, because it is
+    /// bounded: [`CONNECT_TIMEOUT`] is 30 s, after which `sync_sites` tears the
+    /// socket down and the wait becomes a backoff, which is scheduled rather
+    /// than spun on ([`Self::next_retry_delay`]). Thirty seconds of frames is
+    /// worth pinning down eventually — nothing about a handshake needs the
+    /// display's refresh rate — but it ends on its own, which is the property
+    /// the backoff half did not have.
+    pub fn handshake_pending(&self) -> bool {
+        self.subs.values().any(|s| s.state == LinkState::Connecting)
+    }
+
+    /// How long until some subscription's backoff is up, or `None` when none is
+    /// waiting one out.
+    ///
+    /// This used to be half of a boolean the frame loop re-armed on
+    /// unconditionally, and that was the app's last permanent spinner. The
+    /// backoff doubles from 5 s to a 300 s ceiling and *never gives up* — by
+    /// design, since a service that is down for an hour is the case it exists
+    /// to survive — so for anyone who cannot reach the notifier at all
+    /// (offline, a restrictive network, the service down) `backoff` is
+    /// non-empty for the entire session. Re-arming a redraw on that is the
+    /// same defect the auto-poll re-arm had, for a whole class of users: five
+    /// minutes of drawing at the display's refresh rate to make one connection
+    /// attempt.
+    ///
+    /// The retry itself is unchanged. `sync_sites` still decides what is due;
+    /// this only says when to bring it a frame.
+    pub fn next_retry_delay(&self) -> Option<std::time::Duration> {
+        let now = web_time::Instant::now();
+        self.backoff
+            .values()
+            .map(|&(_, retry_at)| retry_at.saturating_duration_since(now))
+            .min()
     }
 
     fn connect(
@@ -636,36 +668,93 @@ mod tests {
         );
     }
 
-    /// The frame loop's re-arm term. Reconnection only runs on a frame, so if
-    /// this ever reported "nothing pending" while a socket was down, the retry
-    /// would depend on unrelated work happening to keep the loop awake.
+    /// The frame loop's two terms, and which is which. Reconnection only runs
+    /// on a frame, so if neither reported anything while a socket was down,
+    /// the retry would depend on unrelated work happening to keep the loop
+    /// awake.
+    ///
+    /// They were one boolean, re-armed on unconditionally. The halves behave
+    /// nothing alike: a handshake resolves or times out inside
+    /// [`CONNECT_TIMEOUT`], while a backoff doubles to a five-minute ceiling
+    /// and never gives up — so on a machine that cannot reach the notifier at
+    /// all, that boolean was true for the entire session and the app drew at
+    /// the display's refresh rate for as long as it ran. Hence a *duration*
+    /// for the backoff, which the loop sleeps through.
     #[test]
     fn a_pending_reconnect_is_visible_to_the_frame_loop() {
         let mut n = ChunkNotifier::new();
         assert!(
-            !n.reconnect_pending(),
+            !n.handshake_pending() && n.next_retry_delay().is_none(),
             "an idle notifier must let the loop sleep"
         );
 
         let sites = ["KTLX".to_string()];
         n.sync_sites(&sites, &Feed::ALL, "wss://127.0.0.1:1", || {});
         assert!(
-            n.reconnect_pending(),
+            n.handshake_pending(),
             "a handshake in progress must keep the loop awake so it can time out"
         );
 
         n.backdate_handshake("KTLX", Feed::Chunk, CONNECT_TIMEOUT + RECONNECT_BASE);
         n.backdate_handshake("KTLX", Feed::Archive, CONNECT_TIMEOUT + RECONNECT_BASE);
         n.sync_sites(&sites, &Feed::ALL, "wss://127.0.0.1:1", || {});
+        let delay = n
+            .next_retry_delay()
+            .expect("a socket waiting out a backoff must be scheduled for");
         assert!(
-            n.reconnect_pending(),
-            "a socket waiting out a backoff must keep the loop awake"
+            !delay.is_zero() && delay <= RECONNECT_BASE,
+            "the retry is scheduled {delay:?} out, which is not the backoff \
+                 it is waiting on"
+        );
+        assert!(
+            !n.handshake_pending(),
+            "a socket that timed out and went to a backoff is still being \
+                 counted as a handshake, so the loop spins through the whole \
+                 backoff instead of sleeping it"
         );
 
         n.sync_sites(&[], &Feed::ALL, "wss://127.0.0.1:1", || {});
         assert!(
-            !n.reconnect_pending(),
+            !n.handshake_pending() && n.next_retry_delay().is_none(),
             "a retired site must not keep the loop awake forever"
+        );
+    }
+
+    /// The backoff grows, and the wake grows with it. A `next_retry_delay`
+    /// that answered a constant would be right on the first attempt and wake
+    /// the app sixty times too often by the sixth.
+    #[test]
+    fn a_lengthening_backoff_lengthens_the_wake_it_asks_for() {
+        let mut n = ChunkNotifier::new();
+
+        n.schedule_retry("KTLX", Feed::Chunk, 1);
+        let first = n.next_retry_delay().expect("a retry is scheduled");
+        assert!(
+            first > RECONNECT_BASE / 2 && first <= RECONNECT_BASE,
+            "the first retry is {first:?}, not the base backoff"
+        );
+
+        n.schedule_retry("KTLX", Feed::Chunk, 4);
+        let later = n.next_retry_delay().expect("a retry is still scheduled");
+        assert!(
+            later > first * 3,
+            "the fourth failure asks for {later:?} against the first's \
+                 {first:?}, so the backoff is not reaching the wake"
+        );
+
+        // And the soonest of several, not whichever the map iterates first.
+        n.schedule_retry("KTLX", Feed::Archive, 1);
+        let soonest = n.next_retry_delay().expect("two retries are scheduled");
+        assert!(
+            soonest <= RECONNECT_BASE,
+            "the loop is sleeping past the sooner of two retries: {soonest:?}"
+        );
+
+        n.sync_sites(&[], &Feed::ALL, "wss://127.0.0.1:1", || {});
+        assert_eq!(
+            n.next_retry_delay(),
+            None,
+            "a retired site's backoff is still asking for frames"
         );
     }
 

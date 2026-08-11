@@ -65,12 +65,20 @@ fn the_chunk_drain_runs_before_the_frame_is_laid_out() {
 
 /// Reconnection must not be conditional on anything else being busy.
 ///
-/// Two source probes, because both halves are positional and neither has a
+/// Three source probes, because all of it is positional and none of it has a
 /// type that could carry the requirement. `sync_sites` is the only thing that
 /// reopens a dropped socket and it only runs on a frame, so the frame has to
 /// keep coming while a reconnect is owed — and the notification driver has to
 /// sit ahead of the `enabled` gate, or turning the chunk feed off would
 /// strand the socket rather than narrowing it to the archive feed.
+///
+/// The reconnect is owed in two different ways and each needs its own route.
+/// A handshake resolves or times out within `CONNECT_TIMEOUT`, so the re-arm
+/// carries it; a backoff doubles to a five-minute ceiling and never gives up,
+/// so the *schedule* carries it. Putting the backoff back in the re-arm is
+/// what this catches, and it is not a hypothetical: that is where it was, and
+/// for anyone who cannot reach the notifier it drew at refresh rate for the
+/// whole session.
 #[test]
 fn a_down_socket_is_retried_regardless_of_other_activity() {
     let redraw = include_str!("../app.rs");
@@ -78,14 +86,30 @@ fn a_down_socket_is_retried_regardless_of_other_activity() {
         .find("fn handle_redraw(")
         .map(|i| &redraw[i..])
         .expect("handle_redraw is gone from app.rs");
+    let first_redraw = arm
+        .find("notify_redraw(&self.window)")
+        .unwrap_or(usize::MAX);
     assert!(
-        arm.find("self.chunk_notify.reconnect_pending()")
-            .is_some_and(|at| at
-                < arm
-                    .find("notify_redraw(&self.window)")
-                    .unwrap_or(usize::MAX)),
-        "the re-arm dropped its reconnect term, so a socket that goes down \
+        arm.find("self.chunk_notify.handshake_pending()")
+            .is_some_and(|at| at < first_redraw),
+        "the re-arm dropped its handshake term, so a socket that goes down \
              with auto-poll off is never retried"
+    );
+    assert!(
+        !arm[..first_redraw.min(arm.len())].contains("self.chunk_notify.next_retry_delay()"),
+        "the notifier's backoff is back in the unconditional re-arm, which is \
+             a permanent spinner for anyone who cannot reach the service: it \
+             retries for the life of the session by design"
+    );
+    let fold = redraw
+        .find("fn auto_poll_delay(")
+        .map(|i| &redraw[i..])
+        .expect("auto_poll_delay is gone from app.rs");
+    assert!(
+        fold.find("self.chunk_notify.next_retry_delay()")
+            .is_some_and(|at| at < fold.find("\n    }").unwrap_or(usize::MAX)),
+        "the backoff is neither re-armed on nor scheduled for, so a dropped \
+             socket is retried only if something unrelated draws a frame"
     );
 
     let chunks = include_str!("../app_chunks.rs");
