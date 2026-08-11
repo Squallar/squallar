@@ -229,6 +229,13 @@ struct SweepData {
     /// difference went unnoticed. Either the number crosses or the divergence
     /// is silent, and this is the field that makes it cross.
     ///
+    /// The same argument now covers a second reader, and a louder one:
+    /// [`crate::nrot::dealias_with_knobs`] *removes* folds around this interval
+    /// where a payload states it and around `estimate_nyquist` where it does
+    /// not, so a plan view and a section of one sweep whose payloads disagree
+    /// about this field are two different velocity fields drawn from one cut.
+    /// Every dispatch site that holds a table therefore stamps one.
+    ///
     /// `None` is honest and common: a volume decoded entirely from Message 1
     /// has no such field to declare, and a payload extracted without a table
     /// carries none. The worker then estimates, which is what the main thread

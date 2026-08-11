@@ -115,7 +115,8 @@ impl DeclaredNyquist {
             return;
         }
         let Some(&held) = self.by_elevation.get(&elevation_number) else {
-            self.by_elevation.insert(elevation_number, metres_per_second);
+            self.by_elevation
+                .insert(elevation_number, metres_per_second);
             return;
         };
         // Bit-equality, and it is the right test rather than a tolerance: the

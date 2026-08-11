@@ -18,9 +18,9 @@ use rustdar_radar::types::RadarProduct;
 use std::sync::{Arc, Mutex};
 
 const SITE: &str = "KTLX";
-/// The 0.5° cut's own statement, and a number no fallback produces: the
-/// fixture's velocity is a constant, so `estimate_nyquist` off it would answer
-/// something else entirely.
+/// The 0.5° cut's own statement — a real TDWR Doppler figure, and a value no
+/// default anywhere produces, so a payload that reached the assertions
+/// carrying it can only have been stamped.
 const DECLARED_MS: f64 = 22.14;
 /// A second cut, declaring something else, so a stamp that copied one cut's
 /// number onto every sweep would be visible.
