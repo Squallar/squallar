@@ -689,15 +689,16 @@ enum Cut {
     /// Terminated, or closed with the volume, short of its radial count.
     ///
     /// Kept as a diagnostic and **never** placed in a snapshot. `nrot::llsd_nrot`
-    /// takes its azimuth step as `360.0 / num_radials` and wraps its neighbour
-    /// lookups with `.rem_euclid(num_radials)`, so a half-received cut both
-    /// halves the computed shear and stitches the last received radial to the
-    /// first — manufacturing a rotation signature out of a gap. It bails only at
-    /// zero radials, so nothing downstream would catch this. (The *painting* of
-    /// that grid no longer compounds it: `render::derived_grid_wedge_deg`
-    /// measures the grid's own azimuths, so a half cut is drawn at its real
-    /// spacing over the arc it covers. The manufactured shear values are still
-    /// manufactured.)
+    /// wraps its neighbour lookups with `.rem_euclid(num_radials)`, so a
+    /// half-received cut is differentiated across the gap as well as along the
+    /// arc: the last received radial is stitched to the first, manufacturing a
+    /// rotation signature out of the hole between them. It bails only at zero
+    /// radials, so nothing downstream would catch this. What no longer compounds
+    /// it is the scale — `nrot::radial_step_deg` measures the grid's own azimuth
+    /// step instead of taking `360 / rows`, so a half cut is differentiated over
+    /// the arc it covers rather than over twice it, and
+    /// `render::derived_grid_wedge_deg` paints it at that same spacing. The
+    /// values at the seam are still manufactured.
     Abandoned { have: usize, expected: usize },
 }
 
