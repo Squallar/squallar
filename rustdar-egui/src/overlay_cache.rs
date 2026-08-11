@@ -208,13 +208,32 @@ pub struct OverlayTextureData {
 }
 
 /// Per-overlay-type texture cache for a single pane.
+///
+/// # There is no dispatch counter here, deliberately
+///
+/// There was one — `render_generation`, bumped by a `next_generation()` that
+/// never had a caller, so it sat at `0` for the life of the process while
+/// `poll_overlay_renders` compared arriving results against it with `<`. That
+/// was inert while the value it was compared against was a monotonic counter
+/// and `0` was the floor. It stopped being safe to leave lying about once the
+/// arriving value became a **content hash** ([`OverlayTextureData::data_generation`]):
+/// an ordering comparison over hashes is meaningless in both directions, so
+/// wiring the counter up later would have begun discarding or accepting
+/// results at random, and swapping the `<` for `!=` against a field nothing
+/// writes would have discarded *every* result immediately.
+///
+/// Nothing is lost by its absence, because staleness here is level-triggered
+/// rather than edge-triggered. A result carries the token, zoom and bounds it
+/// was rendered for; it is stored with them, and the next frame asks
+/// [`Self::needs_rerender`] whether those still describe what the pane wants.
+/// A result that arrived late is therefore superseded on the very next frame by
+/// the same test that would have asked for it in the first place — no sequence
+/// number required.
 pub struct OverlayTextureCache {
     /// Currently displayed texture (if any).
     pub current: Option<OverlayTextureData>,
     /// Whether a background render is in progress for this cache.
     pub render_in_flight: bool,
-    /// Generation counter incremented each time a render is dispatched.
-    pub render_generation: u64,
 }
 
 impl Default for OverlayTextureCache {
@@ -228,7 +247,6 @@ impl OverlayTextureCache {
         Self {
             current: None,
             render_in_flight: false,
-            render_generation: 0,
         }
     }
 
@@ -254,12 +272,6 @@ impl OverlayTextureCache {
         }
         // Check if the viewport has panned outside the texture coverage
         pan_exceeds_coverage(&tex.geo_bounds, viewport_bounds)
-    }
-
-    /// Increment the generation and return the new value.
-    pub fn next_generation(&mut self) -> u64 {
-        self.render_generation += 1;
-        self.render_generation
     }
 }
 

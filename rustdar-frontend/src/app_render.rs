@@ -628,10 +628,15 @@ impl super::App {
 
                 cache.render_in_flight = false;
 
-                // Discard stale results
-                if resp.generation < cache.render_generation {
-                    continue;
-                }
+                // Every result is stored, and the staleness question is asked
+                // next frame instead. `resp.generation` is a content token, not
+                // a sequence number (`ui_map_pane::overlay_cache_token`), so
+                // there is no order to compare it in — and none is needed:
+                // `needs_rerender` re-asks whether the stored token, zoom and
+                // bounds still describe what the pane wants, so a late result
+                // is superseded by the same test that asked for it. See
+                // `OverlayTextureCache` for the counter that used to be
+                // compared here and why it had to go rather than be renamed.
 
                 // Save old texture for deferred cleanup
                 if let Some(old) = cache.current.take() {
