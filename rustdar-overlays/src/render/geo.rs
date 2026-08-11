@@ -1,7 +1,7 @@
 //! Geometry utilities. GUI-framework-agnostic: `rustdar-egui` bridges
 //! `egui::Pos2` ↔ [`ScreenPoint`].
 
-use crate::types::{GeoBounds, GeoPolygon, GeoPolygonRing, PrecomputedTriangulation, ScreenPoint};
+use crate::types::{GeoBounds, GeoPolygon, GeoPolygonRing, ScreenPoint};
 
 /// Ray casting, even-odd rule. Behaviour on the boundary is unspecified.
 pub fn point_in_polygon(point: ScreenPoint, vertices: &[ScreenPoint]) -> bool {
@@ -88,38 +88,6 @@ pub fn simplify_polygons(polygons: &mut Vec<GeoPolygon>, epsilon: f64) {
         polygon.retain(|r| r.len() >= 3);
     }
     polygons.retain(|p| !p.is_empty());
-}
-
-/// Drops GeoJSON's closing duplicate vertex (last == first).
-fn strip_closing_dup(ring: &[(f64, f64)]) -> &[(f64, f64)] {
-    if ring.len() > 3 && ring.first() == ring.last() {
-        &ring[..ring.len() - 1]
-    } else {
-        ring
-    }
-}
-
-/// Exterior rings only — holes are not triangulated.
-pub fn precompute_triangulations(polygons: &[GeoPolygon]) -> Vec<Option<PrecomputedTriangulation>> {
-    polygons
-        .iter()
-        .map(|polygon| {
-            let exterior = polygon.first()?;
-            let ring = strip_closing_dup(exterior);
-            if ring.len() < 3 {
-                return None;
-            }
-            // earcutr wants a flat [lat0, lon0, lat1, lon1, ...] with dim 2.
-            let coords: Vec<f64> = ring.iter().flat_map(|&(lat, lon)| [lat, lon]).collect();
-            let indices = earcutr::earcut(&coords, &[], 2).ok()?;
-            if indices.is_empty() {
-                return None;
-            }
-            Some(PrecomputedTriangulation {
-                indices: indices.into_iter().map(|i| i as u32).collect(),
-            })
-        })
-        .collect()
 }
 
 /// `None` when there is not a single vertex.

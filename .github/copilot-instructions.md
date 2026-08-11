@@ -92,7 +92,7 @@ the resource table so the manifest can reference it.
 ## Adding a New Overlay Type
 
 1. Add fetch/parse module in `rustdar-overlays` (follow `spc/` or `nws/` patterns)
-2. Define data types in `types.rs` (use `OverlayFeature` for polygons with pre-computed triangulations)
+2. Define data types in `types.rs` (use `OverlayFeature` for polygons with pre-computed geo bounds)
 3. Add `LayerKind` variant in `layers.rs`
 4. Add `OverlayKind` variant in `overlay_state.rs`; add to `all()`, `default_draw_order()`, and `texture_overlays()` if applicable
 5. Add rasterize function in `rasterize.rs` (follow `rasterize_nws_alerts()` pattern)

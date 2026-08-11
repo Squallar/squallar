@@ -6,7 +6,6 @@ edition.workspace = true
 [dependencies]
 web-time = { workspace = true }
 chrono = { workspace = true }
-earcutr = "=0.5.0"
 flate2 = { workspace = true }
 # Keep this pin local: Cargo ignores a member's `default-features = false` when
 # the workspace entry leaves defaults on.

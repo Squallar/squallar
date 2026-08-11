@@ -117,13 +117,6 @@ impl GeoBounds {
     }
 }
 
-/// Computed once at fetch time, reused across frames.
-#[derive(Debug, Clone)]
-pub struct PrecomputedTriangulation {
-    /// Indices into the exterior ring, GeoJSON closing duplicate stripped.
-    pub indices: Vec<u32>,
-}
-
 #[derive(Debug, Clone)]
 pub struct OverlayFeature {
     /// One or more polygons (from GeoJSON MultiPolygon).
@@ -135,14 +128,13 @@ pub struct OverlayFeature {
     /// Long label, e.g. "Slight Risk", "5% Tornado Risk".
     pub label2: String,
     pub hatch: HatchPattern,
-    /// Parallel to `polygons`: `triangulations[i]` is for `polygons[i][0]`.
-    pub triangulations: Vec<Option<PrecomputedTriangulation>>,
     pub geo_bounds: Option<GeoBounds>,
 }
 
 impl OverlayFeature {
-    /// Triangulates in geo-coordinates: topology is projection-invariant, so the
-    /// index buffer survives Mercator projection.
+    /// Bounds are taken in geo-coordinates, so they survive projection: the
+    /// viewport cull compares them against a projected viewport's own
+    /// lat/lon box.
     pub fn new(
         polygons: Vec<GeoPolygon>,
         fill_rgba: [u8; 4],
@@ -151,7 +143,6 @@ impl OverlayFeature {
         label2: String,
         hatch: HatchPattern,
     ) -> Self {
-        let triangulations = crate::render::geo::precompute_triangulations(&polygons);
         let geo_bounds = crate::render::geo::compute_geo_bounds(&polygons);
         Self {
             polygons,
@@ -160,14 +151,12 @@ impl OverlayFeature {
             label,
             label2,
             hatch,
-            triangulations,
             geo_bounds,
         }
     }
 
     /// Call after mutating `polygons` (e.g. simplification).
     pub fn recompute_cache(&mut self) {
-        self.triangulations = crate::render::geo::precompute_triangulations(&self.polygons);
         self.geo_bounds = crate::render::geo::compute_geo_bounds(&self.polygons);
     }
 }
