@@ -16,7 +16,7 @@ flate2 = { workspace = true }
 # template 3.30 (Lambert conformal), reimplemented in `hrrr::lambert`.
 # HRRR section 5 is DRT 5.3 (pure Rust in grib), not 5.40/5.42.
 # `time-calculation` backs `temporal_raw_info()`.
-grib = { version = "=0.17.0", default-features = false, features = [
+grib = { version = "=0.17.1", default-features = false, features = [
     "png-unpack-with-png-crate",
     "time-calculation",
 ] }
