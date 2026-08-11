@@ -729,22 +729,23 @@ impl Column {
         // exactly the straddles the mixed-PRF ladder creates.
         //
         // This pair spans *tilts*, and the guard's line sits at
-        // `SEAM_PROXIMITY_ACROSS_TILTS` — higher than the bilinear's,
+        // `SEAM_PROXIMITY_ACROSS_TILTS` — *lower* than the bilinear's,
         // because across hundreds of metres of depth a real fold's ends
-        // stray further from the seam and a real shear's ends reach nearer
-        // it, so this path demands more before refusing to interpolate.
-        // The constant's doc carries the corpus that set it, including what
-        // the guard here still misses: even at the old `0.5` it never kept
-        // every real fold, so its fraction is a measured break-even, not a
-        // construction.
+        // stray further from the seam, so a line drawn far out misses them
+        // and this path has to reach nearer the middle before it will
+        // refuse to interpolate. The constant's doc carries the labelled
+        // corpora that set it, including what the guard here still misses:
+        // at no fraction has it ever kept every real fold, so its number is
+        // a measured operating point, not a construction.
         let fold_limit = match (lo.fold_limit_ms, hi.fold_limit_ms) {
             (Some(a), Some(b)) => Some(a.min(b)),
             // This one-sided arm can fire only for armed limits in
-            // [8.0, ≈11.94): the pair must clear `SEAM_PROXIMITY_ACROSS_TILTS`
+            // [8.0, 16.0): the pair must clear `SEAM_PROXIMITY_ACROSS_TILTS`
             // of the measured limit on both ends while the unarmed rung's
             // speeds stay under the 8.0 m/s floor, which caps the armed limit
-            // below `8.0 / 0.67` — dead at a 12.5 m/s cut, alive at the
-            // ~11 m/s cuts VCP 31 actually flies.
+            // below `8.0 / 0.50`. The window was `[8.0, ≈11.94)` while the
+            // fraction was `0.67`, dead at a 12.5 m/s cut; at `0.50` it
+            // covers every cut VCP 31 flies and the mid-Nyquist ones above.
             (a, b) => a.or(b),
         };
         blend(
@@ -1694,7 +1695,7 @@ fn estimate_fold_limit(radials: &[Radial], slot: MomentSlot) -> Option<f64> {
 ///
 /// A break-even keeps a trade, and the kept side is recorded here rather
 /// than left to a re-run. Measured on the KILN holdout — clear-air VCP 31,
-/// once: at the shipped `0.60`/`0.67` the guard still passes **2,925
+/// once: at the then-shipped `0.60`/`0.67` the guard still passes **2,925
 /// fabricating quads and 2,199 fabricating rung pairs**, oracle-confirmed
 /// folds it now declines that average to near-calm. (On KILN the quad rows
 /// at `0.65` and `0.67` are identical: legacy-resolution velocity is
@@ -1703,13 +1704,46 @@ fn estimate_fold_limit(radials: &[Radial], slot: MomentSlot) -> Option<f64> {
 /// control fabricated nothing at the shipped fractions on its original
 /// measuring run — a claim scoped to that run, whose corpus hours were
 /// never recorded, not a property of storm volumes in general.
+///
+/// # Why the labelled corpus left this number alone and moved the other
+///
+/// The oracle those bands were counted against abstains where the decision
+/// is hard and, worse, is *wrong* in a direction that depends on the path.
+/// `seam_truth` re-scores both paths against labelled ground truth — sweeps
+/// the declared Nyquist says never wrapped, re-folded at a real VCP 31 seam
+/// with the RDA's own arithmetic, so every pair's answer is known. Of the
+/// oracle's `Smooth` verdicts on **quads**, 7.4% (arbitration) and 12.1%
+/// (holdout) are really folds; on **rung pairs** it is 20.6% and 27.8%.
+/// The miscount is two to three times worse vertically, and it lands
+/// entirely in the "confirmed shear" column that placed each break-even.
+///
+/// So the horizontal band count was near enough right and this number
+/// stays, while the vertical one was not — see
+/// [`SEAM_PROXIMITY_ACROSS_TILTS`], which moved.
+///
+/// **What is left open here, deliberately.** Against the label the quad
+/// bands cross 1:1 between `0.25` and `0.30` on both labelled corpora, not
+/// between `0.55` and `0.65`, so a purely marginal criterion would move
+/// this number a long way down too. It is not moved, for three reasons that
+/// are about evidence rather than inertia. The quad false-fire rate at
+/// `0.60` has already collapsed — 0.20% (arbitration) and 0.54% (holdout)
+/// of labelled-smooth candidates — so there is little left to buy. Quad
+/// recall at `0.60` is already 86–90%, against 92–95% at `0.50`, so there
+/// is little left to win. And both labelled corpora are *high*-base-rate
+/// populations (64% and 69% of quad candidates are folds); the only
+/// low-base-rate corpus ever measured, KILN at 12%, put the quad error
+/// minimum at `0.45–0.50` rather than at the bottom of the grid, and no
+/// low-base-rate quad holdout has been built since. Moving both fractions
+/// in one pass would also confound the two paths' evidence, which is the
+/// mistake the split exists to prevent. A low-base-rate labelled quad
+/// holdout is what would settle it.
 const SEAM_PROXIMITY_ACROSS_GATES: f64 = 0.60;
 
 /// How near the seam both rungs must sit before a straddle between adjacent
 /// *tilts* — the pair [`Column::at_height_km`] lerps between — is read as a
 /// fold, as a fraction of the fold limit.
 ///
-/// # Why this is not [`SEAM_PROXIMITY_ACROSS_GATES`]
+/// # Why this is not [`SEAM_PROXIMITY_ACROSS_GATES`], and why it is *below*
 ///
 /// [`straddles_fold`]'s argument — one wrap of a smooth field leaves *both*
 /// sides of the discontinuity near `±limit` — assumes the pair's own true
@@ -1718,18 +1752,106 @@ const SEAM_PROXIMITY_ACROSS_GATES: f64 = 0.60;
 /// hundreds of metres apart, and against a 12.3 m/s Nyquist the real veer
 /// across that depth moves a reading well away from the seam before it
 /// wraps, so a genuine fold across tilts often presents with one end deep
-/// inside the range — the shape the rule reads as shear. That asymmetry is
-/// in the data, not just the argument: at every adequately-powered site of
-/// the corpus, quad recall exceeds rung-pair recall at the same fraction, by
-/// 2.4–13.0 points at `0.50` and 14.4–51.6 at `0.75`, and the gap widens
-/// monotonically with the fraction. So the vertical guard buys each step of
-/// its fraction with more real folds than the horizontal guard pays for the
-/// same step, and its break-even lands higher: the rung-pair marginal bands
-/// cross between 0.65 and 0.70 on the arbitration corpus, `0.67`, and the
-/// KILN holdout reproduces that crossing to within one band too. One
-/// constant serving both paths would put both numbers wrong, and whoever
-/// tuned it would be trading quad false fires against rung-pair recall
-/// without either trade being visible.
+/// inside the range — the shape the rule reads as shear.
+///
+/// **That physics says this fraction must be the lower of the two, and for
+/// two years it shipped as the higher.** If a real vertical fold arrives
+/// with one end deep inside the range, then a bound placed far out catches
+/// fewer of them, and the way to catch more is to bring the bound *in*. The
+/// observation the old text reasoned from is the same one — quad recall
+/// exceeds rung-pair recall at every fraction, by 2.4–13.0 points at `0.50`
+/// and 14.4–51.6 at `0.75` — but a vertical path that is already losing
+/// folds faster is a path that should spend *less* of its fraction, not
+/// more. What sent the old number the other way was not the physics; it was
+/// the oracle. See below.
+///
+/// One constant serving both paths would still put both numbers wrong, and
+/// whoever tuned it would be trading quad false fires against rung-pair
+/// recall without either trade being visible. The split stands; only the
+/// direction of the gap changed.
+///
+/// # Where `0.67` came from, and why it fell
+///
+/// `0.67` was the crossing of the *oracle's* rung-pair marginal bands —
+/// confirmed folds given up against confirmed shear refused, crossing 1:1
+/// between 0.65 and 0.70. That oracle infers from the surrounding field
+/// rather than knowing, and `seam_truth` measured how often it is wrong:
+/// **20.6% of its rung-pair `Smooth` verdicts on the arbitration corpus,
+/// and 27.8% on the holdout, are labelled folds**, against 7.4% and 12.1%
+/// on quads. Every one of those is a real fold booked into the "confirmed
+/// shear refused" column — the column whose growth pushed the vertical
+/// crossing upward. The vertical break-even was high because the vertical
+/// path is exactly where the oracle was weakest.
+///
+/// Against the label the same marginal criterion crosses 1:1 between `0.25`
+/// and `0.30` on the arbitration corpus and below `0.25` on the holdout.
+/// Every band from `0.30` up gives away more real folds than it saves real
+/// shear, on both corpora.
+///
+/// # Where `0.50` comes from — a floor, not an argmin
+///
+/// **The measured optimum is not the shipped number and must not be.**
+/// Mean error in the reported speed falls monotonically as the fraction
+/// falls, all the way to the bottom of the swept grid, on both corpora, in
+/// three weightings (pooled, pooled minus the largest single volume, and
+/// one vote per site), at three synthetic seams, and whether or not the
+/// source volumes are restricted to clear-air patterns. Taken literally
+/// that argues for a fraction near `0.25`, and two things forbid it:
+///
+/// * **The error curve moves with the fold base rate, so it cannot
+///   arbitrate.** Both labelled corpora here are fold-rich — 47.9% and
+///   63.8% of rung candidates — and a fold-rich population always pulls the
+///   minimum down, because a missed fold costs up to a whole Nyquist
+///   interval while a false fire costs about one vertical step. The old
+///   KILN holdout at 12% put its minimum four grid steps higher. What
+///   transfers between populations is the operating point, not the argmin.
+/// * **Below `½` the rule stops being strictly stronger than the rule it
+///   replaced.** [`straddles_fold`] fires on `hi − lo > 2f·limit`; at
+///   `f ≥ ½` that clears half a Nyquist period and so implies the old
+///   sign-change-and-spread test, and below `½` it does not. That is not a
+///   preference, it is pinned executably in
+///   `the_seam_rule_is_strictly_stronger_than_the_spread_rule`, which fails
+///   for any fraction under `½` on either path.
+///
+/// `0.50` is the lowest fraction that keeps that property. It is also where
+/// a decision-maker who charges three false fires per missed fold lands
+/// independently on *both* corpora — the labelled bands fall through 3:1
+/// between `0.45` and `0.50` on each — and it is an interior point of the
+/// swept grid rather than its edge. It is not a new number: `0.5` is what
+/// both paths shipped before the split, and the corpus that split them was
+/// scored by the oracle now known to be weakest here.
+///
+/// # The corpora
+///
+/// Both scored by `seam_truth` against labelled truth at a 11.50 m/s
+/// synthetic seam, and site-disjoint from each other:
+///
+/// * **Arbitration** — 113 volumes, 13 sites, three dates; 56 contribute.
+///   15 692 rung candidates, 7 520 labelled folds (47.9%).
+/// * **Holdout** — 497 volumes, 23 sites, four dates, none shared with the
+///   arbitration set; 102 contribute and **30 volumes over 10 sites carry
+///   at least one labelled vertical fold**. 19 592 rung candidates, 12 505
+///   labelled folds (63.8%). Built specifically because the previous
+///   labelled holdout contained **no vertical folds at all**, which left
+///   the whole vertical case resting on one corpus.
+///
+/// | f | arb recall | arb false-fire | holdout recall | holdout false-fire |
+/// |---|---|---|---|---|
+/// | 0.35 | 77.5% | 10.33% | 76.7% | 12.25% |
+/// | **0.50** | **65.0%** | **5.26%** | **70.2%** | **7.70%** |
+/// | 0.60 | 56.0% | 2.75% | 65.6% | 5.67% |
+/// | 0.67 | 49.8% | 1.60% | 61.8% | 4.52% |
+///
+/// Mean error in the reported speed, m/s: `3.37` at `0.50` against `4.02`
+/// at `0.67` on the arbitration corpus, and `3.46` against `3.91` on the
+/// holdout. The path's guard-off error is 6.46 and 8.03 m/s against a
+/// guard-on error of 3.07 and 3.12 — missing a vertical fold costs roughly
+/// twice what firing on one costs, which is the asymmetry the move buys.
+///
+/// The source sweeps are *rougher* than the population this guard governs
+/// (mean adjacent-gate step 0.92 against 0.59 m/s on the arbitration
+/// corpus, 1.23 against 0.85 on the holdout), so the false-fire rates above
+/// are conservative and the recalls pessimistic.
 ///
 /// # What the pre-corpus text here claimed, corrected
 ///
@@ -1749,13 +1871,21 @@ const SEAM_PROXIMITY_ACROSS_GATES: f64 = 0.60;
 ///
 /// # What the shipped point costs
 ///
-/// The recall quoted above is at `0.50` and `0.75`; the shipped point has
-/// its own number: on the KILN holdout — clear-air VCP 31, measured once —
-/// **rung recall at `0.67` is 63.06%**, so the vertical guard keeps under
-/// two-thirds of oracle-confirmed rung folds at its own line. The
-/// fabrications that survive both shipped fractions are recorded with the
-/// quad figures on [`SEAM_PROXIMITY_ACROSS_GATES`].
-const SEAM_PROXIMITY_ACROSS_TILTS: f64 = 0.67;
+/// It still misses folds, and the number is here rather than left to a
+/// re-run: at `0.50` the vertical guard keeps **65.0%** of labelled rung
+/// folds on the arbitration corpus and **70.2%** on the holdout, so between
+/// a third and three-tenths of real vertical folds are still averaged
+/// across the seam. It also fires on smooth shear more often than the old
+/// number did — 5.26% and 7.70% of labelled-smooth candidates against 1.60%
+/// and 4.52% — and those are fabricated discontinuities in a real field.
+/// Both costs are paid knowingly: the mean error in the number the sampler
+/// reports falls on every stratum measured, which is the quantity that puts
+/// the two costs on one scale.
+///
+/// The older KILN-holdout figure this replaces — rung recall 63.06% at
+/// `0.67` — was scored against the oracle, not against a label, and is kept
+/// out of the table above for that reason.
+const SEAM_PROXIMITY_ACROSS_TILTS: f64 = 0.50;
 
 /// Which adjacency a velocity blend spans, carrying the fold limit its guard
 /// tests against.

@@ -2750,13 +2750,13 @@ fn the_straddle_test_needs_both_extremes_near_the_seam() {
     // line, and one end past it is not enough. The gate bound survives
     // every conversion — `0.60 · 20` is exactly 12.0 in f64 and in a
     // `Sample`'s f32 alike — so the strictness of the rule's own `<` is
-    // pinned exactly on the bound as well as either side of it. The tilt
-    // bound `0.67 · 20 = 13.4` is representable in neither, so there the
-    // nearest half-m/s readings either side — the finest step
-    // legacy-resolution velocity takes — stand in. (An earlier note here
-    // retired the exact-on-bound pin claiming neither shipped bound
-    // survived the trip; the gate bound does, and the three on-bound
-    // cases below restore the pin that claim removed.)
+    // pinned exactly on the bound as well as either side of it. Since the
+    // tilt fraction moved to `0.50` its bound is `10.0` and survives the
+    // trip as well, so the same three on-bound cases are pinned on both
+    // paths; at `0.67` the tilt bound was `13.4`, representable in
+    // neither, and only the nearest half-m/s readings either side could
+    // stand in. (An earlier note here retired the exact-on-bound pin
+    // claiming neither shipped bound survived the trip; both do now.)
     let g = |a: f64, b: f64| {
         straddles_fold(
             &[Sample::found(a as f32), Sample::found(b as f32)],
@@ -2780,10 +2780,20 @@ fn the_straddle_test_needs_both_extremes_near_the_seam() {
             Seam::AcrossTilts(20.0),
         )
     };
-    assert!(!t(13.0, -13.0), "65% is inside the tilt line (67%)");
-    assert!(!t(13.5, -13.0), "one end past the tilt line is not enough");
-    assert!(!t(13.0, -13.5), "nor is the other end alone");
-    assert!(t(13.5, -13.5), "67.5% is past the tilt line on both ends");
+    assert!(!t(9.5, -9.5), "47.5% is inside the tilt line (50%)");
+    assert!(!t(10.5, -9.5), "one end past the tilt line is not enough");
+    assert!(!t(9.5, -10.5), "nor is the other end alone");
+    assert!(t(10.5, -10.5), "52.5% is past the tilt line on both ends");
+    // The tilt bound now survives the trip too: `0.50 · 20` is exactly 10.0
+    // in f64 and in a `Sample`'s f32 alike, so the strictness of the rule's
+    // own `<` is pinnable exactly on the tilt bound as well — which it was
+    // not at `0.67`, where `13.4` is representable in neither.
+    assert!(
+        !t(10.0, -10.0),
+        "exactly on the tilt bound is not past it — the rule is strict",
+    );
+    assert!(!t(10.5, -10.0), "on the bound at the low end interpolates");
+    assert!(!t(10.0, -10.5), "and on the bound at the high end too");
 }
 
 /// The two fractions, by value, and that they are two.
@@ -2792,10 +2802,23 @@ fn the_straddle_test_needs_both_extremes_near_the_seam() {
 /// constant, so a drift in either is a re-decision and must read as one
 /// here. The inequality is pinned separately because it is a separate
 /// claim: an edit landing both paths on one number — either number —
-/// undoes the split while leaving one of the value pins green. And the
-/// *direction* is pinned because it is the physical content of the whole
-/// argument: across tilts a real fold's ends stray further from the
-/// seam, so the vertical guard must be the more reluctant one.
+/// undoes the split while leaving one of the value pins green.
+///
+/// **The direction pin is inverted from what it was, and that is the
+/// re-decision, not a re-baseline.** It used to read
+/// `TILTS > GATES`, on the argument that across tilts a real fold's ends
+/// stray further from the seam so the vertical guard must be the more
+/// reluctant one. The first half of that is measured and still true; the
+/// conclusion does not follow from it. A path whose real folds arrive with
+/// one end deep inside the range catches *fewer* of them at any bound, and
+/// the remedy is a nearer bound, not a further one. What actually put
+/// `0.67` above `0.60` was the oracle those bands were counted against,
+/// which books a fifth to a quarter of real vertical folds into the
+/// "confirmed shear refused" column — two to three times its quad error
+/// rate, and in the column that sets the crossing. Scored against labelled
+/// truth on two site-disjoint corpora the vertical bands cross far lower,
+/// so the vertical fraction is now the *smaller* of the two and the pin
+/// says so. The evidence is on [`SEAM_PROXIMITY_ACROSS_TILTS`].
 #[test]
 fn each_guard_draws_its_line_at_its_own_fraction() {
     assert_eq!(
@@ -2803,8 +2826,8 @@ fn each_guard_draws_its_line_at_its_own_fraction() {
         "the gate fraction moved off its corpus break-even",
     );
     assert_eq!(
-        SEAM_PROXIMITY_ACROSS_TILTS, 0.67,
-        "the tilt fraction moved off its corpus break-even",
+        SEAM_PROXIMITY_ACROSS_TILTS, 0.50,
+        "the tilt fraction moved off its labelled-corpus operating point",
     );
     assert_ne!(
         SEAM_PROXIMITY_ACROSS_GATES, SEAM_PROXIMITY_ACROSS_TILTS,
@@ -2817,23 +2840,37 @@ fn each_guard_draws_its_line_at_its_own_fraction() {
     // refuses to build one.
     const {
         assert!(
-            SEAM_PROXIMITY_ACROSS_TILTS > SEAM_PROXIMITY_ACROSS_GATES,
-            "the vertical guard must demand more than the bilinear, not less",
+            SEAM_PROXIMITY_ACROSS_TILTS < SEAM_PROXIMITY_ACROSS_GATES,
+            "a vertical fold arrives with one end deeper inside the range, \
+             so the vertical guard must reach nearer the middle than the \
+             bilinear, not further out",
+        );
+        // The floor the whole `0.50` argument rests on: under a half the
+        // rule stops implying the sign-change-and-spread rule it replaced.
+        // `the_seam_rule_is_strictly_stronger_than_the_spread_rule` fails
+        // below this, but only for the fractions its fixtures happen to
+        // reach; this refuses to build at all.
+        assert!(
+            SEAM_PROXIMITY_ACROSS_TILTS >= 0.5,
+            "below a half the seam rule is no longer strictly stronger \
+             than the spread rule it replaced",
         );
     }
 
-    // One pair, read across each adjacency: what fires between two gates
-    // need not fire between two tilts. This is the observable the two
+    // One pair, read across each adjacency: what fires between two tilts
+    // need not fire between two gates. This is the observable the two
     // constants exist to create, and no single fraction — whichever
-    // value it took — could answer it both ways.
-    let pair = [Sample::found(13.0), Sample::found(-13.0)];
+    // value it took — could answer it both ways. The pair sits in the
+    // band between the two lines, which since the tilt fraction moved
+    // below the gate fraction is `[0.50·20, 0.60·20) = [10, 12)`.
+    let pair = [Sample::found(11.0), Sample::found(-11.0)];
     assert!(
-        straddles_fold(&pair, Seam::AcrossGates(20.0)),
-        "±13 against a limit of 20 is past the gate line",
+        straddles_fold(&pair, Seam::AcrossTilts(20.0)),
+        "±11 against a limit of 20 is past the tilt line",
     );
     assert!(
-        !straddles_fold(&pair, Seam::AcrossTilts(20.0)),
-        "±13 against a limit of 20 is short of the tilt line",
+        !straddles_fold(&pair, Seam::AcrossGates(20.0)),
+        "±11 against a limit of 20 is short of the gate line",
     );
 }
 
@@ -2969,14 +3006,20 @@ fn the_gate_guard_holds_its_line_from_both_sides() {
 }
 
 /// **The tilt guard's line, held from both sides through the real
-/// lerp.** Two tilts at ±12.5 under a limit of 20 put the pair at 62.5%
-/// — past the *gate* line at 60%, short of the *tilt* line at 67% — so
-/// the lerp must keep interpolating: the midpoint is the plain mean,
-/// 0.0. Two tilts at ±14 are at 70%, past the line, and must snap to a
-/// measured speed. The 62.5% fixture is the other half of the swap
-/// detector: under the gate fraction it fires, so it fails if the tilt
-/// guard regresses to the old 0.5, moves off its break-even, or trades
-/// fractions with the gate guard.
+/// lerp.** Two tilts at ±9.5 under a limit of 20 put the pair at 47.5% —
+/// short of the tilt line at 50% — so the lerp must keep interpolating:
+/// the midpoint is the plain mean, 0.0. Two tilts at ±11 are at 55%,
+/// past the line, and must snap to a measured speed.
+///
+/// **The ±11 fixture is the swap detector, and it changed sides when the
+/// tilt fraction went below the gate fraction.** 55% sits in the band
+/// between the two lines — past the tilt line at 50%, short of the gate
+/// line at 60% — so it fires across tilts and not across gates. If the
+/// tilt guard ever took the gate guard's fraction, or drifted up off its
+/// labelled operating point, this pair would stop firing and the midpoint
+/// would go back to reading a plain mean. While the tilt fraction was the
+/// *higher* of the two the detector had to be the lower-side fixture
+/// instead, because the in-between band was on the other side.
 #[test]
 fn the_tilt_guard_holds_its_line_from_both_sides() {
     // The midpoint of the lerp between tilts at `±speed`, with both
@@ -3032,58 +3075,65 @@ fn the_tilt_guard_holds_its_line_from_both_sides() {
         column.at_height_km(mid)
     };
 
-    // ── 62.5%: short of the tilt line, past the gate line. ──
-    let pair = [Sample::found(12.5), Sample::found(-12.5)];
+    // ── 47.5%: short of the tilt line, and of the gate line too. ──
+    let pair = [Sample::found(9.5), Sample::found(-9.5)];
     assert!(
         !straddles_fold(&pair, Seam::AcrossTilts(20.0)),
-        "±12.5 against 20 is 62.5%, short of the 67% line, and must not \
+        "±9.5 against 20 is 47.5%, short of the 50% line, and must not \
              fire",
     );
-    assert!(
-        straddles_fold(&pair, Seam::AcrossGates(20.0)),
-        "precondition: the same pair is past the gate line, so a swap of \
-             the two fractions cannot leave the lerp below green",
-    );
-    let value = lerped_mid(12.5).value().expect("both rungs measured");
+    let value = lerped_mid(9.5).value().expect("both rungs measured");
     assert!(
         value.abs() < 1e-6,
-        "±12.5 under a 20 m/s limit is short of the tilt line and must \
+        "±9.5 under a 20 m/s limit is short of the tilt line and must \
              lerp to its plain mean at the midpoint; it read {value}, a \
-             corner — the tilt guard is drawing the gate guard's line",
+             corner — the tilt guard is drawing a line below its own",
     );
 
-    // ── 70%: past the tilt line. The midpoint is a measured speed. ──
+    // ── 55%: past the tilt line, short of the gate line. The midpoint
+    //    is a measured speed, and this is the swap detector. ──
+    let pair = [Sample::found(11.0), Sample::found(-11.0)];
     assert!(
-        straddles_fold(
-            &[Sample::found(14.0), Sample::found(-14.0)],
-            Seam::AcrossTilts(20.0),
-        ),
-        "±14 against 20 is 70%, past the 67% line, and must fire",
+        straddles_fold(&pair, Seam::AcrossTilts(20.0)),
+        "±11 against 20 is 55%, past the 50% line, and must fire",
     );
-    let value = lerped_mid(14.0).value().expect("both rungs measured");
     assert!(
-        value == 14.0 || value == -14.0,
-        "the midpoint between a +14 tilt and a −14 tilt read {value}, \
+        !straddles_fold(&pair, Seam::AcrossGates(20.0)),
+        "precondition: the same pair is short of the gate line, so a swap \
+             of the two fractions cannot leave the lerp below green",
+    );
+    let value = lerped_mid(11.0).value().expect("both rungs measured");
+    assert!(
+        value == 11.0 || value == -11.0,
+        "the midpoint between a +11 tilt and a −11 tilt read {value}, \
              which is a speed neither tilt measured — the tilt guard did not \
              fire past its own line",
     );
 }
 
 /// **The tilt line's lower side, at quarter-quantum resolution.** Against
-/// a 20 m/s limit the tilt fraction `0.67` draws its line at 13.4 and the
-/// next band down, `0.65`, at 13.0 — and the 0.5 m/s legacy-resolution
-/// grid steps from 13.0 straight to 13.5, over the whole interval where
-/// the two disagree. So every half-quantum fixture in this file is blind
-/// to the tilt fraction slipping `0.67 → 0.65`, and only the literal
-/// value pin would notice. Super-res velocity is quantised at 0.25 m/s,
-/// and ±13.25 — 66.25% of the limit — sits inside the disputed band:
-/// short of the shipped line, past the band below it. This drives that
-/// pair through the real vertical path at the real super-res encoding
-/// and pins that it still lerps.
+/// a 20 m/s limit the tilt fraction `0.50` draws its line at 10.0 and the
+/// next band down, `0.45`, at 9.0. Super-res velocity is quantised at
+/// 0.25 m/s, and ±9.75 — 48.75% of the limit — sits inside the band where
+/// the two disagree: short of the shipped line, past the band below it.
+/// This drives that pair through the real vertical path at the real
+/// super-res encoding and pins that it still lerps.
+///
+/// **Why this survived the move to `0.50` when its original reason did
+/// not.** It was written because the legacy 0.5 m/s grid steps from 13.0
+/// straight to 13.5, jumping the whole interval between `0.65 · 20 = 13.0`
+/// and `0.67 · 20 = 13.4`, so no half-quantum fixture anywhere in this file
+/// could see the tilt fraction slipping `0.67 → 0.65` and only the literal
+/// value pin would have noticed. At `0.50` that blind spot is gone — 9.5
+/// is on the legacy grid and separates `0.45` from `0.50` perfectly well.
+/// The test is kept anyway, retargeted, because the finest encoding the
+/// moment actually takes is the one worth pinning the line at, and because
+/// a fixture that only works at one value of the constant is a fixture
+/// that quietly dies the next time the constant moves.
 #[test]
 fn the_tilt_line_holds_its_lower_side_at_quarter_quantum() {
     // The super-res encoding: 0.25 m/s per raw step. ±20 planted at the
-    // first gate arms both rungs at 20; ±13.25 everywhere else is the
+    // first gate arms both rungs at 20; ±9.75 everywhere else is the
     // pair under test, and both survive the encoding exactly.
     const SUPER_RES_VEL_SCALE: f32 = 4.0;
     let sweep = |elevation_number: u8, elevation_deg: f32, sign: f64| {
@@ -3091,7 +3141,7 @@ fn the_tilt_line_holds_its_lower_side_at_quarter_quantum() {
             .map(|i| {
                 let bytes: Vec<u8> = (0..200usize)
                     .map(|j| {
-                        let ms = sign * if j == 0 { 20.0 } else { 13.25 };
+                        let ms = sign * if j == 0 { 20.0 } else { 9.75 };
                         (ms * f64::from(SUPER_RES_VEL_SCALE) + f64::from(VEL_OFFSET)).round() as u8
                     })
                     .collect();
@@ -3132,11 +3182,11 @@ fn the_tilt_line_holds_its_lower_side_at_quarter_quantum() {
     // The rule itself, on the pair the fixture carries.
     assert!(
         !straddles_fold(
-            &[Sample::found(13.25), Sample::found(-13.25)],
+            &[Sample::found(9.75), Sample::found(-9.75)],
             Seam::AcrossTilts(20.0),
         ),
-        "±13.25 against 20 is 66.25%, short of the 67% line, and must \
-             not fire — a tilt fraction of 0.65 would fire here",
+        "±9.75 against 20 is 48.75%, short of the 50% line, and must \
+             not fire — a tilt fraction of 0.45 would fire here",
     );
 
     // And through the real lerp: the midpoint is the plain mean, 0.0.
@@ -3144,16 +3194,16 @@ fn the_tilt_line_holds_its_lower_side_at_quarter_quantum() {
     let rungs = column.rungs();
     assert_eq!(
         rungs[0].sample.value(),
-        Some(13.25),
+        Some(9.75),
         "precondition: the quarter-quantum speed did not survive the \
-             super-res encoding, so the pair under test is not ±13.25",
+             super-res encoding, so the pair under test is not ±9.75",
     );
-    assert_eq!(rungs[1].sample.value(), Some(-13.25));
+    assert_eq!(rungs[1].sample.value(), Some(-9.75));
     let mid = 0.5 * (rungs[0].height_km + rungs[1].height_km);
     let value = column.at_height_km(mid).value().expect("both measured");
     assert!(
         value.abs() < 1e-6,
-        "±13.25 under a 20 m/s limit is short of the tilt line and must \
+        "±9.75 under a 20 m/s limit is short of the tilt line and must \
              lerp to its plain mean at the midpoint; it read {value}, a \
              corner — the tilt guard slipped to a lower band",
     );
@@ -3551,14 +3601,18 @@ fn a_sweep_too_slow_to_have_folded_keeps_its_plain_mean() {
 /// looking at slow air can report nothing over [`FOLD_LIMIT_FLOOR_MS`]
 /// and so claims no seam at all, while the cut below it folds.
 ///
-/// (The armed sweep read 12.5 when the vertical fraction was 0.5. This
-/// pair must beat `SEAM_PROXIMITY_ACROSS_TILTS` of the one measured
-/// limit on both ends while its slow side stays under the 8.0 floor
-/// that keeps that sweep unarmed — which caps the armed limit below
-/// `8.0 / 0.67 ≈ 11.9`. At 12.5 the old pair sat at 60% and the tilt
-/// guard now rightly declines it, so the one-sided arm this test exists
-/// to pin was never reached; the straddle precondition below is what
-/// keeps this fixture from going silently dead the same way again.)
+/// (The armed sweep read 12.5 when the vertical fraction was 0.5, then
+/// 11.0 when it was 0.67. This pair must beat
+/// `SEAM_PROXIMITY_ACROSS_TILTS` of the one measured limit on both ends
+/// while its slow side stays under the 8.0 floor that keeps that sweep
+/// unarmed — which caps the armed limit below `8.0 / fraction`: `≈11.9`
+/// at `0.67`, and `16.0` now the fraction is back at `0.50`. The 12.5
+/// fixture went silently dead when the fraction rose to `0.67`, because
+/// at 12.5 the pair then sat at 60% and the tilt guard rightly declined
+/// it, so the one-sided arm this test exists to pin was never reached.
+/// 11.0 is kept rather than restored to 12.5 — it is inside the window at
+/// every fraction this constant has taken — and the straddle precondition
+/// below is what makes a repeat of that failure loud instead of silent.)
 #[test]
 fn a_lerp_between_one_measured_seam_and_one_unmeasured_still_guards() {
     for (low, high, expect_lo, expect_hi) in
