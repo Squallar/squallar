@@ -149,11 +149,13 @@ impl DeclaredNyquist {
     /// **The one place this crate reads the field, and the one place it states
     /// the unit.** Three walks over Level II bytes reach a Message 31 —
     /// [`crate::scan`]'s archive decode, [`crate::chunks`]'s real-time chunk
-    /// decode, and [`Self::from_archive`] — and each used to spell the read out
-    /// for itself. Three copies of "read `nyquist_velocity_raw`, multiply by
-    /// 0.01, first writer wins" is three chances for one of them to drift, and
-    /// the drift would be silent: the guard would simply be a little wrong on
-    /// whichever path diverged. Now they call this.
+    /// decode, and [`Self::from_archive`]. Two of them spelled the read out for
+    /// themselves before this; the archive decode is the walk this change adds,
+    /// and it would have been a third copy. "Read `nyquist_velocity_raw`,
+    /// multiply by 0.01, first writer wins" written out three times is three
+    /// chances for one of them to drift, and the drift would be silent: the
+    /// guard would simply be a little wrong on whichever path diverged. They
+    /// all call this instead.
     ///
     /// A radial with no Radial Data Block leaves its cut unnamed rather than
     /// declaring a zero — an absence the guard estimates for, not a fold limit
@@ -184,11 +186,15 @@ impl DeclaredNyquist {
     /// volume — measured at 98% of `volume::File::scan()`'s own cost, so
     /// running both very nearly doubled every archive decode.
     ///
-    /// It stays because it is the *independent* reading of the same bytes: the
-    /// live test in [`crate::scan`] pins the folded table against this one, and
-    /// a table built by a walk that does nothing else is what makes that a real
-    /// check rather than a tautology. Use it for that, and for a caller who
-    /// wants the numbers without paying for a `Scan`.
+    /// It stays because its *traversal* is independent: the live test in
+    /// [`crate::scan`] pins the folded table against this one, and a table built
+    /// by a walk that does nothing else is what makes that a real check on the
+    /// single-pass restructure rather than a tautology. Note the limit of that
+    /// check — the reading itself is shared through
+    /// [`Self::declare_from_message`], so a wrong field or a wrong unit would be
+    /// wrong identically on both sides and this would still agree. Use it for
+    /// the traversal check, and for a caller who wants the numbers without
+    /// paying for a `Scan`.
     ///
     /// Every failure is an absence, never an error: an unreadable record, a
     /// record that will not decompress, a Message 1 volume (no Nyquist field
