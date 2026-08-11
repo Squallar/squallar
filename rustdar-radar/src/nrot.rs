@@ -483,6 +483,15 @@ fn estimate_nyquist(vel_grid: &[Vec<f64>]) -> f64 {
 /// narrows from 5×5 toward 3×3 with range, so instead of switching at one
 /// fixed range the radial count follows a constant physical footprint, capped
 /// at 5 radials and floored at 3.
+///
+/// This is the one azimuthal scale in the module that is a **distance** and
+/// not a count of rows, and so the one that divides the other way: the
+/// stencils' taps sit at row offsets and their divisors count rows
+/// ([`split_stencil_rot`]), while this counts rows *from* an arc, so a
+/// coarser sweep gets fewer of them. Measured, at 20 km: five rows spanning
+/// 2.5° on a 0.5° sweep, three spanning 3.0° on a 1.0° one — the same half
+/// kilometre of sky either way, until [`MEDIAN_AZ_HALF_MAX`] and the floor of
+/// one bound it.
 const MEDIAN_HALF_WIDTH_KM: f64 = 0.4;
 
 /// Cap on the median filter's azimuthal half-count. Empirical, set against
@@ -609,8 +618,11 @@ const COMPOSITE_TAPS: [f64; 5] = [0.1039, 0.1595, 0.1187, -0.0037, -0.0630];
 /// partner applies `SPLIT_CLEAN` (the legacy-grid taps ĉ = [0.580, 0.238,
 /// −0.151]) at 2/3/4 super-res offsets; the side away from the partner
 /// applies `SPLIT_AWAY` = [ĉ₂, ĉ₁−ĉ₂, ĉ₂, ĉ₃] at 1/2/3/4. Both sides sum to
-/// ĉ₁+ĉ₂+ĉ₃, so the operator is zero-sum; normalization is the legacy 1.0°
-/// arc. Empirical: it is the unique zero-sum anchored linear operator
+/// ĉ₁+ĉ₂+ĉ₃, so the operator is zero-sum; normalization is two rows of the
+/// grid, which is the legacy 1.0° arc on the super-res grid these were fitted
+/// on (see [`split_stencil_rot`], where the difference between those two
+/// readings is what makes the operator a derivative rather than a reading of
+/// one particular spacing). Empirical: it is the unique zero-sum anchored linear operator
 /// solved exactly from the reference's measured per-radial step-response
 /// profiles, which no pair-average-then-convolve chain reproduces.
 /// Measured provenance: branch `campaign-harness`.
@@ -891,7 +903,17 @@ fn split_stencil_rot(
     if acc * acc / (scc * svv) < GK_MIN_R2 {
         return None;
     }
-    // Normalize by the legacy 1.0° arc (two radials of this grid).
+    // Normalize by two radials of *this* grid — the legacy 1.0° arc on the
+    // 0.5° grid the taps were fitted on, and the arc of two rows on any
+    // other. The 2 counts rows, not degrees, and that is what makes this a
+    // derivative rather than a reading of one particular grid: the taps sit
+    // at row offsets, so on a coarser grid the numerator spans proportionally
+    // more sky and the divisor grows by the same factor. The quotient is the
+    // shear either way — one field sampled at 0.5° and 1.0° reads the same
+    // number to 3.1e-14, in both stencil bands, measured in
+    // `one_shear_reads_the_same_at_either_radial_spacing`. Pinning the
+    // divisor to a physical degree instead would make a 1.0°-spaced sweep
+    // report exactly twice the shear its own velocities carry.
     Some(acc / (2.0 * arc_per_radial))
 }
 
@@ -900,6 +922,43 @@ fn split_stencil_rot(
 /// is anchored to ABSOLUTE azimuth — a measured fact: steps at whole-degree
 /// boundaries read clean, at half-degree boundaries pair-averaged. Measured
 /// provenance: branch `campaign-harness`.
+///
+/// # A grid that is already legacy resolution has no phase to find
+///
+/// The question this asks only has an answer on a 0.5° grid. Two radials
+/// 1.0° apart can never share a whole degree — their floors differ by one by
+/// construction — so on a 1.0°-spaced sweep both counts come back zero and
+/// the tie falls to phase 0, for whole-degree azimuths, for a sweep offset by
+/// 0.37° or 0.5°, and for one jittered ±0.06° (all four measured, in
+/// `a_one_degree_sweep_has_no_pair_phase_to_measure`). That is not a bad
+/// reading of a real pairing; there is no pairing. Each radial of such a
+/// sweep *is* a legacy bin.
+///
+/// The consequence is that [`split_stencil_rot`]'s clean/away asymmetry gets
+/// assigned off `i % 2` — off collection index rather than off azimuth — so
+/// the same sky, collected starting one radial later, is differentiated by
+/// the other form of the operator. On the 0.5° grid the anchoring holds and
+/// this cannot happen: rolling a sweep's collection order leaves all 714
+/// compared bins bit-identical. On a 1.0° grid the same roll moved 7 bins of
+/// 353 by more than the 0.04 the reference quantizes in, flipped 3 between a
+/// value and ND, and read −0.198 where the unrolled sweep read −0.086 — both
+/// measured in `a_super_res_sweep_reads_the_same_wherever_collection_began`.
+///
+/// This is **not** settled here, because settling it means choosing a value
+/// nothing has measured. Averaging the two forms, falling back to
+/// [`COMPOSITE_TAPS`] inside 80 km — whose ramp gain is 0.898 against the
+/// split operator's 1.151, a 22% move on every bin of every such cut, in a
+/// band it was never fitted in — and applying the legacy taps ĉ directly (a
+/// 1.0° grid has no row at their 1.5-row offset) all give different fields.
+/// What would settle it is a reference NROT field over a 1.0°-spaced sweep,
+/// read per-radial across a couplet: whether the reference's response
+/// alternates there at all says whether the operator must be symmetrized, and
+/// its step and couplet profiles on such a grid set the gain the same way the
+/// super-res profiles set [`SPLIT_CLEAN`]/[`SPLIT_AWAY`].
+///
+/// TDWR is where this became load-bearing — every one of its cuts is 1.0° —
+/// but it is not where it started: a WSR-88D volume's tilts above the
+/// super-res cuts are 1.0° too, and NROT has been derived for all of them.
 fn pair_phase(azimuths_deg: &[f64]) -> usize {
     let n = azimuths_deg.len();
     if n < 4 {
@@ -1086,9 +1145,13 @@ fn gated_prof<'p>(
 }
 
 /// One bank kernel at one bin: the same clean/away weight assembly as
-/// [`split_stencil_rot`], normalized by the legacy 1.0° arc. Requires every
-/// tap cell — a missing cell means the footprint bin keeps the primary
-/// chain's value.
+/// [`split_stencil_rot`], normalized by the same two rows of this grid — the
+/// legacy 1.0° arc where the grid is super-res. It has to be the same
+/// divisor and the same [`pair_phase`] as the primary chain, since its output
+/// is only ever a cap on the primary's magnitude and two chains scaled over
+/// different arcs would cap by a ratio of arcs rather than by kernel shape.
+/// Requires every tap cell — a missing cell means the footprint bin keeps the
+/// primary chain's value.
 fn bank_kernel_rot(
     vel_grid: &[Vec<f64>],
     i: usize,
@@ -1423,7 +1486,11 @@ fn composite_stencil_rot(
         return None;
     }
     // The normalization is Σc·v/arc with the full stencil (verified against
-    // the reference's step response; branch `campaign-harness`).
+    // the reference's step response; branch `campaign-harness`). One arc here
+    // against [`split_stencil_rot`]'s two, and both count rows of this grid:
+    // these taps are anchored on the grid's own radials, the split operator's
+    // on the legacy pairs of a super-res one. Neither number is a degree, so
+    // both estimators read one shear at either spacing.
     Some(acc / arc_per_radial)
 }
 
@@ -2484,6 +2551,206 @@ mod tests {
         let azs = vec![0.0, 0.5, 1.0];
         let out = compute_nrot_grid(&sweep(&grid, &azs, 200));
         assert!(out.iter().flatten().all(|v| v.is_nan()));
+    }
+
+    /// One shear, sampled at 0.5° and at 1.0°, reads the same number — the
+    /// property that says every stencil divisor in this module counts **rows
+    /// of the grid** and not degrees of sky.
+    ///
+    /// Both estimators place their taps at row offsets, so a 1.0° sweep's
+    /// numerator spans twice the arc a 0.5° sweep's does over the same field;
+    /// `2.0 * arc_per_radial` and `arc_per_radial` grow by that same factor
+    /// and the quotient is the shear either way. The identity is exact in the
+    /// reals and holds to 3.1e-14 in f64 over the 1372 bins compared below —
+    /// the stencils are zero-sum, so the background under the profile cancels
+    /// exactly on paper and only to rounding in arithmetic.
+    ///
+    /// Pinning the divisor to a physical degree instead — reading
+    /// `2.0 * arc_per_radial` as "1.0° of arc" rather than "two rows" — would
+    /// halve it on a 1.0° sweep and report 0.869 where the field carries
+    /// 0.434. That reading is what this test exists to rule out, since it is
+    /// the one a reader meets first: the constant is *called* the legacy 1.0°
+    /// arc, and on the super-res grid it was fitted on the two readings are
+    /// the same number.
+    #[test]
+    fn one_shear_reads_the_same_at_either_radial_spacing() {
+        let gates = 400;
+        // 6 (m/s)/km of azimuthal shear, written as a function of azimuth so
+        // both samplings see one field rather than two.
+        let k = 6.0;
+        let row = |az_deg: f64| -> Vec<f64> {
+            let theta = az_deg.to_radians();
+            let dtheta = if theta > PI { theta - 2.0 * PI } else { theta };
+            (0..gates)
+                .map(|j| k * (0.25 + j as f64 * 0.25) * dtheta)
+                .collect()
+        };
+        let fine_az = ring_azimuths(720);
+        let coarse_az = ring_azimuths(360);
+        let fine: Vec<Vec<f64>> = fine_az.iter().map(|&a| row(a)).collect();
+        let coarse: Vec<Vec<f64>> = coarse_az.iter().map(|&a| row(a)).collect();
+        let fine_nrot = llsd_nrot(&sweep(&fine, &fine_az, gates), &fine);
+        let coarse_nrot = llsd_nrot(&sweep(&coarse, &coarse_az, gates), &coarse);
+
+        // Gates 100/200/300 are 25.25/50.25/75.25 km — the split-tap band;
+        // 380 is 95.25 km, past SPLIT_MAX_RANGE_KM, so the composite stencil
+        // and its one-row divisor are covered too. Azimuth 180 is the field's
+        // own wrap, where both samplings read the ±5 clamp for reasons that
+        // have nothing to do with spacing, and is left out of it.
+        let mut compared = 0;
+        let mut worst = 0.0f64;
+        for az in 0..360 {
+            if (az as f64 - 180.0).abs() <= 8.0 {
+                continue;
+            }
+            for j in [100usize, 200, 300, 380] {
+                let (c, f) = (coarse_nrot[az][j], fine_nrot[2 * az][j]);
+                assert!(c.is_finite() && f.is_finite(), "az {az}° gate {j} read ND");
+                worst = worst.max((c - f).abs());
+                compared += 1;
+            }
+        }
+        assert_eq!(compared, 343 * 4);
+        // Not bit-for-bit, and the gap between the two is arithmetic rather
+        // than physical: both stencils are zero-sum, so the background the
+        // profile sits on cancels exactly in the reals and only to rounding in
+        // f64, leaving a residue that depends on how large that background is.
+        // The worst of the 1372 bins compared here is 3.1e-14, a trillion
+        // times under the 0.04 the reference quantizes its own output in.
+        assert!(
+            worst < 1e-12,
+            "0.5° and 1.0° read one field {worst} apart — a real disagreement, \
+             not rounding",
+        );
+
+        // And the shared number is the shear that is there, not merely a
+        // shared number: the split operator's ramp gain is the mean of its two
+        // sides' Σ t·o over two rows, the composite's is Σ 2·o·c over one.
+        let split_gain: f64 = (SPLIT_CLEAN.iter().map(|&(o, t)| o as f64 * t).sum::<f64>()
+            + SPLIT_AWAY.iter().map(|&(o, t)| o as f64 * t).sum::<f64>())
+            / 2.0;
+        let composite_gain: f64 = COMPOSITE_TAPS
+            .iter()
+            .enumerate()
+            .map(|(idx, &t)| 2.0 * (idx as f64 + 1.0) * t)
+            .sum();
+        for (j, gain) in [(200usize, split_gain), (380, composite_gain)] {
+            let range_km = 0.25 + j as f64 * 0.25;
+            let expect = k * gain / rot_divisor(range_km / KM_PER_NM);
+            let got = coarse_nrot[90][j];
+            assert!(
+                (got - expect).abs() < 1e-9,
+                "gate {j}: read {got}, not the {expect} a {k} (m/s)/km ramp carries",
+            );
+        }
+    }
+
+    /// A 1.0°-spaced sweep has no pair phase, and the measurement says so by
+    /// returning nothing to choose between.
+    ///
+    /// [`pair_phase`] asks which of two index alignments puts radials in the
+    /// same whole degree. Two radials 1.0° apart never are — their floors
+    /// differ by one by construction — so both counts are zero and the answer
+    /// is the tie-break, whatever the sweep's offset or jitter. That is the
+    /// honest result for a grid that is already legacy resolution: each of its
+    /// radials *is* a whole-degree bin. What it leaves behind is recorded at
+    /// [`pair_phase`] and demonstrated in
+    /// `a_super_res_sweep_reads_the_same_wherever_collection_began`.
+    #[test]
+    fn a_one_degree_sweep_has_no_pair_phase_to_measure() {
+        let whole: Vec<f64> = (0..360).map(f64::from).collect();
+        let offset: Vec<f64> = (0..360).map(|i| f64::from(i) + 0.37).collect();
+        let half_offset: Vec<f64> = (0..360).map(|i| f64::from(i) + 0.5).collect();
+        // A real antenna wanders a few hundredths of a degree off the grid.
+        let jittered: Vec<f64> = (0..360)
+            .map(|i| f64::from(i) + 0.06 * (f64::from(i) * 1.7).sin())
+            .collect();
+        for azs in [&whole, &offset, &half_offset, &jittered] {
+            assert_eq!(pair_phase(azs), 0, "a 1.0° sweep reported a pairing");
+        }
+
+        // The super-res control: there the pairing is real, is found, and
+        // follows absolute azimuth rather than collection index — a sweep
+        // whose collection started half a degree along reports the other
+        // phase, which is what keeps the answer the same.
+        assert_eq!(pair_phase(&ring_azimuths(720)), 0);
+        let rolled: Vec<f64> = (0..720).map(|i| f64::from(i) * 0.5 + 0.5).collect();
+        assert_eq!(pair_phase(&rolled), 1);
+    }
+
+    /// Where the antenna happened to start a cut is not a property of the
+    /// weather, so it must not move the rotation. On the 0.5° grid — the one
+    /// validated against the reference — it does not: [`pair_phase`] anchors
+    /// the split operator's asymmetry to absolute azimuth, and a sweep rolled
+    /// by one radial reads bit for bit what it read before.
+    ///
+    /// The 1.0° half of this test records the open question rather than a
+    /// property worth having. There the pairing cannot be measured
+    /// (`a_one_degree_sweep_has_no_pair_phase_to_measure`), the asymmetry
+    /// falls to `i % 2`, and the roll moves the field: bins cross the 0.04 the
+    /// reference quantizes in, and some cross between a value and ND. The
+    /// assertion is deliberately that *something* moves — when a measured
+    /// answer for legacy-resolution grids arrives and this becomes invariant
+    /// too, this is the line that should fail and be deleted.
+    #[test]
+    fn a_super_res_sweep_reads_the_same_wherever_collection_began() {
+        let gates = 224; // to 56.0 km — the split-tap band, whole
+        let j = 199; // 50.0 km, through the vortex core
+        // A Rankine vortex at az 90°, 50 km, 3 km core, on a 15 m/s flow: the
+        // tangential wind projects onto the beam as the azimuthal couplet the
+        // product exists to find.
+        let field = |az_deg: f64| -> Vec<f64> {
+            (0..gates)
+                .map(|jj| {
+                    let r = 0.25 + jj as f64 * 0.25;
+                    let across = r * (az_deg - 90.0).to_radians();
+                    let along = r - 50.0;
+                    let rad = (across * across + along * along).sqrt();
+                    let vt = if rad < 3.0 {
+                        20.0 * rad / 3.0
+                    } else {
+                        20.0 * 3.0 / rad
+                    };
+                    let couplet = if rad > 1e-9 { vt * across / rad } else { 0.0 };
+                    15.0 * (az_deg - 40.0).to_radians().cos() + couplet
+                })
+                .collect()
+        };
+        // One row of NROT at 50 km, indexed by *physical* azimuth, from a
+        // sweep whose collection order starts `roll` radials along.
+        let read = |n: usize, step: f64, roll: usize| -> Vec<f64> {
+            let azs: Vec<f64> = (0..n).map(|i| ((i + roll) % n) as f64 * step).collect();
+            let grid: Vec<Vec<f64>> = azs.iter().map(|&a| field(a)).collect();
+            let nrot = llsd_nrot(&sweep(&grid, &azs, gates), &grid);
+            (0..n).map(|k| nrot[(k + n - roll) % n][j]).collect()
+        };
+
+        let fine = (read(720, 0.5, 0), read(720, 0.5, 1));
+        let mut compared = 0;
+        for (k, (&a, &b)) in fine.0.iter().zip(fine.1.iter()).enumerate() {
+            assert!(
+                a == b || (a.is_nan() && b.is_nan()),
+                "0.5° az {}°: unrolled read {a}, rolled read {b}",
+                k as f64 * 0.5,
+            );
+            compared += usize::from(a.is_finite());
+        }
+        assert_eq!(compared, 714, "the compared row read mostly ND");
+
+        let coarse = (read(360, 1.0, 0), read(360, 1.0, 1));
+        let moved = coarse
+            .0
+            .iter()
+            .zip(coarse.1.iter())
+            .filter(|(a, b)| {
+                a.is_finite() != b.is_finite() || (a.is_finite() && (*a - *b).abs() > 0.04)
+            })
+            .count();
+        assert!(
+            moved > 0,
+            "a 1.0° sweep became roll-invariant — if the pairing question was \
+             settled, delete this half and pin the invariance instead",
+        );
     }
 
     /// A patch whose velocity varies but carries no coherent azimuthal trend
