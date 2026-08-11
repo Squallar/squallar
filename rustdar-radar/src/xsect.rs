@@ -1044,8 +1044,11 @@ fn summarize(columns: &[ColumnAt], axes: &mut SectionAxes, top_row_arl_km: f64) 
 ///
 /// The one arm is the fold. A range-folded gate has no number to colour and
 /// would otherwise vanish into the same transparency as ground the radar never
-/// looked at, which is the reporting `MomentValue::RangeFolded` has never had
-/// from this crate.
+/// looked at. The plan view paints the same purple from its own gate loop, so
+/// the two views agree about the colour; what they do not share is the
+/// **readout** — a section can say `RangeFolded` because it carries a status
+/// per sample, and the plan view's value grid has only a number to hand back,
+/// so a hover there reads "no data" over a pixel this colour.
 fn section_color(product: RadarProduct, sample: Sample) -> (u8, u8, u8, u8) {
     if sample.status() == SampleStatus::RangeFolded {
         return crate::palette::RANGE_FOLDED;

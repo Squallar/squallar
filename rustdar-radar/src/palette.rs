@@ -8,9 +8,12 @@ const TRANSPARENCY: u8 = 180;
 /// [`get_color_for_value`] cannot produce this, and that is the point. A folded
 /// gate has no value — `MomentValue::RangeFolded` carries no number — so it
 /// arrives at a renderer as `NaN`, which every product paints fully
-/// transparent. A consumer that wants to *show* the fold (which
-/// [`crate::sampler::SampleStatus::RangeFolded`] finally makes possible) has to
-/// branch on the status and reach for this constant.
+/// transparent. A consumer that wants to *show* the fold has to carry the
+/// status alongside the number and reach for this constant: the vertical views
+/// through [`crate::sampler::SampleStatus::RangeFolded`], the plan view through
+/// the NaN payload `crate::render`'s gate loop claims a folded pixel with. Two
+/// carriers because the two rasters are shaped differently, one colour because
+/// a fold looks the same from either view.
 ///
 /// **Deliberately not the [`HHC`] table's class-150 entry**, which is the same
 /// idea for a different product: that one is a hydrometeor *class* code in a

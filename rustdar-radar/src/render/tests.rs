@@ -374,6 +374,18 @@ fn probe(az_deg: f64, range_km: f64) -> usize {
     probe_at(types::BASE_EXTENT_KM, types::IMAGE_SIZE, az_deg, range_km)
 }
 
+/// The raw gate codes Level II reserves below the data range. Every other
+/// fixture in this file writes a value byte; these two are the states the
+/// plan view has to tell apart from each other and from an unpainted pixel.
+const RAW_BELOW_THRESHOLD: u8 = 0;
+const RAW_RANGE_FOLDED: u8 = 1;
+
+/// The RGBA a pixel holds.
+fn pixel_at(image: &[u8], idx: usize) -> (u8, u8, u8, u8) {
+    let px = &image[idx * 4..idx * 4 + 4];
+    (px[0], px[1], px[2], px[3])
+}
+
 /// Assert what the sweep painted at a list of `(azimuth, range)` probes.
 fn assert_probes(values: &[f32], painted: bool, probes: &[(f64, f64)], why: &str) {
     for &(az, range) in probes {
@@ -2208,4 +2220,223 @@ fn a_ceiling_under_the_base_size_renders_a_leaner_picture_of_the_same_ground() {
         !values[at].is_nan(),
         "the beacon is unpainted on the lean raster",
     );
+}
+
+// ── Range folding and the declared Nyquist ───────────────────────────────
+
+/// A range-folded gate is a reading, and the plan view says so.
+///
+/// The sweep is 360 radials of ordinary velocity with two of them replaced:
+/// one whose gates are all `RAW_RANGE_FOLDED` and its neighbour whose gates
+/// are all `RAW_BELOW_THRESHOLD`. Both used to leave the same hole. They are
+/// two different statements — one says the echo came from beyond the
+/// unambiguous range, the other says nothing came back at all — and the
+/// cross-section painter has always drawn the difference.
+///
+/// The purple is [`crate::palette::RANGE_FOLDED`] exactly, which is what a
+/// colour no product scale can produce is for: `every_scale_avoids_the_range_
+/// folded_purple` pins that, so a pixel this colour can only have come from
+/// this arm.
+#[test]
+fn a_range_folded_gate_paints_the_dedicated_purple_and_below_threshold_does_not() {
+    const FOLDED_AZ: usize = 90;
+    const BELOW_AZ: usize = 91;
+    let azimuths: Vec<f32> = (0..360).map(|i| i as f32).collect();
+    let mut gates = vec![200u8; 360];
+    gates[FOLDED_AZ] = RAW_RANGE_FOLDED;
+    gates[BELOW_AZ] = RAW_BELOW_THRESHOLD;
+    let scan = l2_sweep(&gates, &azimuths, 1.0, true);
+
+    let SweepRender { image, values, .. } =
+        render_radar_to_image(&scan, L2_ELEVATION, types::RadarProduct::Velocity, LAT, LON)
+            .expect("the fixture renders");
+
+    let folded = probe(FOLDED_AZ as f64, 50.0);
+    assert_eq!(
+        pixel_at(&image, folded),
+        crate::palette::RANGE_FOLDED,
+        "a range-folded gate is the dedicated purple",
+    );
+    assert!(
+        values[folded].is_nan(),
+        "the exported grid carries a plain NaN over a folded gate, not a \
+         payload — nothing across the JS boundary reads one",
+    );
+    assert_eq!(
+        values[folded].to_bits(),
+        f32::NAN.to_bits(),
+        "and it is the canonical NaN, not the sentinel the cell held",
+    );
+
+    let below = probe(BELOW_AZ as f64, 50.0);
+    assert_eq!(
+        pixel_at(&image, below).3,
+        0,
+        "a below-threshold gate stays transparent",
+    );
+    assert!(values[below].is_nan());
+
+    // The precondition: the rest of the sweep really did paint, or the two
+    // assertions above are about a blank picture.
+    let neighbour = probe(80.0, 50.0);
+    assert!(
+        !values[neighbour].is_nan() && pixel_at(&image, neighbour) != crate::palette::RANGE_FOLDED,
+        "an ordinary radial paints its own colour",
+    );
+}
+
+/// The purple is confined to the gates that declared themselves folded: a
+/// sweep with none of them holds no pixel of that colour anywhere.
+#[test]
+fn a_sweep_with_nothing_folded_paints_no_range_folded_pixel() {
+    let azimuths: Vec<f32> = (0..360).map(|i| i as f32).collect();
+    let scan = l2_sweep(&vec![200u8; 360], &azimuths, 1.0, true);
+    let SweepRender { image, .. } =
+        render_radar_to_image(&scan, L2_ELEVATION, types::RadarProduct::Velocity, LAT, LON)
+            .expect("the fixture renders");
+    assert!(
+        !image
+            .chunks_exact(4)
+            .any(|px| (px[0], px[1], px[2], px[3]) == crate::palette::RANGE_FOLDED),
+        "the folded colour appeared with nothing folded",
+    );
+}
+
+/// Two tilts, two PRFs, and the render reports the one belonging to the sweep
+/// it drew.
+///
+/// The lookup is by the RDA's `elevation_number` off the chosen `Sweep`, which
+/// is why this path resolves through `find_sweep_owner`: a table keyed by cut
+/// has to be read with the cut's own number, and asking the raster which tilt
+/// it drew is the only way to know which entry that is.
+#[test]
+fn the_render_reports_the_declared_nyquist_of_the_sweep_it_drew() {
+    let declared: crate::nyquist::DeclaredNyquist =
+        [(1u8, 22.4), (2u8, 31.05)].into_iter().collect();
+    let scan = two_tilt_velocity_scan();
+
+    let low = render_radar_to_image_full(
+        &scan,
+        0.5,
+        types::RadarProduct::Velocity,
+        LAT,
+        LON,
+        None,
+        None,
+        &declared,
+    )
+    .expect("the low tilt renders");
+    assert_eq!(low.nyquist_ms, Some(22.4));
+
+    let high = render_radar_to_image_full(
+        &scan,
+        1.5,
+        types::RadarProduct::Velocity,
+        LAT,
+        LON,
+        None,
+        None,
+        &declared,
+    )
+    .expect("the high tilt renders");
+    assert_eq!(high.nyquist_ms, Some(31.05));
+
+    // A volume that declared nothing for the cut reports nothing, which is the
+    // Message 1 case and every fixture's: the dealiaser then estimates, as it
+    // always did.
+    let partial: crate::nyquist::DeclaredNyquist = [(2u8, 31.05)].into_iter().collect();
+    let unnamed = render_radar_to_image_full(
+        &scan,
+        0.5,
+        types::RadarProduct::Velocity,
+        LAT,
+        LON,
+        None,
+        None,
+        &partial,
+    )
+    .expect("the low tilt renders");
+    assert_eq!(
+        unnamed.nyquist_ms, None,
+        "an entry for another cut is not this cut's",
+    );
+
+    // A volume product has no one sweep behind it to have declared anything.
+    let volume = render_radar_to_image_full(
+        &scan,
+        0.5,
+        types::RadarProduct::EchoTopsInterpolated,
+        LAT,
+        LON,
+        None,
+        None,
+        &declared,
+    )
+    .expect("echo tops render");
+    assert_eq!(volume.nyquist_ms, None);
+}
+
+/// Two velocity tilts carrying the RDA's cut numbers 1 and 2 — the shape
+/// [`the_render_reports_the_declared_nyquist_of_the_sweep_it_drew`] needs and
+/// [`l2_sweep`]'s single sweep cannot be.
+fn two_tilt_velocity_scan() -> Scan {
+    use nexrad_model::data::{MomentData, PulseWidth, RadialStatus, Sweep, VolumeCoveragePattern};
+    let tilt = |elevation_number: u8, elevation_deg: f32| {
+        let radials = (0..360)
+            .map(|i| {
+                Radial::new(
+                    0,
+                    i as u16,
+                    i as f32,
+                    1.0,
+                    RadialStatus::IntermediateRadialData,
+                    elevation_number,
+                    elevation_deg,
+                    Some(MomentData::from_fixed_point(
+                        600,
+                        0,
+                        250,
+                        8,
+                        SCALE,
+                        OFFSET,
+                        vec![200; 600],
+                    )),
+                    Some(MomentData::from_fixed_point(
+                        600,
+                        0,
+                        250,
+                        8,
+                        2.0,
+                        129.0,
+                        vec![200; 600],
+                    )),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            })
+            .collect();
+        Sweep::new(elevation_number, radials)
+    };
+    Scan::new(
+        VolumeCoveragePattern::new(
+            212,
+            0,
+            0.5,
+            PulseWidth::Short,
+            false,
+            0,
+            false,
+            0,
+            false,
+            false,
+            0,
+            false,
+            false,
+            Vec::new(),
+        ),
+        vec![tilt(1, 0.5), tilt(2, 1.5)],
+    )
 }

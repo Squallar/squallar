@@ -586,6 +586,14 @@ impl RenderBuffers {
                     if !v.is_nan() {
                         let c = get_color_for_value(product, *v);
                         px.copy_from_slice(&[c.0, c.1, c.2, c.3]);
+                    } else if v.to_bits() == RANGE_FOLDED_BITS {
+                        // The one colour on this raster that no product scale
+                        // produces, and the one the value grid cannot carry —
+                        // so it is painted here and erased from the numbers in
+                        // the same pass. See [`RANGE_FOLDED_BITS`].
+                        let c = crate::palette::RANGE_FOLDED;
+                        px.copy_from_slice(&[c.0, c.1, c.2, c.3]);
+                        *v = f32::NAN;
                     }
                 }
             });
@@ -598,6 +606,43 @@ impl RenderBuffers {
         }
     }
 }
+
+/// The bit pattern a range-folded gate claims its pixel with.
+///
+/// The RDA reports three things about a gate and Level II encodes all three:
+/// a value, "below threshold", and **range folded** — the gate's echo came back
+/// from beyond the waveform's unambiguous range, so the radar has a return and
+/// cannot say how far away it was. `nexrad_model` keeps the three apart
+/// (`MomentValue::RangeFolded`), the cross-section painter has always drawn the
+/// distinction ([`crate::palette::RANGE_FOLDED`], `xsect::sample_color`), and
+/// the plan view was the one renderer that dropped the last two on the floor
+/// together. On TDWR that is a large share of a Doppler sweep — its
+/// unambiguous range is around 90 km against a WSR-88D's ~150 — and painting
+/// it as nothing says the radar saw nothing there, which is the opposite of
+/// what it saw.
+///
+/// # Why a sentinel and not a second plane
+///
+/// The cell is one `AtomicU64` — key in the high half, `f32` bits in the low —
+/// and that packing is what makes the parallel raster deterministic
+/// ([`write_key`]). A status plane beside it would be a second cell to claim
+/// and a second chance for the two to tear apart, for one bit. So the status
+/// rides in the value: a **NaN payload**, unreachable from real data because
+/// every gate loop in this module already drops NaN before it claims a pixel,
+/// and distinct from the canonical NaN [`RenderBuffers::EMPTY`] decodes to.
+/// Ordering is untouched — the key is the whole of the high 32 bits and no two
+/// gates share one, so the value bits never break a tie.
+///
+/// **What it costs, stated:** the exported value grid canonicalizes this back
+/// to a plain NaN, because that grid crosses into JavaScript, where a NaN
+/// payload is not carried. So the plan view's hover reads "no data" over a
+/// purple pixel. The pixel is the honest half and the readout is the
+/// incomplete one; a cross-section through the same gate reports
+/// `SampleStatus::RangeFolded` properly, and that stays the readout that can.
+const RANGE_FOLDED_BITS: u32 = 0x7FC0_0F1D;
+
+/// The value a range-folded gate carries through the fill loop.
+const RANGE_FOLDED_SENTINEL: f32 = f32::from_bits(RANGE_FOLDED_BITS);
 
 /// One finished plan-view raster.
 ///
@@ -615,7 +660,8 @@ pub struct SweepRender {
     /// go on the ground, not how far the data reached. See
     /// [`render_with_projection`].
     pub max_range_km: f64,
-    /// Per-pixel values, `f32::NAN` where nothing was painted.
+    /// Per-pixel values, `f32::NAN` where nothing was painted **and** where a
+    /// range-folded gate was (see [`RANGE_FOLDED_BITS`]).
     pub values: Vec<f32>,
     /// Where the rendered sweep's cut declared its velocity folds, m/s.
     ///
@@ -1275,13 +1321,26 @@ pub fn render_radar_to_image_full_sized(
                                 break;
                             }
 
+                            use nexrad_model::data::MomentValue;
                             let scaled_value = match moment_value {
-                                nexrad_model::data::MomentValue::Value(v) => v,
-                                _ => continue,
+                                // `v < 999.0` is false for a NaN too, so the
+                                // one test drops both the out-of-scale codes
+                                // and anything that decoded to nothing.
+                                MomentValue::Value(v) if v < 999.0 => v,
+                                MomentValue::Value(_) => continue,
+                                // A range-folded gate is a *reading*, not an
+                                // absence, so it claims its pixel like any
+                                // other and is coloured at output time. See
+                                // [`RANGE_FOLDED_BITS`].
+                                MomentValue::RangeFolded => RANGE_FOLDED_SENTINEL,
+                                // Below threshold stays transparent: there the
+                                // radar looked and found nothing above the
+                                // noise, which is what an unpainted pixel
+                                // already says. Painting the two alike would
+                                // lay the folded-gate colour over most of a
+                                // clear-air sweep.
+                                MomentValue::BelowThreshold => continue,
                             };
-                            if scaled_value >= 999.0 || scaled_value.is_nan() {
-                                continue;
-                            }
 
                             let from = GateId {
                                 radial: radial_idx,

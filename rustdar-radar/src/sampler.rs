@@ -120,9 +120,12 @@
 //!
 //! [`SampleStatus`] carries the six reasons a sample has no number, so a hover
 //! readout can say "below the lowest beam" instead of nothing.
-//! `MomentValue::RangeFolded` is matched **nowhere else** in this crate — six
-//! consumers, every one of them `Value`-only — and closing that gap is half
-//! the point of the type.
+//! `MomentValue::RangeFolded` was matched **nowhere else** in this crate when
+//! that type was written — six consumers, every one of them `Value`-only — and
+//! closing that gap is half the point of it. The plan-view rasterizer has since
+//! grown its own arm (`crate::render`'s `RANGE_FOLDED_BITS`) and paints the
+//! same purple, but it has no status to hand back with the number, so this is
+//! still the only place a *readout* can say the word.
 //!
 //! There is **no downward or upward extrapolation**. Under the lowest rung's
 //! beam the answer is [`SampleStatus::BelowLowestBeam`]; over the highest it is
