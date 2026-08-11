@@ -581,6 +581,15 @@ impl<'a> Reader<'a> {
 /// calls it, and the inline fallback calls it. That is what makes a frame
 /// rendered in a worker byte-identical to one rendered on this thread — the
 /// two are not two renderers that agree, they are one renderer.
+///
+/// "Pure" is a claim about what it *returns*, and it survives one piece of
+/// process-wide state underneath: the plan-view rasterizer carries its cell
+/// buffer between calls (`rustdar_radar::render`'s `POOLED_CELLS`). That buffer
+/// can only ever be handed out drained, so no call can observe another's — and
+/// the byte-identity above was re-measured across five sites and twelve
+/// products with it in place. Anything added below that *is* observable between
+/// calls breaks the worker equivalence this paragraph promises, because a
+/// worker does not share this process's memory.
 pub fn execute(request: &JobRequest) -> JobResult {
     match request {
         JobRequest::Radar {

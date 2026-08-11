@@ -231,6 +231,10 @@ impl RadialContext {
 /// 159 ms *minimum* against Chromium's 174 ms, a matched-pair median ratio of
 /// 0.88; see `rustdar-web`'s crate docs for the medians and the method.
 struct RenderBuffers {
+    /// Borrowed from [`POOLED_CELLS`] for the length of one render and handed
+    /// back by [`Self::into_output`], because on native this single allocation
+    /// is one glibc can never recycle. Always `IMAGE_SIZE²` cells; never
+    /// resized.
     cells: Vec<AtomicU64>,
     /// Only `into_output` needs it, but it has to be the product the gates were
     /// coloured against, so it is captured at construction rather than passed
@@ -238,13 +242,194 @@ struct RenderBuffers {
     product: types::RadarProduct,
 }
 
+/// The one cell buffer this process keeps between plan-view renders.
+///
+/// # What it is worth
+///
+/// `IMAGE_SIZE² × size_of::<AtomicU64>()` is **33,554,432 bytes** on native,
+/// and that is not a size like any other. glibc raises its `mmap` threshold
+/// adaptively as blocks are freed, but never past `DEFAULT_MMAP_THRESHOLD_MAX`,
+/// which is 32 MiB — so a single request of 33,554,393 bytes or more is
+/// `mmap`ed and `munmap`ed *every* time, however often it is made, and pays a
+/// minor fault on first touch of every one of its fresh zero pages. Measured on
+/// glibc 2.44: a request of 33,554,392 bytes recycles at **0** minor faults,
+/// one of 33,554,432 takes **8,193**, and neither number moves with repetition.
+///
+/// Every plan-view rasterization funnels through [`render_with_projection`], so
+/// building this buffer per call was that cost once per render, per product,
+/// per pane, per loop frame. `strace` over six renders of one volume: six
+/// `mmap`s and six `munmap`s of 33,558,528 bytes, against **one** `mmap` and no
+/// `munmap` for the same six with the buffer carried.
+///
+/// # Measured
+///
+/// Minor faults charged to the render call itself, read from `/proc/self/stat`
+/// either side of it. Interleaved A/B — the two binaries alternate, so neither
+/// always follows the other — 7 launches each, 7 renders per product per
+/// launch, over three volumes: KTLX 2019-07-15, KDMX 2022-03-05, KLWX
+/// 2018-03-02. Release profile, so `opt-level = 3` and `lto = true`. Minimum of
+/// each arm over 42 calls, with the maximum beside it; a process's first render
+/// is excluded from the carried arm, because that is the one that buys the
+/// pages.
+///
+/// | per render         |           fresh |        carried |
+/// |--------------------|----------------:|---------------:|
+/// | KTLX reflectivity  | 17,957 (38,309) | 4,472 ( 6,836) |
+/// | KTLX velocity      | 18,284 (34,432) | 6,127 ( 6,513) |
+/// | KDMX reflectivity  | 17,339 (34,414) | 7,255 ( 8,058) |
+/// | KDMX velocity      | 16,015 (34,642) | 6,864 ( 7,951) |
+/// | KLWX reflectivity  | 19,699 (34,463) | 6,665 ( 7,070) |
+/// | KLWX velocity      | 17,589 (33,857) | 6,017 ( 6,579) |
+/// | *control*: voxels  |      0 ( 1,417) |     0 ( 1,409) |
+///
+/// The control is a [`crate::voxel`] build of the same volume, which never
+/// touches these cells and whose largest allocation is 8 MiB — under the cap,
+/// so it recycles either way. It is the finding stated as an experiment: the
+/// win is not "allocation is slow", it is *this one block* never being
+/// reusable, and a build that allocates freely beside it does not move at all.
+///
+/// Fault counts are the evidence rather than wall-clock because this box runs
+/// dozens of agents at once — 30-odd runnable at the time of measurement — and
+/// a fault count is a property of the code, where every timing on such a box is
+/// a property of the neighbours. Note also how much *steadier* the carried arm
+/// is: spreads of 15,000 to 20,000 become spreads of a few hundred.
+///
+/// The drop is larger than this buffer's own 8,193 pages, and the surplus is
+/// the second half of the same effect: while a 32 MiB block is `munmap`ed on
+/// every render, the 16 MiB image and 16 MiB value grid allocated beside it
+/// never get a settled heap to be recycled from either.
+///
+/// # Why one buffer, and not one per thread
+///
+/// A `thread_local` is the obvious shape and is the wrong one here. On native,
+/// `rustdar-frontend`'s `offload` spawns a **fresh `std::thread` per job**, so a
+/// thread-local would be allocated, faulted in and freed with the thread every
+/// single render — the reuse rate would be exactly zero. Even against a
+/// long-lived pool it would pin one 32 MiB buffer per worker thread that had
+/// ever rasterized, which on a 32-thread box is a gigabyte of buffers to save
+/// 32 MiB of allocation.
+///
+/// # Why it is not threaded through from the caller
+///
+/// `rustdar_frontend::volume_bridge::VolumeResources::widening` — the same
+/// cliff, fixed the same way — is the caller's buffer, and that is the right
+/// shape there because its caller is the frame thread, which spans every
+/// upload. This renderer has no
+/// such caller. Its callers are a thread that lives for one render, a browser
+/// worker reached over a message port that cannot be handed a pointer, and
+/// `offload::execute`, whose documented contract is that it is *pure* and the
+/// one implementation shared by all three. Threading a `&mut Vec<AtomicU64>`
+/// through would change ten public entry points, two crate boundaries and the
+/// worker protocol to reach a buffer that only one of the three arms could
+/// supply.
+///
+/// # Residency
+///
+/// **A permanently-held 32 MiB on native — desktop and mobile alike, since
+/// [`types::IMAGE_SIZE`] splits on wasm32 and nothing else — and 8 MiB per
+/// module instance on wasm32, from the first plan-view render onwards.** Never
+/// given back: a session that has rendered once is exactly the one about to
+/// render again, and the whole point is that the pages are bought once. On
+/// wasm32 the main thread and the rasterization worker are separate instances
+/// with separate linear memories, so a build where both rasterize holds the
+/// figure twice.
+///
+/// **What grows is idle residency, not peak.** This buffer was live for the
+/// whole of every render before this change too; all that is different is that
+/// it stays live between them. A process's high-water mark is unchanged, and
+/// the honest cost is that a session sitting on a rendered pane now holds
+/// 32 MiB it used to have handed back.
+///
+/// wasm32 is under the cliff and has nothing to win here: 8 MiB is a size
+/// dlmalloc recycles, and the browser's linear memory never gives pages back to
+/// the system anyway, so the buffer was already being reused in all but name.
+/// It carries the buffer regardless, because a `cfg`-gated behavioural split is
+/// a second renderer that no row of this workspace's gate runs the tests of.
+///
+/// One buffer, not a free list, and that is a deliberate ceiling. Renders can
+/// overlap — `MAX_CONCURRENT_RENDERS` permits six on desktop — and a second
+/// render that finds the slot empty allocates its own and frees it just as it
+/// does without a pool, plus one uncontended `Mutex` acquire around an
+/// `Option::take`. The lock is never held across that allocation
+/// ([`RenderBuffers::pool`] says exactly what it does cover), so the losers of
+/// a burst still allocate in parallel rather than queueing. What is bought is
+/// the sequential case, which is every case the win was measured in: a pane
+/// refreshing, a product switching, a loop advancing a frame at a time. A free
+/// list would instead make a six-wide burst's peak permanent — 192 MiB — to
+/// speed up renders that were already holding those six buffers live at once.
+static POOLED_CELLS: std::sync::Mutex<Option<Vec<AtomicU64>>> = std::sync::Mutex::new(None);
+
 impl RenderBuffers {
     fn new(product: types::RadarProduct) -> Self {
-        let n = types::IMAGE_SIZE * types::IMAGE_SIZE;
         Self {
-            cells: (0..n).map(|_| AtomicU64::new(Self::EMPTY)).collect(),
+            cells: Self::checkout(),
             product,
         }
+    }
+
+    /// Take the pooled buffer, or build one if this is the first render or a
+    /// second render is already holding it. See [`POOLED_CELLS`].
+    ///
+    /// The pool's invariant is that what it holds is exactly `IMAGE_SIZE²`
+    /// cells and every one of them is [`Self::EMPTY`]. [`Self::into_output`] is
+    /// the only path that puts a buffer back and it establishes both, so this
+    /// hands out something indistinguishable from a fresh allocation. The
+    /// length half cannot vary at all — `IMAGE_SIZE` is a compile-time constant
+    /// — which is why there is no grow-only arm here, unlike the caller's buffer
+    /// in `rustdar_frontend::volume_raymarch::coverage_premultiplied_into`,
+    /// whose grid shape does vary. The *content* half is the one that can rot,
+    /// and `tests/render_cell_pool.rs` is what pins it.
+    fn checkout() -> Vec<AtomicU64> {
+        let n = types::IMAGE_SIZE * types::IMAGE_SIZE;
+        // Bound to a `let`, and deliberately **not** written as the `match`
+        // scrutinee. A guard produced in a scrutinee lives to the end of the
+        // match, so `match Self::pool().take()` would hold the pool lock across
+        // the fallback allocation below — 32 MiB and its page faults, under a
+        // process-wide mutex, exactly where concurrent renders that all miss
+        // the slot would then queue on each other instead of allocating in
+        // parallel as they do without a pool at all. `clippy::
+        // significant_drop_in_scrutinee` is the lint for that shape and it is
+        // nursery, so this gate cannot catch it; the statement below is the
+        // only thing keeping the lock off the allocation.
+        let pooled = Self::pool().take();
+        match pooled {
+            Some(cells) => {
+                debug_assert_eq!(cells.len(), n, "the pool holds one shape");
+                cells
+            }
+            None => (0..n).map(|_| AtomicU64::new(Self::EMPTY)).collect(),
+        }
+    }
+
+    /// Offer a drained buffer back to the pool, keeping it only if the slot is
+    /// free. See [`POOLED_CELLS`] for why the slot is one and not many.
+    fn recycle(cells: Vec<AtomicU64>) {
+        let mut pool = Self::pool();
+        if pool.is_none() {
+            *pool = Some(cells);
+        }
+    }
+
+    /// The pool, with a poisoned lock read as a live one.
+    ///
+    /// **What the lock covers is one `Option::take` in [`Self::checkout`] and
+    /// one `is_none` plus a move-assign in [`Self::recycle`], and nothing
+    /// else.** In particular the 32 MiB fallback allocation, the length
+    /// `debug_assert`, the whole rasterization and the drain are all outside
+    /// it, and so is the drop of a buffer `recycle` declines to keep — the
+    /// guard goes out of scope before the argument does. That is what makes it
+    /// a lock renders never contend on for any measurable time; it is also why
+    /// nothing under it can panic, which makes poisoning unreachable.
+    ///
+    /// Recovering rather than unwrapping keeps a panic that cannot happen out
+    /// of the renderer anyway. The claim above is a property of two call sites
+    /// rather than of a type, so it has to be re-read whenever either changes;
+    /// [`Self::checkout`] says which line is load-bearing and why the lint that
+    /// would otherwise catch a regression cannot run in this gate.
+    fn pool() -> std::sync::MutexGuard<'static, Option<Vec<AtomicU64>>> {
+        POOLED_CELLS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// No gate has claimed this pixel. Distinct from every real cell because
@@ -268,23 +453,40 @@ impl RenderBuffers {
     /// vanishes against the palette lookups.
     const COLOR_CHUNK: usize = 16 * 1024;
 
-    /// Split the cells into the RGBA texture and the value grid.
+    /// Split the cells into the RGBA texture and the value grid, and give the
+    /// drained buffer back to [`POOLED_CELLS`].
     ///
     /// Colour is derived here rather than stored per sample: it is a pure
     /// function of the value at every call site, so keeping it in the cell
     /// would only give it a second chance to disagree. Deriving it is also
     /// less work — one lookup per pixel instead of one per gate — but only
     /// once the pass is parallel. Serial, it dominates the whole render.
+    ///
+    /// # The reset is this pass, not another one
+    ///
+    /// A carried buffer has to go back to the pool [`Self::EMPTY`] everywhere,
+    /// or the next render inherits whatever pixels this one painted that it
+    /// does not. That reset costs nothing here because this pass already reads
+    /// every cell: it takes each one's value and leaves `EMPTY` behind it, in
+    /// the same iteration, on cache lines it has just pulled in. There is no
+    /// second sweep of 32 MiB to bulk-zero — not a loop, not a `memset`, not a
+    /// `calloc` on the way in — which is strictly better than any of them, and
+    /// it also means the buffer cannot be handed out un-reset by a path that
+    /// forgot, because there is only the one path.
+    ///
+    /// `get_mut` rather than a `swap`: rasterization is over by the time this
+    /// runs and taking `self` by value proves it, so the drain is a plain load
+    /// and store per cell rather than 4 M locked read-modify-writes.
     fn into_output(self, actual_max_range: f64) -> (Vec<u8>, f64, Vec<f32>) {
-        let product = self.product;
-        let value_data: Vec<f32> = self
-            .cells
-            .iter()
-            .map(|a| match a.load(Ordering::Relaxed) {
+        let Self { mut cells, product } = self;
+        let value_data: Vec<f32> = cells
+            .iter_mut()
+            .map(|a| match std::mem::replace(a.get_mut(), Self::EMPTY) {
                 Self::EMPTY => f32::NAN,
                 cell => f32::from_bits(cell as u32),
             })
             .collect();
+        Self::recycle(cells);
         let mut image = vec![0u8; value_data.len() * 4];
         image
             .par_chunks_mut(4 * Self::COLOR_CHUNK)
