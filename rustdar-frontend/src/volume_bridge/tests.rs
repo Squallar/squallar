@@ -1019,3 +1019,156 @@ fn the_fade_bar_is_inclusive_and_bites_one_index_below_it() {
     assert!(palette_refusal_for(u16::from(MINIMUM_FADE_INDICES), "x").is_none());
     assert!(palette_refusal_for(u16::from(MINIMUM_FADE_INDICES) - 1, "x").is_some());
 }
+
+/// **The byte-bounded eviction actually bounds.** A set holder is exempt from
+/// every shed in this file, so this is the only thing standing between a 3D
+/// loop and an unbounded store.
+///
+/// Driven past the line rather than up to it: the budget is set to two grids
+/// and four are made resident, so the check has to *evict* rather than merely
+/// find nothing to do. A store that returned 0 without freeing anything, or
+/// one that freed everything, both fail — the assertions pin the surviving
+/// count and which ones survived.
+#[test]
+fn the_store_eviction_actually_bounds() {
+    let store = VolumeStore::new();
+    let one = match ready_grid() {
+        VolumeEntry::Ready(grid) => {
+            crate::volume::raymarch::grid_bytes_with_mips([
+                u32::try_from(grid.shape().nx).unwrap(),
+                u32::try_from(grid.shape().ny).unwrap(),
+                u32::try_from(grid.shape().nz).unwrap(),
+            ])
+            .expect("a fixture grid cannot overflow")
+                + crate::constants::VOLUME_LUT_BYTES
+        }
+        _ => unreachable!("ready_grid is Ready"),
+    };
+    assert!(one > 0, "precondition: a resident grid costs something");
+
+    let targets: Vec<VolumeTarget> = (0..4)
+        .map(|m| target(RadarProduct::Reflectivity, m))
+        .collect();
+    for t in &targets {
+        assert!(!store.share_held(0, t, Hold::Set), "each target is new");
+        store.begin_build_held(0, t, Hold::Set);
+        assert!(store.complete(t, ready_grid()), "the build resolves");
+    }
+    assert_eq!(
+        store.texture_bytes(),
+        one * 4,
+        "precondition: four resident grids, and the byte count is per grid — \
+         if this is 0 the eviction below has nothing to measure and passes \
+         vacuously",
+    );
+
+    let evicted = store.enforce_budget(one * 2);
+    assert_eq!(evicted, 2, "the eviction stopped short of the budget");
+    assert!(
+        store.texture_bytes() <= one * 2,
+        "the store is still over its budget after enforcing it: {} bytes \
+         against {}",
+        store.texture_bytes(),
+        one * 2,
+    );
+    // Oldest-first, by build order: the two the pane asked for first are the
+    // two that went. In production those are the pane's live grid and the
+    // oldest loop frame, which is exactly the intended order.
+    assert!(
+        store.lookup(&targets[0]).is_none() && store.lookup(&targets[1]).is_none(),
+        "the two oldest entries survived a budget they caused to be exceeded, \
+         so the eviction is not oldest-first",
+    );
+    assert!(
+        store.lookup(&targets[3]).is_some(),
+        "the newest entry was evicted, so the eviction is not oldest-first and \
+         a playing loop would lose the frame it had just built",
+    );
+}
+
+/// A set holder keeps its whole set through the events that shed a single
+/// holder's other grids.
+///
+/// Both of them, because they are different code paths and either alone would
+/// let a 3D loop lose thirteen of its fourteen frames the moment the
+/// fourteenth landed:
+///
+///  * `share`, which sheds when a pane attaches to a new target;
+///  * `complete`, whose "the grid that landed supersedes the one you were
+///    painting through the wait" rule is the seamless swap.
+#[test]
+fn a_set_holder_keeps_its_whole_set_through_a_build_landing() {
+    let store = VolumeStore::new();
+    let targets: Vec<VolumeTarget> = (0..3)
+        .map(|m| target(RadarProduct::Reflectivity, m))
+        .collect();
+
+    for t in &targets {
+        store.begin_build_held(0, t, Hold::Set);
+        assert!(store.complete(t, ready_grid()), "the build resolves");
+    }
+    assert_eq!(
+        store.live_ids().len(),
+        3,
+        "a set holder lost grids as its own later builds landed, which is the \
+         single-holder swap rule applied to a set",
+    );
+    for t in &targets {
+        assert!(
+            store.lookup(t).is_some(),
+            "one of the set's grids is gone: {:?}",
+            t.volume.collected,
+        );
+    }
+
+    // The same three targets held the *old* way lose all but the last, which
+    // is what makes the assertions above about `Hold::Set` rather than about
+    // the store having stopped shedding altogether.
+    let single = VolumeStore::new();
+    for t in &targets {
+        single.begin_build(1, t);
+        assert!(single.complete(t, ready_grid()), "the build resolves");
+    }
+    assert_eq!(
+        single.live_ids().len(),
+        1,
+        "a single holder no longer sheds, so the set holder's exemption above \
+         is not being tested",
+    );
+}
+
+/// `retain_set` is the set holder's shed: what it does not name, it lets go
+/// of — and an empty set is the release-before-build rule.
+#[test]
+fn retain_set_states_the_whole_set_and_release_set_gives_it_all_back() {
+    let store = VolumeStore::new();
+    let targets: Vec<VolumeTarget> = (0..3)
+        .map(|m| target(RadarProduct::Reflectivity, m))
+        .collect();
+    for t in &targets {
+        store.begin_build_held(0, t, Hold::Set);
+        assert!(store.complete(t, ready_grid()), "the build resolves");
+    }
+
+    let dropped = store.retain_set(0, &targets[1..]);
+    assert_eq!(dropped, 1, "the unnamed grid was not let go of");
+    assert!(store.lookup(&targets[0]).is_none());
+    assert!(store.lookup(&targets[2]).is_some());
+
+    assert_eq!(store.release_set(0), 2, "the whole remaining set goes");
+    assert_eq!(store.texture_bytes(), 0, "the store still holds bytes");
+
+    // And the exemption that makes `release_set` safe to call for every pane
+    // whose loop is not active: a live 3D pane holds one grid, is not a set
+    // holder, and must not lose it.
+    let live = target(RadarProduct::Velocity, 9);
+    store.begin_build(1, &live);
+    assert!(store.complete(&live, ready_grid()), "the build resolves");
+    assert_eq!(
+        store.release_set(1),
+        0,
+        "release_set took a live pane's only grid, so a 3D pane with no loop \
+         would rebuild it every frame",
+    );
+    assert!(store.lookup(&live).is_some());
+}

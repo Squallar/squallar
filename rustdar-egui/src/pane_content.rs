@@ -143,21 +143,23 @@ impl PaneKind {
     ///   line through one volume. The line is part of the loop's identity
     ///   (`crate::pane::SectionLoopKey`); moving it re-cuts every frame, exactly
     ///   as moving the product does for a plan view.
-    /// * A **3D volume does not yet**, and the reason is scope rather than
-    ///   impossibility. Its picture is raymarched live from a
-    ///   `VOLUME_GRID_CELLS` texture every frame, so a cached *image* would be
-    ///   specific to the eye and orbiting would invalidate every frame at once
-    ///   — but that rules out one design, not the feature. Holding the grids
-    ///   **resident** and swapping which one is marched costs a
-    ///   `set_bind_group` per playback step (measured: +2% on a discrete GPU,
-    ///   +4% on a software rasteriser), and against
-    ///   `LOOP_TEXTURE_BUDGET_BYTES` — the budget that bounds what a *loop*
-    ///   costs, rather than `VOLUME_TEXTURE_BUDGET_BYTES`, which bounds one
-    ///   live grid — wasm32 and mobile fit at today's full grid and desktop
-    ///   fits at 14 frames. See that constant's table. What is missing is the
-    ///   work above the GPU layer: a store a loop can hold a *set* of grids in,
-    ///   a build path that accepts a volume time that is not the newest, and a
-    ///   pacing budget for the resample.
+    /// * A **3D volume** can too, and its frame is the one that is not a
+    ///   picture. The picture is raymarched live from the eye every frame, so a
+    ///   cached *image* would be specific to the camera and one orbit would
+    ///   invalidate the whole loop at once. What it caches instead is the
+    ///   **input**: each frame is a resident `VOLUME_GRID_CELLS` 3D texture and
+    ///   the march swaps which one it samples, at a measured +0.01 ms (+2%) on
+    ///   a discrete GPU and +0.31–0.78 ms (+3–4%) on a software rasteriser. So
+    ///   orbiting a resident loop costs nothing and a frame's identity is a
+    ///   [`VolumeTarget`] rather than a raster. Its grids are held in one
+    ///   application-wide store, so the *set* is what the loop owns
+    ///   (`crate::pane::VolumeLoopKey` is the rest of its key: the region and
+    ///   the storm motion vector, for the reason `SectionLoopKey` carries the
+    ///   line and the vector). See
+    ///   `rustdar_frontend::constants::VOLUME_LOOP_TEXTURE_BUDGET_BYTES` for
+    ///   what it costs and `MAX_LOOP_VOLUME_FRAMES` for how much history it
+    ///   buys — 14 frames on desktop at the full grid, rather than 30 at a
+    ///   coarser one that would halve the vertical axis a loop exists to watch.
     ///
     /// Exhaustive on purpose, like [`Self::render_view`]: a fourth kind must be
     /// classified here rather than defaulting into — or out of — the loop
@@ -165,13 +167,14 @@ impl PaneKind {
     /// symmetric. A kind wrongly excluded is a missing feature; a kind wrongly
     /// included is a pane whose frames nothing renders, which under Sync Layers
     /// holds **every other pane's** loop back for ever. That asymmetry is why
-    /// `Volume` answers `false` here today: not because the answer is settled,
-    /// but because flipping it before the store and the build path can serve it
-    /// is the expensive mistake rather than the cheap one.
+    /// `Volume` answered `false` until three things existed: a store a holder
+    /// can own a *set* of grids in, a build path that accepts a volume time
+    /// that is not the newest, and a pacing budget for the resample. All three
+    /// do now, which is what changed the answer — the claim was never that the
+    /// memory did not fit.
     pub fn can_loop(self) -> bool {
         match self {
-            Self::Map | Self::CrossSection => true,
-            Self::Volume => false,
+            Self::Map | Self::CrossSection | Self::Volume => true,
         }
     }
 

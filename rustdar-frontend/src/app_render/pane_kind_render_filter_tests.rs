@@ -296,7 +296,8 @@ fn active_loop(timestamps: &[chrono::NaiveDateTime]) -> LoopPlaybackState {
 /// `pane_has_no_plan_view`, which is what it was while a loop frame could only
 /// be a plan-view tilt. The three rows below are the whole of the difference:
 /// an aimed cross-section pane has no plan view and *does* animate, an unaimed
-/// one has nothing to cut, and a 3D volume cannot cache a frame at all.
+/// one has nothing to cut, and a 3D volume animates a sequence of resident
+/// grids with nothing to be aimed at, so it is a participant from the start.
 #[test]
 fn the_first_loop_dispatch_pass_skips_only_the_panes_that_cannot_loop() {
     let moved_to = RadarProduct::Velocity;
@@ -323,7 +324,9 @@ fn the_first_loop_dispatch_pass_skips_only_the_panes_that_cannot_loop() {
             false,
             Some((PRODUCT, TILT)),
         ),
-        ("volume", PaneKind::Volume, false, Some((PRODUCT, TILT))),
+        // A 3D pane needs no aiming — the volume is the whole box — so its
+        // target moves with the product like a map's.
+        ("volume", PaneKind::Volume, false, Some((moved_to, 0.0))),
     ] {
         let mut app = app_on_site();
         {
@@ -340,6 +343,7 @@ fn the_first_loop_dispatch_pass_skips_only_the_panes_that_cannot_loop() {
                     .line = Some(section_line());
             }
             pane.loop_state = active_loop(&[volume_time()]);
+            pane.loop_state.view = kind.render_view();
             pane.selected_product = moved_to;
             pane.selected_elevation = 0.0;
         }
@@ -379,7 +383,11 @@ fn the_second_loop_dispatch_pass_judges_every_pane_that_can_loop() {
         ("map", PaneKind::Map, false, true),
         ("aimed section", PaneKind::CrossSection, true, true),
         ("unaimed section", PaneKind::CrossSection, false, false),
-        ("volume", PaneKind::Volume, false, false),
+        // The 3D branch judges its frames too: the cached volume carries
+        // nothing for the product, so `extract_volume_parts` refuses and the
+        // store answers `Refused`, which retires the frame exactly as an
+        // unrenderable sweep does on the plan-view path.
+        ("volume", PaneKind::Volume, false, true),
     ] {
         let mut app = app_on_site();
         app.loop_mgr = LoopDownloadManager::new();
@@ -397,14 +405,11 @@ fn the_second_loop_dispatch_pass_judges_every_pane_that_can_loop() {
                     .line = Some(section_line());
             }
             pane.loop_state = active_loop(&[volume_time()]);
-            if aimed {
-                // A section loop is planned on its own view. The state is
-                // planted directly here for the same reason the loop itself
-                // is: this test is about the dispatch filter, not about the
-                // enable path that would normally set it.
-                app.gui.pane_mut(0).unwrap().loop_state.view =
-                    rustdar_radar::types::RenderView::CrossSection;
-            }
+            // Each loop is planned on its own view, which the enable path
+            // takes off the pane's kind. Planted directly here for the same
+            // reason the loop itself is: this test is about the dispatch
+            // filter, not about the enable path.
+            pane.loop_state.view = kind.render_view();
         }
 
         app.dispatch_loop_renders();
@@ -418,7 +423,7 @@ fn the_second_loop_dispatch_pass_judges_every_pane_that_can_loop() {
     }
 }
 
-/// A pane with no plan view cannot hold another pane's loop back.
+/// A pane that cannot loop cannot hold another pane's loop back.
 ///
 /// The worst of these, because the symptom is in the *other* panes and the
 /// cause is the filter that protects the render path.
@@ -428,10 +433,16 @@ fn the_second_loop_dispatch_pass_judges_every_pane_that_can_loop() {
 /// failed. So one such pane, with Sync Layers on, stops every map pane's loop
 /// from ever starting: a deadlock, silently, in panes the user did not touch.
 ///
+/// The pane used to be a 3D volume one, which is now a full loop participant.
+/// The state is still reachable and still the hazard, and what reaches it now
+/// is an **unaimed cross-section** pane — the one kind-and-state combination
+/// `PaneState::can_loop` still refuses, because a section with no line has
+/// nothing to cut while its volumes download perfectly well.
+///
 /// The blocked pane is given a real textured frame so it *is* render-ready and
 /// would start on its own; the only thing that can stop it is the sync rule.
 #[test]
-fn a_pane_with_no_plan_view_cannot_hold_another_panes_loop_back() {
+fn a_pane_that_cannot_loop_cannot_hold_another_panes_loop_back() {
     use rustdar_egui::pane::LoopPhase;
 
     let mut app = two_pane_app(SITE, SITE);
@@ -459,9 +470,13 @@ fn a_pane_with_no_plan_view_cannot_hold_another_panes_loop_back() {
     // still reach.
     {
         let pane = app.gui.pane_mut(1).unwrap();
-        pane.set_kind(PaneKind::Volume);
+        pane.set_kind(PaneKind::CrossSection);
         pane.loop_state = active_loop(&[volume_time()]);
     }
+    assert!(
+        !app.gui.pane(1).unwrap().can_loop(),
+        "precondition: the second pane must be one nothing renders frames              for, or there is no hazard to observe"
+    );
     assert!(
         !app.gui.pane(1).unwrap().loop_state.is_render_ready(),
         "precondition: the converted pane must be un-ready, which is the \

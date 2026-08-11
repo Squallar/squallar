@@ -276,7 +276,7 @@ fn moving_the_line_discards_every_frame() {
          on animating a slice of the ground the user moved away from"
     );
     assert!(ls.frames.iter().all(|f| f.image.is_none()));
-    assert_eq!(ls.section_key.as_ref().map(|k| k.line), Some(elsewhere));
+    assert_eq!(ls.section_key().map(|k| k.line), Some(elsewhere));
 }
 
 /// **The stale-vector bug, one frame at a time.**
@@ -397,9 +397,10 @@ fn a_broadcast_cut_along_another_line_is_refused() {
     );
 }
 
-/// The classification itself: which kinds can animate, and which cannot.
+/// The classification itself: which kinds can animate, and what each one's
+/// frame *is*.
 #[test]
-fn only_the_kinds_with_a_cacheable_picture_can_loop() {
+fn every_kind_can_loop_and_each_frame_is_its_own_shape() {
     assert!(PaneKind::Map.can_loop());
     assert!(
         PaneKind::CrossSection.can_loop(),
@@ -407,10 +408,53 @@ fn only_the_kinds_with_a_cacheable_picture_can_loop() {
          exactly what a loop frame is"
     );
     assert!(
-        !PaneKind::Volume.can_loop(),
-        "a 3D volume is raymarched live from the eye, so a cached frame is \
-         camera-specific and orbiting invalidates the whole loop at once"
+        PaneKind::Volume.can_loop(),
+        "a 3D volume's loop frame is the resident grid rather than a \
+         camera-specific raster, which is what makes orbiting a loop free \
+         instead of invalidating every frame of it"
     );
+    // The classification is not "everything loops" — it is that each kind's
+    // frame is a different shape, and the shapes must not be interchangeable.
+    // Without this the enum could grow a fourth variant that answered every
+    // accessor with `None` and nothing above would notice.
+    for (image, view) in [
+        (
+            LoopFrameImage::Volume(VolumeFrameGrid {
+                id: 7,
+                target: volume_target(),
+            }),
+            RenderView::Volume,
+        ),
+        (
+            plan_view_picture(&egui::Context::default()),
+            RenderView::PlanView,
+        ),
+    ] {
+        assert_eq!(image.view(), view);
+        assert_eq!(
+            image.volume().is_some(),
+            view == RenderView::Volume,
+            "{view:?}: a consumer asking for a resident grid was handed \
+             another kind's frame, or refused its own",
+        );
+        assert!(
+            image.section().is_none(),
+            "{view:?}: a section consumer was handed a frame that is not one",
+        );
+    }
+}
+
+/// A `VolumeTarget` for the fixtures above: this loop's site, the default box
+/// about it, at one arbitrary volume time.
+fn volume_target() -> crate::pane::VolumeTarget {
+    crate::pane::VolumeTarget {
+        volume: crate::pane::VolumeStamp {
+            site: SITE.to_owned(),
+            collected: ts(1),
+        },
+        product: PRODUCT,
+        region: None,
+    }
 }
 
 /// A section pane cannot loop until it has been aimed, and the refusal is on

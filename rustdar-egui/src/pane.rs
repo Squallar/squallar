@@ -107,6 +107,37 @@ pub enum LoopFrameImage {
     PlanView(RadarImageData),
     /// A `SECTION_WIDTH × SECTION_HEIGHT` vertical slice along the loop's line.
     Section(SectionImageData),
+    /// A **resident voxel grid**, named rather than held.
+    ///
+    /// The odd one out, and deliberately so: the other two variants carry the
+    /// picture, and this one carries what the picture is raymarched *from*. A
+    /// 3D pane's image is a function of the camera, so a cached raster would
+    /// be invalidated by one orbit; the grid is not, and swapping which
+    /// resident grid the march samples is a `set_bind_group` and a 192-byte
+    /// uniform write. See `PaneKind::can_loop`.
+    ///
+    /// It is a name rather than an `Arc<VoxelGrid>` because the grids live in
+    /// the frontend's single `VolumeStore`, keyed by target and shared between
+    /// panes — two 3D panes orbiting one volume already share one build and
+    /// one upload, and a loop frame holding its own handle would defeat that
+    /// and put a `rustdar_radar` type in a pane.
+    Volume(VolumeFrameGrid),
+}
+
+/// The resident grid one 3D loop frame marches, named by what built it.
+///
+/// `target` is the whole identity — site, volume time, product and region — and
+/// is what the painter is aimed at while this frame is the playhead's. `id` is
+/// the `VolumeStore` id its GPU upload is keyed by, carried so a consumer can
+/// tell two frames apart without comparing a `String` and a `NaiveDateTime`,
+/// and so a test can assert that the resident set is exactly the frame list.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VolumeFrameGrid {
+    /// The store id of the resident grid. Unique per build; the GPU side keeps
+    /// exactly the ids the store is still holding.
+    pub id: u64,
+    /// Everything the grid was built from.
+    pub target: VolumeTarget,
 }
 
 impl LoopFrameImage {
@@ -116,6 +147,7 @@ impl LoopFrameImage {
         match self {
             Self::PlanView(_) => RenderView::PlanView,
             Self::Section(_) => RenderView::CrossSection,
+            Self::Volume(_) => RenderView::Volume,
         }
     }
 
@@ -123,7 +155,7 @@ impl LoopFrameImage {
     pub fn plan_view(&self) -> Option<&RadarImageData> {
         match self {
             Self::PlanView(image) => Some(image),
-            Self::Section(_) => None,
+            Self::Section(_) | Self::Volume(_) => None,
         }
     }
 
@@ -131,7 +163,15 @@ impl LoopFrameImage {
     pub fn section(&self) -> Option<&SectionImageData> {
         match self {
             Self::Section(image) => Some(image),
-            Self::PlanView(_) => None,
+            Self::PlanView(_) | Self::Volume(_) => None,
+        }
+    }
+
+    /// The resident grid this frame marches, or `None` if it is a raster.
+    pub fn volume(&self) -> Option<&VolumeFrameGrid> {
+        match self {
+            Self::Volume(grid) => Some(grid),
+            Self::PlanView(_) | Self::Section(_) => None,
         }
     }
 }
@@ -287,6 +327,74 @@ impl SectionLoopKey {
     }
 }
 
+/// The 3D counterpart of [`SectionLoopKey`]: what a resident voxel grid depends
+/// on that a [`RenderTarget`] cannot say.
+///
+/// * **The region.** A grid is resampled over a box of ground, and the region
+///   picker exists to spend a fixed cell count over less of it. Re-drag the box
+///   and every frame in the loop is a resample of somewhere else — the exact
+///   counterpart of redrawing a section's line, and the same reason
+///   [`VolumeTarget`] carries it.
+/// * **The storm motion vector.** A storm-relative grid is derived on the way
+///   out of the volume, so the grid *is* a function of the vector, and the
+///   vector is not in the target that keys it. Without it here, an override
+///   edit would leave fourteen grids painting the previous vector's field with
+///   nothing saying so — the same defect `SectionLoopKey::storm_motion` and
+///   `render_dispatch::SectionInputKey::storm_motion` exist for.
+///
+/// Bits rather than `f32`s, for [`SectionLoopKey`]'s reason: a NaN vector would
+/// never equal itself and every grid in the loop would be rebuilt on every
+/// dispatch pass for ever — 89 ms of resample apiece, with a hot CPU as the
+/// only symptom. The region is compared as itself, which is safe because
+/// [`VolumeRegion::new`] refuses a non-finite centre.
+///
+/// The **elevation** is deliberately absent, and that is a difference from
+/// every other loop kind. A grid is resampled from the whole ladder, so the
+/// pane's tilt selection changes nothing about it; keying on the tilt would
+/// throw away fourteen grids and pay ~2 s to rebuild them identically the first
+/// time a user nudged the elevation slider on a 3D pane. See
+/// [`LoopPlaybackState::retarget_renders_keyed`], which is where that exception
+/// is applied.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VolumeLoopKey {
+    /// The ground every frame is resampled over, or `None` for the default box
+    /// about the site.
+    pub region: Option<VolumeRegion>,
+    /// The storm motion vector the grids were derived with, as raw bits, and
+    /// `None` for every product that does not read one.
+    pub storm_motion: Option<(u32, u32)>,
+}
+
+impl VolumeLoopKey {
+    /// The key for `region` under the storm motion vector `motion`, in the same
+    /// `(speed_kt, direction_from_deg)` form the extraction is handed.
+    pub fn new(region: Option<VolumeRegion>, motion: Option<(f32, f32)>) -> Self {
+        Self {
+            region,
+            storm_motion: motion.map(|(speed, direction)| (speed.to_bits(), direction.to_bits())),
+        }
+    }
+}
+
+/// The view-specific half of a loop's render key.
+///
+/// One field on [`LoopPlaybackState`] rather than one per view, so that the
+/// invariant [`SectionLoopKey`]'s doc states — the halves of a key are written
+/// together and cannot disagree — holds across *three* kinds rather than being
+/// re-established for each. A loop that changed kind without changing product
+/// would otherwise keep a key describing the old kind's picture.
+///
+/// A plan-view loop has no view half at all, which is [`Option::None`] at the
+/// use site rather than a third variant: there is nothing to store, and a
+/// variant holding nothing would be a thing to forget to compare.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LoopViewKey {
+    /// See [`SectionLoopKey`].
+    Section(SectionLoopKey),
+    /// See [`VolumeLoopKey`].
+    Volume(VolumeLoopKey),
+}
+
 /// The two sweep angles a sibling broadcast has to reconcile.
 ///
 /// A [`RenderTarget`] carries the *selected* elevation; the renderer is given that
@@ -405,12 +513,16 @@ pub struct LoopPlaybackState {
     /// [`RenderView::PlanView`] for a loop built before the field existed and
     /// for [`LoopPlaybackState::new`], which is the inactive state.
     pub view: RenderView,
-    /// The section half of the render key, or `None` for a plan-view loop.
+    /// The view-specific half of the render key, or `None` for a plan-view
+    /// loop.
     ///
-    /// See [`SectionLoopKey`] for what is in it and why. Written only by
-    /// [`Self::retarget_renders_for`], alongside [`Self::rendered_for`], so the
-    /// two halves of the key cannot describe different pictures.
-    pub section_key: Option<SectionLoopKey>,
+    /// See [`LoopViewKey`] for what is in it and why. Written only by
+    /// [`Self::retarget_renders_keyed`], alongside [`Self::rendered_for`], so
+    /// the two halves of the key cannot describe different pictures. Read
+    /// through [`Self::section_key`] and [`Self::volume_key`], which answer
+    /// `None` for a key of the other kind — so a caller that asks for its own
+    /// kind's key can never be handed another's.
+    pub view_key: Option<LoopViewKey>,
 }
 
 /// Per-pane state: each pane independently selects a radar product,
@@ -528,7 +640,7 @@ impl LoopPlaybackState {
             site_lon: 0.0,
             rendered_for: None,
             view: RenderView::PlanView,
-            section_key: None,
+            view_key: None,
         }
     }
 
@@ -558,7 +670,7 @@ impl LoopPlaybackState {
             site_lon: site.lon,
             rendered_for: None,
             view,
-            section_key: None,
+            view_key: None,
         }
     }
 
@@ -757,7 +869,26 @@ impl LoopPlaybackState {
     /// line and the storm motion vector, and a frame that agrees on one half and
     /// not the other is a picture of a different slice.
     pub fn is_cut_for(&self, target: &RenderTarget, key: &SectionLoopKey) -> bool {
-        self.is_rendered_for(target) && self.section_key.as_ref() == Some(key)
+        self.is_rendered_for(target) && self.section_key() == Some(key)
+    }
+
+    /// The section half of this loop's key, or `None` — including for a loop
+    /// whose key is a *volume* key, which is the point of asking through here
+    /// rather than matching on [`Self::view_key`] at each site.
+    pub fn section_key(&self) -> Option<&SectionLoopKey> {
+        match &self.view_key {
+            Some(LoopViewKey::Section(key)) => Some(key),
+            Some(LoopViewKey::Volume(_)) | None => None,
+        }
+    }
+
+    /// The volume half of this loop's key, or `None`. See
+    /// [`Self::section_key`].
+    pub fn volume_key(&self) -> Option<&VolumeLoopKey> {
+        match &self.view_key {
+            Some(LoopViewKey::Volume(key)) => Some(key),
+            Some(LoopViewKey::Section(_)) | None => None,
+        }
     }
 
     /// The index of the frame awaiting a **section** result for
@@ -904,11 +1035,6 @@ impl LoopPlaybackState {
 
     /// [`Self::retarget_renders`] including the section half of the key.
     ///
-    /// **The only writer of either half**, which is what makes them one key
-    /// rather than two fields that can disagree: a caller cannot move the line
-    /// without the frames keyed to the old one being discarded, because there is
-    /// no way to write [`Self::section_key`] that does not come through here.
-    ///
     /// `section` is `None` for a plan-view loop and `Some` for a section loop.
     /// Passing `None` on a section loop would therefore *also* count as a
     /// change and discard every frame — which is the safe direction, and is what
@@ -919,13 +1045,44 @@ impl LoopPlaybackState {
         elevation: f32,
         section: Option<SectionLoopKey>,
     ) -> bool {
+        self.retarget_renders_keyed(product, elevation, section.map(LoopViewKey::Section))
+    }
+
+    /// [`Self::retarget_renders`] including whichever view half this loop has.
+    ///
+    /// **The only writer of either half**, which is what makes them one key
+    /// rather than two fields that can disagree: a caller cannot move the line
+    /// or the region without the frames keyed to the old one being discarded,
+    /// because there is no way to write [`Self::view_key`] that does not come
+    /// through here.
+    ///
+    /// # A volume loop ignores the elevation, and only a volume loop may
+    ///
+    /// The tilt is part of the target for the two raster kinds because it
+    /// chooses which sweep is drawn. A voxel grid is resampled from the whole
+    /// ladder, so it chooses nothing — and keying on it would discard the
+    /// entire resident set and pay ~2 s of rebuild the first time a user
+    /// nudged the elevation slider on a 3D pane, for fourteen grids that would
+    /// come back byte-identical. The stored `rendered_for` still carries the
+    /// pane's selection, so the sibling broadcast and every result-acceptance
+    /// test are unchanged; what this drops is only the *comparison*, and only
+    /// for the kind whose picture the tilt cannot move.
+    pub fn retarget_renders_keyed(
+        &mut self,
+        product: RadarProduct,
+        elevation: f32,
+        key: Option<LoopViewKey>,
+    ) -> bool {
+        let tilt_matters = !matches!(key, Some(LoopViewKey::Volume(_)));
         // Runs for every looping pane every frame, and almost always finds no change,
         // so ask before building a target rather than allocating one to throw away.
-        if self
-            .rendered_for
-            .as_ref()
-            .is_some_and(|t| t.matches_parts(&self.site, product, elevation))
-            && self.section_key == section
+        if self.rendered_for.as_ref().is_some_and(|t| {
+            if tilt_matters {
+                t.matches_parts(&self.site, product, elevation)
+            } else {
+                t.site == self.site && t.product == product
+            }
+        }) && self.view_key == key
         {
             return false;
         }
@@ -933,7 +1090,7 @@ impl LoopPlaybackState {
         // Nothing to discard before the first dispatch — frames start blank.
         let had_previous_target = self.rendered_for.is_some();
         self.rendered_for = Some(RenderTarget::new(self.site.clone(), product, elevation));
-        self.section_key = section;
+        self.view_key = key;
         if !had_previous_target {
             return false;
         }
@@ -1227,6 +1384,18 @@ impl PaneState {
     /// image" without saying which would draw a plan view into a section's axes.
     pub fn active_section_image(&self) -> Option<&SectionImageData> {
         self.active_loop_image().and_then(LoopFrameImage::section)
+    }
+
+    /// The playing frame's resident voxel grid, or `None` when this pane is not
+    /// animating a 3D volume — including while its loop is still filling.
+    ///
+    /// `None` is what makes the 3D pane keep showing the *live* volume until
+    /// the loop is ready, exactly as a map pane goes on showing its static
+    /// render: the caller aims the painter at this target when there is one and
+    /// at the live stamp when there is not, and there is no third state in
+    /// which the pane is blank because a loop was switched on.
+    pub fn active_volume_frame(&self) -> Option<&VolumeFrameGrid> {
+        self.active_loop_image().and_then(LoopFrameImage::volume)
     }
 
     /// Whichever picture the loop's playhead is on, before it is narrowed to a

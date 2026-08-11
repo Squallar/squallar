@@ -1,7 +1,8 @@
 use crate::constants::{
     DEFAULT_LOOP_SPEED_FPS, MAX_CONCURRENT_LOOP_DOWNLOADS, MAX_CONCURRENT_RENDERS, MAX_LOOP_FRAMES,
     MAX_LOOP_RENDER_BUDGET, MAX_LOOP_SECTION_CUTS_PER_FRAME, MAX_LOOP_SPEED_FPS,
-    MIN_LOOP_SPEED_FPS,
+    MAX_LOOP_VOLUME_BUILDS_PER_FRAME, MAX_LOOP_VOLUME_FRAMES, MIN_LOOP_SPEED_FPS,
+    VOLUME_LOOP_TEXTURE_BUDGET_BYTES,
 };
 use crate::loop_downloads::{
     FramePlan, L3FrameState, LoopFrameData, PendingDownloads, PendingL3Pairings,
@@ -173,6 +174,20 @@ impl super::App {
         self.dispatch_pane_renders(&ctx);
         self.dispatch_section_renders();
         self.dispatch_loop_renders();
+        // After the dispatch, which is the only thing that grows the store,
+        // and before the GUI pass that paints from it — so a grid that has
+        // just been evicted is never one a callback is about to march. The
+        // hard bound on resident voxel grids; see
+        // `VolumeStore::enforce_budget`.
+        let evicted = self
+            .volume_store
+            .enforce_budget(VOLUME_LOOP_TEXTURE_BUDGET_BYTES);
+        if evicted > 0 {
+            log::info!(
+                "3D volume view: evicted {evicted} resident grid(s) to fit the {} MiB budget",
+                VOLUME_LOOP_TEXTURE_BUDGET_BYTES / (1024 * 1024),
+            );
+        }
         self.update_loop_readiness();
 
         // Last, so this frame is laid out over everything applied above.
@@ -604,6 +619,19 @@ impl super::App {
     /// test it end to end is to be able to call it. `dispatch_pane_renders`
     /// takes an `egui::Context` and does eleven other things.
     fn apply_storm_motion_override(&mut self) -> bool {
+        // Commit on release. A `DragValue` produces a value every frame, and
+        // the invalidation below is not cheap: it evicts every storm-relative
+        // grid and section. Applied per drag frame that is ~210 ms of re-cut
+        // for a cross-section and, for a 3D loop, the whole resident set —
+        // fourteen grids and ~2 s of resample, thrown away and restarted on
+        // the next frame, so a loop would never finish building while a finger
+        // was on the widget. Holding the commit makes the cost proportional to
+        // the edit rather than to how long it took. See
+        // `Gui::storm_motion_mid_edit` for why this is a widget-state question
+        // rather than a timeout.
+        if self.gui.storm_motion_mid_edit() {
+            return false;
+        }
         // Editing the vector changes nothing else about a pane, so the derived
         // storm-relative tilts have to be invalidated explicitly.
         let storm_motion = self.gui.storm_motion_override.sample();
@@ -1826,7 +1854,8 @@ impl super::App {
             let Some(p) = self.gui.pane_mut(pidx) else {
                 continue;
             };
-            if settle_loop_phase(loop_mgr, pidx, &mut p.loop_state, MAX_LOOP_RENDER_BUDGET) {
+            let budget = loop_frame_budget(p.loop_state.view);
+            if settle_loop_phase(loop_mgr, pidx, &mut p.loop_state, budget) {
                 abandoned.push(pidx);
             }
         }
@@ -1978,6 +2007,16 @@ impl super::App {
         // bytes nothing is fetching. Collected here and acted on below, because
         // re-deriving a queue needs `loop_mgr` while the pane is borrowed.
         let mut replan: Vec<(usize, rustdar_radar::types::RadarProduct)> = Vec::new();
+        // Panes whose 3D loop must let go of every grid it holds **before**
+        // anything is built for the new key. See `VolumeStore::retain_set`:
+        // the seamless-swap rule that keeps the old grid through a rebuild is
+        // right for one grid and is a peak of two full sets for fourteen.
+        // Collected rather than acted on inline, because the store is borrowed
+        // from `self` while the pane is.
+        let mut release_volume_sets: Vec<usize> = Vec::new();
+        // Panes whose loop is no longer active and whose download queue is
+        // therefore serving nobody. Collected for the same borrow reason.
+        let mut retire_queues: Vec<usize> = Vec::new();
         // Read once, outside the pane loop, so every section loop retargeted in
         // this pass is keyed to the same vector the cuts it is about to dispatch
         // will be derived with — the rule `SectionInputKey::of` states, applied
@@ -2010,10 +2049,50 @@ impl super::App {
                         .flatten(),
                 )
             });
+            // The volume half of the key, for a 3D loop: the ground the frames
+            // are resampled over and the vector they are derived with. See
+            // `VolumeLoopKey`.
+            let volume_key = pane.volume().map(|v| {
+                rustdar_egui::pane::VolumeLoopKey::new(
+                    v.region,
+                    (product == rustdar_radar::types::RadarProduct::StormRelativeVelocity)
+                        .then_some(motion_override)
+                        .flatten(),
+                )
+            });
             let ls = &mut pane.loop_state;
-            if !ls.is_active() || ls.frames.is_empty() {
+            if !ls.is_active() {
+                // The host-side teardown, and the reason it is here rather
+                // than only in the branch above: with every pane kind able to
+                // loop, "cannot loop" no longer covers the pane whose loop was
+                // *torn down* — `PaneState::set_kind` clears `loop_state` on
+                // any kind change and cannot reach `loop_mgr`, which is keyed
+                // by pane index. Left behind, that queue goes on spending the
+                // shared download budget on volumes nobody will draw.
+                //
+                // Also correct for a loop simply switched off, which is what
+                // makes it a property of the state rather than of the route
+                // that reached it.
+                retire_queues.push(pane_idx);
                 continue;
             }
+            if ls.frames.is_empty() {
+                continue;
+            }
+
+            // One key per loop kind, and the kind decides which. `None` for a
+            // plan-view loop; for the other two, `None` also stands for "this
+            // pane has lost the thing its frames were pictures of", which
+            // counts as a change and discards them — the safe direction.
+            let view_key = match ls.view {
+                rustdar_radar::types::RenderView::CrossSection => {
+                    section_key.map(rustdar_egui::pane::LoopViewKey::Section)
+                }
+                rustdar_radar::types::RenderView::Volume => {
+                    volume_key.map(rustdar_egui::pane::LoopViewKey::Volume)
+                }
+                rustdar_radar::types::RenderView::PlanView => None,
+            };
 
             // The pane's product/elevation combo boxes write straight through, so
             // pick the change up here: every texture depicts the old product and
@@ -2022,7 +2101,16 @@ impl super::App {
             // reason and is discarded by the same call — a redrawn line or an
             // edited storm motion vector makes every frame a picture of
             // something else.
-            if ls.retarget_renders_for(product, elevation, section_key) {
+            if ls.retarget_renders_keyed(product, elevation, view_key) {
+                // The 3D loop's frames are not textures to be dropped but
+                // grids in a shared store, and the retarget has just cleared
+                // the only record of which ones this pane was holding. Release
+                // them here, *before* the pass below builds anything for the
+                // new key: `retain_set(&[])`, then rebuild. See
+                // `VolumeStore::retain_set` for the peak that avoids.
+                if ls.view == rustdar_radar::types::RenderView::Volume {
+                    release_volume_sets.push(pane_idx);
+                }
                 log::debug!(
                     "Loop: pane {} retargeted to {:?} at {:.1}°, re-rendering all frames",
                     pane_idx,
@@ -2038,7 +2126,41 @@ impl super::App {
             }
 
             // Evict textures from frames far from the playhead to cap memory usage.
-            ls.evict_textures_outside_render_set(MAX_LOOP_RENDER_BUDGET);
+            ls.evict_textures_outside_render_set(loop_frame_budget(ls.view));
+        }
+        for pane_idx in retire_queues {
+            self.loop_mgr.remove_pending(pane_idx);
+            // A torn-down 3D loop's grids go with its queue. Without this the
+            // resident set outlives the loop that asked for it, and 504 MiB
+            // stays allocated for a pane that is showing a live volume.
+            //
+            // Asked before it is done, because the answer is also what says
+            // whether this pane's `rendered_for` is a lie. While a 3D loop
+            // runs, the pane paints the playhead's frame and stops asking for
+            // the live volume, so `rendered_for` freezes at whatever it named
+            // when the loop started — and the grid it names has just been let
+            // go of. Left alone, the level-triggered `PrepareVolume` would
+            // never fire again and the pane would read "Building…" for ever.
+            // Clearing it is only correct *here*, for a pane that really was a
+            // set holder: doing it unconditionally would clear a live 3D
+            // pane's key every frame and rebuild its grid every frame with it.
+            if self.volume_store.holds_set(pane_idx) {
+                self.volume_store.release_set(pane_idx);
+                if let Some(pane) = self.gui.pane_mut(pane_idx)
+                    && let Some(volume) = pane.volume_mut()
+                {
+                    volume.rendered_for = None;
+                }
+            }
+        }
+        // Ahead of every dispatch below, which is the whole point of the rule:
+        // release, then build.
+        for pane_idx in release_volume_sets {
+            let dropped = self.volume_store.release_set(pane_idx);
+            log::debug!(
+                "3D loop: pane {pane_idx} retargeted, released its resident set ({dropped} grids \
+                 freed)",
+            );
         }
         for (pane_idx, product) in replan {
             if self.loop_mgr.plan_downloads_for(pane_idx, product) {
@@ -2075,6 +2197,13 @@ impl super::App {
         // the frame thread — see `MAX_LOOP_SECTION_CUTS_PER_FRAME`.
         let mut to_cut: Vec<LoopSectionRequest> = Vec::new();
 
+        // Voxel grids to make resident. Planned for every frame of every 3D
+        // loop, not just the ones a build has to be dispatched for: most
+        // passes find the grid already in the store and only have to name it
+        // on the frame, which costs a lookup. See the pacing below, which
+        // counts *dispatches* rather than entries here.
+        let mut to_build: Vec<LoopVolumeRequest> = Vec::new();
+
         for pane_idx in 0..pane_count {
             if self.gui.pane_cannot_loop(pane_idx) {
                 continue;
@@ -2099,7 +2228,68 @@ impl super::App {
 
             // The intended render set — shared with the readiness check so the two
             // cannot drift apart (see `LoopPlaybackState::render_set_settled`).
-            let indices = ls.render_set_indices(MAX_LOOP_RENDER_BUDGET);
+            //
+            // A 3D loop's budget is its own, and it is the *whole* frame list
+            // rather than a window inside it: a resident grid re-entered costs
+            // ~140 ms to rebuild against a 200 ms playback interval, so the
+            // walking window the other two kinds use does not close here. See
+            // `MAX_LOOP_VOLUME_FRAMES`.
+            let indices = ls.render_set_indices(loop_frame_budget(ls.view));
+
+            // A 3D loop's frames are resident grids rather than rasters, so it
+            // plans separately and against a different budget. Same branch
+            // discipline as the section arm below: on the *loop's* view, not
+            // on the pane's kind.
+            if ls.view == rustdar_radar::types::RenderView::Volume {
+                let Some(key) = ls.volume_key().cloned() else {
+                    // Unreachable while the pane is a volume pane — the pass
+                    // above always builds a key for one — and the honest
+                    // answer if a future caller reaches it is the section
+                    // arm's: retire the frames rather than sit in `Rendering`
+                    // for the session.
+                    for &idx in &indices {
+                        to_mark_failed.push((pane_idx, idx));
+                    }
+                    continue;
+                };
+                for &idx in &indices {
+                    let frame = &ls.frames[idx];
+                    let volume_target = rustdar_egui::pane::VolumeTarget {
+                        volume: rustdar_egui::pane::VolumeStamp {
+                            site: target.site.clone(),
+                            collected: frame.timestamp,
+                        },
+                        product: target.product,
+                        region: key.region,
+                    };
+                    // Already resident and already named by this frame. The
+                    // target is compared rather than merely "is there an
+                    // image", because a frame keyed to the previous region
+                    // would otherwise stand for the new one for ever.
+                    if frame
+                        .image
+                        .as_ref()
+                        .and_then(rustdar_egui::pane::LoopFrameImage::volume)
+                        .is_some_and(|held| held.target == volume_target)
+                    {
+                        continue;
+                    }
+                    to_build.push(LoopVolumeRequest {
+                        pane_idx,
+                        frame_idx: idx,
+                        target: volume_target,
+                        // A retired frame is still *planned*, so that the
+                        // store goes on holding the refusal it was retired by
+                        // and the statement of the resident set below names
+                        // the whole frame list. What it must never do is buy
+                        // another extraction: the answer is a property of the
+                        // volume, so retrying is a walk that fails identically
+                        // for ever.
+                        retired: frame.render_failed,
+                    });
+                }
+                continue;
+            }
 
             // A section loop wants a different picture per frame and identifies
             // it with different things, so it plans separately. The branch is on
@@ -2107,7 +2297,7 @@ impl super::App {
             // the value every acceptance test downstream compares against, and
             // two ways of asking one question is how they come to disagree.
             if ls.view == rustdar_radar::types::RenderView::CrossSection {
-                let Some(key) = ls.section_key.clone() else {
+                let Some(key) = ls.section_key().cloned() else {
                     // A section loop with no line has nothing to cut and its
                     // volumes download perfectly well, so nothing would ever
                     // settle the batch and the loop would sit in `Rendering` for
@@ -2383,6 +2573,111 @@ impl super::App {
                 }
             }
         }
+
+        self.make_volume_frames_resident(to_build);
+    }
+
+    /// Make each planned 3D loop frame's grid resident, and name it on the
+    /// frame once it is.
+    ///
+    /// Split out of [`Self::dispatch_loop_renders`], which is long enough, and
+    /// because this is the half with the two rules worth reading together:
+    ///
+    /// * **The pacing counts dispatches, not frames.** A pass over a settled
+    ///   fourteen-frame loop finds every grid already in the store and spends
+    ///   fourteen hash-free linear lookups; only a *miss* costs the
+    ///   `extract_volume_parts` walk on the frame thread, and at most
+    ///   [`MAX_LOOP_VOLUME_BUILDS_PER_FRAME`] of those are paid per frame. The
+    ///   cheap `share_held` probe ahead of the budget check is what separates
+    ///   the two, and without it the cap would stop the *naming* as well and a
+    ///   loop would take a frame per frame to notice grids it already had.
+    /// * **The resident set is stated, not inferred.** After the pass, every
+    ///   3D loop tells the store the whole list it holds — which drops the
+    ///   grids of frames that have scrolled out of the loop, and the pane's own
+    ///   live grid on the frame its loop takes over. That is
+    ///   [`crate::volume::bridge::VolumeStore::retain_set`], and it is what
+    ///   makes "the frame list is the resident set" a property rather than a
+    ///   hope.
+    fn make_volume_frames_resident(&mut self, to_build: Vec<LoopVolumeRequest>) {
+        use crate::volume::bridge::{Hold, VolumeEntry};
+
+        let mut dispatched = 0usize;
+        // Every target still wanted, per pane, gathered as the pass goes so
+        // the statement below is exactly what this pass decided rather than a
+        // second walk free to disagree with it.
+        let mut held: std::collections::BTreeMap<usize, Vec<rustdar_egui::pane::VolumeTarget>> =
+            std::collections::BTreeMap::new();
+
+        for req in to_build {
+            held.entry(req.pane_idx)
+                .or_default()
+                .push(req.target.clone());
+            // Cheap: already built, building, or refused. Costs a lookup and
+            // an attach, and is deliberately outside the pacing budget.
+            let known = self
+                .volume_store
+                .share_held(req.pane_idx, &req.target, Hold::Set);
+            if !known {
+                if req.retired {
+                    // Ruled out, and the store no longer remembers why. Left
+                    // alone rather than re-extracted: every reason a build is
+                    // refused is a property of the volume, so a retry is a
+                    // multi-millisecond walk that fails identically for ever.
+                    continue;
+                }
+                if dispatched >= MAX_LOOP_VOLUME_BUILDS_PER_FRAME {
+                    // Out of frame-thread budget for this pass. Left alone,
+                    // not retired: the next pass asks again, and the pane goes
+                    // on marching whatever has already landed.
+                    continue;
+                }
+                match self.prepare_volume(req.pane_idx, &req.target, Hold::Set) {
+                    // A build was started, or a refusal was decided. Either
+                    // way the store now answers for this target.
+                    crate::app::VolumePrepare::Served => dispatched += 1,
+                    // The scan has not downloaded yet, or the render budget is
+                    // full. Nothing was spent; the next pass asks again.
+                    crate::app::VolumePrepare::Waiting | crate::app::VolumePrepare::Busy => {
+                        continue;
+                    }
+                }
+            }
+            let Some(found) = self.volume_store.lookup(&req.target) else {
+                continue;
+            };
+            let Some(pane) = self.gui.pane_mut(req.pane_idx) else {
+                continue;
+            };
+            let Some(frame) = pane.loop_state.frames.get_mut(req.frame_idx) else {
+                continue;
+            };
+            match found.entry {
+                // Resident. The frame names it, which is what makes the
+                // playhead able to march it.
+                VolumeEntry::Ready(_) => {
+                    frame.render_in_flight = false;
+                    frame.image = Some(rustdar_egui::pane::LoopFrameImage::Volume(
+                        rustdar_egui::pane::VolumeFrameGrid {
+                            id: found.id,
+                            target: req.target.clone(),
+                        },
+                    ));
+                }
+                VolumeEntry::Building => frame.render_in_flight = true,
+                // Terminal for this frame's scan: this volume carries no field
+                // to resample under this product, or the site is unknown. The
+                // same answer `FrameSweep::Unrenderable` gets on the plan-view
+                // path, and it is what lets readiness stop waiting.
+                VolumeEntry::Refused(_) => {
+                    frame.render_in_flight = false;
+                    frame.render_failed = true;
+                }
+            }
+        }
+
+        for (pane_idx, targets) in held {
+            self.volume_store.retain_set(pane_idx, &targets);
+        }
     }
 
     /// Poll for finished cross-section loop cuts and upload their rasters.
@@ -2535,18 +2830,16 @@ fn accept_scan_listing(
         return None;
     }
 
-    // Cap the downloads at MAX_LOOP_FRAMES by evenly sampling the listing.
-    let scans = if scans.len() > MAX_LOOP_FRAMES {
+    // Cap the downloads by evenly sampling the listing. A 3D loop's cap is its
+    // *resident* one and is far lower, because for that kind the frame list and
+    // the resident set are one thing — see `loop_frames_held`.
+    let held = loop_frames_held(ls.view);
+    let scans = if scans.len() > held {
         let total = scans.len();
-        let sampled: Vec<_> = (0..MAX_LOOP_FRAMES)
-            .map(|i| scans[i * (total - 1) / (MAX_LOOP_FRAMES - 1).max(1)].clone())
+        let sampled: Vec<_> = (0..held)
+            .map(|i| scans[i * (total - 1) / (held - 1).max(1)].clone())
             .collect();
-        log::info!(
-            "Loop: sampled {} down to {} frames for {}",
-            total,
-            MAX_LOOP_FRAMES,
-            site
-        );
+        log::info!("Loop: sampled {total} down to {held} frames for {site}");
         sampled
     } else {
         scans
@@ -2999,6 +3292,63 @@ fn frame_section(
     }
 }
 
+/// Frames a loop of this view **holds**.
+///
+/// [`MAX_LOOP_FRAMES`] for the two raster kinds, which hold more than they
+/// texture and re-render as the playhead walks. A 3D loop's frames are resident
+/// grids and re-entering one costs ~140 ms against a 200 ms playback interval,
+/// so its list is its resident set and both are
+/// [`MAX_LOOP_VOLUME_FRAMES`] — 14 rather than 60 on desktop, which is ~70
+/// minutes of history instead of ~150 and is the cost of holding the *full*
+/// grid rather than a coarser one. See that constant.
+///
+/// Exhaustive, like every other classification by view in this workspace.
+fn loop_frames_held(view: rustdar_radar::types::RenderView) -> usize {
+    match view {
+        rustdar_radar::types::RenderView::Volume => MAX_LOOP_VOLUME_FRAMES,
+        rustdar_radar::types::RenderView::PlanView
+        | rustdar_radar::types::RenderView::CrossSection => MAX_LOOP_FRAMES,
+    }
+}
+
+/// Frames of a loop of this view that are *ready to show* at once — the
+/// intended render set's size.
+///
+/// The dispatcher, the texture eviction and the readiness check all read this
+/// one function, for the reason `render_set_indices`' doc gives: a set the
+/// dispatcher fills and a set readiness waits on that could differ is a loop
+/// that plays over frames nothing rendered.
+///
+/// For a 3D loop it is [`loop_frames_held`], exactly — the whole list — which
+/// is what makes `evict_textures_outside_render_set` a no-op there and the
+/// resident set equal to the frame list.
+fn loop_frame_budget(view: rustdar_radar::types::RenderView) -> usize {
+    match view {
+        rustdar_radar::types::RenderView::Volume => MAX_LOOP_VOLUME_FRAMES,
+        rustdar_radar::types::RenderView::PlanView
+        | rustdar_radar::types::RenderView::CrossSection => MAX_LOOP_RENDER_BUDGET,
+    }
+}
+
+/// A 3D loop frame the dispatcher intends to make resident.
+///
+/// Deliberately smaller than [`LoopSectionRequest`], and that is the shape of
+/// the feature: a section frame carries a raster keyed by a line, a ladder and
+/// a pair of site coordinates, while a volume frame carries nothing but the
+/// [`rustdar_egui::pane::VolumeTarget`] the grid is built from — which already
+/// holds the site, the volume time, the product and the region. The frame index
+/// is here because the answer has to be written back to a frame, and the pane
+/// index because the store refcounts by holder.
+pub(crate) struct LoopVolumeRequest {
+    pub pane_idx: usize,
+    pub frame_idx: usize,
+    pub target: rustdar_egui::pane::VolumeTarget,
+    /// This frame has already been ruled out. It is planned anyway so the
+    /// resident set the dispatcher states names the whole frame list, and it
+    /// is never dispatched for.
+    pub retired: bool,
+}
+
 /// A cross-section loop frame the dispatcher intends to cut.
 ///
 /// Also what `App::spawn_loop_section_render` is handed, whole: every field is
@@ -3190,6 +3540,12 @@ mod loop_dispatch_tests;
 #[path = "app_render/loop_section_tests.rs"]
 #[cfg(test)]
 mod loop_section_tests;
+
+/// The 3D loop's dispatch: what becomes resident, what the resident set is
+/// bounded by, and what a region change releases before it rebuilds.
+#[path = "app_render/loop_volume_tests.rs"]
+#[cfg(test)]
+mod loop_volume_tests;
 
 /// What the loop timer does with a playback speed no slider could have set.
 #[path = "app_render/loop_interval_tests.rs"]

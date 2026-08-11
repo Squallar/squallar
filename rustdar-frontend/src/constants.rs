@@ -179,44 +179,12 @@ pub const MAX_LOOP_SECTION_CUTS_PER_FRAME: usize = 1;
 /// serve only the hover readout, which goes quiet under a loop for the same
 /// reason a plan-view loop's does. See `rustdar_egui::pane::SectionImageData`.
 ///
-/// **A 3D volume pane is absent from both tables because it does not loop
-/// *yet*** ([`rustdar_egui::pane::PaneKind::can_loop`]) — and the reason is
-/// scope, not memory. The line to score it against is *this* one, not
-/// [`VOLUME_TEXTURE_BUDGET_BYTES`], which bounds one live grid ("one pane shows
-/// one volume") and is no more the right ceiling for a 3D loop than it would be
-/// for a section loop. Against the loop budget, using the per-grid figures
-/// [`VOLUME_TEXTURE_BUDGET_BYTES`] tabulates:
-///
-/// | target  | frames | 3D texture | total    | budget  |          |
-/// |---------|-------:|-----------:|---------:|--------:|----------|
-/// | wasm32  |      8 |  4.501 MiB |   36 MiB |  48 MiB | fits     |
-/// | mobile  |     12 | 15.189 MiB |  182 MiB | 256 MiB | fits     |
-/// | desktop |     30 | 36.001 MiB | 1080 MiB | 512 MiB | 2.1x over|
-/// | desktop |     14 | 36.001 MiB |  504 MiB | 512 MiB | fits     |
-///
-/// So two of the three arms fit at today's full grid, and desktop fits at 14
-/// frames. Measured on a real device (RTX 3090 and lavapipe, seven consecutive
-/// VCP-212 volumes): every one of those sets allocates, and marching a
-/// *different* resident grid each frame costs **+2% on a discrete GPU and +4%
-/// on the software rasteriser** over marching one — because swapping which
-/// volume is drawn is a `set_bind_group` and a 192-byte uniform write, not an
-/// upload. A resident-grid loop therefore costs nothing to orbit; what it costs
-/// is a one-time progressive build, 14 × (89 ms resample + 51 ms upload) ≈
-/// 1.9 s on desktop, which is the same shape as the section loop's 0.5 s.
-///
-/// What keeps it out of *this* change is the work above the GPU layer, which is
-/// a work package of its own: `VolumeStore` can only be held by a pane holding
-/// one target, `App::handle_prepare_volume` refuses any volume time that is not
-/// the newest, and the voxel build has no pacing budget. None of that is a
-/// memory argument and none of it is written down as one here any more.
-///
-/// Two things a 3D loop would have to settle that the two kinds above do not:
-/// its frame list must equal its **resident** set rather than holding more and
-/// re-texturing as the playhead walks — re-entering the window costs ~140 ms
-/// against a 200 ms interval at [`DEFAULT_LOOP_SPEED_FPS`] — and the storm
-/// motion vector, which `StormMotionOverride::sample` reads live from a
-/// `DragValue`, would have to commit on release, because every drag frame
-/// evicts the whole set.
+/// **A 3D volume loop is budgeted against this line too, but not per pane** —
+/// see [`VOLUME_LOOP_TEXTURE_BUDGET_BYTES`], which is the same figure spent
+/// once for the whole application rather than once per pane, because the grids
+/// live in a single application-wide `VolumeStore` instead of in the pane. The
+/// row it buys, at the per-grid figures [`VOLUME_TEXTURE_BUDGET_BYTES`]
+/// tabulates, is [`MAX_LOOP_VOLUME_FRAMES`]'.
 ///
 /// wasm32's is the tight one: the whole linear memory is capped at 4 GiB, and the
 /// loop is only one of several things competing for it.
@@ -239,6 +207,195 @@ pub const WASM_LOOP_TEXTURE_BUDGET_BYTES: usize = 48 * 1024 * 1024;
 pub const MOBILE_LOOP_TEXTURE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 /// The desktop arm. See [`LOOP_TEXTURE_BUDGET_BYTES`].
 pub const DESKTOP_LOOP_TEXTURE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
+
+/// Ceiling on the resident voxel grids a 3D loop may hold — **for the whole
+/// application**, not per pane.
+///
+/// # A 3D loop's frames are grids, not images
+///
+/// A plan-view or cross-section loop frame is a *rendered picture*, so it can
+/// be cached, evicted and re-rendered as the playhead walks. A 3D pane's
+/// picture is raymarched live from the eye, so caching it per frame would make
+/// every frame wrong the moment the camera moved. What a 3D loop caches
+/// instead is the **input**: each frame is a live [`VOLUME_GRID_CELLS`] 3D
+/// texture and the march swaps which one it samples. Measured on an RTX 3090
+/// and on lavapipe over seven consecutive VCP-212 volumes, marching a
+/// *different* resident grid each frame costs **+0.01 ms (+2%)** on the
+/// discrete GPU and **+0.31–0.78 ms (+3–4%)** on the software rasteriser
+/// against marching one — a `set_bind_group` and a 192-byte uniform write, not
+/// an upload. Orbiting a resident loop is therefore free, and there is no
+/// re-render on a camera change at all.
+///
+/// # Why the frame list must *equal* the resident set
+///
+/// The two loop kinds above hold more frames than they texture
+/// ([`MAX_LOOP_FRAMES`] against [`MAX_LOOP_RENDER_BUDGET`]) and re-render as
+/// the playhead walks back into a window it had left. That treadmill does not
+/// close here: re-entering a resident 3D window costs ~140 ms (89 ms resample,
+/// 51 ms upload) against the 200 ms interval at [`DEFAULT_LOOP_SPEED_FPS`] and
+/// 33 ms at [`MAX_LOOP_SPEED_FPS`]. So [`MAX_LOOP_VOLUME_FRAMES`] is both
+/// numbers at once, and `the_3d_loop_holds_exactly_what_it_marches` pins it.
+///
+/// # Why once for the application rather than once per pane
+///
+/// The grids live in one `VolumeStore` keyed by `VolumeTarget`, shared by every
+/// 3D pane — two panes orbiting one volume from two angles already share one
+/// build and one upload. So two 3D loops on the same site, product and region
+/// cost one set, and the bound that matters is the store's total. That is also
+/// what keeps this feature out of the multiplication
+/// [`APP_TEXTURE_BUDGET_BYTES`] names: a 3D loop is the one loop kind whose
+/// budget is **not** multiplied by `MAX_PANES_DESKTOP`.
+///
+/// Unlike [`LOOP_TEXTURE_BUDGET_BYTES`], this one **is enforced at runtime**:
+/// `VolumeStore::enforce_budget` evicts oldest-first until the resident grids
+/// fit, every frame, and `the_store_eviction_actually_bounds` drives it past
+/// the line. The frame counts below are chosen so it never has to fire in
+/// steady state; it exists for the transition, where a pane can hold its live
+/// grid and a loop set at once.
+///
+/// | target  | frames | 3D texture | resident | budget  |
+/// |---------|-------:|-----------:|---------:|--------:|
+/// | wasm32  |      8 |  4.501 MiB | 36.0 MiB |  48 MiB |
+/// | mobile  |     12 | 15.189 MiB | 182.3MiB | 256 MiB |
+/// | desktop |     14 | 36.001 MiB |  504 MiB | 512 MiB |
+///
+/// Deliberately the same figure as [`LOOP_TEXTURE_BUDGET_BYTES`] rather than a
+/// number of its own: a loop is a loop, and a screen showing a 3D loop instead
+/// of a map loop should cost about the same. Written as an alias so that
+/// raising one raises the other, which is the honest coupling — the day these
+/// need to diverge, that is a decision to make here rather than a drift to
+/// discover.
+pub const VOLUME_LOOP_TEXTURE_BUDGET_BYTES: usize = LOOP_TEXTURE_BUDGET_BYTES;
+/// The wasm32 arm of [`VOLUME_LOOP_TEXTURE_BUDGET_BYTES`].
+pub const WASM_VOLUME_LOOP_TEXTURE_BUDGET_BYTES: usize = WASM_LOOP_TEXTURE_BUDGET_BYTES;
+/// The mobile arm. See [`VOLUME_LOOP_TEXTURE_BUDGET_BYTES`].
+pub const MOBILE_VOLUME_LOOP_TEXTURE_BUDGET_BYTES: usize = MOBILE_LOOP_TEXTURE_BUDGET_BYTES;
+/// The desktop arm. See [`VOLUME_LOOP_TEXTURE_BUDGET_BYTES`].
+pub const DESKTOP_VOLUME_LOOP_TEXTURE_BUDGET_BYTES: usize = DESKTOP_LOOP_TEXTURE_BUDGET_BYTES;
+
+/// Frames a 3D volume loop holds — which is also how many voxel grids it keeps
+/// resident, because for this loop kind those are the same number. See
+/// [`VOLUME_LOOP_TEXTURE_BUDGET_BYTES`].
+///
+/// # Desktop takes fewer frames at the full grid, not more at a coarser one
+///
+/// 14 frames of the full 256×256×128 grid is ~70 minutes of history where 30
+/// frames would be ~150. That is a real loss and it is stated rather than
+/// hidden. The alternative — a loop-specific coarser grid — was rejected for
+/// three reasons, in the order they bite:
+///
+/// * A coarser grid halves the **vertical** axis (141 → 188 m/cell at
+///   192×192×64), and that is where 3D structure lives. A BWER or an overhang
+///   is a few hundred metres; a loop exists to watch exactly those evolve.
+/// * The region picker exists to spend a fixed cell count over less ground,
+///   and it *prints the km/cell it bought* (`VolumeRegion::resolution_km`). A
+///   loop-specific grid would silently undo the user's resolution choice at
+///   the moment they zoomed in to look at structure, and would make that
+///   caption a lie unless it changed under a loop too.
+/// * There is no performance argument either way: 0.60 ms against 0.42 ms per
+///   march on the measured hardware, both trivial against a 16.7 ms frame.
+///
+/// # Each arm is the tighter of two bounds
+///
+/// What [`VOLUME_LOOP_TEXTURE_BUDGET_BYTES`] admits, and
+/// [`MAX_LOOP_RENDER_BUDGET`]. The budget binds desktop (14 grids where a
+/// plan-view loop textures 30 frames); the render budget binds wasm32 and
+/// mobile, where the grids are small enough that the budget would admit 10 and
+/// 16 — a 3D loop is not licensed to hold *more* history than the plan-view
+/// loop beside it on the same device merely because its frames are cheaper
+/// there. `the_3d_loop_holds_exactly_what_it_marches` computes both and pins
+/// the minimum.
+///
+/// Named outside the cascade for the reason [`WASM_VOLUME_GRID_CELLS`] gives.
+#[cfg(target_arch = "wasm32")]
+pub const MAX_LOOP_VOLUME_FRAMES: usize = WASM_MAX_LOOP_VOLUME_FRAMES;
+/// See the wasm32 arm above.
+#[cfg(all(not(target_arch = "wasm32"), mobile))]
+pub const MAX_LOOP_VOLUME_FRAMES: usize = MOBILE_MAX_LOOP_VOLUME_FRAMES;
+/// See the wasm32 arm above.
+#[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
+pub const MAX_LOOP_VOLUME_FRAMES: usize = DESKTOP_MAX_LOOP_VOLUME_FRAMES;
+
+/// The wasm32 arm of [`MAX_LOOP_VOLUME_FRAMES`].
+pub const WASM_MAX_LOOP_VOLUME_FRAMES: usize = 8;
+/// The mobile arm. See [`MAX_LOOP_VOLUME_FRAMES`].
+pub const MOBILE_MAX_LOOP_VOLUME_FRAMES: usize = 12;
+/// The desktop arm. See [`MAX_LOOP_VOLUME_FRAMES`].
+pub const DESKTOP_MAX_LOOP_VOLUME_FRAMES: usize = 14;
+
+/// How many voxel grids a 3D loop may *dispatch* in one frame.
+///
+/// The exact counterpart of [`MAX_LOOP_SECTION_CUTS_PER_FRAME`], for the same
+/// reason and at the same value: building a loop frame's grid needs a
+/// whole-volume payload, and `RenderInput::extract_volume_parts` runs on the
+/// frame thread because the job wire carries a `RenderInput`, not a `Scan`, and
+/// on wasm the volume is only reachable from the main thread. The resample
+/// (~89 ms) and the upload (~51 ms) are both off it.
+///
+/// One per frame means a full desktop set of 14 is dispatched over 14 frames —
+/// under a quarter of a second at 60 fps — and every grid that lands is shown
+/// as it lands rather than the pane blocking on the batch.
+pub const MAX_LOOP_VOLUME_BUILDS_PER_FRAME: usize = 1;
+
+/// Ceiling on the GPU texture memory the **whole application** budgets, in
+/// bytes — every pane, every loop and every volume at once.
+///
+/// # Why this constant did not exist before, and why it has to now
+///
+/// [`LOOP_TEXTURE_BUDGET_BYTES`] and [`VOLUME_TEXTURE_BUDGET_BYTES`] are both
+/// *per pane*, and nothing multiplied either of them by the pane count. The two
+/// halves of that multiplication even live in different crates —
+/// `MAX_PANES_DESKTOP` is `rustdar_egui::pane`'s — so no test could have
+/// noticed. This is that missing line.
+///
+/// The worst case is stated as a sum rather than a maximum, and deliberately
+/// over-counts by one pane: every pane a 2D loop *and* a full 3D loop set *and*
+/// every pane's raymarch offscreen. A pane is only ever one kind at a time, so
+/// nothing can reach this; what matters is that raising any term has to come
+/// past `the_whole_application_fits_its_gpu_ceiling`.
+///
+/// | target  | panes | 2D loops   | 3D grids | offscreens | total     | ceiling  |
+/// |---------|------:|-----------:|---------:|-----------:|----------:|---------:|
+/// | desktop |     6 |   3072 MiB |  512 MiB |    120 MiB |  3704 MiB | 3840 MiB |
+/// | mobile  |     4 |   1024 MiB |  256 MiB |     20 MiB |  1300 MiB | 1408 MiB |
+/// | wasm32  |     6 |    288 MiB |   48 MiB |     30 MiB |   366 MiB |  384 MiB |
+///
+/// # Two findings this arithmetic makes visible, neither of them this change's
+///
+/// **The per-pane loop budget is 83% of the desktop figure and 79% of
+/// mobile's.** `MAX_PANES × LOOP_TEXTURE_BUDGET_BYTES` is 3.0 GiB on desktop
+/// and 1.0 GiB on a phone — the latter is more GPU memory than a mid-range
+/// phone has for everything. Bringing desktop under 2 GiB with the same pane
+/// count would mean a per-pane loop budget of ~320 MiB, i.e.
+/// [`MAX_LOOP_RENDER_BUDGET`] falling from 30 to 19 and the loop's history
+/// with it. That is a product decision about how much history a map loop
+/// holds, not a side effect of teaching the 3D pane to animate, so it is
+/// written down here rather than taken.
+///
+/// **The 3D loop is the one loop kind that does not multiply.** Its grids are
+/// in one application-wide store, so the term above is
+/// [`VOLUME_LOOP_TEXTURE_BUDGET_BYTES`] flat, not per pane. Making it per-pane
+/// would add 2.5 GiB to the desktop row, and this test is what would say so.
+///
+/// Like [`LOOP_TEXTURE_BUDGET_BYTES`], a budget *statement*: the enforcement
+/// points are the per-subsystem ones. `the_app_ceiling_is_not_slack_enough_to_
+/// hide_a_doubling` keeps it snug, so it cannot be quietly raised to admit
+/// whatever the constants grew into.
+#[cfg(target_arch = "wasm32")]
+pub const APP_TEXTURE_BUDGET_BYTES: usize = WASM_APP_TEXTURE_BUDGET_BYTES;
+/// See the wasm32 arm above.
+#[cfg(all(not(target_arch = "wasm32"), mobile))]
+pub const APP_TEXTURE_BUDGET_BYTES: usize = MOBILE_APP_TEXTURE_BUDGET_BYTES;
+/// See the wasm32 arm above.
+#[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
+pub const APP_TEXTURE_BUDGET_BYTES: usize = DESKTOP_APP_TEXTURE_BUDGET_BYTES;
+
+/// The wasm32 arm of [`APP_TEXTURE_BUDGET_BYTES`].
+pub const WASM_APP_TEXTURE_BUDGET_BYTES: usize = 384 * 1024 * 1024;
+/// The mobile arm. See [`APP_TEXTURE_BUDGET_BYTES`].
+pub const MOBILE_APP_TEXTURE_BUDGET_BYTES: usize = 1408 * 1024 * 1024;
+/// The desktop arm. See [`APP_TEXTURE_BUDGET_BYTES`].
+pub const DESKTOP_APP_TEXTURE_BUDGET_BYTES: usize = 3840 * 1024 * 1024;
 
 /// Ceiling on the compressed tile bytes each basemap/label tile source
 /// retains beside its textures: `TILE_CACHE_ENTRIES` PNGs at a generous

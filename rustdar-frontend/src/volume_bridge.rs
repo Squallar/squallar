@@ -368,6 +368,33 @@ pub enum VolumeEntry {
     Refused(String),
 }
 
+/// How a holder holds what it asks the store for.
+///
+/// The store began with one rule — a pane holds one grid, and attaching to a
+/// new one sheds the old — because "one pane shows one volume" was the whole
+/// truth. A 3D loop breaks that: its frames *are* grids, and the pane holds
+/// every one of them at once. The two rules cannot both be the default, and
+/// leaving it implicit would mean a loop's set being silently shed by the next
+/// live rebuild that came through [`VolumeStore::share`].
+///
+/// So the holder says which it means, and the shed is conditional on the
+/// answer rather than on what the store can infer. What replaces the shed for
+/// a set holder is [`VolumeStore::retain_set`] — the holder states the whole
+/// set, and everything outside it goes — plus
+/// [`VolumeStore::enforce_budget`], which is the only hard bound on the
+/// store's size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hold {
+    /// One grid at a time. Attaching sheds everything else this holder has,
+    /// keeping a same-scope resolved grid only while a build is in flight —
+    /// the seamless swap.
+    Single,
+    /// One of a set. Attaching sheds nothing, and the holder is obliged to
+    /// state the whole set through [`VolumeStore::retain_set`] on every pass
+    /// so that a set it has stopped wanting is released rather than leaked.
+    Set,
+}
+
 /// The built voxel grids, refcounted by target.
 ///
 /// # Why refcounting is by target and not by pane
@@ -399,6 +426,16 @@ struct StoreInner {
     /// and it means `VolumeTarget`'s derived `PartialEq` is the only comparison
     /// needed, rather than a hand-written `Hash` that has to agree with it.
     entries: Vec<StoredVolume>,
+    /// Panes holding a *set* rather than one grid — see [`Hold::Set`].
+    ///
+    /// A list beside the entries rather than a flag on each `panes` element,
+    /// because the property belongs to the **holder**, not to the holding: a
+    /// pane animating a 3D loop holds every one of its grids the same way, and
+    /// the question `shed` and `complete` have to ask is "may I shed this
+    /// pane's other entries", which is about the pane alone. Recording it per
+    /// entry would let one pane be a set holder for some of its own grids and
+    /// not others, which is not a state that means anything.
+    set_holders: Vec<usize>,
 }
 
 struct StoredVolume {
@@ -408,6 +445,40 @@ struct StoredVolume {
     /// Which panes are holding this. Empty is impossible: the entry is dropped
     /// when the last pane lets go.
     panes: Vec<usize>,
+}
+
+impl StoredVolume {
+    /// GPU texture bytes this entry's upload occupies, or 0 while there is
+    /// nothing uploaded.
+    ///
+    /// Computed from the grid's own shape through
+    /// `raymarch::grid_bytes_with_mips` — the same arithmetic the upload path
+    /// allocates by, including the coarse mip level — rather than from a
+    /// per-target constant, because the eviction has to measure what is
+    /// actually resident, and a runtime step-down can hand the store a grid
+    /// smaller than [`crate::constants::VOLUME_GRID_CELLS`].
+    ///
+    /// A shape whose product overflows a `usize` reports 0 rather than
+    /// panicking in the paint path. It cannot happen — the shapes are
+    /// compiled-in — and a store that panicked while counting bytes would take
+    /// the frame thread with it.
+    fn texture_bytes(&self) -> usize {
+        let VolumeEntry::Ready(grid) = &self.entry else {
+            return 0;
+        };
+        let shape = grid.shape();
+        let Ok(cells) = [shape.nx, shape.ny, shape.nz]
+            .iter()
+            .map(|&n| u32::try_from(n))
+            .collect::<Result<Vec<u32>, _>>()
+            .map(|v| [v[0], v[1], v[2]])
+        else {
+            return 0;
+        };
+        crate::volume::raymarch::grid_bytes_with_mips(cells)
+            .unwrap_or(0)
+            .saturating_add(crate::constants::VOLUME_LUT_BYTES)
+    }
 }
 
 /// What the store holds for one target, with the id its GPU upload is keyed by.
@@ -439,12 +510,23 @@ impl VolumeStore {
     /// painting until the new one lands, which is what makes a live rebuild a
     /// seamless swap rather than a flash of "Building…" every sealed sweep.
     pub fn share(&self, pane_idx: usize, target: &VolumeTarget) -> bool {
+        self.share_held(pane_idx, target, Hold::Single)
+    }
+
+    /// [`Self::share`], saying how the holder holds it. See [`Hold`].
+    pub fn share_held(&self, pane_idx: usize, target: &VolumeTarget, hold: Hold) -> bool {
         let mut inner = self.lock();
         let Some(found) = inner.entries.iter().position(|e| &e.target == target) else {
             return false;
         };
         let keep_old = matches!(inner.entries[found].entry, VolumeEntry::Building);
-        inner.shed(pane_idx, target, keep_old);
+        match hold {
+            Hold::Single => {
+                inner.set_holders.retain(|&p| p != pane_idx);
+                inner.shed(pane_idx, target, keep_old);
+            }
+            Hold::Set => inner.mark_set_holder(pane_idx),
+        }
         // Re-found after the shed, which prunes entries and moves positions.
         // The target's own entry cannot have been pruned — `shed` skips it and
         // an entry always has at least one pane — but where it sits can shift,
@@ -468,8 +550,19 @@ impl VolumeStore {
     /// same-scope `Ready` grid is kept — it is the picture on screen until
     /// this build lands.
     pub fn begin_build(&self, pane_idx: usize, target: &VolumeTarget) {
+        self.begin_build_held(pane_idx, target, Hold::Single);
+    }
+
+    /// [`Self::begin_build`], saying how the holder holds it. See [`Hold`].
+    pub fn begin_build_held(&self, pane_idx: usize, target: &VolumeTarget, hold: Hold) {
         let mut inner = self.lock();
-        inner.shed(pane_idx, target, true);
+        match hold {
+            Hold::Single => {
+                inner.set_holders.retain(|&p| p != pane_idx);
+                inner.shed(pane_idx, target, true);
+            }
+            Hold::Set => inner.mark_set_holder(pane_idx),
+        }
         let id = inner.next_id;
         inner.next_id += 1;
         inner.entries.push(StoredVolume {
@@ -501,17 +594,157 @@ impl VolumeStore {
         inner.entries[found].entry = entry;
         let panes = inner.entries[found].panes.clone();
         for pane in panes {
+            // A set holder is exempt, and this is the line that makes a 3D
+            // loop possible at all: the seamless swap's rule is "the grid that
+            // just landed supersedes the one this pane was painting through the
+            // wait", which is right for one grid and destroys fourteen. What
+            // bounds a set holder instead is `retain_set` and `enforce_budget`.
+            if inner.set_holders.contains(&pane) {
+                continue;
+            }
             inner.shed(pane, target, false);
         }
         true
+    }
+
+    /// State the whole set `pane_idx` holds, detaching it from everything else
+    /// and dropping whatever nobody is left holding. Returns how many entries
+    /// were dropped outright.
+    ///
+    /// The set holder's replacement for [`StoreInner::shed`], and the reason
+    /// [`Hold::Set`] is safe: a holder that stops asking for a grid stops
+    /// paying for it on the very next pass, without any single attach having to
+    /// guess which of its siblings are still wanted.
+    ///
+    /// Calling it with an empty `keep` is the release-before-build rule a
+    /// region, product or vector change needs. `share`'s `keep_old` deliberately
+    /// holds the old grid through a rebuild so the swap is seamless — right for
+    /// one grid, and for fourteen it is a peak of two full sets at once (1008
+    /// MiB against a 512 MiB budget on desktop). A set holder therefore
+    /// releases *first* and rebuilds after, and accepts the first-build message
+    /// for the fraction of a second that costs.
+    pub fn retain_set(&self, pane_idx: usize, keep: &[VolumeTarget]) -> usize {
+        let mut inner = self.lock();
+        inner.mark_set_holder(pane_idx);
+        for entry in &mut inner.entries {
+            if keep.contains(&entry.target) {
+                continue;
+            }
+            entry.panes.retain(|&p| p != pane_idx);
+        }
+        let before = inner.entries.len();
+        inner.entries.retain(|e| !e.panes.is_empty());
+        before - inner.entries.len()
+    }
+
+    /// Whether `pane_idx` is holding a set rather than one grid. See [`Hold`].
+    pub fn holds_set(&self, pane_idx: usize) -> bool {
+        self.lock().set_holders.contains(&pane_idx)
+    }
+
+    /// Release everything `pane_idx` holds **as a set**, and stop treating it
+    /// as a set holder. Returns how many entries were dropped outright.
+    ///
+    /// A no-op for a pane that was never a set holder, and that exemption is
+    /// the point: this is called for every pane whose loop is not active, and
+    /// a live 3D pane is one of those. Without the exemption it would detach
+    /// that pane from the single grid it is painting, every frame, and the
+    /// pane would rebuild an 8 MiB grid per frame for ever with a hot CPU as
+    /// the only symptom.
+    pub fn release_set(&self, pane_idx: usize) -> usize {
+        if !self.lock().set_holders.contains(&pane_idx) {
+            return 0;
+        }
+        self.retain_set(pane_idx, &[])
+    }
+
+    /// Evict resolved grids, oldest first, until the store's GPU texture bytes
+    /// fit `budget`. Returns how many were evicted.
+    ///
+    /// **The store's only hard bound, and the only one in this file that is
+    /// enforced rather than stated.** Every other rule here is about
+    /// correctness — what a pane may paint — and bounds memory only as a side
+    /// effect of "one pane, one grid". A set holder has no such side effect, so
+    /// this is what stands in its place: whatever the holders ask for, the
+    /// resident grids fit.
+    ///
+    /// Oldest-first by store id, which is *build* order rather than playback
+    /// order. That is deliberate. In steady state this never fires — the frame
+    /// counts in `MAX_LOOP_VOLUME_FRAMES` are chosen to fit — and the case it
+    /// exists for is the transition, where a pane holds its live grid and a
+    /// loop set at the same time. The live grid was built first, so it is
+    /// exactly what should go.
+    ///
+    /// `Building` entries are never evicted: there is nothing to reclaim (the
+    /// grid does not exist yet) and dropping the placeholder would make the
+    /// reply that is already in flight a stale one, silently. `Refused` entries
+    /// are a sentence in a `String` and are left for the same reason.
+    pub fn enforce_budget(&self, budget: usize) -> usize {
+        let mut inner = self.lock();
+        let mut evicted = 0;
+        loop {
+            let total: usize = inner.entries.iter().map(StoredVolume::texture_bytes).sum();
+            if total <= budget {
+                return evicted;
+            }
+            let Some(oldest) = inner
+                .entries
+                .iter()
+                .filter(|e| matches!(e.entry, VolumeEntry::Ready(_)))
+                .map(|e| e.id)
+                .min()
+            else {
+                // Over budget with nothing resolved to give back. Reported by
+                // returning what was actually evicted rather than looping: the
+                // in-flight builds land, and the next pass reclaims.
+                return evicted;
+            };
+            inner.entries.retain(|e| e.id != oldest);
+            evicted += 1;
+        }
+    }
+
+    /// GPU texture bytes the store's resolved grids occupy — what
+    /// [`Self::enforce_budget`] measures.
+    ///
+    /// Separate from [`Self::memory_bytes`], which is the *host* side, and the
+    /// two are different numbers for the same grid: the host holds one byte per
+    /// cell of palette index, and the upload turns it into four bytes of
+    /// coverage-premultiplied `Rg16Float` plus a mip level plus the LUT. The
+    /// budget is about the GPU, so it is this one the eviction measures.
+    pub fn texture_bytes(&self) -> usize {
+        self.lock()
+            .entries
+            .iter()
+            .map(StoredVolume::texture_bytes)
+            .sum()
     }
 
     /// Record a synchronously-known result. `pane_idx` is attached to it and
     /// holds nothing else afterwards — this is for answers that need no build,
     /// like a refusal decided at dispatch time.
     pub fn insert(&self, pane_idx: usize, target: VolumeTarget, entry: VolumeEntry) {
+        self.insert_held(pane_idx, target, entry, Hold::Single);
+    }
+
+    /// [`Self::insert`], saying how the holder holds it. See [`Hold`].
+    ///
+    /// The detach is the part `Hold::Set` turns off, and leaving it on was the
+    /// defect that made a 3D loop over volumes with nothing to resample hold
+    /// exactly one frame: every refusal detached the pane from the thirteen
+    /// entries it already had.
+    pub fn insert_held(
+        &self,
+        pane_idx: usize,
+        target: VolumeTarget,
+        entry: VolumeEntry,
+        hold: Hold,
+    ) {
         let mut inner = self.lock();
-        inner.detach(pane_idx);
+        match hold {
+            Hold::Single => inner.detach(pane_idx),
+            Hold::Set => inner.mark_set_holder(pane_idx),
+        }
         let id = inner.next_id;
         inner.next_id += 1;
         inner.entries.push(StoredVolume {
@@ -662,10 +895,19 @@ impl StoreInner {
     /// Detach `pane_idx` from whatever it holds, dropping entries nobody
     /// holds.
     fn detach(&mut self, pane_idx: usize) {
+        self.set_holders.retain(|&p| p != pane_idx);
         for entry in &mut self.entries {
             entry.panes.retain(|&p| p != pane_idx);
         }
         self.entries.retain(|e| !e.panes.is_empty());
+    }
+
+    /// Record that `pane_idx` holds a set. Idempotent — every attach a set
+    /// holder makes says so, and saying it twice must not double the list.
+    fn mark_set_holder(&mut self, pane_idx: usize) {
+        if !self.set_holders.contains(&pane_idx) {
+            self.set_holders.push(pane_idx);
+        }
     }
 
     /// Detach `pane_idx` from everything it can no longer show, given that it

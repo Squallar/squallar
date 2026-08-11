@@ -994,6 +994,21 @@ pub struct Gui {
     /// take it. `None` means "use the vector the `N0S` product carries", which
     /// is the default and is what AWIPS calls the average storm motion.
     pub storm_motion_override: StormMotionOverride,
+    /// Whether one of the storm-motion `DragValue`s is under the pointer or
+    /// holding the keyboard *right now*. See [`Self::storm_motion_mid_edit`].
+    ///
+    /// Session-only and never persisted: it describes a widget's state this
+    /// frame, not a setting. Written in two places, both in the frame path and
+    /// both clearing it: `render_settings_body`, which clears it before every
+    /// pass over the rows, and [`Self::ui`], which clears it for a frame where
+    /// those rows do not draw at all. A latch with neither would stick the
+    /// first time the panel closed mid-drag and the vector would never be
+    /// applied again.
+    ///
+    /// `pub` for the reason [`Self::storm_motion_override`] beside it is: the
+    /// crate that owns the commit rule is `rustdar_frontend`, and it has to be
+    /// able to drive both halves of it in a test.
+    pub storm_motion_editing: bool,
     /// Whatever can actually draw a 3D pane, or `None` on a machine or a frame
     /// where nothing can.
     ///
@@ -1599,6 +1614,7 @@ impl Gui {
             preferences: UserPreferences::default(),
             gps_config: rustdar_gps::GpsConfig::default(),
             storm_motion_override: StormMotionOverride::default(),
+            storm_motion_editing: false,
             volume_painter: None,
             volume_alpha: crate::volume_alpha::AlphaCurves::default(),
             volume_iso: crate::volume_iso::IsoThresholds::default(),
@@ -1610,6 +1626,15 @@ impl Gui {
     /// Create the UI using egui.
     pub fn ui(&mut self, ctx: &egui::Context) -> Vec<GuiAction> {
         let mut actions = Vec::new();
+
+        // The second writer of `storm_motion_editing`, and the reason a latch
+        // here cannot stick: the rows that clear it only run while the
+        // settings body is drawn, so a panel closed mid-drag would leave the
+        // commit deferred for ever. Cleared *before* the body draws, so a body
+        // that does draw this frame still gets the last word.
+        if !self.settings_visible() {
+            self.storm_motion_editing = false;
+        }
 
         self.check_auto_polls(&mut actions);
 
@@ -3599,6 +3624,36 @@ impl Gui {
     /// The `mem::take` caveat on [`Self::pane`] applies in full.
     pub fn pane_cannot_loop(&self, idx: PaneId) -> bool {
         self.pane(idx).is_some_and(|pane| !pane.can_loop())
+    }
+
+    /// Whether the storm motion vector is being edited *right now*, so that a
+    /// consumer which spends real work on a change can wait for the release.
+    ///
+    /// # Commit on release, and why this control needs it when the others do
+    /// not
+    ///
+    /// Every other setting that invalidates a render is a click: a product, a
+    /// tilt, a checkbox. This one is a `DragValue`, and a drag produces a new
+    /// value *every frame*. `App::apply_storm_motion_override` answers a change
+    /// by evicting every storm-relative grid and section, so a two-second drag
+    /// used to evict and rebuild them sixty times over — 210 ms of re-cut per
+    /// drag frame for a cross-section, and for a 3D loop the whole resident
+    /// set: fourteen grids, ~2 s of resample, discarded and restarted on the
+    /// next frame, for ever, so the loop would never finish building while a
+    /// finger was on the widget.
+    ///
+    /// Holding the commit until the drag ends makes the cost proportional to
+    /// the *edit* rather than to how long it took: one eviction and one
+    /// rebuild, whatever route the number took to get there. The picture on
+    /// screen goes on showing the previous vector until then, which is the
+    /// honest state — it is what the data was derived with — and the widget
+    /// shows the new number, so nothing claims otherwise.
+    ///
+    /// Deliberately not "the value has stopped changing for N frames": a
+    /// timeout would fire mid-drag on a slow frame and would make the commit a
+    /// function of frame rate.
+    pub fn storm_motion_mid_edit(&self) -> bool {
+        self.storm_motion_editing
     }
 
     /// Whether pane `idx` needs every cut of its site's volume rather than the

@@ -6394,22 +6394,17 @@ fn a_non_map_pane_keeps_the_controls_that_apply_to_it_and_drops_the_rest() {
                     | crate::actions::GuiAction::DisableLoop { .. }
             )
         });
-        match kind {
-            // A section pane is a loop participant: its frames are rasters of
-            // the line it is aimed along, one per volume.
-            PaneKind::CrossSection => assert!(
-                armed,
-                "CrossSection: the loop toggle did nothing, so a section pane \
-                 cannot be animated even though every frame of one is a picture"
-            ),
-            // A volume pane is not, and the toggle must say so rather than
-            // arming a loop nothing renders frames for.
-            _ => assert!(
-                !armed,
-                "{kind:?}: the loop toggle armed a loop for a pane nothing \
-                 renders loop frames for, so enabling it would wait for ever"
-            ),
-        }
+        // Every kind is a loop participant, and each one's frame is its own
+        // shape: a section's is the raster of the line it is aimed along, a 3D
+        // pane's is the resident grid the march samples. What the toggle must
+        // never do is arm a loop nothing fills — see `PaneKind::can_loop` — and
+        // for these two kinds something does.
+        assert!(
+            armed,
+            "{kind:?}: the loop toggle did nothing, so this pane cannot be \
+             animated even though every frame of one is something the loop \
+             machinery fills",
+        );
         assert!(
             h.stack().rows.is_empty(),
             "{kind:?}: layer rows were drawn for a pane with no map to draw \

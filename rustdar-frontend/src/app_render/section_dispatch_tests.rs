@@ -699,6 +699,67 @@ fn a_storm_motion_edit_re_derives_the_cross_section() {
     assert_eq!(app.render.section_payload_motion(), Some(None));
 }
 
+/// **Commit on release.** A vector still under the pointer is not applied, and
+/// the moment it is let go it is.
+///
+/// Every other setting that invalidates a render is a click. This one is a
+/// `DragValue`, which produces a value per frame, and applying it evicts every
+/// storm-relative grid and section: ~210 ms of re-cut per drag frame for a
+/// cross-section, and for a 3D loop the whole resident set — fourteen grids and
+/// ~2 s of resample, thrown away and restarted on the next frame, so the loop
+/// would never finish building while a finger was on the widget.
+///
+/// What is *not* deferred matters as much: the widget shows the new number
+/// throughout, and the picture goes on showing the vector it was actually
+/// derived with. Neither half lies while the drag is in progress.
+#[test]
+fn a_storm_motion_drag_commits_on_release_rather_than_per_frame() {
+    let mut app = app_with_section(
+        RadarProduct::StormRelativeVelocity,
+        velocity_volume(vec![one_cut()]),
+    );
+    app.gui.storm_motion_override = rustdar_egui::StormMotionOverride {
+        enabled: true,
+        speed_kt: 20.0,
+        direction_deg: 240.0,
+    };
+    assert!(
+        app.apply_storm_motion_override(),
+        "precondition: the first vector must land, or there is no committed \
+         state for the drag below to be held against",
+    );
+
+    // Mid-drag: a storm-motion widget has the pointer or the keyboard, which
+    // is what the settings rows write when they draw.
+    app.gui.storm_motion_editing = true;
+    assert!(
+        app.gui.storm_motion_mid_edit(),
+        "precondition: the drag must be in progress",
+    );
+    for (speed, direction) in [(30.0, 200.0), (45.0, 150.0), (60.0, 90.0)] {
+        app.gui.storm_motion_override.speed_kt = speed;
+        app.gui.storm_motion_override.direction_deg = direction;
+        assert!(
+            !app.apply_storm_motion_override(),
+            "a value produced mid-drag was applied, so every frame of the drag \
+             evicts and rebuilds every storm-relative grid and section",
+        );
+    }
+
+    // Released.
+    app.gui.storm_motion_editing = false;
+    assert!(
+        app.apply_storm_motion_override(),
+        "the released vector was never applied, so the edit is lost and the \
+         picture keeps the old vector for ever",
+    );
+    assert!(
+        !app.apply_storm_motion_override(),
+        "the committed vector applied twice, so the change detector is not \
+         idempotent and every frame after a drag evicts again",
+    );
+}
+
 /// A cut of the right shape and no content, for the receive path.
 fn blank_cut() -> Box<rustdar_radar::xsect::CrossSection> {
     use rustdar_radar::sampler::SampleStatus;

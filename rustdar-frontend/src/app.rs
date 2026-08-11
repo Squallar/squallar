@@ -509,6 +509,26 @@ const VOLUME_HALF_WIDTH_KM: f64 = rustdar_egui::pane::DEFAULT_HALF_WIDTH_KM;
 /// `site_lat`/`site_lon` are still needed when a region is present:
 /// `build_voxels` reports its `x`/`y` ranges relative to the **site** whatever
 /// the box is centred on.
+/// What one pass of [`App::prepare_volume`] did.
+///
+/// Three answers rather than a `bool`, for the reason
+/// `render_dispatch::SectionDispatch` has three: "the store now holds an answer
+/// for this target" and "nothing was spent because the budget was full" are
+/// different instructions to the caller. A loop dispatcher that treated a
+/// `Busy` as served would mark a frame in flight that nothing is building, and
+/// the frame would stay blank for the life of the loop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VolumePrepare {
+    /// The store holds an entry for this target — built, building or refused —
+    /// with the caller attached to it.
+    Served,
+    /// The data this target names has not arrived. Nothing was spent and
+    /// nothing recorded; ask again.
+    Waiting,
+    /// The concurrent render budget is full. Nothing was spent; ask again.
+    Busy,
+}
+
 fn voxel_request_for(
     target: &rustdar_egui::pane::VolumeTarget,
     site_lat: f64,
@@ -1131,38 +1151,72 @@ impl App {
     /// also what recognises a stale reply: a build superseded by a newer
     /// sealed sweep finds its entry gone and is dropped in `complete`.
     fn handle_prepare_volume(&mut self, pane_idx: usize, target: rustdar_egui::pane::VolumeTarget) {
+        if self.prepare_volume(pane_idx, &target, crate::volume::bridge::Hold::Single)
+            == VolumePrepare::Served
+        {
+            self.mark_volume_rendered(pane_idx, &target);
+        }
+    }
+
+    /// The body of [`Self::handle_prepare_volume`], shared with the 3D loop's
+    /// dispatcher.
+    ///
+    /// `hold` is the whole difference between the two callers: a live 3D pane
+    /// holds one grid and lets the store shed the rest, a loop holds its whole
+    /// frame list. See [`crate::volume::bridge::Hold`].
+    ///
+    /// # Which volume a target names
+    ///
+    /// This used to refuse outright any `collected` that was not the site's
+    /// newest — the pane and the App both computed the stamp through
+    /// `current::resolve`, so a mismatch meant a sweep had sealed between
+    /// publish and here and the superseded build was not worth a resample.
+    /// That is still true of the live pane, and is still what happens: the live
+    /// stamp is re-derived below and a *live* target that disagrees with it is
+    /// dropped exactly as before.
+    ///
+    /// What the gate could not distinguish is a target naming a **past**
+    /// volume, which is every frame of a 3D loop but the newest. Those are
+    /// served from the loop's own downloaded scans instead, which is where the
+    /// section loop's frames come from too. A time that is neither is not
+    /// refused but left alone — it is a frame whose download is still in
+    /// flight, and the level-triggered caller asks again.
+    fn prepare_volume(
+        &mut self,
+        pane_idx: usize,
+        target: &rustdar_egui::pane::VolumeTarget,
+        hold: crate::volume::bridge::Hold,
+    ) -> VolumePrepare {
         use crate::volume::bridge::VolumeEntry;
 
         // Built, building, or refused — attach and share rather than repeat.
-        if self.volume_store.share(pane_idx, &target) {
-            self.mark_volume_rendered(pane_idx, &target);
-            return;
+        if self.volume_store.share_held(pane_idx, target, hold) {
+            return VolumePrepare::Served;
         }
 
-        // The pane asks for the volume the App published; both sides compute
-        // the stamp through `current::resolve` over the same holders. A
-        // mismatch means a sweep sealed between publish and here — the pane
-        // re-asks next frame with the new stamp, and building the superseded
-        // one would be a whole resample for a picture already out of date.
-        let Some(stamp) = self.current_volume_stamp(&target.volume.site) else {
-            // No volume at all yet. Deliberately no entry: the pane goes on
-            // asking, and the first frame after data lands builds it.
-            return;
-        };
-        if stamp.newest != target.volume.collected {
-            return;
+        let live = self
+            .current_volume_stamp(&target.volume.site)
+            .is_some_and(|stamp| stamp.newest == target.volume.collected);
+        // No volume at all yet, live or downloaded. Deliberately no entry: the
+        // caller goes on asking, and the first frame after data lands builds it.
+        if !live
+            && !self
+                .loop_mgr
+                .is_cached(&target.volume.site, &target.volume.collected)
+        {
+            return VolumePrepare::Waiting;
         }
         let Some(site) = rustdar_radar::sites::get_radar_site(&target.volume.site) else {
-            self.volume_store.insert(
+            self.volume_store.insert_held(
                 pane_idx,
                 target.clone(),
                 VolumeEntry::Refused(format!(
                     "{} is not a radar site this build knows the position of.",
                     target.volume.site,
                 )),
+                hold,
             );
-            self.mark_volume_rendered(pane_idx, &target);
-            return;
+            return VolumePrepare::Served;
         };
 
         // The budget gate, **before** the extraction — the same shape
@@ -1174,14 +1228,19 @@ impl App {
         // in-flight render. `spawn_voxel_build`'s own check stays as the
         // belt; this one is what decides whether the walk is paid at all.
         if !self.render.render_slot_free() {
-            return;
+            return VolumePrepare::Busy;
         }
 
         let started = web_time::Instant::now();
-        let Some(input) = self.extract_current_volume(&target.volume.site, target.product) else {
-            // The merged volume carries this moment nowhere — the same answer
+        let extracted = if live {
+            self.extract_current_volume(&target.volume.site, target.product)
+        } else {
+            self.extract_loop_volume(&target.volume.site, target.volume.collected, target.product)
+        };
+        let Some(input) = extracted else {
+            // The volume carries this moment nowhere — the same answer
             // `build_voxels` would give, decided before paying for a dispatch.
-            self.volume_store.insert(
+            self.volume_store.insert_held(
                 pane_idx,
                 target.clone(),
                 VolumeEntry::Refused(format!(
@@ -1190,19 +1249,20 @@ impl App {
                     target.volume.site,
                     target.volume.collected,
                 )),
+                hold,
             );
-            self.mark_volume_rendered(pane_idx, &target);
-            return;
+            return VolumePrepare::Served;
         };
         log::info!(
-            "3D volume view: extracted the {} payload in {} ms on the frame thread",
+            "3D volume view: extracted the {} {} payload in {} ms on the frame thread",
             target.volume.site,
+            if live { "live" } else { "loop-frame" },
             started.elapsed().as_millis(),
         );
 
-        let request = voxel_request_for(&target, site.lat, site.lon);
+        let request = voxel_request_for(target, site.lat, site.lon);
         let spawned = self.render.spawn_voxel_build(
-            &target,
+            target,
             input,
             request,
             self.channels.voxel_sender.clone(),
@@ -1210,11 +1270,47 @@ impl App {
         );
         if !spawned {
             // Budget full. Nothing dispatched and nothing marked: the
-            // level-triggered pane asks again next frame.
-            return;
+            // level-triggered caller asks again next frame.
+            return VolumePrepare::Busy;
         }
-        self.volume_store.begin_build(pane_idx, &target);
-        self.mark_volume_rendered(pane_idx, &target);
+        self.volume_store.begin_build_held(pane_idx, target, hold);
+        VolumePrepare::Served
+    }
+
+    /// The payload for one of a 3D loop's **past** volumes, out of the scans
+    /// the loop has already downloaded.
+    ///
+    /// The counterpart of [`Self::extract_current_volume`], and the same walk:
+    /// what differs is only where the `Scan` comes from. `spawn_loop_section_render`
+    /// does exactly this for a cross-section frame, off the same cache and with
+    /// the storm motion vector read off the dispatcher rather than passed in,
+    /// so that the vector a grid is *keyed* on cannot differ from the one it is
+    /// derived with.
+    ///
+    /// On the frame thread, as the live one is, and for the same two reasons:
+    /// the job wire carries a `RenderInput` rather than a `Scan`, and on wasm
+    /// the volume is only reachable from the main thread. That is what
+    /// `MAX_LOOP_VOLUME_BUILDS_PER_FRAME` paces.
+    fn extract_loop_volume(
+        &mut self,
+        site: &str,
+        collected: chrono::NaiveDateTime,
+        product: rustdar_radar::types::RadarProduct,
+    ) -> Option<rustdar_radar::render_input::RenderInput> {
+        #[cfg(test)]
+        self.volume_extractions
+            .set(self.volume_extractions.get() + 1);
+        let radar = rustdar_radar::sites::get_radar_site(site)?;
+        let scan = Arc::clone(self.loop_mgr.get_cached(site, &collected)?);
+        let sweeps: Vec<&nexrad_model::data::Sweep> = scan.sweeps().iter().collect();
+        rustdar_radar::render_input::RenderInput::extract_volume_parts(
+            scan.coverage_pattern(),
+            &sweeps,
+            product,
+            radar.lat,
+            radar.lon,
+            self.render.storm_motion_override_kt(),
+        )
     }
 
     /// Take delivery of finished voxel builds.

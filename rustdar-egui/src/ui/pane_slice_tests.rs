@@ -873,8 +873,9 @@ fn a_non_map_active_pane_is_not_the_fallback_sync_source() {
 /// The classification is `PaneState::can_loop`, and the three non-map rows
 /// below are the whole of it: an **aimed** cross-section pane animates a
 /// sequence of vertical slices and belongs in the fan-out; an **unaimed** one
-/// has no line and so nothing to cut; a 3D volume pane is raymarched live from
-/// the eye and has no cacheable frame at all.
+/// has no line and so nothing to cut; a 3D volume pane animates a sequence of
+/// resident grids and belongs in it from the moment it exists, because unlike a
+/// section it needs no aiming — the volume is the whole box.
 ///
 /// The active pane is included without being asked, which the second half
 /// below pins. The caller is now the floating timeline, outside every
@@ -894,9 +895,10 @@ fn loop_actions_skip_panes_that_draw_no_frames() {
 
     assert_eq!(
         gui.loop_sync_targets(),
-        vec![0, 3],
-        "an unaimed section pane is not a loop target: it has no line, so its \
-         frames could never be cut and the batch would never settle"
+        vec![0, 2, 3],
+        "an unaimed section pane is not a loop target — it has no line, so its \
+         frames could never be cut and the batch would never settle — while a \
+         3D pane is one from the start, having nothing to be aimed at"
     );
 
     // Aim it, and it joins the fan-out — a section loop is a first-class
@@ -913,12 +915,13 @@ fn loop_actions_skip_panes_that_draw_no_frames() {
     );
     assert_eq!(
         gui.loop_sync_targets(),
-        vec![0, 1, 3],
+        vec![0, 1, 2, 3],
         "an aimed section pane was left out of the loop fan-out, so enabling \
          the loop animates every pane beside it and not this one"
     );
-    // The volume pane stays out however the rest of the layout changes.
-    assert!(!gui.loop_sync_targets().contains(&2));
+    // The line the section needed is not a thing a 3D pane has, so aiming one
+    // must not have changed the other's answer.
+    assert!(gui.loop_sync_targets().contains(&2));
 
     // Sync off narrows to the active pane, whatever kind it is: it is the
     // pane whose own checkbox was clicked.

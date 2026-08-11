@@ -21,6 +21,21 @@ struct Arm {
     loop_budget: usize,
     grid: [u32; 3],
     volume_budget: usize,
+    /// Frames — and so resident voxel grids — a 3D loop holds on this class.
+    /// See [`MAX_LOOP_VOLUME_FRAMES`]: for this loop kind the two are one
+    /// number, which `the_3d_loop_holds_exactly_what_it_marches` is about.
+    volume_loop_frames: usize,
+    /// The application-wide ceiling on those grids.
+    volume_loop_budget: usize,
+    /// The per-pane raymarch offscreen ceiling.
+    offscreen_budget: usize,
+    /// Panes this class can show at once. Not a `cfg` cascade like everything
+    /// else here — it is `rustdar_egui`'s, selected at runtime by width class
+    /// — which is precisely why the multiplication below had nothing checking
+    /// it: the two halves live in different crates.
+    max_panes: usize,
+    /// The whole-application ceiling the row must fit.
+    app_budget: usize,
 }
 
 impl Arm {
@@ -86,6 +101,24 @@ impl Arm {
             .expect("a shipped grid shape cannot overflow")
             + VOLUME_LUT_BYTES
     }
+
+    /// Every GPU texture the application budgets at once, worst case.
+    ///
+    /// A deliberate over-count by one pane: a pane is one kind at a time, so
+    /// nothing can hold a full 2D loop *and* be the 3D pane whose loop set the
+    /// middle term pays for. Summed rather than maximised so that the sum is
+    /// an upper bound whichever mix of pane kinds is on screen, and so that no
+    /// term can grow without this figure growing with it.
+    ///
+    /// The 3D term is **not** multiplied by the pane count, and that is the
+    /// property worth stating: the grids are in one application-wide
+    /// `VolumeStore` keyed by target, so two 3D panes on one volume share one
+    /// set. Multiplying it would be the regression.
+    fn app_texture_bytes(&self) -> usize {
+        self.max_panes * self.loop_budget
+            + self.volume_loop_budget
+            + self.max_panes * self.offscreen_budget
+    }
 }
 
 /// Every device class this workspace builds for, exactly once.
@@ -100,6 +133,11 @@ fn arms() -> [Arm; 3] {
             loop_budget: WASM_LOOP_TEXTURE_BUDGET_BYTES,
             grid: WASM_VOLUME_GRID_CELLS,
             volume_budget: WASM_VOLUME_TEXTURE_BUDGET_BYTES,
+            volume_loop_frames: WASM_MAX_LOOP_VOLUME_FRAMES,
+            volume_loop_budget: WASM_VOLUME_LOOP_TEXTURE_BUDGET_BYTES,
+            offscreen_budget: WASM_VOLUME_OFFSCREEN_BUDGET_BYTES,
+            max_panes: rustdar_egui::pane::MAX_PANES_DESKTOP,
+            app_budget: WASM_APP_TEXTURE_BUDGET_BYTES,
         },
         Arm {
             name: "mobile",
@@ -110,6 +148,11 @@ fn arms() -> [Arm; 3] {
             loop_budget: MOBILE_LOOP_TEXTURE_BUDGET_BYTES,
             grid: MOBILE_VOLUME_GRID_CELLS,
             volume_budget: MOBILE_VOLUME_TEXTURE_BUDGET_BYTES,
+            volume_loop_frames: MOBILE_MAX_LOOP_VOLUME_FRAMES,
+            volume_loop_budget: MOBILE_VOLUME_LOOP_TEXTURE_BUDGET_BYTES,
+            offscreen_budget: MOBILE_VOLUME_OFFSCREEN_BUDGET_BYTES,
+            max_panes: rustdar_egui::pane::MAX_PANES_MOBILE,
+            app_budget: MOBILE_APP_TEXTURE_BUDGET_BYTES,
         },
         Arm {
             name: "desktop",
@@ -120,6 +163,11 @@ fn arms() -> [Arm; 3] {
             loop_budget: DESKTOP_LOOP_TEXTURE_BUDGET_BYTES,
             grid: DESKTOP_VOLUME_GRID_CELLS,
             volume_budget: DESKTOP_VOLUME_TEXTURE_BUDGET_BYTES,
+            volume_loop_frames: DESKTOP_MAX_LOOP_VOLUME_FRAMES,
+            volume_loop_budget: DESKTOP_VOLUME_LOOP_TEXTURE_BUDGET_BYTES,
+            offscreen_budget: DESKTOP_VOLUME_OFFSCREEN_BUDGET_BYTES,
+            max_panes: rustdar_egui::pane::MAX_PANES_DESKTOP,
+            app_budget: DESKTOP_APP_TEXTURE_BUDGET_BYTES,
         },
     ]
 }
@@ -183,6 +231,146 @@ fn a_section_loop_frame_is_half_a_plan_view_one() {
             "{}: a section loop frame is no longer half a plan-view one, so the \
              section rows of the LOOP_TEXTURE_BUDGET_BYTES table are wrong",
             arm.name,
+        );
+    }
+}
+
+/// The **3D volume** row of the loop table, executed.
+///
+/// The third loop kind, and the one whose frames are resident inputs rather
+/// than cached pictures — so this is a claim about GPU texture memory that is
+/// actually enforced at runtime by `VolumeStore::enforce_budget`, unlike the
+/// two rows above.
+#[test]
+fn volume_loop_grids_fit_the_application_texture_budget() {
+    for arm in arms() {
+        let total = arm.volume_loop_frames * arm.volume_bytes();
+        assert!(
+            total <= arm.volume_loop_budget,
+            "{}: {} resident grids x {} B = {:.1} MiB, over the {} MiB budget",
+            arm.name,
+            arm.volume_loop_frames,
+            arm.volume_bytes(),
+            total as f64 / (1024.0 * 1024.0),
+            arm.volume_loop_budget / (1024 * 1024),
+        );
+    }
+}
+
+/// A 3D loop holds exactly what it marches: the frame list **is** the resident
+/// set.
+///
+/// The other two loop kinds hold `MAX_LOOP_FRAMES` and texture
+/// `MAX_LOOP_RENDER_BUDGET` of them, re-rendering as the playhead walks back
+/// into a window it had left. Re-entering a resident 3D window costs ~140 ms
+/// against a 200 ms interval at `DEFAULT_LOOP_SPEED_FPS` and 33 ms at
+/// `MAX_LOOP_SPEED_FPS`, so that treadmill does not close here.
+///
+/// What this pins is that `MAX_LOOP_VOLUME_FRAMES` is *one* number rather than
+/// a held count and a resident count that could drift apart — and that it is at
+/// or under the budget the arm above just checked, with no second number in
+/// between. The dispatcher reads the same constant for both, and
+/// `app_render::volume_loop_tests` drives it end to end.
+#[test]
+fn the_3d_loop_holds_exactly_what_it_marches() {
+    for arm in arms() {
+        assert!(
+            arm.volume_loop_frames >= 2,
+            "{}: a one-frame loop is not a loop",
+            arm.name,
+        );
+        // The frame count is the tighter of two bounds, computed rather than
+        // restated, and it is an *equality* — a list shorter than both bounds
+        // allow is history thrown away for nothing, and a longer one is the
+        // treadmill this loop kind cannot afford.
+        //
+        //  * what the byte budget admits, which binds desktop (14 of the 30
+        //    frames a plan-view loop textures);
+        //  * `MAX_LOOP_RENDER_BUDGET`, which binds wasm32 and mobile — a 3D
+        //    loop is not licensed to hold *more* history than the plan-view
+        //    loop beside it on the same device just because its grids happen
+        //    to be small there.
+        let admits = arm.volume_loop_budget / arm.volume_bytes();
+        assert_eq!(
+            arm.volume_loop_frames,
+            admits.min(arm.render_budget),
+            "{}: the budget admits {admits} grids and the loop render budget is \
+             {}, so the frame list should be their minimum, not {}",
+            arm.name,
+            arm.render_budget,
+            arm.volume_loop_frames,
+        );
+    }
+}
+
+/// The whole application's GPU texture memory, against a ceiling — the line
+/// nothing drew before, because the pane count and the per-pane budgets live in
+/// different crates.
+///
+/// This is the table in [`APP_TEXTURE_BUDGET_BYTES`]' doc, executed. It fails
+/// if `MAX_PANES_DESKTOP` grows, if any per-pane budget grows, or if the 3D
+/// loop's grids are ever made per-pane instead of application-wide.
+#[test]
+fn the_whole_application_fits_its_gpu_ceiling() {
+    for arm in arms() {
+        let total = arm.app_texture_bytes();
+        assert!(
+            total <= arm.app_budget,
+            "{}: {} panes x {} MiB of loop textures + {} MiB of 3D loop grids + \
+             {} panes x {} MiB of raymarch offscreen = {} MiB, over the {} MiB \
+             whole-application ceiling",
+            arm.name,
+            arm.max_panes,
+            arm.loop_budget / (1024 * 1024),
+            arm.volume_loop_budget / (1024 * 1024),
+            arm.max_panes,
+            arm.offscreen_budget / (1024 * 1024),
+            total / (1024 * 1024),
+            arm.app_budget / (1024 * 1024),
+        );
+    }
+}
+
+/// The whole-application ceiling is snug, on the same reasoning
+/// `the_volume_budget_is_not_slack_enough_to_hide_a_doubling` gives: a ceiling
+/// several times the real figure passes the check above while admitting a
+/// silent doubling of any term inside it.
+///
+/// 1.25x, which is tighter than the ~1.33x the per-subsystem budgets keep,
+/// because this one is a sum of already-padded figures rather than a raw
+/// allocation with alignment overhead to absorb.
+#[test]
+fn the_app_ceiling_is_not_slack_enough_to_hide_a_doubling() {
+    for arm in arms() {
+        let total = arm.app_texture_bytes();
+        assert!(
+            arm.app_budget * 4 <= total * 5,
+            "{}: the {} MiB ceiling is more than 1.25x the {} MiB it bounds, so \
+             a term inside it could double unnoticed",
+            arm.name,
+            arm.app_budget / (1024 * 1024),
+            total / (1024 * 1024),
+        );
+    }
+}
+
+/// The 3D loop's pacing cap is a real cap, on the same terms
+/// [`MAX_LOOP_SECTION_CUTS_PER_FRAME`]'s is.
+///
+/// The upper bound is the whole point: a cap at or above
+/// [`MAX_CONCURRENT_RENDERS`] would let one dispatch pass run every
+/// `extract_volume_parts` it could start back to back on the frame that starts
+/// the loop, which is exactly the hitch the constant exists to prevent.
+#[test]
+fn the_volume_build_cap_paces_rather_than_stalls() {
+    const { assert!(MAX_LOOP_VOLUME_BUILDS_PER_FRAME >= 1) };
+    for arm in arms() {
+        assert!(
+            MAX_LOOP_VOLUME_BUILDS_PER_FRAME <= arm.concurrent_renders,
+            "{}: the per-frame build cap ({MAX_LOOP_VOLUME_BUILDS_PER_FRAME}) is \
+             above the concurrent render budget ({}), so it caps nothing",
+            arm.name,
+            arm.concurrent_renders,
         );
     }
 }
@@ -473,6 +661,9 @@ fn every_cfg_arm_selects_the_constant_named_for_its_device_class() {
         // overlap is deliberate, because that test checks one cascade and
         // this one checks that no cascade is missing.
         "VOLUME_OFFSCREEN_BUDGET_BYTES",
+        // The 3D loop's two cascades, landed with it.
+        "MAX_LOOP_VOLUME_FRAMES",
+        "APP_TEXTURE_BUDGET_BYTES",
     ];
 
     // Cascades that still spell their arms as literals, and so cannot be

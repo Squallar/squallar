@@ -146,6 +146,18 @@ fn section_break(ui: &mut egui::Ui) {
     ui.add_space(SETTINGS_SMALL_SPACING);
 }
 
+/// Whether a `DragValue` is mid-edit — being dragged, or holding the keyboard
+/// while a number is typed into it.
+///
+/// Both halves are needed and neither implies the other: a drag is the
+/// continuous case (a value per frame, no commit), and a focused text edit is
+/// the discrete one (`DragValue` writes through on every keystroke, so "42"
+/// passes through 4 on its way). Anything reading the value to spend real work
+/// on it wants to wait for both to end. See [`Gui::storm_motion_mid_edit`].
+fn mid_edit(response: &egui::Response) -> bool {
+    response.dragged() || response.has_focus()
+}
+
 impl super::Gui {
     /// The settings content — the inspector's App › Settings body.
     ///
@@ -169,6 +181,13 @@ impl super::Gui {
         pane: &crate::pane::PaneState,
         actions: &mut Vec<GuiAction>,
     ) {
+        // Re-derived from the widgets every frame rather than latched, so it
+        // cannot get stuck on: the two storm-motion rows below set it while
+        // their `DragValue` is under the pointer or holding the keyboard, and
+        // this is the only writer of `false`. See
+        // [`Gui::storm_motion_mid_edit`] for what holding it costs and why the
+        // commit waits.
+        self.storm_motion_editing = false;
         for &row in SETTINGS_ROWS {
             #[cfg(test)]
             let row_top = ui.cursor().top();
@@ -447,35 +466,43 @@ impl super::Gui {
             }
             "storm.speed" => {
                 let motion = &mut self.storm_motion_override;
-                ui.add_enabled_ui(motion.enabled, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Speed:");
-                        // Upper bound shared with `DERIVED_OFFSET`, which is
-                        // sized so nothing this widget admits can saturate the
-                        // derived gate encoding.
-                        ui.add(
-                            egui::DragValue::new(&mut motion.speed_kt)
-                                .speed(0.5)
-                                .range(0.0..=rustdar_radar::srm::MAX_OVERRIDE_SPEED_KT)
-                                .suffix(" kt"),
-                        );
-                    });
-                });
+                let widget = ui
+                    .add_enabled_ui(motion.enabled, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Speed:");
+                            // Upper bound shared with `DERIVED_OFFSET`, which is
+                            // sized so nothing this widget admits can saturate the
+                            // derived gate encoding.
+                            ui.add(
+                                egui::DragValue::new(&mut motion.speed_kt)
+                                    .speed(0.5)
+                                    .range(0.0..=rustdar_radar::srm::MAX_OVERRIDE_SPEED_KT)
+                                    .suffix(" kt"),
+                            )
+                        })
+                        .inner
+                    })
+                    .inner;
+                self.storm_motion_editing |= mid_edit(&widget);
                 true
             }
             "storm.direction" => {
                 let motion = &mut self.storm_motion_override;
-                ui.add_enabled_ui(motion.enabled, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("From:");
-                        ui.add(
-                            egui::DragValue::new(&mut motion.direction_deg)
-                                .speed(1.0)
-                                .range(0.0..=360.0)
-                                .suffix("\u{00b0}"),
-                        );
-                    });
-                });
+                let widget = ui
+                    .add_enabled_ui(motion.enabled, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("From:");
+                            ui.add(
+                                egui::DragValue::new(&mut motion.direction_deg)
+                                    .speed(1.0)
+                                    .range(0.0..=360.0)
+                                    .suffix("\u{00b0}"),
+                            )
+                        })
+                        .inner
+                    })
+                    .inner;
+                self.storm_motion_editing |= mid_edit(&widget);
                 true
             }
             // --- Advanced ---

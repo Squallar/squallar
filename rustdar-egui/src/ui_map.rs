@@ -1513,6 +1513,13 @@ fn volume_pane_outcome(
     // is what keeps this one borrow deep rather than a clone of the pane.
     let site_code = pane.site.clone();
     let product = pane.selected_product;
+    // The playing loop frame's resident grid, read here for the same borrow
+    // reason as the fields above. `Some` only while a 3D loop is animating
+    // *and* the playhead's frame has landed; the loop's own dispatcher owns
+    // filling it, and until it has, everything below runs exactly as it does
+    // with no loop at all — which is what makes a loop that is still building
+    // show the live volume rather than an empty pane.
+    let loop_grid = pane.active_volume_frame().cloned();
     // The published current-volume stamp, **not** `scan_info`. `scan_info`
     // names whatever the plan view is drawing and freezes for a whole volume;
     // the stamp is the newest data time of the site's merged volume and
@@ -1572,13 +1579,29 @@ fn volume_pane_outcome(
         ));
     }
 
-    let collected = volume_stamp.collected;
-    let target = VolumeTarget {
+    let live_target = VolumeTarget {
         volume: volume_stamp,
         product,
         region,
     };
-    if already_rendered.as_ref() != Some(&target) {
+    // The one substitution a 3D loop makes: the pane marches the playhead
+    // frame's grid instead of the live one. Everything else about the pane —
+    // camera, floor, alpha curve, isosurface, the caption's geometry — is
+    // unchanged, because a loop frame differs from the live volume only in
+    // *which* grid is sampled.
+    //
+    // While a frame is playing the pane does **not** ask for the live volume.
+    // That is what makes the resident set the loop's frame list and nothing
+    // else: asking would attach the pane to a fifteenth grid on desktop, over
+    // the budget by one, for a picture nothing is showing. It is also why the
+    // live grid is *subsumed* rather than added — the playhead's frame is the
+    // volume this pane is displaying.
+    let (target, from_loop) = match loop_grid {
+        Some(grid) => (grid.target, true),
+        None => (live_target, false),
+    };
+    let collected = target.volume.collected;
+    if !from_loop && already_rendered.as_ref() != Some(&target) {
         // Level-triggered on purpose. See `GuiAction::PrepareVolume`: the
         // alternative is remembering an edge across a site switch, a volume
         // roll and a surface loss, which is three places to forget.
