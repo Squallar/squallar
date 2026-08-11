@@ -14,8 +14,11 @@
 //! chain and no clock-skew handling here. Upstream did not sign either.
 //!
 //! Objects are keyed `YYYY/MM/DD/SITE/SITEYYYYMMDD_HHMMSS_V06`, so one site-day
-//! is a prefix query on `YYYY/MM/DD/SITE`. Each volume has a `..._V06_MDM`
-//! metadata sidecar, which [`list_files`] returns too (see
+//! is a prefix query on `YYYY/MM/DD/SITE`. The trailing `_V06` names the volume
+//! format rather than the layout: TDWR sites sit in the same bucket under the
+//! same prefix with `_V08` keys (2026-08-10 held 239 of them for `TPIT` against
+//! 226 `_V06` for `KTLX`), and nothing here reads the suffix. Each volume has a
+//! `..._MDM` metadata sidecar, which [`list_files`] returns too (see
 //! [`key_to_identifier`]).
 
 use std::sync::OnceLock;
@@ -79,7 +82,10 @@ pub type Result<T> = std::result::Result<T, ArchiveError>;
 /// A NEXRAD archive volume file, named but not keyed: a newtype over the bare
 /// object *name*, with site and collection time recovered by fixed-offset
 /// slicing. Names look like `KTLX20240520_000004_V06` -- four characters of
-/// site, eight of `%Y%m%d`, a separator, then six of `%H%M%S`.
+/// site, eight of `%Y%m%d`, a separator, then six of `%H%M%S`. Every offset
+/// sliced here stops at byte 19, so what follows is not looked at: a TDWR's
+/// `TPIT20260810_000139_V08` and either network's `_MDM` sidecar parse by the
+/// same rule as a `_V06`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct Identifier(String);
 

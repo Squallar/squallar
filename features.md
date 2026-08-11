@@ -24,6 +24,7 @@ archive, MRMS, satellite and soundings), not the free app.
 | NEXRAD Level 2 (super-res)                    | ✅      | ✅         | ✅      |
 | Level 2 real-time chunks (sub-volume latency) | ✅      | ❓         | ✅      |
 | NEXRAD Level 3 products                       | ✅      | ✅         | ✅      |
+| TDWR terminal radars                          | ❓      | ✅         | ❌      |
 | Dual-pol moments (CC, ZDR, PHI, KDP)          | ✅      | ✅         | ✅      |
 | Hydrometeor classification (HHC)              | ✅      | ✅         | ✅      |
 | Echo tops (EET, and tilt-interpolated)        | ✅      | ✅         | ✅      |
@@ -50,6 +51,16 @@ Notes on the Rustdar column:
 - **HHC, POSH, MEHS, NROT** are derived locally from the Level 2 volume;
   **KDP, EET, VIL, VILD and DPR** come from the Level III bucket
   (`RadarProduct::is_level3`).
+- **TDWR terminal radars** — the table carries all 45 of them, the picker offers
+  them, and the Level 2 archive holds their volumes under the ordinary site-day
+  prefix (`_V08` keys beside a WSR-88D's `_V06`). What comes back does not draw
+  as a sweep: `nexrad-decode` frames each message from wherever the previous
+  one's parse stopped, and a TDWR pads every Message 31 body to an 8-byte
+  boundary, so a record loses framing after its first radial and the renderer
+  fans the survivors into wedges. The Level 3 bucket does serve TDWR sites, but
+  only the legacy single-pol codes (`TZL`, `TZ0`-`TZ2`, `TV0`-`TV2`, `NCR`,
+  `NHI`, `NMD`, …); none of `EET`, `DVL`, `DPR` or `N0K` exists for one, checked
+  2026-08-11 against `PIT`, `OKC`, `MIA` and `DCA`.
 - **3D volumetric rendering** — a pane can be switched to a 3D view
   (View → 3D volume view), which resamples the volume onto a Cartesian voxel
   grid (`rustdar-radar/src/voxel.rs`) and raymarches it

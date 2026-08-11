@@ -16,6 +16,13 @@ interpolated echo tops and storm-relative velocity — need no source of their
 own. KDP, EET, VIL, VIL density and precipitation rate are fetched from the
 Level 3 bucket (`RadarProduct::is_level3`).
 
+Both radar networks share those buckets, which is not the same as sharing the
+products. The Level 2 archive carries TDWR volumes under the same
+`YYYY/MM/DD/SITE/` prefix as WSR-88D ones, keyed `_V08` rather than `_V06`. The
+Level 3 bucket carries TDWR products too, but the legacy single-pol set (`TZL`,
+`TZ0`-`TZ2`, `TV0`-`TV2`, `NCR`, `NHI`, `NMD`, …) — not one of the four codes
+this app asks for, so the five Level 3 products above are a WSR-88D feature.
+
 ## Numerical Weather Prediction (NWP) Models
 
 | Model                                  | Status | Public Access                                                                                                                                          |

@@ -92,7 +92,7 @@ pub(crate) fn pill_row_clearance(ctx: &egui::Context, idx: PaneId) -> f32 {
 }
 
 /// The site popover's minimum width — room for the search field and the
-/// `XXXX · TDWR` rows without wrapping.
+/// `XXXX - TDWR` rows without wrapping.
 const SITE_POPOVER_WIDTH: f32 = 220.0;
 
 /// The link popover's width ceiling, so [`UNLINK_NOTE`] wraps instead of
@@ -343,10 +343,13 @@ pub(super) fn site_list_ui(ui: &mut egui::Ui, query: &str, current: &str) -> Sit
         .show(ui, |ui| {
             for site in shown {
                 let is_current = current == site.name;
-                // TDWRs are marked in the row: they are pickable — the map
-                // icons allow them too — but the Level II archive has
-                // nothing for them, and the caption's split deserves to be
-                // visible per row.
+                // TDWRs are marked rather than hidden or disabled: they are
+                // pickable — the map icons allow them too, and the archive
+                // carries their volumes. The mark says a pick lands on a
+                // different instrument (single-pol, ~89 km of Doppler range
+                // around one airport, none of the Level III products this app
+                // fetches), which is what the caption's split means and is
+                // worth seeing per row.
                 let label = if site.is_tdwr() {
                     format!("{} - TDWR", site.name)
                 } else {

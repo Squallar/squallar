@@ -68,12 +68,15 @@ pub type Source = Cow<'static, str>;
 pub struct DataSources {
     /// NEXRAD Level II archive volumes. Keys are `YYYY/MM/DD/SITE/NAME`.
     pub level2_bucket: Source,
-    /// NEXRAD Level II real-time chunks.
+    /// NEXRAD Level II real-time chunks. Keys are `SITE/VOLUME/NAME`, a live
+    /// rotation rather than a dated archive.
     ///
-    /// Declared ahead of use: no fetch path reads it yet, so the derived
+    /// [`crate::chunks`] reads it: `list_volume_indices` and `list_chunks`
+    /// walk the rotation and `download_chunk` fetches a piece, all taking the
+    /// bucket from this field rather than naming it, so the derived
     /// validations (the Android network-security-config, the web
-    /// service-worker never-cache list) already cover the origin for when one
-    /// does.
+    /// service-worker never-cache list) describe the origin traffic actually
+    /// goes to.
     pub level2_chunks_bucket: Source,
     /// NEXRAD Level III products. Keys are **flat**: `SSS_PPP_YYYY_MM_DD_HH_MM_SS`.
     pub level3_bucket: Source,

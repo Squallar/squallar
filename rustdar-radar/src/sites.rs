@@ -2381,10 +2381,25 @@ pub fn distance_km(lat_a: f64, lon_a: f64, lat_b: f64, lon_b: f64) -> f64 {
 impl RadarSite {
     /// Whether this is a Terminal Doppler Weather Radar rather than a WSR-88D.
     ///
-    /// The distinction is load-bearing rather than trivia: the Level II archive
-    /// this app reads carries WSR-88D volume scans only, so a TDWR site has no
-    /// reflectivity to show through that path. [`radars()`] lists both because the
-    /// map draws a marker for every site.
+    /// Not a difference in availability: both networks land in the same Level
+    /// II archive under the same `YYYY/MM/DD/SITE/` prefix, a TDWR's objects
+    /// ending `_V08` where a WSR-88D's end `_V06`, and nothing in the fetch or
+    /// decode path branches on which of the two a site is. What differs is the
+    /// instrument. A TDWR is single-pol, so no differential phase or
+    /// correlation coefficient and nothing derived from them; it watches one
+    /// airport, so its Doppler cuts reach ~89 km (592 gates of 150 m, read off
+    /// `TPIT`) beside one surveillance cut out to ~417 km (1,390 of 300 m);
+    /// and its radials are 1.0° apart rather than 0.5°.
+    ///
+    /// Its Level III products differ in kind, not only in number: a TDWR
+    /// publishes the legacy single-pol codes (`TZL`, `TZ0`-`TZ2`, `TV0`-`TV2`,
+    /// `NCR`, `NHI`, `NMD` and the like), and not one of the four codes
+    /// [`crate::level3`] fetches — checked 2026-08-11 by listing that bucket
+    /// for `PIT`, `OKC`, `MIA` and `DCA`, where `EET`, `DVL`, `DPR` and `N0K`
+    /// return no key at all while `TLX` has all four.
+    ///
+    /// [`radars()`] lists both networks, because the map draws a marker for
+    /// every site it knows.
     ///
     /// The `T` prefix identifies the 45 TDWRs, with one exception that a naive
     /// `starts_with('T')` gets wrong: `TJUA` is San Juan's WSR-88D.
@@ -2392,7 +2407,14 @@ impl RadarSite {
         self.name.starts_with('T') && self.name != "TJUA"
     }
 
-    /// Whether this site is a WSR-88D, the network the Level II archive covers.
+    /// Whether this site is a WSR-88D — the network with dual-pol moments,
+    /// 0.5° radials, and every Level III code this app fetches.
+    ///
+    /// A capability question rather than a label, and the one to ask before
+    /// offering or fetching anything that needs a dual-pol moment or a Level
+    /// III object: for a TDWR the answer is no on both counts, and it is no
+    /// for the whole site rather than for a particular volume, so a caller can
+    /// decide once. See [`is_tdwr`](Self::is_tdwr) for what was measured.
     pub fn is_wsr88d(&self) -> bool {
         !self.is_tdwr()
     }
@@ -2434,8 +2456,18 @@ pub fn nearest_radar_site(lat: f64, lon: f64) -> Option<(&'static RadarSite, f64
 /// This is the one startup site selection wants: the nearest operational
 /// WSR-88D. Downtown Oklahoma City illustrates both filters at once — the
 /// literal nearest site is the TDWR `TOKC`, and the nearest WSR-88D is the ROC
-/// test bed `KCRI`. Neither reliably shows a viewer reflectivity, and the site
-/// a person there actually wants is the third one out, `KTLX`.
+/// test bed `KCRI`, which scans to whatever schedule the ROC is testing that
+/// day. The site a person there actually wants is the third one out, `KTLX`.
+///
+/// The TDWR filter is about what an *unattended* pick should open on, not
+/// about what the archive holds — it holds TDWR volumes under the same prefix
+/// as any other site's. The reason is the instrument (see
+/// [`RadarSite::is_tdwr`]): ~89 km of Doppler range around one airport,
+/// single-pol so no dual-pol moment and nothing derived from one, and none of
+/// the Level III codes this app fetches. Opening there by default would
+/// quietly narrow what a viewer can see without their having asked for a
+/// terminal radar. Picking one by hand is unaffected, and
+/// [`nearest_radar_site`] is the unfiltered form.
 pub fn nearest_wsr88d_site(lat: f64, lon: f64) -> Option<(&'static RadarSite, f64)> {
     table().nearest_wsr88d(lat, lon)
 }
@@ -2469,7 +2501,9 @@ mod nearest_tests {
     /// hardcoded default happened to name. The point is that it is now *derived*.
     ///
     /// This is also the case that motivates the TDWR filter: the literal nearest
-    /// site to this coordinate is `TOKC`, which has no Level II data.
+    /// site to this coordinate is `TOKC`, whose Level II volumes the archive
+    /// does carry — it is excluded for being a terminal radar, not for being
+    /// absent.
     #[test]
     fn oklahoma_city_resolves_to_ktlx() {
         let (site, dist) = nearest_wsr88d_site(35.4676, -97.5164).expect("a finite coordinate");
