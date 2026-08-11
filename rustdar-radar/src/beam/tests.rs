@@ -358,8 +358,8 @@ fn the_ground_range_height_is_the_slant_range_height_over_the_same_point() {
         worst_height.2,
     );
 
-    // The `cos e` the plan view omits, at the two tilts the divergence is
-    // quoted at: 0.2 km at 2.4° and 4.0 km at 19.5°.
+    // The `cos e` every renderer here now applies, at the two tilts the
+    // module doc quotes it at: 0.2 km at 2.4° and 4.0 km at 19.5°.
     let at_low = 230.0 - ground_range_km(230.0, 2.4);
     let at_high = 70.0 - ground_range_km(70.0, 19.5);
     assert!(

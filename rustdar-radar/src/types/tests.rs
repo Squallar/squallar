@@ -7,7 +7,7 @@ use nexrad_model::data::{PulseWidth, Scan, VolumeCoveragePattern};
 /// catch: the audit that prompted this changed the wasm literal from 1024 to
 /// 4096 on a pristine tree and the whole workspace passed 1508/0 with the
 /// wasm `cargo check` exiting 0. `sampler.rs`'s
-/// `the_cos_e_correction_diverges_from_the_plan_view_by_a_measured_amount`
+/// `the_cos_e_correction_is_worth_a_measured_number_of_pixels`
 /// looks like it covers this and does not — its `if cfg!(…)` picks the
 /// running target's literal, so the other one is dead text.
 ///
