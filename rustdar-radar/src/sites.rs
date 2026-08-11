@@ -2134,12 +2134,22 @@ pub fn resolve<'a, I>(learned: I) -> &'static SiteTable
 where
     I: IntoIterator<Item = (&'a str, SitePosition)>,
 {
-    let current = table();
-    let Some(extended) = extended(current, learned) else {
-        return current;
-    };
-    *RESOLVED.write().unwrap_or_else(|e| e.into_inner()) = Some(extended);
-    extended
+    // The write lock is held across the read *and* the build, not just the
+    // store. Reading the current table, extending it and then storing it as
+    // three steps is a lost update: two resolutions that start from the same
+    // table each produce one that lacks the other's radars, and whichever
+    // stores second silently discards the first. A test caught this doing
+    // exactly that. Building under the lock costs a startup a few
+    // microseconds it has.
+    let mut resolved = RESOLVED.write().unwrap_or_else(|e| e.into_inner());
+    let current = resolved.unwrap_or_else(seed_table);
+    match extended(current, learned) {
+        Some(extended) => {
+            *resolved = Some(extended);
+            extended
+        }
+        None => current,
+    }
 }
 
 /// Every radar this process knows about.
