@@ -493,18 +493,38 @@ fn the_step_count_is_a_constant_the_loop_bound_names() {
 ///   about which of the two numbers is the promise. Under the `Rg8Unorm`
 ///   this format replaced the same bound was 4 index units, worst on the
 ///   sparse blocks, and it broke the hull outright below index 4.
+///
 /// * The block that is averaged is the one under the coarse cell —
 ///   checked with a value planted in a *different* block, which is what a
 ///   transposed dimension order pushes into the wrong coarse cell.
 /// * An all-empty block stays `(0, 0)`: no data, and zero coverage, which
 ///   is what keeps the shader's floored divisor from inventing an index.
+///
+/// # Every number here is the contract's, not the implementation's
+///
+/// `downsampled_grid` sums the grid's own index bytes as integers, where it
+/// used to sum eight already-rounded binary16 channels out of the widened
+/// level-0 plane. That is a different sequence of roundings, so an assertion
+/// pinning what one of them happened to emit would fail on the other while
+/// both were correct. Nothing here does: the reconstructed index is checked
+/// against the true mean of the block's measured cells to the stated
+/// tolerance, and the equalities that *are* exact — the coverage channel's
+/// `n/8`, an all-empty block's zeros, and a lone 255's eighth of full scale —
+/// are exact because binary16 represents them exactly, under either summing
+/// order.
+///
+/// The bound sweep goes through `downsampled_grid` itself, on a 2x2x2 grid —
+/// one coarse block, which is what the bound is about. It used to model the
+/// arithmetic inline instead, and a model can be right about a function that
+/// is wrong: the path this replaced summed eight *already rounded* channels,
+/// so what it really stored was `half(Σ half(x_i) / 8)` and it exceeded this
+/// very tolerance (0.142 index units against a 0.124 budget, measured over a
+/// desktop-shaped random plane) while the sweep beside it passed. Driving the
+/// production function over every reachable `(n, Σx)` closes that gap: with
+/// integer sums the block is fully described by those two numbers, so 16,320
+/// cases is not a sample.
 #[test]
 fn the_grid_mip_is_the_mean_of_each_coarse_blocks_measured_cells() {
-    /// The grid's own index plane, widened the way `upload_volume` widens
-    /// it — through the production function, so this cannot drift from it.
-    fn premultiplied(indices: &[u8]) -> Vec<u8> {
-        super::coverage_premultiplied(indices)
-    }
     /// One texel of a packed plane, as `(R, G)`, through the production
     /// decoder — so a channel-order or stride error shows up here too.
     fn texel(plane: &[u8], at: usize) -> (f32, f32) {
@@ -528,7 +548,7 @@ fn the_grid_mip_is_the_mean_of_each_coarse_blocks_measured_cells() {
 
     // Uniform control — every cell covered, so the coarse level is the same
     // value at full coverage.
-    let (coarse, bytes) = downsampled_grid([4, 4, 2], &premultiplied(&[7u8; 32]));
+    let (coarse, bytes) = downsampled_grid([4, 4, 2], &[7u8; 32]);
     assert_eq!(coarse, [2, 2, 1]);
     assert_eq!(bytes.len(), 4 * GRID_BYTES_PER_CELL as usize);
     for at in 0..4 {
@@ -543,7 +563,7 @@ fn the_grid_mip_is_the_mean_of_each_coarse_blocks_measured_cells() {
 
     // The all-empty block: no data and no coverage. Nothing divides by zero
     // here or in the shader, whose divisor is floored.
-    let (_, bytes) = downsampled_grid([4, 4, 2], &premultiplied(&[0u8; 32]));
+    let (_, bytes) = downsampled_grid([4, 4, 2], &[0u8; 32]);
     assert_eq!(
         bytes,
         vec![0u8; 4 * GRID_BYTES_PER_CELL as usize],
@@ -555,7 +575,7 @@ fn the_grid_mip_is_the_mean_of_each_coarse_blocks_measured_cells() {
     // coarse block (0,0,0) and nowhere else, and it keeps its own value.
     let mut fine = vec![0u8; 32];
     fine[0] = 255;
-    let (_, bytes) = downsampled_grid([4, 4, 2], &premultiplied(&fine));
+    let (_, bytes) = downsampled_grid([4, 4, 2], &fine);
     assert_eq!(
         texel(&bytes, 0),
         (0.125, 0.125),
@@ -581,7 +601,7 @@ fn the_grid_mip_is_the_mean_of_each_coarse_blocks_measured_cells() {
     let mut fine = vec![0u8; 32];
     fine[0] = 100;
     fine[1] = 105;
-    let (_, bytes) = downsampled_grid([4, 4, 2], &premultiplied(&fine));
+    let (_, bytes) = downsampled_grid([4, 4, 2], &fine);
     assert_eq!(texel(&bytes, 0).1, 0.25, "two of eight cells are covered");
     let index = reconstructed(&bytes, 0).expect("the block is covered");
     assert!(
@@ -590,17 +610,28 @@ fn the_grid_mip_is_the_mean_of_each_coarse_blocks_measured_cells() {
          mean of 102.5 (got {index}), not the full-cube 25.6",
     );
 
-    // The bound itself, over every reachable block: what the shader really
-    // divides, against the true occupancy mean.
+    // The bound itself, over every reachable block, THROUGH `downsampled_grid`:
+    // what the shader really divides, against the true occupancy mean. A coarse
+    // block is `n` measured cells summing to `sum`, and integer summing makes
+    // those two numbers all of it — how the sum is spread over the cells cannot
+    // change the answer — so this sweep is exhaustive rather than sampled.
     let mut worst = 0.0f32;
     let mut worst_at = (0u32, 0u32);
     for n in 1..=8u32 {
-        for sum in 0..=255 * n {
-            let plane = [
-                half::f16::from_f32(sum as f32 / 255.0 / 8.0),
-                half::f16::from_f32(n as f32 / 8.0),
-            ];
-            let error = plane[0].to_f32() / plane[1].to_f32() * 255.0 - sum as f32 / n as f32;
+        // Below `n` is unreachable: a measured cell is `1..=255`, never 0.
+        for sum in n..=255 * n {
+            // `sum` spread as evenly as it goes, which keeps every cell inside
+            // `1..=255` for every reachable pair.
+            let (quotient, remainder) = (sum / n, sum % n);
+            let mut fine = [0u8; 8];
+            for (cell, slot) in fine.iter_mut().take(n as usize).enumerate() {
+                *slot = (quotient + u32::from((cell as u32) < remainder)) as u8;
+            }
+            let (coarse, bytes) = downsampled_grid([2, 2, 2], &fine);
+            assert_eq!(coarse, [1, 1, 1]);
+            let (r, g) = texel(&bytes, 0);
+            assert_eq!(g, n as f32 / 8.0, "the coverage channel is exact in f16");
+            let error = r / g * 255.0 - sum as f32 / n as f32;
             if error.abs() > worst {
                 worst = error.abs();
                 worst_at = (n, sum);
@@ -634,7 +665,7 @@ fn the_grid_mip_is_the_mean_of_each_coarse_blocks_measured_cells() {
             }
         }
     }
-    let (_, bytes) = downsampled_grid([4, 4, 2], &premultiplied(&fine));
+    let (_, bytes) = downsampled_grid([4, 4, 2], &fine);
     for at in 0..4 {
         let covered = at == 1;
         assert_eq!(
@@ -653,7 +684,7 @@ fn the_grid_mip_is_the_mean_of_each_coarse_blocks_measured_cells() {
     // Odd extents follow wgpu's mip arithmetic: max(n / 2, 1). The clamp
     // counts a fine cell more than once — in BOTH channels, so the ratio,
     // and with it the reconstructed index, is untouched.
-    let (coarse, bytes) = downsampled_grid([3, 3, 3], &premultiplied(&[9u8; 27]));
+    let (coarse, bytes) = downsampled_grid([3, 3, 3], &[9u8; 27]);
     assert_eq!(coarse, [1, 1, 1]);
     assert_eq!(bytes.len(), GRID_BYTES_PER_CELL as usize);
     assert_eq!(texel(&bytes, 0).1, 1.0);
