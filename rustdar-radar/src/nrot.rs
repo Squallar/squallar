@@ -221,7 +221,14 @@ fn preprocess_velocity_with(
 const PROFILE_LAYER_KM: f64 = 0.3;
 /// Layers span 0..12 km AGL.
 const PROFILE_LAYERS: usize = 40;
-/// Sample cap per layer keeps memory bounded on wasm.
+/// Sample cap per layer keeps memory bounded on wasm. A volume offers far
+/// more than this: KCRP 2017-08-26 04:41:14 has 326 657 gates to give the
+/// twenty layers under 6 km, and its lowest layer alone is offered more than
+/// the cap within the first two of its fifteen cuts.
+///
+/// So *which* samples the cap keeps is a question about the fit, not only
+/// about memory, and [`WindProfileBuilder::offer`] answers it by thinning
+/// rather than by stopping. See there for what stopping cost.
 const PROFILE_MAX_SAMPLES: usize = 16384;
 
 /// Horizontal wind fitted per height layer from every velocity tilt of a
@@ -357,13 +364,76 @@ fn height_km_with_sin_el(range_km: f64, sin_el: f64) -> f64 {
 /// reads off the pane.
 #[derive(Default)]
 pub struct WindProfileBuilder {
-    samples: Vec<Vec<(f64, f64, f64)>>, // (sin·cosθ, cos·cosθ, vr) per layer
+    samples: Vec<Layer>,
+}
+
+/// One height layer's accumulated VAD samples, thinned to
+/// [`PROFILE_MAX_SAMPLES`] as they arrive.
+struct Layer {
+    /// (sin·cosθ, cos·cosθ, vr).
+    pts: Vec<(f64, f64, f64)>,
+    /// Samples offered so far, counted so `stride` can be applied to them.
+    offered: usize,
+    /// One offer in this many is kept. Doubles each time the layer fills.
+    stride: usize,
+}
+
+impl Default for Layer {
+    fn default() -> Self {
+        Self {
+            pts: Vec::new(),
+            offered: 0,
+            stride: 1,
+        }
+    }
 }
 
 impl WindProfileBuilder {
     pub fn new() -> Self {
         Self {
-            samples: (0..PROFILE_LAYERS).map(|_| Vec::new()).collect(),
+            samples: (0..PROFILE_LAYERS).map(|_| Layer::default()).collect(),
+        }
+    }
+
+    /// Hand one sample to a layer, keeping one offer in `stride` and halving
+    /// the layer whenever it fills.
+    ///
+    /// # Why not simply stop at the cap
+    ///
+    /// A layer fills in the order the volume is walked — cut by cut, row by
+    /// row — so stopping keeps a *prefix*, and a prefix of a sweep is an arc.
+    /// KCRP 2017-08-26 04:41:14 filled its 0.15 km layer partway through the
+    /// second of fifteen cuts: the samples that layer was fitted from spanned
+    /// 237.5° of azimuth with a 122.5° hole in them, 0.45 km spanned 282.5°
+    /// and 0.75 km 315.5°. Those three are the layers the Bunkers 0–0.5 km
+    /// head band and a sixth of its 0–6 km mean wind are read from.
+    ///
+    /// An arc still determines a VAD fit, so this was a conditioning cost
+    /// rather than a wrong answer, and it is worth the size it is and no more.
+    /// Against the same fit with the cap lifted altogether, the shipped
+    /// right-mover moved 5.4 kt and 6.4° on KMSX 2022-06-04 20:05:58, 3.9 kt
+    /// and 7.0° on that KCRP volume, and 2.1 kt and 0.9° on KDMX
+    /// 2022-03-05 23:23:24 — a tenth of the rotation error the same three
+    /// layers carried while the fit read row index, and still a vector a user
+    /// reads.
+    ///
+    /// Thinning costs one halving per doubling of the offer count — four or
+    /// five per layer for a super-res volume — and leaves the layer holding a
+    /// uniform one-in-`stride` sample of the *whole* volume, so its azimuth
+    /// coverage is the volume's. `offered` deliberately keeps counting across
+    /// a halving: the kept samples sit at offers 0, 2·stride, 4·stride…, which
+    /// is exactly the progression the doubled stride continues.
+    fn offer(&mut self, l: usize, sample: (f64, f64, f64)) {
+        let layer = &mut self.samples[l];
+        let keep = layer.offered.is_multiple_of(layer.stride);
+        layer.offered += 1;
+        if !keep {
+            return;
+        }
+        layer.pts.push(sample);
+        if layer.pts.len() == PROFILE_MAX_SAMPLES {
+            layer.pts = layer.pts.iter().step_by(2).copied().collect();
+            layer.stride *= 2;
         }
     }
 
@@ -386,8 +456,8 @@ impl WindProfileBuilder {
                 let r = sweep.first_gate_range_km + j as f64 * sweep.gate_interval_km;
                 let h = height_km_with_sin_el(r, sin_el);
                 let l = (h / PROFILE_LAYER_KM) as usize;
-                if l < PROFILE_LAYERS && self.samples[l].len() < PROFILE_MAX_SAMPLES {
-                    self.samples[l].push((s, c, *v));
+                if l < PROFILE_LAYERS {
+                    self.offer(l, (s, c, *v));
                 }
             }
         }
@@ -398,7 +468,8 @@ impl WindProfileBuilder {
         let layers = self
             .samples
             .iter()
-            .map(|pts| {
+            .map(|layer| {
+                let pts = &layer.pts;
                 let mut fit: Option<(f64, f64, f64)> = None;
                 for _ in 0..2 {
                     let mut m = [[0.0f64; 3]; 3];
@@ -2675,6 +2746,62 @@ mod tests {
             wind,
             1e-6,
             "four cuts pooled",
+        );
+    }
+
+    /// A layer offered more than it can hold is fitted from all of it, thinned
+    /// — not from the first of it.
+    ///
+    /// Two cuts of identical geometry, one carrying a 10 m/s westerly and one
+    /// a 10 m/s southerly. Least squares over two stacked copies of one design
+    /// is the mean of what each copy asks for, so the layer's answer is
+    /// (5, 5) — a 14 m/s wind from 225° — and each cut on its own would say
+    /// (10, 0) or (0, 10). Each cut offers this layer 69 120 samples against a
+    /// [`PROFILE_MAX_SAMPLES`] of 16 384 — the pair thin to 8640 at a stride
+    /// of 16 — so a layer that stopped at the cap would hold nothing but the
+    /// first cut's opening rows and answer (10, 0).
+    #[test]
+    fn a_layer_offered_more_than_it_holds_is_fitted_from_the_whole_volume() {
+        // 700 gates 50 m apart reach 35 km, which at 0.5° is still inside the
+        // second layer: nearly every sample lands in the 0–0.3 km one.
+        let cut = |(u, v): (f64, f64)| -> (Vec<Vec<f64>>, Vec<f64>) {
+            let azimuths: Vec<f64> = (0..360).map(|i| i as f64).collect();
+            let cos_el = 0.5f64.to_radians().cos();
+            let grid = azimuths
+                .iter()
+                .map(|a| {
+                    let r = a.to_radians();
+                    vec![(u * r.sin() + v * r.cos()) * cos_el; 700]
+                })
+                .collect();
+            (grid, azimuths)
+        };
+        let mut builder = WindProfileBuilder::new();
+        for wind in [(10.0, 0.0), (0.0, 10.0)] {
+            let (grid, azimuths) = cut(wind);
+            builder.add_sweep(
+                &VelocitySweep {
+                    vel_grid: &grid,
+                    azimuths_deg: &azimuths,
+                    gate_count: 700,
+                    first_gate_range_km: 0.05,
+                    gate_interval_km: 0.05,
+                },
+                0.5,
+            );
+        }
+        let (u, v) = builder
+            .finish()
+            .expect("two oversubscribed cuts fit")
+            .wind_at_km(0.15)
+            .expect("the 0–0.3 km layer is the one they filled");
+        // The thinned set is an arithmetic progression over both cuts' offers,
+        // so the two are represented to within one sample of each other; the
+        // slack here is that one sample and the round-off of nine thousand
+        // normal-equation terms.
+        assert!(
+            (u - 5.0).abs() < 0.01 && (v - 5.0).abs() < 0.01,
+            "the layer fitted ({u:.4}, {v:.4}), not the (5, 5) both cuts average to",
         );
     }
 
