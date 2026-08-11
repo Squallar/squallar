@@ -90,13 +90,62 @@
 //!
 //! Today the browser takes the floor, which is the right number for a phone and
 //! a conservative one for a workstation. Raising the workstation browser needs a
-//! signal that is not `AdapterInfo`: `navigator.deviceMemory` (Chromium only,
-//! capped at 8 GiB, absent in Safari and Firefox),
-//! `navigator.userAgentData.mobile`, `matchMedia('(pointer: coarse)')`, or the
-//! screen-area heuristic. All of them are *browser* facts, so they arrive
-//! through `rustdar-web` and the platform bridge rather than through wgpu, and
-//! all of them feed this same [`LoopPool::for_device`] seam. Nothing else has to
-//! change when they do — which is the point of the seam.
+//! signal that is not `AdapterInfo`, and the shortlist is shorter than it looks:
+//!
+//! * **`matchMedia('(pointer: coarse)')` with `(any-pointer: fine)`** is the
+//!   only device-class signal stock Chromium, Safari and Firefox all implement
+//!   unclamped, Baseline since 2018. A handheld is coarse-and-not-also-fine; a
+//!   touchscreen laptop is both, which is exactly the case a naive `coarse` test
+//!   gets wrong. `navigator.maxTouchPoints` is the tiebreak — WebKit hard-codes
+//!   5 on iOS/iPadOS and 0 on macOS.
+//! * **Screen area is not a class signal**, however tempting. Phones run a
+//!   device pixel ratio of 3, so their physical pixel counts *exceed* a
+//!   workstation's: 1080p desktop 2.07 Mpx, Pixel 10 2.62, iPhone 16 Pro Max
+//!   3.79. Ranking by pixels puts a flagship phone above a laptop with an 8 GiB
+//!   discrete GPU behind it. It is a good *rendering-cost* term and a bad
+//!   classifier, and the distinction is the whole reason to say so here.
+//! * **`navigator.deviceMemory` refines only on Chromium.** WebKit filed a
+//!   formal oppose position in April 2026, so it will never exist in Safari, and
+//!   Chrome 147 recut the buckets to `{1,2,4,8}` on Android — a 16 GiB flagship
+//!   and an 8 GiB midrange are now the same value. `hardwareConcurrency` is
+//!   worse: Safari's is a two-valued function of 4 or 8, and returns a
+//!   pseudorandom 1..63 to a tracker-classified script under the fingerprinting
+//!   protection that is on by default from iOS 26.
+//!
+//! All of these are *browser* facts, so they would arrive through `rustdar-web`
+//! and the platform bridge rather than through wgpu, and all of them feed this
+//! same [`LoopPool::for_device`] seam. Nothing else has to change when they do —
+//! which is the point of the seam.
+//!
+//! And every one of them is spoofable in a line of JavaScript, so none is a
+//! bound. **The learn-from-failure path is the real backstop**, which is what
+//! [`LoopPool::back_off`] and the memo below are for.
+//!
+//! # The case no signal can see, which is why the memo matters
+//!
+//! An **installed iOS Home Screen PWA** is the tightest thing this application
+//! ships, and an iPhone in Safari and the same iPhone in a Home Screen PWA are
+//! identical to every signal above.
+//!
+//! It really is a different process: WebKit checks
+//! `applicationBundleIsEqualTo("com.apple.webapp")`, and auxiliary processes are
+//! namespaced to the host bundle, so a PWA gets its own WebContent, Networking
+//! and GPU processes rather than sharing Safari's. The background lifecycle is
+//! unchanged at HEAD and is harsher than a desktop's by construction —
+//! background process assertions time out after 30 s on iOS and not at all on
+//! macOS, suspension follows at 20 s, all assertions are dropped at 4 minutes,
+//! and `BoostedJetsam` is taken only under `PLATFORM(MAC)`. WebKit's own
+//! statement in May 2026 is that nothing in iOS 26 changed memory accounting or
+//! budgets for WebKit, and jetsam kills are still being filed against an
+//! iPhone 17 Pro.
+//!
+//! What is **not** established either way is whether a PWA's *memory limit*
+//! differs from a Safari tab's — no primary source says so, and the widely
+//! repeated ~200 MB figure appears in none. The figure that is sourced is
+//! WebKit's own: ~1.5 GB for `WebContent` on most iPhones. The 48 MiB floor is
+//! 3 % of that, which is the margin this arm is entitled to given that it cannot
+//! measure, cannot predict, and cannot recover without taking every other tab
+//! with it.
 //!
 //! # Behaviour is the fallback where nothing can be queried
 //!
