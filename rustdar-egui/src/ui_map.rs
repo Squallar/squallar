@@ -1,6 +1,5 @@
 use super::map_overlays::draw_tile_layer;
 use crate::actions::GuiAction;
-use crate::pane::PaneKind;
 use rustdar_overlays::render::overlay_state::OverlayKind;
 use rustdar_radar::beam;
 use rustdar_radar::types::{IMAGE_SIZE, RadarProduct, RenderView};
@@ -34,6 +33,35 @@ pub(crate) const VOLUME_EMPTY_STATE: &str = "3D volume view unavailable";
 /// same shape as [`super::SECTION_SIDEBAR_HEADER`] and the overlay rows'
 /// labels, which is what keeps the block reading as part of the one panel.
 pub(crate) const VOLUME_SIDEBAR_HEADER: &str = "\u{26f6}  3D view";
+
+/// The Map floor checkbox's label.
+///
+/// Named here so the row, the note that appears beneath it and the tests that
+/// pin both read the same string — a renamed checkbox with a note still
+/// pointing at the old wording is exactly the drift a literal would allow.
+pub(crate) const MAP_FLOOR_LABEL: &str = "Map floor";
+
+/// What the sidebar says when the Map floor checkbox cannot produce anything.
+/// The pane's own reason for drawing nothing follows it.
+///
+/// The floor is not a layer drawn beside the volume; it is drawn *by* the
+/// raymarch, inside the paint callback a 3D pane pushes only when it has a
+/// picture. So a pane that is explaining itself instead of drawing has no floor
+/// whatever this checkbox says — and a checkbox that silently does nothing is
+/// the quietest kind of broken control there is.
+pub(crate) const MAP_FLOOR_INERT_NOTE: &str =
+    "No floor yet - nothing is being drawn to stand it under:";
+
+/// The headline of a pane's empty-state reason: everything up to the first
+/// line break, trimmed.
+///
+/// The reasons are paragraphs — a headline and then the detail, separated by a
+/// blank line, laid out across the pane. The sidebar is a narrow column beside
+/// that pane and is quoting the reason to *identify* it, not to re-explain it:
+/// the whole paragraph is already on screen a few hundred points away.
+fn reason_headline(reason: &str) -> &str {
+    reason.lines().next().unwrap_or(reason).trim()
+}
 
 impl super::Gui {
     /// Draw every visible pane, whatever kind each one is.
@@ -193,6 +221,14 @@ impl super::Gui {
                 self.map_pane_geo
                     .retain(|&idx, _| floors.get(idx).copied().unwrap_or(false));
 
+                // The per-frame record of what each 3D arm drew, emptied here
+                // for the same reason and at the same point: this is the last
+                // moment in the frame at which the sidebar's read (the shell
+                // pass, which has already run) is of the *completed* previous
+                // frame. Emptied rather than pruned, because the entries are
+                // this frame's arms and every one of them is about to run.
+                self.volume_empty_states.clear();
+
                 // Where each of those panes draws its own map, and how far
                 // below the frame the mirror therefore has to reach. Resolved
                 // before the loop because the mirror is **one** texture for the
@@ -282,15 +318,23 @@ impl super::Gui {
                     // would make every line drawn on a phone also a zoom or a
                     // value tooltip.
                     //
-                    // Only a map pane: the line is aimed with a projector, and a
-                    // section or volume pane has none. Arming the mode with one
-                    // of those active therefore leaves it exactly as it was,
-                    // and the press that picks a map pane out of the layout is
-                    // the same press that starts the line — `detect_active_pane_click`
-                    // runs at the top of this frame.
-                    let armed_draw = self.section_draw_armed()
-                        && is_active
-                        && matches!(pane.kind(), PaneKind::Map);
+                    // Only a **plan view**: the line is aimed with a projector,
+                    // and the projector only exists inside the `Map::show` the
+                    // plan-view arm below runs on the pane's own rect. Arming
+                    // the mode with a section or a 3D pane active therefore
+                    // leaves it exactly as it was, and the press that picks a
+                    // plan-view pane out of the layout is the same press that
+                    // starts the line — `detect_active_pane_click` runs at the
+                    // top of this frame.
+                    //
+                    // [`PaneState::is_map`], not the pane's *kind*: a 3D pane's
+                    // kind is `Map` — the 3D view is a render mode of a map
+                    // pane, and only its `RenderView` differs. Asking the kind
+                    // here handed the armed resolver a pane with no projector,
+                    // which suppresses its pan and eats its click for a line
+                    // that can never be drawn. See the fade gate below, which
+                    // is the same question and was the same defect.
+                    let armed_draw = self.section_draw_armed() && is_active && pane.is_map();
                     let (pointer, gesture) = if armed_draw {
                         let armed = self.interaction.resolve_armed(&ctx, modality);
                         (armed.pointer(), Some(armed.gesture()))
@@ -366,12 +410,25 @@ impl super::Gui {
                     // click is inside this pane, no section-handle gesture
                     // owns it, no feature popup was up to be dismissed by it
                     // (`pointer_available`), and no dialog outranks it.
-                    // Map panes only: the fade is a gesture on the *map*
-                    // (§1.8's wording), and a click on a 3D or section pane
-                    // is that pane's own business.
+                    //
+                    // **Plan views only**, and asked through
+                    // [`PaneState::is_map`] rather than through the pane's
+                    // *kind*: the fade is a gesture on the flat map (§1.8's
+                    // wording), and a click on a 3D or section pane is that
+                    // pane's own business. A 3D pane's kind is `Map` — 3D is a
+                    // render mode of a map pane, and only its `RenderView`
+                    // differs — so `matches!(pane.kind(), PaneKind::Map)` here
+                    // handed the fade every click on a 3D pane, the Volume
+                    // Alpha corner button's included. The button won the
+                    // pointer and opened the editor exactly as it should; the
+                    // fade is resolved after the pane loop, and
+                    // `Gui::fade_close_all` shut the editor again in the same
+                    // frame, so the control read as dead while the chrome
+                    // vanished. `is_map` is the question about the *picture*,
+                    // which is the thing that actually differs.
                     if is_active
                         && pointer_available
-                        && matches!(pane.kind(), PaneKind::Map)
+                        && pane.is_map()
                         && !section_editing
                         && !handle_press
                         && self.fade_gesture_allowed()
@@ -677,6 +734,14 @@ impl super::Gui {
                                 #[cfg(test)]
                                 &mut self.last_alpha_buttons,
                             );
+                            // What this pane actually drew, for the sidebar that
+                            // has to explain it — see `Gui::volume_empty_states`.
+                            // An arm that painted a picture leaves no entry, and
+                            // the map was emptied before the loop, so absence is
+                            // the positive answer rather than a stale one.
+                            if let Some(why) = outcome.clone() {
+                                self.volume_empty_states.insert(pane_idx, why);
+                            }
                             #[cfg(test)]
                             self.last_volume_arms
                                 .push(VolumeArmProbe { pane_idx, outcome });
@@ -1975,11 +2040,23 @@ fn volume_pane_outcome(
 /// A free function rather than a `Gui` method because it touches nothing but the
 /// pane it is handed — and the pane it is handed is the one the caller
 /// `mem::take`n, which is the only correct thing to read during the UI pass.
+///
+/// # Why it is told the pane drew nothing
+///
+/// `drawing_nothing` is the arm's own empty-state reason for this pane, or
+/// `None` for a pane that painted a volume — [`super::Gui::volume_empty_states`].
+/// The floor is drawn *by the raymarch*, inside the callback an empty state
+/// means was never pushed, so in every one of those states the Map floor
+/// checkbox is a control that produces nothing. It stays tickable — the
+/// preference is real and persisted, and a user waiting for the first volume
+/// may legitimately set it now — and it says so, which is the half that was
+/// missing.
 pub(crate) fn render_volume_controls(
     ui: &mut egui::Ui,
     pane: &mut crate::pane::PaneState,
     iso_thresholds: &mut crate::volume_iso::IsoThresholds,
     alpha_curves: &crate::volume_alpha::AlphaCurves,
+    drawing_nothing: Option<&str>,
 ) {
     let product = pane.selected_product;
     let Some(volume) = pane.volume_mut() else {
@@ -2078,18 +2155,34 @@ pub(crate) fn render_volume_controls(
         // for why the stored form is the negation.
         let mut show_floor = !volume.hide_floor;
         if ui
-            .checkbox(&mut show_floor, "Map floor")
+            .checkbox(&mut show_floor, MAP_FLOOR_LABEL)
             .on_hover_text(
                 "Draws the ground under the volume: the basemap, SPC outlooks, the base \
                  reflectivity as the 2D map shows it, the range ring, mesoscale discussion, \
                  warning and watch polygons, and city labels, registered to the box. \
                  Warnings and discussions refresh on the floor as they issue and expire. \
                  Always the full composition - the map panes' layer toggles do not apply to \
-                 it, the same way they do not apply to this pane's volume.",
+                 it, the same way they do not apply to this pane's volume. It is drawn by \
+                 the volume's own render, so it appears when the volume does and not before.",
             )
             .changed()
         {
             volume.hide_floor = !show_floor;
+        }
+        // The honest word about a control that is currently producing nothing.
+        // The floor rides the raymarch callback, so a pane explaining itself
+        // instead of drawing has no floor either, whatever this box says — and
+        // silently doing nothing is how a checkbox comes to read as broken. It
+        // stays tickable because the preference is durable and takes effect the
+        // moment the picture arrives; the pane's own reason is quoted rather
+        // than paraphrased, so the sidebar and the pane cannot say two
+        // different things.
+        if let Some(why) = drawing_nothing {
+            ui.label(
+                egui::RichText::new(format!("{MAP_FLOOR_INERT_NOTE} {}", reason_headline(why)))
+                    .small()
+                    .weak(),
+            );
         }
 
         if ui

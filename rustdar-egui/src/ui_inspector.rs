@@ -470,7 +470,18 @@ impl super::Gui {
                 self.render_section_controls(ui, pane);
             }
             rustdar_radar::types::RenderView::Volume => {
-                map::render_volume_controls(ui, pane, &mut self.volume_iso, &self.volume_alpha);
+                // Why this pane drew nothing last frame, if it did — see
+                // `Gui::volume_empty_states`. The active pane's, because this
+                // whole body is the active pane's properties; `pane` itself is
+                // the value taken out of that slot and cannot be asked.
+                let drawing_nothing = self.volume_empty_states.get(&self.active_pane).cloned();
+                map::render_volume_controls(
+                    ui,
+                    pane,
+                    &mut self.volume_iso,
+                    &self.volume_alpha,
+                    drawing_nothing.as_deref(),
+                );
             }
         });
     }

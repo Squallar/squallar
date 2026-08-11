@@ -12515,6 +12515,108 @@ fn the_fade_hides_the_volume_alpha_button_and_restores_it() {
     );
 }
 
+/// M8-11b. **A click on the Volume Alpha button is the button's click, and a
+/// click on a 3D pane is never the fade gesture.**
+///
+/// The regression the 3D-as-a-render-mode collapse landed: the fade gate asked
+/// `matches!(pane.kind(), PaneKind::Map)`, and a 3D pane's *kind* is `Map` now —
+/// only its [`RenderView`] differs. So every click on an already-active 3D pane
+/// qualified as the bare-map fade gesture, the corner button's included. The
+/// button did win the pointer and did toggle the editor open; the fade verdict
+/// is resolved after the pane loop, and `fade_close_all` shut the editor again
+/// in the same frame. What the user saw was a dead button that hid the UI —
+/// "clicking volume alpha no longer works, it fades the ui like I clicked the
+/// map".
+///
+/// **Both halves are asserted, and both are load-bearing.** The editor being
+/// open is the evidence the click reached the *button*; the UI not being faded
+/// is the evidence it did not also reach the *pane*. Either alone passes for
+/// the wrong reason — the fade half alone passes with no button drawn at all,
+/// and the editor half alone passes while the chrome vanishes underneath it.
+/// The bare-map leg at the end holds the gate open the other way, so the fix
+/// cannot be "nothing fades any more".
+#[test]
+fn the_volume_alpha_button_takes_the_click_the_pane_would_have_faded_on() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.set_pane_count(2);
+    h.make_pane_volume(1);
+
+    let editor_open = |h: &mut InputHarness| {
+        h.gui_mut()
+            .pane(1)
+            .expect("pane 1 exists")
+            .volume()
+            .expect("pane 1 is a 3D pane")
+            .alpha_editor_open
+    };
+
+    // The 3D pane has to be the *already-active* one before the button is
+    // pressed. A press that switches panes is excluded from the fade gesture by
+    // `press_switched_pane`, so a test that clicks the button on an inactive
+    // pane is shielded from this bug by an unrelated rule — which is exactly
+    // why the two tests above stayed green through it.
+    h.mouse_click(h.pane_rects()[1].center());
+    h.warm_up();
+    assert_eq!(
+        h.active_pane_index(),
+        1,
+        "precondition: the first click activates the 3D pane"
+    );
+    assert!(
+        !h.faded(),
+        "precondition: the activating click never fades (§1.8)"
+    );
+    assert!(!editor_open(&mut h), "precondition: the editor starts shut");
+
+    // The corner button, on that already-active pane — the user's own gesture.
+    let button = h
+        .alpha_buttons()
+        .into_iter()
+        .find(|&(idx, _)| idx == 1)
+        .expect("precondition: the 3D pane draws its Volume alpha corner button")
+        .1;
+    h.mouse_click(button.center());
+    h.warm_up();
+    assert!(
+        editor_open(&mut h),
+        "the click never reached the Volume Alpha button - the editor did not open"
+    );
+    assert!(
+        !h.faded(),
+        "the click also reached the pane underneath: it hid the UI like a bare-map tap"
+    );
+
+    // And the pane's bare surface, which is the same gesture with no button
+    // under it: the position that *would* be the fade tap on a map pane. A 3D
+    // pane's click is that pane's own business — it orbits — so it must not
+    // hide the chrome either.
+    h.gui_mut()
+        .pane_mut(1)
+        .expect("pane 1 exists")
+        .volume_mut()
+        .expect("pane 1 is a 3D pane")
+        .alpha_editor_open = false;
+    h.mouse_click(h.pane_rects()[1].center());
+    h.warm_up();
+    assert!(
+        !h.faded(),
+        "a click on a 3D pane is the pane's own gesture, not the map fade"
+    );
+
+    // The gate is still open where it belongs: the same double click on the
+    // plan-view pane beside it still fades, so this is a 3D pane's exemption
+    // and not the fade gesture being switched off.
+    let map_spot = h.pane_rects()[0].center();
+    h.mouse_click(map_spot);
+    h.warm_up();
+    h.mouse_click(map_spot);
+    h.warm_up();
+    assert!(
+        h.faded(),
+        "the map pane's bare-surface tap must still fade the UI"
+    );
+}
+
 /// M8-12. **The active-pane border shows all four edges at every grid
 /// position.** The stroke paints inside the pane rect, inside the map's
 /// content rect — with the outside stroke it shipped with, the outer edges

@@ -1615,3 +1615,162 @@ fn a_3d_panes_box_follows_its_own_viewport() {
          not tracking the viewport, it is being nudged by something else",
     );
 }
+
+/// The Map floor checkbox says so when it cannot draw a floor.
+///
+/// The floor is not a layer drawn beside the volume — it is drawn *by* the
+/// raymarch, inside the paint callback a 3D pane pushes only when it has a
+/// picture. So in every state where the arm explains itself instead of drawing
+/// (no painter, no published volume, a product with no vertical structure, a
+/// grid still building) the checkbox is a control that produces nothing, and
+/// until now it produced nothing in silence. It stays tickable — the preference
+/// is durable and takes effect the moment a picture arrives — and it now says
+/// why, quoting the pane's own reason rather than a second wording of it.
+///
+/// **Both halves, and both are what make this able to fail.** The note must be
+/// absent while the pane is drawing, or a note nailed permanently under the row
+/// would pass; and it must be present when the pane is not, or deleting the
+/// note entirely would pass. The `Map floor` anchor is checked in both states so
+/// neither half can pass by the whole block being off screen.
+#[test]
+fn the_map_floor_checkbox_says_when_there_is_no_floor_to_draw() {
+    let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
+
+    // The 3D pane is the one whose properties the sidebar is about. Activated
+    // by a click on the pane itself, which is the user's own route — and which
+    // must not fade the chrome away underneath the panel we are about to read.
+    h.mouse_click(h.pane_rects()[1].center());
+    h.warm_up();
+    assert_eq!(
+        h.active_pane_index(),
+        1,
+        "the 3D pane must be the active one"
+    );
+    h.open_pane_props();
+
+    let inspector = |h: &InputHarness| h.inspector_rect().expect("the inspector is open");
+    let row_drawn = |h: &InputHarness| h.text_painted_in(inspector(h), MAP_FLOOR_LABEL);
+    let note_drawn = |h: &InputHarness| h.text_painted_in(inspector(h), MAP_FLOOR_INERT_NOTE);
+
+    assert_eq!(
+        h.volume_arms()[0].outcome,
+        None,
+        "precondition: the pane is drawing a volume",
+    );
+    assert!(
+        row_drawn(&h),
+        "precondition: the Map floor row is on screen"
+    );
+    assert!(
+        !note_drawn(&h),
+        "a drawing pane must not be told its floor is going nowhere",
+    );
+
+    // Take the picture away, through the path every suspend and surface loss
+    // takes. The checkbox is unchanged; what it can produce is not.
+    h.gui_mut().clear_graphics_state();
+    h.frames_for(3, FRAME_DT);
+    assert_eq!(
+        h.volume_arms()[0].outcome.as_deref(),
+        Some(VOLUME_EMPTY_STATE),
+        "precondition: the pane is now explaining itself instead of drawing",
+    );
+    assert!(row_drawn(&h), "the Map floor row is still on screen");
+    assert!(
+        note_drawn(&h),
+        "the Map floor checkbox draws no floor and says nothing about it; the \
+         sidebar painted {:?}",
+        h.painted_text_strings_in(inspector(&h)),
+    );
+    assert!(
+        h.text_painted_in(inspector(&h), VOLUME_EMPTY_STATE),
+        "the note must quote the pane's own reason, not a second wording of it",
+    );
+}
+
+/// The other interactive surface a 3D pane carries: the Volume Alpha editor's
+/// own window. A drag inside it belongs to the editor and must not also fly the
+/// orbit camera under it.
+///
+/// The glass-layer audit's second half. Everything else drawn over a 3D pane —
+/// the colour-scale legends, the stale-image notice, the caption, the empty
+/// state, the pane border — goes through a bare `egui::Painter` and allocates
+/// no widget at all, so none of it can either take a click or block one. The
+/// corner button and this window are the whole interactive inventory, and both
+/// have to win the pointer against a pane-wide `Sense::click_and_drag`.
+///
+/// **Both halves.** The camera must not move while the window is open (the
+/// window keeps its own drag) *and* it must move on the identical drag once the
+/// window is gone (that position really is over the pane, so the first half is
+/// a window that shields rather than a dead zone in the orbit). Half one alone
+/// passes if the orbit never worked; half two alone passes if the window is not
+/// there at all.
+#[test]
+fn the_open_alpha_editor_keeps_its_drag_off_the_orbit_camera() {
+    let mut h = volume_pane_harness();
+
+    /// One primary drag, pressed at `from` and released 90 points to the right —
+    /// far enough that the orbit's `ORBIT_YAW_DEG_PER_POINT` is unmistakable.
+    fn drag(h: &mut InputHarness, from: egui::Pos2) {
+        let to = from + egui::vec2(90.0, 0.0);
+        h.mouse_press(from);
+        h.frames_for(1, FRAME_DT);
+        h.mouse_move(to);
+        h.frames_for(1, FRAME_DT);
+        h.mouse_release(to);
+        h.frames_for(1, FRAME_DT);
+    }
+    let editor_open = |h: &mut InputHarness| {
+        h.gui_mut()
+            .pane(1)
+            .expect("pane 1 exists")
+            .volume()
+            .expect("pane 1 is a 3D pane")
+            .alpha_editor_open
+    };
+
+    // Opened through the corner button, which is the user's only door to it.
+    let button = h
+        .alpha_buttons()
+        .into_iter()
+        .find(|&(idx, _)| idx == 1)
+        .expect("the 3D pane draws its Volume alpha corner button")
+        .1;
+    h.mouse_click(button.center());
+    h.warm_up();
+    assert!(editor_open(&mut h), "precondition: the editor opened");
+
+    let window = h
+        .area_rect(egui::Id::new(("volume_alpha_editor", 1)))
+        .expect("the editor window is laid out");
+    let spot = window.center();
+    assert!(
+        h.pane_rects()[1].contains(spot),
+        "precondition: the window sits over the 3D pane, so the orbit is what \
+         it has to be shielding the drag from",
+    );
+
+    let before = camera_of(&mut h, 1);
+    drag(&mut h, spot);
+    let shielded = camera_of(&mut h, 1);
+    assert_eq!(
+        (shielded.yaw_deg(), shielded.pitch_deg()),
+        (before.yaw_deg(), before.pitch_deg()),
+        "a drag inside the Volume Alpha window orbited the pane underneath it",
+    );
+
+    // Shut it, and the very same drag reaches the pane it always could.
+    h.mouse_click(button.center());
+    h.warm_up();
+    assert!(!editor_open(&mut h), "precondition: the editor closed");
+
+    let before = camera_of(&mut h, 1);
+    drag(&mut h, spot);
+    let orbited = camera_of(&mut h, 1);
+    assert_ne!(
+        orbited.yaw_deg(),
+        before.yaw_deg(),
+        "the pane does not orbit at that position at all, so the half above \
+         proved nothing",
+    );
+}

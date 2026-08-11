@@ -564,6 +564,32 @@ pub struct Gui {
     /// a pane converted back to a map can leave the mirror copying geography
     /// nothing on screen still has.
     map_pane_geo: HashMap<usize, crate::volume_view::MapPaneGeo>,
+    /// Why each 3D pane drew **no picture** on the last frame, by pane index.
+    /// A pane that drew a volume has no entry.
+    ///
+    /// Not a test probe (`last_volume_arms` is that): the pane-properties
+    /// sidebar reads this to explain its Map floor checkbox. The floor is drawn
+    /// *by the raymarch*, inside the very callback an empty state means was
+    /// never pushed — so in every one of those states the checkbox is a control
+    /// that produces nothing, and a control that produces nothing has to say
+    /// why.
+    ///
+    /// Recorded by the arm rather than re-derived in the sidebar. The arm's
+    /// answer has five independent reasons in it — no painter, no published
+    /// volume, a product with no vertical structure, a grid not built yet, a
+    /// pane that is not 3D at all — and a second copy of them in the sidebar
+    /// would drift from this one silently, in the direction of a checkbox that
+    /// looks fine.
+    ///
+    /// **Last frame's, by construction.** The shell's sidebar pass runs before
+    /// `render_panes` in [`Gui::ui`], so this frame's arm has not run when the
+    /// checkbox is drawn. That is the right staleness rather than a tolerated
+    /// one: the sidebar is describing the picture the user is looking at, and
+    /// the picture the user is looking at is the one the last frame drew.
+    ///
+    /// Cleared and refilled by the pane loop each frame, so a pane that stops
+    /// being 3D — or starts drawing — cannot leave an explanation behind.
+    volume_empty_states: HashMap<usize, String>,
     /// How much of egui's coordinate space the pane mirror has to cover, in
     /// points, as of the last frame: the frame itself, plus however far below
     /// it this frame's off-screen map strips reach. See
@@ -1566,6 +1592,7 @@ impl Gui {
             pane_layout: PaneLayout::default(),
             color_scale_orientation: ColorScaleOrientation::default(),
             map_pane_geo: HashMap::new(),
+            volume_empty_states: HashMap::new(),
             mirror_size_points: egui::Vec2::ZERO,
             floor_tile_zoom_bias: 0,
             #[cfg(test)]
