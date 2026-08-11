@@ -294,24 +294,34 @@ the same default rules as the rest of it.
 
 ## Two other bots that can reach this directory
 
-Neither is handled here, both are named so they are not a surprise.
+- **Renovate** — handled. `.github/renovate.json` scans every Cargo manifest in
+  the repository, and this directory contains one. Its `insta`, `chrono` and
+  `zerocopy` declarations are upstream's, not ours to move: a bump merged here
+  would rewrite the vendored crate and quietly make the *Local changes* list
+  above untrue. `"ignorePaths"` now lists `vendor/**`, so no package file under
+  it is scanned at all.
 
-- **Renovate** (`.github/renovate.json`) scans every Cargo manifest in the
-  repository. It may open pull requests bumping the versions *inside*
-  `vendor/nexrad-decode/Cargo.toml` — `insta`, `chrono`, `zerocopy`, and the
-  rest — which are upstream's declarations and are not ours to move. Whether it
-  actually does depends on the shared `local>USA-RedDragon/renovate-configs`
-  preset, which is not in this repository, so this was not pre-emptively
-  configured against. **Close such a PR and add `"ignorePaths": ["vendor/**"]`
-  rather than merging it**, unless the bump is being taken deliberately and
-  recorded above.
+  Two mechanics behind the shape of that key. It is a top-level option — the
+  schema has no `ignorePaths` inside `packageRules`, so it cannot be scoped to
+  a rule. And it is an array, which config resolution replaces rather than
+  merges, so writing it drops Renovate's own default of
+  `["**/node_modules/**", "**/bower_components/**"]`; both are written back
+  explicitly. That also means a value set by the shared
+  `local>USA-RedDragon/renovate-configs` preset — which is not in this
+  repository and cannot be read from here — is now overridden by this file. If
+  the preset was ignoring paths of its own, they have to be restated here.
 
-- **Coverage.** `cargo llvm-cov --all-features` in `test.yaml` now measures this
-  crate too, and the badge and `coverage-baseline.tsv` it auto-commits move
-  accordingly — roughly 15,500 lines of decoder joined the denominator, covered
-  only to the extent upstream's own suite covers them. The number changing is
-  expected and is not a regression in this workspace's code. Nothing gates on a
-  threshold, so nothing fails.
+  Deliberately not done: pinning the vendored manifest's dependency versions,
+  or moving it out of `[workspace.members]`. Both would trade a bot problem for
+  a real one — the vendored tests must run in `cargo test --workspace`.
+
+- **Coverage** — not handled, named so it is not a surprise.
+  `cargo llvm-cov --all-features` in `test.yaml` now measures this crate too,
+  and the badge and `coverage-baseline.tsv` it auto-commits move accordingly —
+  roughly 15,500 lines of decoder joined the denominator, covered only to the
+  extent upstream's own suite covers them. The number changing is expected and
+  is not a regression in this workspace's code. Nothing gates on a threshold,
+  so nothing fails.
 
 ## Upstream pull request
 
