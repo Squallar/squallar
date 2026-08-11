@@ -122,6 +122,10 @@ fn deliver(data: &JsValue) {
                 .filter(|v| !v.is_null())
                 .map(|v| js_sys::Float32Array::new(&v).to_vec())
                 .unwrap_or_default(),
+            // `as_f64` is `None` for the null this field carries whenever the
+            // rendered raster had no one cut behind it, so the absence needs no
+            // separate test — see `proto::NYQUIST`.
+            nyquist_ms: proto::field(data, proto::NYQUIST).and_then(|v| v.as_f64()),
         })
     });
 

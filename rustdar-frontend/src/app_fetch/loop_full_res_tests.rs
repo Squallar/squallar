@@ -145,7 +145,10 @@ fn a_loop_frame_is_dispatched_leaner_than_the_still_frame_beside_it() {
                 .unwrap()
                 .and_hms_opt(0, 0, 0)
                 .unwrap(),
-            crate::loop_downloads::LoopFrameData::Volume(std::sync::Arc::new(sample_scan())),
+            crate::loop_downloads::LoopFrameData::Volume(
+                std::sync::Arc::new(sample_scan()),
+                Default::default(),
+            ),
             params(),
             rustdar_egui::pane::RenderTarget {
                 site: SITE.to_string(),
@@ -163,6 +166,7 @@ fn a_loop_frame_is_dispatched_leaner_than_the_still_frame_beside_it() {
         &params(),
         SITE,
         std::sync::Arc::new(sample_scan()),
+        &rustdar_radar::nyquist::DeclaredNyquist::empty(),
         sender,
         None,
     );

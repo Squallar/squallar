@@ -238,19 +238,30 @@ impl JobOutput {
 /// has: the two buffers are the same shape to a message port, and transposing
 /// them would swap a texture for a value grid somewhere with no type error to
 /// catch it. A separate type and not that one because this is what crosses the
-/// port, and the renderer reports one thing more than the port carries — the
-/// sweep's declared Nyquist velocity, dropped in the `From` below.
+/// port.
 ///
-/// The extent is metadata and stays metadata — it says where the pixels *are*,
-/// never how many of them there are. How many there are is the buffer's own
-/// length, read back against a closed set at each consumer
-/// (`constants::raster_side_from_rgba_len`); nothing on this port describes its
-/// own shape, which is what keeps a malformed payload from being believed.
+/// The extent and the fold limit are metadata and stay metadata — they say
+/// where the pixels *are* and what speed they wrap at, never how many of them
+/// there are. How many there are is the buffer's own length, read back against
+/// a closed set at each consumer (`constants::raster_side_from_rgba_len`);
+/// nothing on this port describes its own shape, which is what keeps a
+/// malformed payload from being believed. Adding a second `f64` beside the
+/// extent does not weaken that: neither number can be read as a dimension,
+/// and the guard that protects a pane from a blank texture reads the length
+/// and only the length.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderedFrame {
     pub image: Vec<u8>,
     pub max_range_km: f64,
     pub values: Vec<f32>,
+    /// Where the rendered sweep's cut declared its velocity folds, m/s, or
+    /// `None` for a raster with no one cut behind it — every Level III
+    /// product and every volume product — and for a volume that declared
+    /// nothing, which is every Message 1 volume.
+    ///
+    /// See [`rustdar_radar::render::SweepRender::nyquist_ms`], which is where
+    /// it comes from and which explains what it is a property of.
+    pub nyquist_ms: Option<f64>,
 }
 
 /// `None` where the renderer found nothing to draw — a scan with no matching
@@ -258,14 +269,15 @@ pub struct RenderedFrame {
 pub type JobResult = Option<JobOutput>;
 
 impl From<rustdar_radar::render::SweepRender> for RenderedFrame {
-    /// The renderer's own answer, minus the fold limit it reports: nothing on
-    /// this port carries that yet, and dropping it here rather than at each
-    /// arm keeps the three rasterizing arms writing one conversion.
+    /// The renderer's own answer, whole. One conversion for all three
+    /// rasterizing arms, so a Level III frame and a Level II one cannot come to
+    /// describe themselves differently.
     fn from(render: rustdar_radar::render::SweepRender) -> Self {
         Self {
             image: render.image,
             max_range_km: render.max_range_km,
             values: render.values,
+            nyquist_ms: render.nyquist_ms,
         }
     }
 }

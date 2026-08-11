@@ -84,6 +84,13 @@ pub(super) fn scan_with_sweeps(elevations: &[f32]) -> Arc<Scan> {
     ))
 }
 
+/// [`scan_with_sweeps`] as the loop cache holds one. Nothing here reads a fold
+/// limit, so the fixture volume declares none — which is what a Message 1
+/// volume gives the cache in production too.
+pub(super) fn volume_with_sweeps(elevations: &[f32]) -> crate::loop_downloads::CachedVolume {
+    (scan_with_sweeps(elevations), Arc::default())
+}
+
 /// A loop on `site` with three frames, retargeted to Reflectivity at 0.5, and
 /// with `textured` already rendered.
 fn loop_on(ctx: &egui::Context, site: &'static str, textured: &[usize]) -> LoopPlaybackState {
@@ -115,6 +122,7 @@ fn loop_on(ctx: &egui::Context, site: &'static str, textured: &[usize]) -> LoopP
                 lat: 35.0,
                 lon: -97.0,
                 max_range_km: 100.0,
+                nyquist_ms: None,
                 value_data: Arc::new(Vec::new()),
             },
         ));
@@ -145,6 +153,7 @@ fn response(
         // under test reads the metadata — so a 1x1 image stands in for a frame.
         image: Some(egui::ColorImage::filled([1, 1], egui::Color32::WHITE)),
         max_range_km: 100.0,
+        nyquist_ms: None,
     }
 }
 
@@ -645,7 +654,7 @@ fn a_failed_render_retires_its_frame_without_a_texture() {
 #[test]
 fn a_download_is_cached_under_the_site_it_came_from() {
     let mut mgr = LoopDownloadManager::new();
-    let scan = scan_with_sweeps(&[0.5]);
+    let volume = volume_with_sweeps(&[0.5]);
     mgr.mark_in_flight("KTLX", ts(0));
 
     apply_completed_download(
@@ -654,13 +663,13 @@ fn a_download_is_cached_under_the_site_it_came_from() {
             pane_idx: 0,
             site: "KTLX".to_string(),
             timestamp: ts(0),
-            scan: Some(Arc::clone(&scan)),
+            scan: Some(volume.clone()),
         },
     );
 
     assert!(Arc::ptr_eq(
-        mgr.get_cached("KTLX", &ts(0)).expect("cached"),
-        &scan
+        &mgr.get_cached("KTLX", &ts(0)).expect("cached").0,
+        &volume.0
     ));
     assert!(mgr.get_cached("KOUN", &ts(0)).is_none());
     assert!(!mgr.is_in_flight("KTLX", &ts(0)), "and its mark is cleared");
@@ -691,12 +700,19 @@ fn a_failed_download_clears_its_mark_and_caches_nothing() {
 #[test]
 fn a_frames_data_is_looked_up_under_its_targets_site() {
     let mut mgr = LoopDownloadManager::new();
-    let ktlx = scan_with_sweeps(&[0.5]);
-    mgr.cache_scan("KTLX", ts(0), Arc::clone(&ktlx));
+    let ktlx = volume_with_sweeps(&[0.5]);
+    mgr.cache_scan("KTLX", ts(0), ktlx.clone());
 
     let found = frame_data(&mgr, &target("KTLX", 0.5), ts(0)).expect("KTLX's own scan");
     match found {
-        LoopFrameData::Volume(scan) => assert!(Arc::ptr_eq(&scan, &ktlx)),
+        LoopFrameData::Volume(scan, declared) => {
+            assert!(Arc::ptr_eq(&scan, &ktlx.0));
+            assert!(
+                Arc::ptr_eq(&declared, &ktlx.1),
+                "the frame's declarations must be its own volume's, not another \
+                 volume's or a fresh empty table",
+            );
+        }
         LoopFrameData::Products(_) => panic!("reflectivity is a Level II product"),
     }
     assert!(
@@ -715,8 +731,8 @@ fn the_receivers_sweep_comes_from_the_receivers_own_scan() {
     let mut mgr = LoopDownloadManager::new();
     // One timestamp, two sites, two different sweep sets — which is the whole
     // reason two loops can disagree about what a selection resolves to.
-    mgr.cache_scan("KTLX", ts(0), scan_with_sweeps(&[0.5, 1.5]));
-    mgr.cache_scan("KOUN", ts(0), scan_with_sweeps(&[1.4]));
+    mgr.cache_scan("KTLX", ts(0), volume_with_sweeps(&[0.5, 1.5]));
+    mgr.cache_scan("KOUN", ts(0), volume_with_sweeps(&[1.4]));
 
     let ktlx = loop_on(&ctx, "KTLX", &[]);
     let koun = loop_on(&ctx, "KOUN", &[]);
@@ -750,8 +766,8 @@ fn a_broadcast_sweep_pairs_the_senders_image_with_the_receivers_own_scan() {
     // One timestamp, two sites. KOUN's volume carries the selected 0.5° sweep and
     // a 1.4°; KTLX's is a partial volume whose only reflectivity sweep is the
     // 1.4°, so the same 0.5° selection snaps to a different tilt on each.
-    mgr.cache_scan("KOUN", ts(0), scan_with_sweeps(&[0.5, 1.4]));
-    mgr.cache_scan("KTLX", ts(0), scan_with_sweeps(&[1.4]));
+    mgr.cache_scan("KOUN", ts(0), volume_with_sweeps(&[0.5, 1.4]));
+    mgr.cache_scan("KTLX", ts(0), volume_with_sweeps(&[1.4]));
     let koun = loop_on(&ctx, "KOUN", &[]);
 
     // A finished render of the 1.4° sweep, for a 0.5° selection. The target's
@@ -802,7 +818,7 @@ fn a_receiver_with_nothing_to_compare_reports_no_sweep() {
         "nothing downloaded for this frame yet"
     );
 
-    mgr.cache_scan("KTLX", ts(0), scan_with_sweeps(&[0.5]));
+    mgr.cache_scan("KTLX", ts(0), volume_with_sweeps(&[0.5]));
     assert_eq!(
         own_sweep(&mgr, &ktlx, ts(0), RadarProduct::Velocity, 0.5),
         None,
@@ -820,7 +836,7 @@ fn readiness_counts_only_this_loops_own_downloads() {
     let koun = loop_on(&ctx, "KOUN", &[]);
     // Every frame blank, and only *KTLX* scans downloaded.
     for i in 0..3 {
-        mgr.cache_scan("KTLX", ts(i), scan_with_sweeps(&[0.5]));
+        mgr.cache_scan("KTLX", ts(i), volume_with_sweeps(&[0.5]));
     }
 
     assert!(
@@ -831,7 +847,7 @@ fn readiness_counts_only_this_loops_own_downloads() {
     // Now KOUN's own scans arrive: the same blank frames become renders that
     // are owed, and readiness must wait for them.
     for i in 0..3 {
-        mgr.cache_scan("KOUN", ts(i), scan_with_sweeps(&[0.5]));
+        mgr.cache_scan("KOUN", ts(i), volume_with_sweeps(&[0.5]));
     }
     assert!(
         !loop_batch_settled(&mgr, &koun, test_loop_allocation().plan_view_frames),

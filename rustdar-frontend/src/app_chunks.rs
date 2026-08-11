@@ -316,9 +316,16 @@ impl super::App {
             .as_ref()
             .filter(|closed| closed.progress.volume_complete)
             .and_then(|closed| closed.scan.as_ref().map(|scan| (closed, scan)));
-        let (scan, sealed) = match completed {
+        // The declared Nyquist table comes out with the volume on both branches,
+        // because both have one in hand and the consumers below all read
+        // velocity: the plan view dealiases NROT and SRV, the loop cache feeds
+        // frames of the same, and the base is what every section and 3D payload
+        // is cut from. Taking the scan without it here is where a live pane
+        // would start folding around estimates.
+        let (scan, declared, sealed) = match completed {
             Some((closed, scan)) => (
                 Arc::clone(scan),
+                Arc::new(closed.declared_nyquist.clone()),
                 closed.progress.sealed_elevations.as_slice(),
             ),
             None => {
@@ -332,7 +339,11 @@ impl super::App {
                 let Some(live) = self.chunk_feeds.snapshot(site) else {
                     return;
                 };
-                (live.scan, outcome.sealed_elevations.as_slice())
+                (
+                    live.scan,
+                    live.declared,
+                    outcome.sealed_elevations.as_slice(),
+                )
             }
         };
         if scan.sweeps().is_empty() {
@@ -357,11 +368,12 @@ impl super::App {
         // moved under it.
         if !self.any_pane_live_for_site(site) {
             self.latest_cached_scans
-                .insert(site.to_string(), (scan, info, timestamp));
+                .insert(site.to_string(), (scan, declared, info, timestamp));
             return;
         }
 
-        self.scan_data.insert(site.to_string(), Arc::clone(&scan));
+        self.scan_data
+            .insert(site.to_string(), (Arc::clone(&scan), Arc::clone(&declared)));
 
         if let Some((closed, _)) = completed {
             // A whole closed volume is the same volume the archive will
@@ -379,11 +391,7 @@ impl super::App {
                 // worker's velocity fold guard back on estimates.
                 self.base_scans.insert(
                     site.to_string(),
-                    (
-                        Arc::clone(&scan),
-                        Arc::new(closed.declared_nyquist.clone()),
-                        timestamp,
-                    ),
+                    (Arc::clone(&scan), Arc::clone(&declared), timestamp),
                 );
             }
             // The volume is now exactly what the archive would have published,
@@ -428,7 +436,7 @@ impl super::App {
             // stays as the thing that makes a non-whole volume in the cache
             // unreachable rather than merely unlikely.
             if closed.progress.whole_volume_complete {
-                self.append_scan_to_active_loops(site, timestamp, scan);
+                self.append_scan_to_active_loops(site, timestamp, scan, declared);
             } else {
                 log::debug!(
                     "{site}: volume complete on the {} cut(s) the feed asked for but \

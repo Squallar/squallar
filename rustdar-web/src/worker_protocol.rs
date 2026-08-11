@@ -25,6 +25,16 @@ pub const ERROR: &str = "error";
 pub const IMAGE: &str = "image";
 pub const VALUES: &str = "values";
 pub const MAX_RANGE: &str = "range";
+/// Worker → page: where the rendered sweep's cut declared its velocity folds,
+/// m/s, or **null** for a raster with no one cut behind it.
+///
+/// Null is the encoding of `None`, not a compatibility shim: a Level III
+/// product, a volume product and a Message 1 volume all legitimately have no
+/// such number, and `Option::None` has to cross as something. The page reads it
+/// back through the same `as_f64` filter every numeric field takes, so an
+/// absent field and a null one resolve alike — which is what makes writing it
+/// unconditionally in every arm of `post_result` the whole of the contract.
+pub const NYQUIST: &str = "nyq";
 
 /// Worker → page: an output that is not a plan-view frame — a cross-section
 /// raster or a voxel grid — as **one** transferred `Uint8Array` in the payload
@@ -59,10 +69,18 @@ pub const OUT_KIND: &str = "outkind";
 /// running different protocol versions are, by definition, different builds.
 ///
 /// Version 2 added [`OUT`] and [`OUT_KIND`], when a job could answer with
-/// something other than a plan-view frame. It is folded into the token, so a
-/// page and a worker on opposite sides of a deploy boundary terminate cleanly
-/// rather than exchanging a reply one of them cannot read.
-const PROTOCOL_VERSION: u32 = 2;
+/// something other than a plan-view frame. Version 3 added [`NYQUIST`], when
+/// the plan view began reporting the fold limit of the sweep it drew. It is
+/// folded into the token, so a page and a worker on opposite sides of a deploy
+/// boundary terminate cleanly rather than exchanging a reply one of them cannot
+/// read.
+///
+/// A missing [`NYQUIST`] would degrade rather than break — the page would read
+/// `None` and the legend would say nothing — but "degrades quietly" is exactly
+/// the class of mismatch a version number exists to convert into a clean
+/// termination, and a page silently unable to name a fold limit is the same
+/// silence this workstream is closing everywhere else.
+const PROTOCOL_VERSION: u32 = 3;
 
 /// What the page and the worker compare before the page trusts the worker.
 ///

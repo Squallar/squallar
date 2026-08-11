@@ -66,6 +66,14 @@ pub struct RenderedImage {
     /// placement site has the site's coordinates but not the sweep.
     pub max_range_km: f64,
     pub value_data: Arc<Vec<f32>>,
+    /// Where the drawn sweep's cut declared its velocity folds, m/s, or `None`
+    /// for a raster no single cut is behind.
+    ///
+    /// Metadata about the picture, exactly as `max_range_km` is, and carried
+    /// the same distance for the same reason: the far end has the pane and the
+    /// site but not the sweep, so a number about the sweep either travels with
+    /// the pixels or is unavailable where they are drawn.
+    pub nyquist_ms: Option<f64>,
 }
 
 /// Result from a background radar render thread.
@@ -197,8 +205,13 @@ pub struct LoopScanDownloadResponse {
     pub site: String,
     /// UTC timestamp of the downloaded scan.
     pub timestamp: NaiveDateTime,
-    /// The decoded scan data, or `None` if the download failed.
-    pub scan: Option<Arc<Scan>>,
+    /// The decoded volume and what its cuts declared their Nyquist velocities
+    /// to be, or `None` if the download failed.
+    ///
+    /// The pair for the reason [`ScanData::declared_nyquist`] gives: the model
+    /// type has no field for the number, and a loop frame's NROT or SRV
+    /// dealiases around it exactly as the still frame beside it does.
+    pub scan: Option<(Arc<Scan>, Arc<rustdar_radar::nyquist::DeclaredNyquist>)>,
 }
 
 /// The Level III bucket keys a loop's pairings will be ranked against: one
@@ -303,6 +316,11 @@ pub struct LoopRenderResponse {
     /// on the ground. `RadarImageData` carries it forward for exactly that
     /// reason — every frame is placed by its own number.
     pub max_range_km: f64,
+    /// Where this frame's cut declared its velocity folds, m/s. Per frame for
+    /// the same reason the extent is: a loop steps through volumes, and the
+    /// RDA reselects PRFs between them, so the limit the newest frame folded
+    /// at is not necessarily the limit the oldest did.
+    pub nyquist_ms: Option<f64>,
 }
 
 /// Result from cutting a single cross-section loop frame.

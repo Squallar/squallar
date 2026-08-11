@@ -23,6 +23,7 @@ fn gated_render() -> (mpsc::Sender<()>, crate::offload::Job) {
                     image: Vec::new(),
                     max_range_km: 230.0,
                     values: Vec::new(),
+                    nyquist_ms: None,
                 },
             ))
         })),
@@ -466,6 +467,7 @@ fn cached(range: f64) -> CachedRenderOutput {
         image: Arc::new(egui::ColorImage::default()),
         max_range_km: range,
         value_data: Arc::new(Vec::new()),
+        nyquist_ms: None,
     }
 }
 

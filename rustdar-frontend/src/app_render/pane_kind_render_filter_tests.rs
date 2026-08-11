@@ -93,6 +93,7 @@ fn cached_output() -> crate::render_dispatch::CachedRenderOutput {
         image: finished_pixels(),
         max_range_km: 230.0,
         value_data: Arc::new(Vec::new()),
+        nyquist_ms: None,
     }
 }
 
@@ -126,6 +127,7 @@ fn deliver(app: &mut crate::app::App, pane_idx: usize) {
                 image: finished_pixels(),
                 max_range_km: 230.0,
                 value_data: Arc::new(Vec::new()),
+                nyquist_ms: None,
             }),
             product: PRODUCT,
             elevation: TILT,
@@ -445,8 +447,11 @@ fn the_second_loop_dispatch_pass_judges_every_pane_that_can_loop() {
         app.loop_mgr = LoopDownloadManager::new();
         // A volume that is present, so the frame is not `Pending`, and
         // carries nothing for the product, so it is `Unrenderable`.
-        app.loop_mgr
-            .cache_scan(SITE, volume_time(), Arc::new(empty_scan()));
+        app.loop_mgr.cache_scan(
+            SITE,
+            volume_time(),
+            (Arc::new(empty_scan()), Default::default()),
+        );
         {
             let pane = app.gui.pane_mut(0).unwrap();
             // Converted first; see the note in the test above.
@@ -585,7 +590,7 @@ fn the_loop_frame_broadcast_skips_a_pane_with_no_plan_view() {
         app.loop_mgr.cache_scan(
             SITE,
             volume_time(),
-            super::loop_dispatch_tests::scan_with_sweeps(&[TILT]),
+            super::loop_dispatch_tests::volume_with_sweeps(&[TILT]),
         );
         for idx in 0..2 {
             let ls = &mut app.gui.pane_mut(idx).unwrap().loop_state;
@@ -622,6 +627,7 @@ fn the_loop_frame_broadcast_skips_a_pane_with_no_plan_view() {
                 site_lon: -97.27,
                 image: Some(loop_frame_pixels()),
                 max_range_km: 230.0,
+                nyquist_ms: None,
             })
             .expect("the receiver lives on the App");
         app.poll_loop_render_results(&egui::Context::default());
@@ -770,10 +776,14 @@ fn a_whole_volume_pane_keeps_the_volume_it_is_sampling() {
     ] {
         let mut app = app_on_site();
         app.gui.pane_mut(0).unwrap().set_view(kind);
-        app.scan_data
-            .insert(SITE.to_string(), Arc::new(empty_scan()));
-        app.scan_data
-            .insert("KOUN".to_string(), Arc::new(empty_scan()));
+        app.scan_data.insert(
+            SITE.to_string(),
+            (Arc::new(empty_scan()), Default::default()),
+        );
+        app.scan_data.insert(
+            "KOUN".to_string(),
+            (Arc::new(empty_scan()), Default::default()),
+        );
 
         app.evict_unshown_scans();
 

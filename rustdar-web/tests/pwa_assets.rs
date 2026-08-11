@@ -555,10 +555,11 @@ fn the_rasterization_worker_uses_only_relative_paths() {
 #[test]
 fn the_worker_protocol_version_is_the_one_these_shapes_ship() {
     assert!(
-        WORKER_PROTOCOL.contains("const PROTOCOL_VERSION: u32 = 2;"),
-        "worker_protocol.rs does not declare PROTOCOL_VERSION 2. Version 2 is \
-         the one that added the `out` field; changing the message shapes \
-         without changing this number is the whole failure it prevents."
+        WORKER_PROTOCOL.contains("const PROTOCOL_VERSION: u32 = 3;"),
+        "worker_protocol.rs does not declare PROTOCOL_VERSION 3. Version 3 is \
+         the one that added the `nyq` field, where a plan-view reply began \
+         reporting the fold limit of the sweep it drew; changing the message \
+         shapes without changing this number is the whole failure it prevents."
     );
     assert!(
         WORKER_PROTOCOL.contains("PROTOCOL_VERSION,"),
@@ -594,6 +595,7 @@ fn the_worker_reply_writes_every_field_on_every_arm() {
         "proto::IMAGE,",
         "proto::VALUES,",
         "proto::MAX_RANGE,",
+        "proto::NYQUIST,",
         "proto::OUT,",
         "proto::OUT_KIND,",
     ] {
@@ -616,6 +618,13 @@ fn the_worker_reply_writes_every_field_on_every_arm() {
 /// test that exists — it would copy 4 MiB per frame instead of moving it, or
 /// report every plan view's range as the `0.0` default, which is a texture
 /// projected at the wrong scale rather than an error.
+///
+/// `NYQUIST` joined the three when the plan view began reporting where the
+/// sweep it drew folds. It is written here and nowhere else on this arm, and a
+/// `Frame` reply that stopped writing it would leave every velocity pane in
+/// the browser unable to say where its own picture wraps — silently, because
+/// the default written before the match is a legitimate answer for the Level
+/// III and volume products.
 #[test]
 fn the_frame_arm_of_the_worker_reply_is_unchanged() {
     let arm = RASTER_WORKER_RS
@@ -629,6 +638,7 @@ fn the_frame_arm_of_the_worker_reply_is_unchanged() {
         "proto::IMAGE, &image",
         "proto::VALUES, &values",
         "proto::MAX_RANGE,",
+        "proto::NYQUIST,",
         "transfer.push(&image.buffer());",
         "transfer.push(&values.buffer());",
     ] {
@@ -641,7 +651,7 @@ fn the_frame_arm_of_the_worker_reply_is_unchanged() {
     assert!(
         !arm.contains("proto::OUT"),
         "the Frame arm writes an out-of-band field; a frame travels in \
-         IMAGE/VALUES/MAX_RANGE and nothing else, and a reply carrying both \
-         leaves the page arbitrating between two outputs for one job"
+         IMAGE/VALUES/MAX_RANGE/NYQUIST and nothing else, and a reply carrying \
+         both leaves the page arbitrating between two outputs for one job"
     );
 }

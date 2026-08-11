@@ -254,6 +254,7 @@ impl super::App {
                 value_data: rendered.value_data,
                 product: rr.product,
                 elevation: rr.elevation,
+                nyquist_ms: rendered.nyquist_ms,
             };
 
             // Cache the render output for sharing with other panes on the same site
@@ -277,6 +278,7 @@ impl super::App {
                     image: Arc::clone(&render_result.image),
                     max_range_km: render_result.max_range_km,
                     value_data: Arc::clone(&render_result.value_data),
+                    nyquist_ms: render_result.nyquist_ms,
                 },
             );
 
@@ -392,6 +394,7 @@ impl super::App {
                 value_data: Arc::clone(&render.value_data),
                 product: render.product,
                 elevation: render.elevation,
+                nyquist_ms: render.nyquist_ms,
             });
         }
 
@@ -427,6 +430,7 @@ impl super::App {
                 lat,
                 lon,
                 max_range_km: render.max_range_km,
+                nyquist_ms: render.nyquist_ms,
                 // What these pixels are, travelling with them. Whichever
                 // datasource produced them: this is the one assignment behind
                 // `PaneState::stale_image_on_screen`, so a Level II and a
@@ -783,6 +787,7 @@ impl super::App {
                             value_data: Arc::clone(&cached.value_data),
                             product,
                             elevation,
+                            nyquist_ms: cached.nyquist_ms,
                         };
                         log::info!(
                             "Reusing cached render for pane {}: {:?} at {:.1}°",
@@ -817,12 +822,16 @@ impl super::App {
                             self.channels.render_sender.clone(),
                             self.window.clone(),
                         );
-                    } else if let Some(data) = self.scan_data.get(scan_info.site.name) {
+                    } else if let Some((data, declared)) = self.scan_data.get(scan_info.site.name) {
+                        // Cloned out of the map before the dispatcher is
+                        // borrowed mutably; both are refcounts.
+                        let (data, declared) = (Arc::clone(data), Arc::clone(declared));
                         self.render.spawn_level2_render(
                             pane_idx,
                             &params,
                             &pane_site,
-                            Arc::clone(data),
+                            data,
+                            &declared,
                             self.channels.render_sender.clone(),
                             self.window.clone(),
                         );
@@ -1305,6 +1314,7 @@ impl super::App {
             let max_range_km = cached.max_range_km;
             let product = cached.product;
             let elevation = cached.elevation;
+            let nyquist_ms = cached.nyquist_ms;
 
             let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx) else {
                 continue;
@@ -1361,7 +1371,9 @@ impl super::App {
                         // so it is described the same way. A resume that put the
                         // pixels back without this would leave a pane that had
                         // been switched while suspended showing the old product
-                        // with nothing saying so.
+                        // with nothing saying so — and, for the fold limit,
+                        // annotating one cut's velocity with another cut's PRF.
+                        nyquist_ms,
                         product,
                         elevation,
                     }),
@@ -2813,7 +2825,7 @@ impl super::App {
             if self.render.renders_in_flight.load(Ordering::Relaxed) >= MAX_CONCURRENT_RENDERS {
                 break;
             }
-            let Some(LoopFrameData::Volume(scan)) =
+            let Some(LoopFrameData::Volume(scan, declared)) =
                 frame_data(&self.loop_mgr, &req.target, req.timestamp)
             else {
                 // A section is cut from a volume. A loop whose product reads
@@ -2829,7 +2841,7 @@ impl super::App {
                 continue;
             };
             let (pane_idx, frame_idx) = (req.pane_idx, req.frame_idx);
-            match self.spawn_loop_section_render(req, scan) {
+            match self.spawn_loop_section_render(req, scan, declared) {
                 crate::render_dispatch::SectionDispatch::Dispatched => {
                     if let Some(pane) = self.gui.pane_mut(pane_idx)
                         && let Some(frame) = pane.loop_state.frames.get_mut(frame_idx)
@@ -3278,6 +3290,7 @@ fn rendered_image(
         lat: rr.site_lat,
         lon: rr.site_lon,
         max_range_km: rr.max_range_km,
+        nyquist_ms: rr.nyquist_ms,
         value_data: Arc::new(Vec::new()),
     }
 }
@@ -3378,8 +3391,8 @@ fn apply_completed_download(
 ) {
     loop_mgr.complete_download(&resp.site, &resp.timestamp);
     // Skip failures — the mark is cleared either way so the frame can be retried.
-    if let Some(scan) = resp.scan {
-        loop_mgr.cache_scan(&resp.site, resp.timestamp, scan);
+    if let Some(volume) = resp.scan {
+        loop_mgr.cache_scan(&resp.site, resp.timestamp, volume);
     }
 }
 
@@ -3472,7 +3485,7 @@ fn frame_sweep(
             }
         };
     }
-    let Some(scan) = loop_mgr.get_cached(&target.site, &timestamp) else {
+    let Some((scan, _)) = loop_mgr.get_cached(&target.site, &timestamp) else {
         return FrameSweep::Pending;
     };
     match rustdar_radar::render::find_closest_elevation(scan, target.product, target.elevation) {
@@ -3617,7 +3630,7 @@ fn frame_section(
     target: &RenderTarget,
     timestamp: chrono::NaiveDateTime,
 ) -> FrameSection {
-    let Some(scan) = loop_mgr.get_cached(&target.site, &timestamp) else {
+    let Some((scan, _)) = loop_mgr.get_cached(&target.site, &timestamp) else {
         return FrameSection::Pending;
     };
     let sweeps: Vec<&nexrad_model::data::Sweep> = scan.sweeps().iter().collect();
@@ -3851,6 +3864,12 @@ fn render_already_queued<'a>(
 /// and a window — none of which exist here — so the sequence can only be read
 /// off the source, the same handle `handle_input_events` and `begin_frame` are
 /// pinned by.
+/// Whether every dispatch path tells the renderer where the sweep it asked for
+/// folds — the plan view, the section, and the loop.
+#[path = "app_render/declared_nyquist_dispatch_tests.rs"]
+#[cfg(test)]
+mod declared_nyquist_dispatch_tests;
+
 #[path = "app_render/frame_build_order_tests.rs"]
 #[cfg(test)]
 mod frame_build_order_tests;

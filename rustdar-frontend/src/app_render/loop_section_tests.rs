@@ -207,7 +207,10 @@ fn a_volume_with_no_ladder_retires_the_frame() {
     app.loop_mgr.cache_scan(
         SITE,
         ts(0),
-        std::sync::Arc::new(crate::app::tests::empty_scan()),
+        (
+            std::sync::Arc::new(crate::app::tests::empty_scan()),
+            Default::default(),
+        ),
     );
 
     app.dispatch_loop_renders();
@@ -233,7 +236,8 @@ fn a_volume_with_no_ladder_retires_the_frame() {
 fn one_dispatch_pass_starts_at_most_the_capped_number_of_cuts() {
     let mut app = app_with_section_loop(&[0, 1, 2, 3, 4]);
     for m in 0..5 {
-        app.loop_mgr.cache_scan(SITE, ts(m), volume());
+        app.loop_mgr
+            .cache_scan(SITE, ts(m), (volume(), Default::default()));
     }
     // Precondition: more frames are ready than the cap allows, or this test
     // cannot tell a cap from its absence.
@@ -264,7 +268,8 @@ fn one_dispatch_pass_starts_at_most_the_capped_number_of_cuts() {
 fn successive_dispatch_passes_work_through_the_render_set() {
     let mut app = app_with_section_loop(&[0, 1, 2]);
     for m in 0..3 {
-        app.loop_mgr.cache_scan(SITE, ts(m), volume());
+        app.loop_mgr
+            .cache_scan(SITE, ts(m), (volume(), Default::default()));
     }
 
     let mut started = std::collections::HashSet::new();
@@ -421,7 +426,8 @@ fn a_cut_that_produced_nothing_retires_its_frame() {
 fn a_frame_is_recut_when_its_volume_resolves_a_different_ladder() {
     let ctx = egui::Context::default();
     let mut app = app_with_section_loop(&[0]);
-    app.loop_mgr.cache_scan(SITE, ts(0), volume());
+    app.loop_mgr
+        .cache_scan(SITE, ts(0), (volume(), Default::default()));
 
     // The ladder the cached volume actually resolves, asked the way the
     // dispatcher asks it, so the "matching" case below really matches.

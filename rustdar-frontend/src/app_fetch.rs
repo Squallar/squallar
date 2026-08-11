@@ -925,14 +925,16 @@ impl super::App {
         self.gui.set_viewing_live_for_pane(pane_idx, true);
         self.manual_nav_pending = true;
 
-        if let Some((scan_arc, scan_info, timestamp)) = self.latest_cached_scans.remove(&pane_site)
+        if let Some((scan_arc, declared, scan_info, timestamp)) =
+            self.latest_cached_scans.remove(&pane_site)
         {
             log::info!(
                 "JumpToLive: using cached scan for {} @ {}",
                 pane_site,
                 timestamp
             );
-            self.scan_data.insert(pane_site.clone(), scan_arc);
+            self.scan_data
+                .insert(pane_site.clone(), (scan_arc, declared));
 
             let local_ts =
                 chrono::TimeZone::from_utc_datetime(&chrono::Local, &timestamp).naive_local();
@@ -995,13 +997,16 @@ impl super::App {
             self.channels.loop_scan_download_sender.clone(),
             async move {
                 let scan = match scan::download_scan(identifier).await {
-                    // The declared Nyquist table is dropped here on purpose: a
-                    // loop frame is a plan-view raster, and nothing on that
-                    // path interpolates across a fold seam. Only the
-                    // whole-volume readers — sections and the 3D resample,
-                    // which build from `base_scans` and the live feed — carry
-                    // it. See `rustdar_radar::nyquist`.
-                    Ok(decoded) => Some(std::sync::Arc::new(decoded.scan)),
+                    // Both halves, because a loop frame is dealiased on the same
+                    // terms as the still frame beside it: NROT and SRV unfold
+                    // around the limit the cut declared, and a frame that
+                    // arrived without the declaration would unfold around an
+                    // estimate instead — a loop stepping through pictures of
+                    // one storm computed two different ways.
+                    Ok(decoded) => Some((
+                        std::sync::Arc::new(decoded.scan),
+                        std::sync::Arc::new(decoded.declared_nyquist),
+                    )),
                     Err(e) => {
                         log::error!(
                             "Loop scan download failed for pane {} ({} @ {}): {:?}",
@@ -1164,7 +1169,7 @@ impl super::App {
             // without the volume behind it. `None` — no sweep carries the
             // product — is the same answer the renderer gives, and takes the
             // same failure path.
-            crate::loop_downloads::LoopFrameData::Volume(scan_data) => {
+            crate::loop_downloads::LoopFrameData::Volume(scan_data, declared) => {
                 // The storm motion override is read from the dispatcher for the
                 // same reason `spawn_level2_render` reads it there: one field
                 // for both the invalidation and the vector drawn.
@@ -1188,7 +1193,13 @@ impl super::App {
                 ) {
                     Some(input) => {
                         crate::offload::Job::Described(crate::offload::JobRequest::Radar {
-                            input: Box::new(input),
+                            // The same stamp the still frame takes, off this
+                            // frame's own volume. Without it a loop of NROT or
+                            // SRV would fold around whatever each frame's
+                            // calmest sector estimated while the static render
+                            // of the newest frame folded around the RDA's
+                            // declaration — one storm, two pictures, no error.
+                            input: Box::new(input.with_declared_nyquist(&declared)),
                             // Loop frames store an empty value grid, so asking
                             // for one would produce `LOOP_IMAGE_SIZE² × 4` bytes
                             // per frame to be dropped on arrival — and copied
@@ -1236,7 +1247,7 @@ impl super::App {
             // section's differently-shaped buffers. See `JobOutput::frame`.
             let frame = output.and_then(crate::offload::JobOutput::frame);
             // A failed render still has to be sent, so render_in_flight gets cleared.
-            let (image, max_range_km) = match frame {
+            let (image, max_range_km, nyquist_ms) = match frame {
                 Some(frame) => {
                     // Converted here, in `deliver`, so `rgba` drops at the end
                     // of this scope and only one of the two buffers is ever in
@@ -1245,18 +1256,18 @@ impl super::App {
                     // render that lands on the main thread, and it is a
                     // reinterpretation of 4 MiB rather than a rasterization.
                     match loop_frame_image(&frame.image) {
-                        Some(image) => (Some(image), frame.max_range_km),
+                        Some(image) => (Some(image), frame.max_range_km, frame.nyquist_ms),
                         None => {
                             log::error!(
                                 "Loop render for pane {pane_idx} produced {} bytes, expected {}",
                                 frame.image.len(),
                                 LOOP_IMAGE_SIZE * LOOP_IMAGE_SIZE * 4
                             );
-                            (None, 0.0)
+                            (None, 0.0, None)
                         }
                     }
                 }
-                None => (None, 0.0),
+                None => (None, 0.0, None),
             };
             // One send site for both outcomes, so `snapped` cannot come to differ
             // between them. It describes the render that was dispatched — the sweep
@@ -1274,6 +1285,7 @@ impl super::App {
                 site_lon: lon,
                 image,
                 max_range_km,
+                nyquist_ms,
             });
             super::notify_redraw(&window);
         });
@@ -1290,10 +1302,13 @@ impl super::App {
         site: &str,
         timestamp: chrono::NaiveDateTime,
         scan: std::sync::Arc<nexrad_model::data::Scan>,
+        declared: std::sync::Arc<rustdar_radar::nyquist::DeclaredNyquist>,
     ) {
         // Store in the shared cache under this scan's own site, for every loop on
-        // that site to use.
-        self.loop_mgr.cache_scan(site, timestamp, scan);
+        // that site to use. The declarations go with it: this is the newest
+        // frame of a running loop, and the still frame beside it is drawn from
+        // the same volume.
+        self.loop_mgr.cache_scan(site, timestamp, (scan, declared));
 
         append_polled_frame_to_loops(self.gui.panes_mut(), site, timestamp);
     }
@@ -1429,6 +1444,7 @@ impl super::App {
         &self,
         req: crate::app::render::LoopSectionRequest,
         scan: std::sync::Arc<nexrad_model::data::Scan>,
+        declared: std::sync::Arc<rustdar_radar::nyquist::DeclaredNyquist>,
     ) -> crate::render_dispatch::SectionDispatch {
         use crate::render_dispatch::SectionDispatch;
         // Destructured rather than taken as eight parameters, and the plan is
@@ -1474,7 +1490,12 @@ impl super::App {
             lat,
             lon,
             motion,
-        ) else {
+        )
+        // The live section's stamp, off this frame's own volume: a section of
+        // NROT or SRV is dealiased on the worker, and the whole point of the
+        // limits crossing the wire is that the worker folds where this thread
+        // would have.
+        .map(|input| input.with_declared_nyquist(&declared)) else {
             // This volume carries no field to cut under this product. Nothing
             // was spawned and no slot was taken, so the caller retires the frame
             // rather than waiting on a reply that will never come.

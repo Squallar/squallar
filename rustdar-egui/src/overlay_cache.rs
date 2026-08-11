@@ -175,6 +175,15 @@ pub struct RadarTextureMeta {
     /// describes, and geography that outlives its picture places the next one
     /// wrong.
     pub max_range_km: f64,
+    /// Where the cut behind these pixels declared its velocity folds, m/s, or
+    /// `None` for a raster no single cut is behind — every Level III product,
+    /// every volume product, and any volume that declared nothing.
+    ///
+    /// Travels with the texture for the reason `product` does, and it is the
+    /// same failure: a pane-level copy could outlive the pixels it describes,
+    /// and a fold limit that outlives its picture annotates the next one with
+    /// the previous cut's PRF.
+    pub nyquist_ms: Option<f64>,
     /// The product these pixels depict.
     ///
     /// Not the pane's `selected_product`: that is what the user has *asked* for,

@@ -40,6 +40,13 @@ pub struct RadarImageData {
     /// the range ring is drawn on it, and the hover picks a pixel out of it.
     pub max_range_km: f64,
     pub value_data: Arc<Vec<f32>>,
+    /// Where the cut this frame was drawn from declared its velocity folds,
+    /// m/s, or `None` for a frame no single cut is behind.
+    ///
+    /// Per frame, like `max_range_km`: a loop steps through volumes and the RDA
+    /// reselects PRFs between them, so the frame on the glass is the only thing
+    /// that can say where the picture on the glass wraps.
+    pub nyquist_ms: Option<f64>,
 }
 
 /// Holds a rendered cross-section raster and the little that has to travel with

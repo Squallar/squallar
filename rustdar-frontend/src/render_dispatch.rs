@@ -35,6 +35,11 @@ pub struct CachedPaneRender {
     pub value_data: Arc<Vec<f32>>,
     pub product: RadarProduct,
     pub elevation: f32,
+    /// Where the cached sweep's cut declared its velocity folds, m/s. Kept for
+    /// the same reason `max_range_km` is: a restore has to describe the pixels
+    /// it puts back the way the render described them, and the volume behind
+    /// them may be gone by then.
+    pub nyquist_ms: Option<f64>,
 }
 
 /// Per-pane render tracking state.
@@ -125,6 +130,11 @@ pub struct CachedRenderOutput {
     pub image: Arc<egui::ColorImage>,
     pub max_range_km: f64,
     pub value_data: Arc<Vec<f32>>,
+    /// Where the drawn sweep's cut declared its velocity folds, m/s — shared
+    /// with the buffer for the reason the extent is, and it is the same
+    /// argument: two panes on one `(site, product, view, elevation)` are
+    /// looking at one raster of one cut, so they are looking at one fold limit.
+    pub nyquist_ms: Option<f64>,
 }
 
 /// `(site, product, view, elevation_tenths)` — see [`elevation_key`] and
@@ -1202,12 +1212,23 @@ impl RenderDispatcher {
     /// Spawn a Level II render for a pane. `site` names the pane's radar for
     /// the per-site render parameters; the projection geometry still comes
     /// from `params`.
+    ///
+    /// `declared` is what the volume's cuts said about where their velocity
+    /// folds ([`rustdar_radar::nyquist::DeclaredNyquist`]), which `data` cannot
+    /// carry — the model type has no field for it. It is a *render* parameter
+    /// here and not merely provenance: NROT and SRV dealias, and the interval
+    /// they fold around is this number where the volume states one and an
+    /// estimate off the sweep's own extremes where it does not. Passing an
+    /// empty table is not an error and not a compile failure; it is the
+    /// plan view estimating a limit the section pane beside it was told.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_level2_render(
         &mut self,
         pane_idx: usize,
         params: &RenderParams,
         site: &str,
         data: Arc<nexrad_model::data::Scan>,
+        declared: &rustdar_radar::nyquist::DeclaredNyquist,
         sender: std::sync::mpsc::Sender<RenderResponse>,
         window: Option<WindowRef>,
     ) {
@@ -1255,7 +1276,15 @@ impl RenderDispatcher {
         ) {
             Some(input) => {
                 crate::offload::Job::Described(crate::offload::JobRequest::Radar {
-                    input: Box::new(input),
+                    // Stamped after extraction rather than threaded through it,
+                    // which is the shape `with_declared_nyquist` is documented
+                    // for: the walk builds the payload out of the sweeps, and
+                    // the one thing the sweeps do not carry comes from the
+                    // table the caller holds. The wire field already existed
+                    // for the vertical views — this is the plan view joining
+                    // them on it, so a section and the map under it fold the
+                    // same sweep at the same speed.
+                    input: Box::new(input.with_declared_nyquist(declared)),
                     // A static pane keeps the grid: it is what a hover reads.
                     values_wanted: true,
                     // And it is the one render kind that may take the
@@ -1528,6 +1557,7 @@ impl RenderDispatcher {
                             image: Arc::new(plan_view_image(&frame.image)?),
                             max_range_km: frame.max_range_km,
                             value_data: Arc::new(frame.values),
+                            nyquist_ms: frame.nyquist_ms,
                         })
                     }),
                     product,

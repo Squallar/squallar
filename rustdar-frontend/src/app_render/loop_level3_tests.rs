@@ -418,7 +418,7 @@ fn a_level3_loops_batch_settles_on_its_pairings_not_on_volumes() {
 
     // Caching the volumes changes nothing either way: this loop never reads them.
     for i in 0..3 {
-        mgr.cache_scan(SITE, ts(i), volume());
+        mgr.cache_scan(SITE, ts(i), (volume(), Default::default()));
     }
     assert!(!loop_batch_settled(
         &mgr,
@@ -741,6 +741,7 @@ fn image() -> rustdar_egui::pane::RadarImageData {
         lat: 35.33,
         lon: -97.27,
         max_range_km: 100.0,
+        nyquist_ms: None,
         value_data: Arc::new(Vec::new()),
     }
 }

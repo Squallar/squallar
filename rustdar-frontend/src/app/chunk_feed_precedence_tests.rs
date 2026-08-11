@@ -413,9 +413,10 @@ fn the_3d_build_reads_the_base_volume_and_not_the_live_snapshot() {
     // is deliberately never consulted by the stamp or the extraction, so
     // no build can be reached from it.
     let mut live_only = headless(TestBridge::desktop());
-    live_only
-        .scan_data
-        .insert("KTLX".to_string(), Arc::new(stamped_scan(10)));
+    live_only.scan_data.insert(
+        "KTLX".to_string(),
+        (Arc::new(stamped_scan(10)), Default::default()),
+    );
     live_only.handle_prepare_volume(0, target.clone());
     assert!(
         live_only.volume_store.lookup(&target).is_none(),

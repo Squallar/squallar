@@ -16,6 +16,7 @@ fn output(range: f64) -> CachedRenderOutput {
         image: Arc::new(egui::ColorImage::default()),
         max_range_km: range,
         value_data: Arc::new(Vec::new()),
+        nyquist_ms: None,
     }
 }
 

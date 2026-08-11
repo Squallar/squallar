@@ -208,6 +208,7 @@ fn dummy_plan_view(ctx: &egui::Context) -> RadarImageData {
         lat: 0.0,
         lon: 0.0,
         max_range_km: 100.0,
+        nyquist_ms: None,
         value_data: Arc::new(Vec::new()),
     }
 }

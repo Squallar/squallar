@@ -72,6 +72,7 @@ fn finished(product: RadarProduct, elevation: f32) -> CachedPaneRender {
         value_data: Arc::new(Vec::new()),
         product,
         elevation,
+        nyquist_ms: None,
     }
 }
 
@@ -279,6 +280,10 @@ fn a_long_range_render_is_placed_at_the_size_it_was_rendered_at() {
         value_data: std::sync::Arc::new(vec![f32::NAN; side * side]),
         product: PRODUCT,
         elevation: 0.5,
+        // A TDWR Doppler cut's own declaration, so the assertion below reads a
+        // number the fixture states rather than a default that would pass
+        // against a placement that dropped it.
+        nyquist_ms: Some(22.14),
     };
     app.apply_render_to_pane(&ctx, 0, &render);
 
@@ -299,6 +304,13 @@ fn a_long_range_render_is_placed_at_the_size_it_was_rendered_at() {
         Some(417.0),
         "the ground the texture is placed on is the render's own extent",
     );
+    assert_eq!(
+        placed.radar_meta.as_ref().and_then(|m| m.nyquist_ms),
+        Some(22.14),
+        "the fold limit of the cut behind these pixels travels with them; \
+         without it a velocity pane can say nothing about where its own \
+         picture wraps",
+    );
     // And the pane kept a copy at the same size, so a resume re-uploads the
     // picture rather than a differently shaped one.
     assert_eq!(
@@ -307,5 +319,47 @@ fn a_long_range_render_is_placed_at_the_size_it_was_rendered_at() {
             .as_ref()
             .map(|c| c.image.size),
         Some([side, side]),
+    );
+}
+
+/// A suspend and resume puts the picture back exactly as it was, fold limit
+/// included.
+///
+/// The restore path rebuilds the overlay entry from the pane's kept copy and
+/// from nothing else — the volume behind the pixels may have been evicted by
+/// then, and on a device that was backgrounded for an hour it certainly has
+/// been. A field that reached the texture on the render path but not on this
+/// one gives a pane that answers a question before suspend and stops answering
+/// it after, with the same picture on the glass either way.
+#[test]
+fn a_resume_puts_back_the_fold_limit_it_took_down() {
+    let ctx = egui::Context::default();
+    let mut app = app_showing_site();
+    let render = CachedPaneRender {
+        nyquist_ms: Some(26.42),
+        ..finished(PRODUCT, 0.5)
+    };
+    app.apply_render_to_pane(&ctx, 0, &render);
+
+    // What a surface loss does: the overlay entry goes, the pane's kept copy
+    // stays. `restore_cached_render` is what runs on the way back.
+    {
+        let pane = app.gui.pane_mut(0).unwrap();
+        let cache =
+            pane.overlay_cache_mut(rustdar_overlays::render::overlay_state::OverlayKind::Radar);
+        cache.current = None;
+    }
+    app.restore_cached_render(&ctx);
+
+    let pane = app.gui.pane_mut(0).unwrap();
+    let cache = pane.overlay_cache_mut(rustdar_overlays::render::overlay_state::OverlayKind::Radar);
+    let placed = cache
+        .current
+        .as_ref()
+        .expect("the kept copy must have been re-uploaded");
+    assert_eq!(
+        placed.radar_meta.as_ref().and_then(|m| m.nyquist_ms),
+        Some(26.42),
+        "the restored image describes the same cut the render did",
     );
 }

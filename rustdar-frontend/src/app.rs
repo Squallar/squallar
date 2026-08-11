@@ -252,8 +252,31 @@ pub struct App {
     /// Loop frames are not in here. They have their own cache and their own
     /// bound — see `LoopDownloadManager` and `MAX_LOOP_FRAMES`.
     ///
+    /// # Why the table rides beside the volume
+    ///
+    /// `(volume, what its cuts declared)`, for the reason
+    /// [`base_scans`](Self::base_scans) holds the same pair:
+    /// `nexrad_model::data::Radial` has no field for the Nyquist velocity its
+    /// Message 31 stated, so a `Scan` alone cannot answer where a cut's
+    /// velocity folds ([`rustdar_radar::nyquist`]).
+    ///
+    /// This is the store the **plan view** renders from, and it is a velocity
+    /// consumer: NROT and SRV dealias, and the limit they fold around is the
+    /// one the cut declared. `base_scans` already carried the table for the
+    /// section and the 3D resample, so a table here is what stops one pane
+    /// unfolding a sweep around the RDA's own number while the pane beside it
+    /// unfolds the same sweep around whatever its calmest sector estimated —
+    /// a disagreement with no error, no warning and no visible symptom beyond
+    /// two pictures of one cut.
+    ///
     /// [`evict_unshown_scans`]: Self::evict_unshown_scans
-    scan_data: std::collections::HashMap<String, Arc<nexrad_model::data::Scan>>,
+    scan_data: std::collections::HashMap<
+        String,
+        (
+            Arc<nexrad_model::data::Scan>,
+            Arc<rustdar_radar::nyquist::DeclaredNyquist>,
+        ),
+    >,
     /// The most recent **complete** volume for each site, with the time its
     /// first radial was collected — the base of the current merged volume
     /// ([`rustdar_radar::current::resolve`]) that sections, the 3D view and
@@ -343,10 +366,17 @@ pub struct App {
     /// above; see `chunk_notify`.
     chunk_notify: crate::chunk_notify::ChunkNotifier,
     // Cached latest scan per site from auto-poll while panes on that site view historic data.
+    /// `(volume, what its cuts declared, its product inventory, when it was
+    /// collected)`. The declared table travels because `handle_jump_to_live`
+    /// moves this entry straight into [`scan_data`](Self::scan_data), and a
+    /// volume that arrived here with its declarations and left without them
+    /// would put a jumped-to pane's velocity products back on estimated fold
+    /// limits — for exactly the volumes a user pressed Live to see.
     latest_cached_scans: HashMap<
         String,
         (
             Arc<nexrad_model::data::Scan>,
+            Arc<rustdar_radar::nyquist::DeclaredNyquist>,
             ScanInfo,
             chrono::NaiveDateTime,
         ),
@@ -1525,7 +1555,8 @@ impl App {
         self.volume_extractions
             .set(self.volume_extractions.get() + 1);
         let radar = rustdar_radar::sites::get_radar_site(site)?;
-        let scan = Arc::clone(self.loop_mgr.get_cached(site, &collected)?);
+        let (scan, declared) = self.loop_mgr.get_cached(site, &collected)?;
+        let (scan, declared) = (Arc::clone(scan), Arc::clone(declared));
         let sweeps: Vec<&nexrad_model::data::Sweep> = scan.sweeps().iter().collect();
         rustdar_radar::render_input::RenderInput::extract_volume_parts(
             scan.coverage_pattern(),
@@ -1535,6 +1566,12 @@ impl App {
             radar.lon,
             self.render.storm_motion_override_kt(),
         )
+        // The same stamp the live payload takes, off the loop's own copy of the
+        // volume's declarations. A 3D loop frame of NROT or SRV is dealiased on
+        // the worker, and a frame that arrived without this would fold around an
+        // estimate while the still frame beside it folded around the RDA's
+        // statement of the same cut.
+        .map(|input| input.with_declared_nyquist(&declared))
     }
 
     /// Take delivery of finished voxel builds.
@@ -2034,15 +2071,21 @@ impl App {
                                 &site,
                                 timestamp,
                                 Arc::clone(&scan_arc),
+                                Arc::clone(&declared_nyquist),
                             );
                             self.latest_cached_scans
-                                .insert(site, (scan_arc, scan_info, timestamp));
+                                .insert(site, (scan_arc, declared_nyquist, scan_info, timestamp));
                         } else if feed_is_ahead {
                             log::info!(
                                 "Keeping the real-time volume for {site}: the archive's \
                                  latest is {timestamp}, which is not newer"
                             );
-                            self.append_scan_to_active_loops(&site, timestamp, scan_arc);
+                            self.append_scan_to_active_loops(
+                                &site,
+                                timestamp,
+                                scan_arc,
+                                declared_nyquist,
+                            );
                             // The wait this fetch belonged to still has to end.
                             // A Refresh raises `fetching`, and `check_auto_polls`
                             // refuses to poll while it is set — so skipping
@@ -2052,7 +2095,10 @@ impl App {
                             self.gui.clear_loading_site_for_site(&site);
                         } else {
                             log::info!("Received scan data from background thread");
-                            self.scan_data.insert(site.clone(), Arc::clone(&scan_arc));
+                            self.scan_data.insert(
+                                site.clone(),
+                                (Arc::clone(&scan_arc), Arc::clone(&declared_nyquist)),
+                            );
                             self.gui.set_scan_info_for_site(&site, scan_info);
                             self.gui.clear_loading_site_for_site(&site);
                             self.render.reset_panes_for_site(&site, &self.gui);
@@ -2063,6 +2109,7 @@ impl App {
                                 &site,
                                 timestamp,
                                 Arc::clone(&scan_arc),
+                                Arc::clone(&declared_nyquist),
                             );
 
                             // If this was a manual navigation, reinitialize active loops

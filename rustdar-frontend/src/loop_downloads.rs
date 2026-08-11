@@ -20,8 +20,18 @@ pub type L3FrameKey = (String, String, chrono::NaiveDateTime);
 /// target key, the sibling broadcast, the readiness rules — treats a frame the same
 /// either way.
 pub enum LoopFrameData {
-    /// A decoded Level II volume; the renderer picks its sweep out of it.
-    Volume(Arc<nexrad_model::data::Scan>),
+    /// A decoded Level II volume and what its cuts declared their Nyquist
+    /// velocities to be; the renderer picks its sweep out of the first and
+    /// folds that sweep's velocity around the second.
+    ///
+    /// The table is not derivable from the `Scan` — `nexrad_model`'s radial
+    /// has no field for it ([`rustdar_radar::nyquist`]) — so it travels, or
+    /// the frame dealiases on an estimate while the still frame beside it
+    /// dealiases on the RDA's own number.
+    Volume(
+        Arc<nexrad_model::data::Scan>,
+        Arc<rustdar_radar::nyquist::DeclaredNyquist>,
+    ),
     /// The Level III objects of this frame's volume, one per AWIPS code in
     /// [`RadarProduct::level3_products`] order.
     ///
@@ -32,6 +42,17 @@ pub enum LoopFrameData {
     /// that reads more than the first entry.
     Products(Vec<Arc<Level3Product>>),
 }
+
+/// One downloaded volume as the loop caches it: the sweeps, and what their cuts
+/// declared their Nyquist velocities to be.
+///
+/// Named rather than spelt out at the cache, its two accessors and every caller
+/// that holds one: two `Arc`s of unrelated types are exactly the pair that gets
+/// transposed with no type error to catch it.
+pub type CachedVolume = (
+    Arc<nexrad_model::data::Scan>,
+    Arc<rustdar_radar::nyquist::DeclaredNyquist>,
+);
 
 /// Whether a frame's Level III objects have arrived.
 #[derive(Debug, PartialEq, Eq)]
@@ -64,7 +85,11 @@ pub enum L3FrameState {
 pub struct LoopDownloadManager {
     /// Downloaded scan data cache for loop frames, keyed by site then timestamp
     /// (shared across every pane looping that site).
-    scan_cache: HashMap<String, HashMap<chrono::NaiveDateTime, Arc<nexrad_model::data::Scan>>>,
+    ///
+    /// One entry is `(volume, what its cuts declared)` — see
+    /// [`LoopFrameData::Volume`] for why the second half cannot be recovered
+    /// from the first.
+    scan_cache: HashMap<String, HashMap<chrono::NaiveDateTime, CachedVolume>>,
     /// Scans currently being downloaded, keyed by site then timestamp (to avoid
     /// duplicate downloads across panes looping the same site).
     in_flight_set: HashMap<String, HashSet<chrono::NaiveDateTime>>,
@@ -227,26 +252,18 @@ impl LoopDownloadManager {
             .is_some_and(|tss| tss.contains(ts))
     }
 
-    /// Get a cached scan by site and timestamp.
-    pub fn get_cached(
-        &self,
-        site: &str,
-        ts: &chrono::NaiveDateTime,
-    ) -> Option<&Arc<nexrad_model::data::Scan>> {
+    /// Get a cached volume and its declarations by site and timestamp.
+    pub fn get_cached(&self, site: &str, ts: &chrono::NaiveDateTime) -> Option<&CachedVolume> {
         self.scan_cache.get(site)?.get(ts)
     }
 
-    /// Store a downloaded scan in the cache under the site it was downloaded for.
-    pub fn cache_scan(
-        &mut self,
-        site: &str,
-        ts: chrono::NaiveDateTime,
-        scan: Arc<nexrad_model::data::Scan>,
-    ) {
+    /// Store a downloaded volume in the cache under the site it was downloaded
+    /// for, with what its cuts declared.
+    pub fn cache_scan(&mut self, site: &str, ts: chrono::NaiveDateTime, volume: CachedVolume) {
         self.scan_cache
             .entry(site.to_string())
             .or_default()
-            .insert(ts, scan);
+            .insert(ts, volume);
     }
 
     /// Mark a site's timestamp as currently being downloaded.
@@ -502,7 +519,7 @@ impl LoopDownloadManager {
                 .map(LoopFrameData::Products);
         }
         self.get_cached(site, ts)
-            .map(|scan| LoopFrameData::Volume(Arc::clone(scan)))
+            .map(|(scan, declared)| LoopFrameData::Volume(Arc::clone(scan), Arc::clone(declared)))
     }
 
     /// Whether frame `ts`'s data question has been *answered* — the volume is
@@ -607,8 +624,14 @@ mod tests {
             .unwrap()
     }
 
-    /// A distinct scan value. The contents do not matter — every assertion here is
-    /// about *which* `Arc` comes back out, compared by pointer.
+    /// A distinct cached volume. The contents do not matter — every assertion
+    /// here is about *which* `Arc` comes back out, compared by pointer — and
+    /// nothing here reads the declarations, so the fixture declares nothing.
+    fn volume() -> CachedVolume {
+        (scan(), Arc::default())
+    }
+
+    /// A distinct scan value.
     fn scan() -> Arc<Scan> {
         Arc::new(Scan::new(
             VolumeCoveragePattern::new(
@@ -638,18 +661,24 @@ mod tests {
     #[test]
     fn one_sites_scan_does_not_displace_another_at_the_same_timestamp() {
         let mut mgr = LoopDownloadManager::new();
-        let ktlx = scan();
-        let koun = scan();
+        let ktlx = volume();
+        let koun = volume();
 
-        mgr.cache_scan("KTLX", ts(0), Arc::clone(&ktlx));
-        mgr.cache_scan("KOUN", ts(0), Arc::clone(&koun));
+        mgr.cache_scan("KTLX", ts(0), ktlx.clone());
+        mgr.cache_scan("KOUN", ts(0), koun.clone());
 
         assert!(
-            Arc::ptr_eq(mgr.get_cached("KTLX", &ts(0)).expect("KTLX cached"), &ktlx),
+            Arc::ptr_eq(
+                &mgr.get_cached("KTLX", &ts(0)).expect("KTLX cached").0,
+                &ktlx.0
+            ),
             "KTLX's loop must still get KTLX's scan"
         );
         assert!(
-            Arc::ptr_eq(mgr.get_cached("KOUN", &ts(0)).expect("KOUN cached"), &koun),
+            Arc::ptr_eq(
+                &mgr.get_cached("KOUN", &ts(0)).expect("KOUN cached").0,
+                &koun.0
+            ),
             "and KOUN's loop KOUN's"
         );
     }
@@ -660,7 +689,7 @@ mod tests {
     #[test]
     fn a_cached_scan_for_one_site_does_not_satisfy_another() {
         let mut mgr = LoopDownloadManager::new();
-        mgr.cache_scan("KTLX", ts(0), scan());
+        mgr.cache_scan("KTLX", ts(0), volume());
 
         assert!(mgr.is_cached("KTLX", &ts(0)));
         assert!(
@@ -697,14 +726,14 @@ mod tests {
     #[test]
     fn the_same_site_and_timestamp_is_still_replaced() {
         let mut mgr = LoopDownloadManager::new();
-        let first = scan();
-        let second = scan();
-        mgr.cache_scan("KTLX", ts(0), Arc::clone(&first));
-        mgr.cache_scan("KTLX", ts(0), Arc::clone(&second));
+        let first = volume();
+        let second = volume();
+        mgr.cache_scan("KTLX", ts(0), first.clone());
+        mgr.cache_scan("KTLX", ts(0), second.clone());
 
         assert!(Arc::ptr_eq(
-            mgr.get_cached("KTLX", &ts(0)).unwrap(),
-            &second
+            &mgr.get_cached("KTLX", &ts(0)).unwrap().0,
+            &second.0
         ));
     }
 
@@ -720,8 +749,8 @@ mod tests {
     #[test]
     fn clear_all_empties_every_sites_state() {
         let mut mgr = LoopDownloadManager::new();
-        mgr.cache_scan("KTLX", ts(0), scan());
-        mgr.cache_scan("KOUN", ts(0), scan());
+        mgr.cache_scan("KTLX", ts(0), volume());
+        mgr.cache_scan("KOUN", ts(0), volume());
         mgr.mark_in_flight("KTLX", ts(1));
         mgr.insert_pending(
             0,

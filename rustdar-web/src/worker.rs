@@ -131,6 +131,7 @@ fn post_result(
     proto::set_field(&message, proto::IMAGE, &JsValue::NULL);
     proto::set_field(&message, proto::VALUES, &JsValue::NULL);
     proto::set_field(&message, proto::MAX_RANGE, &JsValue::from_f64(0.0));
+    proto::set_field(&message, proto::NYQUIST, &JsValue::NULL);
     proto::set_field(&message, proto::OUT, &JsValue::NULL);
     proto::set_field(&message, proto::OUT_KIND, &JsValue::NULL);
 
@@ -140,6 +141,7 @@ fn post_result(
             image,
             max_range_km,
             values,
+            nyquist_ms,
         })) => {
             let image = js_sys::Uint8Array::from(image.as_slice());
             let values = js_sys::Float32Array::from(values.as_slice());
@@ -148,6 +150,12 @@ fn post_result(
             proto::set_field(&message, proto::IMAGE, &image);
             proto::set_field(&message, proto::VALUES, &values);
             proto::set_field(&message, proto::MAX_RANGE, &JsValue::from_f64(max_range_km));
+            // The one field on this arm that a frame may honestly not have; it
+            // stays null for a Level III or volume product, which is what the
+            // default above already wrote.
+            if let Some(nyquist_ms) = nyquist_ms {
+                proto::set_field(&message, proto::NYQUIST, &JsValue::from_f64(nyquist_ms));
+            }
         }
         Some(output) => {
             let kind = output.view().wire_code();

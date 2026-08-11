@@ -1452,6 +1452,10 @@ impl InputHarness {
                 lat,
                 lon,
                 max_range_km: extent_km,
+                // The fixture states no fold limit: nothing driven through
+                // this harness reads one, and a number invented here would be
+                // a claim about a sweep the harness never rendered.
+                nyquist_ms: None,
                 product,
                 elevation,
             }),

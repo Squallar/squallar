@@ -64,8 +64,11 @@ fn app_with_volume_loop(minutes: &[u32]) -> crate::app::App {
     app.render.ensure_pane_count(1);
     app.loop_mgr = LoopDownloadManager::new();
     for &m in minutes {
-        app.loop_mgr
-            .cache_scan(SITE, ts(m), std::sync::Arc::new(empty_scan()));
+        app.loop_mgr.cache_scan(
+            SITE,
+            ts(m),
+            (std::sync::Arc::new(empty_scan()), Default::default()),
+        );
     }
 
     let pane = app.gui.pane_mut(0).expect("pane 0 exists");
@@ -626,8 +629,11 @@ fn app_with_built_volume_loop(minutes: &[u32]) -> crate::app::App {
     let mut app = app_with_volume_loop(minutes);
     app.loop_mgr = LoopDownloadManager::new();
     for &m in minutes {
-        app.loop_mgr
-            .cache_scan(SITE, ts(m), std::sync::Arc::new(resamplable_scan(m)));
+        app.loop_mgr.cache_scan(
+            SITE,
+            ts(m),
+            (std::sync::Arc::new(resamplable_scan(m)), Default::default()),
+        );
     }
     app
 }

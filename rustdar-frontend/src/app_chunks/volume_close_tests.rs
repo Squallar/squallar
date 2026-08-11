@@ -134,6 +134,7 @@ fn app_showing_a_drawn_volume(product: RadarProduct) -> App {
             image: Arc::new(egui::ColorImage::default()),
             max_range_km: 100.0,
             value_data: Arc::new(Vec::new()),
+            nyquist_ms: None,
         },
     );
     app
@@ -180,7 +181,7 @@ fn a_completed_volume_re_renders_every_whole_volume_pane() {
         assert_eq!(
             app.scan_data
                 .get("KTLX")
-                .map(|s| s.sweeps().len())
+                .map(|(scan, _)| scan.sweeps().len())
                 .unwrap_or(0),
             5,
             "{product:?}: the completed volume never reached the display"
@@ -212,7 +213,7 @@ fn a_completed_volume_reaches_the_scan_info_and_the_loop_cache() {
         .expect("the pane must still have scan info");
     let cached = app.loop_mgr.get_cached("KTLX", &shown);
     assert_eq!(
-        cached.map(|s| s.sweeps().len()),
+        cached.map(|(scan, _)| scan.sweeps().len()),
         Some(5),
         "the completed volume never reached the loop cache, so an active \
              loop's newest frame stays a volume behind"
@@ -399,7 +400,7 @@ fn a_whole_volume_does_reach_the_loop_cache() {
     assert_eq!(
         app.loop_mgr
             .get_cached("KTLX", &shown)
-            .map(|s| s.sweeps().len()),
+            .map(|(scan, _)| scan.sweeps().len()),
         Some(5),
         "a whole volume was withheld from the loop cache, so every loop frame \
              waits on an archive download the feed already had"

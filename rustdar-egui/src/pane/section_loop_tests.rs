@@ -90,6 +90,7 @@ fn plan_view_picture(ctx: &egui::Context) -> LoopFrameImage {
         lat: 35.33,
         lon: -97.28,
         max_range_km: 230.0,
+        nyquist_ms: None,
         value_data: Arc::new(Vec::new()),
     })
 }
