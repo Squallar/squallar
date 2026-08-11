@@ -147,6 +147,7 @@ use crate::hca::{
     resolve_init_fdp,
 };
 use crate::kdp::KdpParams;
+use crate::par::*;
 use nexrad_model::data::Radial;
 
 /// The QPEHHC grid: 360 × 920 gates of 0.25 km (`dp_Consts.h`).
@@ -266,29 +267,54 @@ pub(crate) fn prepare_tilt(
     let dbz0 = params.dbz0.map(f64::from);
     let atmos = params.atmos_db_per_km.map(f64::from);
 
+    // **The tilt's radials fan out; where they land does not.**
+    //
+    // Each radial's row is a pure function of that radial and the volume state
+    // beside it — `radial_fields`, `classify_radial` and `beam_ml_intersection`
+    // read `c`, `ml`, `hsda` and `cappi` and write nothing — so ~360 radials
+    // × 1 832 gates of fuzzy classification is the crate's most obviously
+    // parallel work. What is *not* independent is the placement: two radials
+    // can round to the same whole degree, and there the later one in
+    // `combined`'s order wins.
+    //
+    // So the map keeps `combined`'s order (rayon's `map`/`collect` is
+    // order-preserving, exactly as `into_iter` is) and the writes are replayed
+    // into it afterwards. A `for_each` writing straight into `rows` would have
+    // been shorter and would have let two radials on one degree resolve by
+    // whichever thread finished last.
+    let placed: Vec<(usize, TiltRow)> = combined
+        .par_iter()
+        .map(|c| {
+            let f = radial_fields(
+                c,
+                init_fdp,
+                dbz0,
+                atmos,
+                opts.quantize_transport,
+                opts.metsignal,
+                cappi,
+            );
+            let class = classify_radial(&f, ml, hsda.tw0_km_arl);
+            let az = (f.az.rem_euclid(360.0)) as usize % HHC_AZ;
+            let ml_bins = beam_ml_intersection(f.elev, az, f.dg, ml);
+            (
+                az,
+                TiltRow {
+                    class,
+                    smz: f.smz,
+                    zdr: f.zdr,
+                    kdp: f.kdp,
+                    met: f.met,
+                    hatt: f.hatt,
+                    bin_tt: ml_bins.tt,
+                },
+            )
+        })
+        .collect();
+
     let mut rows: Tilt = (0..HHC_AZ).map(|_| None).collect();
-    for c in &combined {
-        let f = radial_fields(
-            c,
-            init_fdp,
-            dbz0,
-            atmos,
-            opts.quantize_transport,
-            opts.metsignal,
-            cappi,
-        );
-        let class = classify_radial(&f, ml, hsda.tw0_km_arl);
-        let az = (f.az.rem_euclid(360.0)) as usize % HHC_AZ;
-        let ml_bins = beam_ml_intersection(f.elev, az, f.dg, ml);
-        rows[az] = Some(TiltRow {
-            class,
-            smz: f.smz,
-            zdr: f.zdr,
-            kdp: f.kdp,
-            met: f.met,
-            hatt: f.hatt,
-            bin_tt: ml_bins.tt,
-        });
+    for (az, row) in placed {
+        rows[az] = Some(row);
     }
     Some(rows)
 }
@@ -745,5 +771,77 @@ mod tests {
                 "bin {r}: the supplemental cut's BD replaces the base cut's RA",
             );
         }
+    }
+
+    /// One whole-degree radial at an arbitrary azimuth, uniform in range.
+    fn radial_at(az: f64, elev: f32, dbz: f64) -> Radial {
+        let z: Vec<G> = (0..D_GATES).map(|_| G::V(dbz)).collect();
+        let zdr: Vec<G> = (0..D_GATES).map(|_| G::V(1.0)).collect();
+        let rho: Vec<G> = (0..D_GATES).map(|_| G::V(0.99)).collect();
+        let phi: Vec<G> = (0..D_GATES).map(|_| G::V(60.0)).collect();
+        Radial::new(
+            0,
+            0,
+            az as f32,
+            1.0,
+            RadialStatus::IntermediateRadialData,
+            1,
+            elev,
+            Some(m8(2.0, 66.0, &z)),
+            None,
+            None,
+            Some(m8(16.0, 128.0, &zdr)),
+            Some(m16(10.0, 2.0, &phi)),
+            Some(m16(500.0, 2.0, &rho)),
+            None,
+        )
+    }
+
+    /// **Two radials on one whole degree still resolve to the later one.**
+    ///
+    /// [`prepare_tilt`] indexes its rows by whole degree, and a tilt can carry
+    /// two radials that round to the same one. The serial loop it grew out of
+    /// wrote each row as it went, so the last writer won; the fan-out that
+    /// replaced it computes the rows in parallel and *replays* the writes in
+    /// `combined`'s order for exactly this reason. Writing them from the
+    /// parallel loop instead would be shorter, would pass every other test
+    /// here, and would let the two radials resolve by whichever thread finished
+    /// last.
+    #[test]
+    fn two_radials_on_one_degree_resolve_to_the_later_one() {
+        let radials = vec![
+            radial_at(10.2, 0.5, 30.0),
+            radial_at(10.7, 0.5, 55.0),
+            radial_at(11.5, 0.5, 30.0),
+        ];
+
+        // The premise: whole-degree radials pass through `combine_sweep_dp`
+        // unpaired, so the first two really do collide on degree 10.
+        let inputs: Vec<DpInput> = radials.iter().filter_map(DpInput::from_radial).collect();
+        let degrees: Vec<usize> = combine_sweep_dp(&inputs, true)
+            .iter()
+            .map(|c| (c.base.az.rem_euclid(360.0)) as usize % HHC_AZ)
+            .collect();
+        assert_eq!(
+            degrees,
+            vec![10, 10, 11],
+            "the fixture's radials no longer collide on one degree; this proves nothing"
+        );
+
+        let rows = prepare_tilt(
+            &radials,
+            &params(),
+            &MeltingLayer::flat(4.0),
+            &hsda_far(),
+            None,
+            HcaOptions::primary(),
+        )
+        .expect("a tilt");
+        let smz = rows[10].as_ref().expect("degree 10 is filled").smz[100];
+        assert!(
+            smz > 45.0,
+            "degree 10 kept the 30 dBZ radial (smz {smz}), not the 55 dBZ one \
+             that came after it in the sweep",
+        );
     }
 }

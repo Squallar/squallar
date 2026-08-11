@@ -1209,62 +1209,68 @@ fn melting_layer_gaps_interpolate_between_valid_azimuths() {
     assert!(ml.top_km_arl.iter().all(|t| t.is_finite()));
 }
 
-/// The full MLDA on synthetic 4°–10° sweeps: a wet-snow ring (Z 33,
-/// ZDR 1.5, ρ 0.93) painted where the beam sits between 2.5 and
-/// 2.95 km, rain below it, dry snow above it. Three tilts accumulate
-/// past the 1500 floor and the detected layer lands on the ring.
+/// One 360-radial sweep with a wet-snow ring (Z 33, ZDR 1.5, ρ 0.93) painted
+/// where the beam sits between 2.5 and 2.95 km, rain below it and dry snow
+/// above it.
+fn wet_snow_ring_sweep(elev: f64) -> Vec<Radial> {
+    (0..360)
+        .map(|k| {
+            let h = move |i: usize| ml_height_from_range(elev, i as f64 * 0.25);
+            let z = move |i: usize| {
+                let h = h(i);
+                if h < 2.5 {
+                    G::V(30.0)
+                } else if h < 2.95 {
+                    G::V(33.0)
+                } else if h < 5.0 {
+                    G::V(25.0)
+                } else {
+                    G::Nd
+                }
+            };
+            let zdr = move |i: usize| {
+                let h = h(i);
+                if h < 2.5 {
+                    G::V(1.0)
+                } else if h < 2.95 {
+                    G::V(1.5)
+                } else {
+                    G::V(0.25)
+                }
+            };
+            let rho = move |i: usize| {
+                let h = h(i);
+                if (2.5..2.95).contains(&h) {
+                    G::V(0.93)
+                } else {
+                    G::V(0.99)
+                }
+            };
+            let phi = |_: usize| G::V(60.0);
+            hca_radial(
+                0.5 + k as f64,
+                1.0,
+                elev as f32,
+                D_GATES,
+                &z,
+                &zdr,
+                &rho,
+                &phi,
+                None,
+            )
+        })
+        .collect()
+}
+
+/// The full MLDA on synthetic 4°–10° sweeps: a wet-snow ring, rain below it,
+/// dry snow above it. Three tilts accumulate past the 1500 floor and the
+/// detected layer lands on the ring.
 #[test]
 fn detect_melting_layer_finds_the_wet_snow_ring() {
-    let make_sweep = |elev: f64| -> Vec<Radial> {
-        (0..360)
-            .map(|k| {
-                let h = move |i: usize| ml_height_from_range(elev, i as f64 * 0.25);
-                let z = move |i: usize| {
-                    let h = h(i);
-                    if h < 2.5 {
-                        G::V(30.0)
-                    } else if h < 2.95 {
-                        G::V(33.0)
-                    } else if h < 5.0 {
-                        G::V(25.0)
-                    } else {
-                        G::Nd
-                    }
-                };
-                let zdr = move |i: usize| {
-                    let h = h(i);
-                    if h < 2.5 {
-                        G::V(1.0)
-                    } else if h < 2.95 {
-                        G::V(1.5)
-                    } else {
-                        G::V(0.25)
-                    }
-                };
-                let rho = move |i: usize| {
-                    let h = h(i);
-                    if (2.5..2.95).contains(&h) {
-                        G::V(0.93)
-                    } else {
-                        G::V(0.99)
-                    }
-                };
-                let phi = |_: usize| G::V(60.0);
-                hca_radial(
-                    0.5 + k as f64,
-                    1.0,
-                    elev as f32,
-                    D_GATES,
-                    &z,
-                    &zdr,
-                    &rho,
-                    &phi,
-                    None,
-                )
-            })
-            .collect()
-    };
-    let sweeps: Vec<Vec<Radial>> = [4.5, 5.5, 6.5].iter().map(|&e| make_sweep(e)).collect();
+    let sweeps: Vec<Vec<Radial>> = [4.5, 5.5, 6.5]
+        .iter()
+        .map(|&e| wet_snow_ring_sweep(e))
+        .collect();
     let sweep_refs: Vec<&[Radial]> = sweeps.iter().map(|s| s.as_slice()).collect();
     let ml = detect_melting_layer(&sweep_refs, &params(), 2.75, &hsda_far(), None);
     for az in [0usize, 90, 180, 270] {
@@ -1284,6 +1290,54 @@ fn detect_melting_layer_finds_the_wet_snow_ring() {
     let quiet = detect_melting_layer(&[], &params(), 2.75, &hsda_far(), None);
     assert_eq!(quiet.top_km_arl[0], 2.75);
     assert_eq!(quiet.bottom_km_arl[0], 2.25);
+}
+
+/// **The tilt the pool classifies is the tilt one thread classifies, bit for
+/// bit.**
+///
+/// [`compute_hca`] maps each radial to a row of external codes and keeps
+/// `combined`'s order, so nothing is summed across radials and nothing can be
+/// reassociated. Every other test in this module asserts ranges and classes,
+/// which a last-bit difference would slip straight past, so this one compares
+/// the exact bits — against a one-thread pool, and against repeat runs.
+#[test]
+fn the_pool_classifies_a_tilt_the_way_one_thread_does() {
+    assert!(
+        rayon::current_num_threads() > 1,
+        "single-threaded pool: this test cannot observe a race"
+    );
+    let one = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("a one-thread pool");
+
+    // ── One tilt through the per-radial classification ──────────────────
+    let tilt = wet_snow_ring_sweep(4.5);
+    let ml = MeltingLayer::flat(2.75);
+    let classify = || compute_hca(&tilt, &params(), &ml, &hsda_far(), None).expect("computes");
+    let parallel = classify();
+    assert!(
+        parallel.values.iter().flatten().any(|v| !v.is_nan()),
+        "every gate is undefined; the fixture proves nothing"
+    );
+    for (label, other) in [
+        ("one thread", one.install(classify)),
+        ("a repeat", classify()),
+    ] {
+        assert_eq!(
+            parallel.azimuths_deg, other.azimuths_deg,
+            "{label} put the radials in a different order",
+        );
+        for (r, (a, b)) in parallel.values.iter().zip(&other.values).enumerate() {
+            for (g, (&x, &y)) in a.iter().zip(b).enumerate() {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "{label}: radial {r} gate {g} is {y}, not {x}",
+                );
+            }
+        }
+    }
 }
 
 // ── Hail size discrimination (HailSize.cpp v3) ─────────────────────────

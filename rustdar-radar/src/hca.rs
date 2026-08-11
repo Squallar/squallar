@@ -337,6 +337,7 @@ use crate::dpprep::{
     std_filter, unfold_phidp,
 };
 use crate::kdp::KdpParams;
+use crate::par::*;
 use nexrad_model::data::Radial;
 
 pub use crate::dpprep::ReflCappi;
@@ -1940,33 +1941,41 @@ fn compute_hca_impl(
     let dbz0 = params.dbz0.map(f64::from);
     let atmos = params.atmos_db_per_km.map(f64::from);
 
-    let mut values = Vec::with_capacity(combined.len());
-    let mut azimuths = Vec::with_capacity(combined.len());
-    for c in &combined {
-        let fields = radial_fields(
-            c,
-            init_fdp,
-            dbz0,
-            atmos,
-            opts.quantize_transport,
-            opts.metsignal,
-            cappi,
-        );
-        let classes = classify_radial(&fields, ml, hsda.tw0_km_arl);
-        let sub = if ENABLE_SIZE {
-            hail_size_radial(&fields, &classes, hsda)
-        } else {
-            vec![HailSize::NotHail; classes.len()]
-        };
-        values.push(
-            classes
+    // One radial at a time, all at once. `radial_fields`, `classify_radial` and
+    // `hail_size_radial` read this radial and the volume state around it and
+    // write nothing else; the output is one row per radial, in `combined`'s
+    // order, which rayon's `map`/`collect` keeps exactly as `into_iter` did.
+    // Nothing is summed across radials, so no float is reassociated and the
+    // product is the serial one gate for gate —
+    // [`tests::the_pool_classifies_a_volume_the_way_one_thread_does`].
+    let (values, azimuths): (Vec<Vec<f32>>, Vec<f64>) = combined
+        .par_iter()
+        .map(|c| {
+            let fields = radial_fields(
+                c,
+                init_fdp,
+                dbz0,
+                atmos,
+                opts.quantize_transport,
+                opts.metsignal,
+                cappi,
+            );
+            let classes = classify_radial(&fields, ml, hsda.tw0_km_arl);
+            let sub = if ENABLE_SIZE {
+                hail_size_radial(&fields, &classes, hsda)
+            } else {
+                vec![HailSize::NotHail; classes.len()]
+            };
+            let row: Vec<f32> = classes
                 .iter()
                 .zip(sub.iter())
                 .map(|(&cl, &s)| external_code(cl, s))
-                .collect(),
-        );
-        azimuths.push(c.base.az);
-    }
+                .collect();
+            (row, c.base.az)
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .unzip();
 
     Some(DerivedHca {
         values,
