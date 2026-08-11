@@ -1292,16 +1292,20 @@ fn detect_melting_layer_finds_the_wet_snow_ring() {
     assert_eq!(quiet.bottom_km_arl[0], 2.25);
 }
 
-/// **The tilt the pool classifies is the tilt one thread classifies, bit for
-/// bit.**
+/// **Both of this module's radial fan-outs land on the answer one thread
+/// lands on, bit for bit.**
 ///
-/// [`compute_hca`] maps each radial to a row of external codes and keeps
-/// `combined`'s order, so nothing is summed across radials and nothing can be
-/// reassociated. Every other test in this module asserts ranges and classes,
-/// which a last-bit difference would slip straight past, so this one compares
-/// the exact bits — against a one-thread pool, and against repeat runs.
+/// [`compute_hca`] maps each radial to a row and keeps `combined`'s order, so
+/// there is nothing to reassociate; [`detect_melting_layer`] maps each radial
+/// to the heights it votes for and then *adds the votes serially*, because
+/// `weight` is a float accumulator that several radials of a sweep write to and
+/// `+=` over floats is not associative. Turning either into a parallel
+/// reduction would still pass every other test in this module — they assert
+/// ranges and classes, and a last-bit difference in an accumulator is invisible
+/// to all of them — so this compares the exact bits against a one-thread pool
+/// and against repeat runs.
 #[test]
-fn the_pool_classifies_a_tilt_the_way_one_thread_does() {
+fn the_pool_classifies_a_volume_the_way_one_thread_does() {
     assert!(
         rayon::current_num_threads() > 1,
         "single-threaded pool: this test cannot observe a race"
@@ -1336,6 +1340,37 @@ fn the_pool_classifies_a_tilt_the_way_one_thread_does() {
                     "{label}: radial {r} gate {g} is {y}, not {x}",
                 );
             }
+        }
+    }
+
+    // ── Three tilts through the melting-layer accumulator ───────────────
+    let sweeps: Vec<Vec<Radial>> = [4.5, 5.5, 6.5]
+        .iter()
+        .map(|&e| wet_snow_ring_sweep(e))
+        .collect();
+    let refs: Vec<&[Radial]> = sweeps.iter().map(|s| s.as_slice()).collect();
+    let detect = || detect_melting_layer(&refs, &params(), 2.75, &hsda_far(), None);
+    let parallel = detect();
+    assert!(
+        parallel.top_km_arl[0] != 2.75,
+        "the layer is still the default; nothing accumulated and this proves nothing"
+    );
+    for (label, other) in [("one thread", one.install(detect)), ("a repeat", detect())] {
+        for az in 0..360 {
+            assert_eq!(
+                parallel.top_km_arl[az].to_bits(),
+                other.top_km_arl[az].to_bits(),
+                "{label}: the layer top at az {az} is {}, not {}",
+                other.top_km_arl[az],
+                parallel.top_km_arl[az],
+            );
+            assert_eq!(
+                parallel.bottom_km_arl[az].to_bits(),
+                other.bottom_km_arl[az].to_bits(),
+                "{label}: the layer bottom at az {az} is {}, not {}",
+                other.bottom_km_arl[az],
+                parallel.bottom_km_arl[az],
+            );
         }
     }
 }

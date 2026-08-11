@@ -2119,67 +2119,91 @@ fn detect_melting_layer_impl(
         let init_fdp = resolve_init_fdp(params, &combined, opts.isdp_estimated);
         let elev_weight = ml_elev_weight(sweep_elev);
 
-        for c in &combined {
-            let f = radial_fields(
-                c,
-                init_fdp,
-                dbz0,
-                atmos,
-                opts.quantize_transport,
-                opts.metsignal,
-                cappi,
-            );
-            let classes = classify_radial(&f, &default, hsda.tw0_km_arl);
-            let stop = (ml_range_from_height(c.elev, ML_MAX_TOP_KM) / f.dg + 0.5) as usize;
-            let az_index = (f.az.rem_euclid(360.0)) as usize % 360;
-            for (i, &class) in classes.iter().enumerate().take(f.n.min(stop)) {
-                if class == GC || class == BI || class == UK || class == NE {
-                    continue;
-                }
-                if f.snr[i] <= ML_MIN_SNR {
-                    continue;
-                }
-                if !(f.smz[i] > ML_LOWER_Z
-                    && f.smz[i] < ML_UPPER_Z
-                    && f.rho[i] > ML_LOWER_RHO
-                    && f.rho[i] < ML_UPPER_RHO)
-                {
-                    continue;
-                }
-                let height_index = (ml_height_from_range(c.elev, i as f64 * f.dg)
-                    / ML_HEIGHT_INTERVAL_KM
-                    + 0.5) as usize;
-                if height_index >= ML_MAX_HEIGHTS {
-                    continue;
-                }
-                // Search up to 0.5 km above this gate for the Z and ZDR
-                // maxima that fingerprint wet snow.
-                let temp_height = ML_DEPTH_KM + ml_height_from_range(c.elev, i as f64 * f.dg);
-                let range_index =
-                    ((ml_range_from_height(c.elev, temp_height) / f.dg + 0.5) as usize).min(f.n);
-                let (mut zmax, mut zdrmax) = (-1000.0f64, -1000.0f64);
-                let (mut zmax_i, mut zdrmax_i) = (i, i);
-                for j in i..range_index {
-                    if f.snr[j] > ML_MIN_SNR {
-                        if zmax < f.smz[j] {
-                            zmax = f.smz[j];
-                            zmax_i = j;
-                        }
-                        if zdrmax < f.zdr[j] {
-                            zdrmax = f.zdr[j];
-                            zdrmax_i = j;
+        // **Which heights each radial votes for, found in parallel; the votes
+        // themselves cast in order.**
+        //
+        // Finding them is per-radial and pure — the classification, the wet-snow
+        // window and the 0.5 km Z/ZDR search read one radial and the flat
+        // default layer. Casting them is not: `weight` is a float accumulator,
+        // several radials of a sweep round to the same whole degree, and `+=`
+        // over floats is not associative, so a thread order would decide the
+        // last bit of a sum. The map therefore hands back each radial's height
+        // indices in gate order, and the serial loop below adds them in
+        // `combined`'s order — the order the fused loop added them in — so the
+        // accumulation is not merely equivalent but identical.
+        let votes: Vec<(usize, Vec<usize>)> = combined
+            .par_iter()
+            .map(|c| {
+                let f = radial_fields(
+                    c,
+                    init_fdp,
+                    dbz0,
+                    atmos,
+                    opts.quantize_transport,
+                    opts.metsignal,
+                    cappi,
+                );
+                let classes = classify_radial(&f, &default, hsda.tw0_km_arl);
+                let stop = (ml_range_from_height(c.elev, ML_MAX_TOP_KM) / f.dg + 0.5) as usize;
+                let az_index = (f.az.rem_euclid(360.0)) as usize % 360;
+                let mut heights = Vec::new();
+                for (i, &class) in classes.iter().enumerate().take(f.n.min(stop)) {
+                    if class == GC || class == BI || class == UK || class == NE {
+                        continue;
+                    }
+                    if f.snr[i] <= ML_MIN_SNR {
+                        continue;
+                    }
+                    if !(f.smz[i] > ML_LOWER_Z
+                        && f.smz[i] < ML_UPPER_Z
+                        && f.rho[i] > ML_LOWER_RHO
+                        && f.rho[i] < ML_UPPER_RHO)
+                    {
+                        continue;
+                    }
+                    let height_index = (ml_height_from_range(c.elev, i as f64 * f.dg)
+                        / ML_HEIGHT_INTERVAL_KM
+                        + 0.5) as usize;
+                    if height_index >= ML_MAX_HEIGHTS {
+                        continue;
+                    }
+                    // Search up to 0.5 km above this gate for the Z and ZDR
+                    // maxima that fingerprint wet snow.
+                    let temp_height = ML_DEPTH_KM + ml_height_from_range(c.elev, i as f64 * f.dg);
+                    let range_index = ((ml_range_from_height(c.elev, temp_height) / f.dg + 0.5)
+                        as usize)
+                        .min(f.n);
+                    let (mut zmax, mut zdrmax) = (-1000.0f64, -1000.0f64);
+                    let (mut zmax_i, mut zdrmax_i) = (i, i);
+                    for j in i..range_index {
+                        if f.snr[j] > ML_MIN_SNR {
+                            if zmax < f.smz[j] {
+                                zmax = f.smz[j];
+                                zmax_i = j;
+                            }
+                            if zdrmax < f.zdr[j] {
+                                zdrmax = f.zdr[j];
+                                zdrmax_i = j;
+                            }
                         }
                     }
+                    if zmax > ML_LOWER_ZMAX
+                        && zmax < ML_UPPER_ZMAX
+                        && f.rho[zmax_i] > ML_LOW_RHO_PROFILE
+                        && zdrmax > ML_LOWER_ZDRMAX
+                        && zdrmax < ML_UPPER_ZDRMAX
+                        && f.rho[zdrmax_i] > ML_LOW_RHO_PROFILE
+                    {
+                        heights.push(height_index);
+                    }
                 }
-                if zmax > ML_LOWER_ZMAX
-                    && zmax < ML_UPPER_ZMAX
-                    && f.rho[zmax_i] > ML_LOW_RHO_PROFILE
-                    && zdrmax > ML_LOWER_ZDRMAX
-                    && zdrmax < ML_UPPER_ZDRMAX
-                    && f.rho[zdrmax_i] > ML_LOW_RHO_PROFILE
-                {
-                    weight[az_index][height_index] += 1.0 + elev_weight;
-                }
+                (az_index, heights)
+            })
+            .collect();
+
+        for (az_index, heights) in votes {
+            for height_index in heights {
+                weight[az_index][height_index] += 1.0 + elev_weight;
             }
         }
     }
