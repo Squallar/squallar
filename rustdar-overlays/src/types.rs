@@ -86,29 +86,6 @@ pub struct GeoBounds {
 }
 
 impl GeoBounds {
-    /// Points are `(lat, lon)`.
-    pub fn from_points(pts: &[(f64, f64)]) -> Option<Self> {
-        if pts.is_empty() {
-            return None;
-        }
-        let mut min_lat = f64::MAX;
-        let mut max_lat = f64::MIN;
-        let mut min_lon = f64::MAX;
-        let mut max_lon = f64::MIN;
-        for &(lat, lon) in pts {
-            min_lat = min_lat.min(lat);
-            max_lat = max_lat.max(lat);
-            min_lon = min_lon.min(lon);
-            max_lon = max_lon.max(lon);
-        }
-        Some(Self {
-            min_lat,
-            max_lat,
-            min_lon,
-            max_lon,
-        })
-    }
-
     pub fn intersects(&self, other: &GeoBounds) -> bool {
         self.min_lat <= other.max_lat
             && self.max_lat >= other.min_lat
@@ -153,10 +130,5 @@ impl OverlayFeature {
             hatch,
             geo_bounds,
         }
-    }
-
-    /// Call after mutating `polygons` (e.g. simplification).
-    pub fn recompute_cache(&mut self) {
-        self.geo_bounds = crate::render::geo::compute_geo_bounds(&self.polygons);
     }
 }

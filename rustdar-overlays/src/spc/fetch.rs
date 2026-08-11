@@ -94,23 +94,6 @@ pub async fn fetch_active_discussions(
     parse_md_rss(&text)
 }
 
-pub fn available_products(day: OutlookDay) -> Vec<OutlookProduct> {
-    if day.is_extended() {
-        // Days 4-8 publish one "any severe" probabilistic product only.
-        return vec![OutlookProduct::Probabilistic];
-    }
-    match day {
-        OutlookDay::Day1 | OutlookDay::Day2 => vec![
-            OutlookProduct::Categorical,
-            OutlookProduct::Tornado,
-            OutlookProduct::Wind,
-            OutlookProduct::Hail,
-        ],
-        OutlookDay::Day3 => vec![OutlookProduct::Categorical, OutlookProduct::Probabilistic],
-        _ => unreachable!(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
