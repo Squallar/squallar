@@ -3151,18 +3151,18 @@ fn the_bar_never_overlaps_at_mediums_narrowest_width() {
         }
     }
 
-    // Squeezed, not sacrificed: the toggles still take their clicks.
+    // Squeezed, not sacrificed: the toggle still takes its clicks, both ways.
     h.mouse_click(probe.section_arm.0.center());
     h.warm_up();
     assert!(
         h.section_draw_armed(),
-        "the Region toggle stopped responding at the squeezed width"
+        "the X-sec toggle stopped arming at the squeezed width"
     );
     h.mouse_click(h.top_bar().section_arm.0.center());
     h.warm_up();
     assert!(
-        h.section_draw_armed() && !h.section_draw_armed(),
-        "the X-sec toggle stopped responding at the squeezed width"
+        !h.section_draw_armed(),
+        "the X-sec toggle stopped disarming at the squeezed width"
     );
 }
 
@@ -6866,7 +6866,7 @@ fn kind_specific_blocks_sit_inside_the_shared_sidebar_structure() {
     h.gui_mut()
         .pane_mut(0)
         .expect("pane 0 exists")
-        .set_kind(PaneKind::Map);
+        .set_view(rustdar_radar::types::RenderView::PlanView);
     h.make_pane_unaimed_cross_section(0);
     h.frames_for(2, FRAME_DT);
     assert_descending_order(
@@ -10043,20 +10043,6 @@ fn the_armed_hint_chip_follows_the_active_map_pane() {
     assert!(!h.text_painted_in(panes[0], &hint));
     assert!(h.text_painted_in(panes[1], &hint));
 
-    // Arming the section swaps the wording — the two arms are mutually
-    // exclusive, so exactly one chip text exists at a time.
-    let (section_toggle, _) = h.top_bar().section_arm;
-    h.mouse_click(section_toggle.center());
-    h.warm_up();
-    assert!(
-        h.text_painted_in(panes[1], crate::ui::map::SECTION_ARM_HINT),
-        "the section arm must paint its own hint"
-    );
-    assert!(
-        !h.text_painted_in(panes[1], &hint),
-        "the region hint must go with the region arm"
-    );
-
     // Disarming takes the chip with it.
     let (section_toggle, _) = h.top_bar().section_arm;
     h.mouse_click(section_toggle.center());
@@ -12365,7 +12351,7 @@ fn in_pane_text_stays_inside_its_pane_and_clear_of_the_pill_rows() {
     let hints: Vec<(egui::Rect, String)> = h
         .painted_text_rects()
         .into_iter()
-        .filter(|(_, text)| text.contains("Drag to pick 3D region"))
+        .filter(|(_, text)| text.contains(crate::ui::map::SECTION_ARM_HINT))
         .collect();
     assert!(!hints.is_empty(), "the armed mode paints its hint chip");
     for (rect, text) in hints {

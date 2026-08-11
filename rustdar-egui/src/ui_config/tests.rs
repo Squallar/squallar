@@ -936,7 +936,21 @@ fn a_non_finite_float_would_poison_the_config_file_permanently() {
     // The property the filter protects: a `Gui` with a non-map pane writes a
     // config that loads back, rather than one that reads as corrupt.
     let mut gui = crate::Gui::new();
-    gui.pane_mut(0).unwrap().set_view(rustdar_radar::types::RenderView::Volume);
+    let pane = gui.pane_mut(0).unwrap();
+    pane.set_view(rustdar_radar::types::RenderView::Volume);
+    // Moved, because an untouched camera is omitted from the file entirely —
+    // and a file with no `volume` block would exercise none of the guards
+    // below.
+    pane.map_mut()
+        .expect("a map pane")
+        .volume
+        .camera
+        .nudge(crate::pane::OrbitDelta {
+            yaw_deg: 18.0,
+            pitch_deg: 4.0,
+            zoom_factor: 1.25,
+            ..Default::default()
+        });
     let json = gui
         .ui_config_json()
         .expect("a 3D pane stopped the config from being written at all");

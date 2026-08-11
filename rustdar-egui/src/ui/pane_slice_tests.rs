@@ -628,7 +628,7 @@ fn converting_a_pane_tears_down_its_loop_and_nothing_else() {
 
         // …and converting back does not resurrect it. A torn-down loop is torn
         // down; re-enabling it is the transport's job.
-        gui.pane_mut(0).unwrap().set_kind(PaneKind::Map);
+        gui.pane_mut(0).unwrap().set_view(rustdar_radar::types::RenderView::PlanView);
         assert!(!gui.pane(0).unwrap().loop_state.is_active());
     }
 }
@@ -688,7 +688,7 @@ fn overlay_polling_skips_panes_with_no_map_but_keeps_their_toggles() {
             "pane {idx} lost its remembered layer choice"
         );
     }
-    gui.pane_mut(0).unwrap().set_kind(PaneKind::Map);
+    gui.pane_mut(0).unwrap().set_view(rustdar_radar::types::RenderView::PlanView);
     assert_eq!(gui.first_pane_with_overlay_enabled(kind), Some(0));
 }
 

@@ -1201,7 +1201,7 @@ impl InputHarness {
         self.gui
             .pane_mut(idx)
             .unwrap_or_else(|| panic!("no pane {idx}"))
-            .set_kind(PaneKind::Map);
+            .set_view(rustdar_radar::types::RenderView::PlanView);
         self.warm_up();
     }
 

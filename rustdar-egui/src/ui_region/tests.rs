@@ -68,7 +68,7 @@ fn ground_km_to(
 /// in a split layout has.
 #[test]
 fn the_box_fits_inside_the_viewport_on_every_side() {
-    let memory = memory_at(7.0);
+    let memory = memory_at(9.0);
     let center = centre();
     for rect in [
         egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 800.0)),
@@ -76,7 +76,7 @@ fn the_box_fits_inside_the_viewport_on_every_side() {
         egui::Rect::from_min_size(egui::pos2(120.0, 60.0), egui::vec2(400.0, 900.0)),
     ] {
         let region = region_for_viewport(rect, &memory, center)
-            .expect("a pane with area at zoom 7 has a measurable box");
+            .expect("a pane with area at zoom 9 has a measurable box");
         for (name, pos) in [
             ("north", egui::pos2(rect.center().x, rect.top())),
             ("south", egui::pos2(rect.center().x, rect.bottom())),
@@ -110,7 +110,7 @@ fn the_poleward_edge_is_the_near_one_and_the_box_is_sized_by_it() {
     // A tall pane low in the zoom range, so the box spans enough latitude for
     // the asymmetry to exceed the quantisation step.
     let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 900.0));
-    let memory = memory_at(5.0);
+    let memory = memory_at(8.0);
     let center = centre();
     let region = region_for_viewport(rect, &memory, center).expect("a measurable box");
 
@@ -160,12 +160,12 @@ fn zooming_in_buys_resolution() {
     let center = centre();
     let cells = rustdar_radar::voxel::default_shape().nx;
 
-    let wide = region_for_viewport(rect, &memory_at(6.0), center).expect("a measurable box");
-    let tight = region_for_viewport(rect, &memory_at(8.0), center).expect("a measurable box");
+    let wide = region_for_viewport(rect, &memory_at(9.0), center).expect("a measurable box");
+    let tight = region_for_viewport(rect, &memory_at(11.0), center).expect("a measurable box");
 
     assert!(
         tight.half_width_km() < wide.half_width_km(),
-        "zooming from 6 to 8 must shrink the box: {:.1} km against {:.1} km",
+        "zooming from 9 to 11 must shrink the box: {:.1} km against {:.1} km",
         tight.half_width_km(),
         wide.half_width_km(),
     );
@@ -189,7 +189,7 @@ fn zooming_in_buys_resolution() {
 /// not.
 #[test]
 fn a_sub_quantum_change_in_the_viewport_is_the_same_box() {
-    let memory = memory_at(7.0);
+    let memory = memory_at(9.0);
     let center = centre();
     let base = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 800.0));
     let nudged = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.05, 800.05));
@@ -211,7 +211,7 @@ fn a_sub_quantum_change_in_the_viewport_is_the_same_box() {
 /// the derivation exists to remove.
 #[test]
 fn the_half_width_is_a_whole_number_of_steps_and_never_rounded_up() {
-    let memory = memory_at(7.0);
+    let memory = memory_at(9.0);
     let center = centre();
     // Sizes chosen to land the raw measurement all over the step, so at least
     // one of them would be rounded up by a `round()` and caught here.
@@ -298,7 +298,7 @@ fn a_viewport_below_the_resamplers_minimum_is_refused() {
 #[test]
 fn a_pane_zoomed_out_past_the_ceiling_gets_the_whole_scan_box() {
     let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 900.0));
-    let region = region_for_viewport(rect, &memory_at(2.0), centre())
+    let region = region_for_viewport(rect, &memory_at(5.0), centre())
         .expect("a wide-open pane still has a measurable box");
     assert_eq!(
         region.half_width_km(),
@@ -321,7 +321,7 @@ fn a_pane_zoomed_out_past_the_ceiling_gets_the_whole_scan_box() {
 #[test]
 fn the_box_is_centred_on_the_pane() {
     let rect = egui::Rect::from_min_size(egui::pos2(37.0, 91.0), egui::vec2(640.0, 480.0));
-    let memory = memory_at(7.0);
+    let memory = memory_at(9.0);
     let center = centre();
     let region = region_for_viewport(rect, &memory, center).expect("a measurable box");
     let (_, offset_km) = rustdar_radar::beam::site_bearing_range_km(
@@ -345,7 +345,7 @@ fn the_box_is_centred_on_the_pane() {
 #[test]
 fn a_detached_map_measures_its_box_where_it_is_looking() {
     let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 800.0));
-    let mut memory = memory_at(7.0);
+    let mut memory = memory_at(9.0);
     let elsewhere = walkers::lat_lon(41.6, -88.08); // near KLOT, several hundred km away
     memory.center_at(elsewhere);
 
