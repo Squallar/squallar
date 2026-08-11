@@ -681,6 +681,33 @@ enum Cut {
         terminated: bool,
         /// Radials a full rotation implies, from the first radial's azimuth
         /// spacing: 720 at 0.5°, 360 at 1.0°.
+        ///
+        /// A rotation is the assumption, and it is the *only* thing at ingest
+        /// that separates a cut the RDA swept over less than the circle from a
+        /// cut whose chunks did not all arrive. Nothing on the wire announces
+        /// an intended sweep extent, and the two look alike: an `ElevationEnd`
+        /// radial says the RDA finished, not that everything it sent got here,
+        /// so a cut that lost its first or a middle chunk terminates with a
+        /// contiguous-looking 240 of 360 — and sealing that would put a grid
+        /// with a 120° hole in its middle in front of `nrot`, whose
+        /// `azimuth::Rows` measures where a grid ends and not where it is
+        /// sparse. (Losing the *last* chunk is already caught for free: the
+        /// terminating radial is in it.) So a short cut is abandoned, and the
+        /// count is what abandons it.
+        ///
+        /// The assumption costs nothing on the data this reads. Every cut of
+        /// every TDWR volume measured out of the real-time bucket — TATL,
+        /// TDFW, THOU, TJFK, TMCO, TPHX and TPIT, three volumes each, across
+        /// both scan strategies the network flies (16 cuts and 23) — is 360
+        /// radials of declared 1.0°, numbered 1..360 with no gap, so
+        /// `360 / spacing` is their radial count exactly, as it is for every
+        /// WSR-88D VCP cut. The one short cut in the sample was a volume still
+        /// arriving.
+        ///
+        /// If a sector cut ever does turn up, the count is not the number to
+        /// relax. `azimuth_number` is the anchor that tells the two cases
+        /// apart: the RDA numbers a cut's radials from 1, so a swept sector
+        /// runs 1..N dense and a cut with a chunk missing does not.
         expected: Option<usize>,
     },
     /// A full rotation, frozen. Radials are *moved* out of the map rather than
