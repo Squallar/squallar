@@ -50,6 +50,53 @@
 
 use nexrad_model::data::{DataMoment, MomentValue, Radial};
 
+// ── decibel ↔ linear, on the binary exponential ──────────────────────────────
+//
+// `10^(x/10)` is `2^(x·log₂10/10)` and `10·log₁₀(y)` is `log₂(y)·10/log₂10`,
+// exactly — the same functions, in the base the hardware and libm are built
+// around. `powf` with a runtime base has no fast path: it takes libm's generic
+// `exp(y·ln x)` route, and this chain calls it five times per gate of every
+// recombined radial. Measured on this machine, single-threaded, best of 7 over
+// 10⁶ evaluations: `10f64.powf(0.1·x)` 6.385 ms against `exp2` 2.212 ms (2.9×),
+// `10·log₁₀(y)` 4.187 ms against `log2` 2.231 ms (1.9×).
+//
+// **The results move in the last bits, and here is how far.** Over 2×10⁷
+// samples spanning −40..+100 dB the linear conversion's largest relative
+// deviation is 8.6×10⁻¹⁵, and the decibel conversion's largest absolute
+// deviation is 2.8×10⁻¹⁴ dB. The fields these serve arrive quantized at
+// 0.5 dB (reflectivity) and 1/16 dB (ZDR), so the deviation is under 10⁻¹²
+// of one code of the *input* — five orders of magnitude below f32, which is
+// what every consumer of this module stores its answer in.
+//
+// End to end over five archived volumes (KDMX 2022-03-05, KFTG 2023-06-22,
+// KCRP 2017-08-26, KMSX 2022-06-04, KLWX 2018-03-02): the hybrid
+// classification is **byte-identical**, field and 2048² raster both, and KDP
+// moves in 0.07–0.25 % of its bins by at most **3.7×10⁻⁹ °/km** — 8×10⁻⁸ of
+// the 0.048 °/km step its own 254-code display encoding has.
+//
+// `volumetric::sweep_to_grid`'s pair of the same conversions is deliberately
+// **not** rewritten: it feeds `compute_echo_tops`, whose grid is pinned by an
+// exact digest in five tests, and last-bit agreement there cannot be proved,
+// only observed.
+
+/// `log₂10 / 10`: the exponent that turns decibels into a power of two.
+const DB_TO_EXP2: f64 = std::f64::consts::LOG2_10 / 10.0;
+
+/// `10 / log₂10`: the factor that turns a binary logarithm into decibels.
+const EXP2_TO_DB: f64 = 10.0 / std::f64::consts::LOG2_10;
+
+/// `10^(db/10)` — a decibel quantity as its linear ratio.
+#[inline]
+fn from_db(db: f64) -> f64 {
+    (db * DB_TO_EXP2).exp2()
+}
+
+/// `10·log₁₀(ratio)` — a linear ratio as decibels.
+#[inline]
+fn to_db(ratio: f64) -> f64 {
+    ratio.log2() * EXP2_TO_DB
+}
+
 // ── dpprep.alg fleet defaults ────────────────────────────────────────────────
 
 /// `corr_thresh`: RhoHV (5-gate smoothed) below this censors KDP and marks a
@@ -280,11 +327,7 @@ pub(crate) fn dp_gate_power(input: &DpInput, i: usize) -> f64 {
     match index_into(d, input.zr0, input.zg, input.z.len()) {
         Some(zi) => {
             let z = input.z[zi];
-            if z.is_nan() {
-                f64::NAN
-            } else {
-                10f64.powf(0.1 * z)
-            }
+            if z.is_nan() { f64::NAN } else { from_db(z) }
         }
         None => f64::NAN,
     }
@@ -381,12 +424,12 @@ pub(crate) fn combine_pair(a: &DpInput, b: &DpInput, coherent: bool) -> Combined
             let pva = if pha.is_nan() || zdra.is_nan() {
                 f64::NAN
             } else {
-                pha / 10f64.powf(0.1 * zdra)
+                pha / from_db(zdra)
             };
             let pvb = if phb.is_nan() || zdrb.is_nan() {
                 f64::NAN
             } else {
-                phb / 10f64.powf(0.1 * zdrb)
+                phb / from_db(zdrb)
             };
             let (p, r) = coherent_phi_rho(
                 (a.phi[i], b.phi[i]),
@@ -408,7 +451,7 @@ pub(crate) fn combine_pair(a: &DpInput, b: &DpInput, coherent: bool) -> Combined
         let za = a.z.get(i).copied().unwrap_or(f64::NAN);
         let zb = b.z.get(i).copied().unwrap_or(f64::NAN);
         let v = match (za.is_nan(), zb.is_nan()) {
-            (false, false) => 10.0 * (0.5 * (10f64.powf(0.1 * za) + 10f64.powf(0.1 * zb))).log10(),
+            (false, false) => to_db(0.5 * (from_db(za) + from_db(zb))),
             (false, true) => za,
             (true, false) => zb,
             (true, true) => f64::NAN,
@@ -841,19 +884,19 @@ fn combine_pair_zdr(a: &DpInput, b: &DpInput, coherent: bool) -> Vec<f64> {
             let pva = if pha.is_nan() || zdra.is_nan() {
                 f64::NAN
             } else {
-                pha / 10f64.powf(0.1 * zdra)
+                pha / from_db(zdra)
             };
             let pvb = if phb.is_nan() || zdrb.is_nan() {
                 f64::NAN
             } else {
-                phb / 10f64.powf(0.1 * zdrb)
+                phb / from_db(zdrb)
             };
             let phc = nan_mean(pha, phb);
             let pvc = nan_mean(pva, pvb);
             if phc.is_nan() || pvc.is_nan() {
                 f64::NAN
             } else {
-                10.0 * (phc / pvc).log10()
+                to_db(phc / pvc)
             }
         })
         .collect()
