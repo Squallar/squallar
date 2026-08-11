@@ -3509,3 +3509,158 @@ fn coverage_is_exactly_whether_the_index_is_the_no_data_one() {
         }
     }
 }
+
+/// The grid [`build_voxels`] used to build: **one** `Column` buffer for the
+/// whole box, y outermost and z innermost, one cell written at a time.
+///
+/// Restated here rather than called, because it is the thing that is gone.
+/// `build_voxels` now cuts the output into y rows and fills them at once, each
+/// row with a `Column` of its own, and the only way to say "that changed
+/// nothing" is to still have the loop it replaced. Native products only — the
+/// derivation seam is not what this is about, and `Prepared::Native` is a
+/// borrow of the scan the sampler would have taken anyway.
+fn serial_reference_grid(
+    scan: &Scan,
+    req: &VoxelRequest,
+    lat: f64,
+    lon: f64,
+) -> (Vec<u8>, Vec<f32>) {
+    let slot = crate::derive::volume_slot(req.product).expect("a native product");
+    let sampler =
+        VolumeSampler::new(crate::nyquist::Volume::from(scan), req.product).expect("a sampler");
+
+    let half = req
+        .half_width_km
+        .clamp(MIN_HALF_WIDTH_KM, MAX_HALF_WIDTH_KM);
+    let (bearing_deg, range_km) = beam::site_bearing_range_km(lat, lon, req.centre.0, req.centre.1);
+    let bearing = bearing_deg.to_radians();
+    let (cx, cy) = (range_km * bearing.sin(), range_km * bearing.cos());
+    let x_range_km = (cx - half, cx + half);
+    let y_range_km = (cy - half, cy + half);
+    let z_range_km_msl = (req.base_km_msl, req.top_km_msl);
+    let site_km_msl =
+        crate::eet::radar_height_ft_near(lat, lon, crate::sites::Datum::Feedhorn) * 0.0003048;
+    let value_range = value_range_for_product(req.product, slot);
+
+    let (nx, ny, nz) = (req.shape.nx, req.shape.ny, req.shape.nz);
+    let cells = req.shape.cells();
+    let mut indices = vec![NO_DATA_INDEX; cells];
+    let mut values = vec![f32::NAN; cells];
+    let heights_km: Vec<f64> = (0..nz)
+        .map(|iz| axis_centre(z_range_km_msl, nz, iz) - site_km_msl)
+        .collect();
+
+    let plane = ny * nx;
+    let mut column = Column::new();
+    for iy in 0..ny {
+        let y_km = axis_centre(y_range_km, ny, iy);
+        for ix in 0..nx {
+            let x_km = axis_centre(x_range_km, nx, ix);
+            let ground_range_km = x_km.hypot(y_km);
+            let azimuth_deg = x_km.atan2(y_km).to_degrees().rem_euclid(360.0);
+            sampler.column_into(azimuth_deg, ground_range_km, &mut column);
+            for (iz, &height_km) in heights_km.iter().enumerate() {
+                let Some(value) = column
+                    .at_height_km(height_km)
+                    .value()
+                    .filter(|v| v.is_finite())
+                else {
+                    continue;
+                };
+                let offset = iz * plane + iy * nx + ix;
+                indices[offset] = ramp_index(value_range, value);
+                values[offset] = value;
+            }
+        }
+    }
+    (indices, values)
+}
+
+/// **The property the row split has to keep**: the grid the rows build across
+/// the pool is the grid the one-buffer serial loop built, cell for cell.
+///
+/// [`build_voxels`] hands each y row its own slices of the output and its own
+/// [`Column`] — the buffer the loop used to share, which is what forced it
+/// serial. Two things can go wrong there and neither is visible anywhere else
+/// in this module: a row could write outside its own slices, and a row could
+/// come out differently for having started from a fresh buffer instead of the
+/// previous row's. So the check is against [`serial_reference_grid`], which
+/// still shares one buffer over the whole box — a 1-thread rayon pool would
+/// **not** do: it runs this same row-split code, so it can see a data race and
+/// nothing about the restructure.
+///
+/// Both shapes have three different axes, so a task that indexed a transposed
+/// row cannot pass by accident, and both products are checked because the value
+/// plane is compared bit for bit and only a signed one exercises its sign.
+#[test]
+fn the_rows_build_the_grid_the_one_buffer_serial_loop_built() {
+    assert!(
+        rayon::current_num_threads() > 1,
+        "single-threaded pool: this test cannot observe a race"
+    );
+    let scan = six_moment_scan();
+    let shapes = [
+        ODD,
+        VoxelShape {
+            nx: 37,
+            ny: 41,
+            nz: 23,
+        },
+    ];
+    for shape in shapes {
+        for product in [RadarProduct::Reflectivity, RadarProduct::Velocity] {
+            let req = VoxelRequest {
+                product,
+                ..request(shape)
+            };
+            let at = format!(
+                "{} at {}x{}x{}",
+                product.code(),
+                shape.nx,
+                shape.ny,
+                shape.nz
+            );
+            let build = || build_voxels(&scan, &req, SITE.0, SITE.1).expect("a grid");
+            let grid = build();
+
+            // A grid of nothing agrees with itself trivially, so the rows have
+            // to be carrying work before any of this means anything.
+            let filled = grid
+                .indices()
+                .iter()
+                .filter(|&&i| i != NO_DATA_INDEX)
+                .count();
+            assert!(
+                filled > shape.cells() / 10,
+                "{at}: only {filled} of {} cells carry data; the fixture has \
+                 stopped filling rows and this proves nothing",
+                shape.cells(),
+            );
+
+            // Cell by cell rather than slice against slice: a whole-plane
+            // `assert_eq!` prints 34 891 numbers twice and says nothing about
+            // which one moved.
+            let (indices, values) = serial_reference_grid(&scan, &req, SITE.0, SITE.1);
+            for (cell, (&got, &want)) in grid.indices().iter().zip(&indices).enumerate() {
+                assert_eq!(
+                    got, want,
+                    "{at}: index cell {cell} is {got}, the serial loop's is {want}",
+                );
+            }
+            let built = grid.values().expect("the value plane was asked for");
+            for (cell, (&got, &want)) in built.iter().zip(&values).enumerate() {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "{at}: value cell {cell} is {got}, the serial loop's is {want}",
+                );
+            }
+
+            // Stability on top of agreement: settling on the right answer once
+            // could still be a race that usually lands the right way.
+            for run in 1..4 {
+                assert_eq!(build(), grid, "{at}: run {run} differs from run 0");
+            }
+        }
+    }
+}

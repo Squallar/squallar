@@ -352,6 +352,7 @@
 
 use crate::beam;
 use crate::palette::{get_color_for_value, get_legend_scale};
+use crate::par::*;
 use crate::sampler::{Column, VolumeSampler};
 use crate::types::{MomentSlot, RadarProduct};
 
@@ -1500,6 +1501,19 @@ fn colormap_lut(product: RadarProduct, range: (f32, f32)) -> Vec<u8> {
     lut
 }
 
+/// One y row's share of a grid under construction: the row's `nx` cells in
+/// each of the `nz` horizontal planes, cut out of the output so the row can be
+/// filled without touching anything another row owns.
+///
+/// See [`build_voxels_with_motion`] for why the cut is `nz` slices and not one.
+struct VoxelRow<'grid> {
+    iy: usize,
+    indices: Vec<&'grid mut [u8]>,
+    /// Empty unless [`VoxelRequest::values_wanted`] asked for the value plane,
+    /// which is what makes the write below a `get_mut` rather than an index.
+    values: Vec<&'grid mut [f32]>,
+}
+
 /// Resample `scan` onto a Cartesian grid, or `None` if it cannot be done
 /// honestly.
 ///
@@ -1627,9 +1641,48 @@ pub fn build_voxels_with_motion<'a>(
         .collect();
 
     let plane = ny * nx;
-    let mut column = Column::new();
-    for iy in 0..ny {
-        let y_km = axis_centre(y_range_km, ny, iy);
+
+    // One task per **y row**, with that row's output cut out of the grid and
+    // handed to it before anything runs.
+    //
+    // The cut is not one slice. The grid is z-major — cell `(ix, iy, iz)` sits
+    // at `iz·ny·nx + iy·nx + ix` — so a row is `nz` runs of `nx`, one per
+    // horizontal plane, and `chunks_mut` twice is what names them. Doing that up
+    // front is the whole reason the rows can run at once: a task holds `&mut`
+    // slices no other task can reach, so no cell is written twice and nothing is
+    // summed across tasks. There is no reduction here and no shared accumulator,
+    // which is why the answer is the serial loop's cell for cell — see
+    // [`tests::the_rows_build_the_grid_the_one_buffer_serial_loop_built`].
+    //
+    // The `Column` buffer moves with the row rather than being shared by the
+    // whole grid, which is what forced this loop serial. It is still allocated
+    // once per `nx` columns, so [`crate::sampler::VolumeSampler::column_into`]'s
+    // reason for existing survives — a raster sweeping many columns does not
+    // allocate per column. `column_into` clears and overwrites every field, so a
+    // row's first column starts from exactly the state the serial loop's would.
+    let mut rows: Vec<VoxelRow<'_>> = (0..ny)
+        .map(|iy| VoxelRow {
+            iy,
+            indices: Vec::with_capacity(nz),
+            values: Vec::new(),
+        })
+        .collect();
+    for plane_cells in indices.chunks_mut(plane) {
+        for (iy, row) in plane_cells.chunks_mut(nx).enumerate() {
+            rows[iy].indices.push(row);
+        }
+    }
+    if let Some(values) = values.as_mut() {
+        for plane_cells in values.chunks_mut(plane) {
+            for (iy, row) in plane_cells.chunks_mut(nx).enumerate() {
+                rows[iy].values.push(row);
+            }
+        }
+    }
+
+    rows.into_par_iter().for_each(|mut row| {
+        let y_km = axis_centre(y_range_km, ny, row.iy);
+        let mut column = Column::new();
         for ix in 0..nx {
             let x_km = axis_centre(x_range_km, nx, ix);
             let ground_range_km = x_km.hypot(y_km);
@@ -1648,14 +1701,13 @@ pub fn build_voxels_with_motion<'a>(
                 else {
                     continue;
                 };
-                let offset = iz * plane + iy * nx + ix;
-                indices[offset] = ramp_index(value_range, value);
-                if let Some(values) = values.as_mut() {
-                    values[offset] = value;
+                row.indices[iz][ix] = ramp_index(value_range, value);
+                if let Some(plane_cells) = row.values.get_mut(iz) {
+                    plane_cells[ix] = value;
                 }
             }
         }
-    }
+    });
 
     Some(VoxelGrid {
         indices,

@@ -62,6 +62,17 @@ mod seq {
         }
     }
 
+    /// The owning arm of the same trait, for a caller that builds its work
+    /// items first and consumes them — `voxel`'s per-row output slices, which
+    /// have to be cut out of the grid before any row runs and then moved into
+    /// the tasks.
+    impl<T> IntoParIterFallback for Vec<T> {
+        type Item = T;
+        fn into_par_iter(self) -> impl Iterator<Item = T> {
+            self.into_iter()
+        }
+    }
+
     /// Stands in for `rayon::slice::ParallelSlice::par_chunks`.
     pub trait ParChunksFallback<T> {
         fn par_chunks<'a>(&'a self, n: usize) -> impl Iterator<Item = &'a [T]>
