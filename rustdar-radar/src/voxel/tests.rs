@@ -2927,7 +2927,7 @@ fn the_length_prefixes_are_where_the_tests_think_they_are() {
 /// coverage is exactly `index != NO_DATA_INDEX` (pinned by
 /// `coverage_is_exactly_whether_the_index_is_the_no_data_one`), so the
 /// second channel is a function of the first, and it is synthesised at
-/// upload time by `volume::raymarch::coverage_premultiplied` rather than
+/// upload time by `volume::raymarch::coverage_premultiplied_into` rather than
 /// carried. Putting it on the wire would double the worker transfer and the
 /// host residency — 8 MiB to 16 MiB at [`DESKTOP_SHAPE`] — to move no
 /// information.

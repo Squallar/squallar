@@ -347,7 +347,14 @@ fn render_a_real_volume_mask() {
         uniform.map_floor = true;
 
         let volume = pipelines
-            .upload_volume(&device, &queue, grid_dims, grid.indices(), grid.lut())
+            .upload_volume(
+                &device,
+                &queue,
+                grid_dims,
+                grid.indices(),
+                grid.lut(),
+                &mut Vec::new(),
+            )
             .expect("the grid uploads twice as readily as once");
         volume.write_uniform(&queue, &uniform);
         let target = pipelines.create_offscreen(&device, size);
@@ -965,7 +972,7 @@ fn raymarch_once(
     size: [u32; 2],
 ) -> Vec<[u8; 4]> {
     let volume = pipelines
-        .upload_volume(device, queue, cells, indices, lut)
+        .upload_volume(device, queue, cells, indices, lut, &mut Vec::new())
         .expect("the grid and palette were refused");
     volume.write_uniform(queue, uniform);
     let target = pipelines.create_offscreen(device, size);

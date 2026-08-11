@@ -315,7 +315,7 @@ pub fn raymarch_once_at(
     coarse: CoarseLevel,
 ) -> Vec<[u8; 4]> {
     let volume = pipelines
-        .upload_volume_at(device, queue, cells, indices, lut, coarse)
+        .upload_volume_at(device, queue, cells, indices, lut, coarse, &mut Vec::new())
         .expect("the grid and palette were refused");
     assert_eq!(
         volume.cells(),
@@ -397,7 +397,7 @@ pub fn raymarch_once_with_floor(
     floor: &PaneMirror,
 ) -> Vec<[u8; 4]> {
     let volume = pipelines
-        .upload_volume(device, queue, cells, indices, lut)
+        .upload_volume(device, queue, cells, indices, lut, &mut Vec::new())
         .expect("the grid and palette were refused");
     volume.write_uniform(queue, uniform);
     let target = pipelines.create_offscreen(device, size);

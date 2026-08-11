@@ -232,7 +232,7 @@ const FLOOR_BELOW_FADE: f32 = 0.08;
 //
 // *Normalised palette index*, because the field being differenced is
 // `shading_field` — the coverage-premultiplied channel, `coverage x index`
-// with the index stored as `index / 255` (`coverage_premultiplied`, in
+// with the index stored as `index / 255` (`coverage_premultiplied_into`, in
 // `volume::raymarch`). It runs 0 at air to 1 at the top of the table, for
 // every product. `iso_shading`'s field (`iso_field(index) x coverage`) is on
 // that same 0-1 scale, which is what lets one constant serve both call sites.

@@ -80,7 +80,16 @@ fn measure_the_raymarch_cost_on_a_real_volume() {
     let pipelines = VolumePipelines::new(&device, attachments());
     pipelines.upload_quad(&queue);
     let volume = pipelines
-        .upload_volume(&device, &queue, grid_dims, grid.indices(), grid.lut())
+        .upload_volume(
+            &device,
+            &queue,
+            grid_dims,
+            grid.indices(),
+            grid.lut(),
+            // One upload, so nothing to reuse a buffer across. Production
+            // holds one across every grid — `VolumeResources::widening`.
+            &mut Vec::new(),
+        )
         .expect("the grid and palette were refused");
 
     let yaw = parsed_or("YAW", 225.0f32);

@@ -231,13 +231,15 @@ pub const DESKTOP_LOOP_TEXTURE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 /// The two loop kinds above hold more frames than they texture
 /// ([`MAX_LOOP_FRAMES`] against [`MAX_LOOP_RENDER_BUDGET`]) and re-render as
 /// the playhead walks back into a window it had left. That treadmill does not
-/// close here: re-entering a resident 3D window costs ~102 ms — 89 ms of
-/// resample, plus the 12.7 ms the whole upload now takes on the frame thread
-/// (it was ~94 ms of CPU passes and the same staging copy on top; see
-/// [`MAX_LOOP_VOLUME_BUILDS_PER_FRAME`] for what moved and what did not) —
+/// close here: re-entering a resident 3D window costs the 89 ms of resample,
+/// plus a few tens of milliseconds of upload on the frame thread (it was ~94 ms
+/// of CPU passes and the staging copy on top, and has come down twice since;
+/// see [`MAX_LOOP_VOLUME_BUILDS_PER_FRAME`] for what moved, what did not, and
+/// why the upload's total is a range rather than a figure) —
 /// against the 200 ms interval at [`DEFAULT_LOOP_SPEED_FPS`] and 33 ms at
 /// [`MAX_LOOP_SPEED_FPS`]. The resample alone settles it at both speeds, so the
-/// conclusion is the one it always was and does not rest on the upload figure.
+/// conclusion is the one it always was and does not rest on the upload figure —
+/// which is just as well, since that figure turns out to depend on the card.
 /// [`MAX_LOOP_VOLUME_FRAMES`] is therefore both numbers at once, and
 /// `the_3d_loop_holds_exactly_what_it_marches` pins it.
 ///
@@ -355,21 +357,72 @@ pub const DESKTOP_MAX_LOOP_VOLUME_FRAMES: usize = 13;
 /// thread, once per grid that becomes resident — which under this constant is
 /// once per frame while a loop set fills.
 ///
-/// What it costs there, desktop shape, best of seven: the texel widening was
-/// **58.1 ms** and is **10.0 ms** since it became a table lookup, and the
-/// coarse level was **35.9 ms** on top and is now **5.9 ms** when it is built
-/// at all — which at the default 460 km box is never (see
-/// `volume::raymarch::CoarseLevel`).
+/// What it costs there, desktop shape. The texel widening was **58.1 ms** as
+/// per-cell arithmetic, **10.0 ms** once it became a table lookup, and is
+/// **1.86 ms** since the widened plane's 32 MiB stopped being allocated inside
+/// every call: that request lands just over glibc's
+/// `DEFAULT_MMAP_THRESHOLD_MAX`, which is the one size the allocator's adaptive
+/// threshold can never grow to cover, so it was `mmap`ed, faulted in a page at
+/// a time and `munmap`ed on every upload — **8193 minor faults a call, and
+/// 10.1 of the pass's 11.95 ms**, for a buffer whose life ended when
+/// `write_texture` returned. `volume::raymarch::coverage_premultiplied_into`
+/// has the syscall evidence, and `volume::bridge::VolumeResources::widening` is
+/// the buffer that replaced it. The coarse level was **35.9 ms** on top and is
+/// **5.9 ms** when it is built at all — which at the default 460 km box is
+/// never (see `volume::raymarch::CoarseLevel`). Its own 4 MiB allocation is
+/// well under that cap, does recycle — 0 faults a call, measured — and was
+/// therefore left alone.
 ///
-/// Stated as the whole call rather than as its passes, because the whole call
-/// is what `prepare` waits for: the ~94 ms above is the two CPU passes alone,
-/// and `queue.write_texture` copies 32 MiB into a staging buffer on this
-/// thread too. Measured end to end at the default box, where the coarse pass
-/// does not run: **12.7 ms**, of which ~10 ms is the widening and the rest is
-/// that copy and the texture, buffer and bind group being created. The honest
-/// fix for the ~10 ms is to widen the plane inside the offload job that
-/// already builds the grid; the reason not to is wasm, where that pushes
-/// 32 MiB over the worker message port instead of 8 MiB.
+/// # Why this constant no longer quotes one figure for the whole call
+///
+/// It used to, and the figure was **12.7 ms**. That was not wrong, but it was
+/// not a property of the code either, and the paragraph has to say so, because
+/// the same call also measures ~33 ms with nothing changed.
+///
+/// The whole call is **bimodal on the card's host-visible BAR occupancy**.
+/// `queue.write_texture` copies the plane into write-combined memory across
+/// PCIe at ~2 GB/s, and that copy costs ~15.5 ms while the RTX 3090's 246 MiB
+/// host-visible window still has headroom and about a millisecond once the
+/// window is saturated and wgpu stages through system RAM instead — a host
+/// memcpy either way, at **0** minor faults, measured separately from anything
+/// here. Whichever mode a given call lands in is decided by what else is
+/// resident on the card at that instant, so a single end-to-end number
+/// describes the machine's state at one moment and not this code.
+///
+/// What can be quoted is the pass that changed, and the fault count that
+/// attributes it. On a Ryzen 9 7950X (32 threads) otherwise idle, an RTX 3090
+/// through Vulkan, `cargo test --release` — so `opt-level = 3` and
+/// `lto = true` — 31 interleaved pairs with the arms alternating, at the
+/// default box where the coarse pass does not run: the widening **11.95 ms →
+/// 1.86 ms** and **8193 → 0** minor faults, with the whole call around it
+/// moving 26.26 ms → 17.30 ms in that same sweep and in that sweep's BAR mode.
+/// The control is the same call at a `[128, 128, 64]` shape, whose 4 MiB plane
+/// is under the cap and recycles: 2.19 ms against 2.15 ms, 0 faults in both
+/// arms — which is what makes this a finding about one unrecyclable block
+/// rather than about allocation in general.
+///
+/// # What it cost
+///
+/// **Host** residency, and it is now permanent rather than transient: one
+/// widened plane is held for the renderer's life instead of allocated and given
+/// back per upload, sized to the largest shape this process has uploaded:
+/// `cells.product() * GRID_BYTES_PER_CELL`, which is **32.00 MiB** on
+/// [`DESKTOP_VOLUME_GRID_CELLS`], **13.50 MiB** on
+/// [`MOBILE_VOLUME_GRID_CELLS`] and **4.00 MiB** on
+/// [`WASM_VOLUME_GRID_CELLS`]. That is the level-0 plane only — not
+/// `grid_bytes_at(cells, CoarseLevel::Built)`, which folds in a mip this buffer
+/// never holds. It is host memory, so it is outside
+/// [`APP_TEXTURE_BUDGET_BYTES`] and every other budget here, all of which count
+/// device textures; and a session that never opens a 3D pane never allocates it
+/// at all.
+///
+/// What is left of the widening is one pass of 32 MiB of stores. The honest fix
+/// for *that* is to widen the plane inside the offload job that already builds
+/// the grid; the reason not to is wasm, where it would push 32 MiB over the
+/// worker message port instead of 8 MiB. The other end of it — fusing the
+/// widening into a pooled mapped staging buffer, so the pass and the BAR copy
+/// become one write — would subsume this `Vec` entirely, and is a decision
+/// about `write_texture`, not about this constant.
 ///
 /// One per frame means a full desktop set of 13 is dispatched over 13 frames —
 /// under a quarter of a second at 60 fps — and every grid that lands is shown

@@ -745,13 +745,17 @@ impl VolumePipelines {
     /// `indices` is one byte per cell in x-fastest, then y, then z order — the
     /// grid's own plane, with 0 meaning no data. It is widened here into the
     /// [`VOLUME_TEXTURE_FORMAT`] two-channel plane by
-    /// [`coverage_premultiplied`]; the host grid stays one byte per cell,
+    /// [`coverage_premultiplied_into`]; the host grid stays one byte per cell,
     /// because coverage is exactly `index != 0` and storing it twice would
     /// double the worker payload and the host residency to carry no
     /// information.
     ///
     /// `lut` is [`VOLUME_LUT_BYTES`] of straight (non-premultiplied),
     /// gamma-encoded RGBA — what `get_color_for_value` produces.
+    ///
+    /// `widening` is the caller's reusable staging buffer for that widened
+    /// plane; see [`Self::upload_volume_at`], which explains why the caller owns
+    /// it instead of this allocating one.
     ///
     /// The grid carries its coarse level. [`Self::upload_volume_at`] is the
     /// arm that can leave it out; see [`CoarseLevel`] for who may.
@@ -762,8 +766,17 @@ impl VolumePipelines {
         cells: [u32; 3],
         indices: &[u8],
         lut: &[u8],
+        widening: &mut Vec<u8>,
     ) -> Option<VolumeTextures> {
-        self.upload_volume_at(device, queue, cells, indices, lut, CoarseLevel::Built)
+        self.upload_volume_at(
+            device,
+            queue,
+            cells,
+            indices,
+            lut,
+            CoarseLevel::Built,
+            widening,
+        )
     }
 
     /// [`Self::upload_volume`], told whether this device will ever sample the
@@ -772,6 +785,72 @@ impl VolumePipelines {
     /// The caller decides, because the two facts it takes both live above this
     /// module: the adapter's shading rung and the grid's own cell size. See
     /// [`CoarseLevel`].
+    ///
+    /// # Why the widened plane's buffer is a parameter
+    ///
+    /// This runs on the **frame thread** — `volume::bridge` calls it from
+    /// `egui_wgpu::CallbackTrait::prepare` — so what it allocates there is a
+    /// frame's latency, not a background cost. Widening the desktop shape asks
+    /// for a 32 MiB block that glibc can never recycle, and paying for its
+    /// pages was 10.1 ms of an 11.95 ms pass; [`coverage_premultiplied_into`] has
+    /// the syscall evidence. `widening` is therefore the caller's buffer, held
+    /// across uploads and grown to the largest shape it has seen —
+    /// `volume::bridge::VolumeResources::widening` is the one production holds.
+    ///
+    /// It is safe to reuse the instant this returns, and the caller need not
+    /// wait for the queue: `write_texture` copies into wgpu's own staging
+    /// buffer inside the call, so nothing outlives the borrow.
+    ///
+    /// A caller with no buffer to hand may pass `&mut Vec::new()` and get the
+    /// old behaviour — a fresh allocation per upload — which is what the GPU
+    /// suites do, since each of them uploads once and then draws.
+    ///
+    /// # What it saved
+    ///
+    /// Interleaved against the fresh-allocation arm, the order alternating so
+    /// neither always follows the other: 31 timed pairs, desktop shape,
+    /// `CoarseLevel::Omitted` — the shipped default. Host is a Ryzen 9 7950X
+    /// (32 threads) otherwise idle, `cargo test --release` so `opt-level = 3`
+    /// and `lto = true`; device is an RTX 3090 through Vulkan. Best of each arm,
+    /// with the spread beside it.
+    ///
+    /// The pass this changed, which is the only figure here that is a property
+    /// of the code:
+    ///
+    /// | per upload         |             fresh |  pooled |
+    /// |--------------------|------------------:|--------:|
+    /// | the widening       | 11.95 ms (→16.67) | 1.86 ms |
+    /// | minor faults       |              8193 |       0 |
+    ///
+    /// The fault counts are exact rather than typical — minimum, median and
+    /// maximum over the 31 calls were all 8193 and all 0 — and they are what
+    /// makes the attribution safe, because a fault count does not move with the
+    /// machine's load, its other tenants or the driver, and every other number
+    /// on this page does.
+    ///
+    /// # Why the whole call's own figure is not the headline
+    ///
+    /// The same sweep timed the whole call at **26.26 ms against 17.30 ms**,
+    /// and that pair must not be read as this change's before and after: the
+    /// call is **bimodal for a reason that has nothing to do with it**.
+    /// `queue.write_texture`'s share is a host copy into write-combined memory
+    /// across the PCIe BAR at ~2 GB/s, and — measured separately, at **0** minor
+    /// faults either way — it costs ~15.5 ms while the card's 246 MiB
+    /// host-visible window still has headroom, and about a millisecond once that
+    /// window is saturated and wgpu stages through system RAM instead. So the
+    /// very same code times at ~33 ms or ~18.6 ms according to nothing but what
+    /// else is resident on the card, and the 12.7 ms this call was once recorded
+    /// at is the saturated mode. What is invariant across the modes is the
+    /// ~10 ms of widening taken out here.
+    ///
+    /// The control is the same call at `[128, 128, 64]`, whose 4 MiB plane is
+    /// far under the cap and so recycles: **2.19 ms against 2.15 ms**, and 0
+    /// faults in *both* arms. That is the finding stated as an experiment — the
+    /// win is not "allocation is slow", it is this one block never being
+    /// reusable.
+    ///
+    /// See [`crate::constants::MAX_LOOP_VOLUME_BUILDS_PER_FRAME`].
+    #[allow(clippy::too_many_arguments)]
     pub fn upload_volume_at(
         &self,
         device: &wgpu::Device,
@@ -780,6 +859,7 @@ impl VolumePipelines {
         indices: &[u8],
         lut: &[u8],
         coarse: CoarseLevel,
+        widening: &mut Vec<u8>,
     ) -> Option<VolumeTextures> {
         if let Some(why) = upload_refusal(cells, indices.len(), lut.len()) {
             log::error!("3D volume view: {why}");
@@ -816,10 +896,10 @@ impl VolumePipelines {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        let premultiplied = coverage_premultiplied(indices);
+        let premultiplied = coverage_premultiplied_into(widening, indices);
         queue.write_texture(
             grid.as_image_copy(),
-            &premultiplied,
+            premultiplied,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 // No 256-byte row padding: `write_texture` repacks internally to
@@ -1376,15 +1456,65 @@ fn coarse_cells(cells: [u32; 3]) -> [u32; 3] {
 /// byte the same output — `the_texel_table_is_the_conversion_it_replaces`
 /// proves that over the whole 256-value input domain, which is the whole of it.
 ///
-/// What is left is page faults and store bandwidth on 32 MiB, not conversion.
-fn coverage_premultiplied(indices: &[u8]) -> Vec<u8> {
+/// Both of those figures were taken when this allocated its own output, and the
+/// second is mostly that allocation: through the table **and** a carried buffer
+/// the same pass is 1.86 ms. What was left after the conversion went was page
+/// faults and store bandwidth on 32 MiB, and the section below is that.
+///
+/// # Why the caller owns the buffer
+///
+/// This used to return a fresh `Vec<u8>`, and on the desktop shape **the
+/// allocation cost five times the pass it fed**. The request is
+/// `256 × 256 × 128 × 4` bytes plus glibc's chunk header — 33,558,528, just
+/// over the 33,554,432 of `DEFAULT_MMAP_THRESHOLD_MAX`. glibc's mmap threshold
+/// is adaptive and grows to cover blocks it has seen freed, but it is capped at
+/// exactly that constant, so this one request can never come out of the arena:
+/// it is `mmap`ed and `munmap`ed on **every call**, and every call therefore
+/// faults its 8193 pages in again on first touch. Under `strace`, eleven
+/// consecutive widenings made eleven `mmap`/`munmap` pairs of 33,558,528 bytes
+/// and recycled nothing; the same eleven through one carried buffer made
+/// **one** `mmap`, on the first.
+///
+/// The 4 MiB the coarse level allocates beside it ([`downsampled_grid`]) is a
+/// different case and is deliberately left alone: it is far under the cap, so
+/// the threshold grows past it on the first free and every later call comes out
+/// of the arena. The same `strace` counted one `mmap` for eleven coarse passes,
+/// and their timing is flat from the first — there is nothing there to pool.
+///
+/// Measured on the desktop shape (see [`VolumePipelines::upload_volume_at`] for
+/// the machine, profile and method): this pass was **11.95 ms** allocating its
+/// own output and is **1.86 ms** writing into a carried one. The 10.1 ms
+/// between them is the paging and the `munmap` on drop, and the fault counter
+/// says so exactly — **8193 minor faults per call before, 0 after**, the same
+/// on every one of 31 calls. Reusing one buffer removes it, and there is
+/// nothing to reuse *inside* this function: the plane's life ends when
+/// `write_texture` returns.
+///
+/// The buffer only ever **grows** ([`Vec::resize`] under a `<` guard), so it
+/// settles at the largest shape the process has uploaded and no upload after
+/// the first pays for pages again. That makes the residency permanent rather
+/// than transient, which
+/// [`crate::constants::MAX_LOOP_VOLUME_BUILDS_PER_FRAME`] states as the cost.
+///
+/// The returned slice is the **used prefix**, not the whole buffer: a grid
+/// smaller than its predecessor leaves that predecessor's texels in the tail,
+/// and the plane this hands back has to be the one it just wrote rather than
+/// everything it is holding. `a_reused_widening_buffer_is_the_plane_a_fresh_
+/// one_would_be` pins that, smaller shape after larger included, and pins the
+/// tail's being genuinely stale so the case is not checked vacuously.
+fn coverage_premultiplied_into<'a>(out: &'a mut Vec<u8>, indices: &[u8]) -> &'a [u8] {
     let texels = coverage_texels();
     let stride = GRID_BYTES_PER_CELL as usize;
-    let mut out = vec![0u8; indices.len() * stride];
-    for (texel, &index) in out.chunks_exact_mut(stride).zip(indices) {
+    let plane_bytes = indices.len() * stride;
+    // Grow only. Shrinking would give the pages back and buy them again on the
+    // next larger grid, which is the whole cost being removed here.
+    if out.len() < plane_bytes {
+        out.resize(plane_bytes, 0);
+    }
+    for (texel, &index) in out[..plane_bytes].chunks_exact_mut(stride).zip(indices) {
         texel.copy_from_slice(&texels[index as usize]);
     }
-    out
+    &out[..plane_bytes]
 }
 
 /// Every [`VOLUME_TEXTURE_FORMAT`] texel a grid byte can widen into, indexed by
@@ -1498,7 +1628,7 @@ fn upload_coarse_level(queue: &wgpu::Queue, grid: &wgpu::Texture, cells: [u32; 3
 /// plane [`VolumePipelines::upload_volume`] was handed.
 ///
 /// It used to read them back out of the level-0 plane
-/// [`coverage_premultiplied`] had just written — decoding sixteen binary16
+/// [`coverage_premultiplied_into`] had just written — decoding sixteen binary16
 /// channels per coarse cell to recover eight bytes it was already holding, and
 /// gathering them across a 256 KiB z-stride where the index plane's is 64 KiB.
 /// Measured on the desktop shape, best of seven: **35.9 ms through the widened

@@ -728,7 +728,8 @@ fn the_premultiplied_plane_is_index_and_a_binary_coverage() {
     const HALF_ULP: f32 = 1.0 / 2048.0;
 
     let indices: Vec<u8> = (0..=255u8).collect();
-    let plane = super::coverage_premultiplied(&indices);
+    let mut buffer = Vec::new();
+    let plane = super::coverage_premultiplied_into(&mut buffer, &indices);
     assert_eq!(plane.len(), indices.len() * GRID_BYTES_PER_CELL as usize);
     for (index, texel) in indices
         .iter()
@@ -760,7 +761,7 @@ fn the_premultiplied_plane_is_index_and_a_binary_coverage() {
     // scaled by any coverage under a half rounds to zero, the shell around
     // the echo reconstructs to the no-data index, and the silhouette's reach
     // starts reading the stored value again.
-    let faintest = super::read_channel(&plane, GRID_BYTES_PER_CELL as usize);
+    let faintest = super::read_channel(plane, GRID_BYTES_PER_CELL as usize);
     assert!(
         faintest > 0.0 && (faintest * 255.0 - 1.0).abs() < 0.01,
         "index 1 stores {faintest}, which is not 1/255 — the faintest echo \
@@ -772,7 +773,8 @@ fn the_premultiplied_plane_is_index_and_a_binary_coverage() {
 /// The 256-entry texel table is the conversion it replaces, **byte for byte**,
 /// over the whole of its input domain.
 ///
-/// `coverage_premultiplied` no longer calls `half::f16::from_f32` per cell; it
+/// `coverage_premultiplied_into` no longer calls `half::f16::from_f32` per cell;
+/// it
 /// gathers from [`super::coverage_texels`]. That is a speed change and it is
 /// only allowed to be a speed change — the plane the GPU is handed has to be
 /// the same 32 MiB it was before, not a rounding of it. The domain is one byte
@@ -780,12 +782,14 @@ fn the_premultiplied_plane_is_index_and_a_binary_coverage() {
 /// exhaustive rather than a sample: there is no residual risk to argue about.
 ///
 /// The right-hand side is written out as the arithmetic on purpose. Comparing
-/// the table against itself through `coverage_premultiplied` would pass with
+/// the table against itself through `coverage_premultiplied_into` would pass
+/// with
 /// both halves wrong together, which is the failure mode a table introduces.
 #[test]
 fn the_texel_table_is_the_conversion_it_replaces() {
     let indices: Vec<u8> = (0..=255u8).collect();
-    let plane = super::coverage_premultiplied(&indices);
+    let mut buffer = Vec::new();
+    let plane = super::coverage_premultiplied_into(&mut buffer, &indices);
 
     let mut arithmetic = Vec::with_capacity(indices.len() * GRID_BYTES_PER_CELL as usize);
     for &index in &indices {
@@ -800,6 +804,112 @@ fn the_texel_table_is_the_conversion_it_replaces() {
         "the texel table has stopped agreeing with the `half` conversion it \
          was built from — the widening is no longer a pure speed change, and \
          every uploaded grid differs from what the format's contract says",
+    );
+}
+
+/// A widening buffer carried across uploads gives the same plane a fresh one
+/// would — **including when a smaller grid follows a larger one**.
+///
+/// `coverage_premultiplied_into` reuses the caller's buffer and only ever grows
+/// it, which is what makes the upload cheap and is also the one thing that can
+/// make it wrong. After a 256 × 256 × 128 grid the buffer holds 32 MiB of that
+/// grid's texels; the 64 × 64 × 32 grid after it writes 512 KiB and leaves
+/// 31.5 MiB of the previous volume behind it. The contract that keeps that
+/// harmless is
+/// that the function hands back the **used prefix** and never the buffer, and
+/// this is where that is on the hook — the mistake it catches is returning
+/// `&out[..]`, or having the caller reach past the return value to the `Vec`.
+///
+/// Every case is checked against the same function on an *empty* buffer rather
+/// than against a second opinion about the encoding: what is being proved here
+/// is that pooling changed nothing, and `the_texel_table_is_the_conversion_it_
+/// replaces` above is what proves the encoding itself. The shapes include the
+/// odd and partial extents the upload accepts — `[7, 5, 3]` is not a shipped
+/// rung, but nothing in this function knows that.
+///
+/// # Why the order is not largest-first
+///
+/// It was, and that made the **grow** half of the contract unreachable: with
+/// the widest shape first, `out.len() < plane_bytes` is true on call one and
+/// never again, so `if out.capacity() < plane_bytes` and even `if
+/// out.is_empty()` pass the whole test. Neither is correct — the first because
+/// `Vec::resize` over-allocates, so capacity outruns length and a later grow is
+/// skipped while the buffer is still too short; the second because a session's
+/// first upload is simply not guaranteed to be its widest. Nothing makes it so:
+/// the extent follows the region box, and the mobile and wasm rungs ship
+/// narrower grids than the desktop one. A regression there panics on the frame
+/// thread, in `prepare`.
+///
+/// So the walk interleaves both directions. It grows from empty, grows from a
+/// **non-empty smaller** buffer, shrinks onto a tail, and grows again — and the
+/// `[64, 64, 48]` → `[128, 64, 32]` pair is placed deliberately: the first
+/// leaves `Vec`'s amortised doubling holding spare capacity, and the second
+/// asks for more than the length but less than that capacity, which is the one
+/// arrangement a `capacity()` test gets wrong.
+///
+/// The staleness is asserted to be **real**, not assumed: without the length
+/// check on the buffer this test would still pass on a version that shrank the
+/// buffer to fit, and would then be proving nothing about the case it is named
+/// for.
+#[test]
+fn a_reused_widening_buffer_is_the_plane_a_fresh_one_would_be() {
+    let stride = GRID_BYTES_PER_CELL as usize;
+    // Grows and shrinks interleaved — see the note above on why not
+    // largest-first. All three shipped rungs appear, widest last.
+    let shapes = [
+        [3u32, 1, 2],    // grow from empty
+        [64, 64, 32],    // grow from a non-empty smaller buffer
+        [7, 5, 3],       // shrink onto a tail
+        [64, 64, 48],    // grow, leaving spare capacity behind it
+        [128, 64, 32],   // grow past the length but inside that capacity
+        [1, 1, 1],       // shrink to the smallest extent there is
+        [192, 192, 96],  // grow — the mobile rung
+        [128, 128, 64],  // shrink — the wasm32 rung, onto a 13.5 MiB tail
+        [256, 256, 128], // grow — the desktop rung, the widest shipped
+        [64, 64, 32],    // shrink onto the full 32 MiB tail
+    ];
+    let mut reused = Vec::new();
+    let mut high_water = 0;
+    for cells in shapes {
+        let count = cells[0] as usize * cells[1] as usize * cells[2] as usize;
+        // Every one of the 256 input bytes appears, and the pattern is offset
+        // per shape so two shapes never widen to the same bytes.
+        let indices: Vec<u8> = (0..count)
+            .map(|i| (i.wrapping_add(cells[2] as usize) % 256) as u8)
+            .collect();
+
+        let fresh = super::coverage_premultiplied_into(&mut Vec::new(), &indices).to_vec();
+        let pooled = super::coverage_premultiplied_into(&mut reused, &indices);
+        assert_eq!(
+            pooled.len(),
+            count * stride,
+            "the {cells:?} grid's plane is not the length its extent asks for",
+        );
+        assert_eq!(
+            pooled,
+            &fresh[..],
+            "the {cells:?} grid widened into a carried buffer differs from the \
+             same grid widened into an empty one — the upload's bytes now \
+             depend on what was uploaded before it",
+        );
+
+        high_water = high_water.max(count * stride);
+        assert_eq!(
+            reused.len(),
+            high_water,
+            "the widening buffer no longer sits at the largest shape it has \
+             been asked for, so the tail this test exists to catch is not \
+             actually being left behind and the case is going unchecked",
+        );
+    }
+    // And the tail really is the earlier grid, not zeroes that would hide a
+    // missing prefix bound.
+    let small: Vec<u8> = vec![9u8; 8];
+    super::coverage_premultiplied_into(&mut reused, &small);
+    assert!(
+        reused[small.len() * stride..].iter().any(|&b| b != 0),
+        "the buffer's tail past the plane is all zeroes, so a version that \
+         handed back the whole buffer would look correct here",
     );
 }
 
