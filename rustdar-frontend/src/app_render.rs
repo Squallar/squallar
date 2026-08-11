@@ -1484,7 +1484,7 @@ impl super::App {
                         .gui
                         .panes()
                         .iter()
-                        .any(|pane| pane.kind() == rustdar_egui::pane::PaneKind::Volume);
+                        .any(|pane| pane.render_view() == rustdar_radar::types::RenderView::Volume);
                     if volume_on_screen {
                         let losses = crate::volume::degrade::note_surface_loss_with_volume();
                         log::warn!(
@@ -2119,7 +2119,12 @@ impl super::App {
             // `VolumeLoopKey`.
             let volume_key = pane.volume().map(|v| {
                 rustdar_egui::pane::VolumeLoopKey::new(
-                    v.region,
+                    // The pane's own viewport as its render arm last measured
+                    // it — see `VolumePane::viewport_box`. Reading it here is
+                    // what keeps a loop's frames resampled over the same ground
+                    // the live pane is showing; zooming the pane therefore
+                    // rekeys the loop, exactly as a re-dragged box used to.
+                    v.viewport_box,
                     (product == rustdar_radar::types::RadarProduct::StormRelativeVelocity)
                         .then_some(motion_override)
                         .flatten(),

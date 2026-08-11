@@ -1156,6 +1156,10 @@ fn restore_map(pane_idx: usize, pc: &PaneConfig, render: MapRender) -> PaneConte
         render,
         volume: VolumePane {
             camera,
+            // Not persisted, and not invented here: it is a measurement of a
+            // viewport, and the first frame the pane draws in 3D takes it. See
+            // the field.
+            viewport_box: None,
             // A restored pane holds nothing built, so `rendered_for: None` is
             // what makes the dispatcher resample against whatever volume the
             // pane's site loads.

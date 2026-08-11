@@ -1831,6 +1831,9 @@ fn volume_pane_outcome(
         return VolumeOutcome::empty_state(VOLUME_EMPTY_STATE.to_owned());
     };
     volume.camera.nudge(delta);
+    // The measurement, published for the loop planner — which runs outside the
+    // egui pass and cannot take it itself. See `VolumePane::viewport_box`.
+    volume.viewport_box = region;
     let camera = volume.camera;
     let floor = !volume.hide_floor;
     let already_rendered = volume.rendered_for.clone();

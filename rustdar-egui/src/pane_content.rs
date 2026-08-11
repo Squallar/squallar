@@ -878,6 +878,28 @@ impl VolumeRegion {
 pub struct VolumePane {
     /// Where the eye is. See [`OrbitCamera`].
     pub camera: OrbitCamera,
+    /// The box this pane resolved on its last drawn frame — a **readback**, not
+    /// a setting.
+    ///
+    /// The region is the pane's viewport ([`crate::ui_region::region_for_viewport`]),
+    /// and only the render arm can measure it: the rect, the `MapMemory` and the
+    /// centre all exist inside the egui pass and nowhere else. But the loop
+    /// planner runs *outside* that pass and has to name the same ground — every
+    /// frame of a 3D loop is resampled over it — so the arm writes what it
+    /// measured here for the planner to read.
+    ///
+    /// **Nothing may write this to aim the pane.** It is the answer to "what did
+    /// the viewport come to", and the way to change it is to move the viewport.
+    /// A writer that set it directly would be overruled on the very next frame,
+    /// which is the quietest kind of broken control there is. That is also why
+    /// it is not persisted: a measurement of a viewport that no longer exists is
+    /// worse than no measurement, and the viewport itself *is* persisted, so the
+    /// first frame after a restore re-measures it.
+    ///
+    /// `None` before the pane has been drawn in the 3D mode even once, and for a
+    /// viewport too degenerate to measure. Both mean the same thing downstream:
+    /// the default whole-scan box, [`DEFAULT_HALF_WIDTH_KM`].
+    pub viewport_box: Option<VolumeRegion>,
     /// Which volume the grid on screen was built from, or `None` before the
     /// first build.
     pub rendered_for: Option<VolumeTarget>,

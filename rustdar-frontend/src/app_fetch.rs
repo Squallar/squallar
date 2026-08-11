@@ -1502,20 +1502,18 @@ fn begin_loop_for_pane(
     // loop this call is replacing. The scan cache is global and deliberately kept.
     loop_mgr.remove_pending(pane_idx);
 
-    // The view comes off the pane's own kind. A pane that cannot loop at all is
-    // refused above this by `Gui::loop_sync_targets` and the timeline's own
-    // gate; if one reached here anyway it would build a loop whose frames every
-    // predicate refuses, which is a spinner that never finishes — so it is
-    // refused here too, where the kind is in hand.
-    let kind = panes[pane_idx].kind();
-    if !kind.can_loop() {
+    // The view the pane is drawing, which is what a loop's frames are pictures
+    // of. A pane that cannot loop at all is refused above this by
+    // `Gui::loop_sync_targets` and the timeline's own gate; if one reached here
+    // anyway it would build a loop whose frames every predicate refuses, which
+    // is a spinner that never finishes — so it is refused here too, where the
+    // view is in hand.
+    let view = panes[pane_idx].render_view();
+    if !view.can_loop() {
         return None;
     }
-    panes[pane_idx].loop_state = rustdar_egui::pane::LoopPlaybackState::new_for_loop(
-        lookback_secs,
-        &radar_site,
-        kind.render_view(),
-    );
+    panes[pane_idx].loop_state =
+        rustdar_egui::pane::LoopPlaybackState::new_for_loop(lookback_secs, &radar_site, view);
 
     Some(LoopScanRequest {
         site: radar_site.name.to_string(),
