@@ -31,7 +31,9 @@
 //! **There is no Firefox/Chromium gap on `radar-render`.** An earlier claim of
 //! 899-962 ms in Firefox against 162 ms in Chromium (5.7x) does not reproduce.
 //! Both browsers against the same archived sweep (`KTLX20260725_191018_V06`,
-//! 9 067 340 bytes, release, `IMAGE_SIZE` 1024):
+//! 9 067 340 bytes, release, at the 1024 `IMAGE_SIZE` the web arm had when
+//! these were taken — a static web render is 2048 now, so the absolute figures
+//! below are a floor and the browser-to-browser comparison is the finding):
 //!
 //! | browser                          |  n | min    | median |
 //! |----------------------------------|---:|-------:|-------:|

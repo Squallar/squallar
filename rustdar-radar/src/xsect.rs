@@ -37,12 +37,9 @@
 //!
 //! # The raster
 //!
-//! [`SECTION_WIDTH`] is [`crate::types::IMAGE_SIZE`] and [`SECTION_HEIGHT`] is
-//! half of it. That inherits the wasm/native split — 1024 on the web, 2048
-//! native — and with it the WebGL2 2048-texture rationale
-//! [`crate::types::IMAGE_SIZE`] already carries, for free and with no second
-//! `cfg` cascade. Both dimensions stay powers of two and both stay inside the
-//! floor a phone browser may report. A 2 : 1 raster also matches the shape of
+//! [`SECTION_WIDTH`] is 1024 on the web and 2048 native, and [`SECTION_HEIGHT`]
+//! is half of it. Both dimensions stay powers of two and both stay inside the
+//! 2048 floor a phone browser may report. A 2 : 1 raster also matches the shape of
 //! the thing drawn: a 230 km line under a 20 km axis is 11 : 1 in the world, so
 //! the picture is already stretched vertically by an order of magnitude and a
 //! square raster would spend three quarters of its rows on the stretch.
@@ -149,14 +146,38 @@
 use crate::beam;
 use crate::par::*;
 use crate::sampler::{Column, Sample, SampleStatus, VolumeSampler};
-use crate::types::{self, RadarProduct};
+use crate::types::RadarProduct;
 
-/// Width of a rendered section, in pixels: [`crate::types::IMAGE_SIZE`].
-pub const SECTION_WIDTH: usize = types::IMAGE_SIZE;
+/// The wasm32 section width, named outside the cascade so a host build can
+/// check it. See [`SECTION_WIDTH`].
+pub const WASM_SECTION_WIDTH: usize = 1024;
+
+/// The native section width. See [`SECTION_WIDTH`].
+pub const NATIVE_SECTION_WIDTH: usize = 2048;
+
+/// Width of a rendered section, in pixels.
+///
+/// These are the sizes a section has always been rendered at, now written down
+/// instead of inherited: they used to read [`crate::types::IMAGE_SIZE`], which
+/// stopped meaning "the picture a browser gets" when the web plan view went to
+/// 2048. Following it there would have quadrupled a web section loop's
+/// textures — eight resident frames at 8 MiB against a 48 MiB per-pane budget —
+/// for a view whose cost the plan view's texture ceiling has nothing to say
+/// about.
+///
+/// A section raster is not bounded by ground the way a plan view is, so
+/// nothing here follows an extent. Both dimensions stay powers of two and both
+/// stay inside the 2048 floor a phone browser may report. A 2 : 1 raster also
+/// matches the shape of the thing drawn — see the module doc.
+#[cfg(target_arch = "wasm32")]
+pub const SECTION_WIDTH: usize = WASM_SECTION_WIDTH;
+/// See the wasm32 arm above.
+#[cfg(not(target_arch = "wasm32"))]
+pub const SECTION_WIDTH: usize = NATIVE_SECTION_WIDTH;
 
 /// Height of a rendered section, in pixels: half [`SECTION_WIDTH`]. See the
 /// module doc for why half and not square.
-pub const SECTION_HEIGHT: usize = types::IMAGE_SIZE / 2;
+pub const SECTION_HEIGHT: usize = SECTION_WIDTH / 2;
 
 /// How far above the site the default height axis reaches, km.
 ///

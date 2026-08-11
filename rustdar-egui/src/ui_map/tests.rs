@@ -158,3 +158,77 @@ fn the_hover_readout_reports_range_and_azimuth_from_the_site() {
         readout(site_lat, site_lon),
     );
 }
+
+/// The hover reads a value grid at the grid's *own* side, not at a constant.
+///
+/// A grid arrives from a render whose raster size depends on how far the sweep
+/// reached, and this crate is never told which ceiling the frontend offered
+/// it. So the readout has to derive the side, and the derivation has to be
+/// exercised on a grid that is **not** the default size — a test on a
+/// `IMAGE_SIZE`-square grid would pass just as well against the old constant.
+///
+/// The fixture is a 64 × 64 grid with one non-`NaN` cell, placed so that a
+/// side read as anything else lands somewhere else: at row 16, column 48, the
+/// pointer three quarters across and a quarter down finds it, and the same
+/// pointer on a 2048-wide reading would index past the end and report nothing.
+#[test]
+fn the_hover_reads_a_value_grid_at_the_side_its_length_implies() {
+    const SIDE: usize = 64;
+    let mut grid = vec![f32::NAN; SIDE * SIDE];
+    grid[16 * SIDE + 48] = 42.5;
+
+    let prefs = UserPreferences::default();
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0));
+    let readout = |values: &[f32], x: f32, y: f32| {
+        compute_hover_info_raw(
+            values,
+            &HoverInput {
+                site_lat: 35.3333,
+                site_lon: -97.2778,
+                hover_lat: 35.3333,
+                hover_lon: -97.2778,
+                hover_pos: egui::pos2(x, y),
+                rect,
+            },
+            RadarProduct::Reflectivity,
+            &prefs,
+        )
+    };
+
+    // Three quarters across, a quarter down — column 48, row 16 of 64.
+    assert!(
+        readout(&grid, 75.5, 25.5).ends_with("| Reflectivity: 42.5 dBZ"),
+        "the gate at (48, 16) of a 64-wide grid was not found: {}",
+        readout(&grid, 75.5, 25.5),
+    );
+    // And a pointer elsewhere in the same grid finds the NaN that is there.
+    assert!(
+        readout(&grid, 25.5, 75.5).ends_with("\u{b0} "),
+        "a cell with no gate in it must append nothing",
+    );
+
+    // A loop frame's grid: empty on purpose, because a hover goes quiet under
+    // a loop. `poll_loop_render_results` stores `Vec::new()` for every frame,
+    // so this is the routine case and it must not divide by a zero side.
+    assert!(
+        readout(&[], 50.0, 50.0).ends_with("\u{b0} "),
+        "an empty value grid must read as no value rather than dividing by \
+         a side of zero",
+    );
+
+    // A length that is not a square is not a grid this display makes, and is
+    // refused rather than indexed into at some rounded-down side.
+    assert!(readout(&vec![1.0; SIDE * SIDE - 1], 50.0, 50.0).ends_with("\u{b0} "));
+}
+
+/// The side derivation itself, at the two ends and at the sizes that are not
+/// grids.
+#[test]
+fn a_value_grids_side_is_its_exact_integer_square_root_or_nothing() {
+    for side in [1usize, 64, 1024, 2048, 4096] {
+        assert_eq!(value_grid_side(side * side), Some(side), "{side}");
+    }
+    for len in [0, 2, 3, 5, 2048 * 2048 - 1, 2048 * 2048 + 1] {
+        assert_eq!(value_grid_side(len), None, "{len}");
+    }
+}

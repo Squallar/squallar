@@ -366,7 +366,7 @@ fn two_resolvable_objects_pick_the_same_one_every_time() {
 /// the age lookup reads carry anything.
 fn rendered(product: RadarProduct, elevation: f32) -> CachedPaneRender {
     CachedPaneRender {
-        image_data: Arc::new(Vec::new()),
+        image: Arc::new(egui::ColorImage::default()),
         max_range_km: 230.0,
         value_data: Arc::new(Vec::new()),
         product,
@@ -584,7 +584,7 @@ fn an_unchanged_override_invalidates_nothing() {
 
 fn output() -> CachedRenderOutput {
     CachedRenderOutput {
-        image_data: Arc::new(Vec::new()),
+        image: Arc::new(egui::ColorImage::default()),
         max_range_km: 230.0,
         value_data: Arc::new(Vec::new()),
     }

@@ -2,7 +2,7 @@ use super::map_overlays::draw_tile_layer;
 use crate::actions::GuiAction;
 use rustdar_overlays::render::overlay_state::OverlayKind;
 use rustdar_radar::beam;
-use rustdar_radar::types::{IMAGE_SIZE, RadarProduct, RenderView};
+use rustdar_radar::types::{RadarProduct, RenderView};
 use rustdar_units::UserPreferences;
 
 #[path = "ui_map_pane.rs"]
@@ -2805,6 +2805,25 @@ fn draw_pane_border(ui: &mut egui::Ui, pane_rect: egui::Rect, is_active: bool) -
     }
 }
 
+/// The side of a square value grid of `len` entries, or `None` if it has none.
+///
+/// The grid is square by construction — it is one `f32` per pixel of a square
+/// raster — but its side is no longer a constant: a sweep reaching past the
+/// 230 km floor is rendered wider, and this crate has no way to know which
+/// ceiling the frontend passed for it. Reading the side back off the length is
+/// therefore the only honest answer, and an exact integer square root is what
+/// makes it safe: a length that is not a perfect square cannot produce an index
+/// inside a grid that is not there.
+///
+/// **A zero length is the routine case, not the pathological one.** Loop frames
+/// ship an empty grid on purpose — a hover readout goes quiet under a loop —
+/// and every `poll_loop_render_results` frame stores `Vec::new()`. `None` here
+/// is what keeps that from becoming a divide by a zero side.
+pub(super) fn value_grid_side(len: usize) -> Option<usize> {
+    let side = len.isqrt();
+    (side > 0 && side * side == len).then_some(side)
+}
+
 /// Context for computing hover info from radar value data.
 pub(super) struct HoverInput {
     pub site_lat: f64,
@@ -2838,17 +2857,19 @@ pub(super) fn compute_hover_info_raw(
     );
 
     let mut value_str = String::new();
-    let frac_x = (input.hover_pos.x - input.rect.left()) / input.rect.width();
-    let frac_y = (input.hover_pos.y - input.rect.top()) / input.rect.height();
-    let px = (frac_x * IMAGE_SIZE as f32) as i32;
-    let py = (frac_y * IMAGE_SIZE as f32) as i32;
+    if let Some(side) = value_grid_side(value_data.len()) {
+        let frac_x = (input.hover_pos.x - input.rect.left()) / input.rect.width();
+        let frac_y = (input.hover_pos.y - input.rect.top()) / input.rect.height();
+        let px = (frac_x * side as f32) as i32;
+        let py = (frac_y * side as f32) as i32;
 
-    if px >= 0 && px < IMAGE_SIZE as i32 && py >= 0 && py < IMAGE_SIZE as i32 {
-        let pixel_idx = py as usize * IMAGE_SIZE + px as usize;
-        if pixel_idx < value_data.len() {
-            let value = value_data[pixel_idx];
-            if !value.is_nan() {
-                value_str = format!("| {}", product.format_value(value, prefs));
+        if px >= 0 && px < side as i32 && py >= 0 && py < side as i32 {
+            let pixel_idx = py as usize * side + px as usize;
+            if pixel_idx < value_data.len() {
+                let value = value_data[pixel_idx];
+                if !value.is_nan() {
+                    value_str = format!("| {}", product.format_value(value, prefs));
+                }
             }
         }
     }

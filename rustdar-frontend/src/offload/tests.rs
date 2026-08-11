@@ -48,6 +48,7 @@ fn a_job() -> JobRequest {
             RenderInput::from_bytes(&sample_input_bytes()).expect("fixture payload decodes"),
         ),
         values_wanted: true,
+        full_res: true,
     }
 }
 
@@ -165,6 +166,7 @@ fn a_level3_job() -> JobRequest {
         product: rustdar_radar::types::RadarProduct::EchoTops,
         radar_lat: 35.0,
         radar_lon: -97.0,
+        full_res: true,
     }
 }
 
@@ -177,6 +179,7 @@ fn a_level3_pair_job() -> JobRequest {
         eet: std::sync::Arc::new(vec![4, 5, 6, 7, 0xFF, 0]),
         radar_lat: 35.0,
         radar_lon: -97.0,
+        full_res: true,
     }
 }
 
@@ -496,9 +499,10 @@ fn the_vertical_jobs_produce_their_own_output_kinds() {
 /// wrong-shaped buffer.
 ///
 /// This is the accessor the whole widening rests on. `RenderedFrame` was
-/// deliberately not given a width and a height, so every consumer of one
-/// still assumes `IMAGE_SIZE`; the assumption survives only because a
-/// section cannot reach those consumers, and this is what says so.
+/// deliberately not given a width and a height, so every consumer of one reads
+/// its side back off the buffer against the closed set of *square* plan-view
+/// sizes; a section's raster is not square and would be refused, but a refusal
+/// is a blank pane, and this is what keeps one from ever getting that far.
 #[test]
 fn a_frame_consumer_sees_nothing_rather_than_another_kinds_buffers() {
     let section = execute(&a_section_job()).expect("the section job draws");
@@ -624,18 +628,43 @@ fn a_malformed_job_is_refused_rather_than_misread() {
     assert_eq!(JobRequest::from_bytes(&[]), None, "empty");
     assert_eq!(JobRequest::from_bytes(&[0xFF, 1, 2]), None, "unknown tag");
     assert_eq!(JobRequest::from_bytes(&[TAG_RADAR]), None, "no flag");
-    assert_eq!(JobRequest::from_bytes(&[TAG_RADAR, 1]), None, "no payload");
     assert_eq!(
-        JobRequest::from_bytes(&[TAG_RADAR, 2]),
+        JobRequest::from_bytes(&[TAG_RADAR, 1]),
         None,
-        "the flag is a bool, not a byte"
+        "no second flag"
     );
+    assert_eq!(
+        JobRequest::from_bytes(&[TAG_RADAR, 1, 1]),
+        None,
+        "no payload"
+    );
+    // Both flags are booleans, and a byte outside `{0, 1}` is a build whose
+    // protocol is not this one — refused rather than guessed at, on each of
+    // the three variants that carries one.
+    assert_eq!(
+        JobRequest::from_bytes(&[TAG_RADAR, 2, 1]),
+        None,
+        "values_wanted is a bool, not a byte"
+    );
+    assert_eq!(
+        JobRequest::from_bytes(&[TAG_RADAR, 1, 2]),
+        None,
+        "full_res is a bool, not a byte"
+    );
+    for (tag, what) in [(TAG_LEVEL3, "level3"), (TAG_LEVEL3_PAIR, "level3 pair")] {
+        assert_eq!(
+            JobRequest::from_bytes(&[tag, 2]),
+            None,
+            "{what}: full_res is a bool, not a byte"
+        );
+    }
 
     // A length prefix that claims more than the payload holds must be
     // refused, not read as a short object: the pair's first length is the
-    // one number on the wire that could lie.
+    // one number on the wire that could lie. Byte 18, not 17: the tag, the
+    // `full_res` flag and two `f64`s precede it.
     let mut overlong = a_level3_pair_job().to_bytes();
-    overlong[17] = 0xFF;
+    overlong[18] = 0xFF;
     assert_eq!(
         JobRequest::from_bytes(&overlong),
         None,
@@ -657,8 +686,8 @@ fn a_malformed_job_is_refused_rather_than_misread() {
     }
 
     let mut bad_product = a_level3_job().to_bytes();
-    bad_product[1] = 0xFE;
-    bad_product[2] = 0xFF;
+    bad_product[2] = 0xFE;
+    bad_product[3] = 0xFF;
     assert_eq!(
         JobRequest::from_bytes(&bad_product),
         None,

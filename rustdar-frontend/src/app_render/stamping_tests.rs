@@ -59,11 +59,15 @@ pub(super) fn tilt(elevation_tenths: i16, key: &str) -> Level3Product {
 }
 
 /// A finished render, as `poll_render_results` builds one. The pixels are
-/// blank but full size: `ColorImage::from_rgba_unmultiplied` checks the
-/// buffer against the dimensions it is given.
+/// blank but full size, and already converted: the unmultiply moved to the
+/// render thread, so what reaches a pane is a `ColorImage`.
 fn finished(product: RadarProduct, elevation: f32) -> CachedPaneRender {
+    let side = rustdar_radar::types::IMAGE_SIZE;
     CachedPaneRender {
-        image_data: Arc::new(vec![0u8; IMAGE_SIZE * IMAGE_SIZE * 4]),
+        image: Arc::new(egui::ColorImage::from_rgba_unmultiplied(
+            [side, side],
+            &vec![0u8; side * side * 4],
+        )),
         max_range_km: 230.0,
         value_data: Arc::new(Vec::new()),
         product,
@@ -235,5 +239,73 @@ fn a_placed_render_describes_what_it_depicts() {
     assert_eq!(
         app.gui.pane(0).unwrap().stale_image_on_screen(),
         Some((RadarProduct::Reflectivity, 0.5)),
+    );
+}
+
+/// A long-range render lands on a pane at its own size, and the overlay entry
+/// says so.
+///
+/// `apply_render_to_pane` used to name `IMAGE_SIZE` three times: once to
+/// convert the buffer and twice to describe the texture. The conversion has
+/// moved to the render thread, and the two descriptions now come off the
+/// picture itself — which is the property worth pinning, because a texture
+/// uploaded at 4096 and described as 2048 would be placed on a quarter of the
+/// ground its gates were painted onto, with the hover reading the wrong pixel
+/// and nothing anywhere to notice.
+#[test]
+fn a_long_range_render_is_placed_at_the_size_it_was_rendered_at() {
+    let side = crate::constants::LONG_RANGE_IMAGE_SIZE;
+    // The same limit the device gate is read from, told to egui the way
+    // `egui_winit::State::new` tells it: `Context::load_texture` asserts the
+    // image against `max_texture_side`, and a bare `Context` defaults it to
+    // the 2048 WebGL2 floor. The two are one number in the shipped app —
+    // `AppState::long_range_raster_ok` and this both come off
+    // `device.limits().max_texture_dimension_2d` — so a fixture that let them
+    // disagree would be modelling a state the host cannot reach.
+    let ctx = egui::Context::default();
+    ctx.begin_pass(egui::RawInput {
+        max_texture_side: Some(side),
+        ..Default::default()
+    });
+    let mut app = app_showing_site();
+
+    let render = CachedPaneRender {
+        image: std::sync::Arc::new(egui::ColorImage::from_rgba_unmultiplied(
+            [side, side],
+            &vec![0u8; side * side * 4],
+        )),
+        // The extent that put it there: a 417 km TDWR long-range cut.
+        max_range_km: 417.0,
+        value_data: std::sync::Arc::new(vec![f32::NAN; side * side]),
+        product: PRODUCT,
+        elevation: 0.5,
+    };
+    app.apply_render_to_pane(&ctx, 0, &render);
+
+    let pane = app.gui.pane_mut(0).unwrap();
+    let cache = pane.overlay_cache_mut(rustdar_overlays::render::overlay_state::OverlayKind::Radar);
+    let placed = cache
+        .current
+        .as_ref()
+        .expect("the long-range render must have been placed");
+    assert_eq!(
+        (placed.width, placed.height),
+        (side as u32, side as u32),
+        "the overlay entry describes the texture at a size the render did not \
+         produce",
+    );
+    assert_eq!(
+        placed.radar_meta.as_ref().map(|m| m.max_range_km),
+        Some(417.0),
+        "the ground the texture is placed on is the render's own extent",
+    );
+    // And the pane kept a copy at the same size, so a resume re-uploads the
+    // picture rather than a differently shaped one.
+    assert_eq!(
+        app.render.pane_render[0]
+            .cached_render
+            .as_ref()
+            .map(|c| c.image.size),
+        Some([side, side]),
     );
 }

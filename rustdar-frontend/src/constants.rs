@@ -12,6 +12,146 @@ pub const RENDER_WIDTH: u32 = 1920;
 /// Default height for the application window in pixels
 pub const RENDER_HEIGHT: u32 = 1080;
 
+/// The side, in pixels, a **static** plan-view render is allowed to grow to
+/// when its sweep reaches past [`rustdar_radar::types::BASE_EXTENT_KM`].
+///
+/// # Why the size class lives here and not in the rasterizer
+///
+/// `rustdar_radar` cannot pick it. The `mobile` cfg that names the device class
+/// is emitted by *this* crate's `build.rs`, and cargo scopes a build script's
+/// cfgs to its own crate — `rustdar_radar::voxel`'s module doc records what that
+/// trap looks like when it is walked into: a `#[cfg(mobile)]` over there is an
+/// `unexpected_cfgs` warning attached to dead code that silently takes the
+/// desktop answer on a handheld. `MOBILE_SHAPE` is the precedent for the shape
+/// taken instead — a named constant this crate selects and hands over.
+///
+/// # What each class is, and why
+///
+/// | class   | base (`IMAGE_SIZE`) | long range | adaptive |
+/// |---------|--------------------:|-----------:|----------|
+/// | wasm32  |                2048 |       2048 | no       |
+/// | mobile  |                2048 |       4096 | yes      |
+/// | desktop |                2048 |       4096 | yes      |
+///
+/// 4096 is what keeps the scale still: 4096 over a 458 km surveillance cut is
+/// 4.47 px/km against the floor's 4.45, so a long-range sweep is the same
+/// picture over more of the world rather than a coarser one. A base-size raster
+/// stretched over 458 km would be 2.24 px/km — below the two-pixels-per-gate
+/// line a 250 m gate needs to land in a pixel of its own.
+///
+/// **The web arm is not adaptive, and cannot be.** 2048 is the largest 2D
+/// texture WebGL2 guarantees ([`rustdar_radar::types::WEBGL2_MAX_TEXTURE_DIMENSION_2D`]),
+/// wgpu's WebGPU backend is not used here, and a browser that refused a 4096
+/// texture would leave a blank pane rather than a coarse one. So the web ceiling
+/// *is* the base size, which makes [`rustdar_radar::types::raster_side_px`] inert
+/// there — the long-range branch exists but can never choose anything else.
+///
+/// Native's ceiling is checked against the device rather than assumed: see
+/// `AppState::long_range_raster_ok`. Vulkan guarantees 4096 and iOS Metal 8192,
+/// but the GLES 3.0 floor is 2048, so an Android handheld is the one class where
+/// the gate can fail — and it degrades to the base size, which is a correct
+/// picture, not a failed texture.
+///
+/// # What it costs, measured
+///
+/// A 7950X (32 threads), release, medians of 11 rasterizations of a real KDMX
+/// 0.5° cut on the existing render pool — nothing here is on the frame thread:
+///
+/// | sweep                     | side | render  | RGBA   |
+/// |---------------------------|-----:|--------:|-------:|
+/// | reflectivity, 460 km      | 2048 | 27.7 ms | 16 MiB |
+/// | reflectivity, 460 km      | 4096 | 82.4 ms | 64 MiB |
+/// | velocity, 300 km          | 2048 | 26.6 ms | 16 MiB |
+/// | velocity, 300 km          | 4096 | 81.9 ms | 64 MiB |
+///
+/// Three times the wall clock for four times the pixels — the gate loop's
+/// per-sample Mercator is the cost and it parallelises, so the fourth quarter
+/// comes nearly free. Mobile has three render slots against desktop's six and
+/// no comparable pool, and is **not measured here**: no handheld was available,
+/// and a figure scaled off this machine would be a guess wearing a number.
+/// The frame thread is untouched either way; the conversion that used to land
+/// on it moved with this change (`channels::RenderedImage::image`).
+///
+/// The three arms are named outside the cascade for the reason
+/// [`WASM_VOLUME_GRID_CELLS`] gives.
+pub const WASM_LONG_RANGE_IMAGE_SIZE: usize = rustdar_radar::types::WEBGL2_MAX_TEXTURE_DIMENSION_2D;
+/// The mobile arm. See [`LONG_RANGE_IMAGE_SIZE`].
+pub const MOBILE_LONG_RANGE_IMAGE_SIZE: usize = 4096;
+/// The desktop arm. See [`LONG_RANGE_IMAGE_SIZE`].
+pub const DESKTOP_LONG_RANGE_IMAGE_SIZE: usize = 4096;
+
+/// See [`WASM_LONG_RANGE_IMAGE_SIZE`].
+#[cfg(target_arch = "wasm32")]
+pub const LONG_RANGE_IMAGE_SIZE: usize = WASM_LONG_RANGE_IMAGE_SIZE;
+/// See [`WASM_LONG_RANGE_IMAGE_SIZE`].
+#[cfg(all(not(target_arch = "wasm32"), mobile))]
+pub const LONG_RANGE_IMAGE_SIZE: usize = MOBILE_LONG_RANGE_IMAGE_SIZE;
+/// See [`WASM_LONG_RANGE_IMAGE_SIZE`].
+#[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
+pub const LONG_RANGE_IMAGE_SIZE: usize = DESKTOP_LONG_RANGE_IMAGE_SIZE;
+
+/// The side a **loop frame** is rendered at — the whole side, not a ceiling on
+/// a long-range one: a loop of a 458 km surveillance cut draws every frame at
+/// this size, at whatever km/pixel that buys.
+///
+/// Natively it is the base size, so nothing about a native loop moves: a loop
+/// already renders leaner than a still frame (no value grid, so no hover), and
+/// this is the same idiom applied to the one dimension that had not been
+/// asked to give.
+///
+/// **The web arm is a third of the way down, at 1024, and that is the constant
+/// this whole cascade exists for.** A browser's per-pane loop budget is 48 MiB
+/// ([`WASM_LOOP_TEXTURE_BUDGET_BYTES`]) and it textures eight frames at once;
+/// 2048² frames are 16 MiB apiece, so following the static size would need a
+/// 128 MiB loop budget — and [`VOLUME_LOOP_TEXTURE_BUDGET_BYTES`] is an alias
+/// of that one, so the 3D term rises with it: 6 × 128 + 128 + 30 puts
+/// [`APP_TEXTURE_BUDGET_BYTES`] at ~926 MiB against a 384 MiB ceiling.
+/// `the_whole_application_fits_its_gpu_ceiling` is the line that says so and
+/// `the_app_ceiling_is_not_slack_enough_to_hide_a_doubling` is why the ceiling
+/// cannot simply be raised to admit it. So web loops stay exactly the size and
+/// exactly the cost they are today, and only *static* web renders take the
+/// quality bump.
+///
+/// The trade, stated: entering a loop on a long-range pane drops it to this
+/// size for the duration, and back to the full one when the loop stops.
+pub const WASM_LOOP_IMAGE_SIZE: usize = 1024;
+/// The mobile arm. See [`LOOP_IMAGE_SIZE`].
+pub const MOBILE_LOOP_IMAGE_SIZE: usize = rustdar_radar::types::NATIVE_IMAGE_SIZE;
+/// The desktop arm. See [`LOOP_IMAGE_SIZE`].
+pub const DESKTOP_LOOP_IMAGE_SIZE: usize = rustdar_radar::types::NATIVE_IMAGE_SIZE;
+
+/// See [`WASM_LOOP_IMAGE_SIZE`].
+#[cfg(target_arch = "wasm32")]
+pub const LOOP_IMAGE_SIZE: usize = WASM_LOOP_IMAGE_SIZE;
+/// See [`WASM_LOOP_IMAGE_SIZE`].
+#[cfg(all(not(target_arch = "wasm32"), mobile))]
+pub const LOOP_IMAGE_SIZE: usize = MOBILE_LOOP_IMAGE_SIZE;
+/// See [`WASM_LOOP_IMAGE_SIZE`].
+#[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
+pub const LOOP_IMAGE_SIZE: usize = DESKTOP_LOOP_IMAGE_SIZE;
+
+/// The side a raster of `rgba_len` bytes must have been rendered at, or `None`
+/// if no render this build can produce has that length.
+///
+/// Every consumer of a finished raster derives the side this way rather than
+/// naming a constant, because the side is no longer one number: a static render
+/// is [`rustdar_radar::types::IMAGE_SIZE`] or [`LONG_RANGE_IMAGE_SIZE`]
+/// depending on the sweep, and a loop frame is [`LOOP_IMAGE_SIZE`]. Deriving it
+/// keeps `offload`'s rule that a job's output carries no dimensions — the bytes
+/// are the statement — while the closed set is what keeps that from becoming
+/// "believe whatever arrived": a buffer of any other length is refused, and a
+/// refusal is a logged blank pane rather than the `ColorImage`
+/// assertion that would abort a browser tab.
+pub fn raster_side_from_rgba_len(rgba_len: usize) -> Option<usize> {
+    [
+        LOOP_IMAGE_SIZE,
+        rustdar_radar::types::IMAGE_SIZE,
+        LONG_RANGE_IMAGE_SIZE,
+    ]
+    .into_iter()
+    .find(|side| side * side * 4 == rgba_len)
+}
+
 /// Maximum number of concurrent background radar renders (loop + static).
 /// Handhelds have much less RAM, so we cap aggressively to avoid OOM.
 ///
@@ -162,6 +302,11 @@ pub const MAX_LOOP_SECTION_CUTS_PER_FRAME: usize = 1;
 /// one loop's share of a floor-sized pool *is* the old per-pane budget. What
 /// changes is that six of them no longer cost six times it.
 ///
+/// A plan-view frame is a [`LOOP_IMAGE_SIZE`]² RGBA raster — not the size a
+/// static pane render takes, because a loop's frames are held by the dozen and
+/// a still frame is held once. On the web that difference is the whole reason
+/// this budget still fits; natively the two are the same 2048.
+///
 /// | target  | textured | frame size | one loop | floor   |
 /// |---------|---------:|-----------:|---------:|--------:|
 /// | desktop |       30 |     16 MiB |  480 MiB | 512 MiB |
@@ -174,12 +319,12 @@ pub const MAX_LOOP_SECTION_CUTS_PER_FRAME: usize = 1;
 /// the frames a loop *holds* and the frames that are *textured* are different
 /// numbers. Budgeting on `MAX_LOOP_FRAMES` alone overstates desktop by 2x.
 ///
-/// A cross-section frame is `SECTION_WIDTH × SECTION_HEIGHT`, and
-/// `rustdar_radar::xsect` defines those as `IMAGE_SIZE` by `IMAGE_SIZE / 2` — so
-/// it is **exactly half** a plan-view frame on every target, by construction
-/// rather than by coincidence, and a section loop can never be the binding case.
-/// It no longer needs a table of its own to say so: the pool is *bytes*, and an
-/// equal share simply buys a section loop twice the history.
+/// A cross-section frame is `SECTION_WIDTH × SECTION_HEIGHT`, which
+/// `rustdar_radar::xsect` pins per target at 1024 × 512 on the web and
+/// 2048 × 1024 native — **exactly half** a plan-view loop frame on every
+/// target, so a section loop can never be the binding case. It no longer needs
+/// a table of its own to say so: the pool is *bytes*, and an equal share simply
+/// buys a section loop twice the history.
 ///
 /// Section frames carry no value or status plane — those are ~10 MB apiece and
 /// serve only the hover readout, which goes quiet under a loop for the same
@@ -761,15 +906,36 @@ pub const TILE_BYTES_BUDGET_PER_SOURCE_BYTES: usize =
 ///
 /// The cache exists so panes showing the same site/product/elevation share one
 /// render; it is not a history. Each entry holds an RGBA image and a matching
-/// `f32` value grid — `IMAGE_SIZE² × 8` bytes, 32 MiB at 2048² — and until this
-/// bound existed the only thing that ever removed one was `reset_panes*`, so a
-/// user cycling products accumulated them without limit.
+/// `f32` value grid, so an entry is `side² × 8` bytes — and `side` is no longer
+/// one number:
 ///
-/// Sized to comfortably exceed the pane count (`MAX_PANES_DESKTOP` is 6,
-/// `MAX_PANES_MOBILE` is 4) so the panes on screen can never evict each other,
-/// with a little headroom for switching back and forth.
+/// | render                        | side | entry   |
+/// |-------------------------------|-----:|--------:|
+/// | anything inside the 230 km floor | 2048 |  32 MiB |
+/// | a long-range sweep, gate passed  | 4096 | 128 MiB |
+///
+/// Until this bound existed the only thing that ever removed an entry was
+/// `reset_panes*`, so a user cycling products accumulated them without limit.
+///
+/// # The cap is a count, and the worst case is stated rather than bounded
+///
+/// A byte cap would be the obvious answer to a 4× entry and is the wrong one:
+/// it would break the guarantee this number is chosen for, which is that the
+/// panes on screen can never evict *each other*. Four long-range panes under a
+/// byte cap sized for the common case would thrash, re-rendering a 4096 raster
+/// per pane per frame. So the ceiling is stated instead: 8 × 128 MiB = 1 GiB of
+/// host memory on desktop, 4 × 128 MiB = 512 MiB on mobile, both only reachable
+/// with every cached entry a long-range sweep — which needs a whole cache of
+/// surveillance cuts or TDWR long-range reflectivity and no Doppler, derived or
+/// Level III product among them.
+///
+/// **Mobile is 4, exactly `MAX_PANES_MOBILE`**, down from 6. That is the
+/// smallest number that still keeps the never-evict-each-other guarantee, and
+/// what it gives back is the 256 MiB of headroom that 6 entries would have
+/// spent on switching back and forth — on the class with the least host memory
+/// and, at 4096, the largest entries. Desktop keeps 8 against 6 panes.
 #[cfg(mobile)]
-pub const MAX_RENDER_CACHE_ENTRIES: usize = 6;
+pub const MAX_RENDER_CACHE_ENTRIES: usize = 4;
 #[cfg(not(mobile))]
 pub const MAX_RENDER_CACHE_ENTRIES: usize = 8;
 
@@ -1160,11 +1326,22 @@ const _: () = const {
     // Eviction is what bounds the textured-frame count, so it must bind first.
     assert!(MAX_LOOP_RENDER_BUDGET <= MAX_LOOP_FRAMES);
     // Not every render path is square any more — `xsect`'s section raster is
-    // `IMAGE_SIZE` × `IMAGE_SIZE / 2`. What every path does share is the side
+    // `SECTION_WIDTH` × half of it. What every path does share is the side
     // itself: the plan-view projection assumes it is a power of two, and that is
     // also what makes the section's halved height exact and a power of two in
-    // its own right rather than a truncating divide.
+    // its own right rather than a truncating divide. All three plan-view sides
+    // are checked, because `raster_side_from_rgba_len` will hand any of them to
+    // the same projection arithmetic.
     assert!(rustdar_radar::types::IMAGE_SIZE.is_power_of_two());
+    assert!(LONG_RANGE_IMAGE_SIZE.is_power_of_two());
+    assert!(LOOP_IMAGE_SIZE.is_power_of_two());
+    // A ceiling under the base size is a deliberate choice (the web's loop
+    // frames); one *over* the largest texture the class can hold is not a
+    // choice at all, and on the web it would be every render failing to
+    // upload. `the_web_image_fits_the_texture_size_webgl2_guarantees` states
+    // the browser half against wgpu's own limits.
+    assert!(LONG_RANGE_IMAGE_SIZE >= rustdar_radar::types::IMAGE_SIZE);
+    assert!(LOOP_IMAGE_SIZE <= rustdar_radar::types::IMAGE_SIZE);
 
     assert!(VOLUME_TEXTURE_BUDGET_BYTES > 0);
     // A zero axis is a texture wgpu refuses outright, and every axis has to fit

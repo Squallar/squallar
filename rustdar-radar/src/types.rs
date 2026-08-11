@@ -18,7 +18,17 @@ use std::f64::consts::PI;
 /// `cargo check --target wasm32-unknown-unknown` exiting 0 — while 4096 is twice
 /// the largest 2D texture WebGL2 guarantees, so every browser render would have
 /// failed. Both arms now have names, so both arms can be asserted.
-pub const WASM_IMAGE_SIZE: usize = 1024;
+///
+/// It is [`WEBGL2_MAX_TEXTURE_DIMENSION_2D`] itself, which is the most a browser
+/// can be asked for. It used to be half that, on the reasoning that a 2048²
+/// frame "sits exactly on the limit with nothing spare for the overlay textures
+/// beside it" — and that reasoning was wrong about what the limit is.
+/// `max_texture_dimension_2d` bounds each texture's each axis, not the sum of a
+/// frame's textures, and the overlays are sized from the viewport and clamped
+/// against the same limit independently (`rustdar_egui::overlay_cache::
+/// plan_overlay_texture`, handed the adapter's real figure). Nothing was ever
+/// competing for the 2048.
+pub const WASM_IMAGE_SIZE: usize = 2048;
 
 /// The native side length. See [`WASM_IMAGE_SIZE`].
 pub const NATIVE_IMAGE_SIZE: usize = 2048;
@@ -34,14 +44,21 @@ pub const NATIVE_IMAGE_SIZE: usize = 2048;
 /// have wgpu, so the number cannot drift away from wgpu's own.
 pub const WEBGL2_MAX_TEXTURE_DIMENSION_2D: usize = 2048;
 
-/// Side length, in pixels, of the square radar image every render produces.
+/// Side length, in pixels, of the square radar image a render produces **at the
+/// [`BASE_EXTENT_KM`] floor** — which is nearly every render this display makes.
 /// An RGBA texture is `IMAGE_SIZE² × 4` bytes; a static pane render keeps an
 /// `f32` value grid alongside it, doubling that.
 ///
-/// wasm32 halves the side: WebGL2 only guarantees
-/// `max_texture_dimension_2d == 2048` ([`WEBGL2_MAX_TEXTURE_DIMENSION_2D`]), so
-/// a 2048² frame sits exactly on the limit with nothing spare for the overlay
-/// textures beside it.
+/// Both arms are 2048 today, which is a coincidence of the two ceilings rather
+/// than a simplification waiting to happen: native's is what a 230 km frame
+/// costs at 4.45 px/km, and the browser's is the largest texture WebGL2
+/// guarantees ([`WEBGL2_MAX_TEXTURE_DIMENSION_2D`]). The two move for different
+/// reasons, so they keep separate names.
+///
+/// It is no longer the only side a render can have. A sweep reaching past the
+/// floor is projected onto more ground, and [`raster_side_px`] is what decides
+/// how many pixels that ground gets — up to a ceiling the *caller* owns, because
+/// how large a texture this machine can take is not a fact this crate has.
 ///
 /// The two arms select between [`WASM_IMAGE_SIZE`] and [`NATIVE_IMAGE_SIZE`]
 /// rather than repeating their literals, so the *selection* is the only thing
@@ -94,6 +111,51 @@ pub fn plan_view_extent_km(data_reach_km: f64) -> f64 {
         return BASE_EXTENT_KM;
     }
     data_reach_km.clamp(BASE_EXTENT_KM, MAX_EXTENT_KM)
+}
+
+/// How many pixels across to paint a plan view of `extent_km`, given the
+/// largest side this caller can accept.
+///
+/// [`plan_view_extent_km`] decides how much *ground* a raster covers;
+/// this decides how finely that ground is sampled. Splitting the two is what
+/// keeps the display's scale from moving: at the floor the answer is
+/// [`IMAGE_SIZE`], so a 230 km sweep is the same 4.45 px/km it has always been,
+/// and past the floor the extra ground buys extra pixels rather than coarser
+/// ones — 4096 across a 458 km surveillance cut is 4.47 px/km, the same picture
+/// over more of the world.
+///
+/// # Why the ceiling is an argument
+///
+/// The largest texture this machine will accept is not a fact this crate has.
+/// It is a `wgpu` device limit, read by `rustdar-frontend`, and it is a
+/// *runtime* answer: Vulkan guarantees 4096, iOS Metal offers 8192, and the
+/// GLES 3.0 floor is 2048, so an Android handheld can be the one device that
+/// cannot take the long-range raster. The build-script `cfg` that names the
+/// device class does not cross a crate boundary either (see
+/// [`crate::voxel`]'s module doc for that trap), so there is no honest way to
+/// decide this here. The caller passes what it can take, and gets back what it
+/// gets.
+///
+/// # Why it bounds the floor too, and not only the long range
+///
+/// A ceiling *under* [`IMAGE_SIZE`] is a real request, not a mistake to clamp
+/// away: the browser renders its loop frames at 1024 on purpose — the eight it
+/// textures at once would be 128 MiB at 2048², against a 48 MiB per-pane loop
+/// budget — while its static renders take the full 2048. So `min` rather than
+/// "base unless the extent is long": a caller that says 1024 means 1024, and a
+/// caller that says 4096 gets the floor's own size until there is ground to
+/// spend it on.
+///
+/// Passing exactly [`IMAGE_SIZE`] therefore turns adaptivity off, which is the
+/// device gate's whole mechanism: a machine that cannot take the long-range
+/// raster asks for the base one and gets a correct, merely coarser picture,
+/// rather than a texture creation that fails and leaves a blank pane.
+pub fn raster_side_px(extent_km: f64, side_ceiling_px: usize) -> usize {
+    if extent_km > BASE_EXTENT_KM {
+        side_ceiling_px
+    } else {
+        IMAGE_SIZE.min(side_ceiling_px)
+    }
 }
 
 /// Mean radius of Earth in kilometers — the IUGG mean radius, and the one

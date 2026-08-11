@@ -131,7 +131,7 @@ fn app_showing_a_drawn_volume(product: RadarProduct) -> App {
         rustdar_radar::types::RenderView::PlanView,
         0.5,
         CachedRenderOutput {
-            image_data: Arc::new(Vec::new()),
+            image: Arc::new(egui::ColorImage::default()),
             max_range_km: 100.0,
             value_data: Arc::new(Vec::new()),
         },

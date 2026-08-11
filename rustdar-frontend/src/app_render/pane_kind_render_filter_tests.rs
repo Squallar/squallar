@@ -70,16 +70,27 @@ fn section_line() -> rustdar_egui::pane::SectionLine {
     .expect("two distinct points on Earth")
 }
 
-/// Finished pixels, full size: `ColorImage::from_rgba_unmultiplied` checks
-/// the buffer against the dimensions it is handed, in a bare `assert_eq!`
-/// that is live in release and on the main thread.
-fn finished_pixels() -> Arc<Vec<u8>> {
-    Arc::new(vec![0u8; IMAGE_SIZE * IMAGE_SIZE * 4])
+/// Finished pixels at the base size, already converted — which is the shape
+/// `poll_render_results` now receives, the unmultiply having happened on the
+/// render thread.
+fn finished_pixels() -> Arc<egui::ColorImage> {
+    let side = rustdar_radar::types::IMAGE_SIZE;
+    Arc::new(egui::ColorImage::from_rgba_unmultiplied(
+        [side, side],
+        &vec![0u8; side * side * 4],
+    ))
+}
+
+/// A loop frame's pixels, which are the *loop* size and not the static one —
+/// see `constants::LOOP_IMAGE_SIZE`.
+fn loop_frame_pixels() -> egui::ColorImage {
+    let side = crate::constants::LOOP_IMAGE_SIZE;
+    egui::ColorImage::from_rgba_unmultiplied([side, side], &vec![0u8; side * side * 4])
 }
 
 fn cached_output() -> crate::render_dispatch::CachedRenderOutput {
     crate::render_dispatch::CachedRenderOutput {
-        image_data: finished_pixels(),
+        image: finished_pixels(),
         max_range_km: 230.0,
         value_data: Arc::new(Vec::new()),
     }
@@ -112,7 +123,7 @@ fn deliver(app: &mut crate::app::App, pane_idx: usize) {
         .render_sender
         .send(crate::channels::RenderResponse {
             rendered: Some(crate::channels::RenderedImage {
-                image_data: finished_pixels(),
+                image: finished_pixels(),
                 max_range_km: 230.0,
                 value_data: Arc::new(Vec::new()),
             }),
@@ -609,10 +620,7 @@ fn the_loop_frame_broadcast_skips_a_pane_with_no_plan_view() {
                 snapped: TILT,
                 site_lat: 35.33,
                 site_lon: -97.27,
-                image: Some(egui::ColorImage::from_rgba_unmultiplied(
-                    [IMAGE_SIZE, IMAGE_SIZE],
-                    &finished_pixels(),
-                )),
+                image: Some(loop_frame_pixels()),
                 max_range_km: 230.0,
             })
             .expect("the receiver lives on the App");

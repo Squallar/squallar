@@ -1,13 +1,23 @@
 //! A render never inherits a pixel from the render before it.
 //!
-//! `RenderBuffers` carries its 32 MiB cell buffer from one render to the next
-//! — see `POOLED_CELLS` for why — and the whole safety of that rests on one
-//! invariant: what comes back out of the pool is `EMPTY` everywhere, so a
-//! render handed a used buffer cannot tell it from a fresh allocation. Break
-//! the invariant and the failure is not a crash or a wrong length, it is a
-//! *smaller* render showing the larger one's echoes in the ring it does not
-//! itself paint — which is exactly the shape of bug that survives a test
-//! asserting only that the output has the right size.
+//! `RenderBuffers` carries its cell buffer from one render to the next — see
+//! `POOLED_CELLS` for why — and the whole safety of that rests on two
+//! invariants: what comes back out of the pool is `EMPTY` everywhere, and it is
+//! as long as the raster asking for it, so a render handed a used buffer cannot
+//! tell it from a fresh allocation.
+//!
+//! Break the content half and the failure is not a crash, it is a *smaller*
+//! render showing the larger one's echoes in the ring it does not itself
+//! paint — which is exactly the shape of bug that survives a test asserting
+//! only that the output has the right size.
+//!
+//! The length half became a live question when a raster's side stopped being
+//! one constant: `raster_side_px` answers 2048 at the floor, a device's
+//! ceiling past it, and 1024 for a browser loop frame, so the buffer in the
+//! slot is routinely the wrong length for the render that takes it. `checkout`
+//! resizes it to fit, which makes both directions failable — a buffer
+//! truncated to a smaller raster, and one grown back for a larger one, where
+//! everything past the old length is a cell the pool has just put there.
 //!
 //! # Why this is an integration test
 //!
@@ -40,7 +50,7 @@
 
 use nexrad_level3::model::{RadialPacket, RadialRun};
 use rustdar_radar::render::render_level3_radial_to_image;
-use rustdar_radar::types::RadarProduct;
+use rustdar_radar::types::{IMAGE_SIZE, RadarProduct};
 
 const LAT: f64 = 35.3333;
 const LON: f64 = -97.2778;
@@ -92,15 +102,27 @@ fn packet(bins: usize, paint: bool) -> RadialPacket {
     }
 }
 
+/// A side the pool has to serve that is not the base one. 1024 is what a
+/// browser renders its loop frames at, so this is a production size rather than
+/// an invented one, and being *under* [`IMAGE_SIZE`] it is what `raster_side_px`
+/// answers whatever ground the sweep covers.
+const SMALL_SIDE: usize = 1024;
+
 /// The RGBA texture and the value grid as raw bits, which is what
 /// "byte-identical" has to mean here: the grid is `NaN` wherever nothing was
 /// painted, and `NaN != NaN` would make a plain comparison of two correct
 /// results fail.
-fn render(p: &RadialPacket) -> (Vec<u8>, Vec<u32>) {
+fn render_at(p: &RadialPacket, side_ceiling_px: usize) -> (Vec<u8>, Vec<u32>) {
     let (image, _, values) =
-        render_level3_radial_to_image(p, PRODUCT, LAT, LON, SCALE, OFFSET, None)
+        render_level3_radial_to_image(p, PRODUCT, LAT, LON, SCALE, OFFSET, None, side_ceiling_px)
             .expect("the packet renders");
     (image, values.iter().map(|v| v.to_bits()).collect())
+}
+
+/// [`render_at`] at the base raster side, which is what every assertion of
+/// byte-identity in this file is stated at.
+fn render(p: &RadialPacket) -> (Vec<u8>, Vec<u32>) {
+    render_at(p, IMAGE_SIZE)
 }
 
 /// How many pixels the render claimed.
@@ -168,6 +190,59 @@ fn a_render_never_inherits_a_pixel_from_the_one_before_it() {
     assert_eq!(
         again_values, narrow_values,
         "the narrow render's value grid changed when it followed a wider one"
+    );
+
+    // Now the shape half, which only became failable when a raster's side
+    // stopped being one constant. This render needs a quarter of the cells the
+    // wide one just gave back, so the pool has to fit the buffer to the render
+    // rather than hand over the length it happens to be holding.
+    let (small_image, small_values) = render_at(&wide, SMALL_SIDE);
+    assert_eq!(
+        small_values.len(),
+        SMALL_SIDE * SMALL_SIDE,
+        "a render at a smaller side got a value grid of the pooled buffer's length, not its own"
+    );
+    assert_eq!(
+        small_image.len(),
+        small_values.len() * 4,
+        "the texture and the value grid disagree about how many pixels were rendered"
+    );
+    assert!(
+        painted(&small_values) > 10_000,
+        "the smaller raster has to paint for the two assertions below to say anything: {} pixels",
+        painted(&small_values)
+    );
+
+    // Truncating a buffer keeps whatever the cut-off cells held, so a render at
+    // the smaller side has to be as clean as one at the base side is.
+    let (small_blank_image, small_blank_values) = render_at(&blank, SMALL_SIDE);
+    assert_eq!(
+        painted(&small_blank_values),
+        0,
+        "a render that paints no gate must leave every value NaN, at any raster side"
+    );
+    assert!(
+        small_blank_image.iter().all(|&b| b == 0),
+        "a render that paints no gate must leave every texel zero, at any raster side"
+    );
+
+    // And back up. The pool now holds SMALL_SIDE² cells against the IMAGE_SIZE²
+    // this asks for, so everything past the first quarter is a cell the pool
+    // has just grown into place — and the narrow disc, centred in a raster four
+    // times the area, lies entirely inside that grown tail.
+    let (grown_image, grown_values) = render(&narrow);
+    assert_eq!(
+        painted(&grown_values),
+        narrow_pixels,
+        "the narrow render claimed a different number of pixels when it followed a smaller raster"
+    );
+    assert_eq!(
+        grown_image, narrow_image,
+        "the narrow render's texture changed when the pooled buffer had to grow for it"
+    );
+    assert_eq!(
+        grown_values, narrow_values,
+        "the narrow render's value grid changed when the pooled buffer had to grow for it"
     );
 
     // And the limit case: a render that claims nothing must produce nothing,

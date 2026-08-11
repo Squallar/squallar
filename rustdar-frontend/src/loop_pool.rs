@@ -172,8 +172,9 @@
 //! every start.
 
 use crate::constants::{
-    LOOP_POOL_CEILING_BYTES, LOOP_POOL_DWELL_FRAMES, LOOP_POOL_FLOOR_BYTES, LOOP_POOL_HYSTERESIS,
-    MAX_LOOP_RENDER_BUDGET, MIN_LOOP_FRAMES_PER_PANE, VOLUME_GRID_CELLS, VOLUME_LUT_BYTES,
+    LOOP_IMAGE_SIZE, LOOP_POOL_CEILING_BYTES, LOOP_POOL_DWELL_FRAMES, LOOP_POOL_FLOOR_BYTES,
+    LOOP_POOL_HYSTERESIS, MAX_LOOP_RENDER_BUDGET, MIN_LOOP_FRAMES_PER_PANE, VOLUME_GRID_CELLS,
+    VOLUME_LUT_BYTES,
 };
 use crate::volume::quality::DeviceClass;
 use rustdar_egui::config_store::ConfigStore;
@@ -229,11 +230,20 @@ impl LoopPoolLimits {
 /// tables has to be reachable from that one host build.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LoopFrameModel {
-    /// An `IMAGE_SIZE²` RGBA raster.
+    /// A [`LOOP_IMAGE_SIZE`]² RGBA raster.
+    ///
+    /// **Not `IMAGE_SIZE`**, and the difference is not cosmetic: a loop frame
+    /// is rendered `full_res: false`, which on the web is 1024 against a static
+    /// render's 2048. Modelling a browser's loop frame at the static size would
+    /// overstate it fourfold — 16 MiB against the real 4 MiB — and the
+    /// division would hand every browser loop the
+    /// [`MIN_LOOP_FRAMES_PER_PANE`] floor and then blow through the pool
+    /// anyway, which is what `the_pool_actually_bounds_the_sum` sees.
     pub plan_view: usize,
     /// `SECTION_WIDTH × SECTION_HEIGHT` RGBA — exactly half the above, by
-    /// construction rather than coincidence. See
-    /// `a_section_loop_frame_is_half_a_plan_view_one`.
+    /// construction rather than coincidence: `xsect` pins the section width per
+    /// target at the same figure [`LOOP_IMAGE_SIZE`] takes, and the height is
+    /// half of it. See `an_equal_share_buys_a_section_loop_more_history`.
     pub section: usize,
     /// One resident voxel grid with its mips and its colour table.
     pub grid: usize,
@@ -246,7 +256,7 @@ pub struct LoopFrameModel {
 impl LoopFrameModel {
     /// The compiled target's figures.
     pub fn for_target() -> Self {
-        let side = rustdar_radar::types::IMAGE_SIZE;
+        let side = LOOP_IMAGE_SIZE;
         Self {
             plan_view: side * side * 4,
             section: rustdar_radar::xsect::SECTION_WIDTH * rustdar_radar::xsect::SECTION_HEIGHT * 4,

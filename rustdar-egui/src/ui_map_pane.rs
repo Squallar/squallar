@@ -1832,7 +1832,7 @@ fn draw_long_press_tooltip(
     pane: &PaneState,
     prefs: &UserPreferences,
 ) {
-    use rustdar_radar::types::{IMAGE_SIZE, ImageBounds};
+    use rustdar_radar::types::ImageBounds;
 
     let bounds = ImageBounds::from_radar_site(lat, lon, extent_km);
 
@@ -1844,19 +1844,22 @@ fn draw_long_press_tooltip(
         .to_pos2();
     let image_rect = egui::Rect::from_two_pos(nw, se);
 
-    // Compute pixel coordinates inside the radar image
-    let frac_x = (touch_pos.x - image_rect.left()) / image_rect.width();
-    let frac_y = (touch_pos.y - image_rect.top()) / image_rect.height();
-    let px = (frac_x * IMAGE_SIZE as f32) as i32;
-    let py = (frac_y * IMAGE_SIZE as f32) as i32;
-
+    // Compute pixel coordinates inside the radar image, on the grid's own
+    // side — see `ui_map::value_grid_side` for why it is read off the length.
     let mut text = String::new();
-    if px >= 0 && px < IMAGE_SIZE as i32 && py >= 0 && py < IMAGE_SIZE as i32 {
-        let pixel_idx = py as usize * IMAGE_SIZE + px as usize;
-        if pixel_idx < value_data.len() {
-            let value = value_data[pixel_idx];
-            if !value.is_nan() {
-                text = pane.selected_product.format_value(value, prefs);
+    if let Some(side) = super::value_grid_side(value_data.len()) {
+        let frac_x = (touch_pos.x - image_rect.left()) / image_rect.width();
+        let frac_y = (touch_pos.y - image_rect.top()) / image_rect.height();
+        let px = (frac_x * side as f32) as i32;
+        let py = (frac_y * side as f32) as i32;
+
+        if px >= 0 && px < side as i32 && py >= 0 && py < side as i32 {
+            let pixel_idx = py as usize * side + px as usize;
+            if pixel_idx < value_data.len() {
+                let value = value_data[pixel_idx];
+                if !value.is_nan() {
+                    text = pane.selected_product.format_value(value, prefs);
+                }
             }
         }
     }

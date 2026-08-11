@@ -3687,7 +3687,7 @@ impl Gui {
     ///
     /// The sibling of [`Self::pane_has_no_plan_view`], and the distinction
     /// between them is the whole reason both exist. That one asks "does this
-    /// pane draw an `IMAGE_SIZE` square raster of one tilt?" and gates the
+    /// pane draw a square raster of one tilt?" and gates the
     /// plan-view dispatch, the static sibling broadcast and the suspend/resume
     /// restore. This one asks "can a sequence of this pane's pictures be
     /// animated?" and gates the loop dispatch, the loop-frame broadcast, the

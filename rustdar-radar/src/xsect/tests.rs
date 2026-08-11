@@ -1,4 +1,5 @@
 use super::*;
+use crate::types;
 use nexrad_model::data::{
     ChannelConfiguration, ElevationCut, MomentData, PulseWidth, Radial, RadialStatus, Scan, Sweep,
     VolumeCoveragePattern, WaveformType,
@@ -480,17 +481,22 @@ fn no_value_in_a_section_sits_above_the_top_rung() {
 
 // ── The raster's shape and its two axis mappings ────────────────────────
 
-/// The raster is `IMAGE_SIZE` by half of it, and that is what buys the
-/// WebGL2 argument for free.
+/// The raster is twice as wide as it is tall and fits the WebGL2 floor on
+/// both targets.
 ///
 /// Pinned because the two constants are the load-bearing half of "the UI
 /// does not clamp against `max_texture_side`": if either stopped being a
 /// power of two at or under 2048, a section would start failing to upload
 /// on a device that reports the GLES 3.0 floor, and nothing in this crate
 /// would notice.
+///
+/// The width no longer follows `IMAGE_SIZE`, and the arms are checked from
+/// one host build for the reason that constant's own test gives — the arm a
+/// build does not compile is the one nothing else catches.
 #[test]
 fn the_raster_is_a_half_height_image_size_and_fits_the_webgl2_floor() {
-    assert_eq!(SECTION_WIDTH, types::IMAGE_SIZE);
+    assert_eq!(WASM_SECTION_WIDTH, 1024);
+    assert_eq!(NATIVE_SECTION_WIDTH, 2048);
     assert_eq!(SECTION_HEIGHT * 2, SECTION_WIDTH);
     for (name, n) in [("width", SECTION_WIDTH), ("height", SECTION_HEIGHT)] {
         assert!(
@@ -500,8 +506,8 @@ fn the_raster_is_a_half_height_image_size_and_fits_the_webgl2_floor() {
         assert!(n <= 2048, "the section {name} {n} exceeds the WebGL2 floor");
         assert!(n > 0);
     }
-    // And the target split is the one `IMAGE_SIZE` already made, not a
-    // second one: 2048 x 1024 native, 1024 x 512 on wasm.
+    // And this target selected the arm named for it: 2048 x 1024 native,
+    // 1024 x 512 on wasm.
     #[cfg(target_arch = "wasm32")]
     assert_eq!((SECTION_WIDTH, SECTION_HEIGHT), (1024, 512));
     #[cfg(not(target_arch = "wasm32"))]
@@ -988,7 +994,9 @@ fn dropping_the_cos_e_correction_would_move_the_wall_further_than_the_tolerance(
 /// 2048-wide plan view, always in the same direction. `ImageBounds` reads
 /// [`crate::types::KM_PER_DEGREE_LAT`] now, which is the *expression*
 /// `EARTH_RADIUS_KM · π/180`, so the ring's latitude offset converts back to
-/// exactly the extent it was drawn at.
+/// exactly the extent it was drawn at. The pixel figure below is computed from
+/// [`crate::types::IMAGE_SIZE`] rather than quoted, so it keeps meaning if
+/// either arm of that constant moves.
 ///
 /// Measured at [`crate::types::BASE_EXTENT_KM`], and that is enough for every
 /// extent. The closure is a *ratio* of the two spheres, now 1, so it holds at
@@ -1018,10 +1026,11 @@ fn the_ground_track_and_the_range_ring_are_the_same_sphere() {
     );
 
     // In pixels of the plan view the ring is drawn on: under a millionth of
-    // one, on either target, so the figure is stated rather than branched on.
-    // The scale is computed rather than read off a constant because there is
-    // no longer a constant to read — a render's pixels-per-km is its own
-    // `IMAGE_SIZE / (2 · extent)`, and this is that at the floor.
+    // one, at the floor's own 2048 on either target, so the figure is stated
+    // rather than branched on. The scale is computed rather than read off a
+    // constant because there is no longer a constant to read — a render's
+    // pixels-per-km is its own `IMAGE_SIZE / (2 · extent)`, and this is that
+    // at the floor.
     let px_per_km = types::IMAGE_SIZE as f64 / (2.0 * types::BASE_EXTENT_KM);
     let px = gap_mm / 1e6 * px_per_km;
     assert!(

@@ -1,11 +1,11 @@
 use crate::channels::{Level3Response, OverlayRenderResponse, ScanData, ScanResponse};
-use crate::constants::MAX_CONCURRENT_RENDERS;
+use crate::constants::{LOOP_IMAGE_SIZE, MAX_CONCURRENT_RENDERS};
 use crate::render_dispatch::RenderGuard;
 use chrono::NaiveDateTime;
 use chrono::TimeZone;
 use rustdar_egui::actions::GuiAction;
 use rustdar_overlays::render::overlay_state::{OverlayFetchResult, OverlayKind};
-use rustdar_radar::types::{IMAGE_SIZE, RadarProduct};
+use rustdar_radar::types::RadarProduct;
 use std::sync::atomic::Ordering;
 use winit::event_loop::ActiveEventLoop;
 
@@ -1190,10 +1190,17 @@ impl super::App {
                         crate::offload::Job::Described(crate::offload::JobRequest::Radar {
                             input: Box::new(input),
                             // Loop frames store an empty value grid, so asking
-                            // for one would produce `IMAGE_SIZE² × 4` bytes per
-                            // frame to be dropped on arrival — and copied across
-                            // a worker boundary first.
+                            // for one would produce `LOOP_IMAGE_SIZE² × 4` bytes
+                            // per frame to be dropped on arrival — and copied
+                            // across a worker boundary first.
                             values_wanted: false,
+                            // The same policy in the other dimension: a loop
+                            // renders at `LOOP_IMAGE_SIZE` however far its
+                            // sweep reaches. A desktop loop textures 30 frames
+                            // at once, and at 4096² that is 30 × 64 MiB =
+                            // 1.9 GiB a pane against a 512 MiB loop budget.
+                            // See `JobRequest::side_ceiling_px`.
+                            full_res: false,
                         })
                     }
                     None => crate::offload::Job::renders_nothing(),
@@ -1215,6 +1222,8 @@ impl super::App {
                     product,
                     radar_lat: lat,
                     radar_lon: lon,
+                    // A loop frame, so the base size — see the Level II arm.
+                    full_res: false,
                 }),
                 None => crate::offload::Job::renders_nothing(),
             },
@@ -1241,7 +1250,7 @@ impl super::App {
                             log::error!(
                                 "Loop render for pane {pane_idx} produced {} bytes, expected {}",
                                 frame.image.len(),
-                                IMAGE_SIZE * IMAGE_SIZE * 4
+                                LOOP_IMAGE_SIZE * LOOP_IMAGE_SIZE * 4
                             );
                             (None, 0.0)
                         }
@@ -1535,7 +1544,12 @@ impl super::App {
 }
 
 /// Convert a renderer RGBA buffer into egui's pixel layout, or `None` if it is not
-/// the `IMAGE_SIZE²` image the renderer is supposed to produce.
+/// the `LOOP_IMAGE_SIZE²` image a loop frame is supposed to be.
+///
+/// A constant and not a derived side, unlike the static render path: a loop
+/// frame's size is a *policy* rather than a consequence of the sweep, so a
+/// frame of any other size is a job that came back at the wrong ceiling, which
+/// is a bug to log rather than a picture to place.
 ///
 /// The length check is not defensive padding. `ColorImage::from_rgba_unmultiplied`
 /// asserts on a mismatch, and this now runs on the render worker rather than the
@@ -1545,11 +1559,11 @@ impl super::App {
 /// malformed buffer down the same path as "no matching sweep", which the dispatcher
 /// already knows how to retire.
 fn loop_frame_image(rgba: &[u8]) -> Option<egui::ColorImage> {
-    if rgba.len() != IMAGE_SIZE * IMAGE_SIZE * 4 {
+    if rgba.len() != LOOP_IMAGE_SIZE * LOOP_IMAGE_SIZE * 4 {
         return None;
     }
     Some(egui::ColorImage::from_rgba_unmultiplied(
-        [IMAGE_SIZE, IMAGE_SIZE],
+        [LOOP_IMAGE_SIZE, LOOP_IMAGE_SIZE],
         rgba,
     ))
 }
@@ -1732,6 +1746,10 @@ mod local_time_tests;
 #[path = "app_fetch/loop_frame_image_tests.rs"]
 #[cfg(test)]
 mod loop_frame_image_tests;
+
+#[path = "app_fetch/loop_full_res_tests.rs"]
+#[cfg(test)]
+mod loop_full_res_tests;
 
 #[path = "app_fetch/loop_pane_tests.rs"]
 #[cfg(test)]

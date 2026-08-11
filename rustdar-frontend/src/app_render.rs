@@ -11,7 +11,6 @@ use crate::render_dispatch::CachedPaneRender;
 use egui_wgpu::wgpu;
 use rustdar_egui::actions::GuiAction;
 use rustdar_egui::pane::{BroadcastSweep, ELEVATION_TOLERANCE, RenderTarget};
-use rustdar_radar::types::IMAGE_SIZE;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -250,7 +249,7 @@ impl super::App {
             // Extract fields to avoid borrow issues
             let origin_pane = rr.pane_idx;
             let render_result = crate::render_dispatch::CachedPaneRender {
-                image_data: rendered.image_data,
+                image: rendered.image,
                 max_range_km: rendered.max_range_km,
                 value_data: rendered.value_data,
                 product: rr.product,
@@ -265,8 +264,8 @@ impl super::App {
                 .unwrap_or_default();
             // `RenderView::PlanView` because this is the plan-view path and
             // only the plan-view path: `dispatch_pane_renders` starts no render
-            // for a non-map pane, and `CachedRenderOutput` is an `IMAGE_SIZE`
-            // square raster by construction. The axis exists so a section
+            // for a non-map pane, and `CachedRenderOutput` is a square
+            // plan-view raster by construction. The axis exists so a section
             // cached later cannot be handed to this consumer — see
             // `RenderCacheKey`.
             self.render.cache_render(
@@ -275,7 +274,7 @@ impl super::App {
                 rustdar_radar::types::RenderView::PlanView,
                 render_result.elevation,
                 crate::render_dispatch::CachedRenderOutput {
-                    image_data: Arc::clone(&render_result.image_data),
+                    image: Arc::clone(&render_result.image),
                     max_range_km: render_result.max_range_km,
                     value_data: Arc::clone(&render_result.value_data),
                 },
@@ -372,15 +371,23 @@ impl super::App {
         }
 
         self.texture_counter += 1;
-        let color_image =
-            egui::ColorImage::from_rgba_unmultiplied([IMAGE_SIZE, IMAGE_SIZE], &render.image_data);
+        // The picture's own dimensions, not a constant: a sweep reaching past
+        // the floor is a wider raster, and the texture, the overlay entry and
+        // the hover all have to agree about which. `plan_view_image` already
+        // refused anything that is not a size this build makes, so there is
+        // nothing left here to validate.
+        let side = render.image.width();
         let texture_name = format!("radar_image_{}", self.texture_counter);
-        let texture = ctx.load_texture(texture_name, color_image, egui::TextureOptions::NEAREST);
+        let texture = ctx.load_texture(
+            texture_name,
+            Arc::clone(&render.image),
+            egui::TextureOptions::NEAREST,
+        );
 
-        // Cache the raw image data for fast restore after suspend/resume
+        // Cache the pixels for fast restore after suspend/resume
         if pane_idx < self.render.pane_render.len() {
             self.render.pane_render[pane_idx].cached_render = Some(CachedPaneRender {
-                image_data: Arc::clone(&render.image_data),
+                image: Arc::clone(&render.image),
                 max_range_km: render.max_range_km,
                 value_data: Arc::clone(&render.value_data),
                 product: render.product,
@@ -413,8 +420,8 @@ impl super::App {
             geo_bounds,
             data_generation: 0,
             render_zoom: 0,
-            width: IMAGE_SIZE as u32,
-            height: IMAGE_SIZE as u32,
+            width: side as u32,
+            height: side as u32,
             radar_meta: Some(RadarTextureMeta {
                 value_data: Arc::clone(&render.value_data),
                 lat,
@@ -735,9 +742,8 @@ impl super::App {
             // Ahead of the rendering-params branch, not inside it. A pane with
             // no plan view still has a product and an elevation selected —
             // they are flat fields — so it would take the `if` arm and buy a
-            // full `IMAGE_SIZE` x `IMAGE_SIZE` RGBA image plus an equally large
-            // `f32` value grid, per pane per selection change, that nothing
-            // draws. Under the `else` arm it would instead have its radar
+            // full-size plan-view image plus an equally large `f32` value
+            // grid, per pane per selection change, that nothing draws. Under the `else` arm it would instead have its radar
             // texture torn down, which is a wasted upload on the way back.
             // Skipping outright leaves whatever it had as a map pane in place,
             // so converting back to a map is instant and needs no re-render.
@@ -772,7 +778,7 @@ impl super::App {
                         elevation,
                     ) {
                         let render_result = crate::render_dispatch::CachedPaneRender {
-                            image_data: Arc::clone(&cached.image_data),
+                            image: Arc::clone(&cached.image),
                             max_range_km: cached.max_range_km,
                             value_data: Arc::clone(&cached.value_data),
                             product,
@@ -1287,9 +1293,9 @@ impl super::App {
             // `dispatch_pane_renders` deliberately *keeps* `cached_render` on a
             // converted pane, so that converting back to a map is instant. That
             // makes this the one place the kept copy could still be uploaded: every
-            // suspend, resume and surface loss would re-create a full
-            // `IMAGE_SIZE` x `IMAGE_SIZE` RGBA texture in the Radar overlay cache of
-            // a pane that draws no map.
+            // suspend, resume and surface loss would re-create a full-size
+            // plan-view texture in the Radar overlay cache of a pane that draws
+            // no map.
             if self.gui.pane_has_no_plan_view(pane_idx) {
                 continue;
             }
@@ -1314,13 +1320,13 @@ impl super::App {
             );
 
             self.texture_counter += 1;
-            let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                [IMAGE_SIZE, IMAGE_SIZE],
-                &cached.image_data,
-            );
+            let side = cached.image.width();
             let texture_name = format!("radar_image_{}", self.texture_counter);
-            let texture =
-                ctx.load_texture(texture_name, color_image, egui::TextureOptions::NEAREST);
+            let texture = ctx.load_texture(
+                texture_name,
+                Arc::clone(&cached.image),
+                egui::TextureOptions::NEAREST,
+            );
 
             // The cached extent, not a fresh one: these are the pixels the
             // render produced, so they belong on the ground that render
@@ -1344,8 +1350,8 @@ impl super::App {
                     geo_bounds,
                     data_generation: 0,
                     render_zoom: 0,
-                    width: IMAGE_SIZE as u32,
-                    height: IMAGE_SIZE as u32,
+                    width: side as u32,
+                    height: side as u32,
                     radar_meta: Some(RadarTextureMeta {
                         value_data: Arc::clone(&cached.value_data),
                         lat,
@@ -3906,8 +3912,8 @@ mod loop_level3_tests;
 /// raster, and every one of them reads a pane's `selected_product` and
 /// `selected_elevation` — flat fields a section or a volume pane carries exactly
 /// as a map pane does. So none of them *fails* on a non-map pane. Each one
-/// quietly buys an `IMAGE_SIZE` x `IMAGE_SIZE` RGBA image plus an equally large
-/// `f32` value grid, uploads a texture, and hands it to a pane that draws none.
+/// quietly buys a full-size plan-view image plus an equally large `f32` value
+/// grid, uploads a texture, and hands it to a pane that draws none.
 ///
 /// The four have to agree with each other as well as with reality, which is why
 /// they share one predicate ([`Gui::pane_has_no_plan_view`]): a pane that is

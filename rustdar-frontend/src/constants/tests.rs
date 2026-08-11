@@ -1,5 +1,6 @@
 use super::*;
 use rustdar_radar::types::{IMAGE_SIZE, NATIVE_IMAGE_SIZE, WASM_IMAGE_SIZE};
+use rustdar_radar::xsect::{NATIVE_SECTION_WIDTH, WASM_SECTION_WIDTH};
 
 /// One device class's share of every cascade in this file.
 ///
@@ -11,10 +12,21 @@ use rustdar_radar::types::{IMAGE_SIZE, NATIVE_IMAGE_SIZE, WASM_IMAGE_SIZE};
 /// run against every row.
 struct Arm {
     name: &'static str,
-    /// `rustdar_radar::types::IMAGE_SIZE` for this class. It is a *two*-arm
-    /// cascade — mobile is native — so this is where the two cascade shapes
-    /// in this workspace are reconciled.
+    /// `rustdar_radar::types::IMAGE_SIZE` for this class — the side a static
+    /// plan-view render takes at the 230 km floor. It is a *two*-arm cascade —
+    /// mobile is native — so this is where the two cascade shapes in this
+    /// workspace are reconciled.
     image_size: usize,
+    /// The side a static render may grow to past the floor. Equal to
+    /// `image_size` on the arm where adaptivity is off.
+    long_range_image_size: usize,
+    /// The side a **loop** frame is rendered at, whatever its sweep reaches.
+    /// This, not `image_size`, is what the loop budgets are computed from.
+    loop_image_size: usize,
+    /// `rustdar_radar::xsect::SECTION_WIDTH` for this class. Pinned per target
+    /// rather than derived from `image_size`, so it is carried here rather
+    /// than reconstructed.
+    section_width: usize,
     concurrent_renders: usize,
     loop_frames: usize,
     render_budget: usize,
@@ -48,34 +60,50 @@ impl Arm {
     /// Loop frames carry no value grid — `poll_loop_render_results` stores an
     /// empty one — so this is the whole cost, unlike a static pane render.
     fn loop_frame_bytes(&self) -> usize {
-        self.image_size * self.image_size * 4
+        self.loop_image_size * self.loop_image_size * 4
+    }
+
+    /// Bytes one **static** pane render's texture occupies, worst case: the
+    /// long-range side, since that is the one a device that passes the gate can
+    /// be asked to hold. Not part of `app_texture_bytes` — see
+    /// `the_static_render_textures_are_named_even_though_the_ceiling_omits_them`.
+    fn static_frame_bytes(&self) -> usize {
+        self.long_range_image_size * self.long_range_image_size * 4
     }
 
     /// Bytes one **cross-section** loop frame's texture occupies: RGBA at
     /// `SECTION_WIDTH × SECTION_HEIGHT`.
     ///
-    /// Derived from `rustdar_radar::xsect`'s own constants rather than written
-    /// as `image_size² × 2`, so that the halving this relies on is read from the
-    /// definition instead of restated beside it. Section loop frames carry no
-    /// value or status plane, for the reason plan-view frames carry no value
-    /// grid — see `rustdar_egui::pane::SectionImageData`.
-    ///
-    /// The section raster's width is `IMAGE_SIZE`, which is a `cfg`-selected
-    /// constant, so it is reconstructed from this arm's `image_size` to keep
-    /// every row checkable from one host build — the reason `arms()` exists.
+    /// The width comes from this arm's own `section_width` so that every row
+    /// is checkable from one host build — the reason `arms()` exists — and the
+    /// halving is read from `SECTION_HEIGHT`'s definition through the
+    /// assertion below rather than restated beside it. Section loop frames
+    /// carry no value or status plane, for the reason plan-view frames carry
+    /// no value grid — see `rustdar_egui::pane::SectionImageData`.
     fn section_frame_bytes(&self) -> usize {
-        let width = self.image_size;
-        let height = self.image_size / 2;
         assert_eq!(
             (
                 rustdar_radar::xsect::SECTION_WIDTH,
                 rustdar_radar::xsect::SECTION_HEIGHT
             ),
-            (IMAGE_SIZE, IMAGE_SIZE / 2),
-            "the section raster is no longer IMAGE_SIZE by IMAGE_SIZE/2, so the \
+            (
+                self.section_width_for_this_target(),
+                self.section_width_for_this_target() / 2
+            ),
+            "the section raster is no longer SECTION_WIDTH by half of it, so the \
              per-arm reconstruction above no longer describes it",
         );
-        width * height * 4
+        self.section_width * (self.section_width / 2) * 4
+    }
+
+    /// This *build's* section width, for the consistency check above — the
+    /// per-arm figure is `section_width` and is what the budget rows use.
+    fn section_width_for_this_target(&self) -> usize {
+        if cfg!(target_arch = "wasm32") {
+            WASM_SECTION_WIDTH
+        } else {
+            NATIVE_SECTION_WIDTH
+        }
     }
 
     /// Frames that hold a texture at once. `evict_textures_outside_render_set`
@@ -134,6 +162,9 @@ fn arms() -> [Arm; 3] {
         Arm {
             name: "wasm32",
             image_size: WASM_IMAGE_SIZE,
+            long_range_image_size: WASM_LONG_RANGE_IMAGE_SIZE,
+            loop_image_size: WASM_LOOP_IMAGE_SIZE,
+            section_width: WASM_SECTION_WIDTH,
             concurrent_renders: WASM_MAX_CONCURRENT_RENDERS,
             loop_frames: WASM_MAX_LOOP_FRAMES,
             render_budget: WASM_MAX_LOOP_RENDER_BUDGET,
@@ -150,6 +181,9 @@ fn arms() -> [Arm; 3] {
         Arm {
             name: "mobile",
             image_size: NATIVE_IMAGE_SIZE,
+            long_range_image_size: MOBILE_LONG_RANGE_IMAGE_SIZE,
+            loop_image_size: MOBILE_LOOP_IMAGE_SIZE,
+            section_width: NATIVE_SECTION_WIDTH,
             concurrent_renders: MOBILE_MAX_CONCURRENT_RENDERS,
             loop_frames: MOBILE_MAX_LOOP_FRAMES,
             render_budget: MOBILE_MAX_LOOP_RENDER_BUDGET,
@@ -166,6 +200,9 @@ fn arms() -> [Arm; 3] {
         Arm {
             name: "desktop",
             image_size: NATIVE_IMAGE_SIZE,
+            long_range_image_size: DESKTOP_LONG_RANGE_IMAGE_SIZE,
+            loop_image_size: DESKTOP_LOOP_IMAGE_SIZE,
+            section_width: NATIVE_SECTION_WIDTH,
             concurrent_renders: DESKTOP_MAX_CONCURRENT_RENDERS,
             loop_frames: DESKTOP_MAX_LOOP_FRAMES,
             render_budget: DESKTOP_MAX_LOOP_RENDER_BUDGET,
@@ -204,7 +241,7 @@ fn one_loop_at_the_floor_is_exactly_what_a_pane_used_to_get() {
              today",
             arm.name,
             arm.textured_frames(),
-            arm.image_size,
+            arm.loop_image_size,
             total / (1024 * 1024),
             arm.pool_floor / (1024 * 1024),
         );
@@ -265,11 +302,14 @@ fn every_pool_ceiling_is_at_least_its_own_floor() {
 /// A section loop can never be the binding case, and that is a property of the
 /// raster's shape rather than of the numbers chosen for it.
 ///
-/// `SECTION_HEIGHT` is `IMAGE_SIZE / 2` against `SECTION_WIDTH`'s `IMAGE_SIZE`,
-/// so a section frame is exactly half a plan-view frame on every target. Pinned
-/// so that a future change to the section raster's aspect has to come here and
-/// re-argue the budget rather than quietly making a section loop the largest
-/// thing on the screen.
+/// `SECTION_HEIGHT` is half `SECTION_WIDTH`, and `SECTION_WIDTH` is pinned per
+/// target at the same figure a loop frame takes, so a section frame is exactly
+/// half a plan-view loop frame on every target. That used to fall out of both
+/// following `IMAGE_SIZE`; the web plan view moving to 2048 while its loops and
+/// sections stayed at 1024 is what turned it into two decisions that have to
+/// agree. Pinned so that changing either has to come here and re-argue the
+/// budget rather than quietly making a section loop the largest thing on the
+/// screen.
 #[test]
 fn a_section_loop_frame_is_half_a_plan_view_one() {
     for arm in arms() {
@@ -567,16 +607,86 @@ fn the_volume_budget_is_not_slack_enough_to_hide_a_doubling() {
 #[test]
 fn the_documented_per_class_figures_are_what_the_arms_actually_say() {
     let expected = [
-        // name, image, concurrent, held, textured, floor MiB, ceiling MiB, volume budget B
-        ("wasm32", 1024, 1, 12, 8, 48, 192, 6 * 1024 * 1024),
-        ("mobile", 2048, 3, 20, 12, 256, 640, 20 * 1024 * 1024),
-        ("desktop", 2048, 6, 60, 30, 512, 3072, 48 * 1024 * 1024),
+        // name, base, long range, loop, section width, concurrent, held,
+        // textured, pool floor MiB, pool ceiling MiB, volume budget B
+        (
+            "wasm32",
+            2048,
+            2048,
+            1024,
+            1024,
+            1,
+            12,
+            8,
+            48,
+            192,
+            6 * 1024 * 1024,
+        ),
+        (
+            "mobile",
+            2048,
+            4096,
+            2048,
+            2048,
+            3,
+            20,
+            12,
+            256,
+            640,
+            20 * 1024 * 1024,
+        ),
+        (
+            "desktop",
+            2048,
+            4096,
+            2048,
+            2048,
+            6,
+            60,
+            30,
+            512,
+            3072,
+            48 * 1024 * 1024,
+        ),
     ];
-    for (arm, (name, image, concurrent, held, textured, floor_mib, ceiling_mib, volume)) in
-        arms().into_iter().zip(expected)
+    for (
+        arm,
+        (
+            name,
+            image,
+            long_range,
+            loop_image,
+            section_width,
+            concurrent,
+            held,
+            textured,
+            floor_mib,
+            ceiling_mib,
+            volume,
+        ),
+    ) in arms().into_iter().zip(expected)
     {
         assert_eq!(arm.name, name);
         assert_eq!(arm.image_size, image, "{name} image size");
+        assert_eq!(
+            arm.long_range_image_size, long_range,
+            "{name} long-range image size"
+        );
+        assert_eq!(arm.loop_image_size, loop_image, "{name} loop image size");
+        assert_eq!(arm.section_width, section_width, "{name} section width");
+        // The three sides a plan-view raster can have on this class, ordered.
+        // The loop never exceeds the base — a loop frame is the same picture
+        // or a leaner one, never a larger one — and the long-range ceiling
+        // never falls under it, or `raster_side_px` would shrink a raster the
+        // moment its sweep reached further.
+        assert!(
+            arm.loop_image_size <= arm.image_size,
+            "{name}: a loop frame is larger than a still one"
+        );
+        assert!(
+            arm.image_size <= arm.long_range_image_size,
+            "{name}: the long-range ceiling is under the base size"
+        );
         assert_eq!(arm.concurrent_renders, concurrent, "{name} renders");
         assert_eq!(arm.loop_frames, held, "{name} held frames");
         assert_eq!(arm.render_budget, textured, "{name} render budget");
@@ -740,6 +850,12 @@ fn every_cfg_arm_selects_the_constant_named_for_its_device_class() {
     ];
 
     let covered = [
+        // The two raster-size cascades. `IMAGE_SIZE` itself is not here — it
+        // is `rustdar_radar`'s, and its own crate's
+        // `each_cfg_arm_selects_the_image_size_named_for_it` reads it the same
+        // way.
+        "LONG_RANGE_IMAGE_SIZE",
+        "LOOP_IMAGE_SIZE",
         "MAX_CONCURRENT_RENDERS",
         "MAX_LOOP_RENDER_BUDGET",
         "MAX_LOOP_FRAMES",
@@ -850,10 +966,24 @@ fn the_web_image_fits_the_texture_size_webgl2_guarantees() {
         "the web radar image is {WASM_IMAGE_SIZE} px, over the {guaranteed} px \
              2D texture WebGL2 guarantees — every browser render would fail"
     );
-    // And with the whole other half of the guarantee still free, which is
-    // the stated reason the web arm halves rather than matching native: the
-    // overlay textures are allocated alongside the radar frame.
-    assert!(WASM_IMAGE_SIZE as u32 * 2 <= guaranteed);
+    // The web arm sits *on* the guarantee rather than under it, and that is
+    // the decision: `max_texture_dimension_2d` bounds each texture's each
+    // axis, not a frame's total, and the overlay textures beside the radar
+    // frame are sized from the viewport and clamped against the same limit
+    // independently (`plan_overlay_texture`). The earlier ×2 headroom rule
+    // was a policy resting on a misreading of the limit.
+    assert_eq!(WASM_IMAGE_SIZE as u32, guaranteed);
+    // Which is also why the web arm's long-range ceiling has to *be* the
+    // guarantee: there is nothing above it to grow into, so
+    // `raster_side_px` is inert on the web and every browser render is
+    // exactly the size every browser must accept.
+    assert_eq!(
+        WASM_LONG_RANGE_IMAGE_SIZE as u32, guaranteed,
+        "the web long-range ceiling is over what WebGL2 guarantees, so a \
+             long-reaching sweep would fail to upload in some browser"
+    );
+    // And the web loop frame is under it by construction.
+    assert!(WASM_LOOP_IMAGE_SIZE as u32 <= guaranteed);
 }
 
 /// The reference pane fits this target's offscreen budget **at its own
@@ -1239,4 +1369,87 @@ fn the_pane_mirrors_ceiling_is_the_cap_it_is_actually_halved_to() {
             && size[0] * size[1] * 4 <= WASM_VOLUME_MIRROR_BYTES_MAX as u32,
         "a frame far over the cap must halve until it fits, got {size:?}",
     );
+}
+
+/// The static pane textures the app ceiling does **not** count, named so the
+/// figure is on the record rather than absent.
+///
+/// [`APP_TEXTURE_BUDGET_BYTES`] bounds loops, 3D grids and raymarch
+/// offscreens. A still pane's own radar texture has never been in it — it was
+/// 4 MiB on the web and 16 MiB native, small against the loop term and not a
+/// term anyone had to reason about. The long-range raster changes the size of
+/// that omission, not its shape, and the honest thing is to say what it is:
+///
+/// | target  | panes | static texture | worst case |
+/// |---------|------:|---------------:|-----------:|
+/// | desktop |     6 |         64 MiB |    384 MiB |
+/// | mobile  |     4 |         64 MiB |    256 MiB |
+/// | wasm32  |     6 |         16 MiB |     96 MiB |
+///
+/// Reachable only with every pane on a sweep that reaches past 230 km on a
+/// device that can hold one, and never at the same time as the loop term
+/// above it — a pane showing a loop is not showing a still frame. It is not
+/// added to the ceiling because doing so would fold two mutually exclusive
+/// worst cases into one sum; it is pinned here so that a future change to
+/// either raster size has to come past a stated number.
+#[test]
+fn the_static_render_textures_are_named_even_though_the_ceiling_omits_them() {
+    let expected = [
+        ("wasm32", 16 * 1024 * 1024, 96),
+        ("mobile", 64 * 1024 * 1024, 256),
+        ("desktop", 64 * 1024 * 1024, 384),
+    ];
+    for (arm, (name, frame, worst_mib)) in arms().into_iter().zip(expected) {
+        assert_eq!(arm.name, name);
+        assert_eq!(arm.static_frame_bytes(), frame, "{name} static frame");
+        assert_eq!(
+            arm.max_panes * arm.static_frame_bytes() / (1024 * 1024),
+            worst_mib,
+            "{name} worst-case static textures",
+        );
+    }
+}
+
+/// The closed set a finished raster's length is read against, and the
+/// lengths that are not in it.
+///
+/// Every consumer of a render derives its side this way — see
+/// [`raster_side_from_rgba_len`] — so this is the one place the set is
+/// stated. The refusals matter as much as the acceptances: a length that
+/// slipped through would reach `ColorImage::from_rgba_unmultiplied`'s
+/// `assert_eq!`, which on a native render thread means no response ever
+/// arrives and the pane stays blank for good.
+#[test]
+fn a_rasters_side_is_read_back_from_its_length_against_a_closed_set() {
+    for side in [
+        LOOP_IMAGE_SIZE,
+        rustdar_radar::types::IMAGE_SIZE,
+        LONG_RANGE_IMAGE_SIZE,
+    ] {
+        assert_eq!(
+            raster_side_from_rgba_len(side * side * 4),
+            Some(side),
+            "{side} px is a size this build renders",
+        );
+    }
+    for (len, why) in [
+        (0, "an empty buffer"),
+        (1, "a single byte"),
+        (3, "a length that is not even a whole pixel"),
+        (512 * 512 * 4, "a square raster of a size nothing renders"),
+        (
+            LONG_RANGE_IMAGE_SIZE * LONG_RANGE_IMAGE_SIZE * 4 - 4,
+            "one pixel short of the long-range raster",
+        ),
+        (
+            LONG_RANGE_IMAGE_SIZE * LONG_RANGE_IMAGE_SIZE * 4 + 4,
+            "one pixel over it",
+        ),
+        (
+            rustdar_radar::xsect::SECTION_WIDTH * rustdar_radar::xsect::SECTION_HEIGHT * 4,
+            "a cross-section raster, which is not square and not a plan view",
+        ),
+    ] {
+        assert_eq!(raster_side_from_rgba_len(len), None, "{why}");
+    }
 }

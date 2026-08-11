@@ -21,10 +21,12 @@ impl Drop for RenderGuard {
     }
 }
 
-/// Cached raw RGBA + metadata from the last successful render so we can
-/// re-upload the texture instantly after suspend/resume without re-rendering.
+/// The last successful render's pixels + metadata, so the texture can be
+/// re-uploaded instantly after suspend/resume without re-rendering.
 pub struct CachedPaneRender {
-    pub image_data: Arc<Vec<u8>>,
+    /// See [`crate::channels::RenderedImage::image`] — held converted, so a
+    /// resume is an upload and not a second unmultiply of 64 MiB.
+    pub image: Arc<egui::ColorImage>,
     /// The half-width the cached pixels were projected at, km. Kept beside
     /// them because a restore has to place them where the render put them —
     /// see `restore_cached_renders`, which rebuilds the bounds from this and
@@ -120,7 +122,7 @@ impl PaneRenderState {
 /// view, elevation)` are looking at one buffer, and a buffer projected at
 /// 417 km has to be placed at 417 km on both of them.
 pub struct CachedRenderOutput {
-    pub image_data: Arc<Vec<u8>>,
+    pub image: Arc<egui::ColorImage>,
     pub max_range_km: f64,
     pub value_data: Arc<Vec<f32>>,
 }
@@ -133,11 +135,11 @@ pub struct CachedRenderOutput {
 /// The cache is shared between panes, and what it shares is a *buffer*. A plan
 /// view of reflectivity and a cross-section of reflectivity at the same site
 /// are the same `(site, product, elevation)` and completely different shapes —
-/// `IMAGE_SIZE²` of ground against `SECTION_WIDTH × SECTION_HEIGHT` of a
+/// a square of ground against `SECTION_WIDTH × SECTION_HEIGHT` of a
 /// vertical plane. Without this axis they collide in the LRU and one pane is
-/// handed the other's buffers, which is not a wrong picture: it is
-/// `ColorImage::from_rgba_unmultiplied`'s `assert_eq!` on the **main thread**,
-/// live in release, and under wasm a main-thread panic aborts the whole app.
+/// handed the other's buffers, which is not a wrong picture: it is a texture of
+/// the wrong shape stretched over a pane's geography, with the hover reading
+/// a vertical plane's values through a plan view's bounds.
 ///
 /// It is added now, while the cache still holds only plan-view rasters, because
 /// this is the last moment at which the change is mechanical.
@@ -145,10 +147,10 @@ pub type RenderCacheKey = (String, RadarProduct, RenderView, i32);
 
 /// Bounded least-recently-used cache of render outputs shared between panes.
 ///
-/// Each entry is an `IMAGE_SIZE²` RGBA image plus an `IMAGE_SIZE²` `f32` value
-/// grid — 32 MiB apiece at 2048² — and before this was bounded the only thing
-/// that ever dropped one was `reset_panes*`, so switching product or elevation
-/// grew the cache without limit.
+/// Each entry is a `side²` image plus a `side²` `f32` value grid — 32 MiB
+/// apiece at 2048², 128 MiB at 4096² — and before this was bounded the only
+/// thing that ever dropped one was `reset_panes*`, so switching product or
+/// elevation grew the cache without limit.
 ///
 /// The recency queue holds exactly the keys of `entries`, each exactly once,
 /// oldest use first. Every method that touches one touches the other; the pair
@@ -382,10 +384,25 @@ pub struct RenderDispatcher {
     /// Cache of the latest render output per (site, product, elevation_tenths), shared
     /// across panes that display the same product at the same elevation on the same site.
     ///
-    /// Bounded by `MAX_RENDER_CACHE_ENTRIES` on an LRU policy: it is a sharing cache
-    /// for the panes on screen, not a history, and each entry costs `IMAGE_SIZE² × 8`
-    /// bytes.
+    /// Bounded by `MAX_RENDER_CACHE_ENTRIES` on an LRU policy: it is a sharing
+    /// cache for the panes on screen, not a history, and each entry costs
+    /// `side² × 8` bytes — 32 MiB at the 230 km floor and 128 MiB for a
+    /// long-range sweep on a device that can take one. See
+    /// `constants::MAX_RENDER_CACHE_ENTRIES` for why the bound stays a count
+    /// and what the resulting ceiling is.
     pub render_cache: RenderCache,
+    /// Whether the device this process is drawing on can hold a long-range
+    /// raster — `AppState::long_range_raster_ok`, copied here because the
+    /// dispatch sites are where it turns into a job.
+    ///
+    /// `false` until a device exists, which is the safe direction: a static
+    /// render dispatched before `ensure_rendering_state` has installed one
+    /// would be dispatched at the base size, not at a size nothing can upload.
+    /// Nothing dispatches that early in the shipped app — the frame loop
+    /// returns before `dispatch_pane_renders` while `state` is `None` — so
+    /// what actually observes the default is this crate's tests, and the base
+    /// size is what they were written against.
+    long_range_raster_ok: bool,
     /// The storm motion override the storm-relative renders on screen were
     /// built with. Nothing else about a pane changes when the user edits the
     /// vector, so without this the field would keep the old motion until the
@@ -536,6 +553,36 @@ impl SectionInputKey {
     }
 }
 
+/// A finished plan-view raster in egui's pixel layout, or `None` if its length
+/// is not one this build can have produced.
+///
+/// **Where this runs is the point.** It is called from `spawn_render`'s
+/// `deliver`, which is the render thread natively — so the unmultiply is off
+/// the frame thread entirely — and the browser's main thread, which is the only
+/// thread a browser has and where a loop frame has always been converted for
+/// the same reason. What the frame thread receives either way is a buffer it
+/// hands straight to `Context::load_texture`.
+///
+/// The side is derived from the length rather than named, because a static
+/// render is `IMAGE_SIZE` or `LONG_RANGE_IMAGE_SIZE` square depending on how
+/// far its sweep reached and the caller here does not know which. Validating
+/// against the closed set is what makes deriving it safe:
+/// `ColorImage::from_rgba_unmultiplied` asserts on a mismatch, and this is
+/// called on a render worker natively — where a panic means no `RenderResponse`
+/// ever arrives, `render_in_flight` never clears, and the pane stays blank for
+/// good. `None` instead routes a malformed buffer down the "no matching sweep"
+/// path the dispatcher already retires cleanly.
+fn plan_view_image(rgba: &[u8]) -> Option<egui::ColorImage> {
+    let Some(side) = crate::constants::raster_side_from_rgba_len(rgba.len()) else {
+        log::error!(
+            "a radar render produced {} bytes, which is no raster size this build makes",
+            rgba.len(),
+        );
+        return None;
+    };
+    Some(egui::ColorImage::from_rgba_unmultiplied([side, side], rgba))
+}
+
 impl Default for RenderDispatcher {
     fn default() -> Self {
         Self::new()
@@ -553,9 +600,30 @@ impl RenderDispatcher {
             // Owned here so there is exactly one render budget counter in the process.
             renders_in_flight: Arc::new(AtomicUsize::new(0)),
             render_cache: RenderCache::new(MAX_RENDER_CACHE_ENTRIES),
+            long_range_raster_ok: false,
             last_storm_motion_override: None,
             section_input: None,
         }
+    }
+
+    /// Record what the device that has just been created can hold. See
+    /// [`long_range_raster_ok`](Self::long_range_raster_ok).
+    ///
+    /// Called where the device is installed rather than read from there per
+    /// dispatch, because the dispatcher outlives the device: a lost surface
+    /// drops `AppState` and a new one is built, and a dispatcher that reached
+    /// for a device would have to answer the question with no device in hand.
+    pub fn set_long_range_raster_ok(&mut self, ok: bool) {
+        self.long_range_raster_ok = ok;
+    }
+
+    /// Whether a **static** render dispatched now may take the long-range
+    /// raster size — the value that becomes `JobRequest`'s `full_res`.
+    ///
+    /// Static, because a loop frame's answer is always `false` by policy; see
+    /// `offload::JobRequest::side_ceiling_px` for both halves of that byte.
+    fn static_full_res(&self) -> bool {
+        self.long_range_raster_ok
     }
 
     /// Cache a fetched Level III object under the `(AWIPS code, site)` it is.
@@ -1089,6 +1157,7 @@ impl RenderDispatcher {
                     eet: std::sync::Arc::clone(&eet.bytes),
                     radar_lat: params.lat,
                     radar_lon: params.lon,
+                    full_res: self.static_full_res(),
                 }),
             );
             return true;
@@ -1101,6 +1170,8 @@ impl RenderDispatcher {
         let lat = params.lat;
         let lon = params.lon;
         let product = params.product;
+        // Read before `spawn_render` borrows `self` mutably.
+        let full_res_for_this_render = self.static_full_res();
 
         log::info!(
             "Spawning Level III render for pane {}: {:?}",
@@ -1122,6 +1193,7 @@ impl RenderDispatcher {
                 product,
                 radar_lat: lat,
                 radar_lon: lon,
+                full_res: full_res_for_this_render,
             }),
         );
         true
@@ -1186,6 +1258,9 @@ impl RenderDispatcher {
                     input: Box::new(input),
                     // A static pane keeps the grid: it is what a hover reads.
                     values_wanted: true,
+                    // And it is the one render kind that may take the
+                    // long-range raster, if this device can hold one.
+                    full_res: self.static_full_res(),
                 })
             }
             None => crate::offload::Job::renders_nothing(),
@@ -1429,10 +1504,7 @@ impl RenderDispatcher {
         crate::offload::offload_job("radar-render", job, move |output| {
             let _guard = guard;
             // An output of another kind is `None` here — "nothing to draw",
-            // which every path below already handles. `RenderResponse` carries
-            // a square `IMAGE_SIZE` plan-view raster and `apply_render_to_pane`
-            // asserts that shape on the **main thread**, live in release: under
-            // wasm that panic aborts the whole app. See `JobOutput::frame`.
+            // which every path below already handles. See `JobOutput::frame`.
             let frame = output.and_then(crate::offload::JobOutput::frame);
             // Sent whether or not there is a frame, because the receiver is what
             // clears `render_in_flight` and a pane that never hears back stops
@@ -1451,10 +1523,12 @@ impl RenderDispatcher {
             drop(wanted);
             if still_wanted {
                 let _ = sender.send(RenderResponse {
-                    rendered: frame.map(|frame| crate::channels::RenderedImage {
-                        image_data: Arc::new(frame.image),
-                        max_range_km: frame.max_range_km,
-                        value_data: Arc::new(frame.values),
+                    rendered: frame.and_then(|frame| {
+                        Some(crate::channels::RenderedImage {
+                            image: Arc::new(plan_view_image(&frame.image)?),
+                            max_range_km: frame.max_range_km,
+                            value_data: Arc::new(frame.values),
+                        })
                     }),
                     product,
                     elevation,
@@ -1479,3 +1553,6 @@ mod render_invalidation_tests;
 
 #[cfg(test)]
 mod section_payload_cache_tests;
+
+#[cfg(test)]
+mod raster_size_tests;

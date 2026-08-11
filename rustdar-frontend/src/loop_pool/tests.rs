@@ -1,13 +1,14 @@
 use super::*;
 use crate::constants::{
-    DESKTOP_LOOP_POOL_CEILING_BYTES, DESKTOP_LOOP_POOL_FLOOR_BYTES, DESKTOP_MAX_LOOP_RENDER_BUDGET,
-    DESKTOP_MAX_LOOP_VOLUME_FRAMES, DESKTOP_VOLUME_GRID_CELLS, MOBILE_LOOP_POOL_CEILING_BYTES,
-    MOBILE_LOOP_POOL_FLOOR_BYTES, MOBILE_MAX_LOOP_RENDER_BUDGET, MOBILE_MAX_LOOP_VOLUME_FRAMES,
-    MOBILE_VOLUME_GRID_CELLS, WASM_LOOP_POOL_CEILING_BYTES, WASM_LOOP_POOL_FLOOR_BYTES,
+    DESKTOP_LOOP_IMAGE_SIZE, DESKTOP_LOOP_POOL_CEILING_BYTES, DESKTOP_LOOP_POOL_FLOOR_BYTES,
+    DESKTOP_MAX_LOOP_RENDER_BUDGET, DESKTOP_MAX_LOOP_VOLUME_FRAMES, DESKTOP_VOLUME_GRID_CELLS,
+    MOBILE_LOOP_IMAGE_SIZE, MOBILE_LOOP_POOL_CEILING_BYTES, MOBILE_LOOP_POOL_FLOOR_BYTES,
+    MOBILE_MAX_LOOP_RENDER_BUDGET, MOBILE_MAX_LOOP_VOLUME_FRAMES, MOBILE_VOLUME_GRID_CELLS,
+    WASM_LOOP_IMAGE_SIZE, WASM_LOOP_POOL_CEILING_BYTES, WASM_LOOP_POOL_FLOOR_BYTES,
     WASM_MAX_LOOP_RENDER_BUDGET, WASM_MAX_LOOP_VOLUME_FRAMES, WASM_VOLUME_GRID_CELLS,
 };
 use rustdar_egui::config_store::MemoryConfigStore;
-use rustdar_radar::types::{NATIVE_IMAGE_SIZE, WASM_IMAGE_SIZE};
+use rustdar_radar::xsect::{NATIVE_SECTION_WIDTH, WASM_SECTION_WIDTH};
 
 /// One device class, with both halves of every question a host build cannot
 /// otherwise reach.
@@ -28,10 +29,20 @@ struct Arm {
     volume_loop_frames: usize,
 }
 
-fn model(image_size: usize, grid: [u32; 3], render_budget: usize) -> LoopFrameModel {
+/// `loop_image_size` is the side a **loop** frame renders at, which on the web
+/// is not the side a static one takes — see [`LoopFrameModel::plan_view`]. The
+/// section width is passed rather than derived from it for the same reason:
+/// `xsect` pins it per target, and the two agreeing on every arm this ships is
+/// a fact to be read from the constants, not one to be assumed here.
+fn model(
+    loop_image_size: usize,
+    section_width: usize,
+    grid: [u32; 3],
+    render_budget: usize,
+) -> LoopFrameModel {
     LoopFrameModel {
-        plan_view: image_size * image_size * 4,
-        section: image_size * (image_size / 2) * 4,
+        plan_view: loop_image_size * loop_image_size * 4,
+        section: section_width * (section_width / 2) * 4,
         grid: crate::volume::raymarch::grid_bytes_with_mips(grid).expect("a shipped grid shape")
             + crate::constants::VOLUME_LUT_BYTES,
         render_budget,
@@ -43,7 +54,8 @@ fn arms() -> [Arm; 3] {
         Arm {
             name: "wasm32",
             model: model(
-                WASM_IMAGE_SIZE,
+                WASM_LOOP_IMAGE_SIZE,
+                WASM_SECTION_WIDTH,
                 WASM_VOLUME_GRID_CELLS,
                 WASM_MAX_LOOP_RENDER_BUDGET,
             ),
@@ -57,7 +69,8 @@ fn arms() -> [Arm; 3] {
         Arm {
             name: "mobile",
             model: model(
-                NATIVE_IMAGE_SIZE,
+                MOBILE_LOOP_IMAGE_SIZE,
+                NATIVE_SECTION_WIDTH,
                 MOBILE_VOLUME_GRID_CELLS,
                 MOBILE_MAX_LOOP_RENDER_BUDGET,
             ),
@@ -71,7 +84,8 @@ fn arms() -> [Arm; 3] {
         Arm {
             name: "desktop",
             model: model(
-                NATIVE_IMAGE_SIZE,
+                DESKTOP_LOOP_IMAGE_SIZE,
+                NATIVE_SECTION_WIDTH,
                 DESKTOP_VOLUME_GRID_CELLS,
                 DESKTOP_MAX_LOOP_RENDER_BUDGET,
             ),
@@ -565,7 +579,12 @@ fn backing_off_halves_toward_the_floor_and_stops() {
 /// [`LOOP_POOL_DWELL_FRAMES`] before it is taken.
 #[test]
 fn a_pane_that_flickers_inside_the_dwell_changes_nothing() {
-    let model = model(NATIVE_IMAGE_SIZE, DESKTOP_VOLUME_GRID_CELLS, 30);
+    let model = model(
+        DESKTOP_LOOP_IMAGE_SIZE,
+        NATIVE_SECTION_WIDTH,
+        DESKTOP_VOLUME_GRID_CELLS,
+        30,
+    );
     let limits = LoopPoolLimits {
         floor: DESKTOP_LOOP_POOL_FLOOR_BYTES,
         ceiling: DESKTOP_LOOP_POOL_CEILING_BYTES,
@@ -619,7 +638,12 @@ fn a_pane_that_flickers_inside_the_dwell_changes_nothing() {
 /// more share, which is not worth re-fetching every loop on screen for.
 #[test]
 fn a_growth_has_to_clear_the_dead_band_but_a_shrink_does_not() {
-    let model = model(NATIVE_IMAGE_SIZE, DESKTOP_VOLUME_GRID_CELLS, 30);
+    let model = model(
+        DESKTOP_LOOP_IMAGE_SIZE,
+        NATIVE_SECTION_WIDTH,
+        DESKTOP_VOLUME_GRID_CELLS,
+        30,
+    );
     let limits = LoopPoolLimits {
         floor: DESKTOP_LOOP_POOL_FLOOR_BYTES,
         ceiling: DESKTOP_LOOP_POOL_CEILING_BYTES,

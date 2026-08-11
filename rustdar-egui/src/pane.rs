@@ -118,7 +118,7 @@ pub struct SectionImageData {
 /// [`RenderCacheKey`]: https://docs.rs/rustdar-frontend
 #[derive(Clone)]
 pub enum LoopFrameImage {
-    /// An `IMAGE_SIZE²` plan-view raster, positioned by the site's coordinates.
+    /// A square plan-view raster, positioned by the site's coordinates.
     PlanView(RadarImageData),
     /// A `SECTION_WIDTH × SECTION_HEIGHT` vertical slice along the loop's line.
     Section(SectionImageData),
@@ -1513,7 +1513,7 @@ impl PaneState {
     /// A loop's frames are pictures of one shape, and
     /// [`LoopPlaybackState::view`] is the field that says which. Converting a
     /// looping map pane into a section pane leaves a frame list full of
-    /// `IMAGE_SIZE` square plan-view rasters under a state that now claims to be
+    /// square plan-view rasters under a state that now claims to be
     /// a section — every acceptance and donation predicate would refuse them,
     /// which is the point of that field, so nothing would be *drawn* wrongly;
     /// but the pane would animate a list of frames nothing can fill and hold

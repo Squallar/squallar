@@ -96,8 +96,9 @@ fn handle_message(scope: &web_sys::DedicatedWorkerGlobalScope, data: &JsValue) {
 
 /// Post the answer, moving the buffers rather than copying them.
 ///
-/// The frame's two buffers are `IMAGE_SIZE² × 4` bytes each — 4 MiB apiece at
-/// the browser's 1024². They are built as typed arrays (one copy out of this
+/// The frame's two buffers are `side² × 4` bytes each — 16 MiB apiece for a
+/// browser's still frame at 2048², 4 MiB for a loop frame at 1024². They are
+/// built as typed arrays (one copy out of this
 /// instance's linear memory, which is unavoidable without a `SharedArrayBuffer`
 /// this deployment cannot have) and then *transferred*, so the page adopts them
 /// instead of receiving a second copy.

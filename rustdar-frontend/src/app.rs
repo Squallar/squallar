@@ -1164,6 +1164,8 @@ impl App {
             });
             if let Some(state) = new_state {
                 let ctx = state.egui_renderer.context().clone();
+                self.render
+                    .set_long_range_raster_ok(state.long_range_raster_ok);
                 self.state = Some(state);
                 self.restore_cached_render(&ctx);
                 self.install_volume_bridge();
@@ -1187,6 +1189,8 @@ impl App {
                 Ok(state) => {
                     self.pending_state = None;
                     let ctx = state.egui_renderer.context().clone();
+                    self.render
+                        .set_long_range_raster_ok(state.long_range_raster_ok);
                     self.state = Some(state);
                     self.restore_cached_render(&ctx);
                     self.install_volume_bridge();

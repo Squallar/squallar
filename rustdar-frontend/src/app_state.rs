@@ -120,6 +120,24 @@ pub struct AppState {
     /// surface — outrank it, and they deliberately live outside this struct
     /// because a lost surface destroys this struct. See `volume::degrade`.
     pub volume_support: volume::VolumeSupport,
+    /// Whether this device's 2D textures reach
+    /// [`crate::constants::LONG_RANGE_IMAGE_SIZE`], and so whether a sweep
+    /// reaching past the 230 km floor may be rendered at the long-range raster
+    /// size.
+    ///
+    /// Read off the device once, here, rather than probed per render: it is a
+    /// static property of the adapter and the render that would learn it the
+    /// hard way learns it by failing to create a texture, which leaves a blank
+    /// pane behind an error the latch swallows. Vulkan guarantees 4096 and iOS
+    /// Metal offers 8192, so this is `true` on every desktop and every iPhone;
+    /// the case it exists for is an Android GLES device reporting the spec
+    /// floor of 2048, where the answer is a correct 2.24 px/km picture instead
+    /// of nothing.
+    ///
+    /// A `bool` and not the size itself, because the size belongs to the
+    /// constants and this is the one bit the *device* has to say. The dispatch
+    /// sites turn it into `JobRequest`'s `full_res`.
+    pub long_range_raster_ok: bool,
     max_surface_dimension: u32,
 }
 
@@ -182,6 +200,18 @@ impl AppState {
 
         // Get the maximum texture dimension - wgpu requires surface dimensions to respect this
         let max_surface_dimension = device.limits().max_texture_dimension_2d;
+        // The same figure, asked a different question: can a plan view of a
+        // long-reaching sweep become a texture on this machine at all?
+        let long_range_raster_ok =
+            max_surface_dimension as usize >= crate::constants::LONG_RANGE_IMAGE_SIZE;
+        if !long_range_raster_ok {
+            log::info!(
+                "long-range plan views degrade to {} px: this device's 2D textures stop at \
+                 {max_surface_dimension} px, under the {} px a long-range raster needs",
+                rustdar_radar::types::IMAGE_SIZE,
+                crate::constants::LONG_RANGE_IMAGE_SIZE,
+            );
+        }
 
         // Clamp surface dimensions to the device's texture dimension limit
         let width = width.clamp(MIN_SIZE, max_surface_dimension);
@@ -211,6 +241,7 @@ impl AppState {
             egui_renderer,
             adapter,
             volume_support,
+            long_range_raster_ok,
             max_surface_dimension,
         }
     }

@@ -105,11 +105,14 @@ pub enum JobRequest {
         ///
         /// Static pane renders do — it is what a hover reads. Loop frames drop
         /// it on arrival, and it is the same size as the texture, so returning
-        /// it would copy `IMAGE_SIZE² × 4` bytes across a worker boundary per
-        /// frame purely to discard them.
+        /// it would copy `LOOP_IMAGE_SIZE² × 4` bytes across a worker boundary
+        /// per frame purely to discard them.
         ///
         /// The texture is unaffected either way; only the grid is cleared.
         values_wanted: bool,
+        /// Whether this render may take the long-range raster size. See
+        /// [`JobRequest::side_ceiling_px`].
+        full_res: bool,
     },
     /// Rasterize a Level III radial product.
     ///
@@ -123,6 +126,8 @@ pub enum JobRequest {
         product: rustdar_radar::types::RadarProduct,
         radar_lat: f64,
         radar_lon: f64,
+        /// See [`JobRequest::side_ceiling_px`].
+        full_res: bool,
     },
     /// Rasterize a Level III product **derived from two objects of the same
     /// volume**: VIL density, Digital VIL over Enhanced Echo Tops
@@ -138,6 +143,8 @@ pub enum JobRequest {
         eet: std::sync::Arc<Vec<u8>>,
         radar_lat: f64,
         radar_lon: f64,
+        /// See [`JobRequest::side_ceiling_px`].
+        full_res: bool,
     },
     /// Draw a vertical cross-section through a volume.
     ///
@@ -164,12 +171,13 @@ pub enum JobRequest {
 /// Widened from a bare [`RenderedFrame`] when a section and a voxel grid became
 /// things a worker could be asked for. **[`RenderedFrame`] itself is
 /// deliberately untouched**, and in particular did not gain a width and a
-/// height: `loop_frame_image`'s constant-shaped length check and
-/// `ColorImage::from_rgba_unmultiplied([IMAGE_SIZE, IMAGE_SIZE], …)` are guards
-/// that exist because a `ColorImage` panic on a render worker means no response
-/// ever arrives and the pane stays blank forever. Payload-supplied dimensions
-/// would delete them. The existing `IMAGE_SIZE` assumptions survive here
-/// because the new outputs never reach them — see [`JobOutput::frame`].
+/// height even once a plan view stopped having one size: its consumers derive
+/// the side from the buffer's own length and check it against the closed set of
+/// sizes this build renders (`constants::raster_side_from_rgba_len`), which is
+/// the same guard a named constant was — a `ColorImage` panic on a render
+/// worker means no response ever arrives and the pane stays blank forever —
+/// without the payload being trusted to describe itself. See
+/// [`JobOutput::frame`].
 #[derive(Debug, PartialEq)]
 pub enum JobOutput {
     Frame(RenderedFrame),
@@ -231,9 +239,10 @@ impl JobOutput {
 /// swap a texture for a value grid somewhere with no type error to catch it.
 ///
 /// The extent is metadata and stays metadata — it says where the pixels *are*,
-/// never how many of them there are. The image's dimensions remain
-/// `IMAGE_SIZE²` on both sides of every port here, which is what lets
-/// `loop_frame_image` keep its constant-shaped anti-blank guard.
+/// never how many of them there are. How many there are is the buffer's own
+/// length, read back against a closed set at each consumer
+/// (`constants::raster_side_from_rgba_len`); nothing on this port describes its
+/// own shape, which is what keeps a malformed payload from being believed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderedFrame {
     pub image: Vec<u8>,
@@ -294,10 +303,12 @@ impl JobRequest {
             Self::Radar {
                 input,
                 values_wanted,
+                full_res,
             } => {
                 let mut out = Vec::new();
                 out.push(TAG_RADAR);
                 out.push(u8::from(*values_wanted));
+                out.push(u8::from(*full_res));
                 out.extend_from_slice(&input.to_bytes());
                 out
             }
@@ -306,8 +317,10 @@ impl JobRequest {
                 product,
                 radar_lat,
                 radar_lon,
+                full_res,
             } => {
                 let mut out = vec![TAG_LEVEL3];
+                out.push(u8::from(*full_res));
                 out.extend_from_slice(&product.wire_code().to_le_bytes());
                 out.extend_from_slice(&radar_lat.to_le_bytes());
                 out.extend_from_slice(&radar_lon.to_le_bytes());
@@ -319,10 +332,12 @@ impl JobRequest {
                 eet,
                 radar_lat,
                 radar_lon,
+                full_res,
             } => {
                 // The first object is length-prefixed and the second takes the
                 // rest, so neither length can lie about the other.
                 let mut out = vec![TAG_LEVEL3_PAIR];
+                out.push(u8::from(*full_res));
                 out.extend_from_slice(&radar_lat.to_le_bytes());
                 out.extend_from_slice(&radar_lon.to_le_bytes());
                 out.extend_from_slice(&(dvl.len() as u32).to_le_bytes());
@@ -355,19 +370,18 @@ impl JobRequest {
         let (tag, rest) = bytes.split_first()?;
         match *tag {
             TAG_RADAR => {
-                let (flag, rest) = rest.split_first()?;
+                let (values_wanted, rest) = rest.split_first()?;
+                let (full_res, rest) = rest.split_first()?;
                 Some(Self::Radar {
-                    values_wanted: match flag {
-                        0 => false,
-                        1 => true,
-                        _ => return None,
-                    },
+                    values_wanted: flag(*values_wanted)?,
+                    full_res: flag(*full_res)?,
                     input: Box::new(RenderInput::from_bytes(rest)?),
                 })
             }
             TAG_LEVEL3 => {
                 let mut r = Reader::new(rest);
                 Some(Self::Level3 {
+                    full_res: flag(r.u8()?)?,
                     product: rustdar_radar::types::RadarProduct::from_wire_code(r.u16()?)?,
                     radar_lat: r.f64()?,
                     radar_lon: r.f64()?,
@@ -376,10 +390,12 @@ impl JobRequest {
             }
             TAG_LEVEL3_PAIR => {
                 let mut r = Reader::new(rest);
+                let full_res = flag(r.u8()?)?;
                 let radar_lat = r.f64()?;
                 let radar_lon = r.f64()?;
                 let dvl_len = r.u32()? as usize;
                 Some(Self::Level3Pair {
+                    full_res,
                     radar_lat,
                     radar_lon,
                     dvl: std::sync::Arc::new(r.take(dvl_len)?.to_vec()),
@@ -407,6 +423,46 @@ impl JobRequest {
                 })
             }
             _ => None,
+        }
+    }
+
+    /// The largest raster side this job's render may produce.
+    ///
+    /// One byte on the wire — `full_res` — and two questions answered by it,
+    /// which is deliberate rather than a conflation. The renderer needs a
+    /// single number; what it is *for* is "how big a texture is this result
+    /// allowed to become", and there are exactly two reasons to say "the base
+    /// one":
+    ///
+    ///   * **This is a loop frame.** A loop holds frames by the dozen, so it
+    ///     renders leaner by policy — it already drops the value grid for the
+    ///     same reason. [`crate::constants::LOOP_IMAGE_SIZE`] is the base size
+    ///     natively and 1024 on the web, where the per-pane loop budget is what
+    ///     it is.
+    ///   * **This device cannot take the long-range texture.** The gate is
+    ///     `AppState::long_range_raster_ok`, a `max_texture_dimension_2d`
+    ///     comparison made once at device creation; a sub-4096 GLES handheld
+    ///     degrades to a correct base-size picture instead of a texture
+    ///     creation that fails and leaves the pane blank.
+    ///
+    /// Both answers are "render this at the size the display always used", so
+    /// they are one flag. The gate is applied at the dispatch site rather than
+    /// here because this type travels to a worker that has no device to ask.
+    ///
+    /// The [`JobRequest::Section`] and [`JobRequest::Voxels`] arms have no such
+    /// byte: a section's raster is a constant of the view (`xsect`'s
+    /// `SECTION_WIDTH`) and a voxel grid's shape is already on the wire.
+    fn side_ceiling_px(&self) -> usize {
+        let full_res = match self {
+            Self::Radar { full_res, .. }
+            | Self::Level3 { full_res, .. }
+            | Self::Level3Pair { full_res, .. } => *full_res,
+            Self::Section { .. } | Self::Voxels { .. } => return 0,
+        };
+        if full_res {
+            crate::constants::LONG_RANGE_IMAGE_SIZE
+        } else {
+            crate::constants::LOOP_IMAGE_SIZE
         }
     }
 
@@ -443,6 +499,20 @@ impl JobRequest {
 /// disagreement from the wire into the type.
 fn agree_on_product(wanted: rustdar_radar::types::RadarProduct, input: &RenderInput) -> Option<()> {
     (wanted == input.product()).then_some(())
+}
+
+/// A wire boolean, refusing anything that is not 0 or 1.
+///
+/// The two ends of a message port can be different builds, and a byte outside
+/// the pair is a payload this one cannot read rather than a `true` to guess at
+/// — the same refusal `values_wanted` has always made, now spelt once for the
+/// several flags that make it.
+fn flag(byte: u8) -> Option<bool> {
+    match byte {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
 }
 
 fn encode_section_request(out: &mut Vec<u8>, request: &SectionRequest) {
@@ -596,29 +666,40 @@ impl<'a> Reader<'a> {
 /// calls breaks the worker equivalence this paragraph promises, because a
 /// worker does not share this process's memory.
 pub fn execute(request: &JobRequest) -> JobResult {
+    // Read once, off the request, so the three rasterizing arms cannot come to
+    // disagree about how large a picture this job was allowed to make.
+    let side_ceiling_px = request.side_ceiling_px();
     match request {
         JobRequest::Radar {
             input,
             values_wanted,
-        } => rustdar_radar::render::render_from(input).map(|(image, max_range_km, values)| {
-            JobOutput::Frame(RenderedFrame {
-                image,
-                max_range_km,
-                // Dropped rather than never produced: the grid is what the
-                // rasterizer writes into, and the texture is derived from it.
-                // Clearing it here costs nothing and keeps the renderer's
-                // output the one thing it has always been.
-                values: if *values_wanted { values } else { Vec::new() },
-            })
-        }),
+            ..
+        } => rustdar_radar::render::render_from_sized(input, side_ceiling_px).map(
+            |(image, max_range_km, values)| {
+                JobOutput::Frame(RenderedFrame {
+                    image,
+                    max_range_km,
+                    // Dropped rather than never produced: the grid is what the
+                    // rasterizer writes into, and the texture is derived from
+                    // it. Clearing it here costs nothing and keeps the
+                    // renderer's output the one thing it has always been.
+                    values: if *values_wanted { values } else { Vec::new() },
+                })
+            },
+        ),
         JobRequest::Level3 {
             bytes,
             product,
             radar_lat,
             radar_lon,
+            ..
         } => decode_level3(bytes).and_then(|message| {
-            rustdar_radar::render::render_level3_message_to_image(
-                &message, *product, *radar_lat, *radar_lon,
+            rustdar_radar::render::render_level3_message_to_image_sized(
+                &message,
+                *product,
+                *radar_lat,
+                *radar_lon,
+                side_ceiling_px,
             )
             .map(Into::into)
             .map(JobOutput::Frame)
@@ -628,9 +709,14 @@ pub fn execute(request: &JobRequest) -> JobResult {
             eet,
             radar_lat,
             radar_lon,
+            ..
         } => match (decode_level3(dvl), decode_level3(eet)) {
-            (Some(dvl), Some(eet)) => rustdar_radar::render::render_derived_vild_to_image(
-                &dvl, &eet, *radar_lat, *radar_lon,
+            (Some(dvl), Some(eet)) => rustdar_radar::render::render_derived_vild_to_image_sized(
+                &dvl,
+                &eet,
+                *radar_lat,
+                *radar_lon,
+                side_ceiling_px,
             )
             .map(Into::into)
             .map(JobOutput::Frame),

@@ -459,7 +459,7 @@ fn gui_on_tilt(
 
 fn cached(range: f64) -> CachedRenderOutput {
     CachedRenderOutput {
-        image_data: Arc::new(Vec::new()),
+        image: Arc::new(egui::ColorImage::default()),
         max_range_km: range,
         value_data: Arc::new(Vec::new()),
     }

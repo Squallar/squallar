@@ -85,12 +85,13 @@
 //!
 //! `KDMX20250314_175512_V06`, default box, `THRESH=15`:
 //!
-//! | path | raster extent | IoU identity | best translation |
+//! | path | raster | IoU identity | best translation |
 //! |---|---|---|---|
-//! | the deleted `resample_floor` floor | ±230 km | 0.5815 | (0, 0) texels |
-//! | the mirror read through `floor_colour` | ±230 km | 0.5777 | (0, 0) texels |
-//! | the same, per-radial wedge widths | ±230 km | 0.5776 | (0, 0) texels |
-//! | the same, extent from the sweep | **±458 km** | **0.6789** | (−1, +2) texels |
+//! | the deleted `resample_floor` floor | ±230 km, 2048 px | 0.5815 | (0, 0) texels |
+//! | the mirror read through `floor_colour` | ±230 km, 2048 px | 0.5777 | (0, 0) texels |
+//! | the same, per-radial wedge widths | ±230 km, 2048 px | 0.5776 | (0, 0) texels |
+//! | the same, extent from the sweep | ±458 km, 2048 px | 0.6789 | (−1, +2) texels |
+//! | the same, side from the extent | **±458 km, 4096 px** | **0.6883** | (−1, +2) texels |
 //!
 //! The first two are the same measurement to within the mask criterion — the
 //! old one asked "does this texel differ from the ground colour", this one asks
@@ -111,27 +112,51 @@
 //!     every corner texel was a miss the mapping could do nothing about. The
 //!     far south-west square — where this day's storms were — goes 0.5009 →
 //!     0.8635 on that alone.
-//!   * **The mirror is half as fine, and the echo dilates.** 2.24 px/km instead
-//!     of 4.45, so `render_gate`'s two extra samples per axis pad a gate's
-//!     footprint by ~0.45 km rather than ~0.22 km: 38 208 texels painted
+//!   * **The mirror was half as fine, and the echo dilated.** 2.24 px/km
+//!     instead of 4.45, so `render_gate`'s two extra samples per axis padded a
+//!     gate's footprint by ~0.45 km rather than ~0.22 km: 38 208 texels painted
 //!     against 29 263. The best translation drifts off zero by one and two
 //!     texels (−0.90, +1.80 km) and buys 0.0041 of IoU, which is the dilation
 //!     finding its own centre rather than a registration error — a
 //!     mis-registration of that size would show as a centroid shift and does
 //!     not (the centroid delta *shrank*, +24.8/−17.6 → +9.3/−13.3 texels).
 //!
-//! **The mapping table stops discriminating on this volume, and that is
-//! expected.** Whole-box: honest 0.6789, trapezoid 0.6797, linear-v 0.6838 —
-//! the two deliberate perturbations now score *above* the exact mapping. Both
-//! errors grow with distance from the site in uv, and halving the uv rate
-//! halves them, which puts them under this volume's own mask noise. Only
-//! `no cos(lat)` — a first-order error, 1.34× at this latitude — still falls
-//! clear (0.4611). The discrimination that is *asserted* rather than reported
-//! lives in
+//! The fifth row restores the resolution: the raster's side now follows its
+//! extent, so ±458 km is drawn on 4096 px at 4.45 px/km — the floor's own
+//! scale. The dilation goes back with it (36 450 texels painted against
+//! 38 208), the centroid delta closes a little further (+7.9/−11.0 texels) and
+//! the identity IoU rises to 0.6883.
+//!
+//! **The mapping table still does not discriminate on this volume, and the
+//! resolution was not why.** Whole-box after the restoration: honest 0.6883,
+//! trapezoid 0.6899, linear-v 0.6936 — the two deliberate perturbations score
+//! *above* the exact mapping, by +0.0016 and +0.0053 where at 2048 px they
+//! scored above it by +0.0008 and +0.0049. Doubling the resolution moved those
+//! margins by under 0.001 and did not change their sign, which disposes of the
+//! explanation the 2048 row carried (that halving the uv rate sank two
+//! second-order errors under the mask noise). Measured directly on the
+//! synthetic fixture — the same tree, the same field, only the side changed —
+//! resolution barely moves this instrument at all: the corner falls are
+//! 0.2366 / 0.1610 at 2048 px against 0.2406 / 0.1648 at 4096.
+//!
+//! What is left is the volume. This day's echo is one broad mass in the
+//! south-west — 8 440 of the box's 29 252 grid texels are in that one eighth,
+//! and the other three corners hold 0, 0 and 4 — and the honest mapping
+//! already carries a residual against it that has nothing to do with the
+//! mapping: the grid's mask is a **column max** through a box sampled with the
+//! `cos e` slant-to-ground correction, the raster's is a plan view painted
+//! without it, and the two masks differ in area by a quarter (36 450 against
+//! 29 252). A second-order perturbation of a few kilometres inside a
+//! contiguous echo mass costs almost no overlap, and one that happens to nudge
+//! the floor mask along that residual *buys* some. Only `no cos(lat)` — first
+//! order, 1.34× at this latitude — still falls clear (0.4633).
+//!
+//! So this table reports registration and coverage on a real volume, and the
+//! discrimination that is *asserted* rather than reported lives in
 //! [`a_broken_mapping_costs_iou_in_the_corner_even_where_the_centre_cannot_tell`],
-//! whose fixture stops at 237 km and is therefore unaffected; this table was
-//! always the reported half, and the module already warned that scoring a
-//! lopsided real echo is not a fair comparison.
+//! whose field has structure at the perturbations' own scale everywhere in the
+//! box. That is the fixture to change if the shader's mapping is ever
+//! reworked; this one is for coverage and gross misregistration.
 //!
 //! # What this file inherited from the deleted `volume_floor/tests.rs`
 //!
@@ -234,6 +259,14 @@ fn mercator_y(lat_rad: f64) -> f64 {
 /// how fast its texture coordinates run with geography.
 struct Mirror {
     side: usize,
+    /// Kilometres of ground across one texel: `2 · extent / side`.
+    ///
+    /// Here because a budget written in *pixels* is a budget that changes
+    /// meaning when the raster's size does, and it does now — the same 237 km
+    /// fixture is 2048 texels on a device that cannot take the long-range
+    /// raster and 4096 on one that can. What the mapping can be wrong by is a
+    /// distance on the ground, so that is the unit the pins below state.
+    km_per_px: f64,
     rgba: Vec<u8>,
     site_lat_deg: f64,
     /// `floor_uv.x`
@@ -271,11 +304,13 @@ impl Mirror {
         extent_km: f64,
     ) -> Self {
         let bounds = ImageBounds::from_radar_site(site_lat, site_lon, extent_km);
+        let km_per_px = 2.0 * extent_km / side as f64;
         let lon_span = bounds.max_lon - bounds.min_lon;
         let merc_span = bounds.mercator_y_max - bounds.mercator_y_min;
         let site_merc = mercator_y(site_lat.to_radians());
         Mirror {
             side,
+            km_per_px,
             rgba,
             site_lat_deg: site_lat,
             u_at_site: (site_lon - bounds.min_lon) / lon_span,
@@ -859,9 +894,7 @@ fn measure_floor_against_grid_on_a_real_volume() {
         None,
     )
     .expect("a renderable base tilt");
-    let (image, extent_km, _values) =
-        rustdar_radar::render::render_from(&input).expect("a rendered base tilt");
-    let raster_side = rustdar_radar::types::IMAGE_SIZE;
+    let (image, raster_side, extent_km) = pane_raster(&input).expect("a rendered base tilt");
     let mirror = Mirror::from_pane_raster(image, raster_side, site.lat, site.lon, extent_km);
     let geo = BoxGeo::from_grid(&grid);
 
@@ -1102,15 +1135,34 @@ fn mirror_from_field(
         None,
     )
     .expect("a renderable base tilt");
-    let (image, extent_km, _values) =
-        rustdar_radar::render::render_from(&input).expect("a rendered base tilt");
-    Mirror::from_pane_raster(
-        image,
-        rustdar_radar::types::IMAGE_SIZE,
-        site_lat,
-        site_lon,
-        extent_km,
-    )
+    let (image, side, extent_km) = pane_raster(&input).expect("a rendered base tilt");
+    Mirror::from_pane_raster(image, side, site_lat, site_lon, extent_km)
+}
+
+/// The raster a **static desktop pane** would produce for `input`, its side and
+/// its extent — the picture the shipped mirror is made of.
+///
+/// `render_from_sized` at this build's own long-range ceiling, not
+/// `render_from`: a pane render is dispatched with `full_res`, so a sweep
+/// reaching past the 230 km floor is drawn onto 4096 px rather than 2048, and
+/// an instrument that modelled the mirror at the base size would be scoring a
+/// picture no pane ever shows.
+///
+/// The side is read back off the buffer for the reason every consumer in the
+/// app reads it back off the buffer: it is a function of how far the sweep
+/// reached, which is a property of the volume on disk and not of this file.
+fn pane_raster(input: &rustdar_radar::render_input::RenderInput) -> Option<(Vec<u8>, usize, f64)> {
+    let (image, extent_km, _values) = rustdar_radar::render::render_from_sized(
+        input,
+        rustdar_frontend::constants::LONG_RANGE_IMAGE_SIZE,
+    )?;
+    let side = (image.len() / 4).isqrt();
+    assert_eq!(
+        side * side * 4,
+        image.len(),
+        "a plan-view raster is square RGBA",
+    );
+    Some((image, side, extent_km))
 }
 
 /// The default box, as a [`BoxGeo`] — `±DEFAULT_HALF_WIDTH_KM` about the site,
@@ -1248,29 +1300,40 @@ fn the_boxs_site_position_lands_on_the_mirrors_site_pixel() {
 /// a corner probe:
 ///
 ///   * `(150, 160)` — well east and well north, where taking `cos φ` at the
-///     site instead of at the point costs 16 px and a latitude-linear v axis 11;
+///     site instead of at the point costs 3.67 km and a latitude-linear v axis
+///     2.47;
 ///   * `(60, 215)` — nearly due north, where the `cos` errors nearly vanish
-///     (8 px) and the v axis is at its worst (18 px);
+///     (1.93 km) and the v axis is at its worst (4.05 km);
 ///   * `(-190, -100)` — the opposite quadrant, which catches a sign as well as
-///     a scale, and where the v error is down to 3 px.
+///     a scale, and where the v error is down to 0.65 km.
 ///
 /// Probes at KMPX, 44.8°N, for the reason
 /// [`a_broken_mapping_costs_iou_in_the_corner_even_where_the_centre_cannot_tell`]
 /// gives: both second-order errors scale with `tan φ₀`, and this pin wants them
 /// clear of the honest mapping's own budget rather than merely above it.
 ///
-/// That budget is 4 px. It used to be spent almost entirely on one known
+/// **The figures are kilometres of ground, not texels**, and that is the
+/// change the adaptive raster forced: this fixture reaches 237 km, so it is
+/// drawn on 2048 texels where the device cannot take a long-range raster and
+/// on 4096 where it can, and every texel figure would double between the two
+/// while nothing about the mapping moved. What a mapping can be wrong by is a
+/// distance.
+///
+/// The honest budget is 0.9 km. When it was set, most of it was one known
 /// disagreement — `render_gate` walked north on `EARTH_RADIUS_KM` (6371 km)
 /// and `floor_colour` on a `KM_PER_DEGREE_LAT` of 111.32 (a 6378 km sphere),
-/// 0.12 % apart, about a pixel at 200 km — and the worst probe measured 2.3 px
-/// against it. The two spheres are one sphere now, so what is left is the
-/// blob's own discretisation. The budget is deliberately *not* tightened to
-/// the new measurement: it is a ceiling separating an honest mapping from the
-/// broken ones at `MUST_MISS_PX`, and those still miss by more than twice it.
+/// 0.12 % apart, about 0.24 km at 200 km — with a measured worst probe of
+/// 0.48 km against it. The two spheres are one sphere now, so what is left is
+/// the blob's own discretisation and the worst probe can only have come down.
+///
+/// The budget is deliberately *not* tightened to the smaller residual: it is a
+/// ceiling separating an honest mapping from the broken ones at `MUST_MISS_KM`,
+/// and those still miss by more than twice it for reasons — `cos φ` taken at
+/// the site, a latitude-linear v axis — that no unification touches.
 #[test]
 fn a_gate_lands_on_the_mirror_pixel_that_renders_it() {
-    const HONEST_BUDGET_PX: f64 = 4.0;
-    const MUST_MISS_PX: f64 = 10.0;
+    const HONEST_BUDGET_KM: f64 = 0.9;
+    const MUST_MISS_KM: f64 = 2.3;
 
     let site = rustdar_radar::sites::get_radar_site("KMPX").expect("KMPX is a known site");
     let geo = default_box();
@@ -1283,17 +1346,17 @@ fn a_gate_lands_on_the_mirror_pixel_that_renders_it() {
         for (slot, mapping) in worst_miss.iter_mut().zip(Mapping::ALL) {
             let mapped = mirror_pixel_for_km(&mirror, &geo, dx_km, dy_km, mapping)
                 .unwrap_or_else(|| panic!("({dx_km}, {dy_km}) km fell off the mirror"));
-            let apart = (mapped.0 - drawn.0).hypot(mapped.1 - drawn.1);
+            let apart = (mapped.0 - drawn.0).hypot(mapped.1 - drawn.1) * mirror.km_per_px;
             println!(
-                "({dx_km:>6.0}, {dy_km:>6.0}) km  {:<26} {apart:>8.2} px",
+                "({dx_km:>6.0}, {dy_km:>6.0}) km  {:<26} {apart:>8.3} km",
                 mapping.label(),
             );
             if mapping == Mapping::Honest {
                 assert!(
-                    apart < HONEST_BUDGET_PX,
+                    apart < HONEST_BUDGET_KM,
                     "a gate at ({dx_km}, {dy_km}) km was drawn at raster pixel \
                      ({:.1}, {:.1}) and the mapping put it at ({:.1}, {:.1}) — \
-                     {apart:.1} px apart, over the {HONEST_BUDGET_PX} px budget",
+                     {apart:.3} km apart, over the {HONEST_BUDGET_KM} km budget",
                     drawn.0,
                     drawn.1,
                     mapped.0,
@@ -1311,8 +1374,8 @@ fn a_gate_lands_on_the_mirror_pixel_that_renders_it() {
             continue;
         }
         assert!(
-            *miss > MUST_MISS_PX,
-            "{} — a mapping this file calls broken — landed within {miss:.1} px of \
+            *miss > MUST_MISS_KM,
+            "{} — a mapping this file calls broken — landed within {miss:.3} km of \
              the drawn gate at every probe, so no probe here would notice it. The \
              probe set has gone blind, not the shader.",
             mapping.label(),
@@ -1400,15 +1463,8 @@ fn a_planted_storm_lands_on_the_floor_exactly_under_its_own_voxels() {
         None,
     )
     .expect("a renderable base tilt");
-    let (image, extent_km, _) =
-        rustdar_radar::render::render_from(&input).expect("a rendered base tilt");
-    let mirror = Mirror::from_pane_raster(
-        image,
-        rustdar_radar::types::IMAGE_SIZE,
-        site.lat,
-        site.lon,
-        extent_km,
-    );
+    let (image, side, extent_km) = pane_raster(&input).expect("a rendered base tilt");
+    let mirror = Mirror::from_pane_raster(image, side, site.lat, site.lon, extent_km);
     let geo = BoxGeo::from_grid(&grid);
     let floor = sample_floor(&mirror, &geo, Mapping::Honest);
 
@@ -1524,8 +1580,8 @@ fn block_is_lit(ix: i64, iy: i64) -> bool {
 ///   * [`Mapping::CosAtSite`] (the trapezoid) and [`Mapping::LinearLatitudeV`]
 ///     are **second order**: both are exactly right at the site and grow with
 ///     the square of the distance from its parallel. These are the errors the
-///     warning is about. Measured on this fixture they cost 0.001 and 0.009 of
-///     IoU at the centre — noise — and 0.12 and 0.09 in the corner. A
+///     warning is about. Measured on this fixture they cost 0.007 and 0.005 of
+///     IoU at the centre — noise — and 0.24 and 0.16 in the corner. A
 ///     centred-only instrument would have called both of them clean.
 ///
 /// The site is **KMPX**, at 44.8°N, and not the KTLX the other fixtures fly:
@@ -1577,15 +1633,8 @@ fn a_broken_mapping_costs_iou_in_the_corner_even_where_the_centre_cannot_tell() 
         None,
     )
     .expect("a renderable base tilt");
-    let (image, extent_km, _values) =
-        rustdar_radar::render::render_from(&input).expect("a rendered base tilt");
-    let mirror = Mirror::from_pane_raster(
-        image,
-        rustdar_radar::types::IMAGE_SIZE,
-        site.lat,
-        site.lon,
-        extent_km,
-    );
+    let (image, side, extent_km) = pane_raster(&input).expect("a rendered base tilt");
+    let mirror = Mirror::from_pane_raster(image, side, site.lat, site.lon, extent_km);
     let geo = BoxGeo::from_grid(&grid);
 
     let whole = Region::whole(PROBE_TEXELS);

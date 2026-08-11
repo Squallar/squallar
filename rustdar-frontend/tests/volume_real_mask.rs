@@ -287,14 +287,23 @@ fn render_a_real_volume_mask() {
     .and_then(|(mut image, extent_km, _)| {
         // The returned `max_range_km`, which *is* the raster's geometry: the
         // renderer projects at `plan_view_extent_km` of the sweep's reach, so
-        // this picture is `IMAGE_SIZE` texels square over
+        // this picture is `side` texels square over
         // `ImageBounds::from_radar_site(.., extent_km)` and the lanes below
         // have to describe that box and no other. On a real super-res volume
-        // it is 458 km, not the 230 the raster was fixed at when this harness
-        // was written.
+        // the extent is 458 km, not the 230 the raster was fixed at when this
+        // harness was written.
+        //
+        // The side comes off the buffer rather than from a constant, because
+        // this render went through the unsized entry and a later one might
+        // not: what the lanes below need is the side of *this* picture.
         let bounds =
             rustdar_radar::types::ImageBounds::from_radar_site(site_lat, site_lon, extent_km);
-        let side = rustdar_radar::types::IMAGE_SIZE as u32;
+        let side = (image.len() / 4).isqrt() as u32;
+        assert_eq!(
+            (side as usize) * (side as usize) * 4,
+            image.len(),
+            "a plan-view raster is square RGBA",
+        );
 
         let mut mirror = None;
         assert!(
@@ -323,7 +332,7 @@ fn render_a_real_volume_mask() {
         // Where the site sits in that picture and how fast its texture
         // coordinates run with geography, read straight off the rasterizer's
         // own projection (`render::MercatorProjection`): x is linear in
-        // longitude about `IMAGE_SIZE / 2`, and y is
+        // longitude about half the side, and y is
         // `(mercator_y_max - mercator_y) / span` measured down from the top —
         // hence a negative v rate, v running down while Mercator y runs north.
         // v at the site is *not* 0.5: the bounds are symmetric in latitude and

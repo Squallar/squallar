@@ -17,14 +17,7 @@ use nexrad_model::data::{PulseWidth, Scan, VolumeCoveragePattern};
 /// to be deliberate.
 #[test]
 fn both_image_size_arms_are_pinned_not_just_the_compiled_one() {
-    // The web arm has to leave room *beside* the radar frame for the overlay
-    // textures, which is the stated reason it halves; native allocates its
-    // frame on a real GPU and is only checked against the same floor for
-    // symmetry.
-    for (target, size, wants_overlay_room) in [
-        ("wasm32", WASM_IMAGE_SIZE, true),
-        ("native", NATIVE_IMAGE_SIZE, false),
-    ] {
+    for (target, size) in [("wasm32", WASM_IMAGE_SIZE), ("native", NATIVE_IMAGE_SIZE)] {
         // `render::project` indexes `py * IMAGE_SIZE + px` into a single
         // allocation and `ImageBounds` divides the extent by it, so zero is
         // a division by zero before it is an empty image.
@@ -33,23 +26,25 @@ fn both_image_size_arms_are_pinned_not_just_the_compiled_one() {
         // same thing at compile time for whichever arm it compiled.
         assert!(size.is_power_of_two(), "{target}: {size}");
         // A browser may legitimately report exactly the WebGL2 guarantee, so
-        // *both* arms have to fit it — the web one with room to spare,
-        // because the overlay textures sit alongside the radar frame in the
-        // same budget. This is the assertion the 4096 mutation trips.
-        let needed = if wants_overlay_room { size * 2 } else { size };
+        // *both* arms have to fit it. This is the assertion the 4096 mutation
+        // trips. The web arm is allowed to sit exactly on the line: the
+        // guarantee bounds each texture's each axis, and the overlays beside
+        // the radar frame are sized from the viewport and clamped against the
+        // same limit separately (`plan_overlay_texture`), so there was never a
+        // sum for the radar frame to leave room in.
         assert!(
-            needed <= WEBGL2_MAX_TEXTURE_DIMENSION_2D,
-            "the {target} image is {size} px and needs {needed} px of the \
+            size <= WEBGL2_MAX_TEXTURE_DIMENSION_2D,
+            "the {target} image is {size} px, over the \
                  {WEBGL2_MAX_TEXTURE_DIMENSION_2D} px 2D texture size WebGL2 guarantees"
         );
     }
 
-    // The web arm halves the side, which quarters the RGBA texture. That
-    // ratio is what `LOOP_TEXTURE_BUDGET_BYTES`' 4 MiB-vs-16 MiB frame
-    // figures are computed from, so it is a relation and not a coincidence.
-    assert_eq!(NATIVE_IMAGE_SIZE, WASM_IMAGE_SIZE * 2);
-
-    assert_eq!(WASM_IMAGE_SIZE, 1024);
+    // The two arms are the same size *today*, and the equality is asserted
+    // rather than collapsed because they are not the same decision: native's
+    // is what 230 km costs at 4.45 px/km, and the web's is the largest
+    // texture WebGL2 guarantees. `LOOP_TEXTURE_BUDGET_BYTES`' frame figures
+    // are computed off the loop sizes, which do still differ.
+    assert_eq!(WASM_IMAGE_SIZE, 2048);
     assert_eq!(NATIVE_IMAGE_SIZE, 2048);
     assert_eq!(WEBGL2_MAX_TEXTURE_DIMENSION_2D, 2048);
 
@@ -161,6 +156,67 @@ fn the_extent_is_the_reach_held_between_a_floor_and_a_cap() {
     // A `NaN` reach is the one input `clamp` would pass straight through, and
     // an unplaceable raster is a worse answer than a too-wide one.
     assert_eq!(plan_view_extent_km(f64::NAN), BASE_EXTENT_KM);
+}
+
+/// How many pixels each extent gets, at each ceiling a caller in this
+/// workspace passes.
+///
+/// The first block is the guarantee: at or under the floor the answer is
+/// [`IMAGE_SIZE`] whatever ceiling is offered, so a Doppler cut, a derived
+/// grid and every fetched Level III product are drawn on exactly the raster
+/// they have always been drawn on. The last block is the mechanism the device
+/// gate and the loop policy both use — a ceiling is a ceiling, and one at or
+/// below the base size turns adaptivity off rather than being ignored.
+#[test]
+fn the_side_follows_the_extent_up_to_the_ceiling_the_caller_owns() {
+    const LONG_RANGE: usize = 4096;
+    for (extent, ceiling, side, why) in [
+        // At and below the floor: the base size, whatever is on offer.
+        (0.0, LONG_RANGE, IMAGE_SIZE, "a product no radial carries"),
+        (148.0, LONG_RANGE, IMAGE_SIZE, "a WSR-88D Doppler cut"),
+        (
+            BASE_EXTENT_KM,
+            LONG_RANGE,
+            IMAGE_SIZE,
+            "exactly the floor, with 4096 offered",
+        ),
+        // Past it: the ceiling, because there is now ground to spend it on.
+        (
+            230.1,
+            LONG_RANGE,
+            LONG_RANGE,
+            "one tenth of a kilometre past the floor",
+        ),
+        (417.0, LONG_RANGE, LONG_RANGE, "a TDWR long-range cut"),
+        (458.0, LONG_RANGE, LONG_RANGE, "a WSR-88D surveillance cut"),
+        (MAX_EXTENT_KM, LONG_RANGE, LONG_RANGE, "the cap"),
+        // A ceiling at the base size disables adaptivity outright: this is
+        // what a device whose textures stop at 2048 asks for, and what every
+        // caller with no GPU to consult gets by default.
+        (
+            458.0,
+            IMAGE_SIZE,
+            IMAGE_SIZE,
+            "the base size as the ceiling",
+        ),
+        (
+            BASE_EXTENT_KM,
+            IMAGE_SIZE,
+            IMAGE_SIZE,
+            "the floor, ceiling == base",
+        ),
+        // And a ceiling *below* it is honoured rather than clamped away —
+        // the web's loop frames, which are deliberately leaner than its
+        // static renders.
+        (BASE_EXTENT_KM, 1024, 1024, "a loop frame on the floor"),
+        (458.0, 1024, 1024, "a loop frame of a surveillance cut"),
+    ] {
+        assert_eq!(
+            raster_side_px(extent, ceiling),
+            side,
+            "{extent} km under a {ceiling} px ceiling ({why})",
+        );
+    }
 }
 
 /// The bounds are the extent, in degrees, and nothing else — so a raster twice

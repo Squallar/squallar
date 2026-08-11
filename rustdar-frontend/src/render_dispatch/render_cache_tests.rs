@@ -13,7 +13,7 @@ fn key(site: &str, elevation_tenths: i32) -> RenderCacheKey {
 /// can tell which render it got back.
 fn output(range: f64) -> CachedRenderOutput {
     CachedRenderOutput {
-        image_data: Arc::new(Vec::new()),
+        image: Arc::new(egui::ColorImage::default()),
         max_range_km: range,
         value_data: Arc::new(Vec::new()),
     }

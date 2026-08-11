@@ -22,10 +22,11 @@ struct MercatorProjection {
     merc_y_scale: f64,
     /// The image's scale, pixels per kilometre east-west at the site.
     ///
-    /// A field rather than a constant because the extent below is per render
-    /// and the side is fixed, so this is the quantity that moves: 4.45 px/km
-    /// for the 230 km most sweeps get on a 2048-pixel image, 2.24 for a TDWR
-    /// long-range cut at 417 km.
+    /// A field rather than a constant because both of the quantities behind it
+    /// are per render now. It stays close to 4.45 px/km on purpose — 2048 over
+    /// the 230 km floor, 4096 over a 458 km surveillance cut (4.47) or a TDWR's
+    /// 417 km long-range reflectivity (4.91) — and drops to 2.24 only where the
+    /// caller's ceiling stopped the side from following the extent.
     px_per_km: f64,
     /// The half-width this raster covers, km — [`types::plan_view_extent_km`]
     /// of the sweep's own reach.
@@ -36,20 +37,33 @@ struct MercatorProjection {
     /// two arguments is how a loop comes to clip against one extent while
     /// painting at another.
     extent_km: f64,
+    /// The image's side, pixels — [`types::raster_side_px`]'s answer for this
+    /// extent and this caller's ceiling.
+    ///
+    /// Here beside the scale for the same reason the extent is: the gate loop's
+    /// bounds check and its row stride are both this number, and a projection
+    /// scaled for one side while indexed at another writes the picture on a
+    /// diagonal.
+    side_px: usize,
 }
 
 impl MercatorProjection {
-    fn from_bounds(radar_lat: f64, bounds: &types::ImageBounds, extent_km: f64) -> Self {
+    fn from_bounds(
+        radar_lat: f64,
+        bounds: &types::ImageBounds,
+        extent_km: f64,
+        side_px: usize,
+    ) -> Self {
         let radar_lat_rad = radar_lat.to_radians();
         Self {
             radar_lat_rad,
             cos_radar_lat: radar_lat_rad.cos(),
-            center_px: types::IMAGE_SIZE as f64 / 2.0,
+            center_px: side_px as f64 / 2.0,
             merc_y_top: bounds.mercator_y_max,
-            merc_y_scale: types::IMAGE_SIZE as f64
-                / (bounds.mercator_y_max - bounds.mercator_y_min),
-            px_per_km: types::IMAGE_SIZE as f64 / (2.0 * extent_km),
+            merc_y_scale: side_px as f64 / (bounds.mercator_y_max - bounds.mercator_y_min),
+            px_per_km: side_px as f64 / (2.0 * extent_km),
             extent_km,
+            side_px,
         }
     }
 
@@ -93,11 +107,11 @@ impl MercatorProjection {
                 let py_i = ((self.merc_y_top - dest_merc_y) * self.merc_y_scale) as i32;
 
                 if px_i >= 0
-                    && px_i < types::IMAGE_SIZE as i32
+                    && px_i < self.side_px as i32
                     && py_i >= 0
-                    && py_i < types::IMAGE_SIZE as i32
+                    && py_i < self.side_px as i32
                 {
-                    let pixel_idx = py_i as usize * types::IMAGE_SIZE + px_i as usize;
+                    let pixel_idx = py_i as usize * self.side_px + px_i as usize;
                     bufs.claim(pixel_idx, cell);
                 }
             }
@@ -175,7 +189,7 @@ impl RadialContext {
 /// things:
 ///
 ///   * The render was not reproducible. Over 12 runs of a 720 × 1200 L3 sweep
-///     at `IMAGE_SIZE` 2048 on 32 threads: 12 distinct hashes, ~16 k of 3.3 M
+///     at a 2048 side on 32 threads: 12 distinct hashes, ~16 k of 3.3 M
 ///     painted pixels differing per pair, 53 k in the union. Invisible, in
 ///     fairness — 91% of those differed by ≤ 0.5 dBZ (one data level), none by
 ///     more than 5 dBZ, and no pixel flipped between opaque and transparent.
@@ -206,7 +220,7 @@ impl RadialContext {
 /// is actively misleading here, because `fetch_max` widens the distribution
 /// instead of shifting it, and min-of-N reports the run that got lucky:
 ///
-/// | `IMAGE_SIZE` 2048           |  1 thr | 8 thr | 16 thr | 32 thr |
+/// | 2048 px square              |  1 thr | 8 thr | 16 thr | 32 thr |
 /// |-----------------------------|-------:|------:|-------:|-------:|
 /// | 2 × `AtomicU32`, store      |  395.8 |  73.2 |   51.1 |   42.9 |
 /// | 1 × `AtomicU32`, store      |  394.6 |  67.0 |   45.2 |   37.9 |
@@ -214,8 +228,9 @@ impl RadialContext {
 ///
 /// At 32 threads that is +21% against the old layout, and the spread tells the
 /// story better than the median: 41.7 / 42.9 / 44.0 (min/median/max) before,
-/// 37.0 / 52.1 / 64.7 now. At `IMAGE_SIZE` 1024 single-threaded — the web arm's
-/// operating point — it is a wash: 201.7 / 195.5 / 200.3.
+/// 37.0 / 52.1 / 64.7 now. At a 1024 side single-threaded — the web arm's
+/// operating point when this was measured, and its loop frames' still — it is a
+/// wash: 201.7 / 195.5 / 200.3.
 ///
 /// The middle row is why the cell was collapsed at all, and it is separable
 /// from the keying: a single `AtomicU32` holding just the value bits ends the
@@ -235,7 +250,7 @@ impl RadialContext {
 /// The atomics are *not* load-bearing on wasm32, so cfg-splitting that arm to a
 /// plain buffer looks like a free win. It was measured per component, not
 /// assumed, against a real KTLX 0.5° reflectivity sweep (720 radials × 1832
-/// gates) at `IMAGE_SIZE` 1024, release, rasterizer isolated from WebGL/winit.
+/// gates) at a 1024 side, release, rasterizer isolated from WebGL/winit.
 /// It predates the collapse to one cell, so the store counts are the old
 /// paired ones and it measured relaxed *stores*, not the RMW the fill loop now
 /// runs. Nothing here re-measures that in a browser; what carries over is only
@@ -268,8 +283,10 @@ impl RadialContext {
 struct RenderBuffers {
     /// Borrowed from [`POOLED_CELLS`] for the length of one render and handed
     /// back by [`Self::into_output`], because on native this single allocation
-    /// is one glibc can never recycle. Always `IMAGE_SIZE²` cells; never
-    /// resized.
+    /// is one glibc can never recycle. Exactly `side_px²` cells for the
+    /// [`types::raster_side_px`] this render was given, fixed for the whole of
+    /// it: [`Self::checkout`] resizes a carried buffer to that length on the way
+    /// in and nothing resizes it again.
     cells: Vec<AtomicU64>,
     /// Only `into_output` needs it, but it has to be the product the gates were
     /// coloured against, so it is captured at construction rather than passed
@@ -360,26 +377,33 @@ struct RenderBuffers {
 ///
 /// # Residency
 ///
-/// **A permanently-held 32 MiB on native — desktop and mobile alike, since
-/// [`types::IMAGE_SIZE`] splits on wasm32 and nothing else — and 8 MiB per
-/// module instance on wasm32, from the first plan-view render onwards.** Never
+/// **One buffer of the largest raster this process has rendered, held from its
+/// first plan-view render onwards.** That is 32 MiB at the base side — the
+/// `IMAGE_SIZE²` figure above, desktop, mobile and wasm32 alike — and 128 MiB
+/// once a long-range cut has been rendered against a 4096 ceiling, which on a
+/// desktop showing a surveillance sweep is the ordinary case and not a corner.
+/// It is a *high-water* mark rather than a constant because
+/// [`RenderBuffers::checkout`] resizes the one buffer instead of reallocating
+/// it, so the figure does not come back down when a base-size raster follows a
+/// long-range one; that is the price of the alternation costing nothing. Never
 /// given back: a session that has rendered once is exactly the one about to
 /// render again, and the whole point is that the pages are bought once. On
 /// wasm32 the main thread and the rasterization worker are separate instances
 /// with separate linear memories, so a build where both rasterize holds the
-/// figure twice.
+/// figure twice — at the base side both times, since the web's ceiling is 2048.
 ///
 /// **What grows is idle residency, not peak.** This buffer was live for the
 /// whole of every render before this change too; all that is different is that
 /// it stays live between them. A process's high-water mark is unchanged, and
-/// the honest cost is that a session sitting on a rendered pane now holds
-/// 32 MiB it used to have handed back.
+/// the honest cost is that a session sitting on a rendered pane now holds the
+/// buffer it used to have handed back.
 ///
-/// wasm32 is under the cliff and has nothing to win here: 8 MiB is a size
-/// dlmalloc recycles, and the browser's linear memory never gives pages back to
-/// the system anyway, so the buffer was already being reused in all but name.
-/// It carries the buffer regardless, because a `cfg`-gated behavioural split is
-/// a second renderer that no row of this workspace's gate runs the tests of.
+/// wasm32 has nothing to win here, and the cliff measured above is not the
+/// reason: glibc's `mmap` threshold has no counterpart in a linear memory that
+/// never shrinks, where dlmalloc recycles a freed block of this size as readily
+/// as any other and there are no fresh zero pages to fault. It carries the
+/// buffer regardless, because a `cfg`-gated behavioural split is a second
+/// renderer that no row of this workspace's gate runs the tests of.
 ///
 /// One buffer, not a free list, and that is a deliberate ceiling. Renders can
 /// overlap — `MAX_CONCURRENT_RENDERS` permits six on desktop — and a second
@@ -390,32 +414,60 @@ struct RenderBuffers {
 /// a burst still allocate in parallel rather than queueing. What is bought is
 /// the sequential case, which is every case the win was measured in: a pane
 /// refreshing, a product switching, a loop advancing a frame at a time. A free
-/// list would instead make a six-wide burst's peak permanent — 192 MiB — to
-/// speed up renders that were already holding those six buffers live at once.
+/// list would instead make a six-wide burst's peak permanent — 192 MiB of base
+/// rasters, four times that if they were long-range — to speed up renders that
+/// were already holding those six buffers live at once.
 static POOLED_CELLS: std::sync::Mutex<Option<Vec<AtomicU64>>> = std::sync::Mutex::new(None);
 
 impl RenderBuffers {
-    fn new(product: types::RadarProduct) -> Self {
+    /// `side_px` is the only statement of the buffer's shape, and
+    /// [`RenderBuffers::into_output`] reads the lengths back off `cells` rather
+    /// than being told them again — so nothing downstream can be handed a
+    /// picture whose dimensions disagree with its bytes.
+    fn new(product: types::RadarProduct, side_px: usize) -> Self {
         Self {
-            cells: Self::checkout(),
+            cells: Self::checkout(side_px * side_px),
             product,
         }
     }
 
-    /// Take the pooled buffer, or build one if this is the first render or a
-    /// second render is already holding it. See [`POOLED_CELLS`].
+    /// Take the pooled buffer resized to `n` cells, or build one if this is the
+    /// first render or a second render is already holding it. See
+    /// [`POOLED_CELLS`].
     ///
-    /// The pool's invariant is that what it holds is exactly `IMAGE_SIZE²`
-    /// cells and every one of them is [`Self::EMPTY`]. [`Self::into_output`] is
-    /// the only path that puts a buffer back and it establishes both, so this
-    /// hands out something indistinguishable from a fresh allocation. The
-    /// length half cannot vary at all — `IMAGE_SIZE` is a compile-time constant
-    /// — which is why there is no grow-only arm here, unlike the caller's buffer
-    /// in `rustdar_frontend::volume_raymarch::coverage_premultiplied_into`,
-    /// whose grid shape does vary. The *content* half is the one that can rot,
-    /// and `tests/render_cell_pool.rs` is what pins it.
-    fn checkout() -> Vec<AtomicU64> {
-        let n = types::IMAGE_SIZE * types::IMAGE_SIZE;
+    /// The pool's invariant is that every cell it holds is [`Self::EMPTY`].
+    /// [`Self::into_output`] is the only path that puts a buffer back and it
+    /// establishes that, so this hands out something indistinguishable from a
+    /// fresh allocation. `tests/render_cell_pool.rs` is what pins it.
+    ///
+    /// # Why the length is made to match rather than asserted
+    ///
+    /// The pool holds one *block*, not one shape. A raster's side is
+    /// [`types::raster_side_px`]'s answer and it genuinely varies — 2048 at the
+    /// floor, the caller's ceiling past it (4096 on a device that can take it),
+    /// 1024 for a browser loop frame — so a buffer coming back out of the slot
+    /// is only sometimes the length the render asking for it needs, and a
+    /// `debug_assert` on that length would be a claim that is simply false.
+    /// Nor can the mismatch be answered by declining the buffer: the long-range
+    /// raster is the *most* expensive one to allocate and reflectivity's
+    /// surveillance cut reaches past the floor routinely, so the shape that
+    /// would go unpooled is the one with the most to win.
+    ///
+    /// So this grows and shrinks the one buffer instead — the same grow-only
+    /// arm as the caller's buffer in
+    /// `rustdar_frontend::volume_raymarch::coverage_premultiplied_into`, which
+    /// has always varied its grid shape this way. `resize_with` truncating is a
+    /// length store that keeps the capacity, and `resize_with` extending fills
+    /// from that capacity when it is already there, so a workload alternating
+    /// between two sides re-faults nothing once the larger of them has been
+    /// rendered once: what alternates is the length, not the allocation. It
+    /// also means the length cannot disagree with what the render asked for,
+    /// because it is *made* equal here rather than checked — a `debug_assert`
+    /// would leave a release build to index off the end of a short buffer.
+    ///
+    /// The cost is that residency follows the high-water mark rather than a
+    /// constant; [`POOLED_CELLS`] states the figure.
+    fn checkout(n: usize) -> Vec<AtomicU64> {
         // Bound to a `let`, and deliberately **not** written as the `match`
         // scrutinee. A guard produced in a scrutinee lives to the end of the
         // match, so `match Self::pool().take()` would hold the pool lock across
@@ -428,8 +480,8 @@ impl RenderBuffers {
         // only thing keeping the lock off the allocation.
         let pooled = Self::pool().take();
         match pooled {
-            Some(cells) => {
-                debug_assert_eq!(cells.len(), n, "the pool holds one shape");
+            Some(mut cells) => {
+                cells.resize_with(n, || AtomicU64::new(Self::EMPTY));
                 cells
             }
             None => (0..n).map(|_| AtomicU64::new(Self::EMPTY)).collect(),
@@ -449,9 +501,10 @@ impl RenderBuffers {
     ///
     /// **What the lock covers is one `Option::take` in [`Self::checkout`] and
     /// one `is_none` plus a move-assign in [`Self::recycle`], and nothing
-    /// else.** In particular the 32 MiB fallback allocation, the length
-    /// `debug_assert`, the whole rasterization and the drain are all outside
-    /// it, and so is the drop of a buffer `recycle` declines to keep — the
+    /// else.** In particular the 32 MiB fallback allocation, the resize that
+    /// fits a carried buffer to the raster asking for it, the whole
+    /// rasterization and the drain are all outside it, and so is the drop of a
+    /// buffer `recycle` declines to keep — the
     /// guard goes out of scope before the argument does. That is what makes it
     /// a lock renders never contend on for any measurable time; it is also why
     /// nothing under it can panic, which makes poisoning unreachable.
@@ -847,24 +900,32 @@ fn compute_max_range(radials: &[Radial], product: types::RadarProduct) -> f64 {
 /// which pixel a hover lands in. Where the data actually stopped is a property
 /// of the sweep, answered by [`compute_max_range`], and a cross-section is
 /// where this display reports it (`SectionAxes::coverage_ground_range_km`).
+///
+/// `side_ceiling_px` is the largest side the caller will accept; the extent and
+/// that ceiling together give the raster's own side through
+/// [`types::raster_side_px`], which is the second half of the geometry and the
+/// only half this crate cannot decide alone.
 fn render_with_projection(
     radar_lat: f64,
     radar_lon: f64,
     actual_max_range: f64,
     product: types::RadarProduct,
+    side_ceiling_px: usize,
     label: &str,
     fill: impl FnOnce(&MercatorProjection, &RenderBuffers),
 ) -> (Vec<u8>, f64, Vec<f32>) {
     let extent_km = types::plan_view_extent_km(actual_max_range);
+    let side_px = types::raster_side_px(extent_km, side_ceiling_px);
     let bounds = types::ImageBounds::from_radar_site(radar_lat, radar_lon, extent_km);
-    let proj = MercatorProjection::from_bounds(radar_lat, &bounds, extent_km);
-    let bufs = RenderBuffers::new(product);
+    let proj = MercatorProjection::from_bounds(radar_lat, &bounds, extent_km, side_px);
+    let bufs = RenderBuffers::new(product, side_px);
 
     fill(&proj, &bufs);
 
     let (image, extent_km, value_data) = bufs.into_output(extent_km);
     log::info!(
-        "{} rendering complete: data reaches {:.1}km, projected at ±{:.1}km ({:.2} px/km)",
+        "{} rendering complete: data reaches {:.1}km, projected at ±{:.1}km \
+         onto {side_px}² px ({:.2} px/km)",
         label,
         actual_max_range,
         extent_km,
@@ -874,6 +935,16 @@ fn render_with_projection(
 }
 
 // ── Public rendering functions ───────────────────────────────────────────────
+
+//
+// Four of these come in pairs: a `_sized` entry taking the caller's side
+// ceiling, and the plain name over it passing [`types::IMAGE_SIZE`]. The plain
+// name is not a legacy shim — it is the honest answer for every caller that
+// does not own a GPU and so has nothing to say about texture limits, which is
+// every test in this workspace and every consumer outside the frontend. What
+// the pairing buys is that "the base size" is spelt once, in one place, so a
+// caller who wanted the floor's behaviour cannot get anything else.
+//
 
 /// Render radar data to an image projected for geographic display. Returns
 /// `(RGBA pixels, max_range_km, per-pixel values)`; a value is `f32::NAN` where
@@ -908,7 +979,18 @@ pub fn render_radar_to_image(
 /// rasterizer rather than two that could disagree about a pixel; see
 /// [`crate::render_input`] for why the reconstruction is exact.
 pub fn render_from(input: &crate::render_input::RenderInput) -> Option<(Vec<u8>, f64, Vec<f32>)> {
-    render_radar_to_image_full(
+    render_from_sized(input, types::IMAGE_SIZE)
+}
+
+/// [`render_from`] at a caller-chosen side ceiling — the entry the offload
+/// job's `execute` takes, because it is the one place that knows both whether
+/// this is a static render or a loop frame and what this device's textures can
+/// be.
+pub fn render_from_sized(
+    input: &crate::render_input::RenderInput,
+    side_ceiling_px: usize,
+) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+    render_radar_to_image_full_sized(
         &input.to_scan(),
         input.elevation(),
         input.product(),
@@ -916,6 +998,7 @@ pub fn render_from(input: &crate::render_input::RenderInput) -> Option<(Vec<u8>,
         input.radar_lon(),
         input.storm_motion_override(),
         input.env_heights_km_msl(),
+        side_ceiling_px,
     )
 }
 
@@ -945,29 +1028,74 @@ pub fn render_radar_to_image_full(
     storm_motion_override: Option<(f32, f32)>,
     env_heights_km_msl: Option<(f64, f64)>,
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+    render_radar_to_image_full_sized(
+        data,
+        elevation_angle,
+        product,
+        radar_lat,
+        radar_lon,
+        storm_motion_override,
+        env_heights_km_msl,
+        types::IMAGE_SIZE,
+    )
+}
+
+/// [`render_radar_to_image_full`] at a caller-chosen side ceiling. See
+/// [`types::raster_side_px`] for what a ceiling is and why the caller owns it.
+#[allow(clippy::too_many_arguments)]
+pub fn render_radar_to_image_full_sized(
+    data: &Scan,
+    elevation_angle: f32,
+    product: types::RadarProduct,
+    radar_lat: f64,
+    radar_lon: f64,
+    storm_motion_override: Option<(f32, f32)>,
+    env_heights_km_msl: Option<(f64, f64)>,
+    side_ceiling_px: usize,
+) -> Option<(Vec<u8>, f64, Vec<f32>)> {
     if product == types::RadarProduct::EchoTopsInterpolated {
-        return render_echo_tops_interp_to_image(data, radar_lat, radar_lon);
+        return render_echo_tops_interp_to_image(data, radar_lat, radar_lon, side_ceiling_px);
     }
 
     if matches!(
         product,
         types::RadarProduct::ProbabilityOfSevereHail | types::RadarProduct::MaxExpectedHailSize
     ) {
-        return render_hail_to_image(data, product, radar_lat, radar_lon, env_heights_km_msl);
+        return render_hail_to_image(
+            data,
+            product,
+            radar_lat,
+            radar_lon,
+            env_heights_km_msl,
+            side_ceiling_px,
+        );
     }
 
     if product == types::RadarProduct::HydrometeorClassification {
-        return render_hhc_to_image(data, radar_lat, radar_lon, env_heights_km_msl);
+        return render_hhc_to_image(
+            data,
+            radar_lat,
+            radar_lon,
+            env_heights_km_msl,
+            side_ceiling_px,
+        );
     }
 
     let radials = find_sweep(data, product, elevation_angle)?;
 
     if product == types::RadarProduct::NormalizedRotation {
-        return render_nrot_to_image(data, radials, radar_lat, radar_lon);
+        return render_nrot_to_image(data, radials, radar_lat, radar_lon, side_ceiling_px);
     }
 
     if product == types::RadarProduct::StormRelativeVelocity {
-        return render_srv_to_image(data, radials, radar_lat, radar_lon, storm_motion_override);
+        return render_srv_to_image(
+            data,
+            radials,
+            radar_lat,
+            radar_lon,
+            storm_motion_override,
+            side_ceiling_px,
+        );
     }
 
     // The stand-in for an unmeasurable sweep is 1.0° because that is the
@@ -984,6 +1112,7 @@ pub fn render_radar_to_image_full(
         radar_lon,
         actual_max_range,
         product,
+        side_ceiling_px,
         "Radar",
         |proj, bufs| {
             radials
@@ -1049,6 +1178,7 @@ fn render_nrot_to_image(
     radials: &[Radial],
     radar_lat: f64,
     radar_lon: f64,
+    side_ceiling_px: usize,
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
     let num_radials = radials.len();
     if num_radials < 3 {
@@ -1082,6 +1212,7 @@ fn render_nrot_to_image(
         radar_lon,
         actual_max_range,
         types::RadarProduct::NormalizedRotation,
+        side_ceiling_px,
         "NROT",
         |proj, bufs| {
             nrot_grid.par_iter().enumerate().for_each(|(i, nrot_row)| {
@@ -1141,6 +1272,7 @@ fn render_srv_to_image(
     radar_lat: f64,
     radar_lon: f64,
     storm_motion_override: Option<(f32, f32)>,
+    side_ceiling_px: usize,
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
     if radials.len() < 3 {
         return None;
@@ -1170,6 +1302,7 @@ fn render_srv_to_image(
         radar_lon,
         actual_max_range,
         types::RadarProduct::StormRelativeVelocity,
+        side_ceiling_px,
         "SRV",
         |proj, bufs| {
             grid.values.par_iter().enumerate().for_each(|(i, row)| {
@@ -1279,6 +1412,7 @@ pub fn render_echo_tops_interp_to_image(
     scan: &Scan,
     radar_lat: f64,
     radar_lon: f64,
+    side_ceiling_px: usize,
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
     let grid = crate::volumetric::compute_echo_tops(scan);
     let max_range = grid.range_bins as f64;
@@ -1287,6 +1421,7 @@ pub fn render_echo_tops_interp_to_image(
         radar_lon,
         max_range,
         types::RadarProduct::EchoTopsInterpolated,
+        side_ceiling_px,
         "Radar",
         |proj, bufs| {
             grid.values.par_iter().enumerate().for_each(|(az, row)| {
@@ -1327,6 +1462,23 @@ pub fn render_derived_vild_to_image(
     radar_lat: f64,
     radar_lon: f64,
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+    render_derived_vild_to_image_sized(dvl, eet, radar_lat, radar_lon, types::IMAGE_SIZE)
+}
+
+/// [`render_derived_vild_to_image`] at a caller-chosen side ceiling.
+///
+/// The derivation is a 360 × 1 km grid, so its extent never leaves the floor
+/// and the ceiling never changes what this draws. It takes one anyway, because
+/// `execute` dispatches every render-producing job through one shape and an
+/// arm that quietly ignored the size would be the one place a future
+/// longer-reaching Level III product got drawn at the wrong scale.
+pub fn render_derived_vild_to_image_sized(
+    dvl: &nexrad_level3::model::Level3Message,
+    eet: &nexrad_level3::model::Level3Message,
+    radar_lat: f64,
+    radar_lon: f64,
+    side_ceiling_px: usize,
+) -> Option<(Vec<u8>, f64, Vec<f32>)> {
     let grid = match crate::vild::compute_vild(dvl, eet) {
         Ok(grid) => grid,
         Err(refusal) => {
@@ -1340,6 +1492,7 @@ pub fn render_derived_vild_to_image(
         radar_lon,
         max_range,
         types::RadarProduct::VilDensity,
+        side_ceiling_px,
         "Radar",
         |proj, bufs| {
             grid.values.par_iter().enumerate().for_each(|(az, row)| {
@@ -1409,6 +1562,7 @@ pub fn render_hail_to_image(
     radar_lat: f64,
     radar_lon: f64,
     env_heights_km_msl: Option<(f64, f64)>,
+    side_ceiling_px: usize,
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
     let Some((h0c_km_msl, hm20c_km_msl)) = env_heights_km_msl else {
         log::info!("{product:?}: no environmental heights — nothing to render");
@@ -1432,6 +1586,7 @@ pub fn render_hail_to_image(
         radar_lon,
         max_range,
         product,
+        side_ceiling_px,
         "Radar",
         |proj, bufs| {
             grid.values.par_iter().enumerate().for_each(|(az, row)| {
@@ -1472,6 +1627,7 @@ pub fn render_hhc_to_image(
     radar_lat: f64,
     radar_lon: f64,
     env_heights_km_msl: Option<(f64, f64)>,
+    side_ceiling_px: usize,
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
     let radar_km_msl = render_site_height_ft(radar_lat, radar_lon) * 0.0003048;
     let params = crate::kdp::KdpParams {
@@ -1523,6 +1679,7 @@ pub fn render_hhc_to_image(
         radar_lon,
         max_range,
         types::RadarProduct::HydrometeorClassification,
+        side_ceiling_px,
         "Radar",
         |proj, bufs| {
             grid.values.par_iter().enumerate().for_each(|(az, row)| {
@@ -1561,6 +1718,7 @@ pub fn render_derived_kdp_to_image(
     radar_lat: f64,
     radar_lon: f64,
     params: &crate::kdp::KdpParams,
+    side_ceiling_px: usize,
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
     let radials = find_sweep(
         scan,
@@ -1581,6 +1739,7 @@ pub fn render_derived_kdp_to_image(
         radar_lon,
         actual_max_range,
         types::RadarProduct::SpecificDifferentialPhase,
+        side_ceiling_px,
         "KDP",
         |proj, bufs| {
             derived.values.par_iter().enumerate().for_each(|(i, row)| {
@@ -1608,6 +1767,7 @@ pub fn render_derived_kdp_to_image(
 /// For digital products `physical = (gate_byte - offset) / scale`. A `lut`
 /// overrides that and indexes on the gate value directly, covering legacy 4-bit
 /// products (16 entries) and VIL (256 entries).
+#[allow(clippy::too_many_arguments)]
 pub fn render_level3_radial_to_image(
     radial_packet: &nexrad_level3::model::RadialPacket,
     product: types::RadarProduct,
@@ -1616,6 +1776,7 @@ pub fn render_level3_radial_to_image(
     scale: f32,
     offset: f32,
     lut: Option<&[f32]>,
+    side_ceiling_px: usize,
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
     render_level3_radial_with_gate_km(
         radial_packet,
@@ -1626,6 +1787,7 @@ pub fn render_level3_radial_to_image(
         scale,
         offset,
         lut,
+        side_ceiling_px,
     )
 }
 
@@ -1645,6 +1807,7 @@ fn render_level3_radial_with_gate_km(
     scale: f32,
     offset: f32,
     lut: Option<&[f32]>,
+    side_ceiling_px: usize,
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
     if radial_packet.radials.is_empty() {
         return None;
@@ -1661,6 +1824,7 @@ fn render_level3_radial_with_gate_km(
         radar_lon,
         actual_max_range,
         product,
+        side_ceiling_px,
         "Level III",
         |proj, bufs| {
             radials
@@ -1713,6 +1877,7 @@ pub fn render_derived_srm_to_image(
     derived: &crate::srm::DerivedSrm,
     radar_lat: f64,
     radar_lon: f64,
+    side_ceiling_px: usize,
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
     render_level3_radial_to_image(
         &derived.packet,
@@ -1722,6 +1887,7 @@ pub fn render_derived_srm_to_image(
         derived.scale,
         derived.offset,
         None,
+        side_ceiling_px,
     )
 }
 
@@ -1733,6 +1899,23 @@ pub fn render_level3_message_to_image(
     product: types::RadarProduct,
     radar_lat: f64,
     radar_lon: f64,
+) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+    render_level3_message_to_image_sized(l3_msg, product, radar_lat, radar_lon, types::IMAGE_SIZE)
+}
+
+/// [`render_level3_message_to_image`] at a caller-chosen side ceiling.
+///
+/// Every Level III product this display fetches stops well inside the floor —
+/// the longest is a 460 km-diameter composite — so like the VIL density pair
+/// this reaches the base size whatever ceiling it is handed. The parameter is
+/// here so that the job that carries it does not have to know which of its
+/// render arms cares.
+pub fn render_level3_message_to_image_sized(
+    l3_msg: &nexrad_level3::model::Level3Message,
+    product: types::RadarProduct,
+    radar_lat: f64,
+    radar_lon: f64,
+    side_ceiling_px: usize,
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
     use nexrad_level3::model::DataPacket;
 
@@ -1807,6 +1990,7 @@ pub fn render_level3_message_to_image(
         scale,
         offset,
         lut,
+        side_ceiling_px,
     )
 }
 

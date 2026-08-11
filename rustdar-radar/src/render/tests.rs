@@ -61,7 +61,8 @@ fn packet(silence: Option<usize>) -> RadialPacket {
 
 fn render(p: &RadialPacket) -> (Vec<u8>, Vec<f32>) {
     let (image, _, values) =
-        render_level3_radial_to_image(p, PRODUCT, LAT, LON, SCALE, OFFSET, None).unwrap();
+        render_level3_radial_to_image(p, PRODUCT, LAT, LON, SCALE, OFFSET, None, types::IMAGE_SIZE)
+            .unwrap();
     (image, values)
 }
 
@@ -348,27 +349,28 @@ fn render_l2(gates: &[u8], product: types::RadarProduct) -> (Vec<u8>, Vec<f32>) 
 /// somewhere and the difference between "unpainted" and "off by one" is the
 /// whole point of these tests.
 ///
-/// The extent is an argument because it is now a property of the render being
-/// probed rather than of the display: a fixture reaching 150 km is drawn on
-/// the 230 km floor and a TDWR-shaped one on a 417 km frame, and a probe that
-/// assumed either would be asking about the wrong picture. Callers pass what
-/// the render they are probing handed back.
-fn probe_at(extent_km: f64, az_deg: f64, range_km: f64) -> usize {
+/// The extent and the side are both arguments because both are now properties
+/// of the render being probed rather than of the display: a fixture reaching
+/// 150 km is drawn on the 230 km floor at [`types::IMAGE_SIZE`], a TDWR-shaped
+/// one on a 417 km frame, and the same TDWR through a `_sized` entry on a
+/// 4096-pixel one. A probe that assumed any of those would be asking about the
+/// wrong picture. Callers pass what the render they are probing handed back.
+fn probe_at(extent_km: f64, side_px: usize, az_deg: f64, range_km: f64) -> usize {
     let bounds = types::ImageBounds::from_radar_site(LAT, LON, extent_km);
-    let proj = MercatorProjection::from_bounds(LAT, &bounds, extent_km);
+    let proj = MercatorProjection::from_bounds(LAT, &bounds, extent_km, side_px);
     let (sin_az, cos_az) = az_deg.to_radians().sin_cos();
     let dest_lat_rad = proj.radar_lat_rad + (range_km * cos_az) / types::EARTH_RADIUS_KM;
     let cos_correction = proj.cos_radar_lat / dest_lat_rad.cos();
     let px = (proj.center_px + range_km * sin_az * cos_correction * proj.px_per_km) as usize;
     let py = ((proj.merc_y_top - types::lat_rad_to_mercator_y(dest_lat_rad)) * proj.merc_y_scale)
         as usize;
-    py * types::IMAGE_SIZE + px
+    py * side_px + px
 }
 
 /// [`probe_at`] on the floor, which is where every fixture in this file that
 /// does not say otherwise is drawn — their moments reach 150 km.
 fn probe(az_deg: f64, range_km: f64) -> usize {
-    probe_at(types::BASE_EXTENT_KM, az_deg, range_km)
+    probe_at(types::BASE_EXTENT_KM, types::IMAGE_SIZE, az_deg, range_km)
 }
 
 /// Assert what the sweep painted at a list of `(azimuth, range)` probes.
@@ -833,7 +835,10 @@ fn tdwr_long_range_sweep(beacon_km: f64) -> Scan {
 /// so it answers in the same kilometres the gates were indexed by.
 fn painted_ranges_km(values: &[f32], extent_km: f64) -> Vec<f64> {
     let bounds = types::ImageBounds::from_radar_site(LAT, LON, extent_km);
-    let side = types::IMAGE_SIZE;
+    // Off the grid's own length, so this reads a 4096-pixel render as readily
+    // as a base one and cannot be pointed at the wrong picture.
+    let side = values.len().isqrt();
+    assert_eq!(side * side, values.len(), "a value grid must be square");
     let merc_span = bounds.mercator_y_max - bounds.mercator_y_min;
     (0..side)
         .flat_map(|row| (0..side).map(move |col| (row, col)))
@@ -871,7 +876,7 @@ fn a_tdwr_long_range_sweep_is_projected_at_its_own_reach() {
     // the floor's frame: a probe there would be asking about a picture 1.81×
     // smaller, and 400 km east of the site is not on it at all.
     for az in [0.0, 90.0, 180.0, 270.0] {
-        let at = probe_at(extent_km, az, BEACON_KM);
+        let at = probe_at(extent_km, types::IMAGE_SIZE, az, BEACON_KM);
         assert!(
             !values[at].is_nan(),
             "the beacon 400 km out at {az}° is unpainted at the pixel this \
@@ -1571,10 +1576,12 @@ fn the_hybrid_classification_changes_with_the_environmental_heights() {
     /// Rain: what the default melting layer puts the beam below.
     const RA: f32 = 60.0;
 
+    // The fixture reaches 100 km, well inside the floor, so both renders take
+    // the base raster and neither is asking anything of the size cascade.
     let scan = scan_of(vec![dual_pol_tilt(1, 0.5)]);
-    let defaults =
-        super::render_hhc_to_image(&scan, LAT, LON, None).expect("the fixture classifies");
-    let sounding = super::render_hhc_to_image(&scan, LAT, LON, Some((0.8, 2.0)))
+    let defaults = super::render_hhc_to_image(&scan, LAT, LON, None, types::IMAGE_SIZE)
+        .expect("the fixture classifies");
+    let sounding = super::render_hhc_to_image(&scan, LAT, LON, Some((0.8, 2.0)), types::IMAGE_SIZE)
         .expect("the fixture classifies");
 
     let painted = |grid: &[f32]| grid.iter().filter(|v| !v.is_nan()).count();
@@ -1606,5 +1613,221 @@ fn the_hybrid_classification_changes_with_the_environmental_heights() {
     assert_ne!(
         defaults.0, sounding.0,
         "and the rasterized pixels differ too, which is what a pane shows",
+    );
+}
+
+// ── The adaptive raster size ─────────────────────────────────────────────────
+
+/// The side a static desktop or mobile pane offers, and the only 4096 in this
+/// file. Named rather than repeated so the rows below cannot drift apart.
+const LONG_RANGE_SIDE: usize = 4096;
+
+/// A sweep stopping inside the floor is drawn **byte for byte** the same way
+/// whether or not a long-range raster was on offer.
+///
+/// This is the guarantee the whole size cascade rests on. Nearly every render
+/// this display makes stops inside 230 km — every Doppler cut, every derived
+/// 1° × 1 km grid, every Level III product fetched here — and a change to the
+/// raster's size that moved any of them would move the entire fleet of
+/// pictures that were correct yesterday. Bit-identical rather than
+/// approximately equal, because "close" is not the claim: the claim is that
+/// nothing already on screen changed at all.
+///
+/// Both buffers are compared, not just the image: a value grid that shifted
+/// while the colours did not would be a hover reading the wrong gate, which no
+/// visual check would ever show.
+#[test]
+fn a_render_inside_the_floor_ignores_the_long_range_ceiling_entirely() {
+    let azimuths: Vec<f32> = (0..360).map(|i| i as f32).collect();
+    let scan = l2_sweep(&[200; 360], &azimuths, 1.0, false);
+
+    let base = render_radar_to_image_full(&scan, L2_ELEVATION, PRODUCT, LAT, LON, None, None)
+        .expect("the fixture renders");
+    let offered = render_radar_to_image_full_sized(
+        &scan,
+        L2_ELEVATION,
+        PRODUCT,
+        LAT,
+        LON,
+        None,
+        None,
+        LONG_RANGE_SIDE,
+    )
+    .expect("the fixture renders at the long-range ceiling too");
+
+    assert_eq!(
+        base.1, offered.1,
+        "a 150 km sweep must project at the floor under either ceiling",
+    );
+    assert_eq!(
+        base.0.len(),
+        types::IMAGE_SIZE * types::IMAGE_SIZE * 4,
+        "the floor's raster is the base size",
+    );
+    assert_eq!(base.0, offered.0, "the image moved under an unused ceiling");
+    // `NaN` is most of a value grid, and `NaN != NaN`, so the bits are what is
+    // compared — a grid full of quiet NaNs would otherwise never be equal to
+    // itself and this assertion would be vacuous.
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(
+        bits(&base.2),
+        bits(&offered.2),
+        "the value grid moved under an unused ceiling",
+    );
+}
+
+/// A TDWR's long-range cut takes the long-range raster, and a return 400 km
+/// out lands within a pixel of where the render's own projection puts it.
+///
+/// The size and the extent are separate decisions and this is where they meet:
+/// 1390 gates of 300 m reach 417 km, so the picture covers 1.81× the ground
+/// the floor does — and on 4096 px rather than 2048 it covers it at very
+/// nearly the same resolution, which is the whole point of the second number.
+#[test]
+fn a_tdwr_long_range_sweep_takes_the_long_range_raster() {
+    const BEACON_KM: f64 = 400.2; // gate 1334's centre
+    let scan = tdwr_long_range_sweep(BEACON_KM);
+    let (image, extent_km, values) = render_radar_to_image_full_sized(
+        &scan,
+        L2_ELEVATION,
+        PRODUCT,
+        LAT,
+        LON,
+        None,
+        None,
+        LONG_RANGE_SIDE,
+    )
+    .expect("the fixture renders");
+
+    assert_eq!(
+        image.len(),
+        LONG_RANGE_SIDE * LONG_RANGE_SIDE * 4,
+        "a 417 km sweep under a {LONG_RANGE_SIDE} px ceiling must take it",
+    );
+    assert_eq!(values.len(), LONG_RANGE_SIDE * LONG_RANGE_SIDE);
+    assert!(
+        (extent_km - 417.0).abs() < 1e-9,
+        "the extent is the sweep's own reach, not the raster's size: {extent_km}",
+    );
+
+    for az in [0.0, 90.0, 180.0, 270.0] {
+        let at = probe_at(extent_km, LONG_RANGE_SIDE, az, BEACON_KM);
+        assert!(
+            !values[at].is_nan(),
+            "the beacon 400 km out at {az}° is unpainted at the pixel this \
+             render's own projection puts it in",
+        );
+    }
+}
+
+/// What the second number buys, measured: a long-range raster is never
+/// meaningfully coarser than the floor, where a base-size one would be less
+/// than half as fine.
+///
+/// The floor is 2048 px over 460 km — 4.4522 px/km, or 1.11 pixels across a
+/// 250 m gate — and that figure is what every visual judgement this display
+/// has ever been checked against was made at. Stretching the *base* raster
+/// over a 458 km surveillance cut gives 2.2358 px/km, 0.56 pixels a gate, so
+/// gates start sharing pixels rather than owning them; 4096 px gives 4.4716
+/// and 1.12, which is the floor's own scale to within half a percent.
+///
+/// The ratio is not flat, and pretending it were would be the wrong claim: the
+/// side steps once at the floor while the extent is continuous, so a 298 km
+/// Doppler cut comes out **finer** than the floor at 6.87 px/km. Finer is
+/// free — the raster costs the same pixels wherever they land — and what
+/// matters is only that it is never much coarser.
+///
+/// | reach | side | px/km  | vs floor | base raster would be |
+/// |-------|-----:|-------:|---------:|---------------------:|
+/// | 298   | 4096 | 6.8725 |  +54.4 % |               3.4362 |
+/// | 417   | 4096 | 4.9113 |  +10.3 % |               2.4556 |
+/// | 458   | 4096 | 4.4716 |   +0.4 % |               2.2358 |
+/// | 470   | 4096 | 4.3574 |   −2.1 % |               2.1787 |
+///
+/// The last row is [`types::MAX_EXTENT_KM`], which is a guard on arithmetic
+/// rather than a reach any radar has — the widest real sweep is the 458 km
+/// row — so it is the one place the picture is (slightly) coarser than the
+/// floor, and it is stated rather than excluded.
+#[test]
+fn the_long_range_raster_keeps_the_floors_km_per_pixel() {
+    let floor = types::IMAGE_SIZE as f64 / (2.0 * types::BASE_EXTENT_KM);
+    for (extent_km, why) in [
+        (298.0, "a WSR-88D Doppler cut at 1192 gates"),
+        (417.0, "a TDWR long-range reflectivity cut"),
+        (458.0, "a WSR-88D surveillance cut"),
+    ] {
+        let side = types::raster_side_px(extent_km, LONG_RANGE_SIDE);
+        let px_per_km = side as f64 / (2.0 * extent_km);
+        assert!(
+            px_per_km >= floor,
+            "{why}: {extent_km} km on {side} px is {px_per_km:.4} px/km, under \
+             the floor's {floor:.4}",
+        );
+        // And that the base raster is what it would have been *without* the
+        // second number, so the comparison above is against a real
+        // alternative rather than a straw one.
+        let unadapted = types::IMAGE_SIZE as f64 / (2.0 * extent_km);
+        assert!(
+            unadapted < floor,
+            "{why}: the base raster would be {unadapted:.4} px/km, which is \
+             not coarser than the floor's {floor:.4} — this row is measuring \
+             nothing",
+        );
+    }
+
+    // The widest real sweep, in the unit that decides whether a gate is drawn
+    // or shared: pixels across one 250 m super-resolution gate. The base
+    // raster gives it half a pixel; the long-range one gives it its own.
+    const SURVEILLANCE_KM: f64 = 458.0;
+    const GATE_KM: f64 = 0.25;
+    let px_per_gate = |side: usize| side as f64 / (2.0 * SURVEILLANCE_KM) * GATE_KM;
+    assert!(
+        px_per_gate(types::IMAGE_SIZE) < 0.6,
+        "a 250 m gate on the base raster is {:.3} px across",
+        px_per_gate(types::IMAGE_SIZE),
+    );
+    assert!(
+        px_per_gate(LONG_RANGE_SIDE) > 1.0,
+        "a 250 m gate on the long-range raster is {:.3} px across",
+        px_per_gate(LONG_RANGE_SIDE),
+    );
+
+    // The cap: the one extent where the long-range raster *is* coarser, by the
+    // 2.1% the table names and no more.
+    let at_cap = types::raster_side_px(types::MAX_EXTENT_KM, LONG_RANGE_SIDE) as f64
+        / (2.0 * types::MAX_EXTENT_KM);
+    assert!(
+        (at_cap / floor - 0.9787).abs() < 1e-3,
+        "at the {} km cap the raster is {at_cap:.4} px/km, {:.4} of the \
+         floor — the table above says 0.9787",
+        types::MAX_EXTENT_KM,
+        at_cap / floor,
+    );
+}
+
+/// A ceiling *under* the base size is honoured, which is how the browser's
+/// loop frames stay the size its texture budget was written for.
+///
+/// The same sweep at the same extent, drawn onto a quarter of the pixels: the
+/// picture is coarser and the geometry is not, so the extent it declares is
+/// the extent it would have declared at any size.
+#[test]
+fn a_ceiling_under_the_base_size_renders_a_leaner_picture_of_the_same_ground() {
+    const LEAN: usize = 1024;
+    let scan = tdwr_long_range_sweep(400.2);
+    let (image, extent_km, values) =
+        render_radar_to_image_full_sized(&scan, L2_ELEVATION, PRODUCT, LAT, LON, None, None, LEAN)
+            .expect("the fixture renders");
+
+    assert_eq!(image.len(), LEAN * LEAN * 4);
+    assert_eq!(values.len(), LEAN * LEAN);
+    assert!(
+        (extent_km - 417.0).abs() < 1e-9,
+        "a leaner raster covers the same ground: {extent_km}",
+    );
+    let at = probe_at(extent_km, LEAN, 90.0, 400.2);
+    assert!(
+        !values[at].is_nan(),
+        "the beacon is unpainted on the lean raster",
     );
 }
