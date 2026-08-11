@@ -24,6 +24,9 @@ pub use message::{Message, MessageHeaders};
 mod message_contents;
 pub use message_contents::MessageContents;
 
+#[cfg(test)]
+mod framing_tests;
+
 use crate::result::{Error, Result};
 use crate::segmented_slice_reader::SegmentedSliceReader;
 use crate::slice_reader::SliceReader;
@@ -31,6 +34,33 @@ use log::{trace, warn};
 
 /// Size of a single fixed-length message frame (header + content + padding).
 const SEGMENT_FRAME_SIZE: usize = 2432;
+
+/// Size of the RPG-supplied prefix at the head of every message header.
+///
+/// `MessageHeader::message_size_bytes` counts from the end of this prefix, not
+/// from the start of the message, so a message occupies
+/// `CTM_PREFIX_SIZE + message_size_bytes()` bytes on the wire.
+const CTM_PREFIX_SIZE: usize = 12;
+
+/// The largest gap tolerated between where a message's parser stopped and where
+/// its header says the message ends.
+///
+/// TDWR pads each Type 31 body out to an eight-byte boundary, so its trailing
+/// slack is 4-7 bytes; WSR-88D pads none. A declaration further out than this
+/// disagrees with the parse by more than padding can explain and is not
+/// trusted.
+const MAX_TRAILING_PAD: usize = 7;
+
+/// The byte position at which a message's header says the message ends.
+///
+/// Saturating throughout: a variable-length header can declare a size up to
+/// `u32::MAX`, which overflows a 32-bit `usize`. A saturated target is past the
+/// end of any input, which `try_skip_to` rejects.
+fn declared_end(offset: usize, header: &MessageHeader) -> usize {
+    offset
+        .saturating_add(CTM_PREFIX_SIZE)
+        .saturating_add(header.message_size_bytes() as usize)
+}
 
 /// Decode a series of NEXRAD Level II messages from a reader.
 ///
@@ -66,7 +96,7 @@ pub fn decode_messages<'a>(input: &'a [u8]) -> Result<Vec<Message<'a>>> {
                         offset,
                         e
                     );
-                    if !reader.try_skip_to(offset + header.message_size_bytes() as usize) {
+                    if !reader.try_skip_to(declared_end(offset, header)) {
                         break;
                     }
                 }
@@ -82,6 +112,14 @@ pub fn decode_messages<'a>(input: &'a [u8]) -> Result<Vec<Message<'a>>> {
         // SegmentedSliceReader's auto-skip logic correctly detects segment boundaries.
         // Single-segment messages: use the full frame content area as payload so
         // parsers can read structs that extend beyond the declared message_size.
+        //
+        // Note: this payload is CTM_PREFIX_SIZE bytes short. message_size_bytes()
+        // already excludes the prefix, so subtracting the whole header excludes it
+        // twice. The reader position self-corrects — the frame is padded to
+        // SEGMENT_FRAME_SIZE regardless — but the tail of a multi-segment payload
+        // (e.g. a Message 15 clutter filter map) is truncated. Left alone here
+        // because correcting it changes what WSR-88D messages decode to, which
+        // wants fixture coverage this crate does not yet have.
         let payload = if segment_count > 1 {
             let payload_size =
                 (header.message_size_bytes() as usize).saturating_sub(size_of::<MessageHeader>());
@@ -198,19 +236,52 @@ fn build_fixed_segment_message<'a>(
 }
 
 /// Parse a variable-length message (e.g. Type 31 Digital Radar Data).
+///
+/// Leaves the reader at the end of the message, which is the end its header
+/// declares whenever that is believable — see the arms below. The returned
+/// message's size is measured from wherever the reader ends up, so it includes
+/// any trailing pad the message carries.
 fn decode_variable_length_message<'a>(
     reader: &mut SliceReader<'a>,
     header: &'a MessageHeader,
     offset: usize,
 ) -> Result<Message<'a>> {
+    let declared = declared_end(offset, header);
+
     let contents = if header.message_type() == MessageType::RDADigitalRadarDataGenericFormat {
         let radar_data_message = digital_radar_data::Message::parse(reader)?;
+
+        // The data block walk stops at the last block it was pointed at, which
+        // is the end of the message only if nothing follows it. WSR-88D pads
+        // nothing, so the walk and the declared end agree. TDWR pads each body
+        // out to an eight-byte boundary, and without skipping that slack the
+        // next header is read out of the padding.
+        //
+        // The declaration is trusted only within a pad's width of the walk. Any
+        // further out and it disagrees with the parse by more than padding can
+        // explain, and the parse is the better answer — a corrupt segment_size
+        // then cannot desync a record whose messages are parsing cleanly.
+        let walk = reader.position();
+        if (walk..=walk.saturating_add(MAX_TRAILING_PAD)).contains(&declared) {
+            // A last radial whose padding was truncated is still a whole
+            // radial, so clamp to the input rather than refusing the skip.
+            let end_of_input = walk.saturating_add(reader.remaining().len());
+            reader.try_skip_to(declared.min(end_of_input));
+        } else {
+            warn!(
+                "Message type 31 at offset {} declares it ends at {} but parsed to {}, \
+                 framing from the parse",
+                offset, declared, walk
+            );
+        }
+
         MessageContents::DigitalRadarData(Box::new(radar_data_message))
     } else {
-        // Unknown variable-length message type — skip its payload
-        let payload_size =
-            (header.message_size_bytes() as usize).saturating_sub(size_of::<MessageHeader>());
-        reader.advance(payload_size);
+        // Unknown variable-length message type — nothing walked its payload, so
+        // its declared end is the only framing available.
+        if !reader.try_skip_to(declared) {
+            return Err(Error::UnexpectedEof);
+        }
         MessageContents::Other
     };
 

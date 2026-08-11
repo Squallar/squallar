@@ -39,9 +39,18 @@ header is read out of that padding, `segmented()` flips true on garbage, the
 decoder logs segment numbers in the tens of thousands, and the record never
 resyncs.
 
-Byte-verified on `s3://unidata-nexrad-level2/2026/08/10/TPIT/TPIT20260810_000139_V08`:
-as published, 782 garbage-mixed "messages" and 328 warnings; with the framing
-corrected, 48/48 records × 120/120 radials, zero warnings, zero bytes remaining.
+Byte-verified on `s3://unidata-nexrad-level2/2026/08/10/TPIT/TPIT20260810_000139_V08`
+(924,093 bytes, 49 records, VCP 90), decoded through `nexrad-data` both ways:
+
+| | as published | with the framing fix |
+| --- | --- | --- |
+| messages | 780 | 5,894 |
+| Type 31 radials | **51** | **5,760** |
+| radials per radial record | 1 or 2 | 120, all 48 records |
+| warnings | 330 | **0** |
+
+Fifty-one radials out of 5,760 is why the site rendered as filled wedges rather
+than a sweep.
 
 There is no seam to work around it in — both of this workspace's ingest paths
 reach the decoder through `nexrad-data`, which depends on nexrad-decode itself.
@@ -132,7 +141,73 @@ Verified against a real case: `manual_div_ceil` in
 
 ### Changed — source
 
-**Exactly one source deviation exists, and it changes no behaviour.**
+Two changes: the framing fix this directory exists for, and one lint scoping
+that changes no behaviour.
+
+#### The framing fix — `src/messages/mod.rs`
+
+Three places decided where a message ends, and all three read the declared size
+as if it were measured from the start of the message. It is measured from byte
+12: `segment_size` counts halfwords from the end of the CTM prefix, so a
+message occupies `12 + message_size_bytes()` bytes. Upstream states this itself
+in `nexrad-data`'s `src/volume/record.rs:213-214`. A new `declared_end(offset,
+header)` helper is now the single answer to the question, and all three call
+it.
+
+1. **Type 31, parsed successfully.** Previously the reader was left wherever
+   the data block walk stopped. Now the declared end is used instead — but only
+   when it lies within `MAX_TRAILING_PAD` (7) bytes of the walk. That range is
+   the whole of the disagreement TDWR can legitimately produce: it pads each
+   radial body out to an eight-byte boundary, which is 4-7 bytes, and WSR-88D
+   pads none. Anything further out is a declaration no parse agrees with, and
+   the framing stays with the parse, with one warning naming both positions.
+
+   The bound is the point. Trusting the declaration unconditionally would have
+   fixed TDWR and simultaneously introduced a failure the published code did
+   not have — a corrupt `segment_size` desyncing a record whose messages are
+   all parsing cleanly. Bounded, neither failure exists.
+
+   The skip is clamped to the end of the input, so a final radial that parsed
+   completely but whose pad was truncated is still kept.
+
+2. **Unknown variable-length message.** Previously `advance(size - 28)`, which
+   lands 12 bytes short because `size_of::<MessageHeader>()` includes the CTM
+   prefix that `message_size_bytes()` already excludes. Now a skip to the
+   declared end, and `Err(UnexpectedEof)` if that is past the end of the input.
+   Nothing walks these messages, so there is no second opinion to bound the
+   declaration against.
+
+3. **Error recovery.** `try_skip_to(offset + size)` → `try_skip_to(declared_end
+   (…))`; same 12 bytes, same correction. Landing short here put the reader
+   inside the failed message's padding, so a single bad radial cost the rest of
+   the record.
+
+Every addition saturates. A 0xFFFF-sentinel header carries a 32-bit byte count
+of up to `0xFFFF_FFFF`, which overflows a 32-bit `usize` — a panic on wasm32 in
+dev and a silent wrap into mis-framing in release. `tests/malformed_input.rs`'s
+`test_all_ones` constructs exactly that header, and rustdar-web is a shipped
+wasm32 target. A saturated target is simply past the end of any input, which
+`try_skip_to` rejects.
+
+Two behaviour deltas worth stating:
+
+- `Message::size` for a Type 31 is now the declared framed size including pad,
+  where before it was the distance the parser walked. Identical on any message
+  without pad, which is every WSR-88D message and every packaged fixture.
+- A truncated unknown variable-length message at the end of the input now
+  surfaces `UnexpectedEof` instead of over-advancing silently. `decode_messages`
+  absorbs that as a `break` and keeps everything decoded so far, so no caller
+  can newly lose a record.
+
+New `src/messages/framing_tests.rs`, an in-source `#[cfg(test)]` module so it
+travels with the fix in the upstream diff. Six tests: the padded TDWR stream
+stays framed; the unpadded stream keeps the exact offsets and sizes it had;
+the packaged WSR-88D radial declares exactly its own length so the skip is a
+no-op; a failed parse recovers to the next message; an unknown variable-length
+message is skipped to its declared end; and a corrupt declared size does not
+desync a clean parse. Three of the six fail against the published code.
+
+#### The lint scoping — `src/lib.rs`
 
 In `src/lib.rs`'s crate-level lint attributes, upstream writes
 
@@ -175,6 +250,8 @@ upstream PR can raise them without having to rediscover them.
   on purpose: changing it changes what WSR-88D clutter-map messages decode to,
   which is precisely what the byte-identical-snapshot bar exists to protect.
   Raise it upstream, where the fixture coverage to validate it can be built.
+  A comment at the site says the same thing, so the next person to read that
+  arithmetic does not have to conclude it was an oversight.
 
 - **`SliceReader::advance` is unchecked** (`src/slice_reader.rs:35-37`). A
   runaway skip produces no warning at all; the "bytes remaining" diagnostic
@@ -187,6 +264,16 @@ upstream PR can raise them without having to rediscover them.
   sentinel case no real message exists in any fixture to prove it; internal
   consistency favours it, and this note exists so that nobody later mistakes
   the inference for a citation.
+
+  The framing fix above inherits the inference rather than introducing it —
+  `declared_end` applies the same `+12` to both cases, because
+  `message_size_bytes()` is the same function for both. The ICD says the
+  sentinel repurposes the segment count and number fields as a 32-bit byte
+  count; it does not say what that count is measured from.
+  `an_unknown_variable_length_message_is_skipped_to_its_declared_end` pins the
+  inference so that changing it is a deliberate act, and says so in its own
+  comment. The one thing that would settle it is a real sentinel message, which
+  no volume examined here contains.
 
 ## rustfmt
 
