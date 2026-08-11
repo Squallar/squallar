@@ -2749,11 +2749,27 @@ fn a_position_a_volume_taught_survives_a_restart() {
 ///
 /// This is the degradation `LocationGate` chose for the same reason: no
 /// `ConfigStore` must never mean "refuse", it means "ask again next time".
+///
+/// # Why not `KTLX`
+///
+/// The last assertion compares against the *seeded* row, and a seeded row is
+/// no longer immovable: `sites::resolve` applies a learned fix onto the row it
+/// lands on, so any sibling test that constructs an app over a store holding a
+/// learned position moves that radar in this process's table.
+/// `a_position_a_volume_taught_survives_a_restart` does exactly that, to
+/// `KTLX`, and running the two in either order made this test fail in release
+/// and pass in debug — which is the worst kind, a test whose outcome is a
+/// scheduling accident.
+///
+/// So this uses `KMBX`, which nothing else in the workspace names. The
+/// identifier is load-bearing: it must stay one no other test learns a
+/// position for.
 #[test]
 fn a_run_with_no_config_store_still_applies_the_volumes_own_position() {
     use rustdar_radar::site_position::SitePositionSource;
 
-    let table = rustdar_radar::sites::get_radar_site("KTLX").expect("in the table");
+    const SITE: &str = "KMBX";
+    let table = rustdar_radar::sites::get_radar_site(SITE).expect("in the table");
     let stated_lat = (table.lat + 0.25) as f32;
     let at = chrono::NaiveDate::from_ymd_opt(2026, 8, 11)
         .unwrap()
@@ -2762,23 +2778,29 @@ fn a_run_with_no_config_store_still_applies_the_volumes_own_position() {
 
     let mut app = headless(TestBridge::desktop().without_config_store());
     let info =
-        app.scan_info_learning_position(&scan_stating(stated_lat, table.lon as f32), "KTLX", at);
+        app.scan_info_learning_position(&scan_stating(stated_lat, table.lon as f32), SITE, at);
     assert_eq!(info.site_source, SitePositionSource::Volume);
     assert!((info.site.lat - f64::from(stated_lat)).abs() < 1e-5);
 
     // Within the run it is still remembered — the map is in memory and the
     // store is only where it is *written* — so a chunk-fed volume arriving
     // after an archive one is placed correctly even here.
-    let same_run = app.scan_info_learning_position(&empty_scan(), "KTLX", at);
+    let same_run = app.scan_info_learning_position(&empty_scan(), SITE, at);
     assert_eq!(same_run.site_source, SitePositionSource::Learned);
     assert_eq!(same_run.site.lat.to_bits(), info.site.lat.to_bits());
 
     // And nothing outlives the process: a fresh app is back on the table,
     // which is where the app was before any of this existed.
     let mut next_run = headless(TestBridge::desktop().without_config_store());
-    let plain = next_run.scan_info_learning_position(&empty_scan(), "KTLX", at);
+    let plain = next_run.scan_info_learning_position(&empty_scan(), SITE, at);
     assert_eq!(plain.site_source, SitePositionSource::Table);
     assert_eq!(plain.site.lat, table.lat);
+    assert_ne!(
+        plain.site.lat,
+        f64::from(stated_lat),
+        "with no store, the volume's own position must not have outlived the \
+         process that decoded it",
+    );
 }
 
 /// A radar the compiled-in seed has never heard of is in the table by the time
@@ -2800,11 +2822,13 @@ fn a_run_with_no_config_store_still_applies_the_volumes_own_position() {
 ///
 /// # Why it can run beside everything else
 ///
-/// `sites::resolve` only ever adds radars, so no other test's app construction
-/// can take `ZZZF` away again once this one has put it there, and this one
-/// cannot disturb them: `ZZZF` is 5000 km from the nearest real radar, and no
-/// seeded row moves. The identifier is unique to this test for the same
-/// reason.
+/// `sites::resolve` never *forgets* a radar, so no other test's app
+/// construction can take `ZZZF` away again once this one has put it there. It
+/// can move one — a fix now displaces the row it lands on — but only a row it
+/// names, and `ZZZF` is named by nothing else. The identifier being unique to
+/// this test is what makes both halves true, and it is load-bearing rather
+/// than tidy; `ZZZF` also sits 5000 km from the nearest real radar, so no
+/// nearest-search elsewhere can answer with it.
 #[test]
 fn a_learned_radar_the_seed_never_had_is_in_the_table_before_the_first_frame() {
     use rustdar_egui::config_store::ConfigStore;
