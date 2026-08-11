@@ -7,8 +7,7 @@
 //! builder inherits the sampler's. Those are three consumers of one
 //! measurement, and the measurement is what this module holds. Derived per
 //! consumer it drifted, and drifted in the way that matters: on a sparse sweep
-//! the sampler reports the hole and the plan view — still reading the sweep
-//! its own way, see [`MAX_ADJACENT_GAP_STEPS`] — paints across it.
+//! the sampler reported the hole and the plan view painted across it.
 //!
 //! The measurement is [`median_azimuth_step_deg`] and the rule built on it is
 //! [`MAX_ADJACENT_GAP_STEPS`]. Nothing here knows about radar beyond the units:
@@ -42,13 +41,14 @@
 /// sweep, and an abandoned tail should leave the same shaped absence in the
 /// plan view that it leaves in a cross-section or a voxel column.
 ///
-/// **The plan view does not honour this yet.**
-/// `render::render_radar_to_image_full` still hands every radial one global
-/// half-width taken from the arithmetic mean of signed collection-order
-/// differences, so each surviving radial fans across the gap to its neighbour
-/// and a sparse sweep comes out as filled chords rather than as holes. That
-/// divergence is why this module exists; the contract above is what it is being
-/// moved onto, and this constant is the number it will be moved onto.
+/// The plan view reads it as a ceiling rather than as a bridge, because a
+/// rasterizer has nothing to interpolate: `render::l2_wedge_width_deg` starts
+/// from what each radial declares its own resolution to be and holds it under
+/// this many median steps, so a radial that declares more sky than its
+/// neighbours leave it is cut back to what the sweep supports. What it never
+/// does is *widen* a radial to close a gap — the width does not depend on where
+/// the next radial is at all — so the hole this constant refuses to bridge in
+/// the sampler is the same hole the plan view leaves unpainted.
 pub(crate) const MAX_ADJACENT_GAP_STEPS: f64 = 1.5;
 
 /// The median circular gap between a sweep's adjacent azimuths, degrees, or
@@ -83,7 +83,8 @@ pub(crate) const MAX_ADJACENT_GAP_STEPS: f64 = 1.5;
 /// always computed, where the effect is only that a two-radial rung serves its
 /// two footprints generously, and changing it would change sampler behaviour
 /// under the banner of a refactor. A consumer for which a 350° step is not
-/// merely generous but absurd — a wedge width, say — caps it at the call site.
+/// merely generous but absurd caps it at the call site: a wedge width does, at
+/// `render::MAX_WEDGE_DEG`.
 pub(crate) fn median_azimuth_step_deg(azimuths: impl IntoIterator<Item = f64>) -> Option<f64> {
     let mut sorted: Vec<f32> = azimuths
         .into_iter()

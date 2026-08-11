@@ -100,7 +100,24 @@ struct RadialContext {
 }
 
 impl RadialContext {
+    /// A half-width below zero is not a narrow wedge, it is an inside-out one:
+    /// `render_gate` derives its azimuth sample count from this number, so a
+    /// negative value makes `0..count` empty and the radial silently paints
+    /// nothing — a whole sweep can disappear without a line in the log. The
+    /// Level II callers below now compute a width that cannot go negative, but
+    /// the Level III path hands over a packet's declared `angle_delta`
+    /// unexamined, and nothing between the wire and here checks it. Clamped
+    /// rather than asserted in release because a zero-width radial draws a
+    /// spoke, which is a visible, self-explaining failure; the `debug_assert`
+    /// catches a NaN in the tests, where a NaN half-width would otherwise turn
+    /// into a zero here and look like a mere spoke.
     fn new(azimuth_deg: f64, az_half_spacing_deg: f64) -> Self {
+        debug_assert!(
+            az_half_spacing_deg.is_finite(),
+            "radial at {azimuth_deg}° was handed a non-finite half-width \
+             ({az_half_spacing_deg})"
+        );
+        let az_half_spacing_deg = az_half_spacing_deg.max(0.0);
         let az_start_rad = (azimuth_deg - az_half_spacing_deg) * PI / 180.0;
         let az_end_rad = (azimuth_deg + az_half_spacing_deg) * PI / 180.0;
         let cos_az_center = (azimuth_deg * PI / 180.0).cos();
@@ -127,10 +144,11 @@ impl RadialContext {
 /// footprints are quantized onto a pixel grid nothing aligns them to — inside
 /// ~26 km a 0.5° radial's arc is narrower than one pixel, and at any range the
 /// truncating cast drops neighbouring wedges into the same cell. The L2 path
-/// adds a second source: `compute_azimuth_spacing` hands every radial the
-/// *average* half-width, so radials packed tighter than average overlap for
-/// real. A fixture whose wedges tile exactly still contends over 271 pixels;
-/// see `overlapping_radials_contend_for_pixels`.
+/// adds a second source: [`l2_wedge_width_deg`] paints each radial at the width
+/// it *declares*, and a real antenna does not land its radials exactly that far
+/// apart, so wherever the sweep ran a few hundredths of a degree tight the
+/// wedges overlap for real. A fixture whose wedges tile exactly still contends
+/// over 271 pixels; see `overlapping_radials_contend_for_pixels`.
 ///
 /// Neither claimant is more correct — the rasterizer never computes subpixel
 /// coverage — so the tie is arbitrary, and the only question is whether it gets
@@ -672,43 +690,131 @@ pub(crate) fn find_sweep_owner(
     }
 }
 
-/// Average azimuth spacing (degrees) between consecutive Level II radials.
-fn compute_azimuth_spacing(radials: &[Radial]) -> f64 {
-    let mut prev_azimuth: Option<f64> = None;
-    let mut spacing_sum = 0.0f64;
-    let mut spacing_count = 0u32;
-    for radial in radials {
-        let az = radial.azimuth_angle_degrees() as f64;
-        if let Some(prev) = prev_azimuth {
-            let mut diff = az - prev;
-            if diff < -180.0 {
-                diff += 360.0;
-            } else if diff > 180.0 {
-                diff -= 360.0;
-            }
-            spacing_sum += diff;
-            spacing_count += 1;
-        }
-        prev_azimuth = Some(az);
-    }
-    if spacing_count > 0 {
-        spacing_sum / spacing_count as f64
+/// The widest wedge any radial is ever painted at, degrees.
+///
+/// A ceiling on top of the per-sweep one, and not redundant with it, because
+/// the per-sweep ceiling is derived from the sweep and a sweep with two radials
+/// in it has no meaningful spacing to derive from: two azimuths give two
+/// circular gaps, and [`crate::azimuth::median_azimuth_step_deg`] answers with
+/// the larger of them, so a pair 10° apart reports a step of 350°. As a sampler
+/// footprint that is generous; as a wedge width it is a 350°-wide chord lens
+/// laid across the display, apex at the site. A radial that declares nothing
+/// would fall back onto exactly that number.
+///
+/// 2.0° caps every such pathology while touching nothing real: Level II
+/// declares 0.5° or 1.0° and nothing else, the RDA has no third resolution, so
+/// no sweep this display has ever drawn comes within a factor of two of the
+/// cap.
+const MAX_WEDGE_DEG: f64 = 2.0;
+
+/// How wide to paint one Level II radial, degrees, given what it declares and
+/// what the sweep around it measures.
+///
+/// A radial declares its own azimuth resolution on the wire and has since
+/// Message 31 — 0.5° for a super-res cut, 1.0° otherwise — and that declaration
+/// is the honest answer to "how much sky does this sample stand for". The
+/// sweep's median step is the cross-check, not the answer: it is what the
+/// radials around this one are actually spaced by, and
+/// [`crate::azimuth::MAX_ADJACENT_GAP_STEPS`] is already the rule for how far
+/// past that spacing a consumer may reach before it is inventing coverage.
+///
+/// So the declaration wins where it exists and is believable, the median stands
+/// in where it does not (the legacy Message 1 path is the case that matters,
+/// and it declares a flat 1.0°, which is what those volumes are — so this
+/// fallback is reached only by a genuinely empty declaration), and both are
+/// held under [`MAX_WEDGE_DEG`].
+///
+/// What this buys is the property the sampler already had and the plan view did
+/// not: a sweep with radials missing leaves the gap *empty*. The width no
+/// longer has anything to do with where the next radial is, so a survivor
+/// cannot fan across to it.
+fn l2_wedge_width_deg(declared_deg: f64, median_step_deg: f64) -> f64 {
+    let base = if declared_deg > 0.0 {
+        declared_deg
     } else {
-        1.0
-    }
+        median_step_deg
+    };
+    base.min(crate::azimuth::MAX_ADJACENT_GAP_STEPS * median_step_deg)
+        .min(MAX_WEDGE_DEG)
 }
 
-/// Maximum range (km) derived from the first radial that carries the given
-/// product's moment data.
+/// How wide to paint one row of a derived polar grid, degrees.
+///
+/// NROT, SRV and KDP are computed onto grids of their own, and a grid row
+/// carries an azimuth but no declared resolution — the declaration belongs to
+/// the radial the row was computed *from*, and deliberately is not threaded
+/// through, since a derived value spans whatever its input span was rather than
+/// one radial's. So these rows are painted at the sweep's measured median step,
+/// capped by [`MAX_WEDGE_DEG`] for the two-radial reason given there.
+///
+/// The alternative these replace was `360 / rows`, which is the same
+/// fan-to-the-neighbour assumption in a different disguise: it is only the
+/// spacing if the grid closes the circle. A 36° NROT sector of 0.5° radials
+/// came out at 5° a row and smeared two and a half degrees past its own edge.
+fn derived_grid_wedge_deg(azimuths_deg: &[f64]) -> f64 {
+    crate::azimuth::median_azimuth_step_deg(azimuths_deg.iter().copied())
+        .unwrap_or(1.0)
+        .min(MAX_WEDGE_DEG)
+}
+
+/// How far apart two radials' reaches may be before the sweep is reported as
+/// disagreeing with itself, km.
+///
+/// Within one cut the RDA declares one gate count per moment, and real volumes
+/// hold to it exactly: walked over 102 sweeps and all six moments of the
+/// opening volume at KTLX, KDMX, KMPX, KAMX, KFTG and TJUA — plains, upper
+/// midwest, coastal, mountain, tropical — every sweep's radials agreed on their
+/// reach to the last bit, spread **0.000 km** everywhere. So this fires on
+/// something wrong rather than on ordinary variation, and 1.0 km is chosen for
+/// what it catches rather than for what it tolerates: it is under half of the
+/// widest gate this display draws (TDWR surveillance, 0.3 km), so a difference
+/// of four gates anywhere trips it.
+///
+/// A `warn` and not a clamp: a sweep whose radials disagree is a sweep this
+/// code cannot resolve on its own, and guessing which of them is right is how
+/// the first-radial rule got this wrong in the first place.
+const RADIAL_REACH_DISAGREEMENT_KM: f64 = 1.0;
+
+/// How far the sweep's data actually reaches, km: the **greatest** reach among
+/// the radials carrying this product's moment, or 0 if none do.
+///
+/// The greatest and not the first, which is what this used to read. A radial
+/// whose gate count came back short — a truncated record, a mis-framed
+/// message — is a radial, not a sweep, and taking the first one that happened
+/// to carry the moment let one of them speak for all 720. The greatest and not
+/// the median either: this number becomes the extent the raster is projected at
+/// and the range the gate loops stop at, so anything below the true maximum is
+/// real data cut off at the edge of the image.
+///
+/// That does mean one *over*-long radial coarsens the whole sweep's km/pixel
+/// until the next render. The trade is deliberate — a render that is slightly
+/// too zoomed-out still shows everything, a render that is too zoomed-in does
+/// not — and the spread warning below is what makes the case visible when it
+/// happens rather than leaving it to be noticed on the glass.
 fn compute_max_range(radials: &[Radial], product: types::RadarProduct) -> f64 {
-    radials
-        .iter()
-        .find_map(|radial| {
-            let moment = product.get_moment(radial)?;
-            let gate_count = moment.gate_count() as usize;
-            Some(moment.first_gate_range_km() + gate_count as f64 * moment.gate_interval_km())
-        })
-        .unwrap_or(0.0)
+    let mut reach = f64::NEG_INFINITY;
+    let mut shortest = f64::INFINITY;
+    for radial in radials {
+        let Some(moment) = product.get_moment(radial) else {
+            continue;
+        };
+        let km = moment.first_gate_range_km()
+            + f64::from(moment.gate_count()) * moment.gate_interval_km();
+        reach = reach.max(km);
+        shortest = shortest.min(km);
+    }
+    if reach == f64::NEG_INFINITY {
+        return 0.0;
+    }
+    if reach - shortest > RADIAL_REACH_DISAGREEMENT_KM {
+        log::warn!(
+            "{product:?}: this sweep's radials do not agree on how far they reach — \
+             {shortest:.1}km to {reach:.1}km, a spread of {:.1}km; rendering to the \
+             longest",
+            reach - shortest
+        );
+    }
+    reach
 }
 
 fn render_with_projection(
@@ -832,7 +938,13 @@ pub fn render_radar_to_image_full(
         return render_srv_to_image(data, radials, radar_lat, radar_lon, storm_motion_override);
     }
 
-    let avg_azimuth_spacing = compute_azimuth_spacing(radials);
+    // The stand-in for an unmeasurable sweep is 1.0° because that is the
+    // coarser of the two resolutions the RDA has, so a sweep too degenerate to
+    // measure is painted as if it were the wider one rather than as a spoke.
+    let median_step = crate::azimuth::median_azimuth_step_deg(
+        radials.iter().map(|r| f64::from(r.azimuth_angle_degrees())),
+    )
+    .unwrap_or(1.0);
     let actual_max_range = compute_max_range(radials, product);
 
     let output = render_with_projection(
@@ -847,7 +959,11 @@ pub fn render_radar_to_image_full(
                 .enumerate()
                 .for_each(|(radial_idx, radial)| {
                     let azimuth = radial.azimuth_angle_degrees() as f64;
-                    let ctx = RadialContext::new(azimuth, avg_azimuth_spacing / 2.0);
+                    let width = l2_wedge_width_deg(
+                        f64::from(radial.azimuth_spacing_degrees()),
+                        median_step,
+                    );
+                    let ctx = RadialContext::new(azimuth, width / 2.0);
 
                     if let Some(moment) = product.get_moment(radial) {
                         let first_gate_range = moment.first_gate_range_km();
@@ -901,7 +1017,7 @@ fn render_nrot_to_image(
     let vg = build_velocity_grid(radials)?;
 
     let actual_max_range = vg.first_gate_range_km + vg.gate_count as f64 * vg.gate_interval_km;
-    let avg_spacing_deg = 360.0 / num_radials as f64;
+    let wedge_deg = derived_grid_wedge_deg(&vg.azimuths_deg);
 
     let elevation_deg = radials
         .first()
@@ -928,7 +1044,7 @@ fn render_nrot_to_image(
         "NROT",
         |proj, bufs| {
             nrot_grid.par_iter().enumerate().for_each(|(i, nrot_row)| {
-                let ctx = RadialContext::new(vg.azimuths_deg[i], avg_spacing_deg / 2.0);
+                let ctx = RadialContext::new(vg.azimuths_deg[i], wedge_deg / 2.0);
 
                 for (j, &nrot_val) in nrot_row.iter().enumerate() {
                     if nrot_val.is_nan() {
@@ -1007,7 +1123,7 @@ fn render_srv_to_image(
 
     let actual_max_range =
         grid.first_gate_range_km + grid.gate_count as f64 * grid.gate_interval_km;
-    let avg_spacing_deg = 360.0 / grid.values.len().max(1) as f64;
+    let wedge_deg = derived_grid_wedge_deg(&grid.azimuths_deg);
     let output = render_with_projection(
         radar_lat,
         radar_lon,
@@ -1016,7 +1132,7 @@ fn render_srv_to_image(
         "SRV",
         |proj, bufs| {
             grid.values.par_iter().enumerate().for_each(|(i, row)| {
-                let ctx = RadialContext::new(grid.azimuths_deg[i], avg_spacing_deg / 2.0);
+                let ctx = RadialContext::new(grid.azimuths_deg[i], wedge_deg / 2.0);
                 for (j, &value) in row.iter().enumerate() {
                     if value.is_nan() {
                         continue;
@@ -1417,7 +1533,7 @@ pub fn render_derived_kdp_to_image(
     }
     let max_gates = derived.values.iter().map(Vec::len).max().unwrap_or(0);
     let actual_max_range = derived.first_gate_km + max_gates as f64 * derived.gate_interval_km;
-    let avg_spacing_deg = 360.0 / n_radials as f64;
+    let wedge_deg = derived_grid_wedge_deg(&derived.azimuths_deg);
 
     let output = render_with_projection(
         radar_lat,
@@ -1427,7 +1543,7 @@ pub fn render_derived_kdp_to_image(
         "KDP",
         |proj, bufs| {
             derived.values.par_iter().enumerate().for_each(|(i, row)| {
-                let ctx = RadialContext::new(derived.azimuths_deg[i], avg_spacing_deg / 2.0);
+                let ctx = RadialContext::new(derived.azimuths_deg[i], wedge_deg / 2.0);
                 for (j, &v) in row.iter().enumerate() {
                     if v.is_nan() {
                         continue;

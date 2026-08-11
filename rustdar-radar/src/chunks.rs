@@ -688,13 +688,16 @@ enum Cut {
     Sealed(nexrad_model::data::Sweep),
     /// Terminated, or closed with the volume, short of its radial count.
     ///
-    /// Kept as a diagnostic and **never** placed in a snapshot.
-    /// `render_nrot_to_image` computes `avg_spacing_deg = 360.0 / num_radials`
-    /// and wraps its azimuthal neighbour lookups with `.rem_euclid(num_radials)`,
-    /// so a half-received cut both halves the computed shear and stitches the
-    /// last received radial to the first — manufacturing a rotation signature
-    /// out of a gap. It bails only at zero radials, so nothing downstream would
-    /// catch this.
+    /// Kept as a diagnostic and **never** placed in a snapshot. `nrot::llsd_nrot`
+    /// takes its azimuth step as `360.0 / num_radials` and wraps its neighbour
+    /// lookups with `.rem_euclid(num_radials)`, so a half-received cut both
+    /// halves the computed shear and stitches the last received radial to the
+    /// first — manufacturing a rotation signature out of a gap. It bails only at
+    /// zero radials, so nothing downstream would catch this. (The *painting* of
+    /// that grid no longer compounds it: `render::derived_grid_wedge_deg`
+    /// measures the grid's own azimuths, so a half cut is drawn at its real
+    /// spacing over the arc it covers. The manufactured shear values are still
+    /// manufactured.)
     Abandoned { have: usize, expected: usize },
 }
 

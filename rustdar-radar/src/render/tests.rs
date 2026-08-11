@@ -257,15 +257,24 @@ fn colour_agrees_with_value_at_every_pixel() {
 
 const L2_ELEVATION: f32 = 0.5;
 
-/// A one-sweep Level II scan, one radial per entry in `gates`, spaced 1°
-/// from 90°. A radial whose byte is 0 decodes as below-threshold and is
-/// skipped, which silences it without renumbering the rest.
-fn l2_scan(gates: &[u8], velocity: bool) -> Scan {
+/// A one-sweep Level II scan of `gates.len()` radials sitting at `azimuths`,
+/// each declaring `declared_spacing` as its own azimuth resolution. A radial
+/// whose byte is 0 decodes as below-threshold and is skipped, which silences
+/// it without renumbering the rest.
+///
+/// Where a radial sits and how wide it says it is are separate arguments
+/// because the renderer now reads them separately, and every way they can
+/// disagree is a case: sparser than declared is the sweep with radials
+/// missing, denser is the lying declaration, and a `declared_spacing` of 0 is
+/// a sweep that declares nothing at all.
+fn l2_sweep(gates: &[u8], azimuths: &[f32], declared_spacing: f32, velocity: bool) -> Scan {
     use nexrad_model::data::{MomentData, PulseWidth, RadialStatus, Sweep, VolumeCoveragePattern};
+    assert_eq!(gates.len(), azimuths.len(), "one gate byte per radial");
     let radials = gates
         .iter()
+        .zip(azimuths)
         .enumerate()
-        .map(|(i, &byte)| {
+        .map(|(i, (&byte, &azimuth))| {
             let moment =
                 MomentData::from_fixed_point(600, 0, 250, 8, SCALE, OFFSET, vec![byte; 600]);
             let (refl, vel) = if velocity {
@@ -276,8 +285,8 @@ fn l2_scan(gates: &[u8], velocity: bool) -> Scan {
             Radial::new(
                 0,
                 i as u16,
-                90.0 + i as f32,
-                1.0,
+                azimuth,
+                declared_spacing,
                 RadialStatus::IntermediateRadialData,
                 1,
                 L2_ELEVATION,
@@ -312,10 +321,52 @@ fn l2_scan(gates: &[u8], velocity: bool) -> Scan {
     )
 }
 
+/// [`l2_sweep`] with the shape the tie-break tests were written against: 1°
+/// apart from 90°, declaring the 1° they are apart by.
+fn l2_scan(gates: &[u8], velocity: bool) -> Scan {
+    let azimuths: Vec<f32> = (0..gates.len()).map(|i| 90.0 + i as f32).collect();
+    l2_sweep(gates, &azimuths, 1.0, velocity)
+}
+
 fn render_l2(gates: &[u8], product: types::RadarProduct) -> (Vec<u8>, Vec<f32>) {
     let scan = l2_scan(gates, product != types::RadarProduct::Reflectivity);
     let (image, _, values) = render_radar_to_image(&scan, L2_ELEVATION, product, LAT, LON).unwrap();
     (image, values)
+}
+
+/// Which pixel a point `range_km` out at `az_deg` from the site lands in,
+/// through the same [`MercatorProjection`] the renderer paints with.
+///
+/// A duplicate of the arithmetic in `render_gate` rather than a call into it,
+/// because `render_gate` writes and this asks. Both walk azimuth → offset →
+/// Mercator → truncated pixel, and the truncation is why a probe has to go
+/// through the projection at all: a hand-computed pixel would be off by one
+/// somewhere and the difference between "unpainted" and "off by one" is the
+/// whole point of these tests. Probes are kept well inside 230 km so the
+/// answer does not depend on the raster's extent.
+fn probe(az_deg: f64, range_km: f64) -> usize {
+    let bounds = types::ImageBounds::from_radar_site(LAT, LON);
+    let proj = MercatorProjection::from_bounds(LAT, &bounds);
+    let (sin_az, cos_az) = az_deg.to_radians().sin_cos();
+    let dest_lat_rad = proj.radar_lat_rad + (range_km * cos_az) / types::EARTH_RADIUS_KM;
+    let cos_correction = proj.cos_radar_lat / dest_lat_rad.cos();
+    let px = (proj.center_px + range_km * sin_az * cos_correction * types::PIXELS_PER_KM) as usize;
+    let py = ((proj.merc_y_top - types::lat_rad_to_mercator_y(dest_lat_rad)) * proj.merc_y_scale)
+        as usize;
+    py * types::IMAGE_SIZE + px
+}
+
+/// Assert what the sweep painted at a list of `(azimuth, range)` probes.
+fn assert_probes(values: &[f32], painted: bool, probes: &[(f64, f64)], why: &str) {
+    for &(az, range) in probes {
+        let v = values[probe(az, range)];
+        assert_eq!(
+            !v.is_nan(),
+            painted,
+            "({az}°, {range} km) is {} — {why}",
+            if v.is_nan() { "unpainted" } else { "painted" },
+        );
+    }
 }
 
 #[test]
@@ -350,6 +401,17 @@ fn level2_colour_agrees_with_value_at_every_pixel() {
 /// the range normalization, and the ±0.25 display threshold, so
 /// `render_nrot_to_image` actually paints.
 fn nrot_scan(n_radials: usize) -> Scan {
+    nrot_sector(n_radials, 360.0 / n_radials as f32)
+}
+
+/// [`nrot_scan`] over an arc rather than the whole circle: `n_radials` spaced
+/// `step_deg` apart from 0°, so `n_radials · step_deg` of sky is covered and
+/// the rest of the circle is a hole.
+///
+/// The shear is a function of the radial *index*, not of the azimuth, so a
+/// sector carries the same shear per radial that the full circle does and the
+/// LLSD fit has the same fixture to work with either way.
+fn nrot_sector(n_radials: usize, step_deg: f32) -> Scan {
     use nexrad_model::data::{MomentData, PulseWidth, RadialStatus, Sweep, VolumeCoveragePattern};
     let radials = (0..n_radials)
         .map(|i| {
@@ -361,8 +423,8 @@ fn nrot_scan(n_radials: usize) -> Scan {
             Radial::new(
                 0,
                 i as u16,
-                i as f32 * (360.0 / n_radials as f32),
-                360.0 / n_radials as f32,
+                i as f32 * step_deg,
+                step_deg,
                 RadialStatus::IntermediateRadialData,
                 1,
                 L2_ELEVATION,
@@ -474,6 +536,319 @@ fn nrot_render_is_deterministic() {
         first,
         "NROT parallel differs from sequential"
     );
+}
+
+// ── How wide a radial is painted ─────────────────────────────────────────
+//
+// Every probe here sits at 50 km, comfortably inside the raster whatever
+// extent it is projected at, and every fixture is built so that the
+// difference between a radial's declared width and the distance to its
+// neighbour is the only thing under test.
+
+/// A sweep with radials missing leaves the sky between them **empty**. Four
+/// radials 90° apart declaring the 0.5° a super-res cut is: the sweep covers
+/// two degrees of sky in total and 358 degrees of nothing.
+///
+/// This is the shape TDWR arrives in when the decoder loses radials, and the
+/// failure it used to produce is not a subtle one: painting each survivor at
+/// the mean distance to the next drew four 90°-wide wedges, and a wedge is
+/// built from a chord rather than an arc, so the display filled with four
+/// enormous triangles meeting at the site.
+#[test]
+fn a_sparse_sweep_leaves_holes_not_chord_triangles() {
+    let scan = l2_sweep(&[200; 4], &[0.0, 90.0, 180.0, 270.0], 0.5, false);
+    let (_, _, values) = render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, LAT, LON).unwrap();
+
+    assert_probes(
+        &values,
+        true,
+        &[(0.0, 50.0), (90.0, 50.0), (180.0, 50.0), (270.0, 50.0)],
+        "a radial paints where it looked",
+    );
+    assert_probes(
+        &values,
+        false,
+        &[(30.0, 50.0), (60.0, 50.0), (120.0, 50.0), (300.0, 50.0)],
+        "the radar never looked here and the display must not claim it did",
+    );
+}
+
+/// Collection order is where the antenna happened to start and which way it
+/// happened to turn, and it is not data. A sweep handed over descending must
+/// paint the same sky as the same sweep handed over ascending.
+///
+/// The masks are compared and the values are not, deliberately. Where two
+/// wedges quantize onto one pixel the winner is the later *radial*, and
+/// reversing the order reverses which of the two that is — so the values
+/// legitimately differ at the seams while the painted region does not.
+///
+/// The old signed mean made this a hollowed-out display rather than a
+/// shifted one: descending 1° radials averaged −1° a radial, and
+/// `render_gate` derives its azimuth sample count from that width, so beyond
+/// the range where the count first goes negative — about 26 km at 2048² —
+/// the loop ran zero times and every radial stopped dead. 34 k pixels of the
+/// 1.4 M this sweep covers, silently, with nothing in the log.
+#[test]
+fn an_out_of_order_sweep_still_paints() {
+    let azimuths: Vec<f32> = (0..360).map(|i| i as f32).collect();
+    // Varying bytes, so a pixel two radials contend for really does hold a
+    // different value depending on which of them won it.
+    let gates: Vec<u8> = (0..360).map(|i| 2 + (i % 200) as u8).collect();
+
+    let render = |ascending: bool| {
+        let (az, g) = if ascending {
+            (azimuths.clone(), gates.clone())
+        } else {
+            (
+                azimuths.iter().rev().copied().collect(),
+                gates.iter().rev().copied().collect(),
+            )
+        };
+        let scan = l2_sweep(&g, &az, 1.0, false);
+        render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, LAT, LON)
+            .unwrap()
+            .2
+    };
+
+    let up = render(true);
+    let down = render(false);
+
+    let up_painted = up.iter().filter(|v| !v.is_nan()).count();
+    let down_painted = down.iter().filter(|v| !v.is_nan()).count();
+    assert_eq!(
+        down_painted, up_painted,
+        "a descending sweep painted {down_painted} px against the ascending {up_painted}",
+    );
+
+    let mask_differs = up
+        .iter()
+        .zip(&down)
+        .filter(|(a, b)| a.is_nan() != b.is_nan())
+        .count();
+    assert_eq!(
+        mask_differs, 0,
+        "{mask_differs} pixels are painted in one collection order and not the other",
+    );
+
+    // And the reason the masks are what is compared: the values are not
+    // equal, and are not expected to be.
+    let value_differs = up
+        .iter()
+        .zip(&down)
+        .filter(|(a, b)| !a.is_nan() && a.to_bits() != b.to_bits())
+        .count();
+    assert!(
+        value_differs > 0,
+        "no contested pixel changed hands, so this fixture cannot tell a mask \
+         comparison from a value comparison",
+    );
+}
+
+/// The width comes from what the radial declares, not from where the next
+/// radial is. Two sweeps of radials 2° apart, one declaring the 2° it is
+/// spaced by and one declaring 0.5°: the first tiles, the second leaves
+/// three quarters of the sky between its wedges unpainted — which is the
+/// honest answer, since 0.5° is all the sky the radar says each sample
+/// covers.
+#[test]
+fn declared_spacing_drives_the_wedge_width() {
+    let azimuths: Vec<f32> = (0..180).map(|i| i as f32 * 2.0).collect();
+    let render = |declared: f32| {
+        let scan = l2_sweep(&[200; 180], &azimuths, declared, false);
+        render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, LAT, LON)
+            .unwrap()
+            .2
+    };
+
+    let midpoints = [(1.0, 50.0), (3.0, 50.0), (181.0, 50.0)];
+    assert_probes(
+        &render(2.0),
+        true,
+        &midpoints,
+        "radials declaring the 2° they are apart by tile with no seam",
+    );
+    assert_probes(
+        &render(0.5),
+        false,
+        &midpoints,
+        "radials declaring 0.5° cover 0.5°, whatever their neighbours do",
+    );
+}
+
+/// A declaration is believed, not obeyed. A 200° arc of radials really 0.5°
+/// apart, every one of them declaring 45°: the sweep's own median step is
+/// what says 45° cannot be true, and the width is held to
+/// [`crate::azimuth::MAX_ADJACENT_GAP_STEPS`] of it.
+///
+/// Without the clamp the arc would paint 22.5° past each end and the sweep
+/// would cover 245° of sky it never looked at.
+#[test]
+fn a_lying_declaration_is_clamped_to_the_sweeps_median() {
+    let azimuths: Vec<f32> = (0..=400).map(|i| i as f32 * 0.5).collect();
+    let scan = l2_sweep(&vec![200; azimuths.len()], &azimuths, 45.0, false);
+    let (_, _, values) = render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, LAT, LON).unwrap();
+
+    assert_probes(
+        &values,
+        true,
+        &[(0.0, 50.0), (100.0, 50.0), (200.0, 50.0)],
+        "the arc itself still paints",
+    );
+    assert_probes(
+        &values,
+        false,
+        &[(205.0, 50.0), (250.0, 50.0), (355.0, 50.0)],
+        "45° is not a resolution the RDA has and the sweep's own spacing says so",
+    );
+}
+
+/// The absolute cap, which the per-sweep one cannot stand in for. Two
+/// radials 10° apart declaring nothing at all: their median circular gap is
+/// the *larger* of the two ways round, 350°, so both the fallback and the
+/// per-sweep ceiling derived from it are useless here.
+/// [`super::MAX_WEDGE_DEG`] is what keeps the pair from being drawn as two
+/// 350°-wide chord lenses covering the entire display.
+#[test]
+fn a_sweep_with_no_declaration_is_capped_at_a_sane_wedge() {
+    let scan = l2_sweep(&[200, 200], &[0.0, 10.0], 0.0, false);
+    let (_, _, values) = render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, LAT, LON).unwrap();
+
+    assert_probes(
+        &values,
+        true,
+        &[(0.0, 50.0), (10.0, 50.0)],
+        "both radials paint",
+    );
+    assert_probes(
+        &values,
+        false,
+        &[(4.0, 50.0), (90.0, 50.0), (270.0, 50.0)],
+        "two radials are two samples, not a sweep",
+    );
+}
+
+/// The same rule on the derived grids, which have no declaration to read: a
+/// 36° NROT sector must stop at its own edge.
+///
+/// NROT used to take its row width as `360 / rows`, which is the spacing
+/// only if the grid closes the circle — a 72-row sector came out at 5° a row
+/// and smeared 2.5° past both ends of the arc it was computed over.
+#[test]
+fn nrot_does_not_smear_past_its_sector() {
+    let scan = nrot_sector(72, 0.5);
+    let (_, _, values) = render_radar_to_image(
+        &scan,
+        L2_ELEVATION,
+        types::RadarProduct::NormalizedRotation,
+        LAT,
+        LON,
+    )
+    .unwrap();
+
+    let painted = values.iter().filter(|v| !v.is_nan()).count();
+    assert!(painted > 1_000, "the NROT sector painted only {painted} px");
+
+    for range in [20.0, 30.0, 40.0, 50.0] {
+        assert_probes(
+            &values,
+            false,
+            &[(37.0, range), (-1.5, range)],
+            "the sector runs 0° to 35.5° and the display must end where it does",
+        );
+    }
+}
+
+/// How far a sweep reaches is the longest of its radials, not the first one
+/// to carry the moment. A truncated opening radial used to speak for the
+/// whole sweep — and the number it set is the extent the raster is projected
+/// at, so a short answer is real data cut off at the edge of the image.
+#[test]
+fn max_range_is_robust_to_a_truncated_first_radial() {
+    let mut gates = vec![600u16; 8];
+    gates[0] = 100;
+    let scan = truncated_sweep(&gates);
+    let radials = find_sweep(&scan, PRODUCT, L2_ELEVATION).expect("the sweep is reachable");
+
+    assert_eq!(
+        super::compute_max_range(radials, PRODUCT),
+        150.0,
+        "600 gates of 0.25 km reach 150 km; the 100-gate opener reaches 25",
+    );
+    assert_eq!(
+        super::compute_max_range(radials, types::RadarProduct::Velocity),
+        0.0,
+        "a product no radial carries reaches nowhere",
+    );
+}
+
+/// A sweep whose radials carry different gate counts, 1° apart from 0°.
+fn truncated_sweep(gate_counts: &[u16]) -> Scan {
+    use nexrad_model::data::{MomentData, PulseWidth, RadialStatus, Sweep, VolumeCoveragePattern};
+    let radials = gate_counts
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| {
+            Radial::new(
+                0,
+                i as u16,
+                i as f32,
+                1.0,
+                RadialStatus::IntermediateRadialData,
+                1,
+                L2_ELEVATION,
+                Some(MomentData::from_fixed_point(
+                    n,
+                    0,
+                    250,
+                    8,
+                    SCALE,
+                    OFFSET,
+                    vec![200u8; n as usize],
+                )),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        })
+        .collect();
+    Scan::new(
+        VolumeCoveragePattern::new(
+            212,
+            0,
+            0.5,
+            PulseWidth::Short,
+            false,
+            0,
+            false,
+            0,
+            false,
+            false,
+            0,
+            false,
+            false,
+            Vec::new(),
+        ),
+        vec![Sweep::new(1, radials)],
+    )
+}
+
+/// The width arithmetic on its own, at the boundaries the fixtures above
+/// cannot reach: a NaN declaration, a negative one, and the point where the
+/// two ceilings swap over.
+#[test]
+fn a_wedge_width_is_never_negative_absent_or_unbounded() {
+    let w = super::l2_wedge_width_deg;
+    assert_eq!(w(0.5, 0.5), 0.5, "the ordinary super-res case");
+    assert_eq!(w(1.0, 1.0), 1.0, "the ordinary legacy case");
+    assert_eq!(w(0.0, 0.5), 0.5, "no declaration falls back to the median");
+    assert_eq!(w(-1.0, 0.5), 0.5, "nor is a negative one a narrow wedge");
+    assert_eq!(w(f64::NAN, 0.5), 0.5, "nor a NaN");
+    assert_eq!(w(0.5, 0.25), 0.375, "1.5 median steps is the tighter cap");
+    assert_eq!(w(45.0, 2.0), 2.0, "MAX_WEDGE_DEG is the tighter cap");
+    assert_eq!(w(0.0, 350.0), 2.0, "and it bounds the fallback too");
 }
 
 #[test]
