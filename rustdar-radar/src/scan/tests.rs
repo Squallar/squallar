@@ -57,6 +57,359 @@ fn a_volume_with_no_coverage_pattern_fails_rather_than_inventing_one() {
     );
 }
 
+/// **The premise every claim below rests on, and the one thing here that is
+/// not this crate's own code**: `crate::par`'s
+/// `into_par_iter().map(…).collect::<Vec<_>>()` returns results in **input**
+/// order, whatever order the workers happen to finish in.
+///
+/// [`super::fold_contributions`] decides "first wins" by walking its `Vec`, so
+/// if that `Vec` were ever in completion order every rule it states would
+/// silently become "whichever worker won the race" — the exact failure the fold
+/// exists to prevent, and one no fixture driving the fold directly can see.
+///
+/// So the map is given work shaped to scramble completion order and to punish
+/// index 0 specifically: a decreasing gradient across the rest, and an item 0
+/// slow enough to outlast every other worker's whole share. Instrumenting the
+/// same closure with a completion counter measured item 0 finishing at rank
+/// **1020 of 1024**, 680 of the 1024 items completing in the opposite half of
+/// the ordering, and the four error items completing at ranks 1020, 41, 4 and
+/// 219 — so a collect that honoured completion order would report index **512**
+/// as its first error, on nearly every run rather than rarely. The assertion
+/// below says 0.
+///
+/// On wasm32 the fallback is a plain `into_iter` and this is trivially true;
+/// it compiles and runs there anyway, because "trivially true on one arm" is
+/// how the two arms are kept saying the same thing.
+#[test]
+fn the_map_collects_in_input_order_however_the_workers_finish() {
+    use crate::par::*;
+
+    const N: usize = 1024;
+
+    let collected = (0..N)
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map(|i| {
+            // Item 0 outlasts any other worker's entire share, so it finishes
+            // last; the gradient scrambles the rest.
+            let iterations = if i == 0 { 2_000_000 } else { (N - i) * 16 };
+            let mut spin = 0u64;
+            for k in 0..iterations {
+                spin = spin.wrapping_add(std::hint::black_box(k as u64));
+            }
+            std::hint::black_box(spin);
+            if i % 256 == 0 { Err(i) } else { Ok(i) }
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(collected.len(), N, "every item comes back");
+    assert!(
+        collected
+            .iter()
+            .enumerate()
+            .all(|(position, item)| item.unwrap_or_else(|i| i) == position),
+        "the collected results are in input order, not completion order",
+    );
+    assert_eq!(
+        collected.iter().find_map(|item| item.err()),
+        Some(0),
+        "the first Err walking the results is the first in input order — the \
+         last item to finish, and the one a completion-ordered collect buries",
+    );
+}
+
+// -- the record-order fold ----------------------------------------------
+//
+// [`super::decoded`] decodes the LDM records apart and puts the answer back
+// together with [`super::fold_contributions`]. Everything that used to be
+// decided by "the walk got here first" is now decided by that fold, so these
+// drive it directly: they hand it contributions in a known order and check that
+// the order — not the arrival, not the value — is what picks the winner.
+
+/// A contribution that carries nothing but a coverage pattern, so a fold can
+/// reach its end without failing on `MissingCoveragePattern`.
+fn a_pattern_and_nothing_else(vcp_number: u16) -> RecordContribution {
+    RecordContribution {
+        declared_nyquist: crate::nyquist::DeclaredNyquist::empty(),
+        radials: Vec::new(),
+        coverage_pattern: Some(nexrad_model::data::VolumeCoveragePattern::new(
+            vcp_number,
+            1,
+            0.5,
+            nexrad_model::data::PulseWidth::Short,
+            false,
+            0,
+            false,
+            0,
+            false,
+            false,
+            0,
+            false,
+            false,
+            Vec::new(),
+        )),
+        site_location: None,
+    }
+}
+
+/// A radial identified only by its azimuth number, all on one cut so that
+/// `Sweep::from_radials` keeps them in one sweep and in the order given.
+fn radial_numbered(azimuth_number: u16) -> nexrad_model::data::Radial {
+    nexrad_model::data::Radial::new(
+        0,
+        azimuth_number,
+        f32::from(azimuth_number),
+        0.5,
+        nexrad_model::data::RadialStatus::IntermediateRadialData,
+        1,
+        0.5,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+/// **The failure mode `rustdar-radar/Cargo.toml` warns about**, held shut: the
+/// error a caller sees is the first one in *record order*, not whichever
+/// worker tripped first.
+///
+/// Two different variants in two different orders is the whole test. rayon's
+/// `Result` collect would keep either one depending on which thread lost, so a
+/// volume with two malformed records would report a variant that changed run to
+/// run — and the serial walk this replaced always reported the earlier record's.
+/// Note that the later error is not merely deprioritised, it is discarded: a
+/// fold that returned both, or the last, would fail this too.
+#[test]
+fn the_reported_error_is_the_first_in_record_order() {
+    let file = nexrad_data::volume::File::new(Vec::new());
+
+    let earlier_is_uncompressed = fold_contributions(
+        &file,
+        vec![
+            Ok(a_pattern_and_nothing_else(21)),
+            Err(nexrad_data::result::Error::UncompressedData),
+            Err(nexrad_data::result::Error::CompressedData),
+        ],
+    );
+    assert!(
+        matches!(
+            earlier_is_uncompressed,
+            Err(ScanError::Decode(
+                nexrad_data::result::Error::UncompressedData
+            ))
+        ),
+        "the first malformed record in the file is the one reported",
+    );
+
+    let earlier_is_compressed = fold_contributions(
+        &file,
+        vec![
+            Ok(a_pattern_and_nothing_else(21)),
+            Err(nexrad_data::result::Error::CompressedData),
+            Err(nexrad_data::result::Error::UncompressedData),
+        ],
+    );
+    assert!(
+        matches!(
+            earlier_is_compressed,
+            Err(ScanError::Decode(
+                nexrad_data::result::Error::CompressedData
+            ))
+        ),
+        "swapping the two records swaps the answer, so it is the order deciding",
+    );
+}
+
+/// `DeclaredNyquist::declare` is first-writer-wins *within* a table, and
+/// replaying the per-record tables in record order is what extends that rule
+/// across the whole volume — which is what makes the folded table the one the
+/// single serial walk produced.
+///
+/// Both orders again, because a fold that simply kept the smaller number, or
+/// the first table wholesale, would pass one of them.
+#[test]
+fn an_earlier_records_declared_nyquist_survives_a_later_records() {
+    let file = nexrad_data::volume::File::new(Vec::new());
+
+    let low_cut_first = |first: f64, second: f64| {
+        let mut earlier = a_pattern_and_nothing_else(21);
+        earlier.declared_nyquist = [(1u8, first)].into_iter().collect();
+        let mut later = a_pattern_and_nothing_else(21);
+        later.declared_nyquist = [(1u8, second), (2u8, 31.0)].into_iter().collect();
+        fold_contributions(&file, vec![Ok(earlier), Ok(later)])
+            .expect("two well-formed records fold")
+            .declared_nyquist
+    };
+
+    let ascending = low_cut_first(22.5, 35.5);
+    assert_eq!(
+        ascending.get(1),
+        Some(22.5),
+        "the earlier record's statement of cut 1 stands",
+    );
+    assert_eq!(
+        ascending.get(2),
+        Some(31.0),
+        "a cut only the later record names is still picked up",
+    );
+
+    assert_eq!(
+        low_cut_first(35.5, 22.5).get(1),
+        Some(35.5),
+        "swapping them swaps the answer, so it is the order deciding and not the value",
+    );
+}
+
+/// The radials come back in record order, and the site and the coverage
+/// pattern come from the earliest record that states one.
+///
+/// `Sweep::from_radials` walks its `Vec` in order and splits on a change of
+/// elevation number, so radial order *is* the `Vec`'s order — the reason the
+/// per-record radials are `extend`ed rather than merged.
+#[test]
+fn radials_the_site_and_the_pattern_all_come_from_the_earliest_record_that_has_them() {
+    // An ICAO for the site to be named with; the location itself comes off the
+    // radials, which is the half the fold decides.
+    let mut header = Vec::new();
+    header.extend_from_slice(b"AR2V0006.");
+    header.extend_from_slice(b"001");
+    header.extend_from_slice(&1u32.to_be_bytes());
+    header.extend_from_slice(&0u32.to_be_bytes());
+    header.extend_from_slice(b"KTLX");
+    let file = nexrad_data::volume::File::new(header);
+
+    let mut earlier = a_pattern_and_nothing_else(21);
+    earlier.radials = vec![radial_numbered(1), radial_numbered(2)];
+    earlier.site_location = Some(SiteLocation {
+        latitude: 35.25,
+        longitude: -97.5,
+        site_height: 370,
+        tower_height: 20,
+    });
+
+    let mut later = a_pattern_and_nothing_else(12);
+    later.radials = vec![radial_numbered(3), radial_numbered(4)];
+    later.site_location = Some(SiteLocation {
+        latitude: 0.0,
+        longitude: 0.0,
+        site_height: 0,
+        tower_height: 0,
+    });
+
+    let folded = fold_contributions(&file, vec![Ok(earlier), Ok(later)])
+        .expect("two well-formed records fold");
+
+    let sweeps = folded.scan.sweeps();
+    assert_eq!(sweeps.len(), 1, "one elevation number is one sweep");
+    assert_eq!(
+        sweeps[0]
+            .radials()
+            .iter()
+            .map(|r| r.azimuth_number())
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3, 4],
+        "the second record's radials follow the first record's, in record order",
+    );
+
+    let site = folded.scan.site().expect("the first record states one");
+    assert_eq!(site.latitude(), 35.25);
+    assert_eq!(site.longitude(), -97.5);
+    assert_eq!(site.height_meters(), 370);
+    assert_eq!(site.identifier_string(), "KTLX");
+    assert_eq!(
+        folded.scan.coverage_pattern_number().number(),
+        21,
+        "the first record's message 5 wins, as it does in `scan()`",
+    );
+}
+
+/// The same "first record wins" through the real decode, records and all:
+/// two records each carrying a message 5, decoded under [`crate::par`].
+///
+/// # What the bytes are
+///
+/// A 24-byte volume header followed by two size-prefixed LDM records. Real
+/// records are bzip2-compressed, and `Record::compressed` decides that on two
+/// magic bytes — so a record whose payload does not carry them is handed
+/// straight to the message decoder, which is what lets a multi-record volume be
+/// written out here without a compressor. Each record is one 2432-byte message
+/// frame with its leading four bytes overwritten by the LDM size prefix, which
+/// lands inside the message header's `rpg_unknown` padding and so changes
+/// nothing the decoder reads.
+#[test]
+fn the_first_records_coverage_pattern_wins_through_the_parallel_decode() {
+    const FRAME: usize = 2432;
+    const MESSAGE_HEADER: usize = 28;
+
+    fn message_5_record(vcp_number: u16) -> Vec<u8> {
+        let mut frame = vec![0u8; FRAME];
+        // The LDM record size prefix, over the first four bytes of the message
+        // header's `rpg_unknown`. Non-zero, which is also what keeps
+        // `split_compressed_records` on the LDM path rather than the legacy one.
+        frame[0..4].copy_from_slice(&((FRAME - 4) as u32).to_be_bytes());
+        frame[12..14].copy_from_slice(&11u16.to_be_bytes()); // segment size, halfwords
+        frame[15] = 5; // RDA volume coverage pattern
+        frame[16..18].copy_from_slice(&1u16.to_be_bytes()); // sequence number
+        frame[24..26].copy_from_slice(&1u16.to_be_bytes()); // segment count
+        frame[26..28].copy_from_slice(&1u16.to_be_bytes()); // segment number
+        let vcp = MESSAGE_HEADER;
+        frame[vcp..vcp + 2].copy_from_slice(&11u16.to_be_bytes()); // size, halfwords
+        frame[vcp + 2..vcp + 4].copy_from_slice(&2u16.to_be_bytes()); // pattern type
+        frame[vcp + 4..vcp + 6].copy_from_slice(&vcp_number.to_be_bytes());
+        frame[vcp + 6..vcp + 8].copy_from_slice(&0u16.to_be_bytes()); // elevation cuts
+        frame[vcp + 8] = 1; // version
+        frame[vcp + 10] = 2; // doppler velocity resolution, 0.5
+        frame[vcp + 11] = 2; // pulse width, short
+        frame
+    }
+
+    let volume = |first: u16, second: u16| {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"AR2V0006.");
+        bytes.extend_from_slice(b"001");
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(b"KTLX");
+        assert_eq!(bytes.len(), 24, "the Archive II header is 24 bytes");
+        bytes.extend_from_slice(&message_5_record(first));
+        bytes.extend_from_slice(&message_5_record(second));
+        nexrad_data::volume::File::new(bytes)
+    };
+
+    let file = volume(21, 12);
+    assert_eq!(
+        file.records().expect("the records split").len(),
+        2,
+        "premise: this really is a two-record volume",
+    );
+    assert!(
+        !file.records().expect("the records split")[0].compressed(),
+        "premise: the records go to the decoder without a decompress",
+    );
+
+    assert_eq!(
+        decoded(&file)
+            .expect("the volume decodes")
+            .scan
+            .coverage_pattern_number()
+            .number(),
+        21,
+    );
+    assert_eq!(
+        decoded(&volume(12, 21))
+            .expect("the volume decodes")
+            .scan
+            .coverage_pattern_number()
+            .number(),
+        12,
+        "swapping the records swaps the answer, so record order survives the map",
+    );
+}
+
 // -- live ---------------------------------------------------------------
 //
 // Run with:

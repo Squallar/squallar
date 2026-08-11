@@ -44,8 +44,9 @@ rayon = "=1.12.0"
 # a worker reaches first rather than the first in record order. A volume with
 # more than one malformed record can therefore surface a different error variant
 # than the serial arm. Immaterial while this path is tests-only on
-# single-record fixtures, and worth remembering if `scan::decoded` is ever
-# parallelised the same way — there the errors want folding in record order.
+# single-record fixtures. `scan::decoded` now fans out the same way and does
+# *not* inherit it: it collects a `Vec<Result<_>>` and folds it in record order,
+# so the error it reports is the first in the file. See `scan::fold_contributions`.
 #
 # Target-gated for rayon's reason, not its own: the feature's only effect is to
 # pull rayon in, and rayon cannot build a pool in the browser.
@@ -53,10 +54,11 @@ rayon = "=1.12.0"
 # **This is not the application's decode path**, and the entry is worth no more
 # than it says. `scan::decoded` walks the records itself in one pass, because it
 # has to read each Message 31's declared Nyquist velocity before `into_radial`
-# throws it away; that walk is where a downloaded volume actually goes and it is
-# still serial. What this reaches is `File::scan()` — the upstream oracle
-# `scan::tests` pins that one-pass walk against, and anything outside this crate
-# that decodes a volume the ordinary way.
+# throws it away; that walk is where a downloaded volume actually goes, and it
+# fans out over `crate::par` rather than over this. What this reaches is
+# `File::scan()` — the upstream oracle `scan::tests` pins that one-pass walk
+# against, and anything outside this crate that decodes a volume the ordinary
+# way.
 nexrad-data = { workspace = true, features = ["parallel"] }
 
 # Gated, not plain `[dev-dependencies]`: `rt-multi-thread` is not one of the

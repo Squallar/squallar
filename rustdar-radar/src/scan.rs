@@ -78,56 +78,216 @@ pub struct DecodedScan {
 /// `scan()`, which also matches only `DigitalRadarData`. Widening that is a
 /// separate change with its own evidence to gather, not a side effect of this
 /// one.
+///
+/// # Why the records are decoded in parallel
+///
+/// The walk above is one walk, but it is not a cheap one, and 92% of it is
+/// bzip2. `perf record` over one volume's decode puts 53.2% in
+/// `bzip2::mem::Decompress::decompress` — the adapter `BzDecoder::read` drives
+/// — and 38.5% in `libbz2_rs_sys::decompress` under it. Nothing else reaches
+/// 1%: the Message 31 parse this walk exists for is two tenths of a percent,
+/// and the rest is libc moving bytes for those two.
+///
+/// A volume is 50–130 LDM records, each **independently** compressed, so that
+/// 92% is embarrassingly parallel at almost perfect granularity — and this is a
+/// path every volume open, every timeline scrub, every "next scan", the archive
+/// fallback when a chunk feed retires and every frame of a loop download goes
+/// through, at 1.2–8.0 billion instructions a volume.
+///
+/// So [`contribution`] decodes one record on its own, the map runs under
+/// [`crate::par`] — rayon on desktop, the sequential stand-in on the web, one
+/// code path either way — and [`fold_contributions`] puts the pieces back
+/// together **in record order**. Order is the whole of the correctness
+/// argument and every part of it is stated there, including why the results
+/// come back as a `Vec<Result<_>>` rather than a `Result<Vec<_>>`.
+///
+/// Nothing about the answer changes, and it is not meant to. The map is
+/// order-preserving —
+/// [`tests::the_map_collects_in_input_order_however_the_workers_finish`] holds
+/// that down rather than assuming it — `fold_contributions` is where every
+/// "first wins" in the walk is decided and the fixtures below pin it, and
+/// [`tests::live_one_pass_decode_matches_the_two_pass_decode`] still holds the
+/// whole thing against `File::scan()` and against
+/// [`crate::nyquist::DeclaredNyquist::from_archive`]'s own serial walk on a
+/// real volume.
+///
+/// # What does change: the work done on the way to an error
+///
+/// The answer is the serial walk's; the *effort* spent reaching it is not. The
+/// serial walk stopped at the first malformed record, and this one decodes
+/// every record before the fold ever looks at the first `Err` — a volume
+/// corrupt at record 2 of 60 now costs a whole parallel decode, measured at
+/// 23.5 ms against the 3 ms the serial walk took to give up. Three consequences,
+/// all of them small and all of them deliberate:
+///
+/// * wasted work on a path that is already failing, which is the price of the
+///   ordered error and cheap next to what the success path saves;
+/// * a panic in a *later* record now surfaces where the serial walk would have
+///   returned a clean `Err` from an earlier one, because the later record is
+///   now reached;
+/// * a decompression bomb in a later record is now decompressed, and up to
+///   `threads` of them at once. Archive volumes come from the NWS bucket over
+///   TLS, so this is a property to know rather than a threat model that
+///   changed.
+///
+/// # One pool, shared with the renderer
+///
+/// This is rayon's *global* pool, which is also where [`crate::render`] and
+/// [`crate::voxel`] run their `par_iter`s — some of them from the frame thread.
+/// A render issued while a decode is in flight can now wait for a worker to
+/// finish the record it is holding, which is one bzip2 decompress, 1–8 ms. The
+/// decode window it might land in is also ~10× shorter than it was, so the
+/// integral is very likely better; it is written down because it is a new
+/// interaction, not because it has been observed to hurt.
 fn decoded(file: &nexrad_data::volume::File) -> Result<DecodedScan> {
+    use crate::par::*;
+
+    // `Vec<Result<_>>`, not `Result<Vec<_>>`: rayon's `Result` collect keeps
+    // whichever error a worker tripped on first, and the error this reports has
+    // to be the first one in the *file*. `into_par_iter` is `crate::par`'s —
+    // rayon's off wasm32, a plain `into_iter` on it, so the browser walks the
+    // same records in the same order through the same fold.
+    let contributions = file
+        .records()?
+        .into_par_iter()
+        .map(contribution)
+        .collect::<Vec<_>>();
+
+    fold_contributions(file, contributions)
+}
+
+/// The site's location, as one Message 31's volume data block states it.
+///
+/// Stated on every radial; the first one wins, as it does in `scan()`.
+struct SiteLocation {
+    latitude: f32,
+    longitude: f32,
+    site_height: i16,
+    tower_height: u16,
+}
+
+/// What one LDM record contributes to the volume.
+///
+/// Per-record accumulators rather than shared ones. The radial `Vec` is
+/// order-dependent, and a table shared behind a lock would both serialise the
+/// decode it exists to parallelise and turn "first radial wins" into "whichever
+/// thread got there first". Everything here is folded in record order by
+/// [`fold_contributions`].
+struct RecordContribution {
+    declared_nyquist: crate::nyquist::DeclaredNyquist,
+    radials: Vec<nexrad_model::data::Radial>,
+    coverage_pattern: Option<nexrad_model::data::VolumeCoveragePattern>,
+    site_location: Option<SiteLocation>,
+}
+
+/// One record's decompress-and-decode: the body of what used to be the walk's
+/// inner loop, lifted out so it can run on a worker.
+///
+/// The error type is `nexrad_data`'s rather than [`ScanError`] because every
+/// failure reachable in here is one of upstream's — which is what keeps the
+/// variant a caller sees the same one `scan()` raised — and because it is what
+/// a worker has to be able to carry back.
+fn contribution(
+    record: nexrad_data::volume::Record<'_>,
+) -> std::result::Result<RecordContribution, nexrad_data::result::Error> {
     use nexrad_decode::messages::MessageContents;
 
-    // The site's location is stated on every radial's volume block; the first
-    // one wins, as it does in `scan()`.
-    struct SiteLocation {
-        latitude: f32,
-        longitude: f32,
-        site_height: i16,
-        tower_height: u16,
+    let record = if record.compressed() {
+        record.decompress()?
+    } else {
+        record
+    };
+
+    let mut out = RecordContribution {
+        declared_nyquist: crate::nyquist::DeclaredNyquist::empty(),
+        radials: Vec::new(),
+        coverage_pattern: None,
+        site_location: None,
+    };
+
+    for message in record.messages()? {
+        match message.into_contents() {
+            MessageContents::DigitalRadarData(m) => {
+                if out.site_location.is_none()
+                    && let Some(volume) = m.volume_data_block()
+                {
+                    out.site_location = Some(SiteLocation {
+                        latitude: volume.inner().latitude_raw(),
+                        longitude: volume.inner().longitude_raw(),
+                        site_height: volume.inner().site_height_raw(),
+                        tower_height: volume.inner().tower_height_raw(),
+                    });
+                }
+                // Before `into_radial`, which is where the number is lost.
+                out.declared_nyquist.declare_from_message(&m);
+                // Through `nexrad_data`'s error rather than straight to
+                // `ScanError`, so a decode failure here is the same variant it
+                // was when `scan()` raised it.
+                out.radials
+                    .push(m.into_radial().map_err(nexrad_data::result::Error::from)?);
+            }
+            // First one wins, as in `scan()`: a repeat of message 5 inside one
+            // volume is the same pattern restated. First *in this record* here;
+            // the fold keeps the first record that has one, which is the same
+            // volume-wide answer.
+            MessageContents::VolumeCoveragePattern(m) if out.coverage_pattern.is_none() => {
+                out.coverage_pattern = Some(crate::chunks::coverage_pattern_from(&m));
+            }
+            _ => {}
+        }
     }
 
+    Ok(out)
+}
+
+/// Fold the per-record results back into one volume, **in record order**.
+///
+/// Order is the whole of the correctness argument for decoding the records
+/// apart, and this function is where all of it lives:
+///
+/// * **Errors fold in record order.** rayon's `Result` collect keeps whichever
+///   error a worker reached first, so a volume with two malformed records could
+///   report either — a race, and one that would surface as a flaky error
+///   *variant* rather than a flaky decode. Taking the first `Err` walking the
+///   `Vec` in record order reports the first failure in the *file*, which is
+///   the one the serial walk reported. This is the failure mode
+///   `rustdar-radar/Cargo.toml` warns about where it enables
+///   `nexrad-data/parallel`.
+/// * **The Nyquist table.** [`crate::nyquist::DeclaredNyquist::declare`] is
+///   first-writer-wins, so each record's own table names a cut with its
+///   earliest radial, and replaying those tables in record order into one
+///   accumulator names each cut with the earliest radial in the volume —
+///   exactly what one serial walk produced.
+/// * **Radials** are `extend`ed in record order, which is the order the serial
+///   walk `push`ed them in, and `Sweep::from_radials` is fed the same `Vec`.
+/// * **The site and the coverage pattern** take the first record that states
+///   one, which is the first radial and the first message 5 in the file.
+///
+/// It takes the whole `Vec` rather than an iterator of `Result`s because the
+/// map has to run to completion anyway — rayon has already spent the work by
+/// the time the first error is visible — and because short-circuiting on the
+/// first `Err` would leave the reported error dependent on how far the caller
+/// got, which is the property this exists to remove.
+fn fold_contributions(
+    file: &nexrad_data::volume::File,
+    contributions: Vec<std::result::Result<RecordContribution, nexrad_data::result::Error>>,
+) -> Result<DecodedScan> {
     let mut declared_nyquist = crate::nyquist::DeclaredNyquist::empty();
     let mut radials: Vec<nexrad_model::data::Radial> = Vec::new();
     let mut coverage_pattern = None;
     let mut site_location: Option<SiteLocation> = None;
 
-    for record in file.records()? {
-        let record = if record.compressed() {
-            record.decompress()?
-        } else {
-            record
-        };
-        for message in record.messages()? {
-            match message.into_contents() {
-                MessageContents::DigitalRadarData(m) => {
-                    if site_location.is_none()
-                        && let Some(volume) = m.volume_data_block()
-                    {
-                        site_location = Some(SiteLocation {
-                            latitude: volume.inner().latitude_raw(),
-                            longitude: volume.inner().longitude_raw(),
-                            site_height: volume.inner().site_height_raw(),
-                            tower_height: volume.inner().tower_height_raw(),
-                        });
-                    }
-                    // Before `into_radial`, which is where the number is lost.
-                    declared_nyquist.declare_from_message(&m);
-                    // Through `nexrad_data`'s error rather than straight to
-                    // `ScanError`, so a decode failure here is the same variant
-                    // it was when `scan()` raised it.
-                    radials.push(m.into_radial().map_err(nexrad_data::result::Error::from)?);
-                }
-                // First one wins, as in `scan()`: a repeat of message 5 inside
-                // one volume is the same pattern restated.
-                MessageContents::VolumeCoveragePattern(m) if coverage_pattern.is_none() => {
-                    coverage_pattern = Some(crate::chunks::coverage_pattern_from(&m));
-                }
-                _ => {}
-            }
+    for contribution in contributions {
+        let contribution = contribution?;
+        for (elevation_number, metres_per_second) in contribution.declared_nyquist.iter() {
+            declared_nyquist.declare(elevation_number, metres_per_second);
+        }
+        radials.extend(contribution.radials);
+        if coverage_pattern.is_none() {
+            coverage_pattern = contribution.coverage_pattern;
+        }
+        if site_location.is_none() {
+            site_location = contribution.site_location;
         }
     }
 
