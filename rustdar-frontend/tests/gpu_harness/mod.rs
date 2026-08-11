@@ -16,7 +16,7 @@
 use egui_wgpu::wgpu;
 use rustdar_frontend::constants::VOLUME_LUT_BYTES;
 use rustdar_frontend::egui_renderer::AttachmentConfig;
-use rustdar_frontend::volume::raymarch::{FLOOR_FORMAT, PaneMirror, VolumePipelines};
+use rustdar_frontend::volume::raymarch::{CoarseLevel, FLOOR_FORMAT, PaneMirror, VolumePipelines};
 use rustdar_frontend::volume::uniform::VolumeUniform;
 
 /// Held for the length of a test, so only one talks to the GPU at a time.
@@ -269,7 +269,8 @@ pub fn iso_uniform(cells: [u32; 3]) -> VolumeUniform {
     uniform
 }
 
-/// Render one raymarched frame and read it back.
+/// Render one raymarched frame and read it back, with the grid's coarse level
+/// built — [`raymarch_once_at`] at [`CoarseLevel::Built`].
 #[allow(clippy::too_many_arguments)]
 pub fn raymarch_once(
     device: &wgpu::Device,
@@ -281,8 +282,40 @@ pub fn raymarch_once(
     uniform: &VolumeUniform,
     size: [u32; 2],
 ) -> Vec<[u8; 4]> {
+    raymarch_once_at(
+        device,
+        queue,
+        pipelines,
+        cells,
+        indices,
+        lut,
+        uniform,
+        size,
+        CoarseLevel::Built,
+    )
+}
+
+/// [`raymarch_once`], told whether this grid is uploaded with a coarse mip
+/// level at all.
+///
+/// The decision `volume::bridge` makes per adapter and per grid, and on the
+/// shipped desktop default it is [`CoarseLevel::Omitted`] — so a suite that
+/// only ever went through [`raymarch_once`] would render every fixture on the
+/// one arm production mostly does not take.
+#[allow(clippy::too_many_arguments)]
+pub fn raymarch_once_at(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipelines: &VolumePipelines,
+    cells: [u32; 3],
+    indices: &[u8],
+    lut: &[u8],
+    uniform: &VolumeUniform,
+    size: [u32; 2],
+    coarse: CoarseLevel,
+) -> Vec<[u8; 4]> {
     let volume = pipelines
-        .upload_volume(device, queue, cells, indices, lut)
+        .upload_volume_at(device, queue, cells, indices, lut, coarse)
         .expect("the grid and palette were refused");
     assert_eq!(
         volume.cells(),

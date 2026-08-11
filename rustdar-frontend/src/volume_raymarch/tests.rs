@@ -521,8 +521,12 @@ fn the_step_count_is_a_constant_the_loop_bound_names() {
 /// very tolerance (0.142 index units against a 0.124 budget, measured over a
 /// desktop-shaped random plane) while the sweep beside it passed. Driving the
 /// production function over every reachable `(n, Σx)` closes that gap: with
-/// integer sums the block is fully described by those two numbers, so 16,320
-/// cases is not a sample.
+/// integer sums the block is fully described by those two numbers, so the
+/// 9,152 cases below are not a sample. (Not 16,320: that is eight `n` over the
+/// full `1..=2040`, before the `n..=` floor drops the sums too small for `n`
+/// cells of at least 1 and the `255 * n` cap drops the ones too large for `n`
+/// cells of at most 255. The sweep asserts its own count, so this number
+/// cannot drift from the loop again.)
 #[test]
 fn the_grid_mip_is_the_mean_of_each_coarse_blocks_measured_cells() {
     /// One texel of a packed plane, as `(R, G)`, through the production
@@ -617,6 +621,7 @@ fn the_grid_mip_is_the_mean_of_each_coarse_blocks_measured_cells() {
     // change the answer — so this sweep is exhaustive rather than sampled.
     let mut worst = 0.0f32;
     let mut worst_at = (0u32, 0u32);
+    let mut cases = 0u32;
     for n in 1..=8u32 {
         // Below `n` is unreachable: a measured cell is `1..=255`, never 0.
         for sum in n..=255 * n {
@@ -636,8 +641,15 @@ fn the_grid_mip_is_the_mean_of_each_coarse_blocks_measured_cells() {
                 worst = error.abs();
                 worst_at = (n, sum);
             }
+            cases += 1;
         }
     }
+    assert_eq!(
+        cases, 9152,
+        "the exhaustiveness argument in this test's doc names a count, and \
+         the count is now {cases}: the sweep no longer covers what it says it \
+         covers, or covers it more than once",
+    );
     assert!(
         worst < MIP_QUANTISATION_TOLERANCE,
         "the mip's worst reconstruction error is {worst} index units at \
@@ -982,7 +994,15 @@ fn a_grids_byte_count_is_four_per_cell_and_the_budget_counts_the_mip() {
 /// zeroed, which is the worse of both outcomes: the memory is still held, and
 /// a uniform that did ask for level 1 would march empty space instead of being
 /// clamped back to the raw field. `mip_level_count` is the thing that has to
-/// move, so `mip_level_count` is what this asserts, on every shipped shape.
+/// move.
+///
+/// What this asserts is [`grid_mip_levels`] — the expression the descriptor's
+/// `mip_level_count` is set from — on every shipped shape. It is deliberately
+/// not the same statement: the field itself is only observable through a
+/// `create_texture`, so a descriptor that had stopped reading this function
+/// would pass here. `an_omitted_coarse_level_marches_the_raw_field_at_the_
+/// cloud_rung` in `tests/volume_gpu.rs` is where the descriptor is on the
+/// hook, against a device, and it is the only thing standing under that half.
 ///
 /// The budget arithmetic deliberately does *not* follow: `grid_bytes_with_mips`
 /// is a ceiling and an eviction figure, and both want the level that may be
@@ -1006,7 +1026,7 @@ fn an_omitted_coarse_level_leaves_the_texture_with_one_level() {
             without / 8,
             "every shipped shape halves on all three axes, so the level left \
              out is an eighth of the raw field — 4 MiB of the desktop grid's \
-             36, and 56 MiB across a 14-frame desktop 3D loop",
+             36, and 52 MiB across a desktop 3D loop's 13 frames",
         );
     }
     // A grid too small to halve keeps one level either way — the shape rung

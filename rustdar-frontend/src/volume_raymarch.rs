@@ -1243,7 +1243,7 @@ pub fn grid_bytes(cells: [u32; 3]) -> Option<usize> {
 /// under-count, so both want the level that *may* be there — an upload that
 /// skipped it costs 11% less than this says on the desktop shape, which is the
 /// safe direction for both callers. The saving is real GPU memory either way;
-/// what it does not do is let the loop hold a fifteenth frame.
+/// what it does not do is let the loop hold a fourteenth frame.
 pub fn grid_bytes_with_mips(cells: [u32; 3]) -> Option<usize> {
     let mut total = grid_bytes(cells)?;
     if grid_mip_levels(cells, CoarseLevel::Built) > 1 {
@@ -1269,7 +1269,9 @@ pub fn grid_bytes_with_mips(cells: [u32; 3]) -> Option<usize> {
 ///
 /// Everywhere else it was 4 MiB of a 36 MiB upload, a second `write_texture`,
 /// and a CPU pass over the whole index plane, to fill a level nothing sampled.
-/// A 14-frame desktop 3D loop held 56 MiB of it.
+/// A desktop 3D loop's 13 frames held 52 MiB of it, and 56 MiB at the peak
+/// `DESKTOP_MAX_LOOP_VOLUME_FRAMES` is sized for: those grids beside the one
+/// live volume the budget also has to admit.
 ///
 /// Both facts the decision needs are fixed for a grid's whole life — the
 /// adapter's shading rung is chosen once when the renderer is built, and the

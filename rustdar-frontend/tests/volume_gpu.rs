@@ -60,7 +60,7 @@
 use egui_wgpu::wgpu;
 use rustdar_frontend::constants::VOLUME_LUT_BYTES;
 use rustdar_frontend::volume::raymarch::{
-    ENTRY_FS_BLIT_GAMMA, ENTRY_FS_BLIT_LINEAR, OffscreenTarget, VolumePipelines,
+    CoarseLevel, ENTRY_FS_BLIT_GAMMA, ENTRY_FS_BLIT_LINEAR, OffscreenTarget, VolumePipelines,
     mirror_is_gamma_encoded,
 };
 use rustdar_frontend::volume::uniform::{ISO_OFF, VolumeUniform};
@@ -68,8 +68,9 @@ use rustdar_frontend::volume::uniform::{ISO_OFF, VolumeUniform};
 mod gpu_harness;
 use gpu_harness::{
     MIRROR_FORMAT, attachments, box_from_clip_down, centre, device, equatorial_box_km,
-    equatorial_floor_lanes, eye_outside, gpu_lock, grey_ramp_lut, iso_uniform, mercator_y, palette,
-    planted_mirror, raymarch_once, raymarch_once_with_floor, read_back, render_target, slab_ramp,
+    equatorial_floor_lanes, eye_outside, gpu_lock, grey_ramp_lut, iso_uniform, mercator_y,
+    opaque_white_lut, palette, planted_mirror, raymarch_once, raymarch_once_at,
+    raymarch_once_with_floor, read_back, render_target, slab_ramp,
 };
 
 /// Open a pass that clears to opaque black, which is what `EguiRenderer::draw`
@@ -1829,6 +1830,145 @@ fn the_smoothed_reconstruction_spreads_a_lone_voxel() {
         "the smoothed reconstruction painted {cloud} px against the raw \
          field's {raw} — more than the two-cell kernel can explain, so the \
          coarse level's bytes are misplaced",
+    );
+}
+
+/// A grid uploaded **without** its coarse level marches the raw field at the
+/// cloud rung — the same image, pixel for pixel, as asking for level 0.
+///
+/// `volume::bridge::coarse_level_for` leaves the level out on every arm but
+/// one, so [`CoarseLevel::Omitted`] is what the shipped desktop default
+/// uploads: at the 460 km box the taper has already taken the reconstruction
+/// LOD to zero, and every other platform ceiling puts `GradientShading::Off`
+/// on the adapter. Nothing else in these suites renders through that arm —
+/// `raymarch_once` uploads at [`CoarseLevel::Built`] — which is what leaves
+/// two mutations of the omission alive that no host test can reach:
+///
+/// * **The descriptor allocating a level the write does not fill.** Level 1
+///   would exist and be zeroed (WebGPU zero-initialises), so a march at the
+///   cloud rung samples all-air through it and this fixture paints *nothing*:
+///   0 px of 4096. The saving would also not be a saving — the 4 MiB is still
+///   resident.
+/// * **The write not being gated with it.** A mip-1 `write_texture` against a
+///   one-level texture is a validation error raised inside
+///   `egui_wgpu::CallbackTrait::prepare`, which has no `Result` to carry it
+///   anywhere and no user-visible symptom on a driver that tolerates it. The
+///   error scope below is what makes it a failing assertion rather than a line
+///   in a log.
+///
+/// The equality is exact rather than tolerant because the clamp is exact:
+/// WebGPU clamps the sample level to the levels that exist, and with one level
+/// that is level 0 itself, not something very near it. `field_at`'s LOD is the
+/// only thing varying between the two renders — the step is held at the cloud
+/// rung's own for both — so a difference of any size is the texture, not the
+/// march.
+///
+/// # The control is not optional
+///
+/// A shader that had stopped reading `reconstruction_lod` at all would satisfy
+/// the equality for entirely the wrong reason. So the same fixture is rendered
+/// a third time at the same rung with the level *built*, and required to
+/// differ: that is the level being sampled, which is what makes the first
+/// comparison a statement about the omission rather than about a dead uniform.
+///
+/// ```text
+/// cargo test -p rustdar-frontend --test volume_gpu \
+///     an_omitted_coarse_level_marches_the_raw_field_at_the_cloud_rung \
+///     -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
+fn an_omitted_coarse_level_marches_the_raw_field_at_the_cloud_rung() {
+    let _serialised = gpu_lock();
+    let size = [64u32, 64];
+    let cells = [16u32, 16, 16];
+    /// The rung a desktop asks for when the taper has not closed it.
+    const CLOUD_LOD: f32 = rustdar_frontend::volume::bridge::CLOUD_RECONSTRUCTION_LOD;
+
+    let (device, queue) = device();
+    let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Bgra8Unorm));
+    pipelines.upload_quad(&queue);
+
+    // The isolated spike the reconstruction is most visible on — one filled
+    // cell in empty air — so a level that is present and empty, and a level
+    // that is absent, cannot paint the same thing.
+    let mut indices = vec![0u8; (cells[0] * cells[1] * cells[2]) as usize];
+    indices[((8 * cells[1] + 8) * cells[0] + 8) as usize] = 255;
+    let lut = opaque_white_lut();
+
+    let mut uniform = VolumeUniform::new([10.0, 10.0, 10.0], cells);
+    uniform.box_from_clip = box_from_clip_down(2);
+    uniform.eye_in_box = eye_outside(2);
+    uniform.extinction_per_km = 1000.0;
+    uniform.gradient_shading = false;
+    // The cloud rung's own step, held for every render below: the LOD is the
+    // one variable, so an exact comparison is a comparison of the texture.
+    uniform.step_cells = rustdar_frontend::volume::bridge::CLOUD_STEP_CELLS;
+
+    let render = |coarse: CoarseLevel, lod: f32| {
+        let mut uniform = uniform;
+        uniform.reconstruction_lod = lod;
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let pixels = raymarch_once_at(
+            &device, &queue, &pipelines, cells, &indices, &lut, &uniform, size, coarse,
+        );
+        let error = pollster::block_on(scope.pop());
+        assert!(
+            error.is_none(),
+            "uploading a {coarse:?} grid and marching it at LOD {lod} raised \
+             a validation error: {}. In production this lands inside \
+             `prepare`, which has no `Result` — writing mip 1 of a texture \
+             that has only mip 0 is silent there.",
+            error.map(|e| e.to_string()).unwrap_or_default(),
+        );
+        pixels
+    };
+
+    let raw = render(CoarseLevel::Omitted, 0.0);
+    let clamped = render(CoarseLevel::Omitted, CLOUD_LOD);
+    let built = render(CoarseLevel::Built, CLOUD_LOD);
+
+    let painted = |pixels: &[[u8; 4]]| pixels.iter().filter(|px| px[3] > 0).count();
+    let (raw_px, clamped_px, built_px) = (painted(&raw), painted(&clamped), painted(&built));
+    println!(
+        "omitted coarse level: level 0 paints {raw_px} px, the cloud rung \
+         {clamped_px} px, and the built level at that rung {built_px} px, of \
+         {} pixels",
+        size[0] * size[1],
+    );
+
+    assert!(
+        raw_px > 0,
+        "precondition: the fixture must paint at level 0, or every comparison \
+         below is between two empty images",
+    );
+    // The first pixel that differs rather than `assert_eq!` on the images:
+    // equal is equal either way, and the two 4096-texel vectors an inequality
+    // prints are a hundred kilobytes that say less than this line does.
+    let parted = raw
+        .iter()
+        .zip(&clamped)
+        .position(|(level_0, rung)| level_0 != rung);
+    let at = parted.unwrap_or_default();
+    assert!(
+        parted.is_none(),
+        "an omitted coarse level marched at LOD {CLOUD_LOD} is not level 0's \
+         own image: it paints {clamped_px} px where level 0 paints {raw_px}, \
+         and the images first part at pixel {at} ({:?} against {:?}). The \
+         sampler clamps an out-of-range level to the levels that exist, so a \
+         grid with one of them must render the raw field here; a descriptor \
+         that allocated a second level nothing writes gives a zeroed one to \
+         sample instead",
+        raw[at],
+        clamped[at],
+    );
+    assert!(
+        built != raw,
+        "control: with the coarse level built, the same fixture at the same \
+         rung rendered level 0's own image ({built_px} px against {raw_px}). \
+         `reconstruction_lod` is reaching nothing, so the equality above holds \
+         for a reason that has nothing to do with the omission and would go on \
+         holding over a texture that had lost its second level entirely",
     );
 }
 
