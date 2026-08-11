@@ -10,6 +10,7 @@
 //! interpolated echo tops here interpolate between tilt centers, calibrated
 //! against a reference implementation's readouts.
 
+use crate::par::*;
 use crate::types::RadarProduct;
 use nexrad_model::data::{DataMoment, MomentValue, Radial, Scan};
 
@@ -182,74 +183,45 @@ impl VolumeCube {
     }
 
     /// Build the cube with an explicit statistic per moment.
+    ///
+    /// The tilts are built **across rayon's pool**, one task per elevation.
+    /// [`tilt_at`] is a pure function of `(scan, moments, chosen, key)` — see
+    /// its own note for why, and [`LinearZMemo`] for the table that would
+    /// otherwise be shared — so the tasks touch nothing in common but
+    /// immutable inputs, and no float crosses between them: **nothing in the
+    /// parallel region is summed across tilts**, so a tilt's grid is the same
+    /// arithmetic in the same order on the same inputs whichever thread runs
+    /// it.
+    ///
+    /// `collect` into a `Vec` is order-preserving for an indexed parallel
+    /// iterator, so `tilts` still comes out in ascending-elevation order.
+    ///
+    /// **That ordering is load-bearing, not incidental**, and the reason is
+    /// downstream rather than here. Products *do* combine tilts, along the one
+    /// axis this function must therefore keep stable: [`crate::hail`] and
+    /// [`crate::vil`] accumulate a running `f64` over the tilt index per
+    /// column, and [`crate::eet`] and [`compute_echo_tops`] scan
+    /// `(0..tilts.len()).rev()` and stop at the first tilt that qualifies. All
+    /// four are outside the parallel region and untouched by it — and all four
+    /// are safe only because the tilts they walk are the same tilts, in the
+    /// same order, as a serial walk would have produced. Reordering them would
+    /// reassociate those sums and change which tilt "topmost" names, without
+    /// making any single grid wrong.
+    ///
+    /// [`tests::the_tilts_the_pool_builds_are_the_tilts_a_serial_walk_builds`]
+    /// pins order and contents against a serial walk over the same selection,
+    /// on top of the pinned echo-tops digest this function is the direct
+    /// producer of.
     pub fn build_with_stats(
         scan: &Scan,
         moments: &[(RadarProduct, CellStat)],
         policy: DedupPolicy,
     ) -> Self {
-        // Per moment: (elevation key, sweep index, displaced an earlier
-        // same-elevation sweep), in encounter order.
-        let mut chosen: Vec<Vec<(f64, usize, bool)>> = vec![Vec::new(); moments.len()];
-        for (si, sweep) in scan.sweeps().iter().enumerate() {
-            let Some(first) = sweep.radials().first() else {
-                continue;
-            };
-            // Keyed on the sweep's median elevation, not the first radial's —
-            // see [`sweep_elevation_deg`] for what settling does to the first.
-            let key =
-                (sweep_elevation_deg(sweep.radials()).unwrap_or_default() * 10.0).round() / 10.0;
-            for (mi, (moment, _)) in moments.iter().enumerate() {
-                if moment.get_moment(first).is_none() {
-                    continue;
-                }
-                match chosen[mi]
-                    .iter_mut()
-                    .find(|(k, ..)| (*k - key).abs() < 0.05)
-                {
-                    Some(entry) => {
-                        if policy == DedupPolicy::NewestWins {
-                            *entry = (entry.0, si, true);
-                        }
-                    }
-                    None => chosen[mi].push((key, si, false)),
-                }
-            }
-        }
-
-        // The union of every moment's elevations, ascending.
-        let mut keys: Vec<f64> = Vec::new();
-        for per_moment in &chosen {
-            for &(k, ..) in per_moment {
-                if !keys.iter().any(|e| (e - k).abs() < 0.05) {
-                    keys.push(k);
-                }
-            }
-        }
-        keys.sort_by(f64::total_cmp);
+        let (chosen, keys) = sweep_selection(scan, moments, policy);
 
         let tilts = keys
-            .into_iter()
-            .map(|key| {
-                let grids = moments
-                    .iter()
-                    .enumerate()
-                    .map(|(mi, &(moment, stat))| {
-                        chosen[mi]
-                            .iter()
-                            .find(|(k, ..)| (k - key).abs() < 0.05)
-                            .map(|&(_, si, displaced)| MomentGrid {
-                                values: sweep_to_grid(scan.sweeps()[si].radials(), moment, stat),
-                                sweep_index: si,
-                                displaced_repeat: displaced,
-                            })
-                    })
-                    .collect();
-                Tilt {
-                    elevation_deg: key,
-                    heights: BeamHeights::at_elevation(key),
-                    grids,
-                }
-            })
+            .into_par_iter()
+            .map(|key| tilt_at(scan, moments, &chosen, key))
             .collect();
 
         Self {
@@ -269,6 +241,103 @@ impl VolumeCube {
     pub fn grid(&self, tilt: usize, moment: RadarProduct) -> Option<&MomentGrid> {
         let mi = self.moments.iter().position(|m| *m == moment)?;
         self.tilts.get(tilt)?.grids[mi].as_ref()
+    }
+}
+
+/// One moment's chosen sweep at one elevation: the elevation key, the index
+/// into [`Scan::sweeps`], and whether it displaced an earlier sweep at the
+/// same elevation.
+type SweepChoice = (f64, usize, bool);
+
+/// Which sweep supplies each moment at each elevation, and the tilt list.
+///
+/// Returns the per-moment choices in encounter order, and the union of every
+/// moment's elevations ascending — the keys [`VolumeCube::build_with_stats`]
+/// then builds one tilt per.
+///
+/// Split out from the build so the tilt walk above it is the whole of what
+/// runs under rayon, and so a test can drive that walk serially over exactly
+/// this selection rather than restating the dedup rules and drifting from
+/// them.
+fn sweep_selection(
+    scan: &Scan,
+    moments: &[(RadarProduct, CellStat)],
+    policy: DedupPolicy,
+) -> (Vec<Vec<SweepChoice>>, Vec<f64>) {
+    let mut chosen: Vec<Vec<SweepChoice>> = vec![Vec::new(); moments.len()];
+    for (si, sweep) in scan.sweeps().iter().enumerate() {
+        let Some(first) = sweep.radials().first() else {
+            continue;
+        };
+        // Keyed on the sweep's median elevation, not the first radial's —
+        // see [`sweep_elevation_deg`] for what settling does to the first.
+        let key = (sweep_elevation_deg(sweep.radials()).unwrap_or_default() * 10.0).round() / 10.0;
+        for (mi, (moment, _)) in moments.iter().enumerate() {
+            if moment.get_moment(first).is_none() {
+                continue;
+            }
+            match chosen[mi]
+                .iter_mut()
+                .find(|(k, ..)| (*k - key).abs() < 0.05)
+            {
+                Some(entry) => {
+                    if policy == DedupPolicy::NewestWins {
+                        *entry = (entry.0, si, true);
+                    }
+                }
+                None => chosen[mi].push((key, si, false)),
+            }
+        }
+    }
+
+    // The union of every moment's elevations, ascending.
+    let mut keys: Vec<f64> = Vec::new();
+    for per_moment in &chosen {
+        for &(k, ..) in per_moment {
+            if !keys.iter().any(|e| (e - k).abs() < 0.05) {
+                keys.push(k);
+            }
+        }
+    }
+    keys.sort_by(f64::total_cmp);
+
+    (chosen, keys)
+}
+
+/// One tilt of the cube: the beam geometry at `key`, and each requested
+/// moment's grid from whichever sweep [`sweep_selection`] gave that moment at
+/// that elevation.
+///
+/// **A pure function of its arguments, and it has to stay one**: this is the
+/// unit of work [`VolumeCube::build_with_stats`] hands to rayon, so the
+/// signature is the claim — three shared references and a key in, one owned
+/// [`Tilt`] out, nothing read that another tilt writes and nothing carried
+/// between calls. [`sweep_to_grid`] is pure for the same reason and says so at
+/// [`LinearZMemo`], whose table lives and dies inside a single call.
+fn tilt_at(
+    scan: &Scan,
+    moments: &[(RadarProduct, CellStat)],
+    chosen: &[Vec<SweepChoice>],
+    key: f64,
+) -> Tilt {
+    let grids = moments
+        .iter()
+        .enumerate()
+        .map(|(mi, &(moment, stat))| {
+            chosen[mi]
+                .iter()
+                .find(|(k, ..)| (k - key).abs() < 0.05)
+                .map(|&(_, si, displaced)| MomentGrid {
+                    values: sweep_to_grid(scan.sweeps()[si].radials(), moment, stat),
+                    sweep_index: si,
+                    displaced_repeat: displaced,
+                })
+        })
+        .collect();
+    Tilt {
+        elevation_deg: key,
+        heights: BeamHeights::at_elevation(key),
+        grids,
     }
 }
 
@@ -302,13 +371,25 @@ const LINEAR_Z_MEMO_BITS: u32 = 11;
 /// `chunks::tests`) does not move. Rewriting the power itself — as `exp2`, say
 /// — would have moved it, on most inputs.
 ///
-/// One table per [`sweep_to_grid`] call, never leaving it. Nothing here runs
-/// under rayon today — the cube builds its tilts serially, and the parallelism
-/// above it (`crate::render` fanning out over a *finished* grid) only starts
-/// once the cube exists — but a pane render is offloaded to its own thread, so
-/// two cube builds can be in flight at once. A table that cannot outlive a
-/// call frame cannot be shared between them, and `sweep_to_grid` stays a pure
-/// function of its arguments, which is the property every digest pin rests on.
+/// One table per [`sweep_to_grid`] call, never leaving it. That is what lets
+/// [`VolumeCube::build_with_stats`] fan its tilts across rayon: many tables are
+/// live at once — one per sweep in flight, and a pane render is offloaded to
+/// its own thread besides, so two whole cube builds can overlap — and a table
+/// that cannot outlive a call frame cannot be shared between any of them.
+/// `sweep_to_grid` therefore stays a pure function of its arguments whatever
+/// thread it lands on, which is the property every digest pin rests on.
+///
+/// **Nothing tests this, and nothing can.** Hoisting the table to a shared
+/// `static` or carrying it between calls in a `thread_local!` would leave
+/// every output bit-identical — the key is the gate's exact `to_bits()` and
+/// every writer stores the same `f64` for the same key, so a reader cannot
+/// tell which writer won or whether the entry outlived the call that made it.
+/// A `static` version would also be an unsynchronised data race that no
+/// assertion over this cube can see. So the locality here is held by this
+/// paragraph and by review, not by a pin, and it is not on offer: the
+/// contract is that a hit returns the bits the miss it replaces would have
+/// returned, and a table nobody else can reach is how that stays cheap to
+/// believe.
 struct LinearZMemo {
     /// `(gate value bits, 10^(value/10))` per bucket.
     slots: Vec<(u32, f64)>,

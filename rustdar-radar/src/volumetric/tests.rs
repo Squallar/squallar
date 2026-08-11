@@ -708,3 +708,177 @@ fn a_split_cut_supplies_each_moment_from_its_own_sweep() {
         &[RadarProduct::Reflectivity, RadarProduct::Velocity],
     );
 }
+
+/// **The property the parallel tilt walk has to keep**: the cube the pool
+/// builds is the cube a serial walk over the same selection builds — same
+/// tilts, same order, cell for cell.
+///
+/// [`VolumeCube::build_with_stats`] hands rayon one task per elevation. Two
+/// things can go wrong there and nothing else in this module would see either.
+/// `collect` could return the tilts out of order — every product over the cube
+/// is a top-down or bottom-up column scan, and two of them sum along the tilt
+/// index, so a swapped pair reads its reflectivity off one tilt and its beam
+/// heights off another and the answer stays plausible. And a tilt could come
+/// out differently for having run beside its neighbours rather than after
+/// them.
+///
+/// **Read the second one narrowly**: what is pinned is *observational*
+/// equivalence to a serial walk, not [`LinearZMemo`]'s locality contract.
+/// Hoisting that table to a `static` shared unsynchronised across the pool, or
+/// carrying it between calls in a `thread_local!`, both survive this test —
+/// and would survive any test over this cube — because the table is keyed on
+/// the gate's exact `to_bits()` and every racing writer stores the same `f64`
+/// for the same key, so no reader can observe which writer won or whether the
+/// entry was left over from an earlier call. Those rewrites are ruled out by
+/// the argument at [`LinearZMemo`] and by review, and this test cannot be the
+/// thing that catches them. What it does catch is any restructure that changes
+/// what a caller sees: order, geometry, provenance, or a single cell's bits.
+///
+/// The reference is therefore a **serial `map` over [`sweep_selection`]'s own
+/// output** — exactly the walk this function ran before it was parallelised,
+/// over exactly the same selection, so the oracle cannot drift from the dedup
+/// rules by restating them. A 1-thread rayon pool would not do on its own: it
+/// runs this same par-map-collect code, so it can observe a data race and
+/// nothing about the restructure. It is checked as well, with a repeat run,
+/// because settling on the right answer once can still be a race that usually
+/// lands the right way.
+///
+/// Every [`CellStat`] and both [`DedupPolicy`] arms: the statistic decides
+/// which accumulator — and whether the memo is reached at all — inside each
+/// task, and the policy decides which sweep a tilt is built from.
+// Named rather than gating the module, as in `voxel` and `hca`: this is the
+// only test here that reaches for `rayon` by name, and a module-wide gate
+// would stop the rest being type-checked for wasm32 — the arm that compiles
+// `par.rs`'s sequential stand-ins.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn the_tilts_the_pool_builds_are_the_tilts_a_serial_walk_builds() {
+    assert!(
+        rayon::current_num_threads() > 1,
+        "single-threaded pool: this test cannot observe a race"
+    );
+    let one = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("a one-thread pool");
+
+    // A split cut (velocity on its own sweep at 0.5°) and a SAILS repeat, so
+    // the two policies genuinely disagree and one moment is absent on most
+    // tilts.
+    let scan = golden_scan();
+
+    for stat in [CellStat::LinearZMean, CellStat::Mean, CellStat::Max] {
+        let moments: Vec<(RadarProduct, CellStat)> =
+            [RadarProduct::Reflectivity, RadarProduct::Velocity]
+                .into_iter()
+                .map(|m| (m, stat))
+                .collect();
+        for policy in [DedupPolicy::NewestWins, DedupPolicy::FirstOfVolume] {
+            let at = format!("{stat:?} under {policy:?}");
+
+            let (chosen, keys) = sweep_selection(&scan, &moments, policy);
+            let serial: Vec<Tilt> = keys
+                .into_iter()
+                .map(|key| tilt_at(&scan, &moments, &chosen, key))
+                .collect();
+
+            // A one-tilt cube cannot be out of order, and a cube of nothing
+            // agrees with itself trivially.
+            assert!(
+                serial.len() > 1,
+                "{at}: the fixture yielded {} tilt(s); this proves nothing",
+                serial.len(),
+            );
+            let defined: usize = serial
+                .iter()
+                .flat_map(|t| t.grids.iter().flatten())
+                .flat_map(|g| g.values.iter().flatten())
+                .filter(|v| !v.is_nan())
+                .count();
+            assert!(
+                defined > 1000,
+                "{at}: only {defined} cells carry data; this proves nothing",
+            );
+
+            let build = || VolumeCube::build_with_stats(&scan, &moments, policy);
+            let pooled = build();
+            let one_thread = one.install(build);
+            let repeat = build();
+            for (label, other) in [
+                ("the pool", &pooled),
+                ("one thread", &one_thread),
+                ("a repeat", &repeat),
+            ] {
+                assert_eq!(
+                    other.tilts.len(),
+                    serial.len(),
+                    "{at}: {label} built {} tilts, the serial walk {}",
+                    other.tilts.len(),
+                    serial.len(),
+                );
+                for (ti, (got, want)) in other.tilts.iter().zip(&serial).enumerate() {
+                    // The ordering claim, stated where a swap would show:
+                    // tilt `ti` is the same elevation the serial walk put
+                    // there, and carries that elevation's own geometry.
+                    assert_eq!(
+                        got.elevation_deg.to_bits(),
+                        want.elevation_deg.to_bits(),
+                        "{at}: {label} put {}° at tilt {ti}, the serial walk {}°",
+                        got.elevation_deg,
+                        want.elevation_deg,
+                    );
+                    for (which, a, b) in [
+                        ("bottom", &got.heights.bottom_km, &want.heights.bottom_km),
+                        ("centre", &got.heights.centre_km, &want.heights.centre_km),
+                        ("top", &got.heights.top_km, &want.heights.top_km),
+                    ] {
+                        for (r, (&x, &y)) in a.iter().zip(b).enumerate() {
+                            assert_eq!(
+                                x.to_bits(),
+                                y.to_bits(),
+                                "{at}: {label} tilt {ti} {which} height at {r} km is {x}, \
+                                 the serial walk's is {y}",
+                            );
+                        }
+                    }
+
+                    assert_eq!(got.grids.len(), want.grids.len(), "{at}: tilt {ti}");
+                    for (mi, (g, w)) in got.grids.iter().zip(&want.grids).enumerate() {
+                        let (g, w) = match (g, w) {
+                            (None, None) => continue,
+                            (Some(g), Some(w)) => (g, w),
+                            (g, _) => panic!(
+                                "{at}: {label} tilt {ti} moment {mi} is {}, the serial \
+                                 walk's is the other",
+                                if g.is_some() { "present" } else { "absent" },
+                            ),
+                        };
+                        assert_eq!(
+                            g.sweep_index, w.sweep_index,
+                            "{at}: {label} tilt {ti} moment {mi} came from sweep {}, \
+                             the serial walk's from {}",
+                            g.sweep_index, w.sweep_index,
+                        );
+                        assert_eq!(
+                            g.displaced_repeat, w.displaced_repeat,
+                            "{at}: {label} tilt {ti} moment {mi} disagrees on displacement",
+                        );
+                        // Cell by cell rather than slice against slice: a
+                        // whole-grid `assert_eq!` prints 82 800 numbers twice
+                        // and says nothing about which one moved.
+                        for (az, (a, b)) in g.values.iter().zip(&w.values).enumerate() {
+                            for (r, (&x, &y)) in a.iter().zip(b).enumerate() {
+                                assert_eq!(
+                                    x.to_bits(),
+                                    y.to_bits(),
+                                    "{at}: {label} tilt {ti} moment {mi} cell \
+                                     [{az}][{r}] is {x}, the serial walk's is {y}",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
