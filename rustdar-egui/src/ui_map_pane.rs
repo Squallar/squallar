@@ -48,7 +48,7 @@ pub(super) struct PaneRenderCtx<'a> {
     /// `is_pos_blocked` catches without plumbing — but the mechanism stays for
     /// the next painted-in-pane chrome (see `ShellOutput::excluded_rects`).
     /// Map content that is itself clickable does **not** belong here — see
-    /// `site_icon_rects` in `render_pane_map_content`.
+    /// `visible_sites` in `render_pane_map_content`.
     pub excluded_rects: Vec<egui::Rect>,
     /// Screen position of an active long-press (for the radar value tooltip),
     /// or `None`. Only the touch pipeline ever produces one.

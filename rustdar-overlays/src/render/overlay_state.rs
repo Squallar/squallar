@@ -881,6 +881,43 @@ mod pane_config_tests {
         );
     }
 
+    /// The one mutation route that reaches a handler without `handler_mut`
+    /// still forgets what that handler was loaded from.
+    ///
+    /// Nothing observable depends on this today — no shipped
+    /// `apply_fetch_result` writes a field its `deserialize_state` reads, so
+    /// deleting the invalidation breaks no behaviour any test can see. That is
+    /// exactly why the invariant is asserted directly: the skip at
+    /// [`OverlayRegistry::load_pane_configs`] is built on "every mutation route
+    /// forgets", and a route that quietly stops forgetting would only surface
+    /// the first time a handler grew a field on both sides.
+    #[test]
+    fn a_fetch_result_forgets_the_config_the_handler_was_loaded_from() {
+        let mut registry = OverlayRegistry::default();
+        let configs = mds_off(&mut registry);
+
+        registry.load_pane_configs(&configs);
+        assert!(
+            registry
+                .loaded_configs
+                .contains_key(&OverlayKind::SpcDiscussions),
+            "fixture: a load has to record what it read for the skip to exist",
+        );
+
+        registry.apply_fetch_result(OverlayFetchResult {
+            kind: OverlayKind::SpcDiscussions,
+            data: OverlayRegistry::spc_discussions_payload(Vec::new()),
+        });
+
+        assert!(
+            !registry
+                .loaded_configs
+                .contains_key(&OverlayKind::SpcDiscussions),
+            "a fetch may move what `serialize_state` reports, so the next load \
+             has to run rather than be skipped",
+        );
+    }
+
     /// The reload discipline survives the skip: a handler change that never
     /// reached the config is still undone by the next load.
     ///
