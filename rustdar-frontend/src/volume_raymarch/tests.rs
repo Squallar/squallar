@@ -726,6 +726,40 @@ fn the_premultiplied_plane_is_index_and_a_binary_coverage() {
     );
 }
 
+/// The 256-entry texel table is the conversion it replaces, **byte for byte**,
+/// over the whole of its input domain.
+///
+/// `coverage_premultiplied` no longer calls `half::f16::from_f32` per cell; it
+/// gathers from [`super::coverage_texels`]. That is a speed change and it is
+/// only allowed to be a speed change — the plane the GPU is handed has to be
+/// the same 32 MiB it was before, not a rounding of it. The domain is one byte
+/// wide, so "over the whole input domain" is 256 cases and this test is
+/// exhaustive rather than a sample: there is no residual risk to argue about.
+///
+/// The right-hand side is written out as the arithmetic on purpose. Comparing
+/// the table against itself through `coverage_premultiplied` would pass with
+/// both halves wrong together, which is the failure mode a table introduces.
+#[test]
+fn the_texel_table_is_the_conversion_it_replaces() {
+    let indices: Vec<u8> = (0..=255u8).collect();
+    let plane = super::coverage_premultiplied(&indices);
+
+    let mut arithmetic = Vec::with_capacity(indices.len() * GRID_BYTES_PER_CELL as usize);
+    for &index in &indices {
+        let covered = index != rustdar_radar::voxel::NO_DATA_INDEX;
+        arithmetic.extend_from_slice(&half::f16::from_f32(f32::from(index) / 255.0).to_le_bytes());
+        arithmetic
+            .extend_from_slice(&half::f16::from_f32(if covered { 1.0 } else { 0.0 }).to_le_bytes());
+    }
+
+    assert_eq!(
+        plane, arithmetic,
+        "the texel table has stopped agreeing with the `half` conversion it \
+         was built from — the widening is no longer a pure speed change, and \
+         every uploaded grid differs from what the format's contract says",
+    );
+}
+
 /// The step length puts the ray direction inside the `length`.
 ///
 /// This is spike 0a's first bug and it is worth the source scan, because
