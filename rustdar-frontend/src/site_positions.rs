@@ -111,6 +111,26 @@ impl SitePositions {
         self.known.is_empty()
     }
 
+    /// Every remembered site, as `(ICAO, position)`.
+    ///
+    /// This is how a cache that lives in the *frontend* overlays a table that
+    /// lives in `rustdar-radar`, without `rustdar-radar` learning that this
+    /// crate exists. The radar crate publishes
+    /// [`sites::resolve`](rustdar_radar::sites::resolve), which takes exactly
+    /// this shape — a borrowed name beside a plain [`SitePosition`], both of
+    /// them already `rustdar-radar`'s own vocabulary — and the frontend hands
+    /// it what it loaded. The dependency still points one way; only data
+    /// crosses.
+    ///
+    /// Borrowed rather than cloned because `resolve` keeps a name only for a
+    /// site the compiled-in seed has never heard of, and usually there are
+    /// none.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, SitePosition)> {
+        self.known
+            .iter()
+            .map(|(site, position)| (site.as_str(), *position))
+    }
+
     /// Remember what a volume just said, and write it out **now**.
     ///
     /// Returns whether anything changed, which is also whether a write was

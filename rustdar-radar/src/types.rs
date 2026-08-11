@@ -246,7 +246,7 @@ impl ScanInfo {
     ///    corrected across restarts, and what lets the map centre correctly on
     ///    a site opened before but not yet re-downloaded this session.
     ///
-    /// 3. **[`crate::sites::RADARS`]**, the compiled-in snapshot. Still the
+    /// 3. **[`crate::sites::radars()`]**, the compiled-in snapshot. Still the
     ///    answer for a pre-2010 `AR2V0001` volume, which is Message 1
     ///    throughout and carries no Volume Data Block to read, and for a
     ///    chunk-fed `Scan`, which is assembled by `crate::chunks` through

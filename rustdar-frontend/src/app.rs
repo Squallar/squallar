@@ -736,6 +736,14 @@ impl App {
         // Reloaded in `set_config_dir` for Android, which has no store yet.
         let site_positions =
             crate::site_positions::SitePositions::load(platform.config_store().as_deref());
+        // The same reasoning one level down: the *table* is resolved here too,
+        // not on first use. A site the compiled-in seed has never heard of only
+        // becomes nameable and drawable once this runs, so if it ran after the
+        // first frame the map would gain a marker, the site list a row, and a
+        // section its height datum, under a user already looking at them.
+        // Resolving beside the load — before any frame exists — is what keeps
+        // reopening exactly 1:1.
+        rustdar_radar::sites::resolve(site_positions.iter());
 
         let mut app = Self {
             instance,
@@ -2437,6 +2445,13 @@ impl App {
             // a returning user's learned positions are worth reading even on a
             // run where the UI config itself does not come back.
             self.site_positions = crate::site_positions::SitePositions::load(Some(store.as_ref()));
+            // Re-resolved, not merely re-loaded. This is the resolution that
+            // has anything to overlay on Android — `App::new` ran without a
+            // store — and it is why the table is swappable rather than a
+            // `OnceLock`: a one-shot resolve would have let the empty first
+            // attempt win and silently discarded every learned position on the
+            // one platform that needs this call.
+            rustdar_radar::sites::resolve(self.site_positions.iter());
             if self.gui.load_ui_config(store.as_ref()) {
                 // A returning user on Android reaches the timezone guess before
                 // their stored site is readable, so the guess has to be undone

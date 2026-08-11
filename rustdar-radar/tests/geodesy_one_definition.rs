@@ -146,20 +146,6 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "Asserts the definition's value, which is the one place a literal \
          6371 in an assertion is the point.",
     ),
-    // ── Horizontal geodesy that is not yet the shared constant ──────────
-    (
-        "rustdar-radar/src/sites.rs",
-        "const EARTH_RADIUS_KM: f64 = 6371.0088;",
-        "`distance_km`'s haversine radius: the IUGG mean to four more \
-         decimals than `types::EARTH_RADIUS_KM`. THE ONE REMAINING \
-         DUPLICATION, and it is horizontal geodesy, so it should become the \
-         shared constant. It is left alone only because it was 1.4e-6 % away \
-         — 9 m on a site-to-site distance the caller uses to pick the \
-         *nearest* radar, where a metre cannot change the answer — and \
-         because the file was being edited concurrently when the rest was \
-         unified. Folding it in is a two-line change and this entry is the \
-         reminder.",
-    ),
     // ── The one hand-written copy outside Rust ──────────────────────────
     (
         "rustdar-frontend/src/volume.wgsl",

@@ -295,20 +295,23 @@ pub(super) struct SiteListOutcome {
 /// pill's popover both render this, which is what keeps the two routes one
 /// inventory (module note).
 pub(super) fn site_list_ui(ui: &mut egui::Ui, query: &str, current: &str) -> SiteListOutcome {
-    use rustdar_radar::sites::RADARS;
+    // One read of the resolved table, reused for the rows and for both counts.
+    // Read separately they could answer for two different tables, and the
+    // caption would then be counting a list it is not standing beside.
+    let radars = rustdar_radar::sites::radars();
 
     // The codes are the table's names; uppercased so a lowercase query
     // still finds them.
     let query = query.trim().to_uppercase();
-    let shown: Vec<&rustdar_radar::sites::RadarSite> = RADARS
+    let shown: Vec<&rustdar_radar::sites::RadarSite> = radars
         .iter()
         .filter(|site| query.is_empty() || site.name.contains(query.as_str()))
         .collect();
 
     // Computed from the table, not restated: the split is the caption's
     // claim, and a hardcoded count would outlive an edit.
-    let total = RADARS.len();
-    let tdwr = RADARS.iter().filter(|site| site.is_tdwr()).count();
+    let total = radars.len();
+    let tdwr = radars.iter().filter(|site| site.is_tdwr()).count();
     let caption = format!(
         "{} shown - {} sites ({} NEXRAD + {} TDWR)",
         shown.len(),

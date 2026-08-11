@@ -311,7 +311,7 @@ pub fn radar_height_ft_near(lat: f64, lon: f64, datum: Datum) -> Option<f64> {
     if crate::sites::distance_km(lat, lon, nearest.lat, nearest.lon) > crate::types::MAX_RANGE_KM {
         return None;
     }
-    crate::sites::RADARS
+    crate::sites::radars()
         .iter()
         .filter_map(|s| s.height_ft(datum).map(|ft| (s, ft)))
         .min_by(|(a, _), (b, _)| {
@@ -684,7 +684,7 @@ mod tests {
         // is genuinely at sea level, the lowest being KBYX at 87 ft. A future
         // row at exactly 0 would make this test wrong rather than the code, so
         // it fails here first and says so.
-        let lowest = crate::sites::RADARS
+        let lowest = crate::sites::radars()
             .iter()
             .filter_map(|s| s.height_ft(Datum::Feedhorn))
             .min()
@@ -696,7 +696,7 @@ mod tests {
         );
 
         for datum in [Datum::SiteBase, Datum::Feedhorn] {
-            for site in crate::sites::RADARS.iter() {
+            for site in crate::sites::radars().iter() {
                 let ft = radar_height_ft_near(site.lat, site.lon, datum);
                 // Two failure modes now, not one: the lookup must answer at
                 // all for a row's own coordinates — the plausibility bound

@@ -2,7 +2,7 @@
 //!
 //! # Why this exists
 //!
-//! [`crate::sites::RADARS`] is a snapshot of the network on the day the binary
+//! [`crate::sites::radars()`] is a snapshot of the network on the day the binary
 //! shipped. It is correct today — every row was read out of that site's own
 //! Level II volume — and it starts rotting the moment it is compiled. A radar
 //! that is re-surveyed, relocated, or commissioned after the build is a row
@@ -69,7 +69,7 @@ pub enum SitePositionSource {
     Volume,
     /// A volume said so in an earlier session, and it was remembered.
     Learned,
-    /// [`crate::sites::RADARS`], the compiled-in snapshot.
+    /// [`crate::sites::radars()`], the compiled-in snapshot.
     Table,
     /// Nothing knows where this site is.
     ///
@@ -161,7 +161,7 @@ impl SitePosition {
     /// # Why the table is not simply overwritten
     ///
     /// The volume's height fields are **whole metres** and
-    /// [`crate::sites::RADARS`]' are feet, and the feet are the finer
+    /// [`crate::sites::radars()`]' are feet, and the feet are the finer
     /// expression of the same measurement: `TICH` reads 1351 ft where its
     /// volume truncates to 411 m, and 411.78 m is what the published station
     /// record holds. Overwriting a row with `feet(411)` would move it 3 ft for
@@ -211,11 +211,36 @@ impl SitePosition {
     /// `table` keeps only its name: everything else here is measured, and the
     /// name is the one thing a volume cannot supply as a `&'static str`.
     pub fn applied_to(&self, table: Option<&'static RadarSite>) -> RadarSite {
+        self.applied_to_named(
+            table.map_or(crate::sites::UNKNOWN_SITE_NAME, |row| row.name),
+            table.and_then(|row| row.heights),
+        )
+    }
+
+    /// The row a radar of this `name` becomes at this position.
+    ///
+    /// The same construction as [`applied_to`](Self::applied_to) with the name
+    /// supplied separately, which is what a site the compiled-in seed has
+    /// never heard of needs: it has no table row to take a name from, but it
+    /// does have an ICAO — the key its position was learned under — and that
+    /// is a better name than [`UNKNOWN_SITE_NAME`](crate::sites::UNKNOWN_SITE_NAME).
+    /// [`crate::sites::build_table`] is the caller, and it leaks the
+    /// identifier so this can take it as `&'static str`.
+    ///
+    /// `table_heights` are the seed's figures for this row if it has any, so
+    /// [`heights_over`](Self::heights_over) can keep the finer of the two, and
+    /// `None` for a row the seed never had — which then takes the volume's
+    /// heights outright rather than recording none at all.
+    pub fn applied_to_named(
+        &self,
+        name: &'static str,
+        table_heights: Option<SiteHeights>,
+    ) -> RadarSite {
         RadarSite {
-            name: table.map_or(crate::sites::UNKNOWN_SITE_NAME, |row| row.name),
+            name,
             lat: self.lat(),
             lon: self.lon(),
-            heights: Some(self.heights_over(table.and_then(|row| row.heights))),
+            heights: Some(self.heights_over(table_heights)),
         }
     }
 }

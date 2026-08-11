@@ -595,7 +595,7 @@ impl super::App {
                 let target_loading = target_pane.loading_site.clone();
                 let is_dark = self.cached_dark_theme.unwrap_or(false);
                 let actual_zoom = zoom as f64 / ZOOM_QUANTIZATION_FACTOR;
-                let sites: Vec<rasterize::RadarSiteInfo> = rustdar_radar::sites::RADARS
+                let sites: Vec<rasterize::RadarSiteInfo> = rustdar_radar::sites::radars()
                     .iter()
                     .map(|s| rasterize::RadarSiteInfo {
                         name: s.name.to_string(),

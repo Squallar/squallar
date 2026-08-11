@@ -12,7 +12,7 @@ use rustdar_units::{HailSizeUnit, UserPreferences};
 use std::sync::Arc;
 
 use crate::tile_source::HttpsTiles;
-use rustdar_radar::sites::RADARS;
+use rustdar_radar::sites::RadarSite;
 use rustdar_radar::types::{ImageBounds, KM_PER_DEGREE_LAT, MAX_RANGE_KM, RadarProduct};
 use rustdar_radar::{get_color_for_value, get_legend_scale};
 
@@ -1002,8 +1002,15 @@ fn map_hover_tooltip(
 /// list the overlays under the sites are hit-tested against, and the label /
 /// click / hover pass — read this rather than re-projecting.
 struct VisibleSite {
-    /// Index into [`RADARS`].
-    index: usize,
+    /// The row itself, not its position in the table.
+    ///
+    /// This used to be a `usize` index back into the compiled-in array, which
+    /// was safe only because the array could never change length. The table is
+    /// resolved at runtime now and a later one can be longer, so an index
+    /// minted during the walk would name a different radar by the time the
+    /// interaction pass read it. The reference cannot: the rows are leaked, so
+    /// it stays valid and keeps naming the radar it was minted for.
+    site: &'static RadarSite,
     /// Screen position of the site marker's centre.
     screen: egui::Pos2,
     /// The clickable icon box around `screen`.
@@ -1030,16 +1037,35 @@ fn visible_radar_sites(
     // `a_click_outside_the_pane_does_not_reach_a_site_icon_straddling_its_edge`.
     let near = ui.max_rect().expand(100.0);
     let icon_size = (10.0 + zoom as f32 * 2.0).clamp(8.0, 24.0);
+    visible_sites_in(
+        rustdar_radar::sites::radars(),
+        near,
+        icon_size,
+        |lat, lon| projector.project(walkers::lat_lon(lat, lon)).to_pos2(),
+    )
+}
+
+/// The walk itself, over whichever table it is handed.
+///
+/// Split out from [`visible_radar_sites`] so the table is an argument rather
+/// than a global read: that is what lets a test hand it two tables of
+/// different lengths and check that each [`VisibleSite`] still names the row
+/// it was built from. `project` stands in for the map projection, which is the
+/// only part of the caller that needs a live `egui::Ui`.
+fn visible_sites_in(
+    rows: &'static [RadarSite],
+    near: egui::Rect,
+    icon_size: f32,
+    project: impl Fn(f64, f64) -> egui::Pos2,
+) -> Vec<VisibleSite> {
     let mut visible = Vec::new();
-    for (index, site) in RADARS.iter().enumerate() {
-        let screen = projector
-            .project(walkers::lat_lon(site.lat, site.lon))
-            .to_pos2();
+    for site in rows {
+        let screen = project(site.lat, site.lon);
         if !near.contains(screen) {
             continue;
         }
         visible.push(VisibleSite {
-            index,
+            site,
             screen,
             icon_rect: egui::Rect::from_center_size(screen, egui::vec2(icon_size, icon_size)),
         });
@@ -1099,7 +1125,7 @@ fn handle_radar_site_interactions(
     };
 
     for site in sites {
-        let radar_site = &RADARS[site.index];
+        let radar_site = site.site;
         let site_screen = site.screen;
         let icon_rect = site.icon_rect;
 

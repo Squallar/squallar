@@ -1,3 +1,8 @@
+use crate::site_position::SitePosition;
+use crate::types::EARTH_RADIUS_KM;
+use std::collections::HashMap;
+use std::sync::{LazyLock, RwLock};
+
 /// Which height above mean sea level a caller means.
 ///
 /// A site has two, and they are 30–115 ft apart: the ground the tower stands
@@ -48,7 +53,7 @@ pub enum SiteHeights {
     /// feedhorn, and hence no answer at all for [`Datum::SiteBase`]: the base
     /// is unknown, not equal to this.
     ///
-    /// `LPLA` (Lajes) is here too, for a different reason — see [`RADARS`].
+    /// `LPLA` (Lajes) is here too, for a different reason — see [`radars()`].
     FeedhornOnly { feedhorn_ft: i32 },
 }
 
@@ -173,7 +178,23 @@ pub const UNKNOWN_SITE_NAME: &str = "UNKNOWN";
 /// across seven epochs. The volume wins, because it is the position the RDA
 /// georeferences its own data against, and the disagreement is recorded here
 /// rather than split.
-pub const RADARS: [RadarSite; 207] = [
+///
+/// # Why this is a seed and not the table
+///
+/// Everything above describes a snapshot taken on one day, and a binary that
+/// can only ever know these 207 rows rots: a radar commissioned after the
+/// build is a site the app cannot name, cannot draw and cannot centre on, and
+/// no amount of care about the figures below changes that.
+///
+/// So this is the *seed* the process resolves its table from. It is private,
+/// and reachable only through [`radars()`] — never by position, because a
+/// runtime table can be a different length than this one and an index into
+/// the array would then name a different radar than the one it was minted
+/// for. [`resolve`] overlays the seed with what an install has learned from
+/// the volumes it has actually read, and a later stage will overlay it again
+/// from the network. A row here is a starting guess with a name attached, not
+/// the last word.
+const SEED: [RadarSite; 207] = [
     RadarSite {
         name: "KABR",
         lat: 45.45583,
@@ -1901,19 +1922,208 @@ pub const RADARS: [RadarSite; 207] = [
     },
 ];
 
-pub fn get_radar_site(site: &str) -> Option<&'static RadarSite> {
-    use std::collections::HashMap;
-    use std::sync::LazyLock;
+/// Every radar this process knows about, resolved once and then fixed.
+///
+/// Holds its rows as `&'static [RadarSite]` because they are leaked on the way
+/// in, which is what lets every lookup below keep handing out
+/// `&'static RadarSite` the way the compiled-in array used to. Leaking is
+/// honest here rather than a dodge: a table is resolved a bounded number of
+/// times per process — once at startup, and once more on Android when the
+/// config directory arrives — and then read for the life of the process, so
+/// "lives forever" is a description of the value's real lifetime and not a
+/// promise being smuggled past the borrow checker.
+///
+/// The name index is built with the rows and travels with them, so the two
+/// cannot disagree about which radars exist. That was the one real hazard in
+/// making the table resizable: a `LazyLock` name map beside a swappable row
+/// list would answer for a table nobody could still see.
+pub struct SiteTable {
+    rows: &'static [RadarSite],
+    by_name: HashMap<&'static str, &'static RadarSite>,
+}
 
-    static SITE_MAP: LazyLock<HashMap<&'static str, &'static RadarSite>> = LazyLock::new(|| {
-        let mut map = HashMap::with_capacity(RADARS.len());
-        for radar in RADARS.iter() {
-            map.insert(radar.name, radar);
+impl SiteTable {
+    /// Every row, in seed order with anything learned appended.
+    ///
+    /// Callers may walk this and may enumerate it, but must not store the
+    /// enumeration index anywhere that outlives the walk: the next table can
+    /// be a different length, and position `n` in it is a different radar.
+    /// Keep the `&'static RadarSite` itself, which stays valid and keeps
+    /// naming the row it named.
+    pub fn rows(&self) -> &'static [RadarSite] {
+        self.rows
+    }
+
+    /// The row for an ICAO identifier, or `None` if this table has no such
+    /// radar.
+    pub fn get(&self, site: &str) -> Option<&'static RadarSite> {
+        self.by_name.get(site).copied()
+    }
+
+    /// The row closest to `lat`/`lon`, with its distance in kilometres.
+    pub fn nearest(&self, lat: f64, lon: f64) -> Option<(&'static RadarSite, f64)> {
+        self.nearest_where(lat, lon, |_| true)
+    }
+
+    /// The closest operational WSR-88D, with its distance in kilometres.
+    pub fn nearest_wsr88d(&self, lat: f64, lon: f64) -> Option<(&'static RadarSite, f64)> {
+        self.nearest_where(lat, lon, |site| site.is_wsr88d() && site.is_operational())
+    }
+
+    fn nearest_where(
+        &self,
+        lat: f64,
+        lon: f64,
+        accept: impl Fn(&RadarSite) -> bool,
+    ) -> Option<(&'static RadarSite, f64)> {
+        if !lat.is_finite() || !lon.is_finite() {
+            return None;
         }
-        map
-    });
+        self.rows
+            .iter()
+            .filter(|site| accept(site))
+            .map(|site| (site, distance_km(lat, lon, site.lat, site.lon)))
+            // `total_cmp`, not `partial_cmp().unwrap()`: the distances are
+            // finite given a finite input, but the unwrap would be a panic
+            // path in a startup routine to save nothing.
+            .min_by(|(_, a), (_, b)| a.total_cmp(b))
+    }
+}
 
-    SITE_MAP.get(site).copied()
+/// Build a table from [`SEED`], overlaid by what an install has learned.
+///
+/// Each `(name, position)` pair either **moves** the seed row of that name
+/// onto the position its own volume reported, or — and this is the point of
+/// the whole exercise — **adds a row the seed has never heard of**. A radar
+/// commissioned after this binary was built reaches the user as a real row
+/// with its real ICAO, because the position was learned from a volume and the
+/// name is the key that position was filed under.
+///
+/// The added row's name is leaked, because [`RadarSite::name`] is
+/// `&'static str` and a four-byte identifier read out of a volume header at
+/// runtime is not. That is a handful of bytes per radar this install has ever
+/// opened, once per resolution, against a `MAX_REMEMBERED_SITES` cap upstream.
+///
+/// Heights come from [`SitePosition::heights_over`], which keeps a seed row's
+/// finer figures wherever the volume's whole metres cannot contradict them —
+/// so an overlay never costs a row the precision it already had. A row the
+/// seed never had takes the volume's heights outright, and therefore always
+/// records *an* elevation: `every_site_records_an_elevation` holds over a
+/// learned row for the same reason it holds over a seeded one, which matters
+/// because the alternative is a section anchored at sea level.
+pub fn build_table<'a, I>(learned: I) -> &'static SiteTable
+where
+    I: IntoIterator<Item = (&'a str, SitePosition)>,
+{
+    let mut rows: Vec<RadarSite> = SEED.to_vec();
+    let mut at: HashMap<&'static str, usize> = rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| (row.name, index))
+        .collect();
+
+    for (name, position) in learned {
+        match at.get(name) {
+            Some(&index) => {
+                let row = &rows[index];
+                rows[index] = position.applied_to_named(row.name, row.heights);
+            }
+            None => {
+                // Leaked so the row can carry it as `&'static str`. The name
+                // is also re-keyed into `at`, so a second entry for the same
+                // unseeded site updates the row it already added rather than
+                // filing a duplicate radar beside it.
+                let name: &'static str = Box::leak(name.to_owned().into_boxed_str());
+                at.insert(name, rows.len());
+                rows.push(position.applied_to_named(name, None));
+            }
+        }
+    }
+
+    let rows: &'static [RadarSite] = Box::leak(rows.into_boxed_slice());
+    let by_name = rows.iter().map(|row| (row.name, row)).collect();
+    Box::leak(Box::new(SiteTable { rows, by_name }))
+}
+
+/// The seed on its own, built once and shared by every resolution that learns
+/// nothing.
+///
+/// Almost every process is this one — a fresh install, and every test that
+/// constructs an app against an empty store — and giving them all the same
+/// table means the overwhelmingly common `resolve` is a pointer store rather
+/// than a fresh leak of 207 rows.
+fn seed_table() -> &'static SiteTable {
+    static SEED_TABLE: LazyLock<&'static SiteTable> =
+        LazyLock::new(|| build_table(std::iter::empty()));
+    *SEED_TABLE
+}
+
+/// The table this process resolved, or `None` until something resolves one.
+static RESOLVED: RwLock<Option<&'static SiteTable>> = RwLock::new(None);
+
+/// The table every lookup in this module reads.
+///
+/// Falls back to [`seed_table`] rather than panicking when nothing has
+/// resolved yet: a crate-level test, a benchmark or a tool that never builds
+/// an app still gets the compiled-in radars, which is exactly where the app
+/// was before any of this existed.
+pub fn table() -> &'static SiteTable {
+    // `into_inner` rather than `expect`: a poisoned lock here means some other
+    // thread panicked while swapping a pointer, and the pointer it was
+    // swapping is valid either way. Refusing to draw the map over it would
+    // turn an unrelated panic into a second one.
+    match *RESOLVED.read().unwrap_or_else(|e| e.into_inner()) {
+        Some(table) => table,
+        None => seed_table(),
+    }
+}
+
+/// Resolve the process-wide site table from what this install has learned.
+///
+/// # Call this before the first paint
+///
+/// A site's position or name that arrives *late* moves a marker, a label and
+/// a section's height datum under a user who is already looking at them,
+/// which is the one thing the reopen-is-1:1 rule forbids. So resolution
+/// belongs with the rest of the startup read, beside the config load and
+/// ahead of any frame — `App::new`, and again in `set_config_dir` where
+/// Android finally has a store to read from. Both run before a frame exists.
+///
+/// Resolving is therefore idempotent-shaped rather than one-shot: Android
+/// genuinely resolves twice, and a `OnceLock` would have made the second
+/// attempt — the one that has the learned positions — silently do nothing.
+///
+/// Rows from the previous table stay valid; they are leaked, so a
+/// `&'static RadarSite` handed out before a resolution keeps naming the radar
+/// it named. What it must not be is an *index*, which is why nothing outside
+/// this module can reach the rows by position.
+pub fn resolve<'a, I>(learned: I) -> &'static SiteTable
+where
+    I: IntoIterator<Item = (&'a str, SitePosition)>,
+{
+    let learned: Vec<(&'a str, SitePosition)> = learned.into_iter().collect();
+    let table = if learned.is_empty() {
+        seed_table()
+    } else {
+        build_table(learned)
+    };
+    *RESOLVED.write().unwrap_or_else(|e| e.into_inner()) = Some(table);
+    table
+}
+
+/// Every radar this process knows about.
+///
+/// The replacement for the compiled-in array: same rows on a fresh install,
+/// plus whatever this one has learned. Walk it, filter it, count it — but see
+/// [`SiteTable::rows`] on why an index into it must not outlive the walk.
+pub fn radars() -> &'static [RadarSite] {
+    table().rows()
+}
+
+/// The row for an ICAO identifier, or `None` if this process knows no such
+/// radar.
+pub fn get_radar_site(site: &str) -> Option<&'static RadarSite> {
+    table().get(site)
 }
 
 /// Great-circle distance between two coordinates, in kilometres.
@@ -1922,10 +2132,12 @@ pub fn get_radar_site(site: &str) -> Option<&'static RadarSite> {
 /// compares sites up to a continent apart (a fix in Hawaii against a table that
 /// is mostly CONUS), and the flat approximation's error grows with both
 /// separation and latitude — exactly the regime the comparison runs in.
+///
+/// On [`crate::types::EARTH_RADIUS_KM`], the workspace's one sphere. This
+/// used to carry its own `6371.0088`, the IUGG mean to four more decimals;
+/// the two are 1.4e-6 % apart, which is 9 m across a continent and cannot
+/// change which radar is nearest.
 pub fn distance_km(lat_a: f64, lon_a: f64, lat_b: f64, lon_b: f64) -> f64 {
-    /// Mean radius, the value the WGS-84 sphere approximation uses.
-    const EARTH_RADIUS_KM: f64 = 6371.0088;
-
     let (lat_a_rad, lat_b_rad) = (lat_a.to_radians(), lat_b.to_radians());
     let d_lat = (lat_b - lat_a).to_radians();
     let d_lon = (lon_b - lon_a).to_radians();
@@ -1942,7 +2154,7 @@ impl RadarSite {
     ///
     /// The distinction is load-bearing rather than trivia: the Level II archive
     /// this app reads carries WSR-88D volume scans only, so a TDWR site has no
-    /// reflectivity to show through that path. [`RADARS`] lists both because the
+    /// reflectivity to show through that path. [`radars()`] lists both because the
     /// map draws a marker for every site.
     ///
     /// The `T` prefix identifies the 45 TDWRs, with one exception that a naive
@@ -1965,7 +2177,7 @@ impl RadarSite {
     /// pick for the Oklahoma City metro would land on it and intermittently show
     /// an empty map.
     ///
-    /// Only automatic selection consults this. The site stays in [`RADARS`], the
+    /// Only automatic selection consults this. The site stays in [`radars()`], the
     /// map still draws it, and a user who picks it by hand still gets it.
     pub fn is_operational(&self) -> bool {
         self.name != "KCRI"
@@ -1979,13 +2191,13 @@ impl RadarSite {
 ///
 /// Returns `None` only for a non-finite input. A NaN coordinate would otherwise
 /// compare `false` against every candidate and silently yield whichever site
-/// happens to sit first in [`RADARS`], which reads as a deliberate choice.
+/// happens to sit first in [`radars()`], which reads as a deliberate choice.
 ///
 /// No distance cap: a caller in Europe gets the nearest NEXRAD and a very large
 /// number, and it is the caller's business whether that is useful. Callers that
 /// care should test the returned distance rather than expect `None`.
 pub fn nearest_radar_site(lat: f64, lon: f64) -> Option<(&'static RadarSite, f64)> {
-    nearest_site_where(lat, lon, |_| true)
+    table().nearest(lat, lon)
 }
 
 /// The closest site an automatic pick should open on, with its distance in km.
@@ -1996,25 +2208,7 @@ pub fn nearest_radar_site(lat: f64, lon: f64) -> Option<(&'static RadarSite, f64
 /// test bed `KCRI`. Neither reliably shows a viewer reflectivity, and the site
 /// a person there actually wants is the third one out, `KTLX`.
 pub fn nearest_wsr88d_site(lat: f64, lon: f64) -> Option<(&'static RadarSite, f64)> {
-    nearest_site_where(lat, lon, |site| site.is_wsr88d() && site.is_operational())
-}
-
-fn nearest_site_where(
-    lat: f64,
-    lon: f64,
-    accept: impl Fn(&RadarSite) -> bool,
-) -> Option<(&'static RadarSite, f64)> {
-    if !lat.is_finite() || !lon.is_finite() {
-        return None;
-    }
-    RADARS
-        .iter()
-        .filter(|site| accept(site))
-        .map(|site| (site, distance_km(lat, lon, site.lat, site.lon)))
-        // `total_cmp`, not `partial_cmp().unwrap()`: the distances are finite
-        // given a finite input, but the unwrap would be a panic path in a
-        // startup routine to save nothing.
-        .min_by(|(_, a), (_, b)| a.total_cmp(b))
+    table().nearest_wsr88d(lat, lon)
 }
 
 #[cfg(test)]
@@ -2062,7 +2256,8 @@ mod nearest_tests {
             "the literal nearest site is a TDWR"
         );
 
-        let (nearest_88d, _) = nearest_site_where(35.4676, -97.5164, RadarSite::is_wsr88d)
+        let (nearest_88d, _) = table()
+            .nearest_where(35.4676, -97.5164, RadarSite::is_wsr88d)
             .expect("a finite coordinate");
         assert_eq!(
             nearest_88d.name, "KCRI",
@@ -2114,9 +2309,9 @@ mod nearest_tests {
     /// rather than silently changing what startup selection can choose from.
     #[test]
     fn the_table_splits_into_45_tdwrs_and_the_wsr88d_network() {
-        let tdwrs = RADARS.iter().filter(|s| s.is_tdwr()).count();
+        let tdwrs = SEED.iter().filter(|s| s.is_tdwr()).count();
         assert_eq!(tdwrs, 45);
-        assert_eq!(RADARS.len() - tdwrs, 162);
+        assert_eq!(SEED.len() - tdwrs, 162);
     }
 
     /// A NaN must not silently degrade to "the first entry in the table".
@@ -2132,7 +2327,7 @@ mod nearest_tests {
     ///
     /// Pinned by value so a re-import of the table from whatever list it came
     /// from originally cannot quietly put them back. Forty-five of the fifty
-    /// are TDWRs — see [`RADARS`] on why that is one defect and not
+    /// are TDWRs — see [`radars()`] on why that is one defect and not
     /// forty-five.
     const MOVED_ONTO_ITS_VOLUME: [(&str, f64, f64, f64, f64, &str); 50] = [
         (
@@ -2286,7 +2481,7 @@ mod nearest_tests {
     /// be seen — a test, rather than a render that silently sits 89 m low.
     #[test]
     fn every_site_records_an_elevation() {
-        let missing: Vec<&str> = RADARS
+        let missing: Vec<&str> = radars()
             .iter()
             .filter(|s| s.heights.is_none())
             .map(|s| s.name)
@@ -2307,7 +2502,7 @@ mod nearest_tests {
     /// This closes it against the datum the callers actually name.
     #[test]
     fn every_site_answers_the_feedhorn_datum() {
-        let missing: Vec<&str> = RADARS
+        let missing: Vec<&str> = radars()
             .iter()
             .filter(|s| s.height_ft(Datum::Feedhorn).is_none())
             .map(|s| s.name)
@@ -2323,7 +2518,7 @@ mod nearest_tests {
     /// leaving that set should be visible rather than inferred.
     #[test]
     fn only_the_single_height_rows_lack_a_base() {
-        let no_base: Vec<&str> = RADARS
+        let no_base: Vec<&str> = SEED
             .iter()
             .filter(|s| s.height_ft(Datum::SiteBase).is_none())
             .map(|s| s.name)
@@ -2346,7 +2541,7 @@ mod nearest_tests {
     /// nothing here would matter. It is 30–115 ft.
     #[test]
     fn the_two_datums_are_a_tower_apart() {
-        let mut gaps: Vec<i32> = RADARS
+        let mut gaps: Vec<i32> = SEED
             .iter()
             .filter_map(|s| Some(s.height_ft(Datum::Feedhorn)? - s.height_ft(Datum::SiteBase)?))
             .collect();
@@ -2446,7 +2641,7 @@ mod nearest_tests {
                 hash = hash.wrapping_mul(0x1000_0000_01b3);
             }
         };
-        for site in RADARS.iter() {
+        for site in SEED.iter() {
             eat(site.name.as_bytes());
             eat(&site.lat.to_bits().to_be_bytes());
             eat(&site.lon.to_bits().to_be_bytes());
@@ -2462,7 +2657,7 @@ mod nearest_tests {
     /// a transposed lat/lon in any single table row.
     #[test]
     fn every_site_is_its_own_nearest_neighbour() {
-        for site in RADARS.iter() {
+        for site in radars() {
             let (found, dist) =
                 nearest_radar_site(site.lat, site.lon).expect("table coordinates are finite");
             assert_eq!(

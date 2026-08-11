@@ -9134,7 +9134,7 @@ fn the_site_search_narrows_the_list_and_a_row_click_switches_the_site() {
     h.open_pane_props();
 
     let inspector = h.inspector();
-    let total = rustdar_radar::sites::RADARS.len();
+    let total = rustdar_radar::sites::radars().len();
     assert_eq!(
         inspector.site_rows.len(),
         total,
@@ -9941,7 +9941,7 @@ fn the_site_pill_popover_searches_and_switches() {
     let search = popover.search.expect("with its search field");
     assert_eq!(
         popover.rows.len(),
-        rustdar_radar::sites::RADARS.len(),
+        rustdar_radar::sites::radars().len(),
         "unfiltered, the popover offers the whole table — the inspector's \
          own list"
     );
