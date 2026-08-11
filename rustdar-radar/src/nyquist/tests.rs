@@ -12,6 +12,53 @@ fn the_first_statement_of_a_cut_wins() {
     assert_eq!(table.get(3), Some(26.42));
 }
 
+/// Two cuts under one elevation number is the one shape first-wins answers
+/// wrongly, and the answer is indistinguishable from a right one at every
+/// reader. So it is *recorded* — the value still stands, because no data
+/// justifies a rule for choosing between two waveforms, but the volume can no
+/// longer claim the number went unquestioned.
+#[test]
+fn a_second_disagreeing_declaration_is_recorded_against_its_cut() {
+    let mut table = DeclaredNyquist::empty();
+    table.declare(1, 26.42);
+    table.declare(2, 22.14);
+    table.declare(1, 31.0);
+    assert_eq!(
+        table.get(1),
+        Some(26.42),
+        "the resolution policy is unchanged: the first statement still stands",
+    );
+    assert_eq!(table.contradicted().collect::<Vec<_>>(), vec![1]);
+}
+
+/// The ordinary case must stay quiet. Every radial of a cut declares the same
+/// number and the archive walk offers all 360 of them, so a repeat that agrees
+/// is the shape of a working volume, not of a broken one.
+#[test]
+fn a_repeated_agreeing_declaration_is_not_a_contradiction() {
+    let mut table = DeclaredNyquist::empty();
+    for _ in 0..360 {
+        table.declare(4, 22.14);
+    }
+    assert_eq!(table.contradicted().count(), 0, "{table:?}");
+}
+
+/// A merged volume inherits the doubt as well as the numbers. `resolve` serves
+/// each cut from whichever of the two volumes sealed it last, so a
+/// contradiction in either is a contradiction behind a value the merged table
+/// hands out.
+#[test]
+fn a_merge_carries_the_contradictions_of_both_volumes() {
+    let mut base = DeclaredNyquist::empty();
+    base.declare(1, 26.42);
+    base.declare(1, 31.0);
+    let mut overlay = DeclaredNyquist::empty();
+    overlay.declare(2, 22.14);
+    overlay.declare(2, 25.0);
+    base.overlay(&overlay);
+    assert_eq!(base.contradicted().collect::<Vec<_>>(), vec![1, 2]);
+}
+
 /// A non-finite declaration is dropped rather than stored. Stored, it would
 /// reach the guard as a comparison that is false in both directions — a guard
 /// that is off while looking armed — which is strictly worse than the absence

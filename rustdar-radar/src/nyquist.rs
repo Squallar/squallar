@@ -41,7 +41,7 @@
 //! where it exists. Comparing the two would be a measurement, and this is the
 //! plumbing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use nexrad_model::data::Scan;
 
@@ -60,6 +60,9 @@ use nexrad_model::data::Scan;
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DeclaredNyquist {
     by_elevation: BTreeMap<u8, f64>,
+    /// Elevation numbers a second, **different** declaration arrived for. See
+    /// [`Self::declare`] for what that means and why it is only ever recorded.
+    contradicted: BTreeSet<u8>,
 }
 
 impl DeclaredNyquist {
@@ -68,6 +71,7 @@ impl DeclaredNyquist {
     pub const fn empty() -> Self {
         Self {
             by_elevation: BTreeMap::new(),
+            contradicted: BTreeSet::new(),
         }
     }
 
@@ -82,12 +86,59 @@ impl DeclaredNyquist {
     /// stored: it would reach the guard as a comparison that is false in both
     /// directions, which is a silently disabled guard rather than an absent
     /// one.
+    ///
+    /// # When first-wins is the wrong rule, and how you would know
+    ///
+    /// The key is the RDA's `elevation_number`, and the constancy above holds
+    /// *within a cut*. A VCP that gave two cuts the same number would put two
+    /// waveforms under one key, and the first would pin every later revisit to
+    /// its own PRF — a fold limit that is wrong but entirely plausible, which
+    /// no reader can tell from a right one. Nothing downstream can catch it
+    /// either: [`crate::sampler::VolumeSampler`] and
+    /// [`crate::nrot::dealias_with_knobs`] both take the number as given.
+    ///
+    /// Today's TDWR VCPs do not do this — VCP 80's seven revisits of the
+    /// 0.2637° tilt carry elevation numbers 1, 2, 6, 10, 14, 18 and 22, and VCP
+    /// 90's sixteen cuts are a strict 1..16 — so this is a shape the archive
+    /// has not been observed to take rather than one it cannot. **A
+    /// contradiction is therefore reported and recorded, and nothing else**:
+    /// there is no data behind a rule for choosing between two declarations
+    /// (newest? the wider one? per-radial keying?), and inventing one would
+    /// substitute a guess for the absence of a case.
+    ///
+    /// Once per elevation number, not once per statement. The archive walk
+    /// calls this for every radial of every cut, so a contradicted revisit
+    /// would otherwise log its 360 radials identically and bury the one line
+    /// that says which cut and which two numbers.
     pub fn declare(&mut self, elevation_number: u8, metres_per_second: f64) {
-        if metres_per_second.is_finite() {
-            self.by_elevation
-                .entry(elevation_number)
-                .or_insert(metres_per_second);
+        if !metres_per_second.is_finite() {
+            return;
         }
+        let Some(&held) = self.by_elevation.get(&elevation_number) else {
+            self.by_elevation.insert(elevation_number, metres_per_second);
+            return;
+        };
+        // Bit-equality, and it is the right test rather than a tolerance: the
+        // number is a `u16` of hundredths times 0.01, so one PRF always
+        // produces one `f64` and two PRFs never produce the same one.
+        if held == metres_per_second || !self.contradicted.insert(elevation_number) {
+            return;
+        }
+        log::warn!(
+            "elevation number {elevation_number} declared {held} m/s and then \
+             {metres_per_second} m/s: two cuts share one key, so every reader of this volume \
+             folds the later one around the earlier one's PRF"
+        );
+    }
+
+    /// The cuts a second, different declaration arrived for — empty on every
+    /// volume this archive has been observed to produce. See [`Self::declare`].
+    ///
+    /// Public because the warning alone is a statement nothing can act on or
+    /// test against, and because this is the honest answer to "how much do you
+    /// trust this cut's number". It reports; it decides nothing.
+    pub fn contradicted(&self) -> impl Iterator<Item = u8> + '_ {
+        self.contradicted.iter().copied()
     }
 
     /// What cut `elevation_number` declared, m/s, or `None` when this table
@@ -126,6 +177,12 @@ impl DeclaredNyquist {
         for (elevation_number, ms) in newer.iter() {
             self.set(elevation_number, ms);
         }
+        // A union, not a replacement: whichever of the two volumes put two
+        // waveforms under one key, the merged table serves a value that came
+        // from one of them. Note that a *disagreement between* the two — the
+        // ordinary VCP change this merge exists for — is not one of these; only
+        // `declare` records anything here.
+        self.contradicted.extend(newer.contradicted.iter().copied());
     }
 
     /// [`Self::declare`]'s last-wins twin: replace whatever this table held
