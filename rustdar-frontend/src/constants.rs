@@ -249,15 +249,17 @@ pub const DESKTOP_LOOP_TEXTURE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 /// Unlike [`LOOP_TEXTURE_BUDGET_BYTES`], this one **is enforced at runtime**:
 /// `VolumeStore::enforce_budget` evicts oldest-first until the resident grids
 /// fit, every frame, and `the_store_eviction_actually_bounds` drives it past
-/// the line. The frame counts below are chosen so it never has to fire in
-/// steady state; it exists for the transition, where a pane can hold its live
-/// grid and a loop set at once.
+/// the line. The frame counts below are chosen so it never has to fire for a
+/// loop and a live 3D pane together, which is the layout it would otherwise
+/// fire for constantly — the `headroom` column is what buys that, and
+/// `a_full_3d_loop_leaves_room_for_a_live_grid_beside_it` is why every row of
+/// it is at least one grid wide.
 ///
-/// | target  | frames | 3D texture | resident | budget  |
-/// |---------|-------:|-----------:|---------:|--------:|
-/// | wasm32  |      8 |  4.501 MiB | 36.0 MiB |  48 MiB |
-/// | mobile  |     12 | 15.189 MiB | 182.3MiB | 256 MiB |
-/// | desktop |     14 | 36.001 MiB |  504 MiB | 512 MiB |
+/// | target  | frames | 3D texture | resident  | headroom | budget  |
+/// |---------|-------:|-----------:|----------:|---------:|--------:|
+/// | wasm32  |      8 |  4.501 MiB |  36.0 MiB | 12.0 MiB |  48 MiB |
+/// | mobile  |     12 | 15.189 MiB | 182.3 MiB | 73.7 MiB | 256 MiB |
+/// | desktop |     13 | 36.001 MiB | 468.0 MiB | 44.0 MiB | 512 MiB |
 ///
 /// Deliberately the same figure as [`LOOP_TEXTURE_BUDGET_BYTES`] rather than a
 /// number of its own: a loop is a loop, and a screen showing a 3D loop instead
@@ -279,7 +281,7 @@ pub const DESKTOP_VOLUME_LOOP_TEXTURE_BUDGET_BYTES: usize = DESKTOP_LOOP_TEXTURE
 ///
 /// # Desktop takes fewer frames at the full grid, not more at a coarser one
 ///
-/// 14 frames of the full 256×256×128 grid is ~70 minutes of history where 30
+/// 13 frames of the full 256×256×128 grid is ~65 minutes of history where 30
 /// frames would be ~150. That is a real loss and it is stated rather than
 /// hidden. The alternative — a loop-specific coarser grid — was rejected for
 /// three reasons, in the order they bite:
@@ -297,14 +299,24 @@ pub const DESKTOP_VOLUME_LOOP_TEXTURE_BUDGET_BYTES: usize = DESKTOP_LOOP_TEXTURE
 ///
 /// # Each arm is the tighter of two bounds
 ///
-/// What [`VOLUME_LOOP_TEXTURE_BUDGET_BYTES`] admits, and
-/// [`MAX_LOOP_RENDER_BUDGET`]. The budget binds desktop (14 grids where a
+/// What [`VOLUME_LOOP_TEXTURE_BUDGET_BYTES`] admits **beside one live grid**,
+/// and [`MAX_LOOP_RENDER_BUDGET`]. The budget binds desktop (13 grids where a
 /// plan-view loop textures 30 frames); the render budget binds wasm32 and
-/// mobile, where the grids are small enough that the budget would admit 10 and
-/// 16 — a 3D loop is not licensed to hold *more* history than the plan-view
+/// mobile, where the grids are small enough that the budget would admit 9 and
+/// 15 — a 3D loop is not licensed to hold *more* history than the plan-view
 /// loop beside it on the same device merely because its frames are cheaper
 /// there. `the_3d_loop_holds_exactly_what_it_marches` computes both and pins
 /// the minimum.
+///
+/// The subtracted grid is the correction to the count this loop kind shipped
+/// with. Desktop was 14 — the whole budget, to the last 1.5% — and the store
+/// is application-wide, so a second 3D pane showing a live volume put it over
+/// by 28 MiB. `enforce_budget` evicts *oldest first*, and the loop's frames
+/// are older than the live grid that arrived after it, so what went was the
+/// loop's own frame 0. The dispatcher re-plans it the next pass, rebuilds it
+/// at ~89 ms, and the store evicts frame 1 to make room: a permanent rebuild
+/// treadmill whose only symptoms are a warm machine and a loop one frame
+/// short. Two 3D panes, one looping and one live, is an ordinary layout.
 ///
 /// Named outside the cascade for the reason [`WASM_VOLUME_GRID_CELLS`] gives.
 #[cfg(target_arch = "wasm32")]
@@ -321,7 +333,7 @@ pub const WASM_MAX_LOOP_VOLUME_FRAMES: usize = 8;
 /// The mobile arm. See [`MAX_LOOP_VOLUME_FRAMES`].
 pub const MOBILE_MAX_LOOP_VOLUME_FRAMES: usize = 12;
 /// The desktop arm. See [`MAX_LOOP_VOLUME_FRAMES`].
-pub const DESKTOP_MAX_LOOP_VOLUME_FRAMES: usize = 14;
+pub const DESKTOP_MAX_LOOP_VOLUME_FRAMES: usize = 13;
 
 /// How many voxel grids a 3D loop may *dispatch* in one frame.
 ///
@@ -332,7 +344,7 @@ pub const DESKTOP_MAX_LOOP_VOLUME_FRAMES: usize = 14;
 /// on wasm the volume is only reachable from the main thread. The resample
 /// (~89 ms) and the upload (~51 ms) are both off it.
 ///
-/// One per frame means a full desktop set of 14 is dispatched over 14 frames —
+/// One per frame means a full desktop set of 13 is dispatched over 13 frames —
 /// under a quarter of a second at 60 fps — and every grid that lands is shown
 /// as it lands rather than the pane blocking on the batch.
 pub const MAX_LOOP_VOLUME_BUILDS_PER_FRAME: usize = 1;

@@ -1009,3 +1009,172 @@ fn the_loop_transport_payloads_drive_the_playback_state() {
     );
     assert_eq!(frame(&app), 1, "an out-of-range seek changes nothing");
 }
+
+/// A volume whose flight runs from `first` to `last` — two sweeps, dated
+/// minutes apart, as a real VCP-212 volume's are.
+///
+/// The span is the point. `ScanInfo::from_scan` dates a volume by its **first**
+/// radial and the base holder is keyed by that, while `current::resolve`
+/// reports the **newest** data time; on any real volume those are five minutes
+/// apart. Every existing fixture here is a single radial, where the two
+/// coincide — and a target keyed on one while the source decision tests the
+/// other passes perfectly well until they are told apart.
+fn spanning_scan(first: u32, last: u32) -> nexrad_model::data::Scan {
+    use nexrad_model::data::{
+        ChannelConfiguration, ElevationCut, MomentData, PulseWidth, Radial, RadialStatus, Scan,
+        Sweep, VolumeCoveragePattern, WaveformType,
+    };
+    let sweep = |number: u8, elevation: f32, minute: u32| {
+        let radials = (0..8u16)
+            .map(|i| {
+                Radial::new(
+                    at(minute).and_utc().timestamp_millis() + i64::from(i),
+                    i + 1,
+                    f32::from(i) * 45.0,
+                    45.0,
+                    RadialStatus::IntermediateRadialData,
+                    number,
+                    elevation,
+                    Some(MomentData::from_fixed_point(
+                        4,
+                        2125,
+                        250,
+                        8,
+                        2.0,
+                        66.0,
+                        vec![120, 140, 160, 180],
+                    )),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            })
+            .collect();
+        Sweep::new(number, radials)
+    };
+    let cut = |angle: f64| {
+        ElevationCut::new(
+            angle,
+            ChannelConfiguration::ConstantPhase,
+            WaveformType::CS,
+            20.0,
+            true,
+            true,
+            false,
+            false,
+            1,
+            20,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            false,
+            0,
+            false,
+            0,
+            false,
+            false,
+        )
+    };
+    Scan::new(
+        VolumeCoveragePattern::new(
+            212,
+            0,
+            0.5,
+            PulseWidth::Short,
+            false,
+            0,
+            false,
+            0,
+            false,
+            false,
+            0,
+            false,
+            false,
+            vec![cut(0.5), cut(1.5)],
+        ),
+        vec![sweep(1, 0.5, first), sweep(2, 1.5, last)],
+    )
+}
+
+fn volume_target(collected: chrono::NaiveDateTime) -> rustdar_egui::pane::VolumeTarget {
+    rustdar_egui::pane::VolumeTarget {
+        volume: rustdar_egui::pane::VolumeStamp {
+            site: "KTLX".to_owned(),
+            collected,
+        },
+        product: rustdar_radar::types::RadarProduct::Reflectivity,
+        region: None,
+    }
+}
+
+/// **A 3D pane navigated off live is served the volume it names.**
+///
+/// The host half of "changing time in the time bar does not change the 3D
+/// viewer". A navigated pane stamps its target with `ScanInfo::timestamp` —
+/// the volume's *start*, the same field a cross-section pane's target carries
+/// and the same key the base holder is stored under. `prepare_volume` knew
+/// only two sources: the live merged volume, matched by *newest data time*,
+/// and a 3D loop's downloaded scans. A navigated target is neither, so it fell
+/// through to `Waiting`: no build, no entry, no picture, for the rest of the
+/// session.
+///
+/// The two coincide on a one-radial fixture, which is why nothing caught this.
+/// [`spanning_scan`] tells them apart the way a real volume does.
+#[test]
+fn a_navigated_3d_pane_is_served_the_volume_it_names() {
+    let mut app = headless(TestBridge::desktop());
+    app.base_scans.insert(
+        "KTLX".to_string(),
+        (
+            Arc::new(spanning_scan(10, 14)),
+            Default::default(),
+            // The key the scan drain records: `scan_info.timestamp`.
+            at(10),
+        ),
+    );
+    let newest = app
+        .current_volume_stamp("KTLX")
+        .expect("the fixture volume resolves a stamp")
+        .newest;
+    assert!(
+        newest >= at(14),
+        "precondition: the volume's newest data time must be the end of the \
+         flight and not the key it is held under ({}), or the two source \
+         decisions cannot be told apart — got {newest}",
+        at(10),
+    );
+
+    let navigated = volume_target(at(10));
+    app.handle_prepare_volume(0, navigated.clone());
+    assert!(
+        app.volume_store.lookup(&navigated).is_some(),
+        "the pane named the volume it is showing and the host had it in hand, \
+         and no build was reached — so a scrubbed 3D pane waits for ever",
+    );
+
+    // The live target is still served, and from the merge rather than from
+    // this arm — so the assertion above is about a new source and not about
+    // the gate having been dropped.
+    let live = volume_target(newest);
+    app.handle_prepare_volume(1, live.clone());
+    assert!(
+        app.volume_store.lookup(&live).is_some(),
+        "the live target stopped being served",
+    );
+
+    // And a time the app holds no volume for is still left alone, with no
+    // entry, so the level-triggered caller goes on asking.
+    let unheld = volume_target(at(30));
+    app.handle_prepare_volume(2, unheld.clone());
+    assert!(
+        app.volume_store.lookup(&unheld).is_none(),
+        "a volume the app does not hold was answered for, which stops the pane \
+         ever asking again",
+    );
+}

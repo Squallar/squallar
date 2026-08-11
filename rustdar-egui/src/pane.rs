@@ -338,7 +338,7 @@ impl SectionLoopKey {
 /// * **The storm motion vector.** A storm-relative grid is derived on the way
 ///   out of the volume, so the grid *is* a function of the vector, and the
 ///   vector is not in the target that keys it. Without it here, an override
-///   edit would leave fourteen grids painting the previous vector's field with
+///   edit would leave thirteen grids painting the previous vector's field with
 ///   nothing saying so — the same defect `SectionLoopKey::storm_motion` and
 ///   `render_dispatch::SectionInputKey::storm_motion` exist for.
 ///

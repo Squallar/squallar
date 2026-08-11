@@ -257,6 +257,46 @@ fn volume_loop_grids_fit_the_application_texture_budget() {
     }
 }
 
+/// **A full 3D loop leaves room for one live 3D grid beside it.**
+///
+/// Fitting the set alone is not enough, and the ~1.5% of headroom desktop had
+/// under it was not slack — it was a defect one ordinary layout away. A second
+/// 3D pane showing a live volume is one more grid in the same
+/// application-wide store, and `VolumeStore::enforce_budget` evicts **oldest
+/// first**: the loop started first, so what goes is the loop's frame 0, not
+/// the live grid that pushed the store over. The dispatcher then re-plans that
+/// frame on the very next pass, rebuilds it (a frame-thread extraction and an
+/// ~89 ms worker resample), and the store evicts frame 1 to make room. That is
+/// a permanent rebuild treadmill with a hot CPU and a loop visibly missing a
+/// frame as its only symptoms.
+///
+/// So the frame count is chosen against `budget − one grid`, which
+/// `the_3d_loop_holds_exactly_what_it_marches` computes. This is the same
+/// claim stated as the property rather than as the formula, because it is the
+/// property that is load-bearing: the formula could be changed to agree with a
+/// wrong count and this would still fail.
+///
+/// It bounds the *reachable* layouts rather than every conceivable one — a
+/// third distinct live grid is over the line again, and the eviction's answer
+/// there is the same. What it buys is that the common two-pane case never
+/// reaches the eviction at all.
+#[test]
+fn a_full_3d_loop_leaves_room_for_a_live_grid_beside_it() {
+    for arm in arms() {
+        let resident = arm.volume_loop_frames * arm.volume_bytes();
+        assert!(
+            resident + arm.volume_bytes() <= arm.volume_loop_budget,
+            "{}: {} resident grids + one live grid = {:.1} MiB against a {} MiB \
+             budget, so a 3D loop beside a live 3D pane makes the store evict \
+             the loop's own oldest frame and rebuild it for ever",
+            arm.name,
+            arm.volume_loop_frames,
+            (resident + arm.volume_bytes()) as f64 / (1024.0 * 1024.0),
+            arm.volume_loop_budget / (1024 * 1024),
+        );
+    }
+}
+
 /// A 3D loop holds exactly what it marches: the frame list **is** the resident
 /// set.
 ///
@@ -284,13 +324,16 @@ fn the_3d_loop_holds_exactly_what_it_marches() {
         // allow is history thrown away for nothing, and a longer one is the
         // treadmill this loop kind cannot afford.
         //
-        //  * what the byte budget admits, which binds desktop (14 of the 30
-        //    frames a plan-view loop textures);
+        //  * what the byte budget admits **beside one live grid**, which binds
+        //    desktop (13 of the 30 frames a plan-view loop textures). The
+        //    subtracted grid is not padding: see
+        //    `a_full_3d_loop_leaves_room_for_a_live_grid_beside_it` for the
+        //    layout it is there for and what happens without it.
         //  * `MAX_LOOP_RENDER_BUDGET`, which binds wasm32 and mobile — a 3D
         //    loop is not licensed to hold *more* history than the plan-view
         //    loop beside it on the same device just because its grids happen
         //    to be small there.
-        let admits = arm.volume_loop_budget / arm.volume_bytes();
+        let admits = arm.volume_loop_budget.saturating_sub(arm.volume_bytes()) / arm.volume_bytes();
         assert_eq!(
             arm.volume_loop_frames,
             admits.min(arm.render_budget),

@@ -623,7 +623,7 @@ impl super::App {
         // the invalidation below is not cheap: it evicts every storm-relative
         // grid and section. Applied per drag frame that is ~210 ms of re-cut
         // for a cross-section and, for a 3D loop, the whole resident set —
-        // fourteen grids and ~2 s of resample, thrown away and restarted on
+        // thirteen grids and ~1.8 s of resample, thrown away and restarted on
         // the next frame, so a loop would never finish building while a finger
         // was on the widget. Holding the commit makes the cost proportional to
         // the edit rather than to how long it took. See
@@ -2059,7 +2059,7 @@ impl super::App {
         // Panes whose 3D loop must let go of every grid it holds **before**
         // anything is built for the new key. See `VolumeStore::retain_set`:
         // the seamless-swap rule that keeps the old grid through a rebuild is
-        // right for one grid and is a peak of two full sets for fourteen.
+        // right for one grid and is a peak of two full sets for thirteen.
         // Collected rather than acted on inline, because the store is borrowed
         // from `self` while the pane is.
         let mut release_volume_sets: Vec<usize> = Vec::new();
@@ -2180,7 +2180,7 @@ impl super::App {
         for pane_idx in retire_queues {
             self.loop_mgr.remove_pending(pane_idx);
             // A torn-down 3D loop's grids go with its queue. Without this the
-            // resident set outlives the loop that asked for it, and 504 MiB
+            // resident set outlives the loop that asked for it, and 468 MiB
             // stays allocated for a pane that is showing a live volume.
             //
             // Asked before it is done, because the answer is also what says
@@ -2316,29 +2316,35 @@ impl super::App {
                         product: target.product,
                         region: key.region,
                     };
-                    // Already resident and already named by this frame. The
-                    // target is compared rather than merely "is there an
-                    // image", because a frame keyed to the previous region
-                    // would otherwise stand for the new one for ever.
-                    if frame
-                        .image
-                        .as_ref()
-                        .and_then(rustdar_egui::pane::LoopFrameImage::volume)
-                        .is_some_and(|held| held.target == volume_target)
-                    {
-                        continue;
-                    }
+                    // **Every frame is planned, every pass, whatever state it
+                    // is in** — including one already resident and already
+                    // named. The plan is not a work list, it is the statement
+                    // `retain_set` makes below, and that statement detaches
+                    // the holder from everything it does not name. A frame
+                    // dropped from the plan for having landed is therefore a
+                    // frame whose grid is handed back on the very next pass,
+                    // and the set is eaten from the front as fast as it is
+                    // built: what survives is the last grid stated, which
+                    // `lookup_for_pane`'s same-scope fallback then paints
+                    // under every other frame's caption. That is the "the loop
+                    // sort of plays and then shows the current time" report,
+                    // and the skip that caused it read perfectly reasonably as
+                    // an optimisation.
+                    //
+                    // The cost of planning a landed frame is a `share_held`
+                    // probe and a `lookup` — see `make_volume_frames_resident`,
+                    // whose pacing counts *dispatches* precisely so that the
+                    // naming half can run for every frame of every pass.
                     to_build.push(LoopVolumeRequest {
                         pane_idx,
                         frame_idx: idx,
                         target: volume_target,
-                        // A retired frame is still *planned*, so that the
-                        // store goes on holding the refusal it was retired by
-                        // and the statement of the resident set below names
-                        // the whole frame list. What it must never do is buy
-                        // another extraction: the answer is a property of the
-                        // volume, so retrying is a walk that fails identically
-                        // for ever.
+                        // A retired frame is still planned for the same
+                        // reason, so that the store goes on holding the
+                        // refusal it was retired by. What it must never do is
+                        // buy another extraction: the answer is a property of
+                        // the volume, so retrying is a walk that fails
+                        // identically for ever.
                         retired: frame.render_failed,
                     });
                 }
@@ -2665,8 +2671,8 @@ impl super::App {
     /// because this is the half with the two rules worth reading together:
     ///
     /// * **The pacing counts dispatches, not frames.** A pass over a settled
-    ///   fourteen-frame loop finds every grid already in the store and spends
-    ///   fourteen hash-free linear lookups; only a *miss* costs the
+    ///   thirteen-frame loop finds every grid already in the store and spends
+    ///   thirteen hash-free linear lookups; only a *miss* costs the
     ///   `extract_volume_parts` walk on the frame thread, and at most
     ///   [`MAX_LOOP_VOLUME_BUILDS_PER_FRAME`] of those are paid per frame. The
     ///   cheap `share_held` probe ahead of the budget check is what separates
@@ -2679,6 +2685,15 @@ impl super::App {
     ///   [`crate::volume::bridge::VolumeStore::retain_set`], and it is what
     ///   makes "the frame list is the resident set" a property rather than a
     ///   hope.
+    ///
+    /// The two rules meet at one obligation on the *caller*: `to_build` must be
+    /// the loop's **whole** frame list on every pass, not the frames that still
+    /// need work. `retain_set` detaches the holder from everything the list
+    /// does not name, so a frame left out of the plan for having already landed
+    /// is a frame whose grid is handed straight back — the set eaten from the
+    /// front as fast as it is built, which is what the loop-that-snaps-back
+    /// report turned out to be. The pacing above is what makes that affordable:
+    /// planning a landed frame costs a probe and a lookup, never an extraction.
     fn make_volume_frames_resident(&mut self, to_build: Vec<LoopVolumeRequest>) {
         use crate::volume::bridge::{Hold, VolumeEntry};
 

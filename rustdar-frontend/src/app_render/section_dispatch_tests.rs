@@ -705,8 +705,8 @@ fn a_storm_motion_edit_re_derives_the_cross_section() {
 /// Every other setting that invalidates a render is a click. This one is a
 /// `DragValue`, which produces a value per frame, and applying it evicts every
 /// storm-relative grid and section: ~210 ms of re-cut per drag frame for a
-/// cross-section, and for a 3D loop the whole resident set — fourteen grids and
-/// ~2 s of resample, thrown away and restarted on the next frame, so the loop
+/// cross-section, and for a 3D loop the whole resident set — thirteen grids and
+/// ~1.8 s of resample, thrown away and restarted on the next frame, so the loop
 /// would never finish building while a finger was on the widget.
 ///
 /// What is *not* deferred matters as much: the widget shows the new number

@@ -16,7 +16,7 @@
 //!    holder is exempt from every shed there is;
 //!  * a change of key **releases before it builds**, because the seamless-swap
 //!    rule that keeps the old grid through a rebuild is a peak of two full sets
-//!    — 1008 MiB against a 512 MiB budget on desktop.
+//!    — 936 MiB against a 512 MiB budget on desktop.
 //!
 //! The pane-level identity rules live in `rustdar_egui::pane`; the store's own
 //! rules live in `volume::bridge::tests`. These are the dispatcher's.
@@ -190,8 +190,8 @@ fn the_resident_set_is_the_whole_frame_list() {
 /// ones were built.
 ///
 /// That rule is right for one grid — it is what stops a live 3D pane flashing
-/// "Building…" every sealed sweep — and wrong for fourteen: 14 × 36.001 MiB
-/// twice over is 1008 MiB against a 512 MiB budget. So a set holder releases
+/// "Building…" every sealed sweep — and wrong for thirteen: 13 × 36.001 MiB
+/// twice over is 936 MiB against a 512 MiB budget. So a set holder releases
 /// first and accepts the first-build message for the fraction of a second that
 /// costs.
 ///
@@ -267,8 +267,8 @@ fn a_region_change_releases_the_old_set_before_building_the_new_one() {
 /// `extract_volume_parts` runs on the frame thread — the job wire carries a
 /// `RenderInput`, not a `Scan` — so at most `MAX_LOOP_VOLUME_BUILDS_PER_FRAME`
 /// of them may be paid per pass. But a pass over a settled loop must be free to
-/// name every frame it finds already resident, or a fourteen-frame loop would
-/// take fourteen frames to notice grids it already had, every time the playhead
+/// name every frame it finds already resident, or a thirteen-frame loop would
+/// take thirteen frames to notice grids it already had, every time the playhead
 /// moved.
 ///
 /// `App::volume_extractions` counts the walks, and it is a `#[cfg(test)]`
@@ -306,7 +306,7 @@ fn the_pacing_caps_the_extraction_and_not_the_naming() {
 ///
 /// The teardown `PaneState::set_kind` starts is pane-local; the store is keyed
 /// by pane index and a `PaneState` cannot reach it. Without the host-side half,
-/// 504 MiB stays allocated for a pane that has gone back to showing one live
+/// 468 MiB stays allocated for a pane that has gone back to showing one live
 /// volume — the 3D counterpart of the download queue that outlived its loop.
 #[test]
 fn switching_the_loop_off_gives_the_resident_set_back() {
@@ -433,9 +433,9 @@ fn a_volume_with_nothing_to_resample_retires_its_frame() {
 /// A 3D loop is capped at its **resident** frame count when the scan listing
 /// lands, not at `MAX_LOOP_FRAMES`.
 ///
-/// Sixty frames sampled down to fourteen is what makes the frame list and the
+/// Sixty frames sampled down to thirteen is what makes the frame list and the
 /// resident set the same thing on desktop. Without this the list would be sixty
-/// long, the render set a fourteen-wide window inside it, and the loop would be
+/// long, the render set a thirteen-wide window inside it, and the loop would be
 /// back on the treadmill it cannot afford — 89 ms of resample per playback
 /// step, at a 200 ms interval.
 #[test]
@@ -519,5 +519,216 @@ fn the_playing_frame_is_a_grid_and_no_raster_consumer_takes_it() {
         pane.active_section_image().is_none(),
         "a section consumer took a 3D loop frame, which it would draw into a \
          height scale and a tilt ladder that are not there",
+    );
+}
+
+/// A volume that really resamples, dated at `minute`.
+///
+/// Every other fixture in this file is an `empty_scan`, so every build is
+/// *refused* — and a refused frame is never named: `LoopFrameImage` stays
+/// `None` and `render_failed` goes up instead. That is a state in which the
+/// resident-set statement cannot go wrong, and it is why the defect
+/// [`the_resident_set_survives_its_own_frames_landing`] pins survived a suite
+/// that already claimed to cover it. A grid is the other half, and only a scan
+/// carrying a moment over real elevation cuts produces one.
+///
+/// Two sweeps of eight radials, which is the smallest shape
+/// `rustdar_radar::voxel::build_voxels` returns a grid for.
+fn resamplable_scan(minute: u32) -> nexrad_model::data::Scan {
+    use nexrad_model::data::{
+        ChannelConfiguration, ElevationCut, MomentData, PulseWidth, Radial, RadialStatus, Scan,
+        Sweep, VolumeCoveragePattern, WaveformType,
+    };
+    let stamp_ms = ts(minute).and_utc().timestamp_millis();
+    let sweep = |number: u8, elevation: f32| {
+        let radials = (0..8u16)
+            .map(|i| {
+                Radial::new(
+                    stamp_ms + i64::from(i),
+                    i + 1,
+                    f32::from(i) * 45.0,
+                    45.0,
+                    RadialStatus::IntermediateRadialData,
+                    number,
+                    elevation,
+                    Some(MomentData::from_fixed_point(
+                        4,
+                        2125,
+                        250,
+                        8,
+                        2.0,
+                        66.0,
+                        vec![120, 140, 160, 180],
+                    )),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            })
+            .collect();
+        Sweep::new(number, radials)
+    };
+    let cut = |angle: f64| {
+        ElevationCut::new(
+            angle,
+            ChannelConfiguration::ConstantPhase,
+            WaveformType::CS,
+            20.0,
+            true,
+            true,
+            false,
+            false,
+            1,
+            20,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            false,
+            0,
+            false,
+            0,
+            false,
+            false,
+        )
+    };
+    Scan::new(
+        VolumeCoveragePattern::new(
+            212,
+            0,
+            0.5,
+            PulseWidth::Short,
+            false,
+            0,
+            false,
+            0,
+            false,
+            false,
+            0,
+            false,
+            false,
+            vec![cut(0.5), cut(1.5)],
+        ),
+        vec![sweep(1, 0.5), sweep(2, 1.5)],
+    )
+}
+
+/// [`app_with_volume_loop`], over volumes that resample into real grids rather
+/// than into refusals.
+fn app_with_built_volume_loop(minutes: &[u32]) -> crate::app::App {
+    let mut app = app_with_volume_loop(minutes);
+    app.loop_mgr = LoopDownloadManager::new();
+    for &m in minutes {
+        app.loop_mgr
+            .cache_scan(SITE, ts(m), std::sync::Arc::new(resamplable_scan(m)));
+    }
+    app
+}
+
+/// One dispatch pass, with the worker's replies taken delivery of exactly as
+/// `App::poll_voxel_results` does.
+///
+/// The builds are real and run on the real job wire — `offload` spawns a thread
+/// natively — so the pass waits for precisely the replies it dispatched and no
+/// more. How many that is, is read off the store rather than guessed: a
+/// `Building` entry is opened at dispatch and by nothing else.
+fn pass(app: &mut crate::app::App) {
+    app.dispatch_loop_renders();
+    let in_flight = MINUTES
+        .iter()
+        .filter(|&&m| {
+            matches!(
+                app.volume_store
+                    .lookup(&frame_target(m, None))
+                    .map(|f| f.entry),
+                Some(VolumeEntry::Building),
+            )
+        })
+        .count();
+    for _ in 0..in_flight {
+        let reply = app
+            .channels
+            .voxel_receiver
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("every dispatched build answers, or the store's placeholder is a lie");
+        let grid = reply
+            .grid
+            .expect("the fixture volume resamples into a grid");
+        assert!(
+            app.volume_store.complete(
+                &reply.target,
+                VolumeEntry::Ready(std::sync::Arc::new(*grid))
+            ),
+            "the store had nothing waiting for a build it opened",
+        );
+    }
+}
+
+/// **A frame landing must not take it out of its own loop's resident set.**
+///
+/// The dispatcher plans the set, hands it to `make_volume_frames_resident`, and
+/// that pass states the whole thing through `VolumeStore::retain_set` — which
+/// detaches the holder from *everything it did not name*. So the planned list
+/// has to be the whole frame list, every pass, whatever state the frames are
+/// in. Skipping a frame because it is already resident and already named drops
+/// it out of the statement, and the next pass hands its grid back: the set is
+/// eaten one frame at a time, from the front, as it is built.
+///
+/// What the user sees is the report this test was written from — a loop that
+/// "sort of" plays and then shows the newest volume for every frame. The last
+/// grid built is the only survivor (nothing is stated once every frame is
+/// named, so the last statement stands), and `lookup_for_pane`'s same-scope
+/// fallback quietly paints it under every other frame's caption.
+///
+/// This cannot be written against the refusal fixtures the rest of this file
+/// uses: a refusal never names a frame, so the skip is never taken and the set
+/// is always stated whole.
+#[test]
+fn the_resident_set_survives_its_own_frames_landing() {
+    let mut app = app_with_built_volume_loop(&MINUTES);
+    for _ in 0..MINUTES.len() + 3 {
+        pass(&mut app);
+    }
+
+    let live = app.volume_store.live_ids();
+    let resident = resident_times(&app);
+    let frames = &app.gui.pane(0).expect("pane 0").loop_state.frames;
+    assert_eq!(
+        frames.len(),
+        MINUTES.len(),
+        "precondition: one frame per volume",
+    );
+    for (idx, frame) in frames.iter().enumerate() {
+        assert!(
+            !frame.render_failed,
+            "precondition: frame {idx} was retired, so this fixture is back to \
+             asserting about refusals",
+        );
+    }
+
+    for (idx, frame) in frames.iter().enumerate() {
+        let grid = frame
+            .image
+            .as_ref()
+            .and_then(rustdar_egui::pane::LoopFrameImage::volume)
+            .unwrap_or_else(|| panic!("frame {idx} was never named"));
+        assert!(
+            live.contains(&grid.id),
+            "frame {idx} ({}) names grid {} and the store has let it go — the \
+             playhead will march whatever grid is left instead, which is the \
+             newest volume under every frame's caption",
+            grid.target.volume.collected,
+            grid.id,
+        );
+    }
+    assert_eq!(
+        resident,
+        MINUTES.iter().map(|&m| ts(m)).collect::<Vec<_>>(),
+        "the store is not holding one grid per loop frame",
     );
 }

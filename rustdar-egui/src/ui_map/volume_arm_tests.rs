@@ -174,12 +174,18 @@ fn a_pane_with_no_published_stamp_does_not_build_from_the_plan_views_scan() {
     );
 }
 
-/// The pane names the **published stamp**, not the plan view's own time.
+/// **While it follows live**, the pane names the published stamp, not the
+/// plan view's own time.
 ///
 /// The two differ constantly: `scan_info.timestamp` is the volume's start
 /// and freezes for the whole flight, while the stamp advances on every
 /// sealed sweep. A target built from the wrong one would ask the host for
 /// a volume it does not have.
+///
+/// The pane here is live, which is the whole scope of this rule — the
+/// other half is [`a_pane_taken_off_live_names_the_volume_it_is_showing`],
+/// and reading the stamp unconditionally is what made the timeline inert
+/// over a 3D pane.
 #[test]
 fn the_target_names_the_published_stamp_rather_than_the_displayed_time() {
     let painter = Arc::new(StubVolumePainter::painting());
@@ -209,6 +215,91 @@ fn the_target_names_the_published_stamp_rather_than_the_displayed_time() {
         "the grid must be asked for against the published stamp, not the displayed time",
     );
     assert_eq!(frame.target.volume.site, "KTLX");
+}
+
+/// **A pane taken off live names the volume it is showing.**
+///
+/// The report this was written from: "changing time in the time bar does
+/// not change the 3d viewer render at all". The published current-volume
+/// stamp is per **site** and describes what the App holds *now*, so it
+/// cannot express "this pane is looking at 18:05"; a 3D pane that read it
+/// unconditionally went on naming the live volume through every scrub,
+/// never changed its target, and so never asked for a rebuild. The plan
+/// view and the cross-section beside it both moved, because both are keyed
+/// on the pane's own `scan_info.timestamp`.
+///
+/// Staged through the two setters the host really uses — `handle_navigate_time`
+/// calls `set_viewing_live_for_pane(idx, false)` and the scan drain calls
+/// `set_scan_info_for_site` with the volume that came back. The published
+/// stamp is deliberately left where it was: on a chunk-fed site the feed
+/// goes on sealing sweeps and the stamp never moves backwards at all,
+/// which is the state the report came from.
+#[test]
+fn a_pane_taken_off_live_names_the_volume_it_is_showing() {
+    let painter = Arc::new(StubVolumePainter::painting());
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.set_pane_count(2);
+    h.make_pane_volume(1);
+    h.gui_mut().set_volume_painter(Some(painter.clone()));
+    h.load_scan("KTLX");
+    let live = h
+        .gui_mut()
+        .pane(1)
+        .expect("pane 1")
+        .scan_info
+        .as_ref()
+        .expect("a scan")
+        .timestamp;
+    h.set_current_volume("KTLX", Some(live));
+    h.frames_for(2, FRAME_DT);
+    assert_eq!(
+        last_seen(&painter).target.volume.collected,
+        live,
+        "precondition: the live pane names the live volume, or the scrub \
+         below has nothing to move",
+    );
+
+    // The scrub. Half an hour back, which is several volumes.
+    //
+    // Every pane on the site, because that is what a navigation does: the
+    // scan drain's `set_scan_info_for_site` writes the site's panes and
+    // `propagate_layer_sync` converges `viewing_live` across the time-linked
+    // group. Writing pane 1 alone would be undone by that pass before the
+    // frame drew, which is not a state production can be in.
+    let scrubbed = live - chrono::Duration::minutes(30);
+    for idx in 0..2 {
+        h.gui_mut().set_viewing_live_for_pane(idx, false);
+        h.gui_mut()
+            .pane_mut(idx)
+            .expect("a pane")
+            .scan_info
+            .as_mut()
+            .expect("a scan")
+            .timestamp = scrubbed;
+    }
+    painter.seen.lock().unwrap().clear();
+    h.frames_for(2, FRAME_DT);
+
+    assert_eq!(
+        last_seen(&painter).target.volume.collected,
+        scrubbed,
+        "the 3D pane is still aimed at the live volume after a scrub, so the \
+         picture cannot change however far the timeline is dragged",
+    );
+    let asked: Vec<chrono::NaiveDateTime> = h
+        .last_actions()
+        .iter()
+        .filter_map(|a| match a {
+            GuiAction::PrepareVolume { target, .. } => Some(target.volume.collected),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        asked.contains(&scrubbed),
+        "no build was asked for against the scrubbed time — the pane's target \
+         did not move, so the level-triggered ask never fired. It asked for \
+         {asked:?}",
+    );
 }
 
 /// **The Volume Alpha curve rides the frame, and only when one exists.**

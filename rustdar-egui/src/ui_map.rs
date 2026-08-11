@@ -1550,23 +1550,55 @@ fn volume_pane_outcome(
     // with no loop at all — which is what makes a loop that is still building
     // show the live volume rather than an empty pane.
     let loop_grid = pane.active_volume_frame().cloned();
-    // The published current-volume stamp, **not** `scan_info`. `scan_info`
-    // names whatever the plan view is drawing and freezes for a whole volume;
-    // the stamp is the newest data time of the site's merged volume and
-    // advances on every sealed sweep — it is what makes the 3D pane rebuild in
-    // step with the map beside it, and what a build is deduplicated by.
+    // The volume this pane has been **navigated** to, or `None` while it is
+    // following live. See the stamp below, which is what it displaces.
+    let navigated = (!pane.viewing_live)
+        .then(|| pane.scan_info.as_ref().map(|info| info.timestamp))
+        .flatten();
+    // While the pane follows live: the published current-volume stamp, **not**
+    // `scan_info`. `scan_info` names whatever the plan view is drawing and
+    // freezes for a whole volume; the stamp is the newest data time of the
+    // site's merged volume and advances on every sealed sweep — it is what
+    // makes the 3D pane rebuild in step with the map beside it, and what a
+    // build is deduplicated by.
+    //
+    // Once the pane has been taken off live, its own displayed volume wins,
+    // exactly as a cross-section pane's `SectionTarget` is stamped with
+    // `scan_info.timestamp` while the live stamp goes on advancing beside it.
+    // The published stamp is per **site** and per **frame**: it says what the
+    // App holds *now*, so it cannot express "this pane is looking at 18:05"
+    // at all. Reading it unconditionally is what made the timeline inert over
+    // a 3D pane — the scrub moved the plan view and the section beside it, the
+    // 3D target never changed, and no rebuild was ever asked for. It also made
+    // a live 3D pane and a scrubbed one on the same site two names for one
+    // picture.
+    //
+    // Still gated on there being a published stamp at all. That gate is the
+    // App's statement that it holds a volume worth building, and a pane with a
+    // plan view and no stamp must wait rather than build from the plan view's
+    // scan — see `a_pane_with_no_published_stamp_does_not_build_from_the_plan_views_scan`.
     //
     // The site comes from `pane.site` rather than from `scan_info.site`,
     // because a pane that has switched site should ask for the new site's
     // volume, not go on naming the old one until a plan view catches up.
-    let stamp = current_stamp.map(|stamp| {
-        (
+    let stamp = current_stamp.map(|stamp| match navigated {
+        // A navigated volume is a complete archive volume, so the moment it
+        // began and the moment it is named by are the same one — there are no
+        // un-refreshed tilts under it from an earlier flight.
+        Some(collected) => (
+            VolumeStamp {
+                site: site_code.clone(),
+                collected,
+            },
+            Some(collected),
+        ),
+        None => (
             VolumeStamp {
                 site: site_code.clone(),
                 collected: stamp.newest,
             },
             stamp.base_started,
-        )
+        ),
     });
 
     // Unreachable from the kind branch, which only enters here for a `Volume`

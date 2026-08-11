@@ -1195,11 +1195,27 @@ impl App {
     /// dropped exactly as before.
     ///
     /// What the gate could not distinguish is a target naming a **past**
-    /// volume, which is every frame of a 3D loop but the newest. Those are
-    /// served from the loop's own downloaded scans instead, which is where the
-    /// section loop's frames come from too. A time that is neither is not
-    /// refused but left alone — it is a frame whose download is still in
-    /// flight, and the level-triggered caller asks again.
+    /// volume. There are two kinds and they come from different holders:
+    ///
+    ///  * every frame of a 3D loop but the newest, served from the loop's own
+    ///    downloaded scans — which is where the section loop's frames come
+    ///    from too;
+    ///  * the volume a pane has been **navigated** to off the timeline, served
+    ///    from the site's base holder, which the scan drain re-bases onto
+    ///    whatever a manual navigation fetched.
+    ///
+    /// The navigated arm is the one a scrub needs and the one that was
+    /// missing: the pane's target names `scan_info.timestamp` once it is off
+    /// live, that is by construction *not* the merged volume's newest data
+    /// time, and without this arm every scrubbed 3D pane fell through to
+    /// `Waiting` and rebuilt nothing for the rest of the session. It extracts
+    /// the base volume **alone** rather than the merge: the merge would fold
+    /// the live feed's newer sweeps into a picture the caption dates to the
+    /// navigated moment, which is the one lie a historic view must not tell.
+    ///
+    /// A time that is none of the three is not refused but left alone — it is
+    /// a loop frame whose download is still in flight, and the level-triggered
+    /// caller asks again.
     fn prepare_volume(
         &mut self,
         pane_idx: usize,
@@ -1216,9 +1232,20 @@ impl App {
         let live = self
             .current_volume_stamp(&target.volume.site)
             .is_some_and(|stamp| stamp.newest == target.volume.collected);
-        // No volume at all yet, live or downloaded. Deliberately no entry: the
-        // caller goes on asking, and the first frame after data lands builds it.
+        // The volume the site's base holder carries, named by the key the
+        // holder is stamped with — which is `ScanInfo::timestamp`, the very
+        // field a navigated pane's target is built from, so this is an exact
+        // identity rather than a nearest match.
+        let navigated = !live
+            && self
+                .base_scans
+                .get(&target.volume.site)
+                .is_some_and(|(_, _, held)| *held == target.volume.collected);
+        // No volume at all yet, live, navigated or downloaded. Deliberately no
+        // entry: the caller goes on asking, and the first frame after data
+        // lands builds it.
         if !live
+            && !navigated
             && !self
                 .loop_mgr
                 .is_cached(&target.volume.site, &target.volume.collected)
@@ -1253,6 +1280,8 @@ impl App {
         let started = web_time::Instant::now();
         let extracted = if live {
             self.extract_current_volume(&target.volume.site, target.product)
+        } else if navigated {
+            self.extract_base_volume(&target.volume.site, target.product)
         } else {
             self.extract_loop_volume(&target.volume.site, target.volume.collected, target.product)
         };
@@ -1275,7 +1304,11 @@ impl App {
         log::info!(
             "3D volume view: extracted the {} {} payload in {} ms on the frame thread",
             target.volume.site,
-            if live { "live" } else { "loop-frame" },
+            match (live, navigated) {
+                (true, _) => "live",
+                (_, true) => "navigated",
+                _ => "loop-frame",
+            },
             started.elapsed().as_millis(),
         );
 
@@ -1383,6 +1416,34 @@ impl App {
         site: &str,
         product: rustdar_radar::types::RadarProduct,
     ) -> Option<rustdar_radar::render_input::RenderInput> {
+        self.extract_site_volume(site, product, true)
+    }
+
+    /// The **base** volume's whole-volume payload for `site` and `product` —
+    /// the same walk, over the base holder alone.
+    ///
+    /// What a pane navigated off live builds from. The live snapshot is
+    /// deliberately left out: on a chunk-fed site the feed is minutes ahead of
+    /// whatever a manual navigation re-based onto, and merging it in would put
+    /// current sweeps under a caption dated to the navigated moment. The
+    /// difference is nothing at all on a site with no feed, which is the
+    /// ordinary case for a historic view.
+    fn extract_base_volume(
+        &mut self,
+        site: &str,
+        product: rustdar_radar::types::RadarProduct,
+    ) -> Option<rustdar_radar::render_input::RenderInput> {
+        self.extract_site_volume(site, product, false)
+    }
+
+    /// The body of the two above: resolve the site's volume — with or without
+    /// the live overlay merged in — and walk the product's moment out of it.
+    fn extract_site_volume(
+        &mut self,
+        site: &str,
+        product: rustdar_radar::types::RadarProduct,
+        merge_live: bool,
+    ) -> Option<rustdar_radar::render_input::RenderInput> {
         #[cfg(test)]
         self.volume_extractions
             .set(self.volume_extractions.get() + 1);
@@ -1391,7 +1452,9 @@ impl App {
             .base_scans
             .get(site)
             .map(|(scan, declared, _)| (Arc::clone(scan), Arc::clone(declared)));
-        let overlay = self.chunk_feeds.snapshot(site);
+        let overlay = merge_live
+            .then(|| self.chunk_feeds.snapshot(site))
+            .flatten();
         let current = rustdar_radar::current::resolve(
             base.as_ref()
                 .map(|(scan, declared)| rustdar_radar::nyquist::Volume::new(scan, declared)),

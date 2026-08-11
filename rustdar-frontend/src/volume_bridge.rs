@@ -597,7 +597,7 @@ impl VolumeStore {
             // A set holder is exempt, and this is the line that makes a 3D
             // loop possible at all: the seamless swap's rule is "the grid that
             // just landed supersedes the one this pane was painting through the
-            // wait", which is right for one grid and destroys fourteen. What
+            // wait", which is right for one grid and destroys thirteen. What
             // bounds a set holder instead is `retain_set` and `enforce_budget`.
             if inner.set_holders.contains(&pane) {
                 continue;
@@ -619,7 +619,7 @@ impl VolumeStore {
     /// Calling it with an empty `keep` is the release-before-build rule a
     /// region, product or vector change needs. `share`'s `keep_old` deliberately
     /// holds the old grid through a rebuild so the swap is seamless — right for
-    /// one grid, and for fourteen it is a peak of two full sets at once (1008
+    /// one grid, and for thirteen it is a peak of two full sets at once (936
     /// MiB against a 512 MiB budget on desktop). A set holder therefore
     /// releases *first* and rebuilds after, and accepts the first-build message
     /// for the fraction of a second that costs.
