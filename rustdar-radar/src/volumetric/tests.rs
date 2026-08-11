@@ -496,6 +496,177 @@ fn cell_statistics_dispatch_per_moment() {
     assert_eq!(m, 40.0, "Max must keep the peak");
 }
 
+/// The free-bucket key must be a NaN, because that — and only that — is what
+/// puts it behind [`sweep_to_grid`]'s `z.is_nan()` filter and so out of
+/// [`LinearZMemo::linear_z`]'s reach. Any NaN would do; the pattern itself
+/// buys nothing (see [`a_nan_gate_never_reaches_the_memo`]).
+#[test]
+fn the_linear_z_memo_free_bucket_is_a_nan() {
+    assert!(f32::from_bits(LinearZMemo::FREE).is_nan());
+}
+
+/// A gate whose decoded value is *exactly* the free-bucket key must never
+/// reach the memo, or it would match a bucket nothing ever wrote and read the
+/// initial `0.0` back as a real answer.
+///
+/// Such a gate is constructible, which is the whole point: a NaN `offset`
+/// propagates its payload through `(raw - offset) / scale` unchanged, so a
+/// block declaring `offset = f32::from_bits(0xFFFF_FFFF)` decodes gate after
+/// gate to `u32::MAX`. What keeps them out is `sweep_to_grid`'s `z.is_nan()`
+/// filter, standing in front of the only call site.
+///
+/// Deleting `|| z.is_nan()` passes every other test in this crate. It does
+/// not pass this one: the cell reads `-inf` instead of `NaN`, because
+/// `LinearZMean` finishes with `10·log10(sum / n)` and the sum is the free
+/// bucket's zero.
+#[test]
+fn a_nan_gate_never_reaches_the_memo() {
+    let nan_offset = f32::from_bits(LinearZMemo::FREE);
+    let refl = MomentData::from_fixed_point(8, 0, 1000, 8, SCALE, nan_offset, vec![100u8; 8]);
+
+    // The premise: these gates decode to values, and they wear the free key.
+    let wearing_free = refl
+        .iter()
+        .filter(|v| matches!(v, MomentValue::Value(z) if z.to_bits() == LinearZMemo::FREE))
+        .count();
+    assert_eq!(
+        wearing_free, 8,
+        "a NaN offset must hand every gate the free-bucket key, or this test \
+         proves nothing",
+    );
+
+    let scan = Scan::new(
+        vcp(),
+        vec![one_radial_sweep(1, 0.5, 42.5, Some(refl), None, None)],
+    );
+    let cube = VolumeCube::build(
+        &scan,
+        &[RadarProduct::Reflectivity],
+        DedupPolicy::NewestWins,
+    );
+    let g = cube.grid(0, RadarProduct::Reflectivity).unwrap();
+    for (r, v) in g.values[42].iter().enumerate() {
+        assert!(
+            v.is_nan(),
+            "range cell {r} took a value from a NaN gate: {v}"
+        );
+    }
+}
+
+/// The memo's contract is bit-identity over the domain it actually sees.
+/// Raw 0 and 1 are the below-threshold and range-folded sentinels and never
+/// decode to a value, so an 8-bit reflectivity block reaches the conversion
+/// with 254 distinct values — and every one of them, on the miss that
+/// computes it and on the hits that follow, must be exactly the `f64`
+/// `10f64.powf(z / 10.0)` returns.
+#[test]
+fn the_linear_z_memo_answers_every_reachable_gate_exactly_as_powf() {
+    let domain: Vec<f32> = (2u16..=255)
+        .map(|raw| (f32::from(raw) - OFFSET) / SCALE)
+        .collect();
+    assert_eq!(domain.len(), 254, "the reachable 8-bit gate domain");
+
+    let mut memo = LinearZMemo::for_stat(CellStat::LinearZMean);
+    // Three passes: the first misses everywhere, the rest hit.
+    for pass in 0..3 {
+        for &z in &domain {
+            assert_eq!(
+                memo.linear_z(z).to_bits(),
+                10f64.powf(z as f64 / 10.0).to_bits(),
+                "pass {pass}, gate {z} dBZ",
+            );
+        }
+    }
+}
+
+/// The table is direct-mapped and a collision overwrites, so correctness
+/// must not rest on an entry staying resident. A 16-bit moment block
+/// reaches the conversion with 65 534 values — thirty-two per bucket — and
+/// every answer is still `powf`'s, bit for bit, whether the bucket held this
+/// key, someone else's, or nothing. The 8-bit domain, evicted wholesale by
+/// that flood, then reads back identically too.
+#[test]
+fn the_linear_z_memo_is_exact_through_eviction() {
+    let mut memo = LinearZMemo::for_stat(CellStat::LinearZMean);
+    for raw in 2u32..=65_535 {
+        let z = (raw as f32 - OFFSET) / SCALE;
+        assert_eq!(
+            memo.linear_z(z).to_bits(),
+            10f64.powf(z as f64 / 10.0).to_bits(),
+            "16-bit code {raw}",
+        );
+    }
+    for raw in 2u16..=255 {
+        let z = (f32::from(raw) - OFFSET) / SCALE;
+        assert_eq!(
+            memo.linear_z(z).to_bits(),
+            10f64.powf(z as f64 / 10.0).to_bits(),
+            "8-bit code {raw} after eviction",
+        );
+    }
+}
+
+/// The gates that are not ordinary reflectivity but still reach the
+/// conversion: zero — whose `-0.0` twin is a *different* key for the same
+/// answer — the infinity a degenerate scale could decode to, which passes
+/// `sweep_to_grid`'s `>= 999.0` and NaN filters unharmed, and a pair of
+/// adjacent `f32`s.
+///
+/// That last pair is the one that keeps the key honest. Two values one ULP
+/// apart are distinct gates with distinct answers, so any key that quantises
+/// away low mantissa bits — `to_bits() >> 1`, `to_bits() & !0xFF` — hands the
+/// second gate the first one's number. Nothing else here would notice: every
+/// other domain in these tests is spaced half a dBZ apart.
+#[test]
+fn the_linear_z_memo_is_exact_on_the_gates_that_are_not_reflectivity() {
+    let mut memo = LinearZMemo::for_stat(CellStat::LinearZMean);
+    let ulp = 20.0f32;
+    let ulp_next = f32::from_bits(ulp.to_bits() + 1);
+    assert_ne!(ulp, ulp_next, "the ULP pair must be two distinct gates");
+    for z in [
+        0.0f32,
+        -0.0,
+        f32::NEG_INFINITY,
+        -3.4e38,
+        998.9,
+        ulp,
+        ulp_next,
+    ] {
+        // Twice: the miss that computes, then the hit that recalls.
+        for _ in 0..2 {
+            assert_eq!(
+                memo.linear_z(z).to_bits(),
+                10f64.powf(z as f64 / 10.0).to_bits(),
+                "gate {z}",
+            );
+        }
+    }
+}
+
+/// A memo built for a statistic that never converts carries no buckets, and
+/// a bucketless memo is exactly the expression the call site used to run
+/// inline — every call straight to `powf`, nothing remembered between them.
+/// That is what makes the empty case safe to carry rather than guard.
+#[test]
+fn a_memo_for_a_statistic_that_never_converts_is_powf_itself() {
+    for stat in [CellStat::Mean, CellStat::Max] {
+        let mut memo = LinearZMemo::for_stat(stat);
+        assert!(
+            memo.slots.is_empty(),
+            "{stat:?} bought buckets it cannot use",
+        );
+        for raw in 2u16..=255 {
+            let z = (f32::from(raw) - OFFSET) / SCALE;
+            assert_eq!(
+                memo.linear_z(z).to_bits(),
+                10f64.powf(z as f64 / 10.0).to_bits(),
+                "{stat:?}, 8-bit code {raw}",
+            );
+        }
+        assert!(memo.slots.is_empty(), "a bucketless memo stays bucketless");
+    }
+}
+
 /// A split cut: reflectivity and velocity at the same elevation on
 /// different sweeps. Each moment must come from its own sweep, on one
 /// shared tilt.

@@ -272,6 +272,109 @@ impl VolumeCube {
     }
 }
 
+/// Buckets in a [`LinearZMemo`], as a power of two so the index is a shift.
+///
+/// Sized from the domain, not from a guess: an 8-bit moment block can express
+/// at most 254 distinct values (raw 0 and 1 are the below-threshold and
+/// range-folded sentinels, and never reach a value), and sixteen archived
+/// volumes from six sites between 2010 and 2026 each offered 141–206, 214
+/// between them. 2048 buckets leave even the 254-value ceiling nearly
+/// collision-free — and a collision costs a recomputation, not an error.
+const LINEAR_Z_MEMO_BITS: u32 = 11;
+
+/// `10^(dBZ/10)` — [`CellStat::LinearZMean`]'s per-gate conversion — memoized
+/// on the gate value's exact `f32` bit pattern.
+///
+/// Gate values are decoded from a fixed-point block, so this conversion's
+/// input domain is tiny and discrete while a single sweep feeds it hundreds of
+/// thousands of gates. Nearly every call is a repeat of one already answered,
+/// and answering it again was about half the cube's build time on a volume
+/// with real coverage.
+///
+/// **A hit returns the same bits, not merely the same value.** A miss runs
+/// exactly the `10f64.powf(z as f64 / 10.0)` this conversion has always run
+/// and stores *that* number; a hit hands the stored number back untouched.
+/// Nothing here approximates the power, and nothing depends on which entries
+/// happen to be resident: the table is direct-mapped, a collision simply
+/// overwrites, and an evicted key recomputes to the identical number when it
+/// next appears. That is why the pinned echo-tops digest
+/// ([`tests::golden_echo_tops_grid_is_pinned`], mirrored four times in
+/// `chunks::tests`) does not move. Rewriting the power itself — as `exp2`, say
+/// — would have moved it, on most inputs.
+///
+/// One table per [`sweep_to_grid`] call, never leaving it. Nothing here runs
+/// under rayon today — the cube builds its tilts serially, and the parallelism
+/// above it (`crate::render` fanning out over a *finished* grid) only starts
+/// once the cube exists — but a pane render is offloaded to its own thread, so
+/// two cube builds can be in flight at once. A table that cannot outlive a
+/// call frame cannot be shared between them, and `sweep_to_grid` stays a pure
+/// function of its arguments, which is the property every digest pin rests on.
+struct LinearZMemo {
+    /// `(gate value bits, 10^(value/10))` per bucket.
+    slots: Vec<(u32, f64)>,
+}
+
+impl LinearZMemo {
+    /// The free-bucket key: a pattern [`linear_z`](Self::linear_z) is never
+    /// called with, because [`sweep_to_grid`]'s `z.is_nan()` filter stands in
+    /// front of the only call site and this is a NaN.
+    ///
+    /// That filter is what makes this safe — **not** the bit pattern being
+    /// exotic. A gate really can carry these exact bits: decoding is
+    /// `(raw - offset) / scale`, a NaN `offset` propagates its payload
+    /// unchanged through both operations on x86-64, and a block declaring
+    /// `offset = f32::from_bits(0xFFFF_FFFF)` hands almost every gate a value
+    /// whose `to_bits()` is precisely `u32::MAX`. Were the filter dropped,
+    /// such a gate would match a bucket that had never been written and read
+    /// the initial `0.0` as its own answer — the one way this table can return
+    /// something `powf` would not. [`tests::a_nan_gate_never_reaches_the_memo`]
+    /// pins the filter for that reason; it is load-bearing now in a way it was
+    /// not before the memo existed.
+    const FREE: u32 = u32::MAX;
+
+    /// Buckets only for the statistic that converts. [`sweep_to_grid`] builds
+    /// one memo per call whatever statistic it was asked for, and two of the
+    /// three never reach the conversion at all, so buying them 2048 buckets
+    /// would be 32 KiB allocated and filled per sweep to be read zero times.
+    ///
+    /// Declining it did not show up in measurement — `compute_eet`, which
+    /// grids on [`CellStat::Max`], timed the same either way — so this is
+    /// tidiness, not a win. It is here because the empty case costs nothing to
+    /// carry (see [`Self::linear_z`]), not because it bought anything.
+    fn for_stat(stat: CellStat) -> Self {
+        Self {
+            slots: match stat {
+                CellStat::LinearZMean => vec![(Self::FREE, 0.0); 1 << LINEAR_Z_MEMO_BITS],
+                CellStat::Mean | CellStat::Max => Vec::new(),
+            },
+        }
+    }
+
+    /// `10^(z / 10)`: from the table when this exact `z` has been converted
+    /// before, and from `powf` — the identical call — when it has not.
+    ///
+    /// A bucketless memo answers every call from `powf`, which is to say it is
+    /// precisely the expression this replaced. Carrying that case is free: the
+    /// bucket lookup is one bounds check either way, and an empty `slots`
+    /// simply fails it.
+    #[inline]
+    fn linear_z(&mut self, z: f32) -> f64 {
+        let key = z.to_bits();
+        // Fibonacci hashing. The keys come off a fixed-point decode, so their
+        // low mantissa bits are largely zero and their exponents span a narrow
+        // band; multiplying and taking the *top* bits spreads them where any
+        // slice of the raw pattern would pile up.
+        let idx = (key.wrapping_mul(0x9E37_79B1) >> (32 - LINEAR_Z_MEMO_BITS)) as usize;
+        let Some(slot) = self.slots.get_mut(idx) else {
+            return 10f64.powf(z as f64 / 10.0);
+        };
+        if slot.0 != key {
+            *slot = (key, 10f64.powf(z as f64 / 10.0));
+        }
+        slot.1
+    }
+}
+
 /// One sweep collapsed onto the cube's grid for one moment: per whole-degree
 /// azimuth cell the radial nearest the cell centre, per 1-km range cell `stat`
 /// over the gates falling in it. `NaN` where no gate carried data; gate values
@@ -296,6 +399,9 @@ fn sweep_to_grid(radials: &[Radial], moment: RadarProduct, stat: CellStat) -> Ve
             nearest[cell] = Some(ri);
         }
     }
+    // Shared by every azimuth cell of this sweep: one sweep's gates repeat the
+    // same few hundred values a third of a million times over.
+    let mut memo = LinearZMemo::for_stat(stat);
     for (cell, slot) in nearest.iter().enumerate() {
         let Some(ri) = slot else { continue };
         let radial = &radials[*ri];
@@ -320,7 +426,7 @@ fn sweep_to_grid(radials: &[Radial], moment: RadarProduct, stat: CellStat) -> Ve
                 continue;
             }
             match stat {
-                CellStat::LinearZMean => acc[r].0 += 10f64.powf(z as f64 / 10.0),
+                CellStat::LinearZMean => acc[r].0 += memo.linear_z(z),
                 CellStat::Mean => acc[r].0 += z as f64,
                 CellStat::Max => {
                     acc[r].0 = if acc[r].1 == 0 {
