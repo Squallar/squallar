@@ -87,57 +87,86 @@ impl RadarSite {
     }
 }
 
-/// Every radar site, with the heights its own Level II volume reports.
+/// Every radar site, at the position and height its own Level II volume
+/// reports.
 ///
-/// # Where the heights come from
+/// # Where the figures come from
 ///
 /// One archive volume per site, read out of the Volume Data Block of its
-/// first message 31 — 205 of the 207 rows, fetched from the public Google
-/// mirror of the Level II archive by the `site_elev_probe` instrument on the
-/// `campaign-harness` branch, which is also what measured everything claimed
-/// below. The two rows with no volume in any year of the mirror that was
-/// tried are `KCRI` (the ROC test bed) and `LPLA` (Lajes); both keep the
-/// height the table already carried, and `KCRI`'s tower comes from the
-/// published station record rather than from a volume.
+/// first message 31 by the `site_elev_probe` instrument on the
+/// `campaign/site-position-probe` branch, which is also what measured
+/// everything claimed below. The bucket is `unidata-nexrad-level2` — the same
+/// Level II origin [`crate::sources`] gives the application, current to the
+/// day, rather than the Google mirror that runs three weeks behind.
 ///
-/// # What the measurement found
+/// Position and height are read from the *same* volume for every row, never
+/// one without the other. A row carrying one site's coordinates and another
+/// epoch's height is worse than a consistently stale row, and `RKSG` is why:
+/// the pass that corrected heights alone had to skip it, because giving it
+/// Camp Humphreys' height while it kept Osan's position would have turned a
+/// self-consistently wrong row into an incoherent one.
 ///
-/// Before it, the table held one `elev` per row and a note saying six rows
-/// had been checked, of which five sat on `site_height` and KMSX sat on
-/// neither. Over 205 rows:
+/// # The epoch policy: the most recent volume, per site
 ///
-/// * 139 sat on `site_height` within 2 ft. **None** sat on
-///   `site_height + tower_height` — the one row classified that way, PACG,
-///   is 63 ft above its own volume's base and lands on the feedhorn by
-///   arithmetic accident.
-/// * All 45 TDWR rows sat within 3.2 ft of the single height their volumes
-///   report, 29 of them within 2 ft. The asymmetry — every delta positive —
-///   is the archive truncating metres downward rather than rounding.
-/// * **50 rows sat on neither**, by −63 to +81 ft. KMSX was one of 50, not a
-///   singleton, so the six-row generalisation was wrong about the rule *and*
-///   wrong about the exception. Forty-nine of them now carry the height their
-///   volume reports (the fiftieth is `RKSG`, below); every other row keeps the
-///   figure it had, which is the more precise of the two wherever they agree
-///   (the archive's is a whole-metre figure, this table's a whole-foot one).
+/// Reported position and height are step functions, not drifting ones. Across
+/// nine epochs from 2026-01 to 2026-08, no site changed its reported height
+/// and exactly one changed its reported position; across 2017–2023 `RODN`
+/// reports its position bit-identically at every epoch. Where a figure does
+/// move it moves once and stays: `KTLX` stepped 43 m and 1 m in a re-survey
+/// between 2013 and 2016 and has not moved since.
 ///
-/// # What is still wrong here
+/// So the rule is **the most recent volume that decodes**, and no averaging
+/// or voting across epochs — a vote would keep a relocated radar at its old
+/// site for as many years as it stood there, which is exactly the `RKSG`
+/// failure. `MOVED_ONTO_ITS_VOLUME` records the epoch each correction was
+/// read at; 202 of the 206 come from one day, 2026-08-10.
 ///
-/// `RKSG` deliberately keeps its old height. Its volume and the published
-/// station record agree the RDA is at 37.2076, 127.2856 at 439 m — 40 km and
-/// 1388 ft from the 36.95972, 127.01833 at 52 ft this row carries, which is
-/// the pre-move Osan location. The row is wrong in its *coordinates*, and
-/// giving it Camp Humphreys' height while it keeps Osan's position would
-/// make a self-consistent wrong row into an incoherent one. Fixing the
-/// coordinates is a separate change.
+/// # What is corrected, and by what rule
 ///
-/// A further 54 rows differ from their volume's reported position by more
-/// than 0.002°, most of them TDWRs and none by more than 0.11°. That is
-/// recorded, not corrected, for the same reason.
+/// * **Position** — every row takes what its volume reports, to 5 dp. 193
+///   rows moved, by a median of 49 m; 50 moved further than one 250 m data
+///   cell and 42 further than a kilometre. Afterwards the table agrees with
+///   `api.weather.gov/radar/stations` to a median of 1.5 m with no row over
+///   a kilometre, against a median of 33 m and 41 rows over a kilometre
+///   before.
+/// * **Height** — a row keeps the figure it has unless it disagrees with its
+///   volume by 1 m or more, the resolution of the volume's own field, below
+///   which the volume cannot adjudicate. Over all 367 height components in
+///   the table exactly one crosses that line: `RKSG`'s base, by 423 m. The
+///   table's foot figures are otherwise the finer expression of the same
+///   metre and are kept — `TICH` reads 1351 ft where its volume truncates to
+///   411 m, and 411.78 m is what the published station record holds.
+///
+/// # The TDWR block came from somewhere else
+///
+/// The 45 TDWR rows were wrong in position at a scale the 161 others were
+/// not: median 3.7 km against 33 m, every single row past a data cell, 40 of
+/// them past a kilometre and `TICH` 11.7 km out. That is a whole-source
+/// defect rather than 45 mistakes.
+///
+/// It is *not* the airport reference point, which is the obvious suspect and
+/// was measured: across the 40 TDWR sites whose airport `api.weather.gov`
+/// knows, the old rows sat a median 16.2 km from the airport and 3.2 km from
+/// the radar, and not one was nearer the airport than the radar. Nor is it a
+/// datum shift, which is a 100 m effect. The heights in the same 45 rows were
+/// right all along, to better than a metre — so position and height in the
+/// TDWR block never shared a source.
+///
+/// # Rows with no volume
+///
+/// `LPLA` (Lajes) is in no epoch of either the Unidata bucket or the Google
+/// mirror, back to 2011, and keeps everything it had. `KLIX` and `RODN` are
+/// corrected from their most recent volumes, of 2023-11 and 2023-08; neither
+/// has produced data since, and `RODN` is the one row where the volume and
+/// `api.weather.gov` disagree past 250 m — 901 m — with the volume steady
+/// across seven epochs. The volume wins, because it is the position the RDA
+/// georeferences its own data against, and the disagreement is recorded here
+/// rather than split.
 pub const RADARS: [RadarSite; 207] = [
     RadarSite {
         name: "KABR",
         lat: 45.45583,
-        lon: -98.41306,
+        lon: -98.41333,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 1302,
             tower_ft: 79,
@@ -146,7 +175,7 @@ pub const RADARS: [RadarSite; 207] = [
     RadarSite {
         name: "KABX",
         lat: 35.14972,
-        lon: -106.82333,
+        lon: -106.82389,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 5870,
             tower_ft: 79,
@@ -154,8 +183,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KAKQ",
-        lat: 36.98389,
-        lon: -77.0075,
+        lat: 36.98405,
+        lon: -77.00736,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 157,
             tower_ft: 95,
@@ -164,7 +193,7 @@ pub const RADARS: [RadarSite; 207] = [
     RadarSite {
         name: "KAMA",
         lat: 35.23333,
-        lon: -101.70889,
+        lon: -101.70927,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 3622,
             tower_ft: 79,
@@ -172,8 +201,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KAMX",
-        lat: 25.61056,
-        lon: -80.41306,
+        lat: 25.61108,
+        lon: -80.41267,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 14,
             tower_ft: 95,
@@ -181,8 +210,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KAPX",
-        lat: 44.90722,
-        lon: -84.71972,
+        lat: 44.90635,
+        lon: -84.71954,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 1464,
             tower_ft: 95,
@@ -199,8 +228,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KATX",
-        lat: 48.19472,
-        lon: -122.49444,
+        lat: 48.19461,
+        lon: -122.4957,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 528,
             tower_ft: 112,
@@ -208,8 +237,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KBBX",
-        lat: 39.49611,
-        lon: -121.63167,
+        lat: 39.49564,
+        lon: -121.63161,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 173,
             tower_ft: 46,
@@ -217,8 +246,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KBGM",
-        lat: 42.19972,
-        lon: -75.985,
+        lat: 42.1997,
+        lon: -75.98473,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 1606,
             tower_ft: 95,
@@ -226,8 +255,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KBHX",
-        lat: 40.49833,
-        lon: -124.29194,
+        lat: 40.49858,
+        lon: -124.29217,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 2402,
             tower_ft: 112,
@@ -236,7 +265,7 @@ pub const RADARS: [RadarSite; 207] = [
     RadarSite {
         name: "KBIS",
         lat: 46.77083,
-        lon: -100.76028,
+        lon: -100.76056,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 1658,
             tower_ft: 95,
@@ -244,8 +273,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KBLX",
-        lat: 45.85389,
-        lon: -108.60611,
+        lat: 45.85378,
+        lon: -108.6068,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 3638,
             tower_ft: 62,
@@ -253,8 +282,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KBMX",
-        lat: 33.17194,
-        lon: -86.76972,
+        lat: 33.17242,
+        lon: -86.77016,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 645,
             tower_ft: 112,
@@ -262,8 +291,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KBOX",
-        lat: 41.95583,
-        lon: -71.1375,
+        lat: 41.95578,
+        lon: -71.13686,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 118,
             tower_ft: 112,
@@ -271,8 +300,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KBRO",
-        lat: 25.91556,
-        lon: -97.41861,
+        lat: 25.916,
+        lon: -97.41897,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 23,
             tower_ft: 62,
@@ -280,8 +309,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KBUF",
-        lat: 42.94861,
-        lon: -78.73694,
+        lat: 42.94879,
+        lon: -78.73678,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 693,
             tower_ft: 95,
@@ -289,8 +318,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KBYX",
-        lat: 24.59694,
-        lon: -81.70333,
+        lat: 24.5975,
+        lon: -81.70316,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 8,
             tower_ft: 79,
@@ -298,8 +327,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KCAE",
-        lat: 33.94861,
-        lon: -81.11861,
+        lat: 33.94872,
+        lon: -81.11828,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 231,
             tower_ft: 112,
@@ -307,8 +336,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KCBW",
-        lat: 46.03917,
-        lon: -67.80694,
+        lat: 46.03925,
+        lon: -67.80643,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 746,
             tower_ft: 112,
@@ -316,8 +345,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KCBX",
-        lat: 43.49083,
-        lon: -116.23444,
+        lat: 43.49021,
+        lon: -116.23603,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 3091,
             tower_ft: 79,
@@ -325,8 +354,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KCCX",
-        lat: 40.92306,
-        lon: -78.00389,
+        lat: 40.92317,
+        lon: -78.00372,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 2405,
             tower_ft: 79,
@@ -334,8 +363,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KCLE",
-        lat: 41.41306,
-        lon: -81.86,
+        lat: 41.41322,
+        lon: -81.85986,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 763,
             tower_ft: 95,
@@ -343,8 +372,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KCLX",
-        lat: 32.65556,
-        lon: -81.04222,
+        lat: 32.65553,
+        lon: -81.0422,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 115,
             tower_ft: 112,
@@ -352,8 +381,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KCRI",
-        lat: 35.2383,
-        lon: -97.4602,
+        lat: 35.23833,
+        lon: -97.46,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 1201,
             tower_ft: 114,
@@ -361,8 +390,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KCRP",
-        lat: 27.78389,
-        lon: -97.51083,
+        lat: 27.78402,
+        lon: -97.51125,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 45,
             tower_ft: 95,
@@ -370,8 +399,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KCXX",
-        lat: 44.51111,
-        lon: -73.16639,
+        lat: 44.511,
+        lon: -73.16643,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 317,
             tower_ft: 112,
@@ -379,8 +408,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KCYS",
-        lat: 41.15194,
-        lon: -104.80611,
+        lat: 41.15192,
+        lon: -104.80603,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 6128,
             tower_ft: 62,
@@ -389,7 +418,7 @@ pub const RADARS: [RadarSite; 207] = [
     RadarSite {
         name: "KDAX",
         lat: 38.50111,
-        lon: -121.67667,
+        lon: -121.67783,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 30,
             tower_ft: 112,
@@ -398,7 +427,7 @@ pub const RADARS: [RadarSite; 207] = [
     RadarSite {
         name: "KDDC",
         lat: 37.76083,
-        lon: -99.96833,
+        lon: -99.96889,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 2590,
             tower_ft: 79,
@@ -406,8 +435,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KDFX",
-        lat: 29.2725,
-        lon: -100.28028,
+        lat: 29.27314,
+        lon: -100.28033,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 1131,
             tower_ft: 62,
@@ -415,7 +444,7 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KDGX",
-        lat: 32.28,
+        lat: 32.27994,
         lon: -89.98444,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 495,
@@ -424,8 +453,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KDIX",
-        lat: 39.94694,
-        lon: -74.41111,
+        lat: 39.94709,
+        lon: -74.41073,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 149,
             tower_ft: 79,
@@ -433,7 +462,7 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KDLH",
-        lat: 46.83694,
+        lat: 46.83695,
         lon: -92.20972,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 1428,
@@ -442,8 +471,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KDMX",
-        lat: 41.73111,
-        lon: -93.72278,
+        lat: 41.7312,
+        lon: -93.72287,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 981,
             tower_ft: 112,
@@ -451,8 +480,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KDOX",
-        lat: 38.82556,
-        lon: -75.44,
+        lat: 38.82577,
+        lon: -75.44012,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 50,
             tower_ft: 112,
@@ -460,8 +489,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KDTX",
-        lat: 42.69972,
-        lon: -83.47167,
+        lat: 42.7,
+        lon: -83.47166,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 1102,
             tower_ft: 112,
@@ -478,8 +507,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KDYX",
-        lat: 32.53833,
-        lon: -99.25417,
+        lat: 32.5385,
+        lon: -99.25433,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 1517,
             tower_ft: 62,
@@ -487,8 +516,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KEAX",
-        lat: 38.81028,
-        lon: -94.26417,
+        lat: 38.81025,
+        lon: -94.26447,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 995,
             tower_ft: 95,
@@ -496,8 +525,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KEMX",
-        lat: 31.89361,
-        lon: -110.63028,
+        lat: 31.89365,
+        lon: -110.63025,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 5202,
             tower_ft: 112,
@@ -505,8 +534,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KENX",
-        lat: 42.58639,
-        lon: -74.06444,
+        lat: 42.58655,
+        lon: -74.06409,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 1854,
             tower_ft: 79,
@@ -514,8 +543,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KEOX",
-        lat: 31.46028,
-        lon: -85.45944,
+        lat: 31.46056,
+        lon: -85.45939,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 472,
             tower_ft: 62,
@@ -524,7 +553,7 @@ pub const RADARS: [RadarSite; 207] = [
     RadarSite {
         name: "KEPZ",
         lat: 31.87306,
-        lon: -106.6975,
+        lon: -106.698,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 4104,
             tower_ft: 112,
@@ -532,8 +561,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KESX",
-        lat: 35.70111,
-        lon: -114.89139,
+        lat: 35.70135,
+        lon: -114.89165,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 4867,
             tower_ft: 79,
@@ -541,8 +570,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KEVX",
-        lat: 30.56417,
-        lon: -85.92139,
+        lat: 30.56503,
+        lon: -85.92167,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 140,
             tower_ft: 79,
@@ -550,8 +579,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KEWX",
-        lat: 29.70361,
-        lon: -98.02806,
+        lat: 29.70406,
+        lon: -98.02861,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 669,
             tower_ft: 95,
@@ -559,8 +588,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KEYX",
-        lat: 35.09778,
-        lon: -117.56,
+        lat: 35.09785,
+        lon: -117.56075,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 2776,
             tower_ft: 95,
@@ -568,8 +597,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KFCX",
-        lat: 37.02417,
-        lon: -80.27417,
+        lat: 37.0244,
+        lon: -80.27397,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 2868,
             tower_ft: 95,
@@ -577,8 +606,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KFDR",
-        lat: 34.36222,
-        lon: -98.97611,
+        lat: 34.36219,
+        lon: -98.97667,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 1267,
             tower_ft: 46,
@@ -586,8 +615,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KFDX",
-        lat: 34.63528,
-        lon: -103.62944,
+        lat: 34.63417,
+        lon: -103.61889,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 4650,
             tower_ft: 46,
@@ -595,8 +624,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KFFC",
-        lat: 33.36333,
-        lon: -84.56583,
+        lat: 33.36355,
+        lon: -84.56595,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 858,
             tower_ft: 112,
@@ -605,7 +634,7 @@ pub const RADARS: [RadarSite; 207] = [
     RadarSite {
         name: "KFSD",
         lat: 43.58778,
-        lon: -96.72889,
+        lon: -96.72945,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 1430,
             tower_ft: 62,
@@ -613,8 +642,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KFSX",
-        lat: 34.57444,
-        lon: -111.19833,
+        lat: 34.57433,
+        lon: -111.19845,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 7418,
             tower_ft: 95,
@@ -622,8 +651,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KFTG",
-        lat: 39.78667,
-        lon: -104.54528,
+        lat: 39.78664,
+        lon: -104.54581,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 5497,
             tower_ft: 112,
@@ -631,8 +660,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KFWS",
-        lat: 32.57278,
-        lon: -97.30278,
+        lat: 32.573,
+        lon: -97.30315,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 696,
             tower_ft: 79,
@@ -640,8 +669,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KGGW",
-        lat: 48.20639,
-        lon: -106.62417,
+        lat: 48.20636,
+        lon: -106.6247,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 2303,
             tower_ft: 79,
@@ -649,8 +678,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KGJX",
-        lat: 39.06222,
-        lon: -108.21306,
+        lat: 39.06217,
+        lon: -108.21376,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 10036,
             tower_ft: 62,
@@ -659,7 +688,7 @@ pub const RADARS: [RadarSite; 207] = [
     RadarSite {
         name: "KGLD",
         lat: 39.36694,
-        lon: -101.7,
+        lon: -101.70028,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 3651,
             tower_ft: 62,
@@ -667,7 +696,7 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KGRB",
-        lat: 44.49833,
+        lat: 44.49863,
         lon: -88.11111,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 709,
@@ -676,8 +705,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KGRK",
-        lat: 30.72167,
-        lon: -97.38278,
+        lat: 30.72183,
+        lon: -97.38294,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 538,
             tower_ft: 62,
@@ -686,7 +715,7 @@ pub const RADARS: [RadarSite; 207] = [
     RadarSite {
         name: "KGRR",
         lat: 42.89389,
-        lon: -85.54472,
+        lon: -85.54489,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 778,
             tower_ft: 95,
@@ -694,8 +723,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KGSP",
-        lat: 34.88306,
-        lon: -82.22028,
+        lat: 34.88331,
+        lon: -82.21983,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 955,
             tower_ft: 112,
@@ -703,8 +732,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KGWX",
-        lat: 33.89667,
-        lon: -88.32889,
+        lat: 33.89691,
+        lon: -88.32919,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 509,
             tower_ft: 79,
@@ -712,8 +741,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KGYX",
-        lat: 43.89139,
-        lon: -70.25694,
+        lat: 43.8913,
+        lon: -70.25636,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 409,
             tower_ft: 62,
@@ -721,8 +750,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KHDC",
-        lat: 30.519,
-        lon: -90.407,
+        lat: 30.51931,
+        lon: -90.40736,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 43,
             tower_ft: 112,
@@ -730,8 +759,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KHDX",
-        lat: 33.07639,
-        lon: -106.12222,
+        lat: 33.077,
+        lon: -106.12003,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 4222,
             tower_ft: 46,
@@ -739,8 +768,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KHGX",
-        lat: 29.47194,
-        lon: -95.07889,
+        lat: 29.4719,
+        lon: -95.07873,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 18,
             tower_ft: 95,
@@ -748,8 +777,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KHNX",
-        lat: 36.31417,
-        lon: -119.63111,
+        lat: 36.31418,
+        lon: -119.63214,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 243,
             tower_ft: 95,
@@ -757,8 +786,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KHPX",
-        lat: 36.73667,
-        lon: -87.285,
+        lat: 36.73697,
+        lon: -87.28558,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 564,
             tower_ft: 46,
@@ -775,8 +804,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KICT",
-        lat: 37.65444,
-        lon: -97.4425,
+        lat: 37.65445,
+        lon: -97.44305,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 1335,
             tower_ft: 62,
@@ -784,8 +813,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KICX",
-        lat: 37.59083,
-        lon: -112.86222,
+        lat: 37.59105,
+        lon: -112.86218,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 10643,
             tower_ft: 112,
@@ -793,8 +822,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KILN",
-        lat: 39.42028,
-        lon: -83.82167,
+        lat: 39.42048,
+        lon: -83.82145,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 1056,
             tower_ft: 112,
@@ -802,8 +831,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KILX",
-        lat: 40.15056,
-        lon: -89.33667,
+        lat: 40.1505,
+        lon: -89.33679,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 617,
             tower_ft: 112,
@@ -820,8 +849,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KINX",
-        lat: 36.175,
-        lon: -95.56444,
+        lat: 36.17513,
+        lon: -95.56416,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 668,
             tower_ft: 79,
@@ -829,8 +858,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KIWA",
-        lat: 33.28917,
-        lon: -111.66917,
+        lat: 33.28923,
+        lon: -111.66991,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 1362,
             tower_ft: 62,
@@ -838,7 +867,7 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KIWX",
-        lat: 41.40861,
+        lat: 41.35861,
         lon: -85.7,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 960,
@@ -847,8 +876,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KJAX",
-        lat: 30.48444,
-        lon: -81.70194,
+        lat: 30.48463,
+        lon: -81.7019,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 62,
             tower_ft: 95,
@@ -856,8 +885,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KJGX",
-        lat: 32.675,
-        lon: -83.35111,
+        lat: 32.67568,
+        lon: -83.35083,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 521,
             tower_ft: 95,
@@ -874,8 +903,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KLBB",
-        lat: 33.65417,
-        lon: -101.81361,
+        lat: 33.65414,
+        lon: -101.81416,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 3297,
             tower_ft: 79,
@@ -883,8 +912,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KLCH",
-        lat: 30.125,
-        lon: -93.21583,
+        lat: 30.12531,
+        lon: -93.21589,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 56,
             tower_ft: 79,
@@ -892,8 +921,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KLGX",
-        lat: 47.1158,
-        lon: -124.1069,
+        lat: 47.11694,
+        lon: -124.10667,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 252,
             tower_ft: 112,
@@ -902,7 +931,7 @@ pub const RADARS: [RadarSite; 207] = [
     RadarSite {
         name: "KLIX",
         lat: 30.33667,
-        lon: -89.82528,
+        lon: -89.82542,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 66,
             tower_ft: 112,
@@ -910,8 +939,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KLNX",
-        lat: 41.95778,
-        lon: -100.57583,
+        lat: 41.95794,
+        lon: -100.57622,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 3015,
             tower_ft: 95,
@@ -920,7 +949,7 @@ pub const RADARS: [RadarSite; 207] = [
     RadarSite {
         name: "KLOT",
         lat: 41.60444,
-        lon: -88.08472,
+        lon: -88.08444,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 663,
             tower_ft: 95,
@@ -928,8 +957,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KLRX",
-        lat: 40.73972,
-        lon: -116.80278,
+        lat: 40.73955,
+        lon: -116.8027,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 6781,
             tower_ft: 112,
@@ -937,7 +966,7 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KLSX",
-        lat: 38.69889,
+        lat: 38.69861,
         lon: -90.68278,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 608,
@@ -946,8 +975,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KLTX",
-        lat: 33.98917,
-        lon: -78.42917,
+        lat: 33.98915,
+        lon: -78.42911,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 64,
             tower_ft: 79,
@@ -964,8 +993,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KLWX",
-        lat: 38.97628,
-        lon: -77.48751,
+        lat: 38.97611,
+        lon: -77.4875,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 292,
             tower_ft: 112,
@@ -973,8 +1002,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KLZK",
-        lat: 34.83639,
-        lon: -92.26194,
+        lat: 34.8365,
+        lon: -92.26219,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 568,
             tower_ft: 79,
@@ -982,8 +1011,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KMAF",
-        lat: 31.94333,
-        lon: -102.18889,
+        lat: 31.94346,
+        lon: -102.18925,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 2897,
             tower_ft: 62,
@@ -991,8 +1020,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KMAX",
-        lat: 42.08111,
-        lon: -122.71611,
+        lat: 42.08117,
+        lon: -122.71737,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 7513,
             tower_ft: 46,
@@ -1000,7 +1029,7 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KMBX",
-        lat: 48.3925,
+        lat: 48.39305,
         lon: -100.86444,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 1493,
@@ -1009,8 +1038,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KMHX",
-        lat: 34.77583,
-        lon: -76.87639,
+        lat: 34.77591,
+        lon: -76.87619,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 31,
             tower_ft: 112,
@@ -1018,8 +1047,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KMKX",
-        lat: 42.96778,
-        lon: -88.55056,
+        lat: 42.9679,
+        lon: -88.55067,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 958,
             tower_ft: 62,
@@ -1027,8 +1056,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KMLB",
-        lat: 28.11306,
-        lon: -80.65444,
+        lat: 28.11319,
+        lon: -80.65408,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 36,
             tower_ft: 112,
@@ -1036,8 +1065,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KMOB",
-        lat: 30.67944,
-        lon: -88.23972,
+        lat: 30.67945,
+        lon: -88.24,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 208,
             tower_ft: 79,
@@ -1046,7 +1075,7 @@ pub const RADARS: [RadarSite; 207] = [
     RadarSite {
         name: "KMPX",
         lat: 44.84889,
-        lon: -93.56528,
+        lon: -93.56553,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 988,
             tower_ft: 112,
@@ -1063,8 +1092,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KMRX",
-        lat: 36.16833,
-        lon: -83.40194,
+        lat: 36.16861,
+        lon: -83.40195,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 1337,
             tower_ft: 95,
@@ -1072,8 +1101,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KMSX",
-        lat: 47.04111,
-        lon: -113.98611,
+        lat: 47.041,
+        lon: -113.98622,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 7930,
             tower_ft: 46,
@@ -1082,7 +1111,7 @@ pub const RADARS: [RadarSite; 207] = [
     RadarSite {
         name: "KMTX",
         lat: 41.26278,
-        lon: -112.44694,
+        lon: -112.44778,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 6480,
             tower_ft: 112,
@@ -1090,8 +1119,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KMUX",
-        lat: 37.15528,
-        lon: -121.8975,
+        lat: 37.15522,
+        lon: -121.89844,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 3469,
             tower_ft: 79,
@@ -1099,8 +1128,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KMVX",
-        lat: 47.52806,
-        lon: -97.325,
+        lat: 47.52778,
+        lon: -97.32555,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 986,
             tower_ft: 95,
@@ -1108,8 +1137,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KMXX",
-        lat: 32.53667,
-        lon: -85.78972,
+        lat: 32.53665,
+        lon: -85.78975,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 446,
             tower_ft: 112,
@@ -1117,8 +1146,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KNKX",
-        lat: 32.91889,
-        lon: -117.04194,
+        lat: 32.91902,
+        lon: -117.0418,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 955,
             tower_ft: 95,
@@ -1127,7 +1156,7 @@ pub const RADARS: [RadarSite; 207] = [
     RadarSite {
         name: "KNQA",
         lat: 35.34472,
-        lon: -89.87333,
+        lon: -89.87334,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 338,
             tower_ft: 95,
@@ -1135,8 +1164,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KOAX",
-        lat: 41.32028,
-        lon: -96.36639,
+        lat: 41.32037,
+        lon: -96.36682,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 1148,
             tower_ft: 112,
@@ -1153,8 +1182,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KOKX",
-        lat: 40.86556,
-        lon: -72.86444,
+        lat: 40.86553,
+        lon: -72.86391,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 85,
             tower_ft: 112,
@@ -1162,8 +1191,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KOTX",
-        lat: 47.68056,
-        lon: -117.62583,
+        lat: 47.68042,
+        lon: -117.62678,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 2384,
             tower_ft: 62,
@@ -1180,8 +1209,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KPBZ",
-        lat: 40.53167,
-        lon: -80.21833,
+        lat: 40.53171,
+        lon: -80.21796,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 1185,
             tower_ft: 79,
@@ -1189,8 +1218,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KPDT",
-        lat: 45.69056,
-        lon: -118.85278,
+        lat: 45.69065,
+        lon: -118.85293,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 1515,
             tower_ft: 62,
@@ -1199,7 +1228,7 @@ pub const RADARS: [RadarSite; 207] = [
     RadarSite {
         name: "KPOE",
         lat: 31.15528,
-        lon: -92.97583,
+        lon: -92.97611,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 408,
             tower_ft: 62,
@@ -1207,8 +1236,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KPUX",
-        lat: 38.45944,
-        lon: -104.18139,
+        lat: 38.45955,
+        lon: -104.18135,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 5299,
             tower_ft: 62,
@@ -1216,8 +1245,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KRAX",
-        lat: 35.66528,
-        lon: -78.49,
+        lat: 35.66552,
+        lon: -78.48975,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 348,
             tower_ft: 112,
@@ -1225,8 +1254,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KRGX",
-        lat: 39.75417,
-        lon: -119.46111,
+        lat: 39.75406,
+        lon: -119.46203,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 8299,
             tower_ft: 95,
@@ -1234,8 +1263,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KRIW",
-        lat: 43.06611,
-        lon: -108.47667,
+        lat: 43.06609,
+        lon: -108.4773,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 5568,
             tower_ft: 62,
@@ -1243,8 +1272,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KRLX",
-        lat: 38.31194,
-        lon: -81.72389,
+        lat: 38.31111,
+        lon: -81.72278,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 1099,
             tower_ft: 112,
@@ -1252,8 +1281,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KRTX",
-        lat: 45.715,
-        lon: -122.96417,
+        lat: 45.71504,
+        lon: -122.965,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 1614,
             tower_ft: 112,
@@ -1261,8 +1290,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KSFX",
-        lat: 43.10583,
-        lon: -112.68528,
+        lat: 43.1056,
+        lon: -112.68613,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 4474,
             tower_ft: 62,
@@ -1270,8 +1299,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KSGF",
-        lat: 37.23528,
-        lon: -93.40028,
+        lat: 37.23524,
+        lon: -93.40042,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 1278,
             tower_ft: 95,
@@ -1279,8 +1308,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KSHV",
-        lat: 32.45056,
-        lon: -93.84111,
+        lat: 32.45083,
+        lon: -93.84125,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 273,
             tower_ft: 112,
@@ -1288,8 +1317,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KSJT",
-        lat: 31.37111,
-        lon: -100.49222,
+        lat: 31.37128,
+        lon: -100.4925,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 1890,
             tower_ft: 112,
@@ -1297,8 +1326,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KSOX",
-        lat: 33.81778,
-        lon: -117.635,
+        lat: 33.81773,
+        lon: -117.636,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 3041,
             tower_ft: 62,
@@ -1306,8 +1335,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KSRX",
-        lat: 35.29056,
-        lon: -94.36167,
+        lat: 35.29042,
+        lon: -94.36189,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 656,
             tower_ft: 79,
@@ -1315,8 +1344,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KTBW",
-        lat: 27.70528,
-        lon: -82.40194,
+        lat: 27.7055,
+        lon: -82.40178,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 41,
             tower_ft: 79,
@@ -1324,8 +1353,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KTFX",
-        lat: 47.45972,
-        lon: -111.38444,
+        lat: 47.45958,
+        lon: -111.38533,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 3740,
             tower_ft: 62,
@@ -1333,8 +1362,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KTLH",
-        lat: 30.3975,
-        lon: -84.32889,
+        lat: 30.39758,
+        lon: -84.32894,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 63,
             tower_ft: 112,
@@ -1342,8 +1371,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KTLX",
-        lat: 35.33306,
-        lon: -97.2775,
+        lat: 35.33336,
+        lon: -97.27776,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 1213,
             tower_ft: 62,
@@ -1351,8 +1380,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KTWX",
-        lat: 38.99694,
-        lon: -96.2325,
+        lat: 38.99695,
+        lon: -96.23255,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 1367,
             tower_ft: 46,
@@ -1360,8 +1389,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KTYX",
-        lat: 43.75583,
-        lon: -75.68,
+        lat: 43.7557,
+        lon: -75.67986,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 1846,
             tower_ft: 112,
@@ -1369,8 +1398,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KUDX",
-        lat: 44.125,
-        lon: -102.82944,
+        lat: 44.12472,
+        lon: -102.83,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 3081,
             tower_ft: 112,
@@ -1378,8 +1407,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KUEX",
-        lat: 40.32083,
-        lon: -98.44167,
+        lat: 40.32084,
+        lon: -98.44195,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 1976,
             tower_ft: 79,
@@ -1387,8 +1416,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KVAX",
-        lat: 30.89,
-        lon: -83.00194,
+        lat: 30.89028,
+        lon: -83.00181,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 217,
             tower_ft: 112,
@@ -1396,8 +1425,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KVBX",
-        lat: 34.83806,
-        lon: -120.39583,
+        lat: 34.83855,
+        lon: -120.39792,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 1257,
             tower_ft: 95,
@@ -1405,8 +1434,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KVNX",
-        lat: 36.74083,
-        lon: -98.1275,
+        lat: 36.74062,
+        lon: -98.12772,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 1210,
             tower_ft: 46,
@@ -1414,8 +1443,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KVTX",
-        lat: 34.41167,
-        lon: -119.17861,
+        lat: 34.41202,
+        lon: -119.17875,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 2726,
             tower_ft: 79,
@@ -1423,8 +1452,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "KVWX",
-        lat: 38.2600,
-        lon: -87.7247,
+        lat: 38.26025,
+        lon: -87.72452,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 512,
             tower_ft: 112,
@@ -1433,7 +1462,7 @@ pub const RADARS: [RadarSite; 207] = [
     RadarSite {
         name: "KYUX",
         lat: 32.49528,
-        lon: -114.65583,
+        lon: -114.65671,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 174,
             tower_ft: 62,
@@ -1447,8 +1476,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "PABC",
-        lat: 60.79278,
-        lon: -161.87417,
+        lat: 60.79194,
+        lon: -161.87639,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 162,
             tower_ft: 30,
@@ -1457,7 +1486,7 @@ pub const RADARS: [RadarSite; 207] = [
     RadarSite {
         name: "PACG",
         lat: 56.85278,
-        lon: -135.52917,
+        lon: -135.52916,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 207,
             tower_ft: 62,
@@ -1474,8 +1503,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "PAHG",
-        lat: 60.725914,
-        lon: -151.35146,
+        lat: 60.72591,
+        lon: -151.35147,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 243,
             tower_ft: 112,
@@ -1483,8 +1512,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "PAIH",
-        lat: 59.46194,
-        lon: -146.30111,
+        lat: 59.46077,
+        lon: -146.30345,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 67,
             tower_ft: 62,
@@ -1501,8 +1530,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "PAPD",
-        lat: 65.03556,
-        lon: -147.49917,
+        lat: 65.03511,
+        lon: -147.50143,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 2593,
             tower_ft: 112,
@@ -1510,8 +1539,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "PGUA",
-        lat: 13.45444,
-        lon: 144.80833,
+        lat: 13.45583,
+        lon: 144.81111,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 272,
             tower_ft: 112,
@@ -1519,8 +1548,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "PHKI",
-        lat: 21.89417,
-        lon: -159.55222,
+        lat: 21.89389,
+        lon: -159.5525,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 226,
             tower_ft: 112,
@@ -1528,8 +1557,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "PHKM",
-        lat: 20.12556,
-        lon: -155.77778,
+        lat: 20.12528,
+        lon: -155.77777,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 3852,
             tower_ft: 112,
@@ -1538,7 +1567,7 @@ pub const RADARS: [RadarSite; 207] = [
     RadarSite {
         name: "PHMO",
         lat: 21.13278,
-        lon: -157.18,
+        lon: -157.18028,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 1363,
             tower_ft: 79,
@@ -1564,17 +1593,17 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "RKSG",
-        lat: 36.95972,
-        lon: 127.01833,
+        lat: 37.20757,
+        lon: 127.28556,
         heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 52,
+            base_ft: 1440,
             tower_ft: 79,
         }),
     },
     RadarSite {
         name: "RODN",
-        lat: 26.30194,
-        lon: 127.90972,
+        lat: 26.3078,
+        lon: 127.90347,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 299,
             tower_ft: 112,
@@ -1582,8 +1611,8 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "TJUA",
-        lat: 18.1175,
-        lon: -66.07861,
+        lat: 18.11567,
+        lon: -66.07816,
         heights: Some(SiteHeights::BaseAndTower {
             base_ft: 2844,
             tower_ft: 112,
@@ -1591,272 +1620,272 @@ pub const RADARS: [RadarSite; 207] = [
     },
     RadarSite {
         name: "TJFK",
-        lat: 40.5668,
-        lon: -73.8874,
+        lat: 40.589,
+        lon: -73.88,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 112 }),
     },
     RadarSite {
         name: "TADW",
-        lat: 38.6704,
-        lon: -76.8446,
+        lat: 38.695,
+        lon: -76.845,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 346 }),
     },
     RadarSite {
         name: "TATL",
-        lat: 33.6433,
-        lon: -84.2524,
+        lat: 33.647,
+        lon: -84.262,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 1075 }),
     },
     RadarSite {
         name: "TBNA",
-        lat: 35.9767,
-        lon: -86.6618,
+        lat: 35.98,
+        lon: -86.662,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 817 }),
     },
     RadarSite {
         name: "TBOS",
-        lat: 42.1515,
-        lon: -70.9302,
+        lat: 42.158,
+        lon: -70.933,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 264 }),
     },
     RadarSite {
         name: "TBWI",
-        lat: 39.0870,
-        lon: -76.6276,
+        lat: 39.09,
+        lon: -76.63,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 297 }),
     },
     RadarSite {
         name: "TCLT",
-        lat: 35.3269,
-        lon: -80.8772,
+        lat: 35.337,
+        lon: -80.885,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 871 }),
     },
     RadarSite {
         name: "TCMH",
-        lat: 39.9878,
-        lon: -82.71,
+        lat: 40.006,
+        lon: -82.715,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 1148 }),
     },
     RadarSite {
         name: "TCVG",
-        lat: 38.8799,
-        lon: -84.5737,
+        lat: 38.898,
+        lon: -84.58,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 1053 }),
     },
     RadarSite {
         name: "TDAL",
-        lat: 32.9076,
-        lon: -96.9568,
+        lat: 32.926,
+        lon: -96.968,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 622 }),
     },
     RadarSite {
         name: "TDAY",
-        lat: 39.9875,
-        lon: -84.1102,
+        lat: 40.022,
+        lon: -84.123,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 1019 }),
     },
     RadarSite {
         name: "TDCA",
-        lat: 38.7474,
-        lon: -76.9509,
+        lat: 38.759,
+        lon: -76.962,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 345 }),
     },
     RadarSite {
         name: "TDEN",
-        lat: 39.7256,
-        lon: -104.5431,
+        lat: 39.727,
+        lon: -104.526,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 5701 }),
     },
     RadarSite {
         name: "TDFW",
-        lat: 33.0396,
-        lon: -96.8974,
+        lat: 33.065,
+        lon: -96.918,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 585 }),
     },
     RadarSite {
         name: "TDTW",
-        lat: 42.0710,
-        lon: -83.4704,
+        lat: 42.111,
+        lon: -83.515,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 772 }),
     },
     RadarSite {
         name: "TEWR",
-        lat: 40.5880,
-        lon: -74.2503,
+        lat: 40.594,
+        lon: -74.27,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 136 }),
     },
     RadarSite {
         name: "TFLL",
-        lat: 26.1263,
-        lon: -80.3478,
+        lat: 26.143,
+        lon: -80.344,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 120 }),
     },
     RadarSite {
         name: "THOU",
-        lat: 29.5328,
-        lon: -95.2444,
+        lat: 29.516,
+        lon: -95.242,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 117 }),
     },
     RadarSite {
         name: "TIAD",
-        lat: 39.0675,
-        lon: -77.5012,
+        lat: 39.084,
+        lon: -77.529,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 473 }),
     },
     RadarSite {
         name: "TIAH",
-        lat: 30.0297,
-        lon: -95.5708,
+        lat: 30.065,
+        lon: -95.567,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 253 }),
     },
     RadarSite {
         name: "TICH",
-        lat: 37.4069,
-        lon: -97.4764,
+        lat: 37.507,
+        lon: -97.437,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 1351 }),
     },
     RadarSite {
         name: "TIDS",
-        lat: 39.5978,
-        lon: -86.4085,
+        lat: 39.637,
+        lon: -86.435,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 847 }),
     },
     RadarSite {
         name: "TLAS",
-        lat: 36.1292,
-        lon: -115.0147,
+        lat: 36.144,
+        lon: -115.007,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 2058 }),
     },
     RadarSite {
         name: "TLVE",
-        lat: 41.2805,
-        lon: -81.9659,
+        lat: 41.29,
+        lon: -82.008,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 931 }),
     },
     RadarSite {
         name: "TMCI",
-        lat: 39.4488,
-        lon: -94.7396,
+        lat: 39.499,
+        lon: -94.742,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 1090 }),
     },
     RadarSite {
         name: "TMCO",
-        lat: 28.2584,
-        lon: -81.3133,
+        lat: 28.344,
+        lon: -81.326,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 169 }),
     },
     RadarSite {
         name: "TMDW",
-        lat: 41.69,
-        lon: -87.8034,
+        lat: 41.651,
+        lon: -87.73,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 763 }),
     },
     RadarSite {
         name: "TMEM",
-        lat: 34.8867,
-        lon: -90.0007,
+        lat: 34.896,
+        lon: -89.993,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 483 }),
     },
     RadarSite {
         name: "TMIA",
-        lat: 25.7555,
-        lon: -80.4932,
+        lat: 25.758,
+        lon: -80.491,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 125 }),
     },
     RadarSite {
         name: "TMKE",
-        lat: 42.7619,
-        lon: -87.9994,
+        lat: 42.819,
+        lon: -88.046,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 933 }),
     },
     RadarSite {
         name: "TMSP",
-        lat: 44.8197,
-        lon: -92.9392,
+        lat: 44.871,
+        lon: -92.933,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 1121 }),
     },
     RadarSite {
         name: "TMSY",
-        lat: 29.9385,
-        lon: -90.3811,
+        lat: 30.022,
+        lon: -90.403,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 99 }),
     },
     RadarSite {
         name: "TOKC",
-        lat: 35.2474,
-        lon: -97.5395,
+        lat: 35.276,
+        lon: -97.51,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 1308 }),
     },
     RadarSite {
         name: "TORD",
-        lat: 41.7712,
-        lon: -87.8363,
+        lat: 41.797,
+        lon: -87.858,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 744 }),
     },
     RadarSite {
         name: "TPBI",
-        lat: 26.6572,
-        lon: -80.2586,
+        lat: 26.688,
+        lon: -80.273,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 133 }),
     },
     RadarSite {
         name: "TPHL",
-        lat: 39.9084,
-        lon: -75.0426,
+        lat: 39.949,
+        lon: -75.07,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 153 }),
     },
     RadarSite {
         name: "TPHX",
-        lat: 33.3678,
-        lon: -112.1580,
+        lat: 33.42,
+        lon: -112.163,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 1089 }),
     },
     RadarSite {
         name: "TPIT",
-        lat: 40.4641,
-        lon: -80.4697,
+        lat: 40.501,
+        lon: -80.486,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 1386 }),
     },
     RadarSite {
         name: "TRDU",
-        lat: 35.9898,
-        lon: -78.6787,
+        lat: 36.002,
+        lon: -78.697,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 515 }),
     },
     RadarSite {
         name: "TSDF",
-        lat: 38.0109,
-        lon: -85.5995,
+        lat: 38.046,
+        lon: -85.611,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 731 }),
     },
     RadarSite {
         name: "TSJU",
-        lat: 18.4313,
-        lon: -66.1722,
+        lat: 18.474,
+        lon: -66.18,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 157 }),
     },
     RadarSite {
         name: "TSLC",
-        lat: 40.9341,
-        lon: -111.9214,
+        lat: 40.967,
+        lon: -111.93,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 4295 }),
     },
     RadarSite {
         name: "TSTL",
-        lat: 38.7668,
-        lon: -90.4698,
+        lat: 38.805,
+        lon: -90.489,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 647 }),
     },
     RadarSite {
         name: "TTPA",
-        lat: 27.8196,
-        lon: -82.5179,
+        lat: 27.86,
+        lon: -82.518,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 93 }),
     },
     RadarSite {
         name: "TTUL",
-        lat: 36.0236,
-        lon: -95.8175,
+        lat: 36.071,
+        lon: -95.826,
         heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 823 }),
     },
 ];
@@ -2086,12 +2115,101 @@ mod nearest_tests {
         assert!(nearest_wsr88d_site(35.0, f64::INFINITY).is_none());
     }
 
+    /// Every row that moved further than one 250 m data cell onto the
+    /// position its own volume reports, as (site, old lat, old lon, new lat,
+    /// new lon, the epoch the volume came from).
+    ///
+    /// Pinned by value so a re-import of the table from whatever list it came
+    /// from originally cannot quietly put them back. Forty-five of the fifty
+    /// are TDWRs — see [`RADARS`] on why that is one defect and not
+    /// forty-five.
+    const MOVED_ONTO_ITS_VOLUME: [(&str, f64, f64, f64, f64, &str); 50] = [
+        (
+            "RKSG",
+            36.95972,
+            127.01833,
+            37.20757,
+            127.28556,
+            "2026/08/10",
+        ),
+        ("TICH", 37.4069, -97.4764, 37.507, -97.437, "2026/06/25"),
+        ("TMCO", 28.2584, -81.3133, 28.344, -81.326, "2026/08/10"),
+        ("TMSY", 29.9385, -90.3811, 30.022, -90.403, "2026/08/10"),
+        ("TMDW", 41.69, -87.8034, 41.651, -87.73, "2026/08/10"),
+        ("TMKE", 42.7619, -87.9994, 42.819, -88.046, "2026/08/10"),
+        ("TPHX", 33.3678, -112.158, 33.42, -112.163, "2026/08/10"),
+        ("TDTW", 42.071, -83.4704, 42.111, -83.515, "2026/08/10"),
+        ("TMSP", 44.8197, -92.9392, 44.871, -92.933, "2026/08/10"),
+        ("TMCI", 39.4488, -94.7396, 39.499, -94.742, "2026/08/10"),
+        ("KIWX", 41.40861, -85.7, 41.35861, -85.7, "2026/08/10"),
+        ("TTUL", 36.0236, -95.8175, 36.071, -95.826, "2026/08/10"),
+        ("TPHL", 39.9084, -75.0426, 39.949, -75.07, "2026/08/10"),
+        ("TIDS", 39.5978, -86.4085, 39.637, -86.435, "2026/08/10"),
+        ("TSJU", 18.4313, -66.1722, 18.474, -66.18, "2026/08/10"),
+        ("TSTL", 38.7668, -90.4698, 38.805, -90.489, "2026/08/10"),
+        ("TTPA", 27.8196, -82.5179, 27.86, -82.518, "2026/08/10"),
+        ("TPIT", 40.4641, -80.4697, 40.501, -80.486, "2026/08/10"),
+        ("TOKC", 35.2474, -97.5395, 35.276, -97.51, "2026/08/10"),
+        ("TSDF", 38.0109, -85.5995, 38.046, -85.611, "2026/08/10"),
+        ("TDAY", 39.9875, -84.1102, 40.022, -84.123, "2026/08/10"),
+        ("TIAH", 30.0297, -95.5708, 30.065, -95.567, "2026/08/10"),
+        ("TSLC", 40.9341, -111.9214, 40.967, -111.93, "2026/08/10"),
+        ("TPBI", 26.6572, -80.2586, 26.688, -80.273, "2026/07/28"),
+        ("TLVE", 41.2805, -81.9659, 41.29, -82.008, "2026/08/10"),
+        ("TDFW", 33.0396, -96.8974, 33.065, -96.918, "2026/08/10"),
+        ("TORD", 41.7712, -87.8363, 41.797, -87.858, "2026/08/10"),
+        ("TIAD", 39.0675, -77.5012, 39.084, -77.529, "2026/08/10"),
+        ("TADW", 38.6704, -76.8446, 38.695, -76.845, "2026/08/10"),
+        ("TJFK", 40.5668, -73.8874, 40.589, -73.88, "2026/08/10"),
+        ("TDAL", 32.9076, -96.9568, 32.926, -96.968, "2026/08/10"),
+        ("TRDU", 35.9898, -78.6787, 36.002, -78.697, "2026/08/10"),
+        ("TCVG", 38.8799, -84.5737, 38.898, -84.58, "2026/08/10"),
+        ("TCMH", 39.9878, -82.71, 40.006, -82.715, "2026/08/10"),
+        ("TFLL", 26.1263, -80.3478, 26.143, -80.344, "2026/08/10"),
+        ("THOU", 29.5328, -95.2444, 29.516, -95.242, "2026/08/10"),
+        ("TEWR", 40.588, -74.2503, 40.594, -74.27, "2026/08/10"),
+        ("TLAS", 36.1292, -115.0147, 36.144, -115.007, "2026/08/10"),
+        ("TDCA", 38.7474, -76.9509, 38.759, -76.962, "2026/08/10"),
+        ("TDEN", 39.7256, -104.5431, 39.727, -104.526, "2026/08/10"),
+        ("TCLT", 35.3269, -80.8772, 35.337, -80.885, "2026/08/10"),
+        ("TMEM", 34.8867, -90.0007, 34.896, -89.993, "2026/08/10"),
+        ("TATL", 33.6433, -84.2524, 33.647, -84.262, "2026/08/10"),
+        (
+            "KFDX",
+            34.63528,
+            -103.62944,
+            34.63417,
+            -103.61889,
+            "2026/08/10",
+        ),
+        (
+            "RODN",
+            26.30194,
+            127.90972,
+            26.3078,
+            127.90347,
+            "2023/06/01",
+        ),
+        ("TBOS", 42.1515, -70.9302, 42.158, -70.933, "2026/08/10"),
+        ("TBWI", 39.087, -76.6276, 39.09, -76.63, "2026/08/10"),
+        ("TBNA", 35.9767, -86.6618, 35.98, -86.662, "2026/08/10"),
+        ("TMIA", 25.7555, -80.4932, 25.758, -80.491, "2026/08/10"),
+        (
+            "PGUA",
+            13.45444,
+            144.80833,
+            13.45583,
+            144.81111,
+            "2026/08/10",
+        ),
+    ];
+
     /// The rows this table corrected against their own Level II volume, as
     /// (site, the height it recorded before, the height its volume reports).
     ///
     /// Feet, on [`Datum::SiteBase`]. Measured by `site_elev_probe` on the
     /// `campaign-harness` branch over one volume per site.
-    const CORRECTED_AGAINST_A_VOLUME: [(&str, i32, i32); 49] = [
+    const CORRECTED_AGAINST_A_VOLUME: [(&str, i32, i32); 50] = [
         ("KAKQ", 112, 157),
         ("KAMA", 3587, 3622),
         ("KATX", 494, 528),
@@ -2136,6 +2254,7 @@ mod nearest_tests {
         ("PACG", 270, 207),
         ("PAEC", 54, 59),
         ("PGUA", 264, 272),
+        ("RKSG", 52, 1440),
         ("PHKI", 179, 226),
         ("PHKM", 3812, 3852),
         ("PHWA", 1370, 1381),
@@ -2226,15 +2345,21 @@ mod nearest_tests {
         assert_eq!(*gaps.last().expect("non-empty"), 114, "the tallest tower");
     }
 
-    /// The 49 rows whose height was corrected against their own volume,
+    /// The 50 rows whose height was corrected against their own volume,
     /// pinned by value.
     ///
     /// The table used to hold one number per row and a note saying six had
     /// been checked. Checking all 207 against one archive volume each found
     /// these disagreeing with the height their own RDA reports by more than
     /// the whole-metre rounding of the field — from 63 ft high to 81 ft low.
-    /// KMSX, the one the old note called unexplained, is item 31 of 49 rather
+    /// KMSX, the one the old note called unexplained, is item 31 of 50 rather
     /// than a singleton.
+    ///
+    /// `RKSG` is the fiftieth and arrived a campaign later: the pass that
+    /// corrected the other 49 left it alone because its *coordinates* were
+    /// 36 km out, and a row holding Camp Humphreys' height over Osan's
+    /// position would have been incoherent rather than merely stale. Both
+    /// halves now come from the same volume.
     ///
     /// Pinned as (site, what it said, what it says now) so a re-import of the
     /// table from whatever list it originally came from cannot quietly put
@@ -2246,7 +2371,80 @@ mod nearest_tests {
             assert_eq!(site.height_ft(Datum::SiteBase), Some(now), "{name}");
             assert_ne!(was, now, "{name} is listed as corrected but did not move");
         }
-        assert_eq!(CORRECTED_AGAINST_A_VOLUME.len(), 49);
+        assert_eq!(CORRECTED_AGAINST_A_VOLUME.len(), 50);
+    }
+
+    /// The rows that moved onto their volume's position carry it, and are
+    /// not where they used to be.
+    ///
+    /// Both halves matter. Asserting only the new value would pass on a table
+    /// that had never moved if the pin were generated from it; asserting the
+    /// row is no longer at the old coordinates is what makes this a
+    /// correction rather than a description.
+    #[test]
+    fn the_moved_rows_sit_where_their_volume_says() {
+        for (name, was_lat, was_lon, lat, lon, epoch) in MOVED_ONTO_ITS_VOLUME {
+            let site = get_radar_site(name).expect("in the table");
+            assert_eq!(site.lat, lat, "{name} latitude");
+            assert_eq!(site.lon, lon, "{name} longitude");
+            assert!(
+                distance_km(was_lat, was_lon, lat, lon) > 0.25,
+                "{name} is listed as moved but did not move a data cell",
+            );
+            assert_eq!(epoch.len(), "YYYY/MM/DD".len(), "{name} epoch");
+        }
+        assert_eq!(MOVED_ONTO_ITS_VOLUME.len(), 50);
+    }
+
+    /// The far end of the correction, named: `RKSG` is a relocated radar, not
+    /// a mis-transcribed one.
+    ///
+    /// It is the only row in the table whose position and height were *both*
+    /// wrong, and the only one wrong by more than a few kilometres. Osan is
+    /// 36 km from Camp Humphreys and 1388 ft below it, so a section anchored
+    /// on the old row put the beam through the wrong air over the wrong
+    /// ground.
+    #[test]
+    fn rksg_is_at_camp_humphreys_and_not_at_osan() {
+        let site = get_radar_site("RKSG").expect("in the table");
+        assert_eq!((site.lat, site.lon), (37.20757, 127.28556));
+        assert_eq!(site.height_ft(Datum::SiteBase), Some(1440));
+        assert_eq!(site.height_ft(Datum::Feedhorn), Some(1519));
+        assert!(
+            distance_km(site.lat, site.lon, 36.95972, 127.01833) > 35.0,
+            "the pre-move Osan coordinates are 36 km away and must not come back",
+        );
+    }
+
+    /// A digest over every row's name and coordinates.
+    ///
+    /// [`MOVED_ONTO_ITS_VOLUME`] names the 50 rows that moved far enough to
+    /// argue about; 143 more moved by tens of metres, where a literal list
+    /// would be noise but a silent revert would still be a defect. This
+    /// covers all 207 at once: change any row's position by one place in the
+    /// last decimal and this fails.
+    ///
+    /// FNV-1a over the IEEE bits, so it is exact rather than tolerant —
+    /// tolerance is what the named tables are for.
+    #[test]
+    fn every_rows_coordinates_are_pinned() {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut eat = |bytes: &[u8]| {
+            for byte in bytes {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(0x1000_0000_01b3);
+            }
+        };
+        for site in RADARS.iter() {
+            eat(site.name.as_bytes());
+            eat(&site.lat.to_bits().to_be_bytes());
+            eat(&site.lon.to_bits().to_be_bytes());
+        }
+        assert_eq!(
+            hash, 0x67b7_7f0e_1c1c_defc,
+            "a row's coordinates changed; if that was deliberate, re-measure \
+             against the volumes rather than editing this number",
+        );
     }
 
     /// Every site must be reachable as its own nearest neighbour, which catches

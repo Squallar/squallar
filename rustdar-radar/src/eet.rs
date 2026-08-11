@@ -560,6 +560,35 @@ mod tests {
         assert_eq!(radar_height_ft_near(35.4, -97.2, Datum::Feedhorn), 1275.0);
     }
 
+    /// The one row whose height moved when the table was put on its volumes,
+    /// pinned where its consumers read it.
+    ///
+    /// `RKSG` was carrying the pre-move Osan site, 36 km and 1388 ft from the
+    /// Camp Humphreys RDA its volumes report. This is the number that reaches
+    /// [`crate::xsect`]'s `base_km_msl`, the [`crate::voxel`] grid's datum,
+    /// [`crate::hail`]'s above-radar-level heights and the wet-bulb heights
+    /// [`crate::hca`] and `hsda` classify against — every one of them adds a
+    /// beam height to it, so all four moved by the same 1388 ft together.
+    ///
+    /// Pinned at the *new* coordinates: at the old ones the lookup now finds
+    /// no site within 36 km and the answer is a neighbour's, which is the
+    /// failure this replaced rather than the behaviour to keep.
+    #[test]
+    fn the_relocated_site_reaches_its_consumers_at_its_new_height() {
+        assert_eq!(
+            radar_height_ft_near(37.20757, 127.28556, Datum::Feedhorn),
+            1519.0,
+        );
+        assert_eq!(
+            radar_height_ft_near(37.20757, 127.28556, Datum::SiteBase),
+            1440.0,
+        );
+        // The figure the render path actually adds, in the units it adds it
+        // in: 1519 ft is 0.463 km, not the 0.040 km Osan's 131 ft gave.
+        let km = radar_height_ft_near(37.20757, 127.28556, Datum::Feedhorn) * 0.0003048;
+        assert!((km - 0.463).abs() < 0.001, "{km} km MSL");
+    }
+
     /// A row that cannot answer the datum must not drag the lookup down to
     /// sea level.
     ///
