@@ -20,7 +20,7 @@ grib = { version = "=0.17.1", default-features = false, features = [
     "time-calculation",
 ] }
 rustdar-units = { workspace = true }
-futures = "=0.3.33"
+futures = "=0.3.34"
 # GOES GLM granules. GLM L2 LCFA files are NetCDF4, i.e. plain HDF5 (every
 # netCDF variable is an HDF5 dataset in the root group), so `glm::h5` reads them
 # without a netCDF layer. Pure Rust; no `-sys` crate, unlike `netcdf`.

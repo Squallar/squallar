@@ -33,7 +33,7 @@ walkers = { workspace = true }
 # Channels and the concurrency-bounded tile fetch loop in `tile_source`. Same
 # pin as rustdar-overlays; walkers uses this version too, so it is already in the
 # graph either way.
-futures = "=0.3.33"
+futures = "=0.3.34"
 # Bounded tile cache with LRU eviction. Pinned to the version walkers already
 # resolves, so this adds no new node to the dependency graph.
 lru = "=0.18.2"

@@ -153,7 +153,7 @@ ashpd = { version = "=0.10.3", default-features = false, features = [
 # Neither is an executor. `block_on` parks the calling thread on one future;
 # nothing here spawns.
 futures-lite = "=2.6.1"
-futures-channel = "=0.3.33"
+futures-channel = "=0.3.34"
 # For `GpsFix::timestamp`, which is a `chrono::NaiveDateTime` and arrives from
 # the portal as epoch seconds. Already in the graph via `rustdar-gps`; named
 # here because this crate now converts one.
