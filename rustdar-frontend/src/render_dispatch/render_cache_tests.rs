@@ -318,7 +318,7 @@ const TILT_INDEPENDENT: [RadarProduct; 4] = [
 fn the_tilt_independent_set_is_the_renderers_own_pre_sweep_dispatch() {
     for &product in RadarProduct::all() {
         assert_eq!(
-            tilt_independent_plan_view(product),
+            product.tilt_independent_plan_view(),
             TILT_INDEPENDENT.contains(&product),
             "{product:?} is on the wrong side of the tilt-independence line",
         );

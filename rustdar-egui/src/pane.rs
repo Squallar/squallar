@@ -1086,24 +1086,49 @@ impl LoopPlaybackState {
     /// because there is no way to write [`Self::view_key`] that does not come
     /// through here.
     ///
-    /// # A volume loop ignores the elevation, and only a volume loop may
+    /// # The tilt is only part of the target where it chooses the picture
     ///
-    /// The tilt is part of the target for the two raster kinds because it
-    /// chooses which sweep is drawn. A voxel grid is resampled from the whole
-    /// ladder, so it chooses nothing — and keying on it would discard the
-    /// entire resident set and pay ~2 s of rebuild the first time a user
-    /// nudged the elevation slider on a 3D pane, for fourteen grids that would
-    /// come back byte-identical. The stored `rendered_for` still carries the
-    /// pane's selection, so the sibling broadcast and every result-acceptance
-    /// test are unchanged; what this drops is only the *comparison*, and only
-    /// for the kind whose picture the tilt cannot move.
+    /// The tilt is part of the target for a section loop because the frames it
+    /// keys are still keyed by a `RenderTarget` the section pipeline stamps
+    /// with it. It is *not* part of it for the other two kinds, and neither
+    /// exemption is a loop-kind carve-out — both are the same question asked of
+    /// the thing that draws the frame:
+    ///
+    /// * **A volume loop.** A voxel grid is resampled from the whole ladder, so
+    ///   it chooses nothing — and keying on it would discard the entire
+    ///   resident set and pay ~2 s of rebuild the first time a user nudged the
+    ///   elevation slider on a 3D pane, for fourteen grids that would come back
+    ///   byte-identical.
+    /// * **A plan-view loop of a tilt-independent product.** The four products
+    ///   [`RadarProduct::tilt_independent_plan_view`] names reduce the whole
+    ///   volume to one polar grid before `render::render_radar_to_image_full`
+    ///   ever calls `find_sweep`, so the elevation reaches no line of them. It
+    ///   is asked here and not restated, because the same predicate keys
+    ///   `render_dispatch`'s shared `RenderCache` — and a loop's re-renders do
+    ///   *not* consult that cache, so a duplicated list that drifted would cost
+    ///   a whole-volume recompute per frame rather than per pane, up to
+    ///   `MAX_LOOP_RENDER_BUDGET` of them for one tilt click.
+    ///
+    /// The stored `rendered_for` still carries the pane's selection, so the
+    /// sibling broadcast and every result-acceptance test are unchanged; what
+    /// this drops is only the *comparison*, and only where the tilt cannot move
+    /// the picture.
+    ///
+    /// A `key` of `None` also stands for a section or volume loop that has lost
+    /// the line or region its frames were pictures of. That case never reaches
+    /// the product question: losing the key is itself a change of
+    /// [`Self::view_key`], which discards the frames below whatever this says.
     pub fn retarget_renders_keyed(
         &mut self,
         product: RadarProduct,
         elevation: f32,
         key: Option<LoopViewKey>,
     ) -> bool {
-        let tilt_matters = !matches!(key, Some(LoopViewKey::Volume(_)));
+        let tilt_matters = match &key {
+            Some(LoopViewKey::Volume(_)) => false,
+            Some(LoopViewKey::Section(_)) => true,
+            None => !product.tilt_independent_plan_view(),
+        };
         // Runs for every looping pane every frame, and almost always finds no change,
         // so ask before building a target rather than allocating one to throw away.
         if self.rendered_for.as_ref().is_some_and(|t| {

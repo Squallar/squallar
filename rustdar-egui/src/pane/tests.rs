@@ -419,6 +419,78 @@ fn retarget_reacts_to_an_elevation_change() {
     assert!(retargeted.matches(&target(SITE, RadarProduct::Reflectivity, 1.5)));
 }
 
+/// The four products whose plan view is the same picture at every tilt, named
+/// here rather than derived: naming them is what makes this a test of the
+/// predicate rather than a restatement of it. It is the set
+/// `render::render_radar_to_image_full` dispatches before it calls
+/// `find_sweep`, read off that function — and the same list
+/// `render_dispatch`'s `render_cache_tests` checks the shared cache against.
+const TILT_INDEPENDENT: [RadarProduct; 4] = [
+    RadarProduct::EchoTopsInterpolated,
+    RadarProduct::ProbabilityOfSevereHail,
+    RadarProduct::MaxExpectedHailSize,
+    RadarProduct::HydrometeorClassification,
+];
+
+/// A plan-view loop of a product the tilt cannot move must keep its frames when
+/// only the tilt moves.
+///
+/// A loop's re-renders do not go through `render_dispatch`'s `RenderCache`, so
+/// the exemption that cache already applies buys nothing here: without it a
+/// tilt click discarded every texture and paid a whole-volume recompute for
+/// each of up to `MAX_LOOP_RENDER_BUDGET` frames — the per-pane cost the cache
+/// was measured saving (6.9 s for a 14-tilt hybrid classification), multiplied
+/// by the frame count, for pictures that come back byte-identical.
+#[test]
+fn a_tilt_change_keeps_a_tilt_independent_plan_view_loops_frames() {
+    let ctx = egui::Context::default();
+    for product in TILT_INDEPENDENT {
+        let mut state = loop_with_frames(3, 0);
+        state.retarget_renders(product, 0.5);
+        state.frames[0].image = Some(dummy_texture(&ctx));
+
+        assert!(
+            !state.retarget_renders(product, 19.5),
+            "{product:?} re-rendered every loop frame for a byte-identical picture",
+        );
+        assert!(
+            state.frames[0].image.is_some(),
+            "{product:?} dropped a texture the new tilt cannot change",
+        );
+    }
+}
+
+/// The other half: a product whose pixels really do come from the sweep
+/// `find_sweep` picks must still discard, or a tilt click would leave the loop
+/// animating the tilt before it with nothing saying so.
+///
+/// NROT and SRV are the pair that makes this more than a restatement of the
+/// test above — both answer *true* to `RadarProduct::reads_whole_volume`,
+/// because they fit their dealias seed from every velocity tilt, and both still
+/// rasterize one sweep. A fix that reached for that predicate instead would
+/// pass every assertion above and silently freeze these two.
+#[test]
+fn a_tilt_change_still_discards_a_tilt_dependent_plan_view_loops_frames() {
+    let ctx = egui::Context::default();
+    for product in RadarProduct::all().iter().copied() {
+        if TILT_INDEPENDENT.contains(&product) {
+            continue;
+        }
+        let mut state = loop_with_frames(3, 0);
+        state.retarget_renders(product, 0.5);
+        state.frames[0].image = Some(dummy_texture(&ctx));
+
+        assert!(
+            state.retarget_renders(product, 19.5),
+            "{product:?} kept frames drawn from another tilt's sweep",
+        );
+        assert!(
+            state.frames[0].image.is_none(),
+            "{product:?} left a texture of the previous tilt on screen",
+        );
+    }
+}
+
 /// The render target is the *whole* key a frame's image is determined by, and the
 /// site is half the geometry: `render_radar_to_image` projects around the site's
 /// coordinates, so the same scan at the same product and elevation is a different

@@ -998,6 +998,52 @@ impl RadarProduct {
         }
     }
 
+    /// Whether a **plan view** of this product draws the same picture whatever
+    /// tilt is selected, so everything that keys a plan-view raster on the
+    /// elevation may drop that half of the key.
+    ///
+    /// Four Level II products qualify, and they are the four
+    /// [`crate::render::render_radar_to_image_full`] dispatches *before* it
+    /// calls `find_sweep`: interpolated echo tops, the hail pair, and the
+    /// hybrid classification. Each reduces the whole volume to one polar grid,
+    /// and the `elevation_angle` argument reaches no line of any of them —
+    /// `render_echo_tops_interp_to_image` says so in its own doc:
+    /// "Tilt-independent — every elevation request renders the same volume
+    /// product."
+    ///
+    /// **Derived from the two exhaustive predicates rather than restated as a
+    /// list.** [`crate::derive::volume_slot`] is `None` for exactly the
+    /// products with no per-tilt field and no per-tilt derivation, and
+    /// [`is_level3`](Self::is_level3) removes the ones whose pixels come from
+    /// an RPG object instead of a Level II tilt (those keep the elevation axis:
+    /// their objects *are* per-tilt). A hand-kept fifth copy of "which products
+    /// read the whole volume" is the mistake
+    /// [`reads_whole_volume`](Self::reads_whole_volume) documents having
+    /// already been paid for once — a copy that omitted SRV, so live panes
+    /// fitted their dealias seed from volumes the feed had skipped cuts of.
+    /// `reads_whole_volume` is the wrong predicate to reuse here: it is also
+    /// true of NROT and SRV, which rasterize the sweep `find_sweep` picks and
+    /// so really do change with the tilt.
+    ///
+    /// # It lives on the product, in this crate, because two crates ask it
+    ///
+    /// `rustdar_frontend`'s `render_cache_key` asks it to collapse those four
+    /// into one cache slot, and `rustdar_egui`'s
+    /// `LoopPlaybackState::retarget_renders_keyed` asks it to keep a plan-view
+    /// loop's frames when only the tilt moved. `rustdar_frontend` depends on
+    /// `rustdar_egui`, so the second cannot call into the first, and a second
+    /// copy of the list in the crate that cannot reach the original is exactly
+    /// the failure `reads_whole_volume` above describes. Both depend on this
+    /// crate, which is also where the two predicates it is derived from live.
+    ///
+    /// Without this, a tilt click on one of those four panes missed the cache
+    /// and paid a full whole-volume recompute — measured at 6.9 s for a 14-tilt
+    /// dual-pol hybrid classification — to redraw a byte-identical picture; and
+    /// on a *looping* pane it discarded every frame and paid that per frame.
+    pub fn tilt_independent_plan_view(&self) -> bool {
+        !self.is_level3() && crate::derive::volume_slot(*self).is_none()
+    }
+
     /// Format a radar product value for display (e.g. in a hover tooltip).
     pub fn format_value(&self, value: f32, prefs: &UserPreferences) -> String {
         match self {
