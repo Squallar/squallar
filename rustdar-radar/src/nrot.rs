@@ -2711,6 +2711,7 @@ mod tests {
             gate_count: grid.first().map_or(0, Vec::len),
             first_gate_range_km: 1.0,
             gate_interval_km: 1.0,
+            declared_nyquist_ms: None,
         }
     }
 
@@ -2851,6 +2852,7 @@ mod tests {
                     gate_count: 700,
                     first_gate_range_km: 0.05,
                     gate_interval_km: 0.05,
+                    declared_nyquist_ms: None,
                 },
                 0.5,
             );
@@ -2996,6 +2998,9 @@ mod tests {
             gate_count: gates,
             first_gate_range_km: 50.0,
             gate_interval_km: 1.0,
+            // No declaration: this fixture's expectations were measured against
+            // the estimator, which is what an undeclared sweep still reaches.
+            declared_nyquist_ms: None,
         };
         dealias(&mut grid, &sw, 0.5, Some(&wp), DealiasProfile::NoFalseShear);
 
