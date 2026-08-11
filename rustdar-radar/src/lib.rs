@@ -1,5 +1,6 @@
 pub mod archive;
 pub mod beam;
+pub mod catalogue;
 pub mod chunks;
 pub mod current;
 pub mod derive;

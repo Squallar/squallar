@@ -289,6 +289,53 @@ mod tests {
         }
     }
 
+    /// The network site catalogue reaches for two hosts, and **both are
+    /// already here**.
+    ///
+    /// That is the whole reason the catalogue costs nothing beyond its own
+    /// code. A genuinely new origin has to be added in four more places before
+    /// it works everywhere — the service worker's `NEVER_CACHE_HOSTS`, Android's
+    /// `network_security_config.xml`, `rustdar-web`'s `pwa_assets` list, and the
+    /// staging loop — and the tests over those files fail if one appears
+    /// without them. Nothing fails today, which is a fact worth asserting
+    /// rather than a fact worth assuming: a future rewrite of the catalogue
+    /// onto, say, `noaa-nexrad-level2` would compile, would pass its own tests,
+    /// and would be unreachable from the web build and from Android.
+    ///
+    /// `catalogue::fetch` builds its two URLs from exactly these two fields;
+    /// this pins which fields those are.
+    #[test]
+    fn no_new_origin_is_needed_for_the_catalogue() {
+        let s = DataSources::production();
+        assert_eq!(
+            s.level2_chunks_bucket, "unidata-nexrad-level2-chunks",
+            "the catalogue's membership half lists this bucket's root",
+        );
+        assert_eq!(
+            s.nws_api_base, "https://api.weather.gov",
+            "the catalogue's position half GETs {}/radar/stations",
+            s.nws_api_base,
+        );
+        // Both were reachable from a real origin in headless Chromium *and*
+        // Firefox, with the AWS `noaa-nexrad-level2` bucket as the negative
+        // control that the probe could detect a CORS failure at all. That
+        // bucket grants neither listing nor public GET, and the Google mirror
+        // runs ~3.5 weeks behind with `.tar`-bundled volumes.
+        for url in [
+            DataSources::s3_object_url(&s.level2_chunks_bucket, "KTLX/"),
+            format!("{}/radar/stations", s.nws_api_base),
+        ] {
+            for rejected in ["noaa-nexrad-level2", "storage.googleapis.com"] {
+                assert!(
+                    !url.contains(rejected),
+                    "{url} points at {rejected}, which the catalogue was \
+                     measured against and cannot use",
+                );
+            }
+            assert!(url.starts_with("https://"), "{url} is not https");
+        }
+    }
+
     /// Level III keys are flat with no `sn.last`, so the prefix is the whole
     /// addressing scheme. Expected string is a live key
     /// (`TLX_N0S_2026_07_25_17_23_22`) truncated at the day.

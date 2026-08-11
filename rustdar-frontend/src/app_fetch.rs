@@ -81,6 +81,39 @@ impl super::App {
         });
     }
 
+    /// Refresh the cached network site catalogue, once per launch, detached.
+    ///
+    /// # Nothing here is on the critical path, by construction
+    ///
+    /// The table has already been resolved from the *cached* catalogue by the
+    /// time this runs — see `App::new` — so this fetch changes nothing about
+    /// this session. It writes the cache and the next launch reads it. A
+    /// failure is therefore not a degraded mode: the app was already running on
+    /// the cache plus the compiled-in seed, and stays there.
+    ///
+    /// That is also why there is no timeout of its own beyond the request's, no
+    /// retry, and no spinner. A refresh that takes a minute on a bad link, or
+    /// never lands because the machine is offline, is indistinguishable from
+    /// one that landed instantly — which is what makes "resolution before first
+    /// paint" and "a catalogue from the network" compatible at all.
+    ///
+    /// # Once, and not per poll
+    ///
+    /// Two requests, ~11 KB and ~22 KB gzipped, at launch. The thing being
+    /// fetched is which radars exist and where — a set that changes when a
+    /// radar is commissioned or relocated, which is a step function that steps
+    /// a few times a decade. Anything more often would re-download the same
+    /// answer.
+    pub(super) fn spawn_site_catalogue_refresh(&self) {
+        let sender = self.channels.site_catalogue_sender.clone();
+        let window = self.window.clone();
+        self.spawn_detached(async move {
+            let catalogue = rustdar_radar::catalogue::fetch(&Default::default()).await;
+            let _ = sender.send(crate::channels::SiteCatalogueResponse { catalogue });
+            super::notify_redraw(&window);
+        });
+    }
+
     /// Spawn an async radar data fetch on the background runtime.
     /// Handles generation tracking, result sending, and redraw requests.
     pub fn spawn_fetch(&mut self, site: String, timestamp: NaiveDateTime) {

@@ -1,0 +1,137 @@
+//! Where the fetched network catalogue is kept between launches.
+//!
+//! [`rustdar_radar::catalogue`] decides *what* the catalogue is; this decides
+//! where it lives on each platform and when it is read and written. The split
+//! is the one [`crate::site_positions`] already makes and for the same reason:
+//! [`ConfigStore`] is a `rustdar-egui` type, and `rustdar-radar` must not learn
+//! that this crate exists.
+//!
+//! # The cache is what the app actually runs on
+//!
+//! The requirement above everything else here is that resolution happens
+//! **before the first paint** — a name or a position arriving late adds a map
+//! marker, adds a site-list row, and shifts a section's height datum under a
+//! user who is already looking at them, and reopening has to be exactly 1:1.
+//!
+//! A network fetch cannot meet that. So it does not try: the cache is read
+//! synchronously in `App::new`, beside the learned positions and ahead of any
+//! frame, and *that* is what resolves the table. The fetch runs detached
+//! afterwards, writes the cache, and is applied on the **next** launch. There
+//! is no path by which a response landing mid-session moves anything a user is
+//! looking at, which is why the fetch has no deadline and no bearing on
+//! startup: it can take a minute, or never finish, and the app is identical.
+//!
+//! One consequence stated plainly: a fresh install's first launch runs on the
+//! seed alone, and its second launch has the network. That is the cost of the
+//! 1:1 rule and it is the right way round — a first launch has no session to
+//! be consistent with, and every launch after it does.
+//!
+//! # Its own key, written synchronously
+//!
+//! Not `ui.json`. `App::autosave_config` writes that on a 3 s timer behind a
+//! string compare, and everything the user has configured rides in the one
+//! blob: a catalogue landing in the last three seconds of a session would be
+//! lost, and — much worse — one unreadable value in that blob costs *every*
+//! setting on the next load. Its own key bounds the blast radius of a corrupt
+//! entry to this map, whereupon the app degrades to the seed and nothing else
+//! notices.
+//!
+//! Integers throughout, for the reason [`rustdar_radar::site_position`] gives:
+//! `serde_json` writes a non-finite float as `null` and `null` then fails to
+//! deserialize on the *next* load, so one bad `f64` costs the whole record a
+//! run after the bug. Every field of a [`CataloguePosition`] is an `i32`, so
+//! there is nothing to filter and nothing to remember to filter.
+//!
+//! No TTL. A published station position is a step function that steps once a
+//! decade, and the fetch already refreshes the cache on every launch that has a
+//! network — so a TTL could only ever throw away a good answer for a worse one.
+
+use rustdar_egui::config_store::ConfigStore;
+use rustdar_radar::catalogue::SiteCatalogue;
+
+/// Key the fetched catalogue is persisted under.
+pub const SITE_CATALOGUE_KEY: &str = "site_catalogue";
+
+/// How many radars a stored catalogue may carry.
+///
+/// The live listing is ~210. This is four times that: reaching it means the
+/// stored blob is junk rather than that the network grew, and the cap exists so
+/// a store that somehow accumulates entries cannot grow without bound in a
+/// browser's `localStorage`, where the whole origin shares a few megabytes.
+const MAX_CATALOGUE_SITES: usize = 800;
+
+/// Read the cached catalogue, or an empty one.
+///
+/// **Called before the first volume is decoded and before the first frame** —
+/// see the module note. An unreadable or implausible blob is logged and
+/// dropped rather than propagated: the cost is one session on the seed, which
+/// is where the app was before any of this existed, and the fetch will replace
+/// it.
+pub fn load(store: Option<&dyn ConfigStore>) -> SiteCatalogue {
+    let Some(raw) = store.and_then(|store| store.load(SITE_CATALOGUE_KEY)) else {
+        return SiteCatalogue::default();
+    };
+    match serde_json::from_str::<SiteCatalogue>(&raw) {
+        Ok(catalogue) if catalogue.len() > MAX_CATALOGUE_SITES => {
+            log::warn!(
+                "ignoring a cached site catalogue of {} radars: the live \
+                 network is ~210, and {MAX_CATALOGUE_SITES} is four times it",
+                catalogue.len(),
+            );
+            SiteCatalogue::default()
+        }
+        Ok(catalogue) => catalogue,
+        // Worth saying rather than silently starting over: until the next
+        // fetch lands, this install is back on the compiled-in seed.
+        Err(e) => {
+            log::warn!("ignoring an unreadable cached site catalogue: {e}");
+            SiteCatalogue::default()
+        }
+    }
+}
+
+/// Write `catalogue` out **now**, replacing whatever was there.
+///
+/// Returns whether a write was attempted, which is also whether anything
+/// changed: a fetch that comes back with the catalogue already cached is the
+/// ordinary case, and rewriting the same ~15 KB blob into `localStorage` on
+/// every launch for a value that has not moved is a cost with no benefit.
+///
+/// Synchronous rather than deferred to the autosave tick, for the reason in the
+/// module note. A failed write is logged and dropped — a full `localStorage`
+/// must not stop the map from working, and the cost of losing it is one more
+/// launch on the seed.
+pub fn store_if_changed(
+    store: Option<&dyn ConfigStore>,
+    cached: &SiteCatalogue,
+    fetched: &SiteCatalogue,
+) -> bool {
+    if cached == fetched {
+        return false;
+    }
+    let Some(store) = store else {
+        return false;
+    };
+    // Cannot fail — every field is an `i32` or a `String`, which is the whole
+    // reason they are. Handled rather than unwrapped because a panic here
+    // would be a panic in a frame.
+    let json = match serde_json::to_string(fetched) {
+        Ok(json) => json,
+        Err(e) => {
+            log::warn!("could not serialize the fetched site catalogue: {e}");
+            return false;
+        }
+    };
+    if let Err(e) = store.store(SITE_CATALOGUE_KEY, &json) {
+        log::warn!("could not persist the fetched site catalogue: {e}");
+        return false;
+    }
+    log::info!(
+        "site catalogue cached: {} radars, applied on the next launch",
+        fetched.len(),
+    );
+    true
+}
+
+#[cfg(test)]
+mod tests;

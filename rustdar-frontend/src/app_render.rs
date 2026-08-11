@@ -171,6 +171,7 @@ impl super::App {
         self.poll_render_results(&ctx);
         self.poll_section_results(&ctx);
         self.poll_level3_results();
+        self.poll_site_catalogue();
         self.poll_overlay_render_results();
         self.poll_loop_scan_list_results();
         self.poll_loop_scan_download_results();
@@ -420,6 +421,39 @@ impl super::App {
         if pane_idx < self.render.pane_render.len() {
             self.render.pane_render[pane_idx].last_rendered =
                 Some((render.product, render.elevation));
+        }
+    }
+
+    /// Take the launch's one catalogue refresh and write it to the cache.
+    ///
+    /// **It is not applied to the live table**, and that is the whole design:
+    /// the table was resolved from the cached catalogue before the first frame,
+    /// and applying a fresh one here would add a map marker, add a site-list row
+    /// and shift a section's height datum under a user who is already looking at
+    /// them. The refresh is for the *next* launch. See [`crate::site_catalogue`].
+    ///
+    /// Drains rather than taking one, like every sibling poller, even though
+    /// exactly one message can ever arrive: a poller that leaves a message in
+    /// the queue is a poller that needs another frame to come, and the frame
+    /// after a startup fetch is not guaranteed.
+    fn poll_site_catalogue(&mut self) {
+        while let Ok(response) = self.channels.site_catalogue_receiver.try_recv() {
+            // A failed fetch is silent by design — offline is not an error
+            // state here, it is a launch that runs on the cache. `catalogue`
+            // has already logged the reason at `debug`.
+            let Some(fetched) = response.catalogue else {
+                continue;
+            };
+            let store = self.platform.config_store();
+            if crate::site_catalogue::store_if_changed(
+                store.as_deref(),
+                &self.site_catalogue,
+                &fetched,
+            ) {
+                // Kept in step so a second refresh in the same session — there
+                // is none today — would not rewrite the blob it just wrote.
+                self.site_catalogue = fetched;
+            }
         }
     }
 

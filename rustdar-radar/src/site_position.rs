@@ -135,11 +135,12 @@ impl SitePosition {
             return None;
         }
         Some(Self {
-            // `round` before `as`: the saturating cast would otherwise be the
-            // only thing standing between a bad float and the integer, and the
-            // checks above already mean it can never be reached.
-            lat_udeg: (lat * MICRO_DEGREES_PER_DEGREE).round() as i32,
-            lon_udeg: (lon * MICRO_DEGREES_PER_DEGREE).round() as i32,
+            // `round` before `as` inside `micro_from_degrees`: the saturating
+            // cast would otherwise be the only thing standing between a bad
+            // float and the integer, and the checks above already mean it can
+            // never be reached.
+            lat_udeg: micro_from_degrees(lat),
+            lon_udeg: micro_from_degrees(lon),
             site_height_m: i32::from(site.height_meters()),
             tower_height_m: i32::from(site.tower_height_meters()),
         })
@@ -147,12 +148,12 @@ impl SitePosition {
 
     /// Latitude in degrees.
     pub fn lat(&self) -> f64 {
-        f64::from(self.lat_udeg) / MICRO_DEGREES_PER_DEGREE
+        degrees_from_micro(self.lat_udeg)
     }
 
     /// Longitude in degrees.
     pub fn lon(&self) -> f64 {
-        f64::from(self.lon_udeg) / MICRO_DEGREES_PER_DEGREE
+        degrees_from_micro(self.lon_udeg)
     }
 
     /// This position's heights, keeping `table`'s finer figures wherever the
@@ -245,8 +246,36 @@ impl SitePosition {
     }
 }
 
+/// Degrees from a micro-degree count.
+///
+/// The one place the division happens, so
+/// [`SiteFix::Network`](crate::sites::SiteFix::Network) — which carries
+/// micro-degrees without carrying a whole [`SitePosition`] — cannot land on a
+/// different last decimal place than a learned position does.
+pub(crate) fn degrees_from_micro(udeg: i32) -> f64 {
+    f64::from(udeg) / MICRO_DEGREES_PER_DEGREE
+}
+
+/// A micro-degree count from degrees, rounded.
+///
+/// The inverse of [`degrees_from_micro`], and the boundary
+/// [`crate::catalogue::parse_stations`] crosses: it is the same conversion
+/// [`SitePosition::from_volume`] does, kept in one place so a position learned
+/// from a volume and the same position read from the station record round to
+/// the same integer.
+///
+/// Callers must range-check first — this saturates rather than wrapping, but a
+/// saturated value is still a coordinate nobody measured.
+pub(crate) fn micro_from_degrees(degrees: f64) -> i32 {
+    (degrees * MICRO_DEGREES_PER_DEGREE).round() as i32
+}
+
 /// Feet MSL from a whole-metre figure the archive truncated.
-fn feet_from_metres(m: i32) -> i32 {
+///
+/// `pub(crate)` for `SiteFix::applied`, which converts a catalogue's feedhorn
+/// metres the same way — the published record quotes whole metres exactly as
+/// the Volume Data Block does.
+pub(crate) fn feet_from_metres(m: i32) -> i32 {
     (f64::from(m) / METRES_PER_FOOT).round() as i32
 }
 

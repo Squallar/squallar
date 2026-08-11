@@ -42,6 +42,7 @@
 
 use rustdar_egui::config_store::ConfigStore;
 use rustdar_radar::site_position::SitePosition;
+use rustdar_radar::sites::SiteFix;
 use std::collections::BTreeMap;
 
 /// Key the learned positions are persisted under.
@@ -129,6 +130,22 @@ impl SitePositions {
         self.known
             .iter()
             .map(|(site, position)| (site.as_str(), *position))
+    }
+
+    /// The same entries, labelled with the authority they carry.
+    ///
+    /// This is what [`sites::resolve`](rustdar_radar::sites::resolve) takes now
+    /// that more than one source can speak. A caller chains this onto the
+    /// fetched catalogue's fixes and hands the stream over as one; the label is
+    /// what makes the order of that chain irrelevant, so neither source has to
+    /// know the other exists.
+    ///
+    /// [`SiteFix::Learned`] and not a bare position because these came from a
+    /// volume: they carry a Volume Data Block's two separately-reported
+    /// heights, and outrank anything the network can say.
+    pub fn fixes(&self) -> impl Iterator<Item = (&str, SiteFix)> {
+        self.iter()
+            .map(|(site, position)| (site, SiteFix::Learned(position)))
     }
 
     /// Remember what a volume just said, and write it out **now**.

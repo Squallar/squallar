@@ -1,0 +1,90 @@
+{
+  "@context": ["https://geojson.org/geojson-ld/geojson-context.jsonld"],
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "id": "https://api.weather.gov/radar/stations/KTLX",
+      "type": "Feature",
+      "geometry": { "type": "Point", "coordinates": [-97.2775, 35.33334] },
+      "properties": {
+        "id": "KTLX",
+        "name": "Oklahoma City",
+        "stationType": "WSR-88D",
+        "elevation": { "unitCode": "wmoUnit:m", "value": 370.0 },
+        "timeZone": "America/Chicago"
+      }
+    },
+    {
+      "id": "https://api.weather.gov/radar/stations/KOAX",
+      "type": "Feature",
+      "geometry": { "type": "Point", "coordinates": [-96.36683, 41.32028] },
+      "properties": {
+        "id": "KOAX",
+        "name": "Omaha",
+        "stationType": "WSR-88D",
+        "elevation": { "unitCode": "wmoUnit:m", "value": 349.9 },
+        "timeZone": "America/Chicago"
+      }
+    },
+    {
+      "id": "https://api.weather.gov/radar/stations/KRAX",
+      "type": "Feature",
+      "geometry": { "type": "Point", "coordinates": [-78.48975, 35.66552] },
+      "properties": {
+        "id": "KRAX",
+        "name": "Raleigh/Durham",
+        "stationType": "WSR-88D",
+        "elevation": { "unitCode": "wmoUnit:m", "value": 106.07 },
+        "timeZone": "America/New_York"
+      }
+    },
+    {
+      "id": "https://api.weather.gov/radar/stations/TDJT",
+      "type": "Feature",
+      "geometry": { "type": "Point", "coordinates": [-80.27306, 26.68806] },
+      "properties": {
+        "id": "TDJT",
+        "name": "Palm Beach",
+        "stationType": "TDWR",
+        "elevation": { "unitCode": "wmoUnit:m", "value": 6.0 },
+        "timeZone": "America/New_York"
+      }
+    },
+    {
+      "id": "https://api.weather.gov/radar/stations/PAPD",
+      "type": "Feature",
+      "geometry": { "type": "Point", "coordinates": [-147.50143, 65.03511] },
+      "properties": {
+        "id": "PAPD",
+        "name": "Fairbanks/Pedro Dome",
+        "stationType": "WSR-88D",
+        "elevation": { "unitCode": "wmoUnit:m", "value": null },
+        "timeZone": "America/Anchorage"
+      }
+    },
+    {
+      "id": "https://api.weather.gov/radar/stations/KFTG",
+      "type": "Feature",
+      "geometry": { "type": "Point", "coordinates": [-104.54581, 39.78664] },
+      "properties": {
+        "id": "KFTG",
+        "name": "Denver",
+        "stationType": "WSR-88D",
+        "elevation": { "unitCode": "wmoUnit:ft", "value": 5497.0 },
+        "timeZone": "America/Denver"
+      }
+    },
+    {
+      "id": "https://api.weather.gov/radar/stations/KABR",
+      "type": "Feature",
+      "geometry": null,
+      "properties": {
+        "id": "KABR",
+        "name": "Aberdeen",
+        "stationType": "WSR-88D",
+        "elevation": { "unitCode": "wmoUnit:m", "value": 396.8 },
+        "timeZone": "America/Chicago"
+      }
+    }
+  ]
+}

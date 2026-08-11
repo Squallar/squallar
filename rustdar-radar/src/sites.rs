@@ -57,7 +57,11 @@ pub enum SiteHeights {
     FeedhornOnly { feedhorn_ft: i32 },
 }
 
-#[derive(Debug, Clone)]
+/// `PartialEq` because [`extended`] compares the row a fix would produce
+/// against the row already in the table, and builds nothing when they are
+/// equal. Without that comparison every startup would leak a fresh copy of the
+/// whole table for a catalogue that had not changed since the last one.
+#[derive(Debug, Clone, PartialEq)]
 pub struct RadarSite {
     pub name: &'static str,
     pub lat: f64,
@@ -1990,79 +1994,254 @@ impl SiteTable {
     }
 }
 
-/// [`SEED`] plus a row for every radar in `learned` that the seed has never
-/// heard of.
+/// How much authority one [`SiteFix`] carries, as a value that can be compared.
+///
+/// **A smaller variant outranks a larger one**, matching
+/// [`SitePositionSource`](crate::site_position::SitePositionSource), whose
+/// order this continues. Put end to end the two make one ladder, and it is the
+/// design:
+///
+/// ```text
+/// Volume   the volume in hand   ScanInfo::from_scan     SitePositionSource
+/// Learned  an earlier volume    SiteFix::Learned        SiteFixRank
+/// Network  the fetched catalogue    SiteFix::Network    SiteFixRank
+/// Seed     the compiled-in SEED     (not a fix)         — the base table
+/// ```
+///
+/// The bottom rung has no variant on purpose: the seed is not something a
+/// caller can *supply*, it is the table a fix is applied **to**. So "Network
+/// beats Seed" is not a comparison this enum makes — it is the fact that a
+/// fix replaces the row it lands on. `the_precedence_is_volume_learned_network_seed`
+/// pins all four rungs together as one table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SiteFixRank {
+    /// A volume this install decoded in an earlier session said so.
+    Learned,
+    /// The fetched network catalogue said so.
+    Network,
+}
+
+/// One source's claim about where one radar is: the shape [`build_table`] and
+/// [`resolve`] take.
+///
+/// # Why this is not a bare `SitePosition` any more
+///
+/// It was, while a volume this install had decoded was the only thing that
+/// could contradict the seed. A [`SitePosition`] is specifically *a Volume Data
+/// Block's four fields* — position in micro-degrees plus `site_height` and
+/// `tower_height` as two separately-reported whole metres — and reading a
+/// published station record into that shape would have had to invent a tower.
+///
+/// The network catalogue is a second source, and it differs from a volume in
+/// both directions:
+///
+/// * it has **less** height information — one elevation, on the feedhorn, with
+///   no separable tower — so it can never fill a
+///   [`SiteHeights::BaseAndTower`] and must never overwrite one; and
+/// * it has **less authority** — it is a record about the radar rather than a
+///   report from it — so where both sources speak the volume wins.
+///
+/// A tuple of numbers could say neither. Naming the source says both, which is
+/// what the widening buys: [`rank`](Self::rank) makes the precedence a value,
+/// and [`applied`](Self::applied) makes each source's height provenance a
+/// branch instead of a convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SiteFix {
+    /// What a volume this install decoded stated about itself, remembered
+    /// across sessions. Carries the Volume Data Block's own fields, so it can
+    /// speak to both height datums and be adjudicated against a seeded row's
+    /// finer feet by [`SitePosition::heights_over`].
+    Learned(SitePosition),
+    /// What the fetched catalogue says: a position, and **one** elevation.
+    ///
+    /// The elevation is on the feedhorn. `api.weather.gov/radar/stations`
+    /// agrees with the seed — whose figures were read out of the volumes — to
+    /// a median of 1.5 m with no row past 187 m, and agrees with the *feedhorn*
+    /// wherever a WSR-88D lets the two be told apart. There is no tower figure
+    /// and none can be derived, which is why this is one number and not two.
+    Network {
+        /// Latitude, micro-degrees north.
+        lat_udeg: i32,
+        /// Longitude, micro-degrees east.
+        lon_udeg: i32,
+        /// Feedhorn height, whole metres MSL.
+        feedhorn_m: i32,
+    },
+}
+
+impl SiteFix {
+    /// How much authority this claim carries. See [`SiteFixRank`].
+    pub fn rank(&self) -> SiteFixRank {
+        match self {
+            Self::Learned(_) => SiteFixRank::Learned,
+            Self::Network { .. } => SiteFixRank::Network,
+        }
+    }
+
+    /// The row a radar called `name` becomes under this fix, given whatever
+    /// heights the row it is displacing already recorded.
+    ///
+    /// `known` is `None` for a radar the base table has never heard of.
+    ///
+    /// # Position always moves; heights only improve
+    ///
+    /// Both arms take the fix's position outright — that is what a fix is for.
+    /// They differ on heights, because their provenance differs:
+    ///
+    /// * **Learned** goes through [`SitePosition::heights_over`], which keeps
+    ///   `known`'s finer foot figures wherever the volume's whole metre cannot
+    ///   contradict them, and takes the volume's where it can.
+    /// * **Network** keeps `known` untouched whenever there is one. Its single
+    ///   feedhorn metre is strictly less than a `BaseAndTower` row already
+    ///   holds, so overwriting would *lose* the base datum — every
+    ///   [`Datum::SiteBase`] query in the process would start answering `None`
+    ///   the first time a catalogue landed. It fills in only where the row had
+    ///   nothing, which is exactly the radar the seed never had.
+    ///
+    /// # Every row this produces records an elevation
+    ///
+    /// `heights` is `Some` on both arms and for both values of `known`, which
+    /// is what keeps `every_site_records_an_elevation` true over arrivals as
+    /// well as seeded rows. A row without one anchors a cross-section at sea
+    /// level, which reads as a measurement rather than as a gap — 292 ft of it
+    /// at `KLWX`.
+    fn applied(&self, name: &'static str, known: Option<SiteHeights>) -> RadarSite {
+        match *self {
+            Self::Learned(position) => position.applied_to_named(name, known),
+            Self::Network {
+                lat_udeg,
+                lon_udeg,
+                feedhorn_m,
+            } => RadarSite {
+                name,
+                lat: crate::site_position::degrees_from_micro(lat_udeg),
+                lon: crate::site_position::degrees_from_micro(lon_udeg),
+                heights: known.or(Some(SiteHeights::FeedhornOnly {
+                    feedhorn_ft: crate::site_position::feet_from_metres(feedhorn_m),
+                })),
+            },
+        }
+    }
+}
+
+/// [`SEED`], with every radar in `fixes` moved onto what its strongest fix
+/// says and a row added for every radar the seed has never heard of.
 ///
 /// This is the whole point of the exercise. A radar commissioned after this
 /// binary was built used to be unnameable: `get_radar_site` answered `None`,
 /// so `applied_to` fell back to [`UNKNOWN_SITE_NAME`], the map drew no marker
 /// and the site list had no row. It reaches the user as a real row here,
-/// because the position was learned from its own volume and the name is the
-/// key that position was filed under.
+/// because something outside the binary knows where it is and the name is the
+/// key that knowledge was filed under.
 ///
-/// # Why a site the seed *does* know keeps its seeded row
+/// # A fix now displaces a seeded row, where it used to be ignored
 ///
-/// Not an oversight. A learned position already outranks the table where it
-/// counts: `SitePositionSource` orders them `Volume` → `Learned` → `Table`,
-/// pinned by `the_precedence_is_volume_then_learned_then_table`, and
-/// `ScanInfo::from_scan` consults the cache directly. Applying it here as well
-/// would put one correction in two places. The table's job in that order is to
-/// be the *fallback* — what is known about a radar when nothing else knows
-/// anything — and for a seeded radar the fallback is the seeded row.
+/// It did not, while the only fix was a learned one: a learned position already
+/// outranks the table inside `ScanInfo::from_scan`, so applying it here as well
+/// put one correction in two places, and the table's job was to be the
+/// *fallback*.
 ///
-/// What the table genuinely cannot express, and what nothing else can supply,
-/// is a row that does not exist. So that is what this adds, and only that.
+/// That stopped being tenable when the catalogue arrived. The catalogue is
+/// current where the seed is a snapshot of one day, and stage 4 deletes the
+/// seed outright — so if a fix could not move a seeded row, every seeded radar
+/// would keep its build-day position until the seed vanished and then jump.
+/// Deleting the seed has to be a *deletion*, not a behaviour change, and that
+/// only holds if the fix was already winning while the seed was still there.
+///
+/// The double-application that motivated the old rule is harmless, and checked:
+/// `heights_over`'s adjudication is idempotent, so a learned fix landing on a
+/// row a learned fix already produced yields that same row, `extended` sees no
+/// change, and nothing is rebuilt.
+///
+/// # The strongest fix per radar wins, and only that one is applied
+///
+/// `fixes` is a flat stream from every source at once — that is what lets a
+/// caller `chain` its learned cache onto its catalogue without either knowing
+/// about the other. Where two of them name the same radar, [`SiteFixRank`]
+/// decides, once, before anything is built. A fetched position therefore never
+/// reaches a row a learned one also claims: it is not overwritten afterwards,
+/// it is never applied.
 ///
 /// # The name is leaked
 ///
-/// [`RadarSite::name`] is `&'static str` and a four-byte identifier read out
-/// of a volume header at runtime is not, so it is leaked — a handful of bytes
-/// per radar beyond the seed that this install has ever opened, bounded
-/// upstream by `MAX_REMEMBERED_SITES`.
-///
-/// # An added row always records an elevation
-///
-/// It takes the volume's heights through [`SitePosition::heights_over`], which
-/// always yields some [`SiteHeights`]. So `every_site_records_an_elevation`
-/// holds over a learned row for the same reason it holds over a seeded one,
-/// and that matters: a row without one anchors a cross-section at sea level,
-/// which reads as a measurement rather than as a gap.
-pub fn build_table<'a, I>(learned: I) -> &'static SiteTable
+/// [`RadarSite::name`] is `&'static str` and a four-byte identifier read out of
+/// a volume header or a JSON body at runtime is not, so an *arrival*'s name is
+/// leaked — a handful of bytes per radar beyond the seed, bounded by the
+/// catalogue's own size. A radar the base already has keeps the `&'static str`
+/// it already had, so a fix landing on an existing row leaks no name at all.
+pub fn build_table<'a, I>(fixes: I) -> &'static SiteTable
 where
-    I: IntoIterator<Item = (&'a str, SitePosition)>,
+    I: IntoIterator<Item = (&'a str, SiteFix)>,
 {
-    extended(seed_table(), learned).unwrap_or_else(seed_table)
+    extended(seed_table(), fixes).unwrap_or_else(seed_table)
 }
 
-/// `base` plus the radars in `learned` it does not have, or `None` if it
-/// already has all of them.
+/// `base` with `fixes` applied, or `None` if applying them would change
+/// nothing.
 ///
-/// `None` rather than an identical copy so the common resolution — an install
-/// that has learned nothing beyond the seed, which is every fresh install and
-/// every test that builds an app against an empty store — reuses the table it
-/// already has instead of leaking another 207 rows beside it.
-fn extended<'a, I>(base: &'static SiteTable, learned: I) -> Option<&'static SiteTable>
+/// `None` rather than an identical copy so a resolution that says nothing new —
+/// an install that has learned nothing and fetched nothing, every fresh
+/// install, every test that builds an app against an empty store, and every
+/// *second* resolution against an unchanged catalogue cache — reuses the table
+/// it already has instead of leaking another 207 rows beside it. That last case
+/// is why the comparison is against the produced row and not merely against the
+/// set of names: Android resolves twice with the same cache, and a name-only
+/// check would leak a whole table on the second call.
+fn extended<'a, I>(base: &'static SiteTable, fixes: I) -> Option<&'static SiteTable>
 where
-    I: IntoIterator<Item = (&'a str, SitePosition)>,
+    I: IntoIterator<Item = (&'a str, SiteFix)>,
 {
-    let mut rows: Vec<RadarSite> = Vec::new();
-    let mut added: HashMap<&'a str, ()> = HashMap::new();
-    for (name, position) in learned {
-        // `added` as well as `base`, so two entries for the same unseeded
-        // radar file one row rather than two radars of the same name.
-        if base.get(name).is_some() || added.insert(name, ()).is_some() {
-            continue;
+    // The strongest claim per radar, decided before a row is built. Doing it
+    // here rather than while walking the rows is what makes "a fetched position
+    // never outranks a learned one" a property of the *input* rather than of
+    // the order two loops happened to run in.
+    let mut best: HashMap<&'a str, SiteFix> = HashMap::new();
+    for (name, fix) in fixes {
+        match best.entry(name) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(fix);
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                if fix.rank() < slot.get().rank() {
+                    slot.insert(fix);
+                }
+            }
         }
-        let name: &'static str = Box::leak(name.to_owned().into_boxed_str());
-        rows.push(position.applied_to_named(name, None));
     }
-    if rows.is_empty() {
+    if best.is_empty() {
         return None;
     }
 
-    let mut all: Vec<RadarSite> = base.rows().to_vec();
-    all.append(&mut rows);
-    let rows: &'static [RadarSite] = Box::leak(all.into_boxed_slice());
+    let mut rows: Vec<RadarSite> = base.rows().to_vec();
+    let mut changed = false;
+    for row in &mut rows {
+        // `remove`, so what is left in `best` afterwards is exactly the set of
+        // radars this table has never heard of.
+        if let Some(fix) = best.remove(row.name) {
+            let next = fix.applied(row.name, row.heights);
+            if next != *row {
+                *row = next;
+                changed = true;
+            }
+        }
+    }
+
+    // Sorted, so a table resolved from the same inputs is the same table
+    // whichever order a `HashMap` felt like iterating in. Nothing addresses a
+    // row by position, but a table that varies run to run is one no test can
+    // pin.
+    let mut arrivals: Vec<(&'a str, SiteFix)> = best.into_iter().collect();
+    arrivals.sort_unstable_by_key(|(name, _)| *name);
+    for (name, fix) in arrivals {
+        let name: &'static str = Box::leak(name.to_owned().into_boxed_str());
+        rows.push(fix.applied(name, None));
+        changed = true;
+    }
+    if !changed {
+        return None;
+    }
+
+    let rows: &'static [RadarSite] = Box::leak(rows.into_boxed_slice());
     let by_name = rows.iter().map(|row| (row.name, row)).collect();
     Some(Box::leak(Box::new(SiteTable { rows, by_name })))
 }
@@ -2115,24 +2294,33 @@ pub fn table() -> &'static SiteTable {
 /// discarded every learned position on the one platform that needs the second
 /// call.
 ///
-/// # Resolution only ever adds radars
+/// # Resolution never forgets a radar
 ///
 /// Each call extends the table already in hand rather than rebuilding from
-/// [`SEED`], so the process can learn about a radar but never forget one. Two
-/// consequences worth naming:
+/// [`SEED`], so the process can learn about a radar but never lose one, and a
+/// later resolution with nothing to say cannot undo an earlier one that had
+/// something. That is what the Android pair needs: `App::new` resolves with no
+/// store at all and `set_config_dir` resolves with the real one.
 ///
-/// * A resolution that learns nothing new is a genuine no-op — it does not
-///   even take the write lock — so the common startup costs nothing and
-///   cannot undo an earlier one.
-/// * No row ever moves. A `&'static RadarSite` handed out before a resolution
-///   keeps naming the radar it named, and so does the row at any given
-///   position. That last part is a happy accident and **not** something to
-///   lean on: the table gets longer, so an index minted against one table
-///   still means nothing against a later one, which is why nothing outside
-///   this module can reach the rows by position at all.
-pub fn resolve<'a, I>(learned: I) -> &'static SiteTable
+/// A resolution that changes nothing is a genuine no-op — it does not even
+/// take the write lock — so the common startup costs nothing.
+///
+/// # Rows do move
+///
+/// They did not before the catalogue existed, when a fix could only *add*. Now
+/// a fix displaces the row it lands on (see [`build_table`]), so a
+/// `&'static RadarSite` taken before a resolution keeps naming the radar it
+/// named but may describe where that radar was believed to be a moment
+/// earlier. That is not a hazard in practice and must not become one: both
+/// call sites run before the first frame, precisely so that no row can move
+/// under a user who is already looking at it.
+///
+/// An index into [`radars()`] was never valid across a resolution and still is
+/// not, which is why nothing outside this module can reach the rows by
+/// position at all.
+pub fn resolve<'a, I>(fixes: I) -> &'static SiteTable
 where
-    I: IntoIterator<Item = (&'a str, SitePosition)>,
+    I: IntoIterator<Item = (&'a str, SiteFix)>,
 {
     // The write lock is held across the read *and* the build, not just the
     // store. Reading the current table, extending it and then storing it as
@@ -2143,7 +2331,7 @@ where
     // microseconds it has.
     let mut resolved = RESOLVED.write().unwrap_or_else(|e| e.into_inner());
     let current = resolved.unwrap_or_else(seed_table);
-    match extended(current, learned) {
+    match extended(current, fixes) {
         Some(extended) => {
             *resolved = Some(extended);
             extended
@@ -2716,12 +2904,12 @@ mod nearest_tests {
     /// so "the search found the added row" cannot be confused with "the search
     /// found something else nearby".
     const UNSEEDED: &str = "ZZZZ";
-    const REMOTE: SitePosition = SitePosition {
+    const REMOTE: SiteFix = SiteFix::Learned(SitePosition {
         lat_udeg: -30_000_000,
         lon_udeg: -140_000_000,
         site_height_m: 100,
         tower_height_m: 20,
-    };
+    });
 
     /// A table built over the seed carries a radar the seed has never heard
     /// of, and carries it as a *radar* — named, placed and elevated.
@@ -2801,31 +2989,95 @@ mod nearest_tests {
         assert_eq!(okc.name, "KTLX", "adding a radar must not move the others");
     }
 
-    /// A radar the seed *does* carry keeps its seeded row.
+    /// A radar the seed *does* carry takes the fix that lands on it, in place.
     ///
-    /// Deliberate, and documented on [`build_table`]: a learned position
-    /// already outranks the table through `SitePositionSource`, so applying it
-    /// here as well would put one correction in two places. The table is the
-    /// fallback, and for a seeded radar the fallback is the seeded row.
+    /// It used to keep its seeded row, on the argument that a learned position
+    /// already outranked the table inside `ScanInfo::from_scan` and applying it
+    /// here too would put one correction in two places. The catalogue ended
+    /// that: it is current where the seed is a snapshot, and stage 4 deletes
+    /// the seed outright — so a fix that could not move a seeded row would let
+    /// every seeded radar keep its build-day position until the seed vanished
+    /// and then jump. See [`build_table`].
+    ///
+    /// **In place**, not appended: two rows of one name is the
+    /// `TOK2`/`DOP1` failure, where which one a nearest-search answers with is
+    /// arbitrary.
     #[test]
-    fn a_seeded_radar_keeps_its_seeded_row() {
+    fn a_seeded_radar_takes_the_fix_that_lands_on_it() {
         let seeded = seed_table().get("KTLX").expect("KTLX is a seed row");
-        let elsewhere = SitePosition {
+        let elsewhere = SiteFix::Learned(SitePosition {
             lat_udeg: 100_000,
             lon_udeg: 100_000,
             site_height_m: 1,
             tower_height_m: 1,
-        };
+        });
 
         let table = build_table([("KTLX", elsewhere)]);
 
         let after = table.get("KTLX").expect("still there");
-        assert_eq!((after.lat, after.lon), (seeded.lat, seeded.lon));
+        assert_eq!((after.lat, after.lon), (0.1, 0.1), "it moved");
+        assert_ne!((after.lat, after.lon), (seeded.lat, seeded.lon));
         assert_eq!(
             table.rows().len(),
             seed_table().rows().len(),
             "and nothing was appended beside it",
         );
+        assert_eq!(
+            table.rows().iter().filter(|r| r.name == "KTLX").count(),
+            1,
+            "one row per radar, whatever moved it",
+        );
+    }
+
+    /// A fetched fix that agrees with the row it lands on builds nothing.
+    ///
+    /// The cheap half of the 1:1 rule and the reason `RadarSite` is
+    /// `PartialEq`: Android resolves twice from the same cached catalogue, and
+    /// a rebuild there would leak a whole table — every row of it — for a
+    /// catalogue that had not changed since the last call.
+    #[test]
+    fn a_fix_that_changes_nothing_reuses_the_table() {
+        let ktlx = seed_table().get("KTLX").expect("a seed row");
+        let identical = SiteFix::Network {
+            lat_udeg: crate::site_position::micro_from_degrees(ktlx.lat),
+            lon_udeg: crate::site_position::micro_from_degrees(ktlx.lon),
+            // Whatever the row already records wins, so this is ignored.
+            feedhorn_m: 1,
+        };
+
+        let table = build_table([("KTLX", identical)]);
+        assert!(
+            std::ptr::eq(table.rows(), seed_table().rows()),
+            "a fix that reproduces the row it lands on must not build a table",
+        );
+    }
+
+    /// The catalogue can move a seeded row without taking its base datum.
+    ///
+    /// A `SiteFix::Network` carries one feedhorn metre where the row carries a
+    /// base and a tower in feet. Overwriting would make every
+    /// [`Datum::SiteBase`] query in the process answer `None` the first time a
+    /// catalogue landed — a silent, whole-network loss with no failing call.
+    #[test]
+    fn a_network_fix_moves_a_row_and_leaves_its_heights_alone() {
+        let seeded = seed_table().get("KDDC").expect("a seed row");
+        let table = build_table([(
+            "KDDC",
+            SiteFix::Network {
+                lat_udeg: -30_000_000,
+                lon_udeg: -140_000_000,
+                feedhorn_m: 1,
+            },
+        )]);
+
+        let after = table.get("KDDC").expect("still there");
+        assert_eq!(
+            (after.lat, after.lon),
+            (-30.0, -140.0),
+            "the position moved"
+        );
+        assert_eq!(after.heights, seeded.heights, "the heights did not");
+        assert!(after.height_ft(Datum::SiteBase).is_some());
     }
 
     /// Two entries for one unseeded radar file one row, not two radars of the

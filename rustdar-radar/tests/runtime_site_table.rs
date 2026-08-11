@@ -22,7 +22,7 @@
 //! ran first, and a test that cannot fail reliably is worse than no test.
 
 use rustdar_radar::site_position::SitePosition;
-use rustdar_radar::sites::{self, Datum};
+use rustdar_radar::sites::{self, Datum, SiteFix};
 
 /// A position in the middle of the South Pacific, ~5000 km from the nearest
 /// real radar.
@@ -31,13 +31,13 @@ use rustdar_radar::sites::{self, Datum};
 /// confused with it answering with something genuinely nearby, and far enough
 /// from every other identifier used here that they cannot answer for each
 /// other.
-fn remote(lat_udeg: i32, lon_udeg: i32) -> SitePosition {
-    SitePosition {
+fn remote(lat_udeg: i32, lon_udeg: i32) -> SiteFix {
+    SiteFix::Learned(SitePosition {
         lat_udeg,
         lon_udeg,
         site_height_m: 100,
         tower_height_m: 20,
-    }
+    })
 }
 
 /// The refactor's whole point, through the production lookup.

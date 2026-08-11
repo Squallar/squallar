@@ -368,6 +368,23 @@ pub struct SoundingResponse {
     pub heights: Option<rustdar_radar::sounding::EnvHeights>,
 }
 
+/// The network site catalogue, once the launch's one refresh has landed.
+///
+/// It exists to be **written to the cache**, not applied: the table was
+/// resolved from the cached catalogue before the first frame and is
+/// deliberately not re-resolved from this. See [`crate::site_catalogue`].
+///
+/// The trip through a channel is not ceremony. `PlatformBridge::config_store`
+/// hands out a `Box<dyn ConfigStore>`, which is neither `Send` nor something a
+/// detached future can hold, so the persist has to happen back on the thread
+/// that owns the app — which is also the thread holding the cached copy the
+/// write is compared against.
+pub struct SiteCatalogueResponse {
+    /// `None` when the fetch failed for any reason. The receiver keeps the
+    /// cache it already had; there is no retry, because the next launch is one.
+    pub catalogue: Option<rustdar_radar::catalogue::SiteCatalogue>,
+}
+
 /// Centralized channel hub for all async communication between the App and
 /// background tasks (network fetches, radar rendering, etc.).
 pub struct ChannelHub {
@@ -401,6 +418,8 @@ pub struct ChannelHub {
     pub chunk_receiver: Receiver<ChunkResponse>,
     pub sounding_sender: Sender<SoundingResponse>,
     pub sounding_receiver: Receiver<SoundingResponse>,
+    pub site_catalogue_sender: Sender<SiteCatalogueResponse>,
+    pub site_catalogue_receiver: Receiver<SiteCatalogueResponse>,
 }
 
 impl Default for ChannelHub {
@@ -426,6 +445,7 @@ impl ChannelHub {
         let (loop_section_sender, loop_section_receiver) = std::sync::mpsc::channel();
         let (sounding_sender, sounding_receiver) = std::sync::mpsc::channel();
         let (chunk_sender, chunk_receiver) = std::sync::mpsc::channel();
+        let (site_catalogue_sender, site_catalogue_receiver) = std::sync::mpsc::channel();
 
         Self {
             scan_sender,
@@ -458,6 +478,8 @@ impl ChannelHub {
             chunk_receiver,
             sounding_sender,
             sounding_receiver,
+            site_catalogue_sender,
+            site_catalogue_receiver,
         }
     }
 }

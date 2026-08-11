@@ -412,6 +412,17 @@ pub struct App {
     /// [`scan_info_learning_position`](Self::scan_info_learning_position).
     /// See [`crate::site_positions`].
     site_positions: crate::site_positions::SitePositions,
+    /// The network catalogue this install last cached: which radars exist, and
+    /// where the published record puts them.
+    ///
+    /// Loaded once, in [`App::new`], and — like the positions above — only ever
+    /// *applied* there, before the first frame. Kept on the app afterwards for
+    /// one purpose: when the detached refresh lands,
+    /// [`poll_site_catalogue`](Self::poll_site_catalogue) compares it against
+    /// this to decide whether the ~15 KB blob is worth rewriting. The live
+    /// table is deliberately **not** re-resolved from it. See
+    /// [`crate::site_catalogue`].
+    site_catalogue: rustdar_radar::catalogue::SiteCatalogue,
 }
 
 /// Bookkeeping for the periodic config write.
@@ -736,6 +747,13 @@ impl App {
         // Reloaded in `set_config_dir` for Android, which has no store yet.
         let site_positions =
             crate::site_positions::SitePositions::load(platform.config_store().as_deref());
+        // And the network catalogue this install last fetched, which is where
+        // the radars the compiled-in seed has never heard of come from. Read
+        // from the cache and never from the network on this path: a fetch
+        // cannot finish before the first frame, and one that landed mid-session
+        // would move a marker under the user. The refresh is spawned below and
+        // is applied on the *next* launch. See `crate::site_catalogue`.
+        let site_catalogue = crate::site_catalogue::load(platform.config_store().as_deref());
         // The same reasoning one level down: the *table* is resolved here too,
         // not on first use. A site the compiled-in seed has never heard of only
         // becomes nameable and drawable once this runs, so if it ran after the
@@ -743,7 +761,12 @@ impl App {
         // section its height datum, under a user already looking at them.
         // Resolving beside the load — before any frame exists — is what keeps
         // reopening exactly 1:1.
-        rustdar_radar::sites::resolve(site_positions.iter());
+        //
+        // Both sources in one stream. `SiteFix` carries which is which, so the
+        // order they are chained in decides nothing: a learned position
+        // outranks a fetched one wherever both exist, and `sites::extended`
+        // settles that before it builds a row.
+        rustdar_radar::sites::resolve(site_positions.fixes().chain(site_catalogue.fixes()));
 
         let mut app = Self {
             instance,
@@ -794,7 +817,15 @@ impl App {
             // `android_main`.
             location: LocationGate::new(),
             site_positions,
+            site_catalogue,
         };
+
+        // Detached, and deliberately after the table is already resolved: this
+        // refreshes the *cache*, for the next launch. Nothing it produces
+        // reaches the table this session, so a slow endpoint, a captive portal
+        // or no network at all is invisible here — the app is already running
+        // on the cache plus the seed by the time this is spawned.
+        app.spawn_site_catalogue_refresh();
 
         // Here, and not later, because "later" does not exist for two of the
         // bridge's producers: Android starts its theme poller from
@@ -2445,13 +2476,25 @@ impl App {
             // a returning user's learned positions are worth reading even on a
             // run where the UI config itself does not come back.
             self.site_positions = crate::site_positions::SitePositions::load(Some(store.as_ref()));
+            // And the cached catalogue, for the same reason: on Android this is
+            // the first moment there is a store to read it out of, so `App::new`
+            // resolved without it and every radar the seed never had is still
+            // missing until here.
+            self.site_catalogue = crate::site_catalogue::load(Some(store.as_ref()));
             // Re-resolved, not merely re-loaded. This is the resolution that
             // has anything to overlay on Android — `App::new` ran without a
             // store — and it is why the table is swappable rather than a
             // `OnceLock`: a one-shot resolve would have let the empty first
             // attempt win and silently discarded every learned position on the
             // one platform that needs this call.
-            rustdar_radar::sites::resolve(self.site_positions.iter());
+            //
+            // Still before the first paint: `android_main` calls this ahead of
+            // the event loop.
+            rustdar_radar::sites::resolve(
+                self.site_positions
+                    .fixes()
+                    .chain(self.site_catalogue.fixes()),
+            );
             if self.gui.load_ui_config(store.as_ref()) {
                 // A returning user on Android reaches the timezone guess before
                 // their stored site is readable, so the guess has to be undone

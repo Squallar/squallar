@@ -44,5 +44,6 @@ pub mod platform;
 #[cfg(test)]
 pub(crate) mod platform_double;
 pub mod render_dispatch;
+pub mod site_catalogue;
 pub mod site_positions;
 pub mod volume;

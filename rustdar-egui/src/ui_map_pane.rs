@@ -1994,9 +1994,10 @@ mod tests {
             tower_height_m: 20,
         };
         // Two radars no seed row carries, in the empty South Pacific.
+        let learned = rustdar_radar::sites::SiteFix::Learned;
         let bigger = rustdar_radar::sites::build_table([
-            ("ZZZY", position(-30_000_000, -140_000_000)),
-            ("ZZZX", position(-31_000_000, -141_000_000)),
+            ("ZZZY", learned(position(-30_000_000, -140_000_000))),
+            ("ZZZX", learned(position(-31_000_000, -141_000_000))),
         ]);
         let seeded = rustdar_radar::sites::build_table(std::iter::empty());
         assert_eq!(
