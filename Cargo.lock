@@ -2768,6 +2768,7 @@ dependencies = [
  "log",
  "nexrad-decode",
  "nexrad-model",
+ "rayon",
  "thiserror 2.0.20",
  "zerocopy",
 ]

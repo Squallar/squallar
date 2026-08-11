@@ -31,6 +31,24 @@ rustls = { workspace = true }
 # sequential stand-ins on the web — and is why this dependency is target-gated
 # rather than plain.
 rayon = "=1.12.0"
+# Fans `volume::File::scan()`'s per-LDM-record decompress-and-decode across the
+# pool (upstream's `volume/file.rs`: `into_par_iter` with the feature, plain
+# `into_iter` without). A super-res volume is 50–130 independently compressed
+# records, so the granularity is nearly perfect, and the feature changes only
+# *where* the records are decoded — the map is order-preserving and the results
+# are recombined in record order either way, so the `Scan` is identical.
+#
+# Target-gated for rayon's reason, not its own: the feature's only effect is to
+# pull rayon in, and rayon cannot build a pool in the browser.
+#
+# **This is not the application's decode path**, and the entry is worth no more
+# than it says. `scan::decoded` walks the records itself in one pass, because it
+# has to read each Message 31's declared Nyquist velocity before `into_radial`
+# throws it away; that walk is where a downloaded volume actually goes and it is
+# still serial. What this reaches is `File::scan()` — the upstream oracle
+# `scan::tests` pins that one-pass walk against, and anything outside this crate
+# that decodes a volume the ordinary way.
+nexrad-data = { workspace = true, features = ["parallel"] }
 
 # Gated, not plain `[dev-dependencies]`: `rt-multi-thread` is not one of the
 # features tokio accepts on wasm, and `--all-targets` builds dev-deps too, so an
