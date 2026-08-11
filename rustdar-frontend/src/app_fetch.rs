@@ -50,6 +50,31 @@ pub trait MaybeSend {}
 #[cfg(target_arch = "wasm32")]
 impl<T: ?Sized> MaybeSend for T {}
 
+/// Whether an RPG publishes the Level III objects this app fetches for `site`.
+///
+/// The fetch-side twin of the offering gate in
+/// `rustdar_radar::types::ScanInfo::from_scan`, and it has to exist separately:
+/// **not offering a product is not the same as not fetching it.**
+/// [`super::App::spawn_level3_fetches`] walks
+/// [`RadarProduct::level3_codes_for`] over the whole product table, not over
+/// what a pane offers, so without this a TDWR pane asked S3 for four objects
+/// that do not exist on every scan load and every poll — each a *doubled*
+/// request, since `crate::level3`'s day listing falls back to yesterday when
+/// today's prefix comes back empty — and filled the log with fetch-failed
+/// warnings for it.
+///
+/// Same rule as the offering gate, for the same reason: a TDWR's Supplemental
+/// Product Generator makes its own short list of products and none of
+/// `N0K`/`EET`/`DVL`/`DPR` (evidence recorded at the offering gate). A site that
+/// is not in `rustdar_radar::sites::radars()` at all fetches, which is what it
+/// did before this gate existed — an unrecognised id is far more likely to be a
+/// new WSR-88D than a TDWR. The table is resolved at runtime and can grow, so
+/// this asks it rather than a compiled-in array, and a site learned this
+/// session is gated on exactly the same rule as a seeded one.
+pub(super) fn site_offers_level3(site: &str) -> bool {
+    rustdar_radar::sites::get_radar_site(site).is_none_or(|radar| radar.is_wsr88d())
+}
+
 impl super::App {
     /// Spawn a detached future on whatever executor this target provides.
     ///
@@ -148,6 +173,10 @@ impl super::App {
     /// Spawn Level III product fetches for all supported Level III products.
     /// Called after a Level II scan loads so the products are available
     /// alongside the base moments.
+    ///
+    /// Two spawns, gated differently, and the split is the point: the sounding
+    /// goes out for every site, and the Level III objects only for a site
+    /// [`site_offers_level3`] says has an RPG behind it.
     pub(super) fn spawn_level3_fetches(&self, site: &str) {
         let generation = self
             .render
@@ -185,6 +214,13 @@ impl super::App {
                     }
                 });
             }
+        }
+        // The sounding above is deliberately outside this gate: the hail pair
+        // computes locally off the Level II volume and needs those
+        // environmental heights at *every* site, TDWR included.
+        if !site_offers_level3(site) {
+            log::debug!("{site} has no RPG, so no Level III objects are fetched for it");
+            return;
         }
         // One request per distinct object, not per (product, object). Three
         // products read `DVL` and `EET` between them — VIL, echo tops, and the
@@ -1635,6 +1671,10 @@ fn append_polled_frame(
 
     true
 }
+
+#[path = "app_fetch/level3_site_gate_tests.rs"]
+#[cfg(test)]
+mod level3_site_gate_tests;
 
 #[path = "app_fetch/local_time_tests.rs"]
 #[cfg(test)]

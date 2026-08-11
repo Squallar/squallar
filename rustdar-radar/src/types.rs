@@ -263,22 +263,12 @@ impl ScanInfo {
     ) -> Self {
         let vcp_number = data.coverage_pattern_number().number();
 
-        let product_elevations = discover_product_elevations(data);
-
-        let mut available_products: Vec<RadarProduct> =
-            product_elevations.keys().copied().collect();
-        available_products.sort_by_key(|p| p.sort_order());
-
-        let actual_timestamp = data
-            .sweeps()
-            .first()
-            .and_then(|s| s.radials().first())
-            .and_then(|r| {
-                chrono::DateTime::from_timestamp_millis(r.collection_timestamp())
-                    .map(|dt| dt.naive_utc())
-            })
-            .unwrap_or(requested_timestamp);
-
+        // Resolved before discovery, not after: what a site's network *is*
+        // decides which products can be offered for it at all, so
+        // `discover_product_elevations` has to be handed the row rather than
+        // the row being looked up afterwards for its coordinates. Nothing in
+        // the precedence below reads a product or a timestamp, so it is free
+        // to move up here.
         let row = get_radar_site(site);
         let (site_position, site_source) = match (
             data.site().and_then(SitePosition::from_volume),
@@ -312,6 +302,22 @@ impl ScanInfo {
                 }
             }
         };
+
+        let product_elevations = discover_product_elevations(data, &radar_site);
+
+        let mut available_products: Vec<RadarProduct> =
+            product_elevations.keys().copied().collect();
+        available_products.sort_by_key(|p| p.sort_order());
+
+        let actual_timestamp = data
+            .sweeps()
+            .first()
+            .and_then(|s| s.radials().first())
+            .and_then(|r| {
+                chrono::DateTime::from_timestamp_millis(r.collection_timestamp())
+                    .map(|dt| dt.naive_utc())
+            })
+            .unwrap_or(requested_timestamp);
 
         let status = format!(
             "Loaded {} products: {}",
@@ -347,8 +353,31 @@ impl ScanInfo {
 /// the one on the label — and, where two labels collapsed onto one sweep, cuts
 /// the picker could not reach at all. `find_sweep` matches on the same median,
 /// so an entry and the sweep behind it are the same quantity.
-fn discover_product_elevations(scan: &Scan) -> HashMap<RadarProduct, Vec<f32>> {
+///
+/// # What is offered is what can be drawn
+///
+/// The map this returns *is* the product picker, and `ScanInfo` accumulates
+/// downstream — `Gui::apply_chunk_scan_info` merges and never removes — so an
+/// entry that cannot render has to be withheld here or it is permanent for the
+/// session. Two things are withheld, both decided per **volume** and per
+/// **site** rather than per sweep: the hybrid classification on a single-pol
+/// volume, and the Level III family at a site whose network has no RPG.
+fn discover_product_elevations(scan: &Scan, site: &RadarSite) -> HashMap<RadarProduct, Vec<f32>> {
     let mut product_elevations: HashMap<RadarProduct, Vec<f32>> = HashMap::new();
+
+    // Asked once of the volume, not once per sweep.
+    // [`RadarProduct::HydrometeorClassification`] lists off the *reflectivity*
+    // slot ([`RadarProduct::moment_slot`]) because it composites every dual-pol
+    // tilt into one tilt-independent field — so a per-sweep test would offer it
+    // from a split cut's dual-pol Doppler half and withdraw it again from the
+    // surveillance half, the entry flapping as a live volume filled. One sweep
+    // carrying both of the moments `crate::hhc` cannot run without is enough to
+    // answer for the whole volume.
+    let volume_is_dual_pol = scan.sweeps().iter().any(|sweep| {
+        sweep.radials().first().is_some_and(|radial| {
+            radial.differential_phase().is_some() && radial.correlation_coefficient().is_some()
+        })
+    });
 
     for (i, sweep) in scan.sweeps().iter().enumerate() {
         if let Some(first_radial) = sweep.radials().first() {
@@ -358,6 +387,16 @@ fn discover_product_elevations(scan: &Scan) -> HashMap<RadarProduct, Vec<f32>> {
 
             let mut products_found: Vec<&str> = Vec::new();
             for product in RadarProduct::all() {
+                // The one product whose moment slot does not stand for the data
+                // it reads: reflectivity is where it *lists*, ΦDP and ρHV are
+                // what it classifies from. On a single-pol volume — every TDWR
+                // volume, and every legacy Message 1 WSR-88D one — `crate::hhc`
+                // refuses cleanly and the pane stays empty, so listing it beside
+                // the reflectivity tilts offers a product that can only ever
+                // draw nothing.
+                if *product == RadarProduct::HydrometeorClassification && !volume_is_dual_pol {
+                    continue;
+                }
                 if product.get_moment(first_radial).is_some() {
                     products_found.push(product.code());
                     product_elevations
@@ -392,8 +431,34 @@ fn discover_product_elevations(scan: &Scan) -> HashMap<RadarProduct, Vec<f32>> {
         );
     }
 
-    for l3_product in RadarProduct::all().iter().filter(|p| p.is_level3()) {
-        product_elevations.entry(*l3_product).or_default();
+    // Level III objects are made by an RPG, and only the WSR-88D network has
+    // one. A TDWR is served by the Supplemental Product Generator, which
+    // publishes its own short list and none of the four objects
+    // [`RadarProduct::level3_products`] names. Measured against the bucket the
+    // fetch itself reads, on 2026-08-11, for `TPIT`'s three-letter form:
+    //
+    //     curl -s "https://unidata-nexrad-level3.s3.amazonaws.com/\
+    //              ?list-type=2&prefix=PIT_&delimiter=_&max-keys=200"
+    //
+    // returned a complete listing (`IsTruncated false`) of twenty codes — DHR,
+    // DPA, DSP, N1P, NCR, NET, NHI, NMD, NST, NTV, NVL, NVW, RSL, TV0-TV2,
+    // TZ0-TZ2, TZL — and not one of N0K/EET/DVL/DPR. `PIT_TZL_2026_08_11_…`
+    // keys exist, so the site is archived and current; these products are
+    // simply not generated for it. Offering them anyway put five entries in the
+    // picker that draw an empty pane forever, and — because `ScanInfo`
+    // accumulates — they stayed there for the rest of the session.
+    //
+    // `is_wsr88d` answers **true** for the unplaceable-site row `from_scan`
+    // builds (it is named [`crate::sites::UNKNOWN_SITE_NAME`], not the `T`
+    // prefix `is_tdwr` looks for), and for the row a volume's own position
+    // builds when [`crate::sites::radars()`] has no entry to name it from —
+    // `SitePosition::applied_to` reaches for the same constant. So a site the
+    // resolved table has never heard of keeps every product it is offered
+    // today, and only a site the table does name as a `T` loses the four.
+    if site.is_wsr88d() {
+        for l3_product in RadarProduct::all().iter().filter(|p| p.is_level3()) {
+            product_elevations.entry(*l3_product).or_default();
+        }
     }
 
     product_elevations

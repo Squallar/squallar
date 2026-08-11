@@ -201,6 +201,164 @@ fn every_level3_product_is_listed_from_the_moment_a_volume_loads() {
     );
 }
 
+/// A cut carrying exactly the moments named and nothing else.
+///
+/// [`settling_sweep`] below is reflectivity-only by construction; what the two
+/// tests after this vary is the moment *set*, because which fields a volume's
+/// radials carry is the whole input to what it can be asked to draw.
+///
+/// Three radials, not 360: `discover_product_elevations` reads the first radial
+/// for its moments and the sweep's median for its label, and three is the
+/// smallest count that makes "median" mean anything.
+fn sweep_carrying(number: u8, elevation: f32, moments: &[MomentSlot]) -> nexrad_model::data::Sweep {
+    use nexrad_model::data::{MomentData, Radial, RadialStatus, Sweep};
+    // The gate geometry is irrelevant here — nothing rasterizes these — but a
+    // moment has to be present or absent, and only a real block is present.
+    let carried = |slot: MomentSlot| {
+        moments
+            .contains(&slot)
+            .then(|| MomentData::from_fixed_point(600, 0, 250, 8, 2.0, 66.0, vec![200u8; 600]))
+    };
+    let radials = (0..3u16)
+        .map(|i| {
+            Radial::new(
+                0,
+                i,
+                f32::from(i) * 120.0,
+                1.0,
+                RadialStatus::IntermediateRadialData,
+                number,
+                elevation,
+                carried(MomentSlot::Reflectivity),
+                carried(MomentSlot::Velocity),
+                carried(MomentSlot::SpectrumWidth),
+                carried(MomentSlot::DifferentialReflectivity),
+                carried(MomentSlot::DifferentialPhase),
+                carried(MomentSlot::CorrelationCoefficient),
+                None,
+            )
+        })
+        .collect();
+    Sweep::new(number, radials)
+}
+
+/// A volume of `sweeps` under a VCP number, dated from its radials.
+fn scan_of(vcp: u16, sweeps: Vec<nexrad_model::data::Sweep>) -> Scan {
+    Scan::new(
+        VolumeCoveragePattern::new(
+            vcp,
+            0,
+            0.5,
+            PulseWidth::Short,
+            false,
+            0,
+            false,
+            0,
+            false,
+            false,
+            0,
+            false,
+            false,
+            Vec::new(),
+        ),
+        sweeps,
+    )
+}
+
+fn a_time() -> NaiveDateTime {
+    chrono::NaiveDate::from_ymd_opt(2026, 8, 11)
+        .unwrap()
+        .and_hms_opt(0, 1, 39)
+        .unwrap()
+}
+
+/// A TDWR offers the eight products it can draw, not the fourteen it used to.
+///
+/// The shape is `TPIT`'s real VCP 90, byte-verified: a reflectivity-only
+/// long-range surveillance cut and a `REF`/`VEL`/`SW` Doppler cut at the same
+/// nominal tilt. No dual-pol moment appears anywhere in a TDWR volume, and no
+/// RPG stands behind the site, so six of the fourteen entries the picker used
+/// to show could never paint a pixel: the five Level III products (no `N0K`,
+/// `EET`, `DVL` or `DPR` object is generated for `PIT` — see the evidence at
+/// the gate in `types.rs`) and the hybrid classification, which lists off the
+/// reflectivity slot and so used to ride in on a single-pol volume's
+/// reflectivity.
+///
+/// The eight that survive are the ones with a path to pixels: three native
+/// moments, two velocity derivations, and three reflectivity-volume
+/// integrations that need environmental heights but no RPG.
+#[test]
+fn a_tdwr_volume_offers_only_what_it_can_render() {
+    let scan = scan_of(
+        90,
+        vec![
+            sweep_carrying(1, 0.26, &[MomentSlot::Reflectivity]),
+            sweep_carrying(
+                2,
+                0.26,
+                &[
+                    MomentSlot::Reflectivity,
+                    MomentSlot::Velocity,
+                    MomentSlot::SpectrumWidth,
+                ],
+            ),
+        ],
+    );
+
+    let info = ScanInfo::from_scan(&scan, "TPIT", a_time(), None);
+
+    let offered: Vec<&str> = info.available_products.iter().map(|p| p.code()).collect();
+    assert_eq!(
+        offered,
+        ["ref", "vel", "sw", "nrot", "srv", "eti", "posh", "mehs"],
+        "the picker must offer only what a TDWR volume can be asked to draw",
+    );
+}
+
+/// The gate is dual-pol and RPG, not "is it a WSR-88D": a legacy Message 1
+/// volume hides the classification and keeps its Level III products.
+///
+/// Both halves matter and they fail in opposite directions. Gating the hybrid
+/// classification on the *site* would leave it offered on the pre-2013 archive
+/// — single-pol WSR-88D volumes, where `crate::hhc` refuses for exactly the
+/// reason it refuses on a TDWR. Gating the Level III family on the volume's
+/// moments would withdraw all five from any single-pol WSR-88D scan, and those
+/// objects come from the RPG and do not care what the volume in hand carries.
+#[test]
+fn a_single_pol_wsr88d_volume_hides_hhc_but_keeps_level3() {
+    let scan = scan_of(
+        11,
+        vec![sweep_carrying(1, 0.5, &[MomentSlot::Reflectivity])],
+    );
+
+    let info = ScanInfo::from_scan(&scan, "KTLX", a_time(), None);
+
+    assert!(
+        !info
+            .available_products
+            .contains(&RadarProduct::HydrometeorClassification),
+        "a volume with no ΦDP and no ρHV offered a hydrometeor classification",
+    );
+    for product in RadarProduct::all().iter().filter(|p| p.is_level3()) {
+        assert!(
+            info.available_products.contains(product),
+            "{} left the picker with the classification — the Level III gate \
+                 is reading the volume's moments, not the site",
+            product.name(),
+        );
+    }
+
+    let offered: Vec<&str> = info.available_products.iter().map(|p| p.code()).collect();
+    assert_eq!(
+        offered,
+        [
+            "ref", "kdp", "eet", "eti", "vil", "vild", "posh", "mehs", "dpr"
+        ],
+        "a reflectivity-only WSR-88D volume offers its reflectivity \
+             derivations and every Level III product, and nothing else",
+    );
+}
+
 /// A sweep that opens off its own tilt while the antenna settles: the first
 /// thirty radials ramp from `first` to `flown`, the rest sit on `flown`, so
 /// the sweep's median is `flown` and its first radial is not.
