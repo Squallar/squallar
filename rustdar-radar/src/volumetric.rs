@@ -307,9 +307,12 @@ fn sweep_to_grid(radials: &[Radial], moment: RadarProduct, stat: CellStat) -> Ve
         // (accumulator, gate count) per cell; what the accumulator holds
         // depends on `stat`.
         let mut acc = vec![(0.0f64, 0u32); RANGE_BINS];
-        for (j, v) in md.values().iter().enumerate() {
+        // `iter`, not `values`: this walk is sequential, so the `Vec` `values`
+        // collects into would be eight bytes per gate allocated and dropped
+        // for every azimuth cell of every sweep of the volume.
+        for (j, v) in md.iter().enumerate() {
             let MomentValue::Value(z) = v else { continue };
-            if *z >= 999.0 || z.is_nan() {
+            if z >= 999.0 || z.is_nan() {
                 continue;
             }
             let r = (fg + j as f64 * gi) as usize;
@@ -317,13 +320,13 @@ fn sweep_to_grid(radials: &[Radial], moment: RadarProduct, stat: CellStat) -> Ve
                 continue;
             }
             match stat {
-                CellStat::LinearZMean => acc[r].0 += 10f64.powf(*z as f64 / 10.0),
-                CellStat::Mean => acc[r].0 += *z as f64,
+                CellStat::LinearZMean => acc[r].0 += 10f64.powf(z as f64 / 10.0),
+                CellStat::Mean => acc[r].0 += z as f64,
                 CellStat::Max => {
                     acc[r].0 = if acc[r].1 == 0 {
-                        *z as f64
+                        z as f64
                     } else {
-                        acc[r].0.max(*z as f64)
+                        acc[r].0.max(z as f64)
                     }
                 }
             }

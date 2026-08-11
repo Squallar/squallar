@@ -647,14 +647,18 @@ pub fn render_radar_to_image_full(
                         let first_gate_range = moment.first_gate_range_km();
                         let gate_size = moment.gate_interval_km();
 
-                        for (gate_idx, moment_value) in moment.values().iter().enumerate() {
+                        // `iter`, not `values`: the latter is `iter().collect()`
+                        // and this walk is strictly sequential, so the `Vec`
+                        // would be eight bytes per gate allocated and dropped
+                        // for every radial of every render.
+                        for (gate_idx, moment_value) in moment.iter().enumerate() {
                             let range_km = first_gate_range + (gate_idx as f64 * gate_size);
                             if range_km > types::MAX_RANGE_KM {
                                 break;
                             }
 
                             let scaled_value = match moment_value {
-                                nexrad_model::data::MomentValue::Value(v) => *v,
+                                nexrad_model::data::MomentValue::Value(v) => v,
                                 _ => continue,
                             };
                             if scaled_value >= 999.0 || scaled_value.is_nan() {
@@ -881,12 +885,14 @@ fn build_velocity_grid(radials: &[Radial]) -> Option<VelocityGrid> {
         azimuths_deg.push(radial.azimuth_angle_degrees() as f64);
         let mut gates = vec![f64::NAN; gate_count];
         if let Some(moment) = radial.velocity() {
-            for (j, val) in moment.values().iter().enumerate().take(gate_count) {
+            // `iter`, not `values`: sequential, and `take` then stops decoding
+            // at `gate_count` instead of collecting every gate first.
+            for (j, val) in moment.iter().enumerate().take(gate_count) {
                 if let nexrad_model::data::MomentValue::Value(v) = val
                     && !v.is_nan()
-                    && *v < 999.0
+                    && v < 999.0
                 {
-                    gates[j] = *v as f64;
+                    gates[j] = v as f64;
                 }
             }
         }

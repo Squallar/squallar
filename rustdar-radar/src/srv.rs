@@ -208,12 +208,14 @@ pub fn velocity_grid(radials: &[Radial]) -> Option<VelocityGrid> {
         azimuths_deg.push(radial.azimuth_angle_degrees() as f64);
         let mut gates = vec![f64::NAN; gate_count];
         if let Some(moment) = radial.velocity() {
-            for (j, val) in moment.values().iter().enumerate().take(gate_count) {
+            // `iter`, not `values`: sequential, and `take` then stops decoding
+            // at `gate_count` instead of collecting every gate first.
+            for (j, val) in moment.iter().enumerate().take(gate_count) {
                 if let nexrad_model::data::MomentValue::Value(v) = val
                     && !v.is_nan()
-                    && *v < 999.0
+                    && v < 999.0
                 {
-                    gates[j] = *v as f64;
+                    gates[j] = v as f64;
                 }
             }
         }

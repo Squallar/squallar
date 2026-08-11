@@ -133,12 +133,16 @@ pub(crate) struct DpInput {
     pub(crate) elev: f64,
 }
 
+/// One moment's gates as `f64`, with every non-value gate a `NaN`.
+///
+/// `iter`, not `values`: the latter is `iter().collect()`, so going through it
+/// would build an intermediate `Vec<MomentValue>` — eight bytes per gate — only
+/// to walk it once and drop it. This runs six times per radial.
 pub(crate) fn decode_moment(moment: &nexrad_model::data::MomentData) -> Vec<f64> {
     moment
-        .values()
         .iter()
         .map(|v| match v {
-            MomentValue::Value(x) => f64::from(*x),
+            MomentValue::Value(x) => f64::from(x),
             _ => f64::NAN,
         })
         .collect()
