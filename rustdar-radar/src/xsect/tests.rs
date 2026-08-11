@@ -80,6 +80,35 @@ fn sweep(
     field: &dyn Fn(f64, f64) -> Gate,
     first_gate_m: u16,
 ) -> Sweep {
+    sweep_at(
+        0,
+        elevation_number,
+        elevation_deg,
+        n_radials,
+        n_gates,
+        first_azimuth_deg,
+        field,
+        first_gate_m,
+    )
+}
+
+/// [`sweep`] with a clock on every radial, milliseconds since the Unix epoch.
+///
+/// `0` is the decoder's own "no timestamp" value and is what every fixture
+/// that does not care about time passes, through [`sweep`]. The ones that do
+/// care need *distinct* clocks per sweep: a volume of identical zeros cannot
+/// tell a ladder that dated its rungs from one that dated none of them.
+#[allow(clippy::too_many_arguments)]
+fn sweep_at(
+    collected_ms: i64,
+    elevation_number: u8,
+    elevation_deg: f32,
+    n_radials: usize,
+    n_gates: usize,
+    first_azimuth_deg: f64,
+    field: &dyn Fn(f64, f64) -> Gate,
+    first_gate_m: u16,
+) -> Sweep {
     let spacing = 360.0 / n_radials as f64;
     let radials = (0..n_radials)
         .map(|i| {
@@ -96,7 +125,7 @@ fn sweep(
                 })
                 .collect();
             Radial::new(
-                0,
+                collected_ms,
                 i as u16,
                 az as f32,
                 spacing as f32,
@@ -1997,6 +2026,7 @@ fn the_wire_constructor_refuses_a_misshaped_section() {
     let section = radial_section(&scan, 45.0, 100.0);
     let axes = *section.axes();
     let ladder = || section.tilt_elevations_deg().to_vec();
+    let clocks = || section.tilt_collected_ms().to_vec();
 
     let rebuilt = CrossSection::from_parts(
         section.image().to_vec(),
@@ -2004,6 +2034,7 @@ fn the_wire_constructor_refuses_a_misshaped_section() {
         section.status().to_vec(),
         axes,
         ladder(),
+        clocks(),
     )
     .expect("a section round-trips through its own planes");
     assert_eq!(rebuilt, section);
@@ -2020,6 +2051,7 @@ fn the_wire_constructor_refuses_a_misshaped_section() {
             section.status().to_vec(),
             axes,
             ladder(),
+            clocks(),
         )
         .is_none(),
         "a short image plane was accepted — `apply_render_to_pane` asserts \
@@ -2032,6 +2064,7 @@ fn the_wire_constructor_refuses_a_misshaped_section() {
             section.status().to_vec(),
             axes,
             ladder(),
+            clocks(),
         )
         .is_none(),
         "a short value plane was accepted",
@@ -2043,6 +2076,7 @@ fn the_wire_constructor_refuses_a_misshaped_section() {
             section.status()[1..].to_vec(),
             axes,
             ladder(),
+            clocks(),
         )
         .is_none(),
         "a short status plane was accepted",
@@ -2060,6 +2094,7 @@ fn the_wire_constructor_refuses_a_misshaped_section() {
             future,
             axes,
             ladder(),
+            clocks(),
         )
         .is_none(),
         "an unknown status code was accepted",
@@ -2102,6 +2137,7 @@ fn the_wire_constructor_refuses_a_misshaped_section() {
                     section.status().to_vec(),
                     broken,
                     ladder(),
+                    clocks(),
                 )
                 .is_none(),
                 "a {name} of {bad} was accepted",
@@ -2127,6 +2163,7 @@ fn the_wire_constructor_refuses_a_misshaped_section() {
                     section.status().to_vec(),
                     broken,
                     ladder(),
+                    clocks(),
                 )
                 .is_none(),
                 "a {name} of {bad} was accepted",
@@ -2146,6 +2183,7 @@ fn the_wire_constructor_refuses_a_misshaped_section() {
                 tilt_count: 0,
                 ..axes
             },
+            Vec::new(),
             Vec::new(),
         )
         .is_some(),
@@ -2170,6 +2208,7 @@ fn the_wire_constructor_refuses_a_misshaped_section() {
                 section.status().to_vec(),
                 axes,
                 wrong.clone(),
+                clocks(),
             )
             .is_none(),
             "a {}-rung ladder was accepted for a {}-rung section",
@@ -2177,6 +2216,32 @@ fn the_wire_constructor_refuses_a_misshaped_section() {
             axes.tilt_count,
         );
     }
+    // **And the clocks are one per rung too.** A consumer zips the two lists
+    // to say "this rung, this old", so a short clock list either truncates
+    // the ladder or pairs a rung with its neighbour's age — and an age is a
+    // number no reader can sanity-check by looking at the picture, unlike an
+    // elevation, which lands the curve visibly in the wrong place.
+    for wrong in [
+        clocks()[1..].to_vec(),
+        Vec::new(),
+        vec![0; ladder().len() + 1],
+    ] {
+        assert!(
+            CrossSection::from_parts(
+                section.image().to_vec(),
+                section.values().to_vec(),
+                section.status().to_vec(),
+                axes,
+                ladder(),
+                wrong.clone(),
+            )
+            .is_none(),
+            "a {}-clock ladder was accepted for a {}-rung section",
+            wrong.len(),
+            axes.tilt_count,
+        );
+    }
+
     // And a rung that is not an angle. A `NaN` elevation draws no curve and
     // reports nothing, so the honesty device goes quiet in the one way
     // nobody notices.
@@ -2190,6 +2255,7 @@ fn the_wire_constructor_refuses_a_misshaped_section() {
                 section.status().to_vec(),
                 axes,
                 broken,
+                clocks(),
             )
             .is_none(),
             "a rung at {bad} degrees was accepted",
@@ -2215,6 +2281,7 @@ fn the_wire_constructor_refuses_a_misshaped_section() {
                 section.status().to_vec(),
                 axes,
                 ladder(),
+                clocks(),
             )
             .is_none(),
             "a Value pixel carrying {bad} was accepted",
@@ -2237,6 +2304,7 @@ fn the_wire_constructor_refuses_a_misshaped_section() {
             section.status().to_vec(),
             axes,
             ladder(),
+            clocks(),
         )
         .is_some(),
         "a NaN under a non-Value status was refused, which is every \
@@ -2441,10 +2509,12 @@ fn the_three_planes_agree_everywhere() {
 /// [`WIRE_FIXTURE_RUNGS`] included.
 ///
 /// How many rungs every fixture below encodes: `scan_with` flies a
-/// five-cut pattern, and the ladder's `f64` per rung sits between the axes
-/// and the first plane.
+/// five-cut pattern, and the ladder sits between the axes and the first
+/// plane — **twice**, an `f64` of elevation per rung and an `i64` of
+/// collection time per rung, each behind its own `u32` length.
 const WIRE_FIXTURE_RUNGS: usize = 5;
-const IMAGE_LEN_AT: usize = 4 + 2 + 7 * 8 + 4 + 3 * 8 + 4 + WIRE_FIXTURE_RUNGS * 8;
+const IMAGE_LEN_AT: usize =
+    4 + 2 + 7 * 8 + 4 + 3 * 8 + 4 + WIRE_FIXTURE_RUNGS * 8 + 4 + WIRE_FIXTURE_RUNGS * 8;
 const VALUE_LEN_AT: usize = IMAGE_LEN_AT + 4 + SECTION_WIDTH * SECTION_HEIGHT * 4;
 const STATUS_LEN_AT: usize = VALUE_LEN_AT + 4 + SECTION_WIDTH * SECTION_HEIGHT * 4;
 
@@ -2485,6 +2555,12 @@ fn the_length_prefixes_are_where_the_tests_think_they_are() {
              points into the middle of a plane and the negative tests are \
              corrupting the wrong bytes",
     );
+    assert_eq!(
+        fixture.tilt_collected_ms().len(),
+        WIRE_FIXTURE_RUNGS,
+        "the clock list is a second per-rung block between the axes and the \
+             first plane, and the offsets above count it",
+    );
     let bytes = fixture.to_bytes();
     let pixels = SECTION_WIDTH * SECTION_HEIGHT;
     assert_eq!(prefix_at(&bytes, IMAGE_LEN_AT), (pixels * 4) as u32);
@@ -2493,7 +2569,7 @@ fn the_length_prefixes_are_where_the_tests_think_they_are() {
     assert_eq!(bytes.len(), STATUS_LEN_AT + 4 + pixels);
 }
 
-/// The version this layout ships is **2**, and it is written where a
+/// The version this layout ships is **3**, and it is written where a
 /// decoder from another build reads it.
 ///
 /// `a_malformed_section_payload_is_refused_rather_than_misread` plants
@@ -2526,12 +2602,12 @@ fn the_length_prefixes_are_where_the_tests_think_they_are() {
 /// refusal rather than a misparse.
 #[test]
 fn the_format_version_is_the_one_this_layout_ships() {
-    assert_eq!(FORMAT_VERSION, 2);
+    assert_eq!(FORMAT_VERSION, 3);
     let bytes = wire_fixture().to_bytes();
     assert_eq!(&bytes[..4], b"RDXS", "the magic moved");
     assert_eq!(
         u16::from_le_bytes([bytes[4], bytes[5]]),
-        2,
+        3,
         "the version is not where a decoder from another build looks for it",
     );
 }
@@ -2815,4 +2891,140 @@ fn the_capacity_guard_refuses_a_length_the_buffer_cannot_hold() {
 
     // And the multiply cannot overflow into a pass.
     assert_eq!(Reader::new(&bytes).bounded(u32::MAX, usize::MAX), None);
+}
+
+/// Milliseconds since the epoch the clocked ladder below starts at.
+const SECTION_T0: i64 = 1_760_000_000_000;
+
+/// **A rendered section carries its ladder's clocks, rung for rung.**
+///
+/// A section reads as an instant and is not one: a VCP takes four to ten
+/// minutes to fly, so the bottom of the picture and the top are minutes apart,
+/// and the pane used to caption the whole thing with one volume time. The
+/// numbers that withdraw that claim have to travel *with the raster* — a pane
+/// keeps a section across a suspend and re-uploads it rather than re-cutting,
+/// precisely because the volume behind it may be gone by then.
+///
+/// The fixture flies its cuts in a hostile order (4.0°, 0.5°, 19.5°, 1.3°,
+/// 10.0°, then a SAILS repeat of the base tilt) and stamps each with a clock
+/// **in that collection order**, so the assertion is a statement about the
+/// ladder's own ordering as much as about the clocks: a list merely copied in
+/// sweep order would come out shuffled against the elevations beside it.
+#[test]
+fn a_section_carries_the_clock_of_every_rung_it_was_cut_from() {
+    let field = |_az: f64, _slant: f64| Gate::Dbz(30.0);
+    let order = [2usize, 0, 4, 1, 3];
+    let mut sweeps: Vec<Sweep> = order
+        .iter()
+        .enumerate()
+        .map(|(collected, &i)| {
+            let (number, elevation, gates) = LADDER[i];
+            sweep_at(
+                SECTION_T0 + collected as i64 * 60_000,
+                number,
+                elevation,
+                720,
+                gates,
+                13.7 * (i as f64 + 1.0),
+                &field,
+                FIRST_GATE_M,
+            )
+        })
+        .collect();
+    // The SAILS repeat of the base tilt, six minutes in and newest of all —
+    // and it is a *reflectivity* repeat here, so the surveillance preference
+    // has nothing to prefer and "newest wins" takes it. The 0.5° rung must
+    // therefore be dated to this sweep and not to the one at index 1.
+    sweeps.push(sweep_at(
+        SECTION_T0 + 5 * 60_000,
+        LADDER[0].0,
+        LADDER[0].1 + 0.01,
+        720,
+        LADDER[0].2,
+        201.3,
+        &field,
+        FIRST_GATE_M,
+    ));
+    let scan = Scan::new(
+        vcp(&LADDER
+            .iter()
+            .map(|&(_, e, _)| f64::from(e))
+            .collect::<Vec<_>>()),
+        sweeps,
+    );
+
+    let section = radial_section(&scan, 45.0, 100.0);
+    let clocks = section.tilt_collected_ms();
+
+    assert_eq!(
+        clocks.len(),
+        section.tilt_elevations_deg().len(),
+        "one clock per rung, or the two lists cannot be zipped",
+    );
+    assert!(
+        clocks.iter().all(|&ms| ms > 0),
+        "a rendered section lost its rung clocks — every age it reports is \
+         then a fabrication: {clocks:?}",
+    );
+
+    // The ladder is ascending by cut, and the clocks are the *collection*
+    // order — 0.5° was flown second and repeated last, 19.5° third — so the
+    // two lists are deliberately not in the same order as each other. A
+    // section that copied sweep order into the clock list would come out
+    // ascending here, and it must not.
+    assert_eq!(
+        clocks,
+        [
+            SECTION_T0 + 5 * 60_000, // 0.5°, the SAILS repeat: newest of all
+            SECTION_T0 + 3 * 60_000, // 1.3°, flown fourth
+            SECTION_T0,              // 4.0°, flown first
+            SECTION_T0 + 4 * 60_000, // 10.0°, flown fifth
+            SECTION_T0 + 2 * 60_000, // 19.5°, flown third
+        ],
+        "the rungs are dated by position rather than by the sweep each one \
+         actually took",
+    );
+
+    // Five minutes of clock across the ladder, which is what a caption asks
+    // for. The literal is the fixture's own spread, not a re-derivation.
+    assert_eq!(
+        section.assembly_span_secs(),
+        Some(300),
+        "the section's assembly span is not its ladder's",
+    );
+}
+
+/// `assembly_span_secs` tells "flown all at once" from "nothing here knows
+/// when anything was flown", because a caption must not assert the first when
+/// it only has grounds for the second.
+#[test]
+fn an_unclocked_ladder_reports_no_span_rather_than_a_zero_one() {
+    use crate::xsect::assembly_span_secs;
+
+    assert_eq!(
+        assembly_span_secs(&[]),
+        None,
+        "an empty ladder knows nothing"
+    );
+    assert_eq!(
+        assembly_span_secs(&[0, 0, 0]),
+        None,
+        "a ladder of `0` sentinels reported itself as flown in one instant",
+    );
+    assert_eq!(
+        assembly_span_secs(&[SECTION_T0]),
+        Some(0),
+        "one clocked rung is a known span of nothing, not an unknown one",
+    );
+    assert_eq!(
+        assembly_span_secs(&[SECTION_T0, SECTION_T0 + 360_000]),
+        Some(360),
+    );
+    // A `0` beside real clocks is skipped rather than minimised over — taking
+    // it would date the section to 1970 and report a span of half a century.
+    assert_eq!(
+        assembly_span_secs(&[0, SECTION_T0, SECTION_T0 + 360_000]),
+        Some(360),
+        "an unclocked rung dragged the span back to the epoch",
+    );
 }

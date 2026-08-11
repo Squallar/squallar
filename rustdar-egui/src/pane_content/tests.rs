@@ -252,6 +252,7 @@ fn blank_section() -> CrossSection {
             top_declared_cut_deg: 19.5,
         },
         vec![0.5],
+        vec![0],
     )
     .expect("a full-size, all-NoCoverage section is well formed")
 }

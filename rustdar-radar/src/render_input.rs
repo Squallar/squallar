@@ -234,6 +234,36 @@ struct SweepData {
     /// carries none. The worker then estimates, which is what the main thread
     /// does for the same volume.
     declared_nyquist_ms: Option<f64>,
+    /// When the RDA flew this sweep — the **earliest** collection timestamp on
+    /// any of its radials, milliseconds since the Unix epoch, `0` when none of
+    /// them carried one.
+    ///
+    /// # Why a sweep's clock has to cross the port
+    ///
+    /// A volume is flown one tilt at a time over four to ten minutes, and a
+    /// section is a picture of the whole ladder at once. The bottom rung and
+    /// the top rung of one cross-section are therefore minutes apart, and with
+    /// a SAILS repeat one rung in the middle can be newer than both its
+    /// neighbours. That spread is invisible in the picture and the pane used to
+    /// caption the lot with a single volume time.
+    ///
+    /// [`to_scan`](RenderInput::to_scan) stamped `0` on every reconstructed
+    /// radial, because until now nothing on any render path read a timestamp —
+    /// and **every cross-section in the app is cut from a reconstructed scan**.
+    /// So a rung age read off the sampler would have been correct in
+    /// `rustdar-radar`'s own tests, which sample real fixtures, and uniformly
+    /// zero in the product. Carrying the number is what makes the two agree;
+    /// `a_reconstructed_render_input_scan_keeps_each_sweeps_clock` is what
+    /// keeps them agreeing.
+    ///
+    /// One value per sweep rather than one per radial, exactly like
+    /// [`elevation_angle`](Self::elevation_angle): a sweep is flown in about
+    /// fifteen seconds and the question this answers is asked in minutes, so
+    /// per-radial resolution would cost 8 bytes a radial to say nothing more.
+    /// The **earliest** of them rather than the first in collection order,
+    /// because a sweep's radials start wherever the antenna was and a wrapped
+    /// sweep's first radial is not its oldest.
+    collected_ms: i64,
     radials: Vec<RadialData>,
 }
 
@@ -665,7 +695,13 @@ impl RenderInput {
                         }
                         let (reflectivity, velocity, spectrum_width, zdr, phi, rho) = slots;
                         Radial::new(
-                            0,
+                            // The sweep's own clock, stamped across its
+                            // radials exactly as `elevation_angle` is — see
+                            // `SweepData::collected_ms`. It used to be `0`
+                            // here, which is what made a rung's age readable
+                            // in this crate's tests and uniformly zero in the
+                            // app, where every section is cut from this scan.
+                            sweep.collected_ms,
                             0,
                             radial.azimuth,
                             radial.azimuth_spacing,
@@ -936,6 +972,26 @@ const ALL_SLOTS: [MomentSlot; 6] = [
     MomentSlot::CorrelationCoefficient,
 ];
 
+/// When a sweep was flown: the earliest positive collection timestamp on its
+/// radials, milliseconds since the Unix epoch, or `0` when it carries none.
+///
+/// `0` is the decoder's own sentinel for a radial with no clock, and it is
+/// filtered out rather than taken as a candidate minimum — one unstamped radial
+/// in an otherwise dated sweep would otherwise place the whole tilt in 1970 and
+/// caption a live volume as decades old.
+///
+/// Shared with [`crate::sampler`], which asks the same question of the same
+/// radials on the other side of the port; a second spelling of it is how the
+/// worker's rung ages and the frame thread's would come to differ by a sweep.
+pub(crate) fn sweep_collected_ms(radials: &[Radial]) -> i64 {
+    radials
+        .iter()
+        .map(Radial::collection_timestamp)
+        .filter(|&ms| ms > 0)
+        .min()
+        .unwrap_or(0)
+}
+
 /// Flatten one sweep, carrying `slot`'s moment and nothing else.
 ///
 /// `slot` comes from the caller rather than being probed off the radial: a
@@ -977,6 +1033,13 @@ fn sweep_data(
         // function, which reads a `Sweep` and nothing else, has no honest way
         // to know it. See that method for why the two steps are separate.
         declared_nyquist_ms: None,
+        // A whole pass over the radials rather than `first()`, because a
+        // sweep's radials are in *collection* order, which starts wherever the
+        // antenna happened to be — so the first one is not the oldest. Zero is
+        // the decoder's own "no timestamp" value and is filtered rather than
+        // minimised over, or a single unstamped radial would date the sweep to
+        // 1970.
+        collected_ms: sweep_collected_ms(radials),
         radials: radials
             .iter()
             .map(|radial| RadialData {
@@ -1148,7 +1211,13 @@ const MAGIC: [u8; 4] = *b"RDRI";
 /// leave the worker estimating while the main thread declared — two ladders
 /// guarding a band of borderline velocity pairs differently, with no error, no
 /// warning and no visible difference to point at.
-const FORMAT_VERSION: u16 = 8;
+/// Version 9 added the per-sweep **collection timestamp**, after the declared
+/// Nyquist velocity. `to_scan` stamped zero on every reconstructed radial
+/// because no render path read one, and every cross-section in the app is cut
+/// from a reconstructed scan — so the tilt ladder's per-rung ages, which a
+/// section pane now reports, were readable off a real volume and identically
+/// zero off a payload. See [`SweepData::collected_ms`].
+const FORMAT_VERSION: u16 = 9;
 
 impl RenderInput {
     /// Encode for transport. Little-endian throughout; gate blobs are copied
@@ -1204,6 +1273,10 @@ impl RenderInput {
                     out.extend_from_slice(&ms.to_le_bytes());
                 }
             }
+            // Unconditional rather than flagged: `0` is already this field's
+            // "no clock" value on the struct, so a presence byte would be a
+            // second way to spell the same absence.
+            out.extend_from_slice(&sweep.collected_ms.to_le_bytes());
             out.extend_from_slice(&(sweep.radials.len() as u32).to_le_bytes());
             for radial in &sweep.radials {
                 out.extend_from_slice(&radial.azimuth.to_le_bytes());
@@ -1275,8 +1348,9 @@ impl RenderInput {
         }
         let sweep_count = r.u32()?;
         // A sweep costs at least its own header, so this bounds the count
-        // against what is actually left rather than trusting it.
-        let mut sweeps = Vec::with_capacity(r.bounded(sweep_count, 12)?);
+        // against what is actually left rather than trusting it. Twenty since
+        // the collection timestamp joined it — see `encoded_len`.
+        let mut sweeps = Vec::with_capacity(r.bounded(sweep_count, 20)?);
         for _ in 0..sweep_count {
             let elevation_angle = r.f32()?;
             let elevation_number = r.u8()?;
@@ -1295,6 +1369,7 @@ impl RenderInput {
                 1 => Some(r.f64()?),
                 _ => return None,
             };
+            let collected_ms = r.i64()?;
             let radial_count = r.u32()?;
             let mut radials = Vec::with_capacity(r.bounded(radial_count, 9)?);
             for _ in 0..radial_count {
@@ -1329,6 +1404,7 @@ impl RenderInput {
                 cut_angle_deg,
                 carried_velocity,
                 declared_nyquist_ms,
+                collected_ms,
                 radials,
             });
         }
@@ -1367,8 +1443,9 @@ impl RenderInput {
             .map(|s| {
                 // 4 elevation angle + 1 elevation number + 1 carried-velocity
                 // flag + 1 cut-angle flag (+ 8 for the angle) + 1
-                // declared-Nyquist flag (+ 8 for the value) + 4 radial count.
-                12 + if s.cut_angle_deg.is_some() { 8 } else { 0 }
+                // declared-Nyquist flag (+ 8 for the value) + 8 collection
+                // timestamp + 4 radial count.
+                20 + if s.cut_angle_deg.is_some() { 8 } else { 0 }
                     + if s.declared_nyquist_ms.is_some() {
                         8
                     } else {
@@ -1462,6 +1539,10 @@ impl<'a> Reader<'a> {
 
     fn f64(&mut self) -> Option<f64> {
         Some(f64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+
+    fn i64(&mut self) -> Option<i64> {
+        Some(i64::from_le_bytes(self.take(8)?.try_into().ok()?))
     }
 
     /// `count` as a capacity, refused if the buffer cannot possibly hold that

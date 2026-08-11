@@ -311,6 +311,15 @@ fn synth_sweep(
         .radials()
         .first()
         .map_or(0.0, Radial::elevation_angle_degrees);
+    // The source sweep's clock, carried onto every synthetic radial for the
+    // same reason `elevation_deg` above is: a derivation computes new *values*
+    // for a tilt the radar already flew, and when it was flown is a property of
+    // that tilt rather than of this computation. Left at the `0` it started
+    // from, the derived products would be the one family whose sections could
+    // not say how old the rung under the pointer is — silently, and only in the
+    // product, since a rung age is read off these radials. See
+    // [`crate::sampler::Rung`]'s `collected_ms`.
+    let collected_ms = crate::render_input::sweep_collected_ms(source.radials());
     let spacing = 360.0 / values.len().max(1) as f32;
     let first_gate_m = (first_gate_km * 1000.0).round().clamp(0.0, 65535.0) as u16;
     let gate_m = (gate_interval_km * 1000.0).round().clamp(1.0, 65535.0) as u16;
@@ -351,7 +360,7 @@ fn synth_sweep(
                 MomentSlot::CorrelationCoefficient => rho = Some(moment),
             }
             Radial::new(
-                0,
+                collected_ms,
                 i as u16,
                 az as f32,
                 spacing,

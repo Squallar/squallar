@@ -65,6 +65,15 @@ pub struct SectionImageData {
     pub axes: rustdar_radar::xsect::SectionAxes,
     /// Where the ladder's rungs are, in degrees of beam elevation.
     pub tilt_elevations_deg: Vec<f64>,
+    /// When each of those rungs was flown, milliseconds since the Unix epoch,
+    /// in the same order — `CrossSection::tilt_collected_ms`.
+    ///
+    /// Kept for the reason the two fields above it are: it is a *label on this
+    /// picture*, not a fact about the live volume. A loop frame's ladder was
+    /// flown minutes or hours before the one the pane would otherwise read, and
+    /// a caption that took its assembly span from the live cut would describe a
+    /// volume that is not on the glass.
+    pub tilt_collected_ms: Vec<i64>,
     /// The fingerprint of the tilt ladder this frame was cut from, from
     /// [`rustdar_radar::sampler::ladder_fingerprint`].
     ///

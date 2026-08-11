@@ -509,6 +509,24 @@ pub enum SectionUnavailable {
     /// elevation numbers. Without a name of its own it reads as a section that
     /// silently does not work on live data.
     AwaitingCoveragePattern,
+    /// The coverage pattern **has** arrived — so there is a tilt ladder to cut
+    /// along — but no sweep has been sealed onto it yet.
+    ///
+    /// The mid-flight join one step past
+    /// [`AwaitingCoveragePattern`](Self::AwaitingCoveragePattern): the start
+    /// chunk has landed and the antenna is still flying the first tilt, with no
+    /// archive base yet to fill the ladder from. It lasts as long as one cut
+    /// takes — up to about half a minute — and it is the ordinary state for a
+    /// site the user has only just switched to on the live feed.
+    ///
+    /// It had no name, and what it fell through to was
+    /// [`ProductMissingFromVolume`](Self::ProductMissingFromVolume): *"this
+    /// volume carries no Reflectivity to cut"*. True, and about the wrong
+    /// thing. The volume carries no anything; the product is not implicated;
+    /// and changing moment — which is what that message invites — does nothing
+    /// at all. See `app_render::section_source_refusal` for why a merge can
+    /// resolve and still be empty.
+    AwaitingFirstSweep,
     /// The pane's product has no vertical structure to slice — the column
     /// integrals, the hybrid-scan composite, the derived velocity fields. See
     /// `rustdar_radar::sampler::samplable`.
@@ -559,6 +577,17 @@ impl SectionUnavailable {
             Self::AwaitingCoveragePattern => {
                 "This volume was joined mid-scan and its coverage pattern has not arrived yet, \
                  so there is no tilt ladder to cut along. It will appear on the next volume."
+                    .to_owned()
+            }
+            // One sentence, and deliberately: this is the state a user meets
+            // seconds after switching to a live site, and it is nothing going
+            // wrong. Naming what is being waited on (a tilt) and roughly how
+            // long (under a minute) is everything a reader can act on; the
+            // sibling above needs two sentences because a missing VCP message
+            // is a genuinely odd thing to have to explain.
+            Self::AwaitingFirstSweep => {
+                "This volume has only just started - the section appears with its first \
+                 completed tilt, within about half a minute."
                     .to_owned()
             }
             Self::ProductHasNoVerticalStructure(product) => format!(

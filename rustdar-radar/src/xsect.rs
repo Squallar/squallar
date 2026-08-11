@@ -394,6 +394,10 @@ pub struct CrossSection {
     /// See [`tilt_elevations_deg`](CrossSection::tilt_elevations_deg) for why
     /// this travels with the raster instead of being looked up.
     tilt_elevations_deg: Vec<f64>,
+    /// When each of those rungs was flown, milliseconds since the Unix epoch,
+    /// in the same order. See
+    /// [`tilt_collected_ms`](CrossSection::tilt_collected_ms).
+    tilt_collected_ms: Vec<i64>,
 }
 
 /// Equality that ignores a value where there is no value to compare.
@@ -425,6 +429,7 @@ impl PartialEq for CrossSection {
     fn eq(&self, other: &Self) -> bool {
         self.axes == other.axes
             && self.tilt_elevations_deg == other.tilt_elevations_deg
+            && self.tilt_collected_ms == other.tilt_collected_ms
             && self.image == other.image
             && self.status == other.status
             && self.values.len() == other.values.len()
@@ -483,6 +488,7 @@ impl CrossSection {
         status: Vec<u8>,
         axes: SectionAxes,
         tilt_elevations_deg: Vec<f64>,
+        tilt_collected_ms: Vec<i64>,
     ) -> Option<Self> {
         let pixels = SECTION_WIDTH * SECTION_HEIGHT;
         if image.len() != pixels * 4 || values.len() != pixels || status.len() != pixels {
@@ -510,6 +516,14 @@ impl CrossSection {
         {
             return None;
         }
+        // The clocks are one per rung too, and checked for the same reason the
+        // angles are: a consumer zips the two lists to say "this rung, this
+        // old", and a short list would either silently truncate the ladder or
+        // pair a rung with its neighbour's age — an age is a number a reader
+        // has no way to sanity-check by looking at the picture.
+        if tilt_collected_ms.len() != axes.tilt_count {
+            return None;
+        }
         // One pass over the two planes that have to agree with each other, so
         // the unknown-code test and the value-pairing test cannot drift apart
         // into two walks with two different ideas of which pixel is which.
@@ -526,6 +540,7 @@ impl CrossSection {
             status,
             axes,
             tilt_elevations_deg,
+            tilt_collected_ms,
         })
     }
 
@@ -586,6 +601,42 @@ impl CrossSection {
         &self.tilt_elevations_deg
     }
 
+    /// When each rung of [`tilt_elevations_deg`](Self::tilt_elevations_deg)
+    /// was flown, milliseconds since the Unix epoch, in the same order and the
+    /// same length. `0` for a rung whose chosen sweep carried no clock.
+    ///
+    /// # Why one time for the whole section is a lie
+    ///
+    /// A section *looks* like an instant. It is not: the radar flies one tilt
+    /// at a time, so the bottom rung and the top rung of the same picture are
+    /// minutes apart — four to five on a VCP 212, ten on a clear-air pattern —
+    /// and a SAILS repeat can leave one rung in the middle newer than both of
+    /// its neighbours. The pane used to caption the whole thing with a single
+    /// volume time, which reads as a photograph taken at that moment.
+    ///
+    /// The list is the ladder's own, from
+    /// [`VolumeSampler::collection_times_ms`](crate::sampler::VolumeSampler::collection_times_ms),
+    /// which reads the chosen sweep's radials — the same sweeps
+    /// [`crate::sampler::ladder_fingerprint`] keys the re-cut on. There is no
+    /// second notion of which sweep a rung came from anywhere, and there must
+    /// not be: an age attached to the wrong rung is unfalsifiable by looking at
+    /// the picture.
+    ///
+    /// It travels with the raster for the reason
+    /// [`tilt_elevations_deg`](Self::tilt_elevations_deg) does, and one more:
+    /// the pane keeps a section across a suspend/resume and re-uploads it
+    /// rather than re-cutting, precisely because the volume behind it may have
+    /// been evicted by then. Anything looked up beside the section would be
+    /// gone exactly when the section is still on screen.
+    pub fn tilt_collected_ms(&self) -> &[i64] {
+        &self.tilt_collected_ms
+    }
+
+    /// How long this ladder took to fly — see [`assembly_span_secs`].
+    pub fn assembly_span_secs(&self) -> Option<i64> {
+        assembly_span_secs(&self.tilt_collected_ms)
+    }
+
     /// The sample behind one pixel, re-paired from the value and status planes.
     ///
     /// This is what a hover readout wants: it can say "below the lowest beam"
@@ -605,6 +656,30 @@ impl CrossSection {
             Sample::missing(status)
         })
     }
+}
+
+/// How long a tilt ladder took to fly: the newest rung's clock less the
+/// oldest's, in seconds, over a list shaped like
+/// [`CrossSection::tilt_collected_ms`].
+///
+/// **`None` means "nothing here knows when anything was flown"**, and `Some(0)`
+/// means "as far as the clocks go, all at once". Those are different claims and
+/// collapsing them is how a caption comes to assert the second when it only has
+/// grounds for the first — a Level III-sourced or hand-built section carries no
+/// radial clocks at all, and it must stay silent rather than call itself
+/// instantaneous.
+///
+/// A free function rather than only a method because a **loop frame** drops the
+/// `CrossSection` behind its raster (the value and status planes are ~18 MB a
+/// frame) and keeps only the labels, this list among them.
+pub fn assembly_span_secs(tilt_collected_ms: &[i64]) -> Option<i64> {
+    // `0` is the decoder's "no clock" value, not a date, so it is filtered
+    // rather than minimised over — one unstamped rung would otherwise report a
+    // section assembled over half a century.
+    let mut clocked = tilt_collected_ms.iter().copied().filter(|&ms| ms > 0);
+    let first = clocked.next()?;
+    let (min, max) = clocked.fold((first, first), |(lo, hi), ms| (lo.min(ms), hi.max(ms)));
+    Some((max - min) / 1000)
 }
 
 /// Draw a vertical section of `scan` along `req`'s line, for a radar at
@@ -789,6 +864,9 @@ fn render_with_sampler(
         status,
         axes,
         tilt_elevations_deg: sampler.elevations_deg().collect(),
+        // The same ladder, in the same cut order, so the two lists zip into
+        // "this rung, this old" without either being re-derived.
+        tilt_collected_ms: sampler.collection_times_ms().collect(),
     })
 }
 
@@ -964,7 +1042,14 @@ const MAGIC: [u8; 4] = *b"RDXS";
 ///   is not a version 2 payload missing three fields — it is a payload whose
 ///   consumer would have to invent a ladder to draw, which is the fabrication
 ///   the whole change exists to remove. So it is refused rather than defaulted.
-const FORMAT_VERSION: u16 = 2;
+/// * **2 -> 3**: the section gained each rung's **collection timestamp**, beside
+///   the rung elevations it already carried. A version 2 payload is a ladder
+///   with no clocks, and a consumer would have to date its rungs from the one
+///   volume time the pane already had — which is exactly the single-instant
+///   claim [`CrossSection::tilt_collected_ms`] exists to withdraw. Refused
+///   rather than zero-filled, because a zero here is indistinguishable from a
+///   real sweep that carried no clock.
+const FORMAT_VERSION: u16 = 3;
 
 impl CrossSection {
     /// Encode for transport. Little-endian throughout; the image and status
@@ -1020,6 +1105,14 @@ impl CrossSection {
         out.extend_from_slice(&(self.tilt_elevations_deg.len() as u32).to_le_bytes());
         for elevation in &self.tilt_elevations_deg {
             out.extend_from_slice(&elevation.to_le_bytes());
+        }
+        // The clocks, length-prefixed for the same reason the angles are: the
+        // two lists and `tilt_count` are made to agree in `from_parts`, and a
+        // decoder that derived any of the three from another could not hand it
+        // a disagreement to refuse.
+        out.extend_from_slice(&(self.tilt_collected_ms.len() as u32).to_le_bytes());
+        for collected in &self.tilt_collected_ms {
+            out.extend_from_slice(&collected.to_le_bytes());
         }
 
         out.extend_from_slice(&(self.image.len() as u32).to_le_bytes());
@@ -1082,6 +1175,12 @@ impl CrossSection {
             tilt_elevations_deg.push(r.f64()?);
         }
 
+        let clock_len = r.u32()?;
+        let mut tilt_collected_ms = Vec::with_capacity(r.bounded(clock_len, 8)?);
+        for _ in 0..clock_len {
+            tilt_collected_ms.push(r.i64()?);
+        }
+
         // One byte per element, so `take` is the bound: it can only hand back
         // a slice that is really there, and nothing is reserved on the claimed
         // length before that.
@@ -1106,7 +1205,14 @@ impl CrossSection {
         if !r.at_end() {
             return None;
         }
-        Self::from_parts(image, values, status, axes, tilt_elevations_deg)
+        Self::from_parts(
+            image,
+            values,
+            status,
+            axes,
+            tilt_elevations_deg,
+            tilt_collected_ms,
+        )
     }
 
     /// What [`to_bytes`](Self::to_bytes) will write, exactly.
@@ -1125,6 +1231,7 @@ impl CrossSection {
         header
             + axes
             + (4 + self.tilt_elevations_deg.len() * 8)
+            + (4 + self.tilt_collected_ms.len() * 8)
             + (4 + self.image.len())
             + (4 + self.values.len() * 4)
             + (4 + self.status.len())
@@ -1158,6 +1265,10 @@ impl<'a> Reader<'a> {
 
     fn u16(&mut self) -> Option<u16> {
         Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
+    }
+
+    fn i64(&mut self) -> Option<i64> {
+        Some(i64::from_le_bytes(self.take(8)?.try_into().ok()?))
     }
 
     fn u32(&mut self) -> Option<u32> {

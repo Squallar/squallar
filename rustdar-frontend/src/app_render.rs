@@ -867,10 +867,11 @@ impl super::App {
                 base.as_ref().map(|(scan, _)| scan.as_ref()),
                 overlay.as_ref().map(|live| live.scan.as_ref()),
             ) {
-                // Both reasons resolve themselves — the mid-flight pattern
-                // arrives with the next volume start, the first download is
-                // already in flight — so the key is *not* written: the pane
-                // will ask again, and get an answer.
+                // All three reasons resolve themselves — the mid-flight
+                // pattern arrives with the next volume start, the first sealed
+                // sweep is minutes away at most, the first download is already
+                // in flight — so the key is *not* written: the pane will ask
+                // again, and get an answer.
                 self.mark_section_unavailable(pane_idx, reason);
                 continue;
             }
@@ -2865,12 +2866,45 @@ impl super::App {
 /// when one can.
 ///
 /// A pure function of the two holders so the decision is testable without a
-/// live chunk feed. The distinction between its two answers is the load-bearing
-/// part: an overlay carrying sealed sweeps but no pattern is the mid-flight
-/// join — `chunks.rs` stands in an empty coverage pattern until the VCP
-/// message lands, and `current::resolve` correctly refuses to key a flight by
-/// another flight's table — while nothing at all is the cold-start download.
-/// Both clear themselves, and each needs its own sentence.
+/// live chunk feed. The distinctions between its three answers are the
+/// load-bearing part, and all three are mid-flight or cold-start states that
+/// clear themselves — each needs its own sentence:
+///
+/// * an overlay carrying sealed sweeps but **no pattern** is the mid-flight
+///   join before the VCP message: `chunks.rs` stands in an empty coverage
+///   pattern until it lands, and `current::resolve` correctly refuses to key a
+///   flight by another flight's table;
+/// * an overlay carrying a **pattern with nothing sealed yet** is the same join
+///   one step later, and it is the one that used to have no name at all — see
+///   below;
+/// * nothing at all is the cold-start download.
+///
+/// # The merge that resolves and is still empty
+///
+/// `current::resolve` answers "can these two volumes be keyed onto one ladder",
+/// not "is there anything on it". A feed that joins after a volume start but
+/// before the first seal, with no archive base yet, gives it a pattern it can
+/// key and zero sweeps to key — so it succeeds, returning a merged volume with
+/// an empty sweep list, and this function used to read that as "a section can
+/// be cut".
+///
+/// Nothing downstream could recover. `ladder_fingerprint` answers `None` over
+/// no sweeps so the staleness key was `0`; the extraction found no moment and
+/// `spawn_section_render` returned [`SectionDispatch::NoPayload`], which named
+/// the state `ProductMissingFromVolume` — *"this volume carries no Reflectivity
+/// to cut"*. That is a true sentence about the wrong thing: the volume carries
+/// no anything, this has nothing to do with the product, and switching moment
+/// (which is what the message invites) changes nothing. Meanwhile the dispatch
+/// logged "no volume payload" once per key, and the pane stood blank for the
+/// rest of the volume's first tilt — up to ~30 s.
+///
+/// Refusing here fixes both halves at once, and that is why it is here rather
+/// than in the dispatch's `NoPayload` arm: the pane gets a sentence about
+/// *waiting*, and the render path is never entered, so there is nothing left to
+/// log. The key is deliberately not written by the caller for any of these
+/// three, because all three are answered by the next thing that arrives.
+///
+/// [`SectionDispatch::NoPayload`]: crate::render_dispatch::SectionDispatch::NoPayload
 fn section_source_refusal(
     base: Option<&nexrad_model::data::Scan>,
     overlay: Option<&nexrad_model::data::Scan>,
@@ -2879,8 +2913,18 @@ fn section_source_refusal(
     // — the admission rule reads cut angles and elevation numbers only — so
     // this asks the question with empty ones rather than threading tables into
     // a pure predicate about coverage.
-    if rustdar_radar::current::resolve(base.map(Into::into), overlay.map(Into::into)).is_some() {
-        return None;
+    if let Some(current) =
+        rustdar_radar::current::resolve(base.map(Into::into), overlay.map(Into::into))
+    {
+        // Asked of the **merged** sweep list rather than of either source's,
+        // because that list is what the cut would be taken from: a base whose
+        // every sweep the admission rule dropped on a VCP change resolves to
+        // exactly the same nothing as a flight that has sealed nothing yet, and
+        // the pane owes the same sentence for both.
+        return current
+            .sweeps()
+            .is_empty()
+            .then_some(rustdar_egui::pane::SectionUnavailable::AwaitingFirstSweep);
     }
     if overlay.is_some_and(|scan| !scan.sweeps().is_empty()) {
         return Some(rustdar_egui::pane::SectionUnavailable::AwaitingCoveragePattern);
@@ -3138,6 +3182,7 @@ fn accept_section_result(
         texture: upload(color_image),
         axes,
         tilt_elevations_deg: std::mem::take(&mut sr.tilt_elevations_deg),
+        tilt_collected_ms: std::mem::take(&mut sr.tilt_collected_ms),
         ladder: sr.ladder,
     };
     frame.image = Some(rustdar_egui::pane::LoopFrameImage::Section(image.clone()));

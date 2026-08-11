@@ -4,6 +4,23 @@ use super::*;
 /// that are about the *rest* of the layout. Real ones come from
 /// [`lay_out_caption`], which needs fonts.
 const ONE_LINE: f32 = 15.0;
+/// Feet per kilometre, for the tests that check a `Feet` locale's height.
+///
+/// **The tests' own constant, not the module's.** The pane converts through
+/// `HeightUnit::convert_km_to_kilo` now; a test that computed its expectation
+/// with the same call would pass against any self-consistent wrong formula,
+/// the identity included.
+const KM_TO_KFT: f64 = 1.0 / 0.3048;
+/// A ladder carrying no rungs and no clocks, for the tests that are about
+/// something other than age.
+///
+/// A section built from one knows nothing about when anything was flown, which
+/// is exactly the state in which the caption and the ⓘ detail must say nothing
+/// about it — so these tests also pin that the age work is silent by default.
+const BARE_LADDER: Ladder<'static> = Ladder {
+    elevations_deg: &[],
+    collected_ms: &[],
+};
 /// Two wrapped rows, for the tests about the caption taking room.
 const TWO_LINES: f32 = 30.0;
 
@@ -290,6 +307,7 @@ fn the_caption_wraps_and_the_layout_pays_for_the_rows_it_takes() {
                 &truncated,
                 RadarProduct::Reflectivity,
                 None,
+                BARE_LADDER,
                 None,
                 true,
                 &visuals,
@@ -375,6 +393,7 @@ fn the_caption_wraps_and_the_layout_pays_for_the_rows_it_takes() {
                 &truncated,
                 RadarProduct::Reflectivity,
                 None,
+                BARE_LADDER,
                 Some(crate::pane::SectionUnavailable::RenderFailed),
                 true,
                 &visuals,
@@ -413,6 +432,7 @@ fn a_degenerate_ladder_does_not_report_itself_as_a_perfect_one() {
             &axes,
             RadarProduct::Reflectivity,
             None,
+            BARE_LADDER,
             None,
             false,
             &visuals,
@@ -502,6 +522,7 @@ fn a_ladder_that_stopped_short_stays_calm_and_explains_on_request() {
             &axes,
             RadarProduct::Reflectivity,
             None,
+            BARE_LADDER,
             None,
             detail_open,
             &visuals,
@@ -698,6 +719,7 @@ fn red_is_reserved_for_broken_states() {
             &axes,
             RadarProduct::Reflectivity,
             None,
+            BARE_LADDER,
             unavailable,
             false,
             &visuals,
@@ -899,4 +921,460 @@ fn the_plot_leaves_room_for_whichever_edge_the_colour_bar_took() {
     // than reserving both edges always.
     assert!(horizontal.plot.right() > vertical.plot.right());
     assert!(vertical.plot.bottom() > horizontal.plot.bottom());
+}
+
+/// **One line, one length, one unit.** The chip over the plot and the rest of
+/// the app convert the same quantity through the same `DistanceUnit`.
+///
+/// The failure this pins is not cosmetic. A user who reads `62` on the pane and
+/// `100` in the sidebar for the line they just drew does not conclude that one
+/// of them is in miles; they conclude that the app disagrees with itself about
+/// where their cut is. The chip's own doc used to describe it as miles outright.
+///
+/// # The expectations are independent of the code
+///
+/// The fixture line runs **one degree of latitude due north**, which on
+/// `rustdar_radar`'s 6371 km sphere is `6371 · π/180` = 111.19 km — a number
+/// that comes from the sphere's radius, not from `edit::length_km`. In miles
+/// that is 69.1, in nautical miles 60.0 (a degree of latitude *is* a nautical
+/// mile by definition, which is a second independent check on the whole chain).
+/// A test that formatted its expectation with `convert_from_km` would pass
+/// against a chip hardcoded to any single unit.
+#[test]
+fn the_line_chip_reads_in_the_users_own_distance_unit() {
+    use rustdar_units::DistanceUnit;
+
+    let line = crate::pane::SectionLine::new(
+        crate::pane::GeoPoint {
+            lat: 35.0,
+            lon: -97.0,
+        },
+        crate::pane::GeoPoint {
+            lat: 36.0,
+            lon: -97.0,
+        },
+    )
+    .expect("two distinct finite points");
+
+    let with = |unit: DistanceUnit| {
+        let prefs = UserPreferences {
+            distance: unit,
+            ..UserPreferences::default()
+        };
+        line_readout(line, &prefs)
+    };
+
+    assert_eq!(
+        with(DistanceUnit::Kilometers),
+        "000\u{b0} - 111km",
+        "a metric user's chip is not in kilometres"
+    );
+    assert_eq!(
+        with(DistanceUnit::Miles),
+        "000\u{b0} - 69mi",
+        "a miles user's chip is not in miles"
+    );
+    assert_eq!(
+        with(DistanceUnit::NauticalMiles),
+        "000\u{b0} - 60nmi",
+        "a degree of latitude is sixty nautical miles by definition, so this \
+         is the arithmetic checking itself"
+    );
+
+    // And the three really are three, rather than one unit relabelled.
+    let all = [
+        with(DistanceUnit::Kilometers),
+        with(DistanceUnit::Miles),
+        with(DistanceUnit::NauticalMiles),
+    ];
+    for (i, a) in all.iter().enumerate() {
+        for b in &all[i + 1..] {
+            assert_ne!(a, b, "two distance units render the same chip");
+        }
+    }
+}
+
+/// Milliseconds since the epoch that every age fixture below is measured from.
+/// An arbitrary but *real* instant, so nothing here can accidentally rely on
+/// `0` — which is the decoder's "no clock" sentinel and must keep meaning that.
+const T0: i64 = 1_760_000_000_000;
+
+/// A ladder whose rungs were flown `secs` apart, oldest (lowest) first — the
+/// order a radar actually flies a volume in.
+fn ladder_flown_over(elevations: &[f64], step_secs: i64) -> (Vec<f64>, Vec<i64>) {
+    let clocks = (0..elevations.len())
+        .map(|i| T0 + (i as i64) * step_secs * 1000)
+        .collect();
+    (elevations.to_vec(), clocks)
+}
+
+/// **The caption says how long the section took to assemble only when that is
+/// beyond what one volume accounts for.**
+///
+/// Every section is assembled over minutes; a clause on the ordinary case
+/// would be exactly the constant qualifier the caption redesign removed, and
+/// a qualifier that fires always stops being read. `ASSEMBLY_SPAN_CAPTION_MIN_SECS`
+/// carries the reasoning; this pins the behaviour on both sides of it.
+///
+/// The expectations are **literals**. A test that built its own expected string
+/// out of `whole_minutes` and the same threshold would agree with any threshold
+/// at all, including none.
+#[test]
+fn the_caption_names_the_assembly_span_only_when_it_is_beyond_one_volume() {
+    let prefs = UserPreferences::default();
+    let visuals = egui::Visuals::dark();
+    let headline = |elevations: &[f64], step_secs: i64| {
+        let (degs, clocks) = ladder_flown_over(elevations, step_secs);
+        let axes = axes();
+        caption_lines(
+            &axes,
+            RadarProduct::Reflectivity,
+            None,
+            Ladder {
+                elevations_deg: &degs,
+                collected_ms: &clocks,
+            },
+            None,
+            false,
+            &visuals,
+            &prefs,
+        )
+        .swap_remove(0)
+        .text
+    };
+
+    // Four rungs 80 s apart is a four-minute volume: an ordinary VCP 12, and
+    // the caption stays quiet.
+    let tight = headline(&[0.5, 1.5, 2.4, 3.4], 80);
+    assert!(
+        !tight.contains("assembled"),
+        "a four-minute volume was qualified, which is the constant-qualifier \
+         failure the caption was redesigned to remove: {tight}"
+    );
+
+    // Four rungs two minutes apart is six minutes end to end — a ladder
+    // stitched across a volume boundary, which the single volume stamp hides.
+    let stretched = headline(&[0.5, 1.5, 2.4, 3.4], 120);
+    assert!(
+        stretched.contains("assembled over 6 min"),
+        "a six-minute spread was not reported: {stretched}"
+    );
+
+    // The boundary itself, both sides of it, in seconds rather than in
+    // whatever the caption rounds to.
+    let (degs, mut clocks) = ladder_flown_over(&[0.5, 1.5], 0);
+    let at_threshold = {
+        clocks[1] = T0 + ASSEMBLY_SPAN_CAPTION_MIN_SECS * 1000;
+        let axes = axes();
+        caption_lines(
+            &axes,
+            RadarProduct::Reflectivity,
+            None,
+            Ladder {
+                elevations_deg: &degs,
+                collected_ms: &clocks,
+            },
+            None,
+            false,
+            &visuals,
+            &prefs,
+        )
+        .swap_remove(0)
+        .text
+    };
+    assert!(
+        at_threshold.contains("assembled over 5 min"),
+        "the threshold is exclusive where it is documented inclusive: \
+         {at_threshold}"
+    );
+    let just_under = {
+        clocks[1] = T0 + (ASSEMBLY_SPAN_CAPTION_MIN_SECS - 1) * 1000;
+        let axes = axes();
+        caption_lines(
+            &axes,
+            RadarProduct::Reflectivity,
+            None,
+            Ladder {
+                elevations_deg: &degs,
+                collected_ms: &clocks,
+            },
+            None,
+            false,
+            &visuals,
+            &prefs,
+        )
+        .swap_remove(0)
+        .text
+    };
+    assert!(
+        !just_under.contains("assembled"),
+        "one second under the threshold still fired: {just_under}"
+    );
+
+    // A ladder with no clocks says nothing at all — which is a different
+    // statement from "flown all at once", and must not render as one.
+    let silent = headline(&[0.5, 1.5, 2.4], 0);
+    assert!(
+        !silent.contains("assembled"),
+        "a ladder flown in one instant claimed a span: {silent}"
+    );
+    let unclocked = {
+        let axes = axes();
+        caption_lines(
+            &axes,
+            RadarProduct::Reflectivity,
+            None,
+            Ladder {
+                elevations_deg: &[0.5, 1.5, 2.4],
+                collected_ms: &[0, 0, 0],
+            },
+            None,
+            false,
+            &visuals,
+            &prefs,
+        )
+        .swap_remove(0)
+        .text
+    };
+    assert!(
+        !unclocked.contains("assembled"),
+        "a section that knows nothing about when it was flown described its \
+         own assembly: {unclocked}"
+    );
+}
+
+/// **The ⓘ detail carries the whole ladder: rung, elevation, age.** That is
+/// where the user asked for detail, so detail is allowed there — and it is the
+/// only place the per-rung spread is given rung by rung.
+///
+/// The ages are against the **newest rung in this section**, not the wall
+/// clock, so the sentence reads the same for a live volume and for an archive
+/// one three years old. Expectations are literals for the reason the caption's
+/// are.
+#[test]
+fn the_info_detail_lists_every_rung_with_its_own_age() {
+    let prefs = UserPreferences::default();
+    let visuals = egui::Visuals::dark();
+    let lines = |degs: &[f64], clocks: &[i64], detail_open: bool| {
+        let axes = axes();
+        caption_lines(
+            &axes,
+            RadarProduct::Reflectivity,
+            None,
+            Ladder {
+                elevations_deg: degs,
+                collected_ms: clocks,
+            },
+            None,
+            detail_open,
+            &visuals,
+            &prefs,
+        )
+    };
+
+    // Three rungs three minutes apart: the bottom of the picture is six
+    // minutes older than the top.
+    let (degs, clocks) = ladder_flown_over(&[0.5, 2.4, 8.0], 180);
+    let detail: String = lines(&degs, &clocks, true)
+        .iter()
+        .skip(1)
+        .map(|l| l.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        detail.contains("1: 0.5\u{b0} 6 min older"),
+        "the lowest rung's own age is missing: {detail}"
+    );
+    assert!(
+        detail.contains("2: 2.4\u{b0} 3 min older"),
+        "the middle rung's age is missing or misattributed: {detail}"
+    );
+    assert!(
+        detail.contains("3: 8.0\u{b0} newest"),
+        "the reference rung is given as a rounding artefact rather than named: \
+         {detail}"
+    );
+    assert!(
+        detail.contains("older each is than the newest tilt"),
+        "the list does not state what its numbers are measured against, and \
+         '6 min' alone is ambiguous by a whole volume: {detail}"
+    );
+
+    // And it is the ⓘ's, not the default line's: the closed caption is one
+    // line and says none of this.
+    let closed = lines(&degs, &clocks, false);
+    assert_eq!(closed.len(), 1, "a closed detail contributed caption lines");
+    assert!(
+        !closed[0].text.contains("0.5\u{b0} 6 min"),
+        "the per-rung ladder leaked into the calm default line: {}",
+        closed[0].text
+    );
+
+    // A ladder with no clocks contributes no list at all. "Unknown" repeated
+    // once per rung is noise wearing the shape of information.
+    let unclocked: String = lines(&degs, &[0, 0, 0], true)
+        .iter()
+        .skip(1)
+        .map(|l| l.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !unclocked.contains("flown one at a time"),
+        "a section with no clocks listed ages anyway: {unclocked}"
+    );
+    // ...while the detail lines that do not depend on clocks still appear, so
+    // the silence is about the ages rather than about the whole panel.
+    assert!(
+        unclocked.contains("interpolated"),
+        "the clock-less section lost the rest of its detail: {unclocked}"
+    );
+}
+
+/// **The hover names the sweep the pixel under the pointer came from, and how
+/// much older it is than the freshest tilt in the same picture.**
+///
+/// This is where someone is asking about a *specific point*, and it is the one
+/// place the readout can attribute a value to a moment. The readout already
+/// carries this kind of qualifier ("below the lowest beam", "range folded"), so
+/// the sentence has a shape to join.
+///
+/// # How the geometry is pinned without recomputing it
+///
+/// The fixture flies two rungs, 0.5° and 5.0°, over a line running due east
+/// from the site — so at the `A` end the two beams are kilometres apart in
+/// height and there is no ambiguity about which one a given row is nearest.
+/// The **low rung is the older one**, which is the order a radar flies a
+/// volume in and the order that makes a mis-zipped pair (ages against the
+/// wrong rungs) fail rather than pass.
+#[test]
+fn the_hover_names_the_sweep_it_came_from_and_how_old_it_is() {
+    use rustdar_radar::sampler::SampleStatus;
+    use rustdar_radar::xsect::CrossSection;
+
+    let (site_lat, site_lon) = (35.0, -97.0);
+    let line = crate::pane::SectionLine::new(
+        crate::pane::GeoPoint {
+            lat: site_lat,
+            lon: -96.0,
+        },
+        crate::pane::GeoPoint {
+            lat: site_lat,
+            lon: -95.0,
+        },
+    )
+    .expect("two distinct finite points");
+
+    // Six minutes between the two rungs, so the low one is unambiguously old
+    // and the high one is the reference.
+    let (degs, clocks) = ladder_flown_over(&[0.5, 5.0], 360);
+    let axes = SectionAxes {
+        length_km: 91.0,
+        base_km_msl: 0.0,
+        top_km_msl: 20.0,
+        near_ground_range_km: 91.0,
+        far_ground_range_km: 182.0,
+        coverage_ground_range_km: 182.0,
+        cone_of_silence_km: 0.0,
+        tilt_count: 2,
+        widest_tilt_gap_deg: 4.5,
+        top_tilt_deg: 5.0,
+        top_declared_cut_deg: 19.5,
+    };
+    let pixels = SECTION_WIDTH * SECTION_HEIGHT;
+    let section = CrossSection::from_parts(
+        vec![0u8; pixels * 4],
+        vec![f32::NAN; pixels],
+        vec![SampleStatus::BelowThreshold.wire_code(); pixels],
+        axes,
+        degs.clone(),
+        clocks.clone(),
+    )
+    .expect("a full-size section with a two-rung clocked ladder is well formed");
+
+    let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 500.0));
+    let layout = SectionLayout::new(rect, crate::ui::PILL_ROW_CLEARANCE, ONE_LINE, false);
+    let source = SectionSource {
+        ladder: Ladder {
+            elevations_deg: &degs,
+            collected_ms: &clocks,
+        },
+        line,
+        site_lat,
+        site_lon,
+    };
+    // The `A` end of the line, where the two beams are furthest apart in the
+    // vertical. `x_of_distance(0)` is the plot's left edge, which is inside it.
+    let at = |km_msl: f64| egui::pos2(layout.plot.left() + 1.0, layout.y_of_height(&axes, km_msl));
+    let read = |km_msl: f64, prefs: &UserPreferences| {
+        hover_readout(
+            &section,
+            &layout,
+            at(km_msl),
+            RadarProduct::Reflectivity,
+            Some(source),
+            prefs,
+        )
+        .expect("the pointer is inside the plot")
+    };
+    let prefs = UserPreferences::default();
+
+    // Low in the picture: the 0.5° beam, six minutes older than the 5.0° one.
+    let low = read(1.5, &prefs);
+    assert!(
+        low.contains("0.5\u{b0} sweep - 6 min old"),
+        "the low rung was not named, or was paired with the wrong clock: {low}"
+    );
+
+    // High in the picture: the 5.0° beam, which *is* the newest, so no age
+    // qualifier at all — a `0 min old` under every pixel is the caption's
+    // withdrawn mistake in miniature.
+    let high = read(7.5, &prefs);
+    assert!(
+        high.contains("5.0\u{b0} sweep"),
+        "the high rung was not named: {high}"
+    );
+    assert!(
+        !high.contains("min old"),
+        "the freshest rung in the section was qualified as old: {high}"
+    );
+
+    // Outside the ladder there is no source, and the value field already says
+    // which side. Naming a sweep for a blank it did not produce is the same
+    // confident-and-wrong the cone-of-silence wording was fixed for.
+    for outside in [0.05, 19.5] {
+        let text = read(outside, &prefs);
+        assert!(
+            !text.contains("sweep"),
+            "a pixel at {outside} km MSL, outside the ladder entirely, was \
+             attributed to a tilt: {text}"
+        );
+    }
+
+    // The readout keeps its existing shape either side of the addition.
+    assert!(low.contains("below threshold"), "{low}");
+    assert!(low.contains("MSL"), "{low}");
+
+    // And the height half of it follows the user's unit preference, through
+    // `HeightUnit` like everything else. 1.5 km is 4.921 kft by the definition
+    // of the international foot — an expectation that owes nothing to the
+    // conversion under test.
+    let metric = UserPreferences {
+        height: rustdar_units::HeightUnit::Meters,
+        ..UserPreferences::default()
+    };
+    assert!(
+        read(1.5, &metric).contains("1.5 km MSL"),
+        "{}",
+        read(1.5, &metric)
+    );
+    let imperial = UserPreferences {
+        height: rustdar_units::HeightUnit::Feet,
+        ..UserPreferences::default()
+    };
+    assert!(
+        read(1.5, &imperial).contains("4.9 kft MSL"),
+        "{}",
+        read(1.5, &imperial)
+    );
 }

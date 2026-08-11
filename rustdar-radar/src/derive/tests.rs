@@ -68,6 +68,27 @@ fn sweep_with(
     n_gates: usize,
     fields: Fields<'_>,
 ) -> Sweep {
+    sweep_with_clock(
+        0,
+        elevation_number,
+        elevation_deg,
+        n_radials,
+        n_gates,
+        fields,
+    )
+}
+
+/// [`sweep_with`] with a clock on every radial, milliseconds since the Unix
+/// epoch. `0` is the decoder's own "no timestamp" value, which is what every
+/// fixture that does not care about time passes.
+fn sweep_with_clock(
+    collected_ms: i64,
+    elevation_number: u8,
+    elevation_deg: f32,
+    n_radials: usize,
+    n_gates: usize,
+    fields: Fields<'_>,
+) -> Sweep {
     let encode = |v: Option<f64>, scale: f64, offset: f64| -> u8 {
         match v {
             None => 0,
@@ -101,7 +122,7 @@ fn sweep_with(
                 ))
             };
             Radial::new(
-                0,
+                collected_ms,
                 i as u16,
                 az as f32,
                 spacing,
@@ -515,6 +536,79 @@ fn kdp_is_the_phase_derivative_not_relabelled_phase() {
             (0.1..1.2).contains(&v),
             "a 1 °/km ΦDP ramp must derive to ≈0.5 °/km, not {v} — raw \
                  phase would read tens of degrees",
+        );
+    }
+}
+
+/// **A derivation keeps the tilt's clock.**
+///
+/// `synth_sweep` builds fresh radials for a tilt the radar already flew, and it
+/// used to stamp `0` on their collection timestamps because nothing read one.
+/// Now something does: a section pane reports how old the rung under the
+/// pointer is, and that age is read off these radials.
+///
+/// Left unfixed the failure would have been invisible in exactly the way this
+/// campaign keeps paying for — every *native* moment's section would date its
+/// rungs correctly while storm-relative velocity, NROT and KDP silently could
+/// not, with no error, no warning and nothing in the picture to point at.
+///
+/// The two tilts carry clocks a minute apart, so a derivation that stamped one
+/// constant across the volume fails as well as one that stamped zero.
+#[test]
+fn a_derived_sweep_keeps_the_clock_of_the_tilt_it_was_computed_from() {
+    const T0: i64 = 1_760_000_000_000;
+    // A rotational couplet's worth of velocity, plus the phase and correlation
+    // KDP needs, so all three derivations have something to run on.
+    let fields = &|az: f64, slant: f64| {
+        (
+            Some(30.0),
+            Some(if az < 180.0 { 20.0 } else { -20.0 }),
+            Some(slant * 2.0),
+            Some(0.98),
+        )
+    };
+    let scan = Scan::new(
+        vcp(&[0.5, 1.5]),
+        vec![
+            sweep_with_clock(T0, 1, 0.53, 360, 240, fields),
+            sweep_with_clock(T0 + 60_000, 2, 1.47, 360, 240, fields),
+        ],
+    );
+
+    // precondition: the source really is clocked, and not all alike.
+    let source_clocks: Vec<i64> = scan
+        .sweeps()
+        .iter()
+        .map(|s| crate::render_input::sweep_collected_ms(s.radials()))
+        .collect();
+    assert_eq!(
+        source_clocks,
+        vec![T0, T0 + 60_000],
+        "precondition: the fixture's tilts are not clocked a minute apart",
+    );
+
+    for product in [
+        RadarProduct::StormRelativeVelocity,
+        RadarProduct::NormalizedRotation,
+        RadarProduct::SpecificDifferentialPhase,
+    ] {
+        // A motion vector for SRV; the other two read none.
+        let prepared = prepare(&scan, product, Some((30.0, 240.0)))
+            .unwrap_or_else(|| panic!("{product:?} derives from this fixture"));
+        let derived = match &prepared {
+            Prepared::Derived(scan) => scan,
+            Prepared::Native(_) => panic!("{product:?} took the native path"),
+        };
+        let clocks: Vec<i64> = derived
+            .sweeps()
+            .iter()
+            .map(|s| crate::render_input::sweep_collected_ms(s.radials()))
+            .collect();
+        assert_eq!(
+            clocks, source_clocks,
+            "{product:?}: the derived tilts lost the clocks of the tilts they \
+             were computed from, so every rung age a derived section reports \
+             is missing or wrong",
         );
     }
 }

@@ -318,6 +318,14 @@ pub struct LoopSectionResponse {
     pub axes: Option<rustdar_radar::xsect::SectionAxes>,
     /// See [`Self::axes`].
     pub tilt_elevations_deg: Vec<f64>,
+    /// When each of those rungs was flown, milliseconds since the Unix epoch,
+    /// in the same order — `rustdar_radar::xsect::CrossSection::tilt_collected_ms`.
+    ///
+    /// A label on the picture like the two above it, and it travels for the
+    /// same reason: a loop frame drops the `CrossSection` behind its raster, so
+    /// a frame whose ages were looked up beside it would be captioned with the
+    /// live cut's ladder while showing its own.
+    pub tilt_collected_ms: Vec<i64>,
 }
 
 /// One round of a site's real-time chunk feed.

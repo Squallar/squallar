@@ -252,6 +252,140 @@ fn the_section_refusal_tells_a_mid_scan_join_from_a_cold_start() {
     );
 }
 
+/// **A volume that has started and sealed nothing has a name of its own.**
+///
+/// `current::resolve` answers "can these volumes be keyed onto one ladder",
+/// not "is there anything on it". A live feed that joins after a volume
+/// start but before the first seal, with no archive base yet, hands it a
+/// pattern it can key and zero sweeps to key — so it *succeeds*, with an
+/// empty sweep list, and the refusal used to read that as "a section can be
+/// cut".
+///
+/// What the pane then got was the wrong sentence. The extraction found no
+/// moment, the dispatch answered `NoPayload`, and the state was named
+/// `ProductMissingFromVolume`: *"this volume carries no Reflectivity to
+/// cut"* — true, and about the wrong thing. The volume carries no anything,
+/// the product is not implicated, and switching moment — which is what that
+/// message invites — changes nothing. The pane stood blank meanwhile for
+/// the rest of the first tilt, up to ~30 s.
+///
+/// Both halves are fixed by refusing *here*, before any dispatch: the
+/// second assertion below is the log-spam half, because
+/// `spawn_section_render` — the only thing that logs "no volume payload" —
+/// is unreachable for a state the refusal has already named.
+#[test]
+fn a_volume_with_no_sealed_sweep_yet_is_named_rather_than_blamed_on_the_product() {
+    // A pattern, so `resolve` can key a ladder, and no sweeps to put on it.
+    let started = volume_of(0, vec![one_cut()]);
+    assert!(
+        started.sweeps().is_empty(),
+        "precondition: the fixture is a started volume with nothing sealed"
+    );
+    assert!(
+        !started.coverage_pattern().elevation_cuts().is_empty(),
+        "precondition: the pattern has arrived, so this is not the \
+             `AwaitingCoveragePattern` case"
+    );
+    assert!(
+        rustdar_radar::current::resolve(None, Some((&*started).into())).is_some(),
+        "precondition: the merge resolves — that is exactly why this state \
+             had no name"
+    );
+
+    assert_eq!(
+        section_source_refusal(None, Some(&started)),
+        Some(SectionUnavailable::AwaitingFirstSweep),
+        "a volume that has sealed nothing yet was reported as a product \
+             problem, or not reported at all"
+    );
+
+    // The log-spam half. A refusal is a `Some`, and a `Some` makes
+    // `dispatch_section_renders` `continue` before it reaches
+    // `spawn_section_render` — the only caller of the "no volume payload"
+    // log. Naming the state is what silences it.
+    assert!(
+        section_source_refusal(None, Some(&started)).is_some(),
+        "the dispatch would be entered for a volume with nothing in it, and \
+             would log its refusal for as long as the volume stood"
+    );
+
+    // And the message is about waiting, not about the moment: nothing in it
+    // invites the user to change product, because that would not help.
+    let message = SectionUnavailable::AwaitingFirstSweep.message();
+    assert!(
+        message.contains("only just started"),
+        "the message does not say what is being waited on: {message}"
+    );
+    assert!(
+        message.contains("tilt"),
+        "the message does not name the thing that will end the wait: {message}"
+    );
+    assert!(
+        !message.to_lowercase().contains("carries no"),
+        "the message still blames the product for an empty volume: {message}"
+    );
+
+    // The sibling states keep their own sentences: three ways of waiting,
+    // three different things to say, and a collapse of any two is the
+    // failure this whole enum exists to prevent.
+    let messages = [
+        SectionUnavailable::AwaitingVolume.message(),
+        SectionUnavailable::AwaitingCoveragePattern.message(),
+        SectionUnavailable::AwaitingFirstSweep.message(),
+    ];
+    for (i, a) in messages.iter().enumerate() {
+        for b in &messages[i + 1..] {
+            assert_ne!(a, b, "two waiting states say the same thing");
+        }
+    }
+
+    // With one sealed sweep the refusal is gone, so this really is about
+    // emptiness rather than about live volumes in general.
+    let sealed = volume_of(1, vec![one_cut()]);
+    assert_eq!(
+        section_source_refusal(None, Some(&sealed)),
+        None,
+        "a volume with a sealed sweep on a keyable pattern is a section"
+    );
+}
+
+/// The refusal reaches the **pane**, not just the predicate: an empty live
+/// volume leaves the section labelled and un-keyed, so it asks again the
+/// moment the first tilt seals.
+#[test]
+fn an_empty_live_volume_labels_the_pane_and_keeps_it_asking() {
+    let mut app = app_with_section(RadarProduct::Reflectivity, volume(vec![one_cut()]));
+    // No archive base — the live-feed-only case — and a started volume with
+    // nothing sealed standing in for the chunk feed's snapshot.
+    app.base_scans.clear();
+    app.base_scans.insert(
+        SITE.to_owned(),
+        (
+            volume_of(0, vec![one_cut()]),
+            Default::default(),
+            volume_time(),
+        ),
+    );
+
+    app.dispatch_section_renders();
+
+    assert_eq!(
+        state(&app).unavailable,
+        Some(SectionUnavailable::AwaitingFirstSweep),
+        "a started, empty volume left the pane blank or blamed the product"
+    );
+    assert_eq!(
+        state(&app).rendered_for,
+        None,
+        "the key was written for a state the next sealed sweep resolves, so \
+             the pane would never ask again"
+    );
+    assert!(
+        !app.render.pane_render[0].render_in_flight,
+        "a render slot was spent on a volume with nothing in it"
+    );
+}
+
 /// The transient refusals leave the pane **asking**: the state resolves
 /// itself, so the key must not be written.
 #[test]
@@ -784,6 +918,7 @@ fn blank_cut() -> Box<rustdar_radar::xsect::CrossSection> {
                 top_declared_cut_deg: 19.5,
             },
             vec![0.5],
+            vec![0],
         )
         .expect("a full-size, all-NoCoverage section is well formed"),
     )

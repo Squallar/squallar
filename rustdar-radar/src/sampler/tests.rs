@@ -73,6 +73,35 @@ fn make_sweep(
     refl: Option<Field<'_>>,
     vel: Option<Field<'_>>,
 ) -> Sweep {
+    make_sweep_at(
+        0,
+        elevation_number,
+        elevation_deg,
+        n_radials,
+        n_gates,
+        refl,
+        vel,
+    )
+}
+
+/// [`make_sweep`] with a clock on every radial.
+///
+/// `collected_ms` is milliseconds since the Unix epoch, and `0` is the
+/// decoder's own "no timestamp" value — which is what every fixture that does
+/// not care about time passes, through [`make_sweep`]. A fixture that *does*
+/// care needs distinct clocks per sweep, because "when was this rung flown" is
+/// answered off these radials on both sides of the worker port and a volume of
+/// identical zeros cannot tell a preserved clock from a dropped one.
+#[allow(clippy::too_many_arguments)]
+fn make_sweep_at(
+    collected_ms: i64,
+    elevation_number: u8,
+    elevation_deg: f32,
+    n_radials: usize,
+    n_gates: usize,
+    refl: Option<Field<'_>>,
+    vel: Option<Field<'_>>,
+) -> Sweep {
     let spacing = 360.0 / n_radials as f32;
     let radials = (0..n_radials)
         .map(|i| {
@@ -87,7 +116,7 @@ fn make_sweep(
                 moment_from(bytes, scale, offset)
             };
             Radial::new(
-                0,
+                collected_ms,
                 i as u16,
                 az,
                 spacing,
@@ -3820,5 +3849,191 @@ fn the_blend_table_agrees_with_the_echo_top_cubes() {
         CellStat::Mean,
         "precondition: CellStat grew an angular arm, so this module should \
              read it instead of overriding it",
+    );
+}
+
+/// Milliseconds since the epoch the clocked fixture below starts at.
+const LADDER_T0: i64 = 1_760_000_000_000;
+
+/// [`sails_volume`] with a real clock on each sweep, sixty seconds apart in
+/// elevation-number order — the order the RDA flies them in.
+///
+/// The three members of the 0.48° cut therefore carry *different* clocks, which
+/// is what makes the ladder's answer a statement about **which sweep won the
+/// rung** rather than about the volume as a whole.
+fn clocked_sails_volume() -> Scan {
+    let refl = |dbz: f64| move |_: f64, _: f64| Some(dbz);
+    let at = |n: u8| LADDER_T0 + i64::from(n) * 60_000;
+    Scan::new(
+        vcp(&[359.7, 0.40, 0.48, 0.48, 1.5, 0.48]),
+        vec![
+            make_sweep_at(
+                at(1),
+                1,
+                -0.28,
+                360,
+                SHORT_GATES,
+                Some(&refl(15.0)),
+                Some(&|_, _| Some(7.0)),
+            ),
+            make_sweep_at(at(2), 2, 0.44, 360, LONG_GATES, Some(&refl(20.0)), None),
+            make_sweep_at(at(3), 3, 0.53, 360, LONG_GATES, Some(&refl(25.0)), None),
+            make_sweep_at(
+                at(4),
+                4,
+                0.53,
+                360,
+                SHORT_GATES,
+                Some(&refl(26.0)),
+                Some(&|_, _| Some(9.0)),
+            ),
+            make_sweep_at(
+                at(5),
+                5,
+                1.51,
+                360,
+                SHORT_GATES,
+                Some(&refl(30.0)),
+                Some(&|_, _| Some(11.0)),
+            ),
+            make_sweep_at(
+                at(6),
+                6,
+                0.53,
+                360,
+                SHORT_GATES,
+                Some(&refl(35.0)),
+                Some(&|_, _| Some(13.0)),
+            ),
+        ],
+    )
+}
+
+/// **Each rung's clock survives the worker port**, so a section cut in a worker
+/// can say how old the tilt under the pointer is.
+///
+/// # Why this is the load-bearing test of the whole per-rung-age feature
+///
+/// Every cross-section in the app is cut from a **reconstructed** scan:
+/// `dispatch_section_renders` extracts a `RenderInput`, and the job handler
+/// rebuilds a `Scan` from it. `RenderInput::to_scan` used to stamp `0` on every
+/// radial's collection timestamp, because until now no render path read one.
+///
+/// So a rung age read off the sampler was correct in this crate's own tests —
+/// which sample real fixtures — and identically zero in the product. That is
+/// precisely the shape of test that cannot fail: the feature is exercised
+/// everywhere except where it runs. This test is the one that goes through the
+/// bytes, and it is the one that fails if the clock stops crossing.
+///
+/// The three 0.48° members carry different clocks, so the assertion is also a
+/// statement about **which** sweep won the rung: a ladder that took the SAILS
+/// Doppler repeat instead of the surveillance half reports a clock two minutes
+/// out, not merely a different number of gates.
+#[test]
+fn a_reconstructed_render_input_scan_keeps_each_sweeps_clock() {
+    let scan = clocked_sails_volume();
+    let declared = sails_declared_nyquist();
+    for product in [RadarProduct::Reflectivity, RadarProduct::Velocity] {
+        let original = VolumeSampler::new(Volume::new(&scan, &declared), product)
+            .expect("the fixture's own ladder builds");
+        let here: Vec<i64> = original.collection_times_ms().collect();
+
+        // precondition: the fixture actually dates its rungs, and does not
+        // date them all alike — a ladder of equal clocks would pass this
+        // comparison against a reconstruction that invented one constant.
+        assert!(
+            here.iter().all(|&ms| ms > 0),
+            "{product:?}: precondition — a rung carries no clock: {here:?}",
+        );
+        assert!(
+            here.windows(2).any(|w| w[0] != w[1]),
+            "{product:?}: precondition — every rung reports the same clock, so \
+             this cannot see a reconstruction that stamped one value on all of \
+             them: {here:?}",
+        );
+
+        let input = crate::render_input::RenderInput::extract_volume(&scan, product, 35.33, -97.27)
+            .expect("the fixture carries the moment")
+            .with_declared_nyquist(&declared);
+        // Through the bytes, because a worker holds bytes rather than a
+        // `RenderInput`, and the clock has to be in the layout as well as in
+        // the struct.
+        let decoded = crate::render_input::RenderInput::from_bytes(&input.to_bytes())
+            .expect("the payload round-trips");
+        let reconstructed = decoded.to_scan();
+        let ported_declared = decoded.declared_nyquist();
+        let ported = VolumeSampler::new(Volume::new(&reconstructed, &ported_declared), product)
+            .expect("the reconstructed scan's ladder builds");
+
+        assert_eq!(
+            ported.collection_times_ms().collect::<Vec<_>>(),
+            here,
+            "{product:?}: the worker's rungs are dated differently from the \
+             frame thread's, so every age a section reports is the worker's \
+             invention",
+        );
+
+        // And the ladder itself is still the same ladder, so this is a claim
+        // about the clocks rather than about a reconstruction that happened to
+        // pick different sweeps with matching times.
+        assert_eq!(
+            ported.elevations_deg().collect::<Vec<_>>(),
+            original.elevations_deg().collect::<Vec<_>>(),
+            "{product:?}: the ported ladder is not the original's",
+        );
+    }
+}
+
+/// The rung clocks are read from the same radials [`ladder_fingerprint`] hashes,
+/// so a rung's age describes the sweep the picture was cut from.
+///
+/// The fixture's split cut is what makes this say something: three sweeps share
+/// the 0.48° cut and carry clocks a minute apart, and reflectivity takes the
+/// **surveillance** half while velocity takes the newest Doppler one. If the
+/// clock were read off "the volume" or off the first sweep of the cut, the two
+/// products would report the same time for that rung. They must not.
+#[test]
+fn a_rungs_clock_is_the_clock_of_the_sweep_that_won_it() {
+    let scan = clocked_sails_volume();
+    let declared = sails_declared_nyquist();
+
+    let refl = VolumeSampler::new(Volume::new(&scan, &declared), RadarProduct::Reflectivity)
+        .expect("the reflectivity ladder builds");
+    let vel = VolumeSampler::new(Volume::new(&scan, &declared), RadarProduct::Velocity)
+        .expect("the velocity ladder builds");
+
+    // The 0.48° rung, found by its nominal key rather than by position, so a
+    // reordering of the ladder cannot quietly move this assertion to another
+    // cut.
+    let at_cut = |sampler: &VolumeSampler<'_>| -> i64 {
+        let idx = sampler
+            .nominal_elevations_deg()
+            .position(|k| (k - 0.48).abs() < 1e-9)
+            .expect("the fixture flies a 0.48 degree cut");
+        sampler
+            .collection_times_ms()
+            .nth(idx)
+            .expect("one clock per rung")
+    };
+
+    // Sweep 3 is the surveillance half (no velocity, 460 km of gates) and
+    // sweep 6 is the SAILS Doppler repeat, flown three minutes later.
+    assert_eq!(
+        at_cut(&refl),
+        LADDER_T0 + 3 * 60_000,
+        "reflectivity's 0.48 rung is not dated to the surveillance half it is \
+         actually sampled from",
+    );
+    assert_eq!(
+        at_cut(&vel),
+        LADDER_T0 + 6 * 60_000,
+        "velocity's 0.48 rung is not dated to the newest Doppler member it is \
+         actually sampled from",
+    );
+    assert_ne!(
+        at_cut(&refl),
+        at_cut(&vel),
+        "one clock for a cut flown three times is a fact about the volume, not \
+         about the rung the picture was cut from",
     );
 }

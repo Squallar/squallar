@@ -1088,6 +1088,9 @@ impl InputHarness {
             vec![SampleStatus::BelowLowestBeam.wire_code(); pixels],
             axes,
             rungs.to_vec(),
+            // No clocks: the harness draws geometry, and an age it
+            // invented would be a number a pixel test could pin.
+            vec![0; rungs.len()],
         )
         .expect(
             "a full-size, all-BelowLowestBeam section with a matching ladder is \

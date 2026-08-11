@@ -118,8 +118,50 @@ const AXIS_UNIT_HEADROOM: f32 = 13.0;
 /// pane no wider than ~2000 points is well under a point of chord error.
 const TILT_CURVE_SAMPLES: usize = 64;
 
-/// Feet per kilometre, for the height axis in a `Feet` locale.
-const KM_TO_KFT: f64 = 1.0 / 0.3048;
+/// How far apart the ladder's oldest and newest rung must be before the caption
+/// says so, in seconds.
+///
+/// # Why five minutes, and why a threshold at all
+///
+/// Every section is assembled over minutes — that is what a volume *is* — so a
+/// clause that fired on the ordinary case would be the constant qualifier this
+/// module's own history warns about: a caption shown on almost every volume is
+/// an alarm people learn to skip, and the previous caption was withdrawn for
+/// exactly that. The clause is worth its line only where the spread is beyond
+/// what "one volume" accounts for.
+///
+/// Two independent arguments put the line in the same place:
+///
+/// * **What a volume takes to fly.** The precipitation patterns a section is
+///   read on complete in 4.1–5 minutes (VCP 12, VCP 212 with SAILS) and VCP 215
+///   in 6. At or under five minutes the spread says nothing the volume time in
+///   the same caption does not already imply. Above it, the ladder is stitching
+///   across a volume boundary — which is precisely what the merged current
+///   volume does, filling the rungs this flight has not reached from the
+///   previous one — and *that* is a fact the single volume stamp actively
+///   hides.
+/// * **What the spread does to the picture.** A cell moving at 40 kt covers
+///   1.2 km a minute. A convective cell is 5–10 km across, so at five minutes
+///   the bottom of the section and the top are displaced by more than half a
+///   cell width relative to each other: the lean a reader sees is then partly
+///   the storm's motion rather than its structure. Under that the displacement
+///   is inside the tilt-interpolation error the ⓘ detail already explains, and
+///   a second caveat about it would be noise.
+///
+/// The clear-air patterns (VCP 31/32, ten minutes) trip it always, and should:
+/// in clear air the lowest rung really is ten minutes older than the highest,
+/// and that is the case where a reader's instinct — one picture, one moment —
+/// is most wrong.
+const ASSEMBLY_SPAN_CAPTION_MIN_SECS: i64 = 300;
+
+/// How old a rung must be, against the newest rung in the same section, before
+/// the hover readout mentions its age at all.
+///
+/// One minute, so a rung flown alongside the freshest data reads as just
+/// `4.3° sweep` and the qualifier appears only where there is something to
+/// qualify. The readout is a running commentary under a moving pointer; a
+/// `0 min old` on every pixel would be the caption's mistake in miniature.
+const HOVER_AGE_MIN_SECS: i64 = 60;
 
 /// Room left along whichever edge the colour bar took, in points.
 ///
@@ -181,7 +223,7 @@ pub(super) fn render_cross_section(
     // `MAX_LOOP_RENDER_BUDGET` frames, so they are dropped on the way in. A
     // plan-view loop frame drops its value grid for the same reason, and the
     // hover readout goes quiet in both — see `pane::SectionImageData`.
-    let (section, texture, axes, tilts, collected) = if looping {
+    let (section, texture, axes, tilts, clocks, collected) = if looping {
         let Some(frame) = pane.active_section_image().cloned() else {
             paint_centered(ui, pane_rect, "Cutting the cross-section...");
             return;
@@ -192,6 +234,9 @@ pub(super) fn render_cross_section(
             frame.texture,
             frame.axes,
             frame.tilt_elevations_deg,
+            // The frame's own clocks, not the live cut's: a loop frame is a
+            // volume from minutes or hours ago and its ladder was flown then.
+            frame.tilt_collected_ms,
             collected,
         )
     } else {
@@ -209,7 +254,12 @@ pub(super) fn render_cross_section(
         };
         let axes = *section.axes();
         let tilts = section.tilt_elevations_deg().to_vec();
-        (Some(section), texture, axes, tilts, live_collected)
+        let clocks = section.tilt_collected_ms().to_vec();
+        (Some(section), texture, axes, tilts, clocks, live_collected)
+    };
+    let ladder = Ladder {
+        elevations_deg: &tilts,
+        collected_ms: &clocks,
     };
 
     let painter = ui.painter().with_clip_rect(pane_rect);
@@ -224,6 +274,7 @@ pub(super) fn render_cross_section(
             &axes,
             product,
             collected,
+            ladder,
             unavailable,
             detail_open,
             ui.visuals(),
@@ -344,7 +395,24 @@ pub(super) fn render_cross_section(
         && pane_rect.contains(pos)
         && let Some(section) = section.as_deref()
     {
-        pane.hover_value = hover_readout(section, &layout, pos, product, prefs);
+        // The site is what turns a distance *along the line* into a ground
+        // range from the radar, which is what a beam height needs. Without it
+        // the readout keeps its distance, height and value and says nothing
+        // about which sweep answered — the same graceful silence
+        // `paint_tilt_ladder` already takes when the site is unknown.
+        pane.hover_value = hover_readout(
+            section,
+            &layout,
+            pos,
+            product,
+            site.map(|(lat, lon)| SectionSource {
+                ladder,
+                line,
+                site_lat: lat,
+                site_lon: lon,
+            }),
+            prefs,
+        );
     }
 }
 
@@ -403,10 +471,15 @@ fn control_chip(
 ///
 /// # The readout
 ///
-/// `056° · 62 mi` — the A→B bearing at the line's midpoint and the line's
-/// ground length, in the user's units. Without it a sweep is blind: every step
-/// looks like "the picture changed", and only the number says which way the
-/// cut now faces. Three digits so north reads `000°`, not `0°`.
+/// `056° - 62 mi` in a `Miles` locale, `056° - 100 km` in a metric one: the
+/// A-to-B bearing at the line's midpoint, then the line's ground length **in
+/// the user's own distance unit**, through the same `DistanceUnit` the axis
+/// ticks and the ℹ detail's gap figures already convert with. One quantity
+/// shown on two surfaces in two units reads to a user as a measurement error
+/// in the data rather than as a formatting one. Without the readout a sweep
+/// is blind: every step looks like "the picture changed", and only the number
+/// says which way the cut now faces. Three digits so north reads `000°`,
+/// not `0°`.
 ///
 /// The glyphs are chosen from what egui's bundled fonts actually carry
 /// (`◀`/`▶` from NotoEmoji, `↺`/`↻` from emoji-icon-font) — see the caption's
@@ -459,17 +532,10 @@ fn render_line_controls(
     );
 
     let length_km = edit::length_km(line);
-    // Rounded before it is wrapped: a bearing of 359.7° would otherwise
-    // render "360°", and north is "000°" — three digits, one name.
-    let bearing = (edit::bearing_deg(line).rem_euclid(360.0).round() as u32) % 360;
     painter.text(
         egui::pos2(right - 4.0, top + button.y * 0.5),
         egui::Align2::RIGHT_CENTER,
-        format!(
-            "{bearing:03}\u{b0} - {:.0}{}",
-            prefs.distance.convert_from_km(length_km),
-            prefs.distance.suffix(),
-        ),
+        line_readout(line, prefs),
         egui::FontId::proportional(10.0),
         ui.visuals().text_color(),
     );
@@ -486,6 +552,26 @@ fn render_line_controls(
     } else {
         None
     }
+}
+
+/// The chip's text: the line's bearing and its ground length, the latter **in
+/// the user's own distance unit**.
+///
+/// A function rather than an inline `format!` so a test can read what the chip
+/// says without standing up a painter — and because the thing worth pinning is
+/// that this and the sidebar convert the same quantity the same way. One length
+/// shown as `62 mi` here and `100 km` there is not a formatting slip to a
+/// reader; it is two different measurements of their own line.
+fn line_readout(line: crate::pane::SectionLine, prefs: &UserPreferences) -> String {
+    use crate::ui_section_edit as edit;
+    // Rounded before it is wrapped: a bearing of 359.7° would otherwise
+    // render "360°", and north is "000°" — three digits, one name.
+    let bearing = (edit::bearing_deg(line).rem_euclid(360.0).round() as u32) % 360;
+    format!(
+        "{bearing:03}\u{b0} - {:.0}{}",
+        prefs.distance.convert_from_km(edit::length_km(line)),
+        prefs.distance.suffix(),
+    )
 }
 
 /// Where each part of a section pane goes.
@@ -633,14 +719,12 @@ fn paint_axes(
     // Heights, in the user's own unit. The axis is in km MSL internally
     // whatever the locale, so the ticks are chosen in the *displayed* unit and
     // converted back — otherwise a `Feet` user gets ticks at 3.28, 6.56, 9.84.
-    let to_display = |km: f64| match prefs.height {
-        rustdar_units::HeightUnit::Feet => km * KM_TO_KFT,
-        rustdar_units::HeightUnit::Meters => km,
-    };
-    let from_display = |shown: f64| match prefs.height {
-        rustdar_units::HeightUnit::Feet => shown / KM_TO_KFT,
-        rustdar_units::HeightUnit::Meters => shown,
-    };
+    // Both directions come off `HeightUnit`, which is where every other unit
+    // decision in this pane is made. They used to be two inline `match`es over
+    // a feet-per-kilometre constant this module kept for itself, alongside two
+    // more copies of the same `match` elsewhere in the file.
+    let to_display = |km: f64| prefs.height.convert_km_to_kilo(km);
+    let from_display = |shown: f64| prefs.height.convert_kilo_to_km(shown);
     let step = nice_step(
         to_display(axes.top_km_msl - axes.base_km_msl),
         (layout.plot.height() / 34.0) as f64,
@@ -860,6 +944,83 @@ fn ladder_reaches_pattern_top(axes: &SectionAxes) -> bool {
     axes.top_tilt_deg >= axes.top_declared_cut_deg
 }
 
+/// The tilt ladder this picture was cut from: where each rung is, and **when
+/// it was flown**.
+///
+/// The two lists are `CrossSection::tilt_elevations_deg` and
+/// `CrossSection::tilt_collected_ms`, in the same cut order and the same
+/// length — `CrossSection::from_parts` refuses any other pairing, so nothing
+/// here re-checks it and every method zips them.
+///
+/// # Why the clocks are here at all
+///
+/// A section reads as an instant and is not one. The radar flies one tilt at a
+/// time, so the bottom rung and the top rung of one picture are four to ten
+/// minutes apart, and a SAILS repeat can leave a rung in the middle newer than
+/// both its neighbours. Nothing in the pixels says so, and the caption used to
+/// stamp the whole thing with a single volume time.
+///
+/// Ages here are measured **against the newest rung in this section**, not
+/// against the wall clock. That is the reference the picture itself sets: the
+/// numbers then mean "how much older than the freshest thing on this glass",
+/// which is the question a reader of a section actually has — and it keeps
+/// reading correctly for an archive volume and for a loop frame from three
+/// hours ago, where an age from `now` would be a number about the user's
+/// afternoon rather than about the storm.
+#[derive(Clone, Copy)]
+struct Ladder<'a> {
+    elevations_deg: &'a [f64],
+    collected_ms: &'a [i64],
+}
+
+impl<'a> Ladder<'a> {
+    /// The newest rung's clock, or `None` when no rung carries one.
+    ///
+    /// `0` is the decoder's "no clock" sentinel rather than a date, so it is
+    /// filtered out: a section whose rungs are all unclocked must stay silent
+    /// about ages rather than report itself freshly flown.
+    fn newest_ms(self) -> Option<i64> {
+        self.collected_ms.iter().copied().filter(|&ms| ms > 0).max()
+    }
+
+    /// How long this ladder took to fly, in seconds — see
+    /// [`rustdar_radar::xsect::assembly_span_secs`], which is the one
+    /// definition. The raster's own crate owns it because a live cut and a loop
+    /// frame both ask, and neither may re-derive it.
+    fn span_secs(self) -> Option<i64> {
+        rustdar_radar::xsect::assembly_span_secs(self.collected_ms)
+    }
+
+    /// Each rung as `(number, elevation, age against the newest rung)`, in cut
+    /// order — ascending, which is the order the dotted curves are drawn in and
+    /// the order a reader's eye climbs the picture.
+    ///
+    /// The age is `None` for a rung whose sweep carried no clock. That is a
+    /// different statement from "flown with the newest rung" and must not
+    /// render as one.
+    fn rungs(self) -> impl Iterator<Item = (usize, f64, Option<i64>)> + 'a {
+        let newest = self.newest_ms();
+        self.elevations_deg
+            .iter()
+            .copied()
+            .zip(self.collected_ms.iter().copied())
+            .enumerate()
+            .map(move |(i, (deg, ms))| {
+                let age = newest.filter(|_| ms > 0).map(|newest| (newest - ms) / 1000);
+                (i + 1, deg, age)
+            })
+    }
+}
+
+/// Whole minutes, rounded to nearest, from a count of seconds.
+///
+/// One spelling, so the caption's "assembled over 6 min", the hover's "3 min
+/// old" and the ⓘ ladder's per-rung figures cannot round differently and show
+/// one 5½-minute spread as both 5 and 6 in the same pane.
+fn whole_minutes(secs: i64) -> i64 {
+    (secs + 30) / 60
+}
+
 /// One line of the caption, before it is laid out.
 struct CaptionLine {
     text: String,
@@ -901,10 +1062,12 @@ struct CaptionLine {
 /// Built as text before anything is measured or drawn, because the caption's
 /// height decides where the plot starts and the caption's height is only known
 /// once its text has been wrapped to the pane's width.
+#[allow(clippy::too_many_arguments)]
 fn caption_lines(
     axes: &SectionAxes,
     product: RadarProduct,
     collected: Option<chrono::NaiveDateTime>,
+    ladder: Ladder<'_>,
     unavailable: Option<crate::pane::SectionUnavailable>,
     detail_open: bool,
     visuals: &egui::Visuals,
@@ -916,9 +1079,21 @@ fn caption_lines(
     // The volume time in the user's zone, because "how fresh is this picture"
     // is the third thing the default line owes — a section is cut once per
     // volume and a storm outruns one in minutes.
-    let stamp = collected.map_or_else(String::new, |t| {
+    let mut stamp = collected.map_or_else(String::new, |t| {
         format!("  -  {}", prefs.timezone.format_naive_utc(t, "%H:%M"))
     });
+    // ...and, **only when it is beyond what one volume accounts for**, how far
+    // apart the ladder's ends are. One clause, in the same calm colour, on the
+    // line that already carries the time it qualifies. See
+    // `ASSEMBLY_SPAN_CAPTION_MIN_SECS` for why the threshold is where it is;
+    // the short version is that every section is assembled over minutes, so a
+    // clause on the ordinary case would be the constant qualifier this pane's
+    // caption was redesigned to remove.
+    if let Some(span) = ladder.span_secs()
+        && span >= ASSEMBLY_SPAN_CAPTION_MIN_SECS
+    {
+        stamp.push_str(&format!("  -  assembled over {} min", whole_minutes(span)));
+    }
 
     let (headline, headline_color) = match axes.tilt_count {
         // No data for this moment at all is a genuinely broken picture, and the
@@ -965,7 +1140,7 @@ fn caption_lines(
     });
 
     if detail_open {
-        detail_lines(axes, visuals, prefs, &mut lines);
+        detail_lines(axes, ladder, visuals, prefs, &mut lines);
     }
 
     // Last, under everything, so a transient state never pushes the caption off
@@ -1013,6 +1188,7 @@ fn caption_lines(
 ///    the beam model is a fact for `render_gate`'s docs, not for the pane.
 fn detail_lines(
     axes: &SectionAxes,
+    ladder: Ladder<'_>,
     visuals: &egui::Visuals,
     prefs: &UserPreferences,
     lines: &mut Vec<CaptionLine>,
@@ -1043,10 +1219,7 @@ fn detail_lines(
         let ceiling_km_msl = axes.base_km_msl
             + beam::height_at_ground_km(axes.coverage_ground_range_km, axes.top_tilt_deg);
         if ceiling_km_msl <= axes.top_km_msl {
-            let ceiling_shown = match prefs.height {
-                rustdar_units::HeightUnit::Feet => ceiling_km_msl * KM_TO_KFT,
-                rustdar_units::HeightUnit::Meters => ceiling_km_msl,
-            };
+            let ceiling_shown = prefs.height.convert_km_to_kilo(ceiling_km_msl);
             text.push_str(&format!(
                 " The picture's ceiling is ~{:.0} {} MSL at the far end of the line.",
                 ceiling_shown,
@@ -1093,6 +1266,56 @@ fn detail_lines(
         ));
     }
     push(registration);
+
+    // 4. **When each rung was flown.** The caption above says *whether* the
+    //    spread is worth knowing about; this says what it is, rung by rung,
+    //    and it is allowed to be long because the reader opened the panel to
+    //    ask. It is the last detail line, so it is the first one dropped on a
+    //    pane with no room — which is right: it is the most specific and the
+    //    least urgent of the four.
+    if let Some(list) = ladder_ages_sentence(ladder) {
+        push(list);
+    }
+}
+
+/// The ⓘ panel's per-rung ladder: number, elevation, and how much older that
+/// tilt is than the newest in this section.
+///
+/// `None` when there is nothing to say — no rungs, or no rung carrying a clock.
+/// Silence rather than a row of blanks: a section reassembled from a payload
+/// that predates the clocks, or built by hand in a test, knows nothing about
+/// when anything was flown, and "unknown" repeated fourteen times is noise
+/// wearing the shape of information.
+///
+/// The lead-in states the reference, because "6 min" on its own is ambiguous
+/// between "six minutes ago" and "six minutes older than its neighbour" and the
+/// two differ by the whole volume. Ascending by cut, which is the order the
+/// dotted curves stack up the picture — so the list reads in the direction the
+/// eye travels.
+fn ladder_ages_sentence(ladder: Ladder<'_>) -> Option<String> {
+    ladder.newest_ms()?;
+    let entries: Vec<String> = ladder
+        .rungs()
+        .map(|(number, deg, age)| {
+            let when = match age.map(whole_minutes) {
+                // The rung the others are measured against. Named rather than
+                // given as "0 min", which reads as a rounding artefact.
+                Some(0) => "newest".to_owned(),
+                Some(min) => format!("{min} min older"),
+                None => "no time recorded".to_owned(),
+            };
+            format!("{number}: {deg:.1}\u{b0} {when}")
+        })
+        .collect();
+    if entries.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "The tilts were flown one at a time, so each rung of this picture is a \
+         different moment - here is how much older each is than the newest tilt \
+         in it, from the bottom up. {}.",
+        entries.join(", "),
+    ))
 }
 
 /// Wrap the caption to the pane's width, dropping detail lines — last first —
@@ -1169,6 +1392,7 @@ fn hover_readout(
     layout: &SectionLayout,
     pos: egui::Pos2,
     product: RadarProduct,
+    source: Option<SectionSource<'_>>,
     prefs: &UserPreferences,
 ) -> Option<String> {
     if !layout.plot.contains(pos) {
@@ -1183,23 +1407,113 @@ fn hover_readout(
 
     let along = prefs.distance.convert_from_km(axes.column_distance_km(col));
     let height_km = axes.row_height_km_msl(row);
-    let height_shown = match prefs.height {
-        rustdar_units::HeightUnit::Feet => height_km * KM_TO_KFT,
-        rustdar_units::HeightUnit::Meters => height_km,
-    };
+    let height_shown = prefs.height.convert_km_to_kilo(height_km);
 
     let value = match sample.value() {
         Some(value) => product.format_value(value, prefs),
         None => describe_missing(sample.status(), ladder_reaches_pattern_top(axes)).to_owned(),
     };
+    // Which sweep answered here, and how much older it is than the freshest one
+    // in this picture. Empty for a pixel no rung reaches, and for a pane that
+    // does not know where its radar is — see `describe_source`.
+    let from = source.map_or_else(String::new, |source| {
+        describe_source(source, axes, col, height_km)
+            .map_or_else(String::new, |text| format!("  |  {text}"))
+    });
     Some(format!(
-        "{:.1}{} along  |  {:.1} {} MSL  |  {}",
+        "{:.1}{} along  |  {:.1} {} MSL  |  {}{}",
         along,
         prefs.distance.suffix(),
         height_shown,
         prefs.height.kilo_suffix(),
         value,
+        from,
     ))
+}
+
+/// What a hover needs in order to say **which sweep** answered it: the ladder,
+/// the line it was cut along, and where the radar is.
+#[derive(Clone, Copy)]
+struct SectionSource<'a> {
+    ladder: Ladder<'a>,
+    line: crate::pane::SectionLine,
+    site_lat: f64,
+    site_lon: f64,
+}
+
+/// `4.3° sweep - 3 min old` for the pixel under the pointer, or `None`
+/// when no rung reaches it.
+///
+/// # Why the nearest rung, and why only inside the ladder
+///
+/// A section pixel between two rungs is a two-point interpolation in beam
+/// height, so strictly it has two sources. The nearer rung is the one weighted
+/// at or above a half, and it is also the dotted curve the pointer is sitting
+/// closest to — so the readout names something the reader can *see*, and the ⓘ
+/// panel carries the whole ladder for anyone who wants the pair.
+///
+/// Outside the ladder's span at this ground range there is no source at all,
+/// and the value field already says which side: "below the lowest beam" or
+/// "above the highest tilt this volume flew". Naming a sweep there would
+/// attribute a blank to a tilt that did not produce it, which is the same class
+/// of confident-and-wrong the cone-of-silence wording was fixed for.
+///
+/// The geometry is [`tilt_curves`]', not a second model of it: the same
+/// `great_circle_point` walk to the pointer's ground range and the same
+/// `height_at_ground_km` per rung. A readout drawn from different geometry than
+/// the curves would name the rung above the one the pointer is on.
+fn describe_source(
+    source: SectionSource<'_>,
+    axes: &SectionAxes,
+    col: usize,
+    height_km_msl: f64,
+) -> Option<String> {
+    let t = axes.column_distance_km(col) / axes.length_km;
+    if !t.is_finite() {
+        return None;
+    }
+    let a = (source.line.a().lat, source.line.a().lon);
+    let b = (source.line.b().lat, source.line.b().lon);
+    let (lat, lon) = beam::great_circle_point(a, b, t);
+    let (_, ground_km) = beam::site_bearing_range_km(source.site_lat, source.site_lon, lat, lon);
+    // The beam model measures above the antenna; the axis is MSL.
+    let query_arl_km = height_km_msl - axes.base_km_msl;
+
+    let mut nearest: Option<(f64, f64, Option<i64>)> = None;
+    let (mut lowest, mut highest) = (f64::INFINITY, f64::NEG_INFINITY);
+    for (_, deg, age) in source.ladder.rungs() {
+        let rung_arl_km = beam::height_at_ground_km(ground_km, deg);
+        if !rung_arl_km.is_finite() {
+            continue;
+        }
+        lowest = lowest.min(rung_arl_km);
+        highest = highest.max(rung_arl_km);
+        let gap = (rung_arl_km - query_arl_km).abs();
+        if nearest.is_none_or(|(best, _, _)| gap < best) {
+            nearest = Some((gap, deg, age));
+        }
+    }
+    let (_, deg, age) = nearest?;
+    if query_arl_km < lowest || query_arl_km > highest {
+        return None;
+    }
+
+    // The age only where there is an age to give. A `0 min old` under every
+    // pixel of a tight volume is the caption's withdrawn mistake in miniature:
+    // a qualifier that fires always stops being read, and then stops being
+    // noticed on the volume where it matters.
+    match age.filter(|&secs| secs >= HOVER_AGE_MIN_SECS) {
+        // ` - ` rather than the ` \u{b7} ` the design sketch used: `ui_glyphs`
+        // pins every non-ASCII character in a UI string against what egui's
+        // bundled fonts actually carry, and a middot is not among them — an
+        // unregistered glyph renders as a tofu box, which is worse than a
+        // hyphen in every locale.
+        Some(secs) => Some(format!(
+            "{deg:.1}\u{b0} sweep - {} min old",
+            whole_minutes(secs)
+        )),
+        None => Some(format!("{deg:.1}\u{b0} sweep")),
+    }
 }
 
 /// Why there is no number here, in words a forecaster would use.

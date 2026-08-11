@@ -559,6 +559,22 @@ struct Rung<'a> {
     ///
     /// `false` when there is no limit at all, which `describe` never prints.
     fold_limit_declared: bool,
+    /// When the chosen sweep was flown — the earliest collection timestamp on
+    /// its radials, milliseconds since the Unix epoch, `0` when it carries
+    /// none.
+    ///
+    /// # Why a rung has a clock of its own
+    ///
+    /// A volume is flown one tilt at a time over four to ten minutes, so the
+    /// bottom and the top of a single cross-section are minutes apart, and a
+    /// SAILS repeat can leave one rung in the middle newer than both its
+    /// neighbours. The ladder is the only thing that knows, because it is the
+    /// only thing that knows **which sweep won each cut** — the same question
+    /// [`ladder_fingerprint`] asks, of the same radials, through the same
+    /// [`resolve_ladder`]. Read here rather than beside the ladder so a
+    /// reported age describes the rung the picture was actually sampled from
+    /// and not one rediscovered by a second rule.
+    collected_ms: i64,
 }
 
 /// The tilt ladder over one ground point: every rung's beam height there and
@@ -1079,6 +1095,11 @@ impl<'a> VolumeSampler<'a> {
                 az_step_deg,
                 fold_limit_ms,
                 fold_limit_declared,
+                // The same reading of the same radials `RenderInput` makes
+                // when it flattens a sweep for the port, shared rather than
+                // restated: a second spelling is how the worker's ages and
+                // the frame thread's come to differ by a sweep.
+                collected_ms: crate::render_input::sweep_collected_ms(radials),
             });
         }
 
@@ -1213,6 +1234,19 @@ impl<'a> VolumeSampler<'a> {
     /// delivered.
     pub fn nominal_elevations_deg(&self) -> impl Iterator<Item = f64> + '_ {
         self.rungs.iter().map(|r| r.nominal_deg)
+    }
+
+    /// When each rung's chosen sweep was flown, milliseconds since the Unix
+    /// epoch, **in the same cut order** [`elevations_deg`](Self::elevations_deg)
+    /// reports — so the two zip into `(where, when)` per rung. `0` for a rung
+    /// whose sweep carried no clock at all.
+    ///
+    /// This is the ladder's spread, and the spread is the fact: a section is
+    /// one picture of a volume flown over minutes, and nothing else in the
+    /// pipeline can say that the rung under the pointer is four minutes older
+    /// than the one above it. See [`Rung::collected_ms`].
+    pub fn collection_times_ms(&self) -> impl Iterator<Item = i64> + '_ {
+        self.rungs.iter().map(|r| r.collected_ms)
     }
 
     /// The highest cut angle **this ladder has**, degrees — the top rung's

@@ -1379,12 +1379,13 @@ impl super::App {
             // shaped for a `SECTION_WIDTH × SECTION_HEIGHT` raster and must
             // never be handed a plan view's — see `JobOutput::section`.
             let cut = output.and_then(crate::offload::JobOutput::section);
-            let (image, axes, tilt_elevations_deg) = match cut {
+            let (image, axes, tilt_elevations_deg, tilt_collected_ms) = match cut {
                 Some(cut) => match loop_section_image(cut.image()) {
                     Some(image) => (
                         Some(image),
                         Some(*cut.axes()),
                         cut.tilt_elevations_deg().to_vec(),
+                        cut.tilt_collected_ms().to_vec(),
                     ),
                     None => {
                         log::error!(
@@ -1394,10 +1395,10 @@ impl super::App {
                                 * rustdar_radar::xsect::SECTION_HEIGHT
                                 * 4
                         );
-                        (None, None, Vec::new())
+                        (None, None, Vec::new(), Vec::new())
                     }
                 },
-                None => (None, None, Vec::new()),
+                None => (None, None, Vec::new(), Vec::new()),
             };
             let _ = sender.send(crate::channels::LoopSectionResponse {
                 pane_idx,
@@ -1408,6 +1409,7 @@ impl super::App {
                 image,
                 axes,
                 tilt_elevations_deg,
+                tilt_collected_ms,
             });
             super::notify_redraw(&window);
         });

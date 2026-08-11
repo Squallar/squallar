@@ -517,6 +517,7 @@ fn section_response(ctx: &egui::Context, ladder: u64) -> crate::channels::LoopSe
         )),
         axes: Some(axes()),
         tilt_elevations_deg: vec![0.5],
+        tilt_collected_ms: vec![0],
     }
 }
 
@@ -526,6 +527,7 @@ fn section_picture(ctx: &egui::Context, ladder: u64) -> LoopFrameImage {
         texture: ctx.load_texture("section", image, egui::TextureOptions::NEAREST),
         axes: axes(),
         tilt_elevations_deg: vec![0.5],
+        tilt_collected_ms: vec![0],
         ladder,
     })
 }

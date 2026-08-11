@@ -245,6 +245,7 @@ fn blank_section() -> rustdar_radar::xsect::CrossSection {
             top_declared_cut_deg: 19.5,
         },
         vec![0.5],
+        vec![0],
     )
     .expect("a full-size, all-NoCoverage section is well formed")
 }
