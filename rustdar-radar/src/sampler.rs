@@ -137,6 +137,7 @@
 
 use nexrad_model::data::{DataMoment, ElevationCut, MomentData, Radial, Sweep};
 
+use crate::azimuth::{MAX_ADJACENT_GAP_STEPS, median_azimuth_step_deg};
 use crate::beam;
 use crate::nyquist::Volume;
 use crate::types::{MomentSlot, RadarProduct};
@@ -489,24 +490,6 @@ impl Blend {
 /// the same thing; they are deliberately equal.
 const FOLD_LIMIT_FLOOR_MS: f64 = 8.0;
 
-/// How many median azimuth steps two radials may be apart and still count as
-/// adjacent — i.e. as a pair worth interpolating between.
-///
-/// One step is what consecutive radials are apart by construction, and a real
-/// sweep's jitter is a few hundredths of a step, so 1.5 is bracketed from both
-/// sides: it is wide enough that a jittered sweep stays one continuous ladder
-/// (`azimuth_jitter_does_not_open_a_hole`), and narrow enough that one dropped
-/// radial — a gap of **two** steps — falls outside it and is therefore *not*
-/// bridged (`an_azimuth_hole_is_reported_rather_than_painted_across`). What
-/// happens past it is not a fallback to nearest-across-the-hole, which is how a
-/// sampler paints data where the radar never looked: past it a rung serves
-/// only the azimuths inside a surviving radial's own half-step footprint —
-/// the same footprint `render::render_gate` paints, via
-/// `RadialContext::new(azimuth, avg_azimuth_spacing / 2.0)` — and reports
-/// [`SampleStatus::NoCoverage`] between them. An abandoned tail therefore
-/// leaves a hole, exactly as it does in the plan view.
-const MAX_ADJACENT_GAP_STEPS: f64 = 1.5;
-
 /// One rung of the tilt ladder: the sweep that won its cut, indexed for random
 /// access.
 struct Rung<'a> {
@@ -525,11 +508,9 @@ struct Rung<'a> {
     /// Median gap between adjacent azimuths, degrees — the scale
     /// [`MAX_ADJACENT_GAP_STEPS`] is measured in.
     ///
-    /// The median rather than `render::compute_azimuth_spacing`'s mean,
-    /// because the sweeps this guard exists for are exactly the ones with one
-    /// enormous gap in them: a 400-radial abandoned tail spanning 200° has a
-    /// mean step of 0.5° only if you already ignore the 160° hole, while its
-    /// median step is 0.5° whether you noticed the hole or not.
+    /// [`median_azimuth_step_deg`], not a local reading of the sweep: the
+    /// median rather than the mean, and the crate's one measurement rather
+    /// than this rung's own, for the reasons kept beside the constant.
     az_step_deg: f64,
     /// The speed this rung's sweep folds at, m/s, or `None` when this moment
     /// has no fold seam, the volume declared nothing *and* the sweep never got
@@ -1416,23 +1397,17 @@ fn index_azimuths(radials: &[Radial]) -> (Vec<(f32, u32)>, f64) {
         .collect();
     by_azimuth.sort_by(|a, b| a.0.total_cmp(&b.0));
 
-    // Circular gaps, so the seam between the last and first azimuth counts as
-    // one step in a complete sweep rather than as the sweep's one big hole.
-    let mut gaps: Vec<f64> = Vec::with_capacity(by_azimuth.len());
-    for i in 0..by_azimuth.len() {
-        let a = f64::from(by_azimuth[i].0);
-        let b = f64::from(by_azimuth[(i + 1) % by_azimuth.len()].0);
-        let gap = (b - a).rem_euclid(360.0);
-        if gap > 0.0 {
-            gaps.push(gap);
-        }
-    }
-    gaps.sort_by(f64::total_cmp);
+    // The declared angles again, not `by_azimuth`'s wrapped copies: the helper
+    // performs the same wrap itself, and feeding it values that have already
+    // been through the `f32` round-trip would run the quantization twice.
+    //
     // A sweep with no two distinct azimuths has no observable step. One degree
     // is the coarsest spacing a WSR-88D produces, so it is the least
     // presumptuous stand-in: it makes the footprint rule serve half a degree
     // either side and no more.
-    let az_step_deg = gaps.get(gaps.len() / 2).copied().unwrap_or(1.0);
+    let az_step_deg =
+        median_azimuth_step_deg(radials.iter().map(|r| f64::from(r.azimuth_angle_degrees())))
+            .unwrap_or(1.0);
     (by_azimuth, az_step_deg)
 }
 

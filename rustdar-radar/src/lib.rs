@@ -1,4 +1,5 @@
 pub mod archive;
+pub(crate) mod azimuth;
 pub mod beam;
 pub mod catalogue;
 pub mod chunks;
