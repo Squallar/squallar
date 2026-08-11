@@ -1773,7 +1773,18 @@ fn render_per_frame_overlay(
     let geo_bounds = viewport_geo_bounds(projector, expanded);
 
     let painter = ui.painter();
-    let hover_pos = ui.ctx().pointer_hover_pos();
+
+    // Blocked-ness is a property of the *position*, not of the point being
+    // tested against it, so it is settled once here rather than inside the
+    // loop. It used to be evaluated per visible station: each call scans the
+    // excluded rects — up to 207 radar-site icons — and takes egui's memory
+    // lock through `layer_id_at`, so 200 stations meant 200 lock acquisitions
+    // and ~41,000 rect tests per pane per frame, every one of them returning
+    // the same answer. `&&` short-circuits left to right, which is why the
+    // cheap distance test in front of it did not save any of them.
+    let blocked = |pos: egui::Pos2| is_pos_blocked(ui.ctx(), pos, pf.pane_rect, pf.excluded_rects);
+    let hover_pos = ui.ctx().pointer_hover_pos().filter(|&p| !blocked(p));
+    let click_pos = pf.overlay_click_pos.filter(|&p| !blocked(p));
 
     let mut selected = Vec::new();
     let mut closest_hover: Option<(f32, u32)> = None; // (distance², id)
@@ -1804,20 +1815,16 @@ fn render_per_frame_overlay(
         pf.overlays.draw_point(pf.kind, pt.id, &mut ep, &draw_ctx);
 
         // Click detection — layer blocking already applied by pre-filter in ui_map.rs.
-        if let Some(click_pos) = pf.overlay_click_pos {
+        if let Some(click_pos) = click_pos {
             let dx = click_pos.x - screen.x;
             let dy = click_pos.y - screen.y;
-            if dx * dx + dy * dy <= hit_radius * hit_radius
-                && !is_pos_blocked(ui.ctx(), click_pos, pf.pane_rect, pf.excluded_rects)
-            {
+            if dx * dx + dy * dy <= hit_radius * hit_radius {
                 selected.push(pt.selection.clone());
             }
         }
 
-        // Hover detection — skip if cursor is over a dialog or outside the pane.
-        if let Some(hp) = hover_pos
-            && !is_pos_blocked(ui.ctx(), hp, pf.pane_rect, pf.excluded_rects)
-        {
+        // Hover detection — a blocked cursor was already dropped above.
+        if let Some(hp) = hover_pos {
             let dx = hp.x - screen.x;
             let dy = hp.y - screen.y;
             let d2 = dx * dx + dy * dy;
