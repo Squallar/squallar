@@ -2245,4 +2245,87 @@ mod tests {
             2.0 * max,
         );
     }
+
+    /// A projection with no map in it: one screen point per degree, so a
+    /// row's coordinates and the pixel it lands on are the same numbers.
+    ///
+    /// The site walk does not care which projection it is handed, and a real
+    /// one would need a live `egui::Ui`, a `walkers::Projector` and a tile
+    /// source to say something this says in a line.
+    fn degrees_as_pixels(lat: f64, lon: f64) -> egui::Pos2 {
+        egui::pos2(lon as f32, lat as f32)
+    }
+
+    /// Everything, so the walk's on-screen filter never decides anything here.
+    fn everywhere() -> egui::Rect {
+        egui::Rect::from_min_max(egui::pos2(-400.0, -400.0), egui::pos2(400.0, 400.0))
+    }
+
+    /// A [`VisibleSite`] keeps naming its own radar after the table grows
+    /// under it.
+    ///
+    /// This used to be a `usize` index back into a compiled-in
+    /// `[RadarSite; 207]`, which was safe only because that array could never
+    /// be any other length. The table is resolved at runtime now: a returning
+    /// user's table carries radars the seed never had, so position `n` in one
+    /// table is a different radar in the next.
+    ///
+    /// The revert this pins is a real one. Index `206` in the seed is the last
+    /// row; in a table with two arrivals appended it is still that row, but
+    /// index `207` and `208` exist and name radars that the seed's array
+    /// cannot address at all — so a walk over the resolved table that resolved
+    /// through the compiled-in one would panic or, worse, silently label a
+    /// marker with whatever row happened to sit at that offset.
+    #[test]
+    fn a_visible_site_names_its_own_radar_after_the_table_grows() {
+        let position = |lat_udeg, lon_udeg| rustdar_radar::site_position::SitePosition {
+            lat_udeg,
+            lon_udeg,
+            site_height_m: 100,
+            tower_height_m: 20,
+        };
+        // Two radars no seed row carries, in the empty South Pacific.
+        let bigger = rustdar_radar::sites::build_table([
+            ("ZZZY", position(-30_000_000, -140_000_000)),
+            ("ZZZX", position(-31_000_000, -141_000_000)),
+        ]);
+        let seeded = rustdar_radar::sites::build_table(std::iter::empty());
+        assert_eq!(
+            bigger.rows().len(),
+            seeded.rows().len() + 2,
+            "precondition: the two tables must be different lengths, or this \
+             test cannot tell an index from a reference",
+        );
+
+        let walked = |rows| visible_sites_in(rows, everywhere(), 18.0, degrees_as_pixels);
+
+        // Every site the smaller table produced is still named by the larger
+        // one's walk, at the same place.
+        let before = walked(seeded.rows());
+        let after = walked(bigger.rows());
+        assert!(!before.is_empty(), "the seed must produce some visible sites");
+        for (old, new) in before.iter().zip(after.iter()) {
+            assert_eq!(
+                old.site.name, new.site.name,
+                "a row changed identity when the table grew",
+            );
+            assert_eq!(old.screen, new.screen);
+        }
+
+        // And every row names the radar whose coordinates put it there, which
+        // is the property an index cannot promise across two tables.
+        for visible in &after {
+            assert_eq!(
+                visible.screen,
+                degrees_as_pixels(visible.site.lat, visible.site.lon),
+                "{} is drawn somewhere other than its own position",
+                visible.site.name,
+            );
+        }
+
+        // The arrivals are among them, reachable and named.
+        let names: Vec<&str> = after.iter().map(|v| v.site.name).collect();
+        assert!(names.contains(&"ZZZY"), "got {names:?}");
+        assert!(names.contains(&"ZZZX"));
+    }
 }

@@ -2780,3 +2780,124 @@ fn a_run_with_no_config_store_still_applies_the_volumes_own_position() {
     assert_eq!(plain.site_source, SitePositionSource::Table);
     assert_eq!(plain.site.lat, table.lat);
 }
+
+/// A radar the compiled-in seed has never heard of is in the table by the time
+/// `App::new` returns — before any frame exists.
+///
+/// # Why the timing is the assertion
+///
+/// The reopen-is-1:1 rule says a pane must look on its second opening exactly
+/// as it looked on its first. A site's position or *name* that arrives late
+/// breaks that in the most visible way there is: the map gains a marker, the
+/// site list gains a row, and a cross-section's height datum moves, under a
+/// user who is already looking at them. So the table is resolved beside the
+/// config load, in `App::new`, and again in `set_config_dir` where Android
+/// finally has a store — both of them ahead of the event loop.
+///
+/// The test therefore draws **no frames at all**. Constructing the app is the
+/// entire act under test, and an assertion that only held after a warm-up
+/// would be asserting the opposite of what this is for.
+///
+/// # Why it can run beside everything else
+///
+/// `sites::resolve` only ever adds radars, so no other test's app construction
+/// can take `ZZZF` away again once this one has put it there, and this one
+/// cannot disturb them: `ZZZF` is 5000 km from the nearest real radar, and no
+/// seeded row moves. The identifier is unique to this test for the same
+/// reason.
+#[test]
+fn a_learned_radar_the_seed_never_had_is_in_the_table_before_the_first_frame() {
+    use rustdar_egui::config_store::ConfigStore;
+
+    const SITE: &str = "ZZZF";
+
+    let store = std::rc::Rc::new(MemoryConfigStore::default());
+    // A previous session learned this radar from its own volume. The blob is
+    // written in the shape `SitePositions` persists, because going through the
+    // real load is the point: a hand-installed table would not show that the
+    // cache reaches the table at all.
+    let learned = serde_json::to_string(&std::collections::BTreeMap::from([(
+        SITE.to_owned(),
+        rustdar_radar::site_position::SitePosition {
+            lat_udeg: -34_000_000,
+            lon_udeg: -144_000_000,
+            site_height_m: 100,
+            tower_height_m: 20,
+        },
+    )]))
+    .expect("a SitePosition serializes");
+    store
+        .store(crate::site_positions::SITE_POSITIONS_KEY, &learned)
+        .expect("the double's store cannot fail");
+
+    assert!(
+        rustdar_radar::sites::get_radar_site(SITE).is_none(),
+        "precondition: {SITE} must not be a seed row, or this proves nothing",
+    );
+
+    let _app = headless(TestBridge::desktop().with_store(std::rc::Rc::clone(&store)));
+
+    let row = rustdar_radar::sites::get_radar_site(SITE).unwrap_or_else(|| {
+        panic!(
+            "constructing the app must resolve the table: {SITE} was learned \
+             in an earlier session and is still unknown",
+        )
+    });
+    assert_eq!(row.name, SITE, "it carries its own ICAO, not UNKNOWN");
+    assert_eq!((row.lat, row.lon), (-34.0, -144.0));
+    assert!(
+        rustdar_radar::sites::radars().iter().any(|r| r.name == SITE),
+        "and the walk the map and the site list both do reaches it",
+    );
+}
+
+/// Android's second resolution is the one that has anything to resolve.
+///
+/// `App::new` runs before the bridge will hand out a store, so it resolves
+/// with nothing; `set_config_dir` is the first moment a returning user's
+/// learned radars are readable at all. This pins that the table is resolved
+/// *there* too, and it is the reason `sites::resolve` extends the table in
+/// hand rather than rebuilding from the seed: had it been a `OnceLock`, the
+/// empty first attempt would have won and the one platform that needs the
+/// second call would be the one platform where a learned radar never arrived.
+///
+/// Still before the first frame — `set_config_dir` runs inside `android_main`,
+/// ahead of the event loop.
+#[test]
+fn android_resolves_the_table_when_the_config_directory_arrives() {
+    use rustdar_egui::config_store::ConfigStore;
+
+    const SITE: &str = "ZZZG";
+
+    let bridge = TestBridge::android();
+    let learned = serde_json::to_string(&std::collections::BTreeMap::from([(
+        SITE.to_owned(),
+        rustdar_radar::site_position::SitePosition {
+            lat_udeg: -35_000_000,
+            lon_udeg: -145_000_000,
+            site_height_m: 100,
+            tower_height_m: 20,
+        },
+    )]))
+    .expect("a SitePosition serializes");
+    bridge
+        .store()
+        .store(crate::site_positions::SITE_POSITIONS_KEY, &learned)
+        .expect("the double's store cannot fail");
+
+    let mut app = headless(bridge);
+    assert!(
+        rustdar_radar::sites::get_radar_site(SITE).is_none(),
+        "precondition: there was nowhere to read {SITE} from yet",
+    );
+
+    app.set_config_dir(std::path::PathBuf::from("/data/user/0/rustdar"));
+
+    let row = rustdar_radar::sites::get_radar_site(SITE).unwrap_or_else(|| {
+        panic!(
+            "the config directory arrived and the table was not resolved from \
+             it: {SITE} is still unknown",
+        )
+    });
+    assert_eq!((row.lat, row.lon), (-35.0, -145.0));
+}
