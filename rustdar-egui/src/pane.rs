@@ -1086,49 +1086,36 @@ impl LoopPlaybackState {
     /// because there is no way to write [`Self::view_key`] that does not come
     /// through here.
     ///
-    /// # The tilt is only part of the target where it chooses the picture
+    /// # The tilt is part of the target only where it chooses the picture
     ///
-    /// The tilt is part of the target for a section loop because the frames it
-    /// keys are still keyed by a `RenderTarget` the section pipeline stamps
-    /// with it. It is *not* part of it for the other two kinds, and neither
-    /// exemption is a loop-kind carve-out — both are the same question asked of
-    /// the thing that draws the frame:
+    /// Asked of [`Self::view`] and the product together, through
+    /// [`RenderView::elevation_selects_picture`] — the one predicate that also
+    /// keys `render_dispatch`'s shared `RenderCache`. This is not a loop-kind
+    /// carve-out, and it is deliberately not restated here: a loop's re-renders
+    /// do **not** consult that cache, so every pair the two answered
+    /// differently cost a whole-volume recompute per *frame* rather than per
+    /// pane — up to `MAX_LOOP_RENDER_BUDGET` of them for one tilt click. Both
+    /// directions of that disagreement had already been paid for. See that
+    /// predicate for which pairs qualify and how the pipeline enforces each.
     ///
-    /// * **A volume loop.** A voxel grid is resampled from the whole ladder, so
-    ///   it chooses nothing — and keying on it would discard the entire
-    ///   resident set and pay ~2 s of rebuild the first time a user nudged the
-    ///   elevation slider on a 3D pane, for fourteen grids that would come back
-    ///   byte-identical.
-    /// * **A plan-view loop of a tilt-independent product.** The four products
-    ///   [`RadarProduct::tilt_independent_plan_view`] names reduce the whole
-    ///   volume to one polar grid before `render::render_radar_to_image_full`
-    ///   ever calls `find_sweep`, so the elevation reaches no line of them. It
-    ///   is asked here and not restated, because the same predicate keys
-    ///   `render_dispatch`'s shared `RenderCache` — and a loop's re-renders do
-    ///   *not* consult that cache, so a duplicated list that drifted would cost
-    ///   a whole-volume recompute per frame rather than per pane, up to
-    ///   `MAX_LOOP_RENDER_BUDGET` of them for one tilt click.
+    /// On [`Self::view`] rather than on `key`, for the reason
+    /// [`RenderView::can_loop`] gives: the view is what a frame is a picture
+    /// of, and it is already the axis the loop dispatcher branches every other
+    /// decision on. `key` cannot answer it — `None` is both "a plan-view loop"
+    /// and "a section or volume loop that has lost its line or region", which
+    /// are opposite answers.
     ///
     /// The stored `rendered_for` still carries the pane's selection, so the
     /// sibling broadcast and every result-acceptance test are unchanged; what
     /// this drops is only the *comparison*, and only where the tilt cannot move
     /// the picture.
-    ///
-    /// A `key` of `None` also stands for a section or volume loop that has lost
-    /// the line or region its frames were pictures of. That case never reaches
-    /// the product question: losing the key is itself a change of
-    /// [`Self::view_key`], which discards the frames below whatever this says.
     pub fn retarget_renders_keyed(
         &mut self,
         product: RadarProduct,
         elevation: f32,
         key: Option<LoopViewKey>,
     ) -> bool {
-        let tilt_matters = match &key {
-            Some(LoopViewKey::Volume(_)) => false,
-            Some(LoopViewKey::Section(_)) => true,
-            None => !product.tilt_independent_plan_view(),
-        };
+        let tilt_matters = self.view.elevation_selects_picture(product);
         // Runs for every looping pane every frame, and almost always finds no change,
         // so ask before building a target rather than allocating one to throw away.
         if self.rendered_for.as_ref().is_some_and(|t| {

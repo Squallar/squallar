@@ -248,19 +248,24 @@ const NO_ELEVATION_SLOT: i32 = 0;
 /// The cache key for one render, and the only place one is built.
 ///
 /// Written once rather than at each call site because the three rules above —
-/// which axis discriminates, which slot a viewless view uses, and which plan
-/// views have no tilt to discriminate on — are the kind that a second copy gets
-/// half right.
+/// which axis discriminates, which slot a viewless view uses, and which
+/// `(view, product)` pairs have no tilt to discriminate on — are the kind that
+/// a second copy gets half right.
+///
+/// The third of those is [`RenderView::elevation_selects_picture`], asked
+/// rather than restated here: the loop path keys its frames on the same
+/// question, and the two answering it separately is what let a section loop
+/// discard every frame for a tilt no section can see.
 fn render_cache_key(
     site: &str,
     product: RadarProduct,
     view: RenderView,
     elevation: f32,
 ) -> RenderCacheKey {
-    let elevation = match view {
-        RenderView::PlanView if product.tilt_independent_plan_view() => NO_ELEVATION_SLOT,
-        RenderView::PlanView => elevation_key(elevation),
-        RenderView::CrossSection | RenderView::Volume => NO_ELEVATION_SLOT,
+    let elevation = if view.elevation_selects_picture(product) {
+        elevation_key(elevation)
+    } else {
+        NO_ELEVATION_SLOT
     };
     (site.to_string(), product, view, elevation)
 }

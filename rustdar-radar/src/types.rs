@@ -538,6 +538,60 @@ impl RenderView {
         }
     }
 
+    /// Whether the pane's **selected elevation** chooses which picture a render
+    /// of this view showing `product` produces — and therefore whether anything
+    /// holding such a render has to key on the tilt.
+    ///
+    /// `false` means the tilt is not part of that render's identity: two
+    /// renders of one `(site, product, view)` at different selections are the
+    /// same bytes, so a cache may collapse them into one slot and a loop may
+    /// keep its frames across a tilt click.
+    ///
+    /// **Only a plan view has a tilt to ask about, and only for some products.**
+    ///
+    /// * **A cross-section** cuts across every rung of the ladder, so there is
+    ///   no selection to answer for. The pipeline says so at three separate
+    ///   points rather than by convention: [`crate::xsect::SectionRequest`] is
+    ///   `(start, end, top, product)` with no elevation field;
+    ///   [`RenderInput::extract_volume_parts`] — the only door a section
+    ///   payload comes through — stores [`NO_ELEVATION_DEG`] rather than the
+    ///   caller's angle, and takes no angle to store; and
+    ///   [`crate::xsect::render_section`] reaches the sampler through
+    ///   [`crate::derive::prepare`], which derives per sweep across the whole
+    ///   ladder and never calls `render::find_sweep`. That last point is what
+    ///   makes the answer hold for **NROT and SRV too**: those two rasterize
+    ///   the sweep `find_sweep` picks in a *plan* view, which is why they are
+    ///   tilt-dependent there, but the section path does not run that
+    ///   rasterizer at all.
+    /// * **A voxel grid** is resampled from the whole ladder for the same
+    ///   reason, which is why [`crate::render_input::NO_ELEVATION_DEG`] serves
+    ///   both vertical views.
+    /// * **A plan view** rasterizes one sweep — unless the product is one
+    ///   [`RadarProduct::tilt_independent_plan_view`] names, which reduce the
+    ///   whole volume before `render::render_radar_to_image_full` ever calls
+    ///   `find_sweep`.
+    ///
+    /// # One predicate, because two copies of it already disagreed
+    ///
+    /// `rustdar_frontend`'s `render_cache_key` and `rustdar_egui`'s
+    /// `LoopPlaybackState::retarget_renders_keyed` both ask this. They used to
+    /// answer it separately, and they disagreed in both directions: the loop
+    /// charged a tilt click for the four whole-volume plan views the cache
+    /// already collapsed, *and* charged a section loop for a tilt no section
+    /// can see — up to `MAX_LOOP_RENDER_BUDGET` re-renders apiece, none of
+    /// which consult that cache. Classified against the **view**, not the pane
+    /// kind, for [`can_loop`](Self::can_loop)'s reason: one map pane produces
+    /// two different kinds of frame depending on its render mode.
+    ///
+    /// [`RenderInput::extract_volume_parts`]: crate::render_input::RenderInput::extract_volume_parts
+    /// [`NO_ELEVATION_DEG`]: crate::render_input::NO_ELEVATION_DEG
+    pub fn elevation_selects_picture(self, product: RadarProduct) -> bool {
+        match self {
+            Self::PlanView => !product.tilt_independent_plan_view(),
+            Self::CrossSection | Self::Volume => false,
+        }
+    }
+
     /// A stable byte for the wire and for a cache key, **not** the declaration
     /// order.
     ///

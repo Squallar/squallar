@@ -324,6 +324,98 @@ fn editing_the_storm_motion_vector_discards_every_frame() {
     assert!(ls.frames.iter().all(|f| f.image.is_none()));
 }
 
+/// The products a section can actually be cut of: the ones
+/// `derive::volume_slot` admits, which is the gate `dispatch_section_renders`
+/// refuses on. Derived rather than listed because *which* products are
+/// sectionable is not what these two tests are about — the view is — and a
+/// stale hand-list would quietly stop covering a newly sectionable product.
+fn sectionable_products() -> Vec<RadarProduct> {
+    RadarProduct::all()
+        .iter()
+        .copied()
+        .filter(|p| rustdar_radar::derive::volume_slot(*p).is_some())
+        .collect()
+}
+
+/// **A tilt click must not re-cut a section loop, and it must still re-render
+/// the same product's plan-view loop.** One test, two loops, because the claim
+/// is that the answer belongs to the *view*: a fix that simply stopped asking
+/// would pass half of this and fail the other half.
+///
+/// The tilt cannot reach a section at three separate points — `SectionRequest`
+/// has no elevation field, `RenderInput::extract_volume_parts` stores
+/// `NO_ELEVATION_DEG` instead of any caller's angle, and `render_section` goes
+/// through `derive::prepare` rather than `render::find_sweep` — so every frame
+/// re-cut here came back byte-identical, up to `MAX_LOOP_RENDER_BUDGET` of them
+/// per click, and a loop's re-cuts never consult the shared `RenderCache` that
+/// had this right all along.
+///
+/// Walked over every sectionable product, **including NROT and SRV**. Those two
+/// are the trap: they rasterize the sweep `find_sweep` picks in a *plan* view,
+/// so they are genuinely tilt-dependent there, and a reader checking only
+/// "does this product read the whole volume" would conclude the section had to
+/// be re-cut too. The section path never runs that rasterizer.
+#[test]
+fn a_tilt_change_re_cuts_no_section_but_still_re_renders_the_plan_view() {
+    let ctx = egui::Context::default();
+    let products = sectionable_products();
+    for pair in [
+        RadarProduct::NormalizedRotation,
+        RadarProduct::StormRelativeVelocity,
+    ] {
+        assert!(
+            products.contains(&pair),
+            "fixture: {pair:?} must be sectionable, or the trap this test exists \
+             for is not covered",
+        );
+    }
+
+    for product in products {
+        // The section half: the tilt moved and every cut must survive.
+        let mut section = LoopPlaybackState::new_for_loop(3600, &site(), RenderView::CrossSection);
+        section.phase = LoopPhase::Rendering;
+        section.frames = (0..3)
+            .map(|i| LoopFrame {
+                timestamp: ts(i),
+                image: None,
+                render_in_flight: false,
+                render_failed: false,
+            })
+            .collect();
+        section.retarget_renders_for(product, TILT, Some(key()));
+        for frame in &mut section.frames {
+            frame.image = Some(section_picture(&ctx, 1));
+        }
+
+        assert!(
+            !section.retarget_renders_for(product, 19.5, Some(key())),
+            "{product:?}: a tilt click re-cut a section the tilt cannot move",
+        );
+        assert!(
+            section.frames.iter().all(|f| f.image.is_some()),
+            "{product:?}: a tilt click dropped a cut that would come back \
+             byte-identical",
+        );
+
+        // The plan-view half of the same product, over the same two tilts.
+        // These *are* pictures of one sweep, so they must go.
+        let mut plan = loop_in(RenderView::PlanView, 3);
+        plan.retarget_renders(product, TILT);
+        for frame in &mut plan.frames {
+            frame.image = Some(plan_view_picture(&ctx));
+        }
+        assert!(
+            plan.retarget_renders(product, 19.5),
+            "{product:?}: a plan-view loop kept frames drawn from another tilt's \
+             sweep",
+        );
+        assert!(
+            plan.frames.iter().all(|f| f.image.is_none()),
+            "{product:?}: a plan-view loop left the previous tilt on screen",
+        );
+    }
+}
+
 /// The vector is stored as raw bits so the comparison is reflexive: rewriting
 /// the same key must not invalidate anything, or a section loop would re-cut
 /// every frame on every dispatch pass for ever.
