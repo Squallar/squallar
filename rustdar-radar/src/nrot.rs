@@ -858,29 +858,61 @@ fn pair_phase(azimuths_deg: &[f64]) -> usize {
     if cohabit(1) > cohabit(0) { 1 } else { 0 }
 }
 
+/// The widest azimuthal half-span any profile reader asks for: the width-4
+/// bank kernel's tap list ([`BANK_K4_CLEAN`]) reaches ±11 radials, which is
+/// more than the base cap's ±7 and more than `gated_prof`'s ±(w+3) ≤ ±7.
+const PROFILE_MAX_HALF: usize = 11;
+
+/// Backing store for one [`az_profile`], sized for [`PROFILE_MAX_HALF`].
+///
+/// A `Vec` here was ~1.15 M heap allocations per sweep: [`apply_kernel_bank`]
+/// takes a profile once per non-`NaN` bin and three more through
+/// [`bank_kernel_rot`]'s kernel sweep, over ~230 k bins, for a fifteen-element
+/// array with a fixed maximum length. [`composite_stencil_rot`] and
+/// [`split_stencil_rot`] already had the right shape — a plain stack array —
+/// and this gives the bank path the same one. Nothing about the values
+/// changes; the profile is filled and read exactly as before.
+type ProfileBuf = [f64; 2 * PROFILE_MAX_HALF + 1];
+
+/// An empty [`ProfileBuf`], for a caller about to hand it to [`az_profile`].
+const EMPTY_PROFILE: ProfileBuf = [f64::NAN; 2 * PROFILE_MAX_HALF + 1];
+
 /// Range-averaged azimuthal velocity profile around (i, j): the 3-gate range
 /// mean per radial offset −half..=half — the same per-radial samples the tap
 /// stencils consume. NaN where a radial has no data in the range window.
-fn az_profile(vel_grid: &[Vec<f64>], i: usize, j: usize, gate_count: usize, half: i32) -> Vec<f64> {
+///
+/// Fills the leading `2·half + 1` entries of `out` and returns them; `half`
+/// above [`PROFILE_MAX_HALF`] would be a caller with a wider tap list than any
+/// kernel in the bank has, and panics rather than silently truncating.
+fn az_profile<'p>(
+    out: &'p mut ProfileBuf,
+    vel_grid: &[Vec<f64>],
+    i: usize,
+    j: usize,
+    gate_count: usize,
+    half: i32,
+) -> &'p [f64] {
     let num_radials = vel_grid.len() as i32;
-    (-half..=half)
-        .map(|da| {
-            let ai = ((i as i32 + da).rem_euclid(num_radials)) as usize;
-            let (mut sum, mut n) = (0.0, 0);
-            for dr in -STENCIL_RNG_HALF..=STENCIL_RNG_HALF {
-                let rj = j as i32 + dr;
-                if rj < 0 || rj >= gate_count as i32 {
-                    continue;
-                }
-                let v = vel_grid[ai][rj as usize];
-                if !v.is_nan() {
-                    sum += v;
-                    n += 1;
-                }
+    let len = 2 * half as usize + 1;
+    let slot = &mut out[..len];
+    for (idx, cell) in slot.iter_mut().enumerate() {
+        let da = idx as i32 - half;
+        let ai = ((i as i32 + da).rem_euclid(num_radials)) as usize;
+        let (mut sum, mut n) = (0.0, 0);
+        for dr in -STENCIL_RNG_HALF..=STENCIL_RNG_HALF {
+            let rj = j as i32 + dr;
+            if rj < 0 || rj >= gate_count as i32 {
+                continue;
             }
-            if n > 0 { sum / n as f64 } else { f64::NAN }
-        })
-        .collect()
+            let v = vel_grid[ai][rj as usize];
+            if !v.is_nan() {
+                sum += v;
+                n += 1;
+            }
+        }
+        *cell = if n > 0 { sum / n as f64 } else { f64::NAN };
+    }
+    slot
 }
 
 /// Best squared Pearson correlation between a fully-valid profile (centred
@@ -908,33 +940,40 @@ fn bank_template_r2(prof: &[f64], w: i32, neg_amp: f64) -> Option<f64> {
         .map(|(k, p)| (k as f64 - (n - 1.0) / 2.0) * (p - pm))
         .sum();
     let slope = sxy / sxx;
-    let prof: Vec<f64> = prof
-        .iter()
-        .enumerate()
-        .map(|(k, p)| p - pm - slope * (k as f64 - (n - 1.0) / 2.0))
-        .collect();
+    // Stack, not heap: this runs per candidate core per width, four `Vec`s a
+    // call (the detrended profile and one template per alignment), and the
+    // length is bounded by `PROFILE_MAX_HALF` like every other profile here.
+    let mut detrended = EMPTY_PROFILE;
+    let detrended = &mut detrended[..prof.len()];
+    for (k, slot) in detrended.iter_mut().enumerate() {
+        *slot = prof[k] - pm - slope * (k as f64 - (n - 1.0) / 2.0);
+    }
     let pm = 0.0;
-    let pv: f64 = prof.iter().map(|p| (p - pm).powi(2)).sum();
+    let pv: f64 = detrended.iter().map(|p| (p - pm).powi(2)).sum();
     if pv <= 0.0 {
         return None;
     }
     let mut best: Option<f64> = None;
+    let mut template = EMPTY_PROFILE;
+    let t = &mut template[..prof.len()];
     for s in -1..=1 {
-        let t: Vec<f64> = (-half..=half)
-            .map(|d| {
-                let x = d - s;
-                if (-w..0).contains(&x) {
-                    1.0
-                } else if (0..w).contains(&x) {
-                    -neg_amp
-                } else {
-                    0.0
-                }
-            })
-            .collect();
+        for (k, slot) in t.iter_mut().enumerate() {
+            let x = k as i32 - half - s;
+            *slot = if (-w..0).contains(&x) {
+                1.0
+            } else if (0..w).contains(&x) {
+                -neg_amp
+            } else {
+                0.0
+            };
+        }
         let tm = t.iter().sum::<f64>() / n;
         let tv: f64 = t.iter().map(|x| (x - tm).powi(2)).sum();
-        let cov: f64 = prof.iter().zip(&t).map(|(p, x)| (p - pm) * (x - tm)).sum();
+        let cov: f64 = detrended
+            .iter()
+            .zip(t.iter())
+            .map(|(p, x)| (p - pm) * (x - tm))
+            .sum();
         let r2 = cov * cov / (pv * tv);
         if best.is_none_or(|b| r2 > b) {
             best = Some(r2);
@@ -945,6 +984,45 @@ fn bank_template_r2(prof: &[f64], w: i32, neg_amp: f64) -> Option<f64> {
 
 /// A kernel's clean-side and away-side tap lists.
 type TapPair<'a> = (&'a [(i32, f64)], &'a [(i32, f64)]);
+
+/// A candidate window for the footprint pass that passes the ends-return gate
+/// (a couplet's profile comes back to the background on both sides; a step's
+/// does not), with the profile's bipolar balance about its median. `None` when
+/// the window is incomplete or the gate rejects it.
+///
+/// Takes its own backing array rather than returning a `Vec`, and is a free
+/// function rather than the closure it was so the borrow ends with the caller's
+/// use of the slice.
+fn gated_prof<'p>(
+    out: &'p mut ProfileBuf,
+    vel_grid: &[Vec<f64>],
+    i: usize,
+    j: usize,
+    gate_count: usize,
+    w: i32,
+) -> Option<(&'p [f64], f64)> {
+    let prof = az_profile(out, vel_grid, i, j, gate_count, w + 3);
+    if prof.iter().any(|p| p.is_nan()) {
+        return None;
+    }
+    let (lo, hi) = prof
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), &p| {
+            (l.min(p), h.max(p))
+        });
+    if hi <= lo || (prof[prof.len() - 1] - prof[0]).abs() > 0.5 * (hi - lo) {
+        return None;
+    }
+    let mut vals = EMPTY_PROFILE;
+    let vals = &mut vals[..prof.len()];
+    vals.copy_from_slice(prof);
+    vals.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    let med = vals[vals.len() / 2];
+    let dpos = vals[vals.len() - 1] - med;
+    let dneg = med - vals[0];
+    let balance = dpos.min(dneg) / dpos.max(dneg).max(1e-9);
+    Some((prof, balance))
+}
 
 /// One bank kernel at one bin: the same clean/away weight assembly as
 /// [`split_stencil_rot`], normalized by the legacy 1.0° arc. Requires every
@@ -961,7 +1039,8 @@ fn bank_kernel_rot(
 ) -> Option<f64> {
     let (clean, away) = taps;
     let span = clean.len() as i32;
-    let prof = az_profile(vel_grid, i, j, gate_count, span);
+    let mut buf = EMPTY_PROFILE;
+    let prof = az_profile(&mut buf, vel_grid, i, j, gate_count, span);
     let (plus, minus) = if pair_first {
         (clean, away)
     } else {
@@ -1058,11 +1137,20 @@ fn apply_kernel_bank(
                 if ci.is_nan() {
                     continue;
                 }
-                let prof = az_profile(vel_grid, i, j, sweep.gate_count, 7);
-                let mut vals: Vec<f64> = prof.iter().copied().filter(|p| !p.is_nan()).collect();
-                if vals.is_empty() {
+                let mut buf = EMPTY_PROFILE;
+                let prof = az_profile(&mut buf, vel_grid, i, j, sweep.gate_count, 7);
+                let mut vals = EMPTY_PROFILE;
+                let mut nvals = 0;
+                for &p in prof {
+                    if !p.is_nan() {
+                        vals[nvals] = p;
+                        nvals += 1;
+                    }
+                }
+                if nvals == 0 {
                     continue;
                 }
+                let vals = &mut vals[..nvals];
                 let (first, last) = (vals[0], vals[vals.len() - 1]);
                 vals.sort_by(|x, y| x.partial_cmp(y).unwrap());
                 let (lo, hi) = (vals[0], vals[vals.len() - 1]);
@@ -1115,62 +1203,45 @@ fn apply_kernel_bank(
                 {
                     continue;
                 }
-                // A candidate window that passes the ends-return gate (a
-                // couplet's profile comes back to the background on both
-                // sides; a step's does not), or None with the profile's
-                // bipolar balance about its median otherwise.
-                let gated_prof = |w: i32| -> Option<(Vec<f64>, f64)> {
-                    let prof = az_profile(vel_grid, i, j, sweep.gate_count, w + 3);
-                    if prof.iter().any(|p| p.is_nan()) {
-                        return None;
-                    }
-                    let (lo, hi) = prof
-                        .iter()
-                        .fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), &p| {
-                            (l.min(p), h.max(p))
-                        });
-                    if hi <= lo || (prof[prof.len() - 1] - prof[0]).abs() > 0.5 * (hi - lo) {
-                        return None;
-                    }
-                    let mut vals: Vec<f64> = prof.clone();
-                    vals.sort_by(|x, y| x.partial_cmp(y).unwrap());
-                    let med = vals[vals.len() / 2];
-                    let dpos = vals[vals.len() - 1] - med;
-                    let dneg = med - vals[0];
-                    let balance = dpos.min(dneg) / dpos.max(dneg).max(1e-9);
-                    Some((prof, balance))
-                };
                 let mut best: Option<(f64, i32, TapPair)> = None;
+                let mut buf = EMPTY_PROFILE;
                 for &(w, clean, away) in BANK.iter() {
                     // Bipolar balance about the window median: a monopolar
                     // notch (one deep pole, weak counter-deviation) never
                     // balances; a symmetric rotation couplet does.
-                    let Some((prof, balance)) = gated_prof(w) else {
+                    let Some((prof, balance)) =
+                        gated_prof(&mut buf, vel_grid, i, j, sweep.gate_count, w)
+                    else {
                         continue;
                     };
                     if balance < BANK_BALANCE_MIN {
                         continue;
                     }
-                    if let Some(r2) = bank_template_r2(&prof, w, 1.0)
+                    if let Some(r2) = bank_template_r2(prof, w, 1.0)
                         && r2 >= BANK_R2_MIN
                         && best.is_none_or(|(b, _, _)| r2 > b)
                     {
                         best = Some((r2, w, (clean, away)));
                     }
                 }
-                for &(neg_amp, clean, away) in BANK_ASYM.iter() {
-                    // Asymmetric couplets fail the balance test by nature;
-                    // their template gate alone carries the notch guard
-                    // (the measured notch scores r² ≈ 0.2–0.3 here).
-                    let w = 3;
-                    let Some((prof, _)) = gated_prof(w) else {
-                        continue;
-                    };
-                    if let Some(r2) = bank_template_r2(&prof, w, neg_amp)
-                        && r2 >= BANK_R2_MIN
-                        && best.is_none_or(|(b, _, _)| r2 > b)
-                    {
-                        best = Some((r2, w, (clean, away)));
+                // Both asymmetric entries are width 3, so their window is one
+                // window: gated as one, and the same three radial means the
+                // symmetric width-3 pass already walked. It used to be
+                // recomputed three times per candidate core.
+                let mut asym_buf = EMPTY_PROFILE;
+                if let Some((prof, _)) =
+                    gated_prof(&mut asym_buf, vel_grid, i, j, sweep.gate_count, 3)
+                {
+                    for &(neg_amp, clean, away) in BANK_ASYM.iter() {
+                        // Asymmetric couplets fail the balance test by nature;
+                        // their template gate alone carries the notch guard
+                        // (the measured notch scores r² ≈ 0.2–0.3 here).
+                        if let Some(r2) = bank_template_r2(prof, 3, neg_amp)
+                            && r2 >= BANK_R2_MIN
+                            && best.is_none_or(|(b, _, _)| r2 > b)
+                        {
+                            best = Some((r2, 3, (clean, away)));
+                        }
                     }
                 }
                 let Some((_, w, (clean, away))) = best else {
