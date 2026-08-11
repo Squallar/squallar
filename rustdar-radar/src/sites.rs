@@ -1990,71 +1990,92 @@ impl SiteTable {
     }
 }
 
-/// Build a table from [`SEED`], overlaid by what an install has learned.
+/// [`SEED`] plus a row for every radar in `learned` that the seed has never
+/// heard of.
 ///
-/// Each `(name, position)` pair either **moves** the seed row of that name
-/// onto the position its own volume reported, or — and this is the point of
-/// the whole exercise — **adds a row the seed has never heard of**. A radar
-/// commissioned after this binary was built reaches the user as a real row
-/// with its real ICAO, because the position was learned from a volume and the
-/// name is the key that position was filed under.
+/// This is the whole point of the exercise. A radar commissioned after this
+/// binary was built used to be unnameable: `get_radar_site` answered `None`,
+/// so `applied_to` fell back to [`UNKNOWN_SITE_NAME`], the map drew no marker
+/// and the site list had no row. It reaches the user as a real row here,
+/// because the position was learned from its own volume and the name is the
+/// key that position was filed under.
 ///
-/// The added row's name is leaked, because [`RadarSite::name`] is
-/// `&'static str` and a four-byte identifier read out of a volume header at
-/// runtime is not. That is a handful of bytes per radar this install has ever
-/// opened, once per resolution, against a `MAX_REMEMBERED_SITES` cap upstream.
+/// # Why a site the seed *does* know keeps its seeded row
 ///
-/// Heights come from [`SitePosition::heights_over`], which keeps a seed row's
-/// finer figures wherever the volume's whole metres cannot contradict them —
-/// so an overlay never costs a row the precision it already had. A row the
-/// seed never had takes the volume's heights outright, and therefore always
-/// records *an* elevation: `every_site_records_an_elevation` holds over a
-/// learned row for the same reason it holds over a seeded one, which matters
-/// because the alternative is a section anchored at sea level.
+/// Not an oversight. A learned position already outranks the table where it
+/// counts: `SitePositionSource` orders them `Volume` → `Learned` → `Table`,
+/// pinned by `the_precedence_is_volume_then_learned_then_table`, and
+/// `ScanInfo::from_scan` consults the cache directly. Applying it here as well
+/// would put one correction in two places. The table's job in that order is to
+/// be the *fallback* — what is known about a radar when nothing else knows
+/// anything — and for a seeded radar the fallback is the seeded row.
+///
+/// What the table genuinely cannot express, and what nothing else can supply,
+/// is a row that does not exist. So that is what this adds, and only that.
+///
+/// # The name is leaked
+///
+/// [`RadarSite::name`] is `&'static str` and a four-byte identifier read out
+/// of a volume header at runtime is not, so it is leaked — a handful of bytes
+/// per radar beyond the seed that this install has ever opened, bounded
+/// upstream by `MAX_REMEMBERED_SITES`.
+///
+/// # An added row always records an elevation
+///
+/// It takes the volume's heights through [`SitePosition::heights_over`], which
+/// always yields some [`SiteHeights`]. So `every_site_records_an_elevation`
+/// holds over a learned row for the same reason it holds over a seeded one,
+/// and that matters: a row without one anchors a cross-section at sea level,
+/// which reads as a measurement rather than as a gap.
 pub fn build_table<'a, I>(learned: I) -> &'static SiteTable
 where
     I: IntoIterator<Item = (&'a str, SitePosition)>,
 {
-    let mut rows: Vec<RadarSite> = SEED.to_vec();
-    let mut at: HashMap<&'static str, usize> = rows
-        .iter()
-        .enumerate()
-        .map(|(index, row)| (row.name, index))
-        .collect();
-
-    for (name, position) in learned {
-        match at.get(name) {
-            Some(&index) => {
-                let row = &rows[index];
-                rows[index] = position.applied_to_named(row.name, row.heights);
-            }
-            None => {
-                // Leaked so the row can carry it as `&'static str`. The name
-                // is also re-keyed into `at`, so a second entry for the same
-                // unseeded site updates the row it already added rather than
-                // filing a duplicate radar beside it.
-                let name: &'static str = Box::leak(name.to_owned().into_boxed_str());
-                at.insert(name, rows.len());
-                rows.push(position.applied_to_named(name, None));
-            }
-        }
-    }
-
-    let rows: &'static [RadarSite] = Box::leak(rows.into_boxed_slice());
-    let by_name = rows.iter().map(|row| (row.name, row)).collect();
-    Box::leak(Box::new(SiteTable { rows, by_name }))
+    extended(seed_table(), learned).unwrap_or_else(seed_table)
 }
 
-/// The seed on its own, built once and shared by every resolution that learns
-/// nothing.
+/// `base` plus the radars in `learned` it does not have, or `None` if it
+/// already has all of them.
 ///
-/// Almost every process is this one — a fresh install, and every test that
-/// constructs an app against an empty store — and giving them all the same
-/// table means the overwhelmingly common `resolve` is a pointer store rather
-/// than a fresh leak of 207 rows.
+/// `None` rather than an identical copy so the common resolution — an install
+/// that has learned nothing beyond the seed, which is every fresh install and
+/// every test that builds an app against an empty store — reuses the table it
+/// already has instead of leaking another 207 rows beside it.
+fn extended<'a, I>(base: &'static SiteTable, learned: I) -> Option<&'static SiteTable>
+where
+    I: IntoIterator<Item = (&'a str, SitePosition)>,
+{
+    let mut rows: Vec<RadarSite> = Vec::new();
+    let mut added: HashMap<&'a str, ()> = HashMap::new();
+    for (name, position) in learned {
+        // `added` as well as `base`, so two entries for the same unseeded
+        // radar file one row rather than two radars of the same name.
+        if base.get(name).is_some() || added.insert(name, ()).is_some() {
+            continue;
+        }
+        let name: &'static str = Box::leak(name.to_owned().into_boxed_str());
+        rows.push(position.applied_to_named(name, None));
+    }
+    if rows.is_empty() {
+        return None;
+    }
+
+    let mut all: Vec<RadarSite> = base.rows().to_vec();
+    all.append(&mut rows);
+    let rows: &'static [RadarSite] = Box::leak(all.into_boxed_slice());
+    let by_name = rows.iter().map(|row| (row.name, row)).collect();
+    Some(Box::leak(Box::new(SiteTable { rows, by_name })))
+}
+
+/// The seed on its own, built once.
+///
+/// Where every process starts, and where almost every one stays.
 fn seed_table() -> &'static SiteTable {
-    static SEED_TABLE: LazyLock<&'static SiteTable> =
-        LazyLock::new(|| build_table(std::iter::empty()));
+    static SEED_TABLE: LazyLock<&'static SiteTable> = LazyLock::new(|| {
+        let rows: &'static [RadarSite] = &SEED;
+        let by_name = rows.iter().map(|row| (row.name, row)).collect();
+        &*Box::leak(Box::new(SiteTable { rows, by_name }))
+    });
     *SEED_TABLE
 }
 
@@ -2089,26 +2110,36 @@ pub fn table() -> &'static SiteTable {
 /// ahead of any frame — `App::new`, and again in `set_config_dir` where
 /// Android finally has a store to read from. Both run before a frame exists.
 ///
-/// Resolving is therefore idempotent-shaped rather than one-shot: Android
-/// genuinely resolves twice, and a `OnceLock` would have made the second
-/// attempt — the one that has the learned positions — silently do nothing.
+/// Resolving is therefore not one-shot: Android genuinely resolves twice, and
+/// a `OnceLock` would have let the empty first attempt win and silently
+/// discarded every learned position on the one platform that needs the second
+/// call.
 ///
-/// Rows from the previous table stay valid; they are leaked, so a
-/// `&'static RadarSite` handed out before a resolution keeps naming the radar
-/// it named. What it must not be is an *index*, which is why nothing outside
-/// this module can reach the rows by position.
+/// # Resolution only ever adds radars
+///
+/// Each call extends the table already in hand rather than rebuilding from
+/// [`SEED`], so the process can learn about a radar but never forget one. Two
+/// consequences worth naming:
+///
+/// * A resolution that learns nothing new is a genuine no-op — it does not
+///   even take the write lock — so the common startup costs nothing and
+///   cannot undo an earlier one.
+/// * No row ever moves. A `&'static RadarSite` handed out before a resolution
+///   keeps naming the radar it named, and so does the row at any given
+///   position. That last part is a happy accident and **not** something to
+///   lean on: the table gets longer, so an index minted against one table
+///   still means nothing against a later one, which is why nothing outside
+///   this module can reach the rows by position at all.
 pub fn resolve<'a, I>(learned: I) -> &'static SiteTable
 where
     I: IntoIterator<Item = (&'a str, SitePosition)>,
 {
-    let learned: Vec<(&'a str, SitePosition)> = learned.into_iter().collect();
-    let table = if learned.is_empty() {
-        seed_table()
-    } else {
-        build_table(learned)
+    let current = table();
+    let Some(extended) = extended(current, learned) else {
+        return current;
     };
-    *RESOLVED.write().unwrap_or_else(|e| e.into_inner()) = Some(table);
-    table
+    *RESOLVED.write().unwrap_or_else(|e| e.into_inner()) = Some(extended);
+    extended
 }
 
 /// Every radar this process knows about.
@@ -2666,5 +2697,155 @@ mod nearest_tests {
                 site.name, found.name, dist
             );
         }
+    }
+
+    /// An ICAO no seed row carries, and a position far enough from the network
+    /// that any nearest-search reaching it is unambiguous.
+    ///
+    /// The middle of the South Pacific: 5000 km from the nearest real radar,
+    /// so "the search found the added row" cannot be confused with "the search
+    /// found something else nearby".
+    const UNSEEDED: &str = "ZZZZ";
+    const REMOTE: SitePosition = SitePosition {
+        lat_udeg: -30_000_000,
+        lon_udeg: -140_000_000,
+        site_height_m: 100,
+        tower_height_m: 20,
+    };
+
+    /// A table built over the seed carries a radar the seed has never heard
+    /// of, and carries it as a *radar* — named, placed and elevated.
+    ///
+    /// This is the refactor's reason to exist. Before it, an identifier the
+    /// compiled-in array did not list could not be named at all: `applied_to`
+    /// fell through to `UNKNOWN_SITE_NAME`, the map drew no marker for it and
+    /// the site list had no row. A binary could only ever know the network as
+    /// it stood on the day it was built.
+    ///
+    /// Every clause here fails if the table goes back to being the compiled-in
+    /// array, because the array cannot grow.
+    #[test]
+    fn a_radar_the_seed_never_heard_of_becomes_a_real_row() {
+        assert!(
+            seed_table().get(UNSEEDED).is_none(),
+            "precondition: {UNSEEDED} must not be a seed row, or this test \
+             proves nothing",
+        );
+
+        let table = build_table([(UNSEEDED, REMOTE)]);
+
+        let row = table
+            .get(UNSEEDED)
+            .expect("a learned radar must be findable by name");
+        assert_eq!(
+            row.name, UNSEEDED,
+            "it must carry its own ICAO, not UNKNOWN",
+        );
+        assert_eq!((row.lat, row.lon), (-30.0, -140.0), "at its own position");
+        assert!(
+            row.heights.is_some(),
+            "a row with no elevation anchors a section at sea level",
+        );
+        assert_eq!(
+            row.height_ft(Datum::Feedhorn),
+            Some(394),
+            "120 m of ground and tower, in feet",
+        );
+
+        assert_eq!(
+            table.rows().len(),
+            seed_table().rows().len() + 1,
+            "the table is one longer than the seed",
+        );
+        assert!(
+            table.rows().iter().any(|r| r.name == UNSEEDED),
+            "and the walk every consumer does reaches it",
+        );
+    }
+
+    /// The added radar answers a nearest-search, which is the route startup
+    /// site selection and `radar_height_ft_near` both take.
+    ///
+    /// Being in the name map is not enough: a row nothing can *find* is a row
+    /// the user cannot be placed on.
+    #[test]
+    fn an_added_radar_answers_a_nearest_search() {
+        let table = build_table([(UNSEEDED, REMOTE)]);
+
+        let (found, dist) = table.nearest(-30.0, -140.0).expect("a finite coordinate");
+        assert_eq!(found.name, UNSEEDED, "at {dist} km");
+        assert!(dist < 0.001, "it is its own nearest neighbour: {dist} km");
+
+        // And through the WSR-88D filter, which is what an automatic pick
+        // uses. `ZZZZ` does not start with `T`, so it is not a TDWR.
+        let (found, _) = table
+            .nearest_wsr88d(-30.0, -140.0)
+            .expect("a finite coordinate");
+        assert_eq!(found.name, UNSEEDED);
+
+        // The seed's own answers are unchanged by its presence — it is 5000 km
+        // from anything, so nothing else can have moved.
+        let (okc, _) = table
+            .nearest_wsr88d(35.4676, -97.5164)
+            .expect("a finite coordinate");
+        assert_eq!(okc.name, "KTLX", "adding a radar must not move the others");
+    }
+
+    /// A radar the seed *does* carry keeps its seeded row.
+    ///
+    /// Deliberate, and documented on [`build_table`]: a learned position
+    /// already outranks the table through `SitePositionSource`, so applying it
+    /// here as well would put one correction in two places. The table is the
+    /// fallback, and for a seeded radar the fallback is the seeded row.
+    #[test]
+    fn a_seeded_radar_keeps_its_seeded_row() {
+        let seeded = seed_table().get("KTLX").expect("KTLX is a seed row");
+        let elsewhere = SitePosition {
+            lat_udeg: 100_000,
+            lon_udeg: 100_000,
+            site_height_m: 1,
+            tower_height_m: 1,
+        };
+
+        let table = build_table([("KTLX", elsewhere)]);
+
+        let after = table.get("KTLX").expect("still there");
+        assert_eq!((after.lat, after.lon), (seeded.lat, seeded.lon));
+        assert_eq!(
+            table.rows().len(),
+            seed_table().rows().len(),
+            "and nothing was appended beside it",
+        );
+    }
+
+    /// Two entries for one unseeded radar file one row, not two radars of the
+    /// same name.
+    ///
+    /// A duplicate would break `every_site_is_its_own_nearest_neighbour` in
+    /// exactly the way `TOK2`/`DOP1` were kept out of the seed to avoid: two
+    /// rows at one position, where which of them a search answers with is
+    /// arbitrary.
+    #[test]
+    fn a_repeated_identifier_files_one_row() {
+        let table = build_table([(UNSEEDED, REMOTE), (UNSEEDED, REMOTE)]);
+        assert_eq!(
+            table
+                .rows()
+                .iter()
+                .filter(|r| r.name == UNSEEDED)
+                .count(),
+            1,
+        );
+    }
+
+    /// Learning nothing new reuses the table in hand rather than leaking a
+    /// copy of it.
+    #[test]
+    fn a_resolution_that_learns_nothing_is_the_same_table() {
+        let once = build_table(std::iter::empty());
+        assert!(
+            std::ptr::eq(once.rows(), seed_table().rows()),
+            "an empty overlay must not leak a second copy of the seed",
+        );
     }
 }
