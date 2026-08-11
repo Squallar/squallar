@@ -14,8 +14,9 @@
 //! `nyquist_velocity`, in hundredths of a metre per second, on every radial;
 //! `nexrad-decode` decodes it. What loses it is the model boundary:
 //! `nexrad_model::data::Radial` has no field for it, so `volume::File::scan()`
-//! — the one call every archive path in this crate makes — drops it on the
-//! floor, and nothing downstream of a `Scan` can get it back.
+//! drops it on the floor, and nothing downstream of a `Scan` can get it back.
+//! [`crate::scan`] therefore walks the archive's records itself and reads the
+//! number where it is still in hand, on the same pass that builds the `Scan`.
 //!
 //! Before this module the sampler *estimated* the limit instead, off the
 //! largest speed a sweep observed (`estimate_fold_limit`).
@@ -142,14 +143,52 @@ impl DeclaredNyquist {
         }
     }
 
-    /// Read every cut's declared Nyquist velocity out of a raw Level II
-    /// archive file.
+    /// Record what one decoded Message 31 radial declares, if it declares
+    /// anything.
     ///
-    /// Walks the records itself rather than going through
-    /// `volume::File::scan()`, for the reason [`crate::kdp::KdpParams::from_archive`] does the same: the model type this crate is otherwise built on does not
-    /// carry radial-header parameters, and the raw walk is the only place they
-    /// are still in hand. Costs one decompress-and-parse pass over the volume,
-    /// which is the same pass `scan()` makes.
+    /// **The one place this crate reads the field, and the one place it states
+    /// the unit.** Three walks over Level II bytes reach a Message 31 —
+    /// [`crate::scan`]'s archive decode, [`crate::chunks`]'s real-time chunk
+    /// decode, and [`Self::from_archive`] — and each used to spell the read out
+    /// for itself. Three copies of "read `nyquist_velocity_raw`, multiply by
+    /// 0.01, first writer wins" is three chances for one of them to drift, and
+    /// the drift would be silent: the guard would simply be a little wrong on
+    /// whichever path diverged. Now they call this.
+    ///
+    /// A radial with no Radial Data Block leaves its cut unnamed rather than
+    /// declaring a zero — an absence the guard estimates for, not a fold limit
+    /// of nothing.
+    pub(crate) fn declare_from_message(
+        &mut self,
+        radar: &nexrad_decode::messages::digital_radar_data::Message<'_>,
+    ) {
+        let Some(block) = radar.radial_data_block() else {
+            return;
+        };
+        // The raw word is hundredths of a metre per second. Taken raw rather
+        // than through `nyquist_velocity()` so this crate's one statement of
+        // the unit is the `* 0.01` here, in a module whose whole subject is the
+        // number.
+        self.declare(
+            radar.header().elevation_number(),
+            f64::from(block.nyquist_velocity_raw()) * 0.01,
+        );
+    }
+
+    /// Read every cut's declared Nyquist velocity out of a raw Level II
+    /// archive file, on a walk of its own.
+    ///
+    /// **Not what the archive path uses.** [`crate::scan`] folds this read into
+    /// the same walk that builds the `Scan`, because a separate pass here costs
+    /// a second bzip2 decompress and a second Message 31 parse of the whole
+    /// volume — measured at 98% of `volume::File::scan()`'s own cost, so
+    /// running both very nearly doubled every archive decode.
+    ///
+    /// It stays because it is the *independent* reading of the same bytes: the
+    /// live test in [`crate::scan`] pins the folded table against this one, and
+    /// a table built by a walk that does nothing else is what makes that a real
+    /// check rather than a tautology. Use it for that, and for a caller who
+    /// wants the numbers without paying for a `Scan`.
     ///
     /// Every failure is an absence, never an error: an unreadable record, a
     /// record that will not decompress, a Message 1 volume (no Nyquist field
@@ -176,20 +215,9 @@ impl DeclaredNyquist {
                 continue;
             };
             for message in messages {
-                let MessageContents::DigitalRadarData(radar) = message.contents() else {
-                    continue;
-                };
-                let Some(block) = radar.radial_data_block() else {
-                    continue;
-                };
-                // The raw word is hundredths of a metre per second. Taken raw
-                // rather than through `nyquist_velocity()` so this crate's one
-                // statement of the unit is the `* 0.01` here, in a module whose
-                // whole subject is the number.
-                out.declare(
-                    radar.header().elevation_number(),
-                    f64::from(block.nyquist_velocity_raw()) * 0.01,
-                );
+                if let MessageContents::DigitalRadarData(radar) = message.contents() {
+                    out.declare_from_message(radar);
+                }
             }
         }
         out

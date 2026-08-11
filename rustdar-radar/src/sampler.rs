@@ -449,10 +449,11 @@ impl Blend {
     ///
     /// **The archive carries that number, and it now reaches here.** Message
     /// 31's Radial Data Block has `nyquist_velocity`, `nexrad-decode` decodes
-    /// it, and [`crate::nyquist::DeclaredNyquist::from_archive`] reads it out
-    /// of a raw `nexrad_data::volume::File` the way
-    /// [`crate::kdp::KdpParams::from_archive`] reads the other radial-header
-    /// parameters. What used to drop it was the boundary this sampler sits
+    /// it, and [`crate::scan`] reads it out of a raw
+    /// `nexrad_data::volume::File` on the same walk that builds the `Scan` —
+    /// the way [`crate::kdp::KdpParams::from_archive`] reads the other
+    /// radial-header parameters, except folded in rather than paid for twice.
+    /// What used to drop it was the boundary this sampler sits
     /// behind — `nexrad_model::data::Radial` does not carry it, and the
     /// worker's reconstructed `RenderInput` is built from model types alone —
     /// so the number was *measured off the data* instead. It is now carried:

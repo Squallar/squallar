@@ -541,8 +541,8 @@ impl RenderInput {
     /// and everything else in the payload is derivable from those. The
     /// declared Nyquist velocity is not: `nexrad_model::data::Radial` dropped
     /// it at the decoder, so it can only come from a table the *caller* is
-    /// holding — [`crate::nyquist::DeclaredNyquist::from_archive`]'s, the
-    /// chunk feed's, or the merged current volume's. Threading it into
+    /// holding — [`crate::scan::DecodedScan`]'s, the chunk feed's, or the
+    /// merged current volume's. Threading it into
     /// [`extract`](Self::extract), [`extract_volume`](Self::extract_volume)
     /// and [`extract_volume_parts`](Self::extract_volume_parts) would put an
     /// argument in three signatures — two of them already at clippy's

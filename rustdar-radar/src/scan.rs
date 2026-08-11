@@ -26,8 +26,8 @@ pub type Result<T> = std::result::Result<T, ScanError>;
 /// is gone. The velocity fold guard in [`crate::sampler`] needs it, and by the
 /// time anything reaches the guard the raw file is long dropped.
 ///
-/// So every entry point here hands back both, read from the same bytes in the
-/// same call. `declared_nyquist` is empty rather than absent for a volume that
+/// So every entry point here hands back both, read from the same bytes on the
+/// same walk. `declared_nyquist` is empty rather than absent for a volume that
 /// declared nothing — an all-Message-1 archive, which has no such field —
 /// and readers estimate for the cuts it does not name. See [`crate::nyquist`].
 pub struct DecodedScan {
@@ -35,19 +35,132 @@ pub struct DecodedScan {
     pub declared_nyquist: crate::nyquist::DeclaredNyquist,
 }
 
-/// Decode a downloaded volume into its `Scan` and its declared Nyquist table.
+/// Decode a downloaded volume into its `Scan` and its declared Nyquist table,
+/// in **one** pass over the file.
 ///
-/// Two passes over the file: `scan()`'s, and
-/// [`crate::nyquist::DeclaredNyquist::from_archive`]'s raw walk for the fields
-/// the model type does not keep. The second is the price of reading a
-/// radial-header parameter through a model that has no room for it — the same
-/// price [`crate::kdp::KdpParams::from_archive`] pays for the calibration
-/// constants — and it is paid once per volume, off the frame thread, against a
-/// download that already cost a network round trip.
+/// # Why this is not `file.scan()` plus a second read
+///
+/// It used to be exactly that: `nexrad_data::volume::File::scan()` for the
+/// model types, then [`crate::nyquist::DeclaredNyquist::from_archive`] for the
+/// one radial-header field the model has no room for. Both walk every LDM
+/// record, bzip2-decompress it and parse its Message 31s; the only thing the
+/// second walk does differently is stop before `into_radial`.
+///
+/// So it was not a small surcharge on the decode, it was **another decode**.
+/// Measured over eight archived volumes (1.1–3.2 MB compressed, best of five
+/// runs each), the Nyquist walk cost 1210 ms against `scan()`'s own 1238 ms —
+/// 98% — and the pair together 2448 ms against **1243 ms** for the single walk
+/// here. Reading one number per cut had been doubling the cost of every volume
+/// this application opens.
+///
+/// That is not a price paid once at startup. It is paid on cold start, on every
+/// timeline scrub, on every "next scan" step, and once per frame of a loop
+/// download — up to sixty of them — and on the web it is paid on the browser's
+/// main thread.
+///
+/// So the walk happens once and both consumers read the same decompressed
+/// records. Nothing about the result changes: the radials, their order, the
+/// site and the coverage pattern are `scan()`'s, and the Nyquist table is
+/// `from_archive`'s, both pinned against those two functions by
+/// [`tests::live_one_pass_decode_matches_the_two_pass_decode`].
+///
+/// # Why the body restates `scan()` rather than calling it
+///
+/// The number the fold guard needs is on the Message 31 radial and gone by the
+/// time `into_radial` has run, and `scan()` neither returns it nor takes a
+/// callback. Reading it therefore has to happen *inside* the walk, and there is
+/// no way into upstream's. What is restated is only the traversal: the message-5
+/// translation is [`crate::chunks::coverage_pattern_from`], already in this
+/// crate for the chunk path, and the radial and sweep construction are
+/// upstream's own `into_radial` and `Sweep::from_radials`.
+///
+/// Message 1 volumes decode to no radials here, exactly as they do through
+/// `scan()`, which also matches only `DigitalRadarData`. Widening that is a
+/// separate change with its own evidence to gather, not a side effect of this
+/// one.
 fn decoded(file: &nexrad_data::volume::File) -> Result<DecodedScan> {
+    use nexrad_decode::messages::MessageContents;
+
+    // The site's location is stated on every radial's volume block; the first
+    // one wins, as it does in `scan()`.
+    struct SiteLocation {
+        latitude: f32,
+        longitude: f32,
+        site_height: i16,
+        tower_height: u16,
+    }
+
+    let mut declared_nyquist = crate::nyquist::DeclaredNyquist::empty();
+    let mut radials: Vec<nexrad_model::data::Radial> = Vec::new();
+    let mut coverage_pattern = None;
+    let mut site_location: Option<SiteLocation> = None;
+
+    for record in file.records()? {
+        let record = if record.compressed() {
+            record.decompress()?
+        } else {
+            record
+        };
+        for message in record.messages()? {
+            match message.into_contents() {
+                MessageContents::DigitalRadarData(m) => {
+                    if site_location.is_none()
+                        && let Some(volume) = m.volume_data_block()
+                    {
+                        site_location = Some(SiteLocation {
+                            latitude: volume.inner().latitude_raw(),
+                            longitude: volume.inner().longitude_raw(),
+                            site_height: volume.inner().site_height_raw(),
+                            tower_height: volume.inner().tower_height_raw(),
+                        });
+                    }
+                    // Before `into_radial`, which is where the number is lost.
+                    declared_nyquist.declare_from_message(&m);
+                    // Through `nexrad_data`'s error rather than straight to
+                    // `ScanError`, so a decode failure here is the same variant
+                    // it was when `scan()` raised it.
+                    radials.push(m.into_radial().map_err(nexrad_data::result::Error::from)?);
+                }
+                // First one wins, as in `scan()`: a repeat of message 5 inside
+                // one volume is the same pattern restated.
+                MessageContents::VolumeCoveragePattern(m) if coverage_pattern.is_none() => {
+                    coverage_pattern = Some(crate::chunks::coverage_pattern_from(&m));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // `scan()`'s own outcome for a volume with no message 5: there is no
+    // coverage pattern to invent, and every reader of a `Scan` assumes one.
+    let coverage_pattern =
+        coverage_pattern.ok_or(nexrad_data::result::Error::MissingCoveragePattern)?;
+
+    let site = site_location.map(|loc| {
+        let mut identifier = [0u8; 4];
+        if let Some(icao) = file.header().and_then(|h| h.icao_of_radar()) {
+            let bytes = icao.as_bytes();
+            let len = bytes.len().min(4);
+            identifier[..len].copy_from_slice(&bytes[..len]);
+        }
+        nexrad_model::meta::Site::new(
+            identifier,
+            loc.latitude,
+            loc.longitude,
+            loc.site_height,
+            loc.tower_height,
+        )
+    });
+
+    let sweeps = nexrad_model::data::Sweep::from_radials(radials);
+    let scan = match site {
+        Some(site) => Scan::with_site(site, coverage_pattern, sweeps),
+        None => Scan::new(coverage_pattern, sweeps),
+    };
+
     Ok(DecodedScan {
-        scan: file.scan()?,
-        declared_nyquist: crate::nyquist::DeclaredNyquist::from_archive(file),
+        scan,
+        declared_nyquist,
     })
 }
 
@@ -428,3 +541,6 @@ pub async fn fetch_notified_chunk(
         .fetch_notified(&crate::sources::DataSources::production(), id)
         .await
 }
+
+#[cfg(test)]
+mod tests;

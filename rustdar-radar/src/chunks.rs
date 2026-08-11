@@ -348,13 +348,7 @@ fn ingest_record(name: &str, record: volume::Record<'_>, out: &mut ChunkContents
                 // Before `into_radial`, which is where the number is lost: the
                 // model type has no field for it. First radial of a cut wins,
                 // which `declare` enforces; within a sweep the PRF is constant.
-                if let Some(block) = m.radial_data_block() {
-                    out.declared_nyquist.declare(
-                        m.header().elevation_number(),
-                        // Hundredths of a metre per second on the wire.
-                        f64::from(block.nyquist_velocity_raw()) * 0.01,
-                    );
-                }
+                out.declared_nyquist.declare_from_message(&m);
                 out.radials
                     .push(m.into_radial().map_err(|e| decode(e.into()))?);
             }
@@ -380,7 +374,12 @@ fn ingest_record(name: &str, record: volume::Record<'_>, out: &mut ChunkContents
 /// the pattern number costs one mechanical `map` and makes a chunk-assembled
 /// `Scan` indistinguishable from an archive-decoded one — which matters the day
 /// something reads `coverage_pattern().elevation_cuts()`.
-fn coverage_pattern_from(
+///
+/// `pub(crate)` for [`crate::scan`], which decodes an archive volume on a walk
+/// of its own and needs the same translation. One copy rather than two is the
+/// whole point: an archive volume and a chunk-assembled one must not differ on
+/// a field because two transcriptions of message 5 drifted apart.
+pub(crate) fn coverage_pattern_from(
     msg: &nexrad_decode::messages::volume_coverage_pattern::Message<'_>,
 ) -> VolumeCoveragePattern {
     use nexrad_decode::messages::volume_coverage_pattern as vcp;
