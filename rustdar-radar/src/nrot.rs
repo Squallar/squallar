@@ -932,9 +932,11 @@ fn split_stencil_rot(
     // other. The 2 counts rows, not degrees, and that is what makes this a
     // derivative rather than a reading of one particular grid: the taps sit
     // at row offsets, so on a finer grid the numerator spans proportionally
-    // less sky and the divisor shrinks by the same factor, and the quotient is
-    // the shear either way. Pinning the divisor to a physical degree instead
-    // would double the reading on every grid whose rows are not half degrees.
+    // less sky and the divisor shrinks by the same factor, and the quotient
+    // is the shear either way — measured across 0.5° and 0.25° samplings of
+    // one field in `one_shear_reads_the_gain_its_own_operator_carries`.
+    // Pinning the divisor to a physical degree instead would double the
+    // reading on every grid whose rows are not half degrees.
     //
     // Which grids reach here is the other half of the answer, and it is not
     // "any": a sweep whose rows are already whole degrees has no pairing for
@@ -3120,9 +3122,18 @@ mod tests {
     /// itself on the coarser sweep — measured, not chosen: the taps are the
     /// ones the reference's own hovered step and couplet profiles solve to.
     ///
-    /// Every gain asserted below is checked against its own taps rather than
-    /// against the other sampling, which is what pins each operator's divisor
-    /// in row counts rather than in degrees.
+    /// What the test still has to rule out is the reading a reader meets
+    /// first — that `2.0 * arc_per_radial` in [`split_stencil_rot`] means
+    /// "1.0° of arc" rather than "two rows". Every gain asserted below is
+    /// checked against its own taps rather than against the other sampling,
+    /// which pins each operator's divisor in row counts. That alone no longer
+    /// separates the two readings for the *split* operator, though, and this
+    /// change is what took the separation away: the 1.0° sweep used to supply
+    /// it, and it now takes a different operator, while on the 0.5° grid two
+    /// rows and one degree are the same number by construction. So a third
+    /// sampling at 0.25° carries it — still paired, so still the split
+    /// operator, and its rows are quarter degrees, where the two readings
+    /// differ by a factor of two.
     #[test]
     fn one_shear_reads_the_gain_its_own_operator_carries() {
         let gates = 400;
@@ -3211,6 +3222,52 @@ mod tests {
                 (ratio - legacy_gain / split_gain).abs() < 1e-9,
                 "gate {j}: coarse/fine {ratio}, not the gain ratio {}",
                 legacy_gain / split_gain,
+            );
+        }
+
+        // A third sampling, and the one that keeps the divisor honest. On the
+        // 0.5° grid "two rows" and "1.0° of arc" are the same number, and the
+        // 1.0° grid no longer reaches this operator at all, so neither of the
+        // two above can tell them apart. A 0.25° sweep can: its radials still
+        // pair — a quarter degree apart, they share a whole degree — so it
+        // runs the same split operator, over half the arc per row. Counting
+        // rows it reads the shear that is there; read as a physical degree the
+        // divisor would be twice the grid's own two rows and every bin would
+        // come back at half.
+        assert_eq!(
+            pair_phase(&ring_azimuths(1440)),
+            Some(0),
+            "a 0.25° sweep stopped pairing, and this probe stopped probing",
+        );
+        let probe_gates = 250; // to 62.75 km — inside the split band, whole
+        let quarter_az = ring_azimuths(1440);
+        let quarter: Vec<Vec<f64>> = quarter_az
+            .iter()
+            .map(|&az_deg| {
+                let theta = az_deg.to_radians();
+                let dtheta = if theta > PI { theta - 2.0 * PI } else { theta };
+                (0..probe_gates)
+                    .map(|j| k * (0.25 + j as f64 * 0.25) * dtheta)
+                    .collect()
+            })
+            .collect();
+        let quarter_nrot = llsd_nrot(&sweep(&quarter, &quarter_az, probe_gates), &quarter);
+        for j in [100usize, 200] {
+            let range_km = 0.25 + j as f64 * 0.25;
+            let expect = k * split_gain / rot_divisor(range_km / KM_PER_NM);
+            let got = quarter_nrot[360][j]; // az 90°, clear of the field's wrap
+            assert!(
+                (got - expect).abs() < 1e-9,
+                "0.25° gate {j}: read {got}, not the {expect} the same taps carry \
+                 over this grid's own two rows — the divisor read a degree",
+            );
+            // And it is the same number the 0.5° sampling reads, which is the
+            // spacing identity itself, inside the split band, between the two
+            // grids that share the operator.
+            assert!(
+                (got - fine_nrot[180][j]).abs() < 1e-12,
+                "0.25° gate {j} read {got} where 0.5° read {}",
+                fine_nrot[180][j],
             );
         }
     }
