@@ -320,7 +320,25 @@ fn synth_sweep(
     // product, since a rung age is read off these radials. See
     // [`crate::sampler::Rung`]'s `collected_ms`.
     let collected_ms = crate::render_input::sweep_collected_ms(source.radials());
-    let spacing = 360.0 / values.len().max(1) as f32;
+
+    // How much sky one row of *this* grid stands for, which on a sector is not
+    // `360 / rows`: a 36° NROT sector of 72 rows would declare 5°, ten times
+    // the arc each row was computed over. [`crate::azimuth::Rows`] is the one
+    // place that is decided, so a synthetic radial declares the step the
+    // stencils differentiated the grid over and the plan view paints it at
+    // (`render::derived_grid_wedge_deg`). A complete rotation declares exactly
+    // what it always has: the closed branch *is* `360 / rows`, and that
+    // division agrees to the bit in f32 and f64 for every row count up to
+    // 100 000.
+    //
+    // Nothing reads *this field* off a derived radial today — the vertical
+    // views sample these sweeps by moment and geometry, and `render_input`
+    // extracts from the source volume, upstream of any derivation. (The
+    // timestamp above is the one field that is read back, which is why it is
+    // carried rather than left at zero.) It is still a claim the radial makes
+    // about itself, and the derived grids are the one place in the tree that
+    // manufactures radials rather than decoding them.
+    let spacing = crate::azimuth::Rows::of(azimuths_deg, values.len()).step_deg as f32;
     let first_gate_m = (first_gate_km * 1000.0).round().clamp(0.0, 65535.0) as u16;
     let gate_m = (gate_interval_km * 1000.0).round().clamp(1.0, 65535.0) as u16;
 

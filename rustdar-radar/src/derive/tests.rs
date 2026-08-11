@@ -612,3 +612,64 @@ fn a_derived_sweep_keeps_the_clock_of_the_tilt_it_was_computed_from() {
         );
     }
 }
+
+/// One velocity-carrying sweep of `n` radials `step_deg` apart from due north
+/// — a sector whenever `n · step_deg` stops short of the circle.
+fn arc_sweep(n: usize, step_deg: f32) -> Sweep {
+    let radials = (0..n)
+        .map(|i| {
+            let az = i as f32 * step_deg;
+            let bytes: Vec<u8> = (0..240)
+                .map(|_| ((20.0 * f64::from(az).to_radians().cos()) * 2.0 + 129.0) as u8)
+                .collect();
+            Radial::new(
+                0,
+                i as u16,
+                az,
+                // Deliberately 1.0° in both fixtures, and deliberately not what
+                // the sector's rows are apart by: what a row of a *derived*
+                // grid stands for is a property of that grid.
+                1.0,
+                RadialStatus::IntermediateRadialData,
+                1,
+                0.5,
+                None,
+                Some(MomentData::from_fixed_point(
+                    240,
+                    FIRST_GATE_M,
+                    GATE_M,
+                    8,
+                    2.0,
+                    129.0,
+                    bytes,
+                )),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        })
+        .collect();
+    Sweep::new(1, radials)
+}
+
+/// A synthetic radial declares the arc its own grid row covers. On a rotation
+/// that is `360 / rows` to the bit — which is what every WSR-88D cut is — and
+/// on a 36° sector of 0.5° rows it is 0.5°, not the 5° `360 / 72` claims.
+#[test]
+fn a_derived_radial_declares_the_step_its_own_grid_sits_at() {
+    for (n, step, expected) in [(360usize, 1.0f32, 1.0f32), (72, 0.5, 0.5)] {
+        let scan = Scan::new(vcp(&[0.5]), vec![arc_sweep(n, step)]);
+        let prepared = prepare(&scan, RadarProduct::NormalizedRotation, None)
+            .expect("a velocity volume derives NROT");
+        let Prepared::Derived(derived) = prepared else {
+            panic!("NROT must be derived, never served from the raw scan");
+        };
+        let radials = derived.sweeps()[0].radials();
+        assert_eq!(radials.len(), n);
+        for radial in radials {
+            assert_eq!(radial.azimuth_spacing_degrees(), expected, "{n} rows");
+        }
+    }
+}
