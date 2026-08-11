@@ -1587,60 +1587,51 @@ fn a_discarded_drag_leaves_no_box_behind_on_the_map() {
     );
 }
 
-/// Aim `idx`'s 3D pane at the map in pane `source`.
+/// The mirror pass's guest list is this frame's floor strips — and nothing
+/// else.
 ///
-/// What a region drag does, without needing one: `ui_region` sets exactly this
-/// field, and every test below is about what happens to the *registration*
-/// afterwards rather than about how the field came to be set.
-fn source_pane(h: &mut InputHarness, idx: usize, source: Option<usize>) {
-    h.gui_mut()
-        .pane_mut(idx)
-        .expect("a pane")
-        .volume_mut()
-        .expect("a 3D pane")
-        .source_pane = source;
-}
-
-/// The mirror pass's guest list is the set of map panes some 3D pane is
-/// standing on — and nothing else.
+/// The baseline for the tests below, and the first coverage
+/// `mirror_source_rects` or `map_pane_geo` have ever had. The negative cases
+/// would pass vacuously if the positive one did not work, because "no rects" is
+/// also what a guest list that never populates says.
 ///
-/// The baseline for the two tests below, and the first coverage
-/// `mirror_source_rects` or `map_pane_geo` have ever had. Both of the negative
-/// cases here would pass vacuously if the positive one did not work, because
-/// "no rects" is also what a guest list that never populates says.
+/// The strip's *position* is the load-bearing half. A guest rect inside the
+/// frame would be the pane's own chrome — the volume, drawn over itself — and a
+/// guest rect at the pane's own coordinates would be exactly that. Both are
+/// checked, because "one rect of the right size" is true of the wrong rect too.
 #[test]
-fn the_mirror_guest_list_is_the_maps_a_3d_pane_stands_on() {
+fn the_mirror_guest_list_is_this_frames_floor_strips() {
     let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
-    source_pane(&mut h, 1, Some(0));
-    h.frames_for(2, FRAME_DT);
+    let screen = h.screen_rect();
+    let pane_rect = h.pane_rects()[1];
 
     let rects = h.gui_mut().mirror_source_rects();
     assert_eq!(
         rects.len(),
         1,
-        "one 3D pane sourced from one map should ask for that map's rect and \
-         nothing else, got {rects:?}",
+        "one 3D pane showing a floor should ask for one strip and nothing \
+         else, got {rects:?}",
     );
-    let map_rect = rects[0];
+    let strip = rects[0];
     assert!(
-        map_rect.width() > 0.0 && map_rect.height() > 0.0,
-        "the guest list carried a degenerate rect {map_rect:?}; the mirror pass \
+        strip.width() > 0.0 && strip.height() > 0.0,
+        "the guest list carried a degenerate rect {strip:?}; the mirror pass \
          would clip every primitive away and the floor would be blank",
     );
-
-    // A 3D pane with no source asks for nothing: there is no affine to
-    // reproject through, so mirroring anything would be mirroring a guess.
-    source_pane(&mut h, 1, None);
-    h.frames_for(2, FRAME_DT);
     assert!(
-        h.gui_mut().mirror_source_rects().is_empty(),
-        "a 3D pane with no source pane still put a map on the mirror's guest \
-         list",
+        strip.min.y >= screen.max.y,
+        "the strip {strip:?} is inside the frame (bottom {}); the map would be \
+         drawn on the glass, over the volume it is the floor for",
+        screen.max.y,
+    );
+    assert_eq!(
+        strip.size(),
+        pane_rect.size(),
+        "the strip is the pane's own rect moved down, so it is the pane's own \
+         size — a strip of another size would sample the wrong ground",
     );
 
-    // A pane whose floor is switched off asks for nothing either, even though
-    // its source is a perfectly good map.
-    source_pane(&mut h, 1, Some(0));
+    // A pane whose floor is switched off asks for nothing.
     h.gui_mut()
         .pane_mut(1)
         .expect("a pane")
@@ -1653,89 +1644,282 @@ fn the_mirror_guest_list_is_the_maps_a_3d_pane_stands_on() {
         "a 3D pane with its map floor turned off is still paying for a mirror \
          pass it does not read",
     );
+
+    // And a layout with no 3D pane in it asks for nothing at all, so a frame
+    // of plain maps allocates no mirror.
+    h.gui_mut()
+        .pane_mut(1)
+        .expect("a pane")
+        .volume_mut()
+        .expect("a 3D pane")
+        .hide_floor = false;
+    h.make_pane_map(1);
+    h.frames_for(2, FRAME_DT);
+    assert!(
+        h.gui_mut().mirror_source_rects().is_empty(),
+        "a layout of plain map panes is still asking for a mirror pass",
+    );
 }
 
-/// A source pane that stops being a map stops registering the floor — the
-/// second clause of [`crate::volume_view::VolumeFrameState::source`]'s
-/// contract.
+/// **The reported bug.** A 3D view opened from a tab — no split, no region
+/// dragged on a neighbouring map — shows its floor.
 ///
-/// `map_pane_geo` is written only from the `PaneKind::Map` arm, so before this
-/// was fixed the entry simply *survived* a conversion: the pane's last map
-/// frame's affine stayed in the table for ever, keyed by an index that is now a
-/// 3D pane. Two things then go wrong together and neither recovers, because
-/// nothing ever writes that key again — the mirror pass copies the 3D pane's
-/// own chrome (its rect is still on the guest list), and the dependent pane
-/// reprojects through an affine describing a zoom and centre that left the
-/// screen. The ground becomes a frozen slab of UI.
+/// This is the one-pane shape, which is what a tab is and what every phone is.
+/// Under the borrowed-source arrangement it was the shape with no floor at all:
+/// the pane's `source_pane` was either unset or pointed at *itself*, and either
+/// way the registration was refused — correctly, because the only thing at that
+/// index was the 3D pane's own chrome. The strip is what gives the pane a map
+/// of its own to stand on.
 ///
-/// Reachable from the pane-kind menu, and reachable *automatically*: on a
-/// one-pane width class `RegionDestination::Convert` converts the source pane
-/// itself, which is the case the second half of this test drives.
+/// Both halves are asserted. A `source` alone would be satisfied by registering
+/// the pane's own rect, which is the failure the old arrangement was protecting
+/// against; a strip alone would be satisfied by geometry nothing samples.
 #[test]
-fn a_source_pane_that_stops_being_a_map_stops_registering_the_floor() {
-    let (mut h, painter) = volume_harness(StubVolumePainter::painting());
-    source_pane(&mut h, 1, Some(0));
+fn a_3d_pane_with_no_neighbouring_map_still_gets_a_floor() {
+    let painter = Arc::new(StubVolumePainter::painting());
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.set_pane_count(1);
+    h.load_scan("KTLX");
+    h.gui_mut().set_volume_painter(Some(painter.clone()));
     h.frames_for(2, FRAME_DT);
+    assert_eq!(h.pane_kinds(), vec![PaneKind::Map]);
+
+    h.make_pane_volume(0);
+    h.frames_for(2, FRAME_DT);
+
+    let seen = last_seen(&painter);
+    assert!(
+        seen.floor,
+        "the pane is not even asking for a floor, so nothing below is about \
+         the floor",
+    );
+    let geo = seen
+        .source
+        .expect("a 3D pane that is its own map must be registered to it");
+    let screen = h.screen_rect();
+    assert!(
+        geo.rect.min.y >= screen.max.y,
+        "the floor is registered to {:?}, which is inside the frame — that is \
+         the pane's own chrome, not a map",
+        geo.rect,
+    );
+    assert!(
+        geo.points_per_degree_lon > 0.0 && geo.points_per_mercator_y < 0.0,
+        "the affine {geo:?} is not a live Mercator projection; the floor would \
+         reproject through zeros",
+    );
+    assert_eq!(
+        h.gui_mut().mirror_source_rects(),
+        vec![geo.rect],
+        "the pane is registered to a strip the mirror pass does not copy",
+    );
+    assert!(
+        seen.mirror_size_points[1] >= geo.rect.max.y,
+        "the mirror is {} points tall and the strip reaches {}: the floor \
+         would sample past the bottom of the texture",
+        seen.mirror_size_points[1],
+        geo.rect.max.y,
+    );
+}
+
+/// Two 3D panes get two strips, and the strips do not overlap.
+///
+/// The one failure a packed layout would have that a uniform translation cannot:
+/// a strip landing on another pane's makes one pane's floor a picture of the
+/// other pane's map, which is a plausible-looking picture rather than a blank
+/// one. Also the case the mirror's size bound is written against — see
+/// `Gui::mirror_size_points`.
+#[test]
+fn two_3d_panes_get_two_strips_that_cannot_collide() {
+    let painter = Arc::new(StubVolumePainter::painting());
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.set_pane_count(2);
+    h.make_pane_volume(0);
+    h.make_pane_volume(1);
+    h.load_scan("KTLX");
+    h.gui_mut().set_volume_painter(Some(painter.clone()));
+    h.frames_for(2, FRAME_DT);
+
+    let screen = h.screen_rect();
+    let rects = h.gui_mut().mirror_source_rects();
+    assert_eq!(rects.len(), 2, "two 3D panes asked for {rects:?}");
+    // Area, not `intersects`: side-by-side panes share an edge and so do
+    // their strips, exactly as the panes themselves do on the glass.
+    let shared = rects[0].intersect(rects[1]);
+    assert!(
+        shared.width() <= 0.0 || shared.height() <= 0.0,
+        "the strips {rects:?} overlap over {shared:?}: one pane's floor would \
+         be the other pane's map",
+    );
+    for strip in &rects {
+        assert!(
+            strip.min.y >= screen.max.y,
+            "strip {strip:?} is inside the frame",
+        );
+    }
+    // The bound the mirror's memory arithmetic rests on.
+    let bottom = rects.iter().map(|r| r.max.y).fold(0.0f32, f32::max);
+    assert!(
+        bottom <= 2.0 * screen.max.y,
+        "the strips reach {bottom} points, past twice the frame's {}: the \
+         mirror is no longer bounded at twice the frame",
+        screen.max.y,
+    );
+}
+
+/// A pane that stops showing a floor stops being registered, and its index does
+/// not carry its old strip to whatever pane takes it next.
+///
+/// Indices are reused when the layout sheds panes, so a stale entry does not
+/// read as absent — it reads as *some other pane's* map. Two ways in: the pane
+/// becomes a map again, and the user hides the floor. Both must give the
+/// mirror's texels back rather than go on copying a strip nothing draws into.
+#[test]
+fn a_pane_that_stops_showing_a_floor_stops_being_registered() {
+    let (mut h, painter) = volume_harness(StubVolumePainter::painting());
     assert!(
         last_seen(&painter).source.is_some(),
         "the floor was never registered in the first place, so nothing below \
          means anything",
     );
 
-    // The conversion. Pane 0 is no longer a map; its affine describes nothing
-    // on screen.
-    h.make_pane_volume(0);
+    h.gui_mut()
+        .pane_mut(1)
+        .expect("a pane")
+        .volume_mut()
+        .expect("a 3D pane")
+        .hide_floor = true;
     h.frames_for(2, FRAME_DT);
-
     assert_eq!(
         last_seen(&painter).source,
         None,
-        "pane 1's floor is still reprojecting through pane 0's last map frame, \
-         and pane 0 is a 3D pane now — the affine is dead and nothing will ever \
-         write it again",
+        "a pane with the floor hidden is still handing the renderer a \
+         registration to draw one through",
     );
+    assert!(h.gui_mut().mirror_source_rects().is_empty());
+
+    // Back on, then converted away entirely.
+    h.gui_mut()
+        .pane_mut(1)
+        .expect("a pane")
+        .volume_mut()
+        .expect("a 3D pane")
+        .hide_floor = false;
+    h.frames_for(2, FRAME_DT);
+    assert!(h.gui_mut().mirror_source_rects().len() == 1);
+    h.make_pane_map(1);
+    h.frames_for(2, FRAME_DT);
     assert!(
         h.gui_mut().mirror_source_rects().is_empty(),
-        "the mirror pass is still copying pane 0's rect, which now holds a 3D \
-         pane's own chrome rather than a map",
+        "a pane that is a map again is still on the mirror's guest list, so \
+         the mirror is copying a strip nothing draws into",
     );
 }
 
-/// The self-sourcing case: a one-pane layout where the region drag converted
-/// the very pane it was dragged on.
+/// The pane's map really is drawn — into the strip, exactly as the same pane
+/// drew it on the glass, and no longer on the glass.
 ///
-/// `RegionDestination::Convert(source_pane)` is the fallback arm — see
-/// `ui_region::destination_for` — and on a one-pane width class it is the arm
-/// that fires, so the resulting 3D pane's `source_pane` points at *itself*.
-/// Split out from the test above because it is the one shape where the stale
-/// entry and the pane reading it are the same index, which is exactly where a
-/// filter that consults the pane being drawn cannot see the truth: that pane is
-/// held out of the vector by `mem::take` while its own arm runs. The prune runs
-/// before the loop for that reason.
+/// Every other test here is about geometry the arm *reported*. This one is
+/// about geometry the tessellator was actually handed, which is the difference
+/// between a floor and a plan for one: the mirror pass copies primitives, so a
+/// strip with no primitives in it is a transparent texture and a blank floor,
+/// and nothing above this would notice.
+///
+/// It is written as a **comparison against the same pane as a map** rather than
+/// as a count, because a count cannot tell a map from a stray highlight. The
+/// same pane is rendered both ways at the same size and the painted rects are
+/// compared in rect-local coordinates, so the claim is that every mark in the
+/// strip is a mark the map pane made at the same place within its own rect.
+///
+/// Containment rather than equality, and the direction is the honest one: the
+/// map pane's rect also has the shell's chrome over it — the layers panel, the
+/// status bar, the pills — which is drawn above the pane rather than inside
+/// `Map::show`, is not the same for a 3D pane as for a map, and must **not** be
+/// copied onto a floor. So the strip is a subset, and the two assertions that
+/// stop a subset being vacuous are that it is non-empty and that it carries the
+/// pane's own legend, which only `render_pane_map_content` draws.
+///
+/// Tiles and the radar raster are absent from both sides — a headless frame
+/// fetches no tiles and uploads no textures — so what is being compared is the
+/// rest of the map content pass. That is the point: whatever the map arm
+/// paints, the strip paints, and neither side is written down here to be kept
+/// in step by hand.
 #[test]
-fn a_pane_that_converted_itself_does_not_stand_on_its_own_old_map() {
+fn the_panes_map_is_painted_into_the_strip_and_not_onto_the_glass() {
+    /// Every painted rect inside `region`, in coordinates relative to it.
+    fn local_rects(h: &InputHarness, region: egui::Rect) -> Vec<(i32, i32, i32, i32)> {
+        let mut rects: Vec<(i32, i32, i32, i32)> = h
+            .painted_rects()
+            .iter()
+            .filter(|rect| region.contains_rect(**rect))
+            .map(|rect| {
+                let local = rect.translate(-region.min.to_vec2());
+                (
+                    local.min.x.round() as i32,
+                    local.min.y.round() as i32,
+                    local.max.x.round() as i32,
+                    local.max.y.round() as i32,
+                )
+            })
+            .collect();
+        rects.sort_unstable();
+        rects
+    }
+
     let painter = Arc::new(StubVolumePainter::painting());
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.set_pane_count(1);
     h.load_scan("KTLX");
     h.gui_mut().set_volume_painter(Some(painter.clone()));
-    // A frame as a map, which is what puts the affine in the table.
-    h.frames_for(2, FRAME_DT);
-    assert_eq!(h.pane_kinds(), vec![PaneKind::Map]);
-
-    h.make_pane_volume(0);
-    source_pane(&mut h, 0, Some(0));
     h.frames_for(2, FRAME_DT);
 
-    assert_eq!(
-        last_seen(&painter).source,
-        None,
-        "the pane is standing on the map it used to be; its floor is a picture \
-         of its own chrome, registered to a view nothing is showing",
+    // The same pane, as a map, on the glass.
+    let pane_rect = h.pane_rects()[0];
+    let as_a_map = local_rects(&h, pane_rect);
+    assert!(
+        as_a_map.len() > 1,
+        "the map pane painted nothing inside its own rect, so the comparison \
+         below would hold between two empty sets",
     );
     assert!(
-        h.gui_mut().mirror_source_rects().is_empty(),
-        "the mirror pass is copying the 3D pane's own rect into the texture \
-         that pane then samples as ground",
+        h.text_painted_in(pane_rect, "dBZ"),
+        "the map pane drew no legend, so its absence below would prove nothing",
+    );
+
+    h.make_pane_volume(0);
+    h.frames_for(2, FRAME_DT);
+    let strip = *h
+        .gui_mut()
+        .mirror_source_rects()
+        .first()
+        .expect("the 3D pane asked for no strip at all");
+
+    let in_strip = local_rects(&h, strip);
+    assert!(
+        !in_strip.is_empty(),
+        "nothing was painted into the strip {strip:?}: the mirror would copy \
+         an empty rect and the floor would be blank",
+    );
+    let stray: Vec<_> = in_strip
+        .iter()
+        .filter(|rect| !as_a_map.contains(rect))
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "the strip has {} marks the same pane's map does not, at {stray:?}: it \
+         is drawing something other than the map it is supposed to be",
+        stray.len(),
+    );
+    assert!(
+        h.text_painted_in(strip, "dBZ"),
+        "the strip did not get the pane's own map content — only \
+         `render_pane_map_content` draws that legend",
+    );
+
+    // And none of it is on the glass, under the volume.
+    assert!(
+        !h.text_painted_in(pane_rect, "dBZ"),
+        "the pane's map is still being drawn at {pane_rect:?}, on the glass, \
+         over the volume it is meant to be the ground under",
     );
 }

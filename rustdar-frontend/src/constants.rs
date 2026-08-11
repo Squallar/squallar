@@ -729,6 +729,14 @@ pub const VOLUME_OFFSCREEN_BUDGET_BYTES: usize = DESKTOP_VOLUME_OFFSCREEN_BUDGET
 ///   taken from the rung that was *applied*, so a target that cannot show the
 ///   detail does not fetch it either.
 ///
+/// **The mirror is no longer the frame.** A 3D pane draws its own map into a
+/// strip below the frame and the mirror has to reach it, so what is measured
+/// against this budget is up to twice the frame — bounded there, and at most one
+/// extra halving, both of which `MIRROR_SCALE_MAX`'s table works through per
+/// target. The budget itself is unmoved, deliberately: on the arms where the
+/// doubling bites, a softer floor is the answer rather than a bigger single
+/// allocation on the devices least able to spare one.
+///
 /// It replaces a per-scope cost rather than adding to a static one: the design
 /// this supersedes composited a 512² RGBA floor for every live `(site, region)`
 /// scope — 1 MiB each, unbounded in principle by anything but the number of

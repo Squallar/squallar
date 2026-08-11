@@ -1249,6 +1249,7 @@ impl VolumePainter for BridgeVolumePainter {
                 // so these are what turn a unit-cube coordinate into ground.
                 west_km: grid.x_range_km().0 as f32,
                 south_km: grid.y_range_km().0 as f32,
+                mirror_size_points: frame.mirror_size_points,
             }
         });
         uniform.map_floor = floor.is_some();
@@ -1319,13 +1320,20 @@ fn paint_payload(callback: impl egui_wgpu::CallbackTrait + 'static) -> Arc<dyn A
 }
 
 /// The floor's two uniform `vec4`s: the geography `paint` resolved, normalised
-/// against the frame this `prepare` was handed.
+/// against the mirror it will be sampled from.
 ///
-/// The mirror covers the whole frame, so a position in points becomes a texture
-/// coordinate by `point · pixels_per_point ÷ frame_pixels` — and the mirror's
-/// *own* size does not appear, because the reduced-resolution path halves
-/// `size_in_pixels` and `pixels_per_point` together and the quotient is
-/// unchanged.
+/// A position in points becomes a texture coordinate by `point ÷
+/// mirror_size_points` — the mirror's extent in **points**, which is the frame
+/// plus however far below it this frame's off-screen map strips reach
+/// (`rustdar_egui::Gui::mirror_size_points`).
+///
+/// Points rather than texels, and the mirror's rather than the frame's. The
+/// first half is why the adaptive rung cannot move registration: scaling the
+/// mirror halves or doubles `size_in_pixels` and `pixels_per_point` together
+/// and leaves this quotient alone. The second half is what the off-screen strip
+/// changed — the mirror used to *be* the frame, so the frame's own
+/// `ScreenDescriptor` answered this correctly by coincidence, and now it would
+/// stretch every floor vertically by the ratio between the two.
 ///
 /// `gamma_encoded` is not cosmetic and cannot be decided here: `egui_wgpu` chose
 /// its fragment entry point from the **swapchain's** format once, at
@@ -1337,12 +1345,11 @@ fn paint_payload(callback: impl egui_wgpu::CallbackTrait + 'static) -> Arc<dyn A
 /// a swapped axis or a lost sign would live.
 fn floor_lanes(
     source: &FloorSource,
-    size_in_pixels: [u32; 2],
-    pixels_per_point: f32,
+    mirror_size_points: [f32; 2],
     gamma_encoded: bool,
 ) -> ([f32; 4], [f32; 4]) {
-    let per_point_u = pixels_per_point / size_in_pixels[0].max(1) as f32;
-    let per_point_v = pixels_per_point / size_in_pixels[1].max(1) as f32;
+    let per_point_u = 1.0 / mirror_size_points[0].max(f32::MIN_POSITIVE);
+    let per_point_v = 1.0 / mirror_size_points[1].max(f32::MIN_POSITIVE);
     (
         [
             source.site_points[0] * per_point_u,
@@ -1619,6 +1626,10 @@ struct FloorSource {
     west_km: f32,
     /// The box's south edge, km north of the site.
     south_km: f32,
+    /// The mirror's extent in points, which the positions above are normalised
+    /// against. See [`floor_lanes`] and
+    /// `rustdar_egui::volume_view::VolumeFrameState::mirror_size_points`.
+    mirror_size_points: [f32; 2],
 }
 
 impl egui_wgpu::CallbackTrait for VolumeCallback {
@@ -1626,7 +1637,7 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        screen_descriptor: &egui_wgpu::ScreenDescriptor,
+        _screen_descriptor: &egui_wgpu::ScreenDescriptor,
         egui_encoder: &mut wgpu::CommandEncoder,
         callback_resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
@@ -1710,12 +1721,8 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
         let mut uniform = self.uniform;
         let floor_texture = match (self.floor.as_ref(), mirror.as_ref()) {
             (Some(source), Some(mirror)) => {
-                let (uv, geo) = floor_lanes(
-                    source,
-                    screen_descriptor.size_in_pixels,
-                    screen_descriptor.pixels_per_point,
-                    mirror.is_gamma_encoded(),
-                );
+                let (uv, geo) =
+                    floor_lanes(source, source.mirror_size_points, mirror.is_gamma_encoded());
                 uniform.floor_uv = uv;
                 uniform.floor_geo = geo;
                 Some(mirror)

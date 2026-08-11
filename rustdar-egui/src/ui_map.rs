@@ -180,36 +180,45 @@ impl super::Gui {
                 // copies could disagree silently, leaving a dead zone at the
                 // old position and a live one under the widget.
 
-                // A pane that is no longer a map on screen must not leave a 3D
-                // pane reprojecting its floor through the affine it had while
-                // it was one. Two ways that happens, and neither is exotic:
+                // A pane that is no longer showing a floor must not leave one
+                // registered. Three ways that happens, and none is exotic:
                 //
                 //  * the layout sheds panes — indices are reused, so a stale
                 //    entry would not read as absent, it would read as *some
                 //    other pane's* map;
-                //  * a map pane becomes a 3D or cross-section pane, from the
-                //    pane-kind menu or automatically through
-                //    `RegionDestination::Convert`, which on a one-pane width
-                //    class converts the source pane *itself*. The entry would
-                //    otherwise survive with the last map frame's affine for
-                //    ever: the mirror would copy a 3D pane's own chrome and the
-                //    dependent pane would sample it through a dead affine, so
-                //    the ground becomes a frozen slab of UI that never
-                //    recovers.
+                //  * a 3D pane becomes a map or a cross-section, from the
+                //    pane-kind menu or automatically;
+                //  * the user hides the floor, which must give the mirror's
+                //    texels back rather than go on drawing a strip nothing
+                //    samples.
                 //
                 // Done here rather than in the arms below because here is the
                 // one point in the frame where every pane is intact and its
                 // kind is the live one — inside the loop the pane being drawn
                 // is held out by `mem::take`. It is also *before* any pane
-                // draws, so both readers (the `source_geo` lookup in the volume
-                // arm and `Gui::mirror_source_rects`) see an already-filtered
-                // map. See `Gui::map_pane_geo` and `VolumeFrameState::source`.
-                let kinds: Vec<PaneKind> = self.panes[..pane_count]
+                // draws, so `Gui::mirror_source_rects` sees an already-filtered
+                // map whenever the frontend asks. See `Gui::map_pane_geo`.
+                let floors: Vec<bool> = self.panes[..pane_count]
                     .iter()
-                    .map(crate::pane::PaneState::kind)
+                    .map(|pane| pane.volume().is_some_and(|volume| !volume.hide_floor))
                     .collect();
                 self.map_pane_geo
-                    .retain(|&idx, _| kinds.get(idx) == Some(&PaneKind::Map));
+                    .retain(|&idx, _| floors.get(idx).copied().unwrap_or(false));
+
+                // Where each of those panes draws its own map, and how far
+                // below the frame the mirror therefore has to reach. Resolved
+                // before the loop because the mirror is **one** texture for the
+                // whole application: the first 3D pane's floor is normalised
+                // against a size the last 3D pane's strip helps decide, and the
+                // pane rects are all knowable from the layout without drawing
+                // any of them. See `floor_strip_plan`.
+                let (floor_strips, mirror_size_points) = floor_strip_plan(
+                    ui.ctx().viewport_rect(),
+                    &(0..pane_count)
+                        .map(|idx| floors[idx].then(|| self.pane_layout.pane_rect(idx, panel_rect)))
+                        .collect::<Vec<_>>(),
+                );
+                self.mirror_size_points = mirror_size_points;
 
                 for pane_idx in 0..pane_count {
                     let pane_rect = self.pane_layout.pane_rect(pane_idx, panel_rect);
@@ -521,45 +530,6 @@ impl super::Gui {
                                             self.track_section_draw(pane_idx, gesture, projector);
                                         }
 
-                                        // The registration for any 3D pane
-                                        // whose region was dragged on this
-                                        // map. Recorded here for the same
-                                        // reason the section anchor above is:
-                                        // this is the only place a projector
-                                        // exists, and the affine it yields is
-                                        // only true of the zoom and centre
-                                        // this frame drew at.
-                                        let geo = map_pane_geo_from(projector, pane_rect);
-                                        // One-frame staleness, mitigated where
-                                        // it can actually be seen. Panes render
-                                        // in index order, so a 3D pane sitting
-                                        // *before* its source reads the
-                                        // previous frame's affine. During a pan
-                                        // that is one frame's pan delta and
-                                        // nobody sees it at 60 Hz. Across a
-                                        // discontinuity — a site switch,
-                                        // jump-to-live, a layout change — it is
-                                        // a whole-continent offset, and the app
-                                        // returns to `ControlFlow::Wait` when
-                                        // idle: if that jump's frame is the
-                                        // last one requested, the misregistered
-                                        // floor is what stays on screen. So ask
-                                        // for the frame that corrects it, and
-                                        // only when there is something to
-                                        // correct — an affine that moved, with
-                                        // an earlier pane actually standing on
-                                        // it. A steady map requests nothing.
-                                        if self.map_pane_geo.get(&pane_idx) != Some(&geo)
-                                            && self.panes[..pane_idx].iter().any(|p| {
-                                                p.volume().is_some_and(|v| {
-                                                    !v.hide_floor && v.source_pane == Some(pane_idx)
-                                                })
-                                            })
-                                        {
-                                            ui.ctx().request_repaint();
-                                        }
-                                        self.map_pane_geo.insert(pane_idx, geo);
-
                                         let mut render_ctx = pane_render::PaneRenderCtx {
                                             pane_idx,
                                             pane: &mut pane,
@@ -664,6 +634,45 @@ impl super::Gui {
                         }
                         PaneKind::Volume => {
                             self.record_pane_content(pane_idx, PaneKind::Volume, pane_rect);
+                            // The pane's own map, drawn where only the mirror
+                            // can see it. This is the floor: not a second map,
+                            // not a synthetic projector and not a borrowed
+                            // pane's render, but this pane's own `Map::show`
+                            // with exactly the layers, tile requests and draw
+                            // order the map arm above gives it — moved below
+                            // the frame so the volume, which occupies the
+                            // pane's rect on the glass, is what the user sees
+                            // there. See `floor_strip_plan`.
+                            //
+                            // Before the volume rather than after, so the
+                            // affine the floor is reprojected through is
+                            // **this** frame's: the pane writes and reads its
+                            // own registration inside one arm, which is what
+                            // retired the one-frame staleness the borrowed
+                            // source had, and the `request_repaint` that used
+                            // to paper over its discontinuities.
+                            let source_geo = self.draw_floor_strip(
+                                &ctx,
+                                pane_idx,
+                                floor_strips.get(pane_idx).copied().flatten(),
+                                FloorStripCtx {
+                                    pane: &mut pane,
+                                    map_memory: &mut map_memory,
+                                    center,
+                                    tiles: tiles_owned.as_mut(),
+                                    label_tiles: &mut label_tiles,
+                                    tile_zoom_bias: tile_zoom_biases
+                                        .get(pane_idx)
+                                        .copied()
+                                        .unwrap_or(0),
+                                    horizontal_color_scale,
+                                    user_location,
+                                    user_heading,
+                                    user_fix: user_fix.clone(),
+                                    committed_regions: &committed_regions,
+                                    actions: &mut actions,
+                                },
+                            );
                             // Cloned rather than borrowed: `record_pane_content`
                             // above and the probe below both want `&mut self`,
                             // and an `Arc` clone is a refcount bump against a
@@ -679,15 +688,6 @@ impl super::Gui {
                             // is floating chrome over the picture and fades
                             // with the rest of it (§1.8 — the M8 addition).
                             let chrome = self.chrome_fade();
-                            // The map this pane's region was dragged on, as
-                            // that pane last drew itself — the whole of the
-                            // floor's registration. Copied out here rather
-                            // than looked up inside the arm for the same
-                            // borrow reason as the two above.
-                            let source_geo = pane
-                                .volume()
-                                .and_then(|v| v.source_pane)
-                                .and_then(|idx| self.map_pane_geo.get(&idx).copied());
                             let outcome = render_volume_pane(
                                 &mut child_ui,
                                 pane_rect,
@@ -697,6 +697,7 @@ impl super::Gui {
                                 current_stamp,
                                 chrome,
                                 source_geo,
+                                mirror_size_points,
                                 &mut actions,
                                 &mut self.volume_alpha,
                                 &self.volume_iso,
@@ -1275,6 +1276,161 @@ impl super::Gui {
         }
         pointer_available
     }
+
+    /// Draw one 3D pane's own map into its off-screen strip, and answer with
+    /// the affine it drew through.
+    ///
+    /// `None` when the pane wants no floor, when the layout gave it no strip,
+    /// or when there is no tile source to draw a basemap from — the three ways
+    /// a floor legitimately does not exist, all of which the renderer must
+    /// treat as "draw no floor" rather than as "draw one through zeroed lanes".
+    ///
+    /// # Why a bare `Ui` rather than an `egui::Area`
+    ///
+    /// An `Area` spends its first frame invisible working out its own size, and
+    /// a floor is entered *by a mode change* — so an `Area` would blank the
+    /// floor for one frame on every entry into 3D, on every machine, and would
+    /// look like a slow load on the ones where the frame is long.
+    /// `the_strip_is_tessellated_on_its_very_first_frame` in
+    /// `rustdar-frontend/tests/floor_offscreen_strip.rs` asserts on frame **0**
+    /// for exactly that reason, and it fails against an `Area`.
+    ///
+    /// # Why the interaction is emptied rather than suppressed
+    ///
+    /// The strip is not in the frame and the pointer is in frame coordinates,
+    /// so `hovered()` and `dragged()` are already false down there — a hidden
+    /// map cannot swallow the drag the orbit camera wants, structurally rather
+    /// than by a flag someone has to remember to set. What is passed as empty
+    /// here is the state a *second* live map would otherwise share with the
+    /// first: a region drag in flight, a click to consume, a long-press.
+    /// Sharing those would let an off-screen map answer a gesture aimed at
+    /// something on screen.
+    #[allow(clippy::too_many_lines)]
+    fn draw_floor_strip(
+        &mut self,
+        ctx: &egui::Context,
+        pane_idx: usize,
+        strip: Option<egui::Rect>,
+        floor: FloorStripCtx<'_>,
+    ) -> Option<crate::volume_view::MapPaneGeo> {
+        let FloorStripCtx {
+            pane,
+            map_memory,
+            center,
+            tiles,
+            label_tiles,
+            tile_zoom_bias,
+            horizontal_color_scale,
+            user_location,
+            user_heading,
+            user_fix,
+            committed_regions,
+            actions,
+        } = floor;
+        use walkers::Map;
+
+        let (strip, tiles) = (strip?, tiles?);
+
+        // Its own layer, at `Background` order, keyed by pane: the strip has
+        // to be a sibling of the pane's chrome rather than a child of it,
+        // because a child would inherit the pane's clip rect and be clipped
+        // away before it ever reached the tessellator.
+        let layer = egui::LayerId::new(
+            egui::Order::Background,
+            egui::Id::new(("volume_floor_strip", pane_idx)),
+        );
+        let mut strip_ui = egui::Ui::new(
+            ctx.clone(),
+            egui::Id::new(("volume_floor_strip_ui", pane_idx)),
+            egui::UiBuilder::new().layer_id(layer).max_rect(strip),
+        );
+        strip_ui.set_clip_rect(strip);
+
+        // The three pieces of pointer state a live map pane owns, given to
+        // this one as fresh locals so the strip cannot reach the real ones.
+        let mut strip_click_consumed = false;
+        let mut strip_region_drag = None;
+        let mut strip_pending_region = None;
+
+        Map::new(None, map_memory, center)
+            // Every input lever walkers has, off. See the doc comment: the
+            // strip cannot be hovered, so this is belt and braces — but a
+            // future walkers that reads the pointer without a hover gate would
+            // otherwise pan this map under the user's orbit drag.
+            .zoom_with_ctrl(false)
+            .panning(false)
+            .drag_pan_buttons(egui::DragPanButtons::empty())
+            .show(&mut strip_ui, |ui, _response, projector, memory| {
+                let zoom = memory.zoom();
+                // The basemap first, so everything below draws over it — the
+                // same order the map arm gives it.
+                draw_tile_layer(ui, projector, zoom, tiles, tile_zoom_bias);
+
+                // The registration, recorded here because this is the only
+                // place a projector exists, and keyed to the **strip** rather
+                // than to the pane: the affine's job is to say where a
+                // latitude and longitude landed in the geometry the mirror
+                // copied, and the mirror copied the strip.
+                self.map_pane_geo
+                    .insert(pane_idx, map_pane_geo_from(projector, strip));
+
+                let mut render_ctx = pane_render::PaneRenderCtx {
+                    pane_idx,
+                    pane,
+                    overlays: &mut self.overlays,
+                    user_location,
+                    user_heading,
+                    user_fix,
+                    label_tiles,
+                    tile_zoom_bias,
+                    actions,
+                    pane_rect: strip,
+                    horizontal_color_scale,
+                    pointer_available: false,
+                    excluded_rects: Vec::new(),
+                    long_press_pos: None,
+                    overlay_click_pos: None,
+                    click_consumed: &mut strip_click_consumed,
+                    preferences: &self.preferences,
+                    region: pane_render::RegionCtx {
+                        armed: false,
+                        drag: &mut strip_region_drag,
+                        pending: &mut strip_pending_region,
+                        committed: committed_regions,
+                    },
+                    #[cfg(test)]
+                    paint_order: Vec::new(),
+                };
+                pane_render::render_pane_map_content(ui, projector, zoom, &mut render_ctx);
+            });
+
+        self.map_pane_geo.get(&pane_idx).copied()
+    }
+}
+
+/// Everything [`Gui::draw_floor_strip`] needs from the pane loop that is not
+/// already on the `Gui`.
+///
+/// A struct rather than a dozen parameters because every one of them is a
+/// borrow the pane loop is already holding — `pane` and `map_memory` are held
+/// out of `self.panes` by `mem::take`, and the rest are the frame's shared
+/// resources. Naming them at the call site is what makes it visible that the
+/// strip is handed the *same* pane state the volume is about to be drawn from.
+struct FloorStripCtx<'a> {
+    pane: &'a mut crate::pane::PaneState,
+    map_memory: &'a mut walkers::MapMemory,
+    center: walkers::Position,
+    /// `None` when the frame has no tile source at all, which is the one way
+    /// the floor can be missing that is not about the pane.
+    tiles: Option<&'a mut crate::tile_source::HttpsTiles>,
+    label_tiles: &'a mut Option<crate::tile_source::HttpsTiles>,
+    tile_zoom_bias: u8,
+    horizontal_color_scale: bool,
+    user_location: Option<(f64, f64)>,
+    user_heading: Option<f32>,
+    user_fix: Option<rustdar_gps::GpsFix>,
+    committed_regions: &'a [(usize, crate::pane::VolumeRegion)],
+    actions: &'a mut Vec<GuiAction>,
 }
 
 /// Paint a pane's empty state: one line of centred, muted text and nothing
@@ -1358,6 +1514,7 @@ fn render_volume_pane(
     current_stamp: Option<crate::ui::CurrentVolumeStamp>,
     chrome: Option<f32>,
     source_geo: Option<crate::volume_view::MapPaneGeo>,
+    mirror_size_points: egui::Vec2,
     actions: &mut Vec<GuiAction>,
     alpha_curves: &mut crate::volume_alpha::AlphaCurves,
     iso_thresholds: &crate::volume_iso::IsoThresholds,
@@ -1371,6 +1528,7 @@ fn render_volume_pane(
         painter,
         current_stamp,
         source_geo,
+        mirror_size_points,
         actions,
         alpha_curves,
         iso_thresholds,
@@ -1429,6 +1587,7 @@ fn volume_pane_outcome(
     painter: Option<&dyn crate::volume_view::VolumePainter>,
     current_stamp: Option<crate::ui::CurrentVolumeStamp>,
     source_geo: Option<crate::volume_view::MapPaneGeo>,
+    mirror_size_points: egui::Vec2,
     actions: &mut Vec<GuiAction>,
     alpha_curves: &crate::volume_alpha::AlphaCurves,
     iso_thresholds: &crate::volume_iso::IsoThresholds,
@@ -1687,6 +1846,7 @@ fn volume_pane_outcome(
         pixels_per_point,
         floor,
         source: source_geo,
+        mirror_size_points: [mirror_size_points.x, mirror_size_points.y],
         // The user's Volume Alpha curve for this product, or `None` for an
         // untouched editor — which the painter is obliged to render
         // bit-exactly through the palette's own alpha.
@@ -1899,6 +2059,73 @@ pub(crate) fn reset_volume_view(volume: &mut crate::pane::VolumePane) {
     // lost, it is a choice of picture. A reset that also flipped an
     // isosurface pane back to the lit volume would un-choose something the
     // user chose on purpose.
+}
+
+/// Where each 3D pane draws its own map so that **only the mirror can see it**,
+/// and how much of egui's coordinate space the mirror must therefore cover.
+///
+/// # The mechanism
+///
+/// A 3D view is an alternative rendering of a map pane, so the map it stands on
+/// is its *own* — but the pane's rect is occupied by the volume, and a map drawn
+/// there would cover it. The map is therefore drawn into a **strip**: the pane's
+/// rect, translated below the frame. The two render passes then disagree about
+/// it purely through their attachment size:
+///
+/// * the **screen** pass's attachment is the frame, so the strip's scissor is
+///   clamped to zero height and `egui_wgpu::Renderer::render` skips it — while
+///   still advancing its mesh iterators, which is the same property the mirror's
+///   own primitive filter is built on;
+/// * the **mirror** pass's attachment is the frame *plus* the strips, so it has
+///   texels down there and draws it.
+///
+/// `tests/floor_offscreen_strip.rs` in `rustdar-frontend` asserts all of that
+/// against real tessellator output, including that egui does not cull the strip
+/// and that a pointer over the pane cannot reach the map in it.
+///
+/// # Why one translation for every pane
+///
+/// The strips could be packed, and packing would be smaller. It would also make
+/// two 3D panes able to collide — the failure being a floor showing the *other*
+/// pane's map, which looks like a plausible picture — and the saving is bounded:
+/// however many 3D panes there are, one uniform translation keeps every strip
+/// disjoint (the pane rects already are) and keeps the mirror under twice the
+/// frame.
+///
+/// The translation is the smallest one that clears the frame: the topmost strip
+/// starts exactly at the frame's bottom edge. That is not free elegance, it is
+/// the difference between fitting a target's mirror budget and halving its
+/// floor. A 3D pane in the lower half of a vertical split asks for 1.5x the
+/// frame this way and 2x under a fixed full-frame offset; a single pane under a
+/// top bar asks for 2x minus the bar. See `Gui::mirror_size_points`.
+///
+/// Returns the strips, indexed as `wanted` was, and the mirror's size in points.
+fn floor_strip_plan(
+    screen: egui::Rect,
+    wanted: &[Option<egui::Rect>],
+) -> (Vec<Option<egui::Rect>>, egui::Vec2) {
+    // egui's screen rect starts at the origin and the mirror's attachment does
+    // too, so the frame's *far corner* is the size the mirror starts from.
+    let frame = screen.max.to_vec2();
+    let Some(top) = wanted
+        .iter()
+        .flatten()
+        .map(|rect| rect.min.y)
+        .reduce(f32::min)
+    else {
+        return (vec![None; wanted.len()], frame);
+    };
+    // Never negative: a strip lifted *into* the frame would be drawn on the
+    // glass, over the volume it is the floor for.
+    let offset = egui::vec2(0.0, (screen.max.y - top).max(0.0));
+    let strips: Vec<Option<egui::Rect>> = wanted
+        .iter()
+        .map(|rect| rect.map(|rect| rect.translate(offset)))
+        .collect();
+    let size = strips.iter().flatten().fold(frame, |size, strip| {
+        egui::vec2(size.x.max(strip.max.x), size.y.max(strip.max.y))
+    });
+    (strips, size)
 }
 
 /// Reduce a live `walkers::Projector` to the four numbers a 3D pane's map

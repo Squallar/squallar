@@ -1205,6 +1205,15 @@ impl InputHarness {
         self.warm_up();
     }
 
+    /// Convert pane `idx` back to a plan-view map pane.
+    pub(crate) fn make_pane_map(&mut self, idx: usize) {
+        self.gui
+            .pane_mut(idx)
+            .unwrap_or_else(|| panic!("no pane {idx}"))
+            .set_kind(PaneKind::Map);
+        self.warm_up();
+    }
+
     /// What the 3D arm decided for each volume pane on the last frame.
     ///
     /// The only thing that can tell a pane that drew a volume from one that drew

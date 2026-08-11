@@ -386,10 +386,16 @@ fn a_released_id_is_never_handed_out_again() {
 /// The floor's uniform lanes, both ways the mirror can be encoded.
 ///
 /// This is the arithmetic `prepare` does and nothing else: geography in
-/// points from `paint`, the frame's own pixel size from the descriptor, out
-/// come the two `vec4`s the shader reprojects through. It is a free function
-/// precisely so it can be pinned here — the containing `prepare` needs a
-/// `wgpu::Device`, and this is where a sign or a swapped axis would live.
+/// points from `paint`, the mirror's own extent in points from the frame
+/// state, out come the two `vec4`s the shader reprojects through. It is a free
+/// function precisely so it can be pinned here — the containing `prepare` needs
+/// a `wgpu::Device`, and this is where a sign or a swapped axis would live.
+///
+/// The mirror's extent is **taller than the frame** and that is the whole
+/// reason it is passed in rather than read off the frame's `ScreenDescriptor`:
+/// a 3D pane draws its own map into a strip below the frame, and the mirror has
+/// to reach it. The second block below is what fails if that quantity is ever
+/// taken from the frame again.
 ///
 /// The gamma lane gets both arms because **both are live** — though not
 /// equally common. `app_state::preferred_surface_format` prefers a non-sRGB
@@ -400,9 +406,10 @@ fn a_released_id_is_never_handed_out_again() {
 /// floor merely a little too dark or too light, with no validation error
 /// anywhere, so the rare arm is precisely the one that would ship broken.
 #[test]
-fn the_floor_lanes_normalise_points_against_the_frame_and_carry_the_encoding() {
+fn the_floor_lanes_normalise_points_against_the_mirror_and_carry_the_encoding() {
+    let mirror = [1600.0, 1200.0];
     let source = FloorSource {
-        // 400 points across a 1600-point-wide frame: a quarter in.
+        // 400 points across a 1600-point-wide mirror: a quarter in.
         site_points: [400.0, 300.0],
         points_per_degree_lon: 80.0,
         // Negative, because Mercator y grows north and screen y grows down.
@@ -410,15 +417,13 @@ fn the_floor_lanes_normalise_points_against_the_frame_and_carry_the_encoding() {
         site_lat: 41.7,
         west_km: -230.0,
         south_km: -230.0,
+        mirror_size_points: mirror,
     };
-    // 3200x2400 pixels at 2 points per pixel is a 1600x1200-point frame.
-    let (uv, geo) = floor_lanes(&source, [3200, 2400], 2.0, true);
+    let (uv, geo) = floor_lanes(&source, mirror, true);
 
-    // `point x pixels_per_point / frame_pixels`: 400 x 2 / 3200 = 0.25 across,
-    // 300 x 2 / 2400 = 0.25 down; 80 x 2 / 3200 = 0.05 of the mirror per degree
-    // of longitude, and -5000 x 2 / 2400 = -4.1667 per unit of Mercator y.
-    // Compared with a tolerance because the products are not representable:
-    // 80 x 2 / 3200 comes out 0.049999997.
+    // `point / mirror_points`: 400 / 1600 = 0.25 across, 300 / 1200 = 0.25
+    // down; 80 / 1600 = 0.05 of the mirror per degree of longitude, and
+    // -5000 / 1200 = -4.1667 per unit of Mercator y.
     for (lane, (got, want)) in [
         "u at the site",
         "v at the site",
@@ -432,14 +437,27 @@ fn the_floor_lanes_normalise_points_against_the_frame_and_carry_the_encoding() {
     }
     assert_eq!(geo, [41.7, -230.0, -230.0, 1.0], "geo lanes, gamma-encoded");
 
-    // Halving the mirror halves nothing: the lanes are `point x
-    // pixels_per_point / frame_pixels`, and the reduced-resolution path
-    // halves both of those together. This is why the mirror's own size never
-    // reaches this function.
-    let (half_uv, _) = floor_lanes(&source, [1600, 1200], 1.0, true);
-    assert_eq!(half_uv, uv, "a half-resolution mirror maps identically");
+    // A mirror grown to hold a floor strip moves every v lane and no u lane.
+    // This is the assertion that fails if the extent is ever read off the
+    // frame again: the frame is 1200 points tall in both of these, and the
+    // strip below it is what the second mirror has and the first does not.
+    let (with_strip, _) = floor_lanes(&source, [1600.0, 2400.0], true);
+    assert_eq!(
+        [with_strip[0], with_strip[2]],
+        [uv[0], uv[2]],
+        "growing the mirror downwards must not move anything across",
+    );
+    for (lane, (tall, square)) in ["v at the site", "v per unit of Mercator y"]
+        .into_iter()
+        .zip([(with_strip[1], uv[1]), (with_strip[3], uv[3])])
+    {
+        assert!(
+            (tall - square / 2.0).abs() < 1e-5,
+            "{lane}: a mirror twice as tall must halve it, got {tall} against {square}",
+        );
+    }
 
-    let (_, linear) = floor_lanes(&source, [3200, 2400], 2.0, false);
+    let (_, linear) = floor_lanes(&source, mirror, false);
     assert_eq!(linear[3], 0.0, "an sRGB swapchain leaves the mirror linear");
 }
 

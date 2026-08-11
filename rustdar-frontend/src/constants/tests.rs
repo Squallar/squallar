@@ -1112,8 +1112,10 @@ fn the_pane_mirrors_ceiling_is_the_cap_it_is_actually_halved_to() {
          floor-on memory, not to a per-pane cost.",
     );
 
-    // The tight row of the desktop table: 1440p at the top rung. If this stops
-    // fitting, the prose's headroom claim is wrong.
+    // The tight row of the desktop table: 1440p at the top rung, with no floor
+    // strip under it. If this stops fitting, the prose's headroom claim is
+    // wrong. *With* a strip it no longer fits and the rung is given up — the
+    // deliberate loss `the_strips_verdict_is_the_one_the_table_states` pins.
     let bytes = |w: usize, h: usize| w * h * 4;
     assert!(
         bytes(5120, 2880) <= DESKTOP_VOLUME_MIRROR_BYTES_MAX,
@@ -1133,14 +1135,16 @@ fn the_pane_mirrors_ceiling_is_the_cap_it_is_actually_halved_to() {
         max_side: 8192,
         max_bytes: DESKTOP_VOLUME_MIRROR_BYTES_MAX,
     };
-    let plan = crate::egui_renderer::mirror_plan([1920, 1080], 1.5, 2.0, desktop);
+    // Points, not pixels: `mirror_plan` sizes a region of egui's own space.
+    // 1280x720 points at 1.5 is a 1920x1080 frame.
+    let plan = crate::egui_renderer::mirror_plan([1280.0, 720.0], 1.5, 2.0, desktop);
     assert_eq!(
         (plan.size_in_pixels, plan.pixels_per_point),
         ([3840, 2160], 3.0),
         "a desktop 1080p frame asked for rung 2 must get it, both halves moved",
     );
     assert!(!plan.is_degraded() && plan.tile_zoom_bias() == 1);
-    let plan = crate::egui_renderer::mirror_plan([3840, 2160], 2.0, 2.0, desktop);
+    let plan = crate::egui_renderer::mirror_plan([1920.0, 1080.0], 2.0, 2.0, desktop);
     assert_eq!(
         (
             plan.size_in_pixels,
@@ -1161,7 +1165,7 @@ fn the_pane_mirrors_ceiling_is_the_cap_it_is_actually_halved_to() {
         max_side: crate::egui_renderer::MIRROR_MAX_SIDE,
         max_bytes: WASM_VOLUME_MIRROR_BYTES_MAX,
     };
-    let plan = crate::egui_renderer::mirror_plan([2560, 1440], 2.0, 2.0, web);
+    let plan = crate::egui_renderer::mirror_plan([1280.0, 720.0], 2.0, 2.0, web);
     assert_eq!(
         (plan.size_in_pixels, plan.applied_scale),
         ([1280, 720], 0.5),
@@ -1170,15 +1174,15 @@ fn the_pane_mirrors_ceiling_is_the_cap_it_is_actually_halved_to() {
     assert!(plan.is_degraded() && plan.tile_zoom_bias() == 0);
 
     // The pre-adaptive helper, unchanged for every frame with no 3D pane on it.
-    let (size, scale) = crate::egui_renderer::mirror_size_for([3840, 2160], 2.0);
+    let (size, scale) = crate::egui_renderer::mirror_size_for([1920.0, 1080.0], 2.0);
     assert_eq!((size, scale), ([1920, 1080], 1.0), "a 4K frame halves once");
-    let (size, scale) = crate::egui_renderer::mirror_size_for([1920, 1080], 1.5);
+    let (size, scale) = crate::egui_renderer::mirror_size_for([1280.0, 720.0], 1.5);
     assert_eq!(
         (size, scale),
         ([1920, 1080], 1.5),
         "a frame already under the cap is mirrored at its own size",
     );
-    let (size, _) = crate::egui_renderer::mirror_size_for([8192, 8192], 1.0);
+    let (size, _) = crate::egui_renderer::mirror_size_for([8192.0, 8192.0], 1.0);
     assert!(
         size[0].max(size[1]) <= crate::egui_renderer::MIRROR_MAX_SIDE
             && size[0] * size[1] * 4 <= WASM_VOLUME_MIRROR_BYTES_MAX as u32,

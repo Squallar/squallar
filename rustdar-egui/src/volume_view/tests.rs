@@ -338,6 +338,7 @@ fn the_stub_payload_is_the_kind_egui_wgpu_discards_in_silence() {
         pixels_per_point: 1.0,
         floor: true,
         source: None,
+        mirror_size_points: [800.0, 600.0],
         alpha: None,
         view_mode: crate::pane::VolumeViewMode::LitVolume,
         iso_threshold: 18.0,

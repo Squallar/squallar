@@ -482,6 +482,64 @@ fn a_config_naming_a_product_from_the_future_still_loads() {
     );
 }
 
+/// A config naming a **pane kind** this build does not know still loads.
+///
+/// Exactly the loss [`a_config_naming_a_product_from_the_future_still_loads`]
+/// closes, on the field this application is currently adding variants to: a
+/// pane kind is a unit enum on the wire, `serde` refuses an unknown one, and
+/// `load_ui_config` has a single `Result` for the entire file — so one word
+/// from a later build used to cost the user their site, layout, camera and
+/// curves permanently, because the autosave then rewrites the file from
+/// defaults.
+///
+/// The second pane carries a live volume so the assertion is not merely that
+/// *something* loaded: an unknown kind on pane 0 must not disturb pane 1, and
+/// the fixture's site and lookback are deliberately not the defaults, so a
+/// failed load cannot pass by looking like a fresh one.
+#[test]
+fn a_config_naming_a_pane_kind_from_the_future_still_loads() {
+    let store = MemoryConfigStore::default();
+    store
+        .store(
+            UI_CONFIG_KEY,
+            r#"{
+                    "site": "KDMX",
+                    "loop_lookback_secs": 7200,
+                    "pane_count": 2,
+                    "panes": [
+                        {"site": "KDMX", "kind": "Hologram"},
+                        {"site": "KDMX", "kind": "Volume", "volume": {"hide_floor": true}}
+                    ]
+                }"#,
+        )
+        .expect("the memory store accepts a write");
+
+    let mut gui = crate::Gui::new();
+    assert!(
+        gui.load_ui_config(&store),
+        "one unknown pane kind must not fail the whole config load",
+    );
+    assert_eq!(
+        gui.pane(0).map(crate::pane::PaneState::kind),
+        Some(crate::pane::PaneKind::Map),
+        "the unknown kind falls back to a map pane",
+    );
+    assert_eq!(
+        gui.pane(1).map(crate::pane::PaneState::kind),
+        Some(crate::pane::PaneKind::Volume),
+        "the pane beside the unknown one keeps its own kind",
+    );
+    assert_eq!(
+        gui.loop_lookback_secs, 7200,
+        "the rest of the file must survive the unknown pane kind",
+    );
+    assert_eq!(
+        gui.pane(0).map(|pane| pane.site.as_str()),
+        Some("KDMX"),
+        "the unreadable pane keeps every field that was readable",
+    );
+}
+
 /// An alpha curve saved for an unknown product is dropped, never
 /// reassigned to a product this build knows.
 ///

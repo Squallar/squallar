@@ -1383,9 +1383,16 @@ impl super::App {
             None
         } else {
             let points = state.egui_renderer.context().pixels_per_point();
+            // Sized in **points**, from the UI rather than from the surface:
+            // the mirror is no longer the frame. Each 3D pane draws its own map
+            // into a strip below the frame's bottom edge, and the mirror has to
+            // reach down to the lowest of them — the frame's own pixel size
+            // covers none of that, and using it would leave every floor
+            // sampling the top of a texture whose content is underneath.
+            let size_in_points = self.gui.mirror_size_points();
             let plan = self.mirror_rungs.observe(
                 demand,
-                size_in_pixels,
+                [size_in_points.x, size_in_points.y],
                 points,
                 crate::egui_renderer::MirrorLimits::for_device(
                     state.device.limits().max_texture_dimension_2d,

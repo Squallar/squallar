@@ -230,31 +230,35 @@ pub struct VolumeFrameState {
     /// place the pane's state is read. The renderer may still draw no floor —
     /// none may be in hand yet — but it must never draw one against this.
     pub floor: bool,
-    /// The Mercator affine of the 2D pane this pane's region was dragged on,
-    /// as that pane last drew itself.
+    /// The Mercator affine of the map this pane drew into its own off-screen
+    /// floor strip, and the strip it drew it into.
     ///
-    /// This is the whole of the floor's registration. `None` — no
-    /// `source_pane`, or a source pane that is not a map — means the renderer
-    /// has nothing to reproject through and must draw no floor, whatever
-    /// [`Self::floor`] says.
+    /// This is the whole of the floor's registration. `None` — no strip, or no
+    /// tile source to draw one from — means the renderer has nothing to
+    /// reproject through and must draw no floor, whatever [`Self::floor`] says.
     ///
-    /// **"As that pane last drew itself"** is exact rather than loose: panes
-    /// render in index order, so a 3D pane sitting *before* its source in that
-    /// order reads the previous frame's affine. The mirror it samples is
-    /// always this frame's picture, so during a pan of the source map the
-    /// floor can trail the pane it mirrors by one frame's pan delta. That is
-    /// bounded by one frame; the alternative is a second layout pass over every
-    /// pane purely to hoist four numbers, which is a large cost for an artefact
-    /// nobody can see at 60 Hz.
-    ///
-    /// Self-correction needs a *next frame*, though, and the app returns to
-    /// `ControlFlow::Wait` when idle. A **discontinuous** jump — a site switch,
-    /// jump-to-live, a layout change — puts a whole-continent offset on that
-    /// frame rather than a pan delta, and if it is the last frame requested the
-    /// misregistration is what stays on screen. So `render_panes` asks for a
-    /// repaint whenever a map pane's freshly recorded affine differs from the
-    /// one an earlier-indexed 3D pane consumed. A steady map asks for nothing.
+    /// **This frame's**, exactly: the pane draws its map and reads the affine
+    /// back inside one arm of the pane loop, before the volume that stands on
+    /// it. The borrowed-source arrangement this replaced could not — it read
+    /// another pane's affine out of a map recorded in pane-index order, so a 3D
+    /// pane before its source saw the previous frame's, which trailed a pan by
+    /// one frame and needed a `request_repaint` to keep a *discontinuity* (a
+    /// site switch, a jump to live) from being the last thing drawn. Neither
+    /// the lag nor the mitigation survives a pane that is its own source.
     pub source: Option<MapPaneGeo>,
+    /// How much of egui's coordinate space the pane mirror covers, in points —
+    /// `Gui::mirror_size_points`.
+    ///
+    /// The floor samples the mirror by turning a position in points into a
+    /// texture coordinate, so it needs the points-extent of the texture, and
+    /// that is **not** the frame's: the mirror is the frame plus the strips
+    /// below it. Frame-relative was right while the two agreed and is a
+    /// vertical stretch of the whole floor now that they do not.
+    ///
+    /// In points rather than texels because it must not move with the adaptive
+    /// mirror rung — the rung scales `size_in_pixels` and `pixels_per_point`
+    /// together precisely so the quotient, which is this, stays put.
+    pub mirror_size_points: [f32; 2],
     /// The user's Volume Alpha curve for this pane's product, or `None` for
     /// an untouched editor.
     ///

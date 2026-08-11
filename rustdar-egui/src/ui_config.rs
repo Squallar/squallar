@@ -85,8 +85,10 @@ struct PaneConfig {
     /// 3D volume view.
     ///
     /// `PaneKind::default()` is `Map`, so a config written before pane kinds
-    /// existed loads as a screen full of maps — which is what it was.
-    #[serde(default)]
+    /// existed loads as a screen full of maps — which is what it was. A kind
+    /// this build does not *know* falls back the same way rather than failing
+    /// the load — see [`kind_or_default`].
+    #[serde(default, deserialize_with = "kind_or_default")]
     kind: PaneKind,
     /// A cross-section pane's own state, present only when [`Self::kind`] is
     /// `CrossSection`.
@@ -415,13 +417,15 @@ struct VolumeAlphaConfig {
 /// Deserialize a [`RadarProduct`], falling back to the default product when
 /// the name is unknown.
 ///
-/// `RadarProduct` is the one enum on the config wire without a tolerance
-/// story: `PaneKind` falls back to `Map`, unknown `OverlayKind`s are filtered
-/// out, and the worker wire's `from_wire_code` returns `None` — but a bare
-/// `#[derive(Deserialize)]` enum fails on an unknown variant, and that error
-/// used to propagate up and fail the *entire* config load. One product name
+/// A bare `#[derive(Deserialize)]` enum fails on an unknown variant, and that
+/// error propagates up and fails the *entire* config load. One product name
 /// from a newer build would cost the user their site, layout and curves,
 /// permanently, because the autosave then rewrites the file from defaults.
+///
+/// See [`kind_or_default`] for the other half of the same story: unknown
+/// `OverlayKind`s are filtered out and the worker wire's `from_wire_code`
+/// returns `None`, so these two are the whole of the enum tolerance the config
+/// wire needs.
 pub(crate) fn product_or_default<'de, D>(deserializer: D) -> Result<RadarProduct, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -436,6 +440,40 @@ where
                 RadarProduct::Reflectivity.name(),
             );
             Ok(RadarProduct::Reflectivity)
+        }
+    }
+}
+
+/// Deserialize a [`PaneKind`], falling back to `Map` when the name is one this
+/// build does not know.
+///
+/// The same class of loss [`product_or_default`] closes, on the field that is
+/// most likely to grow a variant next: pane kinds are what this application is
+/// currently adding to, and until this existed a config naming a kind from a
+/// later build failed the *whole* load — layout, sites, curves, camera, every
+/// setting — because `serde` refuses an unknown unit variant and `load_ui_config`
+/// has one `Result` for the whole file.
+///
+/// `Map` rather than "drop the pane", because a pane is a position in a layout:
+/// dropping it would renumber every pane after it and silently move the user's
+/// windows around. A pane whose kind is unreadable is still a pane, and a map is
+/// what every pane starts as. The kind-specific state (`cross_section`,
+/// `volume`) is then a mismatch, which `restore_content` already treats as a
+/// corrupt pane and falls back to `Map` for — so the fallback lands in a state
+/// the loader already knows how to make consistent.
+fn kind_or_default<'de, D>(deserializer: D) -> Result<PaneKind, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match PaneKind::deserialize(&value) {
+        Ok(kind) => Ok(kind),
+        Err(_) => {
+            log::warn!(
+                "config names a pane kind this build does not know ({value}); \
+                 falling back to a map pane"
+            );
+            Ok(PaneKind::Map)
         }
     }
 }

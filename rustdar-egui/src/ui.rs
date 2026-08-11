@@ -6,7 +6,7 @@ use rustdar_overlays::render::controls::{
 
 const DEFAULT_INITIAL_ZOOM: f64 = 7.0;
 
-use crate::pane::{ColorScaleOrientation, PaneId, PaneKind, PaneLayout, PaneState};
+use crate::pane::{ColorScaleOrientation, PaneId, PaneLayout, PaneState};
 use crate::tiles::MapTileState;
 use crate::ui_layout::{LayoutCtx, ModalityLatch};
 use chrono::{NaiveDateTime, Timelike};
@@ -543,23 +543,31 @@ pub struct Gui {
     /// Remembered color-scale bar orientation for the map panel (hysteresis, so
     /// a resize near the boundary cannot make the bars hop).
     color_scale_orientation: ColorScaleOrientation,
-    /// Each map pane's Mercator affine and rect, as of the last frame that
-    /// drew it — the registration a 3D pane's map floor is reprojected
-    /// through, and the rects the frontend clips its mirror pass to.
+    /// Each 3D pane's own map strip: the Mercator affine it drew that map
+    /// through, and the off-screen rect it drew it *into*. This is both the
+    /// registration the pane's floor is reprojected by and the rect the
+    /// frontend clips its mirror pass to.
     ///
     /// Recorded inside `Map::show`, because that is the only place a
     /// `walkers::Projector` exists. Kept across frames rather than cleared,
     /// deliberately: a pane that is momentarily not drawn (a collapsed
-    /// divider, a hidden tab) should leave its 3D pane's floor where it was
-    /// rather than dropping it, and a stale entry costs six words of state.
+    /// divider, a hidden tab) should leave its floor where it was rather than
+    /// dropping it, and a stale entry costs six words of state.
     ///
-    /// **The invariant is that a key here is a pane that is a map right now**,
-    /// not merely a pane that was one when the affine was taken. Entries are
-    /// pruned at the top of the pane loop against both the live pane count and
-    /// the live [`crate::pane::PaneKind`], so neither a layout that sheds panes
-    /// nor a map pane converted to 3D or cross-section can leave a floor
-    /// reprojecting through geography nothing on screen still has.
+    /// **The invariant is that a key here is a pane showing a floor right
+    /// now**, not merely a pane that was one when the affine was taken.
+    /// Entries are pruned at the top of the pane loop against the live pane
+    /// count, the live [`crate::pane::PaneKind`] and the live floor toggle, so
+    /// neither a layout that sheds panes — indices are reused, and a stale
+    /// entry would read as *some other pane's* map rather than as absent — nor
+    /// a pane converted back to a map can leave the mirror copying geography
+    /// nothing on screen still has.
     map_pane_geo: HashMap<usize, crate::volume_view::MapPaneGeo>,
+    /// How much of egui's coordinate space the pane mirror has to cover, in
+    /// points, as of the last frame: the frame itself, plus however far below
+    /// it this frame's off-screen map strips reach. See
+    /// [`Gui::mirror_size_points`].
+    mirror_size_points: egui::Vec2,
     /// How many slippy zoom levels deeper a **floor-source** map pane should
     /// fetch its raster tiles, from the renderer's last mirror plan.
     ///
@@ -1577,6 +1585,7 @@ impl Gui {
             pane_layout: PaneLayout::default(),
             color_scale_orientation: ColorScaleOrientation::default(),
             map_pane_geo: HashMap::new(),
+            mirror_size_points: egui::Vec2::ZERO,
             floor_tile_zoom_bias: 0,
             #[cfg(test)]
             last_map_panel_rect: egui::Rect::ZERO,
@@ -3094,52 +3103,68 @@ impl Gui {
         &self.panes[..self.visible_pane_count()]
     }
 
-    /// The 2D map panes whose render some 3D pane is standing on this frame,
+    /// The off-screen strips this frame's 3D panes drew their own maps into,
     /// as rects in **points**.
     ///
-    /// This is the mirror pass's guest list. The 3D view's map floor is the
-    /// source pane's own render copied into an offscreen texture, and the copy
-    /// is clipped to exactly these rects — so the sidebar, the top bar, the
-    /// other panes' chrome and the 3D panes themselves never land in it. A box
-    /// whose footprint reaches past its source pane's edge finds nothing
-    /// there, which is correct: that is ground the source pane is not
-    /// currently showing.
+    /// This is the mirror pass's guest list. A 3D pane's map floor is its own
+    /// `Map::show`, drawn a second time into a rect *below the frame* — see
+    /// `ui_map`'s `floor_strip_for` — and the mirror pass copies exactly these
+    /// rects, so the sidebar, the top bar, the panes' chrome and the volumes
+    /// themselves never land in it.
     ///
     /// Empty means there is nothing to mirror, and the frontend skips the pass
     /// entirely rather than clearing a texture nobody reads.
     ///
-    /// A source pane that is **not a map** contributes nothing, and the kind is
-    /// re-read from the live pane here rather than inferred from the presence
-    /// of a recorded affine. `render_panes` already drops the entry when a pane
-    /// stops being a map, so this is belt and braces — but this is a `pub`
-    /// reader the frontend calls at a point in the frame of its own choosing,
-    /// and copying a 3D pane's own chrome onto another pane's ground is not a
-    /// failure anyone would think to look for in a guest list.
+    /// The floor toggle is re-read from the live pane here rather than inferred
+    /// from the presence of a recorded affine. `render_panes` already prunes
+    /// the entry when a pane stops wanting a floor, so this is belt and braces
+    /// — but this is a `pub` reader the frontend calls at a point in the frame
+    /// of its own choosing, and copying a hidden pane's map is not a failure
+    /// anyone would think to look for in a guest list.
     pub fn mirror_source_rects(&self) -> Vec<egui::Rect> {
-        let panes = self.panes();
         let mut rects: Vec<egui::Rect> = Vec::new();
-        for pane in panes {
+        for (idx, pane) in self.panes().iter().enumerate() {
             let Some(volume) = pane.volume() else {
                 continue;
             };
             if volume.hide_floor {
                 continue;
             }
-            let Some(geo) = volume
-                .source_pane
-                .filter(|&i| panes.get(i).map(PaneState::kind) == Some(PaneKind::Map))
-                .and_then(|i| self.map_pane_geo.get(&i))
-            else {
+            let Some(geo) = self.map_pane_geo.get(&idx) else {
                 continue;
             };
-            // Two 3D panes sourced from one map ask for one rect. Compared by
-            // value rather than deduped by pane index because the index is not
-            // carried this far and the rect is what the pass actually uses.
+            // Strips are disjoint by construction — they are the pane rects
+            // under one uniform translation — so this can only dedupe an
+            // entry that has not been re-recorded yet. Compared by value
+            // rather than by index because the rect is what the pass uses.
             if !rects.contains(&geo.rect) {
                 rects.push(geo.rect);
             }
         }
         rects
+    }
+
+    /// How much of egui's coordinate space the mirror has to cover this frame,
+    /// in **points**: the frame itself, plus however far below it the 3D panes'
+    /// off-screen map strips reach.
+    ///
+    /// The frame is included even though nothing in it is ever copied — after
+    /// the strips landed, every rect in [`Self::mirror_source_rects`] is below
+    /// the frame's bottom edge. It has to be: `egui_wgpu::Renderer::render`
+    /// hardcodes `set_viewport(0, 0, size_in_pixels)` and its vertex shader
+    /// divides by `screen_size_in_points`, so the attachment always spans
+    /// egui's space from the origin. A texture that started at the strips would
+    /// need an origin egui has no way to be told about.
+    ///
+    /// That is the whole of what the strip design costs: a frame's worth of
+    /// texels that are cleared and never drawn into, bounding the mirror at
+    /// twice the frame. `mirror_size_points_for` keeps it as far under that
+    /// bound as the layout allows.
+    ///
+    /// `Vec2::ZERO` before the first frame has laid a pane grid out, which
+    /// cannot coincide with a real answer — the frame is always in it.
+    pub fn mirror_size_points(&self) -> egui::Vec2 {
+        self.mirror_size_points
     }
 
     /// Tell the UI how much extra tile detail the 3D floor can actually show.
@@ -3152,13 +3177,13 @@ impl Gui {
         self.floor_tile_zoom_bias = bias;
     }
 
-    /// The tile zoom bias for one map pane: the frame's bias if some 3D pane is
-    /// standing on it, zero otherwise.
+    /// The tile zoom bias for one pane: the frame's bias if this pane is
+    /// drawing a floor strip, zero otherwise.
     ///
     /// Per-pane rather than global on purpose. The extra detail is only ever
-    /// looked at through a floor, so a second map pane with no 3D view over it
+    /// looked at through a floor, so a map pane with no 3D view of its own
     /// would pay four times the fetches — against the one
-    /// `tile_source::TILE_CACHE_ENTRIES` LRU both panes share — for a picture
+    /// `tile_source::TILE_CACHE_ENTRIES` LRU every pane shares — for a picture
     /// the user is already seeing at its native scale.
     pub(crate) fn tile_zoom_bias_for_pane(&self, pane_idx: usize) -> u8 {
         if self.floor_tile_zoom_bias == 0 || !self.is_floor_source(pane_idx) {
@@ -3172,28 +3197,28 @@ impl Gui {
         self.floor_tile_zoom_bias
     }
 
-    /// Whether some 3D pane is standing on this map pane's render.
+    /// Whether this pane draws a map into a floor strip — a 3D pane with the
+    /// floor showing.
     fn is_floor_source(&self, pane_idx: usize) -> bool {
-        self.panes().iter().any(|pane| {
-            pane.volume()
-                .is_some_and(|volume| !volume.hide_floor && volume.source_pane == Some(pane_idx))
-        })
+        self.panes()
+            .get(pane_idx)
+            .and_then(PaneState::volume)
+            .is_some_and(|volume| !volume.hide_floor)
     }
 
-    /// How many tiles every floor-source pane together would keep resident at
-    /// `bias`, across the raster layers each of them draws.
+    /// How many tiles every floor strip together would keep resident at `bias`,
+    /// across the raster layers each of them draws.
     ///
     /// Summed over panes rather than checked per pane because
     /// `tile_source::TILE_CACHE_ENTRIES` is **one** LRU for the whole
-    /// application: two source panes that each fit it individually still evict
-    /// each other. This is what stops a bias being taken on a frame where it
-    /// would thrash — a large window, or a split with two 3D views on two
-    /// different maps.
+    /// application: two strips that each fit it individually still evict each
+    /// other. This is what stops a bias being taken on a frame where it would
+    /// thrash — a large window, or a split with two 3D views in it.
     fn floor_tile_working_set(&self, bias: u8) -> usize {
         self.panes()
             .iter()
             .enumerate()
-            .filter(|(idx, pane)| pane.is_map() && self.is_floor_source(*idx))
+            .filter(|(idx, _)| self.is_floor_source(*idx))
             .map(|(idx, pane)| {
                 // The basemap always, the label tiles only when the layer is on.
                 let layers = 1 + usize::from(pane.is_overlay_enabled(OverlayKind::CityLabels));
