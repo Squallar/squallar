@@ -297,3 +297,135 @@ fn the_whole_volume_predicate_is_both_halves() {
         "the predicate answers true for everything, which is safe and vacuous",
     );
 }
+
+/// The four products whose plan view is the same picture at every tilt. Named
+/// here rather than derived, because this list *is* what the derived predicate
+/// is being checked against: it is the set
+/// `render::render_radar_to_image_full` dispatches before it calls
+/// `find_sweep`, read off that function.
+const TILT_INDEPENDENT: [RadarProduct; 4] = [
+    RadarProduct::EchoTopsInterpolated,
+    RadarProduct::ProbabilityOfSevereHail,
+    RadarProduct::MaxExpectedHailSize,
+    RadarProduct::HydrometeorClassification,
+];
+
+/// The predicate must name exactly the products the renderer dispatches
+/// before `find_sweep` — no more (a tilt-dependent product collapsed into one
+/// slot would hand a pane another tilt's picture) and no fewer (each one left
+/// out is a whole-volume recompute per tilt click).
+#[test]
+fn the_tilt_independent_set_is_the_renderers_own_pre_sweep_dispatch() {
+    for &product in RadarProduct::all() {
+        assert_eq!(
+            tilt_independent_plan_view(product),
+            TILT_INDEPENDENT.contains(&product),
+            "{product:?} is on the wrong side of the tilt-independence line",
+        );
+    }
+}
+
+/// What the fix is for: clicking to another tilt on one of those panes now
+/// finds the render already there instead of paying for the whole volume
+/// again to redraw the identical picture.
+#[test]
+fn a_tilt_change_on_a_volume_product_is_a_cache_hit() {
+    for product in TILT_INDEPENDENT {
+        let mut d = RenderDispatcher::new();
+        d.cache_render("KTLX", product, RenderView::PlanView, 0.5, output(11.0));
+        assert_eq!(
+            d.get_cached_render("KTLX", product, RenderView::PlanView, 19.5)
+                .map(|c| c.max_range_km),
+            Some(11.0),
+            "{product:?} re-rendered the whole volume for a byte-identical picture",
+        );
+    }
+}
+
+/// And the other half: a product whose pixels really do come from the sweep
+/// `find_sweep` picks must still miss, or a tilt click would show the tilt
+/// before it. NROT and SRV are the pair that makes this more than a
+/// restatement — both answer *true* to `reads_whole_volume`, because they fit
+/// their dealias seed from every velocity tilt, and both still rasterize one
+/// sweep.
+#[test]
+fn a_tilt_change_on_a_sweep_product_is_still_a_miss() {
+    for &product in RadarProduct::all() {
+        if TILT_INDEPENDENT.contains(&product) {
+            continue;
+        }
+        let mut d = RenderDispatcher::new();
+        d.cache_render("KTLX", product, RenderView::PlanView, 0.5, output(11.0));
+        assert!(
+            d.get_cached_render("KTLX", product, RenderView::PlanView, 19.5)
+                .is_none(),
+            "{product:?} answered a 19.5\u{b0} request with the 0.5\u{b0} render",
+        );
+    }
+}
+
+/// The collapse is per product, and the cache still tells the four apart from
+/// each other and from the other views — a shared `NO_ELEVATION_SLOT` is not a
+/// shared entry.
+#[test]
+fn the_collapsed_products_still_key_apart_from_each_other() {
+    let mut d = RenderDispatcher::new();
+    for (i, product) in TILT_INDEPENDENT.iter().enumerate() {
+        d.cache_render(
+            "KTLX",
+            *product,
+            RenderView::PlanView,
+            0.5,
+            output(i as f64),
+        );
+    }
+    d.cache_render(
+        "KTLX",
+        RadarProduct::EchoTopsInterpolated,
+        RenderView::CrossSection,
+        0.5,
+        output(99.0),
+    );
+    for (i, product) in TILT_INDEPENDENT.iter().enumerate() {
+        assert_eq!(
+            d.get_cached_render("KTLX", *product, RenderView::PlanView, 7.5)
+                .map(|c| c.max_range_km),
+            Some(i as f64),
+            "{product:?} was handed another product's render",
+        );
+    }
+    assert_eq!(
+        d.get_cached_render(
+            "KTLX",
+            RadarProduct::EchoTopsInterpolated,
+            RenderView::CrossSection,
+            0.5,
+        )
+        .map(|c| c.max_range_km),
+        Some(99.0),
+        "the plan view and the section collided in the viewless slot",
+    );
+}
+
+/// A completed cut still invalidates what it should. `reset_panes_for_tilts`
+/// matches a plan view's entry by `elevation_key(angle)`, and the four
+/// collapsed products no longer carry one — but they are also the products it
+/// deliberately skips, because a volume still being assembled must not be read
+/// as a complete short one. `reset_panes_for_site` is what refreshes them, and
+/// it is elevation-blind, so the collapse cannot leave a stale entry behind.
+#[test]
+fn a_site_reset_still_clears_a_collapsed_entry() {
+    let gui = rustdar_egui::Gui::new();
+    let mut d = RenderDispatcher::new();
+    for product in TILT_INDEPENDENT {
+        d.cache_render("KTLX", product, RenderView::PlanView, 0.5, output(11.0));
+    }
+    d.reset_panes_for_site("KTLX", &gui);
+    for product in TILT_INDEPENDENT {
+        assert!(
+            d.get_cached_render("KTLX", product, RenderView::PlanView, 0.5)
+                .is_none(),
+            "{product:?} survived a site reset in the viewless slot",
+        );
+    }
+}

@@ -245,11 +245,43 @@ fn elevation_key(elevation: f32) -> i32 {
 /// `0` is not a sentinel at all: it is the one bucket a viewless render has.
 const NO_ELEVATION_SLOT: i32 = 0;
 
+/// Whether a **plan view** of `product` draws the same picture whatever tilt is
+/// selected, so its cache entry belongs in [`NO_ELEVATION_SLOT`] as a section's
+/// does.
+///
+/// Four Level II products qualify, and they are the four
+/// `render::render_radar_to_image_full` dispatches *before* it calls
+/// `find_sweep`: interpolated echo tops, the hail pair, and the hybrid
+/// classification. Each reduces the whole volume to one polar grid, and the
+/// `elevation_angle` argument reaches no line of any of them —
+/// `render_echo_tops_interp_to_image` says so in its own doc: "Tilt-independent
+/// — every elevation request renders the same volume product."
+///
+/// **Derived from the two exhaustive predicates rather than restated as a
+/// list.** `derive::volume_slot` is `None` for exactly the products with no
+/// per-tilt field and no per-tilt derivation, and `is_level3` removes the ones
+/// whose pixels come from an RPG object instead of a Level II tilt (those keep
+/// the elevation axis: their objects *are* per-tilt). A hand-kept fifth copy of
+/// "which products read the whole volume" is the mistake `needs_whole_volume`
+/// documents having already been paid for once — a copy that omitted SRV, so
+/// live panes fitted their dealias seed from volumes the feed had skipped cuts
+/// of. `reads_whole_volume` is the wrong predicate to reuse here: it is also
+/// true of NROT and SRV, which rasterize the sweep `find_sweep` picks and so
+/// really do change with the tilt.
+///
+/// Without this a tilt click on one of those four panes missed the cache and
+/// paid a full whole-volume recompute — measured at 6.9 s for a 14-tilt
+/// dual-pol hybrid classification — to redraw a byte-identical picture.
+fn tilt_independent_plan_view(product: RadarProduct) -> bool {
+    !product.is_level3() && rustdar_radar::derive::volume_slot(product).is_none()
+}
+
 /// The cache key for one render, and the only place one is built.
 ///
-/// Written once rather than at each call site because the two rules above —
-/// which axis discriminates, and which slot a viewless view uses — are the kind
-/// that a second copy gets half right.
+/// Written once rather than at each call site because the three rules above —
+/// which axis discriminates, which slot a viewless view uses, and which plan
+/// views have no tilt to discriminate on — are the kind that a second copy gets
+/// half right.
 fn render_cache_key(
     site: &str,
     product: RadarProduct,
@@ -257,6 +289,7 @@ fn render_cache_key(
     elevation: f32,
 ) -> RenderCacheKey {
     let elevation = match view {
+        RenderView::PlanView if tilt_independent_plan_view(product) => NO_ELEVATION_SLOT,
         RenderView::PlanView => elevation_key(elevation),
         RenderView::CrossSection | RenderView::Volume => NO_ELEVATION_SLOT,
     };
