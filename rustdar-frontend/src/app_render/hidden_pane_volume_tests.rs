@@ -19,7 +19,7 @@ use crate::platform_double::TestBridge;
 use crate::volume::bridge::tests::ready_grid;
 use crate::volume::bridge::{Hold, VolumeEntry};
 use rustdar_egui::config_store::{ConfigStore, MemoryConfigStore, UI_CONFIG_KEY};
-use rustdar_egui::pane::{PaneKind, VolumeStamp, VolumeTarget};
+use rustdar_egui::pane::{VolumeStamp, VolumeTarget};
 use rustdar_radar::types::RadarProduct;
 
 const SITE: &str = "KTLX";

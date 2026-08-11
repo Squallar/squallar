@@ -390,6 +390,153 @@ fn a_config_written_before_the_floor_toggle_keeps_its_floor() {
     );
 }
 
+/// A config from a build in which 3D was a **pane kind** comes back as a map
+/// pane in the 3D render mode — the same picture, with its camera.
+///
+/// `"kind": "Volume"` is a name this program no longer has, and there are three
+/// things it could do with it. Failing the load loses the user's entire
+/// configuration over one word. Falling back to a plain map — which is what
+/// `kind_or_default` does with a name it does not recognise — silently
+/// downgrades their layout on the first launch after an update, with the camera
+/// they aimed still sitting in the file underneath. Reading it as the mode it
+/// always meant is the only one that keeps the promise the persistence makes,
+/// so `PaneKindConfig` keeps the variant on the wire deliberately: read-only,
+/// never written again.
+///
+/// The camera is asserted too, not just the mode. A migration that produced a
+/// 3D pane pointing somewhere else would be a pane the user has to re-aim, and
+/// it would look exactly like the app forgetting.
+#[test]
+fn a_config_naming_the_old_3d_pane_kind_comes_back_as_a_3d_render_mode() {
+    use crate::pane::{MapRender, OrbitCamera, PaneKind};
+
+    let store = MemoryConfigStore::default();
+    store
+        .store(
+            UI_CONFIG_KEY,
+            r#"{
+                "site": "KDMX",
+                "pane_count": 2,
+                "panes": [
+                    {
+                        "kind": "Volume",
+                        "site": "KDMX",
+                        "volume": {
+                            "yaw_deg": 300.0,
+                            "pitch_deg": 40.0,
+                            "eye_distance": 1.75,
+                            "pivot": [0.25, -0.5, 0.125],
+                            "vertical_exaggeration": 6.5,
+                            "region": {
+                                "centre_lat": 41.73,
+                                "centre_lon": -93.72,
+                                "half_width_km": 25.0
+                            },
+                            "source_pane": 0,
+                            "hide_floor": true
+                        }
+                    },
+                    {"kind": "Map", "site": "KTLX"}
+                ]
+            }"#,
+        )
+        .expect("the memory store accepts a write");
+
+    let mut gui = crate::Gui::new();
+    assert!(
+        gui.load_ui_config(&store),
+        "a config naming the removed 3D pane kind must still load — the whole \
+         file, not just the pane"
+    );
+
+    let pane = gui.pane(0).expect("pane 0");
+    assert_eq!(
+        pane.kind(),
+        PaneKind::Map,
+        "a 3D view is a map pane now: it was always looking at a patch of ground",
+    );
+    assert_eq!(
+        pane.map_render(),
+        Some(MapRender::Volume),
+        "the pane must come back drawing its volume, not silently flattened to \
+         the plan view",
+    );
+    assert_eq!(
+        pane.render_view(),
+        rustdar_radar::types::RenderView::Volume,
+        "and the render dispatched for it must be the raymarch",
+    );
+
+    let volume = pane.volume().expect("a pane in the 3D render mode");
+    let expected = OrbitCamera::restore(300.0, 40.0, 1.75, [0.25, -0.5, 0.125], 6.5)
+        .expect("the fixture's camera is finite and in range");
+    assert_eq!(
+        volume.camera, expected,
+        "the camera the user aimed must survive the migration",
+    );
+    assert!(
+        volume.hide_floor,
+        "and so must the floor they turned off — through the inverted key, \
+         unchanged on the wire",
+    );
+    // The two keys that no longer exist are ignored rather than fatal. `region`
+    // and `source_pane` described a box dragged on another pane; the box is
+    // this pane's own viewport now, and there is nothing to restore.
+    assert_eq!(
+        volume.viewport_box, None,
+        "a box from the file must not be resurrected: it is a measurement, and \
+         the first frame the pane draws takes it",
+    );
+
+    // The pane beside it is untouched, so the migration is about the one pane
+    // rather than about the file.
+    let sibling = gui.pane(1).expect("pane 1");
+    assert_eq!(sibling.kind(), PaneKind::Map);
+    assert_eq!(sibling.map_render(), Some(MapRender::Plan));
+}
+
+/// Saving after that migration writes the **new** vocabulary, so the legacy
+/// name is read once and never again.
+///
+/// Without this the wire would keep two spellings of one state alive
+/// indefinitely, and the `Volume` variant would quietly become something this
+/// build writes rather than something it only tolerates.
+#[test]
+fn a_migrated_3d_pane_is_saved_in_the_new_vocabulary() {
+    use crate::pane::MapRender;
+
+    let store = MemoryConfigStore::default();
+    store
+        .store(
+            UI_CONFIG_KEY,
+            r#"{"site": "KDMX", "panes": [{"kind": "Volume", "site": "KDMX", "volume": {}}]}"#,
+        )
+        .expect("the memory store accepts a write");
+    let mut gui = crate::Gui::new();
+    assert!(gui.load_ui_config(&store));
+
+    let json = gui.ui_config_json().expect("the config must be writable");
+    let written: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    assert_eq!(
+        written["panes"][0]["kind"], "Map",
+        "the pane must be saved as the kind it is",
+    );
+    assert_eq!(
+        written["panes"][0]["render"], "Volume",
+        "with the render mode carrying what the kind used to",
+    );
+
+    // And it round-trips through the new spelling.
+    let again = MemoryConfigStore::default();
+    again.store(UI_CONFIG_KEY, &json).expect("storable");
+    let mut restored = crate::Gui::new();
+    assert!(restored.load_ui_config(&again));
+    assert_eq!(
+        restored.pane(0).expect("pane 0").map_render(),
+        Some(MapRender::Volume),
+    );
+}
+
 /// A view mode from a future build loads as the lit volume, and a
 /// threshold for an unknown product is dropped — the same forward
 /// tolerance the product enum has, pinned for the two new fields.

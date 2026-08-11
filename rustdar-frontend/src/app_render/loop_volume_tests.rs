@@ -27,7 +27,7 @@ use crate::loop_downloads::LoopDownloadManager;
 use crate::platform_double::TestBridge;
 use crate::volume::bridge::VolumeEntry;
 use rustdar_egui::pane::{
-    GeoPoint, LoopFrame, LoopFrameImage, LoopPhase, LoopPlaybackState, PaneKind, VolumeRegion,
+    GeoPoint, LoopFrame, LoopFrameImage, LoopPhase, LoopPlaybackState, VolumeRegion,
     VolumeStamp, VolumeTarget,
 };
 use rustdar_radar::sites::RadarSite;
@@ -216,14 +216,16 @@ fn a_region_change_releases_the_old_set_before_building_the_new_one() {
         );
     }
 
-    // The region drag. It writes straight through to the pane, exactly as the
-    // product combo box does.
+    // The pane's box changes. In production that is the user zooming the pane:
+    // the render arm re-measures the viewport and publishes what it measured on
+    // `VolumePane::viewport_box`, which is what the loop planner reads. Written
+    // directly here because this test has no egui pass to measure one in.
     app.gui
         .pane_mut(0)
         .expect("pane 0")
         .volume_mut()
         .expect("a 3D pane")
-        .region = Some(region());
+        .viewport_box = Some(region());
 
     // One pass: the retarget is noticed, the set is released, and at most
     // `MAX_LOOP_VOLUME_BUILDS_PER_FRAME` of the new key's builds start.

@@ -290,9 +290,10 @@ fn the_pane_and_the_resampler_agree_about_the_default_box() {
         VOLUME_HALF_WIDTH_KM,
         rustdar_egui::pane::DEFAULT_HALF_WIDTH_KM,
     );
-    let pane = rustdar_egui::pane::VolumePane::default();
+    // `None` is the degenerate-viewport fallback, which is the case this test
+    // is about: the box a pane gets when nothing measured one for it.
     assert_eq!(
-        pane.box_size_km(),
+        rustdar_egui::pane::box_size_km(None),
         [
             (2.0 * VOLUME_HALF_WIDTH_KM) as f32,
             (2.0 * VOLUME_HALF_WIDTH_KM) as f32,

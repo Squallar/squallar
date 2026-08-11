@@ -593,7 +593,7 @@ fn a_back_press_cancels_an_armed_draw_after_it_has_closed_every_layer() {
 /// is the promise `set_kind` exists to make.
 #[test]
 fn converting_a_pane_tears_down_its_loop_and_nothing_else() {
-    use crate::pane::{LoopPhase, PaneKind};
+    use crate::pane::LoopPhase;
 
     for view in [rustdar_radar::types::RenderView::CrossSection, rustdar_radar::types::RenderView::Volume] {
         let mut gui = Gui::new();
