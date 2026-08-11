@@ -998,8 +998,22 @@ pub struct OrbitDelta {
     /// Change in elevation above the horizontal, degrees. Positive raises the
     /// eye.
     pub pitch_deg: f32,
-    /// Multiplicative zoom, in egui's own sense: a spreading pinch reports a
-    /// factor above 1, which brings the eye *in*.
+    /// Multiplicative dolly: a factor above 1 brings the eye *in*, dividing
+    /// [`OrbitCamera::eye_distance`] by it.
+    ///
+    /// **No gesture produces one.** Scroll and pinch aim the geography, in both
+    /// render modes — `ui_region::zoom_viewport` — so the UI leaves this at 1.0
+    /// on every frame, and the eye follows the box for free because
+    /// `eye_distance` is a ratio of its half-diagonal. The camera's standoff is
+    /// set absolutely instead, through [`OrbitCamera::set_eye_distance`] and the
+    /// pane's own control.
+    ///
+    /// It stays a ratio here because that is what a *delta* means, and because
+    /// the refusal and the clamp it carries into [`OrbitCamera::nudge`] are the
+    /// camera's invariants rather than the gesture's: a caller of this public
+    /// API may still move the eye by a ratio, and when it does, a non-finite or
+    /// non-positive factor must refuse the whole delta rather than launder a NaN
+    /// into a camera whose staleness key never equals itself.
     pub zoom_factor: f32,
     /// Where to move the pivot, as a fraction of the box's half-extent on each
     /// axis. See [`OrbitCamera::pivot`].
@@ -1049,8 +1063,8 @@ const MAX_PITCH_DEG: f32 = 89.0;
 /// `volume_view::build_view` finds no forward direction and refuses the frame —
 /// a pane that goes blank at the end of the zoom's travel. 0.05 keeps the
 /// direction defined with two orders of magnitude to spare.
-const MIN_EYE_DISTANCE: f32 = 0.05;
-const MAX_EYE_DISTANCE: f32 = 8.0;
+pub const MIN_EYE_DISTANCE: f32 = 0.05;
+pub const MAX_EYE_DISTANCE: f32 = 8.0;
 
 /// How far the pivot may be pushed from the box's centre, as a fraction of the
 /// box's half-extent on each axis.
@@ -1208,6 +1222,35 @@ impl OrbitCamera {
         for (axis, moved) in self.pivot.iter_mut().zip(delta.pan) {
             *axis = (*axis + moved).clamp(-MAX_PIVOT_FRACTION, MAX_PIVOT_FRACTION);
         }
+    }
+
+    /// Set how far back the eye sits, or leave it exactly as it is.
+    ///
+    /// # Why this is a control and not a gesture
+    ///
+    /// The scroll wheel used to drive it, and no longer does: scroll and pinch
+    /// aim the *geography* now, in both render modes, which is the one meaning
+    /// of "zoom" the application has. That is not a loss of magnification —
+    /// tightening the box brings the eye in with it, because this number is a
+    /// ratio of the box's half-diagonal rather than a distance — but it does
+    /// leave the *framing* with no gesture, and framing is a real judgement: how
+    /// much of the pane the box fills, and whether the eye is outside it looking
+    /// in or inside it looking out. [`MIN_EYE_DISTANCE`] documents the inside
+    /// view as a supported camera, and a change that made it unreachable would
+    /// have deleted a shipped capability by omission.
+    ///
+    /// So it is expressed where every other per-pane judgement is expressed, on
+    /// the pane's own controls, which is also the only spelling that works on a
+    /// touch screen and in a browser: there is no modifier key to hang a second
+    /// zoom on, and shipping one would have been a desktop-only model.
+    ///
+    /// Refuses a non-finite value and clamps a finite one, for the same reasons
+    /// [`Self::set_vertical_exaggeration`] gives.
+    pub fn set_eye_distance(&mut self, eye_distance: f32) {
+        if !eye_distance.is_finite() {
+            return;
+        }
+        self.eye_distance = eye_distance.clamp(MIN_EYE_DISTANCE, MAX_EYE_DISTANCE);
     }
 
     /// Set the vertical exaggeration, or leave it exactly as it is.

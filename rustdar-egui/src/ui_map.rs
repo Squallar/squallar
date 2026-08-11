@@ -651,6 +651,33 @@ impl super::Gui {
                         }
                         RenderView::Volume => {
                             self.record_pane_content(pane_idx, RenderView::Volume, pane_rect);
+                            // The pane's one interaction, taken **before** the
+                            // floor is drawn and the box is measured, because
+                            // this frame's scroll changes the viewport both are
+                            // measured off. See `ui_region::zoom_viewport`:
+                            // applying the zoom after either would leave the box
+                            // a frame behind the floor, which does not look like
+                            // a bug — it looks like input lag, and it gets
+                            // "fixed" by turning the sensitivity up.
+                            //
+                            // One response for all three verbs. Orbit, pan and
+                            // zoom are one gesture surface, so they share one
+                            // id, one hit test and one answer to "is the pointer
+                            // on this pane" — which is the gate that keeps a
+                            // pinch over one pane out of every other 3D pane on
+                            // screen.
+                            let volume_response = child_ui.interact(
+                                pane_rect,
+                                child_ui.id().with(("volume_orbit", pane_idx)),
+                                egui::Sense::click_and_drag(),
+                            );
+                            crate::ui_region::zoom_viewport(
+                                &child_ui,
+                                &volume_response,
+                                pane_rect,
+                                &mut map_memory,
+                                center,
+                            );
                             // The pane's own map, drawn where only the mirror
                             // can see it. This is the floor: not a second map,
                             // not a synthetic projector and not a borrowed
@@ -722,6 +749,8 @@ impl super::Gui {
                                 pane_rect,
                                 pane_idx,
                                 &mut pane,
+                                &volume_response,
+                                suppress_pan,
                                 painter.as_deref(),
                                 current_stamp,
                                 chrome,
@@ -1581,10 +1610,6 @@ const ORBIT_YAW_DEG_PER_POINT: f32 = 0.4;
 /// because the usable pitch range is 178° against yaw's unbounded turn, so the
 /// same rate would run into the clamp within a third of a pane.
 const ORBIT_PITCH_DEG_PER_POINT: f32 = 0.25;
-/// Zoom factor per point of scroll. `exp` of this times the scroll, so a notch
-/// is a fixed *ratio* whatever the current distance — the same reason walkers'
-/// wheel zoom is multiplicative.
-const ORBIT_ZOOM_PER_SCROLL_POINT: f32 = 0.004;
 
 /// Fingers a touch drag must have to pan a 3D pane.
 ///
@@ -1593,8 +1618,9 @@ const ORBIT_ZOOM_PER_SCROLL_POINT: f32 = 0.004;
 /// available on a touch screen and orbiting is the pane's primary verb. Two
 /// fingers is what every 3D viewer on a touch device uses for the same reason,
 /// and `MultiTouchInfo` reports the pinch and the translation from one gesture —
-/// so a two-finger drag that also spreads does both, which is what a user
-/// expects and what they will do without noticing.
+/// so a two-finger drag that also spreads does both: it slides the box and zooms
+/// the geography under it, which is what a user expects and what they will do
+/// without noticing.
 const TOUCH_PAN_FINGERS: usize = 2;
 
 /// What the 3D arm did with one pane on one frame.
@@ -1624,19 +1650,21 @@ pub(crate) struct VolumeArmProbe {
 /// a bug, it looks like input lag, and it gets "fixed" by turning the drag
 /// sensitivity up rather than by fixing the order.
 ///
-/// # Why the zoom gate is correctness
+/// # Where the zoom went
 ///
-/// `Input::zoom_delta` is **global**: it reports the frame's pinch or
-/// ctrl-scroll wherever on screen it happened. Without the
-/// `hovered() || dragged()` gate a pinch over a map pane would orbit every 3D
-/// pane on screen at once, which is the sort of thing that gets reported as
-/// "the 3D view moves on its own".
+/// Not here. Scroll and pinch aim the pane's *viewport*, in both render modes,
+/// and that has to happen before the floor is drawn — so the caller reads it
+/// through [`crate::ui_region::zoom_viewport`] and hands this the `response` it
+/// used, rather than this taking a second interaction on the same rect. What
+/// arrives here is the box the zoom already produced.
 #[allow(clippy::too_many_arguments)]
 fn render_volume_pane(
     ui: &mut egui::Ui,
     pane_rect: egui::Rect,
     pane_idx: usize,
     pane: &mut crate::pane::PaneState,
+    response: &egui::Response,
+    suppress_drag: bool,
     painter: Option<&dyn crate::volume_view::VolumePainter>,
     current_stamp: Option<crate::ui::CurrentVolumeStamp>,
     chrome: Option<f32>,
@@ -1653,6 +1681,8 @@ fn render_volume_pane(
         pane_rect,
         pane_idx,
         pane,
+        response,
+        suppress_drag,
         painter,
         current_stamp,
         source_geo,
@@ -1713,6 +1743,8 @@ fn volume_pane_outcome(
     pane_rect: egui::Rect,
     pane_idx: usize,
     pane: &mut crate::pane::PaneState,
+    response: &egui::Response,
+    suppress_drag: bool,
     painter: Option<&dyn crate::volume_view::VolumePainter>,
     current_stamp: Option<crate::ui::CurrentVolumeStamp>,
     source_geo: Option<crate::volume_view::MapPaneGeo>,
@@ -1740,16 +1772,31 @@ fn volume_pane_outcome(
     // state, it survives every reason there is nothing to draw, and a user who
     // orbits an empty box while a volume downloads should find it where they
     // left it when the volume lands.
-    let response = ui.interact(
-        pane_rect,
-        ui.id().with(("volume_orbit", pane_idx)),
-        egui::Sense::click_and_drag(),
-    );
+    //
+    // The `response` is the caller's — one interaction on this rect, taken
+    // before the floor was drawn so that the zoom it also carries could reach
+    // the viewport in time. See `render_volume_pane`.
     let mut delta = OrbitDelta::default();
     // Primary drag orbits; secondary drag pans. Read as two separate questions
     // rather than as an if/else on one drag, because `dragged_by` is per-button
     // and a user with both buttons down means both.
-    if response.dragged_by(egui::PointerButton::Primary) {
+    //
+    // Both are off while `suppress_drag` — the same flag a plan view hands to
+    // `Map::drag_pan_buttons`, meaning "another gesture owns this pointer".
+    // It is the 3D pane's answer to a gesture inventory written for a flat map:
+    // on a touch device a **double-tap-drag zooms**, and it spells that zoom
+    // with a held finger travelling up the screen, which `normalize_touch_devices`
+    // turns into a synthesised *primary* drag. Ungated, every double-tap zoom on
+    // a phone also spun the box — the ground zoomed and the camera turned, from
+    // one gesture, and the pane looked like it had a mind of its own. A long
+    // press is the same shape for the same reason: it raises the value tooltip,
+    // and a tooltip is not an orbit.
+    //
+    // Only the *drag* verbs. The zoom the caller already applied is not
+    // drag-derived — a pinch or a wheel is unambiguous whatever else is in
+    // flight — so suppressing it here would make a pinch during a hold do
+    // nothing, which is not what the hold claimed.
+    if !suppress_drag && response.dragged_by(egui::PointerButton::Primary) {
         let drag = response.drag_delta();
         // Grab-and-turn, in both axes: a point on the box's surface follows the
         // pointer. Dragging right swings the eye's bearing east, which brings
@@ -1773,6 +1820,7 @@ fn volume_pane_outcome(
     // one finger is down, so the one-finger orbit above is unaffected.
     let touch = ui.ctx().multi_touch();
     let pan_drag = match touch {
+        _ if suppress_drag => None,
         Some(touch) if touch.num_touches >= TOUCH_PAN_FINGERS => {
             // Cancel the orbit this frame: the same fingers produced the
             // synthesised primary drag that the branch above already folded in.
@@ -1801,29 +1849,18 @@ fn volume_pane_outcome(
         delta.pan = pan;
     }
 
-    // The pane-rect gate alone stopped being enough at the full-bleed flip:
-    // pane rects now run under the floating chrome (timeline, status bar,
-    // layers panel), so "the pointer is over this pane" no longer implies
-    // "the pointer is over the *map*". The topmost-layer check is the same
-    // rule `filter_dialog_blocked` applies to clicks — a position covered by
-    // any layer above `Background` belongs to that layer, and a wheel there
-    // must work the chrome, not fly the camera under it. `hovered()` already
-    // answers through egui's layer-aware hit test, so the check's own ground
-    // is the `dragged()` arm: a drag keeps this response resolving after the
-    // pointer has wandered over the chrome, and without the layer check a
-    // wheel spun there mid-orbit would still zoom the box.
-    let pointer_on_map_layer = ui.ctx().pointer_latest_pos().is_some_and(|pos| {
-        !ui.ctx()
-            .layer_id_at(pos)
-            .is_some_and(|l| l.order > egui::Order::Background)
-    });
-    if (response.hovered() || response.dragged()) && pointer_on_map_layer {
-        let (pinch, scroll) = ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta.y));
-        // Multiplied, not chosen between: a trackpad can deliver both in one
-        // frame, and `OrbitCamera::nudge` divides the distance by the product
-        // exactly once.
-        delta.zoom_factor = pinch * (scroll * ORBIT_ZOOM_PER_SCROLL_POINT).exp();
-    }
+    // `delta.zoom_factor` stays 1.0 — "the eye did not move" — and there is no
+    // arm here that changes it. Scroll and pinch aim the *geography*, in both
+    // render modes, and `ui_region::zoom_viewport` has already spent this
+    // frame's gesture on the viewport this box was measured off.
+    //
+    // The eye follows anyway, and that is the whole reason this arm could be
+    // deleted rather than replaced: `eye_distance` is in multiples of the box's
+    // half-diagonal, so a box the zoom tightened brings the camera in with it,
+    // continuously, holding the user's orbit angle and standoff ratio exactly.
+    // Nothing here may reframe, ease or fit — the user is the only thing that
+    // moves this camera, and the standoff is theirs to set on the pane's own
+    // control (`render_volume_controls`).
 
     // Read before `volume_mut` borrows the pane: `site`, `scan_info` and
     // `selected_product` are flat fields beside `content`, and taking them first
@@ -2092,6 +2129,41 @@ pub(crate) fn render_volume_controls(
             response.on_hover_text(
                 "Stretches the box vertically so storm structure is legible. Heights the pane \
                  reports stay in real kft MSL at every setting.",
+            );
+        });
+
+        // The framing, which the scroll wheel used to carry and no longer does:
+        // scroll and pinch aim the geography now, in both render modes, so the
+        // standoff needs a home of its own. A control rather than a modifier
+        // key, because a modifier is a desktop-only gesture and this pane has
+        // to work under a finger and in a browser.
+        //
+        // Held in multiples of the box's half-diagonal, which is why the number
+        // means the same thing at every box size — and why tightening the box
+        // does not disturb it. Below 1 the eye is inside the box, which is a
+        // supported camera and the close inspection GR2Analyst allows; see
+        // `MIN_EYE_DISTANCE`.
+        let mut standoff = volume.camera.eye_distance();
+        ui.horizontal(|ui| {
+            ui.label("Distance:");
+            let response = ui.add(
+                egui::Slider::new(
+                    &mut standoff,
+                    crate::pane::MIN_EYE_DISTANCE..=crate::pane::MAX_EYE_DISTANCE,
+                )
+                .logarithmic(true)
+                .suffix("\u{d7}")
+                .fixed_decimals(2),
+            );
+            if response.changed() {
+                // Through the setter, for the reason the exaggeration above
+                // goes through its own: one writer, one clamp, one refusal.
+                volume.camera.set_eye_distance(standoff);
+            }
+            response.on_hover_text(
+                "How far back the eye sits, in box half-diagonals - the framing. Under 1 puts \
+                 the eye inside the box. Scroll and pinch zoom the ground instead, the same \
+                 way they do on a flat pane.",
             );
         });
 

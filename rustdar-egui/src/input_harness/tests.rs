@@ -4658,10 +4658,14 @@ fn back_steps_into_the_archive_and_forward_is_dead_while_live() {
 ///     full-bleed flip, so "the pointer is over this pane" no longer
 ///     implies "the pointer is over the map". Two readers could fall for
 ///     it: walkers' own gate for the 2D map, and the 3D pane's globally
-///     read `zoom_delta` — the second is the one `volume_pane_outcome`'s
-///     topmost-layer check exists for. Each half has a control scroll on
-///     open map first, so a pass cannot come from zooming being broken
-///     altogether.
+///     read `zoom_delta` — the second is the one
+///     `ui_region::pointer_on_map_layer` exists for. Each half has a
+///     control scroll on open map first, so a pass cannot come from
+///     zooming being broken altogether.
+///
+///     Both halves now read a **viewport**, because a scroll aims the
+///     geography whichever way the pane is drawn. That the 3D camera does
+///     not move at all is the subject of its own test.
 #[test]
 fn a_wheel_over_the_floating_chrome_zooms_nothing_underneath() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -4673,27 +4677,25 @@ fn a_wheel_over_the_floating_chrome_zooms_nothing_underneath() {
     let timeline = h.timeline().rect;
     let status_bar = h.status_bar().rect;
     let panes = h.pane_rects();
-    let eye = |h: &mut InputHarness| {
+    let ground = |h: &mut InputHarness| {
         h.gui_mut()
             .pane(1)
             .expect("pane 1 exists")
-            .volume()
-            .expect("pane 1 is a volume")
-            .camera
-            .eye_distance()
+            .map_memory
+            .zoom()
     };
 
-    // Control: a scroll on the open volume pane moves its camera.
+    // Control: a scroll on the open volume pane zooms its geography.
     let clear_volume = egui::pos2(panes[1].center().x, panes[1].center().y);
     assert!(
         !h.is_floating_layer_at(clear_volume),
         "precondition: the control point must be open map"
     );
-    let before = eye(&mut h);
+    let before = ground(&mut h);
     h.scroll_at(clear_volume, egui::vec2(0.0, 200.0));
     h.frames_for(2, FRAME_DT);
     assert!(
-        eye(&mut h) < before,
+        ground(&mut h) > before,
         "control: a scroll on the open volume pane must zoom it"
     );
 
@@ -4706,13 +4708,13 @@ fn a_wheel_over_the_floating_chrome_zooms_nothing_underneath() {
         timeline.contains(covered) && panes[1].contains(covered),
         "precondition: the point is on the timeline over the volume pane"
     );
-    let before = eye(&mut h);
+    let before = ground(&mut h);
     h.scroll_at(covered, egui::vec2(0.0, 200.0));
     h.frames_for(2, FRAME_DT);
     assert_eq!(
-        eye(&mut h),
+        ground(&mut h),
         before,
-        "a wheel over the timeline flew the 3D camera under it"
+        "a wheel over the timeline zoomed the 3D pane's ground under it"
     );
 
     // Control: a scroll on the open map pane zooms the map.

@@ -597,6 +597,23 @@ fn dragging_turns_the_box_the_way_the_pointer_went() {
     }
 }
 
+/// The zoom of a pane's own viewport, whichever way the pane is drawn.
+fn ground_zoom(h: &mut InputHarness, idx: usize) -> f64 {
+    h.gui_mut().pane(idx).expect("a pane").map_memory.zoom()
+}
+
+/// The half-width of the box a 3D pane published this frame, kilometres.
+fn box_km(h: &mut InputHarness, idx: usize) -> f64 {
+    h.gui_mut()
+        .pane(idx)
+        .expect("a pane")
+        .volume()
+        .expect("a pane in the 3D render mode")
+        .viewport_box
+        .expect("the arm must publish the box it measured")
+        .half_width_km()
+}
+
 /// Scrolling over the 3D pane zooms it; scrolling over another pane does
 /// not.
 ///
@@ -604,26 +621,406 @@ fn dragging_turns_the_box_the_way_the_pointer_went() {
 /// frame's gesture wherever on screen it happened — so the
 /// `hovered() || dragged()` gate is correctness rather than politeness.
 /// Without it a wheel over a map pane would zoom every 3D pane on screen.
+///
+/// What "zooms it" means is the pane's **viewport**, which is the whole
+/// change: scroll and pinch aim the geography in both render modes, and the
+/// box follows because the box *is* the viewport.
 #[test]
 fn only_a_gesture_over_the_pane_zooms_it() {
     let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
     let rects = h.pane_rects();
 
-    let before = camera_of(&mut h, 1).eye_distance();
+    let before = ground_zoom(&mut h, 1);
     h.scroll_at(rects[0].center(), egui::vec2(0.0, 200.0));
     h.frames_for(2, FRAME_DT);
     assert_eq!(
-        camera_of(&mut h, 1).eye_distance(),
+        ground_zoom(&mut h, 1),
         before,
-        "a scroll over the map pane must not move the 3D pane's camera",
+        "a scroll over the map pane must not zoom the 3D pane's ground",
     );
 
     h.scroll_at(rects[1].center(), egui::vec2(0.0, 200.0));
     h.frames_for(2, FRAME_DT);
-    let after = camera_of(&mut h, 1).eye_distance();
+    let after = ground_zoom(&mut h, 1);
     assert!(
-        after < before,
-        "scrolling up over the 3D pane should bring the eye in: {before} -> {after}",
+        after > before,
+        "scrolling up over the 3D pane should zoom its geography in: {before} -> {after}",
+    );
+}
+
+/// A **pinch** outside a 3D pane leaves it alone, exactly as a wheel does.
+///
+/// The wheel half above rides on `smooth_scroll_delta`; this one rides on
+/// `zoom_delta`, and they are separate branches of `ui_region::zoom_step`
+/// with separate opportunities to lose the gate. Driven through the web
+/// backend's two-device event shape, because that is what a browser sends
+/// and what `normalize_touch_devices` exists to fold together — so this is
+/// the touch and web arm of the same rule.
+#[test]
+fn a_pinch_outside_a_3d_pane_does_not_zoom_it() {
+    let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
+    let rects = h.pane_rects();
+
+    let before = ground_zoom(&mut h, 1);
+    h.web_pinch(rects[0].center(), 80.0, 400.0, 6);
+    h.frames_for(2, FRAME_DT);
+    assert_eq!(
+        ground_zoom(&mut h, 1),
+        before,
+        "a pinch over the map pane zoomed the 3D pane beside it - the \
+         `hovered() || dragged()` gate on a global `zoom_delta` is gone",
+    );
+
+    // The control, so a pass cannot come from pinch being broken outright.
+    let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
+    let rects = h.pane_rects();
+    let before = ground_zoom(&mut h, 1);
+    h.web_pinch(rects[1].center(), 80.0, 400.0, 6);
+    h.frames_for(2, FRAME_DT);
+    assert!(
+        ground_zoom(&mut h, 1) > before,
+        "control: a pinch on the 3D pane itself must zoom its geography",
+    );
+}
+
+/// **The camera does not move when the box changes.**
+///
+/// The hard requirement of the whole change, and the one that is free:
+/// `eye_distance` is in multiples of the box's half-diagonal, so a box the
+/// zoom tightened carries the eye in with it and the stored *ratio* never
+/// has to be touched. Nothing may reframe, ease or fit — the user is the
+/// only thing that moves this camera.
+///
+/// Asserted on the whole camera rather than on `eye_distance` alone: a
+/// "helpful" reframe would plausibly nudge the pitch or re-centre the pivot
+/// instead, and an assertion aimed at one field would not see it. The camera
+/// is deliberately set away from its default first, because a reframe *to*
+/// the default passes against a default-valued camera.
+#[test]
+fn zooming_the_box_leaves_the_camera_exactly_where_the_user_left_it() {
+    let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
+    let rect = h.pane_rects()[1];
+    let placed = crate::pane::OrbitCamera::restore(137.0, -23.0, 1.75, [0.4, -0.2, 0.6], 4.5)
+        .expect("finite");
+    h.gui_mut()
+        .pane_mut(1)
+        .expect("pane 1")
+        .volume_mut()
+        .expect("a 3D pane")
+        .camera = placed;
+    h.frames_for(2, FRAME_DT);
+
+    let before_box = box_km(&mut h, 1);
+    h.scroll_at(rect.center(), egui::vec2(0.0, 200.0));
+    h.frames_for(4, FRAME_DT);
+
+    let after_box = box_km(&mut h, 1);
+    assert!(
+        after_box < before_box,
+        "precondition: the scroll must have re-cut the box: {before_box} -> {after_box}",
+    );
+    assert_eq!(
+        camera_of(&mut h, 1),
+        placed,
+        "the box changed under the camera and something moved the camera with it",
+    );
+}
+
+/// A drag orbits a 3D pane and pans a plan view — the same gesture, the two
+/// meanings the two pictures have for it.
+///
+/// Both halves in one test on one harness, because the claim is about the
+/// *pair*: a drag that orbited both, or panned both, would satisfy either
+/// half read alone. Each half also asserts the other pane's verb did **not**
+/// happen — a drag that orbited *and* slid the ground under it is the shape
+/// the two-finger cancel in `volume_pane_outcome` exists to prevent.
+#[test]
+fn a_drag_orbits_in_3d_and_pans_in_2d() {
+    let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
+    let rects = h.pane_rects();
+
+    // The 3D pane: the camera turns and the ground stays put.
+    let before_camera = camera_of(&mut h, 1);
+    let before_ground = h.pane_center(1);
+    h.mouse_press(rects[1].center());
+    h.frames_for(1, FRAME_DT);
+    h.mouse_move(rects[1].center() + egui::vec2(110.0, 0.0));
+    h.frames_for(1, FRAME_DT);
+    h.mouse_release(rects[1].center() + egui::vec2(110.0, 0.0));
+    h.frames_for(1, FRAME_DT);
+
+    assert_ne!(
+        camera_of(&mut h, 1).yaw_deg(),
+        before_camera.yaw_deg(),
+        "a drag on a 3D pane must orbit it",
+    );
+    assert_eq!(
+        h.pane_center(1).map(|p| (p.x(), p.y())),
+        before_ground.map(|p| (p.x(), p.y())),
+        "a drag on a 3D pane must not also slide the ground under the box",
+    );
+
+    // The plan view: the ground slides and no camera turns.
+    let before_camera = camera_of(&mut h, 1);
+    let before_ground = h.pane_center(0);
+    h.mouse_press(rects[0].center());
+    h.frames_for(1, FRAME_DT);
+    h.mouse_move(rects[0].center() + egui::vec2(110.0, 0.0));
+    h.frames_for(2, FRAME_DT);
+    h.mouse_release(rects[0].center() + egui::vec2(110.0, 0.0));
+    h.frames_for(1, FRAME_DT);
+
+    assert_ne!(
+        h.pane_center(0).map(|p| (p.x(), p.y())),
+        before_ground.map(|p| (p.x(), p.y())),
+        "a drag on a plan view must pan it",
+    );
+    assert_eq!(
+        camera_of(&mut h, 1),
+        before_camera,
+        "a drag on the plan view moved the 3D pane's camera",
+    );
+}
+
+/// A two-finger drag pans a 3D pane, and the spread in the same gesture
+/// zooms its geography.
+///
+/// The touch spelling of "right-drag pans", and the one that has to carry
+/// both verbs at once: `MultiTouchInfo` reports the translation and the
+/// pinch from one gesture, and a user who slides two fingers apart while
+/// moving them expects both to happen. This is also the pin that one finger
+/// still orbits — `normalize_touch_devices` synthesises a *primary* drag
+/// from a touch, so a two-finger gesture would be read as an orbit too if
+/// the cancel in `volume_pane_outcome` were dropped.
+#[test]
+fn a_two_finger_drag_pans_a_3d_pane_and_its_spread_zooms_the_ground() {
+    let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
+    let rect = h.pane_rects()[1];
+    let before_camera = camera_of(&mut h, 1);
+    let before_ground = ground_zoom(&mut h, 1);
+
+    // Two fingers, spreading *and* travelling: one gesture, both verbs.
+    let a = rect.center() - egui::vec2(60.0, 0.0);
+    let b = rect.center() + egui::vec2(60.0, 0.0);
+    h.web_first_finger_down(a);
+    h.web_second_finger_down(b);
+    h.frames_for(1, FRAME_DT);
+    for step in 1..=6 {
+        let spread = 60.0 + 30.0 * step as f32;
+        let travel = egui::vec2(9.0 * step as f32, 0.0);
+        h.web_pinch_move(
+            rect.center() - egui::vec2(spread, 0.0) + travel,
+            rect.center() + egui::vec2(spread, 0.0) + travel,
+        );
+        h.frames_for(1, FRAME_DT);
+    }
+    h.web_second_finger_up(rect.center() + egui::vec2(300.0, 0.0));
+    h.web_first_finger_up(rect.center() - egui::vec2(120.0, 0.0));
+    h.frames_for(1, FRAME_DT);
+
+    let after = camera_of(&mut h, 1);
+    assert_ne!(
+        after.pivot(),
+        before_camera.pivot(),
+        "a two-finger drag must pan the box",
+    );
+    assert_eq!(
+        (after.yaw_deg(), after.pitch_deg()),
+        (before_camera.yaw_deg(), before_camera.pitch_deg()),
+        "a two-finger drag must not also orbit - the box would spin while it slid",
+    );
+    assert!(
+        ground_zoom(&mut h, 1) > before_ground,
+        "the spread in the same gesture must zoom the geography",
+    );
+}
+
+/// A scroll moves a 3D pane's viewport by the same amount it moves a plan
+/// view's.
+///
+/// "The same gesture means the same thing" is the whole brief, and it is not
+/// something the code can be read for: `ui_region::zoom_step` is a restatement
+/// of `walkers::Map::zoom_delta`, which a 3D pane cannot reach because its map
+/// is drawn off screen. So the two arms are driven through the real UI on one
+/// screen and their answers compared — a restatement that drifts from walkers
+/// fails here, and comparing this function against a copy of itself never
+/// would.
+/// **One harness each, deliberately.** `smooth_scroll_delta` decays over
+/// several frames, so a second notch on the same harness lands on top of the
+/// first one's tail and reads as the two arms disagreeing by two thirds. The
+/// first version of this test did exactly that and blamed the production code.
+#[test]
+fn a_scroll_moves_a_3d_pane_the_same_distance_it_moves_a_plan_view() {
+    // One notch over pane `idx`, from a harness with identical geometry, zoom
+    // and frame history — so the only difference between the two answers is
+    // which arm read the wheel.
+    let notch = |idx: usize| {
+        let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
+        let rects = h.pane_rects();
+        // Both panes start from one zoom, so the comparison is of two deltas
+        // rather than of two ratios taken at different scales.
+        for pane in [0, 1] {
+            h.gui_mut()
+                .pane_mut(pane)
+                .expect("a pane")
+                .map_memory
+                .set_zoom(9.0)
+                .expect("9 is inside walkers' range");
+        }
+        h.warm_up();
+        let before = ground_zoom(&mut h, idx);
+        h.scroll_at(rects[idx].center(), egui::vec2(0.0, 120.0));
+        h.frames_for(1, FRAME_DT);
+        ground_zoom(&mut h, idx) - before
+    };
+
+    let flat_step = notch(0);
+    let solid_step = notch(1);
+    assert!(
+        flat_step > 0.0,
+        "precondition: the plan view must have zoomed at all",
+    );
+    assert!(
+        (flat_step - solid_step).abs() < 1e-9,
+        "one wheel notch moved the plan view {flat_step} zoom levels and the 3D \
+         pane {solid_step} - the same gesture has stopped meaning the same thing",
+    );
+}
+
+/// Zooming in stops at the ground the radar covers rather than falling
+/// through it.
+///
+/// The bound the user approved, and the latent bug it closes: below
+/// `MIN_HALF_WIDTH_KM` the measurement is *refused*, and the caller's
+/// fallback for a refusal is `DEFAULT_HALF_WIDTH_KM` — so a viewport zoomed
+/// one notch too far would have taken the box from 10 km straight to 230,
+/// which is a pop, a full resample, and a floor that covers a twenty-third
+/// of what it stands under. The gesture stops instead.
+#[test]
+fn zooming_in_stops_at_the_resamplers_floor_rather_than_popping_to_the_ceiling() {
+    let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
+    let rect = h.pane_rects()[1];
+
+    // Forty notches: far past the floor at any starting zoom, and each one
+    // is a separate opportunity for the bound to be applied once and then
+    // forgotten.
+    for _ in 0..40 {
+        h.scroll_at(rect.center(), egui::vec2(0.0, 300.0));
+        h.frames_for(1, FRAME_DT);
+        let km = box_km(&mut h, 1);
+        assert!(
+            km >= rustdar_radar::voxel::MIN_HALF_WIDTH_KM,
+            "the box fell through the resampler's floor to {km} km",
+        );
+        assert!(
+            km <= rustdar_radar::voxel::MAX_HALF_WIDTH_KM,
+            "the box popped to the fallback at {km} km - the measurement was \
+             refused and the caller used the whole-scan default",
+        );
+    }
+    assert!(
+        box_km(&mut h, 1) < 2.0 * rustdar_radar::voxel::MIN_HALF_WIDTH_KM,
+        "precondition: the zoom must actually have reached the floor, or the \
+         assertions above passed without ever being tested",
+    );
+}
+
+/// A continuous scroll re-cuts the box while it runs and **stops** when it
+/// does.
+///
+/// The churn question the 1 km quantisation exists to answer. The region is
+/// part of `VolumeTarget`, so every distinct value is a fresh multi-MiB
+/// resample; what must never happen is a *steady state* that keeps producing
+/// new ones, because that is a permanently hot CPU whose only symptom is a
+/// fan. Transient churn during the gesture is the honest cost of the box
+/// being the viewport — the user asked for a different box and got one.
+///
+/// So this pins the settle, not the transient: once the wheel stops, the
+/// region must be bit-identical frame after frame, including through the
+/// frames where `smooth_scroll_delta` is still decaying to zero.
+#[test]
+fn a_scroll_that_stops_stops_re_cutting_the_box() {
+    let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
+    let rect = h.pane_rects()[1];
+
+    for _ in 0..6 {
+        h.scroll_at(rect.center(), egui::vec2(0.0, 150.0));
+        h.frames_for(1, FRAME_DT);
+    }
+    // The decay: `smooth_scroll_delta` does not go to zero the frame the
+    // wheel stops, and a settle measured before it has is a settle that was
+    // never tested.
+    h.frames_for(20, FRAME_DT);
+
+    let settled = h
+        .gui_mut()
+        .pane(1)
+        .expect("pane 1")
+        .volume()
+        .expect("a 3D pane")
+        .viewport_box;
+    for frame in 0..30 {
+        h.frames_for(1, FRAME_DT);
+        let now = h
+            .gui_mut()
+            .pane(1)
+            .expect("pane 1")
+            .volume()
+            .expect("a 3D pane")
+            .viewport_box;
+        assert_eq!(
+            now, settled,
+            "frame {frame} after the scroll stopped re-keyed the region, so the \
+             pane resamples for ever with a still viewport",
+        );
+    }
+}
+
+/// A 3D pane's viewport is its own: the link does not carry it either way.
+///
+/// The **stated decision**, pinned so that it is a decision rather than an
+/// accident of `PaneState::is_map` answering `false` for a 3D pane.
+/// `sync_viewports` is defined over plan views — panes with a raster to
+/// dispatch, donate and synchronise — and a 3D pane is neither a source nor a
+/// target of it.
+///
+/// The cost of the other choice is what settles it: a 3D pane as a sync
+/// *target* would resample its whole box, on the frame thread, every time a
+/// neighbour's wheel turned — and a plan view zoomed to the street would drive
+/// the box straight through the floor `zoom_viewport`'s own bound refuses to
+/// cross. Changing it is a one-word change (`is_map` to a predicate about
+/// having a viewport at all) and wants its own review, not this one.
+#[test]
+fn a_3d_panes_viewport_is_not_carried_by_the_link() {
+    let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
+    let rects = h.pane_rects();
+
+    // The 3D pane's own zoom does not reach the plan view beside it.
+    let flat_before = ground_zoom(&mut h, 0);
+    h.scroll_at(rects[1].center(), egui::vec2(0.0, 200.0));
+    h.frames_for(4, FRAME_DT);
+    assert!(
+        ground_zoom(&mut h, 1) != flat_before,
+        "precondition: the 3D pane must have zoomed",
+    );
+    assert_eq!(
+        ground_zoom(&mut h, 0),
+        flat_before,
+        "a 3D pane drove the linked plan view's viewport",
+    );
+
+    // And the plan view's does not reach the 3D pane.
+    let solid_before = ground_zoom(&mut h, 1);
+    h.scroll_at(rects[0].center(), egui::vec2(0.0, 200.0));
+    h.frames_for(4, FRAME_DT);
+    assert!(
+        ground_zoom(&mut h, 0) != flat_before,
+        "precondition: the plan view must have zoomed",
+    );
+    assert_eq!(
+        ground_zoom(&mut h, 1),
+        solid_before,
+        "the link carried a plan view's zoom into a 3D pane's box",
     );
 }
 
@@ -861,6 +1258,10 @@ fn the_secondary_drag_pans_and_the_primary_drag_orbits() {
     let mut h = volume_pane_harness();
     let rect = h.pane_rects()[1];
     let before = camera_of(&mut h, 1);
+    // The third verb the same rect carries. A pan that also zoomed would be
+    // the box sliding and re-cutting at once, and `zoom_viewport` reads its
+    // gesture off this very response.
+    let before_ground = ground_zoom(&mut h, 1);
 
     h.mouse_press_secondary(rect.center());
     h.frames_for(1, FRAME_DT);
@@ -875,6 +1276,11 @@ fn the_secondary_drag_pans_and_the_primary_drag_orbits() {
         (panned.yaw_deg(), panned.pitch_deg()),
         (before.yaw_deg(), before.pitch_deg()),
         "a secondary drag must not orbit",
+    );
+    assert_eq!(
+        ground_zoom(&mut h, 1),
+        before_ground,
+        "a secondary drag must not zoom the ground as well as pan the box",
     );
 
     let before = panned;
@@ -1772,5 +2178,57 @@ fn the_open_alpha_editor_keeps_its_drag_off_the_orbit_camera() {
         before.yaw_deg(),
         "the pane does not orbit at that position at all, so the half above \
          proved nothing",
+    );
+}
+
+/// A touch **double-tap-drag** zooms a 3D pane's geography and does not also
+/// spin its box.
+///
+/// The one gesture in the shipped inventory that already reached a 3D pane's
+/// viewport before any of this, and the one that collided with the orbit.
+/// `DoubleTapDragDetector` writes `MapMemory` directly for whichever pane is
+/// active, whatever its render mode — so on a phone this was always the way to
+/// re-cut a 3D box. But it spells the zoom with a held finger travelling up the
+/// screen, and `normalize_touch_devices` turns a finger into a synthesised
+/// *primary* drag: ungated, the ground zoomed and the camera turned at once,
+/// from one gesture.
+///
+/// `suppress_drag` is the fix and it is not a new concept — it is the same
+/// `MapPointerFrame::suppress_pan` a plan view already hands to
+/// `Map::drag_pan_buttons`, meaning "another gesture owns this pointer". The
+/// zoom half is asserted too, so a pass cannot come from the gesture being
+/// dead altogether.
+#[test]
+fn a_double_tap_drag_zooms_a_3d_panes_ground_without_spinning_its_box() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.load_scan("KTLX");
+    h.make_pane_volume(0);
+    h.gui_mut()
+        .set_volume_painter(Some(Arc::new(StubVolumePainter::painting())));
+    h.warm_up();
+
+    let start = h.pane_rects()[0].center();
+    let before_camera = camera_of(&mut h, 0);
+    let before_ground = ground_zoom(&mut h, 0);
+
+    // Tap, then press again inside the double-tap window and drag down.
+    h.touch_tap(start);
+    h.touch_start(start);
+    h.frame_after(0.05);
+    for step in 1..=3 {
+        h.touch_move(start + egui::vec2(0.0, 50.0 * step as f32));
+        h.frame_after(FRAME_DT);
+    }
+    h.touch_end(start + egui::vec2(0.0, 150.0));
+    h.frames_for(2, FRAME_DT);
+
+    assert!(
+        ground_zoom(&mut h, 0) > before_ground,
+        "a double-tap-drag down must zoom the 3D pane's geography in",
+    );
+    assert_eq!(
+        camera_of(&mut h, 0),
+        before_camera,
+        "the double-tap zoom also orbited the box - one gesture, two verbs",
     );
 }
