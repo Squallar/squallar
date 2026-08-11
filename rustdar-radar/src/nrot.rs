@@ -39,7 +39,6 @@
 use crate::beam::RE_EFF_KM;
 // rayon on every target that has threads, the sequential stand-ins on wasm32.
 use crate::par::*;
-use std::f64::consts::PI;
 
 const KM_PER_NM: f64 = 1.852;
 
@@ -326,6 +325,36 @@ fn height_km_with_sin_el(range_km: f64, sin_el: f64) -> f64 {
 /// Accumulates VAD samples per height layer across the volume's velocity
 /// tilts, then fits each layer with one trimmed re-fit so folded bins in the
 /// raw (not-yet-dealiased) sweeps cannot drag the wind estimate.
+///
+/// # The fit is in the ground frame
+///
+/// Each sample carries the azimuth **the antenna was pointing at**, off the
+/// radial. Nothing in [`VelocitySweep`] bins rows into a north-referenced
+/// grid: `azimuths_deg` is filled from `Radial::azimuth_angle_degrees` in
+/// sweep order, and a WSR-88D starts each cut wherever the previous one
+/// ended — the fifteen velocity cuts of KCRP volume 2017-08-26 04:41:14
+/// begin at 11.3°, 47.2°, 85.2°, 107.6°, … 104.5°, marching most of the way
+/// round twice.
+///
+/// Row *index* would be a different angle in every cut. `u sin(θ) + v cos(θ)`
+/// fitted against `θ = 2πi/n` returns the true wind turned by that cut's own
+/// start azimuth, so pooling the volume's cuts into one layer — which is the
+/// whole point of pooling, the reason a layer at 1 km holds samples from four
+/// tilts at four ranges — averages winds that disagree by tens to hundreds of
+/// degrees. Measured on that KCRP volume: the 0–6 km sample-weighted trimmed
+/// RMS residual of the pooled fit is 4.85 m/s against azimuth and 5.48 m/s
+/// against index, and on KDMX 2022-03-05 23:23:24 the 1.05 km layer alone
+/// reads 3.55 m/s against 5.81. The model that explains the gates is the one
+/// whose angle is the one the gates were measured at.
+///
+/// Within a single cut the error was invisible, and that is worth stating
+/// because it is why nothing looked wrong: [`WindProfile::predict`] is
+/// queried by the dealiaser at the same azimuth the fit was given, so a fit
+/// turned by `az0` and a query turned by `az0` cancel and the predicted
+/// radial velocity is right. What does not cancel is any reader of the
+/// profile's `(u, v)` as a wind — the Bunkers storm motion under SRV
+/// ([`crate::srv::bunkers_right_mover`]) is one, and it is a vector the user
+/// reads off the pane.
 #[derive(Default)]
 pub struct WindProfileBuilder {
     samples: Vec<Vec<(f64, f64, f64)>>, // (sin·cosθ, cos·cosθ, vr) per layer
@@ -341,9 +370,13 @@ impl WindProfileBuilder {
     pub fn add_sweep(&mut self, sweep: &VelocitySweep, elevation_deg: f64) {
         let el = elevation_deg.to_radians();
         let (sin_el, cos_el) = (el.sin(), el.cos());
-        let n = sweep.vel_grid.len();
-        for (i, row) in sweep.vel_grid.iter().enumerate() {
-            let az = 2.0 * PI * i as f64 / n as f64;
+        // `zip`, not an index: the azimuth slice is the caller's and this
+        // module already declines to assume it is `vel_grid.len()` long
+        // (`sweep_rows` takes the row count separately, for the same reason).
+        // A row the sweep named no azimuth for contributes no sample, which is
+        // the same answer a row of all-NaN gates gives.
+        for (row, &az_deg) in sweep.vel_grid.iter().zip(sweep.azimuths_deg) {
+            let az = az_deg.to_radians();
             let (s, c) = (az.sin() * cos_el, az.cos() * cos_el);
             // Every 3rd gate is plenty for a 3-parameter fit per layer.
             for (j, v) in row.iter().enumerate().step_by(3) {
@@ -1890,6 +1923,23 @@ pub(crate) fn dealias_with_knobs(
     // decision carried across them is carried across ground the antenna never
     // pointed at.
     let rows = sweep_rows(sweep, n);
+    // Where each row points, in radians, for the two wind seeds below. Both
+    // ask [`WindProfile::predict`] what the environment does along one line of
+    // sight, and a line of sight is an angle in the sky, not a position in the
+    // sweep — the same azimuth [`WindProfileBuilder::add_sweep`] fitted the
+    // profile at, which is what makes prediction and fit the same wind.
+    //
+    // Hoisted out of the tile loop as well as the row loop: seed 1 visits
+    // every row once per 10-gate tile column, so a 1832-gate super-res cut
+    // re-derived each row's angle 184 times.
+    //
+    // `Option` per row, because the azimuth slice's length is the caller's to
+    // decide (see `sweep_rows`, which takes the row count separately). A row
+    // with no azimuth gets no prediction, and both seeds already treat "the
+    // profile predicts nothing here" as "do not seed".
+    let az_rad: Vec<Option<f64>> = (0..n)
+        .map(|i| sweep.azimuths_deg.get(i).map(|a| a.to_radians()))
+        .collect();
     let raw: Vec<Vec<f64>> = vel_grid.to_vec();
     // value[i][j] holds the dealiased velocity once valid[i][j].
     let mut valid = vec![false; n * gc];
@@ -1906,14 +1956,14 @@ pub(crate) fn dealias_with_knobs(
                 let mut ok = true;
                 let mut any = false;
                 'tile: for (i, row) in raw.iter().enumerate().take((ti + 5).min(n)).skip(ti) {
-                    let az = 2.0 * PI * i as f64 / n as f64;
+                    let az = az_rad[i];
                     for (j, &v) in row.iter().enumerate().take((tj + 10).min(gc)).skip(tj) {
                         if v.is_nan() {
                             continue;
                         }
                         any = true;
                         let r = sweep.first_gate_range_km + j as f64 * sweep.gate_interval_km;
-                        match wp.predict(az, r, elevation_deg) {
+                        match az.and_then(|az| wp.predict(az, r, elevation_deg)) {
                             Some(pred) if (v - pred).abs() < DA_SEED_TOL => {}
                             _ => {
                                 ok = false;
@@ -1943,7 +1993,7 @@ pub(crate) fn dealias_with_knobs(
             if !has(i, j) {
                 return None;
             }
-            let az = 2.0 * PI * i as f64 / n as f64;
+            let az = az_rad[i]?;
             let r = sweep.first_gate_range_km + j as f64 * sweep.gate_interval_km;
             wp.predict(az, r, elevation_deg)
                 .map(|pred| (raw[i][j] - pred).abs() < DA_SEED_TOL)
@@ -2423,6 +2473,10 @@ pub(crate) fn dealias_with_knobs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the stencil fixtures below sweep a full turn of synthetic
+    // azimuths; nothing outside the tests reaches for π any more, now that
+    // the wind fit reads the angle each radial declares.
+    use std::f64::consts::PI;
 
     /// The hoisted beam height is the shared one, bit for bit.
     ///
@@ -2502,6 +2556,150 @@ mod tests {
         (0..n).map(|i| i as f64 * 360.0 / n as f64).collect()
     }
 
+    // ---- the wind fit is in the ground frame ------------------------------
+    //
+    // A VAD cut carrying one known horizontal wind, laid down from whatever
+    // azimuth the antenna happened to be at when the cut began. Real cuts
+    // begin all over the circle — KCRP volume 2017-08-26 04:41:14 starts its
+    // fifteen velocity cuts at 11.3°, 47.2°, 85.2°, … 104.5° — and the wind
+    // over the radar is the same wind for every one of them.
+
+    /// Range geometry for the synthetic cuts below: 200 gates a kilometre
+    /// apart, which at 0.5° reaches 4.1 km and gives every layer it crosses
+    /// thousands of samples, well clear of both the 200-sample floor and the
+    /// [`PROFILE_MAX_SAMPLES`] ceiling.
+    fn vad_sweep<'a>(grid: &'a [Vec<f64>], azimuths: &'a [f64]) -> VelocitySweep<'a> {
+        VelocitySweep {
+            vel_grid: grid,
+            azimuths_deg: azimuths,
+            gate_count: grid.first().map_or(0, Vec::len),
+            first_gate_range_km: 1.0,
+            gate_interval_km: 1.0,
+        }
+    }
+
+    /// `rows` radials `step_deg` apart from `az0`, every gate holding the
+    /// radial component of `(u, v)`: `vr = u·sin(az)·cos(el) + v·cos(az)·cos(el)`.
+    /// One wind at every height, so every layer must fit the same one.
+    fn vad_cut(
+        rows: usize,
+        az0: f64,
+        step_deg: f64,
+        (u, v): (f64, f64),
+        el_deg: f64,
+    ) -> (Vec<Vec<f64>>, Vec<f64>) {
+        let azimuths: Vec<f64> = (0..rows)
+            .map(|i| (az0 + i as f64 * step_deg).rem_euclid(360.0))
+            .collect();
+        let cos_el = el_deg.to_radians().cos();
+        let grid = azimuths
+            .iter()
+            .map(|a| {
+                let r = a.to_radians();
+                vec![(u * r.sin() + v * r.cos()) * cos_el; 200]
+            })
+            .collect();
+        (grid, azimuths)
+    }
+
+    /// Heights every synthetic cut below reaches with room to spare.
+    const VAD_PROBES: [f64; 4] = [0.15, 0.75, 1.65, 2.85];
+
+    fn assert_wind(profile: &WindProfile, (u, v): (f64, f64), tol: f64, what: &str) {
+        for h in VAD_PROBES {
+            let (fu, fv) = profile
+                .wind_at_km(h)
+                .unwrap_or_else(|| panic!("{what}: no fit at {h} km"));
+            assert!(
+                (fu - u).abs() < tol && (fv - v).abs() < tol,
+                "{what}: {h} km fitted ({fu:.4}, {fv:.4}), wind is ({u}, {v})",
+            );
+        }
+    }
+
+    /// The wind a cut measures does not depend on where the cut began.
+    ///
+    /// Both cuts carry the same 12 m/s westerly with a 5 m/s northerly
+    /// component; one starts at north and one at 137.5°. Read against row
+    /// index instead of azimuth the second returns that wind turned by 137.5°
+    /// — (12, −5) arrives as (−5.5, 11.7), a 20° speed at 65° instead of a
+    /// 13 m/s wind from 293°.
+    #[test]
+    fn a_cut_that_starts_off_north_fits_the_wind_a_cut_starting_at_north_does() {
+        let wind = (12.0, -5.0);
+        let mut fits = Vec::new();
+        for az0 in [0.0, 137.5] {
+            let (grid, azimuths) = vad_cut(360, az0, 1.0, wind, 0.5);
+            let mut builder = WindProfileBuilder::new();
+            builder.add_sweep(&vad_sweep(&grid, &azimuths), 0.5);
+            fits.push(builder.finish().expect("a noiseless cut fits"));
+        }
+        assert_wind(&fits[0], wind, 1e-6, "cut starting at north");
+        assert_wind(&fits[1], wind, 1e-6, "cut starting at 137.5°");
+        for h in VAD_PROBES {
+            let (a, b) = (fits[0].wind_at_km(h), fits[1].wind_at_km(h));
+            let ((au, av), (bu, bv)) = (a.unwrap(), b.unwrap());
+            // Not bit equality: the two cuts solve normal equations built from
+            // the same angles in a different order, so they land within an ulp
+            // or two of each other and of the wind. Everything this test is
+            // about is orders of magnitude coarser than that.
+            assert!(
+                (au - bu).abs() < 1e-9 && (av - bv).abs() < 1e-9,
+                "the two cuts disagree at {h} km: {a:?} against {b:?}",
+            );
+        }
+    }
+
+    /// The whole point of pooling a volume: four cuts, four start azimuths,
+    /// four elevations, one atmosphere. Every sample in a layer has to be
+    /// referred to the same north before the layer is solved, or the layer
+    /// averages winds that disagree by whatever the cuts' starts disagree by
+    /// — here 97.3°, 211.8° and 318.4°, which spans the compass.
+    #[test]
+    fn cuts_that_start_at_four_azimuths_pool_to_the_one_wind() {
+        let wind = (-9.0, 14.0);
+        let cuts: Vec<(Vec<Vec<f64>>, Vec<f64>, f64)> =
+            [(0.0, 0.5), (97.3, 0.9), (211.8, 1.5), (318.4, 2.4)]
+                .into_iter()
+                .map(|(az0, el)| {
+                    let (grid, azimuths) = vad_cut(360, az0, 1.0, wind, el);
+                    (grid, azimuths, el)
+                })
+                .collect();
+        let mut builder = WindProfileBuilder::new();
+        for (grid, azimuths, el) in &cuts {
+            builder.add_sweep(&vad_sweep(grid, azimuths), *el);
+        }
+        assert_wind(
+            &builder.finish().expect("four noiseless cuts fit"),
+            wind,
+            1e-6,
+            "four cuts pooled",
+        );
+    }
+
+    /// A sector holds an arc, and an arc of a sinusoid still determines it.
+    /// 90° of 0.5° radials — the narrowest the chunk feed hands over as a
+    /// usable cut — recovers (7, 11) m/s to 7e-12 m/s. Read
+    /// against row index the same 181 rows are stretched around a full
+    /// circle, and the three-parameter fit then has nothing to do with the
+    /// field it was given.
+    #[test]
+    fn a_ninety_degree_sector_fits_the_wind_over_the_arc_it_has() {
+        let wind = (7.0, 11.0);
+        let (grid, azimuths) = vad_cut(181, 42.0, 0.5, wind, 0.5);
+        let mut builder = WindProfileBuilder::new();
+        builder.add_sweep(&vad_sweep(&grid, &azimuths), 0.5);
+        assert_wind(
+            &builder
+                .finish()
+                .expect("a 90° arc still determines a VAD fit"),
+            wind,
+            1e-9,
+            "90° sector",
+        );
+    }
+
     /// A field folded across the Nyquist limit must come back continuous:
     /// with an environmental wind profile seeding the dealiaser, the folded
     /// arcs unfold by one full 2·Vny interval instead of standing as phantom
@@ -2546,6 +2744,71 @@ mod tests {
         dealias(&mut coverage, &sw, 0.5, Some(&wp), DealiasProfile::Coverage);
         assert_eq!(coverage[0][10], 30.0);
         assert_eq!(coverage[12][10], true_v[12]);
+    }
+
+    /// The wind seeds ask the profile about the sky, not about the sweep.
+    ///
+    /// The fixture above unfolds either way, because all forty of its gates
+    /// sit inside 12 km and the zero-isodop seed reaches anything within 40:
+    /// the near-zero rows anchor the field and the passes carry it round. This
+    /// one puts its gates at 50–89 km, where that seed has nothing to work
+    /// with (`near_gates` is zero), so the environmental wind is the only
+    /// thing that can start the unfolding.
+    ///
+    /// A 30 m/s southerly is what `from_levels` states here and what
+    /// [`crate::srv`] hands the SRV render: a wind over the radar, in the
+    /// ground frame. Asked at row index instead, this cut's row 0 is "row 0 of
+    /// 72" — due north, where the profile predicts +30 m/s — while the gate
+    /// there holds the 21.2 m/s its true 45° azimuth carries. Nothing in the
+    /// cut lands within the 4 m/s seed tolerance of its own row index: the two
+    /// rows whose index prediction comes closest are the ones the fold has
+    /// already moved 50 m/s. So no tile seeds, no gate seeds, no pass has
+    /// anything to propagate, and the two folded arcs stay folded.
+    #[test]
+    fn the_wind_seeds_read_the_azimuth_the_antenna_pointed_at() {
+        let n = 72;
+        let gates = 40;
+        let nyquist = 25.0;
+        // 45° is a whole number of 5° rows, so this cut holds exactly the rows
+        // a cut starting at north would, renumbered: its row 63 faces north.
+        let azs: Vec<f64> = (0..n)
+            .map(|i| (45.0 + i as f64 * 360.0 / n as f64).rem_euclid(360.0))
+            .collect();
+        let true_v: Vec<f64> = azs.iter().map(|a| 30.0 * a.to_radians().cos()).collect();
+        let mut grid: Vec<Vec<f64>> = true_v
+            .iter()
+            .map(|&v| {
+                let folded = if v > nyquist {
+                    v - 2.0 * nyquist
+                } else if v < -nyquist {
+                    v + 2.0 * nyquist
+                } else {
+                    v
+                };
+                vec![folded; gates]
+            })
+            .collect();
+        // One bin pinned at the fold limit so the Nyquist estimate is exactly
+        // 25, as in the fixture above: the 5° rows straddle the ±25 crossing
+        // rather than landing on it, so unaided the estimate would be the
+        // 24.57 of the nearest row and every unfold would land 0.85 m/s short.
+        // Row 9 faces 90°, where a southerly reads zero — an isolated spike
+        // the passes drop.
+        grid[9][0] = 25.0;
+        let wp = WindProfile::from_levels(&[(0.0, 0.0, 30.0)]).unwrap();
+
+        let vg = grid.clone();
+        let sw = VelocitySweep {
+            vel_grid: &vg,
+            azimuths_deg: &azs,
+            gate_count: gates,
+            first_gate_range_km: 50.0,
+            gate_interval_km: 1.0,
+        };
+        dealias(&mut grid, &sw, 0.5, Some(&wp), DealiasProfile::NoFalseShear);
+
+        assert_eq!(grid[63][10], 30.0, "the folded arc should unfold to +30");
+        assert_eq!(grid[3][10], true_v[3], "unfolded flow must not move");
     }
 
     /// The profile parameter reaches only the post-pass censoring: an
