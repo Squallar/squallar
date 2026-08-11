@@ -185,7 +185,7 @@ impl OverlayHandler for NwsAlertHandler {
 
     /// E.g. `"3 shown - W/Wa/Adv"`: how many alerts would draw, and which
     /// categories are letting them. Counted directly rather than through
-    /// `clickable_items`, which clones every feature polygon per call.
+    /// `clickable_items`, which builds a `Vec` and an `Arc` per alert per call.
     fn status_line(&self) -> Option<String> {
         if !self.is_enabled() {
             return None;
@@ -268,7 +268,12 @@ impl OverlayHandler for NwsAlertHandler {
         self.state.data.len()
     }
 
-    fn clickable_items(&self) -> Vec<ClickableItem> {
+    /// The alerts a click can land on, each borrowing its own polygons.
+    ///
+    /// The national feed carries one feature per affected zone, so this is
+    /// thousands of rings on an active day; they are lent, never copied, and
+    /// the call only happens on a frame with a click to resolve.
+    fn clickable_items(&self) -> Vec<ClickableItem<'_>> {
         self.state
             .data
             .iter()
@@ -277,8 +282,7 @@ impl OverlayHandler for NwsAlertHandler {
                     && !self.hidden_alerts.contains(&item.alert.id)
             })
             .map(|item| ClickableItem {
-                features: item.alert.features.clone(),
-                label: None,
+                features: &item.alert.features,
                 item: item.clone() as Arc<dyn OverlayItem>,
             })
             .collect()

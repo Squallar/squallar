@@ -96,10 +96,20 @@ pub trait OverlayItem: Send + Sync + Debug {
     fn as_any(&self) -> &dyn Any;
 }
 
-/// Lets the UI crate hit-test and label without knowing overlay-specific types.
-pub struct ClickableItem {
-    pub features: Vec<OverlayFeature>,
-    pub label: Option<OverlayLabel>,
+/// Lets the UI crate hit-test without knowing overlay-specific types.
+///
+/// A **view** of the handler's geometry, not a copy of it. It used to own a
+/// `Vec<OverlayFeature>` — rings, plus the precomputed triangulation index
+/// buffers — and the draw loop built one per alert per pane per frame, so a day
+/// with national warning coverage deep-cloned every polygon in the country sixty
+/// times a second. Nothing needs the geometry to outlive the handler borrow: the
+/// hit test runs inside it and clones only the `Arc` of what it hit.
+///
+/// Labels are **not** here. They are the one thing the draw loop wants on every
+/// frame, and asking for them through this type is what made a frame with no
+/// click pay for geometry — see [`OverlayHandler::map_labels`].
+pub struct ClickableItem<'a> {
+    pub features: &'a [OverlayFeature],
     pub item: Arc<dyn OverlayItem>,
 }
 
@@ -201,8 +211,27 @@ pub trait OverlayHandler: Send {
 
     // ── Click & selection ─────────────────────────────────────────────
 
-    fn clickable_items(&self) -> Vec<ClickableItem> {
+    /// The features a click is tested against, borrowed from this handler.
+    ///
+    /// Called **only on a frame that has a click to resolve**, and only for a
+    /// layer whose rasterizer produced no hit buffer — never as part of
+    /// ordinary drawing. Building a `Vec` here is therefore fine; cloning
+    /// geometry into it is still not, which is why [`ClickableItem`] borrows.
+    fn clickable_items(&self) -> Vec<ClickableItem<'_>> {
         Vec::new()
+    }
+
+    /// The map labels this layer paints, in the pane's own draw pass.
+    ///
+    /// Split out of [`clickable_items`] because the two have opposite
+    /// schedules: labels are wanted on every frame, geometry only on a frame
+    /// with a click. Handed out as a borrow, not a `Vec`, so a per-pane
+    /// per-frame call allocates nothing — a handler with labels precomputes
+    /// them when its data changes.
+    ///
+    /// [`clickable_items`]: OverlayHandler::clickable_items
+    fn map_labels(&self) -> &[OverlayLabel] {
+        &[]
     }
 
     /// `true` if this handler owned the action.
@@ -473,9 +502,15 @@ impl OverlayRegistry {
         self.handler(kind).and_then(|h| h.status_line())
     }
 
-    pub fn clickable_items(&self, kind: OverlayKind) -> Vec<ClickableItem> {
+    pub fn clickable_items(&self, kind: OverlayKind) -> Vec<ClickableItem<'_>> {
         self.handler(kind)
             .map_or_else(Vec::new, |h| h.clickable_items())
+    }
+
+    /// [`OverlayHandler::map_labels`] for `kind`; empty for a kind with no
+    /// handler.
+    pub fn map_labels(&self, kind: OverlayKind) -> &[OverlayLabel] {
+        self.handler(kind).map_or(&[], |h| h.map_labels())
     }
 
     pub fn hover_value_at(&self, kind: OverlayKind, lat: f64, lon: f64) -> Option<String> {

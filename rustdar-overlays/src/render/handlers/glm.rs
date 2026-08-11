@@ -466,7 +466,7 @@ impl OverlayHandler for GlmHandler {
         Some(20)
     }
 
-    fn clickable_items(&self) -> Vec<ClickableItem> {
+    fn clickable_items(&self) -> Vec<ClickableItem<'_>> {
         // Lightning uses hit-buffer click detection, not polygon containment.
         Vec::new()
     }

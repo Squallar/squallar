@@ -190,7 +190,7 @@ impl OverlayHandler for StormReportsHandler {
         Some(300)
     }
 
-    fn clickable_items(&self) -> Vec<ClickableItem> {
+    fn clickable_items(&self) -> Vec<ClickableItem<'_>> {
         Vec::new() // Clicks resolve through the rasterizer's `HitMap` instead.
     }
 

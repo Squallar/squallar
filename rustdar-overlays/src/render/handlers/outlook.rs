@@ -214,7 +214,7 @@ impl OverlayHandler for SpcOutlookHandler {
         self.state.data.len()
     }
 
-    fn clickable_items(&self) -> Vec<ClickableItem> {
+    fn clickable_items(&self) -> Vec<ClickableItem<'_>> {
         let day = self.selected_day;
         let mut items = Vec::new();
         for &product in &self.enabled_products {
@@ -223,8 +223,7 @@ impl OverlayHandler for SpcOutlookHandler {
             };
             for feature in &outlook.features {
                 items.push(ClickableItem {
-                    features: vec![feature.clone()],
-                    label: None,
+                    features: std::slice::from_ref(feature),
                     item: Arc::new(OutlookItem {
                         label: feature.label.clone(),
                         day,

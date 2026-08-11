@@ -98,7 +98,7 @@ impl OverlayHandler for ModelDataHandler {
         Some(3600) // HRRR runs hourly.
     }
 
-    fn clickable_items(&self) -> Vec<crate::render::overlay_state::ClickableItem> {
+    fn clickable_items(&self) -> Vec<crate::render::overlay_state::ClickableItem<'_>> {
         Vec::new() // Gridded, not feature-based; hover uses `hover_value_at`.
     }
 

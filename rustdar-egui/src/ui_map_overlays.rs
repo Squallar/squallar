@@ -2,6 +2,7 @@ use crate::overlay_cache::{OverlayTextureCache, draw_overlay_texture, geo_point_
 use crate::tile_source::HttpsTiles;
 use crate::tiles::{lat_to_tile_y, lon_to_tile_x, tile_to_lat, tile_to_lon};
 use rustdar_overlays::render::overlay_state::{ClickableItem, OverlayItem};
+use rustdar_overlays::types::OverlayLabel;
 use std::sync::Arc;
 use walkers::{Tile, TileId, Tiles};
 
@@ -77,14 +78,26 @@ impl<'a> OverlayDrawContext<'a> {
 
     /// Draw a single overlay layer: texture, labels, and click detection.
     ///
-    /// This is fully generic — the caller provides the texture cache and the
-    /// pre-built `ClickableItem` list from `OverlayKind::clickable_items()`.
+    /// This is fully generic — the caller provides the texture cache, the
+    /// layer's map labels, and a way to *ask for* its clickable features.
     /// Returns `Arc<dyn OverlayItem>` for all items whose polygons contain the
     /// click point.
-    pub fn draw_overlay(
+    ///
+    /// # Why `items` is a closure
+    ///
+    /// Because almost no frame needs it. Labels are wanted every frame; the
+    /// geometry is wanted only on a frame that carries a click, and then only
+    /// for a layer whose rasterizer left no hit buffer. Handing the list in
+    /// eagerly meant `OverlayRegistry::clickable_items` ran per layer per pane
+    /// per frame — which for NWS alerts is a `Vec` and an `Arc` per warning,
+    /// and used to be a deep clone of every zone polygon in the country — to
+    /// be dropped unread. The closure moves that cost behind the two branches
+    /// that actually reach it.
+    pub fn draw_overlay<'i>(
         &self,
         texture: Option<&OverlayTextureCache>,
-        items: &[ClickableItem],
+        labels: &[OverlayLabel],
+        items: impl FnOnce() -> Vec<ClickableItem<'i>>,
     ) -> Vec<Arc<dyn OverlayItem>> {
         // 1. Draw the pre-rasterized texture if available
         if let Some(tex) = texture.and_then(|c| c.current.as_ref()) {
@@ -93,23 +106,21 @@ impl<'a> OverlayDrawContext<'a> {
 
         // 2. Draw map labels
         let painter = self.ui.painter();
-        for item in items {
-            if let Some(ref label) = item.label {
-                let screen_pos = self
-                    .projector
-                    .project(walkers::lat_lon(label.lat, label.lon))
-                    .to_pos2();
-                if self.screen_rect.contains(screen_pos) {
-                    let [r, g, b, a] = label.color;
-                    let color = egui::Color32::from_rgba_unmultiplied(r, g, b, a);
-                    painter.text(
-                        screen_pos,
-                        egui::Align2::CENTER_CENTER,
-                        &label.text,
-                        egui::FontId::proportional(11.0),
-                        color,
-                    );
-                }
+        for label in labels {
+            let screen_pos = self
+                .projector
+                .project(walkers::lat_lon(label.lat, label.lon))
+                .to_pos2();
+            if self.screen_rect.contains(screen_pos) {
+                let [r, g, b, a] = label.color;
+                let color = egui::Color32::from_rgba_unmultiplied(r, g, b, a);
+                painter.text(
+                    screen_pos,
+                    egui::Align2::CENTER_CENTER,
+                    &label.text,
+                    egui::FontId::proportional(11.0),
+                    color,
+                );
             }
         }
 
@@ -141,7 +152,7 @@ impl<'a> OverlayDrawContext<'a> {
         let lon = geo.x();
 
         let mut hits = Vec::new();
-        for item in items {
+        for item in items() {
             let hit = item
                 .features
                 .iter()

@@ -13094,3 +13094,193 @@ fn the_loop_toggle_is_a_real_button_with_a_visible_on_state() {
         h.painted_fills_within(rect, 1.0)
     );
 }
+
+// ── The overlay draw path's click / label split ──────────────────────────
+//
+// `OverlayDrawContext::draw_overlay` used to be handed a fully built
+// `ClickableItem` list on every frame, and it wanted that list for two
+// unrelated things: the map labels it paints always, and the polygon
+// containment test it runs only for a click. The list now arrives as two
+// separate asks — a borrowed label slice, and a closure for the geometry that
+// only a click reaches. The three tests below hold both halves to what they
+// did before: a click inside a warning still opens it, a click outside still
+// opens nothing, and an MD still writes its number on the map on a frame with
+// no pointer activity at all.
+
+/// A square (lat, lon) ring of `half_deg` about a point, closed as GeoJSON
+/// rings arrive.
+fn ring_about(lat: f64, lon: f64, half_deg: f64) -> Vec<(f64, f64)> {
+    vec![
+        (lat - half_deg, lon - half_deg),
+        (lat - half_deg, lon + half_deg),
+        (lat + half_deg, lon + half_deg),
+        (lat + half_deg, lon - half_deg),
+        (lat - half_deg, lon - half_deg),
+    ]
+}
+
+/// One NWS alert covering a square about (`lat`, `lon`), shaped like the
+/// zone-resolved alerts `nws::zones` builds: geometry in `features`, one
+/// feature per affected area.
+fn alert_over(id: &str, event: &str, lat: f64, lon: f64) -> rustdar_overlays::nws::alert::NwsAlert {
+    use rustdar_overlays::nws::alert::{AlertCategory, NwsAlert};
+    let (fill, stroke) = rustdar_overlays::nws::colors::alert_color(event);
+    NwsAlert {
+        id: id.to_string(),
+        event: event.to_string(),
+        category: AlertCategory::from_event(event),
+        severity: "Severe".parse().expect("a CAP severity"),
+        urgency: "Immediate".parse().expect("a CAP urgency"),
+        certainty: "Observed".parse().expect("a CAP certainty"),
+        headline: None,
+        description: String::new(),
+        instruction: None,
+        area_desc: String::new(),
+        sender_name: String::new(),
+        effective: String::new(),
+        expires: String::new(),
+        onset: None,
+        ends: None,
+        affected_zones: Vec::new(),
+        features: vec![rustdar_overlays::types::OverlayFeature::new(
+            vec![vec![ring_about(lat, lon, 0.25)]],
+            fill,
+            stroke,
+            event.to_string(),
+            String::new(),
+            rustdar_overlays::types::HatchPattern::None,
+        )],
+    }
+}
+
+/// Feed `alerts` in through the production ingest path, exactly as the
+/// national fetch delivers them.
+fn ingest_alerts(h: &mut InputHarness, alerts: Vec<rustdar_overlays::nws::alert::NwsAlert>) {
+    use rustdar_overlays::render::overlay_state::{OverlayFetchResult, OverlayRegistry};
+    h.gui_mut().overlays.apply_fetch_result(OverlayFetchResult {
+        kind: OverlayKind::NwsAlerts,
+        data: OverlayRegistry::nws_alerts_payload(alerts),
+    });
+}
+
+/// A click inside a warning's polygon still selects that warning.
+///
+/// The claim the closure gating has to keep: the geometry is no longer built
+/// on every frame, so the frame that *does* carry a click is the only one that
+/// can still answer — if the ask were skipped there too, this is what would go
+/// quiet, and nothing else in the suite would notice.
+#[test]
+fn a_click_inside_an_alert_polygon_still_selects_it() {
+    let mut h = InputHarness::new();
+    h.gui_mut().enable_overlay_for_test(OverlayKind::NwsAlerts);
+    h.warm_up();
+
+    let target = h.pane_rects()[0].center();
+    let ground = h.ground_at(0, target);
+    ingest_alerts(
+        &mut h,
+        vec![alert_over("a", "Tornado Warning", ground.y(), ground.x())],
+    );
+    h.warm_up();
+
+    h.mouse_click(target);
+
+    let selected = &h.gui_mut().overlays.selected_overlays;
+    assert_eq!(
+        selected.len(),
+        1,
+        "a click in the middle of a tornado warning selected {} items",
+        selected.len()
+    );
+    let prefs = rustdar_units::UserPreferences::default();
+    assert_eq!(
+        selected[0].popup_content(&prefs).title,
+        "Tornado Warning",
+        "the click selected something, but not the warning it landed in"
+    );
+}
+
+/// …and a click well outside every polygon still selects nothing, so the
+/// test above cannot pass by selecting everything the handler holds.
+#[test]
+fn a_click_outside_every_alert_polygon_still_selects_nothing() {
+    let mut h = InputHarness::new();
+    h.gui_mut().enable_overlay_for_test(OverlayKind::NwsAlerts);
+    h.warm_up();
+
+    let pane = h.pane_rects()[0];
+    let elsewhere = h.ground_at(0, pane.center());
+    // Ten degrees away: nowhere near the quarter-degree square, and off the
+    // pane's geography entirely at the default zoom.
+    ingest_alerts(
+        &mut h,
+        vec![alert_over(
+            "a",
+            "Tornado Warning",
+            elsewhere.y() + 10.0,
+            elsewhere.x() + 10.0,
+        )],
+    );
+    h.warm_up();
+
+    h.mouse_click(pane.center());
+
+    assert!(
+        h.gui_mut().overlays.selected_overlays.is_empty(),
+        "a click ten degrees from the only warning selected it anyway"
+    );
+}
+
+/// An MD writes its number on the map on an ordinary frame — no click, no
+/// pointer.
+///
+/// The label used to be carried on the same per-frame `ClickableItem` list the
+/// hit test read, which is exactly why gating that list on a click would have
+/// been wrong. Labels now come from `OverlayHandler::map_labels`, and this is
+/// the claim that they still arrive: delete the `map_labels` call from the
+/// draw loop and the map loses every MD number while every click test stays
+/// green.
+#[test]
+fn an_md_still_labels_itself_on_a_frame_with_no_click() {
+    use rustdar_overlays::render::overlay_state::{OverlayFetchResult, OverlayRegistry};
+    use rustdar_overlays::spc::colors::{md_fill_color, md_stroke_color};
+    use rustdar_overlays::spc::discussion::{MdType, SpcDiscussion};
+
+    let mut h = InputHarness::new();
+    h.gui_mut()
+        .enable_overlay_for_test(OverlayKind::SpcDiscussions);
+    h.warm_up();
+
+    let ground = h.ground_at(0, h.pane_rects()[0].center());
+    let md_type = MdType::Convective;
+    let polygon = vec![ring_about(ground.y(), ground.x(), 0.25)];
+    let md = SpcDiscussion {
+        number: 1234,
+        title: "Mesoscale Discussion #1234".into(),
+        text: String::new(),
+        link: String::new(),
+        md_type,
+        polygon: polygon.clone(),
+        feature: rustdar_overlays::types::OverlayFeature::new(
+            vec![polygon],
+            md_fill_color(&md_type),
+            md_stroke_color(&md_type),
+            "MD 1234".into(),
+            String::new(),
+            rustdar_overlays::types::HatchPattern::None,
+        ),
+        concerning: None,
+    };
+    h.gui_mut().overlays.apply_fetch_result(OverlayFetchResult {
+        kind: OverlayKind::SpcDiscussions,
+        data: OverlayRegistry::spc_discussions_payload(vec![md]),
+    });
+
+    h.warm_up();
+
+    assert!(
+        h.painted_text_strings().iter().any(|t| t == "MD 1234"),
+        "no MD label was painted on a frame with no click. Painted: {:?}",
+        h.painted_text_strings()
+    );
+}

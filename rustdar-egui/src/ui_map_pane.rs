@@ -339,9 +339,16 @@ pub(super) fn render_pane_map_content(
                 // All other overlays dispatched by render mode
                 _ => match ctx.overlays.render_mode(kind) {
                     Some(RenderMode::Texture) => {
-                        let items = ctx.overlays.clickable_items(kind);
-                        selected
-                            .extend(overlay_ctx.draw_overlay(ctx.pane.overlay_cache(kind), &items));
+                        // Shared, not mutable: the labels are borrowed out of
+                        // the handler for the length of the draw, and the
+                        // clickable set is only asked for if a click needs
+                        // resolving — see `OverlayDrawContext::draw_overlay`.
+                        let overlays = &*ctx.overlays;
+                        selected.extend(overlay_ctx.draw_overlay(
+                            ctx.pane.overlay_cache(kind),
+                            overlays.map_labels(kind),
+                            || overlays.clickable_items(kind),
+                        ));
                     }
                     Some(RenderMode::PerFramePoint) => {
                         selected.extend(render_per_frame_overlay(

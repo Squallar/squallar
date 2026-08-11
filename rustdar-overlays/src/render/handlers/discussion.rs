@@ -82,6 +82,12 @@ impl OverlayItem for DiscussionItem {
 pub(crate) struct SpcDiscussionHandler {
     pub state: OverlayState<Vec<Arc<DiscussionItem>>>,
     pub enabled: bool,
+    /// The "MD 1234" map labels, rebuilt whenever `state.data` is — never per
+    /// frame. Each one used to be derived inside `clickable_items`: two full
+    /// `sum::<f64>()` passes over the first ring for a centroid plus a
+    /// `format!`, per MD, per pane, per frame, for text that only changes when
+    /// the discussion set does.
+    labels: Vec<OverlayLabel>,
 }
 
 impl SpcDiscussionHandler {
@@ -89,8 +95,24 @@ impl SpcDiscussionHandler {
         Self {
             state: OverlayState::new(),
             enabled: true,
+            labels: Vec::new(),
         }
     }
+}
+
+/// The label for one MD: its first ring's centroid, its number, its type
+/// colour — or `None` where there is no ring to place it on.
+fn md_label(md: &SpcDiscussion) -> Option<OverlayLabel> {
+    let ring = md.polygon.first().filter(|ring| !ring.is_empty())?;
+    let n = ring.len() as f64;
+    let lat = ring.iter().map(|&(lat, _)| lat).sum::<f64>() / n;
+    let lon = ring.iter().map(|&(_, lon)| lon).sum::<f64>() / n;
+    Some(OverlayLabel {
+        lat,
+        lon,
+        text: format!("MD {}", md.number),
+        color: md_stroke_color(&md.md_type),
+    })
 }
 
 impl OverlayHandler for SpcDiscussionHandler {
@@ -177,35 +199,20 @@ impl OverlayHandler for SpcDiscussionHandler {
         self.state.data.len()
     }
 
-    fn clickable_items(&self) -> Vec<ClickableItem> {
+    fn clickable_items(&self) -> Vec<ClickableItem<'_>> {
         self.state
             .data
             .iter()
             .filter(|item| !item.md.polygon.is_empty())
-            .map(|item| {
-                let label = item
-                    .md
-                    .polygon
-                    .first()
-                    .filter(|ring| !ring.is_empty())
-                    .map(|ring| {
-                        let n = ring.len() as f64;
-                        let lat = ring.iter().map(|&(lat, _)| lat).sum::<f64>() / n;
-                        let lon = ring.iter().map(|&(_, lon)| lon).sum::<f64>() / n;
-                        OverlayLabel {
-                            lat,
-                            lon,
-                            text: format!("MD {}", item.md.number),
-                            color: md_stroke_color(&item.md.md_type),
-                        }
-                    });
-                ClickableItem {
-                    features: vec![item.md.feature.clone()],
-                    label,
-                    item: item.clone() as Arc<dyn OverlayItem>,
-                }
+            .map(|item| ClickableItem {
+                features: std::slice::from_ref(&item.md.feature),
+                item: item.clone() as Arc<dyn OverlayItem>,
             })
             .collect()
+    }
+
+    fn map_labels(&self) -> &[OverlayLabel] {
+        &self.labels
     }
 
     fn apply_fetch_result(&mut self, result: FetchPayload) {
@@ -216,6 +223,14 @@ impl OverlayHandler for SpcDiscussionHandler {
         match fetch.0 {
             Ok(discussions) => {
                 log::info!("Received {} SPC Mesoscale Discussions", discussions.len());
+                // The labels are derived here and nowhere else, so they cannot
+                // fall out of step with the discussions they name — the same
+                // ring filter `clickable_items` applies.
+                self.labels = discussions
+                    .iter()
+                    .filter(|md| !md.polygon.is_empty())
+                    .filter_map(md_label)
+                    .collect();
                 let items = discussions
                     .into_iter()
                     .map(|md| Arc::new(DiscussionItem { md }))
@@ -444,6 +459,60 @@ mod tests {
             handler.content_signature(),
             0,
             "the toggle off must zero the signature — the floor would draw nothing",
+        );
+    }
+
+    /// The labels are derived from the discussions and follow them exactly:
+    /// one per MD that has a ring, none for an MD without one, and the set is
+    /// **replaced** on a refetch rather than appended to.
+    ///
+    /// They used to be rebuilt inside `clickable_items` on every frame, where
+    /// staleness was impossible by construction and paid for at frame rate.
+    /// Precomputing them buys a second copy of the truth, so this is the test
+    /// that the copy tracks: an MD that expired out of the feed must take its
+    /// label with it.
+    #[test]
+    fn the_map_labels_follow_the_discussion_set() {
+        let mut no_ring = md(103);
+        no_ring.polygon = Vec::new();
+        let mut handler = handler_with(vec![md(101), md(102), no_ring]);
+
+        let text: Vec<String> = handler
+            .map_labels()
+            .iter()
+            .map(|l| l.text.clone())
+            .collect();
+        assert_eq!(
+            text,
+            vec!["MD 101".to_string(), "MD 102".to_string()],
+            "an MD with no ring has nowhere to put a label, so it gets none",
+        );
+
+        // The label sits on the first ring's centroid — the only geometry
+        // claim it makes.
+        let ring = &md(101).polygon[0];
+        let n = ring.len() as f64;
+        let label = &handler.map_labels()[0];
+        assert!(
+            (label.lat - ring.iter().map(|&(lat, _)| lat).sum::<f64>() / n).abs() < 1e-9
+                && (label.lon - ring.iter().map(|&(_, lon)| lon).sum::<f64>() / n).abs() < 1e-9,
+            "the label is not on its ring's centroid",
+        );
+
+        // 101 expires; 104 issues.
+        handler.apply_fetch_result(Box::new(SpcDiscussionFetchResult(Ok(vec![
+            md(102),
+            md(104),
+        ]))));
+        let text: Vec<String> = handler
+            .map_labels()
+            .iter()
+            .map(|l| l.text.clone())
+            .collect();
+        assert_eq!(
+            text,
+            vec!["MD 102".to_string(), "MD 104".to_string()],
+            "a refetch must replace the labels, not accumulate them",
         );
     }
 
