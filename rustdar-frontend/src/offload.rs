@@ -234,9 +234,12 @@ impl JobOutput {
 /// What a rasterizing job produces: the RGBA texture, the half-width it was
 /// projected at, and the per-pixel value grid (`NAN` where no gate landed).
 ///
-/// Named fields rather than the renderer's `(Vec<u8>, f64, Vec<f32>)`: the two
-/// buffers are the same shape to a message port, and transposing them would
-/// swap a texture for a value grid somewhere with no type error to catch it.
+/// Named fields, as the renderer's own [`rustdar_radar::render::SweepRender`]
+/// has: the two buffers are the same shape to a message port, and transposing
+/// them would swap a texture for a value grid somewhere with no type error to
+/// catch it. A separate type and not that one because this is what crosses the
+/// port, and the renderer reports one thing more than the port carries — the
+/// sweep's declared Nyquist velocity, dropped in the `From` below.
 ///
 /// The extent is metadata and stays metadata — it says where the pixels *are*,
 /// never how many of them there are. How many there are is the buffer's own

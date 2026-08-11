@@ -73,21 +73,12 @@ mod seq {
         }
     }
 
-    /// Stands in for `rayon::slice::ParallelSlice::par_chunks`.
-    pub trait ParChunksFallback<T> {
-        fn par_chunks<'a>(&'a self, n: usize) -> impl Iterator<Item = &'a [T]>
-        where
-            T: 'a;
-    }
-
-    impl<T> ParChunksFallback<T> for [T] {
-        fn par_chunks<'a>(&'a self, n: usize) -> impl Iterator<Item = &'a [T]>
-        where
-            T: 'a,
-        {
-            self.chunks(n)
-        }
-    }
+    // There is no `par_chunks` stand-in. The crate had exactly one caller —
+    // `render::RenderBuffers::into_output`, reading the value grid while
+    // writing the texture — and that pass now walks the grid mutably so it can
+    // erase the range-folded sentinel it just coloured. A borrowed arm with no
+    // consumer is dead code on wasm32 and a warning under this repo's
+    // `-D warnings` gate, so it stays absent until something wants it.
 
     /// Stands in for `rayon::slice::ParallelSliceMut::par_chunks_mut`.
     pub trait ParChunksMutFallback<T> {
