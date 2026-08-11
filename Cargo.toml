@@ -117,6 +117,13 @@ debug = "line-tables-only"
 # Stepping through this workspace's own crates has to keep working; nobody
 # debugs a dev build by stepping into wgpu.
 #
+# Read that together with `debug` above, which is line tables for the whole
+# graph, workspace crates included: stepping and breakpoints still work here,
+# but inspecting a local is gone with the DWARF that described it. The
+# developer this override exists for is exactly the one who will miss it, so
+# the escape hatch is `RUSTFLAGS=-Cdebuginfo=2 cargo build` for the session
+# that needs variables back.
+#
 # `2` and not `"s"`, because that sentence says debuggability and says nothing
 # about size. `"s"` asks LLVM to give up speed for bytes — a trade this
 # override was never making, since a dependency here is compiled to be *run*

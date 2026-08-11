@@ -39,11 +39,17 @@ jobs:
           #
           # `--release` on every row whose artifact a person can run, and folded
           # into the command that already provides the compile coverage rather
-          # than added as a second one: the row compiles the workspace either
-          # way, so a debug pass for coverage plus a release pass for the upload
-          # would double the wall clock to produce a file one invocation can
-          # write. `--all-targets --all-features` is unchanged, so the coverage
-          # is the same set of crates and the same set of features as before.
+          # than added as a second one. Not for wall clock -- that comes out even,
+          # measured: folding it in is 6:30 cold and 3:25 warm against 6:25 and
+          # 3:27 for a debug coverage pass plus a release `-p rustdar-platform`.
+          # One fat-LTO link is nearly serial, while the 21 here run in parallel.
+          # What folding buys is the other two axes: one profile instead of two
+          # means the dependency graph is compiled once, `target/` is 1.8 GB
+          # instead of 12 GB, and the uploaded file is 27.5 MB instead of 602 MB
+          # on four rows every run. The cost is CPU -- about 3.4x warm, since
+          # 21 test binaries nobody runs are linked under fat LTO.
+          # `--all-targets --all-features` is unchanged, so the coverage is the
+          # same set of crates and the same set of features as before.
           #
           # Until this said `--release`, every desktop download was workspace
           # code at `opt-level = 0` with debug assertions on.
