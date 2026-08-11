@@ -126,22 +126,38 @@ fn a_quarter_kilometre_gate_still_gets_its_own_pixel_at_the_floor() {
 /// What each reach is drawn at, across the whole range of reaches this
 /// display can be handed.
 ///
-/// The floor is the load-bearing row: everything a WSR-88D Doppler cut, a
-/// derived 1° × 1 km grid or a fetched Level III product reaches lands below
-/// 230 km, and every one of them has to project at exactly 230 or the whole
-/// fleet of renders that were correct yesterday move today.
+/// The floor's rows are the load-bearing ones, and what they hold is narrower
+/// than it looks: a derived 1° × 1 km grid and a fetched Level III product land
+/// inside 230 km, and so does every tilt from about 5° up, but a **Doppler cut
+/// does not** — 2.125 + 1192 × 0.25 is 300.125 km, measured identical on eight
+/// sites. The rows below carry the reaches a WSR-88D really produces rather
+/// than the round numbers they used to, because the floor's promise is only
+/// worth what its membership is.
 #[test]
 fn the_extent_is_the_reach_held_between_a_floor_and_a_cap() {
     for (reach, extent, why) in [
         (0.0, BASE_EXTENT_KM, "a product no radial carries"),
         (10.0, BASE_EXTENT_KM, "a 40-gate Level III packet"),
-        (148.0, BASE_EXTENT_KM, "a WSR-88D Doppler cut at 0.25 km"),
+        (208.125, BASE_EXTENT_KM, "KCBW's 5.05° cut, 824 × 0.25 km"),
         (229.9, BASE_EXTENT_KM, "just inside the floor"),
         (230.0, BASE_EXTENT_KM, "exactly the floor"),
         (230.1, 230.1, "just past it — the floor does not round up"),
-        (298.0, 298.0, "WSR-88D Doppler, 1192 × 0.25 km"),
+        (
+            249.125,
+            249.125,
+            "KCBW's 3.96° cut, 988 × 0.25 km — the first tilt past the floor",
+        ),
+        (
+            300.125,
+            300.125,
+            "every WSR-88D Doppler cut: 2.125 + 1192 × 0.25 km",
+        ),
         (417.0, 417.0, "TDWR long-range reflectivity, 1390 × 0.3 km"),
-        (458.0, 458.0, "WSR-88D surveillance, 1832 × 0.25 km"),
+        (
+            460.125,
+            460.125,
+            "WSR-88D surveillance: 2.125 + 1832 × 0.25 km",
+        ),
         (470.0, MAX_EXTENT_KM, "exactly the cap"),
         (12_000.0, MAX_EXTENT_KM, "a mis-framed gate count"),
         (f64::INFINITY, MAX_EXTENT_KM, "an infinite reach"),
@@ -162,18 +178,21 @@ fn the_extent_is_the_reach_held_between_a_floor_and_a_cap() {
 /// workspace passes.
 ///
 /// The first block is the guarantee: at or under the floor the answer is
-/// [`IMAGE_SIZE`] whatever ceiling is offered, so a Doppler cut, a derived
-/// grid and every fetched Level III product are drawn on exactly the raster
-/// they have always been drawn on. The last block is the mechanism the device
-/// gate and the loop policy both use — a ceiling is a ceiling, and one at or
-/// below the base size turns adaptivity off rather than being ignored.
+/// [`IMAGE_SIZE`] whatever ceiling is offered, so a derived 1° × 1 km grid, a
+/// fetched Level III product and every tilt from about 5° up are drawn on
+/// exactly the raster they have always been drawn on. A Doppler cut is **not**
+/// in that block — it reaches 300.125 km — and its rows sit in the second and
+/// third instead, which is where the whole cost of this table lives. The last
+/// block is the mechanism the device gate and the loop policy both use: a
+/// ceiling is a ceiling, and one at or below the base size fixes the side
+/// rather than being ignored.
 #[test]
 fn the_side_follows_the_extent_up_to_the_ceiling_the_caller_owns() {
     const LONG_RANGE: usize = 4096;
     for (extent, ceiling, side, why) in [
         // At and below the floor: the base size, whatever is on offer.
         (0.0, LONG_RANGE, IMAGE_SIZE, "a product no radial carries"),
-        (148.0, LONG_RANGE, IMAGE_SIZE, "a WSR-88D Doppler cut"),
+        (208.125, LONG_RANGE, IMAGE_SIZE, "KCBW's 5.05° cut"),
         (
             BASE_EXTENT_KM,
             LONG_RANGE,
@@ -187,14 +206,23 @@ fn the_side_follows_the_extent_up_to_the_ceiling_the_caller_owns() {
             LONG_RANGE,
             "one tenth of a kilometre past the floor",
         ),
+        (300.125, LONG_RANGE, LONG_RANGE, "a WSR-88D Doppler cut"),
         (417.0, LONG_RANGE, LONG_RANGE, "a TDWR long-range cut"),
-        (458.0, LONG_RANGE, LONG_RANGE, "a WSR-88D surveillance cut"),
-        (MAX_EXTENT_KM, LONG_RANGE, LONG_RANGE, "the cap"),
-        // A ceiling at the base size disables adaptivity outright: this is
-        // what a device whose textures stop at 2048 asks for, and what every
-        // caller with no GPU to consult gets by default.
         (
-            458.0,
+            460.125,
+            LONG_RANGE,
+            LONG_RANGE,
+            "a WSR-88D surveillance cut",
+        ),
+        (MAX_EXTENT_KM, LONG_RANGE, LONG_RANGE, "the cap"),
+        // A ceiling at the base size fixes the side outright: this is what a
+        // browser offers, what a device whose textures stop at 2048 asks for,
+        // and what every caller with no GPU to consult gets by default. The
+        // extent is untouched by it, so these two rows are the same 2048
+        // pixels over 300 and 460 km of ground — see `raster_side_px`.
+        (300.125, IMAGE_SIZE, IMAGE_SIZE, "a Doppler cut on the web"),
+        (
+            460.125,
             IMAGE_SIZE,
             IMAGE_SIZE,
             "the base size as the ceiling",
@@ -209,7 +237,7 @@ fn the_side_follows_the_extent_up_to_the_ceiling_the_caller_owns() {
         // the web's loop frames, which are deliberately leaner than its
         // static renders.
         (BASE_EXTENT_KM, 1024, 1024, "a loop frame on the floor"),
-        (458.0, 1024, 1024, "a loop frame of a surveillance cut"),
+        (460.125, 1024, 1024, "a loop frame of a surveillance cut"),
     ] {
         assert_eq!(
             raster_side_px(extent, ceiling),

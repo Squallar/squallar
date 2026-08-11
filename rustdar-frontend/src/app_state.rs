@@ -131,8 +131,13 @@ pub struct AppState {
     /// pane behind an error the latch swallows. Vulkan guarantees 4096 and iOS
     /// Metal offers 8192, so this is `true` on every desktop and every iPhone;
     /// the case it exists for is an Android GLES device reporting the spec
-    /// floor of 2048, where the answer is a correct 2.24 px/km picture instead
-    /// of nothing.
+    /// floor of 2048, where the answer is a correct picture instead of nothing.
+    ///
+    /// Correct, and coarser than the floor rather than equal to it: the extent
+    /// is the data's on either answer, so such a device draws a Doppler cut's
+    /// ±300.11 km at 3.4121 px/km and a surveillance cut's ±460.11 at 2.2256,
+    /// against the floor's 4.4522. `rustdar_radar::types::raster_side_px` is
+    /// where that trade is argued and measured.
     ///
     /// A `bool` and not the size itself, because the size belongs to the
     /// constants and this is the one bit the *device* has to say. The dispatch

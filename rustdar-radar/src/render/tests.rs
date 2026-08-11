@@ -2103,41 +2103,60 @@ fn a_tdwr_long_range_sweep_takes_the_long_range_raster() {
 /// The floor is 2048 px over 460 km — 4.4522 px/km, or 1.11 pixels across a
 /// 250 m gate — and that figure is what every visual judgement this display
 /// has ever been checked against was made at. Stretching the *base* raster
-/// over a 458 km surveillance cut gives 2.2358 px/km, 0.56 pixels a gate, so
-/// gates start sharing pixels rather than owning them; 4096 px gives 4.4716
-/// and 1.12, which is the floor's own scale to within half a percent.
+/// over a surveillance cut gives 2.2255 px/km, 0.56 pixels a gate, so gates
+/// start sharing pixels rather than owning them; 4096 px gives 4.4510 and
+/// 1.11, which is the floor's own scale to a third of a thousandth.
 ///
 /// The ratio is not flat, and pretending it were would be the wrong claim: the
-/// side steps once at the floor while the extent is continuous, so a 298 km
-/// Doppler cut comes out **finer** than the floor at 6.87 px/km. Finer is
-/// free — the raster costs the same pixels wherever they land — and what
-/// matters is only that it is never much coarser.
+/// side steps once at the floor while the extent is continuous, so a Doppler
+/// cut comes out **finer** than the floor at 6.82 px/km. Finer is free — the
+/// raster costs the same pixels wherever they land — and what matters is only
+/// that it is never much coarser.
 ///
-/// | reach | side | px/km  | vs floor | base raster would be |
-/// |-------|-----:|-------:|---------:|---------------------:|
-/// | 298   | 4096 | 6.8725 |  +54.4 % |               3.4362 |
-/// | 417   | 4096 | 4.9113 |  +10.3 % |               2.4556 |
-/// | 458   | 4096 | 4.4716 |   +0.4 % |               2.2358 |
-/// | 470   | 4096 | 4.3574 |   −2.1 % |               2.1787 |
+/// The rows are the reaches a gate count really produces, first gate included,
+/// rather than the round numbers this table used to carry: a Doppler cut is
+/// 2.125 + 1192 × 0.25 = 300.125 and not 298, a surveillance cut 460.125 and
+/// not 458. The distinction is not cosmetic. At 458 the long-range raster
+/// scores 4.4716 px/km and clears the floor outright; at the 460.125 a radar
+/// actually flies it scores 4.4510 and sits **0.027% under** it, so the claim
+/// this test makes has to be "never meaningfully coarser" with a stated bar,
+/// and `>=` was only ever passing because the input was 2.125 km short.
+///
+/// | reach   | side | px/km  | vs floor | base raster would be |
+/// |---------|-----:|-------:|---------:|---------------------:|
+/// | 300.125 | 4096 | 6.8238 |  +53.3 % |               3.4119 |
+/// | 417     | 4096 | 4.9113 |  +10.3 % |               2.4556 |
+/// | 460.125 | 4096 | 4.4510 |   −0.0 % |               2.2255 |
+/// | 470     | 4096 | 4.3574 |   −2.1 % |               2.1787 |
 ///
 /// The last row is [`types::MAX_EXTENT_KM`], which is a guard on arithmetic
-/// rather than a reach any radar has — the widest real sweep is the 458 km
-/// row — so it is the one place the picture is (slightly) coarser than the
-/// floor, and it is stated rather than excluded.
+/// rather than a reach any radar has — the widest real sweep is the 460.125 km
+/// row — so it is where the picture is furthest under the floor, and it is
+/// stated rather than excluded.
 #[test]
 fn the_long_range_raster_keeps_the_floors_km_per_pixel() {
+    /// How far under the floor a long-range raster may land before "keeps the
+    /// floor's km per pixel" stops being an honest description. The widest
+    /// real sweep is 0.027% under; the arithmetic cap, which no radar reaches,
+    /// is 2.13% under and is asserted separately below.
+    const TOLERANCE: f64 = 0.001;
+
     let floor = types::IMAGE_SIZE as f64 / (2.0 * types::BASE_EXTENT_KM);
     for (extent_km, why) in [
-        (298.0, "a WSR-88D Doppler cut at 1192 gates"),
+        (300.125, "a WSR-88D Doppler cut, 2.125 + 1192 × 0.25 km"),
         (417.0, "a TDWR long-range reflectivity cut"),
-        (458.0, "a WSR-88D surveillance cut"),
+        (
+            460.125,
+            "a WSR-88D surveillance cut, 2.125 + 1832 × 0.25 km",
+        ),
     ] {
         let side = types::raster_side_px(extent_km, LONG_RANGE_SIDE);
         let px_per_km = side as f64 / (2.0 * extent_km);
         assert!(
-            px_per_km >= floor,
-            "{why}: {extent_km} km on {side} px is {px_per_km:.4} px/km, under \
-             the floor's {floor:.4}",
+            px_per_km >= floor * (1.0 - TOLERANCE),
+            "{why}: {extent_km} km on {side} px is {px_per_km:.4} px/km, more \
+             than {:.1}% under the floor's {floor:.4}",
+            TOLERANCE * 100.0,
         );
         // And that the base raster is what it would have been *without* the
         // second number, so the comparison above is against a real
@@ -2154,7 +2173,7 @@ fn the_long_range_raster_keeps_the_floors_km_per_pixel() {
     // The widest real sweep, in the unit that decides whether a gate is drawn
     // or shared: pixels across one 250 m super-resolution gate. The base
     // raster gives it half a pixel; the long-range one gives it its own.
-    const SURVEILLANCE_KM: f64 = 458.0;
+    const SURVEILLANCE_KM: f64 = 460.125;
     const GATE_KM: f64 = 0.25;
     let px_per_gate = |side: usize| side as f64 / (2.0 * SURVEILLANCE_KM) * GATE_KM;
     assert!(
@@ -2168,8 +2187,8 @@ fn the_long_range_raster_keeps_the_floors_km_per_pixel() {
         px_per_gate(LONG_RANGE_SIDE),
     );
 
-    // The cap: the one extent where the long-range raster *is* coarser, by the
-    // 2.1% the table names and no more.
+    // The cap: the extent where the long-range raster is furthest under the
+    // floor, by the 2.1% the table names and no more.
     let at_cap = types::raster_side_px(types::MAX_EXTENT_KM, LONG_RANGE_SIDE) as f64
         / (2.0 * types::MAX_EXTENT_KM);
     assert!(
@@ -2179,6 +2198,220 @@ fn the_long_range_raster_keeps_the_floors_km_per_pixel() {
         types::MAX_EXTENT_KM,
         at_cap / floor,
     );
+}
+
+/// The Doppler half of a WSR-88D split cut, at super-resolution: 1192 gates of
+/// 250 m from a first gate 2.125 km out.
+///
+/// The three numbers are the RDA's, not a guess at them, and they are what
+/// puts this sweep outside [`types::BASE_EXTENT_KM`]'s floor: 2.125 + 1192 ×
+/// 0.25 is 300.125 km. Measured identical on eight sites across three coverage
+/// patterns — KCBW, KESX, KICT, KMPX, KUDX, KCRP, KFTG, KDMX; VCP 35, 212 and
+/// 215 — where it is the geometry of every velocity tilt from the lowest up to
+/// about 3°, and the RDA states the intent itself: those elevation cuts carry
+/// `super_resolution_doppler_to_300km`.
+const DOPPLER_GATES: u16 = 1192;
+/// See [`DOPPLER_GATES`].
+const DOPPLER_GATE_M: u16 = 250;
+/// See [`DOPPLER_GATES`].
+const DOPPLER_FIRST_GATE_M: u16 = 2125;
+
+/// The ground a Doppler cut covers, km: its 300.125 km of beam laid down at
+/// the fixture's own elevation, for the reason [`tdwr_ground_reach_km`] gives.
+fn doppler_ground_reach_km() -> f64 {
+    // Widened before multiplying: 1192 × 250 is 298 000, and the three
+    // constants are the `u16` fields `MomentData` stores them in.
+    let slant_km = (f64::from(DOPPLER_FIRST_GATE_M)
+        + f64::from(DOPPLER_GATES) * f64::from(DOPPLER_GATE_M))
+        / 1000.0;
+    slant_km * f64::from(L2_ELEVATION).to_radians().cos()
+}
+
+/// A filled Doppler cut: every gate of every radial carries a velocity.
+///
+/// Filled rather than the thin ring [`tdwr_long_range_sweep`] paints, because
+/// what is read off this fixture is the scale of the whole picture rather than
+/// where one far return lands, and a filled disc puts a gate under every probe.
+fn wsr88d_doppler_sweep() -> Scan {
+    use nexrad_model::data::{MomentData, PulseWidth, RadialStatus, Sweep, VolumeCoveragePattern};
+
+    let radials = (0..360)
+        .map(|i| {
+            Radial::new(
+                0,
+                i as u16,
+                i as f32,
+                1.0,
+                RadialStatus::IntermediateRadialData,
+                1,
+                L2_ELEVATION,
+                None,
+                Some(MomentData::from_fixed_point(
+                    DOPPLER_GATES,
+                    DOPPLER_FIRST_GATE_M,
+                    DOPPLER_GATE_M,
+                    8,
+                    SCALE,
+                    OFFSET,
+                    vec![200; DOPPLER_GATES as usize],
+                )),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        })
+        .collect();
+    Scan::new(
+        VolumeCoveragePattern::new(
+            212,
+            0,
+            0.5,
+            PulseWidth::Short,
+            false,
+            0,
+            false,
+            0,
+            false,
+            false,
+            0,
+            false,
+            false,
+            Vec::new(),
+        ),
+        vec![Sweep::new(1, radials)],
+    )
+}
+
+/// A ceiling at the base size draws a Doppler cut's extra ground and pays for
+/// it in scale. This is where that costing is written down.
+///
+/// It is the case the floor's guarantee does *not* cover, and it is not a
+/// corner: a Doppler cut reaches 300.125 km, so every velocity tilt below about
+/// 3° is in it. A browser is always in it — 2048 is the largest texture WebGL2
+/// guarantees — and so is a GLES 3.0 handheld that fails
+/// `AppState::long_range_raster_ok`.
+///
+/// **The two ceilings declare the same extent**, and that is the first
+/// assertion because it is the decision the rest follows from: how much ground
+/// a picture shows is a fact about the data, and only how finely it is sampled
+/// is a fact about the device. A raster whose extent moved with the machine
+/// would put the same volume's echo in two places, and a loop frame — which
+/// takes a leaner ceiling on purpose — would crop the still frame it replaces
+/// rather than merely softening it.
+///
+/// **What it costs**: 3.412 px/km against the long-range arm's 6.824, which is
+/// 23.4% under the floor's 4.4522, and 0.853 pixels across a 250 m gate where
+/// the floor gives 1.113.
+///
+/// **What it buys**, and why the trade goes this way rather than holding these
+/// devices at the floor's extent: over 192 Doppler sweeps of the eight sites
+/// [`DOPPLER_GATES`] names, the band from 230 km out to 300 km holds 448 690
+/// gates carrying a velocity — 1.68% of that band's own bins, the rest being
+/// below threshold, but 3.4% of all the velocity those sweeps hold. Sparse and
+/// real. Holding the floor would trade a picture that is uniformly softer for
+/// one missing its outer third.
+///
+/// **What keeps that affordable** is the last block: two pixels per kilometre
+/// is where a 250 m gate stops landing in a pixel at all
+/// (`a_quarter_kilometre_gate_still_gets_its_own_pixel_at_the_floor`), and the
+/// base-size arm clears it at every extent this display can be handed — down to
+/// 2.1787 px/km at [`types::MAX_EXTENT_KM`], which is 8.9% of margin and the
+/// reason that cap cannot quietly rise.
+#[test]
+fn a_base_size_ceiling_pays_for_the_extra_ground_in_scale() {
+    let scan = wsr88d_doppler_sweep();
+    let render_at = |ceiling| {
+        render_radar_to_image_full_sized(
+            &scan,
+            L2_ELEVATION,
+            types::RadarProduct::Velocity,
+            LAT,
+            LON,
+            None,
+            None,
+            &crate::nyquist::DeclaredNyquist::empty(),
+            ceiling,
+        )
+        .expect("the fixture renders")
+    };
+    let lean = render_at(types::IMAGE_SIZE);
+    let wide = render_at(LONG_RANGE_SIDE);
+
+    assert_eq!(
+        lean.max_range_km, wide.max_range_km,
+        "a device's texture ceiling moved how much ground the picture shows",
+    );
+    let extent_km = lean.max_range_km;
+    assert!(
+        (extent_km - doppler_ground_reach_km()).abs() < 1e-9,
+        "1192 gates of 0.25 km from 2.125 km out cover {:.4} km of ground; the \
+         render declares {extent_km}",
+        doppler_ground_reach_km(),
+    );
+    assert!(
+        extent_km > types::BASE_EXTENT_KM,
+        "a Doppler cut stopping at {extent_km:.2} km would be inside the floor, \
+         and this whole test would be measuring the floor's own render",
+    );
+
+    assert_eq!(lean.image.len(), types::IMAGE_SIZE * types::IMAGE_SIZE * 4);
+    assert_eq!(wide.image.len(), LONG_RANGE_SIDE * LONG_RANGE_SIDE * 4);
+
+    let floor = types::IMAGE_SIZE as f64 / (2.0 * types::BASE_EXTENT_KM);
+    let px_per_km = |side: usize| side as f64 / (2.0 * extent_km);
+    for (side, expected, what) in [
+        (types::IMAGE_SIZE, 3.412, "a base-size ceiling"),
+        (LONG_RANGE_SIDE, 6.824, "a long-range ceiling"),
+    ] {
+        assert!(
+            (px_per_km(side) - expected).abs() < 1e-3,
+            "{what}: {:.4} px/km, not the {expected} written down",
+            px_per_km(side),
+        );
+    }
+    assert!(
+        (px_per_km(types::IMAGE_SIZE) / floor - 0.7664).abs() < 1e-3,
+        "the base-size arm is {:.4} of the floor's {floor:.4} px/km — 0.7664 is \
+         written down, and it is the entire cost of this trade",
+        px_per_km(types::IMAGE_SIZE) / floor,
+    );
+
+    // The ground the wider frame bought is carrying data, or the paragraph
+    // above is arguing about an empty annulus: a gate 290 km out paints, and on
+    // the floor's 230 km frame it would not be on the picture at all.
+    const FAR_KM: f64 = 290.0;
+    for az in [0.0, 90.0, 180.0, 270.0] {
+        let at = probe_at(extent_km, types::IMAGE_SIZE, az, FAR_KM);
+        assert!(
+            !lean.values[at].is_nan(),
+            "a gate {FAR_KM} km out at {az}° is unpainted on the base-size \
+             raster, {:.0} km past the floor this render is here to be outside",
+            FAR_KM - types::BASE_EXTENT_KM,
+        );
+    }
+
+    // The margin the trade runs on, at every extent a base-size ceiling can be
+    // handed: the widest sweep a radar flies, and the arithmetic guard past it.
+    const RESOLUTION_LINE: f64 = 2.0;
+    for (extent, expected, why) in [
+        (extent_km, 3.412, "this Doppler cut"),
+        (460.125, 2.2255, "a WSR-88D surveillance cut"),
+        (types::MAX_EXTENT_KM, 2.1787, "the arithmetic cap"),
+    ] {
+        let side = types::raster_side_px(extent, types::IMAGE_SIZE);
+        let scale = side as f64 / (2.0 * extent);
+        assert!(
+            (scale - expected).abs() < 1e-3,
+            "{why} on a base-size ceiling is {scale:.4} px/km, not {expected}",
+        );
+        assert!(
+            scale > RESOLUTION_LINE,
+            "{why} is {scale:.4} px/km, under the {RESOLUTION_LINE} px/km a \
+             250 m gate needs to land in a pixel of its own",
+        );
+    }
 }
 
 /// A ceiling *under* the base size is honoured, which is how the browser's

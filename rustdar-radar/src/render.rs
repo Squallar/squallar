@@ -23,10 +23,12 @@ struct MercatorProjection {
     /// The image's scale, pixels per kilometre east-west at the site.
     ///
     /// A field rather than a constant because both of the quantities behind it
-    /// are per render now. It stays close to 4.45 px/km on purpose — 2048 over
-    /// the 230 km floor, 4096 over a 458 km surveillance cut (4.47) or a TDWR's
-    /// 417 km long-range reflectivity (4.91) — and drops to 2.24 only where the
-    /// caller's ceiling stopped the side from following the extent.
+    /// are per render now. Where the caller's ceiling is above the base size it
+    /// stays close to 4.45 px/km on purpose — 2048 over the 230 km floor, 4096
+    /// over a 460.11 km surveillance cut (4.45) or a TDWR's 417 km long-range
+    /// reflectivity (4.91). Where the ceiling *is* the base size it is the
+    /// extent alone that moves it, so the same sweeps read 2.23 and 2.46, and a
+    /// Doppler cut 3.41; [`types::raster_side_px`] is where that is argued.
     px_per_km: f64,
     /// The half-width this raster covers, km — [`types::plan_view_extent_km`]
     /// of the sweep's own reach.

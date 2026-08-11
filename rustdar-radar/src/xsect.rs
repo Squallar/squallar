@@ -93,9 +93,12 @@
 //! constant, and that changes nothing here: the disagreement was a *ratio* of
 //! two spheres, so closing it closes it at every extent a sweep can ask for.
 //! It would have been scale-free even unclosed — the raster's side follows its
-//! extent ([`crate::types::raster_side_px`]), so 4.45 px/km at the 230 km floor
-//! against 4.47 at a surveillance cut's 458 km on 4096, and a fixed fraction of
-//! a kilometre costs the same pixel on either frame.
+//! extent ([`crate::types::raster_side_px`]), so 4.4522 px/km at the 230 km
+//! floor against 4.4512 at a surveillance cut's ±460.11 km on 4096, and a fixed
+//! fraction of a kilometre costs the same pixel on either frame: the seam was
+//! 1.15 px on both. (That reach is 2.125 + 1832 × 0.25 = 460.125 km of slant
+//! range; the 458 km this paragraph used to quote omitted the first gate and is
+//! a figure no volume produces.)
 //!
 //! # Drawn to the line, where a plan view is drawn to the data
 //!

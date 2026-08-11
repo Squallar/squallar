@@ -33,24 +33,31 @@ pub const RENDER_HEIGHT: u32 = 1080;
 /// | mobile  |                2048 |       4096 | yes      |
 /// | desktop |                2048 |       4096 | yes      |
 ///
-/// 4096 is what keeps the scale still: 4096 over a 458 km surveillance cut is
-/// 4.47 px/km against the floor's 4.45, so a long-range sweep is the same
-/// picture over more of the world rather than a coarser one. A base-size raster
-/// stretched over 458 km would be 2.24 px/km — below the two-pixels-per-gate
-/// line a 250 m gate needs to land in a pixel of its own.
+/// 4096 is what keeps the scale still: 4096 over the 460.11 km a surveillance
+/// cut actually covers is 4.4512 px/km against the floor's 4.4522, so a
+/// long-range sweep is the same picture over more of the world rather than a
+/// coarser one. A base-size raster stretched over the same ground is 2.2256
+/// px/km — half a pixel per 250 m gate, where the floor gives it 1.11.
 ///
 /// **The web arm is not adaptive, and cannot be.** 2048 is the largest 2D
 /// texture WebGL2 guarantees ([`rustdar_radar::types::WEBGL2_MAX_TEXTURE_DIMENSION_2D`]),
 /// wgpu's WebGPU backend is not used here, and a browser that refused a 4096
 /// texture would leave a blank pane rather than a coarse one. So the web ceiling
-/// *is* the base size, which makes [`rustdar_radar::types::raster_side_px`] inert
-/// there — the long-range branch exists but can never choose anything else.
+/// *is* the base size, and [`rustdar_radar::types::raster_side_px`] can never
+/// answer anything else there.
+///
+/// **That makes the browser's raster size inert, not its pictures.** The extent
+/// is the data's on every target, so a browser draws a 1192-gate Doppler cut
+/// over the same ±300.11 km a desktop does, on a quarter of the pixels: 3.4121
+/// px/km against 6.8241, and 23.4% under the floor's own scale. The trade is
+/// deliberate and `raster_side_px`'s doc is where it is argued and measured;
+/// what matters here is that the web class is the one that always pays it.
 ///
 /// Native's ceiling is checked against the device rather than assumed: see
 /// `AppState::long_range_raster_ok`. Vulkan guarantees 4096 and iOS Metal 8192,
 /// but the GLES 3.0 floor is 2048, so an Android handheld is the one class where
-/// the gate can fail — and it degrades to the base size, which is a correct
-/// picture, not a failed texture.
+/// the gate can fail — and it degrades to the base size, joining the browser in
+/// that same trade, which is a correct picture rather than a failed texture.
 ///
 /// # What it costs, measured
 ///

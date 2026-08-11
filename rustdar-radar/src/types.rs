@@ -69,25 +69,48 @@ pub const IMAGE_SIZE: usize = WASM_IMAGE_SIZE;
 pub const IMAGE_SIZE: usize = NATIVE_IMAGE_SIZE;
 
 /// The half-width a plan view is projected at when the data does not reach
-/// further, km — and so the extent of nearly every render this display makes.
+/// further, km.
 ///
 /// 230 km is the WSR-88D's nominal unambiguous range and the extent this
 /// rasterizer was fixed at for its whole life. It is kept as the **floor**
-/// rather than as the extent so that every sweep whose data stops inside it —
-/// which is every Doppler cut of a split cut, every derived 1° × 1 km grid,
-/// and every Level III product this display fetches — projects at exactly the
-/// scale it always did, pixel for pixel.
+/// rather than as the extent so that a sweep whose data stops inside it
+/// projects at exactly the scale it always did, pixel for pixel;
+/// `a_render_inside_the_floor_ignores_the_long_range_ceiling_entirely` pins
+/// that bit for bit, image and value grid both.
+///
+/// # Which sweeps those are, measured
+///
+/// **Not a Doppler cut.** A split cut's Doppler half carries 1192 gates of
+/// 0.25 km from a first gate 2.125 km out — 300.125 km of slant range, ±300.11
+/// on the ground at half a degree — and the RDA states the intent in the volume
+/// coverage pattern itself, where those elevation cuts carry
+/// `super_resolution_doppler_to_300km`. Identical on eight sites across three
+/// patterns (KCBW, KESX, KICT, KMPX, KUDX, KCRP, KFTG, KDMX; VCP 35, 212, 215):
+/// the 1192-gate geometry is every velocity tilt from the lowest up to about
+/// 3°, and the surveillance halves beside them are 1832 gates — 460.125 km
+/// slant, ±460.11 on the ground.
+///
+/// What does stop inside the floor is the volume's **upper** half and the
+/// products that are not a tilt: the first cut whose data ends short of 230 km
+/// is the one near 5° (208.1 km at KCBW, 197.1 at KESX, 210.1 at KCRP), every
+/// tilt above it is shorter again, and every derived 1° × 1 km grid and every
+/// Level III product this display fetches is well inside.
+///
+/// So the floor is the extent of every render with nothing further to say, not
+/// the extent of most of them. [`raster_side_px`] carries what the sweeps that
+/// do reach further cost, which on a device whose textures stop at the base
+/// size is not nothing.
 pub const BASE_EXTENT_KM: f64 = 230.0;
 
 /// The furthest half-width a plan view will project at, km.
 ///
 /// Not a range any radar reaches: the longest real reach in this display is a
-/// WSR-88D surveillance cut at 1832 × 0.25 km = 458 km, and a TDWR's
+/// WSR-88D surveillance cut at 2.125 + 1832 × 0.25 = 460.125 km, and a TDWR's
 /// long-range reflectivity is 1390 × 0.3 km = 417 km. It is a ceiling on
 /// *arithmetic*, because the extent is now derived from a gate count that
 /// arrives over the wire: a mis-framed radial claiming sixty thousand gates
 /// would otherwise zoom the whole display out to a continent. 470 km clears
-/// the widest honest sweep by 12 km and turns every impossible one into a
+/// the widest honest sweep by 9.9 km and turns every impossible one into a
 /// render that is merely too coarse.
 pub const MAX_EXTENT_KM: f64 = 470.0;
 
@@ -117,12 +140,57 @@ pub fn plan_view_extent_km(data_reach_km: f64) -> f64 {
 /// largest side this caller can accept.
 ///
 /// [`plan_view_extent_km`] decides how much *ground* a raster covers;
-/// this decides how finely that ground is sampled. Splitting the two is what
-/// keeps the display's scale from moving: at the floor the answer is
-/// [`IMAGE_SIZE`], so a 230 km sweep is the same 4.45 px/km it has always been,
-/// and past the floor the extra ground buys extra pixels rather than coarser
-/// ones — 4096 across a 458 km surveillance cut is 4.47 px/km, the same picture
-/// over more of the world.
+/// this decides how finely that ground is sampled. The split is on purpose and
+/// it is the answer to two different questions: **how much ground a picture
+/// shows is a fact about the data, and how finely it is sampled is a fact about
+/// the device.** A picture whose ground moved with the machine looking at it
+/// would put the same volume's echo in two places — [`ImageBounds`] takes the
+/// extent as an argument precisely so a raster and its corners cannot disagree
+/// — and a loop frame, which renders leaner on purpose, would crop the pane it
+/// is playing in rather than merely softening it.
+///
+/// At the floor the answer is [`IMAGE_SIZE`], so a 230 km sweep is the same
+/// 4.4522 px/km it has always been. Past it, whether the extra ground is free
+/// depends entirely on the ceiling on offer.
+///
+/// # What each ceiling buys, measured
+///
+/// A real KDMX 0.53° cut (2022-03-05 23:23), rendered through this crate:
+///
+/// | sweep                          | extent    | 4096 ceiling | 2048 ceiling |
+/// |--------------------------------|----------:|-------------:|-------------:|
+/// | velocity, 1192 gates of 0.25 km| ±300.11 km|  6.8241 px/km|  3.4121 px/km|
+/// | reflectivity, 1832 gates       | ±460.11 km|  4.4512 px/km|  2.2256 px/km|
+///
+/// Against the floor's 4.4522 px/km, a 4096 ceiling is where the second number
+/// pays for itself: the Doppler cut comes out **finer** than the floor and the
+/// surveillance cut lands 0.022% under it, which is the same picture over 1.7×
+/// and 4.0× the ground.
+///
+/// # What a ceiling at the base size does instead, and why that is accepted
+///
+/// A ceiling of [`IMAGE_SIZE`] cannot buy pixels, so the wider frame is paid
+/// for in scale: that Doppler cut is 3.4121 px/km, **23.4% coarser** than the
+/// floor, and a 0.25 km gate goes from 1.11 pixels of its own to 0.85 of one.
+/// Two callers are in that case — a browser, where 2048 is the largest texture
+/// WebGL2 guarantees, and a GLES 3.0 handheld reporting the spec floor.
+///
+/// It is a real cost and it is taken deliberately, because the alternative is
+/// worse than it looks. Holding those devices at the floor's scale means
+/// holding them at the floor's *extent*, and that trades a picture that is
+/// uniformly softer for one that is missing its outer third — on a Doppler cut,
+/// everything from 230 km to 300 km, which over 192 sweeps of the eight sites
+/// above is 448 690 gates carrying a velocity, 3.4% of all the velocity those
+/// sweeps hold. It would also make a pane's ground coverage depend on which
+/// machine opened the file, and make a loop frame narrower than the still frame
+/// it replaces.
+///
+/// What is guaranteed instead is that the base-size arm stays inside the
+/// display's own resolution line: the widest sweep a radar flies is 2.2256
+/// px/km there and even [`MAX_EXTENT_KM`]'s arithmetic guard is 2.1787, both
+/// past the two-pixels-per-kilometre mark below which a 250 m gate stops
+/// landing in a pixel at all. `a_base_size_ceiling_pays_for_the_extra_ground_
+/// in_scale` is where that is pinned, on a 1192-gate Doppler cut.
 ///
 /// # Why the ceiling is an argument
 ///
@@ -146,10 +214,13 @@ pub fn plan_view_extent_km(data_reach_km: f64) -> f64 {
 /// caller that says 4096 gets the floor's own size until there is ground to
 /// spend it on.
 ///
-/// Passing exactly [`IMAGE_SIZE`] therefore turns adaptivity off, which is the
-/// device gate's whole mechanism: a machine that cannot take the long-range
-/// raster asks for the base one and gets a correct, merely coarser picture,
-/// rather than a texture creation that fails and leaves a blank pane.
+/// Passing exactly [`IMAGE_SIZE`] therefore fixes the raster's side for every
+/// extent, which is the device gate's whole mechanism: a machine that cannot
+/// take the long-range texture asks for the base one and gets a correct
+/// picture rather than a texture creation that fails and leaves a blank pane.
+/// It is the *side* that stops moving, not the picture — the extent is the
+/// data's either way, so what that caller receives is the section above's
+/// coarser frame over the same ground, not the floor's frame.
 pub fn raster_side_px(extent_km: f64, side_ceiling_px: usize) -> usize {
     if extent_km > BASE_EXTENT_KM {
         side_ceiling_px

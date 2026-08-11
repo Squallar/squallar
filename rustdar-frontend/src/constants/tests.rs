@@ -974,9 +974,11 @@ fn the_web_image_fits_the_texture_size_webgl2_guarantees() {
     // was a policy resting on a misreading of the limit.
     assert_eq!(WASM_IMAGE_SIZE as u32, guaranteed);
     // Which is also why the web arm's long-range ceiling has to *be* the
-    // guarantee: there is nothing above it to grow into, so
-    // `raster_side_px` is inert on the web and every browser render is
-    // exactly the size every browser must accept.
+    // guarantee: there is nothing above it to grow into, so `raster_side_px`
+    // answers one size on the web and every browser render is exactly the size
+    // every browser must accept. Inert in the *side* only — the extent is the
+    // data's on every target, so a browser draws a 300.11 km Doppler cut on
+    // these 2048 pixels at 3.4121 px/km rather than the floor's 4.4522.
     assert_eq!(
         WASM_LONG_RANGE_IMAGE_SIZE as u32, guaranteed,
         "the web long-range ceiling is over what WebGL2 guarantees, so a \
