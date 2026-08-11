@@ -36,7 +36,16 @@ rayon = "=1.12.0"
 # `into_iter` without). A super-res volume is 50–130 independently compressed
 # records, so the granularity is nearly perfect, and the feature changes only
 # *where* the records are decoded — the map is order-preserving and the results
-# are recombined in record order either way, so the `Scan` is identical.
+# are recombined in record order either way, so a successful decode yields an
+# identical `Scan`.
+#
+# One asymmetry, stated because "identical" would otherwise overclaim it:
+# upstream collects into a `Result` under rayon, and rayon keeps whichever error
+# a worker reaches first rather than the first in record order. A volume with
+# more than one malformed record can therefore surface a different error variant
+# than the serial arm. Immaterial while this path is tests-only on
+# single-record fixtures, and worth remembering if `scan::decoded` is ever
+# parallelised the same way — there the errors want folding in record order.
 #
 # Target-gated for rayon's reason, not its own: the feature's only effect is to
 # pull rayon in, and rayon cannot build a pool in the browser.

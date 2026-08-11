@@ -1296,15 +1296,35 @@ fn detect_melting_layer_finds_the_wet_snow_ring() {
 /// lands on, bit for bit.**
 ///
 /// [`compute_hca`] maps each radial to a row and keeps `combined`'s order, so
-/// there is nothing to reassociate; [`detect_melting_layer`] maps each radial
-/// to the heights it votes for and then *adds the votes serially*, because
-/// `weight` is a float accumulator that several radials of a sweep write to and
-/// `+=` over floats is not associative. Turning either into a parallel
-/// reduction would still pass every other test in this module — they assert
-/// ranges and classes, and a last-bit difference in an accumulator is invisible
-/// to all of them — so this compares the exact bits against a one-thread pool
-/// and against repeat runs.
+/// there is nothing to reassociate; [`detect_melting_layer`] maps each radial to
+/// the heights it votes for and then *adds the votes serially*, because `weight`
+/// is a float accumulator several radials of a sweep write to.
+///
+/// Be precise about how much that last one currently buys: `elev_weight` is
+/// bound once per sweep, outside the radial loop, so every addend into a given
+/// `weight[az][h]` within a sweep is the identical `1.0 + elev_weight`, and
+/// summing identical values is permutation-invariant. Order cannot move a bit
+/// today. The serial replay is kept because it costs nothing and becomes
+/// load-bearing the moment `elev_weight` varies per radial — not because a
+/// reassociation hazard exists right now.
+///
+/// Turning either into a parallel reduction would still pass every other test
+/// in this module — they assert ranges and classes, and a last-bit difference in
+/// an accumulator is invisible to all of them — so this compares the exact bits
+/// against a one-thread pool and against repeat runs.
+///
+/// Know what that catches and what it does not. A one-thread pool runs this
+/// same map-collect-replay code, so it can observe a genuine race and nothing
+/// about the restructure: reversing the replay order passes here. What pins the
+/// order is the pre-existing behavioural suite — `a_rain_field_below_the_layer_`
+/// `classifies_ra_end_to_end` and its neighbours. `voxel/tests.rs` needed a
+/// restated serial loop for exactly this reason; the difference is that there
+/// the serial loop is *gone*, whereas here `combined`'s order is still the
+/// thing the surrounding tests assert against.
+// See the note in `voxel/tests.rs`: named rather than module-gated, so the rest
+// of this module keeps being type-checked for wasm32.
 #[test]
+#[cfg(not(target_arch = "wasm32"))]
 fn the_pool_classifies_a_volume_the_way_one_thread_does() {
     assert!(
         rayon::current_num_threads() > 1,

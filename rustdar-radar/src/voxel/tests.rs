@@ -3519,6 +3519,7 @@ fn coverage_is_exactly_whether_the_index_is_the_no_data_one() {
 /// nothing" is to still have the loop it replaced. Native products only — the
 /// derivation seam is not what this is about, and `Prepared::Native` is a
 /// borrow of the scan the sampler would have taken anyway.
+#[cfg(not(target_arch = "wasm32"))]
 fn serial_reference_grid(
     scan: &Scan,
     req: &VoxelRequest,
@@ -3592,7 +3593,12 @@ fn serial_reference_grid(
 /// Both shapes have three different axes, so a task that indexed a transposed
 /// row cannot pass by accident, and both products are checked because the value
 /// plane is compared bit for bit and only a signed one exercises its sign.
+// Named rather than gating the whole module the way `render.rs` does: this is
+// the only test in `voxel` that reaches for `rayon` by name, and a module-wide
+// gate would stop type-checking the other ~600 against wasm32, which is the arm
+// that compiles `par.rs`'s sequential stand-ins.
 #[test]
+#[cfg(not(target_arch = "wasm32"))]
 fn the_rows_build_the_grid_the_one_buffer_serial_loop_built() {
     assert!(
         rayon::current_num_threads() > 1,
