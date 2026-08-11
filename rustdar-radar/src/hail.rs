@@ -207,7 +207,23 @@ pub fn refl_weight(dbz: f64) -> f64 {
 
 /// Ė: the hail kinetic energy flux of Eq. 4, J m⁻² s⁻¹, `W(Z)` included —
 /// zero at or below 40 dBZ.
+///
+/// The ramp is tested **before** the exponential rather than multiplied in
+/// after it. `W(Z)` is exactly zero at or below [`HKE_REF_WGT_LOW_DBZ`], and a
+/// volume is overwhelmingly below it: over five archived volumes chosen for
+/// their spread — KDMX 2022-03-05 (severe), KFTG 2023-06-22, KCRP 2017-08-26
+/// (Harvey's landfall), KMSX 2022-06-04, KLWX 2018-03-02 — the fraction of the
+/// column integral's cells above 40 dBZ runs **11.5 % down to 0.0 %**. So the
+/// unconditional form spent nine to ten `powf`s in every ten to reach a product
+/// it had already decided was zero.
+///
+/// The two forms return the same bits: for `dbz ≤ 40` the old one is
+/// `positive × 0.0`, which is `+0.0`; `NaN` fails the comparison and falls
+/// through to the same arithmetic it always did.
 pub fn hail_kinetic_energy_flux(dbz: f64) -> f64 {
+    if dbz <= HKE_REF_WGT_LOW_DBZ {
+        return 0.0;
+    }
     HKE_FLUX_COEF * 10f64.powf(HKE_FLUX_EXP_PER_DBZ * dbz) * refl_weight(dbz)
 }
 
