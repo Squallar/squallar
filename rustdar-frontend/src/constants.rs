@@ -231,10 +231,14 @@ pub const DESKTOP_LOOP_TEXTURE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 /// The two loop kinds above hold more frames than they texture
 /// ([`MAX_LOOP_FRAMES`] against [`MAX_LOOP_RENDER_BUDGET`]) and re-render as
 /// the playhead walks back into a window it had left. That treadmill does not
-/// close here: re-entering a resident 3D window costs ~140 ms (89 ms resample,
-/// 51 ms upload) against the 200 ms interval at [`DEFAULT_LOOP_SPEED_FPS`] and
-/// 33 ms at [`MAX_LOOP_SPEED_FPS`]. So [`MAX_LOOP_VOLUME_FRAMES`] is both
-/// numbers at once, and `the_3d_loop_holds_exactly_what_it_marches` pins it.
+/// close here: re-entering a resident 3D window costs ~99 ms — 89 ms of
+/// resample, plus the ~10 ms the upload's CPU pass now takes on the frame
+/// thread (it was ~94 ms of upload; see [`MAX_LOOP_VOLUME_BUILDS_PER_FRAME`]
+/// for what moved) — against the 200 ms interval at [`DEFAULT_LOOP_SPEED_FPS`]
+/// and 33 ms at [`MAX_LOOP_SPEED_FPS`]. The resample alone settles it at both
+/// speeds, so the conclusion is the one it always was and does not rest on the
+/// upload figure. [`MAX_LOOP_VOLUME_FRAMES`] is therefore both numbers at once,
+/// and `the_3d_loop_holds_exactly_what_it_marches` pins it.
 ///
 /// # Why once for the application rather than once per pane
 ///
@@ -341,8 +345,24 @@ pub const DESKTOP_MAX_LOOP_VOLUME_FRAMES: usize = 13;
 /// reason and at the same value: building a loop frame's grid needs a
 /// whole-volume payload, and `RenderInput::extract_volume_parts` runs on the
 /// frame thread because the job wire carries a `RenderInput`, not a `Scan`, and
-/// on wasm the volume is only reachable from the main thread. The resample
-/// (~89 ms) and the upload (~51 ms) are both off it.
+/// on wasm the volume is only reachable from the main thread.
+///
+/// The resample (~89 ms) is off the frame thread — it is the offload job's
+/// whole body. **The upload is not**, and saying it was is what let a CPU pass
+/// over 8 MiB of index bytes sit in `egui_wgpu::CallbackTrait::prepare`
+/// unexamined. `volume::raymarch::upload_volume` runs there, on the frame
+/// thread, once per grid that becomes resident — which under this constant is
+/// once per frame while a loop set fills.
+///
+/// What it costs there, desktop shape, best of seven: the texel widening was
+/// **58.1 ms** and is **10.0 ms** since it became a table lookup, and the
+/// coarse level was **35.9 ms** on top and is now **5.9 ms** when it is built
+/// at all — which at the default 460 km box is never (see
+/// `volume::raymarch::CoarseLevel`). So the number this comment should have
+/// been claiming, ~94 ms, is ~10 ms, and it is still on the frame thread. The
+/// honest fix is to widen the plane inside the offload job that already builds
+/// the grid; the reason not to is wasm, where that pushes 32 MiB over the
+/// worker message port instead of 8 MiB.
 ///
 /// One per frame means a full desktop set of 13 is dispatched over 13 frames —
 /// under a quarter of a second at 60 fps — and every grid that lands is shown
