@@ -153,11 +153,13 @@ fn override_for(product: RadarProduct) -> Option<(f32, f32)> {
     (product == RadarProduct::StormRelativeVelocity).then_some((30.0, 240.0))
 }
 
-/// The environmental heights a hail render carries — only the hail pair
-/// reads them, and without a pair those products render nothing at all.
-/// 2 / 4 km MSL sits the fixture's strong low tilt across the ramp.
+/// The environmental heights a render carries, for the products
+/// [`RadarProduct::reads_env_heights`] names — the hail pair, which renders
+/// nothing at all without them, and the hybrid classification, which would
+/// otherwise fall back to the adaptation defaults. 2 / 4 km MSL sits the
+/// fixture's strong low tilt across the ramp.
 fn env_for(product: RadarProduct) -> Option<(f64, f64)> {
-    reads_env_heights(product).then_some((2.0, 4.0))
+    product.reads_env_heights().then_some((2.0, 4.0))
 }
 
 /// The acceptance criterion for moving rasterization into a worker: the

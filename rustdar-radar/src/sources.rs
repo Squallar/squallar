@@ -93,7 +93,8 @@ pub struct DataSources {
     /// Iowa Environmental Mesonet: current ASOS/METAR observations.
     pub iem_base: Source,
     /// Open-Meteo forecast API: environmental sounding heights (0 °C and
-    /// −20 °C levels) per radar site, for the hail products. See
+    /// −20 °C levels) per radar site, for the products
+    /// [`crate::types::RadarProduct::reads_env_heights`] names. See
     /// [`crate::sounding`].
     pub sounding_base: Source,
     /// `false` in production: IEM answers `OPTIONS` with `405`, so a

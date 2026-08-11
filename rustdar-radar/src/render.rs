@@ -785,9 +785,13 @@ pub fn render_from(input: &crate::render_input::RenderInput) -> Option<(Vec<u8>,
 /// motion override, in knots and degrees-from — read by storm-relative
 /// velocity alone; `None` is "no override" and SRV applies the Bunkers
 /// right-mover from the volume's own wind profile ([`crate::srv`]) — and
-/// the environmental 0 °C / −20 °C heights in km MSL, read by the hail pair
-/// alone; `None` there means the hail field is undefined and renders
-/// nothing ([`crate::hail`]).
+/// the environmental 0 °C / −20 °C heights in km MSL, read by the products
+/// [`types::RadarProduct::reads_env_heights`] names: the hail pair, whose
+/// field is undefined without them so `None` renders nothing
+/// ([`crate::hail`]), and the hybrid classification, which answers `None` by
+/// falling back to the operational adaptation defaults and so draws a
+/// *different* picture rather than no picture ([`render_hhc_to_image`], 30
+/// lines below).
 ///
 /// The environmental wind profile NROT's and SRV's dealiasers seed from is
 /// not a parameter: it is fit from the volume's own velocity tilts

@@ -833,3 +833,131 @@ fn the_render_paths_site_height_is_the_feedhorn() {
         "the ground under the tower is not the datum a beam height is above",
     );
 }
+
+/// Gates per dual-pol radial in [`dual_pol_tilt`]: 400 × 250 m from 125 m
+/// reaches 100 km, far enough that a 0.5° beam climbs through either
+/// candidate melting layer.
+const D_GATES: usize = 400;
+
+fn dp_moment8(scale: f32, offset: f32, v: f64) -> nexrad_model::data::MomentData {
+    let raw = ((v * f64::from(scale) + f64::from(offset)).round() as u16) as u8;
+    nexrad_model::data::MomentData::from_fixed_point(
+        D_GATES as u16,
+        125,
+        250,
+        8,
+        scale,
+        offset,
+        vec![raw; D_GATES],
+    )
+}
+
+fn dp_moment16(
+    scale: f32,
+    offset: f32,
+    at: &dyn Fn(usize) -> f64,
+) -> nexrad_model::data::MomentData {
+    let mut bytes = Vec::with_capacity(D_GATES * 2);
+    for i in 0..D_GATES {
+        let raw = (at(i) * f64::from(scale) + f64::from(offset)).round() as u16;
+        bytes.extend_from_slice(&raw.to_be_bytes());
+    }
+    nexrad_model::data::MomentData::from_fixed_point(
+        D_GATES as u16,
+        125,
+        250,
+        16,
+        scale,
+        offset,
+        bytes,
+    )
+}
+
+/// One 360-radial dual-pol tilt of uniform light rain — 30 dBZ, 1 dB ZDR,
+/// 0.99 ρHV, a gently ramping ΦDP. Uniform on purpose: whatever class the
+/// classifier reaches, it reaches for the whole disc, so a change of class
+/// is unmistakably the environment's doing and not a gate-to-gate texture.
+fn dual_pol_tilt(number: u8, elev: f32) -> nexrad_model::data::Sweep {
+    let radials = (0..360)
+        .map(|k| {
+            Radial::new(
+                0,
+                k as u16,
+                k as f32 + 0.5,
+                1.0,
+                nexrad_model::data::RadialStatus::IntermediateRadialData,
+                number,
+                elev,
+                Some(dp_moment8(2.0, 66.0, 30.0)),
+                None,
+                None,
+                Some(dp_moment8(16.0, 128.0, 1.0)),
+                Some(dp_moment16(10.0, 2.0, &|i| 60.0 + 0.02 * i as f64)),
+                Some(dp_moment16(500.0, 2.0, &|_| 0.99)),
+                None,
+            )
+        })
+        .collect();
+    nexrad_model::data::Sweep::new(number, radials)
+}
+
+/// The premise every environmental-heights invalidation rests on: the hybrid
+/// classification's picture is a **function of** the sounding's pair, so a
+/// pane still holding one drawn against the old environment is showing the
+/// wrong classification rather than merely an old one.
+///
+/// Nothing asserted this before, and the gap it left was not theoretical:
+/// `RenderDispatcher::set_env_heights` dropped the hail pair's renders alone
+/// while the render parameters already carried the pair here too, so a landed
+/// sounding left every HCA pane on its default-melting-layer picture until the
+/// volume rolled. [`RadarProduct::reads_env_heights`] is now the one statement
+/// of that set; this is the measurement that puts HCA in it.
+///
+/// The two environments are the adaptation defaults (0 °C at 10.5 kft MSL) and
+/// a winter sounding with the freezing level down at 0.8 km MSL — under, not
+/// over, the beam. Uniform light rain fills the disc either way, so the class
+/// the classifier reaches is the whole answer.
+#[test]
+fn the_hybrid_classification_changes_with_the_environmental_heights() {
+    /// Dry snow: what the low freezing level puts the beam above.
+    const DS: f32 = 40.0;
+    /// Rain: what the default melting layer puts the beam below.
+    const RA: f32 = 60.0;
+
+    let scan = scan_of(vec![dual_pol_tilt(1, 0.5)]);
+    let defaults =
+        super::render_hhc_to_image(&scan, LAT, LON, None).expect("the fixture classifies");
+    let sounding = super::render_hhc_to_image(&scan, LAT, LON, Some((0.8, 2.0)))
+        .expect("the fixture classifies");
+
+    let painted = |grid: &[f32]| grid.iter().filter(|v| !v.is_nan()).count();
+    let all_of = |grid: &[f32], class: f32| grid.iter().filter(|v| **v == class).count();
+
+    let cells = painted(&defaults.2);
+    assert!(
+        cells > 0,
+        "the fixture painted nothing, so it proves nothing"
+    );
+    assert_eq!(
+        painted(&sounding.2),
+        cells,
+        "both environments must classify the same disc — a difference in \
+         *coverage* would confound the difference in class",
+    );
+    assert_eq!(
+        all_of(&defaults.2, RA),
+        cells,
+        "with the adaptation defaults the melting layer sits above the beam \
+         and the whole disc is rain",
+    );
+    assert_eq!(
+        all_of(&sounding.2, DS),
+        cells,
+        "with the sounding's 0.8 km freezing level the beam climbs out of the \
+         melting layer and the whole disc is dry snow",
+    );
+    assert_ne!(
+        defaults.0, sounding.0,
+        "and the rasterized pixels differ too, which is what a pane shows",
+    );
+}

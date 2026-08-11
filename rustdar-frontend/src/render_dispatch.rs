@@ -331,7 +331,9 @@ pub struct RenderDispatcher {
     /// floor, and the pane would render with another volume's.
     level3_data: HashMap<(String, String), Arc<Level3Product>>,
     /// Environmental 0 °C / −20 °C heights per site, from Open-Meteo — staged
-    /// for the hail products, which will read them at render time. Written by
+    /// for the products [`RadarProduct::reads_env_heights`] names, which will
+    /// read them at render time, and which
+    /// [`set_env_heights`](Self::set_env_heights) invalidates on. Written by
     /// the sounding drain in `app_render`; read back by
     /// `spawn_level3_fetches`'s TTL gate, which refetches on poll only once
     /// [`rustdar_radar::sounding::EnvHeights::is_stale`] says the entry has
@@ -579,7 +581,8 @@ impl RenderDispatcher {
     }
 
     /// Record a site's environmental heights and, if the pair actually moved,
-    /// drop that site's hail renders — the per-site counterpart of
+    /// drop that site's renders of every product that reads it — the per-site
+    /// counterpart of
     /// [`set_storm_motion_override`](Self::set_storm_motion_override), for the
     /// other render parameter that is not part of the cache key. Written by
     /// the sounding drain in `app_render`; the field it writes is the same one
@@ -587,10 +590,18 @@ impl RenderDispatcher {
     /// render parameters, so the environment a pane is invalidated for cannot
     /// differ from the one it is redrawn with.
     ///
+    /// The set is [`RadarProduct::reads_env_heights`] and not a list written
+    /// here: this predicate named the hail pair alone while the render
+    /// parameters already carried the pair to the hybrid classification too,
+    /// so an HCA pane went on showing a default-melting-layer picture until
+    /// the volume rolled. Asking the product resolves that by construction —
+    /// the invalidation set cannot fall behind the consuming set, because
+    /// they are the same sentence.
+    ///
     /// An unchanged pair still refreshes the entry — that restarts the TTL the
     /// poll's refetch gate reads — but invalidates nothing: soundings refetch
-    /// on a timer and normally land identical, and redrawing every hail pane
-    /// each time would repeat hourly for no visible change.
+    /// on a timer and normally land identical, and redrawing every affected
+    /// pane each time would repeat hourly for no visible change.
     ///
     /// Returns whether anything was invalidated.
     pub fn set_env_heights(
@@ -599,12 +610,6 @@ impl RenderDispatcher {
         heights: rustdar_radar::sounding::EnvHeights,
         gui: &rustdar_egui::Gui,
     ) -> bool {
-        let hail = |p: RadarProduct| {
-            matches!(
-                p,
-                RadarProduct::ProbabilityOfSevereHail | RadarProduct::MaxExpectedHailSize
-            )
-        };
         let unchanged = self.env_heights.get(site).is_some_and(|old| {
             old.h0c_km_msl == heights.h0c_km_msl && old.hm20c_km_msl == heights.hm20c_km_msl
         });
@@ -614,13 +619,15 @@ impl RenderDispatcher {
         }
         for (idx, prs) in self.pane_render.iter_mut().enumerate() {
             if gui.pane(idx).is_some_and(|p| p.site == site)
-                && prs.last_rendered.is_some_and(|(p, _)| hail(p))
+                && prs
+                    .last_rendered
+                    .is_some_and(|(p, _)| p.reads_env_heights())
             {
                 prs.last_rendered = None;
             }
         }
         self.render_cache
-            .retain(|(s, product, _view, _elev)| s != site || !hail(*product));
+            .retain(|(s, product, _view, _elev)| s != site || !product.reads_env_heights());
         true
     }
 
@@ -970,10 +977,12 @@ impl RenderDispatcher {
     }
 
     /// The environmental heights a Level II render's parameters carry: the
-    /// site's `(0 °C, −20 °C)` pair in km MSL for the hail products, `None`
-    /// for every other product — and `None` when no sounding has landed,
-    /// which the hail render answers by drawing nothing
-    /// ([`rustdar_radar::hail`]).
+    /// site's `(0 °C, −20 °C)` pair in km MSL for the products
+    /// [`RadarProduct::reads_env_heights`] names, `None` for every other
+    /// product — and `None` when no sounding has landed, which the hail
+    /// render answers by drawing nothing ([`rustdar_radar::hail`]) and the
+    /// hybrid classification by falling back to the operational adaptation
+    /// defaults ([`rustdar_radar::hca`]).
     ///
     /// Read from [`env_heights`](Self::env_heights), the same map
     /// [`set_env_heights`](Self::set_env_heights) invalidates on, so the
@@ -984,18 +993,14 @@ impl RenderDispatcher {
         product: RadarProduct,
         site: &str,
     ) -> Option<(f64, f64)> {
-        matches!(
-            product,
-            RadarProduct::ProbabilityOfSevereHail
-                | RadarProduct::MaxExpectedHailSize
-                | RadarProduct::HydrometeorClassification
-        )
-        .then(|| {
-            self.env_heights
-                .get(site)
-                .map(|h| (h.h0c_km_msl, h.hm20c_km_msl))
-        })
-        .flatten()
+        product
+            .reads_env_heights()
+            .then(|| {
+                self.env_heights
+                    .get(site)
+                    .map(|h| (h.h0c_km_msl, h.hm20c_km_msl))
+            })
+            .flatten()
     }
 
     /// The object cached for one `(AWIPS code, site)`.

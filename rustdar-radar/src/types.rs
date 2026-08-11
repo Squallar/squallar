@@ -1098,6 +1098,57 @@ impl RadarProduct {
         !self.is_level3() && crate::derive::volume_slot(*self).is_none()
     }
 
+    /// Whether this product's picture is a function of the environmental
+    /// 0 °C / −20 °C heights — the per-site pair a sounding lands
+    /// ([`crate::sounding`]), which rides the render parameters rather than a
+    /// moment because no radial carries it.
+    ///
+    /// **The one statement of that set.** Three places have to agree about it
+    /// and each used to say it for itself: which products carry the pair
+    /// across the worker port ([`crate::render_input`]), which are handed it
+    /// in their render parameters, and which have to be redrawn when a
+    /// sounding moves it. The third copy named the hail pair alone, so an HCA
+    /// pane kept a default-melting-layer classification after a sounding
+    /// landed and until the volume rolled — a wrong picture, not a stale one,
+    /// and the reason this is a method rather than three `matches!`.
+    ///
+    /// Exhaustive, like [`reads_whole_volume`](Self::reads_whole_volume): a
+    /// new variant fails to compile until it has been classified here, which
+    /// is the only way the three agree by construction rather than by review.
+    pub fn reads_env_heights(&self) -> bool {
+        match self {
+            // The SHI-to-size mapping has no field at all without the pair:
+            // the warning-threshold integral starts at the 0 °C height and
+            // is fully weighted above −20 °C, so without them `crate::hail`
+            // renders nothing rather than guessing.
+            RadarProduct::ProbabilityOfSevereHail | RadarProduct::MaxExpectedHailSize => true,
+            // The hybrid classification picks `HsdaHeights::from_env_heights`
+            // over `operational_defaults` and feeds both the melting-layer
+            // detection, so every class code downstream of the layer moves
+            // with the pair (`crate::render::render_hhc_to_image`). Absent a
+            // sounding it falls back to the adaptation defaults, exactly as
+            // the RPG runs without environmental data — which is why the
+            // stale case looked plausible instead of empty.
+            RadarProduct::HydrometeorClassification => true,
+            // Every other product must never carry the pair, or the byte
+            // identity of its payload would depend on an unrelated cache.
+            RadarProduct::Reflectivity
+            | RadarProduct::Velocity
+            | RadarProduct::SpectrumWidth
+            | RadarProduct::DifferentialPhase
+            | RadarProduct::CorrelationCoefficient
+            | RadarProduct::DifferentialReflectivity
+            | RadarProduct::StormRelativeVelocity
+            | RadarProduct::SpecificDifferentialPhase
+            | RadarProduct::EchoTops
+            | RadarProduct::EchoTopsInterpolated
+            | RadarProduct::VerticallyIntegratedLiquid
+            | RadarProduct::VilDensity
+            | RadarProduct::PrecipitationRate
+            | RadarProduct::NormalizedRotation => false,
+        }
+    }
+
     /// Format a radar product value for display (e.g. in a hover tooltip).
     pub fn format_value(&self, value: f32, prefs: &UserPreferences) -> String {
         match self {

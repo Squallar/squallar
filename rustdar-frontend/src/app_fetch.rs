@@ -156,7 +156,8 @@ impl super::App {
             .copied()
             .unwrap_or(0);
         {
-            // Environmental 0 °C / −20 °C heights for the hail products.
+            // Environmental 0 °C / −20 °C heights, for the products
+            // `RadarProduct::reads_env_heights` names.
             // TTL-gated: Open-Meteo serves hourly model rows, so refetching
             // on every poll would re-download the same numbers.
             // Stale-or-missing is the only trigger, and a failed fetch

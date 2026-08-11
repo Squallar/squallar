@@ -77,7 +77,7 @@ fn a_landed_sounding_routes_into_hail_renders_and_a_moved_pair_drops_them() {
     assert_eq!(
         d.env_heights_km_msl_for(RadarProduct::Reflectivity, "KTLX"),
         None,
-        "only the hail pair reads the environment",
+        "reflectivity does not read the environment",
     );
     assert_eq!(
         d.env_heights_km_msl_for(RadarProduct::ProbabilityOfSevereHail, "KOUN"),
@@ -146,6 +146,96 @@ fn a_landed_sounding_routes_into_hail_renders_and_a_moved_pair_drops_them() {
         .is_some(),
         "an unrelated product keeps its frame",
     );
+}
+
+/// The defect: `set_env_heights` invalidated the hail pair and nothing else,
+/// while `env_heights_km_msl_for` had already grown a third consumer. The
+/// hybrid classification selects `HsdaHeights::from_env_heights` over
+/// `operational_defaults` and feeds either into its melting-layer detection
+/// (`rustdar_radar::render::render_hhc_to_image`), so an HCA pane went on
+/// showing a **default-melting-layer** classification after a sounding landed
+/// — rain where the sounding said snow, as
+/// `the_hybrid_classification_changes_with_the_environmental_heights`
+/// measures — and did so until the volume rolled and reset the pane for
+/// other reasons.
+///
+/// Written as a sweep over every product against
+/// [`RadarProduct::reads_env_heights`] rather than as three named cases,
+/// because the defect was precisely a hand-kept list falling behind the set
+/// that consumes the pair. A fourth consumer added to the predicate and to no
+/// invalidation now fails here instead of shipping a wrong picture.
+///
+/// Both halves of the agreement are asserted, because only one of them was
+/// load-bearing and a mutation proved it: reverting
+/// `env_heights_km_msl_for` to its own hail-only list passed the whole
+/// workspace suite. That drift is *worse* than the bug this branch fixes —
+/// an HCA pane would be invalidated correctly on a landed sounding and then
+/// redrawn with `None`, pinned on the adaptation defaults permanently rather
+/// than until the volume rolls.
+#[test]
+fn a_moved_sounding_drops_every_render_that_read_the_old_environment() {
+    let heights = |h0: f64, hm20: f64| rustdar_radar::sounding::EnvHeights {
+        h0c_km_msl: h0,
+        hm20c_km_msl: hm20,
+        fetched_at: chrono::Utc::now(),
+    };
+    let gui = gui_showing("KTLX");
+
+    for &product in RadarProduct::all() {
+        let consumes = product.reads_env_heights();
+
+        let mut d = RenderDispatcher::new();
+        d.ensure_pane_count(1);
+        // A pane already showing this product, and a cached frame for it,
+        // both drawn against the first pair.
+        d.set_env_heights("KTLX", heights(4.2, 7.1), &gui);
+        d.pane_render[0].last_rendered = Some((product, 0.5));
+        d.cache_render(
+            "KTLX",
+            product,
+            rustdar_radar::types::RenderView::PlanView,
+            0.5,
+            cached(1.0),
+        );
+
+        // The other half of the agreement, and the one a mutation survived:
+        // invalidating a pane is worth nothing if the redraw is then handed
+        // `None`. A product dropped from *this* set but kept in the
+        // invalidation set would be refreshed on every landed sounding and
+        // redrawn on the adaptation defaults every time — pinned there
+        // permanently, and not even corrected by a volume roll.
+        assert_eq!(
+            d.env_heights_km_msl_for(product, "KTLX").is_some(),
+            consumes,
+            "{product:?}: the render parameters carry the pair exactly when \
+             the product reads it",
+        );
+
+        // The sounding refetches and the environment has moved.
+        assert!(
+            d.set_env_heights("KTLX", heights(2.0, 5.0), &gui),
+            "{product:?}: a moved pair is a change",
+        );
+
+        assert_eq!(
+            d.pane_render[0].last_rendered.is_none(),
+            consumes,
+            "{product:?}: a pane is dropped exactly when its picture read the \
+             environment (reads_env_heights = {consumes})",
+        );
+        assert_eq!(
+            d.get_cached_render(
+                "KTLX",
+                product,
+                rustdar_radar::types::RenderView::PlanView,
+                0.5,
+            )
+            .is_none(),
+            consumes,
+            "{product:?}: the cached frame is dropped exactly when it read the \
+             environment (reads_env_heights = {consumes})",
+        );
+    }
 }
 
 fn dispatch(

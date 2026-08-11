@@ -1,7 +1,10 @@
 //! Environmental sounding heights per radar site: where the 0 °C and −20 °C
 //! surfaces sit, from Open-Meteo's forecast API. The hail products need both
-//! (they scale hail size on how far a reflectivity core reaches above them);
-//! nothing else reads them.
+//! (they scale hail size on how far a reflectivity core reaches above them),
+//! and the hybrid hydrometeor classification stands them in for its wet-bulb
+//! operator values ([`crate::hca::HsdaHeights::from_env_heights`]), which
+//! place its melting layer. [`crate::types::RadarProduct::reads_env_heights`]
+//! is the whole set, and the one place it is written down.
 //!
 //! Both heights are **km above mean sea level**, not above the radar. The
 //! 0 °C height is Open-Meteo's `freezing_level_height` taken as-is: when an

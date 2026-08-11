@@ -357,8 +357,8 @@ pub struct ChunkResponse {
 /// The environmental 0 °C / −20 °C heights over a site, from Open-Meteo —
 /// fetched when a scan loads, but TTL-gated (see
 /// [`rustdar_radar::sounding::ENV_HEIGHTS_TTL`]) rather than refetched every
-/// poll. Staged for the hail products, which will read them off
-/// `RenderDispatcher::env_heights`.
+/// poll. Staged for the products `RadarProduct::reads_env_heights` names,
+/// which will read them off `RenderDispatcher::env_heights`.
 pub struct SoundingResponse {
     pub generation: u64,
     pub site: String,

@@ -300,22 +300,6 @@ struct MomentPayload {
     gates: Vec<u8>,
 }
 
-/// Whether a product reads the environmental 0 °C / −20 °C heights.
-///
-/// The hail pair has no field at all without them ([`crate::hail`]); the
-/// hybrid hydrometeor classification uses them for its melting layer and
-/// hail-size heights, falling back to the operational adaptation defaults
-/// when they are absent. Every other product must never carry them, so its
-/// payload bytes cannot depend on an unrelated cache.
-fn reads_env_heights(product: RadarProduct) -> bool {
-    matches!(
-        product,
-        RadarProduct::ProbabilityOfSevereHail
-            | RadarProduct::MaxExpectedHailSize
-            | RadarProduct::HydrometeorClassification
-    )
-}
-
 impl RenderInput {
     /// The reachable subset of `scan` for this request, or `None` when the
     /// request cannot be rendered at all.
@@ -514,7 +498,7 @@ impl RenderInput {
             radar_lat,
             radar_lon,
             storm_motion_override,
-            env_heights_km_msl: if reads_env_heights(product) {
+            env_heights_km_msl: if product.reads_env_heights() {
                 env_heights_km_msl
             } else {
                 // Nothing else reads them; carrying them anyway would make

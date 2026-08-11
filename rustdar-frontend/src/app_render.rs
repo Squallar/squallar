@@ -494,7 +494,7 @@ impl super::App {
                 .set_env_heights(&sounding.site, heights, &self.gui)
             {
                 log::info!(
-                    "Env heights moved for {}: hail renders dropped",
+                    "Env heights moved for {}: dropped the renders that read them",
                     sounding.site
                 );
             }
