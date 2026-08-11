@@ -90,8 +90,12 @@
 //! keep agreeing.
 //!
 //! The ring's radius is now the render's own `extent_km` rather than a
-//! constant, and that changes nothing here: the agreement is a ratio of the
-//! two spheres, so it holds at every extent a sweep can ask for.
+//! constant, and that changes nothing here: the disagreement was a *ratio* of
+//! two spheres, so closing it closes it at every extent a sweep can ask for.
+//! It would have been scale-free even unclosed — the raster's side follows its
+//! extent ([`crate::types::raster_side_px`]), so 4.45 px/km at the 230 km floor
+//! against 4.47 at a surveillance cut's 458 km on 4096, and a fixed fraction of
+//! a kilometre costs the same pixel on either frame.
 //!
 //! # Drawn to the line, where a plan view is drawn to the data
 //!
