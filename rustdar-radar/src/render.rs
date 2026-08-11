@@ -1646,7 +1646,11 @@ pub fn render_hail_to_image(
         fetched_at: chrono::Utc::now(),
     };
     let radar_height_ft = render_site_height_ft(radar_lat, radar_lon);
-    let grids = crate::hail::compute_hail(scan, Some(&env), radar_height_ft)?;
+    // The observing antenna's beam, not the WSR-88D's: this caps the ceiling
+    // layer, and a TDWR's 0.55° is not the fleet's 0.95°. See
+    // `hail::layer_bounds_km`.
+    let beamwidth_deg = crate::beam::half_power_beamwidth_deg_near(radar_lat, radar_lon);
+    let grids = crate::hail::compute_hail(scan, Some(&env), radar_height_ft, beamwidth_deg)?;
     const MM_PER_IN: f32 = 25.4;
     let (grid, unit_scale) = match product {
         types::RadarProduct::MaxExpectedHailSize => (grids.mehs_mm, 1.0 / MM_PER_IN),

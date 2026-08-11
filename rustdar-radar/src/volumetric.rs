@@ -37,9 +37,12 @@ use nexrad_model::data::{DataMoment, MomentValue, Radial, Scan};
 /// Half-power beamwidth of the WSR-88D antenna, degrees. Beam bottom and top
 /// heights sit half of this below and above the tilt centre.
 ///
-/// Re-exported from [`crate::beam`], which owns the crate's beam geometry;
-/// [`crate::hail`] imports it from here alongside the rest of the cube's API.
-pub const HALF_POWER_BEAMWIDTH_DEG: f64 = crate::beam::HALF_POWER_BEAMWIDTH_DEG;
+/// Re-exported from [`crate::beam`], which owns the crate's beam geometry.
+/// The WSR-88D's specifically, and named so: a TDWR's antenna is 0.55°
+/// ([`crate::beam::TDWR_HALF_POWER_BEAMWIDTH_DEG`]), and a caller whose
+/// answer depends on which network it is looking at wants
+/// [`crate::beam::half_power_beamwidth_deg_near`] rather than this.
+pub const WSR88D_HALF_POWER_BEAMWIDTH_DEG: f64 = crate::beam::WSR88D_HALF_POWER_BEAMWIDTH_DEG;
 
 /// Reflectivity threshold for echo tops, dBZ.
 const ET_THRESHOLD_DBZ: f32 = 18.3;
@@ -225,7 +228,7 @@ impl BeamHeights {
     /// which takes the site's own. A product that starts reading `bottom_km`
     /// or `top_km` needs this to take a beamwidth too.
     fn at_elevation(elev_deg: f64, binning: RangeBinning) -> Self {
-        let half = HALF_POWER_BEAMWIDTH_DEG / 2.0;
+        let half = WSR88D_HALF_POWER_BEAMWIDTH_DEG / 2.0;
         let at = |e: f64| -> Vec<f64> {
             (0..RANGE_BINS)
                 .map(|r| binning.height_km(r as f64 + 0.5, e))

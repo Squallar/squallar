@@ -296,7 +296,7 @@ fn the_lifted_beam_height_is_bit_identical_to_the_one_volumetric_shipped() {
         range_km * el.sin() + range_km * range_km / (2.0 * RE_EFF_KM)
     }
 
-    let half = HALF_POWER_BEAMWIDTH_DEG / 2.0;
+    let half = WSR88D_HALF_POWER_BEAMWIDTH_DEG / 2.0;
     let mut checked = 0usize;
     for &e in &ELEVS {
         for e in [e - half, e, e + half] {

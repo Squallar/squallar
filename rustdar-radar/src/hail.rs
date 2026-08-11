@@ -104,8 +104,10 @@
 //!   tilt `i`'s layer runs between the **midpoints of adjacent beam-centre
 //!   heights over that ground**,
 //!   the lowest layer starts at the ground, and the highest is capped at the
-//!   beam's **half-power upper flank** (+0.475°) — the storm is never
-//!   extrapolated past the volume ceiling. The layer straddling `H₀` is
+//!   beam's **half-power upper flank** (+0.475° on a WSR-88D, +0.275° on a
+//!   TDWR) — the storm is never extrapolated past the volume ceiling, and
+//!   never past the part of it the antenna actually lit. The layer
+//!   straddling `H₀` is
 //!   clipped to its part above `H₀`, and `W_T` is evaluated at the clipped
 //!   layer's midpoint — exactly the cell code's `DH_POSH`/`MED_HT` handling
 //!   of the freezing level (`a31539.ftn`).
@@ -116,8 +118,11 @@
 //!   to first order; hail needs the boundary *heights* themselves for the
 //!   `H₀` clip, and they must live in the same vertical coordinate as `W_T`
 //!   or a layer could disagree with its own depth); (2) the top cap uses the
-//!   crate's 0.95° half-power beamwidth, not `a313t1.ftn`'s hardcoded
-//!   0.017 rad (≈ 0.974°); (3) depths are evaluated at the cell centre
+//!   **observing antenna's** half-power beamwidth — 0.95° on a WSR-88D,
+//!   0.55° on a TDWR ([`crate::beam::half_power_beamwidth_deg_near`]) — not
+//!   `a313t1.ftn`'s hardcoded 0.017 rad (≈ 0.974°), which is the WSR-88D's
+//!   and the only network the RPG has; (3) depths are evaluated at the cell
+//!   centre
 //!   `r + 0.5`, the height-table datum, not the legacy depth table's outer
 //!   edge.
 //! * **Elevation angles** are each sweep's measured median
@@ -146,8 +151,8 @@
 use crate::sounding::EnvHeights;
 use crate::types::RadarProduct;
 use crate::volumetric::{
-    CellStat, DedupPolicy, HALF_POWER_BEAMWIDTH_DEG, RANGE_BINS, RangeBinning, VolumeCube,
-    VolumetricGrid, sweep_elevation_deg,
+    CellStat, DedupPolicy, RANGE_BINS, RangeBinning, VolumeCube, VolumetricGrid,
+    sweep_elevation_deg,
 };
 use nexrad_model::data::Scan;
 
@@ -321,7 +326,16 @@ pub struct HailGrids {
 /// layer the depth of a column standing somewhere else — and depth is what
 /// SHI integrates, so the error would land directly in the product rather
 /// than in its geometry.
-fn layer_bounds_km(elevs_deg: &[f64]) -> Vec<Vec<(f64, f64)>> {
+///
+/// `half_power_beamwidth_deg` is the **antenna's**, and this is the one place
+/// in the crate where a beamwidth reaches a rendered number. It sets how far
+/// above the top tilt the ceiling layer is allowed to reach, so a WSR-88D's
+/// 0.95° buys the top layer 0.475° of upper flank and a TDWR's 0.55° buys it
+/// 0.275°. Handing a TDWR the WSR-88D's figure stretched its ceiling layer by
+/// 0.2° of beam — about 100 m of depth at 30 km, more further out — and SHI
+/// integrates that depth, so the products read slightly hot at the top of a
+/// TDWR volume.
+fn layer_bounds_km(elevs_deg: &[f64], half_power_beamwidth_deg: f64) -> Vec<Vec<(f64, f64)>> {
     let n = elevs_deg.len();
     let centre = |e: f64| -> Vec<f64> {
         (0..RANGE_BINS)
@@ -330,7 +344,7 @@ fn layer_bounds_km(elevs_deg: &[f64]) -> Vec<Vec<(f64, f64)>> {
     };
     let centres: Vec<Vec<f64>> = elevs_deg.iter().map(|&e| centre(e)).collect();
     let flank: Vec<f64> = match elevs_deg.last() {
-        Some(&top) => centre(top + HALF_POWER_BEAMWIDTH_DEG / 2.0),
+        Some(&top) => centre(top + half_power_beamwidth_deg / 2.0),
         None => return Vec::new(),
     };
     (0..n)
@@ -380,10 +394,16 @@ fn layer_shi(dbz: f64, bottom_km: f64, top_km: f64, h0_km: f64, hm20_km: f64) ->
 /// [`crate::sites::Datum::Feedhorn`] on the render path), the datum that
 /// converts the MSL sounding heights to the beam's ARL coordinate — ARL is
 /// above the antenna, and the ground under the tower is 30–115 ft lower.
+///
+/// `half_power_beamwidth_deg` is the antenna's own — the render path takes it
+/// from [`crate::beam::half_power_beamwidth_deg_near`], because this crate
+/// draws two networks whose beams differ by nearly a factor of two. It caps
+/// the ceiling layer and nothing else; see [`layer_bounds_km`].
 pub fn compute_hail(
     scan: &Scan,
     env: Option<&EnvHeights>,
     radar_height_ft: f64,
+    half_power_beamwidth_deg: f64,
 ) -> Option<HailGrids> {
     let env = env?;
     let (h0_km, hm20_km) = env_arl_km(env, radar_height_ft);
@@ -419,7 +439,7 @@ pub fn compute_hail(
         })
         .collect();
     let elevs: Vec<f64> = tilts.iter().map(|&(e, _)| e).collect();
-    let bounds = layer_bounds_km(&elevs);
+    let bounds = layer_bounds_km(&elevs, half_power_beamwidth_deg);
 
     let mut shi_grid = vec![vec![f32::NAN; RANGE_BINS]; 360];
     let mut posh_grid = vec![vec![f32::NAN; RANGE_BINS]; 360];

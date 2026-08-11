@@ -140,7 +140,45 @@ pub const RE_EFF_KM: f64 = 6371.0 * 4.0 / 3.0;
 
 /// Half-power beamwidth of the WSR-88D antenna, degrees. A tilt's beam bottom
 /// and top sit half of this below and above its centre elevation.
-pub const HALF_POWER_BEAMWIDTH_DEG: f64 = 0.95;
+pub const WSR88D_HALF_POWER_BEAMWIDTH_DEG: f64 = 0.95;
+
+/// Half-power beamwidth of the TDWR antenna, degrees.
+///
+/// **Sourced, not inferred.** NOAA's NCEI states it directly in its TDWR
+/// product description — "Each radial in TDWR has a beam width of 0.55
+/// degrees" (<https://www.ncei.noaa.gov/products/radar/terminal-doppler-weather-radar>,
+/// read 2026-08-11) — and it is the figure of the system's design paper,
+/// Michelson, Shrader and Wieler, "Terminal Doppler Weather Radar",
+/// *Microwave Journal* **33** (1990), 139.
+///
+/// It is also what the hardware has to give. The TDWR is a 25-foot reflector
+/// at C band (5.60–5.65 GHz, λ ≈ 53 mm), and `1.27·λ/D` puts an
+/// evenly-illuminated dish of that size at 0.51°; ordinary illumination taper
+/// widens it to about this. The WSR-88D reaches 0.95° from a 28-foot
+/// reflector because it is at S band, where the wavelength is nearly twice as
+/// long — the TDWR's narrower beam is the whole reason it can watch one
+/// airport closely.
+pub const TDWR_HALF_POWER_BEAMWIDTH_DEG: f64 = 0.55;
+
+/// The half-power beamwidth, degrees, of whichever network the radar nearest
+/// `lat`/`lon` belongs to.
+///
+/// A lookup rather than a constant because the two networks differ by nearly
+/// a factor of two and this crate draws both. The nearest-site indirection is
+/// the same one [`crate::eet::radar_height_ft_near`] uses and for the same
+/// reason: a render path holds the site's coordinates, not its identifier,
+/// and every row of [`crate::sites::radars()`] is its own nearest neighbour, so
+/// this resolves to the site the caller meant rather than guessing.
+///
+/// A non-finite coordinate, or an empty table, answers the WSR-88D's. That is
+/// the wider of the two, so an unknown site gets the more conservative beam
+/// rather than one claiming a resolution nothing has established.
+pub fn half_power_beamwidth_deg_near(lat: f64, lon: f64) -> f64 {
+    match crate::sites::nearest_radar_site(lat, lon) {
+        Some((site, _)) if site.is_tdwr() => TDWR_HALF_POWER_BEAMWIDTH_DEG,
+        _ => WSR88D_HALF_POWER_BEAMWIDTH_DEG,
+    }
+}
 
 /// Beam-centre height above the radar, km, at a slant range and elevation.
 ///

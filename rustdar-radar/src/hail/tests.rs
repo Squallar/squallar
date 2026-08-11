@@ -132,6 +132,12 @@ fn golden_scan() -> Scan {
     )
 }
 
+/// The WSR-88D's beam, which every hand-computed expectation in this file is
+/// derived under. A TDWR's 0.55° is exercised by
+/// [`a_narrower_antenna_caps_the_ceiling_layer_lower`] alone, so the rest of
+/// the arithmetic stays legible against one number.
+const BEAM: f64 = crate::beam::WSR88D_HALF_POWER_BEAMWIDTH_DEG;
+
 fn assert_close(actual: f64, expected: f64, tol: f64, what: &str) {
     assert!(
         (actual - expected).abs() < tol,
@@ -295,7 +301,7 @@ fn env_heights_resolve_msl_to_arl_against_the_site_elevation() {
 ///   **3.772947**, POSH **1.631597**, MEHS **4.933715**.
 #[test]
 fn the_documented_rules_produce_hand_computed_hail() {
-    let grids = compute_hail(&golden_scan(), Some(&env(1.0, 2.0)), 0.0).unwrap();
+    let grids = compute_hail(&golden_scan(), Some(&env(1.0, 2.0)), 0.0, BEAM).unwrap();
     assert_eq!(grids.posh.range_bins, RANGE_BINS);
     assert_eq!(grids.posh.values.len(), 360);
     let r = 30;
@@ -338,7 +344,7 @@ fn the_minus_20_height_splits_the_column() {
     let scan = golden_scan();
     let r = 30;
 
-    let split = compute_hail(&scan, Some(&env(1.0, 1.5)), 0.0).unwrap();
+    let split = compute_hail(&scan, Some(&env(1.0, 1.5)), 0.0, BEAM).unwrap();
     assert_close(
         f64::from(split.shi.values[10][r]),
         7.512_132_2,
@@ -352,7 +358,7 @@ fn the_minus_20_height_splits_the_column() {
         "Hm20 = 1.5 POSH",
     );
 
-    let step = compute_hail(&scan, Some(&env(1.0, 1.0)), 0.0).unwrap();
+    let step = compute_hail(&scan, Some(&env(1.0, 1.0)), 0.0, BEAM).unwrap();
     assert_close(
         f64::from(step.shi.values[10][r]),
         9.306_606_1,
@@ -370,7 +376,7 @@ fn a_single_tilt_column_is_capped_at_the_beam_flank() {
         vcp(),
         vec![refl_sweep(1, 0.5, |az| (az == 10).then_some(50.0))],
     );
-    let grids = compute_hail(&scan, Some(&env(0.2, 1.0)), 0.0).unwrap();
+    let grids = compute_hail(&scan, Some(&env(0.2, 1.0)), 0.0, BEAM).unwrap();
     assert_close(
         f64::from(grids.shi.values[10][30]),
         0.692_177_31,
@@ -380,12 +386,81 @@ fn a_single_tilt_column_is_capped_at_the_beam_flank() {
     assert!(grids.shi.values[11][30].is_nan(), "uninvolved column");
 }
 
+/// **A narrower antenna caps the ceiling layer lower**, which is the whole of
+/// what a beamwidth does to this product — and the reason it must follow the
+/// radar rather than the fleet.
+///
+/// The same single-tilt column, once with the WSR-88D's 0.95° and once with
+/// the TDWR's 0.55° ([`crate::beam::TDWR_HALF_POWER_BEAMWIDTH_DEG`], sourced
+/// there). The top layer runs to the beam's upper flank, so 0.475° of it
+/// reaches 0.5738382 km over 30.5 km of ground where 0.275° reaches
+/// 0.4673423 — 107 m less ceiling. SHI integrates depth above `H₀ = 0.2`, so
+/// it falls 0.692177 → 0.353985, a **49 %** cut on this column.
+///
+/// That is the size of the error a TDWR was carrying: the fleet's wider beam
+/// bought its ceiling layer depth the antenna never illuminated, and PoSH and
+/// MEHS read hot at the top of every TDWR volume as a result.
+#[test]
+fn a_narrower_antenna_caps_the_ceiling_layer_lower() {
+    let scan = Scan::new(
+        vcp(),
+        vec![refl_sweep(1, 0.5, |az| (az == 10).then_some(50.0))],
+    );
+    let shi = |beam| {
+        f64::from(
+            compute_hail(&scan, Some(&env(0.2, 1.0)), 0.0, beam)
+                .unwrap()
+                .shi
+                .values[10][30],
+        )
+    };
+
+    assert_close(shi(BEAM), 0.692_177_31, 1e-6, "WSR-88D ceiling");
+    assert_close(
+        shi(crate::beam::TDWR_HALF_POWER_BEAMWIDTH_DEG),
+        0.353_985_50,
+        1e-6,
+        "TDWR ceiling",
+    );
+    assert!(
+        shi(crate::beam::TDWR_HALF_POWER_BEAMWIDTH_DEG) < shi(BEAM),
+        "a narrower beam must not buy the ceiling layer more depth",
+    );
+}
+
+/// The beamwidth follows the **radar**, resolved from the coordinates a render
+/// path holds — and `TJUA` is the case a `starts_with('T')` test gets wrong.
+#[test]
+fn the_beamwidth_lookup_answers_per_network() {
+    use crate::beam::{
+        TDWR_HALF_POWER_BEAMWIDTH_DEG, WSR88D_HALF_POWER_BEAMWIDTH_DEG,
+        half_power_beamwidth_deg_near,
+    };
+    let at = |name: &str| {
+        let s = crate::sites::get_radar_site(name).expect("the table carries it");
+        half_power_beamwidth_deg_near(s.lat, s.lon)
+    };
+    assert_eq!(at("TPIT"), TDWR_HALF_POWER_BEAMWIDTH_DEG, "TPIT is a TDWR");
+    assert_eq!(at("KTLX"), WSR88D_HALF_POWER_BEAMWIDTH_DEG);
+    assert_eq!(
+        at("TJUA"),
+        WSR88D_HALF_POWER_BEAMWIDTH_DEG,
+        "TJUA is San Juan's WSR-88D, whatever its name starts with",
+    );
+    // A coordinate nothing can be resolved from takes the wider beam, which
+    // is the conservative answer rather than a claimed resolution.
+    assert_eq!(
+        half_power_beamwidth_deg_near(f64::NAN, 0.0),
+        WSR88D_HALF_POWER_BEAMWIDTH_DEG,
+    );
+}
+
 /// No [`EnvHeights`] is **no field** — `None`, not a zero-filled grid
 /// pretending to be data. The render seam turns this into "nothing to
 /// draw".
 #[test]
 fn no_environment_means_no_field() {
-    assert!(compute_hail(&golden_scan(), None, 0.0).is_none());
+    assert!(compute_hail(&golden_scan(), None, 0.0, BEAM).is_none());
 }
 
 /// A SAILS repeat late in the volume must not displace the first look:
@@ -409,7 +484,7 @@ fn a_sails_repeat_does_not_displace_the_first_look() {
             refl_sweep(3, 1.5, repeat), // SAILS revisit, late
         ],
     );
-    let grids = compute_hail(&scan, Some(&env(0.2, 1.0)), 0.0).unwrap();
+    let grids = compute_hail(&scan, Some(&env(0.2, 1.0)), 0.0, BEAM).unwrap();
 
     // az 60 exists only on the repeat: first-of-volume leaves it empty.
     assert!(
@@ -425,7 +500,7 @@ fn a_sails_repeat_does_not_displace_the_first_look() {
         vcp(),
         vec![refl_sweep(1, 1.5, first), refl_sweep(2, 2.5, upper)],
     );
-    let expected = compute_hail(&alone, Some(&env(0.2, 1.0)), 0.0).unwrap();
+    let expected = compute_hail(&alone, Some(&env(0.2, 1.0)), 0.0, BEAM).unwrap();
     assert_eq!(
         grids.shi.values[61][30], expected.shi.values[61][30],
         "the repeat's reflectivity leaked into the sum",
