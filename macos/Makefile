@@ -97,10 +97,23 @@ build:
 	# has already compiled exactly this binary for exactly this triple, and
 	# compiling the workspace a second time to package it would double the
 	# row's wall clock for a file that is already on disk.
+	#
+	# The corollary is that BIN= picks the profile too. DEBUG= and the default
+	# `--release` above govern a build this recipe runs itself and nothing
+	# else, so a caller handing over a path under debug/ gets a debug .app no
+	# matter what else it passed — which is how every published macOS build
+	# came to be an unoptimized one. Said out loud here rather than left to be
+	# read off a path.
 	if [ -n "$(BIN)" ]; then
 	  EXE="$(BIN)"
 	  [ -f "$$EXE" ] || { echo "ERROR: BIN=$$EXE does not exist"; exit 1; }
 	  echo "==> packaging the existing $$EXE"
+	  case "$$EXE" in
+	    */debug/*)
+	      echo "    NOTE: a debug-profile binary. The .app will carry workspace code at"
+	      echo "          opt-level = 0 with debug assertions on."
+	      ;;
+	  esac
 	else
 	  EXE="$(TARGET_DIR)/$$RUST_TARGET/$$PROFILE_DIR/rustdar-platform"
 	  # RUSTUP_TOOLCHAIN from the image's own RUST_VERSION: rust-toolchain.toml

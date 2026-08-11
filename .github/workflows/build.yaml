@@ -36,10 +36,25 @@ jobs:
           # `--all-features` on the desktop rows only: it enables
           # rustdar-gps/serial, which links IOKit. It also enables
           # rustdar-android/jni-typecheck, so these rows type-check the JNI layer.
+          #
+          # `--release` on every row whose artifact a person can run, and folded
+          # into the command that already provides the compile coverage rather
+          # than added as a second one: the row compiles the workspace either
+          # way, so a debug pass for coverage plus a release pass for the upload
+          # would double the wall clock to produce a file one invocation can
+          # write. `--all-targets --all-features` is unchanged, so the coverage
+          # is the same set of crates and the same set of features as before.
+          #
+          # Until this said `--release`, every desktop download was workspace
+          # code at `opt-level = 0` with debug assertions on.
+          # `[profile.dev.package."*"]` optimizes the dependencies, so the whole
+          # penalty landed on rustdar's own crates -- which is where the
+          # rasterizer is. rustdar-web/src/lib.rs prices unoptimized workspace
+          # code at 2349 ms per Level II frame against 160-190 ms.
           - name: linux-x86_64
             target: x86_64-unknown-linux-gnu
-            cmd: cargo build --workspace --all-targets --all-features --target x86_64-unknown-linux-gnu
-            artifact: target/x86_64-unknown-linux-gnu/debug/rustdar-platform
+            cmd: cargo build --release --workspace --all-targets --all-features --target x86_64-unknown-linux-gnu
+            artifact: target/x86_64-unknown-linux-gnu/release/rustdar-platform
           # The artifact is a signed .app in a zip, not the bare executable.
           # Three reasons, and none of them is polish: arm64 macOS refuses to
           # execute an unsigned Mach-O at all, so the old `macos-aarch64`
@@ -51,19 +66,19 @@ jobs:
             target: aarch64-apple-darwin
             package: macos
             macos_arch: aarch64
-            cmd: cargo build --workspace --all-targets --all-features --target aarch64-apple-darwin
+            cmd: cargo build --release --workspace --all-targets --all-features --target aarch64-apple-darwin
             artifact: macos/build/aarch64-apple-darwin/rustdar.app.zip
           - name: macos-x86_64
             target: x86_64-apple-darwin
             package: macos
             macos_arch: x86_64
-            cmd: cargo build --workspace --all-targets --all-features --target x86_64-apple-darwin
+            cmd: cargo build --release --workspace --all-targets --all-features --target x86_64-apple-darwin
             artifact: macos/build/x86_64-apple-darwin/rustdar.app.zip
           # gnullvm, not MSVC: MSVC is the one family the image does not carry.
           - name: windows-x86_64
             target: x86_64-pc-windows-gnullvm
-            cmd: cargo build --workspace --all-targets --all-features --target x86_64-pc-windows-gnullvm
-            artifact: target/x86_64-pc-windows-gnullvm/debug/rustdar-platform.exe
+            cmd: cargo build --release --workspace --all-targets --all-features --target x86_64-pc-windows-gnullvm
+            artifact: target/x86_64-pc-windows-gnullvm/release/rustdar-platform.exe
 
           # A real link, not a `check`. `rustdar-platform --lib` as a staticlib
           # codegens the whole graph, and the link is where the failures that
@@ -95,14 +110,19 @@ jobs:
           # clang/sysroot it exports, and it is what android/app/build.gradle.kts
           # drives. `-P 28` must track minSdk there -- a lower platform level's
           # sysroot lacks symbols the graphics/JNI stack links against.
+          #
+          # `--release` for the same reason as the desktop rows, and because it
+          # is the profile a real APK ships: build.gradle.kts's
+          # `buildRustLibRelease` passes `--release`, so a debug .so here was a
+          # library nothing installable ever contains.
           - name: android-arm64-v8a
             target: aarch64-linux-android
-            cmd: cargo ndk -t arm64-v8a -P 28 build -p rustdar-android --lib
-            artifact: target/aarch64-linux-android/debug/librustdar_android.so
+            cmd: cargo ndk -t arm64-v8a -P 28 build -p rustdar-android --lib --release
+            artifact: target/aarch64-linux-android/release/librustdar_android.so
           - name: android-x86_64
             target: x86_64-linux-android
-            cmd: cargo ndk -t x86_64 -P 28 build -p rustdar-android --lib
-            artifact: target/x86_64-linux-android/debug/librustdar_android.so
+            cmd: cargo ndk -t x86_64 -P 28 build -p rustdar-android --lib --release
+            artifact: target/x86_64-linux-android/release/librustdar_android.so
 
           # The only wasm build, and deliberately so. The deleted `wasm32
           # libraries` row named members as roots, so rustdar-gps took its own
@@ -258,7 +278,11 @@ jobs:
           rcodesign --version
 
       # `BIN=` rather than a second build: the row above has already compiled
-      # exactly this binary for exactly this triple.
+      # exactly this binary for exactly this triple. `BIN=` names a path and
+      # therefore also names a profile, so it is the one place in this file
+      # where the shipped .app's optimization level is decided -- it must track
+      # the row's own `--release`, or the bundle carries a binary the row did
+      # not intend to ship.
       #
       # ── The secret this needs, which has to be created by hand ──
       #
@@ -297,7 +321,7 @@ jobs:
         run: |
           make -C macos IN_CONTAINER=1 ARCHIVE=1 \
             ARCH=${{ matrix.macos_arch }} \
-            BIN=target/${{ matrix.target }}/debug/rustdar-platform
+            BIN=target/${{ matrix.target }}/release/rustdar-platform
 
       - name: Upload native build
         if: matrix.artifact
