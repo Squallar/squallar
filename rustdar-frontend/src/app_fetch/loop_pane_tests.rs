@@ -25,18 +25,17 @@ fn site(name: &'static str, lat: f64, lon: f64) -> RadarSite {
     }
 }
 
-/// The site every `pane_showing` pane has already switched *to*, and whose scan
-/// has not landed yet. Deliberately not a site any test here builds a loop from.
+/// The site every `pane_showing` pane's `site` field names, and which its scan
+/// did not come from. Deliberately not a site any test here builds a loop from.
 const SWITCHED_TO: &str = "KFWS";
 
 /// A pane showing `site`'s scan at `timestamp`, with its live `site` field
-/// already moved on to [`SWITCHED_TO`].
+/// naming [`SWITCHED_TO`] instead.
 ///
-/// That divergence is the window `begin_loop_for_pane`'s own doc describes: the
-/// pane's `site` field changes the instant the user picks a new radar, while
-/// `scan_info` still holds the previous site's scan until the new one loads. The
-/// loop must be built from the `scan_info` — the one place where the code, the
-/// coordinates and the timestamp all come from the same radar.
+/// The two are separate fields and nothing enforces their agreement: `pane.site`
+/// is the radar the pane is aimed at, `scan_info.site` is the radar the volume in
+/// hand came from. The loop must be built from the second — the one place where
+/// the code, the coordinates and the timestamp all come from the same radar.
 ///
 /// Handing the pane a `site` equal to `scan_info.site.name` would make the two
 /// interchangeable, and every assertion below would hold just as well for a

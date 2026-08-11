@@ -475,8 +475,54 @@ impl super::App {
                 // coverage is a question about what the pane says while it has
                 // nothing to show, which belongs with the interaction that draws
                 // the line rather than here.
+                //
+                // `scan_info` goes the other way and is dropped, because it is
+                // the one field that answers *for the site being left*. It
+                // accumulates by design — `Gui::apply_chunk_scan_info` unions a
+                // partial volume's products and tilts into it and never removes
+                // one, so the tilt picker does not shrink and regrow every few
+                // seconds — and that design assumes one radar behind the union.
+                // Carried across a switch it is a claim about the wrong one,
+                // standing until a completed volume replaces it wholesale, which
+                // is up to a volume period away: the pane offers the previous
+                // site's products and its VCP's tilts, so a TDWR goes on listing
+                // the five Level III entries and the dual-pol moments that
+                // `types::discover_product_elevations` withholds for it, and the
+                // gate that withholds them never gets to apply. Dropping it here
+                // rather than filtering it downstream leaves that union the only
+                // merge rule there is, and confines the correction to the one
+                // moment the site actually changes.
+                //
+                // It is also what the render path steers by: `dispatch_pane_renders`
+                // takes the origin coordinates and the volume it draws from
+                // `scan_info.site`, while `poll_render_results` files the result
+                // under `pane.site`. A product picked from the stale menu in that
+                // window therefore paints the old radar's field and caches it as
+                // the new site's, where every other pane on the new site can pick
+                // it up. With no `ScanInfo` the pane resolves no rendering params
+                // at all and nothing is dispatched.
+                //
+                // `data_time` is dropped with it because it describes the picture
+                // that goes with it — the same `scan_info`-is-`None` branch of
+                // `dispatch_pane_renders` tears the radar texture down — and a
+                // status bar aging the old site's volume against a pane showing
+                // nothing is the same untruth in words.
+                //
+                // Nothing has to stand in for them. The pickers already have a
+                // written state for holding no scan — "No scan loaded", what they
+                // say before a session's first volume. The map does better than
+                // that: with no `ScanInfo` it centres on the new site's own
+                // `sites::radars()` coordinates, so the switch arrives on the new
+                // radar immediately instead of holding the old one's position.
                 for idx in moving {
                     if let Some(pane) = self.gui.pane_mut(idx) {
+                        // Only where the site really moves. `moving` is the
+                        // linked group, and a pane already on `site` — with its
+                        // volume drawn and its menu right — is not switching.
+                        if pane.site != site {
+                            pane.scan_info = None;
+                            pane.data_time = None;
+                        }
                         pane.loading_site = Some(site.clone());
                         pane.site = site.clone();
                         pane.radar_sites_render_gen = pane.radar_sites_render_gen.wrapping_add(1);
@@ -1311,11 +1357,12 @@ fn local_to_utc_in<Tz: TimeZone>(tz: &Tz, timestamp: NaiveDateTime) -> NaiveDate
 /// poll interval, for a scan that has not changed.
 ///
 /// Resolved through each pane's `scan_info`, whose `site` is the site the scan in
-/// hand really came from, rather than through the pane's live `site` field: the
-/// two diverge for as long as a freshly switched pane's new scan takes to land,
-/// and a timestamp read under the wrong site's name is exactly the mismatch this
-/// exists to prevent. During that window this reports `None` for the new site,
-/// which fetches unconditionally — which is what a site with nothing loaded wants.
+/// hand really came from, rather than through the pane's live `site` field. The
+/// scan is what carries the timestamp, and a timestamp reported under a name that
+/// did not produce it is exactly the mismatch this exists to prevent. A pane
+/// between a site switch and that site's first volume holds no `scan_info` at all
+/// and contributes nothing, so the new site reports `None` and fetches
+/// unconditionally — which is what a site with nothing loaded wants.
 pub(super) fn latest_scan_time_for_site(
     panes: &[rustdar_egui::pane::PaneState],
     site: &str,
@@ -1550,10 +1597,12 @@ pub(super) struct LoopScanRequest {
 /// `reinit_active_loops` runs this for every looping pane in turn, and a loop that
 /// took the active pane's site would show that radar under its own pane's label.
 ///
-/// The pane's `scan_info` can lag its `site` field briefly after a site switch,
-/// while the new site's scan is still loading. The loop built in that window is
-/// stale but not wrong: its code, its coordinates and its listing all come from the
-/// one `RadarSite` in that `scan_info`, and the next scan to land re-runs this.
+/// Anchored on the pane's `scan_info` rather than on its `site` field, so the
+/// loop's product code, its coordinates and its listing all come from the one
+/// `RadarSite` the volume in hand actually is. Between a site switch and the new
+/// site's first volume there is no `scan_info` to anchor on, so this answers
+/// `None` and the scan that lands re-runs it — a wait rather than a loop of the
+/// radar the user has just left.
 fn begin_loop_for_pane(
     panes: &mut [rustdar_egui::pane::PaneState],
     loop_mgr: &mut crate::loop_downloads::LoopDownloadManager,
@@ -1687,3 +1736,7 @@ mod loop_frame_image_tests;
 #[path = "app_fetch/loop_pane_tests.rs"]
 #[cfg(test)]
 mod loop_pane_tests;
+
+#[path = "app_fetch/site_switch_tests.rs"]
+#[cfg(test)]
+mod site_switch_tests;

@@ -2203,19 +2203,22 @@ fn a_volume_no_pane_is_showing_is_dropped() {
     );
 }
 
-/// The window a site switch opens.
+/// A pane is under two site names and eviction has to honour both.
 ///
-/// `SwitchRadarSite` moves `pane.site` immediately, but the pane goes on
-/// drawing the old radar until the new volume lands — and
-/// `dispatch_pane_renders` looks that volume up under `scan_info.site.name`,
-/// not under `pane.site`. An eviction keyed on the live site alone therefore
-/// pulls the scan out from under a pane still rendering from it, and the
-/// symptom is a product change that silently does nothing until the switch
-/// completes.
+/// `pane.site` is the radar the pane is aimed at; `scan_info.site.name` is the
+/// radar the volume it is drawing came from, and it is the second that
+/// `dispatch_pane_renders` looks the volume up under. Keyed on the live site
+/// alone, eviction pulls the scan out from under a pane still rendering from it,
+/// and the symptom is a product change that silently does nothing.
 ///
-/// `base_scans` rides the same `shown` set for the same window: a 3D pane
-/// mid-switch is still building from the old site's base volume, and an
-/// eviction keyed on the live site alone would free it under the resampler.
+/// `base_scans` rides the same `shown` set for the same reason: a 3D pane builds
+/// from the base volume of the site its scan came from, and an eviction keyed on
+/// the live site alone would free it under the resampler.
+///
+/// Nothing writes the two names apart today — `SwitchRadarSite` drops the
+/// `scan_info` with the site, and every path that copies a pane's site copies its
+/// scan beside it — so the divergence here is built by hand. The union is what
+/// keeps that a *property of the pane* rather than of one handler remembering.
 #[test]
 fn the_volume_a_switching_pane_is_still_drawing_survives() {
     let mut app = headless(TestBridge::desktop());
