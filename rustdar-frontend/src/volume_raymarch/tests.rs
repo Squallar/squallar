@@ -975,6 +975,46 @@ fn a_grids_byte_count_is_four_per_cell_and_the_budget_counts_the_mip() {
     }
 }
 
+/// An omitted coarse level is one level in the descriptor — the allocation,
+/// not merely the write.
+///
+/// Skipping the `write_texture` alone would leave the 4 MiB resident and
+/// zeroed, which is the worse of both outcomes: the memory is still held, and
+/// a uniform that did ask for level 1 would march empty space instead of being
+/// clamped back to the raw field. `mip_level_count` is the thing that has to
+/// move, so `mip_level_count` is what this asserts, on every shipped shape.
+///
+/// The budget arithmetic deliberately does *not* follow: `grid_bytes_with_mips`
+/// is a ceiling and an eviction figure, and both want the level that may be
+/// there. See its doc.
+#[test]
+fn an_omitted_coarse_level_leaves_the_texture_with_one_level() {
+    for cells in [[256, 256, 128], [192, 192, 96], [128, 128, 64]] {
+        assert_eq!(grid_mip_levels(cells, CoarseLevel::Built), GRID_MIP_LEVELS);
+        assert_eq!(
+            grid_mip_levels(cells, CoarseLevel::Omitted),
+            1,
+            "the {cells:?} grid still allocates a coarse level nothing on \
+             this device will sample",
+        );
+        // What the saving is, on the shape it is largest: 4 MiB of 36.
+        let with = grid_bytes_with_mips(cells).expect("a shipped shape fits");
+        let without = grid_bytes(cells).expect("a shipped shape fits");
+        assert_eq!(with - without, grid_bytes(coarse_cells(cells)).unwrap());
+        assert_eq!(
+            with - without,
+            without / 8,
+            "every shipped shape halves on all three axes, so the level left \
+             out is an eighth of the raw field — 4 MiB of the desktop grid's \
+             36, and 56 MiB across a 14-frame desktop 3D loop",
+        );
+    }
+    // A grid too small to halve keeps one level either way — the shape rung
+    // that would need two is the one `create_texture` refuses.
+    assert_eq!(grid_mip_levels([1, 1, 1], CoarseLevel::Built), 1);
+    assert_eq!(grid_mip_levels([1, 1, 1], CoarseLevel::Omitted), 1);
+}
+
 /// An offscreen never has a zero axis, and a real size passes through.
 ///
 /// Both halves: clamping unconditionally to 1 would be as wrong as not

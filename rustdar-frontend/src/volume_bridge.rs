@@ -99,7 +99,7 @@ use rustdar_radar::voxel::VoxelGrid;
 use crate::egui_renderer::AttachmentConfig;
 use crate::volume::VolumeSupport;
 use crate::volume::quality::VolumeQuality;
-use crate::volume::raymarch::{OffscreenTarget, VolumePipelines, VolumeTextures};
+use crate::volume::raymarch::{CoarseLevel, OffscreenTarget, VolumePipelines, VolumeTextures};
 use crate::volume::uniform::VolumeUniform;
 
 /// The fewest see-through entries a grid's table may have, anywhere on its
@@ -241,6 +241,33 @@ pub fn cloud_reconstruction_lod_for(largest_cell_km: f32) -> f32 {
     let travel = CLOUD_SMOOTHING_RAW_CELL_KM - CLOUD_SMOOTHING_FULL_CELL_KM;
     let weight = ((CLOUD_SMOOTHING_RAW_CELL_KM - largest_cell_km) / travel).clamp(0.0, 1.0);
     CLOUD_RECONSTRUCTION_LOD * weight
+}
+
+/// Whether a grid uploaded on this device, at this cell size, will ever have
+/// its coarse mip level sampled — and so whether the upload should allocate
+/// one. See [`CoarseLevel`] for the cost, and the cross-reference behind the
+/// answer.
+///
+/// Both arguments are the *same two numbers* the paint path above writes into
+/// `gradient_shading` and feeds [`cloud_reconstruction_lod_for`], and this is
+/// deliberately expressed by calling that function rather than by restating
+/// its knee: the level is uploaded exactly when the level would be read, and
+/// a taper that moved without this moving with it would either waste the
+/// memory again or — much worse — leave the smoothing sampling a level that is
+/// not there.
+///
+/// It cannot consult the view mode. Isosurface takes the reconstruction level
+/// to 0 per frame, but the upload is cached across frames and a pane can be
+/// switched back to the lit volume without rebuilding its grid; an upload that
+/// dropped the level for a mode would leave the volume unsmoothed on the way
+/// back. Skipping this is only correct for things that cannot change under the
+/// cached upload, and the mode is not one.
+fn coarse_level_for(gradient_shading: bool, largest_cell_km: f32) -> CoarseLevel {
+    if gradient_shading && cloud_reconstruction_lod_for(largest_cell_km) > 0.0 {
+        CoarseLevel::Built
+    } else {
+        CoarseLevel::Omitted
+    }
 }
 
 /// The march's skip threshold for a palette whose
@@ -1687,7 +1714,7 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
             }
             std::collections::hash_map::Entry::Vacant(vacant) => {
                 let shape = self.grid.shape();
-                let Some(textures) = pipelines.upload_volume(
+                let Some(textures) = pipelines.upload_volume_at(
                     device,
                     queue,
                     [shape.nx as u32, shape.ny as u32, shape.nz as u32],
@@ -1697,6 +1724,15 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
                     // grid's bytes untouched when there is no curve. See the
                     // module doc.
                     &effective_lut(self.grid.lut(), self.alpha.as_ref()),
+                    // Off the uniform, because the uniform is where the two
+                    // facts already agree: `gradient_shading` is the adapter's
+                    // shading rung, which is fixed for the renderer's life, and
+                    // the cell size comes from the same extents and dims the
+                    // shader is handed. See `coarse_level_for`.
+                    coarse_level_for(
+                        self.uniform.gradient_shading,
+                        largest_cell_km(&self.uniform),
+                    ),
                 ) else {
                     // `upload_volume` has already logged which invariant it
                     // refused on. Nothing to add, and nothing to draw.

@@ -788,6 +788,71 @@ fn the_cloud_smoothing_tapers_with_cell_size_and_spares_the_default_box() {
     );
 }
 
+/// The coarse mip level is allocated exactly where the taper would read it,
+/// and nowhere else — which on every shipped platform but one is nowhere.
+///
+/// The upload used to carry the level unconditionally: 4 MiB of a 36 MiB
+/// desktop grid, a second `write_texture`, and a CPU pass over the whole
+/// index plane, all to fill a level the shader reads only when
+/// `flags.y > 0`. This pins the cross-reference that makes skipping it safe,
+/// on the same predicate the paint path raises `gradient_shading` and picks
+/// `reconstruction_lod` from — so a taper change cannot leave the smoothing
+/// sampling a level that was never allocated.
+///
+/// The mobile and wasm32 rows are the platform ceilings themselves rather
+/// than a restatement of them: `capped_by` is what `paint` is subject to, and
+/// both ceilings put `GradientShading::Off` on every adapter those targets
+/// can have, so the level is dead there at every box.
+#[test]
+fn the_coarse_level_is_built_only_where_something_will_sample_it() {
+    use crate::volume::quality::{MOBILE_PLATFORM_CEILING, VolumeQuality, WASM_PLATFORM_CEILING};
+
+    // The one live case: a discrete desktop GPU, lit volume, region box.
+    for cell_km in [60.0 / 256.0, 160.0 / 256.0] {
+        assert_eq!(
+            coarse_level_for(true, cell_km),
+            CoarseLevel::Built,
+            "at {cell_km:.3} km/cell the taper reads the coarse level, so it \
+             has to exist",
+        );
+    }
+
+    // The default desktop box, on that same discrete GPU. 1.8 km cells are
+    // past the taper's 1.75 km zero, so the level is dead at the shipped
+    // default view.
+    let default_cell = largest_cell_km(&VolumeUniform::new([460.0, 460.0, 18.0], [256, 256, 128]));
+    assert_eq!(
+        cloud_reconstruction_lod_for(default_cell),
+        0.0,
+        "the premise moved: see the taper test above",
+    );
+    assert_eq!(
+        coarse_level_for(true, default_cell),
+        CoarseLevel::Omitted,
+        "the default 460 km box marches the raw field, so its 4 MiB coarse \
+         level is 4 MiB nothing samples",
+    );
+
+    // Every adapter on wasm32 and mobile, and every desktop adapter below
+    // discrete: shading off, so `flags.y` is never raised and no cell size
+    // can bring the level back.
+    for ceiling in [WASM_PLATFORM_CEILING, MOBILE_PLATFORM_CEILING] {
+        assert!(
+            !VolumeQuality::BEST.capped_by(ceiling).shading.is_on(),
+            "the platform ceiling {ceiling:?} now admits shading, so this \
+             target can reach the coarse level and the row below is wrong",
+        );
+    }
+    for cell_km in [60.0 / 256.0, 1.2, default_cell] {
+        assert_eq!(
+            coarse_level_for(false, cell_km),
+            CoarseLevel::Omitted,
+            "with shading off the shader never reads a nonzero LOD, so no \
+             box may allocate the level",
+        );
+    }
+}
+
 /// [`empty_index_threshold_for`] sits strictly between the last fully
 /// transparent palette entry and the first visible one, for every band.
 ///

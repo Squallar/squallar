@@ -752,6 +752,9 @@ impl VolumePipelines {
     ///
     /// `lut` is [`VOLUME_LUT_BYTES`] of straight (non-premultiplied),
     /// gamma-encoded RGBA — what `get_color_for_value` produces.
+    ///
+    /// The grid carries its coarse level. [`Self::upload_volume_at`] is the
+    /// arm that can leave it out; see [`CoarseLevel`] for who may.
     pub fn upload_volume(
         &self,
         device: &wgpu::Device,
@@ -759,6 +762,24 @@ impl VolumePipelines {
         cells: [u32; 3],
         indices: &[u8],
         lut: &[u8],
+    ) -> Option<VolumeTextures> {
+        self.upload_volume_at(device, queue, cells, indices, lut, CoarseLevel::Built)
+    }
+
+    /// [`Self::upload_volume`], told whether this device will ever sample the
+    /// coarse level.
+    ///
+    /// The caller decides, because the two facts it takes both live above this
+    /// module: the adapter's shading rung and the grid's own cell size. See
+    /// [`CoarseLevel`].
+    pub fn upload_volume_at(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        cells: [u32; 3],
+        indices: &[u8],
+        lut: &[u8],
+        coarse: CoarseLevel,
     ) -> Option<VolumeTextures> {
         if let Some(why) = upload_refusal(cells, indices.len(), lut.len()) {
             log::error!("3D volume view: {why}");
@@ -772,16 +793,23 @@ impl VolumePipelines {
                 height: cells[1],
                 depth_or_array_layers: cells[2],
             },
-            // Two levels: the raw grid, and the hand-built two-cell mean the
-            // reconstruction LOD blends towards. wgpu generates no mips; the
-            // level is computed on the CPU below, which for the desktop
-            // shape's 16 MiB premultiplied plane is a single pass over the
-            // bytes at upload time. A grid too
-            // small to halve (a 1x1x1 box, which no shape produces but the
-            // upload accepts) keeps one level — `create_texture` would refuse
-            // two, from a call with no `Result`, and the sampler clamps an
-            // out-of-range LOD to the levels that exist.
-            mip_level_count: grid_mip_levels(cells),
+            // Two levels when this device will read the second one: the raw
+            // grid, and the hand-built two-cell mean the reconstruction LOD
+            // blends towards. wgpu generates no mips; the level is computed on
+            // the CPU below, which for the desktop shape is a pass over the
+            // index plane at upload time.
+            //
+            // One level when it will not ([`CoarseLevel::Omitted`]) — the
+            // allocation is what is being saved, so this has to be the
+            // descriptor rather than a skipped `write_texture`. And one level
+            // for a grid too small to halve (a 1x1x1 box, which no shape rung
+            // produces but the upload accepts): `create_texture` would refuse
+            // two, from a call with no `Result`.
+            //
+            // Either way the sampler clamps an out-of-range LOD to the levels
+            // that exist, so a uniform that asks for level 1 of a one-level
+            // grid marches the raw field rather than failing.
+            mip_level_count: grid_mip_levels(cells, coarse),
             sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
             format: VOLUME_TEXTURE_FORMAT,
@@ -807,7 +835,7 @@ impl VolumePipelines {
                 depth_or_array_layers: cells[2],
             },
         );
-        if grid_mip_levels(cells) > 1 {
+        if grid_mip_levels(cells, coarse) > 1 {
             upload_coarse_level(queue, &grid, cells, indices);
         }
 
@@ -1200,8 +1228,8 @@ pub fn grid_bytes(cells: [u32; 3]) -> Option<usize> {
     cell_count(cells)?.checked_mul(GRID_BYTES_PER_CELL as usize)
 }
 
-/// Bytes the grid texture really costs: every level [`grid_mip_levels`] gives
-/// it, at [`GRID_BYTES_PER_CELL`] a cell.
+/// Bytes the grid texture costs **at its worst**: every level
+/// [`grid_mip_levels`] can give it, at [`GRID_BYTES_PER_CELL`] a cell.
 ///
 /// Separate from [`grid_bytes`] because the two answer different questions —
 /// `grid_bytes` sizes the upload buffer for one level, this sizes the
@@ -1209,24 +1237,66 @@ pub fn grid_bytes(cells: [u32; 3]) -> Option<usize> {
 /// the allocation. Before the coverage channel landed the budget quietly
 /// counted mip 0 alone and the coarse level rode in the headroom; now both are
 /// named.
+///
+/// The coarse level, when [`CoarseLevel::Omitted`] leaves it out. A budget is a
+/// ceiling and a residency figure feeding an eviction is a thing that must not
+/// under-count, so both want the level that *may* be there — an upload that
+/// skipped it costs 11% less than this says on the desktop shape, which is the
+/// safe direction for both callers. The saving is real GPU memory either way;
+/// what it does not do is let the loop hold a fifteenth frame.
 pub fn grid_bytes_with_mips(cells: [u32; 3]) -> Option<usize> {
     let mut total = grid_bytes(cells)?;
-    if grid_mip_levels(cells) > 1 {
+    if grid_mip_levels(cells, CoarseLevel::Built) > 1 {
         total = total.checked_add(grid_bytes(coarse_cells(cells))?)?;
     }
     Some(total)
+}
+
+/// Whether an upload gives the grid texture its coarse mip level at all.
+///
+/// # Why this is a decision and not a constant
+///
+/// The shader reads a nonzero LOD only when the uniform's shading flag is
+/// raised *and* `volume::bridge::cloud_reconstruction_lod_for` hands it a
+/// nonzero level — and cross-referencing those two against what each platform
+/// can reach, the second level is live in one place: a **discrete desktop GPU,
+/// in lit-volume mode, at a region box**. It is dead on wasm32 and on mobile
+/// (both platform ceilings are `Half + GradientShading::Off`), dead on desktop
+/// integrated, virtual and software adapters, dead in isosurface mode, which
+/// takes the level back to 0 for reasons of its own — and dead at the
+/// **default** desktop 460 km box, whose 1.80 km cells are past the taper's
+/// 1.75 km zero.
+///
+/// Everywhere else it was 4 MiB of a 36 MiB upload, a second `write_texture`,
+/// and a CPU pass over the whole index plane, to fill a level nothing sampled.
+/// A 14-frame desktop 3D loop held 56 MiB of it.
+///
+/// Both facts the decision needs are fixed for a grid's whole life — the
+/// adapter's shading rung is chosen once when the renderer is built, and the
+/// cell size is a property of the grid — which is what makes it safe to bake
+/// into an upload that is cached and reused across frames. Neither the pane's
+/// view mode nor its size may be read here: those change under a cached upload,
+/// and a texture that has already been allocated cannot grow a level back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoarseLevel {
+    /// Build it and upload it.
+    Built,
+    /// Leave it out of the descriptor. Not merely unwritten — unallocated,
+    /// which is the whole point.
+    Omitted,
 }
 
 /// Mip levels the grid texture carries: the raw field, and one hand-built
 /// two-cell mean below it for the reconstruction LOD to blend towards.
 pub const GRID_MIP_LEVELS: u32 = 2;
 
-/// Mip levels a grid of this shape can actually carry: [`GRID_MIP_LEVELS`]
-/// unless the grid is too small to halve on every axis at once — a 1x1x1
-/// grid, which no shape rung produces but the upload accepts, and for which
-/// `create_texture` would refuse a second level from a call with no `Result`.
-fn grid_mip_levels(cells: [u32; 3]) -> u32 {
-    if cells.iter().copied().max().unwrap_or(0) >= 2 {
+/// Mip levels a grid of this shape actually gets: [`GRID_MIP_LEVELS`] unless
+/// the caller has said nothing will sample the second one, or the grid is too
+/// small to halve on every axis at once — a 1x1x1 grid, which no shape rung
+/// produces but the upload accepts, and for which `create_texture` would refuse
+/// a second level from a call with no `Result`.
+fn grid_mip_levels(cells: [u32; 3], coarse: CoarseLevel) -> u32 {
+    if coarse == CoarseLevel::Built && cells.iter().copied().max().unwrap_or(0) >= 2 {
         GRID_MIP_LEVELS
     } else {
         1
