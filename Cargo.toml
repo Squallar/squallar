@@ -11,6 +11,12 @@ members = [
     "rustdar-units",
     "rustdar-gps",
     "nexrad-level3",
+    # A vendored crates.io crate, and a member rather than an `exclude` on
+    # purpose: its own test targets and its 15 in-source snapshot suites are
+    # the WSR-88D behaviour pin that the decode patch has to leave untouched,
+    # and they only run if `cargo test --workspace` selects them. See
+    # vendor/nexrad-decode/VENDORED.md and `[patch.crates-io]` below.
+    "vendor/nexrad-decode",
 ]
 
 [workspace.package]
@@ -99,6 +105,43 @@ reqwest = { version = "=0.13.4", default-features = false, features = [
 
 rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std"] }
 
+# The published nexrad-decode cannot read a TDWR volume, so this workspace
+# builds against a copy it owns.
+#
+# The defect is one line of framing. `decode_messages` accepts wherever the
+# Message 31 body parser happened to stop instead of the end the message
+# header declared. WSR-88D pads its bodies to nothing, so the two agree and
+# rc.3 is accidentally correct; TDWR pads every radial to an 8-byte boundary,
+# so each message leaves 4-7 bytes of slack, the next header is read out of
+# that padding, and the record never resyncs -- byte-verified on
+# TPIT20260810_000139_V08: 328 warnings and 782 garbage messages before,
+# 48/48 records x 120/120 radials and zero warnings after. Nothing else in
+# this tree can fix it: both ingest paths reach the decoder through
+# nexrad-data, and there is no seam to work around it in.
+#
+# Vendored rather than forked because a git dependency would put this
+# workspace's build on somebody's branch surviving; vendored rather than
+# pinned-and-waited because 1.0.0-rc.3 is the newest published version and
+# upstream `main` still has the identical logic. The fix is meant to go
+# upstream -- VENDORED.md carries the diff list and the PR placeholder -- and
+# this patch entry is meant to be deleted the day a release contains it.
+#
+# `[patch]` and not a direct path dependency, because nexrad-data (=1.0.0-rc.7)
+# depends on nexrad-decode itself, with a caret requirement that 1.0.0-rc.3
+# satisfies. A path dependency would leave *two* nexrad-decodes in the graph:
+# ours for this workspace's own calls, the registry's for everything reached
+# through nexrad-data -- which is most of the decoding, so the bug would still
+# be live. Patching the source redirects both. `[workspace.dependencies]`
+# above keeps its exact `=1.0.0-rc.3` pin and the vendored `package.version`
+# stays exactly `1.0.0-rc.3` (no `+local` metadata), because a patch is only
+# accepted for a version that satisfies the requirement it replaces.
+#
+# Visible in Cargo.lock as the nexrad-decode entry losing its `source` and
+# `checksum` lines. `cargo tree -i nexrad-decode` must keep printing exactly
+# one node, and that node must name the path.
+[patch.crates-io]
+nexrad-decode = { path = "vendor/nexrad-decode" }
+
 # File and line in every frame, and nothing beyond it. A backtrace, a panic
 # location and a `#[track_caller]` frame are all line-table lookups, so each
 # one still names a source position exactly as before; what leaves is the
@@ -134,6 +177,17 @@ debug = "line-tables-only"
 # because the debug info that no longer has to be emitted and linked costs more
 # than the extra optimization does.
 [profile.dev.package."*"]
+opt-level = 2
+
+# `"*"` above means "every package that is not a workspace member", so the
+# moment nexrad-decode became a member it fell out of that override and back to
+# opt-level 0. It is not workspace code in any sense that matters -- nobody
+# steps through a vendored byte parser -- and it is the hottest loop in a dev
+# run: every radial of every record of every volume goes through it. Naming it
+# here puts it back where it was as a plain dependency.
+#
+# Delete this together with the `[patch.crates-io]` entry above.
+[profile.dev.package.nexrad-decode]
 opt-level = 2
 
 [profile.release]
