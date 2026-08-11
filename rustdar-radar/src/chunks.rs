@@ -688,17 +688,22 @@ enum Cut {
     Sealed(nexrad_model::data::Sweep),
     /// Terminated, or closed with the volume, short of its radial count.
     ///
-    /// Kept as a diagnostic and **never** placed in a snapshot. `nrot::llsd_nrot`
-    /// wraps its neighbour lookups with `.rem_euclid(num_radials)`, so a
-    /// half-received cut is differentiated across the gap as well as along the
-    /// arc: the last received radial is stitched to the first, manufacturing a
-    /// rotation signature out of the hole between them. It bails only at zero
-    /// radials, so nothing downstream would catch this. What no longer compounds
-    /// it is the scale — `nrot::radial_step_deg` measures the grid's own azimuth
-    /// step instead of taking `360 / rows`, so a half cut is differentiated over
-    /// the arc it covers rather than over twice it, and
-    /// `render::derived_grid_wedge_deg` paints it at that same spacing. The
-    /// values at the seam are still manufactured.
+    /// Kept as a diagnostic and **never** placed in a snapshot, because a cut
+    /// that lost a chunk out of its middle is a grid with a hole in the middle:
+    /// radials 1..120 and 241..360 land as 240 consecutive rows, and rows 119
+    /// and 120 of that grid are 121° apart with nothing between them.
+    /// `nrot::llsd_nrot` differentiates across that seam like any other pair of
+    /// adjacent rows — `azimuth::Rows` measures where a grid *ends*, which is
+    /// what keeps a sector's two edges honest, and knows nothing about where
+    /// one is sparse. It bails only at zero radials, so nothing downstream
+    /// would catch this.
+    ///
+    /// The two things that no longer compound it: the scale, since
+    /// `azimuth::Rows` measures the grid's own step instead of taking
+    /// `360 / rows` (a half cut is differentiated over the arc it covers rather
+    /// than over twice it, and `render::derived_grid_wedge_deg` paints it at
+    /// that same spacing), and the outer edges, which now read ND rather than
+    /// each other's velocities.
     Abandoned { have: usize, expected: usize },
 }
 

@@ -83,63 +83,30 @@ pub struct VelocitySweep<'a> {
     pub gate_interval_km: f64,
 }
 
-/// How much of the circle a sweep's radials must account for, at their own
-/// measured spacing, before [`radial_step_deg`] calls the sweep closed and
-/// takes `360 / n` for its step.
+/// How this sweep's rows sit in azimuth: the step every stencil's
+/// `arc_per_radial` is built from — and so the scale of every NROT value this
+/// module reports — together with whether row `n−1` borders row 0.
 ///
-/// The two answers differ by exactly the fraction of the circle that is
-/// missing, so this is what bounds the error the closed branch can carry: 2%,
-/// which on a significant rotation of 1.0 is 0.02 — half the 0.04 step the
-/// reference quantizes its own output in, and therefore invisible in the only
-/// comparison this pipeline is calibrated against.
+/// [`crate::azimuth::Rows`] holds both and says why they are one question.
+/// What the answers cost *here*, when a sector takes the complete cut's pair
+/// (`360 / n`, and "the last row borders the first"), is two separate wrong
+/// numbers:
 ///
-/// The margin on the other side is far wider than the noise it has to survive.
-/// A complete cut's azimuths jitter by a few hundredths of a degree, which
-/// moves the median of its 720 gaps by about a thousandth of one — 0.2% of a
-/// step, against the 2% this leaves — so a cut that did close the circle
-/// cannot fall through the test. Nor are the sweeps that do fall through near
-/// cases: a 90° TDWR sector accounts for a quarter of the circle, a
-/// half-received cut for half of it, and the abandoned 200° tail that
-/// [`crate::azimuth::median_azimuth_step_deg`] exists for covers 55%.
-const CLOSED_SWEEP_COVERAGE: f64 = 0.98;
-
-/// How far apart this grid's adjacent rows are in azimuth, degrees — the step
-/// every stencil's `arc_per_radial` is built from, and so the scale of every
-/// NROT value this module reports.
-///
-/// On a sweep that closes the circle, `360 / n` is not an estimate of that
-/// step: n radials laid around a circle leave n gaps summing to exactly 360°,
-/// so their mean is exactly `360 / n` however much the antenna jittered on the
-/// way round. A complete cut therefore takes it unmeasured, and every WSR-88D
-/// VCP cut is a complete cut.
-///
-/// On a sweep that stops short, `360 / n` is the spacing of nothing. A 36°
-/// sector of 72 radials is 0.5° apart and reads 5°, so every arc is ten times
-/// too long and every rotation over it ten times too small — a tornadic
-/// couplet at 1.8 comes back 0.18, under the 0.25 [`SIGNIFICANT`] floor, and
-/// the product paints nothing where the strongest rotation in the sector is.
-/// There the step is measured, and [`crate::azimuth::median_azimuth_step_deg`]
-/// is where this crate measures it: **median**, so the one abandoned arc in a
-/// half-received cut is not averaged into everyone's spacing, and **shared**,
-/// so a sweep is differentiated at the same spacing the sampler serves it and
-/// the plan view paints it at.
-///
-/// The declared `Radial::azimuth_spacing_degrees` is the other candidate and is
-/// the wrong one here. What the stencils need is the angle between rows `i` and
-/// `i+1` of the grid in front of them, which is a property of how the grid was
-/// assembled — a sweep of 0.5° radials handed over every other radial has 1.0°
-/// rows whatever each radial declares — and a declaration of zero, which the
-/// derived grids' own synthetic radials are one refactor away from carrying,
-/// would divide the arc to nothing and clamp the whole sweep to ±5. The
-/// measurement cannot return zero: it drops zero gaps.
-fn radial_step_deg(azimuths_deg: &[f64], num_radials: usize) -> f64 {
-    let closed = 360.0 / num_radials.max(1) as f64;
-    match crate::azimuth::median_azimuth_step_deg(azimuths_deg.iter().copied()) {
-        Some(step) if step * (num_radials as f64) < CLOSED_SWEEP_COVERAGE * 360.0 => step,
-        // Nothing to measure between — one radial, or a sweep that reported
-        // one azimuth n times. Neither is a sector.
-        _ => closed,
-    }
+/// * **Scale.** A 36° sector of 72 radials is 0.5° apart and reads 5°, so every
+///   arc is ten times too long and every rotation over it ten times too small —
+///   a tornadic couplet at 1.8 comes back 0.18, under the 0.25 [`SIGNIFICANT`]
+///   floor, and the product paints nothing where the strongest rotation in the
+///   sector is.
+/// * **Seam.** Both stencils need every cell of a ±5 span, so the outermost
+///   five rows at each end of that sector are read partly from the other end of
+///   it — 324° away, across ground the antenna never pointed at. A field of 6
+///   (m/s)/km of honest shear stands 187 m/s apart across those two ends at 50
+///   km, and dividing that by the 0.44 km of arc half a degree spans saturates:
+///   rows 0, 1, 70 and 71 come back at the ±5 clamp and rows 3 and 68 at 2.49,
+///   against the 0.43 the field carries there and with nothing rotating
+///   anywhere in it.
+fn sweep_rows(sweep: &VelocitySweep, num_radials: usize) -> crate::azimuth::Rows {
+    crate::azimuth::Rows::of(sweep.azimuths_deg, num_radials)
 }
 
 /// Run the full pipeline without a wind profile (elevation assumed 0.5°).
@@ -160,14 +127,18 @@ pub fn compute_nrot_grid_with_profile(
 ) -> Vec<Vec<f64>> {
     let med = preprocess_velocity_with(sweep, elevation_deg, profile);
     let mut grid = llsd_nrot(sweep, &med);
-    despeckle_nrot(&mut grid, DESPECKLE_MIN_BINS);
+    despeckle_nrot(
+        &mut grid,
+        DESPECKLE_MIN_BINS,
+        sweep_rows(sweep, sweep.vel_grid.len()),
+    );
     grid
 }
 
 /// Blank painted clusters smaller than `min_bins`: 8-connected components of
 /// |NROT| ≥ [`SIGNIFICANT`] (either sign — a tiny dipole is still speckle).
-/// Azimuth wraps; range does not.
-fn despeckle_nrot(grid: &mut [Vec<f64>], min_bins: usize) {
+/// Azimuth wraps where the sweep closes the circle; range never does.
+fn despeckle_nrot(grid: &mut [Vec<f64>], min_bins: usize, rows: crate::azimuth::Rows) {
     let num_radials = grid.len();
     if num_radials == 0 {
         return;
@@ -191,7 +162,11 @@ fn despeckle_nrot(grid: &mut [Vec<f64>], min_bins: usize) {
             while let Some((i, j)) = stack.pop() {
                 comp.push((i, j));
                 for di in -1i32..=1 {
-                    let ii = ((i as i32 + di).rem_euclid(num_radials as i32)) as usize;
+                    // Two clusters at the two ends of a sector are two
+                    // clusters, each counted against `min_bins` on its own.
+                    let Some(ii) = rows.neighbour(i, di) else {
+                        continue;
+                    };
                     for dj in -1i32..=1 {
                         let jj = j as i32 + dj;
                         if jj < 0 || jj >= gate_count as i32 {
@@ -239,7 +214,7 @@ fn preprocess_velocity_with(
         sweep.gate_count,
         sweep.first_gate_range_km,
         sweep.gate_interval_km,
-        radial_step_deg(sweep.azimuths_deg, sweep.vel_grid.len()),
+        sweep_rows(sweep, sweep.vel_grid.len()),
     )
 }
 
@@ -520,12 +495,12 @@ fn median_filter(
     gate_count: usize,
     first_gate_range_km: f64,
     gate_interval_km: f64,
-    step_deg: f64,
+    rows: crate::azimuth::Rows,
 ) -> Vec<Vec<f64>> {
-    let num_radials = vel_grid.len() as i32;
-    let spacing_rad = step_deg.to_radians();
+    let num_radials = vel_grid.len();
+    let spacing_rad = rows.step_deg.to_radians();
 
-    (0..num_radials as usize)
+    (0..num_radials)
         .into_par_iter()
         .map(|i| {
             let mut window: Vec<f64> = Vec::with_capacity(25);
@@ -544,7 +519,14 @@ fn median_filter(
                     let mut slots = 0u32;
                     let mut raw_occ = 0u32;
                     for da in -az_half..=az_half {
-                        let ai = ((i as i32 + da).rem_euclid(num_radials)) as usize;
+                        // A row past the end of a sector is skipped rather
+                        // than counted empty, which is what the range axis
+                        // does three lines down at the ends of the grid: the
+                        // occupancy cliff below asks what fraction of the
+                        // cells that exist carry raw data.
+                        let Some(ai) = rows.neighbour(i, da) else {
+                            continue;
+                        };
                         for dr in -MEDIAN_RNG_HALF..=MEDIAN_RNG_HALF {
                             let rj = j as i32 + dr;
                             if rj < 0 || rj >= gate_count as i32 {
@@ -823,8 +805,8 @@ fn split_stencil_rot(
     arc_per_radial: f64,
     gate_count: usize,
     pair_first: bool,
+    rows: crate::azimuth::Rows,
 ) -> Option<f64> {
-    let num_radials = vel_grid.len() as i32;
     // Range-averaged velocity at offsets −(4+margin)..=4+margin; prof[6 + o].
     let mut prof = [f64::NAN; 15];
     for (idx, slot) in prof.iter_mut().enumerate() {
@@ -832,7 +814,11 @@ fn split_stencil_rot(
         if da.abs() > 7 {
             continue;
         }
-        let ai = ((i as i32 + da).rem_euclid(num_radials)) as usize;
+        // Off the end of a sector's arc the cell stays NaN, and the
+        // completeness rules below read that as the data edge it is.
+        let Some(ai) = rows.neighbour(i, da) else {
+            continue;
+        };
         let (mut sum, mut n) = (0.0, 0);
         for dr in -STENCIL_RNG_HALF..=STENCIL_RNG_HALF {
             let rj = j as i32 + dr;
@@ -1011,13 +997,16 @@ fn az_profile<'p>(
     j: usize,
     gate_count: usize,
     half: i32,
+    rows: crate::azimuth::Rows,
 ) -> &'p [f64] {
-    let num_radials = vel_grid.len() as i32;
     let len = 2 * half as usize + 1;
     let slot = &mut out[..len];
     for (idx, cell) in slot.iter_mut().enumerate() {
         let da = idx as i32 - half;
-        let ai = ((i as i32 + da).rem_euclid(num_radials)) as usize;
+        let Some(ai) = rows.neighbour(i, da) else {
+            *cell = f64::NAN;
+            continue;
+        };
         let (mut sum, mut n) = (0.0, 0);
         for dr in -STENCIL_RNG_HALF..=STENCIL_RNG_HALF {
             let rj = j as i32 + dr;
@@ -1120,8 +1109,9 @@ fn gated_prof<'p>(
     j: usize,
     gate_count: usize,
     w: i32,
+    rows: crate::azimuth::Rows,
 ) -> Option<(&'p [f64], f64)> {
-    let prof = az_profile(out, vel_grid, i, j, gate_count, w + 3);
+    let prof = az_profile(out, vel_grid, i, j, gate_count, w + 3, rows);
     if prof.iter().any(|p| p.is_nan()) {
         return None;
     }
@@ -1147,11 +1137,14 @@ fn gated_prof<'p>(
 /// One bank kernel at one bin: the same clean/away weight assembly as
 /// [`split_stencil_rot`], normalized by the same two rows of this grid — the
 /// legacy 1.0° arc where the grid is super-res. It has to be the same
-/// divisor and the same [`pair_phase`] as the primary chain, since its output
-/// is only ever a cap on the primary's magnitude and two chains scaled over
-/// different arcs would cap by a ratio of arcs rather than by kernel shape.
+/// divisor, the same [`pair_phase`] and the same [`crate::azimuth::Rows`] as
+/// the primary chain, since its output is only ever a cap on the primary's
+/// magnitude: two chains scaled over different arcs would cap by a ratio of
+/// arcs rather than by kernel shape, and one reading past a sector's edge
+/// where the other stopped would cap a real value against a manufactured one.
 /// Requires every tap cell — a missing cell means the footprint bin keeps the
 /// primary chain's value.
+#[allow(clippy::too_many_arguments)]
 fn bank_kernel_rot(
     vel_grid: &[Vec<f64>],
     i: usize,
@@ -1160,11 +1153,12 @@ fn bank_kernel_rot(
     gate_count: usize,
     pair_first: bool,
     taps: TapPair,
+    rows: crate::azimuth::Rows,
 ) -> Option<f64> {
     let (clean, away) = taps;
     let span = clean.len() as i32;
     let mut buf = EMPTY_PROFILE;
-    let prof = az_profile(&mut buf, vel_grid, i, j, gate_count, span);
+    let prof = az_profile(&mut buf, vel_grid, i, j, gate_count, span, rows);
     let (plus, minus) = if pair_first {
         (clean, away)
     } else {
@@ -1222,10 +1216,13 @@ fn apply_kernel_bank(
     if num_radials == 0 {
         return;
     }
-    // The same step the primary chain used: the bank's output is a cap on the
+    // The same rows the primary chain read: the bank's output is a cap on the
     // primary's magnitude, and two chains measured over different arcs would
-    // cap by a ratio of arcs rather than by kernel shape.
-    let spacing_rad = radial_step_deg(sweep.azimuths_deg, num_radials).to_radians();
+    // cap by a ratio of arcs rather than by kernel shape — or, reading past a
+    // sector's edge where the primary would not, cap a real value against a
+    // manufactured one.
+    let rows = sweep_rows(sweep, num_radials);
+    let spacing_rad = rows.step_deg.to_radians();
     type Bank = [(i32, &'static [(i32, f64)], &'static [(i32, f64)]); 3];
     const BANK: Bank = [
         (2, &BANK_K2_CLEAN, &BANK_K2_AWAY),
@@ -1265,7 +1262,7 @@ fn apply_kernel_bank(
                     continue;
                 }
                 let mut buf = EMPTY_PROFILE;
-                let prof = az_profile(&mut buf, vel_grid, i, j, sweep.gate_count, 7);
+                let prof = az_profile(&mut buf, vel_grid, i, j, sweep.gate_count, 7, rows);
                 let mut vals = EMPTY_PROFILE;
                 let mut nvals = 0;
                 for &p in prof {
@@ -1301,6 +1298,7 @@ fn apply_kernel_bank(
                         sweep.gate_count,
                         i % 2 == phase,
                         (kc, ka),
+                        rows,
                     ) {
                         let kv = (BANK_CAP_GAIN * rot / divisor)
                             .clamp(-NROT_LIMIT, NROT_LIMIT)
@@ -1323,8 +1321,11 @@ fn apply_kernel_bank(
                 if v.is_nan() || v.abs() < BANK_DETECT_MIN {
                     continue;
                 }
-                let prev = col[(i + num_radials - 1) % num_radials];
-                let next = col[(i + 1) % num_radials];
+                // A row at the end of a sector's arc has no neighbour on that
+                // side, which is the same "no larger neighbour there" the two
+                // tests below already read out of a NaN.
+                let prev = rows.neighbour(i, -1).map_or(f64::NAN, |k| col[k]);
+                let next = rows.neighbour(i, 1).map_or(f64::NAN, |k| col[k]);
                 if (!prev.is_nan() && prev.abs() > v.abs())
                     || (!next.is_nan() && next.abs() > v.abs())
                 {
@@ -1337,7 +1338,7 @@ fn apply_kernel_bank(
                     // notch (one deep pole, weak counter-deviation) never
                     // balances; a symmetric rotation couplet does.
                     let Some((prof, balance)) =
-                        gated_prof(&mut buf, vel_grid, i, j, sweep.gate_count, w)
+                        gated_prof(&mut buf, vel_grid, i, j, sweep.gate_count, w, rows)
                     else {
                         continue;
                     };
@@ -1357,7 +1358,7 @@ fn apply_kernel_bank(
                 // recomputed three times per candidate core.
                 let mut asym_buf = EMPTY_PROFILE;
                 if let Some((prof, _)) =
-                    gated_prof(&mut asym_buf, vel_grid, i, j, sweep.gate_count, 3)
+                    gated_prof(&mut asym_buf, vel_grid, i, j, sweep.gate_count, 3, rows)
                 {
                     for &(neg_amp, clean, away) in BANK_ASYM.iter() {
                         // Asymmetric couplets fail the balance test by nature;
@@ -1385,13 +1386,16 @@ fn apply_kernel_bank(
                     sweep.gate_count,
                     i % 2 == phase,
                     (clean, away),
+                    rows,
                 )
                 .is_none()
                 {
                     continue;
                 }
                 for d in -(w + 2)..=(w + 2) {
-                    let ii = ((i as i32 + d).rem_euclid(num_radials as i32)) as usize;
+                    let Some(ii) = rows.neighbour(i, d) else {
+                        continue;
+                    };
                     if col[ii].is_nan() {
                         continue;
                     }
@@ -1403,6 +1407,7 @@ fn apply_kernel_bank(
                         sweep.gate_count,
                         ii % 2 == phase,
                         (clean, away),
+                        rows,
                     ) {
                         let kv = (rot / divisor).clamp(-NROT_LIMIT, NROT_LIMIT);
                         let mag = kv.abs().max(BANK_CAP_FLOOR * col[ii].abs());
@@ -1434,13 +1439,17 @@ fn composite_stencil_rot(
     j: usize,
     arc_per_radial: f64,
     gate_count: usize,
+    rows: crate::azimuth::Rows,
 ) -> Option<f64> {
-    let num_radials = vel_grid.len() as i32;
     // Range-averaged velocity per azimuthal offset; prof[5 ± o] holds ±o.
     let mut prof = [f64::NAN; 11];
     for (idx, slot) in prof.iter_mut().enumerate() {
         let da = idx as i32 - 5;
-        let ai = ((i as i32 + da).rem_euclid(num_radials)) as usize;
+        // As in the split stencil: past a sector's edge the cell stays NaN and
+        // the all-five-pairs rule below reads the data edge.
+        let Some(ai) = rows.neighbour(i, da) else {
+            continue;
+        };
         let (mut sum, mut n) = (0.0, 0);
         for dr in -STENCIL_RNG_HALF..=STENCIL_RNG_HALF {
             let rj = j as i32 + dr;
@@ -1496,7 +1505,8 @@ fn composite_stencil_rot(
 
 fn llsd_nrot(sweep: &VelocitySweep, vel_grid: &[Vec<f64>]) -> Vec<Vec<f64>> {
     let num_radials = vel_grid.len();
-    let spacing_rad = radial_step_deg(sweep.azimuths_deg, num_radials).to_radians();
+    let rows = sweep_rows(sweep, num_radials);
+    let spacing_rad = rows.step_deg.to_radians();
     let phase = pair_phase(sweep.azimuths_deg);
 
     let mut grid: Vec<Vec<f64>> = (0..num_radials)
@@ -1521,9 +1531,17 @@ fn llsd_nrot(sweep: &VelocitySweep, vel_grid: &[Vec<f64>]) -> Vec<Vec<f64>> {
                             arc_per_radial,
                             sweep.gate_count,
                             i % 2 == phase,
+                            rows,
                         )
                     } else {
-                        composite_stencil_rot(vel_grid, i, j, arc_per_radial, sweep.gate_count)
+                        composite_stencil_rot(
+                            vel_grid,
+                            i,
+                            j,
+                            arc_per_radial,
+                            sweep.gate_count,
+                            rows,
+                        )
                     };
                     match rot {
                         Some(rot) => {
@@ -2376,7 +2394,8 @@ mod tests {
         let gates = 40;
         let mut grid: Vec<Vec<f64>> = vec![vec![10.0; gates]; n];
         grid[20][20] = 90.0;
-        let filtered = median_filter(&grid, &grid, gates, 0.25, 0.25, 360.0 / n as f64);
+        let azs = ring_azimuths(n);
+        let filtered = median_filter(&grid, &grid, gates, 0.25, 0.25, rows_for(&azs, n));
         assert_eq!(filtered[20][20], 10.0);
         assert_eq!(filtered[10][10], 10.0);
     }
@@ -2438,30 +2457,39 @@ mod tests {
         );
     }
 
-    /// Every complete cut keeps the step it always had, bit for bit: n radials
-    /// around a circle leave n gaps summing to 360°, so `360 / n` is their
-    /// exact mean and a measured median is only a noisier reading of the same
-    /// number. Every constant in this module was calibrated against a full
-    /// rotation, so this is the invariance that leaves them measuring what
+    /// The rows `sweep_rows` reports for `azimuths`, without a grid to hang
+    /// them on: only the azimuths and the count decide.
+    fn rows_for(azimuths: &[f64], n: usize) -> crate::azimuth::Rows {
+        let grid: Vec<Vec<f64>> = Vec::new();
+        sweep_rows(&sweep(&grid, azimuths, 0), n)
+    }
+
+    /// Every complete cut is read exactly as it always was, in both halves of
+    /// the answer. The step stays `360 / n` bit for bit — n radials around a
+    /// circle leave n gaps summing to 360°, so that is their exact mean and a
+    /// measured median is only a noisier reading of the same number — and the
+    /// last row still borders the first, at every offset any stencil here
+    /// reaches for. Every constant in this module was calibrated against full
+    /// rotations, so this is the invariance that leaves them measuring what
     /// they were measured against.
     #[test]
-    fn a_closed_sweep_keeps_the_step_it_always_had() {
+    fn a_closed_sweep_is_read_exactly_as_it_always_was() {
         for n in [360usize, 720] {
-            assert_eq!(radial_step_deg(&ring_azimuths(n), n), 360.0 / n as f64);
+            assert_eq!(rows_for(&ring_azimuths(n), n).step_deg, 360.0 / n as f64);
         }
 
         // Collection order starts wherever the antenna was.
         let rolled: Vec<f64> = (0..720).map(|i| f64::from((i + 431) % 720) * 0.5).collect();
-        assert_eq!(radial_step_deg(&rolled, 720), 0.5);
+        assert_eq!(rows_for(&rolled, 720).step_deg, 0.5);
 
         // Real azimuths jitter by a few hundredths of a step; ±0.02° is that,
         // and the median of 720 such gaps still reads within a thousandth of a
-        // degree of the mean — ten times inside what CLOSED_SWEEP_COVERAGE
+        // degree of the mean — ten times inside what the closed-sweep test
         // leaves, so the sweep is still read as closed.
         let jittered: Vec<f64> = (0..720)
             .map(|i| i as f64 * 0.5 + 0.02 * (i as f64 * 1.7).sin())
             .collect();
-        assert_eq!(radial_step_deg(&jittered, 720), 0.5);
+        assert_eq!(rows_for(&jittered, 720).step_deg, 0.5);
 
         // One radial dropped is a hole in a rotation, not a sector: 719 × 0.5°
         // still accounts for 359.5° of the 360.
@@ -2469,7 +2497,22 @@ mod tests {
             .into_iter()
             .filter(|a| *a != 100.0)
             .collect();
-        assert_eq!(radial_step_deg(&dropped, 719), 360.0 / 719.0);
+        assert_eq!(rows_for(&dropped, 719).step_deg, 360.0 / 719.0);
+
+        // The seam. `PROFILE_MAX_HALF` is the widest any reader here reaches,
+        // and every one of them goes through this lookup, so a rotation that
+        // wraps at ±11 wraps everywhere this module indexes a neighbour.
+        let rows = rows_for(&jittered, 720);
+        let half = PROFILE_MAX_HALF as i32;
+        for i in 0..720 {
+            for d in -half..=half {
+                assert_eq!(
+                    rows.neighbour(i, d),
+                    Some((i as i32 + d).rem_euclid(720) as usize),
+                    "row {i} offset {d}",
+                );
+            }
+        }
     }
 
     /// The same physical shear presented twice — 0.5° radials all the way
@@ -2531,22 +2574,75 @@ mod tests {
         );
     }
 
-    /// Degenerate sweeps produce a step rather than an infinity or a zero.
-    /// There is nothing to divide among no radials or one; a sweep that
-    /// reported one azimuth n times has no gap to measure; and two radials —
-    /// where the measurement reports the *larger* of the two circular gaps by
-    /// construction — are not a sector, because 2 × 350° is more circle than
-    /// there is.
+    /// A sector has two edges, and neither of them is a place where anything
+    /// rotates. The same 6 (m/s)/km of azimuthal shear as the full-rotation
+    /// ramp test, laid over 36° of 0.5° radials: inside the arc every row reads
+    /// the value that ramp analytically carries, and the five rows at each end
+    /// — the ones whose ±5 stencil span reaches past a radial the antenna never
+    /// collected — read ND, which is what this module reports at every other
+    /// data edge.
+    ///
+    /// The number the two ends do *not* report is the point. Rows 0 and 71 sit
+    /// 324° apart across ground the sweep never looked at, and this field
+    /// stands 187 m/s apart across them at 50 km; over the 0.44 km of arc half
+    /// a degree spans, that saturates. Nothing anywhere in this sector is
+    /// allowed above 1.0, against a field whose own rotation runs from 0.29 at
+    /// 25 km to 0.86 at the far gate.
+    ///
+    /// Five rows an end and not four: the two stencils read ±4 but demand ±5,
+    /// because a bin whose support only just fits sits on a data edge where
+    /// half the profile is echo boundary ([`GK_DATA_MARGIN`]). That rule costs
+    /// one computable row at each end of a sector, and it is the same rule
+    /// spending the same row at every echo edge in every full rotation.
     #[test]
-    fn a_sweep_with_nothing_to_measure_keeps_the_closed_step() {
-        assert_eq!(radial_step_deg(&[], 0), 360.0);
-        assert_eq!(radial_step_deg(&[37.5], 1), 360.0);
-        assert_eq!(radial_step_deg(&[12.0; 8], 8), 45.0);
-        assert_eq!(radial_step_deg(&[0.0, 10.0], 2), 180.0);
+    fn a_sectors_edges_read_no_data_rather_than_its_far_end() {
+        let gates = 400;
+        let k = 6.0;
+        let azimuths: Vec<f64> = (0..72).map(|i| f64::from(i) * 0.5).collect();
+        let grid: Vec<Vec<f64>> = azimuths
+            .iter()
+            .map(|az| {
+                let dtheta = az.to_radians();
+                (0..gates)
+                    .map(|j| k * (0.25 + j as f64 * 0.25) * dtheta)
+                    .collect()
+            })
+            .collect();
+        let nrot = llsd_nrot(&sweep(&grid, &azimuths, gates), &grid);
 
-        // Three radials of sector run the whole pipeline without dividing an
-        // arc down to nothing: a constant field is incoherent, so every bin
-        // reads ND rather than the ±5 clamp a zero arc would produce.
+        let clean: f64 = SPLIT_CLEAN.iter().map(|&(o, t)| o as f64 * t).sum();
+        let away: f64 = SPLIT_AWAY.iter().map(|&(o, t)| o as f64 * t).sum();
+        for j in 100..300 {
+            let range_km = 0.25 + j as f64 * 0.25;
+            let expected = k * (clean + away) / 2.0 / rot_divisor(range_km / KM_PER_NM);
+            for i in (0..5).chain(67..72) {
+                assert!(
+                    nrot[i][j].is_nan(),
+                    "row {i} gate {j} read {} past the arc's edge",
+                    nrot[i][j],
+                );
+            }
+            for (i, row) in nrot.iter().enumerate().take(67).skip(5) {
+                assert!(
+                    (row[j] - expected).abs() < 1e-9,
+                    "row {i} gate {j} read {}, not the {expected} its shear carries",
+                    row[j],
+                );
+            }
+        }
+        assert!(
+            nrot.iter().flatten().all(|v| v.is_nan() || v.abs() < 1.0),
+            "a sector of pure shear painted a rotation",
+        );
+    }
+
+    /// A sweep far too small for anything here to read runs the whole pipeline
+    /// and reports nothing, rather than dividing an arc down to nothing or
+    /// indexing off its own end. Three radials cannot fill either stencil's ±5
+    /// span from inside a 1° arc, and there is nowhere else for the span to
+    /// come from.
+    #[test]
+    fn a_sweep_too_small_for_a_stencil_reads_nothing() {
         let grid = vec![vec![10.0; 200]; 3];
         let azs = vec![0.0, 0.5, 1.0];
         let out = compute_nrot_grid(&sweep(&grid, &azs, 200));
