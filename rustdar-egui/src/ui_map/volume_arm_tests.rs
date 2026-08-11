@@ -1130,7 +1130,13 @@ fn the_height_the_pane_reports_is_real_at_every_exaggeration() {
     for ex in [1.0f32, 3.0, 12.0] {
         let mut camera = crate::pane::OrbitCamera::default();
         camera.set_vertical_exaggeration(ex);
-        let lines = volume_caption("KTLX", at(33), None, None, camera);
+        let lines = volume_caption(
+            "KTLX",
+            at(33),
+            None,
+            crate::pane::BASE_HALF_WIDTH_KM,
+            camera,
+        );
         let height = lines
             .iter()
             .find(|l| l.contains("kft MSL"))
@@ -1163,7 +1169,13 @@ fn the_height_the_pane_reports_is_real_at_every_exaggeration() {
 /// freshest sweep's currency.
 #[test]
 fn the_caption_states_the_newest_data_time_not_a_whole_volume_claim() {
-    let lines = volume_caption("KTLX", at(39), Some(at(33)), None, Default::default());
+    let lines = volume_caption(
+        "KTLX",
+        at(39),
+        Some(at(33)),
+        crate::pane::BASE_HALF_WIDTH_KM,
+        Default::default(),
+    );
     assert!(
         lines[0].contains("KTLX") && lines[0].contains("newest data") && lines[0].contains("22:39"),
         "the first line must name the site and say the time is the newest \
@@ -1181,7 +1193,13 @@ fn the_caption_states_the_newest_data_time_not_a_whole_volume_claim() {
 /// reads as a full atmosphere.
 #[test]
 fn the_caption_names_the_base_volume_or_says_the_first_is_still_filling() {
-    let merged = volume_caption("KTLX", at(39), Some(at(33)), None, Default::default());
+    let merged = volume_caption(
+        "KTLX",
+        at(39),
+        Some(at(33)),
+        crate::pane::BASE_HALF_WIDTH_KM,
+        Default::default(),
+    );
     let base = merged
         .iter()
         .find(|l| l.contains("base volume"))
@@ -1191,32 +1209,40 @@ fn the_caption_names_the_base_volume_or_says_the_first_is_still_filling() {
         "the base line must carry the base volume's own time: {base}",
     );
 
-    let filling = volume_caption("KTLX", at(39), None, None, Default::default());
+    let filling = volume_caption(
+        "KTLX",
+        at(39),
+        None,
+        crate::pane::BASE_HALF_WIDTH_KM,
+        Default::default(),
+    );
     assert!(
         filling.iter().any(|l| l.contains("no complete volume yet")),
         "a first volume still filling must be said out loud: {filling:?}",
     );
 }
 
-/// The caption reports the resolution the region buys, and it moves with the
-/// region.
+/// The caption reports the resolution the box buys, and it moves with the
+/// box.
 ///
 /// The grid's cell count is fixed, so a tighter box spends the same cells
-/// over less ground — 1.80 km per cell at the whole-scan default against
-/// 0.16 at 20 km. That is the main reason to pick a region, and it is
-/// invisible unless it is written down.
+/// over less ground — 2.54 km per cell over a WSR-88D's whole reflectivity
+/// volume against 0.16 at 20 km. That is the main reason to pick a region,
+/// and it is invisible unless it is written down.
 ///
-/// The default's figures are pinned as literals — the full 460 km scan and
-/// the 1.80 km cells it costs — rather than derived from the constant the
-/// caption itself reads, so a default that drifted from covering the scan
-/// fails here by name instead of being restated as correct.
+/// The sourceless figures are pinned as literals — the 651 km box a 460.125
+/// km reflectivity reach earns and the 2.54 km cells it costs — rather than
+/// derived from the function the caption itself reads, so a policy that
+/// drifted fails here by name instead of being restated as correct.
 #[test]
-fn the_caption_reports_the_resolution_the_region_buys() {
-    let wide = volume_caption("KTLX", at(33), None, None, Default::default());
+fn the_caption_reports_the_resolution_the_box_buys() {
+    let whole_volume = rustdar_radar::voxel::box_half_width_km(460.125);
+    let wide = volume_caption("KTLX", at(33), None, whole_volume, Default::default());
     assert!(
         wide.iter()
-            .any(|l| l.contains("460 km box") && l.contains("1.80 km/cell")),
-        "the sourceless default must report the whole scan and its cost: {wide:?}",
+            .any(|l| l.contains("651 km box") && l.contains("2.54 km/cell")),
+        "a whole WSR-88D reflectivity volume must report the box its reach \
+         earns and the cost of it: {wide:?}",
     );
 
     let tight = crate::pane::VolumeRegion::new(
@@ -1227,7 +1253,13 @@ fn the_caption_reports_the_resolution_the_region_buys() {
         20.0,
     )
     .expect("a valid region");
-    let tight_lines = volume_caption("KTLX", at(33), None, Some(tight), Default::default());
+    let tight_lines = volume_caption(
+        "KTLX",
+        at(33),
+        None,
+        tight.half_width_km(),
+        Default::default(),
+    );
     let line = tight_lines
         .iter()
         .find(|l| l.contains("km box"))
@@ -2145,8 +2177,9 @@ fn a_3d_panes_box_follows_its_own_viewport() {
     };
 
     // Wide open: the viewport shows more ground than the resampler will
-    // honour, so the box stops at its ceiling — the whole scan, cropping
-    // nothing, which is what a pane that has not been aimed should show.
+    // honour, so the box stops at its ceiling — `MAX_EXTENT_KM / √2`, which is
+    // past even a 460 km surveillance cut's own 325.4, so it crops nothing a
+    // radar can produce. That is what a pane nobody has aimed should show.
     let wide = box_at(&mut h);
     assert_eq!(
         wide,

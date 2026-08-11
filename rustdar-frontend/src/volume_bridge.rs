@@ -1383,6 +1383,17 @@ impl VolumePainter for BridgeVolumePainter {
             VolumeEntry::Building | VolumeEntry::Refused(_) => None,
         }
     }
+
+    /// Through the same pane-scoped lookup [`Self::paint`] uses, and through
+    /// the same [`box_size_km`] it hands the uniform — so the box the pan
+    /// gesture is scaled against and the box the shader marches are one
+    /// derivation from one grid, not two that agree by inspection.
+    fn box_size_km(&self, pane_idx: usize, target: &VolumeTarget) -> Option<[f32; 3]> {
+        match self.store.lookup_for_pane(pane_idx, target)?.entry {
+            VolumeEntry::Ready(grid) => Some(box_size_km(&grid)),
+            VolumeEntry::Building | VolumeEntry::Refused(_) => None,
+        }
+    }
 }
 
 /// Wrap a callback in whatever `egui_wgpu` downcasts to.

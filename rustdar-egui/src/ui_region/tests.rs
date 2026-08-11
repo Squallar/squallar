@@ -293,9 +293,28 @@ fn a_viewport_below_the_resamplers_minimum_is_refused() {
 /// The whole-scan box a wide-open pane asks for is honoured rather than clamped
 /// down to something smaller.
 ///
-/// The resampler's ceiling and the fallback are the same constant, so a pane
-/// zoomed right out lands exactly on it — and the caption, the camera's box and
-/// the resample all describe one box.
+/// A pane zoomed right out lands exactly on the resampler's ceiling, and the
+/// caption, the camera's box and the resample all describe that one box.
+///
+/// # The ceiling and the stand-in are no longer one constant
+///
+/// They were, and it read as a tidy coincidence: both were 230 km, the nominal
+/// unambiguous range. They are now two different facts and the pin says which
+/// is which.
+///
+/// The **ceiling** is what a plan view's furthest frame earns —
+/// `box_half_width_km(types::MAX_EXTENT_KM)`, the largest square inscribed in
+/// the widest circle a raster will ever be projected at. That is the number
+/// [`super::zoom_viewport`]'s outward bound means by "the ground the radar
+/// itself covers", and it had to move: a plan view follows its own sweep out to
+/// 460 km now, so holding the box at 230 left the 3D pane showing less than the
+/// 2D pane beside it — the original complaint with the two panes swapped.
+///
+/// The **stand-in** ([`crate::pane::BASE_HALF_WIDTH_KM`]) is still the raster's
+/// floor, because it answers a different question: not "how far may a box be
+/// opened" but "what box does a pane pose its camera against before anything
+/// has measured one". Pinning them equal would tie a fallback for an unmeasured
+/// viewport to a ceiling that follows the data.
 #[test]
 fn a_pane_zoomed_out_past_the_ceiling_gets_the_whole_scan_box() {
     let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 900.0));
@@ -305,12 +324,18 @@ fn a_pane_zoomed_out_past_the_ceiling_gets_the_whole_scan_box() {
         region.half_width_km(),
         rustdar_radar::voxel::MAX_HALF_WIDTH_KM,
         "a pane showing more ground than the resampler will honour must stop at its \
-         ceiling, which is also `DEFAULT_HALF_WIDTH_KM`",
+         ceiling rather than be refused a box",
     );
     assert_eq!(
-        region.half_width_km(),
-        crate::pane::DEFAULT_HALF_WIDTH_KM,
-        "the ceiling and the degenerate-viewport fallback are one constant",
+        rustdar_radar::voxel::MAX_HALF_WIDTH_KM,
+        rustdar_radar::voxel::box_half_width_km(rustdar_radar::types::MAX_EXTENT_KM),
+        "the ceiling must be the box the widest frame a plan view will project \
+         earns, or a 3D pane stops short of the picture beside it",
+    );
+    assert!(
+        region.half_width_km() > crate::pane::BASE_HALF_WIDTH_KM,
+        "the ceiling is no longer the stand-in: a pane zoomed out must be able to \
+         pass the box an unmeasured one poses its camera against",
     );
 }
 

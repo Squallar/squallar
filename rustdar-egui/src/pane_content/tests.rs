@@ -107,37 +107,54 @@ fn the_default_content_is_a_plan_view_map() {
     assert_eq!(MapRender::default(), MapRender::Plan);
 }
 
-/// The fallback box covers the whole scan.
+/// The stand-in box is the resampler's own fallback, it survives un-clamped,
+/// and it still covers the whole scan.
 ///
-/// A pane whose viewport cannot be measured — collapsed to nothing by a divider
-/// drag — is showing "the site's volume", and the plan view beside it draws echo
-/// out to at least `types::BASE_EXTENT_KM`, so a fallback under that range crops
-/// the scan: echo past the box's edge simply vanishes from the 3D picture, which
-/// reads as a resample gone wrong rather than as a choice. Two facts keep it
-/// honest, and both are pinned: it reaches the raster's floor, and the resampler
-/// passes it through un-clamped, so the box the caption and the camera
-/// arithmetic describe is the box that is actually built.
+/// A pane reaches it two ways, and they are the same state: it has not been
+/// drawn in the 3D mode yet, or its viewport cannot be measured — collapsed to
+/// nothing by a divider drag, projecting off Earth. Either way there is no
+/// measurement to size a box from, and three things have to hold.
 ///
-/// "At least": a plan view is now projected at its own sweep's reach, so a
-/// 458 km surveillance cut draws echo the box does not hold. The 3D box stays
-/// at the floor deliberately — see
-/// [`rustdar_radar::voxel::MAX_HALF_WIDTH_KM`] for the cell-count reason —
-/// and this pin is the covering property that still holds.
+/// **One fallback, not two.** While there is no grid the pane poses its camera
+/// against [`BASE_HALF_WIDTH_KM`]; if that were a different number from the one
+/// `build_voxels` reaches for when it cannot read a reach, the pane's
+/// arithmetic would describe a box nothing is building — a pan that drifts
+/// against the picture.
+///
+/// **Honoured un-clamped**, so the caption, the camera arithmetic and the
+/// resample all describe one box.
+///
+/// **It still covers the raster's floor.** The plan view beside it draws echo
+/// out to at least `types::BASE_EXTENT_KM`, and a fallback under that range
+/// crops the scan: echo past the box's edge vanishes from the 3D picture, which
+/// reads as a resample gone wrong rather than as a choice.
+///
+/// What can *not* be pinned here is the box a measurable pane ends up with.
+/// That is its viewport's inscribed square, bounded by the volume's own reach
+/// ([`rustdar_radar::voxel::box_half_width_km`]) — 325.4 km of half-width for a
+/// WSR-88D's 460 km reflectivity, 212.1 for its 300 km Doppler moments — and
+/// this crate sees neither a viewport nor a volume from here.
 #[test]
 #[allow(clippy::assertions_on_constants)] // the covering bound IS a constant pin
-fn the_fallback_box_covers_the_whole_scan() {
+fn the_stand_in_box_is_the_resamplers_own_fallback_and_survives_it_unclamped() {
+    assert_eq!(
+        BASE_HALF_WIDTH_KM,
+        rustdar_radar::voxel::box_half_width_km(f64::NAN),
+        "the pane and the resampler must fall back to one box, or a pane with \
+             no grid poses its camera against a width nothing will resample",
+    );
     assert!(
-        DEFAULT_HALF_WIDTH_KM >= rustdar_radar::types::BASE_EXTENT_KM,
-        "the default box must reach the raster's floor: {DEFAULT_HALF_WIDTH_KM} km \
+        BASE_HALF_WIDTH_KM >= rustdar_radar::types::BASE_EXTENT_KM,
+        "the stand-in box must reach the raster's floor: {BASE_HALF_WIDTH_KM} km \
              of half-width against a {} km frame",
         rustdar_radar::types::BASE_EXTENT_KM,
     );
-    let region = VolumeRegion::new(point(35.3, -97.3), DEFAULT_HALF_WIDTH_KM)
-        .expect("the default half-width must be a region the resampler takes");
+    let region = VolumeRegion::new(point(35.3, -97.3), BASE_HALF_WIDTH_KM)
+        .expect("the stand-in half-width must be a region the resampler takes");
     assert_eq!(
         region.half_width_km(),
-        DEFAULT_HALF_WIDTH_KM,
-        "the resampler must honour the default un-clamped, or the pane's own \
+        BASE_HALF_WIDTH_KM,
+        "the resampler must honour the stand-in un-clamped, or the pane's own \
              camera arithmetic describes a different box than the one built",
     );
 }

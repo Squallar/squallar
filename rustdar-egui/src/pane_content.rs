@@ -804,34 +804,41 @@ pub struct VolumeRegion {
     half_width_km: f64,
 }
 
-/// The half-width a pane falls back to when its viewport cannot be measured,
+/// The half-width a pane falls back to when nothing has sized its box yet,
 /// kilometres.
 ///
-/// **The resampler's own maximum, which is the nominal unambiguous range** —
-/// [`rustdar_radar::voxel::MAX_HALF_WIDTH_KM`] matches
-/// `rustdar_radar::types::BASE_EXTENT_KM`, the 230 km a plan view's raster is
-/// drawn to whenever its data stops inside it. A pane whose viewport is
-/// degenerate — collapsed to nothing by a divider drag, or projecting off
-/// Earth — is answering "show me this site's volume", and the widest honest
-/// box is the one that crops nothing.
+/// **Not the box a drawn pane ends up with.** That box is the pane's own
+/// viewport ([`crate::ui_region::region_for_viewport`]), bounded above by what
+/// the volume actually reaches: [`rustdar_radar::voxel::MAX_HALF_WIDTH_KM`] is
+/// now `types::MAX_EXTENT_KM / √2` — the largest square inscribed in the
+/// furthest circle a plan view will project — and `build_voxels` answers an
+/// unstated width with [`rustdar_radar::voxel::box_half_width_km`] of the
+/// volume's own reach, 325.4 km of half-width for a WSR-88D's 460 km
+/// reflectivity and 212.1 for its 300 km Doppler moments. Only the resampler,
+/// which has the volume, can say which; this crate never sees one.
 ///
-/// A long-range sweep — a 458 km surveillance cut, a TDWR's 417 km — is drawn
-/// past this box on the plan view, so the crop is not gone, only moved out to
-/// where it costs least; `MAX_HALF_WIDTH_KM` records why the box does not
-/// follow.
+/// This is what stands in until one of those two has spoken: a pane not yet
+/// drawn in the 3D mode, or one whose viewport is degenerate — collapsed to
+/// nothing by a divider drag, or projecting off Earth.
 ///
-/// The floor is not guaranteed to cover *this* box, because nothing measured
-/// the viewport it would have to cover. That is the correct trade for a state
-/// that only exists while a pane has no area to draw in: the alternative is
-/// refusing to build at all, which reads as a broken pane rather than as a
-/// pane that has not been given any room.
+/// [`rustdar_radar::voxel::BASE_HALF_WIDTH_KM`] read back rather than a copy
+/// of 230, and it is the resampler's own fallback for exactly the same
+/// situation: nothing known about the reach yet. The two answering differently
+/// would be a pane whose camera arithmetic is scaled against a box the
+/// resampler is not building, which shows up as a pan that drifts against the
+/// picture.
 ///
-/// Written as the resampler's constant rather than a copy of 230 so that
-/// [`VolumeRegion::new`] passes it through un-clamped: the caption,
-/// [`VolumePane::box_size_km`] and the resample all describe the same box, and
-/// if the resampler's ceiling ever moves, the fallback keeps covering the whole
-/// scan by construction.
-pub const DEFAULT_HALF_WIDTH_KM: f64 = rustdar_radar::voxel::MAX_HALF_WIDTH_KM;
+/// It still clears `types::BASE_EXTENT_KM`, so a pane in this state crops
+/// nothing a plan view at the raster's floor would have drawn — but the floor
+/// is not guaranteed to cover it, because nothing measured the viewport it
+/// would have to cover. That is the correct trade for a state that only exists
+/// while a pane has no area to draw in: the alternative is refusing to build at
+/// all, which reads as a broken pane rather than as a pane that has not been
+/// given any room. There is no picture to be wrong about while it is in force —
+/// such a pane is painting its empty state — so this is the width the *camera*
+/// is posed against for the frames before the first build lands, and nothing
+/// else.
+pub const BASE_HALF_WIDTH_KM: f64 = rustdar_radar::voxel::BASE_HALF_WIDTH_KM;
 
 impl VolumeRegion {
     /// A region centred on `centre` with `half_width_km` either side, or `None`
@@ -875,8 +882,20 @@ impl VolumeRegion {
     /// The number the pane shows, and the reason a tight region is worth
     /// picking. Answers `None` for a zero cell count rather than dividing by it.
     pub fn resolution_km(self, cells: usize) -> Option<f64> {
-        (cells > 0).then(|| 2.0 * self.half_width_km / cells as f64)
+        resolution_km(self.half_width_km, cells)
     }
+}
+
+/// Kilometres per cell across a box of `half_width_km`, `cells` cells wide.
+///
+/// A free function beside [`VolumeRegion::resolution_km`] rather than only the
+/// method, because the caption now prints this for boxes that are **not** a
+/// picked region — a pane with no region gets the width the volume's reach
+/// earns, and there is no `VolumeRegion` anywhere in that path to ask. One
+/// definition, two entry points; a caption dividing by its own copy is how the
+/// printed km-per-cell and the resampled one drift apart.
+pub fn resolution_km(half_width_km: f64, cells: usize) -> Option<f64> {
+    (cells > 0).then(|| 2.0 * half_width_km / cells as f64)
 }
 
 /// A pane showing a 3D view of the volume.
@@ -904,7 +923,9 @@ pub struct VolumePane {
     ///
     /// `None` before the pane has been drawn in the 3D mode even once, and for a
     /// viewport too degenerate to measure. Both mean the same thing downstream:
-    /// the default whole-scan box, [`DEFAULT_HALF_WIDTH_KM`].
+    /// nothing here states a width, so `build_voxels` resolves one from the
+    /// volume's own reach ([`rustdar_radar::voxel::box_half_width_km`]) and
+    /// [`BASE_HALF_WIDTH_KM`] stands in for the camera until that grid lands.
     pub viewport_box: Option<VolumeRegion>,
     /// Which volume the grid on screen was built from, or `None` before the
     /// first build.
@@ -953,8 +974,9 @@ pub enum VolumeViewMode {
     Isosurface,
 }
 
-/// The box's full extent in kilometres along each axis, as the resample will
-/// produce it, for a pane showing `region`.
+/// The box's full extent in kilometres along each axis for a pane showing
+/// `region` — **what the pane itself can work out**, which is the whole answer
+/// for a measured viewport and a stand-in otherwise.
 ///
 /// # Why this is derived rather than read off the grid
 ///
@@ -965,18 +987,30 @@ pub enum VolumeViewMode {
 /// pan one frame behind the pointer, which is the exact defect
 /// `VolumePainter::paint`'s ordering exists to avoid.
 ///
-/// The two agree by construction rather than by luck: `build_voxels` spans
-/// `2 · half_width_km` horizontally and `base..top` vertically, from the same
-/// clamped half-width [`VolumeRegion::new`] holds and the same two constants
-/// used here. If they ever disagreed the symptom would be a pan that drifts
-/// against the picture, which is why they read one definition each.
+/// For a `Some` region the two agree by construction rather than by luck:
+/// `build_voxels` spans `2 · half_width_km` horizontally and `base..top`
+/// vertically, from the same clamped half-width [`VolumeRegion::new`] holds and
+/// the same two constants used here. If they ever disagreed the symptom would
+/// be a pan that drifts against the picture, which is why they read one
+/// definition each.
+///
+/// # The one case this cannot answer alone
+///
+/// `None` — a pane not yet drawn in the 3D mode, or a viewport too degenerate
+/// to measure. `build_voxels` answers an unstated width with
+/// [`rustdar_radar::voxel::box_half_width_km`] of the volume's own reach, which
+/// is a fact about the *data* — 325.4 km of half-width for a 460 km
+/// reflectivity volume, 212.1 for the 300 km Doppler moments — and no type in
+/// this crate holds a volume. So [`BASE_HALF_WIDTH_KM`] stands in here, and a
+/// caller that has a grid prefers `VolumePainter::box_size_km` over this. There
+/// is no picture to be wrong about in the meantime: such a pane is painting its
+/// empty state.
 ///
 /// A free function over the region rather than a method on [`VolumePane`],
 /// because the region is no longer *on* the pane — it is the pane's viewport,
-/// measured on the frame it is needed. `None` is the degenerate-viewport
-/// fallback, [`DEFAULT_HALF_WIDTH_KM`].
+/// measured on the frame it is needed.
 pub fn box_size_km(region: Option<VolumeRegion>) -> [f32; 3] {
-    let half_width = region.map_or(DEFAULT_HALF_WIDTH_KM, VolumeRegion::half_width_km);
+    let half_width = region.map_or(BASE_HALF_WIDTH_KM, VolumeRegion::half_width_km);
     [
         (2.0 * half_width) as f32,
         (2.0 * half_width) as f32,
@@ -1083,13 +1117,14 @@ pub const MAX_EYE_DISTANCE: f32 = 8.0;
 /// every pan, whatever the yaw, pitch or zoom.
 ///
 /// Expressed per axis rather than as a radius, because the box is a pancake —
-/// 25.6:1 at the whole-scan default: a spherical bound of one half-extent would either let the pivot leave
-/// the box sideways or stop it well short of the top face.
+/// 36:1 wide open: a spherical bound of one half-extent would either let the
+/// pivot leave the box sideways or stop it well short of the top face.
 const MAX_PIVOT_FRACTION: f32 = 1.0;
 
 /// The vertical exaggeration a 3D pane starts at.
 ///
-/// The default box is 460 km wide and 18 km tall — **25.6:1** — and at true
+/// A wide-open box is 651 km across for a WSR-88D's reflectivity and 18 km
+/// tall — **36:1** — and at true
 /// proportions it reads as a sheet of paper rather than as a volume with storms
 /// standing in it. That is a real property of the atmosphere and the flat view is the honest
 /// one, which is why the number is *shown* rather than hidden; but a view whose

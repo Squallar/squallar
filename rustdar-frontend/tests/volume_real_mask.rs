@@ -23,7 +23,7 @@
 //! | `SITE` | no | first four characters of `VOL`'s file name | ICAO of the radar, looked up in `rustdar_radar::sites`. |
 //! | `CENTRE_LAT` | yes | — | Region centre latitude, degrees. |
 //! | `CENTRE_LON` | yes | — | Region centre longitude, degrees. |
-//! | `HALF_KM` | no | `80.0` | Region half-width, km. `build_voxels` clamps to [10, 230]. |
+//! | `HALF_KM` | no | `80.0` | Region half-width, km. `build_voxels` clamps to [10, 332.34]. |
 //! | `BASE_KM` | no | `0.0` | Box base, km MSL. |
 //! | `TOP_KM` | no | `18.0` | Box top, km MSL. |
 //! | `PRODUCT` | no | `BR` | Product: the six moments `BR`/`REF`, `BV`/`VEL`, `SW`, `ZDR`, `PHI`, `RHO`/`CC`, or the three derivations `SRV`, `NROT`, `KDP`. |
@@ -156,7 +156,7 @@ fn render_a_real_volume_mask() {
     let product = product_from_env();
     let request = VoxelRequest {
         centre: (parsed("CENTRE_LAT"), parsed("CENTRE_LON")),
-        half_width_km: parsed_or("HALF_KM", 80.0),
+        half_width_km: Some(parsed_or("HALF_KM", 80.0)),
         base_km_msl: parsed_or("BASE_KM", 0.0),
         top_km_msl: parsed_or("TOP_KM", 18.0),
         product,
@@ -408,7 +408,7 @@ fn render_a_real_volume_mask() {
          site              {site_name} at {grid_lat:.5}, {grid_lon:.5}\n\
          product           {} ({})\n\
          centre            {:.5}, {:.5}\n\
-         half_width_km     {:.3} (requested {:.3}, clamped by build_voxels)\n\
+         half_width_km     {:.3} (requested {:?}, resolved by build_voxels)\n\
          grid              nx {} ny {} nz {}  ({} cells)\n\
          x_range_km        {x0:.3} .. {x1:.3}  (east of site)\n\
          y_range_km        {y0:.3} .. {y1:.3}  (north of site)\n\
@@ -562,7 +562,7 @@ fn measure_boundary_honesty_and_smoothness() {
     let product = product_from_env();
     let request = VoxelRequest {
         centre: (parsed("CENTRE_LAT"), parsed("CENTRE_LON")),
-        half_width_km: parsed_or("HALF_KM", 80.0),
+        half_width_km: Some(parsed_or("HALF_KM", 80.0)),
         base_km_msl: parsed_or("BASE_KM", 0.0),
         top_km_msl: parsed_or("TOP_KM", 18.0),
         product,

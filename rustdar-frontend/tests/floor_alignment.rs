@@ -874,10 +874,11 @@ fn measure_floor_against_grid_on_a_real_volume() {
     });
     let site = rustdar_radar::sites::get_radar_site(&icao)
         .unwrap_or_else(|| panic!("{icao} is not a site this build knows"));
-    let half_km: f64 = std::env::var("HALF_KM")
+    // `None` without `HALF_KM`, which is what a pane with no picked region
+    // sends: `build_voxels` sizes the box from the volume's own reach.
+    let half_km: Option<f64> = std::env::var("HALF_KM")
         .ok()
-        .map(|s| s.parse().expect("HALF_KM must be a number"))
-        .unwrap_or(rustdar_egui::pane::DEFAULT_HALF_WIDTH_KM);
+        .map(|s| s.parse().expect("HALF_KM must be a number"));
     let thresh: f32 = std::env::var("THRESH")
         .ok()
         .map(|s| s.parse().expect("THRESH must be a number"))
@@ -1189,10 +1190,18 @@ fn pane_raster(input: &rustdar_radar::render_input::RenderInput) -> Option<(Vec<
     Some((image, side, extent_km))
 }
 
-/// The default box, as a [`BoxGeo`] — `±DEFAULT_HALF_WIDTH_KM` about the site,
-/// which is what `build_voxels` produces for the app's own request.
+/// A fixed `±230 km` box about the site, as a [`BoxGeo`].
+///
+/// A **fixture size**, deliberately, and no longer "what the app requests":
+/// the box a sourceless pane gets now follows its volume's own reach
+/// (`rustdar_radar::voxel::box_half_width_km`), and the two tests below are
+/// about the *shape* of the box→mirror mapping rather than about which box it
+/// is handed. Pinning it here keeps their probes — one of them 190 km west of
+/// the site — inside the box whatever the extent policy does next, and the two
+/// tests that do care about the shipped geometry read it off a real grid
+/// (`BoxGeo::from_grid`) instead.
 fn default_box() -> BoxGeo {
-    let half = rustdar_egui::pane::DEFAULT_HALF_WIDTH_KM;
+    let half = rustdar_radar::voxel::BASE_HALF_WIDTH_KM;
     BoxGeo {
         west_km: -half,
         south_km: -half,
@@ -1424,7 +1433,7 @@ fn a_gate_lands_on_the_mirror_pixel_that_renders_it() {
 //    a change to how the rasterizer projects moves this whether or not the
 //    mapping moved with it;
 //  * axis flips, which mirror the off-centre, off-diagonal disc across the box
-//    and miss by hundreds of kilometres;
+//    and miss by more than a hundred kilometres;
 //  * the historical 2026-08-09 2× floor zoom: the raster's *data reach* fed to
 //    the old resampler as its half-extent. The reach and the extent are once
 //    again two different numbers — a raster is projected at
@@ -1432,14 +1441,23 @@ fn a_gate_lands_on_the_mirror_pixel_that_renders_it() {
 //    data passes that — so the fixture's short low tilt (700 gates, 177 km
 //    against a 230 km frame) is not a historical curiosity but the live
 //    discriminator: a mirror built from 177 would be 1.3× zoomed and this pin
-//    would fail.
+//    would fail. The **box** is now a third number again — ±125.2 km, the
+//    reach over √2 (`voxel::box_half_width_km`) — so reach, frame and box are
+//    three distinct scales here and a mapping that confused any two of them
+//    cannot pass.
 
 #[test]
 fn a_planted_storm_lands_on_the_floor_exactly_under_its_own_voxels() {
-    // A 55 dBZ disc, radius 20 km, centred 80 km east / 120 km north of the
+    // A 55 dBZ disc, radius 20 km, centred 60 km east / 85 km north of the
     // site — off-centre on both axes and off the diagonal, so every flip and
-    // the site-centred control disagree with it.
-    const DISC_KM: (f64, f64) = (80.0, 120.0);
+    // the site-centred control disagree with it, by 120 km or more.
+    //
+    // Inside the box on every side with room to spare, which is now a fixture
+    // constraint rather than a free choice: the box this volume earns is
+    // ±125.2 km (177.1 km of reach over √2), and a disc clipped by the box
+    // edge would move the grid's centroid without moving the floor's and fail
+    // the alignment pin for a reason that is not a misalignment.
+    const DISC_KM: (f64, f64) = (60.0, 85.0);
     const DISC_RADIUS_KM: f64 = 20.0;
     let field = |az_deg: f64, slant_km: f64| -> Option<f64> {
         let az = az_deg.to_radians();
@@ -1462,7 +1480,7 @@ fn a_planted_storm_lands_on_the_floor_exactly_under_its_own_voxels() {
     // Path one: the voxel build, at the app's own default request.
     let request = rustdar_radar::voxel::VoxelRequest {
         centre: (site.lat, site.lon),
-        half_width_km: rustdar_egui::pane::DEFAULT_HALF_WIDTH_KM,
+        half_width_km: None,
         base_km_msl: rustdar_radar::voxel::DEFAULT_BASE_KM_MSL,
         top_km_msl: rustdar_radar::voxel::DEFAULT_TOP_KM_MSL,
         product: RadarProduct::Reflectivity,
@@ -1633,7 +1651,7 @@ fn a_broken_mapping_costs_iou_in_the_corner_even_where_the_centre_cannot_tell() 
 
     let request = rustdar_radar::voxel::VoxelRequest {
         centre: (site.lat, site.lon),
-        half_width_km: rustdar_egui::pane::DEFAULT_HALF_WIDTH_KM,
+        half_width_km: None,
         base_km_msl: rustdar_radar::voxel::DEFAULT_BASE_KM_MSL,
         top_km_msl: rustdar_radar::voxel::DEFAULT_TOP_KM_MSL,
         product: RadarProduct::Reflectivity,

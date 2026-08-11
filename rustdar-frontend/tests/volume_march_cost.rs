@@ -63,7 +63,7 @@ fn measure_the_raymarch_cost_on_a_real_volume() {
 
     let request = VoxelRequest {
         centre: (parsed("CENTRE_LAT"), parsed("CENTRE_LON")),
-        half_width_km: parsed_or("HALF_KM", 75.0),
+        half_width_km: Some(parsed_or("HALF_KM", 75.0)),
         base_km_msl: 0.0,
         top_km_msl: 18.0,
         product: RadarProduct::Reflectivity,

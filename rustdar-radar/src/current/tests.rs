@@ -582,7 +582,7 @@ async fn live_substrate_costs_are_measured() {
     // takes off the frame thread.
     let request = crate::voxel::VoxelRequest {
         centre: (radar.lat, radar.lon),
-        half_width_km: 80.0,
+        half_width_km: Some(80.0),
         base_km_msl: crate::voxel::DEFAULT_BASE_KM_MSL,
         top_km_msl: crate::voxel::DEFAULT_TOP_KM_MSL,
         product: RadarProduct::Reflectivity,

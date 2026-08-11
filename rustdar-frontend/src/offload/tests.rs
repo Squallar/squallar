@@ -215,7 +215,7 @@ fn a_voxel_job() -> JobRequest {
         input: Box::new(a_volume_input()),
         request: VoxelRequest {
             centre: (35.0, -97.0),
-            half_width_km: 60.0,
+            half_width_km: Some(60.0),
             base_km_msl: 0.0,
             top_km_msl: 15.0,
             product: rustdar_radar::types::RadarProduct::Reflectivity,
@@ -231,6 +231,27 @@ fn a_voxel_job() -> JobRequest {
     }
 }
 
+/// The voxel job a pane with **no picked region** posts: the width is left
+/// for `build_voxels` to take from the volume's own reach.
+///
+/// A separate job rather than a second field on the one above, because the
+/// half-width is the only tagged optional in this encoding and `None` is the
+/// case every ordinary 3D pane sends. A decoder that read the tag byte as the
+/// first byte of an `f64` would round-trip the `Some` arm and hand the worker
+/// a nonsense box for this one.
+fn a_sourceless_voxel_job() -> JobRequest {
+    match a_voxel_job() {
+        JobRequest::Voxels { input, request } => JobRequest::Voxels {
+            input,
+            request: VoxelRequest {
+                half_width_km: None,
+                ..request
+            },
+        },
+        other => other,
+    }
+}
+
 #[test]
 fn every_job_kind_survives_the_wire_format() {
     for job in [
@@ -239,6 +260,7 @@ fn every_job_kind_survives_the_wire_format() {
         a_level3_pair_job(),
         a_section_job(),
         a_voxel_job(),
+        a_sourceless_voxel_job(),
     ] {
         assert_eq!(
             JobRequest::from_bytes(&job.to_bytes()),

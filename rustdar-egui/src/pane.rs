@@ -15,11 +15,11 @@ mod content;
 // split into a second file is about how much there is to say about each half,
 // not about them being different things.
 pub use content::{
-    CrossSectionPane, DEFAULT_HALF_WIDTH_KM, DEFAULT_VERTICAL_EXAGGERATION, GeoPoint,
+    BASE_HALF_WIDTH_KM, CrossSectionPane, DEFAULT_VERTICAL_EXAGGERATION, GeoPoint,
     MAX_EYE_DISTANCE, MAX_VERTICAL_EXAGGERATION, MIN_EYE_DISTANCE, MIN_VERTICAL_EXAGGERATION,
     MapPane, MapRender, OrbitCamera, OrbitDelta, PaneContent, PaneKind, SectionLine, SectionTarget,
     SectionUnavailable, VolumePane, VolumeRegion, VolumeStamp, VolumeTarget, VolumeViewMode,
-    box_size_km,
+    box_size_km, resolution_km,
 };
 
 const DEFAULT_PANE_ZOOM: f64 = 4.0;

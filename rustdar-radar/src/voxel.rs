@@ -383,19 +383,163 @@ pub const MAX_AXIS: usize = 256;
 /// resample invents smoothness.
 pub const MIN_HALF_WIDTH_KM: f64 = 10.0;
 
-/// Widest half-width a request may ask for, km — the nominal unambiguous
-/// range, matching [`crate::types::BASE_EXTENT_KM`], the extent a plan view is
-/// drawn at whenever its data stops inside it.
+/// The half-width a box is given when nothing can be said about how far its
+/// volume reaches, km — the WSR-88D's nominal unambiguous range, and the box
+/// this resampler was fixed at for its whole life.
 ///
-/// Deliberately *not* the plan view's per-render extent. A 2D raster costs the
-/// same pixels however much ground it covers; this box costs `nx · ny · nz`
-/// cells, so following a 458 km surveillance cut out to its own reach would
-/// either quadruple the resample or halve the resolution of every 3D view of
-/// every site. The consequence is stated rather than hidden: a long-range
-/// sweep's outer returns are on the plan view beside the box and not in the
-/// box, and the pane's own km-per-cell readout is what says how coarse the
-/// trade already is.
-pub const MAX_HALF_WIDTH_KM: f64 = 230.0;
+/// Reached only through [`box_half_width_km`]'s `NaN` and non-positive arms,
+/// which is to say: a volume carrying no gate count at all for the moment
+/// asked for. Every such box is the one that has always been drawn, so an
+/// unreadable reach degrades to yesterday's picture rather than to a 20 km
+/// box with a storm outside it.
+pub const BASE_HALF_WIDTH_KM: f64 = 230.0;
+
+/// Widest half-width a request may ask for, km.
+///
+/// [`crate::types::MAX_EXTENT_KM`] over √2, and written as that division so
+/// the two cannot drift: the plan view's cap is a guard against a mis-framed
+/// radial claiming sixty thousand gates, and the box's cap has to be the same
+/// guard measured through [`box_half_width_km`]'s own geometry. A reach the
+/// raster refuses to zoom out past is a reach this must refuse to widen past.
+///
+/// 332.34 km — a 665 km box — is therefore not a range any radar reaches. The
+/// widest honest one in this display is the 460.1 km WSR-88D surveillance
+/// cut, which asks for 325.4.
+pub const MAX_HALF_WIDTH_KM: f64 = crate::types::MAX_EXTENT_KM / std::f64::consts::SQRT_2;
+
+/// Half-width of the box to resample, km, given how far the volume's data
+/// reaches — **the largest square that fits inside the sweep's own range
+/// circle**.
+///
+/// [`crate::types::plan_view_extent_km`] is this function's counterpart, and
+/// the difference between the two is the whole design. Both take a reach off
+/// the wire and answer a half-width; the raster's answer *circumscribes* the
+/// data circle and this one is *inscribed* in it, because a raster's corners
+/// are free and a box's corners are not:
+///
+/// * a raster grows its side in pixels with its extent
+///   ([`crate::types::raster_side_px`]), so a surveillance cut's 460.1 km of
+///   ground costs 4.4512 px/km against the 230 km floor's 4.4522, and the
+///   corner pixels outside the data circle are pixels the projection simply
+///   leaves empty;
+/// * a box has `nx · ny · nz` cells and `nx` is pinned at [`MAX_AXIS`] — the
+///   3D texture size GLES 3.0 *guarantees*, which the browser is held to — so
+///   its resolution is exactly `2 · half_width / nx` and a corner cell outside
+///   the data circle is a cell that can never hold a measurement **and** a
+///   cell of resolution taken from the ones that can.
+///
+/// So the box stops where its corners touch the data. One cell wider and the
+/// corners are provably empty: at a 460 km reach, a 920 km box (the raster's
+/// own extent, doubled) leaves 21.5% of its cells — 1.8 M of 8.4 M —
+/// permanently [`NO_DATA_INDEX`], and spends 3.59 km per cell to do it.
+///
+/// # What the trade was measured to be
+///
+/// KCRP 2017-08-26 04:41Z (Harvey), [`DESKTOP_SHAPE`], reflectivity, cells
+/// holding each dBZ class after the resample, against the share of the
+/// volume's own ≥5 dBZ gates that fall outside the box:
+///
+/// | half-width | box | km/cell | ≥20 dBZ | ≥35 dBZ | ≥50 dBZ | echo outside | build |
+/// |---|---|---|---|---|---|---|---|
+/// | 230 (the old fixed box) | 460 km | 1.80 | 513 827 | 52 783 | 97 | 1.72% | 28 ms |
+/// | 300 | 600 km | 2.34 | 310 585 | 31 305 | 77 | 0.03% | — |
+/// | **325.4 (this rule)** | **651 km** | **2.54** | 264 617 | 26 449 | 71 | 0.02% | 24 ms |
+/// | 460 (the raster's extent) | 920 km | 3.59 | 132 096 | 13 184 | 27 | 0% | 20 ms |
+///
+/// Widening is free in **memory** and slightly *cheaper* in **time**. The
+/// shape is fixed, so the index plane is 8 MiB and the optional value plane
+/// 32 MiB at every width; and a wider box puts more of its columns outside
+/// the data, where a column costs a range search that finds nothing. The
+/// times are best of fifteen, release, one fresh process per width, on a
+/// 32-thread Ryzen 9 7950X with the one-minute load average under 20 —
+/// measured that way because timing all three widths inside one process made
+/// the widest look 30 ms and the 512-cell shape below 202 ms, which is the
+/// allocator warming to 160 MiB a build rather than anything about the grids.
+///
+/// **Resolution is the entire cost**, and it is why the rule stops at the
+/// corners rather than at the raster's extent: the last doubling buys 0.02%
+/// of the echo for three quarters of the ≥35 dBZ cells.
+///
+/// # Why the grid is not simply made bigger
+///
+/// Because [`MAX_AXIS`] is not a tuning knob — it is `GL_MAX_3D_TEXTURE_SIZE`
+/// as GLES 3.0 guarantees it, so 256 is what a browser has to accept. Lifting
+/// it was measured anyway, since it is the only arrangement that gets both
+/// the reach and the resolution: 512 × 512 × 128 over the 920 km box holds
+/// 1.80 km/cell and every dBZ class the 460 km box had (≥50 dBZ 97 against
+/// 97, ≥35 53 283 against 52 783), for **32 MiB of indices and 128 MiB of
+/// values, and 77 ms against 28** — four times [`VOXEL_TEXTURE_BUDGET_BYTES`],
+/// two and a half times `rustdar_frontend`'s largest per-target volume budget,
+/// unreachable on the web at all, and thirteen such grids in a desktop 3D
+/// loop.
+///
+/// # Why this is worth following per volume rather than pinning
+///
+/// Across 150 archive volumes from 53 sites, every single WSR-88D reports a
+/// **460.1 km** reflectivity reach — there is no variance in it at all, so
+/// for reflectivity this rule and the constant 325.4 are the same number. The
+/// variance is in the other moments, and it runs the *helpful* way: a Doppler
+/// cut reaches 300 km, so velocity, spectrum width, ZDR, ΦDP, ρHV and every
+/// product derived from them ask for a 212 km half-width — a 424 km box at
+/// 1.66 km/cell, both tighter and **finer** than the fixed 230 they used to
+/// get, with the whole 300 km circle inside it. A TDWR's ~89 km Doppler
+/// volume asks for 63 km, and gets 0.49 km/cell where it used to be given
+/// 1.80 and four fifths of an empty box.
+///
+/// A `NaN` or non-positive reach answers [`BASE_HALF_WIDTH_KM`]. `clamp`
+/// propagates `NaN`, and a `NaN` half-width reaches [`VoxelGrid::x_range_km`]
+/// and makes every cell of the grid unplaceable with no error anywhere.
+pub fn box_half_width_km(data_reach_km: f64) -> f64 {
+    // `is_nan` spelled out rather than folded into the comparison: every
+    // ordering against a `NaN` is false, so `<= 0.0` alone would let one
+    // through to a `clamp` that propagates it.
+    if data_reach_km.is_nan() || data_reach_km <= 0.0 {
+        return BASE_HALF_WIDTH_KM;
+    }
+    (data_reach_km / std::f64::consts::SQRT_2).clamp(MIN_HALF_WIDTH_KM, MAX_HALF_WIDTH_KM)
+}
+
+/// How far `product`'s data reaches over the **ground**, km, across every
+/// sweep of `scan` that carries it — 0.0 if none does.
+///
+/// The volume's counterpart to [`crate::render`]'s `compute_max_range`, and
+/// the same gate arithmetic: a moment's first gate plus its gate count times
+/// its interval. Two things differ, and both come from what the answer is
+/// for.
+///
+/// It is a **maximum over the whole volume** rather than one sweep's, because
+/// one box holds every rung: a WSR-88D's split cuts put a 460 km surveillance
+/// sweep and a 300 km Doppler sweep at the same elevation, and a box sized to
+/// the shorter of them would crop the taller one it also resamples.
+///
+/// It is a **ground** range, `cos e` of the sweep's median elevation folded
+/// in, because that is the coordinate the box's axes are in
+/// ([`crate::sampler::VolumeSampler::column_into`] is asked for a ground
+/// range). The correction is 0.004% at 0.5° and would be nothing at all if
+/// only the lowest cut could ever be the longest — but the reach is a maximum
+/// over cuts, and a sweep whose gates were shortened by the projection while
+/// its reach was not is exactly the disagreement the plan view had to fix.
+pub fn volume_reach_km(scan: &nexrad_model::data::Scan, product: RadarProduct) -> f64 {
+    use nexrad_model::data::DataMoment;
+
+    let mut reach = 0.0f64;
+    for sweep in scan.sweeps() {
+        let radials = sweep.radials();
+        let ground = match crate::volumetric::sweep_elevation_deg(radials) {
+            Some(e) if e.is_finite() => e.to_radians().cos().clamp(0.0, 1.0),
+            _ => 1.0,
+        };
+        for radial in radials {
+            let Some(moment) = product.get_moment(radial) else {
+                continue;
+            };
+            let slant = moment.first_gate_range_km()
+                + f64::from(moment.gate_count()) * moment.gate_interval_km();
+            reach = reach.max(slant * ground);
+        }
+    }
+    reach
+}
 
 /// Bottom of the box a 3D view resamples by default, kilometres MSL.
 ///
@@ -545,10 +689,22 @@ pub struct VoxelRequest {
     /// site; the output's `x`/`y` ranges are relative to the **site** either
     /// way.
     pub centre: (f64, f64),
-    /// Half the box's east–west and north–south extent, km. Clamped to
+    /// Half the box's east–west and north–south extent, km, or `None` to take
+    /// the half-width [`box_half_width_km`] derives from the volume's own
+    /// reach.
+    ///
+    /// `None` is the ordinary case — a 3D pane with no picked region — and it
+    /// is an absence rather than a copy of the default for the reason
+    /// [`crate::types::ImageBounds::from_radar_site`] takes its extent as an
+    /// argument: the number depends on the volume, only [`build_voxels`] has
+    /// the volume, and a caller that computed it from a *different* volume
+    /// would resample ground the pane beside it is not drawing, with nothing
+    /// to notice it.
+    ///
+    /// `Some` is a region the user dragged. It is clamped to
     /// `[MIN_HALF_WIDTH_KM, MAX_HALF_WIDTH_KM]` rather than refused, because a
     /// zoom control that reaches the end of its travel should stop, not fail.
-    pub half_width_km: f64,
+    pub half_width_km: Option<f64>,
     /// Bottom of the box, km MSL.
     pub base_km_msl: f64,
     /// Top of the box, km MSL. Must be strictly above `base_km_msl`.
@@ -1540,8 +1696,9 @@ struct VoxelRow<'grid> {
 /// * a non-finite number anywhere in the request or the site, or a top at or
 ///   below the base.
 ///
-/// A `half_width_km` outside `[MIN_HALF_WIDTH_KM, MAX_HALF_WIDTH_KM]` is
-/// **clamped**, not refused.
+/// A `half_width_km` of `Some` outside `[MIN_HALF_WIDTH_KM,
+/// MAX_HALF_WIDTH_KM]` is **clamped**, not refused; a `half_width_km` of
+/// `None` is answered by [`box_half_width_km`] off the volume's own reach.
 pub fn build_voxels<'a>(
     volume: impl Into<crate::nyquist::Volume<'a>>,
     req: &VoxelRequest,
@@ -1574,7 +1731,7 @@ pub fn build_voxels_with_motion<'a>(
         );
         return None;
     }
-    if !(req.half_width_km.is_finite()
+    if !(req.half_width_km.is_none_or(f64::is_finite)
         && req.base_km_msl.is_finite()
         && req.top_km_msl.is_finite()
         && req.centre.0.is_finite()
@@ -1619,9 +1776,19 @@ pub fn build_voxels_with_motion<'a>(
         .ok()?,
     };
 
-    let half = req
-        .half_width_km
-        .clamp(MIN_HALF_WIDTH_KM, MAX_HALF_WIDTH_KM);
+    // The box's width, decided once and here — the counterpart of
+    // `render_with_projection` deciding the raster's extent once, and for the
+    // same reason: the ranges the grid reports, the cells the sampler is asked
+    // for and the km-per-cell the pane prints all have to come off one number.
+    //
+    // The reach is measured on the volume's own scan rather than on `prepared`:
+    // a derivation rewrites a moment's *values*, never its gate geometry, and
+    // reading it here keeps the box a property of the volume the user asked for
+    // rather than of whichever derivation the product happens to go through.
+    let half = match req.half_width_km {
+        Some(picked) => picked.clamp(MIN_HALF_WIDTH_KM, MAX_HALF_WIDTH_KM),
+        None => box_half_width_km(volume_reach_km(volume.scan(), req.product)),
+    };
 
     // The box's centre as km east / north of the site. Polar from the site and
     // back, so this is the same tangent plane the per-cell mapping below uses

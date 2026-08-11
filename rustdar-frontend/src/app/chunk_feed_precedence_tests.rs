@@ -220,7 +220,11 @@ fn a_picked_region_decides_the_ground_that_is_resampled() {
 
     let default = voxel_request_for(&target(None), 35.33, -97.28);
     assert_eq!(default.centre, (35.33, -97.28), "no region means the site");
-    assert_eq!(default.half_width_km, VOLUME_HALF_WIDTH_KM);
+    assert_eq!(
+        default.half_width_km, None,
+        "no region must leave the width to `build_voxels`, which is the only \
+         side of the seam that holds the volume the reach comes from",
+    );
 
     let picked = VolumeRegion::new(
         GeoPoint {
@@ -236,7 +240,7 @@ fn a_picked_region_decides_the_ground_that_is_resampled() {
         (36.1, -98.4),
         "a picked region must move the box off the site",
     );
-    assert_eq!(aimed.half_width_km, 22.5);
+    assert_eq!(aimed.half_width_km, Some(22.5));
 }
 
 /// The vertical extent is not part of the region pick.
@@ -278,25 +282,29 @@ fn a_region_pick_does_not_move_the_top_or_the_bottom_of_the_box() {
     }
 }
 
-/// The pane and the resampler agree about how big the default box is.
+/// The pane and the resampler agree about the box a pane has before its first
+/// grid lands.
 ///
 /// They have to: the pane does its own camera arithmetic against the box it
 /// believes it has — the pan scale and the pivot are both fractions of it —
 /// and a disagreement would show up as a pan that drifts against the picture,
 /// which is the kind of thing that gets "fixed" by tuning a sensitivity.
+///
+/// Only the *stand-in* box can be checked from here, and that is the whole
+/// change: once a grid exists the pane reads the box off it
+/// (`VolumePainter::box_size_km`), and the width the resampler chose came from
+/// a volume neither side of this assertion holds.
 #[test]
-fn the_pane_and_the_resampler_agree_about_the_default_box() {
-    assert_eq!(
-        VOLUME_HALF_WIDTH_KM,
-        rustdar_egui::pane::DEFAULT_HALF_WIDTH_KM,
-    );
-    // `None` is the degenerate-viewport fallback, which is the case this test
-    // is about: the box a pane gets when nothing measured one for it.
+fn the_pane_and_the_resampler_agree_about_the_stand_in_box() {
+    let base = rustdar_egui::pane::BASE_HALF_WIDTH_KM;
+    assert_eq!(base, rustdar_radar::voxel::box_half_width_km(f64::NAN));
+    // `None` is the unmeasured case, which is the one this test is about: the
+    // box a pane gets when neither a viewport nor a grid has sized one for it.
     assert_eq!(
         rustdar_egui::pane::box_size_km(None),
         [
-            (2.0 * VOLUME_HALF_WIDTH_KM) as f32,
-            (2.0 * VOLUME_HALF_WIDTH_KM) as f32,
+            (2.0 * base) as f32,
+            (2.0 * base) as f32,
             (rustdar_radar::voxel::DEFAULT_TOP_KM_MSL - rustdar_radar::voxel::DEFAULT_BASE_KM_MSL)
                 as f32,
         ],

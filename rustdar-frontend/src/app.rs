@@ -581,47 +581,6 @@ pub(crate) fn repaint_action(delay: std::time::Duration) -> RepaintAction {
     }
 }
 
-/// Half the east–west and north–south extent of the box a 3D pane resamples,
-/// kilometres.
-///
-/// **The full 230 km surveillance range**, so a pane with no picked region
-/// shows the whole scan. This began life at 80 km — resolution is bought with
-/// half-width (80 km is 0.63 km per cell against 1.80 at the full range), and
-/// past ~150 km the lowest tilt is already above 3 km AGL, so the outer box is
-/// mostly cone the radar cannot see into. Both arguments are real and both
-/// lost to what the crop looked like: echo running past 80 km — most of a
-/// scan, on a squall-line day — simply vanished from the 3D picture before the
-/// edge of the plan view beside it, which reads as a resample gone wrong
-/// rather than as a curated default.
-///
-/// The resolution trade now belongs to the user: the region drag exists
-/// precisely to spend the same cells over less ground, one deliberate commit
-/// at a time (a rebuild is **150–200 ms** on the frame thread here, which is
-/// why the box never tracks the viewport), and the pane's caption prints the
-/// km-per-cell either way. The flatness objection — 460 x 460 x 18 km is a
-/// 25.6:1 pancake at true proportions — is answered by the default vertical
-/// exaggeration, which is stated on screen beside the true heights.
-///
-/// This value is `rustdar_egui::pane::DEFAULT_HALF_WIDTH_KM` read back, not a
-/// second copy: the pane computes its own camera arithmetic against the box it
-/// believes it has, and the two disagreeing would show up as a pan that drifts
-/// against the picture. That constant is in turn the resampler's own
-/// `MAX_HALF_WIDTH_KM`, so `build_voxels` honours it un-clamped.
-const VOLUME_HALF_WIDTH_KM: f64 = rustdar_egui::pane::DEFAULT_HALF_WIDTH_KM;
-
-/// What to resample for `target`, over the region it names or the default box
-/// about the site.
-///
-/// Split out of `handle_prepare_volume` so the one decision in it that can be
-/// silently wrong is testable without an `App`, a GPU or a decoded volume: which
-/// ground gets sampled. Both failure modes are quiet — a region ignored resamples
-/// the default box and looks like a region that was never committed, and a region
-/// applied to the wrong axis resamples real ground the user did not pick — and
-/// neither shows up as an error anywhere.
-///
-/// `site_lat`/`site_lon` are still needed when a region is present:
-/// `build_voxels` reports its `x`/`y` ranges relative to the **site** whatever
-/// the box is centred on.
 /// What one pass of [`App::prepare_volume`] did.
 ///
 /// Three answers rather than a `bool`, for the reason
@@ -642,20 +601,36 @@ pub(crate) enum VolumePrepare {
     Busy,
 }
 
+/// What to resample for `target`, over the region it names or the default box
+/// about the site.
+///
+/// Split out of `handle_prepare_volume` so the one decision in it that can be
+/// silently wrong is testable without an `App`, a GPU or a decoded volume: which
+/// ground gets sampled. Both failure modes are quiet — a region ignored resamples
+/// the default box and looks like a region that was never committed, and a region
+/// applied to the wrong axis resamples real ground the user did not pick — and
+/// neither shows up as an error anywhere.
+///
+/// `site_lat`/`site_lon` are still needed when a region is present:
+/// `build_voxels` reports its `x`/`y` ranges relative to the **site** whatever
+/// the box is centred on.
 fn voxel_request_for(
     target: &rustdar_egui::pane::VolumeTarget,
     site_lat: f64,
     site_lon: f64,
 ) -> rustdar_radar::voxel::VoxelRequest {
-    // The picked region, or the default box about the site. Both halves come
-    // straight off the target, which is what makes the grid and the pane's own
-    // resolution readout describe the same box.
+    // The picked region, or the site with no width at all — `None` is what
+    // asks `build_voxels` for the box the volume's own reach earns
+    // (`voxel::box_half_width_km`). Passing a width here instead would mean
+    // deriving it from a volume this function does not have, and the one it
+    // could reach for is the *pane's* volume rather than the one about to be
+    // resampled.
     let (centre, half_width_km) = match target.region {
         Some(region) => (
             (region.centre().lat, region.centre().lon),
-            region.half_width_km(),
+            Some(region.half_width_km()),
         ),
-        None => ((site_lat, site_lon), VOLUME_HALF_WIDTH_KM),
+        None => ((site_lat, site_lon), None),
     };
     rustdar_radar::voxel::VoxelRequest {
         centre,

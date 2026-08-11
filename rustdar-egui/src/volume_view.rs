@@ -55,9 +55,11 @@
 //!
 //! # Vertical exaggeration, and where it is and is not applied
 //!
-//! At true proportions the default box is 460 km wide by 18 km tall — **25.6:1**
-//! — and even a tight 40 km one is 2.2:1: either reads as a sheet of paper. So [`OrbitCamera::vertical_exaggeration`] stretches
-//! it, and it is a knob with a number on it rather than a silent constant.
+//! At true proportions a wide-open box is 651 km across a WSR-88D's
+//! reflectivity volume by 18 km tall — **36:1** — and even a tight 40 km one is
+//! 2.2:1: either reads as a sheet of paper. So
+//! [`OrbitCamera::vertical_exaggeration`] stretches it, and it is a knob with a
+//! number on it rather than a silent constant.
 //!
 //! It is applied in exactly one place: [`exaggerated_box_km`], which every
 //! function here routes its box through. Scaling the box's `z` **extent** rather
@@ -324,6 +326,27 @@ pub trait VolumePainter: Send + Sync {
     /// future headless painter) is an editor that says "waiting for the
     /// volume" rather than a build break.
     fn palette(&self, _pane_idx: usize, _target: &VolumeTarget) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// The full extent in kilometres, each axis, of the box the pane's grid was
+    /// actually resampled over — or `None` while no grid is in hand.
+    ///
+    /// The pane's other window into the renderer, alongside
+    /// [`palette`](Self::palette), and it exists for the same reason: since the
+    /// box of a pane with no picked region follows the *volume's* reach
+    /// (`rustdar_radar::voxel::box_half_width_km`), the number is a fact about
+    /// data this crate never sees. The grid carries its own `x`/`y`/`z` ranges,
+    /// so this is a read of the picture rather than a second derivation beside
+    /// it — which is the whole point, because the two things scaled by this
+    /// number are the pan gesture and the caption's km-per-cell, and either
+    /// disagreeing with the picture is invisible until a user notices the drag
+    /// runs at the wrong speed.
+    ///
+    /// Defaulted to `None` so a painter that cannot answer falls back to
+    /// [`crate::pane::box_size_km`] over the pane's own viewport region, which
+    /// is what a pane with no grid uses anyway.
+    fn box_size_km(&self, _pane_idx: usize, _target: &VolumeTarget) -> Option<[f32; 3]> {
         None
     }
 }

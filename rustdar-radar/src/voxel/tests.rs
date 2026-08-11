@@ -365,7 +365,7 @@ fn placeholder_scan() -> Scan {
 fn request(shape: VoxelShape) -> VoxelRequest {
     VoxelRequest {
         centre: SITE,
-        half_width_km: 60.0,
+        half_width_km: Some(60.0),
         base_km_msl: 0.0,
         top_km_msl: 12.0,
         product: RadarProduct::Reflectivity,
@@ -657,7 +657,7 @@ fn a_non_finite_number_anywhere_is_refused() {
         // survives whichever one it missed.
         let cases = [
             VoxelRequest {
-                half_width_km: bad,
+                half_width_km: Some(bad),
                 ..base.clone()
             },
             VoxelRequest {
@@ -721,7 +721,7 @@ fn the_half_width_is_clamped_rather_than_refused() {
         (10_000.0, MAX_HALF_WIDTH_KM),
     ] {
         let req = VoxelRequest {
-            half_width_km: asked,
+            half_width_km: Some(asked),
             ..request(ODD)
         };
         let grid = build_voxels(&scan, &req, SITE.0, SITE.1)
@@ -733,6 +733,262 @@ fn the_half_width_is_clamped_rather_than_refused() {
             grid.x_range_km(),
         );
     }
+}
+
+// ── The box's own extent ────────────────────────────────────────────────
+
+/// Two cuts of 1832 super-resolution gates — a WSR-88D surveillance sweep's
+/// own 460.125 km — over `field`.
+///
+/// Both cuts are low (0.53° and 1.51°) and both reach the full range, which is
+/// what a split-cut VCP's surveillance halves do and what a column past 230 km
+/// needs to be *sampled* rather than merely inside the box: the sampler
+/// interpolates between bracketing rungs and extrapolates past neither, so a
+/// fixture whose upper cut left the 18 km box before the range under test
+/// would prove nothing about the box's width.
+const SURVEILLANCE_GATES: usize = 1832;
+
+fn long_range_scan(field: Field<'_>) -> Scan {
+    Scan::new(
+        vcp(&[0.5, 1.5]),
+        vec![
+            refl_sweep(
+                2,
+                1.51,
+                &wrapped_azimuths(360, 41.0),
+                SURVEILLANCE_GATES,
+                field,
+            ),
+            refl_sweep(
+                1,
+                LOW_DEG,
+                &wrapped_azimuths(720, 293.5),
+                SURVEILLANCE_GATES,
+                field,
+            ),
+        ],
+    )
+}
+
+/// The box is the largest square that fits inside the data's own range
+/// circle, floored and capped.
+///
+/// The inscribed-square rule is the whole policy, so it is pinned as the
+/// geometric property rather than as the constant it works out to: a
+/// half-width of `reach / √2` is exactly the one whose **corner** sits on the
+/// data circle. One kilometre wider and the corner cells are outside the
+/// radar's range — cells that can never hold a measurement, bought with
+/// resolution taken from the cells that can.
+#[test]
+fn the_box_is_the_largest_square_inside_the_datas_range_circle() {
+    for reach in [120.0f64, 300.0, 460.125] {
+        let half = box_half_width_km(reach);
+        let corner = half * std::f64::consts::SQRT_2;
+        assert!(
+            (corner - reach).abs() < 1e-9,
+            "a {reach} km reach earned a {half} km half-width, whose corner is \
+             {corner} km out",
+        );
+    }
+    assert!(
+        (box_half_width_km(460.125) - 325.3575).abs() < 1e-3,
+        "the WSR-88D's own surveillance reach must earn 325.36 km — a 651 km \
+         box at 2.54 km per cell on the desktop shape — got {}",
+        box_half_width_km(460.125),
+    );
+}
+
+/// The two ends of the rule, and the one input that has no honest answer.
+///
+/// The cap is the plan view's own arithmetic guard read through this
+/// geometry, so a mis-framed radial claiming sixty thousand gates widens the
+/// box no further than it zooms the raster out. The floor is the resampler's
+/// narrowest box. A reach that is `NaN` or non-positive is not a reach at all
+/// and answers the box that has always been drawn, because `clamp` propagates
+/// `NaN` and a `NaN` half-width would make every cell of the grid unplaceable
+/// with nothing to report it.
+#[test]
+fn the_box_stops_at_both_ends_and_refuses_to_guess_from_no_reach() {
+    assert_eq!(box_half_width_km(60_000.0), MAX_HALF_WIDTH_KM);
+    assert_eq!(box_half_width_km(f64::INFINITY), MAX_HALF_WIDTH_KM);
+    assert!(
+        (MAX_HALF_WIDTH_KM * std::f64::consts::SQRT_2 - crate::types::MAX_EXTENT_KM).abs() < 1e-9,
+        "the box's cap must be the raster's cap through this rule's own \
+         geometry, or one of them can be raised without the other",
+    );
+    assert_eq!(box_half_width_km(1.0), MIN_HALF_WIDTH_KM);
+    for no_reach in [f64::NAN, 0.0, -1.0] {
+        assert_eq!(
+            box_half_width_km(no_reach),
+            BASE_HALF_WIDTH_KM,
+            "{no_reach} is not a reach; the box must fall back rather than \
+             clamp it",
+        );
+    }
+}
+
+/// The reach is the **volume's** longest cut, over the ground, not the first
+/// sweep's and not a slant range.
+///
+/// Both halves matter and both are silent. A maximum over one sweep would
+/// size the box to whichever cut the decoder happened to hand over first — on
+/// a real split cut that is a 300 km Doppler half beside a 460 km
+/// surveillance one, and the box would crop the taller sweep it is also
+/// resampling. A slant range would size the box by a ruler the sampler does
+/// not use: its columns are asked for ground ranges, so a steep cut's reach
+/// has to be shortened by the same `cos e` its gates are.
+#[test]
+fn the_reach_is_the_volumes_longest_cut_measured_over_the_ground() {
+    let field = &|_: f64, _: f64| Some(30.0);
+    // The long cut is the *second* sweep in collection order, so a reach
+    // taken from the first is 51.9 km rather than 151.9.
+    let scan = scan_of(field);
+    let reach = volume_reach_km(&scan, RadarProduct::Reflectivity);
+    let low_slant = gate_slant_km(LOW_GATES);
+    assert!(
+        (reach - low_slant * f64::from(LOW_DEG).to_radians().cos()).abs() < 1e-9,
+        "expected the low cut's {low_slant} km shortened to the ground, got {reach}",
+    );
+    assert!(
+        reach < low_slant,
+        "a ground range is shorter than the slant range it came from: \
+         {reach} against {low_slant}",
+    );
+
+    // A product the volume does not carry reaches nowhere, which is what
+    // sends the box to its fallback rather than to a 20 km box.
+    assert_eq!(volume_reach_km(&scan, RadarProduct::Velocity), 0.0);
+    assert_eq!(
+        box_half_width_km(volume_reach_km(&scan, RadarProduct::Velocity)),
+        BASE_HALF_WIDTH_KM,
+    );
+}
+
+/// **A long-range volume's box holds echo the fixed 230 km box cut off.**
+///
+/// The user-facing half of the whole change, and the assertion is on the
+/// echo rather than on the width: a beacon 280 km north of the site — inside
+/// a surveillance cut's 460 km reach, on the plan view beside the pane, and
+/// 50 km outside the box this resampler used to build — is resampled into
+/// cells that carry its dBZ.
+///
+/// The old box is the control, in the same test and on the same volume, so
+/// the pin cannot pass by the beacon being somewhere both boxes reach.
+#[test]
+fn a_long_range_volumes_box_holds_the_echo_the_fixed_box_cut_off() {
+    const BEACON_KM: (f64, f64) = (0.0, 280.0);
+    const BEACON_RADIUS_KM: f64 = 22.0;
+    let field = &|az_deg: f64, slant_km: f64| -> Option<f64> {
+        let az = az_deg.to_radians();
+        let (x, y) = (slant_km * az.sin(), slant_km * az.cos());
+        ((x - BEACON_KM.0).hypot(y - BEACON_KM.1) <= BEACON_RADIUS_KM).then_some(55.0)
+    };
+    let scan = long_range_scan(field);
+
+    let following = VoxelRequest {
+        half_width_km: None,
+        top_km_msl: 18.0,
+        shape: DESKTOP_SHAPE,
+        ..request(DESKTOP_SHAPE)
+    };
+    let grid = build_voxels(&scan, &following, SITE.0, SITE.1).expect("a buildable grid");
+    let (y0, y1) = grid.y_range_km();
+    assert!(
+        y1 > BEACON_KM.1 + BEACON_RADIUS_KM,
+        "the fixture is broken: the beacon's far edge is outside the box it \
+         is meant to be inside ({y0} .. {y1} km)",
+    );
+
+    // Cells carrying the beacon's own 55 dBZ, and where their centres are.
+    let cut = grid.value_to_index(50.0).max(1);
+    let shape = grid.shape();
+    let mut lit = 0usize;
+    let mut farthest = 0.0f64;
+    for iy in 0..shape.ny {
+        for ix in 0..shape.nx {
+            for iz in 0..shape.nz {
+                if grid.index_at(ix, iy, iz).expect("an in-grid cell") >= cut {
+                    let (cx, cy, _) = grid.cell_centre_km(ix, iy, iz).expect("an in-grid cell");
+                    lit += 1;
+                    farthest = farthest.max(cx.hypot(cy));
+                    break;
+                }
+            }
+        }
+    }
+    assert!(
+        lit > 0 && farthest > 230.0,
+        "the beacon 280 km out must be in the volume: {lit} columns lit, the \
+         farthest at {farthest:.1} km",
+    );
+
+    // The control: the box this resampler used to build, on the same volume.
+    let fixed = VoxelRequest {
+        half_width_km: Some(BASE_HALF_WIDTH_KM),
+        ..following
+    };
+    let old = build_voxels(&scan, &fixed, SITE.0, SITE.1).expect("a buildable grid");
+    let old_cut = old.value_to_index(50.0).max(1);
+    let old_lit = old
+        .indices()
+        .iter()
+        .filter(|&&index| index >= old_cut)
+        .count();
+    assert_eq!(
+        old_lit, 0,
+        "the fixed box must not reach this beacon, or the pin above is not \
+         measuring the change",
+    );
+}
+
+/// **A short-range volume's box tightens onto its data instead of padding
+/// it.**
+///
+/// The other direction of the same rule, and the reason it is worth
+/// following per volume rather than pinning at a constant. A Doppler-only
+/// volume reaching 88.9 km used to be resampled into the same 460 km box as a
+/// continent-wide surveillance cut, with four fifths of every axis holding
+/// nothing. Following the reach spends the same cells over the ground the
+/// radar actually looked at — and the cells get *finer*, which is the
+/// opposite of what widening the reflectivity box costs.
+#[test]
+fn a_short_range_volumes_box_tightens_onto_its_data() {
+    const GATES: usize = 347; // 2.125 + 86.75 = 88.875 km of slant range
+    let field = &|_: f64, _: f64| Some(12.0);
+    let scan = Scan::new(
+        vcp(&[0.5, 1.5]),
+        vec![
+            vel_sweep(1, LOW_DEG, &wrapped_azimuths(360, 117.5), GATES, field),
+            vel_sweep(2, 1.51, &wrapped_azimuths(360, 41.0), GATES, field),
+        ],
+    );
+
+    let req = VoxelRequest {
+        half_width_km: None,
+        product: RadarProduct::Velocity,
+        shape: DESKTOP_SHAPE,
+        ..request(DESKTOP_SHAPE)
+    };
+    let grid = build_voxels(&scan, &req, SITE.0, SITE.1).expect("a buildable grid");
+    let (x0, x1) = grid.x_range_km();
+    let half = 0.5 * (x1 - x0);
+    let reach = volume_reach_km(&scan, RadarProduct::Velocity);
+    assert!(
+        (half - reach / std::f64::consts::SQRT_2).abs() < 1e-9,
+        "an {reach} km volume must earn a {} km half-width, got {half}",
+        reach / std::f64::consts::SQRT_2,
+    );
+    assert!(
+        half < BASE_HALF_WIDTH_KM,
+        "a volume that stops at {reach} km must not be given the box a \
+         460 km one gets: {half} km",
+    );
+    let cells = f64::from(DESKTOP_SHAPE.nx as u32);
+    assert!(
+        2.0 * half / cells < 2.0 * BASE_HALF_WIDTH_KM / cells,
+        "tightening onto the data has to buy resolution, or there is no \
+         reason to prefer it",
+    );
 }
 
 // ── Orientation and cell centres ────────────────────────────────────────
@@ -759,7 +1015,7 @@ fn the_grid_is_indexed_x_east_y_north_z_up() {
     // apart from 1.0 km MSL, so row 1 (1.63 km over the antenna) is inside
     // the bracket and row 4 (4.63 km) is over the top of it.
     let req = VoxelRequest {
-        half_width_km: 40.0,
+        half_width_km: Some(40.0),
         base_km_msl: 0.5,
         top_km_msl: 5.5,
         ..request(shape)
@@ -812,7 +1068,7 @@ fn cell_centres_sit_at_the_half_step() {
     // the antenna, so rows at 0.7 / 1.1 / 1.5 km MSL — 0.33 / 0.73 /
     // 1.13 km over it — all sit inside.
     let req = VoxelRequest {
-        half_width_km: 40.0,
+        half_width_km: Some(40.0),
         base_km_msl: 0.5,
         top_km_msl: 1.7,
         ..request(shape)
@@ -858,7 +1114,7 @@ fn the_height_axis_is_msl_above_the_sites_own_elevation() {
     let dz = (top_km_msl - base_km_msl) / nz as f64;
     let shape = VoxelShape { nx: 2, ny: 1, nz };
     let req = VoxelRequest {
-        half_width_km: 40.0,
+        half_width_km: Some(40.0),
         base_km_msl,
         top_km_msl,
         ..request(shape)
@@ -898,7 +1154,7 @@ fn the_centre_may_sit_away_from_the_site() {
     let east_lon = SITE.1 + 50.0 / (crate::types::KM_PER_DEGREE_LAT * SITE.0.to_radians().cos());
     let req = VoxelRequest {
         centre: (SITE.0, east_lon),
-        half_width_km: 20.0,
+        half_width_km: Some(20.0),
         ..request(ODD)
     };
     let grid = build_voxels(&scan, &req, SITE.0, SITE.1).unwrap();
@@ -936,7 +1192,7 @@ fn the_centre_may_sit_away_from_the_site() {
 fn the_output_carries_everything_a_model_matrix_needs() {
     let scan = scan_of(&|_, _| Some(35.0));
     let req = VoxelRequest {
-        half_width_km: 37.5,
+        half_width_km: Some(37.5),
         base_km_msl: 0.75,
         top_km_msl: 15.25,
         ..request(ODD)
@@ -1062,7 +1318,7 @@ fn a_layer_is_quantised_to_the_ladder_rather_than_to_nz() {
     // Half-width 200 km with two columns puts their centres at ±100 km
     // east on the y = 0 line — WP-B's own range.
     let req = VoxelRequest {
-        half_width_km: 200.0,
+        half_width_km: Some(200.0),
         base_km_msl,
         top_km_msl,
         ..request(shape)
@@ -1138,7 +1394,7 @@ fn every_cell_is_the_samplers_own_answer() {
         nz: 6,
     };
     let req = VoxelRequest {
-        half_width_km: 55.0,
+        half_width_km: Some(55.0),
         base_km_msl: 0.5,
         top_km_msl: 9.5,
         ..request(shape)
@@ -1198,7 +1454,7 @@ fn nothing_is_extrapolated_outside_the_ladder() {
     // A box reaching well past the low tilt's last gate (151.9 km slant)
     // and well above the high tilt's beam.
     let req = VoxelRequest {
-        half_width_km: 220.0,
+        half_width_km: Some(220.0),
         base_km_msl: 0.0,
         top_km_msl: 25.0,
         ..request(shape)
@@ -1314,7 +1570,7 @@ fn two_identical_grids_compare_equal_through_the_nan_value_plane() {
 
     // And it still discriminates: a different box is a different grid.
     let moved = VoxelRequest {
-        half_width_km: 61.0,
+        half_width_km: Some(61.0),
         ..request(ODD)
     };
     assert_ne!(a, build_voxels(&scan, &moved, SITE.0, SITE.1).unwrap());
@@ -1641,7 +1897,7 @@ fn every_volume_product_builds_a_populated_grid_and_a_full_table() {
     for product in VOLUME_PRODUCTS {
         let req = VoxelRequest {
             product,
-            half_width_km: 40.0,
+            half_width_km: Some(40.0),
             base_km_msl: 0.5,
             top_km_msl: 4.0,
             ..request(ODD)
@@ -1857,7 +2113,7 @@ fn an_echo_edge_fades_instead_of_fabricating_a_mid_value() {
         nz: 24,
     };
     let req = VoxelRequest {
-        half_width_km: 60.0,
+        half_width_km: Some(60.0),
         base_km_msl: 0.5,
         top_km_msl: 8.0,
         ..request(shape)
@@ -2704,7 +2960,7 @@ fn the_velocity_fold_guard_rides_into_the_voxel_grid() {
     );
     let req = VoxelRequest {
         product: RadarProduct::Velocity,
-        half_width_km: 20.0,
+        half_width_km: Some(20.0),
         top_km_msl: 4.0,
         shape: VoxelShape {
             nx: 64,
@@ -3035,7 +3291,7 @@ fn a_grid_round_trips_through_its_wire_form() {
     let elsewhere = build_voxels(
         &scan,
         &VoxelRequest {
-            half_width_km: 61.0,
+            half_width_km: Some(61.0),
             ..request(ODD)
         },
         SITE.0,
@@ -3530,9 +3786,10 @@ fn serial_reference_grid(
     let sampler =
         VolumeSampler::new(crate::nyquist::Volume::from(scan), req.product).expect("a sampler");
 
-    let half = req
-        .half_width_km
-        .clamp(MIN_HALF_WIDTH_KM, MAX_HALF_WIDTH_KM);
+    let half = match req.half_width_km {
+        Some(picked) => picked.clamp(MIN_HALF_WIDTH_KM, MAX_HALF_WIDTH_KM),
+        None => box_half_width_km(volume_reach_km(scan, req.product)),
+    };
     let (bearing_deg, range_km) = beam::site_bearing_range_km(lat, lon, req.centre.0, req.centre.1);
     let bearing = bearing_deg.to_radians();
     let (cx, cy) = (range_km * bearing.sin(), range_km * bearing.cos());

@@ -437,7 +437,7 @@ fn a_derived_voxel_grid_resamples_the_derived_field() {
     let site = (35.33306, -97.2775);
     let req = |product| VoxelRequest {
         centre: site,
-        half_width_km: 30.0,
+        half_width_km: Some(30.0),
         base_km_msl: 0.0,
         top_km_msl: 4.0,
         product,

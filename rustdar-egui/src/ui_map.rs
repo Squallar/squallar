@@ -1799,10 +1799,34 @@ fn volume_pane_outcome(
     // measure it against a camera the user has not seen yet.
     //
     // Answered rather than unwrapped for the reason the `volume_mut` below gives.
-    let box_size_km = crate::pane::box_size_km(region);
+    let mut box_size_km = crate::pane::box_size_km(region);
     let Some((camera_before, view_mode)) = pane.volume().map(|v| (v.camera, v.view_mode)) else {
         return VolumeOutcome::empty_state(VOLUME_EMPTY_STATE.to_owned());
     };
+    // The box the picture on screen was actually *built* over, for the pan to
+    // be scaled against. A measured viewport states its own width and
+    // `build_voxels` honours it, so for those the line above is already exact
+    // and this changes nothing. What it answers is the unmeasured case: an
+    // unstated width is resolved from the volume's own reach
+    // (`rustdar_radar::voxel::box_half_width_km`), which the pane cannot
+    // derive because it holds no volume — so the grid answers, and the pane's
+    // own derivation above stands in only until there is a grid.
+    //
+    // Keyed on `rendered_for` rather than on the target this function resolves
+    // further down, because that target is not known yet and the pan is folded
+    // in before anything that could refuse. The two name the same box wherever
+    // it matters: they differ only on the frame a rebuild is first noticed,
+    // and a rebuild that changes the *width* changes it only when the volume's
+    // reach changed — a pane's own site, moment and region are what the width
+    // otherwise follows, and none of them moved.
+    if let Some(built) = pane
+        .volume()
+        .and_then(|v| v.rendered_for.as_ref())
+        .zip(painter)
+        .and_then(|(target, painter)| painter.box_size_km(pane_idx, target))
+    {
+        box_size_km = built;
+    }
 
     // The gesture first, and unconditionally: the camera is the pane's own
     // state, it survives every reason there is nothing to draw, and a user who
@@ -2071,11 +2095,24 @@ fn volume_pane_outcome(
             // Over the callback, and only when there is a picture to caption: an
             // empty state already says everything, and a caption under it would
             // be two explanations of the same pane.
+            //
+            // The box is looked up again here, on `target` — the same key
+            // `paint` just answered on, so the caption's "651 km box - 2.54
+            // km/cell" is measured off the very grid the callback above is
+            // about to march. The pan's copy at the top of this function is
+            // keyed on `rendered_for` because it has to exist before a target
+            // does; this one has no such excuse, and a caption is exactly
+            // where a box size nobody resampled would go unnoticed.
+            let half_width_km = painter
+                .box_size_km(pane_idx, &target)
+                .map_or(0.5 * f64::from(box_size_km[0]), |built| {
+                    0.5 * f64::from(built[0])
+                });
             paint_volume_caption(
                 ui,
                 pane_rect,
                 crate::ui::pills::pill_row_clearance(ui.ctx(), pane_idx),
-                &volume_caption(&site_code, collected, base_started, region, camera),
+                &volume_caption(&site_code, collected, base_started, half_width_km, camera),
             );
             None
         }
@@ -2481,9 +2518,20 @@ const KFT_PER_KM: f64 = 3.280_84;
 ///
 /// The grid has a fixed cell count, so a tighter region buys detail instead of
 /// saving memory. That is the main reason to pick a region at all, and it is
-/// invisible unless it is written down: 1.80 km per cell at the whole-scan
-/// default box against 0.16 at a 20 km one is the difference between a smear
-/// and a storm.
+/// invisible unless it is written down: 2.54 km per cell over a WSR-88D's
+/// whole reflectivity volume against 0.16 at a 20 km region is the difference
+/// between a smear and a storm.
+///
+/// # Why the box arrives as a number rather than as a region
+///
+/// It has to be the box the grid was **built** over, and for a pane with no
+/// picked region that is no longer derivable from anything this function could
+/// be handed instead: the width follows the volume's own reach
+/// (`rustdar_radar::voxel::box_half_width_km`), so it is 651 km for a
+/// reflectivity volume and 424 for the same site's velocity. The caller reads
+/// it off the grid through `VolumePainter::box_size_km`, and passing the
+/// resolved number is what keeps this caption from being the one place that
+/// says a box size nothing resampled.
 ///
 /// A pure function of five values so that what the pane claims can be tested
 /// without a GPU, a projector or a frame.
@@ -2491,7 +2539,7 @@ fn volume_caption(
     site: &str,
     newest: chrono::NaiveDateTime,
     base_started: Option<chrono::NaiveDateTime>,
-    region: Option<crate::pane::VolumeRegion>,
+    half_width_km: f64,
     camera: crate::pane::OrbitCamera,
 ) -> Vec<String> {
     let mut lines = vec![format!(
@@ -2513,26 +2561,15 @@ fn volume_caption(
         camera.vertical_exaggeration(),
     ));
 
-    let half_width = region.map_or(crate::pane::DEFAULT_HALF_WIDTH_KM, |r| r.half_width_km());
     let cells = rustdar_radar::voxel::default_shape().nx;
-    let resolution = region
-        .unwrap_or(
-            // The default box, expressed as a region purely so the two paths
-            // divide by the same cell count. Infallible for a finite constant,
-            // and answered rather than unwrapped because `new` is the gate and
-            // nothing here should be able to bypass it.
-            crate::pane::VolumeRegion::new(
-                crate::pane::GeoPoint { lat: 0.0, lon: 0.0 },
-                half_width,
-            )
-            .unwrap_or_else(|| unreachable!("the default half-width is finite and in range")),
-        )
-        .resolution_km(cells);
-    match resolution {
-        Some(km) => lines.push(format!("{:.0} km box - {km:.2} km/cell", 2.0 * half_width)),
+    match crate::pane::resolution_km(half_width_km, cells) {
+        Some(km) => lines.push(format!(
+            "{:.0} km box - {km:.2} km/cell",
+            2.0 * half_width_km
+        )),
         // A zero cell count is impossible for every named shape, and a caption is
         // not the place to fail over it.
-        None => lines.push(format!("{:.0} km box", 2.0 * half_width)),
+        None => lines.push(format!("{:.0} km box", 2.0 * half_width_km)),
     }
     lines
 }

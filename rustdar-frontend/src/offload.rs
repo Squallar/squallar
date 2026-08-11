@@ -571,7 +571,18 @@ fn encode_voxel_request(out: &mut Vec<u8>, request: &VoxelRequest) {
     out.extend_from_slice(&request.product.wire_code().to_le_bytes());
     out.extend_from_slice(&request.centre.0.to_le_bytes());
     out.extend_from_slice(&request.centre.1.to_le_bytes());
-    out.extend_from_slice(&request.half_width_km.to_le_bytes());
+    // Tagged rather than sent as a sentinel width, the same shape the storm
+    // motion override above is sent in: `None` means "as wide as the volume
+    // reaches", which is a decision `build_voxels` makes on the worker side
+    // with the volume in hand, and no f64 can stand for it without also being
+    // a width somebody could legitimately ask for.
+    match request.half_width_km {
+        None => out.push(0),
+        Some(half) => {
+            out.push(1);
+            out.extend_from_slice(&half.to_le_bytes());
+        }
+    }
     out.extend_from_slice(&request.base_km_msl.to_le_bytes());
     out.extend_from_slice(&request.top_km_msl.to_le_bytes());
     // `u16` per axis rather than `u8`: `MAX_AXIS` is 256, which does not fit in
@@ -590,7 +601,11 @@ fn decode_voxel_request(r: &mut Reader) -> Option<VoxelRequest> {
     let product = rustdar_radar::types::RadarProduct::from_wire_code(r.u16()?)?;
     let request = VoxelRequest {
         centre: (r.f64()?, r.f64()?),
-        half_width_km: r.f64()?,
+        half_width_km: match r.u8()? {
+            0 => None,
+            1 => Some(r.f64()?),
+            _ => return None,
+        },
         base_km_msl: r.f64()?,
         top_km_msl: r.f64()?,
         product,
