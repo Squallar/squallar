@@ -1480,11 +1480,10 @@ impl super::App {
                     // Safe to read `panes()` here despite its `mem::take`
                     // caveat: `present_frame` runs after the egui pass has
                     // ended, never inside it.
-                    let volume_on_screen = self
-                        .gui
-                        .panes()
-                        .iter()
-                        .any(|pane| pane.render_view() == rustdar_radar::types::RenderView::Volume);
+                    let volume_on_screen =
+                        self.gui.panes().iter().any(|pane| {
+                            pane.render_view() == rustdar_radar::types::RenderView::Volume
+                        });
                     if volume_on_screen {
                         let losses = crate::volume::degrade::note_surface_loss_with_volume();
                         log::warn!(

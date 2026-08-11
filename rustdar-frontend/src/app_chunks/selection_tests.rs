@@ -59,8 +59,6 @@ pub(super) fn show_on(
 /// the exact shape it would narrow.
 #[test]
 fn every_pane_shape_takes_the_whole_feed() {
-    
-
     let mut app = headless(TestBridge::desktop());
     for &product in RadarProduct::all() {
         show(&mut app, product, 0.5, &[0.5, 1.5, 4.0]);
@@ -73,7 +71,10 @@ fn every_pane_shape_takes_the_whole_feed() {
         );
     }
 
-    for kind in [rustdar_radar::types::RenderView::CrossSection, rustdar_radar::types::RenderView::Volume] {
+    for kind in [
+        rustdar_radar::types::RenderView::CrossSection,
+        rustdar_radar::types::RenderView::Volume,
+    ] {
         show(&mut app, RadarProduct::Reflectivity, 0.5, &[0.5, 1.5, 4.0]);
         app.gui.pane_mut(0).unwrap().set_view(kind);
         assert_eq!(app.cut_selection_for("KTLX"), CutSelection::All, "{kind:?}");

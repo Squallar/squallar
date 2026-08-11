@@ -32,7 +32,9 @@ fn changed_settings_survive_a_save_and_load() {
     gui.pane_mut(0).unwrap().layer_link = false;
     // A 3D pane whose camera has been moved off its default, so the assertion
     // below is about the saved value rather than about two defaults agreeing.
-    gui.pane_mut(0).unwrap().set_view(rustdar_radar::types::RenderView::Volume);
+    gui.pane_mut(0)
+        .unwrap()
+        .set_view(rustdar_radar::types::RenderView::Volume);
     let nudged = {
         let volume = gui.pane_mut(0).unwrap().volume_mut().expect("converted");
         volume.camera.nudge(OrbitDelta {
@@ -62,7 +64,10 @@ fn changed_settings_survive_a_save_and_load() {
         !restored.pane(0).unwrap().viewport_link && !restored.pane(0).unwrap().layer_link,
         "the per-pane links must survive the round trip"
     );
-    assert_eq!(restored.pane(0).unwrap().render_view(), rustdar_radar::types::RenderView::Volume);
+    assert_eq!(
+        restored.pane(0).unwrap().render_view(),
+        rustdar_radar::types::RenderView::Volume
+    );
     assert_eq!(
         restored.pane(0).unwrap().volume().map(|v| v.camera),
         Some(nudged),
@@ -294,7 +299,9 @@ fn the_isosurface_mode_and_thresholds_survive_a_save_and_load() {
 
     let store = MemoryConfigStore::default();
     let mut gui = crate::Gui::new();
-    gui.pane_mut(0).unwrap().set_view(rustdar_radar::types::RenderView::Volume);
+    gui.pane_mut(0)
+        .unwrap()
+        .set_view(rustdar_radar::types::RenderView::Volume);
     gui.pane_mut(0).unwrap().volume_mut().unwrap().view_mode = VolumeViewMode::Isosurface;
     gui.volume_iso.set(RadarProduct::Velocity, 35.0);
     assert_ne!(
@@ -333,13 +340,15 @@ fn the_isosurface_mode_and_thresholds_survive_a_save_and_load() {
 /// a one-sided test sees only one of them.
 #[test]
 fn a_hidden_map_floor_survives_a_save_and_load() {
-    
-
     let store = MemoryConfigStore::default();
     let mut gui = crate::Gui::new();
     gui.set_pane_count_for_test(2);
-    gui.pane_mut(0).unwrap().set_view(rustdar_radar::types::RenderView::Volume);
-    gui.pane_mut(1).unwrap().set_view(rustdar_radar::types::RenderView::Volume);
+    gui.pane_mut(0)
+        .unwrap()
+        .set_view(rustdar_radar::types::RenderView::Volume);
+    gui.pane_mut(1)
+        .unwrap()
+        .set_view(rustdar_radar::types::RenderView::Volume);
     assert!(
         !gui.pane(0).unwrap().volume().unwrap().hide_floor,
         "precondition: a fresh 3D pane shows its floor",
@@ -994,7 +1003,10 @@ fn a_restored_non_map_pane_has_no_running_loop() {
 
     restored.load_ui_config(&store);
 
-    assert_eq!(restored.pane(0).unwrap().render_view(), rustdar_radar::types::RenderView::Volume);
+    assert_eq!(
+        restored.pane(0).unwrap().render_view(),
+        rustdar_radar::types::RenderView::Volume
+    );
     assert!(
         !restored.pane(0).unwrap().loop_state.is_active(),
         "a restored 3D pane came back with a loop nothing will ever render \
@@ -1012,8 +1024,6 @@ fn a_restored_non_map_pane_has_no_running_loop() {
 /// the nearest legal camera beats discarding the pane over a number.
 #[test]
 fn a_saved_camera_out_of_range_is_clamped_rather_than_dropped() {
-    
-
     let store = MemoryConfigStore::default();
     store
         .store(
@@ -1027,7 +1037,10 @@ fn a_saved_camera_out_of_range_is_clamped_rather_than_dropped() {
     let mut restored = crate::Gui::new();
     restored.load_ui_config(&store);
 
-    assert_eq!(restored.pane(0).unwrap().render_view(), rustdar_radar::types::RenderView::Volume);
+    assert_eq!(
+        restored.pane(0).unwrap().render_view(),
+        rustdar_radar::types::RenderView::Volume
+    );
     let camera = restored
         .pane(0)
         .unwrap()
@@ -1067,8 +1080,6 @@ fn a_saved_camera_out_of_range_is_clamped_rather_than_dropped() {
 /// kind, a missing filter costs the user their whole configuration.
 #[test]
 fn a_non_finite_float_would_poison_the_config_file_permanently() {
-    
-
     assert_eq!(
         serde_json::to_string(&f32::NAN).expect("serde_json writes it happily"),
         "null",
@@ -1118,7 +1129,10 @@ fn a_non_finite_float_would_poison_the_config_file_permanently() {
     store.store(UI_CONFIG_KEY, &json).unwrap();
     let mut restored = crate::Gui::new();
     assert!(restored.load_ui_config(&store));
-    assert_eq!(restored.pane(0).unwrap().render_view(), rustdar_radar::types::RenderView::Volume);
+    assert_eq!(
+        restored.pane(0).unwrap().render_view(),
+        rustdar_radar::types::RenderView::Volume
+    );
 }
 
 /// Zoom and pan are what "come back to where I left off" actually means, and

@@ -529,29 +529,6 @@ fn a_retargeted_section_takes_the_maps_site_and_drops_the_old_picture() {
     );
 }
 
-/// A minimal scan moment for `site`, distinguishable by its site name.
-fn scan_info_for(site: &'static str) -> rustdar_radar::types::ScanInfo {
-    rustdar_radar::types::ScanInfo {
-        site: rustdar_radar::sites::RadarSite {
-            name: site,
-            lat: 35.33,
-            lon: -97.27,
-            heights: None,
-        },
-        site_source: rustdar_radar::site_position::SitePositionSource::Table,
-        site_position: None,
-        timestamp: chrono::NaiveDate::from_ymd_opt(2026, 7, 30)
-            .unwrap()
-            .and_hms_opt(18, 30, 0)
-            .unwrap(),
-        vcp_number: 212,
-        available_products: vec![RadarProduct::Reflectivity],
-        product_elevations: std::collections::HashMap::new(),
-        status: String::new(),
-    }
-}
-
-
 /// Escape and Android's back cancel the armed draw — last, below every
 /// painted layer, because it is a mode rather than something on screen.
 ///
@@ -595,7 +572,10 @@ fn a_back_press_cancels_an_armed_draw_after_it_has_closed_every_layer() {
 fn converting_a_pane_tears_down_its_loop_and_nothing_else() {
     use crate::pane::LoopPhase;
 
-    for view in [rustdar_radar::types::RenderView::CrossSection, rustdar_radar::types::RenderView::Volume] {
+    for view in [
+        rustdar_radar::types::RenderView::CrossSection,
+        rustdar_radar::types::RenderView::Volume,
+    ] {
         let mut gui = Gui::new();
         {
             let pane = gui.pane_mut(0).unwrap();
@@ -628,7 +608,9 @@ fn converting_a_pane_tears_down_its_loop_and_nothing_else() {
 
         // …and converting back does not resurrect it. A torn-down loop is torn
         // down; re-enabling it is the transport's job.
-        gui.pane_mut(0).unwrap().set_view(rustdar_radar::types::RenderView::PlanView);
+        gui.pane_mut(0)
+            .unwrap()
+            .set_view(rustdar_radar::types::RenderView::PlanView);
         assert!(!gui.pane(0).unwrap().loop_state.is_active());
     }
 }
@@ -664,7 +646,9 @@ fn overlay_polling_skips_panes_with_no_map_but_keeps_their_toggles() {
     );
     assert_eq!(gui.first_pane_with_overlay_enabled(kind), Some(0));
 
-    gui.pane_mut(0).unwrap().set_view(rustdar_radar::types::RenderView::Volume);
+    gui.pane_mut(0)
+        .unwrap()
+        .set_view(rustdar_radar::types::RenderView::Volume);
     assert_eq!(
         gui.first_pane_with_overlay_enabled(kind),
         Some(1),
@@ -688,7 +672,9 @@ fn overlay_polling_skips_panes_with_no_map_but_keeps_their_toggles() {
             "pane {idx} lost its remembered layer choice"
         );
     }
-    gui.pane_mut(0).unwrap().set_view(rustdar_radar::types::RenderView::PlanView);
+    gui.pane_mut(0)
+        .unwrap()
+        .set_view(rustdar_radar::types::RenderView::PlanView);
     assert_eq!(gui.first_pane_with_overlay_enabled(kind), Some(0));
 }
 
@@ -820,11 +806,11 @@ fn a_pane_with_no_map_neither_drives_nor_follows_the_shared_viewport() {
 /// the more likely of the two to be seen.
 #[test]
 fn a_non_map_active_pane_is_not_the_fallback_sync_source() {
-    
-
     let mut gui = Gui::new();
     gui.set_pane_count_for_test(2);
-    gui.pane_mut(1).unwrap().set_view(rustdar_radar::types::RenderView::Volume);
+    gui.pane_mut(1)
+        .unwrap()
+        .set_view(rustdar_radar::types::RenderView::Volume);
     gui.active_pane = 1;
 
     // Deliberately out of step with pane 0, and deliberately *not* reported
@@ -954,7 +940,9 @@ fn loop_actions_skip_panes_that_draw_no_frames() {
     let mut gui = Gui::new();
     gui.set_pane_count_for_test(4);
     gui.pane_mut(1).unwrap().set_kind(PaneKind::CrossSection);
-    gui.pane_mut(2).unwrap().set_view(rustdar_radar::types::RenderView::Volume);
+    gui.pane_mut(2)
+        .unwrap()
+        .set_view(rustdar_radar::types::RenderView::Volume);
 
     assert_eq!(
         gui.loop_sync_targets(),
@@ -1017,11 +1005,11 @@ fn loop_actions_skip_panes_that_draw_no_frames() {
 /// still animate a pane whose user asked it to sit out.
 #[test]
 fn an_unlinked_pane_is_no_loop_target_whatever_its_kind() {
-    
-
     let mut gui = Gui::new();
     gui.set_pane_count_for_test(4);
-    gui.pane_mut(2).unwrap().set_view(rustdar_radar::types::RenderView::Volume);
+    gui.pane_mut(2)
+        .unwrap()
+        .set_view(rustdar_radar::types::RenderView::Volume);
     gui.active_pane = 0;
 
     // A volume pane can loop from the moment it exists — but its link is
@@ -1062,7 +1050,9 @@ fn clearing_graphics_state_reaches_panes_of_every_kind() {
     let mut gui = Gui::new();
     gui.set_pane_count_for_test(4);
     gui.pane_mut(1).unwrap().set_kind(PaneKind::CrossSection);
-    gui.pane_mut(2).unwrap().set_view(rustdar_radar::types::RenderView::Volume);
+    gui.pane_mut(2)
+        .unwrap()
+        .set_view(rustdar_radar::types::RenderView::Volume);
     // Split back down, so panes 2 and 3 are remembered but not shown.
     gui.set_pane_count_for_test(2);
 

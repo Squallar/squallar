@@ -286,8 +286,7 @@ impl super::Gui {
                     MenuNode::Toggle {
                         label: VOLUME_PANE_LABEL,
                         toggle: MenuToggle::VolumePane,
-                        value: pane.render_view()
-                            == rustdar_radar::types::RenderView::Volume,
+                        value: pane.render_view() == rustdar_radar::types::RenderView::Volume,
                     },
                     // Read off the *global* flag rather than off `pane`: it arms
                     // a gesture, and which pane the gesture ends up aiming is
@@ -612,8 +611,6 @@ mod tests {
     /// unticked it to make the box match what they were looking at.
     #[test]
     fn the_volume_toggle_describes_the_active_pane_and_no_other() {
-        
-
         let mut gui = Gui::new();
         gui.set_pane_count_for_test(2);
         assert!(
@@ -621,7 +618,9 @@ mod tests {
             "precondition: two fresh map panes"
         );
 
-        gui.pane_mut(1).unwrap().set_view(rustdar_radar::types::RenderView::Volume);
+        gui.pane_mut(1)
+            .unwrap()
+            .set_view(rustdar_radar::types::RenderView::Volume);
         assert!(
             !find_toggle(&gui, MenuToggle::VolumePane),
             "the toggle read some other pane's kind: pane 0 is the active one and \
@@ -640,8 +639,6 @@ mod tests {
     /// notice, because the first tick moves the fingerprint on its own.
     #[test]
     fn the_volume_toggle_converts_in_both_directions() {
-        
-
         let mut gui = Gui::new();
         let mut actions = Vec::new();
 

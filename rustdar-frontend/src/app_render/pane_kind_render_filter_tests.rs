@@ -135,7 +135,10 @@ fn deliver(app: &mut crate::app::App, pane_idx: usize) {
 /// cannot be satisfied by a dispatcher that skips every pane.
 #[test]
 fn the_dispatcher_skips_a_pane_with_no_plan_view() {
-    for kind in [rustdar_radar::types::RenderView::CrossSection, rustdar_radar::types::RenderView::Volume] {
+    for kind in [
+        rustdar_radar::types::RenderView::CrossSection,
+        rustdar_radar::types::RenderView::Volume,
+    ] {
         let mut app = app_on_site();
         app.render.cache_render(
             SITE,
@@ -194,7 +197,10 @@ fn the_dispatcher_skips_a_pane_with_no_plan_view() {
 /// is observed below is the filter and not a sibling that never qualified.
 #[test]
 fn the_sibling_broadcast_skips_a_pane_with_no_plan_view() {
-    for kind in [rustdar_radar::types::RenderView::CrossSection, rustdar_radar::types::RenderView::Volume] {
+    for kind in [
+        rustdar_radar::types::RenderView::CrossSection,
+        rustdar_radar::types::RenderView::Volume,
+    ] {
         let mut app = two_pane_app(SITE, SITE);
         point_at_site(&mut app, 0);
         point_at_site(&mut app, 1);
@@ -238,7 +244,10 @@ fn the_sibling_broadcast_skips_a_pane_with_no_plan_view() {
 fn a_render_in_flight_across_a_conversion_is_not_placed() {
     let mut app = app_on_site();
     app.render.pane_render[0].render_in_flight = true;
-    app.gui.pane_mut(0).unwrap().set_view(rustdar_radar::types::RenderView::Volume);
+    app.gui
+        .pane_mut(0)
+        .unwrap()
+        .set_view(rustdar_radar::types::RenderView::Volume);
 
     deliver(&mut app, 0);
 
@@ -310,7 +319,12 @@ fn the_first_loop_dispatch_pass_skips_only_the_panes_that_cannot_loop() {
     );
 
     for (label, kind, aimed, expected) in [
-        ("map", rustdar_radar::types::RenderView::PlanView, false, Some((moved_to, 0.0))),
+        (
+            "map",
+            rustdar_radar::types::RenderView::PlanView,
+            false,
+            Some((moved_to, 0.0)),
+        ),
         // Aimed: a section loop is a first-class participant, so its target
         // moves with the product exactly as a map's does.
         (
@@ -328,7 +342,12 @@ fn the_first_loop_dispatch_pass_skips_only_the_panes_that_cannot_loop() {
         ),
         // A 3D pane needs no aiming — the volume is the whole box — so its
         // target moves with the product like a map's.
-        ("volume", rustdar_radar::types::RenderView::Volume, false, Some((moved_to, 0.0))),
+        (
+            "volume",
+            rustdar_radar::types::RenderView::Volume,
+            false,
+            Some((moved_to, 0.0)),
+        ),
     ] {
         let mut app = app_on_site();
         {
@@ -382,14 +401,34 @@ fn the_first_loop_dispatch_pass_skips_only_the_panes_that_cannot_loop() {
 #[test]
 fn the_second_loop_dispatch_pass_judges_every_pane_that_can_loop() {
     for (label, kind, aimed, expected_failed) in [
-        ("map", rustdar_radar::types::RenderView::PlanView, false, true),
-        ("aimed section", rustdar_radar::types::RenderView::CrossSection, true, true),
-        ("unaimed section", rustdar_radar::types::RenderView::CrossSection, false, false),
+        (
+            "map",
+            rustdar_radar::types::RenderView::PlanView,
+            false,
+            true,
+        ),
+        (
+            "aimed section",
+            rustdar_radar::types::RenderView::CrossSection,
+            true,
+            true,
+        ),
+        (
+            "unaimed section",
+            rustdar_radar::types::RenderView::CrossSection,
+            false,
+            false,
+        ),
         // The 3D branch judges its frames too: the cached volume carries
         // nothing for the product, so `extract_volume_parts` refuses and the
         // store answers `Refused`, which retires the frame exactly as an
         // unrenderable sweep does on the plan-view path.
-        ("volume", rustdar_radar::types::RenderView::Volume, false, true),
+        (
+            "volume",
+            rustdar_radar::types::RenderView::Volume,
+            false,
+            true,
+        ),
     ] {
         let mut app = app_on_site();
         app.loop_mgr = LoopDownloadManager::new();
@@ -514,7 +553,11 @@ fn the_loop_frame_broadcast_skips_a_pane_with_no_plan_view() {
             .is_some()
     };
 
-    for kind in [None, Some(rustdar_radar::types::RenderView::CrossSection), Some(rustdar_radar::types::RenderView::Volume)] {
+    for kind in [
+        None,
+        Some(rustdar_radar::types::RenderView::CrossSection),
+        Some(rustdar_radar::types::RenderView::Volume),
+    ] {
         let mut app = two_pane_app(SITE, SITE);
         point_at_site(&mut app, 0);
         point_at_site(&mut app, 1);
@@ -602,7 +645,10 @@ fn the_loop_frame_broadcast_skips_a_pane_with_no_plan_view() {
 /// pane that draws no map.
 #[test]
 fn the_cached_render_restore_skips_a_pane_with_no_plan_view() {
-    for kind in [rustdar_radar::types::RenderView::CrossSection, rustdar_radar::types::RenderView::Volume] {
+    for kind in [
+        rustdar_radar::types::RenderView::CrossSection,
+        rustdar_radar::types::RenderView::Volume,
+    ] {
         let mut app = app_on_site();
         app.render.cache_render(
             SITE,
@@ -655,7 +701,10 @@ fn the_cached_render_restore_skips_a_pane_with_no_plan_view() {
 /// never called the setter.
 #[test]
 fn converting_a_pane_tears_its_loop_down_on_both_sides() {
-    for kind in [rustdar_radar::types::RenderView::CrossSection, rustdar_radar::types::RenderView::Volume] {
+    for kind in [
+        rustdar_radar::types::RenderView::CrossSection,
+        rustdar_radar::types::RenderView::Volume,
+    ] {
         let mut app = app_on_site();
         app.gui.pane_mut(0).unwrap().loop_state = active_loop(&[volume_time()]);
         app.loop_mgr = LoopDownloadManager::new();
@@ -707,7 +756,10 @@ fn converting_a_pane_tears_its_loop_down_on_both_sides() {
 /// `PaneState` rather than an `enum PaneState`.
 #[test]
 fn a_whole_volume_pane_keeps_the_volume_it_is_sampling() {
-    for kind in [rustdar_radar::types::RenderView::CrossSection, rustdar_radar::types::RenderView::Volume] {
+    for kind in [
+        rustdar_radar::types::RenderView::CrossSection,
+        rustdar_radar::types::RenderView::Volume,
+    ] {
         let mut app = app_on_site();
         app.gui.pane_mut(0).unwrap().set_view(kind);
         app.scan_data

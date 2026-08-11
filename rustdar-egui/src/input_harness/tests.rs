@@ -6152,7 +6152,11 @@ fn every_pane_reports_a_pointer_frame_whatever_its_kind() {
     h.make_pane_volume(2);
     assert_eq!(
         h.pane_kinds(),
-        vec![rustdar_radar::types::RenderView::PlanView, rustdar_radar::types::RenderView::CrossSection, rustdar_radar::types::RenderView::Volume],
+        vec![
+            rustdar_radar::types::RenderView::PlanView,
+            rustdar_radar::types::RenderView::CrossSection,
+            rustdar_radar::types::RenderView::Volume
+        ],
         "precondition: one pane of each kind, or this proves nothing"
     );
 
@@ -6387,7 +6391,10 @@ fn converting_the_active_pane_from_the_dropdown_makes_it_a_volume_pane() {
     // pane, so a one-way toggle would be a trap.
     h.mouse_click(clickable_leaf(&h, crate::ui::VOLUME_PANE_LABEL).center());
     h.frames_for(3, FRAME_DT);
-    assert_eq!(h.pane_kinds(), vec![rustdar_radar::types::RenderView::PlanView]);
+    assert_eq!(
+        h.pane_kinds(),
+        vec![rustdar_radar::types::RenderView::PlanView]
+    );
 }
 
 /// 44. **A non-map pane keeps the controls that apply to it and drops the
@@ -6447,7 +6454,10 @@ fn a_non_map_pane_keeps_the_controls_that_apply_to_it_and_drops_the_rest() {
             .collect()
     }
 
-    for kind in [rustdar_radar::types::RenderView::CrossSection, rustdar_radar::types::RenderView::Volume] {
+    for kind in [
+        rustdar_radar::types::RenderView::CrossSection,
+        rustdar_radar::types::RenderView::Volume,
+    ] {
         let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
         h.load_scan("KTLX");
         h.offer_product(0, rustdar_radar::types::RadarProduct::Reflectivity, 0.5);
@@ -6702,7 +6712,10 @@ fn every_pane_kinds_sidebar_opens_with_the_same_identity_line() {
 ///     a false claim about it.
 #[test]
 fn the_missing_layer_list_is_explained_for_both_non_map_kinds() {
-    for kind in [rustdar_radar::types::RenderView::CrossSection, rustdar_radar::types::RenderView::Volume] {
+    for kind in [
+        rustdar_radar::types::RenderView::CrossSection,
+        rustdar_radar::types::RenderView::Volume,
+    ] {
         let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
         h.load_scan("KTLX");
         let sidebar = sidebar_rect(&h);
@@ -7149,7 +7162,11 @@ fn converting_a_pane_moves_no_widget_id() {
 
     assert_eq!(
         h.pane_kinds(),
-        vec![rustdar_radar::types::RenderView::PlanView, rustdar_radar::types::RenderView::CrossSection, rustdar_radar::types::RenderView::PlanView],
+        vec![
+            rustdar_radar::types::RenderView::PlanView,
+            rustdar_radar::types::RenderView::CrossSection,
+            rustdar_radar::types::RenderView::PlanView
+        ],
         "precondition: the middle pane converted and the last one did not"
     );
     assert!(
@@ -8369,7 +8386,6 @@ fn a_press_thirty_points_off_a_cap_and_twenty_off_the_body_still_pans() {
     );
 }
 
-
 /// 45n. **Arming the section draw mid-flight kills the handle drag too**
 ///      — the other armed setter, making the same claim, pinned the same
 ///      way. 45f proves the handles go *inert* while the draw is armed;
@@ -8439,7 +8455,9 @@ fn a_tap_while_armed_draws_nothing_and_leaves_the_mode_armed() {
     h.frames_for(2, FRAME_DT);
 
     assert!(
-        h.pane_kinds().iter().all(|k| *k == rustdar_radar::types::RenderView::PlanView),
+        h.pane_kinds()
+            .iter()
+            .all(|k| *k == rustdar_radar::types::RenderView::PlanView),
         "an 11-point drag became a cross-section"
     );
     assert!(
@@ -8457,7 +8475,8 @@ fn a_tap_while_armed_draws_nothing_and_leaves_the_mode_armed() {
     h.mouse_release(to);
     h.frames_for(2, FRAME_DT);
     assert!(
-        h.pane_kinds().contains(&rustdar_radar::types::RenderView::CrossSection),
+        h.pane_kinds()
+            .contains(&rustdar_radar::types::RenderView::CrossSection),
         "the still-armed mode did not draw the next line"
     );
 }
@@ -8553,8 +8572,6 @@ fn arming_the_draw_changes_nothing_for_a_pane_with_no_map() {
 // is the first branch on which both exist. Everything below is about the
 // pair rather than about either one.
 
-
-
 /// **A back press cancels the armed modal drag.**
 ///
 /// Its own layer, below every painted one — see `Gui::dismiss_top_layer`. On
@@ -8578,8 +8595,6 @@ fn a_back_press_cancels_the_armed_modal_drag() {
         "with nothing left, a back press is a request to leave the app"
     );
 }
-
-
 
 // ── The Location control ─────────────────────────────────────────────
 //
@@ -10002,7 +10017,10 @@ fn the_kind_pill_popover_converts_next_frame_and_arms_the_unaimed_section() {
     let popover = h.pill_popover().expect("the popover opened");
     h.mouse_click(popover.rows[2].1.center());
     h.warm_up();
-    assert_eq!(h.pane_kinds()[0], rustdar_radar::types::RenderView::CrossSection);
+    assert_eq!(
+        h.pane_kinds()[0],
+        rustdar_radar::types::RenderView::CrossSection
+    );
     assert!(
         h.section_draw_armed(),
         "choosing an unaimed cross-section must arm the draw"
@@ -10989,7 +11007,10 @@ fn a_back_press_walks_the_phone_sheet_pages_top_down() {
     walk(&mut h, None);
     // ...and only then does the press reach the armed drag, then the exit.
     assert!(h.gui_mut().dismiss_top_layer(), "the armed drag is below");
-    assert!(!h.section_draw_armed(), "the press must disarm the region drag");
+    assert!(
+        !h.section_draw_armed(),
+        "the press must disarm the region drag"
+    );
     assert!(
         !h.gui_mut().dismiss_top_layer(),
         "nothing is left; the next press belongs to the exit path"

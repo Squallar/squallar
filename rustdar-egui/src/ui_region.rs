@@ -107,8 +107,9 @@ pub(crate) fn region_for_viewport(
         if !point.is_on_earth() {
             return None;
         }
-        let (_, range_km) =
-            rustdar_radar::beam::site_bearing_range_km(centre.lat, centre.lon, point.lat, point.lon);
+        let (_, range_km) = rustdar_radar::beam::site_bearing_range_km(
+            centre.lat, centre.lon, point.lat, point.lon,
+        );
         if !range_km.is_finite() {
             return None;
         }
@@ -120,7 +121,11 @@ pub(crate) fn region_for_viewport(
     // than the viewport that measured it, and the pane's own caption would
     // describe a box the floor does not cover.
     let quantised = (half_width_km / HALF_WIDTH_STEP_KM).floor() * HALF_WIDTH_STEP_KM;
-    if !(quantised >= rustdar_radar::voxel::MIN_HALF_WIDTH_KM) {
+    // `<` rather than a negated `>=`, so a NaN — which compares false against
+    // everything — falls through to `VolumeRegion::new`, where it is refused
+    // outright. Refusing it here as well would be the same answer by a longer
+    // route; laundering it past both would be a key that never equals itself.
+    if quantised < rustdar_radar::voxel::MIN_HALF_WIDTH_KM {
         return None;
     }
     VolumeRegion::new(centre, quantised)

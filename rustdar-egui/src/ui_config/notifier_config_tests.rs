@@ -35,8 +35,6 @@ fn an_empty_endpoint_falls_back_to_the_default() {
     assert_eq!(gui.notifier_endpoint(), "wss://example.test/");
 }
 
-
-
 /// A config written before the camera grew fields loads at the defaults
 /// rather than at zeros.
 ///
@@ -58,12 +56,14 @@ fn a_config_from_before_the_new_camera_fields_loads_at_the_defaults() {
     assert!(pane.set_map_render(MapRender::Volume));
     // Moved, so the `volume` block is written at all: an untouched camera is
     // omitted, and a fixture with no block would exercise nothing.
-    pane.map_mut().expect("a map pane").volume.camera.nudge(
-        crate::pane::OrbitDelta {
+    pane.map_mut()
+        .expect("a map pane")
+        .volume
+        .camera
+        .nudge(crate::pane::OrbitDelta {
             yaw_deg: 12.0,
             ..Default::default()
-        },
-    );
+        });
     gui.save_ui_config(&store);
 
     // Strip the two fields that did not exist, and put back the one that no

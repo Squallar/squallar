@@ -917,10 +917,7 @@ impl super::Gui {
             close |= matches!(event, ui_menu::MenuEvent::Invoked(_))
                 || matches!(
                     event,
-                    ui_menu::MenuEvent::Toggled(
-                        ui_menu::MenuToggle::DrawCrossSection,
-                        true,
-                    )
+                    ui_menu::MenuEvent::Toggled(ui_menu::MenuToggle::DrawCrossSection, true,)
                 );
             self.apply_menu_event(event, actions);
         }

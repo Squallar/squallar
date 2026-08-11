@@ -483,7 +483,8 @@ fn a_volume_pane_asks_for_its_grid_until_the_host_says_it_has_one() {
 #[test]
 fn converting_a_volume_pane_away_releases_its_volume() {
     let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
-    h.gui_mut().request_pane_view(1, rustdar_radar::types::RenderView::PlanView);
+    h.gui_mut()
+        .request_pane_view(1, rustdar_radar::types::RenderView::PlanView);
     h.frames_for(1, FRAME_DT);
 
     assert!(
@@ -507,7 +508,8 @@ fn converting_a_volume_pane_away_releases_its_volume() {
 #[test]
 fn converting_a_map_pane_releases_nothing() {
     let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
-    h.gui_mut().request_pane_view(0, rustdar_radar::types::RenderView::CrossSection);
+    h.gui_mut()
+        .request_pane_view(0, rustdar_radar::types::RenderView::CrossSection);
     h.frames_for(1, FRAME_DT);
     assert!(
         !h.last_actions()
@@ -966,8 +968,6 @@ fn a_pane_with_no_height_pans_to_nothing_rather_than_to_nan() {
 
 // --- Reset --------------------------------------------------------------
 
-
-
 /// A 3D pane on a 2-pane harness, with an archive volume and a painter.
 fn volume_pane_harness() -> InputHarness {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -986,9 +986,6 @@ fn at(minute: u32) -> chrono::NaiveDateTime {
         .and_hms_opt(22, minute, 0)
         .expect("a real time")
 }
-
-
-
 
 /// The mirror pass's guest list is this frame's floor strips — and nothing
 /// else.
@@ -1085,7 +1082,10 @@ fn a_3d_pane_with_no_neighbouring_map_still_gets_a_floor() {
     h.load_scan("KTLX");
     h.gui_mut().set_volume_painter(Some(painter.clone()));
     h.frames_for(2, FRAME_DT);
-    assert_eq!(h.pane_kinds(), vec![rustdar_radar::types::RenderView::PlanView]);
+    assert_eq!(
+        h.pane_kinds(),
+        vec![rustdar_radar::types::RenderView::PlanView]
+    );
 
     h.make_pane_volume(0);
     h.frames_for(2, FRAME_DT);

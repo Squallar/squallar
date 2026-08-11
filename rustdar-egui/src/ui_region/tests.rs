@@ -282,7 +282,8 @@ fn a_viewport_below_the_resamplers_minimum_is_refused() {
     let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(64.0, 64.0));
     let region = region_for_viewport(rect, &memory_at(18.0), centre());
     assert_eq!(
-        region, None,
+        region,
+        None,
         "a viewport under {} km across must be refused, not clamped up to a box the \
          floor does not cover",
         2.0 * rustdar_radar::voxel::MIN_HALF_WIDTH_KM,
