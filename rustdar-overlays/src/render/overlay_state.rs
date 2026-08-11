@@ -138,14 +138,19 @@ pub trait OverlayHandler: Send {
     fn data_generation(&self) -> u64;
 
     /// A cheap token for **what this handler would draw**: consumers that
-    /// re-render only when the picture changes (the 3D floor's composite)
-    /// compare it across frames. Unlike [`data_generation`], a refetch that
-    /// returns the same content should keep it stable where the handler can
-    /// tell — NWS alerts poll every two minutes and mostly return the same
-    /// warning set, and a floor recomposed on every poll is a floor
-    /// recomposed for nothing. The default is `data_generation`, correct for
-    /// every handler that cannot tell (it may only over-refresh, never
-    /// under-refresh). Called every frame, so it must not clone data.
+    /// re-render only when the picture changes compare it across frames.
+    /// Unlike [`data_generation`], a refetch that returns the same content
+    /// should keep it stable where the handler can tell — NWS alerts poll
+    /// every two minutes and mostly return the same warning set, and a raster
+    /// rebuilt on every poll is a raster rebuilt for nothing. The default is
+    /// `data_generation`, correct for every handler that cannot tell (it may
+    /// only over-refresh, never under-refresh). Called every frame, so it must
+    /// not clone data.
+    ///
+    /// `rustdar_egui`'s `overlay_cache_token` is what asks — it is the token
+    /// every [`RenderMode::Texture`] overlay's cached raster is keyed by, so a
+    /// handler that answers this well is one whose overlay is not rasterized
+    /// twice a minute for a byte-identical picture.
     ///
     /// [`data_generation`]: OverlayHandler::data_generation
     fn content_signature(&self) -> u64 {

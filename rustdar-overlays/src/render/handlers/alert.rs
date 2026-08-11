@@ -230,15 +230,39 @@ impl OverlayHandler for NwsAlertHandler {
         self.state.data_generation
     }
 
-    /// The **warning-set** signature: a fold over the ids of the alerts that
-    /// would draw — category-enabled and not hidden — rather than the fetch
-    /// counter. NWS alerts auto-poll every two minutes and the active set is
-    /// usually unchanged, so a consumer keyed on [`data_generation`] would
-    /// re-render on every poll for nothing; this token moves exactly when
-    /// the drawn set moves (a warning issued, expired, hidden, or a whole
-    /// category toggled off). XOR of per-id hashes, so it is order-free the
-    /// way a set is; ids are unique within a response, and an alert whose
-    /// geometry changes upstream arrives under a fresh id.
+    /// The **warning-set** signature: a fold over the alerts that would draw —
+    /// category-enabled and not hidden — rather than the fetch counter. NWS
+    /// alerts auto-poll every two minutes and the active set is usually
+    /// unchanged, so a consumer keyed on [`data_generation`] would re-render on
+    /// every poll for nothing; this token moves when the drawn set moves (a
+    /// warning issued, expired, hidden, or a whole category toggled off). XOR
+    /// of per-alert hashes, so it is order-free the way a set is, and ids are
+    /// unique within a response.
+    ///
+    /// # The id alone is not the picture, and that made a warning invisible
+    ///
+    /// Folding only the id was wrong for a **zone-based** alert, and those are
+    /// ordinary: [`crate::nws::alert`] admits an alert with `affectedZones` and
+    /// no `geometry`, carrying **no features at all**, and
+    /// [`crate::nws::zones::resolve_zone_geometry`] fills them in per poll —
+    /// silently dropping any zone whose fetch failed, with no retry. So the
+    /// same id legitimately arrives drawing nothing on one poll and drawing its
+    /// counties on the next. Same id, same drawn count, and before
+    /// `features.len()` joined the fold, the same token: the consumer kept its
+    /// raster and the warning stayed invisible until the user happened to pan
+    /// or zoom. Counting the features also catches the partial case — three of
+    /// five zones resolved, then all five.
+    ///
+    /// What it does **not** distinguish is a same-length set of *different*
+    /// zones (one zone's fetch failing as another's recovers). That is a
+    /// narrower residue than the bug it closes, and the alternative — hashing
+    /// the rings themselves — is a walk over every polygon in the country on a
+    /// national-coverage day, on a method whose contract is that it is cheap
+    /// enough to call every frame.
+    ///
+    /// A polygon *moving* under a stable id is not a case at all: `id` is the
+    /// NWS per-message URN, and an updated warning arrives as a new message
+    /// under a new id.
     ///
     /// [`data_generation`]: OverlayHandler::data_generation
     fn content_signature(&self) -> u64 {
@@ -249,6 +273,7 @@ impl OverlayHandler for NwsAlertHandler {
             if self.is_drawn(item) {
                 let mut hasher = DefaultHasher::new();
                 item.alert.id.hash(&mut hasher);
+                item.alert.features.len().hash(&mut hasher);
                 folded ^= hasher.finish();
                 visible += 1;
             }
@@ -542,6 +567,90 @@ mod tests {
         let mut handler = NwsAlertHandler::new();
         handler.apply_fetch_result(Box::new(NwsAlertFetchResult(Ok(alerts))));
         handler
+    }
+
+    /// A **zone-based** alert exactly as the parser admits one: `affectedZones`
+    /// listed, no `geometry`, and `zone_count` features — which is `0` on a
+    /// poll whose zone fetches all failed, and one per zone once they resolve.
+    fn zone_alert(id: &str, event: &str, zone_count: usize) -> NwsAlert {
+        let mut alert = alert(id, event);
+        alert.affected_zones = (0..3)
+            .map(|i| format!("https://api.weather.gov/zones/county/OKC{i:03}"))
+            .collect();
+        let (fill, stroke) = crate::nws::colors::alert_color(event);
+        alert.features = (0..zone_count)
+            .map(|i| {
+                let lat = 35.0 + i as f64;
+                OverlayFeature::new(
+                    vec![vec![vec![
+                        (lat, -97.0),
+                        (lat + 0.5, -97.0),
+                        (lat + 0.5, -96.5),
+                    ]]],
+                    fill,
+                    stroke,
+                    event.to_string(),
+                    String::new(),
+                    HatchPattern::None,
+                )
+            })
+            .collect();
+        alert
+    }
+
+    /// **A warning that gains its polygons across a poll must move the token,
+    /// or it stays invisible.**
+    ///
+    /// The id alone cannot see this and the drawn count cannot either.
+    /// `nws::alert` admits a zone-based warning with no geometry and no
+    /// features; `nws::zones::resolve_zone_geometry` fills them per poll and
+    /// silently drops a zone whose fetch failed, with no retry. So poll *N* is
+    /// the same id drawing nothing and poll *N+1* is the same id drawing three
+    /// counties — one alert either way, `is_drawn` true either way. A consumer
+    /// keyed on a token that did not move keeps its raster, and the warning is
+    /// absent from the map until the user happens to pan or zoom.
+    ///
+    /// The partial recovery is asserted too: two of three zones is not the same
+    /// picture as three of three, and the fetch really does deliver that.
+    #[test]
+    fn a_warning_that_gains_its_zone_polygons_moves_the_signature() {
+        let mut handler = handler_with(vec![zone_alert("a", "Tornado Warning", 0)]);
+        let unresolved = handler.content_signature();
+        assert_eq!(
+            handler.drawn_count(),
+            1,
+            "fixture: the alert must count as drawn with no features, or the \
+             count would move on its own and this proves nothing",
+        );
+
+        handler.apply_fetch_result(Box::new(NwsAlertFetchResult(Ok(vec![zone_alert(
+            "a",
+            "Tornado Warning",
+            3,
+        )]))));
+        let resolved = handler.content_signature();
+        assert_eq!(
+            handler.drawn_count(),
+            1,
+            "fixture: still one drawn alert, so only the geometry moved",
+        );
+        assert_ne!(
+            resolved, unresolved,
+            "a warning arrived with its counties and the token did not move, so \
+             nothing re-rasterizes and the warning stays off the map",
+        );
+
+        // And the partial case: some zones resolved, then the rest.
+        handler.apply_fetch_result(Box::new(NwsAlertFetchResult(Ok(vec![zone_alert(
+            "a",
+            "Tornado Warning",
+            2,
+        )]))));
+        assert_ne!(
+            handler.content_signature(),
+            resolved,
+            "two of three zones is not the picture three of three is",
+        );
     }
 
     /// The signature names the **set**, not the fetch: a refetch returning

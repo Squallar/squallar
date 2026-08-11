@@ -13029,6 +13029,37 @@ fn alert_over(id: &str, event: &str, lat: f64, lon: f64) -> rustdar_overlays::nw
     }
 }
 
+/// A **zone-based** NWS alert, shaped as `nws::alert` admits one and
+/// `nws::zones::resolve_zone_geometry` then fills it: `affectedZones` listed,
+/// no `geometry` of its own, and `zones_resolved` features — one per zone whose
+/// fetch succeeded on this poll, which is `0` when they all failed.
+fn zone_alert_over(
+    id: &str,
+    event: &str,
+    lat: f64,
+    lon: f64,
+    zones_resolved: usize,
+) -> rustdar_overlays::nws::alert::NwsAlert {
+    let mut alert = alert_over(id, event, lat, lon);
+    alert.affected_zones = (0..3)
+        .map(|i| format!("https://api.weather.gov/zones/county/OKC{i:03}"))
+        .collect();
+    let (fill, stroke) = rustdar_overlays::nws::colors::alert_color(event);
+    alert.features = (0..zones_resolved)
+        .map(|i| {
+            rustdar_overlays::types::OverlayFeature::new(
+                vec![vec![ring_about(lat + 0.1 * i as f64, lon, 0.25)]],
+                fill,
+                stroke,
+                event.to_string(),
+                String::new(),
+                rustdar_overlays::types::HatchPattern::None,
+            )
+        })
+        .collect();
+    alert
+}
+
 /// Feed `alerts` in through the production ingest path, exactly as the
 /// national fetch delivers them.
 fn ingest_alerts(h: &mut InputHarness, alerts: Vec<rustdar_overlays::nws::alert::NwsAlert>) {
@@ -13158,5 +13189,287 @@ fn an_md_still_labels_itself_on_a_frame_with_no_click() {
         h.painted_text_strings().iter().any(|t| t == "MD 1234"),
         "no MD label was painted on a frame with no click. Painted: {:?}",
         h.painted_text_strings()
+    );
+}
+
+/// The cache token the last frame asked `kind`'s raster to be keyed by — the
+/// value `OverlayTextureCache::needs_rerender` compares the cached texture
+/// against, so two frames agreeing on it means no re-rasterize.
+fn requested_cache_token(h: &InputHarness, kind: OverlayKind) -> u64 {
+    let tokens: Vec<u64> = h
+        .last_actions()
+        .iter()
+        .filter_map(|a| match a {
+            GuiAction::RenderOverlay {
+                overlay_kind,
+                data_generation,
+                ..
+            } if *overlay_kind == kind => Some(*data_generation),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !tokens.is_empty(),
+        "fixture must reach the render path — no RenderOverlay for {kind:?} was emitted"
+    );
+    tokens[0]
+}
+
+/// How many rasterizes the last frame asked for, for `kind`. Zero is the
+/// interesting number: it means the pane looked at its cache and was satisfied.
+fn rasterizes_requested(h: &InputHarness, kind: OverlayKind) -> usize {
+    h.last_actions()
+        .iter()
+        .filter(
+            |a| matches!(a, GuiAction::RenderOverlay { overlay_kind, .. } if *overlay_kind == kind),
+        )
+        .count()
+}
+
+/// Stand every asking pane's cache up as a landed render would leave it:
+/// stamped with exactly the bounds, zoom and token the last frame requested.
+///
+/// Without this the harness can only be asked what a render was *keyed* by,
+/// because `current` is `None` until a result lands and a cache with no texture
+/// re-asks on every frame by definition. With it, a `RenderOverlay` afterwards
+/// is a real re-rasterize — a worker pass plus the frame-thread `ColorImage`
+/// conversion — which is the thing these tests are actually about.
+fn settle_overlay_cache(h: &mut InputHarness, kind: OverlayKind) {
+    let requests: Vec<_> = h
+        .last_actions()
+        .iter()
+        .filter_map(|a| match a {
+            GuiAction::RenderOverlay {
+                pane_idx,
+                overlay_kind,
+                geo_bounds,
+                texture,
+                data_generation,
+                zoom,
+            } if *overlay_kind == kind => {
+                Some((*pane_idx, *geo_bounds, *texture, *data_generation, *zoom))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !requests.is_empty(),
+        "fixture: nothing asked for a {kind:?} raster, so there is no landed \
+         render to stand in for"
+    );
+    for (pane_idx, geo_bounds, plan, token, zoom) in requests {
+        let texture = h.ctx.load_texture(
+            format!("settled-{kind:?}-{pane_idx}"),
+            egui::ColorImage::filled([1, 1], egui::Color32::RED),
+            egui::TextureOptions::default(),
+        );
+        h.gui_mut().panes_mut()[pane_idx]
+            .overlay_cache_mut(kind)
+            .current = Some(crate::overlay_cache::OverlayTextureData {
+            texture,
+            geo_bounds,
+            data_generation: token,
+            render_zoom: zoom,
+            width: plan.width,
+            height: plan.height,
+            radar_meta: None,
+            hit_map: None,
+        });
+    }
+}
+
+/// A poll that returns the same warning set must not re-rasterize the alert
+/// overlay, and the map pane is where that is decided.
+///
+/// `OverlayHandler::content_signature` was written for exactly this and had no
+/// consumer: the pane keyed its raster on `data_generation`, which `set_data`
+/// bumps on *every* successful poll. NWS alerts are default-on, `RenderMode::
+/// Texture`, and poll every 120 s, so each poll bought a worker rasterize plus
+/// a frame-thread `ColorImage` conversion — ~47 ms at 5760×3240 — for a
+/// byte-identical texture.
+///
+/// Asserted on the **rasterizes the pane asks for**, not on the token it would
+/// have keyed them by, so what this pins is the saving itself: ten identical
+/// polls dispatched ten rasterizes before the fix and zero after. The last
+/// stanza is what keeps that from being the trivially-satisfied kind of zero.
+#[test]
+fn an_unchanged_warning_set_does_not_re_rasterize_the_alert_overlay() {
+    let mut h = InputHarness::new();
+    h.gui_mut().enable_overlay_for_test(OverlayKind::NwsAlerts);
+    h.warm_up();
+
+    let ground = h.ground_at(0, h.pane_rects()[0].center());
+    let warning_set = || vec![alert_over("a", "Tornado Warning", ground.y(), ground.x())];
+
+    ingest_alerts(&mut h, warning_set());
+    h.warm_up();
+    settle_overlay_cache(&mut h, OverlayKind::NwsAlerts);
+    h.warm_up();
+    assert_eq!(
+        rasterizes_requested(&h, OverlayKind::NwsAlerts),
+        0,
+        "fixture: a settled cache with nothing new must ask for nothing, or a \
+         zero below would say nothing about the fix",
+    );
+
+    // Ten polls, two minutes apart, each returning the warning still out.
+    for poll in 1..=10 {
+        let generation_before = h.gui_mut().overlays.data_generation(OverlayKind::NwsAlerts);
+        ingest_alerts(&mut h, warning_set());
+        h.warm_up();
+        assert_ne!(
+            h.gui_mut().overlays.data_generation(OverlayKind::NwsAlerts),
+            generation_before,
+            "fixture: poll {poll} must really have replaced the data — that bump \
+             is exactly what the pane used to key on",
+        );
+        assert_eq!(
+            rasterizes_requested(&h, OverlayKind::NwsAlerts),
+            0,
+            "poll {poll} of an unchanged warning set re-rasterized the whole \
+             alert overlay: a worker pass plus a ~47 ms frame-thread ColorImage \
+             conversion for a byte-identical texture",
+        );
+    }
+
+    // And the cache is not simply stuck saying yes: a warning that issues does
+    // buy a rasterize.
+    ingest_alerts(
+        &mut h,
+        vec![
+            alert_over("a", "Tornado Warning", ground.y(), ground.x()),
+            alert_over(
+                "b",
+                "Severe Thunderstorm Warning",
+                ground.y() + 0.5,
+                ground.x(),
+            ),
+        ],
+    );
+    h.warm_up();
+    assert_eq!(
+        rasterizes_requested(&h, OverlayKind::NwsAlerts),
+        1,
+        "a newly issued warning did not buy a re-rasterize, so the ten zeros \
+         above are a cache that never refreshes rather than one that refreshes \
+         when the picture moves",
+    );
+}
+
+/// …and the other half, or the pane would sit on a stale warning for ever: a
+/// warning **issuing** or **expiring** must move the token.
+///
+/// Those two, and not "or moving": a polygon that moves under a stable id is
+/// not a case the feed produces. `id` is the NWS per-message URN and an updated
+/// warning arrives as a new message under a new id, so it reaches this code as
+/// an expiry plus an issue — which is what the two halves below already are.
+/// The case that *is* real, and that this test does not cover, is a zone-based
+/// warning whose geometry arrives on a later poll under the same id; see
+/// [`a_warning_that_gains_its_polygons_re_rasterizes_the_alert_overlay`].
+#[test]
+fn a_changed_warning_set_moves_the_alert_overlays_cache_token() {
+    let mut h = InputHarness::new();
+    h.gui_mut().enable_overlay_for_test(OverlayKind::NwsAlerts);
+    h.warm_up();
+
+    let ground = h.ground_at(0, h.pane_rects()[0].center());
+    ingest_alerts(
+        &mut h,
+        vec![alert_over("a", "Tornado Warning", ground.y(), ground.x())],
+    );
+    h.warm_up();
+    let one_warning = requested_cache_token(&h, OverlayKind::NwsAlerts);
+
+    // A second warning issues.
+    ingest_alerts(
+        &mut h,
+        vec![
+            alert_over("a", "Tornado Warning", ground.y(), ground.x()),
+            alert_over(
+                "b",
+                "Severe Thunderstorm Warning",
+                ground.y() + 0.5,
+                ground.x(),
+            ),
+        ],
+    );
+    h.warm_up();
+    let two_warnings = requested_cache_token(&h, OverlayKind::NwsAlerts);
+    assert_ne!(
+        two_warnings, one_warning,
+        "a newly issued warning left the pane on its old raster",
+    );
+
+    // The first expires out of the feed.
+    ingest_alerts(
+        &mut h,
+        vec![alert_over(
+            "b",
+            "Severe Thunderstorm Warning",
+            ground.y() + 0.5,
+            ground.x(),
+        )],
+    );
+    h.warm_up();
+    assert_ne!(
+        requested_cache_token(&h, OverlayKind::NwsAlerts),
+        two_warnings,
+        "an expired warning stayed painted",
+    );
+}
+
+/// The same warning, on a later poll, with the counties it draws — through the
+/// whole pane, because the consequence is a warning that is not on the map.
+///
+/// `nws::alert` admits an alert that lists `affectedZones` and carries no
+/// `geometry` and therefore **no features**; `nws::zones::resolve_zone_geometry`
+/// fills them in per poll and silently drops any zone whose fetch failed, with
+/// no retry. So this sequence — one alert id, zero features, then the same id
+/// with three — is an ordinary Tuesday, not a contrived one. It is one drawn
+/// alert on both polls, so nothing about the *set* moved; only the picture did.
+///
+/// Keying the pane's raster on a token that could not see that is what made
+/// this a blocker rather than a missed optimisation: the pane keeps its
+/// texture, nothing re-rasterizes, and the warning is absent until the user
+/// happens to pan or zoom.
+#[test]
+fn a_warning_that_gains_its_polygons_re_rasterizes_the_alert_overlay() {
+    let mut h = InputHarness::new();
+    h.gui_mut().enable_overlay_for_test(OverlayKind::NwsAlerts);
+    h.warm_up();
+
+    let ground = h.ground_at(0, h.pane_rects()[0].center());
+    let zone_warning = |resolved| {
+        vec![zone_alert_over(
+            "a",
+            "Tornado Warning",
+            ground.y(),
+            ground.x(),
+            resolved,
+        )]
+    };
+
+    // Poll N: every zone fetch failed, so the warning draws nothing. Let that
+    // raster land, so the pane is holding a picture with no warning in it.
+    ingest_alerts(&mut h, zone_warning(0));
+    h.warm_up();
+    settle_overlay_cache(&mut h, OverlayKind::NwsAlerts);
+    h.warm_up();
+    assert_eq!(
+        rasterizes_requested(&h, OverlayKind::NwsAlerts),
+        0,
+        "fixture: the empty-geometry raster must have settled, or the ask below \
+         is just the cache still filling",
+    );
+
+    // Poll N+1: the same warning, same id, now with its three counties.
+    ingest_alerts(&mut h, zone_warning(3));
+    h.warm_up();
+    assert_eq!(
+        rasterizes_requested(&h, OverlayKind::NwsAlerts),
+        1,
+        "a warning arrived with its counties and the pane kept the raster that \
+         does not contain it — the warning stays off the map until the user \
+         happens to pan or zoom",
     );
 }

@@ -54,6 +54,10 @@ pub enum GuiAction {
         /// Pixel dimensions and the overdraw they were sized for, already
         /// reconciled with the adapter's `max_texture_dimension_2d`.
         texture: crate::overlay_cache::OverlayTexturePlan,
+        /// The cache token this raster is being asked for — see
+        /// `ui_map_pane::overlay_cache_token`. Travels out with the request and
+        /// back onto [`crate::overlay_cache::OverlayTextureData`], which is
+        /// what makes a later frame able to say the picture has not moved.
         data_generation: u64,
         zoom: i32,
     },

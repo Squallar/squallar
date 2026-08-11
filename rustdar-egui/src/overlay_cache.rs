@@ -189,7 +189,12 @@ pub struct OverlayTextureData {
     pub texture: egui::TextureHandle,
     /// Geographic (lat/lon) extent of this texture.
     pub geo_bounds: GeoBounds,
-    /// Data generation at render time (detects stale results).
+    /// The cache token these pixels were rendered for (detects stale results).
+    ///
+    /// Whatever `ui_map_pane::overlay_cache_token` answered at the time — the
+    /// handler's content signature for a fetched overlay, the pane's own
+    /// counter for the radar sites. Not the fetch counter: see that function
+    /// for why the distinction is worth ~47 ms of frame thread per poll.
     pub data_generation: u64,
     /// Quantised zoom at render time (`zoom * 32`).
     pub render_zoom: i32,
@@ -229,18 +234,19 @@ impl OverlayTextureCache {
 
     /// Check whether a re-render is needed for this overlay.
     ///
-    /// Triggers on: data generation change, zoom change, or pan exceeding
-    /// the overdraw margin.
+    /// Triggers on: cache token change, zoom change, or pan exceeding the
+    /// overdraw margin. `token` is `ui_map_pane::overlay_cache_token`'s answer
+    /// — see [`OverlayTextureData::data_generation`].
     pub fn needs_rerender(
         &self,
-        data_gen: u64,
+        token: u64,
         current_zoom: i32,
         viewport_bounds: &GeoBounds,
     ) -> bool {
         let Some(ref tex) = self.current else {
             return true;
         };
-        if tex.data_generation != data_gen {
+        if tex.data_generation != token {
             return true;
         }
         if tex.render_zoom != current_zoom {

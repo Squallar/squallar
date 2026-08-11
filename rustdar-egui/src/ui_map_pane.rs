@@ -503,24 +503,20 @@ pub(super) fn render_pane_map_content(
                 continue;
             }
             let enabled = ctx.pane.is_overlay_enabled(kind);
-            let data_gen = if kind == OverlayKind::RadarSites {
-                ctx.pane.radar_sites_render_gen
-            } else {
-                ctx.overlays.data_generation(kind)
-            };
+            let token = overlay_cache_token(ctx.overlays, ctx.pane, kind);
             let has_data = ctx.overlays.has_data(kind);
             let cache = ctx.pane.overlay_cache_mut(kind);
             if enabled
                 && has_data
                 && !cache.render_in_flight
-                && cache.needs_rerender(data_gen, qzoom, &viewport_bounds)
+                && cache.needs_rerender(token, qzoom, &viewport_bounds)
             {
                 ctx.actions.push(GuiAction::RenderOverlay {
                     pane_idx: ctx.pane_idx,
                     overlay_kind: kind,
                     geo_bounds: viewport_bounds,
                     texture: tex_plan,
-                    data_generation: data_gen,
+                    data_generation: token,
                     zoom: qzoom,
                 });
             }
@@ -568,6 +564,38 @@ pub(super) fn render_pane_map_content(
                 ctx.preferences,
             );
         }
+    }
+}
+
+/// The token a texture overlay's cached raster is keyed by: it moves exactly
+/// when the picture would be different, and a move is what buys a re-rasterize.
+///
+/// # It is the content signature, not the fetch counter
+///
+/// [`OverlayHandler::content_signature`] exists for this call and had no other
+/// caller. Every texture overlay that auto-polls returns the same content most
+/// of the time — NWS alerts poll every 120 s and the active warning set is
+/// usually unchanged — and [`OverlayRegistry::data_generation`] is bumped by
+/// `set_data` on *every* successful poll, so keying on it re-rasterized a
+/// byte-identical overlay twice a minute per pane, then converted the result to
+/// a `ColorImage` on the frame thread: ~47 ms of frame-thread work at 5760×3240
+/// for a picture nobody could tell had been redrawn. The trait's default
+/// implementation *is* `data_generation`, so a handler that cannot tell the
+/// difference is unaffected and still refreshes on every poll.
+///
+/// # `RadarSites` keys on the pane instead
+///
+/// Its handler holds no fetched data at all — the site table is resident — so
+/// neither token says anything about it. What invalidates its raster is the
+/// pane's own `radar_sites_render_gen`, bumped when the egui context is torn
+/// down and every texture handle with it (`Gui::clear_graphics_state`).
+///
+/// [`OverlayHandler::content_signature`]: rustdar_overlays::render::overlay_state::OverlayHandler::content_signature
+fn overlay_cache_token(overlays: &OverlayRegistry, pane: &PaneState, kind: OverlayKind) -> u64 {
+    if kind == OverlayKind::RadarSites {
+        pane.radar_sites_render_gen
+    } else {
+        overlays.content_signature(kind)
     }
 }
 
