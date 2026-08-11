@@ -73,7 +73,6 @@ fn the_pane_rects_a_test_sees_are_only_the_ones_a_frame_drew() {
 fn viewport_sync_never_outruns_the_pane_vector() {
     let mut gui = Gui::new();
     gui.set_pane_count_for_test(2);
-    gui.viewport_sync = true;
     gui.claim_pane_count_for_test(4);
 
     // Snapshots sized to the layout's claim, exactly as `render_panes` would
@@ -757,7 +756,7 @@ fn overlay_polling_skips_panes_with_no_map_but_keeps_their_toggles() {
 /// double-tap-drag on a section pane moves a viewport nothing draws.
 /// Unfiltered, `sync_viewports` then reads that pane as the **source**,
 /// because it is the first whose zoom moved, and re-centres and re-zooms
-/// every map pane on screen. `viewport_sync` defaults *on*, so this is the
+/// every map pane on screen. `viewport_link` defaults *on*, so this is the
 /// shipped default rather than something a user opts into.
 ///
 /// Both directions are asserted, and each one fails on its own: the source
@@ -777,7 +776,6 @@ fn a_pane_with_no_map_neither_drives_nor_follows_the_shared_viewport() {
 
     let mut gui = Gui::new();
     gui.set_pane_count_for_test(3);
-    gui.viewport_sync = true;
     gui.pane_mut(1).unwrap().set_kind(PaneKind::CrossSection);
     for idx in 0..3 {
         assert_eq!(
@@ -839,7 +837,6 @@ fn a_non_map_active_pane_is_not_the_fallback_sync_source() {
 
     let mut gui = Gui::new();
     gui.set_pane_count_for_test(2);
-    gui.viewport_sync = true;
     gui.pane_mut(1).unwrap().set_kind(PaneKind::Volume);
     gui.active_pane = 1;
 
@@ -859,6 +856,86 @@ fn a_non_map_active_pane_is_not_the_fallback_sync_source() {
         4.0,
         "the active pane has no map, so its viewport propagated to a map \
              pane that nothing had interacted with"
+    );
+}
+
+/// M11-1. **The viewport group is per-pane: a move on a linked pane drives
+/// the linked panes and only them; a move on an unlinked pane moves nobody
+/// else.**
+///
+/// Three map panes, pane 1's `viewport_link` off. Both directions asserted
+/// in one run, each failing on its own: the write loop skipping the
+/// unlinked target, and the unlinked source returning before it can drive —
+/// or fall through to the active-pane hold, which is the subtle half (the
+/// scan *found* a source, so the fallback must not run at all).
+#[test]
+fn the_viewport_group_is_per_pane_on_both_ends() {
+    let untouched = 4.0;
+
+    let mut gui = Gui::new();
+    gui.set_pane_count_for_test(3);
+    gui.pane_mut(1).unwrap().viewport_link = false;
+
+    // A linked pane moves: the linked panes converge, the unlinked one is
+    // left where it was.
+    gui.pane_mut(0)
+        .unwrap()
+        .map_memory
+        .set_zoom(6.0)
+        .expect("in range");
+    gui.sync_viewports(&[untouched; 3], &[None; 3]);
+    assert_eq!(
+        (0..3)
+            .map(|idx| gui.pane(idx).unwrap().map_memory.zoom())
+            .collect::<Vec<_>>(),
+        vec![6.0, untouched, 6.0],
+        "a linked move must reach the linked panes and skip the unlinked one"
+    );
+
+    // The unlinked pane moves: nobody follows, and nobody snaps it back.
+    gui.pane_mut(1)
+        .unwrap()
+        .map_memory
+        .set_zoom(8.0)
+        .expect("in range");
+    gui.sync_viewports(&[6.0, untouched, 6.0], &[None; 3]);
+    assert_eq!(
+        (0..3)
+            .map(|idx| gui.pane(idx).unwrap().map_memory.zoom())
+            .collect::<Vec<_>>(),
+        vec![6.0, 8.0, 6.0],
+        "an unlinked move must stay local - and must not hand the frame to \
+             the active-pane hold either"
+    );
+}
+
+/// M11-2. **An unlinked active pane holds nobody.**
+///
+/// The no-motion fallback — "the active pane holds the others where they
+/// are" — is a group behaviour, and an unlinked pane is not in the group:
+/// with its link off, its parked viewport must not be re-imposed on the
+/// linked panes frame after frame.
+#[test]
+fn an_unlinked_active_pane_is_not_the_fallback_hold_source() {
+    let mut gui = Gui::new();
+    gui.set_pane_count_for_test(2);
+    gui.active_pane = 0;
+    gui.pane_mut(0).unwrap().viewport_link = false;
+    gui.pane_mut(0)
+        .unwrap()
+        .map_memory
+        .set_zoom(9.0)
+        .expect("in range");
+
+    // Nothing moved this frame; the only escape for pane 0's zoom is the
+    // fallback hold.
+    gui.sync_viewports(&[9.0, 4.0], &[None; 2]);
+
+    assert_eq!(
+        gui.pane(1).unwrap().map_memory.zoom(),
+        4.0,
+        "the active pane's viewport link is off, so it must not hold the \
+             linked pane to its own viewport"
     );
 }
 
@@ -889,7 +966,6 @@ fn loop_actions_skip_panes_that_draw_no_frames() {
 
     let mut gui = Gui::new();
     gui.set_pane_count_for_test(4);
-    gui.sync_layers = true;
     gui.pane_mut(1).unwrap().set_kind(PaneKind::CrossSection);
     gui.pane_mut(2).unwrap().set_kind(PaneKind::Volume);
 
@@ -923,17 +999,58 @@ fn loop_actions_skip_panes_that_draw_no_frames() {
     // must not have changed the other's answer.
     assert!(gui.loop_sync_targets().contains(&2));
 
-    // Sync off narrows to the active pane, whatever kind it is: it is the
-    // pane whose own checkbox was clicked.
-    gui.sync_layers = false;
+    // Every other pane time-unlinked narrows to the active pane, whatever
+    // kind it is: it is the pane whose own checkbox was clicked.
+    for idx in [0, 1, 3] {
+        gui.pane_mut(idx).unwrap().time_link = false;
+    }
     gui.active_pane = 2;
     assert_eq!(gui.loop_sync_targets(), vec![2]);
 
-    // And with sync back on, the active pane is still in the list even
+    // And with the links back on, the active pane is still in the list even
     // though its slot says it is not a map — because the index is included
     // rather than tested.
-    gui.sync_layers = true;
+    for idx in [0, 1, 3] {
+        gui.pane_mut(idx).unwrap().time_link = true;
+    }
     assert_eq!(gui.loop_sync_targets(), vec![0, 1, 2, 3]);
+}
+
+/// The composed fan-out rule (M11's per-pane link × the can-loop widening):
+/// a pane is a loop target only when **both** gates pass — its own
+/// [`crate::pane::PaneState::time_link`] on *and*
+/// [`crate::pane::PaneState::can_loop`] — and the two failures are
+/// independent.
+///
+/// This is the cross-product neither parent change pinned: an **unlinked
+/// volume pane**. The per-pane link landed against the old is-a-map
+/// classification and the widening landed against the global sync toggle, so
+/// a merge that gated links over map panes only — or fanned out to every
+/// loopable kind regardless of its link — would pass both parents' tests and
+/// still animate a pane whose user asked it to sit out.
+#[test]
+fn an_unlinked_pane_is_no_loop_target_whatever_its_kind() {
+    use crate::pane::PaneKind;
+
+    let mut gui = Gui::new();
+    gui.set_pane_count_for_test(4);
+    gui.pane_mut(2).unwrap().set_kind(PaneKind::Volume);
+    gui.active_pane = 0;
+
+    // A volume pane can loop from the moment it exists — but its link is
+    // off, so the fan-out must leave it alone.
+    gui.pane_mut(2).unwrap().time_link = false;
+    assert_eq!(
+        gui.loop_sync_targets(),
+        vec![0, 1, 3],
+        "an unlinked volume pane was fanned out to: `can_loop` must not \
+         override the pane's own time link"
+    );
+
+    // The same link off on a map pane gives the same answer, so the
+    // exclusion above is the link's and not the kind's.
+    gui.pane_mut(3).unwrap().time_link = false;
+    assert_eq!(gui.loop_sync_targets(), vec![0, 1]);
 }
 
 /// The graphics-state reset reaches panes of every kind, including the ones

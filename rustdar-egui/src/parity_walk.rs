@@ -480,6 +480,48 @@ fn walk_pills(h: &mut InputHarness, width: WidthClass) {
     }
 }
 
+/// The Pane-properties sync section (M11): on a split layout, the five
+/// per-pane rows — three links, two actions — reachable through the
+/// inspector route at every width, against the one inventory
+/// `pills::sync_section_ui` renders ([`crate::ui::SYNC_SECTION_LABELS`],
+/// the model half; the drawn half is the `InspectorProbe`'s `sync_rows`,
+/// written by the renderer). The popover route shows the same function over
+/// the same labels — contracts 73f/73h drive the per-row behaviour; what
+/// the walk owes is that the rows are *on screen* per width.
+fn walk_sync_section(h: &mut InputHarness, width: WidthClass) {
+    h.set_pane_count(2);
+    if width == WidthClass::Compact {
+        // The phone's route: the bottom bar's Pane item hosts the body as
+        // the sheet's Inspector page.
+        let item = h.bottom_bar().pane.0;
+        h.mouse_click(item.center());
+        h.warm_up();
+    } else {
+        h.open_pane_props();
+    }
+    let scroll_pos = if width == WidthClass::Compact {
+        h.sheet_rect()
+            .expect("the Inspector page is open, so the sheet has a rect")
+            .center()
+    } else {
+        inspector_scroll_pos(h)
+    };
+    for needle in crate::ui::SYNC_SECTION_LABELS {
+        let found = h.scroll_until(scroll_pos, SCROLL_STEP, MAX_SCROLL_STEPS, |h| {
+            h.inspector()
+                .sync_rows
+                .iter()
+                .any(|(label, rect, _)| label == needle && h.screen_rect().contains(rect.center()))
+        });
+        assert!(
+            found,
+            "sync row {needle:?} was never drawn on screen on {width:?} — \
+             the section offers it but the inspector route never showed it"
+        );
+    }
+    h.close_inspector();
+}
+
 /// The whole walk for one screen: layer controls through the layers panel,
 /// then the menu, the time dialog and the settings window through the ☰
 /// dropdown — the same routes at every width.
@@ -497,6 +539,9 @@ fn walk_every_option(size: egui::Vec2, expect: WidthClass) {
     walk_settings(&mut h, expect);
     walk_catalog(&mut h, expect);
     walk_pills(&mut h, expect);
+    // Splits the layout to two panes — the sync section only exists with a
+    // group to sync — so it runs after the single-pane legs above.
+    walk_sync_section(&mut h, expect);
     // Last, because it converts pane 0 to a 3D pane and the legs above are
     // claims about a map layout.
     walk_volume_body(&mut h, expect);

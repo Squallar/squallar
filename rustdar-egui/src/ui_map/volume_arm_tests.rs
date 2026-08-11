@@ -275,9 +275,10 @@ fn the_volume_alpha_button_is_painted_on_a_3d_pane() {
 #[test]
 fn a_product_with_no_vertical_structure_is_refused_by_name() {
     let (mut h, painter) = volume_harness(StubVolumePainter::painting());
-    // On every pane, not just the 3D one: `sync_layers` defaults on and
-    // propagates the *active* pane's product to the rest, so writing it to
-    // pane 1 alone is undone on the next frame by pane 0.
+    // On every pane, not just the 3D one: the layer links default on and
+    // `propagate_layer_sync` copies the *active* pane's product to the
+    // rest, so writing it to pane 1 alone is undone on the next frame by
+    // pane 0.
     for pane in h.gui_mut().panes_mut() {
         pane.selected_product = rustdar_radar::types::RadarProduct::EchoTops;
     }
@@ -320,7 +321,8 @@ fn a_derived_product_is_asked_for_rather_than_refused_by_name() {
             product.name(),
         );
         let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
-        // Every pane: `sync_layers` propagates the active pane's product.
+        // Every pane: the linked sync pass propagates the active pane's
+        // product.
         for pane in h.gui_mut().panes_mut() {
             pane.selected_product = product;
         }

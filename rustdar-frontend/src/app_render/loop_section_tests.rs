@@ -451,7 +451,7 @@ fn a_frame_is_recut_when_its_volume_resolves_a_different_ladder() {
 /// acceptance weighs must be the same things.
 #[test]
 fn the_cut_dedupe_weighs_both_halves_of_the_key() {
-    let queued = vec![LoopSectionRequest {
+    let queued = [LoopSectionRequest {
         pane_idx: 0,
         frame_idx: 0,
         timestamp: ts(0),
@@ -462,14 +462,19 @@ fn the_cut_dedupe_weighs_both_halves_of_the_key() {
         site_lon: -97.28,
     }];
 
-    assert!(section_already_queued(&queued, ts(0), &target(), &key()));
+    assert!(section_already_queued(
+        queued.iter(),
+        ts(0),
+        &target(),
+        &key()
+    ));
     assert!(
-        !section_already_queued(&queued, ts(1), &target(), &key()),
+        !section_already_queued(queued.iter(), ts(1), &target(), &key()),
         "another frame's cut was suppressed"
     );
     assert!(
         !section_already_queued(
-            &queued,
+            queued.iter(),
             ts(0),
             &RenderTarget::new("KOUN", PRODUCT, TILT),
             &key()
@@ -491,7 +496,7 @@ fn the_cut_dedupe_weighs_both_halves_of_the_key() {
         None,
     );
     assert!(
-        !section_already_queued(&queued, ts(0), &target(), &elsewhere),
+        !section_already_queued(queued.iter(), ts(0), &target(), &elsewhere),
         "a cut along another line was suppressed on the promise of a broadcast \
          that will refuse it"
     );

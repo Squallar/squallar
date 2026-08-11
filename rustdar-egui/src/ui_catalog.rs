@@ -738,6 +738,17 @@ impl super::Gui {
     /// writes are direct on the same terms as `apply_pending_region`'s. A
     /// volume pane converted away releases its voxel grid exactly as the
     /// deferred applier would have.
+    ///
+    /// # Presets ignore the per-pane links, and leave them alone (M11)
+    ///
+    /// A preset sets up a whole workspace, so apply writes **every** pane it
+    /// configures — a layer-unlinked pane included; skipping it would build
+    /// half the workspace the tile promised, with nothing to say why — and
+    /// touches **no** link: which panes move together afterwards is the
+    /// user's standing arrangement, not part of the picture the preset
+    /// captured. The trailing `propagate_layer_sync` then applies the
+    /// ordinary per-pane gates, converging exactly the linked group and no
+    /// one else.
     fn apply_preset(&mut self, preset: &PresetConfig, actions: &mut Vec<GuiAction>) {
         let count = preset.pane_count.clamp(1, self.layout.width.max_panes());
         let _ = self.set_pane_count(count);

@@ -92,10 +92,11 @@ pub(crate) struct InspectorProbe {
     pub site_rows: Vec<(String, egui::Rect, bool)>,
     /// The site list's count caption, verbatim.
     pub site_caption: String,
-    /// The sync section's "Follows shared time" checkbox and the state it was
-    /// drawn showing — `None` on a single-pane layout, which has no shared
-    /// time to follow.
-    pub time_link: Option<(egui::Rect, bool)>,
+    /// The sync section's rows as drawn — the three link checkboxes with the
+    /// state they were handed and the two action rows with `false`
+    /// (`pills::sync_section_ui`'s outcome, verbatim). Empty on a
+    /// single-pane layout, which has no group to sync with.
+    pub sync_rows: Vec<(String, egui::Rect, bool)>,
 }
 
 #[cfg(test)]
@@ -111,7 +112,7 @@ impl Default for InspectorProbe {
             site_search: egui::Rect::NOTHING,
             site_rows: Vec::new(),
             site_caption: String::new(),
-            time_link: None,
+            sync_rows: Vec::new(),
         }
     }
 }
@@ -438,41 +439,26 @@ impl super::Gui {
 
         // --- Sync ---
         //
-        // Both settings are properties of the *layout* rather than of the
-        // active pane, and they stay meaningful with a non-map pane on
-        // screen — `sync_layers` still converges site, product and time
-        // across every pane, and `sync_viewports` still holds the map panes
-        // together while leaving this one alone. Only offered when there is
-        // more than one pane to hold together.
+        // The per-pane sync section (M11): this pane's three links and the
+        // two action rows, rendered by the same `sync_section_ui` the Sync
+        // pill's popover renders — one implementation, so the two routes are
+        // one wording and one behaviour by construction. Written on the
+        // taken pane, where every write in this body lands; the action rows
+        // go through `apply_sync_outcome`, which never reads the taken
+        // pane's placeholder slot. Only offered when there is more than one
+        // pane to hold together.
         if self.pane_layout.pane_count > 1 {
             ui.add_space(6.0);
             ui.separator();
-            // Plain-text labels, matching the Sync pill popover's — the two
-            // routes are one wording (the old `⛓` prefix read as a DNA
-            // helix; the second user test). This section stays as the
-            // popover's alternate access path, cross-shell parity included.
-            ui.checkbox(&mut self.viewport_sync, "Sync viewport");
-            ui.checkbox(&mut self.sync_layers, "Sync layers");
-            // Per-pane, unlike the two layout-wide toggles above: off means
-            // this pane is *frozen* — left out of the loop fan-out and of
-            // `propagate_layer_sync`'s time pair. Written on the taken pane,
-            // where every write in this body lands.
-            #[cfg(test)]
-            let link_was = pane.time_link;
-            let link = ui
-                .checkbox(&mut pane.time_link, "Sync time - this pane")
-                // The pill popover's own sentence, shared so the two routes
-                // cannot describe unlinking differently — and careful about
-                // "frozen"; see `ui_pills::UNLINK_NOTE`.
-                .on_hover_text(super::pills::UNLINK_NOTE);
+            let outcome = super::pills::sync_section_ui(ui, pane);
             #[cfg(test)]
             {
-                // The state the checkbox was handed, not the one the click
-                // produced — the `DrawnMenuLeaf` discipline.
-                probe.time_link = Some((link.rect, link_was));
+                probe.sync_rows = outcome.rows.clone();
             }
-            #[cfg(not(test))]
-            let _ = link;
+            self.apply_sync_outcome(&outcome, pane, self.active_pane);
+            // `layer_relinked` needs no hand here: this body runs inside the
+            // shell/sheet panel pass, which calls `propagate_layer_sync`
+            // itself as soon as the pane is back in its slot.
         }
 
         // The kind-specific block, last, in its one scope — see the method

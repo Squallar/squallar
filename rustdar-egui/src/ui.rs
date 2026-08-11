@@ -87,6 +87,11 @@ mod pills;
 /// by the section pane's layout and the 3D pane's caption.
 #[cfg(test)]
 pub(crate) use pills::PILL_ROW_CLEARANCE;
+/// The sync section's row labels, for the parity walk — the model half of
+/// its Pane-properties sync leg; the drawn half is `InspectorProbe`'s
+/// `sync_rows`.
+#[cfg(test)]
+pub(crate) use pills::SYNC_SECTION_LABELS;
 /// What the pill rows and their popovers drew last frame, for the input
 /// harness.
 #[cfg(test)]
@@ -791,8 +796,11 @@ pub struct Gui {
     /// poll is what re-cuts. One deferral shape for every writer, rather than
     /// one careful exception.
     pending_section_edit: Option<(PaneId, crate::pane::SectionLine)>,
-    viewport_sync: bool,
-    sync_layers: bool,
+    // The Gui-global `viewport_sync` / `sync_layers` toggles were retired in
+    // M11: sync is per pane now — `PaneState::viewport_link`,
+    // `PaneState::layer_link`, `PaneState::time_link` — and the old globals
+    // survive only as read-only legacy fields on `UiConfig`, which seed the
+    // per-pane links once on load (see `load_ui_config`).
     // --- Radar loop settings ---
     /// How far back (in seconds) to fetch historical scans for the loop.
     pub loop_lookback_secs: u64,
@@ -1570,8 +1578,6 @@ impl Gui {
             section_edit_drag: None,
             section_handles: Vec::new(),
             pending_section_edit: None,
-            viewport_sync: true,
-            sync_layers: true,
             loop_lookback_secs: 3600, // default 1 hour
             loop_speed_fps: 5.0,      // default 5 fps
             drawer_open: false,
@@ -2675,8 +2681,12 @@ impl Gui {
     }
 
     /// The pane indices shared time fans out over: the active pane, plus —
-    /// with Sync Layers on and more than one pane — every visible pane whose
-    /// [`PaneState::time_link`] is still on (plan §3.7).
+    /// with more than one pane — every visible pane whose
+    /// [`PaneState::time_link`] is still on (plan §3.7). The retired
+    /// `sync_layers` global no longer gates this: the per-pane link is the
+    /// whole model, and a migrated old config with the global off arrives
+    /// with every pane's link seeded off (see `load_ui_config`), which is
+    /// the same fan-out it had.
     ///
     /// The active pane is a target unconditionally, its own flag unread: it
     /// is the pane whose control was operated, and "the pane I am driving
@@ -2684,7 +2694,7 @@ impl Gui {
     /// *don't drag me along* — the exclusion is from the fan-out, not from
     /// being driven directly.
     fn time_sync_targets(&self) -> Vec<usize> {
-        if self.sync_layers && self.pane_layout.pane_count > 1 {
+        if self.pane_layout.pane_count > 1 {
             (0..self.pane_layout.pane_count)
                 .filter(|&idx| {
                     idx == self.active_pane || self.panes.get(idx).is_none_or(|pane| pane.time_link)
@@ -2840,8 +2850,19 @@ impl Gui {
         self.insp_open && self.inspector_sel == InspectorSelection::AppSettings
     }
 
-    /// Propagate layer settings from the active pane to all others (when sync is enabled).
-    /// Also converges site and scan_info so all panes display the same radar site.
+    /// Propagate layer settings from a layer-linked active pane to the other
+    /// layer-linked panes. Also converges site and scan_info so the linked
+    /// group displays the same radar site.
+    ///
+    /// # Per-pane gating (M11)
+    ///
+    /// [`PaneState::layer_link`] replaces the retired `sync_layers` global on
+    /// **both ends**. An unlinked *source* — the active pane with its link
+    /// off — propagates nothing: its edits are its own. An unlinked *target*
+    /// is never written: the group's edits leave it alone. Every call site
+    /// (the shell and sheet panel passes, the menu dispatcher, the pill
+    /// popovers, the catalog appliers) inherits the gate from here, which is
+    /// what makes it one rule instead of eight.
     ///
     /// # `content` is deliberately not one of the fields
     ///
@@ -2877,7 +2898,7 @@ impl Gui {
     /// converges unconditionally — an unlinked pane is parked in time, not
     /// exempt from the layout.
     fn propagate_layer_sync(&mut self) {
-        if !self.sync_layers || self.pane_layout.pane_count <= 1 {
+        if self.pane_layout.pane_count <= 1 || !self.panes[self.active_pane].layer_link {
             return;
         }
         let src = &self.panes[self.active_pane];
@@ -2894,8 +2915,11 @@ impl Gui {
         // Sync per-pane fields including enabled overlays, configs, and radar
         // product/elevation. Not `content`: see the note on this function for
         // why the pane's kind is the one field sync deliberately leaves alone.
+        // Hidden panes past the layout's count still converge when linked —
+        // the pre-M11 behaviour, kept so a re-split restores a pane that was
+        // moving with the group rather than one parked months in the past.
         for (idx, p) in self.panes.iter_mut().enumerate() {
-            if idx == self.active_pane {
+            if idx == self.active_pane || !p.layer_link {
                 continue;
             }
             p.site = active_site.clone();
@@ -3967,16 +3991,21 @@ impl Gui {
         self.active_pane
     }
 
-    /// Turn layer sync between panes on or off, as its checkbox does.
+    /// Set every pane's layer link at once — the harness's one-call stand-in
+    /// for the retired `sync_layers` global, for tests that need panes able
+    /// to disagree (off) or the default convergence (on).
     #[cfg(test)]
-    pub(crate) fn set_sync_layers_for_test(&mut self, on: bool) {
-        self.sync_layers = on;
+    pub(crate) fn set_layer_links_for_test(&mut self, on: bool) {
+        for pane in &mut self.panes {
+            pane.layer_link = on;
+        }
     }
 
-    /// The global viewport-sync toggle, for the Sync popover's pin.
+    /// Whether every pane's layer link is on — the default-state precondition
+    /// the sync contracts assert before driving the fan-out.
     #[cfg(test)]
-    pub(crate) fn viewport_sync_for_test(&self) -> bool {
-        self.viewport_sync
+    pub(crate) fn all_layer_linked_for_test(&self) -> bool {
+        self.panes.iter().all(|pane| pane.layer_link)
     }
 
     /// Set one pane's overlay state, writing the config as well as the enabled
@@ -4128,14 +4157,49 @@ impl Gui {
         }
     }
 
-    /// Whether viewport sync is enabled (all panes share the same map viewport).
-    pub fn is_viewport_sync(&self) -> bool {
-        self.viewport_sync
+    /// Whether pane `idx`'s layer state belongs to the linked group — the
+    /// per-pane successor to the retired `is_sync_layers` global, read by the
+    /// frontend's loop texture sharing (broadcast and donor clones happen
+    /// inside the linked group, never across an unlinked pane's boundary).
+    /// Out of bounds answers linked: the default every real pane starts with.
+    pub fn pane_layer_linked(&self, idx: usize) -> bool {
+        self.panes.get(idx).is_none_or(|pane| pane.layer_link)
     }
 
-    /// Whether layer sync is enabled (layer changes propagate to all panes).
-    pub fn is_sync_layers(&self) -> bool {
-        self.sync_layers
+    /// Whether pane `idx` follows shared time — the loop playback
+    /// synchroniser's per-pane gate (`sync_loop_playback_start` holds the
+    /// time-linked loops together and lets an unlinked loop start alone).
+    pub fn pane_time_linked(&self, idx: usize) -> bool {
+        self.panes.get(idx).is_none_or(|pane| pane.time_link)
+    }
+
+    /// The panes a layer-wide change on pane `src` reaches: the visible
+    /// layer-linked panes when `src` is itself linked, or `src` alone when it
+    /// is not — `propagate_layer_sync`'s two-ended gate, exported for the
+    /// frontend's site switch, which writes the move itself.
+    pub fn layer_sync_targets(&self, src: usize) -> Vec<usize> {
+        let count = self.visible_pane_count();
+        if count > 1 && self.pane_layer_linked(src) {
+            (0..count)
+                .filter(|&idx| idx == src || self.pane_layer_linked(idx))
+                .collect()
+        } else {
+            vec![src]
+        }
+    }
+
+    /// Whether one overlay render may serve several panes: every visible map
+    /// pane is viewport-linked *and* layer-linked, so their viewports and
+    /// layer stacks are one by construction. The per-pane successor to the
+    /// old "viewport sync and layer sync both on" grouping gate — one pane
+    /// out of either group and nothing is grouped, because the dedup key
+    /// carries no geo bounds and a shared texture would land on a pane whose
+    /// map is somewhere else.
+    pub fn overlay_renders_groupable(&self) -> bool {
+        (0..self.visible_pane_count()).all(|idx| {
+            let pane = &self.panes[idx];
+            !pane.is_map() || (pane.viewport_link && pane.layer_link)
+        })
     }
 
     /// Get the current radar config
@@ -4391,11 +4455,26 @@ impl Gui {
         self.volume_painter.as_ref()
     }
 
-    /// Propagate the interacted pane's viewport (zoom + position) to all other panes.
+    /// Propagate the interacted pane's viewport (zoom + position) to the
+    /// linked group.
     ///
     /// Bounded by [`Self::visible_pane_count`], not the layout's raw count:
     /// hidden panes are neither read as a sync source nor written to, and a
     /// count that ran ahead of the vector cannot index past its end.
+    ///
+    /// # The group is per-pane now (M11)
+    ///
+    /// The linked group is the visible map panes with
+    /// [`PaneState::viewport_link`] on — the retired `viewport_sync` global's
+    /// successor. Three rules, each pinned:
+    ///
+    /// * a change on a **linked** pane drives the group — the interacted pane
+    ///   must be linked to be the source;
+    /// * a change on an **unlinked** pane moves only itself — the scan still
+    ///   spots it first, and returning there (rather than falling through to
+    ///   the active-pane hold) is what keeps its local move local;
+    /// * an unlinked pane is never a **target** — the group's convergence
+    ///   writes the linked panes and no one else.
     ///
     /// # Why panes with no map are excluded from both ends
     ///
@@ -4408,7 +4487,7 @@ impl Gui {
     /// lets it write a zoom. So a double-tap-drag on a section pane moves a
     /// viewport nothing is drawing, this function then picks that pane as the
     /// **source** because it is the first whose zoom changed, and every map pane
-    /// on screen is re-centred and re-zoomed to it. `viewport_sync` defaults
+    /// on screen is re-centred and re-zoomed to it. `viewport_link` defaults
     /// **on**, so that is the shipped default behaviour, not an opt-in.
     ///
     /// Excluded as a *target* as well, for a quieter reason: a converted pane's
@@ -4417,7 +4496,7 @@ impl Gui {
     /// user is not looking at yet.
     fn sync_viewports(&mut self, pre_zooms: &[f64], pre_positions: &[Option<walkers::Position>]) {
         let pane_count = self.visible_pane_count();
-        if !self.viewport_sync || pane_count <= 1 {
+        if pane_count <= 1 {
             return;
         }
         let mut source_idx = None;
@@ -4446,28 +4525,93 @@ impl Gui {
                 }
             }
         }
+        // A move on an unlinked pane is the pane's own: neither drive the
+        // group from it nor fall through to the active-pane hold, which would
+        // spend the frame fighting nobody on the linked panes while the local
+        // move stays local anyway — returning says what happened.
+        if let Some(idx) = source_idx
+            && !self.panes[idx].viewport_link
+        {
+            return;
+        }
         // Nothing moved, so the active pane holds the others where they are —
         // unless it has no map, in which case its `map_memory` is not a viewport
-        // anyone is looking at and there is nothing to propagate. Returning is
+        // anyone is looking at and there is nothing to propagate; or its link
+        // is off, in which case its viewport is its own and holding the group
+        // to it would be the unlinked pane driving after all. Returning is
         // the whole point: `unwrap_or(self.active_pane)` on its own would make a
         // non-map active pane the source on every frame, which is the same
         // failure as the source scan above with no interaction needed at all.
         let Some(src) = source_idx.or_else(|| {
-            self.panes[self.active_pane]
-                .is_map()
-                .then_some(self.active_pane)
+            let active = &self.panes[self.active_pane];
+            (active.is_map() && active.viewport_link).then_some(self.active_pane)
         }) else {
             return;
         };
         let zoom = self.panes[src].map_memory.zoom();
         let pos = self.panes[src].map_memory.detached();
         for idx in 0..pane_count {
-            if idx != src && self.panes[idx].is_map() {
+            if idx != src && self.panes[idx].is_map() && self.panes[idx].viewport_link {
                 let _ = self.panes[idx].map_memory.set_zoom(zoom);
                 if let Some(p) = pos {
                     self.panes[idx].map_memory.center_at(p);
                 }
             }
+        }
+    }
+
+    /// Apply a sync section's action rows (`pills::sync_section_ui`), with
+    /// `pane` as the section's own pane — held **out of the vector** by both
+    /// callers (the pill popover takes it for the section's duration, the
+    /// inspector's pass holds it throughout), so `self.panes[idx]` is a
+    /// placeholder this function must never read; it skips `idx` everywhere
+    /// and writes the source's own fields through `pane`.
+    ///
+    /// **Match all panes to this view**: copy `pane`'s zoom — and its centre,
+    /// when it has panned off its site — to every visible *map* pane, links
+    /// untouched. The one-shot alignment: a following source hands out its
+    /// zoom and leaves each target's centre alone, exactly as
+    /// [`Self::sync_viewports`] would.
+    ///
+    /// **Re-link all here**: that copy, plus all three links turned on for
+    /// `pane` and every visible pane — and this pane made active, so the
+    /// standard convergence that follows (`propagate_layer_sync`, the
+    /// viewport hold) reads *this* pane as the group's reference. "Here" is a
+    /// place: everything comes home to it.
+    pub(super) fn apply_sync_outcome(
+        &mut self,
+        outcome: &pills::SyncSectionOutcome,
+        pane: &mut PaneState,
+        idx: PaneId,
+    ) {
+        let count = self.visible_pane_count();
+        if outcome.match_all || outcome.relink_all {
+            let zoom = pane.map_memory.zoom();
+            let pos = pane.map_memory.detached();
+            for target in 0..count {
+                if target == idx || !self.panes[target].is_map() {
+                    continue;
+                }
+                let _ = self.panes[target].map_memory.set_zoom(zoom);
+                if let Some(p) = pos {
+                    self.panes[target].map_memory.center_at(p);
+                }
+            }
+        }
+        if outcome.relink_all {
+            pane.viewport_link = true;
+            pane.layer_link = true;
+            pane.time_link = true;
+            for target in 0..count {
+                if target == idx {
+                    continue;
+                }
+                let target = &mut self.panes[target];
+                target.viewport_link = true;
+                target.layer_link = true;
+                target.time_link = true;
+            }
+            self.active_pane = idx;
         }
     }
 }

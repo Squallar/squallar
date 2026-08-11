@@ -136,9 +136,14 @@ impl super::Gui {
 
                 self.detect_active_pane_click(ui.ctx(), panel_rect);
 
-                // Snapshot viewport state before rendering for sync detection
+                // Snapshot viewport state before rendering for sync
+                // detection. Taken whenever a group could exist — the links
+                // are per pane now, and `sync_viewports` itself sorts a
+                // linked mover (drives the group) from an unlinked one
+                // (moves alone); without the snapshot it could not tell who
+                // moved at all.
                 let (pre_zooms, pre_positions): (Vec<f64>, Vec<Option<Position>>) =
-                    if self.viewport_sync && pane_count > 1 {
+                    if pane_count > 1 {
                         self.panes
                             .iter()
                             .take(pane_count)

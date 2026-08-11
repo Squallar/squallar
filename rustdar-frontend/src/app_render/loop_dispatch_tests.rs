@@ -172,11 +172,16 @@ fn queued(
 /// The behaviour the dedup exists for: one render serves both panes.
 #[test]
 fn a_queued_render_for_the_same_target_suppresses_a_duplicate() {
-    let q = vec![queued(target("KTLX", 0.5), ts(0), 0.48)];
-    assert!(render_already_queued(&q, ts(0), &target("KTLX", 0.5), 0.48));
+    let q = [queued(target("KTLX", 0.5), ts(0), 0.48)];
+    assert!(render_already_queued(
+        q.iter(),
+        ts(0),
+        &target("KTLX", 0.5),
+        0.48
+    ));
     // Selection jitter within tolerance is the same target.
     assert!(render_already_queued(
-        &q,
+        q.iter(),
         ts(0),
         &target("KTLX", 0.505),
         0.48
@@ -188,27 +193,32 @@ fn a_queued_render_for_the_same_target_suppresses_a_duplicate() {
 /// neither path — and pushing the pane into the site-blind clone path instead.
 #[test]
 fn a_queued_render_for_another_site_suppresses_nothing() {
-    let q = vec![queued(target("KTLX", 0.5), ts(0), 0.48)];
+    let q = [queued(target("KTLX", 0.5), ts(0), 0.48)];
     assert!(
-        !render_already_queued(&q, ts(0), &target("KOUN", 0.5), 0.48),
+        !render_already_queued(q.iter(), ts(0), &target("KOUN", 0.5), 0.48),
         "a pane on another site must still render its own frame"
     );
 }
 
 #[test]
 fn a_queued_render_at_another_timestamp_or_sweep_suppresses_nothing() {
-    let q = vec![queued(target("KTLX", 0.5), ts(0), 0.48)];
+    let q = [queued(target("KTLX", 0.5), ts(0), 0.48)];
     assert!(!render_already_queued(
-        &q,
+        q.iter(),
         ts(1),
         &target("KTLX", 0.5),
         0.48
     ));
     // Same target, but the two scans resolved the selection to different sweeps,
     // so the images differ.
-    assert!(!render_already_queued(&q, ts(0), &target("KTLX", 0.5), 1.5));
     assert!(!render_already_queued(
-        &[],
+        q.iter(),
+        ts(0),
+        &target("KTLX", 0.5),
+        1.5
+    ));
+    assert!(!render_already_queued(
+        [].iter(),
         ts(0),
         &target("KTLX", 0.5),
         0.48
@@ -228,10 +238,10 @@ fn suppression_and_acceptance_weigh_the_same_sweep() {
     let receiver = loop_on(&ctx, "KTLX", &[]);
     let want = receiver.rendered_for.clone().expect("target adopted");
     // A sibling's render of the 0.48° sweep, queued this pass.
-    let q = vec![queued(target("KTLX", 0.5), ts(0), 0.48)];
+    let q = [queued(target("KTLX", 0.5), ts(0), 0.48)];
 
     for own in [0.48, 0.485, 1.4] {
-        let suppressed = render_already_queued(&q, ts(0), &want, own);
+        let suppressed = render_already_queued(q.iter(), ts(0), &want, own);
         let accepted = receiver
             .frame_accepting_broadcast(
                 ts(0),
@@ -249,14 +259,14 @@ fn suppression_and_acceptance_weigh_the_same_sweep() {
     }
 
     // Not the trivial agreement of "both always refuse".
-    assert!(render_already_queued(&q, ts(0), &want, 0.48));
+    assert!(render_already_queued(q.iter(), ts(0), &want, 0.48));
 }
 
 #[test]
 fn a_queued_render_for_another_product_suppresses_nothing() {
-    let q = vec![queued(target("KTLX", 0.5), ts(0), 0.48)];
+    let q = [queued(target("KTLX", 0.5), ts(0), 0.48)];
     let velocity = RenderTarget::new("KTLX", RadarProduct::Velocity, 0.5);
-    assert!(!render_already_queued(&q, ts(0), &velocity, 0.48));
+    assert!(!render_already_queued(q.iter(), ts(0), &velocity, 0.48));
 }
 
 /// The wiring the donor search exists to get right: every candidate is judged

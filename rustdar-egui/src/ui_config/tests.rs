@@ -15,7 +15,10 @@ fn changed_settings_survive_a_save_and_load() {
     let baseline = crate::Gui::new();
     assert_ne!(baseline.loop_lookback_secs, 7200);
     assert_ne!(baseline.loop_speed_fps, 12.5);
-    assert!(baseline.viewport_sync, "default is on; test flips it off");
+    assert!(
+        baseline.pane(0).unwrap().viewport_link && baseline.pane(0).unwrap().layer_link,
+        "default is linked; test flips both off"
+    );
     assert_eq!(
         baseline.pane(0).unwrap().kind(),
         PaneKind::Map,
@@ -25,7 +28,8 @@ fn changed_settings_survive_a_save_and_load() {
     let mut gui = crate::Gui::new();
     gui.loop_lookback_secs = 7200;
     gui.loop_speed_fps = 12.5;
-    gui.viewport_sync = false;
+    gui.pane_mut(0).unwrap().viewport_link = false;
+    gui.pane_mut(0).unwrap().layer_link = false;
     // A 3D pane whose camera has been moved off its default, so the assertion
     // below is about the saved value rather than about two defaults agreeing.
     gui.pane_mut(0).unwrap().set_kind(PaneKind::Volume);
@@ -54,12 +58,113 @@ fn changed_settings_survive_a_save_and_load() {
 
     assert_eq!(restored.loop_lookback_secs, 7200);
     assert_eq!(restored.loop_speed_fps, 12.5);
-    assert!(!restored.viewport_sync);
+    assert!(
+        !restored.pane(0).unwrap().viewport_link && !restored.pane(0).unwrap().layer_link,
+        "the per-pane links must survive the round trip"
+    );
     assert_eq!(restored.pane(0).unwrap().kind(), PaneKind::Volume);
     assert_eq!(
         restored.pane(0).unwrap().volume().map(|v| v.camera),
         Some(nudged),
         "the pane came back as a 3D view aimed somewhere else"
+    );
+}
+
+/// M11-3. **An old config's `viewport_sync: false` loads as every restored
+/// pane viewport-unlinked, and `sync_layers: false` as every pane layer- and
+/// time-unlinked — the retired globals fold into the per-pane links once,
+/// on load.**
+///
+/// `sync_layers` seeds `time_link` too because under the old model that one
+/// global gated the whole shared-time fan-out: a pane's stored `time_link`
+/// was inert while it was off, and a migrated config must keep behaving as
+/// it observably did — no fan-out.
+#[test]
+fn a_legacy_global_off_seeds_every_restored_panes_links_off() {
+    let store = MemoryConfigStore::default();
+    store
+        .store(
+            UI_CONFIG_KEY,
+            r#"{"pane_count":2,"site":"KMPX","viewport_sync":false,
+                    "panes":[{"site":"KMPX"},{"site":"KOUN","time_link":true}]}"#,
+        )
+        .unwrap();
+    let mut restored = crate::Gui::new();
+    assert!(restored.load_ui_config(&store));
+    for idx in 0..2 {
+        let pane = restored.pane(idx).unwrap();
+        assert!(
+            !pane.viewport_link,
+            "pane {idx}: the legacy viewport_sync=false must seed the link off"
+        );
+        assert!(
+            pane.layer_link && pane.time_link,
+            "pane {idx}: the other dimensions' links are not viewport_sync's \
+                 to seed"
+        );
+    }
+
+    let store = MemoryConfigStore::default();
+    store
+        .store(
+            UI_CONFIG_KEY,
+            r#"{"pane_count":2,"site":"KMPX","sync_layers":false,
+                    "panes":[{"site":"KMPX","time_link":true}]}"#,
+        )
+        .unwrap();
+    let mut restored = crate::Gui::new();
+    assert!(restored.load_ui_config(&store));
+    // Pane 1 has no PaneConfig at all — the fold must reach it too.
+    for idx in 0..2 {
+        let pane = restored.pane(idx).unwrap();
+        assert!(
+            !pane.layer_link && !pane.time_link,
+            "pane {idx}: the legacy sync_layers=false must seed the layer \
+                 and time links off"
+        );
+        assert!(
+            pane.viewport_link,
+            "pane {idx}: the viewport link is not sync_layers' to seed"
+        );
+    }
+}
+
+/// M11-4. **A config with no legacy globals — one this build wrote, or an
+/// old one that simply never mentioned them — loads with every pane linked,
+/// and the legacy fields are never written again.**
+///
+/// The second half is what makes the fold a *migration* rather than a
+/// second copy of the state: a save from the new model must not put
+/// `viewport_sync`/`sync_layers` back on the wire, or a later load would
+/// AND stale globals into links the user has since changed.
+#[test]
+fn absent_legacy_globals_mean_linked_and_are_never_rewritten() {
+    let store = MemoryConfigStore::default();
+    store
+        .store(
+            UI_CONFIG_KEY,
+            r#"{"pane_count":2,"site":"KMPX",
+                    "panes":[{"site":"KMPX"},{"site":"KOUN"}]}"#,
+        )
+        .unwrap();
+    let mut restored = crate::Gui::new();
+    assert!(restored.load_ui_config(&store));
+    for idx in 0..2 {
+        let pane = restored.pane(idx).unwrap();
+        assert!(
+            pane.viewport_link && pane.layer_link && pane.time_link,
+            "pane {idx}: absent legacy fields must load as all-linked"
+        );
+    }
+
+    let json = restored.ui_config_json().expect("serializable");
+    assert!(
+        !json.contains("\"viewport_sync\"") && !json.contains("\"sync_layers\""),
+        "the retired globals must never be written again"
+    );
+    assert!(
+        json.contains("\"viewport_link\"") && json.contains("\"layer_link\""),
+        "the per-pane links are the persisted state now"
     );
 }
 

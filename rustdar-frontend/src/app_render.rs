@@ -1770,8 +1770,9 @@ impl super::App {
     }
 
     /// Poll for completed loop frame render results and upload textures.
-    /// When sync_layers is on, broadcasts rendered textures to sibling panes
-    /// that need the same frame (matching product+elevation+timestamp).
+    /// Broadcasts rendered textures from a layer-linked origin to the
+    /// layer-linked sibling panes that need the same frame (matching
+    /// product+elevation+timestamp).
     fn poll_loop_render_results(&mut self, ctx: &egui::Context) {
         while let Ok(mut rr) = self.channels.loop_render_receiver.try_recv() {
             let origin_pane = rr.pane_idx;
@@ -1810,9 +1811,18 @@ impl super::App {
             // loop, so `is_rendered_for` below would refuse it anyway — this is
             // the cheap, explicit refusal rather than one that depends on a
             // teardown elsewhere having happened first.
-            if self.gui.is_sync_layers() {
+            //
+            // Texture sharing happens inside the layer-linked group (M11):
+            // a linked origin donates to linked siblings, an unlinked pane
+            // neither donates nor receives — the same two-ended gate as
+            // `propagate_layer_sync`, so the render pipeline and the state
+            // convergence describe one group.
+            if self.gui.pane_layer_linked(origin_pane) {
                 for sibling_idx in 0..self.gui.pane_count() {
-                    if sibling_idx == origin_pane || self.gui.pane_has_no_plan_view(sibling_idx) {
+                    if sibling_idx == origin_pane
+                        || self.gui.pane_has_no_plan_view(sibling_idx)
+                        || !self.gui.pane_layer_linked(sibling_idx)
+                    {
                         continue;
                     }
                     let Some(sibling_loop) = self.gui.pane(sibling_idx).map(|p| &p.loop_state)
@@ -1897,12 +1907,17 @@ impl super::App {
             }
         }
 
-        // Synchronized playback start: when sync_layers is on, wait for ALL
-        // looping panes to be render_ready before starting any of them.
+        // Synchronized playback start: the time-linked looping panes wait
+        // for each other; an unlinked loop starts on its own readiness.
         self.sync_loop_playback_start();
     }
 
-    /// Start loop playback for panes that are ready, synchronizing when sync_layers is on.
+    /// Start loop playback for panes that are ready, holding the
+    /// time-linked ones together (M11: `PaneState::time_link` is the gate —
+    /// loop start synchronisation is a shared-time behaviour, so it follows
+    /// the time link, not the layer link). A linked ready pane waits while
+    /// any linked looping pane is not ready; an unlinked ready pane starts
+    /// immediately, and an unlinked not-ready pane holds nobody back.
     ///
     /// # Why a pane that cannot loop is not merely skipped but must be
     ///
@@ -1921,7 +1936,7 @@ impl super::App {
     /// `a_pane_with_no_plan_view_cannot_hold_another_panes_loop_back`.
     fn sync_loop_playback_start(&mut self) {
         let pane_count = self.gui.pane_count();
-        let sync = self.gui.is_sync_layers() && pane_count > 1;
+        let multi = pane_count > 1;
 
         // Collect readiness status for all panes with active loops
         let mut ready_panes: Vec<usize> = Vec::new();
@@ -1951,14 +1966,20 @@ impl super::App {
             return;
         }
 
-        // When syncing, only start if ALL looping panes are ready
-        if sync && !not_ready_panes.is_empty() {
-            return;
-        }
+        // The linked group starts as one: a time-linked ready pane waits
+        // while any time-linked looping pane is still catching up. Unlinked
+        // panes sit outside both halves of that sentence.
+        let hold_linked = multi
+            && not_ready_panes
+                .iter()
+                .any(|&idx| self.gui.pane_time_linked(idx));
 
-        // Start all ready panes with the same instant and frame position
+        // Start the startable panes with the same instant and frame position
         let now = web_time::Instant::now();
         for idx in ready_panes {
+            if hold_linked && self.gui.pane_time_linked(idx) {
+                continue;
+            }
             let pane = self.gui.pane_mut(idx).unwrap();
             let ls = &mut pane.loop_state;
             ls.phase = rustdar_egui::pane::LoopPhase::Playing;
@@ -2217,7 +2238,6 @@ impl super::App {
         // Recorded so they stop being retried and stop holding up readiness.
         let mut to_mark_failed: Vec<(usize, usize)> = Vec::new();
 
-        let sync = self.gui.is_sync_layers();
         let pane_count = self.gui.pane_count();
 
         // Cross-section cuts to dispatch, and the running count that paces them.
@@ -2236,6 +2256,12 @@ impl super::App {
             if self.gui.pane_cannot_loop(pane_idx) {
                 continue;
             }
+            // Texture sharing — donor clones below, and the queued-render
+            // dedup that leans on the response-path broadcast — happens
+            // inside the layer-linked group (M11), the same two-ended gate
+            // the broadcast itself applies: an unlinked pane renders its own
+            // frames and nobody counts on serving it.
+            let linked = self.gui.pane_layer_linked(pane_idx);
             let Some(pane) = self.gui.pane(pane_idx) else {
                 continue;
             };
@@ -2376,10 +2402,13 @@ impl super::App {
                     // Take a sibling's raster instead of cutting, on the same
                     // terms the plan-view path donates on: same target, same key,
                     // and — standing in for the snapped sweep a section has no
-                    // equivalent of — the same ladder.
-                    if sync
+                    // equivalent of — the same ladder. Including about the
+                    // group: donors come from the layer-linked panes, for a
+                    // layer-linked receiver.
+                    if linked
                         && let Some((src_pane, src_frame)) = find_section_donor(
                             (0..pane_count)
+                                .filter(|&i| self.gui.pane_layer_linked(i))
                                 .filter_map(|i| self.gui.pane(i).map(|p| (i, &p.loop_state))),
                             pane_idx,
                             frame.timestamp,
@@ -2403,7 +2432,19 @@ impl super::App {
                         // goes on showing whatever has already landed.
                         break;
                     }
-                    if sync && section_already_queued(&to_cut, frame.timestamp, &target, &key) {
+                    // The queuing pane must be linked too, or the section
+                    // broadcast this lean relies on never runs — the same
+                    // linked-queuer filter as `render_already_queued`'s.
+                    if linked
+                        && section_already_queued(
+                            to_cut
+                                .iter()
+                                .filter(|r| self.gui.pane_layer_linked(r.pane_idx)),
+                            frame.timestamp,
+                            &target,
+                            &key,
+                        )
+                    {
                         continue;
                     }
                     to_cut.push(LoopSectionRequest {
@@ -2428,10 +2469,13 @@ impl super::App {
 
                 // Take a sibling's texture instead of rendering, but only from a loop
                 // keyed to the same target. Same test the response-path broadcast
-                // applies, so the two cannot disagree about who may serve this frame.
-                if sync {
+                // applies, so the two cannot disagree about who may serve this frame
+                // — including about the group: donors come from the layer-linked
+                // panes, for a layer-linked receiver.
+                if linked {
                     let donor = find_donor(
                         (0..pane_count)
+                            .filter(|&i| self.gui.pane_layer_linked(i))
                             .filter_map(|i| self.gui.pane(i).map(|p| (i, &p.loop_state))),
                         pane_idx,
                         frame.timestamp,
@@ -2453,11 +2497,20 @@ impl super::App {
                 // see `frame_sweep`.
                 match frame_sweep(&self.loop_mgr, &target, frame.timestamp) {
                     FrameSweep::At(snapped) => {
-                        // Deduplicate: if another pane already queued a render for the
-                        // same target and timestamp, skip — the broadcast in
-                        // poll_loop_render_results will deliver the texture to this pane.
-                        if sync
-                            && render_already_queued(&to_render, frame.timestamp, &target, snapped)
+                        // Deduplicate: if another *linked* pane already queued a
+                        // render for the same target and timestamp, skip — the
+                        // broadcast in poll_loop_render_results will deliver the
+                        // texture to this pane. The queuing pane must be linked
+                        // too, or the broadcast this lean relies on never runs.
+                        if linked
+                            && render_already_queued(
+                                to_render
+                                    .iter()
+                                    .filter(|r| self.gui.pane_layer_linked(r.pane_idx)),
+                                frame.timestamp,
+                                &target,
+                                snapped,
+                            )
                         {
                             continue;
                         }
@@ -2712,8 +2765,11 @@ impl super::App {
     ///
     /// The section counterpart of [`Self::poll_loop_render_results`], with the
     /// same two steps in the same order: vet-and-place through
-    /// [`accept_section_result`], then — under Sync Layers — offer the finished
-    /// raster to every sibling section loop cut for the same thing.
+    /// [`accept_section_result`], then — inside the layer-linked group — offer
+    /// the finished raster to every sibling section loop cut for the same
+    /// thing. The same two-ended gate as the plan-view broadcast (M11): a
+    /// linked origin donates to linked siblings, an unlinked pane neither
+    /// donates nor receives.
     fn poll_loop_section_results(&mut self, ctx: &egui::Context) {
         while let Ok(mut sr) = self.channels.loop_section_receiver.try_recv() {
             let origin_pane = sr.pane_idx;
@@ -2735,11 +2791,14 @@ impl super::App {
                 continue;
             };
 
-            if !self.gui.is_sync_layers() {
+            if !self.gui.pane_layer_linked(origin_pane) {
                 continue;
             }
             for sibling_idx in 0..self.gui.pane_count() {
-                if sibling_idx == origin_pane || self.gui.pane_cannot_loop(sibling_idx) {
+                if sibling_idx == origin_pane
+                    || self.gui.pane_cannot_loop(sibling_idx)
+                    || !self.gui.pane_layer_linked(sibling_idx)
+                {
                     continue;
                 }
                 // The receiver's own half of the ladder comparison, resolved from
@@ -3432,15 +3491,13 @@ fn find_section_donor<'a>(
 /// `(site, timestamp)` cache entry share one volume and so one ladder, which is
 /// the same argument [`LoopPlaybackState::frame_donatable_to`] makes about the
 /// snapped sweep.
-fn section_already_queued(
-    queued: &[LoopSectionRequest],
+fn section_already_queued<'a>(
+    mut queued: impl Iterator<Item = &'a LoopSectionRequest>,
     timestamp: chrono::NaiveDateTime,
     target: &RenderTarget,
     key: &rustdar_egui::pane::SectionLoopKey,
 ) -> bool {
-    queued
-        .iter()
-        .any(|r| r.timestamp == timestamp && r.target.matches(target) && &r.key == key)
+    queued.any(|r| r.timestamp == timestamp && r.target.matches(target) && &r.key == key)
 }
 
 /// A loop frame render the dispatcher intends to spawn.
@@ -3525,13 +3582,13 @@ fn find_donor<'a>(
 /// carries. If acceptance stopped checking it, a suppressed pane could be handed a
 /// differently-snapped image, have its own in-flight render dropped as redundant, and
 /// keep the wrong sweep permanently.
-fn render_already_queued(
-    queued: &[LoopRenderRequest],
+fn render_already_queued<'a>(
+    mut queued: impl Iterator<Item = &'a LoopRenderRequest>,
     timestamp: chrono::NaiveDateTime,
     target: &RenderTarget,
     snapped: f32,
 ) -> bool {
-    queued.iter().any(|r| {
+    queued.any(|r| {
         r.timestamp == timestamp
             && r.target.matches(target)
             && (r.snapped - snapped).abs() <= ELEVATION_TOLERANCE

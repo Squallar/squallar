@@ -978,15 +978,19 @@ impl InputHarness {
         self.gui.active_pane_index_for_test()
     }
 
-    /// Turn layer sync between panes on or off.
-    pub(crate) fn set_sync_layers(&mut self, on: bool) {
-        self.gui.set_sync_layers_for_test(on);
+    /// Set every pane's layer link at once — off lets the panes disagree
+    /// (no source propagates, no target is written), on restores the
+    /// default convergence. The one-call stand-in for the retired
+    /// `sync_layers` global.
+    pub(crate) fn set_layer_links(&mut self, on: bool) {
+        self.gui.set_layer_links_for_test(on);
         self.warm_up();
     }
 
-    /// Whether layer sync between panes is on.
-    pub(crate) fn sync_layers(&self) -> bool {
-        self.gui.is_sync_layers()
+    /// Whether every pane's layer link is on — the default the sync
+    /// contracts assert before driving the fan-out.
+    pub(crate) fn all_layer_linked(&self) -> bool {
+        self.gui.all_layer_linked_for_test()
     }
 
     /// Set one pane's overlay state directly, writing both the enabled map and

@@ -449,8 +449,9 @@ fn a_pane_that_cannot_loop_cannot_hold_another_panes_loop_back() {
     point_at_site(&mut app, 0);
     point_at_site(&mut app, 1);
     assert!(
-        app.gui.is_sync_layers(),
-        "precondition: sync must be on — it is the config default, and it is              what makes one pane able to hold another back"
+        app.gui.pane_time_linked(0) && app.gui.pane_time_linked(1),
+        "precondition: both panes must be time-linked — it is the per-pane \
+             default, and it is what makes one pane able to hold another back"
     );
 
     // Pane 0: a map pane whose loop is ready to play.
@@ -516,8 +517,8 @@ fn the_loop_frame_broadcast_skips_a_pane_with_no_plan_view() {
         point_at_site(&mut app, 0);
         point_at_site(&mut app, 1);
         assert!(
-            app.gui.is_sync_layers(),
-            "precondition: sync is on by default"
+            app.gui.pane_layer_linked(0) && app.gui.pane_layer_linked(1),
+            "precondition: both panes are layer-linked by default"
         );
         app.loop_mgr = LoopDownloadManager::new();
         // A volume that really carries the tilt, reusing the fixture the loop

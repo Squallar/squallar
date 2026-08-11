@@ -384,14 +384,13 @@ impl super::App {
                 new_config.site = site.clone();
                 self.gui.set_radar_config(new_config.clone());
 
-                // Sync ON moves every pane to the new site; sync OFF only the pane
-                // that asked. That is the whole difference — writing the move out
-                // once per branch invites the two copies to drift.
-                let moving = if self.gui.is_sync_layers() {
-                    0..self.gui.pane_count()
-                } else {
-                    pane_idx..pane_idx + 1
-                };
+                // The linked group moves together; an unlinked pane moves
+                // alone. `layer_sync_targets` is `propagate_layer_sync`'s
+                // own two-ended gate — a layer-linked source reaches the
+                // layer-linked panes, an unlinked source only itself — so
+                // the site switch and the egui-side convergence cannot
+                // disagree about who moves.
+                let moving = self.gui.layer_sync_targets(pane_idx);
                 // Every field written here is flat on `PaneState`, so this reaches
                 // a section or a volume pane unchanged and correctly: those move
                 // site with the layout exactly as a map pane does.

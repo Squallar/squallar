@@ -2,7 +2,7 @@
 //! (plan §1.7, §3.5), and the shared picker bodies behind them.
 //!
 //! One `egui::Area` per visible pane, top-left, wrapping to the pane's width:
-//! pane number · site · product code · tilt (map panes only) · time-link ·
+//! pane number · site · product code · tilt (map panes only) · sync ·
 //! kind. Every pill click makes its pane the active pane first; the pills
 //! with something to choose then open an [`egui::Popup`] anchored under
 //! themselves, closing on a click outside — the M1 dropdown's own pattern.
@@ -104,33 +104,72 @@ const LINK_POPOVER_WIDTH: f32 = 260.0;
 /// reach without scrolling past 200 sites.
 const SITE_LIST_HEIGHT: f32 = 150.0;
 
-/// The Sync pill's text while this pane follows shared time. Plain text —
-/// the old `⛓` rendered like a DNA helix (the second user test), and the
-/// demo's `🔗` has no glyph in egui's bundled fonts (see `ui_glyphs.rs`).
+/// The Sync pill's text while all three of this pane's links are on. Plain
+/// text — the old `⛓` rendered like a DNA helix (the second user test), and
+/// the demo's `🔗` has no glyph in egui's bundled fonts (see `ui_glyphs.rs`).
 const SYNC_PILL_LINKED: &str = "Sync";
 
-/// The Sync pill's text while this pane's time is unlinked — the `⊗` marks
-/// the one per-pane state distinctly on the map, so a pane sitting out
-/// shared time says so at a glance.
+/// The Sync pill's text while **any** of this pane's three links is off —
+/// the `⊗` marks a pane sitting out part of the group at a glance, and the
+/// pill's hover names which parts (see [`sync_pill_hover`]).
 const SYNC_PILL_UNLINKED: &str = "\u{2297} Sync";
 
-/// The Sync popover's three toggles (the second user test's three-way
-/// popover): the two global layout toggles and this pane's own time link,
-/// under honest labels. "Sync time" is per-pane; the caption under it —
-/// [`UNLINK_NOTE`] — says exactly what off means.
-const SYNC_LAYERS_OPTION: &str = "Sync layers";
-const SYNC_VIEWPORT_OPTION: &str = "Sync viewport";
-const SYNC_TIME_OPTION: &str = "Sync time - this pane";
+/// The Sync popover's three toggles — all honestly per-pane since M11:
+/// this pane's own [`crate::pane::PaneState::viewport_link`], `layer_link`
+/// and `time_link`, under one label set the inspector's Pane-properties sync
+/// section shares by rendering the same [`sync_section_ui`].
+pub(super) const SYNC_VIEWPORT_OPTION: &str = "Sync viewport";
+pub(super) const SYNC_LAYERS_OPTION: &str = "Sync layers";
+pub(super) const SYNC_TIME_OPTION: &str = "Sync time";
 
-/// What unlinking really does — one sentence for the popover's caption and
-/// the inspector checkbox's hover, so the two routes cannot describe the
-/// setting differently. Careful about "frozen": shared time navigation and
-/// the loop leave the pane alone, and a pane parked in the archive therefore
-/// holds its moment — but scan delivery is per-site, so an unlinked pane
-/// still watching live still follows new scans.
+/// The two action rows under the toggles — the ways home. The first copies
+/// this pane's viewport everywhere and touches no link; the second is that
+/// copy plus every link on every visible pane turned back on.
+pub(super) const SYNC_MATCH_ALL: &str = "Match all panes to this view";
+pub(super) const SYNC_RELINK_ALL: &str = "Re-link all here";
+
+/// The sync section's five row labels in draw order — the parity walk's
+/// inventory for the one section [`sync_section_ui`] renders at both routes.
+#[cfg(test)]
+pub(crate) const SYNC_SECTION_LABELS: [&str; 5] = [
+    SYNC_VIEWPORT_OPTION,
+    SYNC_LAYERS_OPTION,
+    SYNC_TIME_OPTION,
+    SYNC_MATCH_ALL,
+    SYNC_RELINK_ALL,
+];
+
+/// What unlinking time really does — one sentence for the section's caption,
+/// rendered by [`sync_section_ui`] in the popover and the inspector alike so
+/// the two routes cannot describe the setting differently. Careful about
+/// "frozen": shared time navigation and the loop leave the pane alone, and a
+/// pane parked in the archive therefore holds its moment — but scan delivery
+/// is per-site, so an unlinked pane still watching live still follows new
+/// scans.
 pub(crate) const UNLINK_NOTE: &str = "Off leaves this pane out of shared time \
     navigation and the loop. Parked in the archive it holds its moment; \
     still live, it still follows new scans.";
+
+/// The viewport toggle's hover — brief, because the behaviour is the
+/// symmetric one the label implies: off means this pane pans and zooms
+/// alone, and the group moves without it.
+const VIEWPORT_LINK_NOTE: &str = "Off lets this pane pan and zoom alone; \
+    the other linked panes keep moving together.";
+
+/// The layers toggle's hover — what "layers" covers here, so off is not
+/// mistaken for the eye toggles alone.
+const LAYER_LINK_NOTE: &str = "Off keeps this pane's site, product, tilt and \
+    layers its own; linked panes keep converging without it.";
+
+/// The match-all action's hover: the copy, and the promise that it is only
+/// the copy.
+const MATCH_ALL_NOTE: &str = "Copy this pane's zoom and centre to every map \
+    pane. Links stay as they are.";
+
+/// The re-link action's hover: the same copy, plus the three links turned
+/// back on everywhere.
+const RELINK_ALL_NOTE: &str = "Copy this view to every map pane and turn \
+    viewport, layer and time sync back on for every pane.";
 
 /// The three pane kinds as the pickers offer them — the inspector's
 /// segmented row and the kind popover render this one table.
@@ -358,6 +397,117 @@ pub(super) fn kind_list_ui(ui: &mut egui::Ui, current: PaneKind) -> PickOutcome<
     outcome
 }
 
+/// What one pass of [`sync_section_ui`] produced: which action row was
+/// clicked, whether the layer link was just turned **on** (the popover
+/// converges immediately on that instead of waiting for the next panel
+/// pass), and — for the probes — the five rows as drawn, checkbox rows with
+/// the state they were handed (the `DrawnMenuLeaf` discipline) and action
+/// rows with `false`.
+#[derive(Default)]
+pub(crate) struct SyncSectionOutcome {
+    pub layer_relinked: bool,
+    pub match_all: bool,
+    pub relink_all: bool,
+    #[cfg(test)]
+    pub rows: Vec<(String, egui::Rect, bool)>,
+}
+
+/// **The** per-pane sync section (M11): the three link checkboxes — all
+/// honestly per-pane, writing `pane`'s own fields — and the two action rows.
+///
+/// The Sync pill's popover and the inspector's Pane-properties sync section
+/// both render this one function, which is what keeps the two routes one
+/// wording and one behaviour by construction (the module note's parity
+/// pattern). It only writes the pane it is handed — the pill popover hands
+/// the pane it `mem::take`s, the inspector the pane its whole pass holds —
+/// and reports the action clicks for the caller to apply through
+/// [`super::Gui::apply_sync_outcome`], where touching the *other* panes is
+/// safe.
+pub(super) fn sync_section_ui(
+    ui: &mut egui::Ui,
+    pane: &mut crate::pane::PaneState,
+) -> SyncSectionOutcome {
+    let mut outcome = SyncSectionOutcome::default();
+    #[cfg(test)]
+    let push = |rows: &mut Vec<(String, egui::Rect, bool)>,
+                label: &str,
+                rect: egui::Rect,
+                was: bool| rows.push((label.to_owned(), rect, was));
+
+    #[cfg(test)]
+    let was = pane.viewport_link;
+    let row = ui
+        .checkbox(&mut pane.viewport_link, SYNC_VIEWPORT_OPTION)
+        .on_hover_text(VIEWPORT_LINK_NOTE);
+    #[cfg(test)]
+    push(&mut outcome.rows, SYNC_VIEWPORT_OPTION, row.rect, was);
+    #[cfg(not(test))]
+    let _ = row;
+
+    #[cfg(test)]
+    let was = pane.layer_link;
+    let row = ui
+        .checkbox(&mut pane.layer_link, SYNC_LAYERS_OPTION)
+        .on_hover_text(LAYER_LINK_NOTE);
+    if row.changed() && pane.layer_link {
+        // Rejoining the group converges now, not on the next frame that
+        // happens to run a panel pass — the old global toggle's own rule,
+        // kept per pane.
+        outcome.layer_relinked = true;
+    }
+    #[cfg(test)]
+    push(&mut outcome.rows, SYNC_LAYERS_OPTION, row.rect, was);
+
+    #[cfg(test)]
+    let was = pane.time_link;
+    let row = ui
+        .checkbox(&mut pane.time_link, SYNC_TIME_OPTION)
+        .on_hover_text(UNLINK_NOTE);
+    #[cfg(test)]
+    push(&mut outcome.rows, SYNC_TIME_OPTION, row.rect, was);
+    #[cfg(not(test))]
+    let _ = row;
+    // The honesty sentence rides on screen with the choice, both routes.
+    ui.label(egui::RichText::new(UNLINK_NOTE).small().weak());
+
+    ui.separator();
+    let row = ui.button(SYNC_MATCH_ALL).on_hover_text(MATCH_ALL_NOTE);
+    if row.clicked() {
+        outcome.match_all = true;
+    }
+    #[cfg(test)]
+    push(&mut outcome.rows, SYNC_MATCH_ALL, row.rect, false);
+    let row = ui.button(SYNC_RELINK_ALL).on_hover_text(RELINK_ALL_NOTE);
+    if row.clicked() {
+        outcome.relink_all = true;
+    }
+    #[cfg(test)]
+    push(&mut outcome.rows, SYNC_RELINK_ALL, row.rect, false);
+
+    outcome
+}
+
+/// The Sync pill's hover: plain "Sync options" while every link is on, and
+/// the unlinked dimensions named while any is off — the pill's `⊗` says
+/// *something* is out; this says what.
+fn sync_pill_hover(viewport_link: bool, layer_link: bool, time_link: bool) -> String {
+    let mut off = Vec::new();
+    if !viewport_link {
+        off.push("viewport");
+    }
+    if !layer_link {
+        off.push("layers");
+    }
+    if !time_link {
+        off.push("time");
+    }
+    if off.is_empty() {
+        "Sync options".to_owned()
+    } else {
+        format!("Sync options - unlinked: {}", off.join(", "))
+    }
+}
+
 impl super::Gui {
     /// Ask for pane `idx` to become `kind` the pickers' way: through the
     /// deferred applier, arming the cross-section draw when the pane has no
@@ -449,7 +599,7 @@ impl super::Gui {
         actions: &mut Vec<GuiAction>,
     ) {
         // Everything the row states, read before any closure borrows self.
-        let (site, kind, product, time_link, line_absent, tilt, products, elevations) = {
+        let (site, kind, product, links, line_absent, tilt, products, elevations) = {
             let pane = &self.panes[idx];
             let (_, tilt) = pane
                 .get_rendering_params()
@@ -458,7 +608,7 @@ impl super::Gui {
                 pane.site.clone(),
                 pane.kind(),
                 pane.selected_product,
-                pane.time_link,
+                (pane.viewport_link, pane.layer_link, pane.time_link),
                 pane.cross_section().and_then(|s| s.line).is_none(),
                 tilt,
                 pane.scan_info
@@ -600,19 +750,22 @@ impl super::Gui {
 
                     // -- sync --
                     if offer_link {
-                        // Text, with the ⊗ marking an unlinked-time pane
-                        // distinctly (the second user test: the old ⛓ read
-                        // as a DNA helix).
-                        let label = if time_link {
+                        // Text, with the ⊗ marking a pane with **any** of
+                        // its three links off distinctly (the second user
+                        // test: the old ⛓ read as a DNA helix). The hover
+                        // names which dimensions are out.
+                        let (viewport_link, layer_link, time_link) = links;
+                        let all_linked = viewport_link && layer_link && time_link;
+                        let label = if all_linked {
                             SYNC_PILL_LINKED
                         } else {
                             SYNC_PILL_UNLINKED
                         };
-                        let pill = ui.button(label).on_hover_text(if time_link {
-                            "Sync options"
-                        } else {
-                            "Sync options - this pane's time is unlinked"
-                        });
+                        let pill = ui.button(label).on_hover_text(sync_pill_hover(
+                            viewport_link,
+                            layer_link,
+                            time_link,
+                        ));
                         #[cfg(test)]
                         probe
                             .pills
@@ -625,7 +778,7 @@ impl super::Gui {
                             }
                         }
                         if !swallow {
-                            self.sync_pill_popover(&pill, idx, time_link);
+                            self.sync_pill_popover(&pill, idx);
                         }
                     }
 
@@ -794,57 +947,37 @@ impl super::Gui {
         self.record_popover_rect(&shown);
     }
 
-    /// The Sync popover (the second user test's three-way): "Sync layers"
-    /// and "Sync viewport" flip the two global layout toggles — the same
-    /// state the inspector's Pane-properties sync section writes, kept there
-    /// as the alternate route — and "Sync time" flips this pane's own
-    /// [`crate::pane::PaneState::time_link`], over [`UNLINK_NOTE`], the
-    /// honest description of what off means. Checkboxes that keep the
-    /// popover up: flipping two of them must not be two opens (the ☰
-    /// dropdown's own reasoning).
-    fn sync_pill_popover(&mut self, pill: &egui::Response, idx: PaneId, linked: bool) {
+    /// The Sync popover: the shared per-pane sync section —
+    /// [`sync_section_ui`], the same function the inspector's Pane-properties
+    /// sync section renders — over this pane. Three checkboxes writing this
+    /// pane's own links, and the two action rows applied through
+    /// [`super::Gui::apply_sync_outcome`]. Checkboxes keep the popover up:
+    /// flipping two of them must not be two opens (the ☰ dropdown's own
+    /// reasoning); the action rows close it — they are commands, and their
+    /// effect is on the whole grid behind the popup.
+    ///
+    /// The pane is `mem::take`n for the section's duration so the shared
+    /// body has one signature at both call sites; this pass runs outside
+    /// every other take window (module note), so the slot is free to take.
+    fn sync_pill_popover(&mut self, pill: &egui::Response, idx: PaneId) {
         let shown = egui::Popup::menu(pill)
             .id(pill_popup_id(idx, PillKind::Link))
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show(|ui| {
                 ui.set_max_width(LINK_POPOVER_WIDTH);
-                #[cfg(test)]
-                let mut rows: Vec<(String, egui::Rect, bool)> = Vec::new();
-
-                let mut sync_layers = self.sync_layers;
-                let row = ui.checkbox(&mut sync_layers, SYNC_LAYERS_OPTION);
-                #[cfg(test)]
-                rows.push((SYNC_LAYERS_OPTION.to_owned(), row.rect, self.sync_layers));
-                if row.changed() {
-                    self.sync_layers = sync_layers;
-                    // Turning the convergence on converges now, not on the
-                    // next frame that happens to run a panel pass.
+                let mut pane = std::mem::take(&mut self.panes[idx]);
+                let outcome = sync_section_ui(ui, &mut pane);
+                self.apply_sync_outcome(&outcome, &mut pane, idx);
+                self.panes[idx] = pane;
+                if outcome.layer_relinked || outcome.relink_all {
+                    // Converge now, not on the next frame that happens to
+                    // run a panel pass — after the pane is back in its slot,
+                    // so the pass reads the real active pane.
                     self.propagate_layer_sync();
                 }
-
-                let mut viewport_sync = self.viewport_sync;
-                let row = ui.checkbox(&mut viewport_sync, SYNC_VIEWPORT_OPTION);
-                #[cfg(test)]
-                rows.push((
-                    SYNC_VIEWPORT_OPTION.to_owned(),
-                    row.rect,
-                    self.viewport_sync,
-                ));
-                if row.changed() {
-                    self.viewport_sync = viewport_sync;
+                if outcome.match_all || outcome.relink_all {
+                    ui.close_kind(egui::UiKind::Menu);
                 }
-
-                let mut link = linked;
-                let row = ui
-                    .checkbox(&mut link, SYNC_TIME_OPTION)
-                    .on_hover_text(UNLINK_NOTE);
-                #[cfg(test)]
-                rows.push((SYNC_TIME_OPTION.to_owned(), row.rect, linked));
-                if row.changed() {
-                    self.active_pane = idx;
-                    self.panes[idx].time_link = link;
-                }
-                ui.label(egui::RichText::new(UNLINK_NOTE).small().weak());
 
                 #[cfg(test)]
                 {
@@ -853,7 +986,7 @@ impl super::Gui {
                         pill: PillKind::Link,
                         rect: egui::Rect::NOTHING,
                         search: None,
-                        rows,
+                        rows: outcome.rows,
                     });
                 }
             });

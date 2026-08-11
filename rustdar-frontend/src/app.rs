@@ -1546,7 +1546,11 @@ impl App {
         }
 
         if !overlay_renders.is_empty() {
-            let should_group = self.gui.is_viewport_sync() && self.gui.is_sync_layers();
+            // Groupable only while every visible map pane is viewport- and
+            // layer-linked (M11's per-pane model): the dedup key carries no
+            // geo bounds, so one unlinked pane means its texture must stay
+            // its own.
+            let should_group = self.gui.overlay_renders_groupable();
             let grouped = deduplicate_overlay_renders(overlay_renders, should_group);
             for (pane_indices, kind, req) in grouped {
                 if should_group {

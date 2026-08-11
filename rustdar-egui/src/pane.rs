@@ -576,6 +576,25 @@ pub struct PaneState {
     /// delivery (`set_scan_info_for_site`): the volume a site holds is shared
     /// state, and what this flag freezes is the pane's own time posture.
     pub time_link: bool,
+    /// Whether this pane's viewport belongs to the linked group (M11's
+    /// per-pane sync model — the successor to the retired `Gui`-global
+    /// `viewport_sync`). Persisted; default **true**.
+    ///
+    /// The linked group is the visible map panes with this on: a pan or zoom
+    /// on a linked pane moves the group, a change on an unlinked pane moves
+    /// only itself, and an unlinked pane is never written by the group's
+    /// convergence (`Gui::sync_viewports`).
+    pub viewport_link: bool,
+    /// Whether this pane's layer state belongs to the linked group (M11 —
+    /// the successor to the retired `Gui`-global `sync_layers`). Persisted;
+    /// default **true**.
+    ///
+    /// `propagate_layer_sync` converges site, scan, product, tilt, draw
+    /// order and overlay state from a linked **source** to linked
+    /// **targets** only: an unlinked pane's edits stay its own, and the
+    /// group's edits leave it alone. The time pair inside that pass keeps
+    /// its own gate ([`Self::time_link`]).
+    pub layer_link: bool,
     pub hover_value: Option<String>,
     /// Hover tooltip text from overlay handlers (e.g. model data CIN value).
     pub overlay_hover_value: Option<String>,
@@ -588,7 +607,8 @@ pub struct PaneState {
     /// map layers. Persisted across sessions.
     pub draw_order: Vec<OverlayKind>,
     /// Per-pane overlay enabled state (master visibility for each overlay kind).
-    /// When `sync_layers` is on, this is propagated from the active pane to all others.
+    /// Propagated from a layer-linked active pane to the other layer-linked
+    /// panes by `propagate_layer_sync`.
     pub enabled_overlays: HashMap<OverlayKind, bool>,
     /// Per-pane overlay handler config snapshots (serialized handler state per kind).
     /// Swapped into/out of the global OverlayRegistry around access points so each
@@ -1198,6 +1218,8 @@ impl PaneState {
             viewing_live: true,
             time_step_secs: 600,
             time_link: true,
+            viewport_link: true,
+            layer_link: true,
             hover_value: None,
             overlay_hover_value: None,
             last_hover_pos: None,

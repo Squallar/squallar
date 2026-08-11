@@ -43,6 +43,17 @@ struct PaneConfig {
     /// exactly that.
     #[serde(default = "default_true")]
     time_link: bool,
+    /// Whether this pane's viewport belongs to the linked group (M11).
+    /// Defaults **true** on the same reasoning as `time_link` — with the
+    /// legacy `UiConfig::viewport_sync` global folded in on load, so an old
+    /// config that had the global off comes back with every pane unlinked.
+    #[serde(default = "default_true")]
+    viewport_link: bool,
+    /// Whether this pane's layer state belongs to the linked group (M11).
+    /// Defaults **true**; the legacy `UiConfig::sync_layers` global is
+    /// folded in on load exactly as `viewport_link`'s is.
+    #[serde(default = "default_true")]
+    layer_link: bool,
     /// Visual stacking order for all map layers (bottom to top).
     #[serde(default = "OverlayKind::default_draw_order")]
     draw_order: Vec<OverlayKind>,
@@ -271,6 +282,8 @@ impl Default for PaneConfig {
             site: String::new(),
             time_step_secs: 600,
             time_link: true,
+            viewport_link: true,
+            layer_link: true,
             draw_order: OverlayKind::default_draw_order(),
             enabled_overlays: HashMap::new(),
             overlay_configs: HashMap::new(),
@@ -288,7 +301,21 @@ impl Default for PaneConfig {
 struct UiConfig {
     pane_count: usize,
     active_pane: usize,
+    /// **Read-only legacy** (M11): the retired global viewport-sync toggle.
+    /// Never written again — `skip_serializing` — but still read, so an old
+    /// config that had it off loads with every restored pane's
+    /// `viewport_link` seeded off (see `load_ui_config`). Absent on the wire
+    /// (every config this build writes) it defaults true, which folds into
+    /// the per-pane fields as a no-op.
+    #[serde(skip_serializing, default = "default_true")]
     viewport_sync: bool,
+    /// **Read-only legacy** (M11): the retired global layer-sync toggle,
+    /// on the same terms as `viewport_sync`. On load, false seeds every
+    /// restored pane's `layer_link` **and** `time_link` off — under the old
+    /// model this one global gated the whole shared-time fan-out too, so the
+    /// pane's stored `time_link` was inert while it was off, and honouring
+    /// the observed behaviour means seeding both.
+    #[serde(skip_serializing, default = "default_true")]
     sync_layers: bool,
     auto_poll: bool,
     /// Feed live panes from the real-time chunk bucket rather than polling the
@@ -537,6 +564,8 @@ impl super::Gui {
                     site: pane.site.clone(),
                     time_step_secs: pane.time_step_secs,
                     time_link: pane.time_link,
+                    viewport_link: pane.viewport_link,
+                    layer_link: pane.layer_link,
                     draw_order: pane.draw_order.clone(),
                     enabled_overlays: pane.enabled_overlays.clone(),
                     overlay_configs: pane.overlay_configs.clone(),
@@ -558,8 +587,10 @@ impl super::Gui {
         let config = UiConfig {
             pane_count: self.pane_layout.pane_count,
             active_pane: self.active_pane,
-            viewport_sync: self.viewport_sync,
-            sync_layers: self.sync_layers,
+            // Dead values behind `skip_serializing`: the legacy globals are
+            // never written again — the per-pane links above are the state.
+            viewport_sync: true,
+            sync_layers: true,
             auto_poll: self.auto_poll.enabled,
             live_chunks: self.live_chunks,
             chunk_notifications: self.chunk_notifications,
@@ -703,8 +734,6 @@ impl super::Gui {
             0
         };
 
-        self.viewport_sync = config.viewport_sync;
-        self.sync_layers = config.sync_layers;
         self.auto_poll.enabled = config.auto_poll;
         self.live_chunks = config.live_chunks;
         self.chunk_notifications = config.chunk_notifications;
@@ -775,6 +804,13 @@ impl super::Gui {
             let Some(pc) = pc else {
                 // Fall back to global time_step_secs for panes without PaneConfig
                 pane.time_step_secs = config.time_step_secs;
+                // The legacy-global fold below, for a pane the config never
+                // described: its links are the defaults ANDed with the same
+                // globals, so a legacy sync-off layout cannot grow a linked
+                // pane out of thin air.
+                pane.viewport_link = config.viewport_sync;
+                pane.layer_link = config.sync_layers;
+                pane.time_link = config.sync_layers;
                 continue;
             };
             pane.selected_product = pc.selected_product;
@@ -785,7 +821,20 @@ impl super::Gui {
                 pane.site = config.site.clone();
             }
             pane.time_step_secs = pc.time_step_secs;
-            pane.time_link = pc.time_link;
+            // The M11 migration fold: the per-pane links ANDed with the
+            // legacy globals. A config this build wrote carries no globals,
+            // serde defaults them true, and the AND is the identity; an old
+            // config with a global **off** loads with every pane's
+            // corresponding link off — which is the behaviour that config
+            // described. `sync_layers` folds into `time_link` too: under the
+            // old model that one global gated the whole shared-time fan-out,
+            // so a stored `time_link` was inert while it was off, and
+            // honouring observed behaviour means seeding both. The globals
+            // are never written again (`skip_serializing`), so this fold
+            // runs at most once per legacy file.
+            pane.time_link = pc.time_link && config.sync_layers;
+            pane.viewport_link = pc.viewport_link && config.viewport_sync;
+            pane.layer_link = pc.layer_link && config.sync_layers;
             // Capture the first pane's legacy Radar toggle for migration.
             if legacy_radar_enabled.is_none()
                 && let Some(&enabled) = pc.layers.get(&LayerKind::Radar)

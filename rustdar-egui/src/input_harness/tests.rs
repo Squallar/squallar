@@ -2343,7 +2343,7 @@ fn compact_menu_with_pane_1_active() -> InputHarness {
 #[test]
 fn the_menu_reads_and_writes_the_active_pane_not_pane_zero() {
     let mut h = compact_menu_with_pane_1_active();
-    h.set_sync_layers(false);
+    h.set_layer_links(false);
 
     // The panes must disagree about **two** kinds, not one.
     //
@@ -2420,7 +2420,7 @@ fn a_menu_toggle_loads_the_active_panes_config_before_saving_it() {
     let mut h = InputHarness::with_screen(egui::vec2(800.0, 900.0));
     assert_eq!(h.width_class(), crate::ui_layout::WidthClass::Medium);
     h.set_pane_count(2);
-    h.set_sync_layers(false);
+    h.set_layer_links(false);
     assert_eq!(
         h.active_pane_index(),
         0,
@@ -2472,7 +2472,10 @@ fn a_menu_toggle_propagates_to_the_other_panes_when_sync_is_on() {
     h.warm_up();
     assert_eq!(h.active_pane_index(), 1, "precondition: pane 1 is active");
 
-    assert!(h.sync_layers(), "precondition: layer sync is on by default");
+    assert!(
+        h.all_layer_linked(),
+        "precondition: every pane's layer link is on by default"
+    );
     assert!(
         !h.layers_panel_on_screen(),
         "precondition: the layers panel must NOT be on screen, or its own \
@@ -3294,7 +3297,7 @@ fn expanded_with_pane_1_active() -> InputHarness {
 #[test]
 fn the_stacks_rows_read_and_write_the_active_pane_not_pane_zero() {
     let mut h = expanded_with_pane_1_active();
-    h.set_sync_layers(false);
+    h.set_layer_links(false);
     h.set_overlay_on_pane(0, OverlayKind::RadarSites, false);
     h.set_overlay_on_pane(0, OverlayKind::CityLabels, false);
     h.set_overlay_on_pane(1, OverlayKind::RadarSites, true);
@@ -3442,7 +3445,7 @@ fn the_layer_body_carries_no_master_toggle() {
 fn an_eye_toggle_loads_the_active_panes_config_before_saving_it() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.set_pane_count(2);
-    h.set_sync_layers(false);
+    h.set_layer_links(false);
     assert_eq!(
         h.active_pane_index(),
         0,
@@ -3470,31 +3473,87 @@ fn an_eye_toggle_loads_the_active_panes_config_before_saving_it() {
     );
 }
 
-/// 88. **An eye toggle propagates to the other panes when sync is on.**
+/// 88. **An eye toggle propagates over the layer-link fan-out mask — linked
+///     source to linked targets; an unlinked target is untouched; an
+///     unlinked source stays local.** (M11: `PaneState::layer_link` replaced
+///     the `sync_layers` global on both ends of `propagate_layer_sync`.)
 ///
-///     Contract 28's claim, ported to the eye: the shell's pass ends with
-///     `propagate_layer_sync` after the pane goes back, and this is what
-///     makes a layer flipped on one pane a layer flipped on all of them.
+///     Contract 28's claim, ported to the eye and to the per-pane model:
+///     the shell's pass ends with `propagate_layer_sync` after the pane goes
+///     back, and the mask is what decides who that reaches. All three arms
+///     are driven through the same real eye clicks so a gate deleted on
+///     either end fails here by name.
 #[test]
-fn an_eye_toggle_propagates_to_the_other_panes_when_sync_is_on() {
+fn an_eye_toggle_propagates_over_the_layer_link_mask() {
     let mut h = expanded_with_pane_1_active();
-    assert!(h.sync_layers(), "precondition: layer sync defaults on");
+    assert!(
+        h.all_layer_linked(),
+        "precondition: every pane's layer link defaults on"
+    );
     h.set_overlay_on_pane(0, OverlayKind::RadarSites, false);
     h.set_overlay_on_pane(1, OverlayKind::RadarSites, false);
     h.warm_up();
 
+    // Linked source, linked target: the default, and the propagation.
     let row = h.stack_row(OverlayKind::RadarSites).expect("row drawn");
     h.mouse_click(row.eye.center());
     h.frames_for(5, FRAME_DT);
-
     assert!(
         h.overlay_enabled_on(1, OverlayKind::RadarSites),
         "precondition: the active pane must have taken the toggle"
     );
     assert!(
         h.overlay_enabled_on(0, OverlayKind::RadarSites),
-        "the toggle did not propagate to the other pane, though layer sync \
-             is on"
+        "the toggle did not propagate to the linked pane, though both ends \
+             are linked"
+    );
+
+    // Unlinked target: the group's edits leave it alone.
+    h.gui_mut().pane_mut(0).expect("pane 0").layer_link = false;
+    h.warm_up();
+    let row = h.stack_row(OverlayKind::RadarSites).expect("row drawn");
+    h.mouse_click(row.eye.center());
+    h.frames_for(5, FRAME_DT);
+    assert!(
+        !h.overlay_enabled_on(1, OverlayKind::RadarSites),
+        "precondition: the active pane must have taken the toggle off"
+    );
+    assert!(
+        h.overlay_enabled_on(0, OverlayKind::RadarSites),
+        "the toggle reached a layer-unlinked target pane"
+    );
+
+    // Unlinked source: the active pane's edits stay its own. Pane 0 is
+    // relinked so there is a linked target to observably not reach, and the
+    // panes disagree about a *second* kind — the witness: an unlinked-source
+    // propagation would copy the whole enabled map, flipping pane 0's city
+    // labels to pane 1's, whatever it did about the kind being toggled.
+    {
+        let gui = h.gui_mut();
+        gui.pane_mut(0).expect("pane 0").layer_link = true;
+        gui.pane_mut(1).expect("pane 1").layer_link = false;
+    }
+    h.set_overlay_on_pane(0, OverlayKind::CityLabels, true);
+    h.set_overlay_on_pane(1, OverlayKind::CityLabels, false);
+    h.warm_up();
+    assert!(
+        h.overlay_enabled_on(0, OverlayKind::CityLabels)
+            && !h.overlay_enabled_on(1, OverlayKind::CityLabels),
+        "precondition: the panes must disagree about the witness kind, or \
+             local-stays-local is unobservable"
+    );
+    let row = h.stack_row(OverlayKind::RadarSites).expect("row drawn");
+    h.mouse_click(row.eye.center());
+    h.frames_for(5, FRAME_DT);
+    assert!(
+        h.overlay_enabled_on(1, OverlayKind::RadarSites),
+        "precondition: the unlinked active pane must have taken its own \
+             toggle"
+    );
+    assert!(
+        h.overlay_enabled_on(0, OverlayKind::CityLabels),
+        "an unlinked source pane propagated: pane 0's city labels were \
+             overwritten with pane 1's, though pane 1's layer link is off"
     );
 }
 
@@ -5832,7 +5891,7 @@ fn a_pane_added_by_the_picker_still_shows_radar_with_layer_sync_off() {
         "precondition: an arbitrary width — the picker is in the top bar \
          at all of them"
     );
-    h.set_sync_layers(false);
+    h.set_layer_links(false);
     assert!(
         h.overlay_enabled(OverlayKind::Radar),
         "precondition: the active pane must have Radar on, or there is no \
@@ -5852,8 +5911,9 @@ fn a_pane_added_by_the_picker_still_shows_radar_with_layer_sync_off() {
         "precondition: the click must have split the map"
     );
     assert!(
-        !h.sync_layers(),
-        "precondition: sync must still be off, or it did the seeding"
+        !h.gui_mut().pane(0).expect("pane 0").layer_link,
+        "precondition: the active pane must still be layer-unlinked, or the \
+             sync pass did the seeding"
     );
 
     assert!(
@@ -9060,26 +9120,51 @@ fn the_site_search_narrows_the_list_and_a_row_click_switches_the_site() {
 }
 
 /// 70. **An unlinked pane is excluded from shared time — the loop fan-out
-///     and the sync pass's time pair — and the link checkbox reflects and
-///     toggles.**
+///     and the sync pass's time pair — and the Pane-properties sync section
+///     mirrors the popover: the same five rows, its time checkbox reflecting
+///     and toggling.**
 ///
-///     The checkbox lives in the Pane-properties sync section and writes the
-///     *taken* pane; the fan-out reads `time_sync_targets`, so the loop
-///     actions name exactly the linked map panes; and
-///     `propagate_layer_sync` leaves an unlinked pane's `viewing_live` and
-///     `time_step_secs` alone while still converging everything else.
+///     The section is `pills::sync_section_ui`, the one implementation both
+///     routes render (M11's parity pattern), writing the *taken* pane; the
+///     fan-out reads `time_sync_targets`, so the loop actions name exactly
+///     the linked map panes; and `propagate_layer_sync` leaves an unlinked
+///     pane's `viewing_live` and `time_step_secs` alone while still
+///     converging everything else.
 #[test]
 fn an_unlinked_pane_is_excluded_from_shared_nav_and_loop_fan_out() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.set_pane_count(3);
     h.load_scan("KTLX");
 
-    // The checkbox reflects the stored state and toggles it.
+    // The inspector route is the popover's mirror: one row set, from the
+    // one shared section — the parity walk for the PaneProps route.
     h.open_pane_props();
-    let (link, on) = h
-        .inspector()
-        .time_link
-        .expect("a multi-pane layout draws the link checkbox");
+    assert_eq!(
+        h.inspector()
+            .sync_rows
+            .iter()
+            .map(|(label, _, _)| label.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            "Sync viewport".to_owned(),
+            "Sync layers".to_owned(),
+            "Sync time".to_owned(),
+            "Match all panes to this view".to_owned(),
+            "Re-link all here".to_owned(),
+        ],
+        "the Pane-properties sync section must carry the popover's five rows"
+    );
+
+    // The time checkbox reflects the stored state and toggles it.
+    let time_row = |h: &mut InputHarness| {
+        h.inspector()
+            .sync_rows
+            .iter()
+            .find(|(label, _, _)| label == "Sync time")
+            .map(|&(_, rect, on)| (rect, on))
+            .expect("a multi-pane layout draws the sync section")
+    };
+    let (link, on) = time_row(&mut h);
     assert!(on, "a fresh pane starts linked");
     h.mouse_click(link.center());
     h.warm_up();
@@ -9087,7 +9172,7 @@ fn an_unlinked_pane_is_excluded_from_shared_nav_and_loop_fan_out() {
         !h.gui_mut().pane(0).expect("pane 0").time_link,
         "the click must unlink the pane"
     );
-    let (link, on) = h.inspector().time_link.expect("still drawn");
+    let (link, on) = time_row(&mut h);
     assert!(!on, "the checkbox must reflect the stored state");
     h.mouse_click(link.center());
     h.warm_up();
@@ -9354,7 +9439,7 @@ fn a_saved_preset_appears_applies_and_deletes() {
     h.load_scan("KTLX");
     // Sync off, so what apply writes per pane is what this test observes —
     // not what the sync pass copied a frame later.
-    h.set_sync_layers(false);
+    h.set_layer_links(false);
 
     // A distinctive view: two panes, velocity on the first, storm reports on.
     h.set_pane_count(2);
@@ -9882,21 +9967,23 @@ fn the_product_and_tilt_pill_popovers_write_the_pane() {
     );
 }
 
-/// 73f. **The Sync pill's popover is the three-way: each toggle flips its
-///      real state, and the honest unlink sentence rides with it.**
+/// 73f. **The Sync pill's popover is the per-pane five-row section: the
+///      three link checkboxes flip this pane's own fields, the two action
+///      rows ride under them, and the honest unlink sentence is on screen.**
 ///
-///      The second user test replaced the ⛓ link pill (it rendered like a
-///      DNA helix) with a text pill opening a three-toggle popover: "Sync
-///      layers" is the global `sync_layers`, "Sync viewport" the global
-///      `viewport_sync`, "Sync time" this pane's own `time_link` — the
-///      current semantics, with `UNLINK_NOTE` on screen. Each flip is
-///      asserted against the real field, from the popover, through real
-///      clicks; the pill's own text marks the unlinked-time state
-///      distinctly.
+///      M11's model: "Sync viewport" is this pane's `viewport_link`, "Sync
+///      layers" its `layer_link`, "Sync time" its `time_link` — no globals
+///      left to flip — with `UNLINK_NOTE` on screen. Each flip is asserted
+///      against the real per-pane field, from the popover, through real
+///      clicks, on a pane whose *siblings'* links must not move; the pill's
+///      own text marks any unlinked dimension distinctly, whichever it is.
 #[test]
-fn the_sync_pill_popover_flips_all_three_real_states() {
+fn the_sync_pill_popover_flips_all_three_per_pane_links() {
     let mut h = pill_harness();
-    assert!(h.sync_layers(), "precondition: layer sync defaults on");
+    assert!(
+        h.all_layer_linked(),
+        "precondition: every pane's links default on"
+    );
 
     let (label, pill) = h.pill(0, PillKind::Link).expect("a Sync pill");
     assert_eq!(label, "Sync", "a fresh pane's pill reads plain Sync");
@@ -9909,11 +9996,17 @@ fn the_sync_pill_popover_flips_all_three_real_states() {
             .iter()
             .map(|(label, _, _)| label.as_str())
             .collect::<Vec<_>>(),
-        vec!["Sync layers", "Sync viewport", "Sync time - this pane"],
-        "the three-way popover's honest labels"
+        vec![
+            "Sync viewport",
+            "Sync layers",
+            "Sync time",
+            "Match all panes to this view",
+            "Re-link all here",
+        ],
+        "the five-row per-pane section's honest labels"
     );
-    // The shared honesty sentence — `ui_pills::UNLINK_NOTE`, the inspector
-    // checkbox's own hover — is on screen with the choice.
+    // The shared honesty sentence — `ui_pills::UNLINK_NOTE`, rendered by the
+    // one `sync_section_ui` both routes share — is on screen with the choice.
     assert!(
         h.painted_text_strings()
             .iter()
@@ -9921,37 +10014,166 @@ fn the_sync_pill_popover_flips_all_three_real_states() {
         "the popover must carry the honest unlink caption"
     );
 
-    // Sync layers: flips the global toggle, popover stays up.
+    // Sync viewport: this pane's own link, popover stays up. The `⊗`
+    // marks the pill for *any* unlinked dimension, not just time.
     h.mouse_click(popover.rows[0].1.center());
     h.frame();
-    assert!(
-        !h.sync_layers(),
-        "the Sync layers toggle did not flip the global sync_layers"
+    {
+        let gui = h.gui_mut();
+        assert!(
+            !gui.pane(0).expect("pane 0").viewport_link,
+            "the Sync viewport toggle did not unlink this pane's viewport"
+        );
+        assert!(
+            gui.pane(1).expect("pane 1").viewport_link,
+            "the toggle is per-pane: pane 1's viewport link must not move"
+        );
+    }
+    let (label, _) = h.pill(0, PillKind::Link).expect("still drawn");
+    assert_eq!(
+        label, "\u{2297} Sync",
+        "the pill must mark an unlinked viewport distinctly"
     );
 
-    // Sync viewport: the global viewport sync.
-    let viewport_before = h.gui_mut().viewport_sync_for_test();
+    // Sync layers: this pane's own link.
     let popover = h.pill_popover().expect("the popover stays up for toggles");
     h.mouse_click(popover.rows[1].1.center());
     h.frame();
-    assert_eq!(
-        h.gui_mut().viewport_sync_for_test(),
-        !viewport_before,
-        "the Sync viewport toggle did not flip the global viewport_sync"
-    );
+    {
+        let gui = h.gui_mut();
+        assert!(
+            !gui.pane(0).expect("pane 0").layer_link,
+            "the Sync layers toggle did not unlink this pane's layers"
+        );
+        assert!(
+            gui.pane(1).expect("pane 1").layer_link,
+            "the toggle is per-pane: pane 1's layer link must not move"
+        );
+    }
 
     // Sync time: this pane's own link.
     let popover = h.pill_popover().expect("still up");
     h.mouse_click(popover.rows[2].1.center());
     h.warm_up();
-    assert!(
-        !h.gui_mut().pane(0).expect("pane 0").time_link,
-        "the Sync time toggle did not unlink the pane"
-    );
+    {
+        let gui = h.gui_mut();
+        assert!(
+            !gui.pane(0).expect("pane 0").time_link,
+            "the Sync time toggle did not unlink the pane"
+        );
+        assert!(
+            gui.pane(1).expect("pane 1").time_link,
+            "the toggle is per-pane: pane 1's time link must not move"
+        );
+    }
     let (label, _) = h.pill(0, PillKind::Link).expect("still drawn");
     assert_eq!(
         label, "\u{2297} Sync",
-        "the pill must mark the unlinked-time state distinctly"
+        "the pill must keep marking the unlinked state distinctly"
+    );
+}
+
+/// 73h. **The popover's two action rows do exactly what they say: match-all
+///      copies this pane's viewport to every map pane and leaves the links
+///      alone; re-link-all makes that copy and turns all three links back on
+///      for every visible pane.**
+///
+///      Driven from pane 1's popover with pane 0 deliberately unlinked and
+///      parked at a different zoom, so both halves are observable: the copy
+///      reaching an *unlinked* pane (it is a one-shot override, not a group
+///      write), and the links either staying put or coming back on.
+#[test]
+fn the_sync_popover_action_rows_match_and_relink_the_grid() {
+    let moved_to = 7.0;
+    let mut h = pill_harness();
+
+    // Pane 0: everything unlinked, viewport somewhere else.
+    {
+        let gui = h.gui_mut();
+        let pane = gui.pane_mut(0).expect("pane 0");
+        pane.viewport_link = false;
+        pane.layer_link = false;
+        pane.time_link = false;
+    }
+    h.warm_up();
+
+    // Pane 1's viewport is the one to match. Set after the warm-up so no
+    // frame's own sync pass is what converged anything.
+    {
+        let gui = h.gui_mut();
+        gui.pane_mut(1)
+            .expect("pane 1")
+            .map_memory
+            .set_zoom(moved_to)
+            .expect("the test zoom must be in walkers' accepted range");
+        assert_ne!(
+            gui.pane(0).expect("pane 0").map_memory.zoom(),
+            moved_to,
+            "precondition: the panes must disagree, or the copy is invisible"
+        );
+    }
+
+    // Match all panes to this view, from pane 1's popover.
+    let (_, pill) = h.pill(1, PillKind::Link).expect("pane 1's Sync pill");
+    h.mouse_click(pill.center());
+    h.frame(); // the popup's debut frame only registers it
+    let popover = h.pill_popover().expect("the popover opened");
+    assert_eq!(popover.pane_idx, 1, "precondition: pane 1's popover");
+    h.mouse_click(popover.rows[3].1.center());
+    h.frame();
+    {
+        let gui = h.gui_mut();
+        assert_eq!(
+            gui.pane(0).expect("pane 0").map_memory.zoom(),
+            moved_to,
+            "match-all must copy the viewport to every map pane, linked or \
+                 not"
+        );
+        let pane0 = gui.pane(0).expect("pane 0");
+        assert!(
+            !pane0.viewport_link && !pane0.layer_link && !pane0.time_link,
+            "match-all must leave every link exactly as it was"
+        );
+    }
+
+    // Park pane 0 elsewhere again — with its viewport unlinked, nothing
+    // holds it — then Re-link all here from pane 1.
+    h.warm_up();
+    h.gui_mut()
+        .pane_mut(0)
+        .expect("pane 0")
+        .map_memory
+        .set_zoom(4.0)
+        .expect("in range");
+    let (_, pill) = h.pill(1, PillKind::Link).expect("pane 1's Sync pill");
+    h.mouse_click(pill.center());
+    h.frame();
+    let popover = h.pill_popover().expect("the popover opened");
+    h.mouse_click(popover.rows[4].1.center());
+    h.frame();
+    {
+        let gui = h.gui_mut();
+        let pane0 = gui.pane(0).expect("pane 0");
+        assert!(
+            pane0.viewport_link && pane0.layer_link && pane0.time_link,
+            "re-link-all must turn all three links back on for every pane"
+        );
+        assert_eq!(
+            pane0.map_memory.zoom(),
+            moved_to,
+            "re-link-all must also make the match-all copy"
+        );
+        let pane1 = gui.pane(1).expect("pane 1");
+        assert!(
+            pane1.viewport_link && pane1.layer_link && pane1.time_link,
+            "the popover's own pane relinks too"
+        );
+    }
+    assert_eq!(
+        h.active_pane_index(),
+        1,
+        "re-link-all makes its pane the group's reference: everything came \
+             home to it"
     );
 }
 
