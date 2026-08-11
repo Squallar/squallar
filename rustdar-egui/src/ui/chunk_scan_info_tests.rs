@@ -161,6 +161,21 @@ fn the_first_chunk_volume_of_a_session_still_claims_the_initial_zoom() {
     assert!(gui.initial_zoom_set);
 }
 
+/// ...but only when a pane is actually on that site. The chunk feed keeps
+/// delivering a site's volume for a round or two after the last pane on it
+/// switched away, and that data nobody is looking at must not spend the
+/// one-shot claim the pane's own first volume needs.
+#[test]
+fn a_chunk_volume_no_pane_is_watching_does_not_claim_the_initial_zoom() {
+    let mut gui = gui_with(info(0, &[(RadarProduct::Reflectivity, &[0.5])]));
+    gui.initial_zoom_set = false;
+    gui.apply_chunk_scan_info("KABX", info(5, &[(RadarProduct::Reflectivity, &[0.5])]));
+    assert!(
+        !gui.initial_zoom_set,
+        "a volume for a site no pane is on spent the latch"
+    );
+}
+
 /// A pane on another site is not touched.
 #[test]
 fn a_chunk_update_only_reaches_its_own_site() {

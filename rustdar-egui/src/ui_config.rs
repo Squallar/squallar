@@ -911,6 +911,14 @@ impl super::Gui {
         // global RadarHandler, using the first pane's value (all panes were
         // synced anyway when there was a per-pane layer manager).
         let mut legacy_radar_enabled: Option<bool> = None;
+        // Whether any pane came back carrying a zoom the user chose. Folded up
+        // out of the loop because `Gui::claim_initial_zoom` is the *later*
+        // writer of the same value: it fires on the session's first scan, which
+        // arrives seconds after this load, and without being told it overwrites
+        // every restored zoom with `DEFAULT_INITIAL_ZOOM` — which the next
+        // autosave then writes back to disk. Accumulated rather than assigned
+        // inside the loop only because `self.panes` is borrowed there.
+        let mut zoom_restored = false;
         for (i, pane) in self.panes.iter_mut().enumerate().take(count) {
             let pc = config.panes.get(i);
             let Some(pc) = pc else {
@@ -970,7 +978,19 @@ impl super::Gui {
             if !pc.overlay_configs.is_empty() {
                 pane.overlay_configs = pc.overlay_configs.clone();
             }
-            restore_viewport(pane, pc);
+            zoom_restored |= restore_viewport(pane, pc);
+        }
+
+        // Claim the latch on the load's behalf, so the first scan of the
+        // session leaves the restored viewport alone. Deliberately *not* a
+        // blanket `true`: a first run with no config, and a config written
+        // before the viewport was persisted, both arrive here with no saved
+        // zoom to defend, and those are the two cases `claim_initial_zoom`
+        // still exists for — a fresh pane sits at a continental
+        // `DEFAULT_PANE_ZOOM`, and the first scan is what makes it a radar
+        // view.
+        if zoom_restored {
+            self.initial_zoom_set = true;
         }
 
         // Restore handler-owned overlay states (backward-compatible: old configs have empty map)
@@ -1293,11 +1313,22 @@ fn restore_content(pane_idx: usize, pc: &PaneConfig, pane_count: usize) -> PaneC
 /// valid range and refuses anything outside it; the saved value came from
 /// `walkers` in the first place, so the only way to land here is a hand-edited
 /// or version-skewed config, where keeping the default is the right answer.
-fn restore_viewport(pane: &mut PaneState, pc: &PaneConfig) {
-    if let Some(zoom) = pc.zoom
-        && pane.map_memory.set_zoom(zoom).is_err()
-    {
-        log::warn!("saved zoom {zoom} is out of range; keeping the default");
+///
+/// Returns whether a saved zoom was **actually applied** — not merely present.
+/// `Gui::claim_initial_zoom` overwrites every pane's zoom on the session's first
+/// scan, which lands seconds after this runs, so the load has to be able to tell
+/// the latch that the user's own zoom is already on screen. A `None` zoom and a
+/// rejected one both leave `PaneState::with_site`'s continental default in
+/// place, and that default is exactly the case the latch still exists to fix, so
+/// both report `false`.
+fn restore_viewport(pane: &mut PaneState, pc: &PaneConfig) -> bool {
+    let mut zoom_restored = false;
+    if let Some(zoom) = pc.zoom {
+        if pane.map_memory.set_zoom(zoom).is_err() {
+            log::warn!("saved zoom {zoom} is out of range; keeping the default");
+        } else {
+            zoom_restored = true;
+        }
     }
     // No `else`: a saved `None` means the map was following its site, which is
     // already the state a fresh `MapMemory` is in. Calling `follow_my_position`
@@ -1306,6 +1337,7 @@ fn restore_viewport(pane: &mut PaneState, pc: &PaneConfig) {
     if let Some((lat, lon)) = pc.center {
         pane.map_memory.center_at(walkers::lat_lon(lat, lon));
     }
+    zoom_restored
 }
 
 /// Reconcile a saved draw order with the current set of known `OverlayKind` variants.

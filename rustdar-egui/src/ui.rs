@@ -2022,14 +2022,22 @@ impl Gui {
 
     /// Update the scan info for all panes viewing the given site.
     pub fn set_scan_info_for_site(&mut self, site: &str, info: ScanInfo) {
+        let mut any_pane_took_it = false;
         for pane in &mut self.panes {
             if pane.site == site {
                 pane.scan_info = Some(info.clone());
+                any_pane_took_it = true;
             }
         }
         self.radar.fetching = false;
         self.auto_poll.on_success();
-        self.claim_initial_zoom();
+        // Only a scan someone is actually looking at is a reason to zoom to
+        // radar scale. A volume for a site no pane is on — a fetch that landed
+        // after the pane switched away — must not spend the one-shot latch,
+        // let alone move every other pane's map.
+        if any_pane_took_it {
+            self.claim_initial_zoom();
+        }
     }
 
     /// Zoom to the radar on the first scan of a session and never again, so a
@@ -2039,6 +2047,20 @@ impl Gui {
     /// [`Self::apply_chunk_scan_info`] shares this one behaviour and none of the
     /// others — and with chunks feeding live mode, the first data of a session
     /// can arrive through either.
+    ///
+    /// # `load_ui_config` is the other writer of the latch
+    ///
+    /// This predates viewport persistence, when "the first scan of a session"
+    /// really did mean "the first data a default `Gui` ever saw". It no longer
+    /// does: a restored config sets every pane's zoom *before* any scan arrives,
+    /// so `Gui::load_ui_config` claims the latch itself when it restored one —
+    /// otherwise the first scan seconds later overwrites the user's zoom and the
+    /// next autosave persists the overwrite.
+    ///
+    /// What is left is the two cases where nothing was restored and a pane is
+    /// still sitting at the roughly continental `DEFAULT_PANE_ZOOM`: a first run
+    /// with no config, and a config written before the viewport was persisted.
+    /// Those are the reason this is still here.
     fn claim_initial_zoom(&mut self) {
         if !self.initial_zoom_set {
             for pane in &mut self.panes {
@@ -2074,10 +2096,12 @@ impl Gui {
     /// exactly what the archive path produces — which is what makes a fallback
     /// invisible.
     pub fn apply_chunk_scan_info(&mut self, site: &str, fresh: ScanInfo) {
+        let mut any_pane_took_it = false;
         for pane in &mut self.panes {
             if pane.site != site {
                 continue;
             }
+            any_pane_took_it = true;
             let merged = match pane.scan_info.take() {
                 None => fresh.clone(),
                 Some(mut existing) => {
@@ -2104,7 +2128,13 @@ impl Gui {
             };
             pane.scan_info = Some(merged);
         }
-        self.claim_initial_zoom();
+        // Same guard as `set_scan_info_for_site`, for the same reason: the
+        // chunk feed keeps delivering a site's volume for a round or two after
+        // the last pane on it switched away, and that data nobody is looking at
+        // must not spend the one-shot latch.
+        if any_pane_took_it {
+            self.claim_initial_zoom();
+        }
     }
 
     /// Whether live panes should be fed from the real-time chunk bucket.

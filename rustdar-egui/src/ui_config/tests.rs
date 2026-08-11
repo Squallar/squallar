@@ -1223,6 +1223,203 @@ fn a_config_predating_viewport_persistence_keeps_the_default_zoom() {
     assert!(restored.pane(0).unwrap().map_memory.detached().is_none());
 }
 
+// --- The restored viewport vs. the session's first scan -------------------
+//
+// Everything below asserts *past* the first scan, which is the blind spot the
+// rest of this file has: `a_panned_and_zoomed_map_comes_back_where_it_was_left`
+// checks the zoom at the load boundary and stops, and no persistence test ever
+// delivers data afterwards. `Gui::claim_initial_zoom` runs on the first scan of
+// the process and used to overwrite every pane's zoom with
+// `DEFAULT_INITIAL_ZOOM` — including the one the load had just restored, which
+// the next autosave then wrote back to disk.
+
+/// A minimal `ScanInfo`. Only its arrival matters here, not its contents; the
+/// site the delivery is *addressed to* is the `set_scan_info_for_site`
+/// argument, not this.
+fn a_scan() -> rustdar_radar::types::ScanInfo {
+    rustdar_radar::types::ScanInfo {
+        site: rustdar_radar::sites::RadarSite {
+            name: "KTLX",
+            lat: 35.3,
+            lon: -97.3,
+            heights: None,
+        },
+        site_source: rustdar_radar::site_position::SitePositionSource::Table,
+        site_position: None,
+        timestamp: chrono::NaiveDate::from_ymd_opt(2026, 7, 28)
+            .unwrap()
+            .and_hms_opt(18, 0, 0)
+            .unwrap(),
+        vcp_number: 212,
+        available_products: vec![rustdar_radar::types::RadarProduct::Reflectivity],
+        product_elevations: std::collections::HashMap::new(),
+        status: "test".to_string(),
+    }
+}
+
+/// Save at zoom 9, reload, then let the session's first scan arrive.
+///
+/// The restore was already correct; what was broken is that it did not survive
+/// contact with the first volume, and the clobbered value was then persisted —
+/// so one launch destroyed the zoom permanently, unrecoverably by quitting
+/// without touching anything.
+#[test]
+fn a_restored_zoom_survives_the_sessions_first_scan() {
+    let store = MemoryConfigStore::default();
+
+    let mut gui = crate::Gui::new();
+    let site = gui.pane(0).unwrap().site.clone();
+    assert_ne!(
+        gui.pane(0).unwrap().map_memory.zoom(),
+        9.0,
+        "the test zoom must differ from the default"
+    );
+    gui.pane_mut(0).unwrap().map_memory.set_zoom(9.0).unwrap();
+    gui.save_ui_config(&store);
+
+    let mut restored = crate::Gui::new();
+    assert!(restored.load_ui_config(&store));
+    assert_eq!(
+        restored.pane(0).unwrap().map_memory.zoom(),
+        9.0,
+        "precondition: the load itself must put the zoom back"
+    );
+
+    restored.set_scan_info_for_site(&site, a_scan());
+
+    assert_eq!(
+        restored.pane(0).unwrap().map_memory.zoom(),
+        9.0,
+        "the session's first scan overwrote the zoom the load had restored"
+    );
+
+    // The destructive half: whatever is on the pane now is what the next
+    // autosave commits to disk.
+    let second = MemoryConfigStore::default();
+    restored.save_ui_config(&second);
+    let mut again = crate::Gui::new();
+    assert!(again.load_ui_config(&second));
+    assert_eq!(
+        again.pane(0).unwrap().map_memory.zoom(),
+        9.0,
+        "the clobbered zoom was written back, so the loss is permanent"
+    );
+}
+
+/// The chunk-path twin. With live mode fed by the real-time chunk bucket, the
+/// first data of a session arrives through `apply_chunk_scan_info` instead, and
+/// it claims the same latch.
+#[test]
+fn a_restored_zoom_survives_the_sessions_first_chunk_volume() {
+    let store = MemoryConfigStore::default();
+
+    let mut gui = crate::Gui::new();
+    let site = gui.pane(0).unwrap().site.clone();
+    gui.pane_mut(0).unwrap().map_memory.set_zoom(9.0).unwrap();
+    gui.save_ui_config(&store);
+
+    let mut restored = crate::Gui::new();
+    assert!(restored.load_ui_config(&store));
+    assert_eq!(restored.pane(0).unwrap().map_memory.zoom(), 9.0);
+
+    restored.apply_chunk_scan_info(&site, a_scan());
+
+    assert_eq!(
+        restored.pane(0).unwrap().map_memory.zoom(),
+        9.0,
+        "the session's first chunk volume overwrote the restored zoom"
+    );
+}
+
+/// Anti-degeneration guard 1: deleting the latch also makes the two tests above
+/// pass. A first run has no config to restore, so its panes are still at the
+/// roughly continental `DEFAULT_PANE_ZOOM`, and the first scan is what makes
+/// that a radar view. That must keep happening.
+#[test]
+fn a_first_run_with_no_config_still_zooms_to_the_radar_on_its_first_scan() {
+    let store = MemoryConfigStore::default();
+
+    let mut gui = crate::Gui::new();
+    assert!(
+        !gui.load_ui_config(&store),
+        "precondition: an empty store is a first run"
+    );
+    let site = gui.pane(0).unwrap().site.clone();
+    assert_ne!(
+        gui.pane(0).unwrap().map_memory.zoom(),
+        crate::ui::DEFAULT_INITIAL_ZOOM,
+        "precondition: a fresh pane must not already be at the radar zoom, or \
+         this test cannot tell the latch from a default"
+    );
+
+    gui.set_scan_info_for_site(&site, a_scan());
+
+    assert_eq!(
+        gui.pane(0).unwrap().map_memory.zoom(),
+        crate::ui::DEFAULT_INITIAL_ZOOM,
+        "a first run was left at continental zoom staring at a tiny blob"
+    );
+}
+
+/// Anti-degeneration guard 2: a config written before viewport persistence
+/// (`ee823ca5`) has no `zoom` key at all — every already-installed copy of the
+/// app on disk right now. Nothing was restored, so the pane is at the same
+/// continental default as a first run and the latch must still fire.
+#[test]
+fn a_config_without_a_saved_zoom_still_zooms_to_the_radar_on_its_first_scan() {
+    let store = MemoryConfigStore::default();
+    store
+        .store(
+            UI_CONFIG_KEY,
+            r#"{"pane_count":1,"site":"KMPX","panes":[{"site":"KMPX"}]}"#,
+        )
+        .unwrap();
+
+    let mut gui = crate::Gui::new();
+    assert!(gui.load_ui_config(&store));
+    assert_ne!(
+        gui.pane(0).unwrap().map_memory.zoom(),
+        crate::ui::DEFAULT_INITIAL_ZOOM,
+        "precondition: a legacy config restores no zoom"
+    );
+
+    gui.set_scan_info_for_site("KMPX", a_scan());
+
+    assert_eq!(
+        gui.pane(0).unwrap().map_memory.zoom(),
+        crate::ui::DEFAULT_INITIAL_ZOOM,
+        "a config predating viewport persistence lost the initial zoom"
+    );
+}
+
+/// A scan nobody asked for must not spend the one-shot latch, nor move maps.
+///
+/// The latch is claimed after the match loop, so a volume arriving for a site
+/// no pane is on — a fetch that landed after the pane switched away — used to
+/// zoom *every* pane and burn the claim, leaving the scan the user is actually
+/// waiting on with nothing to do.
+#[test]
+fn a_scan_no_pane_is_watching_neither_moves_a_map_nor_spends_the_latch() {
+    let mut gui = crate::Gui::new();
+    let site = gui.pane(0).unwrap().site.clone();
+    let before = gui.pane(0).unwrap().map_memory.zoom();
+    assert_ne!(site, "KABX", "precondition: the stray site must be a stray");
+
+    gui.set_scan_info_for_site("KABX", a_scan());
+    assert_eq!(
+        gui.pane(0).unwrap().map_memory.zoom(),
+        before,
+        "a scan no pane is viewing moved the map anyway"
+    );
+
+    gui.set_scan_info_for_site(&site, a_scan());
+    assert_eq!(
+        gui.pane(0).unwrap().map_memory.zoom(),
+        crate::ui::DEFAULT_INITIAL_ZOOM,
+        "the stray scan spent the latch the real first scan needed"
+    );
+}
+
 /// A pane layout wider than a phone offers survives the round trip.
 ///
 /// This is the data-loss bug the clamp exists to prevent, asserted at the
