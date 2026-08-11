@@ -6612,6 +6612,14 @@ fn the_missing_layer_list_is_explained_for_both_non_map_kinds() {
 ///     *removing* one — or demoting the section block back to nothing —
 ///     fails on a missing anchor.
 ///
+///     The volume block's needles name **every row it owns** — Vertical,
+///     Mode, Map floor, Reset view — not just enough of them to prove an
+///     order. The list originally sampled the block (header, Mode, Reset),
+///     which meant a re-host could drop the Vertical slider or the Map
+///     floor checkbox and this contract would stay green — exactly the
+///     silent loss a user then has to report. A row that leaves this body
+///     on purpose must leave this list in the same commit, visibly.
+///
 ///     KDMX rather than the default KTLX for the reason test 49 gives:
 ///     the `mem::take` placeholder in the active slot carries the default
 ///     site, and only a non-default fixture makes the identity line's
@@ -6667,9 +6675,11 @@ fn kind_specific_blocks_sit_inside_the_shared_sidebar_structure() {
             "KDMX - 3D volume",
             "Reflectivity",
             crate::ui::VOLUME_SIDEBAR_HEADER,
+            "Vertical:",
             // "Lit volume" and "Isosurface" share this row; the label
             // anchors it (the order test wants one needle per row).
             "Mode:",
+            "Map floor",
             "Reset view",
         ],
     );
@@ -6693,9 +6703,11 @@ fn kind_specific_blocks_sit_inside_the_shared_sidebar_structure() {
         inspector_rect(&h),
         &[
             crate::ui::VOLUME_SIDEBAR_HEADER,
+            "Vertical:",
             "Mode:",
             "\u{2265}:",
             "applies to the lit volume only",
+            "Map floor",
             "Reset view",
         ],
     );
@@ -6736,6 +6748,144 @@ fn kind_specific_blocks_sit_inside_the_shared_sidebar_structure() {
     assert!(
         h.text_painted_in(sidebar_rect(&h), crate::ui::NON_MAP_LAYERS_NOTE),
         "the stack must carry the layer-list note for a converted pane"
+    );
+}
+
+/// The Map floor checkbox **acts**: a click on the drawn row flips the
+/// pane's `hide_floor`, both ways, and the flipped state survives a
+/// restart.
+///
+/// The sidebar-order contract above proves the row *paints*; this is the
+/// other half of the claim, driven through the real chrome rather than by
+/// writing the field — the m10 lesson (the time controls painted perfectly
+/// while acting on nothing) is that the two halves fail independently.
+/// The restart leg reuses the config round trip
+/// `a_hidden_map_floor_survives_a_save_and_load` pins at the field level,
+/// but starts it from the click, so a checkbox rewired to a copy of the
+/// pane would fail here even with the field-level test green.
+#[test]
+fn the_map_floor_click_flips_the_pane_and_survives_a_restart() {
+    use crate::config_store::MemoryConfigStore;
+
+    let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
+    h.load_scan("KDMX");
+    h.open_pane_props();
+    h.make_pane_volume(0);
+    h.frames_for(2, FRAME_DT);
+
+    let floor_row = |h: &InputHarness| {
+        h.painted_text_rects()
+            .into_iter()
+            .find(|(_, text)| text.contains("Map floor"))
+            .expect("the volume body draws its Map floor row")
+            .0
+    };
+
+    h.mouse_click(floor_row(&h).center());
+    h.frames_for(2, FRAME_DT);
+    assert!(
+        h.gui_mut().pane(0).unwrap().volume().unwrap().hide_floor,
+        "clicking Map floor must hide the floor"
+    );
+
+    // The restart, from the click's own result: save, load into a fresh
+    // Gui, and the floor is still off.
+    let store = MemoryConfigStore::default();
+    h.gui_mut().save_ui_config(&store);
+    let mut restored = crate::Gui::new();
+    assert!(restored.load_ui_config(&store));
+    assert!(
+        restored.pane(0).unwrap().volume().unwrap().hide_floor,
+        "the clicked-off floor must come back off after a restart"
+    );
+
+    // And back: the same click is the way home.
+    h.mouse_click(floor_row(&h).center());
+    h.frames_for(2, FRAME_DT);
+    assert!(
+        !h.gui_mut().pane(0).unwrap().volume().unwrap().hide_floor,
+        "a second click must show the floor again"
+    );
+}
+
+/// The Vertical slider **acts**: dragging it moves the pane's vertical
+/// exaggeration in the direction of the drag, and the dragged value
+/// survives a restart.
+///
+/// Same shape as the Map floor test above and for the same reason — the
+/// row's presence is the order contract's claim, this is the wiring's.
+/// The assertions are relative (right of a rail point is a larger value
+/// than left of it) rather than absolute, so the test says "the drag
+/// steers the camera" without restating the rail's geometry.
+#[test]
+fn the_vertical_slider_drag_stretches_the_box_and_survives_a_restart() {
+    use crate::config_store::MemoryConfigStore;
+
+    let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
+    h.load_scan("KDMX");
+    h.open_pane_props();
+    h.make_pane_volume(0);
+    h.frames_for(2, FRAME_DT);
+
+    let exaggeration = |h: &mut InputHarness| {
+        h.gui_mut()
+            .pane(0)
+            .unwrap()
+            .volume()
+            .unwrap()
+            .camera
+            .vertical_exaggeration()
+    };
+    let drag = |h: &mut InputHarness, from_x: f32, by: f32| {
+        let label = h
+            .painted_text_rects()
+            .into_iter()
+            .find(|(_, text)| text.contains("Vertical:"))
+            .expect("the volume body draws its Vertical row")
+            .0;
+        let start = egui::pos2(label.right() + from_x, label.center().y);
+        h.mouse_press(start);
+        h.frame();
+        h.mouse_move(start + egui::vec2(by, 0.0));
+        h.frame();
+        h.mouse_release(start + egui::vec2(by, 0.0));
+        h.frames_for(2, FRAME_DT);
+    };
+
+    let shipped = exaggeration(&mut h);
+    drag(&mut h, 60.0, 40.0);
+    let stretched = exaggeration(&mut h);
+    assert!(
+        (stretched - shipped).abs() > 0.05,
+        "dragging the Vertical slider must move the exaggeration off its \
+         shipped {shipped}; it is still {stretched}"
+    );
+
+    // Back the other way: a release further left is a smaller value.
+    drag(&mut h, 40.0, -20.0);
+    let eased = exaggeration(&mut h);
+    assert!(
+        eased < stretched,
+        "a leftward drag must ease the stretch: {eased} is not below \
+         {stretched}"
+    );
+
+    // The restart: the eased value, not the default, is what comes back.
+    let store = MemoryConfigStore::default();
+    h.gui_mut().save_ui_config(&store);
+    let mut restored = crate::Gui::new();
+    assert!(restored.load_ui_config(&store));
+    let back = restored
+        .pane(0)
+        .unwrap()
+        .volume()
+        .unwrap()
+        .camera
+        .vertical_exaggeration();
+    assert!(
+        (back - eased).abs() < 1e-4,
+        "the dragged exaggeration must survive a restart: saved {eased}, \
+         loaded {back}"
     );
 }
 

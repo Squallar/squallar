@@ -17,7 +17,8 @@
 //! its Settings… entry opens the inspector's App › Settings body, and the
 //! stack's `+ Add layer` opens the catalog — the modal above 600 pt, the
 //! sheet's Catalog page below it — whose every tile the walk scrolls on
-//! screen.
+//! screen. The 3D pane's hand-written rows are the one literal inventory —
+//! see [`walk_volume_body`] for why they cannot be derived.
 //! `ScrollArea`s lay content out beyond the viewport, so an item is only
 //! counted once its probe's rect centre is inside the screen —
 //! [`InputHarness::scroll_until`] does the scrolling a user would.
@@ -402,6 +403,58 @@ fn walk_catalog(h: &mut InputHarness, width: WidthClass) {
     h.warm_up();
 }
 
+/// The 3D pane's own rows in the Pane-properties body, reachable at every
+/// width through that width's own route to the body.
+///
+/// Unlike the layer legs, this inventory is a literal list: the volume rows
+/// are hand-written in `render_volume_controls` rather than offered by a
+/// model, so there is nothing to derive them from. The restatement is the
+/// point — the sidebar-order contract
+/// (`kind_specific_blocks_sit_inside_the_shared_sidebar_structure`) pins
+/// these rows on one Expanded screen only, and the block is the body's
+/// *last*: on the Compact sheet its tail (the Map floor checkbox, the Reset
+/// view button) lays out below the fold, where only the scroll this leg
+/// performs proves a phone user can reach it at all. A row added to the
+/// volume body joins this list by review rather than by construction; a row
+/// dropped from the body fails it by name, on the width that lost it.
+fn walk_volume_body(h: &mut InputHarness, width: WidthClass) {
+    h.make_pane_volume(0);
+    if width == WidthClass::Compact {
+        // The phone's route: the bottom bar's Pane item hosts the body as
+        // the sheet's Inspector page.
+        let item = h.bottom_bar().pane.0;
+        h.mouse_click(item.center());
+        h.warm_up();
+    } else {
+        h.open_pane_props();
+    }
+    let scroll_pos = if width == WidthClass::Compact {
+        h.sheet_rect()
+            .expect("the Inspector page is open, so the sheet has a rect")
+            .center()
+    } else {
+        inspector_scroll_pos(h)
+    };
+    for needle in ["Vertical:", "Mode:", "Map floor", "Reset view"] {
+        let found = h.scroll_until(scroll_pos, SCROLL_STEP, MAX_SCROLL_STEPS, |h| {
+            let host = if width == WidthClass::Compact {
+                h.sheet_rect()
+                    .expect("the Inspector page stays open through the scroll")
+            } else {
+                h.inspector_rect()
+                    .expect("the inspector stays open through the scroll")
+            };
+            h.text_painted_in(host, needle)
+        });
+        assert!(
+            found,
+            "volume row {needle:?} was never drawn on screen on {width:?} — \
+             the 3D pane offers it but its body never showed it"
+        );
+    }
+    h.close_inspector();
+}
+
 /// Every visible pane carries its pill row (M5): presence, at every width.
 /// Deliberately not a per-option leg — every option behind the pills is the
 /// inspector's own inventory through the shared pickers (`ui_pills.rs`'s
@@ -444,6 +497,9 @@ fn walk_every_option(size: egui::Vec2, expect: WidthClass) {
     walk_settings(&mut h, expect);
     walk_catalog(&mut h, expect);
     walk_pills(&mut h, expect);
+    // Last, because it converts pane 0 to a 3D pane and the legs above are
+    // claims about a map layout.
+    walk_volume_body(&mut h, expect);
 }
 
 #[test]
