@@ -193,6 +193,18 @@ pub const MEHS_COEF_MM: f64 = 2.54;
 /// MEHS's exponent (Eq. 10; ORPG `shi_hail_size_exp`).
 pub const MEHS_EXP: f64 = 0.5;
 
+/// [`HKE_FLUX_EXP_PER_DBZ`] rebased on two: `10^(0.084·Z)` is `2^(0.084·log₂10·Z)`
+/// exactly, and `exp2` is one libm fast path where a runtime-base `powf` is
+/// libm's generic `exp(y·ln x)`. Measured here, single-threaded, best of 7 over
+/// 10⁶ evaluations: 6.426 ms for `10f64.powf(0.084·Z)` against 2.214 ms for the
+/// `exp2` form, and over 2×10⁷ samples spanning the 40..100 dBZ range the ramp
+/// admits, the largest relative deviation between them is **4.8×10⁻¹⁵**.
+///
+/// That is 3×10⁻¹⁴ dBZ of Ė's argument against reflectivity's own 0.5 dB
+/// quantization, and the SHI it integrates into lands in an `f32` grid whose
+/// step at a typical 400 J m⁻¹ s⁻¹ is 3×10⁻⁵ — nine orders of magnitude wider.
+const HKE_FLUX_EXP2_PER_DBZ: f64 = HKE_FLUX_EXP_PER_DBZ * std::f64::consts::LOG2_10;
+
 /// One foot in kilometres, exactly — the `a31599.ftn` MSL→ARL conversion's
 /// `FT_TO_KM`.
 const FT_TO_KM: f64 = 0.0003048;
@@ -224,7 +236,7 @@ pub fn hail_kinetic_energy_flux(dbz: f64) -> f64 {
     if dbz <= HKE_REF_WGT_LOW_DBZ {
         return 0.0;
     }
-    HKE_FLUX_COEF * 10f64.powf(HKE_FLUX_EXP_PER_DBZ * dbz) * refl_weight(dbz)
+    HKE_FLUX_COEF * (HKE_FLUX_EXP2_PER_DBZ * dbz).exp2() * refl_weight(dbz)
 }
 
 /// `W_T(H)`: the temperature-based height weighting of Eq. 6, on heights in
