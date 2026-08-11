@@ -91,7 +91,8 @@
 //! | the mirror read through `floor_colour` | ±230 km, 2048 px | 0.5777 | (0, 0) texels |
 //! | the same, per-radial wedge widths | ±230 km, 2048 px | 0.5776 | (0, 0) texels |
 //! | the same, extent from the sweep | ±458 km, 2048 px | 0.6789 | (−1, +2) texels |
-//! | the same, side from the extent | **±458 km, 4096 px** | **0.6883** | (−1, +2) texels |
+//! | the same, side from the extent | ±458 km, 4096 px | 0.6883 | (−1, +2) texels |
+//! | the same, gates on the ground | **±458 km, 4096 px** | **0.6882** | (−1, +1) texels |
 //!
 //! The first two are the same measurement to within the mask criterion — the
 //! old one asked "does this texel differ from the ground colour", this one asks
@@ -127,9 +128,26 @@
 //! 38 208), the centroid delta closes a little further (+7.9/−11.0 texels) and
 //! the identity IoU rises to 0.6883.
 //!
-//! **The mapping table still does not discriminate on this volume, and the
-//! resolution was not why.** Whole-box after the restoration: honest 0.6883,
-//! trapezoid 0.6899, linear-v 0.6936 — the two deliberate perturbations score
+//! **The sixth row is the two sides finally measuring the same geometry, and
+//! it moves almost nothing.** The plan view now paints a gate at the ground
+//! range under it, which is the `cos e` the grid has always sampled with — so
+//! the asymmetry named in the residual paragraph below is gone. What it bought
+//! on this volume: identity 0.6883 → 0.6882, painted 36 450 → 36 461, centroid
+//! delta +7.9/−11.0 → +8.0/−11.0. The best translation is the one thing that
+//! did move, (−1, +2) → (−1, +1) texels, i.e. the floor mask sits 0.9 km
+//! closer to where the grid puts the same echo. That is the right direction
+//! and it is *one texel*, so read it as consistent rather than as evidence.
+//!
+//! The reason it is so small is that this instrument is dominated by tilts
+//! where `cos e` is nothing. KDMX's mask is mostly its 0.5° surveillance cut,
+//! where the correction is 0.08 px; the tilts where it is worth 18 px paint a
+//! small fraction of the texels. **A TDWR volume is where this row would
+//! move**, and there is no TDWR in this instrument's corpus.
+//!
+//! **The mapping table still does not discriminate on this volume, and neither
+//! the resolution nor the `cos e` asymmetry was why.** Whole-box now: honest
+//! 0.6882, trapezoid 0.6901, linear-v 0.6933 — the two deliberate
+//! perturbations score
 //! *above* the exact mapping, by +0.0016 and +0.0053 where at 2048 px they
 //! scored above it by +0.0008 and +0.0049. Doubling the resolution moved those
 //! margins by under 0.001 and did not change their sign, which disposes of the
@@ -143,13 +161,15 @@
 //! south-west — 8 440 of the box's 29 252 grid texels are in that one eighth,
 //! and the other three corners hold 0, 0 and 4 — and the honest mapping
 //! already carries a residual against it that has nothing to do with the
-//! mapping: the grid's mask is a **column max** through a box sampled with the
-//! `cos e` slant-to-ground correction, the raster's is a plan view painted
-//! without it, and the two masks differ in area by a quarter (36 450 against
-//! 29 252). A second-order perturbation of a few kilometres inside a
-//! contiguous echo mass costs almost no overlap, and one that happens to nudge
-//! the floor mask along that residual *buys* some. Only `no cos(lat)` — first
-//! order, 1.34× at this latitude — still falls clear (0.4633).
+//! mapping: the grid's mask is a **column max** through the whole box while
+//! the raster's is one tilt's plan view, so the two masks differ in area by a
+//! quarter (36 461 against 29 252). That was previously attributed in part to
+//! the raster omitting `cos e`; it applies it now and the areas did not move,
+//! so the difference is the column max and nothing else. A second-order
+//! perturbation of a few kilometres inside a contiguous echo mass costs almost
+//! no overlap, and one that happens to nudge the floor mask along that
+//! residual *buys* some. Only `no cos(lat)` — first order, 1.34× at this
+//! latitude — still falls clear (0.4634).
 //!
 //! So this table reports registration and coverage on a real volume, and the
 //! discrimination that is *asserted* rather than reported lives in
