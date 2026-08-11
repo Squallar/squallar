@@ -532,10 +532,13 @@ pub fn compute_vil(scan: &Scan) -> VolumetricGrid {
 }
 
 fn compute_vil_impl(scan: &Scan, opts: VilOptions) -> VolumetricGrid {
+    // Slant, for the reason `crate::eet` gives at its own build: this is the
+    // RPG's product 134 reproduced bin for bin, and the RPG bins slant.
     let cube = VolumeCube::build_with_stats(
         scan,
         &[(RadarProduct::Reflectivity, opts.stat)],
         DedupPolicy::FirstOfVolume,
+        crate::volumetric::RangeBinning::Slant,
     );
 
     // The tilts carrying reflectivity, ascending, each at its *actual*

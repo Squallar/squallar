@@ -492,12 +492,12 @@ fn the_assembled_golden_volume_reproduces_the_pinned_digest() {
     let grid = crate::volumetric::compute_echo_tops(&scan);
     assert_eq!(
         crate::volumetric::tests::fnv1a64(&grid),
-        0x4559ce366731e030,
+        0x5385ddeb1814353b,
         "assembling from chunks does not reproduce the volume the archive \
              path decodes"
     );
     let defined: usize = grid.values.iter().flatten().filter(|v| !v.is_nan()).count();
-    assert_eq!(defined, 4680);
+    assert_eq!(defined, 4689);
     assert!(
         grid.values[300][120].is_nan(),
         "the SAILS repeat no longer displaces the first 0.5° sweep, so the \
@@ -528,7 +528,7 @@ fn a_shuffled_chunk_order_assembles_the_same_volume() {
 
     let mut a = assemble(shuffled);
     assert!(a.progress().volume_complete);
-    assert_eq!(digest(&mut a), 0x4559ce366731e030);
+    assert_eq!(digest(&mut a), 0x5385ddeb1814353b);
 }
 
 /// The extreme case of the same property.
@@ -538,7 +538,7 @@ fn a_reversed_chunk_order_assembles_the_same_volume() {
     chunks.reverse();
     let mut a = assemble(chunks);
     assert!(a.progress().volume_complete);
-    assert_eq!(digest(&mut a), 0x4559ce366731e030);
+    assert_eq!(digest(&mut a), 0x5385ddeb1814353b);
 }
 
 /// A re-listed volume re-delivers chunks already seen. Fails for
@@ -554,7 +554,7 @@ fn ingesting_every_chunk_twice_changes_nothing() {
         golden_chunks().len(),
         "a repeat was counted as new work"
     );
-    assert_eq!(digest(&mut a), 0x4559ce366731e030);
+    assert_eq!(digest(&mut a), 0x5385ddeb1814353b);
 }
 
 /// The safety property, stated directly: a cut short of its radial count is

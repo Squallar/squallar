@@ -117,6 +117,147 @@ fn refl_sweep(
     Sweep::new(elevation_number, radials)
 }
 
+/// One steep sweep whose only return is a band a known **slant** range out.
+///
+/// Deliberately not [`refl_sweep`]'s field: a filled volume answers every bin
+/// something, and the question the binning tests ask is *which bin* a single
+/// return lands in. The band is ±2 gates so neither convention can miss it by
+/// rounding.
+fn banded_sweep(elevation_number: u8, elevation_deg: f32, band_slant_km: f64) -> Sweep {
+    let band_gate = (band_slant_km / 0.25).round() as usize;
+    let bytes: Vec<u8> = (0..GATES)
+        .map(|j| {
+            if j.abs_diff(band_gate) <= 2 {
+                // 45 dBZ: well above the 18.3 echo-tops threshold and the
+                // legacy VIL gate, so a bin holding it is unambiguous.
+                ((45.0 * SCALE + OFFSET).round() as i64).clamp(2, 255) as u8
+            } else {
+                0
+            }
+        })
+        .collect();
+    let radials = (0..360)
+        .map(|i| {
+            Radial::new(
+                0,
+                i as u16,
+                i as f32 + 0.5,
+                1.0,
+                RadialStatus::IntermediateRadialData,
+                elevation_number,
+                elevation_deg,
+                Some(MomentData::from_fixed_point(
+                    GATES as u16,
+                    0,
+                    GATE_INTERVAL_M,
+                    8,
+                    SCALE,
+                    OFFSET,
+                    bytes.clone(),
+                )),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        })
+        .collect();
+    Sweep::new(elevation_number, radials)
+}
+
+/// **The two binnings file the same gate in different bins**, which is the
+/// whole of [`RangeBinning`] and the thing that silently corrupts a twin if
+/// it is set wrong.
+///
+/// A 60° gate 40 km out along the beam stands over 20 km of ground —
+/// `cos 60°` is exactly 0.5, so there is no rounding to argue about. The
+/// slant cube must hold it at bin 40 and nothing at 20; the ground cube the
+/// other way round.
+#[test]
+fn a_high_tilt_gate_bins_at_its_ground_range() {
+    let scan = Scan::new(vcp(), vec![banded_sweep(1, 60.0, 40.0)]);
+    let cube = |binning| {
+        VolumeCube::build(
+            &scan,
+            &[RadarProduct::Reflectivity],
+            DedupPolicy::NewestWins,
+            binning,
+        )
+    };
+    let at =
+        |c: &VolumeCube, r: usize| c.grid(0, RadarProduct::Reflectivity).unwrap().values[42][r];
+
+    let slant = cube(RangeBinning::Slant);
+    assert!(
+        !at(&slant, 40).is_nan(),
+        "the slant cube lost the gate at the range it was measured at",
+    );
+    assert!(
+        at(&slant, 20).is_nan(),
+        "the slant cube put the gate over the ground as well as at its range",
+    );
+
+    let ground = cube(RangeBinning::Ground);
+    assert!(
+        !at(&ground, 20).is_nan(),
+        "the ground cube did not file the 40 km gate over the 20 km of ground \
+         it stands on",
+    );
+    assert!(
+        at(&ground, 40).is_nan(),
+        "the ground cube still holds the gate at its slant range",
+    );
+
+    // And the heights moved with it: the ground cube's bin 20 is the height
+    // over 20.5 km of ground, which is where that gate actually is.
+    let h_ground = ground.tilts[0].heights.centre_km[20];
+    let expect = crate::beam::height_at_ground_km(20.5, ground.tilts[0].elevation_deg);
+    assert!(
+        (h_ground - expect).abs() < 1e-12,
+        "the ground cube's bin 20 sits at {h_ground:.4} km, not the \
+         {expect:.4} km over that ground",
+    );
+}
+
+/// **The RPG twins keep slant binning**, which is not a detail: `eet` and
+/// `vil` exist to reproduce products 135 and 134 bin for bin, and the RPG
+/// files a gate under the range it was measured at.
+///
+/// Two steep tilts carrying the same band at 40 km slant. Under slant binning
+/// they stack in one column at bin 40 and the twins answer there. Under
+/// ground binning they would scatter to bins 28 and 25 and bin 40 would be
+/// empty — so this fails loudly the moment either module is "corrected".
+#[test]
+fn the_rpg_twins_keep_slant_binning() {
+    let scan = Scan::new(
+        vcp(),
+        vec![banded_sweep(1, 45.0, 40.0), banded_sweep(2, 50.0, 40.0)],
+    );
+
+    let vil = crate::vil::compute_vil(&scan);
+    assert!(
+        !vil.values[42][40].is_nan(),
+        "DVL lost its column at the slant bin the RPG would have used",
+    );
+    assert!(
+        vil.values[42][28].is_nan(),
+        "DVL answered at the 28 km of ground a 45° / 40 km gate stands over, \
+         which is not where the twin puts it",
+    );
+
+    let eet = crate::eet::compute_eet(&scan, 0.0);
+    assert!(
+        !eet.values[42][40].is_nan(),
+        "EET lost its column at the slant bin the RPG would have used",
+    );
+    assert!(
+        eet.values[42][28].is_nan(),
+        "EET answered over the ground rather than at the gate's own range",
+    );
+}
+
 /// A velocity-only sweep — the Doppler half of a split cut. It carries no
 /// reflectivity, so the reflectivity tilt selection must skip it entirely.
 fn velocity_only_sweep(elevation_number: u8, elevation_deg: f32) -> Sweep {
@@ -194,10 +335,31 @@ pub(crate) fn fnv1a64(grid: &VolumetricGrid) -> u64 {
 }
 
 /// The golden pin for `compute_echo_tops`: the full grid digest, the
-/// defined-cell count, and spot values, captured from the shipped
-/// implementation before the volume cube refactor. Any change to the
-/// gridding, dedup, beam-height or interpolation arithmetic moves at least
-/// the digest; the refactor must reproduce all of it bit for bit.
+/// defined-cell count, and spot values. Any change to the gridding, dedup,
+/// beam-height or interpolation arithmetic moves at least the digest.
+///
+/// # Re-pinned when the cube learned [`RangeBinning`]
+///
+/// Echo tops moved to [`RangeBinning::Ground`], so every figure below is a
+/// column over a **place** rather than over a beam length, and each one moved
+/// the way that predicts:
+///
+/// * digest `0x4559ce366731e030` → `0x5385ddeb1814353b`;
+/// * defined cells 4680 → 4689. Nine more, and upward is the expected
+///   direction: a gate binning `cos e` inward packs the outer edge of each
+///   core into fewer, fuller cells and the columns that were one gate short
+///   of a defined cell now reach one.
+/// * the spot heights all rise slightly, because a cell now asks "how high is
+///   the beam **over** 40.5 km" rather than "how high is a beam 40.5 km
+///   long", and standing over more ground means standing higher: 10.279476 →
+///   10.309390 kft, 10.541305 → 10.572002, 12.955594 → 12.872785 (this one
+///   falls — it is an *interpolated* crossing between two tilts, so it
+///   follows the pair's spacing rather than either height), 7.6337643 →
+///   7.560002.
+///
+/// The two RPG twins are **not** re-pinned, and that is the load-bearing half:
+/// `eet` and `vil` stayed on [`RangeBinning::Slant`], and their suites are
+/// byte-unchanged.
 #[test]
 fn golden_echo_tops_grid_is_pinned() {
     let grid = compute_echo_tops(&golden_scan());
@@ -205,15 +367,15 @@ fn golden_echo_tops_grid_is_pinned() {
     assert_eq!(grid.values.len(), 360);
 
     let defined: usize = grid.values.iter().flatten().filter(|v| !v.is_nan()).count();
-    assert_eq!(defined, 4680, "defined-cell count moved");
-    assert_eq!(fnv1a64(&grid), 0x4559ce366731e030, "grid digest moved");
+    assert_eq!(defined, 4689, "defined-cell count moved");
+    assert_eq!(fnv1a64(&grid), 0x5385ddeb1814353b, "grid digest moved");
 
     // Spot pins, exact to the bit, each hand-checked against the beam
     // height formula. Chosen to cover every code path:
     //
     // * (45, 40): core A crosses at the top tilt, so its top is *clamped*
-    //   to that tilt's centre height — 40.5·sin 4.3° + 40.5²/(2·8494.7)
-    //   = 3.134 km = 10.28 kft.
+    //   to that tilt's centre height over the cell — 40.5·tan 4.3° +
+    //   40.5²/(2·8494.7·cos² 4.3°) = 3.143 km = 10.309 kft.
     // * (45, 41): one cell further out, the same clamp moves with range.
     // * (150, 80): core B is topmost at 2.4° (18.9 dBZ at 3.75 km) and
     //   interpolates toward 3.4° (14.0 dBZ at 5.16 km) — ~3.95 km.
@@ -224,10 +386,10 @@ fn golden_echo_tops_grid_is_pinned() {
     //   reason. A first-of-volume dedup defines this cell and empties the
     //   one above, so these two pin newest-wins, not merely "some sweep".
     let spots = [
-        (45usize, 40usize, 0x412478bcu32), // core A: 10.279476 kft
-        (45, 41, 0x4128a92f),              // core A, next cell: 10.541305
-        (150, 80, 0x414f4a1d),             // core B interpolated: 12.955594
-        (308, 120, 0x40f447cc),            // core C via SAILS repeat: 7.6337643
+        (45usize, 40usize, 0x4124f343u32), // core A: 10.30939 kft
+        (45, 41, 0x412926ec),              // core A, next cell: 10.572002
+        (150, 80, 0x414df6ed),             // core B interpolated: 12.872785
+        (308, 120, 0x40f1eb89),            // core C via SAILS repeat: 7.560002
     ];
     for (az, r, bits) in spots {
         let got = grid.values[az][r];
@@ -307,16 +469,58 @@ fn beam_heights_match_the_hand_computed_four_thirds_model() {
     //   centre = 100.5·sin 0.500° + 100.5²/(2·8494.667) = 1.4715221935 km
     //   bottom = 100.5·sin 0.025° + …                   = 0.6383567720 km
     //   top    = 100.5·sin 0.975° + …                   = 2.3046273386 km
-    let h = BeamHeights::at_elevation(0.5);
+    let h = BeamHeights::at_elevation(0.5, RangeBinning::Slant);
     assert!((h.centre_km[100] - 1.4715221935087277).abs() < 1e-9);
     assert!((h.bottom_km[100] - 0.638356771987057).abs() < 1e-9);
     assert!((h.top_km[100] - 2.3046273386189857).abs() < 1e-9);
     // Cell 0 (centre 0.5 km) on a 19.5° tilt: 0.5·sin 19.5° + 0.5²/(2·Re′).
-    let steep = BeamHeights::at_elevation(19.5);
+    let steep = BeamHeights::at_elevation(19.5, RangeBinning::Slant);
     assert!((steep.centre_km[0] - 0.16691814473225194).abs() < 1e-9);
     assert_eq!(h.centre_km.len(), RANGE_BINS);
     assert_eq!(h.bottom_km.len(), RANGE_BINS);
     assert_eq!(h.top_km.len(), RANGE_BINS);
+}
+
+/// The [`RangeBinning::Ground`] arm answers over the ground the cell covers,
+/// which is a **different point in the air** from the slant arm's — and the
+/// gap grows with the tilt, which is exactly why the two cannot be mixed.
+///
+/// Cell 100 (centre 100.5 km of ground) on a 0.5° tilt, `s·tan e +
+/// s²/(2·Re′·cos²e)`:
+///   centre = 100.5·tan 0.500° + 100.5²/(2·8494.667·cos² 0.500°)
+///          = 1.4716008654 km
+///   bottom = 100.5·tan 0.025° + 100.5²/(2·8494.667·cos² 0.025°)
+///          = 0.6383568893 km
+///   top    = 100.5·tan 0.975° + 100.5²/(2·8494.667·cos² 0.975°)
+///          = 2.3050471627 km
+///
+/// At 0.5° the two arms are 7.9 cm apart at 100 km — nothing. At 19.5° over
+/// 69.5 km of ground they are **1.447 km** apart, because the slant arm is
+/// answering about a beam 69.5 km long, which stands over only 65.5 km of
+/// ground. A hail layer or an echo top taking the wrong one would be
+/// integrating a column that is not the column it was asked about.
+#[test]
+fn the_ground_arm_answers_over_the_ground_and_the_two_diverge_with_tilt() {
+    let g = BeamHeights::at_elevation(0.5, RangeBinning::Ground);
+    assert!((g.centre_km[100] - 1.4716008653654709).abs() < 1e-9);
+    assert!((g.bottom_km[100] - 0.6383568893468486).abs() < 1e-9);
+    assert!((g.top_km[100] - 2.3050471627204763).abs() < 1e-9);
+
+    let slant = BeamHeights::at_elevation(0.5, RangeBinning::Slant);
+    assert!(
+        (g.centre_km[100] - slant.centre_km[100]).abs() < 1e-4,
+        "at 0.5° the two arms must be within a metre of each other",
+    );
+
+    let steep_g = BeamHeights::at_elevation(19.5, RangeBinning::Ground);
+    let steep_s = BeamHeights::at_elevation(19.5, RangeBinning::Slant);
+    let gap = steep_g.centre_km[69] - steep_s.centre_km[69];
+    assert!(
+        (gap - 1.447316631030965).abs() < 1e-9,
+        "at 19.5° over 69.5 km the arms must stand 1.447 km apart; they are \
+         {gap:.6} km",
+    );
+    assert_eq!(g.centre_km.len(), RANGE_BINS);
 }
 
 /// Both dedup policies, on the same volume, disagree exactly where they
@@ -337,11 +541,13 @@ fn dedup_policies_pick_opposite_ends_of_a_sails_pair() {
         &scan,
         &[RadarProduct::Reflectivity],
         DedupPolicy::NewestWins,
+        RangeBinning::Slant,
     );
     let first = VolumeCube::build(
         &scan,
         &[RadarProduct::Reflectivity],
         DedupPolicy::FirstOfVolume,
+        RangeBinning::Slant,
     );
     assert_eq!(newest.tilts.len(), 2);
     assert_eq!(first.tilts.len(), 2);
@@ -411,6 +617,7 @@ fn the_radial_nearest_the_cell_centre_wins() {
         &scan,
         &[RadarProduct::Reflectivity],
         DedupPolicy::NewestWins,
+        RangeBinning::Slant,
     );
     let g = cube.grid(0, RadarProduct::Reflectivity).unwrap();
     assert!(
@@ -439,6 +646,7 @@ fn nan_propagation_keeps_holes_and_drops_sentinels() {
         &scan,
         &[RadarProduct::DifferentialReflectivity],
         DedupPolicy::NewestWins,
+        RangeBinning::Slant,
     );
     let g = cube
         .grid(0, RadarProduct::DifferentialReflectivity)
@@ -476,6 +684,7 @@ fn cell_statistics_dispatch_per_moment() {
             RadarProduct::DifferentialReflectivity,
         ],
         DedupPolicy::NewestWins,
+        RangeBinning::Slant,
     );
     let z = cube.grid(0, RadarProduct::Reflectivity).unwrap().values[7][0];
     let zdr = cube
@@ -491,6 +700,7 @@ fn cell_statistics_dispatch_per_moment() {
         &scan,
         &[(RadarProduct::Reflectivity, CellStat::Max)],
         DedupPolicy::NewestWins,
+        RangeBinning::Slant,
     );
     let m = peaked.grid(0, RadarProduct::Reflectivity).unwrap().values[7][0];
     assert_eq!(m, 40.0, "Max must keep the peak");
@@ -543,6 +753,7 @@ fn a_nan_gate_never_reaches_the_memo() {
         &scan,
         &[RadarProduct::Reflectivity],
         DedupPolicy::NewestWins,
+        RangeBinning::Slant,
     );
     let g = cube.grid(0, RadarProduct::Reflectivity).unwrap();
     for (r, v) in g.values[42].iter().enumerate() {
@@ -684,6 +895,7 @@ fn a_split_cut_supplies_each_moment_from_its_own_sweep() {
         &scan,
         &[RadarProduct::Reflectivity, RadarProduct::Velocity],
         DedupPolicy::NewestWins,
+        RangeBinning::Slant,
     );
     assert_eq!(cube.tilts.len(), 2);
 
@@ -767,19 +979,26 @@ fn the_tilts_the_pool_builds_are_the_tilts_a_serial_walk_builds() {
     // tilts.
     let scan = golden_scan();
 
-    for stat in [CellStat::LinearZMean, CellStat::Mean, CellStat::Max] {
+    // Both [`RangeBinning`] arms, because the binning reaches inside each task
+    // twice — the range scale a grid is filed at and the heights the tilt
+    // carries — and a determinism claim proved for one filing rule says nothing
+    // about the other.
+    for (stat, binning) in [CellStat::LinearZMean, CellStat::Mean, CellStat::Max]
+        .into_iter()
+        .flat_map(|s| [RangeBinning::Slant, RangeBinning::Ground].map(|b| (s, b)))
+    {
         let moments: Vec<(RadarProduct, CellStat)> =
             [RadarProduct::Reflectivity, RadarProduct::Velocity]
                 .into_iter()
                 .map(|m| (m, stat))
                 .collect();
         for policy in [DedupPolicy::NewestWins, DedupPolicy::FirstOfVolume] {
-            let at = format!("{stat:?} under {policy:?}");
+            let at = format!("{stat:?} under {policy:?}, {binning:?} bins");
 
             let (chosen, keys) = sweep_selection(&scan, &moments, policy);
             let serial: Vec<Tilt> = keys
                 .into_iter()
-                .map(|key| tilt_at(&scan, &moments, &chosen, key))
+                .map(|key| tilt_at(&scan, &moments, &chosen, key, binning))
                 .collect();
 
             // A one-tilt cube cannot be out of order, and a cube of nothing
@@ -800,7 +1019,7 @@ fn the_tilts_the_pool_builds_are_the_tilts_a_serial_walk_builds() {
                 "{at}: only {defined} cells carry data; this proves nothing",
             );
 
-            let build = || VolumeCube::build_with_stats(&scan, &moments, policy);
+            let build = || VolumeCube::build_with_stats(&scan, &moments, policy, binning);
             let pooled = build();
             let one_thread = one.install(build);
             let repeat = build();

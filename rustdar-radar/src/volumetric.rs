@@ -9,6 +9,26 @@
 //! The RPG's EET/DVL products use coarser grids and beam-top conventions; the
 //! interpolated echo tops here interpolate between tilt centers, calibrated
 //! against a reference implementation's readouts.
+//!
+//! # Two kinds of consumer, and [`RangeBinning`] is the seam
+//!
+//! A gate is measured out along the beam. Which 1-km bin it belongs in depends
+//! on what the product asking is *for*, and the two answers are not
+//! reconcilable:
+//!
+//! * [`compute_echo_tops`] and [`crate::hail`] are this display's own
+//!   products. They stack tilts into a column and ask what is above a place,
+//!   so a gate belongs over the ground it sits over — [`RangeBinning::Ground`].
+//!   At 19.5° that moves it 5.7 % inward, four bins at 70 km.
+//! * [`crate::eet`] and [`crate::vil`] exist to **reproduce** the RPG's own
+//!   EET and DVL products bin for bin, and the RPG bins slant. They take
+//!   [`RangeBinning::Slant`], and correcting them would not make them righter
+//!   — it would make the twin comparison that validates them measure
+//!   registration instead of physics.
+//!
+//! The heights travel with the bins ([`BeamHeights::at_elevation`] takes the
+//! same parameter), because a cell filed under a ground range whose altitude
+//! came from a slant range describes two different points in the air.
 
 use crate::par::*;
 use crate::types::RadarProduct;
@@ -106,6 +126,67 @@ pub enum DedupPolicy {
     FirstOfVolume,
 }
 
+/// Which range a cube's 1-km bins are indexed by: the slant range a gate was
+/// measured at, or the ground range under it.
+///
+/// The two answer different questions, and both are needed here. A product
+/// that says *where something is* wants the ground — a 19.5° gate at 60 km
+/// slant sits over 56.5 km of ground, and an echo-top column that binned it at
+/// 60 would be stacking it over a different column's reflectivity. A product
+/// built to **reproduce the RPG's** wants whatever the RPG did, which is
+/// slant: its derived products index by the gate's own range bin, and a twin
+/// scored bin-for-bin against one has to make the same choice or the score
+/// measures the registration rather than the physics.
+///
+/// So this is not a correctness switch with a right setting. It is a statement
+/// about which grid the caller is trying to be, and the call sites divide
+/// exactly on that line — [`compute_echo_tops`] and [`crate::hail`] take
+/// [`Ground`](Self::Ground), [`crate::eet`] and [`crate::vil`] take
+/// [`Slant`](Self::Slant).
+///
+/// The heights go with the bins. [`BeamHeights::at_elevation`] takes this too,
+/// because a cell indexed by ground range whose height was computed from a
+/// slant range is a cell whose two coordinates describe two different points
+/// in the air.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeBinning {
+    /// Bin `r` holds the gates whose **slant** range falls in `[r, r+1)` km.
+    Slant,
+    /// Bin `r` holds the gates whose **ground** range — slant × `cos e` of the
+    /// sweep's median elevation — falls in `[r, r+1)` km.
+    Ground,
+}
+
+impl RangeBinning {
+    /// The factor a sweep's slant ranges are multiplied by to index this
+    /// binning: 1 for [`Slant`](Self::Slant), `cos e` of the sweep's median
+    /// elevation for [`Ground`](Self::Ground).
+    ///
+    /// The median for the same reason [`sweep_elevation_deg`] exists: a
+    /// settling first radial would rebin a whole sweep by a fifth of a degree.
+    /// An empty or non-finite sweep falls back to 1, which bins it where it
+    /// was measured rather than collapsing it onto the site.
+    fn range_scale(self, radials: &[Radial]) -> f64 {
+        match (self, sweep_elevation_deg(radials)) {
+            (Self::Ground, Some(e)) if e.is_finite() => e.to_radians().cos().clamp(0.0, 1.0),
+            _ => 1.0,
+        }
+    }
+
+    /// Beam-centre height, km, over a cell of this binning at `range_km`.
+    ///
+    /// The pair to [`range_scale`](Self::range_scale), and the reason both
+    /// live on the enum: a cube whose bins moved but whose heights did not
+    /// would put a gate's reflectivity at one point and its altitude at
+    /// another, which is a silent error in every column scan above it.
+    fn height_km(self, range_km: f64, elev_deg: f64) -> f64 {
+        match self {
+            Self::Slant => beam_height_km(range_km, elev_deg),
+            Self::Ground => crate::beam::height_at_ground_km(range_km, elev_deg),
+        }
+    }
+}
+
 /// One moment's 360×230 grid on one tilt, with the sweep it came from.
 pub struct MomentGrid {
     /// `[az_deg][range_km]`, `NaN` where no gate carried data.
@@ -129,12 +210,25 @@ pub struct BeamHeights {
 
 impl BeamHeights {
     /// Heights for a tilt centred on `elev_deg`, the bottom and top at half
-    /// the half-power beamwidth below and above it.
-    fn at_elevation(elev_deg: f64) -> Self {
+    /// the half-power beamwidth below and above it, over the cells of
+    /// `binning`.
+    ///
+    /// `binning` is what makes a cell's two coordinates describe one point:
+    /// under [`RangeBinning::Ground`] cell `r` holds the gates over `r + 0.5`
+    /// km of *ground*, so its height is [`crate::beam::height_at_ground_km`]
+    /// there and not the height of a beam `r + 0.5` km long.
+    ///
+    /// The flanks are the WSR-88D's. They are the one thing here a TDWR's
+    /// narrower antenna would change, and nothing in production reads them —
+    /// [`compute_echo_tops`] scans `centre_km` alone, and the one place a
+    /// beamwidth reaches a rendered number is [`crate::hail`]'s top-layer cap,
+    /// which takes the site's own. A product that starts reading `bottom_km`
+    /// or `top_km` needs this to take a beamwidth too.
+    fn at_elevation(elev_deg: f64, binning: RangeBinning) -> Self {
         let half = HALF_POWER_BEAMWIDTH_DEG / 2.0;
         let at = |e: f64| -> Vec<f64> {
             (0..RANGE_BINS)
-                .map(|r| beam_height_km(r as f64 + 0.5, e))
+                .map(|r| binning.height_km(r as f64 + 0.5, e))
                 .collect()
         };
         Self {
@@ -174,18 +268,28 @@ pub struct VolumeCube {
 impl VolumeCube {
     /// Build the cube with each moment's default statistic
     /// ([`CellStat::for_moment`]).
-    pub fn build(scan: &Scan, moments: &[RadarProduct], policy: DedupPolicy) -> Self {
+    pub fn build(
+        scan: &Scan,
+        moments: &[RadarProduct],
+        policy: DedupPolicy,
+        binning: RangeBinning,
+    ) -> Self {
         let with_stats: Vec<(RadarProduct, CellStat)> = moments
             .iter()
             .map(|&m| (m, CellStat::for_moment(m)))
             .collect();
-        Self::build_with_stats(scan, &with_stats, policy)
+        Self::build_with_stats(scan, &with_stats, policy, binning)
     }
 
     /// Build the cube with an explicit statistic per moment.
     ///
+    /// `binning` decides which range a gate is filed under and, with it, the
+    /// heights on every [`Tilt`] — see [`RangeBinning`] for why that is a
+    /// caller's decision rather than this module's.
+    ///
     /// The tilts are built **across rayon's pool**, one task per elevation.
-    /// [`tilt_at`] is a pure function of `(scan, moments, chosen, key)` — see
+    /// [`tilt_at`] is a pure function of `(scan, moments, chosen, key,
+    /// binning)` — see
     /// its own note for why, and [`LinearZMemo`] for the table that would
     /// otherwise be shared — so the tasks touch nothing in common but
     /// immutable inputs, and no float crosses between them: **nothing in the
@@ -216,12 +320,13 @@ impl VolumeCube {
         scan: &Scan,
         moments: &[(RadarProduct, CellStat)],
         policy: DedupPolicy,
+        binning: RangeBinning,
     ) -> Self {
         let (chosen, keys) = sweep_selection(scan, moments, policy);
 
         let tilts = keys
             .into_par_iter()
-            .map(|key| tilt_at(scan, moments, &chosen, key))
+            .map(|key| tilt_at(scan, moments, &chosen, key, binning))
             .collect();
 
         Self {
@@ -310,15 +415,18 @@ fn sweep_selection(
 ///
 /// **A pure function of its arguments, and it has to stay one**: this is the
 /// unit of work [`VolumeCube::build_with_stats`] hands to rayon, so the
-/// signature is the claim — three shared references and a key in, one owned
-/// [`Tilt`] out, nothing read that another tilt writes and nothing carried
-/// between calls. [`sweep_to_grid`] is pure for the same reason and says so at
+/// signature is the claim — three shared references, a key and a [`Copy`]
+/// binning in, one owned [`Tilt`] out, nothing read that another tilt writes
+/// and nothing carried between calls. `binning` is the caller's for the whole
+/// cube, so every tilt is filed and measured the same way whichever thread
+/// builds it. [`sweep_to_grid`] is pure for the same reason and says so at
 /// [`LinearZMemo`], whose table lives and dies inside a single call.
 fn tilt_at(
     scan: &Scan,
     moments: &[(RadarProduct, CellStat)],
     chosen: &[Vec<SweepChoice>],
     key: f64,
+    binning: RangeBinning,
 ) -> Tilt {
     let grids = moments
         .iter()
@@ -327,16 +435,19 @@ fn tilt_at(
             chosen[mi]
                 .iter()
                 .find(|(k, ..)| (k - key).abs() < 0.05)
-                .map(|&(_, si, displaced)| MomentGrid {
-                    values: sweep_to_grid(scan.sweeps()[si].radials(), moment, stat),
-                    sweep_index: si,
-                    displaced_repeat: displaced,
+                .map(|&(_, si, displaced)| {
+                    let radials = scan.sweeps()[si].radials();
+                    MomentGrid {
+                        values: sweep_to_grid(radials, moment, stat, binning.range_scale(radials)),
+                        sweep_index: si,
+                        displaced_repeat: displaced,
+                    }
                 })
         })
         .collect();
     Tilt {
         elevation_deg: key,
-        heights: BeamHeights::at_elevation(key),
+        heights: BeamHeights::at_elevation(key, binning),
         grids,
     }
 }
@@ -460,7 +571,17 @@ impl LinearZMemo {
 /// azimuth cell the radial nearest the cell centre, per 1-km range cell `stat`
 /// over the gates falling in it. `NaN` where no gate carried data; gate values
 /// ≥ 999 are the decoder's sentinels and are dropped.
-fn sweep_to_grid(radials: &[Radial], moment: RadarProduct, stat: CellStat) -> Vec<Vec<f32>> {
+///
+/// `range_scale` is [`RangeBinning::range_scale`] — 1 to file a gate under the
+/// range it was measured at, `cos e` to file it under the ground it sits over.
+/// A parameter rather than a re-derivation from `radials` because it is one
+/// number per sweep and this runs once per moment per tilt.
+fn sweep_to_grid(
+    radials: &[Radial],
+    moment: RadarProduct,
+    stat: CellStat,
+    range_scale: f64,
+) -> Vec<Vec<f32>> {
     let mut grid = vec![vec![f32::NAN; RANGE_BINS]; 360];
     // nearest radial per whole-degree centre
     let mut nearest: Vec<Option<usize>> = vec![None; 360];
@@ -502,7 +623,7 @@ fn sweep_to_grid(radials: &[Radial], moment: RadarProduct, stat: CellStat) -> Ve
             if z >= 999.0 || z.is_nan() {
                 continue;
             }
-            let r = (fg + j as f64 * gi) as usize;
+            let r = ((fg + j as f64 * gi) * range_scale) as usize;
             if r >= RANGE_BINS {
                 continue;
             }
@@ -536,7 +657,15 @@ fn sweep_to_grid(radials: &[Radial], moment: RadarProduct, stat: CellStat) -> Ve
 /// [`ET_THRESHOLD_DBZ`], scanning tilts top-down per column of a
 /// newest-wins reflectivity [`VolumeCube`].
 pub fn compute_echo_tops(scan: &Scan) -> VolumetricGrid {
-    let cube = VolumeCube::build(scan, &[RadarProduct::Reflectivity], DedupPolicy::NewestWins);
+    // Ground: an echo top is the height of a column over a *place*, so the
+    // tilts stacked into it have to be over the same place. See
+    // [`RangeBinning`].
+    let cube = VolumeCube::build(
+        scan,
+        &[RadarProduct::Reflectivity],
+        DedupPolicy::NewestWins,
+        RangeBinning::Ground,
+    );
     // The tilts actually carrying reflectivity, bottom-up.
     let tilts: Vec<(&BeamHeights, &Vec<Vec<f32>>)> = cube
         .tilts

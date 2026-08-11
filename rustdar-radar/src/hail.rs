@@ -98,8 +98,11 @@
 //!   see SAILS revisits). The cell code integrates a *component maximum*
 //!   instead; a column has no component to take a maximum over.
 //! * **Column geometry** — all in the crate's 4/3-earth beam model
-//!   ([`crate::volumetric`]), at the cell centre `r + 0.5` km: tilt `i`'s
-//!   layer runs between the **midpoints of adjacent beam-centre heights**,
+//!   ([`crate::volumetric`]), at the cell centre `r + 0.5` km **of ground**,
+//!   because the cube is built on [`crate::volumetric::RangeBinning::Ground`]
+//!   and a layer's depth has to be the depth of the column it is filed under:
+//!   tilt `i`'s layer runs between the **midpoints of adjacent beam-centre
+//!   heights over that ground**,
 //!   the lowest layer starts at the ground, and the highest is capped at the
 //!   beam's **half-power upper flank** (+0.475°) — the storm is never
 //!   extrapolated past the volume ceiling. The layer straddling `H₀` is
@@ -143,8 +146,8 @@
 use crate::sounding::EnvHeights;
 use crate::types::RadarProduct;
 use crate::volumetric::{
-    CellStat, DedupPolicy, HALF_POWER_BEAMWIDTH_DEG, RANGE_BINS, VolumeCube, VolumetricGrid,
-    beam_height_km, sweep_elevation_deg,
+    CellStat, DedupPolicy, HALF_POWER_BEAMWIDTH_DEG, RANGE_BINS, RangeBinning, VolumeCube,
+    VolumetricGrid, sweep_elevation_deg,
 };
 use nexrad_model::data::Scan;
 
@@ -311,11 +314,18 @@ pub struct HailGrids {
 /// heights in km ARL at every range cell centre: midpoints of adjacent
 /// 4/3-model beam-centre heights, ground below the lowest, the half-power
 /// upper flank above the highest. Empty for an empty ladder.
+///
+/// The cell centres are **ground** ranges, matching the
+/// [`RangeBinning::Ground`] cube [`compute_hail`] builds. A ladder measured
+/// along the beam over cells filed by the ground under it would give every
+/// layer the depth of a column standing somewhere else — and depth is what
+/// SHI integrates, so the error would land directly in the product rather
+/// than in its geometry.
 fn layer_bounds_km(elevs_deg: &[f64]) -> Vec<Vec<(f64, f64)>> {
     let n = elevs_deg.len();
     let centre = |e: f64| -> Vec<f64> {
         (0..RANGE_BINS)
-            .map(|r| beam_height_km(r as f64 + 0.5, e))
+            .map(|r| crate::beam::height_at_ground_km(r as f64 + 0.5, e))
             .collect()
     };
     let centres: Vec<Vec<f64>> = elevs_deg.iter().map(|&e| centre(e)).collect();
@@ -379,10 +389,17 @@ pub fn compute_hail(
     let (h0_km, hm20_km) = env_arl_km(env, radar_height_ft);
     let wt = warning_threshold(h0_km);
 
+    // Ground, like `compute_echo_tops` and unlike the two RPG twins: SHI is a
+    // vertical integral over a column, so the tilts it sums have to be over
+    // one place. There is no gridded RPG twin for POSH or MEHS to hold this
+    // to a slant convention (the RPG publishes hail cell-based, product 59),
+    // which is the other half of why the choice is free here and is not in
+    // `eet`/`vil`. See `volumetric::RangeBinning`.
     let cube = VolumeCube::build_with_stats(
         scan,
         &[(RadarProduct::Reflectivity, CellStat::LinearZMean)],
         DedupPolicy::FirstOfVolume,
+        RangeBinning::Ground,
     );
 
     // The tilts carrying reflectivity, ascending, each at its *actual*

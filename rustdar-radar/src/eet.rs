@@ -177,10 +177,16 @@ struct TiltView<'a> {
 /// [`Datum::Feedhorn`] for a render. The feedhorn, because every height this
 /// adds it to is measured above the antenna.
 pub fn compute_eet(scan: &Scan, radar_height_ft: f64) -> EetGrid {
+    // Slant, and deliberately so. This module reproduces the RPG's product
+    // 135 bin for bin and the RPG files a gate under the range it was measured
+    // at; binning on the ground here would move every bin of the twin
+    // comparison that is the only evidence this module is right. See
+    // `volumetric::RangeBinning`.
     let cube = VolumeCube::build_with_stats(
         scan,
         &[(RadarProduct::Reflectivity, CellStat::Max)],
         DedupPolicy::FirstOfVolume,
+        crate::volumetric::RangeBinning::Slant,
     );
     let radar_height_kft = radar_height_ft * FT_TO_KFT;
 
