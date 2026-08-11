@@ -1816,8 +1816,108 @@ fn a_pane_that_stops_showing_a_floor_stops_being_registered() {
     );
 }
 
-/// The pane's map really is drawn — into the strip, exactly as the same pane
-/// drew it on the glass, and no longer on the glass.
+/// A radar site whose label is map content on this pane and nothing else.
+///
+/// Vance AFB, about 110 km north-west of KTLX, so on a pane centred there at
+/// [`WITNESS_ZOOM`] it lands well inside — nowhere near the 100-point cull
+/// margin `visible_radar_sites` also draws labels into, which reach outside
+/// the strip and are only clipped away later.
+///
+/// Deliberately **not** KTLX: the pane's own site is printed by the pill row
+/// too, and a witness two different things draw cannot say which one drew it.
+const GROUND_WITNESS_SITE: &str = "KVNX";
+
+/// The unit label at the head of the pane's colour scale, which is the one
+/// mark on the pane that only the legend draws.
+const LEGEND_WITNESS: &str = "dBZ";
+
+/// Zoom the ground witness needs. `handle_radar_site_interactions` draws site
+/// names only from zoom 5 up, and a pane's default is 4.
+const WITNESS_ZOOM: f64 = 7.0;
+
+/// One pane, one scan, the radar-site labels switched on and the map zoomed in
+/// far enough to draw them.
+///
+/// Those labels are the only **geography** a headless frame paints: it fetches
+/// no tiles and uploads no radar texture, and both are drawn as textures
+/// anyway, while the `RADARS` table is compiled in and its names are drawn as
+/// per-frame text. Without them a 3D pane's strip is empty — the pane's legend
+/// used to be the only thing in it, and the legend is exactly what has just
+/// been moved out — so both tests below would compare two empty sets and pass
+/// having proved nothing.
+fn ground_witness_harness() -> (InputHarness, Arc<StubVolumePainter>) {
+    let painter = Arc::new(StubVolumePainter::painting());
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.set_pane_count(1);
+    h.load_scan("KTLX");
+    h.gui_mut().set_volume_painter(Some(painter.clone()));
+    h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
+    h.gui_mut()
+        .pane_mut(0)
+        .expect("pane 0")
+        .map_memory
+        .set_zoom(WITNESS_ZOOM)
+        .expect("walkers rejected the witness zoom");
+    h.frames_for(2, FRAME_DT);
+    (h, painter)
+}
+
+/// Where a mark landed inside some rect, rounded to whole points:
+/// `(min x, min y, max x, max y)`.
+type At = (i32, i32, i32, i32);
+
+/// One mark a frame painted: where it landed, and what it said — empty for a
+/// painted rect, which says nothing.
+type Mark = (At, String);
+
+/// Every mark the last frame painted inside `region`, in coordinates relative
+/// to it: painted rects, and text runs with what they said.
+///
+/// Text as well as rects because the two halves of a pane's content are drawn
+/// with different primitives — the legend is mostly filled rects, the site
+/// labels are text — and a probe that saw only one of them would be blind to
+/// whichever half it was pointed at.
+fn local_marks(h: &InputHarness, region: egui::Rect) -> Vec<Mark> {
+    let local = |rect: egui::Rect| {
+        let l = rect.translate(-region.min.to_vec2());
+        (
+            l.min.x.round() as i32,
+            l.min.y.round() as i32,
+            l.max.x.round() as i32,
+            l.max.y.round() as i32,
+        )
+    };
+    let mut marks: Vec<Mark> = h
+        .painted_rects()
+        .iter()
+        .filter(|rect| region.contains_rect(**rect))
+        .map(|rect| (local(*rect), String::new()))
+        .chain(
+            h.painted_text_rects()
+                .into_iter()
+                .filter(|(rect, _)| region.contains_rect(*rect))
+                .map(|(rect, text)| (local(rect), text)),
+        )
+        .collect();
+    marks.sort_unstable();
+    marks
+}
+
+/// The marks of one named text run, out of a set [`local_marks`] produced.
+///
+/// A run and not a single mark: every label on the map is painted twice, once
+/// as its own shadow (`draw_shadowed_text`), so a witness that took one of them
+/// would be picking a half at random.
+fn marks_saying(marks: &[Mark], text: &str) -> Vec<At> {
+    marks
+        .iter()
+        .filter(|(_, said)| said == text)
+        .map(|(at, _)| *at)
+        .collect()
+}
+
+/// The pane's **ground** really is drawn — into the strip, exactly as the same
+/// pane drew it on the glass, and no longer on the glass.
 ///
 /// Every other test here is about geometry the arm *reported*. This one is
 /// about geometry the tessellator was actually handed, which is the difference
@@ -1827,7 +1927,7 @@ fn a_pane_that_stops_showing_a_floor_stops_being_registered() {
 ///
 /// It is written as a **comparison against the same pane as a map** rather than
 /// as a count, because a count cannot tell a map from a stray highlight. The
-/// same pane is rendered both ways at the same size and the painted rects are
+/// same pane is rendered both ways at the same size and the painted marks are
 /// compared in rect-local coordinates, so the claim is that every mark in the
 /// strip is a mark the map pane made at the same place within its own rect.
 ///
@@ -1835,9 +1935,13 @@ fn a_pane_that_stops_showing_a_floor_stops_being_registered() {
 /// map pane's rect also has the shell's chrome over it — the layers panel, the
 /// status bar, the pills — which is drawn above the pane rather than inside
 /// `Map::show`, is not the same for a 3D pane as for a map, and must **not** be
-/// copied onto a floor. So the strip is a subset, and the two assertions that
-/// stop a subset being vacuous are that it is non-empty and that it carries the
-/// pane's own legend, which only `render_pane_map_content` draws.
+/// copied onto a floor. It now also has the pane's own legend, which is chrome
+/// too and stays behind for the same reason (see
+/// [`the_panes_legend_is_painted_onto_the_glass_and_never_into_the_strip`]). So
+/// the strip is a subset, and what stops a subset being vacuous is a named
+/// piece of geography — [`GROUND_WITNESS_SITE`] — required *in* the strip and
+/// required *absent* from the glass, in both cases at the local position the
+/// plan view drew it at.
 ///
 /// Tiles and the radar raster are absent from both sides — a headless frame
 /// fetches no tiles and uploads no textures — so what is being compared is the
@@ -1846,44 +1950,22 @@ fn a_pane_that_stops_showing_a_floor_stops_being_registered() {
 /// in step by hand.
 #[test]
 fn the_panes_map_is_painted_into_the_strip_and_not_onto_the_glass() {
-    /// Every painted rect inside `region`, in coordinates relative to it.
-    fn local_rects(h: &InputHarness, region: egui::Rect) -> Vec<(i32, i32, i32, i32)> {
-        let mut rects: Vec<(i32, i32, i32, i32)> = h
-            .painted_rects()
-            .iter()
-            .filter(|rect| region.contains_rect(**rect))
-            .map(|rect| {
-                let local = rect.translate(-region.min.to_vec2());
-                (
-                    local.min.x.round() as i32,
-                    local.min.y.round() as i32,
-                    local.max.x.round() as i32,
-                    local.max.y.round() as i32,
-                )
-            })
-            .collect();
-        rects.sort_unstable();
-        rects
-    }
-
-    let painter = Arc::new(StubVolumePainter::painting());
-    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
-    h.set_pane_count(1);
-    h.load_scan("KTLX");
-    h.gui_mut().set_volume_painter(Some(painter.clone()));
-    h.frames_for(2, FRAME_DT);
+    let (mut h, _painter) = ground_witness_harness();
 
     // The same pane, as a map, on the glass.
     let pane_rect = h.pane_rects()[0];
-    let as_a_map = local_rects(&h, pane_rect);
+    let as_a_map = local_marks(&h, pane_rect);
     assert!(
         as_a_map.len() > 1,
         "the map pane painted nothing inside its own rect, so the comparison \
          below would hold between two empty sets",
     );
+    let witness = marks_saying(&as_a_map, GROUND_WITNESS_SITE);
     assert!(
-        h.text_painted_in(pane_rect, "dBZ"),
-        "the map pane drew no legend, so its absence below would prove nothing",
+        !witness.is_empty(),
+        "the map pane never drew {GROUND_WITNESS_SITE}, so requiring it below \
+         would prove nothing; it painted {:?}",
+        h.painted_text_strings_in(pane_rect),
     );
 
     h.make_pane_volume(0);
@@ -1894,7 +1976,7 @@ fn the_panes_map_is_painted_into_the_strip_and_not_onto_the_glass() {
         .first()
         .expect("the 3D pane asked for no strip at all");
 
-    let in_strip = local_rects(&h, strip);
+    let in_strip = local_marks(&h, strip);
     assert!(
         !in_strip.is_empty(),
         "nothing was painted into the strip {strip:?}: the mirror would copy \
@@ -1902,7 +1984,7 @@ fn the_panes_map_is_painted_into_the_strip_and_not_onto_the_glass() {
     );
     let stray: Vec<_> = in_strip
         .iter()
-        .filter(|rect| !as_a_map.contains(rect))
+        .filter(|mark| !as_a_map.contains(mark))
         .collect();
     assert!(
         stray.is_empty(),
@@ -1910,16 +1992,110 @@ fn the_panes_map_is_painted_into_the_strip_and_not_onto_the_glass() {
          is drawing something other than the map it is supposed to be",
         stray.len(),
     );
-    assert!(
-        h.text_painted_in(strip, "dBZ"),
-        "the strip did not get the pane's own map content — only \
-         `render_pane_map_content` draws that legend",
-    );
+    for at in &witness {
+        assert!(
+            in_strip.contains(&(*at, GROUND_WITNESS_SITE.to_owned())),
+            "the strip did not get the pane's own map content: \
+             {GROUND_WITNESS_SITE} is missing from {at:?}, where the same pane \
+             drew it as a map",
+        );
+    }
 
     // And none of it is on the glass, under the volume.
+    let on_glass = local_marks(&h, pane_rect);
+    for at in &witness {
+        assert!(
+            !on_glass.contains(&(*at, GROUND_WITNESS_SITE.to_owned())),
+            "the pane's map is still being drawn at {pane_rect:?}, on the \
+             glass, over the volume it is meant to be the ground under: \
+             {GROUND_WITNESS_SITE} is at {at:?}",
+        );
+    }
+}
+
+/// The mirror of the test above, for the other half of the pane's content: the
+/// colour scale is chrome, so it belongs **on the glass** in ordinary 2D and
+/// must never reach the strip.
+///
+/// A legend in the strip is a legend the raymarcher copies onto the floor,
+/// where it is painted flat into the ground in perspective — shrinking with
+/// distance, swinging round with the camera and unreadable from most of them.
+/// That is what this pins, and it pins it in both directions at once, because
+/// only one of the two is a regression anybody would notice: a legend that
+/// stopped being drawn at all would pass a "not in the strip" assertion.
+///
+/// The placement claim is the strong half. The legend's marks are taken from
+/// the pane drawn **as a map** and then required at the *same rect-local
+/// positions* once the pane is a volume — so "the same widget under the same
+/// placement rules" is asserted against the plan view itself rather than
+/// against a copy of the geometry written down here. A 3D pane that drew its
+/// own legend a few points off, or on the other edge, or at the floor's scale,
+/// fails.
+#[test]
+fn the_panes_legend_is_painted_onto_the_glass_and_never_into_the_strip() {
+    let (mut h, _painter) = ground_witness_harness();
+
+    let pane_rect = h.pane_rects()[0];
+    let as_a_map = local_marks(&h, pane_rect);
+    let legend = marks_saying(&as_a_map, LEGEND_WITNESS);
     assert!(
-        !h.text_painted_in(pane_rect, "dBZ"),
-        "the pane's map is still being drawn at {pane_rect:?}, on the glass, \
-         over the volume it is meant to be the ground under",
+        !legend.is_empty(),
+        "the map pane drew no legend, so requiring one below would prove \
+         nothing; it painted {:?}",
+        h.painted_text_strings_in(pane_rect),
+    );
+    // The bar itself, not just its title: `color_scale_strips` counts the 2×20
+    // strips `render_color_scale` lays the ramp down as, along each axis. A
+    // legend reduced to its unit label would still satisfy the marks above.
+    let bar_as_a_map = h.color_scale_strips(pane_rect);
+    assert!(
+        bar_as_a_map.0 + bar_as_a_map.1 > 0,
+        "the map pane painted no colour-scale strips at all, so the counts \
+         below would agree at zero",
+    );
+
+    h.make_pane_volume(0);
+    h.frames_for(2, FRAME_DT);
+    let strip = *h
+        .gui_mut()
+        .mirror_source_rects()
+        .first()
+        .expect("the 3D pane asked for no strip at all");
+    let on_glass = local_marks(&h, pane_rect);
+    let in_strip = local_marks(&h, strip);
+
+    // The strip is drawing *something*, so "the legend is not in it" is a
+    // statement about the legend rather than about an empty rect.
+    assert!(
+        !in_strip.is_empty(),
+        "nothing reached the strip at all, so its lack of a legend says nothing",
+    );
+
+    for at in &legend {
+        assert!(
+            on_glass.contains(&(*at, LEGEND_WITNESS.to_owned())),
+            "the 3D pane's legend is not where the plan view puts it: \
+             {LEGEND_WITNESS} is missing from {at:?} on the glass. The pane \
+             painted {:?}",
+            h.painted_text_strings_in(pane_rect),
+        );
+        assert!(
+            !in_strip.contains(&(*at, LEGEND_WITNESS.to_owned())),
+            "the legend reached the strip at {at:?}: the mirror would copy it \
+             onto the floor and paint it flat into the ground",
+        );
+    }
+
+    assert_eq!(
+        h.color_scale_strips(pane_rect),
+        bar_as_a_map,
+        "the 3D pane's colour bar is not the plan view's: the same pane drew \
+         {bar_as_a_map:?} strips as a map",
+    );
+    assert_eq!(
+        h.color_scale_strips(strip),
+        (0, 0),
+        "colour-bar strips were painted into the strip, so the floor is \
+         carrying a legend",
     );
 }

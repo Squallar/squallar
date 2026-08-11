@@ -541,6 +541,10 @@ impl super::Gui {
                                             tile_zoom_bias,
                                             actions: &mut actions,
                                             pane_rect,
+                                            // A plan view's ground *is* its
+                                            // glass: one rect carries the map
+                                            // and the chrome over it.
+                                            surfaces: pane_render::PaneSurfaces::GroundAndGlass,
                                             horizontal_color_scale,
                                             pointer_available,
                                             excluded_rects: excluded_rects.to_vec(),
@@ -709,6 +713,20 @@ impl super::Gui {
                                 .push(VolumeArmProbe { pane_idx, outcome });
                             #[cfg(not(test))]
                             let _ = outcome;
+
+                            // The pane's glass, in ordinary screen space on
+                            // the pane's own rect — the half of its content
+                            // the floor strip above deliberately did not
+                            // draw. **After** the volume, because the volume
+                            // occupies that same rect and a legend under it
+                            // is a legend nobody can read.
+                            self.draw_volume_glass(
+                                &child_ui,
+                                pane_idx,
+                                pane_rect,
+                                horizontal_color_scale,
+                                &pane,
+                            );
                         }
                     }
 
@@ -1285,6 +1303,20 @@ impl super::Gui {
     /// a floor legitimately does not exist, all of which the renderer must
     /// treat as "draw no floor" rather than as "draw one through zeroed lanes".
     ///
+    /// # What goes down here, and what does not
+    ///
+    /// The **ground** half of the pane's content and no more —
+    /// [`PaneSurfaces::GroundOnly`](pane_render::PaneSurfaces::GroundOnly).
+    /// Everything in the strip is copied onto the floor by the raymarcher, so
+    /// the test is whether it is still true lying flat on the world: tiles,
+    /// rasters, polygons and points are, and a legend pinned to the pane's
+    /// edge is not — down here it would be painted into the ground in
+    /// perspective, shrinking with distance and swinging round with the
+    /// camera. The pane's glass is drawn on its own rect instead, by
+    /// [`Gui::draw_volume_glass`]. [`PaneSurface`](pane_render::PaneSurface)
+    /// is where the rule lives and `surface_of` is where every kind is
+    /// classified against it.
+    ///
     /// # Why a bare `Ui` rather than an `egui::Area`
     ///
     /// An `Area` spends its first frame invisible working out its own size, and
@@ -1385,6 +1417,11 @@ impl super::Gui {
                     tile_zoom_bias,
                     actions,
                     pane_rect: strip,
+                    // Geography only. Everything down here is copied onto the
+                    // floor, and chrome on a floor is chrome lying in the
+                    // grass — see `PaneSurface`. The pane's glass is painted
+                    // by `draw_volume_glass`, on the pane's own rect.
+                    surfaces: pane_render::PaneSurfaces::GroundOnly,
                     horizontal_color_scale,
                     pointer_available: false,
                     excluded_rects: Vec::new(),
@@ -1405,6 +1442,81 @@ impl super::Gui {
             });
 
         self.map_pane_geo.get(&pane_idx).copied()
+    }
+
+    /// Draw a 3D pane's **glass**: the half of its map content that is chrome
+    /// rather than geography, in ordinary 2D on the pane's own rect.
+    ///
+    /// The other half of [`Gui::draw_floor_strip`], and the reason that
+    /// function's pass is
+    /// [`GroundOnly`](pane_render::PaneSurfaces::GroundOnly). A 3D pane draws
+    /// the same content a plan view does; it just draws it onto two surfaces
+    /// instead of one, because only one of them is a floor. What belongs on
+    /// which is [`PaneSurface`](pane_render::PaneSurface), and this is the
+    /// list of everything on the glass side of it.
+    ///
+    /// Same helpers, same rects, same panel-wide orientation as a plan view —
+    /// `pane_rect` here is the pane, exactly as it is for a map pane, so the
+    /// bars land on the same edge at the same margin and the 3D pane's legend
+    /// lines up with its neighbour's in a split.
+    ///
+    /// # Why nothing here is a widget
+    ///
+    /// Every call below paints through a `Painter` and allocates nothing, so
+    /// none of it senses the pointer. That is load-bearing on a 3D pane in a
+    /// way it is not on a map: the pane-wide `ui.interact` that drives the
+    /// orbit camera covers the whole rect, and a legend that took a drag would
+    /// leave a dead strip along the edge where the camera stops turning. It is
+    /// also why the fade factor is not applied — the legend is map content
+    /// that happens to be drawn in screen space, not floating chrome like the
+    /// Volume Alpha button, and the plan view does not fade its legend either.
+    ///
+    /// # Why the layer gates are repeated here
+    ///
+    /// Each piece is gated on the same `is_overlay_enabled` its arm in
+    /// `render_pane_map_content` is gated on. A pane keeps its layer state
+    /// across a conversion, so a user who switched the Color Scale off on a
+    /// map pane and then made it 3D would otherwise find the legend back —
+    /// switched on by the conversion, and unreachable, because a 3D pane's
+    /// Layers panel says the map layers belong to map panes.
+    fn draw_volume_glass(
+        &self,
+        ui: &egui::Ui,
+        pane_idx: usize,
+        pane_rect: egui::Rect,
+        horizontal_color_scale: bool,
+        pane: &crate::pane::PaneState,
+    ) {
+        let painter = ui.painter().with_clip_rect(pane_rect);
+        if pane.is_overlay_enabled(OverlayKind::ColorScale) {
+            pane_render::render_color_scales(
+                &painter,
+                pane_rect,
+                horizontal_color_scale,
+                pane,
+                &self.overlays,
+                &self.preferences,
+            );
+        }
+        // The stale-image notice: same plate, same top-of-pane placement, same
+        // measured pill-row clearance a map pane gives it. A 3D pane's floor
+        // goes stale exactly as a plan view's raster does — it is drawn from
+        // the same texture cache — so the pane that says which product is on
+        // screen has to be the one the user is looking at. Gated on the Radar
+        // layer for the same reason a map pane's is: the notice is produced
+        // inside the Radar arm, and a pane with the radar switched off has no
+        // image on screen to disown.
+        if pane.is_overlay_enabled(OverlayKind::Radar)
+            && let Some((on_screen, elevation)) = pane.stale_image_on_screen()
+        {
+            pane_render::draw_pending_render_notice(
+                &painter,
+                pane_rect,
+                crate::ui::pills::pill_row_clearance(ui.ctx(), pane_idx),
+                on_screen,
+                elevation,
+            );
+        }
     }
 }
 

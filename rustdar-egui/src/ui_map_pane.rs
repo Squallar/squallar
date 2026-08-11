@@ -18,6 +18,92 @@ use rustdar_radar::{get_color_for_value, get_legend_scale};
 
 use super::super::map_overlays::{OverlayDrawContext, draw_tile_layer, is_pos_blocked};
 
+/// Which of the two surfaces a pane's content is drawn onto.
+///
+/// A pane's content divides in two, and the line between them is geography:
+///
+/// * [`Ground`](PaneSurface::Ground) — everything drawn **at** a latitude and
+///   longitude, through the projector. The basemap and city-label tiles, the
+///   radar raster and its range ring, SPC outlooks and mesoscale discussions,
+///   NWS alerts, storm reports, lightning, METARs, model data, the radar-site
+///   icons and their names, the location dot, a committed region box. All of
+///   it is a picture of the world, and all of it is still true when it is laid
+///   flat on the world.
+/// * [`Glass`](PaneSurface::Glass) — chrome, positioned against the pane's own
+///   **edges** rather than against the map underneath: the colour-scale
+///   legends and the stale-image notice. Neither has a latitude, and neither
+///   survives being laid flat — on a 3D pane's floor a legend is painted into
+///   the ground in perspective, shrinking with distance and swinging round
+///   with the camera.
+///
+/// For a plan-view pane the distinction is invisible, because its ground *is*
+/// its glass: one rect carries both. It becomes real for a 3D pane, whose
+/// ground goes into the off-screen strip the raymarcher mirrors onto the floor
+/// (`Gui::draw_floor_strip`) while its glass stays on the pane rect the volume
+/// occupies.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum PaneSurface {
+    /// Geography. Mirrors onto a 3D pane's floor.
+    Ground,
+    /// Chrome over geography. Never mirrors.
+    Glass,
+}
+
+/// Which surface a given overlay kind belongs on. See [`PaneSurface`].
+///
+/// Matched exhaustively on purpose: a new `OverlayKind` does not compile until
+/// somebody has said whether it is a picture of the world or chrome over one.
+/// That is what makes the split a stated rule rather than an `if` somebody
+/// happened to write in one arm — the previous spelling of it was no spelling
+/// at all, which is how the colour scale ended up painted onto the ground the
+/// day the ground arrived.
+pub(super) const fn surface_of(kind: OverlayKind) -> PaneSurface {
+    match kind {
+        // Chrome: bars pinned to the pane's bottom or right edge, labelled in
+        // the pane's own text sizes, describing a palette rather than a place.
+        OverlayKind::ColorScale => PaneSurface::Glass,
+        // Geography, every one of them: each is drawn through the projector,
+        // at the latitude and longitude it was fetched for.
+        OverlayKind::ModelData
+        | OverlayKind::SpcOutlook
+        | OverlayKind::Radar
+        | OverlayKind::SpcDiscussions
+        | OverlayKind::NwsAlerts
+        | OverlayKind::StormReports
+        | OverlayKind::Lightning
+        | OverlayKind::Metar
+        | OverlayKind::CityLabels
+        | OverlayKind::RadarSites
+        | OverlayKind::UserLocation => PaneSurface::Ground,
+    }
+}
+
+/// Which of a pane's surfaces one call to [`render_pane_map_content`] paints.
+///
+/// Two passes exist, not four: a plan view paints both surfaces onto its own
+/// rect, and a 3D pane's floor strip paints only the ground. The glass half of
+/// a 3D pane is painted by the volume arm instead, on the pane's rect and
+/// *after* the volume — see `Gui::draw_volume_glass`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum PaneSurfaces {
+    /// A plan-view pane: ground and glass, both onto the pane's own rect.
+    GroundAndGlass,
+    /// A 3D pane's off-screen floor strip: geography only. Chrome down here
+    /// would be mirrored onto the floor, which is the whole reason the split
+    /// is written down.
+    GroundOnly,
+}
+
+impl PaneSurfaces {
+    /// Whether this pass paints `surface`.
+    const fn paints(self, surface: PaneSurface) -> bool {
+        match self {
+            Self::GroundAndGlass => true,
+            Self::GroundOnly => matches!(surface, PaneSurface::Ground),
+        }
+    }
+}
+
 /// Shared references needed for rendering a single pane's map content.
 pub(super) struct PaneRenderCtx<'a> {
     pub pane_idx: usize,
@@ -37,6 +123,10 @@ pub(super) struct PaneRenderCtx<'a> {
     pub tile_zoom_bias: u8,
     pub actions: &'a mut Vec<GuiAction>,
     pub pane_rect: egui::Rect,
+    /// Which halves of the pane's content this pass is for. See
+    /// [`PaneSurfaces`] — and [`PaneSurface`] for the rule that decides which
+    /// half anything is in.
+    pub surfaces: PaneSurfaces,
     /// Whether this frame's color scale bars run along the bottom edge
     /// (`true`) or the right edge (`false`). Resolved once for the whole map
     /// panel by `ColorScaleOrientation`, so every pane agrees.
@@ -179,6 +269,14 @@ pub(super) fn render_pane_map_content(
             if !ctx.pane.is_overlay_enabled(kind) {
                 continue;
             }
+            // The ground/glass split, applied where the kinds are dispatched
+            // rather than inside the arms: a pass that is not painting this
+            // kind's surface skips the arm entirely, so it also skips the
+            // arm's paint-order record — which is the honest thing to record,
+            // because nothing was painted.
+            if !ctx.surfaces.paints(surface_of(kind)) {
+                continue;
+            }
             // Every arm below paints through `ui.painter()` — the pane's own
             // paint list — so submission order IS `draw_order`. The layer is
             // recorded per arm, from the arm's own painter (one that builds
@@ -311,20 +409,13 @@ pub(super) fn render_pane_map_content(
                     {
                         painted_layer = painter.layer_id();
                     }
-                    let pane_rect = ui.max_rect();
-                    render_color_scale(
+                    render_color_scales(
                         &painter,
-                        pane_rect,
-                        ctx.horizontal_color_scale,
-                        ctx.pane,
-                        ctx.preferences,
-                    );
-                    render_overlay_color_scales(
-                        &painter,
-                        pane_rect,
+                        ui.max_rect(),
                         ctx.horizontal_color_scale,
                         ctx.pane,
                         ctx.overlays,
+                        ctx.preferences,
                     );
                 }
                 // All other overlays dispatched by render mode
@@ -365,7 +456,15 @@ pub(super) fn render_pane_map_content(
 
         // The deferred stale-image notice, submitted after every kind so
         // nothing in `draw_order` can paint over it — see the Radar arm.
-        if let Some((on_screen, elevation)) = pending_notice {
+        //
+        // Glass, by the rule in [`PaneSurface`]: a plate pinned to the top of
+        // the pane, cleared past the pane's *own* pill row, saying which
+        // product the pixels are. It has no latitude, so a floor strip does
+        // not draw it — a 3D pane gets it from `Gui::draw_volume_glass`
+        // instead, over the volume where it can be read.
+        if let Some((on_screen, elevation)) = pending_notice
+            && ctx.surfaces.paints(PaneSurface::Glass)
+        {
             let notice_painter = ui.painter().with_clip_rect(ctx.pane_rect);
             draw_pending_render_notice(
                 &notice_painter,
@@ -1299,7 +1398,7 @@ fn pending_render_notice(product: RadarProduct, elevation: f32) -> String {
 /// Wrapped rather than clipped, because the longest product name is wider than a
 /// pane in a six-way split and a truncated notice about a mislabelled image would
 /// be its own small lie.
-fn draw_pending_render_notice(
+pub(super) fn draw_pending_render_notice(
     painter: &egui::Painter,
     pane_rect: egui::Rect,
     top_margin: f32,
@@ -1341,6 +1440,32 @@ fn draw_shadowed_text(
         egui::Color32::from_black_alpha(200),
     );
     painter.text(pos, anchor, text, font, egui::Color32::WHITE);
+}
+
+/// Every colour-scale legend a pane shows: the radar product's own bar, and
+/// one more for each enabled overlay that carries a legend of its own.
+///
+/// The single entry point for the pane's legends, because there are two
+/// spellings of a legend bar behind it ([`render_color_scale`] and
+/// [`render_overlay_color_scales`], which `AUDIT.md` records as ~130
+/// duplicated lines) and a caller that reached for one of them would silently
+/// draw half the legends. A 3D pane is exactly such a caller — it draws its
+/// glass from the volume arm rather than from the dispatch loop — so the pair
+/// is named once here and called by both.
+///
+/// Painted through a `Painter`, never allocated as a widget: a legend that
+/// sensed the pointer would eat the drag that belongs to the map's pan or, on
+/// a 3D pane, to the orbit camera.
+pub(super) fn render_color_scales(
+    painter: &egui::Painter,
+    pane_rect: egui::Rect,
+    horizontal: bool,
+    pane: &PaneState,
+    overlays: &OverlayRegistry,
+    prefs: &UserPreferences,
+) {
+    render_color_scale(painter, pane_rect, horizontal, pane, prefs);
+    render_overlay_color_scales(painter, pane_rect, horizontal, pane, overlays);
 }
 
 /// Render the color scale legend bar for the current pane's radar product.
