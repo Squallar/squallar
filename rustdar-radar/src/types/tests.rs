@@ -173,6 +173,7 @@ fn every_level3_product_is_listed_from_the_moment_a_volume_loads() {
             .unwrap()
             .and_hms_opt(1, 48, 0)
             .unwrap(),
+        None,
     );
 
     for product in RadarProduct::all().iter().filter(|p| p.is_level3()) {
@@ -284,6 +285,7 @@ fn the_picker_lists_the_tilt_each_sweep_flew() {
             .unwrap()
             .and_hms_opt(1, 48, 0)
             .unwrap(),
+        None,
     );
 
     assert_eq!(
@@ -453,4 +455,235 @@ fn only_the_vertical_views_read_the_whole_volume() {
     // And the product half genuinely cannot answer for it: reflectivity is
     // a one-sweep product, and a reflectivity section is not.
     assert!(!RadarProduct::Reflectivity.reads_whole_volume());
+}
+
+/// A volume that states its own position, as `crate::scan::decoded` builds
+/// one out of the first Message 31's Volume Data Block.
+///
+/// The counterpart of [`empty_scan`], which is the shape a chunk-fed or a
+/// pre-2010 volume arrives in: `Scan::new`, with no site on it at all.
+fn scan_stating(lat: f32, lon: f32, site_height_m: i16, tower_height_m: u16) -> Scan {
+    Scan::with_site(
+        nexrad_model::meta::Site::new(*b"KTLX", lat, lon, site_height_m, tower_height_m),
+        VolumeCoveragePattern::new(
+            212,
+            0,
+            0.5,
+            PulseWidth::Short,
+            false,
+            0,
+            false,
+            0,
+            false,
+            false,
+            0,
+            false,
+            false,
+            Vec::new(),
+        ),
+        Vec::new(),
+    )
+}
+
+fn at(timestamp_minute: u32) -> chrono::NaiveDateTime {
+    chrono::NaiveDate::from_ymd_opt(2026, 7, 26)
+        .unwrap()
+        .and_hms_opt(1, timestamp_minute, 0)
+        .unwrap()
+}
+
+/// **Precedence is the design**: the volume in hand, then what an earlier
+/// volume taught, then the compiled-in table, then nothing.
+///
+/// One table rather than four tests, because the property is the *ordering*
+/// and an ordering asserted one pair at a time is an ordering nobody has
+/// checked. Every row uses the same site and the same three candidate
+/// positions, so the only thing that varies between rows is which of them are
+/// present — which is exactly the variable the ordering is about.
+///
+/// The three positions are a degree apart, not a metre, so a row that resolves
+/// to the wrong one says so in the failure message rather than in the last
+/// decimal place.
+#[test]
+fn the_precedence_is_volume_then_learned_then_table() {
+    use crate::site_position::{SitePosition, SitePositionSource};
+
+    let table = crate::sites::get_radar_site("KTLX").expect("in the table");
+    let volume_lat = 36.5f32;
+    let learned = SitePosition {
+        lat_udeg: 37_500_000,
+        lon_udeg: -97_277_500,
+        site_height_m: 370,
+        tower_height_m: 20,
+    };
+
+    for (case, site, scan, memo, want_lat, want_source) in [
+        (
+            "a volume outranks everything",
+            "KTLX",
+            scan_stating(volume_lat, -97.2775, 370, 20),
+            Some(learned),
+            f64::from(volume_lat),
+            SitePositionSource::Volume,
+        ),
+        (
+            "a volume outranks the table with nothing learned",
+            "KTLX",
+            scan_stating(volume_lat, -97.2775, 370, 20),
+            None,
+            f64::from(volume_lat),
+            SitePositionSource::Volume,
+        ),
+        (
+            "what was learned outranks the table",
+            "KTLX",
+            empty_scan(),
+            Some(learned),
+            learned.lat(),
+            SitePositionSource::Learned,
+        ),
+        (
+            "the table is what is left",
+            "KTLX",
+            empty_scan(),
+            None,
+            table.lat,
+            SitePositionSource::Table,
+        ),
+        (
+            "a volume places a site the table has never heard of",
+            "KXYZ",
+            scan_stating(volume_lat, -97.2775, 370, 20),
+            None,
+            f64::from(volume_lat),
+            SitePositionSource::Volume,
+        ),
+        (
+            "what was learned places one too",
+            "KXYZ",
+            empty_scan(),
+            Some(learned),
+            learned.lat(),
+            SitePositionSource::Learned,
+        ),
+        (
+            "and with none of the three there is no answer",
+            "KXYZ",
+            empty_scan(),
+            None,
+            0.0,
+            SitePositionSource::Unknown,
+        ),
+    ] {
+        let info = ScanInfo::from_scan(&scan, site, at(48), memo);
+        assert_eq!(info.site_source, want_source, "{case}: source");
+        assert!(
+            (info.site.lat - want_lat).abs() < 1e-5,
+            "{case}: site is at {} and should be at {want_lat}",
+            info.site.lat,
+        );
+        // The integer position rides along for the two sources that have one,
+        // and does not for the two that do not — that is what the caller
+        // persists, so a `Some` here for a table row would write the table
+        // into the cache and make it look measured.
+        assert_eq!(
+            info.site_position.is_some(),
+            matches!(
+                want_source,
+                SitePositionSource::Volume | SitePositionSource::Learned
+            ),
+            "{case}: site_position",
+        );
+    }
+}
+
+/// A chunk-fed volume keeps falling back to the table.
+///
+/// `crate::chunks` assembles a live volume through `Scan::new`, which takes no
+/// site, so there is nothing on it to prefer — and this is the path the
+/// application spends most of its time on. Named separately from the
+/// precedence table because it is a *regression* guard rather than a statement
+/// about ordering: the risk is that a change to `from_scan` starts demanding a
+/// site that this path structurally cannot supply.
+#[test]
+fn a_chunk_fed_volume_falls_back_to_the_table() {
+    // The real assembler, not a stand-in for it: this is the object the live
+    // feed hands a `Scan` out of, so if it ever grew a site the fixture would
+    // grow one with it.
+    let mut assembler = crate::chunks::VolumeAssembler::new(
+        "KTLX",
+        crate::chunks::VolumeIndex::new(1).expect("1 is in range"),
+    );
+    let scan = assembler.snapshot();
+    assert!(
+        scan.site().is_none(),
+        "the chunk path builds its Scan with `Scan::new`, which takes no site",
+    );
+
+    let info = ScanInfo::from_scan(&scan, "KTLX", at(48), None);
+    let table = crate::sites::get_radar_site("KTLX").expect("in the table");
+    assert_eq!(
+        info.site_source,
+        crate::site_position::SitePositionSource::Table
+    );
+    assert_eq!(info.site.lat, table.lat);
+    assert_eq!(info.site.lon, table.lon);
+    assert_eq!(info.site.heights, table.heights);
+}
+
+/// Everything downstream of `ScanInfo::site` moves with the volume, and this
+/// is the list of things that do.
+///
+/// Each of these reads the site position out of a `ScanInfo` and turns it into
+/// a number a user sees: the framing of the raster the gates are painted into,
+/// the range and bearing under the cursor, the ground track a cross-section
+/// runs along and the footprint of the 3D box. A correction that reached
+/// `ScanInfo` and not these would be invisible.
+///
+/// The offset used here is `KTLX`'s own 43 m re-survey step, which is the
+/// largest position change any site in the archive has ever made and the
+/// reason last-writer-wins is the right rule.
+#[test]
+fn a_corrected_position_reaches_every_consumer_of_it() {
+    let table = crate::sites::get_radar_site("KTLX").expect("in the table");
+    // 43 m north, spelled in degrees at KTLX's latitude.
+    let moved_lat = table.lat + 43.0 / (KM_PER_DEGREE_LAT * 1000.0);
+    let info = ScanInfo::from_scan(
+        &scan_stating(moved_lat as f32, table.lon as f32, 370, 20),
+        "KTLX",
+        at(48),
+        None,
+    );
+    let moved = (info.site.lat, info.site.lon);
+    assert!(
+        (moved.0 - table.lat).abs() > 1e-6,
+        "the fixture must actually move the site",
+    );
+
+    // The raster the gates are painted into, and so where every echo lands
+    // against the map under it.
+    let was = ImageBounds::from_radar_site(table.lat, table.lon);
+    let now = ImageBounds::from_radar_site(moved.0, moved.1);
+    assert_ne!(was.min_lat, now.min_lat);
+    assert_ne!(was.max_lat, now.max_lat);
+    assert_ne!(was.mercator_y_min, now.mercator_y_min);
+
+    // The hover readout's range and azimuth, and the cross-section's ground
+    // track, both of which start from the site.
+    let target = (table.lat + 0.5, table.lon + 0.5);
+    let (was_bearing, was_range) =
+        crate::beam::site_bearing_range_km(table.lat, table.lon, target.0, target.1);
+    let (now_bearing, now_range) =
+        crate::beam::site_bearing_range_km(moved.0, moved.1, target.0, target.1);
+    assert_ne!(was_range, now_range);
+    assert_ne!(was_bearing, now_bearing);
+
+    // And the site's own height, which every beam height is measured above —
+    // hail, HCA, echo tops, the cross-section's base, the 3D grid's datum.
+    // 370 m is 1214 ft, and KTLX's row records 1213.
+    assert_eq!(
+        info.site.height_ft(crate::sites::Datum::SiteBase),
+        Some(1213),
+        "a metre the volume cannot contradict must not move the row's feet",
+    );
 }

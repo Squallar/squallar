@@ -538,6 +538,8 @@ fn scan_info_for(site: &'static str) -> rustdar_radar::types::ScanInfo {
             lon: -97.27,
             heights: None,
         },
+        site_source: rustdar_radar::site_position::SitePositionSource::Table,
+        site_position: None,
         timestamp: chrono::NaiveDate::from_ymd_opt(2026, 7, 30)
             .unwrap()
             .and_hms_opt(18, 30, 0)

@@ -265,13 +265,30 @@ pub fn compute_eet(scan: &Scan, radar_height_ft: f64) -> EetGrid {
 /// # Why the nearest site rather than the named one
 ///
 /// The render path is handed coordinates, not an ICAO. In practice those
-/// coordinates always *came* from a [`crate::sites::RadarSite`] row —
-/// `ScanInfo::from_scan` resolves the site by identifier through
-/// [`crate::sites::get_radar_site`] and only falls back to (0, 0) with a
-/// warning for an identifier the table does not carry — and every row is its
+/// coordinates *came* from a [`crate::sites::RadarSite`] — a table row, or a
+/// row moved onto the position its own volume states — and every row is its
 /// own nearest neighbour (`every_site_is_its_own_nearest_neighbour`). So this
 /// resolves to the site the caller meant, exactly, and the nearest-neighbour
 /// search is an indirection rather than a guess.
+///
+/// # Coordinates that are not near any radar
+///
+/// `None`, rather than the height of whichever row happens to be least far
+/// away.
+///
+/// `ScanInfo::from_scan` places a site it cannot identify at (0, 0), and this
+/// used to answer that with a real site's elevation — the nearest row to Null
+/// Island, some two thousand kilometres away in the Gulf of Guinea, reported
+/// with the same confidence as `KTLX`'s own. The bound is
+/// [`crate::types::MAX_RANGE_KM`], the distance a WSR-88D can see: if not one
+/// radar in the table could observe the point being asked about, the table has
+/// nothing to say about the ground there and says so.
+///
+/// It is deliberately measured against the nearest row **of any datum**, not
+/// against the nearest row that can answer `datum`. Those are different
+/// questions — "is there a radar here?" and "does that radar record this
+/// height?" — and conflating them would withdraw the neighbour's-ground
+/// fallback described below, which is a real and wanted behaviour.
 ///
 /// # Sites the table cannot answer for
 ///
@@ -288,8 +305,12 @@ pub fn compute_eet(scan: &Scan, radar_height_ft: f64) -> EetGrid {
 /// genuinely cannot answer [`Datum::SiteBase`] — the TDWRs and `LPLA`, whose
 /// volumes report a single height — and for those this returns a neighbour's
 /// ground, which is why no render path asks for that datum. An empty table
-/// still yields 0 ft, having nothing else to say.
-pub fn radar_height_ft_near(lat: f64, lon: f64, datum: Datum) -> f64 {
+/// answers `None`, having nothing else to say.
+pub fn radar_height_ft_near(lat: f64, lon: f64, datum: Datum) -> Option<f64> {
+    let (nearest, _) = crate::sites::nearest_radar_site(lat, lon)?;
+    if crate::sites::distance_km(lat, lon, nearest.lat, nearest.lon) > crate::types::MAX_RANGE_KM {
+        return None;
+    }
     crate::sites::RADARS
         .iter()
         .filter_map(|s| s.height_ft(datum).map(|ft| (s, ft)))
@@ -298,7 +319,7 @@ pub fn radar_height_ft_near(lat: f64, lon: f64, datum: Datum) -> f64 {
             let db = (b.lat - lat).powi(2) + (b.lon - lon).powi(2);
             da.total_cmp(&db)
         })
-        .map_or(0.0, |(_, ft)| f64::from(ft))
+        .map(|(_, ft)| f64::from(ft))
 }
 
 #[cfg(test)]
@@ -550,14 +571,66 @@ mod tests {
         // KTLX's own coordinates give KTLX's heights.
         assert_eq!(
             radar_height_ft_near(35.33306, -97.2775, Datum::SiteBase),
-            1213.0
+            Some(1213.0)
         );
         assert_eq!(
             radar_height_ft_near(35.33306, -97.2775, Datum::Feedhorn),
-            1275.0
+            Some(1275.0)
         );
         // A point nudged off-site still lands on it.
-        assert_eq!(radar_height_ft_near(35.4, -97.2, Datum::Feedhorn), 1275.0);
+        assert_eq!(
+            radar_height_ft_near(35.4, -97.2, Datum::Feedhorn),
+            Some(1275.0)
+        );
+    }
+
+    /// Coordinates that are not near any radar get no answer, rather than a
+    /// real site's elevation reported with the same confidence as its own.
+    ///
+    /// (0, 0) is the case that matters, because that is exactly where
+    /// `ScanInfo::from_scan` leaves a site the build cannot identify — and
+    /// once the radar network stops being a compiled-in list, "an identifier
+    /// this binary has never heard of" stops being a hypothetical. Null Island
+    /// is 2000 km off West Africa; the nearest row to it is `TJUA` in San
+    /// Juan, and this used to hand back San Juan's 95 ft as the elevation of a
+    /// pane that had no idea where it was.
+    #[test]
+    fn coordinates_nowhere_near_a_radar_get_no_height_at_all() {
+        for (name, lat, lon) in [
+            ("null island", 0.0, 0.0),
+            ("the south atlantic", -40.0, -20.0),
+            ("central asia", 45.0, 75.0),
+            ("the south pole", -90.0, 0.0),
+        ] {
+            for datum in [Datum::SiteBase, Datum::Feedhorn] {
+                assert_eq!(
+                    radar_height_ft_near(lat, lon, datum),
+                    None,
+                    "{name} on {datum:?} was answered for",
+                );
+            }
+        }
+
+        // The bound is generous, not tight: a point well away from any site
+        // but still inside somebody's coverage is answered for, because the
+        // neighbour's-terrain degradation below is wanted behaviour and this
+        // must not withdraw it. North-central Oklahoma has no radar on it and
+        // the lookup still has something to say about the ground there.
+        let (nearest, km) = crate::sites::nearest_radar_site(36.68, -97.2775).expect("finite");
+        assert!(
+            (50.0..crate::types::MAX_RANGE_KM).contains(&km),
+            "the case needs a point well away from {} but inside its range; \
+             it is {km} km away",
+            nearest.name,
+        );
+        assert!(radar_height_ft_near(36.68, -97.2775, Datum::Feedhorn).is_some());
+
+        // And a non-finite query is refused rather than compared, which is
+        // what `nearest_radar_site` already guaranteed and this now inherits.
+        assert_eq!(
+            radar_height_ft_near(f64::NAN, -97.2775, Datum::Feedhorn),
+            None,
+        );
     }
 
     /// The one row whose height moved when the table was put on its volumes,
@@ -577,15 +650,16 @@ mod tests {
     fn the_relocated_site_reaches_its_consumers_at_its_new_height() {
         assert_eq!(
             radar_height_ft_near(37.20757, 127.28556, Datum::Feedhorn),
-            1519.0,
+            Some(1519.0),
         );
         assert_eq!(
             radar_height_ft_near(37.20757, 127.28556, Datum::SiteBase),
-            1440.0,
+            Some(1440.0),
         );
         // The figure the render path actually adds, in the units it adds it
         // in: 1519 ft is 0.463 km, not the 0.040 km Osan's 131 ft gave.
-        let km = radar_height_ft_near(37.20757, 127.28556, Datum::Feedhorn) * 0.0003048;
+        let km = radar_height_ft_near(37.20757, 127.28556, Datum::Feedhorn).expect("a site here")
+            * 0.0003048;
         assert!((km - 0.463).abs() < 0.001, "{km} km MSL");
     }
 
@@ -624,10 +698,22 @@ mod tests {
         for datum in [Datum::SiteBase, Datum::Feedhorn] {
             for site in crate::sites::RADARS.iter() {
                 let ft = radar_height_ft_near(site.lat, site.lon, datum);
+                // Two failure modes now, not one: the lookup must answer at
+                // all for a row's own coordinates — the plausibility bound
+                // must never exclude a site standing on itself — and the
+                // answer must not be sea level.
                 assert_ne!(
-                    ft, 0.0,
-                    "{} at ({}, {}) resolved to sea level on {datum:?}",
+                    ft, None,
+                    "{} at ({}, {}) got no answer on {datum:?}",
                     site.name, site.lat, site.lon,
+                );
+                assert_ne!(
+                    ft,
+                    Some(0.0),
+                    "{} at ({}, {}) resolved to sea level on {datum:?}",
+                    site.name,
+                    site.lat,
+                    site.lon,
                 );
             }
         }
@@ -660,7 +746,7 @@ mod tests {
             assert_eq!(site.height_ft(Datum::Feedhorn), Some(feedhorn_ft), "{name}");
             assert_eq!(
                 radar_height_ft_near(site.lat, site.lon, Datum::Feedhorn),
-                f64::from(feedhorn_ft),
+                Some(f64::from(feedhorn_ft)),
             );
         }
     }

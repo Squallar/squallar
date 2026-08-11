@@ -87,6 +87,17 @@ impl RadarSite {
     }
 }
 
+/// The name a [`RadarSite`] carries when nothing in the build knows the
+/// identifier.
+///
+/// It is a placeholder for a `&'static str` this crate cannot manufacture from
+/// a four-byte ICAO read at runtime, **not** a claim that the row means
+/// anything. A site carrying this name has no position of its own unless a
+/// volume supplied one, and
+/// [`ScanInfo::site_source`](crate::types::ScanInfo::site_source) is where a
+/// caller finds out which.
+pub const UNKNOWN_SITE_NAME: &str = "UNKNOWN";
+
 /// Every radar site, at the position and height its own Level II volume
 /// reports.
 ///

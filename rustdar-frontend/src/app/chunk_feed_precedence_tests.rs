@@ -17,6 +17,8 @@ fn app_showing(shown: chrono::NaiveDateTime) -> App {
         pane.site = "KTLX".to_string();
         pane.viewing_live = true;
         pane.scan_info = Some(rustdar_radar::types::ScanInfo {
+            site_source: rustdar_radar::site_position::SitePositionSource::Table,
+            site_position: None,
             site: rustdar_radar::sites::RadarSite {
                 name: "KTLX",
                 lat: 35.3,
@@ -694,6 +696,8 @@ fn add_live_pane(app: &mut App, shown: chrono::NaiveDateTime) {
         let pane = app.gui.pane_mut(idx).unwrap();
         pane.viewing_live = true;
         pane.scan_info = Some(rustdar_radar::types::ScanInfo {
+            site_source: rustdar_radar::site_position::SitePositionSource::Table,
+            site_position: None,
             site: rustdar_radar::sites::RadarSite {
                 name: "KTLX",
                 lat: 35.3,

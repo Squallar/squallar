@@ -19,6 +19,7 @@ pub mod render;
 pub mod render_input;
 pub mod sampler;
 pub mod scan;
+pub mod site_position;
 pub mod sites;
 pub mod sounding;
 pub mod sources;

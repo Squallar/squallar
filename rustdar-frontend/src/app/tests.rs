@@ -2124,6 +2124,7 @@ fn scan_info_for(site: &str) -> ScanInfo {
             .unwrap()
             .and_hms_opt(0, 0, 0)
             .unwrap(),
+        None,
     )
 }
 
@@ -2642,4 +2643,140 @@ fn a_mid_flight_animation_requests_an_immediate_repaint() {
     );
     // (The settled side — no repaint request once the animation ends — is
     // real-clock timing and lives with `repaint_action`'s own mapping pins.)
+}
+
+// ── Learning where the radars are ───────────────────────────────────
+
+/// A volume stating its own position, as `scan::decoded` builds one out of
+/// the first Message 31's Volume Data Block.
+///
+/// The counterpart of [`empty_scan`], which states nothing — the shape a
+/// chunk-fed or a pre-2010 volume arrives in.
+fn scan_stating(lat: f32, lon: f32) -> nexrad_model::data::Scan {
+    use nexrad_model::data::{PulseWidth, Scan, VolumeCoveragePattern};
+    Scan::with_site(
+        nexrad_model::meta::Site::new(*b"KTLX", lat, lon, 370, 20),
+        VolumeCoveragePattern::new(
+            212,
+            0,
+            0.5,
+            PulseWidth::Short,
+            false,
+            0,
+            false,
+            0,
+            false,
+            false,
+            0,
+            false,
+            false,
+            Vec::new(),
+        ),
+        Vec::new(),
+    )
+}
+
+/// The learned position survives the process, and is applied before anything
+/// is drawn from it.
+///
+/// Two apps over one store, which is the only way to exercise something the
+/// app is supposed to remember across restarts. The second one is handed a
+/// volume that states *nothing* — the shape a chunk feed or a pre-2010 archive
+/// produces — so the only thing that can place its site correctly is what the
+/// first one wrote.
+///
+/// The read happens inside `ScanInfo::from_scan`, before the `ScanInfo`
+/// exists and so before any pane can have painted from it. That is what keeps
+/// this out of the "late correction that shifts a pane the user is looking at"
+/// class the 1:1-on-reopen rule forbids.
+#[test]
+fn a_position_a_volume_taught_survives_a_restart() {
+    use rustdar_radar::site_position::SitePositionSource;
+
+    let store = std::rc::Rc::new(MemoryConfigStore::default());
+    let table = rustdar_radar::sites::get_radar_site("KTLX").expect("in the table");
+    // A quarter of a degree from the row: far enough that resolving to the
+    // wrong one is unmistakable, and in the direction a re-survey would move.
+    let stated_lat = (table.lat + 0.25) as f32;
+    let at = chrono::NaiveDate::from_ymd_opt(2026, 8, 11)
+        .unwrap()
+        .and_hms_opt(1, 48, 0)
+        .unwrap();
+
+    let learned_lat = {
+        let mut app = headless(TestBridge::desktop().with_store(std::rc::Rc::clone(&store)));
+        let info = app.scan_info_learning_position(
+            &scan_stating(stated_lat, table.lon as f32),
+            "KTLX",
+            at,
+        );
+        assert_eq!(info.site_source, SitePositionSource::Volume);
+        assert!(
+            (info.site.lat - f64::from(stated_lat)).abs() < 1e-5,
+            "the volume's own position must be what is drawn: {}",
+            info.site.lat,
+        );
+        // Written already, with no autosave tick having run.
+        assert!(
+            rustdar_egui::config_store::ConfigStore::load(
+                store.as_ref(),
+                crate::site_positions::SITE_POSITIONS_KEY,
+            )
+            .is_some(),
+            "the learned position must be durable the moment it is learned",
+        );
+        info.site.lat
+    };
+
+    // A second run, over the same blobs, handed a volume that states nothing.
+    let mut next_run = headless(TestBridge::desktop().with_store(std::rc::Rc::clone(&store)));
+    let recalled = next_run.scan_info_learning_position(&empty_scan(), "KTLX", at);
+
+    assert_eq!(recalled.site_source, SitePositionSource::Learned);
+    assert_eq!(
+        recalled.site.lat.to_bits(),
+        learned_lat.to_bits(),
+        "the recalled position must be bit-identical to the one the pane was \
+         drawn at, or reopening is not 1:1",
+    );
+    assert_ne!(
+        recalled.site.lat, table.lat,
+        "the compiled-in row must not have won",
+    );
+}
+
+/// With nowhere to write, the app still works and simply forgets.
+///
+/// This is the degradation `LocationGate` chose for the same reason: no
+/// `ConfigStore` must never mean "refuse", it means "ask again next time".
+#[test]
+fn a_run_with_no_config_store_still_applies_the_volumes_own_position() {
+    use rustdar_radar::site_position::SitePositionSource;
+
+    let table = rustdar_radar::sites::get_radar_site("KTLX").expect("in the table");
+    let stated_lat = (table.lat + 0.25) as f32;
+    let at = chrono::NaiveDate::from_ymd_opt(2026, 8, 11)
+        .unwrap()
+        .and_hms_opt(1, 48, 0)
+        .unwrap();
+
+    let mut app = headless(TestBridge::desktop().without_config_store());
+    let info =
+        app.scan_info_learning_position(&scan_stating(stated_lat, table.lon as f32), "KTLX", at);
+    assert_eq!(info.site_source, SitePositionSource::Volume);
+    assert!((info.site.lat - f64::from(stated_lat)).abs() < 1e-5);
+
+    // Within the run it is still remembered — the map is in memory and the
+    // store is only where it is *written* — so a chunk-fed volume arriving
+    // after an archive one is placed correctly even here.
+    let same_run = app.scan_info_learning_position(&empty_scan(), "KTLX", at);
+    assert_eq!(same_run.site_source, SitePositionSource::Learned);
+    assert_eq!(same_run.site.lat.to_bits(), info.site.lat.to_bits());
+
+    // And nothing outlives the process: a fresh app is back on the table,
+    // which is where the app was before any of this existed.
+    let mut next_run = headless(TestBridge::desktop().without_config_store());
+    let plain = next_run.scan_info_learning_position(&empty_scan(), "KTLX", at);
+    assert_eq!(plain.site_source, SitePositionSource::Table);
+    assert_eq!(plain.site.lat, table.lat);
 }

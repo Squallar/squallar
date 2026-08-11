@@ -12,6 +12,8 @@ fn pane_listing(products: &[(RadarProduct, &[f32])]) -> PaneState {
             lon: -97.27,
             heights: None,
         },
+        site_source: rustdar_radar::site_position::SitePositionSource::Table,
+        site_position: None,
         timestamp: chrono::NaiveDate::from_ymd_opt(2026, 7, 26)
             .unwrap()
             .and_hms_opt(1, 48, 0)

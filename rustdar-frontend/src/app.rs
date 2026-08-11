@@ -22,6 +22,7 @@ use crate::loop_downloads::LoopDownloadManager;
 use crate::platform::{PlatformBridge, RedrawWaker};
 use crate::render_dispatch::RenderDispatcher;
 use rustdar_egui::{Gui, actions::GuiAction};
+use rustdar_radar::site_position::SitePositionSource;
 use rustdar_radar::types::ScanInfo;
 
 #[path = "app_fetch.rs"]
@@ -403,6 +404,14 @@ pub struct App {
     /// The only thing in this application that can raise a location permission
     /// prompt. See [`crate::location_permission`].
     location: LocationGate,
+    /// Where earlier volumes said their radars are.
+    ///
+    /// Loaded once, in [`App::new`], because a learned position may only be
+    /// applied before a pane's first paint; written the moment a volume
+    /// teaches something new, in
+    /// [`scan_info_learning_position`](Self::scan_info_learning_position).
+    /// See [`crate::site_positions`].
+    site_positions: crate::site_positions::SitePositions,
 }
 
 /// Bookkeeping for the periodic config write.
@@ -719,6 +728,14 @@ impl App {
         // `set_config_dir`, so `restored` is false there even for a returning
         // user. That is handled where the real load happens, not here.
         let site_is_provisional = !restored && apply_location_hint(&mut gui, platform.as_ref());
+        // Here rather than lazily on the first volume, because a position may
+        // only be applied *before* a pane's first paint. Reading it at
+        // construction means `ScanInfo::from_scan` already has it by the time
+        // the first volume decodes, so a corrected site is drawn corrected
+        // from the first frame rather than shifting under the user later.
+        // Reloaded in `set_config_dir` for Android, which has no store yet.
+        let site_positions =
+            crate::site_positions::SitePositions::load(platform.config_store().as_deref());
 
         let mut app = Self {
             instance,
@@ -768,6 +785,7 @@ impl App {
             // finds the memo Android only learns the path to during
             // `android_main`.
             location: LocationGate::new(),
+            site_positions,
         };
 
         // Here, and not later, because "later" does not exist for two of the
@@ -1776,7 +1794,10 @@ impl App {
             } else {
                 match scan_resp.result {
                     Ok(scan_data) => {
-                        let scan_info = ScanInfo::from_scan(
+                        // The archive path is the only one that can *learn*: a
+                        // downloaded volume carries the Volume Data Block the
+                        // chunk feed's reassembled `Scan` has no room for.
+                        let scan_info = self.scan_info_learning_position(
                             &scan_data.scan,
                             &scan_data.site,
                             scan_data.timestamp,
@@ -2096,6 +2117,47 @@ impl App {
         }
     }
 
+    /// Build a volume's [`ScanInfo`], and remember anything it taught about
+    /// where its radar is.
+    ///
+    /// Every `ScanInfo` in the application is built here, so that the
+    /// precedence `ScanInfo::from_scan` documents — the volume in hand, then
+    /// what an earlier volume taught, then the compiled-in table — is applied
+    /// in exactly one place and cannot be half-applied on one path.
+    ///
+    /// # Why the write is here rather than at the pane
+    ///
+    /// This is the moment something is *learned*, as opposed to recalled: only
+    /// [`SitePositionSource::Volume`] means a volume in hand stated a position,
+    /// and only that is worth persisting. Writing on
+    /// [`SitePositionSource::Learned`] as well would rewrite the store on every
+    /// volume for a value that came out of the store.
+    ///
+    /// The read happens *before* the `ScanInfo` exists, which is what keeps the
+    /// 1:1-on-reopen rule true: a learned position is applied before anything
+    /// is drawn from it, never as a late correction that shifts a pane the user
+    /// is already looking at.
+    fn scan_info_learning_position(
+        &mut self,
+        scan: &nexrad_model::data::Scan,
+        site: &str,
+        requested_timestamp: chrono::NaiveDateTime,
+    ) -> ScanInfo {
+        let info = ScanInfo::from_scan(
+            scan,
+            site,
+            requested_timestamp,
+            self.site_positions.get(site),
+        );
+        if info.site_source == SitePositionSource::Volume
+            && let Some(position) = info.site_position
+        {
+            let store = self.platform.config_store();
+            self.site_positions.learn(store.as_deref(), site, position);
+        }
+        info
+    }
+
     /// Replace a timezone-guessed site with the one nearest an actual fix.
     ///
     /// This is the silent upgrade the timezone guess exists to be replaced by:
@@ -2369,6 +2431,12 @@ impl App {
         // Load config now — on Android this is called after App::new(),
         // so the initial load in new() had no config dir yet.
         if let Some(store) = self.platform.config_store() {
+            // Same reason, and still before the first paint: this runs inside
+            // `android_main`, ahead of the event loop and so ahead of any
+            // volume. Unconditional rather than folded into the branch below —
+            // a returning user's learned positions are worth reading even on a
+            // run where the UI config itself does not come back.
+            self.site_positions = crate::site_positions::SitePositions::load(Some(store.as_ref()));
             if self.gui.load_ui_config(store.as_ref()) {
                 // A returning user on Android reaches the timezone guess before
                 // their stored site is readable, so the guess has to be undone

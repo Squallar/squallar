@@ -42,6 +42,8 @@ fn point_at_site(app: &mut crate::app::App, pane_idx: usize) {
         pane_idx,
         rustdar_radar::types::ScanInfo {
             site,
+            site_source: rustdar_radar::site_position::SitePositionSource::Table,
+            site_position: None,
             timestamp: volume_time(),
             vcp_number: 212,
             available_products: vec![PRODUCT],

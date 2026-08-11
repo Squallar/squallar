@@ -1622,9 +1622,12 @@ pub fn build_voxels_with_motion<'a>(
     let y_range_km = (cy - half, cy + half);
     let z_range_km_msl = (req.base_km_msl, req.top_km_msl);
 
-    // The same spelling `render.rs` uses for `radar_km_msl`.
-    let site_km_msl =
-        crate::eet::radar_height_ft_near(lat, lon, crate::sites::Datum::Feedhorn) * 0.0003048;
+    // The same spelling `render.rs` uses for `radar_km_msl`, including what it
+    // does with coordinates the table cannot place: no MSL datum to add, so the
+    // grid's heights are above the antenna. See `render::render_site_height_ft`.
+    let site_km_msl = crate::eet::radar_height_ft_near(lat, lon, crate::sites::Datum::Feedhorn)
+        .unwrap_or(0.0)
+        * 0.0003048;
 
     let value_range = value_range_for_product(req.product, slot);
     let lut = colormap_lut(req.product, value_range);

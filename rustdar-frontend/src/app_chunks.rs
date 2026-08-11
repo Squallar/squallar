@@ -8,8 +8,6 @@
 
 use std::sync::Arc;
 
-use rustdar_radar::types::ScanInfo;
-
 use crate::channels::ChunkResponse;
 use crate::chunk_feed::Retirement;
 use crate::chunk_notify::{ChunkAvailable, Feed, Notified};
@@ -343,7 +341,15 @@ impl super::App {
 
         // The volume's own start, from its first radial — stable across the
         // whole volume, so it does not walk while cuts land.
-        let info = ScanInfo::from_scan(&scan, site, self.gui.get_radar_config().timestamp);
+        //
+        // Through the same helper as the archive drain even though this path
+        // can never learn anything — `chunks::VolumeAssembler` builds through
+        // `Scan::new`, which takes no site — so that a chunk-fed pane and an
+        // archive-fed pane of the same radar cannot end up at different
+        // positions. It is the *read* of the learned position that matters
+        // here, and it is exactly the read the archive path does.
+        let requested = self.gui.get_radar_config().timestamp;
+        let info = self.scan_info_learning_position(&scan, site, requested);
         let timestamp = info.timestamp;
 
         // Mirrors the archive drain: a site no pane is watching live keeps its

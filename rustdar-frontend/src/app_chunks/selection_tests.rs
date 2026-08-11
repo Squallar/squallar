@@ -26,6 +26,8 @@ pub(super) fn show_on(
     let mut product_elevations = std::collections::HashMap::new();
     product_elevations.insert(product, available.to_vec());
     pane.scan_info = Some(ScanInfo {
+        site_source: rustdar_radar::site_position::SitePositionSource::Table,
+        site_position: None,
         site: rustdar_radar::sites::RadarSite {
             name: "KTLX",
             lat: 35.3,

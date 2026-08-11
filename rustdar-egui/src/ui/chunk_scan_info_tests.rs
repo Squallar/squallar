@@ -26,6 +26,8 @@ fn info(minute: u32, products: &[(RadarProduct, &[f32])]) -> ScanInfo {
     }
     ScanInfo {
         site: site(),
+        site_source: rustdar_radar::site_position::SitePositionSource::Table,
+        site_position: None,
         timestamp: at(minute),
         vcp_number: 212,
         available_products: products.iter().map(|(p, _)| *p).collect(),

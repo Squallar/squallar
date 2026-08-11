@@ -395,6 +395,8 @@ fn volume_time() -> chrono::NaiveDateTime {
 fn pane_with_volume(site: &str) -> rustdar_egui::pane::PaneState {
     let mut pane = pane_on(site);
     pane.scan_info = Some(rustdar_radar::types::ScanInfo {
+        site_source: rustdar_radar::site_position::SitePositionSource::Table,
+        site_position: None,
         site: rustdar_radar::sites::get_radar_site(site)
             .cloned()
             .unwrap_or(rustdar_radar::sites::RadarSite {

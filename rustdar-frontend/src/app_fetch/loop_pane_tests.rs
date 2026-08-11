@@ -49,6 +49,8 @@ fn pane_showing(site: RadarSite, timestamp: NaiveDateTime) -> PaneState {
     let mut pane = PaneState::with_site(SWITCHED_TO.to_string());
     pane.scan_info = Some(ScanInfo {
         site,
+        site_source: rustdar_radar::site_position::SitePositionSource::Table,
+        site_position: None,
         timestamp,
         vcp_number: 212,
         available_products: vec![RadarProduct::Reflectivity],

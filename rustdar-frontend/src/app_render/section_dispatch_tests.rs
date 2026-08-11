@@ -193,6 +193,8 @@ fn app_with_section(product: RadarProduct, scan: Arc<Scan>) -> crate::app::App {
         0,
         ScanInfo {
             site,
+            site_source: rustdar_radar::site_position::SitePositionSource::Table,
+            site_position: None,
             timestamp: volume_time(),
             vcp_number: 212,
             available_products: vec![product],

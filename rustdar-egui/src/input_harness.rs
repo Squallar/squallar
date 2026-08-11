@@ -1276,6 +1276,8 @@ impl InputHarness {
         let radar_site = rustdar_radar::sites::get_radar_site(site).expect("unknown radar site");
         let info = rustdar_radar::types::ScanInfo {
             site: radar_site.clone(),
+            site_source: rustdar_radar::site_position::SitePositionSource::Table,
+            site_position: None,
             timestamp: chrono::NaiveDate::from_ymd_opt(2026, 7, 24)
                 .unwrap()
                 .and_hms_opt(18, 30, 0)

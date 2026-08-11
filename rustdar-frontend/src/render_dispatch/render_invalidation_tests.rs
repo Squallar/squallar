@@ -347,6 +347,8 @@ fn gui_on_tilt(
     let mut product_elevations = std::collections::HashMap::new();
     product_elevations.insert(product, available.to_vec());
     pane.scan_info = Some(ScanInfo {
+        site_source: rustdar_radar::site_position::SitePositionSource::Table,
+        site_position: None,
         site: RadarSite {
             name: "KOUN",
             lat: 35.2,

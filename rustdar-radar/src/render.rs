@@ -1010,8 +1010,22 @@ pub fn render_derived_vild_to_image(
 /// Pinned by `the_render_paths_site_height_is_the_feedhorn`, which is the
 /// only thing standing between this and a silent revert: neither hail nor
 /// HCA has a render-level test that would notice a tower's worth of shift.
+///
+/// # When the table cannot place the coordinates at all
+///
+/// Zero, which makes every height this render produces one above the antenna
+/// rather than above sea level. That is the only honest answer available: it
+/// is not a claim that the radar is at sea level, it is the absence of an MSL
+/// datum to add. The alternative — which is what
+/// [`crate::eet::radar_height_ft_near`] used to do — was to report the
+/// elevation of whichever site in the table was least far away, and for a pane
+/// stranded at (0, 0) that is a real site two thousand kilometres off.
+///
+/// Unreachable for a site the build knows or a volume that states its own
+/// position. See [`crate::types::ScanInfo::site_source`], which is where a
+/// caller finds out that it is in this state.
 fn render_site_height_ft(lat: f64, lon: f64) -> f64 {
-    crate::eet::radar_height_ft_near(lat, lon, crate::sites::Datum::Feedhorn)
+    crate::eet::radar_height_ft_near(lat, lon, crate::sites::Datum::Feedhorn).unwrap_or(0.0)
 }
 
 /// Render one of the derived hail products ([`crate::hail`]): POSH in %,

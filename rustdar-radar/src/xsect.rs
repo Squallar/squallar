@@ -792,8 +792,12 @@ fn render_with_sampler(
     // The feedhorn: every height on this axis is a beam height, and `beam`
     // measures those above the antenna, not above the ground the tower
     // stands on.
-    let base_km_msl =
-        crate::eet::radar_height_ft_near(lat, lon, crate::sites::Datum::Feedhorn) * FT_TO_KM;
+    //
+    // Coordinates the table cannot place have no MSL datum to add, so the axis
+    // runs from the antenna. See `render::render_site_height_ft`.
+    let base_km_msl = crate::eet::radar_height_ft_near(lat, lon, crate::sites::Datum::Feedhorn)
+        .unwrap_or(0.0)
+        * FT_TO_KM;
     let top_km_msl = req
         .top_km_msl
         .unwrap_or(base_km_msl + DEFAULT_AXIS_HEIGHT_KM);

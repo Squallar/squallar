@@ -1,3 +1,4 @@
+use crate::site_position::{SitePosition, SitePositionSource};
 use crate::sites::RadarSite;
 use crate::sites::get_radar_site;
 use chrono::NaiveDateTime;
@@ -160,7 +161,30 @@ impl ImageBounds {
 
 #[derive(Debug, Clone)]
 pub struct ScanInfo {
+    /// Where this volume's radar is, and how high.
+    ///
+    /// **Not simply the table row.** The row is the starting point; a volume
+    /// that states its own position overrides it, and a position learned from
+    /// an earlier volume overrides it in a session where no fresh volume has
+    /// arrived. [`ScanInfo::site_source`] says which of the three this is.
     pub site: RadarSite,
+    /// Which of the three things above [`ScanInfo::site`] came from.
+    ///
+    /// The one thing every consumer of [`ScanInfo::site`] can use to tell a
+    /// measured position from a placeholder:
+    /// [`SitePositionSource::Unknown`] means the coordinates on the site are
+    /// not an answer at all.
+    pub site_source: SitePositionSource,
+    /// The canonical integer position behind [`ScanInfo::site`], when there is
+    /// one.
+    ///
+    /// `None` for [`SitePositionSource::Table`] and
+    /// [`SitePositionSource::Unknown`] — the table's rows are `f64` literals
+    /// and there is nothing measured to remember. `Some` for the other two,
+    /// and the caller persists it when [`ScanInfo::site_source`] is
+    /// [`SitePositionSource::Volume`]: that is the moment something was
+    /// *learned*, as opposed to recalled.
+    pub site_position: Option<SitePosition>,
     /// From the **first** radial of the **first** sweep, not the request.
     ///
     /// # Not a freshness signal on the live chunk feed
@@ -195,7 +219,48 @@ pub struct ScanInfo {
 impl ScanInfo {
     /// Level III products are listed with empty elevation vectors, filled in
     /// later as L3 data arrives.
-    pub fn from_scan(data: &Scan, site: &str, requested_timestamp: NaiveDateTime) -> Self {
+    ///
+    /// # The site's position: volume, then learned, then table
+    ///
+    /// This is the one place in the workspace where a radar's position is
+    /// decided, and the precedence is the design. It is pinned as a table by
+    /// `the_precedence_is_volume_then_learned_then_table`.
+    ///
+    /// 1. **The volume in hand.** Every Message 31 volume states its own
+    ///    latitude, longitude and heights in its Volume Data Block, and
+    ///    `crate::scan::decoded` has always read them — but until this
+    ///    existed, `Scan::site()` had no caller anywhere in the workspace and
+    ///    the value was decoded and dropped. Preferring it makes every site
+    ///    the user actually opens self-correcting, with no network and no new
+    ///    origin.
+    ///
+    ///    Last-writer-wins, with no averaging and no outlier policy, because
+    ///    the reported position does not wobble: across 18 diverse sites at
+    ///    2019, 2022 and 2026 it is bit-identical, span 0.0 m. Where it moves
+    ///    it is a step function — `KTLX` made one 43 m re-survey step between
+    ///    2013 and 2016 — so a disagreement means a re-survey happened and the
+    ///    newer value is the right one.
+    ///
+    /// 2. **A position learned from an earlier volume**, supplied by the
+    ///    caller out of its own store. This is what makes a site stay
+    ///    corrected across restarts, and what lets the map centre correctly on
+    ///    a site opened before but not yet re-downloaded this session.
+    ///
+    /// 3. **[`crate::sites::RADARS`]**, the compiled-in snapshot. Still the
+    ///    answer for a pre-2010 `AR2V0001` volume, which is Message 1
+    ///    throughout and carries no Volume Data Block to read, and for a
+    ///    chunk-fed `Scan`, which is assembled by `crate::chunks` through
+    ///    `Scan::new` and has no site on it by construction.
+    ///
+    /// A site none of the three can place gets
+    /// [`SitePositionSource::Unknown`] and a placeholder row. See
+    /// [`crate::sites::UNKNOWN_SITE_NAME`] for why that row is not an answer.
+    pub fn from_scan(
+        data: &Scan,
+        site: &str,
+        requested_timestamp: NaiveDateTime,
+        learned: Option<SitePosition>,
+    ) -> Self {
         let vcp_number = data.coverage_pattern_number().number();
 
         let product_elevations = discover_product_elevations(data);
@@ -214,15 +279,39 @@ impl ScanInfo {
             })
             .unwrap_or(requested_timestamp);
 
-        let radar_site = get_radar_site(site).cloned().unwrap_or_else(|| {
-            log::warn!("Unknown radar site '{}', using fallback location", site);
-            RadarSite {
-                name: "UNKNOWN",
-                lat: 0.0,
-                lon: 0.0,
-                heights: None,
+        let row = get_radar_site(site);
+        let (site_position, site_source) = match (
+            data.site().and_then(SitePosition::from_volume),
+            learned,
+            row.is_some(),
+        ) {
+            (Some(volume), _, _) => (Some(volume), SitePositionSource::Volume),
+            (None, Some(learned), _) => (Some(learned), SitePositionSource::Learned),
+            (None, None, true) => (None, SitePositionSource::Table),
+            (None, None, false) => (None, SitePositionSource::Unknown),
+        };
+
+        let radar_site = match (site_position, row) {
+            (Some(position), row) => position.applied_to(row),
+            (None, Some(row)) => row.clone(),
+            (None, None) => {
+                // Error, not warning: nothing downstream of here can place
+                // this pane, and every number it draws — the range rings, the
+                // gate positions, the hover readout, the section endpoints —
+                // is about a spot in the Gulf of Guinea rather than about a
+                // radar. `radar_height_ft_near` refuses to answer for it.
+                log::error!(
+                    "no position for radar site '{site}': it is in no table row, \
+                     its volume states none, and nothing was learned for it",
+                );
+                RadarSite {
+                    name: crate::sites::UNKNOWN_SITE_NAME,
+                    lat: 0.0,
+                    lon: 0.0,
+                    heights: None,
+                }
             }
-        });
+        };
 
         let status = format!(
             "Loaded {} products: {}",
@@ -236,6 +325,8 @@ impl ScanInfo {
 
         ScanInfo {
             site: radar_site,
+            site_source,
+            site_position,
             timestamp: actual_timestamp,
             vcp_number,
             available_products,

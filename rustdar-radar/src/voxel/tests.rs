@@ -3539,8 +3539,9 @@ fn serial_reference_grid(
     let x_range_km = (cx - half, cx + half);
     let y_range_km = (cy - half, cy + half);
     let z_range_km_msl = (req.base_km_msl, req.top_km_msl);
-    let site_km_msl =
-        crate::eet::radar_height_ft_near(lat, lon, crate::sites::Datum::Feedhorn) * 0.0003048;
+    let site_km_msl = crate::eet::radar_height_ft_near(lat, lon, crate::sites::Datum::Feedhorn)
+        .unwrap_or(0.0)
+        * 0.0003048;
     let value_range = value_range_for_product(req.product, slot);
 
     let (nx, ny, nz) = (req.shape.nx, req.shape.ny, req.shape.nz);
