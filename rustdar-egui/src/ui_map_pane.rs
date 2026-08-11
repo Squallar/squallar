@@ -139,28 +139,19 @@ pub(super) fn render_pane_map_content(
     // that lands on an icon. Kept out of `ctx.excluded_rects`, which
     // `handle_radar_site_interactions` reads itself: with the icons in there,
     // every site click was blocked by its own icon.
-    let mut site_icon_rects: Vec<egui::Rect> = Vec::new();
-    if ctx.pane.is_overlay_enabled(OverlayKind::RadarSites) {
-        let screen_rect = ui.max_rect();
-        let icon_size = (10.0 + zoom as f32 * 2.0).clamp(8.0, 24.0);
-        for site in &RADARS {
-            let pos = projector
-                .project(walkers::lat_lon(site.lat, site.lon))
-                .to_pos2();
-            if screen_rect.expand(100.0).contains(pos) {
-                site_icon_rects.push(egui::Rect::from_center_size(
-                    pos,
-                    egui::vec2(icon_size, icon_size),
-                ));
-            }
-        }
-    }
+    //
+    // Projected **once**. This used to build the rect list and then throw the
+    // projections away, leaving `handle_radar_site_interactions` to walk all
+    // 207 sites again and re-derive the identical `icon_rect` — two Mercator
+    // passes over the site table per map pane per frame for one answer. The
+    // list is now the answer, and the interaction pass reads it.
+    let visible_sites = visible_radar_sites(ui, projector, zoom, ctx.pane);
     // What the overlays *under* the sites must not be clicked through.
     let overlay_excluded_rects: Vec<egui::Rect> = ctx
         .excluded_rects
         .iter()
-        .chain(&site_icon_rects)
         .copied()
+        .chain(visible_sites.iter().map(|s| s.icon_rect))
         .collect();
 
     // --- Phase 1: immutable-ui work (ordered layer dispatch) ---
@@ -289,7 +280,7 @@ pub(super) fn render_pane_map_content(
                         let screen_rect = ui.max_rect();
                         draw_overlay_texture(ui.painter(), projector, tex, screen_rect);
                     }
-                    handle_radar_site_interactions(ui, projector, zoom, ctx);
+                    handle_radar_site_interactions(ui, zoom, &visible_sites, ctx);
                 }
                 // User location blue dot
                 OverlayKind::UserLocation => {
@@ -897,19 +888,75 @@ fn map_hover_tooltip(
         });
 }
 
+/// One radar site that landed near enough to this pane to matter, with the
+/// projection already done.
+///
+/// The single product of the site table walk: both consumers — the exclusion
+/// list the overlays under the sites are hit-tested against, and the label /
+/// click / hover pass — read this rather than re-projecting.
+struct VisibleSite {
+    /// Index into [`RADARS`].
+    index: usize,
+    /// Screen position of the site marker's centre.
+    screen: egui::Pos2,
+    /// The clickable icon box around `screen`.
+    icon_rect: egui::Rect,
+}
+
+/// Project the radar site table once, keeping the sites within a 100 px margin
+/// of this pane.
+///
+/// Empty when the layer is off, which is the same condition the sites arm of
+/// the draw loop runs under — nothing downstream pays for a walk whose result
+/// would be discarded.
+fn visible_radar_sites(
+    ui: &egui::Ui,
+    projector: &walkers::Projector,
+    zoom: f64,
+    pane: &PaneState,
+) -> Vec<VisibleSite> {
+    if !pane.is_overlay_enabled(OverlayKind::RadarSites) {
+        return Vec::new();
+    }
+    // The margin is what lets a site just off the edge still draw its label and
+    // take a click on the icon straddling the boundary — see the harness's
+    // `a_click_outside_the_pane_does_not_reach_a_site_icon_straddling_its_edge`.
+    let near = ui.max_rect().expand(100.0);
+    let icon_size = (10.0 + zoom as f32 * 2.0).clamp(8.0, 24.0);
+    let mut visible = Vec::new();
+    for (index, site) in RADARS.iter().enumerate() {
+        let screen = projector
+            .project(walkers::lat_lon(site.lat, site.lon))
+            .to_pos2();
+        if !near.contains(screen) {
+            continue;
+        }
+        visible.push(VisibleSite {
+            index,
+            screen,
+            icon_rect: egui::Rect::from_center_size(screen, egui::vec2(icon_size, icon_size)),
+        });
+    }
+    visible
+}
+
 /// Per-frame radar site label rendering and interaction detection.
 ///
 /// The site circles and background pills are in the background-rasterized
 /// texture; this function draws text labels (tiny-skia cannot render text)
 /// and handles interactive hits (clicks → site switch, hover → tooltip/cursor).
 ///
+/// `sites` is [`visible_radar_sites`]' output for this pane and frame: the
+/// projection and the on-screen test are already done, so this walks only the
+/// sites that can be seen.
+///
 /// `overlay_click_pos` must be taken from `PaneRenderCtx::overlay_click_pos`
 /// (pre-filtered — dialog clicks are already stripped). Never pass a raw
 /// `ctx.input()` click position here.
 fn handle_radar_site_interactions(
     ui: &egui::Ui,
-    projector: &walkers::Projector,
     zoom: f64,
+    sites: &[VisibleSite],
     ctx: &mut PaneRenderCtx<'_>,
 ) {
     // Everything below used to arrive as seven separate parameters, all of
@@ -930,7 +977,6 @@ fn handle_radar_site_interactions(
     let pane_idx = *pane_idx;
     let pane_rect = *pane_rect;
 
-    let screen_rect = ui.max_rect();
     let zoom_f32 = zoom as f32;
     let icon_size = (10.0 + zoom_f32 * 2.0).clamp(8.0, 24.0);
     let font_size = (icon_size * 0.6).clamp(8.0, 12.0);
@@ -945,14 +991,10 @@ fn handle_radar_site_interactions(
         egui::Color32::BLACK
     };
 
-    for radar_site in &RADARS {
-        let site_screen = projector
-            .project(walkers::lat_lon(radar_site.lat, radar_site.lon))
-            .to_pos2();
-
-        if !screen_rect.expand(100.0).contains(site_screen) {
-            continue;
-        }
+    for site in sites {
+        let radar_site = &RADARS[site.index];
+        let site_screen = site.screen;
+        let icon_rect = site.icon_rect;
 
         // Draw the text label below the marker (background pill is in the texture)
         if zoom >= 5.0 {
@@ -965,8 +1007,6 @@ fn handle_radar_site_interactions(
                 text_color,
             );
         }
-
-        let icon_rect = egui::Rect::from_center_size(site_screen, egui::vec2(icon_size, icon_size));
 
         if let Some(pos) = click_pos
             && icon_rect.contains(pos)
