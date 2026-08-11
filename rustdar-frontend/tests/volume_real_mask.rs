@@ -284,13 +284,16 @@ fn render_a_real_volume_mask() {
             site_lon,
         )
     })
-    .and_then(|(mut image, _data_reach_km, _)| {
-        // Not the returned `max_range_km`: that is the product's data reach,
-        // and it moves with the volume. The raster's own geometry is fixed —
-        // `IMAGE_SIZE` texels square over `ImageBounds::from_radar_site`, which
-        // is `MAX_RANGE_KM` in every direction — and that geometry, not the
-        // reach, is what the lanes below have to describe.
-        let bounds = rustdar_radar::types::ImageBounds::from_radar_site(site_lat, site_lon);
+    .and_then(|(mut image, extent_km, _)| {
+        // The returned `max_range_km`, which *is* the raster's geometry: the
+        // renderer projects at `plan_view_extent_km` of the sweep's reach, so
+        // this picture is `IMAGE_SIZE` texels square over
+        // `ImageBounds::from_radar_site(.., extent_km)` and the lanes below
+        // have to describe that box and no other. On a real super-res volume
+        // it is 458 km, not the 230 the raster was fixed at when this harness
+        // was written.
+        let bounds =
+            rustdar_radar::types::ImageBounds::from_radar_site(site_lat, site_lon, extent_km);
         let side = rustdar_radar::types::IMAGE_SIZE as u32;
 
         let mut mirror = None;

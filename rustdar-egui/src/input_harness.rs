@@ -1405,7 +1405,14 @@ impl InputHarness {
         elevation: f32,
     ) {
         use crate::overlay_cache::{OverlayTextureData, RadarTextureMeta};
-        use rustdar_radar::types::ImageBounds;
+        use rustdar_radar::types::{BASE_EXTENT_KM, ImageBounds};
+
+        // The extent this fixture's image was "projected" at. One name for the
+        // bounds and the metadata, because production derives both from the
+        // render's single `max_range_km` and a fixture that let them drift
+        // would be modelling a state the host cannot reach. The floor is the
+        // right value: the products these tests place all stop inside it.
+        let extent_km = BASE_EXTENT_KM;
 
         let (lat, lon) = {
             let pane = self
@@ -1422,7 +1429,7 @@ impl InputHarness {
         let texture = self
             .ctx
             .load_texture("harness_radar", image, egui::TextureOptions::NEAREST);
-        let bounds = ImageBounds::from_radar_site(lat, lon);
+        let bounds = ImageBounds::from_radar_site(lat, lon, extent_km);
         let cache = self
             .gui
             .pane_mut(idx)
@@ -1444,7 +1451,7 @@ impl InputHarness {
                 value_data: std::sync::Arc::new(Vec::new()),
                 lat,
                 lon,
-                max_range_km: 230.0,
+                max_range_km: extent_km,
                 product,
                 elevation,
             }),

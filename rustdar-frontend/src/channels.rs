@@ -34,10 +34,14 @@ pub struct ScanResponse {
     pub is_auto_poll: bool,
 }
 
-/// What a render produced: the RGBA texture, the range it was projected at, and
-/// the per-pixel value grid a hover reads.
+/// What a render produced: the RGBA texture, the half-width it was projected
+/// at, and the per-pixel value grid a hover reads.
 pub struct RenderedImage {
     pub image_data: Arc<Vec<u8>>,
+    /// [`rustdar_radar::types::plan_view_extent_km`] of the sweep's reach, and
+    /// so the *only* thing that says where these pixels sit on the ground.
+    /// Carried this far rather than recomputed at the far end because a
+    /// placement site has the site's coordinates but not the sweep.
     pub max_range_km: f64,
     pub value_data: Arc<Vec<f32>>,
 }
@@ -270,6 +274,11 @@ pub struct LoopRenderResponse {
     /// The receiver `take`s it rather than moving it out, so the rest of the response
     /// stays borrowable for `broadcast_sweep`.
     pub image: Option<egui::ColorImage>,
+    /// The half-width this frame was projected at, km. Per **frame**, not per
+    /// loop: a loop steps through volumes, each sweep reaches as far as it
+    /// reaches, and the frames of one loop can legitimately be different sizes
+    /// on the ground. `RadarImageData` carries it forward for exactly that
+    /// reason — every frame is placed by its own number.
     pub max_range_km: f64,
 }
 

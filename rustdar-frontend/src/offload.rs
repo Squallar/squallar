@@ -223,12 +223,17 @@ impl JobOutput {
     }
 }
 
-/// What a rasterizing job produces: the RGBA texture, the range it was
+/// What a rasterizing job produces: the RGBA texture, the half-width it was
 /// projected at, and the per-pixel value grid (`NAN` where no gate landed).
 ///
 /// Named fields rather than the renderer's `(Vec<u8>, f64, Vec<f32>)`: the two
 /// buffers are the same shape to a message port, and transposing them would
 /// swap a texture for a value grid somewhere with no type error to catch it.
+///
+/// The extent is metadata and stays metadata — it says where the pixels *are*,
+/// never how many of them there are. The image's dimensions remain
+/// `IMAGE_SIZE²` on both sides of every port here, which is what lets
+/// `loop_frame_image` keep its constant-shaped anti-blank guard.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderedFrame {
     pub image: Vec<u8>,

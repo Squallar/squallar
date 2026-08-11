@@ -111,23 +111,120 @@ fn each_cfg_arm_selects_the_image_size_named_for_it() {
     }
 }
 
-/// The derived geometry moves with whichever arm was selected.
+/// A 250 m gate has a pixel of its own at the floor, on both arms.
 ///
-/// `PIXELS_PER_KM` is the whole rasterizer's scale factor — `render::project`
-/// and `sampler`'s section geometry both go through it — so a changed
-/// `IMAGE_SIZE` that left this stale would misplace every pixel rather than
-/// resize the image. Written as the ratio rather than as a number so it
-/// cannot be satisfied by a literal that happens to match today.
+/// `MercatorProjection::px_per_km` is the whole rasterizer's scale factor, and
+/// it is now `IMAGE_SIZE / (2 · extent)` per render rather than a constant —
+/// so the property worth pinning is not the arithmetic (which the projection
+/// does in one line) but that the *coarser* arm still resolves a gate at the
+/// extent nearly every render uses. Below two pixels per kilometre a 250 m
+/// gate stops landing in a pixel of its own and the display starts dropping
+/// gates rather than drawing them small.
 #[test]
-fn pixels_per_km_follows_the_selected_image_size() {
-    assert_eq!(PIXELS_PER_KM, IMAGE_SIZE as f64 / (2.0 * MAX_RANGE_KM));
-    // Both arms land on a usable scale: the coarser of the two still puts
-    // more than two pixels on a kilometre, which is what makes a 250 m gate
-    // land in its own pixel rather than being dropped.
+fn a_quarter_kilometre_gate_still_gets_its_own_pixel_at_the_floor() {
     for size in [WASM_IMAGE_SIZE, NATIVE_IMAGE_SIZE] {
-        let scale = size as f64 / (2.0 * MAX_RANGE_KM);
+        let scale = size as f64 / (2.0 * BASE_EXTENT_KM);
         assert!(scale > 2.0, "{size} px gives {scale:.3} px/km");
     }
+}
+
+/// What each reach is drawn at, across the whole range of reaches this
+/// display can be handed.
+///
+/// The floor is the load-bearing row: everything a WSR-88D Doppler cut, a
+/// derived 1° × 1 km grid or a fetched Level III product reaches lands below
+/// 230 km, and every one of them has to project at exactly 230 or the whole
+/// fleet of renders that were correct yesterday move today.
+#[test]
+fn the_extent_is_the_reach_held_between_a_floor_and_a_cap() {
+    for (reach, extent, why) in [
+        (0.0, BASE_EXTENT_KM, "a product no radial carries"),
+        (10.0, BASE_EXTENT_KM, "a 40-gate Level III packet"),
+        (148.0, BASE_EXTENT_KM, "a WSR-88D Doppler cut at 0.25 km"),
+        (229.9, BASE_EXTENT_KM, "just inside the floor"),
+        (230.0, BASE_EXTENT_KM, "exactly the floor"),
+        (230.1, 230.1, "just past it — the floor does not round up"),
+        (298.0, 298.0, "WSR-88D Doppler, 1192 × 0.25 km"),
+        (417.0, 417.0, "TDWR long-range reflectivity, 1390 × 0.3 km"),
+        (458.0, 458.0, "WSR-88D surveillance, 1832 × 0.25 km"),
+        (470.0, MAX_EXTENT_KM, "exactly the cap"),
+        (12_000.0, MAX_EXTENT_KM, "a mis-framed gate count"),
+        (f64::INFINITY, MAX_EXTENT_KM, "an infinite reach"),
+        (-1.0, BASE_EXTENT_KM, "a negative reach"),
+    ] {
+        assert_eq!(
+            plan_view_extent_km(reach),
+            extent,
+            "{reach} km ({why}) must be drawn at {extent} km",
+        );
+    }
+    // A `NaN` reach is the one input `clamp` would pass straight through, and
+    // an unplaceable raster is a worse answer than a too-wide one.
+    assert_eq!(plan_view_extent_km(f64::NAN), BASE_EXTENT_KM);
+}
+
+/// The bounds are the extent, in degrees, and nothing else — so a raster twice
+/// as wide covers twice the ground and a 230 km one covers exactly what it
+/// always did.
+///
+/// Both halves matter, and they are asserted to different strictnesses on
+/// purpose. The scaling is checked to a relative 1e-12: the offsets are
+/// recovered by subtracting a 35° anchor from a 37° bound, and that
+/// cancellation alone costs ~1e-14 of the 2 °-wide difference it leaves, so a
+/// tighter bar would be measuring the subtraction rather than the bounds. It
+/// is still four orders inside anything a wrong extent could do — the failures
+/// this guards against are ratios like 1.0 and 2.04, not 2.000000000001. The
+/// floor is checked **bit for bit**, against the arithmetic spelt the way the
+/// pre-extent code spelt it, because there the claim is not "close": it is
+/// that nothing already on screen moved.
+#[test]
+fn bounds_scale_with_the_extent_and_reproduce_the_floor_exactly() {
+    const LAT: f64 = 35.3333;
+    const LON: f64 = -97.2778;
+
+    let at = |extent| ImageBounds::from_radar_site(LAT, LON, extent);
+    let floor = at(BASE_EXTENT_KM);
+    let doubled = at(2.0 * BASE_EXTENT_KM);
+
+    let scales = |wide: f64, narrow: f64, anchor: f64, what: &str| {
+        let (wide, narrow) = (wide - anchor, narrow - anchor);
+        assert!(
+            (wide / narrow - 2.0).abs() < 1e-12,
+            "twice the extent gave {:.12}× the {what} offset",
+            wide / narrow,
+        );
+    };
+    scales(doubled.max_lat, floor.max_lat, LAT, "latitude");
+    scales(doubled.max_lon, floor.max_lon, LON, "longitude");
+
+    // The pre-extent geometry, spelt as it was spelt: 230 km at
+    // `1/KM_PER_DEGREE_LAT` degrees per km, longitude widened by the site's
+    // own cosine.
+    //
+    // The divisor is the shared constant and not a literal, for two reasons
+    // that happen to agree. It is what the pre-extent code did — `230.0` was
+    // `MAX_RANGE_KM` and the degree was already `KM_PER_DEGREE_LAT`, so this
+    // is the arithmetic being reproduced rather than a re-derivation of it.
+    // And `rustdar-radar/tests/geodesy_one_definition.rs` scans every `.rs`
+    // file in the workspace for a second spelling of the planet: a literal
+    // `111.32` here would be exactly the fourth definition that guard exists
+    // to refuse, and it would be one in an *assertion about the bounds*, which
+    // is the worst place to keep one — the test would go on passing while the
+    // production constant moved out from under it.
+    let lat_offset = BASE_EXTENT_KM * (1.0 / KM_PER_DEGREE_LAT);
+    let lon_offset = BASE_EXTENT_KM * (1.0 / (KM_PER_DEGREE_LAT * LAT.to_radians().cos()));
+    assert_eq!(floor.min_lat.to_bits(), (LAT - lat_offset).to_bits());
+    assert_eq!(floor.max_lat.to_bits(), (LAT + lat_offset).to_bits());
+    assert_eq!(floor.min_lon.to_bits(), (LON - lon_offset).to_bits());
+    assert_eq!(floor.max_lon.to_bits(), (LON + lon_offset).to_bits());
+    assert_eq!(
+        floor.mercator_y_max.to_bits(),
+        lat_rad_to_mercator_y((LAT + lat_offset).to_radians()).to_bits(),
+    );
+    assert_eq!(
+        floor.mercator_y_min.to_bits(),
+        lat_rad_to_mercator_y((LAT - lat_offset).to_radians()).to_bits(),
+    );
 }
 
 /// A volume with no sweeps — enough to build a `ScanInfo`, and the strongest
@@ -819,9 +916,11 @@ fn a_corrected_position_reaches_every_consumer_of_it() {
     );
 
     // The raster the gates are painted into, and so where every echo lands
-    // against the map under it.
-    let was = ImageBounds::from_radar_site(table.lat, table.lon);
-    let now = ImageBounds::from_radar_site(moved.0, moved.1);
+    // against the map under it. Both at the floor extent, because what is
+    // under test is the *centre* moving: a difference in extent would move
+    // these corners for a reason that has nothing to do with the position.
+    let was = ImageBounds::from_radar_site(table.lat, table.lon, BASE_EXTENT_KM);
+    let now = ImageBounds::from_radar_site(moved.0, moved.1, BASE_EXTENT_KM);
     assert_ne!(was.min_lat, now.min_lat);
     assert_ne!(was.max_lat, now.max_lat);
     assert_ne!(was.mercator_y_min, now.mercator_y_min);

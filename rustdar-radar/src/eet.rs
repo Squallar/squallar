@@ -280,9 +280,15 @@ pub fn compute_eet(scan: &Scan, radar_height_ft: f64) -> EetGrid {
 /// used to answer that with a real site's elevation — the nearest row to Null
 /// Island, some two thousand kilometres away in the Gulf of Guinea, reported
 /// with the same confidence as `KTLX`'s own. The bound is
-/// [`crate::types::MAX_RANGE_KM`], the distance a WSR-88D can see: if not one
-/// radar in the table could observe the point being asked about, the table has
-/// nothing to say about the ground there and says so.
+/// [`crate::types::BASE_EXTENT_KM`], the WSR-88D's nominal unambiguous range:
+/// if not one radar in the table could observe the point being asked about,
+/// the table has nothing to say about the ground there and says so.
+///
+/// That constant is borrowed for its *number*, which is a property of the
+/// instrument, and not for its role as the plan view's extent floor — there
+/// is no second definition of 230 km in the workspace to reach for. A sweep
+/// that projects past the floor does not widen this bound, because how far a
+/// radar can see the ground has not changed.
 ///
 /// It is deliberately measured against the nearest row **of any datum**, not
 /// against the nearest row that can answer `datum`. Those are different
@@ -308,7 +314,8 @@ pub fn compute_eet(scan: &Scan, radar_height_ft: f64) -> EetGrid {
 /// answers `None`, having nothing else to say.
 pub fn radar_height_ft_near(lat: f64, lon: f64, datum: Datum) -> Option<f64> {
     let (nearest, _) = crate::sites::nearest_radar_site(lat, lon)?;
-    if crate::sites::distance_km(lat, lon, nearest.lat, nearest.lon) > crate::types::MAX_RANGE_KM {
+    if crate::sites::distance_km(lat, lon, nearest.lat, nearest.lon) > crate::types::BASE_EXTENT_KM
+    {
         return None;
     }
     crate::sites::radars()
@@ -618,7 +625,7 @@ mod tests {
         // the lookup still has something to say about the ground there.
         let (nearest, km) = crate::sites::nearest_radar_site(36.68, -97.2775).expect("finite");
         assert!(
-            (50.0..crate::types::MAX_RANGE_KM).contains(&km),
+            (50.0..crate::types::BASE_EXTENT_KM).contains(&km),
             "the case needs a point well away from {} but inside its range; \
              it is {km} km away",
             nearest.name,

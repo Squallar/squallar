@@ -111,20 +111,26 @@ fn the_default_content_is_a_plan_view_map() {
 ///
 /// A pane whose viewport cannot be measured — collapsed to nothing by a divider
 /// drag — is showing "the site's volume", and the plan view beside it draws echo
-/// out to `MAX_RANGE_KM`, so a fallback under that range crops the scan: echo
-/// past the box's edge simply vanishes from the 3D picture, which reads as a
-/// resample gone wrong rather than as a choice. Two facts keep it honest, and
-/// both are pinned: it reaches the raster's edge, and the resampler passes it
-/// through un-clamped, so the box the caption and the camera arithmetic describe
-/// is the box that is actually built.
+/// out to at least `types::BASE_EXTENT_KM`, so a fallback under that range crops
+/// the scan: echo past the box's edge simply vanishes from the 3D picture, which
+/// reads as a resample gone wrong rather than as a choice. Two facts keep it
+/// honest, and both are pinned: it reaches the raster's floor, and the resampler
+/// passes it through un-clamped, so the box the caption and the camera
+/// arithmetic describe is the box that is actually built.
+///
+/// "At least": a plan view is now projected at its own sweep's reach, so a
+/// 458 km surveillance cut draws echo the box does not hold. The 3D box stays
+/// at the floor deliberately — see
+/// [`rustdar_radar::voxel::MAX_HALF_WIDTH_KM`] for the cell-count reason —
+/// and this pin is the covering property that still holds.
 #[test]
 #[allow(clippy::assertions_on_constants)] // the covering bound IS a constant pin
 fn the_fallback_box_covers_the_whole_scan() {
     assert!(
-        DEFAULT_HALF_WIDTH_KM >= rustdar_radar::types::MAX_RANGE_KM,
-        "the default box must reach the scan's edge: {DEFAULT_HALF_WIDTH_KM} km \
-             of half-width against a {} km surveillance range",
-        rustdar_radar::types::MAX_RANGE_KM,
+        DEFAULT_HALF_WIDTH_KM >= rustdar_radar::types::BASE_EXTENT_KM,
+        "the default box must reach the raster's floor: {DEFAULT_HALF_WIDTH_KM} km \
+             of half-width against a {} km frame",
+        rustdar_radar::types::BASE_EXTENT_KM,
     );
     let region = VolumeRegion::new(point(35.3, -97.3), DEFAULT_HALF_WIDTH_KM)
         .expect("the default half-width must be a region the resampler takes");

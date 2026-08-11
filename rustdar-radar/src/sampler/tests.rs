@@ -1397,9 +1397,11 @@ fn the_cos_e_correction_diverges_from_the_plan_view_by_a_measured_amount() {
         );
     }
 
-    let px = |slant: f64, elev: f64| {
-        (slant - beam::ground_range_km(slant, elev)) * crate::types::PIXELS_PER_KM
-    };
+    // Both probes are inside 230 km, so the plan view they are compared
+    // against is one drawn at the floor — `plan_view_extent_km` of any reach
+    // that puts a gate here.
+    let px_per_km = crate::types::IMAGE_SIZE as f64 / (2.0 * crate::types::BASE_EXTENT_KM);
+    let px = |slant: f64, elev: f64| (slant - beam::ground_range_km(slant, elev)) * px_per_km;
     // 2048 px over 460 km is 4.4522 px/km; wasm32 halves both.
     #[cfg(not(target_arch = "wasm32"))]
     let (expected_low, expected_high) = (0.898, 17.876);

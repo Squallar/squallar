@@ -55,7 +55,7 @@
 //!
 //!   * **columns are linear in longitude**, `min_lon` at column 0 and
 //!     `max_lon` at the right edge — `render_gate` writes
-//!     `centre + dx_km · (cos φ₀ / cos φ) · PIXELS_PER_KM`, and that
+//!     `centre + dx_km · (cos φ₀ / cos φ) · px_per_km`, and that
 //!     `cos φ₀ / cos φ` factor is exactly what turns kilometres east into
 //!     degrees of longitude and back;
 //!   * **rows are linear in Web Mercator y**, not in latitude —
@@ -85,20 +85,53 @@
 //!
 //! `KDMX20250314_175512_V06`, default box, `THRESH=15`:
 //!
-//! | path | IoU identity | best translation |
-//! |---|---|---|
-//! | the deleted `resample_floor` floor | 0.5815 | (0, 0) texels |
-//! | the mirror read through `floor_colour` | 0.5777 | (0, 0) texels |
+//! | path | raster extent | IoU identity | best translation |
+//! |---|---|---|---|
+//! | the deleted `resample_floor` floor | ±230 km | 0.5815 | (0, 0) texels |
+//! | the mirror read through `floor_colour` | ±230 km | 0.5777 | (0, 0) texels |
+//! | the same, per-radial wedge widths | ±230 km | 0.5776 | (0, 0) texels |
+//! | the same, extent from the sweep | **±458 km** | **0.6789** | (−1, +2) texels |
 //!
-//! The two are the same measurement to within the mask criterion — the old one
-//! asked "does this texel differ from the ground colour", this one asks "did
-//! the mirror paint here" — and the registration verdict is identical: no
-//! translation improves on zero, every flip is crushed (0.14, 0.0005, 0.0003).
-//! The reprojection is now *exact* where `resample_floor` was a scale and a
-//! translate, so the small difference is not a regression in registration; the
-//! places the old approximation was wrong (the box's corners, by 7.6 km across
-//! and 3.7 km down) are outside this volume's echo, which stood in the south-
-//! west and inside 230 km.
+//! The first two are the same measurement to within the mask criterion — the
+//! old one asked "does this texel differ from the ground colour", this one asks
+//! "did the mirror paint here". The third is the same picture again after each
+//! radial started being painted at the width it declares rather than at the
+//! distance to its neighbour: one part in six thousand, scattered wedge-edge
+//! pixels, exactly as that change predicted.
+//!
+//! **The fourth is a different picture.** The raster is now projected at the
+//! extent its own sweep reaches, and KDMX's 0.5° surveillance cut is 1832 gates
+//! of 0.25 km — so the mirror covers ±458 km where it used to cover ±230, and
+//! the box being scored occupies a quarter of it instead of all of it. Two
+//! things follow, and they pull in opposite directions:
+//!
+//!   * **Coverage completes, and that is most of the gain.** The box's corners
+//!     stand 325 km from the site. The grid samples the volume out there and
+//!     found echo; the old raster stopped at 230 km and had nothing to show, so
+//!     every corner texel was a miss the mapping could do nothing about. The
+//!     far south-west square — where this day's storms were — goes 0.5009 →
+//!     0.8635 on that alone.
+//!   * **The mirror is half as fine, and the echo dilates.** 2.24 px/km instead
+//!     of 4.45, so `render_gate`'s two extra samples per axis pad a gate's
+//!     footprint by ~0.45 km rather than ~0.22 km: 38 208 texels painted
+//!     against 29 263. The best translation drifts off zero by one and two
+//!     texels (−0.90, +1.80 km) and buys 0.0041 of IoU, which is the dilation
+//!     finding its own centre rather than a registration error — a
+//!     mis-registration of that size would show as a centroid shift and does
+//!     not (the centroid delta *shrank*, +24.8/−17.6 → +9.3/−13.3 texels).
+//!
+//! **The mapping table stops discriminating on this volume, and that is
+//! expected.** Whole-box: honest 0.6789, trapezoid 0.6797, linear-v 0.6838 —
+//! the two deliberate perturbations now score *above* the exact mapping. Both
+//! errors grow with distance from the site in uv, and halving the uv rate
+//! halves them, which puts them under this volume's own mask noise. Only
+//! `no cos(lat)` — a first-order error, 1.34× at this latitude — still falls
+//! clear (0.4611). The discrimination that is *asserted* rather than reported
+//! lives in
+//! [`a_broken_mapping_costs_iou_in_the_corner_even_where_the_centre_cannot_tell`],
+//! whose fixture stops at 237 km and is therefore unaffected; this table was
+//! always the reported half, and the module already warned that scoring a
+//! lopsided real echo is not a fair comparison.
 //!
 //! # What this file inherited from the deleted `volume_floor/tests.rs`
 //!
@@ -223,8 +256,21 @@ impl Mirror {
     /// u is linear in longitude and v in Mercator y, both anchored at the site
     /// the way the uniform anchors them. `v_per_mercator_y` is **negative**:
     /// Mercator y grows north and rows grow south.
-    fn from_pane_raster(rgba: Vec<u8>, side: usize, site_lat: f64, site_lon: f64) -> Self {
-        let bounds = ImageBounds::from_radar_site(site_lat, site_lon);
+    ///
+    /// `extent_km` is the **render's own second return value**, not a
+    /// constant. A raster is projected at `plan_view_extent_km` of its sweep's
+    /// reach, so the fixtures here span three different amounts of ground —
+    /// 230 km where the tilt stops inside the floor, 237 km where it does not,
+    /// 458 km on a real super-res volume — and a mirror built at any other
+    /// number would score a correct mapping as broken.
+    fn from_pane_raster(
+        rgba: Vec<u8>,
+        side: usize,
+        site_lat: f64,
+        site_lon: f64,
+        extent_km: f64,
+    ) -> Self {
+        let bounds = ImageBounds::from_radar_site(site_lat, site_lon, extent_km);
         let lon_span = bounds.max_lon - bounds.min_lon;
         let merc_span = bounds.mercator_y_max - bounds.mercator_y_min;
         let site_merc = mercator_y(site_lat.to_radians());
@@ -501,11 +547,12 @@ impl Region {
         }
     }
 
-    /// One far corner — the outer quarter of the side on each axis, so roughly
-    /// 115..230 km out along both. Both the trapezoid error and the Mercator
-    /// one are at their largest here, and the radar still reaches part of it
-    /// (the raster stops at `MAX_RANGE_KM`, which cuts this square on the
-    /// diagonal).
+    /// One far corner — the outer quarter of the box's side on each axis, so
+    /// roughly 115..230 km out along both on the default box. Both the
+    /// trapezoid error and the Mercator one are at their largest here. Whether
+    /// the radar reaches all of it depends on the volume: a corner stands
+    /// 325 km from the site, so a sweep that stops at 230 km cuts this square
+    /// on the diagonal while a 458 km surveillance cut fills it.
     ///
     /// All four are worth scoring on a real volume, because a real volume's
     /// echo is wherever the weather was: the 2025-03-14 KDMX case this
@@ -812,10 +859,10 @@ fn measure_floor_against_grid_on_a_real_volume() {
         None,
     )
     .expect("a renderable base tilt");
-    let (image, _data_reach_km, _values) =
+    let (image, extent_km, _values) =
         rustdar_radar::render::render_from(&input).expect("a rendered base tilt");
     let raster_side = rustdar_radar::types::IMAGE_SIZE;
-    let mirror = Mirror::from_pane_raster(image, raster_side, site.lat, site.lon);
+    let mirror = Mirror::from_pane_raster(image, raster_side, site.lat, site.lon, extent_km);
     let geo = BoxGeo::from_grid(&grid);
 
     let side = PROBE_TEXELS;
@@ -1055,9 +1102,15 @@ fn mirror_from_field(
         None,
     )
     .expect("a renderable base tilt");
-    let (image, _reach, _values) =
+    let (image, extent_km, _values) =
         rustdar_radar::render::render_from(&input).expect("a rendered base tilt");
-    Mirror::from_pane_raster(image, rustdar_radar::types::IMAGE_SIZE, site_lat, site_lon)
+    Mirror::from_pane_raster(
+        image,
+        rustdar_radar::types::IMAGE_SIZE,
+        site_lat,
+        site_lon,
+        extent_km,
+    )
 }
 
 /// The default box, as a [`BoxGeo`] — `±DEFAULT_HALF_WIDTH_KM` about the site,
@@ -1085,11 +1138,13 @@ fn beacon_pixel(site_lat: f64, site_lon: f64, dx_km: f64, dy_km: f64) -> (f64, f
         let (x, y) = (slant_km * az.sin(), slant_km * az.cos());
         ((x - dx_km).hypot(y - dy_km) <= BLOB_KM).then_some(55.0)
     };
-    // 940 gates reach 237 km — just past `MAX_RANGE_KM`, where the rasterizer
-    // stops anyway, so every probe inside the radar's range is reachable and
-    // nothing is computed that could never be drawn. A probe further out than
-    // that would find an empty raster and trip the assertion below, which is
-    // the right failure for asking about ground the radar cannot see.
+    // 940 gates reach 237 km, so the raster is projected at 237 km — just past
+    // the floor, which keeps this fixture's geometry within 3 % of the ±230 km
+    // frame it was calibrated on while still exercising an extent the sweep
+    // chose. Every probe inside the radar's range is reachable and nothing is
+    // computed that could never be drawn; a probe further out would find an
+    // empty raster and trip the assertion below, which is the right failure for
+    // asking about ground the radar cannot see.
     let mirror = mirror_from_field(site_lat, site_lon, 720, 940, &field);
     let side = mirror.side;
     let (mut n, mut sx, mut sy) = (0usize, 0.0f64, 0.0f64);
@@ -1159,9 +1214,9 @@ fn the_boxs_site_position_lands_on_the_mirrors_site_pixel() {
     );
 
     // And the asymmetry the mapping is carrying: the site's row is off the
-    // raster's middle by Mercator's own curvature over 230 km. If this ever
-    // reads zero the raster has stopped being a Mercator picture and the v
-    // axis of the mapping is no longer the right shape for it.
+    // raster's middle by Mercator's own curvature over the frame's half-width.
+    // If this ever reads zero the raster has stopped being a Mercator picture
+    // and the v axis of the mapping is no longer the right shape for it.
     let middle = mirror.side as f64 / 2.0;
     assert!(
         (mapped.0 - middle).abs() < 1.0,
@@ -1283,13 +1338,14 @@ fn a_gate_lands_on_the_mirror_pixel_that_renders_it() {
 //    mapping moved with it;
 //  * axis flips, which mirror the off-centre, off-diagonal disc across the box
 //    and miss by hundreds of kilometres;
-//  * the historical 2026-08-09 2× floor zoom, in the only form it can still
-//    take. That bug was the raster's *data reach* fed to the old resampler as
-//    its half-extent; the mirror has no half-extent to confuse, because its
-//    geography comes from `ImageBounds::from_radar_site` and nothing else. The
-//    fixture keeps its short low tilt (700 gates, 177 km, deliberately not the
-//    raster's 230 km bounds) anyway: it costs nothing, and it means the pin is
-//    still standing over the ground where that bug lived.
+//  * the historical 2026-08-09 2× floor zoom: the raster's *data reach* fed to
+//    the old resampler as its half-extent. The reach and the extent are once
+//    again two different numbers — a raster is projected at
+//    `plan_view_extent_km` of the reach, which holds it at 230 km until the
+//    data passes that — so the fixture's short low tilt (700 gates, 177 km
+//    against a 230 km frame) is not a historical curiosity but the live
+//    discriminator: a mirror built from 177 would be 1.3× zoomed and this pin
+//    would fail.
 
 #[test]
 fn a_planted_storm_lands_on_the_floor_exactly_under_its_own_voxels() {
@@ -1303,8 +1359,9 @@ fn a_planted_storm_lands_on_the_floor_exactly_under_its_own_voxels() {
         let (dx, dy) = (slant_km * az.sin(), slant_km * az.cos());
         ((dx - DISC_KM.0).hypot(dy - DISC_KM.1) <= DISC_RADIUS_KM).then_some(55.0)
     };
-    // 700 gates: data reach 2.125 + 700·0.25 ≈ 177 km, short of the raster's
-    // 230 km bounds on purpose (see the note above).
+    // 700 gates: data reach 2.125 + 700·0.25 ≈ 177 km, inside the floor on
+    // purpose, so the render's extent is 230 km and the two numbers differ
+    // (see the note above).
     let scan = nexrad_model::data::Scan::new(
         two_tilt_vcp(),
         vec![
@@ -1343,10 +1400,15 @@ fn a_planted_storm_lands_on_the_floor_exactly_under_its_own_voxels() {
         None,
     )
     .expect("a renderable base tilt");
-    let (image, _data_reach_km, _) =
+    let (image, extent_km, _) =
         rustdar_radar::render::render_from(&input).expect("a rendered base tilt");
-    let mirror =
-        Mirror::from_pane_raster(image, rustdar_radar::types::IMAGE_SIZE, site.lat, site.lon);
+    let mirror = Mirror::from_pane_raster(
+        image,
+        rustdar_radar::types::IMAGE_SIZE,
+        site.lat,
+        site.lon,
+        extent_km,
+    );
     let geo = BoxGeo::from_grid(&grid);
     let floor = sample_floor(&mirror, &geo, Mapping::Honest);
 
@@ -1478,8 +1540,9 @@ fn a_broken_mapping_costs_iou_in_the_corner_even_where_the_centre_cannot_tell() 
         let (x, y) = (slant_km * az.sin(), slant_km * az.cos());
         block_is_lit((x / BLOCK_KM).floor() as i64, (y / BLOCK_KM).floor() as i64).then_some(55.0)
     };
-    // 940 gates reach 237 km: past `MAX_RANGE_KM`, so the raster and the grid
-    // both stop where the radar does and neither runs out of fixture first.
+    // 940 gates reach 237 km: past the 230 km floor, so the raster is projected
+    // at 237 and both it and the grid stop where the radar does rather than
+    // either running out of fixture first.
     let scan = nexrad_model::data::Scan::new(
         two_tilt_vcp(),
         vec![
@@ -1514,10 +1577,15 @@ fn a_broken_mapping_costs_iou_in_the_corner_even_where_the_centre_cannot_tell() 
         None,
     )
     .expect("a renderable base tilt");
-    let (image, _reach, _values) =
+    let (image, extent_km, _values) =
         rustdar_radar::render::render_from(&input).expect("a rendered base tilt");
-    let mirror =
-        Mirror::from_pane_raster(image, rustdar_radar::types::IMAGE_SIZE, site.lat, site.lon);
+    let mirror = Mirror::from_pane_raster(
+        image,
+        rustdar_radar::types::IMAGE_SIZE,
+        site.lat,
+        site.lon,
+        extent_km,
+    );
     let geo = BoxGeo::from_grid(&grid);
 
     let whole = Region::whole(PROBE_TEXELS);

@@ -383,8 +383,18 @@ pub const MAX_AXIS: usize = 256;
 /// resample invents smoothness.
 pub const MIN_HALF_WIDTH_KM: f64 = 10.0;
 
-/// Widest half-width a request may ask for, km — the reflectivity
-/// surveillance range, matching [`crate::types::MAX_RANGE_KM`].
+/// Widest half-width a request may ask for, km — the nominal unambiguous
+/// range, matching [`crate::types::BASE_EXTENT_KM`], the extent a plan view is
+/// drawn at whenever its data stops inside it.
+///
+/// Deliberately *not* the plan view's per-render extent. A 2D raster costs the
+/// same pixels however much ground it covers; this box costs `nx · ny · nz`
+/// cells, so following a 458 km surveillance cut out to its own reach would
+/// either quadruple the resample or halve the resolution of every 3D view of
+/// every site. The consequence is stated rather than hidden: a long-range
+/// sweep's outer returns are on the plan view beside the box and not in the
+/// box, and the pane's own km-per-cell readout is what says how coarse the
+/// trade already is.
 pub const MAX_HALF_WIDTH_KM: f64 = 230.0;
 
 /// Bottom of the box a 3D view resamples by default, kilometres MSL.

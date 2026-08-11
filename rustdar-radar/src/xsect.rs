@@ -84,27 +84,33 @@
 //! **It is now also the sphere the plan view's range ring is drawn on.** It
 //! was not: [`crate::types::ImageBounds`] worked in `1.0 / 111.32` degrees per
 //! km — a 6378 km sphere — and the 230 km ring was drawn at
-//! `MAX_RANGE_KM / 111.32` degrees of latitude, which converted back on 6371
-//! is 229.742 km. A point the ring put at 230 km therefore read **258.4 m
+//! `230 / 111.32` degrees of latitude, which converted back on 6371 is
+//! 229.742 km. A point the ring put at 230 km therefore read **258.4 m
 //! nearer the site** here, 1.15 px on a 2048-wide plan view. `ImageBounds`
 //! reads [`crate::types::KM_PER_DEGREE_LAT`] now, which *is*
 //! `EARTH_RADIUS_KM · π/180`, so the two agree exactly and
 //! `the_ground_track_and_the_range_ring_are_the_same_sphere` pins that they
 //! keep agreeing.
 //!
-//! # Clipped to the data, not to `MAX_RANGE_KM`
+//! The ring's radius is now the render's own `extent_km` rather than a
+//! constant, and that changes nothing here: the agreement is a ratio of the
+//! two spheres, so it holds at every extent a sweep can ask for.
 //!
-//! A plan view stops at [`crate::types::MAX_RANGE_KM`] because its frame spans
-//! ±230 km and a gate outside it has nowhere to go. A section has no such
-//! frame — it has the line the user drew — so clipping there would silently
-//! discard real super-resolution returns, which reach 300 km on the Doppler
-//! half of a split cut and 460 km on the surveillance half. So this module
-//! draws the whole line and reports [`SectionAxes::coverage_ground_range_km`]:
-//! the farthest ground range at which this section actually found a gate.
-//! Compared against [`SectionAxes::far_ground_range_km`] it says whether the
-//! drawing ran out of data before it ran out of line, which is exactly the
-//! "declared extent matches the artifact" property a plan view's `max_range`
-//! does not have.
+//! # Drawn to the line, where a plan view is drawn to the data
+//!
+//! A plan view's frame is now sized from its own sweep
+//! ([`crate::types::plan_view_extent_km`]), so it no longer throws returns
+//! away: a surveillance cut's 460 km and a TDWR's 417 km are drawn, where a
+//! fixed ±230 km frame had nowhere to put them.
+//!
+//! A section has no such option, because its extent is not the data's — it is
+//! the line the user drew, and that line routinely outruns the volume. So this
+//! module draws the whole line and reports
+//! [`SectionAxes::coverage_ground_range_km`]: the farthest ground range at
+//! which this section actually found a gate. Compared against
+//! [`SectionAxes::far_ground_range_km`] it says whether the drawing ran out of
+//! data before it ran out of line — a question a plan view cannot be asked,
+//! since its frame is cut to fit.
 //!
 //! # Two numbers that exist because a section can lie
 //!

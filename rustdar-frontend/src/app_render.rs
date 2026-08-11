@@ -388,8 +388,12 @@ impl super::App {
             });
         }
 
-        // Store in overlay cache with radar metadata
-        let bounds = ImageBounds::from_radar_site(lat, lon);
+        // Store in overlay cache with radar metadata. The bounds come from the
+        // render's own `max_range_km` — the half-width it projected at — so
+        // the texture is placed on exactly the ground its gates were painted
+        // onto, whether that is the 230 km floor or a TDWR long-range cut's
+        // 417 km.
+        let bounds = ImageBounds::from_radar_site(lat, lon, render.max_range_km);
         let geo_bounds = GeoBounds {
             min_lat: bounds.min_lat,
             max_lat: bounds.max_lat,
@@ -1318,7 +1322,12 @@ impl super::App {
             let texture =
                 ctx.load_texture(texture_name, color_image, egui::TextureOptions::NEAREST);
 
-            let bounds = ImageBounds::from_radar_site(lat, lon);
+            // The cached extent, not a fresh one: these are the pixels the
+            // render produced, so they belong on the ground that render
+            // projected them onto. A resume that rebuilt the bounds from
+            // anything else would put a restored long-range image back at the
+            // wrong size, which reads as a pane that moved while suspended.
+            let bounds = ImageBounds::from_radar_site(lat, lon, max_range_km);
             let geo_bounds = GeoBounds {
                 min_lat: bounds.min_lat,
                 max_lat: bounds.max_lat,

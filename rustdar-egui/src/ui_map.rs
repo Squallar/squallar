@@ -1145,20 +1145,26 @@ impl super::Gui {
     /// Draw the rubber band of an in-flight draw and the ground track of every
     /// section cut from this map.
     ///
-    /// # The track is ~258 m inside the range ring, deliberately
+    /// # The track ends exactly on the range ring
     ///
-    /// `render_radar_range_ring` places its circle with `MAX_RANGE_KM / 111.32`
-    /// degrees of latitude, and 111.32 km per degree is a sphere of 6378.1 km —
-    /// the WGS84 equatorial radius. The section's geometry, and this track with
-    /// it, walks [`rustdar_radar::types::EARTH_RADIUS_KM`], which is 6371. So a
-    /// track drawn all the way to the edge of coverage lands
-    /// 230 × (1 − 6371/6378.1) ≈ 0.26 km inside the ring, which is 1.15 px at
-    /// the zoom where the whole ring fits a 2048-pixel pane.
+    /// It used to end ~258 m inside it. `render_radar_range_ring` placed its
+    /// circle with `230 / 111.32` degrees of latitude, and 111.32 km per degree
+    /// is a sphere of 6378.1 km — the WGS84 equatorial radius — while the
+    /// section's geometry, and this track with it, walks
+    /// [`rustdar_radar::types::EARTH_RADIUS_KM`], which is 6371. A track drawn
+    /// all the way to the edge of coverage therefore landed
+    /// `230 × (1 − 6371/6378.1)` ≈ 0.26 km inside the ring, 1.15 px at the zoom
+    /// where the whole ring fits a 2048-pixel pane.
     ///
-    /// Measured rather than assumed, and left alone rather than reconciled:
-    /// changing either constant to match the other moves a number that is
-    /// correct for what it describes. The ring is a rendering convenience; the
-    /// track is where the beam went.
+    /// The ring now divides by [`rustdar_radar::types::KM_PER_DEGREE_LAT`],
+    /// which *is* `EARTH_RADIUS_KM · π/180`, so the two are on one sphere and
+    /// the gap is gone; `rustdar_radar`'s
+    /// `the_ground_track_and_the_range_ring_are_the_same_sphere` measures the
+    /// residual at the millimetre.
+    ///
+    /// The ring's radius is the render's own `extent_km` rather than a constant
+    /// now, and that does not reopen anything: the agreement is a ratio of the
+    /// two radii, so it holds at a TDWR's 417 km frame exactly as at 230.
     ///
     /// # And the track is a polyline, because the cut is a great circle
     ///

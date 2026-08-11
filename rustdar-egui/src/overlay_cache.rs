@@ -157,7 +157,8 @@ pub fn plan_overlay_texture(screen_rect: egui::Rect, max_texture_side: u32) -> O
 /// Radar-specific metadata stored alongside the overlay texture.
 ///
 /// Non-radar overlays set `radar_meta: None`. Radar overlays carry hover
-/// value data, site coordinates, and range for per-frame range ring + tooltip.
+/// value data, site coordinates, and the extent they were projected at, which
+/// the per-frame range ring and tooltip both place themselves from.
 pub struct RadarTextureMeta {
     /// Per-pixel values for hover tooltip lookup.
     pub value_data: Arc<Vec<f32>>,
@@ -165,7 +166,14 @@ pub struct RadarTextureMeta {
     pub lat: f64,
     /// Radar site longitude.
     pub lon: f64,
-    /// Maximum range in km (for range ring).
+    /// The half-width this texture was projected at, km — the renderer's own
+    /// answer, which is the sweep's reach held between
+    /// [`rustdar_radar::types::BASE_EXTENT_KM`] and `MAX_EXTENT_KM`.
+    ///
+    /// It travels with the texture rather than beside it for the same reason
+    /// `product` does: a pane-level copy could outlive the pixels it
+    /// describes, and geography that outlives its picture places the next one
+    /// wrong.
     pub max_range_km: f64,
     /// The product these pixels depict.
     ///

@@ -33,6 +33,11 @@ pub struct RadarImageData {
     pub texture: egui::TextureHandle,
     pub lat: f64,
     pub lon: f64,
+    /// The half-width this frame was projected at, km — what the renderer
+    /// handed back, and the only statement of where these pixels are. The
+    /// texture is placed between the corners
+    /// [`rustdar_radar::types::ImageBounds::from_radar_site`] builds from it,
+    /// the range ring is drawn on it, and the hover picks a pixel out of it.
     pub max_range_km: f64,
     pub value_data: Arc<Vec<f32>>,
 }

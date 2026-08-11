@@ -51,8 +51,51 @@ pub const IMAGE_SIZE: usize = WASM_IMAGE_SIZE;
 #[cfg(not(target_arch = "wasm32"))]
 pub const IMAGE_SIZE: usize = NATIVE_IMAGE_SIZE;
 
-pub const MAX_RANGE_KM: f64 = 230.0; // NEXRAD max range ~230km
-pub const PIXELS_PER_KM: f64 = IMAGE_SIZE as f64 / (2.0 * MAX_RANGE_KM);
+/// The half-width a plan view is projected at when the data does not reach
+/// further, km — and so the extent of nearly every render this display makes.
+///
+/// 230 km is the WSR-88D's nominal unambiguous range and the extent this
+/// rasterizer was fixed at for its whole life. It is kept as the **floor**
+/// rather than as the extent so that every sweep whose data stops inside it —
+/// which is every Doppler cut of a split cut, every derived 1° × 1 km grid,
+/// and every Level III product this display fetches — projects at exactly the
+/// scale it always did, pixel for pixel.
+pub const BASE_EXTENT_KM: f64 = 230.0;
+
+/// The furthest half-width a plan view will project at, km.
+///
+/// Not a range any radar reaches: the longest real reach in this display is a
+/// WSR-88D surveillance cut at 1832 × 0.25 km = 458 km, and a TDWR's
+/// long-range reflectivity is 1390 × 0.3 km = 417 km. It is a ceiling on
+/// *arithmetic*, because the extent is now derived from a gate count that
+/// arrives over the wire: a mis-framed radial claiming sixty thousand gates
+/// would otherwise zoom the whole display out to a continent. 470 km clears
+/// the widest honest sweep by 12 km and turns every impossible one into a
+/// render that is merely too coarse.
+pub const MAX_EXTENT_KM: f64 = 470.0;
+
+/// The half-width to project a plan view at, km, given how far its data
+/// reaches.
+///
+/// The reach comes from the sweep itself ([`crate::render`]'s
+/// `compute_max_range`), so this is the one place the raster's geometry is
+/// decided, and both bounds are decisions rather than measurements: the floor
+/// keeps short sweeps drawn the way they have always been drawn, and the cap
+/// keeps a corrupt gate count from redefining the display.
+///
+/// A `NaN` reach answers the floor. Nothing in the decode path can produce one
+/// today — gate counts and intervals are integers off the wire — but `clamp`
+/// propagates a `NaN` rather than rejecting it, and a `NaN` extent would reach
+/// [`ImageBounds`] and make every pixel of the render unplaceable with no error
+/// anywhere. An infinite reach needs no special case: it is only the cap's case
+/// taken to its limit, and `clamp` answers it correctly.
+pub fn plan_view_extent_km(data_reach_km: f64) -> f64 {
+    if data_reach_km.is_nan() {
+        return BASE_EXTENT_KM;
+    }
+    data_reach_km.clamp(BASE_EXTENT_KM, MAX_EXTENT_KM)
+}
+
 /// Mean radius of Earth in kilometers — the IUGG mean radius, and the one
 /// sphere every *horizontal* measurement in this workspace stands on.
 ///
@@ -131,19 +174,32 @@ pub struct ImageBounds {
 }
 
 impl ImageBounds {
-    /// Extent is `MAX_RANGE_KM` in every direction from the site.
+    /// Extent is `extent_km` in every direction from the site — the number
+    /// [`plan_view_extent_km`] chose for this render, not a constant.
+    ///
+    /// It is a parameter and not a default because these bounds are the *only*
+    /// statement of where a raster's pixels are: the frontend places the
+    /// texture between the corners this returns, the hover reads a pixel back
+    /// out of them, and the volume bridge reprojects the whole picture through
+    /// them. A caller that built bounds at one extent for a raster painted at
+    /// another would misplace every pixel by their ratio with nothing to
+    /// notice it, so there is no argument-free way to get bounds at all: the
+    /// render that made the picture reports its extent as `max_range_km`, and
+    /// every placement site hands that back here.
     ///
     /// On [`KM_PER_DEGREE_LAT`], which is [`EARTH_RADIUS_KM`] — the same
     /// sphere [`crate::render::render_gate`] paints the gates inside these
     /// bounds on. It read `111.32` until the two were unified; see that
-    /// constant for what moved.
-    pub fn from_radar_site(radar_lat: f64, radar_lon: f64) -> Self {
+    /// constant for what moved. The two changes compose: the ratio is the
+    /// sphere's and the multiplier is the render's, so a frame drawn at a
+    /// TDWR's 417 km is placed on the same planet as a 230 km one.
+    pub fn from_radar_site(radar_lat: f64, radar_lon: f64, extent_km: f64) -> Self {
         let radar_lat_rad = radar_lat.to_radians();
         let lat_deg_per_km = 1.0 / KM_PER_DEGREE_LAT;
         let lon_deg_per_km = 1.0 / (KM_PER_DEGREE_LAT * radar_lat_rad.cos());
 
-        let max_lat_offset = MAX_RANGE_KM * lat_deg_per_km;
-        let max_lon_offset = MAX_RANGE_KM * lon_deg_per_km;
+        let max_lat_offset = extent_km * lat_deg_per_km;
+        let max_lon_offset = extent_km * lon_deg_per_km;
 
         let min_lat = radar_lat - max_lat_offset;
         let max_lat = radar_lat + max_lat_offset;

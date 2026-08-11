@@ -79,7 +79,10 @@ fn digest(image: &[u8], values: &[f32]) -> u64 {
 fn fixture_covers_a_realistic_share_of_the_image() {
     let (image, values) = render(&packet(None));
     let painted = image.chunks_exact(4).filter(|px| px[3] != 0).count();
-    let disc = std::f64::consts::PI * (N_BINS as f64 * 0.25 * types::PIXELS_PER_KM).powi(2);
+    // 600 gates of 0.25 km reach 150 km, inside the floor, so this fixture is
+    // drawn on the 230 km frame every short product gets.
+    let px_per_km = types::IMAGE_SIZE as f64 / (2.0 * types::BASE_EXTENT_KM);
+    let disc = std::f64::consts::PI * (N_BINS as f64 * 0.25 * px_per_km).powi(2);
     assert!(
         (painted as f64) > disc * 0.9 && (painted as f64) < disc * 1.1,
         "painted {painted}, expected about {disc:.0} for a {N_BINS}-gate disc"
@@ -334,26 +337,38 @@ fn render_l2(gates: &[u8], product: types::RadarProduct) -> (Vec<u8>, Vec<f32>) 
     (image, values)
 }
 
-/// Which pixel a point `range_km` out at `az_deg` from the site lands in,
-/// through the same [`MercatorProjection`] the renderer paints with.
+/// Which pixel a point `range_km` out at `az_deg` from the site lands in on a
+/// raster projected at `extent_km`, through the same [`MercatorProjection`]
+/// the renderer paints with.
 ///
 /// A duplicate of the arithmetic in `render_gate` rather than a call into it,
 /// because `render_gate` writes and this asks. Both walk azimuth → offset →
 /// Mercator → truncated pixel, and the truncation is why a probe has to go
 /// through the projection at all: a hand-computed pixel would be off by one
 /// somewhere and the difference between "unpainted" and "off by one" is the
-/// whole point of these tests. Probes are kept well inside 230 km so the
-/// answer does not depend on the raster's extent.
-fn probe(az_deg: f64, range_km: f64) -> usize {
-    let bounds = types::ImageBounds::from_radar_site(LAT, LON);
-    let proj = MercatorProjection::from_bounds(LAT, &bounds);
+/// whole point of these tests.
+///
+/// The extent is an argument because it is now a property of the render being
+/// probed rather than of the display: a fixture reaching 150 km is drawn on
+/// the 230 km floor and a TDWR-shaped one on a 417 km frame, and a probe that
+/// assumed either would be asking about the wrong picture. Callers pass what
+/// the render they are probing handed back.
+fn probe_at(extent_km: f64, az_deg: f64, range_km: f64) -> usize {
+    let bounds = types::ImageBounds::from_radar_site(LAT, LON, extent_km);
+    let proj = MercatorProjection::from_bounds(LAT, &bounds, extent_km);
     let (sin_az, cos_az) = az_deg.to_radians().sin_cos();
     let dest_lat_rad = proj.radar_lat_rad + (range_km * cos_az) / types::EARTH_RADIUS_KM;
     let cos_correction = proj.cos_radar_lat / dest_lat_rad.cos();
-    let px = (proj.center_px + range_km * sin_az * cos_correction * types::PIXELS_PER_KM) as usize;
+    let px = (proj.center_px + range_km * sin_az * cos_correction * proj.px_per_km) as usize;
     let py = ((proj.merc_y_top - types::lat_rad_to_mercator_y(dest_lat_rad)) * proj.merc_y_scale)
         as usize;
     py * types::IMAGE_SIZE + px
+}
+
+/// [`probe_at`] on the floor, which is where every fixture in this file that
+/// does not say otherwise is drawn — their moments reach 150 km.
+fn probe(az_deg: f64, range_km: f64) -> usize {
+    probe_at(types::BASE_EXTENT_KM, az_deg, range_km)
 }
 
 /// Assert what the sweep painted at a list of `(azimuth, range)` probes.
@@ -727,6 +742,252 @@ fn a_sweep_with_no_declaration_is_capped_at_a_sane_wedge() {
     );
 }
 
+// ── How far a render reaches, and how wide it is drawn ───────────────────
+//
+// A raster used to be ±230 km whatever it held, and the gate loops stopped
+// there. It is now projected at `types::plan_view_extent_km` of the sweep's
+// own reach, so what a render reports is the half-width of the *picture* and
+// the pictures below are three different sizes.
+
+/// Gates in TPIT's long-range surveillance cut.
+const TDWR_GATES: usize = 1390;
+/// Its gate, km. 1390 of them reach 417.
+const TDWR_GATE_KM: f64 = 0.3;
+/// Gates either side of the beacon's own, so the ring is five gates thick —
+/// 1.5 km, three or four pixels at the 2.46 px/km a 417 km frame gives a
+/// 2048-pixel image, which is enough to survive azimuth quantization at every
+/// bearing rather than only at the four cardinals.
+const TDWR_BEACON_GATES: usize = 2;
+
+/// A TDWR long-range reflectivity cut, as TPIT actually flies it: 1390 gates
+/// of 300 m from the antenna, 360 radials at the 1.0° a TDWR declares.
+///
+/// Every gate is below threshold except a band `beacon_km` out, so the render
+/// is a thin ring at a known range rather than a filled disc — a filled one
+/// would put its outermost pixels at the reach whatever happened in between,
+/// and the point here is *where* a single far return lands.
+fn tdwr_long_range_sweep(beacon_km: f64) -> Scan {
+    use nexrad_model::data::{MomentData, PulseWidth, RadialStatus, Sweep, VolumeCoveragePattern};
+
+    let beacon_gate = (beacon_km / TDWR_GATE_KM).round() as usize;
+    let gates: Vec<u8> = (0..TDWR_GATES)
+        .map(|g| {
+            if g.abs_diff(beacon_gate) <= TDWR_BEACON_GATES {
+                200
+            } else {
+                0
+            }
+        })
+        .collect();
+    let radials = (0..360)
+        .map(|i| {
+            Radial::new(
+                0,
+                i as u16,
+                i as f32,
+                1.0,
+                RadialStatus::IntermediateRadialData,
+                1,
+                L2_ELEVATION,
+                Some(MomentData::from_fixed_point(
+                    TDWR_GATES as u16,
+                    0,
+                    (TDWR_GATE_KM * 1000.0) as u16,
+                    8,
+                    SCALE,
+                    OFFSET,
+                    gates.clone(),
+                )),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        })
+        .collect();
+    Scan::new(
+        VolumeCoveragePattern::new(
+            80,
+            0,
+            0.5,
+            PulseWidth::Short,
+            false,
+            0,
+            false,
+            0,
+            false,
+            false,
+            0,
+            false,
+            false,
+            Vec::new(),
+        ),
+        vec![Sweep::new(1, radials)],
+    )
+}
+
+/// Every painted pixel's ground range from the site, km, read back out of the
+/// bounds the render declares — the inverse of the trip `render_gate` makes,
+/// so it answers in the same kilometres the gates were indexed by.
+fn painted_ranges_km(values: &[f32], extent_km: f64) -> Vec<f64> {
+    let bounds = types::ImageBounds::from_radar_site(LAT, LON, extent_km);
+    let side = types::IMAGE_SIZE;
+    let merc_span = bounds.mercator_y_max - bounds.mercator_y_min;
+    (0..side)
+        .flat_map(|row| (0..side).map(move |col| (row, col)))
+        .filter(|&(row, col)| !values[row * side + col].is_nan())
+        .map(|(row, col)| {
+            let lon = bounds.min_lon
+                + (col as f64 + 0.5) / side as f64 * (bounds.max_lon - bounds.min_lon);
+            let merc_y = bounds.mercator_y_max - (row as f64 + 0.5) / side as f64 * merc_span;
+            let lat = (2.0 * merc_y.exp().atan() - std::f64::consts::FRAC_PI_2).to_degrees();
+            crate::beam::site_bearing_range_km(LAT, LON, lat, lon).1
+        })
+        .collect()
+}
+
+/// A TDWR's long-range reflectivity is drawn to the 417 km it reaches, and a
+/// return 400 km out lands where the render's own projection says it should.
+///
+/// 1390 gates of 300 m is the cut TPIT flies on its lowest tilt, and it is the
+/// case the fixed 230 km frame threw away outright: everything past gate 767
+/// fell out of the loop, so nearly half the sweep's range — the whole outer
+/// two thirds of its area — was decoded, held in memory and never drawn.
+#[test]
+fn a_tdwr_long_range_sweep_is_projected_at_its_own_reach() {
+    const BEACON_KM: f64 = 400.2; // gate 1334's centre
+    let scan = tdwr_long_range_sweep(BEACON_KM);
+    let (_, extent_km, values) =
+        render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, LAT, LON).unwrap();
+
+    assert!(
+        (extent_km - 417.0).abs() < 1e-9,
+        "1390 gates of 0.3 km reach 417 km; the render declares {extent_km} km",
+    );
+
+    // The beacon, at four bearings, on the frame this render declared. Not on
+    // the floor's frame: a probe there would be asking about a picture 1.81×
+    // smaller, and 400 km east of the site is not on it at all.
+    for az in [0.0, 90.0, 180.0, 270.0] {
+        let at = probe_at(extent_km, az, BEACON_KM);
+        assert!(
+            !values[at].is_nan(),
+            "the beacon 400 km out at {az}° is unpainted at the pixel this \
+             render's own projection puts it in",
+        );
+    }
+
+    // And the picture really is wider than the wall was, measured off the
+    // pixels: the eastmost painted column stands at the beacon's outer edge,
+    // 170 km past where every gate used to stop. Due east the projection's
+    // `cos φ₀ / cos φ` factor is exactly 1, so a column is the range in pixels
+    // and nothing else.
+    let side = types::IMAGE_SIZE;
+    let px_per_km = side as f64 / (2.0 * extent_km);
+    let east = (0..side)
+        .rev()
+        .find(|&col| (0..side).any(|row| !values[row * side + col].is_nan()))
+        .expect("the beacon painted something");
+    let painted_km = (east as f64 + 0.5 - side as f64 / 2.0) / px_per_km;
+    assert!(
+        painted_km > types::BASE_EXTENT_KM,
+        "the outermost painted column stands {painted_km:.1} km out, still \
+         inside the {} km wall this render is here to be past",
+        types::BASE_EXTENT_KM,
+    );
+    // The band's own far edge: its outermost gate's centre plus half a gate.
+    // Two pixels of tolerance for `render_gate`'s sample padding and the
+    // truncating cast that turns a position into a column — 0.81 km at this
+    // extent, which is under three of the 0.3 km gates being drawn.
+    let band_edge_km =
+        ((BEACON_KM / TDWR_GATE_KM).round() + TDWR_BEACON_GATES as f64 + 0.5) * TDWR_GATE_KM;
+    assert!(
+        (painted_km - band_edge_km).abs() < 2.0 / px_per_km,
+        "the outermost painted column stands {painted_km:.2} km out against a \
+         beacon band ending at {band_edge_km:.2} km",
+    );
+}
+
+/// A sweep whose data stops inside the floor is drawn on the floor's frame,
+/// at the scale it has always been drawn at.
+///
+/// This is the guarantee the floor exists for. `l2_sweep`'s moments are 600
+/// gates of 250 m — 150 km, the shape of a WSR-88D Doppler cut — so the
+/// picture must come out 230 km wide with the echo filling 150 km of it, and
+/// the radius is recovered from the pixels rather than assumed: the painted
+/// disc's outermost column is measured and converted back at
+/// `IMAGE_SIZE / 460`, the km-per-pixel this display had before there was an
+/// extent at all.
+#[test]
+fn a_sweep_inside_the_floor_is_drawn_at_the_floor() {
+    let azimuths: Vec<f32> = (0..360).map(|i| i as f32).collect();
+    let scan = l2_sweep(&[200; 360], &azimuths, 1.0, false);
+    let (_, extent_km, values) =
+        render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, LAT, LON).unwrap();
+
+    assert_eq!(
+        extent_km,
+        types::BASE_EXTENT_KM,
+        "a 150 km sweep must be drawn on the 230 km frame it always was",
+    );
+
+    // Due east and due west of the site the projection's `cos φ₀ / cos φ`
+    // factor is exactly 1 — the destination sits at the site's own latitude —
+    // so the extreme columns of the painted disc are the reach in pixels,
+    // with no Mercator row arithmetic in the way.
+    let side = types::IMAGE_SIZE;
+    let row = side / 2;
+    let painted = |col: usize| !values[row * side + col].is_nan();
+    let east = (0..side).rev().find(|&c| painted(c)).expect("echo east");
+    let west = (0..side).find(|&c| painted(c)).expect("echo west");
+
+    let px_per_km = side as f64 / (2.0 * types::BASE_EXTENT_KM);
+    let radius_km = (east - west) as f64 / 2.0 / px_per_km;
+    assert!(
+        (radius_km - 150.0).abs() < 1.0,
+        "600 gates of 0.25 km must fill 150 km of the frame; the disc measures \
+         {radius_km:.2} km across columns {west}..{east} at {px_per_km:.4} px/km",
+    );
+}
+
+/// The number a render reports bounds the picture it hands over: nothing is
+/// painted further from the site than the extent, on a frame that is full and
+/// on a frame that is not.
+///
+/// The property every consumer of `max_range_km` depends on and none of them
+/// can check. The frontend places the texture between the bounds this extent
+/// builds, and a hover divides a pointer position by them to pick a pixel
+/// back out — so a gate painted past the extent would be a return the display
+/// draws in one place and reads from another, with nothing anywhere to notice.
+#[test]
+fn nothing_is_painted_outside_the_extent_a_render_declares() {
+    let azimuths: Vec<f32> = (0..360).map(|i| i as f32).collect();
+    for (scan, why) in [
+        (
+            l2_sweep(&[200; 360], &azimuths, 1.0, false),
+            "150 km of echo",
+        ),
+        (tdwr_long_range_sweep(400.2), "a 417 km TDWR cut"),
+    ] {
+        let (_, extent_km, values) =
+            render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, LAT, LON).unwrap();
+        let ranges = painted_ranges_km(&values, extent_km);
+        assert!(!ranges.is_empty(), "{why} painted nothing");
+
+        let furthest = ranges.iter().copied().fold(0.0f64, f64::max);
+        // One pixel of slop: a pixel's *centre* is what is measured and a gate
+        // reaching exactly the extent claims the pixel it starts in.
+        let slop = 1.0 / (types::IMAGE_SIZE as f64 / (2.0 * extent_km));
+        assert!(
+            furthest <= extent_km + slop,
+            "{why}: a pixel {furthest:.2} km out on a raster declaring \
+             {extent_km:.2} km",
+        );
+    }
+}
+
 /// The same rule on the derived grids, which have no declaration to read: a
 /// 36° NROT sector must stop at its own edge.
 ///
@@ -937,25 +1198,36 @@ fn message_with_lying_scale_factor(product_code: i16, bins: usize) -> Level3Mess
 /// display path has to prefer the PDB's override the way the
 /// twin-comparison path does, or the on-screen KDP field draws 4× too
 /// far out. A product without an override keeps the packet's own value.
+///
+/// Both arms are given enough gates to reach past
+/// [`types::BASE_EXTENT_KM`], because what a render reports is the extent it
+/// was projected at and below the floor that is 230 km whatever the spacing —
+/// which is exactly the observation this test would lose. 1200 gates at the
+/// ICD's 0.25 km is 300 km; believing the packet instead would ask for
+/// 1201 km and be held at the cap. 460 gates at the packet's own ~1.001 km is
+/// 460.5 km; a spurious override would collapse it to 115 km and be held at
+/// the floor. So each arm's wrong answer is a different number from its right
+/// one on both sides.
 #[test]
 fn message_path_prefers_the_pdb_gate_spacing_over_the_packets() {
-    const BINS: usize = 40;
+    const ICD_BINS: usize = 1200;
+    const PACKET_BINS: usize = 460;
 
-    let (_, max_range, _) = render_level3_message_to_image(
-        &message_with_lying_scale_factor(163, BINS),
+    let (_, extent_km, _) = render_level3_message_to_image(
+        &message_with_lying_scale_factor(163, ICD_BINS),
         types::RadarProduct::SpecificDifferentialPhase,
         LAT,
         LON,
     )
     .unwrap();
     assert!(
-        (max_range - BINS as f64 * 0.25).abs() < 1e-9,
-        "163 must render at the ICD's 0.25 km spacing, got a max range of {max_range} km \
-             from {BINS} gates"
+        (extent_km - ICD_BINS as f64 * 0.25).abs() < 1e-9,
+        "163 must render at the ICD's 0.25 km spacing, got an extent of {extent_km} km \
+             from {ICD_BINS} gates"
     );
 
-    let (_, max_range, _) = render_level3_message_to_image(
-        &message_with_lying_scale_factor(94, BINS),
+    let (_, extent_km, _) = render_level3_message_to_image(
+        &message_with_lying_scale_factor(94, PACKET_BINS),
         PRODUCT,
         LAT,
         LON,
@@ -963,9 +1235,9 @@ fn message_path_prefers_the_pdb_gate_spacing_over_the_packets() {
     .unwrap();
     let packet_km = 1.0 / 0.999_f32 as f64;
     assert!(
-        (max_range - BINS as f64 * packet_km).abs() < 1e-9,
-        "a product with no PDB override must keep the packet's spacing, got a max range \
-             of {max_range} km from {BINS} gates"
+        (extent_km - PACKET_BINS as f64 * packet_km).abs() < 1e-9,
+        "a product with no PDB override must keep the packet's spacing, got an extent \
+             of {extent_km} km from {PACKET_BINS} gates"
     );
 }
 

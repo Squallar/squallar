@@ -807,12 +807,18 @@ pub struct VolumeRegion {
 /// The half-width a pane falls back to when its viewport cannot be measured,
 /// kilometres.
 ///
-/// **The resampler's own maximum, which is the full surveillance range** —
+/// **The resampler's own maximum, which is the nominal unambiguous range** —
 /// [`rustdar_radar::voxel::MAX_HALF_WIDTH_KM`] matches
-/// `rustdar_radar::types::MAX_RANGE_KM`, the 230 km the plan view's raster is
-/// drawn to. A pane whose viewport is degenerate — collapsed to nothing by a
-/// divider drag, or projecting off Earth — is answering "show me this site's
-/// volume", and the widest honest box is the one that crops nothing.
+/// `rustdar_radar::types::BASE_EXTENT_KM`, the 230 km a plan view's raster is
+/// drawn to whenever its data stops inside it. A pane whose viewport is
+/// degenerate — collapsed to nothing by a divider drag, or projecting off
+/// Earth — is answering "show me this site's volume", and the widest honest
+/// box is the one that crops nothing.
+///
+/// A long-range sweep — a 458 km surveillance cut, a TDWR's 417 km — is drawn
+/// past this box on the plan view, so the crop is not gone, only moved out to
+/// where it costs least; `MAX_HALF_WIDTH_KM` records why the box does not
+/// follow.
 ///
 /// The floor is not guaranteed to cover *this* box, because nothing measured
 /// the viewport it would have to cover. That is the correct trade for a state

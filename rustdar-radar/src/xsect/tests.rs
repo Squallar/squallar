@@ -988,7 +988,12 @@ fn dropping_the_cos_e_correction_would_move_the_wall_further_than_the_tolerance(
 /// 2048-wide plan view, always in the same direction. `ImageBounds` reads
 /// [`crate::types::KM_PER_DEGREE_LAT`] now, which is the *expression*
 /// `EARTH_RADIUS_KM · π/180`, so the ring's latitude offset converts back to
-/// exactly `MAX_RANGE_KM`.
+/// exactly the extent it was drawn at.
+///
+/// Measured at [`crate::types::BASE_EXTENT_KM`], and that is enough for every
+/// extent. The closure is a *ratio* of the two spheres, now 1, so it holds at
+/// a TDWR's 417 km frame and a surveillance cut's 458 km one for the same
+/// reason it holds here — there is no per-extent case to check.
 ///
 /// The residual is asserted at the millimetre rather than at zero because
 /// `site_bearing_range_km` is a haversine round trip through `sin`/`asin` and
@@ -997,24 +1002,28 @@ fn dropping_the_cos_e_correction_would_move_the_wall_further_than_the_tolerance(
 /// reason that has nothing to do with which sphere anything is on.
 #[test]
 fn the_ground_track_and_the_range_ring_are_the_same_sphere() {
-    let ring_deg = types::MAX_RANGE_KM / types::KM_PER_DEGREE_LAT;
+    let ring_deg = types::BASE_EXTENT_KM / types::KM_PER_DEGREE_LAT;
 
     // The same latitude offset, measured the way this module measures it.
     let ring_point = (SITE.0 + ring_deg, SITE.1);
     let (_, ours_km) = beam::site_bearing_range_km(SITE.0, SITE.1, ring_point.0, ring_point.1);
 
-    let gap_mm = (types::MAX_RANGE_KM - ours_km) * 1e6;
+    let gap_mm = (types::BASE_EXTENT_KM - ours_km) * 1e6;
     assert!(
         gap_mm.abs() < 1.0,
         "a point the {} km ring draws reads {ours_km:.9} km here, a \
              {gap_mm:.3} mm gap — the 6371/6378 seam this test was written \
              to record has reopened",
-        types::MAX_RANGE_KM,
+        types::BASE_EXTENT_KM,
     );
 
     // In pixels of the plan view the ring is drawn on: under a millionth of
     // one, on either target, so the figure is stated rather than branched on.
-    let px = gap_mm / 1e6 * types::PIXELS_PER_KM;
+    // The scale is computed rather than read off a constant because there is
+    // no longer a constant to read — a render's pixels-per-km is its own
+    // `IMAGE_SIZE / (2 · extent)`, and this is that at the floor.
+    let px_per_km = types::IMAGE_SIZE as f64 / (2.0 * types::BASE_EXTENT_KM);
+    let px = gap_mm / 1e6 * px_per_km;
     assert!(
         px.abs() < 1e-6,
         "the ring and the track are {px:.9} px apart; they were 1.1505 px \
@@ -1035,14 +1044,21 @@ fn the_ground_track_and_the_range_ring_are_the_same_sphere() {
 // ── Coverage, clipping, and what runs out where ─────────────────────────
 
 /// The section draws the whole line and says where the data stopped, rather
-/// than stopping at `MAX_RANGE_KM`.
+/// than stopping at a fixed range.
 ///
-/// The fixture's base tilt reaches 302 km of slant range, well past the
-/// 230 km a plan view draws, and the line is 420 km long — so a rasterizer
-/// that clipped at `MAX_RANGE_KM` would leave the last 190 km empty and
-/// report 230.
+/// The fixture's base tilt reaches 302 km of slant range, past
+/// [`crate::types::BASE_EXTENT_KM`], and the line is 420 km long — so a
+/// rasterizer holding to any single number would leave the last 190 km empty
+/// and report 230.
+///
+/// A plan view no longer holds to one either: it is projected at whatever its
+/// own sweep reaches. What still separates the two is what they are drawn
+/// *to* — a raster's extent is the data's, so it never runs out, while a
+/// section's length is the line the user drew and routinely outruns the volume.
+/// Which is why `coverage_ground_range_km` exists here and has no counterpart
+/// there.
 #[test]
-fn the_section_runs_past_the_plan_views_clip_and_reports_where_data_ends() {
+fn the_section_draws_the_whole_line_and_reports_where_the_data_ends() {
     let scan = scan_with(&|_az, slant| Gate::Dbz(10.0 + slant / 20.0));
     let section = radial_section(&scan, 91.0, 420.0);
     let axes = *section.axes();
@@ -1054,7 +1070,7 @@ fn the_section_runs_past_the_plan_views_clip_and_reports_where_data_ends() {
     let last_slant = gate_slant_km(LADDER[0].2 - 1);
     let reach = beam::ground_range_km(last_slant, f64::from(LADDER[0].1 + 0.01));
     assert!(
-        reach > types::MAX_RANGE_KM,
+        reach > types::BASE_EXTENT_KM,
         "precondition: the fixture only reaches {reach:.1} km, so it never \
              tests the clip it is here to test",
     );
@@ -1069,8 +1085,8 @@ fn the_section_runs_past_the_plan_views_clip_and_reports_where_data_ends() {
         axes.coverage_ground_range_km,
     );
     assert!(
-        axes.coverage_ground_range_km > types::MAX_RANGE_KM,
-        "the section clipped at MAX_RANGE_KM: coverage {:.1} km",
+        axes.coverage_ground_range_km > types::BASE_EXTENT_KM,
+        "the section clipped at the plan view's floor: coverage {:.1} km",
         axes.coverage_ground_range_km,
     );
     // And it ran out before the line did, which is the comparison the field

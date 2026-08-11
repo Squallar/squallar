@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crate::tile_source::HttpsTiles;
 use rustdar_radar::sites::RadarSite;
-use rustdar_radar::types::{ImageBounds, KM_PER_DEGREE_LAT, MAX_RANGE_KM, RadarProduct};
+use rustdar_radar::types::{ImageBounds, KM_PER_DEGREE_LAT, RadarProduct};
 use rustdar_radar::{get_color_for_value, get_legend_scale};
 
 use super::super::map_overlays::{OverlayDrawContext, draw_tile_layer, is_pos_blocked};
@@ -299,8 +299,8 @@ pub(super) fn render_pane_map_content(
                         }
 
                         // Per-frame: range ring + hover value from radar metadata
-                        if let Some((lat, lon, _max_range_km, value_data)) = meta_snapshot {
-                            render_radar_range_ring(ui, projector, lat, lon);
+                        if let Some((lat, lon, extent_km, value_data)) = meta_snapshot {
+                            render_radar_range_ring(ui, projector, lat, lon, extent_km);
                             update_pane_hover_value_from_meta(
                                 ui,
                                 projector,
@@ -308,6 +308,7 @@ pub(super) fn render_pane_map_content(
                                     value_data: &value_data,
                                     lat,
                                     lon,
+                                    extent_km,
                                 },
                                 ctx.pane,
                                 ctx.pane_rect,
@@ -540,14 +541,22 @@ pub(super) fn render_pane_map_content(
             .overlay_cache(OverlayKind::Radar)
             .and_then(|c| c.current.as_ref())
             .and_then(|tex| tex.radar_meta.as_ref())
-            .map(|m| (m.lat, m.lon, std::sync::Arc::clone(&m.value_data)));
-        if let Some((lat, lon, value_data)) = raw_meta {
+            .map(|m| {
+                (
+                    m.lat,
+                    m.lon,
+                    m.max_range_km,
+                    std::sync::Arc::clone(&m.value_data),
+                )
+            });
+        if let Some((lat, lon, extent_km, value_data)) = raw_meta {
             draw_long_press_tooltip(
                 ui,
                 projector,
                 &value_data,
                 lat,
                 lon,
+                extent_km,
                 touch_pos,
                 ctx.pane,
                 ctx.preferences,
@@ -559,6 +568,7 @@ pub(super) fn render_pane_map_content(
                 &img.value_data,
                 img.lat,
                 img.lon,
+                img.max_range_km,
                 touch_pos,
                 ctx.pane,
                 ctx.preferences,
@@ -608,7 +618,7 @@ fn render_radar_overlay(
     pane_rect: egui::Rect,
     prefs: &UserPreferences,
 ) {
-    let bounds = ImageBounds::from_radar_site(img.lat, img.lon);
+    let bounds = ImageBounds::from_radar_site(img.lat, img.lon, img.max_range_km);
 
     let nw = projector
         .project(walkers::lat_lon(bounds.max_lat, bounds.min_lon))
@@ -625,7 +635,7 @@ fn render_radar_overlay(
         egui::Color32::WHITE,
     );
 
-    render_radar_range_ring(ui, projector, img.lat, img.lon);
+    render_radar_range_ring(ui, projector, img.lat, img.lon, img.max_range_km);
     update_pane_hover_value_from_meta(
         ui,
         projector,
@@ -633,6 +643,7 @@ fn render_radar_overlay(
             value_data: &img.value_data,
             lat: img.lat,
             lon: img.lon,
+            extent_km: img.max_range_km,
         },
         pane,
         pane_rect,
@@ -642,17 +653,28 @@ fn render_radar_overlay(
 
 /// Draw only the range ring for a radar site (used with overlay-cache rendering).
 ///
+/// `extent_km` is the half-width the frame beneath it was projected at — the
+/// render's own `max_range_km`, not a constant. The ring is the edge of the
+/// picture, and it has to keep being that: on a TDWR long-range cut the
+/// picture ends at 417 km, and a ring still drawn at 230 would cut a circle
+/// through the middle of the echo it is supposed to bound.
+///
 /// The northward offset is [`KM_PER_DEGREE_LAT`], the same sphere `render_gate`
 /// places the gates on and [`ImageBounds`] frames them with. It read `111.32`
 /// until those were unified, which drew the ring ~258 m *outside* the coverage
 /// the data actually reached — see `rustdar_radar::types::KM_PER_DEGREE_LAT`.
-fn render_radar_range_ring(ui: &egui::Ui, projector: &walkers::Projector, lat: f64, lon: f64) {
+/// The extent is the multiplier and the sphere is the divisor, so the two
+/// changes are independent: a wider frame moves the ring, not the planet.
+fn render_radar_range_ring(
+    ui: &egui::Ui,
+    projector: &walkers::Projector,
+    lat: f64,
+    lon: f64,
+    extent_km: f64,
+) {
     let radar_center = projector.project(walkers::lat_lon(lat, lon)).to_pos2();
     let north_edge = projector
-        .project(walkers::lat_lon(
-            lat + MAX_RANGE_KM / KM_PER_DEGREE_LAT,
-            lon,
-        ))
+        .project(walkers::lat_lon(lat + extent_km / KM_PER_DEGREE_LAT, lon))
         .to_pos2();
     let range_radius_pixels = (radar_center.y - north_edge.y).abs();
     ui.painter().circle_stroke(
@@ -665,11 +687,15 @@ fn render_radar_range_ring(ui: &egui::Ui, projector: &walkers::Projector, lat: f
     );
 }
 
-/// Radar value data and site location for hover queries.
+/// Radar value data, site location and frame extent for hover queries.
 struct RadarHoverData<'a> {
     value_data: &'a [f32],
     lat: f64,
     lon: f64,
+    /// The half-width the value grid was projected at, km — the render's own
+    /// `max_range_km`. A hover divides the pointer's position by the frame to
+    /// pick a pixel, so it has to divide by the frame that was drawn.
+    extent_km: f64,
 }
 
 /// Update hover value using radar metadata from the overlay cache.
@@ -681,7 +707,7 @@ fn update_pane_hover_value_from_meta(
     pane_rect: egui::Rect,
     prefs: &UserPreferences,
 ) {
-    let bounds = ImageBounds::from_radar_site(radar.lat, radar.lon);
+    let bounds = ImageBounds::from_radar_site(radar.lat, radar.lon, radar.extent_km);
     let nw = projector
         .project(walkers::lat_lon(bounds.max_lat, bounds.min_lon))
         .to_pos2();
@@ -1801,13 +1827,14 @@ fn draw_long_press_tooltip(
     value_data: &[f32],
     lat: f64,
     lon: f64,
+    extent_km: f64,
     touch_pos: egui::Pos2,
     pane: &PaneState,
     prefs: &UserPreferences,
 ) {
     use rustdar_radar::types::{IMAGE_SIZE, ImageBounds};
 
-    let bounds = ImageBounds::from_radar_site(lat, lon);
+    let bounds = ImageBounds::from_radar_site(lat, lon, extent_km);
 
     let nw = projector
         .project(walkers::lat_lon(bounds.max_lat, bounds.min_lon))

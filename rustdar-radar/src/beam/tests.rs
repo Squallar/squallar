@@ -59,10 +59,11 @@ fn the_shared_effective_earth_radius_is_bit_identical_to_both_deleted_copies() {
 /// The inverse is exact, not fitted: every height the forward model
 /// produces maps back to the slant range that produced it.
 ///
-/// Over the whole plotted domain — 1..460 km (twice `MAX_RANGE_KM`,
-/// because reflectivity moments really do run past 300 km) × the VCP 212
-/// ladder. 1e-9 km is 1 µm; the assertion is that the algebra is right,
-/// not that it is close.
+/// Over the whole plotted domain — 1..460 km (twice
+/// `types::BASE_EXTENT_KM`, because reflectivity moments really do run past
+/// 300 km, and a plan view now draws them out there) × the VCP 212 ladder.
+/// 1e-9 km is 1 µm; the assertion is that the algebra is right, not that it
+/// is close.
 #[test]
 fn the_beam_height_inverse_returns_the_range_the_height_came_from() {
     let mut checked = 0usize;

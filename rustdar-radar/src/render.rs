@@ -20,10 +20,26 @@ struct MercatorProjection {
     center_px: f64,
     merc_y_top: f64,
     merc_y_scale: f64,
+    /// The image's scale, pixels per kilometre east-west at the site.
+    ///
+    /// A field rather than a constant because the extent below is per render
+    /// and the side is fixed, so this is the quantity that moves: 4.45 px/km
+    /// for the 230 km most sweeps get on a 2048-pixel image, 2.24 for a TDWR
+    /// long-range cut at 417 km.
+    px_per_km: f64,
+    /// The half-width this raster covers, km — [`types::plan_view_extent_km`]
+    /// of the sweep's own reach.
+    ///
+    /// Carried on the projection rather than passed alongside it because the
+    /// gate loops need exactly two things from the geometry, where a gate
+    /// lands and whether it is on the image at all, and splitting those across
+    /// two arguments is how a loop comes to clip against one extent while
+    /// painting at another.
+    extent_km: f64,
 }
 
 impl MercatorProjection {
-    fn from_bounds(radar_lat: f64, bounds: &types::ImageBounds) -> Self {
+    fn from_bounds(radar_lat: f64, bounds: &types::ImageBounds, extent_km: f64) -> Self {
         let radar_lat_rad = radar_lat.to_radians();
         Self {
             radar_lat_rad,
@@ -32,6 +48,8 @@ impl MercatorProjection {
             merc_y_top: bounds.mercator_y_max,
             merc_y_scale: types::IMAGE_SIZE as f64
                 / (bounds.mercator_y_max - bounds.mercator_y_min),
+            px_per_km: types::IMAGE_SIZE as f64 / (2.0 * extent_km),
+            extent_km,
         }
     }
 
@@ -47,10 +65,8 @@ impl MercatorProjection {
         let range_start = range_km - gate_interval / 2.0;
         let range_end = range_km + gate_interval / 2.0;
 
-        let num_range_samples =
-            ((range_end - range_start) * types::PIXELS_PER_KM).ceil() as i32 + 2;
-        let num_az_samples = ((ctx.az_half_spacing * 2.0 * range_km * PI / 180.0)
-            * types::PIXELS_PER_KM)
+        let num_range_samples = ((range_end - range_start) * self.px_per_km).ceil() as i32 + 2;
+        let num_az_samples = ((ctx.az_half_spacing * 2.0 * range_km * PI / 180.0) * self.px_per_km)
             .ceil() as i32
             + 2;
         let inv_num_range = 1.0 / num_range_samples.max(1) as f64;
@@ -71,7 +87,7 @@ impl MercatorProjection {
 
                 let dx_km = r * sin_az;
                 let dy_km = r * cos_az;
-                let px_i = (self.center_px + dx_km * cos_correction * types::PIXELS_PER_KM) as i32;
+                let px_i = (self.center_px + dx_km * cos_correction * self.px_per_km) as i32;
                 let dest_lat_rad = self.radar_lat_rad + dy_km / types::EARTH_RADIUS_KM;
                 let dest_merc_y = types::lat_rad_to_mercator_y(dest_lat_rad);
                 let py_i = ((self.merc_y_top - dest_merc_y) * self.merc_y_scale) as i32;
@@ -208,8 +224,9 @@ impl RadialContext {
 /// row's price.
 ///
 /// Colour is derived in `into_output` rather than stored per gate. That is
-/// *more* palette work, not less — ~663 k gates reach the 230 km break against
-/// 3.3 M painted pixels at 2048² — but it is parallel and off the fill loop,
+/// *more* palette work, not less — ~663 k gates reached the extent break
+/// against 3.3 M painted pixels at 2048², measured when that break was a fixed
+/// 230 km — but it is parallel and off the fill loop,
 /// and it removes a whole store per sample from the loop that is actually hot.
 /// Leaving that pass serial costs more than everything else here put together.
 ///
@@ -471,8 +488,10 @@ impl RenderBuffers {
     /// vanishes against the palette lookups.
     const COLOR_CHUNK: usize = 16 * 1024;
 
-    /// Split the cells into the RGBA texture and the value grid, and give the
-    /// drained buffer back to [`POOLED_CELLS`].
+    /// Split the cells into the RGBA texture and the value grid, give the
+    /// drained buffer back to [`POOLED_CELLS`], and hand back the extent they
+    /// were painted at so that whatever places the picture places it on the
+    /// same ground the gates were projected onto.
     ///
     /// Colour is derived here rather than stored per sample: it is a pure
     /// function of the value at every call site, so keeping it in the cell
@@ -495,7 +514,7 @@ impl RenderBuffers {
     /// `get_mut` rather than a `swap`: rasterization is over by the time this
     /// runs and taking `self` by value proves it, so the drain is a plain load
     /// and store per cell rather than 4 M locked read-modify-writes.
-    fn into_output(self, actual_max_range: f64) -> (Vec<u8>, f64, Vec<f32>) {
+    fn into_output(self, extent_km: f64) -> (Vec<u8>, f64, Vec<f32>) {
         let Self { mut cells, product } = self;
         let value_data: Vec<f32> = cells
             .iter_mut()
@@ -517,12 +536,7 @@ impl RenderBuffers {
                     }
                 }
             });
-        let max_range = if actual_max_range > 0.0 {
-            actual_max_range
-        } else {
-            types::MAX_RANGE_KM
-        };
-        (image, max_range, value_data)
+        (image, extent_km, value_data)
     }
 }
 
@@ -817,6 +831,22 @@ fn compute_max_range(radials: &[Radial], product: types::RadarProduct) -> f64 {
     reach
 }
 
+/// Project a field onto the image, at the extent its own data asks for.
+///
+/// Every render path in this module comes through here, and each already knew
+/// how far its data reached — the number used to be carried through purely so
+/// it could be reported. It now decides the geometry: [`types::plan_view_extent_km`]
+/// turns the reach into the raster's half-width, the bounds and the projection
+/// are both built from that one number, and it is what comes back as
+/// `max_range_km` for the placement sites downstream.
+///
+/// So the returned figure is the **extent of the picture**, not the reach of
+/// the data. Below the floor those differ — a 40 km Level III product is drawn
+/// on a 230 km frame — and the picture's extent is the one a consumer can do
+/// anything with: it is what says where the corners of the texture go and
+/// which pixel a hover lands in. Where the data actually stopped is a property
+/// of the sweep, answered by [`compute_max_range`], and a cross-section is
+/// where this display reports it (`SectionAxes::coverage_ground_range_km`).
 fn render_with_projection(
     radar_lat: f64,
     radar_lon: f64,
@@ -825,20 +855,22 @@ fn render_with_projection(
     label: &str,
     fill: impl FnOnce(&MercatorProjection, &RenderBuffers),
 ) -> (Vec<u8>, f64, Vec<f32>) {
-    let bounds = types::ImageBounds::from_radar_site(radar_lat, radar_lon);
-    let proj = MercatorProjection::from_bounds(radar_lat, &bounds);
+    let extent_km = types::plan_view_extent_km(actual_max_range);
+    let bounds = types::ImageBounds::from_radar_site(radar_lat, radar_lon, extent_km);
+    let proj = MercatorProjection::from_bounds(radar_lat, &bounds, extent_km);
     let bufs = RenderBuffers::new(product);
 
     fill(&proj, &bufs);
 
-    let (image, max_range, value_data) = bufs.into_output(actual_max_range);
+    let (image, extent_km, value_data) = bufs.into_output(extent_km);
     log::info!(
-        "{} rendering complete: actual_max_range={:.1}km, using max_range={:.1}km",
+        "{} rendering complete: data reaches {:.1}km, projected at ±{:.1}km ({:.2} px/km)",
         label,
         actual_max_range,
-        max_range
+        extent_km,
+        proj.px_per_km,
     );
-    (image, max_range, value_data)
+    (image, extent_km, value_data)
 }
 
 // ── Public rendering functions ───────────────────────────────────────────────
@@ -975,7 +1007,16 @@ pub fn render_radar_to_image_full(
                         // for every radial of every render.
                         for (gate_idx, moment_value) in moment.iter().enumerate() {
                             let range_km = first_gate_range + (gate_idx as f64 * gate_size);
-                            if range_km > types::MAX_RANGE_KM {
+                            // The edge of the image, and the image was sized
+                            // from this sweep's own reach — so on a sweep whose
+                            // radials agree this never fires, and a 1832-gate
+                            // surveillance cut paints all 458 km of itself. It
+                            // is reached only where a radial runs past the
+                            // extent the sweep as a whole asked for: past
+                            // `types::MAX_EXTENT_KM`, or past a shorter
+                            // neighbour's agreed reach on a sweep
+                            // `compute_max_range` has already warned about.
+                            if range_km > proj.extent_km {
                                 break;
                             }
 
@@ -1052,7 +1093,7 @@ fn render_nrot_to_image(
                     }
 
                     let range_km = vg.first_gate_range_km + j as f64 * vg.gate_interval_km;
-                    if range_km > types::MAX_RANGE_KM {
+                    if range_km > proj.extent_km {
                         break;
                     }
 
@@ -1138,7 +1179,7 @@ fn render_srv_to_image(
                         continue;
                     }
                     let range_km = grid.first_gate_range_km + j as f64 * grid.gate_interval_km;
-                    if range_km > types::MAX_RANGE_KM {
+                    if range_km > proj.extent_km {
                         break;
                     }
                     let from = GateId { radial: i, gate: j };
@@ -1549,7 +1590,7 @@ pub fn render_derived_kdp_to_image(
                         continue;
                     }
                     let range_km = derived.first_gate_km + j as f64 * derived.gate_interval_km;
-                    if range_km > types::MAX_RANGE_KM {
+                    if range_km > proj.extent_km {
                         break;
                     }
                     let from = GateId { radial: i, gate: j };
@@ -1645,7 +1686,7 @@ fn render_level3_radial_with_gate_km(
                         }
 
                         let range_km = first_gate_range + gate_idx as f64 * gate_interval;
-                        if range_km > types::MAX_RANGE_KM {
+                        if range_km > proj.extent_km {
                             break;
                         }
 

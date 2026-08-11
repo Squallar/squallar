@@ -25,6 +25,10 @@ impl Drop for RenderGuard {
 /// re-upload the texture instantly after suspend/resume without re-rendering.
 pub struct CachedPaneRender {
     pub image_data: Arc<Vec<u8>>,
+    /// The half-width the cached pixels were projected at, km. Kept beside
+    /// them because a restore has to place them where the render put them —
+    /// see `restore_cached_renders`, which rebuilds the bounds from this and
+    /// from nothing else.
     pub max_range_km: f64,
     pub value_data: Arc<Vec<f32>>,
     pub product: RadarProduct,
@@ -110,6 +114,11 @@ impl PaneRenderState {
 }
 
 /// Cached radar render output, shared across panes that show the same product/elevation.
+///
+/// The extent rides in the entry rather than being recomputed per pane, which
+/// is what makes the sharing sound: two panes on the same `(site, product,
+/// view, elevation)` are looking at one buffer, and a buffer projected at
+/// 417 km has to be placed at 417 km on both of them.
 pub struct CachedRenderOutput {
     pub image_data: Arc<Vec<u8>>,
     pub max_range_km: f64,
