@@ -435,3 +435,46 @@ fn the_shader_and_the_lut_constant_agree() {
              `constants::VOLUME_LUT_BYTES` sizes"
     );
 }
+
+/// The shader's kilometres-per-degree is the radar crate's, to the bit.
+///
+/// `floor_colour` reprojects the box floor through geography to sample the
+/// pane mirror, so its degree is the same conversion `ImageBounds` framed
+/// that mirror with and `render_gate` placed the echoes in it with. WGSL
+/// cannot read `rustdar_radar::types::KM_PER_DEGREE_LAT`, so `volume.wgsl`
+/// holds the workspace's only hand-written copy of that number and this is
+/// the guard that stops it becoming a second definition.
+///
+/// The comparison is on `f32` **bits** after parsing the literal out of the
+/// source, not on the decimal text: the shader is entitled to spell the value
+/// with however many digits it likes, and only entitled to spell a different
+/// value. It read `111.32` — a 6378 km sphere — while the data it draws over
+/// was placed on 6371, which put the floor's geography 0.26 km off the echoes
+/// at the raster edge.
+#[test]
+fn the_shaders_km_per_degree_is_the_radar_crates_own() {
+    const DECL: &str = "const KM_PER_DEGREE_LAT: f32 = ";
+    let source = include_str!("../volume.wgsl");
+    let tail = source
+        .split_once(DECL)
+        .expect("volume.wgsl no longer declares `KM_PER_DEGREE_LAT`")
+        .1;
+    let literal = tail
+        .split_once(';')
+        .expect("volume.wgsl's KM_PER_DEGREE_LAT declaration is unterminated")
+        .0
+        .trim();
+    let shader: f32 = literal
+        .parse()
+        .unwrap_or_else(|_| panic!("volume.wgsl's KM_PER_DEGREE_LAT `{literal}` is not a number"));
+
+    let expected = rustdar_radar::types::KM_PER_DEGREE_LAT as f32;
+    assert_eq!(
+        shader.to_bits(),
+        expected.to_bits(),
+        "volume.wgsl says {shader} km per degree and \
+             `rustdar_radar::types::KM_PER_DEGREE_LAT` says {expected}, so \
+             the volume floor's geography and the radar data drawn over it \
+             are on different spheres",
+    );
+}

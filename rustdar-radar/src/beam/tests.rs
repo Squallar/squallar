@@ -417,13 +417,16 @@ fn the_site_bearing_and_range_agree_with_hand_computed_geometry() {
     let (_, range) = site_bearing_range_km(site_lat, site_lon, site_lat, site_lon);
     assert_eq!(range, 0.0, "a site is not at zero range from itself");
 
-    // precondition: `EARTH_RADIUS_KM` is the 6371 sphere, not the 6378 one
-    // `ImageBounds` implies — the whole point of the module doc's note.
+    // precondition: `EARTH_RADIUS_KM` is the 6371 sphere, and the degree
+    // `ImageBounds` frames the raster with is *this* sphere's degree. It was
+    // not — it was a literal 111.32, a 6378 km sphere — and the hand figures
+    // above are what that gap was measured against.
     assert_eq!(EARTH_RADIUS_KM, 6371.0);
-    assert!(
-        (EARTH_RADIUS_KM * std::f64::consts::PI / 180.0 - 111.32).abs() > 0.1,
-        "precondition: the 6371 sphere and `ImageBounds`' implied 111.32 \
-             km/° have converged, so recording the seam is pointless",
+    assert_eq!(
+        crate::types::KM_PER_DEGREE_LAT.to_bits(),
+        (EARTH_RADIUS_KM * std::f64::consts::PI / 180.0).to_bits(),
+        "`ImageBounds`' degree has come off this sphere again, so a gate and \
+             the geography drawn under it are no longer on one planet",
     );
 }
 

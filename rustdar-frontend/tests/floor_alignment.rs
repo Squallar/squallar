@@ -159,12 +159,13 @@ fn scan_from_archive(path: &std::path::Path) -> nexrad_model::data::Scan {
 
 // ── The mirror, and the shader's own conversion into it ──────────────────────
 
-/// Kilometres per degree of latitude. `ImageBounds`' constant and the shader's
-/// `KM_PER_DEGREE_LAT`; both spell it out rather than deriving it from an
-/// Earth radius, so this does too. (It implies a 6378 km sphere, where
-/// `render_gate` walks north on `EARTH_RADIUS_KM = 6371` — a 0.12 % disagreement
-/// that the pins below budget for explicitly rather than paper over.)
-const KM_PER_DEGREE_LAT: f64 = 111.32;
+/// Kilometres per degree of latitude: `ImageBounds`' conversion and the
+/// shader's `KM_PER_DEGREE_LAT`, which are now one figure derived from
+/// `EARTH_RADIUS_KM` — the same sphere `render_gate` walks north on. This
+/// instrument imports it rather than copying it, so that a future divergence
+/// shows up as a *measurement* here instead of being mirrored into the model
+/// and cancelling itself out.
+use rustdar_radar::types::KM_PER_DEGREE_LAT;
 
 /// Side of the lattice both masks are expressed on, in texels.
 ///
@@ -315,7 +316,7 @@ impl BoxGeo {
 enum Mapping {
     /// The shader's own conversion.
     Honest,
-    /// Drop the `cos φ` term: `d_lon = x_km / 111.32`, as though a degree of
+    /// Drop the `cos φ` term: `d_lon = x_km / KM_PER_DEGREE_LAT`, as though a degree of
     /// longitude were a degree of latitude. Stretches the sampled ground
     /// east-west by `1 / cos φ` about the site's meridian — nothing at
     /// `x = 0`, tens of kilometres at the box's east and west edges.
@@ -357,8 +358,8 @@ impl Mapping {
 /// ```text
 /// x_km = floor_geo.y + hit.x · box_size_km.x
 /// y_km = floor_geo.z + hit.y · box_size_km.y
-/// φ    = φ₀ + y_km / 111.32
-/// Δλ   = x_km / (111.32 · cos φ)          ← cos at THIS point's latitude
+/// φ    = φ₀ + y_km / KM_PER_DEGREE_LAT
+/// Δλ   = x_km / (KM_PER_DEGREE_LAT · cos φ)   ← cos at THIS point's latitude
 /// u    = floor_uv.x + Δλ · floor_uv.z
 /// v    = floor_uv.y + (mercᵧ(φ) − mercᵧ(φ₀)) · floor_uv.w
 /// ```
@@ -1203,11 +1204,14 @@ fn the_boxs_site_position_lands_on_the_mirrors_site_pixel() {
 /// gives: both second-order errors scale with `tan φ₀`, and this pin wants them
 /// clear of the honest mapping's own budget rather than merely above it.
 ///
-/// That budget is 4 px, against a measured worst probe of 2.3. Most of it is
-/// one known, deliberate disagreement: `render_gate` walks north on
-/// `EARTH_RADIUS_KM` (6371 km) and `floor_colour` on `KM_PER_DEGREE_LAT`
-/// (111.32 km/°, a 6378 km sphere), which is 0.12 % — about a pixel at 200 km.
-/// The rest is the blob's own discretisation.
+/// That budget is 4 px. It used to be spent almost entirely on one known
+/// disagreement — `render_gate` walked north on `EARTH_RADIUS_KM` (6371 km)
+/// and `floor_colour` on a `KM_PER_DEGREE_LAT` of 111.32 (a 6378 km sphere),
+/// 0.12 % apart, about a pixel at 200 km — and the worst probe measured 2.3 px
+/// against it. The two spheres are one sphere now, so what is left is the
+/// blob's own discretisation. The budget is deliberately *not* tightened to
+/// the new measurement: it is a ceiling separating an honest mapping from the
+/// broken ones at `MUST_MISS_PX`, and those still miss by more than twice it.
 #[test]
 fn a_gate_lands_on_the_mirror_pixel_that_renders_it() {
     const HONEST_BUDGET_PX: f64 = 4.0;

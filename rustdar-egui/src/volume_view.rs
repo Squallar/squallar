@@ -415,12 +415,19 @@ fn half_diagonal(box_size_km: [f32; 3]) -> f32 {
         .sqrt()
 }
 
-/// Kilometres per degree of longitude at the equator, WGS84.
+/// Kilometres per degree of longitude at the equator.
+///
+/// On a sphere a degree of longitude at the equator and a degree of latitude
+/// anywhere are the same arc, so this is
+/// [`rustdar_radar::types::KM_PER_DEGREE_LAT`] rather than a figure of its
+/// own. It spelled `111.319_49` — the WGS-84 *equatorial* radius — which made
+/// it a third planet in a workspace that only ever wanted one; see that
+/// constant.
 ///
 /// Only ever divided by, and only ever with `cos(latitude)` beside it, so it is
 /// a scale rather than a distance: [`floor_magnification`] wants the pane's
 /// points-per-kilometre and the pane's affine is expressed per *degree*.
-const KM_PER_DEGREE_LON_AT_EQUATOR: f64 = 111.319_49;
+const KM_PER_DEGREE_LON_AT_EQUATOR: f64 = rustdar_radar::types::KM_PER_DEGREE_LAT;
 
 /// How much the 3D view magnifies the ground it samples out of the pane mirror,
 /// at the pivot's own depth. Dimensionless; 1.0 means one mirror texel per

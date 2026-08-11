@@ -51,16 +51,16 @@
 //! [`MIN_HALF_WIDTH_KM`]: rustdar_radar::voxel::MIN_HALF_WIDTH_KM
 
 use crate::pane::{GeoPoint, PaneKind, PaneState, VolumeRegion};
-
-/// Kilometres per degree of latitude, the sphere approximation the rest of this
-/// crate's map arithmetic already uses (`render_radar_range_ring`).
+/// Kilometres per degree of latitude, imported rather than spelled: the sphere
+/// this preview rect stands on is the same one the data under it is placed on.
 ///
 /// Only ever used to turn a *distance in kilometres* back into a screen rect for
 /// the preview, never to decide what is resampled: the drag's own half-width
 /// comes from [`rustdar_radar::beam::site_bearing_range_km`], which is the
 /// codebase's real geodesy. The approximation is therefore worth at most a pixel
-/// of preview edge, and never a kilometre of grid.
-const KM_PER_DEGREE_LAT: f64 = 111.32;
+/// of preview edge, and never a kilometre of grid — but it is now the *same*
+/// approximation, which it was not while this file carried its own `111.32`.
+use rustdar_radar::types::KM_PER_DEGREE_LAT;
 
 /// The armed region interaction's yellow: the box in flight, the resolution
 /// hint over its top edge, and the active pane's armed hint chip all paint in

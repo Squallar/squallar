@@ -18,7 +18,7 @@ fn a_committed_track_bows_the_way_the_cut_does() {
     // 229 km due east at 41 °N, the orientation where a rhumb line and a
     // great circle are furthest apart.
     let lat = 41.0_f64;
-    let dlon = 229.0 / (111.32 * lat.to_radians().cos());
+    let dlon = 229.0 / (rustdar_radar::types::KM_PER_DEGREE_LAT * lat.to_radians().cos());
     let line = crate::pane::SectionLine::new(
         crate::pane::GeoPoint { lat, lon: -97.0 },
         crate::pane::GeoPoint {
@@ -28,11 +28,11 @@ fn a_committed_track_bows_the_way_the_cut_does() {
     )
     .expect("a valid line");
 
-    // Web Mercator on a 6371 km sphere, scaled so that one point is one
+    // Web Mercator on the crate's own sphere, scaled so that one point is one
     // metre of *ground* at this latitude — Mercator's local scale factor is
     // `1/cos(lat)`, so the `cos` is what makes the assertion below readable
     // in metres rather than in projected units.
-    let scale = 6_371_000.0 * lat.to_radians().cos();
+    let scale = rustdar_radar::types::EARTH_RADIUS_KM * 1000.0 * lat.to_radians().cos();
     let project = |p: crate::pane::GeoPoint| {
         let y = (std::f64::consts::FRAC_PI_4 + p.lat.to_radians() / 2.0)
             .tan()
@@ -67,11 +67,16 @@ fn a_committed_track_bows_the_way_the_cut_does() {
     // vertices — is inside the error budget the module already accepts.
     //
     // This is the assertion that says what the subdivision is for, and it is
-    // deliberately a **bar rather than a count**: 258 m is the range-ring
-    // offset `draw_section_tracks` documents and lives with, so a track that
-    // beats it is as registered as everything else on the map. The exact
-    // `SECTION_TRACK_SAMPLES` is a quality knob above that bar — it is not
-    // pinned here, and lowering it to 8 would still pass, correctly.
+    // deliberately a **bar rather than a count**. 258 m is where it was set:
+    // the range ring used to sit that far outside the ground the track walked,
+    // because the ring was placed on a 6378 km sphere and the track on 6371,
+    // so a track that beat 258 m was as registered as everything else on the
+    // map. Those are one sphere now and that offset is zero, which makes this
+    // a *legacy* ceiling the track beats by two orders of magnitude rather
+    // than a live budget. It is kept at its old value on purpose: tightening
+    // it to the measurement would pin `SECTION_TRACK_SAMPLES`, and the exact
+    // count is a quality knob above the bar, not a claim — lowering it to 8
+    // would still pass, correctly.
     let sagitta = (0..SECTION_TRACK_SAMPLES)
         .map(|i| {
             let (p, q) = (track[i], track[i + 1]);
@@ -88,8 +93,8 @@ fn a_committed_track_bows_the_way_the_cut_does() {
     assert!(
         sagitta < 258.0,
         "the drawn track leaves {sagitta} m of the curve between vertices, \
-             which is worse than the 258 m range-ring offset the module already \
-             documents as the error it lives with"
+             which is worse than the 258 m the range ring used to sit off this \
+             track before the two spheres were unified"
     );
 }
 

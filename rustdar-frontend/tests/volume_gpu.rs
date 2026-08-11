@@ -1522,8 +1522,9 @@ fn the_floor_takes_cos_at_the_pixels_latitude_not_the_sites() {
     let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Bgra8Unorm));
     pipelines.upload_quad(&queue);
 
-    // The shader's own constant, and `ImageBounds`'.
-    const KM_PER_DEGREE_LAT: f64 = 111.32;
+    // The shader's own constant, and `ImageBounds`' — one figure, imported so
+    // this fixture cannot be reasoning about a sphere the shader left behind.
+    use rustdar_radar::types::KM_PER_DEGREE_LAT;
     const SITE_LAT: f64 = 45.0;
     // East by north. The west and south edges sit *on* the site, so `x_km` and
     // `y_km` are the box coordinate times these — the simplest possible

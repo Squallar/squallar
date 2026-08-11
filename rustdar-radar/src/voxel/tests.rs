@@ -894,8 +894,8 @@ fn the_height_axis_is_msl_above_the_sites_own_elevation() {
 #[test]
 fn the_centre_may_sit_away_from_the_site() {
     let scan = scan_of(&|_, _| Some(30.0));
-    // ~50 km due east of KTLX.
-    let east_lon = SITE.1 + 50.0 / (111.320 * SITE.0.to_radians().cos());
+    // ~50 km due east of KTLX, on the crate's own degree.
+    let east_lon = SITE.1 + 50.0 / (crate::types::KM_PER_DEGREE_LAT * SITE.0.to_radians().cos());
     let req = VoxelRequest {
         centre: (SITE.0, east_lon),
         half_width_km: 20.0,

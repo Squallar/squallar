@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crate::tile_source::HttpsTiles;
 use rustdar_radar::sites::RADARS;
-use rustdar_radar::types::{ImageBounds, MAX_RANGE_KM, RadarProduct};
+use rustdar_radar::types::{ImageBounds, KM_PER_DEGREE_LAT, MAX_RANGE_KM, RadarProduct};
 use rustdar_radar::{get_color_for_value, get_legend_scale};
 
 use super::super::map_overlays::{OverlayDrawContext, draw_tile_layer, is_pos_blocked};
@@ -774,10 +774,18 @@ fn render_radar_overlay(
 }
 
 /// Draw only the range ring for a radar site (used with overlay-cache rendering).
+///
+/// The northward offset is [`KM_PER_DEGREE_LAT`], the same sphere `render_gate`
+/// places the gates on and [`ImageBounds`] frames them with. It read `111.32`
+/// until those were unified, which drew the ring ~258 m *outside* the coverage
+/// the data actually reached — see `rustdar_radar::types::KM_PER_DEGREE_LAT`.
 fn render_radar_range_ring(ui: &egui::Ui, projector: &walkers::Projector, lat: f64, lon: f64) {
     let radar_center = projector.project(walkers::lat_lon(lat, lon)).to_pos2();
     let north_edge = projector
-        .project(walkers::lat_lon(lat + MAX_RANGE_KM / 111.32, lon))
+        .project(walkers::lat_lon(
+            lat + MAX_RANGE_KM / KM_PER_DEGREE_LAT,
+            lon,
+        ))
         .to_pos2();
     let range_radius_pixels = (radar_center.y - north_edge.y).abs();
     ui.painter().circle_stroke(

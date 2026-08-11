@@ -96,13 +96,19 @@
 //! [`crate::types::EARTH_RADIUS_KM`] (6371 km) — deliberately the same
 //! constant [`crate::render`]'s `render_gate` projects gates with, so a line
 //! drawn on a plan view lands on the ground the plan view put under the
-//! cursor. It is **not** the `1.0 / 111.32` degrees-per-km that
-//! [`crate::types::ImageBounds`] implies, which is a 6378 km sphere: that is a
-//! known 0.11 % inconsistency in the image bounds, and reproducing it here
-//! would spread it instead of containing it. The map's hover readout reads
-//! [`site_bearing_range_km`] for exactly that reason — it is the range and
-//! azimuth of the ground the plan view put under the cursor, so it has to be
-//! measured the way the plan view placed it.
+//! cursor. The map's hover readout reads [`site_bearing_range_km`] for exactly
+//! that reason.
+//!
+//! [`crate::types::ImageBounds`] used to disagree, working in `1.0 / 111.32`
+//! degrees per km — a 6378 km sphere, 0.11 % off this one, which put the
+//! framing and everything hung off it (the range ring, the volume floor, the
+//! region-drag preview) a quarter of a kilometre away from the gates at the
+//! raster edge. It now works in [`crate::types::KM_PER_DEGREE_LAT`], which is
+//! this same [`crate::types::EARTH_RADIUS_KM`] times `π/180`. There is one
+//! horizontal sphere in the workspace and
+//! `rustdar-radar/tests/geodesy_one_definition.rs` is what keeps it that way —
+//! including keeping [`RE_EFF_KM`] below out of its reach, since that is
+//! refraction and not geodesy.
 //!
 //! [`ground_range_km`] is the tangent-plane projection `r·cos e`, matching
 //! `render_gate`'s own `r·sin az` / `r·cos az`, and not the spherical arc

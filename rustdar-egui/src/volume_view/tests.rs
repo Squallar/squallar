@@ -780,7 +780,8 @@ fn the_reported_framing_asks_for_more_than_one_mirror_texel_a_pixel() {
     // A source pane showing the 460 km box across about 900 points, expressed
     // the way `MapPaneGeo` carries it: points per degree of longitude at 34.635.
     let points_per_km = 900.0 / 460.0;
-    let points_per_degree_lon = points_per_km * 111.319_49 * 34.635_f64.to_radians().cos();
+    let points_per_degree_lon =
+        points_per_km * rustdar_radar::types::KM_PER_DEGREE_LAT * 34.635_f64.to_radians().cos();
 
     let magnification = floor_magnification(
         camera,

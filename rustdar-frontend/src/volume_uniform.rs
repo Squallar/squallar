@@ -306,10 +306,16 @@ pub struct VolumeUniform {
     /// lines the CPU compositor used to evaluate per texel:
     ///
     /// ```text
-    /// φ = φ₀ + y_km / 111.32
-    /// λ = λ₀ + x_km / (111.32 · cos φ)
+    /// φ = φ₀ + y_km / KM_PER_DEGREE_LAT
+    /// λ = λ₀ + x_km / (KM_PER_DEGREE_LAT · cos φ)
     /// (u, v) = (u₀ + (λ − λ₀)·u_per_deg,  v₀ + (mercᵧ(φ) − mercᵧ(φ₀))·v_per_merc)
     /// ```
+    ///
+    /// `KM_PER_DEGREE_LAT` is [`rustdar_radar::types::KM_PER_DEGREE_LAT`] —
+    /// the sphere `render_gate` placed the echoes in the mirror on, which is
+    /// the whole reason this reprojection lands on them. The shader holds the
+    /// only hand-written copy of the figure and
+    /// `tests::the_shaders_km_per_degree_is_the_radar_crates_own` pins it.
     ///
     /// Anchoring both axes at the **site** rather than at the mirror's corner
     /// is deliberate: it keeps the quantities the shader subtracts small, so

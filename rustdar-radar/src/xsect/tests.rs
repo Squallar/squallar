@@ -977,58 +977,58 @@ fn dropping_the_cos_e_correction_would_move_the_wall_further_than_the_tolerance(
 
 // ── The two spheres ─────────────────────────────────────────────────────
 
-/// The ground track is on 6371 and the plan view's range ring is not, and
-/// the gap is measured rather than discovered later.
+/// The ground track and the plan view's range ring are on one sphere, and
+/// the closure is measured rather than asserted in a comment.
 ///
-/// A point the 230 km ring puts on screen reads 259 m nearer the site here.
-/// The pixel figure is target-dependent — [`crate::types::IMAGE_SIZE`] is
-/// 2048 native and 1024 on wasm — so it is computed from the constant
-/// rather than quoted.
+/// This test used to record a **seam**. `ImageBounds` framed the raster with
+/// `1.0 / 111.32` degrees per km — a 6378.1 km sphere — while the gates
+/// inside it, and this module's columns, walked
+/// [`crate::types::EARTH_RADIUS_KM`] = 6371. A point the 230 km ring drew
+/// therefore measured 229.741580 km here: a 258.42 m gap, 1.1505 px on a
+/// 2048-wide plan view, always in the same direction. `ImageBounds` reads
+/// [`crate::types::KM_PER_DEGREE_LAT`] now, which is the *expression*
+/// `EARTH_RADIUS_KM · π/180`, so the ring's latitude offset converts back to
+/// exactly `MAX_RANGE_KM`.
+///
+/// The residual is asserted at the millimetre rather than at zero because
+/// `site_bearing_range_km` is a haversine round trip through `sin`/`asin` and
+/// not the inverse of a multiplication; sub-millimetre float noise is the
+/// honest expectation, and a *bit-exact* assertion here would fail for a
+/// reason that has nothing to do with which sphere anything is on.
 #[test]
-fn the_ground_track_sphere_is_the_one_render_gate_uses() {
-    // `ImageBounds`' degrees-per-km, which implies a 6378 km sphere.
-    const IMAGE_BOUNDS_KM_PER_DEG: f64 = 111.32;
-    let ring_deg = types::MAX_RANGE_KM / IMAGE_BOUNDS_KM_PER_DEG;
+fn the_ground_track_and_the_range_ring_are_the_same_sphere() {
+    let ring_deg = types::MAX_RANGE_KM / types::KM_PER_DEGREE_LAT;
 
     // The same latitude offset, measured the way this module measures it.
     let ring_point = (SITE.0 + ring_deg, SITE.1);
     let (_, ours_km) = beam::site_bearing_range_km(SITE.0, SITE.1, ring_point.0, ring_point.1);
 
-    let gap_m = (types::MAX_RANGE_KM - ours_km) * 1000.0;
+    let gap_mm = (types::MAX_RANGE_KM - ours_km) * 1e6;
     assert!(
-        (gap_m - 258.42).abs() < 0.02,
-        "the 6371/6378 seam moved: a point the {} km ring draws reads \
-             {ours_km:.6} km here, a {gap_m:.2} m gap, documented as 258.42 m",
+        gap_mm.abs() < 1.0,
+        "a point the {} km ring draws reads {ours_km:.9} km here, a \
+             {gap_mm:.3} mm gap — the 6371/6378 seam this test was written \
+             to record has reopened",
         types::MAX_RANGE_KM,
     );
-    // Which way: the section samples *nearer* the site than the ring's
-    // label claims, never further.
+
+    // In pixels of the plan view the ring is drawn on: under a millionth of
+    // one, on either target, so the figure is stated rather than branched on.
+    let px = gap_mm / 1e6 * types::PIXELS_PER_KM;
     assert!(
-        ours_km < types::MAX_RANGE_KM,
-        "the section now reads the ring as further out than 230 km, which \
-             inverts the module doc's statement of the seam",
+        px.abs() < 1e-6,
+        "the ring and the track are {px:.9} px apart; they were 1.1505 px \
+             apart on a 2048-wide view before the spheres were unified",
     );
 
-    // In pixels of the plan view the ring is drawn on, which is
-    // target-dependent: `IMAGE_SIZE` is 2048 native and 1024 on wasm, so
-    // the same 258 m is twice as many pixels on a desktop.
-    let px = gap_m / 1000.0 * types::PIXELS_PER_KM;
-    #[cfg(target_arch = "wasm32")]
-    let (target, expected) = ("wasm (1024 px)", 0.5753);
-    #[cfg(not(target_arch = "wasm32"))]
-    let (target, expected) = ("native (2048 px)", 1.1505);
-    assert!(
-        (px - expected).abs() < 0.001,
-        "the seam is {px:.4} px on {target}, documented as {expected}",
-    );
-
-    // precondition: the two spheres really do differ, so this is a seam and
-    // not a rounding artefact.
-    assert!(
-        (types::EARTH_RADIUS_KM * std::f64::consts::PI / 180.0 - IMAGE_BOUNDS_KM_PER_DEG).abs()
-            > 0.1,
-        "precondition: `ImageBounds`' 111.32 km/° and the 6371 sphere have \
-             converged, so there is no seam left to record",
+    // precondition: the unification is the *expression*, not a rounded
+    // literal that happens to be close. A `KM_PER_DEGREE_LAT` spelled
+    // `111.195` would pass the assertions above at this tolerance and still
+    // be a second definition of the planet.
+    assert_eq!(
+        types::KM_PER_DEGREE_LAT.to_bits(),
+        (types::EARTH_RADIUS_KM * std::f64::consts::PI / 180.0).to_bits(),
+        "`KM_PER_DEGREE_LAT` is no longer derived from `EARTH_RADIUS_KM`",
     );
 }
 

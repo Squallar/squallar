@@ -722,9 +722,12 @@ fn floor_hit(eye: vec3<f32>, direction: vec3<f32>) -> f32 {
     return t;
 }
 
-// Kilometres per degree of latitude — `ImageBounds`' own constant, which is
-// the convention every other consumer of this mapping already reads with.
-const KM_PER_DEGREE_LAT: f32 = 111.32;
+// Kilometres per degree of latitude — `rustdar_radar::types::KM_PER_DEGREE_LAT`
+// (`EARTH_RADIUS_KM · pi/180`), the one sphere the whole workspace measures
+// ground distance on. WGSL cannot read a Rust constant, so this is the only
+// copy of that number anywhere; `volume_uniform::tests::
+// the_shaders_km_per_degree_is_the_radar_crates_own` pins this literal to it.
+const KM_PER_DEGREE_LAT: f32 = 111.194927;
 
 // Web Mercator's y: `ln(tan(pi/4 + phi/2))`, the projection's definition.
 fn mercator_y(lat_rad: f32) -> f32 {

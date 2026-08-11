@@ -73,7 +73,7 @@
 //! **above the antenna**, so every row height crosses that boundary exactly
 //! once, at [`SectionAxes::row_height_km_msl`]'s caller.
 //!
-//! # The ground track is 6371, and the range ring is not
+//! # The ground track and the range ring are the same sphere
 //!
 //! Columns are great-circle points ([`beam::great_circle_point`]) and their
 //! radar-relative coordinates come from [`beam::site_bearing_range_km`], both
@@ -81,17 +81,16 @@
 //! same sphere `render::render_gate` projects gates onto, so a section samples
 //! the ground the plan view put under the cursor.
 //!
-//! **It is not the sphere the plan view's range ring is drawn on.**
-//! [`crate::types::ImageBounds`] works in `1.0 / 111.32` degrees per km, which
-//! implies a 6378 km sphere, and the 230 km ring is drawn at
-//! `MAX_RANGE_KM / 111.32` degrees of latitude. Converted back on 6371 that
-//! latitude offset is **229.742 km**, so a point the ring puts at 230 km reads
-//! as **258.4 m nearer the site** here — 1.15 px on a 2048-wide plan view,
-//! 0.58 px on the 1024-wide wasm one. This is a deliberate choice, not an
-//! oversight: the alternative is to reproduce a known 0.11 % inconsistency in
-//! the image bounds so that a section agrees with a *ring* rather than with the
-//! *gates* it is made of. `the_ground_track_sphere_is_the_one_render_gate_uses`
-//! measures both numbers so the seam cannot drift unnoticed.
+//! **It is now also the sphere the plan view's range ring is drawn on.** It
+//! was not: [`crate::types::ImageBounds`] worked in `1.0 / 111.32` degrees per
+//! km — a 6378 km sphere — and the 230 km ring was drawn at
+//! `MAX_RANGE_KM / 111.32` degrees of latitude, which converted back on 6371
+//! is 229.742 km. A point the ring put at 230 km therefore read **258.4 m
+//! nearer the site** here, 1.15 px on a 2048-wide plan view. `ImageBounds`
+//! reads [`crate::types::KM_PER_DEGREE_LAT`] now, which *is*
+//! `EARTH_RADIUS_KM · π/180`, so the two agree exactly and
+//! `the_ground_track_and_the_range_ring_are_the_same_sphere` pins that they
+//! keep agreeing.
 //!
 //! # Clipped to the data, not to `MAX_RANGE_KM`
 //!
