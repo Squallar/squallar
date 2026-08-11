@@ -183,7 +183,8 @@ async fn fetch_zone_json(client: &reqwest::Client, url: &str) -> Option<serde_js
 
 /// The zones API returns a bare Feature, not a FeatureCollection: `geometry`
 /// is at the top level. County rings run 100+ vertices each, which is finer
-/// than the map shows and expensive to ear-clip, so they are simplified here.
+/// than the map shows, so they are simplified here: fewer vertices to project
+/// and fill on every render, and smaller files in the on-disk zone cache.
 fn parse_zone_polygons(json: &serde_json::Value, url: &str) -> Option<Vec<GeoPolygon>> {
     let polys = super::alert::parse_geometry(json.get("geometry"))?;
 
