@@ -669,6 +669,62 @@ impl VolumeStore {
         self.lock().set_holders.contains(&pane_idx)
     }
 
+    /// Every pane index this store is still holding something for that the
+    /// layout has stopped showing — at or past `visible_panes` — in ascending
+    /// order.
+    ///
+    /// # The path this closes
+    ///
+    /// Splitting to fewer panes does not convert the panes it hides: they keep
+    /// their `PaneState` so a re-split remembers them, and `ReleaseVolume`
+    /// fires only on a *kind* change. So a 3D pane hidden mid-build kept its
+    /// entry — `Building` through resolved grid — and nothing ever came back
+    /// to ask. At 36 MiB of GPU texture and ~8 MiB of host bytes per resolved
+    /// grid, and up to five hideable panes on desktop, that is the store
+    /// spending its whole enforced budget on panes nobody can see: what
+    /// [`Self::enforce_budget`] then evicts, oldest first, is a *live* 3D
+    /// loop's frames.
+    ///
+    /// # Why an index test and not a pane test
+    ///
+    /// This deliberately asks nothing about the `PaneState`. A pane that is
+    /// merely **not currently drawn** is not a pane that is **gone**: panes are
+    /// `mem::take`n during the UI pass and the taken slot reads as a default
+    /// `PaneState` — a `Map` with an empty site — so any predicate that asked
+    /// "is pane *i* still a 3D pane?" from inside that window would release a
+    /// live pane's grid on the frame its own settings panel was open. The
+    /// layout's count is a fact about the *layout* and is true at every point
+    /// in the frame; the caller's job is to evaluate it at one where the
+    /// vector is whole. `App::release_hidden_pane_volumes` is that caller and
+    /// says where.
+    ///
+    /// Set holders are named too, and by the same index test, because they are
+    /// the ones with nothing else to bound them: a hidden pane is one
+    /// `dispatch_loop_renders` never walks, so its
+    /// [`Self::retain_set`] is never restated and its whole resident set —
+    /// thirteen grids, 468 MiB on desktop — outlives the layout that asked for
+    /// it. A holder marked as a set holder but holding no entry is named as
+    /// well, so that [`Self::release`] can un-mark it: coming back as a
+    /// *single* holder while still on that list would exempt it from every
+    /// shed there is.
+    ///
+    /// Naming only what is actually held is what makes the sweep
+    /// edge-triggered rather than per-frame work: [`Self::release`] detaches
+    /// the pane and unmarks it, so the next pass answers with an empty vector.
+    pub fn hidden_holders(&self, visible_panes: usize) -> Vec<usize> {
+        let inner = self.lock();
+        let mut hidden: Vec<usize> = inner
+            .entries
+            .iter()
+            .flat_map(|e| e.panes.iter().copied())
+            .chain(inner.set_holders.iter().copied())
+            .filter(|&pane| pane >= visible_panes)
+            .collect();
+        hidden.sort_unstable();
+        hidden.dedup();
+        hidden
+    }
+
     /// Release everything `pane_idx` holds **as a set**, and stop treating it
     /// as a set holder. Returns how many entries were dropped outright.
     ///
@@ -883,9 +939,13 @@ impl VolumeStore {
     /// Reported rather than bounded, and logged on every build — because the
     /// bound is "one grid per 3D pane", and 8 MiB a pane is the kind of figure
     /// that wants to be visible in a log the day someone finds a path that
-    /// keeps a grid a pane no longer needs. One such path is already known:
-    /// reducing the pane count hides a 3D pane without converting it, and
-    /// `ReleaseVolume` fires only on a *kind* change.
+    /// keeps a grid a pane no longer needs.
+    ///
+    /// The one such path this doc used to disclose — reducing the pane count
+    /// hides a 3D pane without converting it, and `ReleaseVolume` fires only on
+    /// a *kind* change — is closed: [`Self::hidden_holders`] names those panes
+    /// and `App::release_hidden_pane_volumes` releases them, once per frame,
+    /// outside every `mem::take` window.
     pub fn memory_bytes(&self) -> usize {
         self.lock()
             .entries
@@ -1517,6 +1577,14 @@ impl VolumeResources {
     /// `prepare` against the store's own floor ids, which the release has
     /// already shrunk.
     ///
+    /// The uploads half is not redundant with [`Self::retain_uploads`]'s call
+    /// in `prepare`, and this is the case that says why: when the pane that
+    /// went away was the **last** 3D pane, no `prepare` runs again at all, so
+    /// this is the only thing that ever frees the grid texture. That is also
+    /// why a pane hidden by a pane-count reduction has to reach here —
+    /// `App::release_hidden_pane_volumes` is the caller that makes it, and
+    /// `VolumeStore::hidden_holders` the predicate.
+    ///
     /// The **mirror is not freed here**, and deliberately: it is one texture for
     /// the whole application rather than a per-pane resource, so which pane just
     /// let go says nothing about whether anyone still wants it.
@@ -1524,7 +1592,135 @@ impl VolumeResources {
     /// path asks it every frame.
     pub fn release_pane(&mut self, pane_idx: usize, live_ids: &[u64]) {
         self.targets.remove(&pane_idx);
+        self.retain_uploads(live_ids);
+    }
+
+    /// Keep the uploads `live_ids` names and drop the rest.
+    ///
+    /// One line, named because it has two callers that must not drift: this
+    /// frame's `prepare`, which prunes what the store has let go of before
+    /// making its own resident, and [`Self::release_pane`], which is the only
+    /// one of the two that still runs once the last 3D pane has gone.
+    pub fn retain_uploads(&mut self, live_ids: &[u64]) {
         self.uploads.retain(|id, _| live_ids.contains(id));
+    }
+
+    /// Give `pane_idx` an offscreen of `size_px`, creating or resizing one only
+    /// if it has to, and say whether one is in hand afterwards.
+    ///
+    /// `prepare`'s own first step, named rather than inlined so that the
+    /// resources a pane holds can be made real — actual textures on an actual
+    /// device — by something other than a paint callback. `egui_wgpu::Callback`
+    /// wraps its `Box<dyn CallbackTrait>` in a private field, so a test holding
+    /// the payload `paint` produces cannot call `prepare` on it, and a release
+    /// test that could not allocate first would be asserting over two empty
+    /// maps.
+    pub fn ensure_pane_offscreen(
+        &mut self,
+        device: &wgpu::Device,
+        pane_idx: usize,
+        size_px: [u32; 2],
+    ) -> bool {
+        let slot = self.targets.entry(pane_idx).or_default();
+        self.pipelines.ensure_offscreen(device, slot, size_px);
+        slot.is_some()
+    }
+
+    /// Make `grid_id`'s upload resident — the texels once, the colour table
+    /// whenever the effective one changed — and say whether it is.
+    ///
+    /// `prepare`'s second step, named for the reason
+    /// [`Self::ensure_pane_offscreen`] gives. `palette` is the grid's **own**
+    /// table and `alpha` the user's curve over it: the effective bytes are
+    /// resolved here through [`effective_lut`], which is the one seam a curve
+    /// is applied at, so no caller can upload a table the curve has not been
+    /// through.
+    ///
+    /// The steady state is one hash lookup and one `Option<AlphaCurve>`
+    /// comparison — `AlphaCurve`'s equality takes the `Arc` pointer fast path —
+    /// and the 16 MiB of texels are written exactly once per grid, whatever the
+    /// editor does.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ensure_upload(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        grid_id: u64,
+        cells: [u32; 3],
+        indices: &[u8],
+        palette: &[u8],
+        alpha: Option<&AlphaCurve>,
+        coarse: CoarseLevel,
+    ) -> bool {
+        // Through the entry API rather than `contains_key` + `insert`, which is
+        // one hash lookup instead of two — and the upload is refusable, so this
+        // is a `match` on the entry rather than `or_insert_with`.
+        match self.uploads.entry(grid_id) {
+            std::collections::hash_map::Entry::Occupied(occupied) => {
+                let upload = occupied.into_mut();
+                // The Volume Alpha seam's steady state: rewrite the 1 KiB
+                // table only when the curve actually changed — a pointer
+                // comparison almost every frame — and leave the 16 MiB grid
+                // untouched always. `effective_lut` with `None` is the grid's
+                // own bytes, so clearing a curve restores the palette
+                // bit-exactly through the very same path that applied it.
+                if upload.applied_alpha.as_ref() != alpha {
+                    upload
+                        .textures
+                        .write_lut(queue, &effective_lut(palette, alpha));
+                    upload.applied_alpha = alpha.cloned();
+                }
+                true
+            }
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                let Some(textures) = self.pipelines.upload_volume_at(
+                    device,
+                    queue,
+                    cells,
+                    indices,
+                    &effective_lut(palette, alpha),
+                    coarse,
+                ) else {
+                    // `upload_volume` has already logged which invariant it
+                    // refused on. Nothing to add, and nothing to draw.
+                    return false;
+                };
+                vacant.insert(VolumeUpload {
+                    textures,
+                    applied_alpha: alpha.cloned(),
+                });
+                true
+            }
+        }
+    }
+
+    /// GPU texture bytes this is holding in the two maps
+    /// [`Self::release_pane`] gives back: the panes' offscreens, and the grid
+    /// uploads with their colour tables.
+    ///
+    /// The mirror is **not** counted, for the same reason `release_pane` does
+    /// not free it — it is one texture for the whole application, released by
+    /// [`Self::release_mirror`] on its own predicate, and folding it in here
+    /// would make a per-pane figure move when no pane changed.
+    ///
+    /// The counterpart of `VolumeStore::texture_bytes`, and the two are
+    /// different numbers on purpose: the store measures what the *host* has
+    /// decided should be resident, this measures what the device is actually
+    /// holding for it. A release that moved one without the other is exactly
+    /// the leak this reports.
+    pub fn resident_bytes(&self) -> usize {
+        let offscreens: usize = self
+            .targets
+            .values()
+            .flatten()
+            .map(|target| crate::volume::quality::offscreen_bytes(target.size()))
+            .sum();
+        let uploads: usize = self
+            .uploads
+            .values()
+            .map(|upload| upload.textures.texture_bytes())
+            .sum();
+        offscreens.saturating_add(uploads)
     }
 
     /// Give the pane mirror back, for a frame on which nothing wants a floor.
@@ -1675,74 +1871,54 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
             log::warn!("3D volume view: no VolumeResources in the callback map; nothing to draw");
             return Vec::new();
         };
+        // Everything the store has let go of, before this frame's own is made
+        // resident beside it. The same line `release_pane` runs, and the reason
+        // both exist is written there.
+        resources.retain_uploads(&self.live_ids);
+
+        if !resources.ensure_pane_offscreen(device, self.pane_idx, self.offscreen_px) {
+            return Vec::new();
+        }
+        let shape = self.grid.shape();
+        if !resources.ensure_upload(
+            device,
+            queue,
+            self.grid_id,
+            [shape.nx as u32, shape.ny as u32, shape.nz as u32],
+            self.grid.indices(),
+            // The grid's own table, through the one seam a user curve may
+            // rewrite its alpha at — `ensure_upload` resolves the effective
+            // bytes. See the module doc.
+            self.grid.lut(),
+            self.alpha.as_ref(),
+            // Off the uniform, because the uniform is where the two facts
+            // already agree: `gradient_shading` is the adapter's shading rung,
+            // which is fixed for the renderer's life, and the cell size comes
+            // from the same extents and dims the shader is handed. See
+            // `coarse_level_for`.
+            coarse_level_for(
+                self.uniform.gradient_shading,
+                largest_cell_km(&self.uniform),
+            ),
+        ) {
+            return Vec::new();
+        }
+
         // Destructured so the borrow checker can see that the pipelines are read
-        // while the two maps are written.
+        // while the two maps are read beside them.
         let VolumeResources {
             pipelines,
             targets,
             uploads,
             mirror,
         } = resources;
-
-        uploads.retain(|id, _| self.live_ids.contains(id));
-
-        let slot = targets.entry(self.pane_idx).or_default();
-        pipelines.ensure_offscreen(device, slot, self.offscreen_px);
-        let Some(target) = slot.as_ref() else {
+        // Both are known present — the two calls above answered `true` — and
+        // both are answered rather than unwrapped because this runs on the frame
+        // thread, where on wasm a panic aborts the whole application.
+        let (Some(Some(target)), Some(upload)) =
+            (targets.get(&self.pane_idx), uploads.get(&self.grid_id))
+        else {
             return Vec::new();
-        };
-
-        // Through the entry API rather than `contains_key` + `insert`, which is
-        // one hash lookup instead of two — and the upload is refusable, so this
-        // is a `match` on the entry rather than `or_insert_with`.
-        let upload = match uploads.entry(self.grid_id) {
-            std::collections::hash_map::Entry::Occupied(occupied) => {
-                let upload = occupied.into_mut();
-                // The Volume Alpha seam's steady state: rewrite the 1 KiB
-                // table only when the curve actually changed — a pointer
-                // comparison almost every frame — and leave the 16 MiB grid
-                // untouched always. `effective_lut` with `None` is the grid's
-                // own bytes, so clearing a curve restores the palette
-                // bit-exactly through the very same path that applied it.
-                if upload.applied_alpha != self.alpha {
-                    upload
-                        .textures
-                        .write_lut(queue, &effective_lut(self.grid.lut(), self.alpha.as_ref()));
-                    upload.applied_alpha = self.alpha.clone();
-                }
-                upload
-            }
-            std::collections::hash_map::Entry::Vacant(vacant) => {
-                let shape = self.grid.shape();
-                let Some(textures) = pipelines.upload_volume_at(
-                    device,
-                    queue,
-                    [shape.nx as u32, shape.ny as u32, shape.nz as u32],
-                    self.grid.indices(),
-                    // The grid's own table, through the one seam a user curve
-                    // may rewrite its alpha at — `effective_lut` borrows the
-                    // grid's bytes untouched when there is no curve. See the
-                    // module doc.
-                    &effective_lut(self.grid.lut(), self.alpha.as_ref()),
-                    // Off the uniform, because the uniform is where the two
-                    // facts already agree: `gradient_shading` is the adapter's
-                    // shading rung, which is fixed for the renderer's life, and
-                    // the cell size comes from the same extents and dims the
-                    // shader is handed. See `coarse_level_for`.
-                    coarse_level_for(
-                        self.uniform.gradient_shading,
-                        largest_cell_km(&self.uniform),
-                    ),
-                ) else {
-                    // `upload_volume` has already logged which invariant it
-                    // refused on. Nothing to add, and nothing to draw.
-                    return Vec::new();
-                };
-                vacant.insert(VolumeUpload {
-                    textures,
-                    applied_alpha: self.alpha.clone(),
-                })
-            }
         };
         let textures = &upload.textures;
 
@@ -1815,6 +1991,10 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
     }
 }
 
+/// `pub(crate)` for one item alone: `tests::ready_grid`, the crate's only
+/// real `VoxelGrid` — `build_voxels` is the sole constructor, and a second
+/// copy of its fixture in another test module would be a second thing to keep
+/// in step with the resampler. Everything else in here is a `#[test]`.
 #[path = "volume_bridge/tests.rs"]
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

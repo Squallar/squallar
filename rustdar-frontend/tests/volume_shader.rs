@@ -435,3 +435,60 @@ fn the_binding_map_counts_per_binding_type_the_way_wgpu_hal_does() {
         );
     }
 }
+
+/// **`GRADIENT_EPSILON` says what it is measured in, and what it is worth in
+/// a box the user can actually be in.**
+///
+/// A prose pin, and named as one — but the thing it guards is not prose. The
+/// constant is compared against a `magnitude` whose units are set two
+/// functions away: `shading_field` returns the coverage-premultiplied channel
+/// on a 0-1 scale, and `shading` and `iso_shading` divide the differences by
+/// `cell_km`, so the magnitude is normalised palette index **per displayed
+/// kilometre** and rescales with the box, the grid shape and the vertical
+/// exaggeration. A reader given `1e-6` and nothing else cannot tell a
+/// conservative NaN guard from an accidentally significant cut, and this doc
+/// once said only that it was "unitless".
+///
+/// So the substrings below are the *load-bearing* claims rather than the
+/// wording: the metric, the box the arithmetic is done at, and a ratio against
+/// the constant itself. Any of them going missing means the constant is back
+/// to being unjudgeable, which is the regression — not a rephrasing.
+///
+/// It cannot check that the arithmetic is *right*; nothing can, short of
+/// re-deriving it here, which would be the same statement twice. What it can
+/// do is refuse a doc that does not state it.
+#[test]
+fn the_gradient_epsilon_states_its_metric_and_what_it_is_worth() {
+    let decl = VOLUME_SHADER_WGSL
+        .find("const GRADIENT_EPSILON")
+        .expect("the constant is no longer where this test looks for it");
+    // The run of comment lines immediately above the declaration: everything
+    // since the last blank line.
+    let doc = VOLUME_SHADER_WGSL[..decl]
+        .rsplit("\n\n")
+        .next()
+        .expect("rsplit always yields at least one piece");
+    assert!(
+        doc.lines().all(|line| line.trim_start().starts_with("//")),
+        "the block above the constant is not all comment; this test is reading \
+         the wrong thing",
+    );
+
+    for claim in [
+        // The metric, both halves of it.
+        "palette index",
+        "per displayed kilometre",
+        // The box the figure is quoted at, so it is a real configuration
+        // rather than an abstraction.
+        "460 km",
+        // And a ratio against the constant, which is what makes it judgeable.
+        "GRADIENT_EPSILON",
+    ] {
+        assert!(
+            doc.contains(claim),
+            "GRADIENT_EPSILON's doc no longer says {claim:?}, so the value \
+             cannot be judged from it: a reader sees 1e-6 against a magnitude \
+             whose units are set two functions away",
+        );
+    }
+}

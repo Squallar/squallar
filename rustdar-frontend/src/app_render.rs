@@ -151,6 +151,14 @@ impl super::App {
 
         // Ensure pane_render vec matches gui pane count
         self.render.ensure_pane_count(self.gui.pane_count());
+        // And the other thing keyed by pane index that a layout change strands:
+        // a hidden 3D pane's voxel grid and offscreen. Here rather than in the
+        // pane loop because this is a point at which every pane is in the
+        // vector — `Gui::ui` below opens the frame's first `mem::take` window —
+        // and ahead of the dispatchers so the budget they are measured against
+        // is not being spent on panes nobody can see. See
+        // `App::release_hidden_pane_volumes`.
+        self.release_hidden_pane_volumes();
 
         // The frame's egui context, resolved once. The two passes below that
         // upload a plan-view texture are handed it rather than each reaching
@@ -3653,6 +3661,12 @@ mod loop_section_tests;
 #[path = "app_render/loop_volume_tests.rs"]
 #[cfg(test)]
 mod loop_volume_tests;
+
+/// What a 3D pane the layout stopped showing gives back, and what the release
+/// beside it must not touch.
+#[path = "app_render/hidden_pane_volume_tests.rs"]
+#[cfg(test)]
+mod hidden_pane_volume_tests;
 
 /// What the loop timer does with a playback speed no slider could have set.
 #[path = "app_render/loop_interval_tests.rs"]

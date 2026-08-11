@@ -1605,6 +1605,63 @@ impl App {
         }
     }
 
+    /// Give back what the layout's hidden panes are still holding — the other
+    /// way a 3D pane stops needing its volume.
+    ///
+    /// `GuiAction::ReleaseVolume` covers one of the two: a pane **converted**
+    /// out of `Volume`, which the UI knows it did. It does not cover the other.
+    /// Splitting to fewer panes hides a 3D pane without converting it — the
+    /// `PaneState` stays in the vector so a re-split remembers it — and nothing
+    /// in the frame comes back to ask, so the store went on holding a resolved
+    /// grid (36 MiB of GPU texture, ~8 MiB of host bytes) plus that pane's
+    /// offscreen for the rest of the session.
+    ///
+    /// # Where the safe point is
+    ///
+    /// **Here, and not inside the pane loop.** A pane that is merely *not
+    /// currently drawn* is not a pane that is *gone*: `rustdar-egui` holds a
+    /// pane out of its vector with `mem::take` while the settings panel and the
+    /// layer stack draw, and the taken slot reads as a **default `PaneState` —
+    /// a `Map` with an empty site**. Any predicate that asked a pane whether it
+    /// still wanted its volume from inside that window would read the phantom
+    /// and release a live pane's grid. This runs from `setup_egui_frame`,
+    /// before `Gui::ui` opens the frame's first take window, so every pane is
+    /// in the vector and the layout's count is the whole truth.
+    ///
+    /// # What it must not disturb
+    ///
+    /// A 3D loop holds a **set** of grids ([`crate::volume::bridge::Hold::Set`]),
+    /// exempt from every shed there is. Two directions therefore matter and
+    /// both are pinned:
+    ///
+    /// * releasing a hidden pane must not tear down a *visible* pane's resident
+    ///   set — it cannot, because the store refcounts by pane and this detaches
+    ///   one pane rather than dropping an entry;
+    /// * a hidden pane that *was* a set holder must be released — it is the one
+    ///   holder nothing else bounds, since `dispatch_loop_renders` never walks a
+    ///   hidden pane and so never restates its `retain_set`.
+    ///
+    /// `rendered_for` is cleared with the release, and that half is not
+    /// bookkeeping. `PrepareVolume` is level-triggered on it, so a pane whose
+    /// grid was released while it still named one would come back from a
+    /// re-split with a key that no longer matches anything, never ask again,
+    /// and read "Building…" for ever. The 3D loop teardown in
+    /// `dispatch_loop_renders` clears it for the same reason.
+    pub(super) fn release_hidden_pane_volumes(&mut self) {
+        // The panes the layout is showing, from the same slice `render_panes`
+        // draws — not the raw `pane_count`, which may outrun the vector.
+        let visible = self.gui.panes().len();
+        for pane_idx in self.volume_store.hidden_holders(visible) {
+            self.handle_release_volume(pane_idx);
+            if let Some(pane) = self.gui.pane_mut(pane_idx)
+                && let Some(volume) = pane.volume_mut()
+            {
+                volume.rendered_for = None;
+            }
+            log::debug!("3D volume view: pane {pane_idx} is hidden; released what it held");
+        }
+    }
+
     /// Record that this pane's 3D view is now about `target`, so it stops
     /// asking. Set for a refusal as well as for a grid: a volume that cannot be
     /// resampled must not be re-attempted every frame at 100 ms a go.

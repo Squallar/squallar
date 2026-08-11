@@ -224,14 +224,58 @@ const FLOOR_BELOW_FADE: f32 = 0.08;
 // Below this the central difference is noise rather than a surface, and
 // normalising it would point the normal in an arbitrary direction.
 //
-// The gradient it bounds is per *displayed kilometre* (`shading` divides the
-// index differences by `cell_km`), so the same field measures differently as
-// the cell size changes: this floor rescales with the grid, and 1e-6 was
-// tuned against the old unitless difference. It stays correct as a NaN guard
-// because it sits orders of magnitude under any real surface at every
-// shipped cell size — one R8 index step (1/255) across the coarsest 1.8 km
-// cell is still ~2e-3 per km — but it is a zero-detector, not a
-// surface-classifier, and must not be read as a tuned threshold.
+// # What the magnitude it bounds is measured in
+//
+// **Normalised palette index per displayed kilometre.** Both halves need
+// saying: neither is guessable from the comparison itself, and without them
+// 1e-6 means a different physical thing in every box.
+//
+// *Normalised palette index*, because the field being differenced is
+// `shading_field` — the coverage-premultiplied channel, `coverage x index`
+// with the index stored as `index / 255` (`coverage_premultiplied`, in
+// `volume::raymarch`). It runs 0 at air to 1 at the top of the table, for
+// every product. `iso_shading`'s field (`iso_field(index) x coverage`) is on
+// that same 0-1 scale, which is what lets one constant serve both call sites.
+//
+// *Per displayed kilometre*, because `shading` and `iso_shading` both divide
+// the differences by `cell_km` — the box extent over the cell count, with the
+// vertical multiplied by the exaggeration the pane is drawn at. So this floor
+// rescales with the box, with the grid shape AND with the exaggeration knob,
+// and the bare number says nothing until it is put beside one of them.
+//
+// # What 1e-6 is worth at the box that ships
+//
+// The default box is the whole surveillance volume: `2 x MAX_HALF_WIDTH_KM`
+// = 460 km across, `DEFAULT_BASE_KM_MSL`..`DEFAULT_TOP_KM_MSL` = 0-18 km
+// deep. On the desktop grid (`DESKTOP_VOLUME_GRID_CELLS`, 256 x 256 x 128)
+// that is 1.797 km per horizontal cell and 0.141 km per vertical one — 1.69
+// km even at `MAX_VERTICAL_EXAGGERATION` (12), so the horizontal is the
+// coarsest displayed cell over the whole travel of the knob, and it is the
+// coarsest cell that sets the *smallest* gradient a real feature can make.
+//
+// The smallest signal the field can carry is one palette index, 1/255 =
+// 3.9e-3, across that cell:
+//
+//     3.9e-3 / 1.797 km  ~  2.2e-3 per km  ~  2200 x GRADIENT_EPSILON
+//
+// Conservative by a factor of two, deliberately: the difference above spans
+// two cells and is divided by one, so what is actually compared is ~4.4e-3.
+// That factor is uniform over the three axes, so it moves the magnitude and
+// never the normal.
+//
+// The coarsest configuration that ships at all is wasm32's 128 x 128 x 64
+// grid at the same box — 3.59 km a cell, one index step = 1.1e-3 per km,
+// still ~1100 x this constant. A picked *region* only ever refines the cell
+// and raises the figure, and a data edge (coverage 1 -> 0, a whole 1.0 step)
+// raises it by 255 again. For a one-index feature to fall under 1e-6 the
+// displayed cell would have to be ~3900 km — more than eight times the
+// widest box there is.
+//
+// So it is a **zero-detector**: three orders of magnitude below the smallest
+// thing an eight-bit field can express, guarding `gradient / magnitude`
+// against a uniform sample and nothing else. It is not a tuned threshold and
+// must not be read as one — moved anywhere near a real gradient it would
+// start classifying lit surfaces as flat.
 const GRADIENT_EPSILON: f32 = 1e-6;
 
 // Bisection steps refining an isosurface hit between the sample that crossed

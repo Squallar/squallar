@@ -78,7 +78,12 @@ fn fade_lut(band: usize) -> Vec<u8> {
 /// on screen — only a `Ready` entry ever does, so a `Refused` stub cannot
 /// exercise them. Built through `build_voxels` because that is the one
 /// constructor a `VoxelGrid` has.
-fn ready_grid() -> VolumeEntry {
+///
+/// `pub(crate)` for the same reason: `app_render`'s hidden-pane tests measure
+/// the bytes a release gives back, and only a `Ready` entry has any. A second
+/// copy of this fixture over there would be a second thing to keep in step
+/// with the resampler.
+pub(crate) fn ready_grid() -> VolumeEntry {
     use nexrad_model::data::{
         MomentData, PulseWidth, Radial, RadialStatus, Scan, Sweep, VolumeCoveragePattern,
     };
@@ -1038,38 +1043,61 @@ fn the_skip_threshold_follows_the_effective_curve() {
     );
 }
 
-/// The curve is applied in `prepare` and only through the staleness
+/// The curve is applied on the upload path and only through the staleness
 /// comparison — the same source-scan arrangement as the painter's guards,
-/// and for the same reason: `prepare` needs a `wgpu::Device`, so no host
+/// and for the same reason: the upload needs a `wgpu::Device`, so no host
 /// test can reach it. Mutation testing on the *behavioural* seam is what
 /// pins the values ([`effective_lut`], [`effective_fade_band`] above);
-/// this pins that `prepare` still consults them, and that the rewrite is
-/// gated on the curve actually changing rather than issued per frame.
+/// this pins that the upload still consults them, that the rewrite is
+/// gated on the curve actually changing rather than issued per frame, and
+/// that `prepare` still feeds it both halves.
+///
+/// **Re-anchored**: the residency step this scans used to be inline in
+/// `CallbackTrait::prepare` and is now `VolumeResources::ensure_upload`,
+/// which is what let `release_pane` be driven against real allocations
+/// (`egui_wgpu::Callback` wraps its `Box<dyn CallbackTrait>` in a private
+/// field, so nothing outside a real egui pass can call `prepare`). The
+/// callback half below is what keeps the move from having cut the wiring.
 #[test]
-fn prepare_applies_the_curve_through_the_staleness_gate() {
+fn the_upload_applies_the_curve_through_the_staleness_gate() {
     let source = include_str!("../volume_bridge.rs");
     let start = source
-        .find("impl egui_wgpu::CallbackTrait for VolumeCallback {")
-        .expect("the callback impl is no longer where this test looks for it");
+        .find("    pub fn ensure_upload(")
+        .expect("the upload step is no longer where this test looks for it");
     let body = &source[start..];
     let end = body
-        .find("\n}\n")
-        .expect("the callback impl has no closing brace");
+        .find("\n    }\n")
+        .expect("the upload step has no closing brace");
     let body = &body[..end];
 
     assert!(
-        body.contains("if upload.applied_alpha != self.alpha {"),
+        body.contains("if upload.applied_alpha.as_ref() != alpha {"),
         "the LUT rewrite is no longer gated on the curve changing — either \
              an edit stopped applying to an already-uploaded grid, or the 1 KiB \
              table is being rewritten every frame",
     );
     assert!(
-        body.matches("effective_lut(self.grid.lut(), self.alpha.as_ref())")
-            .count()
-            >= 2,
+        body.matches("effective_lut(palette, alpha)").count() >= 2,
         "both upload paths — first upload and in-place rewrite — must build \
              the table through `effective_lut`, or one of them ships the wrong \
              alpha",
+    );
+
+    // And the caller still hands it the grid's own table and this frame's
+    // curve. Without this the scan above would stay green over an
+    // `ensure_upload` nothing called with a curve at all.
+    let start = source
+        .find("impl egui_wgpu::CallbackTrait for VolumeCallback {")
+        .expect("the callback impl is no longer where this test looks for it");
+    let callback = &source[start..];
+    let end = callback
+        .find("\n}\n")
+        .expect("the callback impl has no closing brace");
+    let callback = &callback[..end];
+    assert!(
+        callback.contains("self.grid.lut(),") && callback.contains("self.alpha.as_ref(),"),
+        "`prepare` no longer hands the upload the grid's own palette and the \
+             frame's curve, so the seam above is reached with neither",
     );
 }
 
@@ -1254,4 +1282,178 @@ fn retain_set_states_the_whole_set_and_release_set_gives_it_all_back() {
          would rebuild it every frame",
     );
     assert!(store.lookup(&live).is_some());
+}
+
+/// GPU texture bytes one [`ready_grid`] costs the store, by the same arithmetic
+/// `StoredVolume::texture_bytes` uses — so a test asserting that bytes went
+/// away is asserting about a real allocation rather than about a count.
+fn one_grid_texture_bytes() -> usize {
+    match ready_grid() {
+        VolumeEntry::Ready(grid) => {
+            let shape = grid.shape();
+            crate::volume::raymarch::grid_bytes_with_mips([
+                u32::try_from(shape.nx).unwrap(),
+                u32::try_from(shape.ny).unwrap(),
+                u32::try_from(shape.nz).unwrap(),
+            ])
+            .expect("a fixture grid cannot overflow")
+                + crate::constants::VOLUME_LUT_BYTES
+        }
+        _ => unreachable!("ready_grid is Ready"),
+    }
+}
+
+/// Host bytes one [`ready_grid`] costs the store.
+fn one_grid_host_bytes() -> usize {
+    match ready_grid() {
+        VolumeEntry::Ready(grid) => grid.memory_bytes(),
+        _ => unreachable!("ready_grid is Ready"),
+    }
+}
+
+/// **A pane the layout stopped showing is named, and nothing else is.**
+///
+/// The store is refcounted by target and keyed by pane index, and a pane-count
+/// reduction is the one way a 3D pane stops needing its grid without anything
+/// telling the store so: the `PaneState` stays in the vector for a re-split,
+/// and `ReleaseVolume` fires only on a *kind* change. This is the predicate
+/// that closes it.
+///
+/// Driven with three holders of two different kinds, and every assertion is in
+/// **bytes** rather than in entry counts — a store holding `Refused` stubs
+/// would satisfy a count assertion while giving nothing back.
+#[test]
+fn hidden_holders_names_the_panes_the_layout_dropped_and_their_bytes_go() {
+    let store = VolumeStore::new();
+    let one = one_grid_texture_bytes();
+    let host_one = one_grid_host_bytes();
+    assert!(
+        one > 0 && host_one > 0,
+        "precondition: a resident grid costs something on both sides, or every \
+         byte assertion below passes vacuously",
+    );
+
+    // Pane 0: a *visible* 3D loop holding a set of two.
+    let kept: Vec<VolumeTarget> = (0..2)
+        .map(|m| target(RadarProduct::Reflectivity, m))
+        .collect();
+    for t in &kept {
+        store.begin_build_held(0, t, Hold::Set);
+        assert!(store.complete(t, ready_grid()), "the build resolves");
+    }
+    // Pane 1: hidden, holding one live grid the ordinary way.
+    let single = target(RadarProduct::Reflectivity, 2);
+    store.begin_build(1, &single);
+    assert!(store.complete(&single, ready_grid()), "the build resolves");
+    // Pane 2: hidden, and a set holder — the case nothing else bounds, because
+    // `dispatch_loop_renders` never walks a hidden pane and so never restates
+    // its `retain_set`.
+    let stranded: Vec<VolumeTarget> = (3..5)
+        .map(|m| target(RadarProduct::Reflectivity, m))
+        .collect();
+    for t in &stranded {
+        store.begin_build_held(2, t, Hold::Set);
+        assert!(store.complete(t, ready_grid()), "the build resolves");
+    }
+
+    assert_eq!(
+        store.texture_bytes(),
+        one * 5,
+        "precondition: five resident grids",
+    );
+    assert_eq!(
+        store.memory_bytes(),
+        host_one * 5,
+        "precondition: host side"
+    );
+
+    assert!(
+        store.hidden_holders(3).is_empty(),
+        "a layout showing all three panes has nothing to release, and naming a \
+         visible pane would take a live volume away mid-frame",
+    );
+    assert_eq!(
+        store.hidden_holders(1),
+        vec![1, 2],
+        "the layout shows one pane, so panes 1 and 2 are gone from it — a set \
+         holder among them, which is the one nothing else bounds",
+    );
+
+    for pane in store.hidden_holders(1) {
+        store.release(pane);
+    }
+
+    assert_eq!(
+        store.texture_bytes(),
+        one * 2,
+        "the hidden panes' grids are still resident: {} bytes where two grids \
+         is {}",
+        store.texture_bytes(),
+        one * 2,
+    );
+    assert_eq!(
+        store.memory_bytes(),
+        host_one * 2,
+        "the host bytes did not go with the GPU ones",
+    );
+
+    // The other direction, and the one a careless release breaks: the visible
+    // loop's resident set is untouched.
+    for t in &kept {
+        assert!(
+            store.lookup(t).is_some(),
+            "releasing a hidden pane tore down the visible loop's set: {:?} is \
+             gone",
+            t.volume.collected,
+        );
+    }
+    assert!(
+        store.holds_set(0),
+        "the visible loop stopped being a set holder, so the next build to land \
+         will shed the twelve frames it is animating",
+    );
+    assert!(
+        !store.holds_set(2),
+        "a released pane is still on the set-holder list, so coming back as a \
+         single holder it would be exempt from every shed there is",
+    );
+
+    assert!(
+        store.hidden_holders(1).is_empty(),
+        "the sweep is not edge-triggered: it names the same panes again with \
+         nothing left to give, so the frame path would do this work for ever",
+    );
+}
+
+/// A pane marked a set holder but holding **no entry** is named too, so the
+/// mark goes with the release.
+///
+/// `retain_set` marks the holder and then detaches it, so `release_set` leaves
+/// exactly this state behind — a live shape, not a contrivance. The mark is
+/// what exempts a pane from every shed in this file, so a hidden pane that
+/// kept it would come back as an ordinary single holder that no longer sheds:
+/// a 3D pane accumulating a grid per volume roll, for ever.
+#[test]
+fn a_hidden_pane_still_marked_a_set_holder_is_named_so_the_mark_goes_too() {
+    let store = VolumeStore::new();
+    let t = target(RadarProduct::Reflectivity, 0);
+    store.begin_build_held(1, &t, Hold::Set);
+    assert!(store.complete(&t, ready_grid()), "the build resolves");
+    assert_eq!(store.release_set(1), 1, "the set goes");
+    assert!(
+        store.holds_set(1),
+        "precondition: `retain_set` leaves the mark behind, which is the state \
+         this test is about",
+    );
+    assert_eq!(store.texture_bytes(), 0, "precondition: no entry is left");
+
+    assert_eq!(
+        store.hidden_holders(1),
+        vec![1],
+        "a holder with a mark and no entry is invisible to a scan of the \
+         entries alone",
+    );
+    store.release(1);
+    assert!(!store.holds_set(1), "the release did not take the mark");
+    assert!(store.hidden_holders(1).is_empty());
 }

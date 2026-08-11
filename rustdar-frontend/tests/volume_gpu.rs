@@ -2275,3 +2275,123 @@ fn blitted(
 
     read_back(device, queue, &target, size)
 }
+
+/// **`release_pane` gives real GPU memory back, and only the pane's own.**
+///
+/// Here rather than in a host test because there is nothing to release without
+/// a device: the two maps `release_pane` empties hold a pane-sized colour
+/// attachment and an uploaded 3D texture apiece, and a test that could not
+/// allocate one would be asserting over two empty `HashMap`s — green whatever
+/// the function did. Both halves are driven and both are measured in bytes,
+/// through `VolumeResources::resident_bytes`.
+///
+/// The two halves fail differently and neither implies the other:
+///
+///  * the **offscreen** is keyed by pane, so releasing the wrong index frees a
+///    live pane's attachment and it is reallocated on the next frame — a
+///    pane-sized texture churned at the frame rate;
+///  * the **uploads** are keyed by the store's ids, and this is the *only*
+///    thing that frees a grid texture when the pane that went away was the last
+///    3D pane: no `prepare` runs again, so the 36 MiB stays for the session.
+///    The two uploads below are deliberately different shapes, so an inverted
+///    retain — which frees exactly as many bytes — is caught by *which* one
+///    survives rather than by how many did.
+///
+/// ```text
+/// cargo test -p rustdar-frontend --test volume_gpu \
+///     release_pane_frees_that_panes_offscreen -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
+fn release_pane_frees_that_panes_offscreen_and_the_uploads_the_store_let_go_of() {
+    use rustdar_frontend::volume::bridge::VolumeResources;
+    use rustdar_frontend::volume::quality::offscreen_bytes;
+    use rustdar_frontend::volume::raymarch::grid_bytes_at;
+
+    let _serialised = gpu_lock();
+    let (device, queue) = device();
+    let mut resources = VolumeResources::new(
+        &device,
+        attachments(wgpu::TextureFormat::Bgra8Unorm),
+        &queue,
+    );
+    assert_eq!(
+        resources.resident_bytes(),
+        0,
+        "a fresh renderer holds no pane resources",
+    );
+
+    // Every fixture is a different size from its sibling, so one byte total
+    // says *which* offscreen and *which* upload survived rather than merely
+    // how many did — an inverted retain frees exactly as many bytes as the
+    // right one, and only the sizes tell the two apart.
+    const KEPT_PANE_PX: [u32; 2] = [96, 64];
+    const GONE_PANE_PX: [u32; 2] = [48, 32];
+    let (kept_cells, kept_indices) = slab_ramp(&[10, 20, 30, 40]);
+    let (gone_cells, gone_indices) = slab_ramp(&[10, 20]);
+    let lut = grey_ramp_lut();
+    const KEPT_ID: u64 = 7;
+    const GONE_ID: u64 = 9;
+
+    assert!(resources.ensure_pane_offscreen(&device, 0, KEPT_PANE_PX));
+    assert!(resources.ensure_pane_offscreen(&device, 1, GONE_PANE_PX));
+    assert!(resources.ensure_upload(
+        &device,
+        &queue,
+        KEPT_ID,
+        kept_cells,
+        &kept_indices,
+        &lut,
+        None,
+        CoarseLevel::Omitted,
+    ));
+    assert!(resources.ensure_upload(
+        &device,
+        &queue,
+        GONE_ID,
+        gone_cells,
+        &gone_indices,
+        &lut,
+        None,
+        CoarseLevel::Omitted,
+    ));
+
+    let kept_pane = offscreen_bytes(KEPT_PANE_PX);
+    let gone_pane = offscreen_bytes(GONE_PANE_PX);
+    let kept_grid = grid_bytes_at(kept_cells, CoarseLevel::Omitted).expect("a tiny grid fits")
+        + VOLUME_LUT_BYTES;
+    let gone_grid = grid_bytes_at(gone_cells, CoarseLevel::Omitted).expect("a tiny grid fits")
+        + VOLUME_LUT_BYTES;
+    assert!(
+        gone_pane > 0 && kept_pane > gone_pane && kept_grid > gone_grid,
+        "precondition: the fixtures cost something and each differs from its \
+         sibling, or the byte total below cannot say which one survived",
+    );
+    assert_eq!(
+        resources.resident_bytes(),
+        kept_pane + gone_pane + kept_grid + gone_grid,
+        "precondition: two offscreens and two uploads are actually resident — \
+         if this is 0 the release below frees nothing and passes vacuously",
+    );
+
+    // Pane 1 goes, and the store has let go of `GONE_ID` with it.
+    resources.release_pane(1, &[KEPT_ID]);
+
+    assert_eq!(
+        resources.resident_bytes(),
+        kept_pane + kept_grid,
+        "the release did not give back exactly pane 1's offscreen and the one \
+         upload the store stopped naming — and, since every fixture is a \
+         different size, this is also what says pane 0's attachment and the \
+         still-named grid are the ones left",
+    );
+
+    // The last pane going takes everything with it — the case that has no
+    // `prepare` after it to prune anything.
+    resources.release_pane(0, &[]);
+    assert_eq!(
+        resources.resident_bytes(),
+        0,
+        "closing the last 3D pane left GPU memory behind for the session",
+    );
+}

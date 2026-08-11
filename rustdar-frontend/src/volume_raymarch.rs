@@ -906,6 +906,14 @@ impl VolumePipelines {
 
         Some(VolumeTextures {
             cells,
+            // The levels this descriptor actually asked for, not the levels a
+            // grid of this shape may have — see `grid_bytes_at`. `upload_refusal`
+            // above has already rejected a shape whose product overflows, so the
+            // `None` arm is unreachable and reports 0 rather than panicking on
+            // the frame thread.
+            bytes: grid_bytes_at(cells, coarse)
+                .unwrap_or(0)
+                .saturating_add(VOLUME_LUT_BYTES),
             uniform,
             bind_group,
             lut_texture,
@@ -1148,6 +1156,11 @@ fn create_pane_mirror(
 /// A voxel grid and its palette, uploaded, plus the camera buffer.
 pub struct VolumeTextures {
     cells: [u32; 3],
+    /// GPU bytes the two textures below occupy, recorded at upload because
+    /// this is the one moment the coarse decision is in hand: `CoarseLevel` is
+    /// consumed by the descriptor and nothing on the handle can be asked
+    /// afterwards whether the level was allocated. See [`Self::texture_bytes`].
+    bytes: usize,
     uniform: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     /// The palette's own texture, kept so the table can be rewritten in place
@@ -1161,6 +1174,18 @@ impl VolumeTextures {
     /// Cells along each axis.
     pub fn cells(&self) -> [u32; 3] {
         self.cells
+    }
+
+    /// GPU texture bytes this upload occupies: the grid at the levels it was
+    /// actually given, plus its colour table.
+    ///
+    /// The uniform buffer is left out — [`VOLUME_UNIFORM_BYTES`] is 192 bytes
+    /// against tens of megabytes, and every budget in `constants` is written
+    /// about textures. What this is for is
+    /// `volume::bridge::VolumeResources::resident_bytes`, so that giving a
+    /// pane's resources back can be measured rather than asserted.
+    pub fn texture_bytes(&self) -> usize {
+        self.bytes
     }
 
     /// Point the raymarch's camera somewhere.
@@ -1245,8 +1270,20 @@ pub fn grid_bytes(cells: [u32; 3]) -> Option<usize> {
 /// safe direction for both callers. The saving is real GPU memory either way;
 /// what it does not do is let the loop hold a fourteenth frame.
 pub fn grid_bytes_with_mips(cells: [u32; 3]) -> Option<usize> {
+    grid_bytes_at(cells, CoarseLevel::Built)
+}
+
+/// [`grid_bytes_with_mips`], for an upload that has already made the coarse
+/// decision — what a *resident* texture of this shape actually occupies.
+///
+/// The two are deliberately different questions and the doc above says which
+/// is which: `grid_bytes_with_mips` is the **budget's** figure and must not
+/// under-count, so it assumes the level that *may* be there. This one is asked
+/// by [`VolumeTextures::texture_bytes`], where the level either was allocated
+/// or was not, and guessing would make a release report bytes it never held.
+pub fn grid_bytes_at(cells: [u32; 3], coarse: CoarseLevel) -> Option<usize> {
     let mut total = grid_bytes(cells)?;
-    if grid_mip_levels(cells, CoarseLevel::Built) > 1 {
+    if grid_mip_levels(cells, coarse) > 1 {
         total = total.checked_add(grid_bytes(coarse_cells(cells))?)?;
     }
     Some(total)
