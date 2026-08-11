@@ -1687,6 +1687,29 @@ impl DealiasProfile {
     }
 }
 
+/// Half a circle, counted in rows of this grid — the offset from a radial to
+/// the one facing it, which the zero-isodop seed pairs a near-zero gate
+/// against.
+///
+/// On a grid that closes the circle it is half the grid, exactly and without
+/// measuring anything: n rows spanning 360° put n/2 of them in 180°. An odd n
+/// has no row at 180° and takes the one just inside, off by 360/2n° — a
+/// quarter of a degree on the 719 rows a rotation that dropped a radial
+/// leaves, and the ±3-row window below is three times that wide.
+///
+/// On an arc it is 180° at the arc's own spacing, and **not** half the arc's
+/// rows: the 36 rows that are half of a 72-row, 36° sector sit 18° around, and
+/// a radial 18° away is on the same side of the isodop as the one it would be
+/// confirming — the near-zero band is tens of degrees wide, so such a pair
+/// agrees with itself and seeds the whole band.
+fn half_turn_rows(rows: crate::azimuth::Rows) -> i32 {
+    if rows.closed {
+        (rows.count / 2) as i32
+    } else {
+        (180.0 / rows.step_deg).round() as i32
+    }
+}
+
 pub(crate) fn dealias(
     vel_grid: &mut [Vec<f64>],
     sweep: &VelocitySweep,
@@ -1720,6 +1743,13 @@ pub(crate) fn dealias_with_knobs(
     if n < 8 {
         return;
     }
+    // Every pass below propagates a fold decision from one gate to a
+    // neighbouring one, so every one of them needs to know where the sweep's
+    // rows end. On a rotation they do not end, and this is the wrap it always
+    // was; on a sector the two ends are the two edges of the arc, and a
+    // decision carried across them is carried across ground the antenna never
+    // pointed at.
+    let rows = sweep_rows(sweep, n);
     let raw: Vec<Vec<f64>> = vel_grid.to_vec();
     // value[i][j] holds the dealiased velocity once valid[i][j].
     let mut valid = vec![false; n * gc];
@@ -1785,13 +1815,21 @@ pub(crate) fn dealias_with_knobs(
                     continue;
                 }
                 let mut agree = 0;
+                // A row past the end of an arc does not agree, in the same
+                // way the gate before the first does not: `nj < gc` is that
+                // same absence on the range axis. A gate on either edge of a
+                // sector therefore needs all three neighbours it has, which
+                // is what a gate at the first range gate has always needed.
                 for (ni, nj) in [
-                    ((i + n - 1) % n, j),
-                    ((i + 1) % n, j),
-                    (i, j.wrapping_sub(1)),
-                    (i, j + 1),
+                    (rows.neighbour(i, -1), j),
+                    (rows.neighbour(i, 1), j),
+                    (Some(i), j.wrapping_sub(1)),
+                    (Some(i), j + 1),
                 ] {
-                    if nj < gc && close(ni, nj) == Some(true) {
+                    if let Some(ni) = ni
+                        && nj < gc
+                        && close(ni, nj) == Some(true)
+                    {
                         agree += 1;
                     }
                 }
@@ -1815,13 +1853,18 @@ pub(crate) fn dealias_with_knobs(
                 seen[s0] = true;
                 let mut q = vec![(si, sj)];
                 while let Some((ci, cj)) = q.pop() {
+                    // Candidate pockets at the two ends of a sector are two
+                    // pockets, each held to `DA_RAWMIN_BINS` on its own.
                     let neigh = [
-                        ((ci + n - 1) % n, cj),
-                        ((ci + 1) % n, cj),
-                        (ci, cj.wrapping_sub(1)),
-                        (ci, cj + 1),
+                        (rows.neighbour(ci, -1), cj),
+                        (rows.neighbour(ci, 1), cj),
+                        (Some(ci), cj.wrapping_sub(1)),
+                        (Some(ci), cj + 1),
                     ];
                     for (ni, nj) in neigh {
+                        let Some(ni) = ni else {
+                            continue;
+                        };
                         if nj >= gc {
                             continue;
                         }
@@ -1844,15 +1887,31 @@ pub(crate) fn dealias_with_knobs(
     }
 
     // Seed 2: zero isodop near the radar, with a counterpart ~180° away.
+    //
+    // On an arc the counterpart is often not there to look at, and that is a
+    // different answer from a radial 324° round the other way: a sector
+    // narrower than 180° has no opposite radial for any of its rows, so this
+    // seed finds nothing there rather than confirming a near-zero gate
+    // against one of its own. Where the arc is wide enough to hold both ends
+    // of a diameter, the counterpart lies forward of some rows and behind
+    // others — the pairing is symmetric, so both are tried, and on a rotation
+    // the forward lookup always answers and the second never runs.
+    let half_turn = half_turn_rows(rows);
+    let opposite = |i: usize| {
+        rows.neighbour(i, half_turn)
+            .or_else(|| rows.neighbour(i, -half_turn))
+    };
     let near_gates = ((40.0 - sweep.first_gate_range_km) / sweep.gate_interval_km) as usize;
     for i in 0..n {
-        let opp = (i + n / 2) % n;
+        let Some(opp) = opposite(i) else {
+            continue;
+        };
         for j in 0..near_gates.min(gc) {
             if has(i, j)
                 && raw[i][j].abs() < DA_ZISO_TOL
                 && (0..3).any(|d| {
-                    let o = (opp + d) % n;
-                    has(o, j) && raw[o][j].abs() < DA_ZISO_TOL
+                    rows.neighbour(opp, d)
+                        .is_some_and(|o| has(o, j) && raw[o][j].abs() < DA_ZISO_TOL)
                 })
             {
                 valid[idx(i, j)] = true;
@@ -1978,33 +2037,42 @@ pub(crate) fn dealias_with_knobs(
             }
         }
 
-        // (b) azimuthal bridge, tighter threshold; azimuth wraps.
+        // (b) azimuthal bridge, tighter threshold; azimuth wraps where the
+        // sweep closes the circle.
         let t_b = 0.35 * nyquist * DA_THRESH_SCALE;
         for j in 0..gc {
             for start in 0..n {
                 if !valid[idx(start, j)] {
                     continue;
                 }
+                // The rows the walk crosses on its way to `end`, in order.
+                // Recorded as it goes rather than recomputed from `start + m`,
+                // because past the end of an arc there is no such row: the
+                // walk stops there with no `end` to bridge to, which is what
+                // it already does at a gate the radar saw nothing in.
+                let mut gap = [0usize; 39];
                 let mut k = 1;
-                let mut any_gap = false;
+                let mut end = None;
                 while k < 40 {
-                    let ii = (start + k) % n;
+                    let Some(ii) = rows.neighbour(start, k as i32) else {
+                        break;
+                    };
                     if valid[idx(ii, j)] {
+                        end = Some(ii);
                         break;
                     }
-                    if has(ii, j) {
-                        any_gap = true;
-                    } else {
-                        k = 40;
+                    if !has(ii, j) {
                         break;
                     }
+                    gap[k - 1] = ii;
                     k += 1;
                 }
-                if k >= 40 || !any_gap {
+                // `k == 1` is `end` sitting in the next row along, with no gap
+                // between the two to bridge.
+                let Some(end) = end.filter(|_| k > 1) else {
                     continue;
-                }
-                let end = (start + k) % n;
-                let raws_f: Vec<f64> = (1..k).map(|m| raw[(start + m) % n][j]).collect();
+                };
+                let raws_f: Vec<f64> = gap[..k - 1].iter().map(|&ii| raw[ii][j]).collect();
                 let raws_b: Vec<f64> = raws_f.iter().rev().copied().collect();
                 let fwd = chain(value[idx(start, j)], &raws_f, t_b, 0);
                 let bwd = chain(value[idx(end, j)], &raws_b, t_b, 0).map(|mut v| {
@@ -2016,7 +2084,7 @@ pub(crate) fn dealias_with_knobs(
                 {
                     for (off, (a, b)) in fwd.iter().zip(&bwd).enumerate() {
                         if !a.is_nan() && !b.is_nan() {
-                            let ii = (start + 1 + off) % n;
+                            let ii = gap[off];
                             valid[idx(ii, j)] = true;
                             value[idx(ii, j)] = *a;
                             changed = true;
@@ -2039,8 +2107,14 @@ pub(crate) fn dealias_with_knobs(
             } * nyquist
                 * DA_THRESH_SCALE;
             for i in 0..n {
-                for di in [n - 1, 1] {
-                    let ni = (i + di) % n;
+                // A row on the edge of a sector is flooded from the one side
+                // it has a neighbour on. The two directions run in order and
+                // the second sees the first's writes, so which side a row is
+                // missing is the side it is not filled from.
+                for di in [-1i32, 1] {
+                    let Some(ni) = rows.neighbour(i, di) else {
+                        continue;
+                    };
                     let mut run = 0usize;
                     for j in 0..gc {
                         let cand = has(i, j) && !valid[idx(i, j)] && valid[idx(ni, j)];
@@ -2117,8 +2191,9 @@ pub(crate) fn dealias_with_knobs(
     // including isolated gates no propagation pass can reach —
     // unresolved-to-ND conversion evidently applies to contradictory
     // bridging, not unreached data. Size-gate the kept-raw regions: connected
-    // components (4-adjacency, azimuth wraps) of unreached data gates below
-    // the measured minimum are dropped to ND.
+    // components (4-adjacency, azimuth wrapping where the sweep closes the
+    // circle) of unreached data gates below the measured minimum are dropped
+    // to ND.
     let mut keep_raw = vec![false; n * gc];
     let mut seen = vec![false; n * gc];
     for si in 0..n {
@@ -2132,12 +2207,15 @@ pub(crate) fn dealias_with_knobs(
             let mut q = vec![(si, sj)];
             while let Some((ci, cj)) = q.pop() {
                 let neigh = [
-                    ((ci + n - 1) % n, cj),
-                    ((ci + 1) % n, cj),
-                    (ci, cj.wrapping_sub(1)),
-                    (ci, cj + 1),
+                    (rows.neighbour(ci, -1), cj),
+                    (rows.neighbour(ci, 1), cj),
+                    (Some(ci), cj.wrapping_sub(1)),
+                    (Some(ci), cj + 1),
                 ];
                 for (ni, nj) in neigh {
+                    let Some(ni) = ni else {
+                        continue;
+                    };
                     if nj >= gc {
                         continue;
                     }
@@ -2181,8 +2259,11 @@ pub(crate) fn dealias_with_knobs(
             if v.is_nan() {
                 continue;
             }
-            let up = snapshot[(i + 1) % n][j];
-            let down = snapshot[(i + n - 1) % n][j];
+            // A row at the edge of an arc has no neighbour on that side, in
+            // exactly the sense the first and last gate of a radial have
+            // none: there is no jump to measure, so nothing to censor for.
+            let up = rows.neighbour(i, 1).map_or(f64::NAN, |k| snapshot[k][j]);
+            let down = rows.neighbour(i, -1).map_or(f64::NAN, |k| snapshot[k][j]);
             let right = if j + 1 < gc {
                 snapshot[i][j + 1]
             } else {
@@ -2384,6 +2465,165 @@ mod tests {
         let sw = sweep_for(&vg, &azs, gates);
         dealias(&mut grid, &sw, 0.5, None, DealiasProfile::NoFalseShear);
         assert_eq!(grid, grid_orig);
+    }
+
+    /// A sector's two edges are two edges, not a join. The same demand as
+    /// [`dealias_leaves_continuous_data_alone`] — a continuous field passes
+    /// through untouched — laid over 36° of 0.5° rows instead of around a
+    /// rotation: 40 m/s of azimuthal shear from one end of the arc to the
+    /// other, 0.56 m/s between adjacent rows, and nothing folded anywhere in
+    /// it, since the Nyquist estimate is the 20 m/s the field itself reaches.
+    ///
+    /// What the two ends read *across* each other is the point. Rows 0 and 71
+    /// stand 40 m/s apart because they are 35.5° apart in the sky, and the
+    /// post-pass censor blanks any bin more than [`CENSOR_VNY_FRAC`]·Vny —
+    /// 24.8 m/s here — from a 4-neighbour. Counted as neighbours, the two rows
+    /// are a fold wall the passes could not place, and both go ND over all 40
+    /// of their gates: 80 of the sector's 2880 bins erased out of a field with
+    /// no fold in it.
+    #[test]
+    fn dealias_leaves_a_sectors_continuous_data_alone() {
+        let n = 72;
+        let gates = 40;
+        let azimuths: Vec<f64> = (0..n).map(|i| i as f64 * 0.5).collect();
+        let orig: Vec<Vec<f64>> = (0..n)
+            .map(|i| vec![-20.0 + 40.0 * i as f64 / (n - 1) as f64; gates])
+            .collect();
+        let mut grid = orig.clone();
+        let vg = grid.clone();
+        dealias(
+            &mut grid,
+            &sweep_for(&vg, &azimuths, gates),
+            0.5,
+            None,
+            DealiasProfile::NoFalseShear,
+        );
+        assert_eq!(grid, orig);
+    }
+
+    /// The radial a near-zero gate is confirmed against is the one facing it,
+    /// and the seed asks for it at 180° rather than at half the rows.
+    ///
+    /// 241 rows of 1.0° covering az 60°..300°, carrying a 30 m/s wind folded
+    /// at a 25 m/s Nyquist. The arc holds the whole isodop — the zeros at az
+    /// 90° and 270° are both in it, and 180 rows apart — and one folded lobe,
+    /// az 146°..214°, where |30·cos(az)| passes 25. The seeds fire along the
+    /// isodop, the flood fills carry them over the arc, and every one of the
+    /// 9640 bins comes back at the velocity the wind carries there.
+    ///
+    /// Half the *arc* is not half the circle. Counted in rows, 241/2 lands
+    /// 120° around, where this wind reads 24.8 m/s and confirms nothing about
+    /// a zero: paired that way no seed fires anywhere in the sector, no pass
+    /// has anything to propagate from, and the lobe stays folded — 2601 bins a
+    /// full 2·Vny from the velocity their own gate holds, with the fold walls
+    /// at either edge of it censored to ND (160 bins more).
+    #[test]
+    fn a_sector_pairs_a_zero_across_the_diameter_it_scanned() {
+        let n = 241;
+        let gates = 40;
+        let azimuths: Vec<f64> = (0..n).map(|i| 60.0 + i as f64).collect();
+        let truth: Vec<f64> = azimuths
+            .iter()
+            .map(|a| 30.0 * a.to_radians().cos())
+            .collect();
+        let fold = |v: f64| (v + 25.0).rem_euclid(50.0) - 25.0;
+        let mut grid: Vec<Vec<f64>> = truth.iter().map(|&v| vec![fold(v); gates]).collect();
+        // One bin pinned at the fold limit so the Nyquist estimate is exactly
+        // the 25 the field was folded at (az 90°, where the wind's radial
+        // component is zero — an isolated spike the passes drop).
+        grid[30][0] = 25.0;
+        let vg = grid.clone();
+        dealias(
+            &mut grid,
+            &sweep_for(&vg, &azimuths, gates),
+            0.5,
+            None,
+            DealiasProfile::NoFalseShear,
+        );
+
+        for (i, row) in grid.iter().enumerate() {
+            for (j, &v) in row.iter().enumerate() {
+                if (i, j) == (30, 0) {
+                    assert!(v.is_nan(), "the pinned spike survived as {v}");
+                    continue;
+                }
+                assert!(
+                    (v - truth[i]).abs() < 1e-9,
+                    "az {} gate {j} read {v}, not the {} its wind carries",
+                    azimuths[i],
+                    truth[i],
+                );
+            }
+        }
+    }
+
+    /// Which radial faces which, on a rotation and on an arc.
+    ///
+    /// A rotation always has an answer, and it is the one it always gave:
+    /// half the rows around, wrapping. An arc narrower than a half circle
+    /// never has one — a 36° sector's rows face 36° of sky it never looked at
+    /// — and a wider arc has one for the rows near its two ends and not for
+    /// the 119 in its middle, whose counterparts lie in the 119° the antenna
+    /// skipped. Forward and backward are both tried because facing is
+    /// symmetric: on the 241-row arc below, az 60° is answered by az 240°
+    /// ahead of it and az 300° by az 120° behind.
+    #[test]
+    fn a_radial_faces_the_one_the_antenna_pointed_at_or_none() {
+        for n in [360usize, 720] {
+            let rows = rows_for(&ring_azimuths(n), n);
+            assert_eq!(half_turn_rows(rows), (n / 2) as i32);
+            for i in 0..n {
+                assert_eq!(
+                    rows.neighbour(i, half_turn_rows(rows)),
+                    Some((i + n / 2) % n)
+                );
+            }
+        }
+
+        // 36° of 0.5° rows: 360 rows of *this* grid would be a half circle,
+        // and it has 72.
+        let sector: Vec<f64> = (0..72).map(|i| f64::from(i) * 0.5).collect();
+        let rows = rows_for(&sector, 72);
+        assert_eq!(half_turn_rows(rows), 360);
+        for i in 0..72 {
+            assert_eq!(rows.neighbour(i, 360), None);
+            assert_eq!(rows.neighbour(i, -360), None);
+        }
+
+        // 241 rows of 1.0° covering az 60°..300°.
+        let arc: Vec<f64> = (0..241).map(|i| 60.0 + f64::from(i)).collect();
+        let rows = rows_for(&arc, 241);
+        assert_eq!(half_turn_rows(rows), 180);
+        assert_eq!(rows.neighbour(0, 180), Some(180));
+        assert_eq!(rows.neighbour(240, 180), None);
+        assert_eq!(rows.neighbour(240, -180), Some(60));
+        let facing = |i: usize| rows.neighbour(i, 180).or_else(|| rows.neighbour(i, -180));
+        assert_eq!((0..241).filter(|&i| facing(i).is_none()).count(), 119);
+    }
+
+    /// Every azimuth lookup the dealiaser makes on a complete cut is the wrap
+    /// it always was, at every row and every offset any of its passes reaches:
+    /// ±1 for the four-neighbour seed tests, the flood fills' neighbouring
+    /// radial and the fold censor, out to 39 for the azimuthal bridge's walk,
+    /// and the half turn plus the isodop's three-row window. Every one of them
+    /// goes through this one lookup, so this identity is what says the tuned
+    /// constants below still measure what they were measured against.
+    #[test]
+    fn a_closed_sweeps_dealias_neighbours_are_the_wrap_they_always_were() {
+        for n in [360usize, 720] {
+            let rows = rows_for(&ring_azimuths(n), n);
+            assert!(rows.closed);
+            let half = half_turn_rows(rows);
+            for i in 0..n {
+                for d in (-39..=39).chain(half..=half + 3).chain([-half]) {
+                    assert_eq!(
+                        rows.neighbour(i, d),
+                        Some((i as i32 + d).rem_euclid(n as i32) as usize),
+                        "row {i} offset {d}",
+                    );
+                }
+            }
+        }
     }
 
     /// The median filter's job in this pipeline: a single-bin velocity spike
