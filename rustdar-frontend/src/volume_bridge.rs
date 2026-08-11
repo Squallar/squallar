@@ -968,7 +968,7 @@ pub struct BridgeVolumePainter {
     /// pane-scoped lookup `paint` already does. Recomputing it there would mean
     /// a second lookup per pane per frame, against a store whose answer can have
     /// changed — so the number is taken at the one moment the grid, the camera
-    /// and the source pane's affine are all in hand together.
+    /// and the pane's own map affine are all in hand together.
     ///
     /// Interior mutability because [`VolumePainter::paint`] takes `&self`: the
     /// painter is the seam's read-only side by design, and widening it to

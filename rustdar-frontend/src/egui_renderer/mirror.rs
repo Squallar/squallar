@@ -45,7 +45,7 @@
 //! arrive as raster tiles chosen for the 2D pane's own zoom, and drawing a
 //! 256-texel tile into twice as many mirror texels interpolates rather than
 //! reveals. So the rung is spent, and only spent, alongside a matching
-//! **tile zoom bias** on the source pane — `log2` of the applied rung, fetched
+//! **tile zoom bias** on the pane drawing it — `log2` of the applied rung, fetched
 //! one slippy level deeper and drawn at half the point footprint. The rung is
 //! where the extra detail lands; the bias is where it comes from. Either alone
 //! is wasted, which is why [`MirrorRungs::tile_zoom_bias`] is derived from the
@@ -74,7 +74,7 @@ pub const MIRROR_MAX_SIDE: u32 = 2048;
 /// * **The tile cache.** A rung is only worth having with a matching tile zoom
 ///   bias, and the bias is `log2(rung)`. Each level is four times the tiles,
 ///   against the single `tile_source::TILE_CACHE_ENTRIES` (256) LRU every pane
-///   and every layer shares. A 900-point-square source pane drawing a basemap
+///   and every layer shares. A 900-point-square floor strip drawing a basemap
 ///   and a label layer needs about 32 tiles at bias 0, 162 at bias 1 and 594 at
 ///   bias 2 — so bias 2 cannot fit however the window is arranged, while bias 1
 ///   fits some windows and not others.
@@ -249,8 +249,9 @@ impl MirrorPlan {
         self.applied_scale < self.wanted_scale
     }
 
-    /// How many slippy zoom levels deeper the source pane should fetch, given
-    /// what this plan actually got. `0` or `1`; see [`MIRROR_SCALE_MAX`].
+    /// How many slippy zoom levels deeper a pane drawing a floor strip should
+    /// fetch, given what this plan actually got. `0` or `1`; see
+    /// [`MIRROR_SCALE_MAX`].
     pub fn tile_zoom_bias(&self) -> u8 {
         if self.applied_scale >= 2.0 { 1 } else { 0 }
     }
@@ -428,7 +429,7 @@ impl MirrorRungs {
         }
     }
 
-    /// How many slippy zoom levels deeper a floor-source pane should fetch on
+    /// How many slippy zoom levels deeper a pane drawing a floor should fetch on
     /// the next frame, from the last plan the mirror was actually sized to.
     ///
     /// Last frame's, necessarily: tiles are drawn while the egui pass is open

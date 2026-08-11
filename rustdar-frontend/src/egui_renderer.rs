@@ -64,12 +64,12 @@ pub use mirror::{
 
 /// What the mirror pass is asked to copy, and where to put it.
 ///
-/// The 3D view's map floor is not a picture built for the floor: it is the 2D
-/// pane's **own render**, drawn a second time into an offscreen texture that the
-/// raymarch samples. Every layer the pane has — tiles, the radar raster,
-/// outlooks, alerts, storm reports, lightning, METARs, the location dot, labels
-/// — lands on the floor for free and stays in step with the pane's own options
-/// by construction, because it *is* the pane's own geometry.
+/// The 3D view's map floor is not a picture built for the floor: it is the
+/// pane's **own map render**, drawn into an off-screen strip below the frame and
+/// copied here for the raymarch to sample. Every layer the pane has — tiles, the
+/// radar raster, outlooks, alerts, storm reports, lightning, METARs, the
+/// location dot, labels — lands on the floor for free and stays in step with the
+/// pane's own options by construction, because it *is* the pane's own geometry.
 pub struct MirrorRequest<'a> {
     /// The colour attachment to draw into. Must have the same sRGB-ness as the
     /// swapchain — `egui_wgpu` picked its fragment entry point from the
@@ -81,8 +81,9 @@ pub struct MirrorRequest<'a> {
     pub size_in_pixels: [u32; 2],
     /// See [`mirror_size_for`].
     pub pixels_per_point: f32,
-    /// The rects, in points, whose primitives are copied. Everything outside
-    /// them is left transparent, which the shader reads as "no ground here".
+    /// The strips, in points, whose primitives are copied — every one of them
+    /// below the frame's bottom edge. Everything outside them is left
+    /// transparent, which the shader reads as "no ground here".
     pub source_rects: &'a [egui::Rect],
 }
 
@@ -171,17 +172,17 @@ impl PreparedFrame {
     }
 }
 
-/// A primitive's clip rect, narrowed to whichever source pane it belongs to.
+/// A primitive's clip rect, narrowed to whichever source rect it belongs to.
 ///
 /// `Rect::ZERO` for a primitive that belongs to none of them — a zero-size
 /// scissor, which `egui_wgpu::Renderer::render` skips while still advancing its
 /// buffer iterators. That is the whole filtering mechanism; see
 /// [`EguiRenderer::render_mirror`].
 ///
-/// First match rather than the union, and that is not a shortcut: egui clips a
-/// pane's contents to the pane, so a primitive can only be inside one source
-/// rect. A primitive that straddles two would be chrome drawn over the panes,
-/// which the mirror wants excluded from at least one of them anyway.
+/// First match rather than the union, and that is not a shortcut: the sources
+/// are the off-screen map strips, egui clips each strip's contents to it, and
+/// one uniform translation of the pane rects leaves the strips disjoint — so a
+/// primitive can only be inside one of them.
 fn clamp_to_sources(clip: egui::Rect, sources: &[egui::Rect]) -> egui::Rect {
     sources
         .iter()
@@ -418,7 +419,7 @@ impl EguiRenderer {
         }
     }
 
-    /// Draw the source panes' own geometry into the mirror, and get it onto the
+    /// Draw the floor strips' own geometry into the mirror, and get it onto the
     /// GPU before anything samples it.
     ///
     /// # The ordering, which is the entire difficulty
@@ -504,7 +505,7 @@ impl EguiRenderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         // Transparent, not black: the shader reads zero alpha
-                        // as "the source pane is not showing this ground",
+                        // as "the pane's map is not showing this ground",
                         // and a black clear would carpet the floor instead.
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         store: StoreOp::Store,

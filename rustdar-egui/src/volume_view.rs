@@ -139,14 +139,15 @@ pub fn mercator_y_of_lat(lat_deg: f64) -> f64 {
     mercator_y(lat_deg.to_radians())
 }
 
-/// How a 2D map pane's own render maps geography onto the frame — the affine a
+/// How a map render maps geography onto egui's coordinate space — the affine a
 /// 3D pane needs in order to find its ground inside a copy of that render.
 ///
 /// # What this is for
 ///
 /// The 3D view's map floor is not a picture built for the floor. It is the
-/// **source pane's own render**, copied into an offscreen "mirror" texture and
-/// sampled by the raymarch. That makes the floor Web Mercator — whatever the
+/// pane's **own map render**, drawn into an off-screen strip below the frame,
+/// copied into an offscreen "mirror" texture and sampled by the raymarch. That
+/// makes the floor Web Mercator — whatever the
 /// 2D pane draws, in whatever projection the 2D pane draws it in — while the
 /// voxel box stays a tangent plane in kilometres east and north of the site,
 /// because beam geometry is kilometres and Mercator's scale factor varies
