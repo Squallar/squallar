@@ -122,7 +122,7 @@ fn viewport_sync_never_outruns_the_pane_vector() {
 /// WP-G's writers run inside `render_panes`' take, where the same direct write
 /// is silently discarded, and a test written after that code would be a test
 /// written after the bug. Driven through `apply_menu_event` rather than
-/// `request_pane_kind` so it covers the arm and the deferral together. The
+/// `request_pane_view` so it covers the arm and the deferral together. The
 /// end-to-end behavioural version, which passes either way, is
 /// `converting_the_active_pane_from_the_drawer_makes_it_a_volume_pane`.
 #[test]
@@ -158,7 +158,7 @@ fn a_pane_kind_request_survives_the_pane_being_held_out_of_the_vector() {
 
     // The restore, which throws the placeholder away.
     gui.panes[gui.active_pane] = held;
-    gui.apply_pending_pane_kind(&mut Vec::new());
+    gui.apply_pending_pane_view(&mut Vec::new());
 
     assert_eq!(
         gui.pane(1).unwrap().site,
@@ -166,13 +166,13 @@ fn a_pane_kind_request_survives_the_pane_being_held_out_of_the_vector() {
         "precondition: the original pane must be the one back in the slot"
     );
     assert_eq!(
-        gui.pane(1).unwrap().kind(),
-        PaneKind::Volume,
+        gui.pane(1).unwrap().render_view(),
+        rustdar_radar::types::RenderView::Volume,
         "the conversion was written to the pane that was held out and thrown \
              away, so the menu item silently did nothing"
     );
     assert_eq!(
-        gui.pending_pane_kind_for_test(),
+        gui.pending_pane_view_for_test(),
         None,
         "the request must be consumed, or every later frame re-converts the \
              pane and any per-kind state it gathers is discarded each time"
@@ -194,11 +194,11 @@ fn a_pane_kind_request_for_a_pane_that_is_gone_converts_nothing() {
     use crate::pane::PaneKind;
 
     let mut gui = Gui::new();
-    gui.request_pane_kind(7, PaneKind::Volume);
-    gui.apply_pending_pane_kind(&mut Vec::new());
+    gui.request_pane_view(7, rustdar_radar::types::RenderView::Volume);
+    gui.apply_pending_pane_view(&mut Vec::new());
 
     assert_eq!(gui.pane(0).unwrap().kind(), PaneKind::Map);
-    assert_eq!(gui.pending_pane_kind_for_test(), None);
+    assert_eq!(gui.pending_pane_view_for_test(), None);
 }
 
 /// A line for the target rule to place, and the pane it was drawn on.
@@ -551,63 +551,6 @@ fn scan_info_for(site: &'static str) -> rustdar_radar::types::ScanInfo {
     }
 }
 
-/// The 3D pane a region lands in adopts the drawing map's site and moment —
-/// the exact property the section applier pins two tests up.
-///
-/// A box is resampled from a *site's* volume, so a target pane that kept its
-/// own site would resample its own radar over the box's ground. The fixture
-/// is the failure that found this: a KTLX map and a sourceless KICT 3D pane,
-/// with room to grow. The destination rule re-aims the sourceless pane, and
-/// an applier that wrote only the region would leave it sampling **KICT's**
-/// volume over a box centred on KTLX's ground ~220 km away — an empty or
-/// sliver grid, captioned KICT. Writing the site is what makes the re-aim
-/// mean "show me this map's ground in 3D".
-#[test]
-fn a_retargeted_3d_pane_takes_the_maps_site_and_moment() {
-    let mut gui = wide(2);
-    gui.panes[0].site = "KTLX".to_owned();
-    gui.panes[0].scan_info = Some(scan_info_for("KTLX"));
-    gui.panes[1].site = "KICT".to_owned();
-    gui.panes[1].scan_info = Some(scan_info_for("KICT"));
-    gui.panes[1].set_kind(crate::pane::PaneKind::Volume);
-    // Sourceless: converted from the menu, reset, or restored with a
-    // dangling source index — no map fed it.
-    gui.panes[1].volume_mut().unwrap().source_pane = None;
-
-    let region = crate::pane::VolumeRegion::new(
-        crate::pane::GeoPoint {
-            lat: 35.3,
-            lon: -97.3,
-        },
-        40.0,
-    )
-    .expect("a fixture region must be a point on Earth");
-    gui.pending_region = Some(crate::ui_region::PendingRegion {
-        source_pane: 0,
-        region,
-    });
-    gui.apply_pending_region();
-
-    assert_eq!(
-        gui.pane_count(),
-        2,
-        "the sourceless pane must be re-aimed, not a sibling grown"
-    );
-    let pane = gui.pane(1).unwrap();
-    assert_eq!(
-        pane.site, "KTLX",
-        "the pane must follow the map the box was dragged on, or it \
-             resamples its own radar over another site's ground"
-    );
-    assert_eq!(
-        pane.scan_info.as_ref().map(|s| s.site.name),
-        Some("KTLX"),
-        "the moment must come across with the site, as a section's does"
-    );
-    let volume = pane.volume().expect("the pane is a 3D view");
-    assert_eq!(volume.region, Some(region));
-    assert_eq!(volume.source_pane, Some(0));
-}
 
 /// Escape and Android's back cancel the armed draw — last, below every
 /// painted layer, because it is a mode rather than something on screen.
@@ -652,7 +595,7 @@ fn a_back_press_cancels_an_armed_draw_after_it_has_closed_every_layer() {
 fn converting_a_pane_tears_down_its_loop_and_nothing_else() {
     use crate::pane::{LoopPhase, PaneKind};
 
-    for kind in [PaneKind::CrossSection, PaneKind::Volume] {
+    for view in [rustdar_radar::types::RenderView::CrossSection, rustdar_radar::types::RenderView::Volume] {
         let mut gui = Gui::new();
         {
             let pane = gui.pane_mut(0).unwrap();
@@ -669,15 +612,15 @@ fn converting_a_pane_tears_down_its_loop_and_nothing_else() {
             );
         }
 
-        gui.pane_mut(0).unwrap().set_kind(kind);
+        gui.pane_mut(0).unwrap().set_view(view);
 
         let pane = gui.pane(0).unwrap();
         assert!(
             !pane.loop_state.is_active(),
-            "{kind:?}: the loop survived, so it will hold every other pane's \
+            "{view:?}: the loop survived, so it will hold every other pane's \
                  loop back and never finish"
         );
-        assert_eq!(pane.site, "KDDC", "{kind:?}: the site went with the loop");
+        assert_eq!(pane.site, "KDDC", "{view:?}: the site went with the loop");
         assert_eq!(pane.selected_product, RadarProduct::Velocity);
         assert_eq!(pane.selected_elevation, 1.5);
         assert!(!pane.viewing_live);
@@ -721,7 +664,7 @@ fn overlay_polling_skips_panes_with_no_map_but_keeps_their_toggles() {
     );
     assert_eq!(gui.first_pane_with_overlay_enabled(kind), Some(0));
 
-    gui.pane_mut(0).unwrap().set_kind(PaneKind::Volume);
+    gui.pane_mut(0).unwrap().set_view(rustdar_radar::types::RenderView::Volume);
     assert_eq!(
         gui.first_pane_with_overlay_enabled(kind),
         Some(1),
@@ -877,11 +820,11 @@ fn a_pane_with_no_map_neither_drives_nor_follows_the_shared_viewport() {
 /// the more likely of the two to be seen.
 #[test]
 fn a_non_map_active_pane_is_not_the_fallback_sync_source() {
-    use crate::pane::PaneKind;
+    
 
     let mut gui = Gui::new();
     gui.set_pane_count_for_test(2);
-    gui.pane_mut(1).unwrap().set_kind(PaneKind::Volume);
+    gui.pane_mut(1).unwrap().set_view(rustdar_radar::types::RenderView::Volume);
     gui.active_pane = 1;
 
     // Deliberately out of step with pane 0, and deliberately *not* reported
@@ -1011,7 +954,7 @@ fn loop_actions_skip_panes_that_draw_no_frames() {
     let mut gui = Gui::new();
     gui.set_pane_count_for_test(4);
     gui.pane_mut(1).unwrap().set_kind(PaneKind::CrossSection);
-    gui.pane_mut(2).unwrap().set_kind(PaneKind::Volume);
+    gui.pane_mut(2).unwrap().set_view(rustdar_radar::types::RenderView::Volume);
 
     assert_eq!(
         gui.loop_sync_targets(),
@@ -1074,11 +1017,11 @@ fn loop_actions_skip_panes_that_draw_no_frames() {
 /// still animate a pane whose user asked it to sit out.
 #[test]
 fn an_unlinked_pane_is_no_loop_target_whatever_its_kind() {
-    use crate::pane::PaneKind;
+    
 
     let mut gui = Gui::new();
     gui.set_pane_count_for_test(4);
-    gui.pane_mut(2).unwrap().set_kind(PaneKind::Volume);
+    gui.pane_mut(2).unwrap().set_view(rustdar_radar::types::RenderView::Volume);
     gui.active_pane = 0;
 
     // A volume pane can loop from the moment it exists — but its link is
@@ -1119,7 +1062,7 @@ fn clearing_graphics_state_reaches_panes_of_every_kind() {
     let mut gui = Gui::new();
     gui.set_pane_count_for_test(4);
     gui.pane_mut(1).unwrap().set_kind(PaneKind::CrossSection);
-    gui.pane_mut(2).unwrap().set_kind(PaneKind::Volume);
+    gui.pane_mut(2).unwrap().set_view(rustdar_radar::types::RenderView::Volume);
     // Split back down, so panes 2 and 3 are remembered but not shown.
     gui.set_pane_count_for_test(2);
 
@@ -1130,12 +1073,15 @@ fn clearing_graphics_state_reaches_panes_of_every_kind() {
         .collect();
     assert_eq!(before.len(), 4, "precondition: four panes to reach");
     assert_eq!(
-        gui.panes.iter().map(|pane| pane.kind()).collect::<Vec<_>>(),
+        gui.panes
+            .iter()
+            .map(|pane| pane.render_view())
+            .collect::<Vec<_>>(),
         [
-            PaneKind::Map,
-            PaneKind::CrossSection,
-            PaneKind::Volume,
-            PaneKind::Map
+            rustdar_radar::types::RenderView::PlanView,
+            rustdar_radar::types::RenderView::CrossSection,
+            rustdar_radar::types::RenderView::Volume,
+            rustdar_radar::types::RenderView::PlanView
         ],
         "precondition: one pane of each kind, two of them hidden"
     );

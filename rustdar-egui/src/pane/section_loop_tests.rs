@@ -398,23 +398,27 @@ fn a_broadcast_cut_along_another_line_is_refused() {
     );
 }
 
-/// The classification itself: which kinds can animate, and what each one's
+/// The classification itself: which views can animate, and what each one's
 /// frame *is*.
+///
+/// Asked of the **view** rather than the pane kind, which is where the
+/// classification moved when a map pane came to have two of them: a loop's
+/// frames are pictures of one shape, and the shape is the view.
 #[test]
-fn every_kind_can_loop_and_each_frame_is_its_own_shape() {
-    assert!(PaneKind::Map.can_loop());
+fn every_view_can_loop_and_each_frame_is_its_own_shape() {
+    assert!(RenderView::PlanView.can_loop());
     assert!(
-        PaneKind::CrossSection.can_loop(),
+        RenderView::CrossSection.can_loop(),
         "a cross-section is a raster of one line through one volume, which is \
          exactly what a loop frame is"
     );
     assert!(
-        PaneKind::Volume.can_loop(),
+        RenderView::Volume.can_loop(),
         "a 3D volume's loop frame is the resident grid rather than a \
          camera-specific raster, which is what makes orbiting a loop free \
          instead of invalidating every frame of it"
     );
-    // The classification is not "everything loops" — it is that each kind's
+    // The classification is not "everything loops" — it is that each view's
     // frame is a different shape, and the shapes must not be interchangeable.
     // Without this the enum could grow a fourth variant that answered every
     // accessor with `None` and nothing above would notice.

@@ -958,7 +958,7 @@ impl super::Gui {
             // already decided both — and because that setter is what enforces what
             // a kind implies, so a restored non-map pane arrives with the same
             // invariants as a converted one. This is the legitimate writer outside
-            // the UI pass; `Gui::request_pane_kind` exists for the writers *inside*
+            // the UI pass; `Gui::request_pane_view` exists for the writers *inside*
             // it, where the pane may be `mem::take`n.
             pane.set_content(restore_content(i, pc, count));
             pane.draw_order = reconcile_draw_order(&pc.draw_order);

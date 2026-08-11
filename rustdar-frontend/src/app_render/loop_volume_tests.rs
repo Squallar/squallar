@@ -72,7 +72,7 @@ fn app_with_volume_loop(minutes: &[u32]) -> crate::app::App {
     pane.site = SITE.to_string();
     pane.selected_product = PRODUCT;
     pane.selected_elevation = TILT;
-    pane.set_kind(PaneKind::Volume);
+    pane.set_view(rustdar_radar::types::RenderView::Volume);
 
     let mut ls = LoopPlaybackState::new_for_loop(3600, &site(), RenderView::Volume);
     ls.phase = LoopPhase::Rendering;
@@ -376,7 +376,7 @@ fn switching_the_loop_off_lets_the_pane_ask_for_a_live_volume_again() {
     let mut live = headless(TestBridge::desktop());
     live.render.ensure_pane_count(1);
     let pane = live.gui.pane_mut(0).expect("pane 0");
-    pane.set_kind(PaneKind::Volume);
+    pane.set_view(rustdar_radar::types::RenderView::Volume);
     pane.volume_mut().expect("a 3D pane").rendered_for = Some(frame_target(MINUTES[0], None));
     live.dispatch_loop_renders();
     assert!(

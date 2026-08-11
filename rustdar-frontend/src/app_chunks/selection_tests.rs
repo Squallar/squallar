@@ -73,7 +73,7 @@ fn every_pane_shape_takes_the_whole_feed() {
         );
     }
 
-    for kind in [PaneKind::CrossSection, PaneKind::Volume] {
+    for kind in [PaneKind::CrossSection, rustdar_radar::types::RenderView::Volume] {
         show(&mut app, RadarProduct::Reflectivity, 0.5, &[0.5, 1.5, 4.0]);
         app.gui.pane_mut(0).unwrap().set_kind(kind);
         assert_eq!(app.cut_selection_for("KTLX"), CutSelection::All, "{kind:?}");

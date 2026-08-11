@@ -1022,8 +1022,12 @@ impl InputHarness {
     /// Deliberately not the same thing as [`Self::pane_content_probes`], which
     /// reports the arm that ran. A test that only asserted on this would agree
     /// with a branch that ignored it.
-    pub(crate) fn pane_kinds(&self) -> Vec<PaneKind> {
-        self.gui.panes().iter().map(|pane| pane.kind()).collect()
+    pub(crate) fn pane_kinds(&self) -> Vec<rustdar_radar::types::RenderView> {
+        self.gui
+            .panes()
+            .iter()
+            .map(|pane| pane.render_view())
+            .collect()
     }
 
     /// Which render arm ran for each pane on the last frame — the **output** of
@@ -1142,22 +1146,6 @@ impl InputHarness {
         self.gui.set_section_draw_armed(armed);
     }
 
-    /// Whether the 3D region drag is armed — the *other* modal drag on a map
-    /// pane, and the one the cross-section draw has to be mutually exclusive
-    /// with.
-    pub(crate) fn region_arm(&self) -> bool {
-        self.gui.region_arm_for_test()
-    }
-
-    /// Arm or disarm the 3D region drag, through the same setter the menu uses.
-    ///
-    /// Deliberately the real setter and not a field write: arming this is what
-    /// disarms the cross-section draw, and a test that reached past that rule
-    /// would be testing a state the app cannot be in.
-    pub(crate) fn set_region_arm(&mut self, on: bool) {
-        self.gui.set_region_arm_for_test(on);
-    }
-
     /// The line pane `idx` is aimed along, if it is a section pane with one.
     pub(crate) fn section_line(&self, idx: usize) -> Option<SectionLine> {
         self.gui.pane(idx)?.cross_section()?.line
@@ -1204,7 +1192,7 @@ impl InputHarness {
         self.gui
             .pane_mut(idx)
             .unwrap_or_else(|| panic!("no pane {idx}"))
-            .set_kind(PaneKind::Volume);
+            .set_view(rustdar_radar::types::RenderView::Volume);
         self.warm_up();
     }
 

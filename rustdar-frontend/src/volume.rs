@@ -706,7 +706,7 @@ mod tests {
             .expect("present_frame no longer counts surface losses against the volume view");
         let preamble = &body[..call];
         assert!(
-            preamble.contains("PaneKind::Volume"),
+            preamble.contains("rustdar_radar::types::RenderView::Volume"),
             "present_frame counts a surface loss against the volume view without \
              first checking that a volume pane was on screen"
         );

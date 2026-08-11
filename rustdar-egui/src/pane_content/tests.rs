@@ -8,10 +8,80 @@ fn point(lat: f64, lon: f64) -> GeoPoint {
 /// is the entire reason it is a method.
 #[test]
 fn every_content_variant_reports_its_own_kind() {
-    assert_eq!(PaneContent::Map.kind(), PaneKind::Map);
-    for kind in [PaneKind::Map, PaneKind::CrossSection, PaneKind::Volume] {
+    for kind in [PaneKind::Map, PaneKind::CrossSection] {
         assert_eq!(PaneContent::for_kind(kind).kind(), kind);
     }
+}
+
+/// A map pane's *view* depends on its render mode; its *kind* does not.
+///
+/// This is the whole shape of the collapse, in one assertion. Both modes are
+/// the same kind of pane — same site, same viewport, same place — and they
+/// produce different pictures, which is what a render mode is. A predicate
+/// asking the kind cannot tell them apart, so every predicate that used to ask
+/// for a `Volume` pane kind now asks the view.
+#[test]
+fn a_map_panes_view_follows_its_render_mode_and_its_kind_does_not() {
+    for (render, view) in [
+        (MapRender::Plan, RenderView::PlanView),
+        (MapRender::Volume, RenderView::Volume),
+    ] {
+        let content = PaneContent::Map(Box::new(MapPane {
+            render,
+            volume: VolumePane::default(),
+        }));
+        assert_eq!(
+            content.kind(),
+            PaneKind::Map,
+            "{render:?} is still a map pane: a 3D view is how a pane draws, not what it is",
+        );
+        assert_eq!(
+            content.render_view(),
+            view,
+            "{render:?} must dispatch a {view:?} render",
+        );
+    }
+    assert_eq!(
+        PaneContent::for_kind(PaneKind::CrossSection).render_view(),
+        RenderView::CrossSection,
+        "a section's view does not depend on any mode",
+    );
+}
+
+/// Switching a map pane's render mode keeps the other mode's state.
+///
+/// The two modes are two ways of looking at *one* pane, so flipping to the plan
+/// view and back must return the same 3D view — the camera the user aimed, the
+/// floor they turned off, the isosurface they chose. State held behind the enum
+/// variant would be destroyed on every toggle, which would make the modes feel
+/// like two panes after all, which is the thing this change exists to stop.
+#[test]
+fn leaving_the_volume_mode_and_returning_keeps_the_camera() {
+    let mut camera = OrbitCamera::default();
+    camera.nudge(OrbitDelta {
+        yaw_deg: -42.0,
+        pitch_deg: 11.0,
+        zoom_factor: 1.7,
+        pan: [0.1, -0.2, 0.05],
+    });
+    let mut map = MapPane {
+        render: MapRender::Volume,
+        volume: VolumePane {
+            camera,
+            hide_floor: true,
+            view_mode: VolumeViewMode::Isosurface,
+            ..Default::default()
+        },
+    };
+    let aimed = map.volume.clone();
+
+    map.render = MapRender::Plan;
+    map.render = MapRender::Volume;
+
+    assert_eq!(
+        map.volume, aimed,
+        "a round trip through the plan view lost the 3D state, so the two modes are          two panes after all",
+    );
 }
 
 /// `Default` is `Map` — a choice, not something the types force: both other
@@ -25,24 +95,31 @@ fn every_content_variant_reports_its_own_kind() {
 /// section pane would make every one of them silently skip whichever pane is
 /// being drawn, with no error to say why.
 #[test]
-fn the_default_content_is_a_map() {
+fn the_default_content_is_a_plan_view_map() {
     assert_eq!(PaneContent::default().kind(), PaneKind::Map);
     assert_eq!(PaneKind::default(), PaneKind::Map);
+    // The *view*, not merely the kind, and this is the half that matters now
+    // that `Map` denotes two pictures. `PaneState::is_map` — the filter every
+    // all-panes loop keys off — reads the view, so a default in the 3D mode
+    // would make the placeholder answer `false` and silently exclude whichever
+    // pane is currently being drawn.
+    assert_eq!(PaneContent::default().render_view(), RenderView::PlanView);
+    assert_eq!(MapRender::default(), MapRender::Plan);
 }
 
-/// The sourceless default box covers the whole scan.
+/// The fallback box covers the whole scan.
 ///
-/// A 3D pane with no picked region is showing "the site's volume", and the
-/// plan view beside it draws echo out to `MAX_RANGE_KM` — so a default
-/// half-width under that range crops the scan: echo past the box's edge
-/// simply vanishes from the 3D picture, which reads as a resample gone
-/// wrong rather than as a choice. Two facts keep the default honest, and
-/// both are pinned: it reaches the raster's edge, and the resampler passes
-/// it through un-clamped, so the box the caption and the camera arithmetic
-/// describe is the box that is actually built.
+/// A pane whose viewport cannot be measured — collapsed to nothing by a divider
+/// drag — is showing "the site's volume", and the plan view beside it draws echo
+/// out to `MAX_RANGE_KM`, so a fallback under that range crops the scan: echo
+/// past the box's edge simply vanishes from the 3D picture, which reads as a
+/// resample gone wrong rather than as a choice. Two facts keep it honest, and
+/// both are pinned: it reaches the raster's edge, and the resampler passes it
+/// through un-clamped, so the box the caption and the camera arithmetic describe
+/// is the box that is actually built.
 #[test]
 #[allow(clippy::assertions_on_constants)] // the covering bound IS a constant pin
-fn the_sourceless_default_box_covers_the_whole_scan() {
+fn the_fallback_box_covers_the_whole_scan() {
     assert!(
         DEFAULT_HALF_WIDTH_KM >= rustdar_radar::types::MAX_RANGE_KM,
         "the default box must reach the scan's edge: {DEFAULT_HALF_WIDTH_KM} km \
@@ -62,21 +139,37 @@ fn the_sourceless_default_box_covers_the_whole_scan() {
 /// A plan view reads one sweep; the other two read the whole ladder, and
 /// giving either of them a volume with cuts deliberately skipped fabricates
 /// layers rather than failing.
+///
+/// Asked of the **view**, which is where the classification moved when a map
+/// pane came to have two of them. Asking the kind would answer once for both of
+/// a map pane's pictures, and the wrong answer for the 3D one is a download
+/// narrowed to a single tilt under a raymarch that interpolates the gap.
 #[test]
-fn only_a_map_pane_is_content_with_one_tilt() {
-    assert!(!PaneKind::Map.consumes_whole_volume());
-    assert!(PaneKind::CrossSection.consumes_whole_volume());
-    assert!(PaneKind::Volume.consumes_whole_volume());
-    // And the predicate is the view's, not a second copy of it: every kind
-    // agrees with the view it maps to, so the two names cannot come to
-    // give different answers.
-    for kind in [PaneKind::Map, PaneKind::CrossSection, PaneKind::Volume] {
+fn only_a_plan_view_is_content_with_one_tilt() {
+    assert!(!RenderView::PlanView.reads_whole_volume());
+    assert!(RenderView::CrossSection.reads_whole_volume());
+    assert!(RenderView::Volume.reads_whole_volume());
+    // And a map pane really does answer both ways, through its mode: the fact
+    // the kind can no longer carry.
+    for (render, whole) in [(MapRender::Plan, false), (MapRender::Volume, true)] {
         assert_eq!(
-            kind.consumes_whole_volume(),
-            kind.render_view().reads_whole_volume(),
-            "{kind:?} answers the whole-volume question twice, differently",
+            render.render_view().reads_whole_volume(),
+            whole,
+            "{render:?} must ask for {} of the ladder",
+            if whole { "all" } else { "one tilt" },
         );
     }
+    // A section's answer comes off its kind, which has only the one view.
+    assert_eq!(
+        PaneKind::CrossSection.render_view(),
+        Some(RenderView::CrossSection),
+    );
+    assert_eq!(
+        PaneKind::Map.render_view(),
+        None,
+        "a map pane's view is not knowable from its kind, and saying otherwise \
+         would pick one of its two pictures at random",
+    );
 }
 
 /// A line that cannot be cut is not representable. Every refusal matters:
@@ -121,7 +214,7 @@ fn a_section_line_refuses_endpoints_it_cannot_be_cut_along() {
 /// a fourth kind stop the build rather than leak quietly.
 #[test]
 fn releasing_textures_is_total_over_the_kinds() {
-    for kind in [PaneKind::Map, PaneKind::CrossSection, PaneKind::Volume] {
+    for kind in [PaneKind::Map, PaneKind::CrossSection] {
         let mut content = PaneContent::for_kind(kind);
         content.release_textures();
         assert_eq!(

@@ -2976,58 +2976,44 @@ fn a_fresh_session_opens_the_sidebar_only_where_it_is_persistent() {
     }
 }
 
-/// 80. **The bar's arm toggles arm, swap and disarm through real clicks.**
+/// 80. **The bar's arm toggle arms and disarms through real clicks.**
 ///
 ///     The end-to-end route the probe fields exist for: a click on the
-///     drawn Region toggle arms the drag and the next frame's probe shows
-///     it on; a click on X-sec swaps the arms — the mutual exclusion via
-///     the *bar*, not just the menu path that `set_region_arm`'s own tests
-///     cover; a second click on the armed toggle disarms.
+///     drawn X-sec toggle arms the draw and the next frame's probe shows
+///     it on; a second click on the armed toggle disarms.
+///
+///     This used to also assert a *swap* — the bar carried a second toggle,
+///     for the 3D region drag, and clicking either un-armed the other,
+///     because one press on one map pane cannot be both a line and a box.
+///     A 3D view's box is the pane's own viewport now, so there is no second
+///     armed mode on the bar and no exclusion left to observe.
 #[test]
-fn the_bars_arm_toggles_arm_swap_and_disarm_through_real_clicks() {
+fn the_bars_arm_toggle_arms_and_disarms_through_real_clicks() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
-    let (region, on) = h.top_bar().region_arm;
+    let (section, on) = h.top_bar().section_arm;
     assert!(!on, "precondition: nothing armed in a fresh session");
-    assert!(
-        !h.top_bar().section_arm.1,
-        "precondition: nor the section draw"
-    );
 
-    h.mouse_click(region.center());
-    h.warm_up();
-    assert!(
-        h.region_arm(),
-        "clicking the bar's Region toggle did not arm"
-    );
-    assert!(
-        h.top_bar().region_arm.1,
-        "the drag is armed but the toggle does not show it"
-    );
-
-    // The swap: arming the other drag through the bar un-arms this one.
-    h.mouse_click(h.top_bar().section_arm.0.center());
+    h.mouse_click(section.center());
     h.warm_up();
     assert!(
         h.section_draw_armed(),
         "clicking the bar's X-sec toggle did not arm the draw"
     );
     assert!(
-        !h.region_arm(),
-        "the region drag stayed armed beside the section draw: the bar's \
-         clicks bypass the mutual exclusion the setters carry"
-    );
-    assert_eq!(
-        (h.top_bar().section_arm.1, h.top_bar().region_arm.1),
-        (true, false),
-        "the two toggles do not show the swap"
+        h.top_bar().section_arm.1,
+        "the draw is armed but the toggle does not show it"
     );
 
     // And off again, from the bar.
     h.mouse_click(h.top_bar().section_arm.0.center());
     h.warm_up();
     assert!(
-        !h.section_draw_armed() && !h.region_arm(),
+        !h.section_draw_armed(),
         "a second click on the armed toggle did not disarm"
+    );
+    assert!(
+        !h.top_bar().section_arm.1,
+        "the draw is disarmed but the toggle still shows it armed"
     );
 }
 
@@ -3047,21 +3033,21 @@ fn arming_from_the_bar_closes_the_open_dropdown() {
         "precondition: the dropdown is open"
     );
 
-    let (region, _) = h.top_bar().region_arm;
+    let (section, _) = h.top_bar().section_arm;
     assert!(
-        !h.is_floating_layer_at(region.center()),
+        !h.is_floating_layer_at(section.center()),
         "precondition: the toggle must not sit under the open popup, or \
          the click below lands on the popup instead"
     );
 
-    h.mouse_click(region.center());
+    h.mouse_click(section.center());
     h.frame_after(FRAME_DT);
     assert!(
         h.menu_leaves().is_empty(),
         "the dropdown stayed open over the armed drag"
     );
     assert!(
-        h.region_arm(),
+        h.section_draw_armed(),
         "closing the dropdown ate the click that was also an arm"
     );
 }
@@ -3119,11 +3105,10 @@ fn the_bar_never_overlaps_at_mediums_narrowest_width() {
 
     let probe = h.top_bar();
     let bar = probe.rect.expand(0.5);
-    let arms = [probe.region_arm.0, probe.section_arm.0];
+    let arms = [probe.section_arm.0];
     for (name, rect) in [
         ("the \u{2630} button", probe.menu_button),
         ("the Layers toggle", probe.layers_toggle.0),
-        ("the Region toggle", probe.region_arm.0),
         ("the X-sec toggle", probe.section_arm.0),
     ] {
         assert!(
@@ -3167,16 +3152,16 @@ fn the_bar_never_overlaps_at_mediums_narrowest_width() {
     }
 
     // Squeezed, not sacrificed: the toggles still take their clicks.
-    h.mouse_click(probe.region_arm.0.center());
+    h.mouse_click(probe.section_arm.0.center());
     h.warm_up();
     assert!(
-        h.region_arm(),
+        h.section_draw_armed(),
         "the Region toggle stopped responding at the squeezed width"
     );
     h.mouse_click(h.top_bar().section_arm.0.center());
     h.warm_up();
     assert!(
-        h.section_draw_armed() && !h.region_arm(),
+        h.section_draw_armed() && !h.section_draw_armed(),
         "the X-sec toggle stopped responding at the squeezed width"
     );
 }
@@ -6167,7 +6152,7 @@ fn every_pane_reports_a_pointer_frame_whatever_its_kind() {
     h.make_pane_volume(2);
     assert_eq!(
         h.pane_kinds(),
-        vec![PaneKind::Map, PaneKind::CrossSection, PaneKind::Volume],
+        vec![rustdar_radar::types::RenderView::PlanView, rustdar_radar::types::RenderView::CrossSection, rustdar_radar::types::RenderView::Volume],
         "precondition: one pane of each kind, or this proves nothing"
     );
 
@@ -6256,7 +6241,7 @@ fn a_converted_pane_keeps_its_site_and_viewport() {
     let before = looking_at(&mut h);
     assert_eq!(
         h.pane_kinds(),
-        vec![PaneKind::Map],
+        vec![rustdar_radar::types::RenderView::PlanView],
         "precondition: it starts as a map"
     );
 
@@ -6265,7 +6250,7 @@ fn a_converted_pane_keeps_its_site_and_viewport() {
 
     assert_eq!(
         h.pane_kinds(),
-        vec![PaneKind::CrossSection],
+        vec![rustdar_radar::types::RenderView::CrossSection],
         "precondition: the conversion must actually have happened"
     );
     assert_eq!(
@@ -6311,12 +6296,12 @@ fn a_non_map_pane_paints_its_empty_state() {
     assert_eq!(
         h.pane_content_probes()
             .iter()
-            .map(|probe| (probe.pane_idx, probe.kind, probe.rect))
+            .map(|probe| (probe.pane_idx, probe.view, probe.rect))
             .collect::<Vec<_>>(),
         vec![
-            (0, PaneKind::Map, rects[0]),
-            (1, PaneKind::CrossSection, rects[1]),
-            (2, PaneKind::Volume, rects[2]),
+            (0, rustdar_radar::types::RenderView::PlanView, rects[0]),
+            (1, rustdar_radar::types::RenderView::CrossSection, rects[1]),
+            (2, rustdar_radar::types::RenderView::Volume, rects[2]),
         ],
         "the arm that ran for a pane is not the arm for that pane's kind"
     );
@@ -6360,7 +6345,7 @@ fn converting_the_active_pane_from_the_dropdown_makes_it_a_volume_pane() {
     h.load_scan("KTLX");
     assert_eq!(
         h.pane_kinds(),
-        vec![PaneKind::Map],
+        vec![rustdar_radar::types::RenderView::PlanView],
         "precondition: it starts as a map"
     );
     assert_eq!(
@@ -6374,16 +6359,16 @@ fn converting_the_active_pane_from_the_dropdown_makes_it_a_volume_pane() {
 
     assert_eq!(
         h.pane_kinds(),
-        vec![PaneKind::Volume],
+        vec![rustdar_radar::types::RenderView::Volume],
         "the click never reached the pane: the write landed on the pane the \
              layers panel had taken out of the vector"
     );
     assert_eq!(
         h.pane_content_probes()
             .iter()
-            .map(|probe| probe.kind)
+            .map(|probe| probe.view)
             .collect::<Vec<_>>(),
-        vec![PaneKind::Volume],
+        vec![rustdar_radar::types::RenderView::Volume],
         "the pane converted but the map arm still drew it"
     );
     assert!(
@@ -6402,7 +6387,7 @@ fn converting_the_active_pane_from_the_dropdown_makes_it_a_volume_pane() {
     // pane, so a one-way toggle would be a trap.
     h.mouse_click(clickable_leaf(&h, crate::ui::VOLUME_PANE_LABEL).center());
     h.frames_for(3, FRAME_DT);
-    assert_eq!(h.pane_kinds(), vec![PaneKind::Map]);
+    assert_eq!(h.pane_kinds(), vec![rustdar_radar::types::RenderView::PlanView]);
 }
 
 /// 44. **A non-map pane keeps the controls that apply to it and drops the
@@ -6462,7 +6447,7 @@ fn a_non_map_pane_keeps_the_controls_that_apply_to_it_and_drops_the_rest() {
             .collect()
     }
 
-    for kind in [PaneKind::CrossSection, PaneKind::Volume] {
+    for kind in [rustdar_radar::types::RenderView::CrossSection, rustdar_radar::types::RenderView::Volume] {
         let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
         h.load_scan("KTLX");
         h.offer_product(0, rustdar_radar::types::RadarProduct::Reflectivity, 0.5);
@@ -6491,7 +6476,7 @@ fn a_non_map_pane_keeps_the_controls_that_apply_to_it_and_drops_the_rest() {
         );
 
         match kind {
-            PaneKind::CrossSection => {
+            rustdar_radar::types::RenderView::CrossSection => {
                 let (a, b) = section_ends();
                 h.make_pane_cross_section(0, a, b);
             }
@@ -6717,7 +6702,7 @@ fn every_pane_kinds_sidebar_opens_with_the_same_identity_line() {
 ///     a false claim about it.
 #[test]
 fn the_missing_layer_list_is_explained_for_both_non_map_kinds() {
-    for kind in [PaneKind::CrossSection, PaneKind::Volume] {
+    for kind in [rustdar_radar::types::RenderView::CrossSection, rustdar_radar::types::RenderView::Volume] {
         let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
         h.load_scan("KTLX");
         let sidebar = sidebar_rect(&h);
@@ -6728,7 +6713,7 @@ fn the_missing_layer_list_is_explained_for_both_non_map_kinds() {
         );
 
         match kind {
-            PaneKind::CrossSection => h.make_pane_unaimed_cross_section(0),
+            rustdar_radar::types::RenderView::CrossSection => h.make_pane_unaimed_cross_section(0),
             _ => h.make_pane_volume(0),
         }
         h.frames_for(2, FRAME_DT);
@@ -7164,7 +7149,7 @@ fn converting_a_pane_moves_no_widget_id() {
 
     assert_eq!(
         h.pane_kinds(),
-        vec![PaneKind::Map, PaneKind::CrossSection, PaneKind::Map],
+        vec![rustdar_radar::types::RenderView::PlanView, rustdar_radar::types::RenderView::CrossSection, rustdar_radar::types::RenderView::PlanView],
         "precondition: the middle pane converted and the last one did not"
     );
     assert!(
@@ -7294,7 +7279,7 @@ fn an_armed_drag_on_a_map_becomes_a_cross_section_aimed_where_it_was_drawn() {
     let target = h
         .pane_kinds()
         .iter()
-        .position(|k| *k == PaneKind::CrossSection)
+        .position(|k| *k == rustdar_radar::types::RenderView::CrossSection)
         .expect("the drag produced no section pane");
     let line = h
         .section_line(target)
@@ -7692,7 +7677,7 @@ fn a_wheel_zoom_mid_drag_leaves_the_anchor_on_the_ground_it_was_put_on() {
         let target = h
             .pane_kinds()
             .iter()
-            .position(|k| *k == PaneKind::CrossSection)
+            .position(|k| *k == rustdar_radar::types::RenderView::CrossSection)
             .expect("the drag produced no section pane");
         let zoom = h.gui_mut().pane(0).unwrap().map_memory.zoom();
         (
@@ -8384,53 +8369,6 @@ fn a_press_thirty_points_off_a_cap_and_twenty_off_the_body_still_pans() {
     );
 }
 
-/// 45m. **Arming the region drag mid-flight kills the handle drag, and
-///      the dead drag never commits.**
-///
-///      Three doc comments claim "both armed setters clear an in-flight
-///      drag"; nothing observed it. The un-cleared failure is quiet today
-///      — the drag freezes under the armed mode, misses its release, and
-///      dies un-committed one frame after disarm — but that is three
-///      accidents deep, and one refactor from committing a line the user
-///      dragged half a gesture ago. The clear is pinned where it is
-///      claimed: at the setter, the instant the mode goes on.
-#[test]
-fn arming_the_region_drag_clears_a_handle_drag_in_flight() {
-    let (mut h, a, b) = harness_with_committed_section();
-    let b_px = h.screen_of(0, b);
-
-    h.mouse_move(b_px);
-    h.frame();
-    h.mouse_press(b_px);
-    h.frame();
-    h.mouse_move(b_px + egui::vec2(-60.0, 30.0));
-    h.frame();
-    assert!(
-        h.gui_mut().section_edit_drag_for_test().is_some(),
-        "precondition: the press on the B cap began a drag"
-    );
-
-    h.set_region_arm(true);
-    assert!(
-        h.gui_mut().section_edit_drag_for_test().is_none(),
-        "arming the region drag left the handle drag alive: one drag on \
-             one map pane would be two gestures"
-    );
-
-    // And nothing about the dead drag ever commits: the release lands
-    // where a live drag would have re-aimed the line, and the line does
-    // not move.
-    h.frame();
-    h.mouse_release(b_px + egui::vec2(-80.0, 40.0));
-    h.frames_for(2, FRAME_DT);
-    h.set_region_arm(false);
-    h.frames_for(2, FRAME_DT);
-    assert_eq!(
-        h.section_line(1),
-        Some(SectionLine::new(a, b).expect("the fixture's line")),
-        "a drag killed by the arming still moved the line"
-    );
-}
 
 /// 45n. **Arming the section draw mid-flight kills the handle drag too**
 ///      — the other armed setter, making the same claim, pinned the same
@@ -8501,7 +8439,7 @@ fn a_tap_while_armed_draws_nothing_and_leaves_the_mode_armed() {
     h.frames_for(2, FRAME_DT);
 
     assert!(
-        h.pane_kinds().iter().all(|k| *k == PaneKind::Map),
+        h.pane_kinds().iter().all(|k| *k == rustdar_radar::types::RenderView::PlanView),
         "an 11-point drag became a cross-section"
     );
     assert!(
@@ -8519,7 +8457,7 @@ fn a_tap_while_armed_draws_nothing_and_leaves_the_mode_armed() {
     h.mouse_release(to);
     h.frames_for(2, FRAME_DT);
     assert!(
-        h.pane_kinds().contains(&PaneKind::CrossSection),
+        h.pane_kinds().contains(&rustdar_radar::types::RenderView::CrossSection),
         "the still-armed mode did not draw the next line"
     );
 }
@@ -8615,128 +8553,21 @@ fn arming_the_draw_changes_nothing_for_a_pane_with_no_map() {
 // is the first branch on which both exist. Everything below is about the
 // pair rather than about either one.
 
-/// **The region checkbox closes the dropdown on arm, exactly as the
-/// section checkbox does.**
+
+
+/// **A back press cancels the armed modal drag.**
 ///
-/// The next thing the user does after arming is a drag on the map, and an
-/// open menu is in its way. Un-ticking is the asymmetric half and it is
-/// pinned too: disarming needs no map, so the menu stays open where the
-/// user is.
+/// Its own layer, below every painted one — see `Gui::dismiss_top_layer`. On
+/// Android a back press with a mode on would otherwise exit the app, which is
+/// the reading of it least likely to be what was meant.
+///
+/// It used to say "whichever" and drive two modes: the 3D region drag sat on
+/// the same layer, mutually exclusive with this one. The region drag is gone,
+/// so there is one mode on the layer and the claim is the narrower one.
 #[test]
-fn the_menus_checkbox_arms_the_region_drag_and_closes_the_dropdown() {
-    let mut h = compact_with_menu();
-    h.load_scan("KTLX");
-    assert!(!h.region_arm(), "precondition: it starts unarmed");
-
-    h.mouse_click(clickable_leaf(&h, crate::ui::REGION_ARM_LABEL).center());
-    h.frames_for(3, FRAME_DT);
-
-    assert!(h.region_arm(), "the checkbox did not arm the drag");
-    assert_eq!(
-        h.menu_leaf(crate::ui::REGION_ARM_LABEL),
-        None,
-        "the dropdown stayed open over the map the box has to be dragged on"
-    );
-
-    // Re-opened, the checkbox shows the mode it turned on — which is what a
-    // user who armed it by accident needs in order to un-tick it.
-    h.open_menu();
-    assert_eq!(
-        h.menu_leaf(crate::ui::REGION_ARM_LABEL).map(|l| l.value),
-        Some(Some(true)),
-        "the checkbox does not show the mode it just turned on"
-    );
-
-    // Un-ticking disarms and leaves the dropdown where the user is: only
-    // arming needs the map underneath.
-    h.mouse_click(clickable_leaf(&h, crate::ui::REGION_ARM_LABEL).center());
-    h.frames_for(3, FRAME_DT);
-    assert!(!h.region_arm(), "the checkbox could not turn it off");
-    assert!(
-        h.menu_leaf(crate::ui::REGION_ARM_LABEL).is_some(),
-        "disarming needs no map, so it must not slam the dropdown shut"
-    );
-}
-
-/// **Arming either modal drag disarms the other, and the menu says so.**
-///
-/// The two entries are adjacent checkboxes in the same submenu and they arm
-/// the same gesture — press, move, release, on a map pane. With both on, one
-/// drag would have to mean two things at once, so exactly one may be armed.
-///
-/// Driven through the dropdown's own checkboxes rather than through the
-/// setters, because the claim is about what a user sees: the box that
-/// un-ticked itself has to *read* as un-ticked, or the mode they think they
-/// are in is not the one a drag will do. A rule enforced only in the setter
-/// would leave two ticked boxes on screen and one working gesture.
-#[test]
-fn arming_either_modal_drag_un_ticks_the_other_in_the_menu() {
-    let mut h = compact_with_menu();
-    h.load_scan("KTLX");
-    assert!(!h.section_draw_armed() && !h.region_arm(), "both start off");
-
-    // Region first, then section. Arming closes the dropdown each time,
-    // so each step re-opens it the user's way.
-    h.mouse_click(clickable_leaf(&h, crate::ui::REGION_ARM_LABEL).center());
-    h.frames_for(3, FRAME_DT);
-    assert!(h.region_arm(), "the region checkbox did not arm the drag");
-
-    h.open_menu();
-    h.mouse_click(clickable_leaf(&h, crate::ui::DRAW_CROSS_SECTION_LABEL).center());
-    h.frames_for(3, FRAME_DT);
-    assert!(h.section_draw_armed(), "the section checkbox did not arm");
-    assert!(
-        !h.region_arm(),
-        "both drags are armed: one press would anchor a line and start a box"
-    );
-
-    h.open_menu();
-    assert_eq!(
-        h.menu_leaf(crate::ui::REGION_ARM_LABEL).map(|l| l.value),
-        Some(Some(false)),
-        "the region checkbox still shows ticked after being un-armed"
-    );
-    assert_eq!(
-        h.menu_leaf(crate::ui::DRAW_CROSS_SECTION_LABEL)
-            .map(|l| l.value),
-        Some(Some(true)),
-        "the section checkbox does not show the mode it just turned on"
-    );
-
-    // And the other way round, which is not symmetric for free: the two
-    // dispatcher arms are separate code.
-    h.mouse_click(clickable_leaf(&h, crate::ui::REGION_ARM_LABEL).center());
-    h.frames_for(3, FRAME_DT);
-    assert!(h.region_arm(), "the region checkbox did not re-arm");
-    assert!(
-        !h.section_draw_armed(),
-        "arming the region drag left the section draw armed"
-    );
-
-    h.open_menu();
-    assert_eq!(
-        h.menu_leaf(crate::ui::DRAW_CROSS_SECTION_LABEL)
-            .map(|l| l.value),
-        Some(Some(false)),
-        "the section checkbox still shows ticked after being un-armed"
-    );
-}
-
-/// **A back press cancels whichever modal drag is armed.**
-///
-/// One layer for both, below every painted layer — see
-/// `Gui::dismiss_top_layer`. The reason it matters for the region drag is the
-/// reason it mattered for the section draw: on Android a back press with a
-/// mode on would otherwise exit the app, which is the reading of it least
-/// likely to be what was meant.
-#[test]
-fn a_back_press_cancels_whichever_modal_drag_is_armed() {
+fn a_back_press_cancels_the_armed_modal_drag() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.load_scan("KTLX");
-
-    h.set_region_arm(true);
-    assert!(h.gui_mut().dismiss_top_layer(), "the region drag was armed");
-    assert!(!h.region_arm());
 
     h.set_section_draw_armed(true);
     assert!(h.gui_mut().dismiss_top_layer(), "the draw was armed");
@@ -8748,143 +8579,7 @@ fn a_back_press_cancels_whichever_modal_drag_is_armed() {
     );
 }
 
-/// **Two appliers, and never both with something to apply.**
-///
-/// `Gui::ui` runs `apply_pending_section_line` and then
-/// `apply_pending_region` after the pane loop, and each of them can grow the
-/// layout. Two growths in one frame is the case neither feature was written
-/// for: the second applier's target rule would run against a layout the first
-/// had already changed, and in a full layout both rules' last resort is the
-/// same pane — so the second would convert the pane the first had just
-/// filled, and one of two completed gestures would visibly produce nothing.
-///
-/// It cannot happen, and this is why: arming is exclusive, only an armed mode
-/// records a pending, and each pending is recorded and consumed inside one
-/// frame. So one drag, however the modes were armed, produces **one** new
-/// pane of **one** kind — the kind the mode armed *last* asked for.
-///
-/// Asserted on the pane count as well as the kinds, because a rule that
-/// produced the right kind by converting a pane the other applier had just
-/// grown would leave the count at three and one of the two panes empty.
-#[test]
-fn two_appliers_never_both_have_something_to_apply() {
-    for section_last in [true, false] {
-        let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
-        h.load_scan("KTLX");
-        // Both armed, in turn, through the setters the menu uses. The second
-        // call is what disarms the first, and that is the whole subject.
-        if section_last {
-            h.set_region_arm(true);
-            h.set_section_draw_armed(true);
-        } else {
-            h.set_section_draw_armed(true);
-            h.set_region_arm(true);
-        }
-        h.warm_up();
-        let before = h.pane_kinds().len();
-        assert_eq!(before, 1, "precondition: one map pane to drag on");
 
-        let pane = h.pane_rects()[0];
-        let from = pane.center() - egui::vec2(120.0, 60.0);
-        let to = pane.center() + egui::vec2(120.0, 60.0);
-        h.mouse_move(from);
-        h.frame();
-        h.mouse_press(from);
-        h.frame();
-        for step in 1..=4 {
-            h.mouse_move(from + (to - from) * (step as f32 / 4.0));
-            h.frame();
-        }
-        h.mouse_release(to);
-        h.frames_for(2, FRAME_DT);
-
-        let kinds = h.pane_kinds();
-        assert_eq!(
-            kinds.len(),
-            before + 1,
-            "one drag grew the layout to {} panes (section_last={section_last}): {kinds:?}",
-            kinds.len(),
-        );
-        assert_eq!(kinds[0], PaneKind::Map, "the map under the drag was spent");
-        let wanted = if section_last {
-            PaneKind::CrossSection
-        } else {
-            PaneKind::Volume
-        };
-        assert_eq!(
-            kinds[1], wanted,
-            "the mode armed last is not the one the drag did \
-                 (section_last={section_last})",
-        );
-        assert_eq!(
-            kinds.iter().filter(|k| **k != PaneKind::Map).count(),
-            1,
-            "one drag produced two non-map panes: {kinds:?}",
-        );
-    }
-}
-
-/// **While the section draw is armed, a drag commits no region — and the
-/// converse.**
-///
-/// The narrower claim under the test above, and the one that would break
-/// first. The two gestures are read by *different* code on different paths:
-/// the section draw goes through `InteractionState::resolve_armed`, while
-/// `handle_region_drag` reads `ui.ctx().input()` raw from inside `Map::show`.
-/// Neither path knows about the other, so if the exclusion at the menu were
-/// ever relaxed both would fire from the same press — and the symptom would
-/// be a section pane *and* a 3D pane from one drag, which is exactly what a
-/// reader would assume could not happen.
-#[test]
-fn an_armed_section_drag_leaves_no_region_behind_and_the_converse() {
-    for section in [true, false] {
-        let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
-        h.load_scan("KTLX");
-        if section {
-            h.set_section_draw_armed(true);
-        } else {
-            h.set_region_arm(true);
-        }
-        h.warm_up();
-
-        let pane = h.pane_rects()[0];
-        let from = pane.center() - egui::vec2(120.0, 60.0);
-        let to = pane.center() + egui::vec2(120.0, 60.0);
-        h.mouse_move(from);
-        h.frame();
-        h.mouse_press(from);
-        h.frame();
-        for step in 1..=4 {
-            h.mouse_move(from + (to - from) * (step as f32 / 4.0));
-            h.frame();
-        }
-        h.mouse_release(to);
-        h.frames_for(2, FRAME_DT);
-
-        let panes = h.pane_kinds().len();
-        let aimed_regions = (0..panes)
-            .filter(|idx| {
-                h.gui_mut()
-                    .pane(*idx)
-                    .and_then(|p| p.volume())
-                    .is_some_and(|v| v.region.is_some())
-            })
-            .count();
-        let lines = (0..panes)
-            .filter(|idx| h.section_line(*idx).is_some())
-            .count();
-        if section {
-            assert_eq!(lines, 1, "the drag drew no section line");
-            assert_eq!(
-                aimed_regions, 0,
-                "a section drag also committed a 3D region"
-            );
-        } else {
-            assert_eq!(aimed_regions, 1, "the drag committed no region");
-            assert_eq!(lines, 0, "a region drag also drew a section line");
-        }
-    }
-}
 
 // ── The Location control ─────────────────────────────────────────────
 //
@@ -10273,19 +9968,19 @@ fn the_kind_pill_popover_converts_next_frame_and_arms_the_unaimed_section() {
     // 3D Volume: recorded as pending on the pick frame, applied the next.
     h.mouse_click(popover.rows[1].1.center());
     assert_eq!(
-        h.gui_mut().pending_pane_kind_for_test(),
-        Some((0, PaneKind::Volume)),
+        h.gui_mut().pending_pane_view_for_test(),
+        Some((0, rustdar_radar::types::RenderView::Volume)),
         "the pick must go through the deferred applier"
     );
     assert_eq!(
         h.pane_kinds()[0],
-        PaneKind::Map,
+        rustdar_radar::types::RenderView::PlanView,
         "…and not convert mid-frame"
     );
     h.frame();
     assert_eq!(
         h.pane_kinds()[0],
-        PaneKind::Volume,
+        rustdar_radar::types::RenderView::Volume,
         "the applier must convert on the next frame"
     );
     let (label, _) = h.pill(0, PillKind::Kind).expect("still drawn");
@@ -10307,7 +10002,7 @@ fn the_kind_pill_popover_converts_next_frame_and_arms_the_unaimed_section() {
     let popover = h.pill_popover().expect("the popover opened");
     h.mouse_click(popover.rows[2].1.center());
     h.warm_up();
-    assert_eq!(h.pane_kinds()[0], PaneKind::CrossSection);
+    assert_eq!(h.pane_kinds()[0], rustdar_radar::types::RenderView::CrossSection);
     assert!(
         h.section_draw_armed(),
         "choosing an unaimed cross-section must arm the draw"
@@ -10316,26 +10011,25 @@ fn the_kind_pill_popover_converts_next_frame_and_arms_the_unaimed_section() {
 
 /// **The armed-tool hint chip sits on the active map pane, and only there.**
 ///
-/// While Region or X-sec is armed, the active map pane paints the centred
-/// dashed chip naming the drag — painter only, so it is asserted through
-/// the painted text. It follows the active pane, swaps wording with the
-/// armed mode, and vanishes with the arm — and a non-map active pane gets
-/// none, because the drag it explains only exists on a map.
+/// While X-sec is armed, the active map pane paints the centred dashed chip
+/// naming the drag — painter only, so it is asserted through the painted
+/// text. It follows the active pane and vanishes with the arm — and a non-map
+/// active pane gets none, because the drag it explains only exists on a map.
 #[test]
 fn the_armed_hint_chip_follows_the_active_map_pane() {
     let mut h = pill_harness();
     let panes = h.pane_rects();
 
-    // Arm the region drag the user's way: the top bar toggle.
-    let (region_toggle, armed) = h.top_bar().region_arm;
-    assert!(!armed, "precondition: the region drag starts unarmed");
-    h.mouse_click(region_toggle.center());
+    // Arm the section draw the user's way: the top bar toggle.
+    let (section_toggle, armed) = h.top_bar().section_arm;
+    assert!(!armed, "precondition: the section draw starts unarmed");
+    h.mouse_click(section_toggle.center());
     h.warm_up();
 
-    let hint = crate::ui::map::region_arm_hint();
+    let hint = crate::ui::map::SECTION_ARM_HINT.to_owned();
     assert!(
         h.text_painted_in(panes[0], &hint),
-        "the active map pane must paint the region hint; painted {:?}",
+        "the active map pane must paint the section hint; painted {:?}",
         h.painted_text_strings_in(panes[0])
     );
     assert!(
@@ -10375,7 +10069,7 @@ fn the_armed_hint_chip_follows_the_active_map_pane() {
     // A non-map active pane paints none: the drag the chip explains needs a
     // projector, and the pane has none.
     h.make_pane_volume(1);
-    h.mouse_click(region_toggle.center());
+    h.mouse_click(h.top_bar().section_arm.0.center());
     h.warm_up();
     assert!(
         !h.text_painted_in(panes[1], &hint),
@@ -11168,7 +10862,7 @@ fn the_phone_top_bar_shares_the_status_collapse_state() {
         "the collapsed bar still carried the scan chip"
     );
     assert!(
-        !collapsed.section_arm.0.is_positive() && !collapsed.region_arm.0.is_positive(),
+        !collapsed.section_arm.0.is_positive(),
         "the collapsed bar still drew the arm toggles"
     );
     assert!(
@@ -11288,7 +10982,7 @@ fn a_back_press_walks_the_phone_sheet_pages_top_down() {
     h.gui_mut().set_sheet_menu_open_for_test(true);
     h.gui_mut().set_time_dialog_open_for_test(true);
     h.gui_mut().overlays.selected_overlays = vec![std::sync::Arc::new(SheetStubFeature)];
-    h.set_region_arm(true);
+    h.set_section_draw_armed(true);
     h.warm_up();
 
     let walk = |h: &mut InputHarness, expect: Option<crate::ui::SheetPage>| {
@@ -11309,7 +11003,7 @@ fn a_back_press_walks_the_phone_sheet_pages_top_down() {
     walk(&mut h, None);
     // ...and only then does the press reach the armed drag, then the exit.
     assert!(h.gui_mut().dismiss_top_layer(), "the armed drag is below");
-    assert!(!h.region_arm(), "the press must disarm the region drag");
+    assert!(!h.section_draw_armed(), "the press must disarm the region drag");
     assert!(
         !h.gui_mut().dismiss_top_layer(),
         "nothing is left; the next press belongs to the exit path"
@@ -11418,7 +11112,7 @@ fn the_phone_error_toast_sits_under_the_top_bar_and_its_cross_dismisses() {
         bar.rect
     );
     assert!(
-        !toast.rect.intersects(bar.region_arm.0) && !toast.rect.intersects(bar.section_arm.0),
+        !toast.rect.intersects(bar.section_arm.0),
         "the toast must not cover the arm toggles"
     );
     assert!(
@@ -11526,21 +11220,21 @@ fn a_release_on_the_forced_full_catalog_page_keeps_the_stored_snap() {
     );
 }
 
-/// **Arming ⬚/╱ from the phone top bar closes the open sheet** — the Menu
-/// page's own rule for its two arm entries, applied to the bar's route: the
-/// next thing the user does is a drag on the map the sheet is covering.
-/// Disarming closes nothing, as the dropdown's reasoning goes.
+/// **Arming ╱ from the phone top bar closes the open sheet** — the Menu
+/// page's own rule for its arm entry, applied to the bar's route: the next
+/// thing the user does is a drag on the map the sheet is covering. Disarming
+/// closes nothing, as the dropdown's reasoning goes.
 #[test]
 fn arming_from_the_phone_top_bar_closes_the_open_sheet() {
     let mut h = phone();
     h.open_layers();
     assert_eq!(h.sheet().page, Some(crate::ui::SheetPage::Layers));
 
-    let (region, armed) = h.top_bar().region_arm;
+    let (section, armed) = h.top_bar().section_arm;
     assert!(!armed, "precondition: the mode starts disarmed");
-    h.mouse_click(region.center());
+    h.mouse_click(section.center());
     h.warm_up();
-    assert!(h.region_arm(), "the tap must arm the drag");
+    assert!(h.section_draw_armed(), "the tap must arm the drag");
     assert_eq!(
         h.sheet().page,
         None,
@@ -11549,11 +11243,11 @@ fn arming_from_the_phone_top_bar_closes_the_open_sheet() {
 
     // Disarming keeps whatever is up.
     h.open_layers();
-    let (region, armed) = h.top_bar().region_arm;
+    let (section, armed) = h.top_bar().section_arm;
     assert!(armed, "precondition: still armed across the reopen");
-    h.mouse_click(region.center());
+    h.mouse_click(section.center());
     h.warm_up();
-    assert!(!h.region_arm(), "the second tap must disarm");
+    assert!(!h.section_draw_armed(), "the second tap must disarm");
     assert_eq!(
         h.sheet().page,
         Some(crate::ui::SheetPage::Layers),
@@ -11614,14 +11308,14 @@ fn a_qualifying_tap_fades_the_chrome_and_the_second_restores_it() {
         "an armed draw must not fade"
     );
     h.set_section_draw_armed(false);
-    h.set_region_arm(true);
+    h.set_section_draw_armed(true);
     h.mouse_click(spot);
     h.warm_up();
     assert!(
         !h.faded() && chrome_on_screen(&h),
         "an armed region must not fade"
     );
-    h.set_region_arm(false);
+    h.set_section_draw_armed(false);
 
     // A consumed click does not fade: the site icon answered it.
     h.close_layers();
@@ -11679,14 +11373,14 @@ fn a_qualifying_tap_fades_the_phone_cluster_and_the_second_restores_it() {
     let spot = h.pane_rects()[0].center();
     assert!(chrome_on_screen(&h), "precondition: the cluster is up");
 
-    h.set_region_arm(true);
+    h.set_section_draw_armed(true);
     h.mouse_click(spot);
     h.warm_up();
     assert!(
         !h.faded() && chrome_on_screen(&h),
         "an armed region must not fade"
     );
-    h.set_region_arm(false);
+    h.set_section_draw_armed(false);
 
     h.mouse_click(spot);
     h.warm_up();
@@ -11990,7 +11684,7 @@ fn a_back_press_walks_the_full_wide_chain_in_order() {
     assert!(chrome_on_screen(&h), "Esc means restore my UI");
 
     // The stack under the fade, deepest first.
-    h.set_region_arm(true);
+    h.set_section_draw_armed(true);
     h.set_drawer_open(true);
     h.gui_mut().open_settings();
     h.gui_mut().set_time_dialog_open_for_test(true);
@@ -12025,7 +11719,7 @@ fn a_back_press_walks_the_full_wide_chain_in_order() {
     assert!(!h.layers_panel_on_screen(), "press 5 closes the drawer");
 
     assert!(h.gui_mut().dismiss_top_layer(), "the armed drag is last");
-    assert!(!h.region_arm(), "press 6 disarms");
+    assert!(!h.section_draw_armed(), "press 6 disarms");
 
     assert!(
         !h.gui_mut().dismiss_top_layer(),
@@ -12663,7 +12357,7 @@ fn in_pane_text_stays_inside_its_pane_and_clear_of_the_pill_rows() {
     // The stack floats over pane 0's corner by design; close it so the only
     // things over the pill rows are the rows themselves.
     h.close_layers();
-    h.set_region_arm(true);
+    h.set_section_draw_armed(true);
     h.warm_up();
 
     // The armed hint chip wraps to its pane rather than clipping mid-word.

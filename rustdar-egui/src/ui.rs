@@ -46,7 +46,6 @@ pub(crate) use ui_menu::DrawnMenuLeaf;
 /// more: the tests that prove the two armed drags are mutually exclusive have to
 /// look both entries up by name in the same menu.
 #[cfg(test)]
-pub(crate) use ui_menu::REGION_ARM_LABEL;
 /// The 3D-pane toggle's label, for the input harness — so the tests that look
 /// the entry up by name cannot go on passing after it is renamed.
 #[cfg(test)]

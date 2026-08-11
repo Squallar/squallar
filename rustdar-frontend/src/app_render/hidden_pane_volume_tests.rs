@@ -60,7 +60,7 @@ fn one_grid() -> usize {
 fn aim_at_volume(app: &mut crate::app::App, pane_idx: usize, t: &VolumeTarget) {
     let pane = app.gui.pane_mut(pane_idx).expect("the pane exists");
     pane.site = SITE.to_owned();
-    pane.set_kind(PaneKind::Volume);
+    pane.set_view(rustdar_radar::types::RenderView::Volume);
     pane.volume_mut()
         .expect("a 3D pane has volume state")
         .rendered_for = Some(t.clone());

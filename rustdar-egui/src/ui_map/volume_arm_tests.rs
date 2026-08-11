@@ -1,6 +1,5 @@
 use super::*;
 use crate::input_harness::InputHarness;
-use crate::pane::PaneKind;
 use crate::volume_view::{StubVolumePainter, VolumeFrameState};
 use std::sync::Arc;
 
@@ -484,7 +483,7 @@ fn a_volume_pane_asks_for_its_grid_until_the_host_says_it_has_one() {
 #[test]
 fn converting_a_volume_pane_away_releases_its_volume() {
     let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
-    h.gui_mut().request_pane_kind(1, PaneKind::Map);
+    h.gui_mut().request_pane_view(1, rustdar_radar::types::RenderView::PlanView);
     h.frames_for(1, FRAME_DT);
 
     assert!(
@@ -508,7 +507,7 @@ fn converting_a_volume_pane_away_releases_its_volume() {
 #[test]
 fn converting_a_map_pane_releases_nothing() {
     let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
-    h.gui_mut().request_pane_kind(0, PaneKind::CrossSection);
+    h.gui_mut().request_pane_view(0, rustdar_radar::types::RenderView::CrossSection);
     h.frames_for(1, FRAME_DT);
     assert!(
         !h.last_actions()
@@ -967,139 +966,7 @@ fn a_pane_with_no_height_pans_to_nothing_rather_than_to_nan() {
 
 // --- Reset --------------------------------------------------------------
 
-/// The reset returns the pivot and the region, not only the angles.
-///
-/// Through `reset_volume_view`, which is what the button calls — a test that
-/// restated the assignments would pass whatever the button actually did.
-///
-/// Leaving the pivot out is the easy mistake and the one that matters: a
-/// pane panned to its clamp and then reset would visibly change angle and
-/// still be looking at the corner of the box, which reads as a reset that
-/// half-worked.
-#[test]
-fn the_reset_returns_the_pivot_and_the_region_as_well_as_the_angles() {
-    let mut volume = crate::pane::VolumePane::default();
-    volume.camera.nudge(crate::pane::OrbitDelta {
-        yaw_deg: 40.0,
-        pitch_deg: -15.0,
-        zoom_factor: 1.4,
-        pan: [0.6, -0.4, 0.3],
-    });
-    volume.camera.set_vertical_exaggeration(9.0);
-    volume.region = crate::pane::VolumeRegion::new(
-        crate::pane::GeoPoint {
-            lat: 35.3,
-            lon: -97.3,
-        },
-        25.0,
-    );
-    volume.source_pane = Some(0);
-    assert_ne!(
-        volume.camera.pivot(),
-        [0.0; 3],
-        "precondition: the view has been panned off centre",
-    );
 
-    reset_volume_view(&mut volume);
-
-    assert_eq!(
-        volume.camera.pivot(),
-        [0.0; 3],
-        "the pivot must come back, or the box stays off to one side",
-    );
-    assert_eq!(volume.camera, crate::pane::OrbitCamera::default());
-    assert_eq!(volume.region, None, "the region must come back too");
-    assert_eq!(
-        volume.source_pane, None,
-        "and its provenance, or the next drag on that map re-aims this pane",
-    );
-}
-
-/// A region change invalidates the grid; a camera change does not.
-///
-/// This is the line between the two halves of the feature — the region
-/// changes what is *sampled*, the camera only how it is *drawn* — and it is
-/// the one that costs 155 ms on the frame thread when it is drawn in the
-/// wrong place. Orbiting, panning or exaggerating must not rebuild.
-#[test]
-fn a_region_change_rebuilds_the_grid_and_a_camera_change_does_not() {
-    let mut h = volume_pane_harness();
-    h.frames_for(2, FRAME_DT);
-    // Settle: the pane has asked for its grid and been told it has one.
-    let target = h
-        .last_actions()
-        .iter()
-        .find_map(|a| match a {
-            GuiAction::PrepareVolume { target, .. } => Some(target.clone()),
-            _ => None,
-        })
-        .expect("a build was asked for");
-    h.gui_mut()
-        .pane_mut(1)
-        .expect("pane 1")
-        .volume_mut()
-        .expect("a 3D pane")
-        .rendered_for = Some(target);
-    h.frames_for(2, FRAME_DT);
-    assert!(
-        !h.last_actions()
-            .iter()
-            .any(|a| matches!(a, GuiAction::PrepareVolume { .. })),
-        "precondition: a settled pane asks for nothing",
-    );
-
-    // Moving the camera every way there is.
-    {
-        let volume = h
-            .gui_mut()
-            .pane_mut(1)
-            .expect("pane 1")
-            .volume_mut()
-            .expect("a 3D pane");
-        volume.camera.nudge(crate::pane::OrbitDelta {
-            yaw_deg: 30.0,
-            pitch_deg: 10.0,
-            zoom_factor: 1.5,
-            pan: [0.5, 0.5, 0.5],
-        });
-        volume.camera.set_vertical_exaggeration(11.0);
-    }
-    h.frames_for(2, FRAME_DT);
-    assert!(
-        !h.last_actions()
-            .iter()
-            .any(|a| matches!(a, GuiAction::PrepareVolume { .. })),
-        "orbiting, panning and exaggerating must all redraw from the grid in hand",
-    );
-
-    // Changing the region.
-    h.gui_mut()
-        .pane_mut(1)
-        .expect("pane 1")
-        .volume_mut()
-        .expect("a 3D pane")
-        .region = crate::pane::VolumeRegion::new(
-        crate::pane::GeoPoint {
-            lat: 35.3,
-            lon: -97.3,
-        },
-        25.0,
-    );
-    h.frames_for(2, FRAME_DT);
-    let asked = h
-        .last_actions()
-        .iter()
-        .find_map(|a| match a {
-            GuiAction::PrepareVolume { target, .. } => Some(target.clone()),
-            _ => None,
-        })
-        .expect("a new region must trigger a rebuild");
-    assert_eq!(
-        asked.region.map(|r| r.half_width_km()),
-        Some(25.0),
-        "the rebuild must be for the region that was picked",
-    );
-}
 
 /// A 3D pane on a 2-pane harness, with an archive volume and a painter.
 fn volume_pane_harness() -> InputHarness {
@@ -1120,472 +987,8 @@ fn at(minute: u32) -> chrono::NaiveDateTime {
         .expect("a real time")
 }
 
-// --- The region drag, end to end ---------------------------------------
 
-/// Arming the mode and dragging on a map opens a 3D pane aimed at the ground
-/// that was dragged.
-///
-/// The whole gesture through the shipped path: menu state, press, drag,
-/// release, deferred apply. Everything below picks at one part of it; this is
-/// the one that proves the parts are joined up.
-#[test]
-fn dragging_on_an_armed_map_aims_a_3d_pane_at_that_ground() {
-    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
-    h.load_scan("KTLX");
-    h.gui_mut().set_region_arm_for_test(true);
-    h.frames_for(1, FRAME_DT);
 
-    let rect = h.pane_rects()[0];
-    drag_region(
-        &mut h,
-        rect.center(),
-        rect.center() + egui::vec2(120.0, 0.0),
-    );
-
-    assert_eq!(
-        h.pane_kinds().len(),
-        2,
-        "a drag with room in the layout must open a pane beside the map",
-    );
-    assert_eq!(h.pane_kinds()[1], PaneKind::Volume);
-    let volume = h
-        .gui_mut()
-        .pane(1)
-        .expect("the new pane")
-        .volume()
-        .expect("a 3D pane")
-        .clone();
-    let region = volume.region.expect("aimed at a region");
-    assert!(
-        region.half_width_km() >= rustdar_radar::voxel::MIN_HALF_WIDTH_KM,
-        "the committed region must be one the resampler will honour: {}",
-        region.half_width_km(),
-    );
-    assert_eq!(
-        volume.source_pane,
-        Some(0),
-        "the pane must remember which map it was aimed from",
-    );
-}
-
-/// A map pane with the region mode already armed.
-fn armed_map() -> InputHarness {
-    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
-    h.load_scan("KTLX");
-    h.gui_mut().set_region_arm_for_test(true);
-    h.frames_for(1, FRAME_DT);
-    h
-}
-
-/// The region the 3D pane a drag opened is aimed at.
-fn aimed_region(h: &mut InputHarness) -> crate::pane::VolumeRegion {
-    h.gui_mut()
-        .pane(1)
-        .expect("the new pane")
-        .volume()
-        .expect("a 3D pane")
-        .region
-        .expect("aimed at a region")
-}
-
-/// **The committed region is centred on the ground the press landed on.**
-///
-/// Every other test of this gesture presses at `rect.center()` — which is
-/// also the one point at which reading the pane's centre instead of the
-/// pointer cannot be told apart from reading the pointer. A regression there
-/// would centre every user-dragged region on the middle of the map with the
-/// whole suite green, and the symptom is a box near where it was drawn rather
-/// than nowhere, which is exactly the kind of wrongness that gets lived with.
-///
-/// Pinned against the gesture's own ruler rather than against a projection
-/// this crate would have to re-derive: a drag from P to Q and a drag from Q to
-/// P commit two boxes of the same size, and their centres are exactly that
-/// size apart. Anchoring both presses at the pane's centre makes the
-/// separation zero.
-///
-/// Two harnesses rather than two drags on one, because the first commit grows
-/// the layout and moves the map's rect out from under the second press.
-#[test]
-fn the_committed_region_is_centred_on_the_ground_the_press_landed_on() {
-    let mut first = armed_map();
-    let rect = first.pane_rects()[0];
-    // Neither end is the pane's centre, and neither shares a coordinate with
-    // it: a substitution has to be wrong in both latitude and longitude.
-    let p = rect.center() + egui::vec2(-40.0, -25.0);
-    let q = rect.center() + egui::vec2(20.0, 18.0);
-
-    drag_region(&mut first, p, q);
-    let from_p = aimed_region(&mut first);
-
-    let mut second = armed_map();
-    drag_region(&mut second, q, p);
-    let from_q = aimed_region(&mut second);
-
-    assert!(
-        from_p.half_width_km() > rustdar_radar::voxel::MIN_HALF_WIDTH_KM
-            && from_p.half_width_km() < rustdar_radar::voxel::MAX_HALF_WIDTH_KM,
-        "precondition: the box must be strictly inside the resampler's clamp, \
-             or its size is not a ruler: {} km",
-        from_p.half_width_km(),
-    );
-
-    // Screen `y` runs down and `x` runs east, so the press up and to the left
-    // is the one further north and further west.
-    assert!(
-        from_p.centre().lat > from_q.centre().lat,
-        "the press higher up the pane must aim further north: {:?} vs {:?}",
-        from_p.centre(),
-        from_q.centre(),
-    );
-    assert!(
-        from_p.centre().lon < from_q.centre().lon,
-        "the press further left must aim further west: {:?} vs {:?}",
-        from_p.centre(),
-        from_q.centre(),
-    );
-
-    // And by exactly the ground the drag measured for itself.
-    let mut apart = crate::ui_region::RegionDrag::begin(0, from_p.centre())
-        .expect("a centre the projector placed on Earth");
-    apart.extend_to(from_q.centre());
-    assert!(
-        (apart.half_width_km() - from_p.half_width_km()).abs() < 1e-6,
-        "the two centres must be the box's own width apart — {} km against a \
-             box of {} km. A press read at the pane's centre puts both boxes in \
-             the same place.",
-        apart.half_width_km(),
-        from_p.half_width_km(),
-    );
-}
-
-/// A commit disarms the mode; a discarded mis-drag leaves it armed.
-///
-/// The same shape the section draw has always had, and for the same two
-/// reasons. Once a box is committed the mode's job is done — leaving it on
-/// turns the user's next pan into a second box, which is how a pane they
-/// never asked for appears. But a mis-click while armed must cost nothing:
-/// a stray tap is how a user checks which pane they are on, and disarming
-/// there would silently throw away the intent they just expressed.
-#[test]
-fn a_commit_disarms_the_mode_and_a_mis_drag_leaves_it_armed() {
-    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
-    h.load_scan("KTLX");
-    h.gui_mut().set_region_arm_for_test(true);
-    h.frames_for(1, FRAME_DT);
-
-    let rect = h.pane_rects()[0];
-    // A press and release with no movement at all: the mis-click, first,
-    // while the mode is still fresh.
-    drag_region(&mut h, rect.center(), rect.center());
-    assert!(
-        h.gui_mut().region_arm_for_test(),
-        "a discarded drag must leave the mode armed",
-    );
-
-    drag_region(
-        &mut h,
-        rect.center(),
-        rect.center() + egui::vec2(120.0, 0.0),
-    );
-    assert!(
-        !h.gui_mut().region_arm_for_test(),
-        "a commit must disarm the mode: its job is done",
-    );
-
-    // And the consequence the disarm exists for: the next drag is a pan
-    // again, not a second box. The committed pane keeps the region it was
-    // aimed at and no further pane appears.
-    let kinds = h.pane_kinds();
-    let aimed = aimed_region(&mut h);
-    drag_region(
-        &mut h,
-        rect.center(),
-        rect.center() + egui::vec2(-90.0, 40.0),
-    );
-    assert_eq!(
-        h.pane_kinds(),
-        kinds,
-        "a drag after the disarm must not grow or convert anything",
-    );
-    assert_eq!(
-        aimed_region(&mut h),
-        aimed,
-        "a drag after the disarm must not re-aim the pane",
-    );
-}
-
-/// A mis-drag commits nothing — it does not open a pane and does not re-aim
-/// one.
-#[test]
-fn a_mis_drag_leaves_the_layout_and_the_region_alone() {
-    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
-    h.load_scan("KTLX");
-    h.gui_mut().set_region_arm_for_test(true);
-    h.frames_for(1, FRAME_DT);
-
-    let rect = h.pane_rects()[0];
-    let before = h.pane_kinds();
-    // Two points apart, which at any plausible zoom is far under 10 km.
-    drag_region(&mut h, rect.center(), rect.center() + egui::vec2(2.0, 0.0));
-
-    assert_eq!(
-        h.pane_kinds(),
-        before,
-        "a drag below the resampler's minimum must change nothing",
-    );
-}
-
-/// **The anchor is the ground, not the pixel.**
-///
-/// Pan is suppressed while armed but zoom is not, so a wheel notch mid-drag
-/// moves every pixel of the map while the ground stays where it is. A pixel
-/// anchor would silently re-aim the box to whatever is now under the old
-/// coordinate; a geographic one cannot.
-#[test]
-fn a_mid_drag_zoom_does_not_move_the_region_it_is_anchored_to() {
-    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
-    h.load_scan("KTLX");
-    h.gui_mut().set_region_arm_for_test(true);
-    h.frames_for(1, FRAME_DT);
-    let rect = h.pane_rects()[0];
-
-    // A drag with no zoom in it, for the baseline.
-    drag_region(
-        &mut h,
-        rect.center(),
-        rect.center() + egui::vec2(120.0, 0.0),
-    );
-    let plain = h
-        .gui_mut()
-        .pane(1)
-        .expect("the new pane")
-        .volume()
-        .expect("a 3D pane")
-        .region
-        .expect("aimed");
-
-    // The same drag, with the map zoomed under it between press and release.
-    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
-    h.load_scan("KTLX");
-    h.gui_mut().set_region_arm_for_test(true);
-    h.frames_for(1, FRAME_DT);
-    h.mouse_press(rect.center());
-    h.frames_for(1, FRAME_DT);
-    h.scroll_at(rect.center(), egui::vec2(0.0, 40.0));
-    h.frames_for(2, FRAME_DT);
-    h.mouse_move(rect.center() + egui::vec2(120.0, 0.0));
-    h.frames_for(1, FRAME_DT);
-    h.mouse_release(rect.center() + egui::vec2(120.0, 0.0));
-    h.frames_for(2, FRAME_DT);
-    let zoomed = h
-        .gui_mut()
-        .pane(1)
-        .expect("the new pane")
-        .volume()
-        .expect("a 3D pane")
-        .region
-        .expect("aimed");
-
-    assert!(
-        (plain.centre().lat - zoomed.centre().lat).abs() < 1e-9
-            && (plain.centre().lon - zoomed.centre().lon).abs() < 1e-9,
-        "the centre is the ground the press landed on and a zoom must not move it: \
-             {:?} vs {:?}",
-        plain.centre(),
-        zoomed.centre(),
-    );
-}
-
-/// While armed, the map does not pan and a click does not switch site.
-///
-/// Both are unconditional — from the moment the mode is on, not from the
-/// moment a drag is recognised — because a press that will become a region
-/// drag is indistinguishable from one that will become a pan until the
-/// pointer moves, and by then the map has slid under the anchor.
-#[test]
-fn arming_the_mode_takes_the_drag_and_the_click_away_from_the_map() {
-    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
-    h.load_scan("KTLX");
-    h.frames_for(1, FRAME_DT);
-    assert!(
-        !h.frame().resolved.suppress_pan,
-        "precondition: an unarmed map pans normally",
-    );
-
-    h.gui_mut().set_region_arm_for_test(true);
-    h.frames_for(1, FRAME_DT);
-    assert!(
-        h.frame().resolved.suppress_pan,
-        "arming the mode must take the pan away at once, before any drag",
-    );
-
-    let rect = h.pane_rects()[0];
-    h.mouse_click(rect.center());
-    h.frames_for(2, FRAME_DT);
-    assert!(
-        !h.last_actions()
-            .iter()
-            .any(|a| matches!(a, GuiAction::SwitchRadarSite { .. })),
-        "a press while armed is a region gesture, not a click on the map",
-    );
-}
-
-/// A committed region is drawn on the map it came from, and only on that
-/// one.
-///
-/// A 3D pane whose box is invisible on the map is one the user cannot tell
-/// the provenance of — "where is this volume from" has no answer on screen.
-/// Drawing it on *every* map would be worse than not drawing it: two panes on
-/// different sites would each claim the other's box.
-#[test]
-fn a_committed_region_is_drawn_on_the_map_it_came_from() {
-    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
-    h.set_pane_count(3);
-    h.load_scan("KTLX");
-    h.gui_mut().set_region_arm_for_test(true);
-    h.frames_for(1, FRAME_DT);
-
-    let source = h.pane_rects()[0];
-    drag_region(
-        &mut h,
-        source.center(),
-        source.center() + egui::vec2(120.0, 0.0),
-    );
-    h.gui_mut().set_region_arm_for_test(false);
-    h.frames_for(2, FRAME_DT);
-
-    // A stroked square whose two sides are within a point of each other,
-    // sitting inside the source pane. Classified by geometry rather than by
-    // colour, the way `color_scale_strips` classifies its bars — and
-    // centred clear of the floating chrome, whose square icon buttons and
-    // checkboxes would otherwise count as regions on whichever pane they
-    // float over. Centre-based, like the pane test itself: a region box
-    // that merely runs *under* a panel's edge is still the map's.
-    let chrome = [
-        h.status_bar().rect,
-        h.timeline().rect,
-        h.layers_panel_rect().unwrap_or(egui::Rect::NOTHING),
-    ];
-    let square_in = move |h: &mut InputHarness, pane: egui::Rect| {
-        h.painted_rects()
-            .iter()
-            .filter(|r| {
-                pane.contains(r.center())
-                    && chrome.iter().all(|c| !c.contains(r.center()))
-                    && r.width() > 8.0
-                    && (r.width() - r.height()).abs() < 1.0
-            })
-            .count()
-    };
-    let others: Vec<egui::Rect> = h.pane_rects()[1..].to_vec();
-    assert!(
-        square_in(&mut h, source) > 0,
-        "the region must be drawn on the map it was dragged on",
-    );
-    for (idx, rect) in others.iter().enumerate() {
-        // Pane 1 became the 3D view; pane 2 is another map and must be clean.
-        if h.pane_kinds()[idx + 1] != PaneKind::Map {
-            continue;
-        }
-        assert_eq!(
-            square_in(&mut h, *rect),
-            0,
-            "a map that did not produce the region must not draw it",
-        );
-    }
-}
-
-/// Press, drag and release on a map pane, then let the deferred apply run.
-fn drag_region(h: &mut InputHarness, from: egui::Pos2, to: egui::Pos2) {
-    h.mouse_press(from);
-    h.frames_for(1, FRAME_DT);
-    h.mouse_move(to);
-    h.frames_for(1, FRAME_DT);
-    h.mouse_release(to);
-    // Two frames: the commit is recorded on the release frame and applied
-    // after that frame's pane loop, so the pane only reads as changed on the
-    // next one.
-    h.frames_for(2, FRAME_DT);
-}
-
-/// While armed, no click reaches the map's own handlers at all.
-///
-/// Asserted on `overlay_click_pos` rather than on a downstream action,
-/// because that field is the *convention*: every map click handler consumes
-/// it, so nulling it is what takes the click away from all of them at once
-/// — including the ones added after this feature. A test that only checked
-/// that no site was switched would pass with the gate removed, because the
-/// radar-sites overlay is off by default.
-#[test]
-fn while_armed_no_click_reaches_the_maps_own_handlers() {
-    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
-    h.load_scan("KTLX");
-    let rect = h.pane_rects()[0];
-
-    // Press and release on separate frames, as a pointer really does: egui
-    // reports the click on the frame the button comes back up.
-    h.mouse_press(rect.center());
-    h.frames_for(1, FRAME_DT);
-    h.mouse_release(rect.center());
-    let unarmed = h.frame();
-    assert!(
-        unarmed.resolved.overlay_click_pos.is_some(),
-        "precondition: an unarmed map delivers its clicks",
-    );
-
-    h.gui_mut().set_region_arm_for_test(true);
-    h.frames_for(1, FRAME_DT);
-    h.mouse_press(rect.center());
-    h.frames_for(1, FRAME_DT);
-    h.mouse_release(rect.center());
-    let armed = h.frame();
-    assert_eq!(
-        armed.resolved.overlay_click_pos, None,
-        "a press while armed is a region gesture and must reach no map handler",
-    );
-}
-
-/// A discarded drag leaves nothing drawn on the map.
-///
-/// The mutation this closes is forgetting to clear the in-flight drag on
-/// release. Nothing breaks immediately — the next press overwrites it — but
-/// the preview box stays painted over the map for as long as the mode is
-/// armed, which looks exactly like a committed region that was never
-/// committed.
-#[test]
-fn a_discarded_drag_leaves_no_box_behind_on_the_map() {
-    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
-    h.load_scan("KTLX");
-    h.gui_mut().set_region_arm_for_test(true);
-    h.frames_for(1, FRAME_DT);
-    let rect = h.pane_rects()[0];
-
-    // Big enough to be drawn while in flight, small enough to be discarded.
-    // 6 points is well under 10 km at this zoom.
-    h.mouse_press(rect.center());
-    h.frames_for(1, FRAME_DT);
-    h.mouse_move(rect.center() + egui::vec2(6.0, 0.0));
-    h.frames_for(1, FRAME_DT);
-    h.mouse_release(rect.center() + egui::vec2(6.0, 0.0));
-    h.frames_for(3, FRAME_DT);
-
-    // Nothing square and region-sized anywhere near where the drag was. The
-    // preview is a stroked square centred on the press, so it would sit
-    // right here if it had survived.
-    let squares = h
-        .painted_rects()
-        .iter()
-        .filter(|r| {
-            (r.width() - r.height()).abs() < 1.0
-                && r.width() > 2.0
-                && r.center().distance(rect.center()) < 40.0
-        })
-        .count();
-    assert_eq!(
-        squares, 0,
-        "a drag that committed nothing must leave nothing drawn",
-    );
-}
 
 /// The mirror pass's guest list is this frame's floor strips — and nothing
 /// else.
@@ -1682,7 +1085,7 @@ fn a_3d_pane_with_no_neighbouring_map_still_gets_a_floor() {
     h.load_scan("KTLX");
     h.gui_mut().set_volume_painter(Some(painter.clone()));
     h.frames_for(2, FRAME_DT);
-    assert_eq!(h.pane_kinds(), vec![PaneKind::Map]);
+    assert_eq!(h.pane_kinds(), vec![rustdar_radar::types::RenderView::PlanView]);
 
     h.make_pane_volume(0);
     h.frames_for(2, FRAME_DT);
@@ -2097,5 +1500,51 @@ fn the_panes_legend_is_painted_onto_the_glass_and_never_into_the_strip() {
         (0, 0),
         "colour-bar strips were painted into the strip, so the floor is \
          carrying a legend",
+    );
+}
+
+/// The reset returns the **pivot** as well as the angles, and leaves the view
+/// mode alone.
+///
+/// The pivot is the one that is easy to forget: a reset that restores the
+/// angle and the zoom while leaving the eye aimed at a corner of the box is a
+/// control that visibly does something and leaves the pane still looking at
+/// the wrong place.
+///
+/// It used to reset the region and its source pane too. Neither exists: the
+/// box is the pane's viewport, so the way back to a wider one is to zoom the
+/// map out, and this button deliberately does not move the user's map.
+#[test]
+fn the_reset_returns_the_pivot_as_well_as_the_angles_and_keeps_the_view_mode() {
+    let mut volume = crate::pane::VolumePane {
+        view_mode: crate::pane::VolumeViewMode::Isosurface,
+        ..Default::default()
+    };
+    volume.camera.nudge(crate::pane::OrbitDelta {
+        yaw_deg: 40.0,
+        pitch_deg: -15.0,
+        zoom_factor: 1.4,
+        pan: [0.6, -0.4, 0.3],
+    });
+    volume.camera.set_vertical_exaggeration(9.0);
+    assert_ne!(
+        volume.camera.pivot(),
+        [0.0; 3],
+        "precondition: the view has been panned off centre",
+    );
+
+    reset_volume_view(&mut volume);
+
+    assert_eq!(
+        volume.camera.pivot(),
+        [0.0; 3],
+        "the pivot must come back, or the box stays off to one side",
+    );
+    assert_eq!(volume.camera, crate::pane::OrbitCamera::default());
+    assert_eq!(
+        volume.view_mode,
+        crate::pane::VolumeViewMode::Isosurface,
+        "the reset is for a pane that is lost, and a view mode is not a way to \
+         be lost — flipping it back would un-choose something the user chose",
     );
 }

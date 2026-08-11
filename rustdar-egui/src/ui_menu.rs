@@ -612,7 +612,7 @@ mod tests {
     /// unticked it to make the box match what they were looking at.
     #[test]
     fn the_volume_toggle_describes_the_active_pane_and_no_other() {
-        use crate::pane::PaneKind;
+        
 
         let mut gui = Gui::new();
         gui.set_pane_count_for_test(2);
@@ -621,7 +621,7 @@ mod tests {
             "precondition: two fresh map panes"
         );
 
-        gui.pane_mut(1).unwrap().set_kind(PaneKind::Volume);
+        gui.pane_mut(1).unwrap().set_view(rustdar_radar::types::RenderView::Volume);
         assert!(
             !find_toggle(&gui, MenuToggle::VolumePane),
             "the toggle read some other pane's kind: pane 0 is the active one and \
@@ -640,7 +640,7 @@ mod tests {
     /// notice, because the first tick moves the fingerprint on its own.
     #[test]
     fn the_volume_toggle_converts_in_both_directions() {
-        use crate::pane::PaneKind;
+        
 
         let mut gui = Gui::new();
         let mut actions = Vec::new();
@@ -650,8 +650,8 @@ mod tests {
             &mut actions,
         );
         assert_eq!(
-            gui.pending_pane_kind_for_test(),
-            Some((0, PaneKind::Volume))
+            gui.pending_pane_view_for_test(),
+            Some((0, rustdar_radar::types::RenderView::Volume))
         );
 
         gui.apply_menu_event(
@@ -659,8 +659,8 @@ mod tests {
             &mut actions,
         );
         assert_eq!(
-            gui.pending_pane_kind_for_test(),
-            Some((0, PaneKind::Map)),
+            gui.pending_pane_view_for_test(),
+            Some((0, rustdar_radar::types::RenderView::PlanView)),
             "unticking the box asked for a volume pane again, so a pane converted \
              by accident can never be converted back"
         );
