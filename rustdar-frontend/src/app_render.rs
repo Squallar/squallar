@@ -1,12 +1,12 @@
 use crate::constants::{
     DEFAULT_LOOP_SPEED_FPS, MAX_CONCURRENT_LOOP_DOWNLOADS, MAX_CONCURRENT_RENDERS, MAX_LOOP_FRAMES,
-    MAX_LOOP_RENDER_BUDGET, MAX_LOOP_SECTION_CUTS_PER_FRAME, MAX_LOOP_SPEED_FPS,
-    MAX_LOOP_VOLUME_BUILDS_PER_FRAME, MAX_LOOP_VOLUME_FRAMES, MIN_LOOP_SPEED_FPS,
-    VOLUME_LOOP_TEXTURE_BUDGET_BYTES,
+    MAX_LOOP_SECTION_CUTS_PER_FRAME, MAX_LOOP_SPEED_FPS, MAX_LOOP_VOLUME_BUILDS_PER_FRAME,
+    MIN_LOOP_SPEED_FPS, VOLUME_LOOP_TEXTURE_BUDGET_BYTES,
 };
 use crate::loop_downloads::{
     FramePlan, L3FrameState, LoopFrameData, PendingDownloads, PendingL3Pairings,
 };
+use crate::loop_pool::{LoopAllocation, LoopDemand, LoopFrameModel};
 use crate::render_dispatch::CachedPaneRender;
 use egui_wgpu::wgpu;
 use rustdar_egui::actions::GuiAction;
@@ -188,13 +188,22 @@ impl super::App {
         // just been evicted is never one a callback is about to march. The
         // hard bound on resident voxel grids; see
         // `VolumeStore::enforce_budget`.
-        let evicted = self
-            .volume_store
-            .enforce_budget(VOLUME_LOOP_TEXTURE_BUDGET_BYTES);
+        //
+        // What it is held to is the loop pool's own answer — one share per
+        // *distinct* 3D loop, which is what stops two panes on one volume being
+        // charged twice — floored at `VOLUME_LOOP_TEXTURE_BUDGET_BYTES` so a
+        // session with no 3D loop at all still has room for the live grids the
+        // store holds for ordinary 3D panes. A bound of zero there would evict
+        // a live volume every frame and rebuild it every frame.
+        let volume_budget = self
+            .loop_allocation()
+            .volume_reserve_bytes()
+            .max(VOLUME_LOOP_TEXTURE_BUDGET_BYTES);
+        let evicted = self.volume_store.enforce_budget(volume_budget);
         if evicted > 0 {
             log::info!(
                 "3D volume view: evicted {evicted} resident grid(s) to fit the {} MiB budget",
-                VOLUME_LOOP_TEXTURE_BUDGET_BYTES / (1024 * 1024),
+                volume_budget / (1024 * 1024),
             );
         }
         self.update_loop_readiness();
@@ -1530,6 +1539,16 @@ impl super::App {
                         );
                     }
 
+                    // A lost surface is the one signal a browser gives that a
+                    // GPU allocation was too large — WebGL2 answers exhaustion
+                    // by destroying the context, not by failing a call — and it
+                    // is the only memory evidence any target here produces at
+                    // all. Counted against the loop pool whether or not a
+                    // volume was on screen, because the loops are the largest
+                    // thing this application allocates. The pool lives on `App`
+                    // precisely so it survives the `self.state = None` below.
+                    self.back_off_loop_pool();
+
                     // Surface is irrecoverably lost (e.g. display changed on a
                     // foldable). Drop the entire rendering state so the next
                     // handle_redraw() lazily recreates it with a fresh surface.
@@ -1561,6 +1580,7 @@ impl super::App {
     /// Poll for loop scan listing results. Populates the pane's frame list
     /// and kicks off downloads for each scan (throttled).
     fn poll_loop_scan_list_results(&mut self) {
+        let allocation = self.loop_allocation();
         while let Ok(resp) = self.channels.loop_scan_list_receiver.try_recv() {
             let Some(pane) = self.gui.pane_mut(resp.pane_idx) else {
                 continue;
@@ -1569,7 +1589,8 @@ impl super::App {
             // list, is decided in one place — including refusing a listing for a
             // site the pane's loop has since moved off.
             let product = pane.selected_product;
-            let Some(plan) = accept_scan_listing(&mut pane.loop_state, &resp.site, resp.scans)
+            let Some(plan) =
+                accept_scan_listing(allocation, &mut pane.loop_state, &resp.site, resp.scans)
             else {
                 continue;
             };
@@ -1940,13 +1961,14 @@ impl super::App {
     /// state that lives outside the pane, which a loop being switched off has to
     /// release.
     pub(super) fn update_loop_readiness(&mut self) {
+        let allocation = self.loop_allocation();
         let mut abandoned = Vec::new();
         for pidx in 0..self.gui.pane_count() {
             let loop_mgr = &self.loop_mgr;
             let Some(p) = self.gui.pane_mut(pidx) else {
                 continue;
             };
-            let budget = loop_frame_budget(p.loop_state.view);
+            let budget = allocation.frames_for(p.loop_state.view);
             if settle_loop_phase(loop_mgr, pidx, &mut p.loop_state, budget) {
                 abandoned.push(pidx);
             }
@@ -2105,7 +2127,103 @@ impl super::App {
     /// cannot reach. Doing it here rather than at the conversion covers every
     /// route to a non-map pane — the menu, a restored config, a later auto-create
     /// — and it is idempotent, so running it once a frame costs a hash lookup.
+    /// What the panes are asking the loop pool for, this frame.
+    ///
+    /// **Counted in loops, not panes.** The two raster kinds never share a
+    /// cached frame between panes, so each looping pane is one loop. A 3D loop's
+    /// frames are resident grids in one application-wide `VolumeStore` keyed by
+    /// target, so two 3D panes on the same site, product and region are one
+    /// resident set, one build and one upload — and therefore **one** loop with
+    /// **one** share. Charging that twice is the double-count
+    /// `the_3d_set_is_not_double_counted_across_two_panes` exists to catch, and
+    /// it would under-serve the one loop kind that cannot re-render its way out
+    /// of being short.
+    ///
+    /// The key deliberately mirrors `VolumeTarget`'s own equality minus the
+    /// per-frame timestamp: site, product and the loop's `VolumeLoopKey`, which
+    /// is the region and the storm motion. Two panes at different zoom levels
+    /// produce different regions and so are correctly two sets.
+    ///
+    /// Safe to read `pane` here despite `render_view`'s `mem::take` caveat: every
+    /// caller runs outside the egui pass.
+    fn loop_demand(&self) -> LoopDemand {
+        let mut demand = LoopDemand::default();
+        let mut seen: Vec<(
+            String,
+            rustdar_radar::types::RadarProduct,
+            Option<rustdar_egui::pane::VolumeLoopKey>,
+        )> = Vec::new();
+        for pane_idx in 0..self.gui.pane_count() {
+            let Some(pane) = self.gui.pane(pane_idx) else {
+                continue;
+            };
+            let ls = &pane.loop_state;
+            if !ls.is_active() {
+                continue;
+            }
+            let already = if ls.view == rustdar_radar::types::RenderView::Volume {
+                let Some(product) = loop_product(ls) else {
+                    continue;
+                };
+                let key = (ls.site.clone(), product, ls.volume_key().cloned());
+                let seen_before = seen.contains(&key);
+                if !seen_before {
+                    seen.push(key);
+                }
+                seen_before
+            } else {
+                false
+            };
+            demand.add(ls.view, already);
+        }
+        demand
+    }
+
+    /// The division of the pool in force, after the dwell and the dead band
+    /// have had their say.
+    ///
+    /// Folded once per frame from `update_loop_state`, and read — never
+    /// recomputed — everywhere else, so that the dispatcher, the texture
+    /// eviction and the readiness check cannot disagree about how many frames a
+    /// loop is entitled to. That is `render_set_indices`' invariant, one level
+    /// up.
+    pub(super) fn observe_loop_demand(&mut self) -> LoopAllocation {
+        let demand = self.loop_demand();
+        self.loop_pool_state
+            .observe(self.loop_pool, LoopFrameModel::for_target(), demand)
+    }
+
+    /// The allocation in force. See [`Self::observe_loop_demand`].
+    pub(super) fn loop_allocation(&self) -> LoopAllocation {
+        self.loop_pool_state.allocation()
+    }
+
+    /// Step the pool down after the device refused, and remember it.
+    ///
+    /// The behavioural half of the sizing, and on every target that can report
+    /// nothing it is the *only* half. Written to the config store at the moment
+    /// of the decision rather than left to `autosave_config`'s 3 s timer,
+    /// because a session that has just lost its rendering surface may not get
+    /// three more seconds — and because a browser's answer to GPU memory
+    /// exhaustion is exactly this event.
+    pub(super) fn back_off_loop_pool(&mut self) {
+        if self
+            .loop_pool
+            .back_off(crate::loop_pool::LoopPoolLimits::for_target())
+        {
+            log::warn!(
+                "Loop pool: backed off to {} MiB after a lost surface",
+                self.loop_pool.bytes() / (1024 * 1024),
+            );
+            crate::loop_pool::remember(
+                self.platform.config_store().as_deref(),
+                self.loop_pool.bytes(),
+            );
+        }
+    }
+
     fn dispatch_loop_renders(&mut self) {
+        let allocation = self.observe_loop_demand();
         // Panes whose product moved to another datasource, so the frames now need
         // bytes nothing is fetching. Collected here and acted on below, because
         // re-deriving a queue needs `loop_mgr` while the pane is borrowed.
@@ -2234,7 +2352,7 @@ impl super::App {
             }
 
             // Evict textures from frames far from the playhead to cap memory usage.
-            ls.evict_textures_outside_render_set(loop_frame_budget(ls.view));
+            ls.evict_textures_outside_render_set(allocation.frames_for(ls.view));
         }
         for pane_idx in retire_queues {
             self.loop_mgr.remove_pending(pane_idx);
@@ -2347,7 +2465,7 @@ impl super::App {
             // ~140 ms to rebuild against a 200 ms playback interval, so the
             // walking window the other two kinds use does not close here. See
             // `MAX_LOOP_VOLUME_FRAMES`.
-            let indices = ls.render_set_indices(loop_frame_budget(ls.view));
+            let indices = ls.render_set_indices(allocation.frames_for(ls.view));
 
             // A 3D loop's frames are resident grids rather than rasters, so it
             // plans separately and against a different budget. Same branch
@@ -3020,6 +3138,7 @@ fn section_source_refusal(
 /// mixed set of panes animating in step. See
 /// [`crate::loop_downloads::LoopDownloadManager::plan_downloads_for`].
 fn accept_scan_listing(
+    allocation: LoopAllocation,
     ls: &mut rustdar_egui::pane::LoopPlaybackState,
     site: &str,
     scans: Vec<(chrono::NaiveDateTime, rustdar_radar::archive::Identifier)>,
@@ -3037,7 +3156,7 @@ fn accept_scan_listing(
     // Cap the downloads by evenly sampling the listing. A 3D loop's cap is its
     // *resident* one and is far lower, because for that kind the frame list and
     // the resident set are one thing — see `loop_frames_held`.
-    let held = loop_frames_held(ls.view);
+    let held = loop_frames_held(allocation, ls.view);
     let scans = if scans.len() > held {
         let total = scans.len();
         let sampled: Vec<_> = (0..held)
@@ -3497,41 +3616,39 @@ fn frame_section(
     }
 }
 
+/// The allocation an idle application has: the whole pool at this target's
+/// floor, undivided.
+///
+/// The tests below are written against the numbers this target ships, and the
+/// pool reproduces them exactly for a single loop at the floor — that is the
+/// continuity property `one_loop_at_the_floor_is_exactly_what_a_pane_used_to_
+/// get` pins. So a test that is about dispatch rather than about division takes
+/// this and reads unchanged; a test that is about division builds its own.
+#[cfg(test)]
+pub(crate) fn test_loop_allocation() -> LoopAllocation {
+    let limits = crate::loop_pool::LoopPoolLimits::for_target();
+    crate::loop_pool::LoopPool::new(limits.floor, limits)
+        .plan(LoopFrameModel::for_target(), LoopDemand::default())
+}
+
 /// Frames a loop of this view **holds**.
 ///
 /// [`MAX_LOOP_FRAMES`] for the two raster kinds, which hold more than they
-/// texture and re-render as the playhead walks. A 3D loop's frames are resident
-/// grids and re-entering one costs ~140 ms against a 200 ms playback interval,
-/// so its list is its resident set and both are
-/// [`MAX_LOOP_VOLUME_FRAMES`] — 14 rather than 60 on desktop, which is ~70
-/// minutes of history instead of ~150 and is the cost of holding the *full*
-/// grid rather than a coarser one. See that constant.
+/// texture and re-render as the playhead walks — a held frame is scan data and
+/// a timestamp, not a texture, so it is not what the loop pool is spent on and
+/// it does not shrink when a pane arrives.
+///
+/// A 3D loop's frames are resident grids and re-entering one costs ~140 ms
+/// against a 200 ms playback interval, so its list *is* its resident set: both
+/// are the pool's answer, and both shrink together. See
+/// `crate::loop_pool::LoopAllocation`.
 ///
 /// Exhaustive, like every other classification by view in this workspace.
-fn loop_frames_held(view: rustdar_radar::types::RenderView) -> usize {
+fn loop_frames_held(allocation: LoopAllocation, view: rustdar_radar::types::RenderView) -> usize {
     match view {
-        rustdar_radar::types::RenderView::Volume => MAX_LOOP_VOLUME_FRAMES,
+        rustdar_radar::types::RenderView::Volume => allocation.volume_frames,
         rustdar_radar::types::RenderView::PlanView
         | rustdar_radar::types::RenderView::CrossSection => MAX_LOOP_FRAMES,
-    }
-}
-
-/// Frames of a loop of this view that are *ready to show* at once — the
-/// intended render set's size.
-///
-/// The dispatcher, the texture eviction and the readiness check all read this
-/// one function, for the reason `render_set_indices`' doc gives: a set the
-/// dispatcher fills and a set readiness waits on that could differ is a loop
-/// that plays over frames nothing rendered.
-///
-/// For a 3D loop it is [`loop_frames_held`], exactly — the whole list — which
-/// is what makes `evict_textures_outside_render_set` a no-op there and the
-/// resident set equal to the frame list.
-fn loop_frame_budget(view: rustdar_radar::types::RenderView) -> usize {
-    match view {
-        rustdar_radar::types::RenderView::Volume => MAX_LOOP_VOLUME_FRAMES,
-        rustdar_radar::types::RenderView::PlanView
-        | rustdar_radar::types::RenderView::CrossSection => MAX_LOOP_RENDER_BUDGET,
     }
 }
 

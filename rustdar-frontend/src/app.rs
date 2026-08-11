@@ -212,6 +212,26 @@ pub struct App {
     /// when it may move. One per application, because the mirror is one texture
     /// for the whole application. See `egui_renderer::mirror`.
     mirror_rungs: crate::egui_renderer::MirrorRungs,
+    /// The application's whole loop allowance, and the hysteresis that governs
+    /// how it is divided. One per application, because the pool is one
+    /// allowance for the whole application. See `crate::loop_pool`.
+    ///
+    /// On `App` rather than on `AppState`, and that is load-bearing for exactly
+    /// the reason `crate::volume::degrade`'s counters are module statics: a lost
+    /// surface sets `self.state = None`, and a pool that backed off *because* of
+    /// a lost surface would be destroyed by the event it just learned from.
+    loop_pool: crate::loop_pool::LoopPool,
+    /// See [`Self::loop_pool`].
+    loop_pool_state: crate::loop_pool::LoopPoolState,
+    /// Whether [`Self::loop_pool`] is already the answer for this machine.
+    ///
+    /// True when a previous session remembered one, and set again the first
+    /// time an adapter is classified. Without it, `install_volume_bridge` —
+    /// which runs on resume and on recovery from a lost surface as well as at
+    /// first start — would re-raise a pool that had just backed off *because*
+    /// the surface was lost, and the app would oscillate between the two sizes
+    /// for as long as the device kept refusing.
+    loop_pool_sized: bool,
     /// The decoded Level II volume each pane's static render draws from, by site.
     ///
     /// # Retention
@@ -768,6 +788,20 @@ impl App {
         // settles that before it builds a row.
         rustdar_radar::sites::resolve(site_positions.fixes().chain(site_catalogue.fixes()));
 
+        // Before the first frame and before any adapter exists, for the reason
+        // the site table is resolved here: what a session remembers has to be
+        // in force from the first paint, or the loop length would change under
+        // a user already watching one. The adapter's own say is folded in later
+        // by `size_loop_pool_for_device`, which runs once the renderer is built
+        // and only when nothing was remembered.
+        let loop_pool_limits = crate::loop_pool::LoopPoolLimits::for_target();
+        let loop_pool_memo =
+            crate::loop_pool::remembered(platform.config_store().as_deref(), loop_pool_limits);
+        let loop_pool = crate::loop_pool::LoopPool::new(
+            loop_pool_memo.unwrap_or(loop_pool_limits.floor),
+            loop_pool_limits,
+        );
+
         let mut app = Self {
             instance,
             state: None,
@@ -775,6 +809,12 @@ impl App {
             gui,
             volume_painter: None,
             mirror_rungs: crate::egui_renderer::MirrorRungs::default(),
+            loop_pool,
+            loop_pool_state: crate::loop_pool::LoopPoolState::new(
+                loop_pool,
+                crate::loop_pool::LoopFrameModel::for_target(),
+            ),
+            loop_pool_sized: loop_pool_memo.is_some(),
             scan_data: std::collections::HashMap::new(),
             base_scans: HashMap::new(),
             input,
@@ -1206,6 +1246,34 @@ impl App {
     fn install_volume_bridge(&mut self) {
         use crate::volume::quality;
 
+        // Read before the `&mut` borrow below, because the pool it also decides
+        // lives on `App` rather than on `AppState` — see `Self::loop_pool`.
+        let Some(class) = self.state.as_ref().map(|state| {
+            quality::DeviceClass::from_device_type(state.adapter.get_info().device_type)
+        }) else {
+            return;
+        };
+
+        // The same signal, spent a second time on a different question, and the
+        // *only* one there is: wgpu 29.0.4 reports no memory capacity on any
+        // backend. `Device::generate_allocator_report` reports what this process
+        // has allocated, not what the device has, and `VK_EXT_memory_budget`'s
+        // `heapBudget` is read by wgpu-hal solely to refuse an allocation past a
+        // threshold the application sets — never handed back. See
+        // `crate::loop_pool` for the citations.
+        if !self.loop_pool_sized {
+            self.loop_pool_sized = true;
+            self.loop_pool = crate::loop_pool::LoopPool::for_device(
+                class,
+                None,
+                crate::loop_pool::LoopPoolLimits::for_target(),
+            );
+            log::info!(
+                "Loop pool: {} MiB for a {class:?} adapter",
+                self.loop_pool.bytes() / (1024 * 1024),
+            );
+        }
+
         let Some(state) = self.state.as_mut() else {
             return;
         };
@@ -1213,10 +1281,7 @@ impl App {
         // The one production call site of `quality::select`, and the reason its
         // `Virtual`/`Unknown` arms matter: that is what a browser reports for
         // every adapter it exposes, so the web build takes them on every device.
-        let quality = quality::select(
-            quality::DeviceClass::from_device_type(state.adapter.get_info().device_type),
-            quality::PLATFORM_CEILING,
-        );
+        let quality = quality::select(class, quality::PLATFORM_CEILING);
 
         // Nothing is built on a device that cannot render a volume — the
         // pipelines would compile a shader against limits already known to be

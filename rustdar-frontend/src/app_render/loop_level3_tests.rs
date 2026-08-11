@@ -399,19 +399,19 @@ fn a_level3_loops_batch_settles_on_its_pairings_not_on_volumes() {
         mgr.cache_l3_product(SITE, code, ts(i), Some(object(0)));
     }
     assert!(
-        !loop_batch_settled(&mgr, &ls, MAX_LOOP_RENDER_BUDGET),
+        !loop_batch_settled(&mgr, &ls, test_loop_allocation().plan_view_frames),
         "three renderable frames and no textures: renders are owed",
     );
     // The contrast, spelled out: the same batch judged the old way — against
     // the volume cache — reads as settled, which is the abandonment above.
     assert!(
-        ls.render_set_settled(MAX_LOOP_RENDER_BUDGET, |f| mgr
+        ls.render_set_settled(test_loop_allocation().plan_view_frames, |f| mgr
             .is_cached(SITE, &f.timestamp)),
         "precondition: a volume-cache check settles this batch, and the loop \
              would then be switched off with everything it needs in hand",
     );
     assert!(
-        !settle_loop_phase(&mgr, 0, &mut ls, MAX_LOOP_RENDER_BUDGET),
+        !settle_loop_phase(&mgr, 0, &mut ls, test_loop_allocation().plan_view_frames),
         "so the loop must be left in Rendering, waiting on its renders",
     );
     assert_eq!(ls.phase, LoopPhase::Rendering);
@@ -420,7 +420,11 @@ fn a_level3_loops_batch_settles_on_its_pairings_not_on_volumes() {
     for i in 0..3 {
         mgr.cache_scan(SITE, ts(i), volume());
     }
-    assert!(!loop_batch_settled(&mgr, &ls, MAX_LOOP_RENDER_BUDGET));
+    assert!(!loop_batch_settled(
+        &mgr,
+        &ls,
+        test_loop_allocation().plan_view_frames
+    ));
 
     // One rendered, one gap, one rendered: the batch settles and the loop is
     // promoted rather than abandoned — the gap is not held against it.
@@ -428,8 +432,17 @@ fn a_level3_loops_batch_settles_on_its_pairings_not_on_volumes() {
     ls.frames[2].image = Some(rustdar_egui::pane::LoopFrameImage::PlanView(image()));
     mgr.cache_l3_product(SITE, code, ts(1), None);
     ls.frames[1].render_failed = true;
-    assert!(loop_batch_settled(&mgr, &ls, MAX_LOOP_RENDER_BUDGET));
-    assert!(!settle_loop_phase(&mgr, 0, &mut ls, MAX_LOOP_RENDER_BUDGET));
+    assert!(loop_batch_settled(
+        &mgr,
+        &ls,
+        test_loop_allocation().plan_view_frames
+    ));
+    assert!(!settle_loop_phase(
+        &mgr,
+        0,
+        &mut ls,
+        test_loop_allocation().plan_view_frames
+    ));
     assert_eq!(ls.phase, LoopPhase::Ready);
 }
 
@@ -443,7 +456,12 @@ fn a_pairing_in_flight_keeps_the_loop_from_being_abandoned() {
     let mut mgr = LoopDownloadManager::new();
     mgr.mark_l3_in_flight(SITE, codes(L3)[0], ts(0));
 
-    assert!(!settle_loop_phase(&mgr, 0, &mut ls, MAX_LOOP_RENDER_BUDGET));
+    assert!(!settle_loop_phase(
+        &mgr,
+        0,
+        &mut ls,
+        test_loop_allocation().plan_view_frames
+    ));
     assert_eq!(ls.phase, LoopPhase::Rendering, "still working");
 
     // Undispatched pairings hold it open too — the queue, not just the marks.
@@ -451,7 +469,12 @@ fn a_pairing_in_flight_keeps_the_loop_from_being_abandoned() {
     mgr.set_plan(0, plan(3));
     mgr.plan_downloads_for(0, L3);
     assert!(!mgr.is_pane_done(0), "pairings are still owed");
-    assert!(!settle_loop_phase(&mgr, 0, &mut ls, MAX_LOOP_RENDER_BUDGET));
+    assert!(!settle_loop_phase(
+        &mgr,
+        0,
+        &mut ls,
+        test_loop_allocation().plan_view_frames
+    ));
     assert_eq!(ls.phase, LoopPhase::Rendering);
 }
 
@@ -468,7 +491,7 @@ fn a_level3_loop_that_is_all_gaps_is_switched_off() {
     }
 
     assert!(
-        settle_loop_phase(&mgr, 0, &mut ls, MAX_LOOP_RENDER_BUDGET),
+        settle_loop_phase(&mgr, 0, &mut ls, test_loop_allocation().plan_view_frames),
         "the caller has to release this pane's loop state",
     );
     assert!(!ls.is_active());
@@ -482,7 +505,11 @@ fn a_loop_before_its_first_dispatch_has_settled_nothing() {
     let mut ls = loop_for(L3, 2);
     ls.rendered_for = None;
     let mgr = LoopDownloadManager::new();
-    assert!(!loop_batch_settled(&mgr, &ls, MAX_LOOP_RENDER_BUDGET));
+    assert!(!loop_batch_settled(
+        &mgr,
+        &ls,
+        test_loop_allocation().plan_view_frames
+    ));
 }
 
 /// The days a Level III listing covers come from the loop's own frames, not

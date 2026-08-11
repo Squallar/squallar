@@ -151,7 +151,7 @@ const MINUTES: [u32; 4] = [0, 5, 10, 15];
 /// thing, and nothing else in the codebase makes them so.
 ///
 /// A plan-view loop holds `MAX_LOOP_FRAMES` and textures
-/// `MAX_LOOP_RENDER_BUDGET` of them, dropping and re-rendering as the playhead
+/// `test_loop_allocation().plan_view_frames` of them, dropping and re-rendering as the playhead
 /// walks. Re-entering a resident 3D window costs ~140 ms (89 ms resample +
 /// 51 ms upload) against the 200 ms interval at `DEFAULT_LOOP_SPEED_FPS`, so
 /// that treadmill does not close here — which is why `loop_frame_budget` and
@@ -461,10 +461,10 @@ fn the_scan_listing_is_sampled_to_the_resident_frame_count() {
          sampling below is not exercised",
     );
 
-    accept_scan_listing(&mut ls, SITE, listing.clone());
+    accept_scan_listing(test_loop_allocation(), &mut ls, SITE, listing.clone());
     assert_eq!(
         ls.frames.len(),
-        MAX_LOOP_VOLUME_FRAMES,
+        test_loop_allocation().volume_frames,
         "a 3D loop took the plan-view frame count, so its frame list is longer \
          than its resident set can be",
     );
@@ -473,7 +473,7 @@ fn the_scan_listing_is_sampled_to_the_resident_frame_count() {
     // about the view rather than about the cap having moved for everyone.
     let mut plan = LoopPlaybackState::new_for_loop(3600, &site(), RenderView::PlanView);
     plan.phase = LoopPhase::Rendering;
-    accept_scan_listing(&mut plan, SITE, listing);
+    accept_scan_listing(test_loop_allocation(), &mut plan, SITE, listing);
     assert_eq!(plan.frames.len(), MAX_LOOP_FRAMES);
 }
 

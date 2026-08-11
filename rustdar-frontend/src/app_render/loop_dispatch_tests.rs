@@ -308,14 +308,15 @@ fn a_listing_for_the_site_the_loop_left_is_refused() {
     let stale = vec![(ts(0), identifier("KTLX20240101_000000_V06"))];
 
     assert!(
-        accept_scan_listing(&mut koun, "KTLX", stale).is_none(),
+        accept_scan_listing(test_loop_allocation(), &mut koun, "KTLX", stale).is_none(),
         "a KTLX listing is not this KOUN loop's frame list"
     );
     assert!(koun.frames.is_empty(), "and left no frames behind");
 
     // The loop's own listing is taken.
     let live = vec![(ts(0), identifier("KOUN20240101_000000_V06"))];
-    let plan = accept_scan_listing(&mut koun, "KOUN", live).expect("its own listing");
+    let plan = accept_scan_listing(test_loop_allocation(), &mut koun, "KOUN", live)
+        .expect("its own listing");
     assert_eq!(
         plan.site, "KOUN",
         "the plan carries the site it was listed for"
@@ -332,7 +333,7 @@ fn a_listing_for_an_inactive_loop_is_refused() {
     ls.phase = LoopPhase::Inactive;
 
     let scans = vec![(ts(0), identifier("KTLX20240101_000000_V06"))];
-    assert!(accept_scan_listing(&mut ls, "KTLX", scans).is_none());
+    assert!(accept_scan_listing(test_loop_allocation(), &mut ls, "KTLX", scans).is_none());
 }
 
 /// The wedge. A failed listing is delivered as an empty list, and so is a
@@ -348,7 +349,7 @@ fn an_empty_listing_switches_the_loop_off() {
     ls.phase = LoopPhase::FetchingScanList;
 
     assert!(
-        accept_scan_listing(&mut ls, "KTLX", Vec::new()).is_none(),
+        accept_scan_listing(test_loop_allocation(), &mut ls, "KTLX", Vec::new()).is_none(),
         "there is nothing to download"
     );
     assert!(
@@ -372,7 +373,7 @@ fn a_loop_no_frame_of_which_can_render_is_switched_off() {
     let mgr = LoopDownloadManager::new();
 
     assert!(
-        settle_loop_phase(&mgr, 0, &mut ls, MAX_LOOP_RENDER_BUDGET),
+        settle_loop_phase(&mgr, 0, &mut ls, test_loop_allocation().plan_view_frames),
         "the caller has to release this pane's loop state"
     );
     assert!(!ls.is_active());
@@ -389,7 +390,12 @@ fn a_loop_still_waiting_on_its_scans_is_left_alone() {
     let mut mgr = LoopDownloadManager::new();
     mgr.mark_in_flight("KTLX", ts(0));
 
-    assert!(!settle_loop_phase(&mgr, 0, &mut ls, MAX_LOOP_RENDER_BUDGET));
+    assert!(!settle_loop_phase(
+        &mgr,
+        0,
+        &mut ls,
+        test_loop_allocation().plan_view_frames
+    ));
     assert_eq!(ls.phase, LoopPhase::Rendering, "still working");
 
     // Undispatched downloads hold it open too.
@@ -403,7 +409,12 @@ fn a_loop_still_waiting_on_its_scans_is_left_alone() {
                 .collect(),
         },
     );
-    assert!(!settle_loop_phase(&mgr, 0, &mut ls, MAX_LOOP_RENDER_BUDGET));
+    assert!(!settle_loop_phase(
+        &mgr,
+        0,
+        &mut ls,
+        test_loop_allocation().plan_view_frames
+    ));
     assert_eq!(ls.phase, LoopPhase::Rendering);
 }
 
@@ -416,7 +427,12 @@ fn a_loop_with_something_to_show_is_promoted_rather_than_abandoned() {
     ls.frames[2].render_failed = true;
     let mgr = LoopDownloadManager::new();
 
-    assert!(!settle_loop_phase(&mgr, 0, &mut ls, MAX_LOOP_RENDER_BUDGET));
+    assert!(!settle_loop_phase(
+        &mgr,
+        0,
+        &mut ls,
+        test_loop_allocation().plan_view_frames
+    ));
     assert_eq!(ls.phase, LoopPhase::Ready);
 }
 
@@ -453,7 +469,8 @@ fn the_frame_list_and_the_frame_plan_describe_the_same_scans() {
         .map(|i| (ts(i), identifier(&format!("KTLX2024010{}_V06", i))))
         .collect();
 
-    let plan = accept_scan_listing(&mut ls, "KTLX", scans).expect("accepted");
+    let plan =
+        accept_scan_listing(test_loop_allocation(), &mut ls, "KTLX", scans).expect("accepted");
 
     assert_eq!(plan.frames.len(), MAX_LOOP_FRAMES, "capped");
     assert_eq!(
@@ -489,7 +506,7 @@ fn a_long_listing_is_sampled_evenly_across_its_whole_span() {
         .map(|i| (ts(i), identifier(&format!("KTLX2024010{}_V06", i))))
         .collect();
 
-    accept_scan_listing(&mut ls, "KTLX", scans).expect("accepted");
+    accept_scan_listing(test_loop_allocation(), &mut ls, "KTLX", scans).expect("accepted");
 
     // `ts` is one minute per listing position, so a frame's minute *is* the
     // position it was sampled from, and the gaps below are index strides.
@@ -807,7 +824,7 @@ fn readiness_counts_only_this_loops_own_downloads() {
     }
 
     assert!(
-        loop_batch_settled(&mgr, &koun, MAX_LOOP_RENDER_BUDGET),
+        loop_batch_settled(&mgr, &koun, test_loop_allocation().plan_view_frames),
         "precondition: with no scan of its own, a blank frame is not waiting on a render"
     );
 
@@ -817,7 +834,7 @@ fn readiness_counts_only_this_loops_own_downloads() {
         mgr.cache_scan("KOUN", ts(i), scan_with_sweeps(&[0.5]));
     }
     assert!(
-        !loop_batch_settled(&mgr, &koun, MAX_LOOP_RENDER_BUDGET),
+        !loop_batch_settled(&mgr, &koun, test_loop_allocation().plan_view_frames),
         "downloaded but unrendered frames must hold the loop out of Ready"
     );
 }

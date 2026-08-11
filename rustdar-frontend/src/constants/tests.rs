@@ -18,7 +18,12 @@ struct Arm {
     concurrent_renders: usize,
     loop_frames: usize,
     render_budget: usize,
-    loop_budget: usize,
+    /// The whole application's loop allowance on a device that reports nothing.
+    /// **Not** a per-pane figure any more — see [`LOOP_POOL_FLOOR_BYTES`].
+    pool_floor: usize,
+    /// The most this class will ever spend on loops, however much the device
+    /// claims. See [`LOOP_POOL_CEILING_BYTES`].
+    pool_ceiling: usize,
     grid: [u32; 3],
     volume_budget: usize,
     /// Frames — and so resident voxel grids — a 3D loop holds on this class.
@@ -104,20 +109,22 @@ impl Arm {
 
     /// Every GPU texture the application budgets at once, worst case.
     ///
-    /// A deliberate over-count by one pane: a pane is one kind at a time, so
-    /// nothing can hold a full 2D loop *and* be the 3D pane whose loop set the
-    /// middle term pays for. Summed rather than maximised so that the sum is
-    /// an upper bound whichever mix of pane kinds is on screen, and so that no
-    /// term can grow without this figure growing with it.
+    /// **The loop term is not multiplied by the pane count, and that is the
+    /// whole change.** It used to be `max_panes × a per-pane loop budget` plus
+    /// a separate flat term for the 3D loop, which was the one loop kind whose
+    /// grids lived in one application-wide store. Every loop kind is now: the
+    /// pool is *divided* among the loops that want one, so there is a single
+    /// loop term and it is the pool's ceiling.
     ///
-    /// The 3D term is **not** multiplied by the pane count, and that is the
-    /// property worth stating: the grids are in one application-wide
-    /// `VolumeStore` keyed by target, so two 3D panes on one volume share one
-    /// set. Multiplying it would be the regression.
+    /// Multiplying it again would be the regression this test exists to catch,
+    /// and so would giving the 3D loop a term of its own — that would be the
+    /// double-count `the_3d_set_is_not_double_counted_across_two_panes` rules
+    /// out, arrived at from the budget side.
+    ///
+    /// The offscreen term *is* still per pane, correctly: each 3D pane
+    /// raymarches into its own target, and no two panes share one.
     fn app_texture_bytes(&self) -> usize {
-        self.max_panes * self.loop_budget
-            + self.volume_loop_budget
-            + self.max_panes * self.offscreen_budget
+        self.pool_ceiling + self.max_panes * self.offscreen_budget
     }
 }
 
@@ -130,7 +137,8 @@ fn arms() -> [Arm; 3] {
             concurrent_renders: WASM_MAX_CONCURRENT_RENDERS,
             loop_frames: WASM_MAX_LOOP_FRAMES,
             render_budget: WASM_MAX_LOOP_RENDER_BUDGET,
-            loop_budget: WASM_LOOP_TEXTURE_BUDGET_BYTES,
+            pool_floor: WASM_LOOP_POOL_FLOOR_BYTES,
+            pool_ceiling: WASM_LOOP_POOL_CEILING_BYTES,
             grid: WASM_VOLUME_GRID_CELLS,
             volume_budget: WASM_VOLUME_TEXTURE_BUDGET_BYTES,
             volume_loop_frames: WASM_MAX_LOOP_VOLUME_FRAMES,
@@ -145,7 +153,8 @@ fn arms() -> [Arm; 3] {
             concurrent_renders: MOBILE_MAX_CONCURRENT_RENDERS,
             loop_frames: MOBILE_MAX_LOOP_FRAMES,
             render_budget: MOBILE_MAX_LOOP_RENDER_BUDGET,
-            loop_budget: MOBILE_LOOP_TEXTURE_BUDGET_BYTES,
+            pool_floor: MOBILE_LOOP_POOL_FLOOR_BYTES,
+            pool_ceiling: MOBILE_LOOP_POOL_CEILING_BYTES,
             grid: MOBILE_VOLUME_GRID_CELLS,
             volume_budget: MOBILE_VOLUME_TEXTURE_BUDGET_BYTES,
             volume_loop_frames: MOBILE_MAX_LOOP_VOLUME_FRAMES,
@@ -160,7 +169,8 @@ fn arms() -> [Arm; 3] {
             concurrent_renders: DESKTOP_MAX_CONCURRENT_RENDERS,
             loop_frames: DESKTOP_MAX_LOOP_FRAMES,
             render_budget: DESKTOP_MAX_LOOP_RENDER_BUDGET,
-            loop_budget: DESKTOP_LOOP_TEXTURE_BUDGET_BYTES,
+            pool_floor: DESKTOP_LOOP_POOL_FLOOR_BYTES,
+            pool_ceiling: DESKTOP_LOOP_POOL_CEILING_BYTES,
             grid: DESKTOP_VOLUME_GRID_CELLS,
             volume_budget: DESKTOP_VOLUME_TEXTURE_BUDGET_BYTES,
             volume_loop_frames: DESKTOP_MAX_LOOP_VOLUME_FRAMES,
@@ -172,44 +182,82 @@ fn arms() -> [Arm; 3] {
     ]
 }
 
-/// The ceiling the per-target constants were chosen to fit, checked on
-/// **every** arm rather than on the one this build compiled.
+/// **One loop, on the worst device this target admits, gets exactly what one
+/// pane used to get.**
 ///
-/// This is the table in [`LOOP_TEXTURE_BUDGET_BYTES`]' doc comment, executed.
-/// Two of its three rows were previously prose.
+/// The property that makes the pool safe to ship, and the reason
+/// [`LOOP_POOL_FLOOR_BYTES`] carries the numbers the per-pane budget carried
+/// rather than numbers of its own. Nobody with a single loop open loses a
+/// frame of history on any device; what changed is that six of them no longer
+/// cost six times it.
+///
+/// This is the table in [`LOOP_POOL_FLOOR_BYTES`]' doc comment, executed, on
+/// **every** arm rather than the one this build compiled.
 #[test]
-fn loop_frames_fit_the_target_texture_budget() {
+fn one_loop_at_the_floor_is_exactly_what_a_pane_used_to_get() {
     for arm in arms() {
         let total = arm.textured_frames() * arm.loop_frame_bytes();
         assert!(
-            total <= arm.loop_budget,
-            "{}: {} textured frames x {}^2 x 4B = {} MiB, over the {} MiB budget",
+            total <= arm.pool_floor,
+            "{}: {} textured frames x {}^2 x 4B = {} MiB, over the {} MiB floor \
+             — a single loop on this target no longer gets the history it does \
+             today",
             arm.name,
             arm.textured_frames(),
             arm.image_size,
             total / (1024 * 1024),
-            arm.loop_budget / (1024 * 1024),
+            arm.pool_floor / (1024 * 1024),
+        );
+        // And a section loop, which is half the frame, comfortably so — the
+        // pool is bytes, so this needs no table of its own any more.
+        assert!(arm.textured_frames() * arm.section_frame_bytes() <= arm.pool_floor);
+    }
+}
+
+/// **The floor seats a full screen of loops without blanking one.**
+///
+/// [`MIN_LOOP_FRAMES_PER_PANE`] is what makes the degradation smooth rather
+/// than a cliff, and it is worth nothing unless the floor can actually pay for
+/// it on every pane the width class admits. Without this, adding the last pane
+/// on a browser would take a loop to zero frames, which reads as a bug and
+/// which the user has no way to undo except by guessing.
+///
+/// wasm32's row is **exact** — six loops at two frames of 4 MiB is 48 MiB to
+/// the byte — so this is the line a change to the browser floor, the minimum,
+/// the pane count or the web image size has to come past.
+#[test]
+fn the_floor_seats_every_pane_without_blanking_one() {
+    for arm in arms() {
+        let needed = arm.max_panes * MIN_LOOP_FRAMES_PER_PANE * arm.loop_frame_bytes();
+        assert!(
+            needed <= arm.pool_floor,
+            "{}: {} panes x {MIN_LOOP_FRAMES_PER_PANE} frames x {} MiB = {} MiB, \
+             over the {} MiB floor — a full screen of loops would be cut below \
+             the minimum and one of them would blank",
+            arm.name,
+            arm.max_panes,
+            arm.loop_frame_bytes() / (1024 * 1024),
+            needed / (1024 * 1024),
+            arm.pool_floor / (1024 * 1024),
         );
     }
 }
 
-/// The **section** row of the same table, executed.
+/// The bounds are a pair, and the floor is the one that wins.
 ///
-/// A cross-section loop is budgeted separately because the budget is per pane
-/// and a screen can hold one of each — so this is not a second claim about the
-/// same memory, it is the claim about a second pane's.
+/// `LoopPoolLimits::hold` is a `clamp`, and `clamp` **panics** on a crossed
+/// pair — at startup, on one target only, which is the arm no host test can
+/// reach. The compile-time block beside the constants asserts it for the
+/// compiled arm; this is the other two.
 #[test]
-fn section_loop_frames_fit_the_target_texture_budget() {
+fn every_pool_ceiling_is_at_least_its_own_floor() {
     for arm in arms() {
-        let total = arm.textured_frames() * arm.section_frame_bytes();
         assert!(
-            total <= arm.loop_budget,
-            "{}: {} textured section frames x {} B = {} MiB, over the {} MiB budget",
+            arm.pool_floor <= arm.pool_ceiling,
+            "{}: a {} MiB floor above a {} MiB ceiling is a `clamp` that panics",
             arm.name,
-            arm.textured_frames(),
-            arm.section_frame_bytes(),
-            total / (1024 * 1024),
-            arm.loop_budget / (1024 * 1024),
+            arm.pool_floor / (1024 * 1024),
+            arm.pool_ceiling / (1024 * 1024),
         );
     }
 }
@@ -359,13 +407,10 @@ fn the_whole_application_fits_its_gpu_ceiling() {
         let total = arm.app_texture_bytes();
         assert!(
             total <= arm.app_budget,
-            "{}: {} panes x {} MiB of loop textures + {} MiB of 3D loop grids + \
-             {} panes x {} MiB of raymarch offscreen = {} MiB, over the {} MiB \
-             whole-application ceiling",
+            "{}: a {} MiB loop pool + {} panes x {} MiB of raymarch offscreen = \
+             {} MiB, over the {} MiB whole-application ceiling",
             arm.name,
-            arm.max_panes,
-            arm.loop_budget / (1024 * 1024),
-            arm.volume_loop_budget / (1024 * 1024),
+            arm.pool_ceiling / (1024 * 1024),
             arm.max_panes,
             arm.offscreen_budget / (1024 * 1024),
             total / (1024 * 1024),
@@ -447,11 +492,12 @@ fn the_budget_is_not_slack_enough_to_hide_a_doubling() {
     for arm in arms() {
         let total = arm.textured_frames() * arm.loop_frame_bytes();
         assert!(
-            total * 2 > arm.loop_budget,
-            "{}: budget {} MiB is more than twice the actual {} MiB — it would \
-                 not catch a regression",
+            total * 2 > arm.pool_floor,
+            "{}: floor {} MiB is more than twice the {} MiB one full loop costs \
+                 — it would not catch a regression, and it would mean the floor \
+                 is no longer 'what one pane used to get'",
             arm.name,
-            arm.loop_budget / (1024 * 1024),
+            arm.pool_floor / (1024 * 1024),
             total / (1024 * 1024),
         );
     }
@@ -521,12 +567,12 @@ fn the_volume_budget_is_not_slack_enough_to_hide_a_doubling() {
 #[test]
 fn the_documented_per_class_figures_are_what_the_arms_actually_say() {
     let expected = [
-        // name, image, concurrent, held, textured, loop budget MiB, volume budget B
-        ("wasm32", 1024, 1, 12, 8, 48, 6 * 1024 * 1024),
-        ("mobile", 2048, 3, 20, 12, 256, 20 * 1024 * 1024),
-        ("desktop", 2048, 6, 60, 30, 512, 48 * 1024 * 1024),
+        // name, image, concurrent, held, textured, floor MiB, ceiling MiB, volume budget B
+        ("wasm32", 1024, 1, 12, 8, 48, 192, 6 * 1024 * 1024),
+        ("mobile", 2048, 3, 20, 12, 256, 640, 20 * 1024 * 1024),
+        ("desktop", 2048, 6, 60, 30, 512, 3072, 48 * 1024 * 1024),
     ];
-    for (arm, (name, image, concurrent, held, textured, loop_mib, volume)) in
+    for (arm, (name, image, concurrent, held, textured, floor_mib, ceiling_mib, volume)) in
         arms().into_iter().zip(expected)
     {
         assert_eq!(arm.name, name);
@@ -534,10 +580,11 @@ fn the_documented_per_class_figures_are_what_the_arms_actually_say() {
         assert_eq!(arm.concurrent_renders, concurrent, "{name} renders");
         assert_eq!(arm.loop_frames, held, "{name} held frames");
         assert_eq!(arm.render_budget, textured, "{name} render budget");
+        assert_eq!(arm.pool_floor, floor_mib * 1024 * 1024, "{name} pool floor");
         assert_eq!(
-            arm.loop_budget,
-            loop_mib * 1024 * 1024,
-            "{name} loop budget"
+            arm.pool_ceiling,
+            ceiling_mib * 1024 * 1024,
+            "{name} pool ceiling"
         );
         assert_eq!(arm.volume_budget, volume, "{name} volume budget");
     }
@@ -567,7 +614,8 @@ fn every_cascade_in_this_file_selected_the_same_arm() {
     );
     assert_eq!(MAX_LOOP_FRAMES, arm.loop_frames, "{}", arm.name);
     assert_eq!(MAX_LOOP_RENDER_BUDGET, arm.render_budget, "{}", arm.name);
-    assert_eq!(LOOP_TEXTURE_BUDGET_BYTES, arm.loop_budget, "{}", arm.name);
+    assert_eq!(LOOP_POOL_FLOOR_BYTES, arm.pool_floor, "{}", arm.name);
+    assert_eq!(LOOP_POOL_CEILING_BYTES, arm.pool_ceiling, "{}", arm.name);
     assert_eq!(VOLUME_GRID_CELLS, arm.grid, "{}", arm.name);
     assert_eq!(
         VOLUME_TEXTURE_BUDGET_BYTES, arm.volume_budget,
@@ -695,7 +743,10 @@ fn every_cfg_arm_selects_the_constant_named_for_its_device_class() {
         "MAX_CONCURRENT_RENDERS",
         "MAX_LOOP_RENDER_BUDGET",
         "MAX_LOOP_FRAMES",
-        "LOOP_TEXTURE_BUDGET_BYTES",
+        // The pool's two bounds, landed when the loop budget stopped being a
+        // per-pane allowance. Both are cascades, so both have to be here.
+        "LOOP_POOL_FLOOR_BYTES",
+        "LOOP_POOL_CEILING_BYTES",
         "VOLUME_GRID_CELLS",
         "VOLUME_TEXTURE_BUDGET_BYTES",
         // Lifted by WP-I after this test first listed it as exempt. It is
