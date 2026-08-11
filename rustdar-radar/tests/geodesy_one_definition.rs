@@ -286,7 +286,14 @@ fn strip_comments_and_strings(src: &str) -> String {
 }
 
 /// Every `.rs` and `.wgsl` file under the workspace root, skipping build
-/// output and this file.
+/// output, nested checkouts and this file.
+///
+/// `.claude` is skipped because agent worktrees live under it — full copies of
+/// the repository at whatever commit they forked from. Scanning them reports
+/// every duplicate this guard ever removed, from trees that are not this one:
+/// 1566 findings on a developer box with worktrees present, and none in CI,
+/// where a fresh clone has no `.claude/worktrees`. A guard that fires only off
+/// CI is one people learn to ignore.
 ///
 /// The self-exclusion is not a loophole: [`BANDS`] has to *state* the numbers
 /// it is looking for, so the scanner is the one file that cannot pass its own
@@ -300,7 +307,7 @@ fn sources(dir: &Path, into: &mut Vec<PathBuf>) {
         let path = entry.expect("a readable directory entry").path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if path.is_dir() {
-            if !matches!(name, "target" | ".git" | "node_modules") {
+            if !matches!(name, "target" | ".git" | ".claude" | "node_modules") {
                 sources(&path, into);
             }
         } else if matches!(
