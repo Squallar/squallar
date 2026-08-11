@@ -142,10 +142,15 @@
 //! * **A blind column where the line crosses the site**, and a 180° flip in
 //!   bearing on either side of it. Both are real: the ground range goes to zero
 //!   and comes back, and the azimuth is the *opposite* one afterwards.
-//! * **A section that does not register with the plan view above ~2°.** The
-//!   sampler applies the `cos e` slant→ground correction that `render_gate`
-//!   omits — 0.2 km at 2.4° and 4.0 km at 19.5°. The section is the correct
-//!   one.
+//! * **A section that used to sit about a pixel off the plan view's range
+//!   ring.** Neither cause survives. It was never the `cos e` correction —
+//!   both renderers apply that now, so an echo is at the same ground range in
+//!   both — and it is no longer the sphere either: this ground track and
+//!   [`crate::types::ImageBounds`] are both on `EARTH_RADIUS_KM`, where the
+//!   bounds used to imply 6378 and left a 258.4 m seam at 230 km. The
+//!   paragraph above on the ground-track sphere has the measurement. It is
+//!   listed here because the offset is what a reader of the old pictures
+//!   remembers, not because it is still there.
 
 use crate::beam;
 use crate::par::*;

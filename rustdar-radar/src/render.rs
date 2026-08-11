@@ -884,6 +884,31 @@ fn compute_max_range(radials: &[Radial], product: types::RadarProduct) -> f64 {
     reach
 }
 
+/// The factor between the slant range a sweep's gates are measured at and the
+/// ground range they sit over: `cos e` of the sweep's **median** elevation.
+///
+/// The median and not the first radial's, and not the tilt label either,
+/// because that is the angle [`crate::sampler`] keys its rungs on
+/// ([`crate::volumetric::sweep_elevation_deg`]) — a section and a plan view
+/// that disagree about which angle a sweep flew disagree about where its
+/// echoes are, and the antenna is still settling when a sweep starts (a live
+/// KMRX 0.5° cut opened at 0.283°).
+///
+/// Hoisted once per sweep rather than evaluated per gate: it is one number for
+/// every gate of every radial, and the gate loops below run a third of a
+/// million times per sweep.
+///
+/// Two answers are not the median's. `None` is an empty sweep, which paints
+/// nothing whichever factor it is handed. A non-finite median is a corrupt
+/// angle, and 1.0 draws that sweep where the RDA said it was measured, which
+/// is a better failure than `cos NaN` collapsing all of it onto the site.
+fn sweep_ground_factor(radials: &[Radial]) -> f64 {
+    match crate::volumetric::sweep_elevation_deg(radials) {
+        Some(e) if e.is_finite() => e.to_radians().cos().clamp(0.0, 1.0),
+        _ => 1.0,
+    }
+}
+
 /// Project a field onto the image, at the extent its own data asks for.
 ///
 /// Every render path in this module comes through here, and each already knew
@@ -901,6 +926,13 @@ fn compute_max_range(radials: &[Radial], product: types::RadarProduct) -> f64 {
 /// of the sweep, answered by [`compute_max_range`], and a cross-section is
 /// where this display reports it (`SectionAxes::coverage_ground_range_km`).
 ///
+/// `reach_km` is measured in **the coordinate its caller paints in**, which
+/// for the four per-tilt paths is a ground range: they have already folded
+/// [`sweep_ground_factor`] into both the reach and every gate, so the frame
+/// and the picture inside it are sized by the same ruler. A raster whose
+/// gates were shortened but whose extent was not would draw a 60° TDWR tilt
+/// at half radius on a frame twice as wide as it needed.
+///
 /// `side_ceiling_px` is the largest side the caller will accept; the extent and
 /// that ceiling together give the raster's own side through
 /// [`types::raster_side_px`], which is the second half of the geometry and the
@@ -908,13 +940,13 @@ fn compute_max_range(radials: &[Radial], product: types::RadarProduct) -> f64 {
 fn render_with_projection(
     radar_lat: f64,
     radar_lon: f64,
-    actual_max_range: f64,
+    reach_km: f64,
     product: types::RadarProduct,
     side_ceiling_px: usize,
     label: &str,
     fill: impl FnOnce(&MercatorProjection, &RenderBuffers),
 ) -> (Vec<u8>, f64, Vec<f32>) {
-    let extent_km = types::plan_view_extent_km(actual_max_range);
+    let extent_km = types::plan_view_extent_km(reach_km);
     let side_px = types::raster_side_px(extent_km, side_ceiling_px);
     let bounds = types::ImageBounds::from_radar_site(radar_lat, radar_lon, extent_km);
     let proj = MercatorProjection::from_bounds(radar_lat, &bounds, extent_km, side_px);
@@ -927,7 +959,7 @@ fn render_with_projection(
         "{} rendering complete: data reaches {:.1}km, projected at ±{:.1}km \
          onto {side_px}² px ({:.2} px/km)",
         label,
-        actual_max_range,
+        reach_km,
         extent_km,
         proj.px_per_km,
     );
@@ -1105,12 +1137,17 @@ pub fn render_radar_to_image_full_sized(
         radials.iter().map(|r| f64::from(r.azimuth_angle_degrees())),
     )
     .unwrap_or(1.0);
-    let actual_max_range = compute_max_range(radials, product);
+    // Slant out of `compute_max_range`, ground into the projection: how far
+    // the *data* goes is a property of the sweep, how wide the *picture* is
+    // has to be the ground it covers, and the four sweep paths in this module
+    // are where the one becomes the other.
+    let cos_e = sweep_ground_factor(radials);
+    let ground_reach_km = compute_max_range(radials, product) * cos_e;
 
     let output = render_with_projection(
         radar_lat,
         radar_lon,
-        actual_max_range,
+        ground_reach_km,
         product,
         side_ceiling_px,
         "Radar",
@@ -1135,7 +1172,14 @@ pub fn render_radar_to_image_full_sized(
                         // would be eight bytes per gate allocated and dropped
                         // for every radial of every render.
                         for (gate_idx, moment_value) in moment.iter().enumerate() {
-                            let range_km = first_gate_range + (gate_idx as f64 * gate_size);
+                            // A gate is measured out along the beam and drawn
+                            // on the ground under it, so what this loop counts
+                            // in and what the projection paints in are two
+                            // different ranges. `cos_e` is monotone in neither
+                            // direction here — it is one constant for the
+                            // sweep — so the break below still short-circuits.
+                            let ground_km =
+                                (first_gate_range + (gate_idx as f64 * gate_size)) * cos_e;
                             // The edge of the image, and the image was sized
                             // from this sweep's own reach — so on a sweep whose
                             // radials agree this never fires, and a 1832-gate
@@ -1145,7 +1189,7 @@ pub fn render_radar_to_image_full_sized(
                             // `types::MAX_EXTENT_KM`, or past a shorter
                             // neighbour's agreed reach on a sweep
                             // `compute_max_range` has already warned about.
-                            if range_km > proj.extent_km {
+                            if ground_km > proj.extent_km {
                                 break;
                             }
 
@@ -1161,7 +1205,20 @@ pub fn render_radar_to_image_full_sized(
                                 radial: radial_idx,
                                 gate: gate_idx,
                             };
-                            proj.render_gate(bufs, &ctx, range_km, gate_size, scaled_value, from);
+                            // The depth foreshortens with the range: a gate is
+                            // a segment of the beam, and its shadow on the
+                            // ground is that segment times the same `cos e`.
+                            // Painting a full-depth cell at a shortened range
+                            // would overlap its neighbour by `1 − cos e` of a
+                            // gate and leave the sweep's outer edge long.
+                            proj.render_gate(
+                                bufs,
+                                &ctx,
+                                ground_km,
+                                gate_size * cos_e,
+                                scaled_value,
+                                from,
+                            );
                         }
                     }
                 });
@@ -1187,9 +1244,19 @@ fn render_nrot_to_image(
 
     let vg = build_velocity_grid(radials)?;
 
-    let actual_max_range = vg.first_gate_range_km + vg.gate_count as f64 * vg.gate_interval_km;
+    let cos_e = sweep_ground_factor(radials);
+    let ground_reach_km =
+        (vg.first_gate_range_km + vg.gate_count as f64 * vg.gate_interval_km) * cos_e;
     let wedge_deg = derived_grid_wedge_deg(&vg.azimuths_deg);
 
+    // The physics keeps the first radial's angle. It is the same number the
+    // shear normalization has always divided by, and the two are not
+    // interchangeable: `sweep_ground_factor`'s median is where the sweep is
+    // *drawn*, this is what the sweep was *computed* at, and swapping one in
+    // for the other would move every NROT value in the field to buy a
+    // difference the settling spread bounds at 0.23° (a KMRX 0.5° cut opening
+    // at 0.283°, the worst of 203 volumes). Placement is worth correcting at
+    // 60°; a value is not worth perturbing for a fifth of a degree.
     let elevation_deg = radials
         .first()
         .map(|r| r.elevation_angle_degrees() as f64)
@@ -1210,7 +1277,7 @@ fn render_nrot_to_image(
     let output = render_with_projection(
         radar_lat,
         radar_lon,
-        actual_max_range,
+        ground_reach_km,
         types::RadarProduct::NormalizedRotation,
         side_ceiling_px,
         "NROT",
@@ -1223,8 +1290,9 @@ fn render_nrot_to_image(
                         continue;
                     }
 
-                    let range_km = vg.first_gate_range_km + j as f64 * vg.gate_interval_km;
-                    if range_km > proj.extent_km {
+                    let ground_km =
+                        (vg.first_gate_range_km + j as f64 * vg.gate_interval_km) * cos_e;
+                    if ground_km > proj.extent_km {
                         break;
                     }
 
@@ -1243,8 +1311,8 @@ fn render_nrot_to_image(
                     proj.render_gate(
                         bufs,
                         &ctx,
-                        range_km,
-                        vg.gate_interval_km,
+                        ground_km,
+                        vg.gate_interval_km * cos_e,
                         scaled_value,
                         from,
                     );
@@ -1294,13 +1362,16 @@ fn render_srv_to_image(
     );
     let grid = crate::srv::compute_srv_grid(radials, elevation_deg, profile.as_ref(), &motion)?;
 
-    let actual_max_range =
-        grid.first_gate_range_km + grid.gate_count as f64 * grid.gate_interval_km;
+    // As in NROT: the dealiaser above keeps the first radial's angle, this is
+    // where the finished field is *placed*.
+    let cos_e = sweep_ground_factor(radials);
+    let ground_reach_km =
+        (grid.first_gate_range_km + grid.gate_count as f64 * grid.gate_interval_km) * cos_e;
     let wedge_deg = derived_grid_wedge_deg(&grid.azimuths_deg);
     let output = render_with_projection(
         radar_lat,
         radar_lon,
-        actual_max_range,
+        ground_reach_km,
         types::RadarProduct::StormRelativeVelocity,
         side_ceiling_px,
         "SRV",
@@ -1311,16 +1382,17 @@ fn render_srv_to_image(
                     if value.is_nan() {
                         continue;
                     }
-                    let range_km = grid.first_gate_range_km + j as f64 * grid.gate_interval_km;
-                    if range_km > proj.extent_km {
+                    let ground_km =
+                        (grid.first_gate_range_km + j as f64 * grid.gate_interval_km) * cos_e;
+                    if ground_km > proj.extent_km {
                         break;
                     }
                     let from = GateId { radial: i, gate: j };
                     proj.render_gate(
                         bufs,
                         &ctx,
-                        range_km,
-                        grid.gate_interval_km,
+                        ground_km,
+                        grid.gate_interval_km * cos_e,
                         value as f32,
                         from,
                     );
@@ -1622,6 +1694,23 @@ pub fn render_hail_to_image(
 /// without a `dbz0` the SNR gate reads every gate as no-echo and the
 /// product would be blank) with the initial phase from the volume's own
 /// estimator, the same fallback family the KDP render arm documents.
+///
+/// # No `cos e` here either, and for a structural reason
+///
+/// A hybrid-scan grid has no elevation to correct by. Every bin is answered
+/// by whichever cut first produced a rate there
+/// ([`crate::hhc::composite_hybrid_scan`]), and the composite keeps the class
+/// and not the tilt it came from, so there is no per-bin angle for a
+/// correction to use — one number for the grid would be wrong for every bin
+/// the lowest cut did not fill.
+///
+/// It would also be a correction to nothing much. The bins that reach a
+/// higher cut are exactly the ones the cut below could not fill — the cone of
+/// silence and blocked sectors, all of them near — and near is where `cos e`
+/// costs nothing: 4.5° over 50 km moves a bin 154 m, under one 0.25 km bin,
+/// while the 0.5° cut that fills the rest of the grid moves 11 m at 230 km.
+/// The same holds for the CAPPI and `crate::dpprep` fields under it, which
+/// are scored bin-for-bin against the RPG's own hybrid-scan products.
 pub fn render_hhc_to_image(
     scan: &Scan,
     radar_lat: f64,
@@ -1731,13 +1820,18 @@ pub fn render_derived_kdp_to_image(
         return None;
     }
     let max_gates = derived.values.iter().map(Vec::len).max().unwrap_or(0);
-    let actual_max_range = derived.first_gate_km + max_gates as f64 * derived.gate_interval_km;
+    // KDP is a range derivative of ΦDP, so its grid keeps the differential
+    // phase sweep's own gate spacing and reaches where that sweep reached —
+    // and is placed on the ground the same way that sweep's moments are.
+    let cos_e = sweep_ground_factor(radials);
+    let ground_reach_km =
+        (derived.first_gate_km + max_gates as f64 * derived.gate_interval_km) * cos_e;
     let wedge_deg = derived_grid_wedge_deg(&derived.azimuths_deg);
 
     let output = render_with_projection(
         radar_lat,
         radar_lon,
-        actual_max_range,
+        ground_reach_km,
         types::RadarProduct::SpecificDifferentialPhase,
         side_ceiling_px,
         "KDP",
@@ -1748,12 +1842,20 @@ pub fn render_derived_kdp_to_image(
                     if v.is_nan() {
                         continue;
                     }
-                    let range_km = derived.first_gate_km + j as f64 * derived.gate_interval_km;
-                    if range_km > proj.extent_km {
+                    let ground_km =
+                        (derived.first_gate_km + j as f64 * derived.gate_interval_km) * cos_e;
+                    if ground_km > proj.extent_km {
                         break;
                     }
                     let from = GateId { radial: i, gate: j };
-                    proj.render_gate(bufs, &ctx, range_km, derived.gate_interval_km, v, from);
+                    proj.render_gate(
+                        bufs,
+                        &ctx,
+                        ground_km,
+                        derived.gate_interval_km * cos_e,
+                        v,
+                        from,
+                    );
                 }
             });
         },
@@ -1797,6 +1899,31 @@ pub fn render_level3_radial_to_image(
 /// (see `ProductDescriptionBlock::range_gate_km`) — so the first gate's range
 /// is also re-derived from `first_range_bin` at the chosen spacing rather
 /// than taken from the packet.
+///
+/// # No `cos e` here, unlike the four Level II paths
+///
+/// The sweep rasterizers above turn a gate's slant range into the ground
+/// range under it. This one deliberately does not, and the reason is that a
+/// Level III bin is **already** the RPG's answer about where something is,
+/// not a measurement this display is placing:
+///
+/// * The RPG bins on the ground itself. Its own generators carry `cos(elev)`
+///   as a *display* constant rather than as a range correction —
+///   `dualpol8bit.c` writes `cos(elev)·1000` into the packet-16 scale-factor
+///   halfword, which `nexrad_level3::model::ProductDescriptionBlock::
+///   range_gate_km` documents and overrides. Applying it a second time here
+///   would move every bin of every product inward by a factor the generator
+///   has already accounted for.
+/// * The codes this app fetches leave nothing to correct anyway. `EET` and
+///   `DVL` are **volume** products with no elevation at all, `DPR` is the
+///   hybrid scan, and `N0K`/`N0H` are the 0.5° cut, where `1 − cos e` is
+///   3.8e-5 — 11 m at the 300 km edge of an `N0K`, a twenty-third of one
+///   0.25 km bin and a twentieth of a pixel.
+/// * It would break the only thing that can tell whether the derived
+///   products here are right. `crate::eet`, `crate::vil` and `crate::hhc`
+///   are scored bin-for-bin against the fetched twin; shifting one side of
+///   that comparison by a range-dependent factor turns a per-bin agreement
+///   bar into a registration test.
 #[allow(clippy::too_many_arguments)]
 fn render_level3_radial_with_gate_km(
     radial_packet: &nexrad_level3::model::RadialPacket,

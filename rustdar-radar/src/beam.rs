@@ -115,12 +115,17 @@
 //! `Rₑ·asin(r·cos e/(Rₑ + h))` that `polar_to_geo` returns. Those differ by
 //! ~110 m at 230 km / 0.5° and ~182 m at 70 km / 19.5° — the same order as the
 //! beam-height residual, and in the same direction for every consumer, which
-//! is what makes it a consistency choice rather than an accuracy claim. Note
-//! `render_gate` applies **no** `cos e` at all (it never receives an
-//! elevation angle), so a consumer that does apply it will not register
-//! against the plan view above ~2°. That divergence is real, deliberate, and
-//! belongs to the consumer to declare — this module only supplies the
-//! `cos e`.
+//! is what makes it a consistency choice rather than an accuracy claim.
+//!
+//! Every drawn product in this crate now shares that choice. The plan view's
+//! four per-tilt rasterizers hoist `cos e` of their sweep's median elevation
+//! and paint at the ground range, the sampler converts a ground range back to
+//! a slant one before reading a gate, and a section drawn from the sampler
+//! therefore registers against the map above it at any tilt. What is left
+//! between them is this paragraph's own subject — tangent plane against
+//! spherical arc, and the 6371-vs-6378 inconsistency [`crate::types::
+//! ImageBounds`] carries — which is a tenth of a pixel, not the 18 px that
+//! `cos e` was worth at 19.5°.
 
 use crate::types::EARTH_RADIUS_KM;
 
@@ -180,9 +185,10 @@ pub fn slant_range_for_height_km(height_km: f64, elev_deg: f64) -> f64 {
 /// Ground range, km: the horizontal distance from the site to the point under
 /// a gate at `slant_range_km` on a tilt of `elev_deg`.
 ///
-/// Tangent-plane `r·cos e`, per the module doc. This is the factor
-/// `render_gate` omits: it is 0.09 % at 2.4° and 5.7 % at 19.5°, i.e. 0.2 km
-/// and 4.0 km at those tilts' plotted extents.
+/// Tangent-plane `r·cos e`, per the module doc. The factor is 0.09 % at 2.4°
+/// and 5.7 % at 19.5° — 0.2 km and 4.0 km at those tilts' plotted extents —
+/// and **50 % at the 60° a TDWR's VCP 80 climbs to**, which is why the plan
+/// view applies it rather than treating it as small.
 #[inline]
 pub fn ground_range_km(slant_range_km: f64, elev_deg: f64) -> f64 {
     slant_range_km * elev_deg.to_radians().cos()

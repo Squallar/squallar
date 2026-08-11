@@ -67,15 +67,17 @@
 //!
 //! # And the second thing, which is about the map rather than the section
 //!
-//! `render_gate` — the plan view's projection — applies no `cos(e)` and no beam
-//! height model: it draws a gate at its *slant* range from the site, on the
-//! ground. This section applies both. They therefore disagree, by 0.9 px at
-//! 2.4° and by 18 px at 19.5° and 70 km. The section is the correct one. A user
-//! comparing the section against the ground track drawn on the map above it
-//! can see this, which is why it is explained at all — but it is explained in
-//! the ⓘ detail, in words about what the user sees, not shipped in the default
-//! caption: *"the section is right"* is this module arguing with itself in
-//! front of the user, and it read exactly that way.
+//! The two used to disagree about *where* an echo was. `render_gate` drew a
+//! gate at its slant range from the site while this section placed it at the
+//! ground range under the beam, which is 0.9 px apart at 2.4°, 18 px at 19.5°
+//! and 70 km, and half the radius on a TDWR's 60° cut. The plan view now
+//! applies the same `cos(e)`, so an echo is at the same ground range in both
+//! and the caveat that used to be needed here is gone.
+//!
+//! What is left is the one thing a section has and a map does not: height. The
+//! ⓘ detail says so in words about what the user sees rather than about which
+//! renderer is right — *"the section is right"* was this module arguing with
+//! itself in front of the user, and it read exactly that way.
 
 use crate::pane::PaneState;
 use rustdar_radar::beam;
@@ -1247,9 +1249,9 @@ fn detail_lines(
     }
 
     let mut registration = String::from(
-        "Echoes can sit a little off the line drawn on the map, most visibly on high \
-         tilts: the map flattens every tilt to the ground, while this section keeps \
-         the beam's height.",
+        "Echoes sit at the same distance from the radar here as they do on the map - \
+         both place a tilt under its beam rather than out along it. The height is \
+         what only this view has.",
     );
     // Only when it is true of *this* section: a line that ran out of data half
     // way along is a fact about the picture, and saying it always would make it

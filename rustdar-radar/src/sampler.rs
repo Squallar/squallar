@@ -106,14 +106,15 @@
 //! # Geometry
 //!
 //! All of it comes from [`crate::beam`] — 4/3 earth, quadratic height,
-//! closed-form inverse. The one thing this module adds is that it **applies
-//! the `cos e` slant→ground correction** that `render::render_gate` does not
-//! (that function never even receives an elevation angle). The consequence is
-//! that a section will not register against the plan view above ~2°:
-//! `the_cos_e_correction_diverges_from_the_plan_view_by_a_measured_amount`
-//! pins it at 0.2017 km and 4.0151 km at the two tilts, and converts both to
-//! pixels for the target being built. The section is the correct one; the
-//! divergence is shipped as a measurement, not as a comment.
+//! closed-form inverse. A query here names a **ground** range and this module
+//! converts it to the slant range a gate was measured at, which is the same
+//! `cos e` the plan view's four per-tilt rasterizers apply in the other
+//! direction. The two therefore register at any tilt, which they did not
+//! before the plan view learned the factor: it drew a 19.5° / 70 km gate
+//! 4.0151 km — 17.876 px — further out than a section drawn from here.
+//! `the_cos_e_correction_is_worth_a_measured_number_of_pixels` keeps those
+//! figures, now as the size of the correction rather than as the size of a
+//! disagreement.
 //!
 //! # Status, rather than `NaN`
 //!
@@ -1350,7 +1351,8 @@ impl<'a> VolumeSampler<'a> {
         let Some((lo, hi, fa)) = azimuth_bracket(rung, azimuth) else {
             return Sample::missing(SampleStatus::NoCoverage);
         };
-        // The `cos e` the plan view omits. See the module doc.
+        // The same `cos e` the plan view applies, run backwards: a caller
+        // names ground, a gate is indexed by beam. See the module doc.
         let slant_km = beam::slant_range_for_ground_km(ground_range_km, rung.elevation_deg);
 
         let mut corners = [Sample::missing(SampleStatus::NoCoverage); 4];

@@ -755,6 +755,18 @@ fn a_sweep_with_no_declaration_is_capped_at_a_sane_wedge() {
 const TDWR_GATES: usize = 1390;
 /// Its gate, km. 1390 of them reach 417.
 const TDWR_GATE_KM: f64 = 0.3;
+/// The ground the cut covers, km: its 417 km of beam laid down at the
+/// fixture's own 0.5°.
+///
+/// Not 417. A frame is sized by the ground its sweep covers, and at 0.5° that
+/// is 16 m short of the beam's length — a fortieth of a pixel, and the whole
+/// reason the correction is landable on the WSR-88D fleet. The tests below
+/// pin the ground figure rather than the round one so that a future change
+/// putting slant ranges back on the glass fails here instead of only at 60°.
+fn tdwr_ground_reach_km() -> f64 {
+    417.0 * f64::from(L2_ELEVATION).to_radians().cos()
+}
+
 /// Gates either side of the beacon's own, so the ring is five gates thick —
 /// 1.5 km, three or four pixels at the 2.46 px/km a 417 km frame gives a
 /// 2048-pixel image, which is enough to survive azimuth quantization at every
@@ -868,8 +880,10 @@ fn a_tdwr_long_range_sweep_is_projected_at_its_own_reach() {
         render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, LAT, LON).unwrap();
 
     assert!(
-        (extent_km - 417.0).abs() < 1e-9,
-        "1390 gates of 0.3 km reach 417 km; the render declares {extent_km} km",
+        (extent_km - tdwr_ground_reach_km()).abs() < 1e-9,
+        "1390 gates of 0.3 km on a {L2_ELEVATION}\u{b0} cut cover {:.4} km of \
+         ground; the render declares {extent_km} km",
+        tdwr_ground_reach_km(),
     );
 
     // The beacon, at four bearings, on the frame this render declared. Not on
@@ -912,6 +926,302 @@ fn a_tdwr_long_range_sweep_is_projected_at_its_own_reach() {
         (painted_km - band_edge_km).abs() < 2.0 / px_per_km,
         "the outermost painted column stands {painted_km:.2} km out against a \
          beacon band ending at {band_edge_km:.2} km",
+    );
+}
+
+// ── Where a tilt's gates are drawn ───────────────────────────────────────
+//
+// A gate is measured out along the beam and belongs on the ground under it,
+// and those are the same number only at zero elevation. The renderer used to
+// paint the slant range: harmless on a WSR-88D, whose highest cut is 19.5°
+// and whose worst error is 5.7 %, and not harmless at all on a TDWR, whose
+// VCP 80 climbs to 60° where the slant range is *twice* the ground range.
+//
+// The fixtures below are single-tilt volumes carrying a cut table, because
+// the point of the first test is that the plan view and the 3D sampler put
+// the same echo in the same place — and the sampler builds its ladder by
+// indexing that table with each sweep's `elevation_number`.
+
+/// A single-tilt volume with one reflectivity band a known **slant** range
+/// out and every other gate below threshold.
+///
+/// A band rather than a filled disc for the same reason
+/// [`tdwr_long_range_sweep`] uses one: a disc paints its outermost pixels at
+/// the reach whatever happened inside it, and every question here is about
+/// *where* one return lands.
+fn tilted_beacon_sweep(
+    elevation_deg: f32,
+    gate_km: f64,
+    n_gates: usize,
+    beacon_slant_km: f64,
+    band_gates: usize,
+) -> Scan {
+    use nexrad_model::data::{
+        ChannelConfiguration, ElevationCut, MomentData, PulseWidth, RadialStatus, Sweep,
+        VolumeCoveragePattern, WaveformType,
+    };
+
+    let beacon_gate = (beacon_slant_km / gate_km).round() as usize;
+    let gates: Vec<u8> = (0..n_gates)
+        .map(|g| {
+            if g.abs_diff(beacon_gate) <= band_gates {
+                200
+            } else {
+                0
+            }
+        })
+        .collect();
+    let radials = (0..360)
+        .map(|i| {
+            Radial::new(
+                0,
+                i as u16,
+                i as f32,
+                1.0,
+                RadialStatus::IntermediateRadialData,
+                1,
+                elevation_deg,
+                Some(MomentData::from_fixed_point(
+                    n_gates as u16,
+                    0,
+                    (gate_km * 1000.0) as u16,
+                    8,
+                    SCALE,
+                    OFFSET,
+                    gates.clone(),
+                )),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        })
+        .collect();
+    let cut = ElevationCut::new(
+        f64::from(elevation_deg),
+        ChannelConfiguration::ConstantPhase,
+        WaveformType::CS,
+        20.0,
+        true,
+        true,
+        false,
+        false,
+        1,
+        20,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        false,
+        0,
+        false,
+        0,
+        false,
+        false,
+    );
+    Scan::new(
+        VolumeCoveragePattern::new(
+            80,
+            0,
+            0.5,
+            PulseWidth::Short,
+            false,
+            0,
+            false,
+            0,
+            false,
+            false,
+            0,
+            false,
+            false,
+            vec![cut],
+        ),
+        vec![Sweep::new(1, radials)],
+    )
+}
+
+/// The inner and outer ground radii of a painted ring, km, and the range
+/// halfway between them.
+fn ring_bounds_km(values: &[f32], extent_km: f64) -> (f64, f64, f64) {
+    let ranges = painted_ranges_km(values, extent_km);
+    assert!(!ranges.is_empty(), "the fixture painted nothing at all");
+    let near = ranges.iter().copied().fold(f64::INFINITY, f64::min);
+    let far = ranges.iter().copied().fold(0.0f64, f64::max);
+    (near, far, (near + far) / 2.0)
+}
+
+/// **The plan view and the 3D sampler put the same gate over the same
+/// ground.** A 45° tilt's return at 20 km slant belongs at 14.142 km, and
+/// both renderers now say so.
+///
+/// This is the property the whole correction exists for, and the one the
+/// display could not previously have: the sampler has always applied `cos e`
+/// (`sampler::sample_rung` converts a ground range to a slant one before
+/// reading a gate), sections and voxels are drawn from it, and the plan view
+/// drew the same echo 5.86 km further out. A user comparing a section against
+/// the map above it was comparing two different geometries, and 45° is chosen
+/// because `cos 45° = 1/√2` makes the disagreement impossible to mistake for
+/// rounding.
+///
+/// Both sides are *measured*, not asserted against the same constant: the 2D
+/// ring is read back out of its own pixels through the bounds the render
+/// declared, and the 3D band is found by walking ground ranges past the
+/// sampler until it stops answering.
+#[test]
+fn a_45_degree_sweep_lands_at_the_same_ground_range_in_2d_and_3d() {
+    const ELEV: f32 = 45.0;
+    const SLANT_KM: f64 = 20.0;
+    const GATE_KM: f64 = 0.25;
+    // 20 · cos 45° — the ground under the gate, and what both must agree on.
+    let ground_km = SLANT_KM * f64::from(ELEV).to_radians().cos();
+
+    let scan = tilted_beacon_sweep(ELEV, GATE_KM, 600, SLANT_KM, 2);
+
+    // ── The plan view ──
+    let (_, extent_km, values) = render_radar_to_image(&scan, ELEV, PRODUCT, LAT, LON).unwrap();
+    let px_per_km = types::IMAGE_SIZE as f64 / (2.0 * extent_km);
+
+    assert!(
+        !values[probe_at(extent_km, types::IMAGE_SIZE, 90.0, ground_km)].is_nan(),
+        "the beacon is unpainted at the {ground_km:.3} km of ground it sits over",
+    );
+    assert!(
+        values[probe_at(extent_km, types::IMAGE_SIZE, 90.0, SLANT_KM)].is_nan(),
+        "the beacon is still painted out at its {SLANT_KM} km slant range, \
+         which is 5.86 km past the ground it is over",
+    );
+
+    // ── The 3D sampler, over the same volume ──
+    let sampler = crate::sampler::VolumeSampler::new(&scan, PRODUCT)
+        .expect("a one-cut volume builds a one-rung ladder");
+    let sampled_at = |g: f64| {
+        sampler
+            .column(90.0, g)
+            .rungs()
+            .first()
+            .and_then(|r| r.sample.value())
+            .is_some()
+    };
+    assert!(
+        sampled_at(ground_km),
+        "the sampler does not find the beacon at {ground_km:.3} km of ground",
+    );
+    assert!(
+        !sampled_at(SLANT_KM),
+        "the sampler answers at the slant range, so this fixture proves nothing",
+    );
+
+    // ── And the two bands are the same band ──
+    let (_, _, centre_2d) = ring_bounds_km(&values, extent_km);
+    let mut lo = f64::INFINITY;
+    let mut hi = 0.0f64;
+    for step in 0..2000 {
+        let g = step as f64 * 0.02;
+        if sampled_at(g) {
+            lo = lo.min(g);
+            hi = hi.max(g);
+        }
+    }
+    let centre_3d = (lo + hi) / 2.0;
+    // One gate of tolerance. The two find the band's edges differently — the
+    // raster paints whole gate cells and the sampler interpolates between
+    // gate centres — so their outermost answers legitimately differ by up to
+    // a gate, while their centres cannot.
+    assert!(
+        (centre_2d - centre_3d).abs() < GATE_KM,
+        "the plan view centres the band at {centre_2d:.3} km and the sampler \
+         at {centre_3d:.3} km; they must agree to within one {GATE_KM} km gate",
+    );
+    assert!(
+        (centre_2d - ground_km).abs() < 2.0 / px_per_km,
+        "the painted band centres at {centre_2d:.3} km against {ground_km:.3} \
+         km of ground",
+    );
+}
+
+/// A TDWR's steep tilts halve in radius, which is the headline: `cos 60°` is
+/// exactly 0.5, so a return 24 km out along a VCP 80 hazardous cut is drawn
+/// 12 km from the site.
+///
+/// 592 gates of 150 m is TPIT's Doppler geometry, and 60° is the top of its
+/// VCP 80 ladder. Before this, every one of those tilts painted its echoes at
+/// up to twice their true distance — a storm over the airport drawn out at
+/// the edge of the terminal area.
+#[test]
+fn a_tdwr_steep_tilt_renders_at_half_its_slant_range() {
+    const ELEV: f32 = 60.0;
+    const SLANT_KM: f64 = 24.0;
+    const GATE_KM: f64 = 0.15;
+    let scan = tilted_beacon_sweep(ELEV, GATE_KM, 592, SLANT_KM, 3);
+
+    let (_, extent_km, values) = render_radar_to_image(&scan, ELEV, PRODUCT, LAT, LON).unwrap();
+    let (near, far, centre) = ring_bounds_km(&values, extent_km);
+
+    assert!(
+        (centre - 12.0).abs() < 0.3,
+        "a 24 km gate on a 60° tilt belongs 12.0 km out; the ring measures \
+         {near:.2}..{far:.2} km, centred at {centre:.2}",
+    );
+    // The whole picture, not just the band's centre: nothing is drawn out at
+    // the slant range any more.
+    assert!(
+        far < SLANT_KM * 0.6,
+        "the outermost painted pixel stands {far:.2} km out, which is most of \
+         the way to the {SLANT_KM} km slant range this tilt used to be drawn at",
+    );
+}
+
+/// The reach a render reports is a **ground** reach, so a frame is sized by
+/// the ground it covers rather than by the beam's length.
+///
+/// TPIT's long-range surveillance cut is the one case where this is visible
+/// in the extent rather than absorbed by the 230 km floor: 1390 gates of
+/// 300 m reach 417 km, and at the 0.2637° that cut actually flies they cover
+/// 416.996 km of ground. Small on purpose — the point is that the number is
+/// the ground one, not that it is far off.
+#[test]
+fn a_frame_is_sized_by_the_ground_its_sweep_covers() {
+    const ELEV: f32 = 0.2637;
+    let scan = tilted_beacon_sweep(ELEV, TDWR_GATE_KM, TDWR_GATES, 400.2, TDWR_BEACON_GATES);
+    let (_, extent_km, _) = render_radar_to_image(&scan, ELEV, PRODUCT, LAT, LON).unwrap();
+
+    let expected = 417.0 * f64::from(ELEV).to_radians().cos();
+    assert!(
+        (extent_km - expected).abs() < 1e-9,
+        "1390 gates of 0.3 km on a {ELEV}° cut cover {expected:.4} km of \
+         ground; the render declares {extent_km:.4} km",
+    );
+    assert!(
+        extent_km < 417.0,
+        "the frame is still the beam's length rather than the ground's",
+    );
+}
+
+/// A 0.5° beacon at 200 km moves less than a pixel — the near-invariance
+/// that makes this landable on the WSR-88D fleet.
+///
+/// `1 − cos 0.5°` is 3.8e-5, so 200 km of range moves 7.6 m. At the floor's
+/// 4.45 px/km that is 0.034 of a pixel: every low tilt, which is nearly every
+/// tilt anyone looks at, is where it has always been. The shift only becomes
+/// visible where the geometry makes it real — 0.9 px at 2.4°, 18 px at 19.5°,
+/// and half the radius at a TDWR's 60°.
+#[test]
+fn a_low_tilt_beacon_moves_less_than_a_pixel() {
+    const ELEV: f32 = 0.5;
+    const SLANT_KM: f64 = 200.0;
+    let scan = tilted_beacon_sweep(ELEV, 0.25, 900, SLANT_KM, 2);
+    let (_, extent_km, values) = render_radar_to_image(&scan, ELEV, PRODUCT, LAT, LON).unwrap();
+
+    let (_, _, centre) = ring_bounds_km(&values, extent_km);
+    let px_per_km = types::IMAGE_SIZE as f64 / (2.0 * extent_km);
+    let moved_px = (SLANT_KM - centre) * px_per_km;
+    assert!(
+        moved_px.abs() < 1.0,
+        "a 0.5° beacon at {SLANT_KM} km moved {moved_px:.3} px, to {centre:.3} km",
     );
 }
 
@@ -1706,8 +2016,9 @@ fn a_tdwr_long_range_sweep_takes_the_long_range_raster() {
     );
     assert_eq!(values.len(), LONG_RANGE_SIDE * LONG_RANGE_SIDE);
     assert!(
-        (extent_km - 417.0).abs() < 1e-9,
-        "the extent is the sweep's own reach, not the raster's size: {extent_km}",
+        (extent_km - tdwr_ground_reach_km()).abs() < 1e-9,
+        "the extent is the ground the sweep covers, not the raster's size: \
+         {extent_km}",
     );
 
     for az in [0.0, 90.0, 180.0, 270.0] {
@@ -1822,7 +2133,7 @@ fn a_ceiling_under_the_base_size_renders_a_leaner_picture_of_the_same_ground() {
     assert_eq!(image.len(), LEAN * LEAN * 4);
     assert_eq!(values.len(), LEAN * LEAN);
     assert!(
-        (extent_km - 417.0).abs() < 1e-9,
+        (extent_km - tdwr_ground_reach_km()).abs() < 1e-9,
         "a leaner raster covers the same ground: {extent_km}",
     );
     let at = probe_at(extent_km, LEAN, 90.0, 400.2);

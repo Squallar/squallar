@@ -1378,17 +1378,22 @@ fn a_planted_vertical_wall_reads_at_its_planted_ground_range() {
     );
 }
 
-/// The divergence this module ships as a measurement rather than as a
-/// comment: `render::render_gate` applies **no** `cos e` at all (it never
-/// receives an elevation angle), so a section and the plan view will not
-/// register above ~2°.
+/// What the `cos e` correction is **worth**, shipped as a measurement rather
+/// than as a comment.
+///
+/// Both renderers apply it now — this module has always converted a ground
+/// range to a slant one before reading a gate, and the plan view's four
+/// per-tilt rasterizers hoist the same factor — so these figures are no
+/// longer a disagreement between them. They are how far every echo on those
+/// tilts moved when the plan view started applying it, which is the number a
+/// reader comparing this display against an older screenshot needs.
 ///
 /// The pixel figures are the same on both targets now that `IMAGE_SIZE` is
 /// 2048 everywhere, but they are still derived from the constant and still
 /// pinned per arm: the two arms are separate decisions that happen to agree
 /// (see `types::IMAGE_SIZE`), and a change to either has to come past here.
 #[test]
-fn the_cos_e_correction_diverges_from_the_plan_view_by_a_measured_amount() {
+fn the_cos_e_correction_is_worth_a_measured_number_of_pixels() {
     let cases = [(230.0f64, 2.4f64, 0.2017f64), (70.0, 19.5, 4.0151)];
     for (slant, elev, expected_km) in cases {
         let gap_km = slant - beam::ground_range_km(slant, elev);
@@ -1418,22 +1423,22 @@ fn the_cos_e_correction_diverges_from_the_plan_view_by_a_measured_amount() {
     let high = px(70.0, 19.5);
     assert!(
         (low - expected_low).abs() < 0.01,
-        "at 2.4° / 230 km the section sits {low:.3} px off the plan view \
-             on a {}-pixel image, documented as {expected_low}",
+        "at 2.4° / 230 km the correction is worth {low:.3} px on a \
+             {}-pixel image, documented as {expected_low}",
         crate::types::IMAGE_SIZE,
     );
     assert!(
         (high - expected_high).abs() < 0.01,
-        "at 19.5° / 70 km the section sits {high:.3} px off the plan view \
-             on a {}-pixel image, documented as {expected_high}",
+        "at 19.5° / 70 km the correction is worth {high:.3} px on a \
+             {}-pixel image, documented as {expected_high}",
         crate::types::IMAGE_SIZE,
     );
-    // precondition: the disagreement is invisible at the low tilts, which
-    // is why "above ~2°" is the way it is stated.
+    // precondition: the correction is invisible at the low tilts, which is
+    // what makes it landable on a fleet that mostly flies them.
     assert!(
         px(230.0, 0.5) < 0.2,
-        "the 0.5° divergence is now {:.3} px, so the ~2° threshold in the \
-             module doc is wrong",
+        "the 0.5° correction is now {:.3} px, so the near-invariance the \
+             module doc claims is wrong",
         px(230.0, 0.5),
     );
 }

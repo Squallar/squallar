@@ -7368,7 +7368,7 @@ fn a_rendered_sections_caption_is_calm_and_its_detail_is_one_click_away() {
         "the default caption lost the ladder's own count; it painted {:?}",
         h.painted_text_strings_in(pane)
     );
-    for wall_of_text in ["not measured", "slant range", "widest", "Echoes can sit"] {
+    for wall_of_text in ["not measured", "slant range", "widest", "Echoes sit at"] {
         assert!(
             !h.text_painted_in(pane, wall_of_text),
             "the long-form detail is back in the default caption \
@@ -7392,9 +7392,9 @@ fn a_rendered_sections_caption_is_calm_and_its_detail_is_one_click_away() {
         "4.9",
         // What the reader must not do with the picture.
         "not measured",
-        // And why echoes sit off the map's track, in words about what the
-        // user sees rather than about which renderer is right.
-        "Echoes can sit",
+        // And how this view stands against the map above it, in words about
+        // what the user sees rather than about which renderer is right.
+        "Echoes sit at",
     ] {
         assert!(
             h.text_painted_in(pane, phrase),
@@ -7525,7 +7525,7 @@ fn a_rendered_section_is_the_right_way_up_and_carries_its_ladder() {
             pane.contains(rect.center())
                 && (text.contains("tilts")
                     || text.contains("dotted curves")
-                    || text.contains("Echoes can sit"))
+                    || text.contains("Echoes sit at"))
         })
         .collect();
     assert_eq!(
