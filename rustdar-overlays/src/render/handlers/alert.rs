@@ -136,6 +136,25 @@ impl NwsAlertHandler {
             enabled_categories: enabled,
         }
     }
+
+    /// Whether this alert would paint: its category is on and the user has not
+    /// hidden it. The one filter, so the count, the signature, the status line
+    /// and the clickable set cannot drift apart.
+    fn is_drawn(&self, item: &AlertItem) -> bool {
+        self.enabled_categories.contains(&item.alert.category)
+            && !self.hidden_alerts.contains(&item.alert.id)
+    }
+
+    /// How many alerts would paint — allocation-free, unlike counting
+    /// `clickable_items()`, which builds a `Vec` and an `Arc` per alert for a
+    /// number.
+    fn drawn_count(&self) -> usize {
+        self.state
+            .data
+            .iter()
+            .filter(|item| self.is_drawn(item))
+            .count()
+    }
 }
 
 impl OverlayHandler for NwsAlertHandler {
@@ -184,21 +203,16 @@ impl OverlayHandler for NwsAlertHandler {
     }
 
     /// E.g. `"3 shown - W/Wa/Adv"`: how many alerts would draw, and which
-    /// categories are letting them. Counted directly rather than through
-    /// `clickable_items`, which builds a `Vec` and an `Arc` per alert per call.
+    /// categories are letting them. Counted through [`drawn_count`], not by
+    /// taking the length of `clickable_items`, which builds a `Vec` and an
+    /// `Arc` per alert for a number this reads straight off the data.
+    ///
+    /// [`drawn_count`]: NwsAlertHandler::drawn_count
     fn status_line(&self) -> Option<String> {
         if !self.is_enabled() {
             return None;
         }
-        let shown = self
-            .state
-            .data
-            .iter()
-            .filter(|item| {
-                self.enabled_categories.contains(&item.alert.category)
-                    && !self.hidden_alerts.contains(&item.alert.id)
-            })
-            .count();
+        let shown = self.drawn_count();
         let mut cats = Vec::new();
         for (category, short) in [
             (AlertCategory::Warning, "W"),
@@ -232,9 +246,7 @@ impl OverlayHandler for NwsAlertHandler {
         let mut folded = 0u64;
         let mut visible = 0u64;
         for item in &self.state.data {
-            if self.enabled_categories.contains(&item.alert.category)
-                && !self.hidden_alerts.contains(&item.alert.id)
-            {
+            if self.is_drawn(item) {
                 let mut hasher = DefaultHasher::new();
                 item.alert.id.hash(&mut hasher);
                 folded ^= hasher.finish();
@@ -277,10 +289,7 @@ impl OverlayHandler for NwsAlertHandler {
         self.state
             .data
             .iter()
-            .filter(|item| {
-                self.enabled_categories.contains(&item.alert.category)
-                    && !self.hidden_alerts.contains(&item.alert.id)
-            })
+            .filter(|item| self.is_drawn(item))
             .map(|item| ClickableItem {
                 features: &item.alert.features,
                 item: item.clone() as Arc<dyn OverlayItem>,
@@ -421,7 +430,11 @@ impl OverlayHandler for NwsAlertHandler {
             });
         }
         if self.has_data() {
-            let visible = self.clickable_items().len();
+            // `drawn_count`, not `clickable_items().len()`: the inspector
+            // panel rebuilds its controls every frame it is open, and the old
+            // spelling allocated a `Vec` and an `Arc` per alert to read a
+            // length off it.
+            let visible = self.drawn_count();
             items.push(ControlItem::InfoText {
                 text: format!("{visible} alerts shown"),
             });
@@ -708,6 +721,54 @@ mod tests {
             bare.iter().any(|(k, _)| k == "Severity"),
             "the CAP triple is unconditional — every alert has one"
         );
+    }
+
+    /// The count the inspector reads and the set a click can land on are the
+    /// same set, under every combination of the two filters.
+    ///
+    /// The panel used to say `clickable_items().len()`, which was the same
+    /// number by construction and built a `Vec` and an `Arc` per alert, every
+    /// frame the panel was open, to read a length off it. Now that they are
+    /// two pieces of code they can disagree, so this is the pin that they do
+    /// not.
+    #[test]
+    fn the_shown_count_is_the_clickable_set() {
+        let mut handler = handler_with(vec![
+            alert("a", "Tornado Warning"),
+            alert("b", "Tornado Watch"),
+            alert("c", "Flood Advisory"),
+        ]);
+        let agree = |h: &NwsAlertHandler, expected: usize, why: &str| {
+            assert_eq!(h.drawn_count(), expected, "{why}");
+            assert_eq!(
+                h.drawn_count(),
+                h.clickable_items().len(),
+                "the count and the clickable set disagree: {why}",
+            );
+        };
+
+        agree(
+            &handler,
+            3,
+            "all three categories are on and nothing is hidden",
+        );
+
+        handler.hidden_alerts.insert("b".to_string());
+        agree(
+            &handler,
+            2,
+            "a hidden alert is neither counted nor clickable",
+        );
+
+        handler.enabled_categories.remove(&AlertCategory::Advisory);
+        agree(
+            &handler,
+            1,
+            "a category turned off takes its alerts with it",
+        );
+
+        handler.enabled_categories.clear();
+        agree(&handler, 0, "the whole layer off draws and answers nothing");
     }
 
     /// The fold is order-free: the same set in another order is the same
