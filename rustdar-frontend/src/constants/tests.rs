@@ -1256,6 +1256,59 @@ fn the_grid_dimensions_match_the_shapes_rustdar_radar_names() {
     assert_eq!(VOLUME_LUT_BYTES, LUT_LEN);
 }
 
+/// The shape the frontend **asks** `build_voxels` for is the one this target's
+/// budgets were computed from.
+///
+/// It was not, and nothing here could see it: `voxel_request_for` called
+/// `voxel::default_shape()`, which takes one `is_wasm` bool and so cannot
+/// return `MOBILE_SHAPE` at all. A mobile *native* build therefore budgeted
+/// against `MOBILE_VOLUME_GRID_CELLS` — 3.375 MiB of indices — and requested
+/// `DESKTOP_SHAPE`'s 8 MiB, 2.4× over, on the class least able to afford it.
+///
+/// Routed through [`shape_of`] for the reason `voxel::default_shape_for` and
+/// `mobile_cfg.rs` are: a `cfg`-gated body is invisible to every target that
+/// does not compile it, and this workspace runs `cargo test` on exactly one of
+/// three. All three arms are checked here from any host; what stays unpinned
+/// is only the `cfg` cascade in `VOLUME_GRID_CELLS`, which the test above
+/// covers as far as a host can.
+#[test]
+fn the_requested_shape_is_the_one_this_targets_budget_was_computed_for() {
+    use rustdar_radar::voxel::{DESKTOP_SHAPE, MOBILE_SHAPE, VoxelShape, WASM_SHAPE};
+
+    // The axis order asserted rather than trusted. Every real triple has
+    // `nx == ny`, so an x/y transposition here would be invisible on all
+    // three of them and would only ever surface as a rectangular box drawn
+    // with its axes exchanged.
+    assert_eq!(
+        shape_of([1, 2, 3]),
+        VoxelShape {
+            nx: 1,
+            ny: 2,
+            nz: 3
+        },
+        "VOLUME_GRID_CELLS is x, y, z",
+    );
+
+    assert_eq!(shape_of(WASM_VOLUME_GRID_CELLS), WASM_SHAPE);
+    assert_eq!(shape_of(MOBILE_VOLUME_GRID_CELLS), MOBILE_SHAPE);
+    assert_eq!(shape_of(DESKTOP_VOLUME_GRID_CELLS), DESKTOP_SHAPE);
+
+    #[cfg(target_arch = "wasm32")]
+    assert_eq!(volume_grid_shape(), WASM_SHAPE);
+    #[cfg(all(not(target_arch = "wasm32"), mobile))]
+    assert_eq!(volume_grid_shape(), MOBILE_SHAPE);
+    #[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
+    assert_eq!(volume_grid_shape(), DESKTOP_SHAPE);
+
+    // The cells the grid is *budgeted* at and the cells it is *built* at are
+    // now one number, which is the whole point of deriving one from the other.
+    let shape = volume_grid_shape();
+    assert_eq!(
+        [shape.nx as u32, shape.ny as u32, shape.nz as u32],
+        VOLUME_GRID_CELLS,
+    );
+}
+
 /// The pane mirror's ceiling is the cap squared, four bytes a texel — and the
 /// cap is the one the renderer actually applies.
 ///

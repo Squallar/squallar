@@ -1036,6 +1036,41 @@ pub const VOLUME_GRID_CELLS: [u32; 3] = MOBILE_VOLUME_GRID_CELLS;
 #[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
 pub const VOLUME_GRID_CELLS: [u32; 3] = DESKTOP_VOLUME_GRID_CELLS;
 
+/// A cell triple as the `VoxelShape` a [`rustdar_radar::voxel::VoxelRequest`]
+/// carries.
+///
+/// The axis order is x, y, z — [`VOLUME_GRID_CELLS`]'s own — and
+/// `the_requested_shape_is_the_one_this_targets_budget_was_computed_for`
+/// asserts that mapping on a triple whose three entries differ, because an
+/// index typo here would be invisible on all three real triples: every one of
+/// them has `nx == ny`.
+const fn shape_of(cells: [u32; 3]) -> rustdar_radar::voxel::VoxelShape {
+    rustdar_radar::voxel::VoxelShape {
+        nx: cells[0] as usize,
+        ny: cells[1] as usize,
+        nz: cells[2] as usize,
+    }
+}
+
+/// The grid shape this target should actually **request**.
+///
+/// [`rustdar_radar::voxel::default_shape`] cannot answer this and says so: it
+/// takes one `is_wasm` bool, because `mobile` is emitted by *this* crate's
+/// `build.rs` and `rustdar-radar` cannot see it. So the frontend — the one
+/// crate that can — has to make the selection, and until it did, an Android
+/// build budgeted every allocation against [`MOBILE_VOLUME_GRID_CELLS`]
+/// (3.375 MiB of indices) while `voxel_request_for` asked `build_voxels` for
+/// [`DESKTOP_SHAPE`](rustdar_radar::voxel::DESKTOP_SHAPE)'s 8 MiB — 2.4× the
+/// budget, on the class with the least memory to absorb it.
+///
+/// Derived from [`VOLUME_GRID_CELLS`] rather than from a fourth copy of the
+/// literals, so `the_grid_dimensions_match_the_shapes_rustdar_radar_names`
+/// keeps this tied to the shapes `rustdar-radar` names and a drift fails by
+/// name rather than by a mismatched allocation at runtime.
+pub const fn volume_grid_shape() -> rustdar_radar::voxel::VoxelShape {
+    shape_of(VOLUME_GRID_CELLS)
+}
+
 /// Bytes in the colour lookup table that travels with a voxel grid.
 ///
 /// The grid holds palette indices, so the table is the 256 RGBA entries

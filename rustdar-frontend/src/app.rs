@@ -660,7 +660,11 @@ fn voxel_request_for(
         base_km_msl: rustdar_radar::voxel::DEFAULT_BASE_KM_MSL,
         top_km_msl: rustdar_radar::voxel::DEFAULT_TOP_KM_MSL,
         product: target.product,
-        shape: rustdar_radar::voxel::default_shape(),
+        // `crate::constants`, not `voxel::default_shape()`: that one takes a
+        // single `is_wasm` bool and cannot return `MOBILE_SHAPE`, because
+        // `mobile` is emitted by *this* crate's `build.rs`. Asking it here is
+        // what made an Android build budget 192³ and request 256³.
+        shape: crate::constants::volume_grid_shape(),
         // The raymarch reads indices only. The value plane is four times larger
         // and exists for a hover readout, which a 3D pane does not have yet.
         values_wanted: false,
