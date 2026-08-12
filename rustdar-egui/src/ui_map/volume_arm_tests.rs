@@ -2535,3 +2535,92 @@ fn a_double_tap_drag_zooms_a_3d_panes_ground_without_spinning_its_box() {
         "the double-tap zoom also orbited the box - one gesture, two verbs",
     );
 }
+
+/// A pane nobody is touching asks for the **same box** on every frame, bit for
+/// bit — so the volume it rebuilds every sealed sweep lands on the same
+/// lattice, and the picture's only change is the new data.
+///
+/// # Why this is worth a test of its own
+///
+/// The region is derived, every frame, by unprojecting the pane rect's centre
+/// and four edge midpoints through a fresh `walkers::Projector`. That is `f32`
+/// rect arithmetic feeding `f64` geodesy, and it is *the same* arithmetic
+/// `HALF_WIDTH_STEP_KM` exists to quantise — the half-width would otherwise
+/// wander by metres between frames and make a new resample key out of nothing.
+/// The **centre** carries no such quantiser, so if it wandered at all, every
+/// frame would name a new `VolumeTarget`, every sweep would resample onto a
+/// lattice a fraction of a cell from the last, and a pane left open would
+/// re-shuffle its bands for ever while its owner sat and watched.
+///
+/// It does not wander, and that is a property of stable inputs rather than of
+/// luck or of rounding: the rect and the map memory do not move when nobody
+/// moves them, and the projection is a pure function of those. This test is
+/// what says so, because the alternative is invisible in every other suite —
+/// a wandering centre costs a rebuild, not a wrong picture, and the only
+/// symptom is a warm CPU.
+///
+/// It is also the measurement that decided **not** to anchor the resample
+/// lattice on the radar (see `rustdar_radar::voxel::horizontal_ranges_km`).
+/// Anchoring's one regime with real value would be a pitch ratio of 1, where
+/// snapping two boxes to a shared lattice makes the resampled field identical
+/// rather than merely better aligned. That is exactly the live-rebuild steady
+/// state — and this test shows the steady state already *has* an identical box,
+/// so there is nothing there for anchoring to win.
+#[test]
+fn a_settled_pane_asks_for_one_box_for_ever() {
+    let (mut h, painter) = volume_harness(StubVolumePainter::painting());
+    // Past whatever the map's own entry animation does.
+    h.frames_for(30, FRAME_DT);
+    painter.seen.lock().expect("stub painter mutex").clear();
+
+    h.frames_for(120, FRAME_DT);
+
+    let seen = painter.seen.lock().expect("stub painter mutex");
+    let boxes: Vec<_> = seen.iter().map(|frame| frame.target.region).collect();
+    assert!(
+        boxes.len() >= 100,
+        "precondition: the pane must actually have been asked to paint on \
+         these frames, or this test proves nothing; it was asked {} times",
+        boxes.len(),
+    );
+    let first = boxes[0];
+    assert!(
+        first.is_some(),
+        "precondition: the pane must have a measurable viewport, or every \
+         frame agrees on `None` and the comparison below is vacuous",
+    );
+    let wandered = boxes.iter().filter(|b| **b != first).count();
+    assert_eq!(
+        wandered,
+        0,
+        "{wandered} of {} frames named a different box than the first with no \
+         input at all. Every one of those is a fresh resample key: a new build \
+         per frame, and a volume that lands on a slightly different lattice \
+         every sealed sweep. The half-width is quantised against exactly this; \
+         the centre is not, and relies on the projection being a pure function \
+         of a rect and a map memory that nobody moved.",
+        boxes.len(),
+    );
+    drop(seen);
+
+    // The control, and the reason the assertion above is not vacuous: the same
+    // pane, the same readback, one wheel notch. A box that never changes for
+    // any reason would satisfy the stability check and mean nothing.
+    painter.seen.lock().expect("stub painter mutex").clear();
+    let pane_rect = h.pane_rects()[1];
+    h.scroll_at(pane_rect.center(), egui::vec2(0.0, 8.0));
+    h.frames_for(20, FRAME_DT);
+    let after: Vec<_> = painter
+        .seen
+        .lock()
+        .expect("stub painter mutex")
+        .iter()
+        .map(|frame| frame.target.region)
+        .collect();
+    assert!(
+        after.iter().any(|b| *b != first),
+        "a wheel notch on the pane left the box exactly where it was, so the \
+         stability asserted above is the readback being blind rather than the \
+         viewport being still",
+    );
+}

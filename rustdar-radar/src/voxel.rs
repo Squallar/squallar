@@ -1865,9 +1865,39 @@ struct VoxelRow<'grid> {
 /// signature, and every grid fixture's ranges move — all for a change nobody
 /// can see.
 ///
-/// One camera, one site, one zoom ratio. Anchoring may still matter at ratios
-/// near 1, which is the regime where an isolated half-cell phase change was
-/// worth 21.19 of the same units. That is not the regime a zoom is in.
+/// # And the one regime where it would have paid does not exist
+///
+/// The measurement above is one camera, one site, one 4:1 zoom. The regime
+/// anchoring would genuinely win is a pitch **ratio of 1** — two boxes of the
+/// same width at a sub-cell offset. There it does not merely align the two
+/// lattices, it makes them the same lattice, so the resampled field comes out
+/// identical and the artefact is zero rather than smaller. An isolated
+/// half-cell phase change at equal pitch was worth 21.19 of the units above,
+/// which is the whole reason to look.
+///
+/// That regime is the live rebuild: a 3D pane reseals every volume for as long
+/// as it is open, at the same width, and the box centre is the viewport's,
+/// which nothing quantises — only the half-width is held to
+/// `ui_region::HALF_WIDTH_STEP_KM`. So the fear is that every sweep resamples a
+/// fraction of a cell from the last and the bands re-shuffle under a user who
+/// is not touching anything.
+///
+/// **They do not, because the centre does not move either.** It is unprojected
+/// from the pane rect and the map memory, and both are still when nobody moves
+/// them, so the region comes out bit-identical frame after frame and every
+/// reseal lands on the very same lattice. `rustdar_egui`'s
+/// `a_settled_pane_asks_for_one_box_for_ever` is what says so — 120 input-free
+/// frames naming one box, with a wheel notch beside it as the control that the
+/// readback can see a change at all. There is nothing at ratio 1 for anchoring
+/// to win.
+///
+/// A **pan** does move the centre continuously, and that is the last place
+/// anchoring could have applied. It would hurt there: snapping quantises the
+/// box's ground position to whole cells, so the volume's coverage would lag the
+/// viewport by up to a cell and then jump — against a floor that pans smoothly,
+/// and in flat contradiction of the region *being* the viewport. The
+/// re-colouring it would trade that for is invisible under a gesture that is
+/// already moving the whole picture.
 pub fn horizontal_ranges_km(
     centre: (f64, f64),
     half: HalfExtentKm,
