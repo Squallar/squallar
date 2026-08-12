@@ -2906,12 +2906,15 @@ fn a_taught_position_moves_the_maps_marker_and_not_only_the_data() {
 fn a_volume_this_session_decoded_gives_its_radar_a_height_this_session() {
     use rustdar_radar::sites::Datum;
 
-    // An identifier nothing else in this workspace names, at a position 5000
-    // km from any other fixture, so "the lookup found this radar" cannot be
-    // confused with "the lookup found a neighbour".
+    // An identifier nothing else in this workspace names, at a coordinate no
+    // other test in this binary places a radar near — the site table is
+    // process-wide, and `first_launch_tests` puts one at (-30, -140). The
+    // Southern Ocean, thousands of kilometres from all of them, so "the lookup
+    // found this radar" cannot be confused with "the lookup found a
+    // neighbour".
     const SITE: &str = "ZZQE";
-    const LAT: f32 = -30.0;
-    const LON: f32 = -140.0;
+    const LAT: f32 = -55.0;
+    const LON: f32 = -120.0;
 
     assert!(
         rustdar_radar::sites::get_radar_site(SITE).is_none(),

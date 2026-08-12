@@ -522,16 +522,13 @@ where
         // A member already listed keeps the `&'static str` it was leaked
         // under, so re-reading the same catalogue every launch leaks nothing.
         if let Some(known) = unplaced.iter().find(|listed| **listed == name).copied() {
-            match fix.applied(known, None) {
-                // It was a member and is now placed: one row, and it leaves
-                // the member list.
-                Some(row) => {
-                    unplaced.retain(|listed| *listed != known);
-                    rows.push(row);
-                    changed = true;
-                }
-                // Still only a member. Nothing to do and nothing to leak.
-                None => {}
+            // `Some` means it was a member and is now placed: one row, and it
+            // leaves the member list. `None` means it is still only a member,
+            // which is nothing to do and nothing to leak.
+            if let Some(row) = fix.applied(known, None) {
+                unplaced.retain(|listed| *listed != known);
+                rows.push(row);
+                changed = true;
             }
             continue;
         }
