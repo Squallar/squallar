@@ -627,13 +627,42 @@ fn estimate_nyquist(vel_grid: &[Vec<f64>]) -> f64 {
 /// one bound it.
 const MEDIAN_HALF_WIDTH_KM: f64 = 0.4;
 
-/// Cap on the median filter's azimuthal half-count. Empirical, set against
-/// the reference median's couplet erasure and near-radar couplet amplitudes
-/// (a 5×5 window counted in legacy 1° radials ≈ 9 super-res).
+/// Cap on the median filter's azimuthal half-count. It is what stops
+/// [`MEDIAN_HALF_WIDTH_KM`] from scaling: four-tenths of a kilometre of arc
+/// is three rows at 9 nm and four at 7 nm, and this holds both at two.
 ///
-/// Those amplitudes were not kept. Branch `campaign-harness` has the
-/// generator that paints the couplets and nothing the reference read off
-/// them, so what survives here is a method and not a result.
+/// # The cap is a couplet guard, and a couplet now says so
+///
+/// It was set against the reference median's couplet erasure and near-radar
+/// couplet amplitudes — a 5×5 window counted in legacy 1° radials ≈ 9
+/// super-res — none of which was kept; branch `campaign-harness` has the
+/// generator that paints those couplets and nothing the reference read off
+/// them. So the number stood on a method and not a result.
+///
+/// It now stands on the KFTG 2023-06-22 03:46:11 mesocyclone, which is the
+/// thing the guard is for. Raising the cap erases it:
+///
+/// ```text
+///     cap   KFTG core                     KTLX   KCRP   KDMX   KFTG  KMSX
+///      2    +1.68 +1.50 +1.59 +1.75       1656   5616   2938   1571    34
+///      3    +0.27 +0.40    ND    ND       1282   5355   2875   1460    23
+///      4    +0.27 +0.40    ND    ND       1275   5353   2875   1456    23
+/// ```
+///
+/// against the reference's +1.64 +1.52 +1.56 +1.76. Two of the four core bins
+/// go ND outright and the other two fall to a sixth of what the reference
+/// reads, because a mesocyclone's poles are a few rows apart and a median
+/// seven rows wide outvotes them. KHNX stays at 0 either way and KLOT at 72.
+///
+/// The core alone refuses it, but the precision case for raising it fails
+/// too, and that is worth recording because azimuthal smoothing is the axis
+/// the over-paint measured at [`SIGNIFICANT`] responds to most: against the
+/// reference's own decoded field at KTLX, cap 3 leaves 493 agreeing bins
+/// where cap 2 leaves 661, at a precision of 0.416 against 0.424. It costs
+/// agreement faster than it buys precision. What it does buy is quiet — bins
+/// over |1.0| fall from 3.1× the reference's count on the same ground to
+/// 1.9× — which is the clearest evidence there is both that the over-paint is
+/// a smoothing question and that a median is the wrong instrument for it.
 const MEDIAN_AZ_HALF_MAX: i32 = 2;
 
 /// Half-depth of the median kernel in range gates — deliberately deeper than it
