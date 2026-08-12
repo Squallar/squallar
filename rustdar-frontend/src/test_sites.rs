@@ -48,9 +48,15 @@ use rustdar_radar::sites::SiteFix;
 /// `KTLX` is the answer an automatic pick should reach.
 ///
 /// `TOKC` states one height twice, which is how a TDWR reports itself.
-const SITES: [(&str, i32, i32, i32, i32); 15] = [
+const SITES: [(&str, i32, i32, i32, i32); 17] = [
     ("KTLX", 35_333_060, -97_277_500, 370, 19),
     ("TOKC", 35_276_000, -97_510_000, 386, 386),
+    // Pittsburgh's WSR-88D and the TDWR that shares its metro, which
+    // `only_a_site_with_an_rpg_behind_it_fetches_level3_objects` needs as a
+    // pair: the gate must answer differently for two rows a naive prefix rule
+    // would treat alike.
+    ("KPBZ", 40_531_670, -80_218_060, 361, 30),
+    ("TPIT", 40_501_000, -80_486_000, 366, 366),
     ("KCRI", 35_238_330, -97_460_280, 383, 19),
     ("KINX", 36_175_000, -95_565_000, 204, 30),
     ("KDDC", 37_761_000, -99_969_000, 789, 24),

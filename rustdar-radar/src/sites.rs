@@ -1516,9 +1516,15 @@ pub(crate) mod fixture {
     /// `TOKC` is a TDWR and states one height twice, which is what makes the
     /// set contain a row that cannot answer `Datum::SiteBase` — the shape
     /// `a_row_that_cannot_answer_never_reports_sea_level` exists for.
-    const SITES: [(&str, i32, i32, i32, i32); 9] = [
+    const SITES: [(&str, i32, i32, i32, i32); 12] = [
         ("KTLX", 35_333_060, -97_277_500, 370, 19),
         ("TOKC", 35_276_000, -97_510_000, 386, 386),
+        // Pittsburgh's pair, and San Juan. Between them they are every answer
+        // the `T` prefix rule has to give: a WSR-88D, the TDWR beside it, and
+        // the WSR-88D whose name begins with `T`.
+        ("KPBZ", 40_531_670, -80_218_060, 361, 30),
+        ("TPIT", 40_501_000, -80_486_000, 366, 366),
+        ("TJUA", 18_115_670, -66_078_160, 833, 34),
         ("RKSG", 37_207_570, 127_285_560, 439, 24),
         ("KDGX", 32_280_000, -89_984_000, 151, 34),
         ("KFSX", 34_574_000, -111_198_000, 2261, 29),

@@ -436,6 +436,8 @@ fn the_beamwidth_lookup_answers_per_network() {
         TDWR_HALF_POWER_BEAMWIDTH_DEG, WSR88D_HALF_POWER_BEAMWIDTH_DEG,
         half_power_beamwidth_deg_near,
     };
+    // The rows this resolves through; nothing is compiled in.
+    crate::sites::fixture::install();
     let at = |name: &str| {
         let s = crate::sites::get_radar_site(name).expect("the table carries it");
         half_power_beamwidth_deg_near(s.lat, s.lon)

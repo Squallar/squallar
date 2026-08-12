@@ -45,6 +45,8 @@ fn wsr88d_scan_info() -> ScanInfo {
 
 /// A partial volume's worth of `TPIT`: the cuts a live feed has sealed so far.
 fn tdwr_chunk_scan_info(products: &[(RadarProduct, &[f32])], minute: u32) -> ScanInfo {
+    // Nothing is compiled in, so the row this reads has to be placed first.
+    crate::test_sites::install();
     ScanInfo {
         site: rustdar_radar::sites::get_radar_site(TDWR)
             .expect("TPIT is in the resolved site table")

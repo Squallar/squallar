@@ -470,6 +470,10 @@ fn a_time() -> NaiveDateTime {
 /// integrations that need environmental heights but no RPG.
 #[test]
 fn a_tdwr_volume_offers_only_what_it_can_render() {
+    // `TPIT`'s row, which is what tells `from_scan` this is a terminal radar.
+    // Nothing is compiled in, so a test that did not place it would be handed
+    // `UNKNOWN_SITE_NAME` and offered the whole WSR-88D product list.
+    crate::sites::fixture::install();
     let scan = scan_of(
         90,
         vec![

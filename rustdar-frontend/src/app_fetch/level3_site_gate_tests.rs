@@ -10,6 +10,10 @@ use super::*;
 /// a WSR-88D this build's table predates than a TDWR.
 #[test]
 fn only_a_site_with_an_rpg_behind_it_fetches_level3_objects() {
+    // The rows the gate reads. There is no compiled-in table under them —
+    // see `rustdar_radar::sites::SiteTable` — so a test that did not place
+    // them would find `ZZZZ`'s "not in the table" answer for every row.
+    crate::test_sites::install();
     for (site, offers, why) in [
         (
             "KTLX",
