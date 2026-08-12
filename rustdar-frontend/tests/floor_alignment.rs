@@ -77,7 +77,9 @@
 //! |---|---|---|---|
 //! | `VOL` | yes | — | Uncompressed NEXRAD Level II archive file. |
 //! | `SITE` | no | the identifier the volume's own radials carry | Radar ICAO. |
-//! | `HALF_KM` | no | the app's default box | Box half-width, km. |
+//! | `HALF_KM` | no | the app's default box | Box half-extent, km, on **both** axes. |
+//! | `HALF_E_KM` | no | `HALF_KM` | Box half-extent east–west, km, overriding `HALF_KM` on that axis alone. |
+//! | `HALF_N_KM` | no | `HALF_KM` | Box half-extent north–south, km. Give both axes, or `HALF_KM`, or neither. |
 //! | `THRESH` | no | `15.0` | dBZ cut for the grid's echo mask. |
 //! | `OUT` | no | — | Prefix; writes `_floor.ppm`, `_grid.pgm`, `_overlay.ppm`. |
 //!
@@ -93,7 +95,8 @@
 //! | the same, extent from the sweep | ±458 km, 2048 px | 0.6789 | (−1, +2) texels |
 //! | the same, side from the extent | ±458 km, 4096 px | 0.6883 | (−1, +2) texels |
 //! | the same, gates on the ground | ±458 km, 4096 px | 0.6882 | (−1, +1) texels |
-//! | the same, box square inside the reach | **±458 km, 4096 px** | **0.6601** | (−1, +1) texels |
+//! | the same, box square inside the reach | ±458 km, 4096 px | 0.6601 | (−1, +1) texels |
+//! | the same, box circumscribing the ring | **±458 km, 4096 px** | **0.6572** | (0, +1) texels |
 //!
 //! The first two are the same measurement to within the mask criterion — the
 //! old one asked "does this texel differ from the ground colour", this one asks
@@ -167,19 +170,69 @@
 //! small fraction of the texels. **A TDWR volume is where this row would
 //! move**, and there is no TDWR in this instrument's corpus.
 //!
+//! **The eighth row is the box widening once more, and it is the seventh row's
+//! arithmetic run a second time.** `box_half_width_km` returns the reach
+//! itself now — the box circumscribes the data ring instead of standing
+//! inscribed in it — so this volume's default box is ±460.1 km where the
+//! seventh row was taken at ±325.3, the same √2 again. The probe pitch
+//! coarsens 1.27 → 1.80 km/texel, both masks halve again (floor 19 973 →
+//! 9 964, grid 15 284 → 7 680) and identity IoU falls 0.6601 → 0.6572.
+//!
+//! **What did not move is the registration, and the centroid says so in
+//! kilometres.** +8.5/−4.6 texels at 1.27 km/texel is +10.80/−5.85 km; this
+//! row's +5.8/−2.9 at 1.80 km/texel is +10.42/−5.21 km. The same offset to
+//! within 0.4 and 0.6 km, which is a third of a texel on either probe. The
+//! best translation reading (0, +1) texels where the seventh read (−1, +1) is
+//! that same statement in the coarser unit: the east lane's −1.27 km is now
+//! under half of a 1.80 km texel and rounds to zero, and the north lane's does
+//! not. The flips still fail, by 5× for x and by three orders of magnitude for
+//! the two that mirror v (0.1299 / 0.0006 / 0.0005 against 0.6572).
+//!
+//! **The corner columns say nothing at this box**, and that is a property of
+//! the box rather than of the day. [`Region::far_corner`] is the outer quarter
+//! of each axis, which now begins 230 km out, and this day's mass sits inside
+//! that on every side: all four corners hold zero grid texels where the
+//! ±325.3 km box put 380 of them in the south-west. Read the eighth row's
+//! whole-box and centre columns only.
+//!
+//! **A fixed box re-read, and a residual this file cannot yet account for.**
+//! `HALF_KM=230` on the same binary gives identity 0.6905 where the sixth row
+//! recorded 0.6882, with the grid mask *identical* — 29 252 texels, the same
+//! number — and the floor's up 13, 36 461 → 36 474. So the grid is the sixth
+//! row's exactly and the mirror is not. Two candidates, neither confirmed
+//! here: the site anchor (the sixth row was placed from the compiled-in table
+//! and every row since is placed where the volume says, which moves the
+//! raster's Mercator bounds while leaving a mask taken in box coordinates
+//! alone), and the render's own rework since. The grid staying put under it is
+//! consistent with either, because a 1.80 km cell and a 0.90 km probe texel
+//! are both far coarser than a 0.22 km raster pixel. It is 0.0023 of IoU, it
+//! is written down rather than explained, and nothing in the commit that
+//! recorded it touched either side.
+//!
 //! **The mapping table still does not discriminate on this volume, and neither
 //! the resolution nor the `cos e` asymmetry was why.** Whole-box on the ±325.3
 //! km box: honest 0.6601, trapezoid 0.6649, linear-v 0.6603 — the two
 //! deliberate perturbations score *above* the exact mapping, by +0.0048 and
 //! +0.0002. They did the same at ±230 km on both raster sides: 0.6882 /
 //! 0.6901 / 0.6933 at 4096 px, and +0.0008 / +0.0049 at 2048 px. Three
-//! resolutions and two box sizes have now moved those margins by under 0.006
-//! and never changed their sign, which disposes of the explanation the 2048 row
+//! resolutions and two box sizes moved those margins by under 0.006 without
+//! changing their sign, which disposes of the explanation the 2048 row
 //! carried (that halving the uv rate sank two second-order errors under the
-//! mask noise). Measured directly on the synthetic fixture — the same tree, the
-//! same field, only the side changed — resolution barely moves this instrument
-//! at all: the corner falls are 0.2366 / 0.1610 at 2048 px against 0.2406 /
-//! 0.1648 at 4096.
+//! mask noise).
+//!
+//! **At the ±460.1 km box the sign finally turns over, and the turn is not the
+//! finding.** Honest 0.6572 against trapezoid 0.6567 and linear-v 0.6548 — the
+//! exact mapping leads, by 0.0005 and 0.0024. Three box sizes and two raster
+//! sides have now put every one of these margins inside ±0.005 of zero in both
+//! directions, which is what "the table does not discriminate here" looks like
+//! when it is measured rather than assumed: a margin that changes sign under a
+//! box change is a margin that was never carrying a signal. The rows that *do*
+//! carry one are unmoved — `no cos(lat)` reads 0.3755 against 0.6572 on this
+//! box, and the discrimination this file actually asserts is against the
+//! synthetic fixture, not against this table. Measured directly on that
+//! fixture — the same tree, the same field, only the side changed —
+//! resolution barely moves this instrument at all: the corner falls are
+//! 0.2366 / 0.1610 at 2048 px against 0.2406 / 0.1648 at 4096.
 //!
 //! What is left is the volume. This day's echo is one broad mass in the
 //! south-west — 380 of the box's 15 284 grid texels are in that one eighth at
@@ -863,15 +916,49 @@ fn print_mapping_table(mirror: &Mirror, geo: &BoxGeo, grid_mask: &Mask, regions:
 
 // ── The instrument ───────────────────────────────────────────────────────────
 
+/// The box's half-extent from the environment, or `None` for the box
+/// `build_voxels` sizes from the volume's own reach.
+///
+/// `None` is what a pane with no picked region sends, and it stays the default
+/// so the standing measurement is still one `VOL=` away.
+///
+/// **Two axes rather than one**, because a 3D pane's box is the rectangle of
+/// ground its viewport shows and no longer the square inscribed in it. An
+/// instrument that could only ask for a square could not score the shape the
+/// application actually renders — and the floor covering the box is precisely
+/// the invariant the inscribed square used to protect for free, so a rectangle
+/// is the case now worth measuring.
+///
+/// One axis alone is refused rather than paired with an invented number: the
+/// other axis's honest partner is the default box, which is not known until
+/// `build_voxels` has seen the scan, and quietly substituting a stand-in would
+/// report a shape nobody asked for.
+fn half_extent_from_env() -> Option<rustdar_radar::voxel::HalfExtentKm> {
+    let parsed = |name: &str| -> Option<f64> {
+        std::env::var(name).ok().map(|raw| {
+            raw.trim()
+                .parse()
+                .unwrap_or_else(|e| panic!("{name}={raw:?} does not parse: {e}"))
+        })
+    };
+    let both = parsed("HALF_KM");
+    match (parsed("HALF_E_KM").or(both), parsed("HALF_N_KM").or(both)) {
+        (None, None) => None,
+        (Some(east_km), Some(north_km)) => {
+            Some(rustdar_radar::voxel::HalfExtentKm { east_km, north_km })
+        }
+        _ => panic!(
+            "set both HALF_E_KM and HALF_N_KM, or HALF_KM for a square, or \
+             neither for the volume's own default box",
+        ),
+    }
+}
+
 #[test]
 #[ignore = "reads a Level II volume from VOL; run with --ignored --nocapture"]
 fn measure_floor_against_grid_on_a_real_volume() {
     let vol = std::path::PathBuf::from(std::env::var("VOL").expect("set VOL"));
-    // `None` without `HALF_KM`, which is what a pane with no picked region
-    // sends: `build_voxels` sizes the box from the volume's own reach.
-    let half_km: Option<f64> = std::env::var("HALF_KM")
-        .ok()
-        .map(|s| s.parse().expect("HALF_KM must be a number"));
+    let half_extent = half_extent_from_env();
     let thresh: f32 = std::env::var("THRESH")
         .ok()
         .map(|s| s.parse().expect("THRESH must be a number"))
@@ -887,7 +974,7 @@ fn measure_floor_against_grid_on_a_real_volume() {
     // The grid, exactly as `handle_prepare_volume` requests the default box.
     let request = rustdar_radar::voxel::VoxelRequest {
         centre: (site_lat, site_lon),
-        half_extent_km: half_km.map(rustdar_radar::voxel::HalfExtentKm::square),
+        half_extent_km: half_extent,
         base_km_msl: rustdar_radar::voxel::DEFAULT_BASE_KM_MSL,
         top_km_msl: rustdar_radar::voxel::DEFAULT_TOP_KM_MSL,
         product: RadarProduct::Reflectivity,
@@ -925,13 +1012,29 @@ fn measure_floor_against_grid_on_a_real_volume() {
     let (x0, x1) = grid.x_range_km();
     let (y0, y1) = grid.y_range_km();
     let shape = grid.shape();
-    let km_per_texel = (x1 - x0) / side as f64;
+    // **Per axis.** The probe lattice is a fixed `PROBE_TEXELS`² over whatever
+    // the box footprint is, so on a rectangular box a texel is not square on
+    // the ground and one number cannot convert both lanes of a translation.
+    // Reading the east rate onto the north lane is how a rectangle would report
+    // a registration error it does not have.
+    let km_per_texel_x = (x1 - x0) / side as f64;
+    let km_per_texel_y = (y1 - y0) / side as f64;
     println!("volume: {}", vol.display());
     // The position is the volume's own, not a table's — see `live_volume`.
     println!("site: {icao} at {site_lat:.5}, {site_lon:.5}, as this volume states it");
     println!(
-        "box: x {:.1}..{:.1} km, y {:.1}..{:.1} km ({:.3} km/texel), grid {}x{}x{}",
-        x0, x1, y0, y1, km_per_texel, shape.nx, shape.ny, shape.nz,
+        "box: x {:.1}..{:.1} km, y {:.1}..{:.1} km ({:.3} x {:.3} km/texel, \
+         {:.4}:1 east:north), grid {}x{}x{}",
+        x0,
+        x1,
+        y0,
+        y1,
+        km_per_texel_x,
+        km_per_texel_y,
+        (x1 - x0) / (y1 - y0),
+        shape.nx,
+        shape.ny,
+        shape.nz,
     );
     println!(
         "mirror: {raster_side}x{raster_side} px, site at u {:.4} v {:.4}, \
@@ -960,8 +1063,8 @@ fn measure_floor_against_grid_on_a_real_volume() {
     let ((dx, dy), at_best) = best_translation(&grid_mask, &floor.mask, 96, 4);
     println!(
         "best translation: ({dx}, {dy}) texels = ({:.2}, {:.2}) km east/south, IoU {at_best:.4}",
-        dx as f64 * km_per_texel,
-        dy as f64 * km_per_texel,
+        dx as f64 * km_per_texel_x,
+        dy as f64 * km_per_texel_y,
     );
     if let (Some(gc), Some(fc)) = (grid_mask.centroid(), floor.mask.centroid()) {
         println!(
