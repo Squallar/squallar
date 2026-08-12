@@ -45,18 +45,32 @@ fn raster(seed: u8) -> Arc<egui::ColorImage> {
     ))
 }
 
-/// Aim a pane at [`SITE`] showing `product` at [`TILT`], far enough along that
+/// Aim a pane at `site` showing `product` at [`TILT`], far enough along that
 /// the broadcast will accept it and `apply_render_to_pane` will not bail out.
 fn point_at(app: &mut crate::app::App, pane_idx: usize, site: &str, product: RadarProduct) {
+    point_at_tilts(app, pane_idx, site, product, &[TILT]);
+}
+
+/// As [`point_at`], but with a volume offering more than one tilt — which is
+/// what makes a tilt change reachable at all, since
+/// `PaneState::get_rendering_params` snaps the selection onto a tilt the scan
+/// actually carries.
+fn point_at_tilts(
+    app: &mut crate::app::App,
+    pane_idx: usize,
+    site: &str,
+    product: RadarProduct,
+    tilts: &[f32],
+) {
     let radar = rustdar_radar::sites::get_radar_site(site)
         .unwrap_or_else(|| panic!("{site} is a real radar"))
         .clone();
     let mut product_elevations = std::collections::HashMap::new();
-    product_elevations.insert(product, vec![TILT]);
+    product_elevations.insert(product, tilts.to_vec());
     let pane = app.gui.pane_mut(pane_idx).expect("pane exists");
     pane.site = site.to_string();
     pane.selected_product = product;
-    pane.selected_elevation = TILT;
+    pane.selected_elevation = tilts[0];
     app.gui.set_scan_info_for_pane(
         pane_idx,
         rustdar_radar::types::ScanInfo {
@@ -83,7 +97,19 @@ fn deliver(
     product: RadarProduct,
     image: Arc<egui::ColorImage>,
 ) {
-    post(app, pane_idx, product, TILT, image);
+    deliver_at(app, ctx, pane_idx, product, TILT, image);
+}
+
+/// As [`deliver`], at a tilt the caller names.
+fn deliver_at(
+    app: &mut crate::app::App,
+    ctx: &egui::Context,
+    pane_idx: usize,
+    product: RadarProduct,
+    elevation: f32,
+    image: Arc<egui::ColorImage>,
+) {
+    post(app, pane_idx, product, elevation, image);
     app.poll_render_results(ctx);
 }
 
@@ -337,4 +363,129 @@ fn a_resume_puts_four_panes_back_with_one_upload() {
             "pane {pane_idx} came back from the resume with a texture of its own"
         );
     }
+}
+
+/// The four products whose plan view is the same picture at every tilt, read
+/// off the predicate rather than restated — `render_cache_tests` is where that
+/// list is pinned against the renderer's own dispatch, and a second copy here
+/// would be a second thing to keep in step.
+fn tilt_independent() -> Vec<RadarProduct> {
+    RadarProduct::all()
+        .iter()
+        .copied()
+        .filter(|p| p.tilt_independent_plan_view())
+        .collect()
+}
+
+/// What a pane's radar texture says it depicts.
+fn stamped_elevation(app: &mut crate::app::App, pane_idx: usize) -> f32 {
+    app.gui
+        .pane_mut(pane_idx)
+        .expect("pane exists")
+        .overlay_cache_mut(OverlayKind::Radar)
+        .current
+        .as_ref()
+        .expect("this pane was served a radar texture")
+        .radar_meta
+        .as_ref()
+        .expect("a radar texture describes itself")
+        .elevation
+}
+
+/// Clicking to another tilt on a tilt-independent pane costs no upload — and
+/// still moves the label.
+///
+/// `render_cache_key` collapses these four onto `NO_ELEVATION_SLOT`, so the
+/// dispatch pass finds the render already there. But `needs_render` compares
+/// the raw elevation and is still true, so `apply_render_to_pane` ran anyway
+/// and put the whole raster back on the GPU to redraw a picture provably
+/// already on it.
+///
+/// The last assertion is the half that makes the first safe:
+/// `PaneState::stale_image_on_screen` reads `RadarTextureMeta::elevation` and
+/// nothing else, so an upload skipped without the restamp would leave the pane
+/// disowning its own correct picture for as long as it showed it.
+#[test]
+fn a_tilt_click_on_a_tilt_independent_pane_reuploads_nothing() {
+    let products = tilt_independent();
+    assert!(
+        !products.is_empty(),
+        "precondition: there are tilt-independent products to test"
+    );
+    for product in products {
+        let ctx = egui::Context::default();
+        let mut app = n_pane_app(1, SITE);
+        point_at_tilts(&mut app, 0, SITE, product, &[TILT, 3.4]);
+        deliver(&mut app, &ctx, 0, product, raster(5));
+        let before = placed(&mut app, 0);
+        assert_eq!(stamped_elevation(&mut app, 0), TILT, "{product:?}");
+        let _ = drain_uploads(&ctx);
+
+        app.gui.pane_mut(0).expect("pane exists").selected_elevation = 3.4;
+        app.dispatch_pane_renders(&ctx);
+
+        assert!(
+            drain_uploads(&ctx).is_empty(),
+            "{product:?}: a tilt click re-uploaded the whole raster. The cache \
+             collapses this product onto one slot, so the buffer handed back is \
+             the buffer already on the GPU.",
+        );
+        assert_eq!(
+            placed(&mut app, 0),
+            before,
+            "{product:?}: the pane swapped textures without uploading one"
+        );
+        assert_eq!(
+            stamped_elevation(&mut app, 0),
+            3.4,
+            "{product:?}: the picture stayed and its label did not follow, so \
+             `stale_image_on_screen` now disowns a correct image",
+        );
+    }
+}
+
+/// The control: a pane handed genuinely different pixels still uploads them,
+/// and retires the texture it was showing.
+///
+/// Buffer identity is what the skip is keyed on, and this is the case that must
+/// not be caught by it. A skip keyed on anything coarser — the product, the
+/// pane, "this pane already has a texture" — passes the test above and freezes
+/// the map here.
+#[test]
+fn a_pane_handed_a_different_raster_uploads_it() {
+    let ctx = egui::Context::default();
+    let mut app = n_pane_app(1, SITE);
+    point_at_tilts(&mut app, 0, SITE, RadarProduct::Reflectivity, &[TILT, 3.4]);
+
+    deliver(&mut app, &ctx, 0, RadarProduct::Reflectivity, raster(1));
+    let first = placed(&mut app, 0);
+    let _ = drain_uploads(&ctx);
+
+    let second_raster = raster(2);
+    app.gui.pane_mut(0).expect("pane exists").selected_elevation = 3.4;
+    deliver_at(
+        &mut app,
+        &ctx,
+        0,
+        RadarProduct::Reflectivity,
+        3.4,
+        Arc::clone(&second_raster),
+    );
+
+    let uploads = drain_uploads(&ctx);
+    assert_eq!(uploads.len(), 1, "a new sweep must reach the GPU");
+    assert_eq!(
+        uploads[0].pixels, second_raster.pixels,
+        "the pane uploaded something other than the sweep it was given"
+    );
+    assert_ne!(
+        placed(&mut app, 0),
+        first,
+        "the pane is still drawing the previous sweep's texture"
+    );
+    assert!(
+        app.old_textures.iter().any(|t| t.id() == first),
+        "the replaced texture was not retired through `old_textures`, so it is \
+         dropped while the GPU may still be reading it"
+    );
 }

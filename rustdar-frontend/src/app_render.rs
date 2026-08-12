@@ -462,14 +462,56 @@ impl super::App {
             (scan_info.site.lat, scan_info.site.lon)
         };
 
-        // Clean up old radar overlay texture
+        // Whether the picture being applied is the picture already on this
+        // pane — the *same buffer*, not a buffer that compares equal.
+        //
+        // `cached_render.image` is the `Arc` this pane's live texture was
+        // uploaded from, and the two are only ever written together: here, and
+        // in `restore_cached_render`. Everything that invalidates one clears the
+        // other or clears `current` outright (`clear_graphics_state`,
+        // `dispatch_pane_renders`' no-scan arm, `reset_panes*`), so a `true`
+        // here means the pixels on the GPU are these pixels.
+        //
+        // # The case this exists for
+        //
+        // The four products `RadarProduct::tilt_independent_plan_view` names
+        // draw the same picture at every tilt, and `render_cache_key` collapses
+        // them onto `NO_ELEVATION_SLOT` for exactly that reason. So a tilt click
+        // on one of those panes is a cache **hit** — and `needs_render` is still
+        // true, because it compares the raw elevation — which put the whole
+        // 16 MiB back on the GPU to redraw a picture that was already on it.
+        // Only `RadarTextureMeta::elevation` genuinely had to move, and it still
+        // does: the rest of this function runs unchanged, so the pane is
+        // re-described even though it is not re-uploaded. That matters rather
+        // than being tidy — `PaneState::stale_image_on_screen` reads that field
+        // and nothing else, so a pane whose upload was skipped without the
+        // restamp would disown its own correct picture for good.
+        //
+        // Stated as buffer identity rather than as the tilt predicate because
+        // the predicate is one instance of it. Any cache hit that hands a pane
+        // back the raster it is already showing is the same waste, and this
+        // needs no second list to stay in step with the first.
+        let already_on_screen = self
+            .render
+            .pane_render
+            .get(pane_idx)
+            .and_then(|prs| prs.cached_render.as_ref())
+            .is_some_and(|cached| Arc::ptr_eq(&cached.image, &render.image));
+
+        // Clean up old radar overlay texture — unless it is the one about to go
+        // back, in which case it is kept rather than retired and re-uploaded.
         let Some(pane) = self.gui.pane_mut(pane_idx) else {
             return;
         };
         let cache = pane.overlay_cache_mut(OverlayKind::Radar);
-        if let Some(old) = cache.current.take() {
-            self.old_textures.push(old.texture);
-        }
+        let retained = match cache.current.take() {
+            Some(old) if already_on_screen => Some(old.texture),
+            Some(old) => {
+                self.old_textures.push(old.texture);
+                None
+            }
+            None => None,
+        };
 
         // The picture's own dimensions, not a constant: a sweep reaching past
         // the floor is a wider raster, and the texture, the overlay entry and
@@ -477,16 +519,22 @@ impl super::App {
         // refused anything that is not a size this build makes, so there is
         // nothing left here to validate.
         let side = render.image.width();
-        let texture = {
-            let counter = &mut self.texture_counter;
-            uploads.handle(&render.image, || {
-                *counter += 1;
-                ctx.load_texture(
-                    format!("radar_image_{counter}"),
-                    Arc::clone(&render.image),
-                    egui::TextureOptions::NEAREST,
-                )
-            })
+        let texture = match retained {
+            // The pane's own handle, preferred over anything `uploads` may hold
+            // for the same raster: taking the memo's instead would drop this one
+            // mid-frame, which is the drop `old_textures` exists to defer.
+            Some(texture) => texture,
+            None => {
+                let counter = &mut self.texture_counter;
+                uploads.handle(&render.image, || {
+                    *counter += 1;
+                    ctx.load_texture(
+                        format!("radar_image_{counter}"),
+                        Arc::clone(&render.image),
+                        egui::TextureOptions::NEAREST,
+                    )
+                })
+            }
         };
 
         // Cache the pixels for fast restore after suspend/resume
