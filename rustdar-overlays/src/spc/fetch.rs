@@ -15,6 +15,7 @@ use rustdar_radar::sources::DataSources;
 
 use super::discussion::{SpcDiscussion, parse_md_rss};
 use super::outlook::{OutlookDay, OutlookProduct, SpcOutlook, outlook_url, parse_geojson};
+use crate::fetch_policy::{FetchError, NotFound};
 
 const SPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -32,66 +33,71 @@ fn md_rss_url(sources: &DataSources) -> String {
     format!("{}/products/spcmdrss.xml", sources.spc_base)
 }
 
+/// A 404 here is **routine**: SPC takes an outlook down when it expires, and
+/// there is no Day 4-8 probabilistic product up at every hour of the day. The
+/// layer must read that as "not published right now" rather than as a fault it
+/// should retry — see [`NotFound`].
 pub async fn fetch_outlook(
     client: &reqwest::Client,
     sources: &DataSources,
     day: OutlookDay,
     product: OutlookProduct,
-) -> Result<SpcOutlook, String> {
+) -> Result<SpcOutlook, FetchError> {
     let url = outlook_url(sources, day, product);
     log::info!("Fetching SPC outlook: {}", url);
 
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("HTTP request failed for {}: {}", url, e))?;
+    let response = client.get(&url).send().await.map_err(|e| {
+        FetchError::from_transport(&e, format!("HTTP request failed for {url}: {e}"))
+    })?;
 
     if !response.status().is_success() {
-        return Err(format!(
-            "SPC returned HTTP {} for {}",
+        return Err(FetchError::from_status(
             response.status(),
-            url
+            NotFound::IsRoutine,
+            format!("SPC returned HTTP {} for {url}", response.status()),
         ));
     }
 
-    let text = response
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read response body: {}", e))?;
+    let text = response.text().await.map_err(|e| {
+        FetchError::from_transport(&e, format!("Failed to read response body: {e}"))
+    })?;
 
-    let json: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| format!("Invalid JSON from {}: {}", url, e))?;
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| FetchError::transient(format!("Invalid JSON from {url}: {e}")))?;
 
-    parse_geojson(&json, day, product)
+    parse_geojson(&json, day, product).map_err(FetchError::transient)
 }
 
+/// A 404 here is **broken**, not routine: `spcmdrss.xml` is a standing feed, so
+/// its absence means the path moved rather than that no discussion is active.
+/// An active-MD-free day still serves the feed, with no `<item>` elements — the
+/// empty-versus-unreachable distinction the panel draws is made there, not by a
+/// missing file.
 pub async fn fetch_active_discussions(
     client: &reqwest::Client,
     sources: &DataSources,
-) -> Result<Vec<SpcDiscussion>, String> {
+) -> Result<Vec<SpcDiscussion>, FetchError> {
     let url = md_rss_url(sources);
     log::info!("Fetching SPC Mesoscale Discussions from {url}");
 
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("SPC MD RSS request failed: {}", e))?;
+    let response =
+        client.get(&url).send().await.map_err(|e| {
+            FetchError::from_transport(&e, format!("SPC MD RSS request failed: {e}"))
+        })?;
 
     if !response.status().is_success() {
-        return Err(format!(
-            "SPC returned HTTP {} for MD RSS feed",
-            response.status()
+        return Err(FetchError::from_status(
+            response.status(),
+            NotFound::IsBroken,
+            format!("SPC returned HTTP {} for MD RSS feed", response.status()),
         ));
     }
 
-    let text = response
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read SPC MD RSS body: {}", e))?;
+    let text = response.text().await.map_err(|e| {
+        FetchError::from_transport(&e, format!("Failed to read SPC MD RSS body: {e}"))
+    })?;
 
-    parse_md_rss(&text)
+    parse_md_rss(&text).map_err(FetchError::transient)
 }
 
 #[cfg(test)]

@@ -17,7 +17,7 @@ use crate::types::GeoBounds;
 pub(crate) struct SpcOutlookFetchResult {
     pub day: OutlookDay,
     pub product: OutlookProduct,
-    pub result: Result<SpcOutlook, String>,
+    pub result: Result<SpcOutlook, crate::fetch_policy::FetchError>,
 }
 
 #[derive(Debug)]
@@ -206,6 +206,14 @@ impl OverlayHandler for SpcOutlookHandler {
         self.state.fetching = fetching;
     }
 
+    fn retry(&self) -> Option<&crate::fetch_policy::FetchRetry> {
+        Some(&self.state.retry)
+    }
+
+    fn retry_mut(&mut self) -> Option<&mut crate::fetch_policy::FetchRetry> {
+        Some(&mut self.state.retry)
+    }
+
     fn fetch_time(&self) -> Option<web_time::Instant> {
         self.state.fetch_time
     }
@@ -246,7 +254,7 @@ impl OverlayHandler for SpcOutlookHandler {
             Ok(outlook) => {
                 log::info!("Received SPC outlook: {:?} {:?}", fetch.day, fetch.product);
                 self.state.data.insert((fetch.day, fetch.product), outlook);
-                self.state.fetch_time = Some(web_time::Instant::now());
+                self.state.record_success();
                 let counter = self
                     .per_product_generation
                     .entry((fetch.day, fetch.product))
@@ -260,9 +268,9 @@ impl OverlayHandler for SpcOutlookHandler {
                     fetch.product,
                     e
                 );
+                self.state.record_failure(&e);
             }
         }
-        self.state.fetching = false;
     }
 
     fn retain_selections(&self, _selections: &mut Vec<Arc<dyn OverlayItem>>) {
@@ -321,9 +329,7 @@ impl OverlayHandler for SpcOutlookHandler {
                     kind: OverlayKind::SpcOutlook,
                     future: Box::pin(async move {
                         let result =
-                            crate::spc::fetch::fetch_outlook(&client, &sources, day, product)
-                                .await
-                                .map_err(|e| e.to_string());
+                            crate::spc::fetch::fetch_outlook(&client, &sources, day, product).await;
                         Box::new(SpcOutlookFetchResult {
                             day,
                             product,

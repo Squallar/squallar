@@ -82,6 +82,14 @@ impl OverlayHandler for ModelDataHandler {
         self.state.fetching = fetching;
     }
 
+    fn retry(&self) -> Option<&crate::fetch_policy::FetchRetry> {
+        Some(&self.state.retry)
+    }
+
+    fn retry_mut(&mut self) -> Option<&mut crate::fetch_policy::FetchRetry> {
+        Some(&mut self.state.retry)
+    }
+
     fn fetch_time(&self) -> Option<web_time::Instant> {
         self.state.fetch_time
     }
@@ -127,10 +135,14 @@ impl OverlayHandler for ModelDataHandler {
             }
             Err(e) => {
                 log::error!("HRRR fetch failed: {e}");
+                // An index fetch, a range fetch and a GRIB2 decode behind one
+                // result; the outer error is "this forecast hour did not
+                // arrive", which another run can fix.
+                self.state
+                    .record_failure(&crate::fetch_policy::FetchError::transient(e.clone()));
                 self.last_error = Some(e);
             }
         }
-        self.state.fetching = false;
     }
 
     fn retain_selections(

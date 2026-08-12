@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use rustdar_units::UserPreferences;
 
+use crate::fetch_policy::{FetchError, FetchFailure, FetchHealth, FetchRetry};
 use crate::render::controls::{
     ControlEffect, ControlItem, ControlUpdate, PaneControlContext, PaneControlContextMut,
 };
@@ -29,9 +30,14 @@ pub struct OverlayLegend {
 /// Fetch-cache-generation lifecycle shared by every overlay type.
 pub struct OverlayState<T> {
     pub data: T,
+    /// Stamped on a **good answer only**. Was the sole input to "is a fetch
+    /// due?", which is what made a failing layer due on every frame — see
+    /// [`crate::fetch_policy`]. `retry` is the other half of that decision now.
     pub fetch_time: Option<web_time::Instant>,
     pub fetching: bool,
     pub data_generation: u64,
+    /// What the last fetch did, and what the next automatic one may do.
+    pub retry: FetchRetry,
 }
 
 impl<T: Default> Default for OverlayState<T> {
@@ -41,6 +47,7 @@ impl<T: Default> Default for OverlayState<T> {
             fetch_time: None,
             fetching: false,
             data_generation: 0,
+            retry: FetchRetry::new(),
         }
     }
 }
@@ -53,19 +60,50 @@ impl<T: Default> OverlayState<T> {
 
 impl<T> OverlayState<T> {
     /// Bumps `data_generation`, which is what invalidates cached textures.
+    ///
+    /// Also ends the fetch and clears the retry ladder: this **is** the good
+    /// answer, and a handler should not have to remember to say so three times.
     pub fn set_data(&mut self, data: T) {
         self.data = data;
         self.fetch_time = Some(web_time::Instant::now());
         self.data_generation = self.data_generation.wrapping_add(1);
+        self.fetching = false;
+        self.retry.record_success();
     }
 
-    /// True when nothing has been fetched yet, **or** `interval_secs` has
-    /// elapsed since the last fetch. The second branch is how every
-    /// auto-polling overlay refreshes.
-    pub fn needs_refresh(&self, interval_secs: u64) -> bool {
-        self.fetch_time
-            .is_none_or(|t| t.elapsed().as_secs() >= interval_secs)
+    /// A good answer that replaced no data — the outlook handler stamps its own
+    /// map rather than going through [`set_data`](Self::set_data).
+    pub fn record_success(&mut self) {
+        self.fetch_time = Some(web_time::Instant::now());
+        self.fetching = false;
+        self.retry.record_success();
     }
+
+    /// End a fetch that did not produce data, filing it against the ladder.
+    ///
+    /// The counterpart to [`set_data`](Self::set_data), and the reason a
+    /// handler's error branch can no longer leave the layer due on the next
+    /// frame: this is the only way to clear `fetching` after a failure, and it
+    /// records the failure in the same move.
+    ///
+    /// [`set_data`]: Self::set_data
+    pub fn record_failure(&mut self, error: &FetchError) {
+        self.fetching = false;
+        self.retry.record_failure(error);
+        // An `Absent` answer is an answer: it stamps the clock, so the layer
+        // goes back to its ordinary interval instead of being permanently due.
+        if error.failure == FetchFailure::Absent {
+            self.fetch_time = Some(web_time::Instant::now());
+        }
+    }
+
+    // `needs_refresh(interval)` used to live here — `fetch_time.is_none_or(|t|
+    // t.elapsed() >= interval)`, documented as "how every auto-polling overlay
+    // refreshes". It had no callers, and that rule is exactly the storm: a
+    // failure never stamps `fetch_time`, so it answers true on every frame
+    // forever. Removed rather than left as a correct-looking helper for the
+    // next person to reach for; the rule that replaced it is
+    // `OverlayHandler::auto_fetch_delay`.
 }
 
 /// The draw loop dispatches on this rather than matching `OverlayKind`.
@@ -168,6 +206,62 @@ pub trait OverlayHandler: Send {
     /// Seconds. `None` means this overlay never auto-polls.
     fn auto_poll_interval(&self) -> Option<u64> {
         None
+    }
+
+    /// This layer's retry ledger; `None` for a handler that never fetches.
+    ///
+    /// Every fetching handler returns `Some(&self.state.retry)`. A handler that
+    /// answers `None` while declaring an [`auto_poll_interval`] gets the old
+    /// behaviour back — which is why `every_auto_polling_handler_keeps_a_retry_ledger`
+    /// fails if a new one forgets.
+    ///
+    /// [`auto_poll_interval`]: OverlayHandler::auto_poll_interval
+    fn retry(&self) -> Option<&FetchRetry> {
+        None
+    }
+
+    fn retry_mut(&mut self) -> Option<&mut FetchRetry> {
+        None
+    }
+
+    /// How long until an **automatic** fetch of this layer may start; `None`
+    /// when one never may.
+    ///
+    /// The single expression of the poll gate. `Gui::check_auto_polls` fires
+    /// when this reads zero and `Gui::overlay_poll_delay` sleeps on it, so the
+    /// schedule and the firing cannot disagree — they used to be two separate
+    /// readings of `fetch_time`, one in whole seconds and one in durations.
+    ///
+    /// Two terms, whichever is later:
+    ///
+    /// - the **poll clock**, `fetch_time + interval`, which is what a healthy
+    ///   layer runs on; and
+    /// - the **backoff**, from [`crate::fetch_policy`], which is zero unless
+    ///   something has failed.
+    ///
+    /// At the ladder's ceiling the two coincide by construction, because the
+    /// ceiling *is* the interval.
+    ///
+    /// `None` for: a layer that does not auto-poll, one whose fetch is already
+    /// in flight (what ends the wait is the result landing, which asks for its
+    /// own frame), and one recorded [`broken`](FetchRetry::is_broken) — the
+    /// last being the difference between "say so in the state" and "retry
+    /// forever at a slow cadence".
+    fn auto_fetch_delay(&self) -> Option<std::time::Duration> {
+        let interval = std::time::Duration::from_secs(self.auto_poll_interval()?);
+        if self.is_fetching() {
+            return None;
+        }
+        let retry = self.retry();
+        if retry.is_some_and(FetchRetry::is_broken) {
+            return None;
+        }
+        // Never fetched and nothing on record: due now.
+        let by_clock = self.fetch_time().map_or(std::time::Duration::ZERO, |t| {
+            interval.saturating_sub(t.elapsed())
+        });
+        let by_backoff = retry.map_or(std::time::Duration::ZERO, |r| r.backoff_remaining(interval));
+        Some(by_clock.max(by_backoff))
     }
 
     fn item_count(&self) -> usize {
@@ -495,6 +589,27 @@ impl OverlayRegistry {
         )))
     }
 
+    /// The SPC MD payload for a fetch that **failed**, exactly as the network
+    /// path would deliver it. The counterpart to [`spc_discussions_payload`],
+    /// and what lets a test drive real failing frames through the real ingest
+    /// path rather than poking the ledger directly.
+    ///
+    /// [`spc_discussions_payload`]: OverlayRegistry::spc_discussions_payload
+    #[doc(hidden)]
+    pub fn spc_discussions_failure_payload(error: FetchError) -> FetchPayload {
+        Box::new(super::handlers::discussion::SpcDiscussionFetchResult(Err(
+            error,
+        )))
+    }
+
+    /// Age `kind`'s retry ledger — see [`FetchRetry::rewind`].
+    #[doc(hidden)]
+    pub fn rewind_retry(&mut self, kind: OverlayKind, by: std::time::Duration) {
+        if let Some(r) = self.handler_mut(kind).and_then(|h| h.retry_mut()) {
+            r.rewind(by);
+        }
+    }
+
     pub fn has_data(&self, kind: OverlayKind) -> bool {
         self.handler(kind).is_some_and(|h| h.has_data())
     }
@@ -515,6 +630,43 @@ impl OverlayRegistry {
 
     pub fn auto_poll_interval(&self, kind: OverlayKind) -> Option<u64> {
         self.handler(kind).and_then(|h| h.auto_poll_interval())
+    }
+
+    /// [`OverlayHandler::auto_fetch_delay`] for `kind` — the one gate the
+    /// automatic poll consults, and the only caller that may.
+    pub fn auto_fetch_delay(&self, kind: OverlayKind) -> Option<std::time::Duration> {
+        self.handler(kind).and_then(|h| h.auto_fetch_delay())
+    }
+
+    /// Wipe `kind`'s retry ledger because the **user** asked for a fetch.
+    ///
+    /// Called from `push_user_overlay_fetch` and nowhere else, so that "a user
+    /// action is never made to wait out a backoff" holds by construction.
+    pub fn clear_retry(&mut self, kind: OverlayKind) {
+        if let Some(r) = self.handler_mut(kind).and_then(|h| h.retry_mut()) {
+            r.clear();
+        }
+    }
+
+    /// File a failure against `kind`'s ladder from outside the handler.
+    ///
+    /// The host uses this for failures that never reach `apply_fetch_result`
+    /// because no task was ever built — see
+    /// [`OverlayHandler::create_fetch_tasks`] returning empty.
+    pub fn record_fetch_failure(&mut self, kind: OverlayKind, error: &FetchError) {
+        if let Some(h) = self.handler_mut(kind) {
+            h.set_fetching(false);
+            if let Some(r) = h.retry_mut() {
+                r.record_failure(error);
+            }
+        }
+    }
+
+    /// What `kind`'s last fetch said, for a caller that renders it.
+    pub fn fetch_health(&self, kind: OverlayKind) -> Option<&FetchHealth> {
+        self.handler(kind)
+            .and_then(|h| h.retry())
+            .map(|r| r.health())
     }
 
     pub fn item_count(&self, kind: OverlayKind) -> usize {
@@ -1048,5 +1200,94 @@ mod controls_parity_tests {
                  the eye must change pixels, never the options"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod retry_ledger_tests {
+    use super::*;
+    use crate::fetch_policy::FetchError;
+    use crate::render::handlers::create_handlers;
+
+    /// **The copy-paste guard.** Every handler that auto-polls must keep a
+    /// retry ledger, and a transient failure must actually push its next
+    /// automatic attempt into the future.
+    ///
+    /// Written over `create_handlers()` rather than over a list of names, so a
+    /// new overlay is covered the day it is registered. All six auto-polling
+    /// handlers had the identical defect — log the error, clear `fetching`,
+    /// leave `fetch_time` alone — because the shape was copied from whichever
+    /// one came first, and nothing stopped the seventh from copying it too.
+    /// (`SpcOutlook` writes the same error branch but declares no interval, so
+    /// it never reached the poll gate; it is fixed alongside them rather than
+    /// left as the one copy of the old shape.)
+    ///
+    /// A handler that keeps no ledger gets the old behaviour exactly: the poll
+    /// gate falls back to `fetch_time`, which a failure never stamps, and the
+    /// layer is due again on the next frame.
+    #[test]
+    fn every_auto_polling_handler_backs_off_after_a_failure() {
+        let mut checked = 0;
+        for handler in create_handlers().iter_mut() {
+            let Some(interval) = handler.auto_poll_interval() else {
+                continue;
+            };
+            checked += 1;
+            let kind = handler.kind();
+
+            assert!(
+                handler.retry().is_some(),
+                "{kind:?} auto-polls every {interval}s but keeps no retry \
+                 ledger, so a failed fetch leaves it due on every frame",
+            );
+
+            assert_eq!(
+                handler.auto_fetch_delay(),
+                Some(std::time::Duration::ZERO),
+                "{kind:?} has never been fetched, so it is due now",
+            );
+
+            handler
+                .retry_mut()
+                .expect("just asserted present")
+                .record_failure(&FetchError::transient("network down"));
+
+            let delay = handler
+                .auto_fetch_delay()
+                .expect("a transient failure is still owed an eventual retry");
+            assert!(
+                !delay.is_zero(),
+                "{kind:?} is due again immediately after a failed fetch — this \
+                 is the per-frame retry storm",
+            );
+            assert!(
+                delay <= std::time::Duration::from_secs(interval),
+                "{kind:?} backs off past its own {interval}s poll interval, so \
+                 a failure recovers slower than an ordinary refresh: {delay:?}",
+            );
+        }
+        assert_eq!(
+            checked, 6,
+            "the six auto-polling handlers that shared the defect must all \
+             still be covered; a new one is not exempt, and a removed one \
+             should be removed from this count deliberately",
+        );
+    }
+
+    /// A failure must not leave the layer stuck "Fetching...", which is the
+    /// other way to make the ledger moot: `is_fetching` suppresses the poll, so
+    /// a handler that never clears it never polls again.
+    #[test]
+    fn recording_a_failure_ends_the_fetch() {
+        let mut state: OverlayState<Vec<u8>> = OverlayState::new();
+        state.fetching = true;
+        state.record_failure(&FetchError::transient("network down"));
+        assert!(!state.fetching);
+        assert_eq!(state.fetch_time, None, "a failure must not stamp the clock");
+
+        state.fetching = true;
+        state.set_data(vec![1]);
+        assert!(!state.fetching);
+        assert!(state.fetch_time.is_some());
     }
 }

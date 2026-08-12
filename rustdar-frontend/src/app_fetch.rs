@@ -573,16 +573,28 @@ impl super::App {
 
         let tasks = self.gui.overlays.create_fetch_tasks(kind, &config);
         if tasks.is_empty() {
-            // Leaves the layer permanently due: nothing is set fetching and no
-            // result will arrive to stamp `fetch_time`, so
-            // `Gui::overlay_poll_delay` answers zero on every following frame.
-            // `App::auto_poll_delay`'s floor holds that at one frame a second
-            // rather than one per refresh — which is where it used to sit — but
-            // the retry is still a retry of something that cannot succeed. The
-            // fix belongs at this seam (a handler that cannot build a task
-            // should be able to say so, and be believed) rather than in the
-            // schedule; see `MetarHandler::create_fetch_tasks`, whose empty
-            // return is a client that failed to build.
+            // A handler that cannot build a task says so, and is believed.
+            //
+            // This used to just `return`: nothing was set fetching and no
+            // result would arrive to stamp `fetch_time`, so the layer read as
+            // due on every following frame — floored at 1 Hz by
+            // `App::auto_poll_delay`'s `MIN_WAKE` on native, and at the display
+            // rate on web, where the same defect on the failure path cost 3089
+            // SPC MD requests in 105 s. Every reason a handler returns nothing
+            // here is a reason repetition cannot fix: a client that would not
+            // build (`MetarHandler::create_fetch_tasks`), or no product
+            // selected to fetch (`SpcOutlookHandler`). Recording it as
+            // `FetchFailure::Permanent` takes the layer off the automatic poll
+            // entirely, and the user actions that could change the answer —
+            // Refresh, enabling the layer, picking a product — all clear the
+            // ledger through `push_user_overlay_fetch`.
+            log::warn!("{kind:?}: no fetch task could be built; not retrying until asked");
+            self.gui.overlays.record_fetch_failure(
+                kind,
+                &rustdar_overlays::fetch_policy::FetchError::permanent(
+                    "no fetch task could be built",
+                ),
+            );
             return;
         }
 

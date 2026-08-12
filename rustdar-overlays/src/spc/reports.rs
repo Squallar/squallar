@@ -1,5 +1,7 @@
 //! Today's preliminary tornado, hail and wind reports, from three SPC CSVs.
 
+use crate::fetch_policy::{FetchError, NotFound};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StormReportKind {
     Tornado,
@@ -39,10 +41,16 @@ pub(crate) fn report_url(
 }
 
 /// `client` must be the preflight-safe [`crate::spc::fetch::spc_client`].
+///
+/// Three CSVs, and a partial result is a real result — a day with tornado and
+/// hail reports but a wind CSV that would not load is still worth drawing. But
+/// **all three failing is not `Ok(vec![])`**: that is indistinguishable from a
+/// quiet day, and it used to be reported as one, which both hid the outage from
+/// the user and stamped the poll clock as though the fetch had succeeded.
 pub async fn fetch_storm_reports(
     client: &reqwest::Client,
     sources: &rustdar_radar::sources::DataSources,
-) -> Result<Vec<StormReport>, String> {
+) -> Result<Vec<StormReport>, FetchError> {
     log::info!("Fetching SPC storm reports");
 
     let (torn, hail, wind) = futures::future::join3(
@@ -65,44 +73,56 @@ pub async fn fetch_storm_reports(
     .await;
 
     let mut reports = Vec::new();
-    match torn {
-        Ok(r) => reports.extend(r),
-        Err(e) => log::warn!("Failed to fetch tornado reports: {e}"),
+    let mut failures: Vec<FetchError> = Vec::new();
+    for (label, outcome) in [("tornado", torn), ("hail", hail), ("wind", wind)] {
+        match outcome {
+            Ok(r) => reports.extend(r),
+            Err(e) => {
+                log::warn!("Failed to fetch {label} reports: {e}");
+                failures.push(e);
+            }
+        }
     }
-    match hail {
-        Ok(r) => reports.extend(r),
-        Err(e) => log::warn!("Failed to fetch hail reports: {e}"),
-    }
-    match wind {
-        Ok(r) => reports.extend(r),
-        Err(e) => log::warn!("Failed to fetch wind reports: {e}"),
+
+    if failures.len() == 3 {
+        // Every CSV failed. Carry the first verdict rather than inventing one:
+        // three 404s on a quiet path mean something different from three
+        // timeouts, and the ladder is entitled to know which.
+        let first = failures.remove(0);
+        return Err(FetchError {
+            failure: first.failure,
+            message: format!("no storm report CSV could be fetched: {}", first.message),
+        });
     }
 
     log::info!("Fetched {} storm reports total", reports.len());
     Ok(reports)
 }
 
+/// A 404 is **routine**: `today_*.csv` is rebuilt each convective day, and a
+/// kind with nothing in it yet is a normal answer rather than an outage.
 async fn fetch_csv(
     client: &reqwest::Client,
     url: &str,
     kind: StormReportKind,
-) -> Result<Vec<StormReport>, String> {
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| format!("HTTP request failed for {url}: {e}"))?;
+) -> Result<Vec<StormReport>, FetchError> {
+    let response = client.get(url).send().await.map_err(|e| {
+        FetchError::from_transport(&e, format!("HTTP request failed for {url}: {e}"))
+    })?;
 
     if !response.status().is_success() {
-        return Err(format!("SPC returned HTTP {} for {url}", response.status()));
+        return Err(FetchError::from_status(
+            response.status(),
+            NotFound::IsRoutine,
+            format!("SPC returned HTTP {} for {url}", response.status()),
+        ));
     }
 
-    let text = response
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read response body: {e}"))?;
+    let text = response.text().await.map_err(|e| {
+        FetchError::from_transport(&e, format!("Failed to read response body: {e}"))
+    })?;
 
-    parse_csv(&text, kind)
+    parse_csv(&text, kind).map_err(FetchError::transient)
 }
 
 /// `Time,{F_Scale|Size|Speed},Location,County,State,Lat,Lon,Comments`, lat/lon

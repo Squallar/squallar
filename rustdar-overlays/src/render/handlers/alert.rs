@@ -15,7 +15,7 @@ use crate::render::overlay_state::{
 use crate::render::rasterize::{self, RasterizeOutput};
 use crate::types::GeoBounds;
 
-pub(crate) struct NwsAlertFetchResult(pub Result<Vec<NwsAlert>, String>);
+pub(crate) struct NwsAlertFetchResult(pub Result<Vec<NwsAlert>, crate::fetch_policy::FetchError>);
 
 #[derive(Debug)]
 pub(crate) struct AlertItem {
@@ -293,6 +293,14 @@ impl OverlayHandler for NwsAlertHandler {
         self.state.fetching = fetching;
     }
 
+    fn retry(&self) -> Option<&crate::fetch_policy::FetchRetry> {
+        Some(&self.state.retry)
+    }
+
+    fn retry_mut(&mut self) -> Option<&mut crate::fetch_policy::FetchRetry> {
+        Some(&mut self.state.retry)
+    }
+
     fn fetch_time(&self) -> Option<web_time::Instant> {
         self.state.fetch_time
     }
@@ -352,10 +360,10 @@ impl OverlayHandler for NwsAlertHandler {
                 self.state.set_data(items);
             }
             Err(e) => {
-                log::error!("NWS alerts fetch failed: {}", e);
+                log::error!("NWS alerts fetch failed: {e}");
+                self.state.record_failure(&e);
             }
         }
-        self.state.fetching = false;
     }
 
     fn retain_selections(&self, selections: &mut Vec<Arc<dyn OverlayItem>>) {
@@ -407,8 +415,7 @@ impl OverlayHandler for NwsAlertHandler {
                     &sources,
                     zone_cache.as_deref(),
                 )
-                .await
-                .map_err(|e| e.to_string());
+                .await;
                 Box::new(NwsAlertFetchResult(result)) as FetchPayload
             }),
         }]

@@ -1,3 +1,4 @@
+pub mod fetch_policy;
 pub mod glm;
 pub mod hrrr;
 pub mod metar;

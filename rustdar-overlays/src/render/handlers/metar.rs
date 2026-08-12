@@ -251,6 +251,14 @@ impl OverlayHandler for MetarHandler {
         self.state.fetching = fetching;
     }
 
+    fn retry(&self) -> Option<&crate::fetch_policy::FetchRetry> {
+        Some(&self.state.retry)
+    }
+
+    fn retry_mut(&mut self) -> Option<&mut crate::fetch_policy::FetchRetry> {
+        Some(&mut self.state.retry)
+    }
+
     fn fetch_time(&self) -> Option<web_time::Instant> {
         self.state.fetch_time
     }
@@ -283,9 +291,14 @@ impl OverlayHandler for MetarHandler {
             }
             Err(e) => {
                 log::error!("METAR fetch failed: {e}");
+                // IEM aggregates one request per state network, so a single
+                // verdict for the round is by definition "the whole round
+                // failed" — transient. The per-request detail that would let
+                // this be sharper is already reported by the fetch itself.
+                self.state
+                    .record_failure(&crate::fetch_policy::FetchError::transient(e));
             }
         }
-        self.state.fetching = false;
         self.rebuild_points();
     }
 

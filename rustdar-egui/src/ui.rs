@@ -481,6 +481,42 @@ struct SectionAnchor {
     current: egui::Pos2,
 }
 
+/// Queue an overlay fetch the **user** asked for, and clear the layer's retry
+/// ladder on the way past.
+///
+/// The one door every user-driven overlay fetch goes through: the Refresh
+/// button, switching a layer on, and every option change that implies a refetch
+/// (outlook day and product, model parameter). The automatic poll in
+/// [`Gui::check_auto_polls`] pushes its action directly and deliberately does
+/// **not** come through here.
+///
+/// That split is what makes "a user action is never made to wait out a backoff"
+/// structural rather than remembered: the ladder is consulted only by
+/// `auto_fetch_delay`, and the only way to queue a user fetch is a call that has
+/// already cleared it — including a layer recorded as permanently broken, which
+/// no automatic poll will ever retry. See [`rustdar_overlays::fetch_policy`].
+///
+/// Still deduplicated per frame: the handlers are global, so one fetch serves
+/// every pane that asked.
+///
+/// Note that overlays are not site-scoped — they are national products, and
+/// changing the radar site does not queue an overlay fetch at all. The user
+/// actions that reach a layer's fetch path are exactly the ones above.
+pub(crate) fn push_user_overlay_fetch(
+    overlays: &mut OverlayRegistry,
+    actions: &mut Vec<GuiAction>,
+    kind: OverlayKind,
+    pane_idx: usize,
+) {
+    overlays.clear_retry(kind);
+    if !actions
+        .iter()
+        .any(|a| matches!(a, GuiAction::FetchOverlay { kind: k, .. } if *k == kind))
+    {
+        actions.push(GuiAction::FetchOverlay { kind, pane_idx });
+    }
+}
+
 pub struct Gui {
     radar: RadarState,
     auto_poll: AutoPollState,
@@ -2059,15 +2095,22 @@ impl Gui {
             self.auto_poll.record_fetch();
         }
 
-        // Auto-refresh overlay data when layers are enabled and refresh interval elapsed
+        // Auto-refresh overlay data when a layer is on screen and its own gate
+        // says a fetch may start. The gate is `OverlayHandler::auto_fetch_delay`
+        // and nothing here second-guesses it: it folds the poll clock, the fetch
+        // in flight, and the retry ladder into one duration, and this is the
+        // only place that reads it as "now".
+        //
+        // It used to be spelled out here as `fetch_time.is_none_or(elapsed >=
+        // interval)`. `fetch_time` is stamped only on success, so a failing
+        // layer answered "due" on every frame — 3089 SPC MD requests in 105 s
+        // in the browser. See `rustdar_overlays::fetch_policy`.
         for &kind in OverlayKind::all() {
-            if let Some(interval) = self.overlays.auto_poll_interval(kind)
+            if self
+                .overlays
+                .auto_fetch_delay(kind)
+                .is_some_and(|d| d.is_zero())
                 && let Some(pane_idx) = self.first_pane_with_overlay_enabled(kind)
-                && !self.overlays.is_fetching(kind)
-                && self
-                    .overlays
-                    .fetch_time(kind)
-                    .is_none_or(|t| t.elapsed().as_secs() >= interval)
             {
                 actions.push(GuiAction::FetchOverlay { kind, pane_idx });
             }
@@ -2818,13 +2861,14 @@ impl Gui {
             pane_state: None,
         };
 
+        let active_pane = self.active_pane;
         for (kind, update) in updates {
             let effect = self.overlays.apply_control(kind, &update, &mut pane_ctx);
             if matches!(effect, ControlEffect::Fetch) {
-                actions.push(GuiAction::FetchOverlay {
-                    kind,
-                    pane_idx: self.active_pane,
-                });
+                // Refresh, and every option change that implies one. A user
+                // pressing Refresh on a layer that has been backing off — or
+                // one given up on entirely — must be answered now.
+                push_user_overlay_fetch(&mut self.overlays, actions, kind, active_pane);
             }
         }
 
@@ -2945,14 +2989,10 @@ impl Gui {
         actions: &mut Vec<GuiAction>,
     ) {
         Self::write_pane_overlay(&mut self.overlays, pane, kind, on);
-        if on
-            && !self.overlays.has_data(kind)
-            && !self.overlays.is_fetching(kind)
-            && !actions
-                .iter()
-                .any(|a| matches!(a, GuiAction::FetchOverlay { kind: k, .. } if *k == kind))
-        {
-            actions.push(GuiAction::FetchOverlay { kind, pane_idx });
+        if on && !self.overlays.has_data(kind) && !self.overlays.is_fetching(kind) {
+            // Switching a layer on is a user action, so it clears whatever the
+            // ladder had accumulated — see `push_user_overlay_fetch`.
+            push_user_overlay_fetch(&mut self.overlays, actions, kind, pane_idx);
         }
     }
 
@@ -4490,15 +4530,14 @@ impl Gui {
     /// when no pane on screen can draw it, or when its fetch is already in
     /// flight.
     fn overlay_poll_delay(&self, kind: OverlayKind) -> Option<std::time::Duration> {
-        let interval = self.overlays.auto_poll_interval(kind)?;
-        if !self.any_pane_has_overlay_enabled(kind) || self.overlays.is_fetching(kind) {
+        if !self.any_pane_has_overlay_enabled(kind) {
             return None;
         }
-        // Never fetched: due now, and the frame this schedules will take it.
-        let Some(fetched) = self.overlays.fetch_time(kind) else {
-            return Some(std::time::Duration::ZERO);
-        };
-        Some(std::time::Duration::from_secs(interval).saturating_sub(fetched.elapsed()))
+        // The same reading `check_auto_polls` fires on, not a second derivation
+        // of it. These were two spellings of one rule — one in whole seconds,
+        // one in durations — and a wake spent on a frame that polls nothing is
+        // the busy loop with extra steps.
+        self.overlays.auto_fetch_delay(kind)
     }
 
     /// How long until the status bar's own text would read differently, or
@@ -4789,3 +4828,6 @@ mod storm_motion_override_tests;
 
 #[cfg(test)]
 mod wake_schedule_tests;
+
+#[cfg(test)]
+mod overlay_retry_tests;

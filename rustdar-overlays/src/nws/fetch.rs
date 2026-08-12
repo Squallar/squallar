@@ -4,17 +4,22 @@ use rustdar_radar::sources::DataSources;
 
 use super::alert::{NwsAlert, parse_alerts};
 use super::zones::resolve_zone_geometries;
+use crate::fetch_policy::{FetchError, NotFound};
 
 /// Unlike SPC and IEM, api.weather.gov *requires* a `User-Agent`; `client` must
 /// carry one. The URL comes from [`DataSources::nws_alerts_url`] so the origin
 /// stays visible to the validations derived from the origin table.
 /// `zone_cache_dir` backs the on-disk zone-geometry cache, without which each
 /// launch issues 1000+ requests.
+///
+/// A 404 is **broken**, not routine: `/alerts/active` is a standing endpoint
+/// that answers with an empty `features` array on a quiet day, so its absence
+/// means the API moved.
 pub async fn fetch_active_alerts(
     client: &reqwest::Client,
     sources: &DataSources,
     zone_cache_dir: Option<&Path>,
-) -> Result<Vec<NwsAlert>, String> {
+) -> Result<Vec<NwsAlert>, FetchError> {
     let url = sources.nws_alerts_url();
     log::info!("Fetching NWS active alerts from {url}");
 
@@ -23,22 +28,24 @@ pub async fn fetch_active_alerts(
         .header("Accept", "application/geo+json")
         .send()
         .await
-        .map_err(|e| format!("NWS alerts HTTP request failed: {}", e))?;
+        .map_err(|e| {
+            FetchError::from_transport(&e, format!("NWS alerts HTTP request failed: {e}"))
+        })?;
 
     if !response.status().is_success() {
-        return Err(format!(
-            "NWS API returned HTTP {} for alerts",
-            response.status()
+        return Err(FetchError::from_status(
+            response.status(),
+            NotFound::IsBroken,
+            format!("NWS API returned HTTP {} for alerts", response.status()),
         ));
     }
 
-    let text = response
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read NWS alerts response body: {}", e))?;
+    let text = response.text().await.map_err(|e| {
+        FetchError::from_transport(&e, format!("Failed to read NWS alerts response body: {e}"))
+    })?;
 
-    let json: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| format!("Invalid JSON from NWS alerts: {}", e))?;
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| FetchError::transient(format!("Invalid JSON from NWS alerts: {e}")))?;
 
     let mut alerts = parse_alerts(&json);
 

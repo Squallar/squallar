@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::fetch_policy::{FetchError, FetchRetry};
 use crate::render::controls::{
     ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext,
     PaneControlContextMut,
@@ -13,7 +14,7 @@ use crate::spc::colors::md_stroke_color;
 use crate::spc::discussion::SpcDiscussion;
 use crate::types::{GeoBounds, OverlayLabel};
 
-pub(crate) struct SpcDiscussionFetchResult(pub Result<Vec<SpcDiscussion>, String>);
+pub(crate) struct SpcDiscussionFetchResult(pub Result<Vec<SpcDiscussion>, FetchError>);
 
 #[derive(Debug)]
 pub(crate) struct DiscussionItem {
@@ -187,6 +188,14 @@ impl OverlayHandler for SpcDiscussionHandler {
         self.state.fetching = fetching;
     }
 
+    fn retry(&self) -> Option<&FetchRetry> {
+        Some(&self.state.retry)
+    }
+
+    fn retry_mut(&mut self) -> Option<&mut FetchRetry> {
+        Some(&mut self.state.retry)
+    }
+
     fn fetch_time(&self) -> Option<web_time::Instant> {
         self.state.fetch_time
     }
@@ -238,10 +247,13 @@ impl OverlayHandler for SpcDiscussionHandler {
                 self.state.set_data(items);
             }
             Err(e) => {
-                log::error!("SPC MD fetch failed: {}", e);
+                // Logged once per *attempt*, and attempts are now on the
+                // ladder in `crate::fetch_policy` — this line is the one that
+                // appeared 3089 times in 105 s.
+                log::error!("SPC MD fetch failed: {e}");
+                self.state.record_failure(&e);
             }
         }
-        self.state.fetching = false;
     }
 
     fn retain_selections(&self, selections: &mut Vec<Arc<dyn OverlayItem>>) {
@@ -286,9 +298,7 @@ impl OverlayHandler for SpcDiscussionHandler {
         vec![FetchTask {
             kind: OverlayKind::SpcDiscussions,
             future: Box::pin(async move {
-                let result = crate::spc::fetch::fetch_active_discussions(&client, &sources)
-                    .await
-                    .map_err(|e| e.to_string());
+                let result = crate::spc::fetch::fetch_active_discussions(&client, &sources).await;
                 Box::new(SpcDiscussionFetchResult(result)) as FetchPayload
             }),
         }]
@@ -325,6 +335,13 @@ impl OverlayHandler for SpcDiscussionHandler {
             items.push(ControlItem::InfoText {
                 text: "Fetching...".into(),
             });
+        }
+        // Above the "Updated" line, because it is the line that changes what
+        // "Updated 4m ago" means. An empty map with a healthy fetch is a quiet
+        // afternoon; an empty map with this line under it is SPC being out of
+        // reach, and the two used to render identically.
+        if let Some(note) = self.state.retry.status_note() {
+            items.push(ControlItem::InfoText { text: note });
         }
         if let Some(t) = self.state.fetch_time {
             let secs = t.elapsed().as_secs();

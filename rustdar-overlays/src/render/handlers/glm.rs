@@ -454,6 +454,14 @@ impl OverlayHandler for GlmHandler {
         self.state.fetching = fetching;
     }
 
+    fn retry(&self) -> Option<&crate::fetch_policy::FetchRetry> {
+        Some(&self.state.retry)
+    }
+
+    fn retry_mut(&mut self) -> Option<&mut crate::fetch_policy::FetchRetry> {
+        Some(&mut self.state.retry)
+    }
+
     fn fetch_time(&self) -> Option<web_time::Instant> {
         self.state.fetch_time
     }
@@ -495,9 +503,14 @@ impl OverlayHandler for GlmHandler {
                 // A failed fetch says nothing about feed liveness, so leave the
                 // previous verdict standing rather than reporting a recovery.
                 log::error!("GLM fetch failed: {e}");
+                // Many S3 requests behind one result; `FailureKind` above
+                // already splits parse from transport per granule. The outer
+                // error means the round as a whole did not complete, which is
+                // transient by construction.
+                self.state
+                    .record_failure(&crate::fetch_policy::FetchError::transient(e));
             }
         }
-        self.state.fetching = false;
     }
 
     fn retain_selections(&self, selections: &mut Vec<Arc<dyn OverlayItem>>) {

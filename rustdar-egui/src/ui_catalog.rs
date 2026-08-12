@@ -244,17 +244,6 @@ fn matches_query(query: &str, label: &str) -> bool {
     query.is_empty() || label.to_lowercase().contains(query)
 }
 
-/// Queue a fetch for `kind` unless this frame already queued one — the
-/// handlers are global, so one fetch serves every pane that asked.
-fn push_overlay_fetch_once(actions: &mut Vec<GuiAction>, kind: OverlayKind, pane_idx: usize) {
-    if !actions
-        .iter()
-        .any(|a| matches!(a, GuiAction::FetchOverlay { kind: k, .. } if *k == kind))
-    {
-        actions.push(GuiAction::FetchOverlay { kind, pane_idx });
-    }
-}
-
 impl super::Gui {
     /// Draw the catalog, when it is open — as the centred modal the two wide
     /// widths get. On Compact the sheet's Catalog page hosts the same body
@@ -696,7 +685,12 @@ impl super::Gui {
             .overlays
             .apply_control(OverlayKind::ModelData, &update, &mut pane_ctx);
         if matches!(effect, ControlEffect::Fetch) {
-            push_overlay_fetch_once(actions, OverlayKind::ModelData, idx);
+            crate::ui::push_user_overlay_fetch(
+                &mut self.overlays,
+                actions,
+                OverlayKind::ModelData,
+                idx,
+            );
         }
         pane.overlay_configs = self.overlays.save_pane_configs();
         pane.enabled_overlays = self.overlays.save_enabled_map();

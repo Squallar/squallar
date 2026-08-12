@@ -15,7 +15,9 @@ use crate::render::rasterize;
 use crate::spc::reports::{StormReport, StormReportKind};
 use crate::types::GeoBounds;
 
-pub(crate) struct StormReportsFetchResult(pub Result<Vec<StormReport>, String>);
+pub(crate) struct StormReportsFetchResult(
+    pub Result<Vec<StormReport>, crate::fetch_policy::FetchError>,
+);
 
 #[derive(Debug)]
 pub(crate) struct StormReportItem {
@@ -178,6 +180,14 @@ impl OverlayHandler for StormReportsHandler {
         self.state.fetching = fetching;
     }
 
+    fn retry(&self) -> Option<&crate::fetch_policy::FetchRetry> {
+        Some(&self.state.retry)
+    }
+
+    fn retry_mut(&mut self) -> Option<&mut crate::fetch_policy::FetchRetry> {
+        Some(&mut self.state.retry)
+    }
+
     fn fetch_time(&self) -> Option<web_time::Instant> {
         self.state.fetch_time
     }
@@ -211,9 +221,9 @@ impl OverlayHandler for StormReportsHandler {
             }
             Err(e) => {
                 log::error!("Storm reports fetch failed: {e}");
+                self.state.record_failure(&e);
             }
         }
-        self.state.fetching = false;
     }
 
     fn retain_selections(&self, selections: &mut Vec<Arc<dyn OverlayItem>>) {
