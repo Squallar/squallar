@@ -60,7 +60,10 @@ impl WorkerPort for Recorder {
 /// retirement call would leave this port installed for the *next* test on that
 /// thread — which would then post its renders into a recorder nobody reads and
 /// fail for reasons of its own. See `offload::InstalledTestWorker`.
-fn recorder() -> (Arc<Mutex<Vec<Vec<u8>>>>, crate::offload::InstalledTestWorker) {
+fn recorder() -> (
+    Arc<Mutex<Vec<Vec<u8>>>>,
+    crate::offload::InstalledTestWorker,
+) {
     let posted = Arc::new(Mutex::new(Vec::new()));
     let installed = crate::offload::install_test_worker(Box::new(Recorder(Arc::clone(&posted))));
     (posted, installed)
