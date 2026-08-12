@@ -483,9 +483,17 @@ fn a_pane_handed_a_different_raster_uploads_it() {
         first,
         "the pane is still drawing the previous sweep's texture"
     );
+    // And the one it stopped drawing is *gone*, not parked. Asserted against
+    // egui's own texture manager rather than against any holding pen in `App`,
+    // because being absent from there is the whole point: a meta entry lives
+    // exactly as long as some `TextureHandle` does, so this fails whether a
+    // replaced raster is kept deliberately or by accident — which is right,
+    // since neither is wanted. An `old_textures` vector used to make this false
+    // for a whole extra frame; see the note in `App::apply_render_to_pane` for
+    // why nothing has to hold a replaced handle at all.
     assert!(
-        app.old_textures.iter().any(|t| t.id() == first),
-        "the replaced texture was not retired through `old_textures`, so it is \
-         dropped while the GPU may still be reading it"
+        ctx.tex_manager().read().meta(first).is_none(),
+        "the replaced texture is still allocated after the pane stopped drawing \
+         it, so two generations of the same overlay are resident at once"
     );
 }

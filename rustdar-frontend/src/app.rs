@@ -337,8 +337,6 @@ pub struct App {
     platform: Box<dyn PlatformBridge>,
     // Counter to generate unique texture names
     texture_counter: u32,
-    // Old textures to clean up after the next frame
-    old_textures: Vec<egui::TextureHandle>,
     // Cache the detected theme to avoid calling detection every frame
     cached_dark_theme: Option<bool>,
     // Flag for deferred exit when event_loop isn't available during redraw
@@ -919,7 +917,6 @@ impl App {
             render,
             platform,
             texture_counter: 0,
-            old_textures: Vec::new(),
             cached_dark_theme: None,
             exit_requested: false,
             // `last_written` starts empty rather than seeded from the config
@@ -3120,7 +3117,6 @@ impl ApplicationHandler for App {
         if let Some(store) = self.platform.config_store() {
             self.gui.save_ui_config(store.as_ref());
         }
-        self.old_textures.clear();
         self.render.clear_last_rendered();
         self.texture_counter = 0;
         self.gui.clear_graphics_state(); // Keep cached_render intact so we can re-upload the texture

@@ -144,9 +144,11 @@ fn loop_interval(fps: f32) -> std::time::Duration {
 /// refcount per *distinct* raster in the pass, against buffers the render cache
 /// is holding anyway.
 ///
-/// Scoped to a pass rather than to the app for the same reason `old_textures` is
-/// cleared each frame: a texture kept alive here is VRAM, and the panes that
-/// want one are already holding their own clones by the time this is dropped.
+/// Scoped to a pass rather than to the app, because a texture kept alive here
+/// is VRAM and nothing else: the panes that want one are already holding their
+/// own clones by the time this is dropped. The app used to hold replaced
+/// handles a frame longer than that as well, in an `old_textures` vector; see
+/// the note in `App::apply_render_to_pane` for why nothing needs to.
 #[derive(Default)]
 pub(super) struct PlanViewUploads {
     uploaded: Vec<(Arc<egui::ColorImage>, egui::TextureHandle)>,
@@ -231,10 +233,6 @@ impl super::App {
 
             [state.surface_config.width, state.surface_config.height]
         };
-
-        // Clean up old textures from previous frame
-        // This allows the GPU to finish using them before we drop them
-        self.old_textures.clear();
 
         // Ensure pane_render vec matches gui pane count
         self.render.ensure_pane_count(self.gui.pane_count());
@@ -503,20 +501,91 @@ impl super::App {
             .and_then(|prs| prs.cached_render.as_ref())
             .is_some_and(|cached| Arc::ptr_eq(&cached.image, &render.image));
 
-        // Clean up old radar overlay texture — unless it is the one about to go
-        // back, in which case it is kept rather than retired and re-uploaded.
+        // Let go of the old radar overlay texture — unless it is the one about
+        // to go back, in which case it is kept rather than retired and
+        // re-uploaded.
+        //
+        // # Why the replaced handle is simply dropped
+        //
+        // There used to be an `App::old_textures` holding pen here: every
+        // replaced handle was pushed onto it and the vector cleared at the top
+        // of the *next* frame, "to let the GPU finish using them before we drop
+        // them". That was written into the app during a wholesale rewrite
+        // (8800bf20) rather than in answer to any crash, and every layer below
+        // it already guarantees what it was defending. It cost a standing second
+        // copy of every replaced overlay texture for a whole extra frame, which
+        // on web is the single largest allocation this application makes:
+        // measured in Chromium on hardware WebGL2, dropping it took standing
+        // overlay residency after a zoom from 395.6 MiB to 257.0 MiB.
+        //
+        // 1. **Nothing in this frame draws it.** Each of the five sites the
+        //    vector used to serve runs before `Gui::ui` builds the frame's paint
+        //    list — four in the poller/dispatcher block of `setup_egui_frame`,
+        //    and `restore_cached_render` earlier still, under
+        //    `ensure_rendering_state`, which `handle_redraw` calls ahead of
+        //    `setup_egui_frame`. "Before `Gui::ui`, inside `handle_redraw`" is
+        //    the claim that covers all five; "inside `setup_egui_frame`" does
+        //    not. The handle being let go here is already out of the pane's
+        //    overlay cache, so no shape in the frame under construction names
+        //    it, and the frame that did draw it was submitted at least one
+        //    `queue.submit()` ago.
+        //
+        // 2. **egui already defers the free by a frame's tail.** Dropping the
+        //    handle only reaches `epaint::TextureManager::free`, which pushes
+        //    the id onto `delta.free`; the delta is taken at `end_pass` and
+        //    `Renderer::free_texture` is not called until after
+        //    `queue.submit()` in `present_frame`. Ids are never recycled —
+        //    `TextureManager::alloc` bumps a monotonic `next_id` — so a freed
+        //    id cannot collide with a live one.
+        //
+        // 3. **wgpu defers the raw delete past the submission using it.**
+        //    `free_texture` calls `wgpu::Texture::destroy()`, which is the wgpu
+        //    API and not a raw `glDeleteTextures`. wgpu-core's
+        //    `Texture::destroy` snatches the raw handle out (so no *new*
+        //    command can name it) and hands it to
+        //    `LifetimeTracker::schedule_resource_destruction(temp,
+        //    last_submit_index)`, which parks it in the still-active
+        //    submission's `temp_resources`. Those are dropped — and the raw
+        //    image actually destroyed — only in `triage_submissions`, once the
+        //    GPU has signalled past that index. When
+        //    `get_texture_latest_submission_index` answers `None` the temp is
+        //    dropped on the spot, which is safe for the reason it is `None`:
+        //    no active submission names the texture. That code is in
+        //    wgpu-**core**, so it is identical for the Vulkan backend used
+        //    natively and the GL/WebGL2 backend the wasm build pins via
+        //    `Backends::GL`; there is no browser-WebGPU path here to reason
+        //    about separately.
+        //
+        // And the case that settles it, because it is this application's own and
+        // has been true all along: **map tiles have always done the far more
+        // dangerous thing without harm.** `tile_source::Tiles` keeps its tiles
+        // in a 256-entry `LruCache`, and `Tiles::at` — "called once per visible
+        // tile per frame by walkers' flood fill" — calls
+        // `receive_one_fetched_tile`, whose `cache.put` evicts at capacity and
+        // drops a `walkers::Tile::Raster(TextureHandle)` *in the middle of
+        // `Gui::ui`*, where a shape added earlier in the same pass can already
+        // name the id. `old_textures` never covered that path, and panning a map
+        // does it continuously without artifact. This change therefore makes
+        // overlay textures exactly as safe as map tiles have always been, and
+        // strictly safer: every site above lets go before the pass opens, where
+        // tile eviction lets go inside it.
+        //
+        // In short, an in-flight submission holding this texture is exactly the
+        // case wgpu is tracking submission indices in order to handle. An extra
+        // application-level frame of deferral buys nothing and doubles
+        // residency. If a future crash ever seems to want it back, measure
+        // first: the bug will be one of the assumptions above breaking, and the
+        // fix belongs wherever it broke — and whatever it is, it would have been
+        // breaking tile eviction for longer.
         let Some(pane) = self.gui.pane_mut(pane_idx) else {
             return;
         };
         let cache = pane.overlay_cache_mut(OverlayKind::Radar);
-        let retained = match cache.current.take() {
-            Some(old) if already_on_screen => Some(old.texture),
-            Some(old) => {
-                self.old_textures.push(old.texture);
-                None
-            }
-            None => None,
-        };
+        let retained = cache
+            .current
+            .take()
+            .filter(|_| already_on_screen)
+            .map(|old| old.texture);
 
         // The picture's own dimensions, not a constant: a sweep reaching past
         // the floor is a wider raster, and the texture, the overlay entry and
@@ -526,8 +595,11 @@ impl super::App {
         let side = render.image.width();
         let texture = match retained {
             // The pane's own handle, preferred over anything `uploads` may hold
-            // for the same raster: taking the memo's instead would drop this one
-            // mid-frame, which is the drop `old_textures` exists to defer.
+            // for the same raster. Not a lifetime question — see the note above
+            // on why a replaced handle can just be dropped — but a churn one:
+            // taking the memo's copy would free this one and retain that one to
+            // no purpose, when the pane is already holding the texture it is
+            // about to be told to draw.
             Some(texture) => texture,
             None => {
                 let counter = &mut self.texture_counter;
@@ -958,11 +1030,12 @@ impl super::App {
                 // `OverlayTextureCache` for the counter that used to be
                 // compared here and why it had to go rather than be renamed.
 
-                // Save old texture for deferred cleanup
-                if let Some(old) = cache.current.take() {
-                    self.old_textures.push(old.texture);
-                }
-
+                // The assignment below is what retires the texture this pane was
+                // showing: the replaced `OverlayTextureData` drops with it, and
+                // that is the whole of the cleanup. See the note in
+                // `App::apply_render_to_pane` for why no frame of deferral is
+                // needed — this is the path it costs the most on, because these
+                // are the full-viewport overlay rasters.
                 cache.current = Some(OverlayTextureData {
                     texture: texture.clone(),
                     geo_bounds: resp.geo_bounds,
@@ -1179,9 +1252,7 @@ impl super::App {
                     let cache = pane.overlay_cache_mut(
                         rustdar_overlays::render::overlay_state::OverlayKind::Radar,
                     );
-                    if let Some(old) = cache.current.take() {
-                        self.old_textures.push(old.texture);
-                    }
+                    cache.current = None;
                 }
                 self.render.pane_render[pane_idx].last_rendered = None;
             }
@@ -1496,9 +1567,8 @@ impl super::App {
             else {
                 continue;
             };
-            if let Some(old) = section_state.texture.take() {
-                self.old_textures.push(old);
-            }
+            // Assigning retires the cut this pane was showing; see the note in
+            // `App::apply_render_to_pane`.
             section_state.texture = Some(texture);
             section_state.section = Some(Arc::from(cut));
             section_state.unavailable = None;
@@ -1694,9 +1764,8 @@ impl super::App {
             };
             if let Some(pane) = self.gui.pane_mut(pane_idx) {
                 let cache = pane.overlay_cache_mut(OverlayKind::Radar);
-                if let Some(old) = cache.current.take() {
-                    self.old_textures.push(old.texture);
-                }
+                // Assigning retires whatever the pane was showing; see the note
+                // in `App::apply_render_to_pane`.
                 cache.current = Some(OverlayTextureData {
                     texture,
                     geo_bounds,
@@ -1923,7 +1992,6 @@ impl super::App {
                     // handle_redraw() lazily recreates it with a fresh surface.
                     // Keep cached_render so the radar image can be restored
                     // instantly.
-                    self.old_textures.clear();
                     self.render.clear_last_rendered();
                     self.gui.clear_graphics_state();
                     self.state = None;
