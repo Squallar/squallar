@@ -79,7 +79,12 @@ pub const SIGNIFICANT: f64 = 0.25;
 
 /// Blank painted clusters (8-connected runs of |NROT| ≥ [`SIGNIFICANT`])
 /// smaller than this many bins. Empirical, chosen to match the reference's
-/// painted density. Measured provenance: branch `campaign-harness`.
+/// painted density.
+///
+/// The density comparison it was chosen on did not outlive the scratchpad it
+/// ran in. Branch `campaign-harness` carries that campaign's apparatus
+/// (`campaigns/nrot/nrot-lab`) and none of its readings, so this is a number
+/// to re-measure rather than one to cite.
 const DESPECKLE_MIN_BINS: usize = 4;
 
 /// A velocity sweep as a dense azimuth × range grid. NaN marks missing data.
@@ -551,8 +556,10 @@ impl WindProfileBuilder {
         // Clamp-extrapolate every unfitted layer from the nearest fitted one:
         // winds vary slowly with height, and a None prediction is worse than
         // the nearest fitted layer's — it vetoes every wind seed tile whose
-        // beam reaches that height. Measured: without the extension most of
-        // the reference's far band is lost (branch `campaign-harness`).
+        // beam reaches that height. Measured once: without the extension most
+        // of the reference's far band is lost. The far-band counts behind that
+        // sentence are gone — branch `campaign-harness` has the probe that
+        // would count them again, not the count.
         let filled: Vec<usize> = (0..layers.len()).filter(|&l| layers[l].is_some()).collect();
         if !filled.is_empty() {
             for l in 0..layers.len() {
@@ -616,22 +623,28 @@ const MEDIAN_HALF_WIDTH_KM: f64 = 0.4;
 
 /// Cap on the median filter's azimuthal half-count. Empirical, set against
 /// the reference median's couplet erasure and near-radar couplet amplitudes
-/// (a 5×5 window counted in legacy 1° radials ≈ 9 super-res). Measured
-/// provenance: branch `campaign-harness`.
+/// (a 5×5 window counted in legacy 1° radials ≈ 9 super-res).
+///
+/// Those amplitudes were not kept. Branch `campaign-harness` has the
+/// generator that paints the couplets and nothing the reference read off
+/// them, so what survives here is a method and not a result.
 const MEDIAN_AZ_HALF_MAX: i32 = 2;
 
 /// Half-depth of the median kernel in range gates — deliberately deeper than it
 /// is wide. Range is the axis this module does *not* differentiate, so smoothing
 /// along it removes noise without touching the azimuthal shear being measured.
 /// The depth is empirical: 2 gates agreed with reference readouts better than
-/// 1 on amplitude, correlation and painted density. Measured provenance:
-/// branch `campaign-harness`.
+/// 1 on amplitude, correlation and painted density. Which readouts, and by how
+/// much, is no longer recoverable — branch `campaign-harness` preserved this
+/// campaign's harness and not the hovering it did.
 const MEDIAN_RNG_HALF: i32 = 2;
 
 /// Minimum RAW-data fraction of the median window for a valid centre to
 /// survive: the reference NDs under-populated windows, cleaning sparse fold
-/// soup the raw-default dealias rule re-admits. The fraction is empirical.
-/// Measured provenance: branch `campaign-harness`.
+/// soup the raw-default dealias rule re-admits. The fraction is empirical,
+/// and like the rest of the median geometry it was fitted against readings
+/// the campaign scratchpad did not outlive: branch `campaign-harness` says
+/// how this was measured, never what came back.
 const MEDIAN_MIN_RAW_OCC: f64 = 0.6;
 
 fn median_filter(
@@ -1707,20 +1720,22 @@ fn llsd_nrot(
 // ————————————————————————————————————————————————————————————————————
 
 /// Environmental-wind seed tolerance in m/s — deliberately tight; empirical,
-/// tuned against the reference's kept fraction on folded volumes. Measured
-/// provenance: branch `campaign-harness`.
+/// tuned against the reference's kept fraction on folded volumes. Those kept
+/// fractions are gone; branch `campaign-harness` preserved the instrument
+/// this campaign tuned with and no reading it took.
 const DA_SEED_TOL: f64 = 5.0;
 
 /// Agreeing 4-neighbors required for a gate-level wind seed. A wind-matching
 /// pocket inside storm-perturbed flow can never seed a 5×10 all-gates tile;
 /// gate seeds anchor it at raw before any bridge can unfold it to the wrong
-/// branch. Measured provenance: branch `campaign-harness`.
+/// branch. The runs that showed it were not kept — nothing on branch
+/// `campaign-harness` audits the 3, so treat it as unaudited.
 const DA_SEEDGATE_NEIGHBORS: i32 = 3;
 
 /// Scale on every bridge/fill threshold — the pass ordering is fixed but the
 /// base thresholds are nominal; the scale is empirical, set where dealias
-/// coverage matches the reference. Measured provenance: branch
-/// `campaign-harness`.
+/// coverage matches the reference. The coverage sweep that located 1.4 is not
+/// on branch `campaign-harness`; the probe that would re-run it is.
 const DA_THRESH_SCALE: f64 = 1.4;
 
 /// Iteration cap for the pass loop; propagation converges within ten on
@@ -1749,8 +1764,9 @@ const DA_ZISO_TOL: f64 = 1.5;
 /// Minimum connected-component size (bins, 4-adjacency) for a never-reached
 /// data region to be kept at raw, and for a gate-seed cluster to count.
 /// Empirical: the reference's raw-default keeps only regions above a
-/// measured size gate this value sits inside. Measured provenance: branch
-/// `campaign-harness`.
+/// measured size gate this value sits inside. Where that gate actually sits
+/// was read off the reference once and written down nowhere that lasted, so
+/// branch `campaign-harness` cannot say how much room 16 has either side.
 const DA_RAWMIN_BINS: usize = 16;
 
 /// Censor threshold in units of Vny: the jump between 4-neighbours above
@@ -1832,8 +1848,9 @@ pub enum DealiasProfile {
     /// measured [`CENSOR_VNY_FRAC`] threshold — dropping the censor entirely
     /// was measured worse against the RPG's own dealiased velocity (a kept
     /// fold wall is a 2·Vny error on every gate it touches, which costs
-    /// more level agreement than the censored hole costs coverage; the A/B
-    /// record lives on branch `campaign-harness`).
+    /// more level agreement than the censored hole costs coverage). That A/B
+    /// ran against live N0G/N1G twins and its record did not survive; branch
+    /// `campaign-harness` carries no reading of it.
     Coverage,
 }
 
@@ -1841,8 +1858,12 @@ pub enum DealiasProfile {
 /// data gate, however small the region. The RPG's dealiaser resolves all
 /// present data, so for a field that is *displayed* rather than
 /// differentiated, matching its coverage matters more than suppressing
-/// isolated pockets — the A/B against live N0G/N1G twins lives on branch
-/// `campaign-harness`.
+/// isolated pockets.
+///
+/// The A/B against live N0G/N1G twins that settled this went with the same
+/// scratchpad as [`DealiasProfile::Coverage`]'s. Branch `campaign-harness` has
+/// the harness the twins were fetched into and not a number either of them
+/// gave back, so the reasoning above is the whole of the surviving case.
 const COVERAGE_RAWMIN_BINS: usize = 1;
 
 /// The two post-pass knobs a [`DealiasProfile`] resolves to. `pub(crate)` so
@@ -2377,8 +2398,9 @@ pub(crate) fn dealias_with_knobs(
     // isolated outliers (left uncommitted), aborting only when over a third
     // of the gap's data gates fail. Measured: a fragile strict chain reaches
     // reference coverage only with its thresholds widened far enough that
-    // the radial bridge mis-unfolds pockets the reference keeps (branch
-    // `campaign-harness`).
+    // the radial bridge mis-unfolds pockets the reference keeps. The coverage
+    // figures behind that were not preserved — branch `campaign-harness` has
+    // the apparatus that took them and no trace of what it read.
     let chain = |seed: f64, raws: &[f64], t: f64, gap_free: i32| -> Option<Vec<f64>> {
         let mut out = Vec::with_capacity(raws.len());
         let mut acc: Vec<f64> = vec![seed];
