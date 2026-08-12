@@ -15,14 +15,14 @@
 //!    derivative stage would misread as extreme shear.
 //! 2. Median-filter the dealiased field (3–5 radials by physical width × 5
 //!    gates); centres whose window is mostly missing raw data read ND.
-//! 3. At each bin, the azimuthal derivative is the per-radial super-res
-//!    operator ([`SPLIT_TAPS`]) inside 80 km and the composite 11-radial
-//!    stencil [`COMPOSITE_TAPS`] beyond, applied to
-//!    3-gate range means and divided by the local arc per radial. The
-//!    sign-reversed outer taps produce the small negative side lobes
-//!    flanking every strong gradient. All five tap pairs must be intact and
-//!    the profile must correlate with the stencil (r² ≥ 0.05); constant or
-//!    incoherent profiles read ND.
+//! 3. At each bin, the azimuthal derivative is **one** antisymmetric tap
+//!    stencil, at every range: the per-radial super-res operator
+//!    ([`SPLIT_TAPS`]) on a 0.5° grid and [`LEGACY_TAPS`] on a sweep whose rows
+//!    are already whole degrees, applied to 3-gate range means and divided by
+//!    the local arc per radial. The sign-reversed outer tap produces the small
+//!    negative side lobes flanking every strong gradient. Every tap cell must
+//!    be intact and the profile must correlate with the stencil (r² ≥ 0.05);
+//!    constant or incoherent profiles read ND.
 //! 4. Divide ROT by the divisor curve — knot ranges in KILOMETRES, linearly
 //!    interpolated, measured off the reference at 60 ranges (22.4 at 13 km
 //!    rising to 24.0 at 22 km, then falling to 8.6 at 80 km and flat beyond)
@@ -756,12 +756,11 @@ fn rot_divisor(range_nm: f64) -> f64 {
 /// leave 62 of 880 readings outside, none by as much as one lattice step; the
 /// 4-knot curve they replace left 703 outside and missed by up to 7.
 ///
-/// Beyond 80 km [`composite_stencil_rot`] takes over and its step gain is
-/// 5.4% under [`split_stencil_rot`]'s, so out there this curve lands the
-/// reading 5.4% under the reference. That is the composite operator's
-/// calibration and not this curve's: the old pairing hid part of it in a flat
-/// 8.0, and the product's discontinuity across the 80 km handover falls from
-/// 9.7% to 5.4% by removing the compensation rather than growing it.
+/// The curve now serves one operator at every range. It used to hand over to a
+/// second, wider stencil past 80 km whose step gain was 5.4% under the split
+/// operator's, so the band beyond read 5.4% under the reference — the curve
+/// being right made that visible rather than causing it, and the handover has
+/// since been measured not to exist ([`SPLIT_TAPS`]).
 ///
 /// Measured provenance: branch `campaign-harness`.
 fn rot_divisor_km(range_km: f64) -> f64 {
@@ -795,13 +794,6 @@ fn rot_divisor_km(range_km: f64) -> f64 {
     }
     KNOTS[KNOTS.len() - 1].1
 }
-
-/// Composite azimuthal derivative stencil, empirically measured from the
-/// reference's step response (measured provenance: branch `campaign-harness`).
-/// Antisymmetric, dimensionless; ROT = Σ cⱼ·v(i+j) / arc. The sign-reversed
-/// outer taps are what produce the small negative side lobes flanking every
-/// strong gradient — a plain least-squares slope cannot produce those.
-const COMPOSITE_TAPS: [f64; 5] = [0.1039, 0.1595, 0.1187, -0.0037, -0.0630];
 
 /// The per-radial operator on a 0.5°-spaced sweep: taps [ĉ₂, ĉ₁−ĉ₂, ĉ₂, ĉ₃]
 /// at row offsets 1/2/3/4, applied **antisymmetrically** — the same list on
@@ -863,6 +855,59 @@ const COMPOSITE_TAPS: [f64; 5] = [0.1039, 0.1595, 0.1187, -0.0037, -0.0630];
 /// pole at 0.67 and at 0.33 of the strong, both parities, same six sites) read
 /// it too, weak flank and all. The readings and what they replaced are at
 /// `a_couplet_reads_the_operator_its_own_step_response_fixes`.
+///
+/// # This is the operator at every range
+///
+/// It used to stop at 80 km, where a wider 11-radial stencil took over. That
+/// handover was ours and not the reference's. Six step edges painted from 8 to
+/// 200 km into a real volume's velocity moment, hovered per radial at 0.25°
+/// steps along five arcs — 55.6, 85.2, 111.1, 144.5 and 175.9 km — over seven
+/// sites (KHNX, KLWX, KLOT, KATX, KMSX, KDMX, and KTWX held out; declared
+/// Nyquist 11.3 to 35.6), at two jump sizes and both boundary parities.
+/// Eighty profiles, and every one of them paints **four radials each side of
+/// the edge and reads ND at the fifth**:
+///
+/// ```text
+///  ND  −0.22  +0.14  +0.69  +1.05  +1.05  +0.69  +0.14  −0.22   ND
+/// ```
+///
+/// (KHNX at 85.2 km; the same shape at every range, scaled by the jump.) The
+/// composite stencil spanned ±5 rows, so it painted six radials a side and put
+/// −0.20 of the peak where the reference reads nothing — a cell whose
+/// magnitude is five lattice steps clear of zero on the 1.60·Vny profiles. It
+/// is refused by all 80, at every range and every site. The reference's
+/// response never widens, so there is no range at which the operator changes,
+/// and the range branch is gone.
+///
+/// # These taps' *shape* is a quantum off, and that is not fixed here
+///
+/// The same 80 profiles pin the shape and not only the support, and they do
+/// not admit this list. Normalized to the peak the reference reads
+/// (1, 0.663, 0.150, −0.228); these taps predict (1, 0.643, 0.130, −0.226),
+/// which falls outside the lattice interval of 55 of the 76 profiles whose
+/// peak is large enough to resolve it. What is admitted is a single shape on a
+/// 0.002 grid, and it has a closed form — the Savitzky–Golay cubic first
+/// derivative over nine points, (126, 193, 142, −86)/1188, ratios
+/// (1, 0.6640, 0.1493, −0.2293), which 73 of the 76 admit. At this list's own
+/// step gain that is 0.2241/0.3433/0.2526/−0.1530 against 0.238/0.342/0.238/
+/// −0.151: the same t₂ and t₄, and t₁ ≠ t₃, which is exactly what the 21.0 nm
+/// profile these were solved from could not separate — its peak is 19 lattice
+/// steps where the profiles here run to 78.
+///
+/// Adopting it is not this change's to make, and the reason is not that it
+/// looks wrong. Substituted at this list's own step gain it *improves* the one
+/// real-weather anchor there is: the KFTG 2023-06-22 mesocyclone core reads a
+/// mean 1.0061 of the reference's four hovered values against these taps'
+/// 1.0108. But it also raises the painted density inside 80 km on the standard
+/// seven-site set from 9572 bins to 9997 — 4.4% — and that density is itself
+/// matched to the reference's (the module header, [`DESPECKLE_MIN_BINS`] and
+/// [`MIN_RANGE_NM`] are all set against it). Nothing measured here says
+/// whether 4.4% more is closer to the reference or further, and a calibrated
+/// figure is not moved blind. Its ramp gain is 1.0565 against these taps'
+/// 1.032, and a hover reports `taps / divisor` and nothing else (see
+/// [`LEGACY_TAPS`]), so [`rot_divisor_km`] would have to be re-anchored
+/// against the new shape over its own 776 readings rather than left where a
+/// step-edge scale constant put it. The two move together or neither moves.
 const SPLIT_TAPS: [(i32, f64); 4] = [(1, 0.238), (2, 0.342), (3, 0.238), (4, -0.151)];
 
 /// The operator for a sweep that is *already* legacy resolution — a TDWR cut,
@@ -922,13 +967,6 @@ const SPLIT_TAPS: [(i32, f64); 4] = [(1, 0.238), (2, 0.342), (3, 0.238), (4, -0.
 /// again by a few per cent.
 const LEGACY_TAPS: [(i32, f64); 2] = [(1, 0.6996), (2, -0.0861)];
 
-/// Range limit in km for the split-tap operator; beyond it the composite
-/// 11-tap stencil takes over. Each operator is used inside the range band
-/// its calibration measurements cover: the split operator near the radar,
-/// the composite at long range where pairing phase is invisible. Measured
-/// provenance: branch `campaign-harness`.
-const SPLIT_MAX_RANGE_KM: f64 = 80.0;
-
 /// Range half-depth in gates for the stencils' 3-gate range means, per
 /// Smith/Elmore's "3 range gates deep" — deeper smooths small features in
 /// range and reads them low.
@@ -960,10 +998,11 @@ const STENCIL_RNG_HALF: i32 = 1;
 const GK_MIN_R2: f64 = 0.05;
 
 /// Extra valid radials required beyond the split stencil's ±4 span on each
-/// side. The composite estimator's all-5-pairs completeness rule doubles as a
-/// data-edge noise gate — bins whose support just barely fits the stencil sit
-/// on echo boundaries where the profile is half real, half edge — and the
-/// margin gives the split stencil the same protection.
+/// side. A completeness rule that stops at the stencil's own span doubles as a
+/// data-edge noise gate — bins whose support just barely fits sit on echo
+/// boundaries where the profile is half real, half edge — and the margin is
+/// what keeps those out. Both readers here demand it, so which bins get a
+/// value does not depend on which operator reads them.
 const GK_DATA_MARGIN: i32 = 1;
 
 /// Range-continuity ceiling. Rotation is reported only over velocity the radar
@@ -1134,9 +1173,64 @@ const GK_DATA_MARGIN: i32 = 1;
 /// ```
 const GK_MAX_TEXTURE_VNY_FRAC: f64 = 0.44;
 
-/// The super-res operator ([`SPLIT_TAPS`]) at one bin. Requires every tap
-/// cell; profiles that do not correlate with the stencil read ND like the
-/// composite estimator's.
+/// One antisymmetric tap list applied to an azimuthal profile: Σ tₖ·(v(i+k) −
+/// v(i−k)), returned **unnormalized** — the caller divides by the arc its own
+/// taps are anchored on, which is the only thing that separates the two
+/// operators here.
+///
+/// `None` when the data margin is not met, when a cell some tap reads is
+/// missing, or when the profile does not correlate with the stencil. Those
+/// three rules are written once on purpose: which bins get a value is a
+/// property of the profile, not of which tap list read it, and a sweep must
+/// not gain or lose painted bins by being read at one resolution or the other.
+fn tap_stencil(prof: &[f64], taps: &[(i32, f64)]) -> Option<f64> {
+    const C: usize = PROFILE_MAX_HALF;
+    // Data-margin completeness: the outermost cells must be populated too, so
+    // bins do not appear at echo edges where the profile is half real.
+    for m in 0..GK_DATA_MARGIN {
+        let o = C - m as usize;
+        if prof[C + o].is_nan() || prof[C - o].is_nan() {
+            return None;
+        }
+    }
+    // Signed weight per profile cell: one tap list, mirrored — positive
+    // toward increasing azimuth, negative away from it.
+    let mut w = [0.0f64; 2 * PROFILE_MAX_HALF + 1];
+    for &(o, t) in taps {
+        w[(C as i32 + o) as usize] += t;
+        w[(C as i32 - o) as usize] -= t;
+    }
+    let (mut acc, mut mean, mut nv) = (0.0, 0.0, 0i32);
+    for (k, &wk) in w.iter().enumerate() {
+        if wk == 0.0 {
+            continue;
+        }
+        let v = prof[k];
+        if v.is_nan() {
+            return None;
+        }
+        acc += wk * v;
+        mean += v;
+        nv += 1;
+    }
+    // Coherence gate: squared correlation between the velocity profile and the
+    // stencil weights. Constant profiles have zero variance — ND.
+    mean /= f64::from(nv);
+    let (mut svv, mut scc) = (0.0, 0.0);
+    for (k, &wk) in w.iter().enumerate() {
+        if wk == 0.0 {
+            continue;
+        }
+        svv += (prof[k] - mean).powi(2);
+        scc += wk * wk;
+    }
+    if svv <= 0.0 || acc * acc / (scc * svv) < GK_MIN_R2 {
+        return None;
+    }
+    Some(acc)
+}
+
+/// The super-res operator ([`SPLIT_TAPS`]) at one bin, at **every** range.
 fn split_stencil_rot(
     vel_grid: &[Vec<f64>],
     i: usize,
@@ -1145,79 +1239,19 @@ fn split_stencil_rot(
     gate_count: usize,
     rows: crate::azimuth::Rows,
 ) -> Option<f64> {
-    // Range-averaged velocity at offsets −(4+margin)..=4+margin; prof[6 + o].
-    let mut prof = [f64::NAN; 15];
-    for (idx, slot) in prof.iter_mut().enumerate() {
-        let da = idx as i32 - 7;
-        if da.abs() > 7 {
-            continue;
-        }
-        // Off the end of a sector's arc the cell stays NaN, and the
-        // completeness rules below read that as the data edge it is.
-        let Some(ai) = rows.neighbour(i, da) else {
-            continue;
-        };
-        let (mut sum, mut n) = (0.0, 0);
-        for dr in -STENCIL_RNG_HALF..=STENCIL_RNG_HALF {
-            let rj = j as i32 + dr;
-            if rj < 0 || rj >= gate_count as i32 {
-                continue;
-            }
-            let v = vel_grid[ai][rj as usize];
-            if !v.is_nan() {
-                sum += v;
-                n += 1;
-            }
-        }
-        if n > 0 {
-            *slot = sum / n as f64;
-        }
-    }
-    // Data-margin completeness: the composite stencil's ±5 span must be
-    // populated too, so bins do not appear at echo edges it would reject.
-    for m in 0..GK_DATA_MARGIN {
-        let o = (5 + m) as usize;
-        if prof[7 + o].is_nan() || prof[7 - o].is_nan() {
-            return None;
-        }
-    }
-    // Signed weight per profile cell: one tap list, mirrored — positive
-    // toward increasing azimuth, negative away from it.
-    let mut w = [0.0f64; 15];
-    for &(o, t) in &SPLIT_TAPS {
-        w[(7 + o) as usize] += t;
-        w[(7 - o) as usize] -= t;
-    }
-    let (mut acc, mut mean, mut nv) = (0.0, 0.0, 0);
-    for k in 0..15 {
-        if w[k] == 0.0 {
-            continue;
-        }
-        let v = prof[k];
-        if v.is_nan() {
-            return None;
-        }
-        acc += w[k] * v;
-        mean += v;
-        nv += 1;
-    }
-    // Coherence gate, same form as the composite estimator's: squared
-    // correlation between the profile and the stencil weights.
-    mean /= nv as f64;
-    let (mut svv, mut scc) = (0.0, 0.0);
-    for k in 0..15 {
-        if w[k] == 0.0 {
-            continue;
-        }
-        svv += (prof[k] - mean).powi(2);
-        scc += w[k] * w[k];
-    }
-    if svv <= 0.0 {
-        return None;
-    }
-    if acc * acc / (scc * svv) < GK_MIN_R2 {
-        return None;
-    }
+    let mut buf = EMPTY_PROFILE;
+    // Off the end of a sector's arc a cell comes back NaN, and the
+    // completeness rules read that as the data edge it is.
+    let prof = az_profile(
+        &mut buf,
+        vel_grid,
+        i,
+        j,
+        gate_count,
+        PROFILE_MAX_HALF as i32,
+        rows,
+    );
+    let acc = tap_stencil(prof, &SPLIT_TAPS)?;
     // Normalize by two radials of *this* grid — the legacy 1.0° arc on the
     // 0.5° grid the taps were fitted on, and the arc of two rows on any
     // other. The 2 counts rows, not degrees, and that is what makes this a
@@ -1232,10 +1266,10 @@ fn split_stencil_rot(
     // Which grids reach here is the other half of the answer, and it is not
     // "any": a sweep whose rows are already whole degrees is read by
     // [`legacy_stencil_rot`], the operator measured on such a sweep
-    // ([`rows_are_half_degree_pairs`]). So the coarse sampling
-    // of one field does *not* read what the fine one reads inside 80 km —
-    // that is a difference of operators, measured against the reference, and
-    // the same test pins it.
+    // ([`rows_are_half_degree_pairs`]). So the coarse sampling of one field
+    // does *not* read what the fine one reads — at any range — and that is a
+    // difference of operators, measured against the reference, rather than a
+    // divisor. The same test pins it.
     Some(acc / (2.0 * arc_per_radial))
 }
 
@@ -1257,48 +1291,18 @@ fn legacy_stencil_rot(
     rows: crate::azimuth::Rows,
 ) -> Option<f64> {
     let mut buf = EMPTY_PROFILE;
-    // ±7, as the split operator reads, so the data-margin rule below tests the
+    // The same span the split operator reads, so the data-margin rule tests the
     // same cells and neither operator paints an echo edge the other would not.
-    let prof = az_profile(&mut buf, vel_grid, i, j, gate_count, 7, rows);
-    for m in 0..GK_DATA_MARGIN {
-        let o = (5 + m) as usize;
-        if prof[7 + o].is_nan() || prof[7 - o].is_nan() {
-            return None;
-        }
-    }
-    let mut w = [0.0f64; 15];
-    for &(o, t) in &LEGACY_TAPS {
-        w[(7 + o) as usize] += t;
-        w[(7 - o) as usize] -= t;
-    }
-    let (mut acc, mut mean, mut nv) = (0.0, 0.0, 0);
-    for k in 0..15 {
-        if w[k] == 0.0 {
-            continue;
-        }
-        let v = prof[k];
-        if v.is_nan() {
-            return None;
-        }
-        acc += w[k] * v;
-        mean += v;
-        nv += 1;
-    }
-    mean /= nv as f64;
-    let (mut svv, mut scc) = (0.0, 0.0);
-    for k in 0..15 {
-        if w[k] == 0.0 {
-            continue;
-        }
-        svv += (prof[k] - mean).powi(2);
-        scc += w[k] * w[k];
-    }
-    if svv <= 0.0 {
-        return None;
-    }
-    if acc * acc / (scc * svv) < GK_MIN_R2 {
-        return None;
-    }
+    let prof = az_profile(
+        &mut buf,
+        vel_grid,
+        i,
+        j,
+        gate_count,
+        PROFILE_MAX_HALF as i32,
+        rows,
+    );
+    let acc = tap_stencil(prof, &LEGACY_TAPS)?;
     // One row, not two: these taps sit at whole-degree offsets of a sweep whose
     // rows are whole degrees, and the reference's step response is 0.69 at
     // 39 km where two rows would make it 0.35.
@@ -1376,17 +1380,16 @@ fn rows_are_half_degree_pairs(azimuths_deg: &[f64]) -> bool {
     2 * cohabit(0).max(cohabit(1)) > n / 2
 }
 
-/// The widest azimuthal half-span any profile reader asks for: both tap
-/// stencils read ±5 and demand ±(5 + [`GK_DATA_MARGIN`]), and
-/// [`legacy_stencil_rot`] asks [`az_profile`] for exactly that.
-const PROFILE_MAX_HALF: usize = 7;
+/// The azimuthal half-span every profile reader asks for: the widest stencil's
+/// own ±4 plus [`GK_DATA_MARGIN`]. Both operators here demand exactly this and
+/// [`az_profile`] is asked for exactly this, which is what makes which bins get
+/// a value independent of which tap list reads them.
+const PROFILE_MAX_HALF: usize = 4 + GK_DATA_MARGIN as usize;
 
 /// Backing store for one [`az_profile`], sized for [`PROFILE_MAX_HALF`].
 ///
-/// A plain stack array rather than a `Vec`, which is the shape
-/// [`composite_stencil_rot`] and [`split_stencil_rot`] fill their own
-/// profiles into: this is read once per non-`NaN` bin, over ~230 k bins of a
-/// sweep, for a fixed-length list of fifteen.
+/// A plain stack array rather than a `Vec`: this is read once per non-`NaN`
+/// bin, over ~230 k bins of a sweep, for a fixed-length list of eleven.
 type ProfileBuf = [f64; 2 * PROFILE_MAX_HALF + 1];
 
 /// An empty [`ProfileBuf`], for a caller about to hand it to [`az_profile`].
@@ -1431,87 +1434,6 @@ fn az_profile<'p>(
         *cell = if n > 0 { sum / n as f64 } else { f64::NAN };
     }
     slot
-}
-
-/// The measured composite estimator: tap correlation across 11 radials at
-/// the centre gate, averaged over one gate each side in range. All five tap
-/// pairs must be intact (fewer pairs → larger rescale → amplified noise at
-/// data edges, so completeness is a noise gate as much as a validity one)
-/// and the profile must correlate with the stencil; constant or incoherent
-/// profiles read ND.
-fn composite_stencil_rot(
-    vel_grid: &[Vec<f64>],
-    i: usize,
-    j: usize,
-    arc_per_radial: f64,
-    gate_count: usize,
-    rows: crate::azimuth::Rows,
-) -> Option<f64> {
-    // Range-averaged velocity per azimuthal offset; prof[5 ± o] holds ±o.
-    let mut prof = [f64::NAN; 11];
-    for (idx, slot) in prof.iter_mut().enumerate() {
-        let da = idx as i32 - 5;
-        // As in the split stencil: past a sector's edge the cell stays NaN and
-        // the all-five-pairs rule below reads the data edge.
-        let Some(ai) = rows.neighbour(i, da) else {
-            continue;
-        };
-        let (mut sum, mut n) = (0.0, 0);
-        for dr in -STENCIL_RNG_HALF..=STENCIL_RNG_HALF {
-            let rj = j as i32 + dr;
-            if rj < 0 || rj >= gate_count as i32 {
-                continue;
-            }
-            let v = vel_grid[ai][rj as usize];
-            if !v.is_nan() {
-                sum += v;
-                n += 1;
-            }
-        }
-        if n > 0 {
-            *slot = sum / n as f64;
-        }
-    }
-    // All five pairs required: a tap pair with a missing member is a data
-    // edge, and the reference reads ND there.
-    let (mut acc, mut mean) = (0.0, 0.0);
-    for (k, &tap) in COMPOSITE_TAPS.iter().enumerate() {
-        let o = k + 1;
-        let (p, m) = (prof[5 + o], prof[5 - o]);
-        if p.is_nan() || m.is_nan() {
-            return None;
-        }
-        acc += tap * (p - m);
-        mean += p + m;
-    }
-    // Coherence gate: squared correlation between the velocity profile and
-    // the stencil (both centred). Constant profiles have zero variance — ND.
-    mean /= 10.0;
-    let (mut svv, mut scc) = (0.0, 0.0);
-    for (k, &tap) in COMPOSITE_TAPS.iter().enumerate() {
-        let o = k + 1;
-        let (p, m) = (prof[5 + o], prof[5 - o]);
-        svv += (p - mean).powi(2) + (m - mean).powi(2);
-        scc += 2.0 * tap * tap;
-    }
-    if svv <= 0.0 {
-        return None;
-    }
-    if acc * acc / (scc * svv) < GK_MIN_R2 {
-        return None;
-    }
-    // The normalization is Σc·v/arc with the full stencil (verified against
-    // the reference's step response; branch `campaign-harness`). One arc here
-    // against [`split_stencil_rot`]'s two, and both count rows of this grid:
-    // these taps are anchored on the grid's own radials, the split operator's
-    // on the legacy pairs of a super-res one. Neither number is a degree.
-    //
-    // This is the one operator every sweep reaches, whatever its rows are, so
-    // it is where one field sampled at 0.5° and at 1.0° really does read one
-    // number — the identity `one_shear_reads_the_gain_its_own_operator_carries`
-    // pins past 80 km. Inside 80 km the two samplings take two different
-    // operators and do not, which is a measurement rather than a divisor.
-    Some(acc / arc_per_radial)
 }
 
 /// Half-depth in km of the range window [`range_texture`] reads. Wide enough
@@ -1637,28 +1559,18 @@ fn llsd_nrot(sweep: &VelocitySweep, vel_grid: &[Vec<f64>]) -> Vec<Vec<f64>> {
                     }
 
                     let arc_per_radial = range_km * spacing_rad;
-                    let rot = if range_km < SPLIT_MAX_RANGE_KM {
-                        // Rows already at whole degrees are read by the
-                        // operator measured on such a sweep, not by the
-                        // super-res one over twice the sky. Same rows either
-                        // way — a sector's arc ends where the antenna stopped
-                        // whichever operator reads it.
-                        let op = if half_degree_rows {
-                            split_stencil_rot
-                        } else {
-                            legacy_stencil_rot
-                        };
-                        op(vel_grid, i, j, arc_per_radial, sweep.gate_count, rows)
+                    // The operator is chosen by the sweep's own row spacing and
+                    // by nothing else — not by range. Rows already at whole
+                    // degrees are read by the operator measured on such a
+                    // sweep, not by the super-res one over twice the sky. Same
+                    // rows either way — a sector's arc ends where the antenna
+                    // stopped whichever operator reads it.
+                    let op = if half_degree_rows {
+                        split_stencil_rot
                     } else {
-                        composite_stencil_rot(
-                            vel_grid,
-                            i,
-                            j,
-                            arc_per_radial,
-                            sweep.gate_count,
-                            rows,
-                        )
+                        legacy_stencil_rot
                     };
+                    let rot = op(vel_grid, i, j, arc_per_radial, sweep.gate_count, rows);
                     match rot {
                         Some(rot) => {
                             let divisor = rot_divisor(range_km / KM_PER_NM);
@@ -3518,7 +3430,8 @@ mod tests {
     /// allowed above 1.0, against a field whose own rotation runs from 0.29 at
     /// 25 km to 0.86 at the far gate.
     ///
-    /// Five rows an end and not four: the two stencils read ±4 but demand ±5,
+    /// Five rows an end and not four: the widest stencil reads ±4 but both
+    /// demand ±5,
     /// because a bin whose support only just fits sits on a data edge where
     /// half the profile is echo boundary ([`GK_DATA_MARGIN`]). That rule costs
     /// one computable row at each end of a sector, and it is the same rule
@@ -3576,7 +3489,7 @@ mod tests {
     /// restatements: rows 5..67 of the sector read, bit for bit, what the same
     /// field's complete 1.0° rotation reads at the same rows, because their
     /// whole support lies inside the arc, which for this operator is ±2 rows
-    /// read and ±(5 + [`GK_DATA_MARGIN`]) demanded. The five rows at
+    /// read and ±(4 + [`GK_DATA_MARGIN`]) demanded. The five rows at
     /// each end read ND, on the same margin the split operator
     /// spends there, and nothing in the sector is allowed near a rotation:
     /// rows 0 and 71 stand 71° and 372 m/s apart at 50 km, and stitched
@@ -3657,19 +3570,23 @@ mod tests {
     /// not degrees of sky, and one shear sampled at 0.5° and at 1.0° is what
     /// shows it.
     ///
-    /// Past 80 km the two samplings read *the same number*: one operator
-    /// serves both grids there, [`COMPOSITE_TAPS`] at row offsets over a
-    /// one-row divisor, so a 1.0° sweep's numerator spans twice the arc and
-    /// its divisor grows by the same factor. The identity is exact in the
-    /// reals and holds to 3.4e-14 over the 343 bins compared below.
+    /// The two samplings do not read the same number, and that is not the
+    /// divisor: it is that the reference uses a *different operator* on a grid
+    /// that is already legacy resolution. [`LEGACY_TAPS`] carries a ramp gain
+    /// of 1.055 against the split operator's 1.032, so the same 6 (m/s)/km
+    /// field reads 1.022 of itself on the coarser sweep — measured, not
+    /// chosen: the taps are the ones the reference's own hovered step and
+    /// couplet profiles solve to, against the divisor curve their scale is
+    /// anchored to.
     ///
-    /// Inside 80 km they do not, and that is not the divisor: it is that the
-    /// reference uses a *different operator* on a grid that is already legacy
-    /// resolution. [`LEGACY_TAPS`] carries a ramp gain of 1.055 against the
-    /// split operator's 1.032, so the same 6 (m/s)/km field reads 1.022 of
-    /// itself on the coarser sweep — measured, not chosen: the taps are the
-    /// ones the reference's own hovered step and couplet profiles solve to,
-    /// against the divisor curve their scale is anchored to.
+    /// They differ by that same ratio at **every** range, which is the other
+    /// thing this test pins. A second, wider stencil used to take over past
+    /// 80 km — one both grids reached, over a one-row divisor, so out there
+    /// they read one number and the handover was invisible here. The reference
+    /// has since been hovered across it, 55.6 to 175.9 km at seven sites, and
+    /// reads the split operator's own 8-radial step response at every range
+    /// ([`SPLIT_TAPS`]). So gate 380 below asserts the same gain ratio gates
+    /// 100/200/300 do, and a range-dependent operator could not pass it.
     ///
     /// What the test still has to rule out is the reading a reader meets
     /// first — that `2.0 * arc_per_radial` in [`split_stencil_rot`] means
@@ -3703,46 +3620,14 @@ mod tests {
         let fine_nrot = llsd_nrot(&sweep(&fine, &fine_az, gates), &fine);
         let coarse_nrot = llsd_nrot(&sweep(&coarse, &coarse_az, gates), &coarse);
 
-        // Gate 380 is 95.25 km, past SPLIT_MAX_RANGE_KM, so both samplings run
-        // the composite stencil over its one-row divisor. Azimuth 180 is the
-        // field's own wrap, where both read the ±5 clamp for reasons that have
-        // nothing to do with spacing, and is left out of it.
-        let mut compared = 0;
-        let mut worst = 0.0f64;
-        for az in 0..360 {
-            if (az as f64 - 180.0).abs() <= 8.0 {
-                continue;
-            }
-            let (c, f) = (coarse_nrot[az][380], fine_nrot[2 * az][380]);
-            assert!(
-                c.is_finite() && f.is_finite(),
-                "az {az}° read ND past 80 km"
-            );
-            worst = worst.max((c - f).abs());
-            compared += 1;
-        }
-        assert_eq!(compared, 343);
-        // Not bit-for-bit, and the gap is arithmetic rather than physical: the
-        // stencil is zero-sum, so the background the profile sits on cancels
-        // exactly in the reals and only to rounding in f64.
-        assert!(
-            worst < 1e-12,
-            "0.5° and 1.0° read one field {worst} apart past 80 km — a real \
-             disagreement, not rounding",
-        );
-
         // Each grid reads the gain its own operator carries: the super-res
-        // operator's is its Σ t·o over two rows, the composite's and the
-        // legacy grid's are Σ 2·o·t over one.
+        // operator's is its Σ t·o over two rows, the legacy grid's is Σ 2·o·t
+        // over one.
         let split_gain: f64 = SPLIT_TAPS.iter().map(|&(o, t)| o as f64 * t).sum::<f64>();
-        let composite_gain: f64 = COMPOSITE_TAPS
-            .iter()
-            .enumerate()
-            .map(|(idx, &t)| 2.0 * (idx as f64 + 1.0) * t)
-            .sum();
         let legacy_gain: f64 = LEGACY_TAPS.iter().map(|&(o, t)| 2.0 * o as f64 * t).sum();
-        // Gates 100/200/300 are 25.25/50.25/75.25 km, all inside the split band.
-        for j in [100usize, 200, 300] {
+        // 25.25/50.25/75.25 km, and 95.25 km — the last one past where a second
+        // stencil used to take both grids over.
+        for j in [100usize, 200, 300, 380] {
             let range_km = 0.25 + j as f64 * 0.25;
             let divisor = rot_divisor(range_km / KM_PER_NM);
             for (label, got, gain) in [
@@ -3757,13 +3642,10 @@ mod tests {
                 );
             }
         }
-        let range_km = 0.25 + 380.0 * 0.25;
-        let expect = k * composite_gain / rot_divisor(range_km / KM_PER_NM);
-        assert!((coarse_nrot[90][380] - expect).abs() < 1e-9);
 
-        // The whole of the difference inside 80 km is the ratio of those two
-        // gains — 1.0221 — and none of it is the divisor.
-        for j in [100usize, 200, 300] {
+        // The whole of the difference is the ratio of those two gains —
+        // 1.0221 — at every range, and none of it is the divisor.
+        for j in [100usize, 200, 300, 380] {
             let ratio = coarse_nrot[90][j] / fine_nrot[180][j];
             assert!(
                 (ratio - legacy_gain / split_gain).abs() < 1e-9,
@@ -4223,22 +4105,20 @@ mod tests {
     /// The sub-threshold tails may read ND (the coherence gate drops them,
     /// and the display palette would not paint them either) but when present
     /// must carry the measured class values.
+    ///
+    /// **And the same four classes at 38.5, 95.25 and 175.25 km**, which is
+    /// the half that pins the handover's absence. A second stencil used to
+    /// take over past 80 km and paint six radials a side; the reference paints
+    /// four at every range out to 175.9 km, over seven sites, and reads ND at
+    /// the fifth ([`SPLIT_TAPS`]). The two long gates below are on either side
+    /// of where that stencil used to start, and read exactly what the short one
+    /// does once the arc and the divisor are taken out.
     #[test]
     fn split_stencil_matches_the_measured_step_profile() {
         let n = 720;
-        let gates = 400;
+        let gates = 800; // to 200.25 km, so a gate past 80 km is a gate here
         let azimuths = ring_azimuths(n); // i·0.5°, pairs at whole degrees
-        let j = 153; // 38.5 km
-        let range_km = 0.25 + j as f64 * 0.25;
-        let arc_legacy = range_km * 1.0_f64.to_radians();
-        let scale = 16.0 / arc_legacy / rot_divisor_km(range_km);
         let (c1, c2, c3) = (0.580, 0.238, -0.151);
-        let class = [
-            (c1 + c2 + c3) * scale,
-            (c2 + (c1 - c2) + c3) * scale,
-            (c2 + c3) * scale,
-            c3 * scale,
-        ];
 
         // Radial 90 is the first +8 radial of a step at az 45.0, a boundary
         // *between* whole-degree pairs; radial 91 is the first of a step at
@@ -4249,36 +4129,53 @@ mod tests {
                 .collect();
             let s = sweep(&grid, &azimuths, gates);
             let nrot = llsd_nrot(&s, &grid);
-            for (radial, expect) in [
-                (first_plus - 1, class[0]),
-                (first_plus, class[0]),
-                (first_plus - 2, class[1]),
-                (first_plus + 1, class[1]),
-                (first_plus - 3, class[2]),
-                (first_plus + 2, class[2]),
-                (first_plus - 4, class[3]),
-                (first_plus + 3, class[3]),
-            ] {
-                let got = nrot[radial][j];
-                let core = expect == class[0];
-                assert!(
-                    (got - expect).abs() < 0.02 || (!core && got.is_nan()),
-                    "az {boundary_az}, radial {radial}: got {got:.3}, expected \
-                     {expect:.3}{}",
-                    if core { "" } else { " or ND" },
-                );
-            }
-            for radial in [
-                first_plus - 6,
-                first_plus - 5,
-                first_plus + 4,
-                first_plus + 5,
-            ] {
-                let got = nrot[radial][j];
-                assert!(
-                    got.is_nan() || got.abs() < 0.02,
-                    "az {boundary_az}, radial {radial}: got {got:.3}, expected ~0"
-                );
+            // 38.5 km, and 95.25 and 175.25 km — both past the range a second
+            // operator used to take the bin over at.
+            for j in [153usize, 380, 700] {
+                let range_km = 0.25 + j as f64 * 0.25;
+                let arc_legacy = range_km * 1.0_f64.to_radians();
+                let scale = 16.0 / arc_legacy / rot_divisor_km(range_km);
+                let class = [
+                    (c1 + c2 + c3) * scale,
+                    (c2 + (c1 - c2) + c3) * scale,
+                    (c2 + c3) * scale,
+                    c3 * scale,
+                ];
+                for (radial, expect) in [
+                    (first_plus - 1, class[0]),
+                    (first_plus, class[0]),
+                    (first_plus - 2, class[1]),
+                    (first_plus + 1, class[1]),
+                    (first_plus - 3, class[2]),
+                    (first_plus + 2, class[2]),
+                    (first_plus - 4, class[3]),
+                    (first_plus + 3, class[3]),
+                ] {
+                    let got = nrot[radial][j];
+                    let core = expect == class[0];
+                    assert!(
+                        (got - expect).abs() < 0.02 || (!core && got.is_nan()),
+                        "az {boundary_az}, gate {j}, radial {radial}: got \
+                         {got:.3}, expected {expect:.3}{}",
+                        if core { "" } else { " or ND" },
+                    );
+                }
+                // The fifth radial out and beyond: this operator's response is
+                // identically zero there, and the reference reads ND. A wider
+                // stencil would paint −0.20 of the peak at the first of them.
+                for radial in [
+                    first_plus - 6,
+                    first_plus - 5,
+                    first_plus + 4,
+                    first_plus + 5,
+                ] {
+                    let got = nrot[radial][j];
+                    assert!(
+                        got.is_nan() || got.abs() < 0.02,
+                        "az {boundary_az}, gate {j}, radial {radial}: got \
+                         {got:.3}, expected ~0"
+                    );
+                }
             }
         }
     }
