@@ -116,6 +116,23 @@ pub struct SpcOutlook {
 /// Origin must come from
 /// [`DataSources::spc_base`](rustdar_radar::sources::DataSources::spc_base),
 /// never a literal, or SPC escapes the origin table's browser-reachability check.
+///
+/// # Why `.lyr.geojson`, and what it costs
+///
+/// SPC publishes each outlook twice. The `.lyr` ("layered") form gives every
+/// risk category as a whole nested region — MRGL ⊃ SLGT ⊃ ENH ⊃ MDT — so each
+/// higher category is drawn again underneath every lower one, and under a
+/// semi-transparent fill that accumulates: the deepest category is painted as
+/// many times as there are categories above it. The `.nolyr` form gives the
+/// same areas as disjoint bands, each a donut with the next category up cut out
+/// as an interior ring, painting every pixel once.
+///
+/// This is the layered one, hardcoded, and that is a choice worth revisiting
+/// rather than an obviously right one. It is left alone here because switching
+/// products changes what every downstream consumer sees — hit testing, labels,
+/// the legend — and because until `draw_feature` learned to honour interior
+/// rings, `.nolyr`'s donuts would have rendered as solid overlapping blobs
+/// anyway. That blocker is gone now; the tradeoff is not.
 pub fn outlook_url(
     sources: &rustdar_radar::sources::DataSources,
     day: OutlookDay,

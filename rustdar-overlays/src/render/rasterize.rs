@@ -16,7 +16,7 @@ use crate::render::overlay_state::OverlayItem;
 use crate::spc::colors::{md_fill_color, md_stroke_color};
 use crate::spc::discussion::SpcDiscussion;
 use crate::spc::reports::{StormReport, StormReportKind};
-use crate::types::{GeoBounds, OverlayFeature};
+use crate::types::{GeoBounds, GeoPolygonRing, OverlayFeature};
 
 // ── Hit buffer types ─────────────────────────────────────────────────────
 
@@ -197,7 +197,9 @@ pub fn rasterize_spc_discussions(
                 .map(|&(lat, lon)| mb.project(lat, lon, w, h))
                 .collect();
             if let Some(path) = build_polygon_path(&pts) {
-                fill_path(&mut pixmap, &path, fill_rgba);
+                // Every ring of an MD is drawn as its own filled polygon, so
+                // there are no holes to honour here.
+                fill_path(&mut pixmap, &path, fill_rgba, FillRule::Winding);
                 let sw = scaled_stroke_width(&path, 2.0);
                 stroke_path(&mut pixmap, &path, stroke_rgba, sw);
             }
@@ -747,20 +749,17 @@ fn draw_feature(
     }
 
     for polygon in &feature.polygons {
-        let Some(exterior) = polygon.first() else {
+        let Some(projected) = project_polygon(polygon, mb, w, h) else {
             continue;
         };
-        if exterior.len() < 3 {
-            continue;
-        }
-        let ring = strip_closing_dup(exterior);
-        let pts: Vec<(f32, f32)> = ring
-            .iter()
-            .map(|&(lat, lon)| mb.project(lat, lon, w, h))
-            .collect();
-        if let Some(path) = build_polygon_path(&pts) {
-            fill_path(pixmap, &path, feature.fill_rgba);
+        if let Some((path, rule)) =
+            build_filled_polygon_path(&projected.exterior, &projected.holes)
+        {
+            fill_path(pixmap, &path, feature.fill_rgba, rule);
             if feature.stroke_rgba[3] > 0 {
+                // The path carries the holes as subpaths, so this outlines
+                // them too: a hole's edge is as much a boundary of the feature
+                // as the exterior is.
                 let sw = scaled_stroke_width(&path, 1.5);
                 stroke_path(pixmap, &path, feature.stroke_rgba, sw);
             }
@@ -778,17 +777,141 @@ fn scaled_stroke_width(path: &tiny_skia::Path, base: f32) -> f32 {
     (min_dim / 40.0 * base).clamp(0.5, base)
 }
 
+/// Interior rings below this projected area (square pixels) are dropped.
+///
+/// They are not rare and they are not hypothetical: RDP simplification
+/// (`SIMPLIFY_EPSILON`) collapses a small closed ring to a retracing
+/// out-and-back, and 2,515 of the 4,579 interior rings in a full 7,015-zone
+/// cache have exactly zero area — every one of them a three-point ring whose
+/// shoelace terms cancel pairwise. Such a ring encloses nothing, so even-odd
+/// already ignores it for the fill — but it is still a subpath, and the stroke
+/// would draw every one of them as a hairline scratch across the zone.
+const MIN_HOLE_AREA_PX: f32 = 0.25;
+
+/// Interior rings thinner than this *on average* — twice the area over the
+/// perimeter — are dropped as well.
+///
+/// Area alone does not catch what it was written to catch. A ring can clear
+/// [`MIN_HOLE_AREA_PX`] and still be a scratch: the worst in that same cache
+/// (`forecast_PKZ785`) spreads 0.39 px² over 31.1 px of rim, so it is a fortieth
+/// of a pixel wide and 15 px long. Even-odd removes a fortieth of a pixel of
+/// alpha, which nobody can see; the stroke then draws its rim at full opacity,
+/// which is a visible line across a zone that has no visible hole in it. The
+/// two tests together are the claim: a ring is kept only if it is both big
+/// enough and thick enough to be *seen* as a hole, not merely outlined as one.
+///
+/// A quarter of a pixel, measured: it drops 78 of the 2,040 rings that clear
+/// the area floor and keeps 1,962. The largest ring it drops is 4.6 px² spread
+/// over 41 px of rim; the largest it keeps anywhere near the boundary is
+/// 20 px² over 145 px (`forecast_GMZ237`, 0.276 px wide), a cut-out big enough
+/// to see. Every ring it drops was invisible before this change too, which
+/// never drew an interior ring at all — so this can only decline to add a
+/// scratch, never remove a hole the map has been showing.
+const MIN_HOLE_WIDTH_PX: f32 = 0.25;
+
+/// Unsigned shoelace area, so it says nothing about which way the ring winds.
+fn ring_area_px(pts: &[(f32, f32)]) -> f32 {
+    let n = pts.len();
+    if n < 3 {
+        return 0.0;
+    }
+    let mut twice = 0.0;
+    for i in 0..n {
+        let (x1, y1) = pts[i];
+        let (x2, y2) = pts[(i + 1) % n];
+        twice += x1 * y2 - x2 * y1;
+    }
+    (twice * 0.5).abs()
+}
+
+/// Closed length of the ring, so the last vertex joins back to the first.
+fn ring_perimeter_px(pts: &[(f32, f32)]) -> f32 {
+    let n = pts.len();
+    if n < 2 {
+        return 0.0;
+    }
+    let mut total = 0.0;
+    for i in 0..n {
+        let (x1, y1) = pts[i];
+        let (x2, y2) = pts[(i + 1) % n];
+        total += ((x2 - x1).powi(2) + (y2 - y1).powi(2)).sqrt();
+    }
+    total
+}
+
+/// Whether an interior ring is worth cutting *and outlining* at the size it is
+/// drawn. See [`MIN_HOLE_AREA_PX`] and [`MIN_HOLE_WIDTH_PX`].
+pub(crate) fn hole_is_drawable(pts: &[(f32, f32)]) -> bool {
+    let area = ring_area_px(pts);
+    let perimeter = ring_perimeter_px(pts);
+    // `2 * area >= width * perimeter` rather than a division, so a ring of zero
+    // perimeter cannot produce a NaN. It cannot reach here anyway: zero
+    // perimeter means zero area, which the first test already rejects.
+    area >= MIN_HOLE_AREA_PX && 2.0 * area >= MIN_HOLE_WIDTH_PX * perimeter
+}
+
+/// A GeoJSON polygon projected to texture pixels: the exterior ring, and the
+/// interior rings that [`hole_is_drawable`] keeps.
+///
+/// One definition of "where this polygon's interior is", so the fill
+/// ([`draw_feature`]) and the hatch mask ([`crate::render::hatch`]) cannot
+/// answer differently — which they did while only the fill honoured holes, the
+/// hatch painting straight across a hole the fill had just cut.
+pub(crate) struct ProjectedPolygon {
+    pub(crate) exterior: Vec<(f32, f32)>,
+    pub(crate) holes: Vec<Vec<(f32, f32)>>,
+}
+
+/// `None` when the exterior ring is too short to enclose anything.
+pub(crate) fn project_polygon(
+    polygon: &[GeoPolygonRing],
+    mb: &MercatorBounds,
+    w: f32,
+    h: f32,
+) -> Option<ProjectedPolygon> {
+    let exterior_ring = polygon.first()?;
+    if exterior_ring.len() < 3 {
+        return None;
+    }
+    let project = |ring: &[(f64, f64)]| -> Vec<(f32, f32)> {
+        strip_closing_dup(ring)
+            .iter()
+            .map(|&(lat, lon)| mb.project(lat, lon, w, h))
+            .collect()
+    };
+    // `polygon[1..]` are interior rings — holes. Dropping them painted a donut
+    // as a solid blob while `geo_point_in_feature` counted the hole as outside,
+    // so a click in the cut-out of a marine zone or a nested SPC outlook hit
+    // nothing the eye could see was not there.
+    let holes = polygon[1..]
+        .iter()
+        .filter(|ring| ring.len() >= 3)
+        .map(|ring| project(ring))
+        .filter(|pts| hole_is_drawable(pts))
+        .collect();
+    Some(ProjectedPolygon {
+        exterior: project(exterior_ring),
+        holes,
+    })
+}
+
+/// One closed subpath. Repeated calls on the same builder produce the
+/// multi-subpath path a polygon with holes needs.
+fn push_ring(pb: &mut PathBuilder, pts: &[(f32, f32)]) {
+    pb.move_to(pts[0].0, pts[0].1);
+    for &(x, y) in &pts[1..] {
+        pb.line_to(x, y);
+    }
+    pb.close();
+}
+
 /// `None` for degenerate paths, which tiny-skia cannot fill.
 pub(crate) fn build_polygon_path(pts: &[(f32, f32)]) -> Option<tiny_skia::Path> {
     if pts.len() < 3 {
         return None;
     }
     let mut pb = PathBuilder::new();
-    pb.move_to(pts[0].0, pts[0].1);
-    for &(x, y) in &pts[1..] {
-        pb.line_to(x, y);
-    }
-    pb.close();
+    push_ring(&mut pb, pts);
     let path = pb.finish()?;
     let b = path.bounds();
     if b.width() < 0.1 || b.height() < 0.1 {
@@ -797,14 +920,80 @@ pub(crate) fn build_polygon_path(pts: &[(f32, f32)]) -> Option<tiny_skia::Path> 
     Some(path)
 }
 
-fn fill_path(pixmap: &mut Pixmap, path: &tiny_skia::Path, rgba: [u8; 4]) {
+/// A whole GeoJSON polygon — exterior ring plus its interior rings — as one
+/// path, with the fill rule that path must be filled under.
+///
+/// **Even-odd, because that is what the hit test computes.**
+/// `geo_point_in_feature` counts ray crossings per ring and never looks at
+/// orientation, so even-odd is the rule that makes painted pixels and clicks
+/// answer the same question. `Winding` would instead punch a hole only where
+/// the interior ring runs against its exterior.
+///
+/// That distinction is not academic even though the producers mostly behave.
+/// Measured over a full 7,015-zone NWS cache and eight archived SPC outlooks:
+/// of 2,064 interior rings with any area at all, 2,062 wind against their
+/// exterior as GeoJSON's right-hand rule asks — and two do not, so `Winding`
+/// would leave those two solid. The other 2,515 interior rings in that cache
+/// have *zero* area after simplification and so no orientation for a
+/// winding rule to consult (see `MIN_HOLE_AREA_PX`). A rule that must ask
+/// which way a ring turns has, for more than half of this data, nothing to
+/// ask.
+///
+/// The exterior alone keeps `Winding`, the rule it has always been filled
+/// under. The two rules agree on any simple ring, but RDP simplification
+/// leaves 811 of the 17,306 rings in that cache (4.7%) self-intersecting, and
+/// some of those enclose a doubly-wound region that even-odd would drop — 400
+/// uniform samples of each such ring's bounding box find one in 46 of the 811.
+/// Sampling can only under-count a lobe it never lands in, so 46 is a floor and
+/// not a fraction. Holes are this change's business; re-cutting hole-free
+/// coastlines is not.
+///
+/// **What that deferral costs.** 694 of the 12,727 exterior rings in that cache
+/// (5.5%) self-intersect, and wherever such a ring carries no hole its fill
+/// still reads `Winding` while `geo_point_in_feature` reads it even-odd: the
+/// same paint/click disagreement this commit closes for holes, left open for
+/// self-intersection. It is smaller — the two rules differ only on the
+/// doubly-wound lobes an RDP crossing leaves behind, not on a whole enclave —
+/// but it is the same bug, and it is still here.
+///
+/// **A second residual, of the same family.** RDP can also leave two interior
+/// rings of one polygon overlapping: 99 such pairs in that cache, across 29
+/// polygons, none nested, ~70 px² of overlap in total. Even-odd paints the
+/// overlap (two hole crossings plus the exterior is odd) while the hit test's
+/// `any(hole contains)` calls it outside. That is a strict improvement on what
+/// this function did before — the region used to be painted along with both
+/// holes, and is now painted alone — so it is recorded, not fixed.
+pub(crate) fn build_filled_polygon_path(
+    exterior: &[(f32, f32)],
+    holes: &[Vec<(f32, f32)>],
+) -> Option<(tiny_skia::Path, FillRule)> {
+    // The degeneracy gate stays on the exterior, so a polygon that used to
+    // draw still draws no matter what its holes look like — and so the
+    // hole-free path below is bit-for-bit the one this function has always
+    // returned.
+    let exterior_path = build_polygon_path(exterior)?;
+    if holes.is_empty() {
+        return Some((exterior_path, FillRule::Winding));
+    }
+    let mut pb = PathBuilder::new();
+    pb.push_path(&exterior_path);
+    for hole in holes {
+        if hole.len() >= 3 {
+            push_ring(&mut pb, hole);
+        }
+    }
+    let path = pb.finish()?;
+    Some((path, FillRule::EvenOdd))
+}
+
+fn fill_path(pixmap: &mut Pixmap, path: &tiny_skia::Path, rgba: [u8; 4], rule: FillRule) {
     if rgba[3] == 0 {
         return;
     }
     let mut paint = Paint::default();
     paint.set_color(Color::from_rgba8(rgba[0], rgba[1], rgba[2], rgba[3]));
     paint.anti_alias = true;
-    pixmap.fill_path(path, &paint, FillRule::Winding, Transform::identity(), None);
+    pixmap.fill_path(path, &paint, rule, Transform::identity(), None);
 }
 
 fn stroke_path(pixmap: &mut Pixmap, path: &tiny_skia::Path, rgba: [u8; 4], width: f32) {
@@ -1108,6 +1297,9 @@ pub fn rasterize_model_data(
 
 #[cfg(test)]
 mod glm_energy_tests;
+
+#[cfg(test)]
+mod hole_tests;
 
 #[cfg(test)]
 pub(crate) mod lambert_fixture;

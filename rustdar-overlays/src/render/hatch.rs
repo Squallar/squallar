@@ -2,7 +2,9 @@ use tiny_skia::{
     Color, FillRule, LineCap, Mask, Paint, PathBuilder, Pixmap, Stroke, StrokeDash, Transform,
 };
 
-use crate::render::rasterize::{MercatorBounds, build_polygon_path, strip_closing_dup};
+use crate::render::rasterize::{
+    MercatorBounds, ProjectedPolygon, build_filled_polygon_path, project_polygon,
+};
 use crate::types::{HatchPattern, OverlayFeature};
 
 /// Pixels.
@@ -113,6 +115,13 @@ fn draw_directional_hatch(
 
 /// A higher CIG level's area is excluded from lower levels' hatching, so
 /// nested outlook areas do not accumulate overlapping line sets.
+///
+/// The polygon this pass hatches is the same polygon `draw_feature`
+/// fills, holes and all — both go through [`project_polygon`] and
+/// [`build_filled_polygon_path`] so that they cannot read one shape as two.
+/// They did: the fill honoured interior rings while this pass took only
+/// `polygon.first()`, so a hole the fill had just cut got hatched straight
+/// across.
 pub(crate) fn draw_hatch_pass(
     pixmap: &mut Pixmap,
     features: &[OverlayFeature],
@@ -124,10 +133,11 @@ pub(crate) fn draw_hatch_pass(
     struct HatchedPolygon {
         feature_idx: usize,
         path: tiny_skia::Path,
+        rule: FillRule,
     }
 
-    let mut cig2_pts: Vec<Vec<(f32, f32)>> = Vec::new();
-    let mut cig3_pts: Vec<Vec<(f32, f32)>> = Vec::new();
+    let mut cig2: Vec<ProjectedPolygon> = Vec::new();
+    let mut cig3: Vec<ProjectedPolygon> = Vec::new();
     let mut all_hatched: Vec<HatchedPolygon> = Vec::new();
 
     for (idx, feature) in features.iter().enumerate() {
@@ -135,24 +145,22 @@ pub(crate) fn draw_hatch_pass(
             continue;
         }
         for polygon in &feature.polygons {
-            let Some(exterior) = polygon.first() else {
+            let Some(projected) = project_polygon(polygon, mb, w, h) else {
                 continue;
             };
-            let ring = strip_closing_dup(exterior);
-            let pts: Vec<(f32, f32)> = ring
-                .iter()
-                .map(|&(lat, lon)| mb.project(lat, lon, w, h))
-                .collect();
-            if let Some(path) = build_polygon_path(&pts) {
-                match feature.hatch {
-                    HatchPattern::Cig2 => cig2_pts.push(pts),
-                    HatchPattern::Cig3 => cig3_pts.push(pts),
-                    _ => {}
-                }
+            if let Some((path, rule)) =
+                build_filled_polygon_path(&projected.exterior, &projected.holes)
+            {
                 all_hatched.push(HatchedPolygon {
                     feature_idx: idx,
                     path,
+                    rule,
                 });
+                match feature.hatch {
+                    HatchPattern::Cig2 => cig2.push(projected),
+                    HatchPattern::Cig3 => cig3.push(projected),
+                    _ => {}
+                }
             }
         }
     }
@@ -163,17 +171,13 @@ pub(crate) fn draw_hatch_pass(
     for hp in &all_hatched {
         let hatch = features[hp.feature_idx].hatch;
 
-        let exclusion_pts: Vec<&[(f32, f32)]> = match hatch {
-            HatchPattern::Cig1 => cig2_pts
-                .iter()
-                .chain(cig3_pts.iter())
-                .map(|v| v.as_slice())
-                .collect(),
-            HatchPattern::Cig2 => cig3_pts.iter().map(|v| v.as_slice()).collect(),
+        let exclusions: Vec<&ProjectedPolygon> = match hatch {
+            HatchPattern::Cig1 => cig2.iter().chain(cig3.iter()).collect(),
+            HatchPattern::Cig2 => cig3.iter().collect(),
             _ => Vec::new(),
         };
 
-        let Some(mask) = hatch_mask_with_exclusions(pw, ph, &hp.path, &exclusion_pts) else {
+        let Some(mask) = hatch_mask_with_exclusions(pw, ph, &hp.path, hp.rule, &exclusions) else {
             continue;
         };
 
@@ -181,8 +185,9 @@ pub(crate) fn draw_hatch_pass(
     }
 }
 
-/// Coverage mask for one hatched ring: the ring's interior minus the union of
-/// every exclusion ring's interior.
+/// Coverage mask for one hatched polygon: the polygon's interior — holes
+/// already cut out of it by `rule` — minus the union of every exclusion
+/// polygon's interior, holes cut out of those too.
 ///
 /// Subtraction, not parity: the previous implementation put the hatched ring
 /// and all exclusion rings into one path and filled it `EvenOdd`, which is
@@ -193,28 +198,36 @@ pub(crate) fn draw_hatch_pass(
 /// bbox got the lower level's hatching drawn outside the hatched polygon
 /// entirely (one crossing, odd). Union-then-subtract holds for any nesting
 /// depth and any disjoint arrangement.
+///
+/// `rule` comes from [`build_filled_polygon_path`], which is also what chose
+/// the path: a hole-free polygon still fills `Winding`, exactly as this
+/// function has always filled it.
 fn hatch_mask_with_exclusions(
     pw: u32,
     ph: u32,
     hatched: &tiny_skia::Path,
-    exclusions: &[&[(f32, f32)]],
+    rule: FillRule,
+    exclusions: &[&ProjectedPolygon],
 ) -> Option<Mask> {
     let mut mask = Mask::new(pw, ph)?;
-    mask.fill_path(hatched, FillRule::Winding, false, Transform::identity());
+    mask.fill_path(hatched, rule, false, Transform::identity());
 
     if exclusions.is_empty() {
         return Some(mask);
     }
 
-    // One `fill_path` per ring: successive fills union onto the mask, and a
-    // ring filled alone covers its interior whichever way it winds. A single
-    // `Winding` fill over all rings at once would cancel to zero wherever two
-    // rings of opposite orientation overlap — SPC does not promise consistent
-    // ring orientation — and `EvenOdd` is the parity bug this replaces.
+    // One `fill_path` per polygon: successive fills union onto the mask, and a
+    // polygon filled alone covers its interior whichever way its rings wind. A
+    // single `Winding` fill over all of them at once would cancel to zero
+    // wherever two rings of opposite orientation overlap — SPC does not promise
+    // consistent ring orientation — and `EvenOdd` over all of them at once is
+    // the parity bug this replaces. Unioning is also what makes an exclusion's
+    // *own* hole work: the fill never writes the hole, so whatever another
+    // exclusion put there survives.
     let mut excl = Mask::new(pw, ph)?;
-    for pts in exclusions {
-        if let Some(path) = build_polygon_path(pts) {
-            excl.fill_path(&path, FillRule::Winding, false, Transform::identity());
+    for poly in exclusions {
+        if let Some((path, poly_rule)) = build_filled_polygon_path(&poly.exterior, &poly.holes) {
+            excl.fill_path(&path, poly_rule, false, Transform::identity());
         }
     }
 
@@ -248,9 +261,18 @@ mod tests {
         mask.data()[(y * mask.width() + x) as usize]
     }
 
-    fn mask_for(hatched_pts: &[(f32, f32)], exclusions: &[&[(f32, f32)]]) -> Mask {
-        let hatched = build_polygon_path(hatched_pts).expect("fixture ring must build");
-        hatch_mask_with_exclusions(100, 100, &hatched, exclusions).expect("mask must build")
+    /// A hole-free projected polygon, the shape most of these fixtures need.
+    fn solid(pts: Vec<(f32, f32)>) -> ProjectedPolygon {
+        ProjectedPolygon {
+            exterior: pts,
+            holes: Vec::new(),
+        }
+    }
+
+    fn mask_for(hatched: &ProjectedPolygon, exclusions: &[&ProjectedPolygon]) -> Mask {
+        let (path, rule) = build_filled_polygon_path(&hatched.exterior, &hatched.holes)
+            .expect("fixture polygon must build");
+        hatch_mask_with_exclusions(100, 100, &path, rule, exclusions).expect("mask must build")
     }
 
     /// The nested case the pass exists for: CIG1 ⊃ CIG2 ⊃ CIG3. A point inside
@@ -259,9 +281,9 @@ mod tests {
     /// again.
     #[test]
     fn cig1s_mask_excludes_a_point_inside_doubly_nested_exclusions() {
-        let cig1 = square(50.0, 50.0, 40.0);
-        let cig2 = square(50.0, 50.0, 25.0);
-        let cig3 = square(50.0, 50.0, 10.0);
+        let cig1 = solid(square(50.0, 50.0, 40.0));
+        let cig2 = solid(square(50.0, 50.0, 25.0));
+        let cig3 = solid(square(50.0, 50.0, 10.0));
         let mask = mask_for(&cig1, &[&cig2, &cig3]);
 
         assert_eq!(
@@ -285,8 +307,8 @@ mod tests {
     /// fill hatched *outside* the hatched polygon entirely.
     #[test]
     fn a_disjoint_exclusion_ring_does_not_pick_up_the_hatching() {
-        let hatched = square(30.0, 50.0, 15.0);
-        let disjoint = square(70.0, 50.0, 10.0);
+        let hatched = solid(square(30.0, 50.0, 15.0));
+        let disjoint = solid(square(70.0, 50.0, 10.0));
         let mask = mask_for(&hatched, &[&disjoint]);
 
         assert_eq!(
@@ -308,10 +330,11 @@ mod tests {
     /// overlap.
     #[test]
     fn exclusion_survives_opposite_winding_directions() {
-        let cig1 = square(50.0, 50.0, 40.0);
-        let cig2 = square(50.0, 50.0, 25.0);
-        let mut cig3 = square(50.0, 50.0, 10.0);
-        cig3.reverse(); // clockwise, opposite to `square`'s order
+        let cig1 = solid(square(50.0, 50.0, 40.0));
+        let cig2 = solid(square(50.0, 50.0, 25.0));
+        let mut cig3_pts = square(50.0, 50.0, 10.0);
+        cig3_pts.reverse(); // clockwise, opposite to `square`'s order
+        let cig3 = solid(cig3_pts);
 
         let mask = mask_for(&cig1, &[&cig2, &cig3]);
         assert_eq!(
@@ -323,6 +346,59 @@ mod tests {
             coverage(&mask, 50, 15),
             255,
             "control: CIG1-only area still hatches"
+        );
+    }
+
+    /// The disagreement honouring holes in the fill would otherwise have
+    /// opened: `draw_feature` cuts the hole, and this pass used to hatch
+    /// straight across it, so the cut-out came back as a patch of bare lines.
+    #[test]
+    fn a_holed_polygon_is_not_hatched_inside_its_hole() {
+        let hatched = ProjectedPolygon {
+            exterior: square(50.0, 50.0, 40.0),
+            holes: vec![square(50.0, 50.0, 15.0)],
+        };
+        let mask = mask_for(&hatched, &[]);
+
+        assert_eq!(
+            coverage(&mask, 50, 50),
+            0,
+            "the hatch mask covers the polygon's hole: this pass is reading \
+             only the exterior ring again while the fill reads all of them"
+        );
+        assert_eq!(
+            coverage(&mask, 50, 20),
+            255,
+            "control: the solid ring between exterior and hole still hatches"
+        );
+        assert_eq!(coverage(&mask, 50, 5), 0, "control: outside the exterior");
+    }
+
+    /// A hole in an *exclusion* polygon is not excluded — the lower level's
+    /// hatching shows through it, because the higher level does not cover it.
+    #[test]
+    fn a_hole_in_an_exclusion_polygon_lets_the_lower_level_hatch_through() {
+        let cig1 = solid(square(50.0, 50.0, 45.0));
+        let cig2 = ProjectedPolygon {
+            exterior: square(50.0, 50.0, 30.0),
+            holes: vec![square(50.0, 50.0, 12.0)],
+        };
+        let mask = mask_for(&cig1, &[&cig2]);
+
+        assert_eq!(
+            coverage(&mask, 50, 50),
+            255,
+            "CIG2's hole is not CIG2's area, so CIG1 must still hatch there"
+        );
+        assert_eq!(
+            coverage(&mask, 50, 30),
+            0,
+            "control: CIG2's solid part still excludes CIG1's hatching"
+        );
+        assert_eq!(
+            coverage(&mask, 50, 10),
+            255,
+            "control: CIG1 outside CIG2 still hatches"
         );
     }
 }
