@@ -110,6 +110,7 @@ weight.
 | --- | --- |
 | `LICENSE` | See above — the tarball ships none. |
 | `VENDORED.md` | This file. |
+| `src/messages/framing_tests.rs` | The framing fix's own tests, described in full under *Changed — source* below. An in-source module rather than a `tests/` target so it travels with the fix in the upstream diff — which does mean it is a new file, shows up in `diff -rq`, and so belongs in this table and not only in that prose. |
 
 ### Changed — `Cargo.toml`
 
@@ -141,8 +142,13 @@ Verified against a real case: `manual_div_ceil` in
 
 ### Changed — source
 
-Two changes: the framing fix this directory exists for, and one lint scoping
-that changes no behaviour.
+The framing fix this directory exists for, one lint scoping that changes no
+behaviour, and four findings from an audit of the vendored copy — one
+allocation removed from the per-radial path, one silent truncation fixed, and
+two hygiene changes. Every one of the four is either a shrink of the delta or a
+pin on something the delta depends on, and none of them moves a decoded byte;
+the three that touch decoding were each verified over 35 volumes (27 WSR-88D,
+8 TDWR) with a digest over every message, every moment array and every radial.
 
 #### The framing fix — `src/messages/mod.rs`
 
@@ -200,12 +206,130 @@ Two behaviour deltas worth stating:
   can newly lose a record.
 
 New `src/messages/framing_tests.rs`, an in-source `#[cfg(test)]` module so it
-travels with the fix in the upstream diff. Six tests: the padded TDWR stream
-stays framed; the unpadded stream keeps the exact offsets and sizes it had;
-the packaged WSR-88D radial declares exactly its own length so the skip is a
-no-op; a failed parse recovers to the next message; an unknown variable-length
-message is skipped to its declared end; and a corrupt declared size does not
-desync a clean parse. Three of the six fail against the published code.
+travels with the fix in the upstream diff. Eight tests: the padded TDWR stream
+stays framed; every pad width from 0 to 7 stays framed; a pad of 8 — one past
+the bound — is not trusted; the unpadded stream keeps the exact offsets and
+sizes it had; the packaged WSR-88D radial declares exactly its own length so
+the skip is a no-op; a failed parse recovers to the next message; an unknown
+variable-length message is skipped to its declared end; and a corrupt declared
+size does not desync a clean parse. Three of the eight fail against the
+published code.
+
+The second and third of those are the ones that make "the bound is the point"
+enforceable rather than merely asserted. Two one-line edits used to survive the
+whole suite: closing the accepted range one byte early
+(`walk..walk + MAX_TRAILING_PAD`), and widening `MAX_TRAILING_PAD` from 7 to
+15. The first silently desyncs 13.3% of real TDWR radials — measured across
+48,600 of them, the pad is 4 on 30,285, 5 on 1,440, 6 on 10,395 and **7 on
+6,480**, so the inclusive endpoint is where a sixth of the site's data lives.
+The second reintroduces exactly the corrupt-`segment_size` failure the bound
+was chosen to prevent. Both now fail, each against a different test. Both
+tests spell 7 out rather than reading `MAX_TRAILING_PAD`: a test phrased in
+terms of the bound moves with the bound and pins nothing.
+
+Odd pads needed a fixture that can express one. A body of message header plus
+radial header is even and `segment_size` counts halfwords, so the original
+`m31` builder can only produce an even pad, and asserts as much.
+`m31_with_moment` adds one eight-bit reflectivity block with an odd gate count,
+which is how real TDWR radials come by their odd pads.
+
+#### The pointer table is walked, not collected — `src/messages/digital_radar_data/message.rs`
+
+Message 31's parser read its data block pointer table into a `Vec` and then
+consumed that `Vec` in the loop immediately below. The list never escaped the
+function, and `pointers_raw` borrows the input rather than the reader, so the
+loop can walk `chunks_exact` directly.
+
+Collecting cost an allocation per radial and usually two: `Result<Vec<_>>`
+collects through a shunt iterator whose `size_hint` lower bound is zero, so the
+`Vec` could not be pre-sized from a count `chunks_exact` knows exactly — it
+allocated at capacity 4 and grew 4 → 8 → 16. Measured over an 11,160-radial
+volume: `decode_messages` allocator operations 40,287 → 14,007 (−65%),
+instructions retired 30.65 M → 17.12 M (−44%), and 63.05 M → 49.51 M (−21.5%)
+across `decode_messages` + `into_radial` together. That is 0.16–1.08% of a
+whole volume decode — not user-visible on WSR-88D, and 4–7× more valuable on
+TDWR, which is the site class this directory exists for.
+
+Bit-identity is structural: `chunks_exact(4)` yields exactly-four-byte slices,
+so the `try_into()` that could fail never could and its error arm was
+unreachable.
+
+**One API consequence.** That arm was the crate's only constructor of
+`Error::Decoding(String)`. The clutter filter map guard below gives the variant
+a constructor again, so the enum is not left with a dead arm — but if only the
+pointer-table change is taken upstream, note that `Error` is not
+`#[non_exhaustive]`, so a downstream `match` naming `Decoding` still compiles
+and simply cannot be reached.
+
+#### The clutter map segment count is refused, not truncated — `src/messages/clutter_filter_map/message.rs`
+
+`elevation_segment_count` is declared as a `u16`; `ElevationSegment` numbers
+itself with a `u8`; the two were reconciled with `as u8`. A header declaring 256
+segments therefore truncated to zero, the loop never ran, and the caller got
+`Ok` on an empty map whose own `elevation_segment_count()` still reported 256.
+Nothing in that value said the map had been lost.
+
+Refused rather than saturated: the ICD allows 1 to 5 elevation segments
+(2620002AA Table XIV), so a declaration past 255 is not a map this decoder can
+act on, and clamping to 255 would mean acting on a number the file never
+stated.
+
+This is the one change here that alters what an input decodes to, and altering
+it is the point — a 256-declaring header used to return `Ok`, and now returns
+an error. What holds is the narrower claim: **no valid map is refused, and
+nothing that ever decoded to a single elevation segment decodes differently.**
+Only counts a `u8` could never hold are affected. The two real Message 15s in
+the corpus checked here, from KABR and KCRP, each declare 5 segments and decode
+5.
+
+Nor can the new error cost a caller anything it had. `decode_messages` catches
+a fixed-segment parse failure as a `warn!` and drops that one message; by then
+the reader has already advanced past the frames, so no record desyncs and
+everything else in it still decodes. This workspace matches only
+`DigitalRadarData`, `DigitalRadarDataLegacy` and `VolumeCoveragePattern`, so it
+never looks at a Message 15 at all.
+
+Two in-source tests pin it: the refusal at 256, 257, 512 and 65,535, and 0, 1,
+2, 5 and 255 still parsing to exactly that many segments.
+
+#### A file's count no longer sizes an allocation on its own — `src/messages/rda_prf_data/message.rs`, `src/messages/clutter_filter_bypass_map/message.rs`
+
+Three `Vec::with_capacity(n)` calls took `n` from a header and allocated before
+anything had checked the input could back it. All three counts are
+`u16`-bounded, so the worst case was about 2.1 MB and the loop underneath hit
+EOF on its first read — but the crate already contains the right shape twice,
+in `volume_coverage_pattern`'s elevation cuts and the clutter filter map's
+range zones: `take_slice(count)`, which fails on EOF, and only then `.collect()`.
+
+`rda_prf_data`'s PRF values are that shape exactly and now use it. The other
+two cannot be: a waveform entry is variable-length, and a bypass map's range
+bins are read across segment boundaries into an owned buffer, which is the one
+thing `take_slice` will not do. Both are instead sized to what the reader still
+holds divided by the smallest an entry can cost, so a declaration can shrink
+the allocation but never grow it past what the input could satisfy.
+
+Two caveats, because these are real differences and not only hygiene, and
+because a note that claims to be the honest account has to carry the parts that
+do not flatter the change. Both are stated at their sites in comments too.
+
+`take_slice` is **narrower** than the `take_ref` loop it replaces, not only
+differently placed. The loop reads what fits in the current segment and
+continues in the next; `take_slice` moves to the next segment first and then
+wants the whole run inside it, because that is what
+`ref_from_prefix_with_elems` needs. So a PRF run that fits across the remaining
+segments but not in the next one alone is now `UnexpectedEof` where the loop
+would have read it in pieces. Unreachable in practice: no Message 32 in any
+volume decoded here is multi-segment, the packaged fixture is a single segment
+of 64 halfwords and its snapshot is unchanged, and this workspace never matches
+the type.
+
+And the bypass map's capacity is now `min(declared, remaining_total / 23042)`,
+which is a floor and not the count. On a real multi-segment map it can come out
+*below* the true number of segments — the more so because the 12-bytes-short
+multi-segment payload slice recorded under *Known upstream defects* below
+biases `remaining_total` down. That is a pre-size that can now under-size,
+trading an over-allocation on an unchecked number for the occasional realloc on
+a once-per-volume metadata path. The right way round, but a trade.
 
 #### The lint scoping — `src/lib.rs`
 
@@ -326,10 +450,15 @@ the same default rules as the rest of it.
 ## Upstream pull request
 
 > **TODO — not yet filed.** When it is, put the URL here and note which of the
-> changes above it carries. The framing fix and the `cfg_attr` lint scoping are
-> both intended for upstream; the trims are not (they are local packaging).
-> The three defects under *Known upstream defects* belong in the PR description
-> or in follow-up issues.
+> changes above it carries. The framing fix, the four audit findings and the
+> `cfg_attr` lint scoping are all intended for upstream; the trims are not
+> (they are local packaging). The three defects under *Known upstream defects*
+> belong in the PR description or in follow-up issues.
+>
+> The four audit findings are independent of the framing fix and of each other,
+> so they can go as their own commits or their own PRs — which is how they are
+> committed here. Only the clutter filter map guard changes what any input
+> decodes to, and only for a declaration no `u8` could ever have held.
 
 ## Removing this directory
 
