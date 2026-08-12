@@ -1765,14 +1765,22 @@ impl PaneState {
     /// cut behind those pixels declared, or `None` when nothing on screen can
     /// carry that annotation.
     ///
-    /// A TDWR's Doppler cuts declare 20-30 m/s against the 22.5-35.5 m/s
-    /// `rustdar_radar::nyquist` measured across its WSR-88D probe volumes, and
-    /// the velocity ramp is fixed at ±80.55 mph (±36.01 m/s) for both. So on a
-    /// TPIT sweep at 22.14 the outer third of the bar is colour that radar
-    /// cannot measure: past ±Vny the sign wraps and an inbound 25 m/s gate
-    /// comes back painted as outbound 19. The legend says where that starts,
-    /// and the one thing it must get right is *which* fold limit is on the
-    /// glass this frame.
+    /// The velocity ramp is fixed at ±80.55 mph (±36.01 m/s) for every radar,
+    /// while a WSR-88D's Doppler cuts declare 23.84–62.94 m/s across the ten
+    /// volumes `rustdar_radar::nyquist` measured. So on KTLX's 0.5° cut at
+    /// 23.84 the outer third of the bar is colour that radar cannot measure —
+    /// past ±Vny the sign wraps and an inbound 25 m/s gate comes back painted
+    /// as outbound 19 — while on KFFC's cut 12 at 62.94 the whole bar is inside
+    /// the fold and nothing on it wraps at all. The legend says which of those
+    /// the reader is looking at, and the one thing it must get right is *which*
+    /// fold limit is on the glass this frame.
+    ///
+    /// A TDWR answers `None` here, always, and not by omission: it declares
+    /// `nyquist_velocity = 0` on every cut of every volume, which
+    /// `rustdar_radar::nyquist::DeclaredNyquist::declare` refuses as the
+    /// absence it is. Before that refusal existed the zero arrived intact and
+    /// this returned `Some(0.0)`, and every TDWR velocity pane was captioned
+    /// `folds ±0`.
     ///
     /// # The playing frame wins over the texture
     ///
@@ -1795,9 +1803,10 @@ impl PaneState {
     ///
     /// Section and volume panes answer `None` by construction. Their picture is
     /// assembled from a whole tilt ladder whose cuts each declare their own
-    /// limit — 22.5 m/s on a low cut against 35.5 on a high cut of the *same*
-    /// volume, which is the measurement `rustdar_radar::nyquist` exists for —
-    /// so a single number over all of them would be wrong for most of them.
+    /// limit — 25.65 m/s on KFFC's low Doppler cuts against 62.94 on its cut
+    /// 12, in one volume, which is the measurement `rustdar_radar::nyquist`
+    /// exists for — so a single number over all of them would be wrong for most
+    /// of them.
     ///
     /// # Only what the pixels are
     ///

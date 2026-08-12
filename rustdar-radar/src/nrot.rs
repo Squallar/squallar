@@ -2040,11 +2040,27 @@ pub(crate) fn dealias(
 /// **Declared wins, above the floor.** The declaration is a property of the
 /// waveform — the PRF the cut was flown at — and it is right whether or not the
 /// sweep happened to fold, which is exactly where [`estimate_nyquist`] is
-/// wrong. TDWR is where the difference stops being academic: its Nyquist
-/// velocity is around 20–30 m/s against the WSR-88D's ~64, so its Doppler cuts
-/// fold routinely, and a calm sector of one of them estimates a limit far
-/// below the real one and then unfolds honest gradients into shear that was
-/// never in the air.
+/// wrong. A calm sector estimates a limit far below the real one and then
+/// unfolds honest gradients into shear that was never in the air; a
+/// declaration cannot do that.
+///
+/// # Which radar this reaches, measured
+///
+/// **The WSR-88D, and only it.** Its Doppler cuts declare 23.84–62.94 m/s
+/// across ten volumes, and the number moves inside one volume as much as
+/// between sites — KFFC's low Doppler cuts declare 25.65 and its cut 12
+/// declares 62.94 — so a per-sweep declaration is worth having and this arm
+/// takes it.
+///
+/// The TDWR does **not** reach it, and that is the correction to what stood
+/// here before. Its short PRT does buy 150 m gates at the cost of unambiguous
+/// velocity, so its Doppler cuts really do fold on ordinary storm motion — but
+/// it never says where. Across 22 volumes from 10 TDWR sites over three days,
+/// every cut declares `nyquist_velocity = 0`, which
+/// [`crate::nyquist::DeclaredNyquist::declare`] refuses as the absence it is.
+/// So a TDWR arrives here with `declared_nyquist_ms == None` and takes the
+/// estimator arm — the radar this argument was originally made about is the one
+/// still being estimated for.
 ///
 /// [`crate::sampler::FOLD_LIMIT_FLOOR_MS`] bounds both, and it is the sampler's
 /// own constant rather than a second copy of the number: the guard that refuses
@@ -3139,10 +3155,11 @@ mod tests {
     /// A gust front is 11 m/s in and 11 m/s out across one line, and the
     /// declared limit is what tells that from a fold.
     ///
-    /// The fixture is the shape a TDWR exists to see: half the rotation
-    /// inbound at 11 m/s, half outbound at 11 m/s, nothing else. Nothing in it
-    /// is folded — a TPIT Doppler cut declares around 22 m/s and the fastest
-    /// gate here is half of that.
+    /// The fixture is the shape a gust front makes: half the rotation inbound
+    /// at 11 m/s, half outbound at 11 m/s, nothing else. Nothing in it is
+    /// folded — the narrowest Doppler declaration measured across ten WSR-88D
+    /// volumes is KTLX's 23.84 m/s, and the fastest gate here is under half of
+    /// that.
     ///
     /// [`estimate_nyquist`] reads the fastest gate, so it answers **11**, and
     /// the post-pass censor then blanks any bin more than
@@ -3150,15 +3167,19 @@ mod tests {
     /// facing each other across the line stand 22 m/s apart, which under that
     /// limit is a fold wall no pass could have placed, so the censor erases
     /// them: 160 bins of the strongest convergence in the sweep, in a field
-    /// with no fold anywhere in it. Told the 22.4 m/s the cut was flown at, the
-    /// same wall sits inside a 27.8 m/s censor and stands.
+    /// with no fold anywhere in it. Told the 23.84 m/s the cut was flown at,
+    /// the same wall sits inside a 29.6 m/s censor and stands.
     ///
     /// The `None` arm is not scaffolding — it is what every reader of this
     /// module did before the declaration crossed the model boundary, and it is
     /// what a Message 1 volume still gets.
     #[test]
     fn a_declared_limit_keeps_a_shear_line_the_estimate_censors_as_a_fold() {
-        const DECLARED_MS: f64 = 22.4;
+        /// KTLX's 0.5° Doppler cut, 2026-08-11 10:09 — the narrowest real
+        /// declaration in the ten-volume WSR-88D control, so the fixture is
+        /// tested against the tightest censor an archive has actually asked
+        /// for.
+        const DECLARED_MS: f64 = 23.84;
         let n = 72;
         let gates = 40;
         let azimuths = ring_azimuths(n);

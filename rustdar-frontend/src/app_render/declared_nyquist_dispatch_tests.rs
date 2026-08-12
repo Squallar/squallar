@@ -8,9 +8,18 @@
 //! that let the dealiaser estimate — the two differ in a band of borderline
 //! gates and in nothing else.
 //!
-//! TDWR is why the band matters: its Doppler cuts declare around 22 m/s
-//! against a WSR-88D's ~64, so they fold on ordinary storm motion and a calm
-//! sector of one estimates far below the truth.
+//! The band matters wherever the estimate can be wrong, which is any cut whose
+//! calmest sector reports well under its real limit. It is the **WSR-88D** that
+//! puts a number on the wire for this to carry: its Doppler cuts declare
+//! 23.84–62.94 m/s across the ten volumes `rustdar_radar::nyquist` measured.
+//!
+//! Not the TDWR, which is worth stating because the case for declared-over-
+//! estimated was originally argued on it. Its short PRT does make folding
+//! routine, but it never says where: across 22 volumes from 10 TDWR sites,
+//! every cut declares `nyquist_velocity = 0`, which
+//! `DeclaredNyquist::declare` refuses as the absence it is. A TDWR therefore
+//! posts jobs carrying `None` here and is dealiased against the estimate, the
+//! same as it was before any of this existed.
 
 use crate::offload::{JobRequest, WorkerPort};
 use crate::platform_double::TestBridge;
@@ -18,10 +27,14 @@ use rustdar_radar::types::RadarProduct;
 use std::sync::{Arc, Mutex};
 
 const SITE: &str = "KTLX";
-/// The 0.5° cut's own statement — a real TDWR Doppler figure, and a value no
-/// default anywhere produces, so a payload that reached the assertions
-/// carrying it can only have been stamped.
-const DECLARED_MS: f64 = 22.14;
+/// The 0.5° cut's own statement — KTLX's real declaration on 2026-08-11 at
+/// 10:09, and a value no default anywhere produces, so a payload that reached
+/// the assertions carrying it can only have been stamped.
+///
+/// It reads `KTLX` above and it is a WSR-88D number, which it was not before:
+/// this constant was 22.14 and called itself "a real TDWR Doppler figure",
+/// and no TDWR declares anything at all.
+const DECLARED_MS: f64 = 23.84;
 /// A second cut, declaring something else, so a stamp that copied one cut's
 /// number onto every sweep would be visible.
 const OTHER_CUT_MS: f64 = 31.35;
@@ -207,8 +220,8 @@ fn posted_jobs(recorded: &Mutex<Vec<Vec<u8>>>) -> Vec<JobRequest> {
 /// The plan view rasterizes NROT on the worker and the section derives NROT on
 /// the worker, and each unfolds velocity before it computes shear. Between them
 /// they used to disagree: the section payload was stamped with the volume's
-/// declarations and the plan view's was not, so a section of a TDWR Doppler cut
-/// unfolded around the RDA's ~22 m/s while the map under it unfolded around
+/// declarations and the plan view's was not, so a section of a Doppler cut
+/// unfolded around the RDA's own number while the map under it unfolded around
 /// whatever its calmest sector happened to observe. Nothing errored, nothing
 /// warned, and the two pictures of one cut simply differed.
 #[test]

@@ -71,6 +71,65 @@ fn a_non_finite_declaration_is_refused_rather_than_stored() {
     assert!(table.is_empty(), "{table:?}");
 }
 
+/// **A zero leaves its cut unnamed.** The live case, not a defensive one:
+/// across 22 TDWR volumes from 10 sites over three days, every cut of every
+/// volume declares `nyquist_velocity = 0`, so this is the arm a TDWR takes on
+/// every radial it has.
+///
+/// Unnamed rather than stored, because `Vny = λ·PRF/4` and no cut that emitted
+/// a radial was flown at no PRF: zero is the wire spelling *not populated*, and
+/// the honest table for a TDWR is the empty one that makes every reader
+/// estimate. Stored, it reached the velocity legend — which floors nothing —
+/// as the caption `folds ±0`.
+#[test]
+fn a_zero_declaration_leaves_its_cut_unnamed() {
+    let mut table = DeclaredNyquist::empty();
+    // Every cut of a 16-cut TDWR volume, as `declare_from_message` offers them.
+    for elevation_number in 1..=16 {
+        table.declare(elevation_number, 0.0);
+    }
+    assert!(
+        table.is_empty(),
+        "a volume that declared zero on every cut must name none of them: {table:?}",
+    );
+    assert_eq!(table.get(1), None);
+    assert_eq!(
+        table.contradicted().count(),
+        0,
+        "a zero is an absence, not two cuts disagreeing under one key",
+    );
+
+    // A cut that already holds a real number is not unnamed by a later zero
+    // either, on the same footing as any other second statement: the zero is
+    // refused before first-wins is consulted, so it is not a contradiction.
+    let mut mixed = DeclaredNyquist::empty();
+    mixed.declare(2, 23.84);
+    mixed.declare(2, 0.0);
+    assert_eq!(mixed.get(2), Some(23.84));
+    assert_eq!(mixed.contradicted().count(), 0, "{mixed:?}");
+}
+
+/// A negative declaration cannot come off the wire — the field is a `u16` of
+/// hundredths — but it can come off [`FromIterator`], which is public. It is
+/// refused on the same test as the zero, so the table's invariant holds
+/// whichever door a value arrives through, `set`'s included.
+#[test]
+fn a_negative_declaration_is_refused_at_every_door() {
+    let collected: DeclaredNyquist = [(1, -23.84), (2, 23.84)].into_iter().collect();
+    assert_eq!(collected.get(1), None);
+    assert_eq!(collected.get(2), Some(23.84));
+
+    let mut base: DeclaredNyquist = [(3, 23.84)].into_iter().collect();
+    base.set(3, -1.0);
+    base.set(4, 0.0);
+    assert_eq!(
+        base.get(3),
+        Some(23.84),
+        "the merge door must not erase a real declaration with a non-speed",
+    );
+    assert_eq!(base.get(4), None);
+}
+
 /// The merge direction the current merged volume needs: the in-flight
 /// overlay's statement replaces the complete base's for a cut it has resealed,
 /// and cuts it has not reached keep the base's.

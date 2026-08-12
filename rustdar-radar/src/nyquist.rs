@@ -6,9 +6,9 @@
 //! Doppler velocity wraps at the Nyquist velocity, and
 //! [`crate::sampler::VolumeSampler`] refuses to interpolate a pair of readings
 //! that straddle that wrap. The number is a property of the sweep's PRF: it
-//! differs from cut to cut inside one volume — measured 22.5–31 m/s on the low
-//! cuts against up to 35.5 on the high cuts of the same volume — so the guard
-//! needs it per sweep, not per volume.
+//! differs from cut to cut inside one volume — KFFC's 2026-08-12 02:05 volume
+//! declares 25.65 m/s on each of its low Doppler cuts and climbs to 62.94 on
+//! cut 12 — so the guard needs it per sweep, not per volume.
 //!
 //! **The archive states it.** Message 31's Radial Data Block carries
 //! `nyquist_velocity`, in hundredths of a metre per second, on every radial;
@@ -27,12 +27,37 @@
 //! stays as the fallback, because it is still the only answer available where
 //! the declaration is not:
 //!
+//! * **every TDWR volume.** See below — the field is on the wire and it is
+//!   zero, which [`DeclaredNyquist::declare`] refuses, so a TDWR reaches the
+//!   sampler with an empty table and estimates every cut exactly as it did
+//!   before this module existed;
 //! * a volume decoded entirely from **Message 1** (`digital_radar_data_legacy`)
 //!   — the legacy message has no Nyquist field of any kind, so there is nothing
 //!   to read, and this is an absence rather than an error;
 //! * a `Scan` that reached the sampler by some route that never carried a
 //!   table — every test fixture, and any future caller that holds only model
 //!   types.
+//!
+//! # Who this actually helps, measured
+//!
+//! **The WSR-88D, and not the TDWR.** Twenty-two TDWR volumes from ten sites
+//! over three days declare `nyquist_velocity = 0` on every cut; ten WSR-88D
+//! volumes read the same way declare 8.27–62.94 m/s and never zero. So the
+//! improvement this module exists for lands on the radar that states its
+//! waveform, and the radar whose short PRT makes folding routine — the one the
+//! case for declared-over-estimated was argued on — is precisely the one still
+//! being estimated for. That is worth knowing before anybody reasons about
+//! TDWR velocity from the presence of this code.
+//!
+//! Two shapes in the WSR-88D numbers matter to a reader:
+//!
+//! * a split cut's **surveillance** half declares 8.27–9.68 m/s. That is the
+//!   long PRT, it is real, and it sits barely above
+//!   [`crate::sampler::FOLD_LIMIT_FLOOR_MS`]'s 8.0 — but those cuts carry no
+//!   velocity moment, so no velocity rung is ever served one;
+//! * the **Doppler** cuts declare 23.84–62.94 m/s, and the spread is within one
+//!   volume as much as across sites: KFFC's low Doppler cuts declare 25.65 and
+//!   its cut 12 declares 62.94.
 //!
 //! # What is *not* in here
 //!
@@ -82,10 +107,49 @@ impl DeclaredNyquist {
     /// constant by construction — every radial of a cut is collected at the
     /// same PRF — so the first radial to arrive is as good a statement as the
     /// last, and first-wins makes the table independent of how many radials a
-    /// caller happens to walk. A non-finite value is refused rather than
-    /// stored: it would reach the guard as a comparison that is false in both
-    /// directions, which is a silently disabled guard rather than an absent
-    /// one.
+    /// caller happens to walk.
+    ///
+    /// # A number that is not a fold limit is not stored
+    ///
+    /// [`Self::is_a_fold_limit`] is the whole admission test, and both halves
+    /// of it refuse rather than clamp.
+    ///
+    /// A non-finite value would reach the guard as a comparison that is false
+    /// in both directions, which is a silently disabled guard rather than an
+    /// absent one.
+    ///
+    /// **Zero and below are refused on the same footing**, and that half is not
+    /// hypothetical. `Vny = λ·PRF/4`, so a fold limit of zero says the cut was
+    /// flown at no PRF at all, which cannot be true of a cut that produced the
+    /// radial the field was read from: it is the wire's way of spelling *not
+    /// populated*. **Every TDWR spells it that way.** Across 22 Level II
+    /// volumes from 10 TDWR sites (TATL, TDFW, THOU, TMCO, TMIA, TMSY, TORD,
+    /// TPHX, TPIT, TTPA) over three days, every cut of every volume declares
+    /// `nyquist_velocity = 0` — not a low number, zero — in a Radial Data Block
+    /// that is otherwise sound: the same 20-byte legacy block decodes
+    /// `unambiguous_range` correctly at 4604, 1259, 905 and 1088, and its two
+    /// channel noise levels are zero beside it. Ten WSR-88D volumes read on the
+    /// same pass declare 8.27–62.94 m/s and never zero.
+    ///
+    /// Refused rather than recorded in [`Self::contradicted`], because the two
+    /// say different things about an archive. A contradiction is two cuts
+    /// colliding under one elevation number — a keying problem the *value*
+    /// survives, which is why it is reported and the number still stands. Zero
+    /// is the absence of a value, and there is nothing for a reader to stand
+    /// on.
+    ///
+    /// And refused here rather than left for each consumer to floor, because
+    /// **no consumer wants "the archive said zero" told apart from "the archive
+    /// said nothing"**: all three answer the same way, estimate. Two of them
+    /// already erased the distinction — [`crate::sampler::VolumeSampler`] and
+    /// `crate::nrot::fold_limit_ms` both drop a limit under
+    /// [`crate::sampler::FOLD_LIMIT_FLOOR_MS`], so a zero has never reached a
+    /// dealias pass or a straddle test. The third had no floor: the velocity
+    /// legend's caption reads its number straight off the render, and every
+    /// TDWR velocity pane in the shipping app was captioned **`folds ±0`** over
+    /// a bar with no fold markers on it, because the markers *did* refuse a
+    /// non-positive limit and the caption did not. One refusal here clears the
+    /// wire, the legend and every future consumer at once.
     ///
     /// # When first-wins is the wrong rule, and how you would know
     ///
@@ -111,7 +175,7 @@ impl DeclaredNyquist {
     /// would otherwise log its 360 radials identically and bury the one line
     /// that says which cut and which two numbers.
     pub fn declare(&mut self, elevation_number: u8, metres_per_second: f64) {
-        if !metres_per_second.is_finite() {
+        if !Self::is_a_fold_limit(metres_per_second) {
             return;
         }
         let Some(&held) = self.by_elevation.get(&elevation_number) else {
@@ -130,6 +194,19 @@ impl DeclaredNyquist {
              {metres_per_second} m/s: two cuts share one key, so every reader of this volume \
              folds the later one around the earlier one's PRF"
         );
+    }
+
+    /// Whether a number is a speed a sweep could actually fold at: finite, and
+    /// above zero.
+    ///
+    /// The one admission test, shared by [`Self::declare`] and [`Self::set`],
+    /// so the table's invariant — *every value in it is a fold limit* — cannot
+    /// depend on which of the two doors a value came in through. Written out
+    /// once for the same reason [`Self::declare_from_message`] is the crate's
+    /// only reader of the wire field: a second copy of the rule is a second
+    /// chance for one of them to drift, and the drift would be silent.
+    fn is_a_fold_limit(metres_per_second: f64) -> bool {
+        metres_per_second.is_finite() && metres_per_second > 0.0
     }
 
     /// The cuts a second, different declaration arrived for — empty on every
@@ -195,7 +272,7 @@ impl DeclaredNyquist {
     /// first-wins rule is what keeps a table from depending on how far a walk
     /// happened to get, so this is not part of the public surface.
     pub(crate) fn set(&mut self, elevation_number: u8, metres_per_second: f64) {
-        if metres_per_second.is_finite() {
+        if Self::is_a_fold_limit(metres_per_second) {
             self.by_elevation
                 .insert(elevation_number, metres_per_second);
         }
@@ -217,7 +294,10 @@ impl DeclaredNyquist {
     ///
     /// A radial with no Radial Data Block leaves its cut unnamed rather than
     /// declaring a zero — an absence the guard estimates for, not a fold limit
-    /// of nothing.
+    /// of nothing. So does a radial whose block is *present* and whose field
+    /// reads zero, which is every TDWR radial there is: [`Self::declare`] makes
+    /// those two the same answer, because the archive means the same thing by
+    /// them.
     pub(crate) fn declare_from_message(
         &mut self,
         radar: &nexrad_decode::messages::digital_radar_data::Message<'_>,
@@ -256,8 +336,10 @@ impl DeclaredNyquist {
     ///
     /// Every failure is an absence, never an error: an unreadable record, a
     /// record that will not decompress, a Message 1 volume (no Nyquist field
-    /// exists in the legacy message) and a Message 31 radial with no Radial
-    /// Data Block all leave their cut unnamed, and the guard estimates for it.
+    /// exists in the legacy message), a Message 31 radial with no Radial Data
+    /// Block and a block declaring zero all leave their cut unnamed, and the
+    /// guard estimates for it. A TDWR is the last of those on every radial, so
+    /// this returns an empty table for one and that is the correct answer.
     /// Returning a `Result` here would make a volume that renders perfectly
     /// well fail on a field only one product's interpolation reads.
     pub fn from_archive(file: &nexrad_data::volume::File) -> Self {

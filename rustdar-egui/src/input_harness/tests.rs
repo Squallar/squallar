@@ -1479,20 +1479,27 @@ fn the_mehs_colour_bar_paints_the_users_hail_size_unit() {
     }
 }
 
-/// A TPIT Doppler cut's own declaration, m/s.
+/// KTLX's 0.5° Doppler cut's own declaration, m/s — 2026-08-11 at 10:09, and
+/// the narrowest of the ten WSR-88D volumes `rustdar_radar::nyquist` measured.
 ///
-/// A real number off a real waveform: the TDWR's short PRT buys 150 m gates and
-/// costs unambiguous velocity, so the picture wraps at less than two thirds of
-/// the ±36.01 m/s the fixed ramp spans.
-const TDWR_NYQUIST_MS: f64 = 22.14;
+/// A real number off a real waveform, and a **WSR-88D** one on purpose. This
+/// constant used to be 22.14 m/s and to call itself a TPIT declaration; no TPIT
+/// cut declares 22.14, and no TDWR cut declares anything at all. Across 22 TDWR
+/// volumes from 10 sites, every cut declares `nyquist_velocity = 0`, which
+/// `DeclaredNyquist::declare` refuses — so a TDWR reaches this annotation with
+/// nothing, and a fixture labelled as one was describing a path that does not
+/// exist. 23.84 wraps at two thirds of the ±36.01 m/s the fixed ramp spans,
+/// which is the geometry these tests are about.
+const DECLARED_NYQUIST_MS: f64 = 23.84;
 
 /// A declaration past the end of the ramp, m/s.
 ///
-/// Wider than anything `rustdar_radar::nyquist` has measured — 22.5-35.5 m/s
-/// across its probe volumes, where even the fastest high cut clears the bar's
-/// 36.01 by half a metre a second — and inside what Message 31's
+/// Wider than the 62.94 m/s of KFFC's cut 12, which is the fastest
+/// `rustdar_radar::nyquist` has measured, and inside what Message 31's
 /// hundredths-of-a-metre field carries. It is the widest speed the velocity
-/// moment itself encodes, ±63.5 m/s in half-metre steps.
+/// moment itself encodes, ±63.5 m/s in half-metre steps — 0.56 m/s of headroom
+/// over the real maximum, so "past the bar" is barely a fixture and mostly a
+/// measurement.
 const PAST_THE_BAR_MS: f64 = 63.5;
 
 /// A landscape pane on `site` showing a finished velocity render that declares
@@ -1554,8 +1561,8 @@ fn fold_markers_painted(h: &InputHarness) -> Vec<egui::Rect> {
 /// 8d. **The velocity bar says where the picture on it folds, in the reader's
 ///     own speed unit.**
 ///
-///     A TDWR folds at ±22.14 m/s against a ramp that spans ±36.01, so a
-///     third of the bar on either end is colour that sweep cannot produce
+///     KTLX's 0.5° cut folds at ±23.84 m/s against a ramp that spans ±36.01,
+///     so a third of the bar on either end is colour that sweep cannot produce
 ///     except by aliasing — an inbound 25 m/s gate comes back painted as
 ///     outbound 19. The number is the pane's own, off the texture metadata
 ///     `apply_render_to_pane` stamped from the render, and it is converted
@@ -1571,16 +1578,16 @@ fn fold_markers_painted(h: &InputHarness) -> Vec<egui::Rect> {
 fn the_velocity_bar_says_where_its_own_sweep_folds_in_every_speed_unit() {
     use rustdar_units::SpeedUnit;
 
-    let mut h = velocity_pane("TOKC", Some(TDWR_NYQUIST_MS));
+    let mut h = velocity_pane("KTLX", Some(DECLARED_NYQUIST_MS));
     let pane = h.pane_rects()[0];
 
-    // 22.14 m/s in each unit, rounded as the annotation rounds: 49.52 mph,
-    // 79.70 km/h, 43.03 kt.
+    // 23.84 m/s in each unit, rounded as the annotation rounds: 53.33 mph,
+    // 85.82 km/h, 46.34 kt.
     let expected = [
-        (SpeedUnit::Mph, "folds \u{b1}50"),
-        (SpeedUnit::MetersPerSec, "folds \u{b1}22"),
-        (SpeedUnit::KilometersPerHour, "folds \u{b1}80"),
-        (SpeedUnit::Knots, "folds \u{b1}43"),
+        (SpeedUnit::Mph, "folds \u{b1}53"),
+        (SpeedUnit::MetersPerSec, "folds \u{b1}24"),
+        (SpeedUnit::KilometersPerHour, "folds \u{b1}86"),
+        (SpeedUnit::Knots, "folds \u{b1}46"),
     ];
     let mut marker_positions: Option<Vec<egui::Rect>> = None;
     for (unit, line) in expected {
@@ -1730,11 +1737,60 @@ fn a_sweep_that_declared_no_nyquist_gets_the_bar_unchanged() {
     );
 }
 
+/// 8f(ii). **A fold limit of zero is no fold limit, and the bar says nothing
+///          rather than `folds ±0`.**
+///
+///          The bug this pins shipped. Every TDWR declares
+///          `nyquist_velocity = 0` on every cut — 22 volumes, 10 sites, three
+///          days, no exceptions — and the zero travelled the whole chain
+///          intact: stored by `DeclaredNyquist::declare`, handed out by
+///          `render`, stamped into the frame metadata, returned by
+///          `displayed_nyquist_ms`, and formatted by `fold_title_line`, which
+///          floored nothing. `fold_marker_positions` *did* refuse it, so what
+///          reached the glass was a caption reading `folds ±0` over a bar with
+///          no markers on it: the two halves of one annotation disagreeing in
+///          front of the user.
+///
+///          `declare` now refuses the zero at the archive, which is why no
+///          TDWR can reach here carrying one. This drives the pane directly to
+///          pin the other half — the legend's own refusal to caption a speed it
+///          will not mark — so the property survives any future producer that
+///          stamps a zero into a frame by some other route.
+#[test]
+fn a_pane_with_no_usable_fold_limit_captions_nothing() {
+    for absurd in [0.0, -1.0, f64::NAN] {
+        let h = velocity_pane("KTLX", Some(absurd));
+        let pane = h.pane_rects()[0];
+        let painted = h.painted_text_strings_in(pane);
+        assert!(
+            painted.iter().any(|t| t == "mph"),
+            "precondition: the velocity bar must be drawn at all; painted: \
+             {painted:?}",
+        );
+        assert_eq!(
+            fold_line_painted(&h),
+            None,
+            "a fold limit of {absurd} was captioned rather than dropped; \
+             painted: {painted:?}",
+        );
+        assert!(
+            fold_markers_painted(&h).is_empty(),
+            "a fold limit of {absurd} was marked on the bar",
+        );
+    }
+
+    // And the honest number still gets its caption, so the guard above is a
+    // filter rather than a switch that turned the annotation off.
+    let good = velocity_pane("KTLX", Some(DECLARED_NYQUIST_MS));
+    assert_eq!(fold_line_painted(&good).as_deref(), Some("folds \u{b1}53"));
+}
+
 /// 8g. **The annotation describes the pixels, not the selection.**
 ///
 ///     A product switch holds the previous image while the new render runs, and
-///     on a TDWR the sweeps either side of that switch declare different
-///     limits. A pane that annotated its *selection* would draw the incoming
+///     the sweeps either side of that switch declare different limits — KFFC's
+///     ladder runs 25.65 m/s on its low cuts to 62.94 on cut 12, inside one
+///     volume. A pane that annotated its *selection* would draw the incoming
 ///     sweep's fold across the outgoing sweep's colours — a marker in the wrong
 ///     place on a picture that is still perfectly real. The same gate the
 ///     pending-render notice reads answers this one.
@@ -1742,7 +1798,7 @@ fn a_sweep_that_declared_no_nyquist_gets_the_bar_unchanged() {
 fn a_pane_annotates_no_fold_while_its_image_lags_the_selection() {
     use rustdar_radar::types::RadarProduct;
 
-    let mut h = velocity_pane("TOKC", Some(TDWR_NYQUIST_MS));
+    let mut h = velocity_pane("KTLX", Some(DECLARED_NYQUIST_MS));
     assert!(
         fold_line_painted(&h).is_some(),
         "precondition: the pane must be annotating its own render",
@@ -1757,16 +1813,16 @@ fn a_pane_annotates_no_fold_while_its_image_lags_the_selection() {
     );
 
     // Back to velocity, but the render that lands is the 2.4° sweep while the
-    // pane has snapped to 0.5° — a different cut, and on a TDWR a different
-    // PRF. Nothing is claimed until the pane's own sweep is on the glass.
+    // pane has snapped to 0.5° — a different cut, and a different PRF. Nothing
+    // is claimed until the pane's own sweep is on the glass.
     h.select_product(0, RadarProduct::Velocity);
-    h.place_radar_image(0, RadarProduct::Velocity, 2.4, Some(TDWR_NYQUIST_MS));
+    h.place_radar_image(0, RadarProduct::Velocity, 2.4, Some(DECLARED_NYQUIST_MS));
     assert_eq!(
         fold_line_painted(&h),
         None,
         "a fold limit was drawn over a sweep the pane did not select",
     );
-    h.place_radar_image(0, RadarProduct::Velocity, 0.5, Some(TDWR_NYQUIST_MS));
+    h.place_radar_image(0, RadarProduct::Velocity, 0.5, Some(DECLARED_NYQUIST_MS));
     assert!(
         fold_line_painted(&h).is_some(),
         "the annotation did not come back with the pane's own sweep",
@@ -1792,7 +1848,7 @@ fn the_fold_annotation_leaves_the_strip_counts_and_the_pane_alone() {
         "precondition: a landscape panel draws a right-edge bar, got {bare:?}",
     );
 
-    let annotated = velocity_pane("TOKC", Some(TDWR_NYQUIST_MS));
+    let annotated = velocity_pane("KTLX", Some(DECLARED_NYQUIST_MS));
     assert_eq!(
         annotated.color_scale_strips(pane),
         bare,
@@ -1838,7 +1894,7 @@ fn a_bottom_edge_bar_annotates_under_itself_rather_than_off_the_pane() {
         "precondition: a portrait panel draws a bottom-edge bar, got {bare:?}",
     );
 
-    let h = velocity_pane_on(portrait, "TOKC", Some(TDWR_NYQUIST_MS));
+    let h = velocity_pane_on(portrait, "KTLX", Some(DECLARED_NYQUIST_MS));
     assert_eq!(
         h.color_scale_strips(pane),
         bare,
@@ -1846,7 +1902,7 @@ fn a_bottom_edge_bar_annotates_under_itself_rather_than_off_the_pane() {
     );
     assert_eq!(
         fold_line_painted(&h).as_deref(),
-        Some("folds \u{b1}50"),
+        Some("folds \u{b1}53"),
         "painted: {:?}",
         h.painted_text_strings_in(pane),
     );
@@ -1944,7 +2000,7 @@ fn every_products_unit_title_fits_inside_its_pane() {
 fn the_range_folded_purple_is_keyed_on_the_bars_that_can_paint_it() {
     use rustdar_radar::types::RadarProduct;
 
-    let mut h = velocity_pane("TOKC", Some(TDWR_NYQUIST_MS));
+    let mut h = velocity_pane("KTLX", Some(DECLARED_NYQUIST_MS));
     let pane = h.pane_rects()[0];
     let purple = {
         let (r, g, b, a) = rustdar_radar::RANGE_FOLDED;
@@ -1998,7 +2054,7 @@ fn the_range_folded_purple_is_keyed_on_the_bars_that_can_paint_it() {
 fn the_fold_annotation_returns_with_the_picture_rather_than_from_a_config() {
     use rustdar_radar::types::RadarProduct;
 
-    let mut h = velocity_pane("TOKC", Some(TDWR_NYQUIST_MS));
+    let mut h = velocity_pane("KTLX", Some(DECLARED_NYQUIST_MS));
     let before = fold_line_painted(&h).expect("precondition: an annotated pane");
 
     // A surface loss: the overlay entry goes, the pane's own state does not.
@@ -2016,7 +2072,7 @@ fn the_fold_annotation_returns_with_the_picture_rather_than_from_a_config() {
     );
 
     // …and the restore, which re-uploads the kept copy with the same metadata.
-    h.place_radar_image(0, RadarProduct::Velocity, 0.5, Some(TDWR_NYQUIST_MS));
+    h.place_radar_image(0, RadarProduct::Velocity, 0.5, Some(DECLARED_NYQUIST_MS));
     assert_eq!(
         fold_line_painted(&h).as_deref(),
         Some(before.as_str()),

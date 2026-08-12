@@ -280,10 +280,13 @@ fn a_long_range_render_is_placed_at_the_size_it_was_rendered_at() {
         value_data: std::sync::Arc::new(vec![f32::NAN; side * side]),
         product: PRODUCT,
         elevation: 0.5,
-        // A TDWR Doppler cut's own declaration, so the assertion below reads a
-        // number the fixture states rather than a default that would pass
-        // against a placement that dropped it.
-        nyquist_ms: Some(22.14),
+        // KTLX's 0.5° Doppler cut's own declaration, so the assertion below
+        // reads a number the fixture states rather than a default that would
+        // pass against a placement that dropped it. A WSR-88D's and not the
+        // TDWR's whose range the extent above came from: a TDWR declares
+        // `nyquist_velocity = 0` on every cut, which `DeclaredNyquist::declare`
+        // refuses, so it arrives here with nothing to stamp.
+        nyquist_ms: Some(23.84),
     };
     app.apply_render_to_pane(&ctx, 0, &render);
 
@@ -306,7 +309,7 @@ fn a_long_range_render_is_placed_at_the_size_it_was_rendered_at() {
     );
     assert_eq!(
         placed.radar_meta.as_ref().and_then(|m| m.nyquist_ms),
-        Some(22.14),
+        Some(23.84),
         "the fold limit of the cut behind these pixels travels with them; \
          without it a velocity pane can say nothing about where its own \
          picture wraps",

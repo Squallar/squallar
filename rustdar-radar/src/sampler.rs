@@ -486,13 +486,33 @@ impl Blend {
 /// when it did not. An underestimate is mostly harmless — see that function —
 /// but a sweep that saw nothing faster than a few m/s gives a limit so small
 /// that ordinary noise clears it, and then the straddle test fires on air that
-/// is merely calm. No operational NEXRAD waveform has a Nyquist velocity this
-/// low, so below it the guard is switched off rather than trusted.
+/// is merely calm. No waveform that carries a velocity moment has a Nyquist
+/// velocity this low, so below it the guard is switched off rather than
+/// trusted.
 ///
 /// It bounds the **declared** limit too, wherever one exists, on the other
-/// half of the same reasoning: no operational waveform folds below 8 m/s, so a
-/// declaration under it is a mis-decoded field rather than a very slow radar,
-/// and the estimate is the better of two poor answers.
+/// half of the same reasoning: a velocity-bearing cut declaring under 8 m/s is
+/// a mis-decoded field rather than a very slow radar, and the estimate is the
+/// better of two poor answers.
+///
+/// # "No operational waveform folds below 8 m/s" is not what the archive says
+///
+/// It very nearly is, and the margin is thinner than the number looks. The
+/// surveillance half of a WSR-88D split cut declares **8.27–9.68 m/s** across
+/// the ten-volume control — KTLX's 8.27 is 0.27 above this floor — because the
+/// long PRT that buys it 460 km of unambiguous range costs it exactly that. So
+/// the floor is not clear of real declarations; it is clear of real
+/// declarations *on cuts anybody asks it about*. Those cuts carry no velocity
+/// moment at all, and [`Blend::folds_at_measured_limit`] is what keeps the
+/// lookup to velocity, so no rung is ever served one.
+///
+/// Which is to say the floor rests on that gate rather than on a comfortable
+/// gap in the physics. Widen the lookup to another moment, or key a rung by
+/// anything other than the sweep that actually carries the moment, and 8.27
+/// m/s is admissible — a fold interval of 16.5 m/s laid over a field that does
+/// not fold. Raising the floor is the wrong repair (it would start refusing
+/// honest Doppler declarations well before it cleared 9.68); keeping the gate
+/// is the right one, which is why it is named here and not only there.
 ///
 /// `pub(crate)` because `crate::nrot::fold_limit_ms` chooses the same way for
 /// the pass that *removes* folds, and this guard is the one that refuses to
@@ -531,9 +551,10 @@ struct Rung<'a> {
     /// over the whole sweep.
     ///
     /// Per rung, not per volume: the Nyquist velocity follows the cut's PRF,
-    /// and it genuinely differs inside one volume — measured across the six
-    /// probe volumes, the low cuts fold at 22.5–31 m/s while the high cuts of
-    /// the same volume fold at up to 35.5.
+    /// and it genuinely differs inside one volume — measured across ten WSR-88D
+    /// volumes, the Doppler cuts declare 23.84–62.94 m/s, and the spread is
+    /// within a volume as much as between sites: KFFC's low Doppler cuts
+    /// declare 25.65 while its cut 12 declares 62.94.
     fold_limit_ms: Option<f64>,
     /// Where [`Self::fold_limit_ms`] came from: `true` for the archive's own
     /// declaration (Message 31's Radial Data Block, carried here by

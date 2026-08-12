@@ -1547,7 +1547,24 @@ pub(super) fn render_color_scale(
     // [`PaneState::displayed_nyquist_ms`], which answers for base velocity
     // alone, and this is one of the two places that would look like an
     // oversight without it.
-    let folds_at = pane.displayed_nyquist_ms();
+    // Filtered here, above both halves of the annotation, so the caption and
+    // the markers answer from one decision about what a fold limit is.
+    //
+    // They did not, and the asymmetry shipped. `fold_marker_positions` has
+    // always refused a non-positive limit and correctly drawn nothing;
+    // `fold_title_line` had no such test and formatted whatever it was handed.
+    // Every TDWR declares `nyquist_velocity = 0` on every cut, so what a user
+    // saw on a TDWR velocity pane was the caption `folds ±0` over a bar with no
+    // markers on it — the two halves of one annotation disagreeing in public.
+    //
+    // `DeclaredNyquist::declare` now refuses that zero at the archive, which is
+    // the fix; this is the legend declining to caption a speed it will not
+    // mark, which holds whatever a future producer stamps into a frame's
+    // metadata. The legend is a leaf and cannot check provenance, so it checks
+    // the one thing it can: a picture does not fold at zero.
+    let folds_at = pane
+        .displayed_nyquist_ms()
+        .filter(|ms| ms.is_finite() && *ms > 0.0);
     if let Some(nyquist_ms) = folds_at {
         for value in fold_marker_positions(nyquist_ms as f32, min_val, max_val)
             .into_iter()
@@ -1793,18 +1810,32 @@ pub(super) fn render_color_scale(
 /// `get_color_for_value(product, value)` as a pure function of the pair. So the
 /// *marker* moves and the colours hold still.
 ///
-/// # An off-scale Nyquist is marked nowhere
+/// # An off-scale Nyquist is marked nowhere, and it is reachable
 ///
-/// The bar reaches 36.01 m/s and the fastest declaration
-/// `rustdar_radar::nyquist` has measured is a high cut's 35.5, so a real one
-/// clears the end of the bar by half a metre a second — and Message 31 carries
-/// the field in hundredths of a metre per second, which is room for a great
-/// deal more than that. A marker clamped to the end for a declaration past it
-/// would say the picture folds at 36.01, the one speed it certainly does not
-/// fold at, and one drawn off the end would land in the pane's chrome. Nothing
-/// is drawn, and the `folds ±142` line beside the unit title still states the
-/// limit — the honest half of the annotation, since a ramp entirely inside a
-/// radar's unambiguous velocity wraps nowhere.
+/// The bar reaches 36.01 m/s. Nine of the ten volumes
+/// `rustdar_radar::nyquist` measured stay inside it — the fastest of those is
+/// KDMX's 35.35, which is the half-metre-a-second margin this note used to
+/// claim was the whole story. The tenth is not a rounding error: **KFFC
+/// declares past the bar on five of its fourteen cuts**, 37.1, 40.43, 40.43,
+/// 49.3 and 62.94 m/s, the last of them clearing the end by 27. One site in ten
+/// is not the ordinary case, but it is not a hypothetical either — select a
+/// high tilt on that volume and this is the branch you get.
+///
+/// A marker clamped to the end would say the picture folds at 36.01, the one
+/// speed it certainly does not fold at, and one drawn off the end would land in
+/// the pane's chrome. Nothing is drawn, and the `folds ±141` line beside the
+/// unit title still states the limit — the honest half of the annotation, and
+/// on these cuts the *whole* honest annotation, since a ramp lying entirely
+/// inside a radar's unambiguous velocity wraps nowhere and has nothing to mark.
+///
+/// # A non-positive Nyquist is marked nowhere either
+///
+/// Zero is what every TDWR declares, on every cut. It reaches here only if
+/// something upstream of `rustdar_radar::nyquist::DeclaredNyquist::declare`
+/// stamped it, and the answer is the same as for the off-scale case: no marker.
+/// The caption is gated on the same test at the one call site, because for a
+/// while it was not, and `folds ±0` over an unmarked bar is what that looked
+/// like.
 fn fold_marker_positions(nyquist_ms: f32, min_val: f32, max_val: f32) -> Option<[f32; 2]> {
     if !nyquist_ms.is_finite() || nyquist_ms <= 0.0 {
         return None;
@@ -2381,43 +2412,60 @@ mod tests {
         (legend.min_value, legend.max_value)
     }
 
-    /// A declaration past the end of the bar, m/s — wider than anything
-    /// `rustdar_radar::nyquist` has measured (22.5-35.5) and inside what
-    /// Message 31's hundredths-of-a-metre field carries. It is also the widest
-    /// speed the velocity moment itself encodes, ±63.5 m/s in half-metre
-    /// steps, so a dealiased field can genuinely reach it.
+    /// A real Doppler declaration that sits **inside** the bar, m/s: KTLX's
+    /// 0.5° cut on 2026-08-11 at 10:09, the narrowest of the ten WSR-88D
+    /// volumes `rustdar_radar::nyquist` measured.
+    ///
+    /// A WSR-88D and not a TDWR, and that is the point rather than an
+    /// arbitrary pick: a TDWR declares `nyquist_velocity = 0` on every cut it
+    /// has, so no TDWR number ever reaches this annotation. A fixture labelled
+    /// as one would be describing a code path that does not exist.
+    const INSIDE_THE_BAR_MS: f32 = 23.84;
+
+    /// A declaration past the end of the bar, m/s — wider than the 62.94 KFFC's
+    /// cut 12 declares, which is the fastest `rustdar_radar::nyquist` has
+    /// measured, and inside what Message 31's hundredths-of-a-metre field
+    /// carries. It is also the widest speed the velocity moment itself encodes,
+    /// ±63.5 m/s in half-metre steps, so a dealiased field can genuinely reach
+    /// it — and the gap between the two, 0.56 m/s, is how little headroom the
+    /// off-scale case has left.
     const PAST_THE_BAR_MS: f32 = 63.5;
 
     /// The fold annotation is the declared limit converted, and nothing else.
     ///
-    /// 22.14 m/s is a TPIT Doppler cut's own declaration. Every user-facing
-    /// number goes through `rustdar-units`, so the four answers here are the
-    /// four the hover readout and the ticks give for the same speed — a bar
-    /// annotated in m/s over ticks in mph is the half-converted state the MEHS
-    /// work ruled out for hail size.
+    /// Every user-facing number goes through `rustdar-units`, so the four
+    /// answers here are the four the hover readout and the ticks give for the
+    /// same speed — a bar annotated in m/s over ticks in mph is the
+    /// half-converted state the MEHS work ruled out for hail size.
     #[test]
     fn the_fold_annotation_is_the_declared_limit_in_the_users_speed_unit() {
+        // 23.84 m/s in each unit, rounded as the annotation rounds: 53.33 mph,
+        // 85.82 km/h, 46.34 kt.
         let expected = [
-            (SpeedUnit::Mph, "folds \u{b1}50"),
-            (SpeedUnit::MetersPerSec, "folds \u{b1}22"),
-            (SpeedUnit::KilometersPerHour, "folds \u{b1}80"),
-            (SpeedUnit::Knots, "folds \u{b1}43"),
+            (SpeedUnit::Mph, "folds \u{b1}53"),
+            (SpeedUnit::MetersPerSec, "folds \u{b1}24"),
+            (SpeedUnit::KilometersPerHour, "folds \u{b1}86"),
+            (SpeedUnit::Knots, "folds \u{b1}46"),
         ];
         for (speed, line) in expected {
             let prefs = UserPreferences {
                 speed,
                 ..UserPreferences::default()
             };
-            assert_eq!(fold_title_line(22.14, &prefs), line, "{speed:?}");
+            assert_eq!(
+                fold_title_line(f64::from(INSIDE_THE_BAR_MS), &prefs),
+                line,
+                "{speed:?}",
+            );
         }
     }
 
-    /// Both ends of a TDWR's fold sit on the bar; a declaration past its reach
-    /// sits nowhere.
+    /// Both ends of a fold inside the ramp are marked; a declaration past its
+    /// reach is marked nowhere.
     ///
-    /// The ramp spans ±36.01 m/s (±80.55 mph) for every radar, so a TPIT cut's
-    /// 22.14 lands at 0.19 and 0.81 of its length while 63.5 is nearly twice
-    /// its reach. The off-scale answer is *nothing*, not a marker parked at the
+    /// The ramp spans ±36.01 m/s (±80.55 mph) for every radar, so KTLX's 23.84
+    /// lands at 0.17 and 0.83 of its length while 63.5 is nearly twice its
+    /// reach. The off-scale answer is *nothing*, not a marker parked at the
     /// end: the end of the bar is the one speed that sweep does not fold at.
     #[test]
     fn a_fold_off_the_end_of_the_ramp_is_marked_nowhere() {
@@ -2430,9 +2478,9 @@ mod tests {
         );
 
         assert_eq!(
-            fold_marker_positions(22.14, min_val, max_val),
-            Some([-22.14, 22.14]),
-            "a TDWR's fold is inside the bar and must be marked at both ends",
+            fold_marker_positions(INSIDE_THE_BAR_MS, min_val, max_val),
+            Some([-INSIDE_THE_BAR_MS, INSIDE_THE_BAR_MS]),
+            "a fold inside the bar must be marked at both ends",
         );
         assert_eq!(
             fold_marker_positions(PAST_THE_BAR_MS, min_val, max_val),
@@ -2447,6 +2495,12 @@ mod tests {
             Some([-max_val, max_val]),
         );
         // A declaration of zero or a non-finite one describes no fold at all.
+        // Zero is the live case — every TDWR declares it — and the caption is
+        // now gated on the same test at the one call site in
+        // `render_color_scale`, which is what
+        // `a_pane_with_no_usable_fold_limit_captions_nothing` pins at app
+        // level. This half always refused it; that is why the bug was a
+        // caption over an unmarked bar rather than a mismarked one.
         for absurd in [0.0, -22.0, f32::NAN, f32::INFINITY] {
             assert_eq!(
                 fold_marker_positions(absurd, min_val, max_val),
