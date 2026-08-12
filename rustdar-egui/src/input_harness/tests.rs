@@ -1479,6 +1479,477 @@ fn the_mehs_colour_bar_paints_the_users_hail_size_unit() {
     }
 }
 
+/// A TPIT Doppler cut's own declaration, m/s.
+///
+/// A real number off a real waveform: the TDWR's short PRT buys 150 m gates and
+/// costs unambiguous velocity, so the picture wraps at less than two thirds of
+/// the ±36.01 m/s the fixed ramp spans.
+const TDWR_NYQUIST_MS: f64 = 22.14;
+
+/// A WSR-88D Doppler cut's, m/s — nearly twice the ramp's reach, so its fold
+/// has no place on the bar.
+const WSR88D_NYQUIST_MS: f64 = 63.7;
+
+/// A landscape pane on `site` showing a finished velocity render that declares
+/// `nyquist_ms`, radar layer on.
+///
+/// Landscape, so the panel-wide orientation puts the bar on the right edge —
+/// the desktop arrangement, and the one whose title block the annotation is
+/// stacked into.
+fn velocity_pane(site: &str, nyquist_ms: Option<f64>) -> InputHarness {
+    velocity_pane_on(egui::vec2(1400.0, 900.0), site, nyquist_ms)
+}
+
+/// The same, on a screen of the caller's choosing — the portrait case puts the
+/// bar along the bottom, where the annotation is laid out differently.
+fn velocity_pane_on(screen: egui::Vec2, site: &str, nyquist_ms: Option<f64>) -> InputHarness {
+    use rustdar_radar::types::RadarProduct;
+
+    let mut h = InputHarness::with_screen(screen);
+    h.load_scan(site);
+    h.gui_mut()
+        .pane_mut(0)
+        .unwrap()
+        .set_overlay_enabled(OverlayKind::Radar, true);
+    h.offer_product(0, RadarProduct::Reflectivity, 0.5);
+    h.offer_product(0, RadarProduct::Velocity, 0.5);
+    h.select_product(0, RadarProduct::Velocity);
+    h.place_radar_image(0, RadarProduct::Velocity, 0.5, nyquist_ms);
+    h
+}
+
+/// The `folds ±N` line the pane painted, if it painted one.
+fn fold_line_painted(h: &InputHarness) -> Option<String> {
+    h.painted_text_strings_in(h.pane_rects()[0])
+        .into_iter()
+        .find(|t| t.starts_with("folds"))
+}
+
+/// The fold markers painted over the bar: rects as long as the 20-point bar
+/// plus its 3-point overhang on each face, which is a shape nothing else on the
+/// legend has.
+///
+/// Written out rather than read off `pane_render`'s constants for the reason
+/// `color_scale_strips` writes out its own 20: a probe sized from the code under
+/// test moves with it, and would go on passing over a marker drawn to the bar's
+/// own width — the one width the strip classifier cannot tell from ramp.
+fn fold_markers_painted(h: &InputHarness) -> Vec<egui::Rect> {
+    const MARKER_LENGTH: f32 = 26.0;
+    let pane = h.pane_rects()[0];
+    h.painted_rects()
+        .iter()
+        .filter(|r| pane.contains(r.center()))
+        .filter(|r| {
+            (r.width() - MARKER_LENGTH).abs() < 0.5 || (r.height() - MARKER_LENGTH).abs() < 0.5
+        })
+        .copied()
+        .collect()
+}
+
+/// 8d. **The velocity bar says where the picture on it folds, in the reader's
+///     own speed unit.**
+///
+///     A TDWR folds at ±22.14 m/s against a ramp that spans ±36.01, so a
+///     third of the bar on either end is colour that sweep cannot produce
+///     except by aliasing — an inbound 25 m/s gate comes back painted as
+///     outbound 19. The number is the pane's own, off the texture metadata
+///     `apply_render_to_pane` stamped from the render, and it is converted
+///     through `rustdar-units` like every other user-facing number: switching
+///     the speed preference must relabel it in the same frame it relabels the
+///     ticks.
+///
+///     The marker positions are asserted alongside, because the whole claim is
+///     that the two agree: a converted title over markers that had moved with
+///     the unit would mean the ramp had been rescaled, which is exactly what
+///     this design refused.
+#[test]
+fn the_velocity_bar_says_where_its_own_sweep_folds_in_every_speed_unit() {
+    use rustdar_units::SpeedUnit;
+
+    let mut h = velocity_pane("TPIT", Some(TDWR_NYQUIST_MS));
+    let pane = h.pane_rects()[0];
+
+    // 22.14 m/s in each unit, rounded as the annotation rounds: 49.52 mph,
+    // 79.70 km/h, 43.03 kt.
+    let expected = [
+        (SpeedUnit::Mph, "folds \u{b1}50"),
+        (SpeedUnit::MetersPerSec, "folds \u{b1}22"),
+        (SpeedUnit::KilometersPerHour, "folds \u{b1}80"),
+        (SpeedUnit::Knots, "folds \u{b1}43"),
+    ];
+    let mut marker_positions: Option<Vec<egui::Rect>> = None;
+    for (unit, line) in expected {
+        h.gui_mut().preferences.speed = unit;
+        h.warm_up();
+        assert_eq!(
+            fold_line_painted(&h).as_deref(),
+            Some(line),
+            "{unit:?}: the bar's fold annotation is not the declared limit in \
+             the unit the reader asked for; painted: {:?}",
+            h.painted_text_strings_in(pane),
+        );
+        // Both ends of the fold are marked, and they are marked in the same
+        // place whatever the labels say — the ramp is a pure function of
+        // (product, value) and the preference is a relabelling.
+        let markers = fold_markers_painted(&h);
+        assert_eq!(
+            markers.len(),
+            2,
+            "{unit:?}: expected a marker at each of ±Vny, got {markers:?}",
+        );
+        match &marker_positions {
+            None => marker_positions = Some(markers),
+            Some(first) => assert_eq!(
+                &markers, first,
+                "{unit:?}: the fold markers moved when the unit changed, so \
+                 the bar was rescaled rather than relabelled",
+            ),
+        }
+    }
+
+    // And the unit title is still over them, unconverted numbers and all.
+    h.gui_mut().preferences.speed = SpeedUnit::MetersPerSec;
+    h.warm_up();
+    let painted = h.painted_text_strings_in(pane);
+    assert!(
+        painted.iter().any(|t| t == "m/s"),
+        "the annotation replaced the unit title instead of standing under it; \
+         painted: {painted:?}",
+    );
+}
+
+/// 8e. **A fold the bar cannot reach is named and not marked.**
+///
+///     A WSR-88D Doppler cut declares ~63.7 m/s, and the ramp stops at 36.01.
+///     A marker clamped to the end of the bar would put the fold at the one
+///     speed the picture certainly does not fold at, so nothing is drawn —
+///     while the title line still states the limit, which is the honest half:
+///     every colour on this bar is inside that radar's unambiguous velocity.
+#[test]
+fn a_nyquist_past_the_end_of_the_bar_is_named_but_not_marked() {
+    let h = velocity_pane("KTLX", Some(WSR88D_NYQUIST_MS));
+
+    assert_eq!(
+        fold_line_painted(&h).as_deref(),
+        // 63.7 m/s is 142.49 mph, the default unit.
+        Some("folds \u{b1}142"),
+        "the off-scale limit is not stated; painted: {:?}",
+        h.painted_text_strings_in(h.pane_rects()[0]),
+    );
+    assert!(
+        fold_markers_painted(&h).is_empty(),
+        "a fold at 63.7 m/s was marked on a bar that stops at 36.01: {:?}",
+        fold_markers_painted(&h),
+    );
+
+    // The widest this line ever gets: three digits, in the unit that produces
+    // them. 63.7 m/s is 229.3 km/h, and `folds ±229` lays out 52 points wide
+    // over a 20-point bar standing 16 points off the pane's edge — so a line
+    // centred on the bar would have handed its last digit to the clip rect.
+    let mut h = h;
+    h.gui_mut().preferences.speed = rustdar_units::SpeedUnit::KilometersPerHour;
+    h.warm_up();
+    let pane = h.pane_rects()[0];
+    let widest: Vec<(egui::Rect, String)> = h
+        .painted_text_rects()
+        .into_iter()
+        .filter(|(_, text)| text == "folds \u{b1}229")
+        .collect();
+    assert!(
+        !widest.is_empty(),
+        "the annotation did not follow the unit change; painted: {:?}",
+        h.painted_text_strings_in(pane),
+    );
+    for (rect, text) in widest {
+        assert!(
+            pane.contains_rect(rect),
+            "{text:?} at {rect:?} runs outside the pane {pane:?}",
+        );
+    }
+}
+
+/// 8f. **An undeclared sweep leaves the bar exactly as it was.**
+///
+///     Most volumes declare a Nyquist and some do not, and the ones that do not
+///     must get the legend the app drew before any of this existed: no marker,
+///     no second title line, and the unit title on its own baseline rather than
+///     pushed up to make room for an annotation that is not there.
+///
+///     The baseline is taken from a *reflectivity* pane of the same geometry,
+///     which shares the title's anchor and knows nothing about folding — so
+///     "unmoved" is asserted against a bar this change cannot have touched
+///     rather than against a number written down here.
+#[test]
+fn a_sweep_that_declared_no_nyquist_gets_the_bar_unchanged() {
+    use rustdar_radar::types::RadarProduct;
+
+    let mut h = velocity_pane("KTLX", None);
+    let pane = h.pane_rects()[0];
+
+    let painted = h.painted_text_strings_in(pane);
+    assert!(
+        painted.iter().any(|t| t == "mph"),
+        "precondition: the velocity bar must be drawn at all; painted: \
+         {painted:?}",
+    );
+    assert_eq!(
+        fold_line_painted(&h),
+        None,
+        "a bar with nothing declared behind it claimed a fold limit; painted: \
+         {painted:?}",
+    );
+    assert!(
+        fold_markers_painted(&h).is_empty(),
+        "markers were painted for a sweep that declared no fold limit",
+    );
+
+    let title_baseline = |h: &InputHarness, unit: &str| -> f32 {
+        h.painted_text_rects()
+            .into_iter()
+            .filter(|(rect, text)| text == unit && pane.contains(rect.center()))
+            .map(|(rect, _)| rect.bottom())
+            .fold(f32::INFINITY, f32::min)
+    };
+    let undeclared = title_baseline(&h, "mph");
+    h.select_product(0, RadarProduct::Reflectivity);
+    h.place_radar_image(0, RadarProduct::Reflectivity, 0.5, None);
+    assert_eq!(
+        undeclared,
+        title_baseline(&h, "dBZ"),
+        "the velocity title sits at a different height from the reflectivity \
+         title on the same bar, so an absent annotation still moved the block",
+    );
+}
+
+/// 8g. **The annotation describes the pixels, not the selection.**
+///
+///     A product switch holds the previous image while the new render runs, and
+///     on a TDWR the sweeps either side of that switch declare different
+///     limits. A pane that annotated its *selection* would draw the incoming
+///     sweep's fold across the outgoing sweep's colours — a marker in the wrong
+///     place on a picture that is still perfectly real. The same gate the
+///     pending-render notice reads answers this one.
+#[test]
+fn a_pane_annotates_no_fold_while_its_image_lags_the_selection() {
+    use rustdar_radar::types::RadarProduct;
+
+    let mut h = velocity_pane("TPIT", Some(TDWR_NYQUIST_MS));
+    assert!(
+        fold_line_painted(&h).is_some(),
+        "precondition: the pane must be annotating its own render",
+    );
+
+    // Reflectivity is selected; the velocity image is still on the glass.
+    h.select_product(0, RadarProduct::Reflectivity);
+    assert_eq!(
+        fold_line_painted(&h),
+        None,
+        "the reflectivity bar carries a velocity sweep's fold limit",
+    );
+
+    // Back to velocity, but the render that lands is the 2.4° sweep while the
+    // pane has snapped to 0.5° — a different cut, and on a TDWR a different
+    // PRF. Nothing is claimed until the pane's own sweep is on the glass.
+    h.select_product(0, RadarProduct::Velocity);
+    h.place_radar_image(0, RadarProduct::Velocity, 2.4, Some(TDWR_NYQUIST_MS));
+    assert_eq!(
+        fold_line_painted(&h),
+        None,
+        "a fold limit was drawn over a sweep the pane did not select",
+    );
+    h.place_radar_image(0, RadarProduct::Velocity, 0.5, Some(TDWR_NYQUIST_MS));
+    assert!(
+        fold_line_painted(&h).is_some(),
+        "the annotation did not come back with the pane's own sweep",
+    );
+}
+
+/// 8h. **The annotation is drawn where nothing else is, and does not change
+///     what the bar is made of.**
+///
+///     Two claims that are one claim in practice. `color_scale_strips`
+///     classifies the legend by shape — 20 points across the bar, ≤4 along it —
+///     and every test that reads it would be counting fold markers as ramp if
+///     they were drawn to the bar's own width. `FOLD_TICK_OVERHANG` takes them
+///     to 26 points instead, out of that classifier's reach, and the whole
+///     annotation stays inside the pane it belongs to.
+#[test]
+fn the_fold_annotation_leaves_the_strip_counts_and_the_pane_alone() {
+    let plain = velocity_pane("KTLX", None);
+    let pane = plain.pane_rects()[0];
+    let bare = plain.color_scale_strips(pane);
+    assert!(
+        bare.1 > 0,
+        "precondition: a landscape panel draws a right-edge bar, got {bare:?}",
+    );
+
+    let annotated = velocity_pane("TPIT", Some(TDWR_NYQUIST_MS));
+    assert_eq!(
+        annotated.color_scale_strips(pane),
+        bare,
+        "the fold markers or the range-folded swatch are being counted as ramp",
+    );
+
+    // Nothing the annotation adds hangs off the pane: the painter is clipped to
+    // it, so anything that did would simply be cut in half on the glass.
+    for (rect, text) in annotated.painted_text_rects() {
+        if text.starts_with("folds") || text == "RF" {
+            assert!(
+                pane.contains_rect(rect),
+                "{text:?} at {rect:?} runs outside the pane {pane:?}",
+            );
+        }
+    }
+    for marker in fold_markers_painted(&annotated) {
+        assert!(
+            pane.contains_rect(marker),
+            "a fold marker at {marker:?} runs outside the pane {pane:?}",
+        );
+    }
+}
+
+/// 8h(ii). **…on the bottom-edge bar too, which lays the annotation out
+///         somewhere else entirely.**
+///
+///         A portrait panel puts the bar along the bottom with its unit title
+///         squeezed into the 12 points between the pane's edge and the bar's
+///         start, so the annotation goes under the *bar* instead — the 16-point
+///         margin below it is the only clear glass on that edge. The painter is
+///         clipped to the pane, so a line laid out on the title's own anchor
+///         would simply be cut off at the screen edge rather than looking
+///         wrong.
+#[test]
+fn a_bottom_edge_bar_annotates_under_itself_rather_than_off_the_pane() {
+    let portrait = egui::vec2(900.0, 1400.0);
+    let plain = velocity_pane_on(portrait, "KTLX", None);
+    let pane = plain.pane_rects()[0];
+    let bare = plain.color_scale_strips(pane);
+    assert!(
+        bare.0 > 0,
+        "precondition: a portrait panel draws a bottom-edge bar, got {bare:?}",
+    );
+
+    let h = velocity_pane_on(portrait, "TPIT", Some(TDWR_NYQUIST_MS));
+    assert_eq!(
+        h.color_scale_strips(pane),
+        bare,
+        "the fold markers or the range-folded swatch are being counted as ramp",
+    );
+    assert_eq!(
+        fold_line_painted(&h).as_deref(),
+        Some("folds \u{b1}50"),
+        "painted: {:?}",
+        h.painted_text_strings_in(pane),
+    );
+    assert_eq!(fold_markers_painted(&h).len(), 2);
+
+    for (rect, text) in h.painted_text_rects() {
+        if text.starts_with("folds") || text == "RF" {
+            assert!(
+                pane.contains_rect(rect),
+                "{text:?} at {rect:?} runs outside the pane {pane:?}, where \
+                 the pane's own clip rect would cut it in half",
+            );
+        }
+    }
+    for marker in fold_markers_painted(&h) {
+        assert!(pane.contains_rect(marker), "{marker:?} outside {pane:?}");
+    }
+}
+
+/// 8i. **The purple on the map has a key, on the two products that can paint
+///     it.**
+///
+///     `render.rs` paints a range-folded gate in a colour no product's scale
+///     can produce, which is what makes it readable as "the radar saw this and
+///     cannot say how far away it was" — but only if the legend says so. The
+///     Doppler cut carries velocity and spectrum width, so those are the two
+///     bars that get the swatch; reflectivity is measured on the surveillance
+///     cut, whose long PRT puts its unambiguous range past anything on screen.
+#[test]
+fn the_range_folded_purple_is_keyed_on_the_bars_that_can_paint_it() {
+    use rustdar_radar::types::RadarProduct;
+
+    let mut h = velocity_pane("TPIT", Some(TDWR_NYQUIST_MS));
+    let pane = h.pane_rects()[0];
+    let purple = {
+        let (r, g, b, a) = rustdar_radar::RANGE_FOLDED;
+        egui::Color32::from_rgba_unmultiplied(r, g, b, a)
+    };
+    let keyed = |h: &InputHarness| {
+        h.painted_text_strings_in(pane).iter().any(|t| t == "RF")
+            && h.painted_fills_within(pane, 0.0).contains(&purple)
+    };
+
+    assert!(
+        keyed(&h),
+        "the velocity bar has no range-folded key; painted: {:?}",
+        h.painted_text_strings_in(pane),
+    );
+
+    h.offer_product(0, RadarProduct::SpectrumWidth, 0.5);
+    h.select_product(0, RadarProduct::SpectrumWidth);
+    h.place_radar_image(0, RadarProduct::SpectrumWidth, 0.5, None);
+    assert!(
+        keyed(&h),
+        "spectrum width carries range-folded gates too and has no key for \
+         them; painted: {:?}",
+        h.painted_text_strings_in(pane),
+    );
+    // …and the fold annotation is velocity's alone: a spectrum width is a
+    // spread, not a Doppler shift, and folds at no speed.
+    assert_eq!(fold_line_painted(&h), None);
+
+    h.select_product(0, RadarProduct::Reflectivity);
+    h.place_radar_image(0, RadarProduct::Reflectivity, 0.5, None);
+    assert!(
+        !keyed(&h),
+        "the reflectivity bar keys a colour its surveillance cut does not \
+         paint; painted: {:?}",
+        h.painted_text_strings_in(pane),
+    );
+}
+
+/// 8j. **The annotation is render-derived, so it comes back with the picture
+///     and nothing has to persist it.**
+///
+///     Nothing in `PaneConfig` describes a fold limit, and nothing should: the
+///     number belongs to a sweep, not to a pane's settings, and a stored copy
+///     would come back beside whatever volume the next session downloads. What
+///     makes that safe is that the annotation is a function of the texture
+///     metadata alone — drop the texture, as a surface loss does, and the pane
+///     goes quiet; put the same render back, as `restore_cached_render` does,
+///     and the annotation returns unchanged.
+#[test]
+fn the_fold_annotation_returns_with_the_picture_rather_than_from_a_config() {
+    use rustdar_radar::types::RadarProduct;
+
+    let mut h = velocity_pane("TPIT", Some(TDWR_NYQUIST_MS));
+    let before = fold_line_painted(&h).expect("precondition: an annotated pane");
+
+    // A surface loss: the overlay entry goes, the pane's own state does not.
+    h.gui_mut()
+        .pane_mut(0)
+        .unwrap()
+        .overlay_cache_mut(OverlayKind::Radar)
+        .current = None;
+    h.warm_up();
+    assert_eq!(
+        fold_line_painted(&h),
+        None,
+        "a pane with no picture on it still claimed to know where that \
+         picture folded",
+    );
+
+    // …and the restore, which re-uploads the kept copy with the same metadata.
+    h.place_radar_image(0, RadarProduct::Velocity, 0.5, Some(TDWR_NYQUIST_MS));
+    assert_eq!(
+        fold_line_painted(&h).as_deref(),
+        Some(before.as_str()),
+        "the annotation did not come back with the restored picture",
+    );
+}
+
 /// 53. A tap that lands on a floating dialog is filtered out by the
 ///     dialog-blocking gate — for both the mouse and the touch path.
 ///     (Renumbered from a colliding 7 — the gesture suite owns that block.)
@@ -4183,7 +4654,12 @@ fn a_compact_mouse_press_and_hold_raises_the_value_popup() {
     let mut h = InputHarness::with_screen(egui::vec2(420.0, 900.0));
     h.load_scan("KTLX");
     let spot = h.pane_rects()[0].center();
-    h.place_radar_image(0, rustdar_radar::types::RadarProduct::Reflectivity, 0.5);
+    h.place_radar_image(
+        0,
+        rustdar_radar::types::RadarProduct::Reflectivity,
+        0.5,
+        None,
+    );
     h.warm_up();
 
     h.mouse_press(spot);
@@ -4923,7 +5399,7 @@ fn pane_showing(showing: rustdar_radar::types::RadarProduct) -> InputHarness {
     h.offer_product(0, RadarProduct::Reflectivity, 0.5);
     h.offer_product(0, RadarProduct::EchoTops, 0.5);
     h.select_product(0, showing);
-    h.place_radar_image(0, showing, 0.5);
+    h.place_radar_image(0, showing, 0.5, None);
     h
 }
 
@@ -4998,7 +5474,7 @@ fn a_pane_says_when_its_image_is_not_the_selected_product() {
     );
 
     // The render lands and the notice goes.
-    h.place_radar_image(0, RadarProduct::EchoTops, 0.5);
+    h.place_radar_image(0, RadarProduct::EchoTops, 0.5, None);
     assert!(
         !any_notice_painted(&h),
         "the notice outlived the render it was waiting for; painted: {:?}",
@@ -5021,7 +5497,7 @@ fn a_same_selection_re_render_draws_no_notice() {
     // Two more volumes' worth of the same selection re-rendered, as an
     // auto-poll or the chunk feed produces.
     for _ in 0..2 {
-        h.place_radar_image(0, RadarProduct::Reflectivity, 0.5);
+        h.place_radar_image(0, RadarProduct::Reflectivity, 0.5, None);
         assert!(
             !any_notice_painted(&h),
             "a routine re-render of the selected product drew a notice; \
@@ -5099,8 +5575,8 @@ fn the_pending_notice_is_identical_for_both_datasources() {
     );
 
     // And each one clears on its own render landing, the same way.
-    awaiting_l3.place_radar_image(0, l3, 0.5);
-    awaiting_l2.place_radar_image(0, l2, 0.5);
+    awaiting_l3.place_radar_image(0, l3, 0.5, None);
+    awaiting_l2.place_radar_image(0, l2, 0.5, None);
     assert!(!any_notice_painted(&awaiting_l3));
     assert!(!any_notice_painted(&awaiting_l2));
 }

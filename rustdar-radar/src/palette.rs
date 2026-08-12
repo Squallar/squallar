@@ -22,7 +22,12 @@ const TRANSPARENCY: u8 = 180;
 /// `the_range_folded_colour_is_unreachable_through_any_products_scale` pins that
 /// no product's own scale can produce this colour at any value, so a folded
 /// pixel is never mistaken for a measured one.
-pub(crate) const RANGE_FOLDED: (u8, u8, u8, u8) = (178, 102, 204, TRANSPARENCY);
+///
+/// Exported because a colour with no key is a colour the reader has to guess
+/// at: `rustdar-egui`'s velocity and spectrum-width legends draw an `RF` swatch
+/// in this exact purple, so the constant that paints the gates is the one that
+/// labels them.
+pub const RANGE_FOLDED: (u8, u8, u8, u8) = (178, 102, 204, TRANSPARENCY);
 
 /// Ascending-threshold color scale: for value `v`, the color of the last entry
 /// whose threshold is <= `v`. The `bool` picks gradient (linear interpolation

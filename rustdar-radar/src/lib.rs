@@ -36,4 +36,4 @@ pub mod volumetric;
 pub mod voxel;
 pub mod xsect;
 
-pub use palette::{LegendScale, get_color_for_value, get_legend_scale};
+pub use palette::{LegendScale, RANGE_FOLDED, get_color_for_value, get_legend_scale};

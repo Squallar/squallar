@@ -1461,17 +1461,24 @@ impl InputHarness {
     /// metadata that says what it depicts.
     ///
     /// The metadata is the point — `PaneState::stale_image_on_screen` reads
-    /// `product` and `elevation` off it — and the fields are filled the way the
-    /// host fills them, from the render's own product and *snapped* elevation
-    /// rather than from the pane's selection. There is one such assignment in
-    /// production, shared by both datasources, and
+    /// `product` and `elevation` off it, `PaneState::displayed_nyquist_ms` reads
+    /// `nyquist_ms` — and the fields are filled the way the host fills them,
+    /// from the render's own product, *snapped* elevation and declared fold
+    /// limit rather than from the pane's selection. There is one such assignment
+    /// in production, shared by both datasources, and
     /// `a_placed_render_describes_what_it_depicts` in `rustdar-frontend` holds
     /// this fixture to it.
+    ///
+    /// `nyquist_ms` is `None` for everything a real render has no declaration
+    /// for — every Level III product, every volume product, and any Level II
+    /// cut whose volume declared nothing — so a test that does not care states
+    /// `None` and gets a pane with nothing to annotate.
     pub(crate) fn place_radar_image(
         &mut self,
         idx: usize,
         product: rustdar_radar::types::RadarProduct,
         elevation: f32,
+        nyquist_ms: Option<f64>,
     ) {
         use crate::overlay_cache::{OverlayTextureData, RadarTextureMeta};
         use rustdar_radar::types::{BASE_EXTENT_KM, ImageBounds};
@@ -1521,10 +1528,7 @@ impl InputHarness {
                 lat,
                 lon,
                 max_range_km: extent_km,
-                // The fixture states no fold limit: nothing driven through
-                // this harness reads one, and a number invented here would be
-                // a claim about a sweep the harness never rendered.
-                nyquist_ms: None,
+                nyquist_ms,
                 product,
                 elevation,
             }),

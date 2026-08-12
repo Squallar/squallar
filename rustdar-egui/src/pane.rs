@@ -1698,6 +1698,72 @@ impl PaneState {
         (!matches_selection).then_some((meta.product, meta.elevation))
     }
 
+    /// Where the picture **on the glass** folds, m/s — the Nyquist velocity the
+    /// cut behind those pixels declared, or `None` when nothing on screen can
+    /// carry that annotation.
+    ///
+    /// A TDWR's Doppler cuts declare 20-30 m/s; a WSR-88D's declare around 64.
+    /// The velocity ramp is fixed at ±80.55 mph (±36.01 m/s) for every one of
+    /// them, so on a TPIT sweep at 22 m/s the outer third of the bar is colour
+    /// the radar cannot measure: past ±Vny the sign wraps and an inbound 25 m/s
+    /// gate comes back as outbound 19. The legend says where that starts, and
+    /// the one thing it must get right is *which* fold limit is on the glass
+    /// this frame.
+    ///
+    /// # The playing frame wins over the texture
+    ///
+    /// A loop steps through volumes and the RDA reselects PRFs between them, so
+    /// two frames of one animation can fold at different speeds. The radar
+    /// texture's metadata describes the *static* render the animation replaced
+    /// — somebody else's picture, exactly as [`Self::data_time`] is while a loop
+    /// runs, which is why [`Self::data_time_on_screen`] exists beside it.
+    ///
+    /// # Base velocity only
+    ///
+    /// Storm-relative velocity is deliberately excluded although it is a
+    /// velocity field: `rustdar_radar::srv` dealiases before subtracting the
+    /// storm motion, so its values legitimately run past ±Vny and a fold marker
+    /// would claim a wrap that is not in the picture. Every other product folds
+    /// nowhere — a fold limit is a property of the Doppler waveform, and
+    /// reflectivity is measured on the surveillance cut.
+    ///
+    /// # A ladder has many Nyquists
+    ///
+    /// Section and volume panes answer `None` by construction. Their picture is
+    /// assembled from a whole tilt ladder whose cuts each declare their own
+    /// limit — a 14-rung VCP 212 volume mixes 8 m/s surveillance cuts with
+    /// 32 m/s Doppler ones — so a single number over all of them would be wrong
+    /// for most of them.
+    ///
+    /// # Only what the pixels are
+    ///
+    /// The static path is gated through [`Self::stale_image_on_screen`], so a
+    /// pane still showing the previous product — or the previous *sweep*, which
+    /// on a TDWR is a different PRF and a different fold limit — annotates
+    /// nothing until its own render lands. The alternative is a number that
+    /// describes the picture the user is waiting for rather than the one they
+    /// are looking at.
+    pub fn displayed_nyquist_ms(&self) -> Option<f64> {
+        if self.selected_product != RadarProduct::Velocity || !self.is_map() {
+            return None;
+        }
+        if self.loop_state.is_active() {
+            // No product gate here, and none is needed: `retarget_renders`
+            // drops every frame texture the moment the selection moves, so a
+            // looping pane cannot hold a frame depicting anything else.
+            return self.active_image().and_then(|frame| frame.nyquist_ms);
+        }
+        if self.stale_image_on_screen().is_some() {
+            return None;
+        }
+        self.overlay_cache(OverlayKind::Radar)?
+            .current
+            .as_ref()?
+            .radar_meta
+            .as_ref()?
+            .nyquist_ms
+    }
+
     /// Whether this overlay is enabled for this pane.
     ///
     /// Falls back to `false` if the kind has no entry (uninitialised pane).

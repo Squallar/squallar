@@ -1100,6 +1100,28 @@ const MIN_LABEL_SPACING: f32 = 14.0;
 /// Gap between two stacked colour-scale bars, logical pixels: the room the
 /// inner one's value labels are read in.
 const SCALE_STACK_GAP: f32 = 40.0;
+/// How thick a fold marker is across the bar's long axis, logical pixels.
+const FOLD_TICK_THICKNESS: f32 = 2.0;
+/// How far a fold marker sticks out past each face of the bar, logical pixels.
+///
+/// **The overhang is load-bearing, not decoration.** `InputHarness::
+/// color_scale_strips` classifies a legend by shape — a rect 20 points across
+/// the bar and ≤4 along it is one strip of the ramp — and a marker drawn to the
+/// bar's own width would be counted as one more strip of colour by every test
+/// that asserts on those counts. Standing 3 points proud of both faces takes
+/// the marker to 26 points, out of that classifier's reach, and is also what
+/// makes it legible against the saturated red and green it is drawn over.
+const FOLD_TICK_OVERHANG: f32 = 3.0;
+/// Side of the range-folded key swatch, logical pixels — small enough to sit in
+/// the [`SCALE_MARGIN`] beyond the end of the bar, and far from the 20-point
+/// bar width [`FOLD_TICK_OVERHANG`] describes.
+const RF_SWATCH_SIZE: f32 = 10.0;
+/// What the range-folded swatch is labelled, matching the two-letter form the
+/// hydrometeor classification bar already uses for its own folded class.
+const RF_SWATCH_LABEL: &str = "RF";
+/// Baseline-to-baseline distance for the fold annotation stacked under the unit
+/// title, logical pixels — [`SCALE_FONT_SIZE`] plus the shadow's own offset.
+const FOLD_TITLE_LINE: f32 = SCALE_FONT_SIZE + SHADOW_OFFSET + 1.0;
 /// How far a unit title may stick out past the bar it is centred on, each side,
 /// logical pixels.
 ///
@@ -1513,6 +1535,51 @@ pub(super) fn render_color_scale(
         }
     }
 
+    // --- Fold markers: where the picture on the glass wraps ---
+    //
+    // Painted over the finished ramp, so the marker sits on the colour it is
+    // about rather than under it. The ramp itself is untouched by this — see
+    // [`fold_marker_positions`] for why a re-scaling velocity ramp was refused.
+    let folds_at = pane.displayed_nyquist_ms();
+    if let Some(nyquist_ms) = folds_at {
+        for value in fold_marker_positions(nyquist_ms as f32, min_val, max_val) {
+            let t = (value - min_val) / range;
+            let marker = if horizontal {
+                egui::Rect::from_min_size(
+                    egui::pos2(
+                        bar_rect.left() + t * bar_rect.width() - FOLD_TICK_THICKNESS / 2.0,
+                        bar_rect.top() - FOLD_TICK_OVERHANG,
+                    ),
+                    egui::vec2(
+                        FOLD_TICK_THICKNESS,
+                        SCALE_BAR_WIDTH + FOLD_TICK_OVERHANG * 2.0,
+                    ),
+                )
+            } else {
+                egui::Rect::from_min_size(
+                    egui::pos2(
+                        bar_rect.left() - FOLD_TICK_OVERHANG,
+                        bar_rect.bottom() - t * bar_rect.height() - FOLD_TICK_THICKNESS / 2.0,
+                    ),
+                    egui::vec2(
+                        SCALE_BAR_WIDTH + FOLD_TICK_OVERHANG * 2.0,
+                        FOLD_TICK_THICKNESS,
+                    ),
+                )
+            };
+            // The same dark backing `draw_shadowed_text` gives every label on
+            // this bar: at ±22 m/s the ramp under the marker is a mid red on
+            // one side and a mid green on the other, and a bare white line
+            // reads as a highlight on the second of them.
+            painter.rect_filled(
+                marker.expand(1.0),
+                0.0,
+                egui::Color32::from_black_alpha(200),
+            );
+            painter.rect_filled(marker, 0.0, egui::Color32::WHITE);
+        }
+    }
+
     // --- Labels: draw threshold values alongside the bar ---
     let label_font = egui::FontId::proportional(SCALE_FONT_SIZE);
     let title_font = egui::FontId::proportional(SCALE_TITLE_FONT_SIZE);
@@ -1582,6 +1649,7 @@ pub(super) fn render_color_scale(
 
     // --- Title: unit label above the bar (desktop) or to the left (mobile) ---
     let unit = product.unit_label(prefs);
+    let fold_line = folds_at.map(|nyquist_ms| fold_title_line(nyquist_ms, prefs));
     if horizontal {
         let title_pos = egui::pos2(bar_rect.left() - 4.0, bar_rect.center().y);
         draw_shadowed_text(
@@ -1591,8 +1659,28 @@ pub(super) fn render_color_scale(
             unit,
             title_font,
         );
+        if let Some(line) = &fold_line {
+            // Under the *bar* rather than under the title, which is the same
+            // place in this orientation: the horizontal title is squeezed into
+            // the 12 points between the pane's edge and the bar's start, the
+            // painter is clipped to the pane, and a nine-character annotation
+            // hung off that anchor would be cut in half. The bar's own bottom
+            // margin is 16 points of clear glass with nothing else in it.
+            draw_shadowed_text(
+                painter,
+                egui::pos2(bar_rect.left(), bar_rect.bottom() + 1.0),
+                egui::Align2::LEFT_TOP,
+                line,
+                label_font.clone(),
+            );
+        }
     } else {
-        let title_pos = egui::pos2(bar_rect.center().x, bar_rect.top() - 4.0);
+        // Two lines stacked above the bar, unit on top. `SCALE_TITLE_MARGIN`
+        // reserves 16 points there and the pane's own edge gives the second
+        // line the 16 above that, so the block ends flush with the pane top
+        // rather than running off it.
+        let stacked = fold_line.as_ref().map_or(0.0, |_| FOLD_TITLE_LINE);
+        let title_pos = egui::pos2(bar_rect.center().x, bar_rect.top() - 4.0 - stacked);
         draw_shadowed_text(
             painter,
             title_pos,
@@ -1600,7 +1688,140 @@ pub(super) fn render_color_scale(
             unit,
             title_font,
         );
+        if let Some(line) = &fold_line {
+            // Hung off the pane's own edge rather than centred on the bar like
+            // the title above it, and by 2 points at `folds ±50` the two look
+            // the same. They stop looking the same at three digits — a
+            // WSR-88D's 63.7 m/s is `folds ±229` in km/h, 56 points wide over a
+            // 20-point bar 16 points from the edge — and a centred line would
+            // hand the last digit to the painter's clip rect.
+            draw_shadowed_text(
+                painter,
+                egui::pos2(pane_rect.right() - 2.0, bar_rect.top() - 4.0),
+                egui::Align2::RIGHT_BOTTOM,
+                line,
+                label_font.clone(),
+            );
+        }
     }
+
+    // --- The range-folded key ---
+    if range_folded_is_painted(product, pane) {
+        // In both orientations the key stands past the end of the bar, in the
+        // pane's bottom-right corner — the one part of the legend's margin
+        // nothing else is drawn in — with its label reading outward from the
+        // swatch. Which way is outward is all the two cases disagree about,
+        // and the constraint is the neighbours: the value labels run down the
+        // inside of a vertical bar and along the top of a horizontal one, so a
+        // label on either of those sides prints through the ±80 tick that ends
+        // the ramp.
+        let (swatch, label_pos, label_anchor) = if horizontal {
+            let swatch = egui::Rect::from_min_size(
+                egui::pos2(
+                    bar_rect.right() + (SCALE_MARGIN - RF_SWATCH_SIZE) / 2.0,
+                    bar_rect.center().y - RF_SWATCH_SIZE / 2.0,
+                ),
+                egui::Vec2::splat(RF_SWATCH_SIZE),
+            );
+            (
+                swatch,
+                egui::pos2(swatch.center().x, swatch.bottom() + 1.0),
+                egui::Align2::CENTER_TOP,
+            )
+        } else {
+            let swatch = egui::Rect::from_min_size(
+                egui::pos2(
+                    bar_rect.center().x - RF_SWATCH_SIZE / 2.0,
+                    bar_rect.bottom() + (SCALE_MARGIN - RF_SWATCH_SIZE) / 2.0,
+                ),
+                egui::Vec2::splat(RF_SWATCH_SIZE),
+            );
+            (
+                swatch,
+                egui::pos2(swatch.right() + 3.0, swatch.center().y),
+                egui::Align2::LEFT_CENTER,
+            )
+        };
+        let (r, g, b, a) = rustdar_radar::RANGE_FOLDED;
+        painter.rect_filled(
+            swatch,
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(r, g, b, a),
+        );
+        draw_shadowed_text(
+            painter,
+            label_pos,
+            label_anchor,
+            RF_SWATCH_LABEL,
+            label_font,
+        );
+    }
+}
+
+/// Which ends of the fold, in the ramp's own m/s domain, have a place on the
+/// bar — both, or neither.
+///
+/// # The ramp does not move
+///
+/// A velocity bar spans a fixed ±80.55 mph (±36.01 m/s) whatever the radar
+/// behind it declared, and rescaling it per sweep was refused on the record:
+/// the colour of 20 m/s has to mean the same thing across the frames of a loop,
+/// across two synced panes showing a TDWR and the WSR-88D it sits inside, and
+/// across the 2D, section and 3D renderers that all sample
+/// `get_color_for_value(product, value)` as a pure function of the pair. So the
+/// *marker* moves and the colours hold still.
+///
+/// # An off-scale Nyquist is marked nowhere
+///
+/// A WSR-88D Doppler cut declares around 64 m/s, which is nearly twice the
+/// 36.01 the bar reaches. A marker clamped to the end of the bar would say the
+/// picture folds at 36 — the one number it certainly does not fold at — and a
+/// marker drawn off the end would land in the pane's chrome. Nothing is drawn,
+/// and the `folds ±142` line above the bar still states the limit, which is
+/// the honest half of the annotation: the whole ramp is inside this radar's
+/// unambiguous velocity, so no part of it wraps.
+fn fold_marker_positions(nyquist_ms: f32, min_val: f32, max_val: f32) -> Vec<f32> {
+    if !nyquist_ms.is_finite() || nyquist_ms <= 0.0 {
+        return Vec::new();
+    }
+    if -nyquist_ms < min_val || nyquist_ms > max_val {
+        return Vec::new();
+    }
+    vec![-nyquist_ms, nyquist_ms]
+}
+
+/// The line under the unit title: where this pane's picture folds, in the unit
+/// the reader chose.
+///
+/// Converted through `rustdar-units` like every other user-facing number, so
+/// switching the speed preference relabels the annotation in the same frame it
+/// relabels the ticks — and moves neither the ramp nor the marker, which are
+/// positioned in the palette's own m/s domain.
+fn fold_title_line(nyquist_ms: f64, prefs: &UserPreferences) -> String {
+    let converted = prefs.speed.convert_from_ms(nyquist_ms as f32);
+    format!("folds \u{b1}{converted:.0}")
+}
+
+/// Whether the purple [`rustdar_radar::RANGE_FOLDED`] can appear in this pane's
+/// picture, and therefore needs a key beside it.
+///
+/// Velocity and spectrum width, and only in the plan view. Both moments are
+/// measured on the Doppler cut, whose unambiguous *range* is ~90 km on a TDWR
+/// against a WSR-88D's ~150, so a gate beyond it comes back marked
+/// `MomentValue::RangeFolded` — a reading with no range, which `render.rs`
+/// paints in a colour no product's scale can produce. Reflectivity comes off
+/// the surveillance cut, whose long PRT puts its unambiguous range past
+/// anything on screen.
+///
+/// The plan view is the gate because that is where the purple is. A 3D pane
+/// raymarches a voxel grid that has no range-folded state at all, and a key for
+/// a colour the picture cannot contain is a legend entry the reader will go
+/// looking for.
+fn range_folded_is_painted(product: RadarProduct, pane: &PaneState) -> bool {
+    matches!(
+        product,
+        RadarProduct::Velocity | RadarProduct::SpectrumWidth
+    ) && pane.is_map()
 }
 
 /// Render color scale legends for overlay layers that provide their own legend
@@ -1994,6 +2215,7 @@ fn draw_long_press_tooltip(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustdar_units::SpeedUnit;
 
     /// The ticks `render_color_scale` would paint for `product`, in order.
     fn ticks(product: RadarProduct, prefs: &UserPreferences) -> Vec<String> {
@@ -2120,6 +2342,77 @@ mod tests {
         assert_eq!(short_tick(4.0), "4");
         assert_eq!(short_tick(0.25), "0.2");
         assert_eq!(short_tick(-1.5), "-1.5");
+    }
+
+    /// The velocity ramp's own reach, m/s — what a fold marker has to fall
+    /// inside to be drawable.
+    fn velocity_bounds() -> (f32, f32) {
+        let legend = get_legend_scale(RadarProduct::Velocity);
+        (legend.min_value, legend.max_value)
+    }
+
+    /// The fold annotation is the declared limit converted, and nothing else.
+    ///
+    /// 22.14 m/s is a TPIT Doppler cut's own declaration. Every user-facing
+    /// number goes through `rustdar-units`, so the four answers here are the
+    /// four the hover readout and the ticks give for the same speed — a bar
+    /// annotated in m/s over ticks in mph is the half-converted state the MEHS
+    /// work ruled out for hail size.
+    #[test]
+    fn the_fold_annotation_is_the_declared_limit_in_the_users_speed_unit() {
+        let expected = [
+            (SpeedUnit::Mph, "folds \u{b1}50"),
+            (SpeedUnit::MetersPerSec, "folds \u{b1}22"),
+            (SpeedUnit::KilometersPerHour, "folds \u{b1}80"),
+            (SpeedUnit::Knots, "folds \u{b1}43"),
+        ];
+        for (speed, line) in expected {
+            let prefs = UserPreferences {
+                speed,
+                ..UserPreferences::default()
+            };
+            assert_eq!(fold_title_line(22.14, &prefs), line, "{speed:?}");
+        }
+    }
+
+    /// Both ends of a TDWR's fold sit on the bar; a WSR-88D's sit off it.
+    ///
+    /// The ramp spans ±36.01 m/s (±80.55 mph) for every radar, so 22.14 lands
+    /// at 0.19 and 0.81 of its length while 63.7 is nearly twice its reach.
+    /// The off-scale answer is *nothing*, not a marker parked at the end: the
+    /// end of the bar is the one speed that sweep does not fold at.
+    #[test]
+    fn a_fold_off_the_end_of_the_ramp_is_marked_nowhere() {
+        let (min_val, max_val) = velocity_bounds();
+        assert!(
+            (max_val - 36.01).abs() < 0.01 && (min_val + 36.01).abs() < 0.01,
+            "the velocity ramp moved: it now spans {min_val}..{max_val} m/s, \
+             so the fixtures below no longer describe an on-scale TDWR fold \
+             and an off-scale WSR-88D one",
+        );
+
+        assert_eq!(
+            fold_marker_positions(22.14, min_val, max_val),
+            vec![-22.14, 22.14],
+            "a TDWR's fold is inside the bar and must be marked at both ends",
+        );
+        assert!(
+            fold_marker_positions(63.7, min_val, max_val).is_empty(),
+            "a WSR-88D's 63.7 m/s fold was marked on a bar that stops at 36.01",
+        );
+        // Exactly at the end still counts — that marker is drawable, and it is
+        // the boundary a clamp would have been written around.
+        assert_eq!(
+            fold_marker_positions(max_val, min_val, max_val),
+            vec![-max_val, max_val],
+        );
+        // A declaration of zero or a non-finite one describes no fold at all.
+        for absurd in [0.0, -22.0, f32::NAN, f32::INFINITY] {
+            assert!(
+                fold_marker_positions(absurd, min_val, max_val).is_empty(),
+                "{absurd} was taken for a fold limit",
+            );
+        }
     }
 
     /// A projection with no map in it: one screen point per degree, so a

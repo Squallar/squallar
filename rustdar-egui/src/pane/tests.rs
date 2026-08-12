@@ -1089,3 +1089,136 @@ fn frames_outside_the_render_set_do_not_block_readiness() {
         "widening the budget pulls blank frames back into the set"
     );
 }
+
+/// A pane showing a finished velocity render whose cut declared `nyquist_ms`.
+///
+/// Built with no `scan_info`, which is what keeps the fixture small: with no
+/// scan there is no snapped angle to compare against, so
+/// `stale_image_on_screen` falls back to the product alone and a pane showing
+/// velocity while velocity is selected is showing what it claims to.
+fn velocity_pane(ctx: &egui::Context, nyquist_ms: Option<f64>) -> PaneState {
+    use crate::overlay_cache::{OverlayTextureData, RadarTextureMeta};
+
+    let image = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[255, 255, 255, 255]);
+    let mut pane = PaneState::new();
+    pane.selected_product = RadarProduct::Velocity;
+    pane.overlay_cache_mut(OverlayKind::Radar).current = Some(OverlayTextureData {
+        texture: ctx.load_texture("fold", image, egui::TextureOptions::NEAREST),
+        geo_bounds: rustdar_overlays::types::GeoBounds {
+            min_lat: 34.0,
+            max_lat: 36.0,
+            min_lon: -98.0,
+            max_lon: -96.0,
+        },
+        data_generation: 0,
+        render_zoom: 0,
+        width: 1,
+        height: 1,
+        radar_meta: Some(RadarTextureMeta {
+            value_data: Arc::new(Vec::new()),
+            lat: 35.0,
+            lon: -97.0,
+            max_range_km: 100.0,
+            nyquist_ms,
+            product: RadarProduct::Velocity,
+            elevation: 0.5,
+        }),
+        hit_map: None,
+    });
+    pane
+}
+
+/// A loop frame carrying its own fold limit.
+fn plan_view_folding_at(ctx: &egui::Context, nyquist_ms: Option<f64>) -> LoopFrameImage {
+    LoopFrameImage::PlanView(RadarImageData {
+        nyquist_ms,
+        ..dummy_plan_view(ctx)
+    })
+}
+
+/// While a loop runs, the number on the legend is the *playing frame's*.
+///
+/// A loop steps through volumes and the RDA reselects PRFs between them: a TPIT
+/// run can carry 22.14 m/s in one frame and 26.42 in the next. The texture
+/// metadata describes the static render the animation replaced, so a pane that
+/// read it would annotate every frame of the loop with a limit belonging to a
+/// picture nobody is looking at — the same mistake `data_time` makes about the
+/// time, which is why `data_time_on_screen` exists beside it.
+#[test]
+fn a_looping_pane_reports_the_playing_frames_fold_limit() {
+    let ctx = egui::Context::default();
+    let mut pane = velocity_pane(&ctx, Some(26.42));
+    assert_eq!(
+        pane.displayed_nyquist_ms(),
+        Some(26.42),
+        "precondition: a still pane says what its own static render declared",
+    );
+
+    pane.loop_state = loop_with_frames(3, 1);
+    pane.loop_state.frames[0].image = Some(plan_view_folding_at(&ctx, Some(31.0)));
+    pane.loop_state.frames[1].image = Some(plan_view_folding_at(&ctx, Some(22.14)));
+    assert_eq!(
+        pane.displayed_nyquist_ms(),
+        Some(22.14),
+        "the pane annotated the replaced static render rather than the frame \
+         on the glass",
+    );
+
+    // The playhead moves and so does the answer.
+    pane.loop_state.current_frame = 0;
+    assert_eq!(pane.displayed_nyquist_ms(), Some(31.0));
+
+    // A frame from a volume that declared nothing says nothing: it does not
+    // fall back to the static texture's number, which is another volume's.
+    pane.loop_state.frames[0].image = Some(plan_view_folding_at(&ctx, None));
+    assert_eq!(pane.displayed_nyquist_ms(), None);
+
+    // And a playhead on a frame with no picture yet has nothing to describe.
+    pane.loop_state.current_frame = 2;
+    assert_eq!(pane.displayed_nyquist_ms(), None);
+}
+
+/// Only a plan view of base velocity answers at all.
+///
+/// Storm-relative velocity is dealiased before the storm motion is subtracted,
+/// so its field legitimately runs past ±Vny and a marker at the fold would
+/// describe a wrap the picture does not have. A section or a 3D volume is
+/// assembled from a whole tilt ladder whose cuts each declare their own limit,
+/// so one number over the picture would be wrong for most of it. Every other
+/// product folds nowhere.
+#[test]
+fn only_a_plan_view_of_base_velocity_carries_a_fold_limit() {
+    let ctx = egui::Context::default();
+    let mut pane = velocity_pane(&ctx, Some(22.14));
+    assert_eq!(pane.displayed_nyquist_ms(), Some(22.14));
+
+    for product in [
+        RadarProduct::StormRelativeVelocity,
+        RadarProduct::SpectrumWidth,
+        RadarProduct::Reflectivity,
+    ] {
+        pane.selected_product = product;
+        assert_eq!(
+            pane.displayed_nyquist_ms(),
+            None,
+            "{product:?} was annotated with a velocity fold limit",
+        );
+    }
+
+    pane.selected_product = RadarProduct::Velocity;
+    pane.set_map_render(MapRender::Volume);
+    assert_eq!(
+        pane.displayed_nyquist_ms(),
+        None,
+        "a 3D pane raymarches a ladder of cuts and cannot fold at one speed",
+    );
+
+    pane.set_map_render(MapRender::Plan);
+    assert_eq!(pane.displayed_nyquist_ms(), Some(22.14));
+    pane.set_kind(PaneKind::CrossSection);
+    assert_eq!(
+        pane.displayed_nyquist_ms(),
+        None,
+        "a section cuts through every rung of the ladder at once",
+    );
+}
