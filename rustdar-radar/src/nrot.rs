@@ -824,18 +824,52 @@ fn rot_divisor(range_nm: f64) -> f64 {
 /// reference reports NROT on a 0.0395 lattice
 /// (see the module header), so each readout is an interval of half-width
 /// 0.0198 and a curve is either consistent with it or is not. These knots
-/// leave 71 of those 808 outside, none by as much as one lattice step (worst
-/// 0.97); the 4-knot curve they replace left 644 outside and missed by up
-/// to 6.1.
+/// leave 38 of those 808 outside, none by as much as one lattice step (worst
+/// 0.67); the 4-knot curve they replace left 631 outside and missed by up
+/// to 5.6.
 ///
-/// Those two counts are a reconstruction. The campaign took each reading as
-/// `D_ours·(ours/GR)` against a dumped field that was not preserved, so they
-/// are recomputed here from the readings that were, recovering the jump the
-/// archive actually painted — velocity is quantised to 0.5 m/s, so it is not
-/// exactly k·Vny — as one constant per site and edge. The population is the
-/// 808 the reduction reports; an earlier hand-written count of 776, and a
-/// third of 880, appear in no generated artifact and are not reproducible
-/// from the logs.
+/// Those counts are a reconstruction, and what one is worth here has a number
+/// on it. The campaign took each reading as `D_ours·(ours/GR)` against a
+/// dumped field that was not preserved, so they are recomputed from the
+/// readings that were, recovering the jump the archive actually painted —
+/// velocity is quantised, so it is not exactly k·Vny — as one constant per
+/// site and edge. That jump is the whole reconstruction: it scales one site's
+/// readings bodily, and the count is steep in it, moving some 20 readings per
+/// 0.1%. So a count is quotable only against a stated recovery. This one
+/// solves the jumps as a two-way layout, one unknown per site and edge and
+/// one per gate, which lands all sixteen within 0.3% of an exact m/s and then
+/// snaps them there — that snap is what fixes the single scale least squares
+/// leaves free, and it is a fact about the archive rather than a fit to this
+/// curve. Recover the jumps instead by matching them to this curve unsnapped,
+/// and the 4-knot table, the 17-knot one it replaced and this one score 636,
+/// 69 and 57 rather than 631, 50 and 38: the corner below is worth 12
+/// readings either way, but the absolute counts do not carry across
+/// recoveries. The 71 and 644 that stood here were an unsnapped pass's, which
+/// this reduction reproduces as 69 and 636. The population is the 808 the
+/// reduction reports; an earlier
+/// hand-written count of 776, and a third of 880, appear in no generated
+/// artifact and are not reproducible from the logs.
+///
+/// # Where the flat begins
+///
+/// The knee is at 81.5 km, and until this knot the table did not say so. The
+/// pooled readings fall 2.6%/km over 79.6 → 81.5 km and then 0.27%/km over
+/// 81.5 → 85.1: a corner, not a curve. The prose above has said this curve
+/// flattens beyond 81 km since the campaign, but the knots ran straight from
+/// (80.0, 8.62) to (85.0, 8.23) and chorded across it, riding above every
+/// reading in between — +2.4% at the 81.4 and 81.6 km gates and +1.2% at
+/// 83.4, against a standard error of 0.3% on each of those gate means. So the
+/// band was the table's worst by a factor of two while both knots bounding it
+/// were right: at 85.1 km the readings give 8.229 against the table's 8.230,
+/// and at 79.6 km 8.701 against 8.698.
+///
+/// The correction is therefore an added knot, not a moved one and not a
+/// restated value. Its range is where the hover actually was, 44.0 nm, and
+/// its value is what the six deciding sites pool to there. Over 81–86 km that
+/// takes the residual from a mean of +0.86% and an rms of 1.70% to +0.05% and
+/// 1.05%, and the readings outside their intervals from 12 to none. Nothing
+/// inside 80 km moves, because no knot below the corner changed. KTWX, still
+/// the holdout, agrees: over the same band its rms falls from 1.00% to 0.66%.
 ///
 /// The curve now serves one operator at every range. It used to hand over to a
 /// second, wider stencil past 80 km whose step gain was 5.4% under the split
@@ -845,7 +879,7 @@ fn rot_divisor(range_nm: f64) -> f64 {
 ///
 /// Measured provenance: branch `campaign-harness`.
 fn rot_divisor_km(range_km: f64) -> f64 {
-    const KNOTS: [(f64, f64); 17] = [
+    const KNOTS: [(f64, f64); 18] = [
         (13.1, 22.43),
         (16.0, 22.97),
         (19.0, 23.60),
@@ -862,6 +896,7 @@ fn rot_divisor_km(range_km: f64) -> f64 {
         (70.0, 10.67),
         (75.0, 9.65),
         (80.0, 8.62),
+        (81.5, 8.31),
         (85.0, 8.23),
     ];
     if range_km <= KNOTS[0].0 {
@@ -3939,9 +3974,9 @@ mod tests {
     ///
     /// Every figure here moved when the curve did, and each is a restatement
     /// of a new measurement rather than an assertion bent to pass: the old
-    /// values were a 4-knot approximation that left 644 of 808 readings
+    /// values were a 4-knot approximation that left 631 of 808 readings
     /// outside the interval the reference's quantisation pins them to, missing
-    /// by up to 6.1 lattice steps, against 71 and under one step now.
+    /// by up to 5.6 lattice steps, against 38 and under one step now.
     #[test]
     fn rot_divisor_matches_the_reference_curve() {
         // Flat below the first knot — unreachable in the pipeline, which skips
@@ -3957,6 +3992,11 @@ mod tests {
         assert_eq!(rot_divisor_km(60.0), 12.93);
         assert!((rot_divisor_km(72.5) - 10.16).abs() < 0.005); // 70→75 segment
         assert_eq!(rot_divisor_km(80.0), 8.62);
+        // The corner is at 81.5 km, where the fall of 2.6%/km before it gives
+        // way to 0.27%/km after. Without this knot the 80→85 chord cut it and
+        // read 2.4% high across the gates between.
+        assert_eq!(rot_divisor_km(81.5), 8.31);
+        assert!((rot_divisor_km(83.25) - 8.27).abs() < 0.005); // 81.5→85 segment
         assert_eq!(rot_divisor_km(85.0), 8.23);
         assert_eq!(rot_divisor_km(250.0), 8.23); // flat beyond the last knot
         // The nm entry point converts and lands on the same curve.
