@@ -876,28 +876,60 @@ const MEDIAN_MIN_RAW_OCC: f64 = 0.6;
 ///
 /// What separates the two fields is the line below it. The reference **fills
 /// a missing centre from its window**, and the hole ladder on [`tap_stencil`]
-/// measures it over seven sites: filling here reproduces the reference's
-/// profile through a hole in value as well as in coverage — 827 of its points
-/// against 633 as shipped, at a mean departure of 0.077 where the shipped rule
-/// reads 0.074 and the same worst case of 1.37. On real volumes it is the
-/// largest single coverage move this module has: KTLX 1227 → 2865 bins and
-/// 1.63% → 3.86% of the annulus, against the reference's 3.27%.
+/// measures it over seven sites. Re-run against this tree, over the holed
+/// sectors only, points where both fields carry a value / points the reference
+/// paints and this module reads ND / points only this module paints:
 ///
-/// # Why it is not taken
+/// ```text
+///                              both   ref only   ours only   mean |Δ|
+///     as shipped                826       292          18      0.075
+///     fill the median centre   1102        16          21      0.080
+/// ```
 ///
-/// KHNX 2024-12-16 goes from 0 painted bins to 96, and **16 of its 17
-/// strongest read ND in the reference** (the seventeenth reads +0.34 against
-/// +0.38). Every guard that returns KHNX to zero is refused by the ladder
-/// itself: the ladder's own hole leaves 0.667 raw occupancy, so an occupancy
-/// floor of 0.88 — the smallest that zeroes KHNX — is a floor the reference
-/// fills below; requiring the hole to be isolated along the beam as well
-/// stops filling the ladder's hole outright, and falls back to the shipped
-/// 633. Requiring only that the hole be isolated in azimuth *is* consistent
-/// with all 70 rungs, and still leaves KHNX 35 bins, seven of whose eight
-/// strongest are reference-ND.
+/// The fill closes the ladder outright — 292 refusals become 16 — and the
+/// values it produces are the reference's, to five thousandths of the departure
+/// the shipped rule already has. On real volumes it is the largest single
+/// coverage move this module has: at KTLX the completeness refusals on
+/// [`tap_stencil`] fall from 664 of the reference's bins to **7** and the bins
+/// with no median value at all from 387 to 3, and 701 more of the reference's
+/// bins come back agreeing (661 → 1362 of 3546). Six of the nine decoded sites
+/// gain agreement; the holdout gains most of all, 2161 → 3184 of 5823.
 ///
-/// So the fill is right and admitting it needs a discriminator this module
-/// does not have — the same one [`COH_MAX_STRADDLE`] turns out to lack.
+/// # Why it is still not taken
+///
+/// Precision falls at every site — KTLX 0.4240 → 0.3604, the holdout 0.7913 →
+/// 0.6350 — and KHNX 2024-12-16 goes from 0 painted bins to 49 in the annulus,
+/// of which **none** is one of the 252 the reference paints there. They are not
+/// near misses: all 49 stand in clusters the reference never touches, a median
+/// **33 bins** from its nearest paint. The null control fails on placement, not
+/// on amplitude.
+///
+/// Three guards return KHNX to zero and the ladder measures all three:
+///
+/// ```text
+///                                       KHNX   ladder both/ref-only
+///     raw window occupancy ≥ 0.88          0       826 / 292
+///     hole isolated in azimuth and range   0       826 / 292
+///     hole isolated in azimuth only       35      1102 /  16
+/// ```
+///
+/// The first two are **bit-identical to the shipped rule on all 70 rungs**:
+/// they buy their zero by not filling at all, so they are exactly as wrong
+/// about the reference as the rule they replace, and each is a constant KHNX
+/// chose. The third is the reference's own behaviour and leaves KHNX painted.
+///
+/// Nor does the completeness rule at [`SIGNIFICANT`] serve as the missing
+/// guard. Asked to refuse the loud paint the fill admits, it needs to reach
+/// down to |NROT| ≥ 0.35 before KHNX is empty, and at that setting KTLX ends
+/// below where it started; counted against the resolved footprint instead, the
+/// pair reaches KTLX 661 → 1062 agreeing at precision 0.4296, KHNX 0, the KFTG
+/// core intact and the holdout 2161 → 2388 at flat precision — but only on top
+/// of the 0.88 occupancy floor above, which the ladder has just refused. A pair
+/// standing on a falsified half is not a pair.
+///
+/// So the fill is right, admitting it needs a discriminator this module does
+/// not have — the same one [`COH_MAX_STRADDLE`] turns out to lack — and the
+/// candidate that looked most like one is a number one volume picked.
 fn median_filter(
     vel_grid: &[Vec<f64>],
     raw_grid: &[Vec<f64>],
@@ -1769,7 +1801,31 @@ const GK_MAX_TEXTURE_VNY_FRAC: f64 = 0.44;
 /// half-lattices — and a worst case of 2.85, which is a fabricated tornadic
 /// couplet. It is refused for that reason and not for its coverage.
 /// [`median_filter`] carries the bottom row, which is the reference's own
-/// answer and is blocked elsewhere.
+/// answer and is blocked elsewhere; re-run against this tree the two rows that
+/// survive read 826 / 292 and 1102 / 16, at 0.075 and 0.080.
+///
+/// # And nine real volumes say the same thing without a synthetic
+///
+/// The ladder is twelve patched sectors of one cut. The reference's whole
+/// decoded field at nine sites ([`SIGNIFICANT`]) asks the same question of real
+/// weather: for every bin of the annulus, how many of the 33 cells this
+/// operator would read carry raw velocity, and does the reference paint there.
+/// Its paint rate, full footprint against a footprint missing one to three
+/// cells:
+///
+/// ```text
+///                KTLX   KCRP   KDMX   KFTG   KATX   KDDC   KHNX
+///     33 cells   11.3%   5.3%   5.2%   2.7%   2.0%  25.4%   0.8%
+///     30–32       9.0%  16.1%   7.9%   3.0%   2.4%  27.8%   0.2%
+/// ```
+///
+/// At six of the nine it paints **more** often where this operator is missing
+/// cells than where it is not, three times as often at KCRP. The rate only
+/// falls away below about 24 of 33 and vanishes below 12. And at the bins where
+/// this module has no velocity at all to read, the reference still carries a
+/// value at 1.2–14.5% of them — 387 bins at KTLX, 467 at KDDC, 191 at KCRP.
+/// The reference is not tolerating an incomplete footprint; it is computing
+/// from one.
 fn tap_stencil(prof: &[f64], taps: &[(i32, f64)]) -> Option<f64> {
     const C: usize = PROFILE_MAX_HALF;
     // Data-margin completeness: the outermost cells must be populated too, so
