@@ -363,3 +363,51 @@ fn a_resume_puts_back_the_fold_limit_it_took_down() {
         "the restored image describes the same cut the render did",
     );
 }
+
+/// …and the legend at the far end of that wire says so again.
+///
+/// The other half of the resume claim, asserted where the user would read it:
+/// `PaneState::displayed_nyquist_ms` is what the velocity bar's `folds ±N` line
+/// and its ±Vny markers are drawn from, so a restore that put the metadata back
+/// without the pane answering would give a picture that came back identical
+/// with an annotation that did not. Reopening is 1:1 or it is not a reopen.
+///
+/// Velocity rather than this module's usual product, because it is the only one
+/// that folds — the annotation is deliberately silent on every other bar.
+#[test]
+fn a_resumed_velocity_pane_annotates_the_fold_again() {
+    let ctx = egui::Context::default();
+    let mut app = app_showing_site();
+    app.gui.pane_mut(0).unwrap().selected_product = RadarProduct::Velocity;
+
+    let render = CachedPaneRender {
+        nyquist_ms: Some(26.42),
+        ..finished(RadarProduct::Velocity, 0.5)
+    };
+    app.apply_render_to_pane(&ctx, 0, &render);
+    assert_eq!(
+        app.gui.pane(0).unwrap().displayed_nyquist_ms(),
+        Some(26.42),
+        "precondition: the pane must be annotating its own render before the \
+         suspend, or the assertion after it proves nothing",
+    );
+
+    {
+        let pane = app.gui.pane_mut(0).unwrap();
+        let cache =
+            pane.overlay_cache_mut(rustdar_overlays::render::overlay_state::OverlayKind::Radar);
+        cache.current = None;
+    }
+    assert_eq!(
+        app.gui.pane(0).unwrap().displayed_nyquist_ms(),
+        None,
+        "a pane whose picture is gone still claimed to know where it folded",
+    );
+
+    app.restore_cached_render(&ctx);
+    assert_eq!(
+        app.gui.pane(0).unwrap().displayed_nyquist_ms(),
+        Some(26.42),
+        "the picture came back and the annotation did not",
+    );
+}

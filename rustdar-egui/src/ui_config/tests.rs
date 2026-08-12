@@ -1495,6 +1495,50 @@ fn unparseable_config_is_ignored() {
     assert_eq!(gui.loop_lookback_secs, expected);
 }
 
+/// A fold limit is a fact about a sweep, so it is never written to the config.
+///
+/// The velocity legend's `folds ±N` annotation is derived from the radar
+/// texture's own metadata and from nothing else, which is what makes a
+/// schema-free reopen honest: the number belongs to the volume that was on the
+/// glass, and a session that reopens tomorrow downloads a different volume,
+/// possibly from a radar that has since reselected its PRFs. A persisted copy
+/// would come back beside those new pixels and describe the old ones — the one
+/// failure the whole "what is on the glass" gate exists to prevent.
+///
+/// So a restored pane starts silent and speaks again with its first render, and
+/// this pins both halves: nothing in the written blob mentions a fold limit,
+/// and the pane that comes back out of it answers `None`.
+#[test]
+fn a_reopened_pane_carries_no_fold_limit_until_its_first_render() {
+    let store = MemoryConfigStore::default();
+    let mut gui = crate::Gui::new();
+    gui.pane_mut(0).unwrap().selected_product = rustdar_radar::types::RadarProduct::Velocity;
+    gui.save_ui_config(&store);
+
+    let written = store.load(UI_CONFIG_KEY).expect("config should be stored");
+    for word in ["nyquist", "fold", "folds"] {
+        assert!(
+            !written.contains(word),
+            "the config schema grew a {word:?} field: {written}",
+        );
+    }
+
+    let mut restored = crate::Gui::new();
+    restored.load_ui_config(&store);
+    let pane = restored.pane(0).expect("a restored pane");
+    assert_eq!(
+        pane.selected_product,
+        rustdar_radar::types::RadarProduct::Velocity,
+        "precondition: the pane must come back on velocity, or it would \
+         answer None for the wrong reason",
+    );
+    assert_eq!(
+        pane.displayed_nyquist_ms(),
+        None,
+        "a pane with no picture on it claimed to know where that picture folds",
+    );
+}
+
 /// Saving writes under the shared key, which is what the filesystem backend
 /// maps onto `ui.json`.
 #[test]
