@@ -1540,6 +1540,13 @@ pub(super) fn render_color_scale(
     // Painted over the finished ramp, so the marker sits on the colour it is
     // about rather than under it. The ramp itself is untouched by this — see
     // [`fold_marker_positions`] for why a re-scaling velocity ramp was refused.
+    //
+    // Storm-relative velocity draws this same ramp and is deliberately never
+    // marked: its field is dealiased before the storm motion comes off it, so
+    // it runs past ±Vny legitimately. The gate is in
+    // [`PaneState::displayed_nyquist_ms`], which answers for base velocity
+    // alone, and this is one of the two places that would look like an
+    // oversight without it.
     let folds_at = pane.displayed_nyquist_ms();
     if let Some(nyquist_ms) = folds_at {
         for value in fold_marker_positions(nyquist_ms as f32, min_val, max_val)
@@ -1838,6 +1845,10 @@ fn fold_title_line(nyquist_ms: f64, prefs: &UserPreferences) -> String {
 /// a colour the picture cannot contain is a legend entry the reader will go
 /// looking for.
 fn range_folded_is_painted(product: RadarProduct, pane: &PaneState) -> bool {
+    // The other place base velocity and SRV part company: SRV is rasterized
+    // from `srv::compute_srv_grid`'s finished `f32` field, whose NaNs are
+    // skipped, so the folded-gate sentinel the moment loop claims a pixel with
+    // never reaches it and there is no purple on an SRV raster to key.
     matches!(
         product,
         RadarProduct::Velocity | RadarProduct::SpectrumWidth
