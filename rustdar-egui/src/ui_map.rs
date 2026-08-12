@@ -775,11 +775,20 @@ impl super::Gui {
                             // orientation `draw_volume_glass` paints the legend
                             // with a few lines below, so the two cannot
                             // disagree about which edge that is.
+                            //
+                            // The painter is passed for its fonts, not to paint
+                            // with: how far in the legend reaches is how wide
+                            // its ticks and its title lay out, which is a
+                            // question only the font can answer. It is this
+                            // pane's own painter, so the layout is the one the
+                            // legend is about to be drawn with.
                             let chrome_rect = pane_render::color_scale_free_rect(
+                                child_ui.painter(),
                                 pane_render::clear_of_bottom_chrome(pane_rect, color_scale_floor),
                                 horizontal_color_scale,
                                 &pane,
                                 &self.overlays,
+                                &self.preferences,
                             );
                             let outcome = render_volume_pane(
                                 &mut child_ui,

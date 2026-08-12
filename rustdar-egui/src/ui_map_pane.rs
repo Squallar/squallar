@@ -1133,16 +1133,18 @@ const RF_SWATCH_LABEL: &str = "RF";
 /// Baseline-to-baseline distance for the fold annotation stacked under the unit
 /// title, logical pixels — [`SCALE_FONT_SIZE`] plus the shadow's own offset.
 const FOLD_TITLE_LINE: f32 = SCALE_FONT_SIZE + SHADOW_OFFSET + 1.0;
-/// How far a unit title may stick out past the bar it is centred on, each side,
-/// logical pixels.
-///
-/// The title is drawn `CENTER_BOTTOM` on the bar's centre line and is wider
-/// than the bar — `"mm/hr"` and `"kg/m\u{b2}"` are the long ones — so the block
-/// the legend occupies is wider than [`SCALE_BAR_WIDTH`] by this on each side.
-/// Measured rather than guessed: `every_unit_titles_overhang_fits_the_gutter`
-/// lays out every product's title at [`SCALE_TITLE_FONT_SIZE`], in every unit
-/// preference that changes one, and fails if any of them outgrows this.
-pub(super) const SCALE_TITLE_OVERHANG: f32 = 16.0;
+/// The gap between a **vertical** bar's inner face and the value labels read
+/// against it, logical pixels. They are drawn `RIGHT_CENTER` at this offset, so
+/// each one runs from here further in by however wide it lays out.
+const SCALE_LABEL_GAP: f32 = 4.0;
+/// The gap between a **horizontal** bar's top edge and the value labels read
+/// against it, logical pixels. They are drawn `CENTER_BOTTOM` at this offset,
+/// so each one stands this much plus one row height above the bar.
+const SCALE_LABEL_LIFT: f32 = 2.0;
+/// How far in from the pane's own edge the fold annotation is hung, logical
+/// pixels — see the note at its draw site for why it hangs off the pane rather
+/// than off the bar it annotates.
+const FOLD_TITLE_INSET: f32 = 2.0;
 
 /// How far in from the pane edge it stands on the colour-scale block reaches,
 /// logical pixels — `0.0` when this pane draws no legend at all.
@@ -1172,18 +1174,40 @@ pub(super) const SCALE_TITLE_OVERHANG: f32 = 16.0;
 /// own at the same height as the radar scale's. So the block's inner edge moves
 /// with the layer stack, and a gutter that only knew about the radar bar would
 /// leave the button over the *second* title instead of the first.
+///
+/// # Why it lays the text out instead of reserving a constant
+///
+/// Every mark past the bar is text, and how far past the bar it reaches is how
+/// wide that text lays out — which is a function of the product, of the unit
+/// preference its ticks are converted into, and of the font. A constant can
+/// only be the widest of those, and until this was measured it was not even
+/// that: the reserve was [`SCALE_BAR_WIDTH`] plus 16 points for the *title*,
+/// with the value labels beside the bar left out of the sum entirely.
+///
+/// Correlation coefficient is what that cost. Its bar ends at `0.98`, which
+/// lays out 21.3 points wide against the 12 the old sum left between the label
+/// and the gutter's inner edge, and — being a gradient scale whose last stop is
+/// its `max_value` — that label centres on the very top of the bar, level with
+/// the Volume Alpha button. `0.98` printed through the button on every 3D pane
+/// showing ρHV, in every unit preference, the default included. Velocity's
+/// `130` in km/h (18.6) and differential phase's `345` (18.6) cleared the
+/// button's own 8-point margin by under a point and a half.
 pub(super) fn color_scale_gutter(
+    measure: &egui::Painter,
     pane_rect: egui::Rect,
     horizontal: bool,
     pane: &PaneState,
     overlays: &OverlayRegistry,
+    prefs: &UserPreferences,
 ) -> f32 {
     // The same gate `Gui::draw_volume_glass` and the `ColorScale` arm put in
     // front of `render_color_scales`: layer off, nothing painted, no gutter.
     if !pane.is_overlay_enabled(OverlayKind::ColorScale) {
         return 0.0;
     }
-    if get_legend_scale(pane.selected_product).thresholds.len() < 2 {
+    let product = pane.selected_product;
+    let legend = get_legend_scale(product);
+    if legend.thresholds.len() < 2 {
         return 0.0;
     }
     // And the "pane too small" bail both painters take, restated from the same
@@ -1196,20 +1220,116 @@ pub(super) fn color_scale_gutter(
     if bar_length < 40.0 {
         return 0.0;
     }
-    let stacked = pane
-        .draw_order
-        .iter()
-        .filter(|&&kind| kind != OverlayKind::ColorScale && pane.is_overlay_enabled(kind))
-        .filter(|&&kind| {
-            overlays
-                .legend(kind)
-                .is_some_and(|l| l.thresholds.len() >= 2)
-        })
-        .count() as f32;
-    SCALE_MARGIN
-        + stacked * (SCALE_BAR_WIDTH + SCALE_STACK_GAP)
-        + SCALE_BAR_WIDTH
-        + SCALE_TITLE_OVERHANG
+
+    // The radar bar stands on the margin; each stacked overlay bar stands one
+    // bar-and-gap further in. Every one of them is measured rather than the
+    // innermost alone, because which block reaches deepest is a question about
+    // their titles and ticks and not only about their offsets.
+    let ticks = legend_ticks(product, prefs);
+    let mut reach = legend_block_reach(measure, horizontal, 0.0, &ticks, product.unit_label(prefs));
+    let mut offset = 0.0;
+    for &kind in &pane.draw_order {
+        if kind == OverlayKind::ColorScale || !pane.is_overlay_enabled(kind) {
+            continue;
+        }
+        let Some(overlay) = overlays.legend(kind) else {
+            continue;
+        };
+        if overlay.thresholds.len() < 2 {
+            continue;
+        }
+        offset += SCALE_BAR_WIDTH + SCALE_STACK_GAP;
+        // `{val:.0}` is the form `render_overlay_color_scales` writes them in:
+        // an overlay legend carries no product, so there is no unit preference
+        // to convert through.
+        let ticks: Vec<String> = overlay
+            .thresholds
+            .iter()
+            .map(|&(value, _)| format!("{value:.0}"))
+            .collect();
+        reach = reach.max(legend_block_reach(
+            measure,
+            horizontal,
+            offset,
+            &ticks,
+            overlay.unit_label,
+        ));
+    }
+    let mut gutter = SCALE_MARGIN + reach;
+
+    // The fold annotation is hung off the pane's own edge rather than off a
+    // bar, so it is a floor under the whole gutter rather than a term in one
+    // block's reach. Read through the same [`PaneState::displayed_nyquist_ms`]
+    // the painter gates on, which answers `None` for anything but base velocity
+    // in a plan view — so today this reserves nothing on the 3D panes that ask,
+    // and it is here so that a widening of that gate cannot silently reopen
+    // this defect on the one line of the legend the blocks above cannot see.
+    if !horizontal && let Some(nyquist_ms) = pane.displayed_nyquist_ms() {
+        let line = fold_title_line(nyquist_ms, prefs);
+        gutter = gutter.max(FOLD_TITLE_INSET + laid_out_width(measure, &line, SCALE_FONT_SIZE));
+    }
+    gutter
+}
+
+/// How wide `text` lays out at `size`, logical pixels.
+fn laid_out_width(measure: &egui::Painter, text: &str, size: f32) -> f32 {
+    measure
+        .layout_no_wrap(
+            text.to_owned(),
+            egui::FontId::proportional(size),
+            egui::Color32::WHITE,
+        )
+        .rect
+        .width()
+}
+
+/// How far in from the pane edge one bar's block reaches: the bar itself, the
+/// value labels read against it, and the unit title centred on it.
+///
+/// `offset` is how far in the bar's own outer face already stands — `0.0` for
+/// the radar bar, one [`SCALE_BAR_WIDTH`] + [`SCALE_STACK_GAP`] more for each
+/// overlay bar stacked inside it. The [`SCALE_MARGIN`] the outermost bar stands
+/// on is the caller's to add, since every block shares it.
+///
+/// The two orientations put the marks on different sides of the bar, so they
+/// measure different things:
+///
+/// * **Vertical** — the labels run down the bar's inner face and the title is
+///   centred above it, so the block is as wide as the wider of the two.
+/// * **Horizontal** — the labels stand above the bar and the title is written
+///   under it, inside the [`SCALE_MARGIN`] the bar already stands on, so the
+///   labels alone set the height. Their width does not matter here: they are
+///   centred along a bar that spans the pane, not stacked past its end.
+fn legend_block_reach(
+    measure: &egui::Painter,
+    horizontal: bool,
+    offset: f32,
+    ticks: &[String],
+    title: &str,
+) -> f32 {
+    let past_the_bar = if horizontal {
+        let row = measure
+            .layout_no_wrap(
+                "0".to_owned(),
+                egui::FontId::proportional(SCALE_FONT_SIZE),
+                egui::Color32::WHITE,
+            )
+            .rect
+            .height();
+        SCALE_LABEL_LIFT + row
+    } else {
+        // Every threshold, not the drawn subset: `MIN_LABEL_SPACING` thinning
+        // drops labels a short bar has no room for, and reserving for one that
+        // was thinned costs a few points of glass while re-deriving which
+        // survived would be a second copy of the painter's own arithmetic.
+        let widest = ticks
+            .iter()
+            .map(|tick| laid_out_width(measure, tick, SCALE_FONT_SIZE))
+            .fold(0.0_f32, f32::max);
+        let title = laid_out_width(measure, title, SCALE_TITLE_FONT_SIZE);
+        (SCALE_LABEL_GAP + widest).max((title - SCALE_BAR_WIDTH) / 2.0)
+    };
+    offset + SCALE_BAR_WIDTH + past_the_bar
 }
 
 /// The part of `pane_rect` the colour scale has *not* claimed: where a pane's
@@ -1218,12 +1338,14 @@ pub(super) fn color_scale_gutter(
 /// See [`color_scale_gutter`] for which edge it comes off and why the chrome is
 /// what moves.
 pub(super) fn color_scale_free_rect(
+    measure: &egui::Painter,
     pane_rect: egui::Rect,
     horizontal: bool,
     pane: &PaneState,
     overlays: &OverlayRegistry,
+    prefs: &UserPreferences,
 ) -> egui::Rect {
-    let gutter = color_scale_gutter(pane_rect, horizontal, pane, overlays);
+    let gutter = color_scale_gutter(measure, pane_rect, horizontal, pane, overlays, prefs);
     let mut free = pane_rect;
     if horizontal {
         // Bars along the bottom; the titles sit beside them, on the same edge.
@@ -1248,6 +1370,22 @@ fn short_tick(value: f32) -> String {
     } else {
         format!("{value:.1}")
     }
+}
+
+/// Every value label `render_color_scale` writes beside `product`'s bar, in
+/// order, before `MIN_LABEL_SPACING` thinning takes out the ones a short bar
+/// has no room for.
+///
+/// Named once because three callers want it: the painter, the gutter that has
+/// to leave room for what the painter writes, and the tests that check the
+/// wording. Two spellings of the tick list is how the gutter comes to reserve
+/// room for labels the bar is no longer labelled with.
+pub(super) fn legend_ticks(product: RadarProduct, prefs: &UserPreferences) -> Vec<String> {
+    get_legend_scale(product)
+        .thresholds
+        .iter()
+        .map(|&(value, _)| format_legend_value(product, value, prefs))
+        .collect()
 }
 
 /// Format a legend label value. For HHC uses category names; for others, a short numeric string.
@@ -1284,7 +1422,15 @@ fn format_legend_value(product: RadarProduct, value: f32, prefs: &UserPreference
             let converted = prefs.speed.convert_from_ms(value);
             format!("{converted:.0}")
         }
-        RadarProduct::EchoTops => {
+        // Both echo-tops products, because both are titled off
+        // `HeightUnit::kilo_suffix` and both are read out through
+        // `convert_kft_to_kilo` in `RadarProduct::format_value`. The
+        // interpolated one was missing from this arm alone: in metres its bar
+        // was labelled `60` under a title reading `km` while the readout under
+        // the pointer said `18.3 km` for the same pixel — the half-converted
+        // pane `a_mehs_tick_and_the_hover_readout_are_the_same_number` was
+        // written to rule out, on the one product that test did not reach.
+        RadarProduct::EchoTops | RadarProduct::EchoTopsInterpolated => {
             let converted = prefs.height.convert_kft_to_kilo(value);
             format!("{converted:.0}")
         }
@@ -1665,7 +1811,12 @@ pub(super) fn render_color_scale(
     let title_font = egui::FontId::proportional(SCALE_TITLE_FONT_SIZE);
 
     let mut label_positions: Vec<(f32, String)> = Vec::new();
-    for (i, &(val, _)) in legend.thresholds.iter().enumerate() {
+    for ((i, &(val, _)), text) in legend
+        .thresholds
+        .iter()
+        .enumerate()
+        .zip(legend_ticks(product, prefs))
+    {
         let pixel_pos = if legend.is_gradient {
             // Gradient: value-proportional positioning
             let t = (val - min_val) / range;
@@ -1683,7 +1834,6 @@ pub(super) fn render_color_scale(
                 bar_rect.bottom() - t * bar_rect.height()
             }
         };
-        let text = format_legend_value(product, val, prefs);
         label_positions.push((pixel_pos, text));
     }
 
@@ -1706,7 +1856,7 @@ pub(super) fn render_color_scale(
     for (pixel_pos, text) in &thinned {
         if horizontal {
             // Labels above the bar
-            let pos = egui::pos2(*pixel_pos, bar_rect.top() - 2.0);
+            let pos = egui::pos2(*pixel_pos, bar_rect.top() - SCALE_LABEL_LIFT);
             draw_shadowed_text(
                 painter,
                 pos,
@@ -1716,7 +1866,7 @@ pub(super) fn render_color_scale(
             );
         } else {
             // Labels to the left of the bar
-            let pos = egui::pos2(bar_rect.left() - 4.0, *pixel_pos);
+            let pos = egui::pos2(bar_rect.left() - SCALE_LABEL_GAP, *pixel_pos);
             draw_shadowed_text(
                 painter,
                 pos,
@@ -1789,7 +1939,7 @@ pub(super) fn render_color_scale(
             // the last digit to the painter's clip rect.
             draw_shadowed_text(
                 painter,
-                egui::pos2(pane_rect.right() - 2.0, bar_rect.top() - 4.0),
+                egui::pos2(pane_rect.right() - FOLD_TITLE_INSET, bar_rect.top() - 4.0),
                 egui::Align2::RIGHT_BOTTOM,
                 line,
                 label_font.clone(),
@@ -2052,7 +2202,7 @@ fn render_overlay_color_scales(
 
         for (pixel_pos, text) in &thinned {
             if horizontal {
-                let pos = egui::pos2(*pixel_pos, bar_rect.top() - 2.0);
+                let pos = egui::pos2(*pixel_pos, bar_rect.top() - SCALE_LABEL_LIFT);
                 draw_shadowed_text(
                     painter,
                     pos,
@@ -2061,7 +2211,7 @@ fn render_overlay_color_scales(
                     label_font.clone(),
                 );
             } else {
-                let pos = egui::pos2(bar_rect.left() - 4.0, *pixel_pos);
+                let pos = egui::pos2(bar_rect.left() - SCALE_LABEL_GAP, *pixel_pos);
                 draw_shadowed_text(
                     painter,
                     pos,
@@ -2333,11 +2483,7 @@ mod tests {
 
     /// The ticks `render_color_scale` would paint for `product`, in order.
     fn ticks(product: RadarProduct, prefs: &UserPreferences) -> Vec<String> {
-        get_legend_scale(product)
-            .thresholds
-            .iter()
-            .map(|&(value, _)| format_legend_value(product, value, prefs))
-            .collect()
+        legend_ticks(product, prefs)
     }
 
     /// The MEHS colour bar is labelled in the user's hail-size unit.
@@ -2456,6 +2602,55 @@ mod tests {
         assert_eq!(short_tick(4.0), "4");
         assert_eq!(short_tick(0.25), "0.2");
         assert_eq!(short_tick(-1.5), "-1.5");
+    }
+
+    /// **Both** echo-tops bars are labelled in the user's height unit.
+    ///
+    /// Their stops are authored in kft (`palette.rs`'s `ECHO_TOPS`, shared by
+    /// the pair) and both are titled off `HeightUnit::kilo_suffix` — so a bar
+    /// whose ticks are not converted is one labelled `60` under a title reading
+    /// `km`, with the readout under the pointer saying `18.3 km` for the same
+    /// pixel. `EchoTopsInterpolated` was in every list but the conversion's:
+    /// `unit_label`'s, `format_value`'s and `get_legend_scale`'s.
+    #[test]
+    fn both_echo_tops_bars_are_labelled_in_the_users_height_unit() {
+        use rustdar_units::HeightUnit;
+
+        let feet = UserPreferences {
+            height: HeightUnit::Feet,
+            ..UserPreferences::default()
+        };
+        let metres = UserPreferences {
+            height: HeightUnit::Meters,
+            ..UserPreferences::default()
+        };
+        for product in [RadarProduct::EchoTops, RadarProduct::EchoTopsInterpolated] {
+            assert_eq!(
+                ticks(product, &feet).last().map(String::as_str),
+                Some("60"),
+                "{product:?} in feet is the bar as it has always been labelled",
+            );
+            assert_eq!(
+                ticks(product, &metres).last().map(String::as_str),
+                Some("18"),
+                "{product:?} in metres is labelled in kft: 60 kft is 18 km",
+            );
+            // And the number on the bar is the number the readout gives for the
+            // same stop, to the tick's own precision — the half-converted pane
+            // is the failure, not the rounding.
+            let top = get_legend_scale(product)
+                .thresholds
+                .last()
+                .expect("the echo-tops ramp has stops")
+                .0;
+            let readout = product.format_value(top, &metres);
+            assert!(
+                readout.contains("18.3 km"),
+                "{product:?} reads out {readout:?} for the stop its bar calls \
+                 {:?}",
+                ticks(product, &metres).last(),
+            );
+        }
     }
 
     /// The velocity ramp's own reach, m/s — what a fold marker has to fall
