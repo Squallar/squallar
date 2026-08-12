@@ -11,6 +11,13 @@ mod radar;
 mod reports;
 mod sites;
 
+/// Invariants over *every* texture handler at once. Here rather than beside one
+/// of them because the thing being checked is the set: a new overlay that
+/// declares the wrong alpha convention is the failure, and no single handler's
+/// test module can see it.
+#[cfg(test)]
+mod texture_tests;
+
 use super::overlay_state::OverlayHandler;
 
 /// Create the default set of overlay handlers.

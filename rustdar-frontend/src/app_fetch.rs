@@ -650,6 +650,40 @@ impl super::App {
         }
     }
 
+    /// The rasterizer's bytes as an egui image, in whichever alpha convention
+    /// the rasterizer says it wrote them.
+    ///
+    /// The whole reason this is one function taking a [`RasterizeOutput`],
+    /// rather than a constructor picked at each `offload` arm: the two egui
+    /// constructors accept the same bytes and neither can fail, so choosing the
+    /// wrong one is invisible until somebody notices that every translucent
+    /// polygon is the wrong colour. Nearly every rasterizer here draws through
+    /// tiny-skia and hands over premultiplied pixels — but `rasterize_model_data`
+    /// writes straight alpha, and it reaches this function through exactly the
+    /// same `prepare_rasterize` arm as the others. Reading
+    /// [`RasterizeOutput::alpha`] is what keeps the HRRR overlay correct while
+    /// the polygon overlays skip a conversion that used to cost 22 ms a render.
+    ///
+    /// Called from inside the `offload` closures and nowhere else — see
+    /// `app_render::frame_thread_conversion_tests`.
+    fn overlay_color_image(
+        output: &rustdar_overlays::render::rasterize::RasterizeOutput,
+        width: u32,
+        height: u32,
+    ) -> egui::ColorImage {
+        use rustdar_overlays::render::rasterize::AlphaMode;
+        let size = [width as usize, height as usize];
+        match output.alpha {
+            // A straight copy: `Color32` *is* premultiplied sRGBA, and so is a
+            // `tiny_skia::Pixmap`.
+            AlphaMode::Premultiplied => {
+                egui::ColorImage::from_rgba_premultiplied(size, &output.rgba)
+            }
+            // Three lookups per pixel through `ecolor`'s 64 KiB table.
+            AlphaMode::Straight => egui::ColorImage::from_rgba_unmultiplied(size, &output.rgba),
+        }
+    }
+
     /// Spawn a background thread to rasterize overlay polygons via tiny-skia.
     pub(super) fn spawn_overlay_render(
         &mut self,
@@ -735,11 +769,11 @@ impl super::App {
                     let output = rasterize_fn(&render_bounds, width, height);
                     // Converted here rather than on arrival, and the RGBA
                     // buffer dropped at the end of this statement — see
-                    // `OverlayRenderResponse::image`.
-                    let image = std::sync::Arc::new(egui::ColorImage::from_rgba_unmultiplied(
-                        [width as usize, height as usize],
-                        &output.rgba,
-                    ));
+                    // `OverlayRenderResponse::image`. In whichever alpha
+                    // convention this kind's rasterizer wrote: see
+                    // `Self::overlay_color_image`.
+                    let image =
+                        std::sync::Arc::new(Self::overlay_color_image(&output, width, height));
                     let _ = sender.send(OverlayRenderResponse {
                         image,
                         geo_bounds: render_bounds,
@@ -772,7 +806,7 @@ impl super::App {
                     })
                     .collect();
                 crate::offload::offload("sites-render", move || {
-                    let rgba = rasterize::rasterize_radar_sites(
+                    let output = rasterize::rasterize_radar_sites(
                         &sites,
                         &render_bounds,
                         width,
@@ -785,10 +819,8 @@ impl super::App {
                     // cheaper case for being a simpler picture: the site markers
                     // cover the whole viewport too, so the buffer is the same
                     // size as any other overlay's.
-                    let image = std::sync::Arc::new(egui::ColorImage::from_rgba_unmultiplied(
-                        [width as usize, height as usize],
-                        &rgba,
-                    ));
+                    let image =
+                        std::sync::Arc::new(Self::overlay_color_image(&output, width, height));
                     let _ = sender.send(OverlayRenderResponse {
                         image,
                         geo_bounds: render_bounds,

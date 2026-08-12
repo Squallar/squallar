@@ -108,9 +108,9 @@ impl Rendered {
         Self { pixmap, mb }
     }
 
-    /// Premultiplied RGBA, as tiny-skia leaves it: `draw_feature` is called
-    /// directly, without the `premultiplied_to_straight` the public entry
-    /// points apply afterwards.
+    /// Premultiplied RGBA, as tiny-skia leaves it — which is now also what the
+    /// public entry points return, since none of them un-premultiplies on the
+    /// way out any more. See [`super::AlphaMode`].
     fn rgba_at_geo(&self, lat: f64, lon: f64) -> [u8; 4] {
         let (px, py) = self.mb.project(lat, lon, W as f32, H as f32);
         let idx = ((py as u32) * W + px as u32) as usize * 4;

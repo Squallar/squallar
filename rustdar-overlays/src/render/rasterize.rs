@@ -83,10 +83,36 @@ impl HitMap {
     }
 }
 
+/// Which of the two RGBA conventions a rasterizer's bytes are written in.
+///
+/// egui has a constructor for each — `ColorImage::from_rgba_premultiplied` is a
+/// copy, `from_rgba_unmultiplied` is a copy through a 64 KiB lookup table — and
+/// picking the wrong one does not fail, it shifts every translucent colour. So
+/// the convention is carried on [`RasterizeOutput`] rather than known by the
+/// consumer: `app_fetch::overlay_color_image` reads it off the value it was
+/// handed and cannot be written to assume one.
+///
+/// It has to be per-rasterizer, not per-crate, because this module genuinely
+/// produces both. Everything drawn through tiny-skia is [`Self::Premultiplied`]
+/// — that is what a `Pixmap` holds, by definition. [`rasterize_model_data`]
+/// bypasses tiny-skia and writes palette bytes into a buffer itself, so its
+/// output is [`Self::Straight`]. A single global choice corrupts whichever half
+/// it is wrong about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlphaMode {
+    /// RGB already scaled by alpha — a `tiny_skia::Pixmap`'s own layout, and
+    /// egui's `Color32` layout, which is why the pair needs no conversion.
+    Premultiplied,
+    /// RGB independent of alpha, as a colour table or a picker states it.
+    Straight,
+}
+
 pub struct RasterizeOutput {
-    /// `width × height × 4` bytes, straight (not premultiplied) alpha.
+    /// `width × height × 4` bytes, in the convention [`Self::alpha`] names.
     pub rgba: Vec<u8>,
     pub hit_map: Option<HitMap>,
+    /// How to read [`Self::rgba`]. See [`AlphaMode`].
+    pub alpha: AlphaMode,
 }
 
 // ── Mercator projection helpers ──────────────────────────────────────────
@@ -134,8 +160,24 @@ impl MercatorBounds {
 }
 
 // ── Public API ───────────────────────────────────────────────────────────
+//
+// Every entry point below draws through tiny-skia, so every `Vec<u8>` they
+// return is a `Pixmap`'s own buffer: **premultiplied** alpha. They used to
+// un-premultiply it on the way out, because egui's overlay upload called
+// `ColorImage::from_rgba_unmultiplied`, which immediately multiplied it back.
+// The pair cancelled — at 15 ms of division plus 7 ms of extra table lookup per
+// 18.7 Mpx texture, and one lossy `u8` round trip, for a picture that was
+// already in the layout `Color32` wants. The buffer is now handed over as it
+// was drawn, and [`AlphaMode`] on [`RasterizeOutput`] is what tells the
+// uploader so.
+//
+// The exception is [`rasterize_model_data`], which never went through
+// tiny-skia and never called the conversion: it writes palette bytes with
+// straight alpha, and says so.
 
 /// `hatch_color` is theme-dependent, so it cannot live in the feature.
+///
+/// Premultiplied RGBA — see the module note above.
 pub fn rasterize_spc_outlooks(
     features: &[OverlayFeature],
     bounds: &GeoBounds,
@@ -162,10 +204,10 @@ pub fn rasterize_spc_outlooks(
     }
     crate::render::hatch::draw_hatch_pass(&mut pixmap, features, &mb, w, h, hatch_color);
 
-    premultiplied_to_straight(pixmap.data_mut());
     pixmap.take()
 }
 
+/// Premultiplied RGBA — see the module note above.
 pub fn rasterize_spc_discussions(
     discussions: &[SpcDiscussion],
     bounds: &GeoBounds,
@@ -206,11 +248,12 @@ pub fn rasterize_spc_discussions(
         }
     }
 
-    premultiplied_to_straight(pixmap.data_mut());
     pixmap.take()
 }
 
 /// Renders only alerts in `enabled_categories` and not in `hidden_ids`.
+///
+/// Premultiplied RGBA — see the module note above.
 pub fn rasterize_nws_alerts(
     alerts: &[NwsAlert],
     enabled_categories: &[AlertCategory],
@@ -240,7 +283,6 @@ pub fn rasterize_nws_alerts(
         }
     }
 
-    premultiplied_to_straight(pixmap.data_mut());
     pixmap.take()
 }
 
@@ -253,6 +295,12 @@ pub struct RadarSiteInfo {
     pub is_loading: bool,
 }
 
+/// [`RasterizeOutput`] and not a bare buffer, unlike its neighbours, because
+/// this is the one rasterizer whose caller is not an
+/// [`OverlayHandler`](crate::render::overlay_state::OverlayHandler): `app_fetch`
+/// invokes it directly, so there is no handler in between to state the alpha
+/// convention on its behalf. Returning the mode with the bytes is what keeps
+/// that call site from having to know it.
 pub fn rasterize_radar_sites(
     sites: &[RadarSiteInfo],
     bounds: &GeoBounds,
@@ -260,14 +308,18 @@ pub fn rasterize_radar_sites(
     height: u32,
     zoom: f64,
     is_dark: bool,
-) -> Vec<u8> {
+) -> RasterizeOutput {
     let Some(mut pixmap) = Pixmap::new(width, height) else {
         log::error!(
             "Pixmap allocation failed in rasterize_radar_sites ({}×{})",
             width,
             height
         );
-        return vec![0u8; (width * height * 4) as usize];
+        return RasterizeOutput {
+            rgba: vec![0u8; (width * height * 4) as usize],
+            hit_map: None,
+            alpha: AlphaMode::Premultiplied,
+        };
     };
     let mb = MercatorBounds::from_geo(bounds);
     let w = width as f32;
@@ -346,8 +398,11 @@ pub fn rasterize_radar_sites(
         }
     }
 
-    premultiplied_to_straight(pixmap.data_mut());
-    pixmap.take()
+    RasterizeOutput {
+        rgba: pixmap.take(),
+        hit_map: None,
+        alpha: AlphaMode::Premultiplied,
+    }
 }
 
 // ── Storm report symbol helpers ───────────────────────────────────────
@@ -465,6 +520,7 @@ pub fn rasterize_storm_reports(
         return RasterizeOutput {
             rgba: vec![0u8; (width * height * 4) as usize],
             hit_map: None,
+            alpha: AlphaMode::Premultiplied,
         };
     };
     let mb = MercatorBounds::from_geo(bounds);
@@ -566,10 +622,10 @@ pub fn rasterize_storm_reports(
         }
     }
 
-    premultiplied_to_straight(pixmap.data_mut());
     RasterizeOutput {
         rgba: pixmap.take(),
         hit_map: Some(hit_map),
+        alpha: AlphaMode::Premultiplied,
     }
 }
 
@@ -661,6 +717,7 @@ pub fn rasterize_glm_strikes(
         return RasterizeOutput {
             rgba: vec![0u8; (width * height * 4) as usize],
             hit_map: None,
+            alpha: AlphaMode::Premultiplied,
         };
     };
     let mb = MercatorBounds::from_geo(bounds);
@@ -719,10 +776,10 @@ pub fn rasterize_glm_strikes(
         }
     }
 
-    premultiplied_to_straight(pixmap.data_mut());
     RasterizeOutput {
         rgba: pixmap.take(),
         hit_map: Some(hit_map),
+        alpha: AlphaMode::Premultiplied,
     }
 }
 
@@ -1025,20 +1082,6 @@ fn merc_y_to_lat(merc_y: f64) -> f64 {
     (2.0 * merc_y.exp().atan() - PI / 2.0).to_degrees()
 }
 
-/// tiny-skia writes premultiplied alpha; egui expects straight. Every
-/// rasterizer here must call this before returning the buffer.
-fn premultiplied_to_straight(data: &mut [u8]) {
-    for pixel in data.chunks_exact_mut(4) {
-        let a = pixel[3] as f32;
-        if a > 0.0 && a < 255.0 {
-            let inv = 255.0 / a;
-            pixel[0] = (pixel[0] as f32 * inv).min(255.0) as u8;
-            pixel[1] = (pixel[1] as f32 * inv).min(255.0) as u8;
-            pixel[2] = (pixel[2] as f32 * inv).min(255.0) as u8;
-        }
-    }
-}
-
 // ── Model data (HRRR) rasterization ──────────────────────────────────────
 
 /// Half-open `(i, j)` ranges of the grid the rasterizer touches.
@@ -1182,6 +1225,7 @@ pub fn rasterize_model_data(
         return RasterizeOutput {
             rgba,
             hit_map: None,
+            alpha: AlphaMode::Straight,
         };
     }
 
@@ -1201,6 +1245,7 @@ pub fn rasterize_model_data(
         return RasterizeOutput {
             rgba,
             hit_map: None,
+            alpha: AlphaMode::Straight,
         };
     }
     let win_w = win.i1 - win.i0;
@@ -1291,8 +1336,12 @@ pub fn rasterize_model_data(
     RasterizeOutput {
         rgba,
         hit_map: None,
+        alpha: AlphaMode::Straight,
     }
 }
+
+#[cfg(test)]
+mod alpha_tests;
 
 #[cfg(test)]
 mod glm_energy_tests;

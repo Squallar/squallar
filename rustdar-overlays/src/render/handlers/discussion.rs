@@ -279,6 +279,7 @@ impl OverlayHandler for SpcDiscussionHandler {
             RasterizeOutput {
                 rgba,
                 hit_map: None,
+                alpha: rasterize::AlphaMode::Premultiplied,
             }
         }))
     }

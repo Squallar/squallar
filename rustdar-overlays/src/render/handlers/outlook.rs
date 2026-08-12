@@ -300,6 +300,7 @@ impl OverlayHandler for SpcOutlookHandler {
             RasterizeOutput {
                 rgba,
                 hit_map: None,
+                alpha: rasterize::AlphaMode::Premultiplied,
             }
         }))
     }

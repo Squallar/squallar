@@ -22,6 +22,14 @@ fn body_of<'a>(source: &'a str, signature: &str) -> &'a str {
 /// The per-pixel unmultiply, by the only name it is ever called by.
 const UNMULTIPLY: &str = "from_rgba_unmultiplied";
 
+/// The overlay path's one converter: the function that reads
+/// `RasterizeOutput::alpha` and picks the egui constructor from it.
+const OVERLAY_CONVERT: &str = "overlay_color_image";
+
+/// The same, as a *call* — so the comment sitting above each one does not get
+/// counted as a second conversion.
+const OVERLAY_CONVERT_CALL: &str = "Self::overlay_color_image(";
+
 /// Every function `setup_egui_frame` reaches that used to walk a full-size
 /// buffer, and no longer may.
 ///
@@ -53,6 +61,13 @@ fn no_poller_unmultiplies_on_the_frame_thread() {
              `channels::RenderedImage::image` and \
              `channels::OverlayRenderResponse::image`.",
         );
+        assert!(
+            !body.contains(OVERLAY_CONVERT),
+            "`{signature}` converts a full-size overlay buffer on the frame \
+             thread. `overlay_color_image` is a per-pixel walk of an 18.7 Mpx \
+             texture whichever arm it takes; it belongs in the `offload` \
+             closure that produced the pixels.",
+        );
     }
 }
 
@@ -62,16 +77,32 @@ fn no_poller_unmultiplies_on_the_frame_thread() {
 /// Both overlay producers, because they are two sends of one response type and
 /// a conversion added back to only one of them would be invisible — the
 /// `RadarSites` raster covers the same viewport as any other overlay's.
+///
+/// Counted on `overlay_color_image` rather than on either egui constructor
+/// because there is no longer one right constructor to look for: the polygon
+/// rasterizers hand over premultiplied pixels and `rasterize_model_data` hands
+/// over straight ones, so the arm is chosen from `RasterizeOutput::alpha` inside
+/// that one function. A call site that picked a constructor itself would be the
+/// regression — hence the second assertion.
 #[test]
 fn both_overlay_rasterizers_convert_before_they_send() {
     let body = body_of(APP_FETCH, "pub(super) fn spawn_overlay_render(");
-    let conversions = body.matches(UNMULTIPLY).count();
+    let conversions = body.matches(OVERLAY_CONVERT_CALL).count();
     assert_eq!(
         conversions, 2,
         "`spawn_overlay_render` converts {conversions} of its two rasters \
          before sending. Each `offload` arm has to do it: an unconverted \
          `OverlayRenderResponse` has nowhere to be converted but \
          `poll_overlay_render_results`, on the frame thread.",
+    );
+    assert!(
+        !body.contains(UNMULTIPLY) && !body.contains("from_rgba_premultiplied"),
+        "`spawn_overlay_render` names an egui alpha constructor directly. \
+         Which one is right depends on the overlay kind — tiny-skia writes \
+         premultiplied, `rasterize_model_data` writes straight, and both \
+         arrive through the same `prepare_rasterize` arm — so the choice has \
+         to be read off `RasterizeOutput::alpha` in `overlay_color_image`, not \
+         written out here.",
     );
 }
 

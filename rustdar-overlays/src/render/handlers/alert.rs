@@ -398,6 +398,7 @@ impl OverlayHandler for NwsAlertHandler {
             RasterizeOutput {
                 rgba,
                 hit_map: None,
+                alpha: rasterize::AlphaMode::Premultiplied,
             }
         }))
     }
