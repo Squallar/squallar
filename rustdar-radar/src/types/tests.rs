@@ -845,6 +845,8 @@ fn at(timestamp_minute: u32) -> chrono::NaiveDateTime {
 /// decimal place.
 #[test]
 fn the_precedence_is_volume_then_learned_then_table() {
+// The radars this renders against; there are none until a test asks.
+crate::sites::fixture::install();
     use crate::site_position::{SitePosition, SitePositionSource};
 
     let table = crate::sites::get_radar_site("KTLX").expect("in the table");
@@ -946,6 +948,8 @@ fn the_precedence_is_volume_then_learned_then_table() {
 /// site that this path structurally cannot supply.
 #[test]
 fn a_chunk_fed_volume_falls_back_to_the_table() {
+// The radars this renders against; there are none until a test asks.
+crate::sites::fixture::install();
     // The real assembler, not a stand-in for it: this is the object the live
     // feed hands a `Scan` out of, so if it ever grew a site the fixture would
     // grow one with it.
@@ -984,6 +988,8 @@ fn a_chunk_fed_volume_falls_back_to_the_table() {
 /// reason last-writer-wins is the right rule.
 #[test]
 fn a_corrected_position_reaches_every_consumer_of_it() {
+// The radars this renders against; there are none until a test asks.
+crate::sites::fixture::install();
     let table = crate::sites::get_radar_site("KTLX").expect("in the table");
     // 43 m north, spelled in degrees at KTLX's latitude.
     let moved_lat = table.lat + 43.0 / (KM_PER_DEGREE_LAT * 1000.0);
@@ -1021,10 +1027,21 @@ fn a_corrected_position_reaches_every_consumer_of_it() {
 
     // And the site's own height, which every beam height is measured above —
     // hail, HCA, echo tops, the cross-section's base, the 3D grid's datum.
-    // 370 m is 1214 ft, and KTLX's row records 1213.
+    //
+    // 370 m is 1214 ft and the row already records 1214 ft, so `adjudicate`
+    // hands back the figure the row had rather than reconverting to it. The
+    // difference is invisible here and load-bearing one layer down: a row
+    // rebuilt rather than kept compares unequal to itself, and a launch would
+    // then leak a fresh table for a volume that had not moved.
+    //
+    // This read 1213 while the compiled-in table existed. That table stated
+    // KTLX's ground in feet from a source finer than a volume's whole metre,
+    // and the metre could not contradict it. With the table deleted there is
+    // no finer figure anywhere in the process and a height is the volume's
+    // metre converted — one foot at KTLX, against a threshold of a metre.
     assert_eq!(
         info.site.height_ft(crate::sites::Datum::SiteBase),
-        Some(1213),
+        Some(1214),
         "a metre the volume cannot contradict must not move the row's feet",
     );
 }

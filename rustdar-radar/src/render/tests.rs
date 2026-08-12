@@ -1828,16 +1828,18 @@ fn find_closest_elevation_snaps_to_the_flown_tilt() {
 /// `Datum::SiteBase` fails here rather than passing quietly.
 #[test]
 fn the_render_paths_site_height_is_the_feedhorn() {
-    // KTLX: 1213 ft of ground under a 62 ft tower.
+// The radars this renders against; there are none until a test asks.
+crate::sites::fixture::install();
+    // KTLX: 1214 ft of ground under a 62 ft tower.
     const KTLX: (f64, f64) = (35.33306, -97.2775);
     assert_eq!(
         super::render_site_height_ft(KTLX.0, KTLX.1),
-        1213.0 + 62.0,
+        1214.0 + 62.0,
         "the feedhorn",
     );
     assert_ne!(
         super::render_site_height_ft(KTLX.0, KTLX.1),
-        1213.0,
+        1214.0,
         "the ground under the tower is not the datum a beam height is above",
     );
 }
@@ -1927,6 +1929,8 @@ fn dual_pol_tilt(number: u8, elev: f32) -> nexrad_model::data::Sweep {
 /// the classifier reaches is the whole answer.
 #[test]
 fn the_hybrid_classification_changes_with_the_environmental_heights() {
+// The radars this renders against; there are none until a test asks.
+crate::sites::fixture::install();
     /// Dry snow: what the low freezing level puts the beam above.
     const DS: f32 = 40.0;
     /// Rain: what the default melting layer puts the beam below.

@@ -91,20 +91,45 @@ fn an_nws_only_radar_never_becomes_selectable() {
     );
 }
 
-/// An unplaced member contributes nothing rather than a placeholder.
+/// An unplaced member contributes membership and no position.
 ///
-/// The alternative — a fix at (0, 0), or at the bucket's idea of nowhere —
-/// would be persisted, would outlive the fetch that produced it, and would draw
-/// a marker in the Gulf of Guinea.
+/// It used to contribute nothing at all, which was right while a compiled-in
+/// table placed `TPBI` and `KCRI` anyway. With that table deleted, dropping
+/// them here would delete the radars: they have real Level II data and would
+/// stop appearing in the site list at all.
+///
+/// So the fix carries no numbers rather than made-up ones. The alternative —
+/// a fix at (0, 0), or at the bucket's idea of nowhere — would be persisted,
+/// would outlive the fetch that produced it, and would draw a marker in the
+/// Gulf of Guinea.
 #[test]
-fn a_member_the_nws_cannot_place_supplies_no_fix() {
+fn a_member_the_nws_cannot_place_supplies_membership_and_no_position() {
     let catalogue = SiteCatalogue::union(ids(&["TPBI", "KTLX"]), &positions());
     assert_eq!(catalogue.len(), 2, "both are members");
+
+    let fixes: Vec<(&str, SiteFix)> = catalogue.fixes().collect();
+    assert_eq!(fixes.len(), 2, "and both have something to say");
     assert_eq!(
-        catalogue.fixes().count(),
-        1,
-        "but only the placed one has anything to say",
+        fixes
+            .iter()
+            .find(|(id, _)| *id == "TPBI")
+            .map(|(_, fix)| *fix),
+        Some(SiteFix::Unplaced),
+        "the one the NWS cannot place says only that it exists",
     );
+    assert!(
+        matches!(
+            fixes.iter().find(|(id, _)| *id == "KTLX"),
+            Some((_, SiteFix::Network { .. })),
+        ),
+        "and the placed one carries its position",
+    );
+
+    // The whole point: it is a member the table can list, and never a row.
+    let table = crate::sites::build_table(catalogue.fixes());
+    assert_eq!(table.unplaced(), ["TPBI"]);
+    assert!(table.get("TPBI").is_none());
+    assert!(table.get("KTLX").is_some());
 }
 
 /// The bucket root can hold anything somebody uploaded, and only a four-byte

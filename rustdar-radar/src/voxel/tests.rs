@@ -42,7 +42,7 @@ const SITE: (f64, f64) = (35.33306, -97.2775);
 /// grid subtracts, because the beam heights it places are measured above the
 /// antenna. Written as the sum so that switching the builder back to
 /// `Datum::SiteBase` fails here rather than passing quietly.
-const SITE_ELEV_FT: f64 = 1213.0 + 62.0;
+const SITE_ELEV_FT: f64 = 1214.0 + 62.0;
 
 fn encode_refl(dbz: f64) -> u8 {
     ((dbz * f64::from(REFL_SCALE) + f64::from(REFL_OFFSET)).round() as i64).clamp(2, 255) as u8
@@ -1108,6 +1108,8 @@ fn cell_centres_sit_at_the_half_step() {
 /// sign, moves the lowest row with data by 7 or 14 rows.
 #[test]
 fn the_height_axis_is_msl_above_the_sites_own_elevation() {
+// The radars this renders against; there are none until a test asks.
+crate::sites::fixture::install();
     let scan = scan_of(&|_, _| Some(35.0));
     let nz = 240;
     let (base_km_msl, top_km_msl) = (0.0, 12.0);
@@ -1311,6 +1313,8 @@ fn a_single_tilt_volume_fills_nothing_rather_than_smearing_one_beam() {
 /// actually resolves, which is the point.
 #[test]
 fn a_layer_is_quantised_to_the_ladder_rather_than_to_nz() {
+// The radars this renders against; there are none until a test asks.
+crate::sites::fixture::install();
     let nz = 200;
     let (base_km_msl, top_km_msl) = (0.0, 12.0);
     let dz = (top_km_msl - base_km_msl) / nz as f64;
@@ -1387,6 +1391,8 @@ fn a_layer_is_quantised_to_the_ladder_rather_than_to_nz() {
 /// through `axis_centre`, so the two spellings have to agree.
 #[test]
 fn every_cell_is_the_samplers_own_answer() {
+// The radars this renders against; there are none until a test asks.
+crate::sites::fixture::install();
     let scan = scan_of(&|az, slant| (az < 200.0).then_some(10.0 + (slant % 37.0) + az / 12.0));
     let shape = VoxelShape {
         nx: 9,

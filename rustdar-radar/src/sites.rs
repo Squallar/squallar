@@ -1223,7 +1223,7 @@ mod tests {
     /// metres, so the gap a row records is those figures to within 3 ft.
     #[test]
     fn the_two_datums_are_a_tower_apart() {
-        for (tower_m, want_ft) in [(14, 45), (19, 62), (24, 78), (29, 95), (34, 111)] {
+        for (tower_m, want_ft) in [(14, 46), (19, 62), (24, 79), (29, 95), (34, 112)] {
             let table = build_table([("ZZZA", learned(-30_000_000, -140_000_000, 100, tower_m))]);
             let row = table.get("ZZZA").expect("a learned row");
             let gap = row.height_ft(Datum::Feedhorn).expect("feedhorn")
@@ -1441,5 +1441,91 @@ mod tests {
             extended(base, [("TPBI", SiteFix::Unplaced)]).is_none(),
             "a member that was already a member is not a change",
         );
+    }
+}
+
+/// The radars this crate's tests render against.
+///
+/// # Why a fixture and not the shipped data
+///
+/// Because there is no shipped data. Deleting `SEED` did not only remove a
+/// list — it removed the reason a test binary had any radars at all, and a
+/// geometry test that renders a cross-section over `KTLX` still needs *some*
+/// site at *some* position with *some* elevation to render against.
+///
+/// So the tests that need one say so, by calling [`install`]. The alternative
+/// — letting them read whatever the process happened to resolve — is how a
+/// test stops being able to fail: with nothing resolved, `radars()` is empty,
+/// `radar_height_ft_near` answers `None`, and an assertion about a height
+/// becomes an assertion about zero that passes for the wrong reason.
+///
+/// # Why these figures are real
+///
+/// Every row here is a real site at the position and heights its own Level II
+/// volume reported, because the tests that read them assert *measured*
+/// numbers: `KLWX`'s 292 ft is the ground a cross-section was once anchored
+/// 89 m under, and `RKSG`'s 1440 ft is the Camp Humphreys figure that replaced
+/// Osan's. A synthetic elevation would turn those into assertions about
+/// arithmetic.
+///
+/// Nine rows, not two hundred. That is the difference between a fixture and a
+/// table: this cannot rot into a wrong answer for a user, because it is
+/// `#[cfg(test)]` and no build ships it, and it cannot silently go stale
+/// either — a figure here is only ever compared against another figure in the
+/// same test.
+#[cfg(test)]
+pub(crate) mod fixture {
+    use super::{SiteFix, SiteTable};
+    use crate::site_position::SitePosition;
+    use std::sync::Once;
+
+    /// `(ICAO, latitude, longitude, site_height_m, tower_height_m)`.
+    ///
+    /// Metres because that is what a Volume Data Block reports and what
+    /// [`SiteFix::Learned`] carries; the feet every assertion is written in
+    /// come back out through the same conversion production uses, so a change
+    /// to that conversion fails these tests rather than sliding past them.
+    ///
+    /// `TOKC` is a TDWR and states one height twice, which is what makes the
+    /// set contain a row that cannot answer `Datum::SiteBase` — the shape
+    /// `a_row_that_cannot_answer_never_reports_sea_level` exists for.
+    const SITES: [(&str, i32, i32, i32, i32); 9] = [
+        ("KTLX", 35_333_060, -97_277_500, 370, 19),
+        ("TOKC", 35_276_000, -97_510_000, 386, 386),
+        ("RKSG", 37_207_570, 127_285_560, 439, 24),
+        ("KDGX", 32_280_000, -89_984_000, 151, 34),
+        ("KFSX", 34_574_000, -111_198_000, 2261, 29),
+        ("KRTX", 45_715_000, -122_965_000, 492, 34),
+        ("KSRX", 35_290_000, -94_361_000, 200, 24),
+        ("KVWX", 38_260_000, -87_724_000, 156, 34),
+        ("KLWX", 38_975_000, -77_477_000, 89, 34),
+    ];
+
+    /// Resolve the fixture into the process-wide table, once.
+    ///
+    /// Idempotent and safe to call from every test in parallel: [`resolve`]
+    /// takes the write lock across read and build, only ever adds radars, and
+    /// builds nothing when the fixes reproduce the rows already there. The
+    /// [`Once`] is for tidiness rather than correctness.
+    ///
+    /// Tests that assert the *absence* of radars must not call this and must
+    /// not read the process table at all — they go through `empty_table` and
+    /// `build_table`, neither of which consults what was resolved.
+    pub(crate) fn install() -> &'static SiteTable {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            super::resolve(SITES.map(|(name, lat_udeg, lon_udeg, site_m, tower_m)| {
+                (
+                    name,
+                    SiteFix::Learned(SitePosition {
+                        lat_udeg,
+                        lon_udeg,
+                        site_height_m: site_m,
+                        tower_height_m: tower_m,
+                    }),
+                )
+            }));
+        });
+        super::table()
     }
 }
