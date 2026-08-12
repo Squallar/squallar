@@ -311,10 +311,17 @@ fn the_old_grid_stands_in_while_its_replacement_builds_and_then_leaves() {
     );
 }
 
-/// The stand-in is scoped: a pane re-aimed at another **site, moment or
-/// region** must not paint its old grid under the new target's caption —
-/// the one lie the swap must never tell: another site's storm under this
-/// pane's caption.
+/// The stand-in is scoped: a pane re-aimed at another **radar or product**
+/// must not paint its old grid under the new target's caption — the one lie
+/// the swap must never tell: another site's storm under this pane's caption.
+///
+/// A change of *region* is deliberately not on that list, and the difference
+/// is what can be done about it. A new box is still a question about this
+/// radar's reflectivity at this moment, and the held grid is a real answer to
+/// part of it — one that can be **drawn into** the new box (see [`DrawnBox`])
+/// under a caption saying what resolution it really has. A new product or a
+/// new radar cannot be transformed into an answer at all, so no crop and no
+/// caption redeems them.
 ///
 /// The held entry is a **`Ready` grid**, and that is what makes the pin
 /// bite. Only a `Ready` entry can ever stand in — held as a `Refused`
@@ -326,19 +333,166 @@ fn the_old_grid_stands_in_while_its_replacement_builds_and_then_leaves() {
 /// reaches that clause.
 #[test]
 fn an_out_of_scope_grid_never_stands_in() {
-    let store = VolumeStore::new();
-    let refl = target(RadarProduct::Reflectivity, 0);
-    assert!(!store.share(0, &refl), "the first ask owns the dispatch");
-    store.begin_build(0, &refl);
-    assert!(store.complete(&refl, ready_grid()));
+    let elsewhere = VolumeTarget {
+        volume: VolumeStamp {
+            site: "KFWS".to_owned(),
+            ..target(RadarProduct::Reflectivity, 0).volume
+        },
+        ..target(RadarProduct::Reflectivity, 0)
+    };
+    for other in [target(RadarProduct::Velocity, 0), elsewhere] {
+        let store = VolumeStore::new();
+        let refl = target(RadarProduct::Reflectivity, 0);
+        assert!(!store.share(0, &refl), "the first ask owns the dispatch");
+        store.begin_build(0, &refl);
+        assert!(store.complete(&refl, ready_grid()));
 
-    let velocity = target(RadarProduct::Velocity, 0);
-    assert!(!store.share(0, &velocity));
-    store.begin_build(0, &velocity);
-    assert!(
-        store.lookup_for_pane(0, &velocity).is_none(),
-        "a reflectivity grid must not stand in for a velocity build",
+        assert!(!store.share(0, &other));
+        store.begin_build(0, &other);
+        assert!(
+            store.lookup_for_pane(0, &other).is_none(),
+            "a KTLX reflectivity grid must not stand in for {} at {}",
+            other.product.code(),
+            other.volume.site,
+        );
+    }
+}
+
+/// The `ready_grid` fixture's own site, and the half-width it was resampled
+/// over. Anything derived from these has to agree with the grid, or the crop
+/// below is measuring itself.
+const FIXTURE_SITE: (f64, f64) = (35.33, -97.27);
+const FIXTURE_HALF_KM: f64 = 40.0;
+
+/// A target over a box centred on the fixture's site, `half_width_km` either
+/// side — a pane that has zoomed to exactly that much ground.
+fn box_target(half_width_km: f64) -> VolumeTarget {
+    VolumeTarget {
+        region: Some(
+            rustdar_egui::pane::VolumeRegion::new(
+                rustdar_egui::pane::GeoPoint {
+                    lat: FIXTURE_SITE.0,
+                    lon: FIXTURE_SITE.1,
+                },
+                half_width_km,
+            )
+            .expect("a finite in-range half-width on a real centre is a region"),
+        ),
+        ..target(RadarProduct::Reflectivity, 0)
+    }
+}
+
+/// **Zooming a 3D pane must not take its picture away.**
+///
+/// The box is the pane's own viewport, so a scroll names a new target on the
+/// very frame the wheel turns, and the grid for it is ~89 ms of resampling
+/// plus ~51 ms of upload away. With the region inside `same_scope` the new
+/// target was out of scope of the grid in the pane's own hand: `begin_build`
+/// shed it, `lookup_for_pane` had nothing left to answer with, and the pane
+/// blanked to "Building…" for that whole window — over a floor that was
+/// already following the viewport in real time, so it read as the data
+/// falling off a moving ground.
+///
+/// Two assertions, and the pairing is what stops this passing vacuously: the
+/// held grid answers **and it is the `Ready` grid**, not the `Building` entry
+/// just opened for the new box. A `lookup_for_pane` that answered with the
+/// in-flight placeholder would satisfy "something came back" and paint
+/// nothing at all.
+#[test]
+fn a_zoom_keeps_the_grid_the_pane_is_already_painting() {
+    let store = VolumeStore::new();
+    let wide = box_target(FIXTURE_HALF_KM);
+    let tight = box_target(FIXTURE_HALF_KM / 2.0);
+
+    store.begin_build(0, &wide);
+    assert!(store.complete(&wide, ready_grid()));
+    let held = store.lookup(&wide).expect("resolved").id;
+
+    assert!(!store.share(0, &tight), "a new box needs a new build");
+    store.begin_build(0, &tight);
+
+    let standing_in = store
+        .lookup_for_pane(0, &tight)
+        .expect("the pane's own grid must answer while the zoomed box builds");
+    assert_eq!(
+        standing_in.id, held,
+        "the picture a zoom leaves on screen must be the grid the pane was \
+         already painting",
     );
+    assert!(
+        matches!(standing_in.entry, VolumeEntry::Ready(_)),
+        "the in-flight placeholder is not a picture; answering with it would \
+         blank the pane exactly as before while looking like a stand-in",
+    );
+
+    assert!(store.complete(&tight, ready_grid()));
+    assert_eq!(
+        store.live_ids().len(),
+        1,
+        "the zoomed grid retires the one it stood in for; two boxes may \
+         coexist through a rebuild and must never accumulate",
+    );
+}
+
+/// The crop's algebra, at both zoom directions and at rest.
+///
+/// This is where a swapped axis or an inverted offset would live, and neither
+/// is visible in a screenshot — a volume drawn from the wrong corner of its
+/// own texture is still a plausible-looking storm.
+#[test]
+fn the_drawn_box_is_the_one_asked_for_and_the_crop_finds_it_in_the_grid() {
+    let VolumeEntry::Ready(grid) = ready_grid() else {
+        panic!("the fixture is a resolved grid");
+    };
+    assert_eq!(
+        (grid.x_range_km(), grid.y_range_km()),
+        (
+            (-FIXTURE_HALF_KM, FIXTURE_HALF_KM),
+            (-FIXTURE_HALF_KM, FIXTURE_HALF_KM)
+        ),
+        "precondition: the fixture is centred on its own site, so the boxes \
+         below are symmetric and an inverted offset cannot cancel out",
+    );
+
+    // At rest the pane asks for the box it already has, and the affine is the
+    // identity — bit-exactly, because both boxes came out of one function.
+    let settled = DrawnBox::for_target(&box_target(FIXTURE_HALF_KM), &grid)
+        .expect("a picked region always places");
+    assert_eq!(settled, DrawnBox::settled(&grid));
+    assert_eq!(
+        (settled.scale, settled.offset, settled.bounded),
+        ([1.0; 3], [0.0; 3], false),
+    );
+
+    // Zoomed in: half the ground, so the middle half of the grid, magnified.
+    // Nothing can fall outside it, so no bounds test is asked for.
+    let inner = DrawnBox::for_target(&box_target(FIXTURE_HALF_KM / 2.0), &grid)
+        .expect("a picked region always places");
+    assert_eq!((inner.x_km, inner.y_km), ((-20.0, 20.0), (-20.0, 20.0)));
+    assert_eq!(inner.scale, [0.5, 0.5, 1.0]);
+    assert_eq!(inner.offset, [0.25, 0.25, 0.0]);
+    assert!(!inner.bounded);
+
+    // Zoomed out: twice the ground, so the grid fills the middle quarter and
+    // the rest must read as air rather than as the sampler's clamped rim.
+    let outer = DrawnBox::for_target(&box_target(FIXTURE_HALF_KM * 2.0), &grid)
+        .expect("a picked region always places");
+    assert_eq!((outer.x_km, outer.y_km), ((-80.0, 80.0), (-80.0, 80.0)));
+    assert_eq!(outer.scale, [2.0, 2.0, 1.0]);
+    assert_eq!(outer.offset, [-0.5, -0.5, 0.0]);
+    assert!(
+        outer.bounded,
+        "a box reaching past the grid must ask for the bounds test, or the \
+         edge texels smear across ground the radar never reported",
+    );
+
+    // The vertical is the grid's own on all three: a region cannot re-cut the
+    // column, so the stand-in must not introduce a vertical pop when the real
+    // build lands.
+    for drawn in [settled, inner, outer] {
+        assert_eq!(drawn.z_km_msl, grid.z_range_km_msl());
+        assert_eq!((drawn.scale[2], drawn.offset[2]), (1.0, 0.0));
+    }
 }
 
 /// A pane that re-aims mid-build supersedes its own build: the orphaned

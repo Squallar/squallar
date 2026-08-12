@@ -364,6 +364,32 @@ fn the_volume_alpha_button_is_painted_on_a_3d_pane() {
     );
 }
 
+/// The painter's report reaches the caption the user reads.
+///
+/// The two halves of the stand-in are pinned apart — the renderer decides
+/// what to draw (`rustdar-frontend`'s `volume_stand_in` suite) and
+/// `volume_caption` decides what to write — and this is the seam between
+/// them. It is exactly the sort of wiring that can be dropped without a
+/// compiler error: `render_volume_pane` could ignore the `showing` field and
+/// hand `Showing::SETTLED` to the caption, and every test on either side
+/// would stay green while the pane silently went back to claiming a sharpness
+/// it does not have.
+#[test]
+fn the_pane_captions_the_picture_the_painter_says_it_drew() {
+    let (h, _painter) = volume_harness(StubVolumePainter::standing_in(Showing {
+        cell_km: Some(1.8),
+        stale: true,
+        partial: false,
+    }));
+    let pane_rect = h.pane_rects()[1];
+    let texts = h.painted_text_strings_in(pane_rect);
+    assert!(
+        texts.iter().any(|t| t.contains("sharpening")),
+        "a pane whose painter says it is standing in must say so in its own \
+             caption; painted texts were {texts:?}",
+    );
+}
+
 /// A moment the radar does not measure directly is refused by name, before
 /// anything asks for a grid `build_voxels` would decline to build.
 #[test]
@@ -1355,32 +1381,6 @@ fn a_caption_over_a_stand_in_reports_the_picture_and_not_the_request() {
         partial: false,
     });
     assert_eq!(settled, format!("40 km box - {asked_for}"));
-}
-
-/// The painter's report reaches the caption the user reads.
-///
-/// The two halves of the stand-in are pinned apart — the renderer decides what
-/// to draw (`rustdar-frontend`'s `volume_stand_in` suite) and `volume_caption`
-/// decides what to write — and this is the seam between them. It is exactly
-/// the sort of wiring that can be dropped without a compiler error:
-/// `render_volume_pane` could ignore the `showing` field and hand
-/// `Showing::SETTLED` to the caption, and every test on either side would stay
-/// green while the pane silently went back to claiming a sharpness it does not
-/// have.
-#[test]
-fn the_pane_captions_the_picture_the_painter_says_it_drew() {
-    let (h, _painter) = volume_harness(StubVolumePainter::standing_in(Showing {
-        cell_km: Some(1.8),
-        stale: true,
-        partial: false,
-    }));
-    let pane_rect = h.pane_rects()[1];
-    let texts = h.painted_text_strings_in(pane_rect);
-    assert!(
-        texts.iter().any(|t| t.contains("sharpening")),
-        "a pane whose painter says it is standing in must say so in its own \
-         caption; painted texts were {texts:?}",
-    );
 }
 
 // --- The pan gesture ----------------------------------------------------
