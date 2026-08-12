@@ -465,16 +465,36 @@ impl super::App {
                 // a section or a volume pane unchanged and correctly: those move
                 // site with the layout exactly as a map pane does.
                 //
-                // What it deliberately does not touch is `content`, and therefore
-                // not a section's drawn line — which is stored *geographically*,
-                // so it goes on naming the same ground under the new radar.
-                // Invalidation is already automatic: `SectionTarget` carries the
-                // site, so the section on screen is stale by definition and
-                // re-cuts from the new site's volume. Whether a line the new site
-                // cannot see should be *cleared* rather than re-cut as empty
-                // coverage is a question about what the pane says while it has
-                // nothing to show, which belongs with the interaction that draws
-                // the line rather than here.
+                // A section's drawn **line** is deliberately kept — it is stored
+                // *geographically*, so it goes on naming the same ground under
+                // the new radar. Whether a line the new site cannot see should be
+                // cleared rather than re-cut as empty coverage is a question
+                // about what the pane says while it has nothing to show, which
+                // belongs with the interaction that draws the line rather than
+                // here.
+                //
+                // The section's **picture** is the opposite and is dropped with
+                // the `ScanInfo`, because it is a different radar's data rather
+                // than the same radar's older data. Invalidation is not automatic
+                // as it looks: `SectionTarget` does carry the site, but
+                // `section_target_for_pane` reads the volume time off
+                // `pane.scan_info` and returns `None` the moment there is no scan,
+                // so after the clear above no target is built and no comparison
+                // ever happens. What runs instead is `mark_section_unavailable`,
+                // whose whole design is to leave the picture up — correctly, for
+                // the case it was written for: "a section of the previous *volume*
+                // is stale rather than wrong, and is labelled with its own volume
+                // time". Across a site change that reasoning inverts. The caption
+                // goes on telling the truth about *when* the cut was taken while
+                // the pane's pills name a radar that did not take it, and the
+                // hover readout answers with the previous site's values — the plan
+                // view's staleness exactly, in the one pane kind that survives it,
+                // and it would stand until the new site's first volume.
+                //
+                // `AwaitingVolume` is what the pane is actually in — its own doc
+                // calls it "the ordinary startup and site-switch state" — and it
+                // is what the next frame would resolve anyway; setting it here
+                // means no frame is drawn claiming a cut is in flight.
                 //
                 // `scan_info` goes the other way and is dropped, because it is
                 // the one field that answers *for the site being left*. It
@@ -522,6 +542,19 @@ impl super::App {
                         if pane.site != site {
                             pane.scan_info = None;
                             pane.data_time = None;
+                            // The picture and the key that names what it was cut
+                            // for, not the line: see above. `texture` goes with
+                            // `section` because the two are a pair — the restore
+                            // path re-uploads one from the other, so a texture
+                            // left behind would be put back on the next surface
+                            // loss from a cut that no longer exists.
+                            if let Some(xsect) = pane.cross_section_mut() {
+                                xsect.section = None;
+                                xsect.texture = None;
+                                xsect.rendered_for = None;
+                                xsect.unavailable =
+                                    Some(rustdar_egui::pane::SectionUnavailable::AwaitingVolume);
+                            }
                         }
                         pane.loading_site = Some(site.clone());
                         pane.site = site.clone();

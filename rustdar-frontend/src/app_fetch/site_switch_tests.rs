@@ -67,6 +67,68 @@ fn tdwr_chunk_scan_info(products: &[(RadarProduct, &[f32])], minute: u32) -> Sca
     }
 }
 
+/// A section pane on `WSR88D` with a line, a cut on screen, and the key saying
+/// which radar's volume that cut came from.
+///
+/// The cut is all-`NoCoverage` because none of these tests read a pixel: what
+/// they are about is whether the three planes are *there*, and a full-size one
+/// is the only kind `CrossSection::from_parts` will build.
+fn section_pane_showing_the_wsr88ds_cut(app: &mut crate::app::App) {
+    use rustdar_radar::sampler::SampleStatus;
+    use rustdar_radar::xsect::{CrossSection, SECTION_HEIGHT, SECTION_WIDTH, SectionAxes};
+
+    let line = rustdar_egui::pane::SectionLine::new(
+        rustdar_egui::pane::GeoPoint {
+            lat: 40.4,
+            lon: -80.2,
+        },
+        rustdar_egui::pane::GeoPoint {
+            lat: 40.6,
+            lon: -79.9,
+        },
+    )
+    .expect("a fixture line must be finite and have two distinct ends");
+    let pixels = SECTION_WIDTH * SECTION_HEIGHT;
+    let cut = CrossSection::from_parts(
+        vec![0u8; pixels * 4],
+        vec![f32::NAN; pixels],
+        vec![SampleStatus::NoCoverage.wire_code(); pixels],
+        SectionAxes {
+            length_km: 100.0,
+            base_km_msl: 0.4,
+            top_km_msl: 20.4,
+            near_ground_range_km: 10.0,
+            far_ground_range_km: 110.0,
+            coverage_ground_range_km: 0.0,
+            cone_of_silence_km: 0.0,
+            tilt_count: 1,
+            widest_tilt_gap_deg: 0.0,
+            top_tilt_deg: 0.5,
+            top_declared_cut_deg: 19.5,
+        },
+        vec![0.5],
+        vec![0],
+    )
+    .expect("a full-size, all-NoCoverage section is well formed");
+
+    let pane = app.gui.pane_mut(0).expect("a fresh Gui has one pane");
+    pane.site = WSR88D.to_string();
+    pane.set_kind(rustdar_egui::pane::PaneKind::CrossSection);
+    let product = pane.selected_product;
+    let xsect = pane.cross_section_mut().expect("just converted");
+    xsect.line = Some(line);
+    xsect.section = Some(std::sync::Arc::new(cut));
+    xsect.rendered_for = Some(rustdar_egui::pane::SectionTarget {
+        volume: rustdar_egui::pane::VolumeStamp {
+            site: WSR88D.to_string(),
+            collected: at(0),
+        },
+        product,
+        line,
+        ladder: 0,
+    });
+}
+
 fn pane_on(app: &mut crate::app::App, site: &str, info: Option<ScanInfo>) {
     let pane = app.gui.pane_mut(0).expect("a fresh Gui has one pane");
     pane.site = site.to_string();
@@ -184,6 +246,69 @@ fn switching_sites_stops_dating_the_previous_sites_volume() {
         app.gui.pane(0).unwrap().data_time,
         None,
         "the pane is captioned with the age of a volume it no longer draws",
+    );
+}
+
+/// A section pane stops showing the radar it just left, and keeps its line.
+///
+/// The one pane kind the plan view's own clear does not reach. Dropping
+/// `scan_info` makes `section_target_for_pane` return `None` — it reads the
+/// volume time off the scan — so no `SectionTarget` is built and the site term
+/// it carries is never compared against anything. What runs instead is
+/// `mark_section_unavailable`, which by design leaves the picture up: right for
+/// the previous *volume*, which is the same radar's older data and is captioned
+/// with its own time, and wrong for the previous *site*, which is another radar
+/// entirely. Left alone the pane holds `KPBZ`'s cut, and answers a hover with
+/// `KPBZ`'s values, under pills that say `TPIT`, until the new site's first
+/// volume lands.
+///
+/// The line stays: it is two geographic points, so it names the same ground
+/// under the new radar, and re-cutting it there is the whole point of keeping
+/// it.
+#[test]
+fn switching_sites_stops_showing_the_previous_radars_cut() {
+    let mut app = headless(TestBridge::desktop());
+    section_pane_showing_the_wsr88ds_cut(&mut app);
+    app.gui.pane_mut(0).unwrap().scan_info = Some(wsr88d_scan_info());
+    let drawn_line = app.gui.pane(0).unwrap().cross_section().unwrap().line;
+    assert!(
+        drawn_line.is_some(),
+        "precondition: the fixture must have aimed the section",
+    );
+
+    switch_to(&mut app, TDWR);
+
+    let xsect = app
+        .gui
+        .pane(0)
+        .unwrap()
+        .cross_section()
+        .expect("the switch must not have changed the pane's kind");
+    assert!(
+        xsect.section.is_none(),
+        "the pane is still showing {WSR88D}'s cut with {TDWR} on its pills, and \
+         a hover still reads {WSR88D}'s values out of it",
+    );
+    assert!(
+        xsect.texture.is_none(),
+        "the raster of a cut that no longer exists is still uploaded, and \
+         `restore_section_textures` would put it back on the next surface loss",
+    );
+    assert_eq!(
+        xsect.rendered_for, None,
+        "the pane still names the volume it was cut for, so the first target \
+         built on the new site is compared against another radar's key",
+    );
+    assert_eq!(
+        xsect.unavailable,
+        Some(rustdar_egui::pane::SectionUnavailable::AwaitingVolume),
+        "a section with a line, no picture and no stated reason reads as a cut \
+         in flight, and nothing is in flight",
+    );
+    assert_eq!(
+        xsect.line, drawn_line,
+        "the drawn line is two geographic points and names the same ground \
+         under the new radar; dropping it throws away the user's aim",
     );
 }
 
