@@ -1921,11 +1921,55 @@ const DA_ZISO_TOL: f64 = 1.5;
 /// `campaign-harness`.
 const DA_RAWMIN_BINS: usize = 16;
 
-/// Censor threshold in units of Vny. Empirical fold-wall transfer point:
-/// it sits between the largest adjacent jump the reference keeps as
-/// rotation and the smallest fold soup it censors — lower values censored
-/// real couplet cores. Measured provenance: branch `campaign-harness`.
-const CENSOR_VNY_FRAC: f64 = 1.24;
+/// Censor threshold in units of Vny: the jump between 4-neighbours above
+/// which the pair is a residual fold wall rather than shear, and both bins go.
+///
+/// # The reference's transfer point, at six sites
+///
+/// Step edges were patched into the 30–47 km band of a real volume's 0.5° cut
+/// and GR2Analyst hovered along the 21.0 nm arc, six sites, jumps sized in
+/// units of **each cut's own declared Nyquist**: a coarse ladder at 0.70,
+/// 1.00, 1.24, 1.50, 1.70 and 1.90·Vny, then a fine one stepping the painted
+/// amplitude by the 0.5 m/s the archive quantizes velocity in, which lands six
+/// rungs between 1.675 and 2.176·Vny depending on how low the site's limit is.
+///
+/// Every rung at or under 1.795·Vny paints at full honest value — peak linear
+/// in the jump, 0.047 per m/s of it at 21.0 nm, the same slope at all six
+/// sites — and no rung from 1.801·Vny up paints anything:
+///
+/// ```text
+/// site   Vny     last kept        first censored
+/// KHNX  11.66   1.715  (0.93)     1.801
+/// KLWX  11.34   1.764  (0.93)     1.852
+/// KLOT  23.96   1.795  (2.04)     1.836
+/// KATX  25.32   1.777  (2.11)     1.817
+/// KMSX  25.91   1.775  (2.15)     1.814
+/// KTLX  11.49   1.741  (0.93)     1.828   (holdout)
+/// ```
+///
+/// Twenty of the 23 rungs above the transfer read ND outright. The other three
+/// read ±0.06 to ±0.10 — which is |jump − 2·Vny| of shear at that same 0.047
+/// per m/s, the reference resolving the wall rather than painting it, and
+/// under the palette's first colour either way. Nothing above the transfer
+/// survives to be seen.
+///
+/// Two things are pinned by that table. The transfer is at the same *multiple*
+/// at every site while the absolute jump under it runs from 20.0 m/s (KLWX) to
+/// 46.0 m/s (KMSX), so the censor scales with the cut's limit and is not a
+/// speed. And it is a plain threshold, not a test of nearness to the 2·Vny a
+/// fold displaces by: the rungs **above** 2·Vny, which only the low-limit
+/// sites can express (2.00, 2.03, 2.06, 2.09, 2.12, 2.14, 2.18), are censored
+/// too.
+///
+/// # What 1.24 was
+///
+/// It was this multiple at one site: 1.24 × 23.96 = 29.7 m/s, the KLOT wall
+/// ladder it was fitted on. Carried to a cut that declares 11.5 m/s it becomes
+/// a 14.3 m/s censor, and a ±8 m/s step — 16 m/s, ordinary strong shear, which
+/// the reference paints at +0.38 — was erased outright at KHNX and KTLX. It
+/// was too low at KLOT as well: the reference paints 1.24, 1.50 and 1.70·Vny
+/// there and we erased all three.
+const CENSOR_VNY_FRAC: f64 = 1.80;
 
 /// The censoring posture [`dealias`] takes once the unfolding passes are done.
 ///
@@ -3128,7 +3172,7 @@ mod tests {
     /// What the two ends read *across* each other is the point. Rows 0 and 71
     /// stand 40 m/s apart because they are 35.5° apart in the sky, and the
     /// post-pass censor blanks any bin more than [`CENSOR_VNY_FRAC`]·Vny —
-    /// 24.8 m/s here — from a 4-neighbour. Counted as neighbours, the two rows
+    /// 36 m/s here — from a 4-neighbour. Counted as neighbours, the two rows
     /// are a fold wall the passes could not place, and both go ND over all 40
     /// of their gates: 80 of the sector's 2880 bins erased out of a field with
     /// no fold in it.
@@ -3163,12 +3207,16 @@ mod tests {
     ///
     /// [`estimate_nyquist`] reads the fastest gate, so it answers **11**, and
     /// the post-pass censor then blanks any bin more than
-    /// [`CENSOR_VNY_FRAC`]·Vny — 13.6 m/s — from a 4-neighbour. The two rows
+    /// [`CENSOR_VNY_FRAC`]·Vny — 19.8 m/s — from a 4-neighbour. The two rows
     /// facing each other across the line stand 22 m/s apart, which under that
     /// limit is a fold wall no pass could have placed, so the censor erases
     /// them: 160 bins of the strongest convergence in the sweep, in a field
     /// with no fold anywhere in it. Told the 23.84 m/s the cut was flown at,
-    /// the same wall sits inside a 29.6 m/s censor and stands.
+    /// the same wall sits inside a 42.9 m/s censor and stands.
+    ///
+    /// The two arms are 2.00·Vny and 0.92·Vny of jump, which is the same
+    /// separation [`CENSOR_VNY_FRAC`]'s six-site ladder measures the reference
+    /// making — an exact fold displacement goes, ordinary shear stays.
     ///
     /// The `None` arm is not scaffolding — it is what every reader of this
     /// module did before the declaration crossed the model boundary, and it is
@@ -3213,6 +3261,58 @@ mod tests {
             estimated.iter().flatten().filter(|v| v.is_nan()).count(),
             4 * gates,
             "only the four rows either side of the two lines are erased",
+        );
+    }
+
+    /// Both halves of the censor's job, on the two jumps the reference draws
+    /// its line between.
+    ///
+    /// The limit is KHNX's 0.5° Doppler declaration, 11.66 m/s — one of the
+    /// low-Nyquist cuts where the old 1.24 threshold erased ordinary shear.
+    /// A ±0.85·Vny step is a 1.70·Vny jump, which the reference paints at
+    /// +0.93 on the hovered ladder [`CENSOR_VNY_FRAC`] carries; a ±1.00·Vny
+    /// step is a 2.00·Vny jump, exactly what one fold displaces a region by,
+    /// and the reference paints nothing there. Nothing else differs between
+    /// the two runs, so the pair is the censor's whole job in one fixture:
+    /// keep the first field intact, erase the two rows either side of each of
+    /// the second's two walls.
+    #[test]
+    fn the_censor_keeps_the_shear_the_reference_paints_and_drops_a_fold_displacement() {
+        /// KHNX 2024-12-16 08:01:56, elevation 2, the cut the ladder was
+        /// painted into.
+        const VNY: f64 = 11.66;
+        let n = 72;
+        let gates = 40;
+        let azimuths = ring_azimuths(n);
+        let run = |amp: f64| {
+            let orig: Vec<Vec<f64>> = (0..n)
+                .map(|i| vec![if i < n / 2 { amp } else { -amp }; gates])
+                .collect();
+            let mut grid = orig.clone();
+            let vg = grid.clone();
+            let mut sweep = sweep_for(&vg, &azimuths, gates);
+            sweep.declared_nyquist_ms = Some(VNY);
+            dealias(&mut grid, &sweep, 0.5, None, DealiasProfile::NoFalseShear);
+            (orig, grid)
+        };
+
+        let (orig, kept) = run(0.85 * VNY);
+        assert_eq!(
+            kept, orig,
+            "a 1.70·Vny jump is shear, and the reference paints it",
+        );
+
+        let (_, walled) = run(VNY);
+        for row in [0usize, n / 2 - 1, n / 2, n - 1] {
+            assert!(
+                walled[row].iter().all(|v| v.is_nan()),
+                "row {row} faces a 2.00·Vny wall and must not survive it",
+            );
+        }
+        assert_eq!(
+            walled.iter().flatten().filter(|v| v.is_nan()).count(),
+            4 * gates,
+            "only the four rows either side of the two walls are erased",
         );
     }
 
