@@ -193,14 +193,16 @@ impl super::Gui {
         map_rect: egui::Rect,
         actions: &mut Vec<GuiAction>,
     ) {
-        // A Layer selection describes a map layer, and a pane with no map has
-        // none — the stack shows it no rows to have selected one from. Snap
+        // A Layer selection describes a map layer, and a pane that draws none
+        // has none — the stack shows it no rows to have selected one from. Snap
         // to the pane's own properties, which is what the inspector can still
-        // truthfully say about it. Before the take, off the live pane — and
-        // at every width: the sheet pass below the breakpoint relies on this
-        // having run.
+        // truthfully say about it. A 3D pane is *not* snapped: it draws the
+        // layers and has the rows (`PaneState::draws_map_layers`), so a layer
+        // selected on it describes something on screen. Before the take, off
+        // the live pane — and at every width: the sheet pass below the
+        // breakpoint relies on this having run.
         if matches!(self.inspector_sel, InspectorSelection::Layer(_))
-            && !self.panes[self.active_pane].is_map()
+            && !self.panes[self.active_pane].draws_map_layers()
         {
             self.inspector_sel = InspectorSelection::PaneProps;
         }
@@ -317,7 +319,8 @@ impl super::Gui {
     }
 
     /// The stack rows' status lines, one per layer in the pane's own order —
-    /// empty for a pane with no map, which has no rows to carry them.
+    /// empty for a pane that draws no map layers, which has no rows to carry
+    /// them.
     ///
     /// Radar's is the exception with a reason: the product and tilt are pane
     /// state — the radar handler holds only the layer toggle — so the line
@@ -328,7 +331,7 @@ impl super::Gui {
         &self,
         pane: &PaneState,
     ) -> Vec<(OverlayKind, Option<String>)> {
-        if !pane.is_map() {
+        if !pane.draws_map_layers() {
             return Vec::new();
         }
         pane.draw_order
@@ -354,6 +357,11 @@ impl super::Gui {
 /// arrives. `None` while the layer is hidden: the dimmed row carries no line,
 /// like every other layer's. `code()` is the fetch path's lowercase spelling,
 /// uppercased here because the row is a display, not a URL.
+///
+/// A pane that reads the whole volume states the product alone. Its
+/// `selected_elevation` is still on the pane, inert, and quoting it here would
+/// have the row name a cut the pane is not showing — the same reason
+/// `Gui::render_radar_controls` draws that pane no tilt picker.
 pub(super) fn radar_row_status(pane: &PaneState) -> Option<String> {
     if !pane.is_overlay_enabled(OverlayKind::Radar) {
         return None;
@@ -361,10 +369,11 @@ pub(super) fn radar_row_status(pane: &PaneState) -> Option<String> {
     let (product, tilt) = pane
         .get_rendering_params()
         .unwrap_or((pane.selected_product, pane.selected_elevation));
-    Some(format!(
-        "{} - {tilt:.1}\u{b0}",
-        product.code().to_uppercase()
-    ))
+    let code = product.code().to_uppercase();
+    if pane.render_view().reads_whole_volume() {
+        return Some(code);
+    }
+    Some(format!("{code} - {tilt:.1}\u{b0}"))
 }
 
 #[cfg(test)]

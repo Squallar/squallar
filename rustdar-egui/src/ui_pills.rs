@@ -130,6 +130,11 @@ pub(super) const SYNC_RELINK_ALL: &str = "Re-link all here";
 
 /// The sync section's five row labels in draw order — the parity walk's
 /// inventory for the one section [`sync_section_ui`] renders at both routes.
+///
+/// A **plan-view** pane's inventory, which is what the walk drives: a pane
+/// that does not share a viewport ([`crate::pane::PaneState::shares_viewport`])
+/// draws no [`SYNC_VIEWPORT_OPTION`] row and carries [`NO_VIEWPORT_LINK_NOTE`]
+/// in its place.
 #[cfg(test)]
 pub(crate) const SYNC_SECTION_LABELS: [&str; 5] = [
     SYNC_VIEWPORT_OPTION,
@@ -155,6 +160,14 @@ pub(crate) const UNLINK_NOTE: &str = "Off leaves this pane out of shared time \
 /// alone, and the group moves without it.
 const VIEWPORT_LINK_NOTE: &str = "Off lets this pane pan and zoom alone; \
     the other linked panes keep moving together.";
+
+/// What stands in the viewport toggle's place on a pane that does not share a
+/// viewport ([`crate::pane::PaneState::shares_viewport`]) — the omission
+/// explained where the row would have been, and the promise that the setting
+/// was kept rather than cleared.
+pub(crate) const NO_VIEWPORT_LINK_NOTE: &str = "Viewport sync is for map \
+    panes. This pane aims its own view; its setting is kept for when it \
+    shows the map again.";
 
 /// The layers toggle's hover — what "layers" covers here, so off is not
 /// mistaken for the eye toggles alone.
@@ -480,9 +493,14 @@ pub(super) fn kind_list_ui(ui: &mut egui::Ui, current: RenderView) -> PickOutcom
 /// What one pass of [`sync_section_ui`] produced: which action row was
 /// clicked, whether the layer link was just turned **on** (the popover
 /// converges immediately on that instead of waiting for the next panel
-/// pass), and — for the probes — the five rows as drawn, checkbox rows with
+/// pass), and — for the probes — the rows as drawn, checkbox rows with
 /// the state they were handed (the `DrawnMenuLeaf` discipline) and action
 /// rows with `false`.
+///
+/// "As drawn" is load-bearing rather than incidental here: the viewport row is
+/// conditional ([`SYNC_VIEWPORT_OPTION`]), so its absence from `rows` is how a
+/// test sees a pane that was never offered the link, as against one that was
+/// offered it and has it off.
 #[derive(Default)]
 pub(crate) struct SyncSectionOutcome {
     pub layer_relinked: bool,
@@ -514,15 +532,26 @@ pub(super) fn sync_section_ui(
                 rect: egui::Rect,
                 was: bool| rows.push((label.to_owned(), rect, was));
 
-    #[cfg(test)]
-    let was = pane.viewport_link;
-    let row = ui
-        .checkbox(&mut pane.viewport_link, SYNC_VIEWPORT_OPTION)
-        .on_hover_text(VIEWPORT_LINK_NOTE);
-    #[cfg(test)]
-    push(&mut outcome.rows, SYNC_VIEWPORT_OPTION, row.rect, was);
-    #[cfg(not(test))]
-    let _ = row;
+    // The viewport row exists only for a pane whose viewport the link can
+    // actually move — see `PaneState::shares_viewport` for which panes those
+    // are and why a 3D pane is not one. Omitted rather than drawn disabled,
+    // the way the tilt picker is omitted on a pane that reads every cut
+    // (`Gui::render_radar_controls`), and with a line in its place saying why
+    // and what became of the setting: it is kept, so the pane rejoins the
+    // group it was in the moment it shows the map again.
+    if pane.shares_viewport() {
+        #[cfg(test)]
+        let was = pane.viewport_link;
+        let row = ui
+            .checkbox(&mut pane.viewport_link, SYNC_VIEWPORT_OPTION)
+            .on_hover_text(VIEWPORT_LINK_NOTE);
+        #[cfg(test)]
+        push(&mut outcome.rows, SYNC_VIEWPORT_OPTION, row.rect, was);
+        #[cfg(not(test))]
+        let _ = row;
+    } else {
+        ui.label(egui::RichText::new(NO_VIEWPORT_LINK_NOTE).small().weak());
+    }
 
     #[cfg(test)]
     let was = pane.layer_link;
@@ -567,12 +596,25 @@ pub(super) fn sync_section_ui(
     outcome
 }
 
-/// The Sync pill's hover: plain "Sync options" while every link is on, and
-/// the unlinked dimensions named while any is off — the pill's `⊗` says
-/// *something* is out; this says what.
-fn sync_pill_hover(viewport_link: bool, layer_link: bool, time_link: bool) -> String {
+/// The Sync pill's hover: plain "Sync options" while every link this pane
+/// offers is on, and the unlinked dimensions named while any is off — the
+/// pill's `⊗` says *something* is out; this says what.
+///
+/// `shares_viewport` is the pane's own
+/// ([`crate::pane::PaneState::shares_viewport`]), and it gates the viewport
+/// dimension out of the sentence for the same reason
+/// [`sync_section_ui`] draws no row for it: a stored `viewport_link` that no
+/// popover offers must not mark the pane unlinked on the glass, or a 3D pane
+/// would wear a `⊗` for a group it is not in and the hover would name a
+/// dimension its own popover does not.
+fn sync_pill_hover(
+    shares_viewport: bool,
+    viewport_link: bool,
+    layer_link: bool,
+    time_link: bool,
+) -> String {
     let mut off = Vec::new();
-    if !viewport_link {
+    if shares_viewport && !viewport_link {
         off.push("viewport");
     }
     if !layer_link {
@@ -680,7 +722,17 @@ impl super::Gui {
         actions: &mut Vec<GuiAction>,
     ) {
         // Everything the row states, read before any closure borrows self.
-        let (site, kind, product, links, line_absent, tilt, products, elevations) = {
+        let (
+            site,
+            kind,
+            product,
+            shares_viewport,
+            links,
+            line_absent,
+            tilt,
+            products,
+            elevations,
+        ) = {
             let pane = &self.panes[idx];
             let (_, tilt) = pane
                 .get_rendering_params()
@@ -689,6 +741,7 @@ impl super::Gui {
                 pane.site.clone(),
                 pane.render_view(),
                 pane.selected_product,
+                pane.shares_viewport(),
                 (pane.viewport_link, pane.layer_link, pane.time_link),
                 pane.cross_section().and_then(|s| s.line).is_none(),
                 tilt,
@@ -836,13 +889,17 @@ impl super::Gui {
                         // test: the old ⛓ read as a DNA helix). The hover
                         // names which dimensions are out.
                         let (viewport_link, layer_link, time_link) = links;
-                        let all_linked = viewport_link && layer_link && time_link;
+                        // Only the links this pane's own popover offers count
+                        // towards the ⊗ — see `sync_pill_hover`.
+                        let all_linked =
+                            (!shares_viewport || viewport_link) && layer_link && time_link;
                         let label = if all_linked {
                             SYNC_PILL_LINKED
                         } else {
                             SYNC_PILL_UNLINKED
                         };
                         let pill = ui.button(label).on_hover_text(sync_pill_hover(
+                            shares_viewport,
                             viewport_link,
                             layer_link,
                             time_link,

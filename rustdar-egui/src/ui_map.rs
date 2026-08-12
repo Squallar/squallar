@@ -1553,9 +1553,14 @@ impl super::Gui {
     /// Each piece is gated on the same `is_overlay_enabled` its arm in
     /// `render_pane_map_content` is gated on. A pane keeps its layer state
     /// across a conversion, so a user who switched the Color Scale off on a
-    /// map pane and then made it 3D would otherwise find the legend back —
-    /// switched on by the conversion, and unreachable, because a 3D pane's
-    /// Layers panel says the map layers belong to map panes.
+    /// map pane and then made it 3D would otherwise find the legend back,
+    /// switched on by the conversion.
+    ///
+    /// This gate is also why a 3D pane's Layers panel lists the colour scale
+    /// alongside the ground kinds rather than the floor's kinds alone: the
+    /// legend here is drawn *and* honoured, so a panel that offered no row for
+    /// it would leave the toggle reachable only by converting the pane back —
+    /// the state this pane was in until `PaneState::draws_map_layers`.
     fn draw_volume_glass(
         &self,
         ui: &egui::Ui,
@@ -2306,8 +2311,8 @@ pub(crate) fn render_volume_controls(
                  reflectivity as the 2D map shows it, the range ring, mesoscale discussion, \
                  warning and watch polygons, and city labels, registered to the box. \
                  Warnings and discussions refresh on the floor as they issue and expire. \
-                 Always the full composition - the map panes' layer toggles do not apply to \
-                 it, the same way they do not apply to this pane's volume. It is drawn by \
+                 Which of them go down there is this pane's own layer set, in the Layers \
+                 panel - the volume above the floor is not one of them. It is drawn by \
                  the volume's own render, so it appears when the volume does and not before.",
             )
             .changed()

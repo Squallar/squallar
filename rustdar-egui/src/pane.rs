@@ -1351,6 +1351,69 @@ impl PaneState {
         }
     }
 
+    /// Whether this pane takes part in the shared viewport — the group
+    /// [`Gui::sync_viewports`](crate::Gui) moves together, at **both** ends,
+    /// and the question the sync section asks before it offers a "Sync
+    /// viewport" row at all.
+    ///
+    /// Only the plan view does. A cross-section has no map viewport to share.
+    /// A 3D pane is left out **by decision**, not for want of a viewport: since
+    /// the box became the largest square inscribed in the pane's own reach,
+    /// scroll and pinch aim it, so there is something a link could drive. The
+    /// exclusion predates that and used to be true by accident; it is kept
+    /// because driving it is wrong at each end. As a *target* the pane would
+    /// resample its whole box every time a neighbour's wheel turned, and a plan
+    /// view zoomed to street level would drive the box straight through the
+    /// floor. As a *source* an orbit's zoom would drag every map pane in the
+    /// group along with it.
+    ///
+    /// [`Self::draws_ground`] is the wrong predicate here even though it reads
+    /// like the friendlier "has a map": it answers `true` for a 3D pane with a
+    /// visible floor, which is exactly the pane this excludes. The question is
+    /// not whether the pane paints geography — it does — but whether its
+    /// viewport is the flat pan-and-zoom the link moves. That is
+    /// [`Self::is_map`].
+    ///
+    /// [`Self::viewport_link`] itself is untouched by a conversion: kept, and
+    /// inert while this answers `false`, so going back to the plan view
+    /// restores the link the pane had. The same rule `selected_elevation`
+    /// follows across a conversion.
+    ///
+    /// Carries [`Self::kind`]'s `mem::take` warning: a taken pane's slot reads
+    /// as a plan view.
+    pub fn shares_viewport(&self) -> bool {
+        self.is_map()
+    }
+
+    /// Whether this pane draws the map layers at all — the Layers panel's gate,
+    /// and so the question "would a row here toggle anything?".
+    ///
+    /// A plan view draws every [`OverlayKind`] onto its own rect. **A 3D pane
+    /// draws them too**, onto two surfaces instead of one: the ground kinds go
+    /// into the off-screen floor strip the raymarcher mirrors onto the box's
+    /// bottom face (`Gui::draw_floor_strip`), and the one glass kind — the
+    /// colour scale — is painted on the pane's own rect by
+    /// `Gui::draw_volume_glass`. `PaneSurface` is where that split is written
+    /// down, and both halves are gated on this pane's own
+    /// [`Self::is_overlay_enabled`]. That is the whole reason a 3D pane gets
+    /// rows: every layer it draws is one the user has to be able to switch off,
+    /// and while the panel showed it none, a layer set from before the
+    /// conversion was honoured and unreachable at the same time.
+    ///
+    /// A cross-section draws none of them — there is no projector anywhere in
+    /// its frame — and is the one kind with nothing to list.
+    ///
+    /// Not [`Self::draws_ground`], which answers `false` the moment the floor
+    /// is switched off. The rows must not go with the floor: the colour scale
+    /// is still on the glass, and the ground set has to stay editable so the
+    /// floor comes back the way it was left.
+    ///
+    /// Carries [`Self::kind`]'s `mem::take` warning: a taken pane's slot reads
+    /// as a plan view.
+    pub fn draws_map_layers(&self) -> bool {
+        self.render_view() != rustdar_radar::types::RenderView::CrossSection
+    }
+
     /// This pane's render mode, if it is a map pane at all.
     pub fn map_render(&self) -> Option<MapRender> {
         self.map().map(|map| map.render)

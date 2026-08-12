@@ -1315,16 +1315,25 @@ impl ControlProbe {
     }
 }
 
-/// The line a 3D or section pane's sidebar shows where a map pane's layer
+/// The line a **cross-section** pane's sidebar shows where a map pane's layer
 /// list would be.
 ///
 /// The panel is titled "Layers", so for a pane whose kind has none the honest
 /// presentations are a tree of disabled ghosts or an explained absence. The
-/// convention here — for both non-map kinds alike — is the absence: every
-/// entry in the tree is a layer drawn over map tiles, and a dozen disabled
-/// rows would bury the controls that do apply under ones that never can. One
-/// line keeps the void from reading as a broken panel.
-pub(crate) const NON_MAP_LAYERS_NOTE: &str = "Map layers apply to map panes.";
+/// convention here is the absence: every entry in the tree is a layer drawn
+/// through a projector, a section pane has none anywhere in its frame, and a
+/// dozen disabled rows would bury the controls that do apply under ones that
+/// never can. One line keeps the void from reading as a broken panel.
+///
+/// A 3D pane no longer sees this. It draws the map layers — its ground kinds
+/// onto its floor and its colour scale onto its glass, each gated on its own
+/// `is_overlay_enabled` — so it gets the rows
+/// ([`PaneState::draws_map_layers`]). The wording says "cross-section" rather
+/// than "map panes" because the old sentence became false the day the 3D view
+/// grew a floor: it claimed the layers did not apply, while the floor was
+/// quietly honouring a set the panel gave no way to reach.
+pub(crate) const NON_MAP_LAYERS_NOTE: &str =
+    "A cross-section has no map to draw layers on.";
 
 /// The header over the section pane's sidebar block. Icon, two spaces, name —
 /// the same shape as the loop transport's and the overlay rows' labels. The
@@ -4559,7 +4568,13 @@ impl Gui {
     /// * an unlinked pane is never a **target** — the group's convergence
     ///   writes the linked panes and no one else.
     ///
-    /// # Why panes with no map are excluded from both ends
+    /// # Why panes that do not share a viewport are excluded from both ends
+    ///
+    /// The membership test is [`PaneState::shares_viewport`], which is where
+    /// the decision and its reasons are written down — including why a 3D pane
+    /// is out of the group even though it has a viewport of its own, and why
+    /// `draws_ground` is the wrong question to ask here. What follows is the
+    /// older half of it, about panes with no viewport at all.
     ///
     /// This is the all-panes site a non-map pane breaks the moment one can
     /// exist, and it breaks it in the direction that looks like a bug in the
@@ -4584,7 +4599,7 @@ impl Gui {
         }
         let mut source_idx = None;
         for idx in 0..pane_count {
-            if !self.panes[idx].is_map() {
+            if !self.panes[idx].shares_viewport() {
                 continue;
             }
             if idx < pre_zooms.len() {
@@ -4627,14 +4642,14 @@ impl Gui {
         // failure as the source scan above with no interaction needed at all.
         let Some(src) = source_idx.or_else(|| {
             let active = &self.panes[self.active_pane];
-            (active.is_map() && active.viewport_link).then_some(self.active_pane)
+            (active.shares_viewport() && active.viewport_link).then_some(self.active_pane)
         }) else {
             return;
         };
         let zoom = self.panes[src].map_memory.zoom();
         let pos = self.panes[src].map_memory.detached();
         for idx in 0..pane_count {
-            if idx != src && self.panes[idx].is_map() && self.panes[idx].viewport_link {
+            if idx != src && self.panes[idx].shares_viewport() && self.panes[idx].viewport_link {
                 let _ = self.panes[idx].map_memory.set_zoom(zoom);
                 if let Some(p) = pos {
                     self.panes[idx].map_memory.center_at(p);
@@ -4651,16 +4666,21 @@ impl Gui {
     /// and writes the source's own fields through `pane`.
     ///
     /// **Match all panes to this view**: copy `pane`'s zoom — and its centre,
-    /// when it has panned off its site — to every visible *map* pane, links
-    /// untouched. The one-shot alignment: a following source hands out its
-    /// zoom and leaves each target's centre alone, exactly as
-    /// [`Self::sync_viewports`] would.
+    /// when it has panned off its site — to every visible pane that shares a
+    /// viewport ([`PaneState::shares_viewport`]), links untouched. The one-shot
+    /// alignment: a following source hands out its zoom and leaves each
+    /// target's centre alone, exactly as [`Self::sync_viewports`] would, and it
+    /// skips the same panes for the same written-down reasons.
     ///
     /// **Re-link all here**: that copy, plus all three links turned on for
     /// `pane` and every visible pane — and this pane made active, so the
     /// standard convergence that follows (`propagate_layer_sync`, the
     /// viewport hold) reads *this* pane as the group's reference. "Here" is a
-    /// place: everything comes home to it.
+    /// place: everything comes home to it. `viewport_link` is written on a 3D
+    /// pane too, where it is inert until the pane shows the map again: the
+    /// field is the pane's stored intent, and leaving it off would mean
+    /// "re-link all" quietly excepted a pane that is going to rejoin the group
+    /// the moment it is switched back.
     pub(super) fn apply_sync_outcome(
         &mut self,
         outcome: &pills::SyncSectionOutcome,
@@ -4672,7 +4692,7 @@ impl Gui {
             let zoom = pane.map_memory.zoom();
             let pos = pane.map_memory.detached();
             for target in 0..count {
-                if target == idx || !self.panes[target].is_map() {
+                if target == idx || !self.panes[target].shares_viewport() {
                     continue;
                 }
                 let _ = self.panes[target].map_memory.set_zoom(zoom);

@@ -71,9 +71,9 @@ const COLLAPSE_LABEL: &str = "\u{2039}";
 /// panel, and "add" is wanted at whichever end the scroll left the user.
 const ADD_LAYER_LABEL: &str = "+ Add layer";
 
-/// The non-map body's route to where the pane's real controls live (plan
-/// §1.4): a pane with no map has no layer rows, and a panel that were only
-/// the explanatory caption read as broken — this button is the body's one
+/// The layer-less body's route to where the pane's real controls live (plan
+/// §1.4): a pane that draws no map layers has no rows, and a panel that were
+/// only the explanatory caption read as broken — this button is the body's one
 /// action, and it opens the inspector on Pane properties.
 const PANE_PROPS_BUTTON_LABEL: &str = "Pane properties...";
 
@@ -143,16 +143,16 @@ pub(crate) struct StackProbe {
     /// Whether the stack was on screen this frame.
     pub open: bool,
     /// The `+ Add layer` button above the rows — [`egui::Rect::NOTHING`] for
-    /// a pane with no map, which has no rows to add to.
+    /// a pane that draws no map layers, which has no rows to add to.
     pub add_top: egui::Rect,
     /// The `+ Add layer` button below the rows, on the same terms.
     pub add_bottom: egui::Rect,
     /// The rows, top row first — draw order reversed.
     pub rows: Vec<StackRowProbe>,
-    /// The non-map body's caption — [`egui::Rect::NOTHING`] on a map pane,
-    /// whose body is the rows above.
+    /// The layer-less body's caption — [`egui::Rect::NOTHING`] on a pane that
+    /// draws the layers, whose body is the rows above.
     pub non_map_note: egui::Rect,
-    /// The non-map body's `Pane properties...` button, on the same terms.
+    /// The layer-less body's `Pane properties...` button, on the same terms.
     pub props_button: egui::Rect,
 }
 
@@ -342,9 +342,10 @@ impl super::Gui {
         let _ = area;
     }
 
-    /// The scroll body: one row per layer for a map pane, the explained
-    /// absence for a pane with no map. `sheet` is the phone-sheet host,
-    /// which alone appends the helper caption under the rows (plan §1.3).
+    /// The scroll body: one row per layer for a pane that draws the map layers
+    /// ([`PaneState::draws_map_layers`] — the plan view and the 3D pane), the
+    /// explained absence for one that does not. `sheet` is the phone-sheet
+    /// host, which alone appends the helper caption under the rows (plan §1.3).
     #[allow(clippy::too_many_arguments)]
     fn render_stack_rows(
         &mut self,
@@ -356,16 +357,18 @@ impl super::Gui {
         actions: &mut Vec<GuiAction>,
         #[cfg(test)] probe: &mut StackProbe,
     ) {
-        // Every row is a layer drawn over map tiles, so a pane with no map
-        // has no rows — the same omission-plus-one-line convention the old
-        // panel used, for the same reason: a dozen disabled rows would bury
-        // the fact that nothing here can apply. No Add-layer buttons either:
-        // the catalog adds map layers, and this pane has no map to add to.
-        // What the body has instead (the M8 fix — a bare one-liner read as a
-        // broken panel): the explained absence as a padded caption, and the
-        // one action that *does* apply — the pane's own properties, where a
-        // 3D or section pane's real controls live.
-        if !pane.is_map() {
+        // Every row is a layer this pane's own render draws and gates on its
+        // own `is_overlay_enabled`, so the body is the rows for every pane that
+        // draws them — a 3D pane included, whose ground kinds go onto its floor
+        // and whose colour scale goes onto its glass
+        // (`PaneState::draws_map_layers`). A cross-section draws none of them
+        // and is the one kind left with nothing to list: no rows, and no
+        // Add-layer buttons, because the catalog adds map layers and this pane
+        // has no map to add them to. What its body has instead (the M8 fix — a
+        // bare one-liner read as a broken panel): the explained absence as a
+        // padded caption, and the one action that *does* apply — the pane's own
+        // properties, where a section pane's real controls live.
+        if !pane.draws_map_layers() {
             ui.add_space(6.0);
             let note = ui.label(
                 egui::RichText::new(super::NON_MAP_LAYERS_NOTE)

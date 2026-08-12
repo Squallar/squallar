@@ -6976,16 +6976,20 @@ fn converting_the_active_pane_from_the_dropdown_makes_it_a_volume_pane() {
 ///       the whole loop at once. `PaneKind::can_loop` is where that split
 ///       lives, and it is pinned here by clicking the toggle and requiring
 ///       the loop action out of one kind and not the other — the failure a
-///       user would actually hit. The overlay tree is still the panel's for
-///       both: every entry in it is a layer drawn over map tiles against a
-///       projector neither pane has.
+///       user would actually hit.
+///     * **The overlay tree for the 3D pane and not for the section.** Every
+///       entry in it is a layer drawn through a projector, and the two kinds
+///       differ on whether they have one: a 3D pane draws the ground kinds onto
+///       its floor and the colour scale onto its glass, each gated on its own
+///       `is_overlay_enabled`, while a cross-section has no projector anywhere
+///       in its frame. `PaneState::draws_map_layers` is where that split lives.
 ///
-///     The rows are also what makes this the test that notices the stack
-///     reading `self.panes[active]` instead of the pane it was handed. That
-///     slot holds a `mem::take` placeholder for the whole of the shell's
-///     pass and therefore reads as a *map* — so a body drawn from it would
-///     keep the rows for a converted pane, and the visible difference is
-///     the rows being drawn. The tilt picker would *not* reveal it: that
+///     The section's missing rows are also what makes this the test that
+///     notices the stack reading `self.panes[active]` instead of the pane it
+///     was handed. That slot holds a `mem::take` placeholder for the whole of
+///     the shell's pass and therefore reads as a *map* — so a body drawn from
+///     it would keep the rows for a converted pane, and the visible difference
+///     is the rows being drawn. The tilt picker would *not* reveal it: that
 ///     is decided inside `render_radar_controls` from the pane passed down.
 ///     (The timeline cannot have this bug: it runs outside every take
 ///     window, which is why it may read the slot directly.)
@@ -7083,12 +7087,22 @@ fn a_non_map_pane_keeps_the_controls_that_apply_to_it_and_drops_the_rest() {
              animated even though every frame of one is something the loop \
              machinery fills",
         );
-        assert!(
-            h.stack().rows.is_empty(),
-            "{kind:?}: layer rows were drawn for a pane with no map to draw \
-             overlays on: {:?}",
-            h.stack().rows
-        );
+        if kind == rustdar_radar::types::RenderView::CrossSection {
+            assert!(
+                h.stack().rows.is_empty(),
+                "{kind:?}: layer rows were drawn for a pane with no projector \
+                 anywhere in its frame: {:?}",
+                h.stack().rows
+            );
+        } else {
+            assert!(
+                h.stack_row(OverlayKind::NwsAlerts).is_some(),
+                "{kind:?}: the layer rows went with the plan view, leaving \
+                 this pane's floor honouring a layer set nothing on screen \
+                 can reach: {:?}",
+                h.stack().rows
+            );
+        }
     }
 }
 
@@ -7310,44 +7324,54 @@ fn every_pane_kinds_sidebar_opens_with_the_same_identity_line() {
     );
 }
 
-/// 50. **The missing layer list is explained, in one line, for both
-///     non-map kinds — and only for them.**
+/// 50. **The missing layer list is explained, in one line, for the one kind
+///     that is missing it — and for no other.**
 ///
-///     The panel is titled "Layers", and for a 3D or section pane the
-///     layer tree is omitted because every entry in it is a layer drawn
-///     over map tiles (test 44 pins the omission). Omitted *silently*, the
-///     void where most of the panel used to be is what made the sidebar
-///     read as broken. The convention pinned here is omission plus one
-///     explanatory line, the same line for both kinds — and its absence on
-///     a map pane, where the list itself is present and the note would be
-///     a false claim about it.
+///     The panel is titled "Layers", and for a cross-section pane the layer
+///     tree is omitted because every entry in it is a layer drawn through a
+///     projector and that pane has none anywhere in its frame (test 44 pins
+///     the omission). Omitted *silently*, the void where most of the panel
+///     used to be is what made the sidebar read as broken, so the convention
+///     is omission plus one explanatory line.
+///
+///     The other two kinds must not carry it, for the same reason and by two
+///     different routes: a map pane draws the list, so the note would be a
+///     false claim about a list that is right there — and **so does a 3D
+///     pane**, whose floor draws the ground kinds and whose glass draws the
+///     colour scale, each gated on the pane's own `is_overlay_enabled`. The
+///     note used to say "Map layers apply to map panes" and to appear on a 3D
+///     pane, which was two untruths at once: the layers did apply to it, and
+///     the panel's silence was the only reason its set could not be reached.
 #[test]
-fn the_missing_layer_list_is_explained_for_both_non_map_kinds() {
-    for kind in [
-        rustdar_radar::types::RenderView::CrossSection,
-        rustdar_radar::types::RenderView::Volume,
-    ] {
-        let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
-        h.load_scan("KTLX");
-        let sidebar = sidebar_rect(&h);
-        assert!(
-            !h.text_painted_in(sidebar, crate::ui::NON_MAP_LAYERS_NOTE),
-            "a map pane draws the layer list itself and must not also \
-                 carry the note explaining its absence"
-        );
+fn the_missing_layer_list_is_explained_for_the_kind_that_is_missing_it() {
+    let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
+    h.load_scan("KTLX");
+    let sidebar = sidebar_rect(&h);
+    assert!(
+        !h.text_painted_in(sidebar, crate::ui::NON_MAP_LAYERS_NOTE),
+        "a map pane draws the layer list itself and must not also \
+             carry the note explaining its absence"
+    );
 
-        match kind {
-            rustdar_radar::types::RenderView::CrossSection => h.make_pane_unaimed_cross_section(0),
-            _ => h.make_pane_volume(0),
-        }
-        h.frames_for(2, FRAME_DT);
-        assert!(
-            h.text_painted_in(sidebar, crate::ui::NON_MAP_LAYERS_NOTE),
-            "{kind:?}: the layer list is omitted with nothing to say why, \
-                 which is what made the panel read as broken; painted: {:?}",
-            h.painted_text_strings_in(sidebar)
-        );
-    }
+    h.make_pane_volume(0);
+    h.frames_for(2, FRAME_DT);
+    assert!(
+        !h.text_painted_in(sidebar, crate::ui::NON_MAP_LAYERS_NOTE),
+        "a 3D pane draws the layer list too — its floor and its glass both \
+             honour the set — so the note explaining an absence is a claim \
+             about nothing; painted: {:?}",
+        h.painted_text_strings_in(sidebar)
+    );
+
+    h.make_pane_map(0);
+    h.make_pane_unaimed_cross_section(0);
+    h.frames_for(2, FRAME_DT);
+    assert!(
+        h.text_painted_in(sidebar, crate::ui::NON_MAP_LAYERS_NOTE),
+        "the layer list is omitted with nothing to say why, which is what \
+             made the panel read as broken; painted: {:?}",
+        h.painted_text_strings_in(sidebar)
+    );
 }
 
 /// 51. **A converted pane's own controls sit inside the Pane-properties
@@ -12706,19 +12730,26 @@ fn the_top_bar_has_breathing_room_at_every_width() {
     }
 }
 
-/// M8-6. **A non-map pane's stack body is the explained absence plus the one
+/// M8-6. **A layer-less pane's stack body is the explained absence plus the one
 /// action that applies.** No layer rows and no Add-layer buttons (correct —
-/// there is no map to layer), but the body must offer the caption and a
-/// `Pane properties...` button that opens the inspector where the pane's
-/// real controls live — not read as a broken panel.
+/// a cross-section has no projector to draw one against), but the body must
+/// offer the caption and a `Pane properties...` button that opens the inspector
+/// where the pane's real controls live — not read as a broken panel.
+///
+/// A cross-section is the only kind this is about now. A 3D pane draws the
+/// layers and gets the rows (`PaneState::draws_map_layers`, test 50); driving
+/// this through one would be asserting the empty body on a pane that has one.
 #[test]
-fn a_non_map_stack_body_offers_the_caption_and_pane_properties() {
+fn a_layerless_stack_body_offers_the_caption_and_pane_properties() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
-    h.make_pane_volume(0);
+    h.make_pane_unaimed_cross_section(0);
     h.open_layers();
 
     let stack = h.stack();
-    assert!(stack.rows.is_empty(), "a 3D pane has no layer rows");
+    assert!(
+        stack.rows.is_empty(),
+        "a cross-section pane has no layer rows"
+    );
     assert_eq!(
         stack.add_top,
         egui::Rect::NOTHING,
