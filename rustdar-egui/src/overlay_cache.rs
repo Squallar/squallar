@@ -39,16 +39,83 @@ fn quantize_zoom(zoom: f64) -> i32 {
 /// Overdraw the renderer *asks* for, as a fraction of the viewport dimension,
 /// on each side of the viewport.
 ///
-/// This is a request, not a promise. A texture wide enough for `1.0` on both
-/// sides is three viewports across, and no adapter is obliged to allocate one:
-/// WebGL2 only guarantees `max_texture_dimension_2d == 2048`, which a viewport
-/// wider than 682 points already blows past. [`plan_overlay_texture`] cuts the
-/// fraction back to whatever the adapter can actually hold, and the reduced
-/// value — never this constant — is what the rest of the pipeline works from.
-pub const OVERDRAW_FRACTION: f32 = 1.0;
+/// This is a request, not a promise. A texture wide enough for `f` on both
+/// sides is `1 + 2f` viewports across, and no adapter is obliged to allocate
+/// one: WebGL2 only guarantees `max_texture_dimension_2d == 2048`, which a
+/// viewport wider than 1365 points already blows past. [`plan_overlay_texture`]
+/// cuts the fraction back to whatever the adapter can actually hold, and the
+/// reduced value — never this constant — is what the rest of the pipeline works
+/// from.
+///
+/// # Why a quarter and not one
+///
+/// It was `1.0`, which is *nine times the viewport's area*: a 1920×1080 pane
+/// planned a 5760×3240 texture, 18.7 Mpx and 74.6 MB, of which — measured at
+/// z=7 over a live 273-alert feed — 11% carried any alert at all. A quarter is
+/// 2.25× the area, 2880×1620, 18.7 MB.
+///
+/// The cost that buys back is *texture area*, and it is paid on every single
+/// render. **One arm, quoted once**, and the commit that moved this constant
+/// quotes the same three pairs: a Ryzen 9 7950X / RTX 3090 (Vulkan) at z=7 over
+/// the live 273-alert feed, release + LTO, best-of-7 with the two plans
+/// interleaved in one process, and that whole probe interleaved against a
+/// binary built at the previous commit.
+///
+/// | stage                    | 5760×3240 | 2880×1620 |
+/// |--------------------------|-----------|-----------|
+/// | raster (tiny-skia)       |   92.2 ms |   67.9 ms |
+/// | convert to `ColorImage`  |   22.6 ms |    5.7 ms |
+/// | `Queue::write_texture`   |   34.8 ms |    8.7 ms |
+///
+/// The last row is the one the user feels: `write_texture` copies the whole
+/// buffer into a staging allocation **on the frame thread** before it returns,
+/// so it is 34.8 ms of dropped frames per render at `1.0` and 8.7 at `0.25`.
+/// The convert and the upload scale with area — 3.96× and 4.0× against the 4.0×
+/// the pixel count demands. The raster does not — only 1.36× — and that is
+/// worth knowing rather than glossing: `draw_feature` culls by geo-AABB, so a
+/// smaller texture drops the features that fall outside it, but every feature
+/// that survives is drawn at the *same* pixel scale in both plans, because the
+/// ground shrank with the pixels. Only the fill and blend scale with area; path
+/// building does not.
+///
+/// # What it costs
+///
+/// Pan re-renders. [`pan_exceeds_coverage`] fires once the viewport has eaten
+/// `PAN_REBUILD_THRESHOLD` of the band, which is `0.7 · f` of a viewport: 0.7
+/// viewports of travel at `1.0`, 0.175 at `0.25`. Four times as many pan
+/// renders, each about four times cheaper on the frame thread — near enough a
+/// wash, and the zoom case it buys is not close.
+///
+/// That wash is a **native** result, and it holds only because native puts just
+/// the `write_texture` row on the frame thread — the one row that scales with
+/// area exactly. On wasm `rustdar_frontend::offload` has no thread to give:
+/// `overlay-render` runs *inline*, so raster, convert and upload are all on the
+/// frame thread, and per unit of pan the trade is `4 · (67.9 + 5.7 + 8.7)`
+/// against `1 · (92.2 + 22.6 + 34.8)` — about 2.2× worse, because the raster
+/// row only fell 1.36×. It bites only where this constant binds rather than the
+/// adapter's limit, i.e. a web pane no wider than 1365 points, where the
+/// absolute textures are small. A browser measurement on real hardware puts the
+/// inline overlay path at 224 ms per raster against a p50 frame duration of
+/// 289.5 ms during a gesture, so the web win from *not* re-rasterising per
+/// frame dwarfs this — but anything that multiplies web pan cost is worth
+/// writing down rather than leaving to be rediscovered.
+///
+/// It also caps how far a zoom-*out* can coast on a stale texture, which is why
+/// this constant and [`OverlayTextureCache::needs_rerender`]'s zoom band have
+/// to be read together. Zooming out grows the viewport, so the pan check is
+/// what stops it: with a centred viewport that check trips exactly when the
+/// viewport's range reaches the texture's, i.e. after `log2(1 + 2f)` zoom units
+/// — 1.58 at `1.0`, 0.58 at `0.25`. Zooming *in* shrinks the viewport and is
+/// bounded by the zoom band alone.
+pub const OVERDRAW_FRACTION: f32 = 0.25;
 
 /// When the accumulated pan exceeds this fraction of the overdraw margin,
 /// a fresh render is triggered so the texture stays ahead of the viewport.
+///
+/// In viewports of travel that is `PAN_REBUILD_THRESHOLD · OVERDRAW_FRACTION`,
+/// so it moves with the overdraw and is 0.175 of a viewport at the current
+/// pair. The remaining `0.3` of the band is what the old texture keeps covering
+/// the viewport with while the new one rasterises.
 const PAN_REBUILD_THRESHOLD: f32 = 0.7;
 
 /// Latitude beyond which Web Mercator stops being finite. Bounds are clamped to it

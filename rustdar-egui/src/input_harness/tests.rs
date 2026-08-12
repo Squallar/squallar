@@ -5995,7 +5995,13 @@ fn a_small_adapter_limit_bounds_what_the_pane_requests() {
 #[test]
 fn a_desktop_class_limit_leaves_the_request_alone() {
     let mut h = harness_requesting_overlays();
-    let default_limit = requested_plans(&h);
+    // A limit this pane genuinely exceeds, named rather than inherited. It used
+    // to be egui's own 2048 default, which stopped clamping the harness pane the
+    // moment `OVERDRAW_FRACTION` became a quarter — leaving the comparison below
+    // true of two identical plans and saying nothing about the limit being read.
+    h.set_max_texture_side(1024);
+    let small_limit = requested_plans(&h);
+    assert!(!small_limit.is_empty());
 
     h.set_max_texture_side(16384);
     let desktop = requested_plans(&h);
@@ -6007,12 +6013,9 @@ fn a_desktop_class_limit_leaves_the_request_alone() {
             "a desktop adapter must not cost any overdraw"
         );
     }
-    // egui's own default is 2048, which this pane already exceeds — so the two
-    // sets differ, which is what makes the assertion above about the limit
-    // rather than about the pane being small.
     assert_ne!(
-        default_limit, desktop,
-        "precondition: egui's 2048 default must clamp this pane, or this test \
+        small_limit, desktop,
+        "precondition: the small limit must clamp this pane, or this test \
              proves nothing about the limit being read at all"
     );
 }

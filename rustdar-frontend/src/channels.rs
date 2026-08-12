@@ -170,12 +170,21 @@ pub struct OverlayRenderResponse {
     ///
     /// An overlay texture is planned against the *viewport plus overdraw*
     /// (`plan_overlay_texture`), so on a desktop it is not the radar raster's
-    /// 2048² but whatever the window is: 5760×3240 measured here, 18.7 M
-    /// pixels, **71.2 MiB** of `Color32` (74,649,600 bytes). The unmultiply over
-    /// that measured **45.5 ms best, 47.6 ms median** on a 7950X — nearly three
-    /// frames — and it used to run in `poll_overlay_render_results`, on the
-    /// **frame thread**, once per arriving overlay, drained unbounded over
-    /// every overlay kind the user has switched on.
+    /// 2048² but whatever the window is: with `OVERDRAW_FRACTION` at 1.0, which
+    /// is what it was when this was measured, a 1920×1080 pane planned
+    /// 5760×3240 — 18.7 M pixels, **71.2 MiB** of `Color32` (74,649,600 bytes).
+    /// The unmultiply over that measured **45.5 ms best, 47.6 ms median** on a
+    /// 7950X — nearly three frames — and it used to run in
+    /// `poll_overlay_render_results`, on the **frame thread**, once per arriving
+    /// overlay, drained unbounded over every overlay kind the user has switched
+    /// on.
+    ///
+    /// The fraction is a quarter now, so the same pane plans 2880×1620 and
+    /// 17.8 MiB, and the polygon path has no unmultiply left in it at all —
+    /// `App::overlay_color_image` copies premultiplied pixels straight through.
+    /// Neither change makes this the smaller of the two cases: this buffer still
+    /// scales with the window rather than being fixed, and it is still the one
+    /// that must not be walked on the frame thread.
     ///
     /// # Two fifths of that was paging, not arithmetic
     ///

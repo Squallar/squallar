@@ -259,7 +259,12 @@ fn the_window_survives_a_viewport_smaller_than_one_grid_cell() {
 ///
 /// The numbers are the reviewer's: -277 is where `lon0 - 180 = -277.5` plus
 /// the growth crosses the cone's seam, and -290..-110 is a viewport of
-/// -230..-170 expanded by `OVERDRAW_FRACTION = 1.0`.
+/// -230..-170 expanded by an overdraw of 1.0 — what `OVERDRAW_FRACTION` held
+/// when these boxes were chosen. They are *fixtures* and stay as they are now
+/// that the constant is a quarter: what is under test is that a texture box
+/// running past the antimeridian narrows correctly, which is a property of this
+/// function rather than of how wide the cache plans today. A smaller overdraw
+/// only means the app reaches such a box by panning further.
 #[test]
 fn the_window_survives_a_texture_running_past_the_antimeridian() {
     let lambert = lambert_grid(97, 61, 0b0100_0000);

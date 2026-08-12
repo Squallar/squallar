@@ -11,6 +11,31 @@ fn pane(w: f32, h: f32) -> egui::Rect {
     egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(w, h))
 }
 
+/// The narrowest pane whose plan has to give **some** overdraw up: one point
+/// past `limit / (1 + 2f)`.
+fn narrowest_clamped(limit: u32) -> f32 {
+    (limit as f32 / (1.0 + 2.0 * OVERDRAW_FRACTION)).ceil() + 1.0
+}
+
+/// A pane side that is clamped but not flattened — overdraw cut back, and some
+/// of it still left.
+///
+/// Below [`narrowest_clamped`] the plan keeps the whole fraction and the
+/// clamping fixtures test nothing; at `limit` and beyond there is no overdraw
+/// left at all and they test the *other* case. Halfway between is the side
+/// furthest from either edge.
+///
+/// Derived rather than written down, for the reason the pane width in
+/// [`a_pane_that_would_overflow_the_limit_gives_up_overdraw_instead`] is:
+/// 1440 and 1400 points were realistic browser windows and correct at a
+/// quarter, with 0.211 and 0.231 of the constant's range to spare. Both would
+/// have stopped being clamped at all somewhere below `f == 0.23`, and a fixture
+/// that stops exercising the thing it is named for is worth less than one that
+/// moves with the constant.
+fn clamped_side(limit: u32) -> f32 {
+    (narrowest_clamped(limit) + limit as f32) / 2.0
+}
+
 /// A plan with the given overdraw. Dimensions are irrelevant to `coverage`, so
 /// they stand in at 1x1 rather than pretending to a size.
 fn plan_with_overdraw(overdraw: f32) -> OverlayTexturePlan {
@@ -47,11 +72,29 @@ fn viewport() -> GeoBounds {
     }
 }
 
-/// The viewport's own extent per axis, which is also the overdraw band at
-/// `overdraw == 1.0`. Derived from [`viewport`] so the two cannot drift apart.
+/// The viewport's own extent per axis. Derived from [`viewport`] so the two
+/// cannot drift apart.
 fn viewport_ranges() -> (f64, f64) {
     let vp = viewport();
     (vp.max_lat - vp.min_lat, vp.max_lon - vp.min_lon)
+}
+
+/// The overdraw band a freshly rendered texture has on each side, per axis.
+///
+/// `range · f`, and not the range: those two were the same number while
+/// [`OVERDRAW_FRACTION`] was `1.0`, and three fixtures below were written in
+/// terms of the range because of it. Naming the band separately is what keeps
+/// them from silently measuring the wrong distance the next time the fraction
+/// moves.
+fn viewport_bands(overdraw: f32) -> (f64, f64) {
+    let (lat, lon) = viewport_ranges();
+    (lat * overdraw as f64, lon * overdraw as f64)
+}
+
+/// How far a viewport may travel on one axis before [`pan_exceeds_coverage`]
+/// asks for a fresh render: [`PAN_REBUILD_THRESHOLD`] of the band.
+fn pan_trip(band: f64) -> f64 {
+    band * PAN_REBUILD_THRESHOLD as f64
 }
 
 /// Slide a viewport south (negative) or north (positive) by `d` degrees.
@@ -73,19 +116,26 @@ fn panned_lon(viewport: &GeoBounds, d: f64) -> GeoBounds {
 
 // ── plan_overlay_texture ─────────────────────────────────────────────
 
-/// The constraint being ported for: a pane only 683 points wide already asks for
-/// 2049 px at the full overdraw, one past WebGL2's guarantee. egui only
+/// The constraint being ported for: a pane barely past `2048 / (1 + 2f)` points
+/// wide already asks for more than WebGL2's guarantee. egui only
 /// `debug_assert!`s that bound, so a release wasm build would sail into
 /// `Device::create_texture` and fail there instead.
+///
+/// The pane width is *derived* from [`OVERDRAW_FRACTION`] rather than written
+/// down. It was written down — 683 points, the right answer at `f == 1.0` — and
+/// cutting the fraction to a quarter would have left a fixture that no longer
+/// crosses the limit it exists to cross, still green while exercising nothing.
 #[test]
 fn a_pane_that_would_overflow_the_limit_gives_up_overdraw_instead() {
-    let unclamped = 683.0 * (1.0 + 2.0 * OVERDRAW_FRACTION);
+    // One point past the widest pane the limit can hold at the full overdraw.
+    let w = narrowest_clamped(WEBGL2_LIMIT);
+    let unclamped = w * (1.0 + 2.0 * OVERDRAW_FRACTION);
     assert!(
         unclamped as u32 > WEBGL2_LIMIT,
         "fixture must actually cross the limit: {unclamped} vs {WEBGL2_LIMIT}"
     );
 
-    let plan = plan_overlay_texture(pane(683.0, 400.0), WEBGL2_LIMIT);
+    let plan = plan_overlay_texture(pane(w, 400.0), WEBGL2_LIMIT);
     assert!(
         plan.width <= WEBGL2_LIMIT,
         "width {} exceeds the limit",
@@ -102,30 +152,46 @@ fn a_pane_that_would_overflow_the_limit_gives_up_overdraw_instead() {
         plan.overdraw
     );
     // The dimensions and the overdraw describe the same rectangle.
-    assert_eq!(plan.width, (683.0 * (1.0 + 2.0 * plan.overdraw)) as u32);
+    assert_eq!(plan.width, (w * (1.0 + 2.0 * plan.overdraw)) as u32);
     assert_eq!(plan.height, (400.0 * (1.0 + 2.0 * plan.overdraw)) as u32);
 }
 
-/// A realistic browser window: 1440 x 900 points against WebGL2's floor.
+/// A full-size browser window against WebGL2's floor: wide enough that the plan
+/// has to give overdraw up, not so wide that it gives up all of it. The width
+/// comes from [`clamped_side`]; the 16:10 shape is the window's.
 #[test]
 fn a_full_size_browser_pane_stays_within_the_limit() {
-    let plan = plan_overlay_texture(pane(1440.0, 900.0), WEBGL2_LIMIT);
+    let w = clamped_side(WEBGL2_LIMIT);
+    let h = w * 10.0 / 16.0;
+    let plan = plan_overlay_texture(pane(w, h), WEBGL2_LIMIT);
     assert!(plan.width <= WEBGL2_LIMIT && plan.height <= WEBGL2_LIMIT);
-    // Width is the binding axis, so it lands on the limit exactly.
-    assert_eq!(plan.width, WEBGL2_LIMIT);
+    // Width is the binding axis, so it lands on the limit — to within the texel
+    // the `as u32` floors off the product.
+    assert!(
+        plan.width + 1 >= WEBGL2_LIMIT,
+        "the wide axis should have been sized to the limit, got {}",
+        plan.width
+    );
     // ...and the *same* fraction sizes the other axis, so the texture stays
     // proportional to the pane rather than stretching.
-    assert_eq!(plan.height, (900.0 * (1.0 + 2.0 * plan.overdraw)) as u32);
+    assert_eq!(plan.height, (h * (1.0 + 2.0 * plan.overdraw)) as u32);
     assert!(plan.overdraw > 0.0 && plan.overdraw < OVERDRAW_FRACTION);
 }
 
-/// The binding axis is whichever needs the most texels, not always width.
+/// The binding axis is whichever needs the most texels, not always width. Same
+/// derivation as above, stood on its side.
 #[test]
 fn the_taller_axis_can_be_the_binding_one() {
-    let plan = plan_overlay_texture(pane(400.0, 1400.0), WEBGL2_LIMIT);
+    let h = clamped_side(WEBGL2_LIMIT);
+    let w = h * 10.0 / 35.0;
+    let plan = plan_overlay_texture(pane(w, h), WEBGL2_LIMIT);
     assert!(plan.width <= WEBGL2_LIMIT && plan.height <= WEBGL2_LIMIT);
-    assert_eq!(plan.height, WEBGL2_LIMIT);
-    assert!(plan.overdraw < OVERDRAW_FRACTION);
+    assert!(
+        plan.height + 1 >= WEBGL2_LIMIT,
+        "the tall axis should have been sized to the limit, got {}",
+        plan.height
+    );
+    assert!(plan.overdraw > 0.0 && plan.overdraw < OVERDRAW_FRACTION);
 }
 
 /// Desktop must not change. A desktop adapter's limit is far above anything a
@@ -231,7 +297,7 @@ fn a_texture_that_just_rendered_covers_its_own_viewport() {
 #[test]
 fn panning_most_of_the_way_across_the_band_triggers_a_rebuild() {
     let vp = viewport();
-    let (band_lat, band_lon) = viewport_ranges(); // at overdraw 1.0 the band is the range
+    let (band_lat, band_lon) = viewport_bands(OVERDRAW_FRACTION);
     let tex = freshly_rendered(&vp, OVERDRAW_FRACTION);
     let past = |band: f64| band * (PAN_REBUILD_THRESHOLD as f64 + 0.05);
     let short = |band: f64| band * (PAN_REBUILD_THRESHOLD as f64 - 0.05);
@@ -269,23 +335,26 @@ fn panning_most_of_the_way_across_the_band_triggers_a_rebuild() {
 #[test]
 fn each_axis_is_judged_against_its_own_band() {
     let vp = viewport();
-    let (band_lat, band_lon) = viewport_ranges();
+    let (band_lat, band_lon) = viewport_bands(OVERDRAW_FRACTION);
     assert!(
         band_lon > band_lat * 1.5,
         "fixture must be decisively non-square"
     );
 
     let tex = freshly_rendered(&vp, OVERDRAW_FRACTION);
-    // Headroom is 30% of the band: 3° of latitude, 4.8° of longitude. A 6.5°
-    // southward pan leaves 3.5° of the latitude band — still covered — but would
-    // read as only 3.5° against a 4.8° longitude margin, and rebuild.
-    let pan = panned_lat(&vp, -6.5);
+    // A southward pan that leaves *more* than the latitude margin of band — so
+    // latitude still covers it — but less than the longitude margin, so
+    // substituting that margin would rebuild. Halfway between the two is the
+    // widest such gap, and it is derived rather than written down: at
+    // `OVERDRAW_FRACTION == 1.0` the answer was 6.5°, and the constant moving
+    // to a quarter moves it to 1.525°.
     let headroom = 1.0 - PAN_REBUILD_THRESHOLD as f64;
+    let (margin_lat, margin_lon) = (band_lat * headroom, band_lon * headroom);
+    let left = (margin_lat + margin_lon) / 2.0;
+    let pan = panned_lat(&vp, -(band_lat - left));
     assert!(
-        band_lat * headroom < 3.5 && 3.5 < band_lon * headroom,
-        "fixture must straddle the two margins: {} < 3.5 < {}",
-        band_lat * headroom,
-        band_lon * headroom
+        margin_lat < left && left < margin_lon,
+        "fixture must straddle the two margins: {margin_lat} < {left} < {margin_lon}",
     );
     assert!(
         !pan_exceeds_coverage(&tex, &pan),
@@ -293,20 +362,22 @@ fn each_axis_is_judged_against_its_own_band() {
     );
 }
 
-/// The invariant clamping would otherwise break. A texture whose overdraw was cut
-/// to 0.2 tolerates far less pan than one with the full 1.0 — and the check has to
-/// notice, or the cache holds a stale image over ground it never rasterised.
+/// The invariant clamping would otherwise break. A texture whose overdraw was
+/// cut to half the request tolerates half the pan — and the check has to notice,
+/// or the cache holds a stale image over ground it never rasterised.
 #[test]
 fn a_clamped_texture_runs_out_of_coverage_sooner_than_a_full_one() {
     let vp = viewport();
-    let clamped = freshly_rendered(&vp, 0.2);
+    let half = OVERDRAW_FRACTION / 2.0;
+    let clamped = freshly_rendered(&vp, half);
     let full = freshly_rendered(&vp, OVERDRAW_FRACTION);
 
-    // 0.2 of a 10 degree viewport height is a 2 degree band; 0.7 of that is 1.4.
-    let pan = panned_lat(&vp, -1.6);
+    // Between the two trip points, so only the measured band separates them.
+    let (band_lat, _) = viewport_bands(OVERDRAW_FRACTION);
+    let pan = panned_lat(&vp, -(pan_trip(band_lat) + pan_trip(band_lat / 2.0)) / 2.0);
     assert!(
         pan_exceeds_coverage(&clamped, &pan),
-        "a 2-degree band cannot absorb a 1.6-degree pan"
+        "a {half}-overdraw band absorbed a pan past its own trip point"
     );
     assert!(
         !pan_exceeds_coverage(&full, &pan),
@@ -365,8 +436,9 @@ fn a_pane_that_outgrew_its_texture_rebuilds() {
 #[test]
 fn the_plans_overdraw_is_what_the_coverage_check_reads_back() {
     let vp = viewport();
-    let (band_lat_at_full, _) = viewport_ranges();
-    let plan = plan_overlay_texture(pane(1440.0, 900.0), WEBGL2_LIMIT);
+    let (lat_range, _) = viewport_ranges();
+    let w = clamped_side(WEBGL2_LIMIT);
+    let plan = plan_overlay_texture(pane(w, w * 10.0 / 16.0), WEBGL2_LIMIT);
     assert!(
         plan.overdraw < OVERDRAW_FRACTION,
         "fixture must be a clamped one"
@@ -376,8 +448,18 @@ fn the_plans_overdraw_is_what_the_coverage_check_reads_back() {
     let honest = plan.coverage(&vp);
     assert!(!pan_exceeds_coverage(&honest, &vp));
 
-    // The band the honest texture really has, and a pan that overruns it.
-    let overrun = panned_lat(&vp, -(band_lat_at_full * plan.overdraw as f64 * 0.95));
+    // A pan that lands *between* the two trip points: past what the clamped
+    // texture really covers, inside what the constant would have claimed. It has
+    // to be between them rather than merely past the first, because the clamp is
+    // no longer the four-to-one cut it was when `OVERDRAW_FRACTION` was 1.0 —
+    // a pane sized by `clamped_side` gives up only a part of the fraction.
+    let honest_trip = pan_trip(lat_range * plan.overdraw as f64);
+    let claimed_trip = pan_trip(lat_range * OVERDRAW_FRACTION as f64);
+    assert!(
+        honest_trip < claimed_trip,
+        "fixture: the clamp must really cut the band, {honest_trip} vs {claimed_trip}"
+    );
+    let overrun = panned_lat(&vp, -(honest_trip + claimed_trip) / 2.0);
     assert!(pan_exceeds_coverage(&honest, &overrun));
 
     // Had the bounds been expanded by the unclamped constant, the same pan would
@@ -393,8 +475,10 @@ fn the_plans_overdraw_is_what_the_coverage_check_reads_back() {
 /// unclamped constant would.
 #[test]
 fn the_bounds_grow_by_the_plans_overdraw_not_the_constant() {
-    // A 1440pt-wide pane against WebGL2's floor: the plan has to give overdraw up.
-    let plan = plan_overlay_texture(pane(1440.0, 900.0), WEBGL2_LIMIT);
+    // A pane in the clamped band against WebGL2's floor: the plan has to give
+    // overdraw up, and has some left to describe.
+    let w = clamped_side(WEBGL2_LIMIT);
+    let plan = plan_overlay_texture(pane(w, w * 10.0 / 16.0), WEBGL2_LIMIT);
     assert!(
         plan.overdraw < OVERDRAW_FRACTION,
         "fixture must be a clamped plan, else this test cannot tell the two apart"
