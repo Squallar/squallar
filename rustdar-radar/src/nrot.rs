@@ -738,13 +738,13 @@ fn rot_divisor(range_nm: f64) -> f64 {
 /// # It is a table because the reference's is a table
 ///
 /// The curve was chased for a closed form first, because a divisor that is
-/// only a table is a divisor nobody can extend. There is none. Against 776
+/// only a table is a divisor nobody can extend. There is none. Against 808
 /// step-edge readings over 60 ranges and six sites, the best two-parameter
 /// physical form — the response of this module's own operator to a reference
 /// circulation of fixed size, which is what "normalized rotation" means —
-/// leaves 286 of them outside the interval the reference's quantisation pins
+/// leaves 272 of them outside the interval the reference's quantisation pins
 /// them to, missing by up to 3.7 lattice steps; an exhaustive three-parameter
-/// search over `K/(1 + (r/a)^m)^n` does no better (292, 3.7 steps). Three
+/// search over `K/(1 + (r/a)^m)^n` does no better. Three
 /// features defeat every smooth form: the curve **rises** 6.1% from 13.9 to
 /// 20.4 km, steepens again over 55–67 km, and then **flattens** at 8.2 beyond
 /// 81 km. The last of those is a table's flat extension, and the shipped
@@ -792,8 +792,18 @@ fn rot_divisor(range_nm: f64) -> f64 {
 /// reference reports NROT on a 0.0395 lattice
 /// (see the module header), so each readout is an interval of half-width
 /// 0.0198 and a curve is either consistent with it or is not. These knots
-/// leave 62 of 880 readings outside, none by as much as one lattice step; the
-/// 4-knot curve they replace left 703 outside and missed by up to 7.
+/// leave 71 of those 808 outside, none by as much as one lattice step (worst
+/// 0.97); the 4-knot curve they replace left 644 outside and missed by up
+/// to 6.1.
+///
+/// Those two counts are a reconstruction. The campaign took each reading as
+/// `D_ours·(ours/GR)` against a dumped field that was not preserved, so they
+/// are recomputed here from the readings that were, recovering the jump the
+/// archive actually painted — velocity is quantised to 0.5 m/s, so it is not
+/// exactly k·Vny — as one constant per site and edge. The population is the
+/// 808 the reduction reports; an earlier hand-written count of 776, and a
+/// third of 880, appear in no generated artifact and are not reproducible
+/// from the logs.
 ///
 /// The curve now serves one operator at every range. It used to hand over to a
 /// second, wider stencil past 80 km whose step gain was 5.4% under the split
@@ -979,8 +989,8 @@ fn rot_divisor_km(range_km: f64) -> f64 {
 ///   operators must read one physical shear consistently. They agreed to 3.5%
 ///   before and agree to 1.1% now.
 ///
-/// Painted density inside 80 km over the seven-site set rises 10801 → 11214
-/// bins, 3.8%, and it rises in the skirts rather than the cores: the peak is
+/// Painted density inside 80 km over the seven-site set rises 10634 → 11044
+/// bins, 3.9%, and it rises in the skirts rather than the cores: the peak is
 /// unchanged and the cell two radials out goes 0.130 → 0.149 of it, toward
 /// the 0.150 the reference reads. The reference paints all four cells on all
 /// 76 profiles; this operator was under-painting the outer two.
@@ -1029,6 +1039,30 @@ const SPLIT_TAPS: [(i32, f64); 4] = [(1, 0.2241), (2, 0.3433), (3, 0.2526), (4, 
 /// closed it without either measurement being touched. What remains is small
 /// enough that a single hovered ramp cannot resolve it, so it is left as read
 /// rather than reconciled.
+///
+/// # The family, and why these are not moved onto it
+///
+/// [`SPLIT_TAPS`] is the 9-point member of the Savitzky–Golay cubic
+/// first-derivative family, so the obvious next claim is that the reference
+/// evaluates one closed form at whatever support the radial spacing gives —
+/// which would make these its 5-point member, (8, −1)/12, ratio
+/// t₂/t₁ = −0.125. That is testable against this ladder, and the ladder does
+/// not refuse it: the readings pin A = t₁+t₂ to [0.61489, 0.61633] and
+/// B = t₂ to [−0.08967, −0.07287], and the line B = −A/7 the closed form
+/// demands runs inside that box, clearing the nearest edge by 9.7% of its
+/// width. Adopting it would also close the gap above from 1.1% to 0.1%.
+///
+/// It is not adopted, because this ladder cannot tell the two apart. The
+/// closed form and the value shipped here each leave **0 of the 120 deciding
+/// readings** outside their intervals, with the same worst residual — 0.97 of
+/// a half-lattice — on the same reading, and likewise for the 20 holdout
+/// readings. What the ladder pins is t₂/t₁ ∈ [−0.127, −0.106], an 18% span:
+/// wide enough for the closed form, the measured centre, and a great deal
+/// else. It is not a vacuous test — it refuses the plain two-point central
+/// difference (t₂ = 0), the 5-point *quadratic* derivative and the 7-point
+/// cubic one — but between these two candidates it is silent, and a measured
+/// constant is not moved onto a closed form that fits no better. Separating
+/// them needs tails read at larger amplitude than ±10 m/s at 78.0 nm gives.
 ///
 /// # Scale and shape are one measurement, and it was re-taken
 ///
@@ -3773,9 +3807,9 @@ mod tests {
     ///
     /// Every figure here moved when the curve did, and each is a restatement
     /// of a new measurement rather than an assertion bent to pass: the old
-    /// values were a 4-knot approximation that left 703 of 880 readings
+    /// values were a 4-knot approximation that left 644 of 808 readings
     /// outside the interval the reference's quantisation pins them to, missing
-    /// by up to 7 lattice steps, against 62 and under one step now.
+    /// by up to 6.1 lattice steps, against 71 and under one step now.
     #[test]
     fn rot_divisor_matches_the_reference_curve() {
         // Flat below the first knot — unreachable in the pipeline, which skips
