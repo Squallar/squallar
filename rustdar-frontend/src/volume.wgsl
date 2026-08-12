@@ -27,14 +27,18 @@
 // Uniform block
 // ---------------------------------------------------------------------------
 
-// One `mat4x4<f32>` plus six `vec4<f32>`: 64 + 96 = 160 bytes, std140-clean.
+// One `mat4x4<f32>` plus ten `vec4<f32>`: 64 + 160 = 224 bytes, std140-clean.
 //
 // Every member is `f32`, including the two that are conceptually integers
 // (`grid_dims`) and the one that is conceptually a bool (`flags`). Mixing
 // integer and float members in a std140 block is where driver bugs live, and
 // the cost of the float round-trip is one `f32()` that the compiler folds.
 //
-// `volume_uniform.rs` writes these 160 bytes by hand and pins every offset.
+// `volume_uniform.rs` writes these 224 bytes by hand and pins every offset, as
+// `VOLUME_UNIFORM_BYTES`. This comment read "six vec4, 160 bytes" until
+// 2026-08-13, four lanes after it stopped being true — worth stating because
+// the probe's `REQUIRED_UNIFORM_BINDING_SIZE` is 256, so the room left for
+// another member is **two lanes**, not the eight the stale figure implied.
 struct Volume {
     // Clip space to box space, where box space is the unit cube [0,1]^3 over
     // the voxel grid. Built compositionally by the caller

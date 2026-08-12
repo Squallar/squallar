@@ -154,22 +154,42 @@ const MIN_TEXTURE_DIMENSION_3D: u32 = 32;
 /// existed: the map floor's mirror had made it 3, so an adapter reporting
 /// exactly 2 passed this probe and then failed pipeline creation — which is
 /// the failure the probe exists to turn into a clean refusal.
+///
+/// Held to the shader by
+/// `the_probe_asks_the_adapter_for_every_binding_the_raymarch_declares`, which
+/// counts it rather than trusting it.
 const REQUIRED_SAMPLED_TEXTURES: u32 = 4;
 
-/// Samplers a volume pipeline binds at once.
+/// Samplers a volume pipeline binds at once: the grid's, the LUT's, the floor's.
 ///
-/// One per texture, and it has to be one *per* texture rather than one shared:
-/// naga rejects a texture sampled through two samplers in one entry point
-/// (`Error::ImageMultipleSamplers`), and the grid wants `Linear` while an
-/// exact-index LUT lookup wants `Nearest`.
-const REQUIRED_SAMPLERS: u32 = 2;
+/// One per texture *that is sampled*, and it has to be one per rather than one
+/// shared: naga rejects a texture sampled through two samplers in one entry
+/// point (`Error::ImageMultipleSamplers`), and the grid wants `Linear` while an
+/// exact-index LUT lookup wants `Nearest`. It is one fewer than
+/// [`REQUIRED_SAMPLED_TEXTURES`] because the jitter tile is read with
+/// `textureLoad` and carries no sampler at all.
+///
+/// It read 2 until 2026-08-13 — the same defect as the one above, one constant
+/// along and found one day later, because the fix that corrected the textures
+/// derived only the textures. Both are now counted by the one scan in
+/// `the_probe_asks_the_adapter_for_every_binding_the_raymarch_declares`, and a
+/// binding class that scan does not recognise fails it rather than passing
+/// silently, so the third constant cannot go stale the way this one did.
+const REQUIRED_SAMPLERS: u32 = 3;
 
 /// Bytes of uniform data one volume draw needs bound at once.
 ///
-/// The raymarch's uniform block is one `mat4x4<f32>` plus six `vec4<f32>` — 160
-/// bytes — and this is the next std140-friendly bound above it. Well under the
-/// 16 KiB WebGL2 itself guarantees; the check exists to catch a device that
-/// reports something absurd, not to be tight.
+/// The raymarch's uniform block is one `mat4x4<f32>` plus ten `vec4<f32>` — 224
+/// bytes, [`uniform::VOLUME_UNIFORM_BYTES`] — and this is the next
+/// std140-friendly bound above it. Well under the 16 KiB WebGL2 itself
+/// guarantees; the check exists to catch a device that reports something
+/// absurd, not to be tight.
+///
+/// The headroom is 32 bytes — two `vec4` lanes — not the 96 the shader's own
+/// comment claimed until 2026-08-13. Small enough that growing the block is a
+/// change to this number too, which is why
+/// `the_probe_asks_the_adapter_for_every_binding_the_raymarch_declares` asserts
+/// the block still fits rather than leaving the two figures to drift.
 ///
 /// `u64` because `Limits::max_uniform_buffer_binding_size` is, unlike the three
 /// counts above.
@@ -274,6 +294,12 @@ pub(crate) fn limits_shortfall(limits: &wgpu::Limits) -> Option<String> {
     // Widened to `u64` because `max_uniform_buffer_binding_size` is one and the
     // other three are `u32`; comparing each in its own width would need four
     // near-identical branches instead of one table.
+    //
+    // `what` names the resource and never counts it. Two of these read "four
+    // sampled textures" and "two samplers" until 2026-08-13, which made the
+    // spelled-out numeral a third place to update when a binding was added —
+    // and the sentence already prints `needed`, so the numeral was only ever a
+    // chance to disagree with it.
     for (actual, needed, what) in [
         (
             u64::from(limits.max_texture_dimension_3d),
@@ -283,12 +309,12 @@ pub(crate) fn limits_shortfall(limits: &wgpu::Limits) -> Option<String> {
         (
             u64::from(limits.max_sampled_textures_per_shader_stage),
             u64::from(REQUIRED_SAMPLED_TEXTURES),
-            "four sampled textures in one shader stage",
+            "sampled textures in one shader stage",
         ),
         (
             u64::from(limits.max_samplers_per_shader_stage),
             u64::from(REQUIRED_SAMPLERS),
-            "two samplers in one shader stage",
+            "samplers in one shader stage",
         ),
         (
             limits.max_uniform_buffer_binding_size,
@@ -417,35 +443,254 @@ mod tests {
     use super::*;
     use crate::constants::WEBGL2_MAX_TEXTURE_DIMENSION_3D;
 
-    /// The probe's texture floor is what the raymarch actually declares.
+    /// What the raymarch's two bind groups declare, counted out of the shader.
     ///
-    /// This constant drifted once already — it sat at 2 while the map floor's
-    /// mirror had made the real count 3 — and the failure that causes is the
-    /// exact one the probe exists to prevent: an adapter passes, and then
-    /// `create_render_pipeline` fails asynchronously into the uncaptured-error
-    /// sink, which panics. So it is counted out of the shader rather than
-    /// remembered, over both of the raymarch's groups and skipping the blit's
-    /// own pair, which belongs to a different pipeline and a different layout.
+    /// One tally rather than one count per constant, because the drift being
+    /// prevented is not "the texture number is wrong". It is "a binding was
+    /// added and *some* number went stale" — which happened twice, to two
+    /// different constants, and the second time to the constant standing next
+    /// to the one that had just been fixed by a count that covered only itself.
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    struct DeclaredBindings {
+        /// Counts against `max_sampled_textures_per_shader_stage`.
+        sampled_textures: u32,
+        /// Counts against `max_samplers_per_shader_stage`.
+        samplers: u32,
+        /// Uniform blocks. A *count*, where the probe's limit is a size — so
+        /// what this pins is the premise that there is exactly one block for
+        /// [`REQUIRED_UNIFORM_BINDING_SIZE`] to be about.
+        uniform_buffers: u32,
+    }
+
+    /// Tally every `@group(...) @binding(...)` the raymarch declares, by class.
+    ///
+    /// **Exhaustive on purpose.** A binding whose class none of the arms below
+    /// recognise is an `Err`, not a skip, because the whole failure being
+    /// guarded against is a binding the probe does not know it needs: a storage
+    /// buffer or a storage texture would be checked against limits
+    /// [`limits_shortfall`] never reads, and silently ignoring it would rebuild
+    /// the exact hole this closes. Each error names the line and the limit that
+    /// would have to be added to the probe before the shader may depend on it.
+    ///
+    /// The blit's own pair is skipped: it belongs to a third layout and a
+    /// different pipeline, so it is never bound alongside these and does not
+    /// add to what one raymarch draw asks of the adapter.
+    ///
+    /// Text rather than a naga parse because this must fail when the *source*
+    /// gains a line, including one no pipeline has been built from yet.
+    fn declared_by_the_raymarch(wgsl: &str) -> Result<DeclaredBindings, String> {
+        use crate::volume::raymarch::{BINDING_BLIT_SAMPLER, BINDING_BLIT_TEXTURE};
+
+        let mut tally = DeclaredBindings::default();
+        for line in wgsl.lines() {
+            let line = line.split("//").next().unwrap_or_default().trim();
+            let Some(rest) = line.strip_prefix("@group(") else {
+                continue;
+            };
+            let malformed = || format!("cannot read a group and binding out of {line:?}");
+            let (group, rest) = rest.split_once(')').ok_or_else(malformed)?;
+            let rest = rest
+                .trim_start()
+                .strip_prefix("@binding(")
+                .ok_or_else(malformed)?;
+            let (binding, declaration) = rest.split_once(')').ok_or_else(malformed)?;
+            let group: u32 = group.trim().parse().map_err(|_| malformed())?;
+            let binding: u32 = binding.trim().parse().map_err(|_| malformed())?;
+
+            if group == 0 && matches!(binding, BINDING_BLIT_TEXTURE | BINDING_BLIT_SAMPLER) {
+                continue;
+            }
+
+            let declaration = declaration.trim().strip_prefix("var").ok_or_else(|| {
+                format!(
+                    "{line:?} carries a binding attribute with no `var` after it on the same \
+                         line, so its class cannot be told and the limit it costs cannot be \
+                         counted; keep each binding on one line",
+                )
+            })?;
+
+            // `var<uniform>` and `var<storage>` carry their class in the address
+            // space; a handle binding — texture or sampler — carries it in the
+            // type after the colon.
+            if let Some(space) = declaration.strip_prefix('<') {
+                let space = space.split_once('>').ok_or_else(malformed)?.0;
+                match space.split(',').next().unwrap_or_default().trim() {
+                    "uniform" => tally.uniform_buffers += 1,
+                    other => {
+                        return Err(format!(
+                            "{line:?} binds a `{other}` buffer, which is checked against a limit \
+                             the volume probe does not read — add it to `limits_shortfall` \
+                             before adding it to the shader",
+                        ));
+                    }
+                }
+                continue;
+            }
+
+            let ty = declaration
+                .split_once(':')
+                .ok_or_else(malformed)?
+                .1
+                .trim()
+                .trim_end_matches(';')
+                .trim();
+            let head = ty.split('<').next().unwrap_or_default();
+            match head {
+                "sampler" | "sampler_comparison" => tally.samplers += 1,
+                // Ordered before the general texture arm: a storage texture is a
+                // `texture_` that counts against a different limit entirely.
+                _ if head.starts_with("texture_storage") => {
+                    return Err(format!(
+                        "{line:?} binds a storage texture, which counts against \
+                         `max_storage_textures_per_shader_stage` — a limit the volume probe \
+                         does not read",
+                    ));
+                }
+                _ if head.starts_with("texture_") => tally.sampled_textures += 1,
+                other => {
+                    return Err(format!(
+                        "{line:?} binds a `{other}`, which the volume probe has no arm for; \
+                         decide which limit it costs before the shader depends on it",
+                    ));
+                }
+            }
+        }
+        Ok(tally)
+    }
+
+    /// Every count the probe asks the adapter for is the shader's own.
+    ///
+    /// Both of these constants have drifted, a day apart, in the same way:
+    /// [`REQUIRED_SAMPLED_TEXTURES`] sat at 2 while the map floor's mirror had
+    /// made it 3, and [`REQUIRED_SAMPLERS`] sat at 2 while the floor's sampler
+    /// had made it 3. The failure either one causes is precisely the one the
+    /// probe exists to prevent: an adapter reporting a figure between the two
+    /// passes, and then `create_render_pipeline` fails asynchronously into the
+    /// uncaptured-error sink, which panics under `debug_assertions`.
+    ///
+    /// So this asserts the whole tally at once. A binding added to
+    /// `volume.wgsl` fails this test whichever class it belongs to, and a class
+    /// with no arm fails it too rather than passing unnoticed — which is what
+    /// the texture-only count that preceded it did to the sampler.
     #[test]
-    fn the_probe_floor_counts_every_texture_the_raymarch_declares() {
+    fn the_probe_asks_the_adapter_for_every_binding_the_raymarch_declares() {
+        use crate::volume::raymarch::VOLUME_SHADER_WGSL;
+
+        let declared = declared_by_the_raymarch(VOLUME_SHADER_WGSL)
+            .unwrap_or_else(|why| panic!("the raymarch's bindings do not read: {why}"));
+        assert_eq!(
+            declared,
+            DeclaredBindings {
+                sampled_textures: REQUIRED_SAMPLED_TEXTURES,
+                samplers: REQUIRED_SAMPLERS,
+                uniform_buffers: 1,
+            },
+            "the raymarch declares {declared:?} and the probe asks the adapter for \
+             {REQUIRED_SAMPLED_TEXTURES} textures and {REQUIRED_SAMPLERS} samplers; an adapter \
+             between those numbers passes this probe and then fails pipeline creation into the \
+             sink that panics",
+        );
+        assert!(
+            uniform::VOLUME_UNIFORM_BYTES as u64 <= REQUIRED_UNIFORM_BINDING_SIZE,
+            "the uniform block is {} bytes and the probe only asks the adapter for \
+             {REQUIRED_UNIFORM_BINDING_SIZE}",
+            uniform::VOLUME_UNIFORM_BYTES,
+        );
+    }
+
+    /// And the tally moves when the shader does — for a sampler specifically.
+    ///
+    /// Without this, the test above passes either because the scan counts or
+    /// because it counts nothing and the constants happen to match zero. What
+    /// it proves is the property the sampler constant lacked for a day: adding
+    /// `var floor_sampler: sampler;` to the shader and nothing else makes the
+    /// assertion above fail.
+    #[test]
+    fn one_more_binding_in_the_shader_is_one_more_in_the_tally() {
+        use crate::volume::raymarch::VOLUME_SHADER_WGSL;
+
+        let shipped = declared_by_the_raymarch(VOLUME_SHADER_WGSL).expect("the shipped shader");
+        for (added, expected) in [
+            (
+                "@group(1) @binding(2) var extra_sampler: sampler;",
+                DeclaredBindings {
+                    samplers: shipped.samplers + 1,
+                    ..shipped
+                },
+            ),
+            (
+                "@group(1) @binding(2) var extra_texture: texture_2d<f32>;",
+                DeclaredBindings {
+                    sampled_textures: shipped.sampled_textures + 1,
+                    ..shipped
+                },
+            ),
+            (
+                "@group(1) @binding(2) var<uniform> extra: Volume;",
+                DeclaredBindings {
+                    uniform_buffers: shipped.uniform_buffers + 1,
+                    ..shipped
+                },
+            ),
+        ] {
+            let grown = format!("{VOLUME_SHADER_WGSL}\n{added}\n");
+            assert_eq!(
+                declared_by_the_raymarch(&grown).expect("a grown shader still reads"),
+                expected,
+                "adding {added:?} did not move the tally, so the probe's constants could go \
+                 stale against it exactly as they have twice",
+            );
+        }
+    }
+
+    /// A binding class the probe cannot price is refused, not skipped.
+    ///
+    /// This is the half that makes one mechanism cover the next constant as
+    /// well as these two. A storage buffer or storage texture is checked by
+    /// wgpu against limits [`limits_shortfall`] never reads, so counting only
+    /// the classes already known would let one in with the probe silent — the
+    /// same shape of hole, one class over.
+    #[test]
+    fn a_binding_the_probe_prices_no_limit_for_fails_the_scan() {
+        use crate::volume::raymarch::VOLUME_SHADER_WGSL;
+
+        for unpriced in [
+            "@group(1) @binding(2) var<storage, read> extra: array<f32>;",
+            "@group(1) @binding(2) var extra: texture_storage_2d<rgba8unorm, write>;",
+        ] {
+            let grown = format!("{VOLUME_SHADER_WGSL}\n{unpriced}\n");
+            let why = declared_by_the_raymarch(&grown).expect_err(
+                "an unpriced binding class was tallied as though the probe checked for it",
+            );
+            assert!(
+                why.contains("limit"),
+                "the refusal does not say which limit is missing: {why:?}",
+            );
+        }
+    }
+
+    /// The blit's pair is not charged to the raymarch.
+    ///
+    /// They share `@group(0)` in the source but belong to a third layout and a
+    /// different pipeline, so they are never bound alongside the raymarch's and
+    /// counting them would raise the probe's floor above what any volume draw
+    /// actually needs — refusing devices that can render one perfectly well.
+    #[test]
+    fn the_blits_own_pair_is_left_out_of_the_raymarchs_tally() {
         use crate::volume::raymarch::{
             BINDING_BLIT_SAMPLER, BINDING_BLIT_TEXTURE, VOLUME_SHADER_WGSL,
         };
-        let blit = [BINDING_BLIT_TEXTURE, BINDING_BLIT_SAMPLER];
-        let declared = VOLUME_SHADER_WGSL
-            .lines()
-            .filter(|line| line.contains(": texture_"))
-            .filter(|line| {
-                !blit
-                    .iter()
-                    .any(|binding| line.starts_with(&format!("@group(0) @binding({binding}) ")))
-            })
-            .count();
+
+        let shipped = declared_by_the_raymarch(VOLUME_SHADER_WGSL).expect("the shipped shader");
+        let with_blit = format!(
+            "{VOLUME_SHADER_WGSL}\n\
+             @group(0) @binding({BINDING_BLIT_TEXTURE}) var again: texture_2d<f32>;\n\
+             @group(0) @binding({BINDING_BLIT_SAMPLER}) var again_sampler: sampler;\n",
+        );
         assert_eq!(
-            declared as u32, REQUIRED_SAMPLED_TEXTURES,
-            "the raymarch declares {declared} textures and the probe asks the adapter for \
-             {REQUIRED_SAMPLED_TEXTURES}; an adapter between those two numbers passes this \
-             probe and then fails pipeline creation into the sink that panics",
+            declared_by_the_raymarch(&with_blit).expect("the blit's bindings still read"),
+            shipped,
+            "the blit's pair is being charged to the raymarch's layouts",
         );
     }
 

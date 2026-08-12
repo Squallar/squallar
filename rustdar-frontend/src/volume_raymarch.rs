@@ -1369,7 +1369,7 @@ impl VolumeTextures {
     /// GPU texture bytes this upload occupies: the grid at the levels it was
     /// actually given, plus its colour table.
     ///
-    /// The uniform buffer is left out — [`VOLUME_UNIFORM_BYTES`] is 192 bytes
+    /// The uniform buffer is left out — [`VOLUME_UNIFORM_BYTES`] is 224 bytes
     /// against tens of megabytes, and every budget in `constants` is written
     /// about textures. What this is for is
     /// `volume::bridge::VolumeResources::resident_bytes`, so that giving a
