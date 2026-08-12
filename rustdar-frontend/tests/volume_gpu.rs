@@ -2503,3 +2503,142 @@ fn both_upload_routes_paint_the_same_frame() {
          volume painted from a `write_texture` upload",
     );
 }
+
+/// The `grid_from_box` affine really crops, and the bounds flag really stops
+/// the sampler smearing the grid's rim across ground the radar never reported.
+///
+/// # Why this needs a GPU at all
+///
+/// The affine's *arithmetic* is pinned host-side (`volume::bridge`'s
+/// `the_drawn_box_is_the_one_asked_for_and_the_crop_finds_it_in_the_grid`), and
+/// that the shader carries the two expressions is pinned by a source scan
+/// (`volume::uniform`'s `a_fresh_uniform_draws_the_grid_in_its_own_box`).
+/// Neither can see whether the numbers reach the fetch. Deleting the
+/// transform's use inside `field_at` — sampling `p` where the uniform said
+/// `t` — leaves both green, leaves the picture a plausible-looking storm, and
+/// makes a zoomed pane draw its whole held grid stretched across the box it was
+/// asked for instead of the part of it that box actually contains.
+///
+/// Both halves are measured against the **identity** render rather than against
+/// absolute figures, so nothing here is pinned to a shape, a camera or a
+/// palette that another test also owns.
+///
+/// ```text
+/// cargo test -p rustdar-frontend --test volume_gpu \
+///     the_crop_magnifies_a_sub_box_and_answers_air_outside_the_grid \
+///     -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
+fn the_crop_magnifies_a_sub_box_and_answers_air_outside_the_grid() {
+    let _serialised = gpu_lock();
+    let size = [128u32, 128];
+    let cells = [16u32, 16, 16];
+    let n = (cells[0] * cells[1] * cells[2]) as usize;
+
+    let (device, queue) = device();
+    let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Bgra8Unorm));
+    pipelines.upload_quad(&queue);
+
+    // Opaque at every non-zero index, so alpha is a mask of what was fetched.
+    let mut lut = vec![0u8; VOLUME_LUT_BYTES];
+    for entry in 1..lut.len() / 4 {
+        lut[entry * 4..entry * 4 + 4].copy_from_slice(&[255, 255, 255, 255]);
+    }
+
+    // Looking down the vertical, so the painted count is the horizontal
+    // footprint the crop is about and the vertical axis stays out of it.
+    //
+    // The eye is a hundred box-heights back rather than `eye_outside`'s three,
+    // which makes the projection all but orthographic: at three, rays converge
+    // hard enough that the whole frame maps into the middle half of the box at
+    // its top face, and every fixture below would saturate at 16384 px whatever
+    // the affine did. Nearly parallel rays make the painted count a plain
+    // measure of the footprint, so the ratios asserted are the areas they read
+    // as.
+    let mut uniform = VolumeUniform::new([10.0, 10.0, 10.0], cells);
+    uniform.box_from_clip = box_from_clip_down(2);
+    uniform.eye_in_box = [0.5, 0.5, 100.0];
+    uniform.extinction_per_km = 1000.0;
+    uniform.gradient_shading = false;
+
+    let painted = |indices: &[u8], uniform: &VolumeUniform| {
+        raymarch_once(
+            &device, &queue, &pipelines, cells, indices, &lut, uniform, size,
+        )
+        .iter()
+        .filter(|px| px[3] > 0)
+        .count()
+    };
+
+    // --- Zooming in: the drawn box is the middle half of the grid ---------
+    //
+    // Data in cells 4..12 on both horizontal axes — exactly the half the
+    // affine below selects — so at the identity it covers a quarter of the
+    // footprint and through the crop it covers all of it.
+    let mut middle = vec![0u8; n];
+    for z in 0..cells[2] {
+        for y in 4..12 {
+            for x in 4..12 {
+                middle[((z * cells[1] + y) * cells[0] + x) as usize] = 255;
+            }
+        }
+    }
+    let whole = painted(&middle, &uniform);
+
+    let mut cropped = uniform;
+    cropped.grid_from_box_scale = [0.5, 0.5, 1.0];
+    cropped.grid_from_box_offset = [0.25, 0.25, 0.0];
+    let magnified = painted(&middle, &cropped);
+    println!(
+        "crop: the middle half of the grid paints {whole} px drawn whole, \
+         {magnified} px drawn as the box"
+    );
+
+    assert!(whole > 0, "precondition: the block paints at all");
+    assert!(
+        magnified > whole * 2,
+        "the middle-half block paints {magnified} px through an affine that \
+         makes it the whole box, against {whole} px drawn whole — it should be \
+         about four times the area. The fetch is not going through \
+         `grid_coord`, so a zoomed pane draws its held grid stretched across \
+         the requested box instead of cropped to it",
+    );
+
+    // --- Zooming out: the drawn box reaches past the grid ------------------
+    //
+    // Every cell filled, so what lies outside the grid is the only thing that
+    // can differ: clamped, the rim texels paint the whole box; answered as
+    // air, only the middle quarter paints.
+    let full = vec![255u8; n];
+    let identity = painted(&full, &uniform);
+
+    let mut outward = uniform;
+    outward.grid_from_box_scale = [2.0, 2.0, 1.0];
+    outward.grid_from_box_offset = [-0.5, -0.5, 0.0];
+    outward.grid_bounded = true;
+    let honest = painted(&full, &outward);
+
+    outward.grid_bounded = false;
+    let smeared = painted(&full, &outward);
+    println!(
+        "bounds: a full grid drawn in a box twice its width paints {honest} px \
+         bounded, {smeared} px clamped, against {identity} px at the identity"
+    );
+
+    assert!(
+        honest < identity / 2,
+        "a full grid drawn into a box twice its width paints {honest} px \
+         against {identity} at the identity; it covers a quarter of that box \
+         and should paint about a quarter. The affine is not reaching the \
+         fetch",
+    );
+    assert!(
+        smeared > honest,
+        "clamped and bounded paint the same {honest} px, so the bounds test is \
+         not doing anything — either the flag is ignored or the sampler is not \
+         clamping. Its whole job is that the ground outside a held grid reads \
+         as air and not as that grid's rim, which would be the picture claiming \
+         weather nobody measured",
+    );
+}
