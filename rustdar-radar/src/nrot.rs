@@ -2354,8 +2354,16 @@ fn llsd_nrot(
     // The cut's own limit, read off the raw sweep: after the dealiaser has
     // run, a grid no longer folds at it.
     let limit = fold_limit_ms(sweep, sweep.vel_grid);
-    let texture = range_texture(dealiased, sweep, rows);
-    let texture_max = limit.map(|v| GK_MAX_TEXTURE_VNY_FRAC * v);
+    // The ceiling and the field it is applied to are one value, so the stage
+    // cannot run where nothing reads it. Without a limit there is no ceiling,
+    // and [`range_texture`] over a whole sweep would be answering a question
+    // no gate below asks.
+    let texture = limit.map(|v| {
+        (
+            GK_MAX_TEXTURE_VNY_FRAC * v,
+            range_texture(dealiased, sweep, rows),
+        )
+    });
     // The dealiaser asked this exact question first, of this exact grid: it
     // set the same ground aside before its first pass ran, from
     // `sweep.vel_grid`, at this `rows`, this `gate_interval_km` and this
@@ -2400,8 +2408,8 @@ fn llsd_nrot(
                     }
                     // Rotation is only reported over velocity the radar
                     // measured continuously along the beam.
-                    if let Some(max) = texture_max
-                        && texture[i][j] > max
+                    if let Some((max, tex)) = &texture
+                        && tex[i][j] > *max
                     {
                         return f64::NAN;
                     }
@@ -4902,6 +4910,57 @@ mod tests {
             bits(&got),
             bits(&unrefused),
             "and it refused ground an empty mask would have painted",
+        );
+    }
+
+    /// A sweep with no fold limit has no continuity ceiling either, and that
+    /// is why [`range_texture`] does not run on one.
+    ///
+    /// [`GK_MAX_TEXTURE_VNY_FRAC`] is a fraction *of the cut's own limit*, so
+    /// where [`fold_limit_ms`] abandons the pass there is no number to compare
+    /// a texture against and every gate passes the rule however rough it is.
+    /// The fixture is rough on purpose — ±2.5 m/s square wave in range, four
+    /// gates to the period, so the 0.5 km difference [`range_texture`]
+    /// measures is 5 m/s everywhere — and every gate of it still paints,
+    /// because 5.5 m/s peak is under [`crate::sampler::FOLD_LIMIT_FLOOR_MS`]
+    /// and the sweep therefore declares nothing this rule could be scaled to.
+    ///
+    /// So the stage is dead work there rather than cheap work, which is what
+    /// makes computing it beside its ceiling rather than before it a guard and
+    /// not a reordering.
+    #[test]
+    fn a_sweep_with_no_fold_limit_has_no_continuity_ceiling() {
+        let (n, gates) = (360usize, 400usize);
+        let azimuths = ring_azimuths(n);
+        let grid: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                let base = 3.0 * azimuths[i].to_radians().cos();
+                (0..gates)
+                    .map(|j| base + if (j % 4) < 2 { 2.5 } else { -2.5 })
+                    .collect()
+            })
+            .collect();
+        let vg = grid.clone();
+        let sweep = sweep_for(&vg, &azimuths, gates);
+        assert_eq!(
+            fold_limit_ms(&sweep, &grid),
+            None,
+            "the fixture must reach the arm this test is about",
+        );
+
+        let rows = sweep_rows(&sweep, n);
+        let texture = range_texture(&grid, &sweep, rows);
+        let coarsest = texture
+            .iter()
+            .flatten()
+            .filter(|v| !v.is_nan())
+            .fold(0.0f64, |a, &b| a.max(b));
+        assert!(coarsest > 4.0, "the fixture must be rough: {coarsest}");
+
+        let nrot = compute_nrot_grid_with_profile(&sweep, 0.5, None);
+        assert!(
+            nrot.iter().flatten().any(|v| !v.is_nan()),
+            "with no limit there is no ceiling, so roughness refuses nothing",
         );
     }
 
