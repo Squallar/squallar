@@ -90,7 +90,7 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          model, not the planet. Derived from the same figure by coincidence \
          of physics. Written as the expression and never as 8494.667 because \
          `volumetric::tests::golden_echo_tops_grid_is_pinned` is bit-exact on \
-         it (digest 0x4559ce366731e030, asserted there and four more times in \
+         it (digest 0x5385ddeb1814353b, asserted there and four more times in \
          `chunks`). Not `EARTH_RADIUS_KM * 4.0 / 3.0` for the same reason: \
          `beam::tests::the_shared_effective_earth_radius_is_bit_identical_to_\
          both_deleted_copies` pins this exact association.",

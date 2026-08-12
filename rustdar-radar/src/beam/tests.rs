@@ -285,7 +285,7 @@ fn the_beam_height_residual_depends_only_on_the_height() {
 /// domain the echo-tops cube evaluates it on (1-km cell centres × the
 /// tilt ladder, plus the ±half-beamwidth offsets `BeamHeights` uses).
 /// This is the fast, local guard for the same property the five pinned
-/// `0x4559ce366731e030` digests guard end to end.
+/// `0x5385ddeb1814353b` digests guard end to end.
 #[test]
 fn the_lifted_beam_height_is_bit_identical_to_the_one_volumetric_shipped() {
     // Verbatim from the pre-lift `volumetric::beam_height_km`, including
