@@ -184,6 +184,50 @@ pub struct VolumeUniform {
     /// `OrbitCamera::vertical_exaggeration`, whose floor is 1.
     pub vertical_exaggeration: f32,
     /// Voxels along each axis.
+    ///
+    /// # It is read as a BOX-space metric, and under a crop that is a lie —
+    /// deliberately
+    ///
+    /// Every consumer treats this as *cells per unit of box space*, never as
+    /// the texture's dimensions: `1 / grid_dims` is the gradient's
+    /// central-difference step as a fraction of the box, `length(direction *
+    /// grid_dims)` is the march's `cells_per_t`, and `volume::bridge`'s `largest_cell_km` on the
+    /// host divides `box_size_km` by it to pick the reconstruction level and to
+    /// decide whether the coarse mip is uploaded at all. The two readings
+    /// coincide exactly when the box **is** the grid, which was the only case
+    /// that existed before the stand-in crop.
+    ///
+    /// Under a crop they do not: the drawn box covers `grid_from_box_scale` of
+    /// the texture, so it spans `grid_dims * scale` cells, and every one of
+    /// those four quantities is off by that factor. The honest metric is
+    /// `grid_dims * grid_from_box_scale`.
+    ///
+    /// **It is not corrected, and the reason is measured rather than argued.**
+    /// Correcting it was tried and makes the artefact it would seem to fix
+    /// *worse*. A zoom from a 100 km box to a 25 km one on a real KTLX volume,
+    /// rendered through the crop and then again from the freshly built grid,
+    /// differs by a mean of 31.49/255 per pixel. With `grid_dims` corrected to
+    /// the cells the box really spans it differs by 31.49 as well at the plan
+    /// camera, by 28.43 against 28.38 with shading on, and by 3.68 against 3.22
+    /// from the side — further every time, in all three configurations,
+    /// including the two chosen so the lane could bite.
+    ///
+    /// The reason is that `cells_per_t` is not a correctness quantity but a
+    /// **sampling rate**, and the field is band-limited: marching a held grid
+    /// at the texture's full cell count oversamples it, which is harmless and
+    /// slightly more accurate, and it happens to march at the *same* rate the
+    /// fresh grid will — so the sample comb does not change across the swap.
+    /// The corrected metric would coarsen the held grid's comb by the scale
+    /// factor and make the comb jump at the swap, which is visible. The
+    /// diagnosis behind these numbers is that nothing translates at a swap
+    /// (best shift is (0,0), the centroid moves 0.15 px); what the user sees is
+    /// the picture *re-colouring in place*, and the comb is one of the two
+    /// things that amplify it.
+    ///
+    /// So the divergence stays, and this note is here because the obvious fix
+    /// is wrong and someone will otherwise make it. If a future change removes
+    /// the amplification — a Linear-sampled palette, or a march whose stride
+    /// does not come off the grid at all — re-measure before correcting.
     pub grid_dims: [u32; 3],
     /// Light direction in box space. Normalised by the shader.
     pub light_dir: [f32; 3],
