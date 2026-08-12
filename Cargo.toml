@@ -17,6 +17,12 @@ members = [
     # and they only run if `cargo test --workspace` selects them. See
     # vendor/nexrad-decode/VENDORED.md and `[patch.crates-io]` below.
     "vendor/nexrad-decode",
+    # The second vendored crates.io crate, a member for the same reason: its
+    # `malformed_records` and `error_handling` targets are the negative pin on
+    # `Record::decompress`, which is the function this copy exists to change,
+    # and they only run if `cargo test --workspace` selects them. See
+    # vendor/nexrad-data/VENDORED.md and `[patch.crates-io]` below.
+    "vendor/nexrad-data",
 ]
 
 [workspace.package]
@@ -139,8 +145,46 @@ rustls = { version = "=0.23.43", default-features = false, features = ["ring", "
 # Visible in Cargo.lock as the nexrad-decode entry losing its `source` and
 # `checksum` lines. `cargo tree -i nexrad-decode` must keep printing exactly
 # one node, and that node must name the path.
+# `Record::decompress` is the dominant cost of the whole decode path, and it is
+# unbounded.
+#
+# Measured over one volume: 7,807 M instructions retired for decompression
+# against 63 M for the entire nexrad-decode pass -- a 124x ratio -- and an
+# allocation amplification of 7.7x on a WSR-88D volume (344.9 MB allocated for
+# 76.3 MB of output) and 21x on a TDWR one. The mechanism is one `BzDecoder`
+# per LDM record, each of which allocates libbzip2's 3,600,000-byte `tt` array
+# for a `BZh9` stream, plus a `Vec::new()` grown by `read_to_end` from 32 bytes
+# through ~19 reallocations. It also explains peak RSS growing with core count:
+# at 32 threads a volume's 133 MB is 95-97% decompression.
+#
+# And `read_to_end` on a `BzDecoder` has no ceiling at all. Every byte reaching
+# it was downloaded from an S3 bucket, so a corrupt or hostile record is an
+# out-of-memory abort with nothing in between. That one is why this directory
+# exists; the allocation work is why it pays for itself. VENDORED.md carries
+# the numbers, the bound and its derivation, and the PR placeholder.
+#
+# Vendored rather than forked because a git dependency would put this
+# workspace's build on somebody's branch surviving; vendored rather than
+# pinned-and-waited because 1.0.0-rc.7 is the newest published version.
+#
+# `[patch]` and not a direct path dependency, for the same reason as
+# nexrad-decode above and one more. nexrad-data is reached from four crates
+# here, and a path dependency would leave the registry copy in the graph for
+# anything that still resolved it by version -- including, awkwardly, whatever
+# nexrad-decode's own dev-dependencies pull. Patching the source redirects
+# every path to one crate. `[workspace.dependencies]` keeps its exact
+# `=1.0.0-rc.7` pin and the vendored `package.version` stays exactly
+# `1.0.0-rc.7` (no `+local` metadata), because a patch is only accepted for a
+# version that satisfies the requirement it replaces.
+#
+# The two patches interact: nexrad-data depends on nexrad-decode with a caret
+# requirement, so the vendored nexrad-data resolves to the vendored
+# nexrad-decode and there is still exactly one of each. `cargo tree -i
+# nexrad-decode` and `cargo tree -i nexrad-data` must each keep printing one
+# node, and both nodes must name a path.
 [patch.crates-io]
 nexrad-decode = { path = "vendor/nexrad-decode" }
+nexrad-data = { path = "vendor/nexrad-data" }
 
 # File and line in every frame, and nothing beyond it. A backtrace, a panic
 # location and a `#[track_caller]` frame are all line-table lookups, so each
@@ -188,6 +232,15 @@ opt-level = 2
 #
 # Delete this together with the `[patch.crates-io]` entry above.
 [profile.dev.package.nexrad-decode]
+opt-level = 2
+
+# Same story, and if anything more so: `Record::decompress` is where a dev run
+# spends most of its decode, and at opt-level 0 the bzip2 inner loop is not a
+# hot loop, it is a stall. Naming it here puts it back where it was as a plain
+# dependency.
+#
+# Delete this together with the `[patch.crates-io]` entry above.
+[profile.dev.package.nexrad-data]
 opt-level = 2
 
 [profile.release]
