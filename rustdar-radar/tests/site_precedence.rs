@@ -1,11 +1,17 @@
-//! **The precedence is the design**: `Volume > Learned > Network > Seed`.
+//! **The precedence is the design**: `Volume > Learned > Network > Unplaced`.
 //!
-//! Four sources can say where a radar is, and they disagree. The volume in hand
+//! Four sources can speak about a radar, and they disagree. The volume in hand
 //! is the radar reporting itself; a learned position is the same radar
 //! reporting itself in an earlier session; the network catalogue is a published
-//! record *about* the radar; the compiled-in seed is a snapshot of that record
-//! on the day the binary was built. The ordering is not a preference — it is
-//! how close each source sits to the instrument.
+//! record *about* the radar; a bucket listing is the bare fact that the radar
+//! exists. The ordering is not a preference — it is how close each source sits
+//! to the instrument.
+//!
+//! There used to be a fifth rung under all of these, a compiled-in table of
+//! the network as it stood on the day the binary was built. Deleting it
+//! removed the bottom of the ladder rather than reordering what is left: a
+//! radar no source speaks for is now a radar the process has never heard of,
+//! and that is the row this file ends on.
 //!
 //! One table rather than a test per pair, because an ordering asserted one pair
 //! at a time is an ordering nobody has checked. Every row uses the same
@@ -14,13 +20,17 @@
 //!
 //! # Why this is its own integration test binary
 //!
-//! `sites::resolve` sets a process-wide table, and this file resolves one with
-//! fixes for *seeded* identifiers — `KTLX`, `KRAX` — which moves rows every
-//! other test in the crate reads. An integration test file is its own process,
-//! so that stays contained here. It is also the only way to exercise the thing
-//! under test: the free functions `get_radar_site` and `radars` read the table
-//! the process resolved, which is what the map marker, the site list and the
-//! section's height datum all walk.
+//! `sites::resolve` sets a process-wide table, and this file resolves one and
+//! then moves rows inside it, which no sibling test could tolerate. An
+//! integration test file is its own process, so that stays contained here. It
+//! is also the only way to exercise the thing under test: the free functions
+//! `get_radar_site` and `radars` read the table the process resolved, which is
+//! what the map marker, the site list and the section's height datum all walk.
+//!
+//! Every identifier below is one this file placed itself. None of them is a
+//! real ICAO, and that is deliberate: with nothing compiled in, a test that
+//! named `KTLX` would be asserting against whatever another test had said
+//! about `KTLX`, which is a test that passes for the wrong reason.
 
 use nexrad_model::data::{PulseWidth, Scan, VolumeCoveragePattern};
 use rustdar_radar::site_position::{SitePosition, SitePositionSource};
@@ -112,38 +122,47 @@ fn silent_scan() -> Scan {
 /// comparing these, so a variant reordering would silently invert the whole
 /// ladder while every structural test still passed.
 #[test]
-fn a_learned_fix_outranks_a_network_one() {
+fn the_ranks_descend_learned_network_unplaced() {
     let _gate = serialized();
     assert!(SiteFixRank::Learned < SiteFixRank::Network);
+    assert!(SiteFixRank::Network < SiteFixRank::Unplaced);
     assert_eq!(SiteFix::Learned(learned()).rank(), SiteFixRank::Learned);
     assert_eq!(network().rank(), SiteFixRank::Network);
+    assert_eq!(SiteFix::Unplaced.rank(), SiteFixRank::Unplaced);
 }
 
 /// The whole ladder, in one resolution.
 ///
-/// The fixes are supplied **network-first** on purpose. A resolution that
+/// The fixes are supplied **weakest-first** on purpose. A resolution that
 /// simply applied them in order — or that let the last one win — would put the
-/// fetched position on `KTLX` and `ZZPY`, and this is the row that catches it.
+/// bare listing on `ZZPV` and the fetched position on `ZZPT` and `ZZPY`, and
+/// this is the row that catches it.
+///
+/// `ZZPU` is the rung that replaced the seed: a radar every source is silent
+/// about. It used to resolve to a compiled-in row; it now resolves to nothing
+/// at all, and that is the deletion stated as a behaviour.
 #[test]
-fn the_precedence_is_volume_learned_network_seed() {
+fn the_precedence_is_volume_learned_network_unplaced() {
     let _gate = serialized();
-    // Seed rows, read before anything is resolved: after the resolution the
-    // table no longer holds them, which is the point of two of the rows below.
-    let seeded_ktlx = sites::get_radar_site("KTLX").expect("a seed row").clone();
-    let seeded_kabr = sites::get_radar_site("KABR").expect("a seed row").clone();
-    assert!(
-        sites::get_radar_site("ZZPX").is_none() && sites::get_radar_site("ZZPY").is_none(),
-        "precondition: the two arrivals must not be seed rows",
-    );
+    for site in ["ZZPT", "ZZPX", "ZZPY", "ZZPU", "ZZPV"] {
+        assert!(
+            !sites::knows_site(site),
+            "precondition: {site} must be unknown, or this proves nothing",
+        );
+    }
 
     sites::resolve([
-        // Network first, and for every identifier.
-        ("KTLX", network()),
-        ("KRAX", network()),
+        // Bare membership first, and for every identifier that will be placed.
+        ("ZZPT", SiteFix::Unplaced),
+        ("ZZPX", SiteFix::Unplaced),
+        ("ZZPY", SiteFix::Unplaced),
+        ("ZZPV", SiteFix::Unplaced),
+        // Then the fetched positions.
+        ("ZZPT", network()),
         ("ZZPX", network()),
         ("ZZPY", network()),
-        // Then the learned fixes, for two of them.
-        ("KTLX", SiteFix::Learned(learned())),
+        // Then the learned ones, for two of them.
+        ("ZZPT", SiteFix::Learned(learned())),
         ("ZZPY", SiteFix::Learned(learned())),
     ]);
 
@@ -152,26 +171,16 @@ fn the_precedence_is_volume_learned_network_seed() {
     for (case, site, want_lat) in [
         (
             "a learned position outranks a fetched one",
-            "KTLX",
+            "ZZPT",
             f64::from(LEARNED_LAT_UDEG) / 1e6,
         ),
         (
-            "a fetched position outranks the seed",
-            "KRAX",
-            f64::from(NETWORK_LAT_UDEG) / 1e6,
-        ),
-        (
-            "the seed is what is left when nothing was fetched or learned",
-            "KABR",
-            seeded_kabr.lat,
-        ),
-        (
-            "a radar the seed never had, placed by the catalogue",
+            "a fetched position outranks bare membership",
             "ZZPX",
             f64::from(NETWORK_LAT_UDEG) / 1e6,
         ),
         (
-            "a radar the seed never had, and learned beats fetched there too",
+            "and learned beats fetched wherever both speak",
             "ZZPY",
             f64::from(LEARNED_LAT_UDEG) / 1e6,
         ),
@@ -180,13 +189,24 @@ fn the_precedence_is_volume_learned_network_seed() {
             sites::get_radar_site(site).unwrap_or_else(|| panic!("{case}: {site} is missing"));
         assert_eq!(row.lat, want_lat, "{case}");
         assert_eq!(row.name, site, "{case}: a row must carry its own ICAO");
+        assert!(
+            !sites::unplaced().contains(&site),
+            "{case}: and a placed radar is not also a bare member",
+        );
     }
 
-    assert_ne!(
-        sites::get_radar_site("KTLX").expect("still a row").lat,
-        seeded_ktlx.lat,
-        "a fix must be able to move a seeded row: stage 4 deletes the seed, \
-         and that has to be a deletion rather than a behaviour change",
+    // Bare membership is what is left when nothing carries a position.
+    assert!(
+        sites::get_radar_site("ZZPV").is_none(),
+        "a listing with no position must not become a row",
+    );
+    assert!(sites::unplaced().contains(&"ZZPV"), "it is still a member");
+
+    // And the rung the seed used to occupy: nothing.
+    assert!(
+        !sites::knows_site("ZZPU"),
+        "a radar no source spoke for is one this process has never heard of; \
+         a compiled-in table would answer here and there is none",
     );
 
     // And what `ScanInfo::from_scan` says, which is the rung above the table.
@@ -220,31 +240,41 @@ fn the_precedence_is_volume_learned_network_seed() {
             SitePositionSource::Table,
         ),
     ] {
-        let info = ScanInfo::from_scan(&scan, "KTLX", at(), memo);
+        let info = ScanInfo::from_scan(&scan, "ZZPT", at(), memo);
         assert_eq!(info.site.lat, want_lat, "{case}");
         assert_eq!(info.site_source, want_source, "{case}");
     }
+
+    // The bottom of the ladder, through the same call: a silent volume for a
+    // radar nothing has placed has no position at all. This used to be
+    // unreachable for any real ICAO, because the seed placed all of them.
+    let orphan = ScanInfo::from_scan(&silent_scan(), "ZZPU", at(), None);
+    assert_eq!(orphan.site_source, SitePositionSource::Unknown);
 }
 
-/// A fetched elevation must not take a seeded row's base datum away.
+/// A fetched elevation must not take a learned row's base datum away.
 ///
 /// The catalogue has *one* height where a Volume Data Block has two, so a fix
 /// that overwrote heights the way it overwrites position would turn every
 /// `BaseAndTower` row into a `FeedhornOnly` one — and every
-/// [`Datum::SiteBase`] query in the process would start answering `None` the
+/// [`Datum::SiteBase`] query about that radar would start answering `None` the
 /// first time a catalogue landed. Position and heights come from different
 /// places and are allowed to move independently.
+///
+/// The row it lands on is one this test learned, because a learned volume is
+/// now the only thing that ever separates a base from a tower.
 #[test]
 fn a_fetched_position_moves_a_row_without_taking_its_base_datum() {
     let _gate = serialized();
-    let seeded = sites::get_radar_site("KDDC").expect("a seed row").clone();
-    let base = seeded
+    sites::resolve([("ZZPS", SiteFix::Learned(learned()))]);
+    let known = sites::get_radar_site("ZZPS").expect("this test learned it").clone();
+    let base = known
         .height_ft(Datum::SiteBase)
-        .expect("a seeded WSR-88D records both datums");
+        .expect("a learned WSR-88D records both datums");
 
-    sites::resolve([("KDDC", network())]);
+    sites::resolve([("ZZPS", network())]);
 
-    let row = sites::get_radar_site("KDDC").expect("still a row");
+    let row = sites::get_radar_site("ZZPS").expect("still a row");
     assert_eq!(
         row.lat,
         f64::from(NETWORK_LAT_UDEG) / 1e6,
@@ -258,17 +288,17 @@ fn a_fetched_position_moves_a_row_without_taking_its_base_datum() {
     );
     assert_eq!(
         row.height_ft(Datum::Feedhorn),
-        seeded.height_ft(Datum::Feedhorn)
+        known.height_ft(Datum::Feedhorn)
     );
 }
 
-/// A radar the seed never had still records an elevation, from the catalogue.
+/// A radar only the catalogue knows still records an elevation.
 ///
 /// The counterweight to the test above: keeping `known` must not become
 /// "never write heights". A row with none anchors a cross-section at sea level,
 /// which reads as a measurement rather than as a gap.
 #[test]
-fn an_arrival_the_seed_never_had_takes_the_catalogue_elevation() {
+fn an_arrival_only_the_catalogue_knows_takes_its_elevation() {
     let _gate = serialized();
     sites::resolve([("ZZPZ", network())]);
 
@@ -296,7 +326,7 @@ fn an_arrival_the_seed_never_had_takes_the_catalogue_elevation() {
 #[test]
 fn a_second_resolution_with_the_same_catalogue_reuses_the_table() {
     let _gate = serialized();
-    let fixes = || [("ZZPW", network()), ("KGLD", network())];
+    let fixes = || [("ZZPW", network()), ("ZZPR", network())];
 
     let first = sites::resolve(fixes());
     let second = sites::resolve(fixes());
