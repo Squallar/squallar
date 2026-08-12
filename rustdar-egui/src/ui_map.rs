@@ -2086,7 +2086,7 @@ fn volume_pane_outcome(
         view_mode,
         iso_threshold: iso_thresholds.get(product),
     }) {
-        VolumePaint::Callback(callback) => {
+        VolumePaint::Callback { payload, showing } => {
             // Hand-constructed, because `egui_wgpu::Callback` has a private
             // field and its only constructor wants the rect up front — so a
             // crate that cannot name `egui_wgpu` cannot make one. Both of
@@ -2095,7 +2095,7 @@ fn volume_pane_outcome(
             ui.painter()
                 .add(egui::Shape::Callback(egui::epaint::PaintCallback {
                     rect: pane_rect,
-                    callback,
+                    callback: payload,
                 }));
             // Over the callback, and only when there is a picture to caption: an
             // empty state already says everything, and a caption under it would
@@ -2117,7 +2117,14 @@ fn volume_pane_outcome(
                 ui,
                 pane_rect,
                 crate::ui::pills::pill_row_clearance(ui.ctx(), pane_idx),
-                &volume_caption(&site_code, collected, base_started, half_width_km, camera),
+                &volume_caption(
+                    &site_code,
+                    collected,
+                    base_started,
+                    half_width_km,
+                    camera,
+                    showing,
+                ),
             );
             None
         }
@@ -2538,7 +2545,19 @@ const KFT_PER_KM: f64 = 3.280_84;
 /// resolved number is what keeps this caption from being the one place that
 /// says a box size nothing resampled.
 ///
-/// A pure function of five values so that what the pane claims can be tested
+/// # Why the resolution line is told what is on screen
+///
+/// The box the pane names is the box it is drawing, always: a zoom retargets
+/// the viewport and the renderer frames the new box on that very frame. The
+/// **resolution** is a different claim. For the ~140 ms a rebuild takes, what
+/// is on screen is the grid the pane already had, drawn into the new box — so
+/// the picture is the right ground at the wrong sharpness, and possibly not
+/// reaching the box's edges if the zoom was outwards. Reading the cell size off
+/// the requested region alone would claim a sharpness that is not there, and
+/// the whole licence for painting a held grid at all is that the caption stays
+/// honest about it. [`crate::volume_view::Showing`] is that report.
+///
+/// A pure function of six values so that what the pane claims can be tested
 /// without a GPU, a projector or a frame.
 fn volume_caption(
     site: &str,
@@ -2546,6 +2565,7 @@ fn volume_caption(
     base_started: Option<chrono::NaiveDateTime>,
     half_width_km: f64,
     camera: crate::pane::OrbitCamera,
+    showing: crate::volume_view::Showing,
 ) -> Vec<String> {
     let mut lines = vec![format!(
         "{site} volume - newest data {}Z",
@@ -2567,14 +2587,30 @@ fn volume_caption(
     ));
 
     let cells = rustdar_radar::voxel::default_shape().nx;
-    match crate::pane::resolution_km(half_width_km, cells) {
-        Some(km) => lines.push(format!(
-            "{:.0} km box - {km:.2} km/cell",
-            2.0 * half_width_km
+    let across = 2.0 * half_width_km;
+    match (
+        showing.stale.then_some(showing.cell_km).flatten(),
+        crate::pane::resolution_km(half_width_km, cells),
+    ) {
+        // Standing in: the cell size on screen is the held grid's, not the one
+        // this box would buy, and the line says which and that a sharper one is
+        // coming. `partial` is the zoom-*out* case, where the held grid does not
+        // reach the new box's edges — the picture is real data in the middle and
+        // nothing outside it, and a caption that did not say so would be read as
+        // "the storm ends there".
+        (Some(shown), _) if showing.partial => lines.push(format!(
+            "{across:.0} km box - {shown:.2} km/cell over the middle, filling in",
         )),
+        (Some(shown), Some(km)) => lines.push(format!(
+            "{across:.0} km box - {shown:.2} km/cell, sharpening to {km:.2}",
+        )),
+        (Some(shown), None) => lines.push(format!(
+            "{across:.0} km box - {shown:.2} km/cell, sharpening",
+        )),
+        (None, Some(km)) => lines.push(format!("{across:.0} km box - {km:.2} km/cell")),
         // A zero cell count is impossible for every named shape, and a caption is
         // not the place to fail over it.
-        None => lines.push(format!("{:.0} km box", 2.0 * half_width_km)),
+        (None, None) => lines.push(format!("{across:.0} km box")),
     }
     lines
 }

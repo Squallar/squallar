@@ -294,10 +294,52 @@ pub struct VolumeFrameState {
 /// machine. A 3D pane that draws an empty box says nothing; one that says *why*
 /// the box is empty is the difference between a feature and a bug report.
 pub enum VolumePaint {
-    /// Draw this. Opaque here on purpose — see the module doc.
-    Callback(Arc<dyn Any + Send + Sync>),
+    /// Draw this. The payload is opaque here on purpose — see the module doc —
+    /// but what it is a picture *of* is not, because the caption has to say so.
+    Callback {
+        payload: Arc<dyn Any + Send + Sync>,
+        showing: Showing,
+    },
     /// Nothing to draw, and why not, in a sentence fit for the pane's centre.
     Empty(String),
+}
+
+/// What a [`VolumePaint::Callback`] is a picture of — the two facts a caption
+/// cannot get right from the pane's own state.
+///
+/// # Why the caption needs telling
+///
+/// A zoom retargets the pane's box, and the grid for the new box takes ~140 ms
+/// to build. Through that wait the pane draws the grid it already has, in the
+/// box the user just asked for; the box is therefore the requested one and the
+/// caption's "N km box" stays true, but the **resolution** is the old grid's
+/// and the coverage may not reach the box's edges. A caption that read both
+/// off the requested region alone would claim a sharpness the picture does not
+/// have, which is the one thing the stand-in is not allowed to do: the picture
+/// may lag, the caption may not lie.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Showing {
+    /// Kilometres across one cell of the grid actually on screen, or `None`
+    /// when the grid has no horizontal extent to divide (impossible for a
+    /// built grid; answered rather than unwrapped because a caption is not a
+    /// place to panic).
+    pub cell_km: Option<f32>,
+    /// The grid on screen was built for a different box, and a build for the
+    /// box the pane asked for has not landed yet.
+    pub stale: bool,
+    /// The grid does not reach the edges of the drawn box: real data in the
+    /// middle and nothing outside it. Only ever true alongside `stale`, and
+    /// only when the zoom was *outwards*.
+    pub partial: bool,
+}
+
+impl Showing {
+    /// The grid on screen is the one the pane asked for.
+    pub const SETTLED: Self = Self {
+        cell_km: None,
+        stale: false,
+        partial: false,
+    };
 }
 
 /// Something that can turn a 3D pane's state into a paint callback.
@@ -795,6 +837,8 @@ fn normalize(v: [f32; 3]) -> Option<[f32; 3]> {
 pub(crate) struct StubVolumePainter {
     /// What every call answers with.
     pub(crate) answer_empty: Option<String>,
+    /// What every painting call claims to be a picture of.
+    pub(crate) answer_showing: Showing,
     /// Every frame this painter has been asked about, in call order.
     pub(crate) seen: std::sync::Mutex<Vec<VolumeFrameState>>,
 }
@@ -804,6 +848,17 @@ impl StubVolumePainter {
     pub(crate) fn painting() -> Self {
         Self {
             answer_empty: None,
+            answer_showing: Showing::SETTLED,
+            seen: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Painting, but standing in for a build that has not landed — the state a
+    /// pane is in for the frames just after a zoom.
+    pub(crate) fn standing_in(showing: Showing) -> Self {
+        Self {
+            answer_empty: None,
+            answer_showing: showing,
             seen: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -811,6 +866,7 @@ impl StubVolumePainter {
     pub(crate) fn empty(why: &str) -> Self {
         Self {
             answer_empty: Some(why.to_owned()),
+            answer_showing: Showing::SETTLED,
             seen: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -825,7 +881,10 @@ impl VolumePainter for StubVolumePainter {
             .push(frame.clone());
         match &self.answer_empty {
             Some(why) => VolumePaint::Empty(why.clone()),
-            None => VolumePaint::Callback(Arc::new(StubPayload)),
+            None => VolumePaint::Callback {
+                payload: Arc::new(StubPayload),
+                showing: self.answer_showing,
+            },
         }
     }
 }

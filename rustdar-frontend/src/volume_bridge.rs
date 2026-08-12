@@ -513,6 +513,18 @@ impl StoredVolume {
 pub struct VolumeLookup {
     pub id: u64,
     pub entry: VolumeEntry,
+    /// This is not the target's own entry — it is a grid the pane was already
+    /// holding, standing in while the build for `target` is in flight.
+    ///
+    /// Told rather than inferred. The caller could compare the grid's box
+    /// against the target's and guess, and it would be right almost always and
+    /// silently wrong for a target whose box the caller cannot compute (a
+    /// `None` region, whose width is the volume's own reach and needs the
+    /// scan). A stand-in that a caller mistook for the real answer would be
+    /// drawn in the wrong box under a caption claiming it was the right one,
+    /// which is the one lie the swap must never tell — so the store, which
+    /// knows, says.
+    pub stood_in: bool,
 }
 
 impl VolumeStore {
@@ -870,20 +882,23 @@ impl VolumeStore {
             .map(|e| VolumeLookup {
                 id: e.id,
                 entry: e.entry.clone(),
+                stood_in: false,
             })
     }
 
     /// What pane `pane_idx` should paint for `target`: the target's own entry
     /// when it is resolved, else the newest same-scope grid the pane still
-    /// holds — the old picture, painted through a rebuild.
+    /// holds — the old picture, painted through a rebuild, and flagged
+    /// [`VolumeLookup::stood_in`] so the caller draws it in the box that was
+    /// asked for rather than in the one it was built over.
     ///
     /// `None` while nothing is paintable at all, which the painter renders as
-    /// the first-build message. The fallback is scoped to the same site,
-    /// product and region on purpose: after a site or product switch the old
-    /// grid answers a question nobody is asking, and painting it with a
-    /// caption describing the new target would be the lie the swap must never
-    /// tell. Newest-first because a pane can transiently hold two resolved
-    /// grids and the later build is the newer picture.
+    /// the first-build message. The fallback is scoped to the same site and
+    /// product on purpose: after a site or product switch the old grid answers
+    /// a question nobody is asking, and painting it with a caption describing
+    /// the new target would be the lie the swap must never tell. Newest-first
+    /// because a pane can transiently hold two resolved grids and the later
+    /// build is the newer picture.
     pub fn lookup_for_pane(&self, pane_idx: usize, target: &VolumeTarget) -> Option<VolumeLookup> {
         let inner = self.lock();
         if let Some(found) = inner
@@ -894,6 +909,7 @@ impl VolumeStore {
             return Some(VolumeLookup {
                 id: found.id,
                 entry: found.entry.clone(),
+                stood_in: false,
             });
         }
         // The `same_scope` clause is **belt and braces, and no test can see
@@ -926,6 +942,7 @@ impl VolumeStore {
             .map(|e| VolumeLookup {
                 id: e.id,
                 entry: e.entry.clone(),
+                stood_in: true,
             })
     }
 
@@ -1023,12 +1040,30 @@ impl StoreInner {
     }
 }
 
-/// Whether two targets differ only in their volume stamp — the same site,
-/// moment and region, at two data times. The seamless swap is licensed exactly
-/// this far: an older picture of the *same question* may stand in while a
-/// newer one builds, and nothing else may.
+/// Whether an entry built for `a` may stand in for `b` — the same radar and
+/// the same moment, at another data time **or over another patch of ground**.
+/// The seamless swap is licensed exactly this far, and nothing else may.
+///
+/// # Why the region is not part of it
+///
+/// It was, and that is what made zooming take the view away. The region is the
+/// pane's own viewport, so every scroll names a new target, and a target
+/// scoped away from the grid in hand meant the pane blanked to "Building…" for
+/// the ~140 ms it takes to resample and upload the new box — on a gesture the
+/// user expects to be continuous, and over a floor that was already following
+/// the viewport in real time, so the effect read as the data falling off a
+/// moving ground.
+///
+/// The reason it was excluded is real and is answered rather than dropped: a
+/// grid over one patch of ground painted under a caption naming another would
+/// be a lie. So the picture is not painted where the grid is — it is painted
+/// in the box the pane asked for, with the held grid fetched through an affine
+/// ([`DrawnBox`]), and the caption says what resolution that picture actually
+/// has ([`rustdar_egui::volume_view::Showing`]). What must still never stand in
+/// is another *radar* or another *product*: no transform can make one of those
+/// into an answer to the question being asked, which is why those two stay.
 fn same_scope(a: &VolumeTarget, b: &VolumeTarget) -> bool {
-    a.volume.site == b.volume.site && a.product == b.product && a.region == b.region
+    a.volume.site == b.volume.site && a.product == b.product
 }
 
 /// The painter a `Gui` is handed. Turns a pane's frame state into a payload
@@ -1134,8 +1169,9 @@ impl VolumePainter for BridgeVolumePainter {
 
         // Through the pane-scoped lookup, which is the seamless swap: while a
         // rebuild for this target is in flight, the pane's previous grid of
-        // the same site, moment and region answers, so a live volume updating
-        // every sealed sweep repaints rather than flashing "Building…".
+        // the same site and product answers, so a live volume updating every
+        // sealed sweep — or a box the user has just zoomed — repaints rather
+        // than flashing "Building…".
         let Some(found) = self.store.lookup_for_pane(frame.pane_idx, &frame.target) else {
             // Nothing paintable at all — the very first build, or a hard
             // retarget with nothing old worth showing.
@@ -1144,8 +1180,8 @@ impl VolumePainter for BridgeVolumePainter {
                 frame.target.product.code(),
             ));
         };
-        let grid = match found.entry {
-            VolumeEntry::Ready(grid) => grid,
+        let grid = match &found.entry {
+            VolumeEntry::Ready(grid) => Arc::clone(grid),
             // Unreachable through `lookup_for_pane`, which never answers with
             // a `Building` entry — but the enum says it can, so the honest
             // fallback is the same first-build message.
@@ -1155,7 +1191,7 @@ impl VolumePainter for BridgeVolumePainter {
                     frame.target.product.code(),
                 ));
             }
-            VolumeEntry::Refused(why) => return VolumePaint::Empty(why),
+            VolumeEntry::Refused(why) => return VolumePaint::Empty(why.clone()),
         };
 
         // On the tilt *count*, never on "the index plane is all no-data".
@@ -1183,7 +1219,22 @@ impl VolumePainter for BridgeVolumePainter {
         }
 
         let fitted = self.quality.fit_to_budget(frame.size_px);
-        let box_size_km = box_size_km(&grid);
+        // The box the pane asked for, which is the grid's own whenever the
+        // build for it has landed. While it has not, this is what makes the
+        // zoom immediate: the camera frames the new box and the floor is
+        // registered to it on the very frame the wheel turned, and the held
+        // grid is fetched through an affine rather than blanked. See
+        // `DrawnBox`.
+        let Some(drawn) = DrawnBox::for_lookup(&found, &frame.target, &grid) else {
+            // A stand-in whose target's box cannot be placed — see
+            // `DrawnBox::for_target`. Blank rather than draw a picture over
+            // ground it is not over.
+            return VolumePaint::Empty(format!(
+                "Building the {} volume...",
+                frame.target.product.code(),
+            ));
+        };
+        let box_size_km = drawn.size_km();
         let aspect = fitted.size[0] as f32 / fitted.size[1] as f32;
         let Some(view) = view_for(frame.camera, box_size_km, aspect) else {
             // Reached by a pane collapsed to nothing by a divider drag, and by a
@@ -1199,6 +1250,11 @@ impl VolumePainter for BridgeVolumePainter {
         );
         uniform.box_from_clip = view.box_from_clip;
         uniform.eye_in_box = view.eye_in_box;
+        // Where the drawn box's unit cube sits in the grid. The identity while
+        // nothing is pending, which is a multiply by one and an add of zero.
+        uniform.grid_from_box_scale = drawn.scale;
+        uniform.grid_from_box_offset = drawn.offset;
+        uniform.grid_bounded = drawn.bounded;
         // The stretch the pane is drawn at, for the shading's normals only —
         // `OrbitCamera` floors it at 1, which is what licenses the shader to
         // divide by it unguarded.
@@ -1335,8 +1391,16 @@ impl VolumePainter for BridgeVolumePainter {
                 // of the site — its *position*, which `box_size_km` does not
                 // carry. The shader measures its reprojection from the site,
                 // so these are what turn a unit-cube coordinate into ground.
-                west_km: grid.x_range_km().0 as f32,
-                south_km: grid.y_range_km().0 as f32,
+                //
+                // The **drawn** box, not the grid's: the mirror is the pane's
+                // own map at the zoom the user has reached this frame, and the
+                // floor covers the drawn box by construction only if it is
+                // registered to the same box the camera is framing. Registered
+                // to a held grid's older, wider box instead, everything past
+                // the viewport's edge would fall outside the mirror and the
+                // ground would visibly eat itself inwards as the user scrolled.
+                west_km: drawn.x_km.0 as f32,
+                south_km: drawn.y_km.0 as f32,
                 mirror_size_points: frame.mirror_size_points,
             }
         });
@@ -1358,6 +1422,15 @@ impl VolumePainter for BridgeVolumePainter {
             }
         }
 
+        // What the caption is allowed to claim. The box it names is the drawn
+        // one and is therefore true either way; what it must not do is report
+        // the *requested* box's cell size while a coarser grid is on screen.
+        let showing = rustdar_egui::volume_view::Showing {
+            cell_km: cell_km(&grid),
+            stale: found.stood_in,
+            partial: drawn.bounded,
+        };
+
         let callback = VolumeCallback {
             pane_idx: frame.pane_idx,
             grid_id: found.id,
@@ -1371,7 +1444,10 @@ impl VolumePainter for BridgeVolumePainter {
             live_ids: self.store.live_ids(),
         };
 
-        VolumePaint::Callback(paint_payload(callback))
+        VolumePaint::Callback {
+            payload: paint_payload(callback),
+            showing,
+        }
     }
 
     /// The grid's own colour table, for the Volume Alpha editor's palette
@@ -1386,14 +1462,21 @@ impl VolumePainter for BridgeVolumePainter {
     }
 
     /// Through the same pane-scoped lookup [`Self::paint`] uses, and through
-    /// the same [`box_size_km`] it hands the uniform — so the box the pan
-    /// gesture is scaled against and the box the shader marches are one
-    /// derivation from one grid, not two that agree by inspection.
+    /// the same [`DrawnBox`] it hands the uniform — so the box the pan gesture
+    /// is scaled against, the box the caption names and the box the shader
+    /// marches are one derivation, not three that agree by inspection.
+    ///
+    /// The **drawn** box and not the held grid's, which is the whole point
+    /// while a stand-in is up: a pane that has just been zoomed is framing the
+    /// box it asked for, so a pan scaled to the older, wider grid would run at
+    /// the wrong speed for exactly as long as the picture was soft, and the
+    /// caption would name a box nobody is looking at.
     fn box_size_km(&self, pane_idx: usize, target: &VolumeTarget) -> Option<[f32; 3]> {
-        match self.store.lookup_for_pane(pane_idx, target)?.entry {
-            VolumeEntry::Ready(grid) => Some(box_size_km(&grid)),
-            VolumeEntry::Building | VolumeEntry::Refused(_) => None,
-        }
+        let found = self.store.lookup_for_pane(pane_idx, target)?;
+        let VolumeEntry::Ready(grid) = &found.entry else {
+            return None;
+        };
+        Some(DrawnBox::for_lookup(&found, target, grid)?.size_km())
     }
 }
 
@@ -1465,12 +1548,176 @@ fn floor_lanes(
     )
 }
 
-/// The box's physical extent in kilometres, along each axis.
-fn box_size_km(grid: &VoxelGrid) -> [f32; 3] {
+/// The box a pane is drawing, and where that box's unit cube sits inside the
+/// grid being drawn through it.
+///
+/// # Why the two can differ at all
+///
+/// The box is the pane's own viewport, so a scroll retargets it, and the grid
+/// for the new box is ~89 ms of resampling plus ~51 ms of upload away. Through
+/// that wait the pane keeps the grid it already has — that is the store's
+/// stand-in, and it is what stops a zoom taking the view away — but it draws
+/// it **in the box the user just asked for**, not in the box the grid was
+/// built for. Everything geographic in the uniform is therefore the requested
+/// box: the camera frames it (so the zoom is immediate), the floor is
+/// registered to it (so it still covers the box exactly, which is the whole
+/// point of the region being the viewport), and only where the field is
+/// fetched from is old. [`Self::scale`] and [`Self::offset`] are that fetch.
+///
+/// When nothing is pending the two boxes are the same object computed from the
+/// same inputs by the same function — see
+/// [`rustdar_radar::voxel::horizontal_ranges_km`] — so they are bit-equal and
+/// the affine is exactly the identity.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DrawnBox {
+    x_km: (f64, f64),
+    y_km: (f64, f64),
+    z_km_msl: (f64, f64),
+    /// Grid texture coordinate from unit-cube position: `t = scale · p +
+    /// offset`, per axis.
+    scale: [f32; 3],
+    offset: [f32; 3],
+    /// The box reaches outside the grid on some axis, so the march has to
+    /// answer air out there rather than let the sampler clamp.
+    bounded: bool,
+}
+
+impl DrawnBox {
+    fn size_km(&self) -> [f32; 3] {
+        [
+            (self.x_km.1 - self.x_km.0) as f32,
+            (self.y_km.1 - self.y_km.0) as f32,
+            (self.z_km_msl.1 - self.z_km_msl.0) as f32,
+        ]
+    }
+
+    /// The grid drawn in its own box — the settled case, and the one every
+    /// mask instrument in this repository measures.
+    fn settled(grid: &VoxelGrid) -> Self {
+        Self {
+            x_km: grid.x_range_km(),
+            y_km: grid.y_range_km(),
+            z_km_msl: grid.z_range_km_msl(),
+            scale: crate::volume::uniform::IDENTITY_GRID_FROM_BOX.0,
+            offset: crate::volume::uniform::IDENTITY_GRID_FROM_BOX.1,
+            bounded: false,
+        }
+    }
+
+    /// The box `target` asks for, drawn through `grid`.
+    ///
+    /// The vertical is the grid's own and not a third thing: the request's
+    /// `base_km_msl`/`top_km_msl` are two constants that a region cannot
+    /// touch (`voxel_request_for` says so in as many words), so the grid's
+    /// vertical *is* the requested one, and taking it from the grid means the
+    /// stand-in cannot introduce a vertical pop when the real build lands.
+    ///
+    /// The site comes off the **grid**, not from a site-table lookup. That is
+    /// deliberate: it is the origin the grid's own `x`/`y` ranges were measured
+    /// from, so the two boxes are guaranteed to be in one frame. A second
+    /// opinion about where the radar is would put the stand-in off its floor by
+    /// however much the two disagreed, and the error would then vanish the
+    /// moment the real grid landed — a discontinuity of exactly the kind the
+    /// stand-in exists to remove.
+    /// `None` when the box cannot be placed without the volume in hand — a
+    /// target with **no picked region**, whose width is the volume's own reach
+    /// (`rustdar_radar::voxel::box_half_width_km` over `volume_reach_km`) and
+    /// therefore a fact about a scan the renderer never sees. There is nothing
+    /// to guess at there: a box drawn at the wrong width would be a picture
+    /// registered to ground it is not over. The caller falls back to the
+    /// first-build message for the one case it happens in — a pane reset to
+    /// the whole volume while a tighter grid is still held — which is a
+    /// deliberate blank rather than a wrong picture.
+    fn for_target(target: &VolumeTarget, grid: &VoxelGrid) -> Option<Self> {
+        let region = target.region?;
+        let (site_lat, site_lon) = grid.site();
+        let (x_km, y_km) = rustdar_radar::voxel::horizontal_ranges_km(
+            (region.centre().lat, region.centre().lon),
+            rustdar_radar::voxel::clamped_half_width_km(region.half_width_km()),
+            site_lat,
+            site_lon,
+        );
+        let settled = Self::settled(grid);
+        if (x_km, y_km) == (settled.x_km, settled.y_km) {
+            return Some(settled);
+        }
+        // A grid with a zero horizontal axis. Impossible for anything
+        // `build_voxels` produced, and a division that returned infinities here
+        // would reach the GPU as a NaN matrix.
+        let (scale, offset) = crop_into(grid, x_km, y_km)?;
+        Some(Self {
+            x_km,
+            y_km,
+            z_km_msl: settled.z_km_msl,
+            scale,
+            offset,
+            // An affine that stays within `[0, 1]` on every axis needs no
+            // bounds test at all, and the zoom-*in* case — the common one — is
+            // exactly that.
+            bounded: (0..3).any(|axis| offset[axis] < 0.0 || offset[axis] + scale[axis] > 1.0),
+        })
+    }
+
+    /// The box a pane holding `lookup` for `target` is drawing.
+    ///
+    /// The target's own grid is drawn in its own box, always: it *is* the
+    /// answer, so there is nothing to crop and nothing that could be asked for
+    /// that it is not already. Only a stand-in is placed against the target,
+    /// and only a stand-in can fail to be placeable — see [`Self::for_target`].
+    fn for_lookup(lookup: &VolumeLookup, target: &VolumeTarget, grid: &VoxelGrid) -> Option<Self> {
+        if lookup.stood_in {
+            Self::for_target(target, grid)
+        } else {
+            Some(Self::settled(grid))
+        }
+    }
+}
+
+/// Kilometres across one horizontal cell of `grid` — the resolution the
+/// picture on screen really has, which is not the requested region's while a
+/// stand-in is up. `None` for a grid with no cells across, which
+/// `build_voxels` does not produce.
+fn cell_km(grid: &VoxelGrid) -> Option<f32> {
     let (x0, x1) = grid.x_range_km();
-    let (y0, y1) = grid.y_range_km();
-    let (z0, z1) = grid.z_range_km_msl();
-    [(x1 - x0) as f32, (y1 - y0) as f32, (z1 - z0) as f32]
+    let across = u32::try_from(grid.shape().nx).ok()?;
+    (across > 0).then(|| ((x1 - x0) / f64::from(across)) as f32)
+}
+
+/// `(scale, offset)` taking the unit cube of the box `x_km × y_km` (with the
+/// grid's own vertical) to a coordinate in `grid`'s texture. `None` if the
+/// grid has a zero horizontal axis.
+///
+/// A free function so the arithmetic can be pinned without a grid fixture at
+/// every zoom ratio: this is where a swapped axis or an inverted offset would
+/// live, and it is one line of algebra —
+///
+/// ```text
+/// world = box_min + p · box_size          (what the shader marches)
+/// t     = (world − grid_min) / grid_size  (where the texture has it)
+/// ```
+fn crop_into(
+    grid: &VoxelGrid,
+    x_km: (f64, f64),
+    y_km: (f64, f64),
+) -> Option<([f32; 3], [f32; 3])> {
+    let axes = [
+        (x_km, grid.x_range_km()),
+        (y_km, grid.y_range_km()),
+        // The vertical is the grid's own, so it is the identity by
+        // construction rather than by arithmetic that happens to cancel.
+        (grid.z_range_km_msl(), grid.z_range_km_msl()),
+    ];
+    let mut scale = [0.0f32; 3];
+    let mut offset = [0.0f32; 3];
+    for (axis, (drawn, held)) in axes.into_iter().enumerate() {
+        let held_size = held.1 - held.0;
+        if !(held_size.is_finite() && held_size > 0.0) {
+            return None;
+        }
+        scale[axis] = ((drawn.1 - drawn.0) / held_size) as f32;
+        offset[axis] = ((drawn.0 - held.0) / held_size) as f32;
+    }
+    Some((scale, offset))
 }
 
 /// The grid's coarsest cell in kilometres — the axis extent over that axis'

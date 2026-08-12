@@ -24,20 +24,22 @@
 //!
 //! # The layout
 //!
-//! One `mat4x4<f32>` and eight `vec4<f32>`: 192 bytes, all naturally 16-byte
+//! One `mat4x4<f32>` and ten `vec4<f32>`: 224 bytes, all naturally 16-byte
 //! aligned, so std140 inserts no padding of its own.
 //!
-//! | offset | member              |
-//! |-------:|---------------------|
-//! |      0 | `box_from_clip`     |
-//! |     64 | `eye_in_box`        |
-//! |     80 | `box_size_km`       |
-//! |     96 | `grid_dims`         |
-//! |    112 | `light_dir_ambient` |
-//! |    128 | `transfer`          |
-//! |    144 | `flags`             |
-//! |    160 | `floor_uv`          |
-//! |    176 | `floor_geo`         |
+//! | offset | member               |
+//! |-------:|----------------------|
+//! |      0 | `box_from_clip`      |
+//! |     64 | `eye_in_box`         |
+//! |     80 | `box_size_km`        |
+//! |     96 | `grid_dims`          |
+//! |    112 | `light_dir_ambient`  |
+//! |    128 | `transfer`           |
+//! |    144 | `flags`              |
+//! |    160 | `floor_uv`           |
+//! |    176 | `floor_geo`          |
+//! |    192 | `grid_from_box_a`    |
+//! |    208 | `grid_from_box_b`    |
 //!
 //! Every lane is an `f32`, including the ones that carry counts and booleans
 //! (`grid_dims` goes out as floats, the flags as 0.0/1.0). That is a rule, not
@@ -52,8 +54,8 @@
 
 use crate::constants::VOLUME_LUT_BYTES;
 
-/// Bytes in the uniform block. One `mat4x4<f32>` + eight `vec4<f32>`.
-pub const VOLUME_UNIFORM_BYTES: usize = 192;
+/// Bytes in the uniform block. One `mat4x4<f32>` + ten `vec4<f32>`.
+pub const VOLUME_UNIFORM_BYTES: usize = 224;
 
 /// `f32` lanes in the uniform block.
 pub const VOLUME_UNIFORM_LANES: usize = VOLUME_UNIFORM_BYTES / 4;
@@ -77,6 +79,10 @@ pub const OFFSET_FLAGS: usize = 144;
 pub const OFFSET_FLOOR_UV: usize = 160;
 /// See [`OFFSET_BOX_FROM_CLIP`].
 pub const OFFSET_FLOOR_GEO: usize = 176;
+/// See [`OFFSET_BOX_FROM_CLIP`].
+pub const OFFSET_GRID_FROM_BOX_A: usize = 192;
+/// See [`OFFSET_BOX_FROM_CLIP`].
+pub const OFFSET_GRID_FROM_BOX_B: usize = 208;
 
 /// Extinction per kilometre at a palette entry whose alpha is 1.
 ///
@@ -341,11 +347,54 @@ pub struct VolumeUniform {
     /// guess is a floor that is merely a bit too dark or too light, which is
     /// exactly the sort of error that ships.
     pub floor_geo: [f32; 4],
+    /// Where in the **grid texture** a position in the drawn box's unit cube
+    /// sits: `t = grid_from_box_scale · p + grid_from_box_offset`, per axis.
+    ///
+    /// [`IDENTITY_GRID_FROM_BOX`] — scale 1, offset 0 — is the ordinary case
+    /// and the only one every instrument in this repository measures: the box
+    /// being drawn *is* the grid, so `t = p` exactly, and the arithmetic is a
+    /// multiply by one and an add of zero that no `f32` can move.
+    ///
+    /// # What the other case is for
+    ///
+    /// A zoom retargets the pane's box, and the grid for the new box takes
+    /// ~140 ms to build and upload. Blanking the pane for that long is what
+    /// made zooming feel like it took the view away. So while the build is in
+    /// flight the pane draws the grid it already has, *in the box the user
+    /// just asked for* — and this affine is what makes that a real picture
+    /// rather than a mislabelled one. The rest of the uniform describes the
+    /// **requested** box throughout (`box_size_km`, `floor_geo`'s west and
+    /// south edges), so the floor, the camera framing and the geography are
+    /// the new ones; only where the field is fetched from is old.
+    ///
+    /// Zooming in, the requested box is inside the held grid and every fetch
+    /// lands in it — the picture magnifies and sharpens when the build lands.
+    /// Zooming out it is not, and fetches outside the grid must read as air
+    /// rather than as the sampler's clamped edge texel, which would smear the
+    /// grid's rim across ground the radar never reported. That is what the
+    /// `w` lane below is for.
+    pub grid_from_box_scale: [f32; 3],
+    /// Whether the drawn box reaches outside the grid, so the march has to
+    /// test each fetch against the grid's bounds. Rides `grid_from_box_a.w`.
+    ///
+    /// A flag rather than an unconditional test because the test is not free
+    /// and, at [`IDENTITY_GRID_FROM_BOX`], not merely redundant but slightly
+    /// wrong: a march parameter that overshoots the exit face by one `f32`
+    /// ulp would have its last sample discarded, and the ordinary path must
+    /// stay bit-identical to what every mask instrument measured.
+    pub grid_bounded: bool,
+    /// See [`VolumeUniform::grid_from_box_scale`]. Rides `grid_from_box_b.xyz`;
+    /// `w` is reserved and written zero.
+    pub grid_from_box_offset: [f32; 3],
 }
 
 /// The lit-volume sentinel for [`VolumeUniform::iso_threshold`] and the
 /// sequential sentinel for [`VolumeUniform::iso_centre`].
 pub const ISO_OFF: f32 = -1.0;
+
+/// `(scale, offset)` for a box that **is** the grid — the ordinary case. See
+/// [`VolumeUniform::grid_from_box_scale`].
+pub const IDENTITY_GRID_FROM_BOX: ([f32; 3], [f32; 3]) = ([1.0; 3], [0.0; 3]);
 
 impl VolumeUniform {
     /// A uniform with the defaults above, an identity transform and no camera.
@@ -377,10 +426,13 @@ impl VolumeUniform {
             // for the reason the module doc gives about unwritten lanes.
             floor_uv: [0.0; 4],
             floor_geo: [0.0; 4],
+            grid_from_box_scale: IDENTITY_GRID_FROM_BOX.0,
+            grid_bounded: false,
+            grid_from_box_offset: IDENTITY_GRID_FROM_BOX.1,
         }
     }
 
-    /// The 192 bytes the GPU reads, little-endian.
+    /// The 224 bytes the GPU reads, little-endian.
     ///
     /// Little-endian unconditionally: every target wgpu supports is
     /// little-endian, and `to_le_bytes` says so at the call site rather than
@@ -433,6 +485,19 @@ impl VolumeUniform {
         );
         write_vec4(&mut out, OFFSET_FLOOR_UV, self.floor_uv);
         write_vec4(&mut out, OFFSET_FLOOR_GEO, self.floor_geo);
+        write_vec4(
+            &mut out,
+            OFFSET_GRID_FROM_BOX_A,
+            xyz_w(
+                self.grid_from_box_scale,
+                f32::from(u8::from(self.grid_bounded)),
+            ),
+        );
+        write_vec4(
+            &mut out,
+            OFFSET_GRID_FROM_BOX_B,
+            xyz_w(self.grid_from_box_offset, 0.0),
+        );
 
         out
     }

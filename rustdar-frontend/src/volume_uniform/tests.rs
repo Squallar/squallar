@@ -47,19 +47,22 @@ fn distinct() -> VolumeUniform {
         iso_centre: 304.0,
         floor_uv: [701.0, 702.0, 703.0, 704.0],
         floor_geo: [801.0, 802.0, 803.0, 804.0],
+        grid_from_box_scale: [901.0, 902.0, 903.0],
+        grid_bounded: true,
+        grid_from_box_offset: [1001.0, 1002.0, 1003.0],
     }
 }
 
-/// The block is exactly 192 bytes, and the shader declares the same.
+/// The block is exactly 224 bytes, and the shader declares the same.
 ///
-/// Both halves matter: the Rust side could be 192 while the WGSL grew a
+/// Both halves matter: the Rust side could be 224 while the WGSL grew a
 /// member, and then every lane after the new one is read from the wrong
 /// place with no error at all — a uniform buffer larger than the shader's
 /// block is legal.
 #[test]
-fn the_block_is_a_mat4_and_eight_vec4s_on_both_sides() {
-    assert_eq!(VOLUME_UNIFORM_BYTES, 64 + 8 * 16);
-    assert_eq!(OFFSET_FLOOR_GEO + 16, VOLUME_UNIFORM_BYTES);
+fn the_block_is_a_mat4_and_ten_vec4s_on_both_sides() {
+    assert_eq!(VOLUME_UNIFORM_BYTES, 64 + 10 * 16);
+    assert_eq!(OFFSET_GRID_FROM_BOX_B + 16, VOLUME_UNIFORM_BYTES);
 
     let source = include_str!("../volume.wgsl");
     let declaration = source
@@ -72,7 +75,7 @@ fn the_block_is_a_mat4_and_eight_vec4s_on_both_sides() {
     let vec4s = declaration.matches("vec4<f32>").count();
     assert_eq!(
         (mat4s, vec4s),
-        (1, 8),
+        (1, 10),
         "volume.wgsl's uniform block is {mat4s} mat4x4 and {vec4s} vec4, \
              which is {} bytes, not the {VOLUME_UNIFORM_BYTES} this file packs. \
              A block smaller than the buffer is legal, so nothing would report \
@@ -105,6 +108,10 @@ fn the_shader_declares_the_members_in_the_order_this_file_packs_them() {
         "light_dir_ambient",
         "transfer",
         "flags",
+        "floor_uv",
+        "floor_geo",
+        "grid_from_box_a",
+        "grid_from_box_b",
     ] {
         let needle = format!("{member}:");
         let found = declaration[at..].find(&needle).unwrap_or_else(|| {
@@ -163,8 +170,10 @@ fn every_lane_lands_at_its_std140_offset() {
             OFFSET_FLAGS,
             OFFSET_FLOOR_UV,
             OFFSET_FLOOR_GEO,
+            OFFSET_GRID_FROM_BOX_A,
+            OFFSET_GRID_FROM_BOX_B,
         ),
-        (0, 64, 80, 96, 112, 128, 144, 160, 176),
+        (0, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208),
         "the std140 offsets have moved. They are the layout the WGSL's \
              `struct Volume` declares, in its declaration order, and nothing \
              else in this file can tell you they are wrong."
@@ -195,6 +204,16 @@ fn every_lane_lands_at_its_std140_offset() {
         (OFFSET_FLAGS, [1.0, 601.0, 602.0, 1.0], "flags"),
         (OFFSET_FLOOR_UV, [701.0, 702.0, 703.0, 704.0], "floor_uv"),
         (OFFSET_FLOOR_GEO, [801.0, 802.0, 803.0, 804.0], "floor_geo"),
+        (
+            OFFSET_GRID_FROM_BOX_A,
+            [901.0, 902.0, 903.0, 1.0],
+            "grid_from_box_scale + grid_bounded",
+        ),
+        (
+            OFFSET_GRID_FROM_BOX_B,
+            [1001.0, 1002.0, 1003.0, 0.0],
+            "grid_from_box_offset + a reserved zero",
+        ),
     ] {
         let lane = offset / 4;
         assert_eq!(
@@ -205,17 +224,19 @@ fn every_lane_lands_at_its_std140_offset() {
     }
 }
 
-/// The block has no reserved lanes left, and the last two to go — the
-/// isosurface pair — default to the negative sentinels that select the
+/// The isosurface pair defaults to the negative sentinels that select the
 /// lit-volume march.
 ///
 /// This test is the free-lane registry's tombstone: `eye_in_box.w` and
 /// `grid_dims.w` were the two reserved-zero lanes (after `box_size_km.w`
 /// and the three upper flags lanes took the exaggeration, the
 /// reconstruction level, the march step and the floor switch), and the
-/// view-mode work took both — `iso_threshold` and `iso_centre`. A seventh
-/// member is now a 176-byte block and a WGSL struct change, on both
-/// sides, with every layout test above moving together.
+/// view-mode work took both — `iso_threshold` and `iso_centre`. The block
+/// then grew for the first time, by the two `grid_from_box` members the
+/// stand-in crop needs; one lane of those (`grid_from_box_b.w`) is the only
+/// reserved-zero left. A further member is another 16 bytes and a WGSL
+/// struct change, on both sides, with every layout test above moving
+/// together.
 ///
 /// The sentinel half matters most: negative — not zero — selects the lit
 /// volume, because an index-0 threshold is a real isosurface
@@ -236,6 +257,54 @@ fn the_iso_lanes_default_to_the_lit_volume_sentinels() {
         include_str!("../volume.wgsl").contains("volume.eye_in_box.w >= 0.0"),
         "the shader no longer selects the isosurface march on the \
              threshold lane's sign, so the sentinel selects nothing",
+    );
+}
+
+/// A fresh uniform draws the grid in its own box: scale 1, offset 0, no
+/// bounds test.
+///
+/// **This is the lane pair's most important property.** Every mask, silhouette
+/// and march-cost instrument in this repository builds a uniform and measures
+/// what the shader does with it, and every one of them was written before the
+/// affine existed. If the default were anything but the identity, all of them
+/// would silently start measuring a transformed field — and the arithmetic
+/// (`p · 1 + 0`) is the one transform no `f32` can move, so at the identity the
+/// instruments are not merely close to what they were but bit-identical.
+///
+/// The bounds flag is separately zero, and that is not redundant: raised at the
+/// identity it would discard any sample whose march parameter overshot the exit
+/// face by an ulp, which is a difference no instrument declares a tolerance for.
+#[test]
+fn a_fresh_uniform_draws_the_grid_in_its_own_box() {
+    let uniform = VolumeUniform::new([240.0, 240.0, 20.0], [128, 128, 64]);
+    assert_eq!(
+        (
+            uniform.grid_from_box_scale,
+            uniform.grid_from_box_offset,
+            uniform.grid_bounded
+        ),
+        (IDENTITY_GRID_FROM_BOX.0, IDENTITY_GRID_FROM_BOX.1, false),
+    );
+
+    let packed = lanes(&uniform.to_bytes());
+    let a = OFFSET_GRID_FROM_BOX_A / 4;
+    let b = OFFSET_GRID_FROM_BOX_B / 4;
+    assert_eq!(&packed[a..a + 4], &[1.0, 1.0, 1.0, 0.0]);
+    assert_eq!(&packed[b..b + 4], &[0.0, 0.0, 0.0, 0.0]);
+
+    let shader = include_str!("../volume.wgsl");
+    assert!(
+        shader.contains("return p * volume.grid_from_box_a.xyz + volume.grid_from_box_b.xyz;"),
+        "the shader no longer applies the affine, so a pane standing in for a \
+             build would draw its held grid stretched across the requested box \
+             instead of cropped to it",
+    );
+    assert!(
+        shader.contains("volume.grid_from_box_a.w > 0.5"),
+        "the shader no longer gates the bounds test on the flag: unconditional \
+             it costs the identity path a discarded exit sample, and absent \
+             altogether a zoomed-out pane smears the grid's rim across ground \
+             the radar never reported",
     );
 }
 

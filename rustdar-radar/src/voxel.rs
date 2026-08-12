@@ -1680,6 +1680,56 @@ struct VoxelRow<'grid> {
     values: Vec<&'grid mut [f32]>,
 }
 
+/// A **picked** half-width, held inside `[MIN_HALF_WIDTH_KM,
+/// MAX_HALF_WIDTH_KM]` — the clamp [`VoxelRequest::half_width_km`] promises.
+///
+/// Named because two callers need the same answer and neither may re-spell
+/// it: the resampler, and the renderer, which has to know the box a request
+/// *will* produce before the build that produces it has run — see
+/// [`horizontal_ranges_km`]. (The `None` arm of that field is a different
+/// question and is answered by [`box_half_width_km`], which needs the scan.)
+pub fn clamped_half_width_km(half_width_km: f64) -> f64 {
+    half_width_km.clamp(MIN_HALF_WIDTH_KM, MAX_HALF_WIDTH_KM)
+}
+
+/// A box of `half_width_km` about `centre`, as `(x_range_km, y_range_km)` —
+/// kilometres east and north **of the radar**, which is the frame
+/// [`VoxelGrid::x_range_km`] and [`VoxelGrid::y_range_km`] report in.
+///
+/// The half-width is taken as already decided: [`build_voxels`] resolves the
+/// request's `Option` first, because its `None` arm is the volume's own reach
+/// and only the scan can answer it.
+///
+/// # Why this is a named function and not four lines inside the resampler
+///
+/// [`build_voxels`] is the only thing that *can* produce a grid, and it takes
+/// hundreds of milliseconds. The renderer needs the same two ranges for a box
+/// whose grid has not been built yet: while a rebuild is in flight it draws
+/// the grid it already has, cropped to the box the user has since asked for,
+/// and the crop is the affine between this answer and the held grid's own
+/// ranges. Computed a second time anywhere else, a disagreement of even a
+/// kilometre would put the volume off its floor — and would then *snap* into
+/// place when the real build landed, which is precisely the discontinuity the
+/// stand-in exists to remove. So the resampler calls this too, and the two
+/// cannot drift.
+///
+/// Polar from the site and back, so this is the same tangent plane the
+/// resampler's per-cell mapping uses and a centre *at* the site lands exactly
+/// on `(0, 0)`.
+pub fn horizontal_ranges_km(
+    centre: (f64, f64),
+    half_width_km: f64,
+    site_lat: f64,
+    site_lon: f64,
+) -> ((f64, f64), (f64, f64)) {
+    let half = half_width_km;
+    let (bearing_deg, range_km) =
+        beam::site_bearing_range_km(site_lat, site_lon, centre.0, centre.1);
+    let bearing = bearing_deg.to_radians();
+    let (cx, cy) = (range_km * bearing.sin(), range_km * bearing.cos());
+    ((cx - half, cx + half), (cy - half, cy + half))
+}
+
 /// Resample `scan` onto a Cartesian grid, or `None` if it cannot be done
 /// honestly.
 ///
@@ -1786,19 +1836,14 @@ pub fn build_voxels_with_motion<'a>(
     // reading it here keeps the box a property of the volume the user asked for
     // rather than of whichever derivation the product happens to go through.
     let half = match req.half_width_km {
-        Some(picked) => picked.clamp(MIN_HALF_WIDTH_KM, MAX_HALF_WIDTH_KM),
+        Some(picked) => clamped_half_width_km(picked),
         None => box_half_width_km(volume_reach_km(volume.scan(), req.product)),
     };
 
-    // The box's centre as km east / north of the site. Polar from the site and
-    // back, so this is the same tangent plane the per-cell mapping below uses
-    // and a centre *at* the site lands exactly on (0, 0).
-    let (bearing_deg, range_km) = beam::site_bearing_range_km(lat, lon, req.centre.0, req.centre.1);
-    let bearing = bearing_deg.to_radians();
-    let (cx, cy) = (range_km * bearing.sin(), range_km * bearing.cos());
-
-    let x_range_km = (cx - half, cx + half);
-    let y_range_km = (cy - half, cy + half);
+    // Placed through the one definition of it — see `horizontal_ranges_km` for
+    // why the renderer has to be able to ask the same question without a grid
+    // in hand.
+    let (x_range_km, y_range_km) = horizontal_ranges_km(req.centre, half, lat, lon);
     let z_range_km_msl = (req.base_km_msl, req.top_km_msl);
 
     // The same spelling `render.rs` uses for `radar_km_msl`, including what it

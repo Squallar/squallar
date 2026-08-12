@@ -1,9 +1,13 @@
 use super::*;
 use crate::input_harness::InputHarness;
-use crate::volume_view::{StubVolumePainter, VolumeFrameState};
+use crate::volume_view::{Showing, StubVolumePainter, VolumeFrameState};
 use std::sync::Arc;
 
 const FRAME_DT: f64 = 1.0 / 60.0;
+
+/// The grid on screen is the one the pane asked for — what every caption test
+/// that is not *about* the stand-in wants to be told.
+const SETTLED: Showing = Showing::SETTLED;
 
 /// A harness with one map pane and one 3D pane, a scan loaded, and the given
 /// painter installed. Returns the painter so a test can read back what it
@@ -1136,6 +1140,7 @@ fn the_height_the_pane_reports_is_real_at_every_exaggeration() {
             None,
             crate::pane::BASE_HALF_WIDTH_KM,
             camera,
+            SETTLED,
         );
         let height = lines
             .iter()
@@ -1175,6 +1180,7 @@ fn the_caption_states_the_newest_data_time_not_a_whole_volume_claim() {
         Some(at(33)),
         crate::pane::BASE_HALF_WIDTH_KM,
         Default::default(),
+        SETTLED,
     );
     assert!(
         lines[0].contains("KTLX") && lines[0].contains("newest data") && lines[0].contains("22:39"),
@@ -1199,6 +1205,7 @@ fn the_caption_names_the_base_volume_or_says_the_first_is_still_filling() {
         Some(at(33)),
         crate::pane::BASE_HALF_WIDTH_KM,
         Default::default(),
+        SETTLED,
     );
     let base = merged
         .iter()
@@ -1215,6 +1222,7 @@ fn the_caption_names_the_base_volume_or_says_the_first_is_still_filling() {
         None,
         crate::pane::BASE_HALF_WIDTH_KM,
         Default::default(),
+        SETTLED,
     );
     assert!(
         filling.iter().any(|l| l.contains("no complete volume yet")),
@@ -1237,7 +1245,7 @@ fn the_caption_names_the_base_volume_or_says_the_first_is_still_filling() {
 #[test]
 fn the_caption_reports_the_resolution_the_box_buys() {
     let whole_volume = rustdar_radar::voxel::box_half_width_km(460.125);
-    let wide = volume_caption("KTLX", at(33), None, whole_volume, Default::default());
+    let wide = volume_caption("KTLX", at(33), None, whole_volume, Default::default(), SETTLED);
     assert!(
         wide.iter()
             .any(|l| l.contains("651 km box") && l.contains("2.54 km/cell")),
@@ -1259,6 +1267,7 @@ fn the_caption_reports_the_resolution_the_box_buys() {
         None,
         tight.half_width_km(),
         Default::default(),
+        SETTLED,
     );
     let line = tight_lines
         .iter()
@@ -1274,6 +1283,103 @@ fn the_caption_reports_the_resolution_the_box_buys() {
     assert!(
         line.contains(&format!("{:.2} km/cell", 40.0 / cells)),
         "the tighter box must report its finer cells: {line:?}",
+    );
+}
+
+/// While the grid on screen is not the one this box asked for, the caption
+/// reports the picture — not the request.
+///
+/// This is the honest half of the zoom's progressive refinement, and it is
+/// what licenses the picture half. A pane that has just been zoomed goes on
+/// drawing the grid it already has, put into the new box, so the "N km box"
+/// figure stays true throughout; the cell size does not, and a caption that
+/// went on dividing this box by the cell count would claim a sharpness nobody
+/// can see. Either the line says what resolution is really there, or the pane
+/// must blank — and blanking is the defect this replaced.
+///
+/// The two arms differ in what the zoom *did*. Inwards, the held grid covers
+/// the whole new box: the picture is complete and merely soft, so the line
+/// promises the sharper one. Outwards it does not: the picture is real data in
+/// the middle and nothing outside it, and a volume that simply stops is read
+/// as weather that stops, so that has to be said rather than promised away.
+#[test]
+fn a_caption_over_a_stand_in_reports_the_picture_and_not_the_request() {
+    let cells = rustdar_radar::voxel::default_shape().nx as f64;
+    let asked_for = format!("{:.2} km/cell", 40.0 / cells);
+    let line_of = |showing| {
+        volume_caption("KTLX", at(33), None, 20.0, Default::default(), showing)
+            .into_iter()
+            .find(|l| l.contains("km box"))
+            .expect("a box line")
+    };
+
+    // Zoomed in: soft now, sharp shortly.
+    let softened = line_of(Showing {
+        cell_km: Some(1.8),
+        stale: true,
+        partial: false,
+    });
+    assert!(
+        softened.contains("40 km box"),
+        "the box is the one being drawn, and that is the requested one even \
+         while the grid inside it is older: {softened:?}",
+    );
+    assert!(
+        softened.contains("1.80 km/cell") && softened.contains("sharpening"),
+        "the line must report the grid actually on screen and say a sharper \
+         one is coming: {softened:?}",
+    );
+    assert!(
+        !softened.starts_with(&format!("40 km box - {asked_for}")),
+        "this box's own cell size must not be the headline figure while a \
+         coarser grid is on screen: {softened:?}",
+    );
+
+    // Zoomed out: the middle is real and the rest is not there yet.
+    let hollow = line_of(Showing {
+        cell_km: Some(1.8),
+        stale: true,
+        partial: true,
+    });
+    assert!(
+        hollow.contains("over the middle") && hollow.contains("filling in"),
+        "a picture that does not reach the box's edges must say so, or the \
+         edge of the grid is read as the edge of the weather: {hollow:?}",
+    );
+
+    // And once the build lands the line goes back to the plain statement —
+    // no permanent "sharpening" on a picture that is already sharp.
+    let settled = line_of(Showing {
+        cell_km: Some(1.8),
+        stale: false,
+        partial: false,
+    });
+    assert_eq!(settled, format!("40 km box - {asked_for}"));
+}
+
+/// The painter's report reaches the caption the user reads.
+///
+/// The two halves of the stand-in are pinned apart — the renderer decides what
+/// to draw (`rustdar-frontend`'s `volume_stand_in` suite) and `volume_caption`
+/// decides what to write — and this is the seam between them. It is exactly
+/// the sort of wiring that can be dropped without a compiler error:
+/// `render_volume_pane` could ignore the `showing` field and hand
+/// `Showing::SETTLED` to the caption, and every test on either side would stay
+/// green while the pane silently went back to claiming a sharpness it does not
+/// have.
+#[test]
+fn the_pane_captions_the_picture_the_painter_says_it_drew() {
+    let (h, _painter) = volume_harness(StubVolumePainter::standing_in(Showing {
+        cell_km: Some(1.8),
+        stale: true,
+        partial: false,
+    }));
+    let pane_rect = h.pane_rects()[1];
+    let texts = h.painted_text_strings_in(pane_rect);
+    assert!(
+        texts.iter().any(|t| t.contains("sharpening")),
+        "a pane whose painter says it is standing in must say so in its own \
+         caption; painted texts were {texts:?}",
     );
 }
 

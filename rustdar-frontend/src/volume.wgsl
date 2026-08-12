@@ -104,9 +104,49 @@ struct Volume {
     //    from the swapchain's format, because that is what picks egui's
     //    fragment entry point and hence what lands in the mirror.
     floor_geo: vec4<f32>,
+    // Where a position in the drawn box's unit cube sits in the GRID texture:
+    //   xyz: the per-axis scale.
+    //   w:   1 when the drawn box reaches outside the grid, so every fetch has
+    //        to be tested against the grid's bounds and answered as air when it
+    //        falls outside. 0 when the box is inside the grid (which includes
+    //        the ordinary case, where it IS the grid).
+    grid_from_box_a: vec4<f32>,
+    // xyz: the per-axis offset. w: reserved, written zero.
+    //
+    // Together: `t = grid_from_box_a.xyz * p + grid_from_box_b.xyz`. Scale 1
+    // and offset 0 — the ordinary case — make that `t = p` exactly.
+    //
+    // See `VolumeUniform::grid_from_box_scale` for what the other case is: a
+    // pane that has been zoomed and is drawing the grid it already has, in the
+    // box the user just asked for, until the build for that box lands.
+    grid_from_box_b: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> volume: Volume;
+
+// A position in the drawn box's unit cube, as a grid texture coordinate.
+//
+// Exactly `p` in the ordinary case: the scale is 1 and the offset 0, and no
+// finite `f32` moves under a multiply by one and an add of zero.
+fn grid_coord(p: vec3<f32>) -> vec3<f32> {
+    return p * volume.grid_from_box_a.xyz + volume.grid_from_box_b.xyz;
+}
+
+// Whether a grid coordinate falls outside the grid, and so must read as air.
+//
+// Short-circuits on the flag, so the ordinary path pays one comparison and
+// never reaches the bounds test — which matters twice over: the test costs
+// three `any`s per fetch, and at the identity affine a march parameter that
+// overshoots the exit face by an ulp would have its last sample discarded,
+// which no mask instrument in this repository was measured against.
+//
+// The alternative is what the sampler does on its own — clamp to the edge
+// texel — and that is not a rendering artefact but a false claim: it paints
+// the grid's rim across ground the radar never reported.
+fn outside_grid(t: vec3<f32>) -> bool {
+    return volume.grid_from_box_a.w > 0.5
+        && (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0)));
+}
 
 // The voxel grid: `Rg16Float`, **coverage-premultiplied**, sampled `Linear` on
 // both channels.
@@ -491,7 +531,13 @@ fn lut_coord(index: f32) -> vec2<f32> {
 // flags.y is never negative any more; the sentinel that used to select a
 // nearest snap is gone with the split it served.
 fn field_at(p: vec3<f32>) -> vec2<f32> {
-    let texel = textureSampleLevel(grid_texture, grid_sampler, p, volume.flags.y).rg;
+    let t = grid_coord(p);
+    if outside_grid(t) {
+        // Air, in both channels: no index and no coverage, which is exactly
+        // what the reconstruction below already means by "nothing here".
+        return vec2<f32>(0.0, 0.0);
+    }
+    let texel = textureSampleLevel(grid_texture, grid_sampler, t, volume.flags.y).rg;
     // No `select`: an all-air fetch is R = G = 0 exactly, so the floored
     // divisor returns index 0 for it, and every covered fetch has G well above
     // the floor by the time the sample is used at all.
@@ -509,7 +555,11 @@ fn field_at(p: vec3<f32>) -> vec2<f32> {
 // out of the data, which is the normal of the surface being drawn. One fetch,
 // like the field it comes from.
 fn shading_field(p: vec3<f32>) -> f32 {
-    return textureSampleLevel(grid_texture, grid_sampler, p, volume.flags.y).r;
+    let t = grid_coord(p);
+    if outside_grid(t) {
+        return 0.0;
+    }
+    return textureSampleLevel(grid_texture, grid_sampler, t, volume.flags.y).r;
 }
 
 // Deterministic per-pixel jitter in [0, 1): Jimenez's interleaved gradient

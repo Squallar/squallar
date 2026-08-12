@@ -1015,8 +1015,8 @@ static MUTANTS: &[Mutant] = &[
     Mutant {
         name: "the march ignores the reconstruction level and always samples LOD 0",
         class: "reconstruction",
-        pattern: "let texel = textureSampleLevel(grid_texture, grid_sampler, p, volume.flags.y).rg;",
-        replacement: "let texel = textureSampleLevel(grid_texture, grid_sampler, p, 0.0).rg;",
+        pattern: "let texel = textureSampleLevel(grid_texture, grid_sampler, t, volume.flags.y).rg;",
+        replacement: "let texel = textureSampleLevel(grid_texture, grid_sampler, t, 0.0).rg;",
         occurrences: 1,
         probe: &LONE_VOXEL,
     },
@@ -1224,7 +1224,7 @@ static MUTANTS: &[Mutant] = &[
     Mutant {
         name: "the shading gradient is taken of the reconstructed index, not the premultiplied channel",
         class: "shading",
-        pattern: "    return textureSampleLevel(grid_texture, grid_sampler, p, volume.flags.y).r;",
+        pattern: "    return textureSampleLevel(grid_texture, grid_sampler, t, volume.flags.y).r;",
         replacement: "    return field_at(p).x;",
         occurrences: 1,
         probe: &LIT_GRADIENT,
