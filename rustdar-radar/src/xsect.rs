@@ -877,10 +877,13 @@ fn render_with_sampler(
     let top_row_arl_km = axes.row_height_km_msl(0) - base_km_msl;
     summarize(&columns, &mut axes, top_row_arl_km);
 
-    let pixels = SECTION_WIDTH * SECTION_HEIGHT;
-    let mut image = vec![0u8; pixels * 4];
-    let mut values = vec![f32::NAN; pixels];
-    let mut status = vec![SampleStatus::NoCoverage.wire_code(); pixels];
+    // Seeded exactly as the three `vec!`s this replaced were, and carried from
+    // the cut before this one rather than allocated afresh. See [`POOLED_PLANES`].
+    let SectionPlanes {
+        mut image,
+        mut values,
+        mut status,
+    } = checkout();
 
     image
         .par_chunks_mut(SECTION_WIDTH * 4)
@@ -913,6 +916,287 @@ fn render_with_sampler(
         // "this rung, this old" without either being re-derived.
         tilt_collected_ms: sampler.collection_times_ms().collect(),
     })
+}
+
+/// The three planes of one section, held between cuts instead of allocated
+/// inside each one.
+///
+/// # What it is worth
+///
+/// A native section is `2048 × 1024` pixels, so the three planes are 8 MiB of
+/// RGBA, 8 MiB of `f32` values and 2 MiB of status bytes: **18,874,368 bytes,
+/// 4,608 pages**. All three are well under glibc's
+/// `DEFAULT_MMAP_THRESHOLD_MAX` of 33,554,432, so this is *not* the `mmap`
+/// cliff that `crate::render`'s `POOLED_CELLS` and
+/// `rustdar_frontend::volume_raymarch::coverage_premultiplied_into` were fixed
+/// for — these blocks come out of an arena, which is exactly the problem.
+///
+/// A cut runs on a thread of its own (`rustdar_frontend::offload` spawns one
+/// per job natively), so it takes whichever arena glibc hands that thread; the
+/// planes are freed when the section is dropped, the arena trims, and the next
+/// cut faults all 4,608 pages back in. Which arena it gets is decided by the
+/// parallel LDM decode that ran first: `scan::decoded` fans 50–130 records
+/// across the whole rayon pool, and a 32-thread pool leaves the process with
+/// enough arenas that no one of them keeps a warm 8 MiB chunk to hand back.
+///
+/// Measured on this box — 32 cores, `--release` (`lto = true`, `opt-level = 3`),
+/// loadavg 3.5–4.5 — over two volumes cut six ways each on a fresh thread per
+/// cut, nine cuts per geometry, interleaved arms with a fresh process for each,
+/// in a process that had already run the parallel decode. The ranges are across
+/// the six geometries, worst of them to best:
+///
+/// | | before | after |
+/// |---|---|---|
+/// | KFTG (21 sweeps), best ms | 9.01–12.61 | **4.08–7.41** |
+/// | KFTG, median ms | 9.57–12.94 | **4.33–7.63** |
+/// | KTLX (8 sweeps), best ms | 2.55–6.55 | **2.54–3.31** |
+/// | minor faults per cut | 3,314–4,916 | **0–9** |
+/// | allocations ≥ 1 MiB per cut | 3 | **0** |
+/// | allocations per cut, all sizes | 6,246 | 6,243 |
+/// | control, best ms | 2.38 | 2.36 |
+///
+/// The control is a fixed, allocation-free compute kernel over a slab already
+/// faulted in, run on a fresh thread beside every cut. It measures the box
+/// rather than the change and it does not move — 2.35–2.38 ms in every arm of
+/// every round, on both volumes — which is what says the section's numbers are
+/// the section's.
+///
+/// The fault count is the whole of the finding: 4,608 of those pages are these
+/// three planes, and the count is the same on every cut, on a raster whose size
+/// is a build constant. It is also the load-insensitive half of the evidence —
+/// the timings move with the box, the faults do not, and the same run under a
+/// loadavg of 10–16 gave 8.47–11.63 ms against 4.27–7.68 with these same two
+/// fault columns. The last row but one is the same fact from the other side:
+/// **three** allocations left, and they are the three planes. Nothing else the
+/// cut does was ever the problem, which is why the 6,243 that remain — the
+/// per-column tilt ladders, above all — are left alone. They cost 0 faults once
+/// these three stop churning the arena, so pooling them too would buy nothing
+/// that can be measured.
+///
+/// The light volume is where the shape of the defect is clearest. Its "before"
+/// column is bimodal, not merely slower: the first cuts in a process pay
+/// 3,200–3,700 faults and later ones pay none, because a small volume
+/// eventually leaves the arena a chunk it can reuse and a large one never does.
+/// After, every cut of both volumes is flat and faults nothing.
+///
+/// The decode itself does not move: 67.1 and 68.6 ms before against 68.3 and
+/// 64.3 after on KFTG, 13.3/15.2 against 14.0/12.8 on KTLX, and over eight
+/// further fresh processes per arm a best of 62.0 ms before against 56.3 after.
+/// Noise in both directions and no systematic change, which is what a pool that
+/// is not in the decode should look like.
+///
+/// `MALLOC_ARENA_MAX=1` removes the same faults and is **not** the fix. It is
+/// process-global, it would apply to every allocation in the app, and it is a
+/// trade rather than a win: on the same box and the same volumes it cost the
+/// decode 53.3 → 99.8 ms on KFTG and 13.8 → 29.4 ms on KTLX, because the decode
+/// is precisely the thing that wants many arenas. What it bought the section —
+/// 4.82–7.24 ms best on KFTG — is what this pool buys without charging the
+/// decode for it.
+///
+/// # Why the section, and what else is standing in the same place
+///
+/// The section is what this change fixes. It is **not** the only consumer with
+/// this exposure, and the two neighbours are worth naming precisely because the
+/// first survey of them was wrong in both directions.
+///
+/// **The plan view is worse, and is not fixed here.**
+/// `crate::render`'s `RenderBuffers::into_output` allocates a fresh
+/// `value_data: Vec<f32>` *and* a fresh `image: Vec<u8>` — 16 MiB each at side
+/// 2048 — writes both in full, and hands both to the caller. Only `cells` is
+/// pooled on that path. Measured on the same per-job thread after the same
+/// decode: **4,895–14,481 minor faults per render**, more than this path was
+/// paying. It is the larger case and it has work of its own; this paragraph
+/// exists so the next reader does not inherit a survey that missed it.
+///
+/// **The voxel grid is smaller than it looks, and improves for free.**
+/// [`crate::voxel::build_voxels`] is the obvious neighbour — same position
+/// after the decode, an index plane of exactly 8 MiB at
+/// [`crate::voxel::DESKTOP_SHAPE`] — and on a fresh thread per build it cost
+/// 762–778 faults against this path's 4,608, with **9.77–11.33 ms against
+/// 9.82–10.54 ms** under `MALLOC_ARENA_MAX=1`: no difference worth a change. In
+/// the production arm (`values_wanted: false`) it went **2,110–2,148 faults
+/// before this pool to 1–424 after it**, without being touched — the 18 MiB
+/// held here is what stops the arena trimming under it. So a grid that leaves
+/// the builder the way a section does would cost the same `Drop` and the same
+/// resident spare to buy something it is already getting. It is left alone.
+///
+/// # Why one process-wide slot, and not the caller's buffer
+///
+/// This is `crate::render`'s `POOLED_CELLS` argument, and it applies here
+/// unchanged because the callers are the same three:
+/// `rustdar_frontend::offload::execute` is documented *pure* and is the one
+/// implementation shared by a fresh `std::thread` per job on native, a browser
+/// worker reached over a message port that cannot be handed a pointer, and the
+/// inline fallback. None of the three has a buffer to lend.
+/// `rustdar_frontend::volume_bridge::VolumeResources::staging` is the other
+/// shape and is right where it is used, because *its* caller is the frame
+/// thread, which spans every upload. There is no such caller here.
+///
+/// A `thread_local` is worse than useless for the same reason: the native job
+/// thread is created for one cut and joined after it, so the reuse rate would
+/// be exactly zero.
+///
+/// One slot rather than a free list, again as the cells pool has it. Two
+/// sections alive at once — a pane's and a loop frame's — means the second
+/// allocates, exactly as it would with no pool, plus one uncontended `Mutex`
+/// acquire around an `Option::take`. What is bought is the sequential case,
+/// which is every case measured above: a pane re-cutting, a product switching,
+/// a loop stepping.
+///
+/// # Residency
+///
+/// **One spare set of planes, from the first cut onwards**: 18 MiB native,
+/// 4.5 MiB on wasm32, where the raster is a quarter the pixels. It is a spare
+/// rather than an addition to the peak — a section that is alive is holding
+/// the buffers, and the slot is empty while it does — so the ceiling is "the
+/// sections alive at once, plus one".
+///
+/// wasm32 carries it too, and has less to win: dlmalloc in a linear memory
+/// that never shrinks recycles an 8 MiB block as readily as any other and
+/// there are no fresh zero pages to fault. It is carried regardless, because a
+/// `cfg`-gated behavioural split here would be a second section renderer that
+/// no row of this workspace's gate runs the tests of. Nothing in this module
+/// is target-conditional; [`crate::par`] is where the one real target split
+/// lives.
+static POOLED_PLANES: std::sync::Mutex<Option<SectionPlanes>> = std::sync::Mutex::new(None);
+
+/// The three parallel planes of one section — see [`CrossSection`], whose
+/// fields these become.
+struct SectionPlanes {
+    image: Vec<u8>,
+    values: Vec<f32>,
+    status: Vec<u8>,
+}
+
+impl SectionPlanes {
+    /// Nothing at all, which [`fit`](Self::fit) turns into a section's worth of
+    /// planes. What a pool miss starts from.
+    fn empty() -> Self {
+        Self {
+            image: Vec::new(),
+            values: Vec::new(),
+            status: Vec::new(),
+        }
+    }
+
+    /// Make these planes exactly what `vec![0u8; pixels * 4]`,
+    /// `vec![f32::NAN; pixels]` and `vec![NoCoverage; pixels]` would be.
+    ///
+    /// # Why the seed is re-established rather than assumed
+    ///
+    /// [`render_with_sampler`]'s raster loop writes **every** pixel of all
+    /// three planes — `columns` is `0..SECTION_WIDTH` long unconditionally and
+    /// the row chunks cover the buffer exactly — so a pooled buffer's contents
+    /// are, today, unobservable. That is a property of one loop, not of this
+    /// type, and it is the property that has already been broken twice in this
+    /// campaign. Re-seeding costs what the three `vec!`s cost anyway: two of
+    /// them were an allocation plus a fill, and the third an `alloc_zeroed`
+    /// whose zero pages are exactly the 2,048 faults this pool exists to
+    /// remove. So the safe version is also the cheaper one, and what a caller
+    /// gets back is indistinguishable from a fresh allocation rather than
+    /// merely equal to one on the paths that exist right now.
+    ///
+    /// `clear` then `resize` rather than `resize` then `fill`: it is total in
+    /// both directions in one step. The raster is a build constant, so a
+    /// buffer coming out of the slot is always already the right length and
+    /// the resize is a fill over retained capacity — but "always" here is a
+    /// fact about two constants, and a length that is *made* correct cannot
+    /// disagree with the one the section is about to claim, where a
+    /// `debug_assert` would leave a release build indexing off the end.
+    fn fit(&mut self) {
+        let pixels = SECTION_WIDTH * SECTION_HEIGHT;
+        self.image.clear();
+        self.image.resize(pixels * 4, 0u8);
+        self.values.clear();
+        self.values.resize(pixels, f32::NAN);
+        self.status.clear();
+        self.status
+            .resize(pixels, SampleStatus::NoCoverage.wire_code());
+    }
+}
+
+/// A seeded, correctly-sized set of planes — the pool's if it has one.
+fn checkout() -> SectionPlanes {
+    // Bound to a `let`, and deliberately not written as
+    // `pool().take().unwrap_or_else(..)`: in that shape the temporary guard
+    // lives to the end of the statement and holds the pool lock across the
+    // fallback allocation below — 18 MiB and its page faults, under a
+    // process-wide mutex, exactly where concurrent cuts that all miss the slot
+    // would queue on each other instead of allocating in parallel as they do
+    // with no pool at all.
+    //
+    // **Nothing catches this if it is edited back.** It is not a nursery lint
+    // that this gate happens not to run: `clippy::significant_drop_in_scrutinee`
+    // and `significant_drop_tightening` were both enabled explicitly against
+    // the method-chain version and **neither fires**, because they look at
+    // `match` and `if let` scrutinees rather than at a temporary in a chain. Nor
+    // does any test — holding the lock across the allocation changes no output,
+    // only contention, so a mutation that does it passes the whole suite. The
+    // guarantee is the `let` and this comment, and it was verified by
+    // measurement rather than by reading: with the two statements separated a
+    // `try_lock` taken inside the fallback **succeeds**, and with them fused it
+    // **fails**.
+    let taken = pool().take();
+    let mut planes = taken.unwrap_or_else(SectionPlanes::empty);
+    planes.fit();
+    planes
+}
+
+/// Offer a set of planes back, keeping them only if the slot is free.
+///
+/// Called from [`CrossSection`]'s [`Drop`], which is the only place a section's
+/// planes stop being reachable. See [`POOLED_PLANES`] for why the slot is one
+/// and not many.
+fn recycle(planes: SectionPlanes) {
+    let mut pool = pool();
+    if pool.is_none() {
+        *pool = Some(planes);
+    }
+}
+
+/// The pool, with a poisoned lock read as a live one.
+///
+/// **What the lock covers is one `Option::take` in [`checkout`] and one
+/// `is_none` plus a move-assign in [`recycle`], and nothing else.** The 18 MiB
+/// fallback allocation, the re-seed, the whole raster loop and the drop of a
+/// set [`recycle`] declines to keep are all outside it — the guard goes out of
+/// scope before the argument does, which is a fact about Rust's drop order for
+/// a local against a by-value parameter and was checked rather than assumed.
+/// That is what makes it a lock cuts never contend on for any measurable time,
+/// and it is also why nothing under it can panic, which makes poisoning
+/// unreachable. Recovering rather than unwrapping keeps a panic that cannot
+/// happen out of the renderer anyway.
+fn pool() -> std::sync::MutexGuard<'static, Option<SectionPlanes>> {
+    POOLED_PLANES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A section's planes go back to the pool when the section does.
+///
+/// This is the counterpart of `crate::render`'s `RenderBuffers::into_output`,
+/// and it is a `Drop` rather than a step in the renderer because the section's
+/// planes **are** its output: they leave [`render_with_sampler`] inside the
+/// `CrossSection` and the last moment at which they are nobody's is this one.
+///
+/// Every `CrossSection` that exists has planes of exactly the raster's size —
+/// [`render_with_sampler`] builds them that way and [`from_parts`](CrossSection::from_parts)
+/// refuses anything else — so what goes back is always what the next cut wants,
+/// whichever route the section came by. A section decoded off a worker's reply
+/// therefore feeds the pool as readily as one this thread cut, which is the
+/// case that matters on the web.
+///
+/// `mem::take` leaves three empty `Vec`s behind for the ordinary field drops to
+/// run over, which is why this does not double-free and does not need
+/// `ManuallyDrop`.
+impl Drop for CrossSection {
+    fn drop(&mut self) {
+        recycle(SectionPlanes {
+            image: std::mem::take(&mut self.image),
+            values: std::mem::take(&mut self.values),
+            status: std::mem::take(&mut self.status),
+        });
+    }
 }
 
 /// One output column's ground range and the tilt ladder over it.

@@ -3059,3 +3059,115 @@ fn an_unclocked_ladder_reports_no_span_rather_than_a_zero_one() {
         "an unclocked rung dragged the span back to the epoch",
     );
 }
+
+/// A set of planes out of the pool is what three fresh `vec!`s would be — the
+/// right length, and seeded, whatever it was holding before.
+///
+/// # Why this tests the mechanism and not the renderer
+///
+/// The end-to-end claim — a cut never inherits a pixel from the cut before it —
+/// is `tests/section_plane_pool.rs`, and that file says why it has to be a
+/// process of its own. What it *cannot* do is fail today: this module's raster
+/// loop writes every pixel of all three planes, so a pooled buffer's contents
+/// are currently unobservable and a version of [`SectionPlanes::fit`] that
+/// skipped the re-seed would pass it. That is exactly the vacuity that let a
+/// stale tail through twice already in this campaign.
+///
+/// So the invariant is pinned here instead, on the primitive, where it is
+/// observable directly and where no global slot is involved — the planes below
+/// are built by hand, so no other test can take them mid-assertion and there is
+/// nothing to make flaky.
+///
+/// The four starting states are the four a slot can hold: nothing (a pool
+/// miss), a longer buffer (which a grow-only `fit` would leave a stale tail
+/// on), a shorter one (which a shrink-only `fit` would leave short — and
+/// `from_parts` would then refuse the section built from it), and the
+/// production case, an exactly-sized set full of the previous cut's bytes.
+#[test]
+fn a_fitted_plane_set_is_what_three_fresh_vecs_would_be() {
+    let pixels = SECTION_WIDTH * SECTION_HEIGHT;
+    // The three `vec!`s this pool replaced, written out here rather than
+    // referenced, so that changing the seed in `fit` fails this test instead of
+    // moving the expectation along with it.
+    let fresh_image = vec![0u8; pixels * 4];
+    let fresh_values = vec![f32::NAN; pixels];
+    let fresh_status = vec![SampleStatus::NoCoverage.wire_code(); pixels];
+
+    // `0xa5` and `Value` and a real number, because none of the three is the
+    // seed: a plane that came back un-reseeded is visible in every byte.
+    let poison = |n: usize| SectionPlanes {
+        image: vec![0xa5u8; n * 4],
+        values: vec![7.5f32; n],
+        status: vec![SampleStatus::Value.wire_code(); n],
+    };
+
+    // Reported by position rather than by `assert_eq!` on the planes
+    // themselves: these are 8 MiB each, and a failed `assert_eq!` prints both
+    // sides in full. The index is also the more useful fact — a stale *tail*
+    // and a stale *whole plane* are different defects and the first differing
+    // element tells them apart.
+    fn first_diff<T: PartialEq + Copy>(got: &[T], want: &[T]) -> Option<usize> {
+        if got.len() != want.len() {
+            return Some(got.len().min(want.len()));
+        }
+        got.iter().zip(want).position(|(a, b)| a != b)
+    }
+
+    for (label, mut planes) in [
+        ("a pool miss", SectionPlanes::empty()),
+        ("a longer set", poison(pixels + 4096)),
+        ("a shorter set", poison(pixels - 4096)),
+        ("the previous cut\'s set", poison(pixels)),
+    ] {
+        planes.fit();
+
+        assert_eq!(
+            (planes.image.len(), planes.values.len(), planes.status.len()),
+            (fresh_image.len(), fresh_values.len(), fresh_status.len()),
+            "{label}: a plane came back a different length from the raster",
+        );
+        assert_eq!(
+            first_diff(&planes.image, &fresh_image),
+            None,
+            "{label}: the image plane differs from `vec![0u8; pixels * 4]` at \
+             this index",
+        );
+        assert_eq!(
+            first_diff(&planes.status, &fresh_status),
+            None,
+            "{label}: the status plane differs from `vec![NoCoverage; pixels]` \
+             at this index",
+        );
+        // Bit patterns: `f32::NAN != f32::NAN`, so a plane of the seed compares
+        // unequal to itself under `==` and the assertion would be vacuously
+        // *failing* rather than vacuously passing. `vec![f32::NAN; n]` is one
+        // bit pattern repeated, and it is the pattern a `from_parts` round trip
+        // has to preserve.
+        let got_bits: Vec<u32> = planes.values.iter().map(|v| v.to_bits()).collect();
+        let want_bits: Vec<u32> = fresh_values.iter().map(|v| v.to_bits()).collect();
+        assert_eq!(
+            first_diff(&got_bits, &want_bits),
+            None,
+            "{label}: the value plane differs from `vec![f32::NAN; pixels]` at \
+             this index",
+        );
+    }
+
+    // The poison is genuinely different from the seed, so none of the four
+    // cases above passed by starting where it finished.
+    let unfitted = poison(pixels);
+    assert_eq!(
+        first_diff(&unfitted.image, &fresh_image),
+        Some(0),
+        "the poison is the seed, so this test cannot fail whatever `fit` does",
+    );
+    assert_eq!(
+        first_diff(&unfitted.status, &fresh_status),
+        Some(0),
+        "likewise for the status plane",
+    );
+    assert!(
+        unfitted.values.iter().all(|v| !v.is_nan()),
+        "likewise for the value plane",
+    );
+}
