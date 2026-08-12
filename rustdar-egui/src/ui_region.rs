@@ -77,6 +77,46 @@
 /// side. If the plan view's arm ever calls `zoom_speed`, this follows it.
 const ZOOM_SPEED: f64 = 2.0;
 
+/// Points of wheel travel worth one Web Mercator zoom level.
+///
+/// **The whole of one notch, not one frame's share of it.**
+///
+/// It is 120 and not something tuned because it *is* the shipped feel at 60 Hz:
+/// the frame-time multiplier this replaced worked out to
+/// `smooth_scroll_delta.y / 120` exactly when a frame took 1/60 s. See
+/// [`zoom_step`] for why that was only ever true at 60 Hz.
+///
+/// # What a notch is worth, per backend — and the 3× that is not this bug
+///
+/// 120 points is a browser notch. Chromium spells it `deltaY: 120` outright;
+/// Firefox spells the same detent `deltaY: 6` in line mode and
+/// [`crate::ui_input::normalize_wheel_units`] rescales it to 120. Both arrive
+/// here as 120, so a web notch is one zoom level.
+///
+/// **Native is not 120.** winit reports a discrete wheel as
+/// `MouseScrollDelta::LineDelta(0, ±1)`, `egui-winit` maps that to
+/// `MouseWheelUnit::Line`, and egui multiplies by `line_scroll_speed` — 40.0
+/// off the web against 8.0 on it. So a native notch reaches this function as
+/// **40 points, or 0.333 zoom levels**, a third of what the same wheel does in
+/// a browser. `normalize_wheel_units` is `cfg(target_arch = "wasm32")` at its
+/// call site, so nothing rescales the native spelling.
+///
+/// That gap is real, measured, and **older than the frame-rate bug this
+/// constant fixes** — it is a question about which feel is right for both
+/// platforms, not about correctness, so it is recorded rather than quietly
+/// decided. What this commit changes is its *status*: the line above now states
+/// "120 points is one zoom level" as a contract, and one platform delivers a
+/// third of it.
+///
+/// **Un-gating `normalize_wheel_units` is not the fix, and would make it
+/// worse.** `ui_input::PX_PER_WHEEL_LINE` is 20.0 because *Firefox*
+/// reports six lines per notch and 6 × 20 lands on Chromium's 120. Native winit
+/// reports **one** line per notch, so the same constant applied natively gives
+/// 1 × 20 = 20 points — half of today's 40, not the 120 that would close the
+/// gap. Whatever closes it needs a per-backend scale, not the browser's number
+/// applied to a different spelling of a notch.
+const POINTS_PER_ZOOM_LEVEL: f64 = 120.0;
+
 /// This frame's geography zoom, in zoom **levels**, from whatever device
 /// produced one.
 ///
@@ -92,21 +132,199 @@ const ZOOM_SPEED: f64 = 2.0;
 ///
 /// The two branches are walkers' own, for the `zoom_with_ctrl(false)` the plan
 /// view selects: `zoom_delta` carries a pinch or a ctrl-scroll, and a frame
-/// with neither — which reports exactly 1.0 — falls back to the raw scroll,
-/// scaled by the frame time so a wheel notch is worth the same at any frame
-/// rate.
+/// with neither — which reports exactly 1.0 — falls back to the raw scroll.
+///
+/// # Why the frame time is not in here, where walkers has it
+///
+/// **It was, and it was the whole of a reported bug**:
+///
+/// > scrolling behavior has gotten choppy. When I'm zoomed out wide, a zoom
+/// > moves a lot more than a close zoom, which is a tiny jump.
+///
+/// walkers multiplies the scroll by
+/// `stable_dt.clamp(predicted_dt * 0.5, predicted_dt * 2.0)`, and this function
+/// restated that faithfully. It reads like the frame-rate normalisation every
+/// animation needs, and it is the exact opposite of one, because
+/// `smooth_scroll_delta` **is not a rate**. egui does not hand a frame the
+/// scroll that arrived during it: `input_state/wheel_state.rs::after_events`
+/// holds an accumulator and releases `1 - 0.1^(dt/0.1)` of it per frame, a
+/// low-pass filter whose output sums to its input *whatever the frame rate is*.
+/// It is a quantity of points, already frame-rate independent, and multiplying
+/// a quantity by a time makes the total ∝ the frame time.
+///
+/// Measured through a real `egui::Context`, one notch at the shipped
+/// `predicted_dt` — which `egui-winit` never writes, so it is
+/// `RawInput::default()`'s 60 Hz for the life of the process, and the clamp is
+/// therefore a fixed `1/120 ..= 1/30`:
+///
+/// | frame rate | zoom levels per notch |
+/// |---|---|
+/// | 240 Hz | 0.50 |
+/// | 120 Hz | 0.50 |
+/// | 60 Hz | 1.00 |
+/// | 30 Hz | 2.00 |
+/// | 10 Hz | 2.00 |
+/// | 3.5 Hz (web, alerts on) | 2.00 |
+///
+/// A **4× spread**, saturating at both clamp bounds, which is both halves of
+/// the report at once. Zoomed out wide is when the app is slowest — more
+/// overlay area, more features — so a notch there was 2.0 levels, a
+/// quadrupling of scale in one click; zoomed in the frames are quick and the
+/// same notch was 0.5 levels. The render cost was feeding back into the input.
+///
+/// So the frame time is gone and [`POINTS_PER_ZOOM_LEVEL`] stands in its place:
+/// the 60 Hz row above, held at every frame rate. Pinned by
+/// `a_notch_is_the_same_zoom_at_every_frame_rate`.
 fn zoom_step(input: &egui::InputState) -> f64 {
     let mut delta = f64::from(input.zoom_delta());
     if delta == 1.0 {
-        delta = 1.0
-            + f64::from(
-                input.smooth_scroll_delta.y
-                    * input
-                        .stable_dt
-                        .clamp(input.predicted_dt * 0.5, input.predicted_dt * 2.0),
-            ) / 4.0;
+        delta = 1.0 + f64::from(input.smooth_scroll_delta.y) / (POINTS_PER_ZOOM_LEVEL * ZOOM_SPEED);
     }
     (delta - 1.0) * ZOOM_SPEED
+}
+
+/// What walkers' own frame-time multiplier has to be divided by for a
+/// `walkers::Map` to zoom the way [`zoom_step`] does.
+///
+/// The plan view reaches walkers' arithmetic rather than this module's, so
+/// fixing [`zoom_step`] alone would fix the 3D pane and leave the main map with
+/// the bug — and leave the two disagreeing by up to 4× as well, which is the
+/// thing `a_scroll_moves_a_3d_pane_the_same_distance_it_moves_a_plan_view`
+/// exists to refuse. walkers has no lever for this: `zoom_speed` scales the
+/// combined delta, so it moves pinch and double-click zoom with it and cannot
+/// be a function of the frame rate anyway.
+///
+/// What it does have is the input it reads. `smooth_scroll_delta` is a public
+/// field that egui expects consumers to write — `ScrollArea` zeroes it to say
+/// it took the scroll — so the correction goes there: scale the scroll by the
+/// reciprocal of the multiplier walkers is about to apply, and the product is
+/// [`POINTS_PER_ZOOM_LEVEL`]'s constant again.
+///
+/// # Why the finiteness test is not dead code
+///
+/// `f32::clamp` **propagates a NaN `self`** — it is written as two `if`s that a
+/// NaN fails both of, so `NAN.clamp(0.00833, 0.03333)` is `NAN`, verified with
+/// standalone `rustc` rather than argued from the docs. `stable_dt` is a
+/// wall-clock difference the platform supplies, so that is a reachable input,
+/// and without the test a NaN would be multiplied into `smooth_scroll_delta`
+/// and from there into `MapMemory::zoom` — which is stored, so one bad frame
+/// would poison the map until the pane was rebuilt. `applied > 0.0` covers the
+/// other end: a `predicted_dt` of zero clamps to zero and would divide by it.
+/// Both arms are pinned by `a_frame_with_unusable_timing_leaves_walkers_alone`.
+///
+/// A NaN `predicted_dt` is the one case not handled here, and deliberately:
+/// `clamp` asserts `min <= max`, which a NaN bound fails, so it panics. walkers
+/// runs the identical expression on the identical input a few microseconds
+/// later, so that frame was going to panic either way; mirroring walkers
+/// exactly is worth more than being the one place that survives it, because
+/// the mirroring is what makes the cancellation exact.
+fn wheel_rate_correction(input: &egui::InputState) -> f32 {
+    // walkers' `Map::zoom_delta`, restated — the same restatement `zoom_step`
+    // is, and drifts from walkers in the same test.
+    let applied = input
+        .stable_dt
+        .clamp(input.predicted_dt * 0.5, input.predicted_dt * 2.0);
+    // The frame time walkers' `/ 4.0` was calibrated at, and the one
+    // `POINTS_PER_ZOOM_LEVEL` restates: `120 * (1/60) / 4 * 2` is one level.
+    const NOMINAL_FRAME_S: f32 = 1.0 / 60.0;
+    if applied.is_finite() && applied > 0.0 {
+        NOMINAL_FRAME_S / applied
+    } else {
+        1.0
+    }
+}
+
+/// Show a `walkers::Map` with the wheel held steady against the frame rate,
+/// then hand egui its own scroll back.
+///
+/// **The map goes in the closure.** An earlier version returned an RAII guard
+/// and told the caller to keep it alive, which is a rule the type system does
+/// not enforce: `#[must_use]` catches a bare `steady_wheel(ctx);` statement and
+/// does *not* catch `let _ = steady_wheel(ctx);` — that binding is rustc's own
+/// suggested way to silence the lint, so the documented footgun was the one
+/// shape the documented protection missed. Taking the closure makes the scope
+/// the call itself, which cannot be got wrong.
+///
+/// See [`wheel_rate_correction`] for why the correction is applied to the input
+/// rather than to walkers.
+///
+/// # Why it is scoped rather than applied once per frame
+///
+/// `smooth_scroll_delta` is what every `ScrollArea` in the app reads too, and a
+/// `ScrollArea` takes it as points with no frame-time multiplier on it —
+/// already correct, and scaling it would break list scrolling in the opposite
+/// direction. Only the map wants this, so only the map gets it.
+///
+/// Restoring rather than zeroing keeps the blast radius at nothing: walkers has
+/// never consumed the scroll it zooms with, so a wheel over a map pane goes on
+/// reaching whatever else reads it, exactly as before. The restore is a `Drop`
+/// so that a panic inside the closure cannot leave the frame's input scaled.
+///
+/// # What the caller must not change without reading this
+///
+/// walkers reads `smooth_scroll_delta` **twice**: the zoom at `map.rs:281`,
+/// which is what this exists to correct, and pan-by-scroll at `map.rs:246`.
+/// The second read is live only when `Map::panning` is on, and the plan view
+/// passes `panning(false)` — so today the correction reaches the zoom and
+/// nothing else. **Turning panning on would make a scaled scroll pan the map
+/// too**, by the reciprocal of the frame time, which is a far worse bug than
+/// the one this fixes. If panning is ever wanted, the correction has to move
+/// off the shared field and onto something only the zoom reads.
+///
+/// # Why the plan view is not simply driven off [`zoom_step`] instead
+///
+/// That was the first design and it is blocked, not merely inconvenient.
+/// walkers anchors its zoom on the cursor by rewriting `MapMemory::center_mode`
+/// either side of the zoom, and `Center` and `AdjustedPosition` are both
+/// private to walkers 0.56 — `MapMemory` exposes `zoom()` and `set_zoom()` and
+/// no `zoom_by`, so a caller can move the zoom but cannot hold the ground under
+/// the pointer still while doing it. Reimplementing cursor-anchored zoom
+/// outside the crate means reimplementing the projection it anchors through.
+///
+/// **The real fix is upstream**: walkers should not multiply
+/// `smooth_scroll_delta` by a frame time at all, for the reason [`zoom_step`]
+/// gives. When that lands this function deletes, rather than becoming
+/// permanent — it is a compensation for a specific upstream defect and it says
+/// so on purpose.
+pub(crate) fn steady_wheel<R>(ctx: &egui::Context, map: impl FnOnce() -> R) -> R {
+    /// Puts egui's own scroll back, panic or not.
+    struct Restore {
+        ctx: egui::Context,
+        y: f32,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let y = self.y;
+            self.ctx.input_mut(|input| input.smooth_scroll_delta.y = y);
+            HELD.with(|held| held.set(false));
+        }
+    }
+
+    // Nesting would apply `wheel_rate_correction` twice and square it — a 289 ms
+    // frame would come out 300× over rather than right. Unreachable today (the
+    // one call site is a leaf), so this is a `debug_assert` guarding a future
+    // caller rather than a condition anyone has hit. Single-threaded on every
+    // target: wasm32 has no threads and egui's UI pass is one thread anyway.
+    debug_assert!(
+        !HELD.with(std::cell::Cell::get),
+        "steady_wheel is already open on this thread; nesting squares the correction",
+    );
+    HELD.with(|held| held.set(true));
+
+    let _restore = Restore {
+        ctx: ctx.clone(),
+        y: ctx.input_mut(|input| {
+            let before = input.smooth_scroll_delta.y;
+            input.smooth_scroll_delta.y = before * wheel_rate_correction(input);
+            before
+        }),
+    };
+    map()
+}
+
+thread_local! {
+    /// Whether a [`steady_wheel`] scope is already open on this thread.
+    static HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// This frame's scroll or pinch as a multiplicative dolly for

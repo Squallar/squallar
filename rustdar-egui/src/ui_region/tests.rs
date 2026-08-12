@@ -21,8 +21,72 @@
 
 use super::{
     COVERAGE_MARGIN, MAX_FRAMING_PASSES, dolly_for_step, ground_half_extent, viewport_for_region,
-    zoom_step,
+    wheel_rate_correction, zoom_step,
 };
+
+/// A frame whose timing is unusable leaves walkers exactly as it found it.
+///
+/// **This is what makes [`wheel_rate_correction`]'s finiteness test reachable**,
+/// and it is reachable: `f32::clamp` is two `if`s that a NaN fails both of, so a
+/// NaN `stable_dt` comes out of the clamp as a NaN rather than being bounded
+/// away. `stable_dt` is a wall-clock difference the platform hands egui, so that
+/// is an input and not a hypothetical — and the correction is multiplied into
+/// `smooth_scroll_delta`, which walkers puts into `MapMemory::zoom`, which is
+/// *stored*. One NaN frame would poison the pane's zoom until it was rebuilt.
+///
+/// 1.0 rather than a refusal because leaving walkers alone is the conservative
+/// answer: the frame zooms by whatever walkers would have done unaided, which is
+/// the behaviour that shipped before this module existed.
+#[test]
+fn a_frame_with_unusable_timing_leaves_walkers_alone() {
+    let with = |stable_dt: f32, predicted_dt: f32| {
+        let mut input = egui::InputState::default();
+        input.stable_dt = stable_dt;
+        input.predicted_dt = predicted_dt;
+        wheel_rate_correction(&input)
+    };
+    assert_eq!(
+        with(f32::NAN, 1.0 / 60.0),
+        1.0,
+        "a NaN frame time survives the clamp, so it has to be caught here",
+    );
+    assert_eq!(
+        with(1.0 / 60.0, 0.0),
+        1.0,
+        "a zero predicted_dt clamps the multiplier to zero, which would divide by it",
+    );
+    // The other side of the same guard: an infinity *is* bounded by the clamp,
+    // so it must come out as a real correction rather than be refused with it.
+    assert!(
+        (with(f32::INFINITY, 1.0 / 60.0) - 0.5).abs() < 1e-6,
+        "an infinite frame time clamps to predicted_dt * 2, a real correction",
+    );
+    // The control: an ordinary 60 Hz frame is corrected by exactly nothing,
+    // because 1/60 is the rate the constant is calibrated at.
+    assert!(
+        (with(1.0 / 60.0, 1.0 / 60.0) - 1.0).abs() < 1e-6,
+        "a 60Hz frame must need no correction at all",
+    );
+}
+
+/// Opening a second [`super::steady_wheel`] inside the first is refused.
+///
+/// The correction is a *multiplication* into a shared field, so nesting squares
+/// it: at the measured web frame time that is a 17× scroll rather than a 1×,
+/// and the map would leap seventeen zoom levels on one notch. Nothing nests
+/// today — the one call site is a leaf — so this exists to keep the guard from
+/// being the thing it is guarding against: an unreachable protection nobody
+/// ever proved fires. It fires.
+///
+/// Debug-only because `debug_assert` compiles out of a release build, and a
+/// `should_panic` test that cannot panic is a test that fails.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "nesting squares the correction")]
+fn nesting_the_wheel_guard_is_refused() {
+    let ctx = egui::Context::default();
+    super::steady_wheel(&ctx, || super::steady_wheel(&ctx, || ()));
+}
 
 /// An input frame carrying `scroll` points of wheel and nothing else, at
 /// egui's own default 60 Hz timing.
@@ -35,6 +99,252 @@ fn scroll_frame(scroll: f32) -> egui::InputState {
     let mut input = egui::InputState::default();
     input.smooth_scroll_delta.y = scroll;
     input
+}
+
+/// The whole of one wheel notch, in zoom levels, at a frame rate of `dt`.
+///
+/// **This is the measurement, not a fixture.** `scroll_frame` writes
+/// `smooth_scroll_delta` by hand and so cannot see the thing being tested:
+/// egui does not hand a frame the scroll that arrived during it, it hands the
+/// frame a *slice* of an accumulator it drains over about 100 ms
+/// (`input_state/wheel_state.rs::after_events`). So one notch is spread across
+/// however many frames fit in that window, and what a user feels is the
+/// **sum**, not any one frame's share. Only a real `egui::Context` run frame by
+/// frame produces that, which is what this does.
+///
+/// Runs until the accumulator is dry and stays dry, so the answer is the whole
+/// gesture rather than a prefix of it.
+fn notch_levels(dt: f64, notch_points: f32) -> f64 {
+    // The shipped `predicted_dt`. `egui-winit` never writes the field — it is
+    // not mentioned anywhere in the crate — so it holds `RawInput::default()`'s
+    // 60 Hz for the life of the process, whatever the app is really running at.
+    // That is what bounds `zoom_step`'s clamp, so a measurement that moved it
+    // with the frame rate would be measuring a program nobody runs.
+    const SHIPPED_PREDICTED_DT: f32 = 1.0 / 60.0;
+    let ctx = egui::Context::default();
+    let mut time = 0.0;
+    let mut total = 0.0;
+    let mut quiet = 0;
+    for frame in 0..2000 {
+        let events = if frame == 1 {
+            vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, notch_points),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::default(),
+            }]
+        } else {
+            Vec::new()
+        };
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 800.0),
+            )),
+            time: Some(time),
+            predicted_dt: SHIPPED_PREDICTED_DT,
+            events,
+            ..Default::default()
+        });
+        let step = ctx.input(zoom_step);
+        let _ = ctx.end_pass();
+        total += step;
+        if frame > 1 {
+            if step == 0.0 {
+                quiet += 1;
+                if quiet > 30 {
+                    break;
+                }
+            } else {
+                quiet = 0;
+            }
+        }
+        time += dt;
+    }
+    total
+}
+
+/// The frame rates this app is measured at: a 240 Hz desktop, a hitched web
+/// frame, and everything between.
+///
+/// The last row is not hypothetical — it is the measured p50 frame duration of
+/// the shipped web build in Chromium with the NWS alerts overlay on, where the
+/// overlay raster runs inline on the main thread.
+const FRAME_RATES: &[(&str, f64)] = &[
+    ("240Hz", 1.0 / 240.0),
+    ("120Hz", 1.0 / 120.0),
+    ("60Hz", 1.0 / 60.0),
+    ("30Hz", 1.0 / 30.0),
+    ("10Hz", 0.1),
+    ("3.5Hz web p50", 0.2895),
+];
+
+/// How far apart two frame rates' answers are allowed to land, as a fraction.
+///
+/// Set by what the `f32` accumulator inside egui's own smoothing leaves behind
+/// — 4.4e-8 at the worst of the rates above — with a decimal order of margin.
+/// The defect this bounds was a factor of **four**, so this is four hundred
+/// thousand times tighter than the thing it is watching for.
+const RATE_TOLERANCE: f64 = 1e-6;
+
+/// **The reported bug, as a gate**: one wheel notch is the same zoom whatever
+/// the frame rate.
+///
+/// > scrolling behavior has gotten choppy. When I'm zoomed out wide, a zoom
+/// > moves a lot more than a close zoom, which is a tiny jump. I think it has
+/// > to do with the processing done during zoom.
+///
+/// The user's diagnosis was right, and this is the arithmetic of it. Before the
+/// fix this table read 0.50 / 0.50 / 1.00 / 2.00 / 2.00 / 2.00 — a 4× spread
+/// driven by nothing but how long the frame took, saturating at both ends of
+/// walkers' `clamp(predicted_dt * 0.5, predicted_dt * 2.0)`. Zoomed out wide is
+/// when the app is slowest, so that is where a notch was worth a *quadrupling*
+/// of scale; zoomed in the frames are quick and the same notch was a 1.41×.
+///
+/// One level per notch is the mapping every map application has, and
+/// [`super::POINTS_PER_ZOOM_LEVEL`] is what holds it.
+///
+/// The tolerance is [`RATE_TOLERANCE`], which is what is left of the coupling
+/// rather than a margin for it: at 240 Hz the notch is spread over about
+/// twenty-five frames and egui's accumulator is `f32`, so the sum lands 4.4e-8
+/// off. That is the arithmetic of the filter, not the frame time — a returning
+/// bug moves this by factors, not by ulps.
+#[test]
+fn a_notch_is_the_same_zoom_at_every_frame_rate() {
+    for &(name, dt) in FRAME_RATES {
+        let levels = notch_levels(dt, 120.0);
+        assert!(
+            (levels - 1.0).abs() < RATE_TOLERANCE,
+            "one notch at {name} moved {levels} zoom levels, not the 1.0 it moves \
+             everywhere else - the frame time is back in the zoom step",
+        );
+    }
+}
+
+/// The gesture is linear in how far the wheel turned, at any frame rate.
+///
+/// The fix could have been a clamp — pin the step and cap it — and that would
+/// pass the table above while quietly making a fast flick worth the same as a
+/// slow one. Two notches are two levels, and a half notch is half a level.
+#[test]
+fn the_zoom_follows_how_far_the_wheel_turned() {
+    for &(name, dt) in FRAME_RATES {
+        for (points, want) in [(240.0, 2.0), (60.0, 0.5), (-120.0, -1.0)] {
+            let levels = notch_levels(dt, points);
+            assert!(
+                (levels - want).abs() < RATE_TOLERANCE * want.abs(),
+                "{points} points at {name} moved {levels} zoom levels, not {want}",
+            );
+        }
+    }
+}
+
+/// One wheel notch over the **plan view**, in zoom levels, at a frame rate of
+/// `dt` — driven through the real UI and the real `walkers::Map`.
+///
+/// The two tests above measure [`zoom_step`], which is the 3D pane's arm. The
+/// plan view does not go through it: it reaches `walkers::Map::zoom_delta`,
+/// which holds its own copy of the frame-time multiplier and cannot be
+/// configured out of it. So the plan view is measured where it actually lives —
+/// through `render_panes`, through walkers, off `MapMemory::zoom` — and
+/// [`super::steady_wheel`] is what has to make this flat.
+///
+/// Runs until the zoom stops moving, for the same reason [`notch_levels`] does:
+/// a notch is spread over about 100 ms of frames, so a fixed frame count reads
+/// a different fraction of the gesture at every rate and would report the
+/// coupling as fixed when it was not.
+fn plan_view_notch_levels(dt: f64) -> f64 {
+    use crate::input_harness::InputHarness;
+
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.set_pane_count(1);
+    h.load_scan("KTLX");
+    h.gui_mut()
+        .pane_mut(0)
+        .expect("a pane")
+        .map_memory
+        .set_zoom(9.0)
+        .expect("9 is inside walkers' range");
+    h.warm_up();
+
+    let rect = h.pane_rects()[0];
+    let zoom = |h: &mut InputHarness| h.gui_mut().pane(0).expect("a pane").map_memory.zoom();
+    let before = zoom(&mut h);
+
+    h.scroll_at(rect.center(), egui::vec2(0.0, 120.0));
+    let mut last = before;
+    let mut quiet = 0;
+    for _ in 0..600 {
+        h.frame_after(dt);
+        let now = zoom(&mut h);
+        if now == last {
+            quiet += 1;
+            if quiet > 40 {
+                break;
+            }
+        } else {
+            quiet = 0;
+            last = now;
+        }
+    }
+    last - before
+}
+
+/// **The reported bug on the surface it was reported from.** The plan view is
+/// the main map, it is where the overlays that make a frame take 289 ms are
+/// drawn, and it is the arm that reaches walkers' multiplier rather than this
+/// module's.
+///
+/// Fixing [`zoom_step`] alone would have left this one at the 4× spread *and*
+/// broken the agreement between the two panes that
+/// `a_scroll_moves_a_3d_pane_the_same_distance_it_moves_a_plan_view` pins — a
+/// half fix that reads as a whole one, because the 3D pane is the one with the
+/// unit tests. Hence [`super::steady_wheel`], and hence this.
+///
+/// # The 1.3% this does not remove, and why it is left
+///
+/// Measured after the fix: 0.9867 at 240 Hz, 0.9983 at 120, 1.0000 at 60 and
+/// 30, 0.9990 at 10 and below. A **1.3% spread**, against the 4× it replaced.
+///
+/// What is left is a *second* frame-rate coupling in walkers, and a much
+/// smaller one: `handle_gestures` only zooms at all when
+/// `(zoom_delta - 1.0).abs() > 0.001`, so a frame carrying less than 0.24
+/// points of wheel is dropped on the floor rather than accumulated. The faster
+/// the frame rate the more of the notch arrives in slices that small — at
+/// 240 Hz the exponential tail spends about 1.6 of its 120 points under the
+/// bar, which is the 1.3%.
+///
+/// Left because removing it means carrying the sub-threshold remainder across
+/// frames — real state, in the input path, to recover a part in eighty of a
+/// gesture nobody can feel. The defect this test exists for was a factor of
+/// four in the same quantity. The bound below is set where the measurement
+/// actually is so that a *regression* moves it, rather than at a round number
+/// that would let one hide.
+#[test]
+fn a_notch_moves_the_plan_view_the_same_distance_at_every_frame_rate() {
+    let measured: Vec<(&str, f64)> = FRAME_RATES
+        .iter()
+        .map(|&(name, dt)| (name, plan_view_notch_levels(dt)))
+        .collect();
+    for &(name, levels) in &measured {
+        assert!(
+            (levels - 1.0).abs() < 0.02,
+            "one notch on the plan view at {name} moved {levels} zoom levels, \
+             not 1.0 - walkers' frame-time multiplier is reaching the map again. \
+             Whole sweep: {measured:?}",
+        );
+    }
+    // The user's complaint was the *spread* — "a zoom moves a lot more than a
+    // close zoom" — so it is asserted directly, and not merely implied by six
+    // separate distances from 1.0.
+    let widest = measured.iter().map(|&(_, l)| l).fold(f64::MIN, f64::max);
+    let tightest = measured.iter().map(|&(_, l)| l).fold(f64::MAX, f64::min);
+    assert!(
+        widest / tightest < 1.02,
+        "the same notch moved the plan view {widest} zoom levels at one frame \
+         rate and {tightest} at another - a {:.1}x spread. Whole sweep: {measured:?}",
+        widest / tightest,
+    );
 }
 
 /// **The property the user asked for, in the one place it is arithmetic**: a

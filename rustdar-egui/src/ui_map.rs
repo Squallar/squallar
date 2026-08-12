@@ -526,119 +526,144 @@ impl super::Gui {
                                 // always used, where the level is a parameter.
                                 // See that function for why `Tiles::tile_size`
                                 // is not that lever.
-                                Map::new(None, &mut map_memory, center)
-                                    // `zoom_with_ctrl(false)` is what puts us on walkers'
-                                    // raw-scroll zoom path, and walkers 0.55 changed that
-                                    // path's frame-time multiplier from
-                                    // `stable_dt.max(predicted_dt * 1.5)` to
-                                    // `stable_dt.clamp(predicted_dt * 0.5, predicted_dt * 2.0)`.
-                                    // At a steady frame rate that is a uniform x0.667 on the
-                                    // scroll-zoom step (60Hz: 0.025 -> 0.01667, so a wheel
-                                    // notch that gave ~1.31x now gives ~1.21x); on a hitched
-                                    // frame the old form grew unbounded and the new one is
-                                    // capped, which is the bug being fixed.
-                                    //
-                                    // `Map::zoom_speed` (default 2.0) can compensate the
-                                    // magnitude, but it is not an exact undo: it scales the
-                                    // combined zoom delta, so pinch and double-click zoom
-                                    // move with it. Left at the default deliberately.
-                                    .zoom_with_ctrl(false)
-                                    .panning(false)
-                                    .drag_pan_buttons(if suppress_pan {
-                                        egui::DragPanButtons::empty()
-                                    } else {
-                                        egui::DragPanButtons::PRIMARY
-                                    })
-                                    .show(&mut child_ui, |ui, _response, projector, memory| {
-                                        let zoom = memory.zoom();
+                                //
+                                // The map goes *inside* `steady_wheel` because
+                                // walkers' raw-scroll zoom multiplies the
+                                // scroll by the frame time, which made one
+                                // wheel notch worth 0.5 zoom levels on a quick
+                                // frame and 2.0 on a slow one. The closure is
+                                // the scope, so there is no guard to forget to
+                                // hold. `panning(false)` below is load-bearing
+                                // for it — see `ui_region::steady_wheel`.
+                                //
+                                // The context is cloned out first because the
+                                // closure needs `child_ui` mutably.
+                                let ctx = child_ui.ctx().clone();
+                                crate::ui_region::steady_wheel(&ctx, || {
+                                    Map::new(None, &mut map_memory, center)
+                                        // `zoom_with_ctrl(false)` is what puts us on walkers'
+                                        // raw-scroll zoom path, whose frame-time multiplier is
+                                        // `stable_dt.clamp(predicted_dt * 0.5, predicted_dt * 2.0)`.
+                                        // walkers 0.55 tightened that from an unbounded
+                                        // `stable_dt.max(predicted_dt * 1.5)`, which **capped** the
+                                        // coupling without removing it: the clamp still spans 4x,
+                                        // and `predicted_dt` is a constant 60Hz here, so a notch
+                                        // was worth 0.5 zoom levels above 120fps and 2.0 at 30fps
+                                        // and below. `steady_wheel` above divides that multiplier
+                                        // back out, which is what makes a notch one level at any
+                                        // frame rate.
+                                        //
+                                        // `Map::zoom_speed` (default 2.0) is not the lever for
+                                        // this: it scales the combined zoom delta, so pinch and
+                                        // double-click zoom move with it, and it is a constant
+                                        // where the error is a function of the frame time. Left at
+                                        // the default deliberately.
+                                        .zoom_with_ctrl(false)
+                                        .panning(false)
+                                        .drag_pan_buttons(if suppress_pan {
+                                            egui::DragPanButtons::empty()
+                                        } else {
+                                            egui::DragPanButtons::PRIMARY
+                                        })
+                                        .show(&mut child_ui, |ui, _response, projector, memory| {
+                                            let zoom = memory.zoom();
 
-                                        // The basemap, first thing in the
-                                        // closure so everything below still
-                                        // draws over it — the place in the
-                                        // layer order walkers' own tile pass
-                                        // occupied.
-                                        draw_tile_layer(ui, projector, zoom, tiles, tile_zoom_bias);
+                                            // The basemap, first thing in the
+                                            // closure so everything below still
+                                            // draws over it — the place in the
+                                            // layer order walkers' own tile pass
+                                            // occupied.
+                                            draw_tile_layer(
+                                                ui,
+                                                projector,
+                                                zoom,
+                                                tiles,
+                                                tile_zoom_bias,
+                                            );
 
-                                        // Inside `Map::show`, because this is
-                                        // the only place a projector exists —
-                                        // and on the frame the gesture happens,
-                                        // because a pixel names different ground
-                                        // one wheel notch later. See
-                                        // `SectionAnchor`.
-                                        if let Some(gesture) = gesture {
-                                            self.track_section_draw(pane_idx, gesture, projector);
-                                        }
+                                            // Inside `Map::show`, because this is
+                                            // the only place a projector exists —
+                                            // and on the frame the gesture happens,
+                                            // because a pixel names different ground
+                                            // one wheel notch later. See
+                                            // `SectionAnchor`.
+                                            if let Some(gesture) = gesture {
+                                                self.track_section_draw(
+                                                    pane_idx, gesture, projector,
+                                                );
+                                            }
 
-                                        let mut render_ctx = pane_render::PaneRenderCtx {
-                                            pane_idx,
-                                            pane: &mut pane,
-                                            overlays: &mut self.overlays,
-                                            user_location,
-                                            user_heading,
-                                            user_fix: user_fix.clone(),
-                                            label_tiles: &mut label_tiles,
-                                            tile_zoom_bias,
-                                            actions: &mut actions,
-                                            pane_rect,
-                                            // A plan view's ground *is* its
-                                            // glass: one rect carries the map
-                                            // and the chrome over it.
-                                            surfaces: pane_render::PaneSurfaces::GroundAndGlass,
-                                            horizontal_color_scale,
-                                            color_scale_floor,
-                                            pointer_available,
-                                            excluded_rects: excluded_rects.to_vec(),
-                                            long_press_pos: pointer.long_press_pos,
-                                            overlay_click_pos,
-                                            click_consumed: &mut click_consumed,
-                                            preferences: &self.preferences,
+                                            let mut render_ctx = pane_render::PaneRenderCtx {
+                                                pane_idx,
+                                                pane: &mut pane,
+                                                overlays: &mut self.overlays,
+                                                user_location,
+                                                user_heading,
+                                                user_fix: user_fix.clone(),
+                                                label_tiles: &mut label_tiles,
+                                                tile_zoom_bias,
+                                                actions: &mut actions,
+                                                pane_rect,
+                                                // A plan view's ground *is* its
+                                                // glass: one rect carries the map
+                                                // and the chrome over it.
+                                                surfaces: pane_render::PaneSurfaces::GroundAndGlass,
+                                                horizontal_color_scale,
+                                                color_scale_floor,
+                                                pointer_available,
+                                                excluded_rects: excluded_rects.to_vec(),
+                                                long_press_pos: pointer.long_press_pos,
+                                                overlay_click_pos,
+                                                click_consumed: &mut click_consumed,
+                                                preferences: &self.preferences,
+                                                #[cfg(test)]
+                                                paint_order: Vec::new(),
+                                            };
+
+                                            pane_render::render_pane_map_content(
+                                                ui,
+                                                projector,
+                                                zoom,
+                                                &mut render_ctx,
+                                            );
+
+                                            // The pane's paint-order record, for
+                                            // the draw-order pin — taken after the
+                                            // content pass so it reports what this
+                                            // frame really dispatched.
                                             #[cfg(test)]
-                                            paint_order: Vec::new(),
-                                        };
+                                            self.last_paint_order.push((
+                                                pane_idx,
+                                                std::mem::take(&mut render_ctx.paint_order),
+                                            ));
 
-                                        pane_render::render_pane_map_content(
-                                            ui,
-                                            projector,
-                                            zoom,
-                                            &mut render_ctx,
-                                        );
+                                            // Before the tracks are drawn, so the
+                                            // preview this frame paints is the one
+                                            // this frame's pointer produced. Inside
+                                            // `Map::show` for the same reason the
+                                            // armed draw is: the projector is the
+                                            // only thing that can turn a pointer
+                                            // into ground, and the handles' screen
+                                            // positions are recorded here for the
+                                            // next frame's pan-suppression call.
+                                            self.track_section_edit(
+                                                ui,
+                                                projector,
+                                                pane_idx,
+                                                pane_rect,
+                                                excluded_rects,
+                                            );
 
-                                        // The pane's paint-order record, for
-                                        // the draw-order pin — taken after the
-                                        // content pass so it reports what this
-                                        // frame really dispatched.
-                                        #[cfg(test)]
-                                        self.last_paint_order.push((
-                                            pane_idx,
-                                            std::mem::take(&mut render_ctx.paint_order),
-                                        ));
-
-                                        // Before the tracks are drawn, so the
-                                        // preview this frame paints is the one
-                                        // this frame's pointer produced. Inside
-                                        // `Map::show` for the same reason the
-                                        // armed draw is: the projector is the
-                                        // only thing that can turn a pointer
-                                        // into ground, and the handles' screen
-                                        // positions are recorded here for the
-                                        // next frame's pan-suppression call.
-                                        self.track_section_edit(
-                                            ui,
-                                            projector,
-                                            pane_idx,
-                                            pane_rect,
-                                            excluded_rects,
-                                        );
-
-                                        // Last, over the radar image and every
-                                        // overlay: a section line the user is
-                                        // dragging that disappeared under a
-                                        // storm would be undrawable exactly
-                                        // where it matters.
-                                        self.draw_section_tracks(
-                                            ui, projector, pane_idx, pane_rect,
-                                        );
-                                    });
+                                            // Last, over the radar image and every
+                                            // overlay: a section line the user is
+                                            // dragging that disappeared under a
+                                            // storm would be undrawable exactly
+                                            // where it matters.
+                                            self.draw_section_tracks(
+                                                ui, projector, pane_idx, pane_rect,
+                                            );
+                                        });
+                                });
                             }
                         }
                         // The two kinds that exist as a shape and nothing more:
