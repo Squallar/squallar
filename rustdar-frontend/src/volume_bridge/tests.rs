@@ -903,15 +903,75 @@ fn the_cloud_rung_marches_the_smoothed_field_at_half_cell_steps() {
     );
 }
 
-/// The cloud smoothing is a function of cell size: full at the region
-/// rungs, **zero at the default whole-volume box**, monotone between.
+/// The ground reach a WSR-88D's surveillance cut has, in km.
 ///
-/// The zero half is the data-honesty pin. A fixed LOD of 1.0 at the
-/// default box's 1.8 km cells was measured erasing the Harvey eyewall —
-/// −41% of the ≥50 dBZ mask, −81% of ≥30 dBZ — while the 2D pane showed
-/// the red core (the table in [`cloud_reconstruction_lod_for`]).
-/// Restoring the fixed LOD fails the third assert; inverting the taper
-/// (smoothing the coarse grid instead of the fine) fails the first.
+/// [`rustdar_radar::voxel::volume_reach_km`]'s units, so the cosine of the
+/// sweep's median elevation is already folded in — which is the whole of the
+/// difference between this and the 460.125 km slant range the gate arithmetic
+/// starts from. Across 150 archive volumes from 53 sites every WSR-88D reports
+/// the same figure with no variance at all; the table in
+/// [`rustdar_radar::voxel::box_half_width_km`] is where that survey lives.
+const REFLECTIVITY_REACH_KM: f64 = 460.109;
+
+/// The same, for the Doppler cut — velocity, spectrum width, ZDR, ΦDP and
+/// ρHV, which is five of the six products a 3D pane can show.
+const DOPPLER_REACH_KM: f64 = 300.114;
+
+/// What a discrete desktop adapter reports for `max_texture_dimension_3d`.
+///
+/// wgpu's own default limit, and the figure `constants::tests`' own
+/// `REPORTED_LIMITS` calls "a modern desktop's". Every limit at or above 512
+/// selects the same shape, so this stands for all of them; a device reporting
+/// only the 256 GLES 3.0 guarantees gets a different shape and a different cell
+/// size, and is a case these tests deliberately do not conflate with this one.
+const DISCRETE_DESKTOP_MAX_AXIS: u32 = 2048;
+
+/// The uniform a desktop pane really hands the shader for the whole-volume box
+/// of a product reaching `reach_km`.
+///
+/// # Why this is derived and not two literals
+///
+/// It used to be `VolumeUniform::new([460.0, 460.0, 18.0], [256, 256, 128])`,
+/// called "the default desktop box", and **by the time this was written both
+/// numbers were wrong**. `f22aa220` circumscribed the box on the ring rather
+/// than inscribing it in it, so reflectivity's box is 920.22 km and not 460;
+/// `280a432b` respent the same cell budget, so the shape is 512 × 512 × 32 and
+/// not 256 × 256 × 128. The fixture went on reading the correct 1.797 km/cell
+/// for entirely the wrong reasons, because `460 / 256` and `920.22 / 512` are
+/// the same number — so a later change to *either* rule alone would have left
+/// it asserting 1.797 while production moved, on a knee it clears by 2.7%.
+///
+/// Both rules are therefore called rather than quoted: the half-width from
+/// [`rustdar_radar::voxel::box_half_width_km`], the shape from
+/// [`crate::constants::volume_grid_shape`]. A change to either now moves this
+/// fixture with production, and the assertions below say what the consequence
+/// is rather than restating the arithmetic.
+fn whole_volume_uniform(reach_km: f64) -> VolumeUniform {
+    let half_width_km = rustdar_radar::voxel::box_half_width_km(reach_km) as f32;
+    let shape = crate::constants::volume_grid_shape(DISCRETE_DESKTOP_MAX_AXIS);
+    let height_km = (rustdar_radar::voxel::DEFAULT_TOP_KM_MSL
+        - rustdar_radar::voxel::DEFAULT_BASE_KM_MSL) as f32;
+    VolumeUniform::new(
+        [half_width_km * 2.0, half_width_km * 2.0, height_km],
+        [shape.nx as u32, shape.ny as u32, shape.nz as u32],
+    )
+}
+
+/// The cloud smoothing is a function of cell size: full at the region
+/// rungs, **zero at the reflectivity whole-volume box**, monotone between.
+///
+/// The zero half is the data-honesty pin. A fixed LOD of 1.0 at that box's
+/// 1.8 km cells was measured erasing the Harvey eyewall — −41% of the ≥50 dBZ
+/// mask, −81% of ≥30 dBZ — while the 2D pane showed the red core (the table in
+/// [`cloud_reconstruction_lod_for`]). Restoring the fixed LOD fails the third
+/// assert; inverting the taper (smoothing the coarse grid instead of the fine)
+/// fails the first.
+///
+/// **The Doppler row is not a duplicate of the reflectivity one.** Its box is
+/// sized on a 300 km cut rather than a 460 km one, so the same cell budget buys
+/// 1.17 km/cell and the taper is *live* there — for five of the six products a
+/// 3D pane can show. Reflectivity clears the knee by 2.7% and everything else
+/// misses it by a third.
 #[test]
 fn the_cloud_smoothing_tapers_with_cell_size_and_spares_the_default_box() {
     // The desktop region rungs: 60 km and 160 km boxes over 256 cells.
@@ -930,25 +990,56 @@ fn the_cloud_smoothing_tapers_with_cell_size_and_spares_the_default_box() {
         mid > 0.0 && mid < CLOUD_RECONSTRUCTION_LOD,
         "the taper must pass through intermediate levels, got {mid}",
     );
-    // The default whole-volume box: 460 km over 256 cells, 1.797 km/cell,
-    // computed through the same helper `paint` feeds the taper.
-    let uniform = VolumeUniform::new([460.0, 460.0, 18.0], [256, 256, 128]);
-    let default_cell = largest_cell_km(&uniform);
+
+    // Reflectivity's whole-volume box, through the same helper `paint` feeds
+    // the taper. Both rules are called, so this reads 1.797 only while the box
+    // rule and the shape rule between them still produce 1.797.
+    let default_cell = largest_cell_km(&whole_volume_uniform(REFLECTIVITY_REACH_KM));
     assert!(
         (1.75..1.85).contains(&default_cell),
-        "the default box's coarsest cell moved: {default_cell} km",
+        "the reflectivity box's coarsest cell moved: {default_cell} km",
     );
     assert_eq!(
         cloud_reconstruction_lod_for(default_cell),
         0.0,
-        "the default whole-volume box must march the raw field: at \
-             1.8 km cells the two-cell kernel is wider than the cores it \
-             lands on, and the smoothing erases them (measured, Harvey)",
+        "the reflectivity whole-volume box must march the raw field: at \
+             {default_cell:.3} km cells the two-cell kernel is wider than the \
+             cores it lands on, and the smoothing erases them (measured, Harvey)",
+    );
+    // How much room that has, stated rather than left implicit. It is the
+    // margin every claim about this box rests on and it is 2.7%: a box rule or
+    // a shape rule that moved cells 2.8% finer would switch the smoothing —
+    // and the coarse level with it — on the shipped default view.
+    let margin = (default_cell - CLOUD_SMOOTHING_RAW_CELL_KM) / CLOUD_SMOOTHING_RAW_CELL_KM;
+    assert!(
+        (0.0..0.05).contains(&margin),
+        "the reflectivity box now clears the taper's {CLOUD_SMOOTHING_RAW_CELL_KM} km zero by \
+         {:.1}%, not the ~2.7% every claim about the default view assumes. Under 0 the default \
+         view has started smoothing (Harvey); far over it, this test has stopped being the \
+         tripwire it is documented as.",
+        100.0 * margin,
+    );
+
+    // The Doppler cut's box, which is the other five products. A 300 km reach
+    // over the same cells is a third finer than reflectivity's, and lands the
+    // taper's live half — so "the whole-volume box marches the raw field" is a
+    // statement about reflectivity and not about a whole-volume box.
+    let doppler_cell = largest_cell_km(&whole_volume_uniform(DOPPLER_REACH_KM));
+    assert!(
+        doppler_cell < default_cell,
+        "the Doppler box ({doppler_cell} km/cell) is sized on a shorter reach than the \
+         reflectivity one ({default_cell} km/cell) and must be finer",
+    );
+    assert!(
+        cloud_reconstruction_lod_for(doppler_cell) > 0.0,
+        "velocity, spectrum width, ZDR, ΦDP and ρHV reach 300 km, so their whole-volume box is \
+         {doppler_cell:.3} km/cell and the taper is live there. A change that took this to zero \
+         would be a rendering change for five of six products, not a no-op.",
     );
 }
 
 /// The coarse mip level is allocated exactly where the taper would read it,
-/// and nowhere else — which on every shipped platform but one is nowhere.
+/// and nowhere else.
 ///
 /// The upload used to carry the level unconditionally: 4 MiB of a 36 MiB
 /// desktop grid, a second `write_texture`, and a CPU pass over the whole
@@ -962,11 +1053,20 @@ fn the_cloud_smoothing_tapers_with_cell_size_and_spares_the_default_box() {
 /// than a restatement of them: `capped_by` is what `paint` is subject to, and
 /// both ceilings put `GradientShading::Off` on every adapter those targets
 /// can have, so the level is dead there at every box.
+///
+/// # The whole-volume box is two cases, and only one of them omits the level
+///
+/// This test used to carry one whole-volume row and call it "the default
+/// desktop box", which read as though a lit desktop volume paid for the level
+/// only at a region box. It does not. Reflectivity's box is 1.797 km/cell and
+/// omits it; the Doppler-cut products' box is 1.172 km/cell and **builds** it,
+/// which is five of the six products a 3D pane can show. Both rows are here
+/// now, and [`crate::volume::raymarch::CoarseLevel`]'s own doc says the same.
 #[test]
 fn the_coarse_level_is_built_only_where_something_will_sample_it() {
     use crate::volume::quality::{MOBILE_PLATFORM_CEILING, VolumeQuality, WASM_PLATFORM_CEILING};
 
-    // The one live case: a discrete desktop GPU, lit volume, region box.
+    // Live: a discrete desktop GPU, lit volume, region box.
     for cell_km in [60.0 / 256.0, 160.0 / 256.0] {
         assert_eq!(
             coarse_level_for(true, cell_km),
@@ -976,10 +1076,11 @@ fn the_coarse_level_is_built_only_where_something_will_sample_it() {
         );
     }
 
-    // The default desktop box, on that same discrete GPU. 1.8 km cells are
-    // past the taper's 1.75 km zero, so the level is dead at the shipped
-    // default view.
-    let default_cell = largest_cell_km(&VolumeUniform::new([460.0, 460.0, 18.0], [256, 256, 128]));
+    // Reflectivity's whole-volume box, on that same discrete GPU. 1.797 km
+    // cells are past the taper's 1.75 km zero — by 2.7%, which the taper test
+    // above is the tripwire for — so the level is dead at the shipped default
+    // view.
+    let default_cell = largest_cell_km(&whole_volume_uniform(REFLECTIVITY_REACH_KM));
     assert_eq!(
         cloud_reconstruction_lod_for(default_cell),
         0.0,
@@ -988,8 +1089,29 @@ fn the_coarse_level_is_built_only_where_something_will_sample_it() {
     assert_eq!(
         coarse_level_for(true, default_cell),
         CoarseLevel::Omitted,
-        "the default 460 km box marches the raw field, so its 4 MiB coarse \
-         level is 4 MiB nothing samples",
+        "the reflectivity whole-volume box marches the raw field, so its 4 MiB \
+         coarse level is 4 MiB nothing samples",
+    );
+
+    // The Doppler cut's whole-volume box, same device, same lit mode. 1.172 km
+    // cells sit inside the taper, so the level is read and therefore has to be
+    // built — at +4 MiB a grid and a CPU pass over the whole index plane
+    // measured at 5.9 ms in `prepare`. That is not a regression (the pre-
+    // `f22aa220` 424 km box was 1.657 km/cell and built it too) and it is not
+    // this test's decision to change; it is a cost the doc and the test both
+    // used to leave unstated.
+    let doppler_cell = largest_cell_km(&whole_volume_uniform(DOPPLER_REACH_KM));
+    assert!(
+        cloud_reconstruction_lod_for(doppler_cell) > 0.0,
+        "the premise moved: see the taper test above",
+    );
+    assert_eq!(
+        coarse_level_for(true, doppler_cell),
+        CoarseLevel::Built,
+        "velocity, spectrum width, ZDR, ΦDP and ρHV reach 300 km, so their \
+         whole-volume box is {doppler_cell:.3} km/cell and the smoothing reads \
+         the coarse level there. Omitting it would leave the shader sampling a \
+         level that was never allocated.",
     );
 
     // Every adapter on wasm32 and mobile, and every desktop adapter below
@@ -1002,7 +1124,7 @@ fn the_coarse_level_is_built_only_where_something_will_sample_it() {
              target can reach the coarse level and the row below is wrong",
         );
     }
-    for cell_km in [60.0 / 256.0, 1.2, default_cell] {
+    for cell_km in [60.0 / 256.0, 1.2, default_cell, doppler_cell] {
         assert_eq!(
             coarse_level_for(false, cell_km),
             CoarseLevel::Omitted,
