@@ -218,7 +218,27 @@ impl SiteTable {
     /// [`get`](Self::get) asks. A site list wants this one; a map marker wants
     /// the other.
     pub fn knows(&self, site: &str) -> bool {
-        self.by_name.contains_key(site) || self.unplaced.contains(&site)
+        self.static_name(site).is_some()
+    }
+
+    /// This table's own `&'static str` for `site`, placed or not.
+    ///
+    /// Every identifier a table knows was leaked on the way in, so a caller
+    /// holding a borrowed four-byte ICAO can trade it for one that lives
+    /// forever — which is what [`RadarSite::name`] requires and what a runtime
+    /// identifier is otherwise short of.
+    ///
+    /// Reaches the **unplaced** members too, and that is the point. `TPBI` is a
+    /// TDWR with real Level II data that `api.weather.gov` will not place, so
+    /// it has no row; without this it would be named
+    /// [`UNKNOWN_SITE_NAME`] by every consumer, and
+    /// [`is_tdwr_id`] would then answer `false` for a terminal radar. The
+    /// compiled-in table used to place it and hide the question.
+    pub fn static_name(&self, site: &str) -> Option<&'static str> {
+        self.by_name
+            .get(site)
+            .map(|row| row.name)
+            .or_else(|| self.unplaced.iter().find(|listed| **listed == site).copied())
     }
 
     /// The row for an ICAO identifier, or `None` if this table cannot place
@@ -689,6 +709,13 @@ pub fn unplaced() -> &'static [&'static str] {
 /// Whether this process has heard of `site` at all, placed or not.
 pub fn knows_site(site: &str) -> bool {
     table().knows(site)
+}
+
+/// This process's own `&'static str` for `site`, placed or not.
+///
+/// See [`SiteTable::static_name`].
+pub fn static_name(site: &str) -> Option<&'static str> {
+    table().static_name(site)
 }
 
 /// The row for an ICAO identifier, or `None` if this process cannot place that

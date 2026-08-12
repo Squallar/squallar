@@ -227,3 +227,116 @@ fn opening_an_unplaceable_radar_places_it() {
         "exactly one row",
     );
 }
+
+/// A radar the catalogue can only *name* is still recognised as a TDWR.
+///
+/// `TPBI` is the case, and it is the one the compiled-in table used to settle
+/// by placing it: a terminal radar with real Level II data that
+/// `api.weather.gov/radar/stations` will not place. With the table deleted it
+/// has no row, and a row is where `ScanInfo::from_scan` used to get the name
+/// that `is_tdwr` reads.
+///
+/// Falling back to `UNKNOWN_SITE_NAME` there would make `is_wsr88d` answer
+/// **true** for it, and the picker would offer the four Level III products a
+/// TDWR's SPG does not generate — five entries that draw an empty pane for the
+/// rest of the session, because `ScanInfo` accumulates.
+///
+/// So the name comes from the membership list rather than from a row. Fails on
+/// revert: take the `sites::static_name` lookup out of `from_scan` and this
+/// site is a WSR-88D with a full product list.
+#[test]
+fn an_unplaceable_tdwr_is_still_a_tdwr() {
+    const SITE: &str = "TZZH";
+
+    sites::resolve([(SITE, SiteFix::Unplaced)]);
+    assert!(
+        sites::get_radar_site(SITE).is_none(),
+        "precondition: it must have no row, or this proves nothing",
+    );
+
+    let info = rustdar_radar::types::ScanInfo::from_scan(
+        &silent_scan(),
+        SITE,
+        chrono::NaiveDate::from_ymd_opt(2026, 8, 11)
+            .expect("a real date")
+            .and_hms_opt(3, 0, 0)
+            .expect("a real time"),
+        None,
+    );
+
+    assert_eq!(
+        info.site.name, SITE,
+        "a radar the catalogue named must not be called UNKNOWN",
+    );
+    assert!(info.site.is_tdwr(), "and the T prefix must still be read");
+    assert!(!info.site.is_wsr88d());
+
+    // It still has no position, which is the other half of what `Unplaced`
+    // means and must not have been invented along with the name.
+    assert_eq!(
+        info.site_source,
+        rustdar_radar::site_position::SitePositionSource::Unknown,
+    );
+    assert!(info.site.heights.is_none());
+}
+
+/// The volume that finally places such a radar keeps its name, too.
+///
+/// The path `TPBI` actually takes: listed, opened, and placed by the volume
+/// that comes back. `SitePosition::applied_to` has no row to take a name from
+/// and reaches for `UNKNOWN_SITE_NAME`; the membership list is what stops it.
+#[test]
+fn a_volume_for_an_unplaceable_radar_names_it_from_the_membership_list() {
+    const SITE: &str = "TZZI";
+
+    sites::resolve([(SITE, SiteFix::Unplaced)]);
+    let scan = nexrad_model::data::Scan::with_site(
+        nexrad_model::meta::Site::new(*b"TZZI", -35.0, -145.0, 100, 100),
+        vcp(),
+        Vec::new(),
+    );
+
+    let info = rustdar_radar::types::ScanInfo::from_scan(
+        &scan,
+        SITE,
+        chrono::NaiveDate::from_ymd_opt(2026, 8, 11)
+            .expect("a real date")
+            .and_hms_opt(3, 0, 0)
+            .expect("a real time"),
+        None,
+    );
+
+    assert_eq!(info.site.name, SITE, "not UNKNOWN");
+    assert!(info.site.is_tdwr());
+    assert_eq!(
+        info.site_source,
+        rustdar_radar::site_position::SitePositionSource::Volume,
+    );
+    assert_eq!((info.site.lat, info.site.lon), (-35.0, -145.0));
+}
+
+/// A volume coverage pattern, which `Scan::with_site` needs and nothing here
+/// reads.
+fn vcp() -> nexrad_model::data::VolumeCoveragePattern {
+    nexrad_model::data::VolumeCoveragePattern::new(
+        212,
+        0,
+        0.5,
+        nexrad_model::data::PulseWidth::Short,
+        false,
+        0,
+        false,
+        0,
+        false,
+        false,
+        0,
+        false,
+        false,
+        Vec::new(),
+    )
+}
+
+/// A volume that states no site at all — the chunk-fed and pre-2010 shape.
+fn silent_scan() -> nexrad_model::data::Scan {
+    nexrad_model::data::Scan::new(vcp(), Vec::new())
+}

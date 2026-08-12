@@ -470,8 +470,20 @@ impl ScanInfo {
             (None, None, false) => (None, SitePositionSource::Unknown),
         };
 
+        // A radar this process knows of and cannot place has no `row` and is
+        // still not anonymous: the catalogue listed its identifier, and
+        // `sites` leaked it. Naming it here is what keeps `is_tdwr` right for
+        // `TPBI` — a terminal radar with real Level II data that
+        // `api.weather.gov` will not place — which the compiled-in table used
+        // to settle by placing it. Without this it is named
+        // `UNKNOWN_SITE_NAME`, `is_wsr88d` answers true, and the picker offers
+        // four Level III products its SPG does not generate.
+        let known_name = crate::sites::static_name(site);
         let radar_site = match (site_position, row) {
-            (Some(position), row) => position.applied_to(row),
+            (Some(position), Some(row)) => position.applied_to(Some(row)),
+            (Some(position), None) => {
+                position.applied_to_named(known_name.unwrap_or(crate::sites::UNKNOWN_SITE_NAME), None)
+            }
             (None, Some(row)) => row.clone(),
             (None, None) => {
                 // Error, not warning: nothing downstream of here can place
@@ -484,7 +496,7 @@ impl ScanInfo {
                      its volume states none, and nothing was learned for it",
                 );
                 RadarSite {
-                    name: crate::sites::UNKNOWN_SITE_NAME,
+                    name: known_name.unwrap_or(crate::sites::UNKNOWN_SITE_NAME),
                     lat: 0.0,
                     lon: 0.0,
                     heights: None,
