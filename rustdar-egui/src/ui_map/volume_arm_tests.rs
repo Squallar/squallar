@@ -2250,6 +2250,181 @@ fn the_colour_scale_does_not_print_through_the_volume_alpha_button() {
     }
 }
 
+/// The Volume Alpha button is inside the pane it belongs to at **every width a
+/// pane can reach** — not only on the one full-width pane the collision test
+/// above runs.
+///
+/// # What the collision test could not see
+///
+/// It asserts `pane_rect.contains_rect(button)` on a single 1400-point pane,
+/// where the button's left edge stands over 1200 points inside the pane's and
+/// containment was never in question. The button hangs off
+/// `color_scale_free_rect`'s top-right corner, so that slack is
+///
+/// ```text
+/// slack(w) = w - gutter - (button width + margin)
+/// ```
+///
+/// and it goes negative on a narrow pane. Drawn there anyway, the half that
+/// hung over the pane's left edge was cut by the child ui's clip rect
+/// (`ui_map.rs`, `child_ui.set_clip_rect(pane_rect)`) — a sheared control,
+/// which reads as a rendering fault rather than as a layout out of room.
+///
+/// # Why it drags a divider rather than shrinking the window
+///
+/// Because that is how a pane gets narrow while its legend stays the size it
+/// is. The gutter is measured text and does not shrink with the pane, and the
+/// bars' orientation is keyed on the whole *panel* with hysteresis
+/// (`ColorScaleOrientation`), so a window shrunk far enough to narrow a pane
+/// would flip the bars to the bottom edge on the way and stop exercising the
+/// gutter at all. A divider drag moves one column and leaves the panel alone,
+/// which is exactly the user gesture that produces the widths this is about.
+///
+/// # Why `needed` is read off the frame and not computed
+///
+/// The width at which the old placement ran out of pane is `gutter + 96`, and
+/// the gutter is what the legend's own text lays out to: 52.4 points for
+/// spectrum width, 67.5 for precipitation rate in mm/hr, 60 more per stacked
+/// overlay legend, and different again in another font. Restating that here
+/// would be a second copy of `color_scale_gutter` that could agree with itself
+/// while both were wrong. One reading of the button at the wide end fixes the
+/// whole line, because `slack` moves point for point with the pane's width.
+///
+/// # Both orientations, because the room runs out in two different ways
+///
+/// Landscape puts the bars on the right edge, where the gutter is what eats the
+/// button's room, and a 900-point panel showing reflectivity needs 151.1 points
+/// of pane against the 135 `MIN_RATIO = 0.15` lets a column reach. Portrait
+/// puts them along the bottom, where the free rect is as wide as the pane and
+/// the button needs its own 96 points against the 64.8 the same floor allows.
+#[test]
+fn the_volume_alpha_button_stays_inside_its_pane_at_every_width() {
+    /// One pointer step of the drag, points.
+    ///
+    /// Small deliberately: `PaneLayout`'s `drag_divider` refuses a step that
+    /// would take a column under `MIN_RATIO` *whole* rather than clamping it to
+    /// the floor, so the sweep stops within one step of `MIN_RATIO` and a
+    /// coarse drag would stop well short of the narrow end this is about.
+    const STEP: f32 = 3.0;
+
+    /// Pane `idx`'s Volume Alpha button on the last frame, if it drew one.
+    fn button_on(h: &InputHarness, idx: usize) -> Option<egui::Rect> {
+        h.alpha_buttons()
+            .into_iter()
+            .find(|&(i, _)| i == idx)
+            .map(|(_, rect)| rect)
+    }
+
+    /// Drag the column divider from the even split down to the `MIN_RATIO`
+    /// floor, checking every button every pane draws on the way.
+    fn sweep(h: &mut InputHarness, what: &str) {
+        let wide_pane = h.pane_rects()[0];
+        let wide_button = button_on(h, 0).unwrap_or_else(|| {
+            panic!(
+                "precondition: the {what} sweep's widest pane {wide_pane:?} \
+                 drew no Volume Alpha button, so there is no wide end to \
+                 measure the narrow one against"
+            )
+        });
+        let needed = wide_pane.width() - (wide_button.left() - wide_pane.left());
+
+        let panel = h.map_panel_rect();
+        let y = panel.center().y;
+        let mut x = wide_pane.right();
+        h.mouse_press(egui::pos2(x, y));
+        h.frames_for(1, FRAME_DT);
+
+        let mut narrowest = wide_pane.width();
+        let mut narrowest_drawn = wide_pane.width();
+        while x - STEP > panel.left() {
+            x -= STEP;
+            h.mouse_move(egui::pos2(x, y));
+            // **Two** frames, and the second one is what makes the two rects
+            // below the same frame's. `PaneLayout::handle_dividers` runs after
+            // the pane loop — deliberately, so a divider outranks a map pan in
+            // the overlap — so the frame that moves a ratio has already drawn
+            // its panes on the previous one, while `pane_rects` reads the live
+            // layout. Comparing across that seam measures a button against a
+            // pane it was never drawn in, in the direction that invents
+            // failures on the pane being narrowed.
+            h.frames_for(2, FRAME_DT);
+            // Every pane, not only the one being narrowed: the other end of
+            // the divider is a pane too, and a rule that held for one width
+            // and not the other would be caught here.
+            for (idx, pane_rect) in h.pane_rects().into_iter().enumerate() {
+                let Some(button) = button_on(h, idx) else {
+                    continue;
+                };
+                assert!(
+                    pane_rect.contains_rect(button),
+                    "on the {what} sweep the Volume Alpha button {button:?} is \
+                     not inside pane {idx} {pane_rect:?}, {:.1} points wide: \
+                     the pane's child ui clips to its own rect, so what the \
+                     user is shown there is half a button",
+                    pane_rect.width(),
+                );
+            }
+            let width = h.pane_rects()[0].width();
+            narrowest = narrowest.min(width);
+            if button_on(h, 0).is_some() {
+                narrowest_drawn = narrowest_drawn.min(width);
+            }
+        }
+        h.mouse_release(egui::pos2(x, y));
+        h.frames_for(1, FRAME_DT);
+
+        // The device that stops the loop above passing vacuously: it must have
+        // visited a width the old placement could not have survived.
+        assert!(
+            narrowest < needed,
+            "the {what} sweep bottomed out at a {narrowest:.1}-point pane and \
+             the old placement only left the pane below {needed:.1}, so it \
+             never reached a width this test is about",
+        );
+        // …and the other half of vacuous, which is a button withheld
+        // everywhere. It is drawn at every width with the room for it, which
+        // the sweep can only see to within one sample either side of the
+        // boundary.
+        assert!(
+            narrowest_drawn < needed + 2.0 * STEP,
+            "the narrowest {what} pane that drew a button was \
+             {narrowest_drawn:.1} points against the {needed:.1} it has the \
+             room at, so the button is being withheld from panes that can hold \
+             it",
+        );
+    }
+
+    // Landscape: 700 points tall against 900 wide is well under
+    // `COLOR_SCALE_HORIZONTAL_EXIT`, so the bars stand on the right edge —
+    // the same edge the button hangs off, and the case where the gutter is
+    // what the button runs out of room against.
+    let mut landscape = InputHarness::with_screen(egui::vec2(900.0, 700.0));
+    landscape.set_pane_count(2);
+    // Explicitly, because the gutter is the whole subject: a pane with the
+    // layer off reserves nothing and the free rect is the pane.
+    landscape
+        .gui_mut()
+        .enable_overlay_for_test(OverlayKind::ColorScale);
+    landscape.make_pane_volume(0);
+    landscape.make_pane_volume(1);
+    landscape.frames_for(2, FRAME_DT);
+    sweep(&mut landscape, "landscape");
+
+    // Portrait: a 432x936 phone window, the one `clear_of_bottom_chrome` is
+    // written against. The bars go along the bottom, so the free rect is as
+    // wide as the pane and the button runs out of room against the pane
+    // itself.
+    let mut portrait = InputHarness::with_screen(egui::vec2(432.0, 936.0));
+    portrait.set_pane_count(2);
+    portrait
+        .gui_mut()
+        .enable_overlay_for_test(OverlayKind::ColorScale);
+    portrait.make_pane_volume(0);
+    portrait.make_pane_volume(1);
+    portrait.frames_for(2, FRAME_DT);
+    sweep(&mut portrait, "portrait");
+}
+
 /// The reset returns the **pivot** as well as the angles, and leaves the view
 /// mode alone.
 ///

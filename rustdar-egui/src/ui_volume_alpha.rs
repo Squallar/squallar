@@ -66,6 +66,12 @@ pub(crate) const RESET_LABEL: &str = "Reset to the 3D default";
 /// the caption's margin in the opposite corner.
 const BUTTON_MARGIN: f32 = 8.0;
 
+/// The corner button's size, points — what it has always been drawn at, named
+/// now because [`corner_button_rect`] asks whether there is room for it as well
+/// as where to put it. Two spellings of one number are two chances for the
+/// answers to disagree.
+const BUTTON_SIZE: egui::Vec2 = egui::vec2(88.0, 20.0);
+
 /// The curve canvas's height, points. Tall enough that one point of pointer
 /// travel is under 1% of alpha, so a curve can be placed rather than lurched.
 const CURVE_HEIGHT: f32 = 110.0;
@@ -99,6 +105,10 @@ const STRIP_GAP: f32 = 4.0;
 /// split (`Gui::draw_volume_glass`); the button exists on 3D panes alone and
 /// keeps no such contract. The legend also cannot yield — it is painted, not
 /// allocated, so it senses nothing and takes no part in layout.
+///
+/// A `chrome_rect` with no room for the button draws none — see
+/// [`corner_button_rect`]. That is the button alone: an editor already open
+/// keeps its window, which floats on the screen rather than inside the pane.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn editor_ui(
     ui: &mut egui::Ui,
@@ -132,35 +142,34 @@ pub(crate) fn editor_ui(
     // wins the pointer over the pane-wide orbit interact.
     //
     // Off `chrome_rect`, not `pane_rect`: see the doc comment. The two are the
-    // same rect whenever the legend is off that edge or off altogether.
-    let button = egui::Button::new(egui::RichText::new(ALPHA_BUTTON_LABEL).size(11.0));
-    let size = egui::vec2(88.0, 20.0);
-    let rect = egui::Rect::from_min_size(
-        chrome_rect.right_top() + egui::vec2(-(size.x + BUTTON_MARGIN), BUTTON_MARGIN),
-        size,
-    );
-    #[cfg(test)]
-    probe.push((pane_idx, rect));
-    let drawn = ui
-        .scope(|ui| {
-            // A transitioning button dims with the chrome and is dead to
-            // input meanwhile — the standing `fade::dim` contract, inlined
-            // because this module sits outside the `ui` module tree.
-            if chrome < 1.0 {
-                ui.multiply_opacity(chrome);
-                ui.disable();
-            }
-            ui.put(rect, button)
-        })
-        .inner;
-    if drawn
-        .on_hover_text(
-            "Redraw the volume's opacity over the value scale - GR2Analyst's Volume Alpha. \
-             Drag on the curve to strip or restore a range of values.",
-        )
-        .clicked()
-    {
-        volume.alpha_editor_open = !volume.alpha_editor_open;
+    // same rect whenever the legend is off that edge or off altogether. A rect
+    // too small to hold the button draws none, and the editor below carries on
+    // either way — see `corner_button_rect`.
+    if let Some(rect) = corner_button_rect(chrome_rect) {
+        let button = egui::Button::new(egui::RichText::new(ALPHA_BUTTON_LABEL).size(11.0));
+        #[cfg(test)]
+        probe.push((pane_idx, rect));
+        let drawn = ui
+            .scope(|ui| {
+                // A transitioning button dims with the chrome and is dead to
+                // input meanwhile — the standing `fade::dim` contract, inlined
+                // because this module sits outside the `ui` module tree.
+                if chrome < 1.0 {
+                    ui.multiply_opacity(chrome);
+                    ui.disable();
+                }
+                ui.put(rect, button)
+            })
+            .inner;
+        if drawn
+            .on_hover_text(
+                "Redraw the volume's opacity over the value scale - GR2Analyst's Volume Alpha. \
+                 Drag on the curve to strip or restore a range of values.",
+            )
+            .clicked()
+        {
+            volume.alpha_editor_open = !volume.alpha_editor_open;
+        }
     }
     if !volume.alpha_editor_open {
         return;
@@ -180,6 +189,70 @@ pub(crate) fn editor_ui(
             editor_contents(ui, pane_idx, product, painter, target, curves);
         });
     volume.alpha_editor_open = open;
+}
+
+/// Where the corner button stands inside `chrome_rect`, or `None` when that
+/// rect has no room for it.
+///
+/// # Why the answer can be nothing
+///
+/// The rect is [`BUTTON_SIZE`] subtracted from `chrome_rect`'s top-right corner
+/// across a [`BUTTON_MARGIN`], so its left edge stands
+/// `chrome_rect.width() - (BUTTON_SIZE.x + BUTTON_MARGIN)` = `width - 96` points
+/// inside `chrome_rect`'s own. Below 96 that is negative, and it used to be
+/// drawn there anyway: the pane's child `Ui` clips to `pane_rect`
+/// (`ui_map.rs`), so the half that hung over the pane's left edge was cut off
+/// and what the user got was a button with its left side sheared away. A
+/// control that has run out of room should look like one, not like a rendering
+/// fault.
+///
+/// The other axis fails the same way and is asked the same question: the button
+/// wants `BUTTON_MARGIN + BUTTON_SIZE.y` = 28 points of height, which a *row*
+/// dragged to its own `MIN_RATIO` on a short window falls under.
+///
+/// # Why it is asked as containment and not as a width
+///
+/// There is no width to compare against. `chrome_rect` is the pane less
+/// whatever edge the colour scale claimed, and that claim is *measured text* —
+/// `pane_render::color_scale_gutter` lays the ticks and the unit title out and
+/// reserves what they come to. Across the 31 distinct legends a 3D pane can
+/// paint it runs 52.4 points (spectrum width, whose ticks are one digit) to
+/// 67.5 (precipitation rate in mm/hr), moves with the font, and gains a further
+/// `SCALE_BAR_WIDTH + SCALE_STACK_GAP` = 60 for every overlay legend stacked
+/// inside the radar bar. So the pane width at which this bites is not a number
+/// anyone can write down — on a 900-point panel showing reflectivity it is
+/// 151.1, and `MIN_RATIO = 0.15` lets a column reach 135.
+///
+/// Placing the rect and then requiring `chrome_rect` to contain it asks the
+/// question in the only form that cannot go stale: the test is the placement's
+/// own arithmetic rather than a second copy of it, so a change to the size, to
+/// the margin or to the corner it hangs off cannot leave the two disagreeing.
+/// It also disposes of a NaN pane — a divider dragged to nothing — without a
+/// clause of its own, since every comparison against NaN is false.
+///
+/// Containment in the *pane* follows and does not need asking separately:
+/// `color_scale_free_rect` only shortens the rect it is handed, and that rect is
+/// `clear_of_bottom_chrome(pane_rect, …)`, which only shortens the pane. So
+/// `chrome_rect ⊆ pane_rect` at every width — including the one where the free
+/// rect would have inverted and that function deliberately hands the pane back
+/// whole, where the button is inside the pane and over the legend, which is the
+/// trade the comment there states.
+///
+/// # Why nothing smaller is drawn instead
+///
+/// No edge of the pane has the room. In the vertical orientation the bar runs
+/// the pane's full height, so the free rect is equally narrow at every `y`, and
+/// a pane with under 96 points of glass beside its legend is one the button
+/// would fill end to end. Shrinking it past its own label only trades a clipped
+/// rect for a clipped word. What withholding costs is the *door* and not the
+/// room: `editor_ui` draws the window regardless, so an editor opened on a wide
+/// pane stays open and usable while the divider is dragged past this point.
+fn corner_button_rect(chrome_rect: egui::Rect) -> Option<egui::Rect> {
+    let rect = egui::Rect::from_min_size(
+        chrome_rect.right_top() + egui::vec2(-(BUTTON_SIZE.x + BUTTON_MARGIN), BUTTON_MARGIN),
+        BUTTON_SIZE,
+    );
+    chrome_rect.contains_rect(rect).then_some(rect)
 }
 
 /// What the editor says when there is no table to draw a curve over.
