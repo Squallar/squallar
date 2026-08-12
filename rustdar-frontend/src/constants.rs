@@ -741,6 +741,14 @@ pub const DESKTOP_MAX_LOOP_VOLUME_FRAMES: usize = 13;
 /// well under that cap, does recycle — 0 faults a call, measured — and was
 /// therefore left alone.
 ///
+/// One more thing used to be in here and is not a per-call cost at all: the
+/// jitter tile. `volume::blue_noise::blue_noise_tile` was a `OnceLock` filled
+/// from the *first* of these calls, so the **first** upload in a process
+/// carried a void-and-cluster run — 9.90 ms natively, 31.4 ms in a browser — on
+/// top of everything above, landing in the frame that first shows a volume. It
+/// is an `include_bytes!` now and the whole of that is gone; that module has
+/// the measurement and the determinism evidence.
+///
 /// # Why this constant no longer quotes one figure for the whole call
 ///
 /// It used to, and the figure was **12.7 ms**. That was not wrong, but it was

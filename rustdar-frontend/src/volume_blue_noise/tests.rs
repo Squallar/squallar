@@ -1,14 +1,75 @@
-//! What the tile has to be, rather than what it happens to contain.
+//! What the tile has to be, rather than what it happens to contain — and,
+//! once, that what ships is what the generator says.
 //!
-//! Nothing here pins a byte. The tile is generated, so pinning its contents
-//! would only assert that the generator is the generator; what the march
-//! actually depends on is four properties, and each test below is paired with
-//! the mistake it exists to catch — a constant offset (the slithering comes
-//! back), a lattice hash (the diagonal weave comes back), a white hash (the
-//! low-frequency mottling arrives), and a non-toroidal filter (a seam every 64
-//! pixels).
+//! Four of the five tests here pin no byte. What the march actually depends on
+//! is four properties, and each of those tests is paired with the mistake it
+//! exists to catch — a constant offset (the slithering comes back), a lattice
+//! hash (the diagonal weave comes back), a white hash (the low-frequency
+//! mottling arrives), and a non-toroidal filter (a seam every 64 pixels). Every
+//! one of them runs over `blue_noise_tile()`, which is to say over the bytes
+//! that actually ship.
+//!
+//! The fifth is the one the `include_bytes!` needs:
+//! `the_shipped_bytes_are_the_ones_void_and_cluster_produces` runs
+//! void-and-cluster here, at test time, and asserts byte-for-byte equality with
+//! `tile.bin`. That is what keeps "a blob can only be pinned against itself"
+//! from being true of this one — the generator is the pin, and the four
+//! property tests are still the reviewable statement of *why* these bytes and
+//! not some others.
 
 use super::*;
+
+/// **The shipped bytes are void-and-cluster's, and nothing else's.**
+///
+/// The test that licenses the `include_bytes!`. `tile.bin` is not a constant
+/// somebody typed and it is not the output of a script that has since been
+/// lost: it is what the generator twelve inches above this file produces, and
+/// this runs that generator and compares all 4096 bytes.
+///
+/// So the whole of the module's old reason for computing at startup survives —
+/// the properties are pinned, and now the contents are pinned to the code that
+/// justifies them too — at no run-time cost. Regenerating after a deliberate
+/// change to the algorithm is `void_and_cluster`'s output written back to
+/// `tile.bin`; the four property tests below are what say whether the new one
+/// is any good.
+///
+/// **If this fails and nothing in this module changed**, read the module doc's
+/// caveat before touching `tile.bin`. `gaussian_kernel` calls `f32::exp`, four
+/// libm implementations were compared and two of them disagree by one ULP, and
+/// a host with a fifth is the one way this can fail without anything being
+/// wrong. Re-baking against that host would ship a tile no other target
+/// reproduces, which is the exact failure this test exists to make visible.
+#[test]
+fn the_shipped_bytes_are_the_ones_void_and_cluster_produces() {
+    let generated = generated_tile();
+    assert_eq!(
+        generated.len(),
+        TEXELS,
+        "void-and-cluster produced {} bytes, not the {TEXELS} a {BLUE_NOISE_EDGE}-square tile is",
+        generated.len(),
+    );
+    if generated.as_slice() == blue_noise_tile() {
+        return;
+    }
+    let differing = generated
+        .iter()
+        .zip(blue_noise_tile())
+        .filter(|(a, b)| a != b)
+        .count();
+    let first = generated
+        .iter()
+        .zip(blue_noise_tile())
+        .position(|(a, b)| a != b)
+        .expect("the slices differ, so some index does");
+    panic!(
+        "tile.bin is not what void_and_cluster() produces: {differing} of {TEXELS} bytes differ, \
+         first at texel {first} ({} shipped against {} generated). Either the generator changed \
+         and tile.bin was not rebaked, or this host's libm is a fifth implementation — see the \
+         module doc before deciding which.",
+        blue_noise_tile()[first],
+        generated[first],
+    );
+}
 
 /// The tile as `f64` in 0..1, which is what the shader's `textureLoad` sees
 /// after the hardware's unorm decode.
