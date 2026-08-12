@@ -14549,3 +14549,276 @@ fn a_warning_that_gains_its_polygons_re_rasterizes_the_alert_overlay() {
          happens to pan or zoom",
     );
 }
+
+// ── The zoom key: a band in motion, an exact render at rest ──────────────
+
+/// Put the pane's map at `zoom`, which is all a wheel or pinch gesture leaves
+/// behind once it has been resolved.
+///
+/// Driven this way rather than through synthetic scroll events on purpose: what
+/// is under test is the *cache's* reaction to a moving zoom, and a gesture
+/// pipeline in between would make every assertion below also a claim about
+/// walkers' drag sensitivity.
+fn set_pane_zoom(h: &mut InputHarness, zoom: f64) {
+    h.gui_mut().panes_mut()[0]
+        .map_memory
+        .set_zoom(zoom)
+        .expect("zoom within walkers' range");
+}
+
+/// The zoom the last frame's `RenderOverlay` for `kind` was keyed at.
+fn requested_render_zoom(h: &InputHarness, kind: OverlayKind) -> i32 {
+    h.last_actions()
+        .iter()
+        .find_map(|a| match a {
+            GuiAction::RenderOverlay {
+                overlay_kind, zoom, ..
+            } if *overlay_kind == kind => Some(*zoom),
+            _ => None,
+        })
+        .expect("no RenderOverlay was emitted for this kind")
+}
+
+/// One alert overlay, rasterised and landed, with the map at `zoom`, and the
+/// frame loop *idle* — nothing else on the pane still asking to be redrawn.
+///
+/// The idling matters for one test only ([`a_stale_zoom_asks_for_the_frame_its_
+/// settle_needs`]) and costs the others nothing. egui's own fades and the map's
+/// first tiles keep asking for frames for a beat after startup, and while
+/// anything else is asking, "the overlay asked" is unobservable.
+fn settled_alert_pane(zoom: f64) -> InputHarness {
+    let mut h = InputHarness::new();
+    h.gui_mut().enable_overlay_for_test(OverlayKind::NwsAlerts);
+    h.warm_up();
+    let ground = h.ground_at(0, h.pane_rects()[0].center());
+    ingest_alerts(
+        &mut h,
+        vec![alert_over("a", "Tornado Warning", ground.y(), ground.x())],
+    );
+    set_pane_zoom(&mut h, zoom);
+    h.warm_up();
+    settle_overlay_cache(&mut h, OverlayKind::NwsAlerts);
+    // Frames until the loop actually goes idle, rather than a fixed count of
+    // them. `frame_after` advances the clock, which `warm_up` does not, so
+    // egui's startup fades do finish on a schedule — but they are not the only
+    // thing asking. `tile_source`'s fetch loop calls `request_repaint()` from a
+    // *task*, whenever a tile lands, and that is on the wall clock rather than
+    // on this one. Twelve frames was enough on an idle box and not always
+    // enough on a loaded one, which is a flake and not a fixture.
+    //
+    // The bound is a guard against spinning for ever, not the thing being
+    // waited for; overshooting it leaves `repaint_delay` non-idle, which the
+    // one test that cares asserts on directly and by name.
+    for _ in 0..60 {
+        if h.repaint_delay() == std::time::Duration::MAX {
+            break;
+        }
+        h.frame_after(0.25);
+    }
+    assert_eq!(
+        rasterizes_requested(&h, OverlayKind::NwsAlerts),
+        0,
+        "fixture: a settled cache with nothing new must ask for nothing"
+    );
+    h
+}
+
+/// Walk the zoom by `step` for `frames` frames, one frame per step, and return
+/// how many rasterizes were asked for along the way.
+///
+/// One frame per step is the whole point: the cache decides a gesture has
+/// *settled* by seeing the same zoom on two consecutive frames, so a helper
+/// that ran `warm_up`'s three frames per step would be holding the map still
+/// between steps and would measure the settle, not the gesture.
+fn zoom_gesture(h: &mut InputHarness, from: f64, step: f64, frames: usize) -> usize {
+    let mut asked = 0;
+    for i in 1..=frames {
+        set_pane_zoom(h, from + step * i as f64);
+        h.frame();
+        asked += rasterizes_requested(h, OverlayKind::NwsAlerts);
+    }
+    asked
+}
+
+/// The win. A zoom gesture that stays inside `ZOOM_REBUILD_BAND` costs **no**
+/// rasterizes at all while it is moving.
+///
+/// The key was an equality on the quantised zoom, and one step of that is 0.031
+/// zoom units — about 4.7 px of finger travel — against a gesture that moves
+/// `zoom` continuously as an `f64`. So it missed on nearly every frame, and each
+/// miss was a fresh 2880×1620 raster and a `write_texture` on the frame thread.
+///
+/// Measured on the **zoom-in** arm at the quarter overdraw, over a real
+/// 2-zoom-unit drag lasting 2 s: 31 renders over the gesture — 15.5 a second —
+/// and 204 ms of frame thread per second of zooming, against 2 renders plus one
+/// settle and 20 ms/s after. `OverlayTextureCache::needs_rerender` tabulates
+/// both arms and both overdraw fractions; the counts and the rates are kept
+/// apart there for the same reason they are here.
+///
+/// Counted over the frames of the gesture rather than at the end of it, so a
+/// key that merely *delayed* the storm rather than avoiding it would still fail.
+#[test]
+fn a_zoom_inside_the_band_asks_for_nothing_while_it_moves() {
+    const Z0: f64 = 7.0;
+    let mut h = settled_alert_pane(Z0);
+
+    // Twelve frames of 0.05, i.e. 0.6 of a zoom unit — comfortably inside the
+    // band and 19 quantisation steps past what the old key tolerated.
+    let asked = zoom_gesture(&mut h, Z0, 0.05, 12);
+    assert_eq!(
+        asked, 0,
+        "a zoom gesture well inside ZOOM_REBUILD_BAND asked for {asked} \
+         rasterizes while it was moving; the cache is keyed on the zoom itself \
+         again rather than on a band"
+    );
+}
+
+/// …and the other half: past the band, it does re-rasterize, so the zero above
+/// is a tolerance and not a cache that has stopped listening.
+#[test]
+fn a_zoom_past_the_band_re_rasterizes_while_it_moves() {
+    const Z0: f64 = 7.0;
+    let mut h = settled_alert_pane(Z0);
+
+    let inside = zoom_gesture(&mut h, Z0, 0.05, 12);
+    assert_eq!(inside, 0, "fixture: the first 0.6 must be free");
+
+    // One more frame, this time a step that carries the total past the band.
+    set_pane_zoom(&mut h, Z0 + crate::overlay_cache::ZOOM_REBUILD_BAND + 0.01);
+    h.frame();
+    assert_eq!(
+        rasterizes_requested(&h, OverlayKind::NwsAlerts),
+        1,
+        "a zoom past ZOOM_REBUILD_BAND left the pane on a texture more than a \
+         factor of two off its own scale"
+    );
+}
+
+/// **The settle.** A gesture that ends inside the band buys exactly one
+/// rasterize when the map stops, at the zoom it stopped at — and then stops
+/// asking.
+///
+/// This is the half whose failure is silent, and the reason the band above is a
+/// tolerance rather than a downgrade. Mid-gesture the overlay is magnified or
+/// minified by up to 2× and its strokes do not rescale; that is accepted,
+/// because it lasts as long as the fingers are moving. A settle that never
+/// fired would make it permanent, with nothing on screen to say the picture is
+/// not the one this zoom would draw.
+#[test]
+fn a_zoom_that_stops_inside_the_band_settles_exactly_once() {
+    const Z0: f64 = 7.0;
+    let mut h = settled_alert_pane(Z0);
+
+    let asked = zoom_gesture(&mut h, Z0, 0.05, 12);
+    assert_eq!(asked, 0, "fixture: the gesture itself must be free");
+    let stopped_at = Z0 + 0.6;
+
+    // The map is now still. The very next frame is the second one at this zoom,
+    // which is what "settled" means.
+    h.frame();
+    assert_eq!(
+        rasterizes_requested(&h, OverlayKind::NwsAlerts),
+        1,
+        "the gesture ended and nothing asked for the texture this zoom wants; \
+         the overlay stays soft until something else invalidates it"
+    );
+    assert_eq!(
+        requested_render_zoom(&h, OverlayKind::NwsAlerts),
+        crate::overlay_cache::current_quantized_zoom(stopped_at),
+        "the settle render was keyed at a zoom the map is not at"
+    );
+
+    // Land it, and the asking stops — one settle, not a loop.
+    settle_overlay_cache(&mut h, OverlayKind::NwsAlerts);
+    for frame in 0..4 {
+        h.frame();
+        assert_eq!(
+            rasterizes_requested(&h, OverlayKind::NwsAlerts),
+            0,
+            "frame {frame} after the settle landed asked for another raster; \
+             the settle is a loop rather than a one-shot"
+        );
+    }
+    assert!(
+        !h.gui_mut().panes_mut()[0]
+            .overlay_cache_mut(OverlayKind::NwsAlerts)
+            .zoom_is_stale(stopped_at),
+        "the settle landed and the overlay is still at another zoom — this is \
+         the permanent-blur failure, and it is invisible without this assertion"
+    );
+}
+
+/// The settle is level-triggered, so a frame it cannot act on does not consume
+/// it.
+///
+/// The edge-triggered version of this test passes: "zoom changed, then did not"
+/// is an event, and it is tempting to fire on the event. But the frame where
+/// the map stops can easily be a frame with a render already in flight — a
+/// gesture that crossed the band a moment earlier is exactly that case — and an
+/// event consumed then is an event gone. The cache asks "is the zoom still, and
+/// is my texture at another one", which stays true until it is answered.
+#[test]
+fn a_settle_frame_lost_to_an_in_flight_render_is_not_a_settle_lost() {
+    const Z0: f64 = 7.0;
+    let mut h = settled_alert_pane(Z0);
+
+    let asked = zoom_gesture(&mut h, Z0, 0.05, 12);
+    assert_eq!(asked, 0, "fixture: the gesture itself must be free");
+
+    // A render is in flight over the frame the gesture ends on.
+    h.gui_mut().panes_mut()[0]
+        .overlay_cache_mut(OverlayKind::NwsAlerts)
+        .render_in_flight = true;
+    h.frame();
+    assert_eq!(
+        rasterizes_requested(&h, OverlayKind::NwsAlerts),
+        0,
+        "fixture: an in-flight render must suppress the dispatch, or this test \
+         is not about what it says"
+    );
+
+    // It lands. The settle is still owed and still asked for.
+    h.gui_mut().panes_mut()[0]
+        .overlay_cache_mut(OverlayKind::NwsAlerts)
+        .render_in_flight = false;
+    h.frame();
+    assert_eq!(
+        rasterizes_requested(&h, OverlayKind::NwsAlerts),
+        1,
+        "the settle was spent on a frame that could not dispatch it, and the \
+         overlay is now permanently at the wrong zoom"
+    );
+}
+
+/// And the frame the settle needs is *asked for*, rather than left to arrive.
+///
+/// egui is reactive: it draws when something requests a draw. The last frame of
+/// a real gesture is the one its own input event produced, and if nothing asks
+/// for another, none comes — so the cache never gets the second look that tells
+/// it the map has stopped, and every test above would still pass while the app
+/// stayed blurry. `ui_map_pane` asks, for as long as `zoom_is_stale`.
+#[test]
+fn a_stale_zoom_asks_for_the_frame_its_settle_needs() {
+    const Z0: f64 = 7.0;
+    let mut h = settled_alert_pane(Z0);
+    assert_eq!(
+        h.repaint_delay(),
+        std::time::Duration::MAX,
+        "fixture: a pane whose overlay is at the map's own zoom must not be \
+         holding the frame loop awake, or the assertion below says nothing. \
+         `settled_alert_pane` drives to this condition and gave up; something \
+         other than the overlay is asking for frames without stopping"
+    );
+
+    // One frame of gesture, ending inside the band: the texture is now at
+    // another zoom and a settle is owed.
+    set_pane_zoom(&mut h, Z0 + 0.05);
+    h.frame();
+    assert!(
+        h.repaint_delay() <= crate::overlay_cache::SETTLE_REPAINT_DELAY,
+        "the overlay is at a zoom the map is not at and nothing asked for \
+         another frame; on a reactive UI the settle render is then waiting for \
+         an input event that may never come — got {:?}",
+        h.repaint_delay(),
+    );
+}

@@ -16,25 +16,95 @@ use rustdar_radar::types::RadarProduct;
 
 // ── Viewport state (reused for render-trigger detection) ─────────────────
 
-/// Multiplier for zoom-level quantization.
+/// Fixed-point scale for carrying a zoom level across the render channel.
 ///
-/// Overlay textures are re-rasterized only when the quantized zoom changes,
-/// so this value controls the trade-off between render frequency and visual
-/// freshness.  32 (= 2^5) gives ~0.031 zoom-unit granularity per step:
+/// A render request travels to a worker as [`crate::actions::GuiAction::
+/// RenderOverlay`] and comes back as an `OverlayRenderResponse`, and the zoom
+/// rides both legs as an `i32` at `zoom · 32` — encoded by [`quantize_zoom`],
+/// decoded by `app_fetch::spawn_overlay_render` for the handlers that scale
+/// their symbols by zoom. 32 (= 2⁵) is exact in binary, so the round trip loses
+/// only the ~0.031 of a zoom unit it deliberately rounds away.
 ///
-/// - **Finer** (e.g. 64): triggers excessive rerenders during smooth zoom
-///   gestures, wasting CPU on nearly-identical textures.
-/// - **Coarser** (e.g. 16): misses visible zoom changes, leaving stale
-///   textures on screen until the next quantization boundary.
+/// # It is not the re-render trigger
 ///
-/// Used in [`quantize_zoom`] to encode and in `rustdar-platform` to decode
-/// back to `f64`.
+/// It was, and that is the whole reason the overlay stuttered on zoom.
+/// [`OverlayTextureCache::needs_rerender`] compared this quantised value for
+/// *equality*, so one step of it — 0.031 zoom units, about 4.7 px of finger
+/// travel at the drag sensitivity — asked for a fresh full-size texture: 4.7 Mpx
+/// at 1920×1080 and the current [`OVERDRAW_FRACTION`], and 18.7 Mpx before that
+/// constant was cut to a quarter. A wheel or pinch zoom is continuous `f64`, so
+/// during a gesture that missed on very nearly every frame.
+///
+/// The trigger is [`ZOOM_REBUILD_BAND`] now, and this constant is back to being
+/// what its name says: a wire encoding. Making it *coarser* is no longer a way
+/// to trade freshness for renders — it would only blur the zoom the handlers
+/// draw at — and making it finer costs nothing.
 pub const ZOOM_QUANTIZATION_FACTOR: f64 = 32.0;
 
-/// Quantised zoom level for detecting when a re-render is needed.
+/// Quantised zoom, for the render channel. See [`ZOOM_QUANTIZATION_FACTOR`].
 fn quantize_zoom(zoom: f64) -> i32 {
     (zoom * ZOOM_QUANTIZATION_FACTOR).round() as i32
 }
+
+/// How far the map may zoom away from a texture's own zoom, in zoom units,
+/// before the texture is re-rasterized mid-gesture.
+///
+/// One zoom unit is a factor of two in scale, so this is the whole budget: a
+/// texture on screen during a gesture may be magnified up to 2× (soft) or
+/// minified up to 2× (aliased) before a fresh one is asked for. That is a
+/// deliberate trade and it is the reason the settle render below is not
+/// optional — mid-gesture the overlay is *meant* to look approximate, and at
+/// rest it is meant to be exact.
+///
+/// It is safe to relax this far because [`draw_overlay_texture`] projects the
+/// texture's stored `geo_bounds` through the *current* projector, so a
+/// stale-zoom texture is drawn over the right ground and only its resolution is
+/// behind. Nor can it strand the viewport off the texture: see
+/// [`pan_exceeds_coverage`], whose containment proof holds for any band and
+/// which fires on its own as a zoom-out grows the viewport.
+///
+/// Two things do not rescale with it, both accepted and both corrected by the
+/// settle render:
+///
+/// * **Strokes.** [`rustdar_overlays::render::rasterize`] thins an outline below
+///   a 40 px feature, so a magnified texture shows the stroke it was drawn with
+///   rather than the one this zoom would draw. It is a line width, and it lasts
+///   as long as the gesture.
+/// * **The radar-site plates.** tiny-skia cannot draw text, so the site raster
+///   is the pill *behind* each label and egui draws the glyphs over it at a
+///   fixed size every frame. Mid-gesture the pill therefore stretches up to 2×
+///   under text that does not, which is the one artefact here that is not
+///   simply "softer".
+///
+/// `RadarSites` is nevertheless **in** the band, deliberately. Excluding it is a
+/// one-line change and it was considered: the plate is screen-space UI, and the
+/// raster draws less than any other layer's. But what a gesture costs is not
+/// path building — it is the buffer, and `app_fetch` says why: the site markers
+/// cover the whole viewport, so the texture is exactly the size of every other
+/// overlay's. Exempting it puts a full-size convert and a full-size
+/// `Queue::write_texture` back on the frame thread on every frame of every zoom
+/// for anyone with the layer on — 8.7 ms a render at 1920×1080 natively, and on
+/// wasm the whole inline raster, measured at 224 ms against a p50 frame of
+/// 289.5 ms. That is precisely the stutter this constant exists to remove, so
+/// the plate stretches for a tenth of a second instead.
+pub const ZOOM_REBUILD_BAND: f64 = 1.0;
+
+/// How long after a zoom stops before the settle render is asked for.
+///
+/// egui is reactive: it draws a frame when something asks for one. A wheel or
+/// pinch gesture's *last* frame is driven by the input event that ended it, and
+/// [`OverlayTextureCache::needs_rerender`] decides the gesture has settled by
+/// seeing the same zoom twice running — so without something asking for that
+/// second frame, the overlay would sit at the gesture's last mid-flight
+/// resolution indefinitely. `ui_map_pane` requests a repaint this far out for
+/// as long as [`OverlayTextureCache::zoom_is_stale`] is true, which makes the
+/// settle a consequence of the code rather than of another frame happening to
+/// come along.
+///
+/// It doubles as the gesture's debounce. During a gesture the input frames
+/// arrive well inside this window and supersede it, so the settle costs nothing
+/// until the fingers stop; a tenth of a second after they do, one render lands.
+pub const SETTLE_REPAINT_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Overdraw the renderer *asks* for, as a fraction of the viewport dimension,
 /// on each side of the viewport.
@@ -318,6 +388,16 @@ pub struct OverlayTextureCache {
     pub current: Option<OverlayTextureData>,
     /// Whether a background render is in progress for this cache.
     pub render_in_flight: bool,
+    /// The zoom [`Self::needs_rerender`] was asked about last time, which is
+    /// how it knows on the next call whether the gesture has stopped.
+    ///
+    /// Private, and written by the query itself rather than by a separate
+    /// `note_zoom` the caller has to remember, because forgetting to call that
+    /// is precisely the permanent-blur failure this design has to make
+    /// unreachable: a cache that never sees a second frame at the same zoom
+    /// never settles, and the overlay stays soft until something else
+    /// invalidates it. Asking the question *is* recording the answer.
+    last_seen_zoom: Option<f64>,
 }
 
 impl Default for OverlayTextureCache {
@@ -331,27 +411,91 @@ impl OverlayTextureCache {
         Self {
             current: None,
             render_in_flight: false,
+            last_seen_zoom: None,
         }
+    }
+
+    /// Whether this cache's texture is at a zoom other than the map's.
+    ///
+    /// The one thing a caller needs in order to know a settle render is still
+    /// owed, and therefore that another frame has to be asked for — see
+    /// `ui_map_pane`. `false` for a cache with no texture: that asks for a
+    /// render outright and needs no timer to do it.
+    pub fn zoom_is_stale(&self, zoom: f64) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|tex| tex.render_zoom != quantize_zoom(zoom))
     }
 
     /// Check whether a re-render is needed for this overlay.
     ///
-    /// Triggers on: cache token change, zoom change, or pan exceeding the
-    /// overdraw margin. `token` is `ui_map_pane::overlay_cache_token`'s answer
-    /// — see [`OverlayTextureData::data_generation`].
-    pub fn needs_rerender(
-        &self,
-        token: u64,
-        current_zoom: i32,
-        viewport_bounds: &GeoBounds,
-    ) -> bool {
+    /// Triggers on: cache token change, the zoom drifting a whole
+    /// [`ZOOM_REBUILD_BAND`] from the texture's own, the zoom having *settled*
+    /// anywhere other than the texture's own, or pan exceeding the overdraw
+    /// margin. `token` is `ui_map_pane::overlay_cache_token`'s answer — see
+    /// [`OverlayTextureData::data_generation`].
+    ///
+    /// # Why the zoom test is a band and a settle, and not an equality
+    ///
+    /// It was an equality on the quantised zoom, and that is what made zooming
+    /// with an alert overlay on stutter: one quantisation step is 0.031 zoom
+    /// units — about 4.7 px of finger travel — while a wheel or pinch gesture
+    /// moves `zoom` continuously as an `f64`. So the test missed on very nearly
+    /// every frame of a gesture, and each miss was a fresh full-size raster plus
+    /// a `write_texture` on the frame thread.
+    ///
+    /// Measured over a 2-zoom-unit drag in 2 s at 1920×1080 over the live
+    /// 273-alert feed, quoting **renders per second of gesture and frame-thread
+    /// milliseconds per second of gesture** throughout, because a per-gesture
+    /// count and a per-second time do not compare:
+    ///
+    /// | arm                                   | zoom in     | zoom out    |
+    /// |---------------------------------------|-------------|-------------|
+    /// | equality key, `OVERDRAW_FRACTION` 1.0 | —           | 8.0 / 301   |
+    /// | equality key, quarter overdraw        | 15.5 / 204  | 19.0 / 248  |
+    /// | this band + settle, quarter overdraw  | 1.5 / 20    | 3.0 / 39    |
+    ///
+    /// The middle row is the one this method changes; the top row is what the
+    /// quarter-overdraw commit before it started from, and it is quoted because
+    /// cheaper renders alone *raise* the count — capping it is this method's
+    /// job, not that constant's.
+    ///
+    /// The bottom row is 2 renders + 1 settle and 5 + 1 over the 2 s drag.
+    ///
+    /// The two halves replace it with a claim about *when* the picture has to be
+    /// right rather than *how often*:
+    ///
+    /// - **In motion**, drift up to a whole zoom unit is tolerated. The texture
+    ///   is drawn through the current projector either way ([`draw_overlay_texture`]),
+    ///   so it is in the geometrically correct place; only its resolution is
+    ///   behind, by at most 2× in each direction.
+    /// - **At rest**, `settled` — this cache saw the same `zoom` on the previous
+    ///   frame — asks for the exact texture, once. That is what makes the
+    ///   tolerance above temporary rather than permanent, and it is the half
+    ///   whose failure mode is silent: a settle that never fires leaves the
+    ///   overlay soft with nothing on screen to say so. It is level-triggered,
+    ///   not edge-triggered — `settled` stays true for as long as the map is
+    ///   still — so a frame lost to `render_in_flight`, or to a render landing
+    ///   late, costs a frame of delay and not the settle itself.
+    ///
+    /// Relaxing the zoom key cannot strand the viewport off the texture: see
+    /// [`pan_exceeds_coverage`], whose containment result holds for any zoom
+    /// band at all.
+    pub fn needs_rerender(&mut self, token: u64, zoom: f64, viewport_bounds: &GeoBounds) -> bool {
+        let settled = self.last_seen_zoom == Some(zoom);
+        self.last_seen_zoom = Some(zoom);
+
         let Some(ref tex) = self.current else {
             return true;
         };
         if tex.data_generation != token {
             return true;
         }
-        if tex.render_zoom != current_zoom {
+        let render_zoom = tex.render_zoom as f64 / ZOOM_QUANTIZATION_FACTOR;
+        if (zoom - render_zoom).abs() >= ZOOM_REBUILD_BAND {
+            return true;
+        }
+        if settled && tex.render_zoom != quantize_zoom(zoom) {
             return true;
         }
         // Check if the viewport has panned outside the texture coverage
@@ -370,11 +514,30 @@ impl OverlayTextureCache {
 /// coverage it never had and sit on a stale image while the viewport panned off it.
 /// Reading the band off the bounds the render actually used cannot drift from them.
 ///
-/// Both ranges come from the same zoom: [`OverlayTextureCache::needs_rerender`]
-/// returns early when the quantised zoom differs, so `viewport_bounds` spans the
-/// same ground per pixel as it did at render time. A pane that has since *grown*
-/// yields a negative band, and hence a negative margin, which trips the comparison
-/// immediately — correct, because the texture no longer covers the viewport.
+/// # The two ranges are no longer at the same zoom, and it does not matter
+///
+/// This used to say they were: [`OverlayTextureCache::needs_rerender`] returned
+/// early whenever the quantised zoom differed, so `viewport_bounds` was
+/// guaranteed to span the same ground per pixel as it did at render time. That
+/// sentence stopped being true the moment the zoom key became a band, and it is
+/// rewritten rather than relied on.
+///
+/// Nothing here depended on it. This function does not look at pixels at all —
+/// it compares two geographic rectangles, and the containment result below holds
+/// whatever scale each was drawn at. What the change means in practice is that
+/// `viewport_bounds` may now be *larger* than it was at render time, because the
+/// map zoomed out inside the band. That is the case the old sentence dismissed
+/// as a pane that had "grown", and the arithmetic handles it identically: a
+/// viewport wider than the texture yields a negative band, hence a negative
+/// margin, and trips the comparison at once — correct, because the texture no
+/// longer covers the viewport.
+///
+/// So this is also what bounds a stale-zoom texture in the zoom-*out* direction,
+/// and the two constants have to be read together: zooming out grows the
+/// viewport until this fires, which for a centred viewport is exactly when the
+/// viewport's range reaches the texture's — `log2(1 + 2·OVERDRAW_FRACTION)` zoom
+/// units, 0.58 at a quarter. [`ZOOM_REBUILD_BAND`] alone bounds zooming *in*,
+/// which shrinks the viewport and can never trip this.
 ///
 /// # `false` implies containment
 ///
@@ -388,10 +551,13 @@ impl OverlayTextureCache {
 /// is exactly `D >= 0`, so the texture is at least as wide as the viewport and,
 /// with the two endpoint inequalities, contains it.
 ///
-/// So this function cannot report "still covered" about a texture that does not in
-/// fact contain the viewport. The stale-overlay failure mode is unrepresentable,
-/// not merely untested — and it stays that way for any threshold anyone picks,
-/// which is why `PAN_REBUILD_THRESHOLD` is safe to tune.
+/// Note what that derivation does *not* assume: nothing about where
+/// `view_range` came from, and in particular nothing about it matching the
+/// texture's zoom. So this function cannot report "still covered" about a
+/// texture that does not in fact contain the viewport — for any threshold
+/// anyone picks, and for any zoom band. That is what makes both
+/// `PAN_REBUILD_THRESHOLD` and [`ZOOM_REBUILD_BAND`] safe to tune: the
+/// stale-overlay failure mode is unrepresentable rather than merely untested.
 fn pan_exceeds_coverage(texture_bounds: &GeoBounds, viewport_bounds: &GeoBounds) -> bool {
     let tex_lat_range = texture_bounds.max_lat - texture_bounds.min_lat;
     let tex_lon_range = texture_bounds.max_lon - texture_bounds.min_lon;

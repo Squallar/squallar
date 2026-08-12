@@ -194,8 +194,32 @@ impl OverlayHandler for SpcOutlookHandler {
         self.combined_generation()
     }
 
+    /// Data **this selection** can draw, not data this layer has ever fetched.
+    ///
+    /// Every other handler's `has_data` is the same test its own
+    /// `prepare_rasterize` opens with, and this one was not: outlooks are keyed
+    /// by `(day, product)`, so a full `state.data` says nothing about whether
+    /// the selected day crossed with the ticked products yields a single
+    /// feature. Untick every product, or move to a day whose products are not
+    /// ticked, and the old answer was `true` while `prepare_rasterize` returned
+    /// `None`.
+    ///
+    /// That gap is not cosmetic. `ui_map_pane` reads this to decide both
+    /// whether to dispatch a render *and* whether a settle render is still owed
+    /// — and the second one asks for a repaint 100 ms out for as long as it is
+    /// owed. An overlay that is asked for for ever and abandoned in
+    /// `spawn_overlay_render` for ever is a permanent 10 Hz wakeup on an
+    /// otherwise idle app, on the battery, with nothing on screen to say why.
+    /// So this is the exact complement of `prepare_rasterize`'s own early
+    /// return, and `every_texture_handler_agrees_with_its_own_rasterizer` is
+    /// what keeps the two from drifting apart again.
     fn has_data(&self) -> bool {
-        !self.state.data.is_empty()
+        self.enabled_products.iter().any(|product| {
+            self.state
+                .data
+                .get(&(self.selected_day, *product))
+                .is_some_and(|outlook| !outlook.features.is_empty())
+        })
     }
 
     fn is_fetching(&self) -> bool {

@@ -505,6 +505,10 @@ pub(super) fn render_pane_map_content(
         let max_texture_side = ui.ctx().input(|i| i.max_texture_side) as u32;
         let tex_plan = plan_overlay_texture(screen_rect, max_texture_side);
 
+        // Whether any overlay on this pane is showing a texture rasterised at a
+        // zoom other than the map's — i.e. whether a settle render is still owed.
+        let mut settle_owed = false;
+
         for &kind in OverlayKind::all() {
             if ctx.overlays.render_mode(kind) != Some(RenderMode::Texture) {
                 continue;
@@ -518,11 +522,16 @@ pub(super) fn render_pane_map_content(
             let token = overlay_cache_token(ctx.overlays, ctx.pane, kind);
             let has_data = ctx.overlays.has_data(kind);
             let cache = ctx.pane.overlay_cache_mut(kind);
-            if enabled
-                && has_data
-                && !cache.render_in_flight
-                && cache.needs_rerender(token, qzoom, &viewport_bounds)
-            {
+            // Asked on every frame the overlay is live, and *not* gated on
+            // `render_in_flight` the way it used to be. `needs_rerender` is also
+            // what records the zoom it was shown, and it decides a gesture has
+            // settled by comparing two consecutive frames — so a frame skipped
+            // here is a frame missing from that comparison, and a gesture that
+            // ends while a render is in flight would take an extra frame to
+            // notice. The flight check moved to the dispatch below, where it
+            // belongs.
+            let stale = enabled && has_data && cache.needs_rerender(token, zoom, &viewport_bounds);
+            if stale && !cache.render_in_flight {
                 ctx.actions.push(GuiAction::RenderOverlay {
                     pane_idx: ctx.pane_idx,
                     overlay_kind: kind,
@@ -532,9 +541,49 @@ pub(super) fn render_pane_map_content(
                     zoom: qzoom,
                 });
             }
+            // `enabled && has_data` and not just `enabled`. A repaint asked for
+            // on a frame that cannot dispatch anything is a 10 Hz wakeup that
+            // nothing can ever satisfy — and an overlay whose data has gone
+            // while its texture has not is precisely that state.
+            //
+            // Matching the dispatch above is *not* what makes this right, and
+            // the first version of this line matched it exactly and was still
+            // wrong. What has to hold is that a dispatched render can actually
+            // land: `spawn_overlay_render` asks the handler for a rasterizer
+            // and abandons the render if it declines, which clears nothing and
+            // leaves `zoom_is_stale` true for ever. `has_data` is that
+            // condition only because
+            // `every_texture_handler_agrees_with_its_own_rasterizer` holds it
+            // to each handler's own `prepare_rasterize` —
+            // `SpcOutlookHandler`'s did not, and unticking its products left
+            // this pane asking for a frame every 100 ms until the app closed.
+            if enabled && has_data && cache.zoom_is_stale(zoom) {
+                settle_owed = true;
+            }
             if !enabled {
                 cache.current = None;
             }
+        }
+
+        // Ask for one more frame while any overlay is still at the wrong zoom.
+        //
+        // This is what makes the settle render in `needs_rerender` reachable
+        // rather than lucky. That test fires when a cache sees the same zoom
+        // twice running, and egui is *reactive*: the last frame of a wheel or
+        // pinch gesture is driven by the input event that ended it, and if
+        // nothing asks for another one, none arrives — the cache never gets its
+        // second look, and the overlay stays soft until the user pans, changes
+        // a layer, or a poll lands. That is the failure this whole change has to
+        // not have, and it is silent when it happens.
+        //
+        // A delay rather than an immediate repaint, so it is also the gesture's
+        // debounce: during a gesture the input frames arrive first and supersede
+        // it, and the settle happens a beat after the fingers stop. It is
+        // self-limiting — the moment the settle render lands, `zoom_is_stale` is
+        // false and nothing here asks again.
+        if settle_owed {
+            ui.ctx()
+                .request_repaint_after(crate::overlay_cache::SETTLE_REPAINT_DELAY);
         }
     }
     // overlay_ctx (and its shared borrow of ui) is dropped here

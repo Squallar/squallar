@@ -442,3 +442,137 @@ fn every_fixture_draws_pixels_the_two_conventions_disagree_about() {
          pass either way. Give the fixture a translucent fill.",
     );
 }
+
+// ── `has_data` against the handler's own rasterizer ──────────────────────
+
+/// **The permanent-wakeup guard.** For every texture handler,
+/// `has_data() == prepare_rasterize().is_some()`.
+///
+/// `ui_map_pane` reads `has_data` for two decisions: whether to dispatch a
+/// `RenderOverlay`, and whether a *settle* render is still owed — and the
+/// second asks egui for a repaint 100 ms out for as long as the answer is yes.
+/// A handler that says it has data and then declines to rasterize is therefore
+/// not merely wasteful: the render is dispatched, `spawn_overlay_render` finds
+/// no rasterizer and abandons it, the texture stays at the old zoom, and the
+/// pane asks for another frame in 100 ms. For ever, on an idle app, with
+/// nothing on screen to say why.
+///
+/// `SpcOutlookHandler` was exactly that. `has_data` was `!state.data.is_empty()`
+/// while `prepare_rasterize` needs the *selected day* crossed with the *ticked
+/// products* to yield a feature — so untick every SPC product, or move to a day
+/// whose products are not ticked, and the two disagreed for ever.
+///
+/// The states below are the ones the layer stack can actually reach, and the
+/// master toggle is the reachable route to the divergence: for a handler whose
+/// "enabled" *is* its product set, switching it off empties the very set
+/// `prepare_rasterize` looks the data up by.
+#[test]
+fn every_texture_handler_agrees_with_its_own_rasterizer() {
+    let ctx = rctx();
+    let mut checked = 0;
+    for handler in create_handlers().iter_mut() {
+        if handler.render_mode() != RenderMode::Texture {
+            continue;
+        }
+        let kind = handler.kind();
+        if matches!(kind, OverlayKind::RadarSites | OverlayKind::Radar) {
+            // The two exempt kinds: there is no `prepare_rasterize` for their
+            // `has_data` to agree *with*. Their `has_data` is an unconditional
+            // `true` and their pixels come from elsewhere — `app_fetch` calls
+            // `rasterize_radar_sites` directly and it always produces a buffer,
+            // and `ui_map_pane` skips `Radar` outright. Neither dispatch can
+            // decline, so neither can strand a settle.
+            assert!(
+                handler.prepare_rasterize(&ctx).is_none(),
+                "{kind:?} grew a `prepare_rasterize`; it now has this invariant \
+                 to keep, so seed it in `seed` and drop it from this exemption",
+            );
+            continue;
+        }
+
+        let agree = |h: &dyn OverlayHandler, state: &str| {
+            assert_eq!(
+                h.has_data(),
+                h.prepare_rasterize(&ctx).is_some(),
+                "{kind:?} disagrees with its own rasterizer while {state}. \
+                 `ui_map_pane` gates both the render dispatch and the settle \
+                 repaint on `has_data`, so `true` here with `None` there is a \
+                 render asked for on every frame and abandoned on every frame, \
+                 and a 100 ms repaint nothing can ever satisfy.",
+            );
+        };
+
+        // Nothing fetched.
+        agree(handler.as_ref(), "empty");
+
+        assert!(
+            seed(handler.as_mut()),
+            "{kind:?} is not exempt above, so it must be seedable",
+        );
+
+        // Seeded and on.
+        agree(handler.as_ref(), "seeded and enabled");
+
+        // Off. For alerts, MDs, reports, GLM and HRRR the master toggle is a
+        // `bool` the rasterizer never reads, so both halves stay `true`; for
+        // outlooks it clears the product set, and both must go to `false`.
+        handler.set_enabled(false);
+        agree(handler.as_ref(), "seeded, then switched off");
+
+        // And back, because `set_enabled(true)` restores a *default* selection
+        // rather than the one that was there — which is another way for the two
+        // halves to part company.
+        handler.set_enabled(true);
+        agree(handler.as_ref(), "seeded, switched off, switched back on");
+
+        checked += 1;
+    }
+    assert_eq!(
+        checked, 6,
+        "the six texture handlers that rasterize through `prepare_rasterize` \
+         must all be covered",
+    );
+}
+
+/// The other reachable route to the outlook divergence, which no walk over the
+/// trait can reach: the day buttons.
+///
+/// Day 5 publishes only `Probabilistic`, so a pane holding Day 1's Categorical
+/// tick and moving to Day 5 has a full `state.data` and nothing at all to draw.
+/// This is the state a user lands in by pressing one button, and before the fix
+/// it was a 10 Hz repaint that outlived the gesture, the pane and the session.
+#[test]
+fn an_outlook_day_with_no_ticked_products_has_no_data_to_draw() {
+    use crate::spc::outlook::{OutlookDay, OutlookProduct};
+
+    let ctx = rctx();
+    let mut handler = super::outlook::SpcOutlookHandler::new();
+    assert!(seed(&mut handler), "the outlook handler takes a fetch");
+    assert!(
+        handler.has_data() && handler.prepare_rasterize(&ctx).is_some(),
+        "fixture: Day 1 Categorical is both ticked and fetched",
+    );
+
+    handler.selected_day = OutlookDay::Day5;
+    assert!(
+        !OutlookDay::Day5
+            .products()
+            .contains(&OutlookProduct::Categorical),
+        "fixture: Day 5 must not publish the product that is ticked",
+    );
+    assert!(
+        !handler.state.data.is_empty(),
+        "fixture: the layer still holds Day 1's outlook, which is what made \
+         the old `!data.is_empty()` answer `true`",
+    );
+
+    assert!(
+        handler.prepare_rasterize(&ctx).is_none(),
+        "fixture: there is nothing on Day 5 to rasterize",
+    );
+    assert!(
+        !handler.has_data(),
+        "the pane would dispatch a render `spawn_overlay_render` abandons, and \
+         ask for another frame 100 ms later, for as long as the app is open",
+    );
+}

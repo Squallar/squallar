@@ -140,6 +140,13 @@ pub(crate) struct InputHarness {
     last_images: Vec<PaintedImage>,
     /// Every line segment painted during the last frame, with its stroke.
     last_segments: Vec<(egui::Pos2, egui::Pos2, egui::Stroke)>,
+    /// The soonest repaint any viewport asked for on the last frame.
+    ///
+    /// `Duration::MAX` means "nothing asked", which is egui's own idle answer
+    /// and the only one that matters here: the overlay cache's settle render
+    /// needs a *second* frame at the same zoom to notice, and a reactive UI only
+    /// draws one if something asks. See `overlay_cache::SETTLE_REPAINT_DELAY`.
+    last_repaint_delay: std::time::Duration,
     /// Rects that came back under a different widget id between passes,
     /// accumulated over every frame since the last [`InputHarness::clear_id_changes`].
     /// See [`InputHarness::id_changes`].
@@ -384,6 +391,7 @@ impl InputHarness {
             last_texts: Vec::new(),
             last_images: Vec::new(),
             last_segments: Vec::new(),
+            last_repaint_delay: std::time::Duration::MAX,
             id_changes: Vec::new(),
             prev_widgets: egui::WidgetRects::default(),
         };
@@ -2184,7 +2192,18 @@ impl InputHarness {
                 _ => None,
             })
             .collect();
+        self.last_repaint_delay = full_output
+            .viewport_output
+            .values()
+            .map(|v| v.repaint_delay)
+            .min()
+            .unwrap_or(std::time::Duration::MAX);
         outcome
+    }
+
+    /// The soonest repaint the last frame asked for; `Duration::MAX` if none.
+    pub(crate) fn repaint_delay(&self) -> std::time::Duration {
+        self.last_repaint_delay
     }
 }
 
