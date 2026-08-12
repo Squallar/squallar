@@ -933,7 +933,10 @@ impl VolumeRegion {
     /// Two numbers because the grid's cell count is the same on both axes while
     /// the box's extent is not: a 16:9 box spends the same 256 cells over 1.78×
     /// as much ground east–west as north–south, and one figure would have to
-    /// pick an axis to be honest about.
+    /// pick an axis to be honest about. What that anisotropy costs the picture
+    /// is measured on [`rustdar_radar::voxel::VoxelShape`] — under 1.1% of the
+    /// ≥20 dBZ volume across four storm volumes, which is why there is no cap
+    /// on the box's aspect.
     pub fn resolution_km(self, cells: usize) -> Option<(f64, f64)> {
         Some((
             resolution_km(self.half.east_km, cells)?,

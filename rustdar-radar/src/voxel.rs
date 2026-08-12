@@ -756,6 +756,54 @@ pub fn default_shape() -> VoxelShape {
 /// How many cells a grid has along each axis.
 ///
 /// `nx` runs east, `ny` north, `nz` up.
+///
+/// # The cells are rectangular, and what that costs — measured
+///
+/// Every named shape has `nx == ny`, but a box's two horizontal extents are
+/// **not** equal: a 3D pane's box is the rectangle of ground its viewport is
+/// showing, so a 16:9 pane spends the same 256 cells over 1.78× as much ground
+/// east–west as north–south. The cells are anisotropic by that ratio, and the
+/// question that raises — whether the coarser axis loses features — is answered
+/// here rather than argued about, because the alternative on the table was a
+/// cap on the box's aspect (letterboxing the excess ground, which is the defect
+/// the rectangle exists to fix).
+///
+/// Measured on four storm volumes — KCRP 2017-08-26 04:41Z (Harvey), KFTG
+/// 2023-06-22 03:46Z, KDMX 2022-03-05 23:23Z, KMSX 2022-06-04 20:05Z — as
+/// **reflectivity volume in km³ at or above a class cut, over the ground the
+/// two boxes share**, at [`DESKTOP_SHAPE`]. Two regimes: a mid zoom holding the
+/// north extent and widening east to 16:9 (cells 2.083 × 1.172 km against a
+/// square box's 1.172), and a wide-open pane on the resampler's own ceiling
+/// (cells 3.200 × 1.800 km against a square box's 2.596). The figure is the
+/// rectangle's volume against the square's:
+///
+/// | cut | mid zoom, four sites | wide open, four sites |
+/// |---|---|---|
+/// | ≥20 dBZ | −0.09, −0.29, −0.15, −0.08 % | −0.02, −0.13, −0.68, −1.01 % |
+/// | ≥35 dBZ | +0.62, −0.41, +0.20, −1.80 % | −0.26, +0.11, −0.18, +1.58 % |
+/// | ≥50 dBZ | −2.42, +0.31, −0.49, −100 % | +4.29, −2.28, −1.43, −100 % |
+///
+/// **So the anisotropy costs nothing at the classes a reader is looking at**:
+/// under 1.1% everywhere at ≥20 and under 1.9% at ≥35, in both directions,
+/// which is sampling noise of a cell or two on a coarser axis rather than a
+/// loss. The two −100% entries are both KMSX, whose ≥50 dBZ class is 4 cells
+/// (0.8 km³) and 2 cells (1.9 km³) in the square box — a feature already below
+/// either grid's resolution, and the honest reading is that it was never
+/// resolved rather than that the rectangle erased it. No aspect cap: it would
+/// trade a measured nothing for the ground the box exists to show.
+///
+/// The one thing that *does* change is the cloud rung.
+/// `volume_bridge::largest_cell_km` feeds `cloud_reconstruction_lod_for` the
+/// **coarsest** axis, so a wide box reaches that taper's 1.75 km/cell knee at a
+/// tighter zoom than a square one did — measured on the mid-zoom pair above,
+/// the square box gets reconstruction level 0.526 where the 16:9 box gets 0.
+/// That is the correct direction and the taper's own measurement is why: the
+/// kernel spans two cells, so on the 16:9 box it is 4.2 km wide east–west, and
+/// at 1.80 km/cell that kernel was measured taking the ≥50 dBZ eyewall to zero
+/// painted pixels. Keying on the finer axis would apply it anyway. The cost is
+/// that the north–south axis is smoothed less than its own 1.17 km cells could
+/// take; a per-axis reconstruction level is the fix if anyone ever wants it,
+/// and nobody has asked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VoxelShape {
     pub nx: usize,

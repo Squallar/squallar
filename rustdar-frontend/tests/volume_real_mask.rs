@@ -23,7 +23,9 @@
 //! | `SITE` | no | the identifier the volume's own radials carry | ICAO the radar is filed under. Its **position** always comes from the volume. |
 //! | `CENTRE_LAT` | yes | — | Region centre latitude, degrees. |
 //! | `CENTRE_LON` | yes | — | Region centre longitude, degrees. |
-//! | `HALF_KM` | no | `80.0` | Region half-width, km. `build_voxels` clamps to [10, 332.34]. |
+//! | `HALF_KM` | no | `80.0` | Region half-extent, km, on **both** axes. |
+//! | `HALF_E_KM` | no | `HALF_KM` | Region half-extent east–west, km, overriding `HALF_KM` on that axis alone. |
+//! | `HALF_N_KM` | no | `HALF_KM` | Region half-extent north–south, km. `HalfExtentKm::clamped` floors each axis at 10 km and holds the corner inside 470. |
 //! | `BASE_KM` | no | `0.0` | Box base, km MSL. |
 //! | `TOP_KM` | no | `18.0` | Box top, km MSL. |
 //! | `PRODUCT` | no | `BR` | Product: the six moments `BR`/`REF`, `BV`/`VEL`, `SW`, `ZDR`, `PHI`, `RHO`/`CC`, or the three derivations `SRV`, `NROT`, `KDP`. |
@@ -165,7 +167,7 @@ fn render_a_real_volume_mask() {
     let product = product_from_env();
     let request = VoxelRequest {
         centre: (parsed("CENTRE_LAT"), parsed("CENTRE_LON")),
-        half_extent_km: Some(HalfExtentKm::square(parsed_or("HALF_KM", 80.0))),
+        half_extent_km: Some(half_extent_from_env()),
         base_km_msl: parsed_or("BASE_KM", 0.0),
         top_km_msl: parsed_or("TOP_KM", 18.0),
         product,
@@ -573,7 +575,7 @@ fn measure_boundary_honesty_and_smoothness() {
     let product = product_from_env();
     let request = VoxelRequest {
         centre: (parsed("CENTRE_LAT"), parsed("CENTRE_LON")),
-        half_extent_km: Some(HalfExtentKm::square(parsed_or("HALF_KM", 80.0))),
+        half_extent_km: Some(half_extent_from_env()),
         base_km_msl: parsed_or("BASE_KM", 0.0),
         top_km_msl: parsed_or("TOP_KM", 18.0),
         product,
@@ -1063,6 +1065,21 @@ where
     raw.trim()
         .parse()
         .unwrap_or_else(|e| panic!("{name}={raw:?} does not parse: {e}"))
+}
+
+/// The region's half-extent from the environment.
+///
+/// `HALF_KM` sets both axes; `HALF_E_KM` and `HALF_N_KM` override one each. A
+/// pane's box is the rectangle of ground its viewport shows, so a harness that
+/// could only ask for a square could not render what the application renders —
+/// and the anisotropy that shape costs is exactly the thing worth measuring
+/// here.
+fn half_extent_from_env() -> HalfExtentKm {
+    let both = parsed_or("HALF_KM", 80.0);
+    HalfExtentKm {
+        east_km: parsed_or("HALF_E_KM", both),
+        north_km: parsed_or("HALF_N_KM", both),
+    }
 }
 
 /// An optional variable, parsed, or `fallback`.

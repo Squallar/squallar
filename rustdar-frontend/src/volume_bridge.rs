@@ -1828,6 +1828,24 @@ fn crop_into(grid: &VoxelGrid, x_km: (f64, f64), y_km: (f64, f64)) -> Option<([f
 /// box the horizontal axes are the coarse ones (the vertical is ~0.14 km).
 /// Off the uniform rather than the grid so the value fed to the taper is
 /// bit-identical to the extent and dims the same uniform hands the shader.
+///
+/// # The `max` decides something now that the two horizontal axes differ
+///
+/// A box is the rectangle of ground its pane is showing and the cell count is
+/// the same on both axes, so a 16:9 box's east–west cell is 1.78× its
+/// north–south one and this picks the east one. That makes a wide pane cross
+/// the taper's 1.75 km/cell knee at a **tighter** zoom than a square box did —
+/// measured on a 533 × 300 km box against a 300 × 300 km one, level 0 against
+/// 0.526.
+///
+/// It is the right axis, and [`cloud_reconstruction_lod_for`]'s own measurement
+/// is the argument rather than symmetry. The kernel spans two cells, so on that
+/// box it is 4.2 km wide east–west and 2.3 km north–south; the table in that
+/// function was taken at 1.80 km/cell, where a 3.6 km kernel took the ≥50 dBZ
+/// eyewall to **zero** painted pixels. Keying on the finer axis would apply a
+/// wider kernel than the one already measured erasing cores. The `max` is the
+/// conservative half of the pair and the cost is only a luxury forgone: the
+/// north–south axis is smoothed less than its own cells could take.
 fn largest_cell_km(uniform: &VolumeUniform) -> f32 {
     (0..3)
         .map(|axis| uniform.box_size_km[axis] / uniform.grid_dims[axis].max(1) as f32)
