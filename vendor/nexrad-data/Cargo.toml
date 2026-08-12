@@ -116,8 +116,22 @@ path = "tests/malformed_records.rs"
 name = "aws_realtime_types"
 path = "tests/aws_realtime_types.rs"
 
-[dependencies.bzip2]
-version = "0.6.0"
+# Upstream asks for `bzip2 = "0.6.0"`, whose backend is `libbz2-rs-sys` -- a
+# c2rust translation of the 1996 C. `bzip2-rs` is the same algorithm written as
+# Rust and `#![forbid(unsafe_code)]`, and on `Record::decompress` -- which is
+# 98-99% of the instructions a Level II volume decode retires at all -- it
+# costs **33.1% fewer** of them, for byte-identical output over 10,063 records
+# and 8.7 GB. Measured both ways; the numbers, the corpus and the method are in
+# vendor/bzip2-rs/VENDORED.md.
+#
+# A `path` and not a version, because the pinned snapshot is upstream's git
+# main, 57 commits past the 0.1.2 the registry has, and there is no
+# `[patch.crates-io]` entry to hide that behind: nothing else in this graph
+# resolves the name, so there is no second copy to unify with. That makes this
+# the one line in this manifest that could not be offered upstream as written
+# -- the upstream form is `bzip2-rs = "0.1.3"`, once there is a 0.1.3.
+[dependencies.bzip2-rs]
+path = "../bzip2-rs"
 
 [dependencies.chrono]
 version = "0.4.42"
@@ -193,6 +207,28 @@ features = ["derive"]
 version = "1.47.1"
 features = ["full"]
 optional = true
+
+# `bzip2-rs` is a *decoder*. It has no encoder and does not intend to have one,
+# and `src/volume/record.rs`'s `decompress_bound_tests` build their fixtures by
+# compressing -- a record at exactly the ceiling, one byte past it, a 256 MiB
+# bomb -- so the thing that produced those records has to stay reachable from
+# the tests. `bzip2::write::BzEncoder` is what upstream already used, so this
+# is a move from `[dependencies]` to `[dev-dependencies]` and not a new name in
+# the manifest.
+#
+# It reaches nothing that ships. Cargo resolves dev-dependencies only for test,
+# bench and example targets, so `bzip2` and `libbz2-rs-sys` are absent from
+# every `cargo build` and `cargo build --release` of every binary here,
+# `rustdar-web`'s wasm bundle included. Checked with
+# `cargo tree -p nexrad-data -e normal -i bzip2`, which answers "did not match
+# any packages", against `-e normal,dev`, which names it. Under `--all-targets`
+# they do compile, wasm32 included, exactly as they did before -- 0.6.1's
+# backend is `libbz2-rs-sys`, which is pure Rust.
+#
+# The exact pin is this workspace's, matching `nexrad-level3`'s `=0.6.1`, so
+# that a test helper cannot quietly resolve a second bzip2 into the lockfile.
+[dev-dependencies.bzip2]
+version = "=0.6.1"
 
 # `.github/workflows/clippy.yaml` runs `cargo clippy --all-targets
 # --all-features --fix` over every workspace member and auto-commits the

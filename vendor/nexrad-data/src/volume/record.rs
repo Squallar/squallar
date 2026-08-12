@@ -150,7 +150,18 @@ impl<'a> Record<'a> {
     /// than decompressed.
     pub fn decompress<'b>(&self) -> crate::result::Result<Record<'b>> {
         use crate::result::Error;
-        use bzip2::read::BzDecoder;
+        // `bzip2_rs`, not `bzip2`. Upstream reaches libbzip2 through `bzip2`
+        // 0.6, whose backend is `libbz2-rs-sys` -- a c2rust translation of the
+        // 1996 C. This is the same algorithm written as Rust, and it retires
+        // **33.1% fewer instructions** on this exact call, which is 98-99% of
+        // the instructions a Level II volume decode retires at all. It is
+        // `#![forbid(unsafe_code)]`; it is decode-only, so `bzip2` stays as a
+        // dev-dependency for the `BzEncoder` the tests below build records
+        // with; and the bytes it produces are identical over 10,063 records
+        // and 8.7 GB. See vendor/bzip2-rs/VENDORED.md for the corpus, the
+        // method, the mutation results and the one measured behavioural
+        // difference.
+        use bzip2_rs::DecoderReader;
         use std::io::Read;
 
         if !self.compressed() {
@@ -166,7 +177,7 @@ impl<'a> Record<'a> {
         // per iteration and how much is kept; it does not reserve its limit, so
         // this costs nothing for an ordinary record.
         let mut decompressed_data = Vec::with_capacity(INITIAL_DECOMPRESSED_CAPACITY);
-        BzDecoder::new(data)
+        DecoderReader::new(data)
             .take(MAX_DECOMPRESSED_RECORD_BYTES as u64 + 1)
             .read_to_end(&mut decompressed_data)?;
 

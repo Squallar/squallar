@@ -81,18 +81,32 @@ pub struct DecodedScan {
 ///
 /// # Why the records are decoded in parallel
 ///
-/// The walk above is one walk, but it is not a cheap one, and 92% of it is
-/// bzip2. `perf record` over one volume's decode puts 53.2% in
-/// `bzip2::mem::Decompress::decompress` — the adapter `BzDecoder::read` drives
-/// — and 38.5% in `libbz2_rs_sys::decompress` under it. Nothing else reaches
-/// 1%: the Message 31 parse this walk exists for is two tenths of a percent,
-/// and the rest is libc moving bytes for those two.
+/// The walk above is one walk, but it is not a cheap one, and almost all of it
+/// is bzip2. Instructions retired for a dense volume (KFTG, 16.9 MB),
+/// `perf stat -e instructions:u` differenced across 2 and 6 repetitions so
+/// process setup and the file read cancel, release + `lto`:
+///
+/// | | this walk, end to end | decompression alone | share |
+/// | --- | --- | --- | --- |
+/// | `bzip2` → `libbz2-rs-sys` | 7,883,148,609 | 7,806,188,828 | **99.0%** |
+/// | `bzip2-rs` | 5,313,317,394 | 5,235,648,591 | **98.5%** |
+///
+/// The Message 31 parse this walk exists for is the remainder — 77 M
+/// instructions for a whole volume, which agrees with the 50–63 M
+/// `vendor/nexrad-decode/VENDORED.md` measures for `decode_messages` plus
+/// `into_radial` on a volume of that size.
+///
+/// An earlier version of this comment gave 92%, from `perf record` sample
+/// shares rather than instruction counts. Both are true of different
+/// quantities: decompression retires its instructions at a lower IPC than the
+/// parse does, so its share of *cycles* is lower than its share of
+/// *instructions*. The counted number is the one quoted here.
 ///
 /// A volume is 50–130 LDM records, each **independently** compressed, so that
-/// 92% is embarrassingly parallel at almost perfect granularity — and this is a
-/// path every volume open, every timeline scrub, every "next scan", the archive
-/// fallback when a chunk feed retires and every frame of a loop download goes
-/// through, at 1.2–8.0 billion instructions a volume.
+/// share is embarrassingly parallel at almost perfect granularity — and this is
+/// a path every volume open, every timeline scrub, every "next scan", the
+/// archive fallback when a chunk feed retires and every frame of a loop
+/// download goes through, at 0.9–5.3 billion instructions a volume.
 ///
 /// So [`contribution`] decodes one record on its own, the map runs under
 /// [`crate::par`] — rayon on desktop, the sequential stand-in on the web, one

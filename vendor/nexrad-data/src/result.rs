@@ -36,8 +36,26 @@ pub enum Error {
     #[error("volume missing coverage pattern (message type 5)")]
     MissingCoveragePattern,
     /// BZIP2 decompression of an LDM record failed.
+    ///
+    /// Note that [`Record::decompress`](crate::volume::Record::decompress)
+    /// does not produce this variant and never did: it drives the decoder
+    /// through [`std::io::Read`], which converts a decoder error into an
+    /// [`std::io::Error`], so a bad record surfaces as [`Error::Io`]. The
+    /// variant exists so that a caller reaching the decoder directly has
+    /// somewhere to put its error.
     #[error("ldm record decompression error")]
-    Decompression(#[from] bzip2::Error),
+    // Upstream's payload here is `bzip2::Error`. Retyping it is the one edit
+    // outside `src/volume/record.rs` that moving off `bzip2` forces, because a
+    // public variant naming a type is a dependency on that type whether or not
+    // anything constructs it -- and keeping `bzip2` as a normal dependency for
+    // one unconstructed variant would put `libbz2-rs-sys` back in every
+    // release binary, which is the whole thing the move exists to avoid.
+    //
+    // It is a public API change: a downstream `Err(Decompression(e))` pattern
+    // still compiles, and anything naming the payload's type does not. Nothing
+    // in this workspace does either -- this file is the only mention of the
+    // variant in the entire tree.
+    Decompression(#[from] bzip2_rs::decoder::DecoderError),
     /// LDM record was truncated and contains fewer bytes than expected.
     #[error("truncated record: expected {expected} bytes, got {actual}")]
     TruncatedRecord {

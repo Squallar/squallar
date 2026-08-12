@@ -2802,6 +2802,7 @@ name = "nexrad-data"
 version = "1.0.0-rc.7"
 dependencies = [
  "bzip2",
+ "bzip2-rs",
  "chrono",
  "flate2",
  "futures",

@@ -44,6 +44,14 @@ measurably — but by 0.039% of instructions, which would not justify a fork by
 itself. The ceiling would. Read the two sections below in that order and in
 that proportion.
 
+> Since this was written the directory has taken a **second** source change of
+> its own, and one that *is* justified by its number: `decompress` no longer
+> calls `bzip2` at all. It calls `bzip2-rs`, which is **−33.1% instructions**
+> on the same pass. See [The decoder](#the-decoder) below and
+> `vendor/bzip2-rs/VENDORED.md`. The paragraph above is left as written because
+> the ceiling is still why this directory exists, and because the proportion it
+> asks for — bound first, cost second — is still the right one.
+
 ### The bound
 
 `read_to_end` on a `BzDecoder` reads until the stream ends. Every byte reaching
@@ -94,6 +102,73 @@ the decoder. Peak RSS for a full parallel decode of this corpus:
 
 The growth is per-worker live decompressor state, not decoded output — 5.77 MB
 of it live at once in a single-threaded decompress pass, times the pool.
+
+## The decoder
+
+`decompress` runs **`bzip2-rs`**, vendored at `vendor/bzip2-rs`, and not
+`bzip2`. The full case, the corpus, the mutation results and the local delta
+are in `vendor/bzip2-rs/VENDORED.md`; this section is what it means *here*.
+
+`bzip2` 0.6 resolves its backend to `libbz2-rs-sys`, a c2rust translation of
+the 1996 C. `bzip2-rs` is the same algorithm written as Rust and
+`#![forbid(unsafe_code)]`. On this function — which is **98–99% of the
+instructions a Level II volume decode retires at all**, counted rather than
+sampled; the derivation is under the table — measured the same way as
+everything else in this file, one instrument source built twice, release +
+`lto`, instructions differenced across 2 and 6 repetitions:
+
+| | before | after | |
+| --- | --- | --- | --- |
+| decompress pass, 8 volumes / 668 records / 421 MB out | 44,809,807,445 | 29,975,059,883 | **−33.10%** |
+| end-to-end decode, dense volume (KFTG) | 7,883,148,609 | 5,313,317,394 | −32.60% |
+| end-to-end decode, light volume (KDMX) | 1,041,455,806 | 865,078,476 | −16.94% |
+| **control** (no compressed records) | 19,261,333 | 19,261,451 | +0.0006% |
+
+The 98–99% above is those first two rows divided: decompression alone on the
+dense volume is 7,806,188,828 of the 7,883,148,609 its whole end-to-end decode
+retires, so **99.0%** before and 98.5% after. `rustdar-radar`'s `scan::decoded`
+used to say 92%, from `perf record` sample shares — cycles, not instructions,
+and decompression retires its instructions at a lower IPC than the Message 31
+parse does. Both are true of different quantities and that comment now says
+which is which. No figure near 91% is measured anywhere and none should be
+quoted.
+
+Wall clock moves less: −19.8% median on the decompress pass, −16.9% on the
+dense end-to-end. The instruction count is the load-insensitive figure; the
+wall clock is what a user feels, and both are in the sibling file.
+
+Three consequences for this directory specifically:
+
+- **`bzip2` moved to `[dev-dependencies]`.** `bzip2-rs` is decode-only, and
+  `decompress_bound_tests` below build their fixtures by *compressing* — a
+  record at the ceiling, one past it, a 256 MiB bomb. That is the only thing
+  still needing `bzip2`, and a dev-dependency reaches no shipped binary.
+  Checked with `cargo tree -e normal -i bzip2` (no match) against
+  `-e normal,dev` (one match), not assumed.
+- **`Error::Decompression`'s payload changed type**, `bzip2::Error` →
+  `bzip2_rs::decoder::DecoderError`. A public API change, and unavoidable: a
+  variant naming a type is a dependency on that type whether or not anything
+  constructs it, and this variant is constructed nowhere — `decompress` drives
+  the decoder through `std::io::Read`, so a bad record has always surfaced as
+  `Error::Io`. `src/result.rs` is the only mention of the variant in this
+  entire tree.
+- **The decoders disagree about which corrupt records to *refuse*, and never
+  about what a record *means*.** The safety property is structural:
+  `bzip2-rs` verifies **every block's CRC32** before returning any of that
+  block's bytes, so an accepted record cannot be silently corrupt short of a
+  CRC32 collision. That is what makes the disagreements below safe, and it does
+  not depend on any of them being enumerated. Over ~85,000 malformed inputs —
+  random mutations plus exhaustive single-bit sweeps of whole records from four
+  sites — the number of cases where both decoders accepted and returned
+  *different* bytes is **zero**. Disagreements run in both directions, they are
+  concentrated in the block header rather than spread evenly, and zero panics
+  on either side in release and under debug assertions. The full account is in
+  the sibling file.
+
+The [starting capacity](#the-starting-capacity--srcvolumerecordrs) and the
+[allocation analysis](#the-change-that-is-not-here-reusing-the-decompressor)
+below were measured against `libbz2-rs-sys` and are labelled where they no
+longer describe what runs.
 
 ## Removing this directory
 
@@ -195,7 +270,24 @@ edit to somebody reading the test file.
 ### Changed — `Cargo.toml`
 
 Beyond the removals already listed: a vendoring note under the generated
-header, one `default` line, and two lint tables.
+header, one `default` line, two lint tables, and the decompression dependency.
+
+#### The decompression dependency
+
+Upstream's `bzip2 = "0.6.0"` under `[dependencies]` becomes two entries:
+
+```toml
+[dependencies.bzip2-rs]
+path = "../bzip2-rs"
+
+[dev-dependencies.bzip2]
+version = "=0.6.1"
+```
+
+The reason is [The decoder](#the-decoder) above. The `path` is the one line in
+this manifest that could not be offered upstream as written — the upstream form
+is `bzip2-rs = "0.1.3"` once there is a 0.1.3 — and `vendor/bzip2-rs/VENDORED.md`
+carries why there is no `[patch.crates-io]` entry to hide it behind.
 
 #### The `default` line
 
@@ -234,6 +326,28 @@ command-line level, so the tables cannot reach `src/lib.rs`'s own
 directory — see *The lint scoping* below.
 
 ### Changed — source
+
+#### The decoder — `src/volume/record.rs`, `src/result.rs`
+
+```rust
+-        use bzip2::read::BzDecoder;
++        use bzip2_rs::DecoderReader;
+...
+-        BzDecoder::new(data)
++        DecoderReader::new(data)
+             .take(MAX_DECOMPRESSED_RECORD_BYTES as u64 + 1)
+             .read_to_end(&mut decompressed_data)?;
+```
+
+Two lines and a comment at the site, plus the `Error::Decompression` payload
+retype in `src/result.rs` that the dependency move forces. Everything about the
+bound, the starting capacity and the framing is untouched — the `Take`, the
+`+ 1`, the length check and the `RecordTooLarge` arm are the same code reading
+from a different decoder, which is what makes the ceiling's six tests a
+sufficient pin on the swap.
+
+The case for it is [The decoder](#the-decoder) above and, in full,
+`vendor/bzip2-rs/VENDORED.md`.
 
 #### The ceiling — `src/volume/record.rs`, `src/result.rs`
 
@@ -473,6 +587,15 @@ Bit-identity, over all 14 volumes — 5 WSR-88D, 7 TDWR, 2 legacy CTM:
 
 ## The change that is not here: reusing the decompressor
 
+> **Written against `libbz2-rs-sys`, which this directory no longer calls.**
+> The section is kept because the *shape* of the problem survived the decoder
+> change intact — `bzip2-rs` allocates a per-record `tt` of the same
+> `blockSize100k × 100000 × 4` bytes for the same reason, and exposes no reuse
+> either — and because the two routes at the end are still the two routes. What
+> is superseded is the specific `bzip2` 0.6.1 API audit, and the numbers, which
+> were measured through the old backend. Peak RSS at 32 threads is now
+> **−12.1%** on the decoder change alone; see [The decoder](#the-decoder).
+
 Worth writing down, because it is the largest remaining win in this function by
 a wide margin, it was attempted, and it is blocked by a dependency rather than
 by a judgement call. Somebody will have this idea again.
@@ -553,6 +676,15 @@ Left alone deliberately: it is 0.2% of the bytes allocated and roughly 0.015%
 of the instructions, which is below the noise this directory's changes are
 being judged against, and it is a fourth change in a diff that is meant to
 carry three. Recorded here so it is not rediscovered as a surprise.
+
+**And it survived the decoder change in a new form**, which is why it is worth
+having written down. `bzip2_rs::DecoderReader::read` pulls from its inner
+reader 1024 bytes at a time into a stack buffer and appends them to a
+`VecDeque`, so the copy of every compressed byte is still made — there is just
+no 8 KB heap `BufReader` behind it now. Driving `bzip2_rs::decoder::Decoder`
+directly would remove it, at the cost of re-deriving the ceiling logic against
+a sans-I/O API. Still not taken, and for the same reason: the −33.1% above was
+measured *through* `DecoderReader`, so it is already paid for.
 
 ## rustfmt
 
