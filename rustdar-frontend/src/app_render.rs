@@ -85,6 +85,94 @@ fn loop_interval(fps: f32) -> std::time::Duration {
     std::time::Duration::from_secs_f32(1.0 / fps)
 }
 
+/// The plan-view rasters one pass has already put on the GPU, so the second
+/// pane showing one of them is handed the *texture* rather than a second copy
+/// of the picture.
+///
+/// # What this is worth
+///
+/// Two panes on one site, one product and one tilt are looking at one buffer,
+/// and that is by design rather than by coincidence: [`RenderCache`] shares an
+/// `Arc<egui::ColorImage>` across them, and every call site here `Arc::clone`s
+/// it. But each pane then ran its own `Context::load_texture`, which is a
+/// distinct `egui::TextureId` and so a distinct `queue.write_texture` of the
+/// whole raster, plus 16 MiB of duplicate VRAM held for as long as the pane
+/// shows it.
+///
+/// Measured here against a 16.7 ms frame budget, uploading through
+/// `egui_wgpu::Renderer` on an RTX 3090, median of eleven, three interleaved
+/// rounds — one pane, then the same volume across two and four:
+///
+/// | panes | before | after |
+/// |---|---|---|
+/// | 1 | 8.44 ms | 8.46 ms |
+/// | 2 | 17.27 ms | 8.44 ms |
+/// | 4 | 35.67 ms | 8.45 ms |
+///
+/// So a four-pane split paid ~27 ms of extra frame thread per volume for three
+/// textures whose contents were provably the same object. The resume path
+/// measured the same shape (35.24 ms → 8.54 ms at four panes), and the
+/// single-pane row is the control: it must not move, and does not.
+///
+/// # The VRAM saving is per volume, not instantaneous
+///
+/// This is scoped to a **pass**, so panes that arrive one at a time — a split
+/// added between volumes, each pane served by its own `dispatch_pane_renders`
+/// hit — still hold a texture each until the next volume lands, when one drain
+/// serves all of them and they collapse onto one. The 48 MiB a four-pane split
+/// stops holding is therefore the steady state, reached within one volume,
+/// rather than something that takes effect the moment a pane is added. That is
+/// the path that matters — the cost being removed was per volume, forever —
+/// but it is not the same claim as "never more than one texture".
+///
+/// The overlay path has always done it the other way — one upload, the handle
+/// cloned into each pane's `OverlayTextureData` — and so has the loop path
+/// (`rendered_image` takes a `&TextureHandle`). This is the plan view catching
+/// up with its two siblings. Nothing reads a per-pane `TextureId`:
+/// `overlay_cache::draw_overlay_texture` and `ui_map_pane::render_radar_overlay`
+/// both paint with `Color32::WHITE` and a full-rect uv, so the id is an argument
+/// to `painter.image` and never an identity.
+///
+/// # Why the `Arc` is held and not just its address
+///
+/// Identity here is "the same buffer", which is exactly what `Arc::ptr_eq`
+/// asks — the audit's own finding was that the bytes are the same *object* and
+/// not merely equal. Keeping only the address would make that true by luck: an
+/// entry could be dropped mid-pass and the next allocation land on it, and this
+/// would then hand back a texture of somebody else's pixels. Holding the `Arc`
+/// makes the address unreusable for as long as it is a key. It costs one
+/// refcount per *distinct* raster in the pass, against buffers the render cache
+/// is holding anyway.
+///
+/// Scoped to a pass rather than to the app for the same reason `old_textures` is
+/// cleared each frame: a texture kept alive here is VRAM, and the panes that
+/// want one are already holding their own clones by the time this is dropped.
+#[derive(Default)]
+pub(super) struct PlanViewUploads {
+    uploaded: Vec<(Arc<egui::ColorImage>, egui::TextureHandle)>,
+}
+
+impl PlanViewUploads {
+    /// The texture holding `image`, running `upload` only if this pass has not
+    /// uploaded that exact buffer already.
+    fn handle(
+        &mut self,
+        image: &Arc<egui::ColorImage>,
+        upload: impl FnOnce() -> egui::TextureHandle,
+    ) -> egui::TextureHandle {
+        if let Some((_, texture)) = self
+            .uploaded
+            .iter()
+            .find(|(seen, _)| Arc::ptr_eq(seen, image))
+        {
+            return texture.clone();
+        }
+        let texture = upload();
+        self.uploaded.push((Arc::clone(image), texture.clone()));
+        texture
+    }
+}
+
 impl super::App {
     /// Set up and run the egui UI pass.
     ///
@@ -215,6 +303,11 @@ impl super::App {
 
     /// Poll for completed background render results and upload textures.
     fn poll_render_results(&mut self, ctx: &egui::Context) {
+        // One upload per raster for the whole drain, not per pane served from
+        // it. The origin pane and every sibling below hold the *same*
+        // `Arc<ColorImage>` — that is what the broadcast hands them — and this
+        // is what stops each of them turning it into 16 MiB of its own VRAM.
+        let mut uploads = PlanViewUploads::default();
         while let Ok(rr) = self.channels.render_receiver.try_recv() {
             if rr.pane_idx < self.render.pane_render.len() {
                 self.render.pane_render[rr.pane_idx].render_in_flight = false;
@@ -290,7 +383,7 @@ impl super::App {
             // above, and `last_rendered` stays unset, so converting back
             // re-dispatches.
             if !self.gui.pane_has_no_plan_view(origin_pane) {
-                self.apply_render_to_pane(ctx, origin_pane, &render_result);
+                self.apply_render_to_pane(ctx, origin_pane, &render_result, &mut uploads);
             }
 
             // Broadcast to sibling panes that need the same site+product+elevation.
@@ -336,7 +429,7 @@ impl super::App {
                             })
                             .unwrap_or(true);
                     if needs {
-                        self.apply_render_to_pane(ctx, other_idx, &render_result);
+                        self.apply_render_to_pane(ctx, other_idx, &render_result, &mut uploads);
                     }
                 }
             }
@@ -344,11 +437,17 @@ impl super::App {
     }
 
     /// Apply a rendered radar image to a specific pane (upload texture to overlay cache).
+    ///
+    /// `uploads` is the pass's record of what is already on the GPU. A pane
+    /// served from a raster another pane in this same pass was served from gets
+    /// that pane's [`egui::TextureHandle`], not a second upload of it — see
+    /// [`PlanViewUploads`].
     fn apply_render_to_pane(
         &mut self,
         ctx: &egui::Context,
         pane_idx: usize,
         render: &crate::render_dispatch::CachedPaneRender,
+        uploads: &mut PlanViewUploads,
     ) {
         use rustdar_egui::overlay_cache::{OverlayTextureData, RadarTextureMeta};
         use rustdar_overlays::render::overlay_state::OverlayKind;
@@ -372,19 +471,23 @@ impl super::App {
             self.old_textures.push(old.texture);
         }
 
-        self.texture_counter += 1;
         // The picture's own dimensions, not a constant: a sweep reaching past
         // the floor is a wider raster, and the texture, the overlay entry and
         // the hover all have to agree about which. `plan_view_image` already
         // refused anything that is not a size this build makes, so there is
         // nothing left here to validate.
         let side = render.image.width();
-        let texture_name = format!("radar_image_{}", self.texture_counter);
-        let texture = ctx.load_texture(
-            texture_name,
-            Arc::clone(&render.image),
-            egui::TextureOptions::NEAREST,
-        );
+        let texture = {
+            let counter = &mut self.texture_counter;
+            uploads.handle(&render.image, || {
+                *counter += 1;
+                ctx.load_texture(
+                    format!("radar_image_{counter}"),
+                    Arc::clone(&render.image),
+                    egui::TextureOptions::NEAREST,
+                )
+            })
+        };
 
         // Cache the pixels for fast restore after suspend/resume
         if pane_idx < self.render.pane_render.len() {
@@ -838,6 +941,11 @@ impl super::App {
     /// Check all panes for needed background renders and spawn render threads.
     fn dispatch_pane_renders(&mut self, ctx: &egui::Context) {
         self.apply_storm_motion_override();
+        // Shared across the pane loop for the reason `poll_render_results`
+        // shares it: two panes that convert to the same `(site, product, view,
+        // elevation)` in one pass are two cache hits on one entry, and so two
+        // `Arc::clone`s of one buffer.
+        let mut uploads = PlanViewUploads::default();
         for pane_idx in 0..self.gui.pane_count() {
             // Ahead of the rendering-params branch, not inside it. A pane with
             // no plan view still has a product and an elevation selected —
@@ -891,7 +999,7 @@ impl super::App {
                             product,
                             elevation
                         );
-                        self.apply_render_to_pane(ctx, pane_idx, &render_result);
+                        self.apply_render_to_pane(ctx, pane_idx, &render_result, &mut uploads);
                         continue;
                     }
 
@@ -1394,6 +1502,14 @@ impl super::App {
         // view, which is every section pane there is.
         self.restore_section_textures(ctx);
 
+        // Panes sharing a raster shared it before the context died too:
+        // `apply_render_to_pane` stores `Arc::clone(&render.image)` into each
+        // pane's `cached_render`, so a resume with four panes on one site is
+        // four copies of one buffer and must be one upload. This is the path
+        // where paying four would be worst — a resume on Android is the frame
+        // with the least budget there is.
+        let mut uploads = PlanViewUploads::default();
+
         for pane_idx in 0..self.render.pane_render.len().min(self.gui.pane_count()) {
             // `dispatch_pane_renders` deliberately *keeps* `cached_render` on a
             // converted pane, so that converting back to a map is instant. That
@@ -1425,14 +1541,19 @@ impl super::App {
                 elevation
             );
 
-            self.texture_counter += 1;
             let side = cached.image.width();
-            let texture_name = format!("radar_image_{}", self.texture_counter);
-            let texture = ctx.load_texture(
-                texture_name,
-                Arc::clone(&cached.image),
-                egui::TextureOptions::NEAREST,
-            );
+            let image = Arc::clone(&cached.image);
+            let texture = {
+                let counter = &mut self.texture_counter;
+                uploads.handle(&image, || {
+                    *counter += 1;
+                    ctx.load_texture(
+                        format!("radar_image_{counter}"),
+                        Arc::clone(&image),
+                        egui::TextureOptions::NEAREST,
+                    )
+                })
+            };
 
             // The cached extent, not a fresh one: these are the pixels the
             // render produced, so they belong on the ground that render
@@ -3986,6 +4107,13 @@ mod frame_thread_conversion_tests;
 #[path = "app_render/overlay_upload_tests.rs"]
 #[cfg(test)]
 mod overlay_upload_tests;
+
+/// One sweep is one texture, however many panes are showing it — counted the
+/// same way, off the delta, because the cost being removed is the upload and
+/// not the picture.
+#[path = "app_render/radar_texture_sharing_tests.rs"]
+#[cfg(test)]
+mod radar_texture_sharing_tests;
 
 #[path = "app_render/frame_order_tests.rs"]
 #[cfg(test)]

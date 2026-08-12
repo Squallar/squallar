@@ -139,7 +139,12 @@ fn a_placed_render_dates_the_pane_it_lands_on() {
         tilt(5, "MPX_EET_2026_07_26_01_55_52"),
     );
 
-    app.apply_render_to_pane(&ctx, 0, &finished(PRODUCT, 0.5));
+    app.apply_render_to_pane(
+        &ctx,
+        0,
+        &finished(PRODUCT, 0.5),
+        &mut PlanViewUploads::default(),
+    );
 
     assert_eq!(
         app.gui.pane(0).unwrap().data_time,
@@ -176,14 +181,24 @@ fn switching_datasource_redates_the_pane_rather_than_undating_it() {
         tilt(5, "MPX_EET_2026_07_26_01_55_52"),
     );
 
-    app.apply_render_to_pane(&ctx, 0, &finished(PRODUCT, 0.5));
+    app.apply_render_to_pane(
+        &ctx,
+        0,
+        &finished(PRODUCT, 0.5),
+        &mut PlanViewUploads::default(),
+    );
     assert_eq!(
         app.gui.pane(0).unwrap().data_time,
         Some(object_time()),
         "precondition: dated from the bucket object",
     );
 
-    app.apply_render_to_pane(&ctx, 0, &finished(RadarProduct::Reflectivity, 0.5));
+    app.apply_render_to_pane(
+        &ctx,
+        0,
+        &finished(RadarProduct::Reflectivity, 0.5),
+        &mut PlanViewUploads::default(),
+    );
 
     assert_eq!(
         app.gui.pane(0).unwrap().data_time,
@@ -218,7 +233,12 @@ fn a_placed_render_describes_what_it_depicts() {
 
     // A Level III image under a Level II selection.
     app.gui.pane_mut(0).unwrap().selected_product = RadarProduct::Reflectivity;
-    app.apply_render_to_pane(&ctx, 0, &finished(PRODUCT, 0.5));
+    app.apply_render_to_pane(
+        &ctx,
+        0,
+        &finished(PRODUCT, 0.5),
+        &mut PlanViewUploads::default(),
+    );
     assert_eq!(
         app.gui.pane(0).unwrap().stale_image_on_screen(),
         Some((PRODUCT, 0.5)),
@@ -236,7 +256,12 @@ fn a_placed_render_describes_what_it_depicts() {
 
     // And the other way round — a Level II image under a Level III selection,
     // through the same call.
-    app.apply_render_to_pane(&ctx, 0, &finished(RadarProduct::Reflectivity, 0.5));
+    app.apply_render_to_pane(
+        &ctx,
+        0,
+        &finished(RadarProduct::Reflectivity, 0.5),
+        &mut PlanViewUploads::default(),
+    );
     assert_eq!(
         app.gui.pane(0).unwrap().stale_image_on_screen(),
         Some((RadarProduct::Reflectivity, 0.5)),
@@ -288,7 +313,7 @@ fn a_long_range_render_is_placed_at_the_size_it_was_rendered_at() {
         // refuses, so it arrives here with nothing to stamp.
         nyquist_ms: Some(23.84),
     };
-    app.apply_render_to_pane(&ctx, 0, &render);
+    app.apply_render_to_pane(&ctx, 0, &render, &mut PlanViewUploads::default());
 
     let pane = app.gui.pane_mut(0).unwrap();
     let cache = pane.overlay_cache_mut(rustdar_overlays::render::overlay_state::OverlayKind::Radar);
@@ -342,7 +367,7 @@ fn a_resume_puts_back_the_fold_limit_it_took_down() {
         nyquist_ms: Some(26.42),
         ..finished(PRODUCT, 0.5)
     };
-    app.apply_render_to_pane(&ctx, 0, &render);
+    app.apply_render_to_pane(&ctx, 0, &render, &mut PlanViewUploads::default());
 
     // What a surface loss does: the overlay entry goes, the pane's kept copy
     // stays. `restore_cached_render` is what runs on the way back.
@@ -387,7 +412,7 @@ fn a_resumed_velocity_pane_annotates_the_fold_again() {
         nyquist_ms: Some(26.42),
         ..finished(RadarProduct::Velocity, 0.5)
     };
-    app.apply_render_to_pane(&ctx, 0, &render);
+    app.apply_render_to_pane(&ctx, 0, &render, &mut PlanViewUploads::default());
     assert_eq!(
         app.gui.pane(0).unwrap().displayed_nyquist_ms(),
         Some(26.42),

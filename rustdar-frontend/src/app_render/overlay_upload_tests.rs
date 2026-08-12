@@ -25,8 +25,7 @@
 //! comparison. Anyone strengthening this should start there.
 
 use super::*;
-use crate::app::tests::headless;
-use crate::platform_double::TestBridge;
+use crate::app::tests::drain_uploads;
 use rustdar_overlays::render::overlay_state::OverlayKind;
 use rustdar_overlays::types::GeoBounds;
 
@@ -68,47 +67,10 @@ fn rasterizer_output() -> Vec<u8> {
     rgba
 }
 
-/// Every whole-texture upload egui has been handed since this was last called,
-/// with the pixels it was handed.
-///
-/// `TexturesDelta::set` is what the renderer uploads and nothing else does, so
-/// counting it counts `queue.write_texture` calls exactly — including the ones
-/// nobody meant to make.
-fn drain_uploads(ctx: &egui::Context) -> Vec<Arc<egui::ColorImage>> {
-    ctx.tex_manager()
-        .write()
-        .take_delta()
-        .set
-        .into_iter()
-        .filter(|(_, delta)| delta.pos.is_none())
-        .map(|(_, delta)| {
-            let egui::epaint::image::ImageData::Color(image) = delta.image;
-            image
-        })
-        .collect()
-}
-
-/// An app with `n` panes, all of them maps, so an overlay result naming several
-/// of them has somewhere to land.
+/// An app with `n` map panes, so an overlay result naming several of them has
+/// somewhere to land.
 fn n_pane_app(n: usize) -> crate::app::App {
-    use rustdar_egui::config_store::{ConfigStore, UI_CONFIG_KEY};
-
-    let mut app = headless(TestBridge::desktop());
-    let panes = (0..n)
-        .map(|_| r#"{"site":"KTLX"}"#.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    let store = rustdar_egui::config_store::MemoryConfigStore::default();
-    store
-        .store(
-            UI_CONFIG_KEY,
-            &format!(r#"{{"pane_count":{n},"site":"KTLX","panes":[{panes}]}}"#),
-        )
-        .expect("the memory store always accepts a write");
-    assert!(app.gui.load_ui_config(&store), "the fixture config parsed");
-    assert_eq!(app.gui.pane_count(), n, "precondition: {n} panes");
-    app.render.ensure_pane_count(n);
-    app
+    crate::app::tests::n_pane_app(n, "KTLX")
 }
 
 /// Post one finished overlay for `pane_indices`, converted where the rasterizer

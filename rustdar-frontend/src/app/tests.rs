@@ -2087,6 +2087,67 @@ pub(super) fn two_pane_app(first: &str, second: &str) -> App {
     app
 }
 
+/// An `App` with `n` map panes, every one of them on `site`.
+///
+/// Built through the config loader for the reason [`two_pane_app`] gives, and
+/// that is the only reason it is not written in terms of this: the two-site
+/// case is what a split usually is, and the one-site case is what makes a
+/// *shared* render observable. Both are one pane list either way.
+pub(super) fn n_pane_app(n: usize, site: &str) -> App {
+    use rustdar_egui::config_store::{ConfigStore, UI_CONFIG_KEY};
+
+    let mut app = headless(TestBridge::desktop());
+    let panes = (0..n)
+        .map(|_| format!(r#"{{"site":"{site}"}}"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    let store = MemoryConfigStore::default();
+    store
+        .store(
+            UI_CONFIG_KEY,
+            &format!(r#"{{"pane_count":{n},"site":"{site}","panes":[{panes}]}}"#),
+        )
+        .expect("the memory store always accepts a write");
+    assert!(
+        app.gui.load_ui_config(&store),
+        "the {n}-pane fixture config did not parse"
+    );
+    assert_eq!(
+        app.gui.pane_count(),
+        n,
+        "precondition: the fixture must really have {n} panes"
+    );
+    app.render.ensure_pane_count(n);
+    app
+}
+
+/// Every whole-texture upload egui has been handed since this was last called,
+/// with the pixels it was handed.
+///
+/// `TexturesDelta::set` is the renderer's entire input — `egui_wgpu::Renderer`
+/// turns each entry into one `queue.write_texture` and nothing else uploads at
+/// all — so counting these counts uploads exactly, including the ones nobody
+/// meant to make. Partial updates (`pos: Some(..)`) are the font atlas growing
+/// and are not what any caller here is asking about.
+///
+/// This is also the only pixel readback egui offers: a `TextureHandle` gives an
+/// id and a size and never its contents. Taking the delta is therefore how a
+/// test says "these exact bytes reached the GPU" rather than "a texture of the
+/// right shape exists".
+pub(super) fn drain_uploads(ctx: &egui::Context) -> Vec<Arc<egui::ColorImage>> {
+    ctx.tex_manager()
+        .write()
+        .take_delta()
+        .set
+        .into_iter()
+        .filter(|(_, delta)| delta.pos.is_none())
+        .map(|(_, delta)| {
+            let egui::epaint::image::ImageData::Color(image) = delta.image;
+            image
+        })
+        .collect()
+}
+
 /// A scan carrying no sweeps.
 ///
 /// Nothing below reads a pixel: what is under test is whether a response was
