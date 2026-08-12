@@ -987,11 +987,19 @@ fn render_with_sampler(
 ///
 /// `MALLOC_ARENA_MAX=1` removes the same faults and is **not** the fix. It is
 /// process-global, it would apply to every allocation in the app, and it is a
-/// trade rather than a win: on the same box and the same volumes it cost the
-/// decode 53.3 → 99.8 ms on KFTG and 13.8 → 29.4 ms on KTLX, because the decode
-/// is precisely the thing that wants many arenas. What it bought the section —
-/// 4.82–7.24 ms best on KFTG — is what this pool buys without charging the
-/// decode for it.
+/// trade rather than a win: the decode is precisely the thing that wants many
+/// arenas, and capping them to one costs it **+41% to +53% on KFTG and +28% to
+/// +37% on KTLX**. What it bought the section is what this pool buys without
+/// charging the decode anything.
+///
+/// Those percentages were re-measured, and the ones this paragraph used to
+/// carry were badly stale. It read 53.3 → 99.8 ms on KFTG and 13.8 → 29.4 ms on
+/// KTLX — +87% and +113% — which was taken before the decode became the
+/// single-pass `par_iter` it is now, so neither the absolute times nor the
+/// ratio survive into the present tree. Re-taken on the current decode over two
+/// volumes, two independent interleaved passes of 20 and 25 rounds, a fresh
+/// process for every run, best-of-N: the cost is about half what this claimed.
+/// The conclusion is unchanged, which is why only the numbers moved.
 ///
 /// # Why the section, and what else is standing in the same place
 ///
