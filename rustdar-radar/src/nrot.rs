@@ -24,13 +24,18 @@
 //!    the profile must correlate with the stencil (r² ≥ 0.05); constant or
 //!    incoherent profiles read ND.
 //! 4. Divide ROT by the divisor curve — knot ranges in KILOMETRES, linearly
-//!    interpolated (25 at ≤20 km → 20 → 12 → 8 at 80 km, flat beyond) — and
-//!    clamp to ±5.
+//!    interpolated, measured off the reference at 60 ranges (22.4 at 13 km
+//!    rising to 24.0 at 22 km, then falling to 8.6 at 80 km and flat beyond)
+//!    — and clamp to ±5.
 //! 5. Blank painted clusters under 4 bins and one-gate-deep slivers.
 //!
 //! Values above 1.0 are significant rotation; above 2.5, extreme. The
-//! reference quantizes NROT in steps of 0.04, so differences below ~0.04
-//! are not observable in its output at all.
+//! reference quantizes NROT on a lattice of **0.0395** — 253 levels across
+//! its own ±5 clamp, reported at bin centres — so differences below that are
+//! not observable in its output at all. That number is not cosmetic: it is
+//! what turns each of its readouts into an interval of half-width 0.0198, and
+//! so what lets a candidate curve be tested for consistency rather than
+//! scored for closeness.
 
 use crate::beam::RE_EFF_KM;
 // rayon on every target that has threads, the sequential stand-ins on wasm32.
@@ -43,9 +48,15 @@ const NROT_LIMIT: f64 = 5.0;
 
 /// Skip bins closer than this. Residual ground clutter close to the radar
 /// produces clamp-level fake shear (adjacent ±30 m/s bins over tens of meters
-/// of arc). Empirical floor — 12.5 km (6.75 nm), where the reference's own
-/// painting starts. Measured provenance: branch `campaign-harness`.
-const MIN_RANGE_NM: f64 = 6.75;
+/// of arc). It is where the reference's own painting starts, walked at 0.05 nm
+/// on a step edge painted continuously from 8 km outward: ND at every sample
+/// to 7.00 nm and a value at 7.05 nm, identically at KHNX, KLOT and KMSX,
+/// whose lowest cuts sit at +0.48°, +0.53° and −0.18° — so it is a range and
+/// not a height. The previous campaign's own coarse ladder agrees (its first
+/// value was at 7.03 nm); 6.75 nm was two gates short of it and painted 320
+/// bins the reference does not, 3.1% of the standard set's inside-80 km
+/// total. Measured provenance: branch `campaign-harness`.
+const MIN_RANGE_NM: f64 = 7.05;
 
 /// The magnitude at which this algorithm considers a bin **painted** — the
 /// significance floor of the whole product, and the one number every consumer
@@ -700,12 +711,79 @@ fn rot_divisor(range_nm: f64) -> f64 {
     rot_divisor_km(range_nm * KM_PER_NM)
 }
 
-/// The divisor curve, empirically fitted to the reference's range response:
-/// the knot ranges are KILOMETERS and the curve is linearly interpolated
-/// between knots (25 at ≤20 km ramping to 8 at 80 km, flat 8 beyond).
+/// The divisor curve: knot ranges in KILOMETRES, linearly interpolated, flat
+/// outside the knots. These are the reference's own values, read off it
+/// directly rather than fitted to it.
+///
+/// # It is a table because the reference's is a table
+///
+/// The curve was chased for a closed form first, because a divisor that is
+/// only a table is a divisor nobody can extend. There is none. Against 776
+/// step-edge readings over 60 ranges and six sites, the best two-parameter
+/// physical form — the response of this module's own operator to a reference
+/// circulation of fixed size, which is what "normalized rotation" means —
+/// leaves 286 of them outside the interval the reference's quantisation pins
+/// them to, missing by up to 3.7 lattice steps; an exhaustive three-parameter
+/// search over `K/(1 + (r/a)^m)^n` does no better (292, 3.7 steps). Three
+/// features defeat every smooth form: the curve **rises** 6.1% from 13.9 to
+/// 20.4 km, steepens again over 55–67 km, and then **flattens** at 8.2 beyond
+/// 81 km. The last of those is a table's flat extension, and the shipped
+/// 4-knot curve already carried it at 8.0 from 80 km.
+///
+/// Normalizing to a physical span with a floor and a ceiling — the obvious
+/// reading of the rise-then-fall — is refuted rather than unfitted. That span
+/// is measurable directly as the velocity jump that reads 1.0: it rises to
+/// 22.3 m/s at 48 km and then *falls* 18% to 18.3 m/s by 85 km, all of it
+/// inside the range band where this module's operator does not change. A
+/// ceiling cannot fall.
+///
+/// # How these numbers were taken
+///
+/// Six step edges painted across 8–95 km at three jump sizes, so no site is
+/// pushed into the reference's ±5 clamp at short range — which is what broke
+/// the previous campaign's 13 km point, where only the two ~11.5 m/s-Nyquist
+/// sites were still on scale. A step is invariant under a median filter, so
+/// the reading is the operator and this curve and nothing else. Deciding
+/// sites KHNX, KLWX, KLOT, KATX, KMSX, KDMX (declared Nyquist 11.3–27.9);
+/// holdout KTWX at 35.6 agrees over 60 ranges to a mean of +0.07% and a
+/// maximum of 2.09%. Site spread at a range is ≤3.5%.
+///
+/// The shape is the reference's alone: it comes from its readings and the
+/// geometry, and this pipeline enters only as one scale constant recovered at
+/// 40 km. What pins it is that the reference reports NROT on a 0.0395 lattice
+/// (see the module header), so each readout is an interval of half-width
+/// 0.0198 and a curve is either consistent with it or is not. These knots
+/// leave 62 of 880 readings outside, none by as much as one lattice step; the
+/// 4-knot curve they replace left 703 outside and missed by up to 7.
+///
+/// Beyond 80 km [`composite_stencil_rot`] takes over and its step gain is
+/// 5.4% under [`split_stencil_rot`]'s, so out there this curve lands the
+/// reading 5.4% under the reference. That is the composite operator's
+/// calibration and not this curve's: the old pairing hid part of it in a flat
+/// 8.0, and the product's discontinuity across the 80 km handover falls from
+/// 9.7% to 5.4% by removing the compensation rather than growing it.
+///
 /// Measured provenance: branch `campaign-harness`.
 fn rot_divisor_km(range_km: f64) -> f64 {
-    const KNOTS: [(f64, f64); 4] = [(20.0, 25.0), (40.0, 20.0), (60.0, 12.0), (80.0, 8.0)];
+    const KNOTS: [(f64, f64); 17] = [
+        (13.1, 22.43),
+        (16.0, 22.97),
+        (19.0, 23.60),
+        (22.0, 23.97),
+        (26.0, 23.40),
+        (30.0, 22.69),
+        (35.0, 21.69),
+        (40.0, 20.57),
+        (45.0, 19.06),
+        (50.0, 17.16),
+        (55.0, 15.03),
+        (60.0, 12.93),
+        (65.0, 11.64),
+        (70.0, 10.67),
+        (75.0, 9.65),
+        (80.0, 8.62),
+        (85.0, 8.23),
+    ];
     if range_km <= KNOTS[0].0 {
         return KNOTS[0].1;
     }
@@ -817,12 +895,32 @@ const SPLIT_TAPS: [(i32, f64); 4] = [(1, 0.238), (2, 0.342), (3, 0.238), (4, -0.
 ///
 /// Twelve hovered readings — a three-range step ladder at 32.2/39.1/45.9 km
 /// and the couplet's four distinct classes — fit these two taps with a worst
-/// residual of 0.026, under the 0.04 the reference quantizes its own output
-/// in. Their ramp gain, Σ2k·tₖ = 1.027, is the one number that is *not* the
-/// split operator's (1.151): one shear reads 11% lower on a sweep collected at
-/// 1.0° than on one collected at 0.5°, because the reference's coarse-grid
-/// operator is a narrower one and not the same taps in row units.
-const LEGACY_TAPS: [(i32, f64); 2] = [(1, 0.6812), (2, -0.0838)];
+/// residual of 0.026, under the lattice the reference quantizes its own output
+/// on. Their ramp gain, Σ2k·tₖ = 1.055, is the one number that is *not* the
+/// split operator's (Σk·tₖ over two rows, 1.032): one shear reads 2.2% higher
+/// on a sweep collected at 1.0° than on one collected at 0.5°, because the
+/// reference's coarse-grid operator is a narrower one and not the same taps in
+/// row units.
+///
+/// # The scale here is anchored to [`rot_divisor_km`] and moved with it
+///
+/// Those twelve readings fix the operator's *shape* on their own — the ND
+/// boundary is the support, the pole-edge ratio the linearity — but its
+/// absolute scale only ever through the product `taps / divisor`, because a
+/// hover reports that product and nothing else. So when the divisor curve was
+/// re-measured against the reference at 60 ranges, these had to follow it or
+/// a reading that was measured to be right would have moved: 0.6812/−0.0838
+/// → 0.6996/−0.0861, scaled by 1.0270, the divisor's own change at 39.1 km,
+/// the middle rung of the ladder they were solved from. On the pinned legacy
+/// couplet the reading is 0.870 against the reference's hovered 0.89, the
+/// same agreement it had before the divisor moved, which is the point.
+///
+/// The divisor's change across their 32.2–45.9 km ladder is not flat (1.4% to
+/// 6.1%), so one constant can no longer restate all three rungs as well as it
+/// did. Re-solving these two taps against the full twelve readings — they are
+/// on branch `campaign-harness`, not here — is owed, and would move this scale
+/// again by a few per cent.
+const LEGACY_TAPS: [(i32, f64); 2] = [(1, 0.6996), (2, -0.0861)];
 
 /// Range limit in km for the split-tap operator; beyond it the composite
 /// 11-tap stencil takes over. Each operator is used inside the range band
@@ -3219,23 +3317,34 @@ mod tests {
         assert_eq!(filtered[10][10], 10.0);
     }
 
-    /// The divisor curve is the measured factory table: kilometre knots,
-    /// linearly interpolated — from the reference step response on a
-    /// synthetic volume. Check the knots, mid-band values, and both flat
+    /// The divisor curve is the reference's own, read off it at 60 ranges on
+    /// six sites. Check the knots, a mid-segment interpolation, and both flat
     /// extensions.
+    ///
+    /// Every figure here moved when the curve did, and each is a restatement
+    /// of a new measurement rather than an assertion bent to pass: the old
+    /// values were a 4-knot approximation that left 703 of 880 readings
+    /// outside the interval the reference's quantisation pins them to, missing
+    /// by up to 7 lattice steps, against 62 and under one step now.
     #[test]
-    fn rot_divisor_matches_the_factory_curve() {
-        assert_eq!(rot_divisor_km(10.0), 25.0); // flat below the first knot
-        assert_eq!(rot_divisor_km(20.0), 25.0);
-        assert_eq!(rot_divisor_km(30.0), 22.5); // halfway 25 → 20
-        assert_eq!(rot_divisor_km(40.0), 20.0);
-        assert_eq!(rot_divisor_km(50.0), 16.0); // halfway 20 → 12
-        assert_eq!(rot_divisor_km(60.0), 12.0);
-        assert_eq!(rot_divisor_km(70.0), 10.0); // halfway 12 → 8
-        assert_eq!(rot_divisor_km(80.0), 8.0);
-        assert_eq!(rot_divisor_km(250.0), 8.0); // flat beyond the last knot
+    fn rot_divisor_matches_the_reference_curve() {
+        // Flat below the first knot — unreachable in the pipeline, which skips
+        // everything inside MIN_RANGE_NM (13.06 km), one gate under it.
+        assert_eq!(rot_divisor_km(10.0), 22.43);
+        assert_eq!(rot_divisor_km(13.1), 22.43);
+        // The curve RISES to its peak near 22 km before it falls: 25.0 flat
+        // below 20 km was the largest single error in the old table, 10% high
+        // where the reference reads 22.7.
+        assert_eq!(rot_divisor_km(22.0), 23.97);
+        assert!((rot_divisor_km(17.5) - 23.285).abs() < 0.001); // 16→19 segment
+        assert_eq!(rot_divisor_km(40.0), 20.57);
+        assert_eq!(rot_divisor_km(60.0), 12.93);
+        assert!((rot_divisor_km(72.5) - 10.16).abs() < 0.005); // 70→75 segment
+        assert_eq!(rot_divisor_km(80.0), 8.62);
+        assert_eq!(rot_divisor_km(85.0), 8.23);
+        assert_eq!(rot_divisor_km(250.0), 8.23); // flat beyond the last knot
         // The nm entry point converts and lands on the same curve.
-        assert_eq!(rot_divisor(40.0 / KM_PER_NM), 20.0);
+        assert_eq!(rot_divisor(40.0 / KM_PER_NM), 20.57);
     }
 
     /// On v = k·(azimuthal arc), the recovered slope is k and NROT is k over
@@ -3556,10 +3665,11 @@ mod tests {
     ///
     /// Inside 80 km they do not, and that is not the divisor: it is that the
     /// reference uses a *different operator* on a grid that is already legacy
-    /// resolution. [`LEGACY_TAPS`] carries a ramp gain of 1.027 against the
-    /// split operator's 1.151, so the same 6 (m/s)/km field reads 0.892 of
+    /// resolution. [`LEGACY_TAPS`] carries a ramp gain of 1.055 against the
+    /// split operator's 1.032, so the same 6 (m/s)/km field reads 1.022 of
     /// itself on the coarser sweep — measured, not chosen: the taps are the
-    /// ones the reference's own hovered step and couplet profiles solve to.
+    /// ones the reference's own hovered step and couplet profiles solve to,
+    /// against the divisor curve their scale is anchored to.
     ///
     /// What the test still has to rule out is the reading a reader meets
     /// first — that `2.0 * arc_per_radial` in [`split_stencil_rot`] means
@@ -3652,7 +3762,7 @@ mod tests {
         assert!((coarse_nrot[90][380] - expect).abs() < 1e-9);
 
         // The whole of the difference inside 80 km is the ratio of those two
-        // gains — 0.8925 — and none of it is the divisor.
+        // gains — 1.0221 — and none of it is the divisor.
         for j in [100usize, 200, 300] {
             let ratio = coarse_nrot[90][j] / fine_nrot[180][j];
             assert!(
