@@ -26,10 +26,6 @@
 //! 4. Divide ROT by the divisor curve — knot ranges in KILOMETRES, linearly
 //!    interpolated (25 at ≤20 km → 20 → 12 → 8 at 80 km, flat beyond) — and
 //!    clamp to ±5.
-//!    Inside 80 km a matched-filter footprint pass ([`apply_kernel_bank`])
-//!    then caps each detected rotation couplet with the kernel fitted to
-//!    its measured pole width, reproducing the reference's width-dependent
-//!    edge compression while monopolar notches keep the full value.
 //! 5. Blank painted clusters under 4 bins and one-gate-deep slivers.
 //!
 //! Values above 1.0 are significant rotation; above 2.5, extreme. The
@@ -742,7 +738,7 @@ const COMPOSITE_TAPS: [f64; 5] = [0.1039, 0.1595, 0.1187, -0.0037, -0.0630];
 ///
 /// This used to be *two* tap lists — `SPLIT_CLEAN` = ĉ at offsets 2/3/4 on
 /// the side facing a radial's whole-degree pair partner, these taps on the
-/// side away from it — with [`pair_phase`] deciding which side each radial
+/// side away from it — with the pairing phase deciding which side each radial
 /// faced. A step landing between pairs then read a flat four-radial core
 /// (0.78 ×4 at 21.0 nm on a ±8 m/s step) and one landing inside a pair read a
 /// two-radial core with 0.50 shoulders, on the same weather, alternating with
@@ -777,6 +773,18 @@ const COMPOSITE_TAPS: [f64; 5] = [0.1039, 0.1595, 0.1187, -0.0037, -0.0630];
 /// index-parity against floor(az) — reads the same profile again at both
 /// KLOT and KTLX. The reference's response is invariant to the pairing, so
 /// there is no phase to anchor.
+///
+/// # This operator is the whole of it, couplets included
+///
+/// A couplet is two steps, so a linear operator's response to one is fixed by
+/// its step response with nothing left to choose. The reference obeys that:
+/// 60 hovered couplets — pole widths 2, 3, 4, 5 and 6 radials at both boundary
+/// parities, over the same six sites — read these taps' own prediction at
+/// every radial of every profile, worst departure 0.04, which is the quantum
+/// the reference reports in. 36 asymmetric ones (a width-3 pair with the weak
+/// pole at 0.67 and at 0.33 of the strong, both parities, same six sites) read
+/// it too, weak flank and all. The readings and what they replaced are at
+/// `a_couplet_reads_the_operator_its_own_step_response_fixes`.
 const SPLIT_TAPS: [(i32, f64); 4] = [(1, 0.238), (2, 0.342), (3, 0.238), (4, -0.151)];
 
 /// The operator for a sweep that is *already* legacy resolution — a TDWR cut,
@@ -803,8 +811,9 @@ const SPLIT_TAPS: [(i32, f64); 4] = [(1, 0.238), (2, 0.342), (3, 0.238), (4, -0.
 ///   zero, so the ND boundary measures the span rather than any gate.
 /// * It is **linear** there: the couplet's pole-edge/core ratio is −0.5 with
 ///   no free parameter under this support, and the reference reads −0.45/0.89
-///   = −0.506. The matched-filter kernel bank, which compresses couplet edges
-///   on the super-res grid, therefore does not run on such a sweep.
+///   = −0.506. A couplet on a 1.0° cut is read by the same operator its step
+///   response fixes and by nothing else, which is what a super-res couplet
+///   turned out to be as well ([`SPLIT_TAPS`]).
 ///
 /// Twelve hovered readings — a three-range step ladder at 32.2/39.1/45.9 km
 /// and the couplet's four distinct classes — fit these two taps with a worst
@@ -814,165 +823,6 @@ const SPLIT_TAPS: [(i32, f64); 4] = [(1, 0.238), (2, 0.342), (3, 0.238), (4, -0.
 /// 1.0° than on one collected at 0.5°, because the reference's coarse-grid
 /// operator is a narrower one and not the same taps in row units.
 const LEGACY_TAPS: [(i32, f64); 2] = [(1, 0.6812), (2, -0.0838)];
-
-/// Matched-filter kernel bank: one per-radial tap operator per couplet pole
-/// width (2/3/4 radials), as a clean/away tap pair a radial chooses between by
-/// which side its whole-degree pair partner sits on. Each kernel is
-/// empirically fitted so that its response to the ideal median-filtered
-/// width-w couplet matches the reference's measured width-w couplet response,
-/// anchored to the primary operator's own core response on the same pattern
-/// (measured provenance: branch `campaign-harness`). The kernels never see
-/// steps or notches: [`apply_kernel_bank`] only engages them — and only as
-/// magnitude caps — where the local velocity profile carries a bipolar
-/// couplet signature, so the primary chain keeps full ownership of sign,
-/// ND, coherence and every non-couplet pattern.
-const BANK_K2_CLEAN: [(i32, f64); 6] = [
-    (1, 0.1916),
-    (2, 0.3660),
-    (3, 0.3660),
-    (4, 0.1854),
-    (5, 0.1854),
-    (6, 0.0168),
-];
-const BANK_K2_AWAY: [(i32, f64); 6] = [
-    (1, 0.1706),
-    (2, 0.1706),
-    (3, 0.2867),
-    (4, 0.2867),
-    (5, 0.0142),
-    (6, 0.0142),
-];
-const BANK_K3_CLEAN: [(i32, f64); 7] = [
-    (1, -0.0812),
-    (2, 0.4297),
-    (3, 0.0225),
-    (4, 0.6003),
-    (5, 0.1732),
-    (6, 0.0613),
-    (7, -0.2276),
-];
-const BANK_K3_AWAY: [(i32, f64); 7] = [
-    (1, 0.2541),
-    (2, -0.0761),
-    (3, 0.8530),
-    (4, 0.2776),
-    (5, 0.4269),
-    (6, -0.0377),
-    (7, 0.1870),
-];
-const BANK_K4_CLEAN: [(i32, f64); 11] = [
-    (1, 0.3727),
-    (2, 0.1368),
-    (3, 0.1368),
-    (4, 0.5549),
-    (5, 0.5549),
-    (6, 0.4834),
-    (7, 0.4834),
-    (8, 0.1101),
-    (9, 0.1101),
-    (10, 0.5916),
-    (11, 0.5916),
-];
-const BANK_K4_AWAY: [(i32, f64); 11] = [
-    (1, 0.2494),
-    (2, 0.2494),
-    (3, 0.1336),
-    (4, 0.1336),
-    (5, 0.6856),
-    (6, 0.6856),
-    (7, 0.0728),
-    (8, 0.0728),
-    (9, 0.2768),
-    (10, 0.2768),
-    (11, 0.9262),
-];
-
-/// Asymmetric-couplet kernels: span-7 operators with the same clean/away
-/// semantics, empirically fitted to the reference's measured
-/// graded-asymmetry couplet responses — a +6/−4 pole pair (ratio 0.67) and
-/// a +6/−2 pair (ratio 0.33). The reference compresses asymmetric-couplet
-/// edges harder as the weak pole shrinks, and symmetric templates cannot
-/// match these patterns, so they get their own kernels and templates.
-/// Footprint-only: their tap energy is too high for the per-bin base cap,
-/// and their template gate is the sole notch guard (measured monopolar
-/// notches score far under the r² floor against them — the balance gate,
-/// which such couplets themselves fail, is deliberately not applied).
-/// Measured provenance: branch `campaign-harness`.
-const BANK_A067_CLEAN: [(i32, f64); 7] = [
-    (1, -0.1595),
-    (2, 0.8119),
-    (3, -0.29),
-    (4, 0.1871),
-    (5, 0.3338),
-    (6, -0.7268),
-    (7, 0.3928),
-];
-const BANK_A067_AWAY: [(i32, f64); 7] = [
-    (1, 0.4798),
-    (2, -0.5459),
-    (3, 0.7539),
-    (4, 0.3544),
-    (5, -0.8263),
-    (6, 0.3977),
-    (7, -0.0731),
-];
-const BANK_A033_CLEAN: [(i32, f64); 7] = [
-    (1, -0.0712),
-    (2, 0.6955),
-    (3, -0.4007),
-    (4, 0.3542),
-    (5, 0.2212),
-    (6, -0.7511),
-    (7, 0.5327),
-];
-const BANK_A033_AWAY: [(i32, f64); 7] = [
-    (1, 0.5561),
-    (2, -0.6041),
-    (3, 0.6831),
-    (4, 0.5249),
-    (5, -1.0944),
-    (6, 0.541),
-    (7, -0.0264),
-];
-
-/// Candidate cores for the footprint pass: local azimuthal maxima of the
-/// primary chain's |NROT| at or above the palette floor.
-const BANK_DETECT_MIN: f64 = 0.25;
-
-/// Template-match floor: squared Pearson correlation between the detrended
-/// local velocity profile and the ideal width-w couplet template (best of
-/// alignments −1/0/+1) must reach this before a width's kernel takes the
-/// couplet's footprint; the best-scoring width wins. High on purpose: the
-/// footprint layer repaints only clean template matches, while the per-bin
-/// base cap handles everything merely couplet-like.
-const BANK_R2_MIN: f64 = 0.8;
-
-/// Compression floor for the footprint cap, as a fraction of the primary
-/// chain's magnitude. On-template the kernels' fitted edge/core responses
-/// stay above this fraction of the primary response, so any deeper
-/// compression is off-template kernel texture, not measured couplet law —
-/// bounding it keeps capped bins within the profile family the bank was
-/// fitted to.
-const BANK_CAP_FLOOR: f64 = 0.7;
-
-/// Gain on the cap operators' output. The kernel fits are anchored to the
-/// primary operator's core response on ideal patterns; on real weak couplet
-/// shoulders the reference's compressed values run below that anchor, so
-/// the cap output is recalibrated by this empirical factor. Measured
-/// provenance: branch `campaign-harness`.
-const BANK_CAP_GAIN: f64 = 0.90;
-
-/// Deviation-balance floor for the per-bin base cap. Empirical separator:
-/// measured monopolar notches balance well below it, rotation couplets at
-/// or above it. Measured provenance: branch `campaign-harness`.
-const BANK_BASE_BALANCE_MIN: f64 = 0.42;
-
-/// Deviation-balance floor for footprint candidates: opposite deviations
-/// about the window median must reach this ratio. Sits between the
-/// measured notch and couplet balance points, nearer the notch to keep
-/// weak lopsided couplets eligible. Measured provenance: branch
-/// `campaign-harness`.
-const BANK_BALANCE_MIN: f64 = 0.35;
 
 /// Range limit in km for the split-tap operator; beyond it the composite
 /// 11-tap stencil takes over. Each operator is used inside the range band
@@ -1094,9 +944,9 @@ fn split_stencil_rot(
     // reading on every grid whose rows are not half degrees.
     //
     // Which grids reach here is the other half of the answer, and it is not
-    // "any": a sweep whose rows are already whole degrees has no pairing for
-    // this operator's clean/away asymmetry to sit on, and takes the symmetric
-    // [`legacy_stencil_rot`] instead ([`pair_phase`]). So the coarse sampling
+    // "any": a sweep whose rows are already whole degrees is read by
+    // [`legacy_stencil_rot`], the operator measured on such a sweep
+    // ([`rows_are_half_degree_pairs`]). So the coarse sampling
     // of one field does *not* read what the fine one reads inside 80 km —
     // that is a difference of operators, measured against the reference, and
     // the same test pins it.
@@ -1169,27 +1019,28 @@ fn legacy_stencil_rot(
     Some(acc / arc_per_radial)
 }
 
-/// Whether this sweep's rows pair into whole-degree legacy bins, and at which
-/// index phase: radials (2k+phase, 2k+1+phase) share a degree sector. The
-/// pairing is anchored to ABSOLUTE azimuth, not to collection order — a
-/// super-res cut's radial centres sit at x.21/x.71 and the two sharing a
-/// floor are the pair.
+/// Whether this sweep's rows pair into whole-degree legacy bins: radials
+/// (2k, 2k+1) — or (2k+1, 2k+2) — sharing a degree sector. The pairing is
+/// anchored to ABSOLUTE azimuth, not to collection order: a super-res cut's
+/// radial centres sit at x.21/x.71 and the two sharing a floor are the pair.
 ///
-/// `Some` versus `None` is the load-bearing half of the answer: it says
-/// whether the rows are a 0.5° grid (take [`SPLIT_TAPS`]) or already whole
-/// degrees (take [`LEGACY_TAPS`]). The phase *value* is used by
-/// [`apply_kernel_bank`] alone, to pick each kernel's clean/away form.
+/// The answer is one bit, and it chooses an operator rather than a form of
+/// one: a 0.5° grid takes [`SPLIT_TAPS`], rows that are already whole degrees
+/// take [`LEGACY_TAPS`]. *Which* alignment cohabits — the phase — is computed
+/// here because it is how the question is answered, and it is not returned,
+/// because nothing downstream may branch on it.
 ///
-/// It no longer picks a form for the primary operator. It used to, and the
-/// reference does not: hovered across 36 synthetic step edges at both
-/// parities over six sites, its super-res step response is the same
-/// symmetric profile every time ([`SPLIT_TAPS`] carries the readings). The
-/// kernel bank's own clean/away split rests on the same assumption and has
-/// not been re-measured — its couplet cores read 0.75 and 0.36 at the two
-/// parities where the reference reads 0.97 on both, so the phase it takes
-/// from here is a suspect, not a validated, input.
+/// That is a measurement, not a preference. Hovered across 36 synthetic step
+/// edges at both parities over six sites, the reference's super-res step
+/// response is the same symmetric profile every time ([`SPLIT_TAPS`] carries
+/// the readings), and across 60 couplets — five pole widths at both parities
+/// over the same six sites — its couplet response is the same profile too,
+/// and is the response [`SPLIT_TAPS`] alone predicts (the width ladder is at
+/// `a_couplet_reads_the_operator_its_own_step_response_fixes`). A
+/// shift-invariant reference cannot have a parity-dependent implementation,
+/// so no reader here takes a parity.
 ///
-/// # `None` where there is no pairing to find
+/// # False on a sweep with no pairing to find
 ///
 /// The question only has an answer on a 0.5° grid. Two radials 1.0° apart can
 /// never share a whole degree — their floors differ by one by construction —
@@ -1198,9 +1049,9 @@ fn legacy_stencil_rot(
 /// (all four measured, in `a_one_degree_sweep_has_no_pair_phase_to_measure`).
 /// That is not a bad reading of a real pairing; there is no pairing. Each
 /// radial of such a sweep *is* a legacy bin, and the caller reaches for
-/// [`LEGACY_TAPS`] rather than a half of an operator it cannot choose between.
+/// [`LEGACY_TAPS`].
 ///
-/// Answering `Some(0)` there — which this did until the reference was hovered
+/// Answering "paired" there — which this did until the reference was hovered
 /// on a 1.0° cut — handed the primary operator's then clean/away asymmetry to
 /// `i % 2`, off collection index rather than off azimuth. Two sites make the
 /// cost concrete: the same synthetic step at az 100.1° and the same couplet at
@@ -1210,14 +1061,14 @@ fn legacy_stencil_rot(
 /// across the couplet — a factor of 2.2 on the same sky. The reference read
 /// 0.69 and 0.89 at both.
 ///
-/// A ragged sweep is deliberately not `None`. Only *no* cohabiting pair at
+/// A ragged sweep is deliberately still paired. Only *no* cohabiting pair at
 /// either alignment says the rows are whole degrees; a sector or a jittered
 /// super-res cut still finds most of its pairs and keeps [`SPLIT_TAPS`],
 /// which is the path validated against the reference.
-fn pair_phase(azimuths_deg: &[f64]) -> Option<usize> {
+fn rows_are_half_degree_pairs(azimuths_deg: &[f64]) -> bool {
     let n = azimuths_deg.len();
     if n < 4 {
-        return None;
+        return false;
     }
     let cohabit = |phase: usize| {
         (0..n / 2)
@@ -1230,33 +1081,26 @@ fn pair_phase(azimuths_deg: &[f64]) -> Option<usize> {
             })
             .count()
     };
-    let (c0, c1) = (cohabit(0), cohabit(1));
     // A real pairing accounts for *most* of the sweep: on a 0.5° grid one
     // alignment puts every pair inside a degree and the other puts none. A
     // 1.0° grid can still show a few, because an antenna that wanders a few
     // hundredths backwards leaves two consecutive radials on the same side of
     // a degree boundary — 8 such pairs in 180 on a ±0.06° jitter. Requiring a
     // majority separates the two without asking the caller for the spacing.
-    if 2 * c0.max(c1) <= n / 2 {
-        return None;
-    }
-    Some(usize::from(c1 > c0))
+    2 * cohabit(0).max(cohabit(1)) > n / 2
 }
 
-/// The widest azimuthal half-span any profile reader asks for: the width-4
-/// bank kernel's tap list ([`BANK_K4_CLEAN`]) reaches ±11 radials, which is
-/// more than the base cap's ±7 and more than `gated_prof`'s ±(w+3) ≤ ±7.
-const PROFILE_MAX_HALF: usize = 11;
+/// The widest azimuthal half-span any profile reader asks for: both tap
+/// stencils read ±5 and demand ±(5 + [`GK_DATA_MARGIN`]), and
+/// [`legacy_stencil_rot`] asks [`az_profile`] for exactly that.
+const PROFILE_MAX_HALF: usize = 7;
 
 /// Backing store for one [`az_profile`], sized for [`PROFILE_MAX_HALF`].
 ///
-/// A `Vec` here was ~1.15 M heap allocations per sweep: [`apply_kernel_bank`]
-/// takes a profile once per non-`NaN` bin and three more through
-/// [`bank_kernel_rot`]'s kernel sweep, over ~230 k bins, for a fifteen-element
-/// array with a fixed maximum length. [`composite_stencil_rot`] and
-/// [`split_stencil_rot`] already had the right shape — a plain stack array —
-/// and this gives the bank path the same one. Nothing about the values
-/// changes; the profile is filled and read exactly as before.
+/// A plain stack array rather than a `Vec`, which is the shape
+/// [`composite_stencil_rot`] and [`split_stencil_rot`] fill their own
+/// profiles into: this is read once per non-`NaN` bin, over ~230 k bins of a
+/// sweep, for a fixed-length list of fifteen.
 type ProfileBuf = [f64; 2 * PROFILE_MAX_HALF + 1];
 
 /// An empty [`ProfileBuf`], for a caller about to hand it to [`az_profile`].
@@ -1267,8 +1111,8 @@ const EMPTY_PROFILE: ProfileBuf = [f64::NAN; 2 * PROFILE_MAX_HALF + 1];
 /// stencils consume. NaN where a radial has no data in the range window.
 ///
 /// Fills the leading `2·half + 1` entries of `out` and returns them; `half`
-/// above [`PROFILE_MAX_HALF`] would be a caller with a wider tap list than any
-/// kernel in the bank has, and panics rather than silently truncating.
+/// above [`PROFILE_MAX_HALF`] would be a caller reaching past the widest span
+/// any operator here has, and panics rather than silently truncating.
 fn az_profile<'p>(
     out: &'p mut ProfileBuf,
     vel_grid: &[Vec<f64>],
@@ -1301,420 +1145,6 @@ fn az_profile<'p>(
         *cell = if n > 0 { sum / n as f64 } else { f64::NAN };
     }
     slot
-}
-
-/// Best squared Pearson correlation between a fully-valid profile (centred
-/// on a candidate core radial) and the ideal width-`w` couplet template —
-/// +1 across w radials meeting −`neg_amp` across w radials at the window
-/// centre — over alignments −1/0/+1. r² is invariant under template
-/// negation, so one template serves both rotation senses and both
-/// orientations of an asymmetric pair (the sign-mirrored pattern scores
-/// identically by construction, and the kernels are linear). Steps and ramps never pass: their profiles do not
-/// return to the background on both sides of the window.
-fn bank_template_r2(prof: &[f64], w: i32, neg_amp: f64) -> Option<f64> {
-    let half = (prof.len() as i32 - 1) / 2;
-    let n = prof.len() as f64;
-    // Detrend: remove the profile's mean and linear component. The second
-    // chain is flow-invariant (measured), so ambient azimuthal shear under a
-    // couplet must not spoil the template match; a monopolar notch stays
-    // monopolar after detrending and still matches nothing.
-    let pm = prof.iter().sum::<f64>() / n;
-    let sxx: f64 = (0..prof.len())
-        .map(|k| (k as f64 - (n - 1.0) / 2.0).powi(2))
-        .sum();
-    let sxy: f64 = prof
-        .iter()
-        .enumerate()
-        .map(|(k, p)| (k as f64 - (n - 1.0) / 2.0) * (p - pm))
-        .sum();
-    let slope = sxy / sxx;
-    // Stack, not heap: this runs per candidate core per width, four `Vec`s a
-    // call (the detrended profile and one template per alignment), and the
-    // length is bounded by `PROFILE_MAX_HALF` like every other profile here.
-    let mut detrended = EMPTY_PROFILE;
-    let detrended = &mut detrended[..prof.len()];
-    for (k, slot) in detrended.iter_mut().enumerate() {
-        *slot = prof[k] - pm - slope * (k as f64 - (n - 1.0) / 2.0);
-    }
-    let pm = 0.0;
-    let pv: f64 = detrended.iter().map(|p| (p - pm).powi(2)).sum();
-    if pv <= 0.0 {
-        return None;
-    }
-    let mut best: Option<f64> = None;
-    let mut template = EMPTY_PROFILE;
-    let t = &mut template[..prof.len()];
-    for s in -1..=1 {
-        for (k, slot) in t.iter_mut().enumerate() {
-            let x = k as i32 - half - s;
-            *slot = if (-w..0).contains(&x) {
-                1.0
-            } else if (0..w).contains(&x) {
-                -neg_amp
-            } else {
-                0.0
-            };
-        }
-        let tm = t.iter().sum::<f64>() / n;
-        let tv: f64 = t.iter().map(|x| (x - tm).powi(2)).sum();
-        let cov: f64 = detrended
-            .iter()
-            .zip(t.iter())
-            .map(|(p, x)| (p - pm) * (x - tm))
-            .sum();
-        let r2 = cov * cov / (pv * tv);
-        if best.is_none_or(|b| r2 > b) {
-            best = Some(r2);
-        }
-    }
-    best
-}
-
-/// A kernel's clean-side and away-side tap lists.
-type TapPair<'a> = (&'a [(i32, f64)], &'a [(i32, f64)]);
-
-/// A candidate window for the footprint pass that passes the ends-return gate
-/// (a couplet's profile comes back to the background on both sides; a step's
-/// does not), with the profile's bipolar balance about its median. `None` when
-/// the window is incomplete or the gate rejects it.
-///
-/// Takes its own backing array rather than returning a `Vec`, and is a free
-/// function rather than the closure it was so the borrow ends with the caller's
-/// use of the slice.
-fn gated_prof<'p>(
-    out: &'p mut ProfileBuf,
-    vel_grid: &[Vec<f64>],
-    i: usize,
-    j: usize,
-    gate_count: usize,
-    w: i32,
-    rows: crate::azimuth::Rows,
-) -> Option<(&'p [f64], f64)> {
-    let prof = az_profile(out, vel_grid, i, j, gate_count, w + 3, rows);
-    if prof.iter().any(|p| p.is_nan()) {
-        return None;
-    }
-    let (lo, hi) = prof
-        .iter()
-        .fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), &p| {
-            (l.min(p), h.max(p))
-        });
-    if hi <= lo || (prof[prof.len() - 1] - prof[0]).abs() > 0.5 * (hi - lo) {
-        return None;
-    }
-    let mut vals = EMPTY_PROFILE;
-    let vals = &mut vals[..prof.len()];
-    vals.copy_from_slice(prof);
-    vals.sort_by(|x, y| x.partial_cmp(y).unwrap());
-    let med = vals[vals.len() / 2];
-    let dpos = vals[vals.len() - 1] - med;
-    let dneg = med - vals[0];
-    let balance = dpos.min(dneg) / dpos.max(dneg).max(1e-9);
-    Some((prof, balance))
-}
-
-/// One bank kernel at one bin: the same clean/away weight assembly as
-/// [`split_stencil_rot`], normalized by the same two rows of this grid — the
-/// legacy 1.0° arc where the grid is super-res. It has to be the same
-/// divisor, the same [`pair_phase`] and the same [`crate::azimuth::Rows`] as
-/// the primary chain, since its output is only ever a cap on the primary's
-/// magnitude: two chains scaled over different arcs would cap by a ratio of
-/// arcs rather than by kernel shape, and one reading past a sector's edge
-/// where the other stopped would cap a real value against a manufactured one.
-/// Requires every tap cell — a missing cell means the footprint bin keeps the
-/// primary chain's value.
-#[allow(clippy::too_many_arguments)]
-fn bank_kernel_rot(
-    vel_grid: &[Vec<f64>],
-    i: usize,
-    j: usize,
-    arc_per_radial: f64,
-    gate_count: usize,
-    pair_first: bool,
-    taps: TapPair,
-    rows: crate::azimuth::Rows,
-) -> Option<f64> {
-    let (clean, away) = taps;
-    let span = clean.len() as i32;
-    let mut buf = EMPTY_PROFILE;
-    let prof = az_profile(&mut buf, vel_grid, i, j, gate_count, span, rows);
-    let (plus, minus) = if pair_first {
-        (clean, away)
-    } else {
-        (away, clean)
-    };
-    let mut acc = 0.0;
-    for &(o, t) in plus {
-        let v = prof[(span + o) as usize];
-        if v.is_nan() {
-            return None;
-        }
-        acc += t * v;
-    }
-    for &(o, t) in minus {
-        let v = prof[(span - o) as usize];
-        if v.is_nan() {
-            return None;
-        }
-        acc -= t * v;
-    }
-    Some(acc / (2.0 * arc_per_radial))
-}
-
-/// Matched-filter bank pass over the primary NROT grid, inside the
-/// split-tap domain. Two layers, both magnitude caps that keep the
-/// primary's sign and leave everything their gates exclude untouched:
-///
-/// 1. Per-bin base cap: every bin whose velocity profile returns to its
-///    background at both window ends (steps and pure azimuthal ramps never
-///    do) and shows balanced opposite deviations about its median
-///    (monopolar notches never do) is bounded by the smallest kernel
-///    magnitude in the bank. This suppresses the broad sign-fragile
-///    fringes the primary chain paints around weak structure.
-/// 2. Footprint refinement: at each candidate core (a local azimuthal max
-///    of |NROT| at or above [`BANK_DETECT_MIN`]) whose profile passes the
-///    same gates and correlates with a couplet template at
-///    [`BANK_R2_MIN`], the best-matching kernel — symmetric widths 2/3/4,
-///    or an asymmetric width-3 pair (weak-pole ratio 0.67/0.33, exempt
-///    from the balance gate their pattern class inherently fails) — caps
-///    the couplet's whole footprint (core ± (w+2) radials), floored at
-///    [`BANK_CAP_FLOOR`] of the primary value.
-///
-/// The reference's measured width-dependent edge compression with
-/// full-value pass-through on monopolar notches follows from this
-/// selection rule, and the cap form bounds the wide kernels' noise gain by
-/// the primary response on real velocity texture. Measured provenance:
-/// branch `campaign-harness`.
-///
-/// None of it runs on a sweep whose rows are already whole degrees. Every
-/// kernel here is a clean/away pair, chosen by [`pair_phase`], and so
-/// has no form to choose on such a grid — and there is nothing for it to
-/// compress: the reference's couplet response there is exactly what
-/// [`LEGACY_TAPS`] predicts from its own step response, pole-edge over core
-/// −0.45/0.89 = −0.506 against the −0.5 that support forces with no free
-/// parameter. The compression this bank exists for is a super-res behaviour.
-fn apply_kernel_bank(
-    sweep: &VelocitySweep,
-    vel_grid: &[Vec<f64>],
-    grid: &mut [Vec<f64>],
-    phase: Option<usize>,
-) {
-    let Some(phase) = phase else {
-        return;
-    };
-    let num_radials = grid.len();
-    if num_radials == 0 {
-        return;
-    }
-    // The same rows the primary chain read: the bank's output is a cap on the
-    // primary's magnitude, and two chains measured over different arcs would
-    // cap by a ratio of arcs rather than by kernel shape — or, reading past a
-    // sector's edge where the primary would not, cap a real value against a
-    // manufactured one.
-    let rows = sweep_rows(sweep, num_radials);
-    let spacing_rad = rows.step_deg.to_radians();
-    type Bank = [(i32, &'static [(i32, f64)], &'static [(i32, f64)]); 3];
-    const BANK: Bank = [
-        (2, &BANK_K2_CLEAN, &BANK_K2_AWAY),
-        (3, &BANK_K3_CLEAN, &BANK_K3_AWAY),
-        (4, &BANK_K4_CLEAN, &BANK_K4_AWAY),
-    ];
-    // Asymmetric entries: (weak-pole template amplitude, taps). Width-3
-    // poles; footprint-only — see the tap constants' doc.
-    type BankAsym = [(f64, &'static [(i32, f64)], &'static [(i32, f64)]); 2];
-    const BANK_ASYM: BankAsym = [
-        (2.0 / 3.0, &BANK_A067_CLEAN, &BANK_A067_AWAY),
-        (1.0 / 3.0, &BANK_A033_CLEAN, &BANK_A033_AWAY),
-    ];
-    let primary: &[Vec<f64>] = grid;
-    let overrides: Vec<Vec<(usize, f64)>> = (0..sweep.gate_count)
-        .into_par_iter()
-        .map(|j| {
-            let mut ov: Vec<(usize, f64)> = Vec::new();
-            let range_km = sweep.first_gate_range_km + j as f64 * sweep.gate_interval_km;
-            if range_km >= SPLIT_MAX_RANGE_KM || range_km <= MIN_RANGE_NM * KM_PER_NM {
-                return ov;
-            }
-            let arc_per_radial = range_km * spacing_rad;
-            let divisor = rot_divisor(range_km / KM_PER_NM);
-            let mut col: Vec<f64> = (0..num_radials).map(|i| primary[i][j]).collect();
-            // Base layer: per-bin bank cap. Every bin
-            // whose profile returns to its background at the window ends
-            // (steps and pure azimuthal ramps do not — they keep the full
-            // primary value) and shows balanced opposite deviations about
-            // its median (monopolar notches do not) is bounded by the
-            // smallest kernel magnitude in the bank. This is what
-            // suppresses the broad sign-fragile fringes around weak
-            // structure; the width-matched footprints below then refine
-            // actual couplets.
-            for (i, ci) in col.iter_mut().enumerate() {
-                if ci.is_nan() {
-                    continue;
-                }
-                let mut buf = EMPTY_PROFILE;
-                let prof = az_profile(&mut buf, vel_grid, i, j, sweep.gate_count, 7, rows);
-                let mut vals = EMPTY_PROFILE;
-                let mut nvals = 0;
-                for &p in prof {
-                    if !p.is_nan() {
-                        vals[nvals] = p;
-                        nvals += 1;
-                    }
-                }
-                if nvals == 0 {
-                    continue;
-                }
-                let vals = &mut vals[..nvals];
-                let (first, last) = (vals[0], vals[vals.len() - 1]);
-                vals.sort_by(|x, y| x.partial_cmp(y).unwrap());
-                let (lo, hi) = (vals[0], vals[vals.len() - 1]);
-                if hi <= lo || (last - first).abs() > 0.7 * (hi - lo) {
-                    continue;
-                }
-                let med = vals[vals.len() / 2];
-                let dpos = hi - med;
-                let dneg = med - lo;
-                let balance = dpos.min(dneg) / dpos.max(dneg).max(1e-9);
-                if balance < BANK_BASE_BALANCE_MIN {
-                    continue;
-                }
-                let mut cap: Option<f64> = None;
-                for &(_, kc, ka) in BANK.iter() {
-                    if let Some(rot) = bank_kernel_rot(
-                        vel_grid,
-                        i,
-                        j,
-                        arc_per_radial,
-                        sweep.gate_count,
-                        i % 2 == phase,
-                        (kc, ka),
-                        rows,
-                    ) {
-                        let kv = (BANK_CAP_GAIN * rot / divisor)
-                            .clamp(-NROT_LIMIT, NROT_LIMIT)
-                            .abs();
-                        if cap.is_none_or(|c| kv < c) {
-                            cap = Some(kv);
-                        }
-                    }
-                }
-                if let Some(kv) = cap
-                    && kv < ci.abs()
-                {
-                    let capped = ci.signum() * kv;
-                    *ci = capped;
-                    ov.push((i, capped));
-                }
-            }
-            for i in 0..num_radials {
-                let v = col[i];
-                if v.is_nan() || v.abs() < BANK_DETECT_MIN {
-                    continue;
-                }
-                // A row at the end of a sector's arc has no neighbour on that
-                // side, which is the same "no larger neighbour there" the two
-                // tests below already read out of a NaN.
-                let prev = rows.neighbour(i, -1).map_or(f64::NAN, |k| col[k]);
-                let next = rows.neighbour(i, 1).map_or(f64::NAN, |k| col[k]);
-                if (!prev.is_nan() && prev.abs() > v.abs())
-                    || (!next.is_nan() && next.abs() > v.abs())
-                {
-                    continue;
-                }
-                let mut best: Option<(f64, i32, TapPair)> = None;
-                let mut buf = EMPTY_PROFILE;
-                for &(w, clean, away) in BANK.iter() {
-                    // Bipolar balance about the window median: a monopolar
-                    // notch (one deep pole, weak counter-deviation) never
-                    // balances; a symmetric rotation couplet does.
-                    let Some((prof, balance)) =
-                        gated_prof(&mut buf, vel_grid, i, j, sweep.gate_count, w, rows)
-                    else {
-                        continue;
-                    };
-                    if balance < BANK_BALANCE_MIN {
-                        continue;
-                    }
-                    if let Some(r2) = bank_template_r2(prof, w, 1.0)
-                        && r2 >= BANK_R2_MIN
-                        && best.is_none_or(|(b, _, _)| r2 > b)
-                    {
-                        best = Some((r2, w, (clean, away)));
-                    }
-                }
-                // Both asymmetric entries are width 3, so their window is one
-                // window: gated as one, and the same three radial means the
-                // symmetric width-3 pass already walked. It used to be
-                // recomputed three times per candidate core.
-                let mut asym_buf = EMPTY_PROFILE;
-                if let Some((prof, _)) =
-                    gated_prof(&mut asym_buf, vel_grid, i, j, sweep.gate_count, 3, rows)
-                {
-                    for &(neg_amp, clean, away) in BANK_ASYM.iter() {
-                        // Asymmetric couplets fail the balance test by nature;
-                        // their template gate alone carries the notch guard
-                        // (the measured notch scores r² ≈ 0.2–0.3 here).
-                        if let Some(r2) = bank_template_r2(prof, 3, neg_amp)
-                            && r2 >= BANK_R2_MIN
-                            && best.is_none_or(|(b, _, _)| r2 > b)
-                        {
-                            best = Some((r2, 3, (clean, away)));
-                        }
-                    }
-                }
-                let Some((_, w, (clean, away))) = best else {
-                    continue;
-                };
-                // The kernel must be computable at the core itself — a core
-                // whose own span is incomplete sits on a data edge, where
-                // the primary chain's completeness rules are the authority.
-                if bank_kernel_rot(
-                    vel_grid,
-                    i,
-                    j,
-                    arc_per_radial,
-                    sweep.gate_count,
-                    i % 2 == phase,
-                    (clean, away),
-                    rows,
-                )
-                .is_none()
-                {
-                    continue;
-                }
-                for d in -(w + 2)..=(w + 2) {
-                    let Some(ii) = rows.neighbour(i, d) else {
-                        continue;
-                    };
-                    if col[ii].is_nan() {
-                        continue;
-                    }
-                    if let Some(rot) = bank_kernel_rot(
-                        vel_grid,
-                        ii,
-                        j,
-                        arc_per_radial,
-                        sweep.gate_count,
-                        ii % 2 == phase,
-                        (clean, away),
-                        rows,
-                    ) {
-                        let kv = (rot / divisor).clamp(-NROT_LIMIT, NROT_LIMIT);
-                        let mag = kv.abs().max(BANK_CAP_FLOOR * col[ii].abs());
-                        if mag < col[ii].abs() {
-                            ov.push((ii, col[ii].signum() * mag));
-                        }
-                    }
-                }
-            }
-            ov
-        })
-        .collect();
-    for (j, ov) in overrides.into_iter().enumerate() {
-        for (i, val) in ov {
-            grid[i][j] = val;
-        }
-    }
 }
 
 /// The measured composite estimator: tap correlation across 11 radials at
@@ -1802,9 +1232,9 @@ fn llsd_nrot(sweep: &VelocitySweep, vel_grid: &[Vec<f64>]) -> Vec<Vec<f64>> {
     let num_radials = vel_grid.len();
     let rows = sweep_rows(sweep, num_radials);
     let spacing_rad = rows.step_deg.to_radians();
-    let phase = pair_phase(sweep.azimuths_deg);
+    let half_degree_rows = rows_are_half_degree_pairs(sweep.azimuths_deg);
 
-    let mut grid: Vec<Vec<f64>> = (0..num_radials)
+    (0..num_radials)
         .into_par_iter()
         .map(|i| {
             (0..sweep.gate_count)
@@ -1819,28 +1249,17 @@ fn llsd_nrot(sweep: &VelocitySweep, vel_grid: &[Vec<f64>]) -> Vec<Vec<f64>> {
 
                     let arc_per_radial = range_km * spacing_rad;
                     let rot = if range_km < SPLIT_MAX_RANGE_KM {
-                        match phase {
-                            Some(_) => split_stencil_rot(
-                                vel_grid,
-                                i,
-                                j,
-                                arc_per_radial,
-                                sweep.gate_count,
-                                rows,
-                            ),
-                            // Rows that are already whole degrees: no partner
-                            // to face, so no asymmetry to assign. Same rows
-                            // either way — a sector's arc ends where the
-                            // antenna stopped whichever operator reads it.
-                            None => legacy_stencil_rot(
-                                vel_grid,
-                                i,
-                                j,
-                                arc_per_radial,
-                                sweep.gate_count,
-                                rows,
-                            ),
-                        }
+                        // Rows already at whole degrees are read by the
+                        // operator measured on such a sweep, not by the
+                        // super-res one over twice the sky. Same rows either
+                        // way — a sector's arc ends where the antenna stopped
+                        // whichever operator reads it.
+                        let op = if half_degree_rows {
+                            split_stencil_rot
+                        } else {
+                            legacy_stencil_rot
+                        };
+                        op(vel_grid, i, j, arc_per_radial, sweep.gate_count, rows)
                     } else {
                         composite_stencil_rot(
                             vel_grid,
@@ -1861,9 +1280,7 @@ fn llsd_nrot(sweep: &VelocitySweep, vel_grid: &[Vec<f64>]) -> Vec<Vec<f64>> {
                 })
                 .collect()
         })
-        .collect();
-    apply_kernel_bank(sweep, vel_grid, &mut grid, phase);
-    grid
+        .collect()
 }
 
 // ————————————————————————————————————————————————————————————————————
@@ -3656,8 +3073,8 @@ mod tests {
 
         // Rows 20..52 of the sector read only rows 3..69 of it, so their whole
         // support lies inside the arc and is the full rotation's data bin for
-        // bin — the kernel bank's footprint layer reaches furthest, capping a
-        // row from a core ±6 away that is itself read over ±11 radials.
+        // bin — the split operator reaches ±4 and demands ±5, and the window
+        // keeps three rows of margin past that at each end.
         let mut carried = 0;
         for i in 20..52 {
             for j in 100..300 {
@@ -3749,17 +3166,18 @@ mod tests {
 
     /// The sector rule and the legacy-resolution operator meet on the same
     /// sweep, and this is that sweep: 72 rows of 1.0°, which is every TDWR cut
-    /// there is. Its rows are whole degrees, so [`pair_phase`] reports nothing
-    /// and [`legacy_stencil_rot`] reads it; its arc stops, so the rows past
-    /// either end are not there to read.
+    /// there is. Its rows are whole degrees, so
+    /// [`rows_are_half_degree_pairs`] is false and [`legacy_stencil_rot`]
+    /// reads it; its arc stops, so the rows past either end are not there to
+    /// read.
     ///
     /// Both halves are asserted against the *rotation* rather than against a
     /// formula, which is what makes this an integration test rather than two
     /// restatements: rows 5..67 of the sector read, bit for bit, what the same
     /// field's complete 1.0° rotation reads at the same rows, because their
-    /// whole support lies inside the arc — the kernel bank, the one reader
-    /// that reaches ±11, does not run on this grid at all. The five rows at
-    /// each end read ND, on the same [`GK_DATA_MARGIN`] the split operator
+    /// whole support lies inside the arc, which for this operator is ±2 rows
+    /// read and ±(5 + [`GK_DATA_MARGIN`]) demanded. The five rows at
+    /// each end read ND, on the same margin the split operator
     /// spends there, and nothing in the sector is allowed near a rotation:
     /// rows 0 and 71 stand 71° and 372 m/s apart at 50 km, and stitched
     /// together over the 0.87 km of arc a whole degree spans they would
@@ -3779,9 +3197,8 @@ mod tests {
         let sector_az = full_az[..72].to_vec();
         let full: Vec<Vec<f64>> = full_az.iter().map(|&a| row(a)).collect();
         let sector: Vec<Vec<f64>> = sector_az.iter().map(|&a| row(a)).collect();
-        assert_eq!(
-            pair_phase(&sector_az),
-            None,
+        assert!(
+            !rows_are_half_degree_pairs(&sector_az),
             "a 1.0° sector found a pairing"
         );
 
@@ -3963,9 +3380,8 @@ mod tests {
         // rows it reads the shear that is there; read as a physical degree the
         // divisor would be twice the grid's own two rows and every bin would
         // come back at half.
-        assert_eq!(
-            pair_phase(&ring_azimuths(1440)),
-            Some(0),
+        assert!(
+            rows_are_half_degree_pairs(&ring_azimuths(1440)),
             "a 0.25° sweep stopped pairing, and this probe stopped probing",
         );
         let probe_gates = 250; // to 62.75 km — inside the split band, whole
@@ -4001,16 +3417,15 @@ mod tests {
         }
     }
 
-    /// A 1.0°-spaced sweep has no pair phase, and the measurement says so by
-    /// answering `None` rather than a phase.
+    /// A 1.0°-spaced sweep has no pairing, and the measurement says so.
     ///
-    /// [`pair_phase`] asks which of two index alignments puts radials in the
-    /// same whole degree. Two radials 1.0° apart never are — their floors
-    /// differ by one by construction — so both counts are zero whatever the
-    /// sweep's offset or jitter, and each of its radials *is* a whole-degree
-    /// bin. Answering a phase there is what handed the split operator's
-    /// asymmetry to the collection index; `None` is what sends such a sweep to
-    /// [`legacy_stencil_rot`] instead.
+    /// [`rows_are_half_degree_pairs`] asks whether either index alignment puts
+    /// radials in the same whole degree. Two radials 1.0° apart never are —
+    /// their floors differ by one by construction — so both counts are zero
+    /// whatever the sweep's offset or jitter, and each of its radials *is* a
+    /// whole-degree bin. Answering "paired" there is what handed the split
+    /// operator's then asymmetry to the collection index; answering false is
+    /// what sends such a sweep to [`legacy_stencil_rot`] instead.
     #[test]
     fn a_one_degree_sweep_has_no_pair_phase_to_measure() {
         let whole: Vec<f64> = (0..360).map(f64::from).collect();
@@ -4021,28 +3436,30 @@ mod tests {
             .map(|i| f64::from(i) + 0.06 * (f64::from(i) * 1.7).sin())
             .collect();
         for azs in [&whole, &offset, &half_offset, &jittered] {
-            assert_eq!(pair_phase(azs), None, "a 1.0° sweep reported a pairing");
+            assert!(
+                !rows_are_half_degree_pairs(azs),
+                "a 1.0° sweep reported a pairing"
+            );
         }
 
-        // The super-res control: there the pairing is real, is found, and
-        // follows absolute azimuth rather than collection index — a sweep
-        // whose collection started half a degree along reports the other
-        // phase, which is what keeps the answer the same.
-        assert_eq!(pair_phase(&ring_azimuths(720)), Some(0));
+        // The super-res control: there the pairing is real and is found,
+        // whichever alignment carries it — a sweep whose collection started
+        // half a degree along pairs on the other one, and the answer is the
+        // same bit, which is now all there is to be had.
+        assert!(rows_are_half_degree_pairs(&ring_azimuths(720)));
         let rolled: Vec<f64> = (0..720).map(|i| f64::from(i) * 0.5 + 0.5).collect();
-        assert_eq!(pair_phase(&rolled), Some(1));
+        assert!(rows_are_half_degree_pairs(&rolled));
 
         // And a super-res sweep that only covers a sector still finds its
-        // pairs: `None` means "these rows are whole degrees", not "this sweep
+        // pairs: false means "these rows are whole degrees", not "this sweep
         // is ragged", so a 60° sector keeps the validated split operator.
         let sector: Vec<f64> = (0..120).map(|i| 30.0 + f64::from(i) * 0.5).collect();
-        assert_eq!(pair_phase(&sector), Some(0));
+        assert!(rows_are_half_degree_pairs(&sector));
     }
 
     /// Where the antenna happened to start a cut is not a property of the
-    /// weather, so it must not move the rotation. On the 0.5° grid — the one
-    /// validated against the reference — it does not: [`pair_phase`] anchors
-    /// the split operator's asymmetry to absolute azimuth, and a sweep rolled
+    /// weather, so it must not move the rotation. It does not: no reader in
+    /// this module takes a radial's index parity any more, so a sweep rolled
     /// by one radial reads bit for bit what it read before.
     ///
     /// The 1.0° half used to assert only that *something* moved, because the
@@ -4131,7 +3548,8 @@ mod tests {
     /// identically zero, which is what fixes the support; the couplet's
     /// −0.45/0.89 = −0.506 is the −0.5 that support forces with no free
     /// parameter, which is what says the reference does not compress couplets
-    /// on this grid the way the kernel bank does on the super-res one.
+    /// on this grid, which is what the super-res width ladder went on to say
+    /// of that grid too.
     /// A three-range step ladder (0.77/0.69/0.65 at 32.2/39.1/45.9 km) fixes
     /// the divisor curve as the one already shipped.
     ///
@@ -4372,6 +3790,240 @@ mod tests {
                     got.is_nan() || got.abs() < 0.02,
                     "az {boundary_az}, radial {radial}: got {got:.3}, expected ~0"
                 );
+            }
+        }
+    }
+
+    /// A couplet reads the operator its own step response fixes — at every
+    /// pole width, at both boundary parities, and with no compression stage
+    /// between.
+    ///
+    /// A couplet is two steps, so a linear operator's response to one is
+    /// determined by its step response with nothing left to choose. Sixty
+    /// hovered couplets say the reference is that operator and no more: pole
+    /// widths 2, 3, 4, 5 and 6 radials, each at a whole-degree and at a
+    /// half-degree centre — opposite radial-index parities, since super-res
+    /// radial centres sit at x.21/x.71 — patched into the 30–47 km band of a
+    /// real volume's 0.5° cut at KHNX (Vny 11.66), KLWX (11.34), KLOT (23.96),
+    /// KATX (25.32), KMSX (25.91) and a KTLX holdout (11.49), and hovered
+    /// along the 21.0 nm arc at 0.25° steps. Poles are 0.45·Vny, so the three
+    /// low-limit sites painted ±5.0 m/s; per radial outward from the couplet's
+    /// centre they read
+    ///
+    /// ```text
+    ///        core     +1     +2     +3     +4     +5
+    /// w2    +0.30  +0.14  −0.18  −0.26     ND  +0.06
+    /// w3    +0.49  +0.14  −0.18  −0.34  −0.14     ND
+    /// w4    +0.53  +0.30  −0.10  −0.34  −0.22  −0.14
+    /// w5    +0.45  +0.38     ND  −0.26  −0.22  −0.22
+    /// w6    +0.45  +0.30  +0.14  −0.14  −0.14  −0.22
+    /// ```
+    ///
+    /// symmetric about the centre, the same at both parities, and the same
+    /// profile scaled by amplitude at the three high-limit sites (w3 core
+    /// +1.09 on KLOT's ±10.5 poles and +1.13 on KATX's and KMSX's ±11.5,
+    /// against +1.07 and +1.17 predicted). Every value above is
+    /// [`SPLIT_TAPS`]' own prediction to within 0.04, the quantum the
+    /// reference reports in — for all 60 profiles, worst departure 0.04.
+    ///
+    /// Thirty-six asymmetric couplets say the same: width-3 poles with the
+    /// weak one at 0.67 and at 0.33 of the strong, both parities, same six
+    /// sites. At ±5.0 m/s strong poles the reference reads, strong side then
+    /// weak side outward,
+    ///
+    /// ```text
+    /// 0.67  +0.42  +0.10  −0.18  −0.34  −0.14 | +0.42  +0.14  −0.10  −0.26  −0.10
+    /// 0.33  +0.30     ND  −0.18  −0.30  −0.14 | +0.34  +0.14     ND  −0.14     ND
+    /// ```
+    ///
+    /// which is again this operator applied to that pattern, weak flank and
+    /// all.
+    ///
+    /// # What this replaced
+    ///
+    /// A matched-filter kernel bank — five fitted tap operators (widths 2/3/4
+    /// and two asymmetric ones), a per-bin cap, a footprint layer, template
+    /// and balance gates — used to cap couplet cores here, and did it by
+    /// radial parity. On the ladder above it read a width-3 core at 0.37 and
+    /// at 0.18 where the reference reads 0.49 at both, and a width-2 core at
+    /// 0.03 and at 0.20 against 0.30. It was fitted against an operator that
+    /// has since been corrected: the compression it existed to reproduce was
+    /// the old parity-split operator's own shape error, and against the
+    /// operator the reference's step response fixes there is nothing left to
+    /// compress. On real weather it was crushing the thing NROT exists to
+    /// show — the KFTG 2023-06-22 mesocyclone's core read +0.34 and +0.30
+    /// under it at az 90.8°/7.5 nm and 91.3°/8.0 nm, where the reference reads
+    /// +1.64 and +1.56 and this operator alone reads +1.52 and +1.46.
+    #[test]
+    fn a_couplet_reads_the_operator_its_own_step_response_fixes() {
+        let n = 720;
+        let gates = 400;
+        let azimuths = ring_azimuths(n);
+        let j = 155; // 38.75 km, mid-band, where the reference was hovered
+        const AMP: f64 = 5.0;
+
+        // Per radial outward from the centre, as hovered. `None` is a class
+        // the reference reports under [`SIGNIFICANT`], where this module's
+        // coherence floor may drop the bin instead — invisible either way.
+        type Profile = [Option<f64>; 6];
+        /// An asymmetric couplet's two sides are two profiles: the weak pole
+        /// is a shorter step, and the reference reads each side accordingly.
+        type Sides = (f64, [Option<f64>; 5], [Option<f64>; 5]);
+        const SYMMETRIC: [(usize, Profile); 5] = [
+            (
+                2,
+                [
+                    Some(0.30),
+                    Some(0.14),
+                    Some(-0.18),
+                    Some(-0.26),
+                    None,
+                    Some(0.06),
+                ],
+            ),
+            (
+                3,
+                [
+                    Some(0.49),
+                    Some(0.14),
+                    Some(-0.18),
+                    Some(-0.34),
+                    Some(-0.14),
+                    None,
+                ],
+            ),
+            (
+                4,
+                [
+                    Some(0.53),
+                    Some(0.30),
+                    Some(-0.10),
+                    Some(-0.34),
+                    Some(-0.22),
+                    Some(-0.14),
+                ],
+            ),
+            (
+                5,
+                [
+                    Some(0.45),
+                    Some(0.38),
+                    None,
+                    Some(-0.26),
+                    Some(-0.22),
+                    Some(-0.22),
+                ],
+            ),
+            (
+                6,
+                [
+                    Some(0.45),
+                    Some(0.30),
+                    Some(0.14),
+                    Some(-0.14),
+                    Some(-0.14),
+                    Some(-0.22),
+                ],
+            ),
+        ];
+        // (weak-pole ratio, strong side outward, weak side outward)
+        const ASYMMETRIC: [Sides; 2] = [
+            (
+                2.0 / 3.0,
+                [
+                    Some(0.42),
+                    Some(0.10),
+                    Some(-0.18),
+                    Some(-0.34),
+                    Some(-0.14),
+                ],
+                [
+                    Some(0.42),
+                    Some(0.14),
+                    Some(-0.10),
+                    Some(-0.26),
+                    Some(-0.10),
+                ],
+            ),
+            (
+                1.0 / 3.0,
+                [Some(0.30), None, Some(-0.18), Some(-0.30), Some(-0.14)],
+                [Some(0.34), Some(0.14), None, Some(-0.14), None],
+            ),
+        ];
+
+        // A couplet of `w` radials a pole, its first positive radial at
+        // `first_plus`; everything else is the zero background the reference
+        // reads ND over.
+        let paint = |w: usize, first_plus: usize, ratio: f64| -> Vec<Vec<f64>> {
+            (0..n)
+                .map(|i| {
+                    let d = i as i64 - first_plus as i64;
+                    let v = if (0..w as i64).contains(&d) {
+                        AMP
+                    } else if (-(w as i64)..0).contains(&d) {
+                        -ratio * AMP
+                    } else {
+                        0.0
+                    };
+                    vec![v; gates]
+                })
+                .collect()
+        };
+        let agrees = |got: f64, want: Option<f64>| match want {
+            Some(w) => (got - w).abs() < 0.04 || (got.is_nan() && w.abs() < SIGNIFICANT),
+            None => got.is_nan() || got.abs() < SIGNIFICANT,
+        };
+
+        for (w, profile) in SYMMETRIC {
+            // Even and odd `first_plus`: the couplet's centre falls between a
+            // whole-degree pair and inside one.
+            let mut both = Vec::new();
+            for first_plus in [100usize, 141] {
+                let grid = paint(w, first_plus, 1.0);
+                let nrot = llsd_nrot(&sweep(&grid, &azimuths, gates), &grid);
+                let mut read = Vec::new();
+                for (m, want) in profile.iter().enumerate() {
+                    for radial in [first_plus + m, first_plus - 1 - m] {
+                        let got = nrot[radial][j];
+                        assert!(
+                            agrees(got, *want),
+                            "width {w} at {first_plus}: radial {radial} read \
+                             {got:.3}, the reference {want:?}",
+                        );
+                        read.push(got);
+                    }
+                }
+                both.push(read);
+            }
+            for (k, (a, b)) in both[0].iter().zip(&both[1]).enumerate() {
+                assert!(
+                    a == b || (a.is_nan() && b.is_nan()),
+                    "width {w} radial {k}: one parity read {a}, the other {b}",
+                );
+            }
+        }
+
+        for (ratio, strong, weak) in ASYMMETRIC {
+            for first_plus in [100usize, 141] {
+                let grid = paint(3, first_plus, ratio);
+                let nrot = llsd_nrot(&sweep(&grid, &azimuths, gates), &grid);
+                for (m, want) in strong.iter().enumerate() {
+                    let got = nrot[first_plus + m][j];
+                    assert!(
+                        agrees(got, *want),
+                        "ratio {ratio:.2} at {first_plus}: strong side +{m} read \
+                         {got:.3}, the reference {want:?}",
+                    );
+                }
+                for (m, want) in weak.iter().enumerate() {
+                    let got = nrot[first_plus - 1 - m][j];
+                    assert!(
+                        agrees(got, *want),
+                        "ratio {ratio:.2} at {first_plus}: weak side {m} out read \
+                         {got:.3}, the reference {want:?}",
+                    );
+                }
             }
         }
     }
