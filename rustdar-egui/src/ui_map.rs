@@ -712,14 +712,33 @@ impl super::Gui {
                             // retired the one-frame staleness the borrowed
                             // source had, and the `request_repaint` that used
                             // to paper over its discontinuities.
+                            //
+                            // Cloned rather than borrowed: `record_pane_content`
+                            // above and the probe below both want `&mut self`,
+                            // and an `Arc` clone is a refcount bump against a
+                            // borrow that would otherwise have to span the whole
+                            // arm. Read here rather than after the strip because
+                            // the strip's framing needs it — a pane with no
+                            // picked region resamples the volume's own reach,
+                            // and the grid is the only thing that knows how wide
+                            // that came out.
+                            let painter = self.volume_painter().cloned();
+                            let floor_frame = floor_frame_for(
+                                &pane,
+                                pane_idx,
+                                painter.as_deref(),
+                                center,
+                                floor_strips.get(pane_idx).copied().flatten(),
+                                &map_memory,
+                            );
                             let source_geo = self.draw_floor_strip(
                                 &ctx,
                                 pane_idx,
                                 floor_strips.get(pane_idx).copied().flatten(),
                                 FloorStripCtx {
                                     pane: &mut pane,
-                                    map_memory: &mut map_memory,
-                                    center,
+                                    map_memory: floor_frame.memory,
+                                    center: floor_frame.centre,
                                     tiles: tiles_owned.as_mut(),
                                     label_tiles: &mut label_tiles,
                                     tile_zoom_bias: tile_zoom_biases
@@ -734,13 +753,7 @@ impl super::Gui {
                                     actions: &mut actions,
                                 },
                             );
-                            // Cloned rather than borrowed: `record_pane_content`
-                            // above and the probe below both want `&mut self`,
-                            // and an `Arc` clone is a refcount bump against a
-                            // borrow that would otherwise have to span the whole
-                            // arm.
-                            let painter = self.volume_painter().cloned();
-                            // Read here, beside the painter, and for the same
+                            // Read beside the painter above, and for the same
                             // reason: both want `&self` across a body that also
                             // wants `&mut self`, and both are cheap to copy out.
                             let current_stamp = self.current_volume_for(&pane.site);
@@ -1450,6 +1463,11 @@ impl super::Gui {
         use walkers::Map;
 
         let (strip, tiles) = (strip?, tiles?);
+        // `Map::new` wants `&mut`, and this is the only thing that will ever
+        // hold one: the framing is recomputed from the box every frame, so
+        // whatever the map writes back into it is discarded here.
+        let mut map_memory = map_memory;
+        let map_memory = &mut map_memory;
 
         // Its own layer, at `Background` order, keyed by pane: the strip has
         // to be a sibling of the pane's chrome rather than a child of it,
@@ -1618,7 +1636,17 @@ impl super::Gui {
 /// strip is handed the *same* pane state the volume is about to be drawn from.
 struct FloorStripCtx<'a> {
     pane: &'a mut crate::pane::PaneState,
-    map_memory: &'a mut walkers::MapMemory,
+    /// The viewport the strip is drawn through, **owned**.
+    ///
+    /// Not the pane's own `MapMemory`. The strip's job is to be the ground under
+    /// the box, so it is framed on the box ([`floor_frame_for`]); the pane's
+    /// memory belongs to its plan view and is the user's to aim. Owned rather
+    /// than borrowed so that "the strip cannot write the pane's viewport" is
+    /// structural instead of a rule somebody has to keep.
+    map_memory: walkers::MapMemory,
+    /// What the strip is centred on: the box's centre, which is the region's for
+    /// a picked one and the **site** otherwise — the point `build_voxels`
+    /// centres an unstated box on.
     center: walkers::Position,
     /// `None` when the frame has no tile source at all, which is the one way
     /// the floor can be missing that is not about the pane.
@@ -1647,6 +1675,88 @@ struct FloorStripCtx<'a> {
 /// auto-ids — so every widget the real content adds later would be keyed one
 /// step along from where it will finally sit, and the empty state going away
 /// would re-key all of them.
+/// Where a 3D pane's floor strip is centred and how far it is zoomed out.
+struct FloorFrame {
+    centre: walkers::Position,
+    memory: walkers::MapMemory,
+}
+
+/// Frame the floor strip on the box the pane resamples.
+///
+/// The floor is a real map drawn off screen and sampled by the raymarch as the
+/// ground under the box, and the shader clips it twice: `floor_hit` to the box's
+/// own bottom face, `floor_colour` to the mirror's `0..1` — **transparent**
+/// outside rather than clamped, because off the mirror is ground the strip is
+/// not showing and has no colour to report. Those two rectangles must be the
+/// same one, or the volume stands on nothing past whichever is smaller.
+///
+/// They used to be the same by construction, because the box was derived from
+/// this very viewport. The region is stored now, so the implication runs the
+/// other way and this is where it is applied.
+///
+/// # Where the box comes from, and why the grid is asked
+///
+/// A picked region states its own centre and extent. An unpicked one — the
+/// ordinary case — is the volume's *reach*, which is a fact about a scan that
+/// this crate never sees: `build_voxels` resolves it through
+/// `rustdar_radar::voxel::box_half_width_km` and centres it on the site. So the
+/// grid is asked, through the same `VolumePainter::box_size_km` the pan and the
+/// caption already read, keyed on `rendered_for` because it is the box the
+/// picture on screen was actually built over.
+///
+/// # What happens before the first grid
+///
+/// The pane's own map memory, unchanged — which is exactly what the strip was
+/// always drawn through. There is no picture to stand on it yet: such a pane is
+/// painting its empty state, and inventing a width for it would mean choosing
+/// between a stand-in that is wrong and a floor that is missing.
+fn floor_frame_for(
+    pane: &crate::pane::PaneState,
+    pane_idx: usize,
+    painter: Option<&dyn crate::volume_view::VolumePainter>,
+    site: walkers::Position,
+    strip: Option<egui::Rect>,
+    pane_memory: &walkers::MapMemory,
+) -> FloorFrame {
+    let fallback = || FloorFrame {
+        centre: site,
+        memory: pane_memory.clone(),
+    };
+    let Some(volume) = pane.volume() else {
+        return fallback();
+    };
+    let (centre, half) = match volume.region {
+        Some(region) => (
+            walkers::Position::new(region.centre().lon, region.centre().lat),
+            region.half_extent_km(),
+        ),
+        // No pick: the volume's own reach, centred on the site, and only the
+        // grid can say how wide that came out.
+        None => {
+            let Some(built) = volume
+                .rendered_for
+                .as_ref()
+                .zip(painter)
+                .and_then(|(target, painter)| painter.box_size_km(pane_idx, target))
+            else {
+                return fallback();
+            };
+            (
+                site,
+                rustdar_radar::voxel::HalfExtentKm {
+                    east_km: 0.5 * f64::from(built[0]),
+                    north_km: 0.5 * f64::from(built[1]),
+                },
+            )
+        }
+    };
+    let framed = strip.and_then(|strip| crate::ui_region::viewport_for_region(strip, centre, half));
+    match framed {
+        Some(memory) => FloorFrame { centre, memory },
+        None => fallback(),
+    }
+}
+
 /// Degrees of yaw per point of horizontal drag.
 ///
 /// Sized so that a drag across a 900-point pane turns the box most of the way

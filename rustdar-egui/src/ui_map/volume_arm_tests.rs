@@ -825,6 +825,65 @@ fn zooming_moves_the_eye_and_leaves_the_box_exactly_where_it_was() {
     );
 }
 
+/// **The user's own acceptance test, read off the pane's own caption.**
+///
+/// The defect was reported with two screenshots of one session, and what made
+/// them a bug report rather than an impression was the caption: `802 x 490 km
+/// box - 3.13 x 1.91 km/cell` as opened, `668 x 408 km box - 2.61 x 1.59
+/// km/cell` after a zoom. So the caption is what this reads, through
+/// `volume_caption` and the painter and the real text the pane puts on screen —
+/// not the field behind it, which is what a test asserting `region` alone
+/// checks. A caption that disagreed with the box would be its own defect, and
+/// it is the one the user would see.
+///
+/// The box figure must be **character-for-character identical** before and
+/// after. Anything else is the reported bug, whatever the numbers happen to be.
+#[test]
+fn the_captions_box_figure_is_identical_before_and_after_a_zoom() {
+    let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
+    let rect = h.pane_rects()[1];
+    pick_region(&mut h, 1, picked_region(120.0, 75.0));
+    h.frames_for(4, FRAME_DT);
+
+    // The caption's box line, as painted into the pane. The caption is one
+    // multi-line block, so the line is picked out of it rather than out of the
+    // list of painted strings.
+    let box_line = |h: &InputHarness| {
+        h.painted_text_strings_in(rect)
+            .iter()
+            .flat_map(|block| block.lines())
+            .find(|line| line.contains("km box"))
+            .map(str::to_owned)
+            .expect("a painting 3D pane must caption the box it drew")
+    };
+
+    let before = box_line(&h);
+    assert!(
+        before.starts_with("240 × 150 km box"),
+        "precondition: a 120 × 75 km half-extent is a 240 × 150 km box, and the \
+         caption must be stating this pane's own box rather than a stand-in: \
+         {before}",
+    );
+
+    for _ in 0..6 {
+        h.scroll_at(rect.center(), egui::vec2(0.0, 200.0));
+        h.frames_for(2, FRAME_DT);
+    }
+
+    assert_eq!(
+        standoff(&mut h, 1),
+        crate::pane::MIN_EYE_DISTANCE,
+        "precondition: six notches must have driven the eye all the way to its \
+         stop, or an identical caption could mean the gesture does nothing",
+    );
+    assert_eq!(
+        before,
+        box_line(&h),
+        "the caption's box figure changed across a zoom - this is the defect \
+         exactly as reported, and the two strings are the two screenshots",
+    );
+}
+
 /// The other half of the same rule: an **unpicked** pane's box does not move
 /// either, and the thing that must not move is the one the resampler keys on.
 ///

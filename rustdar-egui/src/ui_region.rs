@@ -1,4 +1,10 @@
-//! A 3D pane's zoom gesture, which moves the **eye** and nothing else.
+//! What a 3D pane's stored region implies: the viewport its floor is drawn
+//! through, and the zoom gesture that must not touch either.
+//!
+//! Both halves run **from** the region rather than towards it, and that is the
+//! whole of what this module is now. [`viewport_for_region`] frames the floor
+//! strip on the box; [`zoom_camera`] spends the wheel on the eye. Nothing here
+//! writes a region.
 //!
 //! # The region is stored, and this module does not write it
 //!
@@ -163,6 +169,184 @@ fn dolly_for_step(step: f64) -> f32 {
     } else {
         1.0
     }
+}
+
+/// How many passes [`viewport_for_region`] gets to settle.
+///
+/// The east–west lane converges in **one**: walkers' points per degree of
+/// longitude is exactly `tile_size · 2^zoom / 360`, so the ratio of what is
+/// covered to what is wanted is exactly a power of two away and the logarithm
+/// lands on it. The north–south lane does not, because Web Mercator's scale
+/// varies with latitude and the latitudes of the rect's own top and bottom edges
+/// move as the zoom does — so the second pass measures a projection the first
+/// pass changed.
+///
+/// Measured on the worst shape this application can make — a 920 km box in a
+/// 450 × 900 point strip at 64.8°N, where Mercator bends most between a rect's
+/// centre and its poleward edge — the shortfall runs **1.00098, 1.0000019,
+/// 1.0000000038**. So pass two is already inside [`COVERAGE_MARGIN`] and the
+/// loop stops there; four is that with two passes to spare, for a latitude or a
+/// pane shape nobody has thought of.
+const MAX_FRAMING_PASSES: usize = 4;
+
+/// How much more than the box the framing deliberately covers, as a fraction of
+/// it.
+///
+/// **Not slack, and not a fudge — it is the direction the solve is wrong in.**
+/// The single-logarithm step is exact for the east–west lane and asymptotic for
+/// the north–south one, and measurement says it approaches from *above*: at
+/// 64.8°N in a 450 × 900 point strip the shortfall runs 1.00098, 1.0000019,
+/// 1.0000000038 — never crossing 1.0, so a solve aimed at exact coverage lands
+/// fractionally **short** on every pass it will ever take. Short is the one
+/// failure this function exists to prevent: `floor_colour` answers transparent
+/// off the mirror, so a hairline short is a hairline of the volume standing on
+/// nothing, right where the box's edge is.
+///
+/// So the target is the box plus this, and the loop converges onto a viewport
+/// that covers it. 0.1% of a 920 km box is 920 m — under a third of one cell at
+/// the shipped grid's 3.6 km — which is the price of never being short.
+const COVERAGE_MARGIN: f64 = 0.001;
+
+/// A map viewport that frames `rect` on the box of `half` about `centre` —
+/// **the inverse of the measurement this module used to make**.
+///
+/// The floor strip is a real `walkers::Map` drawn off screen, and the volume
+/// shader samples it as the ground under the box. So the strip has to be showing
+/// the box: `floor_hit` clips the floor to the box's own bottom face, and
+/// `floor_colour` clips it again to the mirror's `0..1`, transparent outside
+/// rather than clamped. Those two rectangles used to be the same one because the
+/// box *was* the viewport. Now the box is stored, so the viewport is derived —
+/// the same coupling, with the causality the user asked for:
+///
+/// > the "stage"/"floor" should never get smaller (in real-world geography
+/// > terms) / nor the data above it ofc
+///
+/// # Why the whole box, rather than the part of it on screen
+///
+/// **Because "the part on screen" is not expressible here.** `floor_colour` maps
+/// the box's own unit square through `floor_geo` and `box_size_km` and samples
+/// the mirror with the result; nothing in the uniform says where the camera is.
+/// Sizing the mirror to the visible part would mean putting the camera in it and
+/// re-rendering the strip on every frame the eye moved — a mirror re-render per
+/// gesture frame, to save ground that costs nothing to carry.
+///
+/// And at the standoffs a pane is usually at there would be nothing to save. The
+/// far edge of the frustum meets the ground this many box **half-widths** past
+/// the box's centre — a ratio that depends only on the standoff and the pitch,
+/// not on how big the box is:
+///
+/// | `eye_distance` | pitch 25° (default) | 45° | 89° (`MAX_PITCH_DEG`) |
+/// |---|---|---|---|
+/// | 0.05 (`MIN_EYE_DISTANCE`) | 0.28 | 0.06 | 0.03 |
+/// | 1.94276 (a pane opens here) | 10.78 | 2.22 | 1.01 |
+/// | 8.0 (`MAX_EYE_DISTANCE`) | 44.40 | 9.16 | 4.14 |
+///
+/// Below 20° — half the 40° vertical field of view — the ray never meets the
+/// ground at all and the entry is unbounded.
+///
+/// So the box's edge *is* off screen at the tight end, and that is new: the zoom
+/// gesture now moves the eye, where it used to shrink the box. It changes
+/// nothing here. The mirror is sampled in box space whatever the camera is
+/// doing, so a strip that covers less than the box is a strip with transparent
+/// ground in it, waiting for the first orbit or dolly that brings that part of
+/// the box into frame.
+///
+/// # Why it is measured rather than computed from the zoom
+///
+/// `walkers::Projector` is the projection the strip is actually drawn in, and
+/// going through it rather than restating `tile_size · 2^zoom / 360` is what
+/// keeps the two the same: a tile size or zoom convention that moves in
+/// `walkers` moves both together. The passes are what that costs, and
+/// [`MAX_FRAMING_PASSES`] measures it.
+///
+/// The result is deliberately *tight* — it stops as soon as the strip covers the
+/// box rather than leaving it wide — because the mirror is a fixed number of
+/// pixels, so every kilometre of ground outside the box is floor resolution
+/// spent on ground the box will clip away.
+///
+/// `None` for a rect with no area, an extent that is not finite and positive, or
+/// a zoom outside `walkers`' own range. The caller falls back to the pane's own
+/// map memory, which is what the strip was always drawn through.
+pub(crate) fn viewport_for_region(
+    rect: egui::Rect,
+    centre: walkers::Position,
+    half: rustdar_radar::voxel::HalfExtentKm,
+) -> Option<walkers::MapMemory> {
+    if !(rect.width() > 0.0 && rect.height() > 0.0) {
+        return None;
+    }
+    if !(half.is_finite() && half.east_km > 0.0 && half.north_km > 0.0) {
+        return None;
+    }
+
+    // The box plus the margin: what the strip is actually solved onto. See
+    // `COVERAGE_MARGIN` — the solve approaches from above, so aiming at the box
+    // itself lands short of it every time.
+    let want = rustdar_radar::voxel::HalfExtentKm {
+        east_km: half.east_km * (1.0 + COVERAGE_MARGIN),
+        north_km: half.north_km * (1.0 + COVERAGE_MARGIN),
+    };
+
+    let mut memory = walkers::MapMemory::default();
+    for _ in 0..MAX_FRAMING_PASSES {
+        let covered = ground_half_extent(rect, &memory, centre)?;
+        // How much wider the target is than what the strip currently shows, on
+        // whichever axis is the binding one. Above 1.0 the strip is short.
+        let shortfall = (want.east_km / covered.east_km).max(want.north_km / covered.north_km);
+        if !shortfall.is_finite() || shortfall <= 0.0 {
+            return None;
+        }
+        // Settled once the strip covers the **box** — the margin is what is
+        // being converged through, not what has to be reached exactly.
+        if shortfall <= 1.0 {
+            return Some(memory);
+        }
+        // Ground per point halves with every zoom level, so the zoom that
+        // covers the target is one logarithm away rather than a search.
+        memory.set_zoom(memory.zoom() - shortfall.log2()).ok()?;
+    }
+    // Out of passes, and by construction still inside the margin rather than
+    // short of the box: every pass moves outward and the first one already
+    // clears the box itself. Answered rather than refused, because the
+    // alternative is the pane's own map memory, which is not framed on the box
+    // at all.
+    Some(memory)
+}
+
+/// The ground `rect` covers either side of `centre`, kilometres on each
+/// horizontal axis, through the projection the strip is drawn in.
+///
+/// **Each axis takes the nearer of its own two edges.** Mercator makes the
+/// poleward edge the near one, so the north–south lane is governed by the top
+/// edge in the northern hemisphere and the bottom in the southern — and the
+/// near edge is the binding one for *coverage*, because a box that reaches past
+/// it is a box with a transparent strip along that side.
+///
+/// [`rustdar_radar::beam::site_bearing_range_km`] rather than a flat
+/// approximation, because it is the codebase's real geodesy and the same
+/// function the resampler places the box's own corners with.
+fn ground_half_extent(
+    rect: egui::Rect,
+    map_memory: &walkers::MapMemory,
+    centre: walkers::Position,
+) -> Option<rustdar_radar::voxel::HalfExtentKm> {
+    let projector = walkers::Projector::new(rect, map_memory, centre);
+    let ground_km = |pos: egui::Pos2| {
+        let point = projector.unproject(pos.to_vec2());
+        let (_, range_km) = rustdar_radar::beam::site_bearing_range_km(
+            centre.y(),
+            centre.x(),
+            point.y(),
+            point.x(),
+        );
+        (range_km.is_finite() && range_km > 0.0).then_some(range_km)
+    };
+    Some(rustdar_radar::voxel::HalfExtentKm {
+        east_km: ground_km(egui::pos2(rect.left(), rect.center().y))?
+            .min(ground_km(egui::pos2(rect.right(), rect.center().y))?),
+        north_km: ground_km(egui::pos2(rect.center().x, rect.top()))?
+            .min(ground_km(egui::pos2(rect.center().x, rect.bottom()))?),
+    })
 }
 
 /// Whether the pointer is over the map rather than over floating chrome.
