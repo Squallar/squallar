@@ -2781,18 +2781,32 @@ fn a_position_a_volume_taught_survives_a_restart() {
 /// [`a_run_with_no_config_store_still_applies_the_volumes_own_position`]: a fix
 /// displaces the row it lands on for the whole process, so this test moves
 /// `KMQT` for every test that runs after it. It must stay an identifier no
-/// other test in the workspace names.
+/// other test in the workspace names, and it is placed here rather than by
+/// [`crate::test_sites`] for that reason — the binary carries no radars, so
+/// the row this starts from has to come from somewhere, and a shared fixture
+/// would be a row other tests could read after this one had moved it.
 #[test]
 fn a_taught_position_moves_the_maps_marker_and_not_only_the_data() {
     use rustdar_radar::site_position::SitePositionSource;
 
     const SITE: &str = "KMQT";
     let store = std::rc::Rc::new(MemoryConfigStore::default());
+    // Marquette, Michigan, at the position and heights its own volume reports —
+    // the row this test starts from, because nothing is compiled in.
+    rustdar_radar::sites::resolve([(
+        SITE,
+        rustdar_radar::sites::SiteFix::Learned(rustdar_radar::site_position::SitePosition {
+            lat_udeg: 46_531_110,
+            lon_udeg: -87_548_330,
+            site_height_m: 430,
+            tower_height_m: 20,
+        }),
+    )]);
     // Copied out rather than borrowed: `sites::resolve` below displaces the row
     // this names, and a `&'static RadarSite` held across it goes on describing
     // where the radar was *believed* to be — which is the very thing under test.
     let (seeded_lat, seeded_lon) = {
-        let row = rustdar_radar::sites::get_radar_site(SITE).expect("a seeded row");
+        let row = rustdar_radar::sites::get_radar_site(SITE).expect("this test placed it");
         (row.lat, row.lon)
     };
     // A quarter of a degree, in the direction a re-survey would move: far past
@@ -2826,7 +2840,7 @@ fn a_taught_position_moves_the_maps_marker_and_not_only_the_data() {
     );
     assert_ne!(
         row.lat, seeded_lat,
-        "the seeded row is still standing, so nothing above was tested",
+        "the row this test placed is still standing, so nothing above was tested",
     );
     // The walk both marker consumers really do, rather than the `get` above.
     assert!(
@@ -2865,6 +2879,76 @@ fn a_taught_position_moves_the_maps_marker_and_not_only_the_data() {
         settled,
         "a volume restating what is already known re-rasterized every site icon",
     );
+
+/// **A volume decoded this session gives its radar an MSL datum this session.**
+///
+/// The hole the compiled-in table used to cover, and the reason
+/// `scan_info_learning_position` resolves as well as persists.
+///
+/// `eet::radar_height_ft_near` is what the cross-section's `base_km_msl`, the
+/// voxel grid's datum, hail's ARL and HCA all anchor on, and it searches the
+/// **table** at coordinates that came from the volume. While the binary
+/// carried a row for every radar it always found one. It does not any more, so
+/// on a first run — before any catalogue has landed and before anything was
+/// learned in an earlier session — the table has no row for the radar being
+/// rendered, the lookup answers `None`, and `render_site_height_ft` falls back
+/// to `0.0`.
+///
+/// Zero is not a visible failure. It is sea level, which is a perfectly
+/// plausible reading for a coastal site, and it was 292 ft of silent error at
+/// KLWX when six rows shipped without an elevation. This is the same defect
+/// with the same shape at the scale of the whole network, and this test is
+/// what stands between the two.
+///
+/// Fails on revert: drop the `sites::resolve` from
+/// `scan_info_learning_position` and the lookup below answers `None`.
+#[test]
+fn a_volume_this_session_decoded_gives_its_radar_a_height_this_session() {
+    use rustdar_radar::sites::Datum;
+
+    // An identifier nothing else in this workspace names, at a position 5000
+    // km from any other fixture, so "the lookup found this radar" cannot be
+    // confused with "the lookup found a neighbour".
+    const SITE: &str = "ZZQE";
+    const LAT: f32 = -30.0;
+    const LON: f32 = -140.0;
+
+    assert!(
+        rustdar_radar::sites::get_radar_site(SITE).is_none(),
+        "precondition: nothing may have placed {SITE}",
+    );
+    assert_eq!(
+        rustdar_radar::eet::radar_height_ft_near(f64::from(LAT), f64::from(LON), Datum::Feedhorn),
+        None,
+        "precondition: no radar is anywhere near here yet",
+    );
+
+    let at = chrono::NaiveDate::from_ymd_opt(2026, 8, 11)
+        .unwrap()
+        .and_hms_opt(2, 15, 0)
+        .unwrap();
+    let mut app = headless(TestBridge::desktop());
+    let info = app.scan_info_learning_position(&scan_stating(LAT, LON), SITE, at);
+    assert_eq!(
+        info.site_source,
+        rustdar_radar::site_position::SitePositionSource::Volume,
+        "precondition: the volume states its own position",
+    );
+
+    // 370 m of ground under 20 m of tower, in feet: the figure every beam
+    // height in this session is now measured above.
+    let want = f64::from(
+        rustdar_radar::sites::get_radar_site(SITE)
+            .expect("the volume placed it in the live table")
+            .height_ft(Datum::Feedhorn)
+            .expect("a learned row records both datums"),
+    );
+    assert_eq!(
+        rustdar_radar::eet::radar_height_ft_near(f64::from(LAT), f64::from(LON), Datum::Feedhorn),
+        Some(want),
+        "the render path anchors on sea level for the radar it is drawing",
+    );
+    assert!(want > 1000.0, "and it is a real elevation, not zero: {want} ft");
 }
 
 /// With nowhere to write, the app still works and simply forgets.

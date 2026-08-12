@@ -3965,6 +3965,12 @@ mod frame_order_tests;
 #[cfg(test)]
 mod level3_poll_tests;
 
+/// The launch that has never seen a radar: what a first catalogue does, and
+/// what every later one must not.
+#[path = "app_render/first_launch_tests.rs"]
+#[cfg(test)]
+mod first_launch_tests;
+
 #[path = "app_render/loop_dispatch_tests.rs"]
 #[cfg(test)]
 mod loop_dispatch_tests;
