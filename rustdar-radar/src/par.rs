@@ -95,4 +95,30 @@ mod seq {
             self.chunks_mut(n)
         }
     }
+
+    /// Stands in for `rayon::iter::ParallelIterator::for_each_init`.
+    ///
+    /// The point of the rayon entry point is that `init` runs once per job the
+    /// pool splits off rather than once per item, so a consumer can hold
+    /// per-row scratch without allocating per row. One thread is one job, so
+    /// the sequential arm is one `init` for the whole walk — the same
+    /// guarantee at its limit, and strictly the cheapest end of it.
+    ///
+    /// `Fn` on the operator rather than `FnMut`, matching rayon: the mutation
+    /// a caller wants goes through `&mut T`, and requiring the weaker bound
+    /// here would let a wasm-only closure compile that the native arm rejects.
+    pub trait ForEachInitFallback: Iterator + Sized {
+        fn for_each_init<T, INIT, OP>(self, init: INIT, op: OP)
+        where
+            INIT: Fn() -> T,
+            OP: Fn(&mut T, Self::Item),
+        {
+            let mut state = init();
+            for item in self {
+                op(&mut state, item);
+            }
+        }
+    }
+
+    impl<I: Iterator> ForEachInitFallback for I {}
 }

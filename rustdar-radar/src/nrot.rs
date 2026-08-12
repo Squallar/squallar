@@ -402,8 +402,8 @@ pub fn compute_nrot_grid_with_profile(
     elevation_deg: f64,
     profile: Option<&WindProfile>,
 ) -> Vec<Vec<f64>> {
-    let (dealiased, med, refused) = preprocess_velocity_with(sweep, elevation_deg, profile);
-    let mut grid = llsd_nrot(sweep, &dealiased, &med, refused.as_deref());
+    let pre = preprocess_velocity_with(sweep, elevation_deg, profile);
+    let mut grid = llsd_nrot(sweep, &pre.dealiased, &pre.median, pre.refused.as_deref());
     despeckle_nrot(
         &mut grid,
         DESPECKLE_MIN_BINS,
@@ -472,15 +472,25 @@ fn despeckle_nrot(grid: &mut [Vec<f64>], min_bins: usize, rows: crate::azimuth::
     }
 }
 
-/// The dealiased field, the median-filtered field the stencils read, and the
-/// incoherence mask the dealiasing set aside — [`llsd_nrot`] refuses the same
-/// ground the dealiaser refused, so the mask travels with the grids rather
-/// than being asked for a second time.
+/// Everything step 1 and step 2 produce that [`llsd_nrot`] then reads.
+struct Preprocessed {
+    /// The dealiased field, which the continuity ceiling is measured on.
+    dealiased: Vec<Vec<f64>>,
+    /// The median-filtered field, which the stencils differentiate.
+    median: Vec<Vec<f64>>,
+    /// The incoherence mask the dealiasing set aside, or `None` from a
+    /// dealiasing that produced none — see [`dealias_with_knobs`] for which is
+    /// which, and why the difference matters. It travels with the grids
+    /// because [`llsd_nrot`] refuses exactly the ground the dealiaser refused,
+    /// and asking [`incoherent_velocity`] a second time cannot change it.
+    refused: Option<Vec<bool>>,
+}
+
 fn preprocess_velocity_with(
     sweep: &VelocitySweep,
     elevation_deg: f64,
     profile: Option<&WindProfile>,
-) -> (Vec<Vec<f64>>, Vec<Vec<f64>>, Option<Vec<bool>>) {
+) -> Preprocessed {
     let mut vel: Vec<Vec<f64>> = sweep.vel_grid.to_vec();
     let refused = dealias(
         &mut vel,
@@ -497,7 +507,11 @@ fn preprocess_velocity_with(
         sweep.gate_interval_km,
         sweep_rows(sweep, sweep.vel_grid.len()),
     );
-    (vel, med, refused)
+    Preprocessed {
+        dealiased: vel,
+        median: med,
+        refused,
+    }
 }
 
 /// Wind-profile layer thickness, km.
@@ -2277,6 +2291,9 @@ fn range_texture(
 ) -> Vec<Vec<f64>> {
     let n = grid.len();
     let gc = sweep.gate_count;
+    if gc == 0 {
+        return vec![Vec::new(); n];
+    }
     let dk = ((TEXTURE_STEP_KM / sweep.gate_interval_km).round() as usize).max(1);
     let gh = ((TEXTURE_RANGE_HALF_KM / sweep.gate_interval_km).round() as i32).max(1);
     // Per row, the squared difference at `dk` and its running window sum, so
@@ -2285,34 +2302,46 @@ fn range_texture(
     // held for the length of the azimuthal pass, and a 1832-gate super-res cut
     // has 1.3 M of them. The count never exceeds the window and the sum is a
     // mean of squares, so neither wants the width.
-    let per_row: Vec<(Vec<f32>, Vec<u16>)> = (0..n)
-        .into_par_iter()
-        .map(|i| {
-            let mut d2 = vec![0.0f64; gc];
-            let mut ok = vec![0u32; gc];
-            for j in 0..gc.saturating_sub(dk) {
-                let (a, b) = (grid[i][j], grid[i][j + dk]);
-                if !a.is_nan() && !b.is_nan() {
-                    d2[j] = (b - a).powi(2);
-                    ok[j] = 1;
+    //
+    // Two flat buffers written through `par_chunks_mut` rather than a `Vec` of
+    // per-row pairs collected out of the map: the azimuthal pass holds all of
+    // this at once either way, so the row vectors bought nothing and cost one
+    // allocation each. The prefix sums are scratch — nothing outside the row
+    // reads them — so they are held per *job* through `for_each_init` instead
+    // of per row. `pre[0]`/`pcn[0]` are zero at construction and no row writes
+    // index 0, so a reused pair needs no clearing.
+    let mut sum = vec![0.0f32; n * gc];
+    let mut cnt = vec![0u16; n * gc];
+    sum.par_chunks_mut(gc)
+        .zip(cnt.par_chunks_mut(gc))
+        .enumerate()
+        .for_each_init(
+            || (vec![0.0f64; gc + 1], vec![0u32; gc + 1]),
+            |(pre, pcn), (i, (sum_row, cnt_row))| {
+                // The difference is folded into the prefix sum rather than
+                // laid down in a pass of its own: it is read exactly once,
+                // immediately, in the same order. `d2` and `ok` were two
+                // whole-row allocations to carry a scalar one step.
+                for j in 0..gc {
+                    let (mut d2, mut ok) = (0.0f64, 0u32);
+                    if j + dk < gc {
+                        let (a, b) = (grid[i][j], grid[i][j + dk]);
+                        if !a.is_nan() && !b.is_nan() {
+                            d2 = (b - a).powi(2);
+                            ok = 1;
+                        }
+                    }
+                    pre[j + 1] = pre[j] + d2;
+                    pcn[j + 1] = pcn[j] + ok;
                 }
-            }
-            let mut pre = vec![0.0f64; gc + 1];
-            let mut pcn = vec![0u32; gc + 1];
-            for j in 0..gc {
-                pre[j + 1] = pre[j] + d2[j];
-                pcn[j + 1] = pcn[j] + ok[j];
-            }
-            let (mut sum, mut cnt) = (vec![0.0f32; gc], vec![0u16; gc]);
-            for j in 0..gc {
-                let lo = (j as i32 - gh).max(0) as usize;
-                let hi = ((j as i32 + gh) as usize).min(gc - 1);
-                sum[j] = (pre[hi + 1] - pre[lo]) as f32;
-                cnt[j] = (pcn[hi + 1] - pcn[lo]) as u16;
-            }
-            (sum, cnt)
-        })
-        .collect();
+                for j in 0..gc {
+                    let lo = (j as i32 - gh).max(0) as usize;
+                    let hi = ((j as i32 + gh) as usize).min(gc - 1);
+                    sum_row[j] = (pre[hi + 1] - pre[lo]) as f32;
+                    cnt_row[j] = (pcn[hi + 1] - pcn[lo]) as u16;
+                }
+            },
+        );
     (0..n)
         .into_par_iter()
         .map(|i| {
@@ -2321,8 +2350,8 @@ fn range_texture(
                     let (mut s, mut c) = (0.0f64, 0u32);
                     for da in -TEXTURE_AZ_HALF..=TEXTURE_AZ_HALF {
                         if let Some(ai) = rows.neighbour(i, da) {
-                            s += f64::from(per_row[ai].0[j]);
-                            c += u32::from(per_row[ai].1[j]);
+                            s += f64::from(sum[ai * gc + j]);
+                            c += u32::from(cnt[ai * gc + j]);
                         }
                     }
                     if (c as usize) < TEXTURE_MIN_PAIRS {
@@ -3210,6 +3239,9 @@ fn incoherent_velocity(
     nyquist: f64,
 ) -> Vec<bool> {
     let n = raw.len();
+    if gc == 0 {
+        return Vec::new();
+    }
     let tol = COH_STRADDLE_VNY_FRAC * nyquist;
     let fold = COH_FOLD_VNY_FRAC * nyquist;
     // The same separation [`range_texture`] differences at, and for the same
@@ -3222,59 +3254,73 @@ fn incoherent_velocity(
     // half-span costs nothing beyond the prefix sum however deep it is, which
     // is why ±COH_RANGE_HALF may be 385 gates without the rule getting slower.
     // A window that deep still fits u16: it can hold at most 385 pairs.
-    let per_row: Vec<(Vec<u16>, Vec<u16>)> = (0..n)
-        .into_par_iter()
-        .map(|i| {
-            let mut ps = vec![0u32; gc + 1];
-            let mut pp = vec![0u32; gc + 1];
-            for j in 0..gc {
-                let (mut s, mut p) = (0u32, 0u32);
-                if j + dk < gc {
-                    let (a, b) = (raw[i][j], raw[i][j + dk]);
-                    if !a.is_nan() && !b.is_nan() {
-                        p = 1;
-                        // Above `tol` the pair cannot be read as one continuous
-                        // velocity; above `fold` it cannot be read as anything
-                        // *but* a fold, and a fold is what the dealiaser is for.
-                        let dv = (b - a).abs();
-                        s = u32::from(dv > tol && dv < fold);
-                    }
-                }
-                ps[j + 1] = ps[j] + s;
-                pp[j + 1] = pp[j] + p;
-            }
-            let (mut s, mut p) = (vec![0u16; gc], vec![0u16; gc]);
-            for j in 0..gc {
-                let lo = (j as i32 - COH_RANGE_HALF).max(0) as usize;
-                let hi = ((j as i32 + COH_RANGE_HALF) as usize).min(gc - 1);
-                s[j] = (ps[hi + 1] - ps[lo]) as u16;
-                p[j] = (pp[hi + 1] - pp[lo]) as u16;
-            }
-            (s, p)
-        })
-        .collect();
-    (0..n)
-        .into_par_iter()
-        .flat_map(|i| {
-            (0..gc)
-                .map(|j| {
-                    if raw[i][j].is_nan() {
-                        return false;
-                    }
+    //
+    // Flat, and written in place: the azimuthal pass reads every row of both
+    // counts, so they were always going to be live together, and a row vector
+    // each only added an allocation per radial to say so. The prefix sums are
+    // scratch, so `for_each_init` holds one pair per job the pool splits off
+    // rather than one per row. Index 0 of each is zero at construction and no
+    // row writes it, so a reused pair needs no clearing.
+    let mut straddling = vec![0u16; n * gc];
+    let mut present = vec![0u16; n * gc];
+    straddling
+        .par_chunks_mut(gc)
+        .zip(present.par_chunks_mut(gc))
+        .enumerate()
+        .for_each_init(
+            || (vec![0u32; gc + 1], vec![0u32; gc + 1]),
+            |(ps, pp), (i, (straddling_row, present_row))| {
+                for j in 0..gc {
                     let (mut s, mut p) = (0u32, 0u32);
-                    for da in -COH_AZ_HALF..=COH_AZ_HALF {
-                        // Past the end of a sector's arc there is no row to
-                        // count, exactly as there is no gate past the last.
-                        if let Some(ai) = rows.neighbour(i, da) {
-                            s += u32::from(per_row[ai].0[j]);
-                            p += u32::from(per_row[ai].1[j]);
+                    if j + dk < gc {
+                        let (a, b) = (raw[i][j], raw[i][j + dk]);
+                        if !a.is_nan() && !b.is_nan() {
+                            p = 1;
+                            // Above `tol` the pair cannot be read as one
+                            // continuous velocity; above `fold` it cannot be
+                            // read as anything *but* a fold, and a fold is
+                            // what the dealiaser is for.
+                            let dv = (b - a).abs();
+                            s = u32::from(dv > tol && dv < fold);
                         }
                     }
-                    p > 0 && (s as f64) > COH_MAX_STRADDLE * p as f64
-                })
-                .collect::<Vec<bool>>()
-        })
-        .collect()
+                    ps[j + 1] = ps[j] + s;
+                    pp[j + 1] = pp[j] + p;
+                }
+                for j in 0..gc {
+                    let lo = (j as i32 - COH_RANGE_HALF).max(0) as usize;
+                    let hi = ((j as i32 + COH_RANGE_HALF) as usize).min(gc - 1);
+                    straddling_row[j] = (ps[hi + 1] - ps[lo]) as u16;
+                    present_row[j] = (pp[hi + 1] - pp[lo]) as u16;
+                }
+            },
+        );
+    // The mask is one buffer the rows are written into, rather than a row of
+    // `bool` per radial gathered by `flat_map`: the caller wants it flat, and
+    // building it flat is one allocation instead of `n` plus whatever the
+    // gather costs to concatenate.
+    let mut refused = vec![false; n * gc];
+    refused
+        .par_chunks_mut(gc)
+        .enumerate()
+        .for_each(|(i, refused_row)| {
+            for (j, out) in refused_row.iter_mut().enumerate() {
+                if raw[i][j].is_nan() {
+                    continue;
+                }
+                let (mut s, mut p) = (0u32, 0u32);
+                for da in -COH_AZ_HALF..=COH_AZ_HALF {
+                    // Past the end of a sector's arc there is no row to count,
+                    // exactly as there is no gate past the last.
+                    if let Some(ai) = rows.neighbour(i, da) {
+                        s += u32::from(straddling[ai * gc + j]);
+                        p += u32::from(present[ai * gc + j]);
+                    }
+                }
+                *out = p > 0 && (s as f64) > COH_MAX_STRADDLE * p as f64;
+            }
+        });
+    refused
 }
 
 /// Returns the `n · gc` incoherence mask this dealiasing set aside, so that
@@ -3294,9 +3340,7 @@ pub(crate) fn dealias_with_knobs(
     profile: Option<&WindProfile>,
     knobs: DealiasKnobs,
 ) -> Option<Vec<bool>> {
-    let Some(nyquist) = fold_limit_ms(sweep, vel_grid) else {
-        return None;
-    };
+    let nyquist = fold_limit_ms(sweep, vel_grid)?;
     let interval = 2.0 * nyquist;
     let n = vel_grid.len();
     let gc = sweep.gate_count;
@@ -4844,16 +4888,20 @@ mod tests {
         let (orig, azimuths) = straddle_fixture(360, 400);
         let vg = orig.clone();
         let sweep = straddle_sweep(&vg, &azimuths, 400);
-        let (dealiased, med, refused) = preprocess_velocity_with(&sweep, 0.5, None);
-        let mask = refused.expect("a full sweep with a limit produces a mask");
+        let pre = preprocess_velocity_with(&sweep, 0.5, None);
+        let (dealiased, med) = (&pre.dealiased, &pre.median);
+        let mask = pre
+            .refused
+            .clone()
+            .expect("a full sweep with a limit produces a mask");
         assert!(mask.iter().any(|m| *m), "the fixture must refuse something");
 
-        let reused = llsd_nrot(&sweep, &dealiased, &med, Some(&mask));
-        let recomputed = llsd_nrot(&sweep, &dealiased, &med, None);
+        let reused = llsd_nrot(&sweep, dealiased, med, Some(&mask));
+        let recomputed = llsd_nrot(&sweep, dealiased, med, None);
         assert_eq!(bits(&reused), bits(&recomputed));
 
         let empty = vec![false; orig.len() * 400];
-        let unrefused = llsd_nrot(&sweep, &dealiased, &med, Some(&empty));
+        let unrefused = llsd_nrot(&sweep, dealiased, med, Some(&empty));
         assert!(
             unrefused.iter().flatten().any(|v| !v.is_nan()),
             "the fixture must paint once the refusal is taken away",
@@ -4881,8 +4929,9 @@ mod tests {
         let rows = sweep_rows(&sweep, 7);
         assert!(rows.closed, "the fixture must give the stencils neighbours");
 
-        let (dealiased, med, refused) = preprocess_velocity_with(&sweep, 0.5, None);
-        assert_eq!(refused, None, "seven rows is too few to dealias");
+        let pre = preprocess_velocity_with(&sweep, 0.5, None);
+        let (dealiased, med) = (&pre.dealiased, &pre.median);
+        assert_eq!(pre.refused, None, "seven rows is too few to dealias");
 
         let nyq = fold_limit_ms(&sweep, &grid).expect("a limit");
         let mask = incoherent_velocity(&grid, rows, 400, sweep.gate_interval_km, nyq);
@@ -4892,11 +4941,11 @@ mod tests {
             despeckle_nrot(&mut g, DESPECKLE_MIN_BINS, rows);
             g
         };
-        let want = finish(llsd_nrot(&sweep, &dealiased, &med, Some(&mask)));
+        let want = finish(llsd_nrot(&sweep, dealiased, med, Some(&mask)));
         let unrefused = finish(llsd_nrot(
             &sweep,
-            &dealiased,
-            &med,
+            dealiased,
+            med,
             Some(&vec![false; 7 * 400]),
         ));
         let got = compute_nrot_grid_with_profile(&sweep, 0.5, None);
