@@ -402,8 +402,8 @@ pub fn compute_nrot_grid_with_profile(
     elevation_deg: f64,
     profile: Option<&WindProfile>,
 ) -> Vec<Vec<f64>> {
-    let (dealiased, med) = preprocess_velocity_with(sweep, elevation_deg, profile);
-    let mut grid = llsd_nrot(sweep, &dealiased, &med);
+    let (dealiased, med, refused) = preprocess_velocity_with(sweep, elevation_deg, profile);
+    let mut grid = llsd_nrot(sweep, &dealiased, &med, refused.as_deref());
     despeckle_nrot(
         &mut grid,
         DESPECKLE_MIN_BINS,
@@ -472,13 +472,17 @@ fn despeckle_nrot(grid: &mut [Vec<f64>], min_bins: usize, rows: crate::azimuth::
     }
 }
 
+/// The dealiased field, the median-filtered field the stencils read, and the
+/// incoherence mask the dealiasing set aside — [`llsd_nrot`] refuses the same
+/// ground the dealiaser refused, so the mask travels with the grids rather
+/// than being asked for a second time.
 fn preprocess_velocity_with(
     sweep: &VelocitySweep,
     elevation_deg: f64,
     profile: Option<&WindProfile>,
-) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
+) -> (Vec<Vec<f64>>, Vec<Vec<f64>>, Option<Vec<bool>>) {
     let mut vel: Vec<Vec<f64>> = sweep.vel_grid.to_vec();
-    dealias(
+    let refused = dealias(
         &mut vel,
         sweep,
         elevation_deg,
@@ -493,7 +497,7 @@ fn preprocess_velocity_with(
         sweep.gate_interval_km,
         sweep_rows(sweep, sweep.vel_grid.len()),
     );
-    (vel, med)
+    (vel, med, refused)
 }
 
 /// Wind-profile layer thickness, km.
@@ -2332,10 +2336,15 @@ fn range_texture(
         .collect()
 }
 
+/// `refused` is the incoherence mask [`dealias_with_knobs`] already built for
+/// this sweep, or `None` from a dealiasing that built none. See
+/// [`incoherent_velocity`] for why the two are the same mask, and
+/// [`preprocess_velocity_with`] for how it gets here.
 fn llsd_nrot(
     sweep: &VelocitySweep,
     dealiased: &[Vec<f64>],
     vel_grid: &[Vec<f64>],
+    refused: Option<&[bool]>,
 ) -> Vec<Vec<f64>> {
     let num_radials = vel_grid.len();
     let gc = sweep.gate_count;
@@ -2347,8 +2356,28 @@ fn llsd_nrot(
     let limit = fold_limit_ms(sweep, sweep.vel_grid);
     let texture = range_texture(dealiased, sweep, rows);
     let texture_max = limit.map(|v| GK_MAX_TEXTURE_VNY_FRAC * v);
-    let incoherent =
-        limit.map(|v| incoherent_velocity(sweep.vel_grid, rows, gc, sweep.gate_interval_km, v));
+    // The dealiaser asked this exact question first, of this exact grid: it
+    // set the same ground aside before its first pass ran, from
+    // `sweep.vel_grid`, at this `rows`, this `gate_interval_km` and this
+    // limit. Its answer is reused rather than recomputed.
+    //
+    // `None` is a dealiasing that produced no mask — it returned before
+    // reaching one (no fold limit, or too few rows to propagate across), or
+    // it ran under a profile that does not refuse incoherent velocity at all.
+    // Only the first two can reach here, and in the first the `limit` below is
+    // `None` too, so the fallback is a real computation exactly when the mask
+    // this rule needs does not exist yet.
+    let fallback: Option<Vec<bool>> = match (refused, limit) {
+        (None, Some(v)) => Some(incoherent_velocity(
+            sweep.vel_grid,
+            rows,
+            gc,
+            sweep.gate_interval_km,
+            v,
+        )),
+        _ => None,
+    };
+    let incoherent: Option<&[bool]> = refused.or(fallback.as_deref());
 
     (0..num_radials)
         .into_par_iter()
@@ -2366,7 +2395,7 @@ fn llsd_nrot(
                     // solution: the dealiaser handed that ground back exactly
                     // as the radar reported it, and a rotation computed from
                     // it would be a rotation of the noise.
-                    if incoherent.as_ref().is_some_and(|m| m[i * gc + j]) {
+                    if incoherent.is_some_and(|m| m[i * gc + j]) {
                         return f64::NAN;
                     }
                     // Rotation is only reported over velocity the radar
@@ -2695,6 +2724,11 @@ fn half_turn_rows(rows: crate::azimuth::Rows) -> i32 {
     }
 }
 
+/// Returns what [`dealias_with_knobs`] returns: the incoherence mask this
+/// dealiasing set aside, for the one caller that refuses the same ground
+/// again. A caller that only wants the grid drops it — [`crate::srv`] does,
+/// and under [`DealiasProfile::Coverage`] there is nothing to drop.
+///
 /// **What this hands back does not say which gates it examined**, and the
 /// obvious way to recover that is measured to be useless. A pass either places
 /// a gate on a fold branch, refuses it under
@@ -2729,7 +2763,7 @@ pub(crate) fn dealias(
     elevation_deg: f64,
     profile: Option<&WindProfile>,
     dealias_profile: DealiasProfile,
-) {
+) -> Option<Vec<bool>> {
     dealias_with_knobs(
         vel_grid,
         sweep,
@@ -3235,21 +3269,31 @@ fn incoherent_velocity(
         .collect()
 }
 
+/// Returns the `n · gc` incoherence mask this dealiasing set aside, so that
+/// [`llsd_nrot`] — which refuses exactly the same ground — can read it instead
+/// of asking [`incoherent_velocity`] the same question about the same grid a
+/// second time.
+///
+/// `None` means **no mask was produced**, never "no ground was refused": the
+/// two early returns below reach it before [`incoherent_velocity`] runs, and
+/// [`DealiasKnobs::refuse_incoherent`] off is a posture that refuses nothing
+/// by construction. A caller that needs the mask must compute it itself on
+/// `None`; it must not read the absence as an empty mask.
 pub(crate) fn dealias_with_knobs(
     vel_grid: &mut [Vec<f64>],
     sweep: &VelocitySweep,
     elevation_deg: f64,
     profile: Option<&WindProfile>,
     knobs: DealiasKnobs,
-) {
+) -> Option<Vec<bool>> {
     let Some(nyquist) = fold_limit_ms(sweep, vel_grid) else {
-        return;
+        return None;
     };
     let interval = 2.0 * nyquist;
     let n = vel_grid.len();
     let gc = sweep.gate_count;
     if n < 8 {
-        return;
+        return None;
     }
     // Every pass below propagates a fold decision from one gate to a
     // neighbouring one, so every one of them needs to know where the sweep's
@@ -3796,7 +3840,7 @@ pub(crate) fn dealias_with_knobs(
     // 4-neighbor marks a fold wall no pass could place — kept-raw folded
     // regions meet correctly unfolded ones exactly there.
     if knobs.censor_vny_frac.is_infinite() {
-        return;
+        return knobs.refuse_incoherent.then_some(refused);
     }
     let snapshot: Vec<Vec<f64>> = vel_grid.to_vec();
     let censor_at = knobs.censor_vny_frac * nyquist;
@@ -3839,6 +3883,11 @@ pub(crate) fn dealias_with_knobs(
             }
         }
     }
+    // `refuse_incoherent` off did not compute a mask — it stood in an
+    // all-`false` one so the passes above could read it unconditionally — and
+    // handing that back would tell a caller "nothing is incoherent here" about
+    // a question this dealiasing never asked.
+    knobs.refuse_incoherent.then_some(refused)
 }
 
 #[cfg(test)]
@@ -4637,6 +4686,225 @@ mod tests {
         assert_ne!(grid, orig, "the coverage posture still works the field");
     }
 
+    // ---- the mask is built once and read twice -----------------------------
+
+    /// Every f64 of a grid as the bits it is, so a comparison is exact over
+    /// NaN — which is most of an NROT grid, and exactly the part these tests
+    /// are about.
+    fn bits(grid: &[Vec<f64>]) -> Vec<Vec<u64>> {
+        grid.iter()
+            .map(|row| row.iter().map(|v| v.to_bits()).collect())
+            .collect()
+    }
+
+    /// The fold limit [`STRADDLE_FIXTURE`] declares. Declared rather than
+    /// estimated so the two thresholds the fixture has to sit between are
+    /// fixed numbers and not a property of the noise.
+    const STRADDLE_VNY: f64 = 25.0;
+
+    /// A smooth wind sprinkled with lone gates a whole interval away from it —
+    /// the one fixture on which [`incoherent_velocity`] is the *deciding*
+    /// rule.
+    ///
+    /// [`coherence_fixture`]'s coin toss is refused by the continuity ceiling
+    /// as well, so it cannot show which rule blanked a bin. This one is built
+    /// to sit between the two: one gate in `SPARSE` carries a `+1.00·Vny`
+    /// spike, which puts 2/`SPARSE` ≈ 8.3% of the along-beam pairs inside the
+    /// straddling band — over [`COH_MAX_STRADDLE`]'s 3.9%, so every bin is
+    /// refused — while the rms of the same differences is
+    /// √(0.083)·Vny ≈ 0.29·Vny, under [`GK_MAX_TEXTURE_VNY_FRAC`]'s 0.44, so
+    /// the ceiling admits all of it. Take the refusal away and the sweep
+    /// paints; leave it and the sweep is empty.
+    ///
+    /// The base is a wind and not a constant, because [`tap_stencil`]'s
+    /// coherence gate reads a profile of no azimuthal variance as ND: a flat
+    /// field is blanked by the stencil before either rule is reached, which
+    /// would make the comparison vacuous. Both terms stay well inside the
+    /// declared limit, so nothing in it folds.
+    fn straddle_fixture(n: usize, gates: usize) -> (Vec<Vec<f64>>, Vec<f64>) {
+        const SPARSE: usize = 24;
+        let azimuths = ring_azimuths(n);
+        let grid = (0..n)
+            .map(|i| {
+                let base = 5.0 + 8.0 * azimuths[i].to_radians().cos();
+                (0..gates)
+                    .map(|j| {
+                        if (i * 7 + j * 13) % SPARSE == 0 {
+                            base + STRADDLE_VNY
+                        } else {
+                            base
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        (grid, azimuths)
+    }
+
+    fn straddle_sweep<'a>(
+        grid: &'a [Vec<f64>],
+        azimuths: &'a [f64],
+        gates: usize,
+    ) -> VelocitySweep<'a> {
+        VelocitySweep {
+            vel_grid: grid,
+            azimuths_deg: azimuths,
+            gate_count: gates,
+            first_gate_range_km: 2.125,
+            gate_interval_km: 0.25,
+            declared_nyquist_ms: Some(STRADDLE_VNY),
+        }
+    }
+
+    /// [`dealias_with_knobs`] reports the mask it built, and reports **none**
+    /// wherever it built none.
+    ///
+    /// The distinction is the whole safety of reusing it. An absent mask is
+    /// "this dealiasing never asked the question", which a caller that needs
+    /// the answer must go and compute; an all-`false` mask would be "asked and
+    /// answered nowhere", and reading the first as the second is how a sweep
+    /// silently loses its refusal.
+    #[test]
+    fn the_dealiaser_reports_the_mask_it_built_and_nothing_it_did_not() {
+        let (orig, azimuths, gates) = coherence_fixture(true);
+        let vg = orig.clone();
+        let sweep = sweep_for(&vg, &azimuths, gates);
+        let rows = sweep_rows(&sweep, orig.len());
+        let nyq = fold_limit_ms(&sweep, &orig).expect("a limit");
+        let want = incoherent_velocity(&orig, rows, gates, sweep.gate_interval_km, nyq);
+        assert!(want.iter().any(|m| *m), "the fixture must refuse something");
+
+        let mut grid = orig.clone();
+        let got = dealias(&mut grid, &sweep, 0.5, None, DealiasProfile::NoFalseShear);
+        assert_eq!(
+            got.as_deref(),
+            Some(want.as_slice()),
+            "the mask handed out is the mask the passes ran against",
+        );
+
+        // The posture that refuses nothing produced no mask to hand out.
+        let mut grid = orig.clone();
+        assert_eq!(
+            dealias(&mut grid, &sweep, 0.5, None, DealiasProfile::Coverage),
+            None,
+            "a dealiasing that never asks the question reports no answer",
+        );
+    }
+
+    /// The two early returns report no mask either — and they are the two the
+    /// fallback in [`llsd_nrot`] exists for.
+    #[test]
+    fn a_dealiasing_that_returns_early_reports_no_mask() {
+        // No fold limit: every gate is under `FOLD_LIMIT_FLOOR_MS`, so
+        // `fold_limit_ms` abandons the pass before a mask is reachable.
+        let calm: Vec<Vec<f64>> = vec![vec![1.5; 40]; 360];
+        let calm_az = ring_azimuths(360);
+        let vg = calm.clone();
+        let sweep = sweep_for(&vg, &calm_az, 40);
+        assert_eq!(fold_limit_ms(&sweep, &calm), None);
+        let mut grid = calm.clone();
+        assert_eq!(
+            dealias(&mut grid, &sweep, 0.5, None, DealiasProfile::NoFalseShear),
+            None,
+        );
+
+        // Too few rows to propagate a fold decision across.
+        let (small, small_az) = straddle_fixture(7, 40);
+        let vg = small.clone();
+        let sweep = straddle_sweep(&vg, &small_az, 40);
+        assert!(
+            fold_limit_ms(&sweep, &small).is_some(),
+            "this arm must fail on the row count and not on the limit",
+        );
+        let mut grid = small.clone();
+        assert_eq!(
+            dealias(&mut grid, &sweep, 0.5, None, DealiasProfile::NoFalseShear),
+            None,
+        );
+    }
+
+    /// Handed the dealiaser's mask, [`llsd_nrot`] produces exactly what it
+    /// produces when it computes one itself — and neither is what an empty
+    /// mask produces.
+    ///
+    /// The first equality is the change: the second call was reading the same
+    /// grid, the same rows, the same gate interval and the same limit, so it
+    /// could not have produced a different answer. The inequality is what
+    /// makes the first mean anything.
+    #[test]
+    fn the_reused_mask_and_the_recomputed_one_are_the_same_grid() {
+        let (orig, azimuths) = straddle_fixture(360, 400);
+        let vg = orig.clone();
+        let sweep = straddle_sweep(&vg, &azimuths, 400);
+        let (dealiased, med, refused) = preprocess_velocity_with(&sweep, 0.5, None);
+        let mask = refused.expect("a full sweep with a limit produces a mask");
+        assert!(mask.iter().any(|m| *m), "the fixture must refuse something");
+
+        let reused = llsd_nrot(&sweep, &dealiased, &med, Some(&mask));
+        let recomputed = llsd_nrot(&sweep, &dealiased, &med, None);
+        assert_eq!(bits(&reused), bits(&recomputed));
+
+        let empty = vec![false; orig.len() * 400];
+        let unrefused = llsd_nrot(&sweep, &dealiased, &med, Some(&empty));
+        assert!(
+            unrefused.iter().flatten().any(|v| !v.is_nan()),
+            "the fixture must paint once the refusal is taken away",
+        );
+        assert_ne!(
+            bits(&reused),
+            bits(&unrefused),
+            "an empty mask must not be what an absent one means",
+        );
+    }
+
+    /// End to end on a sweep the dealiaser will not run on: the refusal
+    /// survives.
+    ///
+    /// Seven rows is under the eight [`dealias_with_knobs`] needs, so the
+    /// dealiaser returns before it ever computes a mask and
+    /// [`compute_nrot_grid_with_profile`] has to compute one for itself. Seven
+    /// rows still *close the circle* — 51.4° apart, accounting for all of it —
+    /// so the stencils have their neighbours and there is a grid to compare.
+    #[test]
+    fn a_sweep_too_small_to_dealias_still_refuses_incoherent_velocity() {
+        let (grid, azimuths) = straddle_fixture(7, 400);
+        let vg = grid.clone();
+        let sweep = straddle_sweep(&vg, &azimuths, 400);
+        let rows = sweep_rows(&sweep, 7);
+        assert!(rows.closed, "the fixture must give the stencils neighbours");
+
+        let (dealiased, med, refused) = preprocess_velocity_with(&sweep, 0.5, None);
+        assert_eq!(refused, None, "seven rows is too few to dealias");
+
+        let nyq = fold_limit_ms(&sweep, &grid).expect("a limit");
+        let mask = incoherent_velocity(&grid, rows, 400, sweep.gate_interval_km, nyq);
+        assert!(mask.iter().any(|m| *m), "the fixture must refuse something");
+
+        let finish = |mut g: Vec<Vec<f64>>| {
+            despeckle_nrot(&mut g, DESPECKLE_MIN_BINS, rows);
+            g
+        };
+        let want = finish(llsd_nrot(&sweep, &dealiased, &med, Some(&mask)));
+        let unrefused = finish(llsd_nrot(
+            &sweep,
+            &dealiased,
+            &med,
+            Some(&vec![false; 7 * 400]),
+        ));
+        let got = compute_nrot_grid_with_profile(&sweep, 0.5, None);
+
+        assert!(
+            unrefused.iter().flatten().any(|v| !v.is_nan()),
+            "the fixture must paint once the refusal is taken away",
+        );
+        assert_eq!(bits(&got), bits(&want), "the mask was recomputed, not lost");
+        assert_ne!(
+            bits(&got),
+            bits(&unrefused),
+            "and it refused ground an empty mask would have painted",
+        );
+    }
+
     /// The radial a near-zero gate is confirmed against is the one facing it,
     /// and the seed asks for it at 180° rather than at half the rows.
     ///
@@ -4885,7 +5153,7 @@ mod tests {
             })
             .collect();
         let s = sweep(&grid, &azimuths, gates);
-        let nrot = llsd_nrot(&s, &grid, &grid);
+        let nrot = llsd_nrot(&s, &grid, &grid, None);
 
         // Gate 200 → 50.25 km: inside the super-res operator's domain. Its
         // ramp gain is Σ t·o over the legacy arc, the same on both sides:
@@ -4987,8 +5255,8 @@ mod tests {
         let full: Vec<Vec<f64>> = full_az.iter().map(|&a| row(a)).collect();
         let sector: Vec<Vec<f64>> = sector_az.iter().map(|&a| row(a)).collect();
 
-        let full_nrot = llsd_nrot(&sweep(&full, &full_az, gates), &full, &full);
-        let sector_nrot = llsd_nrot(&sweep(&sector, &sector_az, gates), &sector, &sector);
+        let full_nrot = llsd_nrot(&sweep(&full, &full_az, gates), &full, &full, None);
+        let sector_nrot = llsd_nrot(&sweep(&sector, &sector_az, gates), &sector, &sector, None);
 
         // Rows 20..52 of the sector read only rows 3..69 of it, so their whole
         // support lies inside the arc and is the full rotation's data bin for
@@ -5057,7 +5325,7 @@ mod tests {
                     .collect()
             })
             .collect();
-        let nrot = llsd_nrot(&sweep(&grid, &azimuths, gates), &grid, &grid);
+        let nrot = llsd_nrot(&sweep(&grid, &azimuths, gates), &grid, &grid, None);
 
         let gain: f64 = SPLIT_TAPS.iter().map(|&(o, t)| o as f64 * t).sum();
         for j in 100..300 {
@@ -5122,8 +5390,8 @@ mod tests {
             "a 1.0° sector found a pairing"
         );
 
-        let full_nrot = llsd_nrot(&sweep(&full, &full_az, gates), &full, &full);
-        let sector_nrot = llsd_nrot(&sweep(&sector, &sector_az, gates), &sector, &sector);
+        let full_nrot = llsd_nrot(&sweep(&full, &full_az, gates), &full, &full, None);
+        let sector_nrot = llsd_nrot(&sweep(&sector, &sector_az, gates), &sector, &sector, None);
 
         let legacy_gain: f64 = LEGACY_TAPS.iter().map(|&(o, t)| 2.0 * o as f64 * t).sum();
         let mut carried = 0;
@@ -5224,8 +5492,8 @@ mod tests {
         let coarse_az = ring_azimuths(360);
         let fine: Vec<Vec<f64>> = fine_az.iter().map(|&a| row(a)).collect();
         let coarse: Vec<Vec<f64>> = coarse_az.iter().map(|&a| row(a)).collect();
-        let fine_nrot = llsd_nrot(&sweep(&fine, &fine_az, gates), &fine, &fine);
-        let coarse_nrot = llsd_nrot(&sweep(&coarse, &coarse_az, gates), &coarse, &coarse);
+        let fine_nrot = llsd_nrot(&sweep(&fine, &fine_az, gates), &fine, &fine, None);
+        let coarse_nrot = llsd_nrot(&sweep(&coarse, &coarse_az, gates), &coarse, &coarse, None);
 
         // Each grid reads the gain its own operator carries: the super-res
         // operator's is its Σ t·o over two rows, the legacy grid's is Σ 2·o·t
@@ -5290,6 +5558,7 @@ mod tests {
             &sweep(&quarter, &quarter_az, probe_gates),
             &quarter,
             &quarter,
+            None,
         );
         for j in [100usize, 200] {
             let range_km = 0.25 + j as f64 * 0.25;
@@ -5393,7 +5662,7 @@ mod tests {
         let read = |n: usize, step: f64, roll: usize| -> Vec<f64> {
             let azs: Vec<f64> = (0..n).map(|i| ((i + roll) % n) as f64 * step).collect();
             let grid: Vec<Vec<f64>> = azs.iter().map(|&a| field(a)).collect();
-            let nrot = llsd_nrot(&sweep(&grid, &azs, gates), &grid, &grid);
+            let nrot = llsd_nrot(&sweep(&grid, &azs, gates), &grid, &grid, None);
             (0..n).map(|k| nrot[(k + n - roll) % n][j]).collect()
         };
 
@@ -5496,7 +5765,7 @@ mod tests {
                     .collect()
             })
             .collect();
-        let nrot = llsd_nrot(&sweep(&grid, &azimuths, gates), &grid, &grid);
+        let nrot = llsd_nrot(&sweep(&grid, &azimuths, gates), &grid, &grid, None);
         let j = 154; // 38.75 km, mid-band, where the reference was hovered
         let at = |i: usize| nrot[i][j];
 
@@ -5575,7 +5844,7 @@ mod tests {
             .map(|i| vec![if i % 2 == 0 { 6.0 } else { -6.0 }; gates])
             .collect();
         let s = sweep(&grid, &azimuths, gates);
-        let nrot = llsd_nrot(&s, &grid, &grid);
+        let nrot = llsd_nrot(&s, &grid, &grid, None);
         let strong = nrot
             .iter()
             .flatten()
@@ -5637,7 +5906,7 @@ mod tests {
         let read = |grid: &[Vec<f64>], nyquist: f64| -> f64 {
             let mut s = sweep(grid, &azimuths, gates);
             s.declared_nyquist_ms = Some(nyquist);
-            llsd_nrot(&s, grid, grid)[CORE][j]
+            llsd_nrot(&s, grid, grid, None)[CORE][j]
         };
 
         let ceiling = GK_MAX_TEXTURE_VNY_FRAC * VNY;
@@ -5762,7 +6031,7 @@ mod tests {
                 .map(|i| vec![if azimuths[i] < boundary_az { -8.0 } else { 8.0 }; gates])
                 .collect();
             let s = sweep(&grid, &azimuths, gates);
-            let nrot = llsd_nrot(&s, &grid, &grid);
+            let nrot = llsd_nrot(&s, &grid, &grid, None);
             // 38.5 km, and 95.25 and 175.25 km — both past the range a second
             // operator used to take the bin over at.
             for j in [153usize, 380, 700] {
@@ -6001,7 +6270,7 @@ mod tests {
             let mut both = Vec::new();
             for first_plus in [100usize, 141] {
                 let grid = paint(w, first_plus, 1.0);
-                let nrot = llsd_nrot(&sweep(&grid, &azimuths, gates), &grid, &grid);
+                let nrot = llsd_nrot(&sweep(&grid, &azimuths, gates), &grid, &grid, None);
                 let mut read = Vec::new();
                 for (m, want) in profile.iter().enumerate() {
                     for radial in [first_plus + m, first_plus - 1 - m] {
@@ -6027,7 +6296,7 @@ mod tests {
         for (ratio, strong, weak) in ASYMMETRIC {
             for first_plus in [100usize, 141] {
                 let grid = paint(3, first_plus, ratio);
-                let nrot = llsd_nrot(&sweep(&grid, &azimuths, gates), &grid, &grid);
+                let nrot = llsd_nrot(&sweep(&grid, &azimuths, gates), &grid, &grid, None);
                 for (m, want) in strong.iter().enumerate() {
                     let got = nrot[first_plus + m][j];
                     assert!(
