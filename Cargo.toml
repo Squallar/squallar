@@ -23,6 +23,15 @@ members = [
     # and they only run if `cargo test --workspace` selects them. See
     # vendor/nexrad-data/VENDORED.md and `[patch.crates-io]` below.
     "vendor/nexrad-data",
+    # The third vendored crates.io crate, and the only one that is not patched
+    # over a registry copy -- nothing else in the graph resolves the name, so
+    # `vendor/nexrad-data` depends on it by path and there is no
+    # `[patch.crates-io]` entry to write. A member for the same reason as the
+    # other two: its `decode_reader` and `parallel_decode_reader` targets are
+    # upstream's own behaviour pin on the decoder that `Record::decompress`
+    # now runs, and they only run if `cargo test --workspace` selects them.
+    # See vendor/bzip2-rs/VENDORED.md.
+    "vendor/bzip2-rs",
 ]
 
 [workspace.package]
@@ -247,6 +256,16 @@ opt-level = 2
 #
 # Delete this together with the `[patch.crates-io]` entry above.
 [profile.dev.package.nexrad-data]
+opt-level = 2
+
+# And the crate that decompression is now *actually* spent in. `Record::decompress`
+# is a dozen lines of framing around a Huffman decoder and an inverse
+# Burrows-Wheeler transform that live here; at opt-level 0 those are the stall.
+# Naming it here puts it where `libbz2-rs-sys` -- a plain non-member dependency,
+# and so covered by the `"*"` override above -- already was.
+#
+# Delete this together with `vendor/bzip2-rs/`.
+[profile.dev.package.bzip2-rs]
 opt-level = 2
 
 [profile.release]

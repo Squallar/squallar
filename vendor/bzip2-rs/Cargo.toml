@@ -1,0 +1,97 @@
+# ---------------------------------------------------------------------------
+# VENDORED COPY -- upstream's own manifest, with three removals and two
+# additions. `src/` and `tests/` are byte-for-byte the upstream git tree at
+# 2be7684b444987d6cc7b0b226bda7581be739e3c; this file is the entire local
+# delta. Every edit is listed in VENDORED.md next to it.
+#
+# Removed: the `[[bench]]` block and the `[dev-dependencies]` that served it
+# (criterion, and a `bzip2 = ">= 0.4.1, <0.6"` that would have put a *second*
+# bzip2 in this workspace's lockfile); and the `nightly` feature, which cannot
+# be enabled on the stable toolchain `rust-toolchain.toml` pins and which
+# `--all-features` would otherwise switch on. Added: the two lint tables.
+# ---------------------------------------------------------------------------
+
+[package]
+name = "bzip2-rs"
+version = "0.1.2"
+authors = ["Paolo Barbolini <paolo@paolo565.org>"]
+description = "Pure Rust bzip2 decompressor"
+license = "MIT OR Apache-2.0"
+categories = ["compression"]
+keywords = ["bzip2"]
+repository = "https://github.com/paolobarbolini/bzip2-rs"
+readme = "README.md"
+edition = "2018"
+rust-version = "1.63"
+
+[dependencies]
+crc32fast = "1.2.1"
+tinyvec = { version = "1.7", features = ["rustc_1_61"] }
+
+rayon-core = { version = "1.5", optional = true }
+
+[features]
+default = []
+
+# Crate features
+
+# use rayon as the bzip2_rs::ThreadPool
+rayon = ["rayon-core"]
+
+# Upstream also declares
+#
+#     nightly = ["crc32fast/nightly"]
+#
+# and it is dropped here, because `rust-toolchain.toml` pins `stable` and the
+# feature turns on `#![feature(read_buf, core_io_borrowed_buf)]` in
+# `src/lib.rs` -- E0554, a hard error off nightly. A declared feature is
+# reachable from `cargo clippy --all-targets --all-features` and
+# `cargo test --workspace --all-features`, both of which this workspace's CI
+# runs, so leaving it declared would mean a workspace that cannot be linted.
+#
+# The `#[cfg(feature = "nightly")]` arms in `src/` are deliberately *not*
+# touched -- that is what keeps the source byte-identical to upstream. They
+# simply never select. `unexpected_cfgs = "allow"` below is what stops cargo's
+# check-cfg from warning about them.
+
+[package.metadata.docs.rs]
+features = ["rayon"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+# `.github/workflows/clippy.yaml` runs `cargo clippy --all-targets
+# --all-features --fix` over every workspace member and auto-commits the
+# rewritten tree to `main`, then gates on `-D warnings`. Without these tables a
+# bot would eventually rewrite upstream source in this directory on its own
+# schedule, and VENDORED.md's *Local changes* list would silently stop being
+# true. Silencing the lints leaves the bot nothing to fix, and leaves the gate
+# nothing to fail on.
+#
+# Same mechanism and same shape as `vendor/nexrad-decode` and
+# `vendor/nexrad-data`: cargo turns these into `-A` flags, CI appends
+# `-D warnings` after them, and that does not undo them because `-D warnings`
+# only escalates lints that are *at* warn level. The one form that would not
+# have survived is `[lints.rust] warnings = "allow"` -- same lint id as the CI
+# flag, last one wins -- which is why the rustc side names groups instead.
+#
+# And the same limit: these cannot reach `src/lib.rs`'s own `#![deny(...)]`,
+# because a lint attribute in source outranks any command-line level. Here that
+# costs nothing, unlike in the two sibling directories: upstream's denies are
+# `trivial_casts`, `rust_2018_idioms`, `missing_docs` and three clippy lints,
+# none of which its own test code breaks, so no source edit was needed. See
+# VENDORED.md.
+[lints.rust]
+future_incompatible = { level = "allow", priority = -1 }
+nonstandard_style = { level = "allow", priority = -1 }
+rust_2018_idioms = { level = "allow", priority = -1 }
+unused = { level = "allow", priority = -1 }
+deprecated = "allow"
+unexpected_cfgs = "allow"
+unknown_lints = "allow"
+renamed_and_removed_lints = "allow"
+
+# `clippy::all` is every clippy lint that warns by default -- correctness,
+# suspicious, style, complexity, perf. pedantic/nursery/cargo are allow by
+# default and this workspace never turns them on, so naming them would be
+# decoration.
+[lints.clippy]
+all = { level = "allow", priority = -1 }
