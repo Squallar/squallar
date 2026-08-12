@@ -8,8 +8,10 @@
 //! reference covers 3.27% of KTLX 2025-02-19 and 5.08% of KCRP 2017-08-26
 //! where this module covers 1.62% and 1.07%, and the shortfall is coverage
 //! upstream of the derivative rather than gating — see
-//! [`GK_MAX_TEXTURE_VNY_FRAC`]. The measurement apparatus and the full
-//! calibration record live on branch `campaign-harness`.
+//! [`GK_MAX_TEXTURE_VNY_FRAC`]. The measurement apparatus lives on branch
+//! `campaign-harness`, and so does the calibration record for every constant
+//! whose readings survived — twelve of them kept only the apparatus, and say
+//! so where they are declared.
 //!
 //! 1. Dealias the base velocity with the validity-marking multi-pass
 //!    ([`dealias`]): environmental-wind and zero-isodop seeds, then
