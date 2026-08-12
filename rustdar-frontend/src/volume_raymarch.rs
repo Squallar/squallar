@@ -67,6 +67,7 @@ use crate::constants::{VOLUME_LUT_BYTES, VOLUME_TEXTURE_BUDGET_BYTES};
 use crate::egui_renderer::AttachmentConfig;
 use crate::volume::VOLUME_TEXTURE_FORMAT;
 use crate::volume::uniform::{VOLUME_UNIFORM_BYTES, VolumeUniform};
+use staging::VolumeStaging;
 
 /// The WGSL every volume pipeline is built from.
 ///
@@ -753,9 +754,9 @@ impl VolumePipelines {
     /// `lut` is [`VOLUME_LUT_BYTES`] of straight (non-premultiplied),
     /// gamma-encoded RGBA — what `get_color_for_value` produces.
     ///
-    /// `widening` is the caller's reusable staging buffer for that widened
-    /// plane; see [`Self::upload_volume_at`], which explains why the caller owns
-    /// it instead of this allocating one.
+    /// `staging` is the caller's reusable host memory for that widened plane;
+    /// see [`Self::upload_volume_at`], which explains why the caller owns it
+    /// instead of this allocating one.
     ///
     /// The grid carries its coarse level. [`Self::upload_volume_at`] is the
     /// arm that can leave it out; see [`CoarseLevel`] for who may.
@@ -766,7 +767,7 @@ impl VolumePipelines {
         cells: [u32; 3],
         indices: &[u8],
         lut: &[u8],
-        widening: &mut Vec<u8>,
+        staging: &mut VolumeStaging,
     ) -> Option<VolumeTextures> {
         self.upload_volume_at(
             device,
@@ -775,7 +776,7 @@ impl VolumePipelines {
             indices,
             lut,
             CoarseLevel::Built,
-            widening,
+            staging,
         )
     }
 
@@ -793,17 +794,45 @@ impl VolumePipelines {
     /// frame's latency, not a background cost. Widening the desktop shape asks
     /// for a 32 MiB block that glibc can never recycle, and paying for its
     /// pages was 10.1 ms of an 11.95 ms pass; [`coverage_premultiplied_into`] has
-    /// the syscall evidence. `widening` is therefore the caller's buffer, held
+    /// the syscall evidence. `staging` is therefore the caller's memory, held
     /// across uploads and grown to the largest shape it has seen —
-    /// `volume::bridge::VolumeResources::widening` is the one production holds.
+    /// `volume::bridge::VolumeResources::staging` is the one production holds.
     ///
-    /// It is safe to reuse the instant this returns, and the caller need not
-    /// wait for the queue: `write_texture` copies into wgpu's own staging
-    /// buffer inside the call, so nothing outlives the borrow.
+    /// It is safe to reuse the instant this returns, whichever route the plane
+    /// took, and the caller never has to wait for the queue: `write_texture`
+    /// copies into wgpu's own staging buffer inside the call, and the ring hands
+    /// its slot back to wgpu rather than to the caller.
     ///
-    /// A caller with no buffer to hand may pass `&mut Vec::new()` and get the
-    /// old behaviour — a fresh allocation per upload — which is what the GPU
-    /// suites do, since each of them uploads once and then draws.
+    /// A caller with no memory to hand may pass `&mut VolumeStaging::default()`
+    /// and get the host-only behaviour — a fresh allocation per upload, and no
+    /// ring — which is what the GPU suites do, since each of them uploads once
+    /// and then draws.
+    ///
+    /// # The two routes the plane can take
+    ///
+    /// [`VolumeStaging::write_plane`] is tried first and takes the plane through
+    /// a ring of host-memory buffers the copy engine reads by DMA; `staging`
+    /// answers `false` — on a device without [`staging::STAGING_RING_FEATURE`],
+    /// which is every browser, or on a frame where every slot is still feeding a
+    /// copy — and the `write_texture` below is what runs instead. **Both write
+    /// the same bytes**, from the same table, and
+    /// `the_two_routes_write_the_same_plane` reads them back
+    /// off a real device to say so.
+    ///
+    /// The ring submits its copy before returning, so this function's contract
+    /// is unchanged: a grid it returns `Some` for is complete as far as anything
+    /// ordered after it on the queue can tell, and there is no half-uploaded
+    /// state for the uploads cache or the store's eviction to know about. See
+    /// [`VolumeStaging::write_plane`] for why it does not borrow an encoder.
+    ///
+    /// What it is worth, on the shape and machine below, is the whole reason the
+    /// route exists: the frame-thread cost of the widening and the plane upload
+    /// together, 21 interleaved pairs with the arms alternating, is **17.56 ms
+    /// best / 18.38 ms median through `write_texture` and 2.04 ms best /
+    /// 2.26 ms median through the ring**. That baseline is the
+    /// BAR-with-headroom mode named below — measured in the same process, the
+    /// host's stores into the `MAP_WRITE` mapping `write_texture` uses ran at
+    /// 2.15 GB/s, which is the unsaturated figure.
     ///
     /// # What it saved
     ///
@@ -859,7 +888,7 @@ impl VolumePipelines {
         indices: &[u8],
         lut: &[u8],
         coarse: CoarseLevel,
-        widening: &mut Vec<u8>,
+        staging: &mut VolumeStaging,
     ) -> Option<VolumeTextures> {
         if let Some(why) = upload_refusal(cells, indices.len(), lut.len()) {
             log::error!("3D volume view: {why}");
@@ -896,25 +925,34 @@ impl VolumePipelines {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        let premultiplied = coverage_premultiplied_into(widening, indices);
-        queue.write_texture(
-            grid.as_image_copy(),
-            premultiplied,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                // No 256-byte row padding: `write_texture` repacks internally to
-                // the backend's `buffer_copy_pitch`, which is 4 on GLES. But
-                // `rows_per_image` MUST be `Some` when depth exceeds 1, or every
-                // slice after the first is copied from the wrong offset.
-                bytes_per_row: Some(cells[0] * GRID_BYTES_PER_CELL),
-                rows_per_image: Some(cells[1]),
-            },
-            wgpu::Extent3d {
-                width: cells[0],
-                height: cells[1],
-                depth_or_array_layers: cells[2],
-            },
-        );
+        // The ring first, and the call below only when it declined. Written as
+        // one guarded statement rather than two arms of an `if` so that the
+        // fallback is the *same* code it has always been, on every device that
+        // takes it — which is the whole native/web parity argument for a runtime
+        // capability check over a `cfg`.
+        if !staging.write_plane(device, queue, &grid, cells, indices) {
+            let premultiplied = coverage_premultiplied_into(staging.widening(), indices);
+            queue.write_texture(
+                grid.as_image_copy(),
+                premultiplied,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    // No 256-byte row padding: `write_texture` repacks internally
+                    // to the backend's `buffer_copy_pitch`, which is 4 on GLES.
+                    // But `rows_per_image` MUST be `Some` when depth exceeds 1,
+                    // or every slice after the first is copied from the wrong
+                    // offset. The ring has no such licence and pads its rows;
+                    // see `staging::PlaneLayout`.
+                    bytes_per_row: Some(cells[0] * GRID_BYTES_PER_CELL),
+                    rows_per_image: Some(cells[1]),
+                },
+                wgpu::Extent3d {
+                    width: cells[0],
+                    height: cells[1],
+                    depth_or_array_layers: cells[2],
+                },
+            );
+        }
         if grid_mip_levels(cells, coarse) > 1 {
             upload_coarse_level(queue, &grid, cells, indices);
         }
@@ -1850,6 +1888,9 @@ fn depth_state_for(format: wgpu::TextureFormat) -> wgpu::DepthStencilState {
 /// regression into a blank pane rather than a failing test. The constant is
 /// named so the two stay linked.
 const _: () = assert!(VOLUME_TEXTURE_BUDGET_BYTES > VOLUME_LUT_BYTES);
+
+#[path = "volume_raymarch/staging.rs"]
+pub mod staging;
 
 #[path = "volume_raymarch/tests.rs"]
 #[cfg(test)]

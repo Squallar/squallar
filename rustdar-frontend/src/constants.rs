@@ -787,14 +787,54 @@ pub const DESKTOP_MAX_LOOP_VOLUME_FRAMES: usize = 13;
 /// What is left of the widening is one pass of 32 MiB of stores. The honest fix
 /// for *that* is to widen the plane inside the offload job that already builds
 /// the grid; the reason not to is wasm, where it would push 32 MiB over the
-/// worker message port instead of 8 MiB. The other end of it — fusing the
-/// widening into a pooled mapped staging buffer, so the pass and the BAR copy
-/// become one write — would subsume this `Vec` entirely, and is a decision
-/// about `write_texture`, not about this constant.
+/// worker message port instead of 8 MiB.
+///
+/// # What the staging ring changed, and what it cost on top
+///
+/// The other end of it — fusing the widening into a pooled mapped staging
+/// buffer, so the pass and the BAR copy become one write — has since been done,
+/// and it is `volume::raymarch::staging`. On a device with
+/// `staging::STAGING_RING_FEATURE` the plane is widened **straight into a
+/// host-memory buffer the copy engine reads**, which removes both the second
+/// pass and the blocking BAR copy: the two together were **17.56 ms best /
+/// 18.38 ms median** in `prepare` on the desktop shape and are **2.04 ms best /
+/// 2.26 ms median**. The bytes still cross a PCIe 4.0 x4 link at the same speed
+/// they always did; what left the frame thread is the waiting.
+///
+/// Its residency mostly replaces the figure above rather than adding to it, and
+/// "mostly" is the whole of what has to be said carefully. The ring is
+/// [`staging::STAGING_RING_DEPTH`] planes — **64.00 MiB** on
+/// [`DESKTOP_VOLUME_GRID_CELLS`], 27.00 MiB on [`MOBILE_VOLUME_GRID_CELLS`] —
+/// and while every upload finds a free slot the widening `Vec` above is never
+/// touched and stays at zero length. That is the steady state and it is
+/// **+32.00 MiB of host memory** over what an open 3D session already held.
+///
+/// It is **not** the number to plan against. The ring is allowed to decline an
+/// upload — never waiting is the property the whole design is built on — and the
+/// first frame on which every slot is still feeding a copy takes the
+/// `write_texture` fallback, which allocates the widening buffer and, that `Vec`
+/// only ever growing, keeps it for the session. The two then coexist:
+/// **96.00 MiB on desktop, +64.00 MiB**, and 40.50 MiB on the mobile rung. Both
+/// figures and the condition between them are stated on
+/// `volume::raymarch::staging::VolumeStaging` and pinned by a test there.
+///
+/// Either way it is still outside every budget here for the same reason, and
+/// still nothing at all for a session that never opens a 3D pane.
+/// [`WASM_VOLUME_GRID_CELLS`] is unchanged at 4.00 MiB: WebGL2 has neither the
+/// feature nor a BAR window to have been slow across.
+///
+/// The bimodality two sections up is not repealed by any of this — it is
+/// **scoped**. It was always a property of `write_texture`, and `write_texture`
+/// is now the fallback arm, so the ~33 ms / ~18.6 ms swing is what a device
+/// without the feature still sees and what a device with one sees on a frame its
+/// ring could not serve.
 ///
 /// One per frame means a full desktop set of 13 is dispatched over 13 frames —
 /// under a quarter of a second at 60 fps — and every grid that lands is shown
 /// as it lands rather than the pane blocking on the batch.
+///
+/// [`staging::STAGING_RING_DEPTH`]: crate::volume::raymarch::staging::STAGING_RING_DEPTH
+/// [`staging::STAGING_RING_FEATURE`]: crate::volume::raymarch::staging::STAGING_RING_FEATURE
 pub const MAX_LOOP_VOLUME_BUILDS_PER_FRAME: usize = 1;
 
 /// Ceiling on the GPU texture memory the **whole application** budgets, in

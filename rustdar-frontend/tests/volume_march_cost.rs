@@ -42,6 +42,7 @@ use rustdar_egui::pane::OrbitCamera;
 use rustdar_egui::volume_view::view_for;
 use rustdar_frontend::egui_renderer::AttachmentConfig;
 use rustdar_frontend::volume::raymarch::VolumePipelines;
+use rustdar_frontend::volume::raymarch::staging::{STAGING_RING_FEATURE, VolumeStaging};
 use rustdar_frontend::volume::uniform::VolumeUniform;
 use rustdar_radar::types::RadarProduct;
 use rustdar_radar::voxel::{DESKTOP_SHAPE, VoxelGrid, VoxelRequest, build_voxels};
@@ -86,9 +87,12 @@ fn measure_the_raymarch_cost_on_a_real_volume() {
             grid_dims,
             grid.indices(),
             grid.lut(),
-            // One upload, so nothing to reuse a buffer across. Production
-            // holds one across every grid — `VolumeResources::widening`.
-            &mut Vec::new(),
+            // One upload, so nothing to reuse across. Production holds one
+            // across every grid — `VolumeResources::staging`. Built from the
+            // device so this bench uploads by the route production does; the
+            // device below asks for `STAGING_RING_FEATURE` alongside the
+            // timestamps it exists for.
+            &mut VolumeStaging::new(&device),
         )
         .expect("the grid and palette were refused");
 
@@ -326,7 +330,8 @@ fn device_with_timestamps() -> (wgpu::Device, wgpu::Queue) {
     );
     pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("rustdar.volume.cost.device"),
-        required_features: wgpu::Features::TIMESTAMP_QUERY,
+        required_features: wgpu::Features::TIMESTAMP_QUERY
+            | (adapter.features() & STAGING_RING_FEATURE),
         required_limits: adapter.limits(),
         memory_hints: Default::default(),
         experimental_features: Default::default(),

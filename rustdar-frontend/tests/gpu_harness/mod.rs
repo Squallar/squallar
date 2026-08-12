@@ -16,6 +16,7 @@
 use egui_wgpu::wgpu;
 use rustdar_frontend::constants::VOLUME_LUT_BYTES;
 use rustdar_frontend::egui_renderer::AttachmentConfig;
+use rustdar_frontend::volume::raymarch::staging::{STAGING_RING_FEATURE, VolumeStaging};
 use rustdar_frontend::volume::raymarch::{CoarseLevel, FLOOR_FORMAT, PaneMirror, VolumePipelines};
 use rustdar_frontend::volume::uniform::VolumeUniform;
 
@@ -72,7 +73,11 @@ pub fn device() -> (wgpu::Device, wgpu::Queue) {
     announce(&adapter);
     pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("rustdar.volume.test.device"),
-        required_features: wgpu::Features::empty(),
+        // The one feature production asks for, on the same terms: only where
+        // the adapter already has it. Without this the device would refuse to
+        // create a `MAP_READ | COPY_SRC` buffer and every suite sharing this
+        // harness would test the fallback while production shipped the ring.
+        required_features: adapter.features() & STAGING_RING_FEATURE,
         // Deliberately the adapter's own, not the WebGL2 floor: what is being
         // checked here is that the shader works, and holding a desktop GPU to
         // the browser's limits would only test the limits.
@@ -315,7 +320,22 @@ pub fn raymarch_once_at(
     coarse: CoarseLevel,
 ) -> Vec<[u8; 4]> {
     let volume = pipelines
-        .upload_volume_at(device, queue, cells, indices, lut, coarse, &mut Vec::new())
+        .upload_volume_at(
+            device,
+            queue,
+            cells,
+            indices,
+            lut,
+            coarse,
+            // Staging for the device the caller actually has, exactly as
+            // production builds it — so on an adapter with
+            // `STAGING_RING_FEATURE` every render in these suites arrives
+            // through the staging ring, and on one without it through
+            // `write_texture`. Handing in `VolumeStaging::default()` here would
+            // be cheaper and would quietly take the fallback on every machine,
+            // leaving the route production uses covered by nothing that draws.
+            &mut VolumeStaging::new(device),
+        )
         .expect("the grid and palette were refused");
     assert_eq!(
         volume.cells(),
@@ -397,7 +417,14 @@ pub fn raymarch_once_with_floor(
     floor: &PaneMirror,
 ) -> Vec<[u8; 4]> {
     let volume = pipelines
-        .upload_volume(device, queue, cells, indices, lut, &mut Vec::new())
+        .upload_volume(
+            device,
+            queue,
+            cells,
+            indices,
+            lut,
+            &mut VolumeStaging::new(device),
+        )
         .expect("the grid and palette were refused");
     volume.write_uniform(queue, uniform);
     let target = pipelines.create_offscreen(device, size);

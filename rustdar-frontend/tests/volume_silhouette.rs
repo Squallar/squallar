@@ -79,6 +79,7 @@ use rustdar_egui::pane::OrbitCamera;
 use rustdar_egui::volume_view::view_for;
 use rustdar_frontend::constants::VOLUME_LUT_BYTES;
 use rustdar_frontend::egui_renderer::AttachmentConfig;
+use rustdar_frontend::volume::raymarch::staging::{STAGING_RING_FEATURE, VolumeStaging};
 use rustdar_frontend::volume::raymarch::{
     RAYMARCH_STEP_CEILING, RAYMARCH_STEP_CELLS, VolumePipelines,
 };
@@ -127,7 +128,9 @@ fn device() -> (wgpu::Device, wgpu::Queue) {
     announce(&adapter);
     pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("rustdar.volume.silhouette.device"),
-        required_features: wgpu::Features::empty(),
+        // The one feature production asks for, on the same terms — see
+        // `gpu_harness::device`.
+        required_features: adapter.features() & STAGING_RING_FEATURE,
         required_limits: adapter.limits(),
         memory_hints: Default::default(),
         experimental_features: Default::default(),
@@ -217,7 +220,14 @@ fn raymarch_once(
     size: [u32; 2],
 ) -> Vec<[u8; 4]> {
     let volume = pipelines
-        .upload_volume(device, queue, cells, indices, lut, &mut Vec::new())
+        .upload_volume(
+            device,
+            queue,
+            cells,
+            indices,
+            lut,
+            &mut VolumeStaging::new(device),
+        )
         .expect("the grid and palette were refused");
     volume.write_uniform(queue, uniform);
     let target = pipelines.create_offscreen(device, size);

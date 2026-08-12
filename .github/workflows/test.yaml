@@ -113,9 +113,11 @@ jobs:
         run: |
           cargo test -p rustdar-frontend --lib -- --ignored --nocapture --exact \
             volume::tests::a_real_adapter_supports_the_volume_format \
+            volume::raymarch::staging::tests::the_two_routes_write_the_same_plane \
+            volume::raymarch::staging::tests::the_worst_case_residency_is_the_ring_and_the_widening_together \
             egui_renderer::tests::a_paint_callbacks_own_command_buffer_reaches_the_queue \
             | tee "$RUNNER_TEMP/lib-gpu.log"
-          grep -q '^test result: ok\. 2 passed' "$RUNNER_TEMP/lib-gpu.log"
+          grep -q '^test result: ok\. 4 passed' "$RUNNER_TEMP/lib-gpu.log"
 
   test:
     name: Test

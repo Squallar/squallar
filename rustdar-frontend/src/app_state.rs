@@ -167,7 +167,25 @@ impl AppState {
             .await
             .expect("Failed to find an appropriate adapter");
 
-        let features = wgpu::Features::empty();
+        // One feature, asked for only where the adapter already has it, so this
+        // is the same `request_device` on every target rather than a `cfg`ed
+        // pair. See `staging::STAGING_RING_FEATURE`: it is what lets a voxel
+        // grid's 32 MiB plane be staged through host memory and pulled across
+        // PCIe by DMA instead of being pushed across it by the frame thread,
+        // and on the desktop shape that is the difference between 17.6 ms and
+        // 2.0 ms inside `prepare`.
+        //
+        // Nothing else changes shape when it is on. wgpu warns that the feature
+        // is "a massive performance footgun on a discrete GPU", and it is —
+        // for an application that then maps its vertex, index or uniform
+        // buffers. Buffer placement is decided per buffer from that buffer's
+        // own `MAP_READ`/`MAP_WRITE` bits, and the only buffers in this crate
+        // that name either are the staging ring's.
+        //
+        // WebGL2 offers none of this and takes `Features::empty()`, which is
+        // also the arm with nothing to gain: there is no BAR window in a
+        // browser for the old path to have been slow across.
+        let features = adapter.features() & volume::raymarch::staging::STAGING_RING_FEATURE;
         // Native takes the adapter's actual limits so it is not held to a
         // portable floor; the web arm reconciles them with what WebGL2 can
         // express. See `device_limits`.
@@ -186,10 +204,11 @@ impl AppState {
 
         // Before a single volume resource exists, and before anything can fail
         // asynchronously: purely limits the device already reports and format
-        // features the adapter already knows. Note `required_features` stays
-        // `Features::empty()` and `device_limits` is untouched — an uncompressed
-        // 3D texture needs no feature, and the web arm's `using_resolution`
-        // already lifts `max_texture_dimension_3d`.
+        // features the adapter already knows. Note `device_limits` is untouched
+        // and the one feature above is not consulted here — an uncompressed 3D
+        // texture needs no feature, the staging ring is a route to the same
+        // texture rather than a condition on having one, and the web arm's
+        // `using_resolution` already lifts `max_texture_dimension_3d`.
         let volume_support = volume::probe(&adapter, &device.limits());
         if let Some(why) = volume_support.reason() {
             log::info!("3D volume view unavailable: {why}");

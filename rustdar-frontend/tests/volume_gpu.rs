@@ -2396,3 +2396,110 @@ fn release_pane_frees_that_panes_offscreen_and_the_uploads_the_store_let_go_of()
         "closing the last 3D pane left GPU memory behind for the session",
     );
 }
+
+/// `upload_volume_at` paints the same frame whichever route its plane took.
+///
+/// The exact texels the two routes write are compared in
+/// `volume::raymarch::staging::tests::the_two_routes_write_the_same_plane`,
+/// which owns its textures and can read them back. What *this* checks is the
+/// production wiring around them, which that test cannot see:
+///
+///  * that `upload_volume_at` reaches the ring at all on a device that has one
+///    — a `write_plane` that always answered `false` would leave every
+///    measurement in this campaign describing code nobody runs;
+///  * that the `write_texture` fallback still produces a correct volume, on
+///    the very same device, so the arm every WebGL2 browser takes is not
+///    covered only by adapters that cannot reach it;
+///  * and that the two are indistinguishable in the rendered frame, which is
+///    the only place a user could tell.
+///
+/// The fixture is a slab ramp read through a grey ramp table with ambient light
+/// only, so a pixel's grey level *is* the palette index the surface was found
+/// at: a plane that landed one slab out paints a visibly different grey rather
+/// than a subtly different one.
+///
+/// ```text
+/// cargo test -p rustdar-frontend --test volume_gpu \
+///     both_upload_routes_paint_the_same_frame -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
+fn both_upload_routes_paint_the_same_frame() {
+    use rustdar_frontend::volume::raymarch::staging::{STAGING_RING_FEATURE, VolumeStaging};
+
+    let _serialised = gpu_lock();
+    let (device, queue) = device();
+    let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Bgra8Unorm));
+    pipelines.upload_quad(&queue);
+
+    let (cells, indices) = slab_ramp(&[0, 40, 90, 140, 190, 240, 0, 0]);
+    let lut = grey_ramp_lut();
+    let uniform = iso_uniform(cells);
+    const SIZE: [u32; 2] = [64, 64];
+
+    let mut ring = VolumeStaging::new(&device);
+    assert_eq!(
+        ring.has_ring(),
+        device.features().contains(STAGING_RING_FEATURE),
+        "`VolumeStaging::new` disagrees with the device it was built from about \
+         whether a staging ring is available, so the capability check the whole \
+         design rests on is reading the wrong thing",
+    );
+    // Host-only, whatever this device can do: the arm a browser takes.
+    let mut host_only = VolumeStaging::default();
+    assert!(!host_only.has_ring());
+
+    let mut painted = Vec::new();
+    for staging in [&mut ring, &mut host_only] {
+        let volume = pipelines
+            .upload_volume_at(
+                &device,
+                &queue,
+                cells,
+                &indices,
+                &lut,
+                CoarseLevel::Omitted,
+                staging,
+            )
+            .expect("the grid and palette were refused");
+        volume.write_uniform(&queue, &uniform);
+        let target = pipelines.create_offscreen(&device, SIZE);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        pipelines.encode_raymarch(&mut encoder, &target, &volume);
+        queue.submit(Some(encoder.finish()));
+        painted.push(read_back(&device, &queue, target.texture(), target.size()));
+    }
+
+    // The ring's own residency, and the fallback's — which is what says the two
+    // arms above really were two arms and not the same one twice.
+    eprintln!(
+        "staging ring: {} ({} host bytes); fallback: {} host bytes",
+        ring.has_ring(),
+        ring.host_bytes(),
+        host_only.host_bytes(),
+    );
+    assert!(
+        host_only.host_bytes() > 0,
+        "the fallback widened nothing, so its frame below was painted by \
+         something other than the `write_texture` path this test exists to keep \
+         working",
+    );
+
+    let through_ring = &painted[0];
+    let through_write_texture = &painted[1];
+    let lit = through_write_texture
+        .iter()
+        .filter(|pixel| pixel[3] > 0)
+        .count();
+    assert!(
+        lit * 4 > through_write_texture.len(),
+        "precondition: only {lit} of {} pixels have any coverage, so two blank \
+         frames would compare equal and this test would prove nothing",
+        through_write_texture.len(),
+    );
+    assert_eq!(
+        through_ring, through_write_texture,
+        "the volume painted from a staging-ring upload differs from the same \
+         volume painted from a `write_texture` upload",
+    );
+}

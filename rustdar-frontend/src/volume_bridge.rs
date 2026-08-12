@@ -99,6 +99,7 @@ use rustdar_radar::voxel::VoxelGrid;
 use crate::egui_renderer::AttachmentConfig;
 use crate::volume::VolumeSupport;
 use crate::volume::quality::VolumeQuality;
+use crate::volume::raymarch::staging::VolumeStaging;
 use crate::volume::raymarch::{CoarseLevel, OffscreenTarget, VolumePipelines, VolumeTextures};
 use crate::volume::uniform::VolumeUniform;
 
@@ -1543,8 +1544,8 @@ pub struct VolumeResources {
     /// that never opens a 3D pane never leaves `None` and pays nothing; one that
     /// opens and closes it returns there.
     mirror: Option<crate::volume::raymarch::PaneMirror>,
-    /// The host-side staging buffer every grid upload widens its index plane
-    /// into, held across uploads instead of allocated inside each one.
+    /// The host memory every grid upload widens its index plane into, held
+    /// across uploads instead of allocated inside each one.
     ///
     /// Here rather than inside `VolumePipelines` because `prepare` already
     /// reaches this struct through a `&mut`, and `CallbackResources` is natively
@@ -1553,21 +1554,23 @@ pub struct VolumeResources {
     /// still a `&self` operation on the pipelines, which is what lets the mutant
     /// and silhouette suites keep sharing one built pipeline set.
     ///
-    /// One buffer for the whole application, like the map above it: uploads are
-    /// serialised on the frame thread, so there is never a second one in flight
-    /// to need a second buffer.
+    /// One of these for the whole application, like the map above it: uploads
+    /// are serialised on the frame thread, so there is never a second one in
+    /// flight to need a second.
     ///
     /// **Permanently resident once anything has been uploaded**, at the largest
-    /// shape this process has seen — one level-0 plane, so
-    /// `cells.product() * GRID_BYTES_PER_CELL`: 32.00 MiB on the desktop grid,
-    /// 13.50 MiB on mobile, 4.00 MiB on wasm32. Not given back by `release_pane` or
+    /// shape this process has seen. Which memory that is depends on the route
+    /// the device can take, and [`VolumeStaging`] states both figures and the
+    /// arithmetic between them: on desktop it is a 64.00 MiB ring of two DMA
+    /// staging buffers, and the 32.00 MiB widening buffer that used to be the
+    /// whole cost is never touched there. Not given back by `release_pane` or
     /// `retain_uploads`: a session that closed its last 3D pane is exactly the
     /// one likely to open another, and the whole point is that the pages are
     /// bought once. `VolumePipelines::upload_volume_at` has the measurement.
     /// It is host memory and so is outside the GPU budget
     /// `crate::constants::APP_TEXTURE_BUDGET_BYTES` states — `resident_bytes`
     /// below counts device textures and deliberately does not count this.
-    widening: Vec<u8>,
+    staging: VolumeStaging,
 }
 
 /// One grid's GPU upload, and which Volume Alpha curve its colour table was
@@ -1602,8 +1605,9 @@ impl VolumeResources {
             mirror: None,
             // Empty, not pre-sized: the shape is not known until the first
             // upload, and a machine that never opens a 3D pane must pay
-            // nothing — the same rule the mirror above follows.
-            widening: Vec::new(),
+            // nothing — the same rule the mirror above follows. `new` takes the
+            // device only to read one feature bit off it; it allocates nothing.
+            staging: VolumeStaging::new(device),
         }
     }
 
@@ -1720,7 +1724,7 @@ impl VolumeResources {
                     indices,
                     &effective_lut(palette, alpha),
                     coarse,
-                    &mut self.widening,
+                    &mut self.staging,
                 ) else {
                     // `upload_volume` has already logged which invariant it
                     // refused on. Nothing to add, and nothing to draw.
@@ -1952,8 +1956,10 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
             targets,
             uploads,
             mirror,
-            // The upload above is the only reader, and it has already run.
-            widening: _,
+            // The upload above is the only reader, and it has already run —
+            // including the staging ring's own submit, so nothing here is
+            // waiting on a plane that has not been handed to the queue.
+            staging: _,
         } = resources;
         // Both are known present — the two calls above answered `true` — and
         // both are answered rather than unwrapped because this runs on the frame
