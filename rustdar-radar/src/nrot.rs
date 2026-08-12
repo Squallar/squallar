@@ -4,11 +4,14 @@
 //! a reference implementation: kernel taps, divisor curve, median geometry,
 //! and gating are all empirical rather than derived. Where it paints, it
 //! correlates 0.996 with the reference's cursor readouts. It does not yet
-//! paint as widely: over the 7.05–20 nm annulus of a lowest velocity cut the
-//! reference covers 3.27% of KTLX 2025-02-19 and 5.08% of KCRP 2017-08-26
-//! where this module covers 1.62% and 1.07%, and the shortfall is coverage
-//! upstream of the derivative rather than gating — see
-//! [`GK_MAX_TEXTURE_VNY_FRAC`]. The measurement apparatus lives on branch
+//! paint as widely: over the 7.05–20 nm annulus of KTLX 2025-02-19's lowest
+//! velocity cut the reference paints 5.13% of the bins where this module
+//! paints 1.63%, and the two fields are **aligned, not displaced** — their
+//! overlap peaks at exactly zero shift in both radials and gates, and their
+//! features are the same shape (a median cluster of 3 radials × 4 gates
+//! against 3 × 5). The shortfall is coverage upstream of the derivative
+//! rather than gating, and [`COH_MAX_STRADDLE`] carries where it is.
+//! The measurement apparatus lives on branch
 //! `campaign-harness`, and so does the calibration record for every constant
 //! whose readings survived — twelve of them kept only the apparatus, and say
 //! so where they are declared.
@@ -1994,6 +1997,39 @@ const DA_ZISO_TOL: f64 = 1.5;
 /// measured size gate this value sits inside. Where that gate actually sits
 /// was read off the reference once and written down nowhere that lasted, so
 /// branch `campaign-harness` cannot say how much room 16 has either side.
+///
+/// # The ladder below it, and why none of it is taken
+///
+/// This rule punches two of the thirteen holes at KTLX that the unbiased ring
+/// hover found, so it was worth walking down. Painted bins inside 80 km on the
+/// lowest super-res cut, with KTLX scored against the reference's own field —
+/// GR2Analyst's render decoded bin for bin, 3546 painted bins over the
+/// 7.05–20 nm annulus, not thirteen hover points:
+///
+/// ```text
+///   value  KHNX  KTLX   annulus  agreeing  disagreeing  KFTG core
+///     16      0  1227     1.63%       434          696  intact
+///      8      0  1362     1.97%       499          863  intact
+///      4      4  1540     2.23%       553          987  intact
+///      2      6  1581     2.29%       565         1016  intact
+///      1      6  1585     2.29%       571         1014  moved
+/// ```
+///
+/// Four and below take KHNX off zero, where the reference reads ND at all
+/// twenty bins hovered, so they are refused before anything else is asked.
+/// They also cost a scorecard rung, and it is a real disagreement rather than
+/// an artifact: `CA_KHNX` at 6.0 m/s of range noise, where the reference
+/// paints six of nine hovered points and this module falls from six to one.
+///
+/// Eight survives every hard test — KHNX 0, the KFTG core unmoved, 195 of 216
+/// rungs with not one cell changed — and is refused on its values. It adds 301
+/// painted bins of which **101** are ones the reference paints and 200 are
+/// not, a 34% hit rate against the 38% precision the field already has; it
+/// blanks 69 bins of which 36 were agreeing; the ones it gets right carry a
+/// mean departure of 0.233 and a worst case of 2.09; and the 200 it gets wrong
+/// average |0.471| with eight over 1.0, in twenty free-standing clusters that
+/// touch no reference paint at all. That is noise at a third the honest rate,
+/// not a repair, and 16 stands.
 const DA_RAWMIN_BINS: usize = 16;
 
 /// Censor threshold in units of Vny: the jump between 4-neighbours above
@@ -2284,6 +2320,57 @@ const COH_STRADDLE_VNY_FRAC: f64 = 0.90;
 /// the reference is using is on an axis this module has not found, and
 /// 0.09 remains the best available reading of a statistic that cannot in
 /// principle separate these two volumes.
+///
+/// # What this rule costs, measured against the reference's whole field
+///
+/// Thirteen hover points said this was one refuser among several. The
+/// reference's own field says it is *the* refuser. GR2Analyst's NROT render at
+/// KTLX 2025-02-19 decodes exactly — its colour bar carries no blending, so a
+/// nearest-colour lookup inverts it, and the result reproduces the same 13 of
+/// 13 OCR hovers to a mean 0.0076 and GR's own reported min and max (−1.96,
+/// +2.15) to the digit. That is 3546 painted bins over the 7.05–20 nm annulus
+/// instead of thirteen. Against them, the first rule that refuses each one:
+///
+/// ```text
+///     no raw velocity at the bin                     147    4.1%
+///     the dealiaser dropped it                       182    5.1%
+///     the median filter dropped it                     2    0.1%
+///     a hole in the stencil's 11 × 3 window          879   24.8%
+///     flagged incoherent — here                     1488   42.0%
+///     range texture or r²                            178    5.0%
+///     carried, under SIGNIFICANT                     236    6.7%
+///     painted                                        434   12.2%
+/// ```
+///
+/// And it is not refusing at random. The reference paints at 10.63% of the
+/// bins this rule calls incoherent against 3.37% of the rest — **3.16×
+/// enriched** — and its refusal rate climbs monotonically with how hard the
+/// reference is painting:
+///
+/// ```text
+///     |NROT| the reference reads   0.25–0.40  0.40–0.60  0.60–1.00  1.00–1.50  ≥1.50
+///     flagged incoherent               43.1%      48.0%      59.5%      79.0%  80.8%
+///     this module carries a value      22.2%      18.8%      16.7%       5.1%   4.1%
+/// ```
+///
+/// A rule meant to find velocity that is no measurement of one air motion is
+/// instead selecting, with rising confidence, the ground where the reference
+/// reports the strongest rotation.
+///
+/// The shape of the refusal says why. Over ±[`COH_AZ_HALF`] rows ×
+/// ±[`COH_RANGE_HALF`] gates one verdict covers 81 radials × 65 gates, so the
+/// mask is not scattered — 16 775 flagged bins fall in 76 components of which
+/// **one holds 68%**, spanning 199 of 720 radials and every gate of the
+/// annulus, and a second holds 21%. Half the reference's field (1784 of 3546
+/// bins) lies inside that censored wedge, painted continuously and in
+/// couplet-shaped clusters. This module paints nothing there by construction.
+///
+/// So the clear-air difference is not sparseness spread over the sweep and it
+/// is not a registration error — the two fields' overlap peaks at exactly zero
+/// shift in radials and in gates, falling off symmetrically either way, and
+/// where both carry a value they agree: over the unbiased 240-point ring,
+/// mean |Δ| 0.038 with the sign right 9 times in 9. It is a quadrant cut out
+/// of an otherwise aligned field, and it is cut here.
 const COH_MAX_STRADDLE: f64 = 0.09;
 
 /// The neighbourhood the straddling fraction is counted over: half-spans in
