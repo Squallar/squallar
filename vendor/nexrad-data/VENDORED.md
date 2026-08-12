@@ -284,7 +284,8 @@ true. Same 12 volumes, release + `lto`, instructions retired differenced across
 | before | 26,064,467,974 | — |
 | after | 26,064,595,110 | **+183** |
 
-+0.0005%. Allocation counts, byte totals and peak live bytes are *identical* —
++0.0005%, measured on its own before the capacity change landed. Allocation
+counts, byte totals and peak live bytes are *identical* —
 `diff` on the per-volume allocation table reports no change at all — and so are
 the decoded-moment digest and the raw decompressed-bytes digest over all 14
 volumes.
@@ -317,10 +318,10 @@ candidates, same corpus, same method:
 
 | capacity | KFTG reallocs | KFTG amplification | TDWR amplification | peak RSS @32 |
 | --- | --- | --- | --- | --- |
-| `Vec::new()` | 1,372 | 7.57× | 23.73× | 243–251 MB |
-| 128 KiB | 280 | 7.41× | 22.97× | 230–236 MB |
-| **256 KiB** | **189** | **7.26×** | **22.77×** | **230–240 MB** |
-| 512 KiB | 98 | 6.94× | 24.23× | 243–245 MB |
+| `Vec::new()` | 1,372 | 7.57× | 23.73× | 247.9 MB |
+| 128 KiB | 280 | 7.41× | 22.97× | 233.1 MB |
+| **256 KiB** | **189** | **7.26×** | **22.77×** | **234.8 MB** |
+| 512 KiB | 98 | 6.94× | 24.23× | 244.2 MB |
 
 512 KiB is the instructive row. It keeps improving the WSR-88D volumes, whose
 records are large, while pushing TDWR **worse than doing nothing at all** —
@@ -336,17 +337,18 @@ What 256 KiB buys, over the whole corpus:
 | reallocations, TBOS (TDWR) | 624 | **5** (−99.2%) |
 | bytes recopied, KFTG | 237.0 MB | **189.3 MB** (−20%) |
 | bytes recopied, TBOS | 21.5 MB | **0.53 MB** (−97.5%) |
-| instructions per pass | 26,064,467,974 | **26,054,460,125** (−0.038%) |
-| peak RSS @32 threads | 243–251 MB | **230–240 MB** |
+| instructions per pass | 26,064,568,217 | **26,054,469,940** (−0.039%) |
+| peak RSS @32 threads | 247.9 MB | **234.8 MB** (−5.3%) |
 
-Peak RSS at 1 and 4 threads does not move (101 MB, 113 MB) and is not expected
-to: at low thread counts the peak is the decoded output, and only at 32 is it
-the transient decompression buffers that this changes. The RSS figures are
-given as ranges because they carry about 4% run-to-run spread, unlike the
-instruction counts, which reproduce to within 1,500 out of 52 billion.
+Peak RSS at 1 thread does not move (101 MB) and is not expected to: with one
+worker the peak is the decoded output, and only as the pool grows is it the
+transient decompression buffers that this changes. RSS figures are means of
+five runs and carry a few percent of spread, unlike the instruction counts,
+which reproduce to within 2,000 out of 52 billion.
 
 The decoded-moment digest and the raw decompressed-bytes digest are unchanged
-over all 14 volumes.
+over all 14 volumes. Full method and the control in
+[Measured, end to end](#measured-end-to-end).
 
 #### The lint scoping — `src/lib.rs`
 
@@ -375,6 +377,56 @@ source edit was unavoidable. Scoping the deny to non-test builds keeps it
 saying what it was written to say — no `unwrap` in the library — and is the
 form to offer upstream. A comment at the site says the same thing, so nobody
 has to find this file first.
+
+## Measured, end to end
+
+Both changes together, against the vendored crate at the vendoring commit —
+which `diff -rq` proved byte-identical to the crates.io tarball, so this is
+also the comparison against what the workspace shipped before.
+
+Method: two binaries built from **one** instrument source, differing only in
+this directory, run back to back and interleaved base/final/base/final on an
+otherwise-shared machine with the 1-minute load average below 20. Instructions
+retired via `perf stat -e instructions:u`, differenced across 2 and 6
+repetitions so process setup, the file reads and the record splitting all
+cancel. Release profile, `lto = true`, `codegen-units = 1`, 32 cores. Buffers
+are consumed through a volatile sink so no `malloc`/`free` pair can be elided.
+
+| | before | after | |
+| --- | --- | --- | --- |
+| instructions, decompress pass | 26,064,568,217 | 26,054,469,940 | **−0.039%** |
+| **control** (full decode, no compressed records) | 40,951,141 | 40,966,083 | **+0.036%** |
+| reallocations, KFTG | 1,372 | 189 | −86.2% |
+| reallocations, TBOS (TDWR) | 624 | 5 | −99.2% |
+| reallocations, TSLC (TDWR) | 916 | 6 | −99.3% |
+| bytes recopied, KFTG | 237.0 MB | 189.3 MB | −20.1% |
+| bytes recopied, TBOS | 21.5 MB | 0.53 MB | −97.5% |
+| amplification, KFTG | 7.57× | 7.26× | −4.1% |
+| amplification, TBOS | 23.73× | 22.77× | −4.0% |
+| amplification, TSLC | 17.85× | 16.74× | −6.2% |
+| peak RSS, 1 thread | 101.0 MB | 101.1 MB | +0.1% |
+| peak RSS, 4 threads | 116.0 MB | 113.6 MB | −2.0% |
+| peak RSS, 32 threads | 247.9 MB | 234.8 MB | **−5.3%** |
+
+The control is the load-bearing row. It is a full decode of the two legacy CTM
+volumes, which contain no compressed records at all — every code path except
+decompression — and it does not move.
+
+It earned its place. An earlier version of this comparison showed the control
+moving **+3.3%**, which would have made the whole table meaningless. The cause
+was not the library: the instrument had gained an extra atomic load inside its
+global allocator between the two runs, so `base` and `final` had been measured
+with different instruments. Rebuilding both from one source removed it. Anyone
+repeating this should keep the control and disbelieve any run in which it moves.
+
+Bit-identity, over all 14 volumes — 5 WSR-88D, 7 TDWR, 2 legacy CTM:
+
+- an FNV-1a digest over every decoded moment's raw gate values, gate count,
+  first-gate range, gate interval, word size, scale and offset, plus each
+  radial's timestamp, azimuth number, azimuth angle, azimuth spacing, elevation
+  number, elevation angle and status: **identical**.
+- an FNV-1a digest over the raw decompressed bytes of every record, length
+  included: **identical**.
 
 ## The change that is not here: reusing the decompressor
 
