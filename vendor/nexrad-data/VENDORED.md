@@ -297,6 +297,58 @@ record of exactly `MAX` bytes decompresses; a record one byte over is
 ordinary 2432-byte record round-trips byte-identically; and the Archive II
 arithmetic above.
 
+#### The starting capacity — `src/volume/record.rs`
+
+`Vec::new()` became `Vec::with_capacity(INITIAL_DECOMPRESSED_CAPACITY)`, 256 KiB.
+
+`read_to_end` doubles from nothing, so a 1.4 MB record was reached through
+about fifteen reallocations, each copying everything accumulated so far — 237 MB
+of `memcpy` to produce one KFTG volume's 75 MB of output.
+
+There is nothing exact to size from: a bzip2 stream carries no
+decompressed-size hint, and the four-byte LDM prefix is the *compressed*
+length. Nor anything approximate — expansion ratios inside a single volume run
+from 2.2:1 to 1,363:1, so a multiple of the compressed size is not a
+prediction. What is left is a fixed floor chosen from the distribution of real
+records: smallest 89,760, p25 191,520, median 245,280, p75 737,760, largest
+1,416,480. 256 KiB is the median rounded up to a power of two.
+
+It is also the measured optimum and not just the reasoned one. Three
+candidates, same corpus, same method:
+
+| capacity | KFTG reallocs | KFTG amplification | TDWR amplification | peak RSS @32 |
+| --- | --- | --- | --- | --- |
+| `Vec::new()` | 1,372 | 7.57× | 23.73× | 243–251 MB |
+| 128 KiB | 280 | 7.41× | 22.97× | 230–236 MB |
+| **256 KiB** | **189** | **7.26×** | **22.77×** | **230–240 MB** |
+| 512 KiB | 98 | 6.94× | 24.23× | 243–245 MB |
+
+512 KiB is the instructive row. It keeps improving the WSR-88D volumes, whose
+records are large, while pushing TDWR **worse than doing nothing at all** —
+every one of the 364 TDWR records is under 326 KB, so a 512 KiB floor
+over-allocates all of them — and it hands the entire RSS saving back. Tuning
+this on WSR-88D alone would have chosen it.
+
+What 256 KiB buys, over the whole corpus:
+
+| | before | after |
+| --- | --- | --- |
+| reallocations, KFTG | 1,372 | **189** (−86%) |
+| reallocations, TBOS (TDWR) | 624 | **5** (−99.2%) |
+| bytes recopied, KFTG | 237.0 MB | **189.3 MB** (−20%) |
+| bytes recopied, TBOS | 21.5 MB | **0.53 MB** (−97.5%) |
+| instructions per pass | 26,064,467,974 | **26,054,460,125** (−0.038%) |
+| peak RSS @32 threads | 243–251 MB | **230–240 MB** |
+
+Peak RSS at 1 and 4 threads does not move (101 MB, 113 MB) and is not expected
+to: at low thread counts the peak is the decoded output, and only at 32 is it
+the transient decompression buffers that this changes. The RSS figures are
+given as ranges because they carry about 4% run-to-run spread, unlike the
+instruction counts, which reproduce to within 1,500 out of 52 billion.
+
+The decoded-moment digest and the raw decompressed-bytes digest are unchanged
+over all 14 volumes.
+
 ## rustfmt
 
 `cargo fmt --all -- --check` is clean over this directory as vendored, checked

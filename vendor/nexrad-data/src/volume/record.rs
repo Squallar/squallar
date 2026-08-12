@@ -44,6 +44,46 @@ use std::fmt::Debug;
 /// a decode that reports a bad record, not a process that dies.
 pub const MAX_DECOMPRESSED_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
+/// The capacity [`Record::decompress`] starts its output buffer at.
+///
+/// `Vec::new()` starts at nothing and `read_to_end` doubles from there, so a
+/// 1.4 MB record was reached through about fifteen reallocations, each copying
+/// everything accumulated so far. Across one WSR-88D volume that is 237 MB of
+/// `memcpy` to produce 75 MB of output.
+///
+/// A bzip2 stream carries no decompressed-size hint and the four-byte LDM
+/// prefix is the *compressed* length, so there is nothing exact to size from —
+/// and nothing approximate either, since real expansion ratios inside a single
+/// volume run from 2.2:1 to 1,363:1. What is left is a fixed starting capacity
+/// chosen from the distribution of real records. Measured over the same 693
+/// records as [`MAX_DECOMPRESSED_RECORD_BYTES`]:
+///
+/// | | smallest | p25 | median | p75 | largest |
+/// | --- | --- | --- | --- | --- | --- |
+/// | all 693 | 89,760 | 191,520 | 245,280 | 737,760 | 1,416,480 |
+///
+/// 256 KiB is the median record rounded up to a power of two: half the corpus
+/// is decompressed in a single allocation with no growth at all, and the half
+/// that grows starts five doublings up.
+///
+/// It is also the measured optimum rather than the reasoned one. Three
+/// candidates, same corpus, same method — amplification is
+/// `(allocated + reallocated) / output`, RSS is a 32-thread parallel decode:
+///
+/// | capacity | KFTG amplification | TDWR amplification | peak RSS @32 |
+/// | --- | --- | --- | --- |
+/// | `Vec::new()` | 7.57× | 23.73× | 246.0 MB |
+/// | 128 KiB | 7.41× | 22.97× | 233.1 MB |
+/// | **256 KiB** | **7.26×** | **22.77×** | **230.9 MB** |
+/// | 512 KiB | 6.94× | 24.23× | 244.2 MB |
+///
+/// 512 KiB is the instructive one. It keeps improving the WSR-88D volumes,
+/// whose records are large, and simultaneously pushes TDWR *worse than doing
+/// nothing at all* — every one of the 364 TDWR records in the corpus is under
+/// 326 KB, so a 512 KiB floor over-allocates all of them — and gives the whole
+/// RSS saving back. Tuning this on WSR-88D alone would have picked it.
+const INITIAL_DECOMPRESSED_CAPACITY: usize = 256 * 1024;
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum RecordData<'a> {
     Borrowed(&'a [u8]),
@@ -114,7 +154,7 @@ impl<'a> Record<'a> {
         // being decompressed any further. `Take` bounds only how much is read
         // per iteration and how much is kept; it does not reserve its limit, so
         // this costs nothing for an ordinary record.
-        let mut decompressed_data = Vec::new();
+        let mut decompressed_data = Vec::with_capacity(INITIAL_DECOMPRESSED_CAPACITY);
         BzDecoder::new(data)
             .take(MAX_DECOMPRESSED_RECORD_BYTES as u64 + 1)
             .read_to_end(&mut decompressed_data)?;
