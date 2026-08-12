@@ -922,6 +922,99 @@ const MEDIAN_RNG_HALF: i32 = 2;
 /// how this was measured, never what came back.
 const MEDIAN_MIN_RAW_OCC: f64 = 0.6;
 
+/// Minimum fraction of the median window that must still **carry a dealiased
+/// value** for a median to be reported at all.
+///
+/// [`MEDIAN_MIN_RAW_OCC`] asks whether the radar sampled this sky, and counts
+/// raw cells on purpose, so that a censored fold wall — a thin line
+/// [`CENSOR_VNY_FRAC`] removes from an otherwise complete neighbourhood — does
+/// not deplete a window the radar did fill. That reasoning is right about a
+/// wall and says nothing about a *region*. Where the censor has taken most of
+/// the window, what is left is not a sample of the sky: it is the censor's
+/// leftovers, and they are selected for standing on opposite sides of the jump
+/// the censor found. A median over that set is a median of two fold branches,
+/// and its value need lie in neither of them.
+///
+/// # The bin that measured it
+///
+/// KCRP 2017-08-26, az 73.26°, 9.52 nm. The wind sits at the fold, the raw
+/// sweep is a ±30 checkerboard against a declared 31.52, and the censor cuts it
+/// to a filament: the dealiased window holds **9 of its 25 cells**, reading
+///
+/// ```text
+///     31   30   -31   30   30   0   -30   -30   0
+/// ```
+///
+/// Sorted, that has median **0.00** — at a bin whose own dealiased value is
+/// **+30.00**, and with no cell of the window within 29 of the answer. The
+/// stencil then differentiates the ramp that leaves, and reads −4.776, the
+/// largest magnitude this module produced anywhere on the nine decoded cuts
+/// where the second largest is 2.14. GR2Analyst hovered there reads **+0.18**.
+///
+/// # Where 0.37 comes from
+///
+/// Two-sided, measured through the pipeline at all nine decoded sites, painted
+/// and agreeing bins over the 7.05–20 nm annulus:
+///
+/// ```text
+///     floor       0.32    0.33 .. 0.40    0.41    0.45
+///     KCRP     941/905         935/905  935/905  935/905
+///     KDMX    1453/1107       1453/1107 1452/1107 1450/1106
+///     KTLX     1640/730        1640/730  1640/730  1639/730
+///     KDDC    2731/2161       2731/2161 2731/2161 2730/2161
+/// ```
+///
+/// Below 0.33 the rule does not fire at all; from 0.41 it starts taking bins
+/// off sites it has no business touching. Across the whole plateau the six
+/// remaining sites are **bit-identical**, so 0.37 is the middle of it with
+/// about a tenth of its own value in hand on each side — the two-sided form
+/// [`COH_MAX_STRADDLE`] is chosen by.
+///
+/// # What it moves
+///
+/// Six bins at KCRP, and nothing else anywhere. All six are bins the reference
+/// reads ND at, so **no agreeing bin is lost at any site** — the failure mode
+/// that refused the three magnitude guards a sibling swept, each of which cost
+/// KTLX between 24 and 380. KCRP's spurious count falls 36 → 30 and its
+/// precision rises 0.9617 → 0.9679, with the mean magnitude of what it still
+/// over-paints falling 0.729 → 0.281 and the count of those at or above 0.42
+/// falling 7 → 1. The four bins above are gone, and the largest magnitude this
+/// module reports anywhere on the nine cuts falls **4.7759 → 2.1445**: nothing
+/// on any of them now exceeds |2.2| at all. KTLX holds 1640 painted, 730
+/// agreeing and 0.4451 precision to the digit, KHNX holds 0, the KFTG
+/// 2023-06-22 core holds +1.68 +1.50 +1.59 +1.75, and the 216-rung scorecard
+/// holds 195 rungs and 155 cells exactly right.
+///
+/// # A circular median is the estimator this asks for, and it is worse
+///
+/// Velocity near the limit is circular — at 31.52 the +31 and the −31 above are
+/// 1.04 m/s apart, not 62 — so the linear median is formally the wrong
+/// estimator and a circular one is the right one. It was built and measured
+/// four ways: anchored on the centre's own branch, anchored only where the
+/// dealiaser had claimed no branch, restricted to the cells it had not claimed,
+/// and unanchored (the rotation of the sorted phases minimising the sum of
+/// circular distances). At KTLX, whose field the dealiaser leaves largely
+/// unclaimed, every one of them re-branches ordinary resolved shear — one fold
+/// is 22.98 m/s there and a 5 × 5 window reaches it:
+///
+/// ```text
+///                              KTLX painted / agreeing / precision   KCRP worst
+///     as shipped                      1640 /  730 / 0.4451              4.7759
+///     circular, centre-anchored       2402 /  813 / 0.3385              5.0000
+///     circular, unclaimed cells only  1834 /  756 / 0.4122              5.0000
+///     circular, unanchored            2289 /  800 / 0.3495              5.0000
+///     this floor                      1640 /  730 / 0.4451              2.1445
+/// ```
+///
+/// Each costs KTLX a fifth of its precision, and each drives KCRP's worst bin
+/// **to the ±[`NROT_LIMIT`] clamp** rather than away from it: fixing the
+/// estimator at az 73.26° moves that bin's median to the +30.00 it should be,
+/// but its neighbours at 73.77° and 74.21° are centred on genuine 0.00 gates
+/// and anchor there, so the ramp the operator reads gets steeper, not flatter.
+/// The branch is a property of the neighbourhood and a per-bin estimator cannot
+/// choose it. Refusing the window is what is left.
+const MEDIAN_MIN_DEALIASED_OCC: f64 = 0.37;
+
 /// The coverage rule this filter is often blamed for costs nothing where it is
 /// blamed, and the rule it does **not** have is what costs.
 ///
@@ -1045,6 +1138,13 @@ fn median_filter(
                     // fold walls carry raw data and must not deplete the
                     // window, only genuinely missing samples do.
                     if (raw_occ as f64) < MEDIAN_MIN_RAW_OCC * slots as f64 {
+                        return f64::NAN;
+                    }
+                    // And the window has to be a neighbourhood, not what the
+                    // fold censor left of one: the survivors of a censored
+                    // region stand on both sides of the jump it found, so their
+                    // median can land on neither.
+                    if (window.len() as f64) < MEDIAN_MIN_DEALIASED_OCC * slots as f64 {
                         return f64::NAN;
                     }
                     window.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
@@ -4646,6 +4746,58 @@ mod tests {
         let filtered = median_filter(&grid, &grid, gates, 0.25, 0.25, rows_for(&azs, n));
         assert_eq!(filtered[20][20], 10.0);
         assert_eq!(filtered[10][10], 10.0);
+    }
+
+    /// A window the fold censor has emptied has no median, and the linear one
+    /// it used to report stood on neither branch of what was left.
+    ///
+    /// This is the KCRP 2017-08-26 bin at az 73.26°, 9.52 nm reduced to its
+    /// arithmetic: the raw sweep carries velocity everywhere, so
+    /// [`MEDIAN_MIN_RAW_OCC`] is satisfied, while the dealiased grid holds 9 of
+    /// the window's 25 cells and they read ±30 on both sides of the fold with
+    /// two genuine zeroes between. The sorted median is 0.00 at a centre of
+    /// +30.00 — the value that produced −4.776, the loudest bin the module had.
+    #[test]
+    fn a_median_window_the_censor_emptied_reports_nothing() {
+        let n = 40;
+        let gates = 40;
+        // Raw is complete: the sky was sampled, so the raw cliff is not what
+        // decides this.
+        let raw: Vec<Vec<f64>> = vec![vec![30.0; gates]; n];
+        let mut deal: Vec<Vec<f64>> = vec![vec![f64::NAN; gates]; n];
+        let survivors = [
+            (18, 19, 31.0),
+            (18, 20, 30.0),
+            (19, 18, -31.0),
+            (19, 19, 30.0),
+            (20, 20, 30.0),
+            (21, 20, 0.0),
+            (21, 21, -30.0),
+            (22, 18, -30.0),
+            (22, 20, 0.0),
+        ];
+        for (i, j, v) in survivors {
+            deal[i][j] = v;
+        }
+        let azs = ring_azimuths(n);
+        // 0.5 km first gate and 0.5 km gates put az_half at its cap of 2, so
+        // the window is the 5 × 5 the reading above was taken over.
+        let rows = rows_for(&azs, n);
+        let filtered = median_filter(&deal, &raw, gates, 0.5, 0.5, rows);
+        assert_eq!(deal[20][20], 30.0, "the centre carries a dealiased value");
+        assert!(
+            filtered[20][20].is_nan(),
+            "9 of 25 cells is under MEDIAN_MIN_DEALIASED_OCC, so there is no \
+             neighbourhood to take a median of; got {}",
+            filtered[20][20]
+        );
+        // A window the censor left alone still reports, at the same occupancy
+        // floor the raw cliff has always allowed.
+        let full: Vec<Vec<f64>> = vec![vec![30.0; gates]; n];
+        assert_eq!(
+            median_filter(&full, &raw, gates, 0.5, 0.5, rows)[20][20],
+            30.0
+        );
     }
 
     /// The divisor curve is the reference's own, read off it at 60 ranges on
