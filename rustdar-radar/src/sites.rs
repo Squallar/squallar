@@ -7,19 +7,36 @@ use std::sync::{LazyLock, RwLock};
 ///
 /// A site has two, and they are 30–115 ft apart: the ground the tower stands
 /// on, and the feedhorn on top of it. A single number cannot say which, and
-/// for 201 of the 207 rows nobody had ever checked which one this table was
-/// on — so every consumer that added a site height to a beam height was
-/// choosing a datum by inheritance. This type makes the choice a word in the
-/// call.
+/// while the network shipped as a compiled-in table nobody had checked which
+/// one 201 of its 207 rows were on — so every consumer that added a site
+/// height to a beam height was choosing a datum by inheritance. This type
+/// makes the choice a word in the call, and it outlives that table because the
+/// two datums are a property of the measurement rather than of the list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Datum {
     /// The ground under the tower — `site_height` in a Volume Data Block.
     ///
-    /// This is what the table was on before [`Datum`] existed, and it is
-    /// **not** what a beam height should be added to: it is the terrain, not
-    /// the instrument. Kept because the table records it, because it is what
-    /// a question about the ground would want, and because
-    /// `the_two_datums_are_a_tower_apart` needs both to compare.
+    /// **Learned-only, and asked for by nothing.** The first is pinned by
+    /// `only_a_volume_can_answer_the_base_datum`; the second by the tripwire
+    /// each geometry consumer already carries —
+    /// `the_render_paths_site_height_is_the_feedhorn` in [`crate::render`],
+    /// and the equivalents in [`crate::voxel`] and [`crate::xsect`], every one
+    /// of which fails if its call is switched back to this variant.
+    ///
+    /// The only source that separates a base from a tower is a WSR-88D's own
+    /// Volume Data Block, which reports the two fields independently. A
+    /// published station record gives one elevation and no way to split it, so
+    /// a radar this install has only ever read about answers `None` here. That
+    /// became the common case when the compiled-in table was deleted: before,
+    /// 161 rows shipped with both figures; now a row has both only if a volume
+    /// this install decoded said so.
+    ///
+    /// It survives that narrowing because the distinction is 30–115 ft and is
+    /// still in the data — [`SiteHeights::BaseAndTower`] is what every learned
+    /// WSR-88D row holds — and because naming a datum at the call is what
+    /// stops the four geometry consumers drifting back onto the ground. It is
+    /// **not** what a beam height should be added to: [`crate::beam`] measures
+    /// above the antenna, so that is [`Datum::Feedhorn`].
     SiteBase,
     /// The feedhorn — `site_height + tower_height`, the point [`crate::beam`]
     /// measures every height above, and the figure a published station record
@@ -53,7 +70,9 @@ pub enum SiteHeights {
     /// feedhorn, and hence no answer at all for [`Datum::SiteBase`]: the base
     /// is unknown, not equal to this.
     ///
-    /// `LPLA` (Lajes) is here too, for a different reason — see [`radars()`].
+    /// This is also the only shape [`SiteFix::Network`] can produce, because a
+    /// published station record quotes one elevation and offers nothing to
+    /// split it with.
     FeedhornOnly { feedhorn_ft: i32 },
 }
 
@@ -68,11 +87,17 @@ pub struct RadarSite {
     pub lon: f64,
     /// The heights this row records, or `None` if it records none.
     ///
-    /// Nothing in the shipped table is `None` —
-    /// `every_site_records_an_elevation` keeps it that way, because a missing
+    /// No row any source can produce is `None` —
+    /// `every_placed_row_records_an_elevation` keeps it that way over both
+    /// [`SiteFix::Learned`] and [`SiteFix::Network`], because a missing
     /// elevation used to reach [`crate::eet::radar_height_ft_near`] and come
     /// back as sea level, which is a plausible-looking answer for a coastal
     /// site and a 292 ft error at KLWX.
+    ///
+    /// The `Option` stays because the field is public and the type must not
+    /// let a hand-built row assert an elevation it does not have. A radar with
+    /// no height *at all* is expressed by having no row —
+    /// [`SiteTable::unplaced`] — not by a row full of zeros.
     pub heights: Option<SiteHeights>,
 }
 
@@ -107,1835 +132,53 @@ impl RadarSite {
 /// caller finds out which.
 pub const UNKNOWN_SITE_NAME: &str = "UNKNOWN";
 
-/// Every radar site, at the position and height its own Level II volume
-/// reports.
+/// Every radar this process knows about, resolved once and then extended.
 ///
-/// # Where the figures come from
+/// # There is no compiled-in table under this
 ///
-/// One archive volume per site, read out of the Volume Data Block of its
-/// first message 31 by the `site_elev_probe` instrument on the
-/// `campaign/site-position-probe` branch, which is also what measured
-/// everything claimed below. The bucket is `unidata-nexrad-level2` — the same
-/// Level II origin [`crate::sources`] gives the application, current to the
-/// day, rather than the Google mirror that runs three weeks behind.
+/// There used to be: a `const SEED: [RadarSite; 207]`, every row measured out
+/// of that site's own Level II volume on one day. It was correct on the day it
+/// was compiled and it rotted from then on — a radar commissioned, relocated
+/// or re-surveyed after the build was one the binary could never learn about,
+/// and a binary that carries a list of the network is a binary whose list is
+/// wrong for the rest of its life.
 ///
-/// Position and height are read from the *same* volume for every row, never
-/// one without the other. A row carrying one site's coordinates and another
-/// epoch's height is worse than a consistently stale row, and `RKSG` is why:
-/// the pass that corrected heights alone had to skip it, because giving it
-/// Camp Humphreys' height while it kept Osan's position would have turned a
-/// self-consistently wrong row into an incoherent one.
+/// So a fresh process starts with **no radars at all**, and everything below
+/// answers `None` until something outside the binary says otherwise. The three
+/// things that can are, in order of authority: a volume this install decoded
+/// ([`SiteFix::Learned`]), the fetched network catalogue ([`SiteFix::Network`]),
+/// and — for a radar the catalogue lists but cannot place — bare membership
+/// ([`SiteFix::Unplaced`]).
 ///
-/// # The epoch policy: the most recent volume, per site
+/// An empty table is a real state and not a broken one, and every consumer is
+/// written for it: `nearest_wsr88d_site` answers `None`, the map draws no
+/// marker, and [`crate::eet::radar_height_ft_near`] answers `None` rather than
+/// the sea level a missing row used to degrade to.
 ///
-/// Reported position and height are step functions, not drifting ones. Across
-/// nine epochs from 2026-01 to 2026-08, no site changed its reported height
-/// and exactly one changed its reported position; across 2017–2023 `RODN`
-/// reports its position bit-identically at every epoch. Where a figure does
-/// move it moves once and stays: `KTLX` stepped 43 m and 1 m in a re-survey
-/// between 2013 and 2016 and has not moved since.
+/// # Rows, and members with no row
 ///
-/// So the rule is **the most recent volume that decodes**, and no averaging
-/// or voting across epochs — a vote would keep a relocated radar at its old
-/// site for as many years as it stood there, which is exactly the `RKSG`
-/// failure. `MOVED_ONTO_ITS_VOLUME` records the epoch each correction was
-/// read at; 202 of the 206 come from one day, 2026-08-10.
+/// [`rows`](Self::rows) is every radar this process can *place*. Some radars
+/// are known to exist and cannot be placed — `TPBI` and `KCRI` have Level II
+/// data in the archive bucket and 404 from `api.weather.gov/radar/stations` —
+/// and those are [`unplaced`](Self::unplaced) instead.
 ///
-/// # What is corrected, and by what rule
+/// Keeping them out of `rows` is deliberate: a row needs a latitude and a
+/// longitude, and the only numbers available for one of these would be zeros,
+/// which is a marker in the Gulf of Guinea drawn with exactly the confidence
+/// of a real one. Keeping them *somewhere* is equally deliberate: Level II
+/// data is fetched by identifier and not by position, so a user can open one
+/// of these and the volume that arrives then places it for good.
 ///
-/// * **Position** — every row takes what its volume reports, to 5 dp. 193
-///   rows moved, by a median of 49 m; 50 moved further than one 250 m data
-///   cell and 42 further than a kilometre. Afterwards the table agrees with
-///   `api.weather.gov/radar/stations` to a median of 1.5 m with no row over
-///   a kilometre, against a median of 33 m and 41 rows over a kilometre
-///   before.
-/// * **Height** — a row keeps the figure it has unless it disagrees with its
-///   volume by 1 m or more, the resolution of the volume's own field, below
-///   which the volume cannot adjudicate. Over all 367 height components in
-///   the table exactly one crosses that line: `RKSG`'s base, by 423 m. The
-///   table's foot figures are otherwise the finer expression of the same
-///   metre and are kept — `TICH` reads 1351 ft where its volume truncates to
-///   411 m, and 411.78 m is what the published station record holds.
+/// # Why the rows are leaked
 ///
-/// # The TDWR block came from somewhere else
-///
-/// The 45 TDWR rows were wrong in position at a scale the 161 others were
-/// not: median 3.7 km against 33 m, every single row past a data cell, 40 of
-/// them past a kilometre and `TICH` 11.7 km out. That is a whole-source
-/// defect rather than 45 mistakes.
-///
-/// It is *not* the airport reference point, which is the obvious suspect and
-/// was measured: across the 40 TDWR sites whose airport `api.weather.gov`
-/// knows, the old rows sat a median 16.2 km from the airport and 3.2 km from
-/// the radar, and not one was nearer the airport than the radar. Nor is it a
-/// datum shift, which is a 100 m effect. The heights in the same 45 rows were
-/// right all along, to better than a metre — so position and height in the
-/// TDWR block never shared a source.
-///
-/// # Rows with no volume
-///
-/// `LPLA` (Lajes) is in no epoch of either the Unidata bucket or the Google
-/// mirror, back to 2011, and keeps everything it had. `KLIX` and `RODN` are
-/// corrected from their most recent volumes, of 2023-11 and 2023-08; neither
-/// has produced data since, and `RODN` is the one row where the volume and
-/// `api.weather.gov` disagree past 250 m — 901 m — with the volume steady
-/// across seven epochs. The volume wins, because it is the position the RDA
-/// georeferences its own data against, and the disagreement is recorded here
-/// rather than split.
-///
-/// # Why this is a seed and not the table
-///
-/// Everything above describes a snapshot taken on one day, and a binary that
-/// can only ever know these 207 rows rots: a radar commissioned after the
-/// build is a site the app cannot name, cannot draw and cannot centre on, and
-/// no amount of care about the figures below changes that.
-///
-/// So this is the *seed* the process resolves its table from. It is private,
-/// and reachable only through [`radars()`] — never by position, because a
-/// runtime table can be a different length than this one and an index into
-/// the array would then name a different radar than the one it was minted
-/// for. [`resolve`] overlays the seed with what an install has learned from
-/// the volumes it has actually read, and a later stage will overlay it again
-/// from the network. A row here is a starting guess with a name attached, not
-/// the last word.
-const SEED: [RadarSite; 207] = [
-    RadarSite {
-        name: "KABR",
-        lat: 45.45583,
-        lon: -98.41333,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1302,
-            tower_ft: 79,
-        }),
-    },
-    RadarSite {
-        name: "KABX",
-        lat: 35.14972,
-        lon: -106.82389,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 5870,
-            tower_ft: 79,
-        }),
-    },
-    RadarSite {
-        name: "KAKQ",
-        lat: 36.98405,
-        lon: -77.00736,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 157,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KAMA",
-        lat: 35.23333,
-        lon: -101.70927,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 3622,
-            tower_ft: 79,
-        }),
-    },
-    RadarSite {
-        name: "KAMX",
-        lat: 25.61108,
-        lon: -80.41267,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 14,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KAPX",
-        lat: 44.90635,
-        lon: -84.71954,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1464,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KARX",
-        lat: 43.82278,
-        lon: -91.19111,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1276,
-            tower_ft: 79,
-        }),
-    },
-    RadarSite {
-        name: "KATX",
-        lat: 48.19461,
-        lon: -122.4957,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 528,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KBBX",
-        lat: 39.49564,
-        lon: -121.63161,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 173,
-            tower_ft: 46,
-        }),
-    },
-    RadarSite {
-        name: "KBGM",
-        lat: 42.1997,
-        lon: -75.98473,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1606,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KBHX",
-        lat: 40.49858,
-        lon: -124.29217,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 2402,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KBIS",
-        lat: 46.77083,
-        lon: -100.76056,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1658,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KBLX",
-        lat: 45.85378,
-        lon: -108.6068,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 3638,
-            tower_ft: 62,
-        }),
-    },
-    RadarSite {
-        name: "KBMX",
-        lat: 33.17242,
-        lon: -86.77016,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 645,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KBOX",
-        lat: 41.95578,
-        lon: -71.13686,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 118,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KBRO",
-        lat: 25.916,
-        lon: -97.41897,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 23,
-            tower_ft: 62,
-        }),
-    },
-    RadarSite {
-        name: "KBUF",
-        lat: 42.94879,
-        lon: -78.73678,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 693,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KBYX",
-        lat: 24.5975,
-        lon: -81.70316,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 8,
-            tower_ft: 79,
-        }),
-    },
-    RadarSite {
-        name: "KCAE",
-        lat: 33.94872,
-        lon: -81.11828,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 231,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KCBW",
-        lat: 46.03925,
-        lon: -67.80643,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 746,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KCBX",
-        lat: 43.49021,
-        lon: -116.23603,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 3091,
-            tower_ft: 79,
-        }),
-    },
-    RadarSite {
-        name: "KCCX",
-        lat: 40.92317,
-        lon: -78.00372,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 2405,
-            tower_ft: 79,
-        }),
-    },
-    RadarSite {
-        name: "KCLE",
-        lat: 41.41322,
-        lon: -81.85986,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 763,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KCLX",
-        lat: 32.65553,
-        lon: -81.0422,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 115,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KCRI",
-        lat: 35.23833,
-        lon: -97.46,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1201,
-            tower_ft: 114,
-        }),
-    },
-    RadarSite {
-        name: "KCRP",
-        lat: 27.78402,
-        lon: -97.51125,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 45,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KCXX",
-        lat: 44.511,
-        lon: -73.16643,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 317,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KCYS",
-        lat: 41.15192,
-        lon: -104.80603,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 6128,
-            tower_ft: 62,
-        }),
-    },
-    RadarSite {
-        name: "KDAX",
-        lat: 38.50111,
-        lon: -121.67783,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 30,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KDDC",
-        lat: 37.76083,
-        lon: -99.96889,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 2590,
-            tower_ft: 79,
-        }),
-    },
-    RadarSite {
-        name: "KDFX",
-        lat: 29.27314,
-        lon: -100.28033,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1131,
-            tower_ft: 62,
-        }),
-    },
-    RadarSite {
-        name: "KDGX",
-        lat: 32.27994,
-        lon: -89.98444,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 495,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KDIX",
-        lat: 39.94709,
-        lon: -74.41073,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 149,
-            tower_ft: 79,
-        }),
-    },
-    RadarSite {
-        name: "KDLH",
-        lat: 46.83695,
-        lon: -92.20972,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1428,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KDMX",
-        lat: 41.7312,
-        lon: -93.72287,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 981,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KDOX",
-        lat: 38.82577,
-        lon: -75.44012,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 50,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KDTX",
-        lat: 42.7,
-        lon: -83.47166,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1102,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KDVN",
-        lat: 41.61167,
-        lon: -90.58083,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 754,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KDYX",
-        lat: 32.5385,
-        lon: -99.25433,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1517,
-            tower_ft: 62,
-        }),
-    },
-    RadarSite {
-        name: "KEAX",
-        lat: 38.81025,
-        lon: -94.26447,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 995,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KEMX",
-        lat: 31.89365,
-        lon: -110.63025,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 5202,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KENX",
-        lat: 42.58655,
-        lon: -74.06409,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1854,
-            tower_ft: 79,
-        }),
-    },
-    RadarSite {
-        name: "KEOX",
-        lat: 31.46056,
-        lon: -85.45939,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 472,
-            tower_ft: 62,
-        }),
-    },
-    RadarSite {
-        name: "KEPZ",
-        lat: 31.87306,
-        lon: -106.698,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 4104,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KESX",
-        lat: 35.70135,
-        lon: -114.89165,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 4867,
-            tower_ft: 79,
-        }),
-    },
-    RadarSite {
-        name: "KEVX",
-        lat: 30.56503,
-        lon: -85.92167,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 140,
-            tower_ft: 79,
-        }),
-    },
-    RadarSite {
-        name: "KEWX",
-        lat: 29.70406,
-        lon: -98.02861,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 669,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KEYX",
-        lat: 35.09785,
-        lon: -117.56075,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 2776,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KFCX",
-        lat: 37.0244,
-        lon: -80.27397,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 2868,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KFDR",
-        lat: 34.36219,
-        lon: -98.97667,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1267,
-            tower_ft: 46,
-        }),
-    },
-    RadarSite {
-        name: "KFDX",
-        lat: 34.63417,
-        lon: -103.61889,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 4650,
-            tower_ft: 46,
-        }),
-    },
-    RadarSite {
-        name: "KFFC",
-        lat: 33.36355,
-        lon: -84.56595,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 858,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KFSD",
-        lat: 43.58778,
-        lon: -96.72945,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1430,
-            tower_ft: 62,
-        }),
-    },
-    RadarSite {
-        name: "KFSX",
-        lat: 34.57433,
-        lon: -111.19845,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 7418,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KFTG",
-        lat: 39.78664,
-        lon: -104.54581,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 5497,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KFWS",
-        lat: 32.573,
-        lon: -97.30315,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 696,
-            tower_ft: 79,
-        }),
-    },
-    RadarSite {
-        name: "KGGW",
-        lat: 48.20636,
-        lon: -106.6247,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 2303,
-            tower_ft: 79,
-        }),
-    },
-    RadarSite {
-        name: "KGJX",
-        lat: 39.06217,
-        lon: -108.21376,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 10036,
-            tower_ft: 62,
-        }),
-    },
-    RadarSite {
-        name: "KGLD",
-        lat: 39.36694,
-        lon: -101.70028,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 3651,
-            tower_ft: 62,
-        }),
-    },
-    RadarSite {
-        name: "KGRB",
-        lat: 44.49863,
-        lon: -88.11111,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 709,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KGRK",
-        lat: 30.72183,
-        lon: -97.38294,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 538,
-            tower_ft: 62,
-        }),
-    },
-    RadarSite {
-        name: "KGRR",
-        lat: 42.89389,
-        lon: -85.54489,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 778,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KGSP",
-        lat: 34.88331,
-        lon: -82.21983,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 955,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KGWX",
-        lat: 33.89691,
-        lon: -88.32919,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 509,
-            tower_ft: 79,
-        }),
-    },
-    RadarSite {
-        name: "KGYX",
-        lat: 43.8913,
-        lon: -70.25636,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 409,
-            tower_ft: 62,
-        }),
-    },
-    RadarSite {
-        name: "KHDC",
-        lat: 30.51931,
-        lon: -90.40736,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 43,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KHDX",
-        lat: 33.077,
-        lon: -106.12003,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 4222,
-            tower_ft: 46,
-        }),
-    },
-    RadarSite {
-        name: "KHGX",
-        lat: 29.4719,
-        lon: -95.07873,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 18,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KHNX",
-        lat: 36.31418,
-        lon: -119.63214,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 243,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KHPX",
-        lat: 36.73697,
-        lon: -87.28558,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 564,
-            tower_ft: 46,
-        }),
-    },
-    RadarSite {
-        name: "KHTX",
-        lat: 34.93056,
-        lon: -86.08361,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1760,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KICT",
-        lat: 37.65445,
-        lon: -97.44305,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1335,
-            tower_ft: 62,
-        }),
-    },
-    RadarSite {
-        name: "KICX",
-        lat: 37.59105,
-        lon: -112.86218,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 10643,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KILN",
-        lat: 39.42048,
-        lon: -83.82145,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1056,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KILX",
-        lat: 40.1505,
-        lon: -89.33679,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 617,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KIND",
-        lat: 39.7075,
-        lon: -86.28028,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 790,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KINX",
-        lat: 36.17513,
-        lon: -95.56416,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 668,
-            tower_ft: 79,
-        }),
-    },
-    RadarSite {
-        name: "KIWA",
-        lat: 33.28923,
-        lon: -111.66991,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1362,
-            tower_ft: 62,
-        }),
-    },
-    RadarSite {
-        name: "KIWX",
-        lat: 41.35861,
-        lon: -85.7,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 960,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KJAX",
-        lat: 30.48463,
-        lon: -81.7019,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 62,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KJGX",
-        lat: 32.67568,
-        lon: -83.35083,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 521,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KJKL",
-        lat: 37.59083,
-        lon: -83.31306,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1364,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KLBB",
-        lat: 33.65414,
-        lon: -101.81416,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 3297,
-            tower_ft: 79,
-        }),
-    },
-    RadarSite {
-        name: "KLCH",
-        lat: 30.12531,
-        lon: -93.21589,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 56,
-            tower_ft: 79,
-        }),
-    },
-    RadarSite {
-        name: "KLGX",
-        lat: 47.11694,
-        lon: -124.10667,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 252,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KLIX",
-        lat: 30.33667,
-        lon: -89.82542,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 66,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KLNX",
-        lat: 41.95794,
-        lon: -100.57622,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 3015,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KLOT",
-        lat: 41.60444,
-        lon: -88.08444,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 663,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KLRX",
-        lat: 40.73955,
-        lon: -116.8027,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 6781,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KLSX",
-        lat: 38.69861,
-        lon: -90.68278,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 608,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KLTX",
-        lat: 33.98915,
-        lon: -78.42911,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 64,
-            tower_ft: 79,
-        }),
-    },
-    RadarSite {
-        name: "KLVX",
-        lat: 37.97528,
-        lon: -85.94389,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 719,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KLWX",
-        lat: 38.97611,
-        lon: -77.4875,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 292,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KLZK",
-        lat: 34.8365,
-        lon: -92.26219,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 568,
-            tower_ft: 79,
-        }),
-    },
-    RadarSite {
-        name: "KMAF",
-        lat: 31.94346,
-        lon: -102.18925,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 2897,
-            tower_ft: 62,
-        }),
-    },
-    RadarSite {
-        name: "KMAX",
-        lat: 42.08117,
-        lon: -122.71737,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 7513,
-            tower_ft: 46,
-        }),
-    },
-    RadarSite {
-        name: "KMBX",
-        lat: 48.39305,
-        lon: -100.86444,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1493,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KMHX",
-        lat: 34.77591,
-        lon: -76.87619,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 31,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KMKX",
-        lat: 42.9679,
-        lon: -88.55067,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 958,
-            tower_ft: 62,
-        }),
-    },
-    RadarSite {
-        name: "KMLB",
-        lat: 28.11319,
-        lon: -80.65408,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 36,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KMOB",
-        lat: 30.67945,
-        lon: -88.24,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 208,
-            tower_ft: 79,
-        }),
-    },
-    RadarSite {
-        name: "KMPX",
-        lat: 44.84889,
-        lon: -93.56553,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 988,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KMQT",
-        lat: 46.53111,
-        lon: -87.54833,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1411,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KMRX",
-        lat: 36.16861,
-        lon: -83.40195,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1337,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KMSX",
-        lat: 47.041,
-        lon: -113.98622,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 7930,
-            tower_ft: 46,
-        }),
-    },
-    RadarSite {
-        name: "KMTX",
-        lat: 41.26278,
-        lon: -112.44778,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 6480,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KMUX",
-        lat: 37.15522,
-        lon: -121.89844,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 3469,
-            tower_ft: 79,
-        }),
-    },
-    RadarSite {
-        name: "KMVX",
-        lat: 47.52778,
-        lon: -97.32555,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 986,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KMXX",
-        lat: 32.53665,
-        lon: -85.78975,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 446,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KNKX",
-        lat: 32.91902,
-        lon: -117.0418,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 955,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KNQA",
-        lat: 35.34472,
-        lon: -89.87334,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 338,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KOAX",
-        lat: 41.32037,
-        lon: -96.36682,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1148,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KOHX",
-        lat: 36.24722,
-        lon: -86.5625,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 579,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KOKX",
-        lat: 40.86553,
-        lon: -72.86391,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 85,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KOTX",
-        lat: 47.68042,
-        lon: -117.62678,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 2384,
-            tower_ft: 62,
-        }),
-    },
-    RadarSite {
-        name: "KPAH",
-        lat: 37.06833,
-        lon: -88.77194,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 392,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KPBZ",
-        lat: 40.53171,
-        lon: -80.21796,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1185,
-            tower_ft: 79,
-        }),
-    },
-    RadarSite {
-        name: "KPDT",
-        lat: 45.69065,
-        lon: -118.85293,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1515,
-            tower_ft: 62,
-        }),
-    },
-    RadarSite {
-        name: "KPOE",
-        lat: 31.15528,
-        lon: -92.97611,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 408,
-            tower_ft: 62,
-        }),
-    },
-    RadarSite {
-        name: "KPUX",
-        lat: 38.45955,
-        lon: -104.18135,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 5299,
-            tower_ft: 62,
-        }),
-    },
-    RadarSite {
-        name: "KRAX",
-        lat: 35.66552,
-        lon: -78.48975,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 348,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KRGX",
-        lat: 39.75406,
-        lon: -119.46203,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 8299,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KRIW",
-        lat: 43.06609,
-        lon: -108.4773,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 5568,
-            tower_ft: 62,
-        }),
-    },
-    RadarSite {
-        name: "KRLX",
-        lat: 38.31111,
-        lon: -81.72278,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1099,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KRTX",
-        lat: 45.71504,
-        lon: -122.965,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1614,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KSFX",
-        lat: 43.1056,
-        lon: -112.68613,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 4474,
-            tower_ft: 62,
-        }),
-    },
-    RadarSite {
-        name: "KSGF",
-        lat: 37.23524,
-        lon: -93.40042,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1278,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KSHV",
-        lat: 32.45083,
-        lon: -93.84125,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 273,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KSJT",
-        lat: 31.37128,
-        lon: -100.4925,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1890,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KSOX",
-        lat: 33.81773,
-        lon: -117.636,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 3041,
-            tower_ft: 62,
-        }),
-    },
-    RadarSite {
-        name: "KSRX",
-        lat: 35.29042,
-        lon: -94.36189,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 656,
-            tower_ft: 79,
-        }),
-    },
-    RadarSite {
-        name: "KTBW",
-        lat: 27.7055,
-        lon: -82.40178,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 41,
-            tower_ft: 79,
-        }),
-    },
-    RadarSite {
-        name: "KTFX",
-        lat: 47.45958,
-        lon: -111.38533,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 3740,
-            tower_ft: 62,
-        }),
-    },
-    RadarSite {
-        name: "KTLH",
-        lat: 30.39758,
-        lon: -84.32894,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 63,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KTLX",
-        lat: 35.33336,
-        lon: -97.27776,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1213,
-            tower_ft: 62,
-        }),
-    },
-    RadarSite {
-        name: "KTWX",
-        lat: 38.99695,
-        lon: -96.23255,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1367,
-            tower_ft: 46,
-        }),
-    },
-    RadarSite {
-        name: "KTYX",
-        lat: 43.7557,
-        lon: -75.67986,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1846,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KUDX",
-        lat: 44.12472,
-        lon: -102.83,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 3081,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KUEX",
-        lat: 40.32084,
-        lon: -98.44195,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1976,
-            tower_ft: 79,
-        }),
-    },
-    RadarSite {
-        name: "KVAX",
-        lat: 30.89028,
-        lon: -83.00181,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 217,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KVBX",
-        lat: 34.83855,
-        lon: -120.39792,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1257,
-            tower_ft: 95,
-        }),
-    },
-    RadarSite {
-        name: "KVNX",
-        lat: 36.74062,
-        lon: -98.12772,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1210,
-            tower_ft: 46,
-        }),
-    },
-    RadarSite {
-        name: "KVTX",
-        lat: 34.41202,
-        lon: -119.17875,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 2726,
-            tower_ft: 79,
-        }),
-    },
-    RadarSite {
-        name: "KVWX",
-        lat: 38.26025,
-        lon: -87.72452,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 512,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "KYUX",
-        lat: 32.49528,
-        lon: -114.65671,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 174,
-            tower_ft: 62,
-        }),
-    },
-    RadarSite {
-        name: "LPLA",
-        lat: 38.73028,
-        lon: -27.32167,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 3334 }),
-    },
-    RadarSite {
-        name: "PABC",
-        lat: 60.79194,
-        lon: -161.87639,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 162,
-            tower_ft: 30,
-        }),
-    },
-    RadarSite {
-        name: "PACG",
-        lat: 56.85278,
-        lon: -135.52916,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 207,
-            tower_ft: 62,
-        }),
-    },
-    RadarSite {
-        name: "PAEC",
-        lat: 64.51139,
-        lon: -165.295,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 59,
-            tower_ft: 30,
-        }),
-    },
-    RadarSite {
-        name: "PAHG",
-        lat: 60.72591,
-        lon: -151.35147,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 243,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "PAIH",
-        lat: 59.46077,
-        lon: -146.30345,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 67,
-            tower_ft: 62,
-        }),
-    },
-    RadarSite {
-        name: "PAKC",
-        lat: 58.67944,
-        lon: -156.62944,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 63,
-            tower_ft: 79,
-        }),
-    },
-    RadarSite {
-        name: "PAPD",
-        lat: 65.03511,
-        lon: -147.50143,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 2593,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "PGUA",
-        lat: 13.45583,
-        lon: 144.81111,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 272,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "PHKI",
-        lat: 21.89389,
-        lon: -159.5525,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 226,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "PHKM",
-        lat: 20.12528,
-        lon: -155.77777,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 3852,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "PHMO",
-        lat: 21.13278,
-        lon: -157.18028,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1363,
-            tower_ft: 79,
-        }),
-    },
-    RadarSite {
-        name: "PHWA",
-        lat: 19.095,
-        lon: -155.56889,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1381,
-            tower_ft: 79,
-        }),
-    },
-    RadarSite {
-        name: "RKJK",
-        lat: 35.92417,
-        lon: 126.62222,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 78,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "RKSG",
-        lat: 37.20757,
-        lon: 127.28556,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 1440,
-            tower_ft: 79,
-        }),
-    },
-    RadarSite {
-        name: "RODN",
-        lat: 26.3078,
-        lon: 127.90347,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 299,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "TJUA",
-        lat: 18.11567,
-        lon: -66.07816,
-        heights: Some(SiteHeights::BaseAndTower {
-            base_ft: 2844,
-            tower_ft: 112,
-        }),
-    },
-    RadarSite {
-        name: "TJFK",
-        lat: 40.589,
-        lon: -73.88,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 112 }),
-    },
-    RadarSite {
-        name: "TADW",
-        lat: 38.695,
-        lon: -76.845,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 346 }),
-    },
-    RadarSite {
-        name: "TATL",
-        lat: 33.647,
-        lon: -84.262,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 1075 }),
-    },
-    RadarSite {
-        name: "TBNA",
-        lat: 35.98,
-        lon: -86.662,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 817 }),
-    },
-    RadarSite {
-        name: "TBOS",
-        lat: 42.158,
-        lon: -70.933,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 264 }),
-    },
-    RadarSite {
-        name: "TBWI",
-        lat: 39.09,
-        lon: -76.63,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 297 }),
-    },
-    RadarSite {
-        name: "TCLT",
-        lat: 35.337,
-        lon: -80.885,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 871 }),
-    },
-    RadarSite {
-        name: "TCMH",
-        lat: 40.006,
-        lon: -82.715,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 1148 }),
-    },
-    RadarSite {
-        name: "TCVG",
-        lat: 38.898,
-        lon: -84.58,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 1053 }),
-    },
-    RadarSite {
-        name: "TDAL",
-        lat: 32.926,
-        lon: -96.968,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 622 }),
-    },
-    RadarSite {
-        name: "TDAY",
-        lat: 40.022,
-        lon: -84.123,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 1019 }),
-    },
-    RadarSite {
-        name: "TDCA",
-        lat: 38.759,
-        lon: -76.962,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 345 }),
-    },
-    RadarSite {
-        name: "TDEN",
-        lat: 39.727,
-        lon: -104.526,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 5701 }),
-    },
-    RadarSite {
-        name: "TDFW",
-        lat: 33.065,
-        lon: -96.918,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 585 }),
-    },
-    RadarSite {
-        name: "TDTW",
-        lat: 42.111,
-        lon: -83.515,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 772 }),
-    },
-    RadarSite {
-        name: "TEWR",
-        lat: 40.594,
-        lon: -74.27,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 136 }),
-    },
-    RadarSite {
-        name: "TFLL",
-        lat: 26.143,
-        lon: -80.344,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 120 }),
-    },
-    RadarSite {
-        name: "THOU",
-        lat: 29.516,
-        lon: -95.242,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 117 }),
-    },
-    RadarSite {
-        name: "TIAD",
-        lat: 39.084,
-        lon: -77.529,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 473 }),
-    },
-    RadarSite {
-        name: "TIAH",
-        lat: 30.065,
-        lon: -95.567,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 253 }),
-    },
-    RadarSite {
-        name: "TICH",
-        lat: 37.507,
-        lon: -97.437,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 1351 }),
-    },
-    RadarSite {
-        name: "TIDS",
-        lat: 39.637,
-        lon: -86.435,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 847 }),
-    },
-    RadarSite {
-        name: "TLAS",
-        lat: 36.144,
-        lon: -115.007,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 2058 }),
-    },
-    RadarSite {
-        name: "TLVE",
-        lat: 41.29,
-        lon: -82.008,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 931 }),
-    },
-    RadarSite {
-        name: "TMCI",
-        lat: 39.499,
-        lon: -94.742,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 1090 }),
-    },
-    RadarSite {
-        name: "TMCO",
-        lat: 28.344,
-        lon: -81.326,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 169 }),
-    },
-    RadarSite {
-        name: "TMDW",
-        lat: 41.651,
-        lon: -87.73,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 763 }),
-    },
-    RadarSite {
-        name: "TMEM",
-        lat: 34.896,
-        lon: -89.993,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 483 }),
-    },
-    RadarSite {
-        name: "TMIA",
-        lat: 25.758,
-        lon: -80.491,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 125 }),
-    },
-    RadarSite {
-        name: "TMKE",
-        lat: 42.819,
-        lon: -88.046,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 933 }),
-    },
-    RadarSite {
-        name: "TMSP",
-        lat: 44.871,
-        lon: -92.933,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 1121 }),
-    },
-    RadarSite {
-        name: "TMSY",
-        lat: 30.022,
-        lon: -90.403,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 99 }),
-    },
-    RadarSite {
-        name: "TOKC",
-        lat: 35.276,
-        lon: -97.51,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 1308 }),
-    },
-    RadarSite {
-        name: "TORD",
-        lat: 41.797,
-        lon: -87.858,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 744 }),
-    },
-    RadarSite {
-        name: "TPBI",
-        lat: 26.688,
-        lon: -80.273,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 133 }),
-    },
-    RadarSite {
-        name: "TPHL",
-        lat: 39.949,
-        lon: -75.07,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 153 }),
-    },
-    RadarSite {
-        name: "TPHX",
-        lat: 33.42,
-        lon: -112.163,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 1089 }),
-    },
-    RadarSite {
-        name: "TPIT",
-        lat: 40.501,
-        lon: -80.486,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 1386 }),
-    },
-    RadarSite {
-        name: "TRDU",
-        lat: 36.002,
-        lon: -78.697,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 515 }),
-    },
-    RadarSite {
-        name: "TSDF",
-        lat: 38.046,
-        lon: -85.611,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 731 }),
-    },
-    RadarSite {
-        name: "TSJU",
-        lat: 18.474,
-        lon: -66.18,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 157 }),
-    },
-    RadarSite {
-        name: "TSLC",
-        lat: 40.967,
-        lon: -111.93,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 4295 }),
-    },
-    RadarSite {
-        name: "TSTL",
-        lat: 38.805,
-        lon: -90.489,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 647 }),
-    },
-    RadarSite {
-        name: "TTPA",
-        lat: 27.86,
-        lon: -82.518,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 93 }),
-    },
-    RadarSite {
-        name: "TTUL",
-        lat: 36.071,
-        lon: -95.826,
-        heights: Some(SiteHeights::FeedhornOnly { feedhorn_ft: 823 }),
-    },
-];
-
-/// Every radar this process knows about, resolved once and then fixed.
-///
-/// Holds its rows as `&'static [RadarSite]` because they are leaked on the way
-/// in, which is what lets every lookup below keep handing out
-/// `&'static RadarSite` the way the compiled-in array used to. Leaking is
-/// honest here rather than a dodge: a table is resolved a bounded number of
-/// times per process — once at startup, and once more on Android when the
-/// config directory arrives — and then read for the life of the process, so
-/// "lives forever" is a description of the value's real lifetime and not a
-/// promise being smuggled past the borrow checker.
+/// Held as `&'static [RadarSite]` because they are leaked on the way in, which
+/// is what lets every lookup below keep handing out `&'static RadarSite` the
+/// way the compiled-in array used to. Leaking is honest here rather than a
+/// dodge: a table is resolved a bounded number of times per process — once at
+/// startup, once more on Android when the config directory arrives, and once
+/// per radar whose volume the session decodes — and then read for the life of
+/// the process, so "lives forever" is a description of the value's real
+/// lifetime and not a promise being smuggled past the borrow checker.
 ///
 /// The name index is built with the rows and travels with them, so the two
 /// cannot disagree about which radars exist. That was the one real hazard in
@@ -1944,10 +187,13 @@ const SEED: [RadarSite; 207] = [
 pub struct SiteTable {
     rows: &'static [RadarSite],
     by_name: HashMap<&'static str, &'static RadarSite>,
+    /// Identifiers that exist but have no position, sorted and deduplicated.
+    /// Disjoint from `rows` by construction — see [`extended`].
+    unplaced: &'static [&'static str],
 }
 
 impl SiteTable {
-    /// Every row, in seed order with anything learned appended.
+    /// Every radar this table can place, in the order they were learned.
     ///
     /// Callers may walk this and may enumerate it, but must not store the
     /// enumeration index anywhere that outlives the walk: the next table can
@@ -1958,8 +204,26 @@ impl SiteTable {
         self.rows
     }
 
-    /// The row for an ICAO identifier, or `None` if this table has no such
-    /// radar.
+    /// Identifiers this table knows exist but cannot place, sorted.
+    ///
+    /// Never overlaps [`rows`](Self::rows): a radar that gains a position
+    /// leaves this list in the same resolution that gives it a row.
+    pub fn unplaced(&self) -> &'static [&'static str] {
+        self.unplaced
+    }
+
+    /// Whether this table has heard of `site` at all, placed or not.
+    ///
+    /// The membership question, as distinct from the position question that
+    /// [`get`](Self::get) asks. A site list wants this one; a map marker wants
+    /// the other.
+    pub fn knows(&self, site: &str) -> bool {
+        self.by_name.contains_key(site) || self.unplaced.contains(&site)
+    }
+
+    /// The row for an ICAO identifier, or `None` if this table cannot place
+    /// that radar — because it has never heard of it, or because it has heard
+    /// of it and has no position for it.
     pub fn get(&self, site: &str) -> Option<&'static RadarSite> {
         self.by_name.get(site).copied()
     }
@@ -2002,38 +266,41 @@ impl SiteTable {
 /// design:
 ///
 /// ```text
-/// Volume   the volume in hand   ScanInfo::from_scan     SitePositionSource
-/// Learned  an earlier volume    SiteFix::Learned        SiteFixRank
-/// Network  the fetched catalogue    SiteFix::Network    SiteFixRank
-/// Seed     the compiled-in SEED     (not a fix)         — the base table
+/// Volume    the volume in hand        ScanInfo::from_scan  SitePositionSource
+/// Learned   a volume, earlier         SiteFix::Learned     SiteFixRank
+/// Network   the fetched catalogue     SiteFix::Network     SiteFixRank
+/// Unplaced  the catalogue, positionless  SiteFix::Unplaced SiteFixRank
 /// ```
 ///
-/// The bottom rung has no variant on purpose: the seed is not something a
-/// caller can *supply*, it is the table a fix is applied **to**. So "Network
-/// beats Seed" is not a comparison this enum makes — it is the fact that a
-/// fix replaces the row it lands on. `the_precedence_is_volume_learned_network_seed`
-/// pins all four rungs together as one table.
+/// There is no rung below `Unplaced`. There used to be — a compiled-in seed
+/// the fixes were applied *to* — and deleting it removed the bottom of the
+/// ladder rather than changing the order of what is left: a radar no rung
+/// speaks for is now a radar this process has never heard of.
+/// `the_precedence_is_volume_learned_network_unplaced` pins all four rungs
+/// together as one table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SiteFixRank {
-    /// A volume this install decoded in an earlier session said so.
+    /// A volume this install decoded said so.
     Learned,
     /// The fetched network catalogue said so.
     Network,
+    /// The catalogue lists the radar and cannot say where it is. The weakest
+    /// claim there is — it asserts existence and nothing else — so any fix
+    /// that carries a position displaces it.
+    Unplaced,
 }
 
 /// One source's claim about where one radar is: the shape [`build_table`] and
 /// [`resolve`] take.
 ///
-/// # Why this is not a bare `SitePosition` any more
+/// # Why this is not a bare `SitePosition`
 ///
-/// It was, while a volume this install had decoded was the only thing that
-/// could contradict the seed. A [`SitePosition`] is specifically *a Volume Data
-/// Block's four fields* — position in micro-degrees plus `site_height` and
-/// `tower_height` as two separately-reported whole metres — and reading a
-/// published station record into that shape would have had to invent a tower.
+/// A [`SitePosition`] is specifically *a Volume Data Block's four fields* —
+/// position in micro-degrees plus `site_height` and `tower_height` as two
+/// separately-reported whole metres — and reading a published station record
+/// into that shape would have had to invent a tower.
 ///
-/// The network catalogue is a second source, and it differs from a volume in
-/// both directions:
+/// The network catalogue differs from a volume in both directions:
 ///
 /// * it has **less** height information — one elevation, on the feedhorn, with
 ///   no separable tower — so it can never fill a
@@ -2041,24 +308,28 @@ pub enum SiteFixRank {
 /// * it has **less authority** — it is a record about the radar rather than a
 ///   report from it — so where both sources speak the volume wins.
 ///
-/// A tuple of numbers could say neither. Naming the source says both, which is
-/// what the widening buys: [`rank`](Self::rank) makes the precedence a value,
-/// and [`applied`](Self::applied) makes each source's height provenance a
-/// branch instead of a convention.
+/// And a bucket listing has less than either: it says a radar exists and
+/// nothing more.
+///
+/// A tuple of numbers could say none of that. Naming the source says all of
+/// it: [`rank`](Self::rank) makes the precedence a value, and
+/// [`applied`](Self::applied) makes each source's height provenance a branch
+/// instead of a convention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SiteFix {
-    /// What a volume this install decoded stated about itself, remembered
-    /// across sessions. Carries the Volume Data Block's own fields, so it can
-    /// speak to both height datums and be adjudicated against a seeded row's
-    /// finer feet by [`SitePosition::heights_over`].
+    /// What a volume this install decoded stated about itself. Carries the
+    /// Volume Data Block's own fields, so it can speak to both height datums
+    /// and be adjudicated against an earlier row's finer feet by
+    /// [`SitePosition::heights_over`].
     Learned(SitePosition),
     /// What the fetched catalogue says: a position, and **one** elevation.
     ///
     /// The elevation is on the feedhorn. `api.weather.gov/radar/stations`
-    /// agrees with the seed — whose figures were read out of the volumes — to
-    /// a median of 1.5 m with no row past 187 m, and agrees with the *feedhorn*
-    /// wherever a WSR-88D lets the two be told apart. There is no tower figure
-    /// and none can be derived, which is why this is one number and not two.
+    /// agreed with the measured figures the deleted seed carried — read out of
+    /// the volumes themselves — to a median of 1.5 m with no row past 187 m,
+    /// and agrees with the *feedhorn* wherever a WSR-88D lets the two be told
+    /// apart. There is no tower figure and none can be derived, which is why
+    /// this is one number and not two.
     Network {
         /// Latitude, micro-degrees north.
         lat_udeg: i32,
@@ -2067,6 +338,18 @@ pub enum SiteFix {
         /// Feedhorn height, whole metres MSL.
         feedhorn_m: i32,
     },
+    /// The radar exists and nothing here knows where it is.
+    ///
+    /// The archive bucket lists an identifier that `api.weather.gov` does not
+    /// place: `TPBI` and `KCRI` are both, and both have real Level II data. A
+    /// claim with no numbers in it, so it produces no row — it produces
+    /// membership, which is what [`SiteTable::unplaced`] holds and what keeps
+    /// these radars in the site list instead of at Null Island.
+    ///
+    /// Weakest rung on purpose. A radar that is listed *and* placed gets both
+    /// fixes in the same stream, and the placed one wins by rank rather than
+    /// by whichever the caller happened to chain first.
+    Unplaced,
 }
 
 impl SiteFix {
@@ -2075,83 +358,71 @@ impl SiteFix {
         match self {
             Self::Learned(_) => SiteFixRank::Learned,
             Self::Network { .. } => SiteFixRank::Network,
+            Self::Unplaced => SiteFixRank::Unplaced,
         }
     }
 
     /// The row a radar called `name` becomes under this fix, given whatever
-    /// heights the row it is displacing already recorded.
+    /// heights the row it is displacing already recorded, or `None` if this
+    /// fix carries no position and so produces no row.
     ///
-    /// `known` is `None` for a radar the base table has never heard of.
+    /// `known` is `None` for a radar the table has never heard of.
     ///
     /// # Position always moves; heights only improve
     ///
-    /// Both arms take the fix's position outright — that is what a fix is for.
-    /// They differ on heights, because their provenance differs:
+    /// The two placing arms take the fix's position outright — that is what a
+    /// fix is for. They differ on heights, because their provenance differs:
     ///
     /// * **Learned** goes through [`SitePosition::heights_over`], which keeps
     ///   `known`'s finer foot figures wherever the volume's whole metre cannot
     ///   contradict them, and takes the volume's where it can.
     /// * **Network** keeps `known` untouched whenever there is one. Its single
     ///   feedhorn metre is strictly less than a `BaseAndTower` row already
-    ///   holds, so overwriting would *lose* the base datum — every
-    ///   [`Datum::SiteBase`] query in the process would start answering `None`
-    ///   the first time a catalogue landed. It fills in only where the row had
-    ///   nothing, which is exactly the radar the seed never had.
+    ///   holds, so overwriting would *lose* the base datum: a radar this
+    ///   install has learned from a volume would stop answering
+    ///   [`Datum::SiteBase`] the first time a catalogue landed on it. It fills
+    ///   in only where the row had nothing.
     ///
     /// # Every row this produces records an elevation
     ///
-    /// `heights` is `Some` on both arms and for both values of `known`, which
-    /// is what keeps `every_site_records_an_elevation` true over arrivals as
-    /// well as seeded rows. A row without one anchors a cross-section at sea
-    /// level, which reads as a measurement rather than as a gap — 292 ft of it
-    /// at `KLWX`.
-    fn applied(&self, name: &'static str, known: Option<SiteHeights>) -> RadarSite {
+    /// `heights` is `Some` on both placing arms and for both values of
+    /// `known`, which is what keeps `every_placed_row_records_an_elevation`
+    /// true. A row without one anchors a cross-section at sea level, which
+    /// reads as a measurement rather than as a gap — 292 ft of it at `KLWX`.
+    ///
+    /// `Unplaced` produces no row at all, which is a different thing from a
+    /// row with no elevation and is why the two cases are not one `Option`
+    /// deeper in the type.
+    fn applied(&self, name: &'static str, known: Option<SiteHeights>) -> Option<RadarSite> {
         match *self {
-            Self::Learned(position) => position.applied_to_named(name, known),
+            Self::Learned(position) => Some(position.applied_to_named(name, known)),
             Self::Network {
                 lat_udeg,
                 lon_udeg,
                 feedhorn_m,
-            } => RadarSite {
+            } => Some(RadarSite {
                 name,
                 lat: crate::site_position::degrees_from_micro(lat_udeg),
                 lon: crate::site_position::degrees_from_micro(lon_udeg),
                 heights: known.or(Some(SiteHeights::FeedhornOnly {
                     feedhorn_ft: crate::site_position::feet_from_metres(feedhorn_m),
                 })),
-            },
+            }),
+            Self::Unplaced => None,
         }
     }
 }
 
-/// [`SEED`], with every radar in `fixes` moved onto what its strongest fix
-/// says and a row added for every radar the seed has never heard of.
+/// An empty table with `fixes` applied: a row for every radar one of them can
+/// place, and membership for every radar they can only name.
 ///
-/// This is the whole point of the exercise. A radar commissioned after this
-/// binary was built used to be unnameable: `get_radar_site` answered `None`,
-/// so `applied_to` fell back to [`UNKNOWN_SITE_NAME`], the map drew no marker
-/// and the site list had no row. It reaches the user as a real row here,
-/// because something outside the binary knows where it is and the name is the
-/// key that knowledge was filed under.
-///
-/// # A fix now displaces a seeded row, where it used to be ignored
-///
-/// It did not, while the only fix was a learned one: a learned position already
-/// outranks the table inside `ScanInfo::from_scan`, so applying it here as well
-/// put one correction in two places, and the table's job was to be the
-/// *fallback*.
-///
-/// That stopped being tenable when the catalogue arrived. The catalogue is
-/// current where the seed is a snapshot of one day, and stage 4 deletes the
-/// seed outright — so if a fix could not move a seeded row, every seeded radar
-/// would keep its build-day position until the seed vanished and then jump.
-/// Deleting the seed has to be a *deletion*, not a behaviour change, and that
-/// only holds if the fix was already winning while the seed was still there.
-///
-/// The double-application that motivated the old rule is harmless, and checked:
-/// `heights_over`'s adjudication is idempotent, so a learned fix landing on a
-/// row a learned fix already produced yields that same row, `extended` sees no
-/// change, and nothing is rebuilt.
+/// This is the whole point of the exercise. The binary used to carry a list of
+/// the network, and an identifier outside that list could not be named,
+/// placed or drawn no matter what the application had learned about it:
+/// `get_radar_site` answered `None`, `applied_to` fell back to
+/// [`UNKNOWN_SITE_NAME`], the map drew no marker and the site list had no row.
+/// Now nothing is carried, and every radar the user sees got here because
+/// something outside the binary said it exists.
 ///
 /// # The strongest fix per radar wins, and only that one is applied
 ///
@@ -2160,20 +431,21 @@ impl SiteFix {
 /// about the other. Where two of them name the same radar, [`SiteFixRank`]
 /// decides, once, before anything is built. A fetched position therefore never
 /// reaches a row a learned one also claims: it is not overwritten afterwards,
-/// it is never applied.
+/// it is never applied. Nor does bare membership ever hide a position that
+/// arrived in the same stream.
 ///
 /// # The name is leaked
 ///
 /// [`RadarSite::name`] is `&'static str` and a four-byte identifier read out of
 /// a volume header or a JSON body at runtime is not, so an *arrival*'s name is
-/// leaked — a handful of bytes per radar beyond the seed, bounded by the
-/// catalogue's own size. A radar the base already has keeps the `&'static str`
-/// it already had, so a fix landing on an existing row leaks no name at all.
+/// leaked — a handful of bytes per radar, bounded by the catalogue's own size.
+/// A radar the base table already has keeps the `&'static str` it already had,
+/// so a fix landing on an existing row leaks no name at all.
 pub fn build_table<'a, I>(fixes: I) -> &'static SiteTable
 where
     I: IntoIterator<Item = (&'a str, SiteFix)>,
 {
-    extended(seed_table(), fixes).unwrap_or_else(seed_table)
+    extended(empty_table(), fixes).unwrap_or_else(empty_table)
 }
 
 /// `base` with `fixes` applied, or `None` if applying them would change
@@ -2183,10 +455,18 @@ where
 /// an install that has learned nothing and fetched nothing, every fresh
 /// install, every test that builds an app against an empty store, and every
 /// *second* resolution against an unchanged catalogue cache — reuses the table
-/// it already has instead of leaking another 207 rows beside it. That last case
+/// it already has instead of leaking a second copy beside it. That last case
 /// is why the comparison is against the produced row and not merely against the
 /// set of names: Android resolves twice with the same cache, and a name-only
 /// check would leak a whole table on the second call.
+///
+/// # `rows` and `unplaced` stay disjoint
+///
+/// A radar can be in exactly one of them, and which one is decided by the
+/// strongest fix that names it. So a radar that was only a member and then
+/// gains a position leaves `unplaced` in the same resolution that gives it a
+/// row — otherwise it would appear twice in a site list that walks both, which
+/// is the `TOK2`/`DOP1` duplicate-row failure in a new place.
 fn extended<'a, I>(base: &'static SiteTable, fixes: I) -> Option<&'static SiteTable>
 where
     I: IntoIterator<Item = (&'a str, SiteFix)>,
@@ -2216,10 +496,14 @@ where
     let mut changed = false;
     for row in &mut rows {
         // `remove`, so what is left in `best` afterwards is exactly the set of
-        // radars this table has never heard of.
+        // radars this table has no row for.
         if let Some(fix) = best.remove(row.name) {
-            let next = fix.applied(row.name, row.heights);
-            if next != *row {
+            // A row that is already placed is never *un*placed: `Unplaced` is
+            // the catalogue saying it cannot help, not that the position this
+            // install already has is wrong.
+            if let Some(next) = fix.applied(row.name, row.heights)
+                && next != *row
+            {
                 *row = next;
                 changed = true;
             }
@@ -2232,30 +516,63 @@ where
     // pin.
     let mut arrivals: Vec<(&'a str, SiteFix)> = best.into_iter().collect();
     arrivals.sort_unstable_by_key(|(name, _)| *name);
+
+    let mut unplaced: Vec<&'static str> = base.unplaced().to_vec();
     for (name, fix) in arrivals {
+        // A member already listed keeps the `&'static str` it was leaked
+        // under, so re-reading the same catalogue every launch leaks nothing.
+        if let Some(known) = unplaced.iter().find(|listed| **listed == name).copied() {
+            match fix.applied(known, None) {
+                // It was a member and is now placed: one row, and it leaves
+                // the member list.
+                Some(row) => {
+                    unplaced.retain(|listed| *listed != known);
+                    rows.push(row);
+                    changed = true;
+                }
+                // Still only a member. Nothing to do and nothing to leak.
+                None => {}
+            }
+            continue;
+        }
         let name: &'static str = Box::leak(name.to_owned().into_boxed_str());
-        rows.push(fix.applied(name, None));
+        match fix.applied(name, None) {
+            Some(row) => rows.push(row),
+            None => unplaced.push(name),
+        }
         changed = true;
     }
     if !changed {
         return None;
     }
 
+    unplaced.sort_unstable();
     let rows: &'static [RadarSite] = Box::leak(rows.into_boxed_slice());
     let by_name = rows.iter().map(|row| (row.name, row)).collect();
-    Some(Box::leak(Box::new(SiteTable { rows, by_name })))
+    Some(Box::leak(Box::new(SiteTable {
+        rows,
+        by_name,
+        unplaced: Box::leak(unplaced.into_boxed_slice()),
+    })))
 }
 
-/// The seed on its own, built once.
+/// No radars, built once.
 ///
-/// Where every process starts, and where almost every one stays.
-fn seed_table() -> &'static SiteTable {
-    static SEED_TABLE: LazyLock<&'static SiteTable> = LazyLock::new(|| {
-        let rows: &'static [RadarSite] = &SEED;
-        let by_name = rows.iter().map(|row| (row.name, row)).collect();
-        &*Box::leak(Box::new(SiteTable { rows, by_name }))
+/// Where every process starts. A process that never resolves anything stays
+/// here, and that is the honest answer for it: nothing has told this binary
+/// that any radar exists.
+///
+/// One shared value rather than a fresh allocation per call, so
+/// `std::ptr::eq` against it is a meaningful test of "nothing was built".
+fn empty_table() -> &'static SiteTable {
+    static EMPTY: LazyLock<&'static SiteTable> = LazyLock::new(|| {
+        &*Box::leak(Box::new(SiteTable {
+            rows: &[],
+            by_name: HashMap::new(),
+            unplaced: &[],
+        }))
     });
-    *SEED_TABLE
+    *EMPTY
 }
 
 /// The table this process resolved, or `None` until something resolves one.
@@ -2263,10 +580,10 @@ static RESOLVED: RwLock<Option<&'static SiteTable>> = RwLock::new(None);
 
 /// The table every lookup in this module reads.
 ///
-/// Falls back to [`seed_table`] rather than panicking when nothing has
+/// Falls back to [`empty_table`] rather than panicking when nothing has
 /// resolved yet: a crate-level test, a benchmark or a tool that never builds
-/// an app still gets the compiled-in radars, which is exactly where the app
-/// was before any of this existed.
+/// an app gets no radars, answers `None` to every question about one, and does
+/// not pretend otherwise.
 pub fn table() -> &'static SiteTable {
     // `into_inner` rather than `expect`: a poisoned lock here means some other
     // thread panicked while swapping a pointer, and the pointer it was
@@ -2274,30 +591,47 @@ pub fn table() -> &'static SiteTable {
     // turn an unrelated panic into a second one.
     match *RESOLVED.read().unwrap_or_else(|e| e.into_inner()) {
         Some(table) => table,
-        None => seed_table(),
+        None => empty_table(),
     }
 }
 
-/// Resolve the process-wide site table from what this install has learned.
+/// Resolve the process-wide site table from what this install knows.
 ///
-/// # Call this before the first paint
+/// # Resolve before the paint that would be affected
 ///
 /// A site's position or name that arrives *late* moves a marker, a label and
 /// a section's height datum under a user who is already looking at them,
-/// which is the one thing the reopen-is-1:1 rule forbids. So resolution
-/// belongs with the rest of the startup read, beside the config load and
-/// ahead of any frame — `App::new`, and again in `set_config_dir` where
-/// Android finally has a store to read from. Both run before a frame exists.
+/// which is the one thing the reopen-is-1:1 rule forbids. So the resolutions
+/// that could move an existing row belong with the rest of the startup read,
+/// beside the config load and ahead of any frame — `App::new`, and again in
+/// `set_config_dir` where Android finally has a store to read from. Both run
+/// before a frame exists.
 ///
 /// Resolving is therefore not one-shot: Android genuinely resolves twice, and
 /// a `OnceLock` would have let the empty first attempt win and silently
 /// discarded every learned position on the one platform that needs the second
 /// call.
 ///
+/// Two later resolutions exist and neither can move anything a user is
+/// looking at, which is why they are allowed to run mid-session:
+///
+/// * **the first catalogue on a fresh install**, applied the moment it lands
+///   rather than on the next launch. With nothing carried in the binary the
+///   table before it is *empty*, so there is no marker to move and no label to
+///   change — there is only the app finding out that radars exist.
+/// * **a volume this session decoded**, which adds a row for the radar whose
+///   data the user just asked for, at the position that volume states. The map
+///   is already drawn from that same position by way of
+///   [`crate::types::ScanInfo`], so the row agrees with what is on screen the
+///   moment it exists. Without it, a first session would render every MSL
+///   height against an empty table — which is
+///   [`crate::eet::radar_height_ft_near`] answering `None` and the render
+///   paths falling back to sea level.
+///
 /// # Resolution never forgets a radar
 ///
 /// Each call extends the table already in hand rather than rebuilding from
-/// [`SEED`], so the process can learn about a radar but never lose one, and a
+/// nothing, so the process can learn about a radar but never lose one, and a
 /// later resolution with nothing to say cannot undo an earlier one that had
 /// something. That is what the Android pair needs: `App::new` resolves with no
 /// store at all and `set_config_dir` resolves with the real one.
@@ -2307,13 +641,12 @@ pub fn table() -> &'static SiteTable {
 ///
 /// # Rows do move
 ///
-/// They did not before the catalogue existed, when a fix could only *add*. Now
-/// a fix displaces the row it lands on (see [`build_table`]), so a
+/// A fix displaces the row it lands on (see [`build_table`]), so a
 /// `&'static RadarSite` taken before a resolution keeps naming the radar it
 /// named but may describe where that radar was believed to be a moment
-/// earlier. That is not a hazard in practice and must not become one: both
-/// call sites run before the first frame, precisely so that no row can move
-/// under a user who is already looking at it.
+/// earlier. That is not a hazard in practice and must not become one: see the
+/// four call sites above, each of which either precedes the first frame or
+/// cannot contradict it.
 ///
 /// An index into [`radars()`] was never valid across a resolution and still is
 /// not, which is why nothing outside this module can reach the rows by
@@ -2330,7 +663,7 @@ where
     // exactly that. Building under the lock costs a startup a few
     // microseconds it has.
     let mut resolved = RESOLVED.write().unwrap_or_else(|e| e.into_inner());
-    let current = resolved.unwrap_or_else(seed_table);
+    let current = resolved.unwrap_or_else(empty_table);
     match extended(current, fixes) {
         Some(extended) => {
             *resolved = Some(extended);
@@ -2340,16 +673,28 @@ where
     }
 }
 
-/// Every radar this process knows about.
+/// Every radar this process can place.
 ///
-/// The replacement for the compiled-in array: same rows on a fresh install,
-/// plus whatever this one has learned. Walk it, filter it, count it — but see
-/// [`SiteTable::rows`] on why an index into it must not outlive the walk.
+/// Empty until something resolves a table. Walk it, filter it, count it — but
+/// see [`SiteTable::rows`] on why an index into it must not outlive the walk,
+/// and [`unplaced`] for the radars that exist without appearing here.
 pub fn radars() -> &'static [RadarSite] {
     table().rows()
 }
 
-/// The row for an ICAO identifier, or `None` if this process knows no such
+/// Identifiers this process knows exist and cannot place.
+///
+/// Never overlaps [`radars()`]. See [`SiteTable::unplaced`].
+pub fn unplaced() -> &'static [&'static str] {
+    table().unplaced()
+}
+
+/// Whether this process has heard of `site` at all, placed or not.
+pub fn knows_site(site: &str) -> bool {
+    table().knows(site)
+}
+
+/// The row for an ICAO identifier, or `None` if this process cannot place that
 /// radar.
 pub fn get_radar_site(site: &str) -> Option<&'static RadarSite> {
     table().get(site)
@@ -2401,8 +746,10 @@ impl RadarSite {
     /// [`radars()`] lists both networks, because the map draws a marker for
     /// every site it knows.
     ///
-    /// The `T` prefix identifies the 45 TDWRs, with one exception that a naive
-    /// `starts_with('T')` gets wrong: `TJUA` is San Juan's WSR-88D.
+    /// A rule over the identifier rather than a flag on a row, which is why it
+    /// survived the compiled-in table: the `T` prefix identifies the 45 TDWRs
+    /// wherever the row came from, with one exception a naive
+    /// `starts_with('T')` gets wrong — `TJUA` is San Juan's WSR-88D.
     pub fn is_tdwr(&self) -> bool {
         self.name.starts_with('T') && self.name != "TJUA"
     }
@@ -2428,8 +775,13 @@ impl RadarSite {
     /// pick for the Oklahoma City metro would land on it and intermittently show
     /// an empty map.
     ///
-    /// Only automatic selection consults this. The site stays in [`radars()`], the
-    /// map still draws it, and a user who picks it by hand still gets it.
+    /// Only automatic selection consults this. The site stays in [`radars()`],
+    /// the map still draws it, and a user who picks it by hand still gets it.
+    ///
+    /// `KCRI` is also one of the two identifiers the archive bucket lists and
+    /// `api.weather.gov` will not place, so on most installs it reaches the
+    /// user through [`SiteTable::unplaced`] and has no row for this to be
+    /// called on at all.
     pub fn is_operational(&self) -> bool {
         self.name != "KCRI"
     }
@@ -2440,9 +792,11 @@ impl RadarSite {
 /// Considers every site including TDWRs. Callers picking a site to *display*
 /// almost certainly want [`nearest_wsr88d_site`] instead.
 ///
-/// Returns `None` only for a non-finite input. A NaN coordinate would otherwise
-/// compare `false` against every candidate and silently yield whichever site
-/// happens to sit first in [`radars()`], which reads as a deliberate choice.
+/// `None` for a non-finite input — a NaN coordinate would otherwise compare
+/// `false` against every candidate and silently yield whichever site happens
+/// to sit first in [`radars()`], which reads as a deliberate choice — and
+/// `None` when this process can place no radars at all, which is where every
+/// fresh install starts.
 ///
 /// No distance cap: a caller in Europe gets the nearest NEXRAD and a very large
 /// number, and it is the caller's business whether that is useful. Callers that
@@ -2468,13 +822,61 @@ pub fn nearest_radar_site(lat: f64, lon: f64) -> Option<(&'static RadarSite, f64
 /// quietly narrow what a viewer can see without their having asked for a
 /// terminal radar. Picking one by hand is unaffected, and
 /// [`nearest_radar_site`] is the unfiltered form.
+///
+/// `None` until this process knows where at least one WSR-88D is. A caller
+/// that wants to open on *something* has to wait for that rather than fall
+/// back to a compiled-in guess, because there is no longer one to fall back
+/// to — see [`SiteTable`].
 pub fn nearest_wsr88d_site(lat: f64, lon: f64) -> Option<(&'static RadarSite, f64)> {
     table().nearest_wsr88d(lat, lon)
 }
 
 #[cfg(test)]
-mod nearest_tests {
+mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------
+    // Fixtures
+    //
+    // Every table below is built here, from named fixes, and nothing reads
+    // the process-wide table. That is forced rather than stylistic: this
+    // module used to interrogate a compiled-in `SEED` through the free
+    // functions, and with the seed deleted those answer `None` in a test
+    // binary that resolves nothing — so a test written that way would pass
+    // because there was nothing to find. Building the table the assertion is
+    // about is what keeps each one able to fail.
+    //
+    // The coordinates are deliberately synthetic and far from the real
+    // network. A fixture that used real ICAOs at real positions would be the
+    // deleted table growing back one row per test.
+    // ---------------------------------------------------------------------
+
+    /// A WSR-88D-shaped volume report: two separately-stated heights.
+    fn learned(lat_udeg: i32, lon_udeg: i32, site_m: i32, tower_m: i32) -> SiteFix {
+        SiteFix::Learned(SitePosition {
+            lat_udeg,
+            lon_udeg,
+            site_height_m: site_m,
+            tower_height_m: tower_m,
+        })
+    }
+
+    /// A TDWR-shaped volume report: `tower_height` byte-identical to
+    /// `site_height`, which is how the two instruments are told apart.
+    fn learned_single_height(lat_udeg: i32, lon_udeg: i32, height_m: i32) -> SiteFix {
+        learned(lat_udeg, lon_udeg, height_m, height_m)
+    }
+
+    /// A published station record: a position and one feedhorn elevation.
+    fn network(lat_udeg: i32, lon_udeg: i32, feedhorn_m: i32) -> SiteFix {
+        SiteFix::Network {
+            lat_udeg,
+            lon_udeg,
+            feedhorn_m,
+        }
+    }
+
+    // -- distance ---------------------------------------------------------
 
     /// Two points ~111 km apart along a meridian, where the expected answer is
     /// a definition rather than a measurement.
@@ -2497,482 +899,71 @@ mod nearest_tests {
         assert!(d < 200.0, "{d} km — the meridian wrap was not handled");
     }
 
-    /// Downtown Oklahoma City resolves to KTLX, which is the site the old
-    /// hardcoded default happened to name. The point is that it is now *derived*.
+    // -- the deletion itself ----------------------------------------------
+
+    /// **The binary carries no radars.**
     ///
-    /// This is also the case that motivates the TDWR filter: the literal nearest
-    /// site to this coordinate is `TOKC`, whose Level II volumes the archive
-    /// does carry — it is excluded for being a terminal radar, not for being
-    /// absent.
-    #[test]
-    fn oklahoma_city_resolves_to_ktlx() {
-        let (site, dist) = nearest_wsr88d_site(35.4676, -97.5164).expect("a finite coordinate");
-        assert_eq!(site.name, "KTLX");
-        assert!(dist < 50.0, "{dist}");
-
-        // Both filters are doing work here, and a change to either would
-        // otherwise silently stop mattering while the assertion above still
-        // passed for the wrong reason.
-        let (unfiltered, _) = nearest_radar_site(35.4676, -97.5164).expect("a finite coordinate");
-        assert_eq!(
-            unfiltered.name, "TOKC",
-            "the literal nearest site is a TDWR"
-        );
-
-        let (nearest_88d, _) = table()
-            .nearest_where(35.4676, -97.5164, RadarSite::is_wsr88d)
-            .expect("a finite coordinate");
-        assert_eq!(
-            nearest_88d.name, "KCRI",
-            "the nearest WSR-88D is the ROC test bed"
-        );
-    }
-
-    /// The regression the whole feature exists for: somewhere far from Oklahoma
-    /// must not resolve to Oklahoma's radar.
-    #[test]
-    fn seattle_does_not_resolve_to_an_oklahoma_radar() {
-        let (site, _) = nearest_wsr88d_site(47.6062, -122.3321).expect("a finite coordinate");
-        assert_eq!(site.name, "KATX");
-    }
-
-    /// Miami sits beside `TMIA`, so this is a second independent check that the
-    /// TDWR filter holds in a different part of the table.
-    #[test]
-    fn miami_resolves_to_the_south_florida_wsr88d() {
-        let (site, _) = nearest_wsr88d_site(25.7617, -80.1918).expect("a finite coordinate");
-        assert_eq!(site.name, "KAMX");
-    }
-
-    /// Non-CONUS coverage: the table holds Alaska, Hawaii, Puerto Rico and Guam,
-    /// and a naive CONUS-only assumption would strand these users.
-    #[test]
-    fn outlying_coverage_resolves_locally_rather_than_to_the_mainland() {
-        for (lat, lon, expected) in [
-            (21.3069, -157.8583, "PHMO"),
-            (61.2181, -149.9003, "PAHG"),
-            (18.4655, -66.1057, "TJUA"),
-            (13.4443, 144.7937, "PGUA"),
-        ] {
-            let (site, dist) = nearest_wsr88d_site(lat, lon).expect("a finite coordinate");
-            assert_eq!(site.name, expected, "at {lat},{lon} (got {dist} km)");
-        }
-    }
-
-    /// `TJUA` is San Juan's WSR-88D, not a TDWR, and a `starts_with('T')` test
-    /// would wrongly exclude the only Level II site serving Puerto Rico.
-    #[test]
-    fn tjua_is_not_treated_as_a_tdwr() {
-        let tjua = get_radar_site("TJUA").expect("TJUA is in the table");
-        assert!(tjua.is_wsr88d());
-        assert!(!tjua.is_tdwr());
-    }
-
-    /// Pins the split so a table edit that adds or drops a site is visible here
-    /// rather than silently changing what startup selection can choose from.
-    #[test]
-    fn the_table_splits_into_45_tdwrs_and_the_wsr88d_network() {
-        let tdwrs = SEED.iter().filter(|s| s.is_tdwr()).count();
-        assert_eq!(tdwrs, 45);
-        assert_eq!(SEED.len() - tdwrs, 162);
-    }
-
-    /// A NaN must not silently degrade to "the first entry in the table".
-    #[test]
-    fn a_non_finite_coordinate_has_no_nearest_site() {
-        assert!(nearest_wsr88d_site(f64::NAN, -97.0).is_none());
-        assert!(nearest_wsr88d_site(35.0, f64::INFINITY).is_none());
-    }
-
-    /// Every row that moved further than one 250 m data cell onto the
-    /// position its own volume reports, as (site, old lat, old lon, new lat,
-    /// new lon, the epoch the volume came from).
+    /// This is the whole change, stated once. A process that has resolved
+    /// nothing can place nothing, name nothing and find nothing near
+    /// anywhere — because the only things that could tell it a radar exists
+    /// are outside the binary.
     ///
-    /// Pinned by value so a re-import of the table from whatever list it came
-    /// from originally cannot quietly put them back. Forty-five of the fifty
-    /// are TDWRs — see [`radars()`] on why that is one defect and not
-    /// forty-five.
-    const MOVED_ONTO_ITS_VOLUME: [(&str, f64, f64, f64, f64, &str); 50] = [
-        (
-            "RKSG",
-            36.95972,
-            127.01833,
-            37.20757,
-            127.28556,
-            "2026/08/10",
-        ),
-        ("TICH", 37.4069, -97.4764, 37.507, -97.437, "2026/06/25"),
-        ("TMCO", 28.2584, -81.3133, 28.344, -81.326, "2026/08/10"),
-        ("TMSY", 29.9385, -90.3811, 30.022, -90.403, "2026/08/10"),
-        ("TMDW", 41.69, -87.8034, 41.651, -87.73, "2026/08/10"),
-        ("TMKE", 42.7619, -87.9994, 42.819, -88.046, "2026/08/10"),
-        ("TPHX", 33.3678, -112.158, 33.42, -112.163, "2026/08/10"),
-        ("TDTW", 42.071, -83.4704, 42.111, -83.515, "2026/08/10"),
-        ("TMSP", 44.8197, -92.9392, 44.871, -92.933, "2026/08/10"),
-        ("TMCI", 39.4488, -94.7396, 39.499, -94.742, "2026/08/10"),
-        ("KIWX", 41.40861, -85.7, 41.35861, -85.7, "2026/08/10"),
-        ("TTUL", 36.0236, -95.8175, 36.071, -95.826, "2026/08/10"),
-        ("TPHL", 39.9084, -75.0426, 39.949, -75.07, "2026/08/10"),
-        ("TIDS", 39.5978, -86.4085, 39.637, -86.435, "2026/08/10"),
-        ("TSJU", 18.4313, -66.1722, 18.474, -66.18, "2026/08/10"),
-        ("TSTL", 38.7668, -90.4698, 38.805, -90.489, "2026/08/10"),
-        ("TTPA", 27.8196, -82.5179, 27.86, -82.518, "2026/08/10"),
-        ("TPIT", 40.4641, -80.4697, 40.501, -80.486, "2026/08/10"),
-        ("TOKC", 35.2474, -97.5395, 35.276, -97.51, "2026/08/10"),
-        ("TSDF", 38.0109, -85.5995, 38.046, -85.611, "2026/08/10"),
-        ("TDAY", 39.9875, -84.1102, 40.022, -84.123, "2026/08/10"),
-        ("TIAH", 30.0297, -95.5708, 30.065, -95.567, "2026/08/10"),
-        ("TSLC", 40.9341, -111.9214, 40.967, -111.93, "2026/08/10"),
-        ("TPBI", 26.6572, -80.2586, 26.688, -80.273, "2026/07/28"),
-        ("TLVE", 41.2805, -81.9659, 41.29, -82.008, "2026/08/10"),
-        ("TDFW", 33.0396, -96.8974, 33.065, -96.918, "2026/08/10"),
-        ("TORD", 41.7712, -87.8363, 41.797, -87.858, "2026/08/10"),
-        ("TIAD", 39.0675, -77.5012, 39.084, -77.529, "2026/08/10"),
-        ("TADW", 38.6704, -76.8446, 38.695, -76.845, "2026/08/10"),
-        ("TJFK", 40.5668, -73.8874, 40.589, -73.88, "2026/08/10"),
-        ("TDAL", 32.9076, -96.9568, 32.926, -96.968, "2026/08/10"),
-        ("TRDU", 35.9898, -78.6787, 36.002, -78.697, "2026/08/10"),
-        ("TCVG", 38.8799, -84.5737, 38.898, -84.58, "2026/08/10"),
-        ("TCMH", 39.9878, -82.71, 40.006, -82.715, "2026/08/10"),
-        ("TFLL", 26.1263, -80.3478, 26.143, -80.344, "2026/08/10"),
-        ("THOU", 29.5328, -95.2444, 29.516, -95.242, "2026/08/10"),
-        ("TEWR", 40.588, -74.2503, 40.594, -74.27, "2026/08/10"),
-        ("TLAS", 36.1292, -115.0147, 36.144, -115.007, "2026/08/10"),
-        ("TDCA", 38.7474, -76.9509, 38.759, -76.962, "2026/08/10"),
-        ("TDEN", 39.7256, -104.5431, 39.727, -104.526, "2026/08/10"),
-        ("TCLT", 35.3269, -80.8772, 35.337, -80.885, "2026/08/10"),
-        ("TMEM", 34.8867, -90.0007, 34.896, -89.993, "2026/08/10"),
-        ("TATL", 33.6433, -84.2524, 33.647, -84.262, "2026/08/10"),
-        (
-            "KFDX",
-            34.63528,
-            -103.62944,
-            34.63417,
-            -103.61889,
-            "2026/08/10",
-        ),
-        (
-            "RODN",
-            26.30194,
-            127.90972,
-            26.3078,
-            127.90347,
-            "2023/06/01",
-        ),
-        ("TBOS", 42.1515, -70.9302, 42.158, -70.933, "2026/08/10"),
-        ("TBWI", 39.087, -76.6276, 39.09, -76.63, "2026/08/10"),
-        ("TBNA", 35.9767, -86.6618, 35.98, -86.662, "2026/08/10"),
-        ("TMIA", 25.7555, -80.4932, 25.758, -80.491, "2026/08/10"),
-        (
-            "PGUA",
-            13.45444,
-            144.80833,
-            13.45583,
-            144.81111,
-            "2026/08/10",
-        ),
-    ];
-
-    /// The rows this table corrected against their own Level II volume, as
-    /// (site, the height it recorded before, the height its volume reports).
-    ///
-    /// Feet, on [`Datum::SiteBase`]. Measured by `site_elev_probe` on the
-    /// `campaign-harness` branch over one volume per site.
-    const CORRECTED_AGAINST_A_VOLUME: [(&str, i32, i32); 50] = [
-        ("KAKQ", 112, 157),
-        ("KAMA", 3587, 3622),
-        ("KATX", 494, 528),
-        ("KBLX", 3598, 3638),
-        ("KCBX", 3061, 3091),
-        ("KCLX", 97, 115),
-        ("KDTX", 1072, 1102),
-        ("KENX", 1826, 1854),
-        ("KEOX", 434, 472),
-        ("KEWX", 633, 669),
-        ("KEYX", 2757, 2776),
-        ("KFWS", 683, 696),
-        ("KGGW", 2276, 2303),
-        ("KGJX", 9992, 10036),
-        ("KGRB", 682, 709),
-        ("KGSP", 940, 955),
-        ("KGWX", 476, 509),
-        ("KHPX", 576, 564),
-        ("KICX", 10600, 10643),
-        ("KILX", 582, 617),
-        ("KIWA", 1353, 1362),
-        ("KJAX", 33, 62),
-        ("KLBB", 3259, 3297),
-        ("KLCH", 13, 56),
-        ("KLIX", 24, 66),
-        ("KLNX", 2970, 3015),
-        ("KLRX", 6744, 6781),
-        ("KMAF", 2868, 2897),
-        ("KMLB", 99, 36),
-        ("KMPX", 946, 988),
-        ("KMSX", 7855, 7930),
-        ("KMTX", 6460, 6480),
-        ("KMXX", 400, 446),
-        ("KNQA", 282, 338),
-        ("KPUX", 5249, 5299),
-        ("KRLX", 1080, 1099),
-        ("KSOX", 3027, 3041),
-        ("KTFX", 3714, 3740),
-        ("KUDX", 3016, 3081),
-        ("KVAX", 178, 217),
-        ("KVBX", 1233, 1257),
-        ("PACG", 270, 207),
-        ("PAEC", 54, 59),
-        ("PGUA", 264, 272),
-        ("RKSG", 52, 1440),
-        ("PHKI", 179, 226),
-        ("PHKM", 3812, 3852),
-        ("PHWA", 1370, 1381),
-        ("RODN", 218, 299),
-        ("TJUA", 2794, 2844),
-    ];
-
-    /// Every row must record an elevation.
-    ///
-    /// Six did not — KDGX, KFSX, KLWX, KRTX, KSRX, KVWX, all of them
-    /// `-99999` sentinels in the source the table was generated from, turned
-    /// into `None` by the `Option<i32>` refactor and never filled in. A row
-    /// without one is not inert: it is the datum a cross-section's height axis
-    /// is anchored on, and the old lookup answered sea level for it, which
-    /// reads as a measurement rather than as a gap.
-    ///
-    /// This is the loud failure the elevation deserves, moved to where it can
-    /// be seen — a test, rather than a render that silently sits 89 m low.
+    /// Every clause fails the moment a compiled-in table comes back, whatever
+    /// it is called: a base table with rows in it cannot be empty, cannot fail
+    /// to name its own rows, and cannot answer `None` to a nearest-search over
+    /// the middle of Oklahoma.
     #[test]
-    fn every_site_records_an_elevation() {
-        let missing: Vec<&str> = radars()
-            .iter()
-            .filter(|s| s.heights.is_none())
-            .map(|s| s.name)
-            .collect();
+    fn a_process_that_has_resolved_nothing_knows_no_radars() {
+        let base = empty_table();
+        assert!(base.rows().is_empty(), "{} rows", base.rows().len());
+        assert!(base.unplaced().is_empty());
+        assert!(base.get("KTLX").is_none(), "no identifier is compiled in");
+        assert!(!base.knows("KTLX"), "not even as a member");
+        assert!(base.nearest(35.3331, -97.2778).is_none());
+        assert!(base.nearest_wsr88d(35.3331, -97.2778).is_none());
+
+        // And through the constructor the application calls, not only through
+        // the private constant behind it.
+        let built = build_table(std::iter::empty());
+        assert!(built.rows().is_empty());
         assert!(
-            missing.is_empty(),
-            "these sites record no elevation and would anchor a section at sea \
-             level: {missing:?}",
+            std::ptr::eq(built, base),
+            "building from nothing must not allocate a table",
         );
     }
 
-    /// Recording *an* elevation is not enough: it has to be the one every
-    /// render path asks for.
+    /// A nearest-search over an empty table is `None`, not a panic and not a
+    /// nearest-of-nothing.
     ///
-    /// `every_site_records_an_elevation` would pass on a table where every
-    /// row carried only a base, and every feedhorn lookup would then skip
-    /// every row and answer 0 ft — the same sea-level hole in a new shape.
-    /// This closes it against the datum the callers actually name.
+    /// Separated from the test above because this is the property every
+    /// *consumer* depends on — `radar_height_ft_near` returning `None` here is
+    /// what stops a render anchoring itself at sea level, and startup site
+    /// selection reading `None` is what stops it opening on a radar it cannot
+    /// fetch.
     #[test]
-    fn every_site_answers_the_feedhorn_datum() {
-        let missing: Vec<&str> = radars()
-            .iter()
-            .filter(|s| s.height_ft(Datum::Feedhorn).is_none())
-            .map(|s| s.name)
-            .collect();
-        assert!(missing.is_empty(), "no feedhorn height: {missing:?}");
-    }
-
-    /// The rows that cannot answer [`Datum::SiteBase`], named.
-    ///
-    /// Not a defect — a TDWR volume reports one height and copies it into the
-    /// tower field, so there is no base to record — but it is the one place
-    /// `height_ft` returns `None` for a shipped row, and a row joining or
-    /// leaving that set should be visible rather than inferred.
-    #[test]
-    fn only_the_single_height_rows_lack_a_base() {
-        let no_base: Vec<&str> = SEED
-            .iter()
-            .filter(|s| s.height_ft(Datum::SiteBase).is_none())
-            .map(|s| s.name)
-            .collect();
-        assert_eq!(no_base.len(), 46, "{no_base:?}");
-        assert!(no_base.contains(&"LPLA"), "Lajes carries a single height");
-        let tdwrs = no_base.iter().filter(|n| **n != "LPLA").count();
-        assert_eq!(tdwrs, 45, "every TDWR and nothing else: {no_base:?}");
-        assert!(
-            no_base
-                .iter()
-                .all(|n| get_radar_site(n).is_some_and(|s| s.is_tdwr() || *n == "LPLA"))
-        );
-    }
-
-    /// The two datums are a tower apart, everywhere both are recorded.
-    ///
-    /// This is the property the old single `elev` could not express and the
-    /// reason a consumer has to name one: had the gap been a foot or two,
-    /// nothing here would matter. It is 30–115 ft.
-    #[test]
-    fn the_two_datums_are_a_tower_apart() {
-        let mut gaps: Vec<i32> = SEED
-            .iter()
-            .filter_map(|s| Some(s.height_ft(Datum::Feedhorn)? - s.height_ft(Datum::SiteBase)?))
-            .collect();
-        gaps.sort_unstable();
-        assert_eq!(gaps.len(), 161, "every row that records both");
-        assert_eq!(*gaps.first().expect("non-empty"), 30, "the shortest tower");
-        assert_eq!(*gaps.last().expect("non-empty"), 114, "the tallest tower");
-    }
-
-    /// The 50 rows whose height was corrected against their own volume,
-    /// pinned by value.
-    ///
-    /// The table used to hold one number per row and a note saying six had
-    /// been checked. Checking all 207 against one archive volume each found
-    /// these disagreeing with the height their own RDA reports by more than
-    /// the whole-metre rounding of the field — from 63 ft high to 81 ft low.
-    /// KMSX, the one the old note called unexplained, is item 31 of 50 rather
-    /// than a singleton.
-    ///
-    /// `RKSG` is the fiftieth and arrived a campaign later: the pass that
-    /// corrected the other 49 left it alone because its *coordinates* were
-    /// 36 km out, and a row holding Camp Humphreys' height over Osan's
-    /// position would have been incoherent rather than merely stale. Both
-    /// halves now come from the same volume.
-    ///
-    /// Pinned as (site, what it said, what it says now) so a re-import of the
-    /// table from whatever list it originally came from cannot quietly put
-    /// them back.
-    #[test]
-    fn the_corrected_rows_carry_the_height_their_volume_reports() {
-        for (name, was, now) in CORRECTED_AGAINST_A_VOLUME {
-            let site = get_radar_site(name).expect("in the table");
-            assert_eq!(site.height_ft(Datum::SiteBase), Some(now), "{name}");
-            assert_ne!(was, now, "{name} is listed as corrected but did not move");
-        }
-        assert_eq!(CORRECTED_AGAINST_A_VOLUME.len(), 50);
-    }
-
-    /// The rows that moved onto their volume's position carry it, and are
-    /// not where they used to be.
-    ///
-    /// Both halves matter. Asserting only the new value would pass on a table
-    /// that had never moved if the pin were generated from it; asserting the
-    /// row is no longer at the old coordinates is what makes this a
-    /// correction rather than a description.
-    #[test]
-    fn the_moved_rows_sit_where_their_volume_says() {
-        for (name, was_lat, was_lon, lat, lon, epoch) in MOVED_ONTO_ITS_VOLUME {
-            let site = get_radar_site(name).expect("in the table");
-            assert_eq!(site.lat, lat, "{name} latitude");
-            assert_eq!(site.lon, lon, "{name} longitude");
-            assert!(
-                distance_km(was_lat, was_lon, lat, lon) > 0.25,
-                "{name} is listed as moved but did not move a data cell",
-            );
-            assert_eq!(epoch.len(), "YYYY/MM/DD".len(), "{name} epoch");
-        }
-        assert_eq!(MOVED_ONTO_ITS_VOLUME.len(), 50);
-    }
-
-    /// The far end of the correction, named: `RKSG` is a relocated radar, not
-    /// a mis-transcribed one.
-    ///
-    /// It is the only row in the table whose position and height were *both*
-    /// wrong, and the only one wrong by more than a few kilometres. Osan is
-    /// 36 km from Camp Humphreys and 1388 ft below it, so a section anchored
-    /// on the old row put the beam through the wrong air over the wrong
-    /// ground.
-    #[test]
-    fn rksg_is_at_camp_humphreys_and_not_at_osan() {
-        let site = get_radar_site("RKSG").expect("in the table");
-        assert_eq!((site.lat, site.lon), (37.20757, 127.28556));
-        assert_eq!(site.height_ft(Datum::SiteBase), Some(1440));
-        assert_eq!(site.height_ft(Datum::Feedhorn), Some(1519));
-        assert!(
-            distance_km(site.lat, site.lon, 36.95972, 127.01833) > 35.0,
-            "the pre-move Osan coordinates are 36 km away and must not come back",
-        );
-    }
-
-    /// A digest over every row's name and coordinates.
-    ///
-    /// [`MOVED_ONTO_ITS_VOLUME`] names the 50 rows that moved far enough to
-    /// argue about; 143 more moved by tens of metres, where a literal list
-    /// would be noise but a silent revert would still be a defect. This
-    /// covers all 207 at once: change any row's position by one place in the
-    /// last decimal and this fails.
-    ///
-    /// FNV-1a over the IEEE bits, so it is exact rather than tolerant —
-    /// tolerance is what the named tables are for.
-    #[test]
-    fn every_rows_coordinates_are_pinned() {
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        let mut eat = |bytes: &[u8]| {
-            for byte in bytes {
-                hash ^= u64::from(*byte);
-                hash = hash.wrapping_mul(0x1000_0000_01b3);
-            }
-        };
-        for site in SEED.iter() {
-            eat(site.name.as_bytes());
-            eat(&site.lat.to_bits().to_be_bytes());
-            eat(&site.lon.to_bits().to_be_bytes());
-        }
-        assert_eq!(
-            hash, 0x67b7_7f0e_1c1c_defc,
-            "a row's coordinates changed; if that was deliberate, re-measure \
-             against the volumes rather than editing this number",
-        );
-    }
-
-    /// Every site must be reachable as its own nearest neighbour, which catches
-    /// a transposed lat/lon in any single table row.
-    #[test]
-    fn every_site_is_its_own_nearest_neighbour() {
-        for site in radars() {
-            let (found, dist) =
-                nearest_radar_site(site.lat, site.lon).expect("table coordinates are finite");
-            assert_eq!(
-                found.name, site.name,
-                "{} resolved to {} at {} km",
-                site.name, found.name, dist
-            );
+    fn an_empty_table_answers_no_search_rather_than_answering_wrongly() {
+        for (lat, lon) in [(35.0, -97.0), (0.0, 0.0), (90.0, 180.0)] {
+            assert!(empty_table().nearest(lat, lon).is_none(), "{lat},{lon}");
         }
     }
 
-    /// An ICAO no seed row carries, and a position far enough from the network
-    /// that any nearest-search reaching it is unambiguous.
-    ///
-    /// The middle of the South Pacific: 5000 km from the nearest real radar,
-    /// so "the search found the added row" cannot be confused with "the search
-    /// found something else nearby".
-    const UNSEEDED: &str = "ZZZZ";
-    const REMOTE: SiteFix = SiteFix::Learned(SitePosition {
-        lat_udeg: -30_000_000,
-        lon_udeg: -140_000_000,
-        site_height_m: 100,
-        tower_height_m: 20,
-    });
+    // -- rows arrive from outside -----------------------------------------
 
-    /// A table built over the seed carries a radar the seed has never heard
-    /// of, and carries it as a *radar* — named, placed and elevated.
+    /// An identifier nothing knew of becomes a real row: named, placed and
+    /// elevated.
     ///
-    /// This is the refactor's reason to exist. Before it, an identifier the
-    /// compiled-in array did not list could not be named at all: `applied_to`
-    /// fell through to `UNKNOWN_SITE_NAME`, the map drew no marker for it and
-    /// the site list had no row. A binary could only ever know the network as
-    /// it stood on the day it was built.
-    ///
-    /// Every clause here fails if the table goes back to being the compiled-in
-    /// array, because the array cannot grow.
+    /// The refactor's reason to exist, and now the *only* way a row is ever
+    /// produced. Before it, an identifier the compiled-in array did not list
+    /// could not be named at all — `applied_to` fell through to
+    /// `UNKNOWN_SITE_NAME`, the map drew no marker and the site list had no
+    /// row — and a binary could only ever know the network as it stood on the
+    /// day it was built.
     #[test]
-    fn a_radar_the_seed_never_heard_of_becomes_a_real_row() {
-        assert!(
-            seed_table().get(UNSEEDED).is_none(),
-            "precondition: {UNSEEDED} must not be a seed row, or this test \
-             proves nothing",
-        );
+    fn a_radar_nothing_knew_of_becomes_a_real_row() {
+        let table = build_table([("ZZZA", learned(-30_000_000, -140_000_000, 100, 20))]);
 
-        let table = build_table([(UNSEEDED, REMOTE)]);
-
-        let row = table
-            .get(UNSEEDED)
-            .expect("a learned radar must be findable by name");
-        assert_eq!(
-            row.name, UNSEEDED,
-            "it must carry its own ICAO, not UNKNOWN",
-        );
+        let row = table.get("ZZZA").expect("findable by name");
+        assert_eq!(row.name, "ZZZA", "it carries its own ICAO, not UNKNOWN");
         assert_eq!((row.lat, row.lon), (-30.0, -140.0), "at its own position");
         assert!(
             row.heights.is_some(),
@@ -2984,15 +975,8 @@ mod nearest_tests {
             "120 m of ground and tower, in feet",
         );
 
-        assert_eq!(
-            table.rows().len(),
-            seed_table().rows().len() + 1,
-            "the table is one longer than the seed",
-        );
-        assert!(
-            table.rows().iter().any(|r| r.name == UNSEEDED),
-            "and the walk every consumer does reaches it",
-        );
+        assert_eq!(table.rows().len(), 1, "and it is the only row");
+        assert!(table.rows().iter().any(|r| r.name == "ZZZA"));
     }
 
     /// The added radar answers a nearest-search, which is the route startup
@@ -3002,68 +986,284 @@ mod nearest_tests {
     /// the user cannot be placed on.
     #[test]
     fn an_added_radar_answers_a_nearest_search() {
-        let table = build_table([(UNSEEDED, REMOTE)]);
+        let table = build_table([
+            ("ZZZA", learned(-30_000_000, -140_000_000, 100, 20)),
+            ("ZZZB", learned(-10_000_000, -140_000_000, 100, 20)),
+        ]);
 
         let (found, dist) = table.nearest(-30.0, -140.0).expect("a finite coordinate");
-        assert_eq!(found.name, UNSEEDED, "at {dist} km");
+        assert_eq!(found.name, "ZZZA", "at {dist} km");
         assert!(dist < 0.001, "it is its own nearest neighbour: {dist} km");
 
         // And through the WSR-88D filter, which is what an automatic pick
-        // uses. `ZZZZ` does not start with `T`, so it is not a TDWR.
+        // uses. Neither identifier starts with `T`, so neither is a TDWR.
         let (found, _) = table
             .nearest_wsr88d(-30.0, -140.0)
             .expect("a finite coordinate");
-        assert_eq!(found.name, UNSEEDED);
+        assert_eq!(found.name, "ZZZA");
 
-        // The seed's own answers are unchanged by its presence — it is 5000 km
-        // from anything, so nothing else can have moved.
-        let (okc, _) = table
-            .nearest_wsr88d(35.4676, -97.5164)
-            .expect("a finite coordinate");
-        assert_eq!(okc.name, "KTLX", "adding a radar must not move the others");
+        // The other row is 2200 km away and must not answer for it.
+        let (other, _) = table.nearest(-10.0, -140.0).expect("a finite coordinate");
+        assert_eq!(other.name, "ZZZB", "adding a radar must not move the others");
     }
 
-    /// A radar the seed *does* carry takes the fix that lands on it, in place.
+    /// Every site is its own nearest neighbour, which catches a transposed
+    /// latitude and longitude anywhere on the path that builds a row.
     ///
-    /// It used to keep its seeded row, on the argument that a learned position
-    /// already outranked the table inside `ScanInfo::from_scan` and applying it
-    /// here too would put one correction in two places. The catalogue ended
-    /// that: it is current where the seed is a snapshot, and stage 4 deletes
-    /// the seed outright — so a fix that could not move a seeded row would let
-    /// every seeded radar keep its build-day position until the seed vanished
-    /// and then jump. See [`build_table`].
+    /// It used to guard a hand-maintained table of literals. The literals are
+    /// gone and the hazard is not: `degrees_from_micro` is applied to two
+    /// fields in three places, and swapping them in any one of them would put
+    /// every radar somewhere else while every other assertion still passed.
     ///
-    /// **In place**, not appended: two rows of one name is the
-    /// `TOK2`/`DOP1` failure, where which one a nearest-search answers with is
-    /// arbitrary.
+    /// The fixture is deliberately asymmetric — latitude and longitude differ
+    /// in magnitude *and* sign for every row — because a transposition between
+    /// two similar numbers is invisible.
     #[test]
-    fn a_seeded_radar_takes_the_fix_that_lands_on_it() {
-        let seeded = seed_table().get("KTLX").expect("KTLX is a seed row");
-        let elsewhere = SiteFix::Learned(SitePosition {
-            lat_udeg: 100_000,
-            lon_udeg: 100_000,
-            site_height_m: 1,
-            tower_height_m: 1,
-        });
+    fn every_site_is_its_own_nearest_neighbour() {
+        let table = build_table([
+            ("ZZZA", learned(-30_000_000, -140_000_000, 100, 20)),
+            ("ZZZB", learned(12_000_000, -80_000_000, 30, 10)),
+            ("TZZC", network(-5_000_000, 60_000_000, 400)),
+            ("ZZZD", learned_single_height(48_000_000, 9_000_000, 500)),
+        ]);
+        assert_eq!(table.rows().len(), 4, "precondition: four distinct rows");
 
-        let table = build_table([("KTLX", elsewhere)]);
+        for site in table.rows() {
+            let (found, dist) = table
+                .nearest(site.lat, site.lon)
+                .expect("a built row's coordinates are finite");
+            assert_eq!(
+                found.name, site.name,
+                "{} resolved to {} at {} km",
+                site.name, found.name, dist
+            );
+        }
+    }
 
-        let after = table.get("KTLX").expect("still there");
-        assert_eq!((after.lat, after.lon), (0.1, 0.1), "it moved");
-        assert_ne!((after.lat, after.lon), (seeded.lat, seeded.lon));
-        assert_eq!(
-            table.rows().len(),
-            seed_table().rows().len(),
-            "and nothing was appended beside it",
+    /// A NaN must not silently degrade to "the first row in the table".
+    ///
+    /// Built over a populated table on purpose: over an empty one every
+    /// assertion here would hold for the wrong reason, and the test would have
+    /// stopped being able to fail the moment the seed was deleted.
+    #[test]
+    fn a_non_finite_coordinate_has_no_nearest_site() {
+        let table = build_table([("ZZZA", learned(-30_000_000, -140_000_000, 100, 20))]);
+        assert!(
+            table.nearest_wsr88d(-30.0, -140.0).is_some(),
+            "precondition: this table can answer a finite question",
         );
+
+        assert!(table.nearest_wsr88d(f64::NAN, -97.0).is_none());
+        assert!(table.nearest_wsr88d(35.0, f64::INFINITY).is_none());
+        assert!(table.nearest(f64::NEG_INFINITY, -97.0).is_none());
+    }
+
+    // -- the two filters an automatic pick applies -------------------------
+
+    /// The nearest *usable* site is not the nearest site, and both filters are
+    /// doing work.
+    ///
+    /// This used to be spelled as downtown Oklahoma City resolving past `TOKC`
+    /// and `KCRI` to `KTLX`, which asserted the filters and the seed's
+    /// coordinates at once and could only be written while the coordinates
+    /// were compiled in. The property is the same and it is about the rules:
+    /// nearest of all is a terminal radar — 89 km of single-pol Doppler around
+    /// one airport, not an absence of archive data — nearest WSR-88D is the
+    /// ROC test bed that scans intermittently, and the answer an unattended
+    /// pick wants is the third one out. See [`nearest_wsr88d_site`].
+    #[test]
+    fn an_automatic_pick_skips_the_tdwr_and_the_test_bed() {
+        let table = build_table([
+            ("TZZA", learned_single_height(-30_000_000, -140_000_000, 100)),
+            ("KCRI", learned(-30_100_000, -140_000_000, 100, 20)),
+            ("ZZZC", learned(-30_200_000, -140_000_000, 100, 20)),
+        ]);
+
+        let (nearest, _) = table.nearest(-30.0, -140.0).expect("a finite coordinate");
+        assert_eq!(nearest.name, "TZZA", "the literal nearest site is a TDWR");
+
+        let (nearest_88d, _) = table
+            .nearest_where(-30.0, -140.0, RadarSite::is_wsr88d)
+            .expect("a finite coordinate");
         assert_eq!(
-            table.rows().iter().filter(|r| r.name == "KTLX").count(),
+            nearest_88d.name, "KCRI",
+            "the nearest WSR-88D is the ROC test bed",
+        );
+
+        let (pick, _) = table
+            .nearest_wsr88d(-30.0, -140.0)
+            .expect("a finite coordinate");
+        assert_eq!(pick.name, "ZZZC", "and the pick is the one past both");
+    }
+
+    /// `TJUA` is San Juan's WSR-88D, not a TDWR, and a `starts_with('T')` test
+    /// would wrongly exclude the only Level II site serving Puerto Rico.
+    ///
+    /// The exception lives in the rule rather than in a row, so it outlived
+    /// the table it was written against and is checked here on a row built
+    /// from a fix like any other.
+    #[test]
+    fn tjua_is_not_treated_as_a_tdwr() {
+        let table = build_table([
+            ("TJUA", network(18_474_000, -66_180_000, 867)),
+            ("TZZA", network(-30_000_000, -140_000_000, 100)),
+        ]);
+
+        let tjua = table.get("TJUA").expect("built from its fix");
+        assert!(tjua.is_wsr88d());
+        assert!(!tjua.is_tdwr());
+
+        let tdwr = table.get("TZZA").expect("built from its fix");
+        assert!(tdwr.is_tdwr(), "every other T is one");
+    }
+
+    // -- elevations: the hole that must stay closed ------------------------
+
+    /// **Every row any source can build records an elevation.**
+    ///
+    /// The successor to `every_site_records_an_elevation`, which walked the
+    /// compiled-in table. Six of its rows once recorded none — KDGX, KFSX,
+    /// KLWX, KRTX, KSRX, KVWX, all `-99999` sentinels turned into `None` by an
+    /// `Option<i32>` refactor and never filled in — and a row without one is
+    /// not inert: it is the datum a cross-section's height axis is anchored
+    /// on, and the old lookup answered **sea level** for it, which reads as a
+    /// measurement rather than as a gap. 292 ft of it at KLWX.
+    ///
+    /// With the table deleted the hazard moved rather than went away: rows are
+    /// built by `SiteFix::applied`, so this walks a table built from every
+    /// shape a fix can take — a WSR-88D volume, a TDWR volume, a station
+    /// record onto nothing, and a station record onto a row that already had
+    /// heights.
+    #[test]
+    fn every_placed_row_records_an_elevation() {
+        let base = build_table([("ZZZD", learned(1_000_000, 1_000_000, 300, 25))]);
+        let table = extended(
+            base,
+            [
+                ("ZZZA", learned(-30_000_000, -140_000_000, 100, 20)),
+                ("ZZZB", learned_single_height(-10_000_000, -140_000_000, 60)),
+                ("ZZZC", network(-20_000_000, -140_000_000, 400)),
+                // Onto the row the base already carries.
+                ("ZZZD", network(1_500_000, 1_000_000, 400)),
+            ],
+        )
+        .expect("these fixes change the table");
+        assert_eq!(table.rows().len(), 4, "precondition: all four shapes built");
+
+        let missing: Vec<&str> = table
+            .rows()
+            .iter()
+            .filter(|s| s.heights.is_none())
+            .map(|s| s.name)
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these rows record no elevation and would anchor a section at sea \
+             level: {missing:?}",
+        );
+
+        // Recording *an* elevation is not enough: it has to be the one every
+        // render path asks for. A table where every row carried only a base
+        // would satisfy the assertion above and answer 0 ft to every feedhorn
+        // lookup — the same sea-level hole in a new shape.
+        let no_feedhorn: Vec<&str> = table
+            .rows()
+            .iter()
+            .filter(|s| s.height_ft(Datum::Feedhorn).is_none())
+            .map(|s| s.name)
+            .collect();
+        assert!(no_feedhorn.is_empty(), "no feedhorn height: {no_feedhorn:?}");
+    }
+
+    /// Only a volume can answer [`Datum::SiteBase`], and it answers only for a
+    /// WSR-88D.
+    ///
+    /// The successor to `only_the_single_height_rows_lack_a_base`, which named
+    /// the 46 shipped rows that could not answer. The set is no longer a list
+    /// of radars, it is a rule about sources: a Volume Data Block reports the
+    /// ground and the tower as two fields, a published station record reports
+    /// one elevation with nothing to split it by, and a TDWR volume reports
+    /// the same number twice — so the base is *unknown* for both of the
+    /// latter, not equal to the feedhorn.
+    ///
+    /// This is what the seed's deletion did to the datum, made explicit: what
+    /// used to be answerable for 161 shipped rows is now answerable only where
+    /// this install has decoded that radar's own WSR-88D volume.
+    #[test]
+    fn only_a_volume_can_answer_the_base_datum() {
+        let table = build_table([
+            ("ZZZA", learned(-30_000_000, -140_000_000, 100, 20)),
+            ("ZZZB", learned_single_height(-10_000_000, -140_000_000, 60)),
+            ("ZZZC", network(-20_000_000, -140_000_000, 400)),
+        ]);
+
+        let wsr88d = table.get("ZZZA").expect("a learned two-field row");
+        assert_eq!(wsr88d.height_ft(Datum::SiteBase), Some(328), "100 m");
+        assert_eq!(wsr88d.height_ft(Datum::Feedhorn), Some(394), "120 m");
+
+        for (name, why) in [
+            ("ZZZB", "a TDWR volume states one height twice"),
+            ("ZZZC", "a station record states one height"),
+        ] {
+            let row = table.get(name).expect("built from its fix");
+            assert_eq!(row.height_ft(Datum::SiteBase), None, "{name}: {why}");
+            assert!(
+                row.height_ft(Datum::Feedhorn).is_some(),
+                "{name}: and the feedhorn is still answerable",
+            );
+        }
+    }
+
+    /// The two datums are a tower apart wherever both are recorded.
+    ///
+    /// This is the property the old single `elev` could not express and the
+    /// reason a consumer has to name one: had the gap been a foot or two,
+    /// nothing about [`Datum`] would matter. The five standard towers are 48,
+    /// 65, 81, 97 and 114 ft, and the archive states them in truncated whole
+    /// metres, so the gap a row records is those figures to within 3 ft.
+    #[test]
+    fn the_two_datums_are_a_tower_apart() {
+        for (tower_m, want_ft) in [(14, 45), (19, 62), (24, 78), (29, 95), (34, 111)] {
+            let table = build_table([("ZZZA", learned(-30_000_000, -140_000_000, 100, tower_m))]);
+            let row = table.get("ZZZA").expect("a learned row");
+            let gap = row.height_ft(Datum::Feedhorn).expect("feedhorn")
+                - row.height_ft(Datum::SiteBase).expect("base");
+            assert_eq!(gap, want_ft, "{tower_m} m of tower");
+            assert!(
+                (30..=115).contains(&gap),
+                "{gap} ft is not a tower — the datums have collapsed",
+            );
+        }
+    }
+
+    // -- precedence and identity -------------------------------------------
+
+    /// A row already in the table takes the fix that lands on it, **in place**.
+    ///
+    /// Two rows of one name is the `TOK2`/`DOP1` failure — two entries at one
+    /// position, where which of them a nearest-search answers with is
+    /// arbitrary — and it is the reason those second-stream identifiers were
+    /// deliberately never given rows.
+    #[test]
+    fn an_existing_row_takes_the_fix_that_lands_on_it() {
+        let base = build_table([("ZZZA", learned(-30_000_000, -140_000_000, 100, 20))]);
+        let before = base.get("ZZZA").expect("a row").clone();
+
+        let table = extended(base, [("ZZZA", learned(100_000, 100_000, 1, 1))])
+            .expect("the position moved, so the table is rebuilt");
+
+        let after = table.get("ZZZA").expect("still there");
+        assert_eq!((after.lat, after.lon), (0.1, 0.1), "it moved");
+        assert_ne!((after.lat, after.lon), (before.lat, before.lon));
+        assert_eq!(table.rows().len(), 1, "nothing was appended beside it");
+        assert_eq!(
+            table.rows().iter().filter(|r| r.name == "ZZZA").count(),
             1,
             "one row per radar, whatever moved it",
         );
     }
 
-    /// A fetched fix that agrees with the row it lands on builds nothing.
+    /// A fix that agrees with the row it lands on builds nothing.
     ///
     /// The cheap half of the 1:1 rule and the reason `RadarSite` is
     /// `PartialEq`: Android resolves twice from the same cached catalogue, and
@@ -3071,73 +1271,175 @@ mod nearest_tests {
     /// catalogue that had not changed since the last call.
     #[test]
     fn a_fix_that_changes_nothing_reuses_the_table() {
-        let ktlx = seed_table().get("KTLX").expect("a seed row");
+        let base = build_table([("ZZZA", learned(-30_000_000, -140_000_000, 100, 20))]);
         let identical = SiteFix::Network {
-            lat_udeg: crate::site_position::micro_from_degrees(ktlx.lat),
-            lon_udeg: crate::site_position::micro_from_degrees(ktlx.lon),
+            lat_udeg: -30_000_000,
+            lon_udeg: -140_000_000,
             // Whatever the row already records wins, so this is ignored.
             feedhorn_m: 1,
         };
 
-        let table = build_table([("KTLX", identical)]);
         assert!(
-            std::ptr::eq(table.rows(), seed_table().rows()),
+            extended(base, [("ZZZA", identical)]).is_none(),
             "a fix that reproduces the row it lands on must not build a table",
         );
     }
 
-    /// The catalogue can move a seeded row without taking its base datum.
+    /// A station record can move a row without taking its base datum.
     ///
-    /// A `SiteFix::Network` carries one feedhorn metre where the row carries a
-    /// base and a tower in feet. Overwriting would make every
-    /// [`Datum::SiteBase`] query in the process answer `None` the first time a
-    /// catalogue landed — a silent, whole-network loss with no failing call.
+    /// A `SiteFix::Network` carries one feedhorn metre where a learned row
+    /// carries a base and a tower. Overwriting would make every
+    /// [`Datum::SiteBase`] query about that radar answer `None` the first time
+    /// a catalogue landed — a silent loss with no failing call.
     #[test]
     fn a_network_fix_moves_a_row_and_leaves_its_heights_alone() {
-        let seeded = seed_table().get("KDDC").expect("a seed row");
-        let table = build_table([(
-            "KDDC",
-            SiteFix::Network {
-                lat_udeg: -30_000_000,
-                lon_udeg: -140_000_000,
-                feedhorn_m: 1,
-            },
-        )]);
+        let base = build_table([("ZZZA", learned(1_000_000, 1_000_000, 100, 20))]);
+        let learned_heights = base.get("ZZZA").expect("a row").heights;
 
-        let after = table.get("KDDC").expect("still there");
-        assert_eq!(
-            (after.lat, after.lon),
-            (-30.0, -140.0),
-            "the position moved"
-        );
-        assert_eq!(after.heights, seeded.heights, "the heights did not");
-        assert!(after.height_ft(Datum::SiteBase).is_some());
+        let table = extended(base, [("ZZZA", network(-30_000_000, -140_000_000, 1))])
+            .expect("the position moved");
+
+        let after = table.get("ZZZA").expect("still there");
+        assert_eq!((after.lat, after.lon), (-30.0, -140.0), "the position moved");
+        assert_eq!(after.heights, learned_heights, "the heights did not");
+        assert_eq!(after.height_ft(Datum::SiteBase), Some(328));
     }
 
-    /// Two entries for one unseeded radar file one row, not two radars of the
-    /// same name.
-    ///
-    /// A duplicate would break `every_site_is_its_own_nearest_neighbour` in
-    /// exactly the way `TOK2`/`DOP1` were kept out of the seed to avoid: two
-    /// rows at one position, where which of them a search answers with is
-    /// arbitrary.
+    /// Two entries for one radar file one row, not two radars of the same name.
     #[test]
     fn a_repeated_identifier_files_one_row() {
-        let table = build_table([(UNSEEDED, REMOTE), (UNSEEDED, REMOTE)]);
-        assert_eq!(
-            table.rows().iter().filter(|r| r.name == UNSEEDED).count(),
-            1,
-        );
+        let fix = learned(-30_000_000, -140_000_000, 100, 20);
+        let table = build_table([("ZZZA", fix), ("ZZZA", fix)]);
+        assert_eq!(table.rows().iter().filter(|r| r.name == "ZZZA").count(), 1);
     }
 
-    /// Learning nothing new reuses the table in hand rather than leaking a
-    /// copy of it.
+    /// Resolving nothing over nothing reuses the table in hand rather than
+    /// leaking a copy of it.
     #[test]
     fn a_resolution_that_learns_nothing_is_the_same_table() {
         let once = build_table(std::iter::empty());
         assert!(
-            std::ptr::eq(once.rows(), seed_table().rows()),
-            "an empty overlay must not leak a second copy of the seed",
+            std::ptr::eq(once, empty_table()),
+            "an empty overlay must not leak a second table",
+        );
+    }
+
+    // -- radars that exist and cannot be placed ----------------------------
+
+    /// A radar the catalogue lists and cannot place is a **member without a
+    /// row**: no marker, and no disappearance either.
+    ///
+    /// `TPBI` and `KCRI` are the real cases — both have Level II data in the
+    /// archive bucket and both 404 from `api.weather.gov/radar/stations` — and
+    /// while the compiled-in table existed they were placed by it. Without it
+    /// there are only two honest options, and drawing them at (0, 0) is not
+    /// one: a marker in the Gulf of Guinea has exactly the confidence of a
+    /// real one.
+    ///
+    /// So they are listed, selectable, and absent from every question that
+    /// needs a position.
+    #[test]
+    fn a_member_with_no_position_is_listed_and_is_not_a_row() {
+        let table = build_table([
+            ("TPBI", SiteFix::Unplaced),
+            ("ZZZA", learned(-30_000_000, -140_000_000, 100, 20)),
+        ]);
+
+        assert_eq!(table.unplaced(), ["TPBI"], "it is a member");
+        assert!(table.knows("TPBI"), "and the site list can find it");
+
+        assert!(table.get("TPBI").is_none(), "with no position to hand out");
+        assert!(
+            table.rows().iter().all(|r| r.name != "TPBI"),
+            "and no row, so nothing draws it",
+        );
+
+        // The specific wrong answer this exists to prevent.
+        let (found, _) = table.nearest(0.0, 0.0).expect("a finite coordinate");
+        assert_eq!(
+            found.name, "ZZZA",
+            "a member with no position must never answer a search at Null Island",
+        );
+    }
+
+    /// A member that gains a position becomes a row and stops being a member.
+    ///
+    /// The two lists are disjoint, and this is the transition that would break
+    /// it: opening `TPBI` fetches its data by identifier, the volume states
+    /// where it is, and the next resolution places it. A site list that walks
+    /// rows and members would otherwise show it twice.
+    #[test]
+    fn a_member_that_gains_a_position_leaves_the_member_list() {
+        let base = build_table([("TPBI", SiteFix::Unplaced)]);
+        assert_eq!(base.unplaced(), ["TPBI"], "precondition");
+        assert!(base.rows().is_empty(), "precondition");
+
+        let table = extended(base, [("TPBI", learned(26_688_000, -80_273_000, 5, 5))])
+            .expect("a member gaining a position changes the table");
+
+        assert!(table.unplaced().is_empty(), "no longer merely a member");
+        assert_eq!(table.rows().len(), 1, "exactly one row, not two");
+        let row = table.get("TPBI").expect("now placed");
+        assert_eq!(row.name, "TPBI");
+        assert!(row.height_ft(Datum::Feedhorn).is_some());
+        assert!(table.knows("TPBI"), "and still known, by the other route");
+    }
+
+    /// Bare membership never hides a position that arrived in the same stream.
+    ///
+    /// The catalogue emits both kinds from one `fixes()` and the frontend
+    /// chains its learned cache onto it, so the two claims about one radar
+    /// reach `extended` in whatever order the iterators happen to yield.
+    /// [`SiteFixRank`] is what makes that order irrelevant, and this asserts it
+    /// **both ways round** — the arm that only works in one order is the bug
+    /// this catches.
+    #[test]
+    fn a_placed_fix_beats_bare_membership_in_either_order() {
+        let placed = learned(-30_000_000, -140_000_000, 100, 20);
+        for (case, fixes) in [
+            ("membership first", [("ZZZA", SiteFix::Unplaced), ("ZZZA", placed)]),
+            ("membership last", [("ZZZA", placed), ("ZZZA", SiteFix::Unplaced)]),
+        ] {
+            let table = build_table(fixes);
+            assert!(table.unplaced().is_empty(), "{case}");
+            let row = table
+                .get("ZZZA")
+                .unwrap_or_else(|| panic!("{case}: the position must win"));
+            assert_eq!((row.lat, row.lon), (-30.0, -140.0), "{case}");
+        }
+    }
+
+    /// The ranks, as an ordering, before anything is built on them.
+    ///
+    /// Trivial and worth having: `extended` picks the strongest fix per radar
+    /// by comparing these, so a variant reordering would silently invert the
+    /// ladder while every structural test above still passed.
+    #[test]
+    fn the_ranks_run_learned_then_network_then_unplaced() {
+        assert!(SiteFixRank::Learned < SiteFixRank::Network);
+        assert!(SiteFixRank::Network < SiteFixRank::Unplaced);
+        assert_eq!(
+            learned(0, 0, 1, 2).rank(),
+            SiteFixRank::Learned,
+        );
+        assert_eq!(network(0, 0, 1).rank(), SiteFixRank::Network);
+        assert_eq!(SiteFix::Unplaced.rank(), SiteFixRank::Unplaced);
+    }
+
+    /// Re-reading the same catalogue does not leak a fresh copy of a member's
+    /// name every launch.
+    ///
+    /// A member's identifier is leaked exactly as a row's is, and the reuse
+    /// path for a row — the `PartialEq` comparison — has no counterpart for a
+    /// bare name. Without the lookup in `extended` this would allocate on
+    /// every resolution, forever, on the one platform that resolves twice per
+    /// launch.
+    #[test]
+    fn re_listing_the_same_member_builds_nothing() {
+        let base = build_table([("TPBI", SiteFix::Unplaced)]);
+        assert!(
+            extended(base, [("TPBI", SiteFix::Unplaced)]).is_none(),
+            "a member that was already a member is not a change",
         );
     }
 }

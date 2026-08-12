@@ -170,19 +170,31 @@ impl SiteCatalogue {
 
     /// What this catalogue has to say to [`crate::sites::resolve`].
     ///
-    /// Only the placed members: an unplaced one has nothing to contribute and
-    /// a fix carrying a made-up position would be worse than no fix at all.
+    /// **Every** member, placed or not. A placed one becomes a
+    /// [`SiteFix::Network`] carrying its position; an unplaced one becomes a
+    /// [`SiteFix::Unplaced`], which asserts that the radar exists and nothing
+    /// else.
+    ///
+    /// Emitting the unplaced ones is not a formality. `TPBI` and `KCRI` are
+    /// the two identifiers the bucket lists and `api.weather.gov` will not
+    /// place, and while a compiled-in table existed they were placed by it.
+    /// With it deleted, dropping them here would remove them from the site
+    /// list altogether — a radar with real archive data that the application
+    /// simply refuses to mention. The alternative that must not be taken is a
+    /// fix carrying a made-up position, which is a marker at Null Island drawn
+    /// with the confidence of a real one; hence a variant with no numbers in
+    /// it rather than a variant with zeros.
     pub fn fixes(&self) -> impl Iterator<Item = (&str, SiteFix)> {
-        self.sites.iter().filter_map(|(id, position)| {
-            let position = position.as_ref()?;
-            Some((
-                id.as_str(),
-                SiteFix::Network {
+        self.sites.iter().map(|(id, position)| {
+            let fix = match position {
+                Some(position) => SiteFix::Network {
                     lat_udeg: position.lat_udeg,
                     lon_udeg: position.lon_udeg,
                     feedhorn_m: position.feedhorn_m,
                 },
-            ))
+                None => SiteFix::Unplaced,
+            };
+            (id.as_str(), fix)
         })
     }
 }
