@@ -2879,6 +2879,7 @@ fn a_taught_position_moves_the_maps_marker_and_not_only_the_data() {
         settled,
         "a volume restating what is already known re-rasterized every site icon",
     );
+}
 
 /// **A volume decoded this session gives its radar an MSL datum this session.**
 ///
@@ -2964,7 +2965,6 @@ fn a_volume_this_session_decoded_gives_its_radar_a_height_this_session() {
 ///
 /// # Why not `KTLX`
 ///
-<<<<<<< HEAD
 /// A seeded row is no longer immovable: `sites::resolve` applies a learned fix
 /// onto the row it lands on, so any sibling test that teaches a position — from
 /// a store on construction, or from a volume mid-run — moves that radar in this
@@ -2977,19 +2977,11 @@ fn a_volume_this_session_decoded_gives_its_radar_a_height_this_session() {
 /// identifier is load-bearing: it must stay one no other test learns a
 /// position for. This test's own middle block teaches it, which is why the last
 /// block asserts on the *source* rather than on coordinates — see there.
-=======
-/// The assertions below compare against the row this radar starts on, and a
-/// row is not immovable: `sites::resolve` applies a learned fix onto the row it
-/// lands on, so any sibling test that decodes a volume for a radar moves that
-/// radar in this process's table. `a_position_a_volume_taught_survives_a_restart`
-/// does exactly that, to `KTLX`, and running the two in either order made this
-/// test fail in release and pass in debug — the worst kind, a test whose
-/// outcome is a scheduling accident.
 ///
-/// So this uses `KMBX`, which nothing else in the workspace names, and places
-/// it itself — [`crate::test_sites`] deliberately leaves it out. The
-/// identifier is load-bearing: it must stay one no other test names.
->>>>>>> 1a47feb4 (test: every test binary places the radars it measures against)
+/// It also *places* it, rather than reading a row from
+/// [`crate::test_sites`]: the binary carries no radars, so the row this starts
+/// from has to come from somewhere, and a shared fixture would be a row other
+/// tests could read after this one had moved it.
 #[test]
 fn a_run_with_no_config_store_still_applies_the_volumes_own_position() {
     use rustdar_radar::site_position::SitePositionSource;
@@ -3029,7 +3021,6 @@ fn a_run_with_no_config_store_still_applies_the_volumes_own_position() {
     assert_eq!(same_run.site_source, SitePositionSource::Learned);
     assert_eq!(same_run.site.lat.to_bits(), info.site.lat.to_bits());
 
-<<<<<<< HEAD
     // And nothing outlives the process: a fresh app remembers nothing, so its
     // `ScanInfo` falls back to the table rather than recalling anything.
     //
@@ -3054,36 +3045,6 @@ fn a_run_with_no_config_store_still_applies_the_volumes_own_position() {
         SitePositionSource::Table,
         "with no store, the volume's own position must not have outlived the \
          process that decoded it — this run recalled one",
-=======
-    // And **nothing was written**, which is the whole claim: a store is where
-    // a position outlives the process, and there is no store.
-    let next_run = headless(TestBridge::desktop().without_config_store());
-    assert!(
-        next_run.site_positions.is_empty(),
-        "with no store there is nothing to load, so a fresh app must start \
-         having learned nothing",
-    );
-
-    // What it does *not* claim, and used to: that a fresh `App` is back on the
-    // row this radar started on. It is not, and that is deliberate — a volume
-    // decoded in this process teaches the process-wide site table as well as
-    // the store, because with no compiled-in table the alternative is a first
-    // session rendering every MSL height against a table that has no row for
-    // the radar it is rendering. See `App::scan_info_learning_position`.
-    //
-    // A user never sees the difference: one process is one `App`. A test
-    // building a second one in the same process does, so it is stated here
-    // rather than left to be rediscovered.
-    let placed = rustdar_radar::sites::get_radar_site(SITE).expect("still a row");
-    assert!(
-        (placed.lat - f64::from(stated_lat)).abs() < 1e-5,
-        "the table learned what the volume stated: {} against {stated_lat}",
-        placed.lat,
-    );
-    assert_ne!(
-        placed.lat, table.lat,
-        "and it is no longer where it started",
->>>>>>> 1a47feb4 (test: every test binary places the radars it measures against)
     );
 }
 
