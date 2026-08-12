@@ -70,13 +70,14 @@ fn the_centre_of_the_screen_looks_at_the_centre_of_the_box() {
 /// the pivot.
 ///
 /// This is the geometry half of the #6 zoom: `MIN_EYE_DISTANCE` is 0.05
-/// half-diagonals, which is inside the box from every default angle, and
+/// framing radii, which is inside the box from every default angle, and
 /// nothing in `build_view` assumes the eye is outside — the derivation is a
 /// point and a direction, not a framing. The GPU half (the raymarch's slab
 /// entry clamped to zero so an inside eye marches forward from itself)
 /// lives in `rustdar-frontend`'s silhouette harness, where the shader runs.
-/// Checked at 1x and 12x, because the stop is measured against the
-/// stretched box.
+/// Checked at 1x and 12x. The stop no longer moves with the knob — the
+/// framing radius reads the true box — but the *box* still grows around
+/// the eye, so "inside" is a claim worth re-making at both ends.
 #[test]
 fn a_camera_at_the_zoom_stop_is_inside_the_box_and_still_has_a_view() {
     for exaggeration in [1.0, 12.0] {
@@ -166,19 +167,18 @@ fn the_box_keeps_its_true_proportions() {
     let view = view_for(camera(180.0, 0.0, 2.0), BOX_KM, 1.0).expect("a view");
     // Box space is the unit cube whatever the physical extent, so the proof
     // has to be in world kilometres: the eye distance is set from the
-    // half-diagonal of the *physical* box, which a normalised cube would
-    // not have.
+    // *physical* box's north extent, which a normalised cube would not have.
     let distance = (view.eye_km[0] * view.eye_km[0]
         + view.eye_km[1] * view.eye_km[1]
         + view.eye_km[2] * view.eye_km[2])
         .sqrt();
-    let half_diagonal = 0.5 * (240.0f32 * 240.0 + 240.0 * 240.0 + 18.0 * 18.0).sqrt();
+    let radius = 240.0f32 / std::f32::consts::SQRT_2;
     assert!(
-        (distance - 2.0 * half_diagonal).abs() < 1e-2,
-        "eye at {distance} km is not 2.0 half-diagonals ({half_diagonal} km) out",
+        (distance - 2.0 * radius).abs() < 1e-2,
+        "eye at {distance} km is not 2.0 framing radii ({radius} km) out",
     );
     // And the eye in box space is *not* on a sphere: the z axis is 13x
-    // shorter, so two half-diagonals of z is far more of the box's height
+    // shorter, so two framing radii of z is far more of the box's height
     // than of its width.
     let dz = (view.eye_in_box[2] - 0.5).abs();
     let dy = (view.eye_in_box[1] - 0.5).abs();
@@ -384,34 +384,150 @@ fn exaggeration_stretches_the_world_and_moves_no_cell_in_the_box() {
     }
 }
 
-/// A taller box is looked at from proportionally further out, so the framing
-/// does not change as the knob turns.
+/// Stretching the box does not move the eye, so the ground keeps its scale as
+/// the knob turns and only heights grow.
 ///
-/// `eye_distance` is in half-diagonals, and the half-diagonal is taken from
-/// the *stretched* box. The mutation this closes is measuring it from the
-/// true box instead: the picture would then be correct in shape and the box
-/// would grow out of the pane as the exaggeration went up, which reads as the
-/// slider also being a zoom.
+/// This replaced the opposite assertion, which measured `eye_distance` against
+/// the *stretched* half-diagonal in the name of "the box fills the same
+/// fraction of the pane at 1× and at 12×". That promise was not kept and could
+/// not be: the stretch changes the box's shape, and one distance cannot hold
+/// two changing dimensions still. Measured at 1× against 12×, the box's
+/// silhouette still grew 1.36× on a whole-scan box, while on a box zoomed to
+/// the resampler's 10 km floor the **ground** shrank to 0.154× — the knob was
+/// a 6.5× zoom out, which is precisely what `exaggerated_box_km` says a
+/// vertical exaggeration must never be.
+///
+/// So the property is now the one a vertical exaggeration is defined by, and
+/// it holds exactly rather than approximately. The mutation it closes is
+/// reaching for `exaggerated_box_km` in `framing_radius_km`, which is the
+/// tempting "fix" for a box that stands tall out of the pane at 12×.
 #[test]
-fn a_stretched_box_is_viewed_from_proportionally_further_out() {
-    let flat = OrbitCamera::restore(225.0, 25.0, 2.5, [0.0; 3], 1.0).expect("finite");
-    let tall = OrbitCamera::restore(225.0, 25.0, 2.5, [0.0; 3], 6.0).expect("finite");
-    let flat_km = view_for(flat, BOX_KM, 1.6).expect("viewable").eye_km;
-    let tall_km = view_for(tall, BOX_KM, 1.6).expect("viewable").eye_km;
-
+fn the_exaggeration_knob_does_not_move_the_eye() {
     let length = |v: [f32; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-    let flat_diag = half_diagonal(BOX_KM);
-    let tall_diag = half_diagonal(exaggerated_box_km(tall, BOX_KM));
+    // Both ends of the knob's travel, on a whole-scan box and on one at the
+    // resampler's floor: the old expression was off by 2% at one and by 550%
+    // at the other, so a single box size would have missed it.
+    for box_km in [[651.0, 651.0, 18.0], [20.0, 20.0, 18.0]] {
+        let flat = OrbitCamera::restore(225.0, 25.0, 2.5, [0.0; 3], 1.0).expect("finite");
+        let at_1x = view_for(flat, box_km, 1.6).expect("viewable").eye_km;
+        for exaggeration in [3.0, 6.0, 12.0] {
+            let camera =
+                OrbitCamera::restore(225.0, 25.0, 2.5, [0.0; 3], exaggeration).expect("finite");
+            let stretched = view_for(camera, box_km, 1.6).expect("viewable").eye_km;
+            assert!(
+                (length(stretched) - length(at_1x)).abs() < 1e-3,
+                "a {box_km:?} box at {exaggeration}x moved the eye from \
+                 {} km to {} km, so the knob rescaled the ground",
+                length(at_1x),
+                length(stretched),
+            );
+        }
+    }
+}
+
+/// Widening the box does not push the eye back: a wider pane shows more ground
+/// at the same scale, not the same ground smaller.
+///
+/// The regression this pins arrived with the box that covers its pane's
+/// rectangle instead of the square inscribed in it. The standoff was
+/// `eye_distance × half_diagonal` over all three axes, so the box getting wider
+/// moved the eye out with it — measured on a real KDMX volume at 1600×900,
+/// 1.4397× further out for a 460 km square becoming an 818 × 460 km rectangle,
+/// which brought a patch of ground back at 0.694× its size at the default
+/// camera. Converting a pane to 3D made the storm smaller, which is the
+/// complaint the rectangle was built to answer.
+///
+/// The eye distance is asserted rather than the picture because with a fixed
+/// vertical field of view the two are the same statement: the ground a pane
+/// spans is `2 · distance · tan(fov/2)`, so an unmoved eye *is* an unchanged
+/// scale, at every yaw and pitch at once.
+#[test]
+fn widening_the_box_does_not_push_the_eye_back() {
+    let length = |v: [f32; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    let camera = OrbitCamera::default();
+    let square = view_for(camera, [460.0, 460.0, 18.0], 1.0).expect("viewable");
+    // Every aspect a column can take, from the 0.15 `MIN_RATIO` clamp on a
+    // wide window up past 16:9 — the property has to hold continuously, not
+    // only at the one ratio the complaint arrived at.
+    for east_km in [70.0f32, 230.0, 460.0, 818.0, 1104.0, 3066.0] {
+        let aspect = east_km / 460.0;
+        let wide = view_for(camera, [east_km, 460.0, 18.0], aspect).expect("viewable");
+        assert!(
+            (length(wide.eye_km) - length(square.eye_km)).abs() < 1e-2,
+            "a box {east_km} km east moved the eye from {} km to {} km; the \
+             pane's width must not set the scale",
+            length(square.eye_km),
+            length(wide.eye_km),
+        );
+    }
+}
+
+/// Zooming the ground moves the picture by exactly what was zoomed.
+///
+/// The box's height is fixed — 0 to 18 km MSL, times the knob — while the zoom
+/// moves its ground extent over the resampler's whole range, a 651 km whole-scan
+/// box down to a 20 km floor. A standoff taken from the three-axis half-diagonal
+/// therefore stopped tracking the zoom as the ground shrank past the ~54 km
+/// vertical term: measured across that range at the shipped 3× exaggeration, a
+/// **32.53× ground zoom read as 15.12× of picture**, so the user lost more than
+/// half of what they asked for, worst at the tight end where they were looking
+/// hardest.
+///
+/// Asserted end to end *and* step by step, because a rule can hit the endpoints
+/// and sag between them.
+#[test]
+fn the_zoom_is_proportional_to_the_ground_it_zoomed() {
+    let length = |v: [f32; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    let camera = OrbitCamera::default();
+    let standoff = |half_km: f32| {
+        let box_km = [2.0 * half_km, 2.0 * half_km, 18.0];
+        length(view_for(camera, box_km, 1.6).expect("viewable").eye_km)
+    };
+    // The resampler's ceiling for a square ask down to `MIN_HALF_WIDTH_KM`.
+    let steps = [325.3f32, 160.0, 80.0, 40.0, 20.0, 10.0];
+    for pair in steps.windows(2) {
+        let (wide, tight) = (pair[0], pair[1]);
+        let ground = wide / tight;
+        let picture = standoff(wide) / standoff(tight);
+        assert!(
+            (picture / ground - 1.0).abs() < 1e-3,
+            "zooming {wide} km to {tight} km is {ground}x of ground and came \
+             back as {picture}x of picture",
+        );
+    }
+    let ends = standoff(steps[0]) / standoff(steps[steps.len() - 1]);
     assert!(
-        tall_diag > flat_diag,
-        "precondition: stretching must lengthen the diagonal",
+        (ends / (steps[0] / steps[steps.len() - 1]) - 1.0).abs() < 1e-3,
+        "over the resampler's whole range the zoom came back as {ends}x",
     );
-    assert!(
-        (length(flat_km) / flat_diag - length(tall_km) / tall_diag).abs() < 1e-3,
-        "the eye must stay at the same multiple of the half-diagonal: {} vs {}",
-        length(flat_km) / flat_diag,
-        length(tall_km) / tall_diag,
-    );
+}
+
+/// The box occupies the same fraction of its pane whatever shape the pane is.
+///
+/// The framing is `eye_distance`'s to set and nothing else's. Under the
+/// three-axis half-diagonal it was also the pane's: the pane's height spanned
+/// 0.926 of the box's north extent at aspect 0.15 and 6.525 at 7.1, a factor of
+/// 7.04 from the pane's shape alone, so a user who dragged a divider was
+/// silently zoomed and a narrow 3D pane sat at a different scale from the plan
+/// pane it was made from. Held at `2.5 / √2 · 2 · tan(20°) = 1.28683` here, at
+/// every aspect.
+#[test]
+fn the_box_fills_the_same_fraction_of_every_pane_shape() {
+    let length = |v: [f32; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    let camera = OrbitCamera::default();
+    let north_km = 460.0f32;
+    for aspect in [0.15f32, 0.5, 1.0, 1.778, 2.4, 7.1] {
+        let view = view_for(camera, [aspect * north_km, north_km, 18.0], aspect).expect("viewable");
+        // What the pane's height spans in kilometres, over the box's own north
+        // extent: the box's share of the pane, from the far side of 1.
+        let spanned = 2.0 * length(view.eye_km) * (0.5 * FOV_Y_DEG.to_radians()).tan();
+        assert!(
+            (spanned / north_km - 1.28683).abs() < 1e-4,
+            "at aspect {aspect} the pane spans {spanned} km over a {north_km} km \
+             box, {}x rather than 1.28683x",
+            spanned / north_km,
+        );
+    }
 }
 
 /// Only the vertical axis is stretched.
@@ -483,14 +599,14 @@ fn the_box_follows_the_pointer_when_the_view_is_panned() {
 ///
 /// # The exaggeration is part of the property
 ///
-/// The world a screen point spans is set by the eye's distance, and the eye's
-/// distance is measured in half-diagonals **of the stretched box**; the
-/// fraction the pivot is stored as is against the stretched half-extent too.
-/// So every case here is also a check that `pan_for_drag` measures the same
-/// box `pivot_km` and `view_for` do. Running only at 1× — the single value at
-/// which `exaggerated_box_km` is the identity — would make the test blind to
-/// the whole of that, which is the defect this file's other sites were fixed
-/// for.
+/// The world a screen point spans is set by the eye's distance, which is
+/// measured in framing radii **of the true box**; the fraction the pivot is
+/// stored as is against the *stretched* half-extent. The two boxes are
+/// deliberately not the same one, so every case here is a check that
+/// `pan_for_drag` reads each of them exactly where `pivot_km` and `view_for`
+/// do. Running only at 1× — the single value at which `exaggerated_box_km` is
+/// the identity — would make the test blind to the whole of that, which is
+/// the defect this file's other sites were fixed for.
 #[test]
 fn a_drag_moves_the_pivot_by_exactly_the_world_the_pointer_crossed() {
     let height = 900.0f32;

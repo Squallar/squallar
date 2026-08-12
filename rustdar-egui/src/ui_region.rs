@@ -301,7 +301,7 @@ fn zoom_step(input: &egui::InputState) -> f64 {
 /// # Why the eye does not move
 ///
 /// It has nothing to move for. `OrbitCamera::eye_distance` is in multiples of
-/// the box's half-diagonal, so a box that shrinks carries the eye in with it,
+/// the box's framing radius, so a box that shrinks carries the eye in with it,
 /// continuously, at exactly the angle and standoff ratio the user left it at.
 /// There is no reframe here and there must never be one: nothing may move the
 /// camera but the user.

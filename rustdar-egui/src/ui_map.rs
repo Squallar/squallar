@@ -1949,7 +1949,7 @@ fn volume_pane_outcome(
     //
     // The eye follows anyway, and that is the whole reason this arm could be
     // deleted rather than replaced: `eye_distance` is in multiples of the box's
-    // half-diagonal, so a box the zoom tightened brings the camera in with it,
+    // framing radius, so a box the zoom tightened brings the camera in with it,
     // continuously, holding the user's orbit angle and standoff ratio exactly.
     // Nothing here may reframe, ease or fit — the user is the only thing that
     // moves this camera, and the standoff is theirs to set on the pane's own
@@ -2246,7 +2246,7 @@ pub(crate) fn render_volume_controls(
         // key, because a modifier is a desktop-only gesture and this pane has
         // to work under a finger and in a browser.
         //
-        // Held in multiples of the box's half-diagonal, which is why the number
+        // Held in multiples of the box's framing radius, which is why the number
         // means the same thing at every box size — and why tightening the box
         // does not disturb it. Below 1 the eye is inside the box, which is a
         // supported camera and the close inspection GR2Analyst allows; see
@@ -2269,7 +2269,7 @@ pub(crate) fn render_volume_controls(
                 volume.camera.set_eye_distance(standoff);
             }
             response.on_hover_text(
-                "How far back the eye sits, in box half-diagonals - the framing. Under 1 puts \
+                "How far back the eye sits, in box framing radii - the framing. Under 1 puts \
                  the eye inside the box. Scroll and pinch zoom the ground instead, the same \
                  way they do on a flat pane.",
             );

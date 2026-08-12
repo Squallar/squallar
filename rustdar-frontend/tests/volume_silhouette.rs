@@ -776,6 +776,36 @@ fn camera(yaw: f32, pitch: f32, distance: f32, exaggeration: f32) -> OrbitCamera
     OrbitCamera::restore(yaw, pitch, distance, [0.0; 3], exaggeration).expect("a finite camera")
 }
 
+/// The eye distance that frames [`BOX_KM`] the same size at every exaggeration.
+///
+/// `eye_distance` is in framing radii of the box's *true* north–south extent
+/// (`volume_view::framing_radius_km`), which the knob does not touch — so
+/// stretching the box no longer backs the eye off, deliberately: a vertical
+/// exaggeration that rescaled the ground would be a zoom, which is what
+/// `eye_distance` already is.
+///
+/// This harness wants the opposite, and has to ask for it rather than inherit
+/// it. It compares one silhouette against another across the knob's whole
+/// travel, and its residual is a **filter band a fixed number of pixels wide**;
+/// that is only comparable between two pictures of the same size. Left at a
+/// constant 2.5 the 12× sphere renders 4.9× the pixels of the 1× one, the band
+/// becomes proportionally thinner, and the IoU rises 0.0190 for a reason that
+/// has nothing to do with what the test is asking. So this holds the stretched
+/// box's half-diagonal at a constant 2.5 — the standoff the assertions were
+/// calibrated against — and the residual is the filter's again.
+fn framed_distance(exaggeration: f32) -> f32 {
+    2.5 * stretched_half_diagonal(exaggeration) / (BOX_KM[1] * std::f32::consts::FRAC_1_SQRT_2)
+}
+
+/// Half the diagonal of [`BOX_KM`] stretched by `exaggeration`. See
+/// [`framed_distance`], which is the only reason this harness still needs it.
+fn stretched_half_diagonal(exaggeration: f32) -> f32 {
+    0.5 * (BOX_KM[0] * BOX_KM[0]
+        + BOX_KM[1] * BOX_KM[1]
+        + (BOX_KM[2] * exaggeration) * (BOX_KM[2] * exaggeration))
+        .sqrt()
+}
+
 /// A box whose horizontal axes are far larger than its vertical one, which is
 /// the shape a real volume has.
 const BOX_KM: [f32; 3] = [240.0, 240.0, 60.0];
@@ -1156,7 +1186,7 @@ fn an_off_centre_sphere_puts_its_silhouette_where_the_rays_say() {
 /// behind it.
 ///
 /// The GPU half of the #6 zoom: `OrbitCamera`'s minimum eye distance is 0.05
-/// half-diagonals, which puts the eye inside the volume, and the shader's
+/// framing radii, which puts the eye inside the volume, and the shader's
 /// licence for that is one clamp — `slab_entry_exit` takes
 /// `max(near.z, 0.0)`, so a ray from an inside eye marches forward from the
 /// eye rather than from the box wall *behind* it. This is the test that can
@@ -1165,7 +1195,8 @@ fn an_off_centre_sphere_puts_its_silhouette_where_the_rays_say() {
 /// composites in front of everything. So two renders from the same inside
 /// camera: a sphere wholly behind the eye must paint **nothing**, and a
 /// sphere ahead must land exactly where the rays say. At 1x and 12x
-/// exaggeration, because the zoom stop is measured against the stretched box.
+/// exaggeration: the stop itself no longer moves with the knob, but the box
+/// grows around the eye, so "inside" is worth re-asserting at both ends.
 ///
 /// ```text
 /// cargo test -p rustdar-frontend --test volume_silhouette \
@@ -1514,8 +1545,8 @@ fn a_sphere_in_kilometres_is_an_ellipsoid_in_box_space_and_renders_as_one() {
 ///
 /// — the depth term `(D − h·Sy)` cancels exactly, and with `aspect = W/H` so
 /// does the viewport. So the ratio is **linear in E with no compensation at
-/// all**, even though `eye_distance` is in half-diagonals of the stretched box
-/// and `D` therefore grows with `E`. Where the framing compensation shows up is
+/// all**, even though [`framed_distance`] grows `D` with `E` to hold the
+/// silhouette's size. Where that framing compensation shows up is
 /// in the *absolute* sizes, which is why both are printed: the silhouette's
 /// height grows by far less than `E` while its width shrinks, and the ratio is
 /// the product of the two.
@@ -1551,7 +1582,12 @@ fn the_silhouette_matches_the_rays_at_every_vertical_exaggeration() {
     println!("a box-space sphere against its own ray cast, at each exaggeration:");
     let mut ious = Vec::new();
     for exaggeration in EXAGGERATIONS {
-        let uniform = masking_uniform(camera(225.0, 25.0, 2.5, exaggeration), BOX_KM, cells, size);
+        let uniform = masking_uniform(
+            camera(225.0, 25.0, framed_distance(exaggeration), exaggeration),
+            BOX_KM,
+            cells,
+            size,
+        );
         let pixels = raymarch_once(
             &device, &queue, &pipelines, cells, &sphere, &lut, &uniform, size,
         );
@@ -1593,7 +1629,12 @@ fn the_silhouette_matches_the_rays_at_every_vertical_exaggeration() {
         BOX_KM[2] / BOX_KM[0],
     );
     for exaggeration in EXAGGERATIONS {
-        let uniform = masking_uniform(camera(180.0, 0.0, 2.5, exaggeration), BOX_KM, cells, size);
+        let uniform = masking_uniform(
+            camera(180.0, 0.0, framed_distance(exaggeration), exaggeration),
+            BOX_KM,
+            cells,
+            size,
+        );
         let pixels = raymarch_once(
             &device, &queue, &pipelines, cells, &cube, &lut, &uniform, size,
         );
@@ -1610,12 +1651,7 @@ fn the_silhouette_matches_the_rays_at_every_vertical_exaggeration() {
         let predicted = f64::from(exaggeration) * f64::from(BOX_KM[2] / BOX_KM[0]);
 
         // The absolute sizes, to show where the framing compensation lives.
-        let stretched_half_diagonal = 0.5
-            * (BOX_KM[0] * BOX_KM[0]
-                + BOX_KM[1] * BOX_KM[1]
-                + (BOX_KM[2] * exaggeration) * (BOX_KM[2] * exaggeration))
-                .sqrt();
-        let distance = 2.5 * stretched_half_diagonal;
+        let distance = 2.5 * stretched_half_diagonal(exaggeration);
         let depth = distance - HALF * BOX_KM[1];
         let predicted_width =
             f64::from(2.0 * f * HALF * BOX_KM[0] / depth) * f64::from(size[0]) / 2.0;

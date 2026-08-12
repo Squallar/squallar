@@ -600,7 +600,7 @@ fn a_finite_nudge_moves_the_camera_and_stays_in_range() {
     assert_eq!(camera.eye_distance(), MIN_EYE_DISTANCE);
 }
 
-/// The zoom's near stop is 0.05 half-diagonals — inside the box, by the
+/// The zoom's near stop is 0.05 framing radii — inside the box, by the
 /// literal.
 ///
 /// Pinned as a number rather than as `MIN_EYE_DISTANCE`, because the
@@ -609,10 +609,11 @@ fn a_finite_nudge_moves_the_camera_and_stays_in_range() {
 /// storm; at 0.05 the eye ends up inside it, which the raymarch supports by
 /// clamping its slab entry to zero. A symbolic assertion would follow the
 /// constant wherever it went and could not see this regress. Checked at 1x
-/// and 12x exaggeration: the limit is in half-diagonals of the *stretched*
-/// box, so the stop is the same fraction of the view whatever the stretch.
+/// and 12x exaggeration: the limit is in framing radii of the box's *true*
+/// north–south extent, which the stretch does not touch, so the stop is the
+/// same standoff whatever the knob is set to.
 #[test]
-fn the_zoom_stops_at_a_twentieth_of_a_half_diagonal() {
+fn the_zoom_stops_at_a_twentieth_of_a_framing_radius() {
     for exaggeration in [1.0, 12.0] {
         let mut camera =
             OrbitCamera::restore(225.0, 25.0, 2.5, [0.0; 3], exaggeration).expect("finite");
@@ -623,7 +624,7 @@ fn the_zoom_stops_at_a_twentieth_of_a_half_diagonal() {
         assert_eq!(
             camera.eye_distance(),
             0.05,
-            "at {exaggeration}x the zoom's near stop moved; 0.05 half-diagonals \
+            "at {exaggeration}x the zoom's near stop moved; 0.05 framing radii \
                  is the inside-the-box zoom #6 asked for, and anything at or above \
                  1.0 locks the eye out of the box again",
         );

@@ -1114,7 +1114,7 @@ pub struct OrbitDelta {
     /// **No gesture produces one.** Scroll and pinch aim the geography, in both
     /// render modes — `ui_region::zoom_viewport` — so the UI leaves this at 1.0
     /// on every frame, and the eye follows the box for free because
-    /// `eye_distance` is a ratio of its half-diagonal. The camera's standoff is
+    /// `eye_distance` is a ratio of its framing radius. The camera's standoff is
     /// set absolutely instead, through [`OrbitCamera::set_eye_distance`] and the
     /// pane's own control.
     ///
@@ -1153,9 +1153,12 @@ impl Default for OrbitDelta {
 /// parallel to the up vector, the camera basis is degenerate and the image rolls
 /// arbitrarily as the last representable digit of yaw changes.
 const MAX_PITCH_DEG: f32 = 89.0;
-/// Eye distance is in multiples of the volume box's half-diagonal, so the camera
-/// never has to know the grid's dimensions and the same limits hold for every
-/// grid-spec rung. 1.0 is the eye on the box's corner sphere.
+/// Eye distance is in multiples of the volume box's *framing radius* — half the
+/// diagonal of the square its north–south extent stands on, which is
+/// `volume_view::framing_radius_km` and carries the argument for why that axis
+/// and no other. So the camera never has to know the grid's dimensions and the
+/// same limits hold for every grid-spec rung. 1.0 is the eye on the ground
+/// corner of a square box.
 ///
 /// # The minimum admits the inside of the box
 ///
@@ -1248,7 +1251,7 @@ pub struct OrbitCamera {
     /// Elevation above the horizontal, degrees in `[-MAX_PITCH_DEG,
     /// MAX_PITCH_DEG]`.
     pitch_deg: f32,
-    /// Eye distance in multiples of the volume box's half-diagonal.
+    /// Eye distance in multiples of the volume box's framing radius.
     eye_distance: f32,
     /// The point the orbit turns about and the camera looks at, as a fraction of
     /// the box's half-extent on each axis, each component in
@@ -1343,7 +1346,7 @@ impl OrbitCamera {
     /// aim the *geography* now, in both render modes, which is the one meaning
     /// of "zoom" the application has. That is not a loss of magnification —
     /// tightening the box brings the eye in with it, because this number is a
-    /// ratio of the box's half-diagonal rather than a distance — but it does
+    /// ratio of the box's framing radius rather than a distance — but it does
     /// leave the *framing* with no gesture, and framing is a real judgement: how
     /// much of the pane the box fills, and whether the eye is outside it looking
     /// in or inside it looking out. [`MIN_EYE_DISTANCE`] documents the inside
@@ -1437,7 +1440,7 @@ impl OrbitCamera {
         self.pitch_deg
     }
 
-    /// Eye distance in multiples of the volume box's half-diagonal.
+    /// Eye distance in multiples of the volume box's framing radius.
     pub fn eye_distance(self) -> f32 {
         self.eye_distance
     }

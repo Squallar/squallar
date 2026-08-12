@@ -717,7 +717,7 @@ fn a_pinch_outside_a_3d_pane_does_not_zoom_it() {
 /// **The camera does not move when the box changes.**
 ///
 /// The hard requirement of the whole change, and the one that is free:
-/// `eye_distance` is in multiples of the box's half-diagonal, so a box the
+/// `eye_distance` is in multiples of the box's framing radius, so a box the
 /// zoom tightened carries the eye in with it and the stored *ratio* never
 /// has to be touched. Nothing may reframe, ease or fit — the user is the
 /// only thing that moves this camera.

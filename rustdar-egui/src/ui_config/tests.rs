@@ -1057,7 +1057,7 @@ fn a_saved_camera_out_of_range_is_clamped_rather_than_dropped() {
         camera.eye_distance(),
         0.05,
         "an under-range saved distance must clamp to the zoom's near stop \
-             (0.05 half-diagonals — inside the box is a supported camera), not \
+             (0.05 framing radii — inside the box is a supported camera), not \
              be discarded",
     );
 }
