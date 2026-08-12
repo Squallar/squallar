@@ -1103,6 +1103,34 @@ const GK_DATA_MARGIN: i32 = 1;
 /// the ladder — whose sectors carry no folds, so raw and dealiased agree there
 /// to 0.03 — puts it at 0.44. Only the raw sweep satisfies both.
 ///
+/// Reading it there was tried again once [`incoherent_velocity`] stopped the
+/// dealiaser inventing continuity, which removes that objection: with the
+/// incoherent ground handed back as reported, the dealiased field differs from
+/// the raw one only where a fold was actually resolved. It frees KCRP — 4987
+/// painted bins against 3670 here, and fourteen of the nineteen hovered bins
+/// against four, which is all eleven of the wall bins the reference paints and
+/// this ceiling drops — leaves the KFTG core bit-identical, and keeps KHNX at
+/// 0. The ladder does not move either: 194 of 216 rungs, the same 22.
+///
+/// **KTLX refuses it.** KTLX 2025-02-19 15:05:14 is the other VCP 31 clear-air
+/// volume in the corpus, Nyquist 11.49, and the fourteen strongest bins it
+/// paints inside 80 km were hovered:
+///
+/// ```text
+///     az           312.7 142.3 252.8 278.3 112.3 244.7  33.8 317.3 …
+///     nm            9.65  8.17 10.87  8.17  9.79 16.94  8.30 10.46 …
+///     GR           −0.14    ND    ND −1.56 +0.18    ND    ND +0.61 …
+///     raw sweep       ND +1.67    ND    ND    ND    ND    ND −1.10 …
+///     dealiased    +1.72 +1.67 −1.44 −1.41 +1.31 −1.19 +1.18 −1.10 …
+/// ```
+///
+/// Eleven of the fourteen read ND in the reference and two of the three that
+/// carry a value carry the opposite sign. On the raw sweep this ceiling paints
+/// three of them and 677 bins in the cut; on the dealiased field it paints all
+/// fourteen and 1216. Freeing a hurricane's fold walls by resurrecting a
+/// second clear-air over-paint is not a trade this ceiling may make, so it
+/// still reads the raw sweep.
+///
 /// # The difference is read as it stands, not the short way round
 ///
 /// The obvious objection to reading the raw sweep is that where velocity
@@ -1164,34 +1192,35 @@ const GK_DATA_MARGIN: i32 = 1;
 /// against +0.83, +0.53 against +0.56, +0.49 against +0.54. KCRP's
 /// 5411 → 3572 below is rotation the reference reports and this module drops.
 ///
-/// On KHNX it is the other way and further. Of twenty bins hovered — twelve
-/// this ceiling drops and eight it still keeps — the reference reads ND at all
-/// twenty, so the 1666 that survive there are over-paint as well.
+/// On KHNX it was the other way and further. Of twenty bins hovered — twelve
+/// this ceiling drops and eight it kept — the reference reads ND at all
+/// twenty, so the 1666 that survived there were over-paint as well. That half
+/// is closed, and not here: [`incoherent_velocity`] refuses the ground before
+/// this ceiling ever reads it, and KHNX now paints 0.
 ///
-/// No member of this family closes both. Every candidate that frees KCRP's
-/// walls — wrapping, wrapping only above 1.70 or 1.80·Vny, the dealiased
-/// field, a narrower window in range or azimuth — costs more at KHNX than it
-/// recovers at KCRP, because at Vny 11.66 incoherent velocity produces
-/// differences near 2·Vny by chance and no per-difference transform can tell
-/// those from a wall. Wrapping above 1.80·Vny is the closest: KCRP 5381, KFTG
-/// 1438, and KHNX back to 3577. What separates the two is coherence, which is
-/// a dealiaser's job, and [`dealias`] smooths KHNX's clear air rather than
-/// refusing it — texture on its output paints 10271 there. That is the thread
-/// to pull, and it is not this constant.
+/// The KCRP half stands. No member of this family closes it. Every candidate
+/// that frees KCRP's walls — wrapping, wrapping only above 1.70 or 1.80·Vny,
+/// the dealiased field, a narrower window in range or azimuth — costs more
+/// somewhere else than it recovers here, because at Vny 11.66 incoherent
+/// velocity produces differences near 2·Vny by chance and no per-difference
+/// transform can tell those from a wall. Wrapping above 1.80·Vny is the
+/// closest: KCRP 5381, KFTG 1438, and KHNX back to 3577. Reading the dealiased
+/// field frees KCRP outright and is refused by KTLX, above.
 ///
 /// # What it does on real volumes
 ///
 /// Lowest super-res velocity cut, painted bins (|NROT| ≥ [`SIGNIFICANT`])
-/// inside 80 km, before → after:
+/// inside 80 km. Ungated → this ceiling, with [`incoherent_velocity`]
+/// upstream of both:
 ///
 /// ```text
-///     KHNX 2024-12-16  clear air   20878 → 1666
-///     KTLX 2025-02-19               2970 →  879
-///     KCRP 2017-08-26  Harvey       5411 → 3572
-///     KDMX 2022-03-05               3552 → 2704
-///     KFTG 2023-06-22               1614 → 1431
-///     KLOT 2024-12-16                106 →   97
-///     KMSX 2022-06-04                 47 →   43
+///     KHNX 2024-12-16  clear air      11 →    0
+///     KTLX 2025-02-19              1502 →  677
+///     KCRP 2017-08-26  Harvey      5384 → 3670
+///     KDMX 2022-03-05              3287 → 2469
+///     KFTG 2023-06-22              1482 → 1304
+///     KLOT 2024-12-16                78 →   69
+///     KMSX 2022-06-04                32 →   28
 /// ```
 const GK_MAX_TEXTURE_VNY_FRAC: f64 = 0.44;
 
@@ -1551,6 +1580,7 @@ fn range_texture(sweep: &VelocitySweep, rows: crate::azimuth::Rows) -> Vec<Vec<f
 
 fn llsd_nrot(sweep: &VelocitySweep, vel_grid: &[Vec<f64>]) -> Vec<Vec<f64>> {
     let num_radials = vel_grid.len();
+    let gc = sweep.gate_count;
     let rows = sweep_rows(sweep, num_radials);
     let spacing_rad = rows.step_deg.to_radians();
     let half_degree_rows = rows_are_half_degree_pairs(sweep.azimuths_deg);
@@ -1559,6 +1589,8 @@ fn llsd_nrot(sweep: &VelocitySweep, vel_grid: &[Vec<f64>]) -> Vec<Vec<f64>> {
     let limit = fold_limit_ms(sweep, sweep.vel_grid);
     let texture = range_texture(sweep, rows);
     let texture_max = limit.map(|v| GK_MAX_TEXTURE_VNY_FRAC * v);
+    let incoherent =
+        limit.map(|v| incoherent_velocity(sweep.vel_grid, rows, gc, sweep.gate_interval_km, v));
 
     (0..num_radials)
         .into_par_iter()
@@ -1570,6 +1602,13 @@ fn llsd_nrot(sweep: &VelocitySweep, vel_grid: &[Vec<f64>]) -> Vec<Vec<f64>> {
                     }
                     let range_km = sweep.first_gate_range_km + j as f64 * sweep.gate_interval_km;
                     if range_km <= MIN_RANGE_NM * KM_PER_NM {
+                        return f64::NAN;
+                    }
+                    // Rotation is not reported over velocity with no coherent
+                    // solution: the dealiaser handed that ground back exactly
+                    // as the radar reported it, and a rotation computed from
+                    // it would be a rotation of the noise.
+                    if incoherent.as_ref().is_some_and(|m| m[i * gc + j]) {
                         return f64::NAN;
                     }
                     // Rotation is only reported over velocity the radar
@@ -1711,24 +1750,26 @@ const DA_RAWMIN_BINS: usize = 16;
 /// there and we erased all three.
 const CENSOR_VNY_FRAC: f64 = 1.80;
 
-/// The censoring posture [`dealias`] takes once the unfolding passes are done.
+/// The posture [`dealias`] takes towards data its passes could not settle.
 ///
 /// The passes themselves — seeds, bridges, flood fills, head-and-shoulders —
-/// are identical under every profile; what differs is only what happens to
-/// data the passes could not settle. NROT differentiates the field, so a
-/// residual fold wall becomes clamp-level fake shear and is worth censoring
-/// aggressively. A velocity *display* consumer (storm-relative velocity) shows
-/// the field itself, where a censored gate is a hole in a couplet and the
-/// harm runs the other way — so it keeps everything the passes did not prove
-/// wrong.
+/// are identical under every profile; what differs is only what happens
+/// around them. NROT differentiates the field, so a residual fold wall becomes
+/// clamp-level fake shear and is worth censoring aggressively. A velocity
+/// *display* consumer (storm-relative velocity) shows the field itself, where
+/// a censored gate is a hole in a couplet and the harm runs the other way — so
+/// it keeps everything the passes did not prove wrong.
 ///
-/// The profile reaches ONLY the two post-pass censoring/ND knobs below.
-/// [`DealiasProfile::NoFalseShear`] resolves to the tuned NROT constants
-/// unchanged, so NROT's output is bit-identical to what it was before the
-/// parameter existed — its calibration suite is what pins that.
+/// The profile reaches the two post-pass censoring/ND knobs and one pre-pass
+/// one: whether velocity with no coherent solution is handed back as the radar
+/// reported it ([`incoherent_velocity`]) rather than run through passes that
+/// can only invent an answer. That is on for NROT and off for display, where
+/// the field is measured against the RPG's own dealiased velocity and the
+/// RPG resolves everything present.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DealiasProfile {
-    /// NROT's tuned posture: unreached-data regions under [`DA_RAWMIN_BINS`]
+    /// NROT's tuned posture: velocity with no coherent solution comes back
+    /// exactly as reported, unreached-data regions under [`DA_RAWMIN_BINS`]
     /// bins go ND, and any bin more than [`CENSOR_VNY_FRAC`]·Vny from a
     /// 4-neighbour is censored as a residual fold wall.
     NoFalseShear,
@@ -1762,6 +1803,10 @@ pub(crate) struct DealiasKnobs {
     /// Post-dealias fold-wall censor threshold, in units of Vny;
     /// `f64::INFINITY` disables the censor.
     pub censor_vny_frac: f64,
+    /// Hand back velocity with no coherent solution
+    /// ([`incoherent_velocity`]) exactly as the radar reported it, rather
+    /// than unfolding, censoring or dropping any of it.
+    pub refuse_incoherent: bool,
 }
 
 impl DealiasProfile {
@@ -1770,10 +1815,12 @@ impl DealiasProfile {
             DealiasProfile::NoFalseShear => DealiasKnobs {
                 rawmin_bins: DA_RAWMIN_BINS,
                 censor_vny_frac: CENSOR_VNY_FRAC,
+                refuse_incoherent: true,
             },
             DealiasProfile::Coverage => DealiasKnobs {
                 rawmin_bins: COVERAGE_RAWMIN_BINS,
                 censor_vny_frac: CENSOR_VNY_FRAC,
+                refuse_incoherent: false,
             },
         }
     }
@@ -1865,6 +1912,175 @@ fn fold_limit_ms(sweep: &VelocitySweep, vel_grid: &[Vec<f64>]) -> Option<f64> {
     }
 }
 
+/// Along-beam difference above which two gates [`TEXTURE_STEP_KM`] apart
+/// **straddle** — cannot be read as one continuous velocity — as a fraction of
+/// the cut's own limit.
+///
+/// It is a fraction rather than a speed for the reason every other threshold
+/// on this page is: the reference's answer holds at the same multiple across
+/// a 3.1× span of Nyquist. It sits just under 1 because that is what the two
+/// ladders that bracket it say. On the square wave, whose every wall is a jump
+/// of exactly J and nothing else, the reference paints J = 0.60·Vny at all
+/// seven sites and refuses J = 1.00 at five of them; on the dense wave it
+/// paints 0.80 and refuses 1.20. On the range-noise ladder, whose differences
+/// are triangular on ±2q·Vny, it paints q = 0.51 and refuses q = 0.57, which
+/// puts a per-difference boundary between 1.02 and 1.14·Vny.
+const COH_STRADDLE_VNY_FRAC: f64 = 0.90;
+
+/// Fraction of a neighbourhood's along-beam pairs allowed to straddle before
+/// the sweep is held to carry no coherent velocity there.
+///
+/// A fold wall is a curve: it crosses the neighbourhood along one line and
+/// straddles a few percent of its pairs. Velocity with no coherent solution
+/// straddles everywhere at once. Measured at the bins the reference decides,
+/// over the neighbourhood below:
+///
+/// ```text
+///                                    straddling fraction
+///     KFTG 2023-06-22 mesocyclone core, 4 bins        0.00        painted
+///     KCRP 2017-08-26 Harvey, 19 bins            0.01..0.08   17 painted
+///     KHNX 2024-12-16 clear air, 20 bins         0.11..0.21    0 painted
+/// ```
+///
+/// The gap 0.08..0.11 is wider than it looks: the KCRP maximum is one bin at
+/// az 73.26°, 9.52 nm, where the reference reads −4.42, and the next is 0.07.
+const COH_MAX_STRADDLE: f64 = 0.09;
+
+/// The neighbourhood the straddling fraction is counted over: half-spans in
+/// rows and in gates.
+///
+/// Wide, and that is the measurement rather than a preference. Over the ±5
+/// rows × ±4 gates [`range_texture`] reads, the same statistic puts KCRP's
+/// worst bin at 0.29 and KHNX's best at 0.04 — the two overlap completely,
+/// because a fold wall fills a small window as thoroughly as noise does. The
+/// wall only dilutes once the neighbourhood is large enough to hold ground the
+/// wall does not cross, and incoherent velocity does not dilute at all: at
+/// ±40 rows × ±32 gates KHNX's twenty bins read 0.11..0.21 while KCRP's
+/// nineteen read 0.01..0.08.
+const COH_AZ_HALF: i32 = 40;
+const COH_RANGE_HALF: i32 = 32;
+
+/// Where the sweep carries velocity that has no coherent solution.
+///
+/// The question a dealiaser can actually answer is not "is this smooth" but
+/// "could any assignment of fold branches make it continuous". Shear is not
+/// incoherence — a mesocyclone's own gradient is far under the limit and
+/// straddles nothing — and neither is aliasing, which straddles only along the
+/// line the wall runs on. What straddles everywhere is velocity that is not a
+/// measurement of one air motion at all.
+///
+/// # What is done with it, and why that is a refusal
+///
+/// [`dealias`] hands it back exactly as the radar reported it, under
+/// [`DealiasKnobs::refuse_incoherent`]: not unfolded, not censored, not
+/// dropped. A dealiaser's job is to undo a known encoding wrap, and where no
+/// wrap explains the field there is no claim it can honestly make.
+/// [`llsd_nrot`] then refuses the same ground outright, because a rotation
+/// computed there is a rotation of the noise.
+///
+/// The passes were not merely idle on that ground before — they were
+/// *productive* on it, which is worse. On KHNX 2024-12-16 08:01:56 inside
+/// 80 km, 60.5% of data gates were resolved by a pass, 33.3% kept raw because
+/// no pass reached them, and 5.1% censored as fold walls by
+/// [`CENSOR_VNY_FRAC`]. The censored 5.1% sit against the largest differences
+/// in the sweep, so removing them alone drops the rms range difference from
+/// 0.585–0.676 of the limit to 0.352–0.398 — the dealiaser manufacturing the
+/// very continuity a continuity ceiling then reads. At az 198.25°, 8.57 nm it
+/// went further and unfolded a raw −8.0 m/s to +15.3, a full 2·Vny, out of
+/// nine radials reading −10.0 −5.5 −5.5 −5.0 −8.0 −0.5 −2.0 −4.5 −2.0.
+///
+/// # What it moves
+///
+/// Lowest super-res velocity cut, painted bins (|NROT| ≥ [`SIGNIFICANT`])
+/// inside 80 km, before → after:
+///
+/// ```text
+///     KHNX 2024-12-16  clear air, Vny 11.66   1548 →    0
+///     KTLX 2025-02-19  clear air, Vny 11.49    854 →  677
+///     KCRP 2017-08-26  Harvey,    Vny 31.52   3273 → 3670
+///     KDMX 2022-03-05             Vny 27.93   2470 → 2469
+///     KFTG 2023-06-22             Vny 24.01   1304 → 1304
+///     KLOT 2024-12-16             Vny 23.96     69 →   69
+///     KMSX 2022-06-04             Vny 24.21     28 →   28
+/// ```
+///
+/// KHNX's twenty hovered bins, where the reference reads ND at all twenty, go
+/// from six painted to none, and so does the whole cut inside 80 km — which is
+/// what the reference does there: 290 points on the 8/16/24/32/40 nm rings,
+/// none painted. The KFTG 2023-06-22 mesocyclone core is bit-identical —
+/// +1.68, +1.51, +1.60, +1.75 at az 90.8/91.3° and 7.5/8.0 nm, against the
+/// reference's +1.64, +1.52, +1.56, +1.76 — because the ground this refuses is
+/// nowhere the stencil reads there. And it moves no rung of any synthetic
+/// ladder: 194 of the 216 rungs across the noise, common-mode, fine, azimuthal
+/// and square-wave families at seven sites agree with the reference, the same
+/// 194 as before, disagreeing on the same 22.
+fn incoherent_velocity(
+    raw: &[Vec<f64>],
+    rows: crate::azimuth::Rows,
+    gc: usize,
+    gate_interval_km: f64,
+    nyquist: f64,
+) -> Vec<bool> {
+    let n = raw.len();
+    let tol = COH_STRADDLE_VNY_FRAC * nyquist;
+    // The same separation [`range_texture`] differences at, and for the same
+    // reason: a super-res velocity cut repeats one estimate over two 0.25 km
+    // gates, so adjacent-gate differences are structurally zero half the time.
+    let dk = ((TEXTURE_STEP_KM / gate_interval_km).round() as usize).max(1);
+    // Per row, the straddling and present pair counts and their running window
+    // sums, so the azimuthal pass adds rows rather than rewalking gates —
+    // ±COH_AZ_HALF rows is 81 of them per bin on a rotation.
+    let per_row: Vec<(Vec<u16>, Vec<u16>)> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let mut ps = vec![0u32; gc + 1];
+            let mut pp = vec![0u32; gc + 1];
+            for j in 0..gc {
+                let (mut s, mut p) = (0u32, 0u32);
+                if j + dk < gc {
+                    let (a, b) = (raw[i][j], raw[i][j + dk]);
+                    if !a.is_nan() && !b.is_nan() {
+                        p = 1;
+                        s = u32::from((b - a).abs() > tol);
+                    }
+                }
+                ps[j + 1] = ps[j] + s;
+                pp[j + 1] = pp[j] + p;
+            }
+            let (mut s, mut p) = (vec![0u16; gc], vec![0u16; gc]);
+            for j in 0..gc {
+                let lo = (j as i32 - COH_RANGE_HALF).max(0) as usize;
+                let hi = ((j as i32 + COH_RANGE_HALF) as usize).min(gc - 1);
+                s[j] = (ps[hi + 1] - ps[lo]) as u16;
+                p[j] = (pp[hi + 1] - pp[lo]) as u16;
+            }
+            (s, p)
+        })
+        .collect();
+    (0..n)
+        .into_par_iter()
+        .flat_map(|i| {
+            (0..gc)
+                .map(|j| {
+                    if raw[i][j].is_nan() {
+                        return false;
+                    }
+                    let (mut s, mut p) = (0u32, 0u32);
+                    for da in -COH_AZ_HALF..=COH_AZ_HALF {
+                        // Past the end of a sector's arc there is no row to
+                        // count, exactly as there is no gate past the last.
+                        if let Some(ai) = rows.neighbour(i, da) {
+                            s += u32::from(per_row[ai].0[j]);
+                            p += u32::from(per_row[ai].1[j]);
+                        }
+                    }
+                    p > 0 && (s as f64) > COH_MAX_STRADDLE * p as f64
+                })
+                .collect::<Vec<bool>>()
+        })
+        .collect()
+}
+
 pub(crate) fn dealias_with_knobs(
     vel_grid: &mut [Vec<f64>],
     sweep: &VelocitySweep,
@@ -1905,7 +2121,26 @@ pub(crate) fn dealias_with_knobs(
     let az_rad: Vec<Option<f64>> = (0..n)
         .map(|i| sweep.azimuths_deg.get(i).map(|a| a.to_radians()))
         .collect();
-    let raw: Vec<Vec<f64>> = vel_grid.to_vec();
+    let reported: Vec<Vec<f64>> = vel_grid.to_vec();
+    // Velocity with no coherent solution is set aside before any pass runs:
+    // the passes see it as the absence it is, and the write-back below returns
+    // it exactly as the radar reported it. Neither unfolded, nor censored, nor
+    // dropped — a dealiaser that cannot resolve a region makes no claim about
+    // it, and leaves the incoherence there for whoever reads the field next.
+    let refused = if knobs.refuse_incoherent {
+        incoherent_velocity(&reported, rows, gc, sweep.gate_interval_km, nyquist)
+    } else {
+        vec![false; n * gc]
+    };
+    let mut raw = reported.clone();
+    for (i, row) in raw.iter_mut().enumerate() {
+        for (j, v) in row.iter_mut().enumerate() {
+            if refused[i * gc + j] {
+                *v = f64::NAN;
+            }
+        }
+    }
+    let raw = raw;
     // value[i][j] holds the dealiased velocity once valid[i][j].
     let mut valid = vec![false; n * gc];
     let mut value = vec![f64::NAN; n * gc];
@@ -2391,7 +2626,9 @@ pub(crate) fn dealias_with_knobs(
     }
     for i in 0..n {
         for j in 0..gc {
-            vel_grid[i][j] = if valid[idx(i, j)] {
+            vel_grid[i][j] = if refused[idx(i, j)] {
+                reported[i][j]
+            } else if valid[idx(i, j)] {
                 value[idx(i, j)]
             } else if keep_raw[idx(i, j)] {
                 raw[i][j]
@@ -2410,21 +2647,35 @@ pub(crate) fn dealias_with_knobs(
     let censor_at = knobs.censor_vny_frac * nyquist;
     for i in 0..n {
         for j in 0..gc {
+            // A refused bin is not a fold wall this pass failed to place; it
+            // is a bin no pass made a claim about, and the censor has no
+            // claim to withdraw. It is not evidence against its neighbours
+            // either, for the same reason.
+            if refused[idx(i, j)] {
+                continue;
+            }
             let v = snapshot[i][j];
             if v.is_nan() {
                 continue;
             }
+            let nb_of = |i: usize, j: usize| {
+                if refused[idx(i, j)] {
+                    f64::NAN
+                } else {
+                    snapshot[i][j]
+                }
+            };
             // A row at the edge of an arc has no neighbour on that side, in
             // exactly the sense the first and last gate of a radial have
             // none: there is no jump to measure, so nothing to censor for.
-            let up = rows.neighbour(i, 1).map_or(f64::NAN, |k| snapshot[k][j]);
-            let down = rows.neighbour(i, -1).map_or(f64::NAN, |k| snapshot[k][j]);
+            let up = rows.neighbour(i, 1).map_or(f64::NAN, |k| nb_of(k, j));
+            let down = rows.neighbour(i, -1).map_or(f64::NAN, |k| nb_of(k, j));
             let right = if j + 1 < gc {
-                snapshot[i][j + 1]
+                nb_of(i, j + 1)
             } else {
                 f64::NAN
             };
-            let left = if j > 0 { snapshot[i][j - 1] } else { f64::NAN };
+            let left = if j > 0 { nb_of(i, j - 1) } else { f64::NAN };
             for nb in [up, down, left, right] {
                 if !nb.is_nan() && (nb - v).abs() > censor_at {
                     vel_grid[i][j] = f64::NAN;
@@ -3110,6 +3361,125 @@ mod tests {
         let mut grid = orig.clone();
         dealias(&mut grid, &sweep, 0.5, None, DealiasProfile::NoFalseShear);
         assert_eq!(grid, orig);
+    }
+
+    // ---- velocity with no coherent solution --------------------------------
+
+    /// A sweep of incoherent velocity beside a sweep that only folds, both
+    /// built the same way and differing in one thing: whether the velocity
+    /// under the wrap is a field or a coin toss.
+    ///
+    /// `wrapped` carries a true velocity that ramps across five full
+    /// intervals along the beam, so its raw form jumps 2·Vny at every wrap
+    /// and its texture is enormous — and every one of those jumps is the
+    /// encoding, not the air. `noise` fills the same gates with independent
+    /// draws over the whole interval. [`incoherent_velocity`] must refuse the
+    /// second and not the first, since the first is exactly what a dealiaser
+    /// is for.
+    fn coherence_fixture(noise: bool) -> (Vec<Vec<f64>>, Vec<f64>, usize) {
+        const VNY: f64 = 12.0;
+        let (n, gates) = (360usize, 400usize);
+        let azimuths = ring_azimuths(n);
+        // A fixed multiplicative-congruential stream, so the fixture is the
+        // same on every run and on every platform.
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let grid: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                (0..gates)
+                    .map(|j| {
+                        let v = if noise {
+                            2.0 * VNY * next() - VNY
+                        } else {
+                            let truth = 10.0 * VNY * j as f64 / gates as f64
+                                + 3.0 * (i as f64).to_radians().cos();
+                            (truth + VNY).rem_euclid(2.0 * VNY) - VNY
+                        };
+                        (v / 0.5).round() * 0.5
+                    })
+                    .collect()
+            })
+            .collect();
+        (grid, azimuths, gates)
+    }
+
+    /// Aliasing is not incoherence, and the statistic that separates them says
+    /// so on a fixture where nothing else differs.
+    #[test]
+    fn a_fold_wall_is_coherent_and_a_coin_toss_is_not() {
+        for (noise, want) in [(false, false), (true, true)] {
+            let (grid, azimuths, gates) = coherence_fixture(noise);
+            let sweep = sweep_for(&grid, &azimuths, gates);
+            let rows = sweep_rows(&sweep, grid.len());
+            let nyq = fold_limit_ms(&sweep, &grid).expect("a limit");
+            let mask = incoherent_velocity(&grid, rows, gates, sweep.gate_interval_km, nyq);
+            let refused = mask.iter().filter(|m| **m).count();
+            let all = grid.len() * gates;
+            if want {
+                assert_eq!(refused, all, "every bin of a coin toss is refused");
+            } else {
+                assert_eq!(refused, 0, "a wrapping ramp is refused nowhere");
+            }
+        }
+    }
+
+    /// What the dealiaser does with it: nothing at all. Not a value unfolded,
+    /// not a gate censored, not a region dropped — the field comes back bit
+    /// for bit as the radar reported it, which is the only honest answer where
+    /// no assignment of fold branches explains it.
+    #[test]
+    fn the_dealiaser_hands_incoherent_velocity_back_as_reported() {
+        let (orig, azimuths, gates) = coherence_fixture(true);
+        let vg = orig.clone();
+        let mut grid = orig.clone();
+        dealias(
+            &mut grid,
+            &sweep_for(&vg, &azimuths, gates),
+            0.5,
+            None,
+            DealiasProfile::NoFalseShear,
+        );
+        assert_eq!(grid, orig);
+    }
+
+    /// And rotation is not reported over it. Ungated, the estimator finds
+    /// plenty there — a coin toss differentiates to whatever it likes — which
+    /// is the whole reason the refusal is worth having.
+    #[test]
+    fn no_rotation_is_reported_over_velocity_with_no_coherent_solution() {
+        let (grid, azimuths, gates) = coherence_fixture(true);
+        let sweep = sweep_for(&grid, &azimuths, gates);
+        let nrot = compute_nrot_grid(&sweep);
+        assert!(
+            nrot.iter().flatten().all(|v| v.is_nan()),
+            "a coin toss carries no rotation to report",
+        );
+    }
+
+    /// The display profile is untouched by any of it. Storm-relative velocity
+    /// is measured against the RPG's own dealiased field, which resolves
+    /// everything present, so the refusal is NROT's posture and not the
+    /// module's.
+    #[test]
+    fn the_display_profile_still_resolves_incoherent_velocity() {
+        assert!(DealiasProfile::NoFalseShear.knobs().refuse_incoherent);
+        assert!(!DealiasProfile::Coverage.knobs().refuse_incoherent);
+        let (orig, azimuths, gates) = coherence_fixture(true);
+        let vg = orig.clone();
+        let mut grid = orig.clone();
+        dealias(
+            &mut grid,
+            &sweep_for(&vg, &azimuths, gates),
+            0.5,
+            None,
+            DealiasProfile::Coverage,
+        );
+        assert_ne!(grid, orig, "the coverage posture still works the field");
     }
 
     /// The radial a near-zero gate is confirmed against is the one facing it,
