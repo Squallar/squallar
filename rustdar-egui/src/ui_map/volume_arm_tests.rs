@@ -1320,6 +1320,20 @@ fn the_painters_own_reason_reaches_the_pane() {
 
 // --- The caption: everything the pane claims about the picture ----------
 
+/// Cells across the grid a modern desktop adapter actually gets, which is what
+/// `VolumePainter::grid_cells_across` reports to the caption on that machine.
+///
+/// Derived rather than written as 512, so these tests go on stating "what the
+/// painter would say" if the rule ever spends the budget differently. A
+/// generous limit, because that is the device these captions are read on.
+const DESKTOP_CELLS: usize =
+    rustdar_radar::voxel::shape_for_budget(rustdar_radar::voxel::DESKTOP_SHAPE, 2048).nx;
+
+/// The same, on a device reporting exactly the 3D texture size WebGL2
+/// guarantees — the conservative adapter, which gets the shape that shipped.
+const GUARANTEE_CELLS: usize =
+    rustdar_radar::voxel::shape_for_budget(rustdar_radar::voxel::DESKTOP_SHAPE, 256).nx;
+
 /// **The height the pane reports is real at every exaggeration.**
 ///
 /// This is the counterweight that makes the exaggeration defensible at all.
@@ -1344,6 +1358,7 @@ fn the_height_the_pane_reports_is_real_at_every_exaggeration() {
             square(crate::pane::BASE_HALF_WIDTH_KM),
             camera,
             SETTLED,
+            Some(DESKTOP_CELLS),
         );
         let height = lines
             .iter()
@@ -1384,6 +1399,7 @@ fn the_caption_states_the_newest_data_time_not_a_whole_volume_claim() {
         square(crate::pane::BASE_HALF_WIDTH_KM),
         Default::default(),
         SETTLED,
+        Some(DESKTOP_CELLS),
     );
     assert!(
         lines[0].contains("KTLX") && lines[0].contains("newest data") && lines[0].contains("22:39"),
@@ -1409,6 +1425,7 @@ fn the_caption_names_the_base_volume_or_says_the_first_is_still_filling() {
         square(crate::pane::BASE_HALF_WIDTH_KM),
         Default::default(),
         SETTLED,
+        Some(DESKTOP_CELLS),
     );
     let base = merged
         .iter()
@@ -1426,6 +1443,7 @@ fn the_caption_names_the_base_volume_or_says_the_first_is_still_filling() {
         square(crate::pane::BASE_HALF_WIDTH_KM),
         Default::default(),
         SETTLED,
+        Some(DESKTOP_CELLS),
     );
     assert!(
         filling.iter().any(|l| l.contains("no complete volume yet")),
@@ -1441,26 +1459,58 @@ fn the_caption_names_the_base_volume_or_says_the_first_is_still_filling() {
 /// volume against 0.16 at 20 km. That is the main reason to pick a region,
 /// and it is invisible unless it is written down.
 ///
-/// The sourceless figures are pinned as literals — the 651 km box a 460.125
-/// km reflectivity reach earns and the 3.59 km cells it costs — rather than
-/// derived from the function the caption itself reads, so a policy that
-/// drifted fails here by name instead of being restated as correct.
+/// The sourceless figures are pinned as literals — the 920 km box a 460.125
+/// km reflectivity reach earns, and the cells it costs on each of the two
+/// devices worth naming — rather than derived from the function the caption
+/// itself reads, so a policy that drifted fails here by name instead of being
+/// restated as correct.
+///
+/// **Two devices, because there is no longer one answer.** The grid's shape is
+/// derived from the adapter's `max_texture_dimension_3d`, so the caption's
+/// figure is a fact about the machine: 512 cells and **1.80 km** on a modern
+/// desktop, 256 and 3.59 on one reporting exactly the WebGL2 guarantee. Both
+/// are asserted here because both are shipped, and the second is the one that
+/// says nothing regressed.
 #[test]
 fn the_caption_reports_the_resolution_the_box_buys() {
     let whole_volume = rustdar_radar::voxel::box_half_width_km(460.125);
-    let wide = volume_caption(
-        "KTLX",
-        at(33),
-        None,
-        square(whole_volume),
-        Default::default(),
-        SETTLED,
-    );
+    let ring_caption = |cells| {
+        volume_caption(
+            "KTLX",
+            at(33),
+            None,
+            square(whole_volume),
+            Default::default(),
+            SETTLED,
+            cells,
+        )
+    };
+    let wide = ring_caption(Some(DESKTOP_CELLS));
     assert!(
         wide.iter()
-            .any(|l| l.contains("920 km box") && l.contains("3.59 km/cell")),
+            .any(|l| l.contains("920 km box") && l.contains("1.80 km/cell")),
         "a whole WSR-88D reflectivity volume must report the box its reach \
-         earns and the cost of it: {wide:?}",
+         earns and the cost of it on this device: {wide:?}",
+    );
+    let conservative = ring_caption(Some(GUARANTEE_CELLS));
+    assert!(
+        conservative
+            .iter()
+            .any(|l| l.contains("920 km box") && l.contains("3.59 km/cell")),
+        "a device at the guarantee must report the shape that shipped: \
+         {conservative:?}",
+    );
+    // No grid to ask, so no resolution claimed — the box, and nothing it
+    // cannot know.
+    let unknown = ring_caption(None);
+    let line = unknown
+        .iter()
+        .find(|l| l.contains("km box"))
+        .expect("a box line");
+    assert_eq!(
+        line, "920 km box",
+        "with no grid in hand the caption must state the box and stop, \
+         rather than divide it by a number nothing reported",
     );
 
     let tight = crate::pane::VolumeRegion::new(
@@ -1478,6 +1528,7 @@ fn the_caption_reports_the_resolution_the_box_buys() {
         tight.half_extent_km(),
         Default::default(),
         SETTLED,
+        Some(DESKTOP_CELLS),
     );
     let line = tight_lines
         .iter()
@@ -1489,9 +1540,8 @@ fn the_caption_reports_the_resolution_the_box_buys() {
     );
     // The whole point of the feature: a quarter of the width is four times
     // the resolution, and both figures are on screen.
-    let cells = rustdar_radar::voxel::default_shape().nx as f64;
     assert!(
-        line.contains(&format!("{:.2} km/cell", 40.0 / cells)),
+        line.contains(&format!("{:.2} km/cell", 40.0 / DESKTOP_CELLS as f64)),
         "the tighter box must report its finer cells: {line:?}",
     );
 }
@@ -1514,8 +1564,7 @@ fn the_caption_reports_the_resolution_the_box_buys() {
 /// as weather that stops, so that has to be said rather than promised away.
 #[test]
 fn a_caption_over_a_stand_in_reports_the_picture_and_not_the_request() {
-    let cells = rustdar_radar::voxel::default_shape().nx as f64;
-    let asked_for = format!("{:.2} km/cell", 40.0 / cells);
+    let asked_for = format!("{:.2} km/cell", 40.0 / DESKTOP_CELLS as f64);
     let line_of = |showing| {
         volume_caption(
             "KTLX",
@@ -1524,6 +1573,7 @@ fn a_caption_over_a_stand_in_reports_the_picture_and_not_the_request() {
             square(20.0),
             Default::default(),
             showing,
+            Some(DESKTOP_CELLS),
         )
         .into_iter()
         .find(|l| l.contains("km box"))

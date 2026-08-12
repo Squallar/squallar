@@ -589,8 +589,11 @@ fn encode_voxel_request(out: &mut Vec<u8>, request: &VoxelRequest) {
     }
     out.extend_from_slice(&request.base_km_msl.to_le_bytes());
     out.extend_from_slice(&request.top_km_msl.to_le_bytes());
-    // `u16` per axis rather than `u8`: `MAX_AXIS` is 256, which does not fit in
-    // a byte, and a wrapped 256 would arrive as a 0-length axis.
+    // `u16` per axis rather than `u8`: `MAX_AXIS` is 1625, which does not fit
+    // in a byte, and a wrapped axis would arrive as a shorter one rather than
+    // as an error. It fits a `u16` with room to spare, and
+    // `the_arithmetic_bound_is_the_largest_cubable_axis` is what keeps this
+    // encoding and that bound agreeing if the bound moves again.
     for n in [request.shape.nx, request.shape.ny, request.shape.nz] {
         out.extend_from_slice(&(n as u16).to_le_bytes());
     }
@@ -628,7 +631,20 @@ fn decode_voxel_request(r: &mut Reader) -> Option<VoxelRequest> {
     // built. Refusing here keeps the same rule at the boundary where the bytes
     // are untrusted, and it is the shape check that `is_supported` owns rather
     // than a second copy of the bounds.
-    request.shape.is_supported().then_some(request)
+    //
+    // The **cell count** is checked beside it, and that half is new since
+    // `MAX_AXIS` stopped being the 256 a GLES 3.0 device guarantees.
+    // `is_supported` now admits 1625 an axis, which is 4.29 *billion* cells —
+    // the bound is on what `VoxelShape::cells` can represent, not on what a
+    // machine can hold, and unlike `VoxelGrid::from_bytes` there is no payload
+    // in hand here whose length would have to match. A request is thirty-odd
+    // bytes and `build_voxels` allocates the grid it names, so without this a
+    // malformed job would be a multi-gigabyte allocation rather than a refusal.
+    // `VOXEL_TEXTURE_BUDGET_BYTES` is one byte per cell of the largest index
+    // plane this workspace produces, which is exactly the ceiling wanted: every
+    // shape any tier can ask for is at or under it.
+    let affordable = request.shape.cells() <= rustdar_radar::voxel::VOXEL_TEXTURE_BUDGET_BYTES;
+    (request.shape.is_supported() && affordable).then_some(request)
 }
 
 const TAG_RADAR: u8 = 1;

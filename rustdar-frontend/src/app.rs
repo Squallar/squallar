@@ -665,10 +665,17 @@ pub(crate) enum VolumePrepare {
 /// `site_lat`/`site_lon` are still needed when a region is present:
 /// `build_voxels` reports its `x`/`y` ranges relative to the **site** whatever
 /// the box is centred on.
+///
+/// `max_axis` is the device's `max_texture_dimension_3d`, which decides how the
+/// tier's cell budget is spent over the three axes — see
+/// [`crate::constants::volume_grid_shape`]. It arrives as an argument rather
+/// than being read in here, for the reason everything else does: this function
+/// is pure, and its tests want to name a device rather than have one.
 fn voxel_request_for(
     target: &rustdar_egui::pane::VolumeTarget,
     site_lat: f64,
     site_lon: f64,
+    max_axis: u32,
 ) -> rustdar_radar::voxel::VoxelRequest {
     // The picked region, or the site with no width at all — `None` is what
     // asks `build_voxels` for the box the volume's own reach earns
@@ -698,7 +705,7 @@ fn voxel_request_for(
         // single `is_wasm` bool and cannot return `MOBILE_SHAPE`, because
         // `mobile` is emitted by *this* crate's `build.rs`. Asking it here is
         // what made an Android build budget 192³ and request 256³.
-        shape: crate::constants::volume_grid_shape(),
+        shape: crate::constants::volume_grid_shape(max_axis),
         // The raymarch reads indices only. The value plane is four times larger
         // and exists for a hover readout, which a 3D pane does not have yet.
         values_wanted: false,
@@ -1433,6 +1440,26 @@ impl App {
     /// `share` and attaches instead of dispatching again. The placeholder is
     /// also what recognises a stale reply: a build superseded by a newer
     /// sealed sweep finds its entry gone and is dropped in `complete`.
+    /// The largest 3D texture axis this device will hold, or the WebGL2
+    /// guarantee when there is no device yet.
+    ///
+    /// The one runtime capability `crate::constants::volume_grid_shape` needs,
+    /// read off the device this app actually got — `device_limits`' web arm has
+    /// already reconciled it with what the browser reports, so this is the real
+    /// figure on every target rather than a portable floor.
+    ///
+    /// The fallback is not a guess: with no device there is no volume to build
+    /// either, and the guarantee is what every conforming device must allow, so
+    /// a request formed before the renderer exists asks for the shape that
+    /// shipped rather than one nothing has agreed to.
+    fn volume_grid_axis_limit(&self) -> u32 {
+        self.state
+            .as_ref()
+            .map_or(crate::constants::WEBGL2_MAX_TEXTURE_DIMENSION_3D, |state| {
+                state.device.limits().max_texture_dimension_3d
+            })
+    }
+
     fn handle_prepare_volume(&mut self, pane_idx: usize, target: rustdar_egui::pane::VolumeTarget) {
         if self.prepare_volume(pane_idx, &target, crate::volume::bridge::Hold::Single)
             == VolumePrepare::Served
@@ -1576,7 +1603,7 @@ impl App {
             started.elapsed().as_millis(),
         );
 
-        let request = voxel_request_for(target, site.lat, site.lon);
+        let request = voxel_request_for(target, site.lat, site.lon, self.volume_grid_axis_limit());
         let spawned = self.render.spawn_voxel_build(
             target,
             input,

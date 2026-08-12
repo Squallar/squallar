@@ -426,6 +426,29 @@ pub trait VolumePainter: Send + Sync {
     fn box_size_km(&self, _pane_idx: usize, _target: &VolumeTarget) -> Option<[f32; 3]> {
         None
     }
+
+    /// Cells along the grid's horizontal axes, for the caption's km-per-cell —
+    /// or `None` while no grid is in hand.
+    ///
+    /// **Read off the grid rather than assumed**, which is now the only honest
+    /// way to get it: the shape is derived at runtime from the device's own
+    /// `max_texture_dimension_3d` against the tier's cell budget
+    /// (`rustdar_radar::voxel::shape_for_budget`), so there is no constant this
+    /// crate could name that is guaranteed to be what the grid on screen
+    /// actually has. The caption used to read `default_shape().nx` — a
+    /// compile-time triple — which would now be a confident division by the
+    /// wrong number on any device not reporting exactly the guarantee.
+    ///
+    /// One number rather than two, because the grid is square on its horizontal
+    /// axes by construction (`shape_for_budget` answers `nx == ny`) while the
+    /// *box* need not be — which is exactly why the caption prints two kilometre
+    /// figures out of this one cell count.
+    ///
+    /// Defaulted to `None` for a painter that cannot answer; the caption then
+    /// states the box and omits the resolution rather than guessing at it.
+    fn grid_cells_across(&self, _pane_idx: usize, _target: &VolumeTarget) -> Option<usize> {
+        None
+    }
 }
 
 /// The two things the raymarch's uniform block needs from the camera.
@@ -1060,6 +1083,23 @@ impl VolumePainter for StubVolumePainter {
                 showing: self.answer_showing,
             },
         }
+    }
+
+    /// A painting stub has a grid, so it answers with one's cell count.
+    ///
+    /// Answered — where [`VolumePainter::box_size_km`] is left at its default —
+    /// because these are opposite questions for a stub. The box has a fallback
+    /// the pane derives from its own region, so declining is a *choice* the
+    /// caption handles; the cell count has none, so a stub that declined would
+    /// silently drop the resolution off every caption a harness test reads, and
+    /// the pane on screen would carry a line the tests never see.
+    ///
+    /// The desktop tier's own answer on a capable adapter, rather than a round
+    /// number, so a harness caption is the string a user would actually read.
+    fn grid_cells_across(&self, _pane_idx: usize, _target: &VolumeTarget) -> Option<usize> {
+        self.answer_empty.is_none().then(|| {
+            rustdar_radar::voxel::shape_for_budget(rustdar_radar::voxel::DESKTOP_SHAPE, 2048).nx
+        })
     }
 }
 

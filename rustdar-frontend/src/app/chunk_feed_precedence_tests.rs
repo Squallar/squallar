@@ -195,6 +195,73 @@ fn turning_live_chunks_off_stops_the_overlay_from_standing() {
     );
 }
 
+/// The 3D texture limit these fixtures name when they ask what would be
+/// requested. A modern desktop's, so the shape under test is the one the rule
+/// derives rather than the floor it degrades to.
+const DEVICE_AXIS: u32 = 2048;
+
+/// The device's own limit reaches the request, and the shape it produces is the
+/// one that device can hold.
+///
+/// **This is the seam the Android overrun was made of.** The shape a request
+/// carries and the budget every allocation is sized against have to come from
+/// one decision; when they did not, an Android build budgeted 192×192×96 and
+/// asked `build_voxels` for 256×256×128 — 2.4× the budget, on the class with
+/// the least memory to absorb it. The shape is a runtime answer now, derived
+/// from a limit only the device can report, so that seam is longer than it was
+/// and this is the far end of it: what `voxel_request_for` puts on the wire is
+/// what `constants::volume_grid_shape` says for *that* device, and a device
+/// that reports less is asked for less rather than for the same shape.
+#[test]
+fn the_requested_shape_is_the_one_this_device_can_hold() {
+    use rustdar_egui::pane::{VolumeStamp, VolumeTarget};
+
+    let target = VolumeTarget {
+        volume: VolumeStamp {
+            site: "KTLX".to_owned(),
+            collected: chrono::NaiveDate::from_ymd_opt(2026, 7, 30)
+                .expect("a real date")
+                .and_hms_opt(22, 33, 0)
+                .expect("a real time"),
+        },
+        product: rustdar_radar::types::RadarProduct::Reflectivity,
+        region: None,
+    };
+
+    for axis in [256u32, 512, 2048] {
+        let request = voxel_request_for(&target, 35.33, -97.28, axis);
+        assert_eq!(
+            request.shape,
+            crate::constants::volume_grid_shape(axis),
+            "a {axis}-reporting device must be asked for the shape its own \
+             limit and this target's budget produce",
+        );
+        for (name, n) in [
+            ("nx", request.shape.nx),
+            ("ny", request.shape.ny),
+            ("nz", request.shape.nz),
+        ] {
+            assert!(
+                n as u32 <= axis,
+                "a {axis}-reporting device was asked for {n} cells of {name}",
+            );
+        }
+    }
+    // And at the guarantee — which is what a frame before the renderer exists
+    // passes — the shape that shipped, rather than a guess at what might be
+    // there.
+    assert_eq!(
+        voxel_request_for(
+            &target,
+            35.33,
+            -97.28,
+            crate::constants::WEBGL2_MAX_TEXTURE_DIMENSION_3D,
+        )
+        .shape,
+        crate::constants::VOLUME_GRID_FLOOR_SHAPE,
+    );
+}
+
 /// A picked region decides the ground that is resampled; without one, the
 /// default box about the site does.
 ///
@@ -218,7 +285,7 @@ fn a_picked_region_decides_the_ground_that_is_resampled() {
         region,
     };
 
-    let default = voxel_request_for(&target(None), 35.33, -97.28);
+    let default = voxel_request_for(&target(None), 35.33, -97.28, DEVICE_AXIS);
     assert_eq!(default.centre, (35.33, -97.28), "no region means the site");
     assert_eq!(
         default.half_extent_km, None,
@@ -234,7 +301,7 @@ fn a_picked_region_decides_the_ground_that_is_resampled() {
         rustdar_radar::voxel::HalfExtentKm::square(22.5),
     )
     .expect("a valid region");
-    let aimed = voxel_request_for(&target(Some(picked)), 35.33, -97.28);
+    let aimed = voxel_request_for(&target(Some(picked)), 35.33, -97.28, DEVICE_AXIS);
     assert_eq!(
         aimed.centre,
         (36.1, -98.4),
@@ -276,7 +343,7 @@ fn a_region_pick_does_not_move_the_top_or_the_bottom_of_the_box() {
     );
 
     for target in [make(None), make(picked)] {
-        let request = voxel_request_for(&target, 35.33, -97.28);
+        let request = voxel_request_for(&target, 35.33, -97.28, DEVICE_AXIS);
         assert_eq!(
             request.base_km_msl,
             rustdar_radar::voxel::DEFAULT_BASE_KM_MSL

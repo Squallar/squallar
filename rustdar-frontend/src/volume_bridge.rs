@@ -1491,6 +1491,24 @@ impl VolumePainter for BridgeVolumePainter {
         };
         Some(DrawnBox::for_lookup(&found, target, grid)?.size_km())
     }
+
+    /// The **held grid's** horizontal cell count, not the drawn box's.
+    ///
+    /// The opposite choice from [`Self::box_size_km`] directly above, and for
+    /// the same reason that one takes the drawn box: the caption divides this
+    /// into that, and what the reader is being told is the resolution of the
+    /// picture actually on screen. While a stand-in is up, the box is the one
+    /// the pane asked for and the cells are the ones the older grid has, so
+    /// pairing the drawn box with the held grid's count is what makes the
+    /// printed km-per-cell true of the pixels rather than of a grid that has
+    /// not been built yet.
+    fn grid_cells_across(&self, pane_idx: usize, target: &VolumeTarget) -> Option<usize> {
+        let found = self.store.lookup_for_pane(pane_idx, target)?;
+        let VolumeEntry::Ready(grid) = &found.entry else {
+            return None;
+        };
+        Some(grid.shape().nx)
+    }
 }
 
 /// Wrap a callback in whatever `egui_wgpu` downcasts to.

@@ -584,6 +584,17 @@ fn the_volume_grid_fits_the_target_texture_budget() {
 /// Doubling one axis is the realistic regression here, not doubling the whole
 /// grid — and it is exactly what this catches, because doubling any single
 /// axis doubles the total.
+///
+/// **What it no longer covers, since the grid's shape became a runtime
+/// answer.** `arm.grid` is the *budget* triple now, not the shape the frontend
+/// requests, so this is a claim about two constants: that the ceiling is snug
+/// against the budget. It is still worth making — a loose ceiling is how a term
+/// inside it doubles unnoticed — but the tripwire half, the one that would have
+/// caught the Android build asking for 2.4× what it budgeted, has moved to
+/// [`the_requested_shape_never_outgrows_the_budget_it_was_computed_against`],
+/// which sweeps what a device is actually asked for against what its arm was
+/// sized at. Neither is redundant: this one binds the ceiling to the budget,
+/// that one binds the request to the budget.
 #[test]
 fn the_volume_budget_is_not_slack_enough_to_hide_a_doubling() {
     for arm in arms() {
@@ -1271,6 +1282,13 @@ fn the_grid_dimensions_match_the_shapes_rustdar_radar_names() {
 /// three. All three arms are checked here from any host; what stays unpinned
 /// is only the `cfg` cascade in `VOLUME_GRID_CELLS`, which the test above
 /// covers as far as a host can.
+///
+/// **The shape is a runtime answer now**, so what this can still state as an
+/// identity is the *floor*: the shape a device reporting exactly the WebGL2
+/// guarantee is asked for, which is the budget triple unchanged and is what
+/// makes "nothing regresses" checkable. The claim about every other device is
+/// a relation rather than an identity, and it is
+/// [`the_requested_shape_never_outgrows_the_budget_it_was_computed_against`].
 #[test]
 fn the_requested_shape_is_the_one_this_targets_budget_was_computed_for() {
     use rustdar_radar::voxel::{DESKTOP_SHAPE, MOBILE_SHAPE, VoxelShape, WASM_SHAPE};
@@ -1293,20 +1311,172 @@ fn the_requested_shape_is_the_one_this_targets_budget_was_computed_for() {
     assert_eq!(shape_of(MOBILE_VOLUME_GRID_CELLS), MOBILE_SHAPE);
     assert_eq!(shape_of(DESKTOP_VOLUME_GRID_CELLS), DESKTOP_SHAPE);
 
+    // The floor — the shape a device at the guarantee is asked for — is this
+    // target's own budget triple, unchanged. That is the no-regression claim,
+    // and it is the one arm of the cascade a host can check by name.
     #[cfg(target_arch = "wasm32")]
-    assert_eq!(volume_grid_shape(), WASM_SHAPE);
-    #[cfg(all(not(target_arch = "wasm32"), mobile))]
-    assert_eq!(volume_grid_shape(), MOBILE_SHAPE);
-    #[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
-    assert_eq!(volume_grid_shape(), DESKTOP_SHAPE);
-
-    // The cells the grid is *budgeted* at and the cells it is *built* at are
-    // now one number, which is the whole point of deriving one from the other.
-    let shape = volume_grid_shape();
     assert_eq!(
-        [shape.nx as u32, shape.ny as u32, shape.nz as u32],
-        VOLUME_GRID_CELLS,
+        volume_grid_shape(WEBGL2_MAX_TEXTURE_DIMENSION_3D),
+        rustdar_radar::voxel::shape_for_budget(WASM_SHAPE, 256),
     );
+    #[cfg(all(not(target_arch = "wasm32"), mobile))]
+    assert_eq!(
+        volume_grid_shape(WEBGL2_MAX_TEXTURE_DIMENSION_3D),
+        rustdar_radar::voxel::shape_for_budget(MOBILE_SHAPE, 256),
+    );
+    #[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
+    assert_eq!(
+        volume_grid_shape(WEBGL2_MAX_TEXTURE_DIMENSION_3D),
+        DESKTOP_SHAPE
+    );
+
+    assert_eq!(
+        VOLUME_GRID_FLOOR_SHAPE,
+        volume_grid_shape(WEBGL2_MAX_TEXTURE_DIMENSION_3D),
+        "the floor shape the const assert guards has to be the one a device \
+         at the guarantee is actually asked for",
+    );
+}
+
+/// The limits a real adapter might report, which every sweep below runs.
+///
+/// The guarantee, the two powers of two either side of it, the 704 an
+/// unaligned reading of the desktop budget lands on, and a modern desktop's
+/// own figure.
+const REPORTED_LIMITS: [u32; 5] = [256, 512, 704, 1024, 2048];
+
+/// The three budget triples, whatever this target's cascade selected.
+const ALL_ARMS: [(&str, [u32; 3]); 3] = [
+    ("wasm", WASM_VOLUME_GRID_CELLS),
+    ("mobile", MOBILE_VOLUME_GRID_CELLS),
+    ("desktop", DESKTOP_VOLUME_GRID_CELLS),
+];
+
+/// **The shape the frontend requests never costs more than the budget it was
+/// computed against — on any device.**
+///
+/// # What this replaces, and why it is stronger
+///
+/// `the_volume_budget_is_not_slack_enough_to_hide_a_doubling` asserted that
+/// each arm's ceiling was under twice what it bounds, so a silently doubled
+/// grid axis could not hide inside the headroom. That test is the tripwire for
+/// the shipped Android overrun — a build budgeting 192×192×96 while the radar
+/// was asked for 256×256×128, 2.4× over — and it went **vacuous** the moment
+/// the shape stopped being a constant: it compares two constants, and the thing
+/// that can now be wrong is a *function of the device*.
+///
+/// So it is re-expressed rather than deleted, against the property the whole
+/// rebalance rests on: rearranging a budget's cells is free because there are
+/// never more of them. For every arm and every limit an adapter might report,
+/// what is requested must fit the budget every allocation was sized against —
+/// in cells, and in the bytes those cells actually cost with the coarse level
+/// beside them. That is stronger than the doubling test in two directions: it
+/// catches any overrun rather than only a factor of two, and it catches one
+/// that only appears on some devices.
+#[test]
+fn the_requested_shape_never_outgrows_the_budget_it_was_computed_against() {
+    for (name, budget) in ALL_ARMS {
+        let budget_cells = budget.iter().map(|&n| n as usize).product::<usize>();
+        let budget_bytes = crate::volume::raymarch::grid_bytes_with_mips(budget)
+            .expect("a shipped budget cannot overflow");
+        for limit in REPORTED_LIMITS {
+            let shape = rustdar_radar::voxel::shape_for_budget(shape_of(budget), limit as usize);
+            let cells = [shape.nx as u32, shape.ny as u32, shape.nz as u32];
+            assert!(
+                shape.cells() <= budget_cells,
+                "{name} on a {limit}-reporting device: {cells:?} is {} cells \
+                 against the {budget_cells} this target budgeted for",
+                shape.cells(),
+            );
+            let bytes = crate::volume::raymarch::grid_bytes_with_mips(cells)
+                .expect("a derived shape cannot overflow");
+            assert!(
+                bytes <= budget_bytes,
+                "{name} on a {limit}-reporting device: {cells:?} costs \
+                 {bytes} B of texture against the {budget_bytes} B \
+                 {budget:?} was budgeted at",
+            );
+        }
+    }
+}
+
+/// A device is never asked for an axis it did not say it could hold.
+///
+/// The runtime half of the guarantee the const assert in `constants.rs` used to
+/// make about every shape. It can only make that claim about
+/// [`VOLUME_GRID_FLOOR_SHAPE`] now, because that is the only shape that is
+/// still a compile-time constant; this is what guards everything above it, and
+/// it is the reason `voxel::MAX_AXIS` could be widened off the GLES 3.0
+/// guarantee without any device being asked for more than it reports.
+#[test]
+fn every_axis_stays_within_the_limit_the_adapter_reported() {
+    for (name, budget) in ALL_ARMS {
+        for limit in REPORTED_LIMITS {
+            let shape = rustdar_radar::voxel::shape_for_budget(shape_of(budget), limit as usize);
+            for (axis, n) in [("nx", shape.nx), ("ny", shape.ny), ("nz", shape.nz)] {
+                assert!(
+                    n as u32 <= limit,
+                    "{name} on a {limit}-reporting device: {axis} is {n}, \
+                     which that device cannot allocate — and the failure \
+                     would be a validation error inside a callback, where \
+                     there is no Result to check",
+                );
+            }
+        }
+    }
+}
+
+/// The **device guarantee**, which is what `voxel::tests`'
+/// `an_axis_outside_the_guarantee_is_refused` used to assert with a literal
+/// 257.
+///
+/// It could not stay there. `MAX_AXIS` is 1625 now — the largest axis whose
+/// cube fits a 32-bit cell count, which is the only bound `rustdar-radar` can
+/// actually check, having no `wgpu` and no adapter. The guarantee is a fact
+/// about a *device*, so it moved to the crate that meets one, and it is
+/// asserted the way it is meant: a shape derived for a device reporting exactly
+/// the guarantee has every axis inside it. Neither test was dropped; each went
+/// where its subject lives.
+#[test]
+fn a_shape_derived_for_a_device_at_the_guarantee_stays_within_it() {
+    for (name, budget) in ALL_ARMS {
+        let shape = rustdar_radar::voxel::shape_for_budget(
+            shape_of(budget),
+            WEBGL2_MAX_TEXTURE_DIMENSION_3D as usize,
+        );
+        for (axis, n) in [("nx", shape.nx), ("ny", shape.ny), ("nz", shape.nz)] {
+            assert!(
+                n >= 1 && n as u32 <= WEBGL2_MAX_TEXTURE_DIMENSION_3D,
+                "{name}: {axis} is {n}, outside the 3D texture size WebGL2 \
+                 guarantees, so a phone browser reporting exactly the \
+                 guarantee could not allocate it",
+            );
+        }
+    }
+}
+
+/// `voxel::HORIZONTAL_AXIS_MULTIPLE` is the copy alignment expressed in cells,
+/// and this is the only crate that can say so.
+///
+/// `rustdar-radar` rounds the grid's horizontal axis to 64 and documents why —
+/// `copy_buffer_to_texture` holds every row to
+/// `wgpu::COPY_BYTES_PER_ROW_ALIGNMENT`, and the staging ring's `PlaneLayout`
+/// pads to it — but it has no `wgpu` to check the arithmetic against. This is
+/// the binding, in the shape `the_grid_dimensions_match_the_shapes_rustdar_radar_names`
+/// already uses for the triples: a number in two crates, tied by name so a
+/// drift fails here rather than as 6% of a permanently resident staging ring
+/// spent on padding.
+#[test]
+fn the_horizontal_axis_multiple_is_the_copy_alignment_in_cells() {
+    assert_eq!(
+        rustdar_radar::voxel::HORIZONTAL_AXIS_MULTIPLE,
+        wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize
+            / crate::volume::raymarch::GRID_BYTES_PER_CELL as usize,
+    );
+    // And that the two it is a quotient of are what the doc says, so a change
+    // to either fails by name rather than by cancelling out.
+    assert_eq!(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT, 256);
+    assert_eq!(crate::volume::raymarch::GRID_BYTES_PER_CELL, 4);
 }
 
 /// The pane mirror's ceiling is the cap squared, four bytes a texel — and the

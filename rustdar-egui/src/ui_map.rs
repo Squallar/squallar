@@ -2250,7 +2250,15 @@ fn volume_pane_outcome(
                 ui,
                 pane_rect,
                 crate::ui::pills::pill_row_clearance(ui.ctx(), pane_idx),
-                &volume_caption(&site_code, collected, base_started, half, camera, showing),
+                &volume_caption(
+                    &site_code,
+                    collected,
+                    base_started,
+                    half,
+                    camera,
+                    showing,
+                    painter.grid_cells_across(pane_idx, &target),
+                ),
             );
             None
         }
@@ -2688,8 +2696,18 @@ const KFT_PER_KM: f64 = 3.280_84;
 /// the whole licence for painting a held grid at all is that the caption stays
 /// honest about it. [`crate::volume_view::Showing`] is that report.
 ///
-/// A pure function of six values so that what the pane claims can be tested
+/// A pure function of seven values so that what the pane claims can be tested
 /// without a GPU, a projector or a frame.
+///
+/// `cells` is the grid's own horizontal cell count, passed in rather than read
+/// off a constant: the shape is derived at runtime from the device's
+/// `max_texture_dimension_3d` (`rustdar_radar::voxel::shape_for_budget`), so
+/// there is no compile-time triple this could consult that is guaranteed to be
+/// the grid on screen. It used to read `default_shape().nx`, which would now be
+/// a caption confidently dividing by the wrong number on any device not
+/// reporting exactly the guarantee. `None` — a pane with no grid to ask — states
+/// the box and omits the resolution, which is the honest answer rather than a
+/// division by an assumed number.
 fn volume_caption(
     site: &str,
     newest: chrono::NaiveDateTime,
@@ -2697,6 +2715,7 @@ fn volume_caption(
     half: rustdar_radar::voxel::HalfExtentKm,
     camera: crate::pane::OrbitCamera,
     showing: crate::volume_view::Showing,
+    cells: Option<usize>,
 ) -> Vec<String> {
     let mut lines = vec![format!(
         "{site} volume - newest data {}Z",
@@ -2717,12 +2736,13 @@ fn volume_caption(
         camera.vertical_exaggeration(),
     ));
 
-    let cells = rustdar_radar::voxel::default_shape().nx;
     let across = axes(2.0 * half.east_km, 2.0 * half.north_km, 0);
     match (
         showing.stale.then_some(showing.cell_km).flatten(),
-        crate::pane::resolution_km(half.east_km, cells)
-            .zip(crate::pane::resolution_km(half.north_km, cells)),
+        cells.and_then(|cells| {
+            crate::pane::resolution_km(half.east_km, cells)
+                .zip(crate::pane::resolution_km(half.north_km, cells))
+        }),
     ) {
         // Standing in: the cell size on screen is the held grid's, not the one
         // this box would buy, and the line says which and that a sharper one is

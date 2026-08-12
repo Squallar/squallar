@@ -526,20 +526,333 @@ fn the_named_shapes_cost_what_the_module_doc_says() {
     assert_eq!(DESKTOP_SHAPE.cells() * 4, 32 * MIB);
 }
 
-/// wasm gets the small shape, everything else the large one, and the
-/// **mobile** shape is deliberately unreachable from here — see the module
+/// wasm gets the small budget, everything else the large one, and the
+/// **mobile** tier is deliberately unreachable from here — see the module
 /// doc.
+///
+/// Asked at the WebGL2 guarantee, where [`shape_for_budget`] answers the
+/// shape the tier shipped, so this stays a test about the `cfg` cascade
+/// rather than about the rebalance.
 #[test]
 fn default_shape_is_the_targets() {
+    const GUARANTEE: usize = 256;
     #[cfg(target_arch = "wasm32")]
-    assert_eq!(default_shape(), WASM_SHAPE);
+    assert_eq!(
+        default_shape(GUARANTEE),
+        shape_for_budget(WASM_SHAPE, GUARANTEE)
+    );
     #[cfg(not(target_arch = "wasm32"))]
-    assert_eq!(default_shape(), DESKTOP_SHAPE);
+    assert_eq!(default_shape(GUARANTEE), DESKTOP_SHAPE);
     assert_ne!(
-        default_shape(),
-        MOBILE_SHAPE,
+        default_shape(GUARANTEE),
+        shape_for_budget(MOBILE_SHAPE, GUARANTEE),
         "this crate has no build script, so it cannot see the `mobile` \
              cfg; the frontend selects MOBILE_SHAPE explicitly",
+    );
+}
+
+// ── The rebalance ───────────────────────────────────────────────────────
+//
+// The adapter limits every sweep below runs: the WebGL2 guarantee, the two
+// powers of two either side of it, the 704 an unaligned reading of the
+// desktop budget lands on, and a modern desktop's real report.
+const REPORTED_LIMITS: [usize; 5] = [256, 512, 704, 1024, 2048];
+
+/// Every tier, and the shipped shape that is both its budget and its
+/// baseline.
+const TIERS: [(&str, VoxelShape); 3] = [
+    ("wasm", WASM_SHAPE),
+    ("mobile", MOBILE_SHAPE),
+    ("desktop", DESKTOP_SHAPE),
+];
+
+/// The table in [`shape_for_budget`]'s doc, as arithmetic.
+///
+/// A generous adapter, so what is pinned is the rule rather than a clamp.
+/// The kilometre figures are over the 920.25 km box a WSR-88D's
+/// reflectivity reach earns, which is the box a 3D pane frames by default,
+/// and they are the whole point of the change: they are what a reader sees.
+#[test]
+fn the_rebalanced_shapes_are_the_ones_the_rule_documents() {
+    const RING_KM: f64 = 920.25;
+    const SPAN_KM: f64 = DEFAULT_TOP_KM_MSL - DEFAULT_BASE_KM_MSL;
+    let expected = [
+        (
+            "wasm",
+            WASM_SHAPE,
+            VoxelShape {
+                nx: 256,
+                ny: 256,
+                nz: 16,
+            },
+            3.595,
+            1.125,
+        ),
+        (
+            "mobile",
+            MOBILE_SHAPE,
+            VoxelShape {
+                nx: 320,
+                ny: 320,
+                nz: 34,
+            },
+            2.876,
+            0.529,
+        ),
+        (
+            "desktop",
+            DESKTOP_SHAPE,
+            VoxelShape {
+                nx: 512,
+                ny: 512,
+                nz: 32,
+            },
+            1.797,
+            0.5625,
+        ),
+    ];
+    for (name, shipped, want, horizontal_km, vertical_km) in expected {
+        let got = shape_for_budget(shipped, 2048);
+        assert_eq!(got, want, "{name}");
+        assert!(
+            (RING_KM / got.nx as f64 - horizontal_km).abs() < 0.001,
+            "{name}: {} cells over the ring is {} km, not the documented \
+             {horizontal_km}",
+            got.nx,
+            RING_KM / got.nx as f64,
+        );
+        assert!(
+            (SPAN_KM / got.nz as f64 - vertical_km).abs() < 0.001,
+            "{name}: {} layers over {SPAN_KM} km is {} km, not the \
+             documented {vertical_km}",
+            got.nz,
+            SPAN_KM / got.nz as f64,
+        );
+    }
+}
+
+/// **The invariant the whole change rests on**: rearranging the cells is
+/// free because there are never more of them.
+///
+/// Stated over every tier and every adapter limit rather than over the
+/// three shipped answers, because the shape is a runtime value now and the
+/// three are only the rows a particular machine lands on. This is what
+/// makes the rebalance safe with no memory query anywhere: a shape that
+/// spent more than its tier's budget would be the Android overrun again,
+/// and the frontend's own re-expression of this
+/// (`the_requested_shape_never_outgrows_the_budget_it_was_computed_against`)
+/// is what ties it to the allocations that budget actually pays for.
+#[test]
+fn a_rebalanced_shape_never_outgrows_the_budget_it_came_from() {
+    for (name, shipped) in TIERS {
+        for limit in REPORTED_LIMITS {
+            let got = shape_for_budget(shipped, limit);
+            assert!(
+                got.cells() <= shipped.cells(),
+                "{name} at a {limit} limit: {got:?} is {} cells against a \
+                 {} cell budget",
+                got.cells(),
+                shipped.cells(),
+            );
+            assert!(got.is_supported(), "{name} at a {limit} limit: {got:?}");
+        }
+    }
+}
+
+/// A device is never handed an axis it did not say it could hold.
+///
+/// The runtime half of what `constants.rs`'s const assert used to do for
+/// every shape at compile time. That assert survives on the floor shape,
+/// which is still a compile-time constant; this is the guard for
+/// everything above it, and it is the reason [`MAX_AXIS`] could be widened
+/// off the GLES 3.0 guarantee without any device being asked for more than
+/// it reports.
+#[test]
+fn every_axis_stays_within_the_limit_the_device_reported() {
+    for (name, shipped) in TIERS {
+        for limit in REPORTED_LIMITS {
+            let got = shape_for_budget(shipped, limit);
+            for (axis, n) in [("nx", got.nx), ("ny", got.ny), ("nz", got.nz)] {
+                assert!(
+                    n <= limit,
+                    "{name} at a {limit} limit: {axis} is {n}, which the \
+                     device cannot allocate",
+                );
+            }
+        }
+    }
+    // And the arithmetic bound still binds when the device claims more
+    // than the grid codec can represent.
+    let huge = shape_for_budget(DESKTOP_SHAPE, usize::MAX);
+    assert!(huge.is_supported(), "{huge:?}");
+}
+
+/// The horizontal lands on the copy alignment, so the staging ring pads
+/// nothing.
+///
+/// The frontend owns the derivation of the 64 — see
+/// `the_horizontal_axis_multiple_is_the_copy_alignment_in_cells`, which is
+/// the only place `wgpu` is in scope to state it — and this is the half
+/// that says the rule actually obeys it.
+#[test]
+fn the_horizontal_axis_is_a_multiple_of_the_copy_alignment() {
+    for (name, shipped) in TIERS {
+        for limit in REPORTED_LIMITS {
+            let got = shape_for_budget(shipped, limit);
+            assert_eq!(
+                got.nx % HORIZONTAL_AXIS_MULTIPLE,
+                0,
+                "{name} at a {limit} limit: {} is not a multiple of \
+                 {HORIZONTAL_AXIS_MULTIPLE}, so every row of its staging \
+                 buffer is padded",
+                got.nx,
+            );
+            assert_eq!(got.nx, got.ny, "{name} at a {limit} limit");
+        }
+    }
+    // A device below one whole step of alignment takes what it can hold
+    // rather than nothing at all: `PlaneLayout` pads the rows.
+    assert_eq!(shape_for_budget(DESKTOP_SHAPE, 32).nx, 32);
+    assert_eq!(shape_for_budget(DESKTOP_SHAPE, 0).nx, 1);
+}
+
+/// Nothing regresses on a device that reports exactly the guarantee — and
+/// it falls out of the rule rather than being special-cased.
+///
+/// The desktop tier at 256 is the shape that shipped, axis for axis. Both
+/// arms of the two-step rule agree there, which is why the no-regression
+/// fallback cannot break this: at the guarantee the horizontal is pinned
+/// by the device rather than by the vertical, so there is nothing for the
+/// second step to change.
+#[test]
+fn a_conservative_adapter_gets_the_shape_that_shipped() {
+    assert_eq!(shape_for_budget(DESKTOP_SHAPE, 256), DESKTOP_SHAPE);
+    assert_eq!(
+        shape_for_budget(DESKTOP_SHAPE, 256),
+        VoxelShape {
+            nx: 256,
+            ny: 256,
+            nz: 128
+        },
+    );
+    // The wasm tier's own conservative answer, which is what a browser
+    // reporting the bare guarantee gets. Not the shipped 128×128×64: the
+    // budget buys a 256 axis at `NZ_MIN` and the guarantee is exactly 256,
+    // so the web gains here rather than merely holding.
+    assert_eq!(
+        shape_for_budget(WASM_SHAPE, 256),
+        VoxelShape {
+            nx: 256,
+            ny: 256,
+            nz: 16
+        },
+    );
+    // A browser below the guarantee — non-conformant, but the grid must
+    // still be one it can hold — degrades to exactly what it shipped.
+    assert_eq!(shape_for_budget(WASM_SHAPE, 128), WASM_SHAPE);
+}
+
+/// The deeper vertical is taken only where it *buys* horizontal.
+///
+/// Both halves matter. The two large tiers gain on both axes at once and
+/// take [`NZ_PREFERRED`]. The web cannot: 32 layers cap its horizontal at
+/// 181 cells, which rounds to the 128 it already had — and the box that
+/// axis must now cover has grown by √2, so the tie in cells is a
+/// coarsening in kilometres. It falls back to [`NZ_MIN`] and reaches 256.
+#[test]
+fn the_deeper_vertical_is_taken_only_where_it_buys_horizontal() {
+    for (name, shipped) in [("mobile", MOBILE_SHAPE), ("desktop", DESKTOP_SHAPE)] {
+        let got = shape_for_budget(shipped, 2048);
+        assert!(
+            got.nz >= NZ_PREFERRED,
+            "{name}: {got:?} took the shallow vertical although it could \
+             afford {NZ_PREFERRED} layers",
+        );
+        assert!(
+            got.nx > shipped.nx,
+            "{name}: {got:?} is no wider than the {} it shipped, so the \
+             deeper vertical bought nothing",
+            shipped.nx,
+        );
+    }
+    let web = shape_for_budget(WASM_SHAPE, 2048);
+    assert_eq!(web.nz, NZ_MIN, "the web falls back: {web:?}");
+    assert!(
+        web.nx > WASM_SHAPE.nx,
+        "the fallback has to be the arm that gains: {web:?}",
+    );
+    // Why it falls back, rather than merely that it does: the preferred
+    // arm ties on the horizontal, and a tie is not a gain.
+    let free = (WASM_SHAPE.cells() / NZ_PREFERRED).isqrt();
+    assert_eq!(free, 181, "32 layers leave the web 181 cells across");
+    assert_eq!(
+        free - free % HORIZONTAL_AXIS_MULTIPLE,
+        WASM_SHAPE.nx,
+        "aligned, that is the axis the web already had",
+    );
+}
+
+/// [`NZ_MIN`] and [`NZ_PREFERRED`] are the rungs the beam picks out, not
+/// two numbers that looked about right.
+///
+/// The measure is the share of the 460.125 km ring's **area** over which a
+/// vertical cell is still finer than the 0.95° beam is deep. Below 16 the
+/// loss accelerates — that is the floor. Above 32 it has stopped paying —
+/// that is the preference. Every figure in [`NZ_PREFERRED`]'s table.
+#[test]
+fn the_vertical_rungs_are_the_ones_the_beam_justifies() {
+    /// One-degree-ish: the 0.95° beamwidth in radians, which is the depth
+    /// of the beam per kilometre of range.
+    const BEAM: f64 = 0.95_f64 * std::f64::consts::PI / 180.0;
+    const REACH_KM: f64 = 460.125;
+    const SPAN_KM: f64 = DEFAULT_TOP_KM_MSL - DEFAULT_BASE_KM_MSL;
+
+    let honest_share = |nz: usize| {
+        let cell_km = SPAN_KM / nz as f64;
+        // Beyond this range the beam is deeper than the cell, so the grid
+        // is no longer claiming more than the radar measured.
+        let from_km = cell_km / BEAM;
+        1.0 - (from_km / REACH_KM).powi(2)
+    };
+
+    for (nz, want) in [
+        (64, 0.9986),
+        (NZ_PREFERRED, 0.9946),
+        (24, 0.9903),
+        (NZ_MIN, 0.9783),
+        (8, 0.9130),
+    ] {
+        assert!(
+            (honest_share(nz) - want).abs() < 0.0001,
+            "{nz} layers is honest over {}, not the documented {want}",
+            honest_share(nz),
+        );
+    }
+
+    // Every halving costs exactly four times the one above it — the lost
+    // area goes as the square of the honest radius, which goes as the cell
+    // — so the ratio cannot be what picks a rung out. What picks the floor
+    // out is where four times becomes a tenth of the picture.
+    let below = 1.0 - honest_share(8);
+    let at = 1.0 - honest_share(NZ_MIN);
+    assert!(
+        (below - 4.0 * at).abs() < 1e-9,
+        "the quadrupling is structural: {below} against {at}",
+    );
+    assert!(
+        below > 0.08 && at < 0.025,
+        "{NZ_MIN} is the last rung above the cliff only if the step below \
+         it loses a tenth of the region ({below}) where it loses a \
+         fortieth ({at})",
+    );
+    // And the preference is where the returns stop: doubling again costs
+    // the same √2 of horizontal everywhere and buys under half a point of
+    // area.
+    let beyond = honest_share(64) - honest_share(NZ_PREFERRED);
+    assert!(
+        beyond < 0.005,
+        "{NZ_PREFERRED} is only a stopping point if {beyond} is under half \
+         a point",
     );
 }
 
@@ -557,8 +870,19 @@ fn both_target_classes_get_their_own_default_shape() {
     assert_ne!(default_shape_for(true), default_shape_for(false));
 }
 
+/// The bound this crate owns is the **wire and the arithmetic** one, and
+/// this is where it is tested.
+///
+/// It used to assert 257 was refused, because [`MAX_AXIS`] was the GLES 3.0
+/// guarantee and this crate was the keeper of it. That was two bounds
+/// wearing one name. The device guarantee moved to the frontend, where the
+/// adapter that reports it lives — see
+/// `a_shape_derived_for_a_device_at_the_guarantee_stays_within_it` — and
+/// what is left here is the only bound `rustdar-radar` can actually check:
+/// the largest axis whose cube cannot overflow a 32-bit `usize`. Neither
+/// test was dropped; each went where its subject went.
 #[test]
-fn an_axis_outside_the_guarantee_is_refused() {
+fn an_axis_outside_the_arithmetic_bound_is_refused() {
     let scan = scan_of(&|_, _| Some(40.0));
     // Each axis independently, in both directions, so a guard that checks
     // only one of the three survives none of these.
@@ -566,9 +890,18 @@ fn an_axis_outside_the_guarantee_is_refused() {
         VoxelShape { nx: 0, ..ODD },
         VoxelShape { ny: 0, ..ODD },
         VoxelShape { nz: 0, ..ODD },
-        VoxelShape { nx: 257, ..ODD },
-        VoxelShape { ny: 257, ..ODD },
-        VoxelShape { nz: 257, ..ODD },
+        VoxelShape {
+            nx: MAX_AXIS + 1,
+            ..ODD
+        },
+        VoxelShape {
+            ny: MAX_AXIS + 1,
+            ..ODD
+        },
+        VoxelShape {
+            nz: MAX_AXIS + 1,
+            ..ODD
+        },
     ] {
         assert_eq!(
             build_voxels(&scan, &request(bad), SITE.0, SITE.1),
@@ -588,8 +921,33 @@ fn an_axis_outside_the_guarantee_is_refused() {
             SITE.1,
         )
         .is_some(),
-        "256 is the guarantee, so it is allowed",
+        "{MAX_AXIS} is the bound itself, so it is allowed",
     );
+}
+
+/// [`MAX_AXIS`] is the search it says it is, and the search is right.
+///
+/// Both sides, because a bound that is merely *safe* would pass a check
+/// against overflow alone: 1625 has to fit and 1626 has to not. In `u128`,
+/// so the test cannot overflow the thing it is testing on a 32-bit host.
+#[test]
+fn the_arithmetic_bound_is_the_largest_cubable_axis() {
+    assert_eq!(MAX_AXIS, 1625);
+    let cube = |n: u128| n * n * n;
+    assert!(
+        cube(MAX_AXIS as u128) <= u128::from(u32::MAX),
+        "{MAX_AXIS}³ = {} overflows a 32-bit cell count",
+        cube(MAX_AXIS as u128),
+    );
+    assert!(
+        cube(MAX_AXIS as u128 + 1) > u128::from(u32::MAX),
+        "{}³ fits too, so the bound is not the largest",
+        MAX_AXIS + 1,
+    );
+    // The wire that carries a *request* is a `u16` per axis
+    // (`rustdar_frontend::offload::encode_voxel_request`), so the bound has
+    // to fit one or the encoder would truncate a shape this crate accepts.
+    assert!(u16::try_from(MAX_AXIS).is_ok());
 }
 
 // ── Refusals ────────────────────────────────────────────────────────────

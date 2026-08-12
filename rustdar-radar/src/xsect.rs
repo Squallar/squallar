@@ -1019,9 +1019,15 @@ fn render_with_sampler(
 /// **The voxel grid is smaller than it looks, and improves for free.**
 /// [`crate::voxel::build_voxels`] is the obvious neighbour — same position
 /// after the decode, an index plane of exactly 8 MiB at
-/// [`crate::voxel::DESKTOP_SHAPE`] — and on a fresh thread per build it cost
-/// 762–778 faults against this path's 4,608, with **9.77–11.33 ms against
-/// 9.82–10.54 ms** under `MALLOC_ARENA_MAX=1`: no difference worth a change. In
+/// [`crate::voxel::DESKTOP_SHAPE`]'s budget — and on a fresh thread per build
+/// it cost 762–778 faults against this path's 4,608, with **9.77–11.33 ms
+/// against 9.82–10.54 ms** under `MALLOC_ARENA_MAX=1`: no difference worth a
+/// change. (Timed while that budget was built as 256 × 256 × 128;
+/// [`crate::voxel::shape_for_budget`] now spends the same cells on
+/// 512 × 512 × 32, which roughly doubles the millisecond figure — measured in
+/// that module's own table. What this paragraph turns on is the **fault**
+/// count, which is a property of the allocation, and the allocation has not
+/// moved.) In
 /// the production arm (`values_wanted: false`) it went **2,110–2,148 faults
 /// before this pool to 1–424 after it**, without being touched — the 18 MiB
 /// held here is what stops the arena trimming under it. So a grid that leaves

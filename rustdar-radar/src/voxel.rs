@@ -19,9 +19,34 @@
 //! bilinear in azimuth × slant range per rung, ~64 on a 16-rung VCP 212
 //! ladder — and every height after the first is free, a two-point lerp between
 //! rungs already sampled. So a `nx × ny × nz` grid costs `nx·ny·4·N` gate
-//! reads, not `nx·ny·nz·4·N`: an **`nz`-fold** saving, 128× on the desktop
-//! shape. In numbers, [`DESKTOP_SHAPE`] is 65 536 columns over 8 388 608
-//! cells, or 4.2 M gate reads against 537 M on a 16-rung ladder. The loop
+//! reads, not `nx·ny·nz·4·N`: an **`nz`-fold** saving, 32× on the desktop
+//! grid. In numbers, the desktop tier's 512 × 512 × 32 is 262 144 columns over
+//! 8 388 608 cells, or 16.8 M gate reads against 537 M on a 16-rung ladder.
+//!
+//! **This is the cost side of [`shape_for_budget`], and the one place it is
+//! not free.** The saving is `nz`-fold, so a rebalance that spends the vertical
+//! on the horizontal spends this with it: at the 256 × 256 × 128 the desktop
+//! tier used to build, the same 8 388 608 cells were 65 536 columns and 4.2 M
+//! gate reads — a quarter of the column work for the same picture area. The
+//! memory is identical either way, which is what makes the rebalance safe; the
+//! resample is not, and the difference is bought deliberately.
+//!
+//! **Measured, rather than inferred from the column count**, because the
+//! per-cell work is unchanged and is a real share of the total.
+//! [`build_voxels`] over a whole reflectivity volume, best of three, release,
+//! on two storm volumes (KDMX 2022-03-05 23:23Z and KCRP 2017-08-26 04:41Z):
+//!
+//! | tier | was | now | |
+//! |---|---|---|---|
+//! | web | 2.0–2.3 ms | 4.6–4.7 ms | 128×128×64 → 256×256×16 |
+//! | mobile | 4.1–4.2 ms | 7.7–7.8 ms | 192×192×96 → 320×320×34 |
+//! | desktop | 7.9–8.3 ms | 18.2–18.4 ms | 256×256×128 → 512×512×32 |
+//!
+//! So **about 2.2×**, not the 4× the column arithmetic on its own suggests.
+//! Native figures on a desktop CPU; the web's single worker is slower in
+//! absolute terms and the ratio is the transferable part. All of it is paid on
+//! a worker thread (`rustdar_frontend::offload::execute`) and none of it on the
+//! frame thread, which is what makes it affordable at all. The loop
 //! below therefore runs `for y { for x { column_into(...); for z { ... } } }`
 //! and nothing else — one [`crate::sampler::VolumeSampler::sample`] per voxel
 //! is the version that does not fit in a frame.
@@ -326,21 +351,44 @@
 //!
 //! # Shapes and memory
 //!
-//! Every axis is **≤ 256**, so one code path satisfies the `GL_MAX_3D_TEXTURE_SIZE`
-//! of 256 that GLES 3.0 only *guarantees* and that a phone browser may report.
-//! The 512-XY desktop variant was rejected for that reason: 0.31 km per cell at
-//! a 40 km half-width already beats the 1 km cube this replaces.
+//! The three named shapes are **budgets**, and the cell count is the whole of
+//! what they bound: it is the count that costs memory, so how it is arranged
+//! over the three axes is free. [`shape_for_budget`] is what decides the
+//! arrangement, from the device's own `max_texture_dimension_3d`, and it is a
+//! runtime answer because the limit is a runtime fact — this crate has no
+//! adapter to ask.
 //!
-//! | shape | cells | indices | + values | + table |
+//! | tier | cells | indices | + values | + table |
 //! |---|---|---|---|---|
 //! | [`WASM_SHAPE`] 128×128×64 | 1 048 576 | 1 MiB | 4 MiB | 1 KiB |
 //! | [`MOBILE_SHAPE`] 192×192×96 | 3 538 944 | 3.375 MiB | 13.5 MiB | 1 KiB |
 //! | [`DESKTOP_SHAPE`] 256×256×128 | 8 388 608 | 8 MiB | 32 MiB | 1 KiB |
 //!
-//! The index plane is what becomes a GPU texture and is what
-//! [`VOXEL_TEXTURE_BUDGET_BYTES`] bounds. The value plane is host-side, four
-//! times larger, and exists only when a caller asks for it — see
-//! [`VoxelRequest::values_wanted`].
+//! Each is also the **baseline** its tier may not regress against, which is the
+//! second reason they are still spelt as shapes rather than as three counts.
+//! What a device actually gets is in [`shape_for_budget`]'s own table; a device
+//! reporting exactly the 256 that GLES 3.0 guarantees gets the row above,
+//! unchanged.
+//!
+//! **The 512-XY desktop grid was rejected once, and this is the reversal.** The
+//! rejection was correct on its premise: every axis had to be ≤ 256 so that one
+//! code path satisfied the `GL_MAX_3D_TEXTURE_SIZE` a phone browser may report,
+//! and with the vertical pinned at 128 layers a 512-wide grid was four times
+//! the cells and four times the memory. Both halves of that premise moved. The
+//! axis limit is read from the adapter now instead of assumed, so a browser at
+//! the guarantee is *given* 256 rather than everyone being held to it; and
+//! [`NZ_MIN`] establishes what the vertical actually has to be, which is not
+//! 128 — so 512 × 512 × 32 is the same 8,388,608 cells the rejected variant
+//! would have quadrupled.
+//!
+//! The index plane is what [`VOXEL_TEXTURE_BUDGET_BYTES`] bounds, at one byte a
+//! cell, and it is what travels. It is **not** what the GPU holds: the frontend
+//! widens it on upload into a four-byte `Rg16Float` texel — a premultiplied
+//! index and a coverage, a half float each — so the texture is four times this
+//! table's `indices` column, and `rustdar_frontend::constants`'s
+//! `VOLUME_TEXTURE_BUDGET_BYTES` is the budget for *that*. The value plane is a
+//! third thing again: host-side, four times larger, and present only when a
+//! caller asks for it — see [`VoxelRequest::values_wanted`].
 //!
 //! **[`default_shape`] cannot pick the mobile shape, and that is deliberate.**
 //! The `mobile` cfg is emitted by `rustdar-frontend/build.rs`, and cargo scopes
@@ -373,10 +421,63 @@ pub const LUT_LEN: usize = 256 * 4;
 /// own 180 ceiling, so the measure keeps meaning if a palette's ceiling moves.
 pub const SEE_THROUGH_ALPHA_CEILING: u8 = 64;
 
-/// The largest any axis may be: the `GL_MAX_3D_TEXTURE_SIZE` GLES 3.0
-/// guarantees. Not the largest any *device* allows — the largest every device
-/// must allow.
-pub const MAX_AXIS: usize = 256;
+/// The largest any axis may be **for the wire and the arithmetic** — and
+/// nothing else.
+///
+/// # This is not the device's limit, and must not be confused with it
+///
+/// It was 256, the `GL_MAX_3D_TEXTURE_SIZE` GLES 3.0 guarantees, on the
+/// reasoning that the smallest limit every device must allow is the safe one to
+/// hold everybody to. That made this crate the keeper of a *graphics* fact it
+/// cannot see: `rustdar-radar` has no `wgpu` dependency and no adapter, so it
+/// was asserting a number it had no way to check and no way to relax for a
+/// device that reports more.
+///
+/// The device's limit lives in `rustdar_frontend::constants` — see
+/// `WEBGL2_MAX_TEXTURE_DIMENSION_3D`, which is *derived* from
+/// `wgpu::Limits::downlevel_webgl2_defaults()` and is the floor a browser may
+/// legitimately report — and the adapter's own `max_texture_dimension_3d` is
+/// read at runtime and passed to [`shape_for_budget`]. **The two are different
+/// numbers on purpose and neither is a copy of the other.** They are not to be
+/// "unified": one is what a [`VoxelGrid`] can represent, the other is what a GPU
+/// will accept, and the second is a property of a machine this crate never
+/// meets.
+///
+/// # What it actually bounds
+///
+/// [`VoxelShape::cells`] multiplies three untrusted `u32`s out of a wire
+/// payload, and `usize` is **32 bits on wasm32**. So the bound is the largest
+/// axis for which three of them cannot overflow that product: `1625³` is
+/// 4,291,015,625 against `u32::MAX`'s 4,294,967,295, and 1626 is the first that
+/// does not fit. Written as the search rather than as 1625 so it cannot drift
+/// from the reason, and against `u32::MAX` explicitly rather than `usize::MAX`
+/// so a 64-bit host and a 32-bit browser agree — a bound that differed by target
+/// would be a `cfg`-shaped behavioural split wearing a constant's clothes.
+///
+/// The **request** wire is a narrower thing again and is bounded by its own
+/// encoding: `rustdar_frontend::offload` writes each requested axis as a `u16`,
+/// which 1625 fits with room to spare. `an_axis_outside_the_arithmetic_bound_is_refused`
+/// is the test for this one; the device guarantee is tested where the adapter
+/// lives, in the frontend.
+///
+/// A shape this large is not a denial-of-service route into [`VoxelGrid::from_bytes`]:
+/// it checks `indices.len() != cells` against a slice it has already been
+/// handed, so a payload claiming 1625³ has to actually carry 4.3 GB before
+/// anything is allocated for it.
+pub const MAX_AXIS: usize = largest_cubable_axis();
+
+/// The largest `n` with `n³ ≤ u32::MAX` — [`MAX_AXIS`]'s definition, as a
+/// search rather than a literal.
+///
+/// `u64` arithmetic throughout, because the whole question is what overflows a
+/// 32-bit `usize` and the test itself must not.
+const fn largest_cubable_axis() -> usize {
+    let mut n: u64 = 1;
+    while (n + 1) * (n + 1) * (n + 1) <= u32::MAX as u64 {
+        n += 1;
+    }
+    n as usize
+}
 
 /// Narrowest half-extent a request may ask for on either axis, km.
 ///
@@ -394,10 +495,11 @@ pub const MAX_AXIS: usize = 256;
 /// with that, and the second one mattered enough to send a campaign looking for
 /// a resolution bug that does not exist.
 ///
-/// It never enforced its own claim. At [`DESKTOP_SHAPE`]'s 256 cells a 10 km
-/// half-extent is a **78 m** cell — three times *finer* than the 250 m gates it
-/// was supposedly holding the grid above. Whatever number would have enforced
-/// that reading, this was never it.
+/// It never enforced its own claim. At the 256 cells [`DESKTOP_SHAPE`] used to
+/// be built as, a 10 km half-extent is a **78 m** cell — three times *finer*
+/// than the 250 m gates it was supposedly holding the grid above, and at the
+/// 512 that budget now buys, 39 m. Whatever number would have enforced that
+/// reading, this was never it.
 ///
 /// And the reading itself is false. Measured on KDMX 2025-03-14 17:55Z,
 /// reflectivity: a 0.318 km-cell box — 2 to 3× finer than the radial spacing it
@@ -551,9 +653,11 @@ impl HalfExtentKm {
     /// The floor is applied first, so an extent past 47:1 with its corner over
     /// the bound comes back with its short axis under [`MIN_HALF_WIDTH_KM`]
     /// again — 10 km scaled by `470 / corner`. Shape is the property worth
-    /// keeping there: the floor exists because a box finer than the radar's
-    /// own 250 m gates invents smoothness, and no viewport this is fed from is
-    /// anywhere near that long and thin.
+    /// keeping there, because the floor is an *arithmetic* stop and nothing
+    /// more — see [`MIN_HALF_WIDTH_KM`], which measured and retracted the "a
+    /// box finer than the radar's own gates invents smoothness" reading this
+    /// sentence used to repeat — and no viewport this is fed from is anywhere
+    /// near that long and thin.
     pub fn clamped(self) -> Self {
         let floored = Self {
             east_km: self.east_km.max(MIN_HALF_WIDTH_KM),
@@ -599,16 +703,26 @@ impl HalfExtentKm {
 /// simply the price of the ring.
 ///
 /// The resolution objection is answered by the grid's shape rather than by the
-/// box: at 512 cells across, the 920.25 km box is **1.80 km/cell**, finer than
-/// the 2.54 km the 651 km inscribed box got at 256. The old rule's own table
-/// measured the circumscribed box at 3.59 km/cell, and that number was true only
-/// while `nx` was pinned at 256.
+/// box, and [`shape_for_budget`] is what answers it. **Where the adapter can
+/// hold a 512-cell 3D texture** — which is checked at runtime rather than
+/// assumed — the desktop budget buys 512 × 512 × 32, so the 920.25 km box is
+/// **1.80 km/cell**: finer than the 2.54 km the 651 km inscribed box got at the
+/// 256 cells that used to be built. The same cells, spent differently.
+///
+/// **That was not true when the box was widened, and saying so is the point.**
+/// The circumscription landed while `nx` was pinned at 256, where the wider box
+/// is 3.59 km/cell — *coarser* than the 2.54 it replaced. The trade was a real
+/// regression in resolution for a real gain in geography, and the rebalance is
+/// what pays the resolution back. A device reporting only the 256 that GLES 3.0
+/// guarantees still gets 256×256×128 and still sees 3.59, so this is settled
+/// per device rather than everywhere at once.
 ///
 /// # Every product moves, not only reflectivity
 ///
 /// The per-moment variance the inscribed rule already exploited runs the same
 /// helpful way here, so this is a widening of every box rather than a special
-/// case for the surveillance cut:
+/// case for the surveillance cut. The last column is what a device that can
+/// hold 512 gets; a device at the guarantee sees twice these figures:
 ///
 /// | moment | reach | was (inscribed) | now (circumscribed) | km/cell at 512 |
 /// |---|---|---|---|---|
@@ -707,9 +821,14 @@ pub const DEFAULT_BASE_KM_MSL: f64 = 0.0;
 ///
 /// 18 km clears every overshooting top in the continental United States with
 /// room to spare, and stopping there rather than at 20 km spends the cells on air
-/// that has weather in it: at 128 layers, 18 km is 141 m per layer against 156 m.
+/// that has weather in it: at [`NZ_PREFERRED`]'s 32 layers, 18 km is **562 m**
+/// per layer against 625 m. The conclusion is the one it always was — the top
+/// two kilometres are worth more as resolution below than as headroom above —
+/// and only the figures moved, because the vertical is now cut to the depth the
+/// beam justifies rather than held at 128 layers.
 ///
-/// See [`DEFAULT_BASE_KM_MSL`] for why the pair lives here.
+/// See [`DEFAULT_BASE_KM_MSL`] for why the pair lives here, and [`NZ_PREFERRED`]
+/// and [`NZ_MIN`] for what decides how finely this span is cut.
 pub const DEFAULT_TOP_KM_MSL: f64 = 18.0;
 
 /// What one grid's index plane may occupy, bytes.
@@ -760,8 +879,234 @@ pub const DESKTOP_SHAPE: VoxelShape = VoxelShape {
     nz: 128,
 };
 
-/// The default shape for a device class, as a function of the class rather
-/// than of the `cfg`.
+/// The vertical this would rather have, and takes wherever it can be had
+/// without costing the horizontal.
+///
+/// # Why go finer than the beam at all
+///
+/// [`NZ_MIN`] is the floor at which a vertical cell is still *informative* —
+/// finer than the beam over 97.8% of the ring — and for a while that read like
+/// the whole answer: past the beam a finer grid adds no information, so why buy
+/// it. That is true about information and misleading about **appearance**. A
+/// grid finer than the data adds nothing to know and still changes what is
+/// drawn, because the raymarch interpolates between cells: the extra layers do
+/// not invent structure, they stop the structure that is there from being
+/// rendered as slabs.
+///
+/// And the vertical is the axis a reader is most likely to be magnifying. A
+/// side-on view at 3× vertical exaggeration draws an [`NZ_MIN`] cell — 1.125 km
+/// — as a **3.4 km** slab, so the same change that sharpens the horizontal
+/// would have coarsened, visibly, the exact view that shows the vertical off.
+/// At 32 layers the same cell draws as 1.7 km.
+///
+/// # Why it stops at 32
+///
+/// Each doubling of the vertical costs the horizontal a factor of √2 —
+/// `nx² · nz` is fixed — so the vertical has to keep earning it. Against the
+/// 0.95° beam (`r × 0.016581` deep) over an 18 km span, and taking the share of
+/// the 460.125 km ring's **area** where the grid is still finer than the data:
+///
+/// | `nz` | km/cell | finer than the beam beyond | share of the ring's area |
+/// |---|---|---|---|
+/// | 64 | 0.281 | 17.0 km | 99.86% |
+/// | **32** | **0.5625** | **33.9 km** | **99.46%** |
+/// | 24 | 0.750 | 45.2 km | 99.03% |
+/// | [`NZ_MIN`] 16 | 1.125 | 67.8 km | 97.83% |
+/// | 8 | 2.250 | 135.7 km | 91.30% |
+///
+/// The rungs below 32 each buy a real amount of ring: 8 → 16 is +6.5 points of
+/// area, 16 → 32 is +1.6. Above it they stop: **32 → 64 is +0.40 points**, four
+/// tenths of a percent of the picture, for the same √2 off every horizontal
+/// cell everywhere. That is where the vertical stops paying, so that is where
+/// this stops.
+pub const NZ_PREFERRED: usize = 32;
+
+/// The shallowest the vertical axis may be made in order to buy horizontal
+/// resolution.
+///
+/// # Derived from the beam, not chosen
+///
+/// A 0.95° beam is `r × 0.016581` deep, so a vertical cell is only telling the
+/// reader something the radar measured while it is **finer than the beam**. The
+/// question a given `nz` answers is therefore *over how much of the ring is the
+/// grid still finer than the data*, and the vertical spans
+/// [`DEFAULT_BASE_KM_MSL`]`..`[`DEFAULT_TOP_KM_MSL`] — 18 km — on every tier.
+/// [`NZ_PREFERRED`] carries the table; the two rungs that matter here are its
+/// last two.
+///
+/// **16**, because at 1.125 km the vertical is still finer than the data over
+/// 97.83% of the ring, and the next step down is where the arithmetic stops
+/// being survivable: 8.70% of the region against 2.17%. Every halving costs
+/// four times the one above it — the lost area goes as the square of the
+/// radius, which goes as the cell — so the ratio is structural and cannot pick
+/// a rung out. What picks this one out is that four times 2.17% is **a tenth of
+/// the picture** where the grid would be inventing structure between beams
+/// rather than recording it. That is the cliff, and this is the last rung above
+/// it.
+///
+/// Spending the vertical this way is what buys the horizontal. See
+/// [`shape_for_budget`] — the cell count is fixed, so every layer given up is
+/// horizontal resolution over the whole box.
+pub const NZ_MIN: usize = 16;
+
+/// What the horizontal axes are held to a multiple of, in cells.
+///
+/// # Derived from the upload path, not chosen
+///
+/// `wgpu::CommandEncoder::copy_buffer_to_texture` requires every row of the
+/// source buffer to start on a `wgpu::COPY_BYTES_PER_ROW_ALIGNMENT` — 256 byte
+/// — boundary, and the frontend's staging ring
+/// (`rustdar_frontend::volume::raymarch::staging`) is that copy: its
+/// `PlaneLayout::of` pads each row up to that boundary. The grid's texture
+/// format is four bytes a cell (`Rg16Float`: a premultiplied index and a
+/// coverage, a half float each), so the constraint on the **cell** count is
+/// `COPY_BYTES_PER_ROW_ALIGNMENT / GRID_BYTES_PER_CELL` = 256 / 4 = **64**.
+/// `the_horizontal_axis_multiple_is_the_copy_alignment_in_cells` is the
+/// frontend test that binds this number to those two, since only that crate has
+/// `wgpu` to ask.
+///
+/// The cost of ignoring it is not an error, which is what makes it worth
+/// deriving the axis around: the padding is silent and it is paid on the
+/// permanently resident staging ring. An unaligned free axis of 724 is 2896
+/// bytes a row, padded to 3072 — a **6%** overrun on every slot of the ring,
+/// for nothing.
+///
+/// `queue.write_texture` — the *other* upload path, and the one the coarse mip
+/// level still takes — repacks internally and needs none of this. That is
+/// exactly why the constraint is easy to miss: the path that does not bind is
+/// the one most of the uploads in this codebase read as taking.
+pub const HORIZONTAL_AXIS_MULTIPLE: usize = 64;
+
+/// The grid to build for the tier `shipped` names, on a device whose 3D
+/// textures may be `max_axis` on a side.
+///
+/// # What `shipped` is
+///
+/// The shape that tier's ladder **shipped**, in both of its roles at once: its
+/// cell count is the tier's memory budget, and its horizontal axis is the
+/// resolution this is not allowed to regress against. One argument rather than
+/// two so the pair cannot drift — a budget paired with the wrong baseline would
+/// be a silent quality change on one tier only.
+///
+/// # The rule
+///
+/// The cell count is what costs memory, so a grid of the same count in a
+/// different arrangement is **free on every tier** — 512 × 512 × 32 and
+/// 256 × 256 × 128 are both 8,388,608 cells, both 32 MiB of `Rg16Float`, both
+/// 1,048,576 in the coarse level below. That is what makes this safe with no
+/// memory query anywhere: nothing here can spend more than the tier already
+/// spent.
+///
+/// So, twice: **maximise the horizontal axis subject to `nx² · nz ≤` the cell
+/// budget, `nx` a multiple of [`HORIZONTAL_AXIS_MULTIPLE`], and every axis
+/// `≤ max_axis`** — once at [`NZ_PREFERRED`] and, if that does not leave the
+/// horizontal strictly finer than the tier already had, again at [`NZ_MIN`].
+/// **Prefer the smoother vertical, but never at the cost of a horizontal
+/// regression.**
+///
+/// | tier | budget | shape | horizontal | vertical | budget spent |
+/// |---|---|---|---|---|---|
+/// | [`DESKTOP_SHAPE`] | 8,388,608 | 512 × 512 × 32 | **1.797 km** | 0.5625 km | 100% |
+/// | [`MOBILE_SHAPE`] | 3,538,944 | 320 × 320 × 34 | **2.876 km** | 0.529 km | 98.4% |
+/// | [`WASM_SHAPE`] | 1,048,576 | 256 × 256 × 16 | **3.595 km** | 1.125 km | 100% |
+///
+/// (Horizontal figures over the 920.25 km box a WSR-88D's reflectivity reach
+/// earns — [`box_half_width_km`] — which is the box a 3D pane frames by
+/// default.)
+///
+/// # Why the second step exists: the web
+///
+/// The two large tiers take [`NZ_PREFERRED`] and gain on both axes at once. The
+/// web cannot. `nx² · 32 ≤ 1,048,576` caps its horizontal at 181 cells, which
+/// rounds down to **128** on the alignment — exactly the axis it already had,
+/// while the box it must now cover has grown by √2, so the "no change" is a 41%
+/// coarsening in kilometres. At [`NZ_MIN`] it reaches 256 and 3.595 km, which is
+/// a real gain. A flat 32 everywhere would have bought the desktop a sharper
+/// picture by taking one away from the platform with the least to give.
+///
+/// The comparison is against `shipped.nx` and it is **strict**: the deeper
+/// vertical is taken only where it *buys* horizontal, never where it merely
+/// costs nothing. The web is not near that boundary — it ties on cells and
+/// loses outright in kilometres — so the strictness is not what decides it.
+///
+/// # `max_axis` bounds the depth too
+///
+/// `max_texture_dimension_3d` is a limit on **every** axis of a 3D texture, not
+/// only the two that are square here, so `nz` is held to it as well. A device
+/// reporting less than the derived axis drops to what it reports and lets `nz`
+/// rise to fill the budget back up — which is what makes the step-down safe with
+/// no memory query at all, because the cell count is preserved through it. A
+/// device reporting the bare GLES 3.0 guarantee of 256 comes out at
+/// **256 × 256 × 128** on the desktop budget, which is exactly the shape that
+/// shipped: nothing regresses anywhere, and nothing is assumed about any
+/// device. Note that both steps agree there — at 256 the horizontal is pinned
+/// by the device rather than by the vertical — so the no-regression fallback is
+/// not what produces that property and cannot break it.
+///
+/// # Bounds
+///
+/// Axes are floored at 1, because a zero axis is a grid with no cells that
+/// every later check would agree with, and capped at [`MAX_AXIS`] so the result
+/// is always [`VoxelShape::is_supported`]. A `max_axis` under
+/// [`HORIZONTAL_AXIS_MULTIPLE`] leaves the horizontal unaligned rather than
+/// zero — the alignment is an efficiency, and `PlaneLayout` pads what is not
+/// aligned — and a `max_axis` under [`NZ_MIN`] gets a shallower grid rather
+/// than a refusal, because a coarse picture beats no picture and nothing else
+/// in this file can act on the difference.
+pub const fn shape_for_budget(shipped: VoxelShape, max_axis: usize) -> VoxelShape {
+    let cap = if max_axis < MAX_AXIS {
+        max_axis
+    } else {
+        MAX_AXIS
+    };
+    let budget = shipped.cells();
+    let smoother = spend_budget(budget, NZ_PREFERRED, cap);
+    if smoother.nx > shipped.nx {
+        return smoother;
+    }
+    spend_budget(budget, NZ_MIN, cap)
+}
+
+/// One arm of [`shape_for_budget`]: the widest aligned square `cell_budget`
+/// buys at `nz_floor` layers, with whatever the alignment and the cap left over
+/// put back into the vertical.
+///
+/// The order is what makes the result honest. The vertical is decided against
+/// the square the budget *and the device* actually allow, so a device that caps
+/// the horizontal spends what it saved on depth rather than leaving it unspent;
+/// the horizontal is rounded down to the alignment last, because rounding only
+/// ever removes cells and so cannot carry the result back over the budget.
+const fn spend_budget(cell_budget: usize, nz_floor: usize, cap: usize) -> VoxelShape {
+    // The widest square the budget affords at that vertical, and no wider than
+    // the device will hold.
+    let mut nx = (cell_budget / nz_floor).isqrt();
+    if nx > cap {
+        nx = cap;
+    }
+    // Down to the copy alignment, unless there is not a whole step of it to be
+    // had — a device that small is one `PlaneLayout` will be padding rows for
+    // whatever this returns.
+    if nx >= HORIZONTAL_AXIS_MULTIPLE {
+        nx -= nx % HORIZONTAL_AXIS_MULTIPLE;
+    }
+    if nx < 1 {
+        nx = 1;
+    }
+    // Everything the two steps above left behind goes into the vertical, so the
+    // budget is spent rather than merely respected.
+    let mut nz = cell_budget / (nx * nx);
+    if nz > cap {
+        nz = cap;
+    }
+    if nz < 1 {
+        nz = 1;
+    }
+    VoxelShape { nx, ny: nx, nz }
+}
+
+/// The tier a device class belongs to — its budget and its baseline, in
+/// [`shape_for_budget`]'s sense — as a function of the class rather than of the
+/// `cfg`.
 ///
 /// **Split out so both answers are reachable from a host test.** A `cfg`-gated
 /// body is invisible to every target that does not compile it, and the wasm
@@ -779,21 +1124,28 @@ const fn default_shape_for(is_wasm: bool) -> VoxelShape {
     if is_wasm { WASM_SHAPE } else { DESKTOP_SHAPE }
 }
 
-/// The shape this target builds by default.
+/// The shape this target builds by default on a device whose 3D textures may
+/// be `max_axis` on a side.
 ///
-/// wasm gets [`WASM_SHAPE`], everything else [`DESKTOP_SHAPE`].
-/// [`MOBILE_SHAPE`] is **not** reachable from here — see the module doc. A
-/// caller with a real device capability in hand should pass the shape it wants
-/// rather than start from this.
+/// wasm's budget is [`WASM_SHAPE`]'s and everything else's is
+/// [`DESKTOP_SHAPE`]'s, and [`shape_for_budget`] spends it. [`MOBILE_SHAPE`] is
+/// **not** reachable from here — see the module doc.
+///
+/// **`max_axis` is a parameter rather than a `cfg`**, and that is the whole of
+/// what makes the tier selection a capability query rather than a guess: the
+/// device's limit is a runtime fact only the frontend's adapter can report, and
+/// a fourth `#[cfg]` arm guessing at it is the exact shape of the bug that
+/// shipped a 2.4× budget overrun. A caller with no adapter in hand should pass
+/// the WebGL2 guarantee, which is what every device must allow.
 #[cfg(target_arch = "wasm32")]
-pub fn default_shape() -> VoxelShape {
-    default_shape_for(true)
+pub fn default_shape(max_axis: usize) -> VoxelShape {
+    shape_for_budget(default_shape_for(true), max_axis)
 }
 
 /// The shape this target builds by default. See the wasm arm.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn default_shape() -> VoxelShape {
-    default_shape_for(false)
+pub fn default_shape(max_axis: usize) -> VoxelShape {
+    shape_for_budget(default_shape_for(false), max_axis)
 }
 
 /// How many cells a grid has along each axis.
@@ -814,7 +1166,10 @@ pub fn default_shape() -> VoxelShape {
 /// Measured on four storm volumes — KCRP 2017-08-26 04:41Z (Harvey), KFTG
 /// 2023-06-22 03:46Z, KDMX 2022-03-05 23:23Z, KMSX 2022-06-04 20:05Z — as
 /// **reflectivity volume in km³ at or above a class cut, over the ground the
-/// two boxes share**, at [`DESKTOP_SHAPE`]. Two regimes: a mid zoom holding the
+/// two boxes share**, at the 256-cell desktop grid of the time — the ratio is
+/// what is being measured, and it is a property of the box rather than of the
+/// axis, so [`shape_for_budget`]'s finer cells move every figure below towards
+/// zero rather than changing its sign. Two regimes: a mid zoom holding the
 /// north extent and widening east to 16:9 (cells 2.083 × 1.172 km against a
 /// square box's 1.172), and a wide-open pane on the resampler's own ceiling
 /// (cells 3.200 × 1.800 km against a square box's 2.596). The figure is the
@@ -2390,10 +2745,20 @@ impl VoxelGrid {
             ny: r.u32()? as usize,
             nz: r.u32()? as usize,
         };
-        // Before `cells()`, which multiplies three untrusted numbers: with
-        // every axis at or under `MAX_AXIS` the product is at most 16.7 M and
-        // cannot overflow, and with a zero axis it would be a plane length of
+        // Before `cells()`, which multiplies three untrusted numbers, and both
+        // halves of that ordering are load-bearing. With every axis at or under
+        // `MAX_AXIS` the product cannot overflow a 32-bit `usize` — `MAX_AXIS`
+        // is *defined* as the largest axis for which that holds (1625³ =
+        // 4,291,015,625 against 4,294,967,295), so this is true by construction
+        // rather than by a figure somebody has to maintain. What a real grid
+        // carries is far under it: the widest tier is 512 × 512 × 32 = 8.4 M
+        // cells, and even a cube on that axis is 134,217,728 — a factor of 32
+        // below the ceiling. And with a zero axis it would be a plane length of
         // zero that every later check then agreed with.
+        //
+        // A large shape is not a way to make this allocate: the length check
+        // below is against a slice already in hand, so a payload claiming the
+        // ceiling has to carry the bytes for it.
         if !shape.is_supported() {
             return None;
         }

@@ -307,6 +307,18 @@ use rustdar_radar::types::KM_PER_DEGREE_LAT;
 /// comparable with the ones the old path was measured at.
 const PROBE_TEXELS: usize = 512;
 
+/// The 3D texture limit these fixtures build their grids against.
+///
+/// The grid's shape is a runtime answer now — `voxel::shape_for_budget` spends
+/// the tier's cell budget over the axes a device says it can hold — so a test
+/// that wants a grid has to name a device. This one names the least capable
+/// conforming device, the WebGL2 guarantee, for two reasons: what is being
+/// measured here is a **mapping**, which is a property of the box rather than
+/// of the cell count, and a fixture that moved with the adapter would be an IoU
+/// threshold nobody could reproduce. It is also the cheapest, which matters for
+/// a test that resamples a synthetic volume in the gate.
+const GRID_DEVICE_AXIS: usize = 256;
+
 /// The background the PPM dump draws unpainted probe texels on: the deleted
 /// `volume_floor.rs`'s `FLOOR_GROUND_RGBA`. It is a *dump* convention only —
 /// the shipped floor has no ground colour, and `floor_colour` returns
@@ -978,7 +990,7 @@ fn measure_floor_against_grid_on_a_real_volume() {
         base_km_msl: rustdar_radar::voxel::DEFAULT_BASE_KM_MSL,
         top_km_msl: rustdar_radar::voxel::DEFAULT_TOP_KM_MSL,
         product: RadarProduct::Reflectivity,
-        shape: rustdar_radar::voxel::default_shape(),
+        shape: rustdar_radar::voxel::default_shape(GRID_DEVICE_AXIS),
         values_wanted: false,
     };
     let grid = rustdar_radar::voxel::build_voxels(&scan, &request, site_lat, site_lon)
@@ -1758,7 +1770,7 @@ fn a_planted_storm_lands_on_the_floor_exactly_under_its_own_voxels() {
         base_km_msl: rustdar_radar::voxel::DEFAULT_BASE_KM_MSL,
         top_km_msl: rustdar_radar::voxel::DEFAULT_TOP_KM_MSL,
         product: RadarProduct::Reflectivity,
-        shape: rustdar_radar::voxel::default_shape(),
+        shape: rustdar_radar::voxel::default_shape(GRID_DEVICE_AXIS),
         values_wanted: false,
     };
     let grid = rustdar_radar::voxel::build_voxels(&scan, &request, site.lat, site.lon)
@@ -1930,7 +1942,7 @@ fn a_broken_mapping_costs_iou_in_the_corner_even_where_the_centre_cannot_tell() 
         base_km_msl: rustdar_radar::voxel::DEFAULT_BASE_KM_MSL,
         top_km_msl: rustdar_radar::voxel::DEFAULT_TOP_KM_MSL,
         product: RadarProduct::Reflectivity,
-        shape: rustdar_radar::voxel::default_shape(),
+        shape: rustdar_radar::voxel::default_shape(GRID_DEVICE_AXIS),
         values_wanted: false,
     };
     let grid = rustdar_radar::voxel::build_voxels(&scan, &request, site.lat, site.lon)

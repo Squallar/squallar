@@ -1011,14 +1011,26 @@ pub const MOBILE_VOLUME_GRID_CELLS: [u32; 3] = [192, 192, 96];
 /// The desktop arm. See [`WASM_VOLUME_GRID_CELLS`].
 pub const DESKTOP_VOLUME_GRID_CELLS: [u32; 3] = [256, 256, 128];
 
-/// Cells along x, y and z in the Cartesian voxel grid a 3D volume renders from.
+/// The voxel grid budget this target is held to: the **cell count** every
+/// allocation here is sized against, and the horizontal axis the grid may not
+/// regress below.
 ///
-/// Every axis is at or under 256 because that is what GLES 3.0 — and so WebGL2 —
-/// *guarantees*, which is the floor a phone browser may legitimately report. See
-/// [`WEBGL2_MAX_TEXTURE_DIMENSION_3D`]. One code path satisfying that floor was
-/// chosen over a larger desktop variant: 256 cells over a 40 km half-width is
-/// 0.31 km per cell, already finer than the 1 km cube the design was compared
-/// against.
+/// # It is a budget, not the shape that gets built
+///
+/// It was both until the grid was rebalanced. The count is what costs memory —
+/// 512 × 512 × 32 and 256 × 256 × 128 are the same 8,388,608 cells, the same
+/// 32 MiB of `Rg16Float` and the same coarse level — so how it is spent over
+/// the three axes is free, and spending it on the largest square the device
+/// will hold is a strictly better picture at the same price.
+/// `rustdar_radar::voxel::shape_for_budget` is what spends it, from the
+/// adapter's own `max_texture_dimension_3d`; [`volume_grid_shape`] is this
+/// crate's entry to it and [`VOLUME_GRID_FLOOR_SHAPE`] is what a device
+/// reporting the bare guarantee gets, which is this triple, unchanged.
+///
+/// Every axis here is at or under 256 because that is what GLES 3.0 — and so
+/// WebGL2 — *guarantees*, which is the floor a phone browser may legitimately
+/// report. See [`WEBGL2_MAX_TEXTURE_DIMENSION_3D`]. That property is now
+/// asserted where it belongs, on the floor shape rather than on the budget.
 ///
 /// The cascade shape is the one [`MAX_LOOP_FRAMES`] documents, for the reason it
 /// documents. `mobile` is emitted by *this crate's* `build.rs`, so a copy of this
@@ -1052,7 +1064,8 @@ const fn shape_of(cells: [u32; 3]) -> rustdar_radar::voxel::VoxelShape {
     }
 }
 
-/// The grid shape this target should actually **request**.
+/// The grid shape this target should actually **request** on a device whose 3D
+/// textures may be `max_axis` on a side.
 ///
 /// [`rustdar_radar::voxel::default_shape`] cannot answer this and says so: it
 /// takes one `is_wasm` bool, because `mobile` is emitted by *this* crate's
@@ -1063,13 +1076,46 @@ const fn shape_of(cells: [u32; 3]) -> rustdar_radar::voxel::VoxelShape {
 /// [`DESKTOP_SHAPE`](rustdar_radar::voxel::DESKTOP_SHAPE)'s 8 MiB — 2.4× the
 /// budget, on the class with the least memory to absorb it.
 ///
+/// `max_axis` is the **second** capability the selection needs and it is a
+/// runtime one, so it arrives as an argument: `app_state`'s
+/// `state.device.limits().max_texture_dimension_3d`, which the web arm of
+/// `device_limits` has already lifted to whatever the browser's adapter really
+/// reports. A caller with no device yet passes
+/// [`WEBGL2_MAX_TEXTURE_DIMENSION_3D`] and gets [`VOLUME_GRID_FLOOR_SHAPE`] —
+/// the shape that shipped — which is the conservative answer rather than a
+/// guess.
+///
 /// Derived from [`VOLUME_GRID_CELLS`] rather than from a fourth copy of the
 /// literals, so `the_grid_dimensions_match_the_shapes_rustdar_radar_names`
 /// keeps this tied to the shapes `rustdar-radar` names and a drift fails by
 /// name rather than by a mismatched allocation at runtime.
-pub const fn volume_grid_shape() -> rustdar_radar::voxel::VoxelShape {
-    shape_of(VOLUME_GRID_CELLS)
+pub const fn volume_grid_shape(max_axis: u32) -> rustdar_radar::voxel::VoxelShape {
+    rustdar_radar::voxel::shape_for_budget(shape_of(VOLUME_GRID_CELLS), max_axis as usize)
 }
+
+/// The grid this target builds on a device reporting exactly the guarantee —
+/// and so the only shape here that is still a compile-time constant.
+///
+/// # Why this exists rather than a const assert over the derived shape
+///
+/// The const assert below used to run over [`VOLUME_GRID_CELLS`] itself and
+/// state that the grid fits WebGL2's guaranteed 3D texture size. That was the
+/// enforcement — the wasm `cargo check` row of the gauntlet evaluates it, and a
+/// `#[test]` never can, because a test only exercises the arm its own runner
+/// was built for. Deriving the shape from the adapter would have deleted that
+/// enforcement outright, since there is no adapter at compile time.
+///
+/// So the guarantee is asserted where it is still constant: the shape a
+/// 256-reporting device gets. That is precisely what the guarantee was ever
+/// about — *can the least capable conforming browser hold what we ask for* —
+/// and it is checkable at compile time on every target. Everything above the
+/// floor is guarded at runtime instead, by
+/// `every_axis_stays_within_the_limit_the_adapter_reported`, which sweeps the
+/// limits a real adapter might report and holds each result to that device's
+/// own figure. The compile-time guarantee survives where it can and the runtime
+/// path gained its own guard, rather than the project trading one for none.
+pub const VOLUME_GRID_FLOOR_SHAPE: rustdar_radar::voxel::VoxelShape =
+    volume_grid_shape(WEBGL2_MAX_TEXTURE_DIMENSION_3D);
 
 /// Bytes in the colour lookup table that travels with a voxel grid.
 ///
@@ -1086,9 +1132,12 @@ pub const VOLUME_LUT_BYTES: usize = 256 * 4;
 /// (`app_state::device_limits`). Note the web arm of that function calls
 /// `using_resolution`, which *lifts* `max_texture_dimension_3d` to whatever the
 /// adapter reports (wgpu-types 29.0.4 `limits.rs:603-610`) — so this is a floor
-/// the grid must fit, not a ceiling it is held to. The grid above fits the
-/// unlifted floor on every target, which is the point: no runtime step-down is
-/// needed for a device that reports exactly the guarantee.
+/// the grid must fit, not a ceiling it is held to.
+///
+/// It is also the answer [`volume_grid_shape`] is given when there is no device
+/// to ask, which is what makes [`VOLUME_GRID_FLOOR_SHAPE`] a constant: a device
+/// reporting exactly the guarantee needs no step-down, because the shape it is
+/// handed is derived against that very figure.
 pub const WEBGL2_MAX_TEXTURE_DIMENSION_3D: u32 =
     wgpu::Limits::downlevel_webgl2_defaults().max_texture_dimension_3d;
 
@@ -1435,8 +1484,23 @@ const _: () = const {
     let mut axis = 0;
     while axis < VOLUME_GRID_CELLS.len() {
         assert!(VOLUME_GRID_CELLS[axis] > 0);
+        axis += 1;
+    }
+    // The guarantee, on the shape it is still a compile-time claim about. See
+    // `VOLUME_GRID_FLOOR_SHAPE`: the grid a device *actually* gets is derived
+    // from that device's own limit and is guarded at runtime, but the shape a
+    // browser reporting exactly the guarantee is handed is constant, and it is
+    // the one this assert was ever really about.
+    let floor = [
+        VOLUME_GRID_FLOOR_SHAPE.nx,
+        VOLUME_GRID_FLOOR_SHAPE.ny,
+        VOLUME_GRID_FLOOR_SHAPE.nz,
+    ];
+    let mut axis = 0;
+    while axis < floor.len() {
+        assert!(floor[axis] > 0);
         assert!(
-            VOLUME_GRID_CELLS[axis] <= WEBGL2_MAX_TEXTURE_DIMENSION_3D,
+            floor[axis] <= WEBGL2_MAX_TEXTURE_DIMENSION_3D as usize,
             "a voxel grid axis exceeds the 3D texture size WebGL2 guarantees, so \
              a phone browser reporting exactly the guarantee could not allocate \
              it - and the failure would be a validation error inside a callback, \

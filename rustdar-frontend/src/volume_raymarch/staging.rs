@@ -471,11 +471,16 @@ fn pick(ready: &[bool], next: usize) -> Option<usize> {
 /// The one thing this expresses that `write_texture` did not have to:
 /// `copy_buffer_to_texture` requires each row to start on a
 /// [`wgpu::COPY_BYTES_PER_ROW_ALIGNMENT`] boundary, where `write_texture`
-/// repacks internally to whatever the backend wants. Every shipped rung is
-/// already aligned — `DESKTOP_VOLUME_GRID_CELLS` is 256 cells wide, so 1024
-/// bytes; mobile 768; wasm32 512 — and pads by nothing at all. The padding
-/// exists for the odd extents `upload_volume_at` accepts from a test, so that
-/// they take the same path rather than a second one nobody runs.
+/// repacks internally to whatever the backend wants.
+///
+/// **Every shape that reaches this is already aligned, and that is now a
+/// derived property rather than a coincidence of three literals.** The grid's
+/// horizontal axis is rounded to `rustdar_radar::voxel::HORIZONTAL_AXIS_MULTIPLE`
+/// — 64 cells, which is this alignment divided by the format's four bytes —
+/// precisely so nothing here has to pad: the desktop grid is 512 cells wide, so
+/// 2048 bytes; mobile 320, so 1280; the web 256, so 1024. The padding exists
+/// for the odd extents `upload_volume_at` accepts from a test, so that they
+/// take the same path rather than a second one nobody runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PlaneLayout {
     /// Bytes of real texels in a row: `cells[0] * GRID_BYTES_PER_CELL`.
@@ -616,19 +621,45 @@ mod tests {
         assert_eq!(pick(&[], 0), None);
     }
 
-    /// Every shipped rung's rows are already aligned, so the ring pads nothing.
+    /// Every shape a device can be handed has aligned rows, so the ring pads
+    /// nothing.
     ///
     /// Not decoration: if a shipped shape needed padding, the staging buffer
     /// would be larger than the plane and the residency figure this module
     /// quotes would be wrong. The odd shapes beside them are the ones the
     /// padding exists for, and they are checked to actually exercise it.
+    ///
+    /// **The derived shapes as well as the budget triples**, because the
+    /// derived ones are what is actually uploaded now. This is the property
+    /// `rustdar_radar::voxel::HORIZONTAL_AXIS_MULTIPLE` exists for, seen from
+    /// the end that pays for it: the horizontal axis is rounded to 64 cells
+    /// precisely so `PlaneLayout` never has to pad a real grid, and the free
+    /// axis of 724 that the desktop budget would otherwise land on is 2896
+    /// bytes a row against a 3072-byte padded stride — a 6% overrun on every
+    /// slot of a permanently resident ring, silently.
+    /// `the_horizontal_axis_multiple_is_the_copy_alignment_in_cells` is the
+    /// other end, where the 64 is tied to `COPY_BYTES_PER_ROW_ALIGNMENT`.
     #[test]
     fn the_shipped_grid_shapes_need_no_row_padding_and_the_odd_ones_do() {
-        for cells in [
+        let budgets = [
             crate::constants::WASM_VOLUME_GRID_CELLS,
             crate::constants::MOBILE_VOLUME_GRID_CELLS,
             crate::constants::DESKTOP_VOLUME_GRID_CELLS,
-        ] {
+        ];
+        let derived = budgets.into_iter().flat_map(|budget| {
+            [256usize, 512, 704, 1024, 2048].map(|limit| {
+                let shape = rustdar_radar::voxel::shape_for_budget(
+                    rustdar_radar::voxel::VoxelShape {
+                        nx: budget[0] as usize,
+                        ny: budget[1] as usize,
+                        nz: budget[2] as usize,
+                    },
+                    limit,
+                );
+                [shape.nx as u32, shape.ny as u32, shape.nz as u32]
+            })
+        });
+        for cells in budgets.into_iter().chain(derived) {
             let layout = PlaneLayout::of(cells).expect("a shipped rung is expressible");
             assert_eq!(
                 layout.row,
