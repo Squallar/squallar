@@ -4,8 +4,15 @@ This directory is a copy of a crates.io crate that this workspace maintains
 locally. It is not our code. Everything in it is upstream's except what is
 listed under [Local changes](#local-changes) below, and keeping that list short
 and true is the whole point of the file — it is what makes the directory
-reviewable, and what makes the eventual upstream pull request a diff somebody
-can read.
+reviewable, and what lets a later upstream release be adopted by re-applying a
+delta somebody can still read.
+
+**These changes are not going upstream.** That is a decision taken 2026-08-12,
+not an oversight. The consequence is worth stating plainly: upstream will not
+carry these fixes, so this directory is not a stopgap until a release ships —
+it is where the fixed decoder lives, indefinitely. A later upstream release is
+still worth adopting for everything else it brings, and re-applying this delta
+onto it is the job the short list below exists to make possible.
 
 ## Provenance
 
@@ -113,7 +120,7 @@ weight.
 | --- | --- |
 | `LICENSE` | See above — the tarball ships none. |
 | `VENDORED.md` | This file. |
-| `src/messages/framing_tests.rs` | The framing fix's own tests, and the multi-segment payload fix's, described in full under *Changed — source* below. An in-source module rather than a `tests/` target so it travels with the fix in the upstream diff — which does mean it is a new file, shows up in `diff -rq`, and so belongs in this table and not only in that prose. |
+| `src/messages/framing_tests.rs` | The framing fix's own tests, and the multi-segment payload fix's, described in full under *Changed — source* below. An in-source module rather than a `tests/` target so it travels with the fix in any delta re-applied onto a later upstream release — which does mean it is a new file, shows up in `diff -rq`, and so belongs in this table and not only in that prose. |
 
 ### Changed — `Cargo.toml`
 
@@ -210,7 +217,7 @@ Two behaviour deltas worth stating:
   can newly lose a record.
 
 New `src/messages/framing_tests.rs`, an in-source `#[cfg(test)]` module so it
-travels with the fix in the upstream diff. Eight tests here, and two more added
+travels with the fix when this delta is re-applied onto a later release. Eight tests here, and two more added
 by the multi-segment payload fix below: the padded TDWR stream
 stays framed; every pad width from 0 to 7 stays framed; a pad of 8 — one past
 the bound — is not trusted; the unpadded stream keeps the exact offsets and
@@ -334,7 +341,7 @@ unreachable.
 **One API consequence.** That arm was the crate's only constructor of
 `Error::Decoding(String)`. The clutter filter map guard below gives the variant
 a constructor again, so the enum is not left with a dead arm — but if only the
-pointer-table change is taken upstream, note that `Error` is not
+pointer-table change survives a future re-application, note that `Error` is not
 `#[non_exhaustive]`, so a downstream `match` naming `Decoding` still compiles
 and simply cannot be reached.
 
@@ -427,7 +434,7 @@ fourteen). Upstream never notices, because it lints without
 `--all-targets` and so never compiles `cfg(test)` code under clippy. This
 workspace's CI does lint `--all-targets`, and the crate would not pass clippy
 at all. Scoping the deny to non-test builds keeps it saying what it was written
-to say — no `unwrap` in the library — and is the form to offer upstream.
+to say — no `unwrap` in the library — and is the form to keep.
 
 A comment at the site says the same thing, so nobody has to find this file
 first.
@@ -438,8 +445,10 @@ modules are **not** cfg-gated and run on every target.
 
 ## Known upstream defects deliberately left alone
 
-Recorded so that "we did not notice" is never the explanation, and so the
-upstream PR can raise them without having to rediscover them.
+Recorded so that "we did not notice" is never the explanation, and so anyone
+re-applying this delta onto a later upstream release knows what was examined
+and deliberately left. Nobody is reporting these upstream, so expect them to
+still be there.
 
 - **`tests/generate_synthetic_fixtures.rs` writes a `segment_size` no RDA
   writes.** `build_multi_segment_frames` computes it as
@@ -487,7 +496,7 @@ with the toolchain `rust-toolchain.toml` pins — which is `stable`, i.e. a
 **floating** version. rustfmt's output is version-dependent. A future stable
 release that formats any of these ~15,500 source lines differently turns the
 `fmt` CI job red on code nobody here wrote, and the fix would be a formatting
-commit across upstream source that makes the next upstream diff noisy.
+commit across upstream source that makes the next re-application noisy.
 
 If that happens, the options in preference order are: rebase the vendored copy
 onto a newer upstream release that has the fix (best — deletes this directory);
@@ -528,26 +537,27 @@ the same default rules as the rest of it.
   is not a regression in this workspace's code. Nothing gates on a threshold,
   so nothing fails.
 
-## Upstream pull request
+## Not going upstream
 
-> **TODO — not yet filed.** When it is, put the URL here and note which of the
-> changes above it carries. The framing fix, the multi-segment payload fix, the
-> four audit findings and the `cfg_attr` lint scoping are all intended for
-> upstream; the trims are not (they are local packaging). The three defects
-> under *Known upstream defects* belong in the PR description or in follow-up
-> issues.
->
-> The four audit findings are independent of the framing fix and of each other,
-> so they can go as their own commits or their own PRs — which is how they are
-> committed here. Two changes alter what an input decodes to: the clutter
-> filter map guard, and only for a declaration no `u8` could ever have held;
-> and the multi-segment payload fix, which moves two snapshots and is the one
-> to lead with, because it is the one a maintainer has real volumes to check.
+**Decided 2026-08-12: none of this is being contributed back.** No pull request
+will be filed, and the defects under *Known upstream defects* are not being
+reported as issues.
+
+This is recorded because the shape of the work here only makes sense against
+it. The changes are committed as independent, separately-titled commits; the
+tests live in an in-source module beside the code they pin; the trims are kept
+apart from the behavioural fixes. That was all done to keep a contributable
+diff, and it is worth keeping for a different reason — it is what makes the
+delta re-appliable onto a later upstream release, and auditable in the
+meantime. Read the structure that way rather than as a PR waiting to be sent.
 
 ## Removing this directory
 
-The patch is meant to be temporary. When a published nexrad-decode contains the
-fix:
+Since these fixes are not being contributed, no upstream release will contain
+them by way of this work. The directory therefore stays. The one case that
+removes it is upstream fixing the same defects independently — worth checking
+whenever the pin is bumped. If a published nexrad-decode ever does frame a TDWR
+Message 31 and read a multi-segment payload correctly:
 
 1. Delete `vendor/nexrad-decode/`.
 2. Delete `"vendor/nexrad-decode"` from `[workspace.members]`, the
