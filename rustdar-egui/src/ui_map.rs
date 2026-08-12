@@ -97,18 +97,27 @@ impl super::Gui {
 
         // Initialize tiles via MapTileState
         self.map_tiles.ensure_base_tiles(is_dark_theme, &ctx);
-        // Visible *map* panes only. `Gui::panes` because a pane remembered from a
-        // wider split must not keep label-tile fetching alive; `is_map` for the
-        // same reason and one more — a pane with no tiles has nowhere to put a
+        // Visible panes that draw ground, only. `Gui::panes` because a pane
+        // remembered from a wider split must not keep label-tile fetching alive;
+        // `draws_ground` because a pane with no tiles has nowhere to put a
         // label, so a converted pane would go on fetching a tile pyramid nothing
         // draws. Its `enabled_overlays` is left as it is, so converting back
         // restores the layer: see `Gui::any_pane_has_overlay_enabled`.
         //
-        // Read before the pane loop's `mem::take`, so the kind is the real one.
+        // **Not `is_map`.** That asks whether the pane draws the flat picture,
+        // and a 3D pane answers no while drawing this very layer onto its floor:
+        // `draw_floor_strip` runs the same `Map::show` and the same
+        // `render_pane_map_content` a plan view does, and the `CityLabels` arm
+        // in there draws through the `label_tiles` this decides. So a lone 3D
+        // pane with the layer on had a floor with no city labels on it, and
+        // `Gui::floor_tile_working_set` — which already budgets a label pyramid
+        // for exactly this pane — was budgeting for tiles nothing fetched.
+        //
+        // Read before the pane loop's `mem::take`, so the view is the real one.
         let any_city_labels = self
             .panes()
             .iter()
-            .any(|p| p.is_map() && p.is_overlay_enabled(OverlayKind::CityLabels));
+            .any(|p| p.draws_ground() && p.is_overlay_enabled(OverlayKind::CityLabels));
         if any_city_labels {
             self.map_tiles.ensure_label_tiles(is_dark_theme, &ctx);
         }
@@ -1166,7 +1175,7 @@ impl super::Gui {
     /// now, and that does not reopen anything: the agreement is a ratio of the
     /// two radii, so it holds at a TDWR's 417 km frame exactly as at 230.
     ///
-    /// # And the track is a polyline, because the cut is a great circle
+    /// # The track is a polyline, because the cut is a great circle
     ///
     /// A straight segment between the two projected endpoints is a **rhumb
     /// line**: straight in Web Mercator is constant bearing, not shortest path.
@@ -1175,15 +1184,16 @@ impl super::Gui {
     /// `tilt_curves` samples), and the two part company in the middle. Measured
     /// on a 229 km line at 41 °N — a full-range line at the latitude of the
     /// northern-tier sites — the peak separation is **894 m** running east-west
-    /// and 907 m running north-east. That is ~3.5× the 258 m ring offset above,
-    /// which has a doc block of its own, and about 2.9 px at a zoom filling the
-    /// pane. It is also the one error a user is placed to notice, because the
-    /// track is drawn over the echo the section was aimed at.
+    /// and 907 m running north-east, about 2.9 px at a zoom filling the pane.
+    /// Unifying the two spheres did nothing to this: it is a projection error,
+    /// not a radius disagreement, and it would be the same on any sphere. It is
+    /// also the one error a user is placed to notice, because the track is drawn
+    /// over the echo the section was aimed at.
     ///
     /// So the track is subdivided rather than documented. At
     /// [`SECTION_TRACK_SAMPLES`] segments the residual falls as the square of
-    /// the count — under a metre, comfortably inside the ring offset that is
-    /// already accepted — and it costs 32 projections per track per frame.
+    /// the count — under a metre, three orders of magnitude below the error it
+    /// is correcting — and it costs 32 projections per track per frame.
     ///
     /// The **rubber band is deliberately still a straight segment.** It is a
     /// preview of a gesture in progress and its endpoints are pixels on purpose
@@ -2669,8 +2679,9 @@ fn paint_armed_hint_chip(
 ///
 /// The chord error of a subdivided great circle falls as the square of the
 /// count, so 32 turns the 894 m peak measured in `draw_section_tracks` into
-/// under a metre — an order of magnitude inside the 258 m range-ring offset that
-/// module already accepts and documents.
+/// under a metre — three orders of magnitude below the error it is correcting,
+/// and far under the ~230 m one screen pixel is worth at a zoom that fits a
+/// whole 230 km track in a 1000-point pane.
 const SECTION_TRACK_SAMPLES: usize = 32;
 
 /// The screen polyline of the great circle a section is cut along.

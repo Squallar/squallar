@@ -1303,6 +1303,47 @@ impl PaneState {
         self.render_view() == rustdar_radar::types::RenderView::PlanView
     }
 
+    /// Whether this pane paints map geography through a projector *somewhere*
+    /// on screen this frame.
+    ///
+    /// The third question in the family, and the one the other two kept being
+    /// asked in place of. [`Self::kind`] asks what a pane *is*, [`Self::is_map`]
+    /// asks whether it draws the flat picture — and this asks whether the
+    /// `PaneSurface::Ground` half of the map content pass runs for it at all.
+    /// Every consumer that says "a pane with no map has
+    /// nowhere to put a geo-positioned layer" means *this*, and while a 3D view
+    /// was a pane kind with no map of its own the three answers coincided.
+    ///
+    /// They stopped coinciding when the 3D view became a render mode standing on
+    /// its own map floor. A 3D pane runs `Map::show` on an off-screen strip and
+    /// dispatches exactly the ground layers a plan view does
+    /// (`Gui::draw_floor_strip`), so it wants the tile pyramids, the fetches and
+    /// the rasterizations a plan view wants. It answers `false` to `is_map`,
+    /// which is correct about the picture and was silently wrong about all of
+    /// those.
+    ///
+    /// **A hidden floor answers `false`**, and that is the same question
+    /// `Gui::is_floor_source` and `Gui::mirror_source_rects` already ask: a
+    /// floor the user switched off is not drawn, so nothing is fetched or
+    /// rasterized for it. A cross-section pane answers `false` outright — there
+    /// is no projector anywhere in its frame.
+    ///
+    /// Carries [`Self::kind`]'s `mem::take` warning in full: a taken pane's slot
+    /// is a plan-view map, so this answers `true` for whatever the real pane
+    /// was. Read it before the take, off the value that was taken, or from
+    /// outside the egui pass.
+    pub fn draws_ground(&self) -> bool {
+        match self.render_view() {
+            rustdar_radar::types::RenderView::PlanView => true,
+            // Its own map, drawn below the frame and copied onto the box's
+            // bottom face — geography on a surface, which is all this asks.
+            rustdar_radar::types::RenderView::Volume => {
+                self.volume().is_some_and(|volume| !volume.hide_floor)
+            }
+            rustdar_radar::types::RenderView::CrossSection => false,
+        }
+    }
+
     /// This pane's render mode, if it is a map pane at all.
     pub fn map_render(&self) -> Option<MapRender> {
         self.map().map(|map| map.render)

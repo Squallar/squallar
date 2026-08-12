@@ -3061,13 +3061,25 @@ impl Gui {
     /// Used for auto-poll decisions: we should fetch data for an overlay
     /// if at least one pane wants to display it.
     ///
-    /// # Why a pane with no map does not count, while keeping its toggles
+    /// # Why a pane with nowhere to draw does not count, while keeping its toggles
     ///
     /// This and [`Self::first_pane_with_overlay_enabled`] ask "is this overlay
     /// being *drawn* anywhere?", and every overlay is a layer over map tiles,
-    /// geo-positioned against a projector a section or a volume pane does not
-    /// have. So a converted pane must not keep an overlay's auto-poll timer
+    /// geo-positioned against a projector a pane may not have. So a pane with no
+    /// ground anywhere in its frame must not keep an overlay's auto-poll timer
     /// running, or be the pane a `FetchOverlay` is attributed to.
+    ///
+    /// [`PaneState::draws_ground`], **not** `is_map`, and the difference is a
+    /// live bug rather than a nicety. A 3D pane's floor is its own map: it runs
+    /// the same `Map::show` and the same `render_pane_map_content` a plan view
+    /// does, so it draws these very layers and emits its own `RenderOverlay` for
+    /// each of them at its own bounds. Filtered on `is_map`, a **lone** 3D pane
+    /// answered no here — so nothing polled, the alerts and discussions on its
+    /// floor never refreshed as they issued and expired, and the Map floor
+    /// checkbox's hover text promised in as many words that they would.
+    ///
+    /// A pane whose floor is switched off still answers no, which is the half
+    /// that was right: there is nothing on screen to refresh.
     ///
     /// Its `enabled_overlays` is deliberately left alone rather than cleared,
     /// which is the same choice `set_kind` makes about the viewport and the tilt:
@@ -3076,25 +3088,26 @@ impl Gui {
     /// the readers keeps both properties; clearing the record would lose one.
     ///
     /// Both are called from `check_auto_polls`, at the very top of [`Self::ui`]
-    /// before any pane is `mem::take`n, so reading the kind through `self.panes`
+    /// before any pane is `mem::take`n, so reading the view through `self.panes`
     /// is safe here — see [`PaneContent`](crate::pane::PaneContent)'s module docs
     /// for why that is worth checking rather than assuming.
     pub fn any_pane_has_overlay_enabled(&self, kind: OverlayKind) -> bool {
         self.panes
             .iter()
             .take(self.pane_layout.pane_count)
-            .any(|p| p.is_map() && p.is_overlay_enabled(kind))
+            .any(|p| p.draws_ground() && p.is_overlay_enabled(kind))
     }
 
     /// Returns the index of the first pane that has the given overlay kind enabled,
     /// or `None` if no pane has it enabled.
     ///
-    /// Panes with no map are skipped; see [`Self::any_pane_has_overlay_enabled`].
+    /// Panes with no ground to draw it on are skipped; see
+    /// [`Self::any_pane_has_overlay_enabled`].
     pub fn first_pane_with_overlay_enabled(&self, kind: OverlayKind) -> Option<usize> {
         self.panes
             .iter()
             .take(self.pane_layout.pane_count)
-            .position(|p| p.is_map() && p.is_overlay_enabled(kind))
+            .position(|p| p.draws_ground() && p.is_overlay_enabled(kind))
     }
 
     /// Get the active pane (immutable).
@@ -4169,17 +4182,23 @@ impl Gui {
         }
     }
 
-    /// Whether one overlay render may serve several panes: every visible map
-    /// pane is viewport-linked *and* layer-linked, so their viewports and
-    /// layer stacks are one by construction. The per-pane successor to the
-    /// old "viewport sync and layer sync both on" grouping gate — one pane
-    /// out of either group and nothing is grouped, because the dedup key
-    /// carries no geo bounds and a shared texture would land on a pane whose
-    /// map is somewhere else.
+    /// Whether one overlay render may serve several panes: every visible pane
+    /// that draws ground is viewport-linked *and* layer-linked, so their
+    /// viewports and layer stacks are one by construction. The per-pane
+    /// successor to the old "viewport sync and layer sync both on" grouping
+    /// gate — one pane out of either group and nothing is grouped, because the
+    /// dedup key carries no geo bounds and a shared texture would land on a
+    /// pane whose map is somewhere else.
+    ///
+    /// The exemption is [`PaneState::draws_ground`] rather than `is_map`
+    /// because the panes being excused have to be the ones that never receive
+    /// one of these textures. A 3D pane does receive them — its floor asks for
+    /// them, at its own viewport's bounds — so an unlinked 3D pane excused here
+    /// is exactly the pane a shared texture would land on wrongly.
     pub fn overlay_renders_groupable(&self) -> bool {
         (0..self.visible_pane_count()).all(|idx| {
             let pane = &self.panes[idx];
-            !pane.is_map() || (pane.viewport_link && pane.layer_link)
+            !pane.draws_ground() || (pane.viewport_link && pane.layer_link)
         })
     }
 

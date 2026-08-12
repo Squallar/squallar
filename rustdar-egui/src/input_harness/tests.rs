@@ -6542,7 +6542,8 @@ fn a_non_map_pane_keeps_the_controls_that_apply_to_it_and_drops_the_rest() {
     }
 }
 
-/// 45. **A pane with no map does not keep the label-tile pyramid downloading.**
+/// 45. **A pane with no ground does not keep the label-tile pyramid
+///     downloading — and a 3D pane's floor is ground.**
 ///
 ///     City labels are raster tiles drawn *over* the base map, so a pane with
 ///     no tiles has nowhere to put one — yet its `enabled_overlays` is
@@ -6551,13 +6552,29 @@ fn a_non_map_pane_keeps_the_controls_that_apply_to_it_and_drops_the_rest() {
 ///     because it is the same shape as the overlay auto-poll gate, which is
 ///     not mild, and because the two must agree.
 ///
+///     # The 3D arm used to be on the wrong side of this
+///
+///     It read `is_map`, which is a question about the *picture*, and it was
+///     written when a 3D view was a pane kind with no map of its own. A 3D pane
+///     now stands its volume on its own map: `draw_floor_strip` runs the same
+///     `Map::show` and the same `render_pane_map_content` a plan view does, and
+///     the `CityLabels` arm in there draws whatever `label_tiles` it is handed.
+///     Handed `None`, it draws nothing — so a **lone** 3D pane with the layer on
+///     had a floor with no city names on it, while the Map floor checkbox's
+///     hover text promises them in as many words. Beside a plan-view map pane
+///     that also wanted labels it worked, which is what kept it hidden.
+///
+///     Three arms, so this is a filter and not a constant: a floor draws them, a
+///     floor switched off does not, and a cross-section pane — which has no
+///     projector anywhere in its frame — does not either.
+///
 ///     `clear_graphics_state` in the middle of each arm, because
 ///     `ensure_label_tiles` only ever *creates* the source — a harness that
 ///     had already made them would keep them and prove nothing. That is not a
 ///     contrivance either: dropping the tile sources and letting the next
 ///     frame re-make them is exactly what a suspend or a surface loss does.
 #[test]
-fn a_pane_with_no_map_stops_the_label_tiles_downloading() {
+fn only_a_pane_with_ground_keeps_the_label_tiles_downloading() {
     fn tiles_remade_after_a_reset(h: &mut InputHarness) -> bool {
         h.gui_mut().clear_graphics_state();
         assert!(
@@ -6568,24 +6585,66 @@ fn a_pane_with_no_map_stops_the_label_tiles_downloading() {
         h.gui.label_tiles_made_for_test()
     }
 
-    let mut on_a_map = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
-    on_a_map.set_overlay_on_pane(0, OverlayKind::CityLabels, true);
+    fn lone_pane_wanting_labels() -> InputHarness {
+        let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
+        h.set_overlay_on_pane(0, OverlayKind::CityLabels, true);
+        h
+    }
+
+    let mut on_a_map = lone_pane_wanting_labels();
     assert!(
         tiles_remade_after_a_reset(&mut on_a_map),
         "precondition: a map pane with city labels on must fetch label tiles"
     );
 
-    let mut converted = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
-    converted.set_overlay_on_pane(0, OverlayKind::CityLabels, true);
-    converted.make_pane_volume(0);
+    // A 3D pane, alone on screen, with a floor to draw them on.
+    let mut on_a_floor = lone_pane_wanting_labels();
+    on_a_floor.make_pane_volume(0);
     assert!(
-        converted.overlay_enabled(OverlayKind::CityLabels),
+        on_a_floor.overlay_enabled(OverlayKind::CityLabels),
         "precondition: the pane still *remembers* wanting labels, which is what \
              makes this a filter rather than a cleared flag"
     );
-
+    assert_eq!(
+        on_a_floor.gui_mut().mirror_source_rects().len(),
+        1,
+        "precondition: the pane is not even asking for a floor strip, so the \
+             labels below would have nowhere to land whatever this decides",
+    );
     assert!(
-        !tiles_remade_after_a_reset(&mut converted),
+        tiles_remade_after_a_reset(&mut on_a_floor),
+        "a lone 3D pane's floor draws the city-label layer and nothing fetched \
+             the tiles for it: `draw_floor_strip` was handed `label_tiles: \
+             None`, so the floor came up with no city names on it",
+    );
+
+    // The same pane with its floor switched off: nothing on screen to put them
+    // on, so nothing is fetched.
+    let mut floor_hidden = lone_pane_wanting_labels();
+    floor_hidden.make_pane_volume(0);
+    floor_hidden
+        .gui_mut()
+        .pane_mut(0)
+        .expect("pane 0")
+        .volume_mut()
+        .expect("a 3D pane has volume state")
+        .hide_floor = true;
+    assert!(
+        floor_hidden.gui_mut().mirror_source_rects().is_empty(),
+        "precondition: a hidden floor must not be asking for a strip",
+    );
+    assert!(
+        !tiles_remade_after_a_reset(&mut floor_hidden),
+        "a 3D pane with its floor switched off kept the label-tile pyramid \
+             downloading for a surface that is not drawn",
+    );
+
+    // And a pane with no projector anywhere in its frame, which is the half of
+    // the original filter that was always right.
+    let mut section = lone_pane_wanting_labels();
+    section.make_pane_unaimed_cross_section(0);
+    assert!(
+        !tiles_remade_after_a_reset(&mut section),
         "a pane with no map to draw labels on kept the label-tile pyramid \
              downloading"
     );

@@ -616,19 +616,35 @@ fn converting_a_pane_tears_down_its_loop_and_nothing_else() {
 }
 
 /// Overlay auto-poll and the pane a fetch is attributed to both skip panes
-/// with no map, while the panes keep their layer toggles.
+/// with no **ground**, while the panes keep their layer toggles.
 ///
 /// Both questions are "is this overlay being *drawn* anywhere?", and every
-/// overlay is a layer over map tiles positioned against a projector a non-map
-/// pane does not have — so a converted pane must not keep an auto-poll timer
-/// alive or be handed a `FetchOverlay`.
+/// overlay is a layer positioned against a projector — so a pane with no
+/// projector anywhere in its frame must not keep an auto-poll timer alive or be
+/// handed a `FetchOverlay`.
+///
+/// # A 3D pane's floor is drawn, and used not to count
+///
+/// The filter read `is_map`, which is the question about the flat picture, and
+/// it was written while a 3D view was a pane kind with no map of its own. A 3D
+/// pane's floor now runs the same `Map::show` and the same
+/// `render_pane_map_content` a plan view does, and asks for its own overlay
+/// rasters at its own bounds. So a **lone** 3D pane answered no here and
+/// nothing polled: the warnings and discussions on its floor never refreshed as
+/// they issued and expired, which the Map floor checkbox's hover text promises
+/// they do. Beside a plan-view pane wanting the same layer it worked, which is
+/// what kept it hidden.
+///
+/// A floor the user switched off still answers no — nothing is drawn, so
+/// nothing needs refreshing — and that arm is what keeps this a filter rather
+/// than "every pane counts".
 ///
 /// `enabled_overlays` is deliberately *not* cleared, which is the second half
 /// here: it is the user's remembered answer to "which layers do I want", it
 /// becomes meaningful again the moment the pane converts back, and it is the
 /// same choice `set_kind` makes about the viewport and the tilt.
 #[test]
-fn overlay_polling_skips_panes_with_no_map_but_keeps_their_toggles() {
+fn overlay_polling_skips_panes_with_no_ground_but_keeps_their_toggles() {
     use crate::pane::PaneKind;
 
     let kind = OverlayKind::CityLabels;
@@ -646,13 +662,29 @@ fn overlay_polling_skips_panes_with_no_map_but_keeps_their_toggles() {
     );
     assert_eq!(gui.first_pane_with_overlay_enabled(kind), Some(0));
 
+    // Pane 0 goes 3D. It still draws this layer — on its floor — so it is still
+    // the pane the fetch is attributed to.
     gui.pane_mut(0)
         .unwrap()
         .set_view(rustdar_radar::types::RenderView::Volume);
     assert_eq!(
         gui.first_pane_with_overlay_enabled(kind),
+        Some(0),
+        "the fetch skipped the 3D pane whose floor draws this very layer",
+    );
+    assert!(gui.any_pane_has_overlay_enabled(kind));
+
+    // Its floor switched off, it draws nothing, and the attribution moves to
+    // the map pane beside it.
+    gui.pane_mut(0)
+        .unwrap()
+        .volume_mut()
+        .expect("a 3D pane has volume state")
+        .hide_floor = true;
+    assert_eq!(
+        gui.first_pane_with_overlay_enabled(kind),
         Some(1),
-        "a fetch was attributed to a pane that cannot draw the overlay"
+        "a fetch was attributed to a pane with no surface to draw it on"
     );
     assert!(gui.any_pane_has_overlay_enabled(kind));
 
