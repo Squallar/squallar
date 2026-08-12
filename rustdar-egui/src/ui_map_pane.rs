@@ -130,6 +130,17 @@ pub(super) struct PaneRenderCtx<'a> {
     /// (`true`) or the right edge (`false`). Resolved once for the whole map
     /// panel by `ColorScaleOrientation`, so every pane agrees.
     pub horizontal_color_scale: bool,
+    /// The lowest screen y the colour-scale legend may draw on: the map's
+    /// bottom edge, less whatever the phone shell's bottom bar covered last
+    /// frame. Equal to the map's bottom edge on every width class that draws
+    /// no bar, which makes this a no-op everywhere but a phone.
+    ///
+    /// One number for the whole grid rather than a rect per pane, because the
+    /// bar it describes is one full-bleed strip across the bottom of the map;
+    /// [`clear_of_bottom_chrome`] turns it into the right answer for a pane
+    /// that sits above the strip (unchanged) and for one that runs under it
+    /// (shortened).
+    pub color_scale_floor: f32,
     pub pointer_available: bool,
     /// Rects of chrome painted over the map with no egui layer of its own.
     /// Clicks there are not map clicks. Empty since the top bar replaced the
@@ -383,7 +394,7 @@ pub(super) fn render_pane_map_content(
                     }
                     render_color_scales(
                         &painter,
-                        ui.max_rect(),
+                        clear_of_bottom_chrome(ui.max_rect(), ctx.color_scale_floor),
                         ctx.horizontal_color_scale,
                         ctx.pane,
                         ctx.overlays,
@@ -1425,6 +1436,48 @@ pub(super) fn render_color_scales(
 /// `pane::ColorScaleOrientation` — deliberately *not* recomputed from
 /// `pane_rect` here, so that every pane in the grid draws its bars on the same
 /// edge and dragging a divider cannot flip them.
+/// The part of `pane_rect` the colour-scale legend may draw in: the pane, less
+/// whatever the phone shell's bottom bar covers.
+///
+/// # The bar was painted and then covered
+///
+/// Nothing was wrong with the legend on a phone. It was laid out correctly,
+/// submitted correctly, and then hidden: the map is full-bleed to the window's
+/// bottom edge by design (`ui_shell` — "the map fills everything under the top
+/// bar and all other chrome floats over it"), the legend is painted into the
+/// map's own `Background` layer during the pane loop, and the Compact width
+/// class then draws an opaque, full-bleed bottom bar on `Order::Middle` over
+/// it. The legend's block is the bottom `SCALE_MARGIN + SCALE_BAR_WIDTH` = 36
+/// points of the pane; the bar is about 52 points tall. So on a 432×936 phone
+/// window the ramp, the value labels, the unit title, the `folds ±N` line and
+/// the range-folded swatch were all behind it, and a velocity pane rendered a
+/// picture with no legend at all.
+///
+/// The map keeps its full bleed — that is the design rule, and the picture
+/// *should* run under the bar. Only the chrome moves.
+///
+/// # Why the whole rect and not just the bar
+///
+/// Every piece of the legend is positioned off this rect's bottom edge, and
+/// two of them (the unit title, the RF swatch) hang *below* the bar in the
+/// margin. Shortening the rect moves all of them together and leaves the
+/// `bar_length < 40.0` bail to catch a pane the chrome has eaten, which is
+/// what should happen. Trimming the bar alone would have left the title and the
+/// swatch exactly where they were, still under the phone bar.
+///
+/// A pane whose bottom sits above the chrome is returned unchanged, so this is
+/// a no-op on every width class that draws no bar, and on the upper panes of a
+/// phone-width grid.
+pub(super) fn clear_of_bottom_chrome(pane_rect: egui::Rect, floor: f32) -> egui::Rect {
+    if !floor.is_finite() || floor >= pane_rect.bottom() {
+        return pane_rect;
+    }
+    egui::Rect::from_min_max(
+        pane_rect.min,
+        egui::pos2(pane_rect.right(), floor.max(pane_rect.top())),
+    )
+}
+
 pub(super) fn render_color_scale(
     painter: &egui::Painter,
     pane_rect: egui::Rect,

@@ -1058,6 +1058,29 @@ pub struct Gui {
     /// drag is running — the timeline scrubber's own shape, for the same
     /// reason: the commit happens once, on release.
     sheet_drag: Option<f32>,
+    /// How tall the phone shell's bottom bar drew **last** frame, in points, and
+    /// `0.0` on any frame that drew none — a wider width class, or the chrome
+    /// fully faded.
+    ///
+    /// # Why a frame late, and why that is the right answer
+    ///
+    /// The bar is opaque, full-bleed and drawn on `Order::Middle`, over a map
+    /// that is deliberately full-bleed under it: `ui_shell` gives the map
+    /// everything below the top bar and floats all other chrome on top. That is
+    /// the design and it stays. But the *legend* is not map — it is chrome
+    /// painted into the map's own layer during the pane loop, which runs before
+    /// `render_bottom_bar`, so it cannot ask how much of the bottom edge is
+    /// about to be covered.
+    ///
+    /// It asks what was covered last frame instead. A one-frame lag on a chrome
+    /// inset is invisible: the bar's height changes only when the width class
+    /// or the font metrics change, both of which already cost a relayout, and
+    /// the frame that changes them draws the legend at the previous inset and
+    /// every frame after it at the new one. The alternative — re-deriving the
+    /// bar's height from `BAR_ITEM_PADDING`, `BAR_ITEM_GAP` and two font
+    /// galleys before the pane loop — is a second copy of a layout egui already
+    /// does, and it would drift silently the first time an item changed.
+    phone_bar_height: f32,
     /// What the last frame's bottom bar drew. Only read by tests.
     #[cfg(test)]
     last_bottom_bar: BottomBarProbe,
@@ -1702,6 +1725,7 @@ impl Gui {
             menu_open: false,
             sheet_extent: SheetExtent::Half,
             sheet_drag: None,
+            phone_bar_height: 0.0,
             #[cfg(test)]
             last_bottom_bar: BottomBarProbe::default(),
             #[cfg(test)]
@@ -1898,6 +1922,16 @@ impl Gui {
         // transport and no bar.
         let phone_bar_top = (self.layout.width == crate::ui_layout::WidthClass::Compact)
             .then(|| self.render_bottom_bar(ctx, shell.map_rect));
+        // Measured here and read by *next* frame's pane loop, which is the only
+        // order available: the loop paints the colour-scale legend into the
+        // map's own layer, and this bar is drawn opaque over that layer
+        // afterwards. Written on every frame including the ones that draw no
+        // bar, so a resize out of Compact — or the chrome fading out, which
+        // returns the map's own bottom edge and therefore a height of zero —
+        // hands the edge straight back to the legend instead of stranding an
+        // inset nothing is covering. See the field.
+        self.phone_bar_height =
+            phone_bar_top.map_or(0.0, |top| (shell.map_rect.bottom() - top).max(0.0));
 
         // The timeline transport, after the pane loop and the appliers: every
         // `mem::take` window in the frame has closed, so it reads and writes

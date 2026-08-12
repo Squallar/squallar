@@ -1922,6 +1922,100 @@ fn a_bottom_edge_bar_annotates_under_itself_rather_than_off_the_pane() {
     }
 }
 
+/// 8h(iv). **On a phone the whole legend clears the bottom bar, rather than
+///          being painted under it.**
+///
+///          What a real 432×936 portrait window drew: the velocity picture,
+///          and no colour bar, no unit title, no `folds ±N` line and no RF
+///          swatch anywhere on it. Nothing was wrong with the legend — it was
+///          laid out and submitted correctly and then covered. The map is
+///          full-bleed to the window's bottom edge by design, the legend is
+///          painted into the map's own `Background` layer during the pane
+///          loop, and Compact then draws an opaque full-bleed bottom bar on
+///          `Order::Middle` over it. The legend's block is the bottom 36
+///          points of the pane; the bar is about 52.
+///
+///          Every horizontal-orientation test before this one drove a screen
+///          at least 900 points wide — portrait, so a bottom-edge bar, but far
+///          too wide to be Compact, so no phone bar was ever drawn over it.
+///          That is the whole reason a legend invisible on every actual phone
+///          passed every test that looked at it, and it is why this one asserts
+///          the width class rather than assuming it.
+#[test]
+fn a_phones_colour_scale_clears_the_bottom_bar_that_was_hiding_it() {
+    let phone = egui::vec2(432.0, 936.0);
+    let h = velocity_pane_on(phone, "KTLX", Some(DECLARED_NYQUIST_MS));
+    let pane = h.pane_rects()[0];
+
+    let bar = h.bottom_bar().rect;
+    assert!(
+        bar.is_finite() && bar.height() > 0.0,
+        "precondition: a 432\u{d7}936 window must be Compact and draw the phone \
+         bottom bar — without it this test proves nothing; got {bar:?}",
+    );
+    let strips = h.color_scale_strips(pane);
+    assert!(
+        strips.0 > 0,
+        "precondition: a portrait panel draws a bottom-edge colour bar, got \
+         {strips:?}",
+    );
+
+    // The ramp itself: 20 points across, ≤4 along, the shape
+    // `color_scale_strips` counts by.
+    let ramp: Vec<egui::Rect> = h
+        .painted_rects()
+        .iter()
+        .filter(|r| pane.contains(r.center()))
+        .filter(|r| (r.height() - 20.0).abs() < 0.5 && r.width() <= 4.0)
+        .copied()
+        .collect();
+    assert!(!ramp.is_empty(), "precondition: the ramp must be painted");
+
+    for strip in &ramp {
+        assert!(
+            strip.bottom() <= bar.top() + 0.5,
+            "a ramp strip at {strip:?} runs under the bottom bar {bar:?}, where \
+             nothing on it can be read",
+        );
+    }
+
+    // And the captions and the key, which hang in the margin *below* the bar
+    // and were the furthest under it: the unit title, the fold line, the RF
+    // swatch's label and the value ticks.
+    let legend_text: Vec<(egui::Rect, String)> = h
+        .painted_text_rects()
+        .into_iter()
+        .filter(|(rect, _)| pane.contains(rect.center()))
+        .filter(|(_, text)| {
+            text == "mph"
+                || text == "RF"
+                || text.starts_with("folds")
+                || text.parse::<i32>().is_ok()
+        })
+        .collect();
+    assert!(
+        legend_text.iter().any(|(_, t)| t == "mph"),
+        "precondition: the unit title must be painted; got {legend_text:?}",
+    );
+    assert!(
+        legend_text.iter().any(|(_, t)| t.starts_with("folds")),
+        "precondition: the fold line must be painted; got {legend_text:?}",
+    );
+    for (rect, text) in &legend_text {
+        assert!(
+            rect.bottom() <= bar.top() + 0.5,
+            "{text:?} at {rect:?} is drawn under the bottom bar {bar:?}",
+        );
+    }
+
+    for marker in fold_markers_painted(&h) {
+        assert!(
+            marker.bottom() <= bar.top() + 0.5,
+            "a fold marker at {marker:?} is drawn under the bottom bar {bar:?}",
+        );
+    }
+}
+
 /// 8h(iii). **Every unit title is drawn inside the pane it labels.**
 ///
 ///          The painter is clipped to the pane, so a title that does not fit

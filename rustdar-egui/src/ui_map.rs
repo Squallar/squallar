@@ -159,6 +159,17 @@ impl super::Gui {
                 // `ColorScaleOrientation`.
                 let horizontal_color_scale = self.color_scale_orientation.resolve(panel_rect);
 
+                // And one floor for the whole grid, on the same footing: the
+                // phone shell's bottom bar is a single full-bleed strip across
+                // the bottom of this panel, so how much of the bottom edge is
+                // unavailable to a legend is a property of the panel, not of a
+                // pane. `Gui::phone_bar_height` is last frame's measurement and
+                // zero on every width class that draws no bar — see the field
+                // for why a frame late is the only order available and why it
+                // does not show. `pane_render::clear_of_bottom_chrome` turns
+                // this into each pane's answer.
+                let color_scale_floor = panel_rect.bottom() - self.phone_bar_height;
+
                 self.detect_active_pane_click(ui.ctx(), panel_rect);
 
                 // Snapshot viewport state before rendering for sync
@@ -574,6 +585,7 @@ impl super::Gui {
                                             // and the chrome over it.
                                             surfaces: pane_render::PaneSurfaces::GroundAndGlass,
                                             horizontal_color_scale,
+                                            color_scale_floor,
                                             pointer_available,
                                             excluded_rects: excluded_rects.to_vec(),
                                             long_press_pos: pointer.long_press_pos,
@@ -652,7 +664,7 @@ impl super::Gui {
                             // how they come to disagree.
                             pane_render::render_color_scale(
                                 child_ui.painter(),
-                                pane_rect,
+                                pane_render::clear_of_bottom_chrome(pane_rect, color_scale_floor),
                                 horizontal_color_scale,
                                 &pane,
                                 &self.preferences,
@@ -719,6 +731,7 @@ impl super::Gui {
                                         .copied()
                                         .unwrap_or(0),
                                     horizontal_color_scale,
+                                    color_scale_floor,
                                     user_location,
                                     user_heading,
                                     user_fix: user_fix.clone(),
@@ -763,7 +776,7 @@ impl super::Gui {
                             // with a few lines below, so the two cannot
                             // disagree about which edge that is.
                             let chrome_rect = pane_render::color_scale_free_rect(
-                                pane_rect,
+                                pane_render::clear_of_bottom_chrome(pane_rect, color_scale_floor),
                                 horizontal_color_scale,
                                 &pane,
                                 &self.overlays,
@@ -811,7 +824,7 @@ impl super::Gui {
                             self.draw_volume_glass(
                                 &child_ui,
                                 pane_idx,
-                                pane_rect,
+                                pane_render::clear_of_bottom_chrome(pane_rect, color_scale_floor),
                                 horizontal_color_scale,
                                 &pane,
                             );
@@ -1437,6 +1450,7 @@ impl super::Gui {
             label_tiles,
             tile_zoom_bias,
             horizontal_color_scale,
+            color_scale_floor,
             user_location,
             user_heading,
             user_fix,
@@ -1506,6 +1520,7 @@ impl super::Gui {
                     // by `draw_volume_glass`, on the pane's own rect.
                     surfaces: pane_render::PaneSurfaces::GroundOnly,
                     horizontal_color_scale,
+                    color_scale_floor,
                     pointer_available: false,
                     excluded_rects: Vec::new(),
                     long_press_pos: None,
@@ -1620,6 +1635,10 @@ struct FloorStripCtx<'a> {
     label_tiles: &'a mut Option<crate::tile_source::HttpsTiles>,
     tile_zoom_bias: u8,
     horizontal_color_scale: bool,
+    /// See [`pane_render::PaneRenderCtx::color_scale_floor`]. Carried through
+    /// the floor strip only so the `PaneRenderCtx` it builds is complete; the
+    /// strip itself is `GroundOnly` and paints no legend.
+    color_scale_floor: f32,
     user_location: Option<(f64, f64)>,
     user_heading: Option<f32>,
     user_fix: Option<rustdar_gps::GpsFix>,
