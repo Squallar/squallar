@@ -267,17 +267,27 @@ async fn the_live_station_list_places_the_network_in_metres() {
         .expect("api.weather.gov/radar/stations");
     assert!(placed.len() > 150, "got {}", placed.len());
 
-    // Against the seed, which was read out of the volumes themselves: median
-    // 1.5 m, maximum 187 m, nothing past a kilometre.
+    // Against a position that came out of the radar's own volume: median
+    // 1.5 m, maximum 187 m over the network, nothing past a kilometre.
+    //
+    // There is no compiled-in seed left to compare against, so the comparand
+    // is this crate's own test fixture, whose rows are volume-stated. It is
+    // *installed here* rather than assumed: an `--ignored` run selects this
+    // test alone, so no sibling's `install` has run and the process table
+    // would otherwise be empty.
+    crate::sites::fixture::install();
     let ktlx = placed.get("KTLX").expect("KTLX is a station");
-    let seed = crate::sites::get_radar_site("KTLX").expect("KTLX is a seed row");
+    let stated = crate::sites::get_radar_site("KTLX").expect("the fixture places KTLX");
     let metres = crate::sites::distance_km(
         crate::site_position::degrees_from_micro(ktlx.lat_udeg),
         crate::site_position::degrees_from_micro(ktlx.lon_udeg),
-        seed.lat,
-        seed.lon,
+        stated.lat,
+        stated.lon,
     ) * 1000.0;
-    assert!(metres < 1000.0, "KTLX is {metres:.0} m from its seeded row");
+    assert!(
+        metres < 1000.0,
+        "KTLX is {metres:.0} m from where its own volume puts it"
+    );
 }
 
 /// The union, end to end, against both live endpoints — the one place the

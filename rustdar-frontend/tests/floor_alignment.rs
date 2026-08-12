@@ -76,7 +76,7 @@
 //! | variable | required | default | meaning |
 //! |---|---|---|---|
 //! | `VOL` | yes | — | Uncompressed NEXRAD Level II archive file. |
-//! | `SITE` | no | first four characters of `VOL`'s name | Radar ICAO. |
+//! | `SITE` | no | the identifier the volume's own radials carry | Radar ICAO. |
 //! | `HALF_KM` | no | the app's default box | Box half-width, km. |
 //! | `THRESH` | no | `15.0` | dBZ cut for the grid's echo mask. |
 //! | `OUT` | no | — | Prefix; writes `_floor.ppm`, `_grid.pgm`, `_overlay.ppm`. |
@@ -92,7 +92,8 @@
 //! | the same, per-radial wedge widths | ±230 km, 2048 px | 0.5776 | (0, 0) texels |
 //! | the same, extent from the sweep | ±458 km, 2048 px | 0.6789 | (−1, +2) texels |
 //! | the same, side from the extent | ±458 km, 4096 px | 0.6883 | (−1, +2) texels |
-//! | the same, gates on the ground | **±458 km, 4096 px** | **0.6882** | (−1, +1) texels |
+//! | the same, gates on the ground | ±458 km, 4096 px | 0.6882 | (−1, +1) texels |
+//! | the same, box square inside the reach | **±458 km, 4096 px** | **0.6601** | (−1, +1) texels |
 //!
 //! The first two are the same measurement to within the mask criterion — the
 //! old one asked "does this texel differ from the ground colour", this one asks
@@ -138,6 +139,28 @@
 //! closer to where the grid puts the same echo. That is the right direction
 //! and it is *one texel*, so read it as consistent rather than as evidence.
 //!
+//! **The seventh row is the same picture measured through a coarser probe, and
+//! it is not a registration change.** `box_half_width_km` now returns the
+//! largest square that fits inside the volume's reach, so this volume's default
+//! box is ±325.3 km where the six rows above were taken at ±230 km. The probe
+//! lattice is a fixed [`PROBE_TEXELS`]² over whatever the box footprint is, so
+//! a box 1.41× wider is sampled at 1.27 km/texel instead of 0.90, and both
+//! masks lose about half their texels to it (floor 36 461 → 19 973, grid
+//! 29 252 → 15 284). A mask's boundary is one texel wide either way, so a
+//! coarser texel puts proportionally more of each mask on its own boundary and
+//! IoU falls: 0.6882 → 0.6601. What did *not* move is the registration — the
+//! best translation is (−1, +1) texels in both, the flips still fail by two
+//! orders of magnitude (0.1296 / 0.0004 / 0.0004 against 0.6601) and the
+//! centroid delta closes to +8.5/−4.6 texels. Read this row as the instrument
+//! reporting on a wider box, not as the mapping having drifted.
+//!
+//! It is also the first row taken since the compiled-in site table was deleted,
+//! and the six above it were the last measurement anyone could take: the run
+//! panicked on `get_radar_site("KDMX")` from the moment the table went, so the
+//! box-sizing change landed with nothing able to measure it. The site now comes
+//! out of the volume — see `live_volume::site_of` — which is what makes a row
+//! like this one reachable again for any radar.
+//!
 //! The reason it is so small is that this instrument is dominated by tilts
 //! where `cos e` is nothing. KDMX's mask is mostly its 0.5° surveillance cut,
 //! where the correction is 0.08 px; the tilts where it is worth 18 px paint a
@@ -145,31 +168,33 @@
 //! move**, and there is no TDWR in this instrument's corpus.
 //!
 //! **The mapping table still does not discriminate on this volume, and neither
-//! the resolution nor the `cos e` asymmetry was why.** Whole-box now: honest
-//! 0.6882, trapezoid 0.6901, linear-v 0.6933 — the two deliberate
-//! perturbations score
-//! *above* the exact mapping, by +0.0016 and +0.0053 where at 2048 px they
-//! scored above it by +0.0008 and +0.0049. Doubling the resolution moved those
-//! margins by under 0.001 and did not change their sign, which disposes of the
-//! explanation the 2048 row carried (that halving the uv rate sank two
-//! second-order errors under the mask noise). Measured directly on the
-//! synthetic fixture — the same tree, the same field, only the side changed —
-//! resolution barely moves this instrument at all: the corner falls are
-//! 0.2366 / 0.1610 at 2048 px against 0.2406 / 0.1648 at 4096.
+//! the resolution nor the `cos e` asymmetry was why.** Whole-box on the ±325.3
+//! km box: honest 0.6601, trapezoid 0.6649, linear-v 0.6603 — the two
+//! deliberate perturbations score *above* the exact mapping, by +0.0048 and
+//! +0.0002. They did the same at ±230 km on both raster sides: 0.6882 /
+//! 0.6901 / 0.6933 at 4096 px, and +0.0008 / +0.0049 at 2048 px. Three
+//! resolutions and two box sizes have now moved those margins by under 0.006
+//! and never changed their sign, which disposes of the explanation the 2048 row
+//! carried (that halving the uv rate sank two second-order errors under the
+//! mask noise). Measured directly on the synthetic fixture — the same tree, the
+//! same field, only the side changed — resolution barely moves this instrument
+//! at all: the corner falls are 0.2366 / 0.1610 at 2048 px against 0.2406 /
+//! 0.1648 at 4096.
 //!
 //! What is left is the volume. This day's echo is one broad mass in the
-//! south-west — 8 440 of the box's 29 252 grid texels are in that one eighth,
-//! and the other three corners hold 0, 0 and 4 — and the honest mapping
-//! already carries a residual against it that has nothing to do with the
-//! mapping: the grid's mask is a **column max** through the whole box while
-//! the raster's is one tilt's plan view, so the two masks differ in area by a
-//! quarter (36 461 against 29 252). That was previously attributed in part to
-//! the raster omitting `cos e`; it applies it now and the areas did not move,
-//! so the difference is the column max and nothing else. A second-order
-//! perturbation of a few kilometres inside a contiguous echo mass costs almost
-//! no overlap, and one that happens to nudge the floor mask along that
-//! residual *buys* some. Only `no cos(lat)` — first order, 1.34× at this
-//! latitude — still falls clear (0.4634).
+//! south-west — 380 of the box's 15 284 grid texels are in that one eighth at
+//! this probe pitch, and the other three corners hold 0, 0 and 4 — and the
+//! honest mapping already carries a residual against it that has nothing to do
+//! with the mapping: the grid's mask is a **column max** through the whole box
+//! while the raster's is one tilt's plan view, so the two masks differ in area
+//! by a third (19 973 against 15 284; 36 461 against 29 252 at ±230 km). That
+//! was previously attributed in part to the raster omitting `cos e`; it applies
+//! it now and the areas did not move, so the difference is the column max and
+//! nothing else. A second-order perturbation of a few kilometres inside a
+//! contiguous echo mass costs almost no overlap, and one that happens to nudge
+//! the floor mask along that residual *buys* some. Only `no cos(lat)` — first
+//! order, 1.34× at this latitude — still falls clear (0.3738, and 0.4634 at
+//! ±230 km).
 //!
 //! So this table reports registration and coverage on a real volume, and the
 //! discrimination that is *asserted* rather than reported lives in
@@ -203,37 +228,13 @@
 
 use rustdar_radar::types::{ImageBounds, RadarProduct};
 
-// ── The volume (the recipe `volume_real_mask.rs` documents) ──────────────────
+// ── The volume, and the radar it places ──────────────────────────────────────
 
-/// Decode a whole Level II archive file into a `Scan` through
-/// `rustdar_radar::chunks::decode_chunk` — the only bytes-to-`Scan` route in
-/// this crate's dependency set; see `volume_real_mask.rs` for why not
-/// `nexrad_data::volume::File::scan`.
-fn scan_from_archive(path: &std::path::Path) -> nexrad_model::data::Scan {
-    let bytes =
-        std::fs::read(path).unwrap_or_else(|e| panic!("reading VOL {}: {e}", path.display()));
-    assert!(
-        !bytes.starts_with(&[0x1f, 0x8b]),
-        "{} is gzipped; gunzip it first (see volume_real_mask.rs)",
-        path.display(),
-    );
-    let name = path
-        .file_name()
-        .and_then(std::ffi::OsStr::to_str)
-        .unwrap_or("volume");
-    let contents = rustdar_radar::chunks::decode_chunk(name, &bytes)
-        .unwrap_or_else(|e| panic!("decoding {}: {e}", path.display()));
-    let coverage_pattern = contents
-        .coverage_pattern
-        .unwrap_or_else(|| panic!("{} carries no message 5", path.display()));
-    let sweeps = nexrad_model::data::Sweep::from_radials(contents.radials);
-    assert!(
-        !sweeps.is_empty(),
-        "{} decoded to no sweeps",
-        path.display()
-    );
-    nexrad_model::data::Scan::new(coverage_pattern, sweeps)
-}
+/// The volume reader and the site it learns, shared with the other two live
+/// instruments in this directory. See `live_volume/mod.rs` for why the site
+/// comes out of the volume rather than out of a lookup.
+mod live_volume;
+use live_volume::{scan_from_archive, site_of};
 
 // ── The mirror, and the shader's own conversion into it ──────────────────────
 
@@ -866,19 +867,6 @@ fn print_mapping_table(mirror: &Mirror, geo: &BoxGeo, grid_mask: &Mask, regions:
 #[ignore = "reads a Level II volume from VOL; run with --ignored --nocapture"]
 fn measure_floor_against_grid_on_a_real_volume() {
     let vol = std::path::PathBuf::from(std::env::var("VOL").expect("set VOL"));
-    let icao = std::env::var("SITE").unwrap_or_else(|_| {
-        vol.file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .map(|n| n.chars().take(4).collect())
-            .expect("SITE, or a VOL file name starting with the ICAO")
-    });
-    install_radars();
-    let site = rustdar_radar::sites::get_radar_site(&icao).unwrap_or_else(|| {
-        panic!(
-            "{icao} is not a site this process knows; it places only KMPX and \
-             KTLX, and the binary carries no others"
-        )
-    });
     // `None` without `HALF_KM`, which is what a pane with no picked region
     // sends: `build_voxels` sizes the box from the volume's own reach.
     let half_km: Option<f64> = std::env::var("HALF_KM")
@@ -889,11 +877,16 @@ fn measure_floor_against_grid_on_a_real_volume() {
         .map(|s| s.parse().expect("THRESH must be a number"))
         .unwrap_or(15.0);
 
+    // Decoded before the site is asked for, and that order is the point: the
+    // volume states where its own radar is, so this instrument places the
+    // radar it is about to measure instead of looking it up in a table nothing
+    // filled. `install_radars` below is for the fixture tests only.
     let scan = scan_from_archive(&vol);
+    let (icao, site_lat, site_lon) = site_of(&scan, &vol);
 
     // The grid, exactly as `handle_prepare_volume` requests the default box.
     let request = rustdar_radar::voxel::VoxelRequest {
-        centre: (site.lat, site.lon),
+        centre: (site_lat, site_lon),
         half_width_km: half_km,
         base_km_msl: rustdar_radar::voxel::DEFAULT_BASE_KM_MSL,
         top_km_msl: rustdar_radar::voxel::DEFAULT_TOP_KM_MSL,
@@ -901,7 +894,7 @@ fn measure_floor_against_grid_on_a_real_volume() {
         shape: rustdar_radar::voxel::default_shape(),
         values_wanted: false,
     };
-    let grid = rustdar_radar::voxel::build_voxels(&scan, &request, site.lat, site.lon)
+    let grid = rustdar_radar::voxel::build_voxels(&scan, &request, site_lat, site_lon)
         .expect("a buildable grid");
 
     // The mirror's stand-in: the 2D pane's own raster, rendered the way the
@@ -914,14 +907,14 @@ fn measure_floor_against_grid_on_a_real_volume() {
         &scan,
         elevation,
         RadarProduct::Reflectivity,
-        site.lat,
-        site.lon,
+        site_lat,
+        site_lon,
         None,
         None,
     )
     .expect("a renderable base tilt");
     let (image, raster_side, extent_km) = pane_raster(&input).expect("a rendered base tilt");
-    let mirror = Mirror::from_pane_raster(image, raster_side, site.lat, site.lon, extent_km);
+    let mirror = Mirror::from_pane_raster(image, raster_side, site_lat, site_lon, extent_km);
     let geo = BoxGeo::from_grid(&grid);
 
     let side = PROBE_TEXELS;
@@ -934,6 +927,8 @@ fn measure_floor_against_grid_on_a_real_volume() {
     let shape = grid.shape();
     let km_per_texel = (x1 - x0) / side as f64;
     println!("volume: {}", vol.display());
+    // The position is the volume's own, not a table's — see `live_volume`.
+    println!("site: {icao} at {site_lat:.5}, {site_lon:.5}, as this volume states it");
     println!(
         "box: x {:.1}..{:.1} km, y {:.1}..{:.1} km ({:.3} km/texel), grid {}x{}x{}",
         x0, x1, y0, y1, km_per_texel, shape.nx, shape.ny, shape.nz,
@@ -993,8 +988,13 @@ fn measure_floor_against_grid_on_a_real_volume() {
     // `no cos(lat)` — which stretches the sampled ground outward by `1/cos φ`,
     // 1.34× at KDMX — drags *more* echo into the square and can score **above**
     // the honest mapping there while losing badly over the whole box. Measured
-    // on KDMX 2025-03-14: whole box 0.5777 honest against 0.4989 broken, far SW
-    // corner 0.5009 honest against 0.6326 broken. That is a property of scoring
+    // on KDMX 2025-03-14 at the ±230 km box: whole box 0.5777 honest against
+    // 0.4989 broken, far SW corner 0.5009 honest against 0.6326 broken. It does
+    // not reproduce at the ±325.3 km box the same volume gets now — 0.7204
+    // honest against 0.1683 there, because the wider square no longer saturates
+    // — which is the point: whether the corner column is fair depends on the
+    // volume and the box, so it is never the thing to conclude from. That is a
+    // property of scoring
     // a lopsided sub-region, not a defect in the mapping, and it is why the
     // discrimination is *asserted* against the synthetic fixture in
     // `a_broken_mapping_costs_iou_in_the_corner_even_where_the_centre_cannot_tell`,
@@ -1195,7 +1195,8 @@ fn pane_raster(input: &rustdar_radar::render_input::RenderInput) -> Option<(Vec<
     Some((image, side, extent_km))
 }
 
-/// The two radars this file measures against, placed once.
+/// The two radars **the fixture tests** in this file measure against, placed
+/// once.
 ///
 /// `rustdar-radar` carries no list of the network — see
 /// [`SiteTable`](rustdar_radar::sites::SiteTable) — so a test binary that
@@ -1207,6 +1208,14 @@ fn pane_raster(input: &rustdar_radar::render_input::RenderInput) -> Option<(Vec<
 /// Its own copy rather than the library's `crate::test_sites`, because an
 /// integration test is a separate crate and cannot reach a `#[cfg(test)]`
 /// module inside the one it is testing.
+///
+/// **Not what places the site for
+/// [`measure_floor_against_grid_on_a_real_volume`].** That one holds a volume,
+/// and a volume says where its own radar is — so it learns `VOL`'s site rather
+/// than looking it up here, and works on any radar's volume instead of on the
+/// two written down below. See `live_volume::site_of`. A fixture test has no
+/// volume to learn from and a synthetic grid it builds itself, which is what
+/// this list is for.
 ///
 /// The positions are load-bearing here in a way they are not elsewhere: the
 /// point of `the_boxs_site_position_lands_on_the_mirrors_site_pixel` is that

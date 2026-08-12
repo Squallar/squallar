@@ -24,7 +24,7 @@
 //! | variable | required | default | meaning |
 //! |---|---|---|---|
 //! | `VOL` | yes | — | Uncompressed NEXRAD Level II archive file. |
-//! | `SITE` | no | file name's first four chars | Radar ICAO. |
+//! | `SITE` | no | the identifier the volume's own radials carry | Radar ICAO. Its **position** always comes from the volume. |
 //! | `CENTRE_LAT` / `CENTRE_LON` | yes | — | Region centre, degrees. |
 //! | `HALF_KM` | no | `75` | Region half-width, km. |
 //! | `YAW`/`PITCH`/`DIST`/`EXAG` | no | `225/25/2.5/3` | Orbit camera. |
@@ -47,6 +47,12 @@ use rustdar_frontend::volume::uniform::VolumeUniform;
 use rustdar_radar::types::RadarProduct;
 use rustdar_radar::voxel::{DESKTOP_SHAPE, VoxelGrid, VoxelRequest, build_voxels};
 
+/// The volume reader and the site it learns, shared with the other two live
+/// instruments in this directory. See `live_volume/mod.rs` for why the site
+/// comes out of the volume rather than out of a lookup.
+mod live_volume;
+use live_volume::{scan_from_archive, site_of};
+
 /// Timed render passes per configuration. The reported figure is the mean;
 /// the minimum is printed beside it as the "nothing else was scheduled" bound.
 const TIMED_FRAMES: usize = 30;
@@ -60,7 +66,7 @@ const WARMUP_FRAMES: usize = 5;
 fn measure_the_raymarch_cost_on_a_real_volume() {
     let volume_path = std::path::PathBuf::from(required("VOL"));
     let scan = scan_from_archive(&volume_path);
-    let (_site, site_lat, site_lon) = site_of(&volume_path);
+    let (_site, site_lat, site_lon) = site_of(&scan, &volume_path);
 
     let request = VoxelRequest {
         centre: (parsed("CENTRE_LAT"), parsed("CENTRE_LON")),
@@ -258,50 +264,6 @@ fn timed_passes(
     let mean = samples_ms.iter().sum::<f64>() / samples_ms.len() as f64;
     let min = samples_ms.iter().cloned().fold(f64::MAX, f64::min);
     (mean, min)
-}
-
-// ── The volume, copied from tests/volume_real_mask.rs ───────────────────────
-
-/// Decode a whole Level II archive file into a `Scan`. See
-/// `volume_real_mask.rs` for why this goes through `decode_chunk`.
-fn scan_from_archive(path: &std::path::Path) -> nexrad_model::data::Scan {
-    let bytes =
-        std::fs::read(path).unwrap_or_else(|e| panic!("reading VOL {}: {e}", path.display()));
-    assert!(
-        !bytes.starts_with(&[0x1f, 0x8b]),
-        "{} is gzipped; gunzip it first",
-        path.display(),
-    );
-    let name = path
-        .file_name()
-        .and_then(std::ffi::OsStr::to_str)
-        .unwrap_or("volume");
-    let contents = rustdar_radar::chunks::decode_chunk(name, &bytes)
-        .unwrap_or_else(|e| panic!("decoding {}: {e}", path.display()));
-    let coverage_pattern = contents
-        .coverage_pattern
-        .unwrap_or_else(|| panic!("{} carries no message 5", path.display()));
-    let sweeps = nexrad_model::data::Sweep::from_radials(contents.radials);
-    assert!(
-        !sweeps.is_empty(),
-        "{} decoded to no sweeps",
-        path.display()
-    );
-    nexrad_model::data::Scan::new(coverage_pattern, sweeps)
-}
-
-/// The radar's ICAO and position: `SITE`, or the file name's first four chars.
-fn site_of(path: &std::path::Path) -> (String, f64, f64) {
-    let name = std::env::var("SITE").ok().unwrap_or_else(|| {
-        path.file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .filter(|name| name.len() >= 4)
-            .map(|name| name[..4].to_ascii_uppercase())
-            .unwrap_or_else(|| panic!("cannot read an ICAO off {}; set SITE", path.display()))
-    });
-    let site = rustdar_radar::sites::get_radar_site(&name)
-        .unwrap_or_else(|| panic!("{name} is not in rustdar_radar::sites; set SITE"));
-    (name, site.lat, site.lon)
 }
 
 /// The box's true physical extent in kilometres.

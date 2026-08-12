@@ -28,10 +28,26 @@ const SITE: &str = "KTLX";
 const PRODUCT: RadarProduct = RadarProduct::Reflectivity;
 const TILT: f32 = 0.5;
 
+/// The row every loop below is keyed to, built here rather than read out of
+/// the process-wide table.
+///
+/// `rustdar-radar` carries no list of the network, so that table holds
+/// whatever some *other* test in this binary happened to resolve — and nothing
+/// in this file resolves anything, because nothing in it builds an
+/// `InputHarness`, which is where this crate's tests place their radars.
+/// Reading the table therefore made every test below pass or fail on the order
+/// the harness scheduled them in: `cargo test -p rustdar-egui --lib -- --exact`
+/// on any one of them found an empty table and panicked here.
+///
+/// Nothing below reads the position. What these tests need is a row named
+/// `KTLX`, and a literal is the honest way to have one.
 fn site() -> RadarSite {
-    rustdar_radar::sites::get_radar_site(SITE)
-        .expect("KTLX is a real radar")
-        .clone()
+    RadarSite {
+        name: SITE,
+        lat: 35.33306,
+        lon: -97.2775,
+        heights: None,
+    }
 }
 
 fn ts(minute: u32) -> NaiveDateTime {

@@ -284,6 +284,23 @@ pub struct ChunkContents {
     /// Empty for a Message 1 chunk: the legacy message declares no Nyquist
     /// velocity at all, and that is an absence, not a decode failure.
     pub declared_nyquist: crate::nyquist::DeclaredNyquist,
+    /// Where the radar says it is, off the first Message 31's Volume Data
+    /// Block — the same four fields [`crate::scan`]'s archive walk reads, and
+    /// the same "first radial wins".
+    ///
+    /// Read here for the same reason the Nyquist velocity is: here is the last
+    /// place it exists. `into_radial` builds a `nexrad_model::data::Radial`,
+    /// which has no site on it, so a chunk that has been turned into radials
+    /// has forgotten where it was collected — and this is a position the radar
+    /// itself states, which is the one source [`crate::sites`] ranks above
+    /// every other.
+    ///
+    /// The identifier comes off the Message 31 header rather than off a volume
+    /// header, because an intermediate chunk has no volume header at all.
+    ///
+    /// `None` for a Message 1 chunk, which carries no Volume Data Block, and
+    /// for a start chunk that carries only message 5.
+    pub site: Option<nexrad_model::meta::Site>,
 }
 
 /// Decode one chunk's bytes.
@@ -345,6 +362,21 @@ fn ingest_record(name: &str, record: volume::Record<'_>, out: &mut ChunkContents
     for message in record.messages().map_err(decode)? {
         match message.into_contents() {
             MessageContents::DigitalRadarData(m) => {
+                // First radial of the chunk wins, matching `crate::scan`'s
+                // archive walk. The position is restated on every radial and
+                // does not move within a volume, so any of them would do; the
+                // first is the one the archive path picks.
+                if out.site.is_none()
+                    && let Some(volume) = m.volume_data_block()
+                {
+                    out.site = Some(nexrad_model::meta::Site::new(
+                        *m.header().radar_identifier_raw(),
+                        volume.inner().latitude_raw(),
+                        volume.inner().longitude_raw(),
+                        volume.inner().site_height_raw(),
+                        volume.inner().tower_height_raw(),
+                    ));
+                }
                 // Before `into_radial`, which is where the number is lost: the
                 // model type has no field for it. First radial of a cut wins,
                 // which `declare` enforces; within a sweep the PRF is constant.
@@ -847,6 +879,11 @@ pub struct VolumeAssembler {
     /// Every cut's declared Nyquist velocity, accumulated across the chunks as
     /// they arrive. See [`Self::declared_nyquist`].
     declared_nyquist: crate::nyquist::DeclaredNyquist,
+    /// Where the radar said it was, off the first chunk that carried a Volume
+    /// Data Block. Goes onto [`Self::snapshot`]'s `Scan`, which is what lets a
+    /// chunk-fed pane place itself from its own data — see
+    /// [`ChunkContents::site`].
+    reported_site: Option<nexrad_model::meta::Site>,
 }
 
 impl VolumeAssembler {
@@ -866,6 +903,7 @@ impl VolumeAssembler {
             closed: false,
             cached: None,
             declared_nyquist: crate::nyquist::DeclaredNyquist::empty(),
+            reported_site: None,
         }
     }
 
@@ -929,6 +967,18 @@ impl VolumeAssembler {
         // so a stale volume's numbers cannot leak into this one's table.
         for (elevation_number, ms) in contents.declared_nyquist.iter() {
             self.declared_nyquist.declare(elevation_number, ms);
+        }
+
+        // First chunk that states one wins, as the archive walk's fold does.
+        // The snapshot already handed out does not carry it, so it is dropped:
+        // the position is on the volume the caller is about to ask for again,
+        // and a `Scan` that says where its radar is must not go on being served
+        // from a cache built before anything knew.
+        if self.reported_site.is_none()
+            && let Some(site) = contents.site
+        {
+            self.reported_site = Some(site);
+            self.cached = None;
         }
 
         let mut touched: Vec<u8> = Vec::new();
@@ -1212,6 +1262,14 @@ impl VolumeAssembler {
     /// build one per *rendered* completion, not one per poll, and use
     /// [`IngestOutcome::sealed`] to tell whether the seal was even for a tilt
     /// anything is showing.
+    ///
+    /// **Carries the site** whenever a chunk stated one, which every Message 31
+    /// chunk does. That is what makes a chunk-fed pane place itself the way an
+    /// archive-fed one does: [`crate::types::ScanInfo::from_scan`] reads
+    /// `Scan::site()` first of the three sources it ranks, so a live feed for a
+    /// radar this install has never opened lands on that radar's own position
+    /// instead of on whatever the catalogue could say about it. A Message 1
+    /// volume states none and the `Scan` then carries none.
     pub fn snapshot(&mut self) -> std::sync::Arc<nexrad_model::data::Scan> {
         if let Some(cached) = &self.cached {
             return std::sync::Arc::clone(cached);
@@ -1228,7 +1286,10 @@ impl VolumeAssembler {
             .coverage_pattern
             .clone()
             .unwrap_or_else(|| placeholder_coverage_pattern(0));
-        let scan = std::sync::Arc::new(nexrad_model::data::Scan::new(vcp, sweeps));
+        let scan = std::sync::Arc::new(match self.reported_site.clone() {
+            Some(site) => nexrad_model::data::Scan::with_site(site, vcp, sweeps),
+            None => nexrad_model::data::Scan::new(vcp, sweeps),
+        });
         self.cached = Some(std::sync::Arc::clone(&scan));
         scan
     }

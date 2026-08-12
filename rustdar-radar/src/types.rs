@@ -435,11 +435,11 @@ impl ScanInfo {
     ///    corrected across restarts, and what lets the map centre correctly on
     ///    a site opened before but not yet re-downloaded this session.
     ///
-    /// 3. **[`crate::sites::radars()`]**, the compiled-in snapshot. Still the
-    ///    answer for a pre-2010 `AR2V0001` volume, which is Message 1
-    ///    throughout and carries no Volume Data Block to read, and for a
-    ///    chunk-fed `Scan`, which is assembled by `crate::chunks` through
-    ///    `Scan::new` and has no site on it by construction.
+    /// 3. **[`crate::sites::radars()`]**, whatever this process has resolved.
+    ///    Still the answer for a pre-2010 `AR2V0001` volume, which is Message 1
+    ///    throughout and carries no Volume Data Block to read — from either
+    ///    source, since a chunk-fed `Scan` reads the same block through
+    ///    [`crate::chunks::ChunkContents::site`] and reaches rung 1 with it.
     ///
     /// A site none of the three can place gets
     /// [`SitePositionSource::Unknown`] and a placeholder row. See

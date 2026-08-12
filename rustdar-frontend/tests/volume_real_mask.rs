@@ -20,7 +20,7 @@
 //! | variable | required | default | meaning |
 //! |---|---|---|---|
 //! | `VOL` | yes | — | Path to an uncompressed NEXRAD Level II archive file (`AR2V…`). |
-//! | `SITE` | no | first four characters of `VOL`'s file name | ICAO of the radar, looked up in `rustdar_radar::sites`. |
+//! | `SITE` | no | the identifier the volume's own radials carry | ICAO the radar is filed under. Its **position** always comes from the volume. |
 //! | `CENTRE_LAT` | yes | — | Region centre latitude, degrees. |
 //! | `CENTRE_LON` | yes | — | Region centre longitude, degrees. |
 //! | `HALF_KM` | no | `80.0` | Region half-width, km. `build_voxels` clamps to [10, 332.34]. |
@@ -137,6 +137,12 @@ use rustdar_frontend::volume::uniform::VolumeUniform;
 use rustdar_radar::types::RadarProduct;
 use rustdar_radar::voxel::{DESKTOP_SHAPE, VoxelGrid, VoxelRequest, build_voxels_with_motion};
 
+/// The volume reader and the site it learns, shared with the other two live
+/// instruments in this directory. See `live_volume/mod.rs` for why the site
+/// comes out of the volume rather than out of a lookup.
+mod live_volume;
+use live_volume::{scan_from_archive, site_of};
+
 /// Build a real volume, render it twice, and write a mask, a picture and the
 /// numbers behind both.
 ///
@@ -152,7 +158,7 @@ fn render_a_real_volume_mask() {
 
     let volume_path = std::path::PathBuf::from(required("VOL"));
     let scan = scan_from_archive(&volume_path);
-    let (site_name, site_lat, site_lon) = site_of(&volume_path);
+    let (site_name, site_lat, site_lon) = site_of(&scan, &volume_path);
 
     let product = product_from_env();
     let request = VoxelRequest {
@@ -558,7 +564,7 @@ fn render_a_real_volume_mask() {
 fn measure_boundary_honesty_and_smoothness() {
     let volume_path = std::path::PathBuf::from(required("VOL"));
     let scan = scan_from_archive(&volume_path);
-    let (site_name, site_lat, site_lon) = site_of(&volume_path);
+    let (site_name, site_lat, site_lon) = site_of(&scan, &volume_path);
 
     let product = product_from_env();
     let request = VoxelRequest {
@@ -780,69 +786,6 @@ fn silhouette_roughness(pixels: &[[u8; 4]], size: [u32; 2]) -> (f64, u64, u64) {
         perimeter as f64 / (area as f64).sqrt()
     };
     (roughness, area, perimeter)
-}
-
-// ── The volume ───────────────────────────────────────────────────────────────
-
-/// Decode a whole Level II archive file into a `Scan`.
-///
-/// **Not** `nexrad_data::volume::File::scan`, which is what
-/// `rustdar-radar/examples/render_product.rs` uses: `nexrad-data` is
-/// deliberately not a dependency of `rustdar-frontend` (its manifest says so in
-/// as many words), so the only route from bytes to a `Scan` this crate's
-/// dependency set offers is `rustdar_radar::chunks::decode_chunk` — which
-/// dispatches on the `AR2` magic and walks exactly the same records — plus
-/// `nexrad_model`'s own `Sweep::from_radials`. That pair is what `File::scan`
-/// does internally, minus the `Site` block, which `build_voxels` does not read.
-fn scan_from_archive(path: &std::path::Path) -> nexrad_model::data::Scan {
-    let bytes =
-        std::fs::read(path).unwrap_or_else(|e| panic!("reading VOL {}: {e}", path.display()));
-    assert!(
-        !bytes.starts_with(&[0x1f, 0x8b]),
-        "{} is gzipped. Level II reaches this crate through nexrad-data's \
-         bzip2-per-record framing and nothing in rustdar-frontend's dependency \
-         set can gunzip a whole file; run `gunzip` on it first.",
-        path.display(),
-    );
-    let name = path
-        .file_name()
-        .and_then(std::ffi::OsStr::to_str)
-        .unwrap_or("volume");
-    let contents = rustdar_radar::chunks::decode_chunk(name, &bytes)
-        .unwrap_or_else(|e| panic!("decoding {}: {e}", path.display()));
-    let coverage_pattern = contents.coverage_pattern.unwrap_or_else(|| {
-        panic!(
-            "{} carries no message 5, so there is no tilt ladder and \
-             VolumeSampler would refuse it",
-            path.display(),
-        )
-    });
-    let sweeps = nexrad_model::data::Sweep::from_radials(contents.radials);
-    assert!(
-        !sweeps.is_empty(),
-        "{} decoded to no sweeps",
-        path.display()
-    );
-    nexrad_model::data::Scan::new(coverage_pattern, sweeps)
-}
-
-/// The radar's ICAO and position: `SITE`, or the file name's first four
-/// characters.
-///
-/// `build_voxels`' `lat`/`lon` are the **radar's**, not the region centre's —
-/// the whole grid is expressed as kilometres from the site — so getting this
-/// from the region centre instead would silently move every voxel.
-fn site_of(path: &std::path::Path) -> (String, f64, f64) {
-    let name = std::env::var("SITE").ok().unwrap_or_else(|| {
-        path.file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .filter(|name| name.len() >= 4)
-            .map(|name| name[..4].to_ascii_uppercase())
-            .unwrap_or_else(|| panic!("cannot read an ICAO off {}; set SITE", path.display()))
-    });
-    let site = rustdar_radar::sites::get_radar_site(&name)
-        .unwrap_or_else(|| panic!("{name} is not in rustdar_radar::sites; set SITE"));
-    (name, site.lat, site.lon)
 }
 
 /// The box's true physical extent in kilometres, exactly as

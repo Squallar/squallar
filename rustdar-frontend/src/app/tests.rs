@@ -2703,7 +2703,13 @@ fn a_position_a_volume_taught_survives_a_restart() {
     use rustdar_radar::site_position::SitePositionSource;
 
     let store = std::rc::Rc::new(MemoryConfigStore::default());
-    let table = rustdar_radar::sites::get_radar_site("KTLX").expect("in the table");
+    // Before the read, not merely before the app: `headless` installs the
+    // fixture, and it is not called until further down. Without this the read
+    // below found whatever a *sibling* test's `headless` had left in the
+    // process table, so the test passed in a full run and panicked under
+    // `--exact`.
+    crate::test_sites::install();
+    let table = rustdar_radar::sites::get_radar_site("KTLX").expect("the fixture places KTLX");
     // A quarter of a degree from the row: far enough that resolving to the
     // wrong one is unmistakable, and in the direction a re-survey would move.
     let stated_lat = (table.lat + 0.25) as f32;

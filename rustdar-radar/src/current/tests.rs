@@ -479,13 +479,30 @@ async fn live_substrate_costs_are_measured() {
     use std::time::Instant;
 
     let site = "KTLX";
-    let radar = crate::sites::get_radar_site(site).expect("a real site");
     let now = chrono::Utc::now().naive_utc();
     let crate::scan::DecodedScan {
         scan,
         declared_nyquist,
     } = crate::scan::get_scan(site, now).await.expect("a volume");
     println!("declared Nyquist velocities: {:?}", declared_nyquist);
+
+    // The downloaded volume states where its own radar is, so this places it
+    // from the same bytes it is about to measure. Looking it up first would
+    // have been a lookup into an empty table — this crate carries no list of
+    // the network — and would have tied the instrument to whichever radars
+    // some fixture happened to name. `site` above can be any of them.
+    let position = scan
+        .site()
+        .and_then(crate::site_position::SitePosition::from_volume)
+        .unwrap_or_else(|| {
+            panic!(
+                "the volume for {site} states no position, and this instrument \
+                 has no other way to place it"
+            )
+        });
+    let radar = crate::sites::resolve([(site, crate::sites::SiteFix::Learned(position))])
+        .get(site)
+        .expect("the row the resolve above just placed");
 
     let gate_bytes: usize = scan
         .sweeps()

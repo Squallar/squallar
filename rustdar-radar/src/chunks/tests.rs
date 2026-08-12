@@ -505,6 +505,53 @@ fn the_assembled_golden_volume_reproduces_the_pinned_digest() {
     );
 }
 
+/// A chunk-fed volume places its own radar.
+///
+/// Every Message 31 carries a Volume Data Block, including the ones the
+/// real-time feed publishes, and until [`ChunkContents::site`] existed the
+/// position in it was decoded and dropped: the snapshot went out through
+/// `Scan::new` with no site on it, so `ScanInfo::from_scan` skipped its first
+/// rung and a live feed for a radar this install had never opened fell back to
+/// whatever the catalogue could say about it. Now the first chunk that states
+/// a position puts it on every snapshot, and `from_scan` reaches
+/// [`SitePositionSource::Volume`] with it — from an **empty** site table,
+/// which is what a fresh install has.
+///
+/// The two fixtures land on chunks 2 and 3, both of which carry radials: the
+/// claim is that the first chunk to *state* a position wins, not that the
+/// start chunk is special. The start chunk carries message 5 and no radials
+/// and states nothing.
+#[test]
+fn a_chunk_fed_snapshot_carries_the_position_its_chunks_stated() {
+    let stated = nexrad_model::meta::Site::new(*b"KTLX", 35.33306, -97.2775, 370, 20);
+    let mut chunks = golden_chunks();
+    chunks[2].2.site = Some(stated.clone());
+    chunks[3].2.site = Some(nexrad_model::meta::Site::new(*b"KTLX", 0.5, 0.5, 1, 1));
+
+    let mut a = assemble(chunks);
+    let scan = a.snapshot();
+    assert_eq!(
+        scan.site(),
+        Some(&stated),
+        "the snapshot must carry the first position its chunks stated"
+    );
+
+    let info = crate::types::ScanInfo::from_scan(&scan, "KTLX", volume_time(), None);
+    assert_eq!(
+        info.site_source,
+        crate::site_position::SitePositionSource::Volume,
+        "a chunk-fed scan that states its position must place itself from it",
+    );
+    // Against `from_volume`'s own answer rather than against the `f32` literals
+    // above: the rounding to micro-degrees happens there and once, and pinning
+    // the decimals here would be pinning that conversion a second time.
+    assert_eq!(
+        info.site_position,
+        crate::site_position::SitePosition::from_volume(&stated),
+        "the position on the ScanInfo must be the one the chunk stated",
+    );
+}
+
 /// Out-of-order delivery is the premise of the whole module. Fails for
 /// `Sweep::from_radials`, which groups by consecutive runs and would emit a
 /// sweep per fragment.
@@ -1956,6 +2003,21 @@ async fn live_a_start_chunk_decodes_and_carries_the_coverage_pattern() {
         assert!(
             !contents.radials.is_empty(),
             "an intermediate chunk decoded to no radials"
+        );
+        // The bucket's own answer to "does a headerless chunk still say where
+        // its radar is?" — the fixture-based
+        // `a_chunk_fed_snapshot_carries_the_position_its_chunks_stated` cannot
+        // ask it, because it hands `ChunkContents` its site instead of
+        // decoding one. An intermediate chunk has no volume header at all, so
+        // the identifier here can only have come off the Message 31 itself.
+        let site = contents
+            .site
+            .expect("an intermediate chunk's Message 31s state a position");
+        println!("{} states {site}", mid.name());
+        assert_eq!(site.identifier(), b"KTLX");
+        assert!(
+            crate::site_position::SitePosition::from_volume(&site).is_some(),
+            "the position the feed states is not a place a radar is: {site}",
         );
     }
 }
