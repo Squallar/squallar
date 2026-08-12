@@ -334,7 +334,23 @@ pub(super) struct SiteListOutcome {
 /// caption says so rather than showing a bare `0 shown - 0 sites`, which reads
 /// as a broken filter. It resolves itself within a second of the catalogue
 /// landing — see `App::poll_site_catalogue`.
-pub(super) fn site_list_ui(ui: &mut egui::Ui, query: &str, current: &str) -> SiteListOutcome {
+///
+/// # And the *nearly* empty list is a real state too
+///
+/// The one this list could not previously express, and the one that made a
+/// regression invisible for a release: rows exist, but they are the radars this
+/// install has decoded rather than the network. Counting them produced
+/// `2 shown - 2 sites`, which is exactly what a two-radar network would say —
+/// so a user whose catalogue had not been applied saw a confident, wrong
+/// answer instead of a list still filling in. `catalogue_pending` is the
+/// caller's answer to "is this the network yet", and it is not derivable from
+/// the table.
+pub(super) fn site_list_ui(
+    ui: &mut egui::Ui,
+    query: &str,
+    current: &str,
+    catalogue_pending: bool,
+) -> SiteListOutcome {
     // One read of the resolved table, reused for the rows and for every count.
     // Read separately they could answer for two different tables, and the
     // caption would then be counting a list it is not standing beside.
@@ -367,6 +383,11 @@ pub(super) fn site_list_ui(ui: &mut egui::Ui, query: &str, current: &str) -> Sit
         // Not "0 sites": nothing has told this binary that a radar exists yet,
         // which is a different thing from a filter that matched nothing.
         "Finding radars...".to_owned()
+    } else if catalogue_pending {
+        // Deliberately states no total. The rows here are what this install
+        // decoded, and a total drawn from them is a claim about the network
+        // that nothing has made yet.
+        format!("{} shown - still finding the network", shown.len())
     } else if unplaced.is_empty() {
         format!(
             "{} shown - {} sites ({} NEXRAD + {} TDWR)",
@@ -964,7 +985,7 @@ impl super::Gui {
                         .hint_text("Search radar sites"),
                 );
                 let query = self.site_query.clone();
-                let outcome = site_list_ui(ui, &query, current);
+                let outcome = site_list_ui(ui, &query, current, self.catalogue_pending);
                 #[cfg(test)]
                 {
                     self.last_pill_popover = Some(PillPopoverProbe {

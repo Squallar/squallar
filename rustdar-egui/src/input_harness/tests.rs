@@ -9794,6 +9794,48 @@ fn the_site_search_narrows_the_list_and_a_row_click_switches_the_site() {
     );
 }
 
+/// **A site list that is not the network yet does not state a total.**
+///
+/// The honesty half of the returning-user regression. A user whose catalogue
+/// had not been applied saw `2 shown - 2 sites (2 NEXRAD + 0 TDWR)`: a total,
+/// a split and a confidence indistinguishable from a two-radar network. The
+/// list cannot work this out — two rows learned off two volumes look exactly
+/// like a two-radar network from the table alone — so the caption is told, and
+/// while it is pending it counts only what it is showing.
+///
+/// The complaint this answers was "only KLOT appears", which the app had no
+/// way of contradicting and every appearance of confirming.
+#[test]
+fn a_site_list_still_short_of_the_network_states_no_total() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.open_pane_props();
+
+    // The ordinary state first, so the difference is the flag and not the
+    // fixture: a settled list names its total and splits it by kind.
+    let settled = h.inspector().site_caption;
+    let total = rustdar_radar::sites::radars().len() + rustdar_radar::sites::unplaced().len();
+    assert!(
+        settled.contains(&format!("{total} sites")),
+        "precondition: a settled list states its total; drew {settled:?}",
+    );
+
+    h.set_catalogue_pending(true);
+    let pending = h.inspector().site_caption;
+    assert!(
+        pending.starts_with(&format!("{total} shown")),
+        "it still says what it is showing; drew {pending:?}",
+    );
+    assert!(
+        !pending.contains("sites") && !pending.contains("NEXRAD"),
+        "but it must claim no total and no split — that is the claim about \
+         the network nothing has made yet; drew {pending:?}",
+    );
+    assert!(
+        pending.contains("still finding the network"),
+        "and it must say why; drew {pending:?}",
+    );
+}
+
 /// 70. **An unlinked pane is excluded from shared time — the loop fan-out
 ///     and the sync pass's time pair — and the Pane-properties sync section
 ///     mirrors the popover: the same five rows, its time checkbox reflecting

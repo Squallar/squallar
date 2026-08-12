@@ -16,15 +16,24 @@
 //! A network fetch cannot meet that. So it does not try: the cache is read
 //! synchronously in `App::new`, beside the learned positions and ahead of any
 //! frame, and *that* is what resolves the table. The fetch runs detached
-//! afterwards, writes the cache, and is applied on the **next** launch. There
-//! is no path by which a response landing mid-session moves anything a user is
-//! looking at, which is why the fetch has no deadline and no bearing on
-//! startup: it can take a minute, or never finish, and the app is identical.
+//! afterwards, writes the cache, and is applied on the **next** launch, which
+//! is why it has no deadline and no bearing on startup: it can take a minute,
+//! or never finish, and the app is identical.
 //!
-//! One consequence stated plainly: a fresh install's first launch runs on the
-//! seed alone, and its second launch has the network. That is the cost of the
-//! 1:1 rule and it is the right way round — a first launch has no session to
-//! be consistent with, and every launch after it does.
+//! # The one exception, and what makes it safe
+//!
+//! A launch that read *no* catalogue applies the first one it fetches in that
+//! same session — `App::catalogue_pending` and
+//! `App::adopt_the_first_catalogue`. Without it a launch with nothing cached
+//! shows a site list of only the radars this install has decoded, and the
+//! network appears a launch later; on the web, where a reload is the relaunch
+//! nobody thinks to perform, that read as "there is one radar".
+//!
+//! It does not weaken the rule above. Every row present before that first
+//! catalogue came from a learned position, `SiteFix::Learned` outranks
+//! `Network`, and `sites::extended` settles rank before it builds a row — so
+//! the first catalogue can only *add* rows. Nothing a user is looking at
+//! moves. Every catalogue after it takes the next-launch path.
 //!
 //! # Its own key, written synchronously
 //!
@@ -64,9 +73,9 @@ const MAX_CATALOGUE_SITES: usize = 800;
 ///
 /// **Called before the first volume is decoded and before the first frame** —
 /// see the module note. An unreadable or implausible blob is logged and
-/// dropped rather than propagated: the cost is one session on the seed, which
-/// is where the app was before any of this existed, and the fetch will replace
-/// it.
+/// dropped rather than propagated, and an empty result is not a degraded mode:
+/// it is what arms `App::catalogue_pending`, so this session adopts the
+/// catalogue it fetches rather than waiting for the next launch.
 pub fn load(store: Option<&dyn ConfigStore>) -> SiteCatalogue {
     let Some(raw) = store.and_then(|store| store.load(SITE_CATALOGUE_KEY)) else {
         return SiteCatalogue::default();
@@ -100,7 +109,11 @@ pub fn load(store: Option<&dyn ConfigStore>) -> SiteCatalogue {
 /// Synchronous rather than deferred to the autosave tick, for the reason in the
 /// module note. A failed write is logged and dropped — a full `localStorage`
 /// must not stop the map from working, and the cost of losing it is one more
-/// launch on the seed.
+/// launch that starts without the network.
+///
+/// The return value says nothing about whether the caller should *use* the
+/// catalogue: it did once, and a store that could not be written then discarded
+/// a catalogue already in hand. See `App::poll_site_catalogue`.
 pub fn store_if_changed(
     store: Option<&dyn ConfigStore>,
     cached: &SiteCatalogue,
@@ -126,10 +139,10 @@ pub fn store_if_changed(
         log::warn!("could not persist the fetched site catalogue: {e}");
         return false;
     }
-    log::info!(
-        "site catalogue cached: {} radars, applied on the next launch",
-        fetched.len(),
-    );
+    // Says only what this function did. It used to add "applied on the next
+    // launch", which the launch that adopts its first catalogue contradicts on
+    // the very next line of the log.
+    log::info!("site catalogue cached: {} radars", fetched.len());
     true
 }
 

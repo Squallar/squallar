@@ -523,7 +523,12 @@ impl super::Gui {
             #[cfg(not(test))]
             let _ = search;
 
-            let outcome = super::pills::site_list_ui(ui, &self.site_query, &pane.site);
+            let outcome = super::pills::site_list_ui(
+                ui,
+                &self.site_query,
+                &pane.site,
+                self.catalogue_pending,
+            );
             #[cfg(test)]
             {
                 probe.site_caption = outcome.caption.clone();

@@ -420,6 +420,14 @@ impl InputHarness {
         self.warm_up();
     }
 
+    /// State that the site list is still short of the network, as `App::new`
+    /// and `App::adopt_the_first_catalogue` do. See
+    /// [`Gui::set_catalogue_pending`](crate::Gui::set_catalogue_pending).
+    pub(crate) fn set_catalogue_pending(&mut self, pending: bool) {
+        self.gui.set_catalogue_pending(pending);
+        self.warm_up();
+    }
+
     /// Report host safe-area insets, as the Android side channel does.
     ///
     /// `egui-winit` fills `RawInput::safe_area_insets` only under

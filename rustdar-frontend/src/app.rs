@@ -424,22 +424,56 @@ pub struct App {
     /// so a site the user has actually settled on is never moved out from under
     /// them, however far they later travel.
     site_is_provisional: bool,
-    /// Whether this launch started knowing no radars, and is still waiting for
-    /// the fetch that would tell it about some.
+    /// Whether the live table has never had a network catalogue in it, and is
+    /// still waiting for the fetch that would put one there.
     ///
-    /// True on a fresh install and nowhere else: no cached catalogue, nothing
-    /// learned from a volume, and no stored configuration naming a site. The
-    /// binary carries no table to fall back on — see
-    /// [`rustdar_radar::sites::SiteTable`] — so until the fetch lands there is
-    /// no site list, no marker, and nothing the timezone hint could resolve
-    /// against.
+    /// True whenever the cached catalogue was empty at startup — which is a
+    /// question about *this install's knowledge of the network*, not about
+    /// whether the user is new. It is what lets [`App::poll_site_catalogue`]
+    /// apply that first catalogue **in this session** rather than on the next
+    /// launch.
     ///
-    /// It is what lets [`App::poll_site_catalogue`] apply that first catalogue
-    /// **in this session** rather than on the next launch. The next-launch rule
-    /// exists so a marker cannot move under a user who is already looking at
-    /// it; when the table is empty there is no marker and nothing to move. Once
-    /// this is spent it is never set again, so every later catalogue takes the
-    /// ordinary path.
+    /// # Why it is not "this is a fresh install"
+    ///
+    /// It used to be `!restored && table.rows().is_empty()`, and both halves
+    /// were wrong for the same population. A returning user has a stored
+    /// config, so `restored` is true; and if they have ever opened a radar, the
+    /// position learned from that volume places one row, so the table is not
+    /// empty. Neither conjunct holds, the catalogue was filed for next launch,
+    /// and the session ran with the two radars its learned positions could
+    /// place while 203 sat in the cache. Measured in headless Chromium: `site
+    /// catalogue cached: 203 radars` with no in-session apply, and the full
+    /// list one reload later.
+    ///
+    /// Since every browser session that has ever run this app is exactly that
+    /// state after an upgrade from a build with no catalogue, "is the install
+    /// new" was never the question. "Can the table answer yet" is.
+    ///
+    /// # Applying it mid-session still cannot move anything
+    ///
+    /// That is what the next-launch rule protects, and it survives: the rows
+    /// present before the first catalogue lands are the ones learned positions
+    /// placed, and [`rustdar_radar::sites::SiteFix::Learned`] outranks
+    /// `Network`, so `extended` never applies a fetched position to a row a
+    /// learned one claims. The first catalogue can therefore only *add* rows —
+    /// there is no marker it can move and no height datum it can change.
+    ///
+    /// Once this is spent it is never set again, so every later catalogue takes
+    /// the ordinary next-launch path.
+    catalogue_pending: bool,
+    /// Whether this launch had no site of its own to open on, and is still
+    /// waiting for a catalogue to run the timezone hint against.
+    ///
+    /// The other half of what [`App::catalogue_pending`] used to be, kept
+    /// separate because it answers a different question: not "can the table
+    /// answer yet" but "did the user bring a site with them". A returning user
+    /// has one and must never be moved off it; a first-run user has none, and
+    /// at startup there was nothing for the hint to resolve against.
+    ///
+    /// Fusing the two is what let a returning user's saved site suppress the
+    /// catalogue, and — the mirror image, on Android, where `App::new` runs
+    /// before there is a store to read — would have let a catalogue landing
+    /// mid-session move a returning user off the site they had chosen.
     site_hint_pending: bool,
     /// The voxel grids 3D panes are holding, refcounted by the volume they were
     /// built from.
@@ -815,20 +849,32 @@ impl App {
         let table =
             rustdar_radar::sites::resolve(site_positions.fixes().chain(site_catalogue.fixes()));
         // The exception, and the one state the deleted seed used to make
-        // impossible: this install knows no radars at all. Nothing was cached,
-        // nothing was learned, and the binary carries no list — so there is no
-        // site list to show, no marker to draw and nothing for the timezone
-        // hint to have resolved against a moment ago.
+        // impossible: nothing outside this binary has yet said which radars
+        // exist. Whatever the table holds came from volumes this install
+        // decoded — at most a handful of rows — so the site list is not a list
+        // of the network and must not be presented as one until the fetch
+        // lands.
         //
-        // Recorded here rather than re-derived later because it has to be read
-        // *before* the first frame: a table that fills in mid-session is only
-        // safe when it was empty when the frame was drawn, and by the time the
-        // catalogue lands the table is no longer empty to ask.
+        // Asked of the *catalogue* and not of the table, because the table
+        // conflates two sources: a returning user's learned positions place a
+        // row or two, which made `table.rows().is_empty()` false while the
+        // network was still entirely unknown. Recorded here rather than
+        // re-derived later because by the time the catalogue lands the
+        // catalogue is no longer empty to ask.
+        let catalogue_pending = site_catalogue.is_empty();
+        // And separately: whether this launch has a site of its own to open on.
+        // A returning user does, and a catalogue landing mid-session must not
+        // move them off it; a first run does not, and at startup there was
+        // nothing for the hint to resolve against.
         let site_hint_pending = !restored && table.rows().is_empty();
-        if site_hint_pending {
+        // So the picker can say the list is short of the network. It cannot
+        // work this out for itself: two rows learned off two volumes look
+        // exactly like a two-radar network from the table alone.
+        gui.set_catalogue_pending(catalogue_pending);
+        if catalogue_pending {
             log::info!(
-                "no radars are known yet; the site list is empty until the \
-                 catalogue fetch lands",
+                "no radars are known yet; the site list holds only what this \
+                 install has decoded until the catalogue fetch lands",
             );
         }
 
@@ -880,6 +926,7 @@ impl App {
             egui_repaint_at: None,
             auto_poll_at: None,
             site_is_provisional,
+            catalogue_pending,
             site_hint_pending,
             volume_store: std::sync::Arc::new(crate::volume::bridge::VolumeStore::new()),
             #[cfg(test)]
@@ -2687,21 +2734,36 @@ impl App {
             //
             // Still before the first paint: `android_main` calls this ahead of
             // the event loop.
-            rustdar_radar::sites::resolve(
+            let table = rustdar_radar::sites::resolve(
                 self.site_positions
                     .fixes()
                     .chain(self.site_catalogue.fixes()),
             );
+            // Both recomputed, because `App::new` answered them against a store
+            // it did not have yet. Leaving them alone left a returning Android
+            // user with `site_hint_pending` armed from a launch that could not
+            // see their saved site — so the catalogue landing mid-session ran
+            // the timezone hint and moved them off it. The mirror image of the
+            // web bug, from the same fused flag.
+            self.catalogue_pending = self.site_catalogue.is_empty();
+            self.gui.set_catalogue_pending(self.catalogue_pending);
             if self.gui.load_ui_config(store.as_ref()) {
                 // A returning user on Android reaches the timezone guess before
                 // their stored site is readable, so the guess has to be undone
                 // here rather than merely not applied.
                 self.site_is_provisional = false;
-            } else if !self.site_is_provisional {
-                // Still a first run, and `App::new` had no bridge answer to work
-                // with. This is the first chance to place them.
-                self.site_is_provisional =
-                    apply_location_hint(&mut self.gui, self.platform.as_ref());
+                self.site_hint_pending = false;
+            } else {
+                // No stored site came back, so the hint may still place them —
+                // but only if the table it would resolve against is still
+                // empty, which is the same predicate `App::new` applies.
+                self.site_hint_pending = table.rows().is_empty();
+                if !self.site_is_provisional {
+                    // Still a first run, and `App::new` had no bridge answer to
+                    // work with. This is the first chance to place them.
+                    self.site_is_provisional =
+                        apply_location_hint(&mut self.gui, self.platform.as_ref());
+                }
             }
         }
     }

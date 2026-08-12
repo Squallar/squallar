@@ -608,24 +608,31 @@ impl super::App {
     /// already looking at them. The refresh is for the *next* launch. See
     /// [`crate::site_catalogue`].
     ///
-    /// # The one launch that cannot wait
+    /// # The launch that cannot wait
     ///
-    /// A fresh install knows no radars. Nothing is cached, nothing has been
-    /// learned, and since the compiled-in table was deleted the binary carries
-    /// nothing either — so "apply it next launch" would mean a first run with
-    /// an empty site list, no markers, and a timezone hint that resolved
-    /// against nothing. The second run would be fine and the first would look
-    /// broken, which is the worst possible arrangement for the one run a new
-    /// user judges the app on.
+    /// A launch with no cached catalogue knows no network. Since the
+    /// compiled-in table was deleted the binary carries nothing either, so
+    /// "apply it next launch" means a run whose site list is only the radars
+    /// this install happens to have decoded — an empty list on a first run, and
+    /// one or two rows for anyone else. The following run would be fine and
+    /// this one would look broken.
     ///
-    /// So when [`App::site_hint_pending`] says the table came up empty, this
-    /// resolves the catalogue immediately and then runs the timezone hint
-    /// against it. Neither step can violate the rule the next-launch policy
-    /// exists to protect: an empty table has no marker to move, no row to shift
-    /// and no height datum to change, and a user cannot have chosen a site from
-    /// a list that had nothing in it.
+    /// It is not only the first run, and reading it that way is what shipped
+    /// the bug: a returning user has a stored config and a learned row, and on
+    /// the web — where the reload that would fix it is a relaunch nobody thinks
+    /// to perform — that reads as a network with one radar in it.
     ///
-    /// Spent once, however long the session runs.
+    /// So when [`App::catalogue_pending`] says nothing had yet told this binary
+    /// which radars exist, this resolves the catalogue immediately; and when
+    /// [`App::site_hint_pending`] says the launch brought no site of its own,
+    /// it then runs the timezone hint against it. Neither step can violate the
+    /// rule the next-launch policy exists to protect — see the two functions
+    /// below for why, one each.
+    ///
+    /// Each is spent once, however long the session runs, and each is spent by
+    /// its own step. They were one flag and one function until a returning web
+    /// user's saved site suppressed the catalogue outright; the two questions
+    /// are independent and are now asked independently.
     ///
     /// Drains rather than taking one, like every sibling poller, even though
     /// exactly one message can ever arrive: a poller that leaves a message in
@@ -638,38 +645,60 @@ impl super::App {
             // has already logged the reason at `debug`.
             //
             // On a fresh install with no network it is also the end of the road
-            // for this session: the site list stays empty and says so, which is
-            // the honest reading of "nothing has ever told this binary that a
-            // radar exists". `site_hint_pending` stays set, so the next launch
-            // that reaches the network still fills it in.
+            // for this session: the site list holds only what this install has
+            // decoded and says so, which is the honest reading of "nothing has
+            // told this binary which radars exist". Both flags stay set, so the
+            // next launch that reaches the network still fills it in.
             let Some(fetched) = response.catalogue else {
                 continue;
             };
             let store = self.platform.config_store();
-            if crate::site_catalogue::store_if_changed(
+            crate::site_catalogue::store_if_changed(
                 store.as_deref(),
                 &self.site_catalogue,
                 &fetched,
-            ) {
-                // Kept in step so a second refresh in the same session — there
-                // is none today — would not rewrite the blob it just wrote.
-                self.site_catalogue = fetched;
-            }
-            if self.site_hint_pending {
+            );
+            // Held whether or not the write took, and deliberately not folded
+            // into the `store_if_changed` branch it used to sit in. Site data
+            // blocked, a sandboxed iframe, and a full `localStorage` all answer
+            // `false` there, and treating that as "keep the empty one" discarded
+            // a catalogue that had already arrived — leaving the session with no
+            // radars *and* the flag spent, on precisely the platforms least able
+            // to spare it. Persistence is how the *next* launch benefits; this
+            // one benefits from the value in hand.
+            self.site_catalogue = fetched;
+            if self.catalogue_pending {
                 self.adopt_the_first_catalogue();
+            }
+            // Asked separately rather than nested inside the adopt above: a
+            // catalogue that places nothing leaves the table empty, and a launch
+            // with no site of its own still needs the hint run against whatever
+            // did arrive.
+            if self.site_hint_pending {
+                self.open_on_the_timezones_radar();
             }
         }
     }
 
-    /// Put the first catalogue a fresh install ever fetched into the live
-    /// table, and open on the radar nearest this device's timezone.
+    /// Put the first catalogue this install ever fetched into the live table.
     ///
-    /// Only ever reached with an empty table — see [`App::poll_site_catalogue`]
-    /// — and it spends [`App::site_hint_pending`] on the way in, whether or not
-    /// the hint finds anything, so a catalogue that arrives without a usable
-    /// timezone cannot leave this armed for a later one.
+    /// # It cannot move anything a user is looking at
+    ///
+    /// Which is the rule the next-launch policy exists to protect, and the
+    /// reason this one exception is safe. Reached only while
+    /// [`App::catalogue_pending`] holds — no catalogue has been in the table —
+    /// so every row present came from a position learned off a volume this
+    /// install decoded. [`rustdar_radar::sites::SiteFix::Learned`] outranks
+    /// `Network`, and `sites::extended` settles rank before it builds a row, so
+    /// a fetched position is never *applied* to a row a learned one claims,
+    /// let alone allowed to overwrite it. The first catalogue can only add
+    /// rows: no marker moves, no label changes, no height datum shifts.
+    ///
+    /// Spends [`App::catalogue_pending`], so every later catalogue takes the
+    /// ordinary next-launch path.
     fn adopt_the_first_catalogue(&mut self) {
-        self.site_hint_pending = false;
+        self.catalogue_pending = false;
+        self.gui.set_catalogue_pending(false);
         let table = rustdar_radar::sites::resolve(
             self.site_positions
                 .fixes()
@@ -681,7 +710,22 @@ impl super::App {
             table.rows().len(),
             table.unplaced().len(),
         );
+    }
 
+    /// Open on the radar nearest this device's timezone.
+    ///
+    /// Reached only while [`App::site_hint_pending`] holds — this launch had no
+    /// stored configuration naming a site and no table to resolve one against —
+    /// so there is no site the user chose for this to overrule. That is the
+    /// whole of its licence to change the open pane, and why it is gated on a
+    /// different question from the catalogue apply above: a returning user has
+    /// a site, and a catalogue landing mid-session must never move them off it.
+    ///
+    /// Spends [`App::site_hint_pending`] on the way in, whether or not the hint
+    /// finds anything, so a catalogue that arrives without a usable timezone
+    /// cannot leave this armed for a later one.
+    fn open_on_the_timezones_radar(&mut self) {
+        self.site_hint_pending = false;
         // The hint is run here rather than remembered from startup, because at
         // startup it had nothing to resolve against and chose nothing.
         let Some(zone) = self.platform.iana_timezone() else {

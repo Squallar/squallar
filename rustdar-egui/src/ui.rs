@@ -533,6 +533,17 @@ pub struct Gui {
     /// cadence. `false` by default, so a bridge that has not been asked renders
     /// no button rather than one that does nothing.
     location_settings_available: bool,
+    /// Whether the site list is still only what this install has decoded,
+    /// rather than the network.
+    ///
+    /// The site list reads the process-wide table, and the table cannot tell
+    /// the two apart: two rows learned off two volumes look exactly like a
+    /// network with two radars in it. That is what made the regression this
+    /// exists for invisible — the caption read `2 shown - 2 sites` with a
+    /// confidence it had not earned, while 203 radars sat in the cache
+    /// unapplied. `false` by default, so a bridge that has not been asked
+    /// states nothing rather than crying wolf.
+    catalogue_pending: bool,
     // Compass heading in degrees (0–360), from device compass sensor
     user_heading: Option<f32>,
     // Overlay data (SPC outlooks, NWS alerts, SPC discussions)
@@ -1616,6 +1627,7 @@ impl Gui {
             location_permission: rustdar_gps::LocationPermission::default(),
             location_active: false,
             location_settings_available: false,
+            catalogue_pending: false,
             user_heading: None,
             overlays: OverlayRegistry::default(),
             panes: vec![PaneState::new()],
@@ -4373,6 +4385,20 @@ impl Gui {
     /// See [`set_location_settings_available`](Self::set_location_settings_available).
     pub fn location_settings_available(&self) -> bool {
         self.location_settings_available
+    }
+
+    /// State whether the site list is still short of the network.
+    ///
+    /// Pushed at startup and again the moment the first catalogue is applied,
+    /// because unlike the flag above this one *does* change while the app runs
+    /// — that is the entire point of it. See [`Gui::catalogue_pending`].
+    pub fn set_catalogue_pending(&mut self, pending: bool) {
+        self.catalogue_pending = pending;
+    }
+
+    /// See [`set_catalogue_pending`](Self::set_catalogue_pending).
+    pub fn catalogue_pending(&self) -> bool {
+        self.catalogue_pending
     }
 
     pub fn set_user_heading(&mut self, heading: f32) {
