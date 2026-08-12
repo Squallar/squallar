@@ -429,20 +429,41 @@ pub const BASE_HALF_WIDTH_KM: f64 = 230.0;
 
 /// Furthest a box's **corner** may stand from its centre, km.
 ///
-/// [`crate::types::MAX_EXTENT_KM`] itself, because that is the same guard read
-/// through the same geometry: the plan view's cap is against a mis-framed
-/// radial claiming sixty thousand gates, and a box whose corner is inside the
-/// reach the raster will project is a box the raster can be laid under. A
-/// reach the raster refuses to zoom out past is a reach this must refuse to
-/// widen past.
+/// [`crate::types::MAX_EXTENT_KM`] **times √2** — the corner of the square that
+/// *circumscribes* the widest ring the plan view will draw.
 ///
-/// The corner, rather than either side, because that is the quantity
-/// [`box_half_width_km`] has always capped — its `half ≤ MAX_HALF_WIDTH_KM` is
-/// `half · √2 ≤ MAX_EXTENT_KM` written for the one case where the two sides
-/// are equal. A rectangle has no single "width" to bound, and bounding each
-/// side separately would let a 470 × 470 km half-extent through, whose corner
-/// stands 664.7 km out.
-pub const MAX_HALF_DIAGONAL_KM: f64 = crate::types::MAX_EXTENT_KM;
+/// # Why it is no longer `MAX_EXTENT_KM` itself
+///
+/// It was, on the argument that "a box whose corner is inside the reach the
+/// raster will project is a box the raster can be laid under". That argument
+/// belongs to the **inscribed** box, and the box is now circumscribed: it
+/// deliberately reaches past the data's own ring at the corners, because the
+/// user asked to keep the whole ring rather than the largest square inside it.
+/// Holding the corner inside `MAX_EXTENT_KM` would have squashed the box the
+/// design asks for — a 460.125 km reach wants a 920.25 km box, whose corner
+/// stands 650.72 km out, and [`HalfExtentKm::clamped`] would have scaled it
+/// silently to **664.68 km**. The caption would have read `665 × 665 km box`
+/// for a 920 km ask, on the first frame, before any zoom.
+///
+/// **Raising [`crate::types::MAX_EXTENT_KM`] instead would have been wrong.**
+/// That constant is the *plan view's* cap: [`crate::types::plan_view_extent_km`]
+/// clamps to it, [`crate::types::raster_side_px`] is calibrated against it at
+/// 2.1787 px/km, and its whole job is to stop a mis-framed radial claiming
+/// sixty thousand gates from zooming the display out to a continent. Raising it
+/// would widen every plan view's zoom-out to weaken a guard that has nothing to
+/// do with the volume.
+///
+/// So the two are decoupled in *value* and still bound in *definition*. Written
+/// as the multiplication rather than as 664.68 so they cannot drift: this is
+/// still "as far as the plan view will ever look", read through the geometry the
+/// box now uses. The guard it exists for survives unchanged — a sixty-thousand
+/// gate radial is still refused, at 470 km of half-width instead of 332.34.
+///
+/// The corner, rather than either side, because a rectangle has no single
+/// "width" to bound, and bounding each side separately would change a box's
+/// **aspect** to hold its corner — a silently reshaped picture where a scaled
+/// one is merely a stopped control. See [`HalfExtentKm::clamped`].
+pub const MAX_HALF_DIAGONAL_KM: f64 = crate::types::MAX_EXTENT_KM * std::f64::consts::SQRT_2;
 
 /// Widest half-width a **square** request may ask for, km.
 ///
@@ -451,9 +472,13 @@ pub const MAX_HALF_DIAGONAL_KM: f64 = crate::types::MAX_EXTENT_KM;
 /// case `east_km == north_km`, which is the only case that has a half-width at
 /// all.
 ///
-/// 332.34 km — a 665 km box — is therefore not a range any radar reaches. The
-/// widest honest one in this display is the 460.1 km WSR-88D surveillance
-/// cut, which asks for 325.4.
+/// It comes out at **exactly [`crate::types::MAX_EXTENT_KM`]**, 470.00 km, and
+/// that is the whole point rather than a coincidence: under a circumscribed box
+/// the half-width *is* the reach, so the widest box this will build is the one
+/// that holds the widest ring the plan view will ever draw. The widest honest
+/// reach in this display is the 460.125 km WSR-88D surveillance cut, which now
+/// asks for 460.125 and clears this by the same **9.9 km**
+/// [`crate::types::MAX_EXTENT_KM`]'s own doc cites.
 pub const MAX_HALF_WIDTH_KM: f64 = MAX_HALF_DIAGONAL_KM / std::f64::consts::SQRT_2;
 
 /// Half a box's east–west and north–south extent, km.
@@ -490,9 +515,10 @@ impl HalfExtentKm {
     /// How far the box's corner stands from its centre, km.
     ///
     /// The quantity [`MAX_HALF_DIAGONAL_KM`] bounds, and the rectangle's form
-    /// of the inscribed-square rule in [`box_half_width_km`]: a box whose
-    /// corner sits on the data's own range circle is the largest one of that
-    /// shape with no permanently empty corner cells.
+    /// of the circumscribed rule in [`box_half_width_km`]: a box whose
+    /// **sides** are tangent to the data's own range circle is the smallest one
+    /// of that shape that loses none of the ring, and its corner is the furthest
+    /// point of it from the centre.
     pub fn corner_km(self) -> f64 {
         self.east_km.hypot(self.north_km)
     }
@@ -546,83 +572,66 @@ impl HalfExtentKm {
 }
 
 /// Half-width of the box to resample, km, given how far the volume's data
-/// reaches — **the largest square that fits inside the sweep's own range
-/// circle**.
+/// reaches — **the square that holds the whole of the sweep's own range
+/// circle**, so the half-width *is* the reach.
 ///
-/// [`crate::types::plan_view_extent_km`] is this function's counterpart, and
-/// the difference between the two is the whole design. Both take a reach off
-/// the wire and answer a half-width; the raster's answer *circumscribes* the
-/// data circle and this one is *inscribed* in it, because a raster's corners
-/// are free and a box's corners are not:
+/// # This used to be the largest square *inside* the circle, and the user
+/// reversed it
 ///
-/// * a raster grows its side in pixels with its extent
-///   ([`crate::types::raster_side_px`]), so a surveillance cut's 460.1 km of
-///   ground costs 4.4512 px/km against the 230 km floor's 4.4522, and the
-///   corner pixels outside the data circle are pixels the projection simply
-///   leaves empty;
-/// * a box has `nx · ny · nz` cells and `nx` is pinned at [`MAX_AXIS`] — the
-///   3D texture size GLES 3.0 *guarantees*, which the browser is held to — so
-///   its resolution is exactly `2 · half_width / nx` and a corner cell outside
-///   the data circle is a cell that can never hold a measurement **and** a
-///   cell of resolution taken from the ones that can.
+/// [`crate::types::plan_view_extent_km`] is this function's counterpart, and the
+/// two now agree rather than differing: both take a reach off the wire and
+/// answer a half-width that circumscribes the data circle. The difference used
+/// to be the whole design — the raster's corners are free and a box's are not,
+/// so the box stopped where its corners touched the data, at `reach / √2`.
 ///
-/// So the box stops where its corners touch the data. One cell wider and the
-/// corners are provably empty: at a 460 km reach, a 920 km box (the raster's
-/// own extent, doubled) leaves 21.5% of its cells — 1.8 M of 8.4 M —
-/// permanently [`NO_DATA_INDEX`], and spends 3.59 km per cell to do it.
+/// What that argument left out is that a user looking at a 3D view is looking at
+/// **geography**, and the inscribed rule cuts the ring's north, south, east and
+/// west extremes off the picture. Asked directly, the answer was to keep the
+/// ring:
 ///
-/// # What the trade was measured to be
+/// > The 3d viewer's region should CAP at either the size of the data in the
+/// > radar scan, or the region selected if the user did that. That region (the
+/// > selector OR the radar's ring) must never change.
 ///
-/// KCRP 2017-08-26 04:41Z (Harvey), [`DESKTOP_SHAPE`], reflectivity, cells
-/// holding each dBZ class after the resample, against the share of the
-/// volume's own ≥5 dBZ gates that fall outside the box:
+/// So the corners are bought deliberately. A circumscribed square is
+/// `1 − π/4` = **21.5%** permanently [`NO_DATA_INDEX`] — that figure is
+/// unchanged from when it was the argument *against* this rule, and it is now
+/// simply the price of the ring.
 ///
-/// | half-width | box | km/cell | ≥20 dBZ | ≥35 dBZ | ≥50 dBZ | echo outside | build |
-/// |---|---|---|---|---|---|---|---|
-/// | 230 (the old fixed box) | 460 km | 1.80 | 513 827 | 52 783 | 97 | 1.72% | 28 ms |
-/// | 300 | 600 km | 2.34 | 310 585 | 31 305 | 77 | 0.03% | — |
-/// | **325.4 (this rule)** | **651 km** | **2.54** | 264 617 | 26 449 | 71 | 0.02% | 24 ms |
-/// | 460 (the raster's extent) | 920 km | 3.59 | 132 096 | 13 184 | 27 | 0% | 20 ms |
+/// The resolution objection is answered by the grid's shape rather than by the
+/// box: at 512 cells across, the 920.25 km box is **1.80 km/cell**, finer than
+/// the 2.54 km the 651 km inscribed box got at 256. The old rule's own table
+/// measured the circumscribed box at 3.59 km/cell, and that number was true only
+/// while `nx` was pinned at 256.
 ///
-/// Widening is free in **memory** and slightly *cheaper* in **time**. The
-/// shape is fixed, so the index plane is 8 MiB and the optional value plane
-/// 32 MiB at every width; and a wider box puts more of its columns outside
-/// the data, where a column costs a range search that finds nothing. The
-/// times are best of fifteen, release, one fresh process per width, on a
-/// 32-thread Ryzen 9 7950X with the one-minute load average under 20 —
-/// measured that way because timing all three widths inside one process made
-/// the widest look 30 ms and the 512-cell shape below 202 ms, which is the
-/// allocator warming to 160 MiB a build rather than anything about the grids.
+/// # Every product moves, not only reflectivity
 ///
-/// **Resolution is the entire cost**, and it is why the rule stops at the
-/// corners rather than at the raster's extent: the last doubling buys 0.02%
-/// of the echo for three quarters of the ≥35 dBZ cells.
+/// The per-moment variance the inscribed rule already exploited runs the same
+/// helpful way here, so this is a widening of every box rather than a special
+/// case for the surveillance cut:
 ///
-/// # Why the grid is not simply made bigger
+/// | moment | reach | was (inscribed) | now (circumscribed) | km/cell at 512 |
+/// |---|---|---|---|---|
+/// | WSR-88D reflectivity | 460.1 km | 651 km | **920 km** | 1.80 |
+/// | Doppler moments | 300 km | 424 km | **600 km** | 1.17 |
+/// | TDWR long-range reflectivity | 417 km | 590 km | **834 km** | 1.63 |
+/// | TDWR Doppler | 89 km | 126 km | **178 km** | 0.35 |
 ///
-/// Because [`MAX_AXIS`] is not a tuning knob — it is `GL_MAX_3D_TEXTURE_SIZE`
-/// as GLES 3.0 guarantees it, so 256 is what a browser has to accept. Lifting
-/// it was measured anyway, since it is the only arrangement that gets both
-/// the reach and the resolution: 512 × 512 × 128 over the 920 km box holds
-/// 1.80 km/cell and every dBZ class the 460 km box had (≥50 dBZ 97 against
-/// 97, ≥35 53 283 against 52 783), for **32 MiB of indices and 128 MiB of
-/// values, and 77 ms against 28** — four times [`VOXEL_TEXTURE_BUDGET_BYTES`],
-/// two and a half times `rustdar_frontend`'s largest per-target volume budget,
-/// unreachable on the web at all, and thirteen such grids in a desktop 3D
-/// loop.
+/// Across 150 archive volumes from 53 sites every single WSR-88D reports the
+/// same **460.1 km** reflectivity reach — no variance at all — so for
+/// reflectivity this rule and the constant 460.1 are the same number. Velocity,
+/// spectrum width, ZDR, ΦDP, ρHV and everything derived from them follow the
+/// 300 km Doppler cut instead, and a TDWR follows its own much shorter one.
+/// Each still gets its own ring and nothing else.
 ///
-/// # Why this is worth following per volume rather than pinning
+/// # The bounds
 ///
-/// Across 150 archive volumes from 53 sites, every single WSR-88D reports a
-/// **460.1 km** reflectivity reach — there is no variance in it at all, so
-/// for reflectivity this rule and the constant 325.4 are the same number. The
-/// variance is in the other moments, and it runs the *helpful* way: a Doppler
-/// cut reaches 300 km, so velocity, spectrum width, ZDR, ΦDP, ρHV and every
-/// product derived from them ask for a 212 km half-width — a 424 km box at
-/// 1.66 km/cell, both tighter and **finer** than the fixed 230 they used to
-/// get, with the whole 300 km circle inside it. A TDWR's ~89 km Doppler
-/// volume asks for 63 km, and gets 0.49 km/cell where it used to be given
-/// 1.80 and four fifths of an empty box.
+/// Clamped into [`MIN_HALF_WIDTH_KM`]`..=`[`MAX_HALF_WIDTH_KM`], and the ceiling
+/// is now exactly [`crate::types::MAX_EXTENT_KM`] — see [`MAX_HALF_DIAGONAL_KM`]
+/// for why that constant had to be decoupled in value while staying bound in
+/// definition. The guard is still the one the plan view's cap exists for: a
+/// mis-framed radial claiming sixty thousand gates is refused, at 470 km rather
+/// than 332.34.
 ///
 /// A `NaN` or non-positive reach answers [`BASE_HALF_WIDTH_KM`]. `clamp`
 /// propagates `NaN`, and a `NaN` half-width reaches [`VoxelGrid::x_range_km`]
@@ -634,7 +643,8 @@ pub fn box_half_width_km(data_reach_km: f64) -> f64 {
     if data_reach_km.is_nan() || data_reach_km <= 0.0 {
         return BASE_HALF_WIDTH_KM;
     }
-    (data_reach_km / std::f64::consts::SQRT_2).clamp(MIN_HALF_WIDTH_KM, MAX_HALF_WIDTH_KM)
+    // The reach itself, not `reach / √2`: the box circumscribes the ring.
+    data_reach_km.clamp(MIN_HALF_WIDTH_KM, MAX_HALF_WIDTH_KM)
 }
 
 /// How far `product`'s data reaches over the **ground**, km, across every
@@ -1896,10 +1906,14 @@ struct VoxelRow<'grid> {
 /// draws the identity affine when they match, so the two sides have to agree
 /// *bit for bit* rather than nearly. A separate `clamp(MIN_HALF_WIDTH_KM,
 /// MAX_HALF_WIDTH_KM)` on the renderer's side is not that agreement: for a
-/// square ask past the stop it answers `470 / √2` where [`HalfExtentKm::clamped`]
-/// answers `half · (470 / hypot(half, half))`, and the two differ by one or two
-/// ULP — measured, 332.3401871576773 against 332.34018715767735 for a 400 km
-/// ask and 332.3401871576774 for the ~1800 km one a wide-open pane measures.
+/// square ask past the stop it answers [`MAX_HALF_WIDTH_KM`] where
+/// [`HalfExtentKm::clamped`] answers `half · (MAX_DIAG / hypot(half, half))`,
+/// and the two differ by an ULP at some inputs and not at others — measured
+/// since the box became circumscribed, both spellings give exactly 470.0 for a
+/// 400 km ask, and 470.0 against **470.00000000000006** for the ~1800 km one a
+/// wide-open pane measures. That the two now agree at one of the two sampled
+/// inputs is not the divergence going away; it is the same one-ULP disagreement
+/// landing on a different set of asks.
 ///
 /// **That divergence is reachable, and the route to it is not the obvious
 /// one.** Two sides both under [`MAX_HALF_WIDTH_KM`] cannot have a corner past

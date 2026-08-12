@@ -1267,7 +1267,7 @@ fn the_caption_names_the_base_volume_or_says_the_first_is_still_filling() {
 /// and it is invisible unless it is written down.
 ///
 /// The sourceless figures are pinned as literals — the 651 km box a 460.125
-/// km reflectivity reach earns and the 2.54 km cells it costs — rather than
+/// km reflectivity reach earns and the 3.59 km cells it costs — rather than
 /// derived from the function the caption itself reads, so a policy that
 /// drifted fails here by name instead of being restated as correct.
 #[test]
@@ -1283,7 +1283,7 @@ fn the_caption_reports_the_resolution_the_box_buys() {
     );
     assert!(
         wide.iter()
-            .any(|l| l.contains("651 km box") && l.contains("2.54 km/cell")),
+            .any(|l| l.contains("920 km box") && l.contains("3.59 km/cell")),
         "a whole WSR-88D reflectivity volume must report the box its reach \
          earns and the cost of it: {wide:?}",
     );

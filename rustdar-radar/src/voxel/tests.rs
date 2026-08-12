@@ -719,10 +719,14 @@ fn a_top_at_or_below_the_base_is_refused() {
 #[test]
 fn the_half_width_is_clamped_rather_than_refused() {
     let scan = scan_of(&|_, _| Some(40.0));
-    // `470 / hypot(450, 200)` — the one factor both axes of the last row take,
-    // written out so the row is a number rather than the rule restated. The
-    // rule itself is asserted as a property below the loop.
-    const SCALE: f64 = 0.954_425_395_225_601_9;
+    // `MAX_HALF_DIAGONAL_KM / hypot(600, 300)` — the one factor both axes of
+    // the last row take, written out so the row is a number rather than the
+    // rule restated. The rule itself is asserted as a property below the loop.
+    //
+    // The row moved from 450 × 200 when the box became circumscribed: that
+    // corner is 492.4 km, which cleared the old 470 km bound and clears the new
+    // 664.68 km one by more, so it stopped exercising the scaling at all.
+    const SCALE: f64 = 0.9908470001860922;
     for (asked, want) in [
         (
             HalfExtentKm::square(0.0),
@@ -764,18 +768,18 @@ fn the_half_width_is_clamped_rather_than_refused() {
                 north_km: 100.0,
             },
         ),
-        // The corner — 492.4 km — is over the bound while *neither* side is:
-        // 450 is under MAX_HALF_WIDTH_KM's 332.34 only if you square the box,
-        // and 200 is nowhere near it. Both axes come back scaled by the same
-        // factor, so the 2.25:1 shape survives the stop.
+        // The corner — 670.8 km — is over the bound while *neither* side is:
+        // 600 is under MAX_HALF_WIDTH_KM's 470 and 300 is nowhere near it. Both
+        // axes come back scaled by the same factor, so the 2:1 shape survives
+        // the stop.
         (
             HalfExtentKm {
-                east_km: 450.0,
-                north_km: 200.0,
+                east_km: 600.0,
+                north_km: 300.0,
             },
             HalfExtentKm {
-                east_km: 450.0 * SCALE,
-                north_km: 200.0 * SCALE,
+                east_km: 600.0 * SCALE,
+                north_km: 300.0 * SCALE,
             },
         ),
     ] {
@@ -799,8 +803,8 @@ fn the_half_width_is_clamped_rather_than_refused() {
     // And what the last row's numbers *are*: the corner lands exactly on the
     // bound, and the shape it landed with is the shape that was asked for.
     let over = HalfExtentKm {
-        east_km: 450.0,
-        north_km: 200.0,
+        east_km: 600.0,
+        north_km: 300.0,
     };
     let stopped = over.clamped();
     assert!(
@@ -816,32 +820,53 @@ fn the_half_width_is_clamped_rather_than_refused() {
     );
 }
 
-/// The corner bound **is** the old half-width cap, for the one box that has a
-/// half-width.
+/// The cap circumscribes the widest ring the plan view will draw, and is
+/// **not** `MAX_EXTENT_KM` itself.
 ///
-/// `MAX_HALF_WIDTH_KM` was `MAX_EXTENT_KM / √2` before the extent had two axes
-/// and is still exactly that, so a square ask past the stop lands where it
-/// always did — 332.34 km, a 665 km box. That is the reduction the rectangular
-/// rule has to make, and it is what says this change moved no square box.
+/// The equality it used to assert — `MAX_HALF_DIAGONAL_KM == MAX_EXTENT_KM` —
+/// was the *inscribed* box's coupling: hold the corner inside the reach the
+/// raster projects, and the raster can always be laid under the box. The box is
+/// circumscribed now, so it reaches past the ring at the corners on purpose, and
+/// that equality would squash a 920.25 km ask to 664.68 km — the caption reading
+/// `665 × 665 km box` for a 920 km region, on the first frame.
+///
+/// Restoring the old equality therefore means deleting this reasoning, which is
+/// why the reasoning is asserted rather than the number: the two constants are
+/// still bound in *definition* so they cannot drift, and decoupled in *value* so
+/// the plan view's own cap is not dragged along behind the volume's.
 #[test]
-fn the_corner_bound_reduces_to_the_old_square_cap() {
+fn the_cap_circumscribes_the_widest_ring_rather_than_fitting_inside_it() {
     assert!(
         (HalfExtentKm::square(MAX_HALF_WIDTH_KM).corner_km() - MAX_HALF_DIAGONAL_KM).abs() < 1e-9,
         "a box at the square cap must have its corner exactly on the bound, \
          got {}",
         HalfExtentKm::square(MAX_HALF_WIDTH_KM).corner_km(),
     );
-    assert_eq!(MAX_HALF_DIAGONAL_KM, crate::types::MAX_EXTENT_KM);
     assert!(
-        (MAX_HALF_WIDTH_KM - 332.340_2).abs() < 1e-3,
-        "the square cap must still be 332.34 km, got {MAX_HALF_WIDTH_KM}",
+        (MAX_HALF_DIAGONAL_KM - crate::types::MAX_EXTENT_KM * std::f64::consts::SQRT_2).abs()
+            < 1e-9,
+        "the corner bound must be the plan view's cap read through the \
+         circumscribed geometry — strictly wider than the cap itself, or it \
+         squashes the very box it exists to admit, and drift-proof because it \
+         is still derived from it",
+    );
+    // Which lands the square cap exactly on the plan view's, because a
+    // circumscribed box's half-width *is* its reach.
+    assert!(
+        (MAX_HALF_WIDTH_KM - crate::types::MAX_EXTENT_KM).abs() < 1e-9,
+        "the square cap must be 470.00 km, got {MAX_HALF_WIDTH_KM}",
+    );
+    // The widest honest reach clears it by the 9.9 km `MAX_EXTENT_KM` cites.
+    assert!(
+        (MAX_HALF_WIDTH_KM - 460.125 - 9.875).abs() < 1e-9,
+        "the margin over the widest real surveillance cut moved",
     );
 
     let stopped = HalfExtentKm::square(10_000.0).clamped();
     assert!(
         (stopped.east_km - MAX_HALF_WIDTH_KM).abs() < 1e-9
             && (stopped.north_km - MAX_HALF_WIDTH_KM).abs() < 1e-9,
-        "a square ask past the stop must land on the old cap, got {stopped:?}",
+        "a square ask past the stop must land on the cap, got {stopped:?}",
     );
 }
 
@@ -880,30 +905,34 @@ fn long_range_scan(field: Field<'_>) -> Scan {
     )
 }
 
-/// The box is the largest square that fits inside the data's own range
+/// The box is the smallest square that holds the whole of the data's own range
 /// circle, floored and capped.
 ///
-/// The inscribed-square rule is the whole policy, so it is pinned as the
-/// geometric property rather than as the constant it works out to: a
-/// half-width of `reach / √2` is exactly the one whose **corner** sits on the
-/// data circle. One kilometre wider and the corner cells are outside the
-/// radar's range — cells that can never hold a measurement, bought with
-/// resolution taken from the cells that can.
+/// The circumscribed rule is the whole policy, so it is pinned as the geometric
+/// property rather than as the constant it works out to: a half-width equal to
+/// the reach is exactly the one whose **sides** are tangent to the data circle.
+/// One kilometre narrower and the ring's north, south, east and west extremes
+/// are cut off the picture — which is the crop the user rejected outright, in
+/// those words:
+///
+/// > That region (the selector OR the radar's ring) must never change.
+///
+/// The corners it buys are 21.5% permanently empty, and that is the stated
+/// price rather than an oversight.
 #[test]
-fn the_box_is_the_largest_square_inside_the_datas_range_circle() {
+fn the_box_is_the_smallest_square_holding_the_datas_range_circle() {
     for reach in [120.0f64, 300.0, 460.125] {
         let half = box_half_width_km(reach);
-        let corner = half * std::f64::consts::SQRT_2;
         assert!(
-            (corner - reach).abs() < 1e-9,
-            "a {reach} km reach earned a {half} km half-width, whose corner is \
-             {corner} km out",
+            (half - reach).abs() < 1e-9,
+            "a {reach} km reach must earn a {reach} km half-width so the ring \
+             is tangent to the box's sides, got {half}",
         );
     }
     assert!(
-        (box_half_width_km(460.125) - 325.3575).abs() < 1e-3,
-        "the WSR-88D's own surveillance reach must earn 325.36 km — a 651 km \
-         box at 2.54 km per cell on the desktop shape — got {}",
+        (box_half_width_km(460.125) - 460.125).abs() < 1e-3,
+        "the WSR-88D's own surveillance reach must earn 460.125 km — a 920.25 \
+         km box holding the whole ring — got {}",
         box_half_width_km(460.125),
     );
 }
@@ -922,8 +951,8 @@ fn the_box_stops_at_both_ends_and_refuses_to_guess_from_no_reach() {
     assert_eq!(box_half_width_km(60_000.0), MAX_HALF_WIDTH_KM);
     assert_eq!(box_half_width_km(f64::INFINITY), MAX_HALF_WIDTH_KM);
     assert!(
-        (MAX_HALF_WIDTH_KM * std::f64::consts::SQRT_2 - crate::types::MAX_EXTENT_KM).abs() < 1e-9,
-        "the box's cap must be the raster's cap through this rule's own \
+        (MAX_HALF_WIDTH_KM - crate::types::MAX_EXTENT_KM).abs() < 1e-9,
+        "the box's cap must be the raster's cap read through this rule's own \
          geometry, or one of them can be raised without the other",
     );
     assert_eq!(box_half_width_km(1.0), MIN_HALF_WIDTH_KM);
@@ -1084,9 +1113,9 @@ fn a_short_range_volumes_box_tightens_onto_its_data() {
     let half = 0.5 * (x1 - x0);
     let reach = volume_reach_km(&scan, RadarProduct::Velocity);
     assert!(
-        (half - reach / std::f64::consts::SQRT_2).abs() < 1e-9,
-        "an {reach} km volume must earn a {} km half-width, got {half}",
-        reach / std::f64::consts::SQRT_2,
+        (half - reach).abs() < 1e-9,
+        "an {reach} km volume must earn a {reach} km half-width — its own ring, \
+         circumscribed — got {half}",
     );
     assert!(
         half < BASE_HALF_WIDTH_KM,
