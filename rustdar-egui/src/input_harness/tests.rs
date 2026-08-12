@@ -1571,7 +1571,7 @@ fn fold_markers_painted(h: &InputHarness) -> Vec<egui::Rect> {
 fn the_velocity_bar_says_where_its_own_sweep_folds_in_every_speed_unit() {
     use rustdar_units::SpeedUnit;
 
-    let mut h = velocity_pane("TPIT", Some(TDWR_NYQUIST_MS));
+    let mut h = velocity_pane("TOKC", Some(TDWR_NYQUIST_MS));
     let pane = h.pane_rects()[0];
 
     // 22.14 m/s in each unit, rounded as the annotation rounds: 49.52 mph,
@@ -1742,7 +1742,7 @@ fn a_sweep_that_declared_no_nyquist_gets_the_bar_unchanged() {
 fn a_pane_annotates_no_fold_while_its_image_lags_the_selection() {
     use rustdar_radar::types::RadarProduct;
 
-    let mut h = velocity_pane("TPIT", Some(TDWR_NYQUIST_MS));
+    let mut h = velocity_pane("TOKC", Some(TDWR_NYQUIST_MS));
     assert!(
         fold_line_painted(&h).is_some(),
         "precondition: the pane must be annotating its own render",
@@ -1792,7 +1792,7 @@ fn the_fold_annotation_leaves_the_strip_counts_and_the_pane_alone() {
         "precondition: a landscape panel draws a right-edge bar, got {bare:?}",
     );
 
-    let annotated = velocity_pane("TPIT", Some(TDWR_NYQUIST_MS));
+    let annotated = velocity_pane("TOKC", Some(TDWR_NYQUIST_MS));
     assert_eq!(
         annotated.color_scale_strips(pane),
         bare,
@@ -1838,7 +1838,7 @@ fn a_bottom_edge_bar_annotates_under_itself_rather_than_off_the_pane() {
         "precondition: a portrait panel draws a bottom-edge bar, got {bare:?}",
     );
 
-    let h = velocity_pane_on(portrait, "TPIT", Some(TDWR_NYQUIST_MS));
+    let h = velocity_pane_on(portrait, "TOKC", Some(TDWR_NYQUIST_MS));
     assert_eq!(
         h.color_scale_strips(pane),
         bare,
@@ -1944,7 +1944,7 @@ fn every_products_unit_title_fits_inside_its_pane() {
 fn the_range_folded_purple_is_keyed_on_the_bars_that_can_paint_it() {
     use rustdar_radar::types::RadarProduct;
 
-    let mut h = velocity_pane("TPIT", Some(TDWR_NYQUIST_MS));
+    let mut h = velocity_pane("TOKC", Some(TDWR_NYQUIST_MS));
     let pane = h.pane_rects()[0];
     let purple = {
         let (r, g, b, a) = rustdar_radar::RANGE_FOLDED;
@@ -1998,7 +1998,7 @@ fn the_range_folded_purple_is_keyed_on_the_bars_that_can_paint_it() {
 fn the_fold_annotation_returns_with_the_picture_rather_than_from_a_config() {
     use rustdar_radar::types::RadarProduct;
 
-    let mut h = velocity_pane("TPIT", Some(TDWR_NYQUIST_MS));
+    let mut h = velocity_pane("TOKC", Some(TDWR_NYQUIST_MS));
     let before = fold_line_painted(&h).expect("precondition: an annotated pane");
 
     // A surface loss: the overlay entry goes, the pane's own state does not.
