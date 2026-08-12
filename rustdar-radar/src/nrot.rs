@@ -2,10 +2,14 @@
 //! normalized by a range-dependent divisor so one number reads the same at
 //! every distance from the radar. The pipeline is reverse-engineered against
 //! a reference implementation: kernel taps, divisor curve, median geometry,
-//! and gating are all empirical rather than derived. As last measured it
-//! matches the reference's painted density and correlates 0.996 with its
-//! cursor readouts; the measurement apparatus and the full calibration
-//! record live on branch `campaign-harness`.
+//! and gating are all empirical rather than derived. Where it paints, it
+//! correlates 0.996 with the reference's cursor readouts. It does not yet
+//! paint as widely: over the 7.05–20 nm annulus of a lowest velocity cut the
+//! reference covers 3.27% of KTLX 2025-02-19 and 5.08% of KCRP 2017-08-26
+//! where this module covers 1.62% and 1.07%, and the shortfall is coverage
+//! upstream of the derivative rather than gating — see
+//! [`GK_MAX_TEXTURE_VNY_FRAC`]. The measurement apparatus and the full
+//! calibration record live on branch `campaign-harness`.
 //!
 //! 1. Dealias the base velocity with the validity-marking multi-pass
 //!    ([`dealias`]): environmental-wind and zero-isodop seeds, then
@@ -147,8 +151,8 @@ pub fn compute_nrot_grid_with_profile(
     elevation_deg: f64,
     profile: Option<&WindProfile>,
 ) -> Vec<Vec<f64>> {
-    let med = preprocess_velocity_with(sweep, elevation_deg, profile);
-    let mut grid = llsd_nrot(sweep, &med);
+    let (dealiased, med) = preprocess_velocity_with(sweep, elevation_deg, profile);
+    let mut grid = llsd_nrot(sweep, &dealiased, &med);
     despeckle_nrot(
         &mut grid,
         DESPECKLE_MIN_BINS,
@@ -221,7 +225,7 @@ fn preprocess_velocity_with(
     sweep: &VelocitySweep,
     elevation_deg: f64,
     profile: Option<&WindProfile>,
-) -> Vec<Vec<f64>> {
+) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
     let mut vel: Vec<Vec<f64>> = sweep.vel_grid.to_vec();
     dealias(
         &mut vel,
@@ -230,14 +234,15 @@ fn preprocess_velocity_with(
         profile,
         DealiasProfile::NoFalseShear,
     );
-    median_filter(
+    let med = median_filter(
         &vel,
         sweep.vel_grid,
         sweep.gate_count,
         sweep.first_gate_range_km,
         sweep.gate_interval_km,
         sweep_rows(sweep, sweep.vel_grid.len()),
-    )
+    );
+    (vel, med)
 }
 
 /// Wind-profile layer thickness, km.
@@ -1086,7 +1091,7 @@ const GK_DATA_MARGIN: i32 = 1;
 /// says the same thing louder: 18.13 m/s of range noise is kept there, and
 /// 8.0 m/s silences KHNX.
 ///
-/// # Asked of the raw sweep
+/// # Asked of the dealiased field
 ///
 /// Not the median-filtered field the stencils differentiate: that filter
 /// exists to remove exactly this, and on it the two real cases are one number.
@@ -1094,27 +1099,55 @@ const GK_DATA_MARGIN: i32 = 1;
 /// 14.6 km — the median-filtered rms range difference is 1.65–1.81 m/s, and at
 /// the KFTG 2023-06-22 mesocyclone core the reference paints +1.64 at, it is
 /// 1.58–2.01. Raw they are 6.82–7.88 against 4.93–5.44, which no threshold in
-/// m/s separates either, and 0.585–0.676 against 0.205–0.227 of each cut's own
-/// limit, which does with a factor of 2.6 to spare.
+/// m/s separates either.
 ///
-/// Not the dealiased field either, and that is a measurement rather than a
-/// preference: after [`dealias`] the KHNX bin reads 0.352–0.398 and the
-/// mesocyclone 0.156–0.182, so that field would want a ceiling near 0.30 while
-/// the ladder — whose sectors carry no folds, so raw and dealiased agree there
-/// to 0.03 — puts it at 0.44. Only the raw sweep satisfies both.
+/// It read the raw sweep until [`incoherent_velocity`] landed, because on the
+/// raw sweep a fold wall reads as a discontinuity: KHNX's clear air and KCRP's
+/// hurricane walls were one number, and holding KHNX cost KCRP its walls. That
+/// objection is gone. With incoherent ground handed back as reported, the
+/// dealiased field differs from the raw one only where a fold was actually
+/// resolved, and a resolved fold is not a discontinuity in the velocity — only
+/// in its encoding. Reading it there frees KCRP: 4987 painted bins against
+/// 3670, and fourteen of the nineteen hovered bins against four, which is all
+/// eleven of the wall bins the reference paints and the raw sweep dropped. The
+/// KFTG core stays bit-identical, KHNX stays at 0, and no rung of any
+/// synthetic ladder moves — 194 of 216, the same 22.
 ///
-/// Reading it there was tried again once [`incoherent_velocity`] stopped the
-/// dealiaser inventing continuity, which removes that objection: with the
-/// incoherent ground handed back as reported, the dealiased field differs from
-/// the raw one only where a fold was actually resolved. It frees KCRP — 4987
-/// painted bins against 3670 here, and fourteen of the nineteen hovered bins
-/// against four, which is all eleven of the wall bins the reference paints and
-/// this ceiling drops — leaves the KFTG core bit-identical, and keeps KHNX at
-/// 0. The ladder does not move either: 194 of 216 rungs, the same 22.
+/// # Where the 0.44 comes from on this field
 ///
-/// **KTLX refuses it.** KTLX 2025-02-19 15:05:14 is the other VCP 31 clear-air
-/// volume in the corpus, Nyquist 11.49, and the fourteen strongest bins it
-/// paints inside 80 km were hovered:
+/// Not from the ladder, which cannot see it: the ladder's sectors carry no
+/// folds, so [`dealias`] leaves them alone and the straddling refusal in
+/// [`incoherent_velocity`] already decides every rung the ceiling used to. The
+/// scorecard reads 194 of 216 unchanged for every ceiling from 0.12 to 0.80,
+/// so the ladder pins nothing here and the number is measured on real weather
+/// instead, bracketed from both sides.
+///
+/// From above by KHNX, whose clear air this ceiling must not readmit. Painted
+/// bins inside 80 km on its lowest velocity cut, walked a hundredth at a time:
+///
+/// ```text
+///     ceiling  0.42  0.44  0.45  0.46  0.47  0.48  0.50
+///     KHNX        0     0     0     0     4     8    10
+/// ```
+///
+/// From below by KTLX 2025-02-19 15:05:14, where the reference paints far more
+/// than this module does and a lower ceiling only widens the gap. Painted
+/// fraction of the 7.05–20 nm annulus, the reference read off its own screen at
+/// 20 px/nm against this module's own grid over the same annulus:
+///
+/// ```text
+///     ceiling  0.30  0.36  0.40  0.44   reference
+///     KTLX    0.56% 1.04% 1.41% 1.62%       3.27%
+/// ```
+///
+/// So 0.44 is inside the bracket with two hundredths of margin under the KHNX
+/// knee, which is where the raw sweep's ladder gap (0.427..0.455) also put it.
+/// The constant does not move; only the field it is asked of.
+///
+/// # What this costs, and the sample that hid it
+///
+/// On the fourteen strongest bins this module paints at KTLX, hovered by the
+/// campaign that first tried this field, the trade looks purely bad:
 ///
 /// ```text
 ///     az           312.7 142.3 252.8 278.3 112.3 244.7  33.8 317.3 …
@@ -1124,19 +1157,29 @@ const GK_DATA_MARGIN: i32 = 1;
 ///     dealiased    +1.72 +1.67 −1.44 −1.41 +1.31 −1.19 +1.18 −1.10 …
 /// ```
 ///
-/// Eleven of the fourteen read ND in the reference and two of the three that
-/// carry a value carry the opposite sign. On the raw sweep this ceiling paints
-/// three of them and 677 bins in the cut; on the dealiased field it paints all
-/// fourteen and 1216. Freeing a hurricane's fold walls by resurrecting a
-/// second clear-air over-paint is not a trade this ceiling may make, so it
-/// still reads the raw sweep.
+/// Eleven of the fourteen read ND in the reference, and this field paints all
+/// fourteen where the raw sweep painted three. That reading is what kept the
+/// ceiling on the raw sweep, and it is a biased sample: it asks whether the
+/// reference agrees where *this module* is most confident, which at a site
+/// whose field is displaced rather than merely excessive is exactly where it
+/// will not be. It cannot answer whether the module paints too much or too
+/// little, and the answer is too little. Over the whole annulus the reference
+/// paints 3.27% of KTLX against 0.28% of KHNX — the two clear-air volumes at
+/// nearly the same Nyquist are twelve times apart in the reference, and 1500
+/// times apart in the innermost band, 15.5% against 0.01% at 7–8 nm. An
+/// unbiased ring of 240 hovers at 8/11/14/17/20 nm finds the reference painting
+/// 13 of them at KTLX and none at KHNX. This module paints 0.88% of that
+/// annulus on the raw sweep and 1.62% on this field, so the move is toward the
+/// reference by half the remaining distance, not away from it.
 ///
 /// # The difference is read as it stands, not the short way round
 ///
-/// The obvious objection to reading the raw sweep is that where velocity
-/// aliases, two gates half a kilometre apart differ by ~2·Vny as an artefact
-/// of the encoding while the beam measured something continuous, so the
-/// difference ought to be wrapped into ±Vny first. It ought not to be, and the
+/// Reading the dealiased field removes most of this question but not all of
+/// it: where no pass reached a region, [`dealias`] hands it back as the radar
+/// reported it and a wall inside it still reads as ~2·Vny — an artefact of the
+/// encoding, while the beam measured something continuous. So the objection
+/// survives in the small, that the difference ought to be wrapped into ±Vny
+/// before it is squared. It ought not to be, and the
 /// instrument that says so is a range **square wave** rather than the wrapping
 /// ramp that was tried before. A ramp cannot settle it: adding a couplet ahead
 /// of the wrap displaces the wrap boundary in azimuth, so the sector carries a
@@ -1179,33 +1222,35 @@ const GK_DATA_MARGIN: i32 = 1;
 /// agree there to the third decimal and the ceiling stays 0.44 — and at 0.44
 /// the wrapped statistic returns KHNX's clear air to 17670 painted bins of the
 /// 20878 this ceiling exists to remove. To hold KHNX it would want 0.25..0.30,
-/// which is the same contradiction that ruled out the dealiased field.
+/// and the square wave above says 0.44; nothing satisfies both.
 ///
-/// # Where this ceiling and the reference part company
+/// # Where this ceiling and the reference still part company
 ///
-/// It is a compromise, and both halves of it were hovered rather than assumed.
-/// On KCRP the reference paints every one of eleven bins this ceiling drops,
-/// spread over az 41–140° and 8–39 nm. Their raw texture is 0.55–0.97 of the
-/// limit; wrapping only the differences that exceed 1.80·Vny already collapses
-/// it to 0.10–0.39, so what the statistic counts there is aliasing and not
-/// shear. The reference's values track this module's ungated ones: +0.77
-/// against +0.83, +0.53 against +0.56, +0.49 against +0.54. KCRP's
-/// 5411 → 3572 below is rotation the reference reports and this module drops.
+/// The KCRP half is closed. The eleven bins the raw sweep dropped, spread over
+/// az 41–140° and 8–39 nm, are all painted here, and their values track the
+/// reference's: +0.77 against +0.91, +0.53 against +0.53, +0.49 against +0.48.
+/// Their texture falls from 0.55–0.97 of the limit on the raw sweep to
+/// 0.09–0.16 on this field, which is the measurement saying what the walls
+/// were: aliasing, not shear.
 ///
-/// On KHNX it was the other way and further. Of twenty bins hovered — twelve
-/// this ceiling drops and eight it kept — the reference reads ND at all
-/// twenty, so the 1666 that survived there were over-paint as well. That half
-/// is closed, and not here: [`incoherent_velocity`] refuses the ground before
-/// this ceiling ever reads it, and KHNX now paints 0.
+/// What remains is that this module paints too little, not too much, and
+/// nowhere more than in the near-in clear air. Painted fraction of the
+/// 7.05–20 nm annulus against the reference read off its own screen:
 ///
-/// The KCRP half stands. No member of this family closes it. Every candidate
-/// that frees KCRP's walls — wrapping, wrapping only above 1.70 or 1.80·Vny,
-/// the dealiased field, a narrower window in range or azimuth — costs more
-/// somewhere else than it recovers here, because at Vny 11.66 incoherent
-/// velocity produces differences near 2·Vny by chance and no per-difference
-/// transform can tell those from a wall. Wrapping above 1.80·Vny is the
-/// closest: KCRP 5381, KFTG 1438, and KHNX back to 3577. Reading the dealiased
-/// field frees KCRP outright and is refused by KTLX, above.
+/// ```text
+///                  reference   here
+///     KTLX            3.27%   1.62%
+///     KCRP            5.08%   1.07%
+///     KHNX            0.28%   0.00%
+/// ```
+///
+/// The deficit is not this ceiling's doing and raising it does not close it:
+/// at the thirteen ring points the reference paints at KTLX, this module reads
+/// ND at nine of them with *every* gate on this page disabled. Those nine are
+/// lost upstream — to the post-dealias fold censor, to the median filter's
+/// coverage rule, and to the stencils' demand that every tap cell be intact —
+/// in a cut whose velocity is comparable to its own Nyquist nearly everywhere.
+/// That is a coverage question, not a gating one, and it is not answered here.
 ///
 /// # What it does on real volumes
 ///
@@ -1215,12 +1260,12 @@ const GK_DATA_MARGIN: i32 = 1;
 ///
 /// ```text
 ///     KHNX 2024-12-16  clear air      11 →    0
-///     KTLX 2025-02-19              1502 →  677
-///     KCRP 2017-08-26  Harvey      5384 → 3670
-///     KDMX 2022-03-05              3287 → 2469
-///     KFTG 2023-06-22              1482 → 1304
+///     KTLX 2025-02-19              1502 → 1216
+///     KCRP 2017-08-26  Harvey      5384 → 4987
+///     KDMX 2022-03-05              3287 → 2863
+///     KFTG 2023-06-22              1482 → 1467
 ///     KLOT 2024-12-16                78 →   69
-///     KMSX 2022-06-04                32 →   28
+///     KMSX 2022-06-04                32 →   32
 /// ```
 const GK_MAX_TEXTURE_VNY_FRAC: f64 = 0.44;
 
@@ -1511,12 +1556,16 @@ const TEXTURE_MIN_PAIRS: usize = 8;
 /// ±[`TEXTURE_RANGE_HALF_KM`] in range and ±[`TEXTURE_AZ_HALF`] rows, NaN
 /// where the window holds fewer than [`TEXTURE_MIN_PAIRS`] pairs.
 ///
-/// Read from the sweep's own raw velocity rather than the median-filtered
-/// field the stencils differentiate: the question is whether the radar
-/// measured a continuous velocity along the beam, and a filter of ours must
-/// not be able to answer it yes.
-fn range_texture(sweep: &VelocitySweep, rows: crate::azimuth::Rows) -> Vec<Vec<f64>> {
-    let grid = sweep.vel_grid;
+/// `grid` is [`dealias`]'s output rather than the median-filtered field the
+/// stencils differentiate: the question is whether the radar measured a
+/// continuous velocity along the beam, and a filter of ours must not be able
+/// to answer it yes. Undoing the encoding's own wrap is not answering it —
+/// see [`GK_MAX_TEXTURE_VNY_FRAC`] for which field, and why it changed.
+fn range_texture(
+    grid: &[Vec<f64>],
+    sweep: &VelocitySweep,
+    rows: crate::azimuth::Rows,
+) -> Vec<Vec<f64>> {
     let n = grid.len();
     let gc = sweep.gate_count;
     let dk = ((TEXTURE_STEP_KM / sweep.gate_interval_km).round() as usize).max(1);
@@ -1578,7 +1627,11 @@ fn range_texture(sweep: &VelocitySweep, rows: crate::azimuth::Rows) -> Vec<Vec<f
         .collect()
 }
 
-fn llsd_nrot(sweep: &VelocitySweep, vel_grid: &[Vec<f64>]) -> Vec<Vec<f64>> {
+fn llsd_nrot(
+    sweep: &VelocitySweep,
+    dealiased: &[Vec<f64>],
+    vel_grid: &[Vec<f64>],
+) -> Vec<Vec<f64>> {
     let num_radials = vel_grid.len();
     let gc = sweep.gate_count;
     let rows = sweep_rows(sweep, num_radials);
@@ -1587,7 +1640,7 @@ fn llsd_nrot(sweep: &VelocitySweep, vel_grid: &[Vec<f64>]) -> Vec<Vec<f64>> {
     // The cut's own limit, read off the raw sweep: after the dealiaser has
     // run, a grid no longer folds at it.
     let limit = fold_limit_ms(sweep, sweep.vel_grid);
-    let texture = range_texture(sweep, rows);
+    let texture = range_texture(dealiased, sweep, rows);
     let texture_max = limit.map(|v| GK_MAX_TEXTURE_VNY_FRAC * v);
     let incoherent =
         limit.map(|v| incoherent_velocity(sweep.vel_grid, rows, gc, sweep.gate_interval_km, v));
@@ -1995,14 +2048,20 @@ const COH_RANGE_HALF: i32 = 32;
 /// inside 80 km, before → after:
 ///
 /// ```text
-///     KHNX 2024-12-16  clear air, Vny 11.66   1548 →    0
-///     KTLX 2025-02-19  clear air, Vny 11.49    854 →  677
-///     KCRP 2017-08-26  Harvey,    Vny 31.52   3273 → 3670
-///     KDMX 2022-03-05             Vny 27.93   2470 → 2469
-///     KFTG 2023-06-22             Vny 24.01   1304 → 1304
+///     KHNX 2024-12-16  clear air, Vny 11.66   2404 →    0
+///     KTLX 2025-02-19  clear air, Vny 11.49   1686 → 1216
+///     KCRP 2017-08-26  Harvey,    Vny 31.52   5076 → 4987
+///     KDMX 2022-03-05             Vny 27.93   2868 → 2863
+///     KFTG 2023-06-22             Vny 24.01   1467 → 1467
 ///     KLOT 2024-12-16             Vny 23.96     69 →   69
-///     KMSX 2022-06-04             Vny 24.21     28 →   28
+///     KMSX 2022-06-04             Vny 24.21     32 →   32
 /// ```
+///
+/// Both columns are re-taken since this landed, because
+/// [`GK_MAX_TEXTURE_VNY_FRAC`] now reads the dealiased field and the two
+/// refusals compose differently. Against the raw sweep it read 1548 → 0,
+/// 854 → 677, 3273 → 3670, 2470 → 2469, 1304 → 1304, 69 → 69, 28 → 28. What
+/// this refusal does is unchanged; the ceiling downstream of it moved.
 ///
 /// KHNX's twenty hovered bins, where the reference reads ND at all twenty, go
 /// from six painted to none, and so does the whole cut inside 80 km — which is
@@ -3673,7 +3732,7 @@ mod tests {
             })
             .collect();
         let s = sweep(&grid, &azimuths, gates);
-        let nrot = llsd_nrot(&s, &grid);
+        let nrot = llsd_nrot(&s, &grid, &grid);
 
         // Gate 200 → 50.25 km: inside the super-res operator's domain. Its
         // ramp gain is Σ t·o over the legacy arc, the same on both sides:
@@ -3772,8 +3831,8 @@ mod tests {
         let full: Vec<Vec<f64>> = full_az.iter().map(|&a| row(a)).collect();
         let sector: Vec<Vec<f64>> = sector_az.iter().map(|&a| row(a)).collect();
 
-        let full_nrot = llsd_nrot(&sweep(&full, &full_az, gates), &full);
-        let sector_nrot = llsd_nrot(&sweep(&sector, &sector_az, gates), &sector);
+        let full_nrot = llsd_nrot(&sweep(&full, &full_az, gates), &full, &full);
+        let sector_nrot = llsd_nrot(&sweep(&sector, &sector_az, gates), &sector, &sector);
 
         // Rows 20..52 of the sector read only rows 3..69 of it, so their whole
         // support lies inside the arc and is the full rotation's data bin for
@@ -3842,7 +3901,7 @@ mod tests {
                     .collect()
             })
             .collect();
-        let nrot = llsd_nrot(&sweep(&grid, &azimuths, gates), &grid);
+        let nrot = llsd_nrot(&sweep(&grid, &azimuths, gates), &grid, &grid);
 
         let gain: f64 = SPLIT_TAPS.iter().map(|&(o, t)| o as f64 * t).sum();
         for j in 100..300 {
@@ -3907,8 +3966,8 @@ mod tests {
             "a 1.0° sector found a pairing"
         );
 
-        let full_nrot = llsd_nrot(&sweep(&full, &full_az, gates), &full);
-        let sector_nrot = llsd_nrot(&sweep(&sector, &sector_az, gates), &sector);
+        let full_nrot = llsd_nrot(&sweep(&full, &full_az, gates), &full, &full);
+        let sector_nrot = llsd_nrot(&sweep(&sector, &sector_az, gates), &sector, &sector);
 
         let legacy_gain: f64 = LEGACY_TAPS.iter().map(|&(o, t)| 2.0 * o as f64 * t).sum();
         let mut carried = 0;
@@ -4009,8 +4068,8 @@ mod tests {
         let coarse_az = ring_azimuths(360);
         let fine: Vec<Vec<f64>> = fine_az.iter().map(|&a| row(a)).collect();
         let coarse: Vec<Vec<f64>> = coarse_az.iter().map(|&a| row(a)).collect();
-        let fine_nrot = llsd_nrot(&sweep(&fine, &fine_az, gates), &fine);
-        let coarse_nrot = llsd_nrot(&sweep(&coarse, &coarse_az, gates), &coarse);
+        let fine_nrot = llsd_nrot(&sweep(&fine, &fine_az, gates), &fine, &fine);
+        let coarse_nrot = llsd_nrot(&sweep(&coarse, &coarse_az, gates), &coarse, &coarse);
 
         // Each grid reads the gain its own operator carries: the super-res
         // operator's is its Σ t·o over two rows, the legacy grid's is Σ 2·o·t
@@ -4071,7 +4130,11 @@ mod tests {
                     .collect()
             })
             .collect();
-        let quarter_nrot = llsd_nrot(&sweep(&quarter, &quarter_az, probe_gates), &quarter);
+        let quarter_nrot = llsd_nrot(
+            &sweep(&quarter, &quarter_az, probe_gates),
+            &quarter,
+            &quarter,
+        );
         for j in [100usize, 200] {
             let range_km = 0.25 + j as f64 * 0.25;
             let expect = k * split_gain / rot_divisor(range_km / KM_PER_NM);
@@ -4174,7 +4237,7 @@ mod tests {
         let read = |n: usize, step: f64, roll: usize| -> Vec<f64> {
             let azs: Vec<f64> = (0..n).map(|i| ((i + roll) % n) as f64 * step).collect();
             let grid: Vec<Vec<f64>> = azs.iter().map(|&a| field(a)).collect();
-            let nrot = llsd_nrot(&sweep(&grid, &azs, gates), &grid);
+            let nrot = llsd_nrot(&sweep(&grid, &azs, gates), &grid, &grid);
             (0..n).map(|k| nrot[(k + n - roll) % n][j]).collect()
         };
 
@@ -4271,7 +4334,7 @@ mod tests {
                     .collect()
             })
             .collect();
-        let nrot = llsd_nrot(&sweep(&grid, &azimuths, gates), &grid);
+        let nrot = llsd_nrot(&sweep(&grid, &azimuths, gates), &grid, &grid);
         let j = 154; // 38.75 km, mid-band, where the reference was hovered
         let at = |i: usize| nrot[i][j];
 
@@ -4350,7 +4413,7 @@ mod tests {
             .map(|i| vec![if i % 2 == 0 { 6.0 } else { -6.0 }; gates])
             .collect();
         let s = sweep(&grid, &azimuths, gates);
-        let nrot = llsd_nrot(&s, &grid);
+        let nrot = llsd_nrot(&s, &grid, &grid);
         let strong = nrot
             .iter()
             .flatten()
@@ -4412,7 +4475,7 @@ mod tests {
         let read = |grid: &[Vec<f64>], nyquist: f64| -> f64 {
             let mut s = sweep(grid, &azimuths, gates);
             s.declared_nyquist_ms = Some(nyquist);
-            llsd_nrot(&s, grid)[CORE][j]
+            llsd_nrot(&s, grid, grid)[CORE][j]
         };
 
         let ceiling = GK_MAX_TEXTURE_VNY_FRAC * VNY;
@@ -4523,7 +4586,7 @@ mod tests {
                 .map(|i| vec![if azimuths[i] < boundary_az { -8.0 } else { 8.0 }; gates])
                 .collect();
             let s = sweep(&grid, &azimuths, gates);
-            let nrot = llsd_nrot(&s, &grid);
+            let nrot = llsd_nrot(&s, &grid, &grid);
             // 38.5 km, and 95.25 and 175.25 km — both past the range a second
             // operator used to take the bin over at.
             for j in [153usize, 380, 700] {
@@ -4762,7 +4825,7 @@ mod tests {
             let mut both = Vec::new();
             for first_plus in [100usize, 141] {
                 let grid = paint(w, first_plus, 1.0);
-                let nrot = llsd_nrot(&sweep(&grid, &azimuths, gates), &grid);
+                let nrot = llsd_nrot(&sweep(&grid, &azimuths, gates), &grid, &grid);
                 let mut read = Vec::new();
                 for (m, want) in profile.iter().enumerate() {
                     for radial in [first_plus + m, first_plus - 1 - m] {
@@ -4788,7 +4851,7 @@ mod tests {
         for (ratio, strong, weak) in ASYMMETRIC {
             for first_plus in [100usize, 141] {
                 let grid = paint(3, first_plus, ratio);
-                let nrot = llsd_nrot(&sweep(&grid, &azimuths, gates), &grid);
+                let nrot = llsd_nrot(&sweep(&grid, &azimuths, gates), &grid, &grid);
                 for (m, want) in strong.iter().enumerate() {
                     let got = nrot[first_plus + m][j];
                     assert!(
