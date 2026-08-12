@@ -252,6 +252,29 @@ fn a_sourceless_voxel_job() -> JobRequest {
     }
 }
 
+/// The voxel job a pane whose viewport is **not square** posts.
+///
+/// The two axes are two `f64`s on the wire, adjacent and same-typed, so an
+/// encoder writing them in one order and a decoder reading them in the other
+/// round-trips every square job in this file and none of the real ones. 92 km
+/// east against 37 km north because both are distinctive: no arithmetic
+/// anywhere in the encoding turns one into the other.
+fn a_rectangular_voxel_job() -> JobRequest {
+    match a_voxel_job() {
+        JobRequest::Voxels { input, request } => JobRequest::Voxels {
+            input,
+            request: VoxelRequest {
+                half_extent_km: Some(rustdar_radar::voxel::HalfExtentKm {
+                    east_km: 92.0,
+                    north_km: 37.0,
+                }),
+                ..request
+            },
+        },
+        other => other,
+    }
+}
+
 #[test]
 fn every_job_kind_survives_the_wire_format() {
     for job in [
@@ -261,6 +284,7 @@ fn every_job_kind_survives_the_wire_format() {
         a_section_job(),
         a_voxel_job(),
         a_sourceless_voxel_job(),
+        a_rectangular_voxel_job(),
     ] {
         assert_eq!(
             JobRequest::from_bytes(&job.to_bytes()),
