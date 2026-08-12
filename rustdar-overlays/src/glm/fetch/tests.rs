@@ -1134,3 +1134,46 @@ fn missing_optional_area_degrades_without_failing_the_file() {
     assert!((flashes[0].lat - 35.0).abs() < 1e-4);
     assert!(flashes[0].energy.is_some_and(|e| e > 0.0));
 }
+
+/// A round is refused only when **every** satellite was refused.
+///
+/// The loop this guards used to be `list_glm_files(...).await?`, so one
+/// satellite's failure returned for the whole round and a dead GOES-East
+/// silently blanked GOES-West. It collects per satellite now and only builds a
+/// round verdict when *none* of them answered — and even then, one bucket
+/// answering 400 while the other times out is not the product refusing us.
+#[test]
+fn a_listing_round_is_refused_only_when_every_satellite_was() {
+    use crate::fetch_policy::{FetchError, FetchFailure};
+
+    let context = "no GLM satellite could be listed (2 failed)";
+    let cases: [(Vec<FetchError>, FetchFailure); 3] = [
+        (
+            vec![
+                FetchError::permanent("S3 returned HTTP 400"),
+                FetchError::permanent("S3 returned HTTP 400"),
+            ],
+            FetchFailure::Permanent,
+        ),
+        (
+            vec![
+                FetchError::permanent("S3 returned HTTP 400"),
+                FetchError::transient("S3 list request failed: timed out"),
+            ],
+            FetchFailure::Transient,
+        ),
+        (
+            vec![FetchError::transient("S3 list request failed: timed out")],
+            FetchFailure::Transient,
+        ),
+    ];
+    for (verdicts, expected) in cases {
+        let round = FetchError::of_round(&verdicts, context);
+        assert_eq!(round.failure, expected);
+        assert!(
+            round.message.contains("S3"),
+            "the round must keep the origins\' own words: {}",
+            round.message,
+        );
+    }
+}

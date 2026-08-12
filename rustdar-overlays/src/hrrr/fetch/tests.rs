@@ -855,3 +855,76 @@ async fn live_a_ranged_record_is_a_small_fraction_of_the_file() {
         "range did not start at a record boundary"
     );
 }
+
+/// **The permanently-moved-product test.** A single run 404ing is routine and
+/// must stay routine — it is why the previous-hour fallback exists. Both runs
+/// 404ing is not: the bucket carries a rolling window and should always have
+/// one of the last two hours.
+///
+/// Left `Absent`, that state is invisible for ever: `Absent` resets the ladder,
+/// stamps the clock and reports no fault, so a moved HRRR would poll hourly and
+/// say nothing. Escalated to `Transient` it costs the same one poll an hour and
+/// shows up in the layer's own panel as "not loading".
+#[test]
+fn both_candidate_runs_missing_is_not_routine() {
+    use crate::fetch_policy::{FetchError, FetchFailure, NotFound};
+
+    let absent = || {
+        FetchError::from_status(
+            reqwest::StatusCode::NOT_FOUND,
+            NotFound::IsRoutine,
+            "index …wrfsfcf00.grib2.idx: HTTP 404 Not Found",
+        )
+    };
+    assert_eq!(
+        absent().failure,
+        FetchFailure::Absent,
+        "premise: one run's 404 is routine on its own",
+    );
+
+    let round = round_verdict([absent(), absent()], "HRRR fetch failed");
+    assert_eq!(
+        round.failure,
+        FetchFailure::Transient,
+        "a product missing from both candidate runs polls hourly and reports \
+         nothing at all if this stays Absent",
+    );
+    assert!(
+        round.message.contains("404"),
+        "the round must keep the origin's own words: {}",
+        round.message,
+    );
+}
+
+/// The merge itself is unchanged for every other combination: a round is
+/// refused only when both runs were, and one retryable run keeps the round
+/// retryable. The fallback is the *older* run and so the one less likely to be
+/// missing, which is why "every part" is the right rule here.
+#[test]
+fn a_two_run_round_is_refused_only_when_both_runs_were() {
+    use crate::fetch_policy::{FetchError, FetchFailure};
+
+    let cases = [
+        (
+            FetchError::permanent("400"),
+            FetchError::permanent("400"),
+            FetchFailure::Permanent,
+        ),
+        (
+            FetchError::permanent("400"),
+            FetchError::transient("500"),
+            FetchFailure::Transient,
+        ),
+        (
+            FetchError::transient("500"),
+            FetchError::transient("500"),
+            FetchFailure::Transient,
+        ),
+    ];
+    for (first, second, expected) in cases {
+        assert_eq!(
+            round_verdict([first, second], "HRRR fetch failed").failure,
+            expected,
+        );
+    }
+}

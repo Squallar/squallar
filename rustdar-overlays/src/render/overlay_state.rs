@@ -714,10 +714,36 @@ impl OverlayRegistry {
         }
     }
 
-    /// [`OverlayHandler::status_line`] for `kind`; `None` for a kind with no
-    /// handler.
+    /// [`OverlayHandler::status_line`] for `kind`, marked when the layer is not
+    /// updating; `None` for a kind with no handler.
+    ///
+    /// The companion to [`Self::controls`], and the reason both live here rather
+    /// than in the handlers. `controls` carries the full sentence, but it is in
+    /// the layer's **options panel** — a user has to select the layer to read
+    /// it, and nobody selects a layer that looks fine. The stack row is the
+    /// surface that is always on screen, so it is where "these warnings stopped
+    /// updating" has to appear if it is to be seen at all. A frozen alert set
+    /// and a current one are identical on the map; this is the only difference
+    /// visible without a click.
+    ///
+    /// Short by design: the row is one line beside a name, and the sentence that
+    /// explains it is one click away.
+    ///
+    /// Only for a layer that is **on** — a hidden layer draws nothing, so
+    /// nothing it holds can be misread, and its row is already dimmed. Free
+    /// while healthy: [`FetchRetry::is_unhealthy`] is a discriminant test and
+    /// the `format!` runs only when there is something to say, which matters
+    /// because this is asked of every layer in the stack every frame.
     pub fn status_line(&self, kind: OverlayKind) -> Option<String> {
-        self.handler(kind).and_then(|h| h.status_line())
+        let handler = self.handler(kind)?;
+        let line = handler.status_line();
+        if !handler.is_enabled() || !handler.retry().is_some_and(FetchRetry::is_unhealthy) {
+            return line;
+        }
+        Some(match line {
+            Some(line) => format!("! not updating - {line}"),
+            None => "! not updating".to_string(),
+        })
     }
 
     pub fn clickable_items(&self, kind: OverlayKind) -> Vec<ClickableItem<'_>> {
@@ -1471,6 +1497,72 @@ mod retry_ledger_tests {
             }
             assert_eq!(state.enable_should_refetch(has_data), expected, "{why}");
         }
+    }
+
+    /// **The always-visible half.** The full note is in the layer's options
+    /// panel, which a user has to select the layer to reach — and nobody
+    /// selects a layer that looks fine. The stack row is on screen the whole
+    /// time, so a layer that stopped updating has to say so *there* or it is
+    /// only discoverable by someone already suspicious.
+    #[test]
+    fn a_failing_layer_is_marked_on_the_always_visible_stack_row() {
+        let mut registry = OverlayRegistry::default();
+        let kinds: Vec<OverlayKind> = registry
+            .handlers()
+            .filter(|h| h.retry().is_some())
+            .map(|h| h.kind())
+            .collect();
+
+        for kind in kinds {
+            registry.set_enabled(kind, true);
+            let healthy = registry.status_line(kind);
+            assert!(
+                !healthy
+                    .as_deref()
+                    .is_some_and(|l| l.contains("not updating")),
+                "{kind:?} claims to be failing before anything has failed: {healthy:?}",
+            );
+
+            registry.record_fetch_failure(kind, &FetchError::transient("connection refused"));
+            let marked = registry
+                .status_line(kind)
+                .unwrap_or_else(|| panic!("{kind:?} says nothing on the row while failing"));
+            assert!(
+                marked.starts_with("! not updating"),
+                "{kind:?}: the mark must lead the row, not trail whatever the \
+                 layer was already saying: {marked}",
+            );
+            if let Some(healthy) = healthy.as_deref() {
+                assert!(
+                    marked.contains(healthy),
+                    "{kind:?} lost its own status line to the mark: {marked}",
+                );
+            }
+
+            registry.clear_retry(kind);
+            assert_eq!(
+                registry.status_line(kind),
+                healthy,
+                "{kind:?} kept the mark after recovering",
+            );
+        }
+    }
+
+    /// A hidden layer draws nothing, so nothing it holds can be misread, and
+    /// its row is already dimmed. Marking it would put a warning on every layer
+    /// a user has deliberately switched off.
+    #[test]
+    fn a_hidden_layer_is_not_marked_on_the_stack_row() {
+        let mut registry = OverlayRegistry::default();
+        let kind = OverlayKind::NwsAlerts;
+        registry.record_fetch_failure(kind, &FetchError::transient("connection refused"));
+        registry.set_enabled(kind, false);
+        assert!(
+            !registry
+                .status_line(kind)
+                .is_some_and(|l| l.contains("not updating")),
+            "a layer that is switched off must not carry a staleness mark",
+        );
     }
 
     /// A fetch already in flight is never doubled by switching the layer on,

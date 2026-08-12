@@ -243,6 +243,36 @@ impl FetchError {
         }
     }
 
+    /// One error for a round of several requests that **all** failed: the
+    /// merged verdict from [`FetchFailure::of_round`], with every part's own
+    /// words kept behind `context`.
+    ///
+    /// Four layers issue rounds — GLM's satellites, METAR's per-state networks,
+    /// HRRR's two candidate runs, storm reports' three CSVs — and each had
+    /// grown its own version of this. Storm reports' was `failures.remove(0)`,
+    /// which is not a merge at all: `failures[0]` is always the tornado CSV, so
+    /// one 400 there condemned the layer while hail and wind had merely timed
+    /// out. One helper and one rule, so a caller cannot quietly pick a stricter
+    /// one.
+    ///
+    /// Every part's message is kept rather than a representative one: the panel
+    /// line is what a user reads back when reporting a fault, and "which ones
+    /// failed, and how" is the whole content of a round failure.
+    pub fn of_round(parts: &[FetchError], context: impl Into<String>) -> Self {
+        let context = context.into();
+        Self {
+            failure: FetchFailure::of_round(parts.iter().map(|e| e.failure)),
+            message: format!(
+                "{context}: {}",
+                parts
+                    .iter()
+                    .map(|e| e.message.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        }
+    }
+
     /// The verdict for a status the origin actually returned.
     ///
     /// 408 (timeout) and 429 (rate limited) are 4xx that explicitly invite a
@@ -785,6 +815,40 @@ mod tests {
         );
         retry.record_failure(&transient());
         assert!(retry.is_unhealthy());
+    }
+
+    /// The round *error* keeps every part's words, not a representative one.
+    ///
+    /// Storm reports used to take `failures[0]` — always the tornado CSV — so
+    /// the layer's whole verdict turned on one of the three, and a 400 there
+    /// condemned it while hail and wind had merely timed out. All four
+    /// round-issuing layers go through this now.
+    #[test]
+    fn a_round_error_carries_every_part_and_the_merged_verdict() {
+        let parts = [
+            FetchError::permanent("tornado CSV: HTTP 400"),
+            FetchError::transient("hail CSV: timed out"),
+            FetchError::transient("wind CSV: timed out"),
+        ];
+        let round = FetchError::of_round(&parts, "no storm report CSV could be fetched");
+        assert_eq!(
+            round.failure,
+            FetchFailure::Transient,
+            "one refused CSV among three must not condemn the layer",
+        );
+        for part in &parts {
+            assert!(
+                round.message.contains(&part.message),
+                "the round dropped {:?}: {}",
+                part.message,
+                round.message,
+            );
+        }
+        assert!(
+            round
+                .message
+                .starts_with("no storm report CSV could be fetched")
+        );
     }
 
     /// A round of several requests is refused only when every part of it was.

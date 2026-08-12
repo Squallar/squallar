@@ -144,9 +144,31 @@ pub async fn fetch_glm_flashes(
     let mut dead_feeds = Vec::new();
     let mut tally = PollTally::default();
 
+    // One satellite's failure must not take the other's flashes with it. This
+    // loop used to be `list_glm_files(...).await?` — so a dead GOES-East
+    // silently blanked GOES-West, which is the same "condemned by the weakest
+    // component" shape `FetchFailure::of_round` exists to prevent, on a layer
+    // where the surviving satellite still covers most of CONUS.
+    let mut verdicts = Vec::new();
+    let mut queried = Vec::new();
+
     for &sat in satellites {
         let bucket = sat.bucket(sources);
-        let listing = list_glm_files(client, bucket, start, now).await?;
+        let listing = match list_glm_files(client, bucket, start, now).await {
+            Ok(listing) => listing,
+            Err(e) => {
+                log::warn!("GLM: {} listing failed: {e}", sat.display_name());
+                verdicts.push(e);
+                // Deliberately **not** added to `queried`. A listing that never
+                // answered teaches nothing about whether the feed is alive, and
+                // `report_feed_changes` reads absence-from-`dead_feeds` as
+                // recovery for anything in `queried` — so counting it here
+                // would report a dead feed as recovered on the strength of a
+                // request that failed.
+                continue;
+            }
+        };
+        queried.push(sat);
 
         // Zero objects means the feed is gone (dead bucket, renamed path,
         // satellite rotated out of the slot), not a quiet sky: GOES-East
@@ -176,10 +198,26 @@ pub async fn fetch_glm_flashes(
         acc.absorb(sat, levels, batch);
     }
 
+    // Only a *total* failure is the round's failure. Anything less and the
+    // satellites that did answer are still worth drawing.
+    if queried.is_empty() && !satellites.is_empty() {
+        return Err(FetchError::of_round(
+            &verdicts,
+            format!(
+                "no GLM satellite could be listed ({} failed)",
+                verdicts.len()
+            ),
+        ));
+    }
+
     // Insert new data into cache
     cache_granules(cache, std::mem::take(&mut acc.entries), now);
 
-    // Return all cached flashes within the window
+    // Still keyed on `satellites`, not `queried`: a satellite whose listing
+    // failed this poll contributed no *new* granules, but the ones it
+    // contributed on earlier polls are real flashes and are still in window.
+    // Dropping them would make a single failed listing blank that satellite —
+    // the very thing the `?` above was doing.
     let filtered = flashes_in_window(cache, satellites, cutoff, now);
 
     log::info!(
@@ -189,13 +227,7 @@ pub async fn fetch_glm_flashes(
     );
 
     // Reported, not logged, for the same reason dead feeds are.
-    Ok(build_outcome(
-        filtered,
-        dead_feeds,
-        satellites.to_vec(),
-        &tally,
-        acc,
-    ))
+    Ok(build_outcome(filtered, dead_feeds, queried, &tally, acc))
 }
 
 /// Select the cached flashes that fall inside this poll's window, from the

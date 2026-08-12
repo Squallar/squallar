@@ -39,7 +39,7 @@ use serde_json::Value;
 
 use super::networks;
 use super::types::{CloudLayer, FlightCategory, MetarOb, Visibility, WindDir};
-use crate::fetch_policy::{FetchError, FetchFailure};
+use crate::fetch_policy::FetchError;
 use crate::types::GeoBounds;
 
 // ── Units ─────────────────────────────────────────────────────────────────
@@ -229,7 +229,7 @@ pub async fn fetch_current_metars(
             }
             Err(e) => {
                 log::warn!("METAR network fetch failed: {e}");
-                verdicts.push(e.failure);
+                verdicts.push(e);
             }
         }
     }
@@ -239,11 +239,10 @@ pub async fn fetch_current_metars(
     // round's verdict is the merge of theirs — refused only if every part was,
     // so a single dead network cannot take METAR off the poll nationwide.
     if verdicts.len() == states.len() {
-        let failures = verdicts.len();
-        return Err(FetchError {
-            failure: FetchFailure::of_round(verdicts),
-            message: format!("all {failures} METAR network fetches failed"),
-        });
+        return Err(FetchError::of_round(
+            &verdicts,
+            format!("all {} METAR network fetches failed", verdicts.len()),
+        ));
     }
 
     if rejected_total > 0 {

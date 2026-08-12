@@ -454,17 +454,39 @@ pub async fn fetch_hrrr_data(
 /// One verdict for a two-run attempt, carrying both attempts' words.
 ///
 /// The two runs are the same product an hour apart, so either succeeding fixes
-/// the layer — which is exactly the shape [`FetchFailure::of_round`] is for. In
-/// practice both being 404 is the common case and reads as
-/// [`Absent`](FetchFailure::Absent): the bucket does not have that run yet,
-/// which is a normal answer for a model and must not climb a ladder.
+/// the layer — which is exactly the shape [`FetchFailure::of_round`] is for, and
+/// "refused only if every part was" is the right rule here for a sharper reason
+/// than usual: the fallback is the *older* run, so it is the one **less** likely
+/// to be missing. A refusal that survives both is a refusal of the product.
+///
+/// # Why an all-404 round does not stay routine
+///
+/// A single run 404ing is genuinely routine — the bucket carries a rolling
+/// window and each run's files land over several minutes, which is the whole
+/// reason this fallback exists. So [`fetch_record`] classifies its 404s
+/// [`IsRoutine`](NotFound::IsRoutine), and a lone one reads as
+/// [`Absent`](FetchFailure::Absent): "not published right now", ladder reset,
+/// ordinary hourly poll, no fault reported. Correct.
+///
+/// But the bucket should always carry *at least one* of the last two hourly
+/// runs. Both missing is not the publication schedule; it is a moved path, a
+/// renamed product, or an outage. Left as `Absent` that state is invisible for
+/// ever — `Absent` resets the ladder, stamps the clock and reports no fault, so
+/// a permanently moved HRRR would poll hourly and say nothing, which is the
+/// same silence this module exists to end, just wearing a friendlier verdict.
+///
+/// Escalated to [`Transient`](FetchFailure::Transient) rather than
+/// [`Permanent`](FetchFailure::Permanent) deliberately: a 404 alone cannot tell
+/// a moved product from an outage, and `Transient` costs the ceiling — one poll
+/// an hour, what a healthy HRRR costs — while still surfacing as "not loading"
+/// in the layer's own panel. Claiming a refusal here would be claiming more
+/// than two 404s can prove.
 fn round_verdict(parts: [FetchError; 2], context: &str) -> FetchError {
-    let failure = FetchFailure::of_round(parts.iter().map(|e| e.failure));
-    let [first, second] = parts;
-    FetchError {
-        failure,
-        message: format!("{context}: {first}; then {second}"),
+    let mut round = FetchError::of_round(&parts, context);
+    if round.failure == FetchFailure::Absent {
+        round.failure = FetchFailure::Transient;
     }
+    round
 }
 
 /// Attempt a single HRRR fetch for a specific run.

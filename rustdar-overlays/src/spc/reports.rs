@@ -85,14 +85,15 @@ pub async fn fetch_storm_reports(
     }
 
     if failures.len() == 3 {
-        // Every CSV failed. Carry the first verdict rather than inventing one:
-        // three 404s on a quiet path mean something different from three
-        // timeouts, and the ladder is entitled to know which.
-        let first = failures.remove(0);
-        return Err(FetchError {
-            failure: first.failure,
-            message: format!("no storm report CSV could be fetched: {}", first.message),
-        });
+        // Every CSV failed. The round's verdict is the merge of all three, not
+        // whichever happened to be listed first: `failures[0]` is always the
+        // tornado CSV, so one 400 there condemned the layer even when hail and
+        // wind had merely timed out. Merged, the round is refused only if all
+        // three were — the rule every other multi-request round here follows.
+        return Err(FetchError::of_round(
+            &failures,
+            "no storm report CSV could be fetched",
+        ));
     }
 
     log::info!("Fetched {} storm reports total", reports.len());

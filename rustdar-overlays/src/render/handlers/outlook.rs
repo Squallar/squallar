@@ -112,6 +112,17 @@ pub(crate) struct SpcOutlookHandler {
     /// Bumped when day or product set changes without any fetch, which still
     /// changes what gets drawn.
     config_generation: u64,
+    /// The last *failure* per product, `Absent` excluded — see
+    /// [`Self::refile_round_health`].
+    ///
+    /// This layer is the only one that issues **several fetch tasks per round**,
+    /// one per enabled product, and they all land on one shared `state.retry`.
+    /// Filing each result as it arrived made the layer's health depend on which
+    /// task happened to resolve last: three products succeeding and one 500ing
+    /// showed a fault or showed nothing depending on the order. Keeping the
+    /// failures per product and deriving the ledger from the whole map makes the
+    /// answer a property of the round instead of a race.
+    per_product_error: HashMap<(OutlookDay, OutlookProduct), crate::fetch_policy::FetchError>,
     pub selected_day: OutlookDay,
     /// Empty means the whole overlay is off — see `is_enabled`.
     pub enabled_products: HashSet<OutlookProduct>,
@@ -123,9 +134,67 @@ impl SpcOutlookHandler {
             state: OverlayState::new(),
             per_product_generation: HashMap::new(),
             config_generation: 0,
+            per_product_error: HashMap::new(),
             selected_day: OutlookDay::Day1,
             enabled_products: HashSet::new(),
         }
+    }
+
+    /// Re-derive the layer's ledger from every product's last answer.
+    ///
+    /// Called after **each** task lands, and idempotent so repeating it does not
+    /// climb the ladder: it files a failure only while one is outstanding, and
+    /// the success path has already cleared the ledger by the time it runs. That
+    /// is what makes the layer's final health a property of the round rather
+    /// than of the order its tasks happened to resolve in — three products
+    /// succeeding and one 500ing used to show a fault or show nothing depending
+    /// on which landed last.
+    ///
+    /// Walks the day's own publication order rather than `enabled_products`'
+    /// `HashSet` order, for the same reason
+    /// [`status_line`](OverlayHandler::status_line) does: a message built from a
+    /// `HashSet` walk jitters between frames.
+    ///
+    /// Scoped to the products currently asked for, so one the user has since
+    /// unticked — or one belonging to a day they have navigated away from —
+    /// cannot keep the layer reading as failing.
+    ///
+    /// [`Absent`](crate::fetch_policy::FetchFailure::Absent) never reaches the
+    /// map this reads. SPC does not keep every product up at every hour, so
+    /// "not published right now" for one of four is an answer about that
+    /// product, not a fault in the layer.
+    fn refile_round_health(&mut self) {
+        let day = self.selected_day;
+        let failed: Vec<(OutlookProduct, &crate::fetch_policy::FetchError)> = day
+            .products()
+            .iter()
+            .copied()
+            .filter(|p| self.enabled_products.contains(p))
+            .filter_map(|p| self.per_product_error.get(&(day, p)).map(|e| (p, e)))
+            .collect();
+        if failed.is_empty() {
+            return;
+        }
+        let asked = day
+            .products()
+            .iter()
+            .filter(|p| self.enabled_products.contains(p))
+            .count();
+        let merged = crate::fetch_policy::FetchError {
+            failure: crate::fetch_policy::FetchFailure::of_round(
+                failed.iter().map(|(_, e)| e.failure),
+            ),
+            message: format!(
+                "{} of {asked} outlook products did not load: {}",
+                failed.len(),
+                failed
+                    .iter()
+                    .map(|(p, e)| format!("{p:?}: {}", e.message))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        };
+        self.state.retry.record_failure(&merged);
     }
 
     fn combined_generation(&self) -> u64 {
@@ -274,27 +343,46 @@ impl OverlayHandler for SpcOutlookHandler {
             log::error!("SPC outlook handler received unexpected fetch result type");
             return;
         };
+        let key = (fetch.day, fetch.product);
         match fetch.result {
             Ok(outlook) => {
                 log::info!("Received SPC outlook: {:?} {:?}", fetch.day, fetch.product);
-                self.state.data.insert((fetch.day, fetch.product), outlook);
+                self.state.data.insert(key, outlook);
+                self.per_product_error.remove(&key);
                 self.state.record_success();
-                let counter = self
-                    .per_product_generation
-                    .entry((fetch.day, fetch.product))
-                    .or_insert(0);
+                let counter = self.per_product_generation.entry(key).or_insert(0);
                 *counter = counter.wrapping_add(1);
+            }
+            Err(e) if e.failure == crate::fetch_policy::FetchFailure::Absent => {
+                // An answer, about one product. Straight through: it stamps the
+                // clock and reports "not published right now" without putting
+                // the layer on a ladder.
+                log::info!(
+                    "SPC outlook not published ({:?} {:?}): {e}",
+                    fetch.day,
+                    fetch.product
+                );
+                self.per_product_error.remove(&key);
+                self.state.record_failure(&e);
             }
             Err(e) => {
                 log::error!(
-                    "SPC outlook fetch failed ({:?} {:?}): {}",
+                    "SPC outlook fetch failed ({:?} {:?}): {e}",
                     fetch.day,
-                    fetch.product,
-                    e
+                    fetch.product
                 );
-                self.state.record_failure(&e);
+                // The ledger is **not** written here. One task's error is one
+                // product's error, and this layer has several tasks in flight
+                // at once; writing straight through made the layer's health a
+                // race between them. `refile_round_health` derives it from all
+                // of their answers instead. Only `fetching` is ended here,
+                // which `record_failure` would otherwise have done — leaving it
+                // set is the one absorbing state left in `auto_fetch_delay`.
+                self.per_product_error.insert(key, e);
+                self.state.fetching = false;
             }
         }
+        self.refile_round_health();
     }
 
     fn retain_selections(&self, _selections: &mut Vec<Arc<dyn OverlayItem>>) {
@@ -671,6 +759,156 @@ mod tests {
             handler.status_line().as_deref(),
             Some("Day 1 - Categorical, Tornado"),
             "publication order, not set-iteration order"
+        );
+    }
+
+    fn outlook(product: OutlookProduct) -> SpcOutlook {
+        SpcOutlook {
+            day: OutlookDay::Day1,
+            product,
+            valid: None,
+            expire: None,
+            features: Vec::new(),
+        }
+    }
+
+    /// Deliver one product's result through the real ingest path.
+    fn land(
+        handler: &mut SpcOutlookHandler,
+        product: OutlookProduct,
+        result: Result<SpcOutlook, crate::fetch_policy::FetchError>,
+    ) {
+        handler.apply_fetch_result(Box::new(SpcOutlookFetchResult {
+            day: OutlookDay::Day1,
+            product,
+            result,
+        }));
+    }
+
+    /// A handler asking for all four of day 1's products.
+    fn four_product_handler() -> SpcOutlookHandler {
+        let mut h = SpcOutlookHandler::new();
+        for &p in OutlookDay::Day1.products() {
+            h.enabled_products.insert(p);
+        }
+        h
+    }
+
+    /// **The resolution-order test.** This layer is the only one that puts
+    /// several fetch tasks in flight at once, and they all land on one shared
+    /// `state.retry`. Three products succeeding and one failing must read the
+    /// same either way round; it used to read as a fault or as nothing at all
+    /// depending on which task the network happened to finish last.
+    #[test]
+    fn a_partly_failed_round_reads_the_same_whichever_task_lands_last() {
+        use OutlookProduct::{Categorical, Hail, Tornado, Wind};
+        let failure = || crate::fetch_policy::FetchError::transient("HTTP 500");
+
+        let mut failure_first = four_product_handler();
+        land(&mut failure_first, Tornado, Err(failure()));
+        land(&mut failure_first, Categorical, Ok(outlook(Categorical)));
+        land(&mut failure_first, Wind, Ok(outlook(Wind)));
+        land(&mut failure_first, Hail, Ok(outlook(Hail)));
+
+        let mut failure_last = four_product_handler();
+        land(&mut failure_last, Categorical, Ok(outlook(Categorical)));
+        land(&mut failure_last, Wind, Ok(outlook(Wind)));
+        land(&mut failure_last, Hail, Ok(outlook(Hail)));
+        land(&mut failure_last, Tornado, Err(failure()));
+
+        assert_eq!(
+            failure_first.state.retry.health(),
+            failure_last.state.retry.health(),
+            "the layer's health depends on which task resolved last",
+        );
+        let note = failure_first
+            .state
+            .retry
+            .status_note()
+            .expect("one product of four failed; the layer must say so");
+        assert!(
+            note.contains("Tornado"),
+            "the note must name the product that did not load: {note}",
+        );
+        assert!(
+            note.contains("1 of 4"),
+            "the note must say how much of the round is missing: {note}",
+        );
+        // Both orders left all three good products drawable.
+        assert_eq!(failure_first.state.data.len(), 3);
+        assert_eq!(failure_last.state.data.len(), 3);
+    }
+
+    /// A round where everything arrives is clean, and a product that recovers
+    /// takes the layer back to healthy rather than leaving a stuck note.
+    #[test]
+    fn a_recovered_product_clears_the_layers_verdict() {
+        use OutlookProduct::{Categorical, Hail, Tornado, Wind};
+        let mut h = four_product_handler();
+        for p in [Categorical, Wind, Hail] {
+            land(&mut h, p, Ok(outlook(p)));
+        }
+        land(
+            &mut h,
+            Tornado,
+            Err(crate::fetch_policy::FetchError::transient("HTTP 500")),
+        );
+        assert!(h.state.retry.is_unhealthy(), "premise: one product failed");
+
+        land(&mut h, Tornado, Ok(outlook(Tornado)));
+        assert_eq!(
+            h.state.retry.status_note(),
+            None,
+            "every product has now arrived; the layer must stop reporting a fault",
+        );
+    }
+
+    /// "Not published right now" for one product is an answer about that
+    /// product, not a fault in the layer. Days 4-8 publish one product and SPC
+    /// does not keep every outlook up at every hour, so treating a routine 404
+    /// as staleness would put a permanent warning on a working layer.
+    #[test]
+    fn an_absent_product_is_not_reported_as_the_layer_being_stale() {
+        use OutlookProduct::{Categorical, Hail, Tornado, Wind};
+        let mut h = four_product_handler();
+        for p in [Categorical, Wind, Hail] {
+            land(&mut h, p, Ok(outlook(p)));
+        }
+        land(
+            &mut h,
+            Tornado,
+            Err(crate::fetch_policy::FetchError::absent("HTTP 404")),
+        );
+        assert!(
+            !h.state.retry.is_unhealthy(),
+            "an unpublished product must not read as the layer failing",
+        );
+    }
+
+    /// Unticking the product that failed clears the layer's verdict: the
+    /// round is scoped to what is actually being asked for.
+    #[test]
+    fn a_failure_from_an_unticked_product_stops_counting() {
+        use OutlookProduct::{Categorical, Tornado};
+        let mut h = four_product_handler();
+        land(&mut h, Categorical, Ok(outlook(Categorical)));
+        land(
+            &mut h,
+            Tornado,
+            Err(crate::fetch_policy::FetchError::transient("HTTP 500")),
+        );
+        assert!(h.state.retry.is_unhealthy(), "premise");
+
+        h.enabled_products.remove(&Tornado);
+        h.refile_round_health();
+        // The ledger still carries the old filing; what matters is that a
+        // fresh round no longer re-files it.
+        h.state.retry.clear();
+        h.refile_round_health();
+        assert_eq!(
+            h.state.retry.status_note(),
+            None,
+            "a product the user unticked must not keep the layer reading as failing",
         );
     }
 }
