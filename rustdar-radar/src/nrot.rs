@@ -15,9 +15,9 @@
 //!    derivative stage would misread as extreme shear.
 //! 2. Median-filter the dealiased field (3–5 radials by physical width × 5
 //!    gates); centres whose window is mostly missing raw data read ND.
-//! 3. At each bin, the azimuthal derivative is the split-tap per-radial
-//!    operator ([`SPLIT_CLEAN`]/[`SPLIT_AWAY`]) inside 80 km and the
-//!    composite 11-radial stencil [`COMPOSITE_TAPS`] beyond, applied to
+//! 3. At each bin, the azimuthal derivative is the per-radial super-res
+//!    operator ([`SPLIT_TAPS`]) inside 80 km and the composite 11-radial
+//!    stencil [`COMPOSITE_TAPS`] beyond, applied to
 //!    3-gate range means and divided by the local arc per radial. The
 //!    sign-reversed outer taps produce the small negative side lobes
 //!    flanking every strong gradient. All five tap pairs must be intact and
@@ -729,34 +729,67 @@ fn rot_divisor_km(range_km: f64) -> f64 {
 /// strong gradient — a plain least-squares slope cannot produce those.
 const COMPOSITE_TAPS: [f64; 5] = [0.1039, 0.1595, 0.1187, -0.0037, -0.0630];
 
-/// The per-radial split-tap operator: the side toward the whole-degree pair
-/// partner applies `SPLIT_CLEAN` (the legacy-grid taps ĉ = [0.580, 0.238,
-/// −0.151]) at 2/3/4 super-res offsets; the side away from the partner
-/// applies `SPLIT_AWAY` = [ĉ₂, ĉ₁−ĉ₂, ĉ₂, ĉ₃] at 1/2/3/4. Both sides sum to
-/// ĉ₁+ĉ₂+ĉ₃, so the operator is zero-sum; normalization is two rows of the
-/// grid, which is the legacy 1.0° arc on the super-res grid these were fitted
-/// on (see [`split_stencil_rot`], where the difference between those two
-/// readings is what makes the operator a derivative rather than a reading of
-/// one particular spacing). Empirical: it is the unique zero-sum anchored linear operator
-/// solved exactly from the reference's measured per-radial step-response
-/// profiles, which no pair-average-then-convolve chain reproduces.
-/// Measured provenance: branch `campaign-harness`.
-const SPLIT_CLEAN: [(i32, f64); 3] = [(2, 0.580), (3, 0.238), (4, -0.151)];
-const SPLIT_AWAY: [(i32, f64); 4] = [(1, 0.238), (2, 0.342), (3, 0.238), (4, -0.151)];
+/// The per-radial operator on a 0.5°-spaced sweep: taps [ĉ₂, ĉ₁−ĉ₂, ĉ₂, ĉ₃]
+/// at row offsets 1/2/3/4, applied **antisymmetrically** — the same list on
+/// both sides of the bin, positive toward increasing azimuth. Zero-sum by
+/// construction; normalization is two rows of the grid, which is the legacy
+/// 1.0° arc on the super-res grid it was fitted on (see
+/// [`split_stencil_rot`], where the difference between those two readings is
+/// what makes the operator a derivative rather than a reading of one
+/// particular spacing).
+///
+/// # The reference has no pairing asymmetry to assign here
+///
+/// This used to be *two* tap lists — `SPLIT_CLEAN` = ĉ at offsets 2/3/4 on
+/// the side facing a radial's whole-degree pair partner, these taps on the
+/// side away from it — with [`pair_phase`] deciding which side each radial
+/// faced. A step landing between pairs then read a flat four-radial core
+/// (0.78 ×4 at 21.0 nm on a ±8 m/s step) and one landing inside a pair read a
+/// two-radial core with 0.50 shoulders, on the same weather, alternating with
+/// absolute azimuth.
+///
+/// The reference does neither: it reads the shouldered profile at **every**
+/// step, whatever the parity. Measured by patching six ±8 m/s step edges into
+/// the 30–47 km band of a real volume's 0.5° cut — three at whole-degree
+/// azimuths (40.0, 160.0, 280.0), three at half-degree ones (100.5, 220.5,
+/// 340.5), which are opposite radial-index parities because super-res radial
+/// centres sit at x.21/x.71 — and hovering GR2Analyst's status bar along the
+/// 21.0 nm arc at 0.25° steps. All 36 profiles (KLOT VCP 212, KATX 215, KMSX,
+/// KHNX, KLWX, and a KTLX holdout; declared Nyquist 8.3–24.0 m/s) read
+///
+/// ```text
+/// −0.18  +0.10  +0.49  +0.77  +0.77  +0.49  +0.10  −0.18
+/// ```
+///
+/// symmetric about the edge, which is these taps on both sides (predicted
+/// −0.176/+0.102/+0.501/+0.779) and is *not* any assignment of the old
+/// asymmetry: applying the clean side uniformly reads three radials at 0.78
+/// and one at 0.50, an unsymmetric profile the reference never shows. A step
+/// response determines a zero-sum operator uniquely — its successive
+/// differences *are* the taps — so this is a measurement of the operator, not
+/// a fit to it. Eighteen ±10 m/s six-radial couplet profiles over the same
+/// azimuth classes agree: identical at both parities, flanks +0.30 against
+/// this operator's +0.31.
+///
+/// Nor is the anchor merely off by one: a companion set of volumes with every
+/// super-res azimuth shifted +0.5° — which moves the sweep's first radial
+/// from the low member of its degree to the high one, and so flips
+/// index-parity against floor(az) — reads the same profile again at both
+/// KLOT and KTLX. The reference's response is invariant to the pairing, so
+/// there is no phase to anchor.
+const SPLIT_TAPS: [(i32, f64); 4] = [(1, 0.238), (2, 0.342), (3, 0.238), (4, -0.151)];
 
 /// The operator for a sweep that is *already* legacy resolution — a TDWR cut,
 /// or a WSR-88D tilt above the super-res ones. Antisymmetric, at row offsets
 /// ±1 and ±2 only, normalized by **one** row: ROT = Σ tₖ(v(i+k) − v(i−k)) /
 /// arc_per_radial.
 ///
-/// [`SPLIT_CLEAN`]/[`SPLIT_AWAY`] cannot serve here. They are one operator
-/// split into two halves that a radial chooses between by which side its
-/// whole-degree pair partner sits on, and a 1.0°-spaced sweep has no such
-/// partner ([`pair_phase`]) — so the choice fell to the collection index and
-/// the same sky read two different numbers depending on where the antenna
-/// began. These taps are what the reference does instead, hovered per radial
-/// off a synthetic 1.0° cut carrying a ±8 m/s step and a ±10 m/s six-radial
-/// couplet (measured provenance: branch `campaign-harness`):
+/// [`SPLIT_TAPS`] cannot serve here: it spans ±4 rows of a 0.5° grid, which
+/// is ±4.0° of sky on a 1.0° one, and it carries a different gain
+/// (`one_shear_reads_the_gain_its_own_operator_carries`). These taps are what
+/// the reference does instead, hovered per radial off a synthetic 1.0° cut
+/// carrying a ±8 m/s step and a ±10 m/s six-radial couplet (measured
+/// provenance: branch `campaign-harness`):
 ///
 /// * Its response is the **same at both index parities** — 8 step boundaries
 ///   and 8 couplets of alternating parity, over KLOT (VCP 212), KATX (215),
@@ -783,12 +816,12 @@ const SPLIT_AWAY: [(i32, f64); 4] = [(1, 0.238), (2, 0.342), (3, 0.238), (4, -0.
 const LEGACY_TAPS: [(i32, f64); 2] = [(1, 0.6812), (2, -0.0838)];
 
 /// Matched-filter kernel bank: one per-radial tap operator per couplet pole
-/// width (2/3/4 radials), with the same (offset, tap) clean/away semantics
-/// as [`SPLIT_CLEAN`]/[`SPLIT_AWAY`]. Each kernel is empirically fitted so
-/// that its response to the ideal median-filtered width-w couplet matches
-/// the reference's measured width-w couplet response, anchored to the
-/// primary operator's own core response on the same pattern (measured
-/// provenance: branch `campaign-harness`). The kernels never see
+/// width (2/3/4 radials), as a clean/away tap pair a radial chooses between by
+/// which side its whole-degree pair partner sits on. Each kernel is
+/// empirically fitted so that its response to the ideal median-filtered
+/// width-w couplet matches the reference's measured width-w couplet response,
+/// anchored to the primary operator's own core response on the same pattern
+/// (measured provenance: branch `campaign-harness`). The kernels never see
 /// steps or notches: [`apply_kernel_bank`] only engages them — and only as
 /// magnitude caps — where the local velocity profile carries a bipolar
 /// couplet signature, so the primary chain keeps full ownership of sign,
@@ -965,17 +998,15 @@ const GK_MIN_R2: f64 = 0.05;
 /// margin gives the split stencil the same protection.
 const GK_DATA_MARGIN: i32 = 1;
 
-/// The split-tap operator at one bin. `pair_first` says whether radial `i`
-/// is the first member of its whole-degree pair (partner at i+1) or the
-/// second (partner at i−1). Requires every tap cell; profiles that do not
-/// correlate with the stencil read ND like the composite estimator's.
+/// The super-res operator ([`SPLIT_TAPS`]) at one bin. Requires every tap
+/// cell; profiles that do not correlate with the stencil read ND like the
+/// composite estimator's.
 fn split_stencil_rot(
     vel_grid: &[Vec<f64>],
     i: usize,
     j: usize,
     arc_per_radial: f64,
     gate_count: usize,
-    pair_first: bool,
     rows: crate::azimuth::Rows,
 ) -> Option<f64> {
     // Range-averaged velocity at offsets −(4+margin)..=4+margin; prof[6 + o].
@@ -1014,20 +1045,11 @@ fn split_stencil_rot(
             return None;
         }
     }
-    // Signed weight per profile cell: toward-partner side clean, away side
-    // split. The partner sits at +1 for a pair-first radial.
+    // Signed weight per profile cell: one tap list, mirrored — positive
+    // toward increasing azimuth, negative away from it.
     let mut w = [0.0f64; 15];
-    let clean: &[(i32, f64)] = &SPLIT_CLEAN;
-    let away: &[(i32, f64)] = &SPLIT_AWAY;
-    let (plus, minus) = if pair_first {
-        (clean, away)
-    } else {
-        (away, clean)
-    };
-    for &(o, t) in plus {
+    for &(o, t) in &SPLIT_TAPS {
         w[(7 + o) as usize] += t;
-    }
-    for &(o, t) in minus {
         w[(7 - o) as usize] -= t;
     }
     let (mut acc, mut mean, mut nv) = (0.0, 0.0, 0);
@@ -1147,11 +1169,25 @@ fn legacy_stencil_rot(
     Some(acc / arc_per_radial)
 }
 
-/// Which index phase pairs super-res radials into whole-degree legacy bins:
-/// radials (2k+phase, 2k+1+phase) share a degree sector. The legacy pairing
-/// is anchored to ABSOLUTE azimuth — a measured fact: steps at whole-degree
-/// boundaries read clean, at half-degree boundaries pair-averaged. Measured
-/// provenance: branch `campaign-harness`.
+/// Whether this sweep's rows pair into whole-degree legacy bins, and at which
+/// index phase: radials (2k+phase, 2k+1+phase) share a degree sector. The
+/// pairing is anchored to ABSOLUTE azimuth, not to collection order — a
+/// super-res cut's radial centres sit at x.21/x.71 and the two sharing a
+/// floor are the pair.
+///
+/// `Some` versus `None` is the load-bearing half of the answer: it says
+/// whether the rows are a 0.5° grid (take [`SPLIT_TAPS`]) or already whole
+/// degrees (take [`LEGACY_TAPS`]). The phase *value* is used by
+/// [`apply_kernel_bank`] alone, to pick each kernel's clean/away form.
+///
+/// It no longer picks a form for the primary operator. It used to, and the
+/// reference does not: hovered across 36 synthetic step edges at both
+/// parities over six sites, its super-res step response is the same
+/// symmetric profile every time ([`SPLIT_TAPS`] carries the readings). The
+/// kernel bank's own clean/away split rests on the same assumption and has
+/// not been re-measured — its couplet cores read 0.75 and 0.36 at the two
+/// parities where the reference reads 0.97 on both, so the phase it takes
+/// from here is a suspect, not a validated, input.
 ///
 /// # `None` where there is no pairing to find
 ///
@@ -1165,7 +1201,7 @@ fn legacy_stencil_rot(
 /// [`LEGACY_TAPS`] rather than a half of an operator it cannot choose between.
 ///
 /// Answering `Some(0)` there — which this did until the reference was hovered
-/// on a 1.0° cut — handed [`split_stencil_rot`]'s clean/away asymmetry to
+/// on a 1.0° cut — handed the primary operator's then clean/away asymmetry to
 /// `i % 2`, off collection index rather than off azimuth. Two sites make the
 /// cost concrete: the same synthetic step at az 100.1° and the same couplet at
 /// az 140.1° landed on even indices at KLOT and odd ones at KATX, purely
@@ -1176,7 +1212,7 @@ fn legacy_stencil_rot(
 ///
 /// A ragged sweep is deliberately not `None`. Only *no* cohabiting pair at
 /// either alignment says the rows are whole degrees; a sector or a jittered
-/// super-res cut still finds most of its pairs and keeps the split operator,
+/// super-res cut still finds most of its pairs and keeps [`SPLIT_TAPS`],
 /// which is the path validated against the reference.
 fn pair_phase(azimuths_deg: &[f64]) -> Option<usize> {
     let n = azimuths_deg.len();
@@ -1451,7 +1487,7 @@ fn bank_kernel_rot(
 /// branch `campaign-harness`.
 ///
 /// None of it runs on a sweep whose rows are already whole degrees. Every
-/// kernel here is a clean/away pair like [`SPLIT_CLEAN`]/[`SPLIT_AWAY`] and so
+/// kernel here is a clean/away pair, chosen by [`pair_phase`], and so
 /// has no form to choose on such a grid — and there is nothing for it to
 /// compress: the reference's couplet response there is exactly what
 /// [`LEGACY_TAPS`] predicts from its own step response, pole-edge over core
@@ -1784,13 +1820,12 @@ fn llsd_nrot(sweep: &VelocitySweep, vel_grid: &[Vec<f64>]) -> Vec<Vec<f64>> {
                     let arc_per_radial = range_km * spacing_rad;
                     let rot = if range_km < SPLIT_MAX_RANGE_KM {
                         match phase {
-                            Some(phase) => split_stencil_rot(
+                            Some(_) => split_stencil_rot(
                                 vel_grid,
                                 i,
                                 j,
                                 arc_per_radial,
                                 sweep.gate_count,
-                                i % 2 == phase,
                                 rows,
                             ),
                             // Rows that are already whole degrees: no partner
@@ -3398,13 +3433,15 @@ mod tests {
         let s = sweep(&grid, &azimuths, gates);
         let nrot = llsd_nrot(&s, &grid);
 
-        // Gate 200 → 50.25 km: inside the split-tap operator's domain. Its
-        // ramp gain is the mean of the clean and split sides' Σ t·o over the
-        // legacy arc: (2ĉ₁+3ĉ₂+4ĉ₃ + ĉ₂+2(ĉ₁−ĉ₂)+3ĉ₂+4ĉ₃) / 2.
+        // Gate 200 → 50.25 km: inside the super-res operator's domain. Its
+        // ramp gain is Σ t·o over the legacy arc, the same on both sides:
+        // ĉ₂ + 2(ĉ₁−ĉ₂) + 3ĉ₂ + 4ĉ₃ = 1.032. The reference reads this gain
+        // directly — a 6 m/s-per-degree synthetic ramp at 21.0 nm reads 0.45
+        // there, against this operator's 0.450 and the old split operator's
+        // 0.502 (measured, KLOT/KMSX/KLWX; see [`SPLIT_TAPS`]).
         let range_nm = (0.25 + 200.0 * 0.25) / KM_PER_NM;
-        let clean: f64 = SPLIT_CLEAN.iter().map(|&(o, t)| o as f64 * t).sum();
-        let away: f64 = SPLIT_AWAY.iter().map(|&(o, t)| o as f64 * t).sum();
-        let expected = k * (clean + away) / 2.0 / rot_divisor(range_nm);
+        let gain: f64 = SPLIT_TAPS.iter().map(|&(o, t)| o as f64 * t).sum();
+        let expected = k * gain / rot_divisor(range_nm);
         let got = nrot[10][200];
         assert!(
             (got - expected).abs() < 0.03,
@@ -3514,12 +3551,11 @@ mod tests {
         assert_eq!(carried, 32 * 200, "the compared window read mostly ND");
 
         // And the value is the shear that is there: gate 200 is 50.25 km,
-        // inside the split-tap domain, where the ramp gain is the mean of the
-        // clean and split sides' Σ t·o over the legacy arc.
+        // inside the super-res operator's domain, where the ramp gain is its
+        // Σ t·o over the legacy arc.
         let range_nm = (0.25 + 200.0 * 0.25) / KM_PER_NM;
-        let clean: f64 = SPLIT_CLEAN.iter().map(|&(o, t)| o as f64 * t).sum();
-        let away: f64 = SPLIT_AWAY.iter().map(|&(o, t)| o as f64 * t).sum();
-        let expected = k * (clean + away) / 2.0 / rot_divisor(range_nm);
+        let gain: f64 = SPLIT_TAPS.iter().map(|&(o, t)| o as f64 * t).sum();
+        let expected = k * gain / rot_divisor(range_nm);
         let got = sector_nrot[30][200];
         assert!(
             (got - expected).abs() < 0.03,
@@ -3565,11 +3601,10 @@ mod tests {
             .collect();
         let nrot = llsd_nrot(&sweep(&grid, &azimuths, gates), &grid);
 
-        let clean: f64 = SPLIT_CLEAN.iter().map(|&(o, t)| o as f64 * t).sum();
-        let away: f64 = SPLIT_AWAY.iter().map(|&(o, t)| o as f64 * t).sum();
+        let gain: f64 = SPLIT_TAPS.iter().map(|&(o, t)| o as f64 * t).sum();
         for j in 100..300 {
             let range_km = 0.25 + j as f64 * 0.25;
-            let expected = k * (clean + away) / 2.0 / rot_divisor(range_km / KM_PER_NM);
+            let expected = k * gain / rot_divisor(range_km / KM_PER_NM);
             for i in (0..5).chain(67..72) {
                 assert!(
                     nrot[i][j].is_nan(),
@@ -3757,12 +3792,10 @@ mod tests {
              disagreement, not rounding",
         );
 
-        // Each grid reads the gain its own operator carries: the split
-        // operator's is the mean of its two sides' Σ t·o over two rows, the
-        // composite's and the legacy grid's are Σ 2·o·t over one.
-        let split_gain: f64 = (SPLIT_CLEAN.iter().map(|&(o, t)| o as f64 * t).sum::<f64>()
-            + SPLIT_AWAY.iter().map(|&(o, t)| o as f64 * t).sum::<f64>())
-            / 2.0;
+        // Each grid reads the gain its own operator carries: the super-res
+        // operator's is its Σ t·o over two rows, the composite's and the
+        // legacy grid's are Σ 2·o·t over one.
+        let split_gain: f64 = SPLIT_TAPS.iter().map(|&(o, t)| o as f64 * t).sum::<f64>();
         let composite_gain: f64 = COMPOSITE_TAPS
             .iter()
             .enumerate()
@@ -3942,7 +3975,7 @@ mod tests {
             );
             compared += usize::from(a.is_finite());
         }
-        assert_eq!(compared, 714, "the compared row read mostly ND");
+        assert_eq!(compared, 713, "the compared row read mostly ND");
 
         let coarse = (read(360, 1.0, 0), read(360, 1.0, 1));
         let mut compared = 0;
@@ -4134,57 +4167,91 @@ mod tests {
             }
         }
     }
-    /// The split-tap operator reproduces the measured per-radial step
-    /// profile: a ±8 m/s step at a whole-degree boundary reads the full
-    /// value on four radials, then one radial each of the +0.10-class and
-    /// −0.18-class tails, then nothing.
+    /// [`SPLIT_TAPS`] reproduces the reference's measured per-radial step
+    /// profile, **and reads a step at a whole degree exactly as it reads one
+    /// at a half degree**.
+    ///
+    /// The classes are the operator's cumulative sums from the outside in —
+    /// which is what a step response *is* for a zero-sum operator — and the
+    /// reference's own readings at 21.0 nm on a ±8 m/s step are printed
+    /// beside them:
+    ///
+    /// ```text
+    ///   radials flanking the edge   ĉ₁+ĉ₂+ĉ₃ = 0.667   0.780   GR 0.77
+    ///   one further out             ĉ₂+(ĉ₁−ĉ₂)+ĉ₃      0.501   GR 0.49
+    ///   two further out             ĉ₂+ĉ₃              0.102   GR 0.10
+    ///   three further out           ĉ₃                −0.176   GR −0.18
+    /// ```
+    ///
+    /// Both boundaries carry the same profile because the reference does:
+    /// 36 hovered profiles over six sites, three at whole-degree azimuths and
+    /// three at half-degree ones — opposite radial-index parities, since
+    /// super-res radial centres sit at x.21/x.71 — every one reading the
+    /// shouldered shape above. This test asserted a flat *four*-radial core
+    /// at the whole-degree boundary until those readings were taken; that
+    /// shape is what the old clean/away asymmetry produced there and the
+    /// reference never shows it. See [`SPLIT_TAPS`].
+    ///
+    /// The sub-threshold tails may read ND (the coherence gate drops them,
+    /// and the display palette would not paint them either) but when present
+    /// must carry the measured class values.
     #[test]
     fn split_stencil_matches_the_measured_step_profile() {
         let n = 720;
         let gates = 400;
         let azimuths = ring_azimuths(n); // i·0.5°, pairs at whole degrees
-        let grid: Vec<Vec<f64>> = (0..n)
-            .map(|i| vec![if azimuths[i] < 45.0 { -8.0 } else { 8.0 }; gates])
-            .collect();
-        let s = sweep(&grid, &azimuths, gates);
-        let nrot = llsd_nrot(&s, &grid);
-
         let j = 153; // 38.5 km
         let range_km = 0.25 + j as f64 * 0.25;
         let arc_legacy = range_km * 1.0_f64.to_radians();
         let scale = 16.0 / arc_legacy / rot_divisor_km(range_km);
         let (c1, c2, c3) = (0.580, 0.238, -0.151);
-        // Radial 90 is the first +8 radial; the boundary sits between pairs.
-        // The full-value core must paint on exactly its four radials; the
-        // sub-threshold tails may read ND (the coherence gate drops them,
-        // and the display palette would not paint them either) but when
-        // present must carry the measured class values.
-        let full = (c1 + c2 + c3) * scale;
-        for (radial, row) in nrot.iter().enumerate().take(92).skip(88) {
-            let got = row[j];
-            assert!(
-                (got - full).abs() < 0.02,
-                "radial {radial}: got {got:.3}, expected {full:.3}"
-            );
-        }
-        for (radial, expect) in [
-            (86, c3 * scale),
-            (87, (c2 + c3) * scale),
-            (92, (c2 + c3) * scale),
-            (93, c3 * scale),
-        ] {
-            let got = nrot[radial][j];
-            assert!(
-                got.is_nan() || (got - expect).abs() < 0.02,
-                "radial {radial}: got {got:.3}, expected ND or {expect:.3}"
-            );
-        }
-        for radial in [84, 85, 94, 95] {
-            let got = nrot[radial][j];
-            assert!(
-                got.is_nan() || got.abs() < 0.02,
-                "radial {radial}: got {got:.3}, expected ~0"
-            );
+        let class = [
+            (c1 + c2 + c3) * scale,
+            (c2 + (c1 - c2) + c3) * scale,
+            (c2 + c3) * scale,
+            c3 * scale,
+        ];
+
+        // Radial 90 is the first +8 radial of a step at az 45.0, a boundary
+        // *between* whole-degree pairs; radial 91 is the first of a step at
+        // az 45.5, a boundary *inside* one.
+        for (boundary_az, first_plus) in [(45.0, 90usize), (45.5, 91usize)] {
+            let grid: Vec<Vec<f64>> = (0..n)
+                .map(|i| vec![if azimuths[i] < boundary_az { -8.0 } else { 8.0 }; gates])
+                .collect();
+            let s = sweep(&grid, &azimuths, gates);
+            let nrot = llsd_nrot(&s, &grid);
+            for (radial, expect) in [
+                (first_plus - 1, class[0]),
+                (first_plus, class[0]),
+                (first_plus - 2, class[1]),
+                (first_plus + 1, class[1]),
+                (first_plus - 3, class[2]),
+                (first_plus + 2, class[2]),
+                (first_plus - 4, class[3]),
+                (first_plus + 3, class[3]),
+            ] {
+                let got = nrot[radial][j];
+                let core = expect == class[0];
+                assert!(
+                    (got - expect).abs() < 0.02 || (!core && got.is_nan()),
+                    "az {boundary_az}, radial {radial}: got {got:.3}, expected \
+                     {expect:.3}{}",
+                    if core { "" } else { " or ND" },
+                );
+            }
+            for radial in [
+                first_plus - 6,
+                first_plus - 5,
+                first_plus + 4,
+                first_plus + 5,
+            ] {
+                let got = nrot[radial][j];
+                assert!(
+                    got.is_nan() || got.abs() < 0.02,
+                    "az {boundary_az}, radial {radial}: got {got:.3}, expected ~0"
+                );
+            }
         }
     }
 }
