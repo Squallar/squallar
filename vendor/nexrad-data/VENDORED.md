@@ -210,11 +210,10 @@ and **auto-commits the rewritten tree to `main`**, then gates on `-D warnings`.
 Without the tables a bot would eventually rewrite upstream source here on its
 own schedule and the *Local changes* list above would silently stop being true.
 
-One difference worth naming: unlike nexrad-decode, this crate's `src/lib.rs`
-carries no `#![deny(…)]` of its own. A lint attribute in source outranks any
-command-line level, which is what forced a source edit in the sibling
-directory; here the tables reach everything and **no source edit was needed to
-make clippy pass**.
+And the same limit: a lint attribute written in source outranks any
+command-line level, so the tables cannot reach `src/lib.rs`'s own
+`#![deny(…)]`. That forced one source edit, exactly as it did in the sibling
+directory — see *The lint scoping* below.
 
 ### Changed — source
 
@@ -348,6 +347,34 @@ instruction counts, which reproduce to within 1,500 out of 52 billion.
 
 The decoded-moment digest and the raw decompressed-bytes digest are unchanged
 over all 14 volumes.
+
+#### The lint scoping — `src/lib.rs`
+
+Upstream writes
+
+```rust
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
+```
+
+which here becomes `#![cfg_attr(not(test), deny(…))]` for both. Identical edit,
+identical reason, as `vendor/nexrad-decode`.
+
+Upstream's own test code breaks the rule: five `unwrap`s in
+`src/aws/realtime/retry_policy.rs`'s tests, plus the `expect`s in the
+decompression-bound tests added above. Upstream never notices, because it lints
+without `--all-targets` and so never compiles `cfg(test)` code under clippy.
+This workspace's CI does lint `--all-targets`, and the crate would not pass
+clippy at all — `cargo clippy --all-targets --all-features -- -D warnings`
+failed with nine errors and `could not compile nexrad-data (lib test)` before
+this change.
+
+`Cargo.toml`'s `[lints]` tables cannot fix it, because a lint attribute in
+source outranks any command-line level. This is therefore the one place a
+source edit was unavoidable. Scoping the deny to non-test builds keeps it
+saying what it was written to say — no `unwrap` in the library — and is the
+form to offer upstream. A comment at the site says the same thing, so nobody
+has to find this file first.
 
 ## The change that is not here: reusing the decompressor
 

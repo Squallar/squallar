@@ -380,7 +380,10 @@ mod decompress_bound_tests {
                 assert_eq!(compressed, record.len() - 4);
             }
             Err(other) => panic!("expected RecordTooLarge, got {other:?}"),
-            Ok(r) => panic!("expected RecordTooLarge, decompressed {} bytes", r.data().len()),
+            Ok(r) => panic!(
+                "expected RecordTooLarge, decompressed {} bytes",
+                r.data().len()
+            ),
         }
     }
 

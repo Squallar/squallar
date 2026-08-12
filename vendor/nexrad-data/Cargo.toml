@@ -12,7 +12,8 @@
 # ---------------------------------------------------------------------------
 # VENDORED COPY -- this manifest is no longer what crates.io published.
 #
-# Apart from `src/volume/record.rs` and `src/result.rs`, `src/` is
+# Apart from `src/volume/record.rs`, `src/result.rs` and two commented lint
+# lines in `src/lib.rs`, `src/` is
 # byte-for-byte the crates.io tarball of nexrad-data 1.0.0-rc.7; this file is
 # where the vendoring is expressed. Every edit is listed in VENDORED.md next to
 # it, and every edit here is a *removal* plus the one `default` line and the
@@ -178,9 +179,16 @@ optional = true
 # survived is `[lints.rust] warnings = "allow"` -- same lint id as the CI flag,
 # last one wins -- which is why the rustc side below names groups instead.
 #
-# Groups only. Unlike the sibling nexrad-decode directory, `src/lib.rs` here
-# carries no `#![deny(...)]` of its own, so these tables reach everything and
-# no source edit was needed to make clippy pass.
+# Groups only, and no attempt to also silence what these tables cannot reach:
+# `src/lib.rs`'s own `#![deny(...)]` attributes outrank any command-line level,
+# so the one lint conflict that needed a source edit got one. It is recorded in
+# VENDORED.md.
+#
+# The same precedence leaves one deliberate hole: upstream's own
+# `#![warn(clippy::correctness)]` still wins over `all = "allow"` below, so a
+# correctness lint that a future clippy learns to fire here would reach the
+# `-D warnings` gate. That is the one class worth being interrupted by in a
+# decoder, so it stays.
 [lints.rust]
 future_incompatible = { level = "allow", priority = -1 }
 nonstandard_style = { level = "allow", priority = -1 }

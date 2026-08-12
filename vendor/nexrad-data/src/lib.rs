@@ -80,8 +80,19 @@
 //! (`nexrad-model`).
 
 #![forbid(unsafe_code)]
-#![deny(clippy::unwrap_used)]
-#![deny(clippy::expect_used)]
+// VENDORED: upstream writes these two as plain `#![deny(...)]`. They are scoped
+// to non-test builds here because upstream's own test code breaks them nine
+// times -- five `unwrap`s in `aws::realtime::retry_policy`'s tests, and the
+// `expect`s in the decompression-bound tests this fork adds. Upstream never
+// notices, because it lints without `--all-targets` and so never compiles
+// `cfg(test)` code under clippy; this workspace's CI does, and the crate would
+// not pass clippy at all. A lint attribute in source outranks any
+// command-line level, so `Cargo.toml`'s `[lints]` tables cannot reach these --
+// this is the one place a source edit was unavoidable. The deny still says
+// what it was written to say: no `unwrap` in the library. Same edit, same
+// reason, as vendor/nexrad-decode. See VENDORED.md.
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+#![cfg_attr(not(test), deny(clippy::expect_used))]
 #![warn(clippy::correctness)]
 #![deny(missing_docs)]
 
