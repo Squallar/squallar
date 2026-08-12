@@ -747,11 +747,10 @@ impl RadarSite {
     /// every site it knows.
     ///
     /// A rule over the identifier rather than a flag on a row, which is why it
-    /// survived the compiled-in table: the `T` prefix identifies the 45 TDWRs
-    /// wherever the row came from, with one exception a naive
-    /// `starts_with('T')` gets wrong — `TJUA` is San Juan's WSR-88D.
+    /// survived the compiled-in table. See [`is_tdwr_id`], which is the rule
+    /// itself and the only place it is spelled.
     pub fn is_tdwr(&self) -> bool {
-        self.name.starts_with('T') && self.name != "TJUA"
+        is_tdwr_id(self.name)
     }
 
     /// Whether this site is a WSR-88D — the network with dual-pol moments,
@@ -785,6 +784,21 @@ impl RadarSite {
     pub fn is_operational(&self) -> bool {
         self.name != "KCRI"
     }
+}
+
+/// Whether an identifier names a Terminal Doppler Weather Radar.
+///
+/// The `T` prefix identifies the TDWRs — 45 of them when the network was last
+/// counted — with one exception a naive `starts_with('T')` gets wrong: `TJUA`
+/// is San Juan's WSR-88D.
+///
+/// A free function over a bare `&str` rather than only a method on
+/// [`RadarSite`], because a radar this process knows of and cannot place has
+/// no row to ask — see [`SiteTable::unplaced`] — and the site list has to mark
+/// it correctly all the same. One spelling, so the placed and unplaced halves
+/// of that list cannot come to disagree about `TJUA`.
+pub fn is_tdwr_id(site: &str) -> bool {
+    site.starts_with('T') && site != "TJUA"
 }
 
 /// The radar site closest to `lat`/`lon`, with its distance in kilometres.

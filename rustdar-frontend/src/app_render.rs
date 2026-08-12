@@ -450,11 +450,31 @@ impl super::App {
 
     /// Take the launch's one catalogue refresh and write it to the cache.
     ///
-    /// **It is not applied to the live table**, and that is the whole design:
-    /// the table was resolved from the cached catalogue before the first frame,
-    /// and applying a fresh one here would add a map marker, add a site-list row
-    /// and shift a section's height datum under a user who is already looking at
-    /// them. The refresh is for the *next* launch. See [`crate::site_catalogue`].
+    /// **It is normally not applied to the live table**, and that is the whole
+    /// design: the table was resolved from the cached catalogue before the
+    /// first frame, and applying a fresh one here would add a map marker, add a
+    /// site-list row and shift a section's height datum under a user who is
+    /// already looking at them. The refresh is for the *next* launch. See
+    /// [`crate::site_catalogue`].
+    ///
+    /// # The one launch that cannot wait
+    ///
+    /// A fresh install knows no radars. Nothing is cached, nothing has been
+    /// learned, and since the compiled-in table was deleted the binary carries
+    /// nothing either — so "apply it next launch" would mean a first run with
+    /// an empty site list, no markers, and a timezone hint that resolved
+    /// against nothing. The second run would be fine and the first would look
+    /// broken, which is the worst possible arrangement for the one run a new
+    /// user judges the app on.
+    ///
+    /// So when [`App::site_hint_pending`] says the table came up empty, this
+    /// resolves the catalogue immediately and then runs the timezone hint
+    /// against it. Neither step can violate the rule the next-launch policy
+    /// exists to protect: an empty table has no marker to move, no row to shift
+    /// and no height datum to change, and a user cannot have chosen a site from
+    /// a list that had nothing in it.
+    ///
+    /// Spent once, however long the session runs.
     ///
     /// Drains rather than taking one, like every sibling poller, even though
     /// exactly one message can ever arrive: a poller that leaves a message in
@@ -465,6 +485,12 @@ impl super::App {
             // A failed fetch is silent by design — offline is not an error
             // state here, it is a launch that runs on the cache. `catalogue`
             // has already logged the reason at `debug`.
+            //
+            // On a fresh install with no network it is also the end of the road
+            // for this session: the site list stays empty and says so, which is
+            // the honest reading of "nothing has ever told this binary that a
+            // radar exists". `site_hint_pending` stays set, so the next launch
+            // that reaches the network still fills it in.
             let Some(fetched) = response.catalogue else {
                 continue;
             };
@@ -478,7 +504,60 @@ impl super::App {
                 // is none today — would not rewrite the blob it just wrote.
                 self.site_catalogue = fetched;
             }
+            if self.site_hint_pending {
+                self.adopt_the_first_catalogue();
+            }
         }
+    }
+
+    /// Put the first catalogue a fresh install ever fetched into the live
+    /// table, and open on the radar nearest this device's timezone.
+    ///
+    /// Only ever reached with an empty table — see [`App::poll_site_catalogue`]
+    /// — and it spends [`App::site_hint_pending`] on the way in, whether or not
+    /// the hint finds anything, so a catalogue that arrives without a usable
+    /// timezone cannot leave this armed for a later one.
+    fn adopt_the_first_catalogue(&mut self) {
+        self.site_hint_pending = false;
+        let table = rustdar_radar::sites::resolve(
+            self.site_positions
+                .fixes()
+                .chain(self.site_catalogue.fixes()),
+        );
+        log::info!(
+            "first catalogue applied in-session: {} radars placed, {} listed \
+             without a position",
+            table.rows().len(),
+            table.unplaced().len(),
+        );
+
+        // The hint is run here rather than remembered from startup, because at
+        // startup it had nothing to resolve against and chose nothing.
+        let Some(zone) = self.platform.iana_timezone() else {
+            return;
+        };
+        let Some(site) = crate::location_hint::site_for_timezone(&zone) else {
+            return;
+        };
+        // Still a guess either way, so a later location fix may refine it.
+        self.site_is_provisional = true;
+        if self.gui.pane(0).is_some_and(|pane| pane.site == site) {
+            return;
+        }
+        log::info!("opening on {site}, nearest to timezone {zone}");
+        // Through the action a click on the site picker raises, for the reason
+        // spelled out in `upgrade_provisional_site`: assigning `pane.site` is
+        // only the visible third of a site change, and the part that matters
+        // here is that this also spawns the fetch. `set_initial_site` is right
+        // only before the event loop, where the app's own first fetch reads the
+        // site it leaves behind — and this runs inside a frame.
+        self.handle_gui_action(
+            crate::app::GuiAction::SwitchRadarSite {
+                site: site.to_string(),
+                pane_idx: self.gui.active_pane_idx(),
+            },
+            None,
+        );
     }
 
     /// Poll for completed Level III fetch results and update scan info.

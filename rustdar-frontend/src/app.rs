@@ -424,6 +424,23 @@ pub struct App {
     /// so a site the user has actually settled on is never moved out from under
     /// them, however far they later travel.
     site_is_provisional: bool,
+    /// Whether this launch started knowing no radars, and is still waiting for
+    /// the fetch that would tell it about some.
+    ///
+    /// True on a fresh install and nowhere else: no cached catalogue, nothing
+    /// learned from a volume, and no stored configuration naming a site. The
+    /// binary carries no table to fall back on — see
+    /// [`rustdar_radar::sites::SiteTable`] — so until the fetch lands there is
+    /// no site list, no marker, and nothing the timezone hint could resolve
+    /// against.
+    ///
+    /// It is what lets [`App::poll_site_catalogue`] apply that first catalogue
+    /// **in this session** rather than on the next launch. The next-launch rule
+    /// exists so a marker cannot move under a user who is already looking at
+    /// it; when the table is empty there is no marker and nothing to move. Once
+    /// this is spent it is never set again, so every later catalogue takes the
+    /// ordinary path.
+    site_hint_pending: bool,
     /// The voxel grids 3D panes are holding, refcounted by the volume they were
     /// built from.
     ///
@@ -773,25 +790,44 @@ impl App {
         let site_positions =
             crate::site_positions::SitePositions::load(platform.config_store().as_deref());
         // And the network catalogue this install last fetched, which is where
-        // the radars the compiled-in seed has never heard of come from. Read
-        // from the cache and never from the network on this path: a fetch
+        // *every* radar comes from on an install that has not opened one yet.
+        // Read from the cache and never from the network on this path: a fetch
         // cannot finish before the first frame, and one that landed mid-session
         // would move a marker under the user. The refresh is spawned below and
-        // is applied on the *next* launch. See `crate::site_catalogue`.
+        // is applied on the *next* launch — with one exception, below. See
+        // `crate::site_catalogue`.
         let site_catalogue = crate::site_catalogue::load(platform.config_store().as_deref());
         // The same reasoning one level down: the *table* is resolved here too,
-        // not on first use. A site the compiled-in seed has never heard of only
-        // becomes nameable and drawable once this runs, so if it ran after the
-        // first frame the map would gain a marker, the site list a row, and a
-        // section its height datum, under a user already looking at them.
-        // Resolving beside the load — before any frame exists — is what keeps
-        // reopening exactly 1:1.
+        // not on first use. A radar only becomes nameable and drawable once
+        // this runs, so if it ran after the first frame the map would gain a
+        // marker, the site list a row, and a section its height datum, under a
+        // user already looking at them. Resolving beside the load — before any
+        // frame exists — is what keeps reopening exactly 1:1.
         //
         // Both sources in one stream. `SiteFix` carries which is which, so the
         // order they are chained in decides nothing: a learned position
         // outranks a fetched one wherever both exist, and `sites::extended`
         // settles that before it builds a row.
-        rustdar_radar::sites::resolve(site_positions.fixes().chain(site_catalogue.fixes()));
+        let table = rustdar_radar::sites::resolve(
+            site_positions.fixes().chain(site_catalogue.fixes()),
+        );
+        // The exception, and the one state the deleted seed used to make
+        // impossible: this install knows no radars at all. Nothing was cached,
+        // nothing was learned, and the binary carries no list — so there is no
+        // site list to show, no marker to draw and nothing for the timezone
+        // hint to have resolved against a moment ago.
+        //
+        // Recorded here rather than re-derived later because it has to be read
+        // *before* the first frame: a table that fills in mid-session is only
+        // safe when it was empty when the frame was drawn, and by the time the
+        // catalogue lands the table is no longer empty to ask.
+        let site_hint_pending = !restored && table.rows().is_empty();
+        if site_hint_pending {
+            log::info!(
+                "no radars are known yet; the site list is empty until the \
+                 catalogue fetch lands",
+            );
+        }
 
         // Before the first frame and before any adapter exists, for the reason
         // the site table is resolved here: what a session remembers has to be
@@ -841,6 +877,7 @@ impl App {
             egui_repaint_at: None,
             auto_poll_at: None,
             site_is_provisional,
+            site_hint_pending,
             volume_store: std::sync::Arc::new(crate::volume::bridge::VolumeStore::new()),
             #[cfg(test)]
             volume_extractions: std::cell::Cell::new(0),
@@ -2252,8 +2289,8 @@ impl App {
     ///
     /// Every `ScanInfo` in the application is built here, so that the
     /// precedence `ScanInfo::from_scan` documents — the volume in hand, then
-    /// what an earlier volume taught, then the compiled-in table — is applied
-    /// in exactly one place and cannot be half-applied on one path.
+    /// what an earlier volume taught, then the resolved table — is applied in
+    /// exactly one place and cannot be half-applied on one path.
     ///
     /// # Why the write is here rather than at the pane
     ///
@@ -2322,6 +2359,27 @@ impl App {
             // fields and the bump wants `self.gui`.
             drop(store);
             if learned {
+                // Into the live table, in this session, not only into the store
+                // for the next one — for two reasons that arrived separately
+                // and want the same line.
+                //
+                // The marker: a row that moved has to move on the frame its own
+                // volume moves the data, or the two disagree for a session.
+                //
+                // And the MSL datum. Without this a first run renders every
+                // height against a table that has no row for the radar it is
+                // rendering: `eet::radar_height_ft_near` answers `None` and the
+                // render paths fall back to 0 ft — sea level, which is a
+                // plausible reading for a coastal site and was 292 ft of error
+                // at KLWX. The binary used to carry a row for every radar, so
+                // the hole could not be reached; deleting the table opened it.
+                //
+                // Neither can move anything the user is looking at, which is
+                // the rule `sites::resolve` is otherwise held to. The row is
+                // built from the position this very volume states, and the pane
+                // is already drawn from that same position by way of the
+                // `ScanInfo` above — so the table is brought into agreement
+                // with the screen rather than the other way round.
                 rustdar_radar::sites::resolve(
                     self.site_positions
                         .fixes()

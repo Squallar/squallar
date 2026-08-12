@@ -292,38 +292,86 @@ pub(super) struct SiteListOutcome {
     pub caption: String,
 }
 
-/// The filterable site list over the full compiled-in table: count caption,
-/// then a scrolling list with the current site highlighted and TDWRs marked.
-/// Returns the site a click picked — always a site other than `current`.
+/// The filterable list of every radar this process knows of: count caption,
+/// then a scrolling list with the current site highlighted, TDWRs marked and
+/// radars with no known position marked too. Returns the site a click picked —
+/// always a site other than `current`.
 ///
 /// **The** site list: the inspector's Pane-properties body and the site
 /// pill's popover both render this, which is what keeps the two routes one
 /// inventory (module note).
+///
+/// # Two inventories, one list
+///
+/// [`sites::radars`](rustdar_radar::sites::radars) is every radar that can be
+/// *placed*, and it is what the map draws. It is not the whole membership:
+/// `TPBI` and `KCRI` have Level II data and no published position, and while
+/// the binary carried a compiled-in table it placed them anyway. It does not
+/// any more, so listing only placed radars would delete two working sites from
+/// the picker.
+///
+/// So this walks [`sites::unplaced`](rustdar_radar::sites::unplaced) as well.
+/// They are pickable for the same reason they are listed: Level II data is
+/// fetched by identifier and not by position, so opening one works, and the
+/// volume that comes back places it for good.
+///
+/// # The empty list is a real state
+///
+/// A fresh install that has not reached the network yet knows nothing, and the
+/// caption says so rather than showing a bare `0 shown - 0 sites`, which reads
+/// as a broken filter. It resolves itself within a second of the catalogue
+/// landing — see `App::poll_site_catalogue`.
 pub(super) fn site_list_ui(ui: &mut egui::Ui, query: &str, current: &str) -> SiteListOutcome {
-    // One read of the resolved table, reused for the rows and for both counts.
+    // One read of the resolved table, reused for the rows and for every count.
     // Read separately they could answer for two different tables, and the
     // caption would then be counting a list it is not standing beside.
-    let radars = rustdar_radar::sites::radars();
+    let table = rustdar_radar::sites::table();
+    let radars = table.rows();
+    let unplaced = table.unplaced();
 
     // The codes are the table's names; uppercased so a lowercase query
-    // still finds them.
+    // still finds them. `(name, is_tdwr, is_placed)`, so the row rendering
+    // below needs nothing from the table it was not handed.
     let query = query.trim().to_uppercase();
-    let shown: Vec<&rustdar_radar::sites::RadarSite> = radars
+    let matches = |name: &str| query.is_empty() || name.contains(query.as_str());
+    let shown: Vec<(&'static str, bool, bool)> = radars
         .iter()
-        .filter(|site| query.is_empty() || site.name.contains(query.as_str()))
+        .filter(|site| matches(site.name))
+        .map(|site| (site.name, site.is_tdwr(), true))
+        .chain(
+            unplaced
+                .iter()
+                .filter(|name| matches(name))
+                .map(|name| (*name, rustdar_radar::sites::is_tdwr_id(name), false)),
+        )
         .collect();
 
     // Computed from the table, not restated: the split is the caption's
     // claim, and a hardcoded count would outlive an edit.
-    let total = radars.len();
-    let tdwr = radars.iter().filter(|site| site.is_tdwr()).count();
-    let caption = format!(
-        "{} shown - {} sites ({} NEXRAD + {} TDWR)",
-        shown.len(),
-        total,
-        total - tdwr,
-        tdwr
-    );
+    let total = radars.len() + unplaced.len();
+    let tdwr = shown_total_tdwrs(radars, unplaced);
+    let caption = if total == 0 {
+        // Not "0 sites": nothing has told this binary that a radar exists yet,
+        // which is a different thing from a filter that matched nothing.
+        "Finding radars...".to_owned()
+    } else if unplaced.is_empty() {
+        format!(
+            "{} shown - {} sites ({} NEXRAD + {} TDWR)",
+            shown.len(),
+            total,
+            total - tdwr,
+            tdwr
+        )
+    } else {
+        format!(
+            "{} shown - {} sites ({} NEXRAD + {} TDWR, {} unplaced)",
+            shown.len(),
+            total,
+            total - tdwr,
+            tdwr,
+            unplaced.len(),
+        )
+    };
     ui.label(egui::RichText::new(caption.as_str()).small().weak());
 
     let mut outcome = SiteListOutcome {
@@ -341,31 +389,52 @@ pub(super) fn site_list_ui(ui: &mut egui::Ui, query: &str, current: &str) -> Sit
         .id_salt("site_list")
         .max_height(SITE_LIST_HEIGHT)
         .show(ui, |ui| {
-            for site in shown {
-                let is_current = current == site.name;
+            for (name, is_tdwr, is_placed) in shown {
+                let is_current = current == name;
+                // Two marks, both in the row rather than only in the caption.
+                //
                 // TDWRs are marked rather than hidden or disabled: they are
                 // pickable — the map icons allow them too, and the archive
                 // carries their volumes. The mark says a pick lands on a
                 // different instrument (single-pol, ~89 km of Doppler range
                 // around one airport, none of the Level III products this app
-                // fetches), which is what the caption's split means and is
-                // worth seeing per row.
-                let label = if site.is_tdwr() {
-                    format!("{} - TDWR", site.name)
-                } else {
-                    site.name.to_owned()
+                // fetches), which is what the caption's split means.
+                //
+                // A radar with no known position is pickable as well, and its
+                // row says why there is no marker for it on the map beside it.
+                let label = match (is_tdwr, is_placed) {
+                    (true, true) => format!("{name} - TDWR"),
+                    (true, false) => format!("{name} - TDWR, position unknown"),
+                    (false, false) => format!("{name} - position unknown"),
+                    (false, true) => name.to_owned(),
                 };
                 let row = ui.selectable_label(is_current, label.as_str());
                 #[cfg(test)]
-                outcome
-                    .rows
-                    .push((site.name.to_owned(), row.rect, is_current));
+                outcome.rows.push((name.to_owned(), row.rect, is_current));
                 if row.clicked() && !is_current {
-                    outcome.picked = Some(site.name.to_owned());
+                    outcome.picked = Some(name.to_owned());
                 }
             }
         });
     outcome
+}
+
+/// How many of the two inventories are TDWRs.
+///
+/// Split out because an unplaced member has no `RadarSite` to ask, so the rule
+/// has to reach a bare identifier. Both halves go through
+/// [`is_tdwr_id`](rustdar_radar::sites::is_tdwr_id), which is the one place it
+/// is spelled — two spellings is how the two halves of this list would come to
+/// disagree about `TJUA`.
+fn shown_total_tdwrs(
+    radars: &[rustdar_radar::sites::RadarSite],
+    unplaced: &[&'static str],
+) -> usize {
+    radars.iter().filter(|site| site.is_tdwr()).count()
+        + unplaced
+            .iter()
+            .filter(|name| rustdar_radar::sites::is_tdwr_id(name))
+            .count()
 }
 
 /// The product list a scan offers, current one highlighted. Rendered by the
