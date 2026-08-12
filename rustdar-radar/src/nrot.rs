@@ -81,6 +81,106 @@ const MIN_RANGE_NM: f64 = 7.05;
 /// (`voxel::volume_alpha_profile::NROT_CLEAR`) — so the value the algorithm
 /// calls significant, the value the plan view first colours and the value the
 /// volume first makes visible are one number and cannot drift apart.
+///
+/// # What this module paints that the reference does not
+///
+/// Ten campaigns measured coverage — which of the reference's bins this
+/// module reaches. [`COH_MAX_STRADDLE`] carries that accounting. This is the
+/// other direction, on the same decoded capture (KTLX 2025-02-19 15:05:14,
+/// lowest cut, 3546 reference bins over the 7.05–20 nm annulus):
+///
+/// ```text
+///     annulus bins                                  69 120
+///     this module carries a value at                16 438   23.8%
+///     this module paints                             1 559
+///       the reference paints them too                  661   mean |0.486|
+///       the reference paints nothing there             898   mean |0.592|
+/// ```
+///
+/// **The bins this module is most confident about are the ones the reference
+/// refuses.** They are not a rim: 412 of the 898 sit in 34 of this module's
+/// 89 painted components that touch no reference paint at all, and the other
+/// 486 sit *inside* components that do overlap — 435 of those 486 carrying
+/// the same sign as the nearest agreeing bin, so they are this module's own
+/// version of a shared feature, placed a bin or four off, and not a separate
+/// detection. The two fields' clusters are the same shape (median 4 radials ×
+/// 5 gates here, 3 × 4 there).
+///
+/// The one statistic that states the defect cleanly is the exceedance on the
+/// ground both fields cover — this module's 16 438 carried bins:
+///
+/// ```text
+///     |NROT| at least             0.25   0.35   0.50   0.75   1.00
+///     this module paints          1559   1111    684    323    124
+///     the reference paints        1021    464    239     98     40
+///     ratio                       1.53   2.39   2.86   3.30   3.10
+/// ```
+///
+/// This module's distribution has the heavier tail, and the gap widens with
+/// the value. It is not a gain error and not a registration error: where the
+/// reference reads over 0.6 this module paints 85–92% of the time, and over
+/// the agreeing bins the two agree to a mean |Δ| of 0.168.
+///
+/// # Seven axes, and none of them separates
+///
+/// Each was measured against the decoded field end to end, despeckle
+/// included, and each is quoted as the agreeing bins it costs against the
+/// over-painted bins it removes, from 661 and 898:
+///
+/// ```text
+///                                                    agreeing  over-painted
+///     azimuthal smoothing ([`MEDIAN_AZ_HALF_MAX`] 3)     −168          −206
+///     rms range texture ceiling 0.44 → 0.40               −64          −135
+///     profile cells on common range offsets only          −44          −173
+///     local data completeness, best of six windows        −30          −150
+///     local along-beam straddle count, 420 variants        −0           −19
+///     deeper range window ([`STENCIL_RNG_HALF`] 2..6)  precision falls 0.424 → 0.357
+///     spatially disconnected echo islands         the sweep is one island of 80 972 bins
+/// ```
+///
+/// Every one buys precision by giving up agreement, at five over-painted bins
+/// per agreeing bin lost at the very best, and none of them lowers the mean
+/// magnitude of what is left by more than a few hundredths — the rule that
+/// removes 173 of them leaves the rest at |0.607| against |0.592|. Precision
+/// here is purchasable and was not purchased.
+///
+/// # The data boundary is a marker and not the arithmetic
+///
+/// The over-painted bins do sit nearer the edge of valid data, and the
+/// separation widens monotonically with how hard this module is painting —
+/// mean distance in bins to the nearest missing gate, by this module's own
+/// magnitude:
+///
+/// ```text
+///     |NROT|        0.25–0.35  0.35–0.50  0.50–0.75  0.75–1.00   ≥1.00
+///     agreeing           4.35       4.06       4.50       4.66    5.00
+///     over-painted       3.99       3.81       3.93       3.39    3.20
+///     (counts)        211/237    216/211    145/216     71/128  18/106
+/// ```
+///
+/// That is the signature a derivative straddling a data edge would leave, and
+/// it is the reason [`az_profile`]'s partial range windows were the leading
+/// candidate: where the three-gate window is *empty* the cell is NaN and the
+/// bin is refused — the stencil-window holes — and where it is *partly* empty
+/// the cell is a mean over different gates than its neighbours, which is a
+/// step the operator would differentiate. Those would be one rule failing
+/// two ways.
+///
+/// **They are not.** Remove that step exactly — detrend each cell by the
+/// window's own along-beam gradient before averaging, which costs no coverage
+/// — and the painted values move by 0.9% at the agreeing bins and 1.8% at the
+/// over-painted ones. The occupancy correlation is real and the arithmetic
+/// behind it is worth about a hundredth of an NROT. Missing gates mark ground
+/// where the velocity is poor, and poor velocity is what this module paints
+/// loudly; the partial window is not what makes the value. Nor is the
+/// dealiaser: it changed the bin at 18.3% of the agreeing bins (mean 4.21
+/// m/s) against 7.9% of the over-painted ones (1.82 m/s), so the over-paint
+/// sits on velocity it left alone.
+///
+/// So the discriminator is on an axis this module has not found — the same
+/// answer [`COH_MAX_STRADDLE`] reaches from the coverage side, and the two
+/// are separate defects: every one of the 898 lies outside the coherence
+/// mask by construction. Measured provenance: branch `campaign-harness`.
 pub const SIGNIFICANT: f64 = 0.25;
 
 /// Blank painted clusters (8-connected runs of |NROT| ≥ [`SIGNIFICANT`])
