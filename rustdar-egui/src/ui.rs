@@ -1332,8 +1332,7 @@ impl ControlProbe {
 /// than "map panes" because the old sentence became false the day the 3D view
 /// grew a floor: it claimed the layers did not apply, while the floor was
 /// quietly honouring a set the panel gave no way to reach.
-pub(crate) const NON_MAP_LAYERS_NOTE: &str =
-    "A cross-section has no map to draw layers on.";
+pub(crate) const NON_MAP_LAYERS_NOTE: &str = "A cross-section has no map to draw layers on.";
 
 /// The header over the section pane's sidebar block. Icon, two spaces, name —
 /// the same shape as the loop transport's and the overlay rows' labels. The

@@ -722,17 +722,7 @@ impl super::Gui {
         actions: &mut Vec<GuiAction>,
     ) {
         // Everything the row states, read before any closure borrows self.
-        let (
-            site,
-            kind,
-            product,
-            shares_viewport,
-            links,
-            line_absent,
-            tilt,
-            products,
-            elevations,
-        ) = {
+        let (site, kind, product, shares_viewport, links, line_absent, tilt, products, elevations) = {
             let pane = &self.panes[idx];
             let (_, tilt) = pane
                 .get_rendering_params()
