@@ -7374,6 +7374,101 @@ fn the_missing_layer_list_is_explained_for_the_kind_that_is_missing_it() {
     );
 }
 
+/// 50a. **A 3D pane's layer rows are the layers a 3D pane draws — all of
+///      them, on both of its surfaces — and a cross-section still has none.**
+///
+///      The defect this closes: the floor has always gated every layer on
+///      *that pane's* own `is_overlay_enabled`, and the glass gates the colour
+///      scale the same way, while the Layers panel showed a 3D pane no rows at
+///      all. So a set toggled before the conversion went on being honoured
+///      with no way left to change it — a picture on screen answering to a
+///      control the user could not reach.
+///
+///      Both halves, and the second is the one that keeps this test honest: a
+///      cross-section's rows must still be absent, or "every pane has rows"
+///      would pass. The row **set** is the third claim and it is why
+///      `PaneSurface` is the right authority rather than "the floor's kinds":
+///      the ground kinds go on the floor and the colour scale goes on the
+///      glass, so a 3D pane draws — and must be able to switch off — every one
+///      of them. Dropping the colour-scale row would move the same defect one
+///      layer along.
+#[test]
+fn a_3d_panes_layer_rows_are_the_layers_a_3d_pane_draws() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.load_scan("KTLX");
+    h.open_layers();
+
+    let on_a_map: Vec<OverlayKind> = h.stack().rows.iter().map(|row| row.kind).collect();
+    assert!(
+        on_a_map.contains(&OverlayKind::ColorScale) && on_a_map.len() > 1,
+        "precondition: a map pane lists every layer, colour scale included: \
+         {on_a_map:?}"
+    );
+
+    // A set the user made *before* the conversion — the state that used to
+    // become unreachable the moment the pane went 3D.
+    h.set_overlay_on_pane(0, OverlayKind::CityLabels, false);
+    h.make_pane_volume(0);
+    h.open_layers();
+
+    let stack = h.stack();
+    let on_a_volume: Vec<OverlayKind> = stack.rows.iter().map(|row| row.kind).collect();
+    assert_eq!(
+        on_a_volume, on_a_map,
+        "a 3D pane draws the ground kinds onto its floor and the colour scale \
+         onto its glass, each gated on its own `is_overlay_enabled` — so its \
+         rows are the same list, in the same order"
+    );
+    assert_eq!(
+        stack.non_map_note,
+        egui::Rect::NOTHING,
+        "the explained absence was drawn beside a list that is present"
+    );
+    assert_ne!(
+        stack.add_top,
+        egui::Rect::NOTHING,
+        "a 3D pane has a map to add a layer to — its floor"
+    );
+
+    // The pre-conversion set survived *and* is now on screen to be read…
+    let labels = h
+        .stack_row(OverlayKind::CityLabels)
+        .expect("the city-labels row is in the list asserted above");
+    assert!(
+        !labels.eye_on,
+        "the row must show the state the floor is actually honouring, which \
+         is the one the user set before the conversion"
+    );
+
+    // …and to be changed, through the real eye rather than the field.
+    h.mouse_click(labels.eye.center());
+    h.warm_up();
+    assert!(
+        h.gui_mut()
+            .pane(0)
+            .expect("pane 0")
+            .is_overlay_enabled(OverlayKind::CityLabels),
+        "the eye on a 3D pane's row did not reach the pane's own layer state"
+    );
+
+    // The other half: a cross-section draws no layers and lists none.
+    h.make_pane_map(0);
+    h.make_pane_unaimed_cross_section(0);
+    h.open_layers();
+    let stack = h.stack();
+    assert!(
+        stack.rows.is_empty(),
+        "a cross-section has no projector anywhere in its frame, so a row \
+         here would toggle nothing: {:?}",
+        stack.rows
+    );
+    assert_ne!(
+        stack.non_map_note,
+        egui::Rect::NOTHING,
+        "the one kind with no list must still say why"
+    );
+}
+
 /// 51. **A converted pane's own controls sit inside the Pane-properties
 ///     body's shared structure, in its order.**
 ///
@@ -10500,6 +10595,134 @@ fn the_sync_pill_popover_flips_all_three_per_pane_links() {
     assert_eq!(
         label, "\u{2297} Sync",
         "the pill must keep marking the unlinked state distinctly"
+    );
+}
+
+/// 73i. **A pane in the 3D view is offered no viewport link, at either route
+///      — and a plan-view pane still is.**
+///
+///      `sync_viewports` has always skipped a pane with no plan view at both
+///      ends, so the *behaviour* was right; what was wrong was that the sync
+///      section went on drawing the pane a "Sync viewport" checkbox, which
+///      could be ticked and did nothing. `PaneState::shares_viewport` is the
+///      decision now, with its reasons written down: as a link target a 3D
+///      pane would resample its whole box every time a neighbour's wheel
+///      turned, and a plan view zoomed to street level would drive the box
+///      through the floor.
+///
+///      Both halves are asserted here, because the absent half alone passes on
+///      a section that offers nobody anything: the row is **present** on a
+///      plan-view pane and **absent** on a 3D one, with the other two links
+///      still on offer there — the pane sits out one dimension, it does not
+///      leave the group.
+///
+///      Both routes, too. They are one function (`pills::sync_section_ui`), so
+///      this would be belt and braces if the popover and the inspector could
+///      not drift — the whole point of the shared function is that they
+///      cannot, and the way to keep it that way is to ask both.
+///
+///      The last leg is the persistence rule: an unlinked pane switched to 3D
+///      and back finds its link exactly as it left it. The setting is kept and
+///      inert, never cleared, so a reopen is the screen the user left.
+#[test]
+fn a_3d_pane_is_offered_no_viewport_link_at_either_route() {
+    /// The sync section's rows as the inspector's Pane-properties body drew
+    /// them, labels only.
+    fn inspector_rows(h: &mut InputHarness) -> Vec<String> {
+        h.open_pane_props();
+        h.inspector()
+            .sync_rows
+            .iter()
+            .map(|(label, _, _)| label.clone())
+            .collect()
+    }
+
+    /// The same section as the Sync pill's popover drew it. The panels come
+    /// down first: both of them sit over the map's top-left corner, which is
+    /// where pane 0's pill row is, and a click through them reaches the panel.
+    fn popover_rows(h: &mut InputHarness) -> Vec<String> {
+        h.close_inspector();
+        h.close_layers();
+        let (_, pill) = h.pill(0, PillKind::Link).expect("pane 0's Sync pill");
+        h.mouse_click(pill.center());
+        h.frame(); // the popup's debut frame only registers it
+        let rows = h
+            .pill_popover()
+            .expect("the popover opened")
+            .rows
+            .iter()
+            .map(|(label, _, _)| label.clone())
+            .collect();
+        h.key_press(egui::Key::Escape);
+        h.warm_up();
+        rows
+    }
+
+    // The section's own inventory, in draw order — the same constant the
+    // parity walk drives, so a renamed label cannot make this test vacuous.
+    let [viewport, layers, time, _, _] = crate::ui::SYNC_SECTION_LABELS.map(ToOwned::to_owned);
+
+    let mut h = pill_harness();
+
+    // -- a plan-view pane is offered it, at both routes --
+    assert!(
+        popover_rows(&mut h).contains(&viewport),
+        "precondition: a map pane's Sync popover offers the viewport link, \
+         or the absence below is about a section that offers nobody anything"
+    );
+    assert!(
+        inspector_rows(&mut h).contains(&viewport),
+        "precondition: a map pane's inspector offers the viewport link"
+    );
+
+    // Unlinked before the conversion, so the last leg has something to lose.
+    h.gui_mut().pane_mut(0).expect("pane 0").viewport_link = false;
+    h.warm_up();
+
+    // -- a 3D pane is not, at either route, and keeps the other two --
+    h.make_pane_volume(0);
+    for (route, rows) in [
+        ("the Sync pill's popover", popover_rows(&mut h)),
+        ("the inspector's Pane properties", inspector_rows(&mut h)),
+    ] {
+        assert!(
+            !rows.contains(&viewport),
+            "{route} offered a 3D pane the viewport link, which nothing on \
+             either end of `sync_viewports` would honour: {rows:?}"
+        );
+        assert!(
+            rows.contains(&layers) && rows.contains(&time),
+            "{route}: a 3D pane sits out the viewport dimension, not the \
+             group — the other two links must still be on offer: {rows:?}"
+        );
+    }
+    h.close_inspector();
+    h.close_layers();
+    h.warm_up();
+
+    // The pill stops wearing the ⊗ for a dimension its own popover does not
+    // offer: the pane is fully linked as far as anything it can join goes.
+    let (label, _) = h.pill(0, PillKind::Link).expect("still drawn");
+    assert_eq!(
+        label, "Sync",
+        "the pill marked a 3D pane unlinked over a viewport link it is not \
+         offered and does not take part in"
+    );
+
+    // -- and the stored setting is kept, not cleared --
+    assert!(
+        !h.gui_mut().pane(0).expect("pane 0").viewport_link,
+        "the conversion cleared the stored link instead of leaving it inert"
+    );
+    h.make_pane_map(0);
+    assert!(
+        inspector_rows(&mut h).contains(&viewport),
+        "the row must come back with the plan view"
+    );
+    assert!(
+        !h.gui_mut().pane(0).expect("pane 0").viewport_link,
+        "the round trip through 3D silently re-linked a pane the user had \
+         unlinked — a reopen must be the screen that was left"
     );
 }
 
