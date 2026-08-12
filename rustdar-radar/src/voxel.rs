@@ -378,9 +378,42 @@ pub const SEE_THROUGH_ALPHA_CEILING: u8 = 64;
 /// must allow.
 pub const MAX_AXIS: usize = 256;
 
-/// Narrowest half-extent a request may ask for on either axis, km. Below this
-/// the grid is finer than the radar's own 250 m gates over most of its extent
-/// and the resample invents smoothness.
+/// Narrowest half-extent a request may ask for on either axis, km.
+///
+/// A bound on *arithmetic*, and only that: it keeps a box from collapsing to
+/// nothing, and it is what [`HalfExtentKm::clamped`] floors against so every
+/// path that builds a box agrees on the smallest one. Nothing in the UI can
+/// reach it — the region is the data's own reach or a user's selection, and the
+/// narrowest selection either offers is far above 10 km.
+///
+/// # It is not a bound on stipple, and the reason it used to claim to be is
+/// measured to be false
+///
+/// This said "below this the grid is finer than the radar's own 250 m gates over
+/// most of its extent and the resample invents smoothness". Two things are wrong
+/// with that, and the second one mattered enough to send a campaign looking for
+/// a resolution bug that does not exist.
+///
+/// It never enforced its own claim. At [`DESKTOP_SHAPE`]'s 256 cells a 10 km
+/// half-extent is a **78 m** cell — three times *finer* than the 250 m gates it
+/// was supposedly holding the grid above. Whatever number would have enforced
+/// that reading, this was never it.
+///
+/// And the reading itself is false. Measured on KDMX 2025-03-14 17:55Z,
+/// reflectivity: a 0.318 km-cell box — 2 to 3× finer than the radial spacing it
+/// covers — is **1.3–3.3%** speck, while the 2.54 km-cell whole-scan box over
+/// the same volume is **25–74%** speck between 50 and 125 km, where its cells
+/// are *coarser* than the spacing. Finer cells came out cleaner, so cell size is
+/// not the variable.
+///
+/// The stipple is [`crate::sampler`]'s nearest-corner fallback reproducing a
+/// weak moment's own intermittency at cell resolution: one below-threshold
+/// corner and the blend takes the nearest corner verbatim, so an intermittent
+/// field is redrawn intermittently however the box is diced. It tracks the echo
+/// being **weak**, not the box being **tight**. The fix for it is upstream of
+/// every constant here — `blend` already knows how many of its four corners
+/// carried values and throws that number away when coverage is written as a
+/// binary `index != NO_DATA_INDEX` — and no choice of extent addresses it.
 pub const MIN_HALF_WIDTH_KM: f64 = 10.0;
 
 /// The half-width a box is given when nothing can be said about how far its
