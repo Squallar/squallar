@@ -181,6 +181,90 @@ const MIN_RANGE_NM: f64 = 7.05;
 /// answer [`COH_MAX_STRADDLE`] reaches from the coverage side, and the two
 /// are separate defects: every one of the 898 lies outside the coherence
 /// mask by construction. Measured provenance: branch `campaign-harness`.
+///
+/// # That over-paint is one volume's, and eight more say so
+///
+/// Everything above is KTLX 2025-02-19, because that was the only capture of
+/// the reference's whole field there was. There are now nine, decoded the same
+/// way each against its own calibration, one cut each, every pair registered at
+/// exactly zero shift in radials and in gates. Over the same annulus:
+///
+/// ```text
+///                Vny   this module   agreeing   reference   precision   mean |Δ|
+///     KTLX     11.49          1559        661        3546      0.4240      0.168
+///     KHNX     11.66             0          0         252           —          —
+///     KCRP     31.52          1098        858        4357      0.7814      0.088
+///     KDMX     27.93          1447       1104        2564      0.7630      0.062
+///     KFTG     24.01           903        758        1668      0.8394      0.058
+///     KATX     25.32           469        432         840      0.9211      0.027
+///     KLOT     23.96            14          3          18      0.2143      0.197
+///     KMSX     24.21            16          8          53      0.5000      0.054
+///     KDDC     25.84          2731       2161        5823      0.7913      0.066
+/// ```
+///
+/// **KTLX is the outlier and the accounting above is its portrait.** Where this
+/// module paints at all, the five other storm volumes agree with the reference
+/// 76% to 92% of the time and to a mean |Δ| of 0.03 to 0.09 — better than
+/// KTLX's 0.168 — with the sign right at 96% to 100%. What KTLX has that they
+/// do not is the coherence mask's two wedges ([`COH_MAX_STRADDLE`]), which
+/// refuse 1092 of its reference bins and none of KDMX's, KFTG's, KATX's or
+/// KDDC's.
+///
+/// One number moves the other way and is worth naming because nothing here
+/// fixes it. At KCRP the 240 bins the reference refuses average **|1.990|**
+/// against |0.338| at the bins the two agree on: 137 are over |1.0|, 110 over
+/// |2.0| and 8 sit at the [`NROT_LIMIT`] clamp, while the reference's own
+/// largest reading anywhere in that annulus is 3.00. High Nyquist and a
+/// tropical wind field, and this module reports rotation off the top of the
+/// reference's scale where the reference reports none. That is a different
+/// defect from the one above — KTLX's spurious bins never reach |2.0| — and it
+/// is unaddressed.
+///
+/// # The eighth axis: magnitude and completeness together
+///
+/// Seven axes are refused above for buying precision with agreement. The eighth
+/// is the pair of them — *refuse |NROT| ≥ M where the footprint the operator
+/// read is not fully populated* — which at KTLX alone is worth ten over-painted
+/// bins per agreeing bin lost, twice the best of the seven. Both thresholds
+/// were swept, over three definitions of the footprint (this module's median
+/// field, the raw sweep, the dealiased grid), with M absolute, as a fraction of
+/// the sweep's Nyquist, and as a percentile of the site's own painted
+/// distribution. Over-painted bins removed per agreeing bin lost, footprint =
+/// the stencil's own ±5 rows × 3 gates of the median field, nothing missing:
+///
+/// ```text
+///        M    KTLX    KCRP    KDMX    KFTG    KATX  |  KDDC (holdout)
+///     0.75    3.16    2.64    1.39    1.20    1.60  |  0.63
+///     0.90    5.23    2.62    2.38    1.06    1.36  |  0.49
+///     1.00    7.07    2.67    2.80    1.07    1.40  |  0.37
+///     1.25    9.00    3.33    1.25    1.15    1.00  |  0.53
+/// ```
+///
+/// **The rate does not transfer.** It is 7:1 at KTLX, 1.1:1 at KFTG and below
+/// break-even at the holdout, where the rule spends 38 agreeing bins to remove
+/// 14 and leaves precision at 0.7925 against 0.7913. Neither normalization
+/// repairs it: at every operating point of every footprint definition that
+/// moves more than a handful of bins, some live site's ratio is under one. The
+/// points the holdout does survive sit so deep in the footprint — under 28 of
+/// 33 cells — that the whole nine-site effect is 25 over-painted bins at KTLX
+/// and 11 at the holdout for one agreeing bin, which is inside the instrument's
+/// own resolution. KHNX, KLOT and KMSX are untouched at every point.
+///
+/// So the ten-to-one is KTLX's and not a law, and nothing is taken on its
+/// account. [`median_filter`] carries what happens when this rule is asked to
+/// stand as the guard on the coverage relaxation instead.
+///
+/// # Two precision conventions, and which one is quoted
+///
+/// The reference's colour bar has no class for |v| < 0.25, so a bin where it
+/// reads 0.24 and this module reads 0.26 is a precision failure no hover-free
+/// instrument can tell from a fabrication. 560 of KTLX's 898 read at least 0.42
+/// — the floor plus the mean |Δ| the two fields agree to — and 338 read under
+/// it. Every precision figure in this module's documentation is the strict one,
+/// agreeing over painted, counting all 898. The other convention, agreeing over
+/// agreeing-plus-those-560, reads **0.5414** where the strict one reads 0.4240,
+/// and on every candidate measured the two moved the same way. Measured
+/// provenance: branch `campaign-harness`.
 pub const SIGNIFICANT: f64 = 0.25;
 
 /// Blank painted clusters (8-connected runs of |NROT| ≥ [`SIGNIFICANT`])
