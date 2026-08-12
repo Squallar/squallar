@@ -42,12 +42,12 @@ impl<'a> Message<'a> {
         // checks a count before acting on it, cannot express this one, and the
         // per-segment cost stands in for it.
         //
-        // It is a floor, not the count: on a multi-segment map this can come
-        // out *below* the true number of segments, the more so because the
-        // multi-segment payload slice is 12 bytes short per segment (see
-        // `messages/mod.rs`) and biases `remaining_total` down. That trades an
-        // over-allocation on an unchecked number for the occasional realloc on
-        // a once-per-volume metadata path, which is the right way round.
+        // It is a floor, not the count: on a truncated map it comes out below
+        // the true number of segments, trading an over-allocation on an
+        // unchecked number for the occasional realloc on a once-per-volume
+        // metadata path, which is the right way round. On a whole one it is
+        // exact — a five-elevation map from KCRP and the packaged
+        // single-elevation fixture both pre-size to the number they parse.
         let bytes_per_segment = size_of::<Integer2>() + RANGE_BIN_BYTES_PER_SEGMENT;
         let mut elevation_segments =
             Vec::with_capacity(segment_count.min(reader.remaining_total() / bytes_per_segment));

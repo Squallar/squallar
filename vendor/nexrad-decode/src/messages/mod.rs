@@ -42,6 +42,13 @@ const SEGMENT_FRAME_SIZE: usize = 2432;
 /// `CTM_PREFIX_SIZE + message_size_bytes()` bytes on the wire.
 const CTM_PREFIX_SIZE: usize = 12;
 
+/// Size of the header block `MessageHeader::message_size_bytes` counts — the
+/// message header less the CTM prefix in front of it.
+const MESSAGE_HEADER_BLOCK_SIZE: usize = size_of::<MessageHeader>() - CTM_PREFIX_SIZE;
+
+/// Bytes of payload a fixed-length frame holds after its header.
+const SEGMENT_BODY_SIZE: usize = SEGMENT_FRAME_SIZE - size_of::<MessageHeader>();
+
 /// The largest gap tolerated between where a message's parser stopped and where
 /// its header says the message ends.
 ///
@@ -112,17 +119,24 @@ pub fn decode_messages<'a>(input: &'a [u8]) -> Result<Vec<Message<'a>>> {
         // SegmentedSliceReader's auto-skip logic correctly detects segment boundaries.
         // Single-segment messages: use the full frame content area as payload so
         // parsers can read structs that extend beyond the declared message_size.
-        //
-        // Note: this payload is CTM_PREFIX_SIZE bytes short. message_size_bytes()
-        // already excludes the prefix, so subtracting the whole header excludes it
-        // twice. The reader position self-corrects — the frame is padded to
-        // SEGMENT_FRAME_SIZE regardless — but the tail of a multi-segment payload
-        // (e.g. a Message 15 clutter filter map) is truncated. Left alone here
-        // because correcting it changes what WSR-88D messages decode to, which
-        // wants fixture coverage this crate does not yet have.
         let payload = if segment_count > 1 {
-            let payload_size =
-                (header.message_size_bytes() as usize).saturating_sub(size_of::<MessageHeader>());
+            // `message_size_bytes()` counts from the end of the CTM prefix, so
+            // a segment's payload is what it declares past the header block.
+            // Subtracting the whole of `MessageHeader` takes the prefix out a
+            // second time and drops the last twelve bytes of every segment —
+            // which is content, not padding: ten of a clutter filter map's
+            // 1,800 azimuth segments, every adaptation data field past the
+            // first segment boundary, and enough of a five-elevation bypass
+            // map that it runs out of input and decodes to nothing at all.
+            //
+            // Clamped to the frame, because a segment is one frame and its
+            // body is all there is to read. A segment declaring more than that
+            // is describing bytes this frame does not hold, and slicing to the
+            // declaration would pull the next frame's prefix into the payload
+            // and leave the reader inside that frame.
+            let payload_size = (header.message_size_bytes() as usize)
+                .saturating_sub(MESSAGE_HEADER_BLOCK_SIZE)
+                .min(SEGMENT_BODY_SIZE);
             let payload = match reader.take_bytes(payload_size) {
                 Ok(p) => p,
                 Err(_) => break,
@@ -133,8 +147,7 @@ pub fn decode_messages<'a>(input: &'a [u8]) -> Result<Vec<Message<'a>>> {
             }
             payload
         } else {
-            let content_size = SEGMENT_FRAME_SIZE - size_of::<MessageHeader>();
-            match reader.take_bytes(content_size) {
+            match reader.take_bytes(SEGMENT_BODY_SIZE) {
                 Ok(p) => p,
                 Err(_) => break,
             }

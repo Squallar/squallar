@@ -102,7 +102,10 @@ weight.
 - All 15 in-source `snapshot_test.rs` modules, their 16 `.snap` files, the
   `insta` dev-dependency, and `tests/data/messages/` (15 fixtures, 112 KB).
   **These are the WSR-88D behaviour pin.** The bar for any change to this
-  directory is that they stay byte-unchanged.
+  directory is that they stay byte-unchanged — the one exception being a
+  snapshot that was itself recording a defect, which is the case for the two
+  the multi-segment payload fix moves, each named and evidenced under
+  *Changed — source*. No fixture byte has ever changed.
 
 ### Added
 
@@ -110,7 +113,7 @@ weight.
 | --- | --- |
 | `LICENSE` | See above — the tarball ships none. |
 | `VENDORED.md` | This file. |
-| `src/messages/framing_tests.rs` | The framing fix's own tests, described in full under *Changed — source* below. An in-source module rather than a `tests/` target so it travels with the fix in the upstream diff — which does mean it is a new file, shows up in `diff -rq`, and so belongs in this table and not only in that prose. |
+| `src/messages/framing_tests.rs` | The framing fix's own tests, and the multi-segment payload fix's, described in full under *Changed — source* below. An in-source module rather than a `tests/` target so it travels with the fix in the upstream diff — which does mean it is a new file, shows up in `diff -rq`, and so belongs in this table and not only in that prose. |
 
 ### Changed — `Cargo.toml`
 
@@ -142,13 +145,14 @@ Verified against a real case: `manual_div_ceil` in
 
 ### Changed — source
 
-The framing fix this directory exists for, one lint scoping that changes no
-behaviour, and four findings from an audit of the vendored copy — one
-allocation removed from the per-radial path, one silent truncation fixed, and
-two hygiene changes. Every one of the four is either a shrink of the delta or a
-pin on something the delta depends on, and none of them moves a decoded byte;
-the three that touch decoding were each verified over 35 volumes (27 WSR-88D,
-8 TDWR) with a digest over every message, every moment array and every radial.
+The framing fix this directory exists for, the multi-segment payload fix that
+came out of it, one lint scoping that changes no behaviour, and four findings
+from an audit of the vendored copy — one allocation removed from the per-radial
+path, one silent truncation fixed, and two hygiene changes. Every one of the
+four is either a shrink of the delta or a pin on something the delta depends
+on, and none of them moves a decoded byte; the three that touch decoding were
+each verified over 35 volumes (27 WSR-88D, 8 TDWR) with a digest over every
+message, every moment array and every radial.
 
 #### The framing fix — `src/messages/mod.rs`
 
@@ -206,7 +210,8 @@ Two behaviour deltas worth stating:
   can newly lose a record.
 
 New `src/messages/framing_tests.rs`, an in-source `#[cfg(test)]` module so it
-travels with the fix in the upstream diff. Eight tests: the padded TDWR stream
+travels with the fix in the upstream diff. Eight tests here, and two more added
+by the multi-segment payload fix below: the padded TDWR stream
 stays framed; every pad width from 0 to 7 stays framed; a pad of 8 — one past
 the bound — is not trusted; the unpadded stream keeps the exact offsets and
 sizes it had; the packaged WSR-88D radial declares exactly its own length so
@@ -232,6 +237,78 @@ radial header is even and `segment_size` counts halfwords, so the original
 `m31` builder can only produce an even pad, and asserts as much.
 `m31_with_moment` adds one eight-bit reflectivity block with an odd gate count,
 which is how real TDWR radials come by their odd pads.
+
+#### The multi-segment payload is the whole declaration — `src/messages/mod.rs`
+
+The same twelve bytes again, in the fourth place that read the declared size:
+a fixed-length segment's payload was `message_size_bytes() -
+size_of::<MessageHeader>()`, which takes the CTM prefix out a second time. The
+reader position survives it — the frame is padded to 2432 either way — so
+nothing desynced and nothing warned. What went was the last twelve bytes of
+every segment's *content*.
+
+The previous campaign left this alone and recorded the reason: fixing it
+changes what WSR-88D messages decode to, which was exactly what the
+byte-identical-snapshot bar existed to protect. What was never established was
+whether anything was actually lost. It is, on every volume:
+
+| | as vendored | fixed |
+| --- | --- | --- |
+| Message 15, azimuth segments | 1,790 of 1,800, last elevation **350** of 360 | **1,800**, every elevation 360 |
+| Message 18, `site_name` | `None` — the bytes at that offset are not text | `"KDMX"`, `"KTLX"`, `"KATX"`, `"KLWX"`, `"KCRP"` |
+| Message 13, five elevations (KCRP) | 588 bytes short, `UnexpectedEof`, **0** elevation segments | **5** |
+
+Measured over 171 WSR-88D volumes across 11 sites (KHNX, KMSX, KLOT, KLWX,
+KATX, KTLX, KTWX, KDMX, KFTG, KCRP and the holdout), decoding every fixed-
+segment message both ways. The Message 15 result is 171 of 171, not a sample.
+Message 18 is offset-addressed — `data[ICD_offset - 44]` — so the loss is not
+at the tail but at *each* segment boundary, and every field past the first one
+shifts; its own doc comment already said the message "spans approximately 9468
+bytes", which is the fixed length, against the 9420 the code produced.
+
+Five TDWR volumes (TPIT, TDAL, TJFK, TMCI 2026-08-10, TORD 2020-08-10) carry no
+multi-segment message at all — only types 0, 2, 5 and 31 — so the network this
+directory exists for is untouched by this, and so is everything this workspace
+reads: it matches only Types 31, 1 and 5, and no Type 5 in the corpus is
+multi-segment. Not one radial, moment or VCP moves.
+
+**Clamped to the frame**, which is the second half of the fix. A segment is one
+2432-byte frame and its body is 2404 bytes; a declaration past that describes
+bytes the frame does not hold. All 855 real multi-segment frames measured
+declare 2,416 and clamp to nothing — but this crate's own
+`tests/generate_synthetic_fixtures.rs` measures `segment_size` from the start
+of the frame rather than from the end of the prefix (line 61,
+`(HEADER_SIZE + payload_size) / 2` with `HEADER_SIZE = 28`), so
+`clutter_filter_bypass_map.bin` declares 2,432 against a 2,404-byte body.
+Uncorrected, its payload runs twelve bytes into the next frame, splices that
+frame's CTM prefix into the message content, and leaves the reader inside the
+frame with the next header read out of the middle of a segment. The clamp is
+also strictly safer than what was there: the old arithmetic over-ran the frame
+for any declaration above 2,432, and the new one cannot over-run at all.
+
+**Two snapshots move, and both were recording the defect.**
+
+- `clutter_filter_map`: `azimuth_count: 350` → `360` on the fifth elevation.
+  A clutter filter map has one azimuth segment per degree; 350 is not a map the
+  RDA can emit. The first four elevations were already 360 because the loss
+  lands 12 bytes per segment and only the last elevation runs out.
+- `rda_adaptation_data`: `site_name: None` → `Some("KDMX")`. The fixture is
+  KDMX's — the same snapshot's `site_latitude: 41.731` and
+  `site_longitude: -93.723` are KDMX's coordinates. `None` was
+  `std::str::from_utf8` refusing four shifted bytes, and the same field reads
+  the correct four-letter id at all five sites checked.
+
+Every other snapshot is byte-unchanged, including
+`clutter_filter_bypass_map`'s, which is what the clamp is holding in place.
+
+Two new tests in `src/messages/framing_tests.rs`, which already owns this
+question for variable-length messages. `a_multi_segment_payload_is_everything_
+its_header_declares` builds a two-elevation clutter filter map framed the way
+the RDA frames one and fails against the unfixed decoder with `[360, 356]`;
+`a_segment_declaring_more_than_its_frame_holds_is_read_to_the_frame` builds a
+bypass map framed the way the fixture generator frames one and fails against
+the fix with the clamp removed. Neither is phrased in terms of the constants it
+pins.
 
 #### The pointer table is walked, not collected — `src/messages/digital_radar_data/message.rs`
 
@@ -324,12 +401,13 @@ of 64 halfwords and its snapshot is unchanged, and this workspace never matches
 the type.
 
 And the bypass map's capacity is now `min(declared, remaining_total / 23042)`,
-which is a floor and not the count. On a real multi-segment map it can come out
-*below* the true number of segments — the more so because the 12-bytes-short
-multi-segment payload slice recorded under *Known upstream defects* below
-biases `remaining_total` down. That is a pre-size that can now under-size,
-trading an over-allocation on an unchecked number for the occasional realloc on
-a once-per-volume metadata path. The right way round, but a trade.
+which is a floor and not the count: on a truncated map it comes out *below* the
+true number of segments. That is a pre-size that can under-size, trading an
+over-allocation on an unchecked number for the occasional realloc on a
+once-per-volume metadata path. The right way round, but a trade. On a whole map
+it is exact — while the multi-segment payload slice was twelve bytes short per
+segment it was not, and with that fixed both KCRP's five-elevation map and the
+packaged single-elevation fixture pre-size to the number they parse.
 
 #### The lint scoping — `src/lib.rs`
 
@@ -363,19 +441,22 @@ modules are **not** cfg-gated and run on every target.
 Recorded so that "we did not notice" is never the explanation, and so the
 upstream PR can raise them without having to rediscover them.
 
-- **The multi-segment payload slice is 12 bytes short.**
-  `src/messages/mod.rs:85-96` computes `payload_size` as
-  `message_size_bytes() - size_of::<MessageHeader>()`, but `segment_size`
-  counts halfwords from byte 12 — it already excludes the 12-byte CTM prefix,
-  so subtracting the full 16-byte header again undercounts by 12. The reader
-  position self-corrects, because the frame padding is skipped to
-  `SEGMENT_FRAME_SIZE` regardless; what can truncate is the *content* of a
-  multi-segment payload, e.g. a Message 15 clutter filter map. Not fixed here
-  on purpose: changing it changes what WSR-88D clutter-map messages decode to,
-  which is precisely what the byte-identical-snapshot bar exists to protect.
-  Raise it upstream, where the fixture coverage to validate it can be built.
-  A comment at the site says the same thing, so the next person to read that
-  arithmetic does not have to conclude it was an oversight.
+- **`tests/generate_synthetic_fixtures.rs` writes a `segment_size` no RDA
+  writes.** `build_multi_segment_frames` computes it as
+  `(HEADER_SIZE + payload_size) / 2` with `HEADER_SIZE = 28` (line 61), so a
+  full segment declares 2,432 bytes where the ICD — and all 855 real
+  multi-segment frames measured here — declares 2,416. `build_single_segment_
+  frame` writes `FRAME_SIZE / 2` for the same reason (line 44), which is inert
+  because a single segment's payload is the frame body regardless.
+
+  Not fixed, because fixing it without regenerating leaves the generator and
+  the committed fixture disagreeing, and regenerating rewrites
+  `clutter_filter_bypass_map.bin` — a packaged fixture, which is the one thing
+  this directory does not touch. The symptom to watch for: a multi-segment
+  fixture generated by this file over-declares by twelve bytes per segment, and
+  only the frame clamp in `decode_messages` keeps it decodable. Correct is
+  `(16 + payload_size) / 2`, together with regenerating the fixture; the
+  decoded content does not change either way.
 
 - **`SliceReader::advance` is unchecked** (`src/slice_reader.rs:35-37`). A
   runaway skip produces no warning at all; the "bytes remaining" diagnostic
@@ -450,15 +531,18 @@ the same default rules as the rest of it.
 ## Upstream pull request
 
 > **TODO — not yet filed.** When it is, put the URL here and note which of the
-> changes above it carries. The framing fix, the four audit findings and the
-> `cfg_attr` lint scoping are all intended for upstream; the trims are not
-> (they are local packaging). The three defects under *Known upstream defects*
-> belong in the PR description or in follow-up issues.
+> changes above it carries. The framing fix, the multi-segment payload fix, the
+> four audit findings and the `cfg_attr` lint scoping are all intended for
+> upstream; the trims are not (they are local packaging). The three defects
+> under *Known upstream defects* belong in the PR description or in follow-up
+> issues.
 >
 > The four audit findings are independent of the framing fix and of each other,
 > so they can go as their own commits or their own PRs — which is how they are
-> committed here. Only the clutter filter map guard changes what any input
-> decodes to, and only for a declaration no `u8` could ever have held.
+> committed here. Two changes alter what an input decodes to: the clutter
+> filter map guard, and only for a declaration no `u8` could ever have held;
+> and the multi-segment payload fix, which moves two snapshots and is the one
+> to lead with, because it is the one a maintainer has real volumes to check.
 
 ## Removing this directory
 

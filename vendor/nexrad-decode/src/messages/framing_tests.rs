@@ -9,6 +9,10 @@
 //! These tests fix both answers in place: the padded stream has to stay framed,
 //! and the unpadded stream has to keep the exact offsets and sizes it has
 //! always had.
+//!
+//! The same declared size also says how much of a fixed-length segment is
+//! payload, and the tests at the foot of this file pin that: all of what the
+//! segment declares, and never more than its frame holds.
 
 use super::digital_radar_data::raw as radar_raw;
 use super::{decode_messages, Message, MessageContents};
@@ -20,6 +24,20 @@ const CTM_PREFIX_LEN: usize = 12;
 
 /// The message header less its CTM prefix — the part `segment_size` counts.
 const HEADER_LEN: usize = 16;
+
+/// One fixed-length message frame: CTM prefix, header block, then body.
+const SEGMENT_FRAME_LEN: usize = 2432;
+
+/// The body of one such frame — all the payload it can physically hold.
+const SEGMENT_BODY_LEN: usize = SEGMENT_FRAME_LEN - CTM_PREFIX_LEN - HEADER_LEN;
+
+/// Payload bytes a full segment carries in real RDA output.
+///
+/// Every one of the 855 multi-segment frames measured across 171 WSR-88D
+/// volumes declares 1,208 halfwords — the sixteen-byte header block and 2,400
+/// bytes of payload — which leaves four bytes of the frame unused. None
+/// declares more than the frame body holds.
+const RDA_SEGMENT_PAYLOAD_LEN: usize = 2400;
 
 /// `digital_radar_data::raw::Header`, the first thing a Type 31 body carries.
 const RADIAL_HEADER_LEN: usize = 32;
@@ -406,5 +424,221 @@ fn a_corrupt_declared_size_does_not_desync_a_clean_parse() {
         frames(&messages),
         vec![(0, 60), (60, 60)],
         "both radials framed from the parse, the lie ignored"
+    );
+}
+
+/// Message type 15, the Clutter Filter Map — the fixed-segment message these
+/// last two tests build, chosen because every byte of its payload is reachable
+/// through the public API.
+const CLUTTER_FILTER_MAP_TYPE: u8 = 15;
+
+/// Azimuth segments in one elevation of a clutter filter map, one per degree.
+const AZIMUTHS_PER_ELEVATION: u16 = 360;
+
+/// Message type 13, the Clutter Filter Bypass Map. Its range bins are read
+/// across segment boundaries rather than structure by structure, which is what
+/// lets a segment's content run to the very last byte of its frame.
+const CLUTTER_FILTER_BYPASS_MAP_TYPE: u8 = 13;
+
+/// Range bin bytes one elevation of a bypass map carries: 360 radials of 32
+/// halfwords.
+const BYPASS_MAP_RANGE_BIN_LEN: usize = 360 * 32 * 2;
+
+/// Where a segment's declared halfword count is measured from.
+#[derive(Clone, Copy)]
+enum DeclaredFrom {
+    /// The end of the CTM prefix, which is what the ICD says and what every
+    /// real segment measured here does.
+    HeaderBlock,
+    /// The start of the frame, which is what this crate's own
+    /// `generate_synthetic_fixtures` writes — twelve bytes more than the frame
+    /// body holds.
+    FrameStart,
+}
+
+/// A clutter filter map body of `elevations` elevation segments, each carrying
+/// the full 360 azimuth segments of one range zone that the ICD calls for.
+///
+/// Every zone's end range is its own index across the whole map, so a payload
+/// that arrives short or shifted shows up as a wrong value and not only as a
+/// wrong count.
+fn clutter_filter_map_body(elevations: u16) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&DATE.to_be_bytes()); // map generation date
+    body.extend_from_slice(&720u16.to_be_bytes()); // map generation time, minutes
+    body.extend_from_slice(&elevations.to_be_bytes());
+
+    for zone in 0..elevations * AZIMUTHS_PER_ELEVATION {
+        body.extend_from_slice(&1u16.to_be_bytes()); // one range zone
+        body.extend_from_slice(&1u16.to_be_bytes()); // op code: bypass filter
+        body.extend_from_slice(&zone.to_be_bytes()); // end range, km
+    }
+    body
+}
+
+/// A clutter filter bypass map body of one elevation segment.
+///
+/// The range bins run 0, 1, 2, … modulo a prime, so a payload that arrives
+/// short, shifted or spliced shows up as a wrong byte and not only as a wrong
+/// length.
+fn clutter_filter_bypass_map_body() -> Vec<u8> {
+    let mut body = Vec::with_capacity(8 + BYPASS_MAP_RANGE_BIN_LEN);
+    body.extend_from_slice(&DATE.to_be_bytes()); // map generation date
+    body.extend_from_slice(&720u16.to_be_bytes()); // map generation time, minutes
+    body.extend_from_slice(&1u16.to_be_bytes()); // one elevation segment
+    body.extend_from_slice(&1u16.to_be_bytes()); // elevation segment number
+    body.extend((0..BYPASS_MAP_RANGE_BIN_LEN).map(|bin| (bin % 251) as u8));
+    body
+}
+
+/// Frames a fixed-segment message body into 2432-byte frames, `payload_len`
+/// bytes of it per frame, each declaring its own size.
+fn fixed_segment_frames(
+    message_type: u8,
+    body: &[u8],
+    payload_len: usize,
+    declared_from: DeclaredFrom,
+) -> Vec<u8> {
+    assert!(
+        payload_len <= SEGMENT_BODY_LEN,
+        "a segment cannot carry more payload than its frame holds"
+    );
+
+    let segment_count = body.len().div_ceil(payload_len);
+    let mut frames = Vec::with_capacity(segment_count * SEGMENT_FRAME_LEN);
+
+    for (index, payload) in body.chunks(payload_len).enumerate() {
+        let declared = match declared_from {
+            DeclaredFrom::HeaderBlock => HEADER_LEN + payload.len(),
+            DeclaredFrom::FrameStart => CTM_PREFIX_LEN + HEADER_LEN + payload.len(),
+        };
+        assert_eq!(declared % 2, 0, "segment_size counts halfwords");
+
+        let segment_number = index as u16 + 1;
+        let mut frame = message_header(
+            (declared / 2) as u16,
+            message_type,
+            segment_number,
+            segment_count as u16,
+            segment_number,
+        );
+        frame.extend_from_slice(payload);
+        frame.resize(SEGMENT_FRAME_LEN, PAD_BYTE);
+        frames.extend_from_slice(&frame);
+    }
+
+    frames
+}
+
+/// The azimuth segment count of each elevation of the decoded clutter filter
+/// map, and the end range of every range zone in the order they arrived.
+fn clutter_filter_map(messages: &[Message<'_>]) -> (Vec<usize>, Vec<u16>) {
+    let map = messages
+        .iter()
+        .find_map(|message| match message.contents() {
+            MessageContents::ClutterFilterMap(map) => Some(map),
+            _ => None,
+        })
+        .expect("a clutter filter map decoded");
+
+    let azimuth_counts = map
+        .elevation_segments()
+        .iter()
+        .map(|elevation| elevation.azimuth_segments().len())
+        .collect();
+    let end_ranges = map
+        .elevation_segments()
+        .iter()
+        .flat_map(|elevation| elevation.azimuth_segments())
+        .flat_map(|azimuth| azimuth.range_zones())
+        .map(|zone| zone.end_range())
+        .collect();
+
+    (azimuth_counts, end_ranges)
+}
+
+/// A segment's payload is everything its header declares past the header block.
+///
+/// `segment_size` counts halfwords from the end of the CTM prefix, so
+/// subtracting the whole of `MessageHeader` takes the prefix out a second time
+/// and the last twelve bytes of every segment go missing. The reader position
+/// survives it — the frame is padded to 2432 either way — so nothing desyncs
+/// and the loss is silent.
+///
+/// It is content that goes, not padding. Measured over 171 real WSR-88D
+/// volumes: every clutter filter map loses ten of its 1,800 azimuth segments,
+/// leaving its last elevation with 350 of 360; every adaptation data field past
+/// the first segment boundary shifts, which is why the site name decodes to
+/// nothing where it should read the four-letter site id; and a five-elevation
+/// clutter filter bypass map comes up 588 bytes short of its own length, hits
+/// the end of the input and decodes to no elevation segments at all.
+#[test]
+fn a_multi_segment_payload_is_everything_its_header_declares() {
+    const ELEVATIONS: u16 = 2;
+
+    let body = clutter_filter_map_body(ELEVATIONS);
+    let input = fixed_segment_frames(
+        CLUTTER_FILTER_MAP_TYPE,
+        &body,
+        RDA_SEGMENT_PAYLOAD_LEN,
+        DeclaredFrom::HeaderBlock,
+    );
+
+    let messages = decode_messages(&input).expect("decodes");
+
+    let (azimuth_counts, end_ranges) = clutter_filter_map(&messages);
+    assert_eq!(
+        azimuth_counts,
+        vec![AZIMUTHS_PER_ELEVATION as usize; ELEVATIONS as usize],
+        "every elevation is whole"
+    );
+    assert_eq!(
+        end_ranges,
+        (0..ELEVATIONS * AZIMUTHS_PER_ELEVATION).collect::<Vec<_>>(),
+        "and every zone arrives in order, with none dropped at a segment boundary"
+    );
+}
+
+/// A segment that declares more than its frame holds is read to the frame and
+/// no further.
+///
+/// No real segment does this — all 855 measured here declare 2,416 bytes
+/// against a 2,404-byte body — but this crate's own
+/// `generate_synthetic_fixtures` measures `segment_size` from the start of the
+/// frame, so `clutter_filter_bypass_map.bin` is exactly this shape and its
+/// snapshot is what the clamp keeps decoding.
+///
+/// Without the clamp the payload runs twelve bytes into the next frame, taking
+/// that frame's CTM prefix in as though it were message content and leaving the
+/// reader inside the frame, where the following header is read out of the
+/// middle of a segment. The frame is the bound, not the declaration.
+#[test]
+fn a_segment_declaring_more_than_its_frame_holds_is_read_to_the_frame() {
+    let body = clutter_filter_bypass_map_body();
+    let input = fixed_segment_frames(
+        CLUTTER_FILTER_BYPASS_MAP_TYPE,
+        &body,
+        SEGMENT_BODY_LEN,
+        DeclaredFrom::FrameStart,
+    );
+
+    let messages = decode_messages(&input).expect("decodes");
+
+    assert_eq!(messages.len(), 1, "the frames assemble into one message");
+    let map = messages
+        .iter()
+        .find_map(|message| match message.contents() {
+            MessageContents::ClutterFilterBypassMap(map) => Some(map),
+            _ => None,
+        })
+        .expect("a clutter filter bypass map decoded");
+
+    let elevations = map.elevation_segments();
+    assert_eq!(elevations.len(), 1);
+    assert_eq!(elevations[0].segment_number(), 1);
+    assert_eq!(
+        elevations[0].range_bins(),
+        &body[body.len() - BYPASS_MAP_RANGE_BIN_LEN..],
+        "the range bins arrive whole, with no frame prefix spliced into them"
     );
 }
