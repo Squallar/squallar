@@ -14343,7 +14343,14 @@ fn settle_overlay_cache(h: &mut InputHarness, kind: OverlayKind) {
             .overlay_cache_mut(kind)
             .current = Some(crate::overlay_cache::OverlayTextureData {
             texture,
-            geo_bounds,
+            // What `spawn_overlay_render` stores, which is the plan's own
+            // coverage and *not* the viewport the request named. Storing the
+            // viewport gave the cache a zero-width overdraw band, so
+            // `pan_exceeds_coverage` was answering about a texture no render
+            // ever produced — and the one question it exists to answer, whether
+            // a freshly landed texture covers the pane that asked for it, could
+            // not be reached from here at all.
+            geo_bounds: plan.coverage(&geo_bounds),
             data_generation: token,
             render_zoom: zoom,
             width: plan.width,
@@ -14621,6 +14628,59 @@ fn settled_alert_pane(zoom: f64) -> InputHarness {
         "fixture: a settled cache with nothing new must ask for nothing"
     );
     h
+}
+
+/// Land every raster the pane asks for, up to `budget` of them, and report how
+/// many it took to go quiet. `budget` means "did not converge".
+///
+/// The closed loop this stands in for is the real one: a landed render sends an
+/// `OverlayRenderResponse`, `poll_overlay_render_results` stores it and
+/// `notify_redraw` asks for the frame that reads it back. So a cache that is
+/// never satisfied is not a slow cache — it is a raster running at the frame
+/// rate, for ever, on no input at all.
+fn renders_until_quiet(h: &mut InputHarness, kind: OverlayKind, budget: usize) -> usize {
+    for landed in 0..budget {
+        h.frame();
+        if rasterizes_requested(h, kind) == 0 {
+            return landed;
+        }
+        settle_overlay_cache(h, kind);
+    }
+    budget
+}
+
+/// **The raster that never stops.** Whatever the map is showing, a render that
+/// lands has to satisfy the pane that asked for it.
+///
+/// It did not, and the failure had no decay and no input: measured in Chromium
+/// on the wasm build at ~12 rasters a second — one full-size fill and upload
+/// per enabled texture layer per frame — held for a three-minute probe with the
+/// pointer still. See `pan_exceeds_coverage`; the short version is that walkers
+/// does not clamp the map to the world, so a pane taller than the world
+/// unprojects past the Mercator limit, while the texture's own bounds are
+/// clamped to it. The viewport then names ground no texture can ever contain.
+///
+/// Zoom is the axis because zooming out is what makes the pane taller than the
+/// world; the zoom band next door does not bound it, because this is the pan
+/// check and it is asked on every frame regardless.
+#[test]
+fn every_zoom_the_map_offers_reaches_a_cache_that_is_satisfied() {
+    // Walkers' own range is 0..=26. Below 3 the harness pane is already taller
+    // than the world; above 12 the whole viewport is inside one tile. Both ends
+    // matter — the loop was only ever reachable at the wide end, which is
+    // exactly why nothing caught it.
+    for z in [0.0f64, 1.0, 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 14.0, 20.0, 26.0] {
+        let mut h = settled_alert_pane(7.0);
+        set_pane_zoom(&mut h, z);
+        let landed = renders_until_quiet(&mut h, OverlayKind::NwsAlerts, 20);
+        assert!(
+            landed < 20,
+            "at zoom {z} the pane asked for a raster on every one of 20 \
+             consecutive frames, each one landed in full. Nothing is moving \
+             and nothing decays: this is a texture upload per frame for as long \
+             as the app is open",
+        );
+    }
 }
 
 /// Walk the zoom by `step` for `frames` frames, one frame per step, and return

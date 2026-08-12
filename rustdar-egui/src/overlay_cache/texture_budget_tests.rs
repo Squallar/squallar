@@ -289,6 +289,206 @@ fn a_texture_that_just_rendered_covers_its_own_viewport() {
     );
 }
 
+/// …and that holds **wherever the map is**, which the one viewport above cannot
+/// say. This is the whole invariant: a render that lands satisfies the pane
+/// that asked for it. Break it anywhere and there is no pan and no gesture, only
+/// a raster and an upload on every frame the app ever draws again — measured on
+/// the wasm build at ~12 a second with the pointer still.
+///
+/// The sweep goes to the poles and past them on purpose. `coverage` clamps
+/// latitude to [`MERCATOR_LAT_LIMIT`] because that is where Web Mercator ends,
+/// while a viewport is free to name ground beyond it — walkers does not clamp
+/// the map to the world, so a pane taller than the world unprojects to latitudes
+/// that no texture can ever contain. 96 of the 160 (centre, span) pairs below
+/// put an edge past the limit, and which ones depends on both numbers rather
+/// than on the span alone: at centre 0 it takes a span past 170.1°, at centre 84
+/// a span of 5° does it.
+#[test]
+fn a_freshly_rendered_texture_covers_its_viewport_at_every_latitude() {
+    for &f in &[OVERDRAW_FRACTION, 1.0, 0.05, 0.0] {
+        for center in [0.0, 20.0, 35.0, 50.0, 60.0, 70.0, 78.0, 84.0, 85.05, 89.0] {
+            for span in [0.5, 5.0, 20.0, 40.0, 80.0, 120.0, 170.0, 250.0] {
+                for &lat in &[center, -center] {
+                    let vp = GeoBounds {
+                        min_lat: lat - span / 2.0,
+                        max_lat: lat + span / 2.0,
+                        min_lon: -100.0,
+                        max_lon: -100.0 + span * 1.6,
+                    };
+                    let tex = freshly_rendered(&vp, f);
+                    assert!(
+                        !pan_exceeds_coverage(&tex, &vp),
+                        "overdraw {f}, viewport {:.2}..{:.2} of latitude: the \
+                         texture just rendered for it is already reported out \
+                         of coverage, so the pane re-renders on every frame \
+                         for ever. Texture covers {:.2}..{:.2}",
+                        vp.min_lat,
+                        vp.max_lat,
+                        tex.min_lat,
+                        tex.max_lat,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The part of a viewport that is on the map at all — what a texture can be
+/// asked to cover. Latitude is clipped to [`MERCATOR_LAT_LIMIT`] because the
+/// projection stops there; longitude is not, because the map wraps.
+fn on_map(viewport: &GeoBounds) -> GeoBounds {
+    GeoBounds {
+        min_lat: viewport.min_lat.max(-MERCATOR_LAT_LIMIT),
+        max_lat: viewport.max_lat.min(MERCATOR_LAT_LIMIT),
+        min_lon: viewport.min_lon,
+        max_lon: viewport.max_lon,
+    }
+}
+
+/// **`false` implies containment, over reachable triples rather than by
+/// derivation.** Whenever [`pan_exceeds_coverage`] says a texture still covers
+/// the pane, every part of that pane which is on the map has to be inside the
+/// texture.
+///
+/// This is the safety half, and it is the half the *liveness* tests cannot see.
+/// `a_freshly_rendered_texture_covers_its_viewport_at_every_latitude` next door
+/// asks whether the check ever gets stuck saying `true`; nothing there — and
+/// nothing in the 683 tests of this crate — notices the check saying `false`
+/// when it should not. Those are opposite failures: one re-rasterises for ever,
+/// the other leaves a strip of the pane with no overlay on it, silently, also
+/// for ever.
+///
+/// The two halves of the fix in `pan_exceeds_coverage` split exactly along that
+/// line, which is why both are here. Skipping a texture edge that sits at the
+/// limit is what ends the spin — it is the whole of the liveness fix. Clipping
+/// the viewport to the limit first is what makes that skip *legal*: without it,
+/// a viewport running off the bottom of the world inflates its own latitude
+/// range, the band goes negative, the margin goes negative with it, and the
+/// north comparison it should have tripped misses by exactly that margin. Drop
+/// the clip and every liveness test still passes.
+///
+/// The triples are `old viewport → coverage(old) → new viewport`, because that
+/// is the only shape the production code can present: a texture's bounds are
+/// always some plan's coverage of the viewport that asked for it, never an
+/// arbitrary rectangle.
+#[test]
+fn a_texture_reported_as_covering_really_does_contain_the_visible_pane() {
+    // Anything a `GeoBounds` comparison decides is worth an epsilon; the
+    // violations this exists for are degrees wide, not ulps.
+    const EPS: f64 = 1e-9;
+    let mut answered_false = 0u32;
+    let mut checked = 0u32;
+
+    for &f in &[0.0f32, 0.05, OVERDRAW_FRACTION, 1.0, 2.0] {
+        for old_centre in [
+            -89.0, -85.05, -60.0, -30.0, -0.1, 0.0, 30.0, 60.0, 85.05, 89.0,
+        ] {
+            for old_span in [0.2, 0.4, 5.0, 20.0, 90.0, 170.0, 200.0] {
+                let old = GeoBounds {
+                    min_lat: old_centre - old_span / 2.0,
+                    max_lat: old_centre + old_span / 2.0,
+                    min_lon: -20.0,
+                    max_lon: -20.0 + old_span * 1.6,
+                };
+                let tex = freshly_rendered(&old, f);
+
+                for d_lat in [-40.0, -10.0, -1.0, -0.2, 0.0, 0.2, 1.0, 10.0, 40.0] {
+                    for scale in [0.5, 1.0, 1.6] {
+                        for d_lon in [-30.0, 0.0, 30.0] {
+                            let new_span = old_span * scale;
+                            let new_centre = old_centre + d_lat;
+                            let new = GeoBounds {
+                                min_lat: new_centre - new_span / 2.0,
+                                max_lat: new_centre + new_span / 2.0,
+                                min_lon: old.min_lon + d_lon,
+                                max_lon: old.min_lon + d_lon + new_span * 1.6,
+                            };
+                            checked += 1;
+                            if pan_exceeds_coverage(&tex, &new) {
+                                continue;
+                            }
+                            answered_false += 1;
+                            let vis = on_map(&new);
+                            let contained = vis.min_lat >= tex.min_lat - EPS
+                                && vis.max_lat <= tex.max_lat + EPS
+                                && vis.min_lon >= tex.min_lon - EPS
+                                && vis.max_lon <= tex.max_lon + EPS;
+                            assert!(
+                                contained,
+                                "overdraw {f}: the check reports this texture as \
+                                 still covering the pane, and it does not. The \
+                                 pane shows {:.4}..{:.4} lat / {:.4}..{:.4} lon of \
+                                 map; the texture holds {:.4}..{:.4} / {:.4}..{:.4}. \
+                                 Whatever sticks out has no overlay drawn on it and \
+                                 nothing will ever ask for one. (Texture was \
+                                 rendered for {:.4}..{:.4}.)",
+                                vis.min_lat,
+                                vis.max_lat,
+                                vis.min_lon,
+                                vis.max_lon,
+                                tex.min_lat,
+                                tex.max_lat,
+                                tex.min_lon,
+                                tex.max_lon,
+                                old.min_lat,
+                                old.max_lat,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // A property test that never reached the property is a green test about
+    // nothing, and this one is one `continue` away from being exactly that.
+    assert!(
+        answered_false > checked / 20,
+        "only {answered_false} of {checked} triples were answered `false`, so \
+         the containment assertion barely ran"
+    );
+}
+
+/// The triple that reads as a pan and is not one, kept by name because it is
+/// what the sweep above was written after.
+///
+/// At an effective overdraw of zero — a pane at least as wide as the adapter's
+/// whole texture limit, which is the WebGL2 2048 case and so the very platform
+/// the spin was measured on — a viewport hanging off the bottom of the world
+/// slides 0.2° north. Without the viewport clip its latitude range is 89.7°
+/// against the texture's 84.85°, the band is negative, and the negative margin
+/// it produces *widens* the north edge instead of tightening it: the comparison
+/// that should have caught the 0.2° strip appearing at the top of the pane
+/// misses it by exactly that much, and the strip has no overlay on it for the
+/// rest of the session.
+#[test]
+fn a_viewport_hanging_off_the_pole_does_not_hide_an_uncovered_strip() {
+    let old = GeoBounds {
+        min_lat: -89.90,
+        max_lat: -0.20,
+        min_lon: -20.0,
+        max_lon: 20.0,
+    };
+    let tex = freshly_rendered(&old, 0.0);
+    assert!(
+        (tex.min_lat + MERCATOR_LAT_LIMIT).abs() < 1e-9 && (tex.max_lat + 0.20).abs() < 1e-9,
+        "fixture: the texture's south edge must be the clamp rather than the \
+         viewport, or the triple is not the one this is about: {:.4}..{:.4}",
+        tex.min_lat,
+        tex.max_lat,
+    );
+
+    let new = GeoBounds {
+        max_lat: 0.0,
+        ..old
+    };
+    assert!(
+        pan_exceeds_coverage(&tex, &new),
+        "the pane now shows 0.2° of map above the top of its texture, and this \
+         reported it covered"
+    );
+}
+
 /// Past `PAN_REBUILD_THRESHOLD` of the band, on every edge.
 ///
 /// Each axis is measured against **its own** band. The viewport is 10° tall and

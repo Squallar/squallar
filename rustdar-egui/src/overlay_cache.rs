@@ -539,6 +539,14 @@ impl OverlayTextureCache {
 /// units, 0.58 at a quarter. [`ZOOM_REBUILD_BAND`] alone bounds zooming *in*,
 /// which shrinks the viewport and can never trip this.
 ///
+/// That cap now rests on **longitude alone**, and the reason is the completeness
+/// rule below: once a zoom-out has pushed both latitude edges onto the clamp,
+/// neither of them can trip anything ever again, so latitude stops bounding the
+/// zoom-out entirely. The figure is unaffected — longitude has no clamp and its
+/// range scales with the zoom exactly as latitude's did, so the trip still lands
+/// at 0.585 zoom units — but it is one axis holding it up rather than two, which
+/// is worth knowing before anyone gives longitude a clamp of its own.
+///
 /// # `false` implies containment
 ///
 /// Measuring the band rather than assuming it buys a guarantee stronger than the
@@ -558,10 +566,50 @@ impl OverlayTextureCache {
 /// anyone picks, and for any zoom band. That is what makes both
 /// `PAN_REBUILD_THRESHOLD` and [`ZOOM_REBUILD_BAND`] safe to tune: the
 /// stale-overlay failure mode is unrepresentable rather than merely untested.
+///
+/// # The pole is not a pan, and this used to spin for ever there
+///
+/// The guarantee above is one-way, and the other way round is the one that
+/// bites: nothing in it stops this from answering `true` about a texture that
+/// has *just been rendered for this very viewport*. If it does, the pane asks
+/// for a render, the render lands, the arriving result asks for a redraw, and
+/// the next frame asks again — a closed loop at whatever frame rate the machine
+/// can manage, with no input and no decay. Measured in Chromium on the wasm
+/// build: ~12 rasters a second, two full-size fills and uploads per frame, held
+/// for a three-minute probe.
+///
+/// Two clamps meeting is what produced it. [`OverlayTexturePlan::coverage`]
+/// clamps the texture's latitude to [`MERCATOR_LAT_LIMIT`], because that is
+/// where Web Mercator stops; walkers does *not* clamp the map to the world, so
+/// once the pane is taller than the world — zoom out far enough, or pan to the
+/// top of it — `viewport_geo_bounds` unprojects the pane's corners to latitudes
+/// past the same limit. The viewport then names ground the projection cannot
+/// draw, the texture is clamped to ground it can, and no render can ever close
+/// the gap: `view_max_lat > tex_max_lat` for every texture there will ever be.
+///
+/// So two things are true of a latitude edge and are handled here rather than
+/// left to arithmetic that cannot see them:
+///
+/// * A viewport beyond [`MERCATOR_LAT_LIMIT`] is looking at nothing. The part
+///   past the limit is off the map, so it is clipped away before it is compared
+///   — a texture is not stale for failing to cover empty space.
+/// * A texture edge *at* the limit is complete. There is no more world to
+///   pre-render into on that side, so no pan can consume its band and the
+///   margin test does not apply to it.
+///
+/// Neither weakens the containment result. Clipping only shrinks the viewport,
+/// and the skipped edge is skipped exactly when `tex_edge` is at the limit and
+/// `view_edge` is clipped to it — so `view_max_lat <= tex_max_lat` holds on that
+/// edge by construction rather than by comparison. Longitude needs neither:
+/// `coverage` does not clamp it, because the map wraps.
 fn pan_exceeds_coverage(texture_bounds: &GeoBounds, viewport_bounds: &GeoBounds) -> bool {
+    // The part of the viewport that is on the map at all.
+    let view_min_lat = viewport_bounds.min_lat.max(-MERCATOR_LAT_LIMIT);
+    let view_max_lat = viewport_bounds.max_lat.min(MERCATOR_LAT_LIMIT);
+
     let tex_lat_range = texture_bounds.max_lat - texture_bounds.min_lat;
     let tex_lon_range = texture_bounds.max_lon - texture_bounds.min_lon;
-    let view_lat_range = viewport_bounds.max_lat - viewport_bounds.min_lat;
+    let view_lat_range = view_max_lat - view_min_lat;
     let view_lon_range = viewport_bounds.max_lon - viewport_bounds.min_lon;
 
     // Overdraw actually present on each side of the viewport.
@@ -575,9 +623,14 @@ fn pan_exceeds_coverage(texture_bounds: &GeoBounds, viewport_bounds: &GeoBounds)
     let margin_lat = band_lat * headroom;
     let margin_lon = band_lon * headroom;
 
+    // An edge already at the projection's limit has no band to consume, and
+    // asking it for one is what spun for ever.
+    let south_is_complete = texture_bounds.min_lat <= -MERCATOR_LAT_LIMIT;
+    let north_is_complete = texture_bounds.max_lat >= MERCATOR_LAT_LIMIT;
+
     // If viewport extends beyond texture bounds minus the margin threshold, re-render
-    viewport_bounds.min_lat < texture_bounds.min_lat + margin_lat
-        || viewport_bounds.max_lat > texture_bounds.max_lat - margin_lat
+    (!south_is_complete && view_min_lat < texture_bounds.min_lat + margin_lat)
+        || (!north_is_complete && view_max_lat > texture_bounds.max_lat - margin_lat)
         || viewport_bounds.min_lon < texture_bounds.min_lon + margin_lon
         || viewport_bounds.max_lon > texture_bounds.max_lon - margin_lon
 }
