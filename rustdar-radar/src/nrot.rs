@@ -947,25 +947,47 @@ const SPLIT_TAPS: [(i32, f64); 4] = [(1, 0.238), (2, 0.342), (3, 0.238), (4, -0.
 /// reference's coarse-grid operator is a narrower one and not the same taps in
 /// row units.
 ///
-/// # The scale here is anchored to [`rot_divisor_km`] and moved with it
+/// # Scale and shape are one measurement, and it was re-taken
 ///
-/// Those twelve readings fix the operator's *shape* on their own — the ND
-/// boundary is the support, the pole-edge ratio the linearity — but its
-/// absolute scale only ever through the product `taps / divisor`, because a
-/// hover reports that product and nothing else. So when the divisor curve was
-/// re-measured against the reference at 60 ranges, these had to follow it or
-/// a reading that was measured to be right would have moved: 0.6812/−0.0838
-/// → 0.6996/−0.0861, scaled by 1.0270, the divisor's own change at 39.1 km,
-/// the middle rung of the ladder they were solved from. On the pinned legacy
-/// couplet the reading is 0.870 against the reference's hovered 0.89, the
-/// same agreement it had before the divisor moved, which is the point.
+/// The ND boundary is the support and the pole-edge ratio the linearity, but
+/// the absolute scale is only ever fixed through the product `taps / divisor`,
+/// because a hover reports that product and nothing else. So when the divisor
+/// curve was re-measured against the reference at 60 ranges these had to
+/// follow it, or a reading measured to be right would have moved. They were
+/// scaled by one constant — 0.6812/−0.0838 → 0.6996/−0.0861, ×1.0270, the
+/// divisor's own change at 39.1 km — and that was a restatement rather than a
+/// re-solve: the divisor's change across the ladder's 32.2–45.9 km span runs
+/// 1.4% to 6.1%, so no single constant can restate all three rungs.
 ///
-/// The divisor's change across their 32.2–45.9 km ladder is not flat (1.4% to
-/// 6.1%), so one constant can no longer restate all three rungs as well as it
-/// did. Re-solving these two taps against the full twelve readings — they are
-/// on branch `campaign-harness`, not here — is owed, and would move this scale
-/// again by a few per cent.
-const LEGACY_TAPS: [(i32, f64); 2] = [(1, 0.6996), (2, -0.0861)];
+/// They are now solved against the divisor **each rung has**. The ladder was
+/// re-taken rather than re-read, because it had to reach past the range where
+/// a second operator used to take these bins over: a ±8 m/s step and a ±10 m/s
+/// three-radial-pole couplet painted from 8 to 200 km into a real volume's
+/// velocity moment, on its first legacy-resolution velocity cut, hovered per
+/// radial at 0.35° steps at 32.2, 39.1, 45.9, 85.2 and 144.5 km — two steps
+/// and two couplets a volume, at opposite radial-index parity. Deciding sites
+/// KLOT, KATX, KMSX, KHNX and KLWX (elevations 1.79–3.53°, declared Nyquist
+/// 11.3 to 25.9); KTLX held out.
+///
+/// Every reading constrains exactly one of two numbers — t₁+t₂, which a step's
+/// core and a couplet's core and pole-edge carry, and t₂, which the tails carry
+/// — each over its own rung's arc and divisor, so the answer is an
+/// intersection of intervals and not a fit. Over 120 deciding readings it is
+/// t₁+t₂ ∈ [0.61489, 0.61633] and t₂ ∈ [−0.08967, −0.07287]; these taps are
+/// its centre, which is also where least squares over the same readings puts
+/// t₂ (−0.0806). Nothing is outside its interval, and the holdout's 20
+/// readings are not either — worst 0.97 of a half-lattice. The scaled taps
+/// they replace put t₁+t₂ at 0.61350, just under the deciding intersection,
+/// and left 3 of the 120 outside; the couplet core was one of them, reading
+/// 0.870 against the reference's 0.890 where the interval allows 0.0198. It
+/// now reads 0.873.
+///
+/// The support is the same past 80 km as inside it: at 85.2 and 144.5 km the
+/// reference still paints two radials of core and one of tail each side and
+/// reads ND beyond, at all six sites. That is what lets this operator serve a
+/// 1.0° sweep at every range, now that [`SPLIT_TAPS`] serves a 0.5° one at
+/// every range and there is no third stencil past 80 km to take either over.
+const LEGACY_TAPS: [(i32, f64); 2] = [(1, 0.6969), (2, -0.0813)];
 
 /// Range half-depth in gates for the stencils' 3-gate range means, per
 /// Smith/Elmore's "3 range gates deep" — deeper smooths small features in
@@ -3833,8 +3855,11 @@ mod tests {
     /// parameter, which is what says the reference does not compress couplets
     /// on this grid, which is what the super-res width ladder went on to say
     /// of that grid too.
-    /// A three-range step ladder (0.77/0.69/0.65 at 32.2/39.1/45.9 km) fixes
-    /// the divisor curve as the one already shipped.
+    ///
+    /// A three-range step ladder — 0.77/0.69/0.65 at 32.2/39.1/45.9 km — fixes
+    /// the scale against the divisor curve as shipped. It has since been
+    /// re-taken over five deciding sites and a holdout and carried out to
+    /// 144.5 km, and it is what [`LEGACY_TAPS`] is solved from rung by rung.
     ///
     /// The tolerance is the 0.04 the reference quantizes its own output in.
     #[test]
