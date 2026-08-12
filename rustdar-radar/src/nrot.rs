@@ -30,7 +30,7 @@
 //!    are already whole degrees, applied to 3-gate range means and divided by
 //!    the local arc per radial. The sign-reversed outer tap produces the small
 //!    negative side lobes flanking every strong gradient. Every tap cell must
-//!    be intact and the profile must correlate with the stencil (r² ≥ 0.05);
+//!    be intact and the profile must correlate with the stencil (r² ≥ 0.01);
 //!    constant or incoherent profiles read ND.
 //! 4. Divide ROT by the divisor curve — knot ranges in KILOMETRES, linearly
 //!    interpolated, measured off the reference at 60 ranges (22.4 at 13 km
@@ -1202,9 +1202,43 @@ const STENCIL_RNG_HALF: i32 = 1;
 /// spectrum-width (1 to 12 m/s) ladders painted into that same cut read the
 /// identical +0.49 couplet in all twelve sectors.
 ///
-/// The floor still earns its place on constant and near-constant profiles,
-/// which is what it was set for and all it is claimed to do.
-const GK_MIN_R2: f64 = 0.05;
+/// # Where it sits, measured on the step the operator was measured on
+///
+/// 0.05 was never read off anything. The six-site step ladder that fixed
+/// [`SPLIT_TAPS`] says what it costs: a ±8 m/s edge at six azimuths, hovered
+/// along the 21.0 nm arc at 0.25°, over KHNX, KLWX, KTLX, KLOT, KATX and KMSX,
+/// declared Nyquist 11.34 to 25.91. The reference carries a value at 575 of
+/// those hovers. At 0.05 this module reads ND at **152** of them:
+///
+/// ```text
+///     reference reads   hovers ND at 0.05   at 0.01
+///          +0.49                12             0
+///          +0.10               124             0
+///          −0.18                16            11
+/// ```
+///
+/// Twelve of them are over [`SIGNIFICANT`], so the floor costs painted bins
+/// and not only carried ones. The shoulders it refuses are the step response's
+/// own — the profile `SPLIT_TAPS` was fitted to — and they fit the stencil at
+/// an r² near 0.012: all six sites transfer together between 0.011 and 0.013,
+/// which is a step's shoulder having one shape rather than six.
+///
+/// Recovering them costs no accuracy. Over the whole ladder the mean departure
+/// from the reference moves 0.0475 → 0.0485 on 141 more points, and the worst
+/// case is 0.400 either way. The 216-rung scorecard stays at 195, with 26 of
+/// its cells closer to the reference's hover count and 17 further — 138 cells
+/// exactly right before, 155 after. Painted bins move KTLX 1227 → 1230,
+/// KCRP 5228 → 5288, KDMX 2944 → 2947, KFTG 1539 → 1571, and KHNX stays 0.
+///
+/// **This is an upper bound with no measured floor.** Nothing in the corpus
+/// shows the gate refusing something the reference also refuses: at KTLX the
+/// three bins it admits are three the reference does not paint (+0.38, +0.29,
+/// −0.25, all just over the floor), and that is the entire evidence for
+/// keeping it positive. It sits at the top of what the ladder admits rather
+/// than at zero for that reason and for no stronger one. Exactly constant
+/// profiles are refused by the `svv <= 0.0` test beside it and do not need a
+/// floor at all; near-constant ones are all this number still speaks for.
+const GK_MIN_R2: f64 = 0.01;
 
 /// Extra valid radials required beyond the split stencil's ±4 span on each
 /// side. A completeness rule that stops at the stencil's own span doubles as a
@@ -4634,11 +4668,13 @@ mod tests {
             );
             compared += usize::from(a.is_finite());
         }
-        // 713 until the operator's shape was corrected. The peak is unchanged
-        // and the skirts are not, so one more of the 720 bins on this row
-        // clears [`SIGNIFICANT`]; the roll-invariance this test exists for is
-        // asserted above and is untouched.
-        assert_eq!(compared, 714, "the compared row read mostly ND");
+        // 713 until the operator's shape was corrected, then 714; 715 since
+        // [`GK_MIN_R2`] came down to the floor the six-site step ladder admits.
+        // Each move is one more of the 720 bins on this row carrying a value —
+        // this count is a witness that the row is not mostly ND, not a reading
+        // of anything. The roll-invariance the test exists for is asserted
+        // above, bin for bin, and no change here has touched it.
+        assert_eq!(compared, 715, "the compared row read mostly ND");
 
         let coarse = (read(360, 1.0, 0), read(360, 1.0, 1));
         let mut compared = 0;
