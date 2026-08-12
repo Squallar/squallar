@@ -280,12 +280,7 @@ fn a_sliver_hole_is_dropped_even_though_its_area_clears_the_floor() {
     // The real cut-out this must not touch: Sussex County's enclave, 588.6 px²
     // over 107.7 px of rim at the size `Rendered` draws it, restated the same
     // way.
-    let enclave = [
-        (0.0, 0.0),
-        (38.62, 0.0),
-        (38.62, 15.24),
-        (0.0, 15.24),
-    ];
+    let enclave = [(0.0, 0.0), (38.62, 0.0), (38.62, 15.24), (0.0, 15.24)];
     assert!(
         hole_is_drawable(&enclave),
         "a real enclave was dropped as a sliver — the width test is too tight \

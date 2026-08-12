@@ -752,8 +752,7 @@ fn draw_feature(
         let Some(projected) = project_polygon(polygon, mb, w, h) else {
             continue;
         };
-        if let Some((path, rule)) =
-            build_filled_polygon_path(&projected.exterior, &projected.holes)
+        if let Some((path, rule)) = build_filled_polygon_path(&projected.exterior, &projected.holes)
         {
             fill_path(pixmap, &path, feature.fill_rgba, rule);
             if feature.stroke_rgba[3] > 0 {
