@@ -1706,10 +1706,10 @@ pub(super) fn render_color_scale(
         if let Some(line) = &fold_line {
             // Hung off the pane's own edge rather than centred on the bar like
             // the title above it, and by 2 points at `folds ±50` the two look
-            // the same. They stop looking the same at three digits — a
-            // WSR-88D's 63.7 m/s is `folds ±229` in km/h, 56 points wide over a
-            // 20-point bar 16 points from the edge — and a centred line would
-            // hand the last digit to the painter's clip rect.
+            // the same. They stop looking the same at three digits — 63.5 m/s
+            // is `folds ±229` in km/h, 52 points wide over a 20-point bar
+            // standing 16 points from the edge — and a centred line would hand
+            // the last digit to the painter's clip rect.
             draw_shadowed_text(
                 painter,
                 egui::pos2(pane_rect.right() - 2.0, bar_rect.top() - 4.0),
@@ -1788,13 +1788,16 @@ pub(super) fn render_color_scale(
 ///
 /// # An off-scale Nyquist is marked nowhere
 ///
-/// A WSR-88D Doppler cut declares around 64 m/s, which is nearly twice the
-/// 36.01 the bar reaches. A marker clamped to the end of the bar would say the
-/// picture folds at 36 — the one number it certainly does not fold at — and a
-/// marker drawn off the end would land in the pane's chrome. Nothing is drawn,
-/// and the `folds ±142` line beside the unit title still states the limit,
-/// which is the honest half of the annotation: the whole ramp is inside this
-/// radar's unambiguous velocity, so no part of it wraps.
+/// The bar reaches 36.01 m/s and the fastest declaration
+/// `rustdar_radar::nyquist` has measured is a high cut's 35.5, so a real one
+/// clears the end of the bar by half a metre a second — and Message 31 carries
+/// the field in hundredths of a metre per second, which is room for a great
+/// deal more than that. A marker clamped to the end for a declaration past it
+/// would say the picture folds at 36.01, the one speed it certainly does not
+/// fold at, and one drawn off the end would land in the pane's chrome. Nothing
+/// is drawn, and the `folds ±142` line beside the unit title still states the
+/// limit — the honest half of the annotation, since a ramp entirely inside a
+/// radar's unambiguous velocity wraps nowhere.
 fn fold_marker_positions(nyquist_ms: f32, min_val: f32, max_val: f32) -> Option<[f32; 2]> {
     if !nyquist_ms.is_finite() || nyquist_ms <= 0.0 {
         return None;
@@ -2367,6 +2370,13 @@ mod tests {
         (legend.min_value, legend.max_value)
     }
 
+    /// A declaration past the end of the bar, m/s — wider than anything
+    /// `rustdar_radar::nyquist` has measured (22.5-35.5) and inside what
+    /// Message 31's hundredths-of-a-metre field carries. It is also the widest
+    /// speed the velocity moment itself encodes, ±63.5 m/s in half-metre
+    /// steps, so a dealiased field can genuinely reach it.
+    const PAST_THE_BAR_MS: f32 = 63.5;
+
     /// The fold annotation is the declared limit converted, and nothing else.
     ///
     /// 22.14 m/s is a TPIT Doppler cut's own declaration. Every user-facing
@@ -2391,20 +2401,21 @@ mod tests {
         }
     }
 
-    /// Both ends of a TDWR's fold sit on the bar; a WSR-88D's sit off it.
+    /// Both ends of a TDWR's fold sit on the bar; a declaration past its reach
+    /// sits nowhere.
     ///
-    /// The ramp spans ±36.01 m/s (±80.55 mph) for every radar, so 22.14 lands
-    /// at 0.19 and 0.81 of its length while 63.7 is nearly twice its reach.
-    /// The off-scale answer is *nothing*, not a marker parked at the end: the
-    /// end of the bar is the one speed that sweep does not fold at.
+    /// The ramp spans ±36.01 m/s (±80.55 mph) for every radar, so a TPIT cut's
+    /// 22.14 lands at 0.19 and 0.81 of its length while 63.5 is nearly twice
+    /// its reach. The off-scale answer is *nothing*, not a marker parked at the
+    /// end: the end of the bar is the one speed that sweep does not fold at.
     #[test]
     fn a_fold_off_the_end_of_the_ramp_is_marked_nowhere() {
         let (min_val, max_val) = velocity_bounds();
         assert!(
             (max_val - 36.01).abs() < 0.01 && (min_val + 36.01).abs() < 0.01,
             "the velocity ramp moved: it now spans {min_val}..{max_val} m/s, \
-             so the fixtures below no longer describe an on-scale TDWR fold \
-             and an off-scale WSR-88D one",
+             so the fixtures below no longer describe one fold inside the bar \
+             and one past it",
         );
 
         assert_eq!(
@@ -2413,9 +2424,10 @@ mod tests {
             "a TDWR's fold is inside the bar and must be marked at both ends",
         );
         assert_eq!(
-            fold_marker_positions(63.7, min_val, max_val),
+            fold_marker_positions(PAST_THE_BAR_MS, min_val, max_val),
             None,
-            "a WSR-88D's 63.7 m/s fold was marked on a bar that stops at 36.01",
+            "a {PAST_THE_BAR_MS} m/s fold was marked on a bar that stops at \
+             36.01",
         );
         // Exactly at the end still counts — that marker is drawable, and it is
         // the boundary a clamp would have been written around.

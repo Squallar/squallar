@@ -1486,9 +1486,14 @@ fn the_mehs_colour_bar_paints_the_users_hail_size_unit() {
 /// the ±36.01 m/s the fixed ramp spans.
 const TDWR_NYQUIST_MS: f64 = 22.14;
 
-/// A WSR-88D Doppler cut's, m/s — nearly twice the ramp's reach, so its fold
-/// has no place on the bar.
-const WSR88D_NYQUIST_MS: f64 = 63.7;
+/// A declaration past the end of the ramp, m/s.
+///
+/// Wider than anything `rustdar_radar::nyquist` has measured — 22.5-35.5 m/s
+/// across its probe volumes, where even the fastest high cut clears the bar's
+/// 36.01 by half a metre a second — and inside what Message 31's
+/// hundredths-of-a-metre field carries. It is the widest speed the velocity
+/// moment itself encodes, ±63.5 m/s in half-metre steps.
+const PAST_THE_BAR_MS: f64 = 63.5;
 
 /// A landscape pane on `site` showing a finished velocity render that declares
 /// `nyquist_ms`, radar layer on.
@@ -1620,30 +1625,34 @@ fn the_velocity_bar_says_where_its_own_sweep_folds_in_every_speed_unit() {
 
 /// 8e. **A fold the bar cannot reach is named and not marked.**
 ///
-///     A WSR-88D Doppler cut declares ~63.7 m/s, and the ramp stops at 36.01.
-///     A marker clamped to the end of the bar would put the fold at the one
-///     speed the picture certainly does not fold at, so nothing is drawn —
-///     while the title line still states the limit, which is the honest half:
-///     every colour on this bar is inside that radar's unambiguous velocity.
+///     The ramp stops at 36.01 m/s and a declaration can be wider — the
+///     archive states the number in hundredths of a metre per second, and the
+///     probe volumes' own fastest cut already sits within half a metre a
+///     second of the end. A marker clamped to the end of the bar would put the
+///     fold at the one speed the picture certainly does not fold at, so
+///     nothing is drawn — while the title line still states the limit, which
+///     is the honest half: every colour on this bar is then inside that
+///     radar's unambiguous velocity.
 #[test]
 fn a_nyquist_past_the_end_of_the_bar_is_named_but_not_marked() {
-    let h = velocity_pane("KTLX", Some(WSR88D_NYQUIST_MS));
+    let h = velocity_pane("KTLX", Some(PAST_THE_BAR_MS));
 
     assert_eq!(
         fold_line_painted(&h).as_deref(),
-        // 63.7 m/s is 142.49 mph, the default unit.
+        // 63.5 m/s is 142.05 mph, the default unit.
         Some("folds \u{b1}142"),
         "the off-scale limit is not stated; painted: {:?}",
         h.painted_text_strings_in(h.pane_rects()[0]),
     );
     assert!(
         fold_markers_painted(&h).is_empty(),
-        "a fold at 63.7 m/s was marked on a bar that stops at 36.01: {:?}",
+        "a fold at {PAST_THE_BAR_MS} m/s was marked on a bar that stops at \
+         36.01: {:?}",
         fold_markers_painted(&h),
     );
 
     // The widest this line ever gets: three digits, in the unit that produces
-    // them. 63.7 m/s is 229.3 km/h, and `folds ±229` lays out 52 points wide
+    // them. 63.5 m/s is 228.6 km/h, and `folds ±229` lays out 52 points wide
     // over a 20-point bar standing 16 points off the pane's edge — so a line
     // centred on the bar would have handed its last digit to the clip rect.
     let mut h = h;

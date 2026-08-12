@@ -1702,13 +1702,14 @@ impl PaneState {
     /// cut behind those pixels declared, or `None` when nothing on screen can
     /// carry that annotation.
     ///
-    /// A TDWR's Doppler cuts declare 20-30 m/s; a WSR-88D's declare around 64.
-    /// The velocity ramp is fixed at ±80.55 mph (±36.01 m/s) for every one of
-    /// them, so on a TPIT sweep at 22 m/s the outer third of the bar is colour
-    /// the radar cannot measure: past ±Vny the sign wraps and an inbound 25 m/s
-    /// gate comes back as outbound 19. The legend says where that starts, and
-    /// the one thing it must get right is *which* fold limit is on the glass
-    /// this frame.
+    /// A TDWR's Doppler cuts declare 20-30 m/s against the 22.5-35.5 m/s
+    /// `rustdar_radar::nyquist` measured across its WSR-88D probe volumes, and
+    /// the velocity ramp is fixed at ±80.55 mph (±36.01 m/s) for both. So on a
+    /// TPIT sweep at 22.14 the outer third of the bar is colour that radar
+    /// cannot measure: past ±Vny the sign wraps and an inbound 25 m/s gate
+    /// comes back painted as outbound 19. The legend says where that starts,
+    /// and the one thing it must get right is *which* fold limit is on the
+    /// glass this frame.
     ///
     /// # The playing frame wins over the texture
     ///
@@ -1731,9 +1732,9 @@ impl PaneState {
     ///
     /// Section and volume panes answer `None` by construction. Their picture is
     /// assembled from a whole tilt ladder whose cuts each declare their own
-    /// limit — a 14-rung VCP 212 volume mixes 8 m/s surveillance cuts with
-    /// 32 m/s Doppler ones — so a single number over all of them would be wrong
-    /// for most of them.
+    /// limit — 22.5 m/s on a low cut against 35.5 on a high cut of the *same*
+    /// volume, which is the measurement `rustdar_radar::nyquist` exists for —
+    /// so a single number over all of them would be wrong for most of them.
     ///
     /// # Only what the pixels are
     ///
