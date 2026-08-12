@@ -1047,12 +1047,18 @@ impl StoreInner {
 /// # Why the region is not part of it
 ///
 /// It was, and that is what made zooming take the view away. The region is the
-/// pane's own viewport, so every scroll names a new target, and a target
-/// scoped away from the grid in hand meant the pane blanked to "Building…" for
-/// the ~140 ms it takes to resample and upload the new box — on a gesture the
-/// user expects to be continuous, and over a floor that was already following
-/// the viewport in real time, so the effect read as the data falling off a
-/// moving ground.
+/// pane's own viewport, so every frame of a scroll names a new target, and a
+/// target scoped away from the grid in hand blanked the pane to "Building…" —
+/// on a gesture the user expects to be continuous, and over a floor that was
+/// already following the viewport in real time, so the effect read as the data
+/// falling off a moving ground.
+///
+/// And the gap was never *one build*. Because every gesture frame names a new
+/// box, no build in flight ever answers what the pane is currently asking for,
+/// so the blank lasted the whole gesture **plus** a build — measured at 12
+/// frames over a 200 ms scroll on this machine, and it grows with how long the
+/// user keeps scrolling rather than with what a resample costs. That is why
+/// making the build faster was never the fix.
 ///
 /// The reason it was excluded is real and is answered rather than dropped: a
 /// grid over one patch of ground painted under a caption naming another would
@@ -1554,11 +1560,12 @@ fn floor_lanes(
 /// # Why the two can differ at all
 ///
 /// The box is the pane's own viewport, so a scroll retargets it, and the grid
-/// for the new box is ~89 ms of resampling plus ~51 ms of upload away. Through
-/// that wait the pane keeps the grid it already has — that is the store's
-/// stand-in, and it is what stops a zoom taking the view away — but it draws
-/// it **in the box the user just asked for**, not in the box the grid was
-/// built for. Everything geographic in the uniform is therefore the requested
+/// for the new box is a resample and a GPU upload away (measured together at
+/// ~37 ms here; see `same_scope` for why the number is not what mattered).
+/// Through that wait the pane keeps the grid it already has — that is the
+/// store's stand-in, and it is what stops a zoom taking the view away — but it
+/// draws it **in the box the user just asked for**, not in the box the grid
+/// was built for. Everything geographic in the uniform is therefore the requested
 /// box: the camera frames it (so the zoom is immediate), the floor is
 /// registered to it (so it still covers the box exactly, which is the whole
 /// point of the region being the viewport), and only where the field is

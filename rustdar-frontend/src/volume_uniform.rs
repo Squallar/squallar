@@ -357,12 +357,12 @@ pub struct VolumeUniform {
     ///
     /// # What the other case is for
     ///
-    /// A zoom retargets the pane's box, and the grid for the new box takes
-    /// ~140 ms to build and upload. Blanking the pane for that long is what
-    /// made zooming feel like it took the view away. So while the build is in
-    /// flight the pane draws the grid it already has, *in the box the user
-    /// just asked for* — and this affine is what makes that a real picture
-    /// rather than a mislabelled one. The rest of the uniform describes the
+    /// A zoom retargets the pane's box, and every frame of the gesture names
+    /// another one, so the pane used to stay blank for the whole scroll plus a
+    /// build — 12 frames over a 200 ms wheel turn, measured. So while a build
+    /// is in flight the pane draws the grid it already has, *in the box the
+    /// user just asked for* — and this affine is what makes that a real
+    /// picture rather than a mislabelled one. The rest of the uniform describes the
     /// **requested** box throughout (`box_size_km`, `floor_geo`'s west and
     /// south edges), so the floor, the camera framing and the geography are
     /// the new ones; only where the field is fetched from is old.

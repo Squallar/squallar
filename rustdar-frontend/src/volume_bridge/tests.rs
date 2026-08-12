@@ -384,14 +384,14 @@ fn box_target(half_width_km: f64) -> VolumeTarget {
 
 /// **Zooming a 3D pane must not take its picture away.**
 ///
-/// The box is the pane's own viewport, so a scroll names a new target on the
-/// very frame the wheel turns, and the grid for it is ~89 ms of resampling
-/// plus ~51 ms of upload away. With the region inside `same_scope` the new
-/// target was out of scope of the grid in the pane's own hand: `begin_build`
-/// shed it, `lookup_for_pane` had nothing left to answer with, and the pane
-/// blanked to "Building…" for that whole window — over a floor that was
-/// already following the viewport in real time, so it read as the data
-/// falling off a moving ground.
+/// The box is the pane's own viewport, so a scroll names a new target on every
+/// frame the wheel turns. With the region inside `same_scope` each of those
+/// targets was out of scope of the grid in the pane's own hand: `begin_build`
+/// shed it, `lookup_for_pane` had nothing left to answer with, and — since no
+/// build in flight ever matched what was being asked for either — the pane
+/// blanked for the whole gesture plus a build, 12 frames over a 200 ms scroll.
+/// All of it over a floor that was already following the viewport in real
+/// time, so it read as the data falling off a moving ground.
 ///
 /// Two assertions, and the pairing is what stops this passing vacuously: the
 /// held grid answers **and it is the `Ready` grid**, not the `Building` entry

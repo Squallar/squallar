@@ -2549,8 +2549,8 @@ const KFT_PER_KM: f64 = 3.280_84;
 ///
 /// The box the pane names is the box it is drawing, always: a zoom retargets
 /// the viewport and the renderer frames the new box on that very frame. The
-/// **resolution** is a different claim. For the ~140 ms a rebuild takes, what
-/// is on screen is the grid the pane already had, drawn into the new box — so
+/// **resolution** is a different claim. For as long as a rebuild is pending,
+/// what is on screen is the grid the pane already had, drawn into the new box — so
 /// the picture is the right ground at the wrong sharpness, and possibly not
 /// reaching the box's edges if the zoom was outwards. Reading the cell size off
 /// the requested region alone would claim a sharpness that is not there, and

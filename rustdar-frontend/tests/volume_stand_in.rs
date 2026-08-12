@@ -16,7 +16,10 @@
 //!
 //! Scroll on a 3D pane zooms the *geography*, and the box is the pane's own
 //! viewport, so a zoom names a new `VolumeTarget` on the frame the wheel turns.
-//! The grid for that box is ~89 ms of resampling plus ~51 ms of upload away.
+//! The grid for that box is a resample and a GPU upload away, and — because
+//! every frame of the gesture names another box — no build in flight ever
+//! answers what the pane is currently asking for, so the wait used to last the
+//! whole scroll plus a build (12 frames over a 200 ms wheel turn, measured).
 //! The pane must keep drawing through that window — the held grid, put into the
 //! box the user just asked for — and its caption must say what is really on
 //! screen. Both halves are asserted here, and the file's shape is chosen so
