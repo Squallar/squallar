@@ -1575,6 +1575,50 @@ fn floor_lanes(
 /// same inputs by the same function — see
 /// [`rustdar_radar::voxel::horizontal_ranges_km`] — so they are bit-equal and
 /// the affine is exactly the identity.
+///
+/// # Zooming out: real data in the middle and nothing outside it
+///
+/// Zooming in, the requested box is inside the held grid and the picture is
+/// simply softer until the build lands. Zooming out it is not, and the ring
+/// beyond the grid has to be *something*. It is nothing — transparent, with the
+/// floor showing through it and the caption saying so ("over the middle,
+/// filling in"). The alternative considered and rejected was a resident coarse
+/// whole-volume grid per 3D pane, kept as a permanent backdrop.
+///
+/// **It does not fit, and it is not the memory that decides it.** The bytes are
+/// real: a whole-volume grid is 36 MiB of GPU texture on desktop
+/// (`DESKTOP_SHAPE` 256×256×128 at four bytes a cell, plus its 4 MiB coarse
+/// level), 15.19 MiB on mobile and 4.5 MiB on wasm. At `MAX_PANES_DESKTOP` = 6
+/// that is 216 MiB of backdrop — 42% of [`crate::constants::LOOP_POOL_FLOOR_BYTES`]
+/// (512 MiB desktop), which is also `VOLUME_LOOP_TEXTURE_BUDGET_BYTES`, so it
+/// comes straight out of what a 3D loop may hold: six of the fourteen grids
+/// that floor buys, gone. On wasm the floor is 48 MiB and four panes of
+/// backdrop are 18 MiB of it, 37.5%. Against
+/// [`crate::constants::APP_TEXTURE_BUDGET_BYTES`] alone (3840 MiB desktop, 256
+/// MiB wasm) it would look affordable, and that is exactly the reading to
+/// distrust: `enforce_budget` evicts oldest-first, so what a permanent
+/// per-pane resident actually displaces is a *live* loop's frames.
+///
+/// Two things rule it out before the bytes do:
+///
+/// * **It would cost the user the sharp grid.** The backdrop is a build, and
+///   builds go through one budget. `MAX_CONCURRENT_RENDERS` is 1 on wasm, so a
+///   backdrop build takes the slot the build the user is actually waiting for
+///   needs — the backdrop would lengthen the very wait it exists to cover.
+/// * **It would put two times in one box.** The volume is live and rebuilds
+///   every sealed sweep. A backdrop refreshed on the same cadence costs a
+///   second build per pane per sweep for ever; one that is not is a picture of
+///   an older sweep painted beside a picture of the current one, in the same
+///   box, with no way for a caption to say which is which *per pixel*. The
+///   whole licence for the stand-in is that the caption can describe the
+///   picture; a two-time composite is the one picture it cannot.
+///
+/// And the payoff was small in the first place. The blank the stand-in
+/// removed lasted the whole gesture plus a build — 12 frames over a 200 ms
+/// scroll, measured. What the backdrop would cover is the ring outside the
+/// held grid, on an outward zoom only, for the one build the user has left to
+/// wait: measured at ~37 ms here. Transparent ground under a caption that says
+/// the rest is filling in is an honest answer to that, and a free one.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct DrawnBox {
     x_km: (f64, f64),
