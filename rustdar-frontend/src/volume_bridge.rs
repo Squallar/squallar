@@ -1695,11 +1695,7 @@ fn cell_km(grid: &VoxelGrid) -> Option<f32> {
 /// world = box_min + p · box_size          (what the shader marches)
 /// t     = (world − grid_min) / grid_size  (where the texture has it)
 /// ```
-fn crop_into(
-    grid: &VoxelGrid,
-    x_km: (f64, f64),
-    y_km: (f64, f64),
-) -> Option<([f32; 3], [f32; 3])> {
+fn crop_into(grid: &VoxelGrid, x_km: (f64, f64), y_km: (f64, f64)) -> Option<([f32; 3], [f32; 3])> {
     let axes = [
         (x_km, grid.x_range_km()),
         (y_km, grid.y_range_km()),

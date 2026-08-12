@@ -1271,7 +1271,14 @@ fn the_caption_names_the_base_volume_or_says_the_first_is_still_filling() {
 #[test]
 fn the_caption_reports_the_resolution_the_box_buys() {
     let whole_volume = rustdar_radar::voxel::box_half_width_km(460.125);
-    let wide = volume_caption("KTLX", at(33), None, whole_volume, Default::default(), SETTLED);
+    let wide = volume_caption(
+        "KTLX",
+        at(33),
+        None,
+        whole_volume,
+        Default::default(),
+        SETTLED,
+    );
     assert!(
         wide.iter()
             .any(|l| l.contains("651 km box") && l.contains("2.54 km/cell")),

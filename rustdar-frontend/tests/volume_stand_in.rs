@@ -232,7 +232,10 @@ fn a_zoom_keeps_a_picture_on_screen_and_the_caption_says_what_it_is() {
     assert!(!store.share(0, &tight), "a new box needs a new build");
     store.begin_build(0, &tight);
     assert!(
-        matches!(store.lookup(&tight).map(|l| l.entry), Some(VolumeEntry::Building)),
+        matches!(
+            store.lookup(&tight).map(|l| l.entry),
+            Some(VolumeEntry::Building)
+        ),
         "precondition: the zoomed box is genuinely still building",
     );
 
