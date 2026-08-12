@@ -656,10 +656,13 @@ pub const DESKTOP_VOLUME_LOOP_TEXTURE_BUDGET_BYTES: usize = DESKTOP_LOOP_POOL_FL
 ///
 /// # Desktop takes fewer frames at the full grid, not more at a coarser one
 ///
-/// 13 frames of the full 256×256×128 grid is ~65 minutes of history where 30
+/// 13 frames of the full 512×512×32 grid is ~65 minutes of history where 30
 /// frames would be ~150. That is a real loss and it is stated rather than
-/// hidden. The alternative — a loop-specific coarser grid — was rejected for
-/// three reasons, in the order they bite:
+/// hidden. (The shape was 256×256×128 when this was written, and is the same
+/// 8,388,608 cells either way — `shape_for_budget` respends the budget rather
+/// than enlarging it — so the 13 is unchanged and only the triple has moved.)
+/// The alternative — a loop-specific coarser grid — was rejected for three
+/// reasons, in the order they bite:
 ///
 /// * A coarser grid halves the **vertical** axis (141 → 188 m/cell at
 ///   192×192×64), and that is where 3D structure lives. A BWER or an overhang
@@ -736,8 +739,9 @@ pub const DESKTOP_MAX_LOOP_VOLUME_FRAMES: usize = 13;
 /// `write_texture` returned. `volume::raymarch::coverage_premultiplied_into`
 /// has the syscall evidence, and `volume::bridge::VolumeResources::widening` is
 /// the buffer that replaced it. The coarse level was **35.9 ms** on top and is
-/// **5.9 ms** when it is built at all — which at the default 460 km box is
-/// never (see `volume::raymarch::CoarseLevel`). Its own 4 MiB allocation is
+/// **5.9 ms** when it is built at all — which at reflectivity's whole-volume
+/// box is never, and at the other five products' is every time (see
+/// `volume::raymarch::CoarseLevel`). Its own 4 MiB allocation is
 /// well under that cap, does recycle — 0 faults a call, measured — and was
 /// therefore left alone.
 ///

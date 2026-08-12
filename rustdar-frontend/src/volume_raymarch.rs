@@ -1485,20 +1485,48 @@ pub fn grid_bytes_at(cells: [u32; 3], coarse: CoarseLevel) -> Option<usize> {
 ///
 /// The shader reads a nonzero LOD only when the uniform's shading flag is
 /// raised *and* `volume::bridge::cloud_reconstruction_lod_for` hands it a
-/// nonzero level — and cross-referencing those two against what each platform
-/// can reach, the second level is live in one place: a **discrete desktop GPU,
-/// in lit-volume mode, at a region box**. It is dead on wasm32 and on mobile
-/// (both platform ceilings are `Half + GradientShading::Off`), dead on desktop
-/// integrated, virtual and software adapters, dead in isosurface mode, which
-/// takes the level back to 0 for reasons of its own — and dead at the
-/// **default** desktop 460 km box, whose 1.80 km cells are past the taper's
-/// 1.75 km zero.
+/// nonzero level. Cross-referencing those two against what each platform can
+/// reach, the second level is live on a **discrete desktop GPU, in lit-volume
+/// mode**, and dead everywhere else: dead on wasm32 and on mobile (both
+/// platform ceilings are `Half + GradientShading::Off`), dead on desktop
+/// integrated, virtual and software adapters, and dead in isosurface mode,
+/// which takes the level back to 0 for reasons of its own.
 ///
-/// Everywhere else it was 4 MiB of a 36 MiB upload, a second `write_texture`,
-/// and a CPU pass over the whole index plane, to fill a level nothing sampled.
-/// A desktop 3D loop's 13 frames held 52 MiB of it, and 56 MiB at the peak
-/// `DESKTOP_MAX_LOOP_VOLUME_FRAMES` is sized for: those grids beside the one
-/// live volume the budget also has to admit.
+/// # On that one live platform the cell size decides it, and it decides it per product
+///
+/// This doc used to add "at a **region box**", and say the level was dead at
+/// "the **default** desktop 460 km box". Both halves were written before
+/// `f22aa220` circumscribed the box on the data ring and `280a432b` respent the
+/// cell budget, and measured against the volume those two produce, the second
+/// half is **true for one product of six**:
+///
+/// | product | ground reach | box | km/cell at 512 | coarse level |
+/// |---|---|---|---|---|
+/// | reflectivity | 460.109 km | 920.22 km | 1.7973 | **omitted**, by 2.7% |
+/// | velocity, spectrum width, ZDR, ΦDP, ρHV | 300.114 km | 600.23 km | 1.1723 | **built** |
+///
+/// So a lit desktop volume pays for the level at every whole-volume box but
+/// reflectivity's, not only at a region box — and reflectivity's own omission
+/// rests on clearing `CLOUD_SMOOTHING_RAW_CELL_KM` by 2.7%, which is thin
+/// enough that a box or shape change either way moves it.
+/// `volume::bridge::tests::the_coarse_level_is_built_only_where_something_will_
+/// sample_it` carries both rows, derived from those two rules rather than from
+/// frozen literals.
+///
+/// **This is not a regression, and the arithmetic says so.** The pre-`f22aa220`
+/// 424 km Doppler box over 256 cells was 1.657 km/cell and built the level too;
+/// what changed is the box and the shape together, and they left this decision
+/// where it was. What *is* new is the headroom. When the level is built it costs
+/// +4 MiB a grid and a CPU pass over the whole index plane measured at **5.9 ms
+/// on the frame thread**, so a 13-frame velocity loop is 13 × 36 + 36 = 504 MiB
+/// of the 512 MiB budget — **98.4%**, 8 MiB spare. Changing the policy is a
+/// separate decision from recording it; this records it.
+///
+/// Where the level is omitted it was 4 MiB of a 36 MiB upload, a second
+/// `write_texture`, and a CPU pass over the whole index plane, to fill a level
+/// nothing sampled. A desktop 3D loop's 13 reflectivity frames held 52 MiB of
+/// it, and 56 MiB at the peak `DESKTOP_MAX_LOOP_VOLUME_FRAMES` is sized for:
+/// those grids beside the one live volume the budget also has to admit.
 ///
 /// Both facts the decision needs are fixed for a grid's whole life — the
 /// adapter's shading rung is chosen once when the renderer is built, and the
