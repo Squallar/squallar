@@ -20,7 +20,9 @@
 //! own.
 
 use super::*;
-use rustdar_overlays::fetch_policy::FetchError;
+use rustdar_overlays::fetch_policy::{
+    BROKEN_RETRY_SECS, FetchError, FetchHealth, REFUSALS_BEFORE_BROKEN,
+};
 use rustdar_overlays::render::overlay_state::OverlayFetchResult;
 use std::time::Duration;
 
@@ -194,33 +196,133 @@ fn a_user_fetch_is_answered_immediately_however_deep_the_backoff() {
     );
 }
 
-/// A permanent failure is said in the state rather than retried forever at a
-/// slow cadence — and a user can still revive it.
-#[test]
-fn a_permanent_failure_stops_the_automatic_poll_entirely() {
-    let mut gui = gui_with_only_discussions();
-    let mut actions = Vec::new();
-    gui.check_auto_polls(&mut actions);
+/// Feed one refusal through the real ingest path.
+fn refuse(gui: &mut Gui) {
     gui.overlays.set_fetching(KIND, true);
     gui.overlays.apply_fetch_result(OverlayFetchResult {
         kind: KIND,
         data: OverlayRegistry::spc_discussions_failure_payload(FetchError::permanent(
-            "SPC returned HTTP 403 for MD RSS feed",
+            "SPC returned HTTP 400 for MD RSS feed",
         )),
     });
+}
 
-    assert_eq!(
-        gui.overlay_poll_delay(KIND),
-        None,
-        "a layer that cannot succeed is still being scheduled for",
+/// **One 4xx must not take a layer off the poll.** The frame-level half of
+/// `fetch_policy`'s `one_refusal_does_not_condemn_a_layer`.
+///
+/// This is the bug in its original shape: a single 403 wrote `Broken`,
+/// `auto_fetch_delay` returned `None`, and the layer never fetched again for
+/// the life of the session — while going on drawing whatever it last held.
+#[test]
+fn one_refusal_leaves_the_layer_on_the_ordinary_ladder() {
+    let mut gui = gui_with_only_discussions();
+    let mut actions = Vec::new();
+    gui.check_auto_polls(&mut actions);
+    refuse(&mut gui);
+
+    let delay = gui
+        .overlay_poll_delay(KIND)
+        .expect("one refusal must not end the schedule");
+    assert!(
+        delay <= Duration::from_secs(2),
+        "a first refusal must sit on the first rung, not a long one: {delay:?}",
     );
-    // Far past any ceiling: a slow retry would have fired many times over.
-    gui.overlays.rewind_retry(KIND, Duration::from_secs(86_400));
+    assert_eq!(drive(&mut gui, 200), 0, "premise: the rung has not elapsed");
+    gui.overlays.rewind_retry(KIND, Duration::from_secs(2));
+    assert_eq!(
+        drive(&mut gui, 200),
+        1,
+        "the layer stopped polling after a single 4xx",
+    );
+}
+
+/// A *run* of refusals is believed: the layer drops to the broken heartbeat
+/// rather than the ceiling. Costly to be wrong about, so it takes evidence.
+#[test]
+fn a_run_of_refusals_drops_the_layer_to_a_heartbeat() {
+    let mut gui = gui_with_only_discussions();
+    let mut actions = Vec::new();
+    gui.check_auto_polls(&mut actions);
+    for _ in 0..REFUSALS_BEFORE_BROKEN {
+        refuse(&mut gui);
+        gui.overlays.rewind_retry(KIND, Duration::from_secs(64));
+    }
+
+    let interval = Duration::from_secs(gui.overlays.auto_poll_interval(KIND).unwrap());
+    let delay = gui
+        .overlay_poll_delay(KIND)
+        .expect("broken is a slower poll, never a stopped one");
+    assert!(
+        delay > interval,
+        "a refused layer must cost less than a healthy one, not the same: {delay:?}",
+    );
     assert_eq!(
         drive(&mut gui, 500),
         0,
-        "a permanent failure is being retried anyway, just more slowly",
+        "the heartbeat fired immediately — that is the ceiling, not a heartbeat",
     );
+}
+
+/// **The absorbing-state test.** A broken layer must come back on its own.
+///
+/// `auto_fetch_delay` returning `None` for a broken layer made the state
+/// unreachable-from: no automatic fetch could run, so no success could ever be
+/// recorded, so nothing could ever clear the verdict. A layer condemned by a
+/// transient WAF rule stayed condemned until the process exited. Here the
+/// heartbeat comes due, the fetch goes out, and it succeeds.
+#[test]
+fn a_broken_layer_recovers_on_its_own_once_the_heartbeat_comes_due() {
+    let mut gui = gui_with_only_discussions();
+    let mut actions = Vec::new();
+    gui.check_auto_polls(&mut actions);
+    for _ in 0..REFUSALS_BEFORE_BROKEN {
+        refuse(&mut gui);
+        gui.overlays.rewind_retry(KIND, Duration::from_secs(64));
+    }
+    assert!(
+        gui.overlays
+            .fetch_health(KIND)
+            .is_some_and(FetchHealth::is_unhealthy),
+        "premise: the layer is broken",
+    );
+
+    gui.overlays
+        .rewind_retry(KIND, Duration::from_secs(BROKEN_RETRY_SECS));
+    let mut actions = Vec::new();
+    gui.check_auto_polls(&mut actions);
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, GuiAction::FetchOverlay { kind, .. } if *kind == KIND)),
+        "the heartbeat never came due; a broken layer is still a dead end",
+    );
+
+    // And the fetch it produced can clear the verdict, which is the property
+    // the old `None` made unreachable.
+    gui.overlays.set_fetching(KIND, true);
+    gui.overlays.apply_fetch_result(OverlayFetchResult {
+        kind: KIND,
+        data: OverlayRegistry::spc_discussions_payload(Vec::new()),
+    });
+    assert_eq!(
+        gui.overlays.fetch_health(KIND),
+        Some(&FetchHealth::Ok),
+        "a success on the heartbeat did not clear the verdict",
+    );
+}
+
+/// A user can still revive a broken layer at once, without waiting out the
+/// heartbeat.
+#[test]
+fn refresh_revives_a_broken_layer_immediately() {
+    let mut gui = gui_with_only_discussions();
+    let mut actions = Vec::new();
+    gui.check_auto_polls(&mut actions);
+    for _ in 0..REFUSALS_BEFORE_BROKEN {
+        refuse(&mut gui);
+        gui.overlays.rewind_retry(KIND, Duration::from_secs(64));
+    }
+    assert_eq!(drive(&mut gui, 500), 0, "premise: nothing automatic is due");
 
     let mut actions = Vec::new();
     push_user_overlay_fetch(&mut gui.overlays, &mut actions, KIND, 0);
@@ -229,6 +331,105 @@ fn a_permanent_failure_stops_the_automatic_poll_entirely() {
         Some(Duration::ZERO),
         "Refresh must revive a layer that was given up on",
     );
+}
+
+/// **The recovery that did not recover.** Switching a stale layer off and on
+/// again must re-ask the origin.
+///
+/// The guard on the enable-fetch rule was `!has_data(kind)`, and `has_data` is
+/// `!data.is_empty()` — so a layer that had worked, then took a 4xx, was
+/// *holding* data and did not re-ask. Toggling it off and on did nothing at
+/// all, in exactly the dangerous case: an alerts layer painting a warning set
+/// that stopped updating an hour ago looks identical to one that is current,
+/// and "off and on again" is the first thing a user tries.
+///
+/// The original guard still holds where it should: the last block toggles a
+/// *healthy* layer and asserts no request is spent.
+#[test]
+fn toggling_a_stale_layer_off_and_on_re_asks_the_origin() {
+    let mut gui = gui_with_only_discussions();
+
+    // A layer with data on screen — the case the old guard skipped.
+    gui.overlays.apply_fetch_result(OverlayFetchResult {
+        kind: KIND,
+        data: OverlayRegistry::spc_discussions_payload(vec![a_discussion()]),
+    });
+    assert!(gui.overlays.has_data(KIND), "premise: something is drawn");
+
+    for _ in 0..REFUSALS_BEFORE_BROKEN {
+        refuse(&mut gui);
+        gui.overlays.rewind_retry(KIND, Duration::from_secs(64));
+    }
+    assert!(
+        gui.overlays.has_data(KIND),
+        "premise: the stale data is still on screen, which is the whole danger",
+    );
+
+    let mut actions = Vec::new();
+    let mut pane = std::mem::take(gui.pane_mut(0).expect("a fresh Gui has one pane"));
+    gui.set_pane_overlay_with_fetch(&mut pane, 0, KIND, false, &mut actions);
+    gui.set_pane_overlay_with_fetch(&mut pane, 0, KIND, true, &mut actions);
+    *gui.pane_mut(0).expect("one pane") = pane;
+
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, GuiAction::FetchOverlay { kind, .. } if *kind == KIND)),
+        "toggling a stale layer off and on queued nothing — the frozen warning \
+         set stays frozen and the user has no other lever",
+    );
+    assert_eq!(
+        gui.overlays.fetch_health(KIND),
+        Some(&FetchHealth::Ok),
+        "the toggle queued a fetch but left the ledger condemned, so the very \
+         next automatic poll would still be on the heartbeat",
+    );
+
+    // The guard's own job, unchanged: a healthy layer with fresh data does not
+    // spend a request on being switched on. This is what keeps a preset that
+    // enables eight layers on four panes from being thirty-two requests.
+    gui.overlays.apply_fetch_result(OverlayFetchResult {
+        kind: KIND,
+        data: OverlayRegistry::spc_discussions_payload(vec![a_discussion()]),
+    });
+    let mut actions = Vec::new();
+    let mut pane = std::mem::take(gui.pane_mut(0).expect("one pane"));
+    gui.set_pane_overlay_with_fetch(&mut pane, 0, KIND, false, &mut actions);
+    gui.set_pane_overlay_with_fetch(&mut pane, 0, KIND, true, &mut actions);
+    *gui.pane_mut(0).expect("one pane") = pane;
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, GuiAction::FetchOverlay { kind, .. } if *kind == KIND)),
+        "a healthy layer spent a request on being toggled off and on",
+    );
+}
+
+/// One MD with a polygon, so `has_data()` is true and something is drawn.
+fn a_discussion() -> rustdar_overlays::spc::discussion::SpcDiscussion {
+    use rustdar_overlays::spc::colors::{md_fill_color, md_stroke_color};
+    use rustdar_overlays::spc::discussion::{MdType, SpcDiscussion};
+    use rustdar_overlays::types::{HatchPattern, OverlayFeature};
+
+    let md_type = MdType::Convective;
+    let polygon = vec![vec![(35.0, -97.0), (36.0, -97.0), (36.0, -96.0)]];
+    SpcDiscussion {
+        number: 1234,
+        title: "Mesoscale Discussion #1234".into(),
+        text: String::new(),
+        link: String::new(),
+        md_type,
+        polygon: polygon.clone(),
+        feature: OverlayFeature::new(
+            vec![polygon],
+            md_fill_color(&md_type),
+            md_stroke_color(&md_type),
+            "MD 1234".into(),
+            String::new(),
+            HatchPattern::None,
+        ),
+        concerning: None,
+    }
 }
 
 /// "Not published right now" is an answer, not a fault: it puts the layer back

@@ -506,7 +506,9 @@ impl OverlayHandler for NwsAlertHandler {
                         self.enabled_categories.remove(&category);
                     }
                     self.state.data_generation = self.state.data_generation.wrapping_add(1);
-                    if !was_enabled && self.is_enabled() && !self.has_data() && !self.state.fetching
+                    if !was_enabled
+                        && self.is_enabled()
+                        && self.state.enable_should_refetch(self.has_data())
                     {
                         return ControlEffect::Fetch;
                     }

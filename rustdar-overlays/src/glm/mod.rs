@@ -211,4 +211,10 @@ pub struct GlmFetchOutcome {
 }
 
 /// Type-erased fetch result for GLM lightning data.
-pub struct GlmFetchResult(pub Result<GlmFetchOutcome, String>);
+///
+/// The error is a [`FetchError`](crate::fetch_policy::FetchError) rather than a
+/// `String` so the round's verdict survives the trip to the handler. It used to
+/// be a `String`, and the handler had nothing left to classify it by, so it
+/// recorded every GLM failure as `Transient` — which at a 20 s interval is 180
+/// attempts an hour against a bucket that may have been renamed a year ago.
+pub struct GlmFetchResult(pub Result<GlmFetchOutcome, crate::fetch_policy::FetchError>);

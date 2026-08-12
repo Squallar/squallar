@@ -187,7 +187,9 @@ fn failed_fetch_leaves_feed_verdict_untouched() {
     handler.enabled = true;
     handler.report_feed_changes(&BOTH, vec![dead_east()]);
 
-    handler.apply_fetch_result(Box::new(GlmFetchResult(Err("network down".into()))));
+    handler.apply_fetch_result(Box::new(GlmFetchResult(Err(
+        crate::fetch_policy::FetchError::transient("network down"),
+    ))));
 
     assert_eq!(handler.dead_feeds, vec![dead_east()]);
 }

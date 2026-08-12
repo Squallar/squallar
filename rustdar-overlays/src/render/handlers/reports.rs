@@ -221,6 +221,16 @@ impl OverlayHandler for StormReportsHandler {
             }
             Err(e) => {
                 log::error!("Storm reports fetch failed: {e}");
+                // **Undocumented behaviour, named rather than changed.**
+                // `spc::reports::fetch` errors only when all three CSVs failed,
+                // and this branch does not clear `state.data` — so a total
+                // outage leaves the previous poll's reports on the map instead
+                // of emptying it. Probably the better answer for a product that
+                // only accumulates through the day, but it does mean the map
+                // can be showing an hour-old report set that looks current.
+                // What makes that safe is the health note
+                // `OverlayRegistry::controls` now prepends for every layer;
+                // before it, this layer said nothing at all.
                 self.state.record_failure(&e);
             }
         }
@@ -333,7 +343,7 @@ impl OverlayHandler for StormReportsHandler {
             "enabled" => {
                 if let ControlValue::Bool(val) = update.value {
                     self.enabled = val;
-                    if val && !self.has_data() && !self.state.fetching {
+                    if val && self.state.enable_should_refetch(self.has_data()) {
                         return ControlEffect::Fetch;
                     }
                 }

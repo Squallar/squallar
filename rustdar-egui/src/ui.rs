@@ -11,6 +11,7 @@ use crate::tiles::MapTileState;
 use crate::ui_layout::{LayoutCtx, ModalityLatch};
 use chrono::{NaiveDateTime, Timelike};
 use egui::Context;
+use rustdar_overlays::fetch_policy::FetchHealth;
 use rustdar_overlays::render::overlay_state::{OverlayKind, OverlayRegistry};
 use rustdar_radar::types::{RadarProduct, ScanInfo};
 use rustdar_units::UserPreferences;
@@ -3038,13 +3039,28 @@ impl Gui {
     /// for its three callers — the stack's eye, the inspector's Show toggle
     /// and the catalog's tiles.
     ///
-    /// The rule: a layer turned on with nothing to draw yet fetches now
-    /// rather than waiting out an auto-poll interval — the same effect its
-    /// own sub-toggles ask for, and the only route for a layer (SPC
-    /// outlooks) that never auto-polls. `pane` is the caller's — taken or
-    /// not — and `pane_idx` is the index the fetch is attributed to, because
-    /// two of the callers hold the pane out of the vector where `active_pane`
-    /// cannot be assumed to be it (the preset applier walks every pane).
+    /// The rule: a layer turned on with **nothing to draw, or nothing worth
+    /// trusting**, fetches now rather than waiting out an auto-poll interval —
+    /// the same effect its own sub-toggles ask for, and the only route for a
+    /// layer (SPC outlooks) that never auto-polls. `pane` is the caller's —
+    /// taken or not — and `pane_idx` is the index the fetch is attributed to,
+    /// because two of the callers hold the pane out of the vector where
+    /// `active_pane` cannot be assumed to be it (the preset applier walks every
+    /// pane).
+    ///
+    /// The health half of that condition is the fix for the recovery that did
+    /// not recover. The guard was `!has_data(kind)` alone, and `has_data` is
+    /// `!data.is_empty()` — so a layer that had worked, then started failing,
+    /// was *holding* data and therefore did not re-ask. Toggling it off and on
+    /// did nothing at all, which is the one case where the user is most likely
+    /// to try it: an alerts layer painting a warning set that stopped updating
+    /// an hour ago looks exactly like one that is current. "Off and on again"
+    /// has to mean something, and now it means "re-ask".
+    ///
+    /// What the original guard was for still holds: a layer with fresh, healthy
+    /// data does not spend a request on being switched on. That is what keeps a
+    /// preset that enables eight layers on four panes from becoming thirty-two
+    /// requests, and it is why this is not simply the guard deleted.
     ///
     /// One fetch per kind per frame: a second enable of the same kind in the
     /// same batch (a preset enabling it on every pane) finds the first's
@@ -3059,7 +3075,11 @@ impl Gui {
         actions: &mut Vec<GuiAction>,
     ) {
         Self::write_pane_overlay(&mut self.overlays, pane, kind, on);
-        if on && !self.overlays.has_data(kind) && !self.overlays.is_fetching(kind) {
+        let stale = self
+            .overlays
+            .fetch_health(kind)
+            .is_some_and(FetchHealth::is_unhealthy);
+        if on && (!self.overlays.has_data(kind) || stale) && !self.overlays.is_fetching(kind) {
             // Switching a layer on is a user action, so it clears whatever the
             // ladder had accumulated — see `push_user_overlay_fetch`.
             push_user_overlay_fetch(&mut self.overlays, actions, kind, pane_idx);

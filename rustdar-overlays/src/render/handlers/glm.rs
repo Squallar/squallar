@@ -503,12 +503,15 @@ impl OverlayHandler for GlmHandler {
                 // A failed fetch says nothing about feed liveness, so leave the
                 // previous verdict standing rather than reporting a recovery.
                 log::error!("GLM fetch failed: {e}");
-                // Many S3 requests behind one result; `FailureKind` above
-                // already splits parse from transport per granule. The outer
-                // error means the round as a whole did not complete, which is
-                // transient by construction.
-                self.state
-                    .record_failure(&crate::fetch_policy::FetchError::transient(e));
+                // The verdict travels with the error now. It used to be
+                // hardcoded `transient` here, reasoned as "the outer error
+                // means the round did not complete, which is transient by
+                // construction" — and that was wrong in the direction that
+                // costs something. At a 20 s interval, a GLM bucket renamed a
+                // year ago is 180 requests an hour for ever, and no rung of the
+                // ladder can slow a `Transient` past the ceiling. The S3
+                // listing classifies its own statuses; see `glm::fetch`.
+                self.state.record_failure(&e);
             }
         }
     }
@@ -759,7 +762,7 @@ impl OverlayHandler for GlmHandler {
             "enabled" => {
                 if let ControlValue::Bool(val) = update.value {
                     self.enabled = val;
-                    if val && !self.has_data() && !self.state.fetching {
+                    if val && self.state.enable_should_refetch(self.has_data()) {
                         return ControlEffect::Fetch;
                     }
                 }

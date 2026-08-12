@@ -617,11 +617,17 @@ impl super::App {
             // here is a reason repetition cannot fix: a client that would not
             // build (`MetarHandler::create_fetch_tasks`), or no product
             // selected to fetch (`SpcOutlookHandler`). Recording it as
-            // `FetchFailure::Permanent` takes the layer off the automatic poll
-            // entirely, and the user actions that could change the answer —
-            // Refresh, enabling the layer, picking a product — all clear the
-            // ledger through `push_user_overlay_fetch`.
-            log::warn!("{kind:?}: no fetch task could be built; not retrying until asked");
+            // `FetchFailure::Permanent` says that, and the user actions that
+            // could change the answer — Refresh, enabling the layer, picking a
+            // product — all clear the ledger through `push_user_overlay_fetch`.
+            //
+            // "Permanent" is a claim about this attempt, not a sentence: it
+            // takes `REFUSALS_BEFORE_BROKEN` in a row before the layer drops off
+            // the ordinary ladder, and even then it keeps a `BROKEN_RETRY_SECS`
+            // heartbeat. Which is right here too — a client that would not build
+            // once may build on the next frame, and the second attempt costs one
+            // request that never leaves the process.
+            log::warn!("{kind:?}: no fetch task could be built; backing off");
             self.gui.overlays.record_fetch_failure(
                 kind,
                 &rustdar_overlays::fetch_policy::FetchError::permanent(

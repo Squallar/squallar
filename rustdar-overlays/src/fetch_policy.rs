@@ -41,9 +41,33 @@
 //!
 //! See [`FetchFailure`]. The short version: a 404 for a product that is simply
 //! not published right now is a *normal answer* and is not a failure at all; a
-//! network error is worth waiting out; and a request the origin refused outright
-//! will not start working because we asked again, so it is recorded as broken
-//! rather than retried forever at a slow cadence.
+//! network error is worth waiting out; and a request the origin refuses over and
+//! over will not start working because we ask once more at the same cadence, so
+//! it is recorded as broken and dropped to a much slower one.
+//!
+//! # No single answer condemns a layer, and nothing is condemned for ever
+//!
+//! Two rules, both about the same failure: **a weather warning layer that goes
+//! on painting a frozen alert set with nothing on screen to say so.**
+//!
+//! One 4xx used to be terminal. [`FetchError::from_status`] returned
+//! [`Permanent`](FetchFailure::Permanent) on the first 403,
+//! [`record_failure`](FetchRetry::record_failure) wrote
+//! [`Broken`](FetchHealth::Broken), and `auto_fetch_delay` then returned `None`
+//! for the rest of the session. That state was **absorbing by construction** —
+//! no automatic fetch could run, so no success could ever clear it — and the
+//! only thing that cleared it was a user action on a layer giving no sign it
+//! needed one. One CDN hiccup on `api.weather.gov` was enough to freeze NWS
+//! alerts at whatever they last said, with the options panel counting up
+//! "Updated 47m ago" underneath.
+//!
+//! So a refusal must repeat [`REFUSALS_BEFORE_BROKEN`] times **in a row** before
+//! it is believed, and even then the layer keeps a [`BROKEN_RETRY_SECS`]
+//! heartbeat rather than stopping. Being wrong in this direction costs two
+//! requests an hour against a genuinely dead endpoint — *less* than the ceiling
+//! a healthy layer already spends. Being wrong in the other direction costs a
+//! stale tornado warning on screen, indefinitely. The asymmetry is the whole
+//! argument.
 //!
 //! # A user action never waits out a backoff
 //!
@@ -69,6 +93,35 @@ pub const FIRST_RETRY_SECS: u64 = 2;
 /// clamps the result long before this bites: at `FIRST_RETRY_SECS` = 2 the
 /// 32nd step is already ~272 years.
 const MAX_LADDER_STEPS: u32 = 32;
+
+/// How many **consecutive** refusals it takes before a layer is called
+/// [`Broken`](FetchHealth::Broken).
+///
+/// Two, because one is not evidence of anything. A refusal is the origin
+/// saying it understood us and said no, but the origins here are public
+/// unauthenticated services behind CDNs, and a single 4xx from one of those is
+/// far more often a WAF rule, a rate limiter or a bad edge node than a real
+/// change in what is published. Asking a second time separates the two at a
+/// cost of exactly one extra request.
+///
+/// Counted separately from [`FetchRetry::failures`]: a transient failure in
+/// among the refusals resets it, because "the origin refuses us" is a claim
+/// about a *run* of refusals and a timeout in the middle of that run means we
+/// do not have one.
+pub const REFUSALS_BEFORE_BROKEN: u32 = 2;
+
+/// What a [`Broken`](FetchHealth::Broken) layer waits before trying once more.
+///
+/// Not `None`. A broken layer used to be off the automatic poll entirely, which
+/// made the state absorbing — the only thing that could clear it was a success,
+/// and no fetch that could produce one would ever run. Half an hour is long
+/// enough that a truly dead endpoint costs two requests an hour, and short
+/// enough that a layer condemned by a transient WAF rule comes back on its own
+/// while the storm it was drawing is still on the ground.
+///
+/// Floored at the layer's own interval by [`FetchRetry::backoff`], so this can
+/// never make a broken layer poll *faster* than a healthy one.
+pub const BROKEN_RETRY_SECS: u64 = 1800;
 
 /// What a failed fetch tells us about whether trying again could work.
 ///
@@ -96,14 +149,46 @@ pub enum FetchFailure {
     /// code can prove — and at the ceiling a retried parse failure costs
     /// exactly what a healthy poll costs.
     Transient,
-    /// Repetition cannot help: the origin understood the request and refused it
-    /// (a 4xx that is not 404/408/429), or the request could not be built at
-    /// all — a client that will not construct, or a handler that cannot produce
-    /// a fetch task. The same code will do the same thing next time.
+    /// Repetition is unlikely to help: the origin understood the request and
+    /// refused it (a 4xx that is not 404/408/429 and not 401/403), or the
+    /// request could not be built at all — a client that will not construct, or
+    /// a handler that cannot produce a fetch task.
     ///
-    /// Recorded in the state and **not retried automatically**. Only a user
-    /// action revives it, because a user may know something we do not.
+    /// **One of these is a suspicion, not a verdict.** It takes
+    /// [`REFUSALS_BEFORE_BROKEN`] in a row for
+    /// [`record_failure`](FetchRetry::record_failure) to write
+    /// [`Broken`](FetchHealth::Broken); until then the layer climbs the ordinary
+    /// ladder like any other failure. And [`Broken`](FetchHealth::Broken) is
+    /// still not "never again" — see [`BROKEN_RETRY_SECS`].
     Permanent,
+}
+
+impl FetchFailure {
+    /// The verdict for a round made of several requests — GLM's two satellites,
+    /// METAR's per-state networks, HRRR's two candidate model runs.
+    ///
+    /// A round is refused only when **every** part of it was refused, and absent
+    /// only when every part was absent. Anything mixed is transient: one part
+    /// that could still work next time makes the round worth trying again, and
+    /// condemning a layer on the strength of its weakest component is how a
+    /// single dead state network takes every METAR in the country off the map.
+    ///
+    /// An empty round is `Transient` — no evidence is not evidence of refusal.
+    pub fn of_round(parts: impl IntoIterator<Item = Self>) -> Self {
+        let mut all_permanent = true;
+        let mut all_absent = true;
+        let mut any = false;
+        for part in parts {
+            any = true;
+            all_permanent &= part == Self::Permanent;
+            all_absent &= part == Self::Absent;
+        }
+        match (any, all_permanent, all_absent) {
+            (true, true, _) => Self::Permanent,
+            (true, _, true) => Self::Absent,
+            _ => Self::Transient,
+        }
+    }
 }
 
 /// What a 404 means *for a particular endpoint*, which is not a global fact.
@@ -161,8 +246,24 @@ impl FetchError {
     /// The verdict for a status the origin actually returned.
     ///
     /// 408 (timeout) and 429 (rate limited) are 4xx that explicitly invite a
-    /// later retry, so they are transient despite the class. Every other 4xx is
-    /// the origin saying it understood and refused.
+    /// later retry, so they are transient despite the class.
+    ///
+    /// **401 and 403 join them**, which is not what the class means and is
+    /// deliberate. Every origin this app talks to — `api.weather.gov`, SPC,
+    /// IEM, the public NOAA S3 buckets — is public and unauthenticated, so
+    /// there is no credential for a 401 to be about and no permission for a 403
+    /// to be withholding. What actually produces them is the layer in front:
+    /// a WAF rule that dislikes a header, an over-eager rate limiter answering
+    /// 403 instead of 429, an edge node with a stale config. All three clear on
+    /// their own, and all three used to take an alerts layer off the poll for
+    /// the rest of the session on a single sample. Retrying them costs the
+    /// ceiling — one request per poll interval, what a healthy layer costs.
+    ///
+    /// What is left as a refusal is the 4xx that is a property of the *request*
+    /// rather than of the moment: 400 (we built it wrong), 451 (it is blocked
+    /// where the user is), 405/414/422 and the like. Asking again cannot change
+    /// any of those, because nothing about the next request differs. Even so it
+    /// takes [`REFUSALS_BEFORE_BROKEN`] of them in a row to be believed.
     pub fn from_status(
         status: reqwest::StatusCode,
         not_found: NotFound,
@@ -176,6 +277,8 @@ impl FetchError {
         }
         let failure = if status == reqwest::StatusCode::REQUEST_TIMEOUT
             || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status == reqwest::StatusCode::UNAUTHORIZED
+            || status == reqwest::StatusCode::FORBIDDEN
             || status.is_server_error()
         {
             FetchFailure::Transient
@@ -230,8 +333,23 @@ pub enum FetchHealth {
     Absent,
     /// Failing, but a retry could still work.
     Failing { message: String, attempts: u32 },
-    /// Will not succeed by repetition; waiting changes nothing.
+    /// The origin has refused us [`REFUSALS_BEFORE_BROKEN`] times running, so
+    /// the ordinary ladder is not worth spending. Dropped to a
+    /// [`BROKEN_RETRY_SECS`] heartbeat rather than stopped — see
+    /// [`FetchRetry::backoff`].
     Broken { message: String },
+}
+
+impl FetchHealth {
+    /// Whether what this layer is holding is older than it looks: the last
+    /// fetch did not land and nothing has succeeded since.
+    ///
+    /// [`Absent`](FetchHealth::Absent) is **not** unhealthy — the origin
+    /// answered, and "not published right now" is an answer. That distinction
+    /// is why this is a method here rather than a `!= Ok` at each call site.
+    pub fn is_unhealthy(&self) -> bool {
+        matches!(self, Self::Failing { .. } | Self::Broken { .. })
+    }
 }
 
 /// The per-layer record of what the last fetch did and what the next automatic
@@ -247,6 +365,10 @@ pub enum FetchHealth {
 pub struct FetchRetry {
     /// Consecutive failures since the last good answer.
     failures: u32,
+    /// Consecutive *refusals* since the last good answer or last non-refusal —
+    /// the counter [`REFUSALS_BEFORE_BROKEN`] is measured against. Separate
+    /// from `failures` on purpose; see that constant.
+    refusals: u32,
     /// When the most recent failure landed.
     last_failure: Option<web_time::Instant>,
     health: FetchHealth,
@@ -269,38 +391,59 @@ impl FetchRetry {
         self.failures
     }
 
-    /// Nothing automatic will run again until a user asks.
+    /// The origin has refused us [`REFUSALS_BEFORE_BROKEN`] times running.
+    /// The automatic poll drops to [`BROKEN_RETRY_SECS`]; it does not stop.
     pub fn is_broken(&self) -> bool {
         matches!(self.health, FetchHealth::Broken { .. })
+    }
+
+    /// Whether what the layer is holding is older than it looks — see
+    /// [`FetchHealth::is_unhealthy`]. What the enable-fetch rule reads to
+    /// decide that switching a layer back on should re-ask rather than trust
+    /// what is already drawn.
+    pub fn is_unhealthy(&self) -> bool {
+        self.health.is_unhealthy()
     }
 
     /// A good answer: the ladder resets and the layer returns to its interval.
     pub fn record_success(&mut self) {
         self.failures = 0;
+        self.refusals = 0;
         self.last_failure = None;
         self.health = FetchHealth::Ok;
     }
 
     /// Wipe the ledger for a fetch the **user** asked for, so no user action is
-    /// ever made to wait out a backoff — including one that had been given up
-    /// on as [`FetchFailure::Permanent`]. A user pressing Refresh may know
-    /// something we do not (they fixed their network; the product came back),
-    /// and one request per press is bounded by the human pressing it.
+    /// ever made to wait out a backoff — including a layer already recorded as
+    /// [`Broken`](FetchHealth::Broken). A user pressing Refresh, or switching a
+    /// stale layer off and on, may know something we do not (they fixed their
+    /// network; the product came back), and one request per press is bounded by
+    /// the human pressing it.
     pub fn clear(&mut self) {
         self.record_success();
     }
 
     /// File a failure against the ladder. `Absent` resets it instead: the
     /// origin answered, and "not published right now" is an answer.
+    ///
+    /// A [`Permanent`](FetchFailure::Permanent) verdict climbs the same ladder
+    /// as a transient one until it has repeated [`REFUSALS_BEFORE_BROKEN`]
+    /// times in a row. One refusal reads as `Failing`, which is exactly what it
+    /// is: something is wrong, we do not yet know that repetition cannot fix
+    /// it, and we are still asking.
     pub fn record_failure(&mut self, error: &FetchError) {
         match error.failure {
             FetchFailure::Absent => {
                 self.failures = 0;
+                self.refusals = 0;
                 self.last_failure = None;
                 self.health = FetchHealth::Absent;
             }
             FetchFailure::Transient => {
                 self.failures = self.failures.saturating_add(1);
+                // A timeout in the middle of a run of refusals means we do not
+                // have a run of refusals.
+                self.refusals = 0;
                 self.last_failure = Some(web_time::Instant::now());
                 self.health = FetchHealth::Failing {
                     message: error.message.clone(),
@@ -309,9 +452,17 @@ impl FetchRetry {
             }
             FetchFailure::Permanent => {
                 self.failures = self.failures.saturating_add(1);
+                self.refusals = self.refusals.saturating_add(1);
                 self.last_failure = Some(web_time::Instant::now());
-                self.health = FetchHealth::Broken {
-                    message: error.message.clone(),
+                self.health = if self.refusals >= REFUSALS_BEFORE_BROKEN {
+                    FetchHealth::Broken {
+                        message: error.message.clone(),
+                    }
+                } else {
+                    FetchHealth::Failing {
+                        message: error.message.clone(),
+                        attempts: self.failures,
+                    }
                 };
             }
         }
@@ -322,7 +473,18 @@ impl FetchRetry {
     ///
     /// `Duration::ZERO` with no failures on record, so a healthy layer is
     /// governed purely by its poll clock.
+    ///
+    /// A [`broken`](FetchRetry::is_broken) layer leaves the ladder for a single
+    /// long rung, [`BROKEN_RETRY_SECS`], floored at `interval` so it can never
+    /// poll faster than a healthy layer would. That is one expression of the
+    /// whole schedule: `auto_fetch_delay` used to special-case broken with a
+    /// `None` of its own, and a `None` there is a state nothing can leave,
+    /// because the only thing that clears it is a success and no fetch that
+    /// could produce one ever runs.
     pub fn backoff(&self, interval: Duration) -> Duration {
+        if self.is_broken() {
+            return Duration::from_secs(BROKEN_RETRY_SECS).max(interval);
+        }
         if self.failures == 0 {
             return Duration::ZERO;
         }
@@ -358,16 +520,24 @@ impl FetchRetry {
     /// One line for the layer's options panel, or `None` while all is well.
     ///
     /// Phrased so the three cases cannot be confused for each other by someone
-    /// glancing at a blank map.
+    /// glancing at a blank map — and, for the two failing ones, so that the
+    /// "Updated 47m ago" line beneath cannot be read as the whole story. That
+    /// pairing is the point: a stale alert set and a fresh one look identical
+    /// on the map, and this is the only thing that tells them apart.
+    ///
+    /// Rendered for **every** layer by `OverlayRegistry::controls`, not by each
+    /// handler; four of six used to forget, and the four that forgot included
+    /// NWS alerts.
     pub fn status_note(&self) -> Option<String> {
         match &self.health {
             FetchHealth::Ok => None,
             FetchHealth::Absent => Some("Not published right now".to_string()),
             FetchHealth::Failing { message, attempts } => Some(format!(
-                "Cannot reach the source - retrying ({attempts} failed): {message}"
+                "Not loading - what is shown may be stale. Retrying ({attempts} failed): {message}"
             )),
             FetchHealth::Broken { message } => Some(format!(
-                "Will not load; use Refresh to try again: {message}"
+                "Not loading - what is shown may be stale. Retrying rarely now; \
+                 use Refresh to try again at once: {message}"
             )),
         }
     }
@@ -459,17 +629,112 @@ mod tests {
         );
     }
 
-    /// The bar's own words: a permanent failure is said in the state rather
-    /// than retried forever at a slow cadence.
+    /// **The stale-warning test.** One refusal is a suspicion, not a verdict:
+    /// the layer stays on the ordinary ladder and keeps asking.
+    ///
+    /// The bug: a single 403 wrote `Broken`, `auto_fetch_delay` then returned
+    /// `None` for the session, and the alerts layer went on painting whatever
+    /// warnings it last held. Set `REFUSALS_BEFORE_BROKEN` to 1 and this fails.
     #[test]
-    fn a_permanent_failure_stops_rather_than_slowing_down() {
+    fn one_refusal_does_not_condemn_a_layer() {
         let mut retry = FetchRetry::new();
         retry.record_failure(&FetchError::permanent("HTTP 403"));
-        assert!(retry.is_broken());
         assert!(
-            retry.status_note().is_some_and(|n| n.contains("Refresh")),
-            "a broken layer must tell the user what would revive it",
+            !retry.is_broken(),
+            "one 4xx took the layer off the poll — a CDN hiccup must not freeze \
+             a warning layer for the session",
         );
+        assert_eq!(
+            retry.backoff(INTERVAL),
+            Duration::from_secs(FIRST_RETRY_SECS),
+            "a first refusal must climb the ordinary ladder like any failure",
+        );
+        assert!(
+            retry.status_note().is_some_and(|n| n.contains("stale")),
+            "a layer that is failing must say what that means for what is drawn",
+        );
+    }
+
+    /// Refusals have to be *consecutive*: a transient in among them means we do
+    /// not have a run, and the count starts over.
+    #[test]
+    fn a_transient_between_refusals_resets_the_refusal_count() {
+        let mut retry = FetchRetry::new();
+        retry.record_failure(&FetchError::permanent("HTTP 400"));
+        retry.record_failure(&transient());
+        retry.record_failure(&FetchError::permanent("HTTP 400"));
+        assert!(
+            !retry.is_broken(),
+            "two refusals with a timeout between them are not two refusals in a row",
+        );
+        retry.record_failure(&FetchError::permanent("HTTP 400"));
+        assert!(retry.is_broken(), "two in a row must still be believed");
+    }
+
+    /// `REFUSALS_BEFORE_BROKEN` in a row is the evidence bar, and clearing it
+    /// says so in the state.
+    #[test]
+    fn a_run_of_refusals_is_believed_and_said_out_loud() {
+        let mut retry = FetchRetry::new();
+        for i in 1..=REFUSALS_BEFORE_BROKEN {
+            retry.record_failure(&FetchError::permanent("HTTP 400"));
+            assert_eq!(
+                retry.is_broken(),
+                i == REFUSALS_BEFORE_BROKEN,
+                "refusal {i} of {REFUSALS_BEFORE_BROKEN}",
+            );
+        }
+        let note = retry.status_note().expect("a broken layer must say so");
+        assert!(
+            note.contains("Refresh"),
+            "a broken layer must tell the user what would revive it: {note}",
+        );
+        assert!(
+            note.contains("stale"),
+            "a broken layer must say what it means for what is drawn: {note}",
+        );
+    }
+
+    /// Broken is a slower poll, never a stopped one. The old `None` was
+    /// absorbing by construction: nothing automatic ran, so nothing could
+    /// succeed, so nothing could ever clear it.
+    #[test]
+    fn a_broken_layer_still_gets_a_heartbeat() {
+        let mut retry = FetchRetry::new();
+        for _ in 0..REFUSALS_BEFORE_BROKEN {
+            retry.record_failure(&FetchError::permanent("HTTP 400"));
+        }
+        assert!(retry.is_broken());
+
+        let gap = retry.backoff(INTERVAL);
+        assert_eq!(gap, Duration::from_secs(BROKEN_RETRY_SECS));
+        assert!(
+            gap >= INTERVAL,
+            "a broken layer must never poll faster than a healthy one",
+        );
+        assert!(
+            retry.backoff_remaining(INTERVAL) > Duration::ZERO,
+            "premise: the heartbeat has not come due yet",
+        );
+
+        retry.rewind(gap);
+        assert_eq!(
+            retry.backoff_remaining(INTERVAL),
+            Duration::ZERO,
+            "the heartbeat never came due — broken is still a dead end",
+        );
+    }
+
+    /// The heartbeat is floored at the layer's own interval, so a layer that
+    /// polls *more* slowly than the heartbeat is not sped up by breaking.
+    #[test]
+    fn the_broken_heartbeat_never_outpaces_a_slow_layer() {
+        let slow = Duration::from_secs(BROKEN_RETRY_SECS * 3);
+        let mut retry = FetchRetry::new();
+        for _ in 0..REFUSALS_BEFORE_BROKEN {
+            retry.record_failure(&FetchError::permanent("HTTP 400"));
+        }
+        assert_eq!(retry.backoff(slow), slow);
     }
 
     /// A user action never waits: Refresh clears the ladder even when the layer
@@ -477,14 +742,73 @@ mod tests {
     #[test]
     fn a_user_refresh_clears_even_a_permanent_verdict() {
         let mut retry = FetchRetry::new();
-        retry.record_failure(&FetchError::permanent("HTTP 403"));
+        for _ in 0..REFUSALS_BEFORE_BROKEN {
+            retry.record_failure(&FetchError::permanent("HTTP 400"));
+        }
         assert!(retry.is_broken());
 
         retry.clear();
         assert!(!retry.is_broken());
+        assert!(!retry.is_unhealthy());
         assert_eq!(retry.failures(), 0);
         assert_eq!(retry.backoff(INTERVAL), Duration::ZERO);
         assert_eq!(retry.status_note(), None);
+    }
+
+    /// A success after a run of refusals clears the refusal count too, not just
+    /// the failure count — otherwise one more refusal months later would break
+    /// a layer that had been healthy in between.
+    #[test]
+    fn a_success_clears_the_refusal_count_as_well() {
+        let mut retry = FetchRetry::new();
+        for _ in 0..REFUSALS_BEFORE_BROKEN {
+            retry.record_failure(&FetchError::permanent("HTTP 400"));
+        }
+        retry.record_success();
+        retry.record_failure(&FetchError::permanent("HTTP 400"));
+        assert!(
+            !retry.is_broken(),
+            "a refusal after a good answer is the first of a new run, not the last of an old one",
+        );
+    }
+
+    /// Only [`FetchHealth::Failing`] and [`FetchHealth::Broken`] mean "what is
+    /// drawn may be stale". `Absent` is an answer and must not read as a fault.
+    #[test]
+    fn absent_is_not_unhealthy() {
+        let mut retry = FetchRetry::new();
+        assert!(!retry.is_unhealthy(), "a fresh ledger is not unhealthy");
+        retry.record_failure(&FetchError::absent("HTTP 404"));
+        assert!(
+            !retry.is_unhealthy(),
+            "'not published right now' is an answer, not staleness",
+        );
+        retry.record_failure(&transient());
+        assert!(retry.is_unhealthy());
+    }
+
+    /// A round of several requests is refused only when every part of it was.
+    /// One dead state network must not take every METAR in the country off the
+    /// map.
+    #[test]
+    fn a_round_is_only_refused_when_every_part_of_it_was() {
+        use FetchFailure::{Absent, Permanent, Transient};
+        let cases: [(&[FetchFailure], FetchFailure); 7] = [
+            (&[Permanent, Permanent], Permanent),
+            (&[Permanent, Transient], Transient),
+            (&[Permanent, Absent], Transient),
+            (&[Absent, Absent], Absent),
+            (&[Transient, Transient], Transient),
+            (&[Permanent], Permanent),
+            (&[], Transient),
+        ];
+        for (parts, expected) in cases {
+            assert_eq!(
+                FetchFailure::of_round(parts.iter().copied()),
+                expected,
+                "{parts:?}",
+            );
+        }
     }
 
     /// A success mid-ladder puts the layer back on its ordinary interval.
@@ -533,13 +857,34 @@ mod tests {
                 NotFound::IsBroken,
                 FetchFailure::Permanent,
             ),
+            // The two that changed sides, and the reason this table has a
+            // comment: these origins are public and unauthenticated, so a 401
+            // or a 403 from one is a WAF rule or a rate limiter wearing the
+            // wrong status, not a refusal that will still be there tomorrow.
             (
                 StatusCode::FORBIDDEN,
+                NotFound::IsBroken,
+                FetchFailure::Transient,
+            ),
+            (
+                StatusCode::UNAUTHORIZED,
+                NotFound::IsBroken,
+                FetchFailure::Transient,
+            ),
+            // A property of the request, not of the moment: the next one is
+            // identical, so it gets the identical answer.
+            (
+                StatusCode::BAD_REQUEST,
                 NotFound::IsBroken,
                 FetchFailure::Permanent,
             ),
             (
-                StatusCode::BAD_REQUEST,
+                StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+                NotFound::IsBroken,
+                FetchFailure::Permanent,
+            ),
+            (
+                StatusCode::METHOD_NOT_ALLOWED,
                 NotFound::IsBroken,
                 FetchFailure::Permanent,
             ),

@@ -97,6 +97,26 @@ impl<T> OverlayState<T> {
         }
     }
 
+    /// Whether the user switching this layer on should re-ask the origin, given
+    /// the handler's own answer to "do I have anything to draw?".
+    ///
+    /// Two reasons to ask, and the second is the one that was missing: there is
+    /// nothing drawn, **or** what is drawn is stale
+    /// ([`FetchRetry::is_unhealthy`]). The condition used to be `!has_data`
+    /// alone, and every handler spells `has_data` as "the vector is not empty" —
+    /// so a layer that fetched successfully, then started failing, was holding
+    /// data and did not re-ask. Toggling it off and on did nothing, in the one
+    /// case where a user is most likely to try it, on layers that carry
+    /// warnings. See `Gui::set_pane_overlay_with_fetch` for the same rule at the
+    /// pane seam.
+    ///
+    /// `has_data` is a parameter rather than read from `self` because only the
+    /// handler knows what having data means for its own payload — a `Vec`, an
+    /// `Option<Arc<Grid>>`, a map keyed by product.
+    pub fn enable_should_refetch(&self, has_data: bool) -> bool {
+        !self.fetching && (!has_data || self.retry.is_unhealthy())
+    }
+
     // `needs_refresh(interval)` used to live here — `fetch_time.is_none_or(|t|
     // t.elapsed() >= interval)`, documented as "how every auto-polling overlay
     // refreshes". It had no callers, and that rule is exactly the storm: a
@@ -244,20 +264,23 @@ pub trait OverlayHandler: Send {
     /// At the ladder's ceiling the two coincide by construction, because the
     /// ceiling *is* the interval.
     ///
-    /// `None` for: a layer that does not auto-poll, one whose fetch is already
-    /// in flight (what ends the wait is the result landing, which asks for its
-    /// own frame), and one recorded [`broken`](FetchRetry::is_broken) — the
-    /// last being the difference between "say so in the state" and "retry
-    /// forever at a slow cadence".
+    /// `None` for exactly two reasons: a layer that does not auto-poll, and one
+    /// whose fetch is already in flight (what ends that wait is the result
+    /// landing, which asks for its own frame).
+    ///
+    /// A [`broken`](FetchRetry::is_broken) layer used to be a third, and it was
+    /// the wrong shape. `None` there is a state nothing can leave: no automatic
+    /// fetch runs, so no success is ever recorded, so nothing ever clears the
+    /// verdict — absorbing by construction, on a first 403, for a layer that
+    /// carries tornado warnings. Broken is now just a very long rung of the
+    /// backoff ([`FetchRetry::backoff`]), so it is the same two terms as every
+    /// other state and there is one expression of the schedule rather than two.
     fn auto_fetch_delay(&self) -> Option<std::time::Duration> {
         let interval = std::time::Duration::from_secs(self.auto_poll_interval()?);
         if self.is_fetching() {
             return None;
         }
         let retry = self.retry();
-        if retry.is_some_and(FetchRetry::is_broken) {
-            return None;
-        }
         // Never fetched and nothing on record: due now.
         let by_clock = self.fetch_time().map_or(std::time::Duration::ZERO, |t| {
             interval.saturating_sub(t.elapsed())
@@ -664,7 +687,13 @@ impl OverlayRegistry {
         }
     }
 
-    /// What `kind`'s last fetch said, for a caller that renders it.
+    /// What `kind`'s last fetch said.
+    ///
+    /// Read by `Gui::set_pane_overlay_with_fetch` to decide whether switching a
+    /// layer on should re-ask the origin; the *rendering* of it goes through
+    /// [`Self::controls`], which prepends
+    /// [`FetchRetry::status_note`](crate::fetch_policy::FetchRetry::status_note)
+    /// for every layer rather than trusting handlers to remember.
     pub fn fetch_health(&self, kind: OverlayKind) -> Option<&FetchHealth> {
         self.handler(kind)
             .and_then(|h| h.retry())
@@ -758,9 +787,29 @@ impl OverlayRegistry {
             .map_or_else(Vec::new, |h| h.create_fetch_tasks(ctx))
     }
 
+    /// The handler's own options, with its fetch health prepended.
+    ///
+    /// The note is added **here** rather than in each handler because handlers
+    /// forget. Exactly one of the six fetching handlers rendered
+    /// [`FetchRetry::status_note`] — SPC discussions — so NWS alerts, storm
+    /// reports, METAR and lightning could each be frozen on data hours old with
+    /// nothing on screen but an "Updated 47m ago" line that reads as a fact
+    /// about the weather rather than about the app. A handler cannot forget
+    /// something it does not write.
+    ///
+    /// **First**, not last. It changes what everything under it means: an empty
+    /// alerts layer is a quiet afternoon or an unreachable origin, and a full
+    /// one is current warnings or a frozen copy of last hour's. A caveat below
+    /// the thing it qualifies is a caveat most people do not read.
     pub fn controls(&self, kind: OverlayKind, ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
-        self.handler(kind)
-            .map_or_else(Vec::new, |h| h.controls(ctx))
+        let Some(handler) = self.handler(kind) else {
+            return Vec::new();
+        };
+        let mut items = handler.controls(ctx);
+        if let Some(note) = handler.retry().and_then(FetchRetry::status_note) {
+            items.insert(0, ControlItem::InfoText { text: note });
+        }
+        items
     }
 
     pub fn apply_control(
@@ -1291,5 +1340,149 @@ mod retry_ledger_tests {
         state.set_data(vec![1]);
         assert!(!state.fetching);
         assert!(state.fetch_time.is_some());
+    }
+
+    /// **The silence guard.** Every layer that can fail must *say* it is
+    /// failing, in its own options, without its handler having written a line
+    /// of code to do it.
+    ///
+    /// Exactly one of the six — SPC discussions — used to push
+    /// `status_note()` itself. NWS alerts, storm reports, METAR and lightning
+    /// pushed nothing, so a frozen warning set looked identical to a current
+    /// one and the only thing on screen was an "Updated 47m ago" line that
+    /// reads as a fact about the weather. Written over `create_handlers()`, so
+    /// a seventh overlay is covered the day it is registered rather than the
+    /// day someone remembers.
+    #[test]
+    fn every_fetching_layer_says_so_when_it_is_failing() {
+        use crate::render::controls::{ControlItem, PaneControlContext};
+
+        let ctx = PaneControlContext {
+            pane_idx: 0,
+            pane_state: None,
+        };
+        let mut registry = OverlayRegistry::default();
+        let kinds: Vec<OverlayKind> = registry
+            .handlers()
+            .filter(|h| h.retry().is_some())
+            .map(|h| h.kind())
+            .collect();
+        assert_eq!(
+            kinds.len(),
+            7,
+            "the seven fetching handlers must all be covered",
+        );
+
+        for kind in kinds {
+            let quiet = registry.controls(kind, &ctx).len();
+
+            registry.record_fetch_failure(kind, &FetchError::transient("connection refused"));
+            let note = registry
+                .fetch_health(kind)
+                .and_then(|_| {
+                    registry
+                        .controls(kind, &ctx)
+                        .into_iter()
+                        .find_map(|item| match item {
+                            ControlItem::InfoText { text }
+                                if text.contains("connection refused") =>
+                            {
+                                Some(text)
+                            }
+                            _ => None,
+                        })
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{kind:?} is failing and its options say nothing about it — \
+                         a stale layer that looks current is the whole bug",
+                    )
+                });
+            assert!(
+                note.contains("stale"),
+                "{kind:?} reports the error but not what it means for what is \
+                 drawn: {note}",
+            );
+            assert_eq!(
+                registry.controls(kind, &ctx).len(),
+                quiet + 1,
+                "{kind:?} gained more than the one health line",
+            );
+
+            // First, above everything it qualifies.
+            assert!(
+                matches!(
+                    registry.controls(kind, &ctx).first(),
+                    Some(ControlItem::InfoText { text }) if text.contains("connection refused"),
+                ),
+                "{kind:?} buried its health note below the options it changes the \
+                 meaning of",
+            );
+
+            registry.clear_retry(kind);
+            assert_eq!(
+                registry.controls(kind, &ctx).len(),
+                quiet,
+                "{kind:?} kept a health line after recovering",
+            );
+        }
+    }
+
+    /// The enable-fetch rule, in the four states it has to tell apart.
+    ///
+    /// The third row is the fix: a layer *holding* data that has since gone
+    /// stale must re-ask when the user switches it on. The rule was
+    /// `!has_data` alone, so toggling a frozen alerts layer off and on did
+    /// nothing whatsoever — in the one case where a user is most likely to try
+    /// it, on the layer where being wrong matters most.
+    #[test]
+    fn switching_a_layer_on_re_asks_when_there_is_nothing_worth_trusting() {
+        let cases = [
+            (false, None, true, "nothing drawn: ask"),
+            (
+                true,
+                None,
+                false,
+                "fresh data drawn: do not spend a request",
+            ),
+            (true, Some(false), true, "data drawn but failing: ask"),
+            (true, Some(true), true, "data drawn but broken: ask"),
+        ];
+        for (has_data, unhealthy, expected, why) in cases {
+            let mut state: OverlayState<Vec<u8>> = OverlayState::new();
+            if has_data {
+                state.set_data(vec![1]);
+            }
+            match unhealthy {
+                None => {}
+                Some(broken) => {
+                    let n = if broken {
+                        crate::fetch_policy::REFUSALS_BEFORE_BROKEN
+                    } else {
+                        1
+                    };
+                    for _ in 0..n {
+                        state
+                            .retry
+                            .record_failure(&FetchError::permanent("HTTP 400"));
+                    }
+                    assert_eq!(state.retry.is_broken(), broken, "premise: {why}");
+                }
+            }
+            assert_eq!(state.enable_should_refetch(has_data), expected, "{why}");
+        }
+    }
+
+    /// A fetch already in flight is never doubled by switching the layer on,
+    /// however unhealthy the ledger looks — the result that is coming is the
+    /// answer.
+    #[test]
+    fn switching_a_layer_on_does_not_double_a_fetch_in_flight() {
+        let mut state: OverlayState<Vec<u8>> = OverlayState::new();
+        state
+            .retry
+            .record_failure(&FetchError::transient("timeout"));
+        state.fetching = true;
+        assert!(!state.enable_should_refetch(false));
     }
 }

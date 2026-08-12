@@ -135,12 +135,17 @@ impl OverlayHandler for ModelDataHandler {
             }
             Err(e) => {
                 log::error!("HRRR fetch failed: {e}");
-                // An index fetch, a range fetch and a GRIB2 decode behind one
-                // result; the outer error is "this forecast hour did not
-                // arrive", which another run can fix.
-                self.state
-                    .record_failure(&crate::fetch_policy::FetchError::transient(e.clone()));
-                self.last_error = Some(e);
+                // The verdict comes with the error now, merged across the two
+                // candidate runs by `hrrr::fetch::round_verdict`. It used to be
+                // hardcoded `transient` on the argument that "another run can
+                // fix it" — true of a missed forecast hour, and false of a
+                // moved product, which then stayed on the poll for ever.
+                //
+                // A run the bucket does not carry yet classifies as `Absent`,
+                // which is the honest reading and keeps the layer on its
+                // ordinary hourly interval rather than climbing a ladder.
+                self.last_error = Some(e.message.clone());
+                self.state.record_failure(&e);
             }
         }
     }
@@ -318,7 +323,7 @@ impl OverlayHandler for ModelDataHandler {
             "enabled" => {
                 if let ControlValue::Bool(val) = update.value {
                     self.enabled = val;
-                    if val && !self.has_data() && !self.state.fetching {
+                    if val && self.state.enable_should_refetch(self.has_data()) {
                         return ControlEffect::Fetch;
                     }
                 }
@@ -589,7 +594,9 @@ mod tests {
         let mut h = ModelDataHandler::new();
         h.enabled = true;
         h.selected_param = ModelParameter::MaxUH2to5km;
-        h.apply_fetch_result(Box::new(HrrrFetchResult(Err("HTTP 500".into()))));
+        h.apply_fetch_result(Box::new(HrrrFetchResult(Err(
+            crate::fetch_policy::FetchError::transient("HTTP 500"),
+        ))));
 
         let lines = info_lines(&h);
         assert!(
@@ -604,7 +611,9 @@ mod tests {
         let mut h = ModelDataHandler::new();
         h.enabled = true;
         h.selected_param = ModelParameter::MaxUH2to5km;
-        h.apply_fetch_result(Box::new(HrrrFetchResult(Err("HTTP 500".into()))));
+        h.apply_fetch_result(Box::new(HrrrFetchResult(Err(
+            crate::fetch_policy::FetchError::transient("HTTP 500"),
+        ))));
         h.apply_fetch_result(Box::new(HrrrFetchResult(Ok(grid(
             ModelParameter::MaxUH2to5km,
             vec![120.0],

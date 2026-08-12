@@ -1111,7 +1111,12 @@ pub fn summarize_values(values: &[f32], param: ModelParameter) -> (usize, Option
 }
 
 /// Type-erased fetch result wrapper for the overlay handler.
-pub struct HrrrFetchResult(pub Result<HrrrGridData, String>);
+///
+/// The error carries its own verdict — see [`crate::fetch_policy`]. It was a
+/// `String`, which left the handler nothing to classify by, so every HRRR
+/// failure was recorded as `Transient` and the layer could never come off the
+/// poll however permanently NOMADS had moved.
+pub struct HrrrFetchResult(pub Result<HrrrGridData, crate::fetch_policy::FetchError>);
 
 #[cfg(test)]
 mod tests {

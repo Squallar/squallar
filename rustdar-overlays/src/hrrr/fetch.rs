@@ -37,6 +37,7 @@ use grib::{Grib2SubmessageDecoder, GridDefinitionTemplateValues, LatLons, SubMes
 use rustdar_radar::sources::DataSources;
 
 use super::{GridCoords, HrrrFetchResult, HrrrGridData, ModelParameter, lambert};
+use crate::fetch_policy::{FetchError, FetchFailure, NotFound};
 use crate::types::GeoBounds;
 
 /// Live tests only. Production fetches with `ctx.client` (30 s).
@@ -339,29 +340,44 @@ async fn fetch_record(
     forecast_hour: u8,
     var: &str,
     level: &str,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, FetchError> {
     let idx_url = sources.hrrr_idx_url(&date, run_hour, forecast_hour);
-    let idx_text = client
+    // `IsRoutine`: the bucket holds a rolling window of runs and each run's
+    // files land over several minutes, so a 404 here is "that run is not up
+    // (yet, or any more)" — a normal answer for a model, and the reason this
+    // function has a previous-hour fallback at all. It must not read as a
+    // refusal.
+    let idx_response = client
         .get(&idx_url)
         .send()
         .await
-        .map_err(|e| format!("index request failed: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("index {idx_url}: {e}"))?
+        .map_err(|e| FetchError::from_transport(&e, format!("index request failed: {e}")))?;
+    // Checked here rather than through `error_for_status()`, which funnels into
+    // `NotFound::IsBroken` and would read a not-yet-published run as a refusal.
+    if !idx_response.status().is_success() {
+        return Err(FetchError::from_status(
+            idx_response.status(),
+            NotFound::IsRoutine,
+            format!("index {idx_url}: HTTP {}", idx_response.status()),
+        ));
+    }
+    let idx_text = idx_response
         .text()
         .await
-        .map_err(|e| format!("index body read failed: {e}"))?;
+        .map_err(|e| FetchError::from_transport(&e, format!("index body read failed: {e}")))?;
 
     let records = parse_idx(&idx_text);
     if records.is_empty() {
-        return Err(format!("{idx_url} parsed to no records"));
+        return Err(FetchError::transient(format!(
+            "{idx_url} parsed to no records"
+        )));
     }
 
     let (start, end) = byte_range(&records, var, level).ok_or_else(|| {
-        format!(
+        FetchError::transient(format!(
             "no `{var}:{level}` record in {idx_url} ({} records)",
             records.len()
-        )
+        ))
     })?;
 
     let grib_url = sources.hrrr_grib_url(&date, run_hour, forecast_hour);
@@ -376,22 +392,25 @@ async fn fetch_record(
         .header(reqwest::header::RANGE, &range)
         .send()
         .await
-        .map_err(|e| format!("range request failed: {e}"))?;
+        .map_err(|e| FetchError::from_transport(&e, format!("range request failed: {e}")))?;
 
     // A 200 means the server ignored `Range` and is sending the whole 130 MB.
     if response.status() == reqwest::StatusCode::OK {
-        return Err(format!(
+        return Err(FetchError::transient(format!(
             "{grib_url} ignored the Range header and would return the whole file"
-        ));
+        )));
     }
     if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-        return Err(format!("HTTP {} for {grib_url}", response.status()));
+        return Err(FetchError::from_status(
+            response.status(),
+            NotFound::IsRoutine,
+            format!("HTTP {} for {grib_url}", response.status()),
+        ));
     }
 
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| format!("Failed to read response body: {e}"))?;
+    let bytes = response.bytes().await.map_err(|e| {
+        FetchError::from_transport(&e, format!("Failed to read response body: {e}"))
+    })?;
     log::info!(
         "Received {} bytes of GRIB2 data for {var}:{level}",
         bytes.len()
@@ -410,12 +429,13 @@ pub async fn fetch_hrrr_data(
 ) -> HrrrFetchResult {
     let (date, hour) = latest_available_run();
 
-    match try_fetch(client, sources, param, date, hour).await {
+    let first = match try_fetch(client, sources, param, date, hour).await {
         Ok(data) => return HrrrFetchResult(Ok(data)),
         Err(e) => {
             log::warn!("HRRR fetch for {date} {hour:02}z failed: {e}, trying previous hour");
+            e
         }
-    }
+    };
 
     let (prev_date, prev_hour) = previous_run(date, hour);
 
@@ -423,8 +443,27 @@ pub async fn fetch_hrrr_data(
         Ok(data) => HrrrFetchResult(Ok(data)),
         Err(e) => {
             log::error!("HRRR fallback fetch also failed: {e}");
-            HrrrFetchResult(Err(format!("HRRR fetch failed: {e}")))
+            HrrrFetchResult(Err(round_verdict(
+                [first, e],
+                "HRRR fetch failed for both candidate runs",
+            )))
         }
+    }
+}
+
+/// One verdict for a two-run attempt, carrying both attempts' words.
+///
+/// The two runs are the same product an hour apart, so either succeeding fixes
+/// the layer — which is exactly the shape [`FetchFailure::of_round`] is for. In
+/// practice both being 404 is the common case and reads as
+/// [`Absent`](FetchFailure::Absent): the bucket does not have that run yet,
+/// which is a normal answer for a model and must not climb a ladder.
+fn round_verdict(parts: [FetchError; 2], context: &str) -> FetchError {
+    let failure = FetchFailure::of_round(parts.iter().map(|e| e.failure));
+    let [first, second] = parts;
+    FetchError {
+        failure,
+        message: format!("{context}: {first}; then {second}"),
     }
 }
 
@@ -435,7 +474,7 @@ async fn try_fetch(
     param: &ModelParameter,
     date: NaiveDate,
     hour: u8,
-) -> Result<HrrrGridData, String> {
+) -> Result<HrrrGridData, FetchError> {
     let bytes = fetch_record(
         client,
         sources,
@@ -446,7 +485,9 @@ async fn try_fetch(
         param.grib_level(),
     )
     .await?;
-    parse_grib2(&bytes, *param)
+    // A decode failure is transient by the module's own rule: a truncated body
+    // and a changed product encoding are indistinguishable from one sample.
+    parse_grib2(&bytes, *param).map_err(FetchError::transient)
 }
 
 /// Fetch a composite HRRR parameter (e.g. bulk shear) that requires
@@ -463,14 +504,15 @@ pub async fn fetch_composite_hrrr_data(
 
     let (date, hour) = latest_available_run();
 
-    match try_fetch_composite(client, sources, param, &parts, date, hour).await {
+    let first = match try_fetch_composite(client, sources, param, &parts, date, hour).await {
         Ok(data) => return HrrrFetchResult(Ok(data)),
         Err(e) => {
             log::warn!(
                 "HRRR composite fetch for {date} {hour:02}z failed: {e}, trying previous hour"
             );
+            e
         }
-    }
+    };
 
     let (prev_date, prev_hour) = previous_run(date, hour);
 
@@ -478,7 +520,10 @@ pub async fn fetch_composite_hrrr_data(
         Ok(data) => HrrrFetchResult(Ok(data)),
         Err(e) => {
             log::error!("HRRR composite fallback fetch also failed: {e}");
-            HrrrFetchResult(Err(format!("HRRR composite fetch failed: {e}")))
+            HrrrFetchResult(Err(round_verdict(
+                [first, e],
+                "HRRR composite fetch failed for both candidate runs",
+            )))
         }
     }
 }
@@ -491,7 +536,7 @@ async fn try_fetch_composite(
     parts: &[(&str, &str)],
     date: NaiveDate,
     hour: u8,
-) -> Result<HrrrGridData, String> {
+) -> Result<HrrrGridData, FetchError> {
     let mut grids: Vec<HrrrGridData> = Vec::with_capacity(parts.len());
 
     for (var, level) in parts {
@@ -505,11 +550,13 @@ async fn try_fetch_composite(
             level,
         )
         .await?;
-        grids.push(parse_grib2(&bytes, *param)?);
+        grids.push(parse_grib2(&bytes, *param).map_err(FetchError::transient)?);
     }
 
     if grids.len() < 2 {
-        return Err("Composite requires at least 2 components".into());
+        return Err(FetchError::transient(
+            "Composite requires at least 2 components",
+        ));
     }
 
     // Merge: compute magnitude √(a² + b²) element-wise.
@@ -517,11 +564,11 @@ async fn try_fetch_composite(
     let other = &grids[1];
 
     if base.values.len() != other.values.len() {
-        return Err(format!(
+        return Err(FetchError::transient(format!(
             "Grid size mismatch: {} vs {}",
             base.values.len(),
             other.values.len()
-        ));
+        )));
     }
 
     let values: Vec<f32> = base

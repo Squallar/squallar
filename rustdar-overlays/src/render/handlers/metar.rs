@@ -15,7 +15,7 @@ use crate::render::overlay_state::{
 };
 use crate::render::station_model;
 
-pub(crate) struct MetarFetchResult(pub Result<Vec<MetarOb>, String>);
+pub(crate) struct MetarFetchResult(pub Result<Vec<MetarOb>, crate::fetch_policy::FetchError>);
 
 const METAR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -291,12 +291,14 @@ impl OverlayHandler for MetarHandler {
             }
             Err(e) => {
                 log::error!("METAR fetch failed: {e}");
-                // IEM aggregates one request per state network, so a single
-                // verdict for the round is by definition "the whole round
-                // failed" — transient. The per-request detail that would let
-                // this be sharper is already reported by the fetch itself.
-                self.state
-                    .record_failure(&crate::fetch_policy::FetchError::transient(e));
+                // The round's verdict is computed where the per-request ones
+                // are, by `FetchFailure::of_round` in `metar::fetch`, and is
+                // refused only if every state network was. This used to be
+                // hardcoded `transient` on the argument that one verdict for a
+                // whole round could not be sharper than that — which cost the
+                // sharpness in the wrong direction: a METAR endpoint that is
+                // gone stays on the poll for ever.
+                self.state.record_failure(&e);
             }
         }
         self.rebuild_points();
@@ -419,7 +421,7 @@ impl OverlayHandler for MetarHandler {
             "enabled" => {
                 if let ControlValue::Bool(val) = update.value {
                     self.enabled = val;
-                    if val && !self.has_data() && !self.state.fetching {
+                    if val && self.state.enable_should_refetch(self.has_data()) {
                         return ControlEffect::Fetch;
                     }
                 }

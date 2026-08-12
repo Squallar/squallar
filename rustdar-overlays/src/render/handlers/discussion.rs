@@ -337,13 +337,10 @@ impl OverlayHandler for SpcDiscussionHandler {
                 text: "Fetching...".into(),
             });
         }
-        // Above the "Updated" line, because it is the line that changes what
-        // "Updated 4m ago" means. An empty map with a healthy fetch is a quiet
-        // afternoon; an empty map with this line under it is SPC being out of
-        // reach, and the two used to render identically.
-        if let Some(note) = self.state.retry.status_note() {
-            items.push(ControlItem::InfoText { text: note });
-        }
+        // The fetch-health note this handler used to push here is prepended by
+        // `OverlayRegistry::controls` now, for every layer. This was the only
+        // one of the six that remembered, which is precisely why it stopped
+        // being a handler's job to remember — see that method.
         if let Some(t) = self.state.fetch_time {
             let secs = t.elapsed().as_secs();
             let text = if secs < 60 {
@@ -366,7 +363,7 @@ impl OverlayHandler for SpcDiscussionHandler {
             "enabled" => {
                 if let ControlValue::Bool(val) = update.value {
                     self.enabled = val;
-                    if val && !self.has_data() && !self.state.fetching {
+                    if val && self.state.enable_should_refetch(self.has_data()) {
                         return ControlEffect::Fetch;
                     }
                 }

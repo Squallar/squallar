@@ -39,6 +39,7 @@ use serde_json::Value;
 
 use super::networks;
 use super::types::{CloudLayer, FlightCategory, MetarOb, Visibility, WindDir};
+use crate::fetch_policy::{FetchError, FetchFailure};
 use crate::types::GeoBounds;
 
 // ── Units ─────────────────────────────────────────────────────────────────
@@ -183,7 +184,7 @@ pub async fn fetch_current_metars(
     client: &reqwest::Client,
     sources: &rustdar_radar::sources::DataSources,
     viewport: &GeoBounds,
-) -> Result<Vec<MetarOb>, String> {
+) -> Result<Vec<MetarOb>, FetchError> {
     let states = networks::networks_for_viewport(viewport);
     if states.is_empty() {
         log::info!("METAR: viewport overlaps no ASOS network");
@@ -201,13 +202,17 @@ pub async fn fetch_current_metars(
                 .get(&url)
                 .send()
                 .await
-                .map_err(|e| format!("{state}: request failed: {e}"))?
+                .map_err(|e| {
+                    FetchError::from_transport(&e, format!("{state}: request failed: {e}"))
+                })?
                 .error_for_status()
-                .map_err(|e| format!("{state}: {e}"))?
+                .map_err(|e| FetchError::from_transport(&e, format!("{state}: {e}")))?
                 .text()
                 .await
-                .map_err(|e| format!("{state}: body read failed: {e}"))?;
-            parse_currents(&body).map_err(|e| format!("{state}: {e}"))
+                .map_err(|e| {
+                    FetchError::from_transport(&e, format!("{state}: body read failed: {e}"))
+                })?;
+            parse_currents(&body).map_err(|e| FetchError::transient(format!("{state}: {e}")))
         }
     });
 
@@ -215,7 +220,7 @@ pub async fn fetch_current_metars(
 
     let mut all = Vec::new();
     let mut rejected_total = 0u32;
-    let mut failures = 0usize;
+    let mut verdicts = Vec::new();
     for result in results {
         match result {
             Ok((obs, rejected)) => {
@@ -223,14 +228,22 @@ pub async fn fetch_current_metars(
                 rejected_total += rejected;
             }
             Err(e) => {
-                failures += 1;
                 log::warn!("METAR network fetch failed: {e}");
+                verdicts.push(e.failure);
             }
         }
     }
 
-    if failures == states.len() {
-        return Err(format!("all {failures} METAR network fetches failed"));
+    // Only a *total* failure is a failure at all: one state network being down
+    // still leaves observations to draw. When every one of them failed, the
+    // round's verdict is the merge of theirs — refused only if every part was,
+    // so a single dead network cannot take METAR off the poll nationwide.
+    if verdicts.len() == states.len() {
+        let failures = verdicts.len();
+        return Err(FetchError {
+            failure: FetchFailure::of_round(verdicts),
+            message: format!("all {failures} METAR network fetches failed"),
+        });
     }
 
     if rejected_total > 0 {

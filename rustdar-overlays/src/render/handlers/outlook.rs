@@ -486,6 +486,13 @@ impl OverlayHandler for SpcOutlookHandler {
                 }
                 ControlEffect::None
             }
+            // Refreshing a layer with no product ticked has nothing to ask for.
+            // Left as an unconditional `Fetch`, it reached
+            // `create_fetch_tasks`, got an empty list, and the host recorded
+            // that as a failure — which used to be invisible and is now a
+            // "what is shown may be stale" line in this very panel, said about
+            // a layer that is empty because the user emptied it.
+            "refresh" if self.enabled_products.is_empty() => ControlEffect::None,
             "refresh" => ControlEffect::Fetch,
             _ => ControlEffect::None,
         }

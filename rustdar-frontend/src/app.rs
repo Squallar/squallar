@@ -2656,13 +2656,14 @@ impl App {
     /// is never zero by construction, so the sub-second precision that keeps
     /// it honest survives this.
     ///
-    /// One term with a floor it can sit on: an overlay handler whose
-    /// `create_fetch_tasks` returns nothing leaves `overlay_poll_delay` at
-    /// zero for good, because `App::fetch_overlay` returns before
-    /// `set_fetching` when there are no tasks to run. That is a 1 Hz retry
-    /// rather than the display-rate one it used to be, and it is bounded by
-    /// this floor rather than by anything the handler does — worth fixing at
-    /// the handler seam, not here.
+    /// This used to name a term that could sit on that floor for ever: an
+    /// overlay handler whose `create_fetch_tasks` returned nothing left
+    /// `overlay_poll_delay` at zero, because `App::fetch_overlay` returned
+    /// before `set_fetching` and no result would arrive to stamp anything. It
+    /// was fixed where this said it should be — at the handler seam, in
+    /// [`App::fetch_overlay`] — which now records the empty task list as a
+    /// failure against the layer's own ledger. No term reaches this floor
+    /// indefinitely any more.
     ///
     /// [`Gui::auto_poll_delay`]: rustdar_egui::Gui::auto_poll_delay
     /// [`Gui::status_tick_delay`]: rustdar_egui::Gui::status_tick_delay

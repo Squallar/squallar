@@ -13,6 +13,7 @@ use super::{
     DeadFeed, FetchFailures, GLM_MIN_TIME_WINDOW_SECS, GlmDataLevel, GlmFetchOutcome, GlmFlash,
     GlmSatellite, LevelFailure,
 };
+use crate::fetch_policy::{FetchError, NotFound};
 
 /// One downloaded granule: what it parsed to, and when it is from.
 #[derive(Clone)]
@@ -120,7 +121,7 @@ pub async fn fetch_glm_flashes(
     time_window_secs: f64,
     levels: &[GlmDataLevel],
     cache: &mut GlmCache,
-) -> Result<GlmFetchOutcome, String> {
+) -> Result<GlmFetchOutcome, FetchError> {
     // The zero-object warning below assumes the queried range is wide enough to
     // always cover an already-published granule.
     debug_assert!(
@@ -332,7 +333,7 @@ async fn list_glm_files(
     bucket: &str,
     start: NaiveDateTime,
     end: NaiveDateTime,
-) -> Result<GlmListing, String> {
+) -> Result<GlmListing, FetchError> {
     let mut all_keys = Vec::new();
     let mut objects_seen = 0usize;
 
@@ -377,23 +378,28 @@ async fn list_glm_files(
                 url.push_str(&urlencoded(token));
             }
 
-            let resp = client
-                .get(&url)
-                .send()
-                .await
-                .map_err(|e| format!("S3 list request failed: {e}"))?;
+            let resp = client.get(&url).send().await.map_err(|e| {
+                FetchError::from_transport(&e, format!("S3 list request failed: {e}"))
+            })?;
 
             if !resp.status().is_success() {
-                return Err(format!("S3 returned HTTP {}", resp.status()));
+                // `IsBroken`: a bucket listing is not published on a schedule.
+                // If `?list-type=2` 404s, the bucket is gone or renamed — which
+                // is exactly the noaa-goes16 case this handler already has a
+                // dead-feed warning for.
+                return Err(FetchError::from_status(
+                    resp.status(),
+                    NotFound::IsBroken,
+                    format!("S3 returned HTTP {}", resp.status()),
+                ));
             }
 
-            let body = resp
-                .text()
-                .await
-                .map_err(|e| format!("Failed to read S3 list response: {e}"))?;
+            let body = resp.text().await.map_err(|e| {
+                FetchError::from_transport(&e, format!("Failed to read S3 list response: {e}"))
+            })?;
 
             let doc = roxmltree::Document::parse(&body)
-                .map_err(|e| format!("Failed to parse S3 XML: {e}"))?;
+                .map_err(|e| FetchError::transient(format!("Failed to parse S3 XML: {e}")))?;
 
             for node in doc.descendants() {
                 if node.tag_name().name() == "Key"
