@@ -803,10 +803,11 @@ pub fn worker_attached() -> bool {
 /// are carried inside it.
 ///
 /// That is also what keeps `PaneRenderState::want_result`'s pruning honest. It
-/// treats `Arc::strong_count(flag) > 1` as "still running", and the second
+/// treats `Arc::strong_count(flag) > 1` as "still stoppable", and the second
 /// reference used to be the one the offloaded closure held. It is now the one
 /// `deliver` holds, kept alive by the pending map for exactly as long as the
-/// job is outstanding.
+/// job is outstanding, and released inside `deliver` at the cancellation check
+/// — which is the last moment at which clearing the flag would change anything.
 pub fn offload_job(name: &'static str, job: Job, deliver: impl FnOnce(JobResult) + Send + 'static) {
     let request = match job {
         Job::Described(request) => request,

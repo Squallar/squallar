@@ -78,8 +78,17 @@ impl PaneRenderState {
     /// The flag a newly dispatched render reports through, live until this pane's
     /// renders are abandoned.
     ///
-    /// Finished renders are dropped from the list first: the worker holds the only
-    /// other reference to its own flag, so one strong reference means it is gone.
+    /// Renders past stopping are dropped from the list first: the render holds the
+    /// only other reference to its own flag and releases it the moment it reads it,
+    /// so one strong reference means that render has already decided whether to
+    /// answer and clearing its flag would change nothing.
+    ///
+    /// That release is sequenced before the send, so a result taken off the channel
+    /// is proof that the flag it reported through is prunable here — the list is
+    /// bounded by the renders still *stoppable*, and not by how long a finished
+    /// worker takes to unwind. Before the release moved, this pruned on thread
+    /// teardown instead, and a pane that dispatched under load kept flags for
+    /// renders that had already answered.
     fn want_result(&mut self) -> Arc<AtomicBool> {
         self.results_wanted.retain(|f| Arc::strong_count(f) > 1);
         let flag = Arc::new(AtomicBool::new(true));
@@ -1406,7 +1415,7 @@ impl RenderDispatcher {
         // cannot, since it says nothing about which site a result belongs to.
         //
         // `deliver` carries the only other reference to it, which is also what
-        // `want_result`'s `Arc::strong_count` pruning reads as "still running".
+        // `want_result`'s `Arc::strong_count` pruning reads as "still stoppable".
         let wanted = self.pane_render[pane_idx].want_result();
         crate::offload::offload_job("radar-render", job, move |output| {
             let _guard = guard;
@@ -1420,7 +1429,18 @@ impl RenderDispatcher {
             // clears `render_in_flight` and a pane that never hears back stops
             // dispatching. Still gated on `wanted`: an abandoned render must not
             // clear the flag belonging to the render that superseded it.
-            if wanted.load(Ordering::Relaxed) {
+            //
+            // Read once and released immediately, because this read is where
+            // the flag stops meaning anything. An abandonment that lands after
+            // it cannot stop the send — the decision is already taken — so
+            // holding the reference until the thread finishes unwinding would
+            // only leave `want_result` reading a render that has already
+            // answered as one still running. Released here, the release is
+            // sequenced before the send, so a pane holding the result knows
+            // the flag behind it is already prunable.
+            let still_wanted = wanted.load(Ordering::Relaxed);
+            drop(wanted);
+            if still_wanted {
                 let _ = sender.send(RenderResponse {
                     rendered: frame.map(|frame| crate::channels::RenderedImage {
                         image_data: Arc::new(frame.image),

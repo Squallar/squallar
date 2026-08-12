@@ -695,8 +695,22 @@ fn a_tilt_reset_keeps_the_other_tilts_cached_renders() {
     );
 }
 
-/// The flag list is bounded by what is actually running, not by how many
-/// renders a session has dispatched.
+/// The flag list is bounded by what is still stoppable, not by how many renders
+/// a session has dispatched.
+///
+/// This used to read `len() <= 2` — the render just added, plus a grace slot for
+/// "a worker that had not quite dropped its flag". That bound was a guess at a
+/// thread-teardown race and nothing enforced it: a render released its flag when
+/// its thread finished unwinding, which is *after* the send, so a result in hand
+/// said nothing about the flag behind it. Under CPU contention several workers
+/// sat in that window at once and the list reached 3 and 4 — measured at 5% of
+/// runs with six copies of this test sharing two cores, and seen on a quiet box
+/// too.
+///
+/// The flag is now released at the cancellation check, before the send, so a
+/// result off the channel *is* proof the flag is prunable and the bound is
+/// exact rather than probabilistic. Asserted as `== 1` for that reason: a grace
+/// slot would only hide the race coming back.
 #[test]
 fn finished_renders_stop_being_tracked() {
     let mut d = RenderDispatcher::new();
@@ -704,14 +718,15 @@ fn finished_renders_stop_being_tracked() {
     for _ in 0..5 {
         let release = dispatch(&mut d, 0, &results);
         release.send(()).expect("the render is still running");
-        // The worker has to drop its flag before the next dispatch prunes.
+        // Taking the result is what proves the render released its flag: it let
+        // go of it before sending, so this `recv` is ordered after that release.
         rx.recv().expect("an unabandoned render arrives");
     }
-    // Each dispatch prunes before pushing, so only the render just added — and
-    // at most one whose worker had not quite dropped its flag — can be held.
-    assert!(
-        d.pane_render[0].results_wanted.len() <= 2,
-        "flags accumulated: {}",
-        d.pane_render[0].results_wanted.len()
+    // Each dispatch prunes before pushing, and every render but the last has
+    // answered, so exactly the one just added is held.
+    assert_eq!(
+        d.pane_render[0].results_wanted.len(),
+        1,
+        "flags accumulated for renders that had already answered",
     );
 }
