@@ -12,9 +12,12 @@
 // Rules this file follows, every one of them a naga constraint rather than a
 // preference (see `volume_raymarch.rs`'s module doc for the citations):
 //
-//   * `textureSampleLevel` everywhere. The march breaks on a data-dependent
-//     condition, and implicit-LOD sampling under non-uniform control flow is a
-//     hard validator failure on every target.
+//   * `textureSampleLevel` for everything that is *sampled*. The march breaks
+//     on a data-dependent condition, and implicit-LOD sampling under
+//     non-uniform control flow is a hard validator failure on every target.
+//     The one `textureLoad` (the jitter tile) is not an exception to this: it
+//     takes an explicit level and is not implicit-LOD. It translates to
+//     `texelFetch`, which is core GLSL ES 300.
 //   * `RAYMARCH_STEP_CEILING` is a `const` so it folds to a literal in the loop.
 //   * one sampler per texture per pipeline.
 //   * `textureNumLevels` appears nowhere; it is gated on GLSL core 130 with no
@@ -166,6 +169,17 @@ fn outside_grid(t: vec3<f32>) -> bool {
 // 3.0 has no `sampler1D` at all.
 @group(0) @binding(3) var lut_texture: texture_2d<f32>;
 @group(0) @binding(4) var lut_sampler: sampler;
+
+// The march's stratification tile: `BLUE_NOISE_EDGE` square, `R8Unorm`, read
+// with `textureLoad` and so carrying **no sampler of its own** — the one
+// texture in this module that does not, because an offset table is indexed
+// rather than interpolated. See `blue_noise_jitter`.
+@group(0) @binding(7) var jitter_texture: texture_2d<f32>;
+
+// One less than the blue noise tile's edge, as a mask. Must equal
+// `blue_noise::BLUE_NOISE_EDGE - 1`, and
+// `the_shader_and_the_blue_noise_tile_agree` pins this literal to it.
+const JITTER_TILE_MASK: i32 = 63;
 
 // The pane mirror: the 2D pane's own render, copied. Not a picture built for
 // the floor — literally the frame's egui geometry for the source pane, drawn
@@ -562,23 +576,44 @@ fn shading_field(p: vec3<f32>) -> f32 {
     return textureSampleLevel(grid_texture, grid_sampler, t, volume.flags.y).r;
 }
 
-// Deterministic per-pixel jitter in [0, 1): Jimenez's interleaved gradient
-// noise over the fragment's framebuffer coordinate.
+// Deterministic per-pixel jitter in [0, 1): a wrapped lookup into the blue
+// noise tile at binding 7.
 //
 // The march's sample comb is offset by this fraction of a step, per pixel.
 // Without it the comb is phase-locked to the eye, and every iso-`t` shell
 // draws a contour that stays put in screen space while the volume slides
 // beneath it — the "slithering" the 2026-08-09 recording shows. The jitter
-// trades that coherent crawling for fine noise that is **static**: the hash
-// reads nothing but the pixel coordinate, so it must never be given a time
-// term — animated jitter is shimmer, which is the same artifact at one remove.
+// trades that coherent crawling for fine noise that is **static**: the tile is
+// indexed by nothing but the pixel coordinate, so it must never be given a
+// time term — animated jitter is shimmer, which is the same artifact at one
+// remove.
 //
-// This polynomial rather than a sin-based hash because `sin` at large
-// arguments is where mobile GLES precision goes to die; fract/dot/multiply
-// stay exact in f32 at these magnitudes.
-fn interleaved_gradient_noise(px: vec2<f32>) -> f32 {
-    let magic = vec3<f32>(0.06711056, 0.00583715, 52.9829189);
-    return fract(magic.z * fract(dot(px, magic.xy)));
+// # Why a tile and not a hash
+//
+// This was Jimenez's interleaved gradient noise until 2026-08-11, and what it
+// leaves behind is not invisible: the residual is the hash's own spatial
+// spectrum, scaled by the per-step opacity quantum. IGN is a rank-1 lattice —
+// 81.6% of its energy in 0.1% of its frequency bins, a grating of period
+// 1.86 px at -35 degrees — so wherever that quantum is large enough to see, it
+// draws a fine diagonal weave over every smooth gradient. That is the artefact
+// reported against the 3D view, and no step count removes it: halving the step
+// only scales it down. A white hash removes the grating and is the worse
+// trade, putting fifteen times as much energy in the low band the eye actually
+// reads. See `volume::blue_noise` for the measurements, and for why the tile
+// is generated rather than shipped as bytes.
+//
+// `textureLoad`, not `textureSampleLevel`: the tile is a table of offsets
+// indexed by an exact integer coordinate, so there is nothing to filter and the
+// load needs no sampler of its own. It takes an explicit level, so it is not
+// implicit-LOD and the module's rule about non-uniform control flow does not
+// reach it — and this call sits above the march's data-dependent break in
+// uniform control flow regardless.
+fn blue_noise_jitter(px: vec2<f32>) -> f32 {
+    // A mask rather than `%`: the tile's edge is a power of two, and WGSL's
+    // remainder takes the sign of its left operand, so the mask is the form
+    // that cannot index backwards off the tile.
+    let at = vec2<i32>(px) & vec2<i32>(JITTER_TILE_MASK, JITTER_TILE_MASK);
+    return textureLoad(jitter_texture, at, 0).r;
 }
 
 // Diffuse shading from the central-difference gradient, in 0..1.
@@ -907,7 +942,7 @@ fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
     // expected sample count over the jitter is exactly `span / dt`, so path
     // integrals stay unbiased; what the jitter buys is that the residual
     // quantisation is per-pixel noise instead of screen-space contours.
-    let jitter = interleaved_gradient_noise(in.clip_position.xy);
+    let jitter = blue_noise_jitter(in.clip_position.xy);
     var t = span.x + jitter * dt;
     var transmittance = 1.0;
     // Premultiplied and LINEAR. The conversion to egui's gamma-space

@@ -24,6 +24,8 @@ use egui_wgpu::wgpu;
 
 use crate::constants::VOLUME_GRID_CELLS;
 
+#[path = "volume_blue_noise.rs"]
+pub mod blue_noise;
 #[path = "volume_bridge.rs"]
 pub mod bridge;
 #[path = "volume_degrade.rs"]
@@ -139,8 +141,20 @@ pub const VOLUME_ENV_VAR: &str = "RUSTDAR_VOLUME";
 /// 40 km half-width is 2.5 km per cell, coarser than the beam.
 const MIN_TEXTURE_DIMENSION_3D: u32 = 32;
 
-/// Sampled textures a volume pipeline binds at once: the grid and its colour LUT.
-const REQUIRED_SAMPLED_TEXTURES: u32 = 2;
+/// Sampled textures a volume pipeline binds at once: the grid, its colour LUT,
+/// the jitter tile and the map floor's pane mirror.
+///
+/// "Sampled" is wgpu's name for the binding *class*, not a claim that all four
+/// are read through a sampler — the jitter tile is read with `textureLoad` and
+/// carries none, and it occupies one of these slots regardless. What this has
+/// to match is the number of texture bindings the raymarch's layouts declare
+/// across both groups, because that is what the adapter is being asked for.
+///
+/// It read 2 until 2026-08-12, and was already wrong before the jitter tile
+/// existed: the map floor's mirror had made it 3, so an adapter reporting
+/// exactly 2 passed this probe and then failed pipeline creation — which is
+/// the failure the probe exists to turn into a clean refusal.
+const REQUIRED_SAMPLED_TEXTURES: u32 = 4;
 
 /// Samplers a volume pipeline binds at once.
 ///
@@ -269,7 +283,7 @@ pub(crate) fn limits_shortfall(limits: &wgpu::Limits) -> Option<String> {
         (
             u64::from(limits.max_sampled_textures_per_shader_stage),
             u64::from(REQUIRED_SAMPLED_TEXTURES),
-            "two sampled textures in one shader stage",
+            "four sampled textures in one shader stage",
         ),
         (
             u64::from(limits.max_samplers_per_shader_stage),
@@ -402,6 +416,38 @@ fn disposition(rendered: &str, debug_build: bool) -> ErrorDisposition {
 mod tests {
     use super::*;
     use crate::constants::WEBGL2_MAX_TEXTURE_DIMENSION_3D;
+
+    /// The probe's texture floor is what the raymarch actually declares.
+    ///
+    /// This constant drifted once already — it sat at 2 while the map floor's
+    /// mirror had made the real count 3 — and the failure that causes is the
+    /// exact one the probe exists to prevent: an adapter passes, and then
+    /// `create_render_pipeline` fails asynchronously into the uncaptured-error
+    /// sink, which panics. So it is counted out of the shader rather than
+    /// remembered, over both of the raymarch's groups and skipping the blit's
+    /// own pair, which belongs to a different pipeline and a different layout.
+    #[test]
+    fn the_probe_floor_counts_every_texture_the_raymarch_declares() {
+        use crate::volume::raymarch::{
+            BINDING_BLIT_SAMPLER, BINDING_BLIT_TEXTURE, VOLUME_SHADER_WGSL,
+        };
+        let blit = [BINDING_BLIT_TEXTURE, BINDING_BLIT_SAMPLER];
+        let declared = VOLUME_SHADER_WGSL
+            .lines()
+            .filter(|line| line.contains(": texture_"))
+            .filter(|line| {
+                !blit
+                    .iter()
+                    .any(|binding| line.starts_with(&format!("@group(0) @binding({binding}) ")))
+            })
+            .count();
+        assert_eq!(
+            declared as u32, REQUIRED_SAMPLED_TEXTURES,
+            "the raymarch declares {declared} textures and the probe asks the adapter for \
+             {REQUIRED_SAMPLED_TEXTURES}; an adapter between those two numbers passes this \
+             probe and then fails pipeline creation into the sink that panics",
+        );
+    }
 
     /// One limit lowered below what the probe requires.
     type LowerOneLimit = fn(&mut wgpu::Limits);

@@ -66,6 +66,7 @@ use egui_wgpu::wgpu;
 use crate::constants::{VOLUME_LUT_BYTES, VOLUME_TEXTURE_BUDGET_BYTES};
 use crate::egui_renderer::AttachmentConfig;
 use crate::volume::VOLUME_TEXTURE_FORMAT;
+use crate::volume::blue_noise::{BLUE_NOISE_EDGE, blue_noise_tile};
 use crate::volume::uniform::{VOLUME_UNIFORM_BYTES, VolumeUniform};
 use staging::VolumeStaging;
 
@@ -161,6 +162,23 @@ pub const BINDING_LUT_SAMPLER: u32 = 4;
 pub const BINDING_BLIT_TEXTURE: u32 = 5;
 /// See [`BINDING_BLIT_TEXTURE`].
 pub const BINDING_BLIT_SAMPLER: u32 = 6;
+
+/// The march's blue noise tile, back in the **raymarch's** group 0.
+///
+/// Numbered past the blit's pair rather than filling a gap, for the reason
+/// above: one module, one `(group, binding)` namespace, and 5 and 6 are spoken
+/// for. It carries **no sampler**, which makes it the one texture in this
+/// module without a matching one — the shader reads it with `textureLoad`,
+/// because a table of stratification offsets is indexed at an exact coordinate
+/// and there is nothing to interpolate. See [`VolumePipelines::jitter`] and
+/// `volume::blue_noise`.
+pub const BINDING_JITTER_TEXTURE: u32 = 7;
+
+/// The format the blue noise tile is uploaded as: one byte a texel.
+///
+/// Non-filterable, and bound that way — the tile is a lookup table, and a
+/// filtered read of it would average two unrelated stratification offsets.
+pub const JITTER_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 
 /// The map floor's bindings, in **group 1** of the raymarch pipeline.
 ///
@@ -376,6 +394,18 @@ impl VolumePipelines {
                     binding: BINDING_LUT_SAMPLER,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: BINDING_JITTER_TEXTURE,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        // Non-filterable, and no sampler entry follows: the
+                        // shader reaches this one with `textureLoad`.
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
                     count: None,
                 },
             ],
@@ -986,6 +1016,43 @@ impl VolumePipelines {
             },
         );
 
+        // The march's stratification tile. Created here rather than in the
+        // constructor because writing it needs a queue and the constructor
+        // deliberately takes none — and here rather than behind a second
+        // `upload_*` call because a caller who forgot that call would get a
+        // zero tile, which is a *constant* jitter, which is the screen-locked
+        // banding back at full strength across all thirty-seven call sites.
+        // The bytes themselves are computed once per process; see
+        // `blue_noise::blue_noise_tile`.
+        let jitter_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(&label("jitter")),
+            size: wgpu::Extent3d {
+                width: BLUE_NOISE_EDGE,
+                height: BLUE_NOISE_EDGE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: JITTER_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            jitter_texture.as_image_copy(),
+            blue_noise_tile(),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(BLUE_NOISE_EDGE),
+                rows_per_image: Some(BLUE_NOISE_EDGE),
+            },
+            wgpu::Extent3d {
+                width: BLUE_NOISE_EDGE,
+                height: BLUE_NOISE_EDGE,
+                depth_or_array_layers: 1,
+            },
+        );
+
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(&label("uniform")),
             size: VOLUME_UNIFORM_BYTES as u64,
@@ -995,6 +1062,7 @@ impl VolumePipelines {
 
         let grid_view = grid.create_view(&wgpu::TextureViewDescriptor::default());
         let lut_view = lut_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let jitter_view = jitter_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(&label("raymarch.bind_group")),
             layout: &self.volume_layout,
@@ -1018,6 +1086,10 @@ impl VolumePipelines {
                 wgpu::BindGroupEntry {
                     binding: BINDING_LUT_SAMPLER,
                     resource: wgpu::BindingResource::Sampler(&self.lut_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: BINDING_JITTER_TEXTURE,
+                    resource: wgpu::BindingResource::TextureView(&jitter_view),
                 },
             ],
         });

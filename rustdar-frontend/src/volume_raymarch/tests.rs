@@ -334,6 +334,7 @@ fn the_shaders_bindings_are_the_ones_the_layouts_declare() {
         (0, BINDING_LUT_SAMPLER, "lut_sampler"),
         (0, BINDING_BLIT_TEXTURE, "blit_texture"),
         (0, BINDING_BLIT_SAMPLER, "blit_sampler"),
+        (0, BINDING_JITTER_TEXTURE, "jitter_texture"),
         (1, BINDING_FLOOR_TEXTURE, "floor_texture"),
         (1, BINDING_FLOOR_SAMPLER, "floor_sampler"),
     ] {
@@ -350,28 +351,73 @@ fn the_shaders_bindings_are_the_ones_the_layouts_declare() {
 
     let bindings = shader_code().matches("@binding(").count();
     assert_eq!(
-        bindings, 9,
-        "volume.wgsl declares {bindings} bindings; this file names 9, and a \
+        bindings, 10,
+        "volume.wgsl declares {bindings} bindings; this file names 10, and a \
              binding the layouts do not declare fails pipeline creation"
     );
 }
 
-/// One sampler per texture, in each pipeline, as naga requires.
+/// The shader's tile mask and the tile's edge are the same number.
+///
+/// WGSL cannot read a Rust constant, so `JITTER_TILE_MASK` is a literal and
+/// this is the only thing keeping it honest. It is a *mask*, so it is the edge
+/// minus one — and the edge has to stay a power of two for that to be the same
+/// operation as a wrap at all, which is the second half of what this checks.
+#[test]
+fn the_shader_and_the_blue_noise_tile_agree() {
+    assert!(
+        BLUE_NOISE_EDGE.is_power_of_two(),
+        "the tile's edge is {BLUE_NOISE_EDGE}, not a power of two, so masking is no longer the \
+         same operation as wrapping and the shader would read outside the tile",
+    );
+    let expected = format!("const JITTER_TILE_MASK: i32 = {};", BLUE_NOISE_EDGE - 1);
+    assert!(
+        VOLUME_SHADER_WGSL.contains(&expected),
+        "volume.wgsl does not declare `{expected}`; the shader's mask and \
+         `blue_noise::BLUE_NOISE_EDGE` have drifted, and the march would tile the jitter at the \
+         wrong period",
+    );
+}
+
+/// One sampler per **sampled** texture, in each pipeline, as naga requires.
 ///
 /// `Error::ImageMultipleSamplers` is a real naga error, not a convention:
 /// a texture sampled through two samplers in one entry point does not
 /// translate to GLSL at all, because GLSL's `sampler3D` fuses the two.
+///
+/// The counts are deliberately unequal. `jitter_texture` is read with
+/// `textureLoad` and has no sampler at all, which the naga rule does not reach
+/// — it is about textures that are *sampled*. So the assertion below is not
+/// "five textures, four samplers" on its own, which a genuinely mismatched
+/// pair could also satisfy; it is that the one unsampled texture is exactly
+/// the one that is supposed to be unsampled.
 #[test]
-fn each_texture_has_exactly_one_sampler() {
+fn each_sampled_texture_has_exactly_one_sampler() {
     let code = shader_code();
     let textures = code.matches(": texture_").count();
     let samplers = code.matches(": sampler;").count();
     assert_eq!(
         (textures, samplers),
-        (4, 4),
+        (5, 4),
         "volume.wgsl declares {textures} textures and {samplers} samplers; \
              naga refuses a texture sampled through two samplers in one entry \
              point"
+    );
+    // The unsampled one is the jitter tile, and it is unsampled *because* it
+    // is loaded. Both halves are checked: a `textureSample` of it would be a
+    // texture with no sampler, and a `textureLoad` appearing anywhere else
+    // would mean some other texture had quietly lost its sampler.
+    assert!(
+        code.contains("textureLoad(jitter_texture"),
+        "nothing loads `jitter_texture`; it is the texture that carries no sampler, so if it \
+         is sampled instead the pipeline has a texture with no sampler to sample it through",
+    );
+    assert_eq!(
+        code.matches("textureLoad(").count(),
+        1,
+        "volume.wgsl has more than one `textureLoad`; only the jitter tile is bound without a \
+         sampler, so a second load is either a texture that lost its sampler or a sampled read \
+         written as a load",
     );
 }
 

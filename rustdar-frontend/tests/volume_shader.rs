@@ -50,9 +50,10 @@ use naga::proc::{BoundsCheckPolicies, BoundsCheckPolicy};
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 use rustdar_frontend::volume::raymarch::{
     BINDING_BLIT_SAMPLER, BINDING_BLIT_TEXTURE, BINDING_FLOOR_SAMPLER, BINDING_FLOOR_TEXTURE,
-    BINDING_GRID_SAMPLER, BINDING_GRID_TEXTURE, BINDING_LUT_SAMPLER, BINDING_LUT_TEXTURE,
-    BINDING_UNIFORM, ENTRY_FS_BLIT_GAMMA, ENTRY_FS_BLIT_LINEAR, ENTRY_FS_RAYMARCH, ENTRY_POINTS,
-    ENTRY_VS_BLIT, ENTRY_VS_RAYMARCH, ShaderStage, VOLUME_SHADER_WGSL,
+    BINDING_GRID_SAMPLER, BINDING_GRID_TEXTURE, BINDING_JITTER_TEXTURE, BINDING_LUT_SAMPLER,
+    BINDING_LUT_TEXTURE, BINDING_UNIFORM, ENTRY_FS_BLIT_GAMMA, ENTRY_FS_BLIT_LINEAR,
+    ENTRY_FS_RAYMARCH, ENTRY_POINTS, ENTRY_VS_BLIT, ENTRY_VS_RAYMARCH, ShaderStage,
+    VOLUME_SHADER_WGSL,
 };
 
 /// What kind of resource one bind group layout entry is.
@@ -80,6 +81,10 @@ const RAYMARCH_LAYOUT: Layout = &[
     (0, BINDING_GRID_SAMPLER, BindingKind::Sampler),
     (0, BINDING_LUT_TEXTURE, BindingKind::Texture),
     (0, BINDING_LUT_SAMPLER, BindingKind::Sampler),
+    // The jitter tile: a texture with no sampler after it, because the shader
+    // reaches it with `textureLoad`. It still takes a texture counter slot,
+    // which is what pushes the floor's texture to 3 below.
+    (0, BINDING_JITTER_TEXTURE, BindingKind::Texture),
     // The floor rides group 1, and the counters do NOT restart: wgpu-hal
     // keeps one counter per binding type across the whole pipeline layout.
     (1, BINDING_FLOOR_TEXTURE, BindingKind::Texture),
@@ -418,11 +423,21 @@ fn the_binding_map_counts_per_binding_type_the_way_wgpu_hal_does() {
          this layout those differ, which is what makes the difference visible"
     );
     assert_eq!(
-        slot(1, BINDING_FLOOR_TEXTURE),
+        slot(0, BINDING_JITTER_TEXTURE),
         2,
+        "the jitter tile did not take the texture counter's third slot; it carries no sampler, \
+         but it is still a texture and still consumes a texture slot"
+    );
+    assert_eq!(
+        slot(1, BINDING_FLOOR_TEXTURE),
+        3,
         "the floor's texture must continue the pipeline-wide texture counter \
          across the group boundary, not restart it"
     );
+    // Two, not three: the jitter tile added a texture without adding a
+    // sampler, so the two counters have diverged. That divergence is the
+    // sharpest thing this test now checks — a map that keyed off binding
+    // numbers, or that counted both types together, gets this wrong.
     assert_eq!(slot(1, BINDING_FLOOR_SAMPLER), 2);
 
     let blit = binding_map(BLIT_LAYOUT);
