@@ -1112,9 +1112,9 @@ const FOLD_TICK_THICKNESS: f32 = 2.0;
 /// the marker to 26 points, out of that classifier's reach, and is also what
 /// makes it legible against the saturated red and green it is drawn over.
 const FOLD_TICK_OVERHANG: f32 = 3.0;
-/// Side of the range-folded key swatch, logical pixels — small enough to sit in
-/// the [`SCALE_MARGIN`] beyond the end of the bar, and far from the 20-point
-/// bar width [`FOLD_TICK_OVERHANG`] describes.
+/// Side of the range-folded key swatch, logical pixels — small enough to stand
+/// in the [`SCALE_MARGIN`] past the end of the bar, and nowhere near the
+/// 20-point bar width the strip classifier looks for.
 const RF_SWATCH_SIZE: f32 = 10.0;
 /// What the range-folded swatch is labelled, matching the two-letter form the
 /// hydrometeor classification bar already uses for its own folded class.
@@ -1542,7 +1542,10 @@ pub(super) fn render_color_scale(
     // [`fold_marker_positions`] for why a re-scaling velocity ramp was refused.
     let folds_at = pane.displayed_nyquist_ms();
     if let Some(nyquist_ms) = folds_at {
-        for value in fold_marker_positions(nyquist_ms as f32, min_val, max_val) {
+        for value in fold_marker_positions(nyquist_ms as f32, min_val, max_val)
+            .into_iter()
+            .flatten()
+        {
             let t = (value - min_val) / range;
             let marker = if horizontal {
                 egui::Rect::from_min_size(
@@ -1647,7 +1650,8 @@ pub(super) fn render_color_scale(
         }
     }
 
-    // --- Title: unit label above the bar (desktop) or to the left (mobile) ---
+    // --- Title: unit label above the bar (desktop) or under it (mobile),
+    //     with velocity's fold annotation on the line after it ---
     let unit = product.unit_label(prefs);
     let fold_line = folds_at.map(|nyquist_ms| fold_title_line(nyquist_ms, prefs));
     if horizontal {
@@ -1788,21 +1792,23 @@ pub(super) fn render_color_scale(
 /// 36.01 the bar reaches. A marker clamped to the end of the bar would say the
 /// picture folds at 36 — the one number it certainly does not fold at — and a
 /// marker drawn off the end would land in the pane's chrome. Nothing is drawn,
-/// and the `folds ±142` line above the bar still states the limit, which is
-/// the honest half of the annotation: the whole ramp is inside this radar's
-/// unambiguous velocity, so no part of it wraps.
-fn fold_marker_positions(nyquist_ms: f32, min_val: f32, max_val: f32) -> Vec<f32> {
+/// and the `folds ±142` line beside the unit title still states the limit,
+/// which is the honest half of the annotation: the whole ramp is inside this
+/// radar's unambiguous velocity, so no part of it wraps.
+fn fold_marker_positions(nyquist_ms: f32, min_val: f32, max_val: f32) -> Option<[f32; 2]> {
     if !nyquist_ms.is_finite() || nyquist_ms <= 0.0 {
-        return Vec::new();
+        return None;
     }
     if -nyquist_ms < min_val || nyquist_ms > max_val {
-        return Vec::new();
+        return None;
     }
-    vec![-nyquist_ms, nyquist_ms]
+    Some([-nyquist_ms, nyquist_ms])
 }
 
-/// The line under the unit title: where this pane's picture folds, in the unit
-/// the reader chose.
+/// Where this pane's picture folds, in the unit the reader chose — the line
+/// under the unit title on a right-edge bar, and the one after it on a
+/// bottom-edge one, which is the same place both times: the second thing the
+/// legend's caption says.
 ///
 /// Converted through `rustdar-units` like every other user-facing number, so
 /// switching the speed preference relabels the annotation in the same frame it
@@ -2403,23 +2409,25 @@ mod tests {
 
         assert_eq!(
             fold_marker_positions(22.14, min_val, max_val),
-            vec![-22.14, 22.14],
+            Some([-22.14, 22.14]),
             "a TDWR's fold is inside the bar and must be marked at both ends",
         );
-        assert!(
-            fold_marker_positions(63.7, min_val, max_val).is_empty(),
+        assert_eq!(
+            fold_marker_positions(63.7, min_val, max_val),
+            None,
             "a WSR-88D's 63.7 m/s fold was marked on a bar that stops at 36.01",
         );
         // Exactly at the end still counts — that marker is drawable, and it is
         // the boundary a clamp would have been written around.
         assert_eq!(
             fold_marker_positions(max_val, min_val, max_val),
-            vec![-max_val, max_val],
+            Some([-max_val, max_val]),
         );
         // A declaration of zero or a non-finite one describes no fold at all.
         for absurd in [0.0, -22.0, f32::NAN, f32::INFINITY] {
-            assert!(
-                fold_marker_positions(absurd, min_val, max_val).is_empty(),
+            assert_eq!(
+                fold_marker_positions(absurd, min_val, max_val),
+                None,
                 "{absurd} was taken for a fold limit",
             );
         }
