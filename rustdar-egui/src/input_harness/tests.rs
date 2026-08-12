@@ -3677,11 +3677,11 @@ fn a_fresh_session_opens_the_sidebar_only_where_it_is_persistent() {
 ///     drawn X-sec toggle arms the draw and the next frame's probe shows
 ///     it on; a second click on the armed toggle disarms.
 ///
-///     This used to also assert a *swap* — the bar carried a second toggle,
-///     for the 3D region drag, and clicking either un-armed the other,
-///     because one press on one map pane cannot be both a line and a box.
-///     A 3D view's box is the pane's own viewport now, so there is no second
-///     armed mode on the bar and no exclusion left to observe.
+///     It asserts the *swap* too: the bar carries both armed toggles, and
+///     clicking either un-arms the other, because one press on one map pane
+///     cannot be both a line and a box. The two share one gesture detector,
+///     so a bar that let both light at once would hand one press to two
+///     interpreters — and the bar is where a user would see it happen.
 #[test]
 fn the_bars_arm_toggle_arms_and_disarms_through_real_clicks() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -3709,6 +3709,110 @@ fn the_bars_arm_toggle_arms_and_disarms_through_real_clicks() {
     assert!(
         !h.top_bar().section_arm.1,
         "the draw is disarmed but the toggle still shows it armed"
+    );
+
+    // The Region toggle, the same way round.
+    let region = h.top_bar().region_arm;
+    assert!(!region.1, "precondition: the region pick is not armed");
+    h.mouse_click(region.0.center());
+    h.warm_up();
+    assert!(
+        h.region_pick_armed(),
+        "clicking the bar's Region toggle did not arm the pick"
+    );
+    assert!(
+        h.top_bar().region_arm.1,
+        "the pick is armed but the toggle does not show it"
+    );
+
+    // The swap. Arming X-sec from the bar must take the Region arm down with
+    // it, and the bar must say so on the very next frame — a lit toggle for a
+    // mode that is off is the state a user would act on.
+    h.mouse_click(h.top_bar().section_arm.0.center());
+    h.warm_up();
+    assert!(
+        h.section_draw_armed() && !h.region_pick_armed(),
+        "arming the draw left the region pick armed - one press on one map pane \
+         would be both a line and a box, through one shared detector"
+    );
+    assert!(
+        h.top_bar().section_arm.1 && !h.top_bar().region_arm.1,
+        "the bar shows {:?} for the two arms, which is not the state the Gui is in",
+        (h.top_bar().section_arm.1, h.top_bar().region_arm.1),
+    );
+
+    // And back the other way, so neither toggle is the privileged one.
+    h.mouse_click(h.top_bar().region_arm.0.center());
+    h.warm_up();
+    assert!(
+        h.region_pick_armed() && !h.section_draw_armed(),
+        "arming the region pick left the cross-section draw armed"
+    );
+    assert!(
+        h.top_bar().region_arm.1 && !h.top_bar().section_arm.1,
+        "the bar shows {:?} for the two arms after the reverse swap",
+        (h.top_bar().section_arm.1, h.top_bar().region_arm.1),
+    );
+}
+
+/// The phone bar carries **both** arm icons, and each one works.
+///
+/// Below the Compact breakpoint the top bar is stripped to the wordmark, the
+/// scan chip and the two arms — everything else the wide bar carries moves to
+/// the bottom bar and the sheet. The arms stay because their whole point is
+/// being visible while armed: a mode the user has forgotten they are in is the
+/// classic failure of a modal drag, and on a phone there is no menu on screen
+/// to notice it in.
+///
+/// Both are exercised, and the swap between them, because the phone bar is a
+/// second rendering of the same two toggles — a route that armed nothing, or
+/// that let both light at once, would be invisible to every test of the wide
+/// bar.
+#[test]
+fn the_phone_bar_carries_both_arms_and_they_still_exclude_each_other() {
+    let mut h = InputHarness::with_screen(egui::vec2(420.0, 1200.0));
+    assert_eq!(
+        h.width_class(),
+        crate::ui_layout::WidthClass::Compact,
+        "precondition: this must be the phone bar, not the wide one",
+    );
+
+    let region = h.top_bar().region_arm;
+    assert!(
+        region.0.is_positive(),
+        "the phone bar drew no Region arm, so a phone user has no route to the \
+         one control that buys resolution",
+    );
+    h.mouse_click(region.0.center());
+    h.warm_up();
+    assert!(
+        h.region_pick_armed(),
+        "clicking the phone bar's Region arm did not arm the pick",
+    );
+    assert!(
+        h.top_bar().region_arm.1,
+        "the pick is armed but the phone bar's icon does not show it",
+    );
+
+    // The exclusion, on this bar's own two icons.
+    h.mouse_click(h.top_bar().section_arm.0.center());
+    h.warm_up();
+    assert!(
+        h.section_draw_armed() && !h.region_pick_armed(),
+        "the phone bar armed the draw and left the pick armed - one press on one \
+         map pane would be both a line and a box",
+    );
+    assert!(
+        !h.top_bar().region_arm.1,
+        "the phone bar still lights the Region arm for a mode that is off",
+    );
+
+    // And off again, so neither icon is one-way.
+    h.mouse_click(h.top_bar().section_arm.0.center());
+    h.warm_up();
+    assert!(
+        !h.section_draw_armed() && !h.region_pick_armed(),
+        "a second click on the phone bar's X-sec arm did not disarm it",
     );
 }
 
@@ -3800,11 +3904,12 @@ fn the_bar_never_overlaps_at_mediums_narrowest_width() {
 
     let probe = h.top_bar();
     let bar = probe.rect.expand(0.5);
-    let arms = [probe.section_arm.0];
+    let arms = [probe.section_arm.0, probe.region_arm.0];
     for (name, rect) in [
         ("the \u{2630} button", probe.menu_button),
         ("the Layers toggle", probe.layers_toggle.0),
         ("the X-sec toggle", probe.section_arm.0),
+        ("the Region toggle", probe.region_arm.0),
     ] {
         assert!(
             bar.contains_rect(rect),
@@ -8129,6 +8234,48 @@ fn the_menus_checkbox_arms_the_cross_section_draw() {
     );
 }
 
+/// The dropdown's other arm entry, on the same terms: it arms the 3D region
+/// pick, closes itself over the map the box has to be dragged on, shows the
+/// mode it turned on when reopened, and turns it off again.
+///
+/// A separate test rather than a parameterised one, because the two entries are
+/// not interchangeable — their labels differ, their dispatch arms differ, and
+/// the failure this catches is an entry that renders and dispatches nothing.
+/// The exclusion between them is asserted where a user would see it, on the top
+/// bar's two toggles.
+#[test]
+fn the_menus_checkbox_arms_the_3d_region_pick() {
+    let mut h = compact_with_menu();
+    h.load_scan("KTLX");
+    assert!(!h.region_pick_armed(), "precondition: it starts unarmed");
+    assert_eq!(
+        h.menu_leaf(crate::ui::PICK_REGION_LABEL).map(|l| l.value),
+        Some(Some(false)),
+        "precondition: the dropdown must draw the toggle, unchecked"
+    );
+
+    h.mouse_click(clickable_leaf(&h, crate::ui::PICK_REGION_LABEL).center());
+    h.frames_for(3, FRAME_DT);
+
+    assert!(h.region_pick_armed(), "the checkbox did not arm the pick");
+    assert_eq!(
+        h.menu_leaf(crate::ui::PICK_REGION_LABEL),
+        None,
+        "the dropdown stayed open over the map the box has to be dragged on"
+    );
+
+    h.open_menu();
+    assert_eq!(
+        h.menu_leaf(crate::ui::PICK_REGION_LABEL).map(|l| l.value),
+        Some(Some(true)),
+        "the checkbox does not show the mode it just turned on"
+    );
+
+    h.mouse_click(clickable_leaf(&h, crate::ui::PICK_REGION_LABEL).center());
+    h.frames_for(3, FRAME_DT);
+    assert!(!h.region_pick_armed(), "the checkbox could not turn it off");
+}
+
 /// 55. **An armed drag on a map becomes a section aimed where it was drawn.**
 ///     (Renumbered from a colliding 45.)
 ///
@@ -9372,7 +9519,7 @@ fn a_tap_while_armed_draws_nothing_and_leaves_the_mode_armed() {
 ///     does not pan** — for every pane the frame resolves, not just the one
 ///     the line is on. (Renumbered from a colliding 47.)
 ///
-///     `ArmedSectionFrame` makes both properties of the returned value
+///     `ArmedDragFrame` makes both properties of the returned value
 ///     rather than rules each caller remembers, and this reads them back out
 ///     of the probe `render_panes` records from the very locals that feed
 ///     `PaneRenderCtx` and `drag_pan_buttons`.

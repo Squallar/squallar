@@ -253,9 +253,14 @@ impl VolumeRegionConfig {
 /// The *region* is here rather than derived, and that is the difference between
 /// it and the grid — it is a choice the user made, and losing it on restart
 /// would silently put a carefully aimed 20 km box back to the whole ring with
-/// the pane still claiming to be a 3D view of a storm. That claim used to be
-/// false: the region was measured off the viewport every frame and there was
-/// nothing here to save. It is true now.
+/// the pane still claiming to be a 3D view of a storm.
+///
+/// That claim was false twice over and is now true. First the region was
+/// measured off the viewport every frame, so there was nothing here to save.
+/// Then it was stored and these keys were written — but nothing in the program
+/// could put a `Some` in the field, so the block was never exercised by
+/// anything a user could do. The region selector is what closed the second gap:
+/// a picked box is written here, and comes back.
 ///
 /// Flat `f64`s and `f32`s throughout, never the domain types, for the reason
 /// [`SectionLineConfig`] gives: serde reads any number into these, and the
@@ -290,6 +295,19 @@ struct VolumeConfig {
     /// The ground this pane resamples, or absent for the volume's own reach.
     /// See [`crate::pane::VolumePane::region`] and [`VolumeRegionConfig`].
     region: Option<VolumeRegionConfig>,
+    /// Which map pane the region was dragged on, or absent for a pane nobody
+    /// aimed. See [`crate::pane::VolumePane::source_pane`].
+    ///
+    /// Beside the region rather than inside [`VolumeRegionConfig`], mirroring
+    /// the memory representation exactly — and for the same reason it is
+    /// outside `VolumeRegion` there: it is a fact about where the choice came
+    /// from, not about the box, and the two go stale at different times. A
+    /// restore into a narrower layout drops this and keeps the region, which is
+    /// only expressible if they are separate keys.
+    ///
+    /// A bare `usize`, validated on the way back in against the restored pane
+    /// count, exactly as [`SectionLineConfig::source_pane`] is.
+    source_pane: Option<usize>,
 }
 
 /// Deserialize a [`crate::pane::VolumeViewMode`], falling back to the default
@@ -334,6 +352,11 @@ impl VolumeConfig {
             // comparing four `f64`s against a default that has none would be
             // arithmetic where a presence test is exact.
             || self.region.is_some()
+            // Not folded into the line above: a pane can hold a source with no
+            // region only transiently, but the *file* must round-trip whatever
+            // it was handed rather than deciding that one field implies the
+            // other. A presence test for the same reason.
+            || self.source_pane.is_some()
     }
 }
 
@@ -363,6 +386,8 @@ impl Default for VolumeConfig {
             // No region picked: the volume's own reach. Matches
             // `VolumePane`'s derived default, which is the same `None`.
             region: None,
+            // Nobody aimed it, so it came from nowhere.
+            source_pane: None,
         }
     }
 }
@@ -1165,6 +1190,7 @@ fn content_config(
                     half_east_km: region.half_east_km(),
                     half_north_km: region.half_north_km(),
                 }),
+                source_pane: map.volume.source_pane,
             };
             // Every float that reaches the file, not merely the three angles:
             // `serde_json` writes a non-finite `f32` as `null`, which comes back
@@ -1244,7 +1270,12 @@ fn content_config(
 /// difference the collapse makes here: while 3D was a pane *kind*, a bad camera
 /// left nothing for the pane to be and it had to become a map; now falling back
 /// to the plan view **is** the same pane.
-fn restore_map(pane_idx: usize, pc: &PaneConfig, render: MapRender) -> PaneContent {
+fn restore_map(
+    pane_idx: usize,
+    pc: &PaneConfig,
+    render: MapRender,
+    pane_count: usize,
+) -> PaneContent {
     let Some(saved) = pc.volume.as_ref() else {
         // No 3D state at all. Ordinary for a pane that has never been in the
         // mode, and for every config written before it existed — the camera is
@@ -1282,6 +1313,28 @@ fn restore_map(pane_idx: usize, pc: &PaneConfig, render: MapRender) -> PaneConte
             // a plain plan view — a pane that cannot place its region is still
             // a perfectly good 3D view of the whole ring.
             region: saved.region.as_ref().and_then(VolumeRegionConfig::restore),
+            // A layout saved wider than the one being restored — six panes
+            // opened on a phone — brings back indices that now name a different
+            // pane or no pane at all. Dropped rather than clamped, for the
+            // reason a section's is: re-aiming a 3D view from whichever map
+            // happens to sit at a nearby index is worse than treating it as
+            // never having been aimed from anywhere.
+            //
+            // The region itself survives this. It is ground, and ground does
+            // not stop existing because the map it was drawn on did — the pane
+            // comes back showing exactly what it showed, which is the whole of
+            // the 1:1 reopen rule. What is lost is only the *preference* that a
+            // future drag on that map re-aims this pane.
+            source_pane: saved.source_pane.filter(|idx| {
+                let inside = *idx < pane_count;
+                if !inside {
+                    log::warn!(
+                        "pane {pane_idx}'s 3D region was picked on pane {idx}, which this \
+                         layout does not have; forgetting where it came from"
+                    );
+                }
+                inside
+            }),
             // A restored pane holds nothing built, so `rendered_for: None` is
             // what makes the dispatcher resample against whatever volume the
             // pane's site loads.
@@ -1332,11 +1385,11 @@ fn restore_content(pane_idx: usize, pc: &PaneConfig, pane_count: usize) -> PaneC
     match pc.kind {
         // `render` says which of the two pictures, and `volume` — absent for a
         // pane that has never been in 3D — says how the 3D one is posed.
-        PaneKindConfig::Map => restore_map(pane_idx, pc, pc.render),
+        PaneKindConfig::Map => restore_map(pane_idx, pc, pc.render, pane_count),
         // A build in which 3D was a pane kind of its own wrote no `render` key
         // at all, so the mode has to come from the kind. Same pane, same
         // ground, same camera: only where the fact is written has changed.
-        PaneKindConfig::Volume => restore_map(pane_idx, pc, MapRender::Volume),
+        PaneKindConfig::Volume => restore_map(pane_idx, pc, MapRender::Volume, pane_count),
         PaneKindConfig::CrossSection => {
             // A kind with no sub-config. Not merely missing state: it says the
             // file was written by something that did not agree with itself, and a

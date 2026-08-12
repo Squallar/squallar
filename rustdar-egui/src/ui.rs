@@ -36,9 +36,6 @@ mod map_overlays;
 mod popups;
 #[path = "ui_menu.rs"]
 mod ui_menu;
-/// The cross-section arming toggle's label, for the same reason.
-#[cfg(test)]
-pub(crate) use ui_menu::DRAW_CROSS_SECTION_LABEL;
 /// What the menu presentations actually drew last frame, for the input harness.
 #[cfg(test)]
 pub(crate) use ui_menu::DrawnMenuLeaf;
@@ -50,6 +47,9 @@ pub(crate) use ui_menu::DrawnMenuLeaf;
 /// the entry up by name cannot go on passing after it is renamed.
 #[cfg(test)]
 pub(crate) use ui_menu::VOLUME_PANE_LABEL;
+/// The cross-section arming toggle's label, for the same reason.
+#[cfg(test)]
+pub(crate) use ui_menu::{DRAW_CROSS_SECTION_LABEL, PICK_REGION_LABEL};
 #[path = "ui_map.rs"]
 pub(crate) mod map;
 /// The 3D block's sidebar header, for the input harness — so the test that
@@ -170,6 +170,8 @@ pub(crate) struct TopBarProbe {
     pub pane_count_max: usize,
     /// The X-sec arm toggle, and whether it read as armed.
     pub section_arm: (egui::Rect, bool),
+    /// The Region arm toggle, and whether it read as armed.
+    pub region_arm: (egui::Rect, bool),
     /// The ⚙ Inspector toggle, and whether it read as open.
     pub inspector_toggle: (egui::Rect, bool),
     /// The phone bar's scan summary chip text, verbatim — the short form
@@ -192,6 +194,7 @@ impl Default for TopBarProbe {
             layers_toggle: (egui::Rect::NOTHING, false),
             pane_count_max: 0,
             section_arm: (egui::Rect::NOTHING, false),
+            region_arm: (egui::Rect::NOTHING, false),
             inspector_toggle: (egui::Rect::NOTHING, false),
             scan_text: String::new(),
             collapse: egui::Rect::NOTHING,
@@ -706,6 +709,12 @@ pub struct Gui {
     /// geometry, never the stale pre-drag line.
     #[cfg(test)]
     last_section_tracks: Vec<(usize, usize, egui::Pos2, egui::Pos2)>,
+    /// The committed region boxes the last frame painted over map panes: map
+    /// pane, 3D pane, and the painted rect. Only read by tests — the pin that a
+    /// box is drawn on the map it was picked on and on no other, which is the
+    /// only on-screen answer to "where is that volume from".
+    #[cfg(test)]
+    last_region_boxes: Vec<(usize, usize, egui::Rect)>,
     /// The Volume Alpha corner buttons the last frame drew, per pane. Only
     /// read by tests — the M8 pin that the fade hides pane-borne chrome too.
     #[cfg(test)]
@@ -845,12 +854,11 @@ pub struct Gui {
     /// was turned on; and [`Self::dismiss_top_layer`] cancels it, so Escape and
     /// Android's back button both mean what they mean everywhere else.
     ///
-    /// The only armed modal drag left on a map pane. It had a sibling — a
-    /// "pick a 3D region" mode whose drag drew the box a 3D pane resampled —
-    /// and the two had to be kept mutually exclusive, because one press cannot
-    /// be two gestures. That mode is gone: a 3D view's box is now the pane's
-    /// own viewport, so there is nothing left to aim and nothing left to
-    /// exclude.
+    /// One of the two armed modal drags on a map pane; the other is
+    /// [`region_pick_armed`](Self::region_pick_armed). They are held mutually
+    /// exclusive by their setters, because one press cannot be two gestures,
+    /// and they share one detector for the same reason — see
+    /// [`crate::ui_input::ArmedDragGesture`].
     section_draw_armed: bool,
     /// The in-flight draw: where it started, on which pane, and where the
     /// pointer is now.
@@ -867,6 +875,43 @@ pub struct Gui {
     /// would be drawn in the right place and clicked in the wrong one, for one
     /// frame, with nothing to say so.
     pending_section_line: Option<(PaneId, crate::pane::SectionLine)>,
+    /// Whether the 3D region pick is **armed**: the next drag on a map pane
+    /// draws the square of ground a 3D view will resample, rather than panning.
+    ///
+    /// Armed-modal rather than a modifier-drag, for the reason
+    /// [`section_draw_armed`](Self::section_draw_armed) is — a shift-drag has
+    /// no touch equivalent and one wasm binary serves phones and desktop
+    /// browsers alike — and cancellable the same three ways: the toggle it was
+    /// armed from, Escape, and Android's back button through
+    /// [`Self::dismiss_top_layer`].
+    ///
+    /// # Why this mode exists at all
+    ///
+    /// The grid is a fixed cell count, so a picked region is not a crop — it is
+    /// the **only** control that buys resolution. At the shipped 512 cells a
+    /// 920 km ring is 1.80 km per cell; a 230 km region over the same cells is
+    /// 0.45, and a 100 km one is 0.20. Zoom moves the eye and cannot do this,
+    /// deliberately (see `ui_region`), which leaves this drag as the whole of
+    /// the answer to "show me that storm in detail".
+    ///
+    /// Global rather than per-pane, like the section arm and for its reason:
+    /// the pane it applies to is not knowable when it is ticked. The user arms
+    /// the mode and *then* chooses a map to drag on, and choosing it is the
+    /// same press that starts the box.
+    region_pick_armed: bool,
+    /// The in-flight box: which pane it is being dragged on, where its centre
+    /// was fixed, and how wide it currently stands. See
+    /// [`crate::ui_region::RegionDrag`].
+    region_drag: Option<crate::ui_region::RegionDrag>,
+    /// A finished region and the map pane it was dragged on, applied **after**
+    /// the pane loop.
+    ///
+    /// Deferred for [`pending_section_line`](Self::pending_section_line)'s
+    /// second reason exactly: applying one can *grow the pane count*, and
+    /// `PaneLayout::pane_rect` is a function of it — so a mid-loop growth moves
+    /// the rects of every pane the loop has not reached yet away from the ones
+    /// `detect_active_pane_click` hit-tested at the top of this same frame.
+    pending_region: Option<(PaneId, crate::pane::VolumeRegion)>,
     /// An endpoint drag in flight on a committed section's ground track, or
     /// `None`.
     ///
@@ -1695,6 +1740,8 @@ impl Gui {
             #[cfg(test)]
             last_section_tracks: Vec::new(),
             #[cfg(test)]
+            last_region_boxes: Vec::new(),
+            #[cfg(test)]
             last_alpha_buttons: Vec::new(),
             #[cfg(test)]
             last_paint_order: Vec::new(),
@@ -1731,6 +1778,9 @@ impl Gui {
             section_draw_armed: false,
             section_anchor: None,
             pending_section_line: None,
+            region_pick_armed: false,
+            region_drag: None,
+            pending_region: None,
             section_edit_drag: None,
             section_handles: Vec::new(),
             pending_section_edit: None,
@@ -1829,10 +1879,12 @@ impl Gui {
             // loop, so a leftover entry would report a 3D arm that did not run.
             self.last_volume_arms.clear();
             // Per-frame paint records of the pane loop, on the same terms:
-            // the borders, the section tracks and the Volume Alpha corner
-            // buttons are all re-painted (or legitimately absent) each frame.
+            // the borders, the section tracks, the region boxes and the Volume
+            // Alpha corner buttons are all re-painted (or legitimately absent)
+            // each frame.
             self.last_pane_borders.clear();
             self.last_section_tracks.clear();
+            self.last_region_boxes.clear();
             self.last_alpha_buttons.clear();
             self.last_paint_order.clear();
             // Cleared like the rest: the picker redraws from the top bar every
@@ -1925,6 +1977,13 @@ impl Gui {
         // moves `pane_rect` for every pane. Inside the loop that would leave the
         // panes drawn after it hit-tested against rects they are no longer in.
         self.apply_pending_section_line();
+        // The other modal drag's applier, on the same footing: it grows the
+        // layout through the same `grown_pane`, so it must be outside the loop
+        // for the same reason. Never both in one frame — the two modes are held
+        // mutually exclusive by their setters and share one detector — so the
+        // order between these two is unobservable, and they are adjacent so
+        // that the growth argument is read once for both.
+        self.apply_pending_region();
         // After the modal-draw applier, so if both somehow fired in one frame
         // the dropped edit — the later write — would win. The case is
         // unreachable: an armed draw makes the handles inert, and beginning a
@@ -2499,6 +2558,14 @@ impl Gui {
         //
         if self.section_draw_armed {
             self.set_section_draw_armed(false);
+            return true;
+        }
+        // The second armed mode, on the same footing and for the same reasons.
+        // Never both — the setters hold them exclusive — so the order between
+        // these two arms is unobservable, and they are adjacent so that a third
+        // mode is added here rather than somewhere it would be missed.
+        if self.region_pick_armed {
+            self.set_region_pick_armed(false);
             return true;
         }
         false
@@ -3536,15 +3603,62 @@ impl Gui {
     /// mode it belongs to is off, and leaving it would make re-arming resume a
     /// drag the user abandoned minutes ago.
     ///
+    /// Arming disarms the **region pick**, and that exclusion is the reason
+    /// both modes go through a setter rather than writing the flag: one press
+    /// on one map pane cannot be both a line and a box, and the two share one
+    /// detector, so a frame with both armed would hand one gesture to two
+    /// interpreters. The mode asked for last wins, which is the only reading a
+    /// user can predict from a control they just operated.
     pub fn set_section_draw_armed(&mut self, armed: bool) {
         self.section_draw_armed = armed;
         if armed {
             // An endpoint drag cannot share a map with an armed draw, and the
             // mode was asked for last.
             self.section_edit_drag = None;
+            self.region_pick_armed = false;
+            self.region_drag = None;
         } else {
             self.section_anchor = None;
         }
+    }
+
+    /// Whether the 3D region pick is armed.
+    pub fn region_pick_armed(&self) -> bool {
+        self.region_pick_armed
+    }
+
+    /// Arm or disarm the 3D region pick.
+    ///
+    /// The mirror of [`Self::set_section_draw_armed`], and deliberately the
+    /// same shape: disarming drops a half-dragged box for the reason that one
+    /// drops a half-drawn line, and arming clears the section mode and any
+    /// section drag in flight, because one press cannot be two gestures.
+    pub fn set_region_pick_armed(&mut self, armed: bool) {
+        self.region_pick_armed = armed;
+        if armed {
+            self.section_edit_drag = None;
+            self.section_draw_armed = false;
+            self.section_anchor = None;
+        } else {
+            self.region_drag = None;
+        }
+    }
+
+    /// The box being dragged on pane `pane_idx` right now — its centre and its
+    /// half-width in kilometres — or `None`.
+    ///
+    /// Geographic, unlike [`Self::section_rubber_band`]'s pixels, and the
+    /// difference is real rather than an inconsistency. A rubber band is a
+    /// preview of a *gesture* and should track the finger exactly through a
+    /// mid-drag wheel zoom. A region box is a preview of *ground*: the drag's
+    /// centre was fixed on the press frame and its half-width is measured in
+    /// kilometres, so drawing it through the projector is what makes it stay
+    /// over the same ground when the map moves under it — which is what the
+    /// committed box will do.
+    pub(crate) fn region_preview(&self, pane_idx: PaneId) -> Option<(crate::pane::GeoPoint, f64)> {
+        self.region_drag
+            .filter(|drag| drag.pane_idx() == pane_idx)
+            .map(|drag| (drag.centre(), drag.half_width_km()))
     }
 
     /// The rubber band to draw on pane `pane_idx`, in screen points, or `None`.
@@ -3614,7 +3728,7 @@ impl Gui {
 
         let target = self
             .section_pane_sourced_from(source)
-            .or_else(|| self.grown_section_pane())
+            .or_else(|| self.grown_pane())
             .or_else(|| self.lowest_section_pane())
             .or_else(|| self.highest_pane_other_than(source))
             // Total by construction: `highest_pane_other_than` only answers
@@ -3643,6 +3757,133 @@ impl Gui {
             section.rendered_for = None;
         }
         self.active_pane = target;
+    }
+
+    /// Give the region this frame dragged to a pane, converting or creating one
+    /// if need be.
+    ///
+    /// Called from [`Self::ui`] after the pane loop, beside
+    /// [`Self::apply_pending_section_line`] and for its reason: this can grow
+    /// the pane count, and a mid-loop growth moves the rects of every pane the
+    /// loop has not reached yet away from the ones `detect_active_pane_click`
+    /// hit-tested at the top of this same frame.
+    ///
+    /// # The target rule is total, and it is the section rule's shape
+    ///
+    /// A dragged region always lands somewhere. Five steps, in order:
+    ///
+    /// 1. **A 3D pane already sourced from this map.** A second drag on a map
+    ///    the user has already aimed a 3D view from means "look *there*
+    ///    instead", not "give me another 3D view" — otherwise adjusting a box
+    ///    three times fills the screen with panes nobody asked for. This is the
+    ///    common case after the first drag, and it is why
+    ///    [`VolumePane::source_pane`](crate::pane::VolumePane::source_pane)
+    ///    exists.
+    /// 2. **Grow the layout.** A 3D view beside the map it was picked from is
+    ///    the picture the feature is for, and it costs the user nothing they
+    ///    had — in particular it does not cost them the map they just dragged
+    ///    on, which they will want again to adjust the box.
+    /// 3. **The lowest-indexed 3D pane**, whatever map aimed it. The layout is
+    ///    full; re-aiming an existing 3D view is the cheapest thing that can
+    ///    still answer, and it beats converting because converting destroys a
+    ///    pane the user set up.
+    /// 4. **The highest-indexed pane that is not the one dragged on.** A real
+    ///    loss, so it is last but one — and it is *there*, because the
+    ///    alternative is a drag that silently does nothing, which is
+    ///    indistinguishable from one the app failed to receive. The pane
+    ///    dragged on is excluded because taking the map out from under the box
+    ///    the user just drew, while other panes exist to spend, is the one
+    ///    conversion that is certainly wrong.
+    /// 5. **The pane dragged on.** Reachable only in a one-pane layout that
+    ///    cannot grow — a phone in portrait — and right there: on a screen with
+    ///    room for one thing, asking for a 3D region is asking to look at it.
+    ///    Nothing is lost that a plan view cannot restore, because 3D is a
+    ///    *render mode* of the same map pane: the site, the product, the
+    ///    viewport and the plan view itself all survive, and the mode toggle is
+    ///    the way back.
+    ///
+    /// # Why the target takes the source map's site and moment
+    ///
+    /// The region names **ground**, and a 3D pane left on another site would
+    /// resample its own radar over it — a box drawn on an Oklahoma map filled
+    /// with a Florida volume, registered to the wrong place and captioned as if
+    /// it were right. So the site, the product and the scan follow the region,
+    /// exactly as they follow a section line.
+    fn apply_pending_region(&mut self) {
+        let Some((source, region)) = self.pending_region.take() else {
+            return;
+        };
+
+        let (source_product, source_site, source_scan) = match self.panes.get(source) {
+            Some(pane) => (
+                pane.selected_product,
+                pane.site.clone(),
+                pane.scan_info.clone(),
+            ),
+            None => {
+                log::warn!("pane {source} picked a 3D region and is already gone");
+                return;
+            }
+        };
+
+        let target = self
+            .volume_pane_sourced_from(source)
+            .or_else(|| self.grown_pane())
+            .or_else(|| self.lowest_volume_pane())
+            .or_else(|| self.highest_pane_other_than(source))
+            // Total by construction: `highest_pane_other_than` only answers
+            // `None` in a one-pane layout, and in one the source *is* the only
+            // pane there is. A dragged region is never silently dropped.
+            .unwrap_or(source);
+
+        let Some(pane) = self.panes.get_mut(target) else {
+            log::warn!("no pane could hold the region picked on pane {source}");
+            return;
+        };
+        // A cross-section pane has no render mode, so the kind comes first.
+        // `set_kind` keeps everything about what the pane is looking at, and
+        // `set_map_render` does nothing at all for a pane already in 3D — which
+        // is step 1's whole case, and is what keeps a re-aim from throwing away
+        // the camera the user spent a while aiming.
+        pane.set_kind(crate::pane::PaneKind::Map);
+        pane.set_map_render(crate::pane::MapRender::Volume);
+        pane.selected_product = source_product;
+        pane.site = source_site;
+        pane.scan_info = source_scan;
+        if let Some(volume) = pane.volume_mut() {
+            volume.region = Some(region);
+            volume.source_pane = Some(source);
+            // The picture on screen is of the old box, which a fresh drag can
+            // put across the state from. Blanked rather than left to the
+            // staleness key — which would notice, `region` being part of
+            // `VolumeTarget` — because a volume of somewhere else entirely is
+            // wrong for as long as it stands, and the rebuild is not instant.
+            // This is `apply_pending_section_line`'s judgement, and the
+            // handle-drop's opposite one does not apply: a picked region is a
+            // new aim, not the repeating step of walking a box through a storm.
+            volume.rendered_for = None;
+        }
+        self.active_pane = target;
+    }
+
+    /// The first 3D pane whose region was dragged on `source`.
+    fn volume_pane_sourced_from(&self, source: PaneId) -> Option<PaneId> {
+        (0..self.visible_pane_count()).find(|&idx| {
+            self.panes[idx]
+                .volume()
+                .is_some_and(|v| v.source_pane == Some(source))
+        })
+    }
+
+    /// The lowest-indexed pane currently drawing its volume, whatever aimed it.
+    ///
+    /// [`PaneState::volume`](crate::pane::PaneState::volume) rather than
+    /// [`PaneState::map`](crate::pane::PaneState::map), so this answers only for
+    /// a pane *actually in* the 3D render mode. A plan-view pane keeps a camera
+    /// and a region across the switch, and treating one as a 3D pane here would
+    /// silently flip a map the user is reading.
+    fn lowest_volume_pane(&self) -> Option<PaneId> {
+        (0..self.visible_pane_count()).find(|&idx| self.panes[idx].volume().is_some())
     }
 
     /// Write a dropped handle's line onto the section pane it belongs to.
@@ -3694,7 +3935,11 @@ impl Gui {
     }
 
     /// A new pane at the end of the layout, or `None` if the layout is full.
-    fn grown_section_pane(&mut self) -> Option<PaneId> {
+    ///
+    /// Shared by both target rules — a section line's and a 3D region's —
+    /// because "is there room for one more, and if so which index is it" is a
+    /// question about the layout and not about what will fill the pane.
+    fn grown_pane(&mut self) -> Option<PaneId> {
         let wanted = self.pane_layout.pane_count + 1;
         if wanted > self.layout.width.max_panes() {
             return None;
@@ -3745,6 +3990,13 @@ impl Gui {
     #[cfg(test)]
     pub(crate) fn section_tracks_for_test(&self) -> &[(usize, usize, egui::Pos2, egui::Pos2)] {
         &self.last_section_tracks
+    }
+
+    /// The committed region boxes the last frame painted: map pane, 3D pane,
+    /// and the painted rect.
+    #[cfg(test)]
+    pub(crate) fn region_boxes_for_test(&self) -> &[(usize, usize, egui::Rect)] {
+        &self.last_region_boxes
     }
 
     /// Pane `idx`'s dispatched kinds in paint order, with the layer each

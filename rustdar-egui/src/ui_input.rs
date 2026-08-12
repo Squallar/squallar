@@ -702,7 +702,7 @@ impl LongPressDetector {
 /// The shortest drag, in points, that becomes a cross-section line.
 ///
 /// Below it the drag is discarded **and the mode stays armed** — see
-/// [`SectionGesture::Released`]. A stray tap on a map is the single most likely
+/// [`ArmedDragGesture::Released`]. A stray tap on a map is the single most likely
 /// thing to happen right after arming the mode (it is how a user checks the
 /// pane is the one they meant), and turning that into a zero-ish-length section
 /// somewhere, or worse into a silent disarm, both lose the intent the user just
@@ -714,119 +714,139 @@ impl LongPressDetector {
 /// short enough that a deliberate short section near a site is still drawable.
 pub(crate) const MIN_SECTION_DRAG_PT: f32 = 24.0;
 
-/// What the armed cross-section draw saw this frame, in **screen** space.
+/// What an armed modal drag saw this frame, in **screen** space.
 ///
 /// Screen space is all this can honestly report: the detector runs before the
 /// map's projector exists. Turning a position into ground is the caller's job
 /// and has to happen on the frame it is reported — see
 /// [`Anchored`](Self::Anchored).
+///
+/// # Why one gesture type serves both armed modes
+///
+/// There are two: the cross-section draw and the 3D region pick. They are
+/// **mutually exclusive by construction** — each arming setter disarms the
+/// other, because one press cannot be two gestures — so at most one of them is
+/// interpreting this stream on any frame. What differs between them is what a
+/// press, a drag and a release *mean*, and that lives in the two `track_*`
+/// arms in `ui_map`; what a press, a drag and a release *are* is this, and a
+/// second copy of it is how the two modes come to disagree about when a
+/// cancelled touch ends a gesture.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum SectionGesture {
+pub(crate) enum ArmedDragGesture {
     /// Armed, nothing under the pointer.
     Idle,
     /// The pointer went down this frame.
     ///
     /// **The caller must convert this to ground now, on this frame.** A pixel
-    /// denotes different ground after any viewport change, and the draw mode
-    /// suppresses panning but *not* zooming — a wheel notch mid-drag is an
+    /// denotes different ground after any viewport change, and both armed modes
+    /// suppress panning but *not* zooming — a wheel notch mid-drag is an
     /// ordinary thing to do and would otherwise silently move the anchor.
     Anchored(egui::Pos2),
-    /// Still down, now here. For the rubber band; nothing is committed.
+    /// Still down, now here. For the preview — a rubber band or a box; nothing
+    /// is committed.
     Dragging(egui::Pos2),
     /// The pointer came up this frame, here.
     ///
-    /// Whether this is a line is deliberately **not** decided here: the length
-    /// test is against [`MIN_SECTION_DRAG_PT`] and a failing one leaves the mode
-    /// armed, which is a decision about the mode rather than about the pointer.
+    /// Whether this is a line or a box is deliberately **not** decided here.
+    /// Each mode has its own bar — [`MIN_SECTION_DRAG_PT`] in points for a
+    /// line, [`rustdar_radar::voxel::MIN_HALF_WIDTH_KM`] in kilometres for a
+    /// box — and a failing one leaves the mode armed, which is a decision about
+    /// the mode rather than about the pointer.
     Released(egui::Pos2),
     /// The pointer went away without releasing — a cancelled touch, or the
-    /// cursor leaving the window. No line, and the anchor is dropped.
+    /// cursor leaving the window. Nothing committed, and the anchor is dropped.
     Cancelled,
 }
 
-/// Turns the pointer into a [`SectionGesture`] while the draw mode is armed.
+/// Turns the pointer into an [`ArmedDragGesture`] while either modal drag is
+/// armed.
 ///
 /// Fed from [`PointerTracker::read`] for the same reason [`LongPressDetector`]
 /// is: egui's raw `pointer.down` stays latched `true` forever after a cancelled
-/// touch, and a draw that never ends would leave `suppress_pan` on and the map
+/// touch, and a drag that never ends would leave `suppress_pan` on and the map
 /// un-pannable with nothing on screen to say why.
 #[derive(Clone, Default)]
-pub(crate) struct SectionLineDetector {
-    /// Whether a press has opened a draw that no release has closed.
+pub(crate) struct ArmedDragDetector {
+    /// Whether a press has opened a drag that no release has closed.
     drawing: bool,
 }
 
-impl SectionLineDetector {
+impl ArmedDragDetector {
     /// Process this frame's pointer and say what the draw is doing.
     ///
     /// A press always re-anchors, even part-way through an existing draw: the
     /// only ways to get one are a fresh finger and a fresh button, and both
     /// mean "start here" more plausibly than they mean "ignore me".
-    pub(crate) fn update(&mut self, input: PointerFrame) -> SectionGesture {
+    pub(crate) fn update(&mut self, input: PointerFrame) -> ArmedDragGesture {
         if input.pressed {
             self.drawing = true;
-            return SectionGesture::Anchored(input.pos);
+            return ArmedDragGesture::Anchored(input.pos);
         }
         if !self.drawing {
-            return SectionGesture::Idle;
+            return ArmedDragGesture::Idle;
         }
         if input.released {
             self.drawing = false;
-            return SectionGesture::Released(input.pos);
+            return ArmedDragGesture::Released(input.pos);
         }
         // `down` is the tracker's corrected answer, not egui's latched one, so
         // this is where a cancelled touch actually ends the draw.
         if !input.down {
             self.drawing = false;
-            return SectionGesture::Cancelled;
+            return ArmedDragGesture::Cancelled;
         }
-        SectionGesture::Dragging(input.pos)
+        ArmedDragGesture::Dragging(input.pos)
     }
 }
 
-/// The active pane's resolved state for a frame in which the cross-section draw
-/// is armed: what the draw saw, and the pointer frame the rest of the pane loop
+/// The active pane's resolved state for a frame in which either modal drag is
+/// armed: what the drag saw, and the pointer frame the rest of the pane loop
 /// must use.
 ///
 /// # Why this is a type and not two return values
 ///
-/// While the mode is armed, two things must be true of *every* pane the frame
-/// resolves: the map must not pan (the drag belongs to the line) and no overlay
-/// click may fire (a press on a warning polygon is the start of a section, not a
-/// request to open it). Both are properties of being armed rather than
-/// judgements about the pointer, so they are established by
+/// While a mode is armed, two things must be true of *every* pane the frame
+/// resolves: the map must not pan (the drag belongs to the mode) and no overlay
+/// click may fire (a press on a warning polygon is the start of a section or a
+/// region box, not a request to open it). Both are properties of being armed
+/// rather than judgements about the pointer, so they are established by
 /// [`Self::new`] — the only constructor — and the field is private. A caller
 /// cannot forget them, because there is no value of this type for which they are
 /// false.
+///
+/// The two modes need exactly the same three answers, which is why one type
+/// serves both: neither a line nor a box wants a pan, an overlay click or a
+/// long press out of the press that starts it.
 ///
 /// The alternative, returning a bare [`MapPointerFrame`] and asking each caller
 /// to clear the two fields, is exactly the shape of rule that gets followed at
 /// the site it was written for and nowhere else.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct ArmedSectionFrame {
-    gesture: SectionGesture,
+pub(crate) struct ArmedDragFrame {
+    gesture: ArmedDragGesture,
     pointer: MapPointerFrame,
 }
 
-impl ArmedSectionFrame {
-    fn new(gesture: SectionGesture) -> Self {
+impl ArmedDragFrame {
+    fn new(gesture: ArmedDragGesture) -> Self {
         Self {
             gesture,
             pointer: MapPointerFrame {
-                // A press while armed is the first point of a line. Letting it
-                // also count as an overlay click would open a storm-report
-                // popup over the map the user is drawing on.
+                // A press while armed is the first point of a line or the
+                // centre of a box. Letting it also count as an overlay click
+                // would open a storm-report popup over the map the user is
+                // drawing on.
                 overlay_click_pos: None,
-                // Nothing long-presses while armed: the press is a draw.
+                // Nothing long-presses while armed: the press is the gesture.
                 long_press_pos: None,
-                // Unconditional. The drag is the line.
+                // Unconditional. The drag belongs to the armed mode.
                 suppress_pan: true,
             },
         }
     }
 
-    /// What the draw saw this frame.
-    pub(crate) fn gesture(self) -> SectionGesture {
+    /// What the armed drag saw this frame.
+    pub(crate) fn gesture(self) -> ArmedDragGesture {
         self.gesture
     }
 
@@ -900,16 +920,22 @@ pub(crate) struct TouchGestures {
     pub tracker: PointerTracker,
     pub double_tap: DoubleTapDragDetector,
     pub long_press: LongPressDetector,
-    /// The armed cross-section draw. Lives here, beside the two touch
-    /// detectors, because it shares their [`PointerTracker`] — and sharing it
-    /// is the point: exactly one of the two pipelines runs per frame for the
-    /// active pane, so the tracker is read once either way. Two trackers would
-    /// mean the one that did not run missed a cancellation.
+    /// Whichever modal drag is armed — the cross-section draw or the 3D region
+    /// pick. Lives here, beside the two touch detectors, because it shares
+    /// their [`PointerTracker`] — and sharing it is the point: exactly one of
+    /// the two pipelines runs per frame for the active pane, so the tracker is
+    /// read once either way. Two trackers would mean the one that did not run
+    /// missed a cancellation.
     ///
-    /// Unlike its neighbours it is **not** touch-only: a line is drawn the same
-    /// way with a mouse, and the gestures a mouse produces are the ones this
-    /// detector wants.
-    pub section: SectionLineDetector,
+    /// **One detector for both modes**, because they cannot both be armed —
+    /// see [`ArmedDragGesture`]. A second would be a second place for a
+    /// cancelled touch to latch, and the mode that was not running would be the
+    /// one holding the stale latch.
+    ///
+    /// Unlike its neighbours it is **not** touch-only: a line and a box are
+    /// drawn the same way with a mouse, and the gestures a mouse produces are
+    /// the ones this detector wants.
+    pub armed_drag: ArmedDragDetector,
 }
 
 impl TouchGestures {
@@ -1035,15 +1061,17 @@ impl InteractionState {
         }
     }
 
-    /// Resolve the active pane for a frame in which the cross-section draw is
-    /// **armed**, whichever pointer the user has.
+    /// Resolve the active pane for a frame in which a modal drag is **armed**
+    /// — the cross-section draw or the 3D region pick — whichever pointer the
+    /// user has.
     ///
     /// This replaces [`resolve_active`](Self::resolve_active) rather than
     /// running beside it, and that is the whole design: while armed the pane
-    /// resolves through the line detector *only*. The touch pipeline's own
+    /// resolves through the armed-drag detector *only*. The touch pipeline's own
     /// gestures are not merely unhelpful here, they actively conflict — a
     /// double-tap-drag is a zoom, a hold is a value tooltip, and both are
-    /// spelled with exactly the press-and-move a section line is spelled with.
+    /// spelled with exactly the press-and-move a section line and a region box
+    /// are spelled with.
     ///
     /// One tracker read, as everywhere else: exactly one of the two resolvers
     /// runs per frame for the active pane, so arming and disarming cannot skip
@@ -1056,10 +1084,10 @@ impl InteractionState {
         &mut self,
         ctx: &egui::Context,
         modality: crate::ui_layout::PointerModality,
-    ) -> ArmedSectionFrame {
+    ) -> ArmedDragFrame {
         self.settle_modality(modality);
         let input = self.gestures.tracker.read(ctx);
-        ArmedSectionFrame::new(self.gestures.section.update(input))
+        ArmedDragFrame::new(self.gestures.armed_drag.update(input))
     }
 
     /// A modality change abandons any gesture in flight.

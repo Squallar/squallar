@@ -330,22 +330,31 @@ impl super::Gui {
                     // hit-testing (where `selected_overlays` is pushed) and the
                     // radar-site icon clicks, both in `ui_map_pane.rs`.
                     //
-                    // While the cross-section draw is armed, the active *map*
-                    // pane resolves through the line detector instead — a third
+                    // While either modal drag is armed — the cross-section draw
+                    // or the 3D region pick — the active *map* pane resolves
+                    // through the armed-drag detector instead: a third
                     // resolver, not a filter over the other two. The two touch
                     // gestures are spelled with exactly the press-and-move a
-                    // section line is spelled with, so running them alongside it
-                    // would make every line drawn on a phone also a zoom or a
-                    // value tooltip.
+                    // section line and a region box are spelled with, so
+                    // running them alongside would make every line or box drawn
+                    // on a phone also a zoom or a value tooltip.
                     //
-                    // Only a **plan view**: the line is aimed with a projector,
+                    // One flag for both, because the two modes cannot both be
+                    // armed — `Gui::set_section_draw_armed` and
+                    // `Gui::set_region_pick_armed` each disarm the other — and
+                    // because what they need from the resolver is identical:
+                    // no pan, no overlay click, no long press. Which of them a
+                    // gesture *means* is decided where it is consumed, not
+                    // here.
+                    //
+                    // Only a **plan view**: both are aimed with a projector,
                     // and the projector only exists inside the `Map::show` the
                     // plan-view arm below runs on the pane's own rect. Arming
-                    // the mode with a section or a 3D pane active therefore
+                    // a mode with a section or a 3D pane active therefore
                     // leaves it exactly as it was, and the press that picks a
                     // plan-view pane out of the layout is the same press that
-                    // starts the line — `detect_active_pane_click` runs at the
-                    // top of this frame.
+                    // starts the gesture — `detect_active_pane_click` runs at
+                    // the top of this frame.
                     //
                     // [`PaneState::is_map`], not the pane's *kind*: a 3D pane's
                     // kind is `Map` — the 3D view is a render mode of a map
@@ -354,7 +363,9 @@ impl super::Gui {
                     // which suppresses its pan and eats its click for a line
                     // that can never be drawn. See the fade gate below, which
                     // is the same question and was the same defect.
-                    let armed_draw = self.section_draw_armed() && is_active && pane.is_map();
+                    let armed_draw = (self.section_draw_armed() || self.region_pick_armed())
+                        && is_active
+                        && pane.is_map();
                     let (pointer, gesture) = if armed_draw {
                         let armed = self.interaction.resolve_armed(&ctx, modality);
                         (armed.pointer(), Some(armed.gesture()))
@@ -373,14 +384,11 @@ impl super::Gui {
                         (self.interaction.resolve_inactive(&ctx, modality), None)
                     };
 
-                    // The armed cross-section draw is the only modal drag left
-                    // on a map pane; `ArmedSectionFrame` above has already
-                    // suppressed the pan and cleared the click for it, so
-                    // nothing more is gated here. A second mode used to sit
-                    // beside it — the 3D region drag — and the two had to be
-                    // held mutually exclusive because one press cannot be both a
-                    // line and a box. A 3D view's box is now the pane's own
-                    // viewport, so there is no second gesture to exclude.
+                    // Nothing more is gated here for either armed mode:
+                    // `ArmedDragFrame` above has already suppressed the pan and
+                    // cleared the click, unconditionally and by construction,
+                    // which is the whole reason it is a type rather than three
+                    // fields each caller has to remember to clear.
                     let overlay_click_pos = pointer.overlay_click_pos;
                     // A confirmed map tap puts a touch-revealed pill row
                     // back to sleep: the reveal was granted for a glance at
@@ -586,11 +594,26 @@ impl super::Gui {
                                             // and on the frame the gesture happens,
                                             // because a pixel names different ground
                                             // one wheel notch later. See
-                                            // `SectionAnchor`.
+                                            // `SectionAnchor` and `RegionDrag`.
+                                            //
+                                            // One gesture, and the armed mode says
+                                            // what it means. `if` rather than
+                                            // `else if` on the second arm would be
+                                            // a frame in which one press was both a
+                                            // line and a box; the setters make that
+                                            // unreachable, and this reads the flags
+                                            // in the same exclusive way so that a
+                                            // future third mode has to choose too.
                                             if let Some(gesture) = gesture {
-                                                self.track_section_draw(
-                                                    pane_idx, gesture, projector,
-                                                );
+                                                if self.section_draw_armed() {
+                                                    self.track_section_draw(
+                                                        pane_idx, gesture, projector,
+                                                    );
+                                                } else if self.region_pick_armed() {
+                                                    self.track_region_pick(
+                                                        pane_idx, gesture, projector,
+                                                    );
+                                                }
                                             }
 
                                             let mut render_ctx = pane_render::PaneRenderCtx {
@@ -662,6 +685,14 @@ impl super::Gui {
                                             self.draw_section_tracks(
                                                 ui, projector, pane_idx, pane_rect,
                                             );
+
+                                            // Last of all, for the reason above
+                                            // applied one step further: a region
+                                            // box the user is dragging is the
+                                            // thing they are aiming, and a box
+                                            // lost under a section track or a
+                                            // storm core is a box they cannot aim.
+                                            self.draw_region_boxes(ui, projector, pane_idx);
                                         });
                                 });
                             }
@@ -868,14 +899,22 @@ impl super::Gui {
                     // on every pane would read as five armed modes. Painted
                     // on its own sub-layer, like the pending-render notice,
                     // so nothing drawn later in the pane can cover it.
-                    if is_active && pane.is_map() && self.section_draw_armed() {
-                        paint_armed_hint_chip(
-                            &ctx,
-                            pane_idx,
-                            pane_rect,
-                            SECTION_ARM_HINT,
-                            SECTION_TRACK_COLOR,
-                        );
+                    if is_active && pane.is_map() {
+                        // Whichever mode is armed, in that mode's own colour.
+                        // Never both — the setters hold them exclusive — so
+                        // this reads as one chip or none, and the colour is how
+                        // a user who armed the wrong toggle finds out before
+                        // they drag.
+                        let armed = if self.section_draw_armed() {
+                            Some((SECTION_ARM_HINT, SECTION_TRACK_COLOR))
+                        } else if self.region_pick_armed() {
+                            Some((REGION_ARM_HINT, crate::ui_region::REGION_ARM_COLOR))
+                        } else {
+                            None
+                        };
+                        if let Some((text, color)) = armed {
+                            paint_armed_hint_chip(&ctx, pane_idx, pane_rect, text, color);
+                        }
                     }
 
                     // Restore map_memory and pane
@@ -938,10 +977,10 @@ impl super::Gui {
     fn track_section_draw(
         &mut self,
         pane_idx: usize,
-        gesture: crate::ui_input::SectionGesture,
+        gesture: crate::ui_input::ArmedDragGesture,
         projector: &walkers::Projector,
     ) {
-        use crate::ui_input::{MIN_SECTION_DRAG_PT, SectionGesture};
+        use crate::ui_input::{ArmedDragGesture, MIN_SECTION_DRAG_PT};
 
         let ground = |pos: egui::Pos2| {
             // `walkers::Position` is a `geo_types::Point`, so latitude is `y`
@@ -955,8 +994,8 @@ impl super::Gui {
         };
 
         match gesture {
-            SectionGesture::Idle => {}
-            SectionGesture::Anchored(pos) => {
+            ArmedDragGesture::Idle => {}
+            ArmedDragGesture::Anchored(pos) => {
                 self.section_anchor = Some(super::SectionAnchor {
                     pane_idx,
                     ground: ground(pos),
@@ -964,14 +1003,14 @@ impl super::Gui {
                     current: pos,
                 });
             }
-            SectionGesture::Dragging(pos) => {
+            ArmedDragGesture::Dragging(pos) => {
                 if let Some(anchor) = self.section_anchor.as_mut()
                     && anchor.pane_idx == pane_idx
                 {
                     anchor.current = pos;
                 }
             }
-            SectionGesture::Released(pos) => {
+            ArmedDragGesture::Released(pos) => {
                 let Some(anchor) = self.section_anchor.take() else {
                     return;
                 };
@@ -1003,7 +1042,7 @@ impl super::Gui {
                 // would turn the user's next pan into a second section.
                 self.set_section_draw_armed(false);
             }
-            SectionGesture::Cancelled => {
+            ArmedDragGesture::Cancelled => {
                 if self
                     .section_anchor
                     .as_ref()
@@ -1013,6 +1052,133 @@ impl super::Gui {
                 }
             }
         }
+    }
+
+    /// Advance the armed 3D region pick by one frame's gesture.
+    ///
+    /// [`Self::track_section_draw`]'s counterpart, called from the same place
+    /// inside `Map::show` and for the same reason: the projector is the only
+    /// thing that can turn a pointer position into ground, and the conversion
+    /// has to happen on the frame the gesture happened. The pick suppresses
+    /// panning but not zooming, so a pixel held across a wheel notch names
+    /// somewhere else — which is why [`crate::ui_region::RegionDrag`] stores a
+    /// geographic centre and re-measures a geographic corner rather than
+    /// keeping either as a pixel.
+    ///
+    /// # Why the drag survives the pointer leaving the pane
+    ///
+    /// Only the *press* is gated on this pane. Once a drag has begun,
+    /// [`crate::ui_region::RegionDrag::extend_to`] takes whatever ground the
+    /// pointer is over, including ground in the pane next door: dragging past
+    /// the edge of a pane to make a big box is ordinary, and stopping the box
+    /// growing at the boundary would read as the gesture having been dropped.
+    /// The drag still belongs to the pane it started on — `pane_idx` is checked
+    /// on every frame — so the box is drawn there and commits from there.
+    fn track_region_pick(
+        &mut self,
+        pane_idx: usize,
+        gesture: crate::ui_input::ArmedDragGesture,
+        projector: &walkers::Projector,
+    ) {
+        use crate::ui_input::ArmedDragGesture;
+
+        let ground = |pos: egui::Pos2| {
+            // `walkers::Position` is a `geo_types::Point`, so latitude is `y`
+            // and longitude is `x` — the same reading `track_section_draw`
+            // takes off `unproject`.
+            let position = projector.unproject(egui::vec2(pos.x, pos.y));
+            crate::pane::GeoPoint {
+                lat: position.y(),
+                lon: position.x(),
+            }
+        };
+
+        match gesture {
+            ArmedDragGesture::Idle => {}
+            ArmedDragGesture::Anchored(pos) => {
+                // `begin` refuses a press the projector could not place on
+                // Earth, which leaves `region_drag` as `None` and the mode
+                // armed — a press on a pane a divider collapsed to nothing
+                // costs the user nothing.
+                self.region_drag = crate::ui_region::RegionDrag::begin(pane_idx, ground(pos));
+            }
+            ArmedDragGesture::Dragging(pos) => {
+                if let Some(drag) = self
+                    .region_drag
+                    .as_mut()
+                    .filter(|drag| drag.pane_idx() == pane_idx)
+                {
+                    drag.extend_to(ground(pos));
+                }
+            }
+            ArmedDragGesture::Released(pos) => {
+                let Some(mut drag) = self.region_drag.take() else {
+                    return;
+                };
+                if drag.pane_idx() != pane_idx {
+                    return;
+                }
+                // The release position is folded in before committing: a quick
+                // drag can produce a press frame and a release frame with no
+                // `Dragging` between them, and without this the box would
+                // commit at the half-width it had before the pointer moved,
+                // which is zero.
+                drag.extend_to(ground(pos));
+                match drag.commit() {
+                    Some(region) => {
+                        self.pending_region = Some((pane_idx, region));
+                        // Disarmed by picking: the mode's job is done, and
+                        // leaving it on would turn the user's next pan into a
+                        // second box. `track_section_draw`'s rule exactly.
+                        self.set_region_pick_armed(false);
+                    }
+                    // Below `MIN_HALF_WIDTH_KM`, so `build_voxels` would clamp
+                    // it up and resample a box the user did not draw.
+                    // Discarded, and **the mode stays armed** — a stray tap is
+                    // the likeliest thing to happen right after arming (it is
+                    // how a user checks which pane they are on), and disarming
+                    // there would throw away an intent just expressed.
+                    None => log::debug!(
+                        "3D region drag was {:.1} km across, below the resampler's \
+                         {:.0} km minimum; discarded",
+                        2.0 * drag.half_width_km(),
+                        2.0 * rustdar_radar::voxel::MIN_HALF_WIDTH_KM,
+                    ),
+                }
+            }
+            ArmedDragGesture::Cancelled => {
+                if self
+                    .region_drag
+                    .is_some_and(|drag| drag.pane_idx() == pane_idx)
+                {
+                    self.region_drag = None;
+                }
+            }
+        }
+    }
+
+    /// Cells along a voxel grid's horizontal axes on **this device**, or `None`
+    /// if no 3D pane has built one yet.
+    ///
+    /// The grid's shape is derived at runtime from the adapter's own
+    /// `max_texture_dimension_3d` against the tier's cell budget
+    /// (`rustdar_radar::voxel::shape_for_budget`), so no constant this crate
+    /// could name is guaranteed to be the count a grid actually has — the
+    /// caption learned that and reads it off the grid, and the region drag's
+    /// hint has to divide by the same number or the two would print different
+    /// km-per-cell for the same box.
+    ///
+    /// **Any painting pane's answer is every pane's answer**: the budget is a
+    /// property of the device, not of a pane or a box, so the first grid found
+    /// settles it. Asking a *particular* pane is not possible here anyway — the
+    /// drag has not chosen a destination yet, and will not until it is
+    /// released.
+    fn volume_cells_across(&self) -> Option<usize> {
+        let painter = self.volume_painter()?;
+        (0..self.visible_pane_count()).find_map(|idx| {
+            let target = self.panes[idx].volume()?.rendered_for.as_ref()?;
+            painter.grid_cells_across(idx, target)
+        })
     }
 
     /// Whether this frame's press landed on a section handle recorded last
@@ -1332,6 +1498,89 @@ impl super::Gui {
 
         #[cfg(test)]
         self.last_section_tracks.extend(painted);
+    }
+
+    /// Draw the region boxes that belong to pane `pane_idx`: every committed
+    /// one picked on this map, and the one being dragged on it right now.
+    ///
+    /// # Why committed boxes are drawn at all, and always
+    ///
+    /// A 3D pane resamples a patch of ground that is invisible from the map it
+    /// was picked on, and "where is that volume from" is otherwise unanswerable
+    /// — the 3D view's own caption gives a size, not a place. So the box is
+    /// drawn on its source map for as long as the pane holds it, armed or not.
+    /// Unarmed is the common case, which makes this the only work most frames
+    /// do here.
+    ///
+    /// In a **different colour** from the drag: a committed box is a record and
+    /// the drag is a gesture, and painting them alike would make an old box
+    /// under the cursor look like the one being pulled out.
+    ///
+    /// # Reading `self.panes` from inside the pane loop is safe *here*
+    ///
+    /// `draw_section_tracks`' argument, unchanged and with one more step. The
+    /// loop has `mem::take`n the pane being drawn, so its slot reads as a
+    /// default map pane. That default's `render` is the plan view, so
+    /// [`PaneState::volume`](crate::pane::PaneState::volume) answers `None` for
+    /// it and the taken slot contributes nothing — which is right, because a
+    /// pane cannot be the map its own box was drawn on and be drawing the
+    /// volume at the same time.
+    fn draw_region_boxes(
+        &mut self,
+        ui: &egui::Ui,
+        projector: &walkers::Projector,
+        pane_idx: usize,
+    ) {
+        let painter = ui.painter();
+        // Asked once, before the borrow of `self.panes()` below, and only for
+        // the hint — see `region_hint_text`.
+        let cells_across = self.volume_cells_across();
+
+        #[cfg(test)]
+        let mut painted: Vec<(usize, usize, egui::Rect)> = Vec::new();
+
+        for (idx, other) in self.panes().iter().enumerate() {
+            let Some(volume) = other.volume() else {
+                continue;
+            };
+            if volume.source_pane != Some(pane_idx) {
+                continue;
+            }
+            let Some(region) = volume.region else {
+                continue;
+            };
+            // The committed box is a rectangle in general — a config may carry
+            // one, and `HalfExtentKm::clamped` scales both axes — so it is
+            // drawn from its own two half-extents rather than through the
+            // square-only `corners_for`. A box the drag produced has equal
+            // axes and the two agree exactly.
+            let Some(rect) =
+                region_screen_rect(projector, region.centre(), region.half_extent_km())
+            else {
+                continue;
+            };
+            paint_region_box(painter, rect, REGION_COMMITTED_COLOR, false);
+            #[cfg(test)]
+            painted.push((pane_idx, idx, rect));
+            #[cfg(not(test))]
+            let _ = idx;
+        }
+
+        // The drag last, over any committed box it overlaps: the one under the
+        // pointer is the one the user is working.
+        if let Some((centre, half_width_km)) = self.region_preview(pane_idx)
+            && let Some(rect) = region_screen_rect(
+                projector,
+                centre,
+                rustdar_radar::voxel::HalfExtentKm::square(half_width_km),
+            )
+        {
+            paint_region_box(painter, rect, crate::ui_region::REGION_ARM_COLOR, true);
+            paint_region_hint(painter, rect, half_width_km, cells_across);
+        }
+
+        #[cfg(test)]
+        self.last_region_boxes.extend(painted);
     }
 
     /// Detect which pane was clicked and make it the active pane.
@@ -2501,6 +2750,49 @@ pub(crate) fn render_volume_controls(
             );
         }
 
+        // The picked region, and the way out of it. Shown only when there is
+        // one: a pane on the whole ring has nothing to clear, and a permanently
+        // greyed button would be one more control to read past.
+        //
+        // A control of its own rather than leaving this to Reset view, which
+        // also clears it. The two are for different situations and only one of
+        // them is cheap: a user who tightened onto a storm that turned out to
+        // be nothing wants the ring back and wants to keep the angle they spent
+        // a minute finding, and Reset view costs them that angle. A selection
+        // you can only undo by discarding the rest of your work is still most
+        // of a trap.
+        if let Some(region) = volume.region {
+            ui.horizontal(|ui| {
+                ui.label(format!(
+                    "Region: {}",
+                    axes(
+                        2.0 * region.half_east_km(),
+                        2.0 * region.half_north_km(),
+                        0
+                    ),
+                ));
+                ui.label("km");
+                if ui
+                    .button(WHOLE_RING_LABEL)
+                    .on_hover_text(
+                        "Drops the picked region and goes back to the volume's own data reach - \
+                         the whole ring, at whatever range the scan in hand carries. The camera \
+                         is left exactly as it is. Picking a region is the only way to spend the \
+                         grid's cells on less ground, so this is the way back to the coarser, \
+                         wider picture.",
+                    )
+                    .clicked()
+                {
+                    // The source pane goes with it, for `reset_volume_view`'s
+                    // reason: a pane that is no longer aimed is not aimed from
+                    // anywhere, and a stale index would keep drawing a box on a
+                    // map for a region this pane no longer holds.
+                    volume.region = None;
+                    volume.source_pane = None;
+                }
+            });
+        }
+
         if ui
             .button("Reset view")
             .on_hover_text("Back to the default angle, zoom, centre and region.")
@@ -2510,6 +2802,15 @@ pub(crate) fn render_volume_controls(
         }
     });
 }
+
+/// The label on the control that drops a picked region.
+///
+/// Names the **destination** rather than the act: "Clear region" says what
+/// stops, and the useful thing to know is what the pane will be showing
+/// afterwards. A constant because a test names it, and a test carrying its own
+/// copy of the string would go on passing after the button was renamed out from
+/// under it.
+pub(crate) const WHOLE_RING_LABEL: &str = "Whole ring";
 
 /// Put a 3D pane back to the view it opened at.
 ///
@@ -2523,12 +2824,30 @@ pub(crate) fn render_volume_controls(
 /// visibly changes something and leaves the pane still looking at the wrong
 /// place, which reads as a control that half-works.
 ///
-/// **The box is deliberately not reset**, because it is no longer something
-/// this pane holds: it is the pane's viewport, and the way back to a wider box
-/// is to zoom the map out. Resetting it here would mean silently moving the
-/// user's map, which is a bigger edit than the button offers.
+/// # The region is the reason this button matters
+///
+/// It is also **the only way back to the whole ring**. A picked region is
+/// deliberately immovable — no zoom, pan, divider drag or resize touches it,
+/// which is the entire point of storing it — so nothing else in the pane can
+/// widen a box again. Without this, picking a 20 km region would be a
+/// one-way door: the pane would be stuck on that ground for the rest of its
+/// life, and a user who tightened onto a storm that turned out to be nothing
+/// would have to delete the pane to escape. That is the trap a selection you
+/// cannot undo always is, and clearing to `None` is the way out.
+///
+/// `None` rather than a wide *number*, because `None` is a different rule
+/// rather than a bigger box: the volume's own data reach, circumscribed,
+/// resolved by the resampler from the scan in hand. A pane reset while looking
+/// at a TDWR gets the TDWR's ring, which no stored figure could have known.
+///
+/// The source pane goes with it. It records which map aimed this one, and a
+/// pane that is no longer aimed is not aimed *from* anywhere — leaving the
+/// index would keep the cleared pane the preferred target of the next drag on
+/// that map, and would keep drawing a box on it that this pane no longer holds.
 pub(crate) fn reset_volume_view(volume: &mut crate::pane::VolumePane) {
     volume.camera = crate::pane::OrbitCamera::default();
+    volume.region = None;
+    volume.source_pane = None;
     // `view_mode` stays, deliberately: the reset is for a pane that is *lost*
     // — angle, zoom, centre — and the view mode is not a way to be lost, it is
     // a choice of picture. A reset that also flipped an isosurface pane back to
@@ -2900,6 +3219,147 @@ const SECTION_TRACK_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 214, 10)
 /// What the armed cross-section draw's hint chip says.
 pub(crate) const SECTION_ARM_HINT: &str = "Drag A-B to draw cross-section";
 
+/// What the armed 3D region pick's hint chip says.
+///
+/// Names the **verb and the shape**, not the feature: "drag a square" is what
+/// the user does next, and it is the one thing that is not obvious from a
+/// toggle that has just been ticked. The word "3D" is what says where the
+/// square goes.
+pub(crate) const REGION_ARM_HINT: &str = "Drag a square to pick the 3D region";
+
+/// The colour a **committed** region box is drawn in on its source map.
+///
+/// Cool, where [`crate::ui_region::REGION_ARM_COLOR`] and
+/// [`SECTION_TRACK_COLOR`] are both warm, and that is the whole choice: a
+/// committed box is a *record* of a decision already made, and the two armed
+/// gestures are things happening now. A user with a box on screen and the pick
+/// armed sees two rectangles, and the colour is what says which one the pointer
+/// is pulling.
+const REGION_COMMITTED_COLOR: egui::Color32 = egui::Color32::from_rgb(120, 200, 255);
+
+/// Stroke width of a region box, points.
+///
+/// Thinner than the section track's 2.0: a box is four edges enclosing the
+/// picture the user is judging, and a heavy outline hides the ground just
+/// inside it — which is exactly the ground the box is being drawn around.
+const REGION_STROKE: f32 = 1.5;
+
+/// How much of the armed box's fill shows through, as a multiple of its
+/// colour's alpha.
+///
+/// Low enough that the radar image inside the box is still read at full
+/// contrast — the box is drawn *around* a storm the user is judging, so a wash
+/// that shifted its colours would defeat the gesture — and high enough that the
+/// enclosed area is unambiguous where the stroke runs over a bright core. Only
+/// the drag is filled; a committed box is stroke alone, because a permanent
+/// wash over the map would be a permanent cost.
+const REGION_FILL_ALPHA: f32 = 0.12;
+
+/// One region box's screen rect, or `None` for a box with no rectangle to draw.
+///
+/// The corners are projected rather than the centre offset by a pixel radius, so
+/// the box stays over the same ground at every zoom — the same thing
+/// `overlay_texture_rect` does for an overlay's bounds, and for the same reason.
+///
+/// A degenerate box — a zero extent before the pointer has moved, or a polar
+/// centre — answers `None` rather than a dot, because a dot under the cursor at
+/// the start of every drag reads as a stray click artefact.
+fn region_screen_rect(
+    projector: &walkers::Projector,
+    centre: crate::pane::GeoPoint,
+    half: rustdar_radar::voxel::HalfExtentKm,
+) -> Option<egui::Rect> {
+    if !(half.is_finite() && half.east_km > 0.0 && half.north_km > 0.0) {
+        return None;
+    }
+    let (nw, se) = crate::ui_region::corners_for(centre, half)?;
+    let project =
+        |p: crate::pane::GeoPoint| projector.project(walkers::lat_lon(p.lat, p.lon)).to_pos2();
+    Some(egui::Rect::from_two_pos(project(nw), project(se)))
+}
+
+/// Paint one region box: an outline, and for the drag a translucent fill.
+fn paint_region_box(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32, filled: bool) {
+    if filled {
+        painter.rect_filled(rect, 0.0, color.gamma_multiply(REGION_FILL_ALPHA));
+    }
+    painter.rect_stroke(
+        rect,
+        0.0,
+        egui::Stroke::new(REGION_STROKE, color),
+        egui::StrokeKind::Middle,
+    );
+}
+
+/// The width and per-cell resolution of the box being dragged, over its top
+/// edge.
+///
+/// The resolution is the whole reason to pick a region — the grid's cell count
+/// is fixed, so a tighter box spends the same cells over less ground — and it is
+/// invisible unless it is said. Shown *during* the drag rather than after, so
+/// the choice is made against the number rather than discovered once the
+/// rebuild lands.
+fn paint_region_hint(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    half_width_km: f64,
+    cells: Option<usize>,
+) {
+    let Some(text) = region_hint_text(half_width_km, cells) else {
+        return;
+    };
+    let galley = painter.layout_no_wrap(
+        text,
+        egui::FontId::proportional(12.0),
+        egui::Color32::from_rgb(20, 20, 20),
+    );
+    let origin = egui::pos2(rect.left(), rect.top() - galley.size().y - 4.0);
+    painter.rect_filled(
+        egui::Rect::from_min_size(origin, galley.size()).expand(3.0),
+        2.0,
+        crate::ui_region::REGION_ARM_COLOR,
+    );
+    painter.galley(origin, galley, egui::Color32::PLACEHOLDER);
+}
+
+/// The hint's text for a drag standing at `half_width_km`, or `None` for a box
+/// that cannot be described.
+///
+/// **Through [`VolumeRegion`](crate::pane::VolumeRegion)**, so the figures shown
+/// are the ones that will be resampled: its constructor clamps the extent to the
+/// range `build_voxels` honours, and a hint reading 4 km over a box that would
+/// become 10 km is a hint that lies. `RegionDrag::extend_to` caps the drag at
+/// the same ceiling and `RegionDrag::commit` refuses below the floor, so today
+/// the three agree before this runs — but the hint's honesty is this routing,
+/// not those two, which is why the clamp is re-entered here rather than assumed.
+///
+/// The centre is the equator rather than the drag's own: nothing in the printed
+/// figures depends on where the box is, and asking for a real centre would make
+/// this refuse for a polar drag whose *size* is perfectly describable.
+///
+/// `cells` is this device's real grid width — [`Gui::volume_cells_across`],
+/// which is the same number the caption divides by. `None` before any grid has
+/// been built, and then the hint states the **box alone**: a km-per-cell out of
+/// a compile-time shape would be a confident figure about a device that may not
+/// have it, and the box size is the half of the hint that is knowable either
+/// way.
+///
+/// [`Gui::volume_cells_across`]: super::Gui::volume_cells_across
+fn region_hint_text(half_width_km: f64, cells: Option<usize>) -> Option<String> {
+    let region = crate::pane::VolumeRegion::new(
+        crate::pane::GeoPoint { lat: 0.0, lon: 0.0 },
+        rustdar_radar::voxel::HalfExtentKm::square(half_width_km),
+    )?;
+    let across = 2.0 * region.half_east_km();
+    // A square box has one resolution, so the east lane is the whole answer
+    // rather than a chosen axis — which is why this prints one figure where the
+    // caption prints `axes()`.
+    match cells.and_then(|cells| region.resolution_km(cells)) {
+        Some((km, _)) => Some(format!("{across:.0} km - {km:.2} km/cell")),
+        None => Some(format!("{across:.0} km")),
+    }
+}
+
 /// Padding between the hint chip's text and its dashed border, each axis.
 const ARMED_HINT_PADDING: egui::Vec2 = egui::vec2(12.0, 8.0);
 
@@ -3207,3 +3667,7 @@ mod tests;
 #[path = "ui_map/volume_arm_tests.rs"]
 #[cfg(test)]
 mod volume_arm_tests;
+
+#[path = "ui_map/region_pick_tests.rs"]
+#[cfg(test)]
+mod region_pick_tests;

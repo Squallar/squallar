@@ -18,10 +18,17 @@
 //! the camera. The *gate* — which pane a gesture belongs to — is pinned through
 //! the real UI by `ui_map::volume_arm_tests`, because it is a question about
 //! layers and hover that no unit fixture can ask honestly.
+//!
+//! Since the selector came back there is a third subject here: the one writer
+//! of a stored region. [`RegionDrag`]'s arithmetic — Chebyshev, capped, refused
+//! below the resampler's floor, square on both axes — is pinned as a function,
+//! because every one of those is a decision that can be got wrong silently. The
+//! *gesture* around it is `ui_map::region_pick_tests`, for the reason the gate
+//! is over there.
 
 use super::{
-    COVERAGE_MARGIN, MAX_FRAMING_PASSES, dolly_for_step, ground_half_extent, viewport_for_region,
-    wheel_rate_correction, zoom_step,
+    COVERAGE_MARGIN, MAX_FRAMING_PASSES, RegionDrag, corners_for, dolly_for_step,
+    ground_half_extent, viewport_for_region, wheel_rate_correction, zoom_step,
 };
 
 /// A frame whose timing is unusable leaves walkers exactly as it found it.
@@ -655,4 +662,264 @@ fn a_framed_strip_is_centred_on_the_box() {
         "a detached memory would centre the strip on the pane's last pan \
          instead of on the box",
     );
+}
+
+/// A point on Earth near KTLX, for the drag fixtures.
+fn ktlx() -> crate::pane::GeoPoint {
+    crate::pane::GeoPoint {
+        lat: 35.33,
+        lon: -97.28,
+    }
+}
+
+/// Kilometres a fixture's stated offset may be out by, at the ~100 km distances
+/// used below.
+///
+/// The offsets are built with the **flat** approximation
+/// ([`OFFSET_TOLERANCE_KM`]'s companion, `corners_for`'s own arithmetic) while
+/// the drag measures with [`rustdar_radar::beam::site_bearing_range_km`], the
+/// real geodesy. The two disagree by a fraction of a percent, so an exact
+/// assertion would be an assertion about which approximation the fixture used
+/// rather than about the drag. 1.5 km on a 100 km offset is 1.5% — an order of
+/// magnitude looser than the disagreement and two orders tighter than every
+/// error these tests exist to catch, all of which are 30% or a factor of two.
+const OFFSET_TOLERANCE_KM: f64 = 1.5;
+
+/// A point `east_km` east and `north_km` north of `from`.
+///
+/// The flat approximation, because there is no forward geodesy in `beam` to
+/// invert `site_bearing_range_km` with and inverting it numerically here would
+/// be more arithmetic than the tests contain. See [`OFFSET_TOLERANCE_KM`] for
+/// what that costs and why it costs nothing that matters.
+fn offset(from: crate::pane::GeoPoint, east_km: f64, north_km: f64) -> crate::pane::GeoPoint {
+    let per_deg = rustdar_radar::types::KM_PER_DEGREE_LAT;
+    crate::pane::GeoPoint {
+        lat: from.lat + north_km / per_deg,
+        lon: from.lon + east_km / (per_deg * from.lat.to_radians().cos()),
+    }
+}
+
+/// **The half-width is Chebyshev, not Euclidean**: the square's *edge* follows
+/// the pointer, so a straight drag grows the box at the rate the pointer moves.
+///
+/// The alternative reads as the box tracking something behind the cursor — a
+/// pointer 100 km east would give a 70.7 km half-width, and the edge the user is
+/// watching would lag their finger by 30%. Both axes are swept, and a diagonal,
+/// because a max() written as a min() passes any fixture that only pulls one way.
+#[test]
+fn the_squares_edge_follows_the_pointer_rather_than_its_corner() {
+    for (east_km, north_km, want) in [
+        (100.0, 0.0, 100.0),
+        (0.0, 100.0, 100.0),
+        (-100.0, 0.0, 100.0),
+        (0.0, -100.0, 100.0),
+        (100.0, 40.0, 100.0),
+        (40.0, 100.0, 100.0),
+        (100.0, 100.0, 100.0),
+    ] {
+        let mut drag = RegionDrag::begin(0, ktlx()).expect("KTLX is on Earth");
+        drag.extend_to(offset(ktlx(), east_km, north_km));
+        assert!(
+            (drag.half_width_km() - want).abs() < OFFSET_TOLERANCE_KM,
+            "a pointer {east_km} km east and {north_km} km north gave a \
+             {:.2} km half-width, not the {want} km its furthest axis stands at \
+             - the edge is no longer under the pointer",
+            drag.half_width_km(),
+        );
+    }
+}
+
+/// A drag below the resampler's own minimum **commits nothing**.
+///
+/// The bar is [`rustdar_radar::voxel::MIN_HALF_WIDTH_KM`] rather than a pixel
+/// count because `build_voxels` *clamps* rather than refuses: a 4 km box would
+/// be resampled as a 10 km one, so committing it would put the pane over ground
+/// the user did not draw and make its own resolution readout a description of
+/// the wrong picture. Refusing means every region that commits is honoured
+/// exactly.
+#[test]
+fn a_drag_under_the_resamplers_minimum_commits_nothing() {
+    let min = rustdar_radar::voxel::MIN_HALF_WIDTH_KM;
+    for east_km in [0.0, 0.5, min * 0.5, min - 0.5] {
+        let mut drag = RegionDrag::begin(0, ktlx()).expect("on Earth");
+        drag.extend_to(offset(ktlx(), east_km, 0.0));
+        assert_eq!(
+            drag.commit(),
+            None,
+            "a {:.1} km box committed, and `build_voxels` would have widened it \
+             to {:.0} km behind the user's back",
+            2.0 * east_km,
+            2.0 * min,
+        );
+    }
+
+    let mut drag = RegionDrag::begin(0, ktlx()).expect("on Earth");
+    // Clear of the bar by more than `OFFSET_TOLERANCE_KM`, so this precondition
+    // is about the bar rather than about which approximation built the fixture.
+    drag.extend_to(offset(ktlx(), min + 2.0 * OFFSET_TOLERANCE_KM, 0.0));
+    assert!(
+        drag.commit().is_some(),
+        "precondition: a box clear of the minimum must commit, or the sweep \
+         above passes because nothing ever commits",
+    );
+}
+
+/// The preview **stops** at the widest box the resampler will build.
+///
+/// `VolumeRegion::new` clamps on commit, so an uncapped drag would paint an
+/// ever-bigger square past the stop and release the same box every time — what
+/// is drawn has to be what is resampled. Asserted as the pair: the drag's own
+/// half-width stops, and the region it commits agrees with it.
+#[test]
+fn a_long_drag_stops_at_the_widest_box_the_resampler_will_build() {
+    let max = rustdar_radar::voxel::MAX_HALF_WIDTH_KM;
+    let mut drag = RegionDrag::begin(0, ktlx()).expect("on Earth");
+    drag.extend_to(offset(ktlx(), 3.0 * max, 0.0));
+    assert!(
+        (drag.half_width_km() - max).abs() < 1e-9,
+        "a drag three times past the stop stands at {:.2} km, not the {max:.2} km \
+         ceiling - the preview is drawing a box that cannot be resampled",
+        drag.half_width_km(),
+    );
+    let region = drag.commit().expect("a maximal box is a legal box");
+    assert!(
+        (region.half_east_km() - max).abs() < 1e-6 && (region.half_north_km() - max).abs() < 1e-6,
+        "the committed box is {:.2} x {:.2} km of half-extent where the preview \
+         drew {max:.2} - the hint and the picture would disagree",
+        region.half_east_km(),
+        region.half_north_km(),
+    );
+}
+
+/// **Every committed region is square**, and that is a decision rather than an
+/// accident of the fixture.
+///
+/// `VolumeRegion` carries an axis each and says at length why. The *drag*
+/// produces equal axes because the alternative — keying the box on the pane's
+/// aspect — puts the divider back on the list of things that change the region,
+/// which is the whole defect the stored region exists to remove. A pull that is
+/// long on one axis and short on the other is the case that would expose a
+/// per-axis measurement, so that is what is pulled.
+#[test]
+fn a_committed_region_is_square_whatever_shape_the_pull_was() {
+    for (east_km, north_km) in [(120.0, 20.0), (20.0, 120.0), (200.0, 199.0), (60.0, 60.0)] {
+        let mut drag = RegionDrag::begin(0, ktlx()).expect("on Earth");
+        drag.extend_to(offset(ktlx(), east_km, north_km));
+        let region = drag.commit().expect("a box well over the minimum");
+        assert_eq!(
+            region.half_east_km(),
+            region.half_north_km(),
+            "a {east_km} x {north_km} km pull committed a rectangle - a region \
+             keyed on a shape the user dragged is a region a divider can change",
+        );
+    }
+}
+
+/// A corner the projector could not place leaves the drag **exactly** as it was.
+///
+/// This runs every frame of a drag, so a single laundered NaN would stick for
+/// the rest of it — the box would freeze, or worse commit somewhere nobody
+/// pointed. Refused rather than clamped, because `f64::clamp` propagates NaN
+/// and there is no nearest sensible patch of ground.
+#[test]
+fn a_corner_off_earth_leaves_the_drag_where_it_was() {
+    let mut drag = RegionDrag::begin(0, ktlx()).expect("on Earth");
+    drag.extend_to(offset(ktlx(), 80.0, 0.0));
+    let settled = drag;
+    for bad in [
+        crate::pane::GeoPoint {
+            lat: f64::NAN,
+            lon: -97.28,
+        },
+        crate::pane::GeoPoint {
+            lat: 35.33,
+            lon: f64::INFINITY,
+        },
+        crate::pane::GeoPoint {
+            lat: 95.0,
+            lon: -97.28,
+        },
+    ] {
+        drag.extend_to(bad);
+        assert_eq!(
+            drag, settled,
+            "a corner at {bad:?} moved the drag - one bad frame would stick for \
+             the rest of the gesture",
+        );
+    }
+}
+
+/// A press the projector could not place starts **no drag at all**.
+///
+/// Reachable for a pane a divider has collapsed to nothing. `None` leaves the
+/// mode armed and costs the user nothing, where a laundered centre would commit
+/// a box somewhere they never pointed.
+#[test]
+fn a_press_off_earth_starts_no_drag() {
+    for bad in [
+        crate::pane::GeoPoint {
+            lat: f64::NAN,
+            lon: 0.0,
+        },
+        crate::pane::GeoPoint {
+            lat: 0.0,
+            lon: f64::NAN,
+        },
+        crate::pane::GeoPoint {
+            lat: 91.0,
+            lon: 0.0,
+        },
+    ] {
+        assert_eq!(
+            RegionDrag::begin(0, bad),
+            None,
+            "a press at {bad:?} began a drag",
+        );
+    }
+}
+
+/// The drawn box is square **in kilometres**, not in degrees.
+///
+/// A degree-square box at 35°N is 22% wider than it is tall, and it would not be
+/// the box that gets resampled — the outline would promise ground the grid never
+/// covers. Swept over latitude because the error is `1/cos(lat)` and vanishes at
+/// the equator, where a degree-square fixture would pass.
+#[test]
+fn the_drawn_box_is_square_in_kilometres_rather_than_degrees() {
+    for lat in [0.0, 25.0, 35.33, 49.0, 64.8] {
+        let centre = crate::pane::GeoPoint { lat, lon: -97.28 };
+        let half = rustdar_radar::voxel::HalfExtentKm::square(100.0);
+        let (nw, se) = corners_for(centre, half).expect("a box away from the poles");
+        let (_, north_km) =
+            rustdar_radar::beam::site_bearing_range_km(centre.lat, centre.lon, nw.lat, centre.lon);
+        let (_, east_km) =
+            rustdar_radar::beam::site_bearing_range_km(centre.lat, centre.lon, centre.lat, se.lon);
+        // The two are compared against *each other*, not against 100, so the
+        // flat approximation cancels: what is asserted is that the box is as
+        // wide as it is tall in kilometres, which is the claim that matters.
+        assert!(
+            (east_km - north_km).abs() < OFFSET_TOLERANCE_KM,
+            "at {lat}N the drawn box is {east_km:.1} km east by {north_km:.1} km \
+             north - the outline is not the box the grid will cover",
+        );
+    }
+}
+
+/// A polar centre draws nothing rather than an infinity.
+///
+/// `cos(lat)` is zero at the pole and every longitude is the same place, so the
+/// east half-width has no degree measure. No NEXRAD site is within 20° of one;
+/// the refusal is here because the alternative reaches a painter.
+#[test]
+fn a_polar_box_has_no_corners() {
+    for lat in [90.0, -90.0] {
+        assert_eq!(
+            corners_for(
+                crate::pane::GeoPoint { lat, lon: 0.0 },
+                rustdar_radar::voxel::HalfExtentKm::square(100.0),
+            ),
+            None,
+            "a box at {lat}N produced corners",
+        );
+    }
 }

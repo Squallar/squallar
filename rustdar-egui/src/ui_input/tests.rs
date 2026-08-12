@@ -518,7 +518,7 @@ fn hovering_after_a_real_release_does_not_re_arm() {
     assert!(!hovered.down, "hovering is not holding");
 }
 
-/// A hand-built [`PointerFrame`], for driving [`SectionLineDetector`]
+/// A hand-built [`PointerFrame`], for driving [`ArmedDragDetector`]
 /// directly.
 ///
 /// Straight construction rather than through [`PointerTracker`], because
@@ -538,27 +538,27 @@ fn frame(pressed: bool, released: bool, down: bool, x: f32) -> PointerFrame {
 /// The whole gesture: press, move, release.
 #[test]
 fn a_press_a_move_and_a_release_are_an_anchor_a_drag_and_a_line() {
-    let mut d = SectionLineDetector::default();
+    let mut d = ArmedDragDetector::default();
 
     assert_eq!(
         d.update(frame(false, false, false, 10.0)),
-        SectionGesture::Idle
+        ArmedDragGesture::Idle
     );
     assert_eq!(
         d.update(frame(true, false, true, 10.0)),
-        SectionGesture::Anchored(egui::pos2(10.0, 100.0))
+        ArmedDragGesture::Anchored(egui::pos2(10.0, 100.0))
     );
     assert_eq!(
         d.update(frame(false, false, true, 50.0)),
-        SectionGesture::Dragging(egui::pos2(50.0, 100.0))
+        ArmedDragGesture::Dragging(egui::pos2(50.0, 100.0))
     );
     assert_eq!(
         d.update(frame(false, true, false, 90.0)),
-        SectionGesture::Released(egui::pos2(90.0, 100.0))
+        ArmedDragGesture::Released(egui::pos2(90.0, 100.0))
     );
     assert_eq!(
         d.update(frame(false, false, false, 90.0)),
-        SectionGesture::Idle,
+        ArmedDragGesture::Idle,
         "the draw ended; a later frame must not report a second release"
     );
 }
@@ -569,22 +569,22 @@ fn a_press_a_move_and_a_release_are_an_anchor_a_drag_and_a_line() {
 /// *corrected* answer, and correcting it is the whole reason that type
 /// exists: after an OS-cancelled touch egui's own `primary_down()` stays
 /// `true` for ever. A detector keyed on egui's flag would leave `drawing`
-/// set, and `ArmedSectionFrame` makes `suppress_pan` unconditional — so the
+/// set, and `ArmedDragFrame` makes `suppress_pan` unconditional — so the
 /// map would stay un-pannable with nothing on screen to say why.
 #[test]
 fn a_pointer_that_vanishes_cancels_the_draw_rather_than_finishing_it() {
-    let mut d = SectionLineDetector::default();
+    let mut d = ArmedDragDetector::default();
     d.update(frame(true, false, true, 10.0));
     d.update(frame(false, false, true, 40.0));
 
     assert_eq!(
         d.update(frame(false, false, false, 40.0)),
-        SectionGesture::Cancelled,
+        ArmedDragGesture::Cancelled,
         "a pointer that is no longer down, with no release, is a cancellation"
     );
     assert_eq!(
         d.update(frame(false, false, false, 40.0)),
-        SectionGesture::Idle,
+        ArmedDragGesture::Idle,
         "and the detector is idle afterwards, not stuck in a drag"
     );
 }
@@ -595,15 +595,15 @@ fn a_pointer_that_vanishes_cancels_the_draw_rather_than_finishing_it() {
 /// both mean "start here" more plausibly than they mean "ignore me".
 #[test]
 fn a_second_press_re_anchors_rather_than_being_ignored() {
-    let mut d = SectionLineDetector::default();
+    let mut d = ArmedDragDetector::default();
     d.update(frame(true, false, true, 10.0));
     assert_eq!(
         d.update(frame(true, false, true, 70.0)),
-        SectionGesture::Anchored(egui::pos2(70.0, 100.0))
+        ArmedDragGesture::Anchored(egui::pos2(70.0, 100.0))
     );
     assert_eq!(
         d.update(frame(false, true, false, 90.0)),
-        SectionGesture::Released(egui::pos2(90.0, 100.0)),
+        ArmedDragGesture::Released(egui::pos2(90.0, 100.0)),
         "the re-anchored draw is a real draw, not a discarded one"
     );
 }
@@ -615,22 +615,22 @@ fn a_second_press_re_anchors_rather_than_being_ignored() {
 /// ordinary rather than exotic.
 #[test]
 fn a_press_and_release_in_one_frame_does_not_finish_a_line() {
-    let mut d = SectionLineDetector::default();
+    let mut d = ArmedDragDetector::default();
     assert_eq!(
         d.update(frame(true, true, false, 10.0)),
-        SectionGesture::Anchored(egui::pos2(10.0, 100.0)),
+        ArmedDragGesture::Anchored(egui::pos2(10.0, 100.0)),
         "the press wins the frame: there is nothing to release yet"
     );
     assert_eq!(
         d.update(frame(false, false, false, 10.0)),
-        SectionGesture::Cancelled,
+        ArmedDragGesture::Cancelled,
         "and the pointer is already gone, so the anchor is dropped"
     );
 }
 
 /// The two properties of an armed frame are properties of the **type**.
 ///
-/// `ArmedSectionFrame::new` is the only constructor and the field is
+/// `ArmedDragFrame::new` is the only constructor and the field is
 /// private, so there is no inhabitant for which panning is allowed or an
 /// overlay click fires. The alternative — returning a bare
 /// [`MapPointerFrame`] and asking each caller to clear two fields — is the
@@ -639,13 +639,13 @@ fn a_press_and_release_in_one_frame_does_not_finish_a_line() {
 #[test]
 fn every_armed_frame_suppresses_panning_and_fires_no_overlay_click() {
     for gesture in [
-        SectionGesture::Idle,
-        SectionGesture::Anchored(egui::pos2(1.0, 2.0)),
-        SectionGesture::Dragging(egui::pos2(3.0, 4.0)),
-        SectionGesture::Released(egui::pos2(5.0, 6.0)),
-        SectionGesture::Cancelled,
+        ArmedDragGesture::Idle,
+        ArmedDragGesture::Anchored(egui::pos2(1.0, 2.0)),
+        ArmedDragGesture::Dragging(egui::pos2(3.0, 4.0)),
+        ArmedDragGesture::Released(egui::pos2(5.0, 6.0)),
+        ArmedDragGesture::Cancelled,
     ] {
-        let armed = ArmedSectionFrame::new(gesture);
+        let armed = ArmedDragFrame::new(gesture);
         assert_eq!(armed.gesture(), gesture);
         assert!(
             armed.pointer().suppress_pan,

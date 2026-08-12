@@ -33,6 +33,16 @@ pub(crate) const VOLUME_PANE_LABEL: &str = "3D volume view";
 /// reason [`VOLUME_PANE_LABEL`] is one.
 pub(crate) const DRAW_CROSS_SECTION_LABEL: &str = "Draw cross-section";
 
+/// The label on the 3D region arming toggle.
+///
+/// Phrased as the gesture it arms and the thing that gesture buys, for
+/// [`DRAW_CROSS_SECTION_LABEL`]'s reason plus one of its own: "pick a region"
+/// alone reads as a crop, and a crop is not what this does. The grid's cell
+/// count is fixed, so a tighter region spends the same cells over less ground —
+/// it is the only resolution control there is — and the parenthetical is where
+/// a menu has room to say so and a top bar does not.
+pub(crate) const PICK_REGION_LABEL: &str = "Pick 3D region (drag a square on a map)";
+
 /// A command the user can invoke from the menu.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MenuAction {
@@ -89,6 +99,22 @@ pub(super) enum MenuToggle {
     /// user arms the mode and *then* chooses a map to draw on, and choosing it is
     /// the same press that starts the line.
     DrawCrossSection,
+    /// Arm the 3D region pick: the next drag on a map pane draws the square of
+    /// ground a 3D view resamples, instead of panning.
+    ///
+    /// [`DrawCrossSection`](Self::DrawCrossSection)'s sibling in every respect
+    /// — a checkbox because it arms a **mode** and the classic failure of a
+    /// mode is the user forgetting they are in it; not a modifier-drag because
+    /// a shift-drag has no touch equivalent and one wasm binary serves phones;
+    /// global rather than per-pane because the pane it applies to is chosen by
+    /// the same press that starts the gesture.
+    ///
+    /// Ticking it un-ticks `DrawCrossSection`, and vice versa: one press on one
+    /// map pane cannot be two gestures. That exclusion lives in the two setters
+    /// on `Gui` rather than here, so it holds for every route into them — the
+    /// top bar's toggles, the ☰ dropdown, the phone sheet — rather than only
+    /// for the one the rule was written beside.
+    PickRegion,
 }
 
 /// One entry in the menu.
@@ -296,6 +322,15 @@ impl super::Gui {
                         toggle: MenuToggle::DrawCrossSection,
                         value: self.section_draw_armed(),
                     },
+                    // The two armed drags are adjacent on purpose: they are
+                    // mutually exclusive, so ticking either un-ticks the other,
+                    // and a user only reads that off a menu if the two entries
+                    // are next to each other. Global, for the reason above.
+                    MenuNode::Toggle {
+                        label: PICK_REGION_LABEL,
+                        toggle: MenuToggle::PickRegion,
+                        value: self.region_pick_armed(),
+                    },
                     MenuNode::Separator,
                     MenuNode::Toggle {
                         label: "Show radar sites",
@@ -404,6 +439,16 @@ impl super::Gui {
                 // so arming the mode and leaving it open would arm a gesture
                 // the user cannot make. The ☰ dropdown closes itself on arm
                 // for the same reason; see `render_top_bar`.
+                if on {
+                    self.drawer_open = false;
+                }
+            }
+            MenuEvent::Toggled(MenuToggle::PickRegion, on) => {
+                // The arm above, with the box in place of the line. Same direct
+                // write for the same reason, same setter because disarming has
+                // to drop a half-dragged box, and same drawer close because the
+                // drag needs the map the drawer is covering.
+                self.set_region_pick_armed(on);
                 if on {
                     self.drawer_open = false;
                 }

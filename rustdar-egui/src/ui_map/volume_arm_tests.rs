@@ -668,7 +668,13 @@ fn picked_region(half_east_km: f64, half_north_km: f64) -> crate::pane::VolumeRe
     .expect("a region centred on a point on Earth with a finite extent")
 }
 
-/// Give pane `idx` a picked region, as the selector will.
+/// Give pane `idx` a picked region, as the selector does.
+///
+/// A direct write rather than a driven drag, deliberately: these tests are
+/// about what a *stored* region implies, and driving the gesture would make
+/// every one of them also a test of the arm. The gesture that produces one is
+/// `ui_map::region_pick_tests`, which asserts the same zoom property again on a
+/// region that arrived that way.
 fn pick_region(h: &mut InputHarness, idx: usize, region: crate::pane::VolumeRegion) {
     h.gui_mut()
         .pane_mut(idx)

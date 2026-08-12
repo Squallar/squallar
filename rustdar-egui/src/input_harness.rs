@@ -1231,6 +1231,55 @@ impl InputHarness {
         self.gui.set_section_draw_armed(armed);
     }
 
+    /// Whether the 3D region pick is armed, as the toggle sets it.
+    pub(crate) fn region_pick_armed(&self) -> bool {
+        self.gui.region_pick_armed()
+    }
+
+    /// Arm or disarm the 3D region pick.
+    ///
+    /// The toggle's own end-to-end click has its own test; this is for the
+    /// pointer tests, whose subject is the drag rather than the checkbox —
+    /// `set_section_draw_armed`'s arrangement exactly.
+    pub(crate) fn set_region_pick_armed(&mut self, armed: bool) {
+        self.gui.set_region_pick_armed(armed);
+    }
+
+    /// The region pane `idx` has stored, or `None` for the volume's own reach.
+    pub(crate) fn volume_region(&self, idx: usize) -> Option<crate::pane::VolumeRegion> {
+        self.gui.pane(idx)?.volume()?.region
+    }
+
+    /// The map pane `idx`'s region was picked on, if it is a 3D pane that was
+    /// aimed from one.
+    pub(crate) fn volume_source_pane(&self, idx: usize) -> Option<usize> {
+        self.gui.pane(idx)?.volume()?.source_pane
+    }
+
+    /// Drag a square out while the region pick is armed: press at `centre`,
+    /// move to `corner`, release there.
+    ///
+    /// No pane argument, because the drag does not take one: which pane the box
+    /// belongs to is decided by where the press lands, which is the whole
+    /// design — the user arms the mode and *then* chooses a map.
+    ///
+    /// A helper rather than six lines per test, because the *frame cadence* is
+    /// load-bearing and easy to get subtly wrong. The pointer has to be moved
+    /// and a frame drawn before the press, or the press frame's `interact_pos`
+    /// is the last position the harness knew about rather than the one under
+    /// the finger — which puts the box's centre somewhere the test never asked
+    /// for and makes the failure look like a projection bug.
+    pub(crate) fn drag_region(&mut self, centre: egui::Pos2, corner: egui::Pos2) {
+        self.mouse_move(centre);
+        self.frame();
+        self.mouse_press(centre);
+        self.frame();
+        self.mouse_move(corner);
+        self.frame();
+        self.mouse_release(corner);
+        self.frames_for(2, FRAME_DT);
+    }
+
     /// The line pane `idx` is aimed along, if it is a section pane with one.
     pub(crate) fn section_line(&self, idx: usize) -> Option<SectionLine> {
         self.gui.pane(idx)?.cross_section()?.line

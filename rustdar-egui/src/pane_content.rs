@@ -999,6 +999,30 @@ pub struct VolumePane {
     /// frames before a `None` pane's first grid lands and there is nothing yet
     /// to read a width off.
     pub region: Option<VolumeRegion>,
+    /// Which map pane the region was dragged out on, or `None` for a pane
+    /// nobody aimed — one that opened on the whole ring, was reset, or came
+    /// back from a config whose index the layout no longer has.
+    ///
+    /// **Deliberately not inside [`VolumeRegion`]**, which is a
+    /// [`VolumeTarget`] field and therefore a resample cache key: a region
+    /// re-dragged from a different map is the same ground and must not rebuild
+    /// an 8 MiB grid to say so. This is a fact about *where the choice came
+    /// from*, not about the box, and the two have different lifetimes — the
+    /// index goes stale when the layout shrinks and the box does not.
+    ///
+    /// It earns its place twice. The pick's target rule re-aims the 3D pane a
+    /// map already feeds rather than opening a second one, which is what stops
+    /// a user adjusting a box from filling the screen with panes; and the
+    /// committed box is drawn back on that map, which is the honest answer to
+    /// "where is that volume from". Both are exactly what
+    /// [`CrossSectionPane::source_pane`] does for a section line, and this is
+    /// the same field for the same two reasons.
+    ///
+    /// Persisted beside the region, and validated against the restored pane
+    /// count the same way a section's is: a dangling index is dropped to `None`
+    /// rather than kept, because a stale index would aim a future drag at
+    /// whatever pane happened to inherit the slot.
+    pub source_pane: Option<crate::pane::PaneId>,
     /// Which volume the grid on screen was built from, or `None` before the
     /// first build.
     pub rendered_for: Option<VolumeTarget>,

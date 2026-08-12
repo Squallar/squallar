@@ -1123,6 +1123,127 @@ fn a_picked_region_survives_a_save_and_load() {
     );
 }
 
+/// The map a region was picked on survives the round trip beside the region.
+///
+/// Two things depend on it and both are invisible until they are gone: a second
+/// drag on that map re-aims *this* pane rather than opening another one, and
+/// this pane's box is drawn back on that map — the only on-screen answer to
+/// "where is that volume from". A reopen that lost it would leave a layout that
+/// looked identical and behaved differently the next time the user dragged.
+#[test]
+fn the_map_a_region_was_picked_on_survives_a_save_and_load() {
+    let picked = crate::pane::VolumeRegion::new(
+        crate::pane::GeoPoint {
+            lat: 35.33,
+            lon: -97.28,
+        },
+        rustdar_radar::voxel::HalfExtentKm::square(115.0),
+    )
+    .expect("a region on Earth with a finite extent");
+
+    let mut gui = crate::Gui::new();
+    gui.set_pane_count(2);
+    gui.pane_mut(1)
+        .expect("pane 1")
+        .set_view(rustdar_radar::types::RenderView::Volume);
+    {
+        let volume = gui
+            .pane_mut(1)
+            .expect("pane 1")
+            .volume_mut()
+            .expect("a 3D pane");
+        volume.region = Some(picked);
+        volume.source_pane = Some(0);
+    }
+
+    let store = MemoryConfigStore::default();
+    gui.save_ui_config(&store);
+    let mut restored = crate::Gui::new();
+    restored.load_ui_config(&store);
+
+    let volume = restored
+        .pane(1)
+        .expect("pane 1")
+        .volume()
+        .expect("a 3D pane")
+        .clone();
+    assert_eq!(
+        volume.region,
+        Some(picked),
+        "the region did not survive beside its source",
+    );
+    assert_eq!(
+        volume.source_pane,
+        Some(0),
+        "the pane forgot which map aimed it, so the next drag on pane 0 opens a \
+         second 3D view instead of adjusting this one",
+    );
+}
+
+/// A source index the restored layout does not have is **forgotten, and the
+/// region is kept**.
+///
+/// Six panes opened on a desktop and reopened on a phone brings back indices
+/// that now name a different pane or none at all. Dropped rather than clamped,
+/// for the reason a section's dangling source is: re-aiming a 3D view from
+/// whichever map happens to sit at a nearby index is worse than treating it as
+/// never having been aimed from anywhere.
+///
+/// The **region survives it**, and that asymmetry is the point. A region is
+/// ground, and ground does not stop existing because the map it was drawn on
+/// did — the pane comes back showing exactly what it showed, which is the whole
+/// of the 1:1 reopen rule. What is lost is only the preference about where a
+/// future drag lands, which is a fact about a layout that no longer exists.
+#[test]
+fn a_dangling_source_pane_is_forgotten_and_the_region_kept() {
+    let picked = crate::pane::VolumeRegion::new(
+        crate::pane::GeoPoint {
+            lat: 35.33,
+            lon: -97.28,
+        },
+        rustdar_radar::voxel::HalfExtentKm::square(115.0),
+    )
+    .expect("a region on Earth with a finite extent");
+
+    let mut wide = crate::Gui::new();
+    wide.set_pane_count(4);
+    wide.pane_mut(1)
+        .expect("pane 1")
+        .set_view(rustdar_radar::types::RenderView::Volume);
+    {
+        let volume = wide
+            .pane_mut(1)
+            .expect("pane 1")
+            .volume_mut()
+            .expect("a 3D pane");
+        volume.region = Some(picked);
+        // The highest pane of the wide layout, so the narrow one below cannot
+        // hold it.
+        volume.source_pane = Some(3);
+    }
+
+    let store = MemoryConfigStore::default();
+    wide.save_ui_config(&store);
+
+    // Reopened into a layout that does not reach index 3.
+    let mut narrow = crate::Gui::new();
+    narrow.load_ui_config(&store);
+    narrow.set_pane_count(2);
+
+    let volume = narrow
+        .pane(1)
+        .expect("pane 1")
+        .volume()
+        .expect("a 3D pane")
+        .clone();
+    assert_eq!(
+        volume.region,
+        Some(picked),
+        "the region was dropped along with its dangling source - the ground the user \
+         picked does not stop existing because the map it was drawn on did",
+    );
+}
+
 /// What the write-side finiteness filter actually prevents — and it is worse
 /// than "the config fails to serialize".
 ///

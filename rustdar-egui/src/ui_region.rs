@@ -1,12 +1,15 @@
-//! What a 3D pane's stored region implies: the viewport its floor is drawn
+//! A 3D pane's region: the one gesture that picks one, and the two things a
+//! picked or defaulted region then implies — the viewport its floor is drawn
 //! through, and the zoom gesture that must not touch either.
 //!
-//! Both halves run **from** the region rather than towards it, and that is the
-//! whole of what this module is now. [`viewport_for_region`] frames the floor
-//! strip on the box; [`zoom_camera`] spends the wheel on the eye. Nothing here
-//! writes a region.
+//! [`RegionDrag`] is the **only** writer of a region in this program, and it
+//! writes one exactly once per completed drag. Everything else here runs
+//! **from** the region rather than towards it: [`viewport_for_region`] frames
+//! the floor strip on the box; [`zoom_camera`] spends the wheel on the eye.
+//! Neither of those two writes a region, and that separation is the subject of
+//! the section below.
 //!
-//! # The region is stored, and this module does not write it
+//! # The region is stored, and only a deliberate gesture writes it
 //!
 //! A 3D pane resamples a stored patch of ground: the volume's own data reach,
 //! circumscribed — the whole ring — or a smaller region the user picked. It
@@ -15,6 +18,13 @@
 //! a window resize. See [`crate::pane::VolumeRegion`], which is where it now
 //! lives, and [`rustdar_radar::voxel::box_half_width_km`], which answers the
 //! unselected case from the reach.
+//!
+//! "The selection changes" is [`RegionDrag`] and nothing else, which is what
+//! keeps that list short: a writer reachable only from an armed mode, a
+//! deliberate drag and a release cannot be reached by a gesture that meant to
+//! do something else. The old derivation was the opposite — it was reached by
+//! *every* frame — and that is why zoom, pan, divider drags and window resizes
+//! were all on the list at once.
 //!
 //! It used to be **derived**, every frame, from the pane's own viewport, and
 //! that is the defect this module was rebuilt to remove. Deriving it made the
@@ -68,6 +78,243 @@
 //! projection and out by a fraction of a percent in Mercator, and at the tight
 //! end that fraction decided whether a box was legal at all. A clamp on a
 //! camera ratio has no projection in it and nothing to verify.
+
+/// The armed region pick's yellow: the box in flight, the resolution hint over
+/// its top edge, and the active pane's armed hint chip all paint in this one
+/// colour — so the chip advertises exactly the box the drag will draw.
+///
+/// Deliberately **not** `ui_map`'s `SECTION_TRACK_COLOR`, 255,214,10:
+/// the two armed modes are mutually exclusive and a user who armed the wrong
+/// one has the chip's colour as the fastest way to notice. Warm for the reason
+/// that constant gives — every overlay in the registry is a hazard colour or a
+/// muted grey and the radar image spans the spectrum, so an arm has to stay
+/// findable over a 70 dBZ core — but a paler, sandier warm than the section
+/// track's saturated amber.
+///
+/// A *committed* region is drawn back on its map in a different colour: it is a
+/// record, not the gesture. See `ui_map`'s `REGION_COMMITTED_COLOR`.
+pub(crate) const REGION_ARM_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 220, 120);
+
+/// A region drag in flight.
+///
+/// Geographic, and converted on the press frame: a pixel anchor denotes
+/// different ground after a mid-drag wheel zoom, and zoom is *not* suppressed
+/// while armed even though pan is. The same argument
+/// [`crate::pane::SectionLine`] makes at length, and the same one
+/// [`crate::ui_input::ArmedDragGesture::Anchored`] states for the gesture that
+/// feeds this.
+///
+/// Held on the `Gui` rather than on the pane because it is a property of the
+/// *gesture*, and a gesture that started on one pane must not be inherited by
+/// another when the layout changes under it — which is what [`Self::pane_idx`]
+/// is checked for on every frame of the drag.
+///
+/// # Why it is square
+///
+/// A single half-width, applied to both axes on commit. The box **can** be a
+/// rectangle — [`crate::pane::VolumeRegion`] carries a
+/// [`HalfExtentKm`](rustdar_radar::voxel::HalfExtentKm) with an axis each, and
+/// says at length why — so this is a choice about the *gesture*, not a
+/// limitation of what it can produce.
+///
+/// It is square because the alternative that was tried is worse. Keying the
+/// picked box on the **pane's aspect** is the obvious way to make a 3D view
+/// fill its pane, and it puts the divider back on the list of things that
+/// change the region: drag the divider between two panes and the aspect
+/// changes, so the box changes, so the ground the pane resamples changes — the
+/// exact defect the stored region exists to remove, reintroduced through a
+/// different door. A square asks nothing about the pane it is drawn on, so
+/// there is no pane geometry left for a region to depend on.
+///
+/// Squaring a *free* rectangle drag would be worse still: silently squaring a
+/// user's drag reads as a bug the first time they drag a wide box and get a
+/// tall one. So the square is drawn from the first frame — pressing sets the
+/// centre and dragging sets the half-width, which is the shape of the request
+/// made visible.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct RegionDrag {
+    /// Which map pane the press landed on. A drag belongs to one pane for its
+    /// whole life; the pointer leaving that pane's rect does not end it, because
+    /// dragging past the edge of a pane to make a big box is ordinary.
+    pane_idx: crate::pane::PaneId,
+    /// The box's centre, fixed on the press frame and never revised.
+    centre: crate::pane::GeoPoint,
+    /// Half-width in kilometres as the pointer currently stands. Capped at the
+    /// resampler's maximum on the way in — see [`Self::extend_to`] — but *not*
+    /// held up to its minimum: a too-small drag is refused whole at commit
+    /// rather than resized. Zero until the pointer moves.
+    half_width_km: f64,
+}
+
+impl RegionDrag {
+    /// Start a drag centred on `centre`.
+    ///
+    /// `None` for a press the projector could not place on Earth — which happens
+    /// for a pane collapsed to nothing by a divider drag. Refused rather than
+    /// clamped, because there is no nearest sensible patch of ground and
+    /// `f64::clamp` propagates NaN.
+    pub(crate) fn begin(
+        pane_idx: crate::pane::PaneId,
+        centre: crate::pane::GeoPoint,
+    ) -> Option<Self> {
+        centre.is_on_earth().then_some(Self {
+            pane_idx,
+            centre,
+            half_width_km: 0.0,
+        })
+    }
+
+    /// Which pane this drag belongs to.
+    pub(crate) fn pane_idx(self) -> crate::pane::PaneId {
+        self.pane_idx
+    }
+
+    /// The centre the press fixed.
+    pub(crate) fn centre(self) -> crate::pane::GeoPoint {
+        self.centre
+    }
+
+    /// Half-width as it currently stands, kilometres.
+    pub(crate) fn half_width_km(self) -> f64 {
+        self.half_width_km
+    }
+
+    /// Re-measure the half-width against a pointer now over `corner`.
+    ///
+    /// **Chebyshev, not Euclidean**: the half-width is the larger of the two
+    /// axis distances, so the square's *edge* follows the pointer rather than its
+    /// corner. Dragging straight right therefore grows the box at the rate the
+    /// pointer moves, which is what makes the square read as being pulled out
+    /// rather than as tracking something behind the cursor.
+    ///
+    /// A `corner` that is not on Earth leaves the drag exactly as it was. That is
+    /// the same refusal [`Self::begin`] makes, and it matters more here: this runs
+    /// every frame, so a single laundered NaN would stick for the rest of the
+    /// drag.
+    ///
+    /// **The result is capped at the resampler's maximum** —
+    /// [`MAX_HALF_WIDTH_KM`](rustdar_radar::voxel::MAX_HALF_WIDTH_KM), which is
+    /// the square case of the corner bound [`VolumeRegion::new`] clamps to on
+    /// commit. The preview box and its hint read this value straight off the
+    /// drag, so without the cap a long drag would paint an ever-bigger square
+    /// past 470 km and release the same box every time — what is drawn has to be
+    /// what is resampled. The *minimum* is deliberately not applied here: a
+    /// too-small drag is refused whole by [`Self::commit`] rather than resized,
+    /// so the preview honestly shows the too-small square that is about to be
+    /// discarded.
+    ///
+    /// [`VolumeRegion::new`]: crate::pane::VolumeRegion::new
+    pub(crate) fn extend_to(&mut self, corner: crate::pane::GeoPoint) {
+        if !corner.is_on_earth() {
+            return;
+        }
+        // The codebase's real geodesy, and the same function the resampler
+        // places the box's own corners with — not a flat approximation, which
+        // is what `corners_for` is allowed to use because it only ever draws.
+        let (bearing_deg, range_km) = rustdar_radar::beam::site_bearing_range_km(
+            self.centre.lat,
+            self.centre.lon,
+            corner.lat,
+            corner.lon,
+        );
+        let bearing = bearing_deg.to_radians();
+        let east = (range_km * bearing.sin()).abs();
+        let north = (range_km * bearing.cos()).abs();
+        let half = east.max(north);
+        if half.is_finite() {
+            self.half_width_km = half.min(rustdar_radar::voxel::MAX_HALF_WIDTH_KM);
+        }
+    }
+
+    /// The region this drag would commit, or `None` if it is too small to be one.
+    ///
+    /// The bar is the resampler's own [`MIN_HALF_WIDTH_KM`] rather than a pixel
+    /// count, and that is the useful choice: a drag below it would be *clamped*
+    /// up by `build_voxels`, so committing it would resample a box the user did
+    /// not draw and the pane's own resolution readout would describe the wrong
+    /// picture. Refusing instead means every committed region is one that will
+    /// be honoured exactly.
+    ///
+    /// A **kilometre** bar rather than the section draw's
+    /// [`MIN_SECTION_DRAG_PT`](crate::ui_input::MIN_SECTION_DRAG_PT), and the
+    /// difference is not an oversight: a line is refused for being an
+    /// accidental *tap*, which is a fact about the gesture and therefore about
+    /// points on a screen; a box is refused for naming ground the resampler
+    /// will not honour, which is a fact about kilometres. A 24-point drag at a
+    /// continental zoom is a legitimate 300 km box, and a 24-point drag at
+    /// street level is 200 m and is not.
+    ///
+    /// The mode stays armed when this answers `None` — that decision belongs to
+    /// the caller, and it is stated here because it is the reason this returns
+    /// an `Option` rather than clamping.
+    ///
+    /// [`MIN_HALF_WIDTH_KM`]: rustdar_radar::voxel::MIN_HALF_WIDTH_KM
+    pub(crate) fn commit(self) -> Option<crate::pane::VolumeRegion> {
+        (self.half_width_km >= rustdar_radar::voxel::MIN_HALF_WIDTH_KM)
+            .then(|| {
+                crate::pane::VolumeRegion::new(
+                    self.centre,
+                    rustdar_radar::voxel::HalfExtentKm::square(self.half_width_km),
+                )
+            })
+            .flatten()
+    }
+}
+
+/// A box's corners as geographic points, `(north-west, south-east)`.
+///
+/// For drawing only. A free function over a centre and an extent rather than a
+/// method on [`crate::pane::VolumeRegion`], so that a *committed* region and
+/// the preview of the drag that produced it are drawn by the same arithmetic —
+/// two versions disagreeing by a pixel would be read as the commit having moved
+/// the box.
+///
+/// # Why it takes both axes when the drag only ever makes squares
+///
+/// Because the committed box it also draws need not be one. A config can carry
+/// a rectangle, and
+/// [`HalfExtentKm::clamped`](rustdar_radar::voxel::HalfExtentKm::clamped)
+/// scales both axes of an oversized ask by one factor rather than reshaping it,
+/// so a region is a rectangle in general even though [`RegionDrag`] only
+/// produces the square case. Taking the extent whole is also what stops the two
+/// axes being transposed — the reason
+/// [`HalfExtentKm`](rustdar_radar::voxel::HalfExtentKm) is a named struct
+/// rather than two `f64`s.
+///
+/// The latitude conversion is the flat approximation named on
+/// [`KM_PER_DEGREE_LAT`](rustdar_radar::types::KM_PER_DEGREE_LAT); the longitude
+/// one divides by `cos(lat)` so the box is sized in *kilometres* rather than in
+/// degrees, which is the whole point — a degree-square box drawn at 35°N would
+/// be 22% wider than it is tall and would not be the box that gets resampled.
+///
+/// The approximation is worth at most a pixel of drawn edge and never a
+/// kilometre of grid: [`RegionDrag::extend_to`] measures the drag itself with
+/// [`rustdar_radar::beam::site_bearing_range_km`], the codebase's real geodesy,
+/// and this is only ever asked where the resulting box goes on screen.
+///
+/// `None` at the poles, where `cos(lat)` is zero and every longitude is the same
+/// place. No NEXRAD site is within 20° of one; the check is here because the
+/// alternative is an infinity in a painter.
+pub(crate) fn corners_for(
+    centre: crate::pane::GeoPoint,
+    half: rustdar_radar::voxel::HalfExtentKm,
+) -> Option<(crate::pane::GeoPoint, crate::pane::GeoPoint)> {
+    let d_lat = half.north_km / rustdar_radar::types::KM_PER_DEGREE_LAT;
+    let cos_lat = centre.lat.to_radians().cos();
+    if !(cos_lat.is_finite() && cos_lat.abs() > 1e-6) {
+        return None;
+    }
+    let d_lon = half.east_km / (rustdar_radar::types::KM_PER_DEGREE_LAT * cos_lat);
+    let nw = crate::pane::GeoPoint {
+        lat: centre.lat + d_lat,
+        lon: centre.lon - d_lon,
+    };
+    let se = crate::pane::GeoPoint {
+        lat: centre.lat - d_lat,
+        lon: centre.lon + d_lon,
+    };
+    (d_lat.is_finite() && d_lon.is_finite()).then_some((nw, se))
+}
 
 /// `walkers::Map::zoom_speed`'s default, which the plan view leaves alone.
 ///
@@ -543,7 +790,13 @@ pub(crate) fn viewport_for_region(
 /// [`rustdar_radar::beam::site_bearing_range_km`] rather than a flat
 /// approximation, because it is the codebase's real geodesy and the same
 /// function the resampler places the box's own corners with.
-fn ground_half_extent(
+///
+/// `pub(crate)` for the tests in `ui_map` rather than for any caller: it is the
+/// instrument the coverage property is measured with, and the end-to-end pin —
+/// that a **picked** region's floor is framed on that region rather than on the
+/// site — has to measure the same way this module's own unit sweep does, or the
+/// two could pass while disagreeing about what "covers" means.
+pub(crate) fn ground_half_extent(
     rect: egui::Rect,
     map_memory: &walkers::MapMemory,
     centre: walkers::Position,

@@ -56,6 +56,14 @@ const LAYERS_TOGGLE_LABEL: &str = "\u{25a3} Layers";
 /// word, a menu for a sentence. `∕` (division slash — a carried diagonal)
 /// rather than the uncarried `╱`.
 const SECTION_TOGGLE_LABEL: &str = "\u{2215} X-sec";
+/// The 3D region arm toggle, [`SECTION_TOGGLE_LABEL`]'s sibling and styled
+/// identically: the two are the bar's armed-drag pair and a user has to be able
+/// to see at a glance which of them is lit.
+///
+/// `⛶` is the glyph `ui_glyphs.rs` already assigns to "3D region arm (top bar)
+/// and the 3D view header" — a square being framed, which is the gesture — and
+/// using the 3D view's own icon is what ties the arm to the picture it aims.
+const REGION_TOGGLE_LABEL: &str = "\u{26f6} Region";
 /// The inspector toggle. Selected-state styled while the inspector is open —
 /// the mirror of [`LAYERS_TOGGLE_LABEL`] for the right-hand panel.
 const INSPECTOR_TOGGLE_LABEL: &str = "\u{2699} Inspector";
@@ -160,8 +168,21 @@ impl super::Gui {
                         }
                         if section.clicked() {
                             // Through the setter: disarming drops a half-made
-                            // gesture rather than committing it.
+                            // gesture rather than committing it, and arming
+                            // disarms the region pick beside it — which is why
+                            // neither of these two toggles has to know about
+                            // the other.
                             self.set_section_draw_armed(!armed);
+                        }
+
+                        let region_armed = self.region_pick_armed();
+                        let region = ui.selectable_label(region_armed, REGION_TOGGLE_LABEL);
+                        #[cfg(test)]
+                        {
+                            probe.region_arm = (region.rect, region_armed);
+                        }
+                        if region.clicked() {
+                            self.set_region_pick_armed(!region_armed);
                         }
 
                         // Everything else takes what the toggles left, reading
@@ -259,6 +280,23 @@ impl super::Gui {
                     // to the bar's route. Disarming keeps whatever is up,
                     // as the dropdown does.
                     if !armed && self.top_sheet_page().is_some() {
+                        self.clear_sheet_pages();
+                    }
+                }
+
+                let region_armed = self.region_pick_armed();
+                let region = ui
+                    .selectable_label(region_armed, "\u{26f6}")
+                    .on_hover_text("Pick 3D region");
+                #[cfg(test)]
+                {
+                    probe.region_arm = (region.rect, region_armed);
+                }
+                if region.clicked() {
+                    self.set_region_pick_armed(!region_armed);
+                    // The sheet rule above, unchanged: the box is dragged on
+                    // the map, so a page over it has to go.
+                    if !region_armed && self.top_sheet_page().is_some() {
                         self.clear_sheet_pages();
                     }
                 }
@@ -404,7 +442,8 @@ impl super::Gui {
                                 matches!(
                                     event,
                                     ui_menu::MenuEvent::Toggled(
-                                        ui_menu::MenuToggle::DrawCrossSection,
+                                        ui_menu::MenuToggle::DrawCrossSection
+                                            | ui_menu::MenuToggle::PickRegion,
                                         true,
                                     )
                                 )
