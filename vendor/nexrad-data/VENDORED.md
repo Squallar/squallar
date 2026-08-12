@@ -349,6 +349,76 @@ instruction counts, which reproduce to within 1,500 out of 52 billion.
 The decoded-moment digest and the raw decompressed-bytes digest are unchanged
 over all 14 volumes.
 
+## The change that is not here: reusing the decompressor
+
+Worth writing down, because it is the largest remaining win in this function by
+a wide margin, it was attempted, and it is blocked by a dependency rather than
+by a judgement call. Somebody will have this idea again.
+
+**The prize.** Allocation sizes during a decompress pass, bucketed exactly by a
+counting `GlobalAlloc` — not read off the source:
+
+| size | count | total | per record |
+| --- | --- | --- | --- |
+| **3,600,000** | 91 | **327,600,000** | **1.00** |
+| 262,144 | 91 | 23,855,104 | 1.00 |
+| 60,952 | 91 | 5,546,632 | 1.00 |
+| 8,192 | 91 | 745,472 | 1.00 |
+| 80 | 91 | 7,280 | 1.00 |
+
+That is one KFTG volume, 91 records. Exactly one 3,600,000-byte allocation per
+record, and it is **91.6%** of every byte the decompression allocates. The TDWR
+volumes give the identical shape and the identical 91.6%.
+
+It is libbzip2's `tt` array, `blockSize100k × 100000 × 4` bytes for the `BZh9`
+streams NEXRAD uses, allocated when the stream header is read. Eliminating it
+by holding one decompressor per worker instead of one per record would take
+KFTG's amplification from 7.26× to about **2.9×**, TDWR's from 22.77× to about
+**2.0×**, and per-worker live bytes from 5.77 MB to about 2.17 MB — which is
+most of the peak-RSS growth with core count.
+
+**Why it is not here.** `bzip2` 0.6.1 does not expose any way to reuse a
+decompressor, and 0.6.1 is the newest published version — there is no later one
+to move to. Checked, not assumed:
+
+- `bzip2::Decompress` has exactly `new(small: bool)`, `decompress`,
+  `decompress_uninit`, `decompress_vec`, `total_in`, `total_out`. `new` is the
+  only constructor.
+- `grep -rn "reset\|reinit" bzip2-0.6.1/src/` returns nothing. There is no
+  `reset` on `Decompress`, on `read::BzDecoder`, on `bufread::BzDecoder`, or on
+  `MultiBzDecoder`.
+- `MultiBzDecoder` is not a way in. It is `BzDecoder::new(r).multi(true)`, and
+  `multi` is private — it decodes *concatenated* streams inside one reader, and
+  LDM records are neither concatenated nor wanted in one output buffer.
+- `impl Drop for Stream<DirDecompress>` calls `BZ2_bzDecompressEnd`, whose
+  implementation in `libbz2-rs-sys` is `s.tt.dealloc(&allocator)`. So the 3.6 MB
+  is freed with the decompressor by construction, and even a `reset` written as
+  End-then-Init would give it straight back.
+
+The two ways to have it anyway are forking `bzip2` as well, or calling
+`libbz2-rs-sys` directly through `unsafe` and a `-sys` dependency this crate
+does not have. Both are a larger and worse change than the one they would
+enable, in a directory whose value depends on its diff staying readable.
+
+**What to do instead.** The fix belongs in `bzip2`: a `Decompress::reset` that
+keeps the `tt` allocation when the new stream's `blockSize100k` matches the old
+one — which for NEXRAD it always does, every record being `BZh9`. `flate2`
+already has exactly this shape of API (`Decompress::reset`). That is an
+upstream issue against `bzip2`, and this section is the evidence for it.
+
+## One more thing measured and left alone
+
+The `8,192`-byte row in the table above is a `BufReader`, one per record, from
+`bzip2::read::BzDecoder::new` — which is `bufread::BzDecoder::new(BufReader::new(r))`.
+The input here is already a `&[u8]`, which implements `BufRead`, so
+`bufread::BzDecoder` would drop both the allocation and the copy of every
+compressed byte through it.
+
+Left alone deliberately: it is 0.2% of the bytes allocated and roughly 0.015%
+of the instructions, which is below the noise this directory's changes are
+being judged against, and it is a fourth change in a diff that is meant to
+carry three. Recorded here so it is not rediscovered as a surprise.
+
 ## rustfmt
 
 `cargo fmt --all -- --check` is clean over this directory as vendored, checked
