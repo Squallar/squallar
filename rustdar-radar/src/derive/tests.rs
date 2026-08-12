@@ -431,13 +431,13 @@ fn a_derived_section_slices_the_derived_field() {
 /// source slot's.
 #[test]
 fn a_derived_voxel_grid_resamples_the_derived_field() {
-    use crate::voxel::{VoxelRequest, VoxelShape, build_voxels_with_motion};
+    use crate::voxel::{HalfExtentKm, VoxelRequest, VoxelShape, build_voxels_with_motion};
     let flow = |az: f64| 25.0 * (az - 180.0).to_radians().cos();
     let scan = scan_with(&move |az, _| (Some(40.0), Some(flow(az)), None, Some(0.99)));
     let site = (35.33306, -97.2775);
     let req = |product| VoxelRequest {
         centre: site,
-        half_width_km: Some(30.0),
+        half_extent_km: Some(HalfExtentKm::square(30.0)),
         base_km_msl: 0.0,
         top_km_msl: 4.0,
         product,

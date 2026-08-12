@@ -215,7 +215,7 @@ fn a_voxel_job() -> JobRequest {
         input: Box::new(a_volume_input()),
         request: VoxelRequest {
             centre: (35.0, -97.0),
-            half_width_km: Some(60.0),
+            half_extent_km: Some(rustdar_radar::voxel::HalfExtentKm::square(60.0)),
             base_km_msl: 0.0,
             top_km_msl: 15.0,
             product: rustdar_radar::types::RadarProduct::Reflectivity,
@@ -244,7 +244,7 @@ fn a_sourceless_voxel_job() -> JobRequest {
         JobRequest::Voxels { input, request } => JobRequest::Voxels {
             input,
             request: VoxelRequest {
-                half_width_km: None,
+                half_extent_km: None,
                 ..request
             },
         },

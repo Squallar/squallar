@@ -887,7 +887,7 @@ fn measure_floor_against_grid_on_a_real_volume() {
     // The grid, exactly as `handle_prepare_volume` requests the default box.
     let request = rustdar_radar::voxel::VoxelRequest {
         centre: (site_lat, site_lon),
-        half_width_km: half_km,
+        half_extent_km: half_km.map(rustdar_radar::voxel::HalfExtentKm::square),
         base_km_msl: rustdar_radar::voxel::DEFAULT_BASE_KM_MSL,
         top_km_msl: rustdar_radar::voxel::DEFAULT_TOP_KM_MSL,
         product: RadarProduct::Reflectivity,
@@ -1543,7 +1543,7 @@ fn a_planted_storm_lands_on_the_floor_exactly_under_its_own_voxels() {
     // Path one: the voxel build, at the app's own default request.
     let request = rustdar_radar::voxel::VoxelRequest {
         centre: (site.lat, site.lon),
-        half_width_km: None,
+        half_extent_km: None,
         base_km_msl: rustdar_radar::voxel::DEFAULT_BASE_KM_MSL,
         top_km_msl: rustdar_radar::voxel::DEFAULT_TOP_KM_MSL,
         product: RadarProduct::Reflectivity,
@@ -1715,7 +1715,7 @@ fn a_broken_mapping_costs_iou_in_the_corner_even_where_the_centre_cannot_tell() 
 
     let request = rustdar_radar::voxel::VoxelRequest {
         centre: (site.lat, site.lon),
-        half_width_km: None,
+        half_extent_km: None,
         base_km_msl: rustdar_radar::voxel::DEFAULT_BASE_KM_MSL,
         top_km_msl: rustdar_radar::voxel::DEFAULT_TOP_KM_MSL,
         product: RadarProduct::Reflectivity,

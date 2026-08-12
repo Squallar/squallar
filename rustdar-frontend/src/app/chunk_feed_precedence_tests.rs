@@ -221,8 +221,8 @@ fn a_picked_region_decides_the_ground_that_is_resampled() {
     let default = voxel_request_for(&target(None), 35.33, -97.28);
     assert_eq!(default.centre, (35.33, -97.28), "no region means the site");
     assert_eq!(
-        default.half_width_km, None,
-        "no region must leave the width to `build_voxels`, which is the only \
+        default.half_extent_km, None,
+        "no region must leave the extent to `build_voxels`, which is the only \
          side of the seam that holds the volume the reach comes from",
     );
 
@@ -240,7 +240,10 @@ fn a_picked_region_decides_the_ground_that_is_resampled() {
         (36.1, -98.4),
         "a picked region must move the box off the site",
     );
-    assert_eq!(aimed.half_width_km, Some(22.5));
+    assert_eq!(
+        aimed.half_extent_km,
+        Some(rustdar_radar::voxel::HalfExtentKm::square(22.5)),
+    );
 }
 
 /// The vertical extent is not part of the region pick.

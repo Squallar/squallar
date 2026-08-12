@@ -45,7 +45,7 @@ use rustdar_frontend::volume::raymarch::VolumePipelines;
 use rustdar_frontend::volume::raymarch::staging::{STAGING_RING_FEATURE, VolumeStaging};
 use rustdar_frontend::volume::uniform::VolumeUniform;
 use rustdar_radar::types::RadarProduct;
-use rustdar_radar::voxel::{DESKTOP_SHAPE, VoxelGrid, VoxelRequest, build_voxels};
+use rustdar_radar::voxel::{DESKTOP_SHAPE, HalfExtentKm, VoxelGrid, VoxelRequest, build_voxels};
 
 /// The volume reader and the site it learns, shared with the other two live
 /// instruments in this directory. See `live_volume/mod.rs` for why the site
@@ -70,7 +70,7 @@ fn measure_the_raymarch_cost_on_a_real_volume() {
 
     let request = VoxelRequest {
         centre: (parsed("CENTRE_LAT"), parsed("CENTRE_LON")),
-        half_width_km: Some(parsed_or("HALF_KM", 75.0)),
+        half_extent_km: Some(HalfExtentKm::square(parsed_or("HALF_KM", 75.0))),
         base_km_msl: 0.0,
         top_km_msl: 18.0,
         product: RadarProduct::Reflectivity,

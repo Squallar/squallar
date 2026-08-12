@@ -777,11 +777,14 @@ pub struct VolumeTarget {
 ///
 /// # Why a square
 ///
-/// That is what [`VoxelRequest`] takes: one `half_width_km` for both horizontal
-/// axes, over a grid whose cell counts are fixed. A free rectangle would have to
-/// be either squared silently or honoured with a non-uniform grid, which is a
-/// different resample. So a viewport that is not square inscribes a square in
-/// its shorter axis, and the box stays inside the floor on every side.
+/// Because this type still carries one number. [`VoxelRequest`] takes a
+/// [`HalfExtentKm`] with an axis each, and `build_voxels` honours the two
+/// separately, so the resampler is no longer what forces this — but until the
+/// pick itself is measured per axis, a viewport that is not square inscribes a
+/// square in its shorter axis, and the box stays inside the floor on every
+/// side.
+///
+/// [`HalfExtentKm`]: rustdar_radar::voxel::HalfExtentKm
 ///
 /// # The half-width is a resolution control, not just a crop
 ///

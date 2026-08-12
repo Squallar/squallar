@@ -1682,9 +1682,15 @@ impl DrawnBox {
     fn for_target(target: &VolumeTarget, grid: &VoxelGrid) -> Option<Self> {
         let region = target.region?;
         let (site_lat, site_lon) = grid.site();
+        // `square` because that is what a `VolumeRegion` is today — one number
+        // for both axes — spelled at the call site rather than hidden in a
+        // second clamp, so the day the region grows a second extent this line
+        // stops compiling instead of silently squaring it. `clamped` is the
+        // resampler's own, not a copy of its bounds: `horizontal_ranges_km`
+        // gives the arithmetic that needs the two to agree bit for bit.
         let (x_km, y_km) = rustdar_radar::voxel::horizontal_ranges_km(
             (region.centre().lat, region.centre().lon),
-            rustdar_radar::voxel::clamped_half_width_km(region.half_width_km()),
+            rustdar_radar::voxel::HalfExtentKm::square(region.half_width_km()).clamped(),
             site_lat,
             site_lon,
         );

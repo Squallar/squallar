@@ -165,7 +165,7 @@ pub(crate) fn ready_grid() -> VolumeEntry {
     );
     let request = rustdar_radar::voxel::VoxelRequest {
         centre: (35.33, -97.27),
-        half_width_km: Some(40.0),
+        half_extent_km: Some(rustdar_radar::voxel::HalfExtentKm::square(40.0)),
         base_km_msl: 0.0,
         top_km_msl: 10.0,
         product: RadarProduct::Reflectivity,

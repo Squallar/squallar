@@ -134,7 +134,8 @@ fn ready_grid() -> VolumeEntry {
         centre: SITE,
         // A picked width, not the volume's own reach: this fixture's scan is
         // synthetic and what its gates happen to reach is not the subject.
-        half_width_km: Some(HALF_KM),
+        // Square, because that is what the `VolumeRegion` in `target` carries.
+        half_extent_km: Some(rustdar_radar::voxel::HalfExtentKm::square(HALF_KM)),
         base_km_msl: 0.0,
         top_km_msl: 10.0,
         product: RadarProduct::Reflectivity,

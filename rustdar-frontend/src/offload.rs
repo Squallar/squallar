@@ -576,11 +576,14 @@ fn encode_voxel_request(out: &mut Vec<u8>, request: &VoxelRequest) {
     // reaches", which is a decision `build_voxels` makes on the worker side
     // with the volume in hand, and no f64 can stand for it without also being
     // a width somebody could legitimately ask for.
-    match request.half_width_km {
+    // One number, so this wire carries a *square* extent only. Nothing builds
+    // any other kind yet — `voxel_request_for` squares the pane's region — and
+    // widening it is a change to this encoding rather than to the type above.
+    match request.half_extent_km {
         None => out.push(0),
         Some(half) => {
             out.push(1);
-            out.extend_from_slice(&half.to_le_bytes());
+            out.extend_from_slice(&half.east_km.to_le_bytes());
         }
     }
     out.extend_from_slice(&request.base_km_msl.to_le_bytes());
@@ -601,9 +604,9 @@ fn decode_voxel_request(r: &mut Reader) -> Option<VoxelRequest> {
     let product = rustdar_radar::types::RadarProduct::from_wire_code(r.u16()?)?;
     let request = VoxelRequest {
         centre: (r.f64()?, r.f64()?),
-        half_width_km: match r.u8()? {
+        half_extent_km: match r.u8()? {
             0 => None,
-            1 => Some(r.f64()?),
+            1 => Some(rustdar_radar::voxel::HalfExtentKm::square(r.f64()?)),
             _ => return None,
         },
         base_km_msl: r.f64()?,

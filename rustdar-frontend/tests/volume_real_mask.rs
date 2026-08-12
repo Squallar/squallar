@@ -135,7 +135,9 @@ use rustdar_frontend::volume::raymarch::staging::{STAGING_RING_FEATURE, VolumeSt
 use rustdar_frontend::volume::raymarch::{FLOOR_FORMAT, VolumePipelines};
 use rustdar_frontend::volume::uniform::VolumeUniform;
 use rustdar_radar::types::RadarProduct;
-use rustdar_radar::voxel::{DESKTOP_SHAPE, VoxelGrid, VoxelRequest, build_voxels_with_motion};
+use rustdar_radar::voxel::{
+    DESKTOP_SHAPE, HalfExtentKm, VoxelGrid, VoxelRequest, build_voxels_with_motion,
+};
 
 /// The volume reader and the site it learns, shared with the other two live
 /// instruments in this directory. See `live_volume/mod.rs` for why the site
@@ -163,7 +165,7 @@ fn render_a_real_volume_mask() {
     let product = product_from_env();
     let request = VoxelRequest {
         centre: (parsed("CENTRE_LAT"), parsed("CENTRE_LON")),
-        half_width_km: Some(parsed_or("HALF_KM", 80.0)),
+        half_extent_km: Some(HalfExtentKm::square(parsed_or("HALF_KM", 80.0))),
         base_km_msl: parsed_or("BASE_KM", 0.0),
         top_km_msl: parsed_or("TOP_KM", 18.0),
         product,
@@ -415,7 +417,8 @@ fn render_a_real_volume_mask() {
          site              {site_name} at {grid_lat:.5}, {grid_lon:.5}\n\
          product           {} ({})\n\
          centre            {:.5}, {:.5}\n\
-         half_width_km     {:.3} (requested {:?}, resolved by build_voxels)\n\
+         half_extent_km    east {:.3} north {:.3} \
+         (requested {:?}, resolved by build_voxels)\n\
          grid              nx {} ny {} nz {}  ({} cells)\n\
          x_range_km        {x0:.3} .. {x1:.3}  (east of site)\n\
          y_range_km        {y0:.3} .. {y1:.3}  (north of site)\n\
@@ -446,7 +449,8 @@ fn render_a_real_volume_mask() {
         request.centre.0,
         request.centre.1,
         (x1 - x0) / 2.0,
-        request.half_width_km,
+        (y1 - y0) / 2.0,
+        request.half_extent_km,
         shape.nx,
         shape.ny,
         shape.nz,
@@ -569,7 +573,7 @@ fn measure_boundary_honesty_and_smoothness() {
     let product = product_from_env();
     let request = VoxelRequest {
         centre: (parsed("CENTRE_LAT"), parsed("CENTRE_LON")),
-        half_width_km: Some(parsed_or("HALF_KM", 80.0)),
+        half_extent_km: Some(HalfExtentKm::square(parsed_or("HALF_KM", 80.0))),
         base_km_msl: parsed_or("BASE_KM", 0.0),
         top_km_msl: parsed_or("TOP_KM", 18.0),
         product,

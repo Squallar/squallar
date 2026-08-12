@@ -365,7 +365,7 @@ fn placeholder_scan() -> Scan {
 fn request(shape: VoxelShape) -> VoxelRequest {
     VoxelRequest {
         centre: SITE,
-        half_width_km: Some(60.0),
+        half_extent_km: Some(HalfExtentKm::square(60.0)),
         base_km_msl: 0.0,
         top_km_msl: 12.0,
         product: RadarProduct::Reflectivity,
@@ -657,7 +657,7 @@ fn a_non_finite_number_anywhere_is_refused() {
         // survives whichever one it missed.
         let cases = [
             VoxelRequest {
-                half_width_km: Some(bad),
+                half_extent_km: Some(HalfExtentKm::square(bad)),
                 ..base.clone()
             },
             VoxelRequest {
@@ -709,30 +709,140 @@ fn a_top_at_or_below_the_base_is_refused() {
 }
 
 /// A zoom control that runs out of travel should stop, not fail — so the
-/// half-width clamps where everything else refuses.
+/// half-extent clamps where everything else refuses.
+///
+/// The rectangular rows carry the part a square one cannot see: the upper stop
+/// is on the box's **corner**, and it is taken by scaling both axes by one
+/// factor. Clamping each axis on its own would answer a 450 × 200 km ask with
+/// 332 × 200 — a box of a different aspect ratio from the viewport that framed
+/// it, which is a silently wrong picture rather than a stopped zoom.
 #[test]
 fn the_half_width_is_clamped_rather_than_refused() {
     let scan = scan_of(&|_, _| Some(40.0));
+    // `470 / hypot(450, 200)` — the one factor both axes of the last row take,
+    // written out so the row is a number rather than the rule restated. The
+    // rule itself is asserted as a property below the loop.
+    const SCALE: f64 = 0.954_425_395_225_601_9;
     for (asked, want) in [
-        (0.0, MIN_HALF_WIDTH_KM),
-        (1.0, MIN_HALF_WIDTH_KM),
-        (-500.0, MIN_HALF_WIDTH_KM),
-        (60.0, 60.0),
-        (10_000.0, MAX_HALF_WIDTH_KM),
+        (
+            HalfExtentKm::square(0.0),
+            HalfExtentKm::square(MIN_HALF_WIDTH_KM),
+        ),
+        (
+            HalfExtentKm::square(1.0),
+            HalfExtentKm::square(MIN_HALF_WIDTH_KM),
+        ),
+        (
+            HalfExtentKm::square(-500.0),
+            HalfExtentKm::square(MIN_HALF_WIDTH_KM),
+        ),
+        (HalfExtentKm::square(60.0), HalfExtentKm::square(60.0)),
+        (
+            HalfExtentKm::square(10_000.0),
+            HalfExtentKm::square(MAX_HALF_WIDTH_KM),
+        ),
+        // Well inside the corner bound: honoured as asked, on both axes.
+        (
+            HalfExtentKm {
+                east_km: 200.0,
+                north_km: 80.0,
+            },
+            HalfExtentKm {
+                east_km: 200.0,
+                north_km: 80.0,
+            },
+        ),
+        // One axis under the floor. The other is not touched, so the floor is
+        // per axis and not a squaring in disguise.
+        (
+            HalfExtentKm {
+                east_km: 4.0,
+                north_km: 100.0,
+            },
+            HalfExtentKm {
+                east_km: MIN_HALF_WIDTH_KM,
+                north_km: 100.0,
+            },
+        ),
+        // The corner — 492.4 km — is over the bound while *neither* side is:
+        // 450 is under MAX_HALF_WIDTH_KM's 332.34 only if you square the box,
+        // and 200 is nowhere near it. Both axes come back scaled by the same
+        // factor, so the 2.25:1 shape survives the stop.
+        (
+            HalfExtentKm {
+                east_km: 450.0,
+                north_km: 200.0,
+            },
+            HalfExtentKm {
+                east_km: 450.0 * SCALE,
+                north_km: 200.0 * SCALE,
+            },
+        ),
     ] {
         let req = VoxelRequest {
-            half_width_km: Some(asked),
+            half_extent_km: Some(asked),
             ..request(ODD)
         };
         let grid = build_voxels(&scan, &req, SITE.0, SITE.1)
-            .unwrap_or_else(|| panic!("{asked} km should clamp, not refuse"));
-        let (lo, hi) = grid.x_range_km();
+            .unwrap_or_else(|| panic!("{asked:?} should clamp, not refuse"));
+        let (x0, x1) = grid.x_range_km();
+        let (y0, y1) = grid.y_range_km();
         assert!(
-            (hi - lo - 2.0 * want).abs() < 1e-9,
-            "asked {asked} km, wanted a {want} km half-width, got {:?}",
+            (x1 - x0 - 2.0 * want.east_km).abs() < 1e-6
+                && (y1 - y0 - 2.0 * want.north_km).abs() < 1e-6,
+            "asked {asked:?}, wanted {want:?}, got x {:?} y {:?}",
             grid.x_range_km(),
+            grid.y_range_km(),
         );
     }
+
+    // And what the last row's numbers *are*: the corner lands exactly on the
+    // bound, and the shape it landed with is the shape that was asked for.
+    let over = HalfExtentKm {
+        east_km: 450.0,
+        north_km: 200.0,
+    };
+    let stopped = over.clamped();
+    assert!(
+        (stopped.corner_km() - MAX_HALF_DIAGONAL_KM).abs() < 1e-9,
+        "the stop is on the corner, so a stopped box's corner sits on it: {}",
+        stopped.corner_km(),
+    );
+    assert!(
+        (stopped.east_km / stopped.north_km - over.east_km / over.north_km).abs() < 1e-12,
+        "the stop must not change the box's aspect ratio: {:?} against {:?}",
+        stopped.east_km / stopped.north_km,
+        over.east_km / over.north_km,
+    );
+}
+
+/// The corner bound **is** the old half-width cap, for the one box that has a
+/// half-width.
+///
+/// `MAX_HALF_WIDTH_KM` was `MAX_EXTENT_KM / √2` before the extent had two axes
+/// and is still exactly that, so a square ask past the stop lands where it
+/// always did — 332.34 km, a 665 km box. That is the reduction the rectangular
+/// rule has to make, and it is what says this change moved no square box.
+#[test]
+fn the_corner_bound_reduces_to_the_old_square_cap() {
+    assert!(
+        (HalfExtentKm::square(MAX_HALF_WIDTH_KM).corner_km() - MAX_HALF_DIAGONAL_KM).abs() < 1e-9,
+        "a box at the square cap must have its corner exactly on the bound, \
+         got {}",
+        HalfExtentKm::square(MAX_HALF_WIDTH_KM).corner_km(),
+    );
+    assert_eq!(MAX_HALF_DIAGONAL_KM, crate::types::MAX_EXTENT_KM);
+    assert!(
+        (MAX_HALF_WIDTH_KM - 332.340_2).abs() < 1e-3,
+        "the square cap must still be 332.34 km, got {MAX_HALF_WIDTH_KM}",
+    );
+
+    let stopped = HalfExtentKm::square(10_000.0).clamped();
+    assert!(
+        (stopped.east_km - MAX_HALF_WIDTH_KM).abs() < 1e-9
+            && (stopped.north_km - MAX_HALF_WIDTH_KM).abs() < 1e-9,
+        "a square ask past the stop must land on the old cap, got {stopped:?}",
+    );
 }
 
 // ── The box's own extent ────────────────────────────────────────────────
@@ -886,7 +996,7 @@ fn a_long_range_volumes_box_holds_the_echo_the_fixed_box_cut_off() {
     let scan = long_range_scan(field);
 
     let following = VoxelRequest {
-        half_width_km: None,
+        half_extent_km: None,
         top_km_msl: 18.0,
         shape: DESKTOP_SHAPE,
         ..request(DESKTOP_SHAPE)
@@ -924,7 +1034,7 @@ fn a_long_range_volumes_box_holds_the_echo_the_fixed_box_cut_off() {
 
     // The control: the box this resampler used to build, on the same volume.
     let fixed = VoxelRequest {
-        half_width_km: Some(BASE_HALF_WIDTH_KM),
+        half_extent_km: Some(HalfExtentKm::square(BASE_HALF_WIDTH_KM)),
         ..following
     };
     let old = build_voxels(&scan, &fixed, SITE.0, SITE.1).expect("a buildable grid");
@@ -964,7 +1074,7 @@ fn a_short_range_volumes_box_tightens_onto_its_data() {
     );
 
     let req = VoxelRequest {
-        half_width_km: None,
+        half_extent_km: None,
         product: RadarProduct::Velocity,
         shape: DESKTOP_SHAPE,
         ..request(DESKTOP_SHAPE)
@@ -1015,7 +1125,7 @@ fn the_grid_is_indexed_x_east_y_north_z_up() {
     // apart from 1.0 km MSL, so row 1 (1.63 km over the antenna) is inside
     // the bracket and row 4 (4.63 km) is over the top of it.
     let req = VoxelRequest {
-        half_width_km: Some(40.0),
+        half_extent_km: Some(HalfExtentKm::square(40.0)),
         base_km_msl: 0.5,
         top_km_msl: 5.5,
         ..request(shape)
@@ -1068,7 +1178,7 @@ fn cell_centres_sit_at_the_half_step() {
     // the antenna, so rows at 0.7 / 1.1 / 1.5 km MSL — 0.33 / 0.73 /
     // 1.13 km over it — all sit inside.
     let req = VoxelRequest {
-        half_width_km: Some(40.0),
+        half_extent_km: Some(HalfExtentKm::square(40.0)),
         base_km_msl: 0.5,
         top_km_msl: 1.7,
         ..request(shape)
@@ -1116,7 +1226,7 @@ fn the_height_axis_is_msl_above_the_sites_own_elevation() {
     let dz = (top_km_msl - base_km_msl) / nz as f64;
     let shape = VoxelShape { nx: 2, ny: 1, nz };
     let req = VoxelRequest {
-        half_width_km: Some(40.0),
+        half_extent_km: Some(HalfExtentKm::square(40.0)),
         base_km_msl,
         top_km_msl,
         ..request(shape)
@@ -1156,7 +1266,7 @@ fn the_centre_may_sit_away_from_the_site() {
     let east_lon = SITE.1 + 50.0 / (crate::types::KM_PER_DEGREE_LAT * SITE.0.to_radians().cos());
     let req = VoxelRequest {
         centre: (SITE.0, east_lon),
-        half_width_km: Some(20.0),
+        half_extent_km: Some(HalfExtentKm::square(20.0)),
         ..request(ODD)
     };
     let grid = build_voxels(&scan, &req, SITE.0, SITE.1).unwrap();
@@ -1194,7 +1304,7 @@ fn the_centre_may_sit_away_from_the_site() {
 fn the_output_carries_everything_a_model_matrix_needs() {
     let scan = scan_of(&|_, _| Some(35.0));
     let req = VoxelRequest {
-        half_width_km: Some(37.5),
+        half_extent_km: Some(HalfExtentKm::square(37.5)),
         base_km_msl: 0.75,
         top_km_msl: 15.25,
         ..request(ODD)
@@ -1322,7 +1432,7 @@ fn a_layer_is_quantised_to_the_ladder_rather_than_to_nz() {
     // Half-width 200 km with two columns puts their centres at ±100 km
     // east on the y = 0 line — WP-B's own range.
     let req = VoxelRequest {
-        half_width_km: Some(200.0),
+        half_extent_km: Some(HalfExtentKm::square(200.0)),
         base_km_msl,
         top_km_msl,
         ..request(shape)
@@ -1400,7 +1510,7 @@ fn every_cell_is_the_samplers_own_answer() {
         nz: 6,
     };
     let req = VoxelRequest {
-        half_width_km: Some(55.0),
+        half_extent_km: Some(HalfExtentKm::square(55.0)),
         base_km_msl: 0.5,
         top_km_msl: 9.5,
         ..request(shape)
@@ -1460,7 +1570,7 @@ fn nothing_is_extrapolated_outside_the_ladder() {
     // A box reaching well past the low tilt's last gate (151.9 km slant)
     // and well above the high tilt's beam.
     let req = VoxelRequest {
-        half_width_km: Some(220.0),
+        half_extent_km: Some(HalfExtentKm::square(220.0)),
         base_km_msl: 0.0,
         top_km_msl: 25.0,
         ..request(shape)
@@ -1576,7 +1686,7 @@ fn two_identical_grids_compare_equal_through_the_nan_value_plane() {
 
     // And it still discriminates: a different box is a different grid.
     let moved = VoxelRequest {
-        half_width_km: Some(61.0),
+        half_extent_km: Some(HalfExtentKm::square(61.0)),
         ..request(ODD)
     };
     assert_ne!(a, build_voxels(&scan, &moved, SITE.0, SITE.1).unwrap());
@@ -1903,7 +2013,7 @@ fn every_volume_product_builds_a_populated_grid_and_a_full_table() {
     for product in VOLUME_PRODUCTS {
         let req = VoxelRequest {
             product,
-            half_width_km: Some(40.0),
+            half_extent_km: Some(HalfExtentKm::square(40.0)),
             base_km_msl: 0.5,
             top_km_msl: 4.0,
             ..request(ODD)
@@ -2119,7 +2229,7 @@ fn an_echo_edge_fades_instead_of_fabricating_a_mid_value() {
         nz: 24,
     };
     let req = VoxelRequest {
-        half_width_km: Some(60.0),
+        half_extent_km: Some(HalfExtentKm::square(60.0)),
         base_km_msl: 0.5,
         top_km_msl: 8.0,
         ..request(shape)
@@ -2966,7 +3076,7 @@ fn the_velocity_fold_guard_rides_into_the_voxel_grid() {
     );
     let req = VoxelRequest {
         product: RadarProduct::Velocity,
-        half_width_km: Some(20.0),
+        half_extent_km: Some(HalfExtentKm::square(20.0)),
         top_km_msl: 4.0,
         shape: VoxelShape {
             nx: 64,
@@ -3297,7 +3407,7 @@ fn a_grid_round_trips_through_its_wire_form() {
     let elsewhere = build_voxels(
         &scan,
         &VoxelRequest {
-            half_width_km: Some(61.0),
+            half_extent_km: Some(HalfExtentKm::square(61.0)),
             ..request(ODD)
         },
         SITE.0,
@@ -3792,15 +3902,15 @@ fn serial_reference_grid(
     let sampler =
         VolumeSampler::new(crate::nyquist::Volume::from(scan), req.product).expect("a sampler");
 
-    let half = match req.half_width_km {
-        Some(picked) => picked.clamp(MIN_HALF_WIDTH_KM, MAX_HALF_WIDTH_KM),
-        None => box_half_width_km(volume_reach_km(scan, req.product)),
+    let half = match req.half_extent_km {
+        Some(picked) => picked.clamped(),
+        None => HalfExtentKm::square(box_half_width_km(volume_reach_km(scan, req.product))),
     };
     let (bearing_deg, range_km) = beam::site_bearing_range_km(lat, lon, req.centre.0, req.centre.1);
     let bearing = bearing_deg.to_radians();
     let (cx, cy) = (range_km * bearing.sin(), range_km * bearing.cos());
-    let x_range_km = (cx - half, cx + half);
-    let y_range_km = (cy - half, cy + half);
+    let x_range_km = (cx - half.east_km, cx + half.east_km);
+    let y_range_km = (cy - half.north_km, cy + half.north_km);
     let z_range_km_msl = (req.base_km_msl, req.top_km_msl);
     let site_km_msl = crate::eet::radar_height_ft_near(lat, lon, crate::sites::Datum::Feedhorn)
         .unwrap_or(0.0)

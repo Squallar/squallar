@@ -378,9 +378,9 @@ pub const SEE_THROUGH_ALPHA_CEILING: u8 = 64;
 /// must allow.
 pub const MAX_AXIS: usize = 256;
 
-/// Narrowest half-width a request may ask for, km. Below this the grid is
-/// finer than the radar's own 250 m gates over most of its extent and the
-/// resample invents smoothness.
+/// Narrowest half-extent a request may ask for on either axis, km. Below this
+/// the grid is finer than the radar's own 250 m gates over most of its extent
+/// and the resample invents smoothness.
 pub const MIN_HALF_WIDTH_KM: f64 = 10.0;
 
 /// The half-width a box is given when nothing can be said about how far its
@@ -394,18 +394,123 @@ pub const MIN_HALF_WIDTH_KM: f64 = 10.0;
 /// box with a storm outside it.
 pub const BASE_HALF_WIDTH_KM: f64 = 230.0;
 
-/// Widest half-width a request may ask for, km.
+/// Furthest a box's **corner** may stand from its centre, km.
 ///
-/// [`crate::types::MAX_EXTENT_KM`] over √2, and written as that division so
-/// the two cannot drift: the plan view's cap is a guard against a mis-framed
-/// radial claiming sixty thousand gates, and the box's cap has to be the same
-/// guard measured through [`box_half_width_km`]'s own geometry. A reach the
-/// raster refuses to zoom out past is a reach this must refuse to widen past.
+/// [`crate::types::MAX_EXTENT_KM`] itself, because that is the same guard read
+/// through the same geometry: the plan view's cap is against a mis-framed
+/// radial claiming sixty thousand gates, and a box whose corner is inside the
+/// reach the raster will project is a box the raster can be laid under. A
+/// reach the raster refuses to zoom out past is a reach this must refuse to
+/// widen past.
+///
+/// The corner, rather than either side, because that is the quantity
+/// [`box_half_width_km`] has always capped — its `half ≤ MAX_HALF_WIDTH_KM` is
+/// `half · √2 ≤ MAX_EXTENT_KM` written for the one case where the two sides
+/// are equal. A rectangle has no single "width" to bound, and bounding each
+/// side separately would let a 470 × 470 km half-extent through, whose corner
+/// stands 664.7 km out.
+pub const MAX_HALF_DIAGONAL_KM: f64 = crate::types::MAX_EXTENT_KM;
+
+/// Widest half-width a **square** request may ask for, km.
+///
+/// [`MAX_HALF_DIAGONAL_KM`] over √2, and written as that division so the two
+/// cannot drift: it is [`HalfExtentKm::clamped`]'s corner bound solved for the
+/// case `east_km == north_km`, which is the only case that has a half-width at
+/// all.
 ///
 /// 332.34 km — a 665 km box — is therefore not a range any radar reaches. The
 /// widest honest one in this display is the 460.1 km WSR-88D surveillance
 /// cut, which asks for 325.4.
-pub const MAX_HALF_WIDTH_KM: f64 = crate::types::MAX_EXTENT_KM / std::f64::consts::SQRT_2;
+pub const MAX_HALF_WIDTH_KM: f64 = MAX_HALF_DIAGONAL_KM / std::f64::consts::SQRT_2;
+
+/// Half a box's east–west and north–south extent, km.
+///
+/// **A named struct rather than two `f64` arguments or a pair**, and that is
+/// the whole reason it exists: the two numbers are adjacent, same-typed and
+/// name different axes, so a transposition between them is a change no
+/// compiler and no square fixture can see. Every grid this module has ever
+/// built had `east_km == north_km`, which means a swap was invisible by
+/// construction until now.
+///
+/// Both fields are half-extents, not full ones, so
+/// `HalfExtentKm::square(230.0)` is the 460 km box this resampler was fixed at
+/// for its whole life.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HalfExtentKm {
+    /// Half the box's east–west extent, km. Becomes [`VoxelGrid::x_range_km`].
+    pub east_km: f64,
+    /// Half the box's north–south extent, km. Becomes
+    /// [`VoxelGrid::y_range_km`].
+    pub north_km: f64,
+}
+
+impl HalfExtentKm {
+    /// The same half-extent on both axes — the box every caller asked for
+    /// before a 3D pane's viewport could be anything but square.
+    pub const fn square(km: f64) -> Self {
+        Self {
+            east_km: km,
+            north_km: km,
+        }
+    }
+
+    /// How far the box's corner stands from its centre, km.
+    ///
+    /// The quantity [`MAX_HALF_DIAGONAL_KM`] bounds, and the rectangle's form
+    /// of the inscribed-square rule in [`box_half_width_km`]: a box whose
+    /// corner sits on the data's own range circle is the largest one of that
+    /// shape with no permanently empty corner cells.
+    pub fn corner_km(self) -> f64 {
+        self.east_km.hypot(self.north_km)
+    }
+
+    /// Whether both axes are finite. `NaN` reaches
+    /// [`VoxelGrid::cell_centre_km`] and makes every cell unplaceable with no
+    /// error anywhere, so [`build_voxels`] refuses it at the door.
+    pub fn is_finite(self) -> bool {
+        self.east_km.is_finite() && self.north_km.is_finite()
+    }
+
+    /// This extent floored at [`MIN_HALF_WIDTH_KM`] per axis, then brought
+    /// inside [`MAX_HALF_DIAGONAL_KM`] **without changing its shape** — the
+    /// clamp [`VoxelRequest::half_extent_km`] promises.
+    ///
+    /// **The one definition of that clamp**, because two callers need the same
+    /// answer and neither may re-spell it: the resampler, and the renderer,
+    /// which has to know the box a request *will* produce before the build that
+    /// produces it has run. [`horizontal_ranges_km`] gives the arithmetic that
+    /// depends on them agreeing bit for bit, and the 5.7e-14 km a second
+    /// spelling costs. (The `None` arm of that field is a different question
+    /// and is answered by [`box_half_width_km`], which needs the scan.)
+    ///
+    /// The upper stop scales both axes by one factor rather than clamping each
+    /// on its own. Independent clamps would turn a 450 × 200 km ask into
+    /// 332 × 200 — a box of a different aspect ratio from the one the pane is
+    /// framing, which is a silently wrong picture rather than a stopped zoom.
+    /// One factor keeps the ratio and lands the corner exactly on the bound.
+    ///
+    /// The floor is applied first, so an extent past 47:1 with its corner over
+    /// the bound comes back with its short axis under [`MIN_HALF_WIDTH_KM`]
+    /// again — 10 km scaled by `470 / corner`. Shape is the property worth
+    /// keeping there: the floor exists because a box finer than the radar's
+    /// own 250 m gates invents smoothness, and no viewport this is fed from is
+    /// anywhere near that long and thin.
+    pub fn clamped(self) -> Self {
+        let floored = Self {
+            east_km: self.east_km.max(MIN_HALF_WIDTH_KM),
+            north_km: self.north_km.max(MIN_HALF_WIDTH_KM),
+        };
+        let corner = floored.corner_km();
+        if corner <= MAX_HALF_DIAGONAL_KM {
+            return floored;
+        }
+        let scale = MAX_HALF_DIAGONAL_KM / corner;
+        Self {
+            east_km: floored.east_km * scale,
+            north_km: floored.north_km * scale,
+        }
+    }
+}
 
 /// Half-width of the box to resample, km, given how far the volume's data
 /// reaches — **the largest square that fits inside the sweep's own range
@@ -680,7 +785,7 @@ impl VoxelShape {
 /// What to resample, over what box.
 ///
 /// The fields are public because this is an input record with no invariant to
-/// protect: [`build_voxels`] clamps `half_width_km` and refuses everything
+/// protect: [`build_voxels`] clamps `half_extent_km` and refuses everything
 /// else it cannot honour, so there is no way to build one that lies about its
 /// contents. [`VoxelGrid`]'s fields are private for the opposite reason.
 #[derive(Debug, Clone, PartialEq)]
@@ -690,8 +795,8 @@ pub struct VoxelRequest {
     /// way.
     pub centre: (f64, f64),
     /// Half the box's east–west and north–south extent, km, or `None` to take
-    /// the half-width [`box_half_width_km`] derives from the volume's own
-    /// reach.
+    /// the square half-width [`box_half_width_km`] derives from the volume's
+    /// own reach.
     ///
     /// `None` is the ordinary case — a 3D pane with no picked region — and it
     /// is an absence rather than a copy of the default for the reason
@@ -699,12 +804,14 @@ pub struct VoxelRequest {
     /// argument: the number depends on the volume, only [`build_voxels`] has
     /// the volume, and a caller that computed it from a *different* volume
     /// would resample ground the pane beside it is not drawing, with nothing
-    /// to notice it.
+    /// to notice it. It is also the case with no aspect ratio to be had: the
+    /// caller is a worker holding a volume and no pane.
     ///
-    /// `Some` is a region the user dragged. It is clamped to
-    /// `[MIN_HALF_WIDTH_KM, MAX_HALF_WIDTH_KM]` rather than refused, because a
-    /// zoom control that reaches the end of its travel should stop, not fail.
-    pub half_width_km: Option<f64>,
+    /// `Some` is a region the user picked, and it need not be square — a 3D
+    /// pane's viewport is not. It is put through [`HalfExtentKm::clamped`]
+    /// rather than refused, because a zoom control that reaches the end of its
+    /// travel should stop, not fail.
+    pub half_extent_km: Option<HalfExtentKm>,
     /// Bottom of the box, km MSL.
     pub base_km_msl: f64,
     /// Top of the box, km MSL. Must be strictly above `base_km_msl`.
@@ -1680,25 +1787,15 @@ struct VoxelRow<'grid> {
     values: Vec<&'grid mut [f32]>,
 }
 
-/// A **picked** half-width, held inside `[MIN_HALF_WIDTH_KM,
-/// MAX_HALF_WIDTH_KM]` — the clamp [`VoxelRequest::half_width_km`] promises.
-///
-/// Named because two callers need the same answer and neither may re-spell
-/// it: the resampler, and the renderer, which has to know the box a request
-/// *will* produce before the build that produces it has run — see
-/// [`horizontal_ranges_km`]. (The `None` arm of that field is a different
-/// question and is answered by [`box_half_width_km`], which needs the scan.)
-pub fn clamped_half_width_km(half_width_km: f64) -> f64 {
-    half_width_km.clamp(MIN_HALF_WIDTH_KM, MAX_HALF_WIDTH_KM)
-}
-
-/// A box of `half_width_km` about `centre`, as `(x_range_km, y_range_km)` —
+/// A box of `half` about `centre`, as `(x_range_km, y_range_km)` —
 /// kilometres east and north **of the radar**, which is the frame
 /// [`VoxelGrid::x_range_km`] and [`VoxelGrid::y_range_km`] report in.
 ///
-/// The half-width is taken as already decided: [`build_voxels`] resolves the
-/// request's `Option` first, because its `None` arm is the volume's own reach
-/// and only the scan can answer it.
+/// The extent is taken as already decided, and **already clamped**:
+/// [`build_voxels`] resolves the request's `Option` first, because its `None`
+/// arm is the volume's own reach and only the scan can answer it, and puts a
+/// `Some` through [`HalfExtentKm::clamped`]. A caller that has a picked region
+/// in hand must do the same, and through that same function — see below.
 ///
 /// # Why this is a named function and not four lines inside the resampler
 ///
@@ -1713,21 +1810,35 @@ pub fn clamped_half_width_km(half_width_km: f64) -> f64 {
 /// stand-in exists to remove. So the resampler calls this too, and the two
 /// cannot drift.
 ///
+/// **The clamp is inside that guarantee, not beside it.** `DrawnBox::for_target`
+/// compares its answer against the settled grid's own ranges with `==` and
+/// draws the identity affine when they match, so the two sides have to agree
+/// *bit for bit* rather than nearly. A separate `clamp(MIN_HALF_WIDTH_KM,
+/// MAX_HALF_WIDTH_KM)` on the renderer's side is not that agreement: for a
+/// square ask past the stop it answers `470 / √2` where [`HalfExtentKm::clamped`]
+/// answers `half · (470 / hypot(half, half))`, and the two differ by
+/// 5.7e-14 km. Unreachable today only because `VolumeRegion::new` pre-clamps —
+/// and reachable the moment a region carries two axes, since a 450 × 200 km
+/// half-extent has both sides under [`MAX_HALF_WIDTH_KM`] and a corner 22 km
+/// outside [`MAX_HALF_DIAGONAL_KM`].
+///
 /// Polar from the site and back, so this is the same tangent plane the
 /// resampler's per-cell mapping uses and a centre *at* the site lands exactly
 /// on `(0, 0)`.
 pub fn horizontal_ranges_km(
     centre: (f64, f64),
-    half_width_km: f64,
+    half: HalfExtentKm,
     site_lat: f64,
     site_lon: f64,
 ) -> ((f64, f64), (f64, f64)) {
-    let half = half_width_km;
     let (bearing_deg, range_km) =
         beam::site_bearing_range_km(site_lat, site_lon, centre.0, centre.1);
     let bearing = bearing_deg.to_radians();
     let (cx, cy) = (range_km * bearing.sin(), range_km * bearing.cos());
-    ((cx - half, cx + half), (cy - half, cy + half))
+    (
+        (cx - half.east_km, cx + half.east_km),
+        (cy - half.north_km, cy + half.north_km),
+    )
 }
 
 /// Resample `scan` onto a Cartesian grid, or `None` if it cannot be done
@@ -1746,9 +1857,9 @@ pub fn horizontal_ranges_km(
 /// * a non-finite number anywhere in the request or the site, or a top at or
 ///   below the base.
 ///
-/// A `half_width_km` of `Some` outside `[MIN_HALF_WIDTH_KM,
-/// MAX_HALF_WIDTH_KM]` is **clamped**, not refused; a `half_width_km` of
-/// `None` is answered by [`box_half_width_km`] off the volume's own reach.
+/// A `half_extent_km` of `Some` outside [`HalfExtentKm::clamped`]'s bounds is
+/// **clamped**, not refused; a `half_extent_km` of `None` is answered by
+/// [`box_half_width_km`] off the volume's own reach, on both axes.
 pub fn build_voxels<'a>(
     volume: impl Into<crate::nyquist::Volume<'a>>,
     req: &VoxelRequest,
@@ -1781,7 +1892,7 @@ pub fn build_voxels_with_motion<'a>(
         );
         return None;
     }
-    if !(req.half_width_km.is_none_or(f64::is_finite)
+    if !(req.half_extent_km.is_none_or(HalfExtentKm::is_finite)
         && req.base_km_msl.is_finite()
         && req.top_km_msl.is_finite()
         && req.centre.0.is_finite()
@@ -1826,18 +1937,22 @@ pub fn build_voxels_with_motion<'a>(
         .ok()?,
     };
 
-    // The box's width, decided once and here — the counterpart of
+    // The box's extent, decided once and here — the counterpart of
     // `render_with_projection` deciding the raster's extent once, and for the
     // same reason: the ranges the grid reports, the cells the sampler is asked
-    // for and the km-per-cell the pane prints all have to come off one number.
+    // for and the km-per-cell the pane prints all have to come off one pair of
+    // numbers.
     //
     // The reach is measured on the volume's own scan rather than on `prepared`:
     // a derivation rewrites a moment's *values*, never its gate geometry, and
     // reading it here keeps the box a property of the volume the user asked for
     // rather than of whichever derivation the product happens to go through.
-    let half = match req.half_width_km {
-        Some(picked) => clamped_half_width_km(picked),
-        None => box_half_width_km(volume_reach_km(volume.scan(), req.product)),
+    let half = match req.half_extent_km {
+        Some(picked) => picked.clamped(),
+        None => HalfExtentKm::square(box_half_width_km(volume_reach_km(
+            volume.scan(),
+            req.product,
+        ))),
     };
 
     // Placed through the one definition of it — see `horizontal_ranges_km` for

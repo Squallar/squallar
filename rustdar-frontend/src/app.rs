@@ -642,16 +642,18 @@ fn voxel_request_for(
     // deriving it from a volume this function does not have, and the one it
     // could reach for is the *pane's* volume rather than the one about to be
     // resampled.
-    let (centre, half_width_km) = match target.region {
+    let (centre, half_extent_km) = match target.region {
         Some(region) => (
             (region.centre().lat, region.centre().lon),
-            Some(region.half_width_km()),
+            Some(rustdar_radar::voxel::HalfExtentKm::square(
+                region.half_width_km(),
+            )),
         ),
         None => ((site_lat, site_lon), None),
     };
     rustdar_radar::voxel::VoxelRequest {
         centre,
-        half_width_km,
+        half_extent_km,
         // The vertical extent is a separate axis from the horizontal region and
         // is deliberately not part of the pick: this decides what is sampled over
         // the ground, while the pane's exaggeration knob changes only how the
