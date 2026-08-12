@@ -154,6 +154,22 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          the uniform block is sized against.",
     ),
     (
+        "rustdar-frontend/src/volume.rs",
+        "max_sampled_textures_per_shader_stage",
+        "`wgpu::Limits`' own field, named where the probe's scan explains \
+         which limit each binding class is priced against. Its sibling \
+         `max_uniform_buffer_binding_size` is allowed just above for the same \
+         reason; the scan that counts bindings out of the shader had to name \
+         all three.",
+    ),
+    (
+        "rustdar-frontend/src/volume.rs",
+        "max_samplers_per_shader_stage",
+        "As above. This is the limit whose constant was undercounted at 2 \
+         against the raymarch's three samplers, so the paragraph that fixed it \
+         necessarily names it.",
+    ),
+    (
         "rustdar-frontend/src/app.rs",
         "new_without_display_handle_from_env",
         "`egui_winit`'s constructor, named where this crate explains which of \
