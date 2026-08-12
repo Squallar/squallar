@@ -872,8 +872,13 @@ fn measure_floor_against_grid_on_a_real_volume() {
             .map(|n| n.chars().take(4).collect())
             .expect("SITE, or a VOL file name starting with the ICAO")
     });
-    let site = rustdar_radar::sites::get_radar_site(&icao)
-        .unwrap_or_else(|| panic!("{icao} is not a site this build knows"));
+    install_radars();
+    let site = rustdar_radar::sites::get_radar_site(&icao).unwrap_or_else(|| {
+        panic!(
+            "{icao} is not a site this process knows; it places only KMPX and \
+             KTLX, and the binary carries no others"
+        )
+    });
     // `None` without `HALF_KM`, which is what a pane with no picked region
     // sends: `build_voxels` sizes the box from the volume's own reach.
     let half_km: Option<f64> = std::env::var("HALF_KM")
@@ -1190,6 +1195,52 @@ fn pane_raster(input: &rustdar_radar::render_input::RenderInput) -> Option<(Vec<
     Some((image, side, extent_km))
 }
 
+/// The two radars this file measures against, placed once.
+///
+/// `rustdar-radar` carries no list of the network — see
+/// [`SiteTable`](rustdar_radar::sites::SiteTable) — so a test binary that
+/// decodes no volume and fetches no catalogue has an empty table, and
+/// `get_radar_site` answers `None` for every identifier. The application
+/// resolves its own table before its first frame; this is the same step, for a
+/// process that has no application in it.
+///
+/// Its own copy rather than the library's `crate::test_sites`, because an
+/// integration test is a separate crate and cannot reach a `#[cfg(test)]`
+/// module inside the one it is testing.
+///
+/// The positions are load-bearing here in a way they are not elsewhere: the
+/// point of `the_boxs_site_position_lands_on_the_mirrors_site_pixel` is that
+/// the Mercator offset grows with latitude, so `KMPX` has to actually be at
+/// 44.8°N for the offset it pins to be the ~18 px the note describes.
+fn install_radars() {
+    use rustdar_radar::site_position::SitePosition;
+    use rustdar_radar::sites::SiteFix;
+
+    /// `(ICAO, latitude, longitude, site_height_m, tower_height_m)`, the
+    /// position and heights each radar's own Level II volume reports.
+    const SITES: [(&str, i32, i32, i32, i32); 2] = [
+        ("KMPX", 44_849_000, -93_566_000, 288, 30),
+        ("KTLX", 35_333_060, -97_277_500, 370, 19),
+    ];
+
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        rustdar_radar::sites::resolve(SITES.map(
+            |(name, lat_udeg, lon_udeg, site_height_m, tower_height_m)| {
+                (
+                    name,
+                    SiteFix::Learned(SitePosition {
+                        lat_udeg,
+                        lon_udeg,
+                        site_height_m,
+                        tower_height_m,
+                    }),
+                )
+            },
+        ));
+    });
+}
+
 /// A fixed `±230 km` box about the site, as a [`BoxGeo`].
 ///
 /// A **fixture size**, deliberately, and no longer "what the app requests":
@@ -1271,6 +1322,7 @@ fn beacon_pixel(site_lat: f64, site_lon: f64, dx_km: f64, dy_km: f64) -> (f64, f
 /// 2048 there — and this pin wants it plainly non-zero.
 #[test]
 fn the_boxs_site_position_lands_on_the_mirrors_site_pixel() {
+    install_radars();
     let site = rustdar_radar::sites::get_radar_site("KMPX").expect("KMPX is a known site");
     let geo = default_box();
     let drawn = beacon_pixel(site.lat, site.lon, 0.0, 0.0);
@@ -1368,6 +1420,7 @@ fn a_gate_lands_on_the_mirror_pixel_that_renders_it() {
     const HONEST_BUDGET_KM: f64 = 0.9;
     const MUST_MISS_KM: f64 = 2.3;
 
+    install_radars();
     let site = rustdar_radar::sites::get_radar_site("KMPX").expect("KMPX is a known site");
     let geo = default_box();
     let mirror = mirror_from_field(site.lat, site.lon, 720, 940, &|_, _| None);
@@ -1475,6 +1528,7 @@ fn a_planted_storm_lands_on_the_floor_exactly_under_its_own_voxels() {
         ],
     );
 
+    install_radars();
     let site = rustdar_radar::sites::get_radar_site("KTLX").expect("KTLX is a known site");
 
     // Path one: the voxel build, at the app's own default request.
@@ -1632,6 +1686,7 @@ fn block_is_lit(ix: i64, iy: i64) -> bool {
 /// nothing here depends on which site it is beyond that.
 #[test]
 fn a_broken_mapping_costs_iou_in_the_corner_even_where_the_centre_cannot_tell() {
+    install_radars();
     let site = rustdar_radar::sites::get_radar_site("KMPX").expect("KMPX is a known site");
     let field = |az_deg: f64, slant_km: f64| -> Option<f64> {
         let az = az_deg.to_radians();

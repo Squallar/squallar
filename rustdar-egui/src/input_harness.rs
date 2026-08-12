@@ -285,6 +285,74 @@ fn id_changes_between(prev: &egui::WidgetRects, new: &egui::WidgetRects) -> Vec<
     changed
 }
 
+/// The radars every harness in this crate draws, placed once.
+///
+/// # Why a harness has to do this at all
+///
+/// `rustdar-radar` carries no list of the network — see
+/// [`SiteTable`](rustdar_radar::sites::SiteTable). A process learns which
+/// radars exist from a volume it decoded or from the catalogue it fetched, and
+/// a test binary does neither, so without this every harness runs against an
+/// empty table: `get_radar_site` answers `None`, the map draws no site icons,
+/// and a test about clicking one has nothing to click.
+///
+/// This is the harness standing in for the application's own startup
+/// resolution, which the real app performs in `App::with_instance` before its
+/// first frame. It is not a fixture the tests assert numbers against — nothing
+/// here is compared to a measured figure — it is the set of identifiers the
+/// tests name, at plausible positions, far enough apart that a click on one
+/// site icon cannot land on another.
+///
+/// Positions are real so that a map that draws them is drawing something
+/// shaped like the network. Heights are the volumes' own metres.
+fn install_radars() {
+    use rustdar_radar::site_position::SitePosition;
+    use rustdar_radar::sites::SiteFix;
+
+    /// `(ICAO, latitude, longitude, site_height_m, tower_height_m)`.
+    ///
+    /// `TOKC` states one height twice, which is how a TDWR reports itself and
+    /// what gives the site list a row that is marked as one.
+    const SITES: [(&str, i32, i32, i32, i32); 12] = [
+        ("KTLX", 35_333_060, -97_277_500, 370, 19),
+        ("TOKC", 35_276_000, -97_510_000, 386, 386),
+        ("KOUN", 35_236_000, -97_463_000, 357, 19),
+        ("KINX", 36_175_000, -95_565_000, 204, 30),
+        ("KVNX", 36_741_000, -98_128_000, 369, 30),
+        ("KDDC", 37_761_000, -99_969_000, 789, 24),
+        ("KAMA", 35_233_000, -101_709_000, 1094, 24),
+        ("KABX", 35_150_000, -106_824_000, 1789, 24),
+        ("KDMX", 41_731_000, -93_723_000, 299, 30),
+        ("KMPX", 44_849_000, -93_566_000, 288, 30),
+        ("KABR", 45_455_830, -98_413_330, 397, 24),
+        ("KMKX", 42_967_000, -88_550_000, 292, 30),
+    ];
+
+    // Idempotent anyway — `resolve` builds nothing when the fixes reproduce
+    // the rows already there — but tests run in parallel and this is the
+    // cheaper way to say so.
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        rustdar_radar::sites::resolve(SITES.map(
+            |(name, lat_udeg, lon_udeg, site_height_m, tower_height_m)| {
+                (
+                    name,
+                    SiteFix::Learned(SitePosition {
+                        lat_udeg,
+                        lon_udeg,
+                        site_height_m,
+                        tower_height_m,
+                    }),
+                )
+            },
+        ));
+        // One radar the catalogue could list and never place, so the site
+        // list's second inventory is exercised by the ordinary harness rather
+        // than only by a test that goes looking for it. `KCRI` is a real one.
+        rustdar_radar::sites::resolve([("KCRI", SiteFix::Unplaced)]);
+    });
+}
+
 impl InputHarness {
     /// Build a harness with a fresh [`Gui`] and run enough frames for egui to
     /// settle (areas need a frame to register their rects).
@@ -295,6 +363,7 @@ impl InputHarness {
     /// A harness on a screen of the given size — e.g. a portrait phone, where
     /// the pane grid and the panel disagree about which way up they are.
     pub(crate) fn with_screen(size: egui::Vec2) -> Self {
+        install_radars();
         let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
         let mut harness = Self {
             ctx: egui::Context::default(),

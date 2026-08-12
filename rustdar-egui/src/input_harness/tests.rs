@@ -8905,12 +8905,26 @@ fn the_site_search_narrows_the_list_and_a_row_click_switches_the_site() {
     h.open_pane_props();
 
     let inspector = h.inspector();
-    let total = rustdar_radar::sites::radars().len();
+    // Both inventories: the radars this process can place, and the ones it
+    // knows of and cannot. A list that offered only the first would drop
+    // `KCRI` and `TPBI`, which have Level II data and no published position —
+    // and while the network was compiled in, the table placed them anyway.
+    let placed = rustdar_radar::sites::radars().len();
+    let unplaced = rustdar_radar::sites::unplaced();
+    let total = placed + unplaced.len();
+    assert!(!unplaced.is_empty(), "the harness lists one radar unplaced");
     assert_eq!(
         inspector.site_rows.len(),
         total,
-        "the unfiltered list must offer the whole table"
+        "the unfiltered list must offer every radar this process knows of"
     );
+    for name in unplaced {
+        assert!(
+            inspector.site_rows.iter().any(|(row, ..)| row == name),
+            "{name} has no position and must still be pickable: its data is \
+             fetched by identifier, and the volume then places it",
+        );
+    }
     assert!(
         inspector
             .site_caption
@@ -9712,9 +9726,9 @@ fn the_site_pill_popover_searches_and_switches() {
     let search = popover.search.expect("with its search field");
     assert_eq!(
         popover.rows.len(),
-        rustdar_radar::sites::radars().len(),
-        "unfiltered, the popover offers the whole table — the inspector's \
-         own list"
+        rustdar_radar::sites::radars().len() + rustdar_radar::sites::unplaced().len(),
+        "unfiltered, the popover offers every radar this process knows of, \
+         placed or not — the inspector's own list"
     );
 
     h.mouse_click(search.center());

@@ -654,6 +654,7 @@ fn escape_with_nothing_open_still_exits() {
 
 /// An `App` with no GPU behind it, wired the way `App::new` wires one.
 pub(super) fn headless(platform: TestBridge) -> App {
+    crate::test_sites::install();
     App::with_instance(
         egui_wgpu::wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::empty(),
@@ -2873,6 +2874,7 @@ fn a_taught_position_moves_the_maps_marker_and_not_only_the_data() {
 ///
 /// # Why not `KTLX`
 ///
+<<<<<<< HEAD
 /// A seeded row is no longer immovable: `sites::resolve` applies a learned fix
 /// onto the row it lands on, so any sibling test that teaches a position — from
 /// a store on construction, or from a volume mid-run — moves that radar in this
@@ -2885,12 +2887,39 @@ fn a_taught_position_moves_the_maps_marker_and_not_only_the_data() {
 /// identifier is load-bearing: it must stay one no other test learns a
 /// position for. This test's own middle block teaches it, which is why the last
 /// block asserts on the *source* rather than on coordinates — see there.
+=======
+/// The assertions below compare against the row this radar starts on, and a
+/// row is not immovable: `sites::resolve` applies a learned fix onto the row it
+/// lands on, so any sibling test that decodes a volume for a radar moves that
+/// radar in this process's table. `a_position_a_volume_taught_survives_a_restart`
+/// does exactly that, to `KTLX`, and running the two in either order made this
+/// test fail in release and pass in debug — the worst kind, a test whose
+/// outcome is a scheduling accident.
+///
+/// So this uses `KMBX`, which nothing else in the workspace names, and places
+/// it itself — [`crate::test_sites`] deliberately leaves it out. The
+/// identifier is load-bearing: it must stay one no other test names.
+>>>>>>> 1a47feb4 (test: every test binary places the radars it measures against)
 #[test]
 fn a_run_with_no_config_store_still_applies_the_volumes_own_position() {
     use rustdar_radar::site_position::SitePositionSource;
 
     const SITE: &str = "KMBX";
-    let table = rustdar_radar::sites::get_radar_site(SITE).expect("in the table");
+    // Placed here rather than by the shared fixture, so no sibling can move
+    // it. Minot, North Dakota, at the position and heights its own volume
+    // reports.
+    rustdar_radar::sites::resolve([(
+        SITE,
+        rustdar_radar::sites::SiteFix::Learned(rustdar_radar::site_position::SitePosition {
+            lat_udeg: 48_392_500,
+            lon_udeg: -100_864_720,
+            site_height_m: 455,
+            tower_height_m: 30,
+        }),
+    )]);
+    let table = rustdar_radar::sites::get_radar_site(SITE)
+        .expect("this test just placed it")
+        .clone();
     let stated_lat = (table.lat + 0.25) as f32;
     let at = chrono::NaiveDate::from_ymd_opt(2026, 8, 11)
         .unwrap()
@@ -2910,6 +2939,7 @@ fn a_run_with_no_config_store_still_applies_the_volumes_own_position() {
     assert_eq!(same_run.site_source, SitePositionSource::Learned);
     assert_eq!(same_run.site.lat.to_bits(), info.site.lat.to_bits());
 
+<<<<<<< HEAD
     // And nothing outlives the process: a fresh app remembers nothing, so its
     // `ScanInfo` falls back to the table rather than recalling anything.
     //
@@ -2934,6 +2964,36 @@ fn a_run_with_no_config_store_still_applies_the_volumes_own_position() {
         SitePositionSource::Table,
         "with no store, the volume's own position must not have outlived the \
          process that decoded it — this run recalled one",
+=======
+    // And **nothing was written**, which is the whole claim: a store is where
+    // a position outlives the process, and there is no store.
+    let next_run = headless(TestBridge::desktop().without_config_store());
+    assert!(
+        next_run.site_positions.is_empty(),
+        "with no store there is nothing to load, so a fresh app must start \
+         having learned nothing",
+    );
+
+    // What it does *not* claim, and used to: that a fresh `App` is back on the
+    // row this radar started on. It is not, and that is deliberate — a volume
+    // decoded in this process teaches the process-wide site table as well as
+    // the store, because with no compiled-in table the alternative is a first
+    // session rendering every MSL height against a table that has no row for
+    // the radar it is rendering. See `App::scan_info_learning_position`.
+    //
+    // A user never sees the difference: one process is one `App`. A test
+    // building a second one in the same process does, so it is stated here
+    // rather than left to be rediscovered.
+    let placed = rustdar_radar::sites::get_radar_site(SITE).expect("still a row");
+    assert!(
+        (placed.lat - f64::from(stated_lat)).abs() < 1e-5,
+        "the table learned what the volume stated: {} against {stated_lat}",
+        placed.lat,
+    );
+    assert_ne!(
+        placed.lat, table.lat,
+        "and it is no longer where it started",
+>>>>>>> 1a47feb4 (test: every test binary places the radars it measures against)
     );
 }
 

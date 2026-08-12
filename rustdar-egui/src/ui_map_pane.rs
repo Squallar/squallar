@@ -2142,16 +2142,15 @@ mod tests {
     ///
     /// This used to be a `usize` index back into a compiled-in
     /// `[RadarSite; 207]`, which was safe only because that array could never
-    /// be any other length. The table is resolved at runtime now: a returning
-    /// user's table carries radars the seed never had, so position `n` in one
-    /// table is a different radar in the next.
+    /// be any other length. The table is resolved at runtime and the array is
+    /// gone: every radar arrives from a volume or from the catalogue, so a
+    /// table grows within a session as well as between them, and position `n`
+    /// in one table is a different radar in the next.
     ///
-    /// The revert this pins is a real one. Index `206` in the seed is the last
-    /// row; in a table with two arrivals appended it is still that row, but
-    /// index `207` and `208` exist and name radars that the seed's array
-    /// cannot address at all — so a walk over the resolved table that resolved
-    /// through the compiled-in one would panic or, worse, silently label a
-    /// marker with whatever row happened to sit at that offset.
+    /// The revert this pins is a real one: a walk that resolved a row through
+    /// an index would panic on a table that had since shrunk, or — worse —
+    /// silently label a marker with whatever row happened to sit at that
+    /// offset.
     #[test]
     fn a_visible_site_names_its_own_radar_after_the_table_grows() {
         let position = |lat_udeg, lon_udeg| rustdar_radar::site_position::SitePosition {
@@ -2160,16 +2159,24 @@ mod tests {
             site_height_m: 100,
             tower_height_m: 20,
         };
-        // Two radars no seed row carries, in the empty South Pacific.
+        // Three radars in the empty South Pacific, and a smaller table holding
+        // only the first. Both are built here because the binary carries no
+        // radars at all — `build_table(empty)` is genuinely empty, and a walk
+        // over nothing cannot tell an index from a reference.
         let learned = rustdar_radar::sites::SiteFix::Learned;
+        // `ZZZA` rather than `ZZZZ`: arrivals are sorted by identifier, so the
+        // incumbent has to sort first for the smaller walk to be a prefix of
+        // the larger one, which is what the zip below compares.
+        let incumbent = ("ZZZA", learned(position(-29_000_000, -139_000_000)));
+        let smaller = rustdar_radar::sites::build_table([incumbent]);
         let bigger = rustdar_radar::sites::build_table([
+            incumbent,
             ("ZZZY", learned(position(-30_000_000, -140_000_000))),
             ("ZZZX", learned(position(-31_000_000, -141_000_000))),
         ]);
-        let seeded = rustdar_radar::sites::build_table(std::iter::empty());
         assert_eq!(
             bigger.rows().len(),
-            seeded.rows().len() + 2,
+            smaller.rows().len() + 2,
             "precondition: the two tables must be different lengths, or this \
              test cannot tell an index from a reference",
         );
@@ -2178,11 +2185,11 @@ mod tests {
 
         // Every site the smaller table produced is still named by the larger
         // one's walk, at the same place.
-        let before = walked(seeded.rows());
+        let before = walked(smaller.rows());
         let after = walked(bigger.rows());
         assert!(
             !before.is_empty(),
-            "the seed must produce some visible sites"
+            "the smaller table must produce some visible sites"
         );
         for (old, new) in before.iter().zip(after.iter()) {
             assert_eq!(
