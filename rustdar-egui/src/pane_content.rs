@@ -741,7 +741,7 @@ impl std::fmt::Debug for CrossSectionPane {
 /// `PartialEq` is derived, `f64`s and all, on the same reasoning `SectionTarget`
 /// gives: this compares a stored key against a stored key, and it is only safe
 /// because [`VolumeRegion::new`] refuses a non-finite centre and clamps the
-/// half-width to a finite range. With a NaN in there the key would never equal
+/// extent to a finite range. With a NaN in there the key would never equal
 /// itself and the pane would rebuild an 8 MiB grid every frame forever, with a
 /// hot CPU as its only symptom.
 #[derive(Clone, Debug, PartialEq)]
@@ -775,36 +775,37 @@ pub struct VolumeTarget {
 /// resampler runs, and a grid built for one box must be recognisably the wrong
 /// key for another.
 ///
-/// # Why a square
+/// # Why a square, still
 ///
-/// Because this type still carries one number. [`VoxelRequest`] takes a
-/// [`HalfExtentKm`] with an axis each, and `build_voxels` honours the two
-/// separately, so the resampler is no longer what forces this — but until the
-/// pick itself is measured per axis, a viewport that is not square inscribes a
-/// square in its shorter axis, and the box stays inside the floor on every
-/// side.
+/// **Not because this type forces one any more.** It carries a
+/// [`HalfExtentKm`] — an axis each — and so do [`VoxelRequest`] and
+/// `ui_region::measure_viewport`'s answer. What still produces a
+/// square is the *measurement*: `measure_viewport` takes the smallest of its
+/// four edge distances and writes it into both lanes, so a 16:9 pane inscribes
+/// a square in its shorter axis and throws its left and right flanks away.
+/// Everything downstream of that is already rectangular and waiting.
 ///
 /// [`HalfExtentKm`]: rustdar_radar::voxel::HalfExtentKm
 ///
-/// # The half-width is a resolution control, not just a crop
+/// # The extent is a resolution control, not just a crop
 ///
 /// The grid has a fixed cell count, so a tighter box buys detail rather than
-/// saving memory: at 256 cells across, an 80 km half-width is 0.625 km per cell
-/// and a 20 km half-width is 0.156 km. That is what zooming a 3D pane is *for*,
-/// so [`Self::resolution_km`] exists to be *shown* rather than inferred.
+/// saving memory: at 256 cells across, an 80 km half-extent is 0.625 km per
+/// cell and a 20 km half-extent is 0.156 km. That is what zooming a 3D pane is
+/// *for*, so [`Self::resolution_km`] exists to be *shown* rather than inferred.
 ///
 /// Fields are private because [`Self::new`] is the only writer, and it is what
 /// makes two things true downstream: the centre is a point on Earth, and the
-/// half-width is inside the range `build_voxels` will honour. The second matters
-/// more than it looks — `build_voxels` *clamps* the half-width rather than
-/// refusing it, so a region carrying 5 km would resample 10 km and the pane's
-/// own resolution readout would be a lie about the picture beside it.
+/// extent is inside the range `build_voxels` will honour. The second matters
+/// more than it looks — `build_voxels` *clamps* the extent rather than refusing
+/// it, so a region carrying 5 km would resample 10 km and the pane's own
+/// resolution readout would be a lie about the picture beside it.
 ///
 /// [`VoxelRequest`]: rustdar_radar::voxel::VoxelRequest
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VolumeRegion {
     centre: GeoPoint,
-    half_width_km: f64,
+    half: rustdar_radar::voxel::HalfExtentKm,
 }
 
 /// The half-width a pane falls back to when nothing has sized its box yet,
@@ -844,29 +845,45 @@ pub struct VolumeRegion {
 pub const BASE_HALF_WIDTH_KM: f64 = rustdar_radar::voxel::BASE_HALF_WIDTH_KM;
 
 impl VolumeRegion {
-    /// A region centred on `centre` with `half_width_km` either side, or `None`
-    /// if the centre is not a point on Earth.
+    /// A region centred on `centre` reaching `half` either side on each axis,
+    /// or `None` if the centre is not a point on Earth or the extent is not
+    /// finite.
     ///
-    /// The half-width is **clamped** where the centre is **refused**, and the
+    /// The extent is **clamped** where the centre is **refused**, and the
     /// asymmetry is the same one [`OrbitCamera::restore`] draws. A centre that is
     /// NaN or off-Earth means the projector was fed a degenerate viewport or a
     /// config file was hand-edited: there is no nearest sensible answer, and
-    /// clamping would launder it, because `f64::clamp` propagates NaN. A
-    /// half-width past the end of its range is a zoom control that has been wound
+    /// clamping would launder it, because `f64::clamp` propagates NaN. An
+    /// extent past the end of its range is a zoom control that has been wound
     /// to its stop, and stopping is what a control should do.
     ///
-    /// The clamp is against `build_voxels`' own bounds rather than a copy of
-    /// them, so the number this holds is the number that will be resampled.
-    pub fn new(centre: GeoPoint, half_width_km: f64) -> Option<Self> {
-        if !centre.is_on_earth() || !half_width_km.is_finite() {
+    /// # Why the clamp is [`HalfExtentKm::clamped`] and not a `clamp` here
+    ///
+    /// It was `half_width_km.clamp(MIN_HALF_WIDTH_KM, MAX_HALF_WIDTH_KM)` — a
+    /// **third** spelling of a bound the resampler and the renderer already
+    /// share one definition of, and the only one of the three that clamps the
+    /// axes *independently*.
+    ///
+    /// That difference is not cosmetic once a region has two axes.
+    /// [`HalfExtentKm::clamped`] holds the corner inside
+    /// [`MAX_HALF_DIAGONAL_KM`] by scaling **both** axes by one factor, which
+    /// keeps the box the shape the pane is framing; per-axis clamping keeps the
+    /// corner inside the same bound (`MAX_HALF_WIDTH_KM · √2` *is*
+    /// `MAX_HALF_DIAGONAL_KM`, so it cannot do otherwise) but changes the
+    /// **aspect ratio** to do it — a 450 × 200 km ask comes back 332 × 200,
+    /// 1.66:1 where the viewport is 2.25:1. A stopped zoom is a control at its
+    /// stop; a silently reshaped box is a picture of ground the pane is not
+    /// showing.
+    ///
+    /// [`HalfExtentKm::clamped`]: rustdar_radar::voxel::HalfExtentKm::clamped
+    /// [`MAX_HALF_DIAGONAL_KM`]: rustdar_radar::voxel::MAX_HALF_DIAGONAL_KM
+    pub fn new(centre: GeoPoint, half: rustdar_radar::voxel::HalfExtentKm) -> Option<Self> {
+        if !centre.is_on_earth() || !half.is_finite() {
             return None;
         }
         Some(Self {
             centre,
-            half_width_km: half_width_km.clamp(
-                rustdar_radar::voxel::MIN_HALF_WIDTH_KM,
-                rustdar_radar::voxel::MAX_HALF_WIDTH_KM,
-            ),
+            half: half.clamped(),
         })
     }
 
@@ -875,17 +892,43 @@ impl VolumeRegion {
         self.centre
     }
 
-    /// Half the box's east–west and north–south extent, kilometres.
-    pub fn half_width_km(self) -> f64 {
-        self.half_width_km
+    /// Half the box's extent on each horizontal axis, kilometres.
+    ///
+    /// Handed on whole rather than as two `f64`s wherever it crosses a call
+    /// boundary, for the reason [`HalfExtentKm`] exists: two adjacent,
+    /// same-typed numbers naming different axes transpose without a compiler or
+    /// a square fixture noticing.
+    ///
+    /// [`HalfExtentKm`]: rustdar_radar::voxel::HalfExtentKm
+    pub fn half_extent_km(self) -> rustdar_radar::voxel::HalfExtentKm {
+        self.half
     }
 
-    /// Kilometres per cell along a horizontal axis, for `cells` cells across.
+    /// Half the box's east–west extent, kilometres.
+    pub fn half_east_km(self) -> f64 {
+        self.half.east_km
+    }
+
+    /// Half the box's north–south extent, kilometres.
+    pub fn half_north_km(self) -> f64 {
+        self.half.north_km
+    }
+
+    /// Kilometres per cell east–west and north–south, for `cells` cells along
+    /// each axis.
     ///
-    /// The number the pane shows, and the reason a tight region is worth
+    /// The numbers the pane shows, and the reason a tight region is worth
     /// picking. Answers `None` for a zero cell count rather than dividing by it.
-    pub fn resolution_km(self, cells: usize) -> Option<f64> {
-        resolution_km(self.half_width_km, cells)
+    ///
+    /// Two numbers because the grid's cell count is the same on both axes while
+    /// the box's extent is not: a 16:9 box spends the same 256 cells over 1.78×
+    /// as much ground east–west as north–south, and one figure would have to
+    /// pick an axis to be honest about.
+    pub fn resolution_km(self, cells: usize) -> Option<(f64, f64)> {
+        Some((
+            resolution_km(self.half.east_km, cells)?,
+            resolution_km(self.half.north_km, cells)?,
+        ))
     }
 }
 
@@ -991,11 +1034,19 @@ pub enum VolumeViewMode {
 /// `VolumePainter::paint`'s ordering exists to avoid.
 ///
 /// For a `Some` region the two agree by construction rather than by luck:
-/// `build_voxels` spans `2 · half_width_km` horizontally and `base..top`
-/// vertically, from the same clamped half-width [`VolumeRegion::new`] holds and
-/// the same two constants used here. If they ever disagreed the symptom would
-/// be a pan that drifts against the picture, which is why they read one
-/// definition each.
+/// `build_voxels` spans `2 · east_km` and `2 · north_km` horizontally and
+/// `base..top` vertically, from the same clamped extent [`VolumeRegion::new`]
+/// holds and the same two constants used here. If they ever disagreed the
+/// symptom would be a pan that drifts against the picture, which is why they
+/// read one definition each.
+///
+/// **Both horizontal lanes come from the region, and the second one is the
+/// point.** This squared the region's single half-width into `x` and `y` for as
+/// long as a region had only one number to give. A camera posed against a
+/// square box while the grid is rectangular pans at the wrong speed on one axis
+/// and puts the pivot somewhere the user did not aim — on every frame before
+/// the first grid arrives, and on every frame the painter answers `None`, which
+/// is exactly the window this function exists to cover.
 ///
 /// # The one case this cannot answer alone
 ///
@@ -1013,10 +1064,13 @@ pub enum VolumeViewMode {
 /// because the region is no longer *on* the pane — it is the pane's viewport,
 /// measured on the frame it is needed.
 pub fn box_size_km(region: Option<VolumeRegion>) -> [f32; 3] {
-    let half_width = region.map_or(BASE_HALF_WIDTH_KM, VolumeRegion::half_width_km);
+    let half = region.map_or(
+        rustdar_radar::voxel::HalfExtentKm::square(BASE_HALF_WIDTH_KM),
+        VolumeRegion::half_extent_km,
+    );
     [
-        (2.0 * half_width) as f32,
-        (2.0 * half_width) as f32,
+        (2.0 * half.east_km) as f32,
+        (2.0 * half.north_km) as f32,
         (rustdar_radar::voxel::DEFAULT_TOP_KM_MSL - rustdar_radar::voxel::DEFAULT_BASE_KM_MSL)
             as f32,
     ]

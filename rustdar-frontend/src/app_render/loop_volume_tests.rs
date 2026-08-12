@@ -113,7 +113,7 @@ fn region() -> VolumeRegion {
             lat: 35.33,
             lon: -97.27,
         },
-        20.0,
+        rustdar_radar::voxel::HalfExtentKm::square(20.0),
     )
     .expect("a finite centre and an in-range half-width")
 }

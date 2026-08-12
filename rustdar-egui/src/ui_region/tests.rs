@@ -53,6 +53,40 @@ fn ground_km_to(
     range_km
 }
 
+/// The box is still the inscribed **square**, on a viewport that is not one.
+///
+/// The pin that makes this change's mechanical half a provable no-op. Every
+/// type between the measurement and the resampler now carries two extents, and
+/// the only thing still producing one number is `measure_viewport`'s minimum
+/// over its four edges — so a 1200 × 500 pane, whose ground is 2.4:1, comes
+/// back square.
+///
+/// **This test is meant to be deleted**, by the commit that makes the
+/// measurement per-axis. It exists so that the commit before that one can be
+/// read as moving nothing, and so that a rectangle appearing early — from a
+/// half-finished flip, or from `HalfExtentKm::clamped` reshaping something on
+/// the way through — fails here rather than being noticed as a picture.
+#[test]
+fn the_box_is_still_the_inscribed_square() {
+    let memory = memory_at(9.0);
+    let center = centre();
+    for rect in [
+        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1200.0, 500.0)),
+        egui::Rect::from_min_size(egui::pos2(120.0, 60.0), egui::vec2(400.0, 900.0)),
+    ] {
+        let region = region_for_viewport(rect, &memory, center).expect("a measurable box");
+        assert_eq!(
+            region.half_east_km(),
+            region.half_north_km(),
+            "a {:.0}x{:.0} viewport produced a {:?} box: the flip to a rectangle \
+             has half landed",
+            rect.width(),
+            rect.height(),
+            region.half_extent_km(),
+        );
+    }
+}
+
 /// **The property the whole module exists for**: the box is inside the ground
 /// the pane's map is showing, on every side.
 ///
@@ -77,20 +111,36 @@ fn the_box_fits_inside_the_viewport_on_every_side() {
     ] {
         let region = region_for_viewport(rect, &memory, center)
             .expect("a pane with area at zoom 9 has a measurable box");
-        for (name, pos) in [
-            ("north", egui::pos2(rect.center().x, rect.top())),
-            ("south", egui::pos2(rect.center().x, rect.bottom())),
-            ("west", egui::pos2(rect.left(), rect.center().y)),
-            ("east", egui::pos2(rect.right(), rect.center().y)),
+        for (name, axis_km, pos) in [
+            (
+                "north",
+                region.half_north_km(),
+                egui::pos2(rect.center().x, rect.top()),
+            ),
+            (
+                "south",
+                region.half_north_km(),
+                egui::pos2(rect.center().x, rect.bottom()),
+            ),
+            (
+                "west",
+                region.half_east_km(),
+                egui::pos2(rect.left(), rect.center().y),
+            ),
+            (
+                "east",
+                region.half_east_km(),
+                egui::pos2(rect.right(), rect.center().y),
+            ),
         ] {
             let edge_km = ground_km_to(region, rect, &memory, center, pos);
             assert!(
-                region.half_width_km() <= edge_km,
+                axis_km <= edge_km,
                 "a {:.0}x{:.0} viewport put its box {:.3} km out past its {name} edge at \
                  {:.3} km: the floor stops there and the volume would stand on nothing",
                 rect.width(),
                 rect.height(),
-                region.half_width_km() - edge_km,
+                axis_km - edge_km,
                 edge_km,
             );
         }
@@ -141,9 +191,9 @@ fn the_poleward_edge_is_the_near_one_and_the_box_is_sized_by_it() {
         south - north,
     );
     assert!(
-        region.half_width_km() <= north,
+        region.half_north_km() <= north,
         "the box was sized past the near edge: {:.3} km against {north:.3} km",
-        region.half_width_km(),
+        region.half_north_km(),
     );
 }
 
@@ -163,20 +213,24 @@ fn zooming_in_buys_resolution() {
     let wide = region_for_viewport(rect, &memory_at(9.0), center).expect("a measurable box");
     let tight = region_for_viewport(rect, &memory_at(11.0), center).expect("a measurable box");
 
-    assert!(
-        tight.half_width_km() < wide.half_width_km(),
-        "zooming from 9 to 11 must shrink the box: {:.1} km against {:.1} km",
-        tight.half_width_km(),
-        wide.half_width_km(),
-    );
+    for (axis, tight_km, wide_km) in [
+        ("east", tight.half_east_km(), wide.half_east_km()),
+        ("north", tight.half_north_km(), wide.half_north_km()),
+    ] {
+        assert!(
+            tight_km < wide_km,
+            "zooming from 9 to 11 must shrink the box on its {axis} axis: \
+             {tight_km:.1} km against {wide_km:.1} km",
+        );
+    }
     let (wide_km, tight_km) = (
         wide.resolution_km(cells).expect("a non-zero cell count"),
         tight.resolution_km(cells).expect("a non-zero cell count"),
     );
     assert!(
-        tight_km < wide_km,
-        "the tighter box must be the finer sampling: {tight_km:.3} km/cell against \
-         {wide_km:.3} km/cell",
+        tight_km.0 < wide_km.0 && tight_km.1 < wide_km.1,
+        "the tighter box must be the finer sampling on both axes: \
+         {tight_km:?} km/cell against {wide_km:?} km/cell",
     );
 }
 
@@ -197,8 +251,8 @@ fn a_sub_quantum_change_in_the_viewport_is_the_same_box() {
     let first = region_for_viewport(base, &memory, center).expect("a measurable box");
     let second = region_for_viewport(nudged, &memory, center).expect("a measurable box");
     assert_eq!(
-        first.half_width_km(),
-        second.half_width_km(),
+        first.half_extent_km(),
+        second.half_extent_km(),
         "a 0.05-point change in the pane rect changed the box, so a still pane would \
          rebuild its grid for ever",
     );
@@ -218,27 +272,32 @@ fn the_half_width_is_a_whole_number_of_steps_and_never_rounded_up() {
     for width in [640.0_f32, 683.0, 701.0, 745.0, 799.0] {
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(width, width));
         let region = region_for_viewport(rect, &memory, center).expect("a measurable box");
-        let steps = region.half_width_km() / HALF_WIDTH_STEP_KM;
-        assert_eq!(
-            steps,
-            steps.floor(),
-            "a {width}-point pane produced {:.6} km, which is not a whole number of \
-             {HALF_WIDTH_STEP_KM} km steps",
-            region.half_width_km(),
-        );
-        let raw = ground_km_to(
-            region,
-            rect,
-            &memory,
-            center,
-            egui::pos2(rect.center().x, rect.top()),
-        );
-        assert!(
-            region.half_width_km() <= raw,
-            "a {width}-point pane rounded {raw:.6} km *up* to {:.6} km, putting the box \
-             outside the floor",
-            region.half_width_km(),
-        );
+        for (axis, km, edge) in [
+            (
+                "east",
+                region.half_east_km(),
+                egui::pos2(rect.right(), rect.center().y),
+            ),
+            (
+                "north",
+                region.half_north_km(),
+                egui::pos2(rect.center().x, rect.top()),
+            ),
+        ] {
+            let steps = km / HALF_WIDTH_STEP_KM;
+            assert_eq!(
+                steps,
+                steps.floor(),
+                "a {width}-point pane produced {km:.6} km on its {axis} axis, which is \
+                 not a whole number of {HALF_WIDTH_STEP_KM} km steps",
+            );
+            let raw = ground_km_to(region, rect, &memory, center, edge);
+            assert!(
+                km <= raw,
+                "a {width}-point pane rounded {raw:.6} km *up* to {km:.6} km on its \
+                 {axis} axis, putting the box outside the floor",
+            );
+        }
     }
 }
 
@@ -320,11 +379,19 @@ fn a_pane_zoomed_out_past_the_ceiling_gets_the_whole_scan_box() {
     let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 900.0));
     let region = region_for_viewport(rect, &memory_at(5.0), centre())
         .expect("a wide-open pane still has a measurable box");
-    assert_eq!(
-        region.half_width_km(),
-        rustdar_radar::voxel::MAX_HALF_WIDTH_KM,
+    let corner = region.half_extent_km().corner_km();
+    // The bound is on the **corner**, and it is landed on by scaling both axes
+    // by one factor rather than by clamping each to a constant — so it is hit
+    // to within the last few bits rather than exactly. Measured across 300k
+    // random extents at pane-shaped aspects: 1.14e-13 km, a tenth of a
+    // nanometre. The tolerance is four orders above that and eleven below the
+    // 1 km quantisation this is derived through, so it can only pass for the
+    // right reason.
+    assert!(
+        (corner - rustdar_radar::voxel::MAX_HALF_DIAGONAL_KM).abs() < 1e-9,
         "a pane showing more ground than the resampler will honour must stop at its \
-         ceiling rather than be refused a box",
+         ceiling rather than be refused a box: a {corner} km corner against {}",
+        rustdar_radar::voxel::MAX_HALF_DIAGONAL_KM,
     );
     assert_eq!(
         rustdar_radar::voxel::MAX_HALF_WIDTH_KM,
@@ -333,7 +400,8 @@ fn a_pane_zoomed_out_past_the_ceiling_gets_the_whole_scan_box() {
          earns, or a 3D pane stops short of the picture beside it",
     );
     assert!(
-        region.half_width_km() > crate::pane::BASE_HALF_WIDTH_KM,
+        region.half_east_km() > crate::pane::BASE_HALF_WIDTH_KM
+            && region.half_north_km() > crate::pane::BASE_HALF_WIDTH_KM,
         "the ceiling is no longer the stand-in: a pane zoomed out must be able to \
          pass the box an unmeasured one poses its camera against",
     );

@@ -2127,23 +2127,18 @@ fn volume_pane_outcome(
             // keyed on `rendered_for` because it has to exist before a target
             // does; this one has no such excuse, and a caption is exactly
             // where a box size nobody resampled would go unnoticed.
-            let half_width_km = painter
+            let drawn_box_km = painter
                 .box_size_km(pane_idx, &target)
-                .map_or(0.5 * f64::from(box_size_km[0]), |built| {
-                    0.5 * f64::from(built[0])
-                });
+                .unwrap_or(box_size_km);
+            let half = rustdar_radar::voxel::HalfExtentKm {
+                east_km: 0.5 * f64::from(drawn_box_km[0]),
+                north_km: 0.5 * f64::from(drawn_box_km[1]),
+            };
             paint_volume_caption(
                 ui,
                 pane_rect,
                 crate::ui::pills::pill_row_clearance(ui.ctx(), pane_idx),
-                &volume_caption(
-                    &site_code,
-                    collected,
-                    base_started,
-                    half_width_km,
-                    camera,
-                    showing,
-                ),
+                &volume_caption(&site_code, collected, base_started, half, camera, showing),
             );
             None
         }
@@ -2553,16 +2548,21 @@ const KFT_PER_KM: f64 = 3.280_84;
 /// whole reflectivity volume against 0.16 at a 20 km region is the difference
 /// between a smear and a storm.
 ///
-/// # Why the box arrives as a number rather than as a region
+/// # Why the box arrives as an extent rather than as a region
 ///
 /// It has to be the box the grid was **built** over, and for a pane with no
 /// picked region that is no longer derivable from anything this function could
-/// be handed instead: the width follows the volume's own reach
+/// be handed instead: the extent follows the volume's own reach
 /// (`rustdar_radar::voxel::box_half_width_km`), so it is 651 km for a
 /// reflectivity volume and 424 for the same site's velocity. The caller reads
 /// it off the grid through `VolumePainter::box_size_km`, and passing the
-/// resolved number is what keeps this caption from being the one place that
+/// resolved extent is what keeps this caption from being the one place that
 /// says a box size nothing resampled.
+///
+/// A [`rustdar_radar::voxel::HalfExtentKm`] rather than two `f64`s, for the
+/// reason that type exists: the two are adjacent, same-typed and name different
+/// axes, so a swap here would print a box's height as its width and read as
+/// nothing worse than a surprising pane.
 ///
 /// # Why the resolution line is told what is on screen
 ///
@@ -2582,7 +2582,7 @@ fn volume_caption(
     site: &str,
     newest: chrono::NaiveDateTime,
     base_started: Option<chrono::NaiveDateTime>,
-    half_width_km: f64,
+    half: rustdar_radar::voxel::HalfExtentKm,
     camera: crate::pane::OrbitCamera,
     showing: crate::volume_view::Showing,
 ) -> Vec<String> {
@@ -2606,10 +2606,11 @@ fn volume_caption(
     ));
 
     let cells = rustdar_radar::voxel::default_shape().nx;
-    let across = 2.0 * half_width_km;
+    let across = axes(2.0 * half.east_km, 2.0 * half.north_km, 0);
     match (
         showing.stale.then_some(showing.cell_km).flatten(),
-        crate::pane::resolution_km(half_width_km, cells),
+        crate::pane::resolution_km(half.east_km, cells)
+            .zip(crate::pane::resolution_km(half.north_km, cells)),
     ) {
         // Standing in: the cell size on screen is the held grid's, not the one
         // this box would buy, and the line says which and that a sharper one is
@@ -2618,20 +2619,44 @@ fn volume_caption(
         // nothing outside it, and a caption that did not say so would be read as
         // "the storm ends there".
         (Some(shown), _) if showing.partial => lines.push(format!(
-            "{across:.0} km box - {shown:.2} km/cell over the middle, filling in",
+            "{across} km box - {shown:.2} km/cell over the middle, filling in",
         )),
-        (Some(shown), Some(km)) => lines.push(format!(
-            "{across:.0} km box - {shown:.2} km/cell, sharpening to {km:.2}",
+        (Some(shown), Some((east, north))) => lines.push(format!(
+            "{across} km box - {shown:.2} km/cell, sharpening to {}",
+            axes(east, north, 2),
         )),
-        (Some(shown), None) => lines.push(format!(
-            "{across:.0} km box - {shown:.2} km/cell, sharpening",
+        (Some(shown), None) => {
+            lines.push(format!("{across} km box - {shown:.2} km/cell, sharpening"))
+        }
+        (None, Some((east, north))) => lines.push(format!(
+            "{across} km box - {} km/cell",
+            axes(east, north, 2)
         )),
-        (None, Some(km)) => lines.push(format!("{across:.0} km box - {km:.2} km/cell")),
         // A zero cell count is impossible for every named shape, and a caption is
         // not the place to fail over it.
-        (None, None) => lines.push(format!("{across:.0} km box")),
+        (None, None) => lines.push(format!("{across} km box")),
     }
     lines
+}
+
+/// `east` alone when the two axes print the same at `decimals`, `east × north`
+/// otherwise.
+///
+/// The caption has two numbers for every horizontal quantity now, and a pane
+/// whose box really is square would read as though its two axes agreeing were a
+/// coincidence worth reporting. Comparing the **formatted** strings rather than
+/// the `f64`s is the whole trick: what matters is whether the reader would see
+/// two different numbers, and a 460.0001 × 460.0000 km box prints one.
+///
+/// East first, matching [`rustdar_radar::voxel::HalfExtentKm`]'s own field
+/// order and the box's `x` before its `y`.
+fn axes(east: f64, north: f64, decimals: usize) -> String {
+    let (east, north) = (format!("{east:.decimals$}"), format!("{north:.decimals$}"));
+    if east == north {
+        east
+    } else {
+        format!("{east} × {north}")
+    }
 }
 
 /// Inset of the caption from the pane's top-left corner, points.

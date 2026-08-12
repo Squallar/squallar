@@ -645,9 +645,7 @@ fn voxel_request_for(
     let (centre, half_extent_km) = match target.region {
         Some(region) => (
             (region.centre().lat, region.centre().lon),
-            Some(rustdar_radar::voxel::HalfExtentKm::square(
-                region.half_width_km(),
-            )),
+            Some(region.half_extent_km()),
         ),
         None => ((site_lat, site_lon), None),
     };

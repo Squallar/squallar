@@ -164,7 +164,7 @@ fn target(half_width_km: f64) -> VolumeTarget {
                     lat: SITE.0,
                     lon: SITE.1,
                 },
-                half_width_km,
+                rustdar_radar::voxel::HalfExtentKm::square(half_width_km),
             )
             .expect("a finite in-range half-width on a real centre is a region"),
         ),

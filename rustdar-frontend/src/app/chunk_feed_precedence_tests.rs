@@ -231,7 +231,7 @@ fn a_picked_region_decides_the_ground_that_is_resampled() {
             lat: 36.1,
             lon: -98.4,
         },
-        22.5,
+        rustdar_radar::voxel::HalfExtentKm::square(22.5),
     )
     .expect("a valid region");
     let aimed = voxel_request_for(&target(Some(picked)), 35.33, -97.28);
@@ -272,7 +272,7 @@ fn a_region_pick_does_not_move_the_top_or_the_bottom_of_the_box() {
             lat: 36.1,
             lon: -98.4,
         },
-        15.0,
+        rustdar_radar::voxel::HalfExtentKm::square(15.0),
     );
 
     for target in [make(None), make(picked)] {

@@ -77,31 +77,60 @@ pub(crate) fn region_for_viewport(
     map_memory: &walkers::MapMemory,
     center: walkers::Position,
 ) -> Option<VolumeRegion> {
-    let (centre, half_width_km) = measure_viewport(rect, map_memory, center)?;
+    let (centre, measured) = measure_viewport(rect, map_memory, center)?;
 
-    // Down to the step, then refused rather than clamped up if what is left is
-    // below what `build_voxels` will honour: a clamped-up box would be larger
-    // than the viewport that measured it, and the pane's own caption would
-    // describe a box the floor does not cover.
-    let quantised = (half_width_km / HALF_WIDTH_STEP_KM).floor() * HALF_WIDTH_STEP_KM;
-    // `<` rather than a negated `>=`, so a NaN — which compares false against
-    // everything — falls through to `VolumeRegion::new`, where it is refused
-    // outright. Refusing it here as well would be the same answer by a longer
-    // route; laundering it past both would be a key that never equals itself.
-    if quantised < rustdar_radar::voxel::MIN_HALF_WIDTH_KM {
+    // Down to the step on each axis, and **before** the region's own clamp, so
+    // the whole pipeline is a function of two whole kilometres: `clamped`'s
+    // corner scaling is continuous in its input, and quantising after it would
+    // hand a wide-open pane a fresh cache key on every frame of `f32` rect
+    // jitter — the rebuild-for-ever this step exists to stop, reintroduced by
+    // an ordering.
+    let quantised = rustdar_radar::voxel::HalfExtentKm {
+        east_km: quantise(measured.east_km),
+        north_km: quantise(measured.north_km),
+    };
+    // A NaN reaches `VolumeRegion::new`, where `is_finite` refuses it outright.
+    // Refusing it here as well would be the same answer by a longer route;
+    // laundering it past both would be a key that never equals itself.
+    let region = VolumeRegion::new(centre, quantised)?;
+
+    // Refused rather than clamped up if the resampler's floor grew the box past
+    // the ground that measured it: a clamped-up box is larger than the viewport
+    // it came from, and the pane's own caption would describe a box the floor
+    // does not cover.
+    //
+    // Stated as "did the stored box come back bigger than what was measured"
+    // rather than as a second `< MIN_HALF_WIDTH_KM` test, because that *is* the
+    // property — and because `HalfExtentKm::clamped` has two ways to grow an
+    // axis, only one of which a pre-construction test would catch. The other is
+    // its own documented corner: an extent past 47:1 is scaled to the diagonal
+    // bound and lands back under the floor, which a viewport cannot reach today
+    // and which this covers anyway for free.
+    if region.half_east_km() > quantised.east_km || region.half_north_km() > quantised.north_km {
         return None;
     }
-    VolumeRegion::new(centre, quantised)
+    Some(region)
 }
 
-/// The centre of `rect`'s ground and the **unquantised** half-width of the
+/// One extent, rounded **down** to a whole [`HALF_WIDTH_STEP_KM`].
+fn quantise(km: f64) -> f64 {
+    (km / HALF_WIDTH_STEP_KM).floor() * HALF_WIDTH_STEP_KM
+}
+
+/// The centre of `rect`'s ground and the **unquantised** half-extent of the
 /// largest square inscribed in it, kilometres.
 ///
 /// The measurement half of [`region_for_viewport`], split out because
-/// [`zoom_viewport`] needs the raw number: the quantisation exists to keep a
+/// [`zoom_viewport`] needs the raw numbers: the quantisation exists to keep a
 /// *cache key* still, and a zoom bound computed off a number that has already
 /// been rounded down by up to a kilometre would stop the gesture up to a
 /// kilometre early — visibly, at the tight end where the box is only ten across.
+///
+/// The answer is a [`rustdar_radar::voxel::HalfExtentKm`] and today both its
+/// lanes hold the same number — see the loop below. The type is the one the
+/// resampler, the renderer and [`VolumeRegion`] all speak, so carrying it from
+/// the measurement outwards is what leaves the flip to a rectangle a change in
+/// this function alone.
 ///
 /// `None` for every reason `region_for_viewport` answers `None` except the
 /// resampler's floor, which is the caller's decision rather than the
@@ -110,7 +139,7 @@ fn measure_viewport(
     rect: egui::Rect,
     map_memory: &walkers::MapMemory,
     center: walkers::Position,
-) -> Option<(GeoPoint, f64)> {
+) -> Option<(GeoPoint, rustdar_radar::voxel::HalfExtentKm)> {
     if !(rect.width() > 0.0 && rect.height() > 0.0) {
         return None;
     }
@@ -129,9 +158,9 @@ fn measure_viewport(
     }
 
     // The four edge midpoints. Each gives the ground from the centre to one
-    // edge; the box's half-width is the smallest, so the square it describes is
-    // inside the viewport on all four sides even though Mercator makes the four
-    // distances differ.
+    // edge; the box's half-width is the smallest of all four, so the square it
+    // describes is inside the viewport on all four sides even though Mercator
+    // makes the four distances differ.
     let edges = [
         egui::pos2(rect.center().x, rect.top()),
         egui::pos2(rect.center().x, rect.bottom()),
@@ -152,7 +181,13 @@ fn measure_viewport(
         }
         half_width_km = half_width_km.min(range_km);
     }
-    Some((centre, half_width_km))
+    // One minimum over all four edges, written into both lanes: the box a
+    // rectangular type is carrying is still the inscribed square, and this line
+    // is the only reason it is.
+    Some((
+        centre,
+        rustdar_radar::voxel::HalfExtentKm::square(half_width_km),
+    ))
 }
 
 /// `walkers::Map::zoom_speed`'s default, which the plan view leaves alone.
@@ -244,7 +279,7 @@ pub(crate) fn zoom_viewport(
         return false;
     }
     let from = map_memory.zoom();
-    let Some((_, half_width_km)) = measure_viewport(rect, map_memory, center) else {
+    let Some((_, half)) = measure_viewport(rect, map_memory, center) else {
         return false;
     };
 
@@ -259,8 +294,18 @@ pub(crate) fn zoom_viewport(
     // from a plan view someone had zoomed to the street — can always move
     // *towards* it and never further out. Clamping it on arrival instead would
     // be the camera moving on its own, which is the one thing this must not do.
-    let inward = from + (half_width_km / rustdar_radar::voxel::MIN_HALF_WIDTH_KM).log2();
-    let outward = from + (half_width_km / rustdar_radar::voxel::MAX_HALF_WIDTH_KM).log2();
+    //
+    // **The two bounds read different quantities off the box, and each reads
+    // the one its own limit is about.** Inward is the *narrow* axis, because
+    // that is the one that reaches `MIN_HALF_WIDTH_KM` first and a box with one
+    // axis clamped up off the floor would overhang its own floor on that axis.
+    // Outward is the **corner** against `MAX_HALF_DIAGONAL_KM`, because the
+    // ceiling has always been a bound on the corner — `MAX_HALF_WIDTH_KM` is
+    // that same bound written for the one case where the two sides are equal,
+    // and a rectangle has no single width for it to be about.
+    let inward =
+        from + (half.east_km.min(half.north_km) / rustdar_radar::voxel::MIN_HALF_WIDTH_KM).log2();
+    let outward = from + (half.corner_km() / rustdar_radar::voxel::MAX_HALF_DIAGONAL_KM).log2();
     let target = (from + step).clamp(outward.min(from), inward.max(from));
     if target == from {
         return false;
@@ -277,10 +322,11 @@ pub(crate) fn zoom_viewport(
     if probe.set_zoom(target).is_err() {
         return false;
     }
-    let Some((_, after_km)) = measure_viewport(rect, &probe, center) else {
+    let Some((_, after)) = measure_viewport(rect, &probe, center) else {
         return false;
     };
-    if target > from && after_km < rustdar_radar::voxel::MIN_HALF_WIDTH_KM {
+    if target > from && after.east_km.min(after.north_km) < rustdar_radar::voxel::MIN_HALF_WIDTH_KM
+    {
         return false;
     }
     *map_memory = probe;

@@ -1816,11 +1816,22 @@ struct VoxelRow<'grid> {
 /// *bit for bit* rather than nearly. A separate `clamp(MIN_HALF_WIDTH_KM,
 /// MAX_HALF_WIDTH_KM)` on the renderer's side is not that agreement: for a
 /// square ask past the stop it answers `470 / √2` where [`HalfExtentKm::clamped`]
-/// answers `half · (470 / hypot(half, half))`, and the two differ by
-/// 5.7e-14 km. Unreachable today only because `VolumeRegion::new` pre-clamps —
-/// and reachable the moment a region carries two axes, since a 450 × 200 km
-/// half-extent has both sides under [`MAX_HALF_WIDTH_KM`] and a corner 22 km
-/// outside [`MAX_HALF_DIAGONAL_KM`].
+/// answers `half · (470 / hypot(half, half))`, and the two differ by one or two
+/// ULP — measured, 332.3401871576773 against 332.34018715767735 for a 400 km
+/// ask and 332.3401871576774 for the ~1800 km one a wide-open pane measures.
+///
+/// **That divergence is reachable, and the route to it is not the obvious
+/// one.** Two sides both under [`MAX_HALF_WIDTH_KM`] cannot have a corner past
+/// [`MAX_HALF_DIAGONAL_KM`] — the second is the first times √2, so
+/// `hypot(a, b) ≤ hypot(MAX_W, MAX_W) = MAX_DIAG` for every such pair, and no
+/// ask can slip past a per-axis clamp and be caught by the corner one. What
+/// makes the two spellings differ is the opposite: `clamped` lands the corner
+/// *on* the bound, which puts each side of a square box one ULP **above**
+/// `MAX_HALF_WIDTH_KM`. A renderer that re-clamped per axis would shave that
+/// ULP off a box `build_voxels` keeps, and the pane would sit permanently on
+/// the crop path with a near-identity affine instead of on the settled grid.
+/// `VolumeRegion::new` running this same function is what makes such a box
+/// storable, so the hazard is live rather than hypothetical.
 ///
 /// Polar from the site and back, so this is the same tangent plane the
 /// resampler's per-cell mapping uses and a centre *at* the site lands exactly

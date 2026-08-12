@@ -149,11 +149,12 @@ fn the_stand_in_box_is_the_resamplers_own_fallback_and_survives_it_unclamped() {
              of half-width against a {} km frame",
         rustdar_radar::types::BASE_EXTENT_KM,
     );
-    let region = VolumeRegion::new(point(35.3, -97.3), BASE_HALF_WIDTH_KM)
+    let stand_in = rustdar_radar::voxel::HalfExtentKm::square(BASE_HALF_WIDTH_KM);
+    let region = VolumeRegion::new(point(35.3, -97.3), stand_in)
         .expect("the stand-in half-width must be a region the resampler takes");
     assert_eq!(
-        region.half_width_km(),
-        BASE_HALF_WIDTH_KM,
+        region.half_extent_km(),
+        stand_in,
         "the resampler must honour the stand-in un-clamped, or the pane's own \
              camera arithmetic describes a different box than the one built",
     );

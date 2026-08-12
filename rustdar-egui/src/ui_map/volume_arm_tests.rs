@@ -632,8 +632,9 @@ fn ground_zoom(h: &mut InputHarness, idx: usize) -> f64 {
     h.gui_mut().pane(idx).expect("a pane").map_memory.zoom()
 }
 
-/// The half-width of the box a 3D pane published this frame, kilometres.
-fn box_km(h: &mut InputHarness, idx: usize) -> f64 {
+/// The half-extent of the box a 3D pane published this frame, kilometres on
+/// each horizontal axis.
+fn box_extent(h: &mut InputHarness, idx: usize) -> rustdar_radar::voxel::HalfExtentKm {
     h.gui_mut()
         .pane(idx)
         .expect("a pane")
@@ -641,7 +642,7 @@ fn box_km(h: &mut InputHarness, idx: usize) -> f64 {
         .expect("a pane in the 3D render mode")
         .viewport_box
         .expect("the arm must publish the box it measured")
-        .half_width_km()
+        .half_extent_km()
 }
 
 /// Scrolling over the 3D pane zooms it; scrolling over another pane does
@@ -740,11 +741,11 @@ fn zooming_the_box_leaves_the_camera_exactly_where_the_user_left_it() {
         .camera = placed;
     h.frames_for(2, FRAME_DT);
 
-    let before_box = box_km(&mut h, 1);
+    let before_box = box_extent(&mut h, 1).corner_km();
     h.scroll_at(rect.center(), egui::vec2(0.0, 200.0));
     h.frames_for(4, FRAME_DT);
 
-    let after_box = box_km(&mut h, 1);
+    let after_box = box_extent(&mut h, 1).corner_km();
     assert!(
         after_box < before_box,
         "precondition: the scroll must have re-cut the box: {before_box} -> {after_box}",
@@ -937,19 +938,20 @@ fn zooming_in_stops_at_the_resamplers_floor_rather_than_popping_to_the_ceiling()
     for _ in 0..40 {
         h.scroll_at(rect.center(), egui::vec2(0.0, 300.0));
         h.frames_for(1, FRAME_DT);
-        let km = box_km(&mut h, 1);
+        let km = box_extent(&mut h, 1);
         assert!(
-            km >= rustdar_radar::voxel::MIN_HALF_WIDTH_KM,
-            "the box fell through the resampler's floor to {km} km",
+            km.east_km.min(km.north_km) >= rustdar_radar::voxel::MIN_HALF_WIDTH_KM,
+            "the box fell through the resampler's floor to {km:?} km",
         );
         assert!(
-            km <= rustdar_radar::voxel::MAX_HALF_WIDTH_KM,
-            "the box popped to the fallback at {km} km - the measurement was \
+            km.corner_km() <= rustdar_radar::voxel::MAX_HALF_DIAGONAL_KM,
+            "the box popped to the fallback at {km:?} km - the measurement was \
              refused and the caller used the whole-scan default",
         );
     }
     assert!(
-        box_km(&mut h, 1) < 2.0 * rustdar_radar::voxel::MIN_HALF_WIDTH_KM,
+        box_extent(&mut h, 1).corner_km()
+            < 2.0 * std::f64::consts::SQRT_2 * rustdar_radar::voxel::MIN_HALF_WIDTH_KM,
         "precondition: the zoom must actually have reached the floor, or the \
          assertions above passed without ever being tested",
     );
@@ -1164,7 +1166,7 @@ fn the_height_the_pane_reports_is_real_at_every_exaggeration() {
             "KTLX",
             at(33),
             None,
-            crate::pane::BASE_HALF_WIDTH_KM,
+            square(crate::pane::BASE_HALF_WIDTH_KM),
             camera,
             SETTLED,
         );
@@ -1204,7 +1206,7 @@ fn the_caption_states_the_newest_data_time_not_a_whole_volume_claim() {
         "KTLX",
         at(39),
         Some(at(33)),
-        crate::pane::BASE_HALF_WIDTH_KM,
+        square(crate::pane::BASE_HALF_WIDTH_KM),
         Default::default(),
         SETTLED,
     );
@@ -1229,7 +1231,7 @@ fn the_caption_names_the_base_volume_or_says_the_first_is_still_filling() {
         "KTLX",
         at(39),
         Some(at(33)),
-        crate::pane::BASE_HALF_WIDTH_KM,
+        square(crate::pane::BASE_HALF_WIDTH_KM),
         Default::default(),
         SETTLED,
     );
@@ -1246,7 +1248,7 @@ fn the_caption_names_the_base_volume_or_says_the_first_is_still_filling() {
         "KTLX",
         at(39),
         None,
-        crate::pane::BASE_HALF_WIDTH_KM,
+        square(crate::pane::BASE_HALF_WIDTH_KM),
         Default::default(),
         SETTLED,
     );
@@ -1275,7 +1277,7 @@ fn the_caption_reports_the_resolution_the_box_buys() {
         "KTLX",
         at(33),
         None,
-        whole_volume,
+        square(whole_volume),
         Default::default(),
         SETTLED,
     );
@@ -1291,14 +1293,14 @@ fn the_caption_reports_the_resolution_the_box_buys() {
             lat: 35.3,
             lon: -97.3,
         },
-        20.0,
+        rustdar_radar::voxel::HalfExtentKm::square(20.0),
     )
     .expect("a valid region");
     let tight_lines = volume_caption(
         "KTLX",
         at(33),
         None,
-        tight.half_width_km(),
+        tight.half_extent_km(),
         Default::default(),
         SETTLED,
     );
@@ -1340,10 +1342,17 @@ fn a_caption_over_a_stand_in_reports_the_picture_and_not_the_request() {
     let cells = rustdar_radar::voxel::default_shape().nx as f64;
     let asked_for = format!("{:.2} km/cell", 40.0 / cells);
     let line_of = |showing| {
-        volume_caption("KTLX", at(33), None, 20.0, Default::default(), showing)
-            .into_iter()
-            .find(|l| l.contains("km box"))
-            .expect("a box line")
+        volume_caption(
+            "KTLX",
+            at(33),
+            None,
+            square(20.0),
+            Default::default(),
+            showing,
+        )
+        .into_iter()
+        .find(|l| l.contains("km box"))
+        .expect("a box line")
     };
 
     // Zoomed in: soft now, sharp shortly.
@@ -1536,6 +1545,12 @@ fn at(minute: u32) -> chrono::NaiveDateTime {
         .expect("a real date")
         .and_hms_opt(22, minute, 0)
         .expect("a real time")
+}
+
+/// A square half-extent, for the caption tests whose subject is something
+/// other than the box's shape.
+fn square(half_km: f64) -> rustdar_radar::voxel::HalfExtentKm {
+    rustdar_radar::voxel::HalfExtentKm::square(half_km)
 }
 
 /// The mirror pass's guest list is this frame's floor strips — and nothing
@@ -2278,27 +2293,22 @@ fn a_3d_panes_box_follows_its_own_viewport() {
     h.make_pane_volume(0);
     h.warm_up();
 
-    let box_at = |h: &mut InputHarness| {
-        h.gui_mut()
-            .pane(0)
-            .expect("pane 0")
-            .volume()
-            .expect("a pane in the 3D render mode")
-            .viewport_box
-            .expect("the arm must publish the box it measured")
-            .half_width_km()
-    };
+    let box_at = |h: &mut InputHarness| box_extent(h, 0);
 
     // Wide open: the viewport shows more ground than the resampler will
-    // honour, so the box stops at its ceiling — `MAX_EXTENT_KM / √2`, which is
-    // past even a 460 km surveillance cut's own 325.4, so it crops nothing a
-    // radar can produce. That is what a pane nobody has aimed should show.
+    // honour, so the box stops at its ceiling — a **corner** on
+    // `MAX_HALF_DIAGONAL_KM`, which for the square this measures today is a
+    // half-width of `MAX_EXTENT_KM / √2`. That is past even a 460 km
+    // surveillance cut's own 325.4, so it crops nothing a radar can produce,
+    // and it is what a pane nobody has aimed should show.
     let wide = box_at(&mut h);
-    assert_eq!(
-        wide,
-        rustdar_radar::voxel::MAX_HALF_WIDTH_KM,
+    assert!(
+        (wide.corner_km() - rustdar_radar::voxel::MAX_HALF_DIAGONAL_KM).abs() < 1e-9,
         "a pane at the default zoom sees past the resampler's ceiling, so its \
-         box must sit on it",
+         box's corner must sit on it: {:?} is a {} km corner against {}",
+        wide,
+        wide.corner_km(),
+        rustdar_radar::voxel::MAX_HALF_DIAGONAL_KM,
     );
 
     // Zoomed in, the way a user frames a storm.
@@ -2312,15 +2322,15 @@ fn a_3d_panes_box_follows_its_own_viewport() {
 
     let tight = box_at(&mut h);
     assert!(
-        tight < wide,
-        "zooming the pane in must tighten its box: {tight} km against {wide} km. \
+        tight.corner_km() < wide.corner_km(),
+        "zooming the pane in must tighten its box: {tight:?} against {wide:?}. \
          A box that ignores the viewport is one the pane's own floor cannot cover.",
     );
     // Not merely smaller — small enough that the grid's fixed cell count buys
     // real detail, which is the entire reason a region control ever existed.
     assert!(
-        tight < 0.25 * wide,
-        "four zoom steps bought only {tight} km against {wide} km; the box is \
+        tight.corner_km() < 0.25 * wide.corner_km(),
+        "four zoom steps bought only {tight:?} against {wide:?}; the box is \
          not tracking the viewport, it is being nudged by something else",
     );
 }
