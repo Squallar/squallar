@@ -840,25 +840,25 @@ const STENCIL_RNG_HALF: i32 = 1;
 /// velocity profile and the stencil's ramp response; constant or incoherent
 /// profiles read ND, matching the reference's ND bins over good velocity.
 ///
-/// # Where this floor is measurably too low
+/// # This is not the axis the clear-air over-paint is on
 ///
-/// On a clear-air cut it lets through velocity the reference paints no
-/// rotation over at all. KHNX 2024-12-16 08:01:56, VCP 31, declared Nyquist
-/// 11.66 m/s: 41 bins spread over the sweep where this module reads
-/// |NROT| ≥ 0.5 inside 80 km were hovered in the reference, and **all 41 read
-/// ND** — while its base velocity over the same ground is painted and smooth,
-/// a few m/s. The velocity we read there is not smooth: at az 269.75°,
-/// 14.6 km the nine radials across the bin carry −5.0 −4.0 +10.0 +0.5 +8.5
-/// −7.5 +0.5 −11.5 −11.5, alternating near ±Vny, and this floor admits it.
+/// That was the standing hypothesis here, and the noise ladder refuted it. The
+/// bin it was recorded at — KHNX 2024-12-16 08:01:56, az 269.75°, 14.6 km,
+/// where this module read −1.49 and the reference reads ND — fits the stencil
+/// at r² = 0.315, and the KFTG 2023-06-22 mesocyclone core the reference
+/// paints +1.64 at fits it at r² = 0.197. The bin to drop correlates with the
+/// operator *better* than the bin to keep, so no floor on this axis separates
+/// them, and raising this one only costs real rotation.
 ///
-/// It is not an input gate we are missing. Two ladders were painted into the
-/// same cut, one couplet per sector with only the sector's reflectivity
-/// differing (40, 25, 15, 5, 0, −10 dBZ) and one with only its spectrum width
-/// differing (1, 3, 5, 7, 9, 12 m/s): the reference read the identical +0.49
-/// couplet profile in all twelve. So what it refuses on the real cut is the
-/// velocity field itself, and this floor — or whatever leaves that field raw
-/// and contradictory upstream — is where the difference lives. A noise ladder
-/// against the reference is what would set it.
+/// What does separate them is [`GK_MAX_TEXTURE_VNY_FRAC`], which carries the
+/// ladder: the reference refuses velocity that is discontinuous along the
+/// beam, and reads azimuthal incoherence — which is all r² measures — quite
+/// happily. Nor was it an input gate: reflectivity (40 down to −10 dBZ) and
+/// spectrum-width (1 to 12 m/s) ladders painted into that same cut read the
+/// identical +0.49 couplet in all twelve sectors.
+///
+/// The floor still earns its place on constant and near-constant profiles,
+/// which is what it was set for and all it is claimed to do.
 const GK_MIN_R2: f64 = 0.05;
 
 /// Extra valid radials required beyond the split stencil's ±4 span on each
@@ -867,6 +867,111 @@ const GK_MIN_R2: f64 = 0.05;
 /// on echo boundaries where the profile is half real, half edge — and the
 /// margin gives the split stencil the same protection.
 const GK_DATA_MARGIN: i32 = 1;
+
+/// Range-continuity ceiling. Rotation is reported only over velocity the radar
+/// measured continuously along the beam: [`range_texture`] must stay under
+/// this multiple of the cut's own fold limit.
+///
+/// # What the reference refuses
+///
+/// A noise ladder against GR2Analyst, six sites, hovered along the 21.0 nm arc
+/// of the lowest super-res velocity cut at 0.25° steps. Every volume carries six sectors 60° apart,
+/// each a width-3 couplet of 0.20·Vny poles — a couplet the reference paints
+/// at every rung, so an ND there is a refusal and not a value that rounded
+/// under its 0.04 quantum — plus one pseudorandom perturbation at six
+/// amplitudes.
+///
+/// **The axis is range, not incoherence.** A perturbation that varies only
+/// across azimuth the reference reads straight through: pure ±10 m/s azimuthal
+/// noise at KHNX, no couplet under it at all, reads up to +0.53 and carries a
+/// value at 15 of 21 hover points. The same amplitude varying along range as
+/// well reads ND at all 21.
+///
+/// **Nor is it the painted patch.** A perturbation that varies along range and
+/// is *common-mode across azimuth* — so the rotation computed from it is
+/// exactly the clean couplet's, over exactly the clean couplet's patch, since
+/// an antisymmetric operator cancels it identically — is refused at the same
+/// amplitude as the two-dimensional one: 0/9 at 8.0 m/s at KHNX and KLWX, 9/9
+/// at KMSX, whose limit is 25.91. So what the reference reads is the
+/// velocity's own continuity along the beam, whether or not the discontinuity
+/// ever reaches the derivative.
+///
+/// **The ceiling is a fraction of that cut's limit, not a velocity.** Rung 6
+/// of the absolute ladder is 8.0 m/s at every site:
+///
+/// ```text
+///                KHNX    KLWX    KLOT    KATX    KMSX
+///     Vny       11.66   11.34   23.96   25.32   25.91
+///     8.0 m/s    0/9     0/9     8/9     9/9     8/9    painted
+/// ```
+///
+/// while the relative ladder's top rung, 0.45·Vny, paints 8/9 or better at all
+/// six — including 16.0 m/s at the KTWX holdout, Vny 35.55, twice the absolute
+/// noise that silences KHNX.
+///
+/// **Where it sits.** A fine ladder, six rungs from 0.45 to 0.75·Vny, read as
+/// this module's own [`range_texture`] over the arc actually hovered:
+///
+/// ```text
+///     site   Vny      last kept              first rejected
+///     KHNX  11.66  0.397..0.427  7/9      0.462..0.493  0/9
+///     KLWX  11.34  0.411..0.424  8/9      0.459..0.487  0/9
+///     KLOT  23.96  0.409..0.425  9/9      0.455..0.471  0/9
+///     KATX  25.32  0.406..0.421  9/9      0.456..0.473  2/9
+///     KMSX  25.91  0.408..0.423  9/9      0.456..0.473  0/9
+///     KTWX  35.55  0.408..0.422  9/9      0.456..0.473  0/9   holdout
+/// ```
+///
+/// One rung boundary at every site across a 3.1× span of Nyquist, leaving the
+/// gap 0.427..0.455, and this is its middle. The holdout decides nothing and
+/// says the same thing louder: 18.13 m/s of range noise is kept there, and
+/// 8.0 m/s silences KHNX.
+///
+/// # Asked of the raw sweep
+///
+/// Not the median-filtered field the stencils differentiate: that filter
+/// exists to remove exactly this, and on it the two real cases are one number.
+/// At the bin the reference NDs — KHNX 2024-12-16 08:01:56, az 269.75°,
+/// 14.6 km — the median-filtered rms range difference is 1.65–1.81 m/s, and at
+/// the KFTG 2023-06-22 mesocyclone core the reference paints +1.64 at, it is
+/// 1.58–2.01. Raw they are 6.82–7.88 against 4.93–5.44, which no threshold in
+/// m/s separates either, and 0.585–0.676 against 0.205–0.227 of each cut's own
+/// limit, which does with a factor of 2.6 to spare.
+///
+/// Not the dealiased field either, and that is a measurement rather than a
+/// preference: after [`dealias`] the KHNX bin reads 0.352–0.398 and the
+/// mesocyclone 0.156–0.182, so that field would want a ceiling near 0.30 while
+/// the ladder — whose sectors carry no folds, so raw and dealiased agree there
+/// to 0.03 — puts it at 0.44. Only the raw sweep satisfies both.
+///
+/// # What was not reproduced
+///
+/// A ladder of range ramps that wrap 0, ½, 1, 2, 3 and 4 times across the band
+/// under an unchanged couplet, at KHNX and KMSX. The reference paints all six
+/// rungs, and two of them carry a raw texture of 0.70 and 0.81 — past this
+/// ceiling, which would drop them. The instrument is confounded and does not
+/// settle it: adding a couplet before the wrap moves the wrap boundary in
+/// azimuth, so those two rungs hold a genuine 2·Vny azimuthal step, and what
+/// the reference reads over them is that step (−1.05 and −0.49 where the
+/// couplet alone reads +0.22) rather than the couplet. Painting a fold wall as
+/// rotation is behaviour this module already declines ([`CENSOR_VNY_FRAC`]).
+/// What it costs to leave it here is visible on KCRP below.
+///
+/// # What it does on real volumes
+///
+/// Lowest super-res velocity cut, painted bins (|NROT| ≥ [`SIGNIFICANT`])
+/// inside 80 km, before → after:
+///
+/// ```text
+///     KHNX 2024-12-16  clear air   20878 → 1666
+///     KTLX 2025-02-19               2970 →  879
+///     KCRP 2017-08-26  Harvey       5411 → 3572
+///     KDMX 2022-03-05               3552 → 2704
+///     KFTG 2023-06-22               1614 → 1431
+///     KLOT 2024-12-16                106 →   97
+///     KMSX 2022-06-04                 47 →   43
+/// ```
+const GK_MAX_TEXTURE_VNY_FRAC: f64 = 0.44;
 
 /// The super-res operator ([`SPLIT_TAPS`]) at one bin. Requires every tap
 /// cell; profiles that do not correlate with the stencil read ND like the
@@ -1248,11 +1353,107 @@ fn composite_stencil_rot(
     Some(acc / arc_per_radial)
 }
 
+/// Half-depth in km of the range window [`range_texture`] reads. Wide enough
+/// that a bin's own gate does not decide the question and narrow enough that
+/// the window is still one feature.
+const TEXTURE_RANGE_HALF_KM: f64 = 1.0;
+
+/// Separation in km at which [`range_texture`] differences velocity along the
+/// beam. A physical distance rather than a gate count, because a super-res
+/// velocity cut repeats one estimate over two 0.25 km gates and adjacent-gate
+/// differences there are structurally zero half the time.
+const TEXTURE_STEP_KM: f64 = 0.5;
+
+/// Azimuthal half-span of the texture window, in rows: the widest span any
+/// stencil here reads, so the question asked is about the whole neighbourhood
+/// the estimator differentiates and not about one row of it.
+const TEXTURE_AZ_HALF: i32 = 5;
+
+/// Pairs required before the window has an answer.
+const TEXTURE_MIN_PAIRS: usize = 8;
+
+/// Rms velocity difference along the beam, over the neighbourhood each stencil
+/// reads. Root-mean-square of `v(r + `[`TEXTURE_STEP_KM`]`) − v(r)` across
+/// ±[`TEXTURE_RANGE_HALF_KM`] in range and ±[`TEXTURE_AZ_HALF`] rows, NaN
+/// where the window holds fewer than [`TEXTURE_MIN_PAIRS`] pairs.
+///
+/// Read from the sweep's own raw velocity rather than the median-filtered
+/// field the stencils differentiate: the question is whether the radar
+/// measured a continuous velocity along the beam, and a filter of ours must
+/// not be able to answer it yes.
+fn range_texture(sweep: &VelocitySweep, rows: crate::azimuth::Rows) -> Vec<Vec<f64>> {
+    let grid = sweep.vel_grid;
+    let n = grid.len();
+    let gc = sweep.gate_count;
+    let dk = ((TEXTURE_STEP_KM / sweep.gate_interval_km).round() as usize).max(1);
+    let gh = ((TEXTURE_RANGE_HALF_KM / sweep.gate_interval_km).round() as i32).max(1);
+    // Per row, the squared difference at `dk` and its running window sum, so
+    // the azimuthal pass below adds rows rather than rewalking gates.
+    // `f32`/`u16` per cell rather than `f64`/`u32`: this is one number per bin
+    // held for the length of the azimuthal pass, and a 1832-gate super-res cut
+    // has 1.3 M of them. The count never exceeds the window and the sum is a
+    // mean of squares, so neither wants the width.
+    let per_row: Vec<(Vec<f32>, Vec<u16>)> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let mut d2 = vec![0.0f64; gc];
+            let mut ok = vec![0u32; gc];
+            for j in 0..gc.saturating_sub(dk) {
+                let (a, b) = (grid[i][j], grid[i][j + dk]);
+                if !a.is_nan() && !b.is_nan() {
+                    d2[j] = (b - a).powi(2);
+                    ok[j] = 1;
+                }
+            }
+            let mut pre = vec![0.0f64; gc + 1];
+            let mut pcn = vec![0u32; gc + 1];
+            for j in 0..gc {
+                pre[j + 1] = pre[j] + d2[j];
+                pcn[j + 1] = pcn[j] + ok[j];
+            }
+            let (mut sum, mut cnt) = (vec![0.0f32; gc], vec![0u16; gc]);
+            for j in 0..gc {
+                let lo = (j as i32 - gh).max(0) as usize;
+                let hi = ((j as i32 + gh) as usize).min(gc - 1);
+                sum[j] = (pre[hi + 1] - pre[lo]) as f32;
+                cnt[j] = (pcn[hi + 1] - pcn[lo]) as u16;
+            }
+            (sum, cnt)
+        })
+        .collect();
+    (0..n)
+        .into_par_iter()
+        .map(|i| {
+            (0..gc)
+                .map(|j| {
+                    let (mut s, mut c) = (0.0f64, 0u32);
+                    for da in -TEXTURE_AZ_HALF..=TEXTURE_AZ_HALF {
+                        if let Some(ai) = rows.neighbour(i, da) {
+                            s += f64::from(per_row[ai].0[j]);
+                            c += u32::from(per_row[ai].1[j]);
+                        }
+                    }
+                    if (c as usize) < TEXTURE_MIN_PAIRS {
+                        f64::NAN
+                    } else {
+                        (s / c as f64).sqrt()
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
 fn llsd_nrot(sweep: &VelocitySweep, vel_grid: &[Vec<f64>]) -> Vec<Vec<f64>> {
     let num_radials = vel_grid.len();
     let rows = sweep_rows(sweep, num_radials);
     let spacing_rad = rows.step_deg.to_radians();
     let half_degree_rows = rows_are_half_degree_pairs(sweep.azimuths_deg);
+    // The cut's own limit, read off the raw sweep: after the dealiaser has
+    // run, a grid no longer folds at it.
+    let limit = fold_limit_ms(sweep, sweep.vel_grid);
+    let texture = range_texture(sweep, rows);
+    let texture_max = limit.map(|v| GK_MAX_TEXTURE_VNY_FRAC * v);
 
     (0..num_radials)
         .into_par_iter()
@@ -1264,6 +1465,13 @@ fn llsd_nrot(sweep: &VelocitySweep, vel_grid: &[Vec<f64>]) -> Vec<Vec<f64>> {
                     }
                     let range_km = sweep.first_gate_range_km + j as f64 * sweep.gate_interval_km;
                     if range_km <= MIN_RANGE_NM * KM_PER_NM {
+                        return f64::NAN;
+                    }
+                    // Rotation is only reported over velocity the radar
+                    // measured continuously along the beam.
+                    if let Some(max) = texture_max
+                        && texture[i][j] > max
+                    {
                         return f64::NAN;
                     }
 
@@ -3701,6 +3909,94 @@ mod tests {
         assert_eq!(
             strong, 0,
             "{strong} incoherent bins survived as NROT >= 0.25"
+        );
+    }
+
+    /// Rotation is reported only over velocity that is continuous along the
+    /// beam, and "continuous" is measured against the cut's own fold limit.
+    ///
+    /// The perturbation here is the reference's own discriminating case: it
+    /// varies along range and is **common-mode across azimuth**, so an
+    /// antisymmetric operator cancels it identically and the rotation computed
+    /// from it is the clean couplet's, over the clean couplet's patch. The
+    /// reference refuses it anyway (GR2Analyst, KHNX and KLWX, 0 of 9 hover
+    /// points painted at 8.0 m/s where 6.0 m/s paints; KMSX, whose limit is
+    /// 25.91 rather than 11.66, paints all nine) — so what is being tested is
+    /// the velocity's continuity and not the rotation field's.
+    ///
+    /// The second half is the axis: one grid, two declarations. A cut that
+    /// declares twice the Nyquist tolerates twice the discontinuity, which is
+    /// what [`GK_MAX_TEXTURE_VNY_FRAC`]'s ladder measured across a 3.1× span of
+    /// declared limits.
+    #[test]
+    fn rotation_is_reported_only_over_velocity_continuous_along_the_beam() {
+        let n = 720;
+        let gates = 400;
+        let azimuths = ring_azimuths(n);
+        let j = 155; // 38.75 km, where the ladder was hovered
+        const VNY: f64 = 11.66; // KHNX's declared limit
+        const AMP: f64 = 5.0;
+        const CORE: usize = 100;
+
+        // A width-3 couplet, plus a perturbation that alternates every
+        // TEXTURE_STEP_KM along range and does not vary across azimuth: every
+        // range pair in the window differs by exactly 2·`bump`, so the texture
+        // this fixture carries is 2·`bump` and nothing else.
+        let paint = |bump: f64| -> Vec<Vec<f64>> {
+            (0..n)
+                .map(|i| {
+                    let d = i as i64 - CORE as i64;
+                    let pole = if (0..3).contains(&d) {
+                        AMP
+                    } else if (-3..0).contains(&d) {
+                        -AMP
+                    } else {
+                        0.0
+                    };
+                    (0..gates)
+                        .map(|g| pole + if (g / 2) % 2 == 0 { bump } else { -bump })
+                        .collect()
+                })
+                .collect()
+        };
+        let read = |grid: &[Vec<f64>], nyquist: f64| -> f64 {
+            let mut s = sweep(grid, &azimuths, gates);
+            s.declared_nyquist_ms = Some(nyquist);
+            llsd_nrot(&s, grid)[CORE][j]
+        };
+
+        let ceiling = GK_MAX_TEXTURE_VNY_FRAC * VNY;
+        let (under, over) = (0.4 * ceiling, 0.7 * ceiling); // textures 0.8× and 1.4×
+        let flat = paint(0.0);
+        let quiet = paint(under);
+        let broken = paint(over);
+
+        let clean = read(&flat, VNY);
+        assert!(
+            clean.abs() >= SIGNIFICANT,
+            "precondition: the couplet itself reads {clean:.3}",
+        );
+        let kept = read(&quiet, VNY);
+        assert!(
+            kept.abs() >= SIGNIFICANT,
+            "a discontinuity at {:.2} of the limit blanked the couplet: read {kept:.3}",
+            2.0 * under / VNY,
+        );
+        let dropped = read(&broken, VNY);
+        assert!(
+            dropped.is_nan(),
+            "a discontinuity at {:.2} of the limit still read {dropped:.3}",
+            2.0 * over / VNY,
+        );
+
+        // The same grid, twice the declared limit: the ceiling is a multiple of
+        // what the cut says it can measure, not a velocity.
+        let wider = read(&broken, 2.0 * VNY);
+        assert!(
+            !wider.is_nan() && wider.abs() >= SIGNIFICANT,
+            "a cut declaring {:.2} refused what {:.2} of its own limit allows: read {wider:.3}",
+            2.0 * VNY,
+            2.0 * over / (2.0 * VNY),
         );
     }
 
