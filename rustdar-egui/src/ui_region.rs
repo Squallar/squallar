@@ -1,235 +1,67 @@
-//! The patch of ground a 3D pane resamples, measured off the pane's own
-//! viewport.
+//! A 3D pane's zoom gesture, which moves the **eye** and nothing else.
 //!
-//! # The region *is* the viewport
+//! # The region is stored, and this module does not write it
 //!
-//! There is no separate thing to aim. A 3D pane resamples **the ground its own
-//! map is showing** — the whole rectangle, not a square inside it — so its box
-//! and its floor are two measurements of one thing, and the gesture that aims
-//! it is the gesture that aims every other pane in the application: scroll, or
-//! pinch. [`zoom_viewport`] is that gesture's 3D arm, and it writes the same
-//! `MapMemory` a plan view's `walkers::Map` writes, by the same arithmetic.
+//! A 3D pane resamples a stored patch of ground: the volume's own data reach,
+//! circumscribed — the whole ring — or a smaller region the user picked. It
+//! changes when the site, the product, the reach or the selection changes, and
+//! at no other time. Not on a zoom, not on a pan, not on a divider drag, not on
+//! a window resize. See [`crate::pane::VolumeRegion`], which is where it now
+//! lives, and [`rustdar_radar::voxel::box_half_width_km`], which answers the
+//! unselected case from the reach.
 //!
-//! # Why the box is the viewport's rectangle and not a square inside it
+//! It used to be **derived**, every frame, from the pane's own viewport, and
+//! that is the defect this module was rebuilt to remove. Deriving it made the
+//! gesture that frames the picture also re-cut the data under it, so the ground
+//! the pane covered shrank as the user zoomed in — reported three times:
 //!
-//! It was the inscribed square, and that made converting a 16:9 pane to 3D
-//! *take ground away*: the floor strip has always covered the whole pane rect,
-//! and the box merely stood on the middle of it, so the left and right flanks
-//! of what the pane was showing simply stopped being resampled. The complaint
-//! that ended it is the plain reading of the picture —
+//! > the goddamn 3d viewer still covers less and less 3d geometry
 //!
-//! > I didn't realize the 3d viewer actually cut the viewport smaller, I hate
-//! > that. A user doesn't expect to become more boxed in when they zoom, they
-//! > just expect to be closer with the same area available to them.
+//! > The 3d viewer's region should CAP at either the size of the data in the
+//! > radar scan, or the region selected if the user did that. That region (the
+//! > selector OR the radar's ring) must never change. Zooming should keep the
+//! > rest of the region around and merely zoom into what's already there.
 //!
-//! Nothing downstream ever needed the square. `build_voxels` has taken a
-//! [`rustdar_radar::voxel::HalfExtentKm`] with an axis each since the extent
-//! became two numbers; the grid's wire format has always written its `x` and
-//! `y` ranges separately; and the renderer is anisotropic throughout — step
-//! length, both gradient sites, march density and the floor reprojection all
-//! divide per axis, and the shipped grid is 12.7:1 anisotropic between its
-//! horizontal axes and its vertical already. The squareness lived here, in one
-//! `min` across two axes, and nowhere else.
+//! On the reported session the pane's own caption stated the loss: `802 × 490
+//! km box` as opened, `668 × 408 km box` after a zoom. That is
+//! Chattanooga-to-Jacksonville reduced to Dalton-to-Wilmington. The box was not
+//! *cropped* by the zoom — which would at least have been a visible edge — it
+//! was rebuilt smaller, so the storms outside the new box stopped being
+//! resampled at all and the picture lost them silently.
 //!
-//! What a rectangle costs is **direction-dependent resolution**: the cell count
-//! is fixed per axis, so a 16:9 box spends the same 256 cells over 1.78× as
-//! much ground east–west as north–south. That cost is measured rather than
-//! argued about — see [`crate::pane::VolumeRegion::resolution_km`] and the
-//! anisotropy figures on [`rustdar_radar::voxel::VoxelShape`].
+//! # What the gesture does instead
 //!
-//! That is not a simplification of the drag this replaced — it is the fix for
-//! the class of bug the drag caused. The box's size and the floor's extent used
-//! to be set independently: the box came from a square dragged out on some
-//! *other* map pane, and the floor came from whatever viewport that pane
-//! happened to be showing at the time. Whenever the second was smaller than the
-//! first the floor simply stopped, leaving the volume standing on transparency
-//! past its edge, and a 3D view opened from a tab — which has no source map at
-//! all — got no floor whatsoever. Deriving one from the other makes coverage a
-//! property rather than a coincidence.
+//! It divides [`OrbitCamera::eye_distance`](crate::pane::OrbitCamera::eye_distance).
+//! That value is a multiple of the box's framing radius, so halving it halves
+//! the ground the pane is *looking at* while the box, the grid inside it and
+//! the floor under it all stand exactly still. The rest of the region stays
+//! around, off the edges of the frame, which is the plain reading of the ask.
 //!
-//! The drag's real purpose survives, because the grid has a fixed cell count:
-//! a tighter box spends the same cells over less ground. Zooming the pane in is
-//! now how that is asked for, which is also how every other pane in the
-//! application is aimed.
+//! Nothing else in the pane is touched. In particular the pane's own
+//! `walkers::MapMemory` is left alone, where the old arm wrote it on every
+//! gesture frame: it is shared with the pane's plan view, so writing it here
+//! also meant that flipping a pane to 3D, scrolling, and flipping back moved
+//! the map the user had aimed.
 //!
-//! # Why the ground is measured rather than computed from the zoom
+//! # Why the bound is the camera's and not the box's
 //!
-//! Web Mercator's scale varies with latitude, so the ground under the top edge
-//! of a tall viewport is *narrower* than the ground under its middle. Sizing
-//! the box from the centre's scale alone would let it overhang the floor at the
-//! poleward edge by around 3% on a 460 km box at 40°N — a thin transparent
-//! strip along one side, which is precisely the symptom this module exists to
-//! remove. So all four edges are unprojected through the pane's own projector
-//! and measured with [`rustdar_radar::beam::site_bearing_range_km`], the
-//! codebase's real geodesy, and **each axis takes the nearer of its own two
-//! edges**. Containment then holds on every side, at every latitude.
+//! The old arm clamped the gesture against
+//! [`rustdar_radar::voxel::MIN_HALF_WIDTH_KM`] and
+//! [`rustdar_radar::voxel::MAX_HALF_DIAGONAL_KM`], because the gesture was
+//! resizing the thing those constants bound. It no longer is, so the only
+//! bound left is the one the camera has always carried:
+//! [`crate::pane::MIN_EYE_DISTANCE`]`..=`[`crate::pane::MAX_EYE_DISTANCE`],
+//! 0.05 to 8.0, applied by
+//! [`OrbitCamera::nudge`](crate::pane::OrbitCamera::nudge). That is a range of
+//! 160×, or **7.32 zoom levels**, from inside the box to well outside it — and
+//! it is the honest bound, because what the gesture now runs out of is somewhere
+//! to put the eye rather than ground to resample.
 //!
-//! It is also why the box's aspect is not the pane's *pixel* aspect. The two
-//! differ by whatever Mercator does across the pane's own latitude span, which
-//! is why the ground is measured rather than the rect divided.
-
-use crate::pane::{GeoPoint, VolumeRegion};
-
-/// The step each derived half-extent is quantised to, kilometres.
-///
-/// **Not cosmetic — it is what stops the pane rebuilding for ever.** The region
-/// is part of `VolumeTarget`, so any change to it asks for a fresh 8 MiB
-/// resample. Measured continuously off a viewport, the half-extent would differ
-/// by a few metres between frames from nothing more than `f32` rect arithmetic
-/// and walkers' zoom animation, and every one of those differences would be a
-/// new key, a new build, and a permanently hot CPU whose only symptom is a fan.
-///
-/// A whole kilometre is far below anything a reader can see in a 460 km box
-/// (it is well under one cell at every zoom) and far above the jitter.
-///
-/// Rounded **down**, always. The box must stay inside the ground the floor
-/// covers, and rounding up would push it out by up to a kilometre — the exact
-/// failure this module exists to prevent, reintroduced by a rounding mode.
-///
-/// # The two axes are quantised independently, so the aspect is approximate
-///
-/// Each lane is floored to its own whole kilometre, which means the box's
-/// aspect ratio is the pane's ground aspect only to within a kilometre on each
-/// side — up to 1.6% on a 62 km half-extent, and under 0.2% on the 460 km
-/// boxes a wide-open pane measures. That is harmless for what the quantum is
-/// *for*: it is a cache key, and the key does not care which of two nearby
-/// boxes it names, only that a still pane keeps naming one of them. It is not
-/// harmless for a caption, which is why nothing printed claims the box is the
-/// pane's shape — the caption states two extents and lets the reader divide.
-const HALF_WIDTH_STEP_KM: f64 = 1.0;
-
-/// The box `rect`'s ground occupies, for a map centred by `map_memory` on
-/// `center`.
-///
-/// `None` when the viewport has no area, when the projector cannot place its
-/// centre on Earth, or when the ground it covers is too small for the resampler
-/// to honour — all of which mean "there is no measurable viewport here" rather
-/// than "use a smaller box". The caller falls back to
-/// [`crate::pane::DEFAULT_HALF_WIDTH_KM`], which crops nothing.
-///
-/// A [`walkers::Projector`] is built here rather than borrowed from inside
-/// `Map::show`, because the region is needed on frames where no map is drawn —
-/// a pane with its floor turned off still resamples a box. `Projector::new`
-/// takes exactly the three things the pane already has, and going through it
-/// rather than restating `256 · 2^zoom / 360` is what keeps this measuring the
-/// same projection the floor is drawn in: a tile size or zoom convention that
-/// moves in `walkers` moves both together.
-pub(crate) fn region_for_viewport(
-    rect: egui::Rect,
-    map_memory: &walkers::MapMemory,
-    center: walkers::Position,
-) -> Option<VolumeRegion> {
-    let (centre, measured) = measure_viewport(rect, map_memory, center)?;
-
-    // Down to the step on each axis, and **before** the region's own clamp, so
-    // the whole pipeline is a function of two whole kilometres: `clamped`'s
-    // corner scaling is continuous in its input, and quantising after it would
-    // hand a wide-open pane a fresh cache key on every frame of `f32` rect
-    // jitter — the rebuild-for-ever this step exists to stop, reintroduced by
-    // an ordering.
-    let quantised = rustdar_radar::voxel::HalfExtentKm {
-        east_km: quantise(measured.east_km),
-        north_km: quantise(measured.north_km),
-    };
-    // A NaN reaches `VolumeRegion::new`, where `is_finite` refuses it outright.
-    // Refusing it here as well would be the same answer by a longer route;
-    // laundering it past both would be a key that never equals itself.
-    let region = VolumeRegion::new(centre, quantised)?;
-
-    // Refused rather than clamped up if the resampler's floor grew the box past
-    // the ground that measured it: a clamped-up box is larger than the viewport
-    // it came from, and the pane's own caption would describe a box the floor
-    // does not cover.
-    //
-    // Stated as "did the stored box come back bigger than what was measured"
-    // rather than as a second `< MIN_HALF_WIDTH_KM` test, because that *is* the
-    // property — and because `HalfExtentKm::clamped` has two ways to grow an
-    // axis, only one of which a pre-construction test would catch. The other is
-    // its own documented corner: an extent past 47:1 is scaled to the diagonal
-    // bound and lands back under the floor, which a viewport cannot reach today
-    // and which this covers anyway for free.
-    if region.half_east_km() > quantised.east_km || region.half_north_km() > quantised.north_km {
-        return None;
-    }
-    Some(region)
-}
-
-/// One extent, rounded **down** to a whole [`HALF_WIDTH_STEP_KM`].
-fn quantise(km: f64) -> f64 {
-    (km / HALF_WIDTH_STEP_KM).floor() * HALF_WIDTH_STEP_KM
-}
-
-/// The centre of `rect`'s ground and the **unquantised** half-extent it
-/// occupies, kilometres on each horizontal axis.
-///
-/// The measurement half of [`region_for_viewport`], split out because
-/// [`zoom_viewport`] needs the raw numbers: the quantisation exists to keep a
-/// *cache key* still, and a zoom bound computed off a number that has already
-/// been rounded down by up to a kilometre would stop the gesture up to a
-/// kilometre early — visibly, at the tight end where the box is only ten across.
-///
-/// **This function is where the box stopped being a square**, and it is the
-/// whole of that change: everything on both sides of it — the type this
-/// returns, [`VolumeRegion`], [`rustdar_radar::voxel::VoxelRequest`], the job
-/// wire, the grid and the shader — was already carrying two extents and
-/// receiving two equal ones.
-///
-/// `None` for every reason `region_for_viewport` answers `None` except the
-/// resampler's floor, which is the caller's decision rather than the
-/// measurement's.
-fn measure_viewport(
-    rect: egui::Rect,
-    map_memory: &walkers::MapMemory,
-    center: walkers::Position,
-) -> Option<(GeoPoint, rustdar_radar::voxel::HalfExtentKm)> {
-    if !(rect.width() > 0.0 && rect.height() > 0.0) {
-        return None;
-    }
-    let projector = walkers::Projector::new(rect, map_memory, center);
-    let to_geo = |pos: egui::Pos2| {
-        let position = projector.unproject(pos.to_vec2());
-        GeoPoint {
-            lat: position.y(),
-            lon: position.x(),
-        }
-    };
-
-    let centre = to_geo(rect.center());
-    if !centre.is_on_earth() {
-        return None;
-    }
-
-    // The ground from the centre to one edge midpoint, or `None` for a point
-    // the projector cannot place.
-    let ground_km = |pos: egui::Pos2| {
-        let point = to_geo(pos);
-        if !point.is_on_earth() {
-            return None;
-        }
-        let (_, range_km) = rustdar_radar::beam::site_bearing_range_km(
-            centre.lat, centre.lon, point.lat, point.lon,
-        );
-        range_km.is_finite().then_some(range_km)
-    };
-
-    // **Each axis takes the nearer of its own two edges, and only its own.**
-    // The four distances are still all measured and still all bound something —
-    // Mercator makes the poleward edge the near one, so the north–south lane is
-    // governed by the top edge in the northern hemisphere and the bottom in the
-    // southern, and containment holds on all four sides at every latitude. What
-    // is gone is the *cross*-axis minimum, which is what made a 16:9 pane's box
-    // the square inscribed in its short axis and threw the left and right
-    // flanks of the ground away.
-    Some((
-        centre,
-        rustdar_radar::voxel::HalfExtentKm {
-            east_km: ground_km(egui::pos2(rect.left(), rect.center().y))?
-                .min(ground_km(egui::pos2(rect.right(), rect.center().y))?),
-            north_km: ground_km(egui::pos2(rect.center().x, rect.top()))?
-                .min(ground_km(egui::pos2(rect.center().x, rect.bottom()))?),
-        },
-    ))
-}
+//! It also removes the re-measure probe the old arm needed. That probe existed
+//! because the box's floor was reached by a logarithm that is exact in a flat
+//! projection and out by a fraction of a percent in Mercator, and at the tight
+//! end that fraction decided whether a box was legal at all. A clamp on a
+//! camera ratio has no projection in it and nothing to verify.
 
 /// `walkers::Map::zoom_speed`'s default, which the plan view leaves alone.
 ///
@@ -247,7 +79,7 @@ const ZOOM_SPEED: f64 = 2.0;
 /// map is drawn off screen, so `Map::handle_gestures` skips its zoom outright
 /// (`ui.ui_contains_pointer()` is false down there) and no amount of
 /// configuration will make walkers do this for us. So the arithmetic is
-/// restated, once, beside the measurement it feeds — and pinned by
+/// restated, once, beside the gesture it feeds — and pinned by
 /// `a_scroll_moves_a_3d_pane_the_same_distance_it_moves_a_plan_view`, which
 /// drives the two arms through the real UI and compares the answers rather than
 /// comparing this function against a copy of itself.
@@ -271,107 +103,66 @@ fn zoom_step(input: &egui::InputState) -> f64 {
     (delta - 1.0) * ZOOM_SPEED
 }
 
-/// Apply this frame's scroll or pinch to a 3D pane's own viewport, and say
-/// whether it moved.
+/// This frame's scroll or pinch as a multiplicative dolly for
+/// [`OrbitDelta::zoom_factor`](crate::pane::OrbitDelta::zoom_factor), or `1.0`
+/// — "the eye did not move" — for a frame with no gesture for this pane.
 ///
-/// The 3D half of "scroll zooms the geography". The plan view gets this from
-/// `walkers::Map` for free; a 3D pane cannot, because its map is drawn into an
-/// off-screen strip where `ui_contains_pointer` is false — so the gesture is
-/// read here, against the pane's *on-screen* rect, and written into the very
-/// `MapMemory` the floor and the box are both about to be measured from.
+/// # Why the factor is two to the power of the step
 ///
-/// # Why it must be called before the floor is drawn
+/// [`zoom_step`] answers in Web Mercator **zoom levels**, and one level is a
+/// factor of two of ground per point by the projection's own definition. The
+/// ground a perspective camera sees at its pivot plane is `2 · d · tan(fov/2)`
+/// — linear in the standoff `d` at a fixed field of view — so one level is one
+/// halving of `eye_distance`, exactly. That is what makes a wheel notch on a 3D
+/// pane cover the same ground it covers on the plan view beside it, and it is
+/// derived from the two definitions rather than tuned to feel similar.
 ///
-/// The floor strip and [`region_for_viewport`] both read this `map_memory`, and
-/// the whole point of the region being the viewport is that the two are one
-/// measurement. Applying the zoom after either of them would put the box one
-/// frame behind the floor — which does not look like a bug, it looks like input
-/// lag, and it gets "fixed" by turning the sensitivity up.
+/// The neutral value is 1.0 rather than 0.0 because this is a *ratio*: it is
+/// what `nudge` divides the standoff by, and `2^0 = 1` is the identity a frame
+/// with no gesture must produce.
 ///
 /// # Why the gate is correctness and not politeness
 ///
 /// `Input::zoom_delta` and `smooth_scroll_delta` are **global**: they report the
 /// frame's gesture wherever on screen it happened. Without `hovered() ||
-/// dragged()` a pinch over a map pane would zoom every 3D pane on screen at
+/// dragged()` a pinch over a map pane would dolly every 3D pane on screen at
 /// once. The topmost-layer check is the same rule `filter_dialog_blocked`
 /// applies to clicks — a wheel over the timeline must work the timeline, not
 /// the map under it — and its own ground is the `dragged()` arm, which keeps
 /// the response resolving after the pointer has wandered onto the chrome.
 ///
-/// # Why the eye does not move
+/// # Why a non-finite step is refused rather than clamped
 ///
-/// It has nothing to move for. `OrbitCamera::eye_distance` is in multiples of
-/// the box's framing radius, so a box that shrinks carries the eye in with it,
-/// continuously, at exactly the angle and standoff ratio the user left it at.
-/// There is no reframe here and there must never be one: nothing may move the
-/// camera but the user.
-pub(crate) fn zoom_viewport(
-    ui: &egui::Ui,
-    response: &egui::Response,
-    rect: egui::Rect,
-    map_memory: &mut walkers::MapMemory,
-    center: walkers::Position,
-) -> bool {
-    if !(response.hovered() || response.dragged()) || !pointer_on_map_layer(ui.ctx()) {
-        return false;
+/// [`OrbitCamera::nudge`](crate::pane::OrbitCamera::nudge) refuses a whole
+/// delta whose factor is not finite and positive, which is the right answer but
+/// discards the frame's orbit and pan with it. Answering 1.0 here keeps those
+/// two verbs working on a frame whose scroll arrived as a NaN — and a `2^step`
+/// that overflowed to infinity is the one arithmetic step between `zoom_step`'s
+/// own finiteness and the camera's.
+pub(crate) fn zoom_camera(ctx: &egui::Context, response: &egui::Response) -> f32 {
+    if !(response.hovered() || response.dragged()) || !pointer_on_map_layer(ctx) {
+        return 1.0;
     }
-    let step = ui.input(zoom_step);
+    dolly_for_step(ctx.input(zoom_step))
+}
+
+/// [`zoom_camera`]'s arithmetic, without the gate: zoom levels in, a standoff
+/// divisor out.
+///
+/// Split from the gate because the two fail in different ways and only one of
+/// them can be tested without a live `egui::Context` — this half is the one
+/// that has to answer 1.0 for every input a gesture can produce that the camera
+/// would refuse, and it is exhaustively checkable as a function.
+fn dolly_for_step(step: f64) -> f32 {
     if !step.is_finite() || step == 0.0 {
-        return false;
+        return 1.0;
     }
-    let from = map_memory.zoom();
-    let Some((_, half)) = measure_viewport(rect, map_memory, center) else {
-        return false;
-    };
-
-    // The bound the user asked for, and the only one: the viewport may not be
-    // driven past the ground the radar itself covers, in either direction.
-    //
-    // Ground per point halves with every zoom level, so the two zooms that put
-    // the box exactly on the resampler's ceiling and floor are one logarithm
-    // away — no search, and nothing that has to be walked back. Each limit is
-    // widened to the current zoom (`min`/`max` against `from`) so a pane that
-    // arrives already outside the window — restored from a config, or converted
-    // from a plan view someone had zoomed to the street — can always move
-    // *towards* it and never further out. Clamping it on arrival instead would
-    // be the camera moving on its own, which is the one thing this must not do.
-    //
-    // **The two bounds read different quantities off the box, and each reads
-    // the one its own limit is about.** Inward is the *narrow* axis, because
-    // that is the one that reaches `MIN_HALF_WIDTH_KM` first and a box with one
-    // axis clamped up off the floor would overhang its own floor on that axis.
-    // Outward is the **corner** against `MAX_HALF_DIAGONAL_KM`, because the
-    // ceiling has always been a bound on the corner — `MAX_HALF_WIDTH_KM` is
-    // that same bound written for the one case where the two sides are equal,
-    // and a rectangle has no single width for it to be about.
-    let inward =
-        from + (half.east_km.min(half.north_km) / rustdar_radar::voxel::MIN_HALF_WIDTH_KM).log2();
-    let outward = from + (half.corner_km() / rustdar_radar::voxel::MAX_HALF_DIAGONAL_KM).log2();
-    let target = (from + step).clamp(outward.min(from), inward.max(from));
-    if target == from {
-        return false;
+    let factor = step.exp2() as f32;
+    if factor.is_finite() && factor > 0.0 {
+        factor
+    } else {
+        1.0
     }
-
-    // Measured rather than trusted. The logarithm above is exact for a flat
-    // projection and out by a fraction of a percent in Mercator, where the
-    // latitudes of the four edges move as the zoom does — and at the tight end
-    // that fraction is the difference between a legal box and
-    // `region_for_viewport` refusing one, which would drop the pane's box from
-    // 10 km straight to the 230 km fallback. So an inward step that lands under
-    // the floor is refused whole rather than applied and repaired.
-    let mut probe = map_memory.clone();
-    if probe.set_zoom(target).is_err() {
-        return false;
-    }
-    let Some((_, after)) = measure_viewport(rect, &probe, center) else {
-        return false;
-    };
-    if target > from && after.east_km.min(after.north_km) < rustdar_radar::voxel::MIN_HALF_WIDTH_KM
-    {
-        return false;
-    }
-    *map_memory = probe;
-    true
 }
 
 /// Whether the pointer is over the map rather than over floating chrome.

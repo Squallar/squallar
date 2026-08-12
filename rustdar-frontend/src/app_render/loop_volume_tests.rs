@@ -221,14 +221,14 @@ fn a_region_change_releases_the_old_set_before_building_the_new_one() {
 
     // The pane's box changes. In production that is the user zooming the pane:
     // the render arm re-measures the viewport and publishes what it measured on
-    // `VolumePane::viewport_box`, which is what the loop planner reads. Written
+    // `VolumePane::region`, which is what the loop planner reads. Written
     // directly here because this test has no egui pass to measure one in.
     app.gui
         .pane_mut(0)
         .expect("pane 0")
         .volume_mut()
         .expect("a 3D pane")
-        .viewport_box = Some(region());
+        .region = Some(region());
 
     // One pass: the retarget is noticed, the set is released, and at most
     // `MAX_LOOP_VOLUME_BUILDS_PER_FRAME` of the new key's builds start.

@@ -2611,12 +2611,14 @@ impl super::App {
             // `VolumeLoopKey`.
             let volume_key = pane.volume().map(|v| {
                 rustdar_egui::pane::VolumeLoopKey::new(
-                    // The pane's own viewport as its render arm last measured
-                    // it — see `VolumePane::viewport_box`. Reading it here is
-                    // what keeps a loop's frames resampled over the same ground
-                    // the live pane is showing; zooming the pane therefore
-                    // rekeys the loop, exactly as a re-dragged box used to.
-                    v.viewport_box,
+                    // The pane's stored region — see `VolumePane::region`.
+                    // Reading it here is what keeps a loop's frames resampled
+                    // over the same ground the live pane is showing, and reading
+                    // the *stored* field rather than a per-frame measurement is
+                    // what stops a gesture rekeying the loop: a zoom now moves
+                    // the eye, so thirteen grids are no longer thrown away for
+                    // one scroll.
+                    v.region,
                     (product == rustdar_radar::types::RadarProduct::StormRelativeVelocity)
                         .then_some(motion_override)
                         .flatten(),

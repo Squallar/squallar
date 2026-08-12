@@ -1046,19 +1046,26 @@ impl StoreInner {
 ///
 /// # Why the region is not part of it
 ///
-/// It was, and that is what made zooming take the view away. The region is the
-/// pane's own viewport, so every frame of a scroll names a new target, and a
-/// target scoped away from the grid in hand blanked the pane to "Building…" —
-/// on a gesture the user expects to be continuous, and over a floor that was
-/// already following the viewport in real time, so the effect read as the data
-/// falling off a moving ground.
+/// It was, back when the region was derived from the pane's viewport, and that
+/// is what made zooming take the view away: every frame of a scroll named a new
+/// target, and a target scoped away from the grid in hand blanked the pane to
+/// "Building…" — on a gesture the user expects to be continuous.
 ///
-/// And the gap was never *one build*. Because every gesture frame names a new
-/// box, no build in flight ever answers what the pane is currently asking for,
-/// so the blank lasted the whole gesture **plus** a build — measured at 12
-/// frames over a 200 ms scroll on this machine, and it grows with how long the
-/// user keeps scrolling rather than with what a resample costs. That is why
-/// making the build faster was never the fix.
+/// The gap was never *one build*. Because every gesture frame named a new box,
+/// no build in flight ever answered what the pane was currently asking for, so
+/// the blank lasted the whole gesture **plus** a build — measured at 12 frames
+/// over a 200 ms scroll on this machine, and it grew with how long the user kept
+/// scrolling rather than with what a resample cost. That is why making the build
+/// faster was never the fix.
+///
+/// A stored region cannot do that any more: a gesture does not write it, so a
+/// scroll names one target from beginning to end. What is left for this to
+/// license is the case it was always really about — the **stamp** advancing on
+/// every sealed sweep, thirteen times a volume, over a region that has not
+/// moved. Excluding the region is still right for that, and it is now right for
+/// a reason that does not depend on a gesture: two targets differing only in
+/// their region differ by a *crop*, and a crop is an affine on a grid rather
+/// than a different question.
 ///
 /// The reason it was excluded is real and is answered rather than dropped: a
 /// grid over one patch of ground painted under a caption naming another would
@@ -1707,17 +1714,38 @@ impl DrawnBox {
     /// however much the two disagreed, and the error would then vanish the
     /// moment the real grid landed — a discontinuity of exactly the kind the
     /// stand-in exists to remove.
-    /// `None` when the box cannot be placed without the volume in hand — a
-    /// target with **no picked region**, whose width is the volume's own reach
-    /// (`rustdar_radar::voxel::box_half_width_km` over `volume_reach_km`) and
-    /// therefore a fact about a scan the renderer never sees. There is nothing
-    /// to guess at there: a box drawn at the wrong width would be a picture
-    /// registered to ground it is not over. The caller falls back to the
-    /// first-build message for the one case it happens in — a pane reset to
-    /// the whole volume while a tighter grid is still held — which is a
-    /// deliberate blank rather than a wrong picture.
+    /// # A target with no picked region is drawn in the grid's own box
+    ///
+    /// Such a target's width is the volume's own reach
+    /// (`rustdar_radar::voxel::box_half_width_km` over `volume_reach_km`) — a
+    /// fact about a scan the renderer never sees, so there is no rectangle here
+    /// to crop into. The held grid's own box is the honest answer rather than a
+    /// guess, because `same_scope` has already pinned the stand-in to the same
+    /// **site** and the same **product**, and the reach is a function of exactly
+    /// those two: across 150 archive volumes from 53 sites every WSR-88D
+    /// reports the same 460.1 km reflectivity reach, and each moment follows its
+    /// own cut. So the box the pending build is about to produce is the box the
+    /// held grid was already built in, and drawing it there is not a
+    /// registration error — it is the same ground.
+    ///
+    /// Refusing instead was what this did, and it was affordable only while a
+    /// picked region was the common case. With `None` the ordinary state of a
+    /// pane, refusing here would blank the pane to "Building…" on **every sealed
+    /// sweep** — the live 3D view flashing empty every time new data landed,
+    /// which is the seamless swap's whole reason for existing, inverted.
+    ///
+    /// The one case the two can disagree is a volume still filling: the reach is
+    /// a maximum over the sweeps present, so a half-arrived volume could report
+    /// a shorter one. In practice it cannot move after the first sealed sweep,
+    /// because every moment's longest cut is at the bottom of the ladder — a
+    /// WSR-88D's split cuts put the 460 km surveillance sweep and the 300 km
+    /// Doppler sweep at 0.5°, first and second in the volume. If it ever did
+    /// move, this is a stand-in behaving as a stand-in: one pop when the real
+    /// grid lands, where the alternative is a blank pane every volume.
     fn for_target(target: &VolumeTarget, grid: &VoxelGrid) -> Option<Self> {
-        let region = target.region?;
+        let Some(region) = target.region else {
+            return Some(Self::settled(grid));
+        };
         let (site_lat, site_lon) = grid.site();
         // `clamped` is the resampler's own, not a copy of its bounds:
         // `horizontal_ranges_km` gives the arithmetic that needs the two to

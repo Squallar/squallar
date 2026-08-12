@@ -754,54 +754,58 @@ pub struct VolumeTarget {
 
 /// The patch of ground a 3D pane resamples, stored **geographically**.
 ///
-/// # It is the pane's own viewport, not a separate thing to aim
+/// # It is stored, and a gesture may not move it
 ///
-/// This is **derived**, every frame, as the ground the pane's own viewport is
-/// showing — see [`crate::ui_region::region_for_viewport`]. It used to
-/// be dragged out on some *other* map pane and stored, and that arrangement is
-/// what produced the defect this replaced: the box and the floor under it were
-/// sized by two independent things, so a borrowed viewport smaller than the box
-/// left the floor transparent outside it, and a 3D view opened from a tab — with
-/// no source map at all — had no floor whatsoever. Deriving the box *from* the
-/// viewport makes the floor cover it by construction, which is a property rather
-/// than a thing to keep in step.
+/// A `Some` region is a **choice** — the ground the user picked out — and it
+/// stands until they pick another one. The alternative is `None`, which is not
+/// a smaller or a default box but a different *rule*: the volume's own data
+/// reach, circumscribed, resolved by the resampler because only the resampler
+/// holds a volume. Either way the box is a fact about the data or about a
+/// decision, never about the frame it is being drawn on.
 ///
-/// Zooming the pane is therefore the only region control there is, and it is the
-/// only one there ever needed to be: the drag existed to spend the grid's fixed
-/// cells over less ground, and zooming does exactly that.
+/// This was **derived**, every frame, from the ground the pane's own viewport
+/// was showing, and that is the defect the stored form exists to remove. It
+/// made zoom, pan, divider drags and window resizes all rewrite the box, so a
+/// user zooming in lost the weather around what they were zooming into:
 ///
-/// Still stored geographically rather than as a pixel rect, for the reason
+/// > the goddamn 3d viewer still covers less and less 3d geometry
+///
+/// > The 3d viewer's region should CAP at either the size of the data in the
+/// > radar scan, or the region selected if the user did that.
+///
+/// The derivation's own justification was real and is answered rather than
+/// dropped. It existed because the box and the floor under it used to be sized
+/// by two independent things, so a floor smaller than the box left the volume
+/// standing on transparency. That is now held the other way round — the floor
+/// strip is framed on *this*, so it covers the box by construction — which is
+/// the same property with the causality the user asked for.
+///
+/// Stored geographically rather than as a pixel rect, for the reason
 /// [`SectionLine`] gives — the affine that produced it is gone by the time the
 /// resampler runs, and a grid built for one box must be recognisably the wrong
 /// key for another.
 ///
-/// # Why the footprint is the viewport's rectangle
+/// # Why the footprint is a rectangle rather than a square
 ///
-/// It was the largest **square** inscribed in the viewport, which meant
-/// converting a 16:9 pane to 3D took ground away from it:
+/// Because a region the user drew is whatever shape they drew, and nothing
+/// downstream ever needed a square: `build_voxels` takes a
+/// [`HalfExtentKm`] with an axis each, the grid's wire format writes its `x`
+/// and `y` ranges separately, and the renderer divides per axis throughout.
 ///
-/// > I didn't realize the 3d viewer actually cut the viewport smaller, I hate
-/// > that. A user doesn't expect to become more boxed in when they zoom, they
-/// > just expect to be closer with the same area available to them.
-///
-/// The floor strip always covered the whole pane rect; the box merely stood on
-/// the middle of it, so the pane went on *showing* its left and right flanks
-/// while nothing resampled them. Two extents make the box the ground the pane
-/// is showing, which is what the pane already looked like it was promising.
-///
-/// The one real cost is that the cells are rectangular — a fixed count per axis
-/// over unequal ground, so a 16:9 box's east–west cell is 1.78× its
-/// north–south one. That is a measured figure and its consequences are measured
-/// too; see [`Self::resolution_km`] and
-/// [`rustdar_radar::voxel::VoxelShape`]'s anisotropy note.
+/// The cost is that the cells are rectangular — a fixed count per axis over
+/// unequal ground, so a 16:9 region's east–west cell is 1.78× its north–south
+/// one. That is a measured figure and its consequences are measured too; see
+/// [`Self::resolution_km`] and [`rustdar_radar::voxel::VoxelShape`]'s
+/// anisotropy note. A `None` region is square by construction, because a ring
+/// is.
 ///
 /// [`HalfExtentKm`]: rustdar_radar::voxel::HalfExtentKm
 ///
 /// # The extent is a resolution control, not just a crop
 ///
-/// The grid has a fixed cell count, so a tighter box buys detail rather than
+/// The grid has a fixed cell count, so a tighter region buys detail rather than
 /// saving memory: at 256 cells across, an 80 km half-extent is 0.625 km per
-/// cell and a 20 km half-extent is 0.156 km. That is what zooming a 3D pane is
+/// cell and a 20 km half-extent is 0.156. That is what picking a region is
 /// *for*, so [`Self::resolution_km`] exists to be *shown* rather than inferred.
 ///
 /// Fields are private because [`Self::new`] is the only writer, and it is what
@@ -821,19 +825,17 @@ pub struct VolumeRegion {
 /// The half-width a pane falls back to when nothing has sized its box yet,
 /// kilometres.
 ///
-/// **Not the box a drawn pane ends up with.** That box is the pane's own
-/// viewport ([`crate::ui_region::region_for_viewport`]), bounded above by what
-/// the volume actually reaches: [`rustdar_radar::voxel::MAX_HALF_WIDTH_KM`] is
-/// now `types::MAX_EXTENT_KM / √2` — the largest square inscribed in the
-/// furthest circle a plan view will project — and `build_voxels` answers an
-/// unstated width with [`rustdar_radar::voxel::box_half_width_km`] of the
-/// volume's own reach, 325.4 km of half-width for a WSR-88D's 460 km
-/// reflectivity and 212.1 for its 300 km Doppler moments. Only the resampler,
-/// which has the volume, can say which; this crate never sees one.
+/// **Not the box a drawn pane ends up with.** That box is either a region the
+/// user picked or — for the `None` that a pane opens in — the volume's own
+/// reach, which `build_voxels` answers through
+/// [`rustdar_radar::voxel::box_half_width_km`]: **460.1 km** of half-width for a
+/// WSR-88D's reflectivity and 300 for its Doppler moments, the reach itself
+/// rather than a square inscribed in it, because the box circumscribes the ring.
+/// Only the resampler, which has the volume, can say which; this crate never
+/// sees one.
 ///
-/// This is what stands in until one of those two has spoken: a pane not yet
-/// drawn in the 3D mode, or one whose viewport is degenerate — collapsed to
-/// nothing by a divider drag, or projecting off Earth.
+/// This is what stands in until one of those two has spoken, which is the
+/// window between a pane entering the 3D mode and its first grid landing.
 ///
 /// [`rustdar_radar::voxel::BASE_HALF_WIDTH_KM`] read back rather than a copy
 /// of 230, and it is the resampler's own fallback for exactly the same
@@ -843,14 +845,14 @@ pub struct VolumeRegion {
 /// picture.
 ///
 /// It still clears `types::BASE_EXTENT_KM`, so a pane in this state crops
-/// nothing a plan view at the raster's floor would have drawn — but the floor
-/// is not guaranteed to cover it, because nothing measured the viewport it
-/// would have to cover. That is the correct trade for a state that only exists
-/// while a pane has no area to draw in: the alternative is refusing to build at
-/// all, which reads as a broken pane rather than as a pane that has not been
-/// given any room. There is no picture to be wrong about while it is in force —
-/// such a pane is painting its empty state — so this is the width the *camera*
-/// is posed against for the frames before the first build lands, and nothing
+/// nothing a plan view at the raster's floor would have drawn. It is only ever
+/// **narrower** than the box that replaces it — 230 km of half-width against
+/// the 460.1 the reach earns — so what it can be wrong about is a camera posed
+/// a little too close for one or two frames, never a picture registered to
+/// ground the pane is not over. There is no picture to be wrong about while it
+/// is in force at all: such a pane is painting its empty state. So this is the
+/// width the *camera* is posed against for the frames before the first build
+/// lands, and nothing
 /// else.
 pub const BASE_HALF_WIDTH_KM: f64 = rustdar_radar::voxel::BASE_HALF_WIDTH_KM;
 
@@ -962,30 +964,41 @@ pub fn resolution_km(half_width_km: f64, cells: usize) -> Option<f64> {
 pub struct VolumePane {
     /// Where the eye is. See [`OrbitCamera`].
     pub camera: OrbitCamera,
-    /// The box this pane resolved on its last drawn frame — a **readback**, not
-    /// a setting.
+    /// The ground this pane resamples — a **stored choice**, not a readback.
     ///
-    /// The region is the pane's viewport ([`crate::ui_region::region_for_viewport`]),
-    /// and only the render arm can measure it: the rect, the `MapMemory` and the
-    /// centre all exist inside the egui pass and nowhere else. But the loop
-    /// planner runs *outside* that pass and has to name the same ground — every
-    /// frame of a 3D loop is resampled over it — so the arm writes what it
-    /// measured here for the planner to read.
+    /// `None` is the ordinary case and the one a pane opens in: it means "the
+    /// volume's own data reach, circumscribed", which is a fact about the scan
+    /// rather than about the pane, and only the resampler can resolve it
+    /// ([`rustdar_radar::voxel::box_half_width_km`] over
+    /// [`rustdar_radar::voxel::volume_reach_km`]). `Some` is a region the user
+    /// picked, which is smaller and follows the ground rather than the site.
     ///
-    /// **Nothing may write this to aim the pane.** It is the answer to "what did
-    /// the viewport come to", and the way to change it is to move the viewport.
-    /// A writer that set it directly would be overruled on the very next frame,
-    /// which is the quietest kind of broken control there is. That is also why
-    /// it is not persisted: a measurement of a viewport that no longer exists is
-    /// worse than no measurement, and the viewport itself *is* persisted, so the
-    /// first frame after a restore re-measures it.
+    /// **It changes when the site, the product, the reach or the selection
+    /// changes, and at no other time.** Not on a zoom, not on a pan, not on a
+    /// divider drag, not on a window resize. That list is the whole of the
+    /// user's ask, and every entry not on it was a way the box used to move on
+    /// its own:
     ///
-    /// `None` before the pane has been drawn in the 3D mode even once, and for a
-    /// viewport too degenerate to measure. Both mean the same thing downstream:
-    /// nothing here states a width, so `build_voxels` resolves one from the
-    /// volume's own reach ([`rustdar_radar::voxel::box_half_width_km`]) and
-    /// [`BASE_HALF_WIDTH_KM`] stands in for the camera until that grid lands.
-    pub viewport_box: Option<VolumeRegion>,
+    /// > That region (the selector OR the radar's ring) must never change.
+    /// > Zooming should keep the rest of the region around and merely zoom into
+    /// > what's already there.
+    ///
+    /// It was derived from the pane's viewport, every frame, which is what put
+    /// zoom, pan, divider drags and window resizes all on that list at once.
+    /// The render arm has no business writing it now and does not: it reads it
+    /// to pose the camera and to key the build, and the loop planner — which
+    /// runs outside the egui pass and has to name the same ground for every
+    /// frame of a 3D loop — reads the same field for the same reason.
+    ///
+    /// Persisted, because it is a choice rather than a measurement. A
+    /// carefully aimed region that came back as the whole ring on the next
+    /// launch would be the pane silently un-aiming itself, which is the same
+    /// defect as a zoom doing it, one restart slower.
+    ///
+    /// [`BASE_HALF_WIDTH_KM`] stands in for the camera's own arithmetic on the
+    /// frames before a `None` pane's first grid lands and there is nothing yet
+    /// to read a width off.
+    pub region: Option<VolumeRegion>,
     /// Which volume the grid on screen was built from, or `None` before the
     /// first build.
     pub rendered_for: Option<VolumeTarget>,
@@ -1063,19 +1076,20 @@ pub enum VolumeViewMode {
 ///
 /// # The one case this cannot answer alone
 ///
-/// `None` — a pane not yet drawn in the 3D mode, or a viewport too degenerate
-/// to measure. `build_voxels` answers an unstated width with
-/// [`rustdar_radar::voxel::box_half_width_km`] of the volume's own reach, which
-/// is a fact about the *data* — 325.4 km of half-width for a 460 km
-/// reflectivity volume, 212.1 for the 300 km Doppler moments — and no type in
-/// this crate holds a volume. So [`BASE_HALF_WIDTH_KM`] stands in here, and a
-/// caller that has a grid prefers `VolumePainter::box_size_km` over this. There
-/// is no picture to be wrong about in the meantime: such a pane is painting its
-/// empty state.
+/// `None` — the region a pane opens with, and the ordinary one. It means the
+/// volume's own reach, which `build_voxels` resolves through
+/// [`rustdar_radar::voxel::box_half_width_km`] and which is a fact about the
+/// *data* — 460.1 km of half-width for a WSR-88D's reflectivity, 300 for its
+/// Doppler moments — while no type in this crate holds a volume. So
+/// [`BASE_HALF_WIDTH_KM`] stands in here, and a caller that has a grid prefers
+/// `VolumePainter::box_size_km` over this, which is what the render arm does on
+/// every frame after the first build. There is no picture to be wrong about in
+/// the meantime: such a pane is painting its empty state.
 ///
-/// A free function over the region rather than a method on [`VolumePane`],
-/// because the region is no longer *on* the pane — it is the pane's viewport,
-/// measured on the frame it is needed.
+/// A free function over an `Option<VolumeRegion>` rather than a method on
+/// either type, because the answer for `None` is not a property of any region —
+/// it is the stand-in above — and a method on [`VolumePane`] would put the
+/// same two-branch arithmetic behind a borrow the pan already has to release.
 pub fn box_size_km(region: Option<VolumeRegion>) -> [f32; 3] {
     let half = region.map_or(
         rustdar_radar::voxel::HalfExtentKm::square(BASE_HALF_WIDTH_KM),
@@ -1111,17 +1125,22 @@ pub struct OrbitDelta {
     /// Multiplicative dolly: a factor above 1 brings the eye *in*, dividing
     /// [`OrbitCamera::eye_distance`] by it.
     ///
-    /// **No gesture produces one.** Scroll and pinch aim the geography, in both
-    /// render modes — `ui_region::zoom_viewport` — so the UI leaves this at 1.0
-    /// on every frame, and the eye follows the box for free because
-    /// `eye_distance` is a ratio of its framing radius. The camera's standoff is
-    /// set absolutely instead, through [`OrbitCamera::set_eye_distance`] and the
-    /// pane's own control.
+    /// **This is where a 3D pane's scroll and pinch land**, through
+    /// `ui_region::zoom_camera`, which answers `2^levels` so that one Web
+    /// Mercator zoom level is one halving of the standoff. For a while nothing
+    /// produced one at all: the gesture aimed the *geography* instead and the
+    /// eye followed the box for free, which is exactly the arrangement that made
+    /// zooming shrink the ground the pane resampled. The box no longer moves, so
+    /// the eye has to.
     ///
-    /// It stays a ratio here because that is what a *delta* means, and because
-    /// the refusal and the clamp it carries into [`OrbitCamera::nudge`] are the
-    /// camera's invariants rather than the gesture's: a caller of this public
-    /// API may still move the eye by a ratio, and when it does, a non-finite or
+    /// The standoff can also be set absolutely, through
+    /// [`OrbitCamera::set_eye_distance`] and the pane's own control; the two
+    /// share [`MIN_EYE_DISTANCE`]`..=`[`MAX_EYE_DISTANCE`] and neither may
+    /// exceed it.
+    ///
+    /// It stays a ratio because that is what a *delta* means, and because the
+    /// refusal and the clamp it carries into [`OrbitCamera::nudge`] are the
+    /// camera's invariants rather than the gesture's: a non-finite or
     /// non-positive factor must refuse the whole delta rather than launder a NaN
     /// into a camera whose staleness key never equals itself.
     pub zoom_factor: f32,

@@ -488,13 +488,19 @@ fn a_config_naming_the_old_3d_pane_kind_comes_back_as_a_3d_render_mode() {
         "and so must the floor they turned off — through the inverted key, \
          unchanged on the wire",
     );
-    // The two keys that no longer exist are ignored rather than fatal. `region`
-    // and `source_pane` described a box dragged on another pane; the box is
-    // this pane's own viewport now, and there is nothing to restore.
+    // `source_pane` no longer exists at all, and the `region` block beside it is
+    // the **square-drag** form: `half_width_km`, one number, plus the pane the
+    // drag happened on. A region is stored again and under the same key, so this
+    // is the migration hazard `VolumeRegionConfig::restore` exists for — the old
+    // block's extent keys are absent, `#[serde(default)]` reads them as zero,
+    // and `VolumeRegion::new`'s clamp would turn that into a 10 km box centred
+    // on the old drag. A pane opening onto a twentieth of a county is a worse
+    // answer than one opening onto the whole ring, and it would look exactly
+    // like the user had asked for it.
     assert_eq!(
-        volume.viewport_box, None,
-        "a box from the file must not be resurrected: it is a measurement, and \
-         the first frame the pane draws takes it",
+        volume.region, None,
+        "the square-drag region block was resurrected as a two-axis pick - the \
+         extent keys it does not have were laundered through the extent clamp",
     );
 
     // The pane beside it is untouched, so the migration is about the one pane
@@ -1059,6 +1065,61 @@ fn a_saved_camera_out_of_range_is_clamped_rather_than_dropped() {
         "an under-range saved distance must clamp to the zoom's near stop \
              (0.05 framing radii — inside the box is a supported camera), not \
              be discarded",
+    );
+}
+
+/// A picked region survives a save and a load, both axes and both coordinates.
+///
+/// The region is a **choice**, and the pane's own doc says so in as many words:
+/// a carefully aimed box coming back as the whole ring on the next launch is
+/// the pane un-aiming itself, one restart slower than the zoom used to do it.
+/// For a while there was nothing to save — the box was measured off the viewport
+/// every frame — while the config's doc went on claiming it was persisted. This
+/// is what makes that claim true.
+///
+/// The four numbers are all different and none is the default, so a lane
+/// dropped, defaulted or transposed fails: `half_east_km` and `half_north_km`
+/// are adjacent and same-typed, which is the transposition
+/// `rustdar_radar::voxel::HalfExtentKm` exists to make visible.
+#[test]
+fn a_picked_region_survives_a_save_and_load() {
+    let picked = crate::pane::VolumeRegion::new(
+        crate::pane::GeoPoint {
+            lat: 35.33,
+            lon: -97.28,
+        },
+        rustdar_radar::voxel::HalfExtentKm {
+            east_km: 137.0,
+            north_km: 84.0,
+        },
+    )
+    .expect("a region on Earth with a finite extent");
+
+    let mut gui = crate::Gui::new();
+    gui.set_pane_count(1);
+    gui.pane_mut(0)
+        .expect("pane 0")
+        .set_view(rustdar_radar::types::RenderView::Volume);
+    gui.pane_mut(0)
+        .expect("pane 0")
+        .volume_mut()
+        .expect("a 3D pane")
+        .region = Some(picked);
+
+    let store = MemoryConfigStore::default();
+    gui.save_ui_config(&store);
+    let mut restored = crate::Gui::new();
+    restored.load_ui_config(&store);
+
+    assert_eq!(
+        restored
+            .pane(0)
+            .expect("pane 0")
+            .volume()
+            .expect("a 3D pane")
+            .region,
+        Some(picked),
+        "the region the user picked did not survive the round trip",
     );
 }
 

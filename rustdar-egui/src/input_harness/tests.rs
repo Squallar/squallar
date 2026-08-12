@@ -5363,9 +5363,10 @@ fn back_steps_into_the_archive_and_forward_is_dead_while_live() {
 ///     control scroll on open map first, so a pass cannot come from
 ///     zooming being broken altogether.
 ///
-///     Both halves now read a **viewport**, because a scroll aims the
-///     geography whichever way the pane is drawn. That the 3D camera does
-///     not move at all is the subject of its own test.
+///     The two halves read different things, because a scroll means
+///     different things: a plan view's aims the geography, and a 3D pane's
+///     dollies the eye. That a 3D pane's *box* does not move either way is
+///     the subject of its own test.
 #[test]
 fn a_wheel_over_the_floating_chrome_zooms_nothing_underneath() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -5377,15 +5378,18 @@ fn a_wheel_over_the_floating_chrome_zooms_nothing_underneath() {
     let timeline = h.timeline().rect;
     let status_bar = h.status_bar().rect;
     let panes = h.pane_rects();
+    // What a 3D pane's wheel moves: the eye's standoff, in framing radii.
     let ground = |h: &mut InputHarness| {
         h.gui_mut()
             .pane(1)
             .expect("pane 1 exists")
-            .map_memory
-            .zoom()
+            .volume()
+            .expect("pane 1 is in the 3D render mode")
+            .camera
+            .eye_distance()
     };
 
-    // Control: a scroll on the open volume pane zooms its geography.
+    // Control: a scroll on the open volume pane brings its eye in.
     let clear_volume = egui::pos2(panes[1].center().x, panes[1].center().y);
     assert!(
         !h.is_floating_layer_at(clear_volume),
@@ -5395,7 +5399,7 @@ fn a_wheel_over_the_floating_chrome_zooms_nothing_underneath() {
     h.scroll_at(clear_volume, egui::vec2(0.0, 200.0));
     h.frames_for(2, FRAME_DT);
     assert!(
-        ground(&mut h) > before,
+        ground(&mut h) < before,
         "control: a scroll on the open volume pane must zoom it"
     );
 
@@ -5414,7 +5418,7 @@ fn a_wheel_over_the_floating_chrome_zooms_nothing_underneath() {
     assert_eq!(
         ground(&mut h),
         before,
-        "a wheel over the timeline zoomed the 3D pane's ground under it"
+        "a wheel over the timeline dollied the 3D pane under it"
     );
 
     // Control: a scroll on the open map pane zooms the map.

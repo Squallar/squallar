@@ -672,32 +672,28 @@ impl super::Gui {
                         }
                         RenderView::Volume => {
                             self.record_pane_content(pane_idx, RenderView::Volume, pane_rect);
-                            // The pane's one interaction, taken **before** the
-                            // floor is drawn and the box is measured, because
-                            // this frame's scroll changes the viewport both are
-                            // measured off. See `ui_region::zoom_viewport`:
-                            // applying the zoom after either would leave the box
-                            // a frame behind the floor, which does not look like
-                            // a bug — it looks like input lag, and it gets
-                            // "fixed" by turning the sensitivity up.
+                            // The pane's one interaction, taken before the floor
+                            // strip below so a single hit test answers for this
+                            // rect before anything else draws into it. Orbit,
+                            // pan and zoom are one gesture surface, so they
+                            // share one id, one hit test and one answer to "is
+                            // the pointer on this pane" — which is the gate that
+                            // keeps a pinch over one pane out of every other 3D
+                            // pane on screen.
                             //
-                            // One response for all three verbs. Orbit, pan and
-                            // zoom are one gesture surface, so they share one
-                            // id, one hit test and one answer to "is the pointer
-                            // on this pane" — which is the gate that keeps a
-                            // pinch over one pane out of every other 3D pane on
-                            // screen.
+                            // **The zoom is no longer spent here.** It moves the
+                            // eye rather than the viewport, so it is folded in
+                            // beside the orbit and the pan where the rest of the
+                            // camera delta is assembled — see `ui_region` and
+                            // `volume_pane_outcome`. Nothing on this path writes
+                            // `map_memory` any more: it belongs to the pane's
+                            // plan view, and writing it here is what made
+                            // flipping a pane to 3D, scrolling, and flipping
+                            // back move the map the user had aimed.
                             let volume_response = child_ui.interact(
                                 pane_rect,
                                 child_ui.id().with(("volume_orbit", pane_idx)),
                                 egui::Sense::click_and_drag(),
-                            );
-                            crate::ui_region::zoom_viewport(
-                                &child_ui,
-                                &volume_response,
-                                pane_rect,
-                                &mut map_memory,
-                                center,
                             );
                             // The pane's own map, drawn where only the mirror
                             // can see it. This is the floor: not a second map,
@@ -737,19 +733,6 @@ impl super::Gui {
                                     user_fix: user_fix.clone(),
                                     actions: &mut actions,
                                 },
-                            );
-                            // The box, measured off the very viewport the floor
-                            // above was just drawn through — same rect, same
-                            // `map_memory`, same centre. That is what makes the
-                            // floor cover the box by construction rather than by
-                            // two things happening to agree, and it is the whole
-                            // point of the region being the viewport. Measured
-                            // *after* the strip so it reads the memory
-                            // `Map::show` has settled this frame.
-                            let region = crate::ui_region::region_for_viewport(
-                                pane_rect,
-                                &map_memory,
-                                center,
                             );
                             // Cloned rather than borrowed: `record_pane_content`
                             // above and the probe below both want `&mut self`,
@@ -803,7 +786,6 @@ impl super::Gui {
                                 chrome,
                                 source_geo,
                                 mirror_size_points,
-                                region,
                                 &mut actions,
                                 &mut self.volume_alpha,
                                 &self.volume_iso,
@@ -1715,13 +1697,15 @@ pub(crate) struct VolumeArmProbe {
 /// a bug, it looks like input lag, and it gets "fixed" by turning the drag
 /// sensitivity up rather than by fixing the order.
 ///
-/// # Where the zoom went
+/// # Where the zoom goes
 ///
-/// Not here. Scroll and pinch aim the pane's *viewport*, in both render modes,
-/// and that has to happen before the floor is drawn — so the caller reads it
-/// through [`crate::ui_region::zoom_viewport`] and hands this the `response` it
-/// used, rather than this taking a second interaction on the same rect. What
-/// arrives here is the box the zoom already produced.
+/// Into the camera, beside the orbit and the pan, through
+/// [`crate::ui_region::zoom_camera`]. It used to aim the pane's *viewport*
+/// instead, which is why it had to run before the floor was drawn and why the
+/// caller took the interaction; the caller still takes it, because orbit, pan
+/// and zoom are one gesture surface and must share one hit test, but nothing
+/// about the ordering is load-bearing any more. The region this pane resamples
+/// is stored on the pane and no gesture writes it.
 #[allow(clippy::too_many_arguments)]
 fn render_volume_pane(
     ui: &mut egui::Ui,
@@ -1738,7 +1722,6 @@ fn render_volume_pane(
     chrome: Option<f32>,
     source_geo: Option<crate::volume_view::MapPaneGeo>,
     mirror_size_points: egui::Vec2,
-    region: Option<crate::pane::VolumeRegion>,
     actions: &mut Vec<GuiAction>,
     alpha_curves: &mut crate::volume_alpha::AlphaCurves,
     iso_thresholds: &crate::volume_iso::IsoThresholds,
@@ -1755,7 +1738,6 @@ fn render_volume_pane(
         current_stamp,
         source_geo,
         mirror_size_points,
-        region,
         actions,
         alpha_curves,
         iso_thresholds,
@@ -1818,7 +1800,6 @@ fn volume_pane_outcome(
     current_stamp: Option<crate::ui::CurrentVolumeStamp>,
     source_geo: Option<crate::volume_view::MapPaneGeo>,
     mirror_size_points: egui::Vec2,
-    region: Option<crate::pane::VolumeRegion>,
     actions: &mut Vec<GuiAction>,
     alpha_curves: &crate::volume_alpha::AlphaCurves,
     iso_thresholds: &crate::volume_iso::IsoThresholds,
@@ -1832,10 +1813,18 @@ fn volume_pane_outcome(
     // measure it against a camera the user has not seen yet.
     //
     // Answered rather than unwrapped for the reason the `volume_mut` below gives.
-    let mut box_size_km = crate::pane::box_size_km(region);
-    let Some((camera_before, view_mode)) = pane.volume().map(|v| (v.camera, v.view_mode)) else {
+    //
+    // The region is read off the pane rather than passed in, because it is a
+    // stored choice rather than a measurement of this frame: nothing in the
+    // render arm produces it and nothing here may write it. `None` — the
+    // ordinary case, and the one a pane opens in — means the volume's own data
+    // reach, which only the resampler can resolve; see `VolumePane::region`.
+    let Some((camera_before, view_mode, region)) =
+        pane.volume().map(|v| (v.camera, v.view_mode, v.region))
+    else {
         return VolumeOutcome::empty_state(VOLUME_EMPTY_STATE.to_owned());
     };
+    let mut box_size_km = crate::pane::box_size_km(region);
     // The box the picture on screen was actually *built* over, for the pan to
     // be scaled against. A measured viewport states its own width and
     // `build_voxels` honours it, so for those the line above is already exact
@@ -1942,18 +1931,25 @@ fn volume_pane_outcome(
         delta.pan = pan;
     }
 
-    // `delta.zoom_factor` stays 1.0 — "the eye did not move" — and there is no
-    // arm here that changes it. Scroll and pinch aim the *geography*, in both
-    // render modes, and `ui_region::zoom_viewport` has already spent this
-    // frame's gesture on the viewport this box was measured off.
+    // The zoom, on the same response as the orbit and the pan, because it is
+    // the same gesture surface. It divides the eye's standoff and touches
+    // nothing else: the box, the grid inside it and the floor under it all
+    // stand still, and the ground the pane is *looking* at is what halves.
     //
-    // The eye follows anyway, and that is the whole reason this arm could be
-    // deleted rather than replaced: `eye_distance` is in multiples of the box's
-    // framing radius, so a box the zoom tightened brings the camera in with it,
-    // continuously, holding the user's orbit angle and standoff ratio exactly.
-    // Nothing here may reframe, ease or fit — the user is the only thing that
-    // moves this camera, and the standoff is theirs to set on the pane's own
-    // control (`render_volume_controls`).
+    // This is the fix for the defect the user reported three times. The arm
+    // used to be absent because the zoom aimed the *viewport*, and the box was
+    // derived from the viewport — so scrolling in re-cut the data, and the
+    // caption's own figure fell from `802 x 490 km box` to `668 x 408 km` while
+    // the user watched. The eye no longer "follows for free", because there is
+    // no longer anything for it to follow: the box does not move.
+    //
+    // Not gated on `suppress_drag`, for the reason the orbit arm states — a
+    // pinch or a wheel is unambiguous whatever else is in flight, so
+    // suppressing it during a hold would make a pinch do nothing the hold never
+    // claimed. Nothing here may reframe, ease or fit: the user is the only
+    // thing that moves this camera, and the standoff is also theirs to set
+    // absolutely on the pane's own control (`render_volume_controls`).
+    delta.zoom_factor = crate::ui_region::zoom_camera(ui.ctx(), response);
 
     // Read before `volume_mut` borrows the pane: `site`, `scan_info` and
     // `selected_product` are flat fields beside `content`, and taking them first
@@ -2026,9 +2022,6 @@ fn volume_pane_outcome(
         return VolumeOutcome::empty_state(VOLUME_EMPTY_STATE.to_owned());
     };
     volume.camera.nudge(delta);
-    // The measurement, published for the loop planner — which runs outside the
-    // egui pass and cannot take it itself. See `VolumePane::viewport_box`.
-    volume.viewport_box = region;
     let camera = volume.camera;
     let floor = !volume.hide_floor;
     let already_rendered = volume.rendered_for.clone();

@@ -13,7 +13,7 @@ use super::PaneLayout;
 use super::PaneState;
 use crate::pane::{
     CrossSectionPane, GeoPoint, MapPane, MapRender, OrbitCamera, PaneContent, SectionLine,
-    VolumePane,
+    VolumePane, VolumeRegion,
 };
 use crate::ui_layout::WidthClass;
 
@@ -180,15 +180,82 @@ struct SectionLineConfig {
     b_lon: f64,
 }
 
+/// A 3D pane's picked region, as persisted.
+///
+/// Absent for the ordinary case — the volume's own data reach, which is a fact
+/// about the scan rather than a choice and would be wrong to freeze into a file:
+/// a site switched to a TDWR must get the TDWR's ring, not the WSR-88D's ring
+/// the last session happened to be looking at.
+///
+/// Flat `f64`s rather than the domain types, for [`SectionLineConfig`]'s reason:
+/// serde reads any number into these and
+/// [`VolumeRegion::new`](crate::pane::VolumeRegion::new) is the gate on the way
+/// back in.
+///
+/// # Why a missing extent is not zero
+///
+/// A `region` block has existed under this name before, describing a **square**
+/// box dragged out on another pane: `centre_lat`, `centre_lon`, `half_width_km`,
+/// with a `source_pane` beside it. Its extent key is not one of these, so
+/// `#[serde(default)]` reads both axes as `0.0` — and `VolumeRegion::new`
+/// *clamps* rather than refuses, so a straight construction turns that old block
+/// into a **10 km** box centred where the old drag was. A pane that opened onto
+/// a twentieth of a county would be a far worse outcome than one that opened
+/// onto the whole ring, and it would be indistinguishable from the user having
+/// asked for it.
+///
+/// So [`Self::restore`] requires a positive extent on both axes, which is the
+/// property that separates "a region was written here" from "this block is
+/// something else". The old drag's box is deliberately *not* migrated: it named
+/// a source pane and a gesture that no longer exist, and inventing a new-style
+/// pick out of it would be restoring a decision the user never made in these
+/// terms.
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
+struct VolumeRegionConfig {
+    centre_lat: f64,
+    centre_lon: f64,
+    half_east_km: f64,
+    half_north_km: f64,
+}
+
+impl VolumeRegionConfig {
+    /// The region this block names, or `None` for one that names none —
+    /// including every block written by the square-drag form this replaced.
+    ///
+    /// `VolumeRegion::new` is still the gate on the centre and on the extent's
+    /// upper end; this only adds the lower one, which it deliberately does not
+    /// have. Clamping up is right for a live control wound to its stop and
+    /// wrong for a file, where the same arithmetic launders a missing key into
+    /// a plausible-looking box.
+    fn restore(&self) -> Option<VolumeRegion> {
+        if !(self.half_east_km > 0.0 && self.half_north_km > 0.0) {
+            return None;
+        }
+        VolumeRegion::new(
+            GeoPoint {
+                lat: self.centre_lat,
+                lon: self.centre_lon,
+            },
+            rustdar_radar::voxel::HalfExtentKm {
+                east_km: self.half_east_km,
+                north_km: self.half_north_km,
+            },
+        )
+    }
+}
+
 /// A 3D pane, as persisted: where the eye is, how far the vertical is stretched,
 /// and what ground was picked.
 ///
 /// The voxel grid is not here for the same reason the section raster is not:
 /// it is derived from a volume, and rebuilding it is what opening the pane does.
 /// The *region* is here rather than derived, and that is the difference between
-/// it and the grid — it is a choice the user made with a drag, and losing it on
-/// restart would silently put a carefully aimed 20 km box back to the 460 km
-/// default with the pane still claiming to be a 3D view of a storm.
+/// it and the grid — it is a choice the user made, and losing it on restart
+/// would silently put a carefully aimed 20 km box back to the whole ring with
+/// the pane still claiming to be a 3D view of a storm. That claim used to be
+/// false: the region was measured off the viewport every frame and there was
+/// nothing here to save. It is true now.
 ///
 /// Flat `f64`s and `f32`s throughout, never the domain types, for the reason
 /// [`SectionLineConfig`] gives: serde reads any number into these, and the
@@ -220,6 +287,9 @@ struct VolumeConfig {
     /// the same forward tolerance the product enum has.
     #[serde(deserialize_with = "view_mode_or_default")]
     view_mode: crate::pane::VolumeViewMode,
+    /// The ground this pane resamples, or absent for the volume's own reach.
+    /// See [`crate::pane::VolumePane::region`] and [`VolumeRegionConfig`].
+    region: Option<VolumeRegionConfig>,
 }
 
 /// Deserialize a [`crate::pane::VolumeViewMode`], falling back to the default
@@ -259,6 +329,11 @@ impl VolumeConfig {
             || self.vertical_exaggeration != default.vertical_exaggeration
             || self.hide_floor != default.hide_floor
             || self.view_mode != default.view_mode
+            // `is_some` rather than a comparison: the default is "no region
+            // picked", so *having* one is the whole of the difference, and
+            // comparing four `f64`s against a default that has none would be
+            // arithmetic where a presence test is exact.
+            || self.region.is_some()
     }
 }
 
@@ -285,6 +360,9 @@ impl Default for VolumeConfig {
             // the same inversion — see the field's own doc.
             hide_floor: false,
             view_mode: crate::pane::VolumeViewMode::default(),
+            // No region picked: the volume's own reach. Matches
+            // `VolumePane`'s derived default, which is the same `None`.
+            region: None,
         }
     }
 }
@@ -1081,6 +1159,12 @@ fn content_config(
                 vertical_exaggeration: camera.vertical_exaggeration(),
                 hide_floor: map.volume.hide_floor,
                 view_mode: map.volume.view_mode,
+                region: map.volume.region.map(|region| VolumeRegionConfig {
+                    centre_lat: region.centre().lat,
+                    centre_lon: region.centre().lon,
+                    half_east_km: region.half_east_km(),
+                    half_north_km: region.half_north_km(),
+                }),
             };
             // Every float that reaches the file, not merely the three angles:
             // `serde_json` writes a non-finite `f32` as `null`, which comes back
@@ -1094,6 +1178,19 @@ fn content_config(
                 || !config.eye_distance.is_finite()
                 || !config.pivot.iter().all(|p| p.is_finite())
                 || !config.vertical_exaggeration.is_finite()
+                // The region's four, for the same reason and with the same
+                // unreachability: `VolumeRegion::new` refuses a non-finite
+                // centre and `HalfExtentKm::clamped` a non-finite extent, so
+                // nothing can put one here — but a `null` in the file would come
+                // back through `#[serde(default)]` as a region centred on
+                // 0°N 0°E with no width, which is a *different pane*, not a
+                // failed load.
+                || !config.region.as_ref().is_none_or(|region| {
+                    region.centre_lat.is_finite()
+                        && region.centre_lon.is_finite()
+                        && region.half_east_km.is_finite()
+                        && region.half_north_km.is_finite()
+                })
             {
                 log::warn!("a map pane's 3D camera is not finite; saving it as a plain map");
                 return AS_MAP;
@@ -1176,10 +1273,15 @@ fn restore_map(pane_idx: usize, pc: &PaneConfig, render: MapRender) -> PaneConte
         render,
         volume: VolumePane {
             camera,
-            // Not persisted, and not invented here: it is a measurement of a
-            // viewport, and the first frame the pane draws in 3D takes it. See
-            // the field.
-            viewport_box: None,
+            // Persisted, because it is a choice rather than a measurement —
+            // see the field. `VolumeRegion::new` is the gate, exactly as
+            // `OrbitCamera::restore` is above, and a region it refuses becomes
+            // `None`: the volume's own reach, which crops nothing. That is the
+            // right failure for a hand-edited or truncated file, and it is a
+            // *narrower* consequence than the camera's, which drops the pane to
+            // a plain plan view — a pane that cannot place its region is still
+            // a perfectly good 3D view of the whole ring.
+            region: saved.region.as_ref().and_then(VolumeRegionConfig::restore),
             // A restored pane holds nothing built, so `rendered_for: None` is
             // what makes the dispatcher resample against whatever volume the
             // pane's site loads.
