@@ -12,28 +12,39 @@ use std::fmt::Debug;
 /// corrupt or hostile record is an out-of-memory abort, and on the parallel
 /// path it is one per worker at once.
 ///
-/// **16 MiB**, and the number has to survive two questions: can a real record
-/// reach it, and is it small enough to be worth having?
+/// **16 MiB**, and it rests on measured headroom over real data. There is no
+/// structural ceiling to appeal to — see below — so this is an empirical bound
+/// and is documented as one.
 ///
-/// *Real records.* Measured over 693 compressed records in 12 volumes — 5
-/// WSR-88D sites spanning 2017-2023 and 7 TDWR sites, the two formats with
-/// different record structures:
+/// *Real records.* Measured over 10,063 compressed records in 176 volumes,
+/// WSR-88D and TDWR, the two formats with different record structures. Zero
+/// rejections:
 ///
-/// | | largest record |
-/// | --- | --- |
-/// | WSR-88D | 1,416,480 B |
-/// | TDWR | 325,888 B |
+/// | | largest record | ceiling is |
+/// | --- | --- | --- |
+/// | any site | 1,424,736 B | **11.8×** larger |
+/// | TDWR | 325,888 B | 51× larger |
 ///
-/// The ceiling is **11.8×** the largest record ever observed, and 51× the
-/// largest TDWR one.
+/// *Why there is no structural leg.* An earlier version of this comment
+/// claimed one, and it was wrong; it is written down so nobody reconstructs
+/// it. The reasoning was that Archive II packs at most 120 messages per
+/// record, so 120 × 131,082 (the largest a `u16` halfword count plus the
+/// 12-byte CTM prefix can express) = 15,729,840 < 16,777,216 would put the
+/// ceiling above anything the format can say.
 ///
-/// *The format's own reach.* Archive II groups radials into LDM records of at
-/// most 120 messages, and a message's declared size is a `u16` count of
-/// halfwords measured from byte 12 — at most 65,535 halfwords, so 131,070
-/// bytes plus the 12-byte CTM prefix, 131,082 bytes. A record of 120
-/// maximum-size messages is 15,729,840 bytes, which is **under** 16,777,216.
-/// So the ceiling sits just above the largest record the structure can express,
-/// not merely above the largest one this corpus happened to contain.
+/// Both halves fail. "120" is the radial count, not the message count —
+/// decoding every record in the corpus gives **78–127** messages per record on
+/// WSR-88D and **120–134** on TDWR, because the metadata messages sit in the
+/// same records. At 134 messages the same arithmetic gives 17,564,988, which
+/// is *above* the ceiling. And 131,082 is unreachable in practice anyway: the
+/// largest real message measured is **12,160 bytes** on WSR-88D and 2,432 on
+/// TDWR, so a 134-message record of real messages is about 1.6 MB.
+///
+/// So the format does not bound this and the ceiling does not pretend it does.
+/// What it has is an order of magnitude of headroom over every record ever
+/// measured, which is what
+/// `decompress_bound_tests::the_ceiling_keeps_real_headroom_over_the_largest_record_measured`
+/// pins.
 ///
 /// *Worth having.* 16 MiB caps a decompression bomb at 16 MiB per worker
 /// instead of at the machine's memory. At 32 threads that is a 512 MB worst
@@ -417,22 +428,40 @@ mod decompress_bound_tests {
         assert_eq!(decompressed.data(), &payload[..]);
     }
 
+    /// The largest decompressed LDM record measured anywhere: 10,063 compressed
+    /// records across 176 volumes, WSR-88D and TDWR, with zero rejections.
+    ///
+    /// Raise this only by measuring, and raise the ceiling with it.
+    const LARGEST_MEASURED_RECORD_BYTES: usize = 1_424_736;
+
     #[test]
-    fn the_ceiling_is_above_every_record_the_archive_ii_structure_can_express() {
-        // The derivation in `MAX_DECOMPRESSED_RECORD_BYTES`'s own documentation,
-        // written down as an assertion so that changing the constant downward
-        // past the format's reach is a deliberate act with a failing test.
-        //
-        // 120 messages per LDM record; a message's declared size is a `u16`
-        // count of halfwords measured from byte 12, so at most 65,535 halfwords
-        // plus the 12-byte CTM prefix.
-        const MAX_MESSAGES_PER_RECORD: usize = 120;
-        const MAX_MESSAGE_BYTES: usize = 65_535 * 2 + 12;
+    fn the_ceiling_keeps_real_headroom_over_the_largest_record_measured() {
+        // This is the *whole* justification for the constant, so it is the
+        // thing to assert. An earlier version of this test asserted instead
+        // that the ceiling was above the largest record Archive II could
+        // express, via "at most 120 messages of at most 131,082 bytes". That
+        // was false twice over -- 120 is the radial count, not the message
+        // count (78-127 messages per record measured on WSR-88D, 120-134 on
+        // TDWR), and at 134 messages the same arithmetic exceeds the ceiling.
+        // The test passed only because the 120 in it restated the bad premise.
+        // There is no structural bound; there is an order of magnitude of
+        // measured headroom, and that is what this pins.
         assert!(
-            MAX_MESSAGES_PER_RECORD * MAX_MESSAGE_BYTES <= MAX_DECOMPRESSED_RECORD_BYTES,
-            "the ceiling ({MAX_DECOMPRESSED_RECORD_BYTES}) is below the largest record \
-             Archive II can express ({})",
-            MAX_MESSAGES_PER_RECORD * MAX_MESSAGE_BYTES
+            MAX_DECOMPRESSED_RECORD_BYTES >= 10 * LARGEST_MEASURED_RECORD_BYTES,
+            "the ceiling ({MAX_DECOMPRESSED_RECORD_BYTES}) leaves less than 10x headroom \
+             over the largest record ever measured ({LARGEST_MEASURED_RECORD_BYTES})"
         );
+    }
+
+    #[test]
+    fn the_largest_measured_record_is_accepted() {
+        // The other direction, and the one a user would feel: a record the size
+        // of the biggest one in the archive is data, not an error.
+        let payload = vec![0u8; LARGEST_MEASURED_RECORD_BYTES];
+        let record = ldm_record(&payload);
+        let decompressed = Record::from_slice(&record)
+            .decompress()
+            .expect("the largest measured record decompresses");
+        assert_eq!(decompressed.data().len(), LARGEST_MEASURED_RECORD_BYTES);
     }
 }

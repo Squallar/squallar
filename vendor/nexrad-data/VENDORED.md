@@ -30,14 +30,19 @@ not the notice the license requires us to redistribute.
 
 ## Why this exists
 
-`Record::decompress` (`src/volume/record.rs`) is four lines long, is the
-dominant cost of the entire decode path, and has no upper bound on what it will
-allocate.
+`Record::decompress` (`src/volume/record.rs`) is four lines long and has no
+upper bound on what it will allocate.
 
 ```rust
 let mut decompressed_data = Vec::new();
 BzDecoder::new(data).read_to_end(&mut decompressed_data)?;
 ```
+
+**That is the reason, and it is sufficient on its own.** This function is also
+the dominant cost of the entire decode path, and the fork improves that
+measurably — but by 0.039% of instructions, which would not justify a fork by
+itself. The ceiling would. Read the two sections below in that order and in
+that proportion.
 
 ### The bound
 
@@ -120,15 +125,16 @@ produce exactly these entries and nothing else.
 
 ### Removed — targets that cannot compile or that nothing here runs
 
-Nine of the eleven packaged test targets are gone, and the reason is the same
-one the sibling directory ran into: upstream's tests read files that exist only
-in upstream's checkout, and the packaged tarball does not contain them.
+**Seven of the eleven** packaged test targets are gone and **four stay**. The
+reason for most of them is the same one the sibling directory ran into:
+upstream's tests read files that exist only in upstream's checkout, and the
+packaged tarball does not contain them.
 
 | Path | Why |
 | --- | --- |
 | `tests/volume_header.rs`, `tests/volume_records.rs`, `tests/volume_scan.rs`, `tests/aws_realtime_polling.rs` | All four `include_bytes!("../../downloads/KDMX20220305_232324_V06")`, a file produced by a download step in upstream's repo. Not in the tarball; they cannot compile here at all. |
 | `tests/fixture_integration.rs` | `include_bytes!("../../tests/fixtures/…")` × 8, likewise upstream-checkout-only. |
-| `tests/live_decode.rs`, `tests/aws_realtime_network.rs`, `tests/aws_archive.rs` | Download live data from the AWS archive bucket at test time. A workspace test suite that reaches the network is a test suite that fails when the network does. |
+| `tests/live_decode.rs`, `tests/aws_realtime_network.rs` | Download live data from the AWS archive bucket at test time. A workspace test suite that reaches the network is a test suite that fails when the network does. |
 | `benches/scan.rs` + the `[[bench]]` block + the `criterion` dev-dependency | Nothing in this workspace runs them, and `--all-targets` would compile criterion on every CI row including wasm32. |
 | `examples/` (3 files) + the three `[[example]]` blocks + the `clap` dev-dependency | Same. |
 | dev-dependency `env_logger`, dev-dependency `tokio` | Used only by the deleted tests. |
@@ -137,7 +143,7 @@ in upstream's checkout, and the packaged tarball does not contain them.
 manifest, so each block had to be deleted together with its file: a block
 naming a missing path is a hard error, and a file with no block is dead weight.
 
-Two of the three *kept* targets each had one test reaching for the same missing
+Two of the four *kept* targets each had one test reaching for the same missing
 `downloads/KDMX20220305_232324_V06`, so keeping the file meant dealing with the
 test:
 
@@ -161,6 +167,18 @@ edit to somebody reading the test file.
 - `tests/aws_realtime_types.rs` + its `[[test]]` block — std-only, and behind
   `#![cfg(feature = "aws")]`, so it compiles to nothing unless something asks
   for `aws` and runs for real under `--all-features`.
+- `tests/aws_archive.rs` + its `[[test]]` block — **eleven** plain, synchronous,
+  fixture-free, network-free `Identifier` parsing tests, on exactly the same
+  terms as `aws_realtime_types.rs` above.
+
+  This file was dropped at first, and the justification given for it — "downloads
+  live data from the AWS archive bucket at test time" — was true of only 8 of
+  its 19 tests, and those 8 carry upstream's own `#[ignore = "requires AWS
+  access"]`, so they never ran anywhere. The real obstacle was narrower: their
+  `#[tokio::test]` attribute is what pulled the `tokio` dev-dependency this
+  directory drops. So the eight went and the file stayed, which is the same
+  surgical call already made one test at a time in `aws_realtime_types.rs`. A
+  comment where they stood says so.
 - `src/aws/` in full, and the `aws` and `aws-polling` features. Nothing in this
   workspace calls them — `rustdar-radar/src/archive.rs` and `src/chunks.rs`
   reimplement that surface and say so — but deleting a quarter of a crate to
@@ -234,29 +252,42 @@ memory the decompression will take. Without a ceiling, a corrupt or hostile
 record is an out-of-memory abort, and on the parallel path it is one per worker
 at once.
 
-**Where 16 MiB comes from.** Two independent legs, and the number has to
-satisfy both — it must be out of reach of real data, and low enough to be worth
-having.
+**Where 16 MiB comes from.** Measured headroom over real data, and nothing
+else. It was originally justified on two legs; the second one was false and has
+been withdrawn.
 
-*Real data.* 693 compressed records across 12 volumes: 5 WSR-88D sites spanning
-2017–2023 and 7 TDWR sites, chosen because the two formats build records
-differently.
+*Real data.* 10,063 compressed records across 176 volumes, WSR-88D and TDWR,
+chosen because the two formats build records differently. Zero rejections.
 
 | | largest record | ceiling is |
 | --- | --- | --- |
-| WSR-88D | 1,416,480 B | **11.8×** larger |
+| any site | 1,424,736 B | **11.8×** larger |
 | TDWR | 325,888 B | **51×** larger |
 
-*The format's own reach.* Archive II groups radials into LDM records of at most
-120 messages, and a message's declared size is a `u16` count of halfwords
-measured from byte 12 — at most 65,535 halfwords, so 131,070 bytes plus the
-12-byte CTM prefix. 120 × 131,082 = **15,729,840 bytes**, which is under
-16,777,216. The ceiling therefore sits above the largest record the structure
-can express, not merely above the largest one this corpus happened to hold.
-That arithmetic is an assertion in
-`decompress_bound_tests::the_ceiling_is_above_every_record_the_archive_ii_structure_can_express`,
-so lowering the constant past the format's reach fails a test rather than
-passing review.
+*The withdrawn leg, kept visible so it is not reconstructed.* The claim was
+that Archive II packs at most 120 messages per record, so 120 × 131,082 — the
+largest a `u16` halfword count plus the 12-byte CTM prefix can express —
+= 15,729,840 < 16,777,216 would put the ceiling above anything the format could
+say. The arithmetic is right and the premise is not, twice:
+
+| | messages per record, measured |
+| --- | --- |
+| WSR-88D | **78–127** |
+| TDWR | **120–134** |
+
+"120" is the *radial* count; the metadata messages share the record. At 134 the
+same arithmetic gives 17,564,988, which is **above** the ceiling. And 131,082
+is unreachable anyway — the largest real message measured is **12,160 bytes**
+on WSR-88D and 2,432 on TDWR, so a 134-message record of real messages is about
+1.6 MB.
+
+So the format does not bound record size, and this ceiling does not claim it
+does. The test that asserted the structural leg has been replaced by
+`the_ceiling_keeps_real_headroom_over_the_largest_record_measured`, which pins
+the thing that is actually true: at least 10× headroom over the largest record
+ever measured, with that figure named as a constant so raising it means
+measuring again. A second test decompresses a record of exactly that size and
+requires it to be accepted.
 
 *Worth having.* A bomb costs 16 MiB per worker and ends in an `Err`, instead of
 costing the machine's memory and ending in an abort. At 32 threads that is a
@@ -291,11 +322,23 @@ the decoded-moment digest and the raw decompressed-bytes digest over all 14
 volumes.
 
 New `#[cfg(test)] mod decompress_bound_tests` in `src/volume/record.rs`, an
-in-source module so it travels with the fix in the upstream diff. Five tests: a
+in-source module so it travels with the fix in the upstream diff. Six tests: a
 record of exactly `MAX` bytes decompresses; a record one byte over is
 `RecordTooLarge`; a 256 MiB bomb that is under 4 KB on the wire is refused; an
-ordinary 2432-byte record round-trips byte-identically; and the Archive II
-arithmetic above.
+ordinary 2432-byte record round-trips byte-identically; the ceiling keeps 10×
+headroom over the largest record ever measured; and a record of exactly that
+measured size is accepted.
+
+**The hole this does not close.** `File::decompress`
+(`src/volume/file.rs:46`) has the identical unbounded `read_to_end`, on a
+`GzDecoder`, for the gzip-wrapped volume files that pre-~2016 archives use —
+same network provenance, and a path rustdar takes for legacy `.gz` volumes.
+DEFLATE reaches roughly 1032:1, so 16 MB of download expands to ~16 GB. It is
+one `.take()` away from being fixed and it is deliberately not fixed here:
+its bound is a different number needing its own corpus (whole volumes, not
+records), and this directory's changes are scoped to the record path. Named
+rather than left silent so the safety claim above is not read as complete. It
+is the obvious next commit.
 
 #### The starting capacity — `src/volume/record.rs`
 
@@ -479,11 +522,24 @@ The two ways to have it anyway are forking `bzip2` as well, or calling
 does not have. Both are a larger and worse change than the one they would
 enable, in a directory whose value depends on its diff staying readable.
 
-**What to do instead.** The fix belongs in `bzip2`: a `Decompress::reset` that
-keeps the `tt` allocation when the new stream's `blockSize100k` matches the old
-one — which for NEXRAD it always does, every record being `BZh9`. `flate2`
-already has exactly this shape of API (`Decompress::reset`). That is an
-upstream issue against `bzip2`, and this section is the evidence for it.
+**What to do instead.** Two routes, and the second needs no fork at all.
+
+1. *Upstream.* The fix belongs in `bzip2`: a `Decompress::reset` that keeps the
+   `tt` allocation when the new stream's `blockSize100k` matches the old one —
+   which for NEXRAD it always does, every record being `BZh9`. `flate2` already
+   has exactly this shape of API (`Decompress::reset`). That is an upstream
+   issue against `bzip2`, and this section is the evidence for it.
+
+2. *A caching global allocator, in rustdar rather than here.* The 3.6 MB block
+   is freed and requested again in the identical size, per record, per worker.
+   That is the access pattern a large-block-caching allocator — mimalloc,
+   jemalloc — exists to serve: the free returns the block to a thread-local
+   cache and the next request takes it back without touching the kernel. It
+   recovers most of the same win with **no change to this directory and no
+   fork of `bzip2`**, because it never needs the decompressor to be reused —
+   only the memory. It is a rustdar-level decision with effects far beyond this
+   function, so it is named here rather than made here, and it should be
+   measured the way everything else in this file was.
 
 ## One more thing measured and left alone
 
@@ -517,18 +573,56 @@ here unchanged.
   `coverage-baseline.tsv` it auto-commits move accordingly. Nothing gates on a
   threshold, so nothing fails.
 
-## One resolution artifact
+## The dependency graph, checked under the flags CI actually uses
 
-Adding this member added five packages to `Cargo.lock` that were not there
-before: `aws-lc-rs`, `aws-lc-sys`, `cmake`, `dunce`, `fs_extra`. They arrive
-through the optional `reqwest` dependency's `rustls` feature and are **not
-built** — feature unification with this workspace's own reqwest pin
-(`rustls-no-provider` + `ring`) means the aws-lc provider is never selected,
-which was confirmed by watching a `--all-features` build of this package: it
-compiles `rustls-webpki`, `tokio-rustls`, `hyper-rustls` and
-`rustls-platform-verifier`, and no `aws-lc-sys`. Lockfile entries for optional
-dependencies that nothing enables are ordinary; this note exists so the five
-new lines in `Cargo.lock` are not mistaken for a new C toolchain requirement.
+An earlier version of this file claimed in this spot that `aws-lc-sys` and
+friends "are **not built**" and that the note existed "so the five new lines in
+`Cargo.lock` are not mistaken for a new C toolchain requirement." That was
+wrong, and it is worth keeping the correction visible, because the mistake was
+methodological rather than arithmetical: the check had been run on **one
+package** (`cargo check -p nexrad-data --all-features`) and on the wasm32 row,
+where reqwest elides its rustls features entirely. Neither is what CI runs.
+
+Run whole-workspace, the branch **did** drag in a CMake + C + assembly build,
+reachable only because the crate is now a workspace member and therefore
+in range of `--all-features`. That reaches seven CI invocations, including
+`clippy.yaml`'s `--all-features --fix`, which auto-commits, and four release
+rows in `build.yaml` — Linux, aarch64-apple-darwin, x86_64-apple-darwin and
+x86_64-pc-windows-gnullvm. The chain was
+`reqwest/rustls` → `reqwest/__rustls-aws-lc-rs` → `rustls/aws-lc-rs` →
+`aws-lc-rs` → `aws-lc-sys`.
+
+Fixed by asking for `rustls-no-provider` instead of `rustls` in this
+directory's manifest — the same feature the root `Cargo.toml` already pins, so
+unification leaves one reqwest with `ring` behind it. The reasoning and the
+reason it is *not* an upstream-suitable change are at the dependency itself.
+
+The check that must not regress, and its answer now:
+
+```console
+$ cargo tree --workspace --all-features -i aws-lc-sys
+error: package ID specification `aws-lc-sys` did not match any packages
+```
+
+Same answer on `main`. `aws-lc-sys`, `aws-lc-rs`, `cmake`, `jobserver`,
+`dunce` and `fs_extra` are absent from both sides, under both flag sets.
+
+What the vendoring *does* change in the resolved graph, whole-workspace,
+`cargo tree --prefix none | sort -u`:
+
+| flags | main | branch | difference |
+| --- | --- | --- | --- |
+| default | 608 | 609 | `nexrad-data` registry → path. **Nothing else.** |
+| `--all-features` | 620 | 622 | the same, plus `signal-hook-registry` |
+
+`signal-hook-registry` arrives because `--all-features` turns on this member's
+`aws-polling`, which asks for `tokio/full`. It is a consequence of the crate
+being a member with an optional async feature, not of anything this fork
+changed, and it builds everywhere.
+
+The lesson, written down because it is the one that generalises: **"vendoring
+changes nothing" has to be checked under every flag combination CI uses**, not
+only the default one, and whole-workspace rather than per-package.
 
 ## Upstream pull request
 

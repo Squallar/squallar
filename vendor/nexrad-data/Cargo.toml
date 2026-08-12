@@ -97,11 +97,16 @@ parallel = ["rayon"]
 name = "nexrad_data"
 path = "src/lib.rs"
 
-# Kept: the two test targets that compile here and that pin the code this
-# directory exists to change. See VENDORED.md for the nine that were dropped.
+# Kept: the four test targets that compile here without a fixture or a network,
+# two of which pin the code this directory exists to change. See VENDORED.md
+# for the seven that were dropped and why.
 [[test]]
 name = "error_handling"
 path = "tests/error_handling.rs"
+
+[[test]]
+name = "aws_archive"
+path = "tests/aws_archive.rs"
 
 [[test]]
 name = "malformed_records"
@@ -142,9 +147,34 @@ optional = true
 version = "1.11.0"
 optional = true
 
+# Upstream asks for reqwest's `rustls` feature. Here it is
+# `rustls-no-provider`, and this is a **local** change that would be wrong to
+# offer upstream -- see VENDORED.md.
+#
+# reqwest's `rustls` feature is `__rustls-aws-lc-rs`, which turns on
+# `rustls/aws-lc-rs`, which is `aws-lc-rs` -> `aws-lc-sys`: a CMake + C +
+# assembly build. As a plain registry dependency with `aws` off that never
+# resolved. As a workspace *member* it is reachable the moment anything says
+# `--all-features`, which seven CI invocations do -- including
+# `clippy.yaml`'s `--all-features --fix`, which auto-commits, and the Linux,
+# aarch64-apple-darwin, x86_64-apple-darwin and x86_64-pc-windows-gnullvm
+# release rows in `build.yaml`. Verified by building: it produced a 46 MB
+# `target/debug/build/aws-lc-sys-*/`.
+#
+# `rustls-no-provider` is the same TLS stack with the provider left to the
+# caller, and it is exactly what this workspace's own reqwest pin in the root
+# `Cargo.toml` already asks for, so unification gives one reqwest with `ring`
+# behind it. `cargo tree --workspace --all-features -i aws-lc-sys` returns
+# "did not match any packages" with this line, and names aws-lc-sys without it.
+#
+# Wrong for upstream because a bare `nexrad-data` with `aws` on and no
+# provider selected has no crypto backend. That is a choice only the top-level
+# binary can make, and this workspace has made it; a published crate has to
+# keep offering a default. The upstream conversation is "let dependents pick
+# the provider", not this line.
 [dependencies.reqwest]
 version = "0.13.1"
-features = ["rustls"]
+features = ["rustls-no-provider"]
 optional = true
 default-features = false
 
