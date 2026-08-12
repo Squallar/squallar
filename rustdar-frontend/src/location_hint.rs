@@ -514,8 +514,15 @@ mod tests {
     /// the nearest radar is still the right one to open on. The threshold
     /// admits those and excludes the 700 km-plus cases that are genuinely
     /// outside the network.
+    ///
+    /// Native-only, because the runtime it blocks on is: `tokio` is a
+    /// `cfg(not(target_arch = "wasm32"))` dependency of this crate, since
+    /// wasm rejects the multi-threaded runtime. The wasm rows build
+    /// `--all-targets`, so without this gate the crate would name a
+    /// dependency it does not have there.
     #[test]
     #[ignore = "fetches the live radar catalogue"]
+    #[cfg(not(target_arch = "wasm32"))]
     fn the_live_anchor_survey() {
         let sources = rustdar_radar::sources::DataSources::production();
         let catalogue = tokio::runtime::Runtime::new()
