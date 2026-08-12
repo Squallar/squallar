@@ -769,8 +769,27 @@ fn rot_divisor(range_nm: f64) -> f64 {
 /// maximum of 2.09%. Site spread at a range is ≤3.5%.
 ///
 /// The shape is the reference's alone: it comes from its readings and the
-/// geometry, and this pipeline enters only as one scale constant recovered at
-/// 40 km. What pins it is that the reference reports NROT on a 0.0395 lattice
+/// geometry, and this pipeline enters only as one scale constant — the step
+/// gain Σtₖ of [`SPLIT_TAPS`]. That is worth stating as an identity, because
+/// it is what decides when this curve has to be re-measured and when it does
+/// not. The campaign recorded each reading as `D_ours(r)·(ours/GR)`, and for a
+/// step edge `ours = J·(Σtₖ/2)/(arc(r)·D_ours(r))`, so `D_ours` cancels and
+///
+/// ```text
+///   D_GR(r) = J · (Σtₖ/2) / (arc(r) · NROT_GR(r))
+/// ```
+///
+/// — the painted jump, this operator's step gain, the arc, and what the
+/// reference read. Evaluated over the campaign's own 808 deciding readings it
+/// reproduces all 60 published knots to a mean of +0.12% and an rms of 0.31%.
+///
+/// So the curve is anchored to Σtₖ and is blind to how the operator
+/// distributes it. When the operator's *shape* was corrected, Σtₖ was held at
+/// 0.667000 and these knots were re-derived against the new taps and came back
+/// unchanged — not approximately, identically. A shape error is one factor at
+/// every range, since the operator does not change with range, so none of this
+/// curve's structure was ever absorbing one. What pins it is that the
+/// reference reports NROT on a 0.0395 lattice
 /// (see the module header), so each readout is an interval of half-width
 /// 0.0198 and a curve is either consistent with it or is not. These knots
 /// leave 62 of 880 readings outside, none by as much as one lattice step; the
@@ -815,7 +834,7 @@ fn rot_divisor_km(range_km: f64) -> f64 {
     KNOTS[KNOTS.len() - 1].1
 }
 
-/// The per-radial operator on a 0.5°-spaced sweep: taps [ĉ₂, ĉ₁−ĉ₂, ĉ₂, ĉ₃]
+/// The per-radial operator on a 0.5°-spaced sweep: four taps t₁..t₄
 /// at row offsets 1/2/3/4, applied **antisymmetrically** — the same list on
 /// both sides of the bin, positive toward increasing azimuth. Zero-sum by
 /// construction; normalization is two rows of the grid, which is the legacy
@@ -848,7 +867,7 @@ fn rot_divisor_km(range_km: f64) -> f64 {
 /// ```
 ///
 /// symmetric about the edge, which is these taps on both sides (predicted
-/// −0.176/+0.102/+0.501/+0.779) and is *not* any assignment of the old
+/// −0.179/+0.116/+0.518/+0.780) and is *not* any assignment of the old
 /// asymmetry: applying the clean side uniformly reads three radials at 0.78
 /// and one at 0.50, an unsymmetric profile the reference never shows. A step
 /// response determines a zero-sum operator uniquely — its successive
@@ -899,36 +918,73 @@ fn rot_divisor_km(range_km: f64) -> f64 {
 /// response never widens, so there is no range at which the operator changes,
 /// and the range branch is gone.
 ///
-/// # These taps' *shape* is a quantum off, and that is not fixed here
+/// # The shape is a Savitzky–Golay derivative, and the profiles pick it alone
 ///
-/// The same 80 profiles pin the shape and not only the support, and they do
-/// not admit this list. Normalized to the peak the reference reads
-/// (1, 0.663, 0.150, −0.228); these taps predict (1, 0.643, 0.130, −0.226),
-/// which falls outside the lattice interval of 55 of the 76 profiles whose
-/// peak is large enough to resolve it. What is admitted is a single shape on a
-/// 0.002 grid, and it has a closed form — the Savitzky–Golay cubic first
-/// derivative over nine points, (126, 193, 142, −86)/1188, ratios
-/// (1, 0.6640, 0.1493, −0.2293), which 73 of the 76 admit. At this list's own
-/// step gain that is 0.2241/0.3433/0.2526/−0.1530 against 0.238/0.342/0.238/
-/// −0.151: the same t₂ and t₄, and t₁ ≠ t₃, which is exactly what the 21.0 nm
-/// profile these were solved from could not separate — its peak is 19 lattice
-/// steps where the profiles here run to 78.
+/// The same 80 profiles pin the shape and not only the support, because a
+/// step response fixes a zero-sum operator uniquely. Normalized to the peak,
+/// the reference reads (1, 0.663, 0.150, −0.228). Sweeping candidate shapes on
+/// a 0.002 grid and keeping only those inside **every** profile's lattice
+/// interval admits one, and it has a closed form: the Savitzky–Golay cubic
+/// first derivative over nine points, (126, 193, 142, −86)/1188, ratios
+/// (1, 0.6640, 0.1493, −0.2293). Of the 76 profiles whose peak is large enough
+/// to resolve a shape, **73 admit it**.
 ///
-/// Adopting it is not this change's to make, and the reason is not that it
-/// looks wrong. Substituted at this list's own step gain it *improves* the one
-/// real-weather anchor there is: the KFTG 2023-06-22 mesocyclone core reads a
-/// mean 1.0061 of the reference's four hovered values against these taps'
-/// 1.0108. But it also raises the painted density inside 80 km on the standard
-/// seven-site set from 9572 bins to 9997 — 4.4% — and that density is itself
-/// matched to the reference's (the module header, [`DESPECKLE_MIN_BINS`] and
-/// [`MIN_RANGE_NM`] are all set against it). Nothing measured here says
-/// whether 4.4% more is closer to the reference or further, and a calibrated
-/// figure is not moved blind. Its ramp gain is 1.0565 against these taps'
-/// 1.032, and a hover reports `taps / divisor` and nothing else (see
-/// [`LEGACY_TAPS`]), so [`rot_divisor_km`] would have to be re-anchored
-/// against the new shape over its own 776 readings rather than left where a
-/// step-edge scale constant put it. The two move together or neither moves.
-const SPLIT_TAPS: [(i32, f64); 4] = [(1, 0.238), (2, 0.342), (3, 0.238), (4, -0.151)];
+/// What this list replaced — 0.238/0.342/0.238/−0.151, ratios
+/// (1, 0.643, 0.130, −0.226) — was admitted by **21 of those 76**. It had
+/// t₁ = t₃, and that is the whole of the error: the 21.0 nm arc it was solved
+/// from has a peak of 19 lattice steps and cannot separate t₁ from t₃, where
+/// these profiles reach 175.9 km and run to 78 steps. The deleted
+/// `COMPOSITE_TAPS` was a 5-tap fit to this same operator with its outer tap
+/// smeared, which is how an 80 km handover that does not exist came to be
+/// believed in the first place.
+///
+/// # Why [`rot_divisor_km`] did not have to move with it
+///
+/// A hover reports `taps / divisor` and nothing else, so the pair is only
+/// fixed up to a common scale and the shape cannot be changed without saying
+/// what happens to the divisor. It is written here at the step gain the old
+/// list carried — Σtₖ = 0.667000, the same to the last digit — and that is
+/// what leaves the divisor exactly where its own campaign put it.
+///
+/// The reason is that the divisor's readings are **step edges**, and a
+/// step edge's peak is Σtₖ and nothing else about the shape: the radial
+/// flanking the edge reads Σ_{k} tₖ·(+A −(−A)) over two arcs. Re-deriving
+/// that campaign's curve from its own logs makes the cancellation explicit —
+/// its `D_GR = D_ours·(ours/GR)` reduces to `J·(Σtₖ/2)/(arc(r)·NROT_GR(r))`,
+/// in which our own divisor and grid drop out entirely, and evaluating that
+/// closed form over the 808 deciding readings reproduces all 60 published
+/// knots to a mean of +0.12% and an rms of 0.31%. So the knots are the
+/// reference's readings and the geometry, this operator enters them only
+/// through Σtₖ, and holding Σtₖ fixed re-anchors the divisor to itself. None
+/// of the curve's three awkward features — the 6.1% rise to 20.4 km, the
+/// steepening over 55–67 km, the flat 8.2 past 81 km — was ever absorbing
+/// operator shape error; a shape error is one factor at every range, since
+/// this operator does not change with range, and could not have produced any
+/// of them.
+///
+/// # What did move
+///
+/// The ramp gain, Σk·tₖ, goes 1.032 → 1.0565, which is the operator reading
+/// constant shear 2.4% higher than it did. That is not free — it is what the
+/// shape correction *is* — and three measurements say it is the right
+/// direction:
+///
+/// * The KFTG 2023-06-22 mesocyclone core, the one real-weather anchor there
+///   is, reads a mean 1.0062 of the reference's four hovered values against
+///   the old list's 1.0094.
+/// * The 60 hovered couplet profiles and the 36 asymmetric ones this operator
+///   is also gated on (`a_couplet_reads_the_operator_its_own_step_response_fixes`)
+///   admit it unchanged, at both parities.
+/// * [`LEGACY_TAPS`] is a *separate* measurement on 1.0° cuts, and the two
+///   operators must read one physical shear consistently. They agreed to 3.5%
+///   before and agree to 1.1% now.
+///
+/// Painted density inside 80 km over the seven-site set rises 10801 → 11214
+/// bins, 3.8%, and it rises in the skirts rather than the cores: the peak is
+/// unchanged and the cell two radials out goes 0.130 → 0.149 of it, toward
+/// the 0.150 the reference reads. The reference paints all four cells on all
+/// 76 profiles; this operator was under-painting the outer two.
+const SPLIT_TAPS: [(i32, f64); 4] = [(1, 0.2241), (2, 0.3433), (3, 0.2526), (4, -0.1530)];
 
 /// The operator for a sweep that is *already* legacy resolution — a TDWR cut,
 /// or a WSR-88D tilt above the super-res ones. Antisymmetric, at row offsets
@@ -961,11 +1017,18 @@ const SPLIT_TAPS: [(i32, f64); 4] = [(1, 0.238), (2, 0.342), (3, 0.238), (4, -0.
 /// Twelve hovered readings — a three-range step ladder at 32.2/39.1/45.9 km
 /// and the couplet's four distinct classes — fit these two taps with a worst
 /// residual of 0.026, under the lattice the reference quantizes its own output
-/// on. Their ramp gain, Σ2k·tₖ = 1.055, is the one number that is *not* the
-/// split operator's (Σk·tₖ over two rows, 1.032): one shear reads 2.2% higher
+/// on. Their ramp gain, Σ2k·tₖ = 1.0686, is the one number that is *not* the
+/// split operator's (Σk·tₖ over two rows, 1.0565): one shear reads 1.1% higher
 /// on a sweep collected at 1.0° than on one collected at 0.5°, because the
 /// reference's coarse-grid operator is a narrower one and not the same taps in
 /// row units.
+///
+/// That 1.1% is a gap between two independent measurements — these taps off
+/// 1.0° cuts, [`SPLIT_TAPS`] off 0.5° ones — and it used to be 3.5%. Most of
+/// it was the super-res operator's shape error, and correcting that shape
+/// closed it without either measurement being touched. What remains is small
+/// enough that a single hovered ramp cannot resolve it, so it is left as read
+/// rather than reconciled.
 ///
 /// # Scale and shape are one measurement, and it was re-taken
 ///
@@ -3760,10 +3823,13 @@ mod tests {
 
         // Gate 200 → 50.25 km: inside the super-res operator's domain. Its
         // ramp gain is Σ t·o over the legacy arc, the same on both sides:
-        // ĉ₂ + 2(ĉ₁−ĉ₂) + 3ĉ₂ + 4ĉ₃ = 1.032. The reference reads this gain
-        // directly — a 6 m/s-per-degree synthetic ramp at 21.0 nm reads 0.45
-        // there, against this operator's 0.450 and the old split operator's
-        // 0.502 (measured, KLOT/KMSX/KLWX; see [`SPLIT_TAPS`]).
+        // Σk·tₖ = 1.0565. The reference reads this gain directly — a
+        // 6 m/s-per-degree synthetic ramp at 21.0 nm reads 0.45 there,
+        // against this operator's 0.461, the shape it replaced's 0.450 and
+        // the pre-pairlab operator's 0.502 (measured, KLOT/KMSX/KLWX; see
+        // [`SPLIT_TAPS`]). One hovered ramp is one lattice interval —
+        // 0.45 means [0.436, 0.475] — so it admits the first two and not the
+        // third; it is the 76 step profiles that separate the first two.
         let range_nm = (0.25 + 200.0 * 0.25) / KM_PER_NM;
         let gain: f64 = SPLIT_TAPS.iter().map(|&(o, t)| o as f64 * t).sum();
         let expected = k * gain / rot_divisor(range_nm);
@@ -4048,8 +4114,8 @@ mod tests {
     /// The two samplings do not read the same number, and that is not the
     /// divisor: it is that the reference uses a *different operator* on a grid
     /// that is already legacy resolution. [`LEGACY_TAPS`] carries a ramp gain
-    /// of 1.055 against the split operator's 1.032, so the same 6 (m/s)/km
-    /// field reads 1.022 of itself on the coarser sweep — measured, not
+    /// of 1.0686 against the split operator's 1.0565, so the same 6 (m/s)/km
+    /// field reads 1.011 of itself on the coarser sweep — measured, not
     /// chosen: the taps are the ones the reference's own hovered step and
     /// couplet profiles solve to, against the divisor curve their scale is
     /// anchored to.
@@ -4119,7 +4185,7 @@ mod tests {
         }
 
         // The whole of the difference is the ratio of those two gains —
-        // 1.0221 — at every range, and none of it is the divisor.
+        // 1.0115 — at every range, and none of it is the divisor.
         for j in [100usize, 200, 300, 380] {
             let ratio = coarse_nrot[90][j] / fine_nrot[180][j];
             assert!(
@@ -4275,7 +4341,11 @@ mod tests {
             );
             compared += usize::from(a.is_finite());
         }
-        assert_eq!(compared, 713, "the compared row read mostly ND");
+        // 713 until the operator's shape was corrected. The peak is unchanged
+        // and the skirts are not, so one more of the 720 bins on this row
+        // clears [`SIGNIFICANT`]; the roll-invariance this test exists for is
+        // asserted above and is untouched.
+        assert_eq!(compared, 714, "the compared row read mostly ND");
 
         let coarse = (read(360, 1.0, 0), read(360, 1.0, 1));
         let mut compared = 0;
@@ -4563,17 +4633,25 @@ mod tests {
     /// profile, **and reads a step at a whole degree exactly as it reads one
     /// at a half degree**.
     ///
-    /// The classes are the operator's cumulative sums from the outside in —
-    /// which is what a step response *is* for a zero-sum operator — and the
-    /// reference's own readings at 21.0 nm on a ±8 m/s step are printed
-    /// beside them:
+    /// The classes are the operator's tail sums from the outside in — the
+    /// radial m out from the edge reads Σ_{k>m} tₖ, which is what a step
+    /// response *is* for a zero-sum operator — and the reference's own
+    /// readings at 21.0 nm on a ±8 m/s step are printed beside them:
     ///
     /// ```text
-    ///   radials flanking the edge   ĉ₁+ĉ₂+ĉ₃ = 0.667   0.780   GR 0.77
-    ///   one further out             ĉ₂+(ĉ₁−ĉ₂)+ĉ₃      0.501   GR 0.49
-    ///   two further out             ĉ₂+ĉ₃              0.102   GR 0.10
-    ///   three further out           ĉ₃                −0.176   GR −0.18
+    ///   radials flanking the edge   t₁+t₂+t₃+t₄ = 0.667   0.780   GR 0.77
+    ///   one further out             t₂+t₃+t₄              0.518   GR 0.49
+    ///   two further out             t₃+t₄                 0.116   GR 0.10
+    ///   three further out           t₄                   −0.179   GR −0.18
     /// ```
+    ///
+    /// This arc cannot separate the shape and is not what fixed it. Its peak
+    /// is 19 lattice steps, so each cell is an interval of ±0.0198 and the
+    /// intersection over the four cells admits both this operator and the
+    /// one it replaced — the 0.518 above and the 0.49 the reference reports
+    /// are one lattice step apart under a peak the profile leaves free. What
+    /// pins the shape is the same profile read out to 175.9 km, where the
+    /// peak runs to 78 steps ([`SPLIT_TAPS`]).
     ///
     /// Both boundaries carry the same profile because the reference does:
     /// 36 hovered profiles over six sites, three at whole-degree azimuths and
@@ -4600,7 +4678,13 @@ mod tests {
         let n = 720;
         let gates = 800; // to 200.25 km, so a gate past 80 km is a gate here
         let azimuths = ring_azimuths(n); // i·0.5°, pairs at whole degrees
-        let (c1, c2, c3) = (0.580, 0.238, -0.151);
+        // The step response is the operator's tail sums, outermost first.
+        // Taken from the taps rather than written out, because t₁ ≠ t₃ and an
+        // earlier spelling of these classes quietly assumed they were equal —
+        // which is the shape error the 175.9 km profiles found.
+        let tail: Vec<f64> = (0..SPLIT_TAPS.len())
+            .map(|m| SPLIT_TAPS[m..].iter().map(|&(_, t)| t).sum())
+            .collect();
 
         // Radial 90 is the first +8 radial of a step at az 45.0, a boundary
         // *between* whole-degree pairs; radial 91 is the first of a step at
@@ -4618,10 +4702,10 @@ mod tests {
                 let arc_legacy = range_km * 1.0_f64.to_radians();
                 let scale = 16.0 / arc_legacy / rot_divisor_km(range_km);
                 let class = [
-                    (c1 + c2 + c3) * scale,
-                    (c2 + (c1 - c2) + c3) * scale,
-                    (c2 + c3) * scale,
-                    c3 * scale,
+                    tail[0] * scale,
+                    tail[1] * scale,
+                    tail[2] * scale,
+                    tail[3] * scale,
                 ];
                 for (radial, expect) in [
                     (first_plus - 1, class[0]),
