@@ -1221,6 +1221,31 @@ impl RenderDispatcher {
     /// estimate off the sweep's own extremes where it does not. Passing an
     /// empty table is not an error and not a compile failure; it is the
     /// plan view estimating a limit the section pane beside it was told.
+    /// # Budget first, extraction second
+    ///
+    /// The `render_slot_free` gate below is not a duplicate of the one inside
+    /// [`spawn_render`](Self::spawn_render): it is the same gate asked *before*
+    /// the extraction rather than after it. `RenderInput::extract` walks the
+    /// sweeps this render reads and copies their gates out — a whole-volume
+    /// product's payload is every velocity tilt in the volume — and it ran
+    /// unconditionally, so a pane that then found the budget full had already
+    /// spent that walk on the frame thread and threw the payload away.
+    ///
+    /// It is not a one-off, which is what makes it worth a gate. Nothing about
+    /// a refused dispatch is recorded — no slot taken, no `render_in_flight`
+    /// set — so the pane asks again on the very next frame, and pays again, for
+    /// as long as the budget stays full. Measured on this volume corpus at
+    /// 0.1–1.0 ms a pane for a single tilt and 0.7–2.4 ms for a four-pane split
+    /// of storm-relative velocity, *per frame*. It matters most on wasm, where
+    /// [`MAX_CONCURRENT_RENDERS`] is 1 and so any second render at all is a
+    /// starved frame for as long as the first one runs.
+    ///
+    /// This is the shape [`spawn_section_render`](Self::spawn_section_render)
+    /// has always had and that [`render_slot_free`](Self::render_slot_free)
+    /// exists for; the plan view is joining its siblings on it. Advisory for
+    /// the reason that function documents — the count can move underneath —
+    /// and a false negative costs a frame's retry, exactly as `spawn_render`'s
+    /// own refusal does.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_level2_render(
         &mut self,
@@ -1232,6 +1257,9 @@ impl RenderDispatcher {
         sender: std::sync::mpsc::Sender<RenderResponse>,
         window: Option<WindowRef>,
     ) {
+        if !self.render_slot_free() {
+            return;
+        }
         let product = params.product;
         let elevation = params.elevation;
         let lat = params.lat;
@@ -1603,3 +1631,6 @@ mod section_payload_cache_tests;
 
 #[cfg(test)]
 mod raster_size_tests;
+
+#[cfg(test)]
+mod budget_order_tests;
