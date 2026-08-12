@@ -228,6 +228,13 @@ pub struct VolumeUniform {
     /// is wrong and someone will otherwise make it. If a future change removes
     /// the amplification — a Linear-sampled palette, or a march whose stride
     /// does not come off the grid at all — re-measure before correcting.
+    ///
+    /// The absolute figures carry about a percent of setup drift: a second
+    /// instrument, built independently against the same volume and the same
+    /// boxes, read 31.13 where the first read 31.49, and the difference is
+    /// unexplained. Each comparison above is within one run, and the margins
+    /// they turn on are far wider than the drift — but no single number here is
+    /// reproducible to better than that.
     pub grid_dims: [u32; 3],
     /// Light direction in box space. Normalised by the shader.
     pub light_dir: [f32; 3],

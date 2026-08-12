@@ -1825,6 +1825,49 @@ struct VoxelRow<'grid> {
 /// Polar from the site and back, so this is the same tangent plane the
 /// resampler's per-cell mapping uses and a centre *at* the site lands exactly
 /// on `(0, 0)`.
+///
+/// # The lattice is not anchored, and that was measured rather than assumed
+///
+/// Cell centres sit at `x0 + (i + 0.5) · pitch`, so a box that moves or
+/// resizes puts them over different ground: two builds of one volume at two
+/// boxes sample it on lattices with no common point. The obvious repair is to
+/// snap the box so a cell centre lands exactly on the radar, which every pitch
+/// would then share — and at a 4:1 pitch ratio that nests the coarse lattice
+/// strictly inside the fine one. **It is not worth doing.**
+///
+/// Measured on a real KTLX volume, drawing a held 100 km grid cropped into a
+/// freshly requested 25 km box and comparing it against the grid built for
+/// that box — the moment a zoom hands over:
+///
+/// ```text
+/// unanchored          33.975 mean |dRGB|/255, 83.2% of pixels past 8/255
+/// both axes anchored  33.470                  82.7%
+/// ```
+///
+/// 1.5% on the product palette, 2.5% at a quarter-cell march step, 2.7% on a
+/// smooth ramp; the alpha-weighted centroid delta gets *worse*, 0.403 to 0.628
+/// px. The mechanism fires exactly as the arithmetic says — in texel
+/// coordinates the unanchored crop reads `0.25·p + 96.125`, so no pixel ever
+/// lands on a coarse texel centre, and anchored reads `0.25·p + 96.375`, so
+/// every fourth one lands dead on `i + 0.5`, residual phase zero to nine
+/// places. It simply buys half a unit of thirty-four.
+///
+/// The control beside it is why. Moving the *settled* box by half a fine cell
+/// — 98 metres — and rebuilding changes the picture by 28.090, **83% of the
+/// whole handover discontinuity, with no stand-in involved at all.** A
+/// resampled field is that sensitive to any sub-cell change of its box. Lattice
+/// phase is not a fixable relationship between two grids: at a 4:1 ratio the
+/// held grid is four times too coarse for the box it is drawn in, and no
+/// alignment repairs a resolution deficit.
+///
+/// The cost avoided: the snap has to go *inward* to keep the containment the
+/// floor depends on, so it needs the per-axis cell counts threaded through this
+/// signature, and every grid fixture's ranges move — all for a change nobody
+/// can see.
+///
+/// One camera, one site, one zoom ratio. Anchoring may still matter at ratios
+/// near 1, which is the regime where an isolated half-cell phase change was
+/// worth 21.19 of the same units. That is not the regime a zoom is in.
 pub fn horizontal_ranges_km(
     centre: (f64, f64),
     half: HalfExtentKm,

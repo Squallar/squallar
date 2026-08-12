@@ -1576,6 +1576,43 @@ fn floor_lanes(
 /// [`rustdar_radar::voxel::horizontal_ranges_km`] — so they are bit-equal and
 /// the affine is exactly the identity.
 ///
+/// # What the handover looks like, measured — nothing moves
+///
+/// A user reported the "bands" of the voxels *shifting* when the fresh grid
+/// replaces the held one. They do not, and this is the paragraph to read before
+/// trying to stop them.
+///
+/// Measured on a real KTLX volume at a 100 km → 25 km zoom, rendering the
+/// cropped held grid and the freshly built one at the identical camera and box:
+/// the best whole-pixel alignment between the two frames is **(0, 0)** on both
+/// a luma cross-correlation and a mask IoU, the correlation peak is sharp and
+/// centred, and the alpha centroid moves **0.15 px**. The instrument can see a
+/// translation when there is one — a control that shifts the box by exactly one
+/// cell registers at exactly (+1, 0) — so this is a measurement and not a
+/// failure to detect.
+///
+/// What actually happens is that **83.8% of painted pixels re-colour by more
+/// than 8/255 while the picture stays registered**. Band *boundaries* relocate
+/// by a fraction of a pixel across a palette that is sampled `Nearest`, and a
+/// contour crossing a colour step is what reads as motion. The amplifiers, by
+/// measured size: the stepped palette is worth 5.1× (33.98 against 6.18 on a
+/// smooth ramp), and the march's own sample comb about 47% (33.98 against 18.17
+/// with both sides marched at a quarter cell). Neither is a property of the
+/// stand-in.
+///
+/// **And neither is the artefact.** Move the settled box by half a fine cell —
+/// 98 metres — and rebuild, with no stand-in anywhere in the frame, and the
+/// picture changes by 28.090 of those same units: 83% of the whole handover
+/// discontinuity. This is what a resampled field does when its box moves at
+/// all. The crop did not create it; it made it *visible*, because before the
+/// crop the pane blanked between the two pictures and nobody ever saw them back
+/// to back.
+///
+/// Two repairs were tried against it and both are recorded where someone would
+/// reach for them: correcting the cell metric (`VolumeUniform::grid_dims`)
+/// makes it worse in every configuration, and anchoring the resample lattice on
+/// the site ([`rustdar_radar::voxel::horizontal_ranges_km`]) buys 1.5%.
+///
 /// # Zooming out: real data in the middle and nothing outside it
 ///
 /// Zooming in, the requested box is inside the held grid and the picture is
