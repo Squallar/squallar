@@ -2245,6 +2245,40 @@ impl App {
     /// 1:1-on-reopen rule true: a learned position is applied before anything
     /// is drawn from it, never as a late correction that shifts a pane the user
     /// is already looking at.
+    ///
+    /// # Why the table is resolved again here
+    ///
+    /// [`ScanInfo::site`] is where the *data* goes: the raster is framed on it
+    /// by `ImageBounds::from_radar_site`, the range ring is drawn round it, and
+    /// the hover readout measures bearing and range from it. The site **marker**
+    /// comes from somewhere else — `sites::radars()`, walked afresh every frame
+    /// by `visible_radar_sites` and rasterized from the same table — and until
+    /// this call the two could disagree.
+    ///
+    /// They disagreed exactly once per radar per install, and it is the case
+    /// that matters: the first session in which a volume states a position the
+    /// seed does not have. `ScanInfo::from_scan` takes the volume's word
+    /// immediately, `sites::resolve` runs only at startup, so for the rest of
+    /// that session the icon and the label sat on the seeded coordinates while
+    /// the echo, the ring and the readout stood on the volume's. Bounded — the
+    /// largest step in the archive is `KTLX`'s 43 m re-survey — but it is a
+    /// radar drawn beside its own range ring, which is precisely the kind of
+    /// disagreement a user reads as "one of these is a bug".
+    ///
+    /// Only on the frame something is genuinely learned, which is what
+    /// [`SitePositions::learn`](crate::site_positions::SitePositions::learn)'s
+    /// return value is for: every later volume of that session restates the same
+    /// position, and `sites::resolve` on an unchanged fix set is a no-op that
+    /// does not even take the write lock.
+    ///
+    /// **This is not the "late arrival" the startup resolutions exist to avoid.**
+    /// That rule is about a position or a name appearing under a user who is
+    /// already looking at the radar it names — a store read that lands after the
+    /// first paint, a catalogue that lands off the network — and both of those
+    /// still happen strictly before any frame. Here the row moves on the very
+    /// frame its own volume moves the data, so the marker and the picture step
+    /// together rather than apart, and the texture generation is bumped so the
+    /// rasterized icons are redrawn with them rather than one poll later.
     fn scan_info_learning_position(
         &mut self,
         scan: &nexrad_model::data::Scan,
@@ -2261,7 +2295,18 @@ impl App {
             && let Some(position) = info.site_position
         {
             let store = self.platform.config_store();
-            self.site_positions.learn(store.as_deref(), site, position);
+            let learned = self.site_positions.learn(store.as_deref(), site, position);
+            // `store` borrows `self.platform`; the resolve below wants two other
+            // fields and the bump wants `self.gui`.
+            drop(store);
+            if learned {
+                rustdar_radar::sites::resolve(
+                    self.site_positions
+                        .fixes()
+                        .chain(self.site_catalogue.fixes()),
+                );
+                self.gui.bump_all_radar_sites_gen();
+            }
         }
         info
     }

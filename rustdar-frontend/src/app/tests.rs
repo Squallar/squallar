@@ -2748,6 +2748,119 @@ fn a_position_a_volume_taught_survives_a_restart() {
     );
 }
 
+/// The map's marker moves with the data the moment a volume teaches a position.
+///
+/// Two tables answer "where is this radar", and until the volume lands they
+/// agree. `ScanInfo::site` is where the *data* goes — `ImageBounds` frames the
+/// raster on it, `render_radar_range_ring` draws the ring round it, the hover
+/// readout measures bearing and range from it — and it takes the volume's word
+/// the instant one arrives. `sites::radars()` is where the *marker* goes:
+/// `visible_radar_sites` walks it every frame for the icons, the labels and the
+/// hit-tests, and `rasterize_radar_sites` draws the texture from the same rows.
+/// That one used to be resolved only at startup, so for the whole of the first
+/// session that decoded a volume for a re-surveyed radar the icon sat beside
+/// its own range ring.
+///
+/// # Why the assertions are on the table and not on a screenshot
+///
+/// `radars()` *is* what the map draws from, and both consumers are pure walks
+/// of it. Checking the row and the walk is checking the marker, without a GPU;
+/// what a frame adds is the rasterized icon, and `bump_all_radar_sites_gen` is
+/// what makes it redraw rather than stay on the old coordinates until the next
+/// thing that happens to bump it.
+///
+/// # `KMQT`
+///
+/// Load-bearing, exactly as `KMBX` is for
+/// [`a_run_with_no_config_store_still_applies_the_volumes_own_position`]: a fix
+/// displaces the row it lands on for the whole process, so this test moves
+/// `KMQT` for every test that runs after it. It must stay an identifier no
+/// other test in the workspace names.
+#[test]
+fn a_taught_position_moves_the_maps_marker_and_not_only_the_data() {
+    use rustdar_radar::site_position::SitePositionSource;
+
+    const SITE: &str = "KMQT";
+    let store = std::rc::Rc::new(MemoryConfigStore::default());
+    // Copied out rather than borrowed: `sites::resolve` below displaces the row
+    // this names, and a `&'static RadarSite` held across it goes on describing
+    // where the radar was *believed* to be — which is the very thing under test.
+    let (seeded_lat, seeded_lon) = {
+        let row = rustdar_radar::sites::get_radar_site(SITE).expect("a seeded row");
+        (row.lat, row.lon)
+    };
+    // A quarter of a degree, in the direction a re-survey would move: far past
+    // anything a rounding could produce.
+    let stated_lat = (seeded_lat + 0.25) as f32;
+    let at = chrono::NaiveDate::from_ymd_opt(2026, 8, 11)
+        .unwrap()
+        .and_hms_opt(1, 48, 0)
+        .unwrap();
+
+    let mut app = headless(TestBridge::desktop().with_store(std::rc::Rc::clone(&store)));
+    let before = app.gui.pane(0).unwrap().radar_sites_render_gen;
+
+    let info =
+        app.scan_info_learning_position(&scan_stating(stated_lat, seeded_lon as f32), SITE, at);
+    assert_eq!(info.site_source, SitePositionSource::Volume);
+    assert!(
+        (info.site.lat - f64::from(stated_lat)).abs() < 1e-5,
+        "precondition: the data must have moved, or there is nothing for the \
+         marker to disagree with: {}",
+        info.site.lat,
+    );
+
+    let row = rustdar_radar::sites::get_radar_site(SITE).expect("still a row");
+    assert!(
+        (row.lat - info.site.lat).abs() < 1e-9,
+        "the map draws {SITE} at {} while its own volume put the data — the \
+         raster, the range ring and the hover readout — at {}",
+        row.lat,
+        info.site.lat,
+    );
+    assert_ne!(
+        row.lat, seeded_lat,
+        "the seeded row is still standing, so nothing above was tested",
+    );
+    // The walk both marker consumers really do, rather than the `get` above.
+    assert!(
+        rustdar_radar::sites::radars()
+            .iter()
+            .any(|r| r.name == SITE && (r.lat - info.site.lat).abs() < 1e-9),
+        "the table's `get` moved but the walk `visible_radar_sites` and \
+         `rasterize_radar_sites` both take did not",
+    );
+    // Nothing else moved with it.
+    assert_eq!(
+        rustdar_radar::sites::radars()
+            .iter()
+            .filter(|r| r.name == SITE)
+            .count(),
+        1,
+        "the fix added a second {SITE} instead of displacing the first",
+    );
+
+    assert_ne!(
+        app.gui.pane(0).unwrap().radar_sites_render_gen,
+        before,
+        "the site texture was not invalidated, so the drawn icons stay on the \
+         seeded coordinates until something else happens to bump it",
+    );
+
+    // Restating the same position is not a fresh lesson: no second resolve, no
+    // second invalidation, so a session does not re-key the texture every
+    // volume.
+    let settled = app.gui.pane(0).unwrap().radar_sites_render_gen;
+    let again =
+        app.scan_info_learning_position(&scan_stating(stated_lat, seeded_lon as f32), SITE, at);
+    assert_eq!(again.site_source, SitePositionSource::Volume);
+    assert_eq!(
+        app.gui.pane(0).unwrap().radar_sites_render_gen,
+        settled,
+        "a volume restating what is already known re-rasterized every site icon",
+    );
+}
+
 /// With nowhere to write, the app still works and simply forgets.
 ///
 /// This is the degradation `LocationGate` chose for the same reason: no
@@ -2755,18 +2868,18 @@ fn a_position_a_volume_taught_survives_a_restart() {
 ///
 /// # Why not `KTLX`
 ///
-/// The last assertion compares against the *seeded* row, and a seeded row is
-/// no longer immovable: `sites::resolve` applies a learned fix onto the row it
-/// lands on, so any sibling test that constructs an app over a store holding a
-/// learned position moves that radar in this process's table.
-/// `a_position_a_volume_taught_survives_a_restart` does exactly that, to
-/// `KTLX`, and running the two in either order made this test fail in release
-/// and pass in debug — which is the worst kind, a test whose outcome is a
+/// A seeded row is no longer immovable: `sites::resolve` applies a learned fix
+/// onto the row it lands on, so any sibling test that teaches a position — from
+/// a store on construction, or from a volume mid-run — moves that radar in this
+/// process's table. `a_position_a_volume_taught_survives_a_restart` does exactly
+/// that, to `KTLX`, and running the two in either order made this test fail in
+/// release and pass in debug: the worst kind, a test whose outcome is a
 /// scheduling accident.
 ///
 /// So this uses `KMBX`, which nothing else in the workspace names. The
 /// identifier is load-bearing: it must stay one no other test learns a
-/// position for.
+/// position for. This test's own middle block teaches it, which is why the last
+/// block asserts on the *source* rather than on coordinates — see there.
 #[test]
 fn a_run_with_no_config_store_still_applies_the_volumes_own_position() {
     use rustdar_radar::site_position::SitePositionSource;
@@ -2792,17 +2905,30 @@ fn a_run_with_no_config_store_still_applies_the_volumes_own_position() {
     assert_eq!(same_run.site_source, SitePositionSource::Learned);
     assert_eq!(same_run.site.lat.to_bits(), info.site.lat.to_bits());
 
-    // And nothing outlives the process: a fresh app is back on the table,
-    // which is where the app was before any of this existed.
+    // And nothing outlives the process: a fresh app remembers nothing, so its
+    // `ScanInfo` falls back to the table rather than recalling anything.
+    //
+    // The *source* is the assertion, and it has to be: the site table is
+    // process-global and `sites::resolve` never forgets, so the lesson above
+    // moved this row for the whole process — deliberately, so that the marker
+    // agrees with the data (`a_taught_position_moves_the_maps_marker_and_not_
+    // only_the_data`). Comparing coordinates would therefore be comparing the
+    // learned value with itself, which passes for the wrong reason. What "with
+    // no store, nothing outlived the process" really means is that this app has
+    // nothing to recall, and `Table` is exactly the answer that says so —
+    // `Learned` is the one it would give if anything had been read back.
     let mut next_run = headless(TestBridge::desktop().without_config_store());
+    assert!(
+        next_run.site_positions.is_empty(),
+        "a run with nowhere to read from came up remembering {} positions",
+        next_run.site_positions.len(),
+    );
     let plain = next_run.scan_info_learning_position(&empty_scan(), SITE, at);
-    assert_eq!(plain.site_source, SitePositionSource::Table);
-    assert_eq!(plain.site.lat, table.lat);
-    assert_ne!(
-        plain.site.lat,
-        f64::from(stated_lat),
+    assert_eq!(
+        plain.site_source,
+        SitePositionSource::Table,
         "with no store, the volume's own position must not have outlived the \
-         process that decoded it",
+         process that decoded it — this run recalled one",
     );
 }
 
