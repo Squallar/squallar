@@ -49,9 +49,9 @@
 //! Every row was also run the slow way, by patching `volume.wgsl` on disk and
 //! running every suite that can observe it — `--lib`, `volume_shader`,
 //! `volume_gpu`, `volume_silhouette`; nothing else in the workspace reads the
-//! shader. **Ten of the thirty-one mutations left that whole set green.** They
-//! are therefore shader properties this repository has no other instrument for,
-//! and the probes below are the only thing standing on them.
+//! shader. **Eleven of the thirty-four mutations left that whole set green.**
+//! They are therefore shader properties this repository has no other instrument
+//! for, and the probes below are the only thing standing on them.
 //!
 //! Coverage-premultiplied reconstruction — four of the ten, and the newest code
 //! in the file:
@@ -70,15 +70,22 @@
 //!     reconstructed index. Identical everywhere except the echo edge — which
 //!     is the entire surface being shaded.
 //!
-//! Shading, two more, and the reason is one fixture: the only
-//! `gradient_shading` test renders a *uniform* grid, whose gradient is zero and
-//! whose shading is therefore the 1.0 early exit.
+//! Shading, three more, and the reason for the first two is one fixture: the
+//! only `gradient_shading` test renders a *uniform* grid, whose gradient is
+//! zero and whose shading is therefore the 1.0 early exit.
 //!
 //!   * the sign of the normal — the difference between a lit cloud and one lit
-//!     from inside; and
+//!     from inside;
 //!   * the displayed-kilometre metric the gradient is divided by, invisible
 //!     unless an anisotropic box meets a gradient with more than one non-zero
-//!     component, because a normal is invariant under isotropic rescaling.
+//!     component, because a normal is invariant under isotropic rescaling; and
+//!   * which kilometre `cell_km`'s **north** lane measures. Every box that
+//!     reaches a shading test is square in x and y, so writing the east extent
+//!     into both horizontal entries renders a bit-identical picture. Only a
+//!     horizontally rectangular box carrying a gradient in x *and* y parts
+//!     them, and until [`probe_wide_lit_gradient`] there was none — the one
+//!     rectangular box in the repository, `volume_gpu`'s 100 × 400 km
+//!     cos-at-pixel fixture, is a floor test with `gradient_shading` off.
 //!
 //! The opacity ramp, two: every shipped fixture leaves `edge_soft_width` at the
 //! hard default, where the ramp is a step and neither its shape nor the foot it
@@ -112,9 +119,10 @@ use rustdar_frontend::volume::uniform::{ISO_OFF, VolumeUniform};
 
 mod gpu_harness;
 use gpu_harness::{
-    attachments, box_from_clip_down, centre, device, equatorial_box_km, equatorial_floor_lanes,
-    eye_outside, gpu_lock, grey_ramp_lut, iso_uniform, opaque_white_lut, palette, planted_mirror,
-    raymarch_once, raymarch_once_with_floor, slab_ramp,
+    attachments, box_from_clip_down, centre, device, equatorial_box_km, equatorial_box_km_of,
+    equatorial_floor_lanes, equatorial_floor_lanes_of, eye_outside, gpu_lock, grey_ramp_lut,
+    iso_uniform, opaque_white_lut, palette, planted_mirror, raymarch_once,
+    raymarch_once_with_floor, slab_ramp,
 };
 
 /// The offscreen is format-independent; the blit is not, and the blit is not
@@ -587,6 +595,149 @@ fn probe_floor_registration(
     vec![cx, cy, painted_fraction(&pixels)]
 }
 
+/// The box every fixture below that is **not square** is drawn on: 2° of
+/// longitude east–west against 1° of latitude north–south, 222.4 × 111.2 km.
+///
+/// 2:1 because that is the shape a 3D pane's own viewport has — a 16:9 pane is
+/// 1.78:1 — and because every floor fixture in *this* file was square, which
+/// makes `floor_colour`'s two reprojection lines interchangeable: on a square
+/// box, writing `box_size_km.x` into the north line, or exchanging the two
+/// lines outright, renders a bit-identical picture.
+///
+/// The repository is not entirely square, and the exception is worth naming
+/// because it is what these two floor rows are measured against:
+/// `volume_gpu`'s `the_floor_takes_cos_at_the_pixels_latitude_not_the_sites`
+/// stands on a 100 × 400 km box, and it catches both of them when they are
+/// patched into `volume.wgsl` on disk. So they are rows that prove *that* test
+/// can fail, not holes it leaves. The shading row below is the hole.
+const WIDE_EAST_DEGREES: f64 = 2.0;
+/// The north–south span of the wide box. See [`WIDE_EAST_DEGREES`].
+const WIDE_NORTH_DEGREES: f64 = 1.0;
+
+/// Where one planted floor patch lands on a **rectangular** box.
+///
+/// [`probe_floor_registration`] with two changes and no others: the box is
+/// [`WIDE_EAST_DEGREES`] × [`WIDE_NORTH_DEGREES`] rather than square, and the
+/// lanes are the ones written for it, so the footprint still covers exactly
+/// the whole mirror and the patch's screen centroid is still a direct read of
+/// the shader's floor mapping.
+///
+/// The patch sits at cell (26, 8) of 32 — east of centre and well south of
+/// it, off both the diagonal and the anti-diagonal — so a mapping that
+/// exchanges the two axes moves it whichever way it exchanges them.
+fn probe_wide_floor_registration(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipelines: &VolumePipelines,
+) -> Vec<f64> {
+    let size = [128u32, 128];
+    let cells = [32u32, 32, 32];
+    let (col_cell, row_cell) = (26u32, 8u32);
+    let side = 64usize;
+    let mut rgba = vec![0u8; side * side * 4];
+    for px in rgba.chunks_exact_mut(4) {
+        px[3] = 255;
+    }
+    let scale = side as u32 / cells[0];
+    for row in (side as u32 - (row_cell + 1) * scale)..(side as u32 - row_cell * scale) {
+        for col in (col_cell * scale)..((col_cell + 1) * scale) {
+            let at = ((row * side as u32 + col) * 4) as usize;
+            rgba[at..at + 4].copy_from_slice(&[255, 0, 0, 255]);
+        }
+    }
+    let floor = planted_mirror(device, queue, pipelines, [side as u32, side as u32], &rgba);
+
+    let mut uniform = VolumeUniform::new(
+        equatorial_box_km_of(WIDE_EAST_DEGREES, WIDE_NORTH_DEGREES),
+        cells,
+    );
+    uniform.box_from_clip = box_from_clip_down(2);
+    uniform.eye_in_box = [0.5, 0.5, 200.0];
+    uniform.extinction_per_km = 1000.0;
+    uniform.gradient_shading = false;
+    uniform.map_floor = true;
+    let (floor_uv, floor_geo) = equatorial_floor_lanes_of(
+        WIDE_EAST_DEGREES,
+        WIDE_NORTH_DEGREES,
+        floor.is_gamma_encoded(),
+    );
+    uniform.floor_uv = floor_uv;
+    uniform.floor_geo = floor_geo;
+    let empty = vec![0u8; (cells[0] * cells[1] * cells[2]) as usize];
+    let lut = opaque_white_lut();
+    let pixels = raymarch_once_with_floor(
+        device, queue, pipelines, cells, &empty, &lut, &uniform, size, &floor,
+    );
+    let (cx, cy) = centroid_fraction(&pixels, size, |px| px[0] > 100 && px[2] < 100);
+    vec![cx, cy, painted_fraction(&pixels)]
+}
+
+/// A field graded across **both horizontal axes** of a box whose two
+/// horizontal axes are 6:1, under gradient shading.
+///
+/// [`probe_lit_gradient`] puts the 12:1 aspect between a horizontal axis and
+/// the vertical, which is what sees `cell_km`'s z lane. Nothing sees its **y**
+/// lane, because every box in this repository has `box_size_km.x ==
+/// box_size_km.y`: writing `box_size_km.x` into both horizontal entries of
+/// `cell_km` renders a bit-identical picture on all of them.
+///
+/// So: 240 × 24 × 20 km, with the index ramping along x and y together. The
+/// honest metric divides the two equal raw differences by 15 km and 1.5 km,
+/// which puts the normal 5.7° off the y axis; a squared metric divides both by
+/// 15 km and puts it at 45°. Against the default light that is 0.590 of
+/// half-Lambert against 0.669, and the mutation moves the worst element of the
+/// reading by 0.043 — eleven 8-bit levels — against this probe's bar of 0.012.
+///
+/// **The column is full from bottom to top**, and that is not tidiness. The
+/// first fixture written here was `probe_lit_gradient`'s block with air above
+/// and below it, and the mutation moved the centre pixel by 0.004 — invisible.
+/// A down-looking ray meets that block's *top face* first, where coverage runs
+/// from 0 to 1 across one 1.25 km cell: the z component of the gradient is
+/// twelve times either horizontal one, the normal is very nearly +z, and which
+/// kilometre the two horizontal lanes were divided by cannot matter. A field
+/// with no variation along the ray is what puts the whole normal in the plane
+/// the mutation acts on.
+fn probe_wide_lit_gradient(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipelines: &VolumePipelines,
+) -> Vec<f64> {
+    let size = [64u32, 64];
+    let cells = [16u32, 16, 16];
+    // Air all round it in x and y, so the render still carries an echo edge as
+    // well as an interior — but nothing changes along z.
+    let mut indices = vec![0u8; (cells[0] * cells[1] * cells[2]) as usize];
+    for z in 0..cells[2] {
+        for y in 3..13u32 {
+            for x in 3..13u32 {
+                let ramp = 30 + 9 * (x + y);
+                indices[((z * cells[1] + y) * cells[0] + x) as usize] = ramp as u8;
+            }
+        }
+    }
+    let mut uniform = VolumeUniform::new([240.0, 24.0, 20.0], cells);
+    uniform.box_from_clip = box_from_clip_down(2);
+    uniform.eye_in_box = eye_outside(2);
+    // Enough to saturate over the 20 km vertical path, so the reading is the
+    // near samples' shading rather than a blend with the background.
+    uniform.extinction_per_km = 0.5;
+    uniform.gradient_shading = true;
+    // Ambient is a floor added to every shading, so it compresses exactly the
+    // difference this probe exists to measure: at the shipped 0.35 the whole
+    // half-Lambert term arrives scaled by 0.65. Turned down rather than off,
+    // because 0 would put the away-facing half of a real surface at black and
+    // stop the reading being a shading at all.
+    uniform.ambient = 0.05;
+    let lut = opaque_white_lut();
+    let pixels = raymarch_once(
+        device, queue, pipelines, cells, &indices, &lut, &uniform, size,
+    );
+    let mut reading = channels(centre(&pixels, size));
+    reading.push(channel_mean(&pixels, 0));
+    reading.push(painted_fraction(&pixels));
+    reading
+}
+
 /// A shallow ray that leaves the box through its side and only meets the
 /// bottom plane far outside the footprint.
 ///
@@ -958,6 +1109,16 @@ static FLOOR_REGISTRATION: Probe = Probe {
     tolerance: 0.008,
     run: probe_floor_registration,
 };
+static WIDE_FLOOR_REGISTRATION: Probe = Probe {
+    name: "the same patch on a 2:1 box, which is the only one whose axes differ",
+    tolerance: 0.008,
+    run: probe_wide_floor_registration,
+};
+static WIDE_LIT_GRADIENT: Probe = Probe {
+    name: "a field graded across both horizontal axes of a 6:1 box",
+    tolerance: 0.012,
+    run: probe_wide_lit_gradient,
+};
 static GRAZING_RAY: Probe = Probe {
     name: "a shallow ray whose plane crossing is outside the footprint",
     tolerance: 0.012,
@@ -1148,6 +1309,24 @@ static MUTANTS: &[Mutant] = &[
         probe: &FLOOR_REGISTRATION,
     },
     Mutant {
+        name: "the floor's north axis is reprojected through the box's east extent",
+        class: "floor",
+        pattern: "let y_km = volume.floor_geo.z + hit.y * volume.box_size_km.y;",
+        replacement: "let y_km = volume.floor_geo.z + hit.y * volume.box_size_km.x;",
+        occurrences: 1,
+        probe: &WIDE_FLOOR_REGISTRATION,
+    },
+    Mutant {
+        name: "the floor's two reprojection lines are exchanged, so the map is transposed",
+        class: "floor",
+        pattern: "let x_km = volume.floor_geo.y + hit.x * volume.box_size_km.x;\n    \
+                  let y_km = volume.floor_geo.z + hit.y * volume.box_size_km.y;",
+        replacement: "let x_km = volume.floor_geo.z + hit.y * volume.box_size_km.y;\n    \
+                      let y_km = volume.floor_geo.y + hit.x * volume.box_size_km.x;",
+        occurrences: 1,
+        probe: &WIDE_FLOOR_REGISTRATION,
+    },
+    Mutant {
         name: "the below-floor fade is deleted and the ground is always at full coverage",
         class: "floor",
         pattern: "let floor_fade = clamp(1.0 + eye.z / FLOOR_BELOW_FADE, 0.0, 1.0);",
@@ -1245,6 +1424,16 @@ static MUTANTS: &[Mutant] = &[
         occurrences: 2,
         probe: &LIT_GRADIENT,
     },
+    Mutant {
+        name: "cell_km measures the north axis with the box's east extent",
+        class: "shading",
+        // Both `shading` and `iso_shading` build this vector, which is why the
+        // count is 2 — the same reason the two rows above carry it.
+        pattern: "        volume.box_size_km.x,\n        volume.box_size_km.y,\n",
+        replacement: "        volume.box_size_km.x,\n        volume.box_size_km.x,\n",
+        occurrences: 2,
+        probe: &WIDE_LIT_GRADIENT,
+    },
     // --- geometry ---------------------------------------------------------
     Mutant {
         name: "unproject drops the perspective divide",
@@ -1321,6 +1510,32 @@ fn every_mutant_still_matches_the_shader_it_mutates() {
         broken.len(),
         MUTANTS.len(),
         broken.join("\n\n"),
+    );
+}
+
+/// The rectangular fixtures' box and lanes are two views of the same two
+/// spans, and at one degree they are the square fixtures exactly.
+///
+/// `equatorial_box_km` stays a `const fn` with its own literals, so this is
+/// what stops the two drifting — and it is the tie the rest of the battery
+/// stands on, since a wide box whose lanes described a different one would
+/// move every probe here for a reason that is not the mutation. Needs no GPU.
+#[test]
+fn the_wide_lanes_are_the_square_ones_at_one_degree() {
+    assert_eq!(equatorial_box_km_of(1.0, 1.0), equatorial_box_km());
+    for gamma in [false, true] {
+        assert_eq!(
+            equatorial_floor_lanes_of(1.0, 1.0, gamma),
+            equatorial_floor_lanes(gamma),
+        );
+    }
+
+    // And the wide box really is wide, on the axis it claims: 2:1 east–west,
+    // so a probe drawn on it can see the two lines apart.
+    let wide = equatorial_box_km_of(WIDE_EAST_DEGREES, WIDE_NORTH_DEGREES);
+    assert!(
+        (f64::from(wide[0] / wide[1]) - WIDE_EAST_DEGREES / WIDE_NORTH_DEGREES).abs() < 1e-5,
+        "the wide box is {wide:?}",
     );
 }
 

@@ -1478,6 +1478,114 @@ fn a_gate_lands_on_the_mirror_pixel_that_renders_it() {
     }
 }
 
+/// **A box whose two horizontal extents differ**, and the two mistakes that
+/// are invisible until one does.
+///
+/// [`default_box`] is square, and on a square box `BoxGeo`'s two sizes are
+/// interchangeable — so is `floor_colour`'s pair of reprojection lines, which
+/// this module restates. A box built with the east extent on both axes, or
+/// with the two exchanged, maps every `hit` exactly where the honest one does.
+///
+/// So this pin runs the mapping **forward from a box position** rather than
+/// from a place on the ground. `mirror_pixel_for_km` cannot see any of this:
+/// it goes km → `hit` → km through [`BoxGeo::hit_at_km`] and back through
+/// [`mirror_uv`], and those two cancel exactly whatever the extents are. What
+/// the shader actually does is start from `hit` — the ray's crossing of the
+/// box's bottom face, in the box's own `0..1` coordinates — and the box is the
+/// only thing that says what ground that is.
+///
+/// 460 × 230 km, centred on the site: the 2:1 footprint a wide 3D pane frames,
+/// with both halves inside the fixture's 237 km raster.
+///
+/// `MUST_MISS_KM` is 50 rather than the 2.3 the mapping pins use, and
+/// deliberately so: these two are not projection subtleties competing with the
+/// honest mapping's own budget. They read a box coordinate against the wrong
+/// axis's extent, which at these probes is 60 to 105 km of ground. A bound
+/// that made them look marginal would be describing them wrongly.
+#[test]
+fn a_rectangular_boxs_two_extents_each_stay_on_their_own_axis() {
+    const HONEST_BUDGET_KM: f64 = 0.9;
+    const MUST_MISS_KM: f64 = 50.0;
+
+    install_radars();
+    let site = rustdar_radar::sites::get_radar_site("KMPX").expect("KMPX is a known site");
+    let mirror = mirror_from_field(site.lat, site.lon, 720, 940, &|_, _| None);
+
+    let honest = BoxGeo {
+        west_km: -230.0,
+        south_km: -115.0,
+        size_x_km: 460.0,
+        size_y_km: 230.0,
+    };
+    // The box the pane used to send, and the box a transposition would build.
+    // Both centred on the site, like the honest one, so the only thing wrong
+    // with either is which extent went on which axis.
+    let squared = BoxGeo {
+        south_km: -230.0,
+        size_y_km: 460.0,
+        ..honest
+    };
+    let swapped = BoxGeo {
+        west_km: -115.0,
+        south_km: -230.0,
+        size_x_km: 230.0,
+        size_y_km: 460.0,
+    };
+
+    let pixel_at = |geo: &BoxGeo, hit: (f64, f64)| -> Option<(f64, f64)> {
+        let uv = mirror_uv(&mirror, geo, hit, Mapping::Honest)?;
+        Some((uv.0 * mirror.side as f64, uv.1 * mirror.side as f64))
+    };
+
+    let mut worst_wrong = [0.0f64; 2];
+    for (dx_km, dy_km) in [(150.0, 100.0), (60.0, 105.0), (-190.0, -60.0)] {
+        let drawn = beacon_pixel(site.lat, site.lon, dx_km, dy_km);
+        // The box position the shader would march to for this ground.
+        let hit = honest.hit_at_km(dx_km, dy_km);
+        assert!(
+            (0.0..=1.0).contains(&hit.0) && (0.0..=1.0).contains(&hit.1),
+            "({dx_km}, {dy_km}) km is outside the box this pin frames: {hit:?}",
+        );
+
+        let mapped = pixel_at(&honest, hit).expect("the probe is on the mirror");
+        let apart = (mapped.0 - drawn.0).hypot(mapped.1 - drawn.1) * mirror.km_per_px;
+        println!("({dx_km:>6.0}, {dy_km:>6.0}) km  hit {hit:?}  honest {apart:>8.3} km");
+        assert!(
+            apart < HONEST_BUDGET_KM,
+            "a gate at ({dx_km}, {dy_km}) km was drawn at raster pixel \
+             ({:.1}, {:.1}) and the rectangular box put it at ({:.1}, {:.1}) — \
+             {apart:.3} km apart, over the {HONEST_BUDGET_KM} km budget",
+            drawn.0,
+            drawn.1,
+            mapped.0,
+            mapped.1,
+        );
+
+        for (slot, (wrong, label)) in worst_wrong.iter_mut().zip([
+            (&squared, "east extent on both axes"),
+            (&swapped, "the two extents exchanged"),
+        ]) {
+            let mapped = pixel_at(wrong, hit)
+                .unwrap_or_else(|| panic!("{label} fell off the mirror at ({dx_km}, {dy_km})"));
+            let apart = (mapped.0 - drawn.0).hypot(mapped.1 - drawn.1) * mirror.km_per_px;
+            println!("({dx_km:>6.0}, {dy_km:>6.0}) km  {label:<26} {apart:>8.3} km");
+            *slot = slot.max(apart);
+        }
+    }
+
+    for (miss, label) in worst_wrong
+        .iter()
+        .zip(["east extent on both axes", "the two extents exchanged"])
+    {
+        assert!(
+            *miss > MUST_MISS_KM,
+            "{label} landed within {miss:.3} km of the drawn gate at every \
+             probe, so no probe here would notice it. The probe set has gone \
+             blind, not the mapping.",
+        );
+    }
+}
+
 // ── The pin: a synthetic storm, both production paths, no file, no GPU ───────
 //
 // The instrument above needs a volume on disk; this is the same comparison as

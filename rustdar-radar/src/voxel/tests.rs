@@ -1160,6 +1160,46 @@ fn the_grid_is_indexed_x_east_y_north_z_up() {
         grid.index_at(east, north, shape.nz - 1),
         Some(NO_DATA_INDEX),
     );
+
+    // ── and on a box that is not square ──────────────────────────────
+    //
+    // Everything above passes with the two half-extents exchanged, because a
+    // quadrant field is a function of sign alone and the box was symmetric.
+    // 60 km east against 25 km north is the case that separates them: the
+    // ranges have to be the extents they were given, each on its own axis.
+    let rect = HalfExtentKm {
+        east_km: 60.0,
+        north_km: 25.0,
+    };
+    let req = VoxelRequest {
+        half_extent_km: Some(rect),
+        ..req
+    };
+    let grid = build_voxels(&scan, &req, SITE.0, SITE.1).unwrap();
+    assert_eq!(grid.x_range_km(), (-60.0, 60.0));
+    assert_eq!(grid.y_range_km(), (-25.0, 25.0));
+
+    // The same four corner columns, now at 49.7 km ground range and azimuths
+    // 66.8°, 293.2°, 113.2° and 246.8° — still one per quadrant, and still
+    // bracketed by the two rungs at row 1.
+    let strong = grid.value_at(east, north, iz).unwrap();
+    assert!(
+        (strong - round_trip_refl(60.0)).abs() < 0.05,
+        "north-east should read the 60 dBZ quadrant on a rectangular box too, \
+         read {strong}",
+    );
+    for (x, y, corner) in [
+        (west, north, "north-west"),
+        (east, south, "south-east"),
+        (west, south, "south-west"),
+    ] {
+        let weak = grid.value_at(x, y, iz).unwrap();
+        assert!(
+            (weak - round_trip_refl(15.0)).abs() < 0.05,
+            "{corner} should read the 15 dBZ background on a rectangular box \
+             too, read {weak}",
+        );
+    }
 }
 
 /// Cell centres at the half-step, proved by a field that **varies along
@@ -1205,6 +1245,55 @@ fn cell_centres_sit_at_the_half_step() {
                      field reads 40 dBZ; got {read}. An edge-sampled column \
                      would read 20 or 60.",
             );
+        }
+    }
+
+    // ── and on a box that is not square ──────────────────────────────
+    //
+    // The half-step above is the same number on both axes, so it cannot see
+    // which extent each axis took. 40 km east against 10 km north makes them
+    // different: the four columns sit at ±20 east and ±5 north, and an extent
+    // read off the wrong axis puts them at ±5 east and ±20 north instead —
+    // 20.6 km of ground range either way, so the *values* agree and only the
+    // centres disagree.
+    let shape = VoxelShape {
+        nx: 2,
+        ny: 2,
+        nz: 3,
+    };
+    let req = VoxelRequest {
+        half_extent_km: Some(HalfExtentKm {
+            east_km: 40.0,
+            north_km: 10.0,
+        }),
+        base_km_msl: 0.5,
+        top_km_msl: 1.7,
+        ..request(shape)
+    };
+    let grid = build_voxels(&scan, &req, SITE.0, SITE.1).unwrap();
+    assert_eq!(
+        grid.cell_centre_km(0, 0, 0).map(|c| (c.0, c.1)),
+        Some((-20.0, -5.0)),
+    );
+    assert_eq!(
+        grid.cell_centre_km(1, 1, 0).map(|c| (c.0, c.1)),
+        Some((20.0, 5.0)),
+    );
+
+    // 20.6155 km of ground range at every one of the four columns, and the
+    // rungs bracket 0.216 … 1.637 km over the antenna there, so all three
+    // rows are still inside.
+    let want = round_trip_refl(20.0 + 20.0f64.hypot(5.0));
+    for ix in 0..2 {
+        for iy in 0..2 {
+            for iz in 0..shape.nz {
+                let read = grid.value_at(ix, iy, iz).unwrap();
+                assert!(
+                    (read - want).abs() < 0.3,
+                    "column ({ix}, {iy}) row {iz} sits at 20.62 km ground \
+                     range, so the field reads {want} dBZ; got {read}",
+                );
+            }
         }
     }
 }

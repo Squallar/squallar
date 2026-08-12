@@ -496,26 +496,53 @@ pub fn mercator_y(lat_deg: f64) -> f64 {
 /// [`PaneMirror::is_gamma_encoded`], which is what the shader is being told
 /// about the texels it is sampling.
 pub fn equatorial_floor_lanes(gamma_encoded: bool) -> ([f32; 4], [f32; 4]) {
+    equatorial_floor_lanes_of(1.0, 1.0, gamma_encoded)
+}
+
+/// [`equatorial_floor_lanes`] for a box `east_degrees` of longitude wide and
+/// `north_degrees` of latitude tall.
+///
+/// The square case is `(1.0, 1.0)`, and everything the doc above says about
+/// why the residual is legitimate holds for any span of this order: `cos φ`
+/// departs from 1 by 1.5e-4 at ±1° and Mercator's y from linear by 2e-5, both
+/// far under the floor sampler's own sub-texel wobble.
+///
+/// The two spans exist so that a fixture built on these lanes can be
+/// **rectangular**. Every one of them was square, which makes `floor_colour`'s
+/// two reprojection lines interchangeable: writing `box_size_km.x` into both,
+/// or exchanging the two lines outright, renders exactly the same picture on a
+/// square box.
+pub fn equatorial_floor_lanes_of(
+    east_degrees: f64,
+    north_degrees: f64,
+    gamma_encoded: bool,
+) -> ([f32; 4], [f32; 4]) {
     // v grows downward through the mirror and Mercator y grows north, so the
     // rate is negative; its magnitude is one whole mirror over the Mercator
-    // span of the box's one degree of latitude. Derived from `mercator_y`
-    // rather than written down: it comes out at -57.29505, and a reader who
+    // span of the box's latitude. Derived from `mercator_y` rather than
+    // written down: at one degree it comes out at -57.29505, and a reader who
     // wants to know why *that* number should be able to see the two calls it
     // came from.
-    let v_per_mercator_y = -1.0 / (mercator_y(0.5) - mercator_y(-0.5));
+    let half_north = north_degrees / 2.0;
+    let v_per_mercator_y = -1.0 / (mercator_y(half_north) - mercator_y(-half_north));
     (
         // u at the site, v at the site, u per degree of longitude east, v per
-        // unit of Mercator y. The site is the mirror's centre, and one degree
-        // of longitude — the box's full width at the equator — is one whole
-        // mirror across.
-        [0.5, 0.5, 1.0, v_per_mercator_y as f32],
+        // unit of Mercator y. The site is the mirror's centre, and the box's
+        // full width in longitude — `east_degrees` at the equator — is one
+        // whole mirror across.
+        [
+            0.5,
+            0.5,
+            (1.0 / east_degrees) as f32,
+            v_per_mercator_y as f32,
+        ],
         // Site latitude, then the box's west and south edges as kilometres
         // east and north of it: the site is the box's centre, so both are half
         // a side to the negative.
         [
             0.0,
-            -DEGREE_BOX_KM / 2.0,
-            -DEGREE_BOX_KM / 2.0,
+            (-east_degrees / 2.0 * f64::from(DEGREE_BOX_KM)) as f32,
+            (-north_degrees / 2.0 * f64::from(DEGREE_BOX_KM)) as f32,
             if gamma_encoded { 1.0 } else { 0.0 },
         ],
     )
@@ -529,4 +556,15 @@ pub fn equatorial_floor_lanes(gamma_encoded: bool) -> ([f32; 4], [f32; 4]) {
 /// here turns on — is exactly what it was before the floor grew a projection.
 pub const fn equatorial_box_km() -> [f32; 3] {
     [DEGREE_BOX_KM, DEGREE_BOX_KM, 10.0]
+}
+
+/// The box extent [`equatorial_floor_lanes_of`] is written for, in the same
+/// two spans. `equatorial_box_km_of(1.0, 1.0)` is [`equatorial_box_km`], and
+/// `the_wide_lanes_are_the_square_ones_at_one_degree` holds them to it.
+pub fn equatorial_box_km_of(east_degrees: f64, north_degrees: f64) -> [f32; 3] {
+    [
+        (east_degrees * f64::from(DEGREE_BOX_KM)) as f32,
+        (north_degrees * f64::from(DEGREE_BOX_KM)) as f32,
+        10.0,
+    ]
 }
