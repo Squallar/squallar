@@ -944,18 +944,81 @@ const GK_DATA_MARGIN: i32 = 1;
 /// the ladder — whose sectors carry no folds, so raw and dealiased agree there
 /// to 0.03 — puts it at 0.44. Only the raw sweep satisfies both.
 ///
-/// # What was not reproduced
+/// # The difference is read as it stands, not the short way round
 ///
-/// A ladder of range ramps that wrap 0, ½, 1, 2, 3 and 4 times across the band
-/// under an unchanged couplet, at KHNX and KMSX. The reference paints all six
-/// rungs, and two of them carry a raw texture of 0.70 and 0.81 — past this
-/// ceiling, which would drop them. The instrument is confounded and does not
-/// settle it: adding a couplet before the wrap moves the wrap boundary in
-/// azimuth, so those two rungs hold a genuine 2·Vny azimuthal step, and what
-/// the reference reads over them is that step (−1.05 and −0.49 where the
-/// couplet alone reads +0.22) rather than the couplet. Painting a fold wall as
-/// rotation is behaviour this module already declines ([`CENSOR_VNY_FRAC`]).
-/// What it costs to leave it here is visible on KCRP below.
+/// The obvious objection to reading the raw sweep is that where velocity
+/// aliases, two gates half a kilometre apart differ by ~2·Vny as an artefact
+/// of the encoding while the beam measured something continuous, so the
+/// difference ought to be wrapped into ±Vny first. It ought not to be, and the
+/// instrument that says so is a range **square wave** rather than the wrapping
+/// ramp that was tried before. A ramp cannot settle it: adding a couplet ahead
+/// of the wrap displaces the wrap boundary in azimuth, so the sector carries a
+/// genuine 2·Vny azimuthal step and what the reference reads over it is that
+/// step, not the couplet.
+///
+/// Each of twelve sectors instead carries a couplet of 0.15·Vny poles over a
+/// square wave of jump `J` whose phase depends on range alone. Nothing is ever
+/// wrapped — |core| + J/2 ≤ 0.99·Vny by construction — so the walls sit at
+/// identical ranges at every azimuth, the sector holds no azimuthal step but
+/// the couplet's own, and the wave is common-mode across azimuth, so the
+/// antisymmetric operator cancels it and the rotation over the couplet is the
+/// clean couplet's at every rung. Rung 1 of the first six carries J = 0 and
+/// certifies the couplet is painted at all, so an ND elsewhere is a refusal.
+/// Painted, of nine points hovered along the 21.0 nm arc:
+///
+/// ```text
+///     walls every 1.5 km    J/Vny  0.00  0.60  1.00  1.35  1.55  1.68
+///       raw texture at KHNX        0.00  0.27  0.47  0.64  0.74  0.80
+///       wrapped at KHNX            0.00  0.27  0.46  0.31  0.20  0.15
+///       KLOT KATX KMSX KTWX         9/9   9/9   0/9   0/9   0/9   0/9
+///       KCRP                        9/9   9/9   0/9   0/9   0/9   9/9
+///       KHNX                        4/9   9/9   0/9   0/9   0/9   0/9
+///       KLWX                        4/9   9/9   0/9   7/9   7/9   5/9
+///
+///     walls every 0.5 km    J/Vny  0.20  0.35  0.50  0.80  1.20  1.68
+///       raw texture at KHNX        0.20  0.37  0.49  0.80  1.18  1.69
+///       all seven sites             9/9 6-9/9 8-9/9 5-9/9   0/9   0/9
+/// ```
+///
+/// The wrapped statistic reads the top three sparse rungs at 0.31, 0.20 and
+/// 0.15, well inside this ceiling, so it predicts all three painted; five of
+/// the seven sites refuse all three and KCRP refuses two. The rungs are the
+/// same fraction of a 3.1× span of Nyquist and read the same to a percent at
+/// every site — KTWX at 35.55 gives 0.28, 0.47, 0.64, 0.73, 0.79 where KHNX at
+/// 11.66 gives 0.27, 0.47, 0.64, 0.74, 0.80.
+///
+/// Wrapping is refused a second time by arithmetic already on this page: on
+/// the noise ladder above no difference comes near 2·Vny, so wrapped and raw
+/// agree there to the third decimal and the ceiling stays 0.44 — and at 0.44
+/// the wrapped statistic returns KHNX's clear air to 17670 painted bins of the
+/// 20878 this ceiling exists to remove. To hold KHNX it would want 0.25..0.30,
+/// which is the same contradiction that ruled out the dealiased field.
+///
+/// # Where this ceiling and the reference part company
+///
+/// It is a compromise, and both halves of it were hovered rather than assumed.
+/// On KCRP the reference paints every one of eleven bins this ceiling drops,
+/// spread over az 41–140° and 8–39 nm. Their raw texture is 0.55–0.97 of the
+/// limit; wrapping only the differences that exceed 1.80·Vny already collapses
+/// it to 0.10–0.39, so what the statistic counts there is aliasing and not
+/// shear. The reference's values track this module's ungated ones: +0.77
+/// against +0.83, +0.53 against +0.56, +0.49 against +0.54. KCRP's
+/// 5411 → 3572 below is rotation the reference reports and this module drops.
+///
+/// On KHNX it is the other way and further. Of twenty bins hovered — twelve
+/// this ceiling drops and eight it still keeps — the reference reads ND at all
+/// twenty, so the 1666 that survive there are over-paint as well.
+///
+/// No member of this family closes both. Every candidate that frees KCRP's
+/// walls — wrapping, wrapping only above 1.70 or 1.80·Vny, the dealiased
+/// field, a narrower window in range or azimuth — costs more at KHNX than it
+/// recovers at KCRP, because at Vny 11.66 incoherent velocity produces
+/// differences near 2·Vny by chance and no per-difference transform can tell
+/// those from a wall. Wrapping above 1.80·Vny is the closest: KCRP 5381, KFTG
+/// 1438, and KHNX back to 3577. What separates the two is coherence, which is
+/// a dealiaser's job, and [`dealias`] smooths KHNX's clear air rather than
+/// refusing it — texture on its output paints 10271 there. That is the thread
+/// to pull, and it is not this constant.
 ///
 /// # What it does on real volumes
 ///
