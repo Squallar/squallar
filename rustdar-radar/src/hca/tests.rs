@@ -1316,8 +1316,9 @@ fn detect_melting_layer_finds_the_wet_snow_ring() {
 /// Know what that catches and what it does not. A one-thread pool runs this
 /// same map-collect-replay code, so it can observe a genuine race and nothing
 /// about the restructure: reversing the replay order passes here. What pins the
-/// order is the pre-existing behavioural suite — `a_rain_field_below_the_layer_`
-/// `classifies_ra_end_to_end` and its neighbours. `voxel/tests.rs` needed a
+/// order is the pre-existing behavioural suite —
+/// `a_rain_field_below_the_layer_classifies_ra_end_to_end` and its
+/// neighbours. `voxel/tests.rs` needed a
 /// restated serial loop for exactly this reason; the difference is that there
 /// the serial loop is *gone*, whereas here `combined`'s order is still the
 /// thing the surrounding tests assert against.

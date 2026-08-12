@@ -312,12 +312,19 @@ pub fn compute_eet(scan: &Scan, radar_height_ft: f64) -> EetGrid {
 /// KLWX. Skipping degrades instead to a genuine neighbour's height, wrong by
 /// the terrain between them rather than by the whole height of the site.
 ///
-/// No shipped row fails to answer [`Datum::Feedhorn`]
-/// (`every_site_answers_the_feedhorn_datum` pins that). Forty-six rows
-/// genuinely cannot answer [`Datum::SiteBase`] — the TDWRs and `LPLA`, whose
-/// volumes report a single height — and for those this returns a neighbour's
-/// ground, which is why no render path asks for that datum. An empty table
-/// answers `None`, having nothing else to say.
+/// No row this install can build fails to answer [`Datum::Feedhorn`]:
+/// `every_placed_row_records_an_elevation` walks a table built from every
+/// shape a fix can take — a WSR-88D volume, a TDWR volume, a station record
+/// onto nothing, and a station record onto a row that already had heights —
+/// and pins that none of them answers `None`. Which rows cannot answer
+/// [`Datum::SiteBase`] is no longer a list of radars but a rule about
+/// sources, because the compiled-in table is gone: only a WSR-88D volume
+/// reports the ground and the tower as two fields, so a published station
+/// record and a TDWR volume both leave the base *unknown* rather than equal
+/// to the feedhorn, which `only_a_volume_can_answer_the_base_datum` states.
+/// For those this returns a neighbour's ground, which is why no render path
+/// asks for that datum. An empty table answers `None`, having nothing else
+/// to say.
 pub fn radar_height_ft_near(lat: f64, lon: f64, datum: Datum) -> Option<f64> {
     let (nearest, _) = crate::sites::nearest_radar_site(lat, lon)?;
     if crate::sites::distance_km(lat, lon, nearest.lat, nearest.lon) > crate::types::BASE_EXTENT_KM

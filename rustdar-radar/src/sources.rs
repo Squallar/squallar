@@ -320,11 +320,11 @@ mod tests {
             "the catalogue's position half GETs {}/radar/stations",
             s.nws_api_base,
         );
-        // Both were reachable from a real origin in headless Chromium *and*
-        // Firefox, with the AWS `noaa-nexrad-level2` bucket as the negative
-        // control that the probe could detect a CORS failure at all. That
-        // bucket grants neither listing nor public GET, and the Google mirror
-        // runs ~3.5 weeks behind with `.tar`-bundled volumes.
+        // The two rejected hosts are refused for what they serve, not for
+        // their CORS headers: `noaa-nexrad-level2` grants neither listing nor
+        // public GET, and the Google mirror runs ~3.5 weeks behind with
+        // `.tar`-bundled volumes. Either would compile and pass every other
+        // test in this file, which is why the host is pinned here by name.
         for url in [
             DataSources::s3_object_url(&s.level2_chunks_bucket, "KTLX/"),
             format!("{}/radar/stations", s.nws_api_base),
@@ -332,8 +332,7 @@ mod tests {
             for rejected in ["noaa-nexrad-level2", "storage.googleapis.com"] {
                 assert!(
                     !url.contains(rejected),
-                    "{url} points at {rejected}, which the catalogue was \
-                     measured against and cannot use",
+                    "{url} points at {rejected}, which the catalogue cannot use",
                 );
             }
             assert!(url.starts_with("https://"), "{url} is not https");

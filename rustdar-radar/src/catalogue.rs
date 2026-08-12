@@ -42,9 +42,15 @@
 //! `pwa_assets.rs`, and the staging loop). `no_new_origin_is_needed_for_the_catalogue`
 //! in [`crate::sources`] asserts that rather than leaving it as a claim.
 //!
-//! Verified from a real origin in headless Chromium *and* Firefox, with the AWS
-//! `noaa-nexrad-level2` bucket as a negative control proving the probe could
-//! detect a CORS failure: both endpoints answer 200 to a browser `fetch()`.
+//! What that test does *not* pin — and nothing else in the tree does either —
+//! is that the two hosts actually answer a cross-origin `fetch()`. That was
+//! checked once by hand from a real origin, and no apparatus for it was
+//! committed, so read it as an observation and not as evidence. It could not
+//! be a regression test in any case: the `Access-Control-Allow-Origin` header
+//! is served by hosts this project does not control, so no commit here can
+//! break it and no commit here can fix it. What a commit here *can* break is
+//! which host gets asked, and that is exactly what the test pins.
+//!
 //! Do not move either to AWS `noaa-nexrad-level2` (grants neither listing nor
 //! public GET) or to the Google mirror (~3.5 weeks stale, `.tar`-bundled).
 //!

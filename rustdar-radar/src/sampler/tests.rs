@@ -2852,8 +2852,8 @@ fn each_guard_draws_its_line_at_its_own_fraction() {
         );
         // The floor the whole `0.50` argument rests on: under a half the
         // rule stops implying the sign-change-and-spread rule it replaced.
-        // `the_seam_rule_is_strictly_stronger_than_the_spread_rule` fails
-        // below this, but only for the fractions its fixtures happen to
+        // `the_straddle_test_needs_both_extremes_near_the_seam` pins the
+        // implication, but only at the fractions its fixtures happen to
         // reach; this refuses to build at all.
         assert!(
             SEAM_PROXIMITY_ACROSS_TILTS >= 0.5,

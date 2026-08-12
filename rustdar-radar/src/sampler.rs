@@ -78,16 +78,24 @@
 //! thing that separates KBMX's two base tilts, so the VCP has to be read and
 //! therefore has to cross the worker boundary.
 //!
-//! It does not cross it yet. `render_input`'s `placeholder_coverage_pattern`
-//! builds an **empty** cut list, so a sampler that tolerated a placeholder
-//! would build a *different ladder in the worker than on the main thread*,
-//! with no error and no `NaN` — the exact silent-divergence class this whole
-//! feature exists to avoid. So [`VolumeSampler::new`] **refuses** an empty cut
-//! table and an `elevation_number` that does not index it, returns a
-//! [`SamplerError`] saying which, and logs it. Until the wire carries the cut
-//! angles the sampler is *unusable* in the worker rather than quietly wrong.
-//! `a_reconstructed_render_input_scan_is_refused` pins that against the real
-//! `RenderInput` round trip rather than against a hand-built placeholder.
+//! It crosses it now. `RenderInput` has carried the cut angles since format
+//! version 6 — the payload is on 9 — and `coverage_pattern` rebuilds the real
+//! table from them, falling back to `placeholder_coverage_pattern` only when a
+//! sweep is missing an angle, because a table with a hole in it would key some
+//! sweeps and mis-key the rest.
+//! `a_reconstructed_render_input_scan_builds_the_identical_ladder` pins that
+//! over the sampler's whole `Debug` ladder — product, rung count, each rung's
+//! geometric elevation in cut order, each rung's wrap-corrected nominal key —
+//! and does it through the bytes rather than through `to_scan`.
+//!
+//! The refusal that stood in for that test survives for the case that is
+//! genuinely empty: a volume joined mid-flight has no cut table yet, so there
+//! is nothing for the payload to carry. [`VolumeSampler::new`] **refuses** an
+//! empty cut table and an `elevation_number` that does not index it, returns a
+//! [`SamplerError`] saying which, and logs it — faithfully unusable in the
+//! worker rather than quietly wrong, which is the silent-divergence class this
+//! whole feature exists to avoid, and which
+//! `a_payload_from_a_volume_with_no_cut_table_is_still_refused` pins.
 //!
 //! # Two more deliberate omissions
 //!
@@ -1817,9 +1825,11 @@ const SEAM_PROXIMITY_ACROSS_GATES: f64 = 0.60;
 ///   replaced.** [`straddles_fold`] fires on `hi − lo > 2f·limit`; at
 ///   `f ≥ ½` that clears half a Nyquist period and so implies the old
 ///   sign-change-and-spread test, and below `½` it does not. That is not a
-///   preference, it is pinned executably in
-///   `the_seam_rule_is_strictly_stronger_than_the_spread_rule`, which fails
-///   for any fraction under `½` on either path.
+///   preference: `the_straddle_test_needs_both_extremes_near_the_seam`
+///   sweeps a ±30 m/s grid against the old rule on both paths and pins the
+///   implication at the fraction that ships, and the `const` assertion in
+///   `each_guard_draws_its_line_at_its_own_fraction` refuses to *build* a
+///   fraction under `½` at all.
 ///
 /// `0.50` is the lowest fraction that keeps that property. It is also where
 /// a decision-maker who charges three false fires per missed fold lands

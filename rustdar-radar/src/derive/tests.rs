@@ -291,9 +291,8 @@ fn srv_subtracts_the_override_motion_radial_by_radial() {
 /// codes 2 and 255 *mean*, and the claim is checked against the numbers
 /// the module doc and `voxel::data_levels_for` state independently. The
 /// second half of the loop — that the voxel ramp agrees with these spans
-/// — is
-/// `the_derived_products_resample_their_own_field_not_the_raw_one`'s
-/// `value_range` assertions.
+/// — is `a_derived_voxel_grid_resamples_the_derived_field`'s `value_range`
+/// assertions.
 #[test]
 fn each_derived_codec_spans_exactly_the_range_its_product_declares() {
     for (product, lo, hi, why) in [
