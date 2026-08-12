@@ -6,12 +6,13 @@
 //! correlates 0.996 with the reference's cursor readouts. It does not yet
 //! paint as widely: over the 7.05–20 nm annulus of KTLX 2025-02-19's lowest
 //! velocity cut the reference paints 5.13% of the bins where this module
-//! paints 2.25%, and the two fields are **aligned, not displaced** — their
+//! paints 2.37%, and the two fields are **aligned, not displaced** — their
 //! overlap peaks at exactly zero shift in both radials and gates, and their
 //! features are the same shape (a median cluster of 3 radials × 4 gates
 //! against 3 × 5). The shortfall is coverage upstream of the derivative
-//! rather than gating; [`COH_AZ_HALF`] carries most of what is left of it,
-//! and a hole in the stencil's window carries the next most.
+//! rather than gating; a hole in the stencil's window carries much of what is
+//! left of it, and [`COH_MAX_STRADDLE`] the rest, now that
+//! [`COH_FOLD_VNY_FRAC`] has taken the wedge out of the second.
 //! The measurement apparatus lives on branch
 //! `campaign-harness`, and so does the calibration record for every constant
 //! whose readings survived — twelve of them kept only the apparatus, and say
@@ -205,20 +206,25 @@ const MIN_RANGE_NM: f64 = 7.05;
 /// **KTLX is the outlier and the accounting above is its portrait.** Where this
 /// module paints at all, the five other storm volumes agree with the reference
 /// 76% to 92% of the time and to a mean |Δ| of 0.03 to 0.09 — better than
-/// KTLX's 0.168 — with the sign right at 96% to 100%. What KTLX has that they
-/// do not is the coherence mask's two wedges ([`COH_MAX_STRADDLE`]), which
-/// refuse 1092 of its reference bins and none of KDMX's, KFTG's, KATX's or
-/// KDDC's.
+/// KTLX's 0.168 — with the sign right at 96% to 100%. What KTLX had that they
+/// did not was the coherence mask's two wedges, which refused 1092 of its
+/// reference bins and none of KDMX's, KFTG's, KATX's or KDDC's.
+/// [`COH_FOLD_VNY_FRAC`] is why: the wedges were the fold crossings of a wind
+/// sitting near the Nyquist limit, counted as incoherence. KTLX now reads 1640
+/// painted, 730 agreeing, precision 0.4451.
 ///
-/// One number moves the other way and is worth naming because nothing here
-/// fixes it. At KCRP the 240 bins the reference refuses average **|1.990|**
+/// One number moves the other way and is worth naming. At KCRP the 240 bins the
+/// reference refuses average **|1.990|**
 /// against |0.338| at the bins the two agree on: 137 are over |1.0|, 110 over
 /// |2.0| and 8 sit at the [`NROT_LIMIT`] clamp, while the reference's own
 /// largest reading anywhere in that annulus is 3.00. High Nyquist and a
 /// tropical wind field, and this module reports rotation off the top of the
 /// reference's scale where the reference reports none. That is a different
-/// defect from the one above — KTLX's spurious bins never reach |2.0| — and it
-/// is unaddressed.
+/// defect from the one above — KTLX's spurious bins never reach |2.0|.
+/// [`COH_FOLD_VNY_FRAC`] takes 213 of those bins away, 112 of them over |1.5|
+/// and all eight at the clamp, because they were computed on velocity this rule
+/// had told the dealiaser to hand back unresolved; the rest is unaddressed and
+/// this accounting has not been re-derived around it.
 ///
 /// # The eighth axis: magnitude and completeness together
 ///
@@ -928,8 +934,10 @@ const MEDIAN_MIN_RAW_OCC: f64 = 0.6;
 /// standing on a falsified half is not a pair.
 ///
 /// So the fill is right, admitting it needs a discriminator this module does
-/// not have — the same one [`COH_MAX_STRADDLE`] turns out to lack — and the
-/// candidate that looked most like one is a number one volume picked.
+/// not have, and the candidate that looked most like one is a number one volume
+/// picked. [`COH_MAX_STRADDLE`] was held to lack the same one; it did not —
+/// [`COH_FOLD_VNY_FRAC`] found it in the statistic rather than beside it, which
+/// is worth trying here too before another axis is looked for.
 fn median_filter(
     vel_grid: &[Vec<f64>],
     raw_grid: &[Vec<f64>],
@@ -2580,6 +2588,76 @@ fn fold_limit_ms(sweep: &VelocitySweep, vel_grid: &[Vec<f64>]) -> Option<f64> {
 /// puts a per-difference boundary between 1.02 and 1.14·Vny.
 const COH_STRADDLE_VNY_FRAC: f64 = 0.90;
 
+/// Along-beam difference **above** which the pair is a fold rather than a
+/// straddle, as a fraction of the cut's own limit.
+///
+/// [`COH_STRADDLE_VNY_FRAC`] bounds the straddling band below and this bounds
+/// it above, because for twelve campaigns it had no upper bound at all and that
+/// is what made the rule unable to tell one clear-air volume from another.
+///
+/// # The rule was answering its own question with the wrong statistic
+///
+/// [`incoherent_velocity`] asks whether *any* assignment of fold branches makes
+/// the velocity continuous. It asked it of `|v[j+dk] − v[j]|` on the velocity
+/// the radar reports, which is already wrapped onto ±Vny. A fold wall is a jump
+/// of very nearly 2·Vny — the true change is small and the wrap supplies the
+/// rest — so every fold wall cleared 0.90·Vny and was counted as evidence that
+/// no fold assignment exists. The doc below conceded it ("aliasing straddles
+/// only along the line the wall runs on") and defended it on the grounds that a
+/// wall is one curve crossing the neighbourhood. That defence holds where the
+/// wind is far from the limit. It fails where the wind approaches it, and that
+/// is exactly the one volume where this rule fired and the reference disagreed.
+///
+/// # Why it fails at KTLX and at no other site
+///
+/// KTLX 2025-02-19 is clear air at Vny 11.49. In its 45°–112.5° quadrant the
+/// radial wind sits at 0.73 of that limit on average with 46–52% of its gates
+/// above 0.85 of it; in the quadrants this rule leaves alone it sits at
+/// 0.21–0.39 with 2.6–4.8% above. Velocity that close to the limit crosses it
+/// on estimator noise, and every crossing is a 2·Vny difference. Split the
+/// straddling pairs by whether they *can* be a fold:
+///
+/// ```text
+///                            |d| in (0.90, 1.30)·Vny    |d| >= 1.30·Vny
+///     KTLX quiet sectors              3.33%                  2.56%
+///     KTLX wedge sectors              3.71%                 14.03%
+///     KHNX quiet sectors              7.36%                  7.62%
+///     KHNX wedge sectors              5.92%                  9.54%
+/// ```
+///
+/// The wedge is a 5.5× excess of fold-shaped differences over an unchanged rate
+/// of everything else. KHNX is high on both everywhere — it really is
+/// incoherent and this rule is right about it. KDMX, KFTG, KATX, KMSX and KDDC
+/// never come near their limit, which is why the rule never fired there.
+///
+/// # Where 1.30 comes from
+///
+/// Bounded below by the reference's own ladders and above by its field, and the
+/// two brackets do not overlap.
+///
+/// **Below.** [`COH_STRADDLE_VNY_FRAC`]'s dense-wave ladder has the reference
+/// refusing a wall of J = 1.20·Vny. A bound at or under 1.20 would excuse that
+/// wall as a fold, so the bound must exceed 1.20. Pure fold-invariance —
+/// reducing the difference modulo 2·Vny, which is the bound 1.10 — is therefore
+/// not available, and it measures worse anyway.
+///
+/// **Above.** KHNX is the null control and reads ND across its whole cut. Swept
+/// through the pipeline with [`COH_MAX_STRADDLE`] held at 0.039, painted bins
+/// inside 80 km:
+///
+/// ```text
+///     upper bound        1.20   1.25   1.30   1.35   1.40   none (as shipped)
+///     KHNX                402     10      0      0      0          0
+///     KTLX               2508   2024   1709   1488   1260       1656
+/// ```
+///
+/// 1.30 is the smallest bound at which KHNX still paints nothing, and therefore
+/// the one that releases the most of KTLX's ground while it does. The screen
+/// this was chosen on rated 1.25 equal; the pipeline does not, because the
+/// dealiaser reads this mask too. Above 1.35 the band stops excusing the folds
+/// that made the wedge and KTLX falls below its shipped coverage.
+const COH_FOLD_VNY_FRAC: f64 = 1.30;
+
 /// Fraction of a neighbourhood's along-beam pairs allowed to straddle before
 /// the sweep is held to carry no coherent velocity there.
 ///
@@ -2618,12 +2696,39 @@ const COH_STRADDLE_VNY_FRAC: f64 = 0.90;
 /// smaller in **both** coordinates — so every downward-closed region admitting
 /// the first admits the second, whatever its shape.
 ///
-/// This is the same shape of result as the along-beam rms that a sibling
-/// campaign ruled out, and it is why no coverage relaxation upstream of here
-/// can be admitted: each one moves KTLX and KHNX together. The discriminator
-/// the reference is using is on an axis this module has not found, and
-/// 0.09 remains the best available reading of a statistic that cannot in
-/// principle separate these two volumes.
+/// # None of that was true of the statistic, only of the unbanded one
+///
+/// Every figure above was read off `|d| > 0.90·Vny` with no upper bound, which
+/// counts a fold crossing as evidence that no fold assignment exists — see
+/// [`COH_FOLD_VNY_FRAC`], which is what closed this. Bounded above at 1.30·Vny
+/// the same two populations separate, over the whole decoded field rather than
+/// thirteen hovers and twenty:
+///
+/// ```text
+///                        KTLX reference-painted        KHNX field
+///     unbanded              0.0254 .. 0.1962        0.1129 .. 0.2039
+///     banded                0.0158 .. 0.0479        0.0420 .. 0.0852
+/// ```
+///
+/// Admitting 99% of KTLX's reference-painted bins releases 78.6% of KHNX's
+/// field unbanded and 1.7% banded.
+///
+/// # Where 0.039 comes from
+///
+/// Two-sided, and measured through the pipeline rather than off the screen.
+/// Painted bins inside 80 km with [`COH_FOLD_VNY_FRAC`] at 1.30:
+///
+/// ```text
+///     threshold          0.030   0.035   0.039   0.042   0.045
+///     KHNX (must be 0)       0       0       0       0      30
+///     KDDC (holdout)      2705    2772    2772    2772    2772
+///     KTLX                1090    1623    1709    1968    2336
+/// ```
+///
+/// Above 0.042 the null control starts painting; below 0.035 the holdout starts
+/// losing ground it keeps everywhere else. 0.039 is the middle of what is left,
+/// with about a tenth of its own value in hand on each side — where 0.09 sat
+/// 2.2% under KHNX's minimum and had no second side at all.
 ///
 /// # What this rule costs, measured against the reference's whole field
 ///
@@ -2634,8 +2739,8 @@ const COH_STRADDLE_VNY_FRAC: f64 = 0.90;
 /// 13 OCR hovers to a mean 0.0076 and GR's own reported min and max (−1.96,
 /// +2.15) to the digit. That is 3546 painted bins over the 7.05–20 nm annulus
 /// instead of thirteen. Against them, the first rule that refuses each one, in
-/// the order [`llsd_nrot`] applies them, before and after [`COH_AZ_HALF`] was
-/// re-shaped:
+/// the order [`llsd_nrot`] applies them, as it stood under the two window
+/// shapes and before this rule's difference was bounded above:
 ///
 /// ```text
 ///                                            ±40 × ±32    ±16 × ±192
@@ -2650,43 +2755,38 @@ const COH_STRADDLE_VNY_FRAC: f64 = 0.90;
 ///     painted                                      434           661
 /// ```
 ///
-/// The 691 bins this rule stopped refusing did not all become paint. 227 did;
-/// 255 of them walked straight into a **hole in the stencil's window**, which
-/// is now the second largest refuser and within reach of the largest. That
-/// number is worth reading twice, because a sibling campaign established that
-/// every one of those holes is one this module made: the raw sweep carries
+/// The 691 bins the re-shaped window stopped refusing did not all become paint.
+/// 227 did; 255 of them walked straight into a **hole in the stencil's window**,
+/// which is now the second largest refuser and within reach of the largest.
+/// That number is worth reading twice, because a sibling campaign established
+/// that every one of those holes is one this module made: the raw sweep carries
 /// velocity at all of them and the dealiaser dropped it, and one missing cell
-/// costs eleven radials.
+/// costs eleven radials. Bounding the difference above moves the bottom line to
+/// 730 and does not re-derive that attribution, which is a per-rule count no
+/// probe in the tree produces.
 ///
-/// # The threshold did not move, and the wedge did not go away
+/// # The wedge
 ///
-/// 0.09 is unchanged, and it did not need re-deriving: it sits inside the gap
-/// at every window geometry swept, and the geometry was chosen with it held
-/// fixed. What moved is the shape of the support — see [`COH_AZ_HALF`].
+/// Reshaping the support left one component holding 81% of KTLX's mask, 173 of
+/// 720 radials wide, with 984 of the reference's bins inside it, and it was not
+/// an artefact of the window: the ground under it really did straddle
+/// everywhere by the unbanded statistic. It was an artefact of the statistic.
+/// Banding the difference above breaks it up — 45 radials and 123 reference
+/// bins — because what filled it was the fold crossings of a wind sitting at
+/// 0.73 of the Nyquist limit, not incoherence. [`COH_FOLD_VNY_FRAC`] carries
+/// that measurement.
 ///
-/// The mask that shape produces is smaller and narrower but it is the same
-/// object: 16 775 flagged bins over the annulus become 13 994, in 127
-/// components against 103, and the largest still holds three quarters of it
-/// and spans 173 of 720 radials where it spanned 197. The reference paints
-/// 984 bins inside that component where it painted 1200. So a quadrant is
-/// still cut out of an otherwise aligned field, and **most of it is not an
-/// artefact of the window's extent** — the ground under it really does
-/// straddle everywhere, and the reference really does paint there anyway.
-/// Distance from a censored bin to the nearest straddling pair does not
-/// separate the two volumes either: the bins the reference paints and this
-/// rule refuses at KTLX sit a median 2.0 bins from straddle evidence, and
+/// Distance from a censored bin to the nearest straddling pair separates
+/// nothing and was not what was wrong: the bins the reference paints and this
+/// rule refused at KTLX sit a median 2.0 bins from straddle evidence, and
 /// KHNX's twenty ND bins sit the same 2.0.
-///
-/// Whatever the reference is using to tell KTLX's clear air from KHNX's, it is
-/// still not this statistic, and it is still not this statistic's support. The
-/// window was the wrong shape; it was not the whole answer.
 ///
 /// So the clear-air difference is not sparseness spread over the sweep and it
 /// is not a registration error — the two fields' overlap peaks at exactly zero
 /// shift in radials and in gates, falling off symmetrically either way, and
 /// where both carry a value they agree: over the unbiased 240-point ring,
 /// mean |Δ| 0.038 with the sign right 9 times in 9.
-const COH_MAX_STRADDLE: f64 = 0.09;
+const COH_MAX_STRADDLE: f64 = 0.039;
 
 /// The neighbourhood the straddling fraction is counted over: half-spans in
 /// rows and in gates.
@@ -2745,9 +2845,12 @@ const COH_RANGE_HALF: i32 = 192;
 /// The question a dealiaser can actually answer is not "is this smooth" but
 /// "could any assignment of fold branches make it continuous". Shear is not
 /// incoherence — a mesocyclone's own gradient is far under the limit and
-/// straddles nothing — and neither is aliasing, which straddles only along the
-/// line the wall runs on. What straddles everywhere is velocity that is not a
-/// measurement of one air motion at all.
+/// straddles nothing — and neither is aliasing, which is a fold and is what a
+/// dealiaser is for. What straddles is velocity that is not a measurement of
+/// one air motion at all: a difference too large to be one continuous reading
+/// ([`COH_STRADDLE_VNY_FRAC`]) and too small to be a fold
+/// ([`COH_FOLD_VNY_FRAC`]). For twelve campaigns only the first half of that
+/// was tested, and the missing half is what cut a wedge out of KTLX.
 ///
 /// # What is done with it, and why that is a refusal
 ///
@@ -2773,21 +2876,47 @@ const COH_RANGE_HALF: i32 = 192;
 ///
 /// Lowest super-res velocity cut, painted bins (|NROT| ≥ [`SIGNIFICANT`])
 /// inside 80 km. "off" is this rule removed entirely, "±40 × ±32" the window
-/// it shipped with, "±16 × ±192" the one [`COH_AZ_HALF`] now declares:
+/// it shipped with, "unbanded" the ±16 × ±192 window at 0.09 with no upper
+/// bound on the difference, "banded" this rule as it now stands:
 ///
 /// ```text
-///                                              off   ±40 × ±32   ±16 × ±192
-///     KHNX 2024-12-16  clear air, Vny 11.66    9927           0            0
-///     KTLX 2025-02-19  clear air, Vny 11.49    2539        1230         1656
-///     KBLX 2025-02-19  clear air, Vny 11.17       0           0            0
-///     KAMA 2025-02-19             Vny 11.55       —        1952         2082
-///     KCRP 2017-08-26  Harvey,    Vny 31.52       —        5288         5616
-///     KDMX 2022-03-05             Vny 27.93       —        2947         2938
-///     KFTG 2023-06-22             Vny 24.01       —        1571         1571
-///     KLOT 2024-12-16             Vny 23.96       —          72           72
-///     KMSX 2022-06-04             Vny 24.21       —          34           34
-///     KABR 2025-02-19             Vny 33.33       —          51           51
+///                                              off   ±40 × ±32   unbanded   banded
+///     KHNX 2024-12-16  clear air, Vny 11.66    9927           0          0        0
+///     KTLX 2025-02-19  clear air, Vny 11.49    2539        1230       1656     1709
+///     KBLX 2025-02-19  clear air, Vny 11.17       0           0          0        0
+///     KBLX 2024-12-16  clear air, Vny 11.17       —           —          8       53
+///     KVNX 2025-02-19  clear air, Vny 11.55       —           —       3383     3394
+///     KAMA 2025-02-19             Vny 11.55       —        1952       2082     2082
+///     KCRP 2017-08-26  Harvey,    Vny 31.52       —        5288       5634     5328
+///     KDMX 2022-03-05             Vny 27.93       —        2947       2948     2957
+///     KFTG 2023-06-22             Vny 24.01       —        1571       1571     1571
+///     KATX 2025-02-19             Vny 25.32       —           —       2001     1997
+///     KLOT 2024-12-16             Vny 23.96       —          72         72       72
+///     KMSX 2022-06-04             Vny 24.21       —          34         34       34
+///     KABR 2025-02-19             Vny 33.33       —          51         51       51
+///     KTWX 2025-01-15             Vny 35.55       —           —          0        0
+///     KDDC 2024-12-16  holdout,   Vny 25.84       —           —       2772     2772
 /// ```
+///
+/// Only the low-Nyquist clear-air volumes move, which is where the fold
+/// crossings this rule used to count as incoherence are. Against the
+/// reference's nine decoded fields over the 7.05–20 nm annulus, with both sides
+/// read at |NROT| ≥ [`SIGNIFICANT`] so the reference's own |v| < 0.25 gap
+/// counts as unpainted:
+///
+/// ```text
+///                     ours          agreeing        precision
+///     KTLX      1559 -> 1640     661 ->  730    0.4240 -> 0.4451
+///     KCRP      1098 ->  941     858 ->  905    0.7814 -> 0.9617
+///     KDMX      1447 -> 1453    1104 -> 1107    0.7630 -> 0.7619
+///     KHNX / KFTG / KATX / KLOT / KMSX / KDDC   unchanged
+/// ```
+///
+/// KCRP is the one to read twice. The rule's mask reaches the dealiaser as well
+/// as [`llsd_nrot`], so releasing ground there does not only add paint: 213 bins
+/// stop being painted, 112 of them at |NROT| ≥ 1.5 and eight at the ±5.00 clamp,
+/// and the reference paints **none** of the 213. Bins handed back unresolved
+/// under [`DealiasKnobs::refuse_incoherent`] were the source of those extremes.
 ///
 /// The "off" column is why the window's shape was worth a campaign: at KTLX
 /// removing this rule outright doubles what the module paints **at unchanged
@@ -2806,11 +2935,18 @@ const COH_RANGE_HALF: i32 = 192;
 /// none painted. The KFTG 2023-06-22 mesocyclone core is bit-identical under
 /// either window — +1.68, +1.50, +1.59, +1.75 at az 90.8/91.3° and 7.5/8.0 nm,
 /// against the reference's +1.64, +1.52, +1.56, +1.76 — because the ground
-/// this refuses is nowhere the stencil reads there. And neither window moves a
-/// rung of any synthetic ladder: 195 of the 216 rungs across the noise,
-/// common-mode, fine, azimuthal and square-wave families at seven sites agree
-/// with the reference, disagreeing on the same 21, with the same 155 cells
-/// exactly right.
+/// this refuses is nowhere the stencil reads there — and it is bit-identical
+/// again with the difference bounded above, +1.6839 +1.4955 +1.5884 +1.7520
+/// re-measured.
+///
+/// And neither window nor the band moves a rung of any synthetic ladder: 195 of
+/// the 216 rungs across the noise, common-mode, fine, azimuthal and square-wave
+/// families at seven sites agree with the reference, disagreeing on the same 21,
+/// with the same 155 cells exactly right. The square-wave family was the one to
+/// check, since its walls at J = 1.20, 1.35, 1.55 and 1.68·Vny all sit above
+/// [`COH_FOLD_VNY_FRAC`] and are now excused as folds here: every one of those
+/// cells is unchanged, because [`CENSOR_VNY_FRAC`] and not this rule is what
+/// decides them.
 fn incoherent_velocity(
     raw: &[Vec<f64>],
     rows: crate::azimuth::Rows,
@@ -2820,6 +2956,7 @@ fn incoherent_velocity(
 ) -> Vec<bool> {
     let n = raw.len();
     let tol = COH_STRADDLE_VNY_FRAC * nyquist;
+    let fold = COH_FOLD_VNY_FRAC * nyquist;
     // The same separation [`range_texture`] differences at, and for the same
     // reason: a super-res velocity cut repeats one estimate over two 0.25 km
     // gates, so adjacent-gate differences are structurally zero half the time.
@@ -2841,7 +2978,11 @@ fn incoherent_velocity(
                     let (a, b) = (raw[i][j], raw[i][j + dk]);
                     if !a.is_nan() && !b.is_nan() {
                         p = 1;
-                        s = u32::from((b - a).abs() > tol);
+                        // Above `tol` the pair cannot be read as one continuous
+                        // velocity; above `fold` it cannot be read as anything
+                        // *but* a fold, and a fold is what the dealiaser is for.
+                        let dv = (b - a).abs();
+                        s = u32::from(dv > tol && dv < fold);
                     }
                 }
                 ps[j + 1] = ps[j] + s;
