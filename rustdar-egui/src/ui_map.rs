@@ -753,9 +753,25 @@ impl super::Gui {
                             // is floating chrome over the picture and fades
                             // with the rest of it (§1.8 — the M8 addition).
                             let chrome = self.chrome_fade();
+                            // Where the pane's floating chrome may stand: the
+                            // pane's rect less whatever edge the colour scale
+                            // is on. The legend is painted rather than
+                            // allocated, so it senses nothing and cannot yield
+                            // — the Volume Alpha button is what moves out of
+                            // its way. Resolved from the same panel-wide
+                            // orientation `draw_volume_glass` paints the legend
+                            // with a few lines below, so the two cannot
+                            // disagree about which edge that is.
+                            let chrome_rect = pane_render::color_scale_free_rect(
+                                pane_rect,
+                                horizontal_color_scale,
+                                &pane,
+                                &self.overlays,
+                            );
                             let outcome = render_volume_pane(
                                 &mut child_ui,
                                 pane_rect,
+                                chrome_rect,
                                 pane_idx,
                                 &mut pane,
                                 &volume_response,
@@ -1677,6 +1693,9 @@ pub(crate) struct VolumeArmProbe {
 fn render_volume_pane(
     ui: &mut egui::Ui,
     pane_rect: egui::Rect,
+    // The part of `pane_rect` the colour scale has not claimed, for the pane's
+    // floating chrome — see `pane_render::color_scale_free_rect`.
+    chrome_rect: egui::Rect,
     pane_idx: usize,
     pane: &mut crate::pane::PaneState,
     response: &egui::Response,
@@ -1719,6 +1738,7 @@ fn render_volume_pane(
     volume_alpha_editor::editor_ui(
         ui,
         pane_rect,
+        chrome_rect,
         pane_idx,
         pane,
         painter,

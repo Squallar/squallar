@@ -1909,6 +1909,163 @@ fn the_panes_legend_is_painted_onto_the_glass_and_never_into_the_strip() {
     );
 }
 
+/// Nothing prints through the Volume Alpha button — and the colour scale is
+/// what used to.
+///
+/// The pane's legend is painted onto the glass rather than allocated, so it
+/// senses nothing, takes no part in layout and cannot be pushed aside. The
+/// button, planted in `pane_rect`'s top-right corner, stood in exactly the
+/// corner the vertical scale's unit title stands in: `dBZ` printed straight
+/// through `Volume alpha` at every pane width, which is what
+/// `legend-on-the-glass/floor-after.png` shows. So the *button* moves — off
+/// `color_scale_free_rect` instead of the pane — because the legend's
+/// placement is shared with the plan view and forking it for one pane kind
+/// would trade a visible overlap for an invisible misalignment across a split.
+///
+/// # Why it is written against the marks and not against the arithmetic
+///
+/// The claim is "no text the pane paints lands inside the button, except the
+/// button's own label", which is what a user sees. A test comparing the
+/// button's rect to a second copy of the legend's geometry would agree with
+/// itself while both were wrong, and would say nothing about the value labels
+/// or a second stacked bar.
+///
+/// The last block is what stops it being vacuous: the *old* rect is
+/// reconstructed from `pane_rect` and required to collide, so a legend that
+/// stopped being drawn — or a title that moved off the corner by itself —
+/// fails here rather than passing an assertion about an empty set.
+#[test]
+fn the_colour_scale_does_not_print_through_the_volume_alpha_button() {
+    let (mut h, _painter) = ground_witness_harness();
+    h.make_pane_volume(0);
+    h.frames_for(2, FRAME_DT);
+
+    let pane_rect = h.pane_rects()[0];
+    assert!(
+        !h.gui_mut().mirror_source_rects().is_empty(),
+        "precondition: the 3D arm never got as far as drawing a pane",
+    );
+    let (_, button) = *h
+        .alpha_buttons()
+        .iter()
+        .find(|(idx, _)| *idx == 0)
+        .expect("the 3D pane drew no Volume Alpha button");
+    assert!(
+        pane_rect.contains_rect(button),
+        "the button {button:?} left the pane {pane_rect:?} entirely",
+    );
+
+    // The pane is landscape, so the panel-wide orientation puts the bars on the
+    // right edge — the same edge the button hangs off.
+    let title: Vec<egui::Rect> = h
+        .painted_text_rects()
+        .into_iter()
+        .filter(|(rect, text)| text == LEGEND_WITNESS && pane_rect.contains_rect(*rect))
+        .map(|(rect, _)| rect)
+        .collect();
+    // More than one run: `draw_shadowed_text` lays the title down twice, the
+    // outline and then the text. Both are on screen, so both count.
+    assert!(
+        !title.is_empty(),
+        "precondition: the pane drew no {LEGEND_WITNESS} at all, so the \
+         collision below would be about an empty set; it painted {:?}",
+        h.painted_text_strings_in(pane_rect),
+    );
+
+    let through: Vec<(egui::Rect, String)> = h
+        .painted_text_rects()
+        .into_iter()
+        .filter(|(rect, text)| {
+            pane_rect.contains_rect(*rect)
+                && rect.intersects(button)
+                && text != volume_alpha_editor::ALPHA_BUTTON_LABEL
+        })
+        .collect();
+    assert!(
+        through.is_empty(),
+        "text is printing through the Volume Alpha button at {button:?}: \
+         {through:?}",
+    );
+
+    // …and the corner the button used to stand in really is the one the title
+    // is in, so the guard above has teeth.
+    let old_button = egui::Rect::from_min_size(
+        pane_rect.right_top() + egui::vec2(-(88.0 + 8.0), 8.0),
+        egui::vec2(88.0, 20.0),
+    );
+    assert!(
+        title.iter().any(|rect| old_button.intersects(*rect)),
+        "the legend's title at {title:?} no longer reaches the pane's top-right \
+         corner {old_button:?}, so this test would pass with the button put \
+         back there",
+    );
+}
+
+/// Every product's unit title fits the overhang the gutter reserves for it.
+///
+/// [`SCALE_TITLE_OVERHANG`] is the one guessed number in
+/// `color_scale_gutter`: the title is centred on a [`SCALE_BAR_WIDTH`] bar and
+/// is wider than it, so the block reaches that much further in than the bar
+/// does. Guessed once and then measured here, against every product and every
+/// unit preference that changes a suffix — a title wider than the reserve is a
+/// title the Volume Alpha button would print through again, and the only sign
+/// would be a screenshot.
+#[test]
+fn every_unit_titles_overhang_fits_the_gutter() {
+    use rustdar_units::{HailSizeUnit, HeightUnit, PrecipRateUnit, SpeedUnit, UserPreferences};
+
+    let ctx = egui::Context::default();
+    // One frame, so the fonts exist and the layout below can measure.
+    let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+    let measure = ctx.debug_painter();
+    let font = egui::FontId::proportional(pane_render::SCALE_TITLE_FONT_SIZE);
+
+    // Every unit setting that can change a colour-scale title, crossed. Off
+    // each enum's own `ALL`, so a unit added later is measured without anyone
+    // remembering to add it here.
+    let mut widest = (0.0_f32, "");
+    for &speed in SpeedUnit::ALL {
+        for &height in HeightUnit::ALL {
+            for &hail_size in HailSizeUnit::ALL {
+                for &precip_rate in PrecipRateUnit::ALL {
+                    let prefs = UserPreferences {
+                        speed,
+                        height,
+                        hail_size,
+                        precip_rate,
+                        ..UserPreferences::default()
+                    };
+                    for &product in RadarProduct::all() {
+                        let unit = product.unit_label(&prefs);
+                        let width = measure
+                            .layout_no_wrap(unit.to_owned(), font.clone(), egui::Color32::WHITE)
+                            .rect
+                            .width();
+                        if width > widest.0 {
+                            widest = (width, unit);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        widest.0 > 0.0,
+        "nothing was measured, so the bound below holds vacuously",
+    );
+    let overhang = (widest.0 - pane_render::SCALE_BAR_WIDTH) / 2.0;
+    assert!(
+        overhang <= pane_render::SCALE_TITLE_OVERHANG,
+        "{:?} lays out {} points wide, which hangs {overhang} points past its \
+         bar — more than the {} the gutter reserves, so it reaches back under \
+         the pane's floating chrome",
+        widest.1,
+        widest.0,
+        pane_render::SCALE_TITLE_OVERHANG,
+    );
+}
+
 /// The reset returns the **pivot** as well as the angles, and leaves the view
 /// mode alone.
 ///

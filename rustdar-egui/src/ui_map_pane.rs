@@ -1084,7 +1084,7 @@ fn render_user_location(
 // ── Color scale legend ────────────────────────────────────────────────────
 
 /// Bar width in logical pixels.
-const SCALE_BAR_WIDTH: f32 = 20.0;
+pub(super) const SCALE_BAR_WIDTH: f32 = 20.0;
 /// Margin from pane edge in logical pixels.
 const SCALE_MARGIN: f32 = 16.0;
 /// Extra margin reserved for the unit title above/beside the bar.
@@ -1092,11 +1092,120 @@ const SCALE_TITLE_MARGIN: f32 = 16.0;
 /// Font size for value labels.
 const SCALE_FONT_SIZE: f32 = 11.0;
 /// Font size for the unit title label.
-const SCALE_TITLE_FONT_SIZE: f32 = 12.0;
+pub(super) const SCALE_TITLE_FONT_SIZE: f32 = 12.0;
 /// Outline offset for text shadow.
 const SHADOW_OFFSET: f32 = 1.0;
 /// Minimum pixel spacing between labels before thinning kicks in.
 const MIN_LABEL_SPACING: f32 = 14.0;
+/// Gap between two stacked colour-scale bars, logical pixels: the room the
+/// inner one's value labels are read in.
+const SCALE_STACK_GAP: f32 = 40.0;
+/// How far a unit title may stick out past the bar it is centred on, each side,
+/// logical pixels.
+///
+/// The title is drawn `CENTER_BOTTOM` on the bar's centre line and is wider
+/// than the bar — `"mm/hr"` and `"kg/m\u{b2}"` are the long ones — so the block
+/// the legend occupies is wider than [`SCALE_BAR_WIDTH`] by this on each side.
+/// Measured rather than guessed: `every_unit_titles_overhang_fits_the_gutter`
+/// lays out every product's title at [`SCALE_TITLE_FONT_SIZE`], in every unit
+/// preference that changes one, and fails if any of them outgrows this.
+pub(super) const SCALE_TITLE_OVERHANG: f32 = 16.0;
+
+/// How far in from the pane edge it stands on the colour-scale block reaches,
+/// logical pixels — `0.0` when this pane draws no legend at all.
+///
+/// # What this is for
+///
+/// A pane's *floating* chrome has to know where the legend is, because the
+/// legend is not a widget and cannot fight for the space: it is painted
+/// straight onto the glass, senses nothing, and is drawn before the chrome. The
+/// 3D pane's Volume Alpha button was planted in the pane's top-right corner,
+/// which in the vertical orientation is the corner the scale's unit title
+/// stands in — the two overlapped at every pane width, `dBZ` printed through
+/// the button's label.
+///
+/// The button moves rather than the legend, and the asymmetry is the point.
+/// A 3D pane draws its legend by exactly the placement rules a plan view uses,
+/// with the panel-wide orientation resolved once for the whole grid, so that a
+/// 3D pane's bar lines up with its neighbour's in a split — see
+/// `Gui::draw_volume_glass`. Forking that for one pane kind would trade a
+/// visible overlap for an invisible inconsistency. The button, by contrast,
+/// exists on 3D panes alone and has no such contract to keep.
+///
+/// # Why it counts the overlay bars too
+///
+/// `render_overlay_color_scales` stacks a bar per overlay layer that publishes
+/// a legend, each one [`SCALE_STACK_GAP`] further in, each with a title of its
+/// own at the same height as the radar scale's. So the block's inner edge moves
+/// with the layer stack, and a gutter that only knew about the radar bar would
+/// leave the button over the *second* title instead of the first.
+pub(super) fn color_scale_gutter(
+    pane_rect: egui::Rect,
+    horizontal: bool,
+    pane: &PaneState,
+    overlays: &OverlayRegistry,
+) -> f32 {
+    // The same gate `Gui::draw_volume_glass` and the `ColorScale` arm put in
+    // front of `render_color_scales`: layer off, nothing painted, no gutter.
+    if !pane.is_overlay_enabled(OverlayKind::ColorScale) {
+        return 0.0;
+    }
+    if get_legend_scale(pane.selected_product).thresholds.len() < 2 {
+        return 0.0;
+    }
+    // And the "pane too small" bail both painters take, restated from the same
+    // expressions so a pane that draws no bar reserves no room for one.
+    let bar_length = if horizontal {
+        pane_rect.width() - SCALE_MARGIN * 2.0
+    } else {
+        pane_rect.height() - SCALE_MARGIN * 2.0 - SCALE_TITLE_MARGIN
+    };
+    if bar_length < 40.0 {
+        return 0.0;
+    }
+    let stacked = pane
+        .draw_order
+        .iter()
+        .filter(|&&kind| kind != OverlayKind::ColorScale && pane.is_overlay_enabled(kind))
+        .filter(|&&kind| {
+            overlays
+                .legend(kind)
+                .is_some_and(|l| l.thresholds.len() >= 2)
+        })
+        .count() as f32;
+    SCALE_MARGIN
+        + stacked * (SCALE_BAR_WIDTH + SCALE_STACK_GAP)
+        + SCALE_BAR_WIDTH
+        + SCALE_TITLE_OVERHANG
+}
+
+/// The part of `pane_rect` the colour scale has *not* claimed: where a pane's
+/// floating chrome may sit without printing through a legend.
+///
+/// See [`color_scale_gutter`] for which edge it comes off and why the chrome is
+/// what moves.
+pub(super) fn color_scale_free_rect(
+    pane_rect: egui::Rect,
+    horizontal: bool,
+    pane: &PaneState,
+    overlays: &OverlayRegistry,
+) -> egui::Rect {
+    let gutter = color_scale_gutter(pane_rect, horizontal, pane, overlays);
+    let mut free = pane_rect;
+    if horizontal {
+        // Bars along the bottom; the titles sit beside them, on the same edge.
+        free.max.y -= gutter;
+    } else {
+        free.max.x -= gutter;
+    }
+    // A pane too small for both keeps its own rect rather than an inverted one:
+    // an overlap is better than chrome laid out backwards, and the bail above
+    // has already covered the pane that draws no bar.
+    if free.width() < 1.0 || free.height() < 1.0 {
+        return pane_rect;
+    }
+    free
+}
 
 /// The generic tick form: whole numbers bare, one decimal otherwise. Short is
 /// the point — a tick label sits in the margin beside a 20px bar.

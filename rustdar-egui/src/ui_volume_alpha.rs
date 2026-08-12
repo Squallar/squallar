@@ -62,8 +62,8 @@ pub(crate) const ALPHA_BUTTON_LABEL: &str = "Volume alpha";
 /// cannot drift from the button.
 pub(crate) const RESET_LABEL: &str = "Reset to the 3D default";
 
-/// Inset of the button from the pane's top-right corner, points. Mirrors the
-/// caption's margin in the opposite corner.
+/// Inset of the button from the top-right corner it stands in, points. Mirrors
+/// the caption's margin in the opposite corner.
 const BUTTON_MARGIN: f32 = 8.0;
 
 /// The curve canvas's height, points. Tall enough that one point of pointer
@@ -83,10 +83,27 @@ const STRIP_GAP: f32 = 4.0;
 /// arm never got far enough to name one (no site data yet, no painter). The
 /// editor still opens in that state; it shows its waiting text until a grid's
 /// palette can be looked up.
+///
+/// # Two rects, and the button takes the smaller one
+///
+/// `pane_rect` is the whole pane; `chrome_rect` is the part of it the colour
+/// scale has not claimed (`pane_render::color_scale_free_rect`). The button
+/// hangs off `chrome_rect`'s top-right corner and the window still opens on
+/// `pane_rect`'s centre, because only the button was in the legend's way: in
+/// the vertical orientation the scale's unit title stands in the pane's
+/// top-right corner, and `dBZ` printed straight through the button's label at
+/// every pane width.
+///
+/// The button is what moves, not the legend. A 3D pane draws its legend by
+/// exactly the placement rules a plan view uses so the bars line up across a
+/// split (`Gui::draw_volume_glass`); the button exists on 3D panes alone and
+/// keeps no such contract. The legend also cannot yield — it is painted, not
+/// allocated, so it senses nothing and takes no part in layout.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn editor_ui(
     ui: &mut egui::Ui,
     pane_rect: egui::Rect,
+    chrome_rect: egui::Rect,
     pane_idx: usize,
     pane: &mut crate::pane::PaneState,
     painter: Option<&dyn crate::volume_view::VolumePainter>,
@@ -113,10 +130,13 @@ pub(crate) fn editor_ui(
     // The corner button. Drawn after the pane's own painting, so it sits over
     // the volume; egui resolves overlapping widgets to the later one, so it
     // wins the pointer over the pane-wide orbit interact.
+    //
+    // Off `chrome_rect`, not `pane_rect`: see the doc comment. The two are the
+    // same rect whenever the legend is off that edge or off altogether.
     let button = egui::Button::new(egui::RichText::new(ALPHA_BUTTON_LABEL).size(11.0));
     let size = egui::vec2(88.0, 20.0);
     let rect = egui::Rect::from_min_size(
-        pane_rect.right_top() + egui::vec2(-(size.x + BUTTON_MARGIN), BUTTON_MARGIN),
+        chrome_rect.right_top() + egui::vec2(-(size.x + BUTTON_MARGIN), BUTTON_MARGIN),
         size,
     );
     #[cfg(test)]
