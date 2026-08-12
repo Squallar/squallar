@@ -1,5 +1,5 @@
 use super::*;
-use crate::app::tests::{empty_scan, headless};
+use crate::app::tests::{empty_scan, headless, two_pane_app};
 use crate::platform_double::TestBridge;
 use rustdar_radar::types::ScanInfo;
 
@@ -310,6 +310,53 @@ fn switching_sites_stops_showing_the_previous_radars_cut() {
         "the drawn line is two geographic points and names the same ground \
          under the new radar; dropping it throws away the user's aim",
     );
+}
+
+/// The clear covers every pane the switch moves, not the clicked one alone.
+///
+/// `SwitchRadarSite` writes `layer_sync_targets(pane_idx)` — the whole
+/// layer-linked group when the source is linked — so on a split of two linked
+/// panes a pill click moves both. A clear written for the source alone would
+/// leave the sibling named `TPIT` and still offering `KPBZ`'s menu: the
+/// original staleness, on the pane the user was not looking at when they
+/// clicked, and the pane most likely to be left on it.
+///
+/// The two-site case is covered by [`re_picking_the_site_a_pane_is_on_keeps_its_scan`]'s
+/// rule rather than repeated here — `moving` is filtered pane by pane on
+/// `pane.site != site`, so a linked sibling already on the destination is the
+/// no-op pick with an extra pane in front of it.
+#[test]
+fn the_clear_reaches_every_pane_the_switch_moves() {
+    let mut app = two_pane_app(WSR88D, WSR88D);
+    for idx in 0..2 {
+        let pane = app.gui.pane_mut(idx).expect("the fixture built two panes");
+        pane.scan_info = Some(wsr88d_scan_info());
+        pane.data_time = Some(at(0));
+    }
+    assert_eq!(
+        app.gui.layer_sync_targets(0),
+        vec![0, 1],
+        "precondition: the panes must be layer-linked, or the switch moves \
+         only pane 0 and the sibling below is asserting nothing",
+    );
+
+    switch_to(&mut app, TDWR);
+
+    for idx in 0..2 {
+        let pane = app.gui.pane(idx).expect("the fixture built two panes");
+        assert_eq!(
+            pane.site, TDWR,
+            "pane {idx} was not moved by the linked group's switch",
+        );
+        assert!(
+            pane.scan_info.is_none(),
+            "pane {idx} names {TDWR} and still holds {WSR88D}'s products and tilts",
+        );
+        assert_eq!(
+            pane.data_time, None,
+            "pane {idx} is captioned with the age of a volume it no longer draws",
+        );
+    }
 }
 
 /// Picking the site a pane is already on is not a switch.
