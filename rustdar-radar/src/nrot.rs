@@ -213,18 +213,68 @@ const MIN_RANGE_NM: f64 = 7.05;
 /// sitting near the Nyquist limit, counted as incoherence. KTLX now reads 1640
 /// painted, 730 agreeing, precision 0.4451.
 ///
-/// One number moves the other way and is worth naming. At KCRP the 240 bins the
-/// reference refuses average **|1.990|**
-/// against |0.338| at the bins the two agree on: 137 are over |1.0|, 110 over
-/// |2.0| and 8 sit at the [`NROT_LIMIT`] clamp, while the reference's own
-/// largest reading anywhere in that annulus is 3.00. High Nyquist and a
-/// tropical wind field, and this module reports rotation off the top of the
-/// reference's scale where the reference reports none. That is a different
-/// defect from the one above — KTLX's spurious bins never reach |2.0|.
-/// [`COH_FOLD_VNY_FRAC`] takes 213 of those bins away, 112 of them over |1.5|
-/// and all eight at the clamp, because they were computed on velocity this rule
-/// had told the dealiaser to hand back unresolved; the rest is unaddressed and
-/// this accounting has not been re-derived around it.
+/// One number moved the other way and has been re-derived here. At KCRP the
+/// 240 bins the reference refused averaged **|1.990|** against |0.338| at the
+/// bins the two agree on: 137 over |1.0|, 110 over |2.0| and 8 at the
+/// [`NROT_LIMIT`] clamp. [`COH_FOLD_VNY_FRAC`] takes 213 of them away, because
+/// they were computed on velocity this rule had told the dealiaser to hand
+/// back unresolved. [`CENSOR_VNY_FRAC`] carries what that velocity looked like
+/// and why the censor standing over it did not object.
+///
+/// What is left, on the tree that rule landed on:
+///
+/// ```text
+///                Vny   this module   agreeing   reference   precision   refused
+///     KTLX     11.49          1640        730        3546      0.4451       910
+///     KHNX     11.66             0          0         252           —         0
+///     KCRP     31.52           941        905        4357      0.9617        36
+///     KDMX     27.93          1453       1107        2564      0.7619       346
+///     KFTG     24.01           903        758        1668      0.8394       145
+///     KATX     25.32           469        432         840      0.9211        37
+///     KLOT     23.96            14          3          18      0.2143        11
+///     KMSX     24.21            16          8          53      0.5000         8
+///     KDDC     25.84          2731       2161        5823      0.7913       570
+/// ```
+///
+/// KCRP's 36 average |0.729|. **Four of them are the only bins over |2.0| that
+/// the reference refuses at any of the nine sites**, and they are one cluster
+/// — az 72.72° to 74.21°, 9.52 to 9.65 nm — reaching 4.776, which is also the
+/// largest magnitude this module reports anywhere on any of the nine cuts. The
+/// second largest anywhere is 2.14. **Nothing reaches the [`NROT_LIMIT`] clamp
+/// on any of them**, so the question of what the reference does at its own
+/// ceiling is now about a branch this corpus does not exercise. It does the
+/// same thing: hovered on the KCRP cut, GR2Analyst's Product Details panel
+/// reports a minimum of −5.00 and a maximum of +5.00.
+///
+/// The four are not the mechanism [`CENSOR_VNY_FRAC`] describes — that one is
+/// gone from this cut entirely, along with the last refused bin. They are
+/// [`median_filter`]'s: the wind there sits at the fold, the raw sweep is a
+/// ±30 checkerboard against a declared 31.52, the fold censor cuts it to a
+/// filament and the median then returns **0.00** at a bin whose dealiased
+/// value is **+30.00**, from a window holding {31, 30, −31, 30, 30, 0, −30,
+/// −30, 0}. The operator differentiates that. GR2Analyst hovered at that bin
+/// reads **+0.18**.
+///
+/// Three guards against it were measured — refuse a median window spanning
+/// more than k·Vny, one whose sorted values leave a k·Vny gap, one that moves
+/// its own centre by more than k·Vny — over k from 0.5 to 1.8. Each removes
+/// the four; each costs KTLX 2025-02-19 between 24 and 380 agreeing bins,
+/// because at a declared 11.49 one fold is 23 m/s and ordinary shear reaches
+/// it. Four bins on one volume do not buy a law that a site at a third of the
+/// Nyquist has to obey, and none is taken.
+///
+/// # The decoded reference clips, and one column here is read through it
+///
+/// GR2Analyst's NROT colour bar runs **−2.00 to +3.00**; its product runs to
+/// ±5.00. So every decoded bin at a rail is a lower bound, and 646 of KCRP's
+/// are — 236 at the top and 410 at the bottom. Hovered, six of the top rail
+/// read +3.06 to +3.30 and four of the bottom −2.19 to −2.47.
+///
+/// Where the reference paints nothing it is black, and black is exact, so
+/// every count above stands. The **mean |Δ|** column of the first table does
+/// not: it is computed against a clipped field and is a lower bound wherever
+/// the reference exceeds its own bar, which at KCRP is 15% of what it paints.
+/// It is left as it was measured, and nothing in this module is decided on it.
 ///
 /// # The eighth axis: magnitude and completeness together
 ///
@@ -2404,6 +2454,41 @@ const DA_RAWMIN_BINS: usize = 16;
 /// up, because a kept fold wall is 2·Vny of fake shear the derivative then
 /// reads. 1.80 stands, and on this cut it is buying coverage rather than
 /// costing it.
+///
+/// # The one wall it was told to ignore, and why it still is
+///
+/// The censor skips a bin [`incoherent_velocity`] refused, and does not count
+/// a refused neighbour as evidence against the bin beside it — a bin no pass
+/// made a claim about is not a wall a pass failed to place. That exemption is
+/// what let KCRP 2017-08-26's tail through, and it is still the right rule.
+///
+/// The write-back hands a refused bin back exactly as reported, folded, while
+/// its neighbours come back unfolded, so the two meet across a step that is
+/// pure convention. Before [`COH_FOLD_VNY_FRAC`], with 7.5% of that cut
+/// refused: **191 of the 240 bins the reference refused stood within the
+/// operator's own 11-radial span of such a seam, against 0 of the 858 the two
+/// fields agree on.** Each of the 191 had exactly one refused side; across
+/// them the dealiased pair differed by a median 63.04 m/s, 2·Vny to the
+/// centimetre, and the *reported* pair by a median **1.00**. GR2Analyst,
+/// hovered at the fourteen loudest with the status bar's az/range readback
+/// verified on each, read ND at five and −0.18 to +0.18 at the other nine,
+/// where this module read −3.35 to −5.00. They were an artefact, and they were
+/// this module's own.
+///
+/// Withdrawing the exemption removes them. Adding the test that makes it
+/// principled — count a refused neighbour only where the *reported* field is
+/// continuous across the pair, so the gap is one the passes opened rather than
+/// one the antenna measured — removed 292 values at KCRP of which the
+/// reference painted none, 203 of them painted here at a mean |2.109|, and
+/// left every other decoded site's field alone to the bin.
+///
+/// It is not taken, because the seam was a symptom. On the tree
+/// [`COH_FOLD_VNY_FRAC`] landed on, KCRP has **no refused bins at all** and no
+/// spurious bin within span of such a seam, so the rule buys nothing there —
+/// and at KTLX 2025-02-19, where the mask still fires, it costs **24 agreeing
+/// bins for none removed**, on seams the passes opened correctly and the
+/// reference paints across. The exemption's reasoning survives its own
+/// counter-example: what was wrong was which bins were being refused.
 const CENSOR_VNY_FRAC: f64 = 1.80;
 
 /// The posture [`dealias`] takes towards data its passes could not settle.
