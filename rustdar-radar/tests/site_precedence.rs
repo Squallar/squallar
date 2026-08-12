@@ -267,7 +267,9 @@ fn the_precedence_is_volume_learned_network_unplaced() {
 fn a_fetched_position_moves_a_row_without_taking_its_base_datum() {
     let _gate = serialized();
     sites::resolve([("ZZPS", SiteFix::Learned(learned()))]);
-    let known = sites::get_radar_site("ZZPS").expect("this test learned it").clone();
+    let known = sites::get_radar_site("ZZPS")
+        .expect("this test learned it")
+        .clone();
     let base = known
         .height_ft(Datum::SiteBase)
         .expect("a learned WSR-88D records both datums");

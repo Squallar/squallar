@@ -2948,7 +2948,10 @@ fn a_volume_this_session_decoded_gives_its_radar_a_height_this_session() {
         Some(want),
         "the render path anchors on sea level for the radar it is drawing",
     );
-    assert!(want > 1000.0, "and it is a real elevation, not zero: {want} ft");
+    assert!(
+        want > 1000.0,
+        "and it is a real elevation, not zero: {want} ft"
+    );
 }
 
 /// With nowhere to write, the app still works and simply forgets.

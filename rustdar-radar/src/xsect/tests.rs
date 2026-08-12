@@ -400,8 +400,8 @@ fn the_two_boundary_predicates_round_the_way_the_docs_say() {
 /// recorded as a measured fact rather than as prose.
 #[test]
 fn no_value_in_a_section_sits_above_the_top_rung() {
-// The radars this renders against; there are none until a test asks.
-crate::sites::fixture::install();
+    // The radars this renders against; there are none until a test asks.
+    crate::sites::fixture::install();
     let scan = scan_with(&|_az, _slant| Gate::Dbz(30.0));
     let section = radial_section(&scan, 90.0, 120.0);
     let axes = section.axes();
@@ -1835,8 +1835,8 @@ fn a_short_ladder_fills_the_gap_it_cannot_measure_and_only_the_numbers_object() 
 /// The four request-shape refusals, each for its own reason.
 #[test]
 fn a_request_that_names_no_section_is_refused() {
-// The radars this renders against; there are none until a test asks.
-crate::sites::fixture::install();
+    // The radars this renders against; there are none until a test asks.
+    crate::sites::fixture::install();
     let scan = scan_with(&|_az, _slant| Gate::Dbz(30.0));
     let end = point_at(45.0, 100.0);
 
@@ -1925,8 +1925,8 @@ crate::sites::fixture::install();
 /// finite — which is what lets `SectionAxes` derive `PartialEq`.
 #[test]
 fn every_axis_number_of_a_rendered_section_is_finite() {
-// The radars this renders against; there are none until a test asks.
-crate::sites::fixture::install();
+    // The radars this renders against; there are none until a test asks.
+    crate::sites::fixture::install();
     let scan = scan_with(&|az, slant| Gate::Dbz(15.0 + az / 60.0 + slant / 30.0));
     for (start, end) in [
         (SITE, point_at(0.0, 230.0)),

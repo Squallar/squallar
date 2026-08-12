@@ -1018,7 +1018,10 @@ mod tests {
 
         // The other row is 2200 km away and must not answer for it.
         let (other, _) = table.nearest(-10.0, -140.0).expect("a finite coordinate");
-        assert_eq!(other.name, "ZZZB", "adding a radar must not move the others");
+        assert_eq!(
+            other.name, "ZZZB",
+            "adding a radar must not move the others"
+        );
     }
 
     /// Every site is its own nearest neighbour, which catches a transposed
@@ -1088,7 +1091,10 @@ mod tests {
     #[test]
     fn an_automatic_pick_skips_the_tdwr_and_the_test_bed() {
         let table = build_table([
-            ("TZZA", learned_single_height(-30_000_000, -140_000_000, 100)),
+            (
+                "TZZA",
+                learned_single_height(-30_000_000, -140_000_000, 100),
+            ),
             ("KCRI", learned(-30_100_000, -140_000_000, 100, 20)),
             ("ZZZC", learned(-30_200_000, -140_000_000, 100, 20)),
         ]);
@@ -1186,7 +1192,10 @@ mod tests {
             .filter(|s| s.height_ft(Datum::Feedhorn).is_none())
             .map(|s| s.name)
             .collect();
-        assert!(no_feedhorn.is_empty(), "no feedhorn height: {no_feedhorn:?}");
+        assert!(
+            no_feedhorn.is_empty(),
+            "no feedhorn height: {no_feedhorn:?}"
+        );
     }
 
     /// Only a volume can answer [`Datum::SiteBase`], and it answers only for a
@@ -1314,7 +1323,11 @@ mod tests {
             .expect("the position moved");
 
         let after = table.get("ZZZA").expect("still there");
-        assert_eq!((after.lat, after.lon), (-30.0, -140.0), "the position moved");
+        assert_eq!(
+            (after.lat, after.lon),
+            (-30.0, -140.0),
+            "the position moved"
+        );
         assert_eq!(after.heights, learned_heights, "the heights did not");
         assert_eq!(after.height_ft(Datum::SiteBase), Some(328));
     }
@@ -1411,8 +1424,14 @@ mod tests {
     fn a_placed_fix_beats_bare_membership_in_either_order() {
         let placed = learned(-30_000_000, -140_000_000, 100, 20);
         for (case, fixes) in [
-            ("membership first", [("ZZZA", SiteFix::Unplaced), ("ZZZA", placed)]),
-            ("membership last", [("ZZZA", placed), ("ZZZA", SiteFix::Unplaced)]),
+            (
+                "membership first",
+                [("ZZZA", SiteFix::Unplaced), ("ZZZA", placed)],
+            ),
+            (
+                "membership last",
+                [("ZZZA", placed), ("ZZZA", SiteFix::Unplaced)],
+            ),
         ] {
             let table = build_table(fixes);
             assert!(table.unplaced().is_empty(), "{case}");
@@ -1432,10 +1451,7 @@ mod tests {
     fn the_ranks_run_learned_then_network_then_unplaced() {
         assert!(SiteFixRank::Learned < SiteFixRank::Network);
         assert!(SiteFixRank::Network < SiteFixRank::Unplaced);
-        assert_eq!(
-            learned(0, 0, 1, 2).rank(),
-            SiteFixRank::Learned,
-        );
+        assert_eq!(learned(0, 0, 1, 2).rank(), SiteFixRank::Learned,);
         assert_eq!(network(0, 0, 1).rank(), SiteFixRank::Network);
         assert_eq!(SiteFix::Unplaced.rank(), SiteFixRank::Unplaced);
     }

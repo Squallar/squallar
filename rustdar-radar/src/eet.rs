@@ -582,8 +582,8 @@ mod tests {
     /// and 19 m of tower as its volume reports them, converted.
     #[test]
     fn radar_height_lookup_finds_the_nearest_site() {
-    // The radars this renders against; there are none until a test asks.
-    crate::sites::fixture::install();
+        // The radars this renders against; there are none until a test asks.
+        crate::sites::fixture::install();
         // KTLX's own coordinates give KTLX's heights.
         assert_eq!(
             radar_height_ft_near(35.33306, -97.2775, Datum::SiteBase),
@@ -612,8 +612,8 @@ mod tests {
     /// pane that had no idea where it was.
     #[test]
     fn coordinates_nowhere_near_a_radar_get_no_height_at_all() {
-    // The radars this renders against; there are none until a test asks.
-    crate::sites::fixture::install();
+        // The radars this renders against; there are none until a test asks.
+        crate::sites::fixture::install();
         for (name, lat, lon) in [
             ("null island", 0.0, 0.0),
             ("the south atlantic", -40.0, -20.0),
@@ -666,8 +666,8 @@ mod tests {
     /// failure this replaced rather than the behaviour to keep.
     #[test]
     fn the_relocated_site_reaches_its_consumers_at_its_new_height() {
-    // The radars this renders against; there are none until a test asks.
-    crate::sites::fixture::install();
+        // The radars this renders against; there are none until a test asks.
+        crate::sites::fixture::install();
         assert_eq!(
             radar_height_ft_near(37.20757, 127.28556, Datum::Feedhorn),
             Some(1519.0),
@@ -700,8 +700,8 @@ mod tests {
     /// on it.
     #[test]
     fn a_row_that_cannot_answer_never_reports_sea_level() {
-    // The radars this renders against; there are none until a test asks.
-    crate::sites::fixture::install();
+        // The radars this renders against; there are none until a test asks.
+        crate::sites::fixture::install();
         // The precondition that makes "exactly 0 ft" a usable sentinel: no row
         // is genuinely at sea level, the lowest being KBYX at 87 ft. A future
         // row at exactly 0 would make this test wrong rather than the code, so
@@ -755,8 +755,8 @@ mod tests {
     /// over a 20 km axis.
     #[test]
     fn the_six_formerly_unrecorded_sites_carry_their_measured_elevation() {
-    // The radars this renders against; there are none until a test asks.
-    crate::sites::fixture::install();
+        // The radars this renders against; there are none until a test asks.
+        crate::sites::fixture::install();
         for (name, base_ft, feedhorn_ft) in [
             ("KDGX", 495, 607),
             ("KFSX", 7418, 7513),

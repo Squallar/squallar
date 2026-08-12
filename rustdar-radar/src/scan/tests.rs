@@ -500,8 +500,8 @@ async fn live_one_pass_decode_matches_the_two_pass_decode() {
 /// does, so a legacy radial message is skipped without being looked at.
 #[test]
 fn a_pre_2010_volume_states_no_site_and_falls_back_to_the_table() {
-// The radars this renders against; there are none until a test asks.
-crate::sites::fixture::install();
+    // The radars this renders against; there are none until a test asks.
+    crate::sites::fixture::install();
     const FRAME: usize = 2432;
     const MESSAGE_HEADER: usize = 28;
 

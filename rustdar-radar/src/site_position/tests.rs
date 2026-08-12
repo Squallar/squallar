@@ -198,8 +198,8 @@ fn a_volume_whose_two_heights_are_equal_reports_one_feedhorn() {
 /// cannot supply, and everything else it supplies is measured.
 #[test]
 fn applying_a_position_keeps_the_rows_name_and_replaces_its_geometry() {
-// The radars this renders against; there are none until a test asks.
-crate::sites::fixture::install();
+    // The radars this renders against; there are none until a test asks.
+    crate::sites::fixture::install();
     let row = crate::sites::get_radar_site("KTLX").expect("in the table");
     let pos = SitePosition::from_volume(&volume_site(35.4, -97.3, 439, 24)).expect("place");
 

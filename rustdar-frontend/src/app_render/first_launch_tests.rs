@@ -28,10 +28,7 @@ fn fetched() -> SiteCatalogue {
             feedhorn_m: 400,
         },
     );
-    SiteCatalogue::union(
-        [ARRIVAL.to_string(), UNPLACEABLE.to_string()],
-        &positions,
-    )
+    SiteCatalogue::union([ARRIVAL.to_string(), UNPLACEABLE.to_string()], &positions)
 }
 
 fn landed(catalogue: Option<SiteCatalogue>) -> crate::channels::SiteCatalogueResponse {
@@ -95,10 +92,16 @@ fn a_failed_first_fetch_leaves_the_launch_still_waiting() {
     let mut app = headless(TestBridge::desktop());
     app.site_hint_pending = true;
 
-    app.channels.site_catalogue_sender.send(landed(None)).unwrap();
+    app.channels
+        .site_catalogue_sender
+        .send(landed(None))
+        .unwrap();
     app.poll_site_catalogue();
 
-    assert!(app.site_hint_pending, "nothing arrived, so nothing is spent");
+    assert!(
+        app.site_hint_pending,
+        "nothing arrived, so nothing is spent"
+    );
 }
 
 /// An ordinary launch does **not** take a fetched catalogue into the live

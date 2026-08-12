@@ -845,8 +845,8 @@ fn at(timestamp_minute: u32) -> chrono::NaiveDateTime {
 /// decimal place.
 #[test]
 fn the_precedence_is_volume_then_learned_then_table() {
-// The radars this renders against; there are none until a test asks.
-crate::sites::fixture::install();
+    // The radars this renders against; there are none until a test asks.
+    crate::sites::fixture::install();
     use crate::site_position::{SitePosition, SitePositionSource};
 
     let table = crate::sites::get_radar_site("KTLX").expect("in the table");
@@ -948,8 +948,8 @@ crate::sites::fixture::install();
 /// site that this path structurally cannot supply.
 #[test]
 fn a_chunk_fed_volume_falls_back_to_the_table() {
-// The radars this renders against; there are none until a test asks.
-crate::sites::fixture::install();
+    // The radars this renders against; there are none until a test asks.
+    crate::sites::fixture::install();
     // The real assembler, not a stand-in for it: this is the object the live
     // feed hands a `Scan` out of, so if it ever grew a site the fixture would
     // grow one with it.
@@ -988,8 +988,8 @@ crate::sites::fixture::install();
 /// reason last-writer-wins is the right rule.
 #[test]
 fn a_corrected_position_reaches_every_consumer_of_it() {
-// The radars this renders against; there are none until a test asks.
-crate::sites::fixture::install();
+    // The radars this renders against; there are none until a test asks.
+    crate::sites::fixture::install();
     let table = crate::sites::get_radar_site("KTLX").expect("in the table");
     // 43 m north, spelled in degrees at KTLX's latitude.
     let moved_lat = table.lat + 43.0 / (KM_PER_DEGREE_LAT * 1000.0);

@@ -1108,8 +1108,8 @@ fn cell_centres_sit_at_the_half_step() {
 /// sign, moves the lowest row with data by 7 or 14 rows.
 #[test]
 fn the_height_axis_is_msl_above_the_sites_own_elevation() {
-// The radars this renders against; there are none until a test asks.
-crate::sites::fixture::install();
+    // The radars this renders against; there are none until a test asks.
+    crate::sites::fixture::install();
     let scan = scan_of(&|_, _| Some(35.0));
     let nz = 240;
     let (base_km_msl, top_km_msl) = (0.0, 12.0);
@@ -1313,8 +1313,8 @@ fn a_single_tilt_volume_fills_nothing_rather_than_smearing_one_beam() {
 /// actually resolves, which is the point.
 #[test]
 fn a_layer_is_quantised_to_the_ladder_rather_than_to_nz() {
-// The radars this renders against; there are none until a test asks.
-crate::sites::fixture::install();
+    // The radars this renders against; there are none until a test asks.
+    crate::sites::fixture::install();
     let nz = 200;
     let (base_km_msl, top_km_msl) = (0.0, 12.0);
     let dz = (top_km_msl - base_km_msl) / nz as f64;
@@ -1391,8 +1391,8 @@ crate::sites::fixture::install();
 /// through `axis_centre`, so the two spellings have to agree.
 #[test]
 fn every_cell_is_the_samplers_own_answer() {
-// The radars this renders against; there are none until a test asks.
-crate::sites::fixture::install();
+    // The radars this renders against; there are none until a test asks.
+    crate::sites::fixture::install();
     let scan = scan_of(&|az, slant| (az < 200.0).then_some(10.0 + (slant % 37.0) + az / 12.0));
     let shape = VoxelShape {
         nx: 9,

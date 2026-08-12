@@ -808,9 +808,8 @@ impl App {
         // order they are chained in decides nothing: a learned position
         // outranks a fetched one wherever both exist, and `sites::extended`
         // settles that before it builds a row.
-        let table = rustdar_radar::sites::resolve(
-            site_positions.fixes().chain(site_catalogue.fixes()),
-        );
+        let table =
+            rustdar_radar::sites::resolve(site_positions.fixes().chain(site_catalogue.fixes()));
         // The exception, and the one state the deleted seed used to make
         // impossible: this install knows no radars at all. Nothing was cached,
         // nothing was learned, and the binary carries no list — so there is no
