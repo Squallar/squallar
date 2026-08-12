@@ -6,11 +6,12 @@
 //! correlates 0.996 with the reference's cursor readouts. It does not yet
 //! paint as widely: over the 7.05–20 nm annulus of KTLX 2025-02-19's lowest
 //! velocity cut the reference paints 5.13% of the bins where this module
-//! paints 1.63%, and the two fields are **aligned, not displaced** — their
+//! paints 2.25%, and the two fields are **aligned, not displaced** — their
 //! overlap peaks at exactly zero shift in both radials and gates, and their
 //! features are the same shape (a median cluster of 3 radials × 4 gates
 //! against 3 × 5). The shortfall is coverage upstream of the derivative
-//! rather than gating, and [`COH_MAX_STRADDLE`] carries where it is.
+//! rather than gating; [`COH_AZ_HALF`] carries most of what is left of it,
+//! and a hole in the stencil's window carries the next most.
 //! The measurement apparatus lives on branch
 //! `campaign-harness`, and so does the calibration record for every constant
 //! whose readings survived — twelve of them kept only the apparatus, and say
@@ -2363,63 +2364,112 @@ const COH_STRADDLE_VNY_FRAC: f64 = 0.90;
 /// nearest-colour lookup inverts it, and the result reproduces the same 13 of
 /// 13 OCR hovers to a mean 0.0076 and GR's own reported min and max (−1.96,
 /// +2.15) to the digit. That is 3546 painted bins over the 7.05–20 nm annulus
-/// instead of thirteen. Against them, the first rule that refuses each one:
+/// instead of thirteen. Against them, the first rule that refuses each one, in
+/// the order [`llsd_nrot`] applies them, before and after [`COH_AZ_HALF`] was
+/// re-shaped:
 ///
 /// ```text
-///     no raw velocity at the bin                     147    4.1%
-///     the dealiaser dropped it                       182    5.1%
-///     the median filter dropped it                     2    0.1%
-///     a hole in the stencil's 11 × 3 window          879   24.8%
-///     flagged incoherent — here                     1488   42.0%
-///     range texture or r²                            178    5.0%
-///     carried, under SIGNIFICANT                     236    6.7%
-///     painted                                        434   12.2%
+///                                            ±40 × ±32    ±16 × ±192
+///     no raw velocity at the bin                   147           147
+///     the dealiaser dropped it                     182           238
+///     the median filter dropped it                   2             2
+///     flagged incoherent — here                   1783          1092
+///     range texture or r²                           98           143
+///     a hole in the stencil's window               590           845
+///     carried, under SIGNIFICANT                   276           360
+///     despeckled                                    34            58
+///     painted                                      434           661
 /// ```
 ///
-/// And it is not refusing at random. The reference paints at 10.63% of the
-/// bins this rule calls incoherent against 3.37% of the rest — **3.16×
-/// enriched** — and its refusal rate climbs monotonically with how hard the
-/// reference is painting:
+/// The 691 bins this rule stopped refusing did not all become paint. 227 did;
+/// 255 of them walked straight into a **hole in the stencil's window**, which
+/// is now the second largest refuser and within reach of the largest. That
+/// number is worth reading twice, because a sibling campaign established that
+/// every one of those holes is one this module made: the raw sweep carries
+/// velocity at all of them and the dealiaser dropped it, and one missing cell
+/// costs eleven radials.
 ///
-/// ```text
-///     |NROT| the reference reads   0.25–0.40  0.40–0.60  0.60–1.00  1.00–1.50  ≥1.50
-///     flagged incoherent               43.1%      48.0%      59.5%      79.0%  80.8%
-///     this module carries a value      22.2%      18.8%      16.7%       5.1%   4.1%
-/// ```
+/// # The threshold did not move, and the wedge did not go away
 ///
-/// A rule meant to find velocity that is no measurement of one air motion is
-/// instead selecting, with rising confidence, the ground where the reference
-/// reports the strongest rotation.
+/// 0.09 is unchanged, and it did not need re-deriving: it sits inside the gap
+/// at every window geometry swept, and the geometry was chosen with it held
+/// fixed. What moved is the shape of the support — see [`COH_AZ_HALF`].
 ///
-/// The shape of the refusal says why. Over ±[`COH_AZ_HALF`] rows ×
-/// ±[`COH_RANGE_HALF`] gates one verdict covers 81 radials × 65 gates, so the
-/// mask is not scattered — 16 775 flagged bins fall in 76 components of which
-/// **one holds 68%**, spanning 199 of 720 radials and every gate of the
-/// annulus, and a second holds 21%. Half the reference's field (1784 of 3546
-/// bins) lies inside that censored wedge, painted continuously and in
-/// couplet-shaped clusters. This module paints nothing there by construction.
+/// The mask that shape produces is smaller and narrower but it is the same
+/// object: 16 775 flagged bins over the annulus become 13 994, in 127
+/// components against 103, and the largest still holds three quarters of it
+/// and spans 173 of 720 radials where it spanned 197. The reference paints
+/// 984 bins inside that component where it painted 1200. So a quadrant is
+/// still cut out of an otherwise aligned field, and **most of it is not an
+/// artefact of the window's extent** — the ground under it really does
+/// straddle everywhere, and the reference really does paint there anyway.
+/// Distance from a censored bin to the nearest straddling pair does not
+/// separate the two volumes either: the bins the reference paints and this
+/// rule refuses at KTLX sit a median 2.0 bins from straddle evidence, and
+/// KHNX's twenty ND bins sit the same 2.0.
+///
+/// Whatever the reference is using to tell KTLX's clear air from KHNX's, it is
+/// still not this statistic, and it is still not this statistic's support. The
+/// window was the wrong shape; it was not the whole answer.
 ///
 /// So the clear-air difference is not sparseness spread over the sweep and it
 /// is not a registration error — the two fields' overlap peaks at exactly zero
 /// shift in radials and in gates, falling off symmetrically either way, and
 /// where both carry a value they agree: over the unbiased 240-point ring,
-/// mean |Δ| 0.038 with the sign right 9 times in 9. It is a quadrant cut out
-/// of an otherwise aligned field, and it is cut here.
+/// mean |Δ| 0.038 with the sign right 9 times in 9.
 const COH_MAX_STRADDLE: f64 = 0.09;
 
 /// The neighbourhood the straddling fraction is counted over: half-spans in
 /// rows and in gates.
 ///
-/// Wide, and that is the measurement rather than a preference. Over the ±5
-/// rows × ±4 gates [`range_texture`] reads, the same statistic puts KCRP's
-/// worst bin at 0.29 and KHNX's best at 0.04 — the two overlap completely,
-/// because a fold wall fills a small window as thoroughly as noise does. The
-/// wall only dilutes once the neighbourhood is large enough to hold ground the
-/// wall does not cross, and incoherent velocity does not dilute at all: at
-/// ±40 rows × ±32 gates KHNX's twenty bins read 0.11..0.21 while KCRP's
-/// nineteen read 0.01..0.08.
-const COH_AZ_HALF: i32 = 40;
-const COH_RANGE_HALF: i32 = 32;
+/// Long along the beam and narrow across it, because the statistic is an
+/// along-beam one. It counts pairs of gates [`TEXTURE_STEP_KM`] apart on a
+/// single radial; range is the axis it is measured on and azimuth is only
+/// where more of it can be found. The window that reads it should have the
+/// same shape, and the one this rule shipped with had the opposite one —
+/// ±40 rows × ±32 gates, 81 radials wide and 16 km deep.
+///
+/// # Why a wide window at all
+///
+/// Over the ±5 rows × ±4 gates [`range_texture`] reads, the same statistic
+/// puts KCRP's worst bin at 0.29 and KHNX's best at 0.04 — the two overlap
+/// completely, because a fold wall fills a small window as thoroughly as
+/// noise does. The wall only dilutes once the neighbourhood holds ground the
+/// wall does not cross, and incoherent velocity does not dilute at all.
+///
+/// So the window is a variance argument, and its half-spans are counts of
+/// samples rather than an angle and a distance — which is why they are in
+/// rows and gates and not in degrees and kilometres. A cut with twice the
+/// rows gets twice the rows here, and that is the intent.
+///
+/// # Where these two numbers come from
+///
+/// Not from a preference for narrowness. Against the reference's decoded
+/// field at KTLX (see [`COH_MAX_STRADDLE`]) both half-spans were swept, with
+/// the threshold held at its measured 0.09 throughout and KHNX's twenty ND
+/// bins — the null control — deciding admissibility. Shrinking the window
+/// fails at once: at ±20 × ±16 KHNX paints 180 bins that must read ND, at
+/// ±10 × ±8 it paints 681. Shrinking azimuth *while lengthening range* does
+/// not, and it is the only direction that does not:
+///
+/// ```text
+///     half-spans     KHNX painted   KTLX bins agreeing   precision
+///     ±40 × ±32  (shipped)     0            434            0.383
+///     ±16 × ±96                8            646            0.437
+///     ±16 × ±128               0            654            0.419
+///     ±16 × ±160               0            670            0.426
+///     ±16 × ±192               0            661            0.424
+///     ±16 × ±256               0            661            0.426
+/// ```
+///
+/// ±192 is the smallest depth on that plateau at which KHNX also holds a
+/// margin: raise the threshold to 0.10 and the shipped window leaks 14 bins
+/// at KHNX where this one leaks none, and at 0.11 the shipped window leaks 64
+/// against this one's 15. The neighbourhood is therefore both **narrower
+/// where it was doing harm** — 81 radials to 33 — and better separated from
+/// the volume that has to stay dark.
+const COH_AZ_HALF: i32 = 16;
+const COH_RANGE_HALF: i32 = 192;
 
 /// Where the sweep carries velocity that has no coherent solution.
 ///
@@ -2453,34 +2503,45 @@ const COH_RANGE_HALF: i32 = 32;
 /// # What it moves
 ///
 /// Lowest super-res velocity cut, painted bins (|NROT| ≥ [`SIGNIFICANT`])
-/// inside 80 km, before → after:
+/// inside 80 km. "off" is this rule removed entirely, "±40 × ±32" the window
+/// it shipped with, "±16 × ±192" the one [`COH_AZ_HALF`] now declares:
 ///
 /// ```text
-///     KHNX 2024-12-16  clear air, Vny 11.66   2404 →    0
-///     KTLX 2025-02-19  clear air, Vny 11.49   1686 → 1216
-///     KCRP 2017-08-26  Harvey,    Vny 31.52   5076 → 4987
-///     KDMX 2022-03-05             Vny 27.93   2868 → 2863
-///     KFTG 2023-06-22             Vny 24.01   1467 → 1467
-///     KLOT 2024-12-16             Vny 23.96     69 →   69
-///     KMSX 2022-06-04             Vny 24.21     32 →   32
+///                                              off   ±40 × ±32   ±16 × ±192
+///     KHNX 2024-12-16  clear air, Vny 11.66    9927           0            0
+///     KTLX 2025-02-19  clear air, Vny 11.49    2539        1230         1656
+///     KBLX 2025-02-19  clear air, Vny 11.17       0           0            0
+///     KAMA 2025-02-19             Vny 11.55       —        1952         2082
+///     KCRP 2017-08-26  Harvey,    Vny 31.52       —        5288         5616
+///     KDMX 2022-03-05             Vny 27.93       —        2947         2938
+///     KFTG 2023-06-22             Vny 24.01       —        1571         1571
+///     KLOT 2024-12-16             Vny 23.96       —          72           72
+///     KMSX 2022-06-04             Vny 24.21       —          34           34
+///     KABR 2025-02-19             Vny 33.33       —          51           51
 /// ```
 ///
-/// Both columns are re-taken since this landed, because
-/// [`GK_MAX_TEXTURE_VNY_FRAC`] now reads the dealiased field and the two
-/// refusals compose differently. Against the raw sweep it read 1548 → 0,
-/// 854 → 677, 3273 → 3670, 2470 → 2469, 1304 → 1304, 69 → 69, 28 → 28. What
-/// this refusal does is unchanged; the ceiling downstream of it moved.
+/// The "off" column is why the window's shape was worth a campaign: at KTLX
+/// removing this rule outright doubles what the module paints **at unchanged
+/// precision against the reference** (0.383 → 0.381), so nothing it censors
+/// there is worse than what it lets through. At KHNX it is the only thing
+/// standing between the module and 9927 painted bins the reference reads ND
+/// at. Those two facts are what every candidate support had to satisfy at
+/// once.
+///
+/// Six holdout volumes that decided nothing — KCBW, KESX, KICT, KLRX, KGJX,
+/// KFSX, Vny 24.26 to 33.50 — read 0, 0, 14, 10, 22, 26 under both windows.
 ///
 /// KHNX's twenty hovered bins, where the reference reads ND at all twenty, go
 /// from six painted to none, and so does the whole cut inside 80 km — which is
 /// what the reference does there: 290 points on the 8/16/24/32/40 nm rings,
-/// none painted. The KFTG 2023-06-22 mesocyclone core is bit-identical —
-/// +1.68, +1.51, +1.60, +1.75 at az 90.8/91.3° and 7.5/8.0 nm, against the
-/// reference's +1.64, +1.52, +1.56, +1.76 — because the ground this refuses is
-/// nowhere the stencil reads there. And it moves no rung of any synthetic
-/// ladder: 194 of the 216 rungs across the noise, common-mode, fine, azimuthal
-/// and square-wave families at seven sites agree with the reference, the same
-/// 194 as before, disagreeing on the same 22.
+/// none painted. The KFTG 2023-06-22 mesocyclone core is bit-identical under
+/// either window — +1.68, +1.50, +1.59, +1.75 at az 90.8/91.3° and 7.5/8.0 nm,
+/// against the reference's +1.64, +1.52, +1.56, +1.76 — because the ground
+/// this refuses is nowhere the stencil reads there. And neither window moves a
+/// rung of any synthetic ladder: 195 of the 216 rungs across the noise,
+/// common-mode, fine, azimuthal and square-wave families at seven sites agree
+/// with the reference, disagreeing on the same 21, with the same 155 cells
+/// exactly right.
 fn incoherent_velocity(
     raw: &[Vec<f64>],
     rows: crate::azimuth::Rows,
@@ -2496,7 +2557,10 @@ fn incoherent_velocity(
     let dk = ((TEXTURE_STEP_KM / gate_interval_km).round() as usize).max(1);
     // Per row, the straddling and present pair counts and their running window
     // sums, so the azimuthal pass adds rows rather than rewalking gates —
-    // ±COH_AZ_HALF rows is 81 of them per bin on a rotation.
+    // ±COH_AZ_HALF rows is 33 of them per bin on a rotation, and the range
+    // half-span costs nothing beyond the prefix sum however deep it is, which
+    // is why ±COH_RANGE_HALF may be 385 gates without the rule getting slower.
+    // A window that deep still fits u16: it can hold at most 385 pairs.
     let per_row: Vec<(Vec<u16>, Vec<u16>)> = (0..n)
         .into_par_iter()
         .map(|i| {
