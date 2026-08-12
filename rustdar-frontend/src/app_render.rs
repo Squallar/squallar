@@ -171,7 +171,7 @@ impl super::App {
         self.poll_section_results(&ctx);
         self.poll_level3_results();
         self.poll_site_catalogue();
-        self.poll_overlay_render_results();
+        self.poll_overlay_render_results(&ctx);
         self.poll_loop_scan_list_results();
         self.poll_loop_scan_download_results();
         self.poll_loop_l3_list_results();
@@ -708,19 +708,36 @@ impl super::App {
     }
 
     /// Poll for completed overlay rasterization results and upload textures.
-    fn poll_overlay_render_results(&mut self) {
+    ///
+    /// Handed the frame's context rather than reaching through `self.state` for
+    /// one, for the reason the resolution site gives: an `AppState` is a wgpu
+    /// device, a surface and a window, and `Context::load_texture` needs none of
+    /// them. Taking it as a parameter is what lets this poller be driven against
+    /// a bare `egui::Context`, as its plan-view and loop siblings already are —
+    /// and this is the poller with the largest buffer passing through it.
+    fn poll_overlay_render_results(&mut self, ctx: &egui::Context) {
         use rustdar_egui::overlay_cache::OverlayTextureData;
 
-        let ctx = self.state.as_ref().unwrap().egui_renderer.context();
         while let Ok(resp) = self.channels.overlay_render_receiver.try_recv() {
-            // Load texture once, then clone handle to all target panes
+            // Load texture once, then clone handle to all target panes.
+            //
+            // The pixels arrive already converted — see
+            // `OverlayRenderResponse::image` — so nothing here walks the buffer.
+            // The upload takes the `Arc` itself (`ImageData: From<Arc<ColorImage>>`),
+            // so it is not copied on the way to the GPU either.
             self.texture_counter += 1;
-            let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                [resp.width as usize, resp.height as usize],
-                &resp.image_data,
-            );
+            // The picture's own dimensions rather than a pair carried beside it:
+            // the rasterizer was handed a width and a height and answered with
+            // exactly that many pixels, and a second copy of the numbers is a
+            // second thing that can disagree with the texture being placed.
+            let [width, height] = resp.image.size;
+            let (width, height) = (width as u32, height as u32);
             let tex_name = format!("overlay_{}", self.texture_counter);
-            let texture = ctx.load_texture(tex_name, color_image, egui::TextureOptions::LINEAR);
+            let texture = ctx.load_texture(
+                tex_name,
+                Arc::clone(&resp.image),
+                egui::TextureOptions::LINEAR,
+            );
 
             for &pane_idx in &resp.pane_indices {
                 let Some(pane) = self.gui.pane_mut(pane_idx) else {
@@ -751,8 +768,8 @@ impl super::App {
                     geo_bounds: resp.geo_bounds,
                     data_generation: resp.generation,
                     render_zoom: resp.zoom,
-                    width: resp.width,
-                    height: resp.height,
+                    width,
+                    height,
                     radar_meta: None,
                     hit_map: resp.hit_map.clone(),
                 });
@@ -3952,6 +3969,23 @@ mod declared_nyquist_dispatch_tests;
 #[path = "app_render/frame_build_order_tests.rs"]
 #[cfg(test)]
 mod frame_build_order_tests;
+
+/// Where the per-pixel unmultiply is allowed to run, and where it is not.
+///
+/// The binding rule about heavy work on the frame thread, checked at the two
+/// places that kept breaking it: a full-size `ColorImage::from_rgba_unmultiplied`
+/// is 6.66 ms for a 2048² radar raster and ~47 ms for a desktop-sized overlay,
+/// against a 16.7 ms budget, and both are ordinary per-volume events rather than
+/// rare ones.
+#[path = "app_render/frame_thread_conversion_tests.rs"]
+#[cfg(test)]
+mod frame_thread_conversion_tests;
+
+/// What the overlay poller puts on the GPU, read back from egui's own texture
+/// delta rather than inferred.
+#[path = "app_render/overlay_upload_tests.rs"]
+#[cfg(test)]
+mod overlay_upload_tests;
 
 #[path = "app_render/frame_order_tests.rs"]
 #[cfg(test)]

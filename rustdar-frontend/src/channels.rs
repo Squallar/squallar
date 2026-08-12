@@ -164,9 +164,43 @@ pub struct Level3Response {
 
 /// Result from a background overlay rasterization thread.
 pub struct OverlayRenderResponse {
-    pub image_data: Vec<u8>,
-    pub width: u32,
-    pub height: u32,
+    /// Already in egui's pixel layout, and already an `Arc`, for the reason
+    /// [`RenderedImage::image`] gives — and at the size that makes this the
+    /// larger of the two cases rather than the smaller.
+    ///
+    /// An overlay texture is planned against the *viewport plus overdraw*
+    /// (`plan_overlay_texture`), so on a desktop it is not the radar raster's
+    /// 2048² but whatever the window is: 5760×3240 measured here, 18.7 M
+    /// pixels, **71.2 MiB** of `Color32` (74,649,600 bytes). The unmultiply over
+    /// that measured **45.5 ms best, 47.6 ms median** on a 7950X — nearly three
+    /// frames — and it used to run in `poll_overlay_render_results`, on the
+    /// **frame thread**, once per arriving overlay, drained unbounded over
+    /// every overlay kind the user has switched on.
+    ///
+    /// # Two fifths of that was paging, not arithmetic
+    ///
+    /// Both buffers are far above glibc's `DEFAULT_MMAP_THRESHOLD_MAX` — 32 MiB
+    /// on 64-bit — so neither is ever recycled from the heap: each is its own
+    /// `mmap`/`munmap` and every page of it is faulted in on first touch.
+    /// Measured by running the same per-pixel loop twice, once into a fresh
+    /// destination and once into one that stays faulted in: **40.7 ms with
+    /// 18,226 minor faults, against 23.7 ms with none**. So 17.0 ms of the
+    /// conversion was the destination's first touch, and 18,225 of those faults
+    /// are simply 74,649,600 ÷ 4096 — every page of the buffer, exactly once.
+    ///
+    /// That cost travels with the conversion rather than disappearing: the
+    /// syscall counts either side of this change are the same to within two
+    /// calls. It is now paid on the rasterizing thread, beside the
+    /// rasterization that had to fault the RGBA buffer in anyway.
+    ///
+    /// The `Arc` is the second half — see `App::poll_overlay_render_results`,
+    /// which uploads once and clones the handle to every pane in
+    /// `pane_indices`. Not a link: the module is private, reached through a
+    /// `#[path]` attribute, so rustdoc can resolve no path to it from here.
+    ///
+    /// The renderer's `Vec<u8>` is dropped in the same closure that converts it,
+    /// so the RGBA buffer and its `Color32` copy never coexist in the channel.
+    pub image: Arc<egui::ColorImage>,
     pub geo_bounds: GeoBounds,
     pub overlay_kind: OverlayKind,
     pub generation: u64,

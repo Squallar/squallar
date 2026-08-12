@@ -688,10 +688,15 @@ impl super::App {
                 };
                 crate::offload::offload("overlay-render", move || {
                     let output = rasterize_fn(&render_bounds, width, height);
+                    // Converted here rather than on arrival, and the RGBA
+                    // buffer dropped at the end of this statement — see
+                    // `OverlayRenderResponse::image`.
+                    let image = std::sync::Arc::new(egui::ColorImage::from_rgba_unmultiplied(
+                        [width as usize, height as usize],
+                        &output.rgba,
+                    ));
                     let _ = sender.send(OverlayRenderResponse {
-                        image_data: output.rgba,
-                        width,
-                        height,
+                        image,
                         geo_bounds: render_bounds,
                         overlay_kind: kind,
                         generation: data_generation,
@@ -722,7 +727,7 @@ impl super::App {
                     })
                     .collect();
                 crate::offload::offload("sites-render", move || {
-                    let image_data = rasterize::rasterize_radar_sites(
+                    let rgba = rasterize::rasterize_radar_sites(
                         &sites,
                         &render_bounds,
                         width,
@@ -730,10 +735,17 @@ impl super::App {
                         actual_zoom,
                         is_dark,
                     );
+                    // Same conversion, same place, same reason — see
+                    // `OverlayRenderResponse::image`. This one is not the
+                    // cheaper case for being a simpler picture: the site markers
+                    // cover the whole viewport too, so the buffer is the same
+                    // size as any other overlay's.
+                    let image = std::sync::Arc::new(egui::ColorImage::from_rgba_unmultiplied(
+                        [width as usize, height as usize],
+                        &rgba,
+                    ));
                     let _ = sender.send(OverlayRenderResponse {
-                        image_data,
-                        width,
-                        height,
+                        image,
                         geo_bounds: render_bounds,
                         overlay_kind: kind,
                         generation: data_generation,
