@@ -143,7 +143,26 @@ jobs:
             echo "::error::No Android NDK on this runner. Refusing to auto-commit a tree whose Android arm was never compiled."
             exit 1
           fi
-          cargo ndk -t arm64-v8a -P 28 check -p rustdar-android --lib
+          # `-P` is the NDK link platform and has to equal the Gradle build's
+          # minSdk: a lower level's sysroot is missing symbols the graphics/JNI
+          # stack links against, so a mismatch here checks a target the app is
+          # never built for. It used to be a literal `28` kept in step by hand.
+          # build.yaml's Android rows lost theirs by handing the whole cargo-ndk
+          # invocation to Gradle, which reads minSdk itself; this step lints
+          # rather than packages, so it stays a direct `cargo ndk` call and
+          # reads the number out of the same file instead.
+          #
+          # `|| true` because `set -e` aborts on an assignment whose command
+          # substitution failed -- without it a pattern that stopped matching
+          # would end the step on grep's bare exit 1 and the `::error::` below
+          # would never print.
+          gradle_kts=rustdar-android/android/app/build.gradle.kts
+          min_sdk=$(grep -oP '^\s*minSdk\s*=\s*\K[0-9]+' "$gradle_kts" || true)
+          if [ -z "$min_sdk" ]; then
+            echo "::error::could not read minSdk out of $gradle_kts. Refusing to guess the NDK platform level."
+            exit 1
+          fi
+          cargo ndk -t arm64-v8a -P "$min_sdk" check -p rustdar-android --lib
 
       # Not on pull_request: that event checks out the detached PR merge ref,
       # so there is no branch here to commit to — the push either fails or

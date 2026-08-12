@@ -112,23 +112,79 @@ jobs:
             artifact: ios/build/linux/iphonesimulator/rustdar.app
             cmd: make -C ios IN_CONTAINER=1 SIMULATOR=1
 
-          # cargo-ndk, not bare cargo: `ring`'s build script needs the cross
-          # clang/sysroot it exports, and it is what android/app/build.gradle.kts
-          # drives. `-P 28` must track minSdk there -- a lower platform level's
-          # sysroot lacks symbols the graphics/JNI stack links against.
+          # `./gradlew assembleRelease`, not a bare `cargo ndk`. These were the
+          # only rows whose artifact nobody could act on: every other row ships
+          # something that runs, and these shipped a `.so`, which is not an app
+          # but an input to one. Turning it into an installable APK is
+          # android/app/build.gradle.kts's job and it was already written; CI
+          # simply never called it.
           #
-          # `--release` for the same reason as the desktop rows, and because it
-          # is the profile a real APK ships: build.gradle.kts's
-          # `buildRustLibRelease` passes `--release`, so a debug .so here was a
-          # library nothing installable ever contains.
+          # This is still one compile of one triple, and the coverage the old
+          # `cargo ndk` line gave is unchanged, because Gradle *is* that line:
+          # `buildRustLibRelease` runs `cargo ndk -t <abi> -P <minSdk> build -p
+          # rustdar-android --lib --release`. `ring`'s build script still gets
+          # the cross clang/sysroot cargo-ndk exports. What changes is that the
+          # two constants are read from the Gradle build instead of repeated
+          # here: the old comment warned that `-P 28` "must track minSdk there",
+          # and on these rows it no longer can, because Gradle reads minSdk
+          # rather than being told it.
+          #
+          # That does not retire the literal repo-wide, and it is worth saying
+          # where the other one lives instead of implying there is none.
+          # clippy.yaml's "Verify the autofixed tree still builds (Android
+          # arm64-v8a)" step calls `cargo ndk` directly -- it lints rather than
+          # packages, so routing it through Gradle would buy it an APK it has
+          # no use for -- and something still has to hand it the platform
+          # level. That step now greps `minSdk` out of the same
+          # build.gradle.kts, so the number has one definition and two readers
+          # rather than one definition and two copies.
+          #
+          # `-PabiFilter` is what keeps one row to one ABI. Without it each row
+          # builds both, so every .so is compiled twice per run and a break in
+          # either ABI reddens both rows instead of the one that owns it.
+          #
+          # `abi` repeats what `-PabiFilter` already says because a matrix entry
+          # cannot reference a sibling key. It is not loose duplication: the
+          # assertion step reads the ABI back out of the finished APK and
+          # compares it to this, so the two disagreeing is a red row.
+          #
+          # The artifact *name* is itself the first signing check. AGP emits
+          # `app-<abi>-release-unsigned.apk` when the release build type has no
+          # signingConfig and `app-<abi>-release.apk` when it has one, so with
+          # `if-no-files-found: error` below, a run whose signing step quietly
+          # did nothing fails on the missing path rather than uploading a file
+          # Android would refuse to install. The assertion step still runs
+          # apksigner over the result afterwards, because a filename is not a
+          # signature.
+          #
+          # Two things `assembleRelease` brings with it that this change does
+          # not act on, written down so the next person meets them as known
+          # rather than as a surprise:
+          #
+          #   - It runs `lintVitalRelease`, so these rows can now go red on an
+          #     Android lint finding -- scope the `cargo ndk` line never had,
+          #     since it only ever compiled Rust. Nothing here configures or
+          #     suppresses that. The first time it fires is the moment to
+          #     choose between fixing the finding and scoping the lint,
+          #     deliberately rather than by reflex.
+          #
+          #   - R8 writes `mapping.txt` and AGP writes
+          #     `native-debug-symbols.zip`, and both die with the container.
+          #     Uploading them beside the APK is what would make a crash from a
+          #     CI build symbolicable; it is left out only because it is a
+          #     change to the upload step rather than to the build.
           - name: android-arm64-v8a
             target: aarch64-linux-android
-            cmd: cargo ndk -t arm64-v8a -P 28 build -p rustdar-android --lib --release
-            artifact: target/aarch64-linux-android/release/librustdar_android.so
+            package: android
+            abi: arm64-v8a
+            cmd: cd rustdar-android/android && ./gradlew assembleRelease -PabiFilter=arm64-v8a
+            artifact: rustdar-android/android/app/build/outputs/apk/release/app-arm64-v8a-release.apk
           - name: android-x86_64
             target: x86_64-linux-android
-            cmd: cargo ndk -t x86_64 -P 28 build -p rustdar-android --lib --release
-            artifact: target/x86_64-linux-android/release/librustdar_android.so
+            package: android
+            abi: x86_64
+            cmd: cd rustdar-android/android && ./gradlew assembleRelease -PabiFilter=x86_64
+            artifact: rustdar-android/android/app/build/outputs/apk/release/app-x86_64-release.apk
 
           # The only wasm build, and deliberately so. The deleted `wasm32
           # libraries` row named members as roots, so rustdar-gps took its own
@@ -260,8 +316,263 @@ jobs:
           # over it would shadow the image's own wasm-pack and cargo-ndk.
           cache-bin: "false"
 
+      # ── The two Android steps below run *before* the row's own command ──
+      #
+      # Unlike the macOS packaging steps further down, which take a binary the
+      # row already built, these are prerequisites of the build itself: on the
+      # Android rows Gradle is what compiles the Rust, so the SDK and the
+      # signing key have to exist before `assembleRelease`, not after it.
+      #
+      # `~/.gradle` is deliberately NOT cached, and that is a measured decision
+      # rather than an omission. `rust-cache` above covers Cargo only, so a
+      # Gradle build does add a second cacheable tree -- it is simply not one
+      # worth caching. Measured from a completely empty Gradle home: the whole
+      # Gradle-side cost, wrapper distribution included, is 39 s wall clock,
+      # and what it leaves behind is 708 MB (163 MB of unpacked distribution,
+      # 544 MB of resolved AGP and its dependencies).
+      #
+      # Caching that saves some part of 39 s and costs 708 MB *per row*, in a
+      # repository cache budget of 10 GB that the eleven `rust-cache` entries
+      # already share. Those entries save minutes each; spending 1.4 GB of the
+      # budget that keeps them alive, to save seconds, is the wrong side of
+      # that trade. Revisit it if the Gradle build ever grows a step that is
+      # slow rather than merely large.
+      - name: Install the SDK packages this build needs
+        if: matrix.package == 'android'
+        # The image carries the NDK -- at exactly the version and path
+        # build.gradle.kts pins, `$ANDROID_HOME/ndk/27.3.13750724` -- plus a
+        # JDK 21 and the cmdline-tools. What it does not carry is either half of
+        # what AGP asks for here: its Android platform is `android-37.0` and its
+        # build-tools are `37.0.0`, while `compileSdk` is 36 and AGP 9.3.1's
+        # DEFAULT_BUILD_TOOLS_REVISION is 36.0.0. A *newer* package satisfies
+        # neither request; both are looked up by exact version.
+        #
+        # The conclusion that invites -- that without this step the build dies
+        # in `:app:minifyReleaseWithR8` with "Failed to find target with hash
+        # string 'android-36'" -- is wrong, and this was checked rather than
+        # reasoned about. With this step deleted, a cold Gradle home and an
+        # empty build cache, this image takes that very task to BUILD
+        # SUCCESSFUL, logging "License for package Android SDK Build-Tools 36
+        # accepted" and "Installing Android SDK Platform 36 in
+        # /opt/android-sdk/platforms/android-36" on the way, and leaves both
+        # packages on disk. AGP downloads what it is missing. That failure is
+        # real only with AGP's auto-download disabled, which is not a
+        # configuration this job uses.
+        #
+        # So the step is not a prerequisite. It stays because it makes the
+        # download legible and names the versions. Roughly 70 MB comes off
+        # dl.google.com either way -- fetched here, a bad minute at Google is a
+        # red step called "Install the SDK packages this build needs"; fetched
+        # inside `assembleRelease`, it is a Gradle task dying partway through a
+        # Rust compile, which reads like the build broke. The two versions
+        # below are also the only statement anywhere in this repository of what
+        # AGP 9.3.1 actually asks for.
+        #
+        # Not pinned by sha256 the way `rcodesign` is below, and the difference
+        # is real rather than an oversight. rcodesign is a tarball pulled off a
+        # release page with curl, which verifies nothing at all. `sdkmanager` is
+        # the SDK's own package manager: it resolves against Google's repository
+        # manifest and checks every package against the checksum in it, which is
+        # the same standing this file already extends to `apt-get`. What does
+        # have to be pinned is the *version*, and both of them are.
+        #
+        # `compileSdk` is read out of build.gradle.kts instead of written again
+        # here, because that number belongs to the repo and a second copy of it
+        # would drift in silence -- exactly because of the auto-download above.
+        # A stale literal would not fail; it would leave this step installing
+        # one platform while the build quietly fetched and used another, with
+        # nothing anywhere to notice the divergence.
+        #
+        # `build-tools;36.0.0` beside it is a literal, and that asymmetry is
+        # deliberate rather than the thing the paragraph above complains about.
+        # There is nothing in this repository to read it from: build.gradle.kts
+        # never sets `buildToolsVersion`, so 36.0.0 is AGP 9.3.1's own
+        # DEFAULT_BUILD_TOOLS_REVISION -- a property of the plugin, not of this
+        # code, and reachable only by parsing AGP's jar. What makes the literal
+        # tolerable where a `compileSdk` literal would not be is the same
+        # auto-download: AGP fetches the revision it actually wants regardless,
+        # so a stale number here costs a redundant download, not a red row.
+        #
+        # `--licenses` is a no-op in this image. All seven files under
+        # `$ANDROID_HOME/licenses/` survive its final `rm -rf` -- checked, not
+        # assumed. It is kept as insurance against a *future* image that stops
+        # shipping them, where sdkmanager would refuse to install anything and
+        # this step would be the only thing standing between that image and a
+        # broken Android row. It costs about a second.
+        #
+        # It is fed by redirection from a process substitution and *not* by the
+        # `yes | sdkmanager --licenses` every guide writes, because this job
+        # runs under `bash -eo pipefail`. sdkmanager stops reading once it has
+        # its answers, `yes` takes SIGPIPE, and pipefail hands the pipeline
+        # `yes`'s 141 -- so the idiom aborts the step, having done its work,
+        # whether or not there was anything left to accept. Measured at 141 in
+        # both the already-licensed and the never-licensed case; a redirection
+        # is not a pipeline, so there is no status for pipefail to adopt.
+        #
+        # `|| true` on the grep is load-bearing rather than defensive noise.
+        # Without it the `test -n` under it is unreachable: `set -e` aborts on
+        # an assignment whose command substitution failed, so a `compileSdk`
+        # line that stopped matching would end the step on grep's bare exit 1
+        # and the `::error::` would never be printed. Checked both ways -- the
+        # annotation appears only with the `|| true` there.
+        run: |
+          sdk=$(grep -oP '^\s*compileSdk\s*=\s*\K[0-9]+' rustdar-android/android/app/build.gradle.kts || true)
+          test -n "$sdk" \
+            || { echo "::error::could not read compileSdk out of app/build.gradle.kts"; exit 1; }
+          sdkmanager --licenses < <(yes) >/dev/null
+          sdkmanager "platforms;android-$sdk" "build-tools;36.0.0"
+
+      - name: Mint a throwaway signing key
+        if: matrix.package == 'android'
+        # Android will not install an unsigned APK, so a release artifact has to
+        # be signed with something, and that something must not be a real key:
+        # a signing key wired into CI is reachable by any change to the workflow
+        # that runs it, and these artifacts are per-commit test builds, not Play
+        # Store uploads.
+        # Writing `keystore.properties` is the whole integration -- build.gradle.kts
+        # creates its `release` signingConfig if and only if that file is there,
+        # so nothing in the Gradle build changes for this.
+        #
+        # It also means the loud "NO SIGNING KEY" warning build.gradle.kts
+        # raises at the end of an unsigned release build stops firing here
+        # because the artifact is genuinely signed -- not because anything
+        # suppressed it. If this step is ever removed, that warning comes back
+        # and the upload fails on the `-unsigned` filename.
+        #
+        # ── Why the key is fresh every run, and what that costs ──
+        #
+        # The tempting alternative is "just use the stock Android debug key",
+        # and it does not exist. `~/.android/debug.keystore` is *generated per
+        # machine* by the Android tooling; what is standard about it is only the
+        # `androiddebugkey` alias, the `android` password and the `CN=Android
+        # Debug` subject. The keypair behind them is not standard, and Android
+        # compares the signing certificate, not its subject -- so writing that
+        # DN here would produce a different identity every run anyway, while
+        # implying a stability it does not have.
+        #
+        # So this identity changes per run, and the consequence is worth naming
+        # rather than hiding: installing one run's APK over another's fails with
+        # INSTALL_FAILED_UPDATE_INCOMPATIBLE, and the fix is to
+        # `adb uninstall dev.mcswain.rustdar` first. The assertion step below
+        # puts that in the run's own log as a `::notice::`. It is emitted from
+        # there and not from here so that it is only ever attached to a run
+        # that produced an APK -- said at this point, a row that failed to
+        # compile would still advise the reader how to install an artifact that
+        # does not exist.
+        #
+        # A stable identity is only reachable by persisting key material, and
+        # there are exactly two ways: commit it -- a private key in the repo, no
+        # -- or add a repository secret and base64 it in here, the way
+        # MACOS_SIGNING_P12 is handled below. That is the change to make if
+        # reinstalling ever becomes the annoyance macOS's location re-prompt is;
+        # it is not wired up speculatively.
+        #
+        # The DN is deliberately *not* `CN=Android Debug`. Whoever inspects this
+        # certificate should be able to see at a glance that it is neither a
+        # release key nor a locally built debug APK.
+        #
+        # The password is in the clear on purpose and is not a secret: it guards
+        # a keypair generated three lines above it and destroyed with the
+        # container. Both files land on paths rustdar-android/android/.gitignore
+        # already covers (`keystore.properties`, `*.jks`), so a stray `git add`
+        # cannot carry either of them.
+        #
+        # `$JAVA_HOME/bin/keytool`, not bare `keytool` -- but not because bare
+        # `keytool` is missing. It resolves perfectly well here, through
+        # /usr/bin/keytool -> /etc/alternatives/keytool. That *is* the reason:
+        # what PATH offers is Debian's `alternatives` symlink, which points at
+        # whichever JDK the image last selected, while Gradle and AGP run under
+        # JAVA_HOME. Today both land on the same JDK 21. Naming JAVA_HOME is
+        # what keeps the keystore written by the same JDK that reads it on the
+        # day the image gains a second one.
+        run: |
+          cd rustdar-android/android
+          # Idempotent by deletion. keytool refuses a second `-genkeypair` into
+          # a keystore that already holds the alias ("Key pair not generated,
+          # alias <ci> already exists"), which a GitHub-hosted runner never
+          # reaches -- its workspace is new every time -- and which a
+          # self-hosted one would hit on its second run. The keystore is
+          # throwaway by construction, so throwing the old one away is the
+          # entire fix.
+          rm -f ci-signing.jks keystore.properties
+          "$JAVA_HOME/bin/keytool" -genkeypair -v \
+            -keystore ci-signing.jks -storetype PKCS12 \
+            -alias ci -keyalg RSA -keysize 2048 -validity 10950 \
+            -storepass rustdar-ci-throwaway -keypass rustdar-ci-throwaway \
+            -dname "CN=rustdar CI, OU=throwaway signing key, O=rustdar, C=US"
+          {
+            echo "storeFile=ci-signing.jks"
+            echo "storePassword=rustdar-ci-throwaway"
+            echo "keyAlias=ci"
+            echo "keyPassword=rustdar-ci-throwaway"
+          } > keystore.properties
+
       - name: ${{ matrix.name }}
         run: ${{ matrix.cmd }}
+
+      - name: Prove the APK is a signed, non-debuggable release
+        if: matrix.package == 'android'
+        # Run against the exact file that is about to be uploaded, not against
+        # the build that produced it.
+        #
+        # `apksigner verify` on its own establishes only that the APK carries
+        # *a* valid signature, which any stray keystore.properties would
+        # satisfy just as well as the one the step above wrote. The DN grep is
+        # what makes it *this* key: apksigner prints
+        # `V2 Signer: certificate DN: CN=rustdar CI, OU=throwaway signing key,
+        # O=rustdar, C=US` on stdout, so an APK signed by something unexpected
+        # reddens the row instead of going out as though this workflow had
+        # minted it. `OU=` rather than the whole DN, because the OU is the part
+        # that says what the key is *for*.
+        #
+        # `application-debuggable` is the assertion that earns its keep.
+        # `assembleRelease` is one word away from `assembleDebug`, both produce
+        # an APK that installs and runs, and the difference is that one of them
+        # is a debuggable process holding GPS fixes and cached configuration
+        # that any app on the device can attach to. Nothing else in this file
+        # would notice the substitution: aapt2 prints that line for a debug
+        # build and prints nothing for a release one.
+        #
+        # The ABI line catches the other silent swap. A dropped or mistyped
+        # `-PabiFilter` yields an APK carrying both libraries, which installs
+        # perfectly well -- so both rows would go green while uploading the same
+        # fat file under two different names. Comparing the whole line rather
+        # than searching within it is what makes that fail: aapt2 lists every
+        # ABI on it, so an extra one no longer matches.
+        #
+        # These two tools are taken from whatever build-tools is newest rather
+        # than from the pinned 36.0.0 the step above installs, and that is the
+        # point: AGP looks its build-tools up by exact version, while apksigner
+        # and aapt2 are being used here as general-purpose readers of a finished
+        # APK and any recent copy will do.
+        run: |
+          bt=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          apk='${{ matrix.artifact }}'
+
+          certs=$("$bt/apksigner" verify --verbose --print-certs "$apk")
+          printf '%s\n' "$certs"
+          if ! printf '%s\n' "$certs" | grep -q 'OU=throwaway signing key'; then
+            echo "::error::$apk carries a valid signature, but not from the throwaway key this workflow mints."
+            exit 1
+          fi
+
+          badging=$("$bt/aapt2" dump badging "$apk")
+          if printf '%s\n' "$badging" | grep -q '^application-debuggable'; then
+            echo "::error::$apk is debuggable, so it is not the release build this row claims to ship."
+            exit 1
+          fi
+
+          # `|| true` so that a missing line reaches the comparison below and is
+          # reported, rather than killing the step on grep's exit status under
+          # `set -e` with nothing said about why.
+          got=$(printf '%s\n' "$badging" | grep '^native-code:' || true)
+          want="native-code: '${{ matrix.abi }}'"
+          if [ "$got" != "$want" ]; then
+            echo "::error::expected exactly [$want] in $apk, got [$got]"
+            exit 1
+          fi
+          echo "ok: signed by the throwaway key, not debuggable, $got"
+          echo "::notice::${{ matrix.name }} is signed with a throwaway key that differs every run. Installing it over an earlier CI build fails with INSTALL_FAILED_UPDATE_INCOMPATIBLE; run 'adb uninstall dev.mcswain.rustdar' first."
 
       # Neither `curl` nor `zip` is in the image — every layer that installed
       # curl purged it in the same `RUN` — and `rcodesign` never was. The
