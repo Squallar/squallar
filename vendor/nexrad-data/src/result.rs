@@ -46,6 +46,20 @@ pub enum Error {
         /// Actual number of bytes present.
         actual: usize,
     },
+    /// LDM record decompresses to more than
+    /// [`MAX_DECOMPRESSED_RECORD_BYTES`](crate::volume::MAX_DECOMPRESSED_RECORD_BYTES).
+    ///
+    /// A bzip2 stream does not declare its decompressed size, so this is the
+    /// only point at which an over-large record can be detected. The record is
+    /// abandoned at the ceiling rather than expanded to find out how big it
+    /// really is, which is why no decompressed size is reported here.
+    #[error("record decompresses past the {limit} byte ceiling (compressed size {compressed})")]
+    RecordTooLarge {
+        /// The ceiling that was exceeded, in bytes.
+        limit: usize,
+        /// The record's compressed size in bytes, excluding the size prefix.
+        compressed: usize,
+    },
     /// LDM record size is invalid at the given file offset.
     #[error("invalid record size {size} at offset {offset}")]
     InvalidRecordSize {

@@ -218,9 +218,84 @@ make clippy pass**.
 
 ### Changed — source
 
-Nothing yet. `diff -rq` against the unpacked registry copy reports `src/` as
-byte-identical, and this commit is the pure vendoring so that the diff which
-follows is reviewable on its own.
+#### The ceiling — `src/volume/record.rs`, `src/result.rs`
+
+`Record::decompress` grew an upper bound on what it will produce.
+
+```rust
+pub const MAX_DECOMPRESSED_RECORD_BYTES: usize = 16 * 1024 * 1024;
+```
+
+A bzip2 stream does not declare its decompressed size, so `read_to_end` on a
+`BzDecoder` is unbounded by construction — the only way to find out how big a
+record is, is to finish expanding it. Every record this crate decompresses came
+off a network, and the most expansive record in the corpus below expands
+1,363:1, so "the compressed record is small" implies nothing at all about the
+memory the decompression will take. Without a ceiling, a corrupt or hostile
+record is an out-of-memory abort, and on the parallel path it is one per worker
+at once.
+
+**Where 16 MiB comes from.** Two independent legs, and the number has to
+satisfy both — it must be out of reach of real data, and low enough to be worth
+having.
+
+*Real data.* 693 compressed records across 12 volumes: 5 WSR-88D sites spanning
+2017–2023 and 7 TDWR sites, chosen because the two formats build records
+differently.
+
+| | largest record | ceiling is |
+| --- | --- | --- |
+| WSR-88D | 1,416,480 B | **11.8×** larger |
+| TDWR | 325,888 B | **51×** larger |
+
+*The format's own reach.* Archive II groups radials into LDM records of at most
+120 messages, and a message's declared size is a `u16` count of halfwords
+measured from byte 12 — at most 65,535 halfwords, so 131,070 bytes plus the
+12-byte CTM prefix. 120 × 131,082 = **15,729,840 bytes**, which is under
+16,777,216. The ceiling therefore sits above the largest record the structure
+can express, not merely above the largest one this corpus happened to hold.
+That arithmetic is an assertion in
+`decompress_bound_tests::the_ceiling_is_above_every_record_the_archive_ii_structure_can_express`,
+so lowering the constant past the format's reach fails a test rather than
+passing review.
+
+*Worth having.* A bomb costs 16 MiB per worker and ends in an `Err`, instead of
+costing the machine's memory and ending in an abort. At 32 threads that is a
+512 MB worst case.
+
+**Mechanics.** `.take(MAX + 1)` before `read_to_end`, then a length check. One
+byte past the ceiling, so a record of exactly `MAX` bytes is still data and
+anything beyond it is detected without being expanded any further. `Take`
+bounds only how much is read per iteration and how much is kept — it does not
+reserve its limit, which was checked against `default_read_to_end` in std
+rather than assumed — so an ordinary record pays nothing.
+
+The failure is `Error::RecordTooLarge { limit, compressed }`, a new variant, and
+not a panic: one bad record in a volume of 50–130 should be a decode that
+reports a bad record. No decompressed size is reported because the record is
+abandoned at the ceiling rather than expanded to find out how big it really is,
+which is the entire point.
+
+**What it cost.** Nothing measurable, which is the other thing that had to be
+true. Same 12 volumes, release + `lto`, instructions retired differenced across
+2 and 6 repetitions so process setup, file reads and record splitting cancel:
+
+| | instructions per pass | per record |
+| --- | --- | --- |
+| before | 26,064,467,974 | — |
+| after | 26,064,595,110 | **+183** |
+
++0.0005%. Allocation counts, byte totals and peak live bytes are *identical* —
+`diff` on the per-volume allocation table reports no change at all — and so are
+the decoded-moment digest and the raw decompressed-bytes digest over all 14
+volumes.
+
+New `#[cfg(test)] mod decompress_bound_tests` in `src/volume/record.rs`, an
+in-source module so it travels with the fix in the upstream diff. Five tests: a
+record of exactly `MAX` bytes decompresses; a record one byte over is
+`RecordTooLarge`; a 256 MiB bomb that is under 4 KB on the wire is refused; an
+ordinary 2432-byte record round-trips byte-identically; and the Archive II
+arithmetic above.
 
 ## rustfmt
 

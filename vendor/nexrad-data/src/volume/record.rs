@@ -1,5 +1,49 @@
 use std::fmt::Debug;
 
+/// The largest an LDM record may decompress to before [`Record::decompress`]
+/// treats it as malformed rather than as data.
+///
+/// A bzip2 stream does not declare its decompressed size, so decompressing one
+/// is unbounded by construction: the only way to learn how big a record is, is
+/// to finish expanding it. Every record this crate decompresses arrived over a
+/// network, and expansion ratios in real NEXRAD data reach 1,363:1 — a record
+/// of mostly-empty TDWR gates — so "the compressed record is small" implies
+/// nothing about the memory the decompression will take. Without a ceiling a
+/// corrupt or hostile record is an out-of-memory abort, and on the parallel
+/// path it is one per worker at once.
+///
+/// **16 MiB**, and the number has to survive two questions: can a real record
+/// reach it, and is it small enough to be worth having?
+///
+/// *Real records.* Measured over 693 compressed records in 12 volumes — 5
+/// WSR-88D sites spanning 2017-2023 and 7 TDWR sites, the two formats with
+/// different record structures:
+///
+/// | | largest record |
+/// | --- | --- |
+/// | WSR-88D | 1,416,480 B |
+/// | TDWR | 325,888 B |
+///
+/// The ceiling is **11.8×** the largest record ever observed, and 51× the
+/// largest TDWR one.
+///
+/// *The format's own reach.* Archive II groups radials into LDM records of at
+/// most 120 messages, and a message's declared size is a `u16` count of
+/// halfwords measured from byte 12 — at most 65,535 halfwords, so 131,070
+/// bytes plus the 12-byte CTM prefix, 131,082 bytes. A record of 120
+/// maximum-size messages is 15,729,840 bytes, which is **under** 16,777,216.
+/// So the ceiling sits just above the largest record the structure can express,
+/// not merely above the largest one this corpus happened to contain.
+///
+/// *Worth having.* 16 MiB caps a decompression bomb at 16 MiB per worker
+/// instead of at the machine's memory. At 32 threads that is a 512 MB worst
+/// case that ends in an `Err`, against an abort.
+///
+/// Exceeding it is [`Error::RecordTooLarge`](crate::result::Error::RecordTooLarge),
+/// which is an error and not a panic: one bad record in a volume of 50-130 is
+/// a decode that reports a bad record, not a process that dies.
+pub const MAX_DECOMPRESSED_RECORD_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum RecordData<'a> {
     Borrowed(&'a [u8]),
@@ -49,6 +93,10 @@ impl<'a> Record<'a> {
     }
 
     /// Decompresses this LDM record's data.
+    ///
+    /// Records larger than [`MAX_DECOMPRESSED_RECORD_BYTES`] are rejected with
+    /// [`Error::RecordTooLarge`](crate::result::Error::RecordTooLarge) rather
+    /// than decompressed.
     pub fn decompress<'b>(&self) -> crate::result::Result<Record<'b>> {
         use crate::result::Error;
         use bzip2::read::BzDecoder;
@@ -61,8 +109,22 @@ impl<'a> Record<'a> {
         // Skip the four-byte record size prefix
         let data = self.data().split_at(4).1;
 
+        // Read one byte past the ceiling, so that a record which is exactly at
+        // it still decompresses and anything beyond it is detected without
+        // being decompressed any further. `Take` bounds only how much is read
+        // per iteration and how much is kept; it does not reserve its limit, so
+        // this costs nothing for an ordinary record.
         let mut decompressed_data = Vec::new();
-        BzDecoder::new(data).read_to_end(&mut decompressed_data)?;
+        BzDecoder::new(data)
+            .take(MAX_DECOMPRESSED_RECORD_BYTES as u64 + 1)
+            .read_to_end(&mut decompressed_data)?;
+
+        if decompressed_data.len() > MAX_DECOMPRESSED_RECORD_BYTES {
+            return Err(Error::RecordTooLarge {
+                limit: MAX_DECOMPRESSED_RECORD_BYTES,
+                compressed: data.len(),
+            });
+        }
 
         Ok(Record::new(decompressed_data))
     }
@@ -226,4 +288,108 @@ fn split_ctm_frames(data: &[u8]) -> crate::result::Result<Vec<Record<'_>>> {
     }
 
     Ok(vec![Record::from_slice(data)])
+}
+
+#[cfg(test)]
+mod decompress_bound_tests {
+    use super::*;
+    use crate::result::Error;
+
+    /// Build an LDM record the way a volume file carries one: a four-byte
+    /// big-endian size prefix, then a bzip2 stream. `compressed()` looks for
+    /// `BZ` at bytes 4..6, which is the start of the stream, so this is
+    /// indistinguishable from a real record to everything downstream.
+    fn ldm_record(payload: &[u8]) -> Vec<u8> {
+        use bzip2::write::BzEncoder;
+        use bzip2::Compression;
+        use std::io::Write;
+
+        let mut encoder = BzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(payload).expect("compress");
+        let compressed = encoder.finish().expect("finish");
+
+        let mut record = (compressed.len() as u32).to_be_bytes().to_vec();
+        record.extend_from_slice(&compressed);
+        record
+    }
+
+    #[test]
+    fn a_record_at_the_ceiling_still_decompresses() {
+        // Exactly at the limit, so the ceiling is inclusive and the `+ 1` on
+        // the `take` is doing what it is there for. If this ever starts
+        // failing, the bound has been made exclusive by accident and every
+        // record of exactly this size in the wild would be rejected.
+        let payload = vec![0u8; MAX_DECOMPRESSED_RECORD_BYTES];
+        let record = ldm_record(&payload);
+        let decompressed = Record::from_slice(&record)
+            .decompress()
+            .expect("a record at the ceiling is data, not an error");
+        assert_eq!(decompressed.data().len(), MAX_DECOMPRESSED_RECORD_BYTES);
+    }
+
+    #[test]
+    fn a_record_past_the_ceiling_is_an_error_and_not_a_panic() {
+        // One byte over. The failure has to be a value the caller can handle:
+        // a volume is 50-130 records and one bad one is a reported bad record,
+        // not a dead process.
+        let payload = vec![0u8; MAX_DECOMPRESSED_RECORD_BYTES + 1];
+        let record = ldm_record(&payload);
+        match Record::from_slice(&record).decompress() {
+            Err(Error::RecordTooLarge { limit, compressed }) => {
+                assert_eq!(limit, MAX_DECOMPRESSED_RECORD_BYTES);
+                assert_eq!(compressed, record.len() - 4);
+            }
+            Err(other) => panic!("expected RecordTooLarge, got {other:?}"),
+            Ok(r) => panic!("expected RecordTooLarge, decompressed {} bytes", r.data().len()),
+        }
+    }
+
+    #[test]
+    fn a_decompression_bomb_is_refused_without_being_expanded() {
+        // 256 MiB of zeros compresses to a few hundred bytes: this is the
+        // shape of the attack the ceiling exists for. The assertion that
+        // matters is simply that this returns rather than allocating 256 MiB.
+        let payload = vec![0u8; 256 * 1024 * 1024];
+        let record = ldm_record(&payload);
+        assert!(
+            record.len() < 4096,
+            "premise: the bomb is small on the wire, got {} bytes",
+            record.len()
+        );
+        assert!(matches!(
+            Record::from_slice(&record).decompress(),
+            Err(Error::RecordTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn an_ordinary_record_round_trips_unchanged() {
+        // The other half of the bound: normal data must be untouched by it.
+        // 2432 bytes is one CTM frame, the unit a real record is built from.
+        let payload: Vec<u8> = (0..2432u32).map(|i| (i % 251) as u8).collect();
+        let record = ldm_record(&payload);
+        let decompressed = Record::from_slice(&record)
+            .decompress()
+            .expect("an ordinary record decompresses");
+        assert_eq!(decompressed.data(), &payload[..]);
+    }
+
+    #[test]
+    fn the_ceiling_is_above_every_record_the_archive_ii_structure_can_express() {
+        // The derivation in `MAX_DECOMPRESSED_RECORD_BYTES`'s own documentation,
+        // written down as an assertion so that changing the constant downward
+        // past the format's reach is a deliberate act with a failing test.
+        //
+        // 120 messages per LDM record; a message's declared size is a `u16`
+        // count of halfwords measured from byte 12, so at most 65,535 halfwords
+        // plus the 12-byte CTM prefix.
+        const MAX_MESSAGES_PER_RECORD: usize = 120;
+        const MAX_MESSAGE_BYTES: usize = 65_535 * 2 + 12;
+        assert!(
+            MAX_MESSAGES_PER_RECORD * MAX_MESSAGE_BYTES <= MAX_DECOMPRESSED_RECORD_BYTES,
+            "the ceiling ({MAX_DECOMPRESSED_RECORD_BYTES}) is below the largest record \
+             Archive II can express ({})",
+            MAX_MESSAGES_PER_RECORD * MAX_MESSAGE_BYTES
+        );
+    }
 }
