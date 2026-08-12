@@ -27,17 +27,35 @@ impl<'a> Message<'a> {
         let header = reader.take_ref::<Header>()?;
 
         let waveform_count = header.number_of_waveforms.get() as usize;
-        let mut waveform_prf_data = Vec::with_capacity(waveform_count);
+
+        // Sized to what the input can still supply, not to what the header
+        // claims. A waveform entry is variable-length, so `take_slice` — the
+        // way the rest of this crate checks a count before acting on it —
+        // cannot express one; the floor on an entry's cost can, and bounding
+        // by that keeps a declared count from sizing an allocation on its own.
+        let smallest_entry = 2 * size_of::<Code2>();
+        let mut waveform_prf_data =
+            Vec::with_capacity(waveform_count.min(reader.remaining_total() / smallest_entry));
 
         for _ in 0..waveform_count {
             let waveform_type = reader.take_ref::<Code2>()?.get();
             let prf_count = reader.take_ref::<Code2>()?.get() as usize;
 
-            let mut prf_values = Vec::with_capacity(prf_count);
-            for _ in 0..prf_count {
-                let value = reader.take_ref::<Integer4>()?.get();
-                prf_values.push(value);
-            }
+            // Taken as a slice, which fails on EOF, and only then collected —
+            // the shape `volume_coverage_pattern`'s elevation cuts and the
+            // clutter filter map's range zones already use.
+            //
+            // Narrower than the `take_ref` loop it replaces, not just
+            // differently placed: `take_slice` wants the whole run inside one
+            // segment, so a run that fits across the remaining segments but
+            // not in the next one alone is now `UnexpectedEof` where the loop
+            // would have read it in pieces. No Message 32 in any volume
+            // examined here is multi-segment.
+            let prf_values = reader
+                .take_slice::<Integer4>(prf_count)?
+                .iter()
+                .map(|value| value.get())
+                .collect();
 
             waveform_prf_data.push(WaveformPrfData::new(waveform_type, prf_values));
         }

@@ -34,7 +34,23 @@ impl<'a> Message<'a> {
         let header = reader.take_ref::<Header>()?;
 
         let segment_count = header.number_of_elevation_segments.get() as usize;
-        let mut elevation_segments = Vec::with_capacity(segment_count);
+
+        // Sized to what the input can still supply, not to what the header
+        // claims. Each segment costs a two-byte number and a fixed block of
+        // range bins, and that block is read across segment boundaries into an
+        // owned buffer — so `take_slice`, which is how the rest of this crate
+        // checks a count before acting on it, cannot express this one, and the
+        // per-segment cost stands in for it.
+        //
+        // It is a floor, not the count: on a multi-segment map this can come
+        // out *below* the true number of segments, the more so because the
+        // multi-segment payload slice is 12 bytes short per segment (see
+        // `messages/mod.rs`) and biases `remaining_total` down. That trades an
+        // over-allocation on an unchecked number for the occasional realloc on
+        // a once-per-volume metadata path, which is the right way round.
+        let bytes_per_segment = size_of::<Integer2>() + RANGE_BIN_BYTES_PER_SEGMENT;
+        let mut elevation_segments =
+            Vec::with_capacity(segment_count.min(reader.remaining_total() / bytes_per_segment));
 
         for _ in 0..segment_count {
             let segment_number_ref = reader.take_ref::<Integer2>()?;
