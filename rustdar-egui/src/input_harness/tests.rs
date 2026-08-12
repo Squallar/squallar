@@ -1857,6 +1857,71 @@ fn a_bottom_edge_bar_annotates_under_itself_rather_than_off_the_pane() {
     }
 }
 
+/// 8h(iii). **Every unit title is drawn inside the pane it labels.**
+///
+///          The painter is clipped to the pane, so a title that does not fit
+///          is silently cut in half rather than overlapping something — which
+///          is what a bottom-edge bar did to every one of them: the title was
+///          right-anchored 12 points from the pane's edge, and the shortest
+///          unit label in the app is 22 points wide, so a phone in portrait
+///          was reading `ph` under its velocity bar and `Bz` under its
+///          reflectivity one.
+///
+///          Asserted over every product, in the unit preferences that change a
+///          label, and in both orientations — the vertical bar centres its
+///          title over a bar that stands 16 points off the edge, which is its
+///          own way of running out of room.
+#[test]
+fn every_products_unit_title_fits_inside_its_pane() {
+    use rustdar_radar::types::RadarProduct;
+    use rustdar_units::{HailSizeUnit, HeightUnit, PrecipRateUnit, SpeedUnit};
+
+    for screen in [egui::vec2(900.0, 1400.0), egui::vec2(1400.0, 900.0)] {
+        let mut h = velocity_pane_on(screen, "KTLX", None);
+        let pane = h.pane_rects()[0];
+        for &speed in SpeedUnit::ALL {
+            for &height in HeightUnit::ALL {
+                for &hail_size in HailSizeUnit::ALL {
+                    for &precip_rate in PrecipRateUnit::ALL {
+                        {
+                            let prefs = &mut h.gui_mut().preferences;
+                            prefs.speed = speed;
+                            prefs.height = height;
+                            prefs.hail_size = hail_size;
+                            prefs.precip_rate = precip_rate;
+                        }
+                        for &product in RadarProduct::all() {
+                            h.select_product(0, product);
+                            let unit = product.unit_label(&h.gui_mut().preferences);
+                            let titles: Vec<egui::Rect> = h
+                                .painted_text_rects()
+                                .into_iter()
+                                .filter(|(rect, text)| text == unit && pane.contains(rect.center()))
+                                .map(|(rect, _)| rect)
+                                .collect();
+                            assert!(
+                                !titles.is_empty(),
+                                "{product:?} painted no {unit:?} title at all on \
+                                 a {screen:?} screen; painted: {:?}",
+                                h.painted_text_strings_in(pane),
+                            );
+                            for rect in titles {
+                                assert!(
+                                    pane.contains_rect(rect),
+                                    "{product:?}'s {unit:?} title at {rect:?} \
+                                     hangs outside the pane {pane:?} on a \
+                                     {screen:?} screen, where the pane's clip \
+                                     rect cuts it off",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// 8i. **The purple on the map has a key, on the two products that can paint
 ///     it.**
 ///

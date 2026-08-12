@@ -1651,24 +1651,35 @@ pub(super) fn render_color_scale(
     let unit = product.unit_label(prefs);
     let fold_line = folds_at.map(|nyquist_ms| fold_title_line(nyquist_ms, prefs));
     if horizontal {
-        let title_pos = egui::pos2(bar_rect.left() - 4.0, bar_rect.center().y);
+        // Under the bar's left end, reading left to right: `mph  folds ±50`.
+        //
+        // **Not beside the bar**, where it used to be. A bottom-edge bar starts
+        // `SCALE_MARGIN` in from the pane's edge, so a title right-anchored to
+        // its left end had 12 points to lay out in — and `mph` is 24 points
+        // wide, `dBZ` 22, `kg/m²` 30. The painter is clipped to the pane, so
+        // the half that did not fit was cut off at the pane's edge rather than
+        // overlapping anything: on a phone, which is where a bottom-edge bar
+        // is drawn, the colour scale has been labelled `ph` and `Bz`. The
+        // bottom margin below the bar is 16 points of clear glass the full
+        // width of the pane.
+        let title_pos = egui::pos2(pane_rect.left() + 2.0, bar_rect.bottom() + 1.0);
         draw_shadowed_text(
             painter,
             title_pos,
-            egui::Align2::RIGHT_CENTER,
+            egui::Align2::LEFT_TOP,
             unit,
-            title_font,
+            title_font.clone(),
         );
         if let Some(line) = &fold_line {
-            // Under the *bar* rather than under the title, which is the same
-            // place in this orientation: the horizontal title is squeezed into
-            // the 12 points between the pane's edge and the bar's start, the
-            // painter is clipped to the pane, and a nine-character annotation
-            // hung off that anchor would be cut in half. The bar's own bottom
-            // margin is 16 points of clear glass with nothing else in it.
+            // Measured rather than reserved, because the gap between the two
+            // has to look the same after `m/s` as after `km/h`.
+            let unit_width = painter
+                .layout_no_wrap(unit.to_owned(), title_font, egui::Color32::WHITE)
+                .rect
+                .width();
             draw_shadowed_text(
                 painter,
-                egui::pos2(bar_rect.left(), bar_rect.bottom() + 1.0),
+                title_pos + egui::vec2(unit_width + 6.0, 0.0),
                 egui::Align2::LEFT_TOP,
                 line,
                 label_font.clone(),
@@ -1960,14 +1971,13 @@ fn render_overlay_color_scales(
         // Title
         let unit = legend.unit_label;
         if horizontal {
-            let title_pos = egui::pos2(bar_rect.left() - 4.0, bar_rect.center().y);
-            draw_shadowed_text(
-                painter,
-                title_pos,
-                egui::Align2::RIGHT_CENTER,
-                unit,
-                title_font,
-            );
+            // Under its own bar, for the reason the radar bar's title is: 12
+            // points is not enough to lay `kg/m²` out in, and the pane's clip
+            // rect turns the shortfall into a cut-off label rather than an
+            // overlap. Each stacked bar has the 25 points above the next one's
+            // value labels to itself.
+            let title_pos = egui::pos2(pane_rect.left() + 2.0, bar_rect.bottom() + 1.0);
+            draw_shadowed_text(painter, title_pos, egui::Align2::LEFT_TOP, unit, title_font);
         } else {
             let title_pos = egui::pos2(bar_rect.center().x, bar_rect.top() - 4.0);
             draw_shadowed_text(
