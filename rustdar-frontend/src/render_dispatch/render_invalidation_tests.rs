@@ -251,6 +251,7 @@ fn dispatch(
     let (release, render) = gated_render();
     d.spawn_render(
         pane_idx,
+        "KOUN",
         RadarProduct::Reflectivity,
         0.5,
         results.clone(),
@@ -307,7 +308,7 @@ fn a_scan_for_the_panes_own_site_abandons_its_render() {
 
     d.reset_panes_for_site("KOUN", &gui);
     assert!(
-        !d.pane_render[0].render_in_flight,
+        !d.pane_render[0].render_in_flight(),
         "the pairing an abandoned send depends on: the pane must not be left \
              waiting for a result that will never come"
     );
@@ -371,6 +372,7 @@ fn a_render_that_finds_nothing_still_reports_back() {
     let (release, nothing) = gated_nothing();
     d.spawn_render(
         0,
+        "KOUN",
         RadarProduct::Reflectivity,
         0.5,
         results.clone(),
@@ -405,6 +407,7 @@ fn an_abandoned_render_that_finds_nothing_reports_nothing() {
     let (release, nothing) = gated_nothing();
     d.spawn_render(
         0,
+        "KOUN",
         RadarProduct::Reflectivity,
         0.5,
         results.clone(),
@@ -488,7 +491,7 @@ fn a_finished_tilt_leaves_a_pane_on_another_tilt_alone() {
         0,
         "the 4.0° pane was invalidated by a 0.5° cut completing"
     );
-    assert!(d.pane_render[0].render_in_flight);
+    assert!(d.pane_render[0].render_in_flight());
 
     release.send(()).expect("still running");
     assert_eq!(
@@ -510,7 +513,7 @@ fn a_finished_tilt_invalidates_the_pane_showing_it() {
 
     assert_eq!(d.reset_panes_for_tilts("KOUN", &gui, &[0.5]), 1);
     assert!(
-        !d.pane_render[0].render_in_flight,
+        !d.pane_render[0].render_in_flight(),
         "the pairing an abandoned send depends on"
     );
     release.send(()).expect("still running");

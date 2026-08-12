@@ -118,7 +118,12 @@ fn sample_scan() -> nexrad_model::data::Scan {
 #[test]
 fn a_loop_frame_is_dispatched_leaner_than_the_still_frame_beside_it() {
     let posted = Arc::new(Mutex::new(Vec::new()));
-    crate::offload::set_worker(Box::new(Recorder(Arc::clone(&posted))));
+    // Retired by the guard rather than by the call that used to sit below the
+    // decode: an `assert!`, two `expect`s and four `unwrap`s stand between the
+    // install and that call, and any of them unwinding past it would hand this
+    // port to the next test on this harness thread. See
+    // `offload::InstalledTestWorker`.
+    let _worker = crate::offload::install_test_worker(Box::new(Recorder(Arc::clone(&posted))));
 
     let mut app = crate::app::tests::headless(TestBridge::desktop());
     let site = rustdar_radar::sites::get_radar_site(SITE)
@@ -177,7 +182,6 @@ fn a_loop_frame_is_dispatched_leaner_than_the_still_frame_beside_it() {
         .iter()
         .map(|bytes| JobRequest::from_bytes(bytes).expect("a job this build posted decodes"))
         .collect();
-    crate::offload::abandon_worker("test teardown");
 
     assert_eq!(jobs.len(), 2, "one loop frame and one still frame");
     let full_res = |job: &JobRequest| match job {

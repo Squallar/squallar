@@ -961,6 +961,39 @@ pub fn worker_attached() -> bool {
     WORKER.with(|w| w.borrow().is_some())
 }
 
+/// A [`WorkerPort`] installed for the length of a test, retired when this drops.
+///
+/// [`WORKER`] is a thread-local and the test harness reuses its threads, so a
+/// port left installed is a port the *next* test on that thread inherits — and
+/// that test posts its renders into a recorder nobody reads instead of running
+/// them, then fails for reasons that have nothing to do with it.
+///
+/// **Retiring the port on the test's last line does not cover the case that
+/// matters.** A failed assertion unwinds straight past that line, so the first
+/// failure in a module quietly contaminates every test that runs after it on
+/// the same thread and buries the real fault under wreckage it caused. `Drop`
+/// runs on the unwind too, which is the whole reason this is a guard and not a
+/// function called at the end.
+#[cfg(test)]
+pub struct InstalledTestWorker;
+
+#[cfg(test)]
+impl Drop for InstalledTestWorker {
+    fn drop(&mut self) {
+        abandon_worker("test teardown");
+    }
+}
+
+/// Route [`offload_job`] through `port` until the returned guard drops.
+///
+/// The test-only counterpart of [`set_worker`] — see [`InstalledTestWorker`]
+/// for why the retirement is a guard rather than a call at the end of the test.
+#[cfg(test)]
+pub fn install_test_worker(port: Box<dyn WorkerPort>) -> InstalledTestWorker {
+    set_worker(port);
+    InstalledTestWorker
+}
+
 /// Run `request` away from the frame that requested it, and hand the result to
 /// `deliver`.
 ///

@@ -45,7 +45,47 @@ pub struct CachedPaneRender {
 /// Per-pane render tracking state.
 pub struct PaneRenderState {
     /// True while a background render is in progress for this pane.
-    pub render_in_flight: bool,
+    ///
+    /// Private, with [`render_started`](Self::render_started) and
+    /// [`render_finished`](Self::render_finished) the only ways it moves,
+    /// because it is now half of a pair: `in_flight_plan_view` below says
+    /// *which* picture is being made and is what a sibling pane reads to decide
+    /// it need not ask for the same one. A caller that could set this flag on
+    /// its own could leave a key behind for a render that had already answered,
+    /// and every pane wanting that picture would then wait for a result nobody
+    /// was going to send. The pair moves together or not at all — the same
+    /// reason [`RenderCache`]'s two halves are private.
+    render_in_flight: bool,
+    /// Which **plan view** this pane's in-flight render is drawing, as the
+    /// `(site, product, view, elevation)` key [`render_cache_key`] builds — or
+    /// `None` when nothing is in flight, or when what is in flight is not a
+    /// plan view.
+    ///
+    /// # What it is for
+    ///
+    /// A volume landing on a four-pane split of one site, product and tilt used
+    /// to start **four** renders of one sweep: `dispatch_pane_renders` walks the
+    /// panes in one pass, and the render cache it consults is only written when
+    /// a result comes *back*, so the first pane's job is still in flight when
+    /// the second, third and fourth ask. Each of those panes then also paid a
+    /// full `RenderInput::extract` on the frame thread to build a payload
+    /// identical to the one already on its way.
+    ///
+    /// With this, the first pane to ask is the only one that asks. The
+    /// broadcast in `App::poll_render_results` already serves every sibling
+    /// from the one result — that is what `PlanViewUploads` was built around —
+    /// so the panes that skip here are not waiting on anything extra; they are
+    /// waiting on the same result they would have been handed anyway.
+    ///
+    /// # Why the key is the cache's own
+    ///
+    /// It is built by [`render_cache_key`] and by nothing else, so "a render is
+    /// already making this" and "the cache already holds this" are the same
+    /// question asked at two moments. A dedupe keyed even slightly differently
+    /// — on the raw elevation, say — would suppress a render whose result the
+    /// cache would then file under another key, and the pane that skipped would
+    /// never be served.
+    in_flight_plan_view: Option<RenderCacheKey>,
     /// Last rendered radar parameters to detect changes.
     pub last_rendered: Option<(RadarProduct, f32)>,
     /// Cached render for instant texture restore after suspend/resume.
@@ -80,10 +120,41 @@ impl PaneRenderState {
     pub fn new() -> Self {
         Self {
             render_in_flight: false,
+            in_flight_plan_view: None,
             last_rendered: None,
             cached_render: None,
             results_wanted: Vec::new(),
         }
+    }
+
+    /// Whether a background render is running for this pane.
+    pub fn render_in_flight(&self) -> bool {
+        self.render_in_flight
+    }
+
+    /// Mark a render dispatched for this pane, `key` naming the plan view it
+    /// draws — `None` for a render that is not a plan view, which is every
+    /// cross-section.
+    ///
+    /// A section passes `None` rather than a key of its own on purpose. The
+    /// only reader is the plan-view dispatch, which asks "is this picture
+    /// already being made"; a section pane and a map pane can hold the same
+    /// `(site, product, elevation)` and are not making the same picture, and
+    /// [`RenderCacheKey`]'s view axis exists to say so. Keeping sections out of
+    /// this field entirely is one fewer way for that axis to be got wrong.
+    pub fn render_started(&mut self, key: Option<RenderCacheKey>) {
+        self.render_in_flight = true;
+        self.in_flight_plan_view = key;
+    }
+
+    /// Mark this pane's render finished — answered, discarded or abandoned.
+    ///
+    /// All three are the same fact for every reader: nothing is on its way any
+    /// more, so this pane may dispatch again and no sibling should be waiting
+    /// on it.
+    pub fn render_finished(&mut self) {
+        self.render_in_flight = false;
+        self.in_flight_plan_view = None;
     }
 
     /// The flag a newly dispatched render reports through, live until this pane's
@@ -746,7 +817,7 @@ impl RenderDispatcher {
             if gui.pane(idx).is_some_and(|p| p.site == site) {
                 prs.last_rendered = None;
                 prs.cached_render = None;
-                prs.render_in_flight = false;
+                prs.render_finished();
                 // Paired with the line above: see `results_wanted`.
                 prs.abandon_results();
             }
@@ -846,7 +917,7 @@ impl RenderDispatcher {
             if matches {
                 prs.last_rendered = None;
                 prs.cached_render = None;
-                prs.render_in_flight = false;
+                prs.render_finished();
                 // Paired with the line above: see `results_wanted`.
                 prs.abandon_results();
                 hit += 1;
@@ -879,7 +950,7 @@ impl RenderDispatcher {
         for prs in &mut self.pane_render {
             prs.last_rendered = None;
             prs.cached_render = None;
-            prs.render_in_flight = false;
+            prs.render_finished();
             prs.abandon_results();
         }
         self.render_generation += 1;
@@ -897,7 +968,7 @@ impl RenderDispatcher {
 
     /// Check if any pane has a render in flight.
     pub fn any_render_in_flight(&self) -> bool {
-        self.pane_render.iter().any(|prs| prs.render_in_flight)
+        self.pane_render.iter().any(|prs| prs.render_in_flight())
     }
 
     /// Increment the fetch generation for a site and return the new value.
@@ -1158,6 +1229,7 @@ impl RenderDispatcher {
             log::info!("Spawning VIL density render for pane {pane_idx} from DVL over EET");
             self.spawn_render(
                 pane_idx,
+                site,
                 params.product,
                 params.elevation,
                 sender,
@@ -1190,6 +1262,7 @@ impl RenderDispatcher {
         );
         self.spawn_render(
             pane_idx,
+            site,
             params.product,
             params.elevation,
             sender,
@@ -1221,6 +1294,7 @@ impl RenderDispatcher {
     /// estimate off the sweep's own extremes where it does not. Passing an
     /// empty table is not an error and not a compile failure; it is the
     /// plan view estimating a limit the section pane beside it was told.
+    ///
     /// # Budget first, extraction second
     ///
     /// The `render_slot_free` gate below is not a duplicate of the one inside
@@ -1322,7 +1396,7 @@ impl RenderDispatcher {
             }
             None => crate::offload::Job::renders_nothing(),
         };
-        self.spawn_render(pane_idx, product, elevation, sender, window, job);
+        self.spawn_render(pane_idx, site, product, elevation, sender, window, job);
     }
 
     /// The storm motion vector the cached section payload will be **derived**
@@ -1455,7 +1529,9 @@ impl RenderDispatcher {
             }
             crate::app::notify_redraw(&window);
         });
-        self.pane_render[pane_idx].render_in_flight = true;
+        // `None`: a section is not a plan view, and the only reader of that key
+        // is the plan-view dispatch. See `PaneRenderState::render_started`.
+        self.pane_render[pane_idx].render_started(None);
         SectionDispatch::Dispatched
     }
 
@@ -1533,9 +1609,22 @@ impl RenderDispatcher {
     /// without a second copy of it: `deliver` runs on this thread wherever the
     /// rasterization happened, and holds the two things that must not outlive
     /// the render either way.
+    ///
+    /// `site` is here for one reason: it completes the
+    /// [`RenderCacheKey`] this render will be *filed* under, and this is where
+    /// that key is recorded as in flight
+    /// ([`PaneRenderState::in_flight_plan_view`]). Both callers already hold
+    /// the site, and building the key here rather than at each of them is what
+    /// makes the dedupe and the cache literally the same key — see that field.
+    ///
+    /// The extra argument takes the count past clippy's threshold. Bundling
+    /// them into a struct would only move the same seven values behind a name
+    /// that says nothing the parameters do not.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_render(
         &mut self,
         pane_idx: usize,
+        site: &str,
         product: RadarProduct,
         elevation: f32,
         sender: std::sync::mpsc::Sender<RenderResponse>,
@@ -1613,7 +1702,71 @@ impl RenderDispatcher {
             }
             crate::app::notify_redraw(&window);
         });
-        self.pane_render[pane_idx].render_in_flight = true;
+        // The key this render's result will be cached under, recorded as in
+        // flight so a sibling pane wanting the same picture asks for nothing.
+        // `RenderView::PlanView` because this function dispatches nothing else
+        // — the two callers are the Level II and Level III *plan-view* spawns,
+        // and a section goes through `spawn_section_render`.
+        self.pane_render[pane_idx].render_started(Some(render_cache_key(
+            site,
+            product,
+            RenderView::PlanView,
+            elevation,
+        )));
+    }
+
+    /// Whether some pane already has **this exact plan view** in flight.
+    ///
+    /// The dispatch pass's answer to "somebody else is already making this".
+    /// A linear scan of the pane list, which is at most
+    /// [`rustdar_egui::pane::MAX_PANES_DESKTOP`] entries and is walked once per
+    /// pane that has missed the render cache — so a set keyed for lookup would
+    /// buy nothing but a second structure to keep in step with the flags.
+    ///
+    /// The key is [`render_cache_key`]'s, which is the whole point: see
+    /// [`PaneRenderState::in_flight_plan_view`]. The view is named here rather
+    /// than taken, for the same reason `spawn_render` names it: this question
+    /// has no meaning for any other view — a section stores no key at all — so
+    /// a `view` argument would only be a way to ask it wrongly.
+    ///
+    /// # A render that panics now wedges a key group, not a pane
+    ///
+    /// [`plan_view_image`] names the standing hazard: a render that panics
+    /// sends no [`RenderResponse`], so `render_in_flight` never clears and that
+    /// pane stays blank for good. **This widens the blast radius.** The panes
+    /// that deferred to that render are waiting on a result nobody will send
+    /// either, so what goes blank is every pane on that key rather than the one
+    /// whose render died. Panes on other keys are untouched — nothing here
+    /// crosses keys.
+    ///
+    /// Only the non-deterministic failures reach it. Everything the render
+    /// path can fail *predictably* comes back as a `RenderResponse` that drew
+    /// nothing — a malformed buffer takes `plan_view_image`'s `None` rather
+    /// than the `ColorImage` assertion, and no matching sweep takes
+    /// `Job::renders_nothing` — and `render_finished` clears flag and key alike
+    /// on every one of them, which is what
+    /// `a_render_that_answers_with_nothing_releases_its_siblings` pins. A
+    /// reader deciding whether to extend this mechanism should still know the
+    /// radius changed.
+    ///
+    /// # The two `String`s are deliberate
+    ///
+    /// This builds a whole key to compare it and drops it, and `render_started`
+    /// builds the one it stores. Comparing the tuple's parts instead would
+    /// avoid both allocations — and would mean writing out
+    /// [`render_cache_key`]'s rules a second time: which axis discriminates,
+    /// and which slot a tilt-independent product falls in. That the dedupe key
+    /// and the cache key have one definition is the entire safety argument for
+    /// this suppression (see [`PaneRenderState::in_flight_plan_view`]), and it
+    /// is not worth trading for a four-byte `malloc` on a path reached once per
+    /// dispatch plus once per deferring pane per frame while its render runs —
+    /// tens of allocations against the 70–175 ms of CPU per extra pane, per
+    /// volume, that the suppression saves.
+    pub fn plan_view_in_flight(&self, site: &str, product: RadarProduct, elevation: f32) -> bool {
+        let key = render_cache_key(site, product, RenderView::PlanView, elevation);
+        self.pane_render
+            .iter()
+            .any(|prs| prs.in_flight_plan_view.as_ref() == Some(&key))
     }
 }
 

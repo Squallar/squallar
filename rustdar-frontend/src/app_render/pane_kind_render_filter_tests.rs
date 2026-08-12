@@ -256,7 +256,7 @@ fn the_sibling_broadcast_skips_a_pane_with_no_plan_view() {
 #[test]
 fn a_render_in_flight_across_a_conversion_is_not_placed() {
     let mut app = app_on_site();
-    app.render.pane_render[0].render_in_flight = true;
+    app.render.pane_render[0].render_started(None);
     app.gui
         .pane_mut(0)
         .unwrap()
@@ -266,7 +266,7 @@ fn a_render_in_flight_across_a_conversion_is_not_placed() {
 
     assert!(!holds_radar_texture(&mut app, 0));
     assert!(
-        !app.render.pane_render[0].render_in_flight,
+        !app.render.pane_render[0].render_in_flight(),
         "the in-flight flag was not cleared, so this pane could never ask \
              for another render as long as it lived"
     );

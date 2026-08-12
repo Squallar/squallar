@@ -310,7 +310,12 @@ impl super::App {
         let mut uploads = PlanViewUploads::default();
         while let Ok(rr) = self.channels.render_receiver.try_recv() {
             if rr.pane_idx < self.render.pane_render.len() {
-                self.render.pane_render[rr.pane_idx].render_in_flight = false;
+                // Unconditionally, and before every gate below: a result that
+                // is stale, or for a pane that has since stopped drawing a plan
+                // view, still means this render is over. The key it was holding
+                // goes with the flag — a sibling waiting on a render that has
+                // already answered would wait for ever.
+                self.render.pane_render[rr.pane_idx].render_finished();
             }
 
             if self.render.is_render_stale(rr.generation) {
@@ -1059,7 +1064,7 @@ impl super::App {
                     })
                     .unwrap_or(true);
 
-                if needs_render && !prs.render_in_flight {
+                if needs_render && !prs.render_in_flight() {
                     // Get the pane's site for cache lookups
                     let pane_site = self
                         .gui
@@ -1092,6 +1097,34 @@ impl super::App {
                             elevation
                         );
                         self.apply_render_to_pane(ctx, pane_idx, &render_result, &mut uploads);
+                        continue;
+                    }
+
+                    // A sibling pane is already having this exact picture made.
+                    //
+                    // The cache above only answers for renders that have come
+                    // *back*, so on the frame a volume lands it misses for
+                    // every pane at once — and this pass then started one
+                    // render per pane of one sweep, each preceded by its own
+                    // `RenderInput::extract` on this thread. Measured over four
+                    // sites and three products at 70–175 ms of extra CPU and
+                    // ~15,000 extra minor faults per extra pane, per volume;
+                    // the faults because `rustdar_radar::render`'s pools hold
+                    // one buffer each, so concurrent duplicates can only be
+                    // served once and the rest fault a fresh 16 MiB texture,
+                    // 16 MiB grid and 32 MiB cell array back in.
+                    //
+                    // Nothing is deferred by skipping. `poll_render_results`
+                    // already broadcasts one result to every pane wanting that
+                    // site, product and tilt — the pass `PlanViewUploads` was
+                    // built around — so these panes are waiting on precisely
+                    // the result they would have been handed anyway, and the
+                    // one they *would* have started would have been discarded
+                    // by the same broadcast a moment later.
+                    if self
+                        .render
+                        .plan_view_in_flight(&pane_site, product, elevation)
+                    {
                         continue;
                     }
 
@@ -1198,7 +1231,7 @@ impl super::App {
                 .render
                 .pane_render
                 .get(pane_idx)
-                .is_some_and(|p| p.render_in_flight)
+                .is_some_and(|p| p.render_in_flight())
             {
                 continue;
             }
@@ -1416,7 +1449,7 @@ impl super::App {
     fn poll_section_results(&mut self, ctx: &egui::Context) {
         while let Ok(sr) = self.channels.section_receiver.try_recv() {
             if let Some(state) = self.render.pane_render.get_mut(sr.pane_idx) {
-                state.render_in_flight = false;
+                state.render_finished();
             }
 
             if self.render.is_render_stale(sr.generation) {
@@ -4331,3 +4364,16 @@ mod sounding_poll_tests;
 #[path = "app_render/stamping_tests.rs"]
 #[cfg(test)]
 mod stamping_tests;
+
+/// One sweep is one *render*, however many panes are looking at it — the
+/// sibling of `radar_texture_sharing_tests`, one step earlier in the same path.
+///
+/// That module counts uploads; this one counts the jobs that produce the buffer
+/// being uploaded. `dispatch_pane_renders` walks every pane in one pass and the
+/// render cache is only written on the way back, so on the frame a volume lands
+/// the cache misses for all of them at once — and each pane used to start its
+/// own render of one sweep, preceded by its own `RenderInput::extract` on the
+/// frame thread.
+#[path = "app_render/one_render_per_sweep_tests.rs"]
+#[cfg(test)]
+mod one_render_per_sweep_tests;

@@ -241,7 +241,7 @@ fn a_plan_view_and_a_section_of_one_sweep_fold_at_the_same_speed() {
     // render out, and the mark is cleared on receipt of a `RenderResponse` —
     // which this fixture, holding the job rather than answering it, never
     // sends.
-    app.render.pane_render[0].render_in_flight = false;
+    app.render.pane_render[0].render_finished();
     {
         let pane = app.gui.pane_mut(0).unwrap();
         pane.set_kind(rustdar_egui::pane::PaneKind::CrossSection);

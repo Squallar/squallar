@@ -383,7 +383,7 @@ fn an_empty_live_volume_labels_the_pane_and_keeps_it_asking() {
              the pane would never ask again"
     );
     assert!(
-        !app.render.pane_render[0].render_in_flight,
+        !app.render.pane_render[0].render_in_flight(),
         "a render slot was spent on a volume with nothing in it"
     );
 }
@@ -411,7 +411,7 @@ fn a_transient_section_refusal_keeps_the_pane_asking() {
              will never ask again and never show a section"
     );
     assert!(
-        !app.render.pane_render[0].render_in_flight,
+        !app.render.pane_render[0].render_in_flight(),
         "a render slot was spent to be told what the volume already said"
     );
 
@@ -445,7 +445,7 @@ fn a_dropped_line_re_cuts_once_and_a_held_line_never() {
     // written on dispatch.
     app.dispatch_section_renders();
     assert!(
-        app.render.pane_render[0].render_in_flight,
+        app.render.pane_render[0].render_in_flight(),
         "precondition: the aimed pane never cut at all"
     );
     let first_key = state(&app)
@@ -454,7 +454,7 @@ fn a_dropped_line_re_cuts_once_and_a_held_line_never() {
         .expect("the key is written on dispatch");
     // The cut completes; the budget frees. The key stays, which is the
     // whole staleness machine.
-    app.render.pane_render[0].render_in_flight = false;
+    app.render.pane_render[0].render_finished();
 
     // A drag in flight: the preview lives on the map pane and the stored
     // line holds still, so every one of these polls is the dispatcher
@@ -463,7 +463,7 @@ fn a_dropped_line_re_cuts_once_and_a_held_line_never() {
     for frame in 0..60 {
         app.dispatch_section_renders();
         assert!(
-            !app.render.pane_render[0].render_in_flight,
+            !app.render.pane_render[0].render_in_flight(),
             "poll {frame} against an unmoved line dispatched a cut: that \
                  is a re-cut per frame for the length of every drag"
         );
@@ -501,7 +501,7 @@ fn a_dropped_line_re_cuts_once_and_a_held_line_never() {
 
     app.dispatch_section_renders();
     assert!(
-        app.render.pane_render[0].render_in_flight,
+        app.render.pane_render[0].render_in_flight(),
         "the dropped line did not re-cut: the handle drop is inert until \
              the next volume moves the key"
     );
@@ -535,7 +535,7 @@ fn a_product_with_no_vertical_structure_says_so_and_stops_asking() {
         "nothing will ever make this product sliceable, so leaving the key \
              unwritten re-dispatches the same refusal on every frame"
     );
-    assert!(!app.render.pane_render[0].render_in_flight);
+    assert!(!app.render.pane_render[0].render_in_flight());
 
     // Named, so the message can say which product and what to do instead.
     let message =
@@ -728,7 +728,7 @@ fn a_volume_with_nothing_to_cut_is_named_rather_than_waited_on() {
             volume_time(),
         ),
     );
-    app.render.pane_render[0].render_in_flight = false;
+    app.render.pane_render[0].render_finished();
     app.dispatch_section_renders();
     assert_eq!(
         state(&app).unavailable,
@@ -806,7 +806,7 @@ fn a_storm_motion_edit_re_derives_the_cross_section() {
         // The previous cut has landed. A section pane with a cut in
         // flight does not re-dispatch, which in the app is the arrival
         // that clears this and in a test has to be said out loud.
-        app.render.pane_render[0].render_in_flight = false;
+        app.render.pane_render[0].render_finished();
         app.dispatch_section_renders();
         assert!(
             state(app).rendered_for.is_some(),
@@ -938,7 +938,7 @@ fn a_finished_cut_lands_on_the_pane_that_asked_for_it() {
         .cross_section_mut()
         .unwrap()
         .rendered_for = Some(target.clone());
-    app.render.pane_render[0].render_in_flight = true;
+    app.render.pane_render[0].render_started(None);
 
     app.channels
         .section_sender
@@ -961,7 +961,7 @@ fn a_finished_cut_lands_on_the_pane_that_asked_for_it() {
     );
     assert_eq!(state(&app).unavailable, None);
     assert!(
-        !app.render.pane_render[0].render_in_flight,
+        !app.render.pane_render[0].render_in_flight(),
         "a pane that never hears back stops asking for another cut"
     );
 
@@ -1081,7 +1081,7 @@ fn a_section_pane_gets_its_picture_back_after_the_context_dies() {
         .cross_section_mut()
         .unwrap()
         .rendered_for = Some(target.clone());
-    app.render.pane_render[0].render_in_flight = true;
+    app.render.pane_render[0].render_started(None);
     app.channels
         .section_sender
         .send(crate::channels::SectionResponse {
@@ -1149,10 +1149,10 @@ fn a_section_pane_gets_its_picture_back_after_the_context_dies() {
         Some(target),
         "the resume path moved the staleness key"
     );
-    app.render.pane_render[0].render_in_flight = false;
+    app.render.pane_render[0].render_finished();
     app.dispatch_section_renders();
     assert!(
-        !app.render.pane_render[0].render_in_flight,
+        !app.render.pane_render[0].render_in_flight(),
         "the pane re-cut its section on resume instead of re-uploading it"
     );
 }
