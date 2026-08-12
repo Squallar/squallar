@@ -32,10 +32,10 @@
 //! | `MOTION` | no | — | Storm motion override for `SRV`, as `speed_kt,direction_from_deg`. Without it SRV uses the volume's own Bunkers fit, and refuses if there is none. |
 //! | `THRESH` | yes | — | The mask's cut, in the moment's own units (dBZ for `BR`). |
 //! | `CAM` | no | — | Path to a text file of 19 whitespace-separated `f32`s. |
-//! | `YAW` | no | `225.0` | Fallback camera yaw, degrees — used only without `CAM`. |
-//! | `PITCH` | no | `25.0` | Fallback camera pitch, degrees. |
-//! | `DIST` | no | `2.5` | Fallback eye distance, in box half-diagonals. |
-//! | `EXAG` | no | `3.0` | Fallback vertical exaggeration. |
+//! | `YAW` | no | `OrbitCamera::default()` | Fallback camera yaw, degrees — used only without `CAM`. |
+//! | `PITCH` | no | `OrbitCamera::default()` | Fallback camera pitch, degrees. |
+//! | `DIST` | no | `OrbitCamera::default()` | Fallback eye distance, in `volume_view::framing_radius_km`. |
+//! | `EXAG` | no | `OrbitCamera::default()` | Fallback vertical exaggeration. |
 //! | `SIZE` | no | `1200x900` | Output size, `WxH` pixels. |
 //! | `EXTINCTION` | no | `800.0` | Extinction per km for the **mask** render. |
 //! | `MASK_LOD` | no | `0.0` | Reconstruction level for the **mask** render — 0 is the raw-field instrument; the cloud rung's level turns the mask into a class-coverage measurement of the reconstruction. |
@@ -870,10 +870,18 @@ fn camera(box_size_km: [f32; 3], size: [u32; 2]) -> (String, [[f32; 4]; 4], [f32
         return (format!("CAM {path}"), matrix, eye, 1.0);
     }
 
-    let yaw = parsed_or("YAW", 225.0f32);
-    let pitch = parsed_or("PITCH", 25.0f32);
-    let distance = parsed_or("DIST", 2.5f32);
-    let exaggeration = parsed_or("EXAG", 3.0f32);
+    // Every fallback is read off `OrbitCamera::default()` rather than written
+    // out, so an unset variable renders the camera a fresh pane actually opens
+    // with. A copy would drift the moment one of them moved — silently, in the
+    // one tool whose whole job is to show what the application draws — and
+    // `eye_distance` has since moved off 2.5 to a value derived from the field
+    // of view (`volume_view::eye_distance_for_plan_scale`), which is not a
+    // number that can be written down here at all.
+    let fresh = OrbitCamera::default();
+    let yaw = parsed_or("YAW", fresh.yaw_deg());
+    let pitch = parsed_or("PITCH", fresh.pitch_deg());
+    let distance = parsed_or("DIST", fresh.eye_distance());
+    let exaggeration = parsed_or("EXAG", fresh.vertical_exaggeration());
     let camera = OrbitCamera::restore(yaw, pitch, distance, [0.0; 3], exaggeration)
         .expect("YAW/PITCH/DIST/EXAG must all be finite");
     let aspect = size[0] as f32 / size[1] as f32;

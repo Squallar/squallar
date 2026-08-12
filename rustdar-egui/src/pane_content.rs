@@ -1288,15 +1288,22 @@ pub struct OrbitCamera {
 }
 
 impl Default for OrbitCamera {
-    /// Looking north-ish from above the south-west, a little way out, aimed at
-    /// the box's centre and stretched by [`DEFAULT_VERTICAL_EXAGGERATION`]: an
-    /// angle that shows a storm has height and depth at once, rather than the
-    /// plan view the user already has on another pane.
+    /// Looking north-ish from above the south-west, aimed at the box's centre
+    /// and stretched by [`DEFAULT_VERTICAL_EXAGGERATION`]: an angle that shows a
+    /// storm has height and depth at once, rather than the plan view the user
+    /// already has on another pane.
+    ///
+    /// The standoff is [`crate::volume_view::eye_distance_for_plan_scale`]
+    /// rather than a number of its own, and that function carries the
+    /// derivation: it is the distance at which the pane draws the ground at
+    /// exactly the scale its plan pane draws it at, so switching to 3D changes
+    /// the viewpoint and nothing else. It was 2.5, which opened a 3D pane
+    /// **1.287×** zoomed out from the pane it was made from.
     fn default() -> Self {
         Self {
             yaw_deg: 225.0,
             pitch_deg: 25.0,
-            eye_distance: 2.5,
+            eye_distance: crate::volume_view::eye_distance_for_plan_scale(),
             pivot: [0.0; 3],
             vertical_exaggeration: DEFAULT_VERTICAL_EXAGGERATION,
         }

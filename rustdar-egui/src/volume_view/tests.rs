@@ -509,8 +509,18 @@ fn the_zoom_is_proportional_to_the_ground_it_zoomed() {
 /// 0.926 of the box's north extent at aspect 0.15 and 6.525 at 7.1, a factor of
 /// 7.04 from the pane's shape alone, so a user who dragged a divider was
 /// silently zoomed and a narrow 3D pane sat at a different scale from the plan
-/// pane it was made from. Held at `2.5 / √2 · 2 · tan(20°) = 1.28683` here, at
-/// every aspect.
+/// pane it was made from. Held at `eye_distance / √2 · 2 · tan(20°) = 1.00000`
+/// here, at every aspect.
+///
+/// Re-baselined from **1.28683**, which is what that expression returned at the
+/// 2.5 standoff this default replaced — same six aspect ratios, same 1e-4
+/// tolerance, still pinned to an exact number rather than to a range. The
+/// baseline moved because the standoff did; the property being asserted, that
+/// the number does not depend on the pane's *shape*, did not. 1 is not a
+/// coincidence and not a new literal either: it is what
+/// [`eye_distance_for_plan_scale`] is defined to produce, at any field of view,
+/// so this stays true if [`FOV_Y_DEG`] changes and fails if anyone pins the
+/// standoff to a number again.
 #[test]
 fn the_box_fills_the_same_fraction_of_every_pane_shape() {
     let length = |v: [f32; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
@@ -519,13 +529,144 @@ fn the_box_fills_the_same_fraction_of_every_pane_shape() {
     for aspect in [0.15f32, 0.5, 1.0, 1.778, 2.4, 7.1] {
         let view = view_for(camera, [aspect * north_km, north_km, 18.0], aspect).expect("viewable");
         // What the pane's height spans in kilometres, over the box's own north
-        // extent: the box's share of the pane, from the far side of 1.
+        // extent — the box's share of the pane. 1 is the plan pane's own scale;
+        // above it the 3D view is zoomed out against the pane it came from and
+        // below it zoomed in.
         let spanned = 2.0 * length(view.eye_km) * (0.5 * FOV_Y_DEG.to_radians()).tan();
         assert!(
-            (spanned / north_km - 1.28683).abs() < 1e-4,
+            (spanned / north_km - 1.0).abs() < 1e-4,
             "at aspect {aspect} the pane spans {spanned} km over a {north_km} km \
-             box, {}x rather than 1.28683x",
+             box, {}x rather than 1x",
             spanned / north_km,
+        );
+    }
+}
+
+/// Converting a plan pane to 3D is exactly 1:1 — the same ground at the same
+/// scale, not a change of viewpoint that is also a zoom.
+///
+/// This is the defect [`eye_distance_for_plan_scale`] closes, stated as the user
+/// sees it. At the 2.5 standoff it replaced, a 3D pane opened **1.287×** zoomed
+/// out from the pane it was made from, at every aspect ratio and every zoom.
+///
+/// # Measured out of `box_from_clip`, not off the standoff
+///
+/// The constant being right and the picture being right are two claims, and only
+/// the second one is the user's — so nothing here reads `eye_distance`. Two rays
+/// are cast through the pane's left and right edges exactly as the shader casts
+/// them, meet the horizontal plane the pivot sits on, and the kilometres between
+/// the hits are compared with the kilometres the plan pane of the same shape
+/// draws across the same width. An error anywhere between the camera and the
+/// matrix — a factor left in `framing_radius_km`, a field of view the standoff
+/// stopped agreeing with, a `box_from_world` that scaled the horizontal axes —
+/// lands here.
+///
+/// # Why across the pane and not down it
+///
+/// A tilted camera foreshortens, so the two directions cannot both be 1:1 and
+/// only one of them is the scale. The camera's right vector is level at every
+/// pitch, so the across-pane direction is the one perspective leaves alone; the
+/// receding direction is compressed by the tilt on purpose, and that compression
+/// is what makes the picture read as ground rather than as a plan view.
+///
+/// Both edge rays meet a horizontal plane at the same depth — the right vector
+/// has no vertical component to change it — so the span between them is linear
+/// in the screen coordinate. That makes this a *scale* and not an average of
+/// one, which is why it can be read from the pane's full width rather than from
+/// a derivative at the centre.
+///
+/// Swept over yaw, pitch, the exaggeration knob's whole travel, the resampler's
+/// whole zoom range and every aspect a column can take, because "uniformly" was
+/// the reported shape of the defect and a single framing cannot see it.
+#[test]
+fn converting_a_plan_pane_to_3d_keeps_its_ground_scale() {
+    // The ground the pane's width covers, in kilometres, read out of the view's
+    // own matrix.
+    let ground_across_pane = |view: &VolumeView, box_km: [f32; 3]| {
+        let hit = |ndc_x: f32| {
+            let ray = direction(view, [ndc_x, 0.0]);
+            // The pivot is the box's centre here, so its plane is box z = 0.5.
+            // Solved in box space, where the ray is: the vertical axis is scaled
+            // differently from the other two, but the crossing is the same one.
+            let steps = (0.5 - view.eye_in_box[2]) / ray[2];
+            [
+                (view.eye_in_box[0] + steps * ray[0] - 0.5) * box_km[0],
+                (view.eye_in_box[1] + steps * ray[1] - 0.5) * box_km[1],
+            ]
+        };
+        let (left, right) = (hit(-1.0), hit(1.0));
+        ((right[0] - left[0]).powi(2) + (right[1] - left[1]).powi(2)).sqrt()
+    };
+
+    for (yaw, pitch) in [(225.0, 25.0), (0.0, 25.0), (90.0, 60.0), (315.0, 88.0)] {
+        for exaggeration in [1.0f32, 3.0, 12.0] {
+            let camera = OrbitCamera::restore(
+                yaw,
+                pitch,
+                OrbitCamera::default().eye_distance(),
+                [0.0; 3],
+                exaggeration,
+            )
+            .expect("finite");
+            // The resampler's ceiling for a square ask down to its 10 km floor.
+            for north_km in [650.6f32, 460.0, 80.0, 20.0] {
+                for aspect in [0.15f32, 0.5, 1.0, 1.778, 2.4, 7.1] {
+                    // The box a plan pane of this shape cuts out of the ground:
+                    // its north extent from the pane's height, its east extent
+                    // from the pane's width.
+                    let box_km = [aspect * north_km, north_km, 18.0];
+                    let view = view_for(camera, box_km, aspect).expect("viewable");
+                    // The plan pane draws `north_km` over its height, so it
+                    // draws `aspect * north_km` across its width.
+                    let plan_km = aspect * north_km;
+                    let drawn_km = ground_across_pane(&view, box_km);
+                    assert!(
+                        (drawn_km / plan_km - 1.0).abs() < 1e-3,
+                        "at yaw {yaw} pitch {pitch} {exaggeration}x, a {north_km} km \
+                         box in a pane of aspect {aspect} draws {drawn_km} km of ground \
+                         across its width where the plan pane it was made from draws \
+                         {plan_km} km — {}x, and 1x is what converting a pane means",
+                        drawn_km / plan_km,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A fresh 3D pane asks the mirror for exactly one texel a pixel.
+///
+/// The same equality [`converting_a_plan_pane_to_3d_keeps_its_ground_scale`]
+/// measures, read off the other side and through the production path that sizes
+/// the floor mirror: if the 3D pane draws the ground at the plan pane's scale,
+/// then the copy of the plan pane it samples is already at the right density and
+/// [`floor_magnification`] is 1. It was **1.28683** at the 2.5 standoff — a
+/// pane that opened asking for a rung it did not need.
+///
+/// Worth its own test because the two functions reach the figure by different
+/// arithmetic — one through `box_from_clip`, one through the source pane's
+/// affine and a latitude — and a change that broke the agreement would leave
+/// both self-consistent.
+#[test]
+fn a_fresh_pane_asks_the_mirror_for_one_texel_a_pixel() {
+    let box_km = [460.0f32, 460.0, 18.0];
+    for lat in [25.0f64, 41.7311, 60.0] {
+        // A plan pane 900 points tall showing the box's north extent over that
+        // height, expressed the way `MapPaneGeo` carries it.
+        let points_per_degree_lon =
+            (900.0 / 460.0) * rustdar_radar::types::KM_PER_DEGREE_LAT * lat.to_radians().cos();
+        let magnification = floor_magnification(
+            OrbitCamera::default(),
+            box_km,
+            900.0,
+            points_per_degree_lon,
+            lat,
+        )
+        .expect("a fresh pane on a real affine must produce a demand");
+        assert!(
+            (magnification - 1.0).abs() < 1e-4,
+            "a fresh pane at {lat} N magnifies its own plan pane's floor by \
+             {magnification}x; 1x is what the default standoff is derived to give",
         );
     }
 }

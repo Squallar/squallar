@@ -545,9 +545,12 @@ pub fn exaggerated_box_km(camera: OrbitCamera, box_size_km: [f32; 3]) -> [f32; 3
 ///
 /// The field of view is vertical ([`FOV_Y_DEG`]), so the pane's height is the
 /// projection's fixed dimension and the north extent is the box axis that height
-/// sets. Keying the standoff to it makes the box span the same **1.28683×** of
-/// the pane's height at every aspect ratio. The three-axis half-diagonal spanned
-/// **0.926×** at aspect 0.15 and **6.525×** at 7.1 — a factor of **7.04** set by
+/// sets. Keying the standoff to it makes the pane's height span the same
+/// multiple of the box's north extent at every aspect ratio — and it is
+/// [`eye_distance_for_plan_scale`] that makes that multiple exactly **1.00000×**,
+/// so a plan pane converted to 3D shows the same ground at the same scale. The
+/// three-axis half-diagonal spanned **0.926×** at aspect 0.15 and **6.525×** at
+/// 7.1 (at the 2.5 standoff it shipped beside) — a factor of **7.04** set by
 /// nothing but the pane's shape, and still 2.50 over the 0.27 to 2.4 a two-column
 /// layout actually produces. A narrow pane's 3D view was silently zoomed in
 /// against its own plan pane and a wide one zoomed out; now neither is.
@@ -584,6 +587,63 @@ pub fn exaggerated_box_km(camera: OrbitCamera, box_size_km: [f32; 3]) -> [f32; 3
 /// nothing here for the exaggeration to multiply.
 fn framing_radius_km(box_size_km: [f32; 3]) -> f32 {
     half_diagonal([box_size_km[1], box_size_km[1], 0.0])
+}
+
+/// The standoff at which a 3D pane draws the ground at exactly the scale its
+/// plan pane draws it at — [`OrbitCamera`]'s default, derived here rather than
+/// chosen.
+///
+/// Converting a pane to 3D is a change of *viewpoint*. It is not also a zoom,
+/// and the only standoff at which it is not is this one.
+///
+/// # The arithmetic
+///
+/// A plan pane `H` points tall shows `N` kilometres of north–south ground over
+/// that height, because the box is cut from the pane's own rectangle: `H / N`
+/// points to the kilometre.
+///
+/// The 3D pane is a perspective camera with a vertical field of view
+/// ([`FOV_Y_DEG`]), so at the pivot's own depth `d` its height spans
+/// `2 · d · tan(fov/2)` kilometres and a world offset perpendicular to the view
+/// direction lands `(H/2) / (d · tan(fov/2))` points to the kilometre. That is
+/// the scale the *ground* is drawn at: the camera's right vector is level at
+/// every pitch, so the across-pane direction is the one the tilt does not
+/// foreshorten. Setting the two equal,
+///
+/// ```text
+/// (H/2) / (d · tan(fov/2)) = H / N   ⇒   d = N / (2 · tan(fov/2))
+/// ```
+///
+/// and `eye_distance` is that `d` counted in [`framing_radius_km`], which is
+/// `N / √2`, so `N` cancels and what is left is a property of the lens alone:
+///
+/// ```text
+/// eye_distance = √2 / (2 · tan(fov/2)) = 1.94276 at 40°
+/// ```
+///
+/// It falls out of this that [`floor_magnification`] is exactly 1.0 for a fresh
+/// pane — one mirror texel per screen pixel, the density the adaptive rung is
+/// measured against — which is not a coincidence but the same equality read off
+/// the other side.
+///
+/// # Why a function rather than a `const`
+///
+/// `f32::tan` is not a `const fn` (Rust 1.97), so the division cannot be folded
+/// at compile time and the choice is between this and a literal. A literal would
+/// be a measurement of a field of view it no longer names: at 60° the correct
+/// standoff is 1.2247 and a pinned 1.94276 would stand **1.59× too far back**,
+/// silently, with nothing to fail. This runs once per camera constructed, which
+/// is once per pane opened.
+///
+/// # What it replaced
+///
+/// 2.5, chosen before the standoff had a unit that tracked the framing. Against
+/// the `N / √2` radius that makes the pane span `2.5 · √2 · tan(20°)` =
+/// **1.28683×** the box's north extent, so a 3D pane opened **1.287×** zoomed
+/// out from the plan pane it was made from — uniformly, at every aspect ratio
+/// and every zoom, which is what made it a constant and not a framing bug.
+pub fn eye_distance_for_plan_scale() -> f32 {
+    std::f32::consts::SQRT_2 / (2.0 * (0.5 * FOV_Y_DEG.to_radians()).tan())
 }
 
 /// Half the length of the box's space diagonal — the depth the far plane is
