@@ -481,9 +481,8 @@ impl ScanInfo {
         let known_name = crate::sites::static_name(site);
         let radar_site = match (site_position, row) {
             (Some(position), Some(row)) => position.applied_to(Some(row)),
-            (Some(position), None) => {
-                position.applied_to_named(known_name.unwrap_or(crate::sites::UNKNOWN_SITE_NAME), None)
-            }
+            (Some(position), None) => position
+                .applied_to_named(known_name.unwrap_or(crate::sites::UNKNOWN_SITE_NAME), None),
             (None, Some(row)) => row.clone(),
             (None, None) => {
                 // Error, not warning: nothing downstream of here can place

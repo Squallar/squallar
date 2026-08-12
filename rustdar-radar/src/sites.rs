@@ -235,10 +235,12 @@ impl SiteTable {
     /// [`is_tdwr_id`] would then answer `false` for a terminal radar. The
     /// compiled-in table used to place it and hide the question.
     pub fn static_name(&self, site: &str) -> Option<&'static str> {
-        self.by_name
-            .get(site)
-            .map(|row| row.name)
-            .or_else(|| self.unplaced.iter().find(|listed| **listed == site).copied())
+        self.by_name.get(site).map(|row| row.name).or_else(|| {
+            self.unplaced
+                .iter()
+                .find(|listed| **listed == site)
+                .copied()
+        })
     }
 
     /// The row for an ICAO identifier, or `None` if this table cannot place
