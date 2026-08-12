@@ -52,15 +52,6 @@ impl<'a> Message<'a> {
         let pointers_space = raw_header.data_block_count.get() as usize * size_of::<u32>();
         let pointers_raw = reader.take_bytes(pointers_space)?;
 
-        let pointers = pointers_raw
-            .chunks_exact(size_of::<u32>())
-            .map(|v| {
-                v.try_into()
-                    .map_err(|_| Error::Decoding("message pointers".to_string()))
-                    .map(u32::from_be_bytes)
-            })
-            .collect::<Result<Vec<_>>>()?;
-
         let mut message = Self {
             header: Header::new(raw_header),
             volume_data_block: None,
@@ -75,7 +66,16 @@ impl<'a> Message<'a> {
             clutter_filter_power_data_block: None,
         };
 
-        for pointer in pointers {
+        // Walked straight off the input rather than collected first. The
+        // pointer table is consumed here and nowhere else, and `pointers_raw`
+        // borrows the input, not the reader, so nothing needs it to outlive the
+        // loop. Collecting into a `Result<Vec<_>>` went through a shunt
+        // iterator whose `size_hint` lower bound is zero, so the `Vec` could
+        // not be pre-sized from a count `chunks_exact` knows exactly: it
+        // allocated at capacity four and grew, once per radial.
+        for chunk in pointers_raw.chunks_exact(size_of::<u32>()) {
+            let pointer = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+
             let relative_position = reader.position() - start_position;
             let pointer_position = pointer as usize;
 
