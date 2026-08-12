@@ -2677,3 +2677,96 @@ fn two_tilt_velocity_scan() -> Scan {
         vec![tilt(1, 0.5), tilt(2, 1.5)],
     )
 }
+
+// ── the output pool's two slots ──────────────────────────────────────────────
+
+/// What a *used* buffer looks like. Not zero, and not a byte any correct render
+/// could leave behind either, so one of them surviving into a checkout is
+/// unambiguous.
+const POISON: u8 = 0xA5;
+
+/// `checkout_image` hands out a buffer indistinguishable from a fresh
+/// allocation, at every length relative to the one the slot was holding.
+///
+/// # Why this is a unit test and not only an end-to-end one
+///
+/// `tests/render_output_pool.rs` renders through the public entry and *does*
+/// have teeth on the texture — [`RenderBuffers::into_output`]'s colouring pass
+/// has no `else` arm, so an unpainted pixel keeps whatever the buffer arrived
+/// holding, and a blank render following a painted one shows the difference.
+/// But it can only reach the lengths a raster side actually takes, and it says
+/// nothing at all about the value grid, which `extend` overwrites element for
+/// element and where an end-to-end assertion is therefore vacuous — the trap
+/// this campaign has been caught by three times. This poisons the slot directly
+/// at seven lengths around the one being asked for, which is the only way to
+/// fail a checkout that is right for the sides production happens to use and
+/// wrong for the arithmetic.
+#[test]
+fn a_checked_out_texture_is_zero_at_every_length() {
+    let want = 4096;
+    // Shorter than, equal to and longer than the request, plus both degenerate
+    // ends. A buffer *longer* than the request is what a grow-only fit gets
+    // wrong; a shorter one is what a fit that trusts the slot's own length gets
+    // wrong.
+    for held in [0, 1, want / 2, want - 1, want, want + 1, want * 3] {
+        super::recycle_image(vec![POISON; held]);
+        let image = super::checkout_image(want);
+        assert_eq!(
+            image.len(),
+            want,
+            "a checkout asked for {want} bytes came back with {} after the slot held {held}",
+            image.len()
+        );
+        assert!(
+            image.iter().all(|&b| b == 0),
+            "a checkout after the slot held {held} bytes came back with {} non-zero bytes of {want}",
+            image.iter().filter(|&&b| b != 0).count()
+        );
+    }
+    // And with nothing in the slot, which is every render before the first one
+    // that gives a buffer back — and every render in a browser.
+    let _ = super::image_pool().take();
+    let image = super::checkout_image(want);
+    assert_eq!(image.len(), want);
+    assert!(image.iter().all(|&b| b == 0));
+}
+
+/// `checkout_values` hands out an **empty** grid whatever the slot was holding,
+/// so a longer grid from a previous render cannot survive past the end of this
+/// one's.
+///
+/// The grid is filled by `extend`, which writes every element it produces, so
+/// unlike the texture there is no seeded state here to leak. The failure this
+/// pins is the other one: a checkout that kept the slot's length would leave
+/// the render *appending* to it, and every grid after the first would come out
+/// longer than the raster it describes — which
+/// `crate::render_input::tests`'s shape assertions would then read as a
+/// different raster side.
+#[test]
+fn a_checked_out_value_grid_is_empty_at_every_length() {
+    for held in [0usize, 1, 1024, 4096, 1 << 20] {
+        super::recycle_values(vec![f32::from_bits(0xDEAD_BEEF); held]);
+        let values = super::checkout_values();
+        assert_eq!(
+            values.len(),
+            0,
+            "a checkout came back holding {} values after the slot held {held}",
+            values.len()
+        );
+    }
+}
+
+// What `recycle_image` and `recycle_values` do *to the slot* — keep the first
+// offer, drop the rest, decline a buffer with no capacity — is pinned in
+// `tests/render_output_slot.rs` and deliberately not here. A test of that shape
+// has to assert the slot's exact contents, and this binary's twenty-odd other
+// rendering tests take and fill both slots on other threads while it runs. It
+// was never observed failing — forty-five clean runs of the whole binary all
+// passed — and it fails anyway: with one thread checking out and recycling
+// beside it, the assertion read the wrong answer 2,017 times in 200,000, which
+// puts an ordinary run somewhere around one in a thousand. That is the flake
+// nobody sees for a year and then cannot reproduce. The two tests
+// above are the shape that survives here, and it is not an accident — both
+// assert only what a checkout must satisfy *whatever* the slot held, so no
+// interleaving can make them fail. See that file for how a separate process
+// gets the exact-contents claim back without the race.

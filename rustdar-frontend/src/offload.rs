@@ -701,24 +701,38 @@ impl<'a> Reader<'a> {
 /// rendered in a worker byte-identical to one rendered on this thread — the
 /// two are not two renderers that agree, they are one renderer.
 ///
-/// "Pure" is a claim about what it *returns*, and it survives two pieces of
-/// process-wide state underneath, both of them buffer pools and both admissible
+/// "Pure" is a claim about what it *returns*, and it survives four pieces of
+/// process-wide state underneath, all of them buffer pools and all admissible
 /// for the same one reason:
 ///
 /// * the plan-view rasterizer carries its cell buffer between calls
-///   (`rustdar_radar::render`'s `POOLED_CELLS`), and
+///   (`rustdar_radar::render`'s `POOLED_CELLS`);
 /// * the section rasterizer carries its three planes between cuts
 ///   (`rustdar_radar::xsect`'s `POOLED_PLANES`), which the `Section` arm below
-///   reaches through `render_section`.
+///   reaches through `render_section`; and
+/// * the plan-view rasterizer carries the RGBA texture and the value grid it
+///   answers with (`rustdar_radar::render`'s `POOLED_IMAGE` and
+///   `POOLED_VALUES`).
 ///
-/// Neither buffer can be handed out in any state but the one a fresh allocation
-/// would be in — drained for the cells, re-seeded and resized to the raster for
-/// the planes — so no call can observe another's. The byte-identity above was
-/// re-measured across five sites and twelve products with the first in place,
-/// and across nine volumes at eight sites and six cut geometries with the
-/// second. Anything added below that *is* observable between calls breaks the
-/// worker equivalence this paragraph promises, because a worker does not share
-/// this process's memory.
+/// No buffer can be handed out in any state but the one a fresh allocation would
+/// be in — drained for the cells, re-seeded and resized to the raster for the
+/// planes and the texture, empty for the grid — so no call can observe
+/// another's. The byte-identity above was re-measured across five sites and
+/// twelve products with the first in place, across nine volumes at eight sites
+/// and six cut geometries with the second, and across seven sites, six products
+/// and three image sides with the last two. Anything added below that *is*
+/// observable between calls breaks the worker equivalence this paragraph
+/// promises, because a worker does not share this process's memory.
+///
+/// The last pair is also the one place this function *writes* to that state: the
+/// `values_wanted: false` arm below hands the grid back rather than dropping it.
+/// That is still a claim about a buffer and not about a result — what the next
+/// call receives is a re-seeded buffer, which is what it would have allocated,
+/// so a call that finds the slot full and one that finds it empty return the
+/// same bytes. Worker equivalence is untouched by it and was re-measured with
+/// the write in place; what a worker's write reaches is that instance's own
+/// slot, in its own linear memory, which is a fact about where the win lands
+/// and not about what comes back.
 pub fn execute(request: &JobRequest) -> JobResult {
     // Read once, off the request, so the three rasterizing arms cannot come to
     // disagree about how large a picture this job was allowed to make.
@@ -735,7 +749,18 @@ pub fn execute(request: &JobRequest) -> JobResult {
                 // rasterizer writes into, and the texture is derived from it.
                 // Clearing it here costs nothing and keeps the renderer's
                 // output the one thing it has always been.
-                frame.values = Vec::new();
+                //
+                // Handed back rather than freed, because this is the moment it
+                // dies and the renderer has a slot waiting for it —
+                // `rustdar_radar::render::POOLED_VALUES`. A *Level II* loop
+                // frame is the one render that reaches this arm, and it is also
+                // one of the two that repeat sixty times over, so this is where
+                // its grid's 4,096 pages stop being re-faulted per frame. The
+                // Level III loop has no `values_wanted` to reach it by and gives
+                // its grid back at the consumer instead; `app_fetch`'s `deliver`
+                // is the site, and the husk this `take` leaves is what makes the
+                // one call there safe for both.
+                rustdar_radar::render::recycle_values(std::mem::take(&mut frame.values));
             }
             JobOutput::Frame(frame)
         }),

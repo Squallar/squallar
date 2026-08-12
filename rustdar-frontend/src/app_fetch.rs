@@ -1267,7 +1267,7 @@ impl super::App {
                     // in a browser with a worker it is the one part of the
                     // render that lands on the main thread, and it is a
                     // reinterpretation of 4 MiB rather than a rasterization.
-                    match loop_frame_image(&frame.image) {
+                    let converted = match loop_frame_image(&frame.image) {
                         Some(image) => (Some(image), frame.max_range_km, frame.nyquist_ms),
                         None => {
                             log::error!(
@@ -1277,7 +1277,27 @@ impl super::App {
                             );
                             (None, 0.0, None)
                         }
-                    }
+                    };
+                    // `rgba` drops at the end of this scope either way, as the
+                    // comment above says; this is that drop, spelt as a hand
+                    // back to the renderer's slots. Both outcomes give both
+                    // buffers up, because a frame whose length the loop refused
+                    // is exactly as dead as one it accepted.
+                    //
+                    // The grid is not already covered by `offload::execute`.
+                    // That one runs off `JobRequest::Radar`'s `values_wanted:
+                    // false`, which only the Level II half of the dispatch above
+                    // has: `JobRequest::Level3` carries no such field, so half
+                    // the frames passing this site — every Level III loop —
+                    // arrive still holding a `LOOP_IMAGE_SIZE²` grid, and this
+                    // is the only place it dies. One call covers both halves
+                    // because the Level II half arrives holding the capacity-0
+                    // husk `execute`'s `mem::take` left behind, which
+                    // `recycle_values` declines; so the line is free where it is
+                    // redundant and is the whole of the win where it is not.
+                    rustdar_radar::render::recycle_values(frame.values);
+                    rustdar_radar::render::recycle_image(frame.image);
+                    converted
                 }
                 None => (None, 0.0, None),
             };

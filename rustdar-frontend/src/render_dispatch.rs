@@ -1553,8 +1553,25 @@ impl RenderDispatcher {
             if still_wanted {
                 let _ = sender.send(RenderResponse {
                     rendered: frame.and_then(|frame| {
+                        // The RGBA bytes are finished with the moment they have
+                        // been copied into the `ColorImage`, and this is the
+                        // only place that copy happens for a static render — so
+                        // this is where they go back to the renderer's slot
+                        // rather than to the allocator. Recycled before the `?`
+                        // so that a texture the display layer rejects gives its
+                        // buffer up too.
+                        //
+                        // The value grid does *not* go back here. It leaves in
+                        // the `Arc` below and is held by the pane, the render
+                        // cache and every hover that samples it, so this thread
+                        // is not its last owner and there is no moment on this
+                        // path at which it is nobody's. See
+                        // `rustdar_radar::render::POOLED_VALUES`, which records
+                        // what that costs.
+                        let picture = plan_view_image(&frame.image);
+                        rustdar_radar::render::recycle_image(frame.image);
                         Some(crate::channels::RenderedImage {
-                            image: Arc::new(plan_view_image(&frame.image)?),
+                            image: Arc::new(picture?),
                             max_range_km: frame.max_range_km,
                             value_data: Arc::new(frame.values),
                             nyquist_ms: frame.nyquist_ms,

@@ -351,7 +351,11 @@ struct RenderBuffers {
 /// The drop is larger than this buffer's own 8,193 pages, and the surplus is
 /// the second half of the same effect: while a 32 MiB block is `munmap`ed on
 /// every render, the 16 MiB image and 16 MiB value grid allocated beside it
-/// never get a settled heap to be recycled from either.
+/// never get a settled heap to be recycled from either. Those two were left
+/// costing 7,103–8,208 faults a render once this buffer stopped churning, which
+/// is a different mechanism — 16 MiB is under the cliff, so they are an arena
+/// problem and not an `mmap` one — and they are carried now too. See
+/// [`POOLED_IMAGE`].
 ///
 /// # Why one buffer, and not one per thread
 ///
@@ -420,6 +424,368 @@ struct RenderBuffers {
 /// rasters, four times that if they were long-range — to speed up renders that
 /// were already holding those six buffers live at once.
 static POOLED_CELLS: std::sync::Mutex<Option<Vec<AtomicU64>>> = std::sync::Mutex::new(None);
+
+/// The one RGBA texture this process keeps between plan-view renders, and the
+/// one value grid, in two slots that fill and empty independently.
+///
+/// # What they are worth
+///
+/// [`RenderBuffers::into_output`] built both of these afresh on every render.
+/// At the base side that is `2048² × 4` twice — **16,777,216 bytes each**,
+/// 4,096 pages each — and both are written in full before the render returns.
+/// Neither is near [`POOLED_CELLS`]' cliff: 16 MiB is half of glibc's
+/// `DEFAULT_MMAP_THRESHOLD_MAX`, so these blocks are servable from an arena and
+/// the reason they were not being served from one is different. The parallel
+/// LDM decode that lands first fans 50–130 records across the whole rayon pool
+/// and leaves the process with more arenas than any one of them keeps a warm
+/// 16 MiB chunk in; the render then runs on a thread `offload` spawns for it
+/// alone, takes whichever arena it is given, and faults all 8,192 pages back in.
+///
+/// Measured on this box — 32 cores, `--release` (`lto = true`, `opt-level = 3`),
+/// loadavg 4.7–17 — on a fresh thread per render in a process that had already
+/// run the parallel decode, over four archived volumes at four sites (KFTG, KTLX,
+/// KDMX, KLWX) and two products, nine renders each, interleaved arms with a
+/// fresh process for every one and the arm order alternating by round. The
+/// ranges are across those eight site-product pairs, worst to best; the first
+/// two renders of a process are excluded from every arm, for the reason the last
+/// paragraph of this section gives.
+///
+/// | per render                   |          before |     after |
+/// |------------------------------|----------------:|----------:|
+/// | minor faults, process-wide   |     7,103–8,208 |  **0–15** |
+/// | minor faults, render thread  |     3,340–7,333 |   **0–0** |
+/// | allocations ≥ 1 MiB          |               2 |     **0** |
+/// | allocations, all sizes       |           32–38 | **30–36** |
+/// | bytes allocated              |          33.6 M |**33–47 k**|
+/// | best ms                      |     35.47–38.96 |**31.48–34.91**|
+/// | median ms                    |     36.71–39.68 |**32.47–35.61**|
+/// | *control*, best / median ms  |   40.34 / 41.88 | 40.34 / 41.81 |
+///
+/// The control is a fixed, allocation-free compute kernel over a slab already
+/// faulted in, run on a fresh thread beside every render. It measures the box
+/// rather than the change and it does not move — 40.16–40.34 ms best and
+/// 41.81–41.88 ms median in every arm — which is what says the render's numbers
+/// are the render's, on a box where 30-odd agents are runnable at any moment.
+///
+/// Both fault columns are the evidence rather than the wall clock, and they are
+/// not the same measurement twice. `value_data` is built serially on the
+/// render's own thread and faults there; `image` is written by `par_chunks_mut`
+/// on rayon's workers and faults on *them*, which no per-thread counter on the
+/// render's thread can see. That is why the per-thread figure is roughly half
+/// the process-wide one before, and why both are quoted. 8,192 of those pages
+/// are these two buffers, on a raster whose size the render states up front.
+///
+/// The decode does not move: 50.74 → 49.16 ms best on KFTG and 16.76 → 16.90 on
+/// KTLX, noise in both directions and no systematic change, which is what a pool
+/// that is not in the decode should look like.
+///
+/// # What a miss costs, which is nothing
+///
+/// A render that finds a slot empty must be no worse off than one in a build
+/// with no pool, or the web and every first render pay for a win they do not
+/// get. It is not automatic: fitting an empty `Vec` to the raster reaches the
+/// right length by `reserve` plus a `memset`, where `vec![0u8; n]` is
+/// `alloc_zeroed` and glibc answers a request this size with `mmap` pages that
+/// are *already* zero. The first cut of this cost 70.0 → 75.8 ms on KTLX, a
+/// straight loss. [`checkout_image`]'s miss arm is therefore the original
+/// expression and not a fitted empty, and the third arm of the experiment above
+/// — the pooled build with nothing ever handed back — lands on the before arm to
+/// within noise: 35.30–38.73 ms best against 35.47–38.96, the same 7,104–8,205
+/// faults and the same two allocations ≥ 1 MiB.
+///
+/// # Why the first two renders of a process are excluded
+///
+/// The first buys the pages, as it does for [`POOLED_CELLS`]. The second is less
+/// obvious and is the reset's doing: the colouring pass writes only the pixels a
+/// sweep paints, so the *first* render never touches the mmap'd zero pages under
+/// its own unpainted sky, and the second render's `resize` — which memsets the
+/// whole buffer — is where those pages are first touched. It costs 1,096–2,664
+/// faults once per process, in proportion to how much of the raster the sweep
+/// leaves empty, and from the third render on the figure is the 0–15 above.
+///
+/// # Why not `Drop`, which is how the cross-section's planes come back
+///
+/// `crate::xsect`'s `POOLED_PLANES` is returned by `CrossSection`'s [`Drop`] —
+/// the obvious way to carry a buffer that leaves a function *inside* a value,
+/// and the shape that module can take because its three planes are private
+/// fields behind accessors, so a section really is their last owner. It does
+/// **not** transfer to this renderer, for two independent reasons.
+///
+/// The first is that it does not compile. [`SweepRender`]'s buffers are `pub`,
+/// and they are moved out — by
+/// `rustdar_frontend::offload`'s `From<SweepRender> for RenderedFrame`, by two
+/// integration tests in that crate and by two dozen destructurings in this
+/// module's own tests. A type with a `Drop` impl cannot have a field moved out
+/// of it (E0509), so `Drop` here is a compile error at every one of those
+/// sites.
+///
+/// The second is that converting them all to accessors would not help, because
+/// the buffers do not *stop* at [`SweepRender`] the way a section's planes stop
+/// at `CrossSection`. They keep going: into `RenderedFrame`, then the texture
+/// into an egui `ColorImage` and the grid into an `Arc` a pane holds for as
+/// long as it shows that render. A `Drop` on `SweepRender` would fire on an
+/// emptied husk and hand the pool nothing.
+///
+/// So the buffers are given back where they actually die, by the crate that
+/// owns those moments, through [`recycle_image`] and [`recycle_values`]. That
+/// is the same trade `POOLED_CELLS` refuses for *checkout* — threading a buffer
+/// in would change ten entry points and the worker protocol — and it is a
+/// different trade, because handing a dead buffer back is one call at one site
+/// and needs no route for it to arrive by.
+///
+/// # Why two slots and not one pair
+///
+/// Because the two buffers die in different places and at different times, and
+/// on the path that matters most one of them does not die at all.
+///
+/// A **loop frame** gives both back, and its two buffers die at two different
+/// moments. The texture is finished with as soon as it has been reinterpreted
+/// for the channel, which is `app_fetch`'s `deliver`. The grid is dead the
+/// moment it is produced, because a loop frame stores no values — and *where*
+/// that is honoured depends on which kind of loop frame it is. A Level II frame
+/// is dispatched `JobRequest::Radar { values_wanted: false }` and
+/// `offload::execute` empties it there, in the instance that rasterized it. A
+/// Level III frame is dispatched `JobRequest::Level3`, which has **no such
+/// field** — there is nothing to strip on a raster whose values the loop never
+/// asked for differently — so its grid rides back to `deliver` intact and is
+/// handed over there, beside the texture. One call at that site covers both:
+/// what a Level II frame carries to it is the capacity-0 husk `execute`'s
+/// `mem::take` left behind, which [`recycle_values`] declines. So the
+/// highest-frequency render in the application — sixty of them per loop
+/// download, of either kind — allocates neither buffer, and gets the whole of
+/// the table above.
+///
+/// A **static pane** gives back only the texture. Its grid leaves in an `Arc`
+/// that the pane, the render cache and every hover that samples the field all
+/// hold, so the render's thread is not its last owner and there is no moment on
+/// that path at which it belongs to nobody. That slot therefore misses, which
+/// costs exactly what the "miss" section above says it costs: nothing.
+///
+/// A single slot holding both would be empty whenever either was still out,
+/// which on the static path is always — so it would give the static pane
+/// nothing, where two slots give it half.
+///
+/// Half is worth having and is also the *smaller* half, which is worth writing
+/// down because it is the opposite of what the sizes suggest. The two buffers
+/// are the same 16 MiB and remove the same 4,096 pages each, but they are not
+/// paid for on the same thread: the grid is built serially on the render's own
+/// thread, where a fault stalls the render, and the texture is written by 32
+/// rayon workers, where the same 4,096 faults are spread across the pool and
+/// barely reach the clock. Measured separately over KFTG and KTLX at loadavg
+/// 12–17, best ms and process-wide faults:
+///
+/// |                       | KFTG best | KTLX best |          faults |
+/// |-----------------------|----------:|----------:|----------------:|
+/// | neither slot fed      |     43.92 |     41.92 |     7,106–8,213 |
+/// | texture only          |     43.34 |     40.62 |     3,011–4,107 |
+/// | grid only             |     39.79 |     36.54 |     3,008–4,096 |
+/// | both                  | **39.39** | **35.62** |        **0–16** |
+///
+/// (Those absolutes are not comparable with the table further up — that run was
+/// at a lower load, and its control sits at 40.34 ms against this one's 43.50.
+/// The rows here are comparable with *each other*, which is what they are for.)
+///
+/// So the texture's slot buys half the faults and about a millisecond, and the
+/// grid's buys the other half and four or five more. Giving the static pane its
+/// grid back would need the `Arc` replaced by a handle that recycles when the
+/// last holder drops it — across `rustdar_frontend::channels`,
+/// `rustdar_egui::pane` and `rustdar_egui::overlay_cache` — and the numbers
+/// above are here so that whoever weighs that has them without re-measuring.
+///
+/// # Residency
+///
+/// **One spare texture and one spare grid, each of the largest raster that has
+/// been given back to *that slot*** — which is not the same raster for the two,
+/// and the difference is most of the figure. Both are `side² × 4` bytes, so at
+/// the base side they are 16 MiB each and the pair is **32 MiB**. Past that they
+/// part company:
+///
+/// * The **texture** slot is fed by both consumers, and one of them —
+///   `render_dispatch`'s `deliver`, the static pane — is the one render kind
+///   that may take the long-range raster. So its high-water is the 4096 ceiling:
+///   **64 MiB** natively, 16 MiB on the web, where the ceiling is 2048.
+/// * The **grid** slot is fed only by loop frames, for the reason the section
+///   above gives — a static pane's grid leaves in an `Arc` and never belongs to
+///   nobody. Every loop frame is dispatched `full_res: false`, so this slot
+///   never sees anything larger than `LOOP_IMAGE_SIZE² × 4`: **16 MiB** on
+///   desktop and mobile, 4 MiB on the web, where a loop frame is 1024². A
+///   long-range static render does *take* this slot's buffer and grow it to 64
+///   MiB — but that grown grid leaves in the `Arc` and never comes back, and the
+///   slot it left is empty.
+///
+/// So the real ceiling is **80 MiB** natively and 20 MiB on the web, not the
+/// 128 MiB that doubling the long-range texture would suggest. High-water rather
+/// than constant, for [`RenderBuffers::checkout`]'s reason and with its price:
+/// the slot is fitted to the render asking for it rather than reallocated, so an
+/// alternation between two sides re-faults nothing once the larger has been
+/// seen.
+///
+/// This is a spare rather than an addition to the peak — a render that is alive
+/// is holding its buffers, and the slots are empty while it is — so the ceiling
+/// is "the renders alive at once, plus one of each".
+///
+/// wasm32 carries both regardless and has less to win, exactly as
+/// [`POOLED_CELLS`] does: dlmalloc in a linear memory that never shrinks
+/// recycles a 16 MiB block as readily as any other and there are no fresh zero
+/// pages to fault. Which of the slots can even be fed there depends on where
+/// the render ran, and the two answers differ. The grid's is returned by
+/// `offload::execute` itself, which is the rasterizing instance whichever it
+/// is, so that slot fills in a worker as readily as on the main thread. The
+/// texture's is returned by the consumers — `render_dispatch`'s `deliver` and
+/// `app_fetch`'s — which are always the main instance, so with a worker
+/// attached the worker's texture slot never fills and every render there
+/// allocates as it always did. Without one, the inline fallback rasterizes in
+/// the main instance and both slots fill. None of that is a `cfg`: a
+/// `cfg`-gated behavioural split would be a second renderer that no row of this
+/// workspace's gate runs the tests of, and what the unfed case costs is
+/// measured above at nothing.
+static POOLED_IMAGE: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
+
+/// See [`POOLED_IMAGE`], which documents both slots.
+static POOLED_VALUES: std::sync::Mutex<Option<Vec<f32>>> = std::sync::Mutex::new(None);
+
+/// The texture slot, with a poisoned lock read as a live one — see
+/// [`RenderBuffers::pool`], whose account of what the lock covers holds here
+/// word for word.
+fn image_pool() -> std::sync::MutexGuard<'static, Option<Vec<u8>>> {
+    POOLED_IMAGE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The value-grid slot. See [`image_pool`].
+fn values_pool() -> std::sync::MutexGuard<'static, Option<Vec<f32>>> {
+    POOLED_VALUES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A zeroed texture of exactly `len` bytes — the pool's if it has one.
+///
+/// # Why it is zeroed rather than trusted to be overwritten
+///
+/// Because it genuinely is not overwritten. [`RenderBuffers::into_output`]'s
+/// colouring pass has **no `else` arm**: a pixel whose value is `NaN` and whose
+/// bits are not [`RANGE_FOLDED_BITS`] is left exactly as the buffer delivered
+/// it, and every render leaves most of the raster that way — the corners
+/// outside the disc, the gaps between radials, the whole of a sweep that
+/// paints nothing. `vec![0u8; n]` is what made those pixels transparent, and a
+/// pooled buffer that skipped this would show the previous render's echoes
+/// through the new one's empty sky. That is not the vacuous case the section's
+/// planes were in, where the raster loop covered every pixel and the re-seed
+/// was insurance; here it is the whole correctness of the change, and
+/// `tests/render_output_pool.rs` fails without it.
+///
+/// `clear` then `resize` rather than `resize` then `fill`: it is total in both
+/// directions in one step, so a buffer coming back from a *larger* raster is
+/// truncated and one going out to a larger raster has its grown tail zeroed,
+/// with no length left over from the render before to disagree with the one
+/// this render is about to claim.
+fn checkout_image(len: usize) -> Vec<u8> {
+    // Bound to a `let`, and deliberately **not** written as the scrutinee of
+    // the `match` below. A guard produced inside a scrutinee temporary lives to
+    // the end of the whole `match`, so `match image_pool().take() { .. }` would
+    // hold the pool lock across the fallback allocation and the zero-fill under
+    // it — 16 MiB and its page faults, under a process-wide mutex, exactly
+    // where concurrent renders that all miss the slot would queue on each other
+    // instead of allocating in parallel as they do with no pool at all. Bound
+    // to a `let`, the guard is dropped at this semicolon.
+    //
+    // **This one is caught by a lint and its two siblings are not**, which is
+    // the difference worth knowing. Fusing these two statements makes
+    // `clippy::significant_drop_in_scrutinee` fire on this line and suggest
+    // exactly the `let` that is written here — because this is a `match`, and a
+    // `match` scrutinee is the shape that lint reads. [`checkout_values`] just
+    // below and `crate::xsect`'s `checkout` are the same hazard written as a
+    // method chain (`pool().take().unwrap_or_else(..)`), and neither that lint
+    // nor `significant_drop_tightening` says anything about either. Verified by
+    // fusing all three and re-running with both lints enabled: one warning, on
+    // this line, and silence for the other two.
+    //
+    // Available rather than automatic: both lints are nursery and this
+    // workspace's gate is `clippy --all-targets --all-features -- -D warnings`,
+    // which does not turn them on. So an editor who fuses this and asks
+    // `-W clippy::significant_drop_in_scrutinee` will be told, and one who does
+    // not asks nothing of the two chain-shaped siblings either way — for those,
+    // this comment and `xsect::checkout`'s are the whole of the guarantee.
+    let taken = image_pool().take();
+    match taken {
+        Some(mut image) => {
+            image.clear();
+            image.resize(len, 0u8);
+            image
+        }
+        // `vec!` and not `Vec::new()` fitted by the arm above, which would reach
+        // the same length by `reserve` plus a `memset`. This is `alloc_zeroed`,
+        // and on a request this size glibc answers it with fresh `mmap` pages
+        // that are *already* zero — so the fill is free, and a render that
+        // misses the slot pays exactly what every render paid before this pool
+        // existed and not a byte more. Measured: fitting an empty `Vec` here
+        // instead cost 70.0 → 75.8 ms on KTLX, which is the whole of what a
+        // miss would otherwise have been charged for the pool's existence.
+        None => vec![0u8; len],
+    }
+}
+
+/// An empty value grid with the pool's capacity if it has one.
+///
+/// Returned empty rather than sized, because its one caller fills it by
+/// `extend` from an iterator over the cells — which writes every element it
+/// produces, so unlike the texture there is no seeded state for a stale tail to
+/// hide in. The `clear` is still what makes that true: it is what stops a
+/// longer grid from a previous render surviving past the end of this one's.
+fn checkout_values() -> Vec<f32> {
+    // See [`checkout_image`] for why this is a `let` and not a receiver — and
+    // for why no lint would tell you if it stopped being one here, this being
+    // the chain-shaped half of that asymmetry.
+    let taken = values_pool().take();
+    let mut values = taken.unwrap_or_default();
+    values.clear();
+    values
+}
+
+/// Offer a finished RGBA texture back for the next plan-view render to draw
+/// into.
+///
+/// Call it where the texture stops being needed — after it has been copied into
+/// whatever the display layer holds — and not before. What arrives is *dead*:
+/// this takes ownership, and the next render will overwrite every byte.
+///
+/// Declining is normal and costs the caller nothing. The buffer is dropped
+/// where it stands if the slot is already full, which is what makes this one
+/// slot rather than a free list, and dropped if it has no capacity to lend,
+/// because a `Vec::new()` in the slot would occupy it while forcing the next
+/// render to allocate anyway.
+///
+/// Both of those refusals — and that a buffer this *does* keep is the one the
+/// next render draws into, rather than a `drop` with extra steps — are pinned by
+/// `tests/render_output_slot.rs`, which is its own process because the claim is
+/// about the slot itself and not about any render's output.
+///
+/// `POOLED_IMAGE` — private, and above — is where the slot and its measurements
+/// are documented. Named in text rather than linked because a `pub` item's docs
+/// cannot link to a private one without a rustdoc warning.
+pub fn recycle_image(image: Vec<u8>) {
+    if image.capacity() == 0 {
+        return;
+    }
+    let mut pool = image_pool();
+    if pool.is_none() {
+        *pool = Some(image);
+    }
+}
+
+/// Offer a finished value grid back. See [`recycle_image`], which this mirrors
+/// exactly.
+pub fn recycle_values(values: Vec<f32>) {
+    if values.capacity() == 0 {
+        return;
+    }
+    let mut pool = values_pool();
+    if pool.is_none() {
+        *pool = Some(values);
+    }
+}
 
 impl RenderBuffers {
     /// `side_px` is the only statement of the buffer's shape, and
@@ -548,6 +914,13 @@ impl RenderBuffers {
     /// were painted at so that whatever places the picture places it on the
     /// same ground the gates were projected onto.
     ///
+    /// The texture and the grid are themselves taken from [`POOLED_IMAGE`] and
+    /// [`POOLED_VALUES`] rather than allocated here, which is why the two `vec!`
+    /// this used to open with are now [`checkout_image`] and
+    /// [`checkout_values`]. Both are handed out indistinguishable from a fresh
+    /// allocation and both come back somewhere else entirely — the crate that
+    /// consumes them — for the reasons [`POOLED_IMAGE`] sets out.
+    ///
     /// Colour is derived here rather than stored per sample: it is a pure
     /// function of the value at every call site, so keeping it in the cell
     /// would only give it a second chance to disagree. Deriving it is also
@@ -566,20 +939,26 @@ impl RenderBuffers {
     /// it also means the buffer cannot be handed out un-reset by a path that
     /// forgot, because there is only the one path.
     ///
+    /// That is a claim about the **cells**, and the texture below cannot make
+    /// it: nothing reads a texel before writing it, because the colouring pass
+    /// writes only the pixels a gate claimed. Its reset is therefore a real
+    /// `memset` in [`checkout_image`], and paying for one is still cheaper than
+    /// faulting the pages it writes over.
+    ///
     /// `get_mut` rather than a `swap`: rasterization is over by the time this
     /// runs and taking `self` by value proves it, so the drain is a plain load
     /// and store per cell rather than 4 M locked read-modify-writes.
     fn into_output(self, extent_km: f64) -> SweepRender {
         let Self { mut cells, product } = self;
-        let mut value_data: Vec<f32> = cells
-            .iter_mut()
-            .map(|a| match std::mem::replace(a.get_mut(), Self::EMPTY) {
+        let mut value_data = checkout_values();
+        value_data.extend(cells.iter_mut().map(|a| {
+            match std::mem::replace(a.get_mut(), Self::EMPTY) {
                 Self::EMPTY => f32::NAN,
                 cell => f32::from_bits(cell as u32),
-            })
-            .collect();
+            }
+        }));
         Self::recycle(cells);
-        let mut image = vec![0u8; value_data.len() * 4];
+        let mut image = checkout_image(value_data.len() * 4);
         image
             .par_chunks_mut(4 * Self::COLOR_CHUNK)
             .zip(value_data.par_chunks_mut(Self::COLOR_CHUNK))
