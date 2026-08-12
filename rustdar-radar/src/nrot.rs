@@ -839,6 +839,26 @@ const STENCIL_RNG_HALF: i32 = 1;
 /// Coherence floor for both stencils: squared correlation between the
 /// velocity profile and the stencil's ramp response; constant or incoherent
 /// profiles read ND, matching the reference's ND bins over good velocity.
+///
+/// # Where this floor is measurably too low
+///
+/// On a clear-air cut it lets through velocity the reference paints no
+/// rotation over at all. KHNX 2024-12-16 08:01:56, VCP 31, declared Nyquist
+/// 11.66 m/s: 41 bins spread over the sweep where this module reads
+/// |NROT| ≥ 0.5 inside 80 km were hovered in the reference, and **all 41 read
+/// ND** — while its base velocity over the same ground is painted and smooth,
+/// a few m/s. The velocity we read there is not smooth: at az 269.75°,
+/// 14.6 km the nine radials across the bin carry −5.0 −4.0 +10.0 +0.5 +8.5
+/// −7.5 +0.5 −11.5 −11.5, alternating near ±Vny, and this floor admits it.
+///
+/// It is not an input gate we are missing. Two ladders were painted into the
+/// same cut, one couplet per sector with only the sector's reflectivity
+/// differing (40, 25, 15, 5, 0, −10 dBZ) and one with only its spectrum width
+/// differing (1, 3, 5, 7, 9, 12 m/s): the reference read the identical +0.49
+/// couplet profile in all twelve. So what it refuses on the real cut is the
+/// velocity field itself, and this floor — or whatever leaves that field raw
+/// and contradictory upstream — is where the difference lives. A noise ladder
+/// against the reference is what would set it.
 const GK_MIN_R2: f64 = 0.05;
 
 /// Extra valid radials required beyond the split stencil's ±4 span on each
