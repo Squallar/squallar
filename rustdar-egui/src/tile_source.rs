@@ -349,7 +349,7 @@ impl HttpsTiles {
     ///
     /// Crate-private and exists for the tests, which need to talk cleartext to a
     /// loopback server — [`tile_client`] refuses `http://` by design, and that
-    /// refusal is itself under test in `tile_client_refuses_cleartext_urls`.
+    /// refusal is itself under test in `the_tile_client_refuses_cleartext`.
     fn with_client<S: AsyncTileSource>(
         source: S,
         egui_ctx: Context,

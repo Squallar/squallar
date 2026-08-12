@@ -2471,9 +2471,9 @@ fn a_ceiling_under_the_base_size_renders_a_leaner_picture_of_the_same_ground() {
 /// cross-section painter has always drawn the difference.
 ///
 /// The purple is [`crate::palette::RANGE_FOLDED`] exactly, which is what a
-/// colour no product scale can produce is for: `every_scale_avoids_the_range_
-/// folded_purple` pins that, so a pixel this colour can only have come from
-/// this arm.
+/// colour no product scale can produce is for:
+/// `the_range_folded_colour_is_unreachable_through_any_products_scale` pins
+/// that, so a pixel this colour can only have come from this arm.
 #[test]
 fn a_range_folded_gate_paints_the_dedicated_purple_and_below_threshold_does_not() {
     const FOLDED_AZ: usize = 90;

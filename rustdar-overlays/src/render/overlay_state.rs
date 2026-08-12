@@ -212,8 +212,10 @@ pub trait OverlayHandler: Send {
     ///
     /// Every fetching handler returns `Some(&self.state.retry)`. A handler that
     /// answers `None` while declaring an [`auto_poll_interval`] gets the old
-    /// behaviour back — which is why `every_auto_polling_handler_keeps_a_retry_ledger`
-    /// fails if a new one forgets.
+    /// behaviour back — which is why
+    /// `every_auto_polling_handler_backs_off_after_a_failure` fails if a new
+    /// one forgets: its message is "auto-polls every {interval}s but keeps no
+    /// retry ledger".
     ///
     /// [`auto_poll_interval`]: OverlayHandler::auto_poll_interval
     fn retry(&self) -> Option<&FetchRetry> {

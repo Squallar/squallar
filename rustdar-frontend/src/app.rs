@@ -887,8 +887,8 @@ impl App {
         // the site table is resolved here: what a session remembers has to be
         // in force from the first paint, or the loop length would change under
         // a user already watching one. The adapter's own say is folded in later
-        // by `size_loop_pool_for_device`, which runs once the renderer is built
-        // and only when nothing was remembered.
+        // by `LoopPool::for_device`, which runs once the renderer is built and
+        // only when nothing was remembered.
         let loop_pool_limits = crate::loop_pool::LoopPoolLimits::for_target();
         let loop_pool_memo =
             crate::loop_pool::remembered(platform.config_store().as_deref(), loop_pool_limits);

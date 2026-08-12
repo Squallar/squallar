@@ -561,7 +561,8 @@ fn the_render_budget_is_what_bounds_the_textured_frames() {
 }
 
 /// Every arm is held to its own volume budget, exactly as
-/// `loop_frames_fit_the_target_texture_budget` holds it to its loop budget.
+/// `one_loop_at_the_floor_is_exactly_what_a_pane_used_to_get` holds it to its
+/// loop budget.
 #[test]
 fn the_volume_grid_fits_the_target_texture_budget() {
     for arm in arms() {

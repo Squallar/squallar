@@ -1948,10 +1948,13 @@ impl Gui {
         // mutually exclusive (see [`Self::set_section_draw_armed`]), only an armed
         // mode can record a pending, and each pending is recorded and consumed
         // inside a single frame. So at most one of these two lines does anything
-        // on any frame. Pinned by
-        // `two_appliers_never_both_have_something_to_apply`, which drives the two
-        // toggles rather than writing the flags, because the invariant belongs to
-        // the arming rule rather than to this call order.
+        // on any frame. The exclusivity that argument rests on is pinned by
+        // `arming_the_section_draw_clears_a_handle_drag_in_flight`, which is
+        // where the invariant lives — arming one mode clears the other's
+        // gesture, so two pendings cannot both be recorded. Be aware that the
+        // conclusion *about this call order* is not itself under test: the test
+        // that used to be cited here drove both toggles, and went with the
+        // render-mode split without a successor.
 
         // The fade toggle, after the appliers like every other loop-recorded
         // intent: it needs the pane loop's final consumption verdict, and the

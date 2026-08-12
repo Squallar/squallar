@@ -2446,7 +2446,9 @@ impl super::App {
     /// be unreachable. This is here anyway, because the cost of being wrong is
     /// every loop on screen rather than one pane's, and because the field is
     /// public. Pinned by
-    /// `a_pane_with_no_plan_view_cannot_hold_another_panes_loop_back`.
+    /// `a_pane_that_cannot_loop_cannot_hold_another_panes_loop_back`, whose
+    /// blocked pane is an unaimed cross-section rather than a plan-view-less
+    /// one — the property is the same, the pane kind that shows it changed.
     fn sync_loop_playback_start(&mut self) {
         let pane_count = self.gui.pane_count();
         let multi = pane_count > 1;

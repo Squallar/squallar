@@ -124,7 +124,7 @@ fn viewport_sync_never_outruns_the_pane_vector() {
 /// written after the bug. Driven through `apply_menu_event` rather than
 /// `request_pane_view` so it covers the arm and the deferral together. The
 /// end-to-end behavioural version, which passes either way, is
-/// `converting_the_active_pane_from_the_drawer_makes_it_a_volume_pane`.
+/// `converting_the_active_pane_from_the_dropdown_makes_it_a_volume_pane`.
 #[test]
 fn a_pane_kind_request_survives_the_pane_being_held_out_of_the_vector() {
     use super::ui_menu::{MenuEvent, MenuToggle};

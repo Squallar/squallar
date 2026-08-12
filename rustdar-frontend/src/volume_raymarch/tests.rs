@@ -966,8 +966,10 @@ fn a_reused_widening_buffer_is_the_plane_a_fresh_one_would_be() {
 /// 240 x 240 x 20 km box makes a vertical ray roughly twelve times more
 /// opaque per step than a horizontal one — which looks like haze.
 ///
-/// `a_vertical_and_a_horizontal_ray_agree_on_opacity_per_kilometre` is the
-/// property test; this is the one that runs without a GPU.
+/// `opacity_accumulates_per_kilometre_not_per_box_diagonal`, in
+/// `tests/volume_gpu.rs`, is the property test; this is the one that runs
+/// without a GPU. That one is `#[ignore]`d because it needs an adapter, so on
+/// a row without one this scan is the only cover the property has.
 #[test]
 fn the_step_length_scales_the_direction_not_just_the_box() {
     assert!(

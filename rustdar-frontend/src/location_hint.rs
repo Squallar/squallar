@@ -45,7 +45,9 @@ struct ZoneAnchor {
 /// 700–1300 km away, far enough that the "hint" would be a different flavour of
 /// wrong answer rather than a better one. They fall through to `None` and the
 /// caller's default, which is the honest result for a place NEXRAD does not
-/// cover. `anchors_sit_within_plausible_radar_range` holds the line.
+/// cover. `the_live_anchor_survey` holds the line, and holds it against the
+/// real catalogue rather than a fixture — which is why it is `#[ignore]`d.
+/// `every_anchor_is_a_real_coordinate` is what runs on every row.
 static ZONE_ANCHORS: &[ZoneAnchor] = &[
     // Eastern
     ZoneAnchor {
@@ -364,8 +366,9 @@ mod tests {
     /// which has no Level II data, and the nearest WSR-88D is `KCRI`, which
     /// scans to whatever the ROC is testing that day.
     ///
-    /// There is no anchor at Oklahoma City — that is `no_zone_resolves_to_the
-    /// _old_default`'s business — so this asks the coordinate directly.
+    /// There is no anchor at Oklahoma City — that is
+    /// `no_covered_zone_silently_resolves_to_the_old_default`'s business — so
+    /// this asks the coordinate directly.
     #[test]
     fn an_anchor_skips_the_tdwr_and_the_test_bed() {
         install_radars();
