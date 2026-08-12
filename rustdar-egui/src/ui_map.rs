@@ -2618,16 +2618,19 @@ fn volume_caption(
         // reach the new box's edges — the picture is real data in the middle and
         // nothing outside it, and a caption that did not say so would be read as
         // "the storm ends there".
-        (Some(shown), _) if showing.partial => lines.push(format!(
-            "{across} km box - {shown:.2} km/cell over the middle, filling in",
+        (Some((shown_e, shown_n)), _) if showing.partial => lines.push(format!(
+            "{across} km box - {} km/cell over the middle, filling in",
+            axes(shown_e.into(), shown_n.into(), 2),
         )),
-        (Some(shown), Some((east, north))) => lines.push(format!(
-            "{across} km box - {shown:.2} km/cell, sharpening to {}",
+        (Some((shown_e, shown_n)), Some((east, north))) => lines.push(format!(
+            "{across} km box - {} km/cell, sharpening to {}",
+            axes(shown_e.into(), shown_n.into(), 2),
             axes(east, north, 2),
         )),
-        (Some(shown), None) => {
-            lines.push(format!("{across} km box - {shown:.2} km/cell, sharpening"))
-        }
+        (Some((shown_e, shown_n)), None) => lines.push(format!(
+            "{across} km box - {} km/cell, sharpening",
+            axes(shown_e.into(), shown_n.into(), 2),
+        )),
         (None, Some((east, north))) => lines.push(format!(
             "{across} km box - {} km/cell",
             axes(east, north, 2)

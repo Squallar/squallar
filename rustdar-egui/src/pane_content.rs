@@ -756,8 +756,8 @@ pub struct VolumeTarget {
 ///
 /// # It is the pane's own viewport, not a separate thing to aim
 ///
-/// This is **derived**, every frame, as the largest square inscribed in the
-/// pane's viewport — see [`crate::ui_region::region_for_viewport`]. It used to
+/// This is **derived**, every frame, as the ground the pane's own viewport is
+/// showing — see [`crate::ui_region::region_for_viewport`]. It used to
 /// be dragged out on some *other* map pane and stored, and that arrangement is
 /// what produced the defect this replaced: the box and the floor under it were
 /// sized by two independent things, so a borrowed viewport smaller than the box
@@ -775,15 +775,25 @@ pub struct VolumeTarget {
 /// resampler runs, and a grid built for one box must be recognisably the wrong
 /// key for another.
 ///
-/// # Why a square, still
+/// # Why the footprint is the viewport's rectangle
 ///
-/// **Not because this type forces one any more.** It carries a
-/// [`HalfExtentKm`] — an axis each — and so do [`VoxelRequest`] and
-/// `ui_region::measure_viewport`'s answer. What still produces a
-/// square is the *measurement*: `measure_viewport` takes the smallest of its
-/// four edge distances and writes it into both lanes, so a 16:9 pane inscribes
-/// a square in its shorter axis and throws its left and right flanks away.
-/// Everything downstream of that is already rectangular and waiting.
+/// It was the largest **square** inscribed in the viewport, which meant
+/// converting a 16:9 pane to 3D took ground away from it:
+///
+/// > I didn't realize the 3d viewer actually cut the viewport smaller, I hate
+/// > that. A user doesn't expect to become more boxed in when they zoom, they
+/// > just expect to be closer with the same area available to them.
+///
+/// The floor strip always covered the whole pane rect; the box merely stood on
+/// the middle of it, so the pane went on *showing* its left and right flanks
+/// while nothing resampled them. Two extents make the box the ground the pane
+/// is showing, which is what the pane already looked like it was promising.
+///
+/// The one real cost is that the cells are rectangular — a fixed count per axis
+/// over unequal ground, so a 16:9 box's east–west cell is 1.78× its
+/// north–south one. That is a measured figure and its consequences are measured
+/// too; see [`Self::resolution_km`] and
+/// [`rustdar_radar::voxel::VoxelShape`]'s anisotropy note.
 ///
 /// [`HalfExtentKm`]: rustdar_radar::voxel::HalfExtentKm
 ///

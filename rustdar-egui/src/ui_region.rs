@@ -3,12 +3,39 @@
 //!
 //! # The region *is* the viewport
 //!
-//! There is no separate thing to aim. A 3D pane resamples the largest square
-//! that fits inside the ground its own map is showing, so its box and its floor
-//! are two measurements of one rectangle — and the gesture that aims it is the
-//! gesture that aims every other pane in the application: scroll, or pinch.
-//! [`zoom_viewport`] is that gesture's 3D arm, and it writes the same
+//! There is no separate thing to aim. A 3D pane resamples **the ground its own
+//! map is showing** — the whole rectangle, not a square inside it — so its box
+//! and its floor are two measurements of one thing, and the gesture that aims
+//! it is the gesture that aims every other pane in the application: scroll, or
+//! pinch. [`zoom_viewport`] is that gesture's 3D arm, and it writes the same
 //! `MapMemory` a plan view's `walkers::Map` writes, by the same arithmetic.
+//!
+//! # Why the box is the viewport's rectangle and not a square inside it
+//!
+//! It was the inscribed square, and that made converting a 16:9 pane to 3D
+//! *take ground away*: the floor strip has always covered the whole pane rect,
+//! and the box merely stood on the middle of it, so the left and right flanks
+//! of what the pane was showing simply stopped being resampled. The complaint
+//! that ended it is the plain reading of the picture —
+//!
+//! > I didn't realize the 3d viewer actually cut the viewport smaller, I hate
+//! > that. A user doesn't expect to become more boxed in when they zoom, they
+//! > just expect to be closer with the same area available to them.
+//!
+//! Nothing downstream ever needed the square. `build_voxels` has taken a
+//! [`rustdar_radar::voxel::HalfExtentKm`] with an axis each since the extent
+//! became two numbers; the grid's wire format has always written its `x` and
+//! `y` ranges separately; and the renderer is anisotropic throughout — step
+//! length, both gradient sites, march density and the floor reprojection all
+//! divide per axis, and the shipped grid is 12.7:1 anisotropic between its
+//! horizontal axes and its vertical already. The squareness lived here, in one
+//! `min` across two axes, and nowhere else.
+//!
+//! What a rectangle costs is **direction-dependent resolution**: the cell count
+//! is fixed per axis, so a 16:9 box spends the same 256 cells over 1.78× as
+//! much ground east–west as north–south. That cost is measured rather than
+//! argued about — see [`crate::pane::VolumeRegion::resolution_km`] and the
+//! anisotropy figures on [`rustdar_radar::voxel::VoxelShape`].
 //!
 //! That is not a simplification of the drag this replaced — it is the fix for
 //! the class of bug the drag caused. The box's size and the floor's extent used
@@ -34,16 +61,20 @@
 //! strip along one side, which is precisely the symptom this module exists to
 //! remove. So all four edges are unprojected through the pane's own projector
 //! and measured with [`rustdar_radar::beam::site_bearing_range_km`], the
-//! codebase's real geodesy, and the box takes the **smallest** of the four.
-//! Containment then holds on every side, at every latitude.
+//! codebase's real geodesy, and **each axis takes the nearer of its own two
+//! edges**. Containment then holds on every side, at every latitude.
+//!
+//! It is also why the box's aspect is not the pane's *pixel* aspect. The two
+//! differ by whatever Mercator does across the pane's own latitude span, which
+//! is why the ground is measured rather than the rect divided.
 
 use crate::pane::{GeoPoint, VolumeRegion};
 
-/// The step the derived half-width is quantised to, kilometres.
+/// The step each derived half-extent is quantised to, kilometres.
 ///
 /// **Not cosmetic — it is what stops the pane rebuilding for ever.** The region
 /// is part of `VolumeTarget`, so any change to it asks for a fresh 8 MiB
-/// resample. Measured continuously off a viewport, the half-width would differ
+/// resample. Measured continuously off a viewport, the half-extent would differ
 /// by a few metres between frames from nothing more than `f32` rect arithmetic
 /// and walkers' zoom animation, and every one of those differences would be a
 /// new key, a new build, and a permanently hot CPU whose only symptom is a fan.
@@ -54,10 +85,21 @@ use crate::pane::{GeoPoint, VolumeRegion};
 /// Rounded **down**, always. The box must stay inside the ground the floor
 /// covers, and rounding up would push it out by up to a kilometre — the exact
 /// failure this module exists to prevent, reintroduced by a rounding mode.
+///
+/// # The two axes are quantised independently, so the aspect is approximate
+///
+/// Each lane is floored to its own whole kilometre, which means the box's
+/// aspect ratio is the pane's ground aspect only to within a kilometre on each
+/// side — up to 1.6% on a 62 km half-extent, and under 0.2% on the 460 km
+/// boxes a wide-open pane measures. That is harmless for what the quantum is
+/// *for*: it is a cache key, and the key does not care which of two nearby
+/// boxes it names, only that a still pane keeps naming one of them. It is not
+/// harmless for a caption, which is why nothing printed claims the box is the
+/// pane's shape — the caption states two extents and lets the reader divide.
 const HALF_WIDTH_STEP_KM: f64 = 1.0;
 
-/// The largest square box inscribed in `rect`'s ground, for a map centred by
-/// `map_memory` on `center`.
+/// The box `rect`'s ground occupies, for a map centred by `map_memory` on
+/// `center`.
 ///
 /// `None` when the viewport has no area, when the projector cannot place its
 /// centre on Earth, or when the ground it covers is too small for the resampler
@@ -117,8 +159,8 @@ fn quantise(km: f64) -> f64 {
     (km / HALF_WIDTH_STEP_KM).floor() * HALF_WIDTH_STEP_KM
 }
 
-/// The centre of `rect`'s ground and the **unquantised** half-extent of the
-/// largest square inscribed in it, kilometres.
+/// The centre of `rect`'s ground and the **unquantised** half-extent it
+/// occupies, kilometres on each horizontal axis.
 ///
 /// The measurement half of [`region_for_viewport`], split out because
 /// [`zoom_viewport`] needs the raw numbers: the quantisation exists to keep a
@@ -126,11 +168,11 @@ fn quantise(km: f64) -> f64 {
 /// been rounded down by up to a kilometre would stop the gesture up to a
 /// kilometre early — visibly, at the tight end where the box is only ten across.
 ///
-/// The answer is a [`rustdar_radar::voxel::HalfExtentKm`] and today both its
-/// lanes hold the same number — see the loop below. The type is the one the
-/// resampler, the renderer and [`VolumeRegion`] all speak, so carrying it from
-/// the measurement outwards is what leaves the flip to a rectangle a change in
-/// this function alone.
+/// **This function is where the box stopped being a square**, and it is the
+/// whole of that change: everything on both sides of it — the type this
+/// returns, [`VolumeRegion`], [`rustdar_radar::voxel::VoxelRequest`], the job
+/// wire, the grid and the shader — was already carrying two extents and
+/// receiving two equal ones.
 ///
 /// `None` for every reason `region_for_viewport` answers `None` except the
 /// resampler's floor, which is the caller's decision rather than the
@@ -157,36 +199,35 @@ fn measure_viewport(
         return None;
     }
 
-    // The four edge midpoints. Each gives the ground from the centre to one
-    // edge; the box's half-width is the smallest of all four, so the square it
-    // describes is inside the viewport on all four sides even though Mercator
-    // makes the four distances differ.
-    let edges = [
-        egui::pos2(rect.center().x, rect.top()),
-        egui::pos2(rect.center().x, rect.bottom()),
-        egui::pos2(rect.left(), rect.center().y),
-        egui::pos2(rect.right(), rect.center().y),
-    ];
-    let mut half_width_km = f64::INFINITY;
-    for edge in edges {
-        let point = to_geo(edge);
+    // The ground from the centre to one edge midpoint, or `None` for a point
+    // the projector cannot place.
+    let ground_km = |pos: egui::Pos2| {
+        let point = to_geo(pos);
         if !point.is_on_earth() {
             return None;
         }
         let (_, range_km) = rustdar_radar::beam::site_bearing_range_km(
             centre.lat, centre.lon, point.lat, point.lon,
         );
-        if !range_km.is_finite() {
-            return None;
-        }
-        half_width_km = half_width_km.min(range_km);
-    }
-    // One minimum over all four edges, written into both lanes: the box a
-    // rectangular type is carrying is still the inscribed square, and this line
-    // is the only reason it is.
+        range_km.is_finite().then_some(range_km)
+    };
+
+    // **Each axis takes the nearer of its own two edges, and only its own.**
+    // The four distances are still all measured and still all bound something —
+    // Mercator makes the poleward edge the near one, so the north–south lane is
+    // governed by the top edge in the northern hemisphere and the bottom in the
+    // southern, and containment holds on all four sides at every latitude. What
+    // is gone is the *cross*-axis minimum, which is what made a 16:9 pane's box
+    // the square inscribed in its short axis and threw the left and right
+    // flanks of the ground away.
     Some((
         centre,
-        rustdar_radar::voxel::HalfExtentKm::square(half_width_km),
+        rustdar_radar::voxel::HalfExtentKm {
+            east_km: ground_km(egui::pos2(rect.left(), rect.center().y))?
+                .min(ground_km(egui::pos2(rect.right(), rect.center().y))?),
+            north_km: ground_km(egui::pos2(rect.center().x, rect.top()))?
+                .min(ground_km(egui::pos2(rect.center().x, rect.bottom()))?),
+        },
     ))
 }
 

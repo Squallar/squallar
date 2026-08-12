@@ -319,11 +319,17 @@ pub enum VolumePaint {
 /// may lag, the caption may not lie.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Showing {
-    /// Kilometres across one cell of the grid actually on screen, or `None`
-    /// when the grid has no horizontal extent to divide (impossible for a
-    /// built grid; answered rather than unwrapped because a caption is not a
-    /// place to panic).
-    pub cell_km: Option<f32>,
+    /// Kilometres across one cell of the grid actually on screen, east–west
+    /// and north–south, or `None` when the grid has no horizontal extent to
+    /// divide (impossible for a built grid; answered rather than unwrapped
+    /// because a caption is not a place to panic).
+    ///
+    /// **Two numbers because the box is the pane's viewport rectangle**, so the
+    /// grid's cells are rectangular too: the same cell count per axis over
+    /// unequal ground. One figure here would have had to pick an axis, and a
+    /// caption reporting the east–west cell of a 16:9 pane as *the* resolution
+    /// overstates the north–south one by 1.78×.
+    pub cell_km: Option<(f32, f32)>,
     /// The grid on screen was built for a different box, and a build for the
     /// box the pane asked for has not landed yet.
     pub stale: bool,

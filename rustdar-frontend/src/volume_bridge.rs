@@ -1769,14 +1769,24 @@ impl DrawnBox {
     }
 }
 
-/// Kilometres across one horizontal cell of `grid` — the resolution the
-/// picture on screen really has, which is not the requested region's while a
-/// stand-in is up. `None` for a grid with no cells across, which
-/// `build_voxels` does not produce.
-fn cell_km(grid: &VoxelGrid) -> Option<f32> {
-    let (x0, x1) = grid.x_range_km();
-    let across = u32::try_from(grid.shape().nx).ok()?;
-    (across > 0).then(|| ((x1 - x0) / f64::from(across)) as f32)
+/// Kilometres across one horizontal cell of `grid`, east–west and north–south
+/// — the resolution the picture on screen really has, which is not the
+/// requested region's while a stand-in is up. `None` for a grid with no cells
+/// across either axis, which `build_voxels` does not produce.
+///
+/// Both axes, because a box is the pane's viewport rectangle: the two extents
+/// differ while `nx` and `ny` do not, so the two cell sizes differ in exactly
+/// the pane's own proportion. Reporting only `x` would have made a wide pane's
+/// caption overstate its north–south sharpness by that ratio.
+fn cell_km(grid: &VoxelGrid) -> Option<(f32, f32)> {
+    let axis = |(a, b): (f64, f64), cells: usize| {
+        let cells = u32::try_from(cells).ok()?;
+        (cells > 0).then(|| ((b - a) / f64::from(cells)) as f32)
+    };
+    Some((
+        axis(grid.x_range_km(), grid.shape().nx)?,
+        axis(grid.y_range_km(), grid.shape().ny)?,
+    ))
 }
 
 /// `(scale, offset)` taking the unit cube of the box `x_km × y_km` (with the

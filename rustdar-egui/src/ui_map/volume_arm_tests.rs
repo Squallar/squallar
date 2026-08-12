@@ -377,7 +377,7 @@ fn the_volume_alpha_button_is_painted_on_a_3d_pane() {
 #[test]
 fn the_pane_captions_the_picture_the_painter_says_it_drew() {
     let (h, _painter) = volume_harness(StubVolumePainter::standing_in(Showing {
-        cell_km: Some(1.8),
+        cell_km: Some((1.8, 1.8)),
         stale: true,
         partial: false,
     }));
@@ -1357,7 +1357,7 @@ fn a_caption_over_a_stand_in_reports_the_picture_and_not_the_request() {
 
     // Zoomed in: soft now, sharp shortly.
     let softened = line_of(Showing {
-        cell_km: Some(1.8),
+        cell_km: Some((1.8, 1.8)),
         stale: true,
         partial: false,
     });
@@ -1379,7 +1379,7 @@ fn a_caption_over_a_stand_in_reports_the_picture_and_not_the_request() {
 
     // Zoomed out: the middle is real and the rest is not there yet.
     let hollow = line_of(Showing {
-        cell_km: Some(1.8),
+        cell_km: Some((1.8, 1.8)),
         stale: true,
         partial: true,
     });
@@ -1392,7 +1392,7 @@ fn a_caption_over_a_stand_in_reports_the_picture_and_not_the_request() {
     // And once the build lands the line goes back to the plain statement —
     // no permanent "sharpening" on a picture that is already sharp.
     let settled = line_of(Showing {
-        cell_km: Some(1.8),
+        cell_km: Some((1.8, 1.8)),
         stale: false,
         partial: false,
     });

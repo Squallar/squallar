@@ -260,10 +260,11 @@ fn a_zoom_keeps_a_picture_on_screen_and_the_caption_says_what_it_is() {
         "zooming IN, the held grid covers the whole new box, so nothing is \
          missing and the caption must not say anything is",
     );
+    let held_cell = (2.0 * HALF_KM / f64::from(rustdar_radar::voxel::WASM_SHAPE.nx as u32)) as f32;
     assert_eq!(
         showing.cell_km,
-        Some((2.0 * HALF_KM / f64::from(rustdar_radar::voxel::WASM_SHAPE.nx as u32)) as f32),
-        "the cell size reported is the held grid's own",
+        Some((held_cell, held_cell)),
+        "the cell size reported is the held grid's own, on both axes",
     );
 }
 

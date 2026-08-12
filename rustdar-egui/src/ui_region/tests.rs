@@ -53,36 +53,100 @@ fn ground_km_to(
     range_km
 }
 
-/// The box is still the inscribed **square**, on a viewport that is not one.
+/// **The change itself**: a wide pane gets a wide box, in the proportion its
+/// *ground* is — and that is not the proportion its pixels are.
 ///
-/// The pin that makes this change's mechanical half a provable no-op. Every
-/// type between the measurement and the resampler now carries two extents, and
-/// the only thing still producing one number is `measure_viewport`'s minimum
-/// over its four edges — so a 1200 × 500 pane, whose ground is 2.4:1, comes
-/// back square.
+/// The box was the largest square inscribed in the viewport, so converting a
+/// 16:9 pane to 3D stopped resampling the left and right flanks of the ground
+/// the pane went on showing. Without this test the flip has no pin at all:
+/// every other test here is a containment or stability property that the old
+/// inscribed square satisfied too.
 ///
-/// **This test is meant to be deleted**, by the commit that makes the
-/// measurement per-axis. It exists so that the commit before that one can be
-/// read as moving nothing, and so that a rectangle appearing early — from a
-/// half-finished flip, or from `HalfExtentKm::clamped` reshaping something on
-/// the way through — fails here rather than being noticed as a picture.
+/// The proportion is checked against **ground measured through the projector**,
+/// not against `rect.aspect_ratio()`, and the last assertion is what gives that
+/// teeth. Mercator is conformal, so a pane's ground aspect and its pixel aspect
+/// agree *locally* — they differ only by how much `cos(latitude)` varies over
+/// the pane's own vertical span, since the east lane is measured at the
+/// centre's latitude and the north lane runs to the poleward edge. That is a
+/// small effect and it has to beat the quantisation to be a test rather than a
+/// coincidence. Measured at zoom 8: both panes' pixel aspect sits 0.69% below
+/// their ground aspect, where the band's lower edge is only 0.34% and 0.25%
+/// below it — so an implementation that scaled a square by the pixel aspect
+/// lands outside. (At zoom 9 it would not: the box halves, the quantum does
+/// not, and the band opens to 0.67% while the Mercator gap closes to 0.34%.
+/// The zoom is chosen for that reason and the last assertion is what says so if
+/// it stops being true.)
+///
+/// The band itself is derived rather than picked. Each axis is floored to its
+/// own whole [`HALF_WIDTH_STEP_KM`], so the ratio of the two can be as low as
+/// `(east - step) / north` and as high as `east / (north - step)`.
+///
+/// Zoom 8 is also below the resampler's ceiling for both panes, so what is
+/// being compared is the measurement rather than `HalfExtentKm::clamped`'s
+/// corner scaling — which preserves the aspect and would let this pass while
+/// saying nothing about the measurement.
 #[test]
-fn the_box_is_still_the_inscribed_square() {
-    let memory = memory_at(9.0);
+fn a_wide_viewport_gets_a_wide_box_in_the_proportion_its_ground_is() {
+    let memory = memory_at(8.0);
     let center = centre();
-    for rect in [
-        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1200.0, 500.0)),
-        egui::Rect::from_min_size(egui::pos2(120.0, 60.0), egui::vec2(400.0, 900.0)),
-    ] {
+    for size in [egui::vec2(1200.0, 500.0), egui::vec2(1600.0, 500.0)] {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), size);
         let region = region_for_viewport(rect, &memory, center).expect("a measurable box");
-        assert_eq!(
-            region.half_east_km(),
-            region.half_north_km(),
-            "a {:.0}x{:.0} viewport produced a {:?} box: the flip to a rectangle \
-             has half landed",
-            rect.width(),
-            rect.height(),
+
+        assert!(
+            region.half_east_km() > region.half_north_km(),
+            "a {:.1}:1 pane must get a box wider than it is tall, or the 3D view \
+             is still cutting the viewport down to a square: {:?}",
+            size.x / size.y,
             region.half_extent_km(),
+        );
+
+        // The ground the pane is showing, re-derived through the same projector
+        // and the same geodesy — each axis the nearer of its own two edges,
+        // which is what containment requires.
+        let ground = |a, b| {
+            f64::min(
+                ground_km_to(region, rect, &memory, center, a),
+                ground_km_to(region, rect, &memory, center, b),
+            )
+        };
+        let east = ground(
+            egui::pos2(rect.left(), rect.center().y),
+            egui::pos2(rect.right(), rect.center().y),
+        );
+        let north = ground(
+            egui::pos2(rect.center().x, rect.top()),
+            egui::pos2(rect.center().x, rect.bottom()),
+        );
+        assert!(
+            region.half_extent_km().corner_km() < rustdar_radar::voxel::MAX_HALF_DIAGONAL_KM,
+            "precondition: this fixture must be under the resampler's ceiling, or \
+             the aspect below is `clamped`'s and not the measurement's",
+        );
+
+        let got = region.half_east_km() / region.half_north_km();
+        let (lo, hi) = (
+            (east - HALF_WIDTH_STEP_KM) / north,
+            east / (north - HALF_WIDTH_STEP_KM),
+        );
+        assert!(
+            (lo..=hi).contains(&got),
+            "the box is {got:.4}:1 where the ground it is measured off is \
+             {:.4}:1 ({east:.3} km by {north:.3} km); the {HALF_WIDTH_STEP_KM} km \
+             quantum allows {lo:.4}..={hi:.4} and nothing else does",
+            east / north,
+        );
+
+        // And the ground's proportion is not the rect's, so the assertion above
+        // cannot be satisfied by dividing the pane's width by its height.
+        let pixels = f64::from(size.x / size.y);
+        assert!(
+            !(lo..=hi).contains(&pixels),
+            "at this latitude and zoom the pane's {pixels:.4}:1 pixel aspect is \
+             inside the {lo:.4}..={hi:.4} band its {:.4}:1 ground aspect allows, \
+             so this fixture no longer distinguishes a measured box from a \
+             scaled rect",
+            east / north,
         );
     }
 }
