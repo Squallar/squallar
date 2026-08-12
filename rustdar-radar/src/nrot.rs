@@ -649,6 +649,38 @@ const MEDIAN_RNG_HALF: i32 = 2;
 /// how this was measured, never what came back.
 const MEDIAN_MIN_RAW_OCC: f64 = 0.6;
 
+/// The coverage rule this filter is often blamed for costs nothing where it is
+/// blamed, and the rule it does **not** have is what costs.
+///
+/// At the thirteen ring points the reference paints at KTLX 2025-02-19 and
+/// this module does not, the occupancy cliff above refuses **none**; relaxing
+/// it to zero moves KTLX from 1227 painted bins to 1246 and the 7.05–20 nm
+/// annulus from 1.63% to 1.65% against the reference's 3.27%.
+///
+/// What separates the two fields is the line below it. The reference **fills
+/// a missing centre from its window**, and the hole ladder on [`tap_stencil`]
+/// measures it over seven sites: filling here reproduces the reference's
+/// profile through a hole in value as well as in coverage — 827 of its points
+/// against 633 as shipped, at a mean departure of 0.077 where the shipped rule
+/// reads 0.074 and the same worst case of 1.37. On real volumes it is the
+/// largest single coverage move this module has: KTLX 1227 → 2865 bins and
+/// 1.63% → 3.86% of the annulus, against the reference's 3.27%.
+///
+/// # Why it is not taken
+///
+/// KHNX 2024-12-16 goes from 0 painted bins to 96, and **16 of its 17
+/// strongest read ND in the reference** (the seventeenth reads +0.34 against
+/// +0.38). Every guard that returns KHNX to zero is refused by the ladder
+/// itself: the ladder's own hole leaves 0.667 raw occupancy, so an occupancy
+/// floor of 0.88 — the smallest that zeroes KHNX — is a floor the reference
+/// fills below; requiring the hole to be isolated along the beam as well
+/// stops filling the ladder's hole outright, and falls back to the shipped
+/// 633. Requiring only that the hole be isolated in azimuth *is* consistent
+/// with all 70 rungs, and still leaves KHNX 35 bins, seven of whose eight
+/// strongest are reference-ND.
+///
+/// So the fill is right and admitting it needs a discriminator this module
+/// does not have — the same one [`COH_MAX_STRADDLE`] turns out to lack.
 fn median_filter(
     vel_grid: &[Vec<f64>],
     raw_grid: &[Vec<f64>],
@@ -1358,11 +1390,35 @@ const GK_DATA_MARGIN: i32 = 1;
 ///
 /// The deficit is not this ceiling's doing and raising it does not close it:
 /// at the thirteen ring points the reference paints at KTLX, this module reads
-/// ND at nine of them with *every* gate on this page disabled. Those nine are
-/// lost upstream — to the post-dealias fold censor, to the median filter's
-/// coverage rule, and to the stencils' demand that every tap cell be intact —
-/// in a cut whose velocity is comparable to its own Nyquist nearly everywhere.
-/// That is a coverage question, not a gating one, and it is not answered here.
+/// ND at nine of them with *every* gate on this page disabled. Those nine were
+/// once attributed here to the post-dealias fold censor, the median filter's
+/// coverage rule and the stencils' completeness rule. **Two of those three
+/// cost nothing.** Instrumented bin by bin at the thirteen:
+///
+/// ```text
+///     already painted                                       1
+///     refused by incoherent_velocity                        6
+///     velocity dropped by the dealiaser's unreached rule     2   (a third
+///                                                                has no raw
+///                                                                velocity)
+///     refused by the stencils' completeness rule            3   (2 tap
+///                                                                cells,
+///                                                                1 margin)
+///     refused by the post-dealias fold censor               0
+///     refused by the median filter's coverage rule          0
+/// ```
+///
+/// The censor costs nothing near here at all: disabling it outright *lowers*
+/// KTLX from 1227 painted bins to 1039, because what it removes are walls the
+/// derivative would otherwise read as shear. And every hole the stencils
+/// refuse at those points is one **this module made** — the raw sweep carries
+/// velocity at every one of them and the dealiaser's unreached-region rule
+/// dropped it. One dropped cell then costs eleven radials of NROT, because
+/// the completeness rule spans ±(4 + [`GK_DATA_MARGIN`]).
+///
+/// What the reference does with such a hole is measured, and is neither of the
+/// two repairs it suggests: [`tap_stencil`] and [`median_filter`] carry that
+/// ladder, and why what it says is not yet taken.
 ///
 /// # What it does on real volumes
 ///
@@ -1391,6 +1447,43 @@ const GK_MAX_TEXTURE_VNY_FRAC: f64 = 0.44;
 /// three rules are written once on purpose: which bins get a value is a
 /// property of the profile, not of which tap list read it, and a sweep must
 /// not gain or lose painted bins by being read at one resolution or the other.
+///
+/// # The reference has no completeness rule, and this is not how to drop one
+///
+/// A hole ladder settles the first half. Twelve sectors of a real volume's
+/// lowest cut carry the same ±0.80·Vny step edge in the 30–47 km band — six on
+/// whole-degree edges, six on half-degree ones, so each holed sector has a
+/// clean control at its own sub-radial phase — and five sectors per phase
+/// punch **one whole radial** to ND at offsets 5, 6, 7, 8 and 10 from the edge.
+/// Hovered along the 21.0 nm arc at 0.25°, over KHNX, KLWX, KTLX, KLOT, KATX,
+/// KMSX deciding and KTWX held out; declared Nyquist **11.34 to 35.55**.
+///
+/// A rule needing every cell of ±(4 + [`GK_DATA_MARGIN`]) blanks offsets
+/// o−5 … o+5, so the ND boundary must march one radial per rung. It does here
+/// — the hole costs 6, 4, 2, 2 painted radials at o = 5, 6, 7, 8, identically
+/// at every site. **The reference loses nothing at any rung**: over 70 rungs
+/// its profile through the hole is the clean sector's, radial for radial and
+/// value for value, and the one radial that ever differs also differs at
+/// o = 10, where no candidate rule reaches. So the reference paints straight
+/// through a hole in its own footprint.
+///
+/// Dropping the tap **pair** the hole breaks and renormalizing by the
+/// derivative's own gain — the obvious repair, and the one that keeps the
+/// operator antisymmetric — recovers much of that coverage and gets the values
+/// wrong. Scored point for point against the reference over the holed sectors:
+///
+/// ```text
+///                        agree with GR   GR paints, we ND   mean |Δ|   max
+///     as shipped              633              485           0.074    1.37
+///     drop the broken pair    773              345           0.201    2.85
+///     fill the median centre  827              291           0.077    1.37
+/// ```
+///
+/// The middle row is 140 more painted bins whose mean error is 0.78 — twenty
+/// half-lattices — and a worst case of 2.85, which is a fabricated tornadic
+/// couplet. It is refused for that reason and not for its coverage.
+/// [`median_filter`] carries the bottom row, which is the reference's own
+/// answer and is blocked elsewhere.
 fn tap_stencil(prof: &[f64], taps: &[(i32, f64)]) -> Option<f64> {
     const C: usize = PROFILE_MAX_HALF;
     // Data-margin completeness: the outermost cells must be populated too, so
@@ -1916,6 +2009,18 @@ const DA_RAWMIN_BINS: usize = 16;
 /// the reference paints at +0.38 — was erased outright at KHNX and KTLX. It
 /// was too low at KLOT as well: the reference paints 1.24, 1.50 and 1.70·Vny
 /// there and we erased all three.
+///
+/// # It is not where the clear-air coverage goes
+///
+/// This censor has been named as a suspect for the near-in shortfall
+/// ([`GK_MAX_TEXTURE_VNY_FRAC`] carries that accounting) on the reasoning that
+/// a cut whose velocity is comparable to its own Nyquist nearly everywhere
+/// must be full of pairs 1.80·Vny apart. Measured, it refuses **none** of the
+/// thirteen ring points the reference paints at KTLX 2025-02-19, and disabling
+/// it entirely moves that cut from 1227 painted bins to **1039** — down, not
+/// up, because a kept fold wall is 2·Vny of fake shear the derivative then
+/// reads. 1.80 stands, and on this cut it is buying coverage rather than
+/// costing it.
 const CENSOR_VNY_FRAC: f64 = 1.80;
 
 /// The posture [`dealias`] takes towards data its passes could not settle.
@@ -2117,6 +2222,33 @@ const COH_STRADDLE_VNY_FRAC: f64 = 0.90;
 ///
 /// The gap 0.08..0.11 is wider than it looks: the KCRP maximum is one bin at
 /// az 73.26°, 9.52 nm, where the reference reads −4.42, and the next is 0.07.
+///
+/// # The gap is closed by a site those three did not include
+///
+/// KTLX 2025-02-19 is clear air at 11.49, within 0.2 m/s of KHNX's limit, and
+/// an unbiased 240-point ring hover at 8/11/14/17/20 nm finds the reference
+/// painting thirteen of its bins. Their straddling fractions are
+///
+/// ```text
+///     0.031 0.044 0.065 0.076 0.080 0.085 0.087 0.091 0.094 0.108 0.123
+///     0.148 0.189
+/// ```
+///
+/// and KHNX's twenty ND bins read 0.119..0.211. **Four bins the reference
+/// paints sit inside the band of twenty it refuses**, and six sit above this
+/// threshold. No threshold on this statistic admits the one set and refuses
+/// the other. Nor does adding [`GK_MAX_TEXTURE_VNY_FRAC`]'s range texture as a
+/// second axis: KTLX's painted bin at az 188.75°, 8.00 nm reads (0.148, 0.661)
+/// and KHNX's refused bin at az 330.25°, 8.17 nm reads (0.145, 0.581), which is
+/// smaller in **both** coordinates — so every downward-closed region admitting
+/// the first admits the second, whatever its shape.
+///
+/// This is the same shape of result as the along-beam rms that a sibling
+/// campaign ruled out, and it is why no coverage relaxation upstream of here
+/// can be admitted: each one moves KTLX and KHNX together. The discriminator
+/// the reference is using is on an axis this module has not found, and
+/// 0.09 remains the best available reading of a statistic that cannot in
+/// principle separate these two volumes.
 const COH_MAX_STRADDLE: f64 = 0.09;
 
 /// The neighbourhood the straddling fraction is counted over: half-spans in
