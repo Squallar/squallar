@@ -1569,3 +1569,122 @@ fn the_melting_layer_object_round_trips_and_only_for_the_classification() {
         );
     }
 }
+/// The same sweep with its leading radial's velocity moment removed and every
+/// other radial untouched — a truncated record, a mis-framed message, an
+/// antenna still settling.
+fn leading_radial_blanked(sweep: &Sweep) -> Sweep {
+    let radials = sweep
+        .radials()
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            Radial::new(
+                r.collection_timestamp(),
+                r.azimuth_number(),
+                r.azimuth_angle_degrees(),
+                r.azimuth_spacing_degrees(),
+                r.radial_status(),
+                r.elevation_number(),
+                r.elevation_angle_degrees(),
+                r.reflectivity().cloned(),
+                if i == 0 { None } else { r.velocity().cloned() },
+                r.spectrum_width().cloned(),
+                r.differential_reflectivity().cloned(),
+                r.differential_phase().cloned(),
+                r.correlation_coefficient().cloned(),
+                r.clutter_filter_power().cloned(),
+            )
+        })
+        .collect();
+    Sweep::new(sweep.elevation_number(), radials)
+}
+
+/// A sweep whose leading radial lost its moment still crosses the port, and
+/// still carries every other radial's.
+///
+/// This is the filter that decides what a worker can see, so it is where a
+/// first-radial admission test costs the most: `find_sweep_owner` and
+/// `velocity::tilts` both read the whole sweep now, and both were unreachable
+/// for a whole-volume product while this one did not. SRV and NROT are
+/// `reads_whole_volume`, so `extract` answered `None` for both and the pane
+/// rendered nothing at all — the exact refusal the wind fit's own guard was
+/// widened to prevent, one layer earlier.
+#[test]
+fn a_sweep_whose_leading_radial_is_blank_still_reaches_the_worker() {
+    let intact = volume();
+    let maimed = Scan::new(
+        intact.coverage_pattern().clone(),
+        intact.sweeps().iter().map(leading_radial_blanked).collect(),
+    );
+    assert!(
+        maimed.sweeps()[1].radials()[0].velocity().is_none(),
+        "the fixture must be blank in front",
+    );
+    assert!(
+        maimed.sweeps()[1].radials()[1].velocity().is_some(),
+        "and only in front",
+    );
+
+    for product in [
+        RadarProduct::StormRelativeVelocity,
+        RadarProduct::NormalizedRotation,
+        RadarProduct::Velocity,
+    ] {
+        let payload = RenderInput::extract(
+            &maimed,
+            0.5,
+            product,
+            LAT,
+            LON,
+            override_for(product),
+            env_for(product),
+        )
+        .unwrap_or_else(|| {
+            panic!("{product:?}: one blank leading radial hid the sweep from the port")
+        });
+
+        // And the sweeps arrive whole. The whole-volume pair is where the
+        // wind fit reads, so every velocity tilt the scan offers has to be
+        // there; a per-tilt request carries the one sweep it asked for.
+        let expected = if product.reads_whole_volume() {
+            crate::velocity::tilts(&maimed).count()
+        } else {
+            1
+        };
+        assert_eq!(
+            crate::velocity::tilts(&payload.to_scan()).count(),
+            expected,
+            "{product:?}: the payload dropped a velocity tilt the scan carries",
+        );
+    }
+}
+
+/// The Doppler-half marker is a property of the sweep, so a blank leading
+/// radial does not take it off.
+///
+/// `to_scan` puts a zero-gate velocity moment back on a sweep that carried
+/// velocity, and `find_sweep`'s surveillance preference reads that field's
+/// mere presence. Read off the first radial, the marker went missing and the
+/// reconstructed Doppler half offered itself as the surveillance cut.
+#[test]
+fn the_doppler_half_is_still_marked_when_its_leading_radial_is_blank() {
+    let intact = volume();
+    let maimed = Scan::new(
+        intact.coverage_pattern().clone(),
+        intact.sweeps().iter().map(leading_radial_blanked).collect(),
+    );
+
+    let payload = RenderInput::extract_volume(&maimed, RadarProduct::Reflectivity, LAT, LON)
+        .expect("every sweep carries reflectivity");
+    let rebuilt = payload.to_scan();
+
+    let marked = rebuilt
+        .sweeps()
+        .iter()
+        .filter(|s| s.radials().iter().any(|r| r.velocity().is_some()))
+        .count();
+    assert_eq!(
+        marked, 2,
+        "the two Doppler halves must still be recognisable after the port",
+    );
+}
