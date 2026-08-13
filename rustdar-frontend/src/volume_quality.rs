@@ -343,7 +343,7 @@ pub const PLATFORM_CEILING: VolumeQuality = DESKTOP_PLATFORM_CEILING;
 /// `select(DeviceClass::from_device_type(adapter.get_info().device_type),
 /// PLATFORM_CEILING)`. The result is fixed for the life of that renderer — a
 /// device does not change class — and what varies per frame is the pane's size,
-/// which [`VolumeQuality::fit_to_budget`] applies on top and which may step the
+/// which [`VolumeQuality::fit`] applies on top and which may step the
 /// resolution rung down again.
 ///
 /// It had no production caller while WP-I existed on its own, and every arm was
@@ -411,11 +411,6 @@ impl VolumeQuality {
             }
         }
     }
-
-    /// The offscreen size for a pane against this target's own budget.
-    pub fn fit_to_budget(self, pane_px: [u32; 2]) -> FittedOffscreen {
-        self.fit(pane_px, VOLUME_OFFSCREEN_BUDGET_BYTES)
-    }
 }
 
 /// A pane divided by a rung, never rounded away to nothing.
@@ -451,6 +446,12 @@ fn shrink_into_budget(size: [u32; 2], budget_bytes: usize) -> [u32; 2] {
 /// Exists so `constants`' budget tests have a concrete number to check, the way
 /// `VOLUME_GRID_CELLS` gives the grid budget one. The reference pane is a
 /// constant; what differs per target is the ceiling applied to it.
+///
+/// The `cfg`-selected pair is what makes this *this target's* answer, which is
+/// also what makes it one row of three. `every_offscreen_budget_arm_pays_for_
+/// its_own_reference_pane` is the same claim on all three, and the production
+/// path takes neither: a pane's offscreen is fitted against the resolved
+/// `Budgets::offscreen_bytes` the painter was handed.
 pub fn reference_offscreen() -> FittedOffscreen {
     PLATFORM_CEILING.fit(
         VOLUME_OFFSCREEN_REFERENCE_PANE_PX,

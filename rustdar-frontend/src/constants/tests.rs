@@ -1,252 +1,98 @@
 use super::*;
-use rustdar_radar::types::{IMAGE_SIZE, NATIVE_IMAGE_SIZE, WASM_IMAGE_SIZE};
+use crate::budget::{self, Budgets, DeviceProfile};
+use rustdar_radar::types::{IMAGE_SIZE, WASM_IMAGE_SIZE};
 use rustdar_radar::xsect::{NATIVE_SECTION_WIDTH, WASM_SECTION_WIDTH};
 
-/// One device class's share of every cascade in this file.
+/// Every device class this workspace builds for, exactly once — as the
+/// **profiles** they are, rather than as a hand-built table of budgets.
 ///
-/// The four budget invariants below used to read the `cfg`-selected
-/// constants directly, which meant each of them checked one arm out of
-/// three and left the other two free — the same one-sided shape 3292e8d
-/// fixed for the voxel grid, and it was still here for the budgets. The
-/// arms all have names now, so a table can be built and every invariant
-/// run against every row.
-struct Arm {
-    name: &'static str,
-    /// `rustdar_radar::types::IMAGE_SIZE` for this class — the side a static
-    /// plan-view render takes at the base side. It is a *two*-arm cascade —
-    /// mobile is native — so this is where the two cascade shapes in this
-    /// workspace are reconciled.
-    image_size: usize,
-    /// The side a static render may grow to past the floor. Equal to
-    /// `image_size` on the arm where adaptivity is off.
-    long_range_image_size: usize,
-    /// The side a **loop** frame is rendered at, whatever its sweep reaches.
-    /// This, not `image_size`, is what the loop budgets are computed from.
-    loop_image_size: usize,
-    /// `rustdar_radar::xsect::SECTION_WIDTH` for this class. Pinned per target
-    /// rather than derived from `image_size`, so it is carried here rather
-    /// than reconstructed.
-    section_width: usize,
-    concurrent_renders: usize,
-    loop_frames: usize,
-    render_budget: usize,
-    /// The whole application's loop allowance on a device that reports nothing.
-    /// **Not** a per-pane figure any more — see [`LOOP_POOL_FLOOR_BYTES`].
-    pool_floor: usize,
-    /// The most this class will ever spend on loops, however much the device
-    /// claims. See [`LOOP_POOL_CEILING_BYTES`].
-    pool_ceiling: usize,
-    grid: [u32; 3],
-    volume_budget: usize,
-    /// Frames — and so resident voxel grids — a 3D loop holds on this class.
-    /// For this loop kind the two are one number, which
-    /// `the_3d_loop_holds_exactly_what_it_marches` is about.
-    ///
-    /// **A literal.** It used to read `MAX_LOOP_VOLUME_FRAMES`, a `cfg` cascade
-    /// with no runtime consumer that restated what `LoopPool::plan` already
-    /// computes. The constant is retired; the count is the planner's answer,
-    /// `loop_pool::tests::the_pool_reproduces_the_shipped_3d_frame_count` binds
-    /// the planner to these same figures, and the test below binds them to the
-    /// budget arithmetic they came out of.
-    volume_loop_frames: usize,
-    /// The application-wide ceiling on those grids.
-    volume_loop_budget: usize,
-    /// The per-pane raymarch offscreen ceiling.
-    offscreen_budget: usize,
-    /// Panes this class can show at once. Not a `cfg` cascade like everything
-    /// else here — it is `rustdar_egui`'s, selected at runtime by width class
-    /// — which is precisely why the multiplication below had nothing checking
-    /// it: the two halves live in different crates.
-    max_panes: usize,
-    /// The whole-application ceiling the row must fit.
-    app_budget: usize,
-}
-
-impl Arm {
-    /// Bytes one loop frame's texture occupies: RGBA at `image_size²`.
-    /// Loop frames carry no value grid — `poll_loop_render_results` stores an
-    /// empty one — so this is the whole cost, unlike a static pane render.
-    fn loop_frame_bytes(&self) -> usize {
-        self.loop_image_size * self.loop_image_size * 4
-    }
-
-    /// Bytes one **static** pane render's texture occupies, worst case: the
-    /// long-range side, since that is the one a device that passes the gate can
-    /// be asked to hold. Not part of `app_texture_bytes` — see
-    /// `the_static_render_textures_are_named_even_though_the_ceiling_omits_them`.
-    fn static_frame_bytes(&self) -> usize {
-        self.long_range_image_size * self.long_range_image_size * 4
-    }
-
-    /// Bytes one **cross-section** loop frame's texture occupies: RGBA at
-    /// `SECTION_WIDTH × SECTION_HEIGHT`.
-    ///
-    /// The width comes from this arm's own `section_width` so that every row
-    /// is checkable from one host build — the reason `arms()` exists — and the
-    /// halving is read from `SECTION_HEIGHT`'s definition through the
-    /// assertion below rather than restated beside it. Section loop frames
-    /// carry no value or status plane, for the reason plan-view frames carry
-    /// no value grid — see `rustdar_egui::pane::SectionImageData`.
-    fn section_frame_bytes(&self) -> usize {
-        assert_eq!(
-            (
-                rustdar_radar::xsect::SECTION_WIDTH,
-                rustdar_radar::xsect::SECTION_HEIGHT
-            ),
-            (
-                self.section_width_for_this_target(),
-                self.section_width_for_this_target() / 2
-            ),
-            "the section raster is no longer SECTION_WIDTH by half of it, so the \
-             per-arm reconstruction above no longer describes it",
-        );
-        self.section_width * (self.section_width / 2) * 4
-    }
-
-    /// This *build's* section width, for the consistency check above — the
-    /// per-arm figure is `section_width` and is what the budget rows use.
-    fn section_width_for_this_target(&self) -> usize {
-        if cfg!(target_arch = "wasm32") {
-            WASM_SECTION_WIDTH
+/// # What this replaces
+///
+/// It was `arms() -> [Arm; 3]`, a struct of budgets per device class, built
+/// because the four invariants below used to read the `cfg`-selected constants
+/// directly and so checked one arm out of three while leaving the other two
+/// free. That table was already `crate::budget::Budgets` under another name —
+/// which is why the conversion is a rename and a delegation rather than an
+/// invention. The rows are `DeviceProfile`s now and the budgets come out of
+/// `budget::resolve`, so every proof below is a proof about the function the
+/// application actually runs rather than about a copy of its answers.
+fn profiles() -> [DeviceProfile; 3] {
+    crate::budget::BudgetLimits::SHIPPED.map(|limits| DeviceProfile {
+        limits,
+        platform: if limits.name == "wasm32" {
+            crate::budget::Platform::Web
         } else {
-            NATIVE_SECTION_WIDTH
-        }
-    }
-
-    /// Frames that hold a texture at once. `evict_textures_outside_render_set`
-    /// runs every dispatch with `MAX_LOOP_RENDER_BUDGET`, so a loop of
-    /// `MAX_LOOP_FRAMES` keeps only the render set textured.
-    fn textured_frames(&self) -> usize {
-        self.render_budget.min(self.loop_frames)
-    }
-
-    /// Bytes one pane's 3D volume texture occupies: every mip level of the
-    /// grid at `crate::volume::VOLUME_TEXTURE_FORMAT`'s four bytes a cell, plus
-    /// the RGBA table those cells index.
-    ///
-    /// Read from `volume::raymarch::grid_bytes_with_mips` rather than
-    /// recomputed, so the budget is checked against the arithmetic the upload
-    /// path actually allocates by — including the coarse level, which the
-    /// earlier hand-written product silently left out of the budget entirely.
-    ///
-    /// Four bytes per cell is not an assumption to be tidied away: the format
-    /// is `Rg16Float` because the march reconstructs `R̄ / Ḡ` from a
-    /// coverage-premultiplied index and a coverage channel — which needs a
-    /// filter error that scales with the sample rather than with the format,
-    /// or the quotient is wrong by the whole palette at an echo edge — and
-    /// because `Rg16Float` is *filterable* under `Features::empty()` where
-    /// `R32Float` is not.
-    fn volume_bytes(&self) -> usize {
-        crate::volume::raymarch::resident_grid_bytes(self.grid)
-            .expect("a shipped grid shape cannot overflow")
-    }
-
-    /// Every GPU texture the application budgets at once, worst case.
-    ///
-    /// **The loop term is not multiplied by the pane count, and that is the
-    /// whole change.** It used to be `max_panes × a per-pane loop budget` plus
-    /// a separate flat term for the 3D loop, which was the one loop kind whose
-    /// grids lived in one application-wide store. Every loop kind is now: the
-    /// pool is *divided* among the loops that want one, so there is a single
-    /// loop term and it is the pool's ceiling.
-    ///
-    /// Multiplying it again would be the regression this test exists to catch,
-    /// and so would giving the 3D loop a term of its own — that would be the
-    /// double-count `the_3d_set_is_not_double_counted_across_two_panes` rules
-    /// out, arrived at from the budget side.
-    ///
-    /// The offscreen term *is* still per pane, correctly: each 3D pane
-    /// raymarches into its own target, and no two panes share one.
-    ///
-    /// # The volume store's floor is a third term, and it used to be missing
-    ///
-    /// `App::setup_egui_frame` bounds the store at
-    /// `loop_allocation().volume_reserve_bytes().max(VOLUME_LOOP_TEXTURE_BUDGET_BYTES)`.
-    /// The `max` is not slack inside the pool term above — it is *outside* it.
-    /// Write the reserve as `v · share` for `v` volume sets out of
-    /// `shares = plan_view + section + v`, so `share = pool / shares`. The
-    /// raster loops then hold at most `pool − v·share` and the store is allowed
-    /// `max(v·share, floor)`, and the sum is
-    ///
-    /// ```text
-    /// pool − v·share + max(v·share, floor)  =  pool + max(0, floor − v·share)
-    /// ```
-    ///
-    /// which is maximised at **`v = 0`**, where it is `pool + floor`. A layout
-    /// with no 3D *loop* at all is exactly where the override bites hardest:
-    /// every byte of the pool goes to raster loops, and the store is still
-    /// floored at the whole pool floor so that ordinary live 3D panes have
-    /// somewhere to live.
-    ///
-    /// That term was absent, and its absence was not free — see
-    /// `the_whole_application_fits_its_gpu_ceiling` for the two arms whose
-    /// ceilings had to move to admit it.
-    fn app_texture_bytes(&self) -> usize {
-        self.pool_ceiling + self.volume_loop_budget + self.max_panes * self.offscreen_budget
-    }
+            crate::budget::Platform::Native
+        },
+        ..DeviceProfile::for_target()
+    })
 }
 
-/// Every device class this workspace builds for, exactly once.
-fn arms() -> [Arm; 3] {
-    [
-        Arm {
-            name: "wasm32",
-            image_size: WASM_IMAGE_SIZE,
-            long_range_image_size: WASM_LONG_RANGE_IMAGE_SIZE,
-            loop_image_size: WASM_LOOP_IMAGE_SIZE,
-            section_width: WASM_SECTION_WIDTH,
-            concurrent_renders: WASM_MAX_CONCURRENT_RENDERS,
-            loop_frames: WASM_MAX_LOOP_FRAMES,
-            render_budget: WASM_MAX_LOOP_RENDER_BUDGET,
-            pool_floor: WASM_LOOP_POOL_FLOOR_BYTES,
-            pool_ceiling: WASM_LOOP_POOL_CEILING_BYTES,
-            grid: WASM_VOLUME_GRID_CELLS,
-            volume_budget: WASM_VOLUME_TEXTURE_BUDGET_BYTES,
-            volume_loop_frames: 8,
-            volume_loop_budget: WASM_VOLUME_LOOP_TEXTURE_BUDGET_BYTES,
-            offscreen_budget: WASM_VOLUME_OFFSCREEN_BUDGET_BYTES,
-            max_panes: rustdar_egui::pane::MAX_PANES_DESKTOP,
-            app_budget: WASM_APP_TEXTURE_BUDGET_BYTES,
-        },
-        Arm {
-            name: "mobile",
-            image_size: NATIVE_IMAGE_SIZE,
-            long_range_image_size: MOBILE_LONG_RANGE_IMAGE_SIZE,
-            loop_image_size: MOBILE_LOOP_IMAGE_SIZE,
-            section_width: NATIVE_SECTION_WIDTH,
-            concurrent_renders: MOBILE_MAX_CONCURRENT_RENDERS,
-            loop_frames: MOBILE_MAX_LOOP_FRAMES,
-            render_budget: MOBILE_MAX_LOOP_RENDER_BUDGET,
-            pool_floor: MOBILE_LOOP_POOL_FLOOR_BYTES,
-            pool_ceiling: MOBILE_LOOP_POOL_CEILING_BYTES,
-            grid: MOBILE_VOLUME_GRID_CELLS,
-            volume_budget: MOBILE_VOLUME_TEXTURE_BUDGET_BYTES,
-            volume_loop_frames: 12,
-            volume_loop_budget: MOBILE_VOLUME_LOOP_TEXTURE_BUDGET_BYTES,
-            offscreen_budget: MOBILE_VOLUME_OFFSCREEN_BUDGET_BYTES,
-            max_panes: rustdar_egui::pane::MAX_PANES_MOBILE,
-            app_budget: MOBILE_APP_TEXTURE_BUDGET_BYTES,
-        },
-        Arm {
-            name: "desktop",
-            image_size: NATIVE_IMAGE_SIZE,
-            long_range_image_size: DESKTOP_LONG_RANGE_IMAGE_SIZE,
-            loop_image_size: DESKTOP_LOOP_IMAGE_SIZE,
-            section_width: NATIVE_SECTION_WIDTH,
-            concurrent_renders: DESKTOP_MAX_CONCURRENT_RENDERS,
-            loop_frames: DESKTOP_MAX_LOOP_FRAMES,
-            render_budget: DESKTOP_MAX_LOOP_RENDER_BUDGET,
-            pool_floor: DESKTOP_LOOP_POOL_FLOOR_BYTES,
-            pool_ceiling: DESKTOP_LOOP_POOL_CEILING_BYTES,
-            grid: DESKTOP_VOLUME_GRID_CELLS,
-            volume_budget: DESKTOP_VOLUME_TEXTURE_BUDGET_BYTES,
-            volume_loop_frames: 12,
-            volume_loop_budget: DESKTOP_VOLUME_LOOP_TEXTURE_BUDGET_BYTES,
-            offscreen_budget: DESKTOP_VOLUME_OFFSCREEN_BUDGET_BYTES,
-            max_panes: rustdar_egui::pane::MAX_PANES_DESKTOP,
-            app_budget: DESKTOP_APP_TEXTURE_BUDGET_BYTES,
-        },
-    ]
+/// What [`profiles`] resolve to. The loop variable below is still called `arm`
+/// because that is what one row of this is: one device class's share of every
+/// cascade in this file.
+fn arms() -> [Budgets; 3] {
+    profiles().map(|profile| budget::resolve(&profile))
+}
+
+/// Bytes one resident voxel grid costs on this arm.
+///
+/// Read from `volume::raymarch::resident_grid_bytes` rather than recomputed, so
+/// the budget is checked against the arithmetic the upload path allocates by —
+/// every mip level the device lays the texture out with, the colour table's own
+/// texture, and the jitter tile created beside it. The earlier hand-written
+/// product left the coarse level out of the budget entirely, and the version
+/// after that charged the two levels the descriptor names rather than the whole
+/// pyramid the driver reserves.
+///
+/// Four bytes per cell is not an assumption to be tidied away: the format is
+/// `Rg16Float` because the march reconstructs `R̄ / Ḡ` from a
+/// coverage-premultiplied index and a coverage channel — which needs a filter
+/// error that scales with the sample rather than with the format, or the
+/// quotient is wrong by the whole palette at an echo edge — and because
+/// `Rg16Float` is *filterable* under `Features::empty()` where `R32Float` is
+/// not.
+fn volume_bytes(arm: &Budgets) -> usize {
+    Budgets::volume_bytes(arm).expect("a shipped grid shape cannot overflow")
+}
+
+/// Frames — and so resident voxel grids — a 3D loop holds, per arm, in
+/// [`profiles`] order.
+///
+/// **Literals.** They used to be `MAX_LOOP_VOLUME_FRAMES`, a `cfg` cascade with
+/// no runtime consumer that restated what `LoopPool::plan` already computes.
+/// The constant is retired; the count is the planner's answer,
+/// `loop_pool::tests::the_pool_reproduces_the_shipped_3d_frame_count` binds the
+/// planner to these same figures, and
+/// [`the_3d_loop_holds_exactly_what_it_marches`] binds them to the budget
+/// arithmetic they came out of.
+const SHIPPED_VOLUME_LOOP_FRAMES: [usize; 3] = [8, 12, 12];
+
+/// The section raster is `SECTION_WIDTH` by half of it, which is what makes
+/// [`Budgets::section_frame_bytes`] a reconstruction rather than a guess.
+///
+/// Split out of that method when it moved to `crate::budget`: the per-arm
+/// figure is what every budget row uses, and this is the one claim about the
+/// *compiled* target that keeps the reconstruction honest. Section loop frames
+/// carry no value or status plane, for the reason plan-view frames carry no
+/// value grid — see `rustdar_egui::pane::SectionImageData`.
+#[test]
+fn the_section_raster_is_its_width_by_half_of_it() {
+    let compiled = if cfg!(target_arch = "wasm32") {
+        WASM_SECTION_WIDTH
+    } else {
+        NATIVE_SECTION_WIDTH
+    };
+    assert_eq!(
+        (
+            rustdar_radar::xsect::SECTION_WIDTH,
+            rustdar_radar::xsect::SECTION_HEIGHT
+        ),
+        (compiled, compiled / 2),
+        "the section raster is no longer SECTION_WIDTH by half of it, so the \
+         per-arm reconstruction in `Budgets::section_frame_bytes` no longer \
+         describes it",
+    );
 }
 
 /// **One loop, on the worst device this target admits, gets exactly what one
@@ -265,19 +111,19 @@ fn one_loop_at_the_floor_is_exactly_what_a_pane_used_to_get() {
     for arm in arms() {
         let total = arm.textured_frames() * arm.loop_frame_bytes();
         assert!(
-            total <= arm.pool_floor,
+            total <= arm.loop_pool_floor_bytes,
             "{}: {} textured frames x {}^2 x 4B = {} MiB, over the {} MiB floor \
              — a single loop on this target no longer gets the history it does \
              today",
             arm.name,
             arm.textured_frames(),
-            arm.loop_image_size,
+            arm.loop_image_side_px,
             total / (1024 * 1024),
-            arm.pool_floor / (1024 * 1024),
+            arm.loop_pool_floor_bytes / (1024 * 1024),
         );
         // And a section loop, which is half the frame, comfortably so — the
         // pool is bytes, so this needs no table of its own any more.
-        assert!(arm.textured_frames() * arm.section_frame_bytes() <= arm.pool_floor);
+        assert!(arm.textured_frames() * arm.section_frame_bytes() <= arm.loop_pool_floor_bytes);
     }
 }
 
@@ -297,7 +143,7 @@ fn the_floor_seats_every_pane_without_blanking_one() {
     for arm in arms() {
         let needed = arm.max_panes * MIN_LOOP_FRAMES_PER_PANE * arm.loop_frame_bytes();
         assert!(
-            needed <= arm.pool_floor,
+            needed <= arm.loop_pool_floor_bytes,
             "{}: {} panes x {MIN_LOOP_FRAMES_PER_PANE} frames x {} MiB = {} MiB, \
              over the {} MiB floor — a full screen of loops would be cut below \
              the minimum and one of them would blank",
@@ -305,7 +151,7 @@ fn the_floor_seats_every_pane_without_blanking_one() {
             arm.max_panes,
             arm.loop_frame_bytes() / (1024 * 1024),
             needed / (1024 * 1024),
-            arm.pool_floor / (1024 * 1024),
+            arm.loop_pool_floor_bytes / (1024 * 1024),
         );
     }
 }
@@ -320,11 +166,11 @@ fn the_floor_seats_every_pane_without_blanking_one() {
 fn every_pool_ceiling_is_at_least_its_own_floor() {
     for arm in arms() {
         assert!(
-            arm.pool_floor <= arm.pool_ceiling,
+            arm.loop_pool_floor_bytes <= arm.loop_pool_ceiling_bytes,
             "{}: a {} MiB floor above a {} MiB ceiling is a `clamp` that panics",
             arm.name,
-            arm.pool_floor / (1024 * 1024),
-            arm.pool_ceiling / (1024 * 1024),
+            arm.loop_pool_floor_bytes / (1024 * 1024),
+            arm.loop_pool_ceiling_bytes / (1024 * 1024),
         );
     }
 }
@@ -361,16 +207,16 @@ fn a_section_loop_frame_is_half_a_plan_view_one() {
 /// two rows above.
 #[test]
 fn volume_loop_grids_fit_the_application_texture_budget() {
-    for arm in arms() {
-        let total = arm.volume_loop_frames * arm.volume_bytes();
+    for (arm, frames) in arms().into_iter().zip(SHIPPED_VOLUME_LOOP_FRAMES) {
+        let total = frames * volume_bytes(&arm);
         assert!(
-            total <= arm.volume_loop_budget,
+            total <= arm.volume_loop_bytes(),
             "{}: {} resident grids x {} B = {:.1} MiB, over the {} MiB budget",
             arm.name,
-            arm.volume_loop_frames,
-            arm.volume_bytes(),
+            frames,
+            volume_bytes(&arm),
             total as f64 / (1024.0 * 1024.0),
-            arm.volume_loop_budget / (1024 * 1024),
+            arm.volume_loop_bytes() / (1024 * 1024),
         );
     }
 }
@@ -400,17 +246,17 @@ fn volume_loop_grids_fit_the_application_texture_budget() {
 /// reaches the eviction at all.
 #[test]
 fn a_full_3d_loop_leaves_room_for_a_live_grid_beside_it() {
-    for arm in arms() {
-        let resident = arm.volume_loop_frames * arm.volume_bytes();
+    for (arm, frames) in arms().into_iter().zip(SHIPPED_VOLUME_LOOP_FRAMES) {
+        let resident = frames * volume_bytes(&arm);
         assert!(
-            resident + arm.volume_bytes() <= arm.volume_loop_budget,
+            resident + volume_bytes(&arm) <= arm.volume_loop_bytes(),
             "{}: {} resident grids + one live grid = {:.1} MiB against a {} MiB \
              budget, so a 3D loop beside a live 3D pane makes the store evict \
              the loop's own oldest frame and rebuild it for ever",
             arm.name,
-            arm.volume_loop_frames,
-            (resident + arm.volume_bytes()) as f64 / (1024.0 * 1024.0),
-            arm.volume_loop_budget / (1024 * 1024),
+            frames,
+            (resident + volume_bytes(&arm)) as f64 / (1024.0 * 1024.0),
+            arm.volume_loop_bytes() / (1024 * 1024),
         );
     }
 }
@@ -431,12 +277,8 @@ fn a_full_3d_loop_leaves_room_for_a_live_grid_beside_it() {
 /// `app_render::volume_loop_tests` drives it end to end.
 #[test]
 fn the_3d_loop_holds_exactly_what_it_marches() {
-    for arm in arms() {
-        assert!(
-            arm.volume_loop_frames >= 2,
-            "{}: a one-frame loop is not a loop",
-            arm.name,
-        );
+    for (arm, frames) in arms().into_iter().zip(SHIPPED_VOLUME_LOOP_FRAMES) {
+        assert!(frames >= 2, "{}: a one-frame loop is not a loop", arm.name,);
         // The frame count is the tighter of two bounds, computed rather than
         // restated, and it is an *equality* — a list shorter than both bounds
         // allow is history thrown away for nothing, and a longer one is the
@@ -451,15 +293,16 @@ fn the_3d_loop_holds_exactly_what_it_marches() {
         //    loop is not licensed to hold *more* history than the plan-view
         //    loop beside it on the same device just because its grids happen
         //    to be small there.
-        let admits = arm.volume_loop_budget.saturating_sub(arm.volume_bytes()) / arm.volume_bytes();
+        let admits =
+            arm.volume_loop_bytes().saturating_sub(volume_bytes(&arm)) / volume_bytes(&arm);
         assert_eq!(
-            arm.volume_loop_frames,
-            admits.min(arm.render_budget),
+            frames,
+            admits.min(arm.loop_render_budget),
             "{}: the budget admits {admits} grids and the loop render budget is \
              {}, so the frame list should be their minimum, not {}",
             arm.name,
-            arm.render_budget,
-            arm.volume_loop_frames,
+            arm.loop_render_budget,
+            frames,
         );
     }
 }
@@ -493,17 +336,17 @@ fn the_whole_application_fits_its_gpu_ceiling() {
     for arm in arms() {
         let total = arm.app_texture_bytes();
         assert!(
-            total <= arm.app_budget,
+            total <= arm.app_texture_ceiling_bytes,
             "{}: a {} MiB loop pool + a {} MiB volume-store floor + {} panes x \
              {} MiB of raymarch offscreen = {} MiB, over the {} MiB \
              whole-application ceiling",
             arm.name,
-            arm.pool_ceiling / (1024 * 1024),
-            arm.volume_loop_budget / (1024 * 1024),
+            arm.loop_pool_ceiling_bytes / (1024 * 1024),
+            arm.volume_loop_bytes() / (1024 * 1024),
             arm.max_panes,
-            arm.offscreen_budget / (1024 * 1024),
+            arm.offscreen_bytes / (1024 * 1024),
             total / (1024 * 1024),
-            arm.app_budget / (1024 * 1024),
+            arm.app_texture_ceiling_bytes / (1024 * 1024),
         );
     }
 }
@@ -526,14 +369,14 @@ fn the_volume_store_floor_is_the_widest_the_override_can_open() {
         let model = LoopFrameModel {
             plan_view: arm.loop_frame_bytes(),
             section: arm.section_frame_bytes(),
-            grid: arm.volume_bytes(),
-            render_budget: arm.render_budget,
+            grid: volume_bytes(&arm),
+            render_budget: arm.loop_render_budget,
         };
         let limits = LoopPoolLimits {
-            floor: arm.pool_floor,
-            ceiling: arm.pool_ceiling,
+            floor: arm.loop_pool_floor_bytes,
+            ceiling: arm.loop_pool_ceiling_bytes,
         };
-        for pool_bytes in [arm.pool_floor, arm.pool_ceiling] {
+        for pool_bytes in [arm.loop_pool_floor_bytes, arm.loop_pool_ceiling_bytes] {
             let pool = LoopPool::new(pool_bytes, limits);
             for plan_view_loops in 0..=arm.max_panes {
                 for section_loops in 0..=(arm.max_panes - plan_view_loops) {
@@ -547,14 +390,14 @@ fn the_volume_store_floor_is_the_widest_the_override_can_open() {
                         // What `setup_egui_frame` hands `enforce_budget`.
                         let store = allocation
                             .volume_reserve_bytes()
-                            .max(arm.volume_loop_budget);
+                            .max(arm.volume_loop_bytes());
                         // What the raster loops may cache beside it. Nothing at
                         // runtime takes these back, so the division is the bound.
                         let raster =
                             plan_view_loops * allocation.plan_view_frames * model.plan_view
                                 + section_loops * allocation.section_frames * model.section;
                         assert!(
-                            raster + store <= arm.pool_ceiling + arm.volume_loop_budget,
+                            raster + store <= arm.loop_pool_ceiling_bytes + arm.volume_loop_bytes(),
                             "{}: {demand:?} at a {} MiB pool caches {} MiB of raster \
                              frames beside a {} MiB store bound — over the \
                              `pool ceiling + volume-store floor` the app ceiling \
@@ -584,11 +427,11 @@ fn the_app_ceiling_is_not_slack_enough_to_hide_a_doubling() {
     for arm in arms() {
         let total = arm.app_texture_bytes();
         assert!(
-            arm.app_budget * 4 <= total * 5,
+            arm.app_texture_ceiling_bytes * 4 <= total * 5,
             "{}: the {} MiB ceiling is more than 1.25x the {} MiB it bounds, so \
              a term inside it could double unnoticed",
             arm.name,
-            arm.app_budget / (1024 * 1024),
+            arm.app_texture_ceiling_bytes / (1024 * 1024),
             total / (1024 * 1024),
         );
     }
@@ -644,12 +487,12 @@ fn the_budget_is_not_slack_enough_to_hide_a_doubling() {
     for arm in arms() {
         let total = arm.textured_frames() * arm.loop_frame_bytes();
         assert!(
-            total * 2 > arm.pool_floor,
+            total * 2 > arm.loop_pool_floor_bytes,
             "{}: floor {} MiB is more than twice the {} MiB one full loop costs \
                  — it would not catch a regression, and it would mean the floor \
                  is no longer 'what one pane used to get'",
             arm.name,
-            arm.pool_floor / (1024 * 1024),
+            arm.loop_pool_floor_bytes / (1024 * 1024),
             total / (1024 * 1024),
         );
     }
@@ -664,10 +507,15 @@ fn the_budget_is_not_slack_enough_to_hide_a_doubling() {
 #[test]
 fn the_render_budget_is_what_bounds_the_textured_frames() {
     for arm in arms() {
-        assert_eq!(arm.textured_frames(), arm.render_budget, "{}", arm.name);
+        assert_eq!(
+            arm.textured_frames(),
+            arm.loop_render_budget,
+            "{}",
+            arm.name
+        );
         // A zero anywhere in the cascade is a loop that renders nothing, and
         // the compile-time block next to the constants only sees one arm.
-        assert!(arm.render_budget > 0, "{}", arm.name);
+        assert!(arm.loop_render_budget > 0, "{}", arm.name);
         assert!(arm.concurrent_renders > 0, "{}", arm.name);
     }
 }
@@ -678,14 +526,14 @@ fn the_render_budget_is_what_bounds_the_textured_frames() {
 #[test]
 fn the_volume_grid_fits_the_target_texture_budget() {
     for arm in arms() {
-        let total = arm.volume_bytes();
+        let total = volume_bytes(&arm);
         assert!(
-            total <= arm.volume_budget,
+            total <= arm.volume_texture_bytes,
             "{}: a {:?} grid plus a {VOLUME_LUT_BYTES} B table is {total} B, \
                  over the {} B budget",
             arm.name,
-            arm.grid,
-            arm.volume_budget,
+            arm.grid_cells,
+            arm.volume_texture_bytes,
         );
     }
 }
@@ -699,7 +547,7 @@ fn the_volume_grid_fits_the_target_texture_budget() {
 /// axis doubles the total.
 ///
 /// **What it no longer covers, since the grid's shape became a runtime
-/// answer.** `arm.grid` is the *budget* triple now, not the shape the frontend
+/// answer.** `arm.grid_cells` is the *budget* triple now, not the shape the frontend
 /// requests, so this is a claim about two constants: that the ceiling is snug
 /// against the budget. It is still worth making — a loose ceiling is how a term
 /// inside it doubles unnoticed — but the tripwire half, the one that would have
@@ -711,13 +559,13 @@ fn the_volume_grid_fits_the_target_texture_budget() {
 #[test]
 fn the_volume_budget_is_not_slack_enough_to_hide_a_doubling() {
     for arm in arms() {
-        let total = arm.volume_bytes();
+        let total = volume_bytes(&arm);
         assert!(
-            total * 2 > arm.volume_budget,
+            total * 2 > arm.volume_texture_bytes,
             "{}: budget {} B is more than twice the actual {total} B — it \
                  would not catch a doubled grid axis",
             arm.name,
-            arm.volume_budget,
+            arm.volume_texture_bytes,
         );
     }
 }
@@ -791,36 +639,40 @@ fn the_documented_per_class_figures_are_what_the_arms_actually_say() {
     ) in arms().into_iter().zip(expected)
     {
         assert_eq!(arm.name, name);
-        assert_eq!(arm.image_size, image, "{name} image size");
+        assert_eq!(arm.image_side_px, image, "{name} image size");
         assert_eq!(
-            arm.long_range_image_size, long_range,
+            arm.long_range_image_side_px, long_range,
             "{name} long-range image size"
         );
-        assert_eq!(arm.loop_image_size, loop_image, "{name} loop image size");
-        assert_eq!(arm.section_width, section_width, "{name} section width");
+        assert_eq!(arm.loop_image_side_px, loop_image, "{name} loop image size");
+        assert_eq!(arm.section_width_px, section_width, "{name} section width");
         // The three sides a plan-view raster can have on this class, ordered.
         // The loop never exceeds the base — a loop frame is the same picture
         // or a leaner one, never a larger one — and the long-range ceiling
         // never falls under it, or `raster_side_px` would shrink a raster the
         // moment its sweep reached further.
         assert!(
-            arm.loop_image_size <= arm.image_size,
+            arm.loop_image_side_px <= arm.image_side_px,
             "{name}: a loop frame is larger than a still one"
         );
         assert!(
-            arm.image_size <= arm.long_range_image_size,
+            arm.image_side_px <= arm.long_range_image_side_px,
             "{name}: the long-range ceiling is under the base size"
         );
         assert_eq!(arm.concurrent_renders, concurrent, "{name} renders");
-        assert_eq!(arm.loop_frames, held, "{name} held frames");
-        assert_eq!(arm.render_budget, textured, "{name} render budget");
-        assert_eq!(arm.pool_floor, floor_mib * 1024 * 1024, "{name} pool floor");
+        assert_eq!(arm.loop_frames_held, held, "{name} held frames");
+        assert_eq!(arm.loop_render_budget, textured, "{name} render budget");
         assert_eq!(
-            arm.pool_ceiling,
+            arm.loop_pool_floor_bytes,
+            floor_mib * 1024 * 1024,
+            "{name} pool floor"
+        );
+        assert_eq!(
+            arm.loop_pool_ceiling_bytes,
             ceiling_mib * 1024 * 1024,
             "{name} pool ceiling"
         );
-        assert_eq!(arm.volume_budget, volume, "{name} volume budget");
+        assert_eq!(arm.volume_texture_bytes, volume, "{name} volume budget");
     }
 }
 
@@ -840,19 +692,31 @@ fn every_cascade_in_this_file_selected_the_same_arm() {
     #[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
     let arm = &arms()[2];
 
-    assert_eq!(IMAGE_SIZE, arm.image_size, "{}", arm.name);
+    assert_eq!(IMAGE_SIZE, arm.image_side_px, "{}", arm.name);
     assert_eq!(
         MAX_CONCURRENT_RENDERS, arm.concurrent_renders,
         "{}",
         arm.name
     );
-    assert_eq!(MAX_LOOP_FRAMES, arm.loop_frames, "{}", arm.name);
-    assert_eq!(MAX_LOOP_RENDER_BUDGET, arm.render_budget, "{}", arm.name);
-    assert_eq!(LOOP_POOL_FLOOR_BYTES, arm.pool_floor, "{}", arm.name);
-    assert_eq!(LOOP_POOL_CEILING_BYTES, arm.pool_ceiling, "{}", arm.name);
-    assert_eq!(VOLUME_GRID_CELLS, arm.grid, "{}", arm.name);
+    assert_eq!(MAX_LOOP_FRAMES, arm.loop_frames_held, "{}", arm.name);
     assert_eq!(
-        VOLUME_TEXTURE_BUDGET_BYTES, arm.volume_budget,
+        MAX_LOOP_RENDER_BUDGET, arm.loop_render_budget,
+        "{}",
+        arm.name
+    );
+    assert_eq!(
+        LOOP_POOL_FLOOR_BYTES, arm.loop_pool_floor_bytes,
+        "{}",
+        arm.name
+    );
+    assert_eq!(
+        LOOP_POOL_CEILING_BYTES, arm.loop_pool_ceiling_bytes,
+        "{}",
+        arm.name
+    );
+    assert_eq!(VOLUME_GRID_CELLS, arm.grid_cells, "{}", arm.name);
+    assert_eq!(
+        VOLUME_TEXTURE_BUDGET_BYTES, arm.volume_texture_bytes,
         "{}",
         arm.name
     );
@@ -1847,15 +1711,22 @@ fn a_rasters_side_is_read_back_from_its_length_against_a_closed_set() {
 /// count is safe to move. Every other figure in that row was pre-fix too, on
 /// every row.
 ///
-/// The count it is compared against is [`Arm::volume_loop_frames`], which is a
-/// literal now rather than `DESKTOP_MAX_LOOP_VOLUME_FRAMES` and its two
-/// siblings: that cascade had no runtime consumer and is retired, so this test
-/// and `the_3d_loop_holds_exactly_what_it_marches` are between them what hold
-/// the figures to the budget arithmetic they come out of.
-///
 /// So the doc is parsed rather than trusted. A figure that drifts fails here
 /// with both numbers, which is the only thing that keeps a hand-written table
 /// honest against a constant it is not computed from.
+///
+/// The `frames` column is compared against [`SHIPPED_VOLUME_LOOP_FRAMES`]
+/// rather than against a constant of its own, because there is no longer a
+/// constant of its own: `MAX_LOOP_VOLUME_FRAMES` and its three named arms had
+/// no runtime consumer — `LoopPool::plan` computed the number and the cascade
+/// restated it — and are retired. This test and
+/// `the_3d_loop_holds_exactly_what_it_marches` are between them what hold those
+/// literals to the budget arithmetic they came out of.
+///
+/// The decimals are load-bearing rather than cosmetic: the cells are compared
+/// as **strings**, so `{:.3}` on the texture column and `{:.2}` on the two
+/// derived from it are part of what the table has to say, and a row rounded to
+/// one place fails here.
 #[test]
 fn the_loop_budget_table_is_the_one_the_constants_derive() {
     const MIB: f64 = 1024.0 * 1024.0;
@@ -1883,22 +1754,20 @@ fn the_loop_budget_table_is_the_one_the_constants_derive() {
         "the budget table is no longer three target rows this can read: {rows:?}",
     );
 
-    for (arm, row) in arms().into_iter().zip(rows) {
+    for ((arm, frames), row) in arms().into_iter().zip(SHIPPED_VOLUME_LOOP_FRAMES).zip(rows) {
         assert_eq!(
             row[0], arm.name,
             "the table's rows are out of order: {row:?}"
         );
-        let grid = crate::volume::raymarch::resident_grid_bytes(arm.grid)
-            .expect("a shipped grid shape cannot overflow");
-        let frames = arm.volume_loop_frames;
+        let grid = volume_bytes(&arm);
         let resident = grid * frames;
         let expected = [
             arm.name.to_string(),
             frames.to_string(),
             format!("{:.3}", grid as f64 / MIB),
             format!("{:.2}", resident as f64 / MIB),
-            format!("{:.2}", (arm.volume_loop_budget - resident) as f64 / MIB),
-            format!("{}", arm.volume_loop_budget / (1024 * 1024)),
+            format!("{:.2}", (arm.volume_loop_bytes() - resident) as f64 / MIB),
+            format!("{}", arm.volume_loop_bytes() / (1024 * 1024)),
         ];
         assert_eq!(
             row, expected,

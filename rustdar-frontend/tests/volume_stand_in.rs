@@ -191,7 +191,16 @@ fn frame(target: &VolumeTarget) -> VolumeFrameState {
 }
 
 fn painter(store: Arc<VolumeStore>) -> BridgeVolumePainter {
-    BridgeVolumePainter::new(store, VolumeQuality::BEST, VolumeSupport::Supported)
+    // The offscreen budget this build resolves, so a stand-in fits its panes
+    // against the same figure the application would.
+    let budgets =
+        rustdar_frontend::budget::resolve(&rustdar_frontend::budget::DeviceProfile::for_target());
+    BridgeVolumePainter::new(
+        store,
+        VolumeQuality::BEST,
+        budgets.offscreen_bytes,
+        VolumeSupport::Supported,
+    )
 }
 
 /// **The defect.** A zoom must leave a picture on screen, and the caption must

@@ -171,6 +171,7 @@
 //! re-probe, and a user who had backed off would see a different loop length
 //! every start.
 
+use crate::budget::Budgets;
 use crate::constants::{
     LOOP_IMAGE_SIZE, LOOP_POOL_CEILING_BYTES, LOOP_POOL_DWELL_FRAMES, LOOP_POOL_FLOOR_BYTES,
     LOOP_POOL_HYSTERESIS, MAX_LOOP_RENDER_BUDGET, MIN_LOOP_FRAMES_PER_PANE, VOLUME_GRID_CELLS,
@@ -203,10 +204,27 @@ pub struct LoopPoolLimits {
 
 impl LoopPoolLimits {
     /// The compiled target's bounds.
+    ///
+    /// The convenience arm over [`from_budgets`](Self::from_budgets), kept for
+    /// the tests and the const contexts that want this build's own pair. The
+    /// application takes the other one.
     pub const fn for_target() -> Self {
         Self {
             floor: LOOP_POOL_FLOOR_BYTES,
             ceiling: LOOP_POOL_CEILING_BYTES,
+        }
+    }
+
+    /// The bounds a resolved [`Budgets`] carries.
+    ///
+    /// The pool is the one budget that leaves `budget::resolve` as a *pair*
+    /// rather than as one figure, because it already has a runtime resolution
+    /// (`LoopPool::for_device`) and a back-off path (`LoopPool::back_off`) of
+    /// its own. This is where the two meet.
+    pub const fn from_budgets(budgets: &Budgets) -> Self {
+        Self {
+            floor: budgets.loop_pool_floor_bytes,
+            ceiling: budgets.loop_pool_ceiling_bytes,
         }
     }
 
@@ -254,6 +272,10 @@ pub struct LoopFrameModel {
 
 impl LoopFrameModel {
     /// The compiled target's figures.
+    ///
+    /// The convenience arm over [`from_budgets`](Self::from_budgets), kept for
+    /// the tests that want this build's own row. The application takes the
+    /// other one.
     pub fn for_target() -> Self {
         let side = LOOP_IMAGE_SIZE;
         Self {
@@ -262,6 +284,21 @@ impl LoopFrameModel {
             grid: crate::volume::raymarch::resident_grid_bytes(VOLUME_GRID_CELLS)
                 .unwrap_or(usize::MAX),
             render_budget: MAX_LOOP_RENDER_BUDGET,
+        }
+    }
+
+    /// The figures a resolved [`Budgets`] carries.
+    ///
+    /// The section width is the budget's own rather than
+    /// `rustdar_radar::xsect::SECTION_WIDTH` read inline, so a row that is not
+    /// the compiled arm's is expressible — which is the whole reason the model
+    /// is a parameter in the first place.
+    pub fn from_budgets(budgets: &Budgets) -> Self {
+        Self {
+            plan_view: budgets.loop_frame_bytes(),
+            section: budgets.section_frame_bytes(),
+            grid: budgets.volume_bytes().unwrap_or(usize::MAX),
+            render_budget: budgets.loop_render_budget,
         }
     }
 }

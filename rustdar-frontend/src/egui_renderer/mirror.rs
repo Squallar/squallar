@@ -188,7 +188,8 @@ pub struct MirrorLimits {
     /// The adapter's `max_texture_dimension_2d`, never below
     /// [`MIRROR_MAX_SIDE`].
     pub max_side: u32,
-    /// This target's arm of [`crate::constants::VOLUME_MIRROR_BYTES_MAX`].
+    /// The resolved `Budgets::mirror_bytes` — this build's arm of
+    /// [`crate::constants::VOLUME_MIRROR_BYTES_MAX`].
     pub max_bytes: usize,
 }
 
@@ -197,13 +198,17 @@ impl MirrorLimits {
     ///
     /// Floored at [`MIRROR_MAX_SIDE`] rather than trusted outright so that a
     /// device — or a test double — reporting something absurdly small cannot
-    /// drive the fit loop down to a one-texel mirror. The byte budget is the
-    /// compiled target's, which is the half of this pair that is a *decision*
-    /// rather than a measurement.
-    pub fn for_device(max_texture_dimension_2d: u32) -> Self {
+    /// drive the fit loop down to a one-texel mirror.
+    ///
+    /// The two halves arrive from different places on purpose, and that is the
+    /// whole shape of this pair: the side is a **measurement** the adapter
+    /// makes, and the byte budget is a **decision** this build carries, which
+    /// is why it comes in as `Budgets::mirror_bytes` rather than being read
+    /// from a `cfg` constant here.
+    pub fn for_device(max_texture_dimension_2d: u32, max_bytes: usize) -> Self {
         Self {
             max_side: max_texture_dimension_2d.max(MIRROR_MAX_SIDE),
-            max_bytes: crate::constants::VOLUME_MIRROR_BYTES_MAX,
+            max_bytes,
         }
     }
 }
@@ -347,7 +352,7 @@ pub fn mirror_size_for(size_in_points: [f32; 2], pixels_per_point: f32) -> ([u32
         size_in_points,
         pixels_per_point,
         1.0,
-        MirrorLimits::for_device(MIRROR_MAX_SIDE),
+        MirrorLimits::for_device(MIRROR_MAX_SIDE, crate::constants::VOLUME_MIRROR_BYTES_MAX),
     );
     (plan.size_in_pixels, plan.pixels_per_point)
 }

@@ -1,5 +1,5 @@
 use crate::channels::{Level3Response, OverlayRenderResponse, ScanData, ScanResponse};
-use crate::constants::{LOOP_IMAGE_SIZE, MAX_CONCURRENT_RENDERS};
+use crate::constants::LOOP_IMAGE_SIZE;
 use crate::render_dispatch::RenderGuard;
 use chrono::NaiveDateTime;
 use chrono::TimeZone;
@@ -1375,7 +1375,7 @@ impl super::App {
     ) -> bool {
         // Check concurrent render limit (the counter is shared with static pane renders)
         let current = self.render.renders_in_flight.load(Ordering::Relaxed);
-        if current >= MAX_CONCURRENT_RENDERS {
+        if current >= self.render.concurrent_renders() {
             return false;
         }
         self.render
@@ -1763,7 +1763,7 @@ impl super::App {
             site_lon: lon,
         } = req;
         let current = self.render.renders_in_flight.load(Ordering::Relaxed);
-        if current >= MAX_CONCURRENT_RENDERS {
+        if current >= self.render.concurrent_renders() {
             return SectionDispatch::Busy;
         }
 

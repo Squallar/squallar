@@ -1,7 +1,6 @@
 use crate::constants::{
-    DEFAULT_LOOP_SPEED_FPS, MAX_CONCURRENT_LOOP_DOWNLOADS, MAX_CONCURRENT_RENDERS, MAX_LOOP_FRAMES,
-    MAX_LOOP_SECTION_CUTS_PER_FRAME, MAX_LOOP_SPEED_FPS, MAX_LOOP_VOLUME_BUILDS_PER_FRAME,
-    MIN_LOOP_SPEED_FPS, VOLUME_LOOP_TEXTURE_BUDGET_BYTES,
+    DEFAULT_LOOP_SPEED_FPS, MAX_LOOP_SECTION_CUTS_PER_FRAME, MAX_LOOP_SPEED_FPS,
+    MAX_LOOP_VOLUME_BUILDS_PER_FRAME, MIN_LOOP_SPEED_FPS,
 };
 use crate::loop_downloads::{
     FramePlan, L3FrameState, LoopFrameData, PendingDownloads, PendingL3Pairings,
@@ -276,14 +275,14 @@ impl super::App {
         //
         // What it is held to is the loop pool's own answer — one share per
         // *distinct* 3D loop, which is what stops two panes on one volume being
-        // charged twice — floored at `VOLUME_LOOP_TEXTURE_BUDGET_BYTES` so a
+        // charged twice — floored at `Budgets::volume_loop_bytes` so a
         // session with no 3D loop at all still has room for the live grids the
         // store holds for ordinary 3D panes. A bound of zero there would evict
         // a live volume every frame and rebuild it every frame.
         let volume_budget = self
             .loop_allocation()
             .volume_reserve_bytes()
-            .max(VOLUME_LOOP_TEXTURE_BUDGET_BYTES);
+            .max(self.budgets.volume_loop_bytes());
         let evicted = self.volume_store.enforce_budget(volume_budget);
         if evicted > 0 {
             log::info!(
@@ -1951,6 +1950,7 @@ impl super::App {
                 points,
                 crate::egui_renderer::MirrorLimits::for_device(
                     state.device.limits().max_texture_dimension_2d,
+                    self.budgets.mirror_bytes,
                 ),
             );
             let format = state.egui_renderer.attachment_config().color_format;
@@ -2078,6 +2078,7 @@ impl super::App {
     /// and kicks off downloads for each scan (throttled).
     fn poll_loop_scan_list_results(&mut self) {
         let allocation = self.loop_allocation();
+        let budgets = self.budgets;
         while let Ok(resp) = self.channels.loop_scan_list_receiver.try_recv() {
             let Some(pane) = self.gui.pane_mut(resp.pane_idx) else {
                 continue;
@@ -2086,9 +2087,13 @@ impl super::App {
             // list, is decided in one place — including refusing a listing for a
             // site the pane's loop has since moved off.
             let product = pane.selected_product;
-            let Some(plan) =
-                accept_scan_listing(allocation, &mut pane.loop_state, &resp.site, resp.scans)
-            else {
+            let Some(plan) = accept_scan_listing(
+                allocation,
+                &budgets,
+                &mut pane.loop_state,
+                &resp.site,
+                resp.scans,
+            ) else {
                 continue;
             };
             log::info!(
@@ -2233,7 +2238,9 @@ impl super::App {
             }
         }
 
-        let slots = self.loop_mgr.available_slots(MAX_CONCURRENT_LOOP_DOWNLOADS);
+        let slots = self
+            .loop_mgr
+            .available_slots(self.budgets.concurrent_loop_downloads);
         let mut batch = Vec::new();
         let mut retained = VecDeque::with_capacity(queue.len());
         for (ts, code) in queue {
@@ -2294,7 +2301,9 @@ impl super::App {
 
     /// Dispatch pending loop scan downloads up to the concurrency limit.
     fn dispatch_pending_loop_downloads(&mut self, pane_idx: usize) {
-        let slots = self.loop_mgr.available_slots(MAX_CONCURRENT_LOOP_DOWNLOADS);
+        let slots = self
+            .loop_mgr
+            .available_slots(self.budgets.concurrent_loop_downloads);
         if slots == 0 {
             return;
         }
@@ -2688,8 +2697,11 @@ impl super::App {
     /// up.
     pub(super) fn observe_loop_demand(&mut self) -> LoopAllocation {
         let demand = self.loop_demand();
-        self.loop_pool_state
-            .observe(self.loop_pool, LoopFrameModel::for_target(), demand)
+        self.loop_pool_state.observe(
+            self.loop_pool,
+            LoopFrameModel::from_budgets(&self.budgets),
+            demand,
+        )
     }
 
     /// The allocation in force. See [`Self::observe_loop_demand`].
@@ -3259,7 +3271,7 @@ impl super::App {
         for req in to_render {
             // Check concurrent render limit before each spawn (shared with static pane renders)
             let current = self.render.renders_in_flight.load(Ordering::Relaxed);
-            if current >= MAX_CONCURRENT_RENDERS {
+            if current >= self.render.concurrent_renders() {
                 break;
             }
 
@@ -3297,7 +3309,9 @@ impl super::App {
         // renders, the frame is marked in flight only if a job was actually
         // started, and missing data is a skipped frame the next pass retries.
         for req in to_cut {
-            if self.render.renders_in_flight.load(Ordering::Relaxed) >= MAX_CONCURRENT_RENDERS {
+            if self.render.renders_in_flight.load(Ordering::Relaxed)
+                >= self.render.concurrent_renders()
+            {
                 break;
             }
             let Some(LoopFrameData::Volume(scan, declared)) =
@@ -3641,6 +3655,7 @@ fn section_source_refusal(
 /// [`crate::loop_downloads::LoopDownloadManager::plan_downloads_for`].
 fn accept_scan_listing(
     allocation: LoopAllocation,
+    budgets: &crate::budget::Budgets,
     ls: &mut rustdar_egui::pane::LoopPlaybackState,
     site: &str,
     scans: Vec<(chrono::NaiveDateTime, rustdar_radar::archive::Identifier)>,
@@ -3663,7 +3678,7 @@ fn accept_scan_listing(
     // Cap the downloads by evenly sampling the listing. A 3D loop's cap is its
     // *resident* one and is far lower, because for that kind the frame list and
     // the resident set are one thing — see `loop_frames_held`.
-    let held = loop_frames_held(allocation, ls.view);
+    let held = loop_frames_held(allocation, ls.view, budgets);
     let scans = if scans.len() > held {
         let total = scans.len();
         let sampled: Vec<_> = (0..held)
@@ -4161,14 +4176,26 @@ fn frame_section(
 /// this and reads unchanged; a test that is about division builds its own.
 #[cfg(test)]
 pub(crate) fn test_loop_allocation() -> LoopAllocation {
-    let limits = crate::loop_pool::LoopPoolLimits::for_target();
-    crate::loop_pool::LoopPool::new(limits.floor, limits)
-        .plan(LoopFrameModel::for_target(), LoopDemand::default())
+    let budgets = test_budgets();
+    let limits = crate::loop_pool::LoopPoolLimits::from_budgets(&budgets);
+    crate::loop_pool::LoopPool::new(limits.floor, limits).plan(
+        LoopFrameModel::from_budgets(&budgets),
+        LoopDemand::default(),
+    )
+}
+
+/// This build's own budgets, for the tests that take them as an argument.
+///
+/// The same resolution `App::with_instance` performs, so a test and the
+/// application it stands in for spend the same figures.
+#[cfg(test)]
+pub(crate) fn test_budgets() -> crate::budget::Budgets {
+    crate::budget::resolve(&crate::budget::DeviceProfile::for_target())
 }
 
 /// Frames a loop of this view **holds**.
 ///
-/// [`MAX_LOOP_FRAMES`] for the two raster kinds, which hold more than they
+/// `Budgets::loop_frames_held` for the two raster kinds, which hold more than they
 /// texture and re-render as the playhead walks — a held frame is scan data and
 /// a timestamp, not a texture, so it is not what the loop pool is spent on and
 /// it does not shrink when a pane arrives.
@@ -4179,11 +4206,15 @@ pub(crate) fn test_loop_allocation() -> LoopAllocation {
 /// `crate::loop_pool::LoopAllocation`.
 ///
 /// Exhaustive, like every other classification by view in this workspace.
-fn loop_frames_held(allocation: LoopAllocation, view: rustdar_radar::types::RenderView) -> usize {
+fn loop_frames_held(
+    allocation: LoopAllocation,
+    view: rustdar_radar::types::RenderView,
+    budgets: &crate::budget::Budgets,
+) -> usize {
     match view {
         rustdar_radar::types::RenderView::Volume => allocation.volume_frames,
         rustdar_radar::types::RenderView::PlanView
-        | rustdar_radar::types::RenderView::CrossSection => MAX_LOOP_FRAMES,
+        | rustdar_radar::types::RenderView::CrossSection => budgets.loop_frames_held,
     }
 }
 

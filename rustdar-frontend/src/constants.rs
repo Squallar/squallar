@@ -218,10 +218,23 @@ pub const MAX_LOOP_RENDER_BUDGET: usize = MOBILE_MAX_LOOP_RENDER_BUDGET;
 pub const MAX_LOOP_RENDER_BUDGET: usize = DESKTOP_MAX_LOOP_RENDER_BUDGET;
 
 /// Maximum number of concurrent loop scan downloads per pane.
+///
+/// The arms are named outside the cascade for the reason
+/// [`WASM_VOLUME_GRID_CELLS`] gives, and because `crate::budget::BudgetLimits`
+/// has to be able to reach both from one host build. A two-arm `mobile` /
+/// `not(mobile)` cascade has no `target_arch` arm, so a host build already
+/// picks between the same two values a phone build would — but it picks *one*,
+/// and the bracket names both.
 #[cfg(mobile)]
-pub const MAX_CONCURRENT_LOOP_DOWNLOADS: usize = 4;
+pub const MAX_CONCURRENT_LOOP_DOWNLOADS: usize = MOBILE_MAX_CONCURRENT_LOOP_DOWNLOADS;
+/// See the `mobile` arm above.
 #[cfg(not(mobile))]
-pub const MAX_CONCURRENT_LOOP_DOWNLOADS: usize = 8;
+pub const MAX_CONCURRENT_LOOP_DOWNLOADS: usize = NON_MOBILE_MAX_CONCURRENT_LOOP_DOWNLOADS;
+
+/// The `mobile` arm of [`MAX_CONCURRENT_LOOP_DOWNLOADS`].
+pub const MOBILE_MAX_CONCURRENT_LOOP_DOWNLOADS: usize = 4;
+/// Every other target's arm. See [`MAX_CONCURRENT_LOOP_DOWNLOADS`].
+pub const NON_MOBILE_MAX_CONCURRENT_LOOP_DOWNLOADS: usize = 8;
 
 /// Maximum total number of loop frames kept per pane.
 /// Limits combined memory from textures and scan data.
@@ -1058,10 +1071,19 @@ pub const TILE_BYTES_BUDGET_PER_SOURCE_BYTES: usize =
 /// what it gives back is the 256 MiB of headroom that 6 entries would have
 /// spent on switching back and forth — on the class with the least host memory
 /// and, at 4096, the largest entries. Desktop keeps 8 against 6 panes.
+///
+/// Named outside the cascade for the reason [`MAX_CONCURRENT_LOOP_DOWNLOADS`]
+/// gives.
 #[cfg(mobile)]
-pub const MAX_RENDER_CACHE_ENTRIES: usize = 4;
+pub const MAX_RENDER_CACHE_ENTRIES: usize = MOBILE_MAX_RENDER_CACHE_ENTRIES;
+/// See the `mobile` arm above.
 #[cfg(not(mobile))]
-pub const MAX_RENDER_CACHE_ENTRIES: usize = 8;
+pub const MAX_RENDER_CACHE_ENTRIES: usize = NON_MOBILE_MAX_RENDER_CACHE_ENTRIES;
+
+/// The `mobile` arm of [`MAX_RENDER_CACHE_ENTRIES`].
+pub const MOBILE_MAX_RENDER_CACHE_ENTRIES: usize = 4;
+/// Every other target's arm. See [`MAX_RENDER_CACHE_ENTRIES`].
+pub const NON_MOBILE_MAX_RENDER_CACHE_ENTRIES: usize = 8;
 
 /// The per-device-class voxel grid dimensions, named **outside** the `cfg`
 /// cascade so that all three are reachable from any target's tests.
@@ -1167,7 +1189,20 @@ const fn shape_of(cells: [u32; 3]) -> rustdar_radar::voxel::VoxelShape {
 /// keeps this tied to the shapes `rustdar-radar` names and a drift fails by
 /// name rather than by a mismatched allocation at runtime.
 pub const fn volume_grid_shape(max_axis: u32) -> rustdar_radar::voxel::VoxelShape {
-    rustdar_radar::voxel::shape_for_budget(shape_of(VOLUME_GRID_CELLS), max_axis as usize)
+    volume_grid_shape_of(VOLUME_GRID_CELLS, max_axis)
+}
+
+/// [`volume_grid_shape`], for a cell budget that is not this target's own.
+///
+/// The same selection with the budget as an argument, so `crate::budget` can
+/// ask it for any resolved [`Budgets::grid_cells`](crate::budget::Budgets)
+/// rather than only for the arm this build compiled — which is the whole reason
+/// the arms have names.
+pub const fn volume_grid_shape_of(
+    cells: [u32; 3],
+    max_axis: u32,
+) -> rustdar_radar::voxel::VoxelShape {
+    rustdar_radar::voxel::shape_for_budget(shape_of(cells), max_axis as usize)
 }
 
 /// The grid this target builds on a device reporting exactly the guarantee —

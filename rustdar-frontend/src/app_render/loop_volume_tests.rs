@@ -23,6 +23,7 @@
 
 use super::*;
 use crate::app::tests::{empty_scan, headless};
+use crate::constants::MAX_LOOP_FRAMES;
 use crate::loop_downloads::LoopDownloadManager;
 use crate::platform_double::TestBridge;
 use crate::volume::bridge::VolumeEntry;
@@ -465,7 +466,13 @@ fn the_scan_listing_is_sampled_to_the_resident_frame_count() {
          sampling below is not exercised",
     );
 
-    accept_scan_listing(test_loop_allocation(), &mut ls, SITE, listing.clone());
+    accept_scan_listing(
+        test_loop_allocation(),
+        &test_budgets(),
+        &mut ls,
+        SITE,
+        listing.clone(),
+    );
     assert_eq!(
         ls.frames.len(),
         test_loop_allocation().volume_frames,
@@ -477,7 +484,13 @@ fn the_scan_listing_is_sampled_to_the_resident_frame_count() {
     // about the view rather than about the cap having moved for everyone.
     let mut plan = LoopPlaybackState::new_for_loop(3600, &site(), RenderView::PlanView);
     plan.phase = LoopPhase::Rendering;
-    accept_scan_listing(test_loop_allocation(), &mut plan, SITE, listing);
+    accept_scan_listing(
+        test_loop_allocation(),
+        &test_budgets(),
+        &mut plan,
+        SITE,
+        listing,
+    );
     assert_eq!(plan.frames.len(), MAX_LOOP_FRAMES);
 }
 

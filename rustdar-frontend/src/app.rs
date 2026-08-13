@@ -220,6 +220,22 @@ pub struct App {
     /// the reason `crate::volume::degrade`'s counters are module statics: a lost
     /// surface sets `self.state = None`, and a pool that backed off *because* of
     /// a lost surface would be destroyed by the event it just learned from.
+    /// Every per-target number this build spends, resolved once from a
+    /// [`crate::budget::DeviceProfile`] and threaded from here.
+    ///
+    /// On `App` rather than on `AppState` for the reason
+    /// [`Self::loop_pool`] is: a lost surface sets `self.state = None`, and a
+    /// budget set destroyed by that event would have to be re-resolved on a
+    /// path that also handles a device the app has just been refused by.
+    ///
+    /// It is resolved from `DeviceProfile::for_target()` — every runtime field
+    /// at its most conservative reading — which is exactly what the `cfg`
+    /// constants said. Handing this constructor a profile built from the
+    /// adapter is the whole of what makes the application device-aware, and it
+    /// is deliberately not done here: promoting a field off its bracket floor
+    /// changes what a real machine allocates, and that has to be argued on its
+    /// own rather than ridden in on a refactor.
+    budgets: crate::budget::Budgets,
     loop_pool: crate::loop_pool::LoopPool,
     /// See [`Self::loop_pool`].
     loop_pool_state: crate::loop_pool::LoopPoolState,
@@ -792,7 +808,12 @@ impl App {
         let channels = ChannelHub::new();
         // Owns the single shared render-budget counter used by both the loop and
         // static pane render paths (see `RenderDispatcher::renders_in_flight`).
-        let render = RenderDispatcher::new();
+        // Resolved once, here, and threaded from this point on. Every field
+        // is this build's own bracket floor, which is the `cfg` constant it
+        // replaces — see `crate::budget`, where the reproduction is asserted
+        // field for field rather than claimed.
+        let budgets = crate::budget::resolve(&crate::budget::DeviceProfile::for_target());
+        let render = RenderDispatcher::with_budgets(&budgets);
 
         #[cfg(not(target_arch = "wasm32"))]
         let tokio_runtime = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
@@ -810,9 +831,9 @@ impl App {
         let mut gui = Gui::new();
         gui.set_supports_exit(platform.supports_exit());
         // This build's loop frame cap, so the timeline's caption states the
-        // platform's real budget — the constant lives in this crate and the
+        // platform's real budget — the budget lives in this crate and the
         // UI crate cannot see it.
-        gui.set_loop_frame_budget(crate::constants::MAX_LOOP_FRAMES);
+        gui.set_loop_frame_budget(budgets.loop_frames_held);
         // Once, here, and not at the gate's cadence: whether a platform has a
         // location settings page is a property of the build. The permission it
         // sits beside changes; this does not.
@@ -889,7 +910,7 @@ impl App {
         // a user already watching one. The adapter's own say is folded in later
         // by `LoopPool::for_device`, which runs once the renderer is built and
         // only when nothing was remembered.
-        let loop_pool_limits = crate::loop_pool::LoopPoolLimits::for_target();
+        let loop_pool_limits = crate::loop_pool::LoopPoolLimits::from_budgets(&budgets);
         let loop_pool_memo =
             crate::loop_pool::remembered(platform.config_store().as_deref(), loop_pool_limits);
         let loop_pool = crate::loop_pool::LoopPool::new(
@@ -904,10 +925,11 @@ impl App {
             gui,
             volume_painter: None,
             mirror_rungs: crate::egui_renderer::MirrorRungs::default(),
+            budgets,
             loop_pool,
             loop_pool_state: crate::loop_pool::LoopPoolState::new(
                 loop_pool,
-                crate::loop_pool::LoopFrameModel::for_target(),
+                crate::loop_pool::LoopFrameModel::from_budgets(&budgets),
             ),
             loop_pool_sized: loop_pool_memo.is_some(),
             scan_data: std::collections::HashMap::new(),
@@ -987,6 +1009,7 @@ impl App {
     /// Create surface and initialize AppState for a given window and dimensions.
     async fn initialize_rendering_state(
         instance: &wgpu::Instance,
+        budgets: crate::budget::Budgets,
         window: &WindowRef,
         width: u32,
         height: u32,
@@ -995,7 +1018,7 @@ impl App {
             .create_surface(window.clone())
             .expect("Failed to create surface!");
 
-        app_state::AppState::new(instance, surface, window, width, height).await
+        app_state::AppState::new(instance, &budgets, surface, window, width, height).await
     }
 
     fn handle_resized(&mut self, width: u32, height: u32) {
@@ -1253,6 +1276,7 @@ impl App {
                 let size = window.inner_size();
                 pollster::block_on(Self::initialize_rendering_state(
                     &self.instance,
+                    self.budgets,
                     window,
                     size.width.max(1),
                     size.height.max(1),
@@ -1313,10 +1337,15 @@ impl App {
         self.pending_state = Some(rx);
 
         let instance = self.instance.clone();
+        // Copied into the future rather than reached for through `self`: the
+        // browser arm builds the device on a spawned task, and `Budgets` is
+        // `Copy` precisely so a seam like this costs nothing.
+        let budgets = self.budgets;
         let redraw_target = self.window.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let state = Self::initialize_rendering_state(
                 &instance,
+                budgets,
                 &window,
                 size.width.max(1),
                 size.height.max(1),
@@ -1366,7 +1395,7 @@ impl App {
             self.loop_pool = crate::loop_pool::LoopPool::for_device(
                 class,
                 None,
-                crate::loop_pool::LoopPoolLimits::for_target(),
+                crate::loop_pool::LoopPoolLimits::from_budgets(&self.budgets),
             );
             log::info!(
                 "Loop pool: {} MiB for a {class:?} adapter",
@@ -1381,7 +1410,7 @@ impl App {
         // The one production call site of `quality::select`, and the reason its
         // `Virtual`/`Unknown` arms matter: that is what a browser reports for
         // every adapter it exposes, so the web build takes them on every device.
-        let quality = quality::select(class, quality::PLATFORM_CEILING);
+        let quality = quality::select(class, self.budgets.quality_ceiling);
 
         // Nothing is built on a device that cannot render a volume — the
         // pipelines would compile a shader against limits already known to be
@@ -1405,6 +1434,7 @@ impl App {
         let painter = std::sync::Arc::new(crate::volume::bridge::BridgeVolumePainter::new(
             self.volume_store.clone(),
             quality,
+            self.budgets.offscreen_bytes,
             state.volume_support.clone(),
         ));
         self.volume_painter = Some(painter.clone());

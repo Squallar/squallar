@@ -8,8 +8,8 @@ use rustdar_radar::srm::StormMotionSample;
 use rustdar_radar::types::{RadarProduct, RenderView};
 
 use crate::WindowRef;
+use crate::budget::Budgets;
 use crate::channels::RenderResponse;
-use crate::constants::{MAX_CONCURRENT_RENDERS, MAX_RENDER_CACHE_ENTRIES};
 
 /// Drop guard that decrements an AtomicUsize counter on drop.
 /// Guarantees the counter is decremented even if the thread panics.
@@ -486,7 +486,7 @@ pub struct RenderDispatcher {
     pub fetch_generations: HashMap<String, u64>,
     /// Shared counter for concurrent background render threads.
     ///
-    /// This is the single source of truth for the `MAX_CONCURRENT_RENDERS` budget and is
+    /// This is the single source of truth for the concurrent-render budget and is
     /// shared by *both* render paths: static pane renders (`spawn_render` below) and loop
     /// frame renders (`App::spawn_loop_frame_render` / `App::dispatch_loop_renders`).
     /// Never introduce a second counter — two independent counters would each enforce the
@@ -515,6 +515,10 @@ pub struct RenderDispatcher {
     /// returns before `dispatch_pane_renders` while `state` is `None` — so
     /// what actually observes the default is this crate's tests, and the base
     /// size is what they were written against.
+    /// Background radar renders that may be in flight at once — this build's
+    /// `Budgets::concurrent_renders`, held rather than read from a `cfg`
+    /// constant. See [`RenderDispatcher::with_budgets`].
+    concurrent_renders: usize,
     long_range_raster_ok: bool,
     /// The storm motion override the storm-relative renders on screen were
     /// built with. Nothing else about a pane changes when the user edits the
@@ -544,7 +548,7 @@ pub struct RenderDispatcher {
     /// never per drag frame. The rubber band is drawn locally with no render at
     /// all, so the payload is built when a line is finished and not while it is
     /// being aimed. That matters most exactly where this cache helps least —
-    /// wasm, where `MAX_CONCURRENT_RENDERS` is 1 with no preemption, so a
+    /// wasm, where the concurrent-render budget is 1 with no preemption, so a
     /// per-frame dispatch would not merely be wasteful but would queue behind
     /// itself.
     section_input: Option<SectionInput>,
@@ -723,7 +727,25 @@ impl Default for RenderDispatcher {
 }
 
 impl RenderDispatcher {
+    /// A dispatcher for this build's own budgets.
+    ///
+    /// The convenience arm over [`with_budgets`](Self::with_budgets), for the
+    /// tests that are about invalidation rather than about capacity. The
+    /// application takes the other one, so the two numbers this struct spends
+    /// arrive from the same resolved `Budgets` everything else reads.
     pub fn new() -> Self {
+        Self::with_budgets(&crate::budget::resolve(
+            &crate::budget::DeviceProfile::for_target(),
+        ))
+    }
+
+    /// A dispatcher holding the concurrency and cache budgets it is handed.
+    ///
+    /// Handed rather than read from a `cfg` constant, for the reason
+    /// `volume::quality::select` and `LoopPool::for_device` take theirs as
+    /// parameters: this workspace runs `cargo test` on exactly one of three
+    /// arms, and a budget read inline is a budget checkable on one row.
+    pub fn with_budgets(budgets: &Budgets) -> Self {
         Self {
             pane_render: vec![PaneRenderState::new()],
             level3_data: HashMap::new(),
@@ -733,11 +755,21 @@ impl RenderDispatcher {
             fetch_generations: HashMap::new(),
             // Owned here so there is exactly one render budget counter in the process.
             renders_in_flight: Arc::new(AtomicUsize::new(0)),
-            render_cache: RenderCache::new(MAX_RENDER_CACHE_ENTRIES),
+            render_cache: RenderCache::new(budgets.render_cache_entries),
+            concurrent_renders: budgets.concurrent_renders,
             long_range_raster_ok: false,
             last_storm_motion_override: None,
             section_input: None,
         }
+    }
+
+    /// Background radar renders that may be in flight at once.
+    ///
+    /// The single budget both the loop and the static pane paths spend, so the
+    /// two call sites outside this module read it from here rather than each
+    /// naming a constant.
+    pub fn concurrent_renders(&self) -> usize {
+        self.concurrent_renders
     }
 
     /// Record what the device that has just been created can hold. See
@@ -1456,7 +1488,7 @@ impl RenderDispatcher {
     /// as long as the budget stays full. Measured on this volume corpus at
     /// 0.1–1.0 ms a pane for a single tilt and 0.7–2.4 ms for a four-pane split
     /// of storm-relative velocity, *per frame*. It matters most on wasm, where
-    /// [`MAX_CONCURRENT_RENDERS`] is 1 and so any second render at all is a
+    /// The web arm's budget is 1 and so any second render at all is a
     /// starved frame for as long as the first one runs.
     ///
     /// This is the shape [`spawn_section_render`](Self::spawn_section_render)
@@ -1612,7 +1644,7 @@ impl RenderDispatcher {
         if pane_idx >= self.pane_render.len() {
             return SectionDispatch::Busy;
         }
-        if self.renders_in_flight.load(Ordering::Relaxed) >= MAX_CONCURRENT_RENDERS {
+        if self.renders_in_flight.load(Ordering::Relaxed) >= self.concurrent_renders {
             return SectionDispatch::Busy;
         }
 
@@ -1710,7 +1742,7 @@ impl RenderDispatcher {
     /// cannot turn stale (workers only ever *free* slots), and a `false` costs
     /// a frame's retry exactly as the spawn's own refusal does.
     pub fn render_slot_free(&self) -> bool {
-        self.renders_in_flight.load(Ordering::Relaxed) < MAX_CONCURRENT_RENDERS
+        self.renders_in_flight.load(Ordering::Relaxed) < self.concurrent_renders
     }
 
     /// Resample a volume into a voxel grid, away from the frame thread.
@@ -1732,7 +1764,7 @@ impl RenderDispatcher {
         sender: std::sync::mpsc::Sender<crate::channels::VoxelResponse>,
         window: Option<WindowRef>,
     ) -> bool {
-        if self.renders_in_flight.load(Ordering::Relaxed) >= MAX_CONCURRENT_RENDERS {
+        if self.renders_in_flight.load(Ordering::Relaxed) >= self.concurrent_renders {
             return false;
         }
         self.renders_in_flight.fetch_add(1, Ordering::Relaxed);
@@ -1797,7 +1829,7 @@ impl RenderDispatcher {
     ) {
         // Check concurrent render limit
         let current = self.renders_in_flight.load(Ordering::Relaxed);
-        if current >= MAX_CONCURRENT_RENDERS {
+        if current >= self.concurrent_renders {
             return;
         }
         self.renders_in_flight.fetch_add(1, Ordering::Relaxed);

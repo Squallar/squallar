@@ -145,15 +145,31 @@ fn the_fit_cannot_loop_forever() {
     assert!(plan.size_in_pixels[0] >= 1 && plan.size_in_pixels[1] >= 1);
 }
 
-/// `for_device` never trusts a device below the guarantee.
+/// `for_device` never trusts a device below the guarantee, and it spends the
+/// byte budget it was handed rather than one of its own.
 #[test]
 fn the_device_side_cap_is_floored_at_the_guarantee_and_raised_above_it() {
-    assert_eq!(MirrorLimits::for_device(512).max_side, MIRROR_MAX_SIDE);
-    assert_eq!(MirrorLimits::for_device(16384).max_side, 16384);
+    let budget = crate::constants::VOLUME_MIRROR_BYTES_MAX;
     assert_eq!(
-        MirrorLimits::for_device(8192).max_bytes,
-        crate::constants::VOLUME_MIRROR_BYTES_MAX,
+        MirrorLimits::for_device(512, budget).max_side,
+        MIRROR_MAX_SIDE
     );
+    assert_eq!(MirrorLimits::for_device(16384, budget).max_side, 16384);
+    // The other half of the pair is the caller's decision, not this
+    // function's: it passes straight through, on every arm rather than on the
+    // one this build compiled.
+    for arm in crate::budget::BudgetLimits::SHIPPED {
+        let budgets = crate::budget::resolve(&crate::budget::DeviceProfile {
+            limits: arm,
+            ..crate::budget::DeviceProfile::for_target()
+        });
+        assert_eq!(
+            MirrorLimits::for_device(8192, budgets.mirror_bytes).max_bytes,
+            budgets.mirror_bytes,
+            "{}",
+            budgets.name,
+        );
+    }
 }
 
 /// A camera parked exactly on a rung boundary does not oscillate.

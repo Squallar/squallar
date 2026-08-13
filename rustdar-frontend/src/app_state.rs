@@ -149,6 +149,10 @@ pub struct AppState {
 impl AppState {
     pub async fn new(
         instance: &wgpu::Instance,
+        // The resolved budgets, so the long-range gate below compares the
+        // device against the figure the rest of the application is spending
+        // rather than against a `cfg` constant read here.
+        budgets: &crate::budget::Budgets,
         surface: wgpu::Surface<'static>,
         // The `Arc`, not a bare `&Window`: `EguiRenderer::new` keeps a handle
         // so egui's own repaint requests can reach the event loop — see
@@ -227,13 +231,13 @@ impl AppState {
         // The same figure, asked a different question: can a plan view of a
         // long-reaching sweep become a texture on this machine at all?
         let long_range_raster_ok =
-            max_surface_dimension as usize >= crate::constants::LONG_RANGE_IMAGE_SIZE;
+            max_surface_dimension as usize >= budgets.long_range_image_side_px;
         if !long_range_raster_ok {
             log::info!(
                 "long-range plan views degrade to {} px: this device's 2D textures stop at \
                  {max_surface_dimension} px, under the {} px a long-range raster needs",
-                rustdar_radar::types::IMAGE_SIZE,
-                crate::constants::LONG_RANGE_IMAGE_SIZE,
+                budgets.image_side_px,
+                budgets.long_range_image_side_px,
             );
         }
 
