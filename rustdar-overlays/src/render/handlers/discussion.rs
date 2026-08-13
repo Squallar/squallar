@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::fetch_policy::{FetchError, FetchRetry};
+use crate::fetch_policy::{FetchError, FetchRetry, Whole};
 use crate::render::controls::{
     ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext,
     PaneControlContextMut,
@@ -15,6 +15,15 @@ use crate::spc::discussion::SpcDiscussion;
 use crate::types::{GeoBounds, OverlayLabel};
 
 pub(crate) struct SpcDiscussionFetchResult(pub Result<Vec<SpcDiscussion>, FetchError>);
+/// [`Whole`]: one GET of the SPC mesoscale-discussion RSS feed, parsed in one
+/// pass. Every discussion the layer draws came out of that single document, so
+/// there is no second request to lose and nothing a coverage report could hold
+/// that the `Err` arm does not already say.
+///
+/// [`Whole`]: crate::fetch_policy::Whole
+impl crate::fetch_policy::FetchRound for SpcDiscussionFetchResult {
+    type Shape = crate::fetch_policy::Whole;
+}
 
 #[derive(Debug)]
 pub(crate) struct DiscussionItem {
@@ -81,7 +90,7 @@ impl OverlayItem for DiscussionItem {
 }
 
 pub(crate) struct SpcDiscussionHandler {
-    pub state: OverlayState<Vec<Arc<DiscussionItem>>>,
+    pub state: OverlayState<Vec<Arc<DiscussionItem>>, Whole>,
     pub enabled: bool,
     /// The "MD 1234" map labels, rebuilt whenever `state.data` is — never per
     /// frame. Each one used to be derived inside `clickable_items`: two full
@@ -225,7 +234,10 @@ impl OverlayHandler for SpcDiscussionHandler {
     }
 
     fn apply_fetch_result(&mut self, result: FetchPayload) {
-        let Some(fetch) = result.downcast::<SpcDiscussionFetchResult>().ok() else {
+        let Some(fetch) = self
+            .state
+            .downcast_round::<SpcDiscussionFetchResult>(result)
+        else {
             log::error!("SPC discussion handler received unexpected fetch result type");
             return;
         };

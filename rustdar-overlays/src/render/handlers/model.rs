@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::fetch_policy::Whole;
 use crate::hrrr::{HrrrFetchResult, HrrrGridData, ModelParameter};
 use crate::render::controls::{
     ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext,
@@ -14,7 +15,7 @@ use crate::render::rasterize::{self, RasterizeOutput};
 use crate::types::GeoBounds;
 
 pub(crate) struct ModelDataHandler {
-    pub state: OverlayState<Option<Arc<HrrrGridData>>>,
+    pub state: OverlayState<Option<Arc<HrrrGridData>>, Whole>,
     pub enabled: bool,
     pub selected_param: ModelParameter,
     /// Keyed per parameter so different panes can show different ones.
@@ -111,7 +112,7 @@ impl OverlayHandler for ModelDataHandler {
     }
 
     fn apply_fetch_result(&mut self, result: FetchPayload) {
-        let Some(fetch) = result.downcast::<HrrrFetchResult>().ok() else {
+        let Some(fetch) = self.state.downcast_round::<HrrrFetchResult>(result) else {
             log::error!("ModelData handler received unexpected fetch result type");
             return;
         };

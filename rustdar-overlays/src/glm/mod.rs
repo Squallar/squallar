@@ -231,3 +231,21 @@ pub struct GlmFetchOutcome {
 /// recorded every GLM failure as `Transient` — which at a 20 s interval is 180
 /// attempts an hour against a bucket that may have been renamed a year ago.
 pub struct GlmFetchResult(pub Result<GlmFetchOutcome, crate::fetch_policy::FetchError>);
+
+/// [`Assembled`]: two satellite listings and a request per granule, and
+/// [`GlmFetchOutcome`] above carries five separate lists of what did not come
+/// back.
+///
+/// Declared here, next to those lists, because this is the layer that proves a
+/// declaration made anywhere else does not hold. The first fix wired
+/// `listing_failures` alone; `dead_feeds`, `transport_failures`,
+/// `parse_failures` and `level_failures` stayed silent through that review and
+/// a green suite, and were caught only by driving the round over a socket with
+/// both listings answering 200 and every granule answering 503 — **0 flashes,
+/// `is_complete()` true, no mark.** What this line buys is that the handler for
+/// this round has no `set_data` to go back to.
+///
+/// [`Assembled`]: crate::fetch_policy::Assembled
+impl crate::fetch_policy::FetchRound for GlmFetchResult {
+    type Shape = crate::fetch_policy::Assembled;
+}

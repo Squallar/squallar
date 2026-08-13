@@ -2,6 +2,7 @@ use std::any::Any;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::fetch_policy::Assembled;
 use crate::nws::alert::{AlertCategory, NwsAlert};
 use crate::render::controls::{
     ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext,
@@ -18,6 +19,19 @@ use crate::types::GeoBounds;
 pub(crate) struct NwsAlertFetchResult(
     pub Result<crate::nws::fetch::ActiveAlerts, crate::fetch_policy::FetchError>,
 );
+/// [`Assembled`]: the national alert feed is one request, and the UGC zone
+/// boundaries most alerts reference instead of carrying geometry are one
+/// request **each** — a thousand or more on a busy day, any of which can fail
+/// on its own. `ActiveAlerts::zones` is the report of what that pass managed,
+/// and the layer holding this round has no `set_data` left to ignore it with.
+///
+/// Observed before it did: **212 of 297 warnings absent from the map under a
+/// fully green status line.**
+///
+/// [`Assembled`]: crate::fetch_policy::Assembled
+impl crate::fetch_policy::FetchRound for NwsAlertFetchResult {
+    type Shape = crate::fetch_policy::Assembled;
+}
 
 #[derive(Debug)]
 pub(crate) struct AlertItem {
@@ -118,7 +132,7 @@ impl OverlayItem for AlertItem {
 }
 
 pub(crate) struct NwsAlertHandler {
-    pub state: OverlayState<Vec<Arc<AlertItem>>>,
+    pub state: OverlayState<Vec<Arc<AlertItem>>, Assembled>,
     /// User-dismissed alert IDs. Pruned on refetch so an ID reused upstream
     /// does not stay hidden forever.
     pub hidden_alerts: HashSet<String>,
@@ -372,7 +386,7 @@ impl OverlayHandler for NwsAlertHandler {
     }
 
     fn apply_fetch_result(&mut self, result: FetchPayload) {
-        let Some(fetch) = result.downcast::<NwsAlertFetchResult>().ok() else {
+        let Some(fetch) = self.state.downcast_round::<NwsAlertFetchResult>(result) else {
             log::error!("NWS alert handler received unexpected fetch result type");
             return;
         };

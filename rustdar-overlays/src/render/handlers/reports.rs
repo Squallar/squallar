@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use rustdar_units::UserPreferences;
 
+use crate::fetch_policy::Assembled;
 use crate::render::controls::{
     ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext,
     PaneControlContextMut,
@@ -18,6 +19,18 @@ use crate::types::GeoBounds;
 pub(crate) struct StormReportsFetchResult(
     pub Result<StormReportRound, crate::fetch_policy::FetchError>,
 );
+/// [`Assembled`]: three CSVs, one per report kind, fetched independently and
+/// refused as a round only when **all three** failed. One failing arrives here
+/// as `Ok` with a whole kind of report absent from the map.
+///
+/// Observed: the tornado CSV answering 503 took every tornado report in the
+/// country off the map, byte-for-byte indistinguishable from a quiet day on
+/// every user-visible surface.
+///
+/// [`Assembled`]: crate::fetch_policy::Assembled
+impl crate::fetch_policy::FetchRound for StormReportsFetchResult {
+    type Shape = crate::fetch_policy::Assembled;
+}
 
 #[derive(Debug)]
 pub(crate) struct StormReportItem {
@@ -136,7 +149,7 @@ impl OverlayItem for StormReportItem {
 }
 
 pub(crate) struct StormReportsHandler {
-    pub state: OverlayState<Vec<Arc<StormReportItem>>>,
+    pub state: OverlayState<Vec<Arc<StormReportItem>>, Assembled>,
     pub enabled: bool,
 }
 
@@ -219,7 +232,7 @@ impl OverlayHandler for StormReportsHandler {
     }
 
     fn apply_fetch_result(&mut self, result: FetchPayload) {
-        let Some(fetch) = result.downcast::<StormReportsFetchResult>().ok() else {
+        let Some(fetch) = self.state.downcast_round::<StormReportsFetchResult>(result) else {
             log::error!("Storm reports handler received unexpected fetch result type");
             return;
         };

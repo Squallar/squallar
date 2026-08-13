@@ -1118,6 +1118,22 @@ pub fn summarize_values(values: &[f32], param: ModelParameter) -> (usize, Option
 /// poll however permanently NOMADS had moved.
 pub struct HrrrFetchResult(pub Result<HrrrGridData, crate::fetch_policy::FetchError>);
 
+/// **[`Whole`], and the counter-example worth stating.**
+///
+/// This round asks NOMADS for two candidate model runs an hour apart and keeps
+/// whichever answers — so it is several requests, and it is still not
+/// assembled. Either run alone is the same product and a complete answer to the
+/// question the layer asked; a round that fell back to the older one has not
+/// left anything off the map, it has answered with an hour-old forecast and
+/// says so in its own valid time. Nothing is missing from what it drew, so
+/// there is nothing for a coverage report to hold, and a design that made this
+/// layer file one would be a design this layer got worked around.
+///
+/// [`Whole`]: crate::fetch_policy::Whole
+impl crate::fetch_policy::FetchRound for HrrrFetchResult {
+    type Shape = crate::fetch_policy::Whole;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

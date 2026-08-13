@@ -2,6 +2,7 @@ use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::fetch_policy::Assembled;
 use crate::render::controls::{
     ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext,
     PaneControlContextMut,
@@ -18,6 +19,19 @@ pub(crate) struct SpcOutlookFetchResult {
     pub day: OutlookDay,
     pub product: OutlookProduct,
     pub result: Result<SpcOutlook, crate::fetch_policy::FetchError>,
+}
+/// [`Assembled`], and the shape is the **round's**, not this struct's.
+///
+/// One of these is one product's answer; the layer's round is up to four of
+/// them in flight at once, and any can fail while its siblings draw. That is
+/// the assembled shape however few requests a single payload represents, and
+/// the state it lands in says so — see `SpcOutlookHandler::file_round_verdict`
+/// for where this layer writes its ledger, which is once per round rather than
+/// once per payload.
+///
+/// [`Assembled`]: crate::fetch_policy::Assembled
+impl crate::fetch_policy::FetchRound for SpcOutlookFetchResult {
+    type Shape = crate::fetch_policy::Assembled;
 }
 
 #[derive(Debug)]
@@ -123,7 +137,7 @@ enum RoundVerdict {
 }
 
 pub(crate) struct SpcOutlookHandler {
-    pub state: OverlayState<HashMap<(OutlookDay, OutlookProduct), SpcOutlook>>,
+    pub state: OverlayState<HashMap<(OutlookDay, OutlookProduct), SpcOutlook>, Assembled>,
     /// Per product, so one product's refetch does not invalidate the others.
     per_product_generation: HashMap<(OutlookDay, OutlookProduct), u64>,
     /// Bumped when day or product set changes without any fetch, which still
@@ -527,7 +541,7 @@ impl OverlayHandler for SpcOutlookHandler {
     }
 
     fn apply_fetch_result(&mut self, result: FetchPayload) {
-        let Some(fetch) = result.downcast::<SpcOutlookFetchResult>().ok() else {
+        let Some(fetch) = self.state.downcast_round::<SpcOutlookFetchResult>(result) else {
             log::error!("SPC outlook handler received unexpected fetch result type");
             return;
         };
