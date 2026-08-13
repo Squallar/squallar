@@ -3,8 +3,33 @@ use std::path::Path;
 use rustdar_radar::sources::DataSources;
 
 use super::alert::{NwsAlert, parse_alerts};
-use super::zones::resolve_zone_geometries;
+use super::zones::{ZoneResolution, resolve_zone_geometries};
 use crate::fetch_policy::{FetchError, NotFound};
+
+/// One round of the alerts endpoint: the alerts, and how much of their geometry
+/// was actually obtained.
+///
+/// The second field is the whole point of this type existing. The round is two
+/// stages — one request for the alert list, then one per referenced zone — and
+/// only the first was ever reported on. A `Vec<NwsAlert>` has nowhere to put
+/// "and 212 of these have no shape", so the handler had nothing to say and the
+/// layer read as healthy while most of it was missing from the map.
+pub struct ActiveAlerts {
+    pub alerts: Vec<NwsAlert>,
+    pub zones: ZoneResolution,
+}
+
+impl ActiveAlerts {
+    /// A known alert set that asked nothing of zone resolution — every alert
+    /// carrying its own geometry, which is what a test fixture or a host
+    /// feeding a chosen warning set has.
+    pub fn whole(alerts: Vec<NwsAlert>) -> Self {
+        Self {
+            alerts,
+            zones: ZoneResolution::default(),
+        }
+    }
+}
 
 /// Unlike SPC and IEM, api.weather.gov *requires* a `User-Agent`; `client` must
 /// carry one. The URL comes from [`DataSources::nws_alerts_url`] so the origin
@@ -19,7 +44,7 @@ pub async fn fetch_active_alerts(
     client: &reqwest::Client,
     sources: &DataSources,
     zone_cache_dir: Option<&Path>,
-) -> Result<Vec<NwsAlert>, FetchError> {
+) -> Result<ActiveAlerts, FetchError> {
     let url = sources.nws_alerts_url();
     log::info!("Fetching NWS active alerts from {url}");
 
@@ -49,10 +74,14 @@ pub async fn fetch_active_alerts(
 
     let mut alerts = parse_alerts(&json);
 
-    // Many alerts carry zone references instead of geometry.
-    resolve_zone_geometries(client, &mut alerts, zone_cache_dir).await;
+    // Many alerts carry zone references instead of geometry. A zone that will
+    // not resolve is **not** an error for the round: the alerts that did get
+    // their outlines are real and have to be drawn. It is carried back beside
+    // them instead, which is what lets the layer draw what it has and still say
+    // what it is missing.
+    let zones = resolve_zone_geometries(client, &mut alerts, zone_cache_dir).await;
 
-    Ok(alerts)
+    Ok(ActiveAlerts { alerts, zones })
 }
 
 #[cfg(test)]

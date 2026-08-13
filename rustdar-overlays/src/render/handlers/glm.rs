@@ -20,6 +20,37 @@ use crate::render::overlay_state::{
 use crate::render::rasterize;
 use crate::types::GeoBounds;
 
+/// What a poll's listings covered, in the layer-agnostic terms the UI renders.
+///
+/// GLM's round is one S3 listing per selected satellite and a dead one does not
+/// fail the round — the survivor's flashes are real and cover most of CONUS. But
+/// nothing said so: the round returned `Ok`, stamped a fresh clock and read
+/// health `Ok`, while GOES-East's contribution drained out of the cache window
+/// over the next half hour. This is that half of the round, written down.
+///
+/// No `parts`: a satellite *is* the unit here, so a second denominator would be
+/// the same two numbers again. See
+/// [`DataCompleteness`](crate::fetch_policy::DataCompleteness) for how the two
+/// halves are rendered.
+fn listing_coverage(
+    queried: &[GlmSatellite],
+    listing_failures: &[(GlmSatellite, crate::fetch_policy::FetchError)],
+) -> crate::fetch_policy::DataCompleteness {
+    crate::fetch_policy::DataCompleteness {
+        expected: queried.len() + listing_failures.len(),
+        partial: 0,
+        missing: listing_failures.len(),
+        parts_requested: 0,
+        parts_resolved: 0,
+        unit: "satellite feeds",
+        part_unit: "listings",
+        reasons: listing_failures
+            .iter()
+            .map(|(sat, e)| (format!("{}: {e}", sat.display_name()), 1))
+            .collect(),
+    }
+}
+
 /// Clickable item representing a single GLM lightning flash.
 #[derive(Debug)]
 pub(crate) struct GlmFlashItem {
@@ -491,13 +522,17 @@ impl OverlayHandler for GlmHandler {
                 self.report_failures(FailureKind::Parse, outcome.parse_failures);
                 self.report_failures(FailureKind::Transport, outcome.transport_failures);
                 self.report_level_failures(&outcome.evaluated_levels, outcome.level_failures);
+                let coverage = listing_coverage(&outcome.queried, &outcome.listing_failures);
                 let items = outcome
                     .flashes
                     .into_iter()
                     .enumerate()
                     .map(|(i, flash)| Arc::new(GlmFlashItem { flash, index: i }))
                     .collect();
-                self.state.set_data(items);
+                // The satellite that answered gives real flashes on a fresh
+                // clock; the one that did not is recorded beside them rather
+                // than instead of them.
+                self.state.set_data_with_coverage(items, coverage);
             }
             Err(e) => {
                 // A failed fetch says nothing about feed liveness, so leave the

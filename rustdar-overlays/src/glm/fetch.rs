@@ -149,7 +149,10 @@ pub async fn fetch_glm_flashes(
     // silently blanked GOES-West, which is the same "condemned by the weakest
     // component" shape `FetchFailure::of_round` exists to prevent, on a layer
     // where the surviving satellite still covers most of CONUS.
-    let mut verdicts = Vec::new();
+    // Kept per satellite rather than as a bare list of verdicts: a round that
+    // half succeeded has to be able to say *which* half, and `of_round` below
+    // still takes the errors out of it.
+    let mut listing_failures: Vec<(GlmSatellite, FetchError)> = Vec::new();
     let mut queried = Vec::new();
 
     for &sat in satellites {
@@ -158,7 +161,7 @@ pub async fn fetch_glm_flashes(
             Ok(listing) => listing,
             Err(e) => {
                 log::warn!("GLM: {} listing failed: {e}", sat.display_name());
-                verdicts.push(e);
+                listing_failures.push((sat, e));
                 // Deliberately **not** added to `queried`. A listing that never
                 // answered teaches nothing about whether the feed is alive, and
                 // `report_feed_changes` reads absence-from-`dead_feeds` as
@@ -201,6 +204,10 @@ pub async fn fetch_glm_flashes(
     // Only a *total* failure is the round's failure. Anything less and the
     // satellites that did answer are still worth drawing.
     if queried.is_empty() && !satellites.is_empty() {
+        let verdicts: Vec<FetchError> = listing_failures
+            .iter()
+            .map(|(_, e)| e.clone())
+            .collect::<Vec<_>>();
         return Err(FetchError::of_round(
             &verdicts,
             format!(
@@ -227,7 +234,14 @@ pub async fn fetch_glm_flashes(
     );
 
     // Reported, not logged, for the same reason dead feeds are.
-    Ok(build_outcome(filtered, dead_feeds, queried, &tally, acc))
+    Ok(build_outcome(
+        filtered,
+        dead_feeds,
+        queried,
+        listing_failures,
+        &tally,
+        acc,
+    ))
 }
 
 /// Select the cached flashes that fall inside this poll's window, from the
@@ -271,6 +285,7 @@ fn build_outcome(
     flashes: Vec<GlmFlash>,
     dead_feeds: Vec<DeadFeed>,
     queried: Vec<GlmSatellite>,
+    listing_failures: Vec<(GlmSatellite, FetchError)>,
     tally: &PollTally,
     acc: PollAccumulator,
 ) -> GlmFetchOutcome {
@@ -278,6 +293,7 @@ fn build_outcome(
         flashes,
         dead_feeds,
         queried,
+        listing_failures,
         parse_failures: summarize_failures(tally.in_window, acc.parse_errors),
         transport_failures: summarize_failures(tally.in_window, acc.transport_errors),
         // Not routed through `summarize_failures`: a level failure has no

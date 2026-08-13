@@ -208,6 +208,19 @@ pub struct GlmFetchOutcome {
     /// A poll that downloaded no new granules evaluates nothing, and must not
     /// read as a recovery.
     pub evaluated_levels: Vec<(GlmSatellite, GlmDataLevel)>,
+    /// Satellites whose S3 listing never answered this poll — the complement of
+    /// `queried`, and the thing this outcome had no way to express.
+    ///
+    /// A round that lists one satellite and fails the other returns `Ok`,
+    /// deliberately, because the survivor's flashes are real. It then went
+    /// through `set_data`, stamped a fresh clock and reported health `Ok`, with
+    /// nothing anywhere saying half the sky had stopped arriving: GOES-East
+    /// dies, its flashes drain out of the cache window over the next half hour,
+    /// and most of CONUS quietly loses its lightning under an `Updated 0s ago`
+    /// line. Carried here so the handler can file it as
+    /// [`DataCompleteness`](crate::fetch_policy::DataCompleteness) beside the
+    /// data that did arrive.
+    pub listing_failures: Vec<(GlmSatellite, crate::fetch_policy::FetchError)>,
 }
 
 /// Type-erased fetch result for GLM lightning data.

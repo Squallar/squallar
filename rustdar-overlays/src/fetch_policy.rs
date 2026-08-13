@@ -69,6 +69,33 @@
 //! stale tornado warning on screen, indefinitely. The asymmetry is the whole
 //! argument.
 //!
+//! # A round that half succeeded is neither, and it used to read as green
+//!
+//! Everything above is about **time**: whether what is drawn is current. It has
+//! nothing to say about **coverage** — whether what is drawn is all of what
+//! arrived — and a layer can fail at that while passing every check here.
+//!
+//! Two shipped layers did. NWS alerts mostly carry UGC zone codes instead of
+//! geometry, and the zone-boundary fetch that turns those into polygons returned
+//! `()`: every zone it could not obtain was skipped, and an alert whose zones all
+//! failed drew nothing at all. GLM lists two satellites' buckets, and one dead
+//! listing leaves the other's flashes to drain out of the cache window over half
+//! an hour. Both round trips end in `Ok`, both go through
+//! [`OverlayState::set_data`] to [`FetchRetry::record_success`], both stamp a
+//! fresh clock, and both then report [`Ok`](FetchHealth::Ok) with `Updated 0s
+//! ago` under a map that is missing most of its warnings or half of its
+//! lightning. Observed on the alerts layer: **212 of 297 warnings absent, status
+//! line fully green.**
+//!
+//! So there are three states and not two — healthy, stale, and *incomplete* —
+//! and the third is orthogonal to the second rather than a rung below it. It
+//! lives in [`DataCompleteness`], on this same ledger but beside `health`, so
+//! that a layer can be both at once and say both. It has to sit **beside** the
+//! data rather than replace it: the half of the round that did arrive is real,
+//! has to be drawn, and has to stamp a real fetch time.
+//!
+//! [`OverlayState::set_data`]: crate::render::overlay_state::OverlayState::set_data
+//!
 //! # A user action never waits out a backoff
 //!
 //! The ladder governs the **automatic** poll and nothing else. Every
@@ -382,6 +409,143 @@ impl FetchHealth {
     }
 }
 
+/// What a layer is drawing, against what its own last answer said it should
+/// draw.
+///
+/// The **coverage** half of "is what I am looking at what I think it is";
+/// [`FetchHealth`] is the **time** half. They are different faults and they
+/// want different things from a user, which is why they are two reports and not
+/// one verdict: a stale layer is drawing an old answer in full and the response
+/// is to wait or press Refresh, an incomplete one is drawing part of the
+/// current answer and the response is to find out which part is absent. A
+/// single "something is wrong" would collapse them, and the collapse is what
+/// makes a mark unactionable.
+///
+/// # The silence this exists for
+///
+/// NWS alerts mostly reference UGC zone codes rather than carrying geometry,
+/// and [`resolve_zone_geometries`] fetches one boundary per zone — a thousand
+/// or more requests on a busy day, each of which can fail on its own.
+/// That function returned `()`. A zone whose fetch failed was skipped, an alert
+/// whose zones all failed kept an empty feature list and drew nothing, and the
+/// only thing on screen was `Updated 0s ago` — which was *true*, because the
+/// alert fetch had genuinely succeeded. Observed: **212 of 297 warnings absent
+/// from the map under a green status line.**
+///
+/// An alert that resolved *some* of its zones is the worse case and the reason
+/// [`partial`](Self::partial) is counted apart from [`missing`](Self::missing):
+/// it draws a real shape that is the wrong shape, and nothing about a
+/// three-county outline says the warning covers five.
+///
+/// [`resolve_zone_geometries`]: crate::nws::zones::resolve_zone_geometries
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DataCompleteness {
+    /// How many things the answer said belong on the map.
+    pub expected: usize,
+    /// ...that are drawing only some of their area. A wrong shape, not an
+    /// absent one.
+    pub partial: usize,
+    /// ...that have nothing at all to draw.
+    pub missing: usize,
+    /// The pieces those things are assembled from — how many distinct ones were
+    /// needed, and how many were obtained.
+    pub parts_requested: usize,
+    pub parts_resolved: usize,
+    /// Plural noun for what [`expected`](Self::expected) counts: `"alerts"`.
+    pub unit: &'static str,
+    /// Plural noun for what the parts are: `"zone boundaries"`.
+    pub part_unit: &'static str,
+    /// Why the parts that are missing are missing, commonest first —
+    /// `("HTTP 503", 198)`. Empty is allowed and means nobody wrote a cause
+    /// down, not that there was none.
+    pub reasons: Vec<(String, usize)>,
+}
+
+impl DataCompleteness {
+    /// Everything the answer named is on the map, whole. The default state, and
+    /// the state of every layer that assembles nothing.
+    pub fn is_complete(&self) -> bool {
+        self.partial == 0 && self.missing == 0
+    }
+
+    /// The always-visible half: one word for the layer stack's row, beside
+    /// `not updating`.
+    ///
+    /// A verdict rather than a count, deliberately. The row is one line next to
+    /// a name, the numbers are one click away in
+    /// [`status_note`](Self::status_note), and the handler's own status line is
+    /// already standing right beside this saying how many of its items drew —
+    /// `"85 of 297 shown"`. Free to call: no allocation, no format, which
+    /// matters because the stack asks every layer this on every frame.
+    pub fn status_mark(&self) -> Option<&'static str> {
+        (!self.is_complete()).then_some("incomplete")
+    }
+
+    /// The full sentence for the layer's options panel, or `None` while
+    /// everything drew.
+    ///
+    /// Says three things, in this order: how much of the layer is not on the
+    /// map, what could not be obtained and why, and — last, because it is the
+    /// distinction a user is most likely to get wrong — that this is **not** the
+    /// same fault as stale data.
+    ///
+    /// Both notes can be on screen at once (a layer that under-drew and has
+    /// since stopped fetching is both), so this one never claims the layer is
+    /// current. It says only that the two are separate faults and that a
+    /// refresh retries what is missing, which is the part a user can act on.
+    ///
+    /// Phrased without a verb over the counts — "missing 1 of 2" rather than
+    /// "1 of 2 is missing" — so one layer's wording does not have to know
+    /// whether its own numbers are singular.
+    pub fn status_note(&self) -> Option<String> {
+        if self.is_complete() {
+            return None;
+        }
+        let Self {
+            expected,
+            partial,
+            missing,
+            unit,
+            part_unit,
+            ..
+        } = self;
+        let subject = match (missing, partial) {
+            (0, p) => format!("{p} of {expected} {unit} drawing only part of their area"),
+            (m, 0) => format!("missing {m} of {expected} {unit}"),
+            (m, p) => format!(
+                "missing {m} of {expected} {unit}, with {p} more drawing only part of \
+                 their area"
+            ),
+        };
+        let mut note = format!("Incomplete - {subject}");
+        if self.parts_requested > 0 {
+            note.push_str(&format!(
+                ". {} of {} {part_unit} resolved",
+                self.parts_resolved, self.parts_requested,
+            ));
+        }
+        if !self.reasons.is_empty() {
+            note.push_str(": ");
+            note.push_str(
+                &self
+                    .reasons
+                    .iter()
+                    .map(|(why, count)| {
+                        if *count == 1 {
+                            why.clone()
+                        } else {
+                            format!("{count} {why}")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+        }
+        note.push_str(". Not the same as stale data: a refresh retries what is missing.");
+        Some(note)
+    }
+}
+
 /// The per-layer record of what the last fetch did and what the next automatic
 /// one is allowed to do.
 ///
@@ -402,6 +566,24 @@ pub struct FetchRetry {
     /// When the most recent failure landed.
     last_failure: Option<web_time::Instant>,
     health: FetchHealth,
+    /// How much of the **last answer that arrived** made it onto the map.
+    ///
+    /// A second axis, not another rung of the ladder: a round that half
+    /// succeeded is `Ok` on this ledger's terms and must stay that way, because
+    /// the half that arrived is real data that has to be drawn and has to stamp
+    /// a real fetch time. Kept here rather than in the handler so the registry
+    /// can render it for every layer that keeps a ledger, exactly as it renders
+    /// [`status_note`](FetchRetry::status_note) — the same reason four of six
+    /// handlers used to say nothing at all about being stale.
+    ///
+    /// Moved only by a **new answer** ([`record_coverage`](Self::record_coverage),
+    /// which `OverlayState::set_data` and its coverage-carrying sibling drive).
+    /// A failure leaves it alone — what is drawn did not change, so what is
+    /// missing from it did not either — and so does
+    /// [`clear`](FetchRetry::clear): a user pressing Refresh has not yet been
+    /// given the zones that failed, and marking the layer whole before the
+    /// answer lands would be the same silence in a shorter window.
+    coverage: DataCompleteness,
 }
 
 impl FetchRetry {
@@ -411,6 +593,30 @@ impl FetchRetry {
 
     pub fn health(&self) -> &FetchHealth {
         &self.health
+    }
+
+    /// How much of the last answer that arrived is on the map. See
+    /// [`coverage`](FetchRetry::coverage) — the field, for why it is here and
+    /// not on the handler.
+    pub fn coverage(&self) -> &DataCompleteness {
+        &self.coverage
+    }
+
+    /// Record what a **new answer** covered.
+    ///
+    /// Called with a complete report by every ordinary `set_data`, so a layer
+    /// that recovers stops being marked without its handler remembering to say
+    /// so; called with a real one by the handlers whose round can half succeed.
+    pub fn record_coverage(&mut self, coverage: DataCompleteness) {
+        self.coverage = coverage;
+    }
+
+    /// Whether the layer is holding less than it was told to draw — the
+    /// coverage counterpart of [`is_unhealthy`](FetchRetry::is_unhealthy), and
+    /// the state no health mechanism in this crate could express before it:
+    /// a round that succeeded, stamped a fresh clock, read `Ok`, and under-drew.
+    pub fn is_incomplete(&self) -> bool {
+        !self.coverage.is_complete()
     }
 
     /// Consecutive failures since the last good answer. Test seam and panel
@@ -436,6 +642,13 @@ impl FetchRetry {
     }
 
     /// A good answer: the ladder resets and the layer returns to its interval.
+    ///
+    /// Deliberately silent about **coverage**: a round can be a good answer and
+    /// still have under-drawn, and clearing that here would erase the report
+    /// belonging to the very data being kept. [`record_coverage`] is the other
+    /// axis, and every route that replaces data calls it.
+    ///
+    /// [`record_coverage`]: FetchRetry::record_coverage
     pub fn record_success(&mut self) {
         self.failures = 0;
         self.refusals = 0;

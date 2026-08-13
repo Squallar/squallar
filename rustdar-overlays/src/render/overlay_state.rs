@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use rustdar_units::UserPreferences;
 
-use crate::fetch_policy::{FetchError, FetchFailure, FetchHealth, FetchRetry};
+use crate::fetch_policy::{DataCompleteness, FetchError, FetchFailure, FetchHealth, FetchRetry};
 use crate::render::controls::{
     ControlEffect, ControlItem, ControlUpdate, PaneControlContext, PaneControlContextMut,
 };
@@ -15,6 +15,17 @@ use crate::render::rasterize::RasterizeOutput;
 use crate::types::{GeoBounds, OverlayFeature, OverlayLabel};
 
 pub type RasterizeFn = Box<dyn FnOnce(&GeoBounds, u32, u32) -> RasterizeOutput + Send>;
+
+/// What opens a layer-stack status line that is reporting a fault rather than a
+/// count — see [`OverlayRegistry::status_line`].
+///
+/// A `const` and not a literal because the host **reads** it: the stack row
+/// renders its status line `.small().weak()`, which is the same dim grey an
+/// ordinary `3 shown - W/Wa` sits in, so a warning rendered that way is a
+/// warning in the typeface of a footnote. `rustdar-egui` tests this prefix to
+/// colour the line instead, and a mark the two crates spelled differently would
+/// be a mark that silently stopped being legible.
+pub const STATUS_MARK: &str = "!";
 
 /// Not `rustdar_radar::LegendScale`: duplicated here to avoid the dependency.
 pub struct OverlayLegend {
@@ -63,12 +74,37 @@ impl<T> OverlayState<T> {
     ///
     /// Also ends the fetch and clears the retry ladder: this **is** the good
     /// answer, and a handler should not have to remember to say so three times.
+    ///
+    /// And declares the answer **whole**. A handler that says nothing about
+    /// coverage is saying its round cannot half-succeed, which is true of most
+    /// of them; the ones whose round is several requests call
+    /// [`set_data_with_coverage`](Self::set_data_with_coverage) instead. The
+    /// declaration is here rather than left as "whatever was there before" so
+    /// that a layer which recovers stops being marked incomplete without its
+    /// handler remembering to say so.
     pub fn set_data(&mut self, data: T) {
+        self.set_data_with_coverage(data, DataCompleteness::default());
+    }
+
+    /// [`set_data`](Self::set_data) for a round that can deliver less than it
+    /// was asked for, carrying the report of how much less.
+    ///
+    /// One call rather than two, so the order cannot be got wrong: `set_data`
+    /// declares its answer whole, so a handler that recorded coverage first and
+    /// data second would erase its own report and be back to the silence this
+    /// exists to end.
+    ///
+    /// The data still lands, the clock still stamps, the ladder still resets. A
+    /// half-delivered round is a **good answer missing pieces**, not a failure:
+    /// what arrived is real and has to be drawn, and filing it as a failure
+    /// would back the layer off from the very retry that could complete it.
+    pub fn set_data_with_coverage(&mut self, data: T, coverage: DataCompleteness) {
         self.data = data;
         self.fetch_time = Some(web_time::Instant::now());
         self.data_generation = self.data_generation.wrapping_add(1);
         self.fetching = false;
         self.retry.record_success();
+        self.retry.record_coverage(coverage);
     }
 
     /// A good answer that replaced no data — the outlook handler stamps its own
@@ -100,9 +136,10 @@ impl<T> OverlayState<T> {
     /// Whether the user switching this layer on should re-ask the origin, given
     /// the handler's own answer to "do I have anything to draw?".
     ///
-    /// Two reasons to ask, and the second is the one that was missing: there is
-    /// nothing drawn, **or** what is drawn is stale
-    /// ([`FetchRetry::is_unhealthy`]). The condition used to be `!has_data`
+    /// Three reasons to ask, and the last two are the ones that were missing:
+    /// there is nothing drawn, **or** what is drawn is stale
+    /// ([`FetchRetry::is_unhealthy`]), **or** what is drawn is missing pieces
+    /// ([`FetchRetry::is_incomplete`]). The condition used to be `!has_data`
     /// alone, and every handler spells `has_data` as "the vector is not empty" —
     /// so a layer that fetched successfully, then started failing, was holding
     /// data and did not re-ask. Toggling it off and on did nothing, in the one
@@ -110,11 +147,17 @@ impl<T> OverlayState<T> {
     /// warnings. See `Gui::set_pane_overlay_with_fetch` for the same rule at the
     /// pane seam.
     ///
+    /// The incompleteness clause is the same argument one axis over: a layer
+    /// drawing 85 of 297 warnings is the strongest case there is for a user
+    /// toggling it and expecting the missing ones to appear, and a re-ask is
+    /// exactly what could deliver them — the zone boundaries that failed are not
+    /// cached, so the next round retries precisely them.
+    ///
     /// `has_data` is a parameter rather than read from `self` because only the
     /// handler knows what having data means for its own payload — a `Vec`, an
     /// `Option<Arc<Grid>>`, a map keyed by product.
     pub fn enable_should_refetch(&self, has_data: bool) -> bool {
-        !self.fetching && (!has_data || self.retry.is_unhealthy())
+        !self.fetching && (!has_data || self.retry.is_unhealthy() || self.retry.is_incomplete())
     }
 
     // `needs_refresh(interval)` used to live here — `fetch_time.is_none_or(|t|
@@ -598,7 +641,9 @@ impl OverlayRegistry {
     /// [`apply_fetch_result`]: OverlayRegistry::apply_fetch_result
     #[doc(hidden)]
     pub fn nws_alerts_payload(alerts: Vec<crate::nws::alert::NwsAlert>) -> FetchPayload {
-        Box::new(super::handlers::alert::NwsAlertFetchResult(Ok(alerts)))
+        Box::new(super::handlers::alert::NwsAlertFetchResult(Ok(
+            crate::nws::fetch::ActiveAlerts::whole(alerts),
+        )))
     }
 
     /// The SPC Mesoscale Discussion fetch payload for a known MD list — the
@@ -731,18 +776,42 @@ impl OverlayRegistry {
     ///
     /// Only for a layer that is **on** — a hidden layer draws nothing, so
     /// nothing it holds can be misread, and its row is already dimmed. Free
-    /// while healthy: [`FetchRetry::is_unhealthy`] is a discriminant test and
-    /// the `format!` runs only when there is something to say, which matters
-    /// because this is asked of every layer in the stack every frame.
+    /// while healthy: both tests are discriminant tests and the `format!` runs
+    /// only when there is something to say, which matters because this is asked
+    /// of every layer in the stack every frame.
+    ///
+    /// # Two marks, because there are two ways to be wrong
+    ///
+    /// `not updating` is the time axis and `incomplete` is the coverage axis,
+    /// and a layer can carry both at once: `! not updating, incomplete`. They
+    /// are not interchangeable and must not be collapsed into one word — stale
+    /// means wait or refresh, incomplete means look at what is missing and why,
+    /// and a mark that cannot tell a user which one they are looking at is a
+    /// mark they cannot act on.
+    ///
+    /// `incomplete` is a verdict rather than a count on purpose. The counts are
+    /// one click away in the layer's options
+    /// ([`DataCompleteness::status_note`]), and the handler's own line is
+    /// already standing right beside this saying how much of it drew —
+    /// `! incomplete - 85 of 297 shown - W/Wa/Adv`.
     pub fn status_line(&self, kind: OverlayKind) -> Option<String> {
         let handler = self.handler(kind)?;
         let line = handler.status_line();
-        if !handler.is_enabled() || !handler.retry().is_some_and(FetchRetry::is_unhealthy) {
+        if !handler.is_enabled() {
             return line;
         }
+        let retry = handler.retry();
+        let stale = retry.is_some_and(FetchRetry::is_unhealthy);
+        let incomplete = retry.and_then(|r| r.coverage().status_mark());
+        let mark = match (stale, incomplete) {
+            (false, None) => return line,
+            (true, None) => format!("{STATUS_MARK} not updating"),
+            (false, Some(mark)) => format!("{STATUS_MARK} {mark}"),
+            (true, Some(mark)) => format!("{STATUS_MARK} not updating, {mark}"),
+        };
         Some(match line {
-            Some(line) => format!("! not updating - {line}"),
-            None => "! not updating".to_string(),
+            Some(line) => format!("{mark} - {line}"),
+            None => mark,
         })
     }
 
@@ -827,11 +896,20 @@ impl OverlayRegistry {
     /// alerts layer is a quiet afternoon or an unreachable origin, and a full
     /// one is current warnings or a frozen copy of last hour's. A caveat below
     /// the thing it qualifies is a caveat most people do not read.
+    ///
+    /// Two notes, not one merged sentence, and a layer can carry both. Staleness
+    /// leads because it is the older and broader claim; incompleteness follows
+    /// it and above everything else, because `212 of 297 alerts missing` also
+    /// changes what `85 alerts shown` beneath it means.
     pub fn controls(&self, kind: OverlayKind, ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
         let Some(handler) = self.handler(kind) else {
             return Vec::new();
         };
         let mut items = handler.controls(ctx);
+        // Inserted in reverse, so each lands above the one before it.
+        if let Some(note) = handler.retry().and_then(|r| r.coverage().status_note()) {
+            items.insert(0, ControlItem::InfoText { text: note });
+        }
         if let Some(note) = handler.retry().and_then(FetchRetry::status_note) {
             items.insert(0, ControlItem::InfoText { text: note });
         }

@@ -35,7 +35,7 @@
 //! state remembers, and a short list still shrink-wraps.
 
 use crate::actions::GuiAction;
-use rustdar_overlays::render::overlay_state::OverlayKind;
+use rustdar_overlays::render::overlay_state::{OverlayKind, STATUS_MARK};
 
 use super::shell::SurfaceSlot;
 use super::{InspectorSelection, PaneState};
@@ -595,11 +595,21 @@ impl super::Gui {
                             ui.add(egui::Label::new(name_text).selectable(false).truncate());
                         let mut text_rect = name_label.rect;
                         if let Some(line) = &status {
-                            let status_label = ui.add(
-                                egui::Label::new(egui::RichText::new(line.as_str()).small().weak())
-                                    .selectable(false)
-                                    .truncate(),
-                            );
+                            // A line that opens with the fault mark is not a
+                            // count, and `.weak()` is the theme's own way of
+                            // saying "this is a detail" — the same dim grey
+                            // `3 shown - W/Wa` sits in. A layer that stopped
+                            // updating, or is drawing 85 of 297 warnings, gets
+                            // the warning colour instead: same size, same
+                            // place, same rect, legible as a fault.
+                            let text = egui::RichText::new(line.as_str()).small();
+                            let text = if line.starts_with(STATUS_MARK) {
+                                text.color(ui.visuals().warn_fg_color)
+                            } else {
+                                text.weak()
+                            };
+                            let status_label =
+                                ui.add(egui::Label::new(text).selectable(false).truncate());
                             text_rect = text_rect.union(status_label.rect);
                         }
                         text_rect

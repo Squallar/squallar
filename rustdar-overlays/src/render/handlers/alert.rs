@@ -15,7 +15,9 @@ use crate::render::overlay_state::{
 use crate::render::rasterize::{self, RasterizeOutput};
 use crate::types::GeoBounds;
 
-pub(crate) struct NwsAlertFetchResult(pub Result<Vec<NwsAlert>, crate::fetch_policy::FetchError>);
+pub(crate) struct NwsAlertFetchResult(
+    pub Result<crate::nws::fetch::ActiveAlerts, crate::fetch_policy::FetchError>,
+);
 
 #[derive(Debug)]
 pub(crate) struct AlertItem {
@@ -145,14 +147,33 @@ impl NwsAlertHandler {
             && !self.hidden_alerts.contains(&item.alert.id)
     }
 
-    /// How many alerts would paint — allocation-free, unlike counting
-    /// `clickable_items()`, which builds a `Vec` and an `Arc` per alert for a
-    /// number.
+    /// How many alerts the user's filters let through — allocation-free, unlike
+    /// counting `clickable_items()`, which builds a `Vec` and an `Arc` per
+    /// alert for a number.
+    ///
+    /// Not the same as [`painted_count`](NwsAlertHandler::painted_count), and
+    /// the difference is the bug: an alert whose zone boundaries did not resolve
+    /// is let through by every filter and paints nothing.
     fn drawn_count(&self) -> usize {
         self.state
             .data
             .iter()
             .filter(|item| self.is_drawn(item))
+            .count()
+    }
+
+    /// How many alerts actually put ink on the map: let through *and* holding
+    /// geometry.
+    ///
+    /// A zone-based alert whose boundaries all failed to resolve keeps its place
+    /// in the list — it is not dropped and nothing is invented for it — so it is
+    /// `is_drawn` and paints nothing. Counting it as shown is what let the row
+    /// read `297 shown` over a map with 85 warnings on it.
+    fn painted_count(&self) -> usize {
+        self.state
+            .data
+            .iter()
+            .filter(|item| self.is_drawn(item) && !item.alert.features.is_empty())
             .count()
     }
 }
@@ -202,17 +223,32 @@ impl OverlayHandler for NwsAlertHandler {
         }
     }
 
-    /// E.g. `"3 shown - W/Wa/Adv"`: how many alerts would draw, and which
-    /// categories are letting them. Counted through [`drawn_count`], not by
-    /// taking the length of `clickable_items`, which builds a `Vec` and an
-    /// `Arc` per alert for a number this reads straight off the data.
+    /// E.g. `"3 shown - W/Wa/Adv"`: how many alerts are on the map, and which
+    /// categories are letting them through. Counted through
+    /// [`painted_count`] and [`drawn_count`], not by taking the length of
+    /// `clickable_items`, which builds a `Vec` and an `Arc` per alert for a
+    /// number this reads straight off the data.
+    ///
+    /// **`"85 of 297 shown"`** when the two disagree, which is the honest
+    /// reading of a poll whose zone boundaries did not all resolve. It used to
+    /// say `297 shown` there: every one of those alerts passed every filter, and
+    /// 212 of them had no shape to put on the map. The registry adds the
+    /// `! incomplete` mark ahead of this line and the reasons behind the layer's
+    /// options; the split count is the part that is countable at a glance.
     ///
     /// [`drawn_count`]: NwsAlertHandler::drawn_count
+    /// [`painted_count`]: NwsAlertHandler::painted_count
     fn status_line(&self) -> Option<String> {
         if !self.is_enabled() {
             return None;
         }
-        let shown = self.drawn_count();
+        let allowed = self.drawn_count();
+        let painted = self.painted_count();
+        let shown = if painted == allowed {
+            format!("{allowed}")
+        } else {
+            format!("{painted} of {allowed}")
+        };
         let mut cats = Vec::new();
         for (category, short) in [
             (AlertCategory::Warning, "W"),
@@ -349,7 +385,8 @@ impl OverlayHandler for NwsAlertHandler {
             return;
         };
         match fetch.0 {
-            Ok(alerts) => {
+            Ok(fetched) => {
+                let crate::nws::fetch::ActiveAlerts { alerts, zones } = fetched;
                 log::info!("Received {} NWS alerts", alerts.len());
                 let current_ids: HashSet<String> = alerts.iter().map(|a| a.id.clone()).collect();
                 self.hidden_alerts.retain(|id| current_ids.contains(id));
@@ -357,7 +394,11 @@ impl OverlayHandler for NwsAlertHandler {
                     .into_iter()
                     .map(|alert| Arc::new(AlertItem { alert }))
                     .collect();
-                self.state.set_data(items);
+                // The coverage report travels with the data it describes: a
+                // round that placed 85 of 297 warnings is a good answer, keeps
+                // its fresh clock, and is still marked for the 212 it did not.
+                self.state
+                    .set_data_with_coverage(items, zones.completeness());
             }
             Err(e) => {
                 log::error!("NWS alerts fetch failed: {e}");
@@ -467,9 +508,17 @@ impl OverlayHandler for NwsAlertHandler {
             // panel rebuilds its controls every frame it is open, and the old
             // spelling allocated a `Vec` and an `Arc` per alert to read a
             // length off it.
-            let visible = self.drawn_count();
+            let allowed = self.drawn_count();
+            let painted = self.painted_count();
             items.push(ControlItem::InfoText {
-                text: format!("{visible} alerts shown"),
+                text: if painted == allowed {
+                    format!("{allowed} alerts shown")
+                } else {
+                    // The same split the stack row carries. The completeness
+                    // note above says why; this says how many, in the same
+                    // words as the row that sent the user here.
+                    format!("{painted} of {allowed} alerts shown")
+                },
             });
         }
         if let Some(t) = self.state.fetch_time {
