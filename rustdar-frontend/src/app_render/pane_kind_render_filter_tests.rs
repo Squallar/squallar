@@ -109,7 +109,7 @@ fn holds_radar_texture(app: &mut crate::app::App, pane_idx: usize) -> bool {
         .pane_mut(pane_idx)
         .expect("pane exists")
         .overlay_cache_mut(OverlayKind::Radar)
-        .current
+        .current()
         .is_some()
 }
 
@@ -690,7 +690,7 @@ fn the_cached_render_restore_skips_a_pane_with_no_plan_view() {
             .pane_mut(0)
             .unwrap()
             .overlay_cache_mut(OverlayKind::Radar)
-            .current = None;
+            .clear();
 
         app.restore_cached_render(&egui::Context::default());
 

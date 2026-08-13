@@ -1931,8 +1931,7 @@ impl PaneState {
         }
         let meta = self
             .overlay_cache(OverlayKind::Radar)?
-            .current
-            .as_ref()?
+            .current()?
             .radar_meta
             .as_ref()?;
         let matches_selection = match self.get_rendering_params() {
@@ -2017,8 +2016,7 @@ impl PaneState {
             return None;
         }
         self.overlay_cache(OverlayKind::Radar)?
-            .current
-            .as_ref()?
+            .current()?
             .radar_meta
             .as_ref()?
             .nyquist_ms
@@ -2059,8 +2057,7 @@ impl PaneState {
             return None;
         }
         self.overlay_cache(OverlayKind::Radar)?
-            .current
-            .as_ref()?
+            .current()?
             .radar_meta
             .as_ref()?
             .melting_layer_source
@@ -2103,8 +2100,7 @@ impl PaneState {
             return None;
         }
         self.overlay_cache(OverlayKind::Radar)?
-            .current
-            .as_ref()?
+            .current()?
             .radar_meta
             .as_ref()?
             .storm_motion_source
@@ -2130,6 +2126,57 @@ impl PaneState {
     /// Get the overlay texture cache for a given kind, inserting a default if absent.
     pub fn overlay_cache_mut(&mut self, kind: OverlayKind) -> &mut OverlayTextureCache {
         self.overlay_textures.entry(kind).or_default()
+    }
+
+    /// Whether this pane is waiting on a raster's pixels to finish arriving.
+    ///
+    /// The frame loop's own term: the app runs on `ControlFlow::Wait`, so a pane
+    /// holding a picture is a pane that has to be given the frames to finish
+    /// arriving on and the frame to swap on. See `App::handle_redraw`.
+    pub fn is_holding_raster(&self) -> bool {
+        self.overlay_cache(OverlayKind::Radar)
+            .is_some_and(OverlayTextureCache::is_holding)
+    }
+
+    /// The id of the raster this pane is waiting on, if it is waiting on one.
+    pub fn held_raster_id(&self) -> Option<egui::TextureId> {
+        Some(self.overlay_cache(OverlayKind::Radar)?.held_texture()?.id())
+    }
+
+    /// Let go of a raster that is still arriving, without showing it.
+    ///
+    /// For the one event that ends a hold the upload path will never end: a
+    /// renderer rebuilt after suspend, resume or surface loss holds nothing for
+    /// the dead context's ids and would answer "not delivered" about them
+    /// forever. `App::restore_cached_render` calls this on every pane before it
+    /// re-uploads, including the panes it goes on to skip — a pane with no
+    /// cached render is exactly a pane nothing else would come back for.
+    pub fn release_held_raster(&mut self) {
+        self.overlay_cache_mut(OverlayKind::Radar).release_hold();
+    }
+
+    /// Show the raster this pane is holding, if every texel of it has landed.
+    ///
+    /// The swap, and the only one. `delivered` is
+    /// `EguiRenderer::is_delivered`; returns whether anything moved, which the
+    /// caller has no use for beyond a test saying so.
+    ///
+    /// **The picture and everything describing it move together.** The bounds it
+    /// is placed on, the product and tilt `stale_image_on_screen` reads, the
+    /// fold limit, the melting-layer provenance and the data time all travel in
+    /// the held record and land in this one step. That is the whole reason the
+    /// hold is at this layer rather than in the renderer: the renderer could
+    /// keep the old *pixels* on screen, and would then be pairing them with the
+    /// new sweep's caption and the new sweep's ground — a wrong answer where the
+    /// banding was only a late one.
+    pub fn promote_held_raster(&mut self, delivered: impl Fn(egui::TextureId) -> bool) -> bool {
+        let cache = self.overlay_cache_mut(OverlayKind::Radar);
+        let Some(held) = cache.take_held_if_delivered(delivered) else {
+            return false;
+        };
+        cache.show(held.data);
+        self.data_time = held.data_time;
+        true
     }
 
     /// Get rendering params for this pane (product + closest elevation).

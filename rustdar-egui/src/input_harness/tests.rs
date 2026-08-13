@@ -2170,7 +2170,7 @@ fn the_fold_annotation_returns_with_the_picture_rather_than_from_a_config() {
         .pane_mut(0)
         .unwrap()
         .overlay_cache_mut(OverlayKind::Radar)
-        .current = None;
+        .clear();
     h.warm_up();
     assert_eq!(
         fold_line_painted(&h),
@@ -5824,7 +5824,7 @@ fn a_pane_says_when_its_image_is_not_the_selected_product() {
             .pane(0)
             .unwrap()
             .overlay_cache(OverlayKind::Radar)
-            .and_then(|c| c.current.as_ref())
+            .and_then(|c| c.current())
             .is_some(),
         "the pane was cleared rather than annotated",
     );
@@ -14646,23 +14646,23 @@ fn settle_overlay_cache(h: &mut InputHarness, kind: OverlayKind) {
         );
         h.gui_mut().panes_mut()[pane_idx]
             .overlay_cache_mut(kind)
-            .current = Some(crate::overlay_cache::OverlayTextureData {
-            texture,
-            // What `spawn_overlay_render` stores, which is the plan's own
-            // coverage and *not* the viewport the request named. Storing the
-            // viewport gave the cache a zero-width overdraw band, so
-            // `pan_exceeds_coverage` was answering about a texture no render
-            // ever produced — and the one question it exists to answer, whether
-            // a freshly landed texture covers the pane that asked for it, could
-            // not be reached from here at all.
-            geo_bounds: plan.coverage(&geo_bounds),
-            data_generation: token,
-            render_zoom: zoom,
-            width: plan.width,
-            height: plan.height,
-            radar_meta: None,
-            hit_map: None,
-        });
+            .show(crate::overlay_cache::OverlayTextureData {
+                texture,
+                // What `spawn_overlay_render` stores, which is the plan's own
+                // coverage and *not* the viewport the request named. Storing the
+                // viewport gave the cache a zero-width overdraw band, so
+                // `pan_exceeds_coverage` was answering about a texture no render
+                // ever produced — and the one question it exists to answer, whether
+                // a freshly landed texture covers the pane that asked for it, could
+                // not be reached from here at all.
+                geo_bounds: plan.coverage(&geo_bounds),
+                data_generation: token,
+                render_zoom: zoom,
+                width: plan.width,
+                height: plan.height,
+                radar_meta: None,
+                hit_map: None,
+            });
     }
 }
 

@@ -100,7 +100,7 @@ impl<'a> OverlayDrawContext<'a> {
         items: impl FnOnce() -> Vec<ClickableItem<'i>>,
     ) -> Vec<Arc<dyn OverlayItem>> {
         // 1. Draw the pre-rasterized texture if available
-        if let Some(tex) = texture.and_then(|c| c.current.as_ref()) {
+        if let Some(tex) = texture.and_then(|c| c.current()) {
             draw_overlay_texture(self.ui.painter(), self.projector, tex, self.screen_rect);
         }
 
@@ -133,7 +133,7 @@ impl<'a> OverlayDrawContext<'a> {
         };
 
         // If a hit buffer is available, use it for pixel-perfect detection.
-        if let Some(tex) = texture.and_then(|c| c.current.as_ref())
+        if let Some(tex) = texture.and_then(|c| c.current())
             && let Some(ref hit_map) = tex.hit_map
         {
             let rect = crate::overlay_cache::overlay_texture_rect(self.projector, tex);

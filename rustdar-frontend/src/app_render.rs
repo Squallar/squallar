@@ -584,11 +584,9 @@ impl super::App {
             return;
         };
         let cache = pane.overlay_cache_mut(OverlayKind::Radar);
-        let retained = cache
-            .current
-            .take()
-            .filter(|_| already_on_screen)
-            .map(|old| old.texture);
+        let retained = already_on_screen
+            .then(|| cache.current().map(|old| old.texture.clone()))
+            .flatten();
 
         // The picture's own dimensions, not a constant: a sweep reaching past
         // the floor is a wider raster, and the texture, the overlay entry and
@@ -651,7 +649,7 @@ impl super::App {
         // is `stamping_tests` below.
         self.render.stamp_pane_with_data_time(pane, render);
         let cache = pane.overlay_cache_mut(OverlayKind::Radar);
-        cache.current = Some(OverlayTextureData {
+        cache.show(OverlayTextureData {
             texture,
             geo_bounds,
             data_generation: 0,
@@ -1129,7 +1127,7 @@ impl super::App {
                 // `App::apply_render_to_pane` for why no frame of deferral is
                 // needed — this is the path it costs the most on, because these
                 // are the full-viewport overlay rasters.
-                cache.current = Some(OverlayTextureData {
+                cache.show(OverlayTextureData {
                     texture: texture.clone(),
                     geo_bounds: resp.geo_bounds,
                     data_generation: resp.generation,
@@ -1355,7 +1353,7 @@ impl super::App {
                     let cache = pane.overlay_cache_mut(
                         rustdar_overlays::render::overlay_state::OverlayKind::Radar,
                     );
-                    cache.current = None;
+                    cache.clear();
                 }
                 self.render.pane_render[pane_idx].last_rendered = None;
             }
@@ -1881,9 +1879,9 @@ impl super::App {
             };
             if let Some(pane) = self.gui.pane_mut(pane_idx) {
                 let cache = pane.overlay_cache_mut(OverlayKind::Radar);
-                // Assigning retires whatever the pane was showing; see the note
+                // Showing retires whatever the pane was showing; see the note
                 // in `App::apply_render_to_pane`.
-                cache.current = Some(OverlayTextureData {
+                cache.show(OverlayTextureData {
                     texture,
                     geo_bounds,
                     data_generation: 0,

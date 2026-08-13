@@ -4861,6 +4861,48 @@ impl Gui {
             })
     }
 
+    /// Whether any pane is waiting on a raster's pixels to finish arriving.
+    ///
+    /// A term in `App::handle_redraw`'s re-arm, beside the renders and the loops
+    /// and for the same reason: **it finishes**. A hold ends when its last band
+    /// lands, when a newer render replaces it, when the pane's radar cache is
+    /// cleared, or when a renderer rebuild releases it — and until then the loop
+    /// owes a frame, because a hold with nothing waking the loop is a pane
+    /// showing the previous sweep until some unrelated input happens by.
+    ///
+    /// Over **every** pane rather than the layout's count, unlike
+    /// [`any_loop_active`](Self::any_loop_active) above. The two differ because
+    /// the failures differ: a loop on a hidden pane is unstoppable work, where a
+    /// hold on a hidden pane is a bounded upload that finishes and then stops
+    /// answering yes. Counting it costs at most the frames that upload takes,
+    /// and *not* counting it would leave a pane split back into view showing the
+    /// sweep before last.
+    pub fn any_raster_held(&self) -> bool {
+        self.panes.iter().any(PaneState::is_holding_raster)
+    }
+
+    /// Show every held raster whose pixels have all landed.
+    ///
+    /// One pass, over every pane for the reason above. `delivered` is
+    /// `EguiRenderer::is_delivered`, asked once per held id — panes served from
+    /// one raster hold clones of one handle (`PlanViewUploads`), so a split of
+    /// four on one site swaps on one answer.
+    pub fn promote_held_rasters(&mut self, delivered: impl Fn(egui::TextureId) -> bool) {
+        for pane in &mut self.panes {
+            pane.promote_held_raster(&delivered);
+        }
+    }
+
+    /// Let go of every raster still arriving, without showing any of them.
+    ///
+    /// See [`PaneState::release_held_raster`]: the ids belong to a context that
+    /// no longer exists, so nothing will ever say they arrived.
+    pub fn release_held_rasters(&mut self) {
+        for pane in &mut self.panes {
+            pane.release_held_raster();
+        }
+    }
+
     pub fn clear_graphics_state(&mut self) {
         for pane in &mut self.panes {
             pane.loading_site = None;
@@ -4876,7 +4918,7 @@ impl Gui {
             // egui context is destroyed. needs_rerender() will trigger fresh
             // background renders.
             for cache in pane.overlay_textures.values_mut() {
-                cache.current = None;
+                cache.clear();
                 cache.render_in_flight = false;
             }
             // And whatever the pane's *kind* holds — today, a section pane's
