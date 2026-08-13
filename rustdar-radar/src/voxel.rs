@@ -1771,16 +1771,18 @@ fn data_levels(slot: MomentSlot) -> (f32, f32) {
 ///
 /// A derived product borrows a native moment's *slot* but not its units:
 /// NROT is unitless rotation in a velocity slot, KDP is °/km in a ΦDP slot —
-/// encoded into the slot's ramp they would read as nonsense (±4 rotation
+/// encoded into the slot's ramp they would read as nonsense (±5 rotation
 /// squeezed into ±63.5 m/s is half an index of signal). SRV keeps velocity's
 /// range: same units, same symmetric-about-zero palette. The ranges here
 /// match `derive`'s codecs exactly — raw 2..=255 and index 1..=255 both span
-/// `[lo, hi]`.
+/// `[lo, hi]` — and that agreement is the whole point of the entry: a span
+/// stated here and not there paints every derived voxel at the wrong value.
 fn data_levels_for(product: RadarProduct, slot: MomentSlot) -> (f32, f32) {
     match product {
-        // Unitless; GR pins the meso class near |1|, ±4 keeps extreme
-        // couplets on scale at 0.031 resolution.
-        RadarProduct::NormalizedRotation => (-4.0, 4.0),
+        // Unitless, and one number with the field's own NROT_LIMIT clamp, at
+        // 0.0395 resolution. `crate::derive::codec` carries the measurement
+        // that span was chosen on; this must move with it.
+        RadarProduct::NormalizedRotation => (-5.0, 5.0),
         // The estimator's own display clamp.
         RadarProduct::SpecificDifferentialPhase => {
             (crate::kdp::KDP_MIN_DISPLAY, crate::kdp::KDP_MAX_DISPLAY)

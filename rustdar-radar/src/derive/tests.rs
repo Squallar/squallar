@@ -304,9 +304,9 @@ fn each_derived_codec_spans_exactly_the_range_its_product_declares() {
         ),
         (
             RadarProduct::NormalizedRotation,
-            -4.0,
-            4.0,
-            "unitless, GR's meso class near |1| with headroom for extremes",
+            -5.0,
+            5.0,
+            "unitless, one number with the field's own NROT_LIMIT clamp",
         ),
         (
             RadarProduct::SpecificDifferentialPhase,
@@ -338,6 +338,90 @@ fn each_derived_codec_spans_exactly_the_range_its_product_declares() {
             decode(0.0),
         );
     }
+}
+
+/// NROT's decoded levels **are** GR2Analyst's lattice, not merely near it.
+///
+/// **Non-circular by construction.** Every expectation here is the
+/// reference's own number, and the lattice under test is read back out of
+/// the decode rather than recomputed from `codec`'s constants — so widening
+/// or narrowing that span fails this on the reference's quantum. The sibling
+/// above cannot catch that: it checks a span against the same span.
+///
+/// The reference's numbers come from the `campaign-harness` NROT record.
+/// Its hovered readouts pool to **14 780** values, and a two-parameter fit
+/// over them admits exactly one lattice — spacing **10/253 = 0.0395257**,
+/// offset **half a step**, so zero is deliberately *not* a point on it —
+/// with the denominators 252 and 254 both infeasible against those same
+/// readings. Its ends are what GR2Analyst's own Product Details panel
+/// reports hovered on a KCRP cut: minimum **−5.00**, maximum **+5.00**.
+///
+/// The half-step is the part worth pinning. The record's prose quotes the
+/// lattice as `n·0.03950 + 0.0210`, and that offset breaks 6.6% of the
+/// readings it was drawn from; half a step breaks none of them.
+#[test]
+fn nrot_decodes_onto_the_reference_lattice() {
+    /// GR2Analyst's quantum: 253 gaps across its own ±5.
+    const STEP: f64 = 10.0 / 253.0;
+    /// The ends its Product Details panel reports.
+    const CLAMP: f64 = 5.0;
+
+    let (scale, offset) = codec(RadarProduct::NormalizedRotation);
+    let decode = |raw: u8| (f64::from(raw) - f64::from(offset)) / f64::from(scale);
+    let levels: Vec<f64> = (2..=255u8).map(decode).collect();
+    assert_eq!(
+        levels.len(),
+        254,
+        "254 codes carry a value; 0 is no-data and 1 is reserved",
+    );
+
+    // Spacing, measured off the decode rather than assumed of it.
+    let measured = (levels[253] - levels[0]) / 253.0;
+    assert!(
+        (measured - STEP).abs() < 1e-6,
+        "NROT decodes on a {measured} lattice; the reference reports on {STEP}",
+    );
+    for pair in levels.windows(2) {
+        assert!(
+            (pair[1] - pair[0] - STEP).abs() < 1e-6,
+            "the lattice is not uniform: {} to {}",
+            pair[0],
+            pair[1],
+        );
+    }
+
+    // The offset. Zero is not a level, and the two straddling it sit half a
+    // step out — the half of the reference's lattice its own prose got wrong.
+    let nearest = levels
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, |acc, v| acc.min(v.abs()));
+    assert!(
+        (nearest - STEP / 2.0).abs() < 1e-6,
+        "the level nearest zero is {nearest}, not the reference's half-step {}",
+        STEP / 2.0,
+    );
+
+    // And the ends are the reference's ends, reached with no clamp engaged:
+    // `synth_sweep`'s `clamp(2, 255)` cannot fire on a value the field can
+    // produce, because the field's own clamp is where this span stops.
+    assert!(
+        (levels[0] + CLAMP).abs() < 1e-3,
+        "raw code 2 means {}, not the reference's −5",
+        levels[0],
+    );
+    assert!(
+        (levels[253] - CLAMP).abs() < 1e-3,
+        "raw code 255 means {}, not the reference's +5",
+        levels[253],
+    );
+    let encode = |v: f64| (v * f64::from(scale) + f64::from(offset)).round() as i64;
+    assert_eq!(encode(-CLAMP), 2, "−5 must reach raw 2 without saturating");
+    assert_eq!(
+        encode(CLAMP),
+        255,
+        "+5 must reach raw 255 without saturating"
+    );
 }
 
 /// SRV with neither an override nor a usable wind fit refuses: base
@@ -490,12 +574,12 @@ fn a_derived_voxel_grid_resamples_the_derived_field() {
     assert_eq!(srv.value_range().1, 63.5, "SRV rides velocity's ramp");
     assert_eq!(
         nrot.value_range().1,
-        4.0,
-        "NROT carries its own ±4 unitless ramp",
+        5.0,
+        "NROT carries its own ±5 unitless ramp",
     );
     assert!(
-        (f64::from(nrot.value_range().0) - (-4.0 - 8.0 / 254.0)).abs() < 1e-3,
-        "NROT's index 0 sits one step under −4",
+        (f64::from(nrot.value_range().0) - (-5.0 - 10.0 / 254.0)).abs() < 1e-3,
+        "NROT's index 0 sits one step under −5",
     );
 
     // And a derived grid survives its own wire form: the far end

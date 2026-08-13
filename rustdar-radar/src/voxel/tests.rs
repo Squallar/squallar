@@ -3348,11 +3348,17 @@ fn the_default_transparency_profile_is_measured_per_product() {
             // Velocity's own count, which is what sharing its band means.
             ("srv", 41, 180),
             // Only the unpainted core of the ramp: |NROT| under the
-            // algorithm's significance floor, on a ±4 span. Everything
+            // algorithm's significance floor, on a ±5 span. Everything
             // outside it starts at the weak class's quarter alpha, which
             // is over the see-through ceiling, so the count is the
             // unpainted band and nothing else.
-            ("nrot", 27, 180),
+            //
+            // Was 27 on the ±4 span. The floor did not move — the ramp
+            // did: a quarter more value per index over the same 254 of
+            // them puts a fifth fewer inside a band the palette fixes in
+            // unitless rotation. `derive::codec` carries why the span
+            // widened.
+            ("nrot", 21, 180),
             ("kdp", 60, 180),
         ],
         "see-through data entries and max data alpha, per product",
@@ -3453,9 +3459,9 @@ fn the_isosurface_params_translate_the_user_threshold_per_shape() {
 
     // The derived products carry their own ramps, so their thresholds
     // must be read through those and not through the source moment's.
-    // NROT spans ±4 unitless where the velocity slot it borrows spans
+    // NROT spans ±5 unitless where the velocity slot it borrows spans
     // ±63.5 m/s: a translation that reached for the slot would put the
-    // meso surface sixteen times too low on the ramp.
+    // meso surface nearly thirteen times too low on the ramp.
     let nrot = grid(RadarProduct::NormalizedRotation);
     let (centre, threshold) = nrot.iso_uniform_params(1.0);
     let c = nrot.value_to_index(0.0);
@@ -3469,9 +3475,13 @@ fn the_isosurface_params_translate_the_user_threshold_per_shape() {
         nrot.value_range(),
         value_range_for_product(RadarProduct::NormalizedRotation, MomentSlot::Velocity,)
     );
+    // A tenth of the ±5 ramp, to within an index. Two-sided on purpose:
+    // the lower bound is the ±63.5 misroute this paragraph names (which
+    // would read 1/127), and the upper one catches the span drifting back
+    // under NROT's own clamp without this pin noticing.
     assert!(
-        threshold > 0.1,
-        "|NROT| = 1 is an eighth of a ±4 ramp; {threshold} says the \
+        (threshold - 0.1).abs() < 2.0 / 255.0,
+        "|NROT| = 1 is a tenth of a ±5 ramp; {threshold} says the \
              surface was translated through velocity's ±63.5 span",
     );
     // SRV keeps velocity's ramp and velocity's centre; KDP is sequential
