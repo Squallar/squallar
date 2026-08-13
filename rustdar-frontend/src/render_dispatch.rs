@@ -767,9 +767,11 @@ impl SectionInputKey {
 /// hands straight to `Context::load_texture`.
 ///
 /// The side is derived from the length rather than named, because a static
-/// render is `IMAGE_SIZE` or `LONG_RANGE_IMAGE_SIZE` square depending on how
-/// far its sweep reached and the caller here does not know which. Validating
-/// against the closed set is what makes deriving it safe:
+/// render is anywhere from `IMAGE_SIZE` up to the ceiling this device reported,
+/// depending on how far its sweep reached and how finely its gates sampled it,
+/// and the caller here does not know which. Validating what comes back — a
+/// whole number of pixels, a perfect square, a side inside this build's own
+/// bounds — is what makes deriving it safe:
 /// `ColorImage::from_rgba_unmultiplied` asserts on a mismatch, and this is
 /// called on a render worker natively — where a panic means no `RenderResponse`
 /// ever arrives, `render_in_flight` never clears, and the pane stays blank for

@@ -669,7 +669,7 @@ const CELL_POOL_REUSE_FACTOR: usize = 4;
 ///   **64 MiB** natively, 16 MiB on the web, where the ceiling is 2048.
 /// * The **grid** slot is fed only by loop frames, for the reason the section
 ///   above gives — a static pane's grid leaves in an `Arc` and never belongs to
-///   nobody. Every loop frame is dispatched `full_res: false`, so this slot
+///   nobody. Every loop frame is dispatched at `LOOP_IMAGE_SIZE`, so this slot
 ///   never sees anything larger than `LOOP_IMAGE_SIZE² × 4`: **16 MiB** on
 ///   desktop and mobile, 4 MiB on the web, where a loop frame is 1024². A
 ///   long-range static render does *take* this slot's buffer and grow it to 64

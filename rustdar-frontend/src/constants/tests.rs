@@ -1788,91 +1788,91 @@ fn the_loop_budget_table_is_the_one_the_constants_derive() {
             arm.name,
         );
     }
+}
 
-    /// The raster ceiling is the device's own answer, bounded by a measurement —
-    /// and it can only ever add to what this build already shipped.
-    ///
-    /// The row that matters most is the first. This box reports 32768 through
-    /// Vulkan (`vulkaninfo`: `maxImageDimension2D = 32768`, confirmed against
-    /// wgpu's adapter limits), and every render it made was 4096, because the only
-    /// question anything asked the device was `>= 4096`. A `bool` cannot carry a
-    /// size, and the size it was turned back into was a literal.
-    ///
-    /// Halving what is reported is not caution for its own sake: this box fails to
-    /// allocate the 32768 texture it advertises — `GL_OUT_OF_MEMORY` in Firefox
-    /// 153, `GL_INVALID_VALUE` in Chrome — while an AMD 890M reporting 16384
-    /// allocates 16384. One of the two overstates by a doubling and the number
-    /// alone does not say which. But halving *alone* would take the long-range
-    /// raster away from a device reporting exactly 4096, which draws one today, so
-    /// `long_range_image_side_px` is the floor under the result.
-    ///
-    /// Run over all three shipped brackets rather than the one this target
-    /// compiled, which is the property `budget` exists to give: the two classes
-    /// whose ceiling is pinned are asserted to be *unmoved* by any adapter, and
-    /// that is a claim about them, not an absence of one.
-    #[test]
-    fn the_raster_ceiling_follows_the_device_and_never_falls_below_what_shipped() {
-        for arm in arms() {
-            let floor = arm.long_range_image_side_px;
-            for reports in [32768u32, 16384, 8192, 4096, 2048] {
-                let got = arm.raster_side_for_adapter(reports);
-                let reported = reports as usize;
-                let why = format!("{}, a device reporting {reports}", arm.name);
+/// The raster ceiling is the device's own answer, bounded by a measurement —
+/// and it can only ever add to what this build already shipped.
+///
+/// The row that matters most is the first. This box reports 32768 through
+/// Vulkan (`vulkaninfo`: `maxImageDimension2D = 32768`, confirmed against
+/// wgpu's adapter limits), and every render it made was 4096, because the only
+/// question anything asked the device was `>= 4096`. A `bool` cannot carry a
+/// size, and the size it was turned back into was a literal.
+///
+/// Halving what is reported is not caution for its own sake: this box fails to
+/// allocate the 32768 texture it advertises — `GL_OUT_OF_MEMORY` in Firefox
+/// 153, `GL_INVALID_VALUE` in Chrome — while an AMD 890M reporting 16384
+/// allocates 16384. One of the two overstates by a doubling and the number
+/// alone does not say which. But halving *alone* would take the long-range
+/// raster away from a device reporting exactly 4096, which draws one today, so
+/// the long-range image side is the floor under the result.
+///
+/// Run over all three shipped brackets rather than the one this target
+/// compiled, which is the property `budget` exists to give: the two classes
+/// whose ceiling is pinned are asserted to be *unmoved* by any adapter, and
+/// that is a claim about them, not an absence of one.
+#[test]
+fn the_raster_ceiling_follows_the_device_and_never_falls_below_what_shipped() {
+    for arm in arms() {
+        let floor = arm.long_range_image_side_px;
+        for reports in [32768u32, 16384, 8192, 4096, 2048] {
+            let got = arm.raster_side_for_adapter(reports);
+            let reported = reports as usize;
+            let why = format!("{}, a device reporting {reports}", arm.name);
 
-                // Never more than the device claimed at all.
-                assert!(got <= reported, "{why}: {got} px over {reported} px");
-                // Never more than half of it, unless the floor is holding it up.
-                assert!(
-                    got <= (reported / 2).max(floor.min(reported)),
-                    "{why}: {got} px is more than half of what was reported",
-                );
-                // Never past the ceiling this class was measured to.
-                assert!(
-                    got <= arm.raster_side_ceiling_px,
-                    "{why}: {got} px over the {} px ceiling",
-                    arm.raster_side_ceiling_px,
-                );
-                // And never below what this build already draws on such a device,
-                // which is the whole no-regression guarantee.
-                assert!(
-                    got >= floor.min(reported),
-                    "{why}: {got} px is under the {} px this build already draws",
-                    floor.min(reported),
-                );
-            }
-
-            // A device that reports nothing usable still gets a raster it can hold
-            // rather than one it cannot.
-            assert!(arm.raster_side_for_adapter(0) <= 1);
-            assert!(arm.raster_side_for_adapter(1) <= 1);
-
-            // The two classes with a pinned ceiling must be unmoved by *any*
-            // adapter — that is what declining to raise them means, and asserting
-            // it is what stops a later edit raising them by accident.
-            if arm.raster_side_ceiling_px == arm.long_range_image_side_px {
-                assert_eq!(
-                    arm.raster_side_for_adapter(32768),
-                    arm.long_range_image_side_px,
-                    "{} has a pinned ceiling and must not move off it",
-                    arm.name,
-                );
-            }
+            // Never more than the device claimed at all.
+            assert!(got <= reported, "{why}: {got} px over {reported} px");
+            // Never more than half of it, unless the floor is holding it up.
+            assert!(
+                got <= (reported / 2).max(floor.min(reported)),
+                "{why}: {got} px is more than half of what was reported",
+            );
+            // Never past the ceiling this class was measured to.
+            assert!(
+                got <= arm.raster_side_ceiling_px,
+                "{why}: {got} px over the {} px ceiling",
+                arm.raster_side_ceiling_px,
+            );
+            // And never below what this build already draws on such a device,
+            // which is the whole no-regression guarantee.
+            assert!(
+                got >= floor.min(reported),
+                "{why}: {got} px is under the {} px this build already draws",
+                floor.min(reported),
+            );
         }
 
-        // The reading is a *reading*: on the class whose ceiling was raised, two
-        // devices that differ must not be given the same answer. This is the
-        // assertion the `bool` could not make, and it fails if the ceiling is ever
-        // pinned back to its floor without this test being revisited.
-        let desktop = budget::resolve(&DeviceProfile {
-            limits: crate::budget::BudgetLimits::DESKTOP,
-            ..DeviceProfile::for_target()
-        });
-        assert!(
-            desktop.raster_side_for_adapter(2048) < desktop.raster_side_for_adapter(32768),
-            "a device reporting the GLES floor and one reporting 32768 were \
-         offered the same ceiling",
-        );
-        assert_eq!(desktop.raster_side_for_adapter(32768), 8192);
-        assert_eq!(desktop.raster_side_for_adapter(4096), 4096);
+        // A device that reports nothing usable still gets a raster it can hold
+        // rather than one it cannot.
+        assert!(arm.raster_side_for_adapter(0) <= 1);
+        assert!(arm.raster_side_for_adapter(1) <= 1);
+
+        // The two classes with a pinned ceiling must be unmoved by *any*
+        // adapter — that is what declining to raise them means, and asserting
+        // it is what stops a later edit raising them by accident.
+        if arm.raster_side_ceiling_px == arm.long_range_image_side_px {
+            assert_eq!(
+                arm.raster_side_for_adapter(32768),
+                arm.long_range_image_side_px,
+                "{} has a pinned ceiling and must not move off it",
+                arm.name,
+            );
+        }
     }
+
+    // The reading is a *reading*: on the class whose ceiling was raised, two
+    // devices that differ must not be given the same answer. This is the
+    // assertion the `bool` could not make, and it fails if the ceiling is ever
+    // pinned back to its floor without this test being revisited.
+    let desktop = budget::resolve(&DeviceProfile {
+        limits: crate::budget::BudgetLimits::DESKTOP,
+        ..DeviceProfile::for_target()
+    });
+    assert!(
+        desktop.raster_side_for_adapter(2048) < desktop.raster_side_for_adapter(32768),
+        "a device reporting the GLES floor and one reporting 32768 were \
+     offered the same ceiling",
+    );
+    assert_eq!(desktop.raster_side_for_adapter(32768), 8192);
+    assert_eq!(desktop.raster_side_for_adapter(4096), 4096);
 }

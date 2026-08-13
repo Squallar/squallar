@@ -1309,8 +1309,9 @@ fn mirror_from_field(
 /// its extent — the picture the shipped mirror is made of.
 ///
 /// `render_from_sized` at this build's own long-range ceiling, not
-/// `render_from`: a pane render is dispatched with `full_res`, so a sweep
-/// reaching past the 230 km floor is drawn onto 4096 px rather than 2048, and
+/// `render_from`: a pane render is dispatched at the ceiling its device
+/// reported, so a sweep reaching past the 230 km floor is drawn onto at least
+/// 4096 px rather than 2048, and
 /// an instrument that modelled the mirror at the base size would be scoring a
 /// picture no pane ever shows.
 ///
