@@ -232,3 +232,174 @@ fn a_value_grids_side_is_its_exact_integer_square_root_or_nothing() {
         assert_eq!(value_grid_side(len), None, "{len}");
     }
 }
+
+/// **Every digit the status bar shows, pinned.**
+///
+/// The readout is about to stop reading a `side²` raster grid and start reading
+/// the gate the render painted. That is a change of *source*, and the whole
+/// claim being made for it is that a user watching a still pane sees no
+/// difference — so the strings below were captured from the grid
+/// implementation before it was touched, and the same table is asserted against
+/// whatever the readout reads next. If a digit moves, this fails, and the digit
+/// that moved is the finding.
+///
+/// It covers the product formatters rather than the geometry — one position,
+/// seventeen rows — because the geometry half is already pinned by
+/// [`the_hover_readout_reports_range_and_azimuth_from_the_site`] and by
+/// `rustdar_radar::beam::tests::
+/// the_hover_readouts_polar_coordinates_are_bit_identical_to_the_deleted_copy`.
+/// What is not pinned anywhere else is the interaction of the value with the
+/// user's units: velocity in a metric preference still reads in mph, spectrum
+/// width follows the speed unit, hail follows its own, and the distance unit
+/// changes the range half of the same string. Those are the rows that would
+/// move silently.
+///
+/// **What this deliberately does not pin is which gate is read.** No fixture
+/// here goes through a rasterizer, so the value is placed under the pointer by
+/// hand and the assertion is on the formatting alone. That the new source names
+/// the same gate as the old grid is
+/// `rustdar_radar::render::tests::the_polar_field_answers_what_the_value_grid_holds`,
+/// which is where a rasterizer is available to be asked.
+const PINNED_READOUTS: &[(&str, &str)] = &[
+    (
+        "reflectivity",
+        "Lat: 35.9000\u{b0}, Lon: -96.8000\u{b0} | Range: 76.4km, Az: 34.3\u{b0} | Reflectivity: 42.5 dBZ",
+    ),
+    (
+        "reflectivity negative",
+        "Lat: 35.9000\u{b0}, Lon: -96.8000\u{b0} | Range: 76.4km, Az: 34.3\u{b0} | Reflectivity: -8.2 dBZ",
+    ),
+    (
+        "reflectivity miles",
+        "Lat: 35.9000\u{b0}, Lon: -96.8000\u{b0} | Range: 47.5mi, Az: 34.3\u{b0} | Reflectivity: 42.5 dBZ",
+    ),
+    (
+        "velocity m/s",
+        "Lat: 35.9000\u{b0}, Lon: -96.8000\u{b0} | Range: 76.4km, Az: 34.3\u{b0} | Velocity: -39.1 mph",
+    ),
+    (
+        "velocity mph",
+        "Lat: 35.9000\u{b0}, Lon: -96.8000\u{b0} | Range: 47.5mi, Az: 34.3\u{b0} | Velocity: -39.1 mph",
+    ),
+    (
+        "spectrum width",
+        "Lat: 35.9000\u{b0}, Lon: -96.8000\u{b0} | Range: 76.4km, Az: 34.3\u{b0} | Spectrum Width: 7.3 mph",
+    ),
+    (
+        "zdr",
+        "Lat: 35.9000\u{b0}, Lon: -96.8000\u{b0} | Range: 76.4km, Az: 34.3\u{b0} | Diff. Reflectivity: 1.75 dB",
+    ),
+    (
+        "cc",
+        "Lat: 35.9000\u{b0}, Lon: -96.8000\u{b0} | Range: 76.4km, Az: 34.3\u{b0} | Corr. Coefficient: 0.9870",
+    ),
+    (
+        "phi",
+        "Lat: 35.9000\u{b0}, Lon: -96.8000\u{b0} | Range: 76.4km, Az: 34.3\u{b0} | Diff. Phase: 122.0\u{b0}",
+    ),
+    (
+        "kdp",
+        "Lat: 35.9000\u{b0}, Lon: -96.8000\u{b0} | Range: 76.4km, Az: 34.3\u{b0} | KDP: 0.85 \u{b0}/km",
+    ),
+    (
+        "nrot",
+        "Lat: 35.9000\u{b0}, Lon: -96.8000\u{b0} | Range: 76.4km, Az: 34.3\u{b0} | NROT: 2.75",
+    ),
+    (
+        "echo tops",
+        "Lat: 35.9000\u{b0}, Lon: -96.8000\u{b0} | Range: 76.4km, Az: 34.3\u{b0} | Echo Tops: 42.0 kft",
+    ),
+    (
+        "vil",
+        "Lat: 35.9000\u{b0}, Lon: -96.8000\u{b0} | Range: 76.4km, Az: 34.3\u{b0} | VIL: 18.0 kg/m\u{b2}",
+    ),
+    (
+        "mehs",
+        "Lat: 35.9000\u{b0}, Lon: -96.8000\u{b0} | Range: 47.5mi, Az: 34.3\u{b0} | MEHS: 1.25 in",
+    ),
+    (
+        "hca",
+        "Lat: 35.9000\u{b0}, Lon: -96.8000\u{b0} | Range: 76.4km, Az: 34.3\u{b0} | HHC: No Data",
+    ),
+    (
+        "precip rate",
+        "Lat: 35.9000\u{b0}, Lon: -96.8000\u{b0} | Range: 47.5mi, Az: 34.3\u{b0} | Precip Rate: 0.35 in/hr",
+    ),
+    (
+        "no gate",
+        "Lat: 35.9000\u{b0}, Lon: -96.8000\u{b0} | Range: 76.4km, Az: 34.3\u{b0} ",
+    ),
+];
+
+/// The product, preferences and value behind each row of [`PINNED_READOUTS`],
+/// in the same order.
+fn pinned_cases() -> Vec<(RadarProduct, UserPreferences, Option<f32>)> {
+    use rustdar_units::{DistanceUnit, HailSizeUnit, PrecipRateUnit, SpeedUnit};
+    let imperial = UserPreferences {
+        distance: DistanceUnit::Miles,
+        speed: SpeedUnit::Mph,
+        hail_size: HailSizeUnit::Inches,
+        precip_rate: PrecipRateUnit::InchesPerHour,
+        ..UserPreferences::default()
+    };
+    let si = UserPreferences::default;
+    vec![
+        (RadarProduct::Reflectivity, si(), Some(42.5)),
+        (RadarProduct::Reflectivity, si(), Some(-8.25)),
+        (RadarProduct::Reflectivity, imperial.clone(), Some(42.5)),
+        (RadarProduct::Velocity, si(), Some(-17.5)),
+        (RadarProduct::Velocity, imperial.clone(), Some(-17.5)),
+        (RadarProduct::SpectrumWidth, si(), Some(3.25)),
+        (RadarProduct::DifferentialReflectivity, si(), Some(1.75)),
+        (RadarProduct::CorrelationCoefficient, si(), Some(0.987)),
+        (RadarProduct::DifferentialPhase, si(), Some(122.0)),
+        (RadarProduct::SpecificDifferentialPhase, si(), Some(0.85)),
+        (RadarProduct::NormalizedRotation, si(), Some(2.75)),
+        (RadarProduct::EchoTops, si(), Some(42.0)),
+        (RadarProduct::VerticallyIntegratedLiquid, si(), Some(18.0)),
+        (
+            RadarProduct::MaxExpectedHailSize,
+            imperial.clone(),
+            Some(1.25),
+        ),
+        (RadarProduct::HydrometeorClassification, si(), Some(6.0)),
+        (RadarProduct::PrecipitationRate, imperial, Some(0.35)),
+        (RadarProduct::Reflectivity, si(), None),
+    ]
+}
+
+/// See [`PINNED_READOUTS`].
+#[test]
+fn the_hover_readouts_digits_do_not_move() {
+    const SIDE: usize = 8;
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(80.0, 80.0));
+    // Row 3, column 5 of an 8 x 8 grid.
+    let hover_pos = egui::pos2(55.0, 35.0);
+    let cases = pinned_cases();
+    assert_eq!(
+        cases.len(),
+        PINNED_READOUTS.len(),
+        "one case per pinned row"
+    );
+
+    for ((product, prefs, value), &(label, expected)) in cases.iter().zip(PINNED_READOUTS) {
+        let mut grid = vec![f32::NAN; SIDE * SIDE];
+        if let Some(v) = value {
+            grid[3 * SIDE + 5] = *v;
+        }
+        let got = compute_hover_info_raw(
+            &grid,
+            &HoverInput {
+                site_lat: 35.3333,
+                site_lon: -97.2778,
+                hover_lat: 35.9,
+                hover_lon: -96.8,
+                hover_pos,
+                rect,
+            },
+            *product,
+            prefs,
+        );
+        assert_eq!(got, expected, "{label}");
+    }
+}
