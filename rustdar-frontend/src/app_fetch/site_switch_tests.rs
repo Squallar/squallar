@@ -387,6 +387,97 @@ fn re_picking_the_site_a_pane_is_on_keeps_its_scan() {
     );
 }
 
+/// The same no-op pick, on the pane's **loop** — the half the rule above did
+/// not reach.
+///
+/// The scan, the section and the `data_time` all moved behind the
+/// `pane.site != site` guard when the site-switch release landed; the loop
+/// reset and `LoopDownloadManager::clear_all` were left in front of it. So the
+/// two halves of one handler disagreed about what a re-pick is, and this is the
+/// half that costs the most: a re-pick threw away a listing, every downloaded
+/// volume and every rendered frame of a loop that was correct — and raises
+/// neither of the two actions that rebuild one (`handle_enable_loop`,
+/// `reinit_active_loops`), so the pane fell back to its static image for the
+/// rest of the session with the transport still showing the loop on.
+///
+/// Both halves are asserted because either alone leaves the loop dead. A
+/// surviving `loop_state` whose scans and frame plan were cleared underneath it
+/// is a loop that plays blank frames and has nothing queued to fill them.
+#[test]
+fn re_picking_the_site_a_pane_is_on_keeps_its_loop() {
+    use rustdar_radar::archive::Identifier;
+
+    let mut app = headless(TestBridge::desktop());
+    pane_on(&mut app, WSR88D, Some(wsr88d_scan_info()));
+
+    let radar_site = rustdar_radar::sites::get_radar_site(WSR88D)
+        .expect("KPBZ is in the resolved site table")
+        .clone();
+    let pane = app.gui.pane_mut(0).expect("a fresh Gui has one pane");
+    pane.loop_state = rustdar_egui::pane::LoopPlaybackState::new_for_loop(
+        3600,
+        &radar_site,
+        rustdar_radar::types::RenderView::PlanView,
+    );
+    for minute in [0, 4, 8] {
+        super::append_polled_frame(&mut pane.loop_state, WSR88D, at(minute));
+    }
+    let frames_before: Vec<NaiveDateTime> = pane
+        .loop_state
+        .frames
+        .iter()
+        .map(|frame| frame.timestamp)
+        .collect();
+    assert_eq!(frames_before.len(), 3, "precondition: the loop has frames");
+
+    // The two halves of the loop's download state: a volume already in hand for
+    // the oldest frame, and the queue the rest are still owed through.
+    app.loop_mgr
+        .cache_scan(WSR88D, at(0), (empty_scan().into(), Default::default()));
+    app.loop_mgr.insert_pending(
+        0,
+        crate::loop_downloads::PendingDownloads {
+            site: WSR88D.to_string(),
+            queue: [(at(8), Identifier::new("KPBZ20260811_180800_V06".to_string()))]
+                .into_iter()
+                .collect(),
+        },
+    );
+    assert!(
+        !app.loop_mgr.is_pane_done(0),
+        "precondition: the loop still owes a download",
+    );
+
+    switch_to(&mut app, WSR88D);
+
+    let loop_state = &app.gui.pane(0).expect("a fresh Gui has one pane").loop_state;
+    assert!(
+        loop_state.is_active(),
+        "a no-op pick switched the pane's loop off; nothing rebuilds it, so the \
+         pane is back to its static image with the transport still reading \
+         \"loop on\"",
+    );
+    assert_eq!(
+        loop_state
+            .frames
+            .iter()
+            .map(|frame| frame.timestamp)
+            .collect::<Vec<_>>(),
+        frames_before,
+        "a no-op pick threw away a listing that named this very site's files",
+    );
+    assert!(
+        app.loop_mgr.is_cached(WSR88D, &at(0)),
+        "a no-op pick dropped a volume this very site's loop had already \
+         downloaded and rendered from",
+    );
+    assert!(
+        !app.loop_mgr.is_pane_done(0),
+        "a no-op pick emptied the download queue out from under a surviving \
+         loop, so its remaining frames have nothing queued to fill them",
+    );
+}
+
 /// The switch ends the accumulation; it does not weaken it.
 ///
 /// `apply_chunk_scan_info` unions a partial volume's products and tilts into
