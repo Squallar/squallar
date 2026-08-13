@@ -553,6 +553,48 @@ const PROFILE_LAYERS: usize = 40;
 /// rather than by stopping. See there for what stopping cost.
 const PROFILE_MAX_SAMPLES: usize = 16384;
 
+/// Largest RMS fit residual, m/s, a layer may carry and still be published as
+/// a wind — the RPG's own goodness-of-fit ceiling, converted.
+///
+/// # This number is the RPG's, not ours
+///
+/// The NVW product carries the adaptable parameters the RPG's own VAD was run
+/// under, and a fit-quality ceiling is one of them: **RMS ≤ 9.7 kt**, alongside
+/// ≥25 data points per level, 2 fit passes, and a fixed 16.2 nmi ring. The RPG
+/// honours it rather than merely declaring it — across the thirteen volumes
+/// whose NVW we hold, **not one published a level whose RMS exceeded 9.7**.
+///
+/// We had the other two gates and not this one. [`WindProfileBuilder::finish`]
+/// refuses a layer with under 200 samples and trims residuals over 12 m/s
+/// before its second pass, but nothing then asked whether what came back
+/// *fit*: a layer whose samples are a folded mess solves its normal equations
+/// just as willingly as a clean one, returns a wind that is biased low, and is
+/// published with no mark on it. The dealiaser then seeds from that wind.
+///
+/// # Why the same number applies to a differently-shaped fit
+///
+/// The RPG fits one elevation's ring; this fits every tilt pooled into a
+/// height layer, so its residual carries real wind variation across the pooling
+/// volume on top of measurement noise, and is structurally the larger of the
+/// two. Applying the RPG's ceiling to it is therefore **conservative in the
+/// direction that matters** — it refuses some layers the RPG would have kept,
+/// and refuses every layer the RPG would have refused. A gate that errs toward
+/// silence is the right error for a seed: [`WindProfile::predict`] is consulted
+/// to *propose* a branch, and a layer that proposes nothing costs coverage,
+/// while a layer that proposes a wrong wind costs correctness.
+const PROFILE_MAX_RMS_MS: f64 = 9.7 * 0.514_444;
+
+/// Residual, m/s, past which a sample is dropped from the second of
+/// [`WindProfileBuilder::finish`]'s two fit passes — the robust-regression trim
+/// that keeps folded bins in a raw sweep from dragging the layer's wind.
+///
+/// Named because [`PROFILE_MAX_RMS_MS`] is measured over the population this
+/// admits, and the two numbers have to be read together: an RMS taken over the
+/// untrimmed samples would be a statement about the outliers the trim exists to
+/// discard, not about how well the published wind describes the gates it was
+/// fitted from.
+const PROFILE_TRIM_MS: f64 = 12.0;
+
 /// Horizontal wind fitted per height layer from every velocity tilt of a
 /// volume: vr ≈ u·sin(az)·cos(el) + v·cos(az)·cos(el) + c.
 pub struct WindProfile {
@@ -799,7 +841,7 @@ impl WindProfileBuilder {
                     let mut n = 0u32;
                     for &(s, c, v) in pts {
                         if let Some((u, w, cc)) = fit
-                            && (u * s + w * c + cc - v).abs() > 12.0
+                            && (u * s + w * c + cc - v).abs() > PROFILE_TRIM_MS
                         {
                             continue;
                         }
@@ -834,6 +876,24 @@ impl WindProfileBuilder {
                             / det
                     };
                     fit = Some((solve(0), solve(1), solve(2)));
+                }
+                // The gate the RPG publishes and this did not have. A layer
+                // whose samples are a folded mess solves as willingly as a
+                // clean one; only the residual distinguishes them, and until
+                // now nothing looked at it. See [`PROFILE_MAX_RMS_MS`].
+                if let Some((u, w, cc)) = fit {
+                    let (mut sq, mut n) = (0.0f64, 0u32);
+                    for &(s, c, v) in pts {
+                        let r = u * s + w * c + cc - v;
+                        if r.abs() > PROFILE_TRIM_MS {
+                            continue;
+                        }
+                        sq += r * r;
+                        n += 1;
+                    }
+                    if n == 0 || (sq / f64::from(n)).sqrt() > PROFILE_MAX_RMS_MS {
+                        fit = None;
+                    }
                 }
                 if fit.is_some() {
                     any = true;
@@ -4427,14 +4487,33 @@ mod tests {
     /// A layer offered more than it can hold is fitted from all of it, thinned
     /// — not from the first of it.
     ///
-    /// Two cuts of identical geometry, one carrying a 10 m/s westerly and one
-    /// a 10 m/s southerly. Least squares over two stacked copies of one design
+    /// Two cuts of identical geometry, one carrying a 6 m/s westerly and one
+    /// a 6 m/s southerly. Least squares over two stacked copies of one design
     /// is the mean of what each copy asks for, so the layer's answer is
-    /// (5, 5) — a 14 m/s wind from 225° — and each cut on its own would say
-    /// (10, 0) or (0, 10). Each cut offers this layer 69 120 samples against a
+    /// (3, 3) — a 4.2 m/s wind from 225° — and each cut on its own would say
+    /// (6, 0) or (0, 6). Each cut offers this layer 69 120 samples against a
     /// [`PROFILE_MAX_SAMPLES`] of 16 384 — the pair thin to 8640 at a stride
     /// of 16 — so a layer that stopped at the cap would hold nothing but the
-    /// first cut's opening rows and answer (10, 0).
+    /// first cut's opening rows and answer (6, 0).
+    ///
+    /// # Why 6 m/s and not 10
+    ///
+    /// Two contradictory winds are, by construction, a layer that does not fit
+    /// a single VAD, and [`PROFILE_MAX_RMS_MS`] now measures exactly that. The
+    /// residual against the pooled answer is `(v/2)·(cos − sin)` — amplitude
+    /// `v·√2/2`, and over a uniform circle an RMS of exactly **`v/2`**. At the
+    /// original 10 m/s that is 5.000 m/s against a ceiling of 4.990: the
+    /// fixture missed it by two parts in a thousand, and the gate was right to
+    /// refuse it. At 6 m/s the RMS is 3.0 and the fixture is clear of the
+    /// ceiling by the same factor it was over it.
+    ///
+    /// The amplitude was never what this test is about. Halving both winds
+    /// halves the answer and changes nothing about the thinning: a layer that
+    /// kept a prefix still reads the first cut alone, and still answers
+    /// `(6, 0)` instead of `(3, 3)`. What the scaling buys is that the two
+    /// properties stay separable — this test fails for a broken cap, and
+    /// `a_layer_whose_residual_clears_the_rpgs_ceiling_is_not_published` fails
+    /// for a broken gate, neither standing in for the other.
     #[test]
     fn a_layer_offered_more_than_it_holds_is_fitted_from_the_whole_volume() {
         // 700 gates 50 m apart reach 35 km, which at 0.5° is still inside the
@@ -4452,7 +4531,7 @@ mod tests {
             (grid, azimuths)
         };
         let mut builder = WindProfileBuilder::new();
-        for wind in [(10.0, 0.0), (0.0, 10.0)] {
+        for wind in [(6.0, 0.0), (0.0, 6.0)] {
             let (grid, azimuths) = cut(wind);
             builder.add_sweep(
                 &VelocitySweep {
@@ -4477,8 +4556,8 @@ mod tests {
         // slack here is that one sample and the round-off of nine thousand
         // normal-equation terms.
         assert!(
-            (u - 5.0).abs() < 0.01 && (v - 5.0).abs() < 0.01,
-            "the layer fitted ({u:.4}, {v:.4}), not the (5, 5) both cuts average to",
+            (u - 3.0).abs() < 0.01 && (v - 3.0).abs() < 0.01,
+            "the layer fitted ({u:.4}, {v:.4}), not the (3, 3) both cuts average to",
         );
     }
 
@@ -4501,6 +4580,95 @@ mod tests {
             wind,
             1e-9,
             "90° sector",
+        );
+    }
+
+    /// [`vad_cut`] with a residual of a **chosen size** laid over the wind:
+    /// `+amp` on even gate indices, `−amp` on odd ones.
+    ///
+    /// The perturbation alternates along the beam, so within any one row — and
+    /// every sample of a row shares that row's `(sin, cos)` — it sums to zero
+    /// across the gates the fit reads. It is therefore very nearly orthogonal
+    /// to the design `(sin·cos el, cos·cos el, 1)`: the solved wind stays the
+    /// planted one and **every** residual is `±amp`, so the layer's RMS
+    /// residual is `amp` by construction rather than by anything this module
+    /// computes. That is what makes the gate test below non-circular — the
+    /// number the test asserts against is one the test itself put there.
+    fn vad_cut_noisy(
+        rows: usize,
+        (u, v): (f64, f64),
+        el_deg: f64,
+        amp: f64,
+    ) -> (Vec<Vec<f64>>, Vec<f64>) {
+        let azimuths: Vec<f64> = (0..rows).map(|i| i as f64).collect();
+        let cos_el = el_deg.to_radians().cos();
+        let grid = azimuths
+            .iter()
+            .map(|a| {
+                let r = a.to_radians();
+                let base = (u * r.sin() + v * r.cos()) * cos_el;
+                (0..200)
+                    .map(|j| if j % 2 == 0 { base + amp } else { base - amp })
+                    .collect()
+            })
+            .collect();
+        (grid, azimuths)
+    }
+
+    /// A layer that solves but does not *fit* is not a wind.
+    ///
+    /// The RPG publishes the goodness-of-fit ceiling its own VAD honours —
+    /// RMS ≤ 9.7 kt — inside the NVW product, and across the thirteen volumes
+    /// whose NVW we hold it never published a level above it. This module had
+    /// the RPG's sample-count gate and its trim and not this one, so a layer
+    /// fitted on a folded mess was published with no mark on it and the
+    /// dealiaser seeded from it.
+    ///
+    /// 9.7 kt is 4.990 m/s. The two arms plant a residual of **4 m/s (7.8 kt)**
+    /// and **6 m/s (11.7 kt)**, bracketing the ceiling from both sides with a
+    /// margin far wider than the fit's own round-off. The planted wind is
+    /// identical in both; only how well the gates agree with it changes.
+    ///
+    /// Every layer of the refused arm carries the same residual, so all of them
+    /// fail together and the builder has no layer to publish — `finish` returns
+    /// `None` rather than a profile of clamp-copies of nothing.
+    #[test]
+    fn a_layer_whose_residual_clears_the_rpgs_ceiling_is_not_published() {
+        let wind = (9.0, -6.0);
+        // 4 m/s of residual — 7.8 kt, inside the RPG's 9.7 — is a fit.
+        let (grid, azimuths) = vad_cut_noisy(360, wind, 0.5, 4.0);
+        let mut builder = WindProfileBuilder::new();
+        builder.add_sweep(&vad_sweep(&grid, &azimuths), 0.5);
+        let kept = builder
+            .finish()
+            .expect("a 7.8 kt residual is under the RPG's 9.7 kt ceiling");
+        // The wind itself is untouched by the perturbation, which is what
+        // "orthogonal to the design" buys and what makes the arms comparable.
+        assert_wind(&kept, wind, 0.05, "4 m/s residual");
+
+        // 6 m/s — 11.7 kt — is not, and no layer of it is.
+        let (grid, azimuths) = vad_cut_noisy(360, wind, 0.5, 6.0);
+        let mut builder = WindProfileBuilder::new();
+        builder.add_sweep(&vad_sweep(&grid, &azimuths), 0.5);
+        assert!(
+            builder.finish().is_none(),
+            "an 11.7 kt residual is over the RPG's 9.7 kt ceiling and must not \
+             be published as a wind",
+        );
+    }
+
+    /// The ceiling is the RPG's published number, not a tuned one: 9.7 kt
+    /// expressed in the m/s the fit works in.
+    #[test]
+    fn the_fit_quality_ceiling_is_the_rpgs_published_knots() {
+        assert!(
+            (PROFILE_MAX_RMS_MS - 9.7 * 0.514_444).abs() < 1e-12,
+            "the ceiling must stay 9.7 kt converted, not a number chosen here",
+        );
+        // Bracketed by the two arms above, so neither is a boundary case.
+        assert!(
+            4.0 < PROFILE_MAX_RMS_MS && PROFILE_MAX_RMS_MS < 6.0,
+            "the test's two residuals must straddle the ceiling",
         );
     }
 

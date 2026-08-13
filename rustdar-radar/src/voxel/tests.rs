@@ -279,9 +279,40 @@ fn six_moment_scan() -> Scan {
                     // testing the out-of-span clamp rather than the
                     // builder, and the clamp has its own test.
                     let floor = usize::from(if slot == 2 { 129u8 } else { 2 });
-                    let bytes: Vec<u8> = (0..n_gates)
-                        .map(|j| (floor + ((j * 7 + slot * 31 + i) % (256 - floor))) as u8)
-                        .collect();
+                    let bytes: Vec<u8> = if slot == 1 {
+                        // Velocity is the one slot that cannot be an arbitrary
+                        // byte pattern, because a real consumer *fits* it: the
+                        // SRV and NROT products both seed from
+                        // `velocity::volume_wind_profile`, and
+                        // `nrot::PROFILE_MAX_RMS_MS` now refuses a layer whose
+                        // samples do not describe a wind. The ramp below spans
+                        // ±63 m/s in a sawtooth along the beam — an RMS
+                        // residual of tens of m/s against any VAD — so with it
+                        // in this slot the profile is (correctly) refused, and
+                        // every product that needs one stops building.
+                        //
+                        // So velocity carries an actual VAD field: a uniform
+                        // 21.1 m/s wind, `vr = (u·sin az + v·cos az)·cos el`.
+                        // The wrong-slot trap this fixture exists for is
+                        // untouched — a builder reaching for the velocity slot
+                        // while meaning another moment still reads a number
+                        // that is nothing like the sawtooth its own slot
+                        // carries, and the other five slots keep both their
+                        // per-moment code and their variation along the beam.
+                        // What is given up is only velocity's *range*
+                        // variation, and only because a VAD wind at one
+                        // elevation does not have any.
+                        let r = f64::from(az).to_radians();
+                        let cos_el = f64::from(elevation_deg).to_radians().cos();
+                        let vr = (18.0 * r.sin() + -11.0 * r.cos()) * cos_el;
+                        let code = ((vr * f64::from(scale) + f64::from(offset)).round() as i64)
+                            .clamp(2, 255) as u8;
+                        vec![code; n_gates]
+                    } else {
+                        (0..n_gates)
+                            .map(|j| (floor + ((j * 7 + slot * 31 + i) % (256 - floor))) as u8)
+                            .collect()
+                    };
                     Some(MomentData::from_fixed_point(
                         bytes.len() as u16,
                         FIRST_GATE_M,
