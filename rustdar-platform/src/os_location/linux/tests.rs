@@ -168,19 +168,6 @@ fn the_reading_this_machine_sends_becomes_a_device_fix_with_its_accuracy() {
     );
 }
 
-/// The gate downstream reads `accuracy_m`, so losing it is not a cosmetic
-/// omission: an accuracy-less fix is treated as trustworthy and spends the
-/// provisional site permanently.
-#[test]
-fn a_fix_without_its_accuracy_is_not_what_this_provider_emits() {
-    assert!(
-        fix_from_reading(&measured())
-            .expect("a position")
-            .accuracy_m
-            .is_some()
-    );
-}
-
 /// The honesty rule, pinned on the real path because it is the one somebody
 /// will be tempted to "improve": accuracy says how tight the circle is and
 /// says nothing at all about whether a satellite was involved. The variant
@@ -540,18 +527,30 @@ fn linux_offers_no_location_settings_page() {
 /// A session whose thread has exited must not leave the provider claiming
 /// to be live — otherwise `request` would see `active` and refuse to start
 /// a second one, and the button would be dead for the life of the process.
-/// This is the shape of that: the far end of the cancellation channel is
-/// what `active` reads.
+/// Through the provider's own `active`, on a reader holding a session whose
+/// receiver end has been dropped — which is exactly what a thread that
+/// returned leaves behind.
 #[test]
 fn a_session_whose_thread_has_gone_is_no_longer_active() {
+    let (fixes, _receiver) = std::sync::mpsc::channel();
     let (stop, stopped) = oneshot::channel::<()>();
-    let session = Session { stop };
-    assert!(!session.stop.is_canceled(), "the thread still holds it");
+    let reader = OsLocationReader {
+        sink: OsLocationSink {
+            fixes,
+            wake: Arc::new(|| unreachable!("`active` never wakes anything")),
+            report: Arc::new(|_| unreachable!("`active` never reports")),
+        },
+        session: Some(Session { stop }),
+    };
+    assert!(
+        reader.active(),
+        "while the thread holds the receiver, the session is live"
+    );
 
     drop(stopped);
 
     assert!(
-        session.stop.is_canceled(),
+        !reader.active(),
         "a thread that returned dropped the receiver, and `active` has to \
              see that"
     );
