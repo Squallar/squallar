@@ -15,6 +15,9 @@ pub struct EguiRenderer {
     /// construction because there is nowhere else to read them back from — see
     /// [`AttachmentConfig`].
     attachment_config: AttachmentConfig,
+    /// Where egui's texture deltas actually cross PCIe. See
+    /// [`texture_upload`] for why they no longer do it in one go.
+    uploads: texture_upload::TextureUploads,
 }
 
 /// The attachment layout of the egui render pass.
@@ -61,6 +64,13 @@ pub use mirror::{
     MIRROR_MAX_SIDE, MIRROR_RUNG_DWELL_FRAMES, MIRROR_RUNG_HYSTERESIS, MIRROR_SCALE_MAX,
     MirrorLimits, MirrorPlan, MirrorRungs, mirror_plan, mirror_size_for, wanted_scale_for,
 };
+
+/// How a texture delta gets onto the GPU without the frame paying for it.
+///
+/// Its own module because it is a whole upload strategy — row bands, a staging
+/// ring, a fallback and the arithmetic that bounds all three — and none of it is
+/// about the pass below that draws the result.
+pub mod texture_upload;
 
 /// What the mirror pass is asked to copy, and where to put it.
 ///
@@ -276,6 +286,7 @@ impl EguiRenderer {
                 depth_format: output_depth_format,
                 msaa_samples,
             },
+            uploads: texture_upload::TextureUploads::new(device),
         }
     }
 
@@ -392,10 +403,15 @@ impl EguiRenderer {
             .egui_ctx()
             .tessellate(full_output.shapes, pixels_per_point);
 
-        for (id, image_delta) in &full_output.textures_delta.set {
-            self.renderer
-                .update_texture(device, queue, *id, image_delta);
-        }
+        // Not `Renderer::update_texture` in a loop, which is `queue.write_texture`
+        // in a loop, which is up to 59 ms of blocking host stores on this thread
+        // at the raster ceiling. See [`texture_upload`].
+        let uploading = self.uploads.apply(
+            device,
+            queue,
+            &mut self.renderer,
+            &full_output.textures_delta.set,
+        );
         // Before the `update_buffers` below, not after, and that ordering is
         // the whole design — see `render_mirror`.
         if let Some(request) = mirror {
@@ -415,7 +431,15 @@ impl EguiRenderer {
             // resources still referenced by the recorded render pass.
             textures_to_free: full_output.textures_delta.free,
             user_command_buffers,
-            repaint_delay,
+            // An upload still has bands to move, so there must be another frame
+            // to move them on — the loop runs on `ControlFlow::Wait` and would
+            // otherwise leave the raster half on the glass until some unrelated
+            // input woke it. See `texture_upload`'s note on this.
+            repaint_delay: if uploading {
+                std::time::Duration::ZERO
+            } else {
+                repaint_delay
+            },
         }
     }
 
@@ -576,6 +600,9 @@ impl EguiRenderer {
         for id in ids {
             self.renderer.free_texture(id);
         }
+        // And whatever `texture_upload` was still holding for them: the texture
+        // it allocated, and any band of it that had not crossed yet.
+        self.uploads.free(ids);
     }
 
     /// Apply dark/light theme only when it actually changes.

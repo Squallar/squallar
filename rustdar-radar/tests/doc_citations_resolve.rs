@@ -201,6 +201,24 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          harness has to keep quiet.",
     ),
     (
+        "rustdar-frontend/src/egui_renderer/texture_upload.rs",
+        "update_egui_texture_from_wgpu_texture_with_sampler_options",
+        "`egui_wgpu::Renderer`'s own method, and the pivot the whole module \
+         turns on: it is the only public way to bind a texture this crate owns \
+         to a `TextureId` egui minted, and every constraint that follows — the \
+         1x1 stand-in, sticky ownership, the restated sampler — is a \
+         consequence of what it will and will not do. The paragraphs that \
+         explain those cannot avoid naming it.",
+    ),
+    (
+        "rustdar-frontend/src/egui_renderer/texture_upload/tests.rs",
+        "update_egui_texture_from_wgpu_texture_with_sampler_options",
+        "The same upstream method, named from the test that exists because it \
+         takes a `wgpu::SamplerDescriptor` rather than egui's `TextureOptions` \
+         — which is why the mapping between them is restated code, and why the \
+         test checks it.",
+    ),
+    (
         "rustdar-frontend/src/platform.rs",
         "attach_current_thread_for_scope",
         "The `jni` crate's scoped attachment call — the one this module must \
