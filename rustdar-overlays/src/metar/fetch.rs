@@ -621,10 +621,15 @@ fn parse_wind_token(token: &str) -> Option<(Option<u16>, u16)> {
     let (dir, speed_digits) = match body.strip_prefix("VRB") {
         Some(rest) => (None, rest),
         None => {
-            if body.len() < 5 {
-                return None;
-            }
-            let (d, rest) = body.split_at(3);
+            // `split_at_checked`, not `split_at`: `body` comes out of the raw
+            // METAR text IEM serves, and the `len() < 5` gate it replaces
+            // counted bytes. The token "éééKT" left a six-byte body that
+            // cleared that gate, and splitting it at byte 3 cut the second `é`
+            // in half — before the ASCII-digit test below could reject it.
+            // The gate is gone rather than corrected: the split failing is the
+            // same answer, and the length that actually matters is the one
+            // `speed_digits` is checked against further down.
+            let (d, rest) = body.split_at_checked(3)?;
             if !d.bytes().all(|b| b.is_ascii_digit()) {
                 return None;
             }

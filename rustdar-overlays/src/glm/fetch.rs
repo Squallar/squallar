@@ -531,15 +531,17 @@ fn parse_filename_start_time(key: &str) -> Option<NaiveDateTime> {
     let filename = key.rsplit('/').next()?;
     let s_idx = filename.find("_s")?;
     let s_field = &filename[s_idx + 2..];
-    if s_field.len() < 14 {
-        return None;
-    }
-    let digits = &s_field[..14];
-    let year: i32 = digits[0..4].parse().ok()?;
-    let doy: u32 = digits[4..7].parse().ok()?;
-    let hour: u32 = digits[7..9].parse().ok()?;
-    let min: u32 = digits[9..11].parse().ok()?;
-    let sec: u32 = digits[11..13].parse().ok()?;
+    // `get`, not `[..14]`: `key` is the text of a `<Key>` node in the bucket's
+    // own `ListObjectsV2` reply, filtered only on a `.nc` suffix, and `len()`
+    // counts bytes. A key whose `_s` field carries a multi-byte character put
+    // one of these six ranges inside a UTF-8 sequence — the length test could
+    // not see it — and killed the GLM poll task.
+    let digits = s_field.get(..14)?;
+    let year: i32 = digits.get(0..4)?.parse().ok()?;
+    let doy: u32 = digits.get(4..7)?.parse().ok()?;
+    let hour: u32 = digits.get(7..9)?.parse().ok()?;
+    let min: u32 = digits.get(9..11)?.parse().ok()?;
+    let sec: u32 = digits.get(11..13)?.parse().ok()?;
 
     let date = chrono::NaiveDate::from_yo_opt(year, doy)?;
     let time = chrono::NaiveTime::from_hms_opt(hour, min, sec)?;

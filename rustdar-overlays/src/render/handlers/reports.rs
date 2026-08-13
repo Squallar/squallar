@@ -41,15 +41,29 @@ impl OverlayItem for StormReportItem {
         };
         // The feed gives HHMM with no date, so local conversion has to assume
         // today's date.
-        let formatted_time = if report.time.len() == 4 {
-            let hhmm = format!("{}:{}", &report.time[..2], &report.time[2..]);
+        //
+        // Four ASCII digits, which is what "the feed gives HHMM" means, tested
+        // as such rather than as a byte count. `time` is a field of the SPC
+        // reports CSV and nothing between the fetch and here checks its
+        // charset, so `len() == 4` admitted two different wrong values: "1é2"
+        // is four bytes and `&time[..2]` split `é` down the middle — a panic in
+        // `popup_content`, on the render thread, taking the app rather than the
+        // overlay — and "éé" is four bytes that split *legally* into a clock
+        // reading "é:é". The digit test rejects both, and anything it rejects
+        // is shown below exactly as the feed sent it, which is the only place
+        // the user can see that it was unreadable.
+        let is_hhmm = report.time.len() == 4 && report.time.bytes().all(|b| b.is_ascii_digit());
+        // `split_at_checked` even so. The digit test above already makes the
+        // split legal, and it costs nothing to have the total form guard it
+        // anyway rather than leave the next edit to this line one condition
+        // away from the panic it replaced.
+        let split = is_hhmm.then(|| report.time.split_at_checked(2)).flatten();
+        let formatted_time = if let Some((hh, mm)) = split {
+            let hhmm = format!("{hh}:{mm}");
             match prefs.timezone {
                 rustdar_units::TimezonePreference::Utc => format!("{hhmm} UTC"),
                 rustdar_units::TimezonePreference::Local => {
-                    if let (Ok(h), Ok(m)) = (
-                        report.time[..2].parse::<u32>(),
-                        report.time[2..].parse::<u32>(),
-                    ) {
+                    if let (Ok(h), Ok(m)) = (hh.parse::<u32>(), mm.parse::<u32>()) {
                         let today = chrono::Utc::now().date_naive();
                         if let Some(naive) = today.and_hms_opt(h, m, 0) {
                             let utc_dt = chrono::TimeZone::from_utc_datetime(&chrono::Utc, &naive);
@@ -425,6 +439,93 @@ mod tests {
             };
             assert_eq!(size, expected, "{unit:?}");
         }
+    }
+
+    /// A report whose time field is multi-byte still opens its popup.
+    ///
+    /// `time` is `parts[0]` of the SPC storm-reports CSV, trimmed and kept
+    /// verbatim — nothing between the fetch and here checks its charset. The
+    /// gate was `time.len() == 4`, in bytes, so `"1é2"` cleared it and
+    /// `&time[..2]` then split `é` down the middle. This is the worst-placed
+    /// of the family: `popup_content` runs on the render thread, so one row of
+    /// a public CSV took the whole app down, not one overlay.
+    ///
+    /// Both clocks are exercised because the local branch re-derives the same
+    /// two halves, and it was the branch a user with the default timezone
+    /// would land on.
+    #[test]
+    fn a_report_whose_time_is_multibyte_still_opens_its_popup() {
+        for time in ["1é2", "éé", "é", "🌀", "12é4", "20:5"] {
+            for timezone in [
+                rustdar_units::TimezonePreference::Utc,
+                rustdar_units::TimezonePreference::Local,
+            ] {
+                let item = StormReportItem {
+                    report: StormReport {
+                        kind: StormReportKind::Tornado,
+                        time: time.into(),
+                        magnitude: None,
+                        location: "NORMAN".into(),
+                        county: "CLEVELAND".into(),
+                        state: "OK".into(),
+                        lat: 35.22,
+                        lon: -97.44,
+                        comments: String::new(),
+                    },
+                    index: 0,
+                };
+                let prefs = UserPreferences {
+                    timezone,
+                    ..UserPreferences::default()
+                };
+                // The assertion is that this returns at all. An unreadable
+                // time is shown as it stands rather than repaired: the popup
+                // is the only place the user can see the feed said something
+                // this build could not read.
+                let content = item.popup_content(&prefs);
+                assert!(
+                    content.sections.iter().any(|section| matches!(
+                        section,
+                        PopupSection::Text(text) if text.contains(time),
+                    )),
+                    "{time:?} ({timezone:?}) must still reach the popup verbatim",
+                );
+            }
+        }
+    }
+
+    /// The fix must not have stopped an ordinary HHMM being split into a clock.
+    ///
+    /// Without this, the guard could reject every time and the test above would
+    /// still pass, leaving every report reading `2015 UTC` instead of `20:15`.
+    #[test]
+    fn an_ordinary_hhmm_still_reads_as_a_clock() {
+        let item = StormReportItem {
+            report: StormReport {
+                kind: StormReportKind::Tornado,
+                time: "2015".into(),
+                magnitude: None,
+                location: "NORMAN".into(),
+                county: "CLEVELAND".into(),
+                state: "OK".into(),
+                lat: 35.22,
+                lon: -97.44,
+                comments: String::new(),
+            },
+            index: 0,
+        };
+        let prefs = UserPreferences {
+            timezone: rustdar_units::TimezonePreference::Utc,
+            ..UserPreferences::default()
+        };
+        let content = item.popup_content(&prefs);
+        assert!(
+            content.sections.iter().any(|section| matches!(
+                section,
+                PopupSection::Text(text) if text.contains("20:15"),
+            )),
+            "an ASCII HHMM must still be split into a clock",
+        );
     }
 }
 

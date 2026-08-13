@@ -321,6 +321,24 @@ fn wind_tokens_are_recognised_by_shape_not_by_substring() {
     }
 }
 
+/// A wind group whose direction field is multi-byte is rejected, not split.
+///
+/// `body` is a whitespace token of the raw METAR text IEM serves, and the
+/// length gate this replaced counted bytes: `"éééKT"` leaves a six-byte body,
+/// which cleared `len() < 5`, and `split_at(3)` then cut the second `é` in
+/// half. The ASCII-digit test that would have rejected the token ran *after*
+/// the split, so it never got the chance.
+#[test]
+fn a_multibyte_wind_group_is_rejected_rather_than_split_mid_character() {
+    for bad in ["éééKT", "1é2KT", "éé0KT", "ééééKT", "🌀🌀KT"] {
+        assert_eq!(
+            parse_wind_token(bad),
+            None,
+            "{bad:?} is not a wind group, and must not panic on the way to saying so",
+        );
+    }
+}
+
 /// Fails if `000` with a speed is drawn as due north; `000` means calm.
 #[test]
 fn a_zero_bearing_with_speed_is_not_treated_as_north() {
