@@ -28,7 +28,8 @@
 
 use super::{
     COVERAGE_MARGIN, MAX_FRAMING_PASSES, MAX_ZOOM_LEVEL, MIN_ZOOM_LEVEL, RegionDrag, corners_for,
-    dolly_for_step, ground_half_extent, viewport_for_region, wheel_rate_correction, zoom_step,
+    dolly_for_step, ground_half_extent, solve_viewport, viewport_for_region, wheel_rate_correction,
+    zoom_step,
 };
 
 /// A frame whose timing is unusable leaves walkers exactly as it found it.
@@ -553,56 +554,172 @@ fn the_framing_spends_no_more_of_the_mirror_than_the_box_needs() {
     }
 }
 
-/// What [`MAX_FRAMING_PASSES`] is actually worth, measured rather than asserted.
+/// **The early-out fires.** [`MAX_FRAMING_PASSES`] is a budget the solve stops
+/// short of, and this counts the passes it really ran.
 ///
-/// The east–west lane is exact in one pass because walkers' points per degree of
-/// longitude is exactly `tile_size · 2^zoom / 360`. The north–south lane is not,
-/// because Web Mercator's scale varies with latitude and the latitudes of the
-/// rect's own edges move as the zoom does, so each pass measures a projection
-/// the last one changed — and it approaches from **above**, which is why
-/// [`COVERAGE_MARGIN`] exists rather than an exact target.
+/// It ran four, always, for as long as this function has existed. The loop's
+/// settle test compared a shortfall measured against the box *plus*
+/// [`COVERAGE_MARGIN`] to `1.0` — a value the margin's own doc says the solve
+/// approaches from above and never reaches — so the condition was unsatisfiable
+/// and the constant described a ceiling nothing could come in under.
 ///
-/// Both facts are asserted here, on the worst shape this application can make.
-/// The budget is held to the convergence rate that justifies it, and the
-/// approach direction is held because the margin's whole argument rests on it:
-/// a solve that crossed below 1.0 would make the margin unnecessary slack, and
-/// one that stopped converging would make it insufficient.
+/// The predecessor of this test could not have caught it, and the shape of the
+/// mistake is worth keeping in view: it re-ran the solve's arithmetic in the
+/// test body and counted *that* loop's passes. Its copy used the settle
+/// condition the prose describes and the real loop used a different one, so both
+/// were green while disagreeing. So this drives [`super::solve_viewport`] — the
+/// shipped loop — and reads the count out of it.
+///
+/// The pass counts below are measured, and the fixtures are chosen to show what
+/// decides them. It is not latitude alone: which lane *binds* is the box's shape
+/// against the strip's, and the east lane is exact in one step where the north
+/// lane has to iterate. So a whole-ring box in a **tall** strip settles in two at
+/// 64.8°N — that is the shape the old constant's "two passes to spare" was
+/// measured on — and the same box in a **wide** strip at the same latitude takes
+/// four.
 #[test]
-fn the_framing_budget_is_enough_for_the_worst_shape_the_app_can_make() {
-    // Tall, high-latitude, whole-ring: the most Mercator can bend between a
-    // rect's centre and its poleward edge in this application.
-    let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(450.0, 900.0));
-    let centre = walkers::lat_lon(64.8, -147.5);
-    let want = half(460.125, 460.125);
+fn the_solve_stops_as_soon_as_the_strip_covers_the_box() {
+    let ring = half(460.125, 460.125);
+    for (w, h, lat, box_half, expect) in [
+        // Tall strip, so the exact east lane binds however far north it is.
+        (450.0, 900.0, 64.8, ring, 2),
+        // Wide strip: the north lane binds and the count follows the latitude.
+        (700.0, 450.0, 0.0, ring, 2),
+        (700.0, 450.0, 35.33, ring, 3),
+        (700.0, 450.0, 64.8, ring, 4),
+        // A tight pick is a smaller ask on the same lane, not an easier one.
+        (700.0, 450.0, 35.33, half(10.0, 10.0), 2),
+    ] {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(w, h));
+        let centre = walkers::lat_lon(lat, -97.28);
+        let (memory, passes) =
+            solve_viewport(rect, centre, box_half).expect("a finite box in a pane with area");
+        assert_eq!(
+            passes, expect,
+            "a {w}x{h} strip at {lat}N framed on {box_half:?} took {passes}              passes, not the {expect} this doc records",
+        );
+        assert!(
+            passes < MAX_FRAMING_PASSES,
+            "the solve used its whole {MAX_FRAMING_PASSES}-pass budget on a              {w}x{h} strip at {lat}N, so the early-out did not fire",
+        );
 
-    let mut memory = walkers::MapMemory::default();
-    let mut shortfalls = Vec::new();
-    for _ in 0..MAX_FRAMING_PASSES {
+        // What the early-out fired *on*: the strip covers the box, and is still
+        // inside the margin rather than past it. Both directions matter — short
+        // is transparent floor, wide is mirror resolution spent outside the box.
         let covered = ground_half_extent(rect, &memory, centre).expect("measurable");
-        let shortfall = (want.east_km / covered.east_km).max(want.north_km / covered.north_km);
-        shortfalls.push(shortfall);
-        memory
-            .set_zoom(memory.zoom() - shortfall.log2())
-            .expect("inside walkers' range");
+        assert!(
+            covered.east_km >= box_half.east_km && covered.north_km >= box_half.north_km,
+            "the solve stopped at {covered:?}, short of {box_half:?}",
+        );
+        let settled = ((box_half.east_km * (1.0 + COVERAGE_MARGIN)) / covered.east_km)
+            .max((box_half.north_km * (1.0 + COVERAGE_MARGIN)) / covered.north_km);
+        assert!(
+            (1.0..=1.0 + COVERAGE_MARGIN).contains(&settled),
+            "the solve settled at {settled}, outside the margin it converges              through - below 1.0 makes `COVERAGE_MARGIN` slack rather than the              direction the solve is wrong in, above it is a strip left wide",
+        );
+    }
+}
+
+/// The pass table on [`MAX_FRAMING_PASSES`], re-measured — including the row
+/// that says the solve does not converge at all.
+///
+/// The budget is a claim about every strip, latitude and box this application
+/// can produce, and the last one to be measured on a single fixture was measured
+/// on the easy one. So this sweeps: ten strip sizes on each axis from a
+/// collapsed 8 points to a 1400-point ultrawide, every whole degree from the
+/// equator to 84°, and six boxes — the whole ring, 300 km, the 10 km floor, the
+/// 664 × 10 km rectangle a config can carry, its transpose, and an ordinary
+/// 120 × 75.
+///
+/// Two things are held. Up to 79° every solve settles inside its band's row, and
+/// each row is *reached* — a table whose numbers are all overstatements is a
+/// table nobody can use to choose the budget. Past 80° some shape must exhaust
+/// the budget, because that row claims the solve stops converging there and an
+/// unreachable claim is one that has quietly become false.
+///
+/// A solve that runs out of zoom rather than out of passes is excluded from the
+/// coverage half: the clamp at [`MIN_ZOOM_LEVEL`] is the strip being physically
+/// unable to show the box, which
+/// [`a_box_wider_than_the_strip_can_show_is_framed_as_wide_as_walkers_allows`]
+/// covers and this is not about.
+///
+/// [`a_box_wider_than_the_strip_can_show_is_framed_as_wide_as_walkers_allows`]:
+///     a_box_wider_than_the_strip_can_show_is_framed_as_wide_as_walkers_allows
+#[test]
+fn the_framing_budget_covers_every_latitude_a_region_can_sit_at() {
+    /// The row of [`MAX_FRAMING_PASSES`]' table that `lat` falls in.
+    fn documented_passes(lat: f64) -> usize {
+        match lat as i64 {
+            0..=49 => 4,
+            50..=59 => 5,
+            60..=69 => 6,
+            _ => 7,
+        }
     }
 
-    // The approach direction the margin is built on: never below 1.0.
+    // Awkward on purpose. The shapes that stress the solve hardest are the
+    // lopsided ones — a 536 × 8 strip at 58°N, a 1256 × 56 at 65°N — so a list
+    // of round sizes measures the table as easier than it is.
+    const SIDES: [f32; 10] = [
+        8.0, 24.0, 56.0, 96.0, 200.0, 392.0, 536.0, 680.0, 1016.0, 1256.0,
+    ];
+    let boxes = [
+        half(460.125, 460.125),
+        half(300.0, 300.0),
+        half(10.0, 10.0),
+        half(664.0, 10.0),
+        half(10.0, 664.0),
+        half(120.0, 75.0),
+    ];
+
+    let mut reached = std::collections::BTreeMap::<usize, usize>::new();
+    let mut exhausted_past_80 = 0usize;
+    for w in SIDES {
+        for h in SIDES {
+            let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(w, h));
+            for degrees in 0..=84 {
+                let lat = f64::from(degrees);
+                let centre = walkers::lat_lon(lat, -97.28);
+                for box_half in boxes {
+                    let (memory, passes) =
+                        solve_viewport(rect, centre, box_half).expect("framable");
+                    if lat > 79.0 {
+                        if passes == MAX_FRAMING_PASSES && memory.zoom() > MIN_ZOOM_LEVEL {
+                            exhausted_past_80 += 1;
+                        }
+                        continue;
+                    }
+                    let budget = documented_passes(lat);
+                    assert!(
+                        passes <= budget,
+                        "a {w}x{h} strip at {lat}N framed on {box_half:?} took                          {passes} passes against the {budget} its band records",
+                    );
+                    *reached.entry(budget).or_default() =
+                        (*reached.entry(budget).or_default()).max(passes);
+                    // Out of zoom is a different failure and has its own test.
+                    if memory.zoom() > MIN_ZOOM_LEVEL {
+                        let covered =
+                            ground_half_extent(rect, &memory, centre).expect("measurable");
+                        assert!(
+                            covered.east_km >= box_half.east_km
+                                && covered.north_km >= box_half.north_km,
+                            "a {w}x{h} strip at {lat}N settled on {covered:?},                              short of {box_half:?}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    for (budget, worst) in &reached {
+        assert_eq!(
+            budget, worst,
+            "no shape in the band that documents {budget} passes needed more              than {worst}, so the table overstates what the budget is for",
+        );
+    }
     assert!(
-        shortfalls.iter().all(|s| *s >= 1.0),
-        "the solve crossed below exact coverage, so `COVERAGE_MARGIN` is slack \
-         rather than the direction the solve is wrong in: {shortfalls:?}",
-    );
-    // And the budget: settled inside the margin with passes still in hand.
-    let settled = shortfalls
-        .iter()
-        .position(|s| *s - 1.0 <= COVERAGE_MARGIN)
-        .expect("the solve must settle inside the margin at all");
-    assert!(
-        settled + 1 < MAX_FRAMING_PASSES,
-        "the solve took {} of {MAX_FRAMING_PASSES} passes to reach the margin, \
-         leaving no room for a latitude or a pane shape nobody has thought of: \
-         {shortfalls:?}",
-        settled + 1,
+        exhausted_past_80 > 0,
+        "every shape past 80N settled inside {MAX_FRAMING_PASSES} passes, so          the table's last row no longer describes anything",
     );
 }
 

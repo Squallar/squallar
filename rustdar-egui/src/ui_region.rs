@@ -636,7 +636,8 @@ fn dolly_for_step(step: f64) -> f32 {
     }
 }
 
-/// How many passes [`viewport_for_region`] gets to settle.
+/// How many passes [`viewport_for_region`] gets to settle, and the number the
+/// loop really can stop short of.
 ///
 /// The east–west lane converges in **one**: walkers' points per degree of
 /// longitude is exactly `tile_size · 2^zoom / 360`, so the ratio of what is
@@ -644,15 +645,57 @@ fn dolly_for_step(step: f64) -> f32 {
 /// lands on it. The north–south lane does not, because Web Mercator's scale
 /// varies with latitude and the latitudes of the rect's own top and bottom edges
 /// move as the zoom does — so the second pass measures a projection the first
-/// pass changed.
+/// pass changed. Which lane *binds* is therefore what decides the pass count,
+/// and it is the box's shape against the strip's: a square box in a tall narrow
+/// strip binds east and settles in two, the same box in a wide strip binds north
+/// and has to iterate.
 ///
-/// Measured on the worst shape this application can make — a 920 km box in a
-/// 450 × 900 point strip at 64.8°N, where Mercator bends most between a rect's
-/// centre and its poleward edge — the shortfall runs **1.00098, 1.0000019,
-/// 1.0000000038**. So pass two is already inside [`COVERAGE_MARGIN`] and the
-/// loop stops there; four is that with two passes to spare, for a latitude or a
-/// pane shape nobody has thought of.
-const MAX_FRAMING_PASSES: usize = 4;
+/// # The measurement
+///
+/// A sweep of every strip from 8 to 1400 points on each axis, every latitude
+/// from 0° to 84°, and six boxes — the whole ring square, 300 km square, the
+/// 10 km floor, the 664 × 10 km rectangle a config can carry, its transpose, and
+/// an ordinary 120 × 75 — settling against [`COVERAGE_MARGIN`], worst case per
+/// band:
+///
+/// | centre latitude | passes to settle |
+/// |---|---|
+/// | 0–49° | 4 |
+/// | 50–59° | 5 |
+/// | 60–69° | 6 |
+/// | 70–79° | 7 |
+/// | 80°+ | does not settle |
+///
+/// Eight is the 70–79° figure with one pass in hand. It is not chosen to cover
+/// the last row, because nothing covers the last row: past about 80° the
+/// single-logarithm step stops converging — 40 passes leaves the worst shapes no
+/// closer than 8 does — so a bigger budget there buys arithmetic and no
+/// coverage. Those latitudes are 15° past the northernmost radar the US network
+/// has and are reachable only by panning a map to the Arctic and picking a
+/// region there; the loop's answer is documented on [`viewport_for_region`] and
+/// is still a strip framed on the box.
+///
+/// # Why this was four, and dead
+///
+/// It was four with a doc claiming "pass two is already inside `COVERAGE_MARGIN`
+/// and the loop stops there; four is that with two passes to spare". Both halves
+/// were wrong. The loop could not stop at all — its early-out compared the
+/// margin-inflated shortfall against 1.0, a value the solve approaches from
+/// above and never reaches, for the reason [`COVERAGE_MARGIN`] exists — so every
+/// framing in the application ran exactly four passes. And the shape the figure
+/// was measured on, a 450 × 900 point strip, is the *easy* one: it binds east
+/// and settles in two. Turn it on its side and 700 × 450 at 64.8°N takes four,
+/// which is the budget entire, with nothing spare.
+///
+/// [`the_solve_stops_as_soon_as_the_strip_covers_the_box`] holds the early-out
+/// to firing, and [`the_framing_budget_covers_every_latitude_a_region_can_sit_at`]
+/// re-measures the table above.
+///
+/// [`the_solve_stops_as_soon_as_the_strip_covers_the_box`]:
+///     tests::the_solve_stops_as_soon_as_the_strip_covers_the_box
+/// [`the_framing_budget_covers_every_latitude_a_region_can_sit_at`]:
+///     tests::the_framing_budget_covers_every_latitude_a_region_can_sit_at
+const MAX_FRAMING_PASSES: usize = 8;
 
 /// How much more than the box the framing deliberately covers, as a fraction of
 /// it.
@@ -666,6 +709,12 @@ const MAX_FRAMING_PASSES: usize = 4;
 /// failure this function exists to prevent: `floor_colour` answers transparent
 /// off the mirror, so a hairline short is a hairline of the volume standing on
 /// nothing, right where the box's edge is.
+///
+/// The sequence above is what the arithmetic *would* run to; the loop stops on
+/// the first of those terms, because this constant is also its settle bar. The
+/// solve is aimed at the box plus this and stops when it has cleared the box
+/// itself — [`MAX_FRAMING_PASSES`] for how that check is written and for why it
+/// used to be one nothing could satisfy.
 ///
 /// So the target is the box plus this, and the loop converges onto a viewport
 /// that covers it. 0.1% of a 920 km box is 920 m — under a third of one cell at
@@ -805,6 +854,28 @@ pub(crate) fn viewport_for_region(
     centre: walkers::Position,
     half: rustdar_radar::voxel::HalfExtentKm,
 ) -> Option<walkers::MapMemory> {
+    Some(solve_viewport(rect, centre, half)?.0)
+}
+
+/// [`viewport_for_region`]'s whole body, plus **how many passes it took**.
+///
+/// The count exists because [`MAX_FRAMING_PASSES`] is a claim about what the
+/// loop does, and the only honest way to hold a loop to a claim about its own
+/// iterations is to count the ones that ran. It used to be checked by a test
+/// that re-ran the solve's arithmetic beside it and counted *that* — which is
+/// how the early-out came to be dead for as long as it was: the copy in the test
+/// used the settle condition the prose describes, the loop here used a different
+/// one, and no run of either could notice.
+///
+/// It is a bare `usize` on a private tuple rather than a field on a named
+/// struct so that there is nothing for the application to branch on: the count
+/// is evidence about the solve, not a fact about the framing, and
+/// [`viewport_for_region`] drops it on the way out.
+fn solve_viewport(
+    rect: egui::Rect,
+    centre: walkers::Position,
+    half: rustdar_radar::voxel::HalfExtentKm,
+) -> Option<(walkers::MapMemory, usize)> {
     if !(rect.width() > 0.0 && rect.height() > 0.0) {
         return None;
     }
@@ -821,7 +892,7 @@ pub(crate) fn viewport_for_region(
     };
 
     let mut memory = walkers::MapMemory::default();
-    for _ in 0..MAX_FRAMING_PASSES {
+    for pass in 1..=MAX_FRAMING_PASSES {
         let covered = ground_half_extent(rect, &memory, centre)?;
         // How much wider the target is than what the strip currently shows, on
         // whichever axis is the binding one. Above 1.0 the strip is short.
@@ -830,9 +901,13 @@ pub(crate) fn viewport_for_region(
             return None;
         }
         // Settled once the strip covers the **box** — the margin is what is
-        // being converged through, not what has to be reached exactly.
-        if shortfall <= 1.0 {
-            return Some(memory);
+        // being converged *through*, not what has to be reached exactly, so the
+        // bar is the margin and not 1.0. `shortfall` is measured against `want`,
+        // which is the box scaled by `1 + COVERAGE_MARGIN`, so "covers the box"
+        // is `shortfall / (1 + COVERAGE_MARGIN) <= 1` and this is that with the
+        // division folded into the constant.
+        if shortfall <= 1.0 + COVERAGE_MARGIN {
+            return Some((memory, pass));
         }
         // Ground per point halves with every zoom level, so the zoom that
         // covers the target is one logarithm away rather than a search — held
@@ -845,7 +920,7 @@ pub(crate) fn viewport_for_region(
         // widest strip walkers can draw is the answer, and it is centred on the
         // box.
         if target == memory.zoom() {
-            return Some(memory);
+            return Some((memory, pass));
         }
         // Unreachable: `target` is finite and inside the range walkers checks,
         // which is the whole of `Zoom::try_from`. Handled rather than unwrapped
@@ -853,15 +928,17 @@ pub(crate) fn viewport_for_region(
         // moving its bounds — and keeping the framing already solved is the same
         // degradation the clamp above makes, for the same reason.
         if memory.set_zoom(target).is_err() {
-            return Some(memory);
+            return Some((memory, pass));
         }
     }
-    // Out of passes, and by construction still inside the margin rather than
-    // short of the box: every pass moves outward and the first one already
-    // clears the box itself. Answered rather than refused, because the
-    // alternative is the pane's own map memory, which is not framed on the box
-    // at all.
-    Some(memory)
+    // Out of passes without the strip ever measuring as covering. Reachable
+    // only past about 80° of latitude, where the single-logarithm step stops
+    // converging at all — see `MAX_FRAMING_PASSES`. The answer is still framed
+    // on the box and still biased outward: the loop's last act was a step, so
+    // this memory is one whole measured shortfall wider than the last thing
+    // measured short. Answered rather than refused, because the alternative is
+    // the pane's own map memory, which is not framed on the box at all.
+    Some((memory, MAX_FRAMING_PASSES))
 }
 
 /// The ground `rect` covers either side of `centre`, kilometres on each
