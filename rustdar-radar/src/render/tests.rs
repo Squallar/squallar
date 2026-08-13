@@ -3490,3 +3490,211 @@ fn one_stray_velocity_radial_does_not_reframe_the_reflectivity_pane() {
     let doppler_km = TDWR_DOPPLER_GATES as f64 * TDWR_DOPPLER_GATE_KM * cos_e;
     assert!((vel.max_range_km - doppler_km).abs() < 1e-9);
 }
+
+// ── The polar field against the raster it was painted beside ────────────────
+
+/// The readout's gate **is** the raster's gate, everywhere the raster is not
+/// quantizing — and where it is, the disagreement is one cell wide.
+///
+/// This is the test that keeps [`polar`]'s inverse and
+/// [`MercatorProjection::render_gate`]'s forward paint describing one picture.
+/// Nothing else can: the module's own tests run on geometry written down by
+/// hand, and a rule that had drifted half a gate out would still pass every one
+/// of them.
+///
+/// # Two claims, because there are two questions
+///
+/// **At a cell's centre the two agree exactly, with no tolerance.** A point at
+/// a wedge's own azimuth and a gate's own range sits deep inside that gate's
+/// footprint, so the pixel under it was claimed by that gate and no other, and
+/// the number the grid holds there is that gate's to the bit. A rule off by
+/// half a gate in range, or half a wedge in azimuth, moves the answer to a
+/// neighbour at *every one* of these probes; this is what would catch it.
+///
+/// **Away from the centres they disagree on 2.70% of points, and that is the
+/// raster's quantization rather than a second rule.** Measured over 263,683
+/// probes on a 1° × 0.25 km sweep drawn at 2048 px (6.83 px/km), stepping
+/// azimuth by 0.37° and range geometrically by 3%: 7,114 disagreements, and in
+/// 7,071 of them — **99.4%** — the number the grid holds is one of the eight
+/// gates immediately around the one the point is in. The differences are one
+/// data level: median 0.500 dBZ, p90 0.500, p99 2.000, worst 4.500.
+///
+/// That is exactly what a truncating rasterizer does. `render_gate` walks
+/// sample points and drops them onto a pixel grid nothing aligns them to, so a
+/// pixel straddling a cell boundary goes to whichever claimant `write_key`
+/// ranks highest rather than to whichever covers most of it. The reader cannot
+/// see which; the cursor's own gate is the honest answer, and it is the one
+/// this returns.
+///
+/// The bound is what makes the number an assertion rather than a note. A rule
+/// half a gate out disagrees on roughly half the probes, not a fortieth.
+///
+/// # A raster defect this found, which is not fixed here
+///
+/// The centre half tolerates a small number of cell centres where the raster is
+/// **unpainted under a gate that was painted** — 4 of 2,028 (0.20%) on the
+/// coarse render. They are single-pixel pinholes: a 5 x 5 neighbourhood around
+/// one reads `##.##` with the hole in the middle, inside a solid echo.
+///
+/// The cause is `render_gate`'s sample lattice. Its two step counts are
+/// `ceil(len_px) + 2` per axis, which makes each step under a pixel — 0.622 px
+/// radially and 0.910 px tangentially at (308.5 deg, 347 km) — but those axes
+/// are radial and tangential, not the raster's, and a lattice whose *covering
+/// radius* exceeds half a pixel can miss a pixel square entirely when it lies
+/// diagonally across it. `hypot(0.622, 0.910) / 2` is **0.551 px**, over the
+/// 0.5 a unit square needs, and all four holes measured 0.549-0.560.
+///
+/// So a hover over one of those pixels reads nothing today, in the middle of an
+/// echo. The polar field has no pinholes — it is the measurements, not a
+/// resampling of them — so this change removes the symptom from the readout
+/// without touching the cause. The cause is a sample-density change in the
+/// rasterizer's innermost loop: raising the steps to `ceil(len_px * 1.5) + 2`
+/// puts the covering radius at 0.37 px, and costs 2.25x the samples in the loop
+/// `POOLED_CELLS` measures at 233 ms of a browser frame, on top of moving every
+/// picture the display has ever drawn. That is its own change with its own
+/// measurement, and it is deliberately not made here.
+#[test]
+fn the_polar_field_answers_what_the_value_grid_holds() {
+    let out = render_level3_radial_to_image(
+        &packet(None),
+        PRODUCT,
+        LAT,
+        LON,
+        SCALE,
+        OFFSET,
+        None,
+        types::IMAGE_SIZE,
+    )
+    .unwrap();
+    let extent = out.max_range_km;
+    let geom = out.polar.geometry().clone();
+    assert_eq!(geom.radials(), N_RADIALS);
+    assert_eq!(geom.gates(), N_BINS);
+
+    // ── At the centres: exact, every time ──
+    //
+    // On a *second* render of the same field, at 1 km gates rather than
+    // 0.25 km. The fine render cannot answer this question at all: the raster
+    // is 2.0 texels per gate by construction ([`types::TEXELS_PER_SAMPLE`]), so
+    // a gate is two texels deep and its centre falls on the seam between them —
+    // the worst probe point there is, and one where the neighbouring gate's
+    // claim on the pixel is as good as this gate's. Widen the gate and the cell
+    // becomes 4.36 texels deep at the display's calibrated scale, with a
+    // genuine interior for a point to be inside of.
+    let coarse = render_level3_radial_with_gate_km(
+        &packet(None),
+        1.0,
+        PRODUCT,
+        LAT,
+        LON,
+        SCALE,
+        OFFSET,
+        None,
+        LONG_RANGE_SIDE,
+    )
+    .unwrap();
+    let cgeom = coarse.polar.geometry().clone();
+    let cside = (coarse.image.len() / 4).isqrt();
+    let mut centres = 0u32;
+    let mut pinholes = 0u32;
+    for radial in (0..cgeom.radials()).step_by(7) {
+        let az = f64::from(cgeom.wedges()[radial].azimuth_deg);
+        // From 50 km out. Inside that a 1° wedge is under four texels wide and
+        // the same seam problem returns in the other axis.
+        for gate in (50..cgeom.gates()).step_by(11) {
+            let km = cgeom.first_gate_km() + gate as f64 * cgeom.gate_interval_km();
+            if km > coarse.max_range_km {
+                break;
+            }
+            let picked = cgeom.pick(az, km).expect("a centre is inside its own gate");
+            assert_eq!(
+                picked,
+                super::polar::GateAt { radial, gate },
+                "({az}°, {km} km) is the centre of ({radial}, {gate})"
+            );
+            centres += 1;
+            let from_grid = coarse.values[probe_at(coarse.max_range_km, cside, az, km)];
+            if from_grid.is_nan() {
+                pinholes += 1;
+                continue;
+            }
+            assert_eq!(
+                coarse.polar.at(picked).unwrap().to_bits(),
+                from_grid.to_bits(),
+                "({az}°, {km} km): the grid and the gate must be the same number"
+            );
+        }
+    }
+    assert!(centres > 1500, "only {centres} centre probes");
+    assert!(
+        pinholes * 200 <= centres,
+        "{pinholes} of {centres} cell centres are unpainted in the raster — over \
+         0.5%, which is more than the rasterizer's known pinholes"
+    );
+
+    // ── Away from them: one cell wide, and rare ──
+    let mut probes = 0u32;
+    let mut disagreed = 0u32;
+    let mut adjacent = 0u32;
+    let mut az = 0.13f64;
+    while az < 360.0 {
+        let mut km = 0.05f64;
+        while km < 150.0 {
+            let from_grid = out.values[probe_at(extent, types::IMAGE_SIZE, az, km)];
+            let picked = geom.pick(az, km);
+            let from_gate = picked.and_then(|a| out.polar.at(a));
+            probes += 1;
+            let agreed = match (from_grid.is_nan(), from_gate) {
+                (true, None) => true,
+                (false, Some(v)) => v == from_grid,
+                _ => false,
+            };
+            if !agreed {
+                disagreed += 1;
+                if let Some(a) = picked
+                    && !from_grid.is_nan()
+                    && neighbours(&geom, a)
+                        .into_iter()
+                        .any(|n| out.polar.at(n) == Some(from_grid))
+                {
+                    adjacent += 1;
+                }
+            }
+            km *= 1.03;
+        }
+        az += 0.37;
+    }
+
+    assert!(
+        disagreed * 100 < probes * 3,
+        "{disagreed} of {probes} probes disagree — over 3%, which is a rule that \
+         has moved rather than a raster that is quantizing"
+    );
+    assert!(
+        adjacent * 1000 >= disagreed * 990,
+        "only {adjacent} of {disagreed} disagreements are an adjacent cell; the \
+         rest are not quantization"
+    );
+}
+
+/// The eight gates around `at`, wrapping in azimuth because a sweep closes.
+fn neighbours(
+    geom: &super::polar::PolarGeometry,
+    at: super::polar::GateAt,
+) -> Vec<super::polar::GateAt> {
+    let n = geom.radials();
+    let mut out = Vec::with_capacity(8);
+    for dr in [-1i64, 0, 1] {
+        for dg in [-1i64, 0, 1] {
+            if dr == 0 && dg == 0 {
+                continue;
+            }
+            let radial = (at.radial as i64 + dr).rem_euclid(n as i64) as usize;
+            let Ok(gate) = usize::try_from(at.gate as i64 + dg) else {
+                continue;
+            };
+            out.push(super::polar::GateAt { radial, gate });
+        }
+    }
+    out
+}
