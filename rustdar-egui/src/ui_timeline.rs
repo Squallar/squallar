@@ -36,6 +36,7 @@
 //! renders around it.
 
 use crate::actions::GuiAction;
+use crate::pane::LoopFrame;
 
 /// Available time step options: (seconds, label). 0 = "one scan". Moved here
 /// from the layers panel with the navigation buttons that consume it.
@@ -72,6 +73,164 @@ const SCRUB_LIVE_THRESHOLD: f32 = 0.99;
 /// Slider width for the row-2 tuning sliders — modest, so lookback and speed
 /// share a row.
 const TUNING_SLIDER_WIDTH: f32 = 120.0;
+
+/// How much longer one interval must be than another before the caption calls
+/// the difference out — as a ratio, and as an absolute floor in seconds. Both
+/// must be cleared.
+///
+/// The ratio keeps ordinary jitter quiet. A WSR-88D volume is nominally 259 s
+/// but really runs 193–356 s at one site over a day (KPBZ, 2026-08-11, 342
+/// volumes) as SAILS and AVSET lengthen and shorten it, and a loop of those is
+/// evenly spaced in every sense the user cares about. 1.5 sits above that
+/// jitter and below the two steps that matter: a dropped scan doubles a gap,
+/// and a VCP change from precip to clear air takes 259 s to 517 s.
+///
+/// The floor keeps the ratio from firing on intervals so short that a 50%
+/// difference is a rounding artifact. It is one minute because the caption
+/// speaks in whole minutes: `format_span` rounds to nearest, so a difference
+/// under 60 s can print the same number twice, and "4 to 4 min apart" is worse
+/// than saying nothing. Clearing this floor guarantees the two ends differ by
+/// at least one printed minute.
+const NOTICEABLE_RATIO: f64 = 1.5;
+/// The absolute half of [`NOTICEABLE_RATIO`]'s rule, in seconds.
+const NOTICEABLE_FLOOR_SECS: i64 = 60;
+
+/// Whether `longer` is enough longer than `shorter` for the caption to say so.
+///
+/// One rule, used for two questions that are the same question: whether a
+/// loop's frames are evenly spaced, and whether a loop is showing every scan or
+/// a sample of them (frame spacing against the site's own cadence). Both are
+/// "is this interval a different animal from that one", and answering them by
+/// different rules would let a loop read as evenly spaced and decimated at
+/// once, or the reverse.
+///
+/// Always compared against the **median** gap, never the shortest one. A real
+/// WSR-88D wanders far more than its nominal volume suggests — the widest
+/// 29-gap window KPBZ produced on 2026-08-11 runs 210 s to 356 s, a ratio of
+/// 1.7 — so a shortest-against-longest test would call an ordinary precip loop
+/// unevenly spaced every time. Against the median that same window is 356 s
+/// versus 269 s and stays quiet, while the two steps that matter still fire.
+fn markedly_longer(longer: i64, shorter: i64) -> bool {
+    longer - shorter >= NOTICEABLE_FLOOR_SECS && longer as f64 > shorter as f64 * NOTICEABLE_RATIO
+}
+
+/// A duration in words, for the loop caption: `"45 s"`, `"6 min"`, `"2h 54m"`.
+///
+/// Rounds to nearest, where [`statusbar::format_product_age`](super::statusbar)
+/// truncates, and the difference is not cosmetic. Truncation is right for an
+/// age — data collected 359 s ago really is "5 min old". It is wrong for a
+/// *cadence*: a TDWR volume arrives every 360 s but the gaps measure 359 s about
+/// as often, and a caption that truncated would report a six-minute radar as
+/// five-minute — an error of one whole volume, in the one number the user is
+/// reading the caption to learn.
+fn format_span(secs: i64) -> String {
+    if secs < 60 {
+        return format!("{secs} s");
+    }
+    let mins = (secs + 30) / 60;
+    if mins < 60 {
+        format!("{mins} min")
+    } else {
+        format!("{}h {}m", mins / 60, mins % 60)
+    }
+}
+
+/// The loop's own extent, in words, for the head of the row-2 caption.
+///
+/// `None` when there is nothing to say — no frames, which is every pane that is
+/// not looping and a loop still fetching its listing.
+///
+/// # What this has to make visible, and why a span alone would not
+///
+/// The frame cap does not shorten a loop's window. `accept_scan_listing` samples
+/// a listing that overruns the cap instead of truncating it, so the loop always
+/// covers the whole lookback and what the cap costs is *resolution*. A caption
+/// that reported only "spans 23h 58m" would therefore be true and still mislead:
+/// at that lookback a desktop loop is showing 60 of ~333 WSR-88D volumes, four
+/// scans in five dropped, and the span is exactly the number that hides it.
+///
+/// So the spacing is reported beside the span, and calibrated against
+/// `scan_step_secs` — the site's own cadence, caught before the sampling. With
+/// it the caption commits to "every scan" or to "sampled from ~4 min scans";
+/// without it (an older loop, or a listing too short to have a gap) it states
+/// the spacing and claims nothing about fidelity, which is the honest silence.
+///
+/// # The awkward cases
+///
+/// - **Still filling.** `settled` is the loop's own readiness. While it is false
+///   the counts can still move, so every clause takes "so far" rather than being
+///   suppressed — a caption that appeared only once the loop was complete would
+///   be missing exactly when the user is watching it fill.
+/// - **A single frame**, and the degenerate case of several frames sharing one
+///   timestamp, take the same sentence: there is a frame count but no span, and
+///   printing "spans 0 s" invites the reader to believe the loop is broken.
+/// - **A gap in the frames**, from a scan that never landed.
+/// - **A VCP change mid-loop**, which is not a corner case: on 2026-08-11 every
+///   measured site but TDFW alternated VCPs during the day, and a TDWR switching
+///   VCP 80 to 90 or a WSR-88D switching VCP 212 to 35 moves its cadence by up to
+///   2x mid-window.
+///
+/// The last two are deliberately **not** distinguished. From timestamps alone
+/// they are the same evidence — one gap of roughly twice the cadence — and
+/// nothing in the frame list says which. So the caption reports the honest range
+/// it can defend, "4 to 9 min apart", and never guesses at a cause.
+fn loop_span_phrase(
+    frames: &[LoopFrame],
+    scan_step_secs: Option<u32>,
+    settled: bool,
+) -> Option<String> {
+    let first = frames.first()?;
+    let last = frames.last()?;
+    let count = frames.len();
+    let so_far = if settled { "" } else { " so far" };
+
+    let span = (last.timestamp - first.timestamp).num_seconds();
+    if count == 1 || span <= 0 {
+        let plural = if count == 1 { "frame" } else { "frames" };
+        return Some(format!(
+            "This loop is {count} {plural}{so_far}, so it spans no time yet"
+        ));
+    }
+
+    let mut gaps: Vec<i64> = frames
+        .windows(2)
+        .map(|pair| (pair[1].timestamp - pair[0].timestamp).num_seconds())
+        .collect();
+    gaps.sort_unstable();
+    let shortest = gaps[0];
+    let longest = gaps[gaps.len() - 1];
+    let typical = gaps[gaps.len() / 2];
+
+    // Both directions, each against the median. Which side stands out depends
+    // on which cadence held for most of the window: a site that spends the last
+    // third of a loop in clear air pushes the *longest* gap out, and one that
+    // spends the last third back in precip pushes the *shortest* one out
+    // instead. Testing only the long side would call that second loop evenly
+    // spaced while a run of its frames sat at half the spacing of the rest.
+    let uneven = markedly_longer(longest, typical) || markedly_longer(typical, shortest);
+    let spacing = if uneven {
+        format!(
+            "{} to {} apart",
+            format_span(shortest),
+            format_span(longest)
+        )
+    } else {
+        format!("~{} apart", format_span(typical))
+    };
+
+    let fidelity = match scan_step_secs {
+        Some(step) if markedly_longer(typical, i64::from(step)) => {
+            format!("sampled from ~{} scans, ", format_span(i64::from(step)))
+        }
+        Some(_) => "every scan, ".to_owned(),
+        None => String::new(),
+    };
+
+    Some(format!(
+        "This loop spans {} over {count} frames{so_far}, {fidelity}{spacing}",
+        format_span(span)
+    ))
+}
 
 /// What the timeline drew last frame, as it was drawn. Reported by the
 /// renderer, never rebuilt by a test — see `ui_menu::DrawnMenuLeaf` for the
@@ -1060,19 +1219,35 @@ impl super::Gui {
             }
         }
 
-        // The closing caption (plan §1.5): what this platform's loops can
-        // hold, and the escape hatch from shared time. The budget is the
-        // running build's own, pushed in by the frontend
-        // (`set_loop_frame_budget`) — not a guess from the width, which a
-        // 1400 pt Android tablet would get wrong. "Sits out", not "stays
-        // frozen": scan delivery is site-keyed and ignores the link, so a
-        // live unlinked pane still follows new scans — the checkbox's own
+        // The closing caption (plan §1.5): what this loop actually holds, what
+        // this platform's loops can hold, and the escape hatch from shared
+        // time. The budget is the running build's own, pushed in by the
+        // frontend (`set_loop_frame_budget`) — not a guess from the width,
+        // which a 1400 pt Android tablet would get wrong. "Sits out", not
+        // "stays frozen": scan delivery is site-keyed and ignores the link, so
+        // a live unlinked pane still follows new scans — the checkbox's own
         // hover (`ui_pills::UNLINK_NOTE`) spells the full claim out.
-        let caption = format!(
+        //
+        // The span leads because it is the live fact and the budget behind it
+        // is the standing one. It is gated on `loop_active`, not merely on the
+        // frame list being non-empty: single-frame mode keeps the current
+        // picture in `frames` too, and an ungated clause would have a static
+        // pane announce "This loop is 1 frame".
+        let span = if loop_active {
+            let ls = &self.panes[pane_idx].loop_state;
+            loop_span_phrase(&ls.frames, ls.scan_step_secs, ls.is_render_ready())
+        } else {
+            None
+        };
+        let budget = format!(
             "Loops keep up to {} frames on this platform - a pane with \
              \"Sync time\" off sits out the loop and shared navigation",
             self.loop_frame_budget
         );
+        let caption = match span {
+            Some(span) => format!("{span} - {budget}"),
+            None => budget,
+        };
         ui.label(egui::RichText::new(caption.as_str()).small().weak());
         #[cfg(test)]
         {
@@ -1087,3 +1262,7 @@ impl super::Gui {
         }
     }
 }
+
+#[path = "ui_timeline/tests.rs"]
+#[cfg(test)]
+mod tests;

@@ -3594,6 +3594,11 @@ fn accept_scan_listing(
         return None;
     }
 
+    // The site's own cadence, read off the listing *before* the sampling below
+    // throws scans away. Once sampled there is no way back to it, and it is what
+    // the timeline caption needs to tell "every scan" from "one in five".
+    ls.scan_step_secs = median_step_secs(&scans);
+
     // Cap the downloads by evenly sampling the listing. A 3D loop's cap is its
     // *resident* one and is far lower, because for that kind the frame list and
     // the resident set are one thing — see `loop_frames_held`.
@@ -3625,6 +3630,32 @@ fn accept_scan_listing(
     }
 
     Some(FramePlan::new(site.to_string(), scans))
+}
+
+/// The median gap between consecutive scans in a listing, in whole seconds.
+///
+/// `None` for a listing too short to have a gap. Zero and negative gaps are
+/// dropped rather than clamped: a listing is oldest-first and strictly
+/// increasing, so a non-positive gap is a duplicate key or an out-of-order one,
+/// and averaging it in would pull the cadence toward a value no radar ran at.
+///
+/// Median rather than mean because a window can straddle a VCP change — a real
+/// event, not a corner case: across the six TDWR and four WSR-88D sites measured
+/// for 2026-08-11, every site but TDFW alternated VCPs during the day. A window
+/// holding a 259 s run and a 517 s run has no meaningful mean.
+fn median_step_secs(
+    scans: &[(chrono::NaiveDateTime, rustdar_radar::archive::Identifier)],
+) -> Option<u32> {
+    let mut gaps: Vec<i64> = scans
+        .windows(2)
+        .map(|pair| (pair[1].0 - pair[0].0).num_seconds())
+        .filter(|secs| *secs > 0)
+        .collect();
+    if gaps.is_empty() {
+        return None;
+    }
+    gaps.sort_unstable();
+    u32::try_from(gaps[gaps.len() / 2]).ok()
 }
 
 /// Move a loop that is still `Rendering` on to whatever its frames have settled

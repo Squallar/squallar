@@ -10511,6 +10511,61 @@ fn the_timeline_row2_caption_states_the_pushed_frame_budget() {
          own name (the Sync popover's and the inspector checkbox's); drew {:?}",
         row2.caption
     );
+    assert!(
+        !row2.caption.contains("This loop"),
+        "with no loop running there is no span to state; drew {:?}",
+        row2.caption
+    );
+}
+
+/// **The caption states the running loop's own time span, ahead of the standing
+/// budget** — the whole point being that a frame count says nothing about how
+/// much weather a user is actually looking at.
+///
+/// End to end through the real transport, because the clause is gated on the
+/// active pane's loop being *active*: single-frame mode keeps the current
+/// picture in `frames` too, and no unit test can catch an ungated caption
+/// having a static pane announce "This loop is 1 frame".
+///
+/// The frames are an hour of WSR-88D precip at the measured 259 s cadence.
+#[test]
+fn the_timeline_row2_caption_states_the_running_loops_span_and_fidelity() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    {
+        let pane = h.gui_mut().pane_mut(0).unwrap();
+        pane.loop_state = crate::pane::LoopPlaybackState::new_for_loop(
+            3600,
+            rustdar_radar::sites::get_radar_site("KTLX").unwrap(),
+            rustdar_radar::types::RenderView::PlanView,
+        );
+        pane.loop_state.phase = crate::pane::LoopPhase::Playing;
+        pane.loop_state.scan_step_secs = Some(259);
+        let base = written_ago(60);
+        pane.loop_state.frames = (0..14)
+            .map(|i| crate::pane::LoopFrame {
+                timestamp: base + chrono::Duration::seconds(i * 259),
+                image: None,
+                render_in_flight: false,
+                render_failed: false,
+            })
+            .collect();
+        pane.loop_state.current_frame = 13;
+    }
+    h.mouse_click(h.timeline().expander.center());
+    h.warm_up();
+
+    let row2 = h.timeline().row2.expect("the expander must open row 2");
+    assert!(
+        row2.caption
+            .starts_with("This loop spans 56 min over 14 frames, every scan, ~4 min apart - "),
+        "the span leads the caption, and states fidelity as well as extent; drew {:?}",
+        row2.caption
+    );
+    assert!(
+        row2.caption.contains("Loops keep up to"),
+        "the standing budget sentence still follows it; drew {:?}",
+        row2.caption
+    );
 }
 
 // ── M5: pane pills, popovers and the armed hint ─────────────────────────

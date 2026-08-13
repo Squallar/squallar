@@ -480,6 +480,29 @@ pub struct LoopPlaybackState {
     pub frames: Vec<LoopFrame>,
     /// Lookback duration in seconds that was requested.
     pub lookback_secs: u64,
+    /// The site's own scan cadence over this loop's window, in seconds: the median
+    /// gap between consecutive scans in the listing the loop was built from,
+    /// measured **before** any sampling. `None` until a listing has been accepted.
+    ///
+    /// # Why the pre-sampling figure is the one worth keeping
+    ///
+    /// `accept_scan_listing` does not truncate a listing that overruns the frame
+    /// cap — it *evenly samples* it. So a loop always covers the whole lookback the
+    /// user asked for, and what the cap actually costs is temporal resolution: at
+    /// the 1440-minute maximum lookback a WSR-88D in precip offers ~333 scans and a
+    /// desktop loop keeps 60 of them, four scans in five dropped. Nothing in
+    /// `frames` can reveal that on its own, because every surviving gap is a
+    /// sampled gap. This is the only witness to what was skipped, and it is what
+    /// lets the timeline caption say "every scan" or "sampled from ~4 min scans"
+    /// instead of quoting a frame spacing the user has no way to calibrate.
+    ///
+    /// The measured cadences it gets compared against, so the units are concrete: a
+    /// TDWR volume is 360 s on **both** VCP 80 and VCP 90, a WSR-88D precip volume
+    /// (VCP 212/215) is 259 s, and a WSR-88D clear-air volume (VCP 35) is 517 s.
+    ///
+    /// A median, not a mean: a site that changes VCP mid-window mixes two cadences,
+    /// and the mean of a 259 s run and a 517 s run describes neither of them.
+    pub scan_step_secs: Option<u32>,
     /// Instant of the last frame advance (for animation timing).
     pub last_advance: Option<web_time::Instant>,
     /// NEXRAD site code the loop's geometry belongs to, captured at loop creation
@@ -676,6 +699,7 @@ impl LoopPlaybackState {
             current_frame: 0,
             frames: Vec::new(),
             lookback_secs: 0,
+            scan_step_secs: None,
             last_advance: None,
             site: String::new(),
             site_lat: 0.0,
@@ -706,6 +730,7 @@ impl LoopPlaybackState {
             current_frame: 0,
             frames: Vec::new(),
             lookback_secs,
+            scan_step_secs: None,
             last_advance: None,
             site: site.name.to_string(),
             site_lat: site.lat,
