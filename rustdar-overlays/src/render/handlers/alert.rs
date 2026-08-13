@@ -19,6 +19,7 @@ use crate::types::GeoBounds;
 pub(crate) struct NwsAlertFetchResult(
     pub Result<crate::nws::fetch::ActiveAlerts, crate::fetch_policy::FetchError>,
 );
+
 /// [`Assembled`]: the national alert feed is one request, and the UGC zone
 /// boundaries most alerts reference instead of carrying geometry are one
 /// request **each** — a thousand or more on a busy day, any of which can fail
@@ -28,7 +29,32 @@ pub(crate) struct NwsAlertFetchResult(
 /// Observed before it did: **212 of 297 warnings absent from the map under a
 /// fully green status line.**
 ///
+/// # That number's causes are closed, and this declaration is not thereby dead
+///
+/// The zone-geometry measurement then put every cause against all 11,651
+/// published NWS zones plus two live rounds, and found the two real ones were
+/// **ours**: 227 zones served as a `GeometryCollection` the parser did not
+/// know, and a simplifier eating 26,963 of 44,579 polygon parts. Its top row is
+/// the one to read here — [`Http`], [`Unreachable`] and [`Unreadable`] fired
+/// **0** times, twice — and set beside the paragraph above, it says the
+/// opposite of what that paragraph says.
+///
+/// Both are true. A round is assembled because its parts **can** fail
+/// separately, never because they were failing on the day somebody measured.
+/// Zero across two rounds from one machine is not a property of a thousand
+/// independent requests over a network; the 212-of-297 event was itself
+/// 198 × `Http(503)`, which is the row now reading zero; and the web build
+/// reaches these same URLs through CORS, where a refusal arrives as
+/// `Unreachable` wearing the browser's opaque `TypeError`.
+///
+/// What the zone work changed is how *often* this report comes back non-empty,
+/// which was never the argument for keeping it. What would change the shape is
+/// the zone pass ceasing to be one request per zone.
+///
 /// [`Assembled`]: crate::fetch_policy::Assembled
+/// [`Http`]: crate::nws::zones::ZoneFailure::Http
+/// [`Unreachable`]: crate::nws::zones::ZoneFailure::Unreachable
+/// [`Unreadable`]: crate::nws::zones::ZoneFailure::Unreadable
 impl crate::fetch_policy::FetchRound for NwsAlertFetchResult {
     type Shape = crate::fetch_policy::Assembled;
 }
