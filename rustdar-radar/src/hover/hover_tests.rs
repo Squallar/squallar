@@ -276,60 +276,114 @@ fn every_product_is_its_own_moment_or_is_derived() {
     }
 }
 
-/// **The readout is cheap enough to run on pointer motion.**
+/// **The readout does not walk the gates, which is what would make it too
+/// expensive to run on pointer motion.**
 ///
-/// It runs on the frame thread, every frame the pointer is over a pane, and it
-/// walks the wedges linearly — so an implementation that had become `O(gates)`,
-/// or that allocated, would be a frame-rate regression bought with a memory
-/// win. A full ring at 0.5° is 720 wedges, which is the worst case this display
-/// draws.
+/// It runs on the frame thread, every frame the pointer is over a pane. The
+/// regression that matters is a lookup that became `O(gates)` — a linear search
+/// along the radial instead of the one division
+/// [`crate::render::polar::PolarGeometry::pick`] does, or a decode of every
+/// gate up to the one asked for — because that is a real temptation on the
+/// volume-backed path, where the gate has to come out of a `MomentData`.
 ///
-/// Measured on this box over 12,800 calls at spread positions: **903 ns** per
-/// hover from resident values and **897 ns** out of the volume in `--release`,
-/// 3.13 µs and 7.69 µs unoptimized. The release figures matching is what says
-/// the gate decode is not the cost — both paths walk the same 720 wedges, and
-/// only one of them decodes anything.
+/// So this measures the **shape** rather than the clock: two fields with the
+/// same 720 radials and gate counts nine times apart, timed against each other.
+/// A lookup that is flat in the gate count answers both alike; one that walks
+/// them is nine times slower on the wider field. The arms are interleaved and
+/// the *minimum* per-call time is taken, which is what makes the comparison
+/// survive a 32-core box that is compiling this workspace while it runs — the
+/// same method `POOLED_CELLS` uses for the same reason.
 ///
-/// The bound is deliberately loose against that: 20 µs, because what it has to
-/// keep out is a per-hover walk of every gate on a radial, or an allocation,
-/// and those are two orders of magnitude away — not because 20 µs would be
-/// acceptable. A tight bound on a shared 32-core box, in a test run that is
-/// itself compiling, fails for reasons that have nothing to do with the code.
-/// The `eprintln!` is where the real figure is read off.
+/// The absolute figures, measured on this box with nothing else running:
+/// **832 ns** per hover at 200 gates, **832 ns** at 1832 and **851 ns** reading
+/// out of the volume, `--release`; 3.03 / 3.03 / 5.33 µs unoptimized. They are
+/// printed rather than asserted, because a bound tight enough to mean anything
+/// is a bound that fails for reasons that have nothing to do with the code —
+/// this one did, at 25 µs, on a box compiling the workspace beside it.
 #[test]
-fn the_hover_lookup_is_cheap_enough_for_pointer_motion() {
-    let scan = std::sync::Arc::new(volume(720, false));
-    let out = render(&scan, RadarProduct::Reflectivity);
-    let still = HoverSource::resident(out.polar.clone());
-    let mut looping_field = out.polar;
-    looping_field.strip_values();
-    let looping = HoverSource::from_volume(
-        looping_field,
-        SweepGates::new(scan, RadarProduct::Reflectivity, ELEVATION),
-    );
+fn the_hover_lookup_does_not_walk_the_gates() {
+    const NARROW: usize = 200;
+    const WIDE: usize = 1832;
+    const ROUNDS: u32 = 60;
 
-    for (name, src) in [("resident", &still), ("from the volume", &looping)] {
-        // A spread of points rather than one, so neither the wedge walk nor the
-        // gate decode is answered out of a warm branch predictor.
-        let probes: Vec<(f64, f64)> = (0..64)
-            .map(|i| (i as f64 * 5.6 + 0.3, 3.0 + i as f64 * 1.4))
-            .collect();
+    let scan = std::sync::Arc::new(volume(720, false));
+    let sources = |gates: usize| {
+        // A field of `gates` gates over the fixture's own wedges, so the two
+        // arms differ in exactly one dimension.
+        let out = render(&scan, RadarProduct::Reflectivity);
+        let geom = out.polar.geometry();
+        let wedges = geom.wedges().to_vec();
+        let g = crate::render::polar::PolarGeometry::from_parts(
+            wedges,
+            geom.first_gate_km(),
+            geom.gate_interval_km(),
+            gates,
+        );
+        let values = (0..720 * gates).map(|i| (i % 97) as f32).collect();
+        HoverSource::resident(crate::render::polar::PolarField::from_parts(g, values))
+    };
+    let narrow = sources(NARROW);
+    let wide = sources(WIDE);
+    let volume_backed = {
+        let out = render(&scan, RadarProduct::Reflectivity);
+        let mut field = out.polar;
+        field.strip_values();
+        HoverSource::from_volume(
+            field,
+            SweepGates::new(
+                std::sync::Arc::clone(&scan),
+                RadarProduct::Reflectivity,
+                ELEVATION,
+            ),
+        )
+    };
+
+    let probes: Vec<(f64, f64)> = (0..64)
+        .map(|i| (i as f64 * 5.6 + 0.3, 3.0 + i as f64 * 0.7))
+        .collect();
+    let time = |src: &HoverSource| {
         let mut sink = 0u32;
         let start = std::time::Instant::now();
-        const ROUNDS: u32 = 200;
-        for _ in 0..ROUNDS {
-            for &(az, km) in &probes {
-                if let Reading::Value(v) = src.read(az, km) {
-                    sink = sink.wrapping_add(v.to_bits());
-                }
+        for &(az, km) in &probes {
+            if let Reading::Value(v) = src.read(az, km) {
+                sink = sink.wrapping_add(v.to_bits());
             }
         }
-        let each = start.elapsed() / (ROUNDS * probes.len() as u32);
-        assert!(sink != 0, "the loop was optimised away");
-        eprintln!("{name}: {each:?} per hover over 720 wedges × {GATES} gates");
+        (start.elapsed(), sink)
+    };
+
+    let mut best = [std::time::Duration::MAX; 3];
+    let mut sink = 0u32;
+    for round in 0..ROUNDS {
+        // Alternating order, so neither arm always runs into a cold cache.
+        let order: [usize; 3] = if round % 2 == 0 { [0, 1, 2] } else { [2, 1, 0] };
+        for i in order {
+            let (d, s) = time([&narrow, &wide, &volume_backed][i]);
+            best[i] = best[i].min(d);
+            sink = sink.wrapping_add(s);
+        }
+    }
+    assert!(sink != 0, "the loop was optimised away");
+
+    let each = |d: std::time::Duration| d / probes.len() as u32;
+    eprintln!(
+        "per hover over 720 wedges: {NARROW} gates {:?}, {WIDE} gates {:?}, \
+         from the volume {:?}",
+        each(best[0]),
+        each(best[1]),
+        each(best[2]),
+    );
+
+    // Nine times the gates must not cost anything like nine times the time.
+    // Two is generous against a flat lookup and far under a walking one.
+    for (i, name) in [(1usize, "resident"), (2, "from the volume")] {
         assert!(
-            each < std::time::Duration::from_micros(20),
-            "{name}: {each:?} per hover is too slow for pointer motion"
+            best[i] < best[0] * 2,
+            "{name}: {:?} against {:?} for {}x fewer gates — the lookup is \
+             walking the radial rather than indexing into it",
+            each(best[i]),
+            each(best[0]),
+            WIDE / NARROW,
         );
     }
 }

@@ -43,13 +43,19 @@
 //! `MomentData::iter().nth` is `chunks_exact().map()`, and `nth` on either is a
 //! pointer add rather than a walk.
 //!
-//! Measured by `the_hover_lookup_is_cheap_enough_for_pointer_motion` on a full
-//! ring — 720 wedges of 400 gates — over 12,800 calls at spread positions:
-//! **903 ns** resident and **897 ns** out of the volume, `--release`, and
-//! 3.13 µs / 7.69 µs unoptimized. The two release figures being the same is the
-//! point: the gate decode is not what this costs, the wedge walk is, and both
-//! paths walk the same wedges. Against a 16.7 ms frame that is 0.005% of one,
-//! and it happens once per frame rather than once per pointer event.
+//! `the_hover_lookup_does_not_walk_the_gates` asserts the shape — nine times
+//! the gates must not cost nine times the time — because that is the property,
+//! and an absolute bound tight enough to mean anything fails for reasons that
+//! have nothing to do with the code. It prints the figures. Measured on a full
+//! ring of 720 wedges over 12,800 calls at spread positions with nothing else
+//! on the box:
+//! **832 ns** at 200 gates, **832 ns** at 1832, and **851 ns** reading out of
+//! the volume, `--release`; 3.03 / 3.03 / 5.33 µs unoptimized. Flat in the gate
+//! count in both builds, which is the claim, and the volume-backed path costs
+//! 2% more than the resident one — the gate decode is not what this costs, the
+//! wedge walk is, and both paths walk the same wedges. Against a 16.7 ms frame
+//! that is 0.005% of one, and it happens once per frame rather than once per
+//! pointer event.
 //!
 //! A binary search over the wedges is available if a sweep ever arrives with
 //! enough radials to matter, but it is not free to have: the wedges are in the
