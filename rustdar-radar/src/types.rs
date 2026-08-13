@@ -44,8 +44,8 @@ pub const NATIVE_IMAGE_SIZE: usize = 2048;
 /// have wgpu, so the number cannot drift away from wgpu's own.
 pub const WEBGL2_MAX_TEXTURE_DIMENSION_2D: usize = 2048;
 
-/// Side length, in pixels, of the square radar image a render produces **at the
-/// [`BASE_EXTENT_KM`] floor** — which is nearly every render this display makes.
+/// Side length, in pixels, of the square radar image a render produces at
+/// [`BASE_EXTENT_KM`] and at every extent inside it.
 /// An RGBA texture is `IMAGE_SIZE² × 4` bytes; a static pane render keeps an
 /// `f32` value grid alongside it, doubling that.
 ///
@@ -68,39 +68,71 @@ pub const IMAGE_SIZE: usize = WASM_IMAGE_SIZE;
 #[cfg(not(target_arch = "wasm32"))]
 pub const IMAGE_SIZE: usize = NATIVE_IMAGE_SIZE;
 
-/// The half-width a plan view is projected at when the data does not reach
-/// further, km.
+/// The half-width [`IMAGE_SIZE`] is calibrated at, km: the extent at which the
+/// base texture is 4.4522 px/km.
 ///
 /// 230 km is the WSR-88D's nominal unambiguous range and the extent this
-/// rasterizer was fixed at for its whole life. It is kept as the **floor**
-/// rather than as the extent so that a sweep whose data stops inside it
-/// projects at exactly the scale it always did, pixel for pixel;
-/// `a_render_inside_the_floor_ignores_the_long_range_ceiling_entirely` pins
-/// that bit for bit, image and value grid both.
+/// rasterizer was fixed at for its whole life. **It is no longer a floor under
+/// the extent** — [`plan_view_extent_km`] projects a plan view at the range its
+/// own data reaches, and nothing here raises a short sweep to meet this number.
+/// What is left of it is the *resolution* reference in [`raster_side_px`]: a
+/// render at this extent or inside it fits in the base texture, and only a
+/// render past it needs the caller's larger ceiling.
 ///
-/// # Which sweeps those are, measured
+/// # What the floor was doing, measured
 ///
-/// **Not a Doppler cut.** A split cut's Doppler half carries 1192 gates of
-/// 0.25 km from a first gate 2.125 km out — 300.125 km of slant range, ±300.11
-/// on the ground at half a degree — and the RDA states the intent in the volume
-/// coverage pattern itself, where those elevation cuts carry
+/// It never touched a WSR-88D's lowest cuts. A split cut's Doppler half carries
+/// 1192 gates of 0.25 km from a first gate 2.125 km out — 300.125 km of slant
+/// range, ±300.11 on the ground at half a degree — and the RDA states the intent
+/// in the volume coverage pattern itself, where those elevation cuts carry
 /// `super_resolution_doppler_to_300km`. Identical on eight sites across three
 /// patterns (KCBW, KESX, KICT, KMPX, KUDX, KCRP, KFTG, KDMX; VCP 35, 212, 215):
 /// the 1192-gate geometry is every velocity tilt from the lowest up to about
 /// 3°, and the surveillance halves beside them are 1832 gates — 460.125 km
 /// slant, ±460.11 on the ground.
 ///
-/// What does stop inside the floor is the volume's **upper** half and the
-/// products that are not a tilt: the first cut whose data ends short of 230 km
-/// is the one near 5° (208.1 km at KCBW, 197.1 at KESX, 210.1 at KCRP), every
-/// tilt above it is shorter again, and every derived 1° × 1 km grid and every
-/// Level III product this display fetches is well inside.
+/// What it did touch was **every TDWR Doppler moment**, the volume's upper half,
+/// and the products that are not a tilt. A TDWR's velocity and spectrum width
+/// are 592 gates of 0.15 km from 0.0 km out — 88.800 km slant, ±88.80 on the
+/// ground — on all four sites measured (TOKC, TDAL, TPIT, TATL, 2026-08-11 00Z),
+/// beside a 1390-gate reflectivity reaching 417 km. Raised to 230 km, that
+/// Doppler disc was 11.7% of its own raster and every one of its 0.15 km gates
+/// was 0.668 px across: **sub-pixel, so gates fought each other for pixels**.
+/// At its own extent the disc is 78.5% of the raster and a gate is 1.73 px.
+/// The first WSR-88D cut ending short of 230 km is the one near 5° (208.1 km at
+/// KCBW, 197.1 at KESX, 210.1 at KCRP), and every tilt above it is shorter
+/// again; every derived 1° × 1 km grid and every Level III product this display
+/// fetches was inside the floor too, and so was being drawn on a frame wider
+/// than its data.
 ///
-/// So the floor is the extent of every render with nothing further to say, not
-/// the extent of most of them. [`raster_side_px`] carries what the sweeps that
-/// do reach further cost, which on a device whose textures stop at the base
-/// size is not nothing.
+/// `a_tdwr_doppler_sweep_is_projected_at_its_own_reach_not_the_base_extent` is
+/// where the TDWR case is pinned, and
+/// `a_short_sweep_gets_the_base_texture_over_its_own_ground` is where this
+/// constant's surviving role is.
 pub const BASE_EXTENT_KM: f64 = 230.0;
+
+/// The half-width to project a plan view at when the scan does not say how far
+/// its data reached, km.
+///
+/// **A fallback and only a fallback.** [`plan_view_extent_km`] reaches it on a
+/// `NaN` reach and on a non-positive one, which between them are the two ways a
+/// render can be asked for a picture of nothing: a product no radial of the
+/// sweep carries (`crate::render`'s `compute_max_range` answers 0.0), and a
+/// derived grid that came back with no range bins. Both paint an empty raster,
+/// so what this number decides is the size of an empty frame and never where an
+/// echo goes.
+///
+/// It is 230 km because that is the extent this display has always drawn an
+/// otherwise-unexplained frame at, and it is spelt separately from
+/// [`BASE_EXTENT_KM`] rather than reusing it because the two answer different
+/// questions and would move for different reasons — the same argument
+/// [`WASM_IMAGE_SIZE`] and [`NATIVE_IMAGE_SIZE`] are kept apart on. One is the
+/// extent a texture size was calibrated at; this one is what to draw when there
+/// is nothing to draw.
+///
+/// `an_unstated_reach_is_the_only_way_to_reach_the_fallback_extent` is the
+/// guard that it stays unreachable from any sweep that states a reach.
+pub const FALLBACK_EXTENT_KM: f64 = 230.0;
 
 /// The furthest half-width a plan view will project at, km.
 ///
@@ -114,26 +146,58 @@ pub const BASE_EXTENT_KM: f64 = 230.0;
 /// render that is merely too coarse.
 pub const MAX_EXTENT_KM: f64 = 470.0;
 
-/// The half-width to project a plan view at, km, given how far its data
-/// reaches.
+/// The half-width to project a plan view at, km: **how far this data reaches**,
+/// and nothing else.
 ///
 /// The reach comes from the sweep itself ([`crate::render`]'s
-/// `compute_max_range`), so this is the one place the raster's geometry is
-/// decided, and both bounds are decisions rather than measurements: the floor
-/// keeps short sweeps drawn the way they have always been drawn, and the cap
-/// keeps a corrupt gate count from redefining the display.
+/// `compute_max_range`, the per-sweep counterpart of
+/// [`crate::voxel::volume_reach_km`]), so this is the one place the raster's
+/// geometry is decided and it is now a measurement rather than a decision.
+/// [`MAX_EXTENT_KM`] is the only bound left, and it bounds *arithmetic*, not
+/// data: a mis-framed radial claiming sixty thousand gates is refused.
 ///
-/// A `NaN` reach answers the floor. Nothing in the decode path can produce one
-/// today — gate counts and intervals are integers off the wire — but `clamp`
-/// propagates a `NaN` rather than rejecting it, and a `NaN` extent would reach
-/// [`ImageBounds`] and make every pixel of the render unplaceable with no error
-/// anywhere. An infinite reach needs no special case: it is only the cap's case
-/// taken to its limit, and `clamp` answers it correctly.
+/// # There is no floor, and that is the change
+///
+/// This used to `clamp` the reach up to [`BASE_EXTENT_KM`], so a sweep that
+/// stopped inside 230 km was projected onto a 230 km frame anyway. Every
+/// consumer of the returned figure treats it as the edge of the picture — the
+/// texture's corners, the hover's divisor, the plan view's range ring — so a
+/// TDWR velocity sweep reaching 88.8 km was drawn with a ring at 230 km around
+/// it, which states coverage the radar did not have. The extent is the data's
+/// now, so the ring is the data's, and none of those consumers had to learn
+/// anything new.
+///
+/// Nor is there a *lower* clamp to replace the floor with. A floor at any value
+/// is the same claim in a smaller font, and the reach is already a maximum over
+/// the sweep's radials, so no single short radial can drag it down.
+///
+/// # The one case that is not the data's
+///
+/// A `NaN` reach and a non-positive reach both answer [`FALLBACK_EXTENT_KM`],
+/// spelt as an early return so the fallback is legible as one. Those are the
+/// two shapes of "the scan does not say": `compute_max_range` returns 0.0 when
+/// no radial of the sweep carries the product's moment, a derived grid with no
+/// range bins arrives as 0.0, and a `NaN` cannot come off the wire today —
+/// gate counts and intervals are integers — but `clamp` propagates one, and a
+/// `NaN` extent reaches [`ImageBounds`] and makes every pixel of the render
+/// unplaceable with no error anywhere. All three paint nothing, so the fallback
+/// sizes an empty frame and never places an echo.
+///
+/// An infinite reach needs no special case: it is the cap's case taken to its
+/// limit, and `min` answers it correctly.
+///
+/// `a_tdwr_doppler_sweep_is_projected_at_its_own_reach_not_the_base_extent`
+/// pins the reported defect and
+/// `an_unstated_reach_is_the_only_way_to_reach_the_fallback_extent` pins the
+/// fallback's reachability.
 pub fn plan_view_extent_km(data_reach_km: f64) -> f64 {
-    if data_reach_km.is_nan() {
-        return BASE_EXTENT_KM;
+    // `is_nan` spelled out rather than folded into the comparison: every
+    // ordering against a `NaN` is false, so `<= 0.0` alone would let one
+    // through to arithmetic that propagates it.
+    if data_reach_km.is_nan() || data_reach_km <= 0.0 {
+        return FALLBACK_EXTENT_KM;
     }
-    data_reach_km.clamp(BASE_EXTENT_KM, MAX_EXTENT_KM)
+    data_reach_km.min(MAX_EXTENT_KM)
 }
 
 /// How many pixels across to paint a plan view of `extent_km`, given the
