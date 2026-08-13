@@ -6,9 +6,10 @@
 //! ([`compute_echo_tops`], and the EET/DVL/KDP/HCA family to come) are then
 //! column scans over the cube rather than owners of their own gridding.
 //!
-//! The RPG's EET/DVL products use coarser grids and beam-top conventions; the
-//! interpolated echo tops here interpolate between tilt centers, calibrated
-//! against a reference implementation's readouts.
+//! The interpolated echo tops here interpolate between tilt centres. What they
+//! were calibrated against, and how far that goes, is written out at
+//! [`compute_echo_tops`] — the short of it is **GR2Analyst's** own Echo Tops
+//! and not the RPG's product 135, which [`crate::eet`] reproduces separately.
 //!
 //! # Two kinds of consumer, and [`RangeBinning`] is the seam
 //!
@@ -746,6 +747,166 @@ fn sweep_to_grid(
 /// Echo tops: height (kft above radar) of the interpolated crossing of
 /// [`ET_THRESHOLD_DBZ`], scanning tilts top-down per column of a
 /// newest-wins reflectivity [`VolumeCube`].
+///
+/// # What this is a twin of, and what it is not
+///
+/// **It is not the RPG's product 135.** [`crate::eet`] is; this is a separate,
+/// adjacent product (`RadarProduct::EchoTopsInterpolated`, "Echo Tops
+/// (Interp)"), added deliberately alongside it.
+///
+/// The reference it was calibrated against is **GR2Analyst's own Echo Tops** —
+/// GR computes echo tops itself from the Level II volume rather than displaying
+/// the RPG's. The module doc used to say only "a reference implementation's
+/// readouts" without naming it, which is how it came to look self-validating.
+/// The calibration was **twelve hover readouts on one frozen KOAX volume**
+/// (2026-07-28): the cell statistic, the ground binning and the
+/// echo-absent-above clamp were each chosen to move those twelve points, and
+/// nothing since had re-measured them.
+///
+/// Two things followed that a reader should have in hand:
+///
+/// * That is single-site tuning, on one volume, at one site, in one regime.
+/// * GR was **de-scoped as a target for this product family** by the user the
+///   same day, on the ground that for products already displayed from RPG
+///   Level III the RPG's version is the intended one and GR is a gut check.
+///
+/// # Measured against GR — the calibration generalised
+///
+/// GR2Analyst was run headless and its Echo Tops render decoded against its own
+/// colour bar (step 0.164 kft, i.e. 50 m), registered **values-blind on the
+/// footprint**. On cells GR paints:
+///
+/// | site | VCP | mean | rms | within 1 kft | footprint IoU |
+/// |------|-----|------|-----|--------------|---------------|
+/// | KDMX | 212 | −0.45 | 1.47 | 81.0 % | 0.846 |
+/// | KFTG | 212 | −0.73 | 1.68 | 72.1 % | 0.908 |
+/// | KCRP | 212 | −0.58 | 1.28 | 79.1 % | 0.934 |
+/// | KMSX | 212 | −0.51 | 1.11 | 73.6 % | 0.647 |
+/// | KATX | 215 | −0.08 | 0.34 | 98.0 % | 0.471 |
+///
+/// So it **does** reproduce its reference, at four sites that had no part in the
+/// original KOAX tuning, with a small and consistent low bias of about half a
+/// kft. Set that beside the RPG twin's 31.9–54.4 % within 1 kft in the table
+/// above: this is a GR twin and not an RPG one, and the two tables are the
+/// evidence for saying so rather than an assumption.
+///
+/// Three things bound that result, and none of them is a disagreement:
+///
+/// * **GR's colour bar floors at 10.17 kft.** Below that GR paints nothing, so
+///   a decode cannot see it. At **KAMA, KICT, KESX and KGJX** every top is
+///   under that floor and the oracle yielded no cells at all — "could not be
+///   obtained", not "disagrees". That is **all three holdout sites**, so the
+///   GR comparison is measured on five sites and *held out on none*. The
+///   holdout carries the `eet` comparison and the independent-implementation
+///   check above, not this one.
+/// * **GR's own product header reports its threshold as `Top: 18.5dbz`**
+///   (seen at KDMX, KICT and KESX) where [`ET_THRESHOLD_DBZ`] here is 18.3, the
+///   RPG's fleet default. The product takes its threshold from one reference
+///   and its target from the other. The sign does not explain the residual —
+///   a lower threshold crosses *higher* — so the −0.5 kft is something else.
+/// * The registration was checked against the known false-offset trap: shifting
+///   range by ±1 and +2 bins degrades footprint IoU *and* rms *and* the
+///   within-1-kft share at all four convective sites, all peaking at zero
+///   shift. The mean alone drifts toward zero under a +1 shift and would have
+///   sold that offset as real.
+///
+/// One convention this settles: **GR's Echo Tops is above the radar, not above
+/// MSL**, which is what this function reports and is *not* what [`crate::eet`]
+/// reports. KFTG sits 5.5 kft above sea level and KCRP at sea level; their
+/// offsets against GR differ by 0.15 kft, not by 5.5.
+///
+/// # Measured against [`crate::eet`]
+///
+/// Nine volumes, nine sites, four VCPs (212/215/31/35), three of them a
+/// holdout. Both grids taken in kft **above the radar** — `compute_eet` run
+/// with its datum zeroed — so the comparison is of algorithm and convention
+/// and not of site elevation. `eet` minus this, on cells both define:
+///
+/// | site | VCP | mean | rms | within 1 kft | footprint IoU |
+/// |------|-----|------|-----|--------------|---------------|
+/// | KDMX | 212 | +1.02 | 2.95 | 51.7 % | 0.808 |
+/// | KFTG | 212 | +1.93 | 3.78 | 31.9 % | 0.855 |
+/// | KCRP | 212 | +1.58 | 2.67 | 38.0 % | 0.933 |
+/// | KMSX | 212 | +1.21 | 1.75 | 54.4 % | 0.715 |
+/// | KATX | 215 | +0.69 | 1.13 | 79.1 % | 0.540 |
+/// | KAMA | 31  | +0.09 | 0.27 | 100 %  | 0.477 |
+/// | KICT | 35 (holdout) | +0.10 | 0.26 | 100 % | 0.194 |
+/// | KESX | 35 (holdout) | +0.23 | 0.52 | 98.2 % | 0.404 |
+/// | KGJX | 35 (holdout) | +0.29 | 0.56 | 89.3 % | 0.250 |
+///
+/// This reads **low** against the RPG twin wherever there is deep convection,
+/// and only a third to a half of cells agree inside the ICD's own 1 kft
+/// quantisation. The shallow clear-air sites agree on value because their tops
+/// are shallow — but disagree most on *footprint*: at KICT the two products
+/// share under a fifth of the cells either one defines, and `eet` defines more
+/// cells than this at **all nine** sites.
+///
+/// # Where the difference comes from
+///
+/// Flipping one convention at a time from here toward [`crate::eet`], mean
+/// change in kft: **[`CellStat::Max`] +0.54 … +1.87** and every other
+/// convention within ±0.21 of zero — dedup policy, the 0.1°-rounded elevation
+/// key, ground-versus-slant binning and the refraction model. Essentially the
+/// whole *systematic* gap is the cell statistic.
+///
+/// "Negligible in the mean" is not "negligible", and the dedup policy is the
+/// one to watch: switching it to [`DedupPolicy::FirstOfVolume`] moves the mean
+/// by at most 0.07 kft while moving individual cells by up to **15.7 kft**
+/// (p99 5.5 at KDMX), and drops footprint agreement to 0.21 at KICT. It is a
+/// wash on average and a large per-cell disagreement — which is what picking a
+/// different sweep looks like. [`DedupPolicy::NewestWins`] takes the *latest*
+/// sweep at an elevation, and on a split cut both halves carry reflectivity,
+/// so the freshest look is the short-PRT Doppler half rather than the
+/// surveillance cut: measured independently, 30 of 31 split elevations across
+/// these nine volumes. The policy's doc justifies itself by SAILS revisits and
+/// does not mention split cuts.
+///
+/// That matters because the statistic is the one choice already settled
+/// elsewhere: [`crate::eet`]'s [`CellStat::Max`] is correct per FMH-11 Part C
+/// § 3.2.3 and beat linear-Z mean at all seven sites it was measured on. This
+/// product uses [`CellStat::LinearZMean`], which is also what makes it define
+/// fewer cells — averaging a 1-km cell's gates dilutes a strong gate below
+/// 18.3 dBZ, so the column never crosses and reports nothing.
+///
+/// The residual also has the **opposite sign in height** to `eet`'s own. `eet`
+/// grades +0.36 kft below 15 kft to −2.94 kft above 45 kft against the real
+/// RPG; this grades the other way against `eet` — about −0.1 below 15 kft
+/// rising to +1.8…+4.5 kft in the 25–45 kft bands. The two errors compound
+/// rather than cancel, so against the actual RPG product this sits lower still
+/// at height.
+///
+/// # A cube-level defect the measurement turned up
+///
+/// **One physical cut, visited twice, can become two tilts.** The cube keys
+/// tilts on the sweep's median elevation rounded to 0.1°, and a SAILS revisit
+/// of the same cut does not repeat that median exactly. When the two visits
+/// straddle a rounding boundary they get two keys: KMSX's 0.879° cut keys at
+/// 0.8 **and** 0.9 (medians 0.8350 / 0.8789), KICT's 0.483° cut at 0.4 **and**
+/// 0.5 (medians 0.4395 / 0.4834) — 0.0439° apart, the same beam.
+///
+/// For a column scan that is not cosmetic. A column crossing at the lower
+/// phantom interpolates toward a "next tilt up" that is the same beam 0.044°
+/// higher — a rung of 0.003–1.3 kft where the real next cut is 2.9–5.2 kft up
+/// — so its top is truncated to very near its own tilt. It reaches 5.2 % of
+/// KMSX's defined cells and 34 % of KICT's.
+///
+/// This is [`VolumeCube`]'s keying, not this function's, so it reaches
+/// [`crate::hail`], [`crate::eet`] and [`crate::vil`] equally. Keying on the
+/// VCP's **target** elevation angle — bit-identical for both visits of a cut —
+/// would remove the failure mode outright. Not done here: it re-pins every
+/// cube consumer's fixtures at once and wants its own change.
+///
+/// # None of this is a licence to "fix" this to match `eet`
+///
+/// The measurement above says this product is doing its job: it reproduces the
+/// reference it was built to reproduce. Moving it toward [`crate::eet`] — the
+/// cell statistic above all — would improve the RPG comparison and *break* the
+/// GR one, and there is no reading of "correct" under which both improve. The
+/// two products target two different things, and the tables are here so that
+/// choice is made deliberately rather than by whoever reads one table first.
+///
+/// What is genuinely open, and cheap to close, is the 18.3-versus-18.5 dBZ
+/// threshold and whether it accounts for any of the −0.5 kft.
 pub fn compute_echo_tops(scan: &Scan) -> VolumetricGrid {
     // Ground: an echo top is the height of a column over a *place*, so the
     // tilts stacked into it have to be over the same place. See
