@@ -12,6 +12,10 @@ fn key(site: &str, elevation_tenths: i32) -> RenderCacheKey {
 
 /// A distinguishable entry — `max_range_km` doubles as the identity so a test
 /// can tell which render it got back.
+///
+/// Empty buffers, so it costs nothing: the tests that use it are about the
+/// *count* bound, and they are handed a byte budget that cannot bind so that
+/// each bound is exercised on its own.
 fn output(range: f64) -> CachedRenderOutput {
     CachedRenderOutput {
         image: Arc::new(egui::ColorImage::default()),
@@ -22,12 +26,27 @@ fn output(range: f64) -> CachedRenderOutput {
     }
 }
 
+/// An entry that costs what a real raster of `side` costs: the texture and the
+/// value grid beside it, `side² × 4` each.
+fn output_of_side(range: f64, side: usize) -> CachedRenderOutput {
+    CachedRenderOutput {
+        image: Arc::new(egui::ColorImage::new(
+            [side, side],
+            vec![egui::Color32::BLACK; side * side],
+        )),
+        max_range_km: range,
+        value_data: Arc::new(vec![0.0; side * side]),
+        nyquist_ms: None,
+        melting_layer_source: None,
+    }
+}
+
 /// The bound the cache exists for. Before this it was a bare `HashMap` that only
 /// `reset_panes*` ever shrank, so cycling products grew it without limit at
 /// ~32 MiB per entry.
 #[test]
 fn inserting_past_capacity_evicts_instead_of_growing() {
-    let mut cache = RenderCache::new(3);
+    let mut cache = RenderCache::new(3, usize::MAX);
     for i in 0..10 {
         cache.insert(key("KTLX", i), output(i as f64));
     }
@@ -44,7 +63,7 @@ fn inserting_past_capacity_evicts_instead_of_growing() {
 /// its entry must not lose it to one nobody has touched since it was written.
 #[test]
 fn a_read_protects_an_entry_from_eviction() {
-    let mut cache = RenderCache::new(3);
+    let mut cache = RenderCache::new(3, usize::MAX);
     cache.insert(key("KTLX", 0), output(0.0));
     cache.insert(key("KTLX", 1), output(1.0));
     cache.insert(key("KTLX", 2), output(2.0));
@@ -68,7 +87,7 @@ fn a_read_protects_an_entry_from_eviction() {
 /// rather than queueing the key a second time and corrupting the eviction order.
 #[test]
 fn reinserting_a_key_replaces_it_without_duplicating_it() {
-    let mut cache = RenderCache::new(2);
+    let mut cache = RenderCache::new(2, usize::MAX);
     cache.insert(key("KTLX", 0), output(0.0));
     cache.insert(key("KTLX", 1), output(1.0));
     cache.insert(key("KTLX", 0), output(99.0));
@@ -88,7 +107,7 @@ fn reinserting_a_key_replaces_it_without_duplicating_it() {
 /// oldest entry survives.
 #[test]
 fn retain_drops_keys_from_the_recency_queue_as_well() {
-    let mut cache = RenderCache::new(4);
+    let mut cache = RenderCache::new(4, usize::MAX);
     cache.insert(key("KTLX", 0), output(0.0));
     cache.insert(key("KOUN", 1), output(1.0));
     cache.insert(key("KTLX", 2), output(2.0));
@@ -109,7 +128,7 @@ fn retain_drops_keys_from_the_recency_queue_as_well() {
 
 #[test]
 fn clear_empties_both_halves() {
-    let mut cache = RenderCache::new(4);
+    let mut cache = RenderCache::new(4, usize::MAX);
     cache.insert(key("KTLX", 0), output(0.0));
     cache.insert(key("KTLX", 1), output(1.0));
     cache.clear();
@@ -121,7 +140,7 @@ fn clear_empties_both_halves() {
 /// cross-pane sharing the cache exists for.
 #[test]
 fn capacity_is_floored_at_one() {
-    let mut cache = RenderCache::new(0);
+    let mut cache = RenderCache::new(0, usize::MAX);
     cache.insert(key("KTLX", 0), output(0.0));
     assert_eq!(cache.entry_count(), 1);
     assert!(cache.get(&key("KTLX", 0)).is_some());
@@ -459,4 +478,102 @@ fn a_site_reset_still_clears_a_collapsed_entry() {
             "{product:?} survived a site reset in the viewless slot",
         );
     }
+}
+
+/// The cache is bounded by bytes as well as by entries, because the count
+/// stopped being a statement about memory.
+///
+/// Eight entries of `4096² × 8` is 1 GiB, and that is what
+/// [`MAX_RENDER_CACHE_ENTRIES`] meant while a plan view was one of three sizes.
+/// Once the side became the device's own answer — a 7362 px surveillance cut on
+/// a machine that reports 32768 — the same eight entries are 3.3 GiB. Nothing
+/// in the cache was counting, so that regression would have been silent, which
+/// is why this is asserted against the resident total and not against a count.
+///
+/// The three sizes are the real ones: a browser loop frame, the base raster,
+/// and the widest sweep a WSR-88D flies at two texels per gate.
+#[test]
+fn a_cache_of_long_range_rasters_is_bounded_by_bytes_not_by_entries() {
+    // A quarter of a base-size raster, so the arithmetic below is exact and the
+    // test is not sized to whatever the host class ships.
+    const BUDGET: usize = 4 * 128 * 1024 * 1024;
+
+    for (side, why) in [
+        (1024usize, "a browser's loop frame"),
+        (2048, "the base raster"),
+        (7362, "a 1832-gate surveillance cut at two texels per gate"),
+    ] {
+        let mut cache = RenderCache::new(usize::MAX, BUDGET);
+        for i in 0..12 {
+            cache.insert(key("KTLX", i), output_of_side(i as f64, side));
+        }
+        assert!(
+            cache.resident_bytes() <= BUDGET,
+            "{why}: {} bytes resident against a {BUDGET} byte budget",
+            cache.resident_bytes(),
+        );
+        // And the bound is on bytes, so a smaller raster genuinely buys more
+        // entries — the thing a fixed count could not express.
+        let held = cache.entry_count();
+        assert!(
+            held >= 1,
+            "{why}: the cache evicted everything, so nothing is ever shared",
+        );
+        assert_eq!(
+            held,
+            (BUDGET / (side * side * 8)).clamp(1, 12),
+            "{why}: {held} entries of {side} px is not what the budget pays for",
+        );
+    }
+}
+
+/// An entry larger than the whole budget is kept anyway, alone.
+///
+/// The alternative is worse than holding it: a cache that dropped the render
+/// just handed to it would report a miss to the pane that asked, which would
+/// dispatch the same render again, for as long as the pane stayed open. The
+/// budget bounds what is *retained beside* an entry, and cannot be a reason to
+/// refuse one.
+#[test]
+fn a_single_raster_over_the_whole_budget_is_still_cached() {
+    let mut cache = RenderCache::new(usize::MAX, 1);
+    cache.insert(key("KTLX", 5), output_of_side(460.0, 512));
+    assert_eq!(cache.entry_count(), 1);
+    assert!(cache.get(&key("KTLX", 5)).is_some());
+
+    // A second one evicts the first rather than accumulating.
+    cache.insert(key("KTLX", 6), output_of_side(300.0, 512));
+    assert_eq!(cache.entry_count(), 1);
+    assert!(cache.get(&key("KTLX", 6)).is_some());
+}
+
+/// The byte total tracks every way an entry can arrive or leave, not just
+/// insertion.
+///
+/// A counter that only counted upward would drift above the truth and evict a
+/// cache that was already empty — silently turning off pane sharing, which is
+/// the failure this whole cache exists to prevent and the one nothing on screen
+/// would show.
+#[test]
+fn the_resident_total_survives_replacement_retention_and_clearing() {
+    let mut cache = RenderCache::new(usize::MAX, usize::MAX);
+    let one = 512 * 512 * 8;
+
+    cache.insert(key("KTLX", 5), output_of_side(1.0, 512));
+    cache.insert(key("KOUN", 5), output_of_side(2.0, 512));
+    assert_eq!(cache.resident_bytes(), 2 * one);
+
+    // Replacing a key must not count the old entry twice.
+    cache.insert(key("KTLX", 5), output_of_side(3.0, 512));
+    assert_eq!(
+        cache.resident_bytes(),
+        2 * one,
+        "a replacement double-counted"
+    );
+
+    cache.retain(|(site, ..)| site == "KTLX");
+    assert_eq!(cache.resident_bytes(), one, "retain did not release bytes");
+
+    cache.clear();
+    assert_eq!(cache.resident_bytes(), 0, "clear did not release bytes");
 }

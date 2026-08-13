@@ -554,6 +554,34 @@ impl Budgets {
         self.loop_image_side_px * self.loop_image_side_px * 4
     }
 
+    /// The bytes the shared render cache's entries may occupy between them,
+    /// which is the bound that actually holds on it.
+    ///
+    /// **[`Self::render_cache_entries`] was a statement about memory and
+    /// stopped being one.** Eight entries of `4096² × 8` is 1 GiB, and that is
+    /// what the count meant for as long as a plan view was one of three sizes.
+    /// Once the side became the device's own answer, spent as far as a sweep's
+    /// gates justify, the same eight entries of a 7362 px surveillance cut are
+    /// **3.3 GiB** — a regression the cache would have taken on silently,
+    /// because nothing in it was counting bytes.
+    ///
+    /// Derived rather than bracketed, so that it is the *same* ceiling the count
+    /// used to imply and this moves no memory: it is [`Self::render_cache_entries`]
+    /// rasters at the size this class shipped before the device was ever asked.
+    /// Both bounds apply and either may bind — on desktop 1 GiB is two
+    /// long-range rasters, eight base-size ones (the count, exactly as before),
+    /// or thirty-two of a browser's loop frames, which is the case a fixed
+    /// count served worst.
+    ///
+    /// `long_range_image_side_px` and **not** [`Self::raster_side_ceiling_px`]:
+    /// the ceiling is what one raster may reach, and sizing the cache off it
+    /// would raise the ceiling and the budget together, which is the tautology
+    /// [`BudgetLimits::app_texture_ceiling_bytes`]' doc refuses for the app
+    /// sum. What the cache is owed is the memory it was already promised.
+    pub fn render_cache_budget_bytes(&self) -> usize {
+        self.render_cache_entries * constants::raster_bytes(self.long_range_image_side_px)
+    }
+
     /// Bytes one **static** pane render's texture occupies, worst case: the
     /// raster ceiling, since that is the most a device on this class can be
     /// asked to hold.
