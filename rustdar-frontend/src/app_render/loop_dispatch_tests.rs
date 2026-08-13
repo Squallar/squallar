@@ -589,6 +589,69 @@ fn a_long_listing_is_sampled_evenly_across_its_whole_span() {
     );
 }
 
+/// **One scan over the cap is already a sample, and the loop records it as
+/// one.** The whole fidelity claim in the timeline caption rests on this flag,
+/// and it is decided here and nowhere else.
+///
+/// The boundary is the point. The rule the caption used before compared the
+/// frame list's median gap against the listing's, which cannot see a sample at
+/// all until two-step gaps are the majority — so everything from one scan over
+/// the cap up to about 1.5x it read as "every scan". This walks the boundary:
+/// exactly the cap is not a sample, and one more is.
+///
+/// The cap is taken from `Budgets::loop_frames_held`, which is what
+/// `loop_frames_held` resolves a raster loop's cap from — not from
+/// [`MAX_LOOP_FRAMES`], which is the same figure today and is no longer the one
+/// the code reads. The unit half in `rustdar_egui::ui_timeline` has to write the
+/// caps out as literals because neither `crate::budget` nor `crate::constants`
+/// is visible from that crate; this is what would catch it drifting from either.
+#[test]
+fn a_listing_one_scan_over_the_cap_is_recorded_as_sampled() {
+    let ctx = egui::Context::default();
+    let cap = test_budgets().loop_frames_held;
+    assert_eq!(
+        cap, MAX_LOOP_FRAMES,
+        "the resolver and the constant have parted company; this test follows \
+         the resolver, and `ui_timeline`'s literals need re-reading against it",
+    );
+    for (listed, expected) in [(cap, false), (cap + 1, true)] {
+        let mut ls = loop_on(&ctx, "KTLX", &[]);
+        let scans: Vec<_> = (0..listed as u32)
+            .map(|i| (ts(i), identifier(&format!("KTLX2024010{}_V06", i))))
+            .collect();
+
+        accept_scan_listing(
+            test_loop_allocation(),
+            &test_budgets(),
+            &mut ls,
+            "KTLX",
+            scans,
+        )
+        .expect("accepted");
+
+        assert_eq!(
+            ls.listing_sampled,
+            Some(expected),
+            "a listing of {listed} against a cap of {cap} kept {} frames and \
+             recorded {:?}",
+            ls.frames.len(),
+            ls.listing_sampled,
+        );
+    }
+}
+
+/// A loop that has taken no listing yet claims nothing about fidelity.
+///
+/// `None` is a third state and not a synonym for `Some(false)`: a loop still in
+/// `FetchingScanList` holds frames from no listing at all, and a caption reading
+/// "every scan" off that would be making the claim before there was anything to
+/// claim about.
+#[test]
+fn a_loop_that_has_taken_no_listing_records_no_fidelity() {
+    let ctx = egui::Context::default();
+    assert_eq!(loop_on(&ctx, "KTLX", &[]).listing_sampled, None);
+}
+
 /// The coordinates an image is placed at come off the response — the ones the
 /// renderer was actually handed — never off the loop receiving it.
 ///

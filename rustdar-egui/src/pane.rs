@@ -229,6 +229,49 @@ pub struct LoopFrame {
     pub render_failed: bool,
 }
 
+/// Which entries of a listing of `total` scans a loop that may hold `held`
+/// frames keeps, oldest-first — or `None` when the listing fits and every scan
+/// becomes a frame.
+///
+/// # The `Option` is the answer, not a convenience
+///
+/// This is the *only* place the two outcomes are distinguished, and
+/// distinguishing them is the whole reason the function exists rather than the
+/// arithmetic sitting inline at the one call site. "Did this loop drop scans"
+/// is not recoverable afterwards from anything the loop holds: the sampling is
+/// even, so every surviving gap is a sampled gap and the frame list looks
+/// exactly like a listing at a slower cadence. `LoopPlaybackState::listing_sampled`
+/// is `is_none()` on this and is what the timeline caption reads.
+///
+/// The comparison the caption used to make instead was the frame list's own
+/// median gap against the listing's, and that cannot resolve this at all. Even
+/// sampling keeps the frame median at one listing step until two-step gaps are
+/// the *majority*, so it caught 2x decimation cleanly and nothing below about
+/// 1.5x: a browser loop of 17 scans held at 12 drops 29.4% of them and every
+/// gap the median can see is still one step. Two statistics over the same
+/// timestamps cannot answer a question about the timestamps that were thrown
+/// away.
+///
+/// # The spacing it produces
+///
+/// `i * (total - 1) / (held - 1)` puts the first sample on the oldest scan and
+/// the last on the newest, which is what keeps a loop covering the whole
+/// lookback the user asked for however hard it is decimated — the cap costs
+/// resolution, never span. Between those ends the integer division leaves gaps
+/// of alternating width, so a sampled loop's frames are *unevenly spaced by
+/// construction* and that unevenness says nothing about the radar. The caption
+/// names the sampling for exactly this reason; see `ui_timeline::loop_span_phrase`.
+pub fn listing_sample_indices(total: usize, held: usize) -> Option<Vec<usize>> {
+    if total <= held {
+        return None;
+    }
+    Some(
+        (0..held)
+            .map(|i| i * (total - 1) / (held - 1).max(1))
+            .collect(),
+    )
+}
+
 /// Tolerance for comparing two selected elevation angles. Shared with the render
 /// dispatcher, which uses it when deciding whether two panes' selections are the
 /// same and whether a queued render already covers a frame.
@@ -489,6 +532,32 @@ pub struct LoopPlaybackState {
     pub frames: Vec<LoopFrame>,
     /// Lookback duration in seconds that was requested.
     pub lookback_secs: u64,
+    /// Whether the listing this loop was built from had to be **sampled** to fit
+    /// the frame cap — `Some(true)` when scans were dropped, `Some(false)` when
+    /// every scan in the window became a frame, `None` before a listing has been
+    /// accepted at all.
+    ///
+    /// # Recorded, because it cannot be recovered
+    ///
+    /// [`listing_sample_indices`] is where it is decided and its doc says why no
+    /// later inspection of `frames` can re-derive it: the sampling is even, so a
+    /// decimated loop's frame list is indistinguishable from a listing at a
+    /// slower cadence. This flag and [`Self::scan_step_secs`] are the loop's only
+    /// two witnesses to the listing it came from, and they answer different
+    /// halves — this one says *whether* scans were dropped, that one says what
+    /// the site's cadence was.
+    ///
+    /// # It survives live appends, and that is not an accident
+    ///
+    /// `append_polled_frame` adds the newest scan and evicts from the old end,
+    /// so it moves the window without changing what the loop does with it: a
+    /// loop showing every scan goes on showing every scan over a window one
+    /// scan newer, and a sampled loop stays sampled. A fidelity claim derived
+    /// from the frame list instead flips with the frame count — about sixty
+    /// appends were enough to make a loop missing 273 scans read as "every
+    /// scan" — which is why this is a recorded decision rather than a measured
+    /// one.
+    pub listing_sampled: Option<bool>,
     /// The site's own scan cadence over this loop's window, in seconds: the median
     /// gap between consecutive scans in the listing the loop was built from,
     /// measured **before** any sampling. `None` until a listing has been accepted.
@@ -708,6 +777,7 @@ impl LoopPlaybackState {
             current_frame: 0,
             frames: Vec::new(),
             lookback_secs: 0,
+            listing_sampled: None,
             scan_step_secs: None,
             last_advance: None,
             site: String::new(),
@@ -739,6 +809,7 @@ impl LoopPlaybackState {
             current_frame: 0,
             frames: Vec::new(),
             lookback_secs,
+            listing_sampled: None,
             scan_step_secs: None,
             last_advance: None,
             site: site.name.to_string(),

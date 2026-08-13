@@ -52,6 +52,29 @@ fn loop_frames(gaps: &[i64]) -> Vec<LoopFrame> {
     frames
 }
 
+/// A loop built the way `accept_scan_listing` builds one: a listing whose
+/// consecutive gaps are `listing_gaps`, run through the **shipped** sampler at a
+/// cap of `held`, with the fidelity flag that sampling recorded.
+///
+/// [`crate::pane::listing_sample_indices`] is called rather than restated, and
+/// that is the point of the helper. The predecessor of these tests wrote
+/// `i * (total - 1) / (held - 1)` out in the test body, which is the same shape
+/// of mistake `MAX_FRAMING_PASSES` documents: a test that re-runs the shipped
+/// arithmetic in its own words is green against its own words.
+fn loop_from_listing(listing_gaps: &[i64], held: usize) -> (Vec<LoopFrame>, Option<bool>) {
+    let listing = loop_frames(listing_gaps);
+    match crate::pane::listing_sample_indices(listing.len(), held) {
+        Some(indices) => (
+            indices
+                .into_iter()
+                .map(|i| frame_at(listing[i].timestamp))
+                .collect(),
+            Some(true),
+        ),
+        None => (listing, Some(false)),
+    }
+}
+
 /// `format_span` rounds to nearest, and the 359 s row is the whole reason.
 ///
 /// A TDWR volume arrives every 360 s, but the listing timestamps are whole
@@ -121,7 +144,12 @@ fn a_real_wsr88d_loops_own_jitter_still_reads_as_evenly_spaced() {
         268, 269, 256, 255, 243, 229, 229, 235, 229, 230, 210,
     ];
     assert_eq!(
-        loop_span_phrase(&loop_frames(&measured), cadence(WSR_PRECIP), true),
+        loop_span_phrase(
+            &loop_frames(&measured),
+            Some(false),
+            cadence(WSR_PRECIP),
+            true
+        ),
         Some("This loop spans 2h 8m over 30 frames, every scan, ~4 min apart".to_owned())
     );
 }
@@ -130,7 +158,10 @@ fn a_real_wsr88d_loops_own_jitter_still_reads_as_evenly_spaced() {
 /// and a loop still fetching its listing.
 #[test]
 fn a_loop_with_no_frames_says_nothing() {
-    assert_eq!(loop_span_phrase(&[], cadence(WSR_PRECIP), true), None);
+    assert_eq!(
+        loop_span_phrase(&[], Some(false), cadence(WSR_PRECIP), true),
+        None
+    );
 }
 
 /// **Full fidelity.** An hour of WSR-88D precip fits the cap whole, so the
@@ -138,7 +169,12 @@ fn a_loop_with_no_frames_says_nothing() {
 #[test]
 fn a_loop_holding_every_scan_says_so() {
     assert_eq!(
-        loop_span_phrase(&loop_frames(&[WSR_PRECIP; 13]), cadence(WSR_PRECIP), true),
+        loop_span_phrase(
+            &loop_frames(&[WSR_PRECIP; 13]),
+            Some(false),
+            cadence(WSR_PRECIP),
+            true,
+        ),
         Some("This loop spans 56 min over 14 frames, every scan, ~4 min apart".to_owned())
     );
 }
@@ -149,13 +185,13 @@ fn a_loop_holding_every_scan_says_so() {
 #[test]
 fn a_tdwr_loop_reports_six_minute_volumes_not_five() {
     assert_eq!(
-        loop_span_phrase(&loop_frames(&[359; 10]), cadence(359), true),
+        loop_span_phrase(&loop_frames(&[359; 10]), Some(false), cadence(359), true),
         Some("This loop spans 1h 0m over 11 frames, every scan, ~6 min apart".to_owned())
     );
 }
 
-/// **Decimated** — the case the whole clause exists for, built from the real
-/// sampling arithmetic rather than a guess at it.
+/// **Decimated** — the case the whole clause exists for, built by the shipped
+/// sampler rather than by a restatement of it.
 ///
 /// A 24 h lookback on a WSR-88D in precip lists ~333 volumes; a desktop loop
 /// keeps 60. `accept_scan_listing` does not truncate that, it evenly samples,
@@ -164,22 +200,110 @@ fn a_tdwr_loop_reports_six_minute_volumes_not_five() {
 /// scans, ~26 min apart" is the same loop, unable to hide it.
 #[test]
 fn a_decimated_loop_admits_it_is_showing_a_sample() {
-    // The frame list `accept_scan_listing` would build: `scans[i * (total - 1)
-    // / (held - 1)]` over a 333-scan listing, capped at the desktop 60.
-    let (total, held) = (333_i64, 60_i64);
-    let sampled: Vec<i64> = (0..held).map(|i| i * (total - 1) / (held - 1)).collect();
-    let gaps: Vec<i64> = sampled
-        .windows(2)
-        .map(|pair| (pair[1] - pair[0]) * WSR_PRECIP)
-        .collect();
+    let (frames, sampled) = loop_from_listing(&[WSR_PRECIP; 332], 60);
+    assert_eq!(frames.len(), 60, "precondition: the desktop cap");
 
-    let phrase = loop_span_phrase(&loop_frames(&gaps), cadence(WSR_PRECIP), true);
     assert_eq!(
-        phrase,
+        loop_span_phrase(&frames, sampled, cadence(WSR_PRECIP), true),
         Some(
             "This loop spans 23h 53m over 60 frames, sampled from ~4 min scans, ~26 min apart"
                 .to_owned()
         )
+    );
+}
+
+/// **The measured defect: a third of the scans dropped, and the caption said
+/// "every scan".**
+///
+/// Not an extreme — it is the ordinary case of a lookback a little past what
+/// the cap covers, on both shipped raster caps:
+///
+/// | target | listing | held | dropped |
+/// |---|---|---|---|
+/// | browser | 17 scans, 69 min | 12 | 5, **29.4%** |
+/// | desktop | 89 scans, 6h 20m | 60 | 29, **32.6%** |
+///
+/// The caps appear here as bare numbers because the figure the application
+/// resolves them from — `budget::Budgets::loop_frames_held` — lives in the
+/// frontend crate and this one cannot see it. The half that reads the resolved
+/// budget, and so would catch either row drifting from it, is
+/// `a_listing_one_scan_over_the_cap_is_recorded_as_sampled` in the frontend's
+/// `app_render/loop_dispatch_tests.rs`.
+#[test]
+fn a_loop_that_dropped_a_third_of_the_scans_never_claims_every_scan() {
+    for (listing_scans, held, dropped_pct) in [(17usize, 12usize, 29.4), (89, 60, 32.6)] {
+        let (frames, sampled) = loop_from_listing(&vec![WSR_PRECIP; listing_scans - 1], held);
+        assert_eq!(frames.len(), held, "precondition: the loop filled its cap");
+        let dropped = listing_scans - held;
+        assert!(
+            ((dropped as f64 / listing_scans as f64) * 100.0 - dropped_pct).abs() < 0.05,
+            "the fixture no longer drops the {dropped_pct}% this row records",
+        );
+
+        let phrase = loop_span_phrase(&frames, sampled, cadence(WSR_PRECIP), true)
+            .expect("frames enough for a span");
+        assert!(
+            phrase.contains("sampled from ~4 min scans"),
+            "a loop holding {held} of {listing_scans} scans — {dropped} dropped \
+             — captioned itself {phrase:?}",
+        );
+        assert!(
+            !phrase.contains("every scan"),
+            "{phrase:?} claims every scan while dropping {dropped} of \
+             {listing_scans}",
+        );
+    }
+}
+
+/// **Why the median comparison could never have caught the row above**, pinned
+/// on the shipped [`markedly_longer`] rather than argued in prose.
+///
+/// The old rule asked whether the frame list's median gap was markedly longer
+/// than the listing's own median step. Both are medians over the same
+/// timestamps, so even sampling keeps the frame median at exactly one listing
+/// step until two-step gaps are the *majority* — which needs a listing more
+/// than twice the cap. At 17-into-12 and at 89-into-60 the frame median is still
+/// one step and the rule is silent, whatever fraction was dropped.
+///
+/// This is the property rather than the symptom: the signal is blind below
+/// about 1.5x decimation by construction, so no threshold on it would have
+/// worked.
+#[test]
+fn the_frame_medians_own_step_is_blind_to_a_third_of_the_scans_going_missing() {
+    for (listing_scans, held) in [(17usize, 12usize), (89, 60)] {
+        let (frames, _) = loop_from_listing(&vec![WSR_PRECIP; listing_scans - 1], held);
+        let mut gaps: Vec<i64> = frames
+            .windows(2)
+            .map(|pair| (pair[1].timestamp - pair[0].timestamp).num_seconds())
+            .collect();
+        gaps.sort_unstable();
+        let typical = gaps[gaps.len() / 2];
+
+        assert_eq!(
+            typical, WSR_PRECIP,
+            "{listing_scans}-into-{held}: the frame median moved off the listing \
+             step, so this test is no longer about the blind case",
+        );
+        assert!(
+            !markedly_longer(typical, WSR_PRECIP),
+            "the old fidelity rule fired at {listing_scans}-into-{held}, so the \
+             defect it was measured on is not reproduced here",
+        );
+    }
+}
+
+/// A sampled loop with no measurable listing cadence says it is sampled and
+/// quotes no figure. Unreachable from `accept_scan_listing` — a listing short
+/// enough to have no gap fits every cap — and written down anyway, because the
+/// two facts are independent and an arm that assumed otherwise would print
+/// "sampled from ~0 min scans".
+#[test]
+fn a_sampled_loop_with_no_known_cadence_quotes_no_figure() {
+    let phrase = loop_span_phrase(&loop_frames(&[WSR_PRECIP; 13]), Some(true), None, true)
+        .expect("frames enough for a span");
+    assert_eq!(
+        phrase,
+        "This loop spans 56 min over 14 frames, sampled, ~4 min apart".to_owned()
     );
 }
 
@@ -189,7 +313,12 @@ fn a_decimated_loop_admits_it_is_showing_a_sample() {
 #[test]
 fn a_loop_still_filling_says_so_far() {
     assert_eq!(
-        loop_span_phrase(&loop_frames(&[WSR_PRECIP; 13]), cadence(WSR_PRECIP), false),
+        loop_span_phrase(
+            &loop_frames(&[WSR_PRECIP; 13]),
+            Some(false),
+            cadence(WSR_PRECIP),
+            false,
+        ),
         Some("This loop spans 56 min over 14 frames so far, every scan, ~4 min apart".to_owned())
     );
 }
@@ -199,11 +328,11 @@ fn a_loop_still_filling_says_so_far() {
 #[test]
 fn a_single_frame_has_no_span_to_report() {
     assert_eq!(
-        loop_span_phrase(&loop_frames(&[]), cadence(TDWR), false),
+        loop_span_phrase(&loop_frames(&[]), Some(false), cadence(TDWR), false),
         Some("This loop is 1 frame so far, so it spans no time yet".to_owned())
     );
     assert_eq!(
-        loop_span_phrase(&loop_frames(&[]), cadence(TDWR), true),
+        loop_span_phrase(&loop_frames(&[]), Some(false), cadence(TDWR), true),
         Some("This loop is 1 frame, so it spans no time yet".to_owned())
     );
 }
@@ -213,7 +342,7 @@ fn a_single_frame_has_no_span_to_report() {
 #[test]
 fn frames_at_one_instant_report_the_count_and_no_span() {
     assert_eq!(
-        loop_span_phrase(&loop_frames(&[0, 0]), cadence(TDWR), true),
+        loop_span_phrase(&loop_frames(&[0, 0]), Some(false), cadence(TDWR), true),
         Some("This loop is 3 frames, so it spans no time yet".to_owned())
     );
 }
@@ -226,7 +355,7 @@ fn a_dropped_scan_shows_up_as_a_range() {
     let mut gaps = vec![TDWR; 18];
     gaps.push(2 * TDWR);
     assert_eq!(
-        loop_span_phrase(&loop_frames(&gaps), cadence(TDWR), true),
+        loop_span_phrase(&loop_frames(&gaps), Some(false), cadence(TDWR), true),
         Some("This loop spans 2h 0m over 20 frames, every scan, 6 min to 12 min apart".to_owned())
     );
 }
@@ -243,7 +372,7 @@ fn a_mid_loop_vcp_change_widens_the_range_rather_than_being_explained() {
     let mut gaps = vec![WSR_PRECIP; 15];
     gaps.extend(std::iter::repeat_n(WSR_CLEAR_AIR, 14));
     assert_eq!(
-        loop_span_phrase(&loop_frames(&gaps), cadence(WSR_PRECIP), true),
+        loop_span_phrase(&loop_frames(&gaps), Some(false), cadence(WSR_PRECIP), true),
         Some("This loop spans 3h 5m over 30 frames, every scan, 4 min to 9 min apart".to_owned())
     );
 }
@@ -253,7 +382,7 @@ fn a_mid_loop_vcp_change_widens_the_range_rather_than_being_explained() {
 /// nothing about fidelity. Silence, not a guess.
 #[test]
 fn without_a_known_cadence_the_caption_makes_no_fidelity_claim() {
-    let phrase = loop_span_phrase(&loop_frames(&[WSR_PRECIP; 13]), None, true)
+    let phrase = loop_span_phrase(&loop_frames(&[WSR_PRECIP; 13]), None, None, true)
         .expect("frames enough for a span");
     assert_eq!(
         phrase,
