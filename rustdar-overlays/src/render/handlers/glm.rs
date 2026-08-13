@@ -7,7 +7,7 @@ use rustdar_units::UserPreferences;
 use crate::glm::fetch::GlmCache;
 use crate::glm::{
     DeadFeed, FetchFailures, GLM_MAX_TIME_WINDOW_SECS, GLM_MIN_TIME_WINDOW_SECS, GlmDataLevel,
-    GlmFetchResult, GlmFlash, GlmSatellite, LevelFailure,
+    GlmFetchOutcome, GlmFetchResult, GlmFlash, GlmSatellite, LevelFailure,
 };
 use crate::render::controls::{
     ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext,
@@ -28,26 +28,127 @@ use crate::types::GeoBounds;
 /// health `Ok`, while GOES-East's contribution drained out of the cache window
 /// over the next half hour. This is that half of the round, written down.
 ///
-/// No `parts`: a satellite *is* the unit here, so a second denominator would be
-/// the same two numbers again. See
-/// [`DataCompleteness`](crate::fetch_policy::DataCompleteness) for how the two
-/// halves are rendered.
-fn listing_coverage(
-    queried: &[GlmSatellite],
-    listing_failures: &[(GlmSatellite, crate::fetch_policy::FetchError)],
-) -> crate::fetch_policy::DataCompleteness {
+/// # A listing is one of four ways this round under-delivers
+///
+/// The first draft of this counted [`listing_failures`] alone, and the other
+/// three each end a poll with flashes missing from the map and the ledger
+/// reading whole:
+///
+/// - a [`DeadFeed`] — the listing answered `200` with **zero objects**, which
+///   for a product that publishes a granule every twenty seconds is the feed
+///   being gone rather than a quiet sky. It is in `queried`, so counting only
+///   `listing_failures` counted it as a feed that delivered;
+/// - [`transport_failures`](GlmFetchOutcome::transport_failures) — the granules
+///   were listed and would not download. Its own log line already said what
+///   this costs: *"the map is blank despite a healthy S3 listing"*;
+/// - [`parse_failures`](GlmFetchOutcome::parse_failures) — they downloaded and
+///   would not parse;
+/// - [`level_failures`](GlmFetchOutcome::level_failures) — one hierarchy level
+///   stopped parsing inside granules that otherwise did, so that layer alone is
+///   empty.
+///
+/// Each was reported to the log and nowhere else. Measured over a socket with
+/// both listings healthy and every granule refused: two feeds queried, zero
+/// flashes, `is_complete()` = `true`.
+///
+/// # Which bucket each falls in
+///
+/// A feed is [`missing`](DataCompleteness::missing) when nothing of it reached
+/// the map and [`partial`](DataCompleteness::partial) when some of its window
+/// did — the same rule the zone resolver uses per alert. A listing failure and
+/// a dead feed are missing outright. Granule failures are counted against the
+/// feeds that *did* list: total means those feeds delivered nothing, so they
+/// are missing too; anything short of total leaves them drawing part of their
+/// window.
+///
+/// `parts` are **granules**, the piece a feed is assembled from, which is the
+/// denominator the granule failures are already measured against. The listing
+/// half has no second denominator — a satellite *is* the unit there.
+fn round_coverage(outcome: &GlmFetchOutcome) -> crate::fetch_policy::DataCompleteness {
+    let GlmFetchOutcome {
+        queried,
+        dead_feeds,
+        listing_failures,
+        transport_failures,
+        parse_failures,
+        level_failures,
+        ..
+    } = outcome;
+
+    // Transport and parse partition the same granules — a file that failed to
+    // download was never parsed — so their counts add and share `in_window`.
+    let in_window = transport_failures
+        .as_ref()
+        .or(parse_failures.as_ref())
+        .map_or(0, |f| f.in_window);
+    let granules_failed = transport_failures.as_ref().map_or(0, |f| f.failed)
+        + parse_failures.as_ref().map_or(0, |f| f.failed);
+
+    // Feeds that listed objects. A dead feed listed none, so it is already
+    // accounted for and must not be charged again for the granule failures.
+    let live = queried.len().saturating_sub(dead_feeds.len());
+    let (granule_partial, granule_missing) = if granules_failed == 0 {
+        (0, 0)
+    } else if granules_failed >= in_window {
+        (0, live)
+    } else {
+        (live, 0)
+    };
+    // A level that stopped parsing empties that layer and leaves the others, so
+    // a live feed is drawing part of its window — unless it is already counted
+    // as having delivered nothing, which is the stronger claim.
+    let granule_partial =
+        if granule_partial == 0 && granule_missing == 0 && !level_failures.is_empty() {
+            live
+        } else {
+            granule_partial
+        };
+
+    let mut reasons: Vec<(String, usize)> = listing_failures
+        .iter()
+        .map(|(sat, e)| (format!("{}: {e}", sat.display_name()), 1))
+        .collect();
+    for feed in dead_feeds {
+        reasons.push((
+            format!(
+                "{}: listing returned no objects",
+                feed.satellite.display_name()
+            ),
+            1,
+        ));
+    }
+    if let Some(f) = transport_failures {
+        reasons.push((
+            format!("granule download failed ({})", f.sample_error),
+            f.failed,
+        ));
+    }
+    if let Some(f) = parse_failures {
+        reasons.push((
+            format!("granule would not parse ({})", f.sample_error),
+            f.failed,
+        ));
+    }
+    for failure in level_failures {
+        reasons.push((
+            format!(
+                "{} {} level stopped parsing",
+                failure.satellite.display_name(),
+                failure.level.display_name(),
+            ),
+            1,
+        ));
+    }
+
     crate::fetch_policy::DataCompleteness {
         expected: queried.len() + listing_failures.len(),
-        partial: 0,
-        missing: listing_failures.len(),
-        parts_requested: 0,
-        parts_resolved: 0,
+        partial: granule_partial,
+        missing: listing_failures.len() + dead_feeds.len() + granule_missing,
+        parts_requested: in_window,
+        parts_resolved: in_window.saturating_sub(granules_failed),
         unit: "satellite feeds",
-        part_unit: "listings",
-        reasons: listing_failures
-            .iter()
-            .map(|(sat, e)| (format!("{}: {e}", sat.display_name()), 1))
-            .collect(),
+        part_unit: "granules",
+        reasons,
     }
 }
 
@@ -518,11 +619,14 @@ impl OverlayHandler for GlmHandler {
         match fetch.0 {
             Ok(outcome) => {
                 log::info!("Received {} GLM lightning flashes", outcome.flashes.len());
+                // Before the reports below, which take the outcome's failure
+                // lists by value: every one of them is a way this round
+                // under-delivered, and the coverage report needs all four.
+                let coverage = round_coverage(&outcome);
                 self.report_feed_changes(&outcome.queried, outcome.dead_feeds);
                 self.report_failures(FailureKind::Parse, outcome.parse_failures);
                 self.report_failures(FailureKind::Transport, outcome.transport_failures);
                 self.report_level_failures(&outcome.evaluated_levels, outcome.level_failures);
-                let coverage = listing_coverage(&outcome.queried, &outcome.listing_failures);
                 let items = outcome
                     .flashes
                     .into_iter()
