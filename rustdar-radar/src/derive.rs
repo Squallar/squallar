@@ -271,7 +271,14 @@ fn derive_kdp(scan: &Scan) -> Option<Scan> {
         .iter()
         .filter_map(|sweep| {
             let radials = sweep.radials();
-            radials.first()?.differential_phase()?;
+            // Every radial, not the first — a sweep carries ΦDP when any of it
+            // does, which is the same test `kdp::compute_kdp` below then makes
+            // for itself. Asked of the leading radial alone, the two disagreed:
+            // one blank radial refused a cut the estimator was willing to
+            // derive, exactly as it did for the wind fit (`crate::velocity`).
+            if !radials.iter().any(|r| r.differential_phase().is_some()) {
+                return None;
+            }
             let derived = kdp::compute_kdp(radials, &params);
             if derived.is_none() {
                 log::warn!(
