@@ -1935,6 +1935,36 @@ fn render_srv_to_image(
 }
 
 /// Velocity as a 2D grid (azimuth × range).
+///
+/// **Three of the decoder's four answers arrive here as the same NaN.**
+/// [`build_velocity_grid`] initialises every gate to `f64::NAN` and writes only
+/// `MomentValue::Value`, so `BelowThreshold`, `RangeFolded` and a gate the
+/// radar never reported are indistinguishable to everything downstream — the
+/// dealiaser, the median filter's occupancy rules, and the stencils' demand
+/// that every tap cell be intact. `sampler.rs` keeps the distinction
+/// (`SampleStatus`), `xsect.rs` consumes it and `palette.rs` paints
+/// range-folded deliberately; this path alone flattens it.
+///
+/// Measured 2026-08-12 on real archive volumes, lowest Doppler cut, over the
+/// 7.05–20 nm annulus the reference comparison uses:
+///
+/// | volume | below threshold | range folded |
+/// |---|---|---|
+/// | KDMX 2022-03-05 | 19.7% | 2.9% |
+/// | KTLX 2024-12-16 | 21.0% | 1.0% |
+/// | KHNX 2024-12-16 | 9.9% | **0.0%** |
+/// | KFTG 2023-06-22 | 3.1% | **4.5%** |
+/// | KMSX 2022-06-04 | 7.3% | 1.3% |
+/// | KCRP 2017-08-26 | 0.6% | 0.0% |
+///
+/// So neither is a rounding error. Below-threshold means *the radar looked and
+/// found nothing*, which an occupancy rule ought to weigh differently from *no
+/// gate was reported*; range-folded means *there is signal and its velocity is
+/// ambiguous*, which is the opposite of absence, and it peaks on the
+/// mesocyclone volume. Nothing yet reads the distinction — recorded because a
+/// measurement that says a gap is real is what any future consumer has to
+/// argue against, and because the synthetic corpus cannot show it (its patcher
+/// repaints every gate, so it reads zero folded everywhere).
 struct VelocityGrid {
     vel_grid: Vec<Vec<f64>>,
     azimuths_deg: Vec<f64>,
