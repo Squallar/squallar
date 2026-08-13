@@ -2736,9 +2736,10 @@ fn wsr88d_doppler_sweep() -> Scan {
 ///
 /// It is the case the floor's guarantee does *not* cover, and it is not a
 /// corner: a Doppler cut reaches 300.125 km, so every velocity tilt below about
-/// 3° is in it. A browser is always in it — 2048 is the largest texture WebGL2
-/// guarantees — and so is a GLES 3.0 handheld that fails
-/// `AppState::long_range_raster_ok`.
+/// 3° is in it. A browser is always in it — its class pins the raster ceiling
+/// to the base size, whatever the browser reports — and so is a GLES 3.0
+/// handheld whose `AppState::raster_side_ceiling_px` comes back at the base
+/// size because that is all it said it could hold.
 ///
 /// **The two ceilings declare the same extent**, and that is the first
 /// assertion because it is the decision the rest follows from: how much ground

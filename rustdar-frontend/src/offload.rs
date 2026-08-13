@@ -172,10 +172,11 @@ pub enum JobRequest {
 /// things a worker could be asked for. **[`RenderedFrame`] itself is
 /// deliberately untouched**, and in particular did not gain a width and a
 /// height even once a plan view stopped having one size: its consumers derive
-/// the side from the buffer's own length and check it against the closed set of
-/// sizes this build renders (`constants::raster_side_from_rgba_len`), which is
-/// the same guard a named constant was — a `ColorImage` panic on a render
-/// worker means no response ever arrives and the pane stays blank forever —
+/// the side from the buffer's own length and check it — a whole number of
+/// pixels, a perfect square, a side inside this build's own bounds
+/// (`constants::raster_side_from_rgba_len`), which is the same guard a named
+/// constant was — a `ColorImage` panic on a render worker means no response
+/// ever arrives and the pane stays blank forever —
 /// without the payload being trusted to describe itself. See
 /// [`JobOutput::frame`].
 #[derive(Debug, PartialEq)]
@@ -242,8 +243,8 @@ impl JobOutput {
 ///
 /// The extent and the fold limit are metadata and stay metadata — they say
 /// where the pixels *are* and what speed they wrap at, never how many of them
-/// there are. How many there are is the buffer's own length, read back against
-/// a closed set at each consumer (`constants::raster_side_from_rgba_len`);
+/// there are. How many there are is the buffer's own length, checked rather
+/// than believed at each consumer (`constants::raster_side_from_rgba_len`);
 /// nothing on this port describes its own shape, which is what keeps a
 /// malformed payload from being believed. Adding a second `f64` beside the
 /// extent does not weaken that: neither number can be read as a dimension,

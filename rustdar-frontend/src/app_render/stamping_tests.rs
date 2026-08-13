@@ -286,7 +286,7 @@ fn a_long_range_render_is_placed_at_the_size_it_was_rendered_at() {
     // `egui_winit::State::new` tells it: `Context::load_texture` asserts the
     // image against `max_texture_side`, and a bare `Context` defaults it to
     // the 2048 WebGL2 floor. The two are one number in the shipped app —
-    // `AppState::long_range_raster_ok` and this both come off
+    // `AppState::raster_side_ceiling_px` and this both come off
     // `device.limits().max_texture_dimension_2d` — so a fixture that let them
     // disagree would be modelling a state the host cannot reach.
     let ctx = egui::Context::default();

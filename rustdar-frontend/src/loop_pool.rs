@@ -250,7 +250,7 @@ pub struct LoopFrameModel {
     /// A [`LOOP_IMAGE_SIZE`]² RGBA raster.
     ///
     /// **Not `IMAGE_SIZE`**, and the difference is not cosmetic: a loop frame
-    /// is rendered `full_res: false`, which on the web is 1024 against a static
+    /// is rendered at `LOOP_IMAGE_SIZE`, which on the web is 1024 against a static
     /// render's 2048. Modelling a browser's loop frame at the static size would
     /// overstate it fourfold — 16 MiB against the real 4 MiB — and the
     /// division would hand every browser loop the

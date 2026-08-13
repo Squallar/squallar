@@ -2076,9 +2076,9 @@ mod local_time_tests;
 #[cfg(test)]
 mod loop_frame_image_tests;
 
-#[path = "app_fetch/loop_full_res_tests.rs"]
+#[path = "app_fetch/loop_raster_ceiling_tests.rs"]
 #[cfg(test)]
-mod loop_full_res_tests;
+mod loop_raster_ceiling_tests;
 
 #[path = "app_fetch/loop_pane_tests.rs"]
 #[cfg(test)]

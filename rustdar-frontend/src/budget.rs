@@ -341,7 +341,7 @@ pub struct BudgetLimits {
     /// however much the adapter offers.
     ///
     /// Already a ceiling, so like [`Self::quality_ceiling`] it has no pair: its
-    /// floor is [`Self::long_range_image_side_px`], because the whole point of
+    /// floor is the long-range image side, because the whole point of
     /// reading the device is that it may only ever *add* to what this build
     /// already draws. [`Budgets::raster_side_for_adapter`] spends between them.
     ///
@@ -523,7 +523,7 @@ pub struct Budgets {
     /// The largest side a static plan-view raster may reach on this class.
     ///
     /// Carried as the *ceiling* of a pair whose floor is
-    /// [`Self::long_range_image_side_px`], rather than as one resolved figure,
+    /// the long-range image side, rather than as one resolved figure,
     /// for the same reason [`Self::loop_pool_floor_bytes`] is: the number is
     /// settled at a seam this resolver runs before. The pool's seam is a
     /// failure it learns from; this one is simply **the adapter arriving** —
@@ -573,7 +573,7 @@ impl Budgets {
     /// or thirty-two of a browser's loop frames, which is the case a fixed
     /// count served worst.
     ///
-    /// `long_range_image_side_px` and **not** [`Self::raster_side_ceiling_px`]:
+    /// The long-range image side and **not** [`Self::raster_side_ceiling_px`]:
     /// the ceiling is what one raster may reach, and sizing the cache off it
     /// would raise the ceiling and the budget together, which is the tautology
     /// [`BudgetLimits::app_texture_ceiling_bytes`]' doc refuses for the app
@@ -586,7 +586,7 @@ impl Budgets {
     /// raster ceiling, since that is the most a device on this class can be
     /// asked to hold.
     ///
-    /// [`Self::raster_side_ceiling_px`] and not `long_range_image_side_px`,
+    /// [`Self::raster_side_ceiling_px`] and not the long-range image side,
     /// which is what this read before the ceiling could leave its floor. The
     /// two are still the same number on every class whose ceiling is pinned;
     /// where they differ, the larger is the honest worst case, and
@@ -615,7 +615,7 @@ impl Budgets {
     ///
     /// # It can only add
     ///
-    /// [`Self::long_range_image_side_px`] is the floor, so a device reporting
+    /// the long-range image side is the floor, so a device reporting
     /// exactly that much keeps the raster it draws today rather than losing it
     /// to the halving. The `min` afterwards is the other end: a device is never
     /// offered more than it just said it has, which is what makes a machine

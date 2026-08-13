@@ -515,9 +515,10 @@ fn the_vertical_jobs_produce_their_own_output_kinds() {
 ///
 /// This is the accessor the whole widening rests on. `RenderedFrame` was
 /// deliberately not given a width and a height, so every consumer of one reads
-/// its side back off the buffer against the closed set of *square* plan-view
-/// sizes; a section's raster is not square and would be refused, but a refusal
-/// is a blank pane, and this is what keeps one from ever getting that far.
+/// its side back off the buffer, checked against the *square* shape and the
+/// bounds a plan view has; a section's raster is not square and would be
+/// refused, but a refusal is a blank pane, and this is what keeps one from ever
+/// getting that far.
 #[test]
 fn a_frame_consumer_sees_nothing_rather_than_another_kinds_buffers() {
     let section = execute(&a_section_job()).expect("the section job draws");

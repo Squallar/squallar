@@ -245,9 +245,9 @@ fn an_unstated_reach_is_the_only_way_to_reach_the_fallback_extent() {
 /// 5° up are drawn on the base texture. What that texture now *buys* them has
 /// changed — the extent is their own reach rather than a 230 km frame, so the
 /// same pixels land on less ground and resolve it more finely — but the side
-/// itself has not moved, which is what keeps
-/// `rustdar_frontend::constants::raster_side_from_rgba_len`'s closed set of
-/// valid sides honest. A Doppler cut on a WSR-88D is **not** in that block —
+/// itself has not moved, which is why nothing in that block is affected by the
+/// device having an answer at all. A Doppler cut on a WSR-88D is **not** in
+/// that block —
 /// it reaches 300.125 km — and its rows sit in the second and third instead.
 /// The last block is the mechanism the device gate and the loop policy both
 /// use: a ceiling is a ceiling, and one at or below the base size fixes the

@@ -1,7 +1,7 @@
 //! Which melting layer each dispatch path actually puts on the wire.
 //!
 //! Read back through `JobRequest::from_bytes`, the same decode a worker runs,
-//! for the reason `loop_full_res_tests` does it: the melting layer is a *render
+//! for the reason `loop_raster_ceiling_tests` does it: the melting layer is a *render
 //! input*, and by the time a raster comes back there is nothing left in it to
 //! distinguish "classified against the RPG's own layer" from "classified
 //! against a fleet constant" — that is the entire problem this workstream
@@ -49,7 +49,7 @@ const OBJECT: &[u8] = &[0xAB; 16];
 /// hybrid classification to extract from: every moment the classifier reads,
 /// on every radial.
 ///
-/// The single-moment scan `loop_full_res_tests` uses would answer `None` from
+/// The single-moment scan `loop_raster_ceiling_tests` uses would answer `None` from
 /// `RenderInput::extract` for this product and dispatch `Job::renders_nothing`,
 /// which posts nothing at all — so the test would pass against a dispatcher
 /// that had lost the melting layer entirely.
