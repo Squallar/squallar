@@ -62,12 +62,18 @@ static ALERT_COLORS: &[AlertColorEntry] = &[
         g: 0,
         b: 139,
     }, // Dark magenta
+    // Blue, and **not** the retired Wind Chill Warning's LightSteelBlue: the
+    // 2022 hazard simplification was not symmetric. NWS carried the old
+    // *watch* colour onto Extreme Cold Watch and the old *advisory* colour
+    // onto the new Cold Weather Advisory, but Extreme Cold Warning already
+    // existed as its own Alaska product in Blue and kept it. See
+    // `the_renamed_cold_and_heat_products_match_the_nws_published_colours`.
     AlertColorEntry {
         keywords: &["extreme cold", "warning"],
-        r: 176,
-        g: 196,
-        b: 222,
-    }, // Light steel blue
+        r: 0,
+        g: 0,
+        b: 255,
+    }, // Blue
     AlertColorEntry {
         keywords: &["high wind", "warning"],
         r: 218,
@@ -263,9 +269,9 @@ static RETIRED_ALERT_COLORS: &[AlertColorEntry] = &[
     }, // = Extreme Heat Watch
     AlertColorEntry {
         keywords: &["wind chill", "warning"],
-        r: 176,
-        g: 196,
-        b: 222,
+        r: 0,
+        g: 0,
+        b: 255,
     }, // = Extreme Cold Warning
     AlertColorEntry {
         keywords: &["wind chill", "watch"],
@@ -403,11 +409,102 @@ mod tests {
     #[test]
     fn extreme_cold_is_not_tornado_coloured() {
         // Same failure mode via the "Wind Chill" rename.
-        assert_eq!(rgb_of("Extreme Cold Warning"), (176, 196, 222));
+        assert_eq!(rgb_of("Extreme Cold Warning"), (0, 0, 255));
         assert_eq!(rgb_of("Extreme Cold Watch"), (95, 158, 160));
         assert_eq!(rgb_of("Cold Weather Advisory"), (175, 238, 238));
         assert_ne!(rgb_of("Extreme Cold Warning"), TORNADO_WARNING_RED);
         assert_ne!(rgb_of("Extreme Cold Watch"), TORNADO_WATCH_YELLOW);
+    }
+
+    /// The published colours for every product the 2022 hazard simplification
+    /// touched, plus the two Extreme Cold products that predate it.
+    ///
+    /// **These values are NWS's, not ours.** Transcribed from the
+    /// "Watch/Warning/Advisory Color Table" at <https://www.weather.gov/help-map>
+    /// (fetched 2026-08-13; 111 rows, one per `api.weather.gov/alerts/types`
+    /// entry), columns *Event / Priority / Color Name / RGB / Hex*. The
+    /// priority column is quoted alongside so a future reader can find the row
+    /// again in a table sorted by it.
+    const NWS_PUBLISHED_COLD_AND_HEAT: &[PublishedColor] = &[
+        PublishedColor::new(
+            "Extreme Heat Warning",
+            44,
+            (199, 21, 133),
+            "Mediumvioletred",
+        ),
+        PublishedColor::new("Extreme Cold Warning", 50, (0, 0, 255), "Blue"),
+        PublishedColor::new(
+            "Cold Weather Advisory",
+            62,
+            (175, 238, 238),
+            "Paleturquoise",
+        ),
+        PublishedColor::new("Heat Advisory", 63, (255, 127, 80), "Coral"),
+        PublishedColor::new("Extreme Heat Watch", 93, (128, 0, 0), "Maroon"),
+        PublishedColor::new("Extreme Cold Watch", 94, (95, 158, 160), "CadetBlue"),
+    ];
+
+    /// One row of NWS's table, in NWS's own columns.
+    struct PublishedColor {
+        event: &'static str,
+        /// NWS's stacking priority, 1 = drawn over everything. Quoted only so
+        /// a reader can find the row again; we do not model it.
+        priority: u8,
+        rgb: (u8, u8, u8),
+        /// NWS's colour name for that RGB.
+        name: &'static str,
+    }
+
+    impl PublishedColor {
+        const fn new(
+            event: &'static str,
+            priority: u8,
+            rgb: (u8, u8, u8),
+            name: &'static str,
+        ) -> Self {
+            Self {
+                event,
+                priority,
+                rgb,
+                name,
+            }
+        }
+    }
+
+    /// The rename was **not symmetric**, and assuming it was is what painted
+    /// `Extreme Cold Warning` in the retired Wind Chill Warning's
+    /// LightSteelBlue `B0C4DE` instead of its own Blue `0000FF`.
+    ///
+    /// When NWS retired the Wind Chill family in 2022 it carried the old
+    /// *watch* colour onto `Extreme Cold Watch` and the old *advisory* colour
+    /// onto the new `Cold Weather Advisory` — but not the *warning*'s, because
+    /// `Extreme Cold Warning` already existed as an Alaska product in Blue and
+    /// kept it. Four of the five renamed products were right; exactly one was
+    /// not, and nothing in the module compared any of them to the authority.
+    ///
+    /// Checking against [`NWS_PUBLISHED_COLD_AND_HEAT`] rather than against
+    /// `ALERT_COLORS` is the point: a test that reads our own table can only
+    /// ever agree with itself, which is precisely how a self-consistent wrong
+    /// colour survived — `retired_names_still_render_like_their_replacements`
+    /// pinned Wind Chill Warning to Extreme Cold Warning and both were wrong
+    /// together.
+    #[test]
+    fn the_renamed_cold_and_heat_products_match_the_nws_published_colours() {
+        for row in NWS_PUBLISHED_COLD_AND_HEAT {
+            let PublishedColor {
+                event,
+                priority,
+                rgb,
+                name,
+            } = row;
+            assert_eq!(
+                rgb_of(event),
+                *rgb,
+                "{event:?} (NWS priority {priority}) is published as {name} \
+                 {rgb:?} at weather.gov/help-map; we paint {:?}",
+                rgb_of(event),
+            );
+        }
     }
 
     #[test]
