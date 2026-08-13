@@ -573,3 +573,188 @@ fn a_pre_2010_volume_states_no_site_and_falls_back_to_the_table() {
     assert_eq!(info.site.lon, table.lon);
     assert_eq!(info.site_position, None);
 }
+
+// -- sweep coverage -----------------------------------------------------
+//
+// The volume behind these numbers is `KCRP20260717_211257_V06`, whose 0.5°
+// Doppler cut renders with a 60° wedge missing. Its radial inventory was
+// established **independently of this crate**, by two decoders that share no
+// code with it: MetPy's `Level2File`, and a raw walk of the LDM framing and
+// Message 31 headers written from the ICD. Both report the same 8280 radials,
+// the same per-cut counts and the same gaps, radial for radial.
+//
+// So the table below is an observation, not an expectation borrowed from our
+// own assembler: it says which 120-radial LDM records the *file* contains, and
+// these tests ask whether our assembly reproduces that and whether the
+// measurement names the holes. Asserting our decode against our decode would
+// have passed on the day the wedge went missing.
+
+/// Which 120-radial records each cut of `KCRP20260717_211257_V06` carries.
+///
+/// `(elevation number, azimuth spacing, records present)`, where record `k`
+/// holds azimuth numbers `(k - 1) * 120 + 1 ..= k * 120`. A 0.5° cut has six,
+/// a 1.0° cut three. Nine records are absent across the volume, which is the
+/// 1080 radials between its 8280 and the 9360 a complete VCP 215 would hold.
+const KCRP_2026_07_17T21_12_57: &[(u8, f32, &[u8])] = &[
+    (1, 0.5, &[1, 2, 5, 6]),
+    (2, 0.5, &[1, 2, 3, 4, 5, 6]),
+    (3, 0.5, &[1, 2, 3, 5]),
+    (4, 0.5, &[1, 2, 4, 5, 6]),
+    (5, 0.5, &[1, 2, 3, 4, 5, 6]),
+    (6, 0.5, &[1, 2, 3, 4, 5, 6]),
+    (7, 0.5, &[2, 3, 4, 5, 6]),
+    (8, 0.5, &[1, 3, 4, 5, 6]),
+    (9, 0.5, &[1, 2, 3, 4, 5, 6]),
+    (10, 0.5, &[1, 2, 3, 4, 5]),
+    (11, 1.0, &[1, 2, 3]),
+    (12, 1.0, &[1, 2, 3]),
+    (13, 1.0, &[1, 2]),
+    (14, 1.0, &[1, 2, 3]),
+    (15, 1.0, &[1, 2, 3]),
+    (16, 1.0, &[1, 2, 3]),
+];
+
+/// The cuts the independent decode found short, and the widest gap each one
+/// measures in the real file. The synthetic radials below sit on exact
+/// multiples of their spacing, so they measure the whole number the real
+/// jittered antenna misses by a few hundredths — 60.480 against 60.5 on cut 4.
+const KCRP_SHORT_CUTS: &[(u8, usize, f64)] = &[
+    (1, 480, 120.5),
+    (3, 480, 60.5),
+    (4, 600, 60.5),
+    (7, 600, 60.5),
+    (8, 600, 60.5),
+    (10, 600, 60.5),
+    (13, 240, 121.0),
+];
+
+/// One radial of a cut, at the azimuth its azimuth number implies.
+fn radial_at(
+    elevation_number: u8,
+    azimuth_number: u16,
+    spacing: f32,
+) -> nexrad_model::data::Radial {
+    nexrad_model::data::Radial::new(
+        0,
+        azimuth_number,
+        f32::from(azimuth_number - 1) * spacing,
+        spacing,
+        nexrad_model::data::RadialStatus::IntermediateRadialData,
+        elevation_number,
+        0.5,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+/// The volume as the file holds it, cut by cut, record by record.
+fn kcrp_radials() -> Vec<nexrad_model::data::Radial> {
+    let mut radials = Vec::new();
+    for (elevation_number, spacing, records) in KCRP_2026_07_17T21_12_57 {
+        for record in *records {
+            for offset in 0..120u16 {
+                let azimuth_number = (u16::from(*record) - 1) * 120 + offset + 1;
+                radials.push(radial_at(*elevation_number, azimuth_number, *spacing));
+            }
+        }
+    }
+    radials
+}
+
+/// **The wedge that went missing, and the silence around it.**
+///
+/// Assembly first: fed the file's own radial inventory, the fold must produce
+/// each cut at exactly the count the independent decoders found — nothing
+/// dropped by us, nothing invented. In particular cut 4, the one
+/// `render::find_sweep` hands the 0.5° storm-relative velocity pane, holds 600
+/// radials and not 720.
+///
+/// Then the part that was missing: each short cut must *say* it is short. The
+/// gap is what carries it, because the count alone cannot — cut 13 holds a
+/// dense 1..240 with no interior seam at all, and only the 121° hole where the
+/// circle closes distinguishes it from a sector the antenna really swept.
+#[test]
+fn a_volume_missing_whole_chunks_assembles_short_and_says_so() {
+    let file = nexrad_data::volume::File::new(Vec::new());
+    let mut contribution = a_pattern_and_nothing_else(215);
+    contribution.radials = kcrp_radials();
+
+    let decoded = fold_contributions(&file, vec![Ok(contribution)]).expect("the fold succeeds");
+    let coverage = decoded.sweep_coverage();
+
+    assert_eq!(
+        coverage.len(),
+        KCRP_2026_07_17T21_12_57.len(),
+        "one sweep per cut: no cut fragmented, because no elevation number repeats",
+    );
+    assert_eq!(
+        coverage.iter().map(|cut| cut.radials).sum::<usize>(),
+        8280,
+        "every radial the file holds survives assembly",
+    );
+
+    for (cut, (elevation_number, spacing, records)) in coverage.iter().zip(KCRP_2026_07_17T21_12_57)
+    {
+        assert_eq!(cut.elevation_number, *elevation_number);
+        assert_eq!(
+            cut.radials,
+            records.len() * 120,
+            "cut {elevation_number} holds the records the file carries",
+        );
+        assert_eq!(cut.azimuth_step_degrees, f64::from(*spacing));
+    }
+
+    let short: Vec<_> = coverage.iter().filter(|cut| !cut.is_whole).collect();
+    assert_eq!(
+        short
+            .iter()
+            .map(|cut| (cut.elevation_number, cut.radials, cut.largest_gap_degrees))
+            .collect::<Vec<_>>(),
+        KCRP_SHORT_CUTS.to_vec(),
+        "exactly the cuts the independent decode found short are named short",
+    );
+
+    let doppler = coverage
+        .iter()
+        .find(|cut| cut.elevation_number == 4)
+        .expect("cut 4");
+    assert_eq!(doppler.radials, 600);
+    assert!(!doppler.is_whole);
+    assert_eq!(doppler.arc_degrees(), 299.5, "300° of azimuth, not 360°");
+}
+
+/// The complement, and the half that stops the measurement being a rubber
+/// stamp: the nine cuts the file carries whole are reported whole, arc 360°.
+///
+/// Without this a measurement that called *everything* sectored would pass the
+/// test above.
+#[test]
+fn the_cuts_the_file_carries_whole_are_not_called_short() {
+    let file = nexrad_data::volume::File::new(Vec::new());
+    let mut contribution = a_pattern_and_nothing_else(215);
+    contribution.radials = kcrp_radials();
+
+    let decoded = fold_contributions(&file, vec![Ok(contribution)]).expect("the fold succeeds");
+
+    let whole: Vec<u8> = decoded
+        .sweep_coverage()
+        .iter()
+        .filter(|cut| cut.is_whole)
+        .map(|cut| cut.elevation_number)
+        .collect();
+    assert_eq!(whole, vec![2, 5, 6, 9, 11, 12, 14, 15, 16]);
+
+    assert!(
+        decoded
+            .sweep_coverage()
+            .iter()
+            .filter(|cut| cut.is_whole)
+            .all(|cut| cut.arc_degrees() == 360.0),
+        "a whole cut covers the circle",
+    );
+}
