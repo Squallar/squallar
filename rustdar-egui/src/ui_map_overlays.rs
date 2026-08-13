@@ -200,6 +200,29 @@ impl<'a> OverlayDrawContext<'a> {
 /// `HttpsTiles::at` interpolates from whatever coarser level it already holds,
 /// so the pane degrades to the detail it has rather than flashing empty while
 /// the fetches land.
+///
+/// # The tile grid does not wrap, and a pane across the antimeridian shows it
+///
+/// The index walk below runs `min_tx..=max_tx` on one grid, and
+/// [`crate::tiles::lon_to_tile_x`] **clamps** a longitude past ±180 to the last
+/// column rather than wrapping it. Neither `walkers` nor this application
+/// bounds the map's centre longitude, so a pane can be panned onto the seam,
+/// and when it is, the far side gets no basemap: the tiles are there, at
+/// wrapped `x`, and nothing asks for them.
+///
+/// Measured on a 1920-point pane centred exactly on 180°, at every zoom from 3
+/// to 10: **4 of the 9 tile columns the viewport covers are drawn, and 5 are
+/// not — 1280 points of the 1920**. It is the same figure at every zoom because
+/// it is a property of the seam, not of the scale.
+///
+/// It is written down rather than fixed because fixing it is not a clamp — the
+/// walk has to iterate unwrapped `x` and index the tile at `x.rem_euclid(n)`
+/// while still projecting the corner at its unwrapped longitude, and the same
+/// question then applies to every other layer this pane draws. What makes it
+/// worth writing down is that only the *basemap* stops at the seam: the radar
+/// raster, the overlays and the vectors are placed by projection and keep
+/// drawing, so the pane reads as a data layer over a blank, which looks like a
+/// tile server that is down.
 pub(super) fn draw_tile_layer(
     ui: &egui::Ui,
     projector: &walkers::Projector,

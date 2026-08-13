@@ -156,7 +156,14 @@ const MIN_BASIS_LENGTH: f32 = 1e-6;
 pub type Mat4 = [[f32; 4]; 4];
 
 /// Web Mercator's `y` for a latitude in radians: `ln(tan(π/4 + φ/2))`.
-fn mercator_y(lat_rad: f64) -> f64 {
+///
+/// Public alongside [`mercator_y_of_lat`], for the same reason that one is: a
+/// caller holding radians would otherwise write the formula out again or route
+/// through degrees and back, and `to_degrees().to_radians()` is not the
+/// identity in `f64`. `overlay_cache`'s geographic hit test is that caller, and
+/// it has to reach the same Mercator `y` the renderer drew with or a click
+/// misses the shape under it.
+pub fn mercator_y(lat_rad: f64) -> f64 {
     (std::f64::consts::FRAC_PI_4 + lat_rad * 0.5).tan().ln()
 }
 
