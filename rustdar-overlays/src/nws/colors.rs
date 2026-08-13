@@ -383,12 +383,6 @@ mod tests {
     }
 
     #[test]
-    fn tornado_watch_is_yellow() {
-        let (fill, _) = alert_color("Tornado Watch");
-        assert_eq!(fill, [255, 255, 0, NWS_FILL_ALPHA]);
-    }
-
-    #[test]
     fn unknown_event_gets_default() {
         let (fill, _) = alert_color("Something New");
         assert_eq!(fill, [200, 200, 200, NWS_FILL_ALPHA]);

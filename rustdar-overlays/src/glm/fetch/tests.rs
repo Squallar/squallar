@@ -142,7 +142,10 @@ fn flash_level_reports_area_and_event_level_reports_none() {
 }
 
 /// A required variable disappearing from the product must fail the parse,
-/// not quietly yield zeros or an empty result set.
+/// not quietly yield zeros or an empty result set. Each required variable is
+/// omitted alone in turn — energy included, whose zero-default would render
+/// as a minimum-size bolt — so the other columns stay equally sized and no
+/// length mismatch can mask which gate fired.
 ///
 /// Verbatim, not `contains`: with the required-variable gate removed the
 /// downstream length check also errors, and its message interpolates both
@@ -179,35 +182,6 @@ fn a_whole_level_vanishing_is_an_error_not_zero_records() {
     let err = parse_flashes(&bytes)
         .expect_err("an entirely absent level must not read as 'no lightning'");
     assert_eq!(err, absent_variable_error("flash_lat"));
-}
-
-/// Only the time variable is omitted, so the other columns stay equally
-/// sized and no length mismatch can mask the gate. The verbatim assertion
-/// proves which gate fired.
-#[test]
-fn a_missing_time_variable_alone_is_an_error() {
-    let bytes = synthetic_glm_file(Fixture {
-        omit: &["flash_time_offset_of_first_event"],
-        ..Default::default()
-    });
-    let err = parse_flashes(&bytes).expect_err("absent time variable must surface");
-    assert_eq!(
-        err,
-        absent_variable_error("flash_time_offset_of_first_event")
-    );
-}
-
-/// Fails if energy falls back to 0.0, which the rasterizer turns into
-/// `0f32.log10()` = -inf and draws as a minimum-size bolt — total data loss
-/// that looks like a normal render.
-#[test]
-fn missing_energy_does_not_default_to_zero() {
-    let bytes = synthetic_glm_file(Fixture {
-        omit: &["flash_energy"],
-        ..Default::default()
-    });
-    let err = parse_flashes(&bytes).expect_err("absent energy must surface");
-    assert_eq!(err, absent_variable_error("flash_energy"));
 }
 
 /// A separate gate from the required-variable one: a *present but short*
