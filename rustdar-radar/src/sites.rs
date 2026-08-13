@@ -1769,7 +1769,7 @@ pub(crate) mod fixture {
     /// `TOKC` is a TDWR and states one height twice, which is what makes the
     /// set contain a row that cannot answer `Datum::SiteBase` — the shape
     /// `a_row_that_cannot_answer_never_reports_sea_level` exists for.
-    const SITES: [(&str, i32, i32, i32, i32); 12] = [
+    const SITES: [(&str, i32, i32, i32, i32); 14] = [
         ("KTLX", 35_333_060, -97_277_500, 370, 19),
         ("TOKC", 35_276_000, -97_510_000, 386, 386),
         // Pittsburgh's pair, and San Juan. Between them they are every answer
@@ -1785,6 +1785,16 @@ pub(crate) mod fixture {
         ("KSRX", 35_290_000, -94_361_000, 200, 24),
         ("KVWX", 38_260_000, -87_724_000, 156, 34),
         ("KLWX", 38_975_000, -77_477_000, 89, 34),
+        // A high-latitude pair, placed so that the two ways of ranking
+        // "nearest" disagree — what
+        // `the_nearest_row_is_measured_in_kilometres_not_degrees` stands on.
+        // From (65°N, 150°W), `PAZA` is 1.0° north and `PAZB` is 1.8° east:
+        // degree-squared makes that 1.00 against 3.24 and picks `PAZA`, while
+        // the ground distances are 111 km against 85 km and pick `PAZB`.
+        // Their heights are far apart so which one answered is legible, and
+        // no other row in the fixture is within 2000 km of either.
+        ("PAZA", 66_000_000, -150_000_000, 100, 30),
+        ("PAZB", 65_000_000, -148_200_000, 500, 30),
     ];
 
     /// Resolve the fixture into the process-wide table, once.
