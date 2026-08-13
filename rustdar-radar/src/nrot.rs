@@ -5017,6 +5017,229 @@ mod tests {
         );
     }
 
+    // ---- the row scratch is pooled, and no row can tell ---------------------
+
+    /// A sweep of no gates is answered before either windowing stage splits
+    /// its work.
+    ///
+    /// Both stages hold their per-row output flat and write it through
+    /// `par_chunks_mut`, and **a zero chunk size is a panic there**, not an
+    /// empty walk — `chunk_size must not be zero`. That makes the width an
+    /// argument the stage has to check before it splits, where a plain
+    /// `for j in 0..gc` needed no check because the body simply never ran.
+    ///
+    /// The limit is declared rather than estimated, so `fold_limit_ms` answers
+    /// off the header and both guards are reached end to end: the dealiaser
+    /// asks [`incoherent_velocity`] for a mask, and [`llsd_nrot`] has a ceiling
+    /// and so asks [`range_texture`] for a field.
+    #[test]
+    fn a_sweep_with_no_gates_is_answered_before_the_work_is_split() {
+        let n = 360usize;
+        let grid: Vec<Vec<f64>> = vec![Vec::new(); n];
+        let azimuths = ring_azimuths(n);
+        let sweep = straddle_sweep(&grid, &azimuths, 0);
+        let rows = sweep_rows(&sweep, n);
+        assert_eq!(
+            fold_limit_ms(&sweep, &grid),
+            Some(STRADDLE_VNY),
+            "the declaration must stand so both stages are reached",
+        );
+
+        let empty: Vec<Vec<f64>> = vec![Vec::new(); n];
+        assert_eq!(range_texture(&grid, &sweep, rows), empty);
+        assert!(
+            incoherent_velocity(&grid, rows, 0, sweep.gate_interval_km, STRADDLE_VNY).is_empty(),
+            "no gates is no mask, not a mask of nothing",
+        );
+        assert_eq!(compute_nrot_grid(&sweep), empty);
+    }
+
+    /// [`range_texture`]'s range pass with a fresh prefix-sum pair per row,
+    /// and the squared difference laid down in a pass of its own — the shape
+    /// the pooled version has to agree with, bit for bit.
+    fn range_texture_fresh_scratch(
+        grid: &[Vec<f64>],
+        sweep: &VelocitySweep,
+        rows: crate::azimuth::Rows,
+    ) -> Vec<Vec<f64>> {
+        let n = grid.len();
+        let gc = sweep.gate_count;
+        let dk = ((TEXTURE_STEP_KM / sweep.gate_interval_km).round() as usize).max(1);
+        let gh = ((TEXTURE_RANGE_HALF_KM / sweep.gate_interval_km).round() as i32).max(1);
+        let per_row: Vec<(Vec<f32>, Vec<u16>)> = (0..n)
+            .map(|i| {
+                let mut d2 = vec![0.0f64; gc];
+                let mut ok = vec![0u32; gc];
+                for j in 0..gc.saturating_sub(dk) {
+                    let (a, b) = (grid[i][j], grid[i][j + dk]);
+                    if !a.is_nan() && !b.is_nan() {
+                        d2[j] = (b - a).powi(2);
+                        ok[j] = 1;
+                    }
+                }
+                let mut pre = vec![0.0f64; gc + 1];
+                let mut pcn = vec![0u32; gc + 1];
+                for j in 0..gc {
+                    pre[j + 1] = pre[j] + d2[j];
+                    pcn[j + 1] = pcn[j] + ok[j];
+                }
+                let (mut sum, mut cnt) = (vec![0.0f32; gc], vec![0u16; gc]);
+                for j in 0..gc {
+                    let lo = (j as i32 - gh).max(0) as usize;
+                    let hi = ((j as i32 + gh) as usize).min(gc - 1);
+                    sum[j] = (pre[hi + 1] - pre[lo]) as f32;
+                    cnt[j] = (pcn[hi + 1] - pcn[lo]) as u16;
+                }
+                (sum, cnt)
+            })
+            .collect();
+        (0..n)
+            .map(|i| {
+                (0..gc)
+                    .map(|j| {
+                        let (mut s, mut c) = (0.0f64, 0u32);
+                        for da in -TEXTURE_AZ_HALF..=TEXTURE_AZ_HALF {
+                            if let Some(ai) = rows.neighbour(i, da) {
+                                s += f64::from(per_row[ai].0[j]);
+                                c += u32::from(per_row[ai].1[j]);
+                            }
+                        }
+                        if (c as usize) < TEXTURE_MIN_PAIRS {
+                            f64::NAN
+                        } else {
+                            (s / c as f64).sqrt()
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// [`incoherent_velocity`]'s range pass with a fresh prefix-sum pair per
+    /// row, and the mask gathered per row rather than written flat.
+    fn incoherent_velocity_fresh_scratch(
+        raw: &[Vec<f64>],
+        rows: crate::azimuth::Rows,
+        gc: usize,
+        gate_interval_km: f64,
+        nyquist: f64,
+    ) -> Vec<bool> {
+        let n = raw.len();
+        let tol = COH_STRADDLE_VNY_FRAC * nyquist;
+        let fold = COH_FOLD_VNY_FRAC * nyquist;
+        let dk = ((TEXTURE_STEP_KM / gate_interval_km).round() as usize).max(1);
+        let per_row: Vec<(Vec<u16>, Vec<u16>)> = (0..n)
+            .map(|i| {
+                let mut ps = vec![0u32; gc + 1];
+                let mut pp = vec![0u32; gc + 1];
+                for j in 0..gc {
+                    let (mut s, mut p) = (0u32, 0u32);
+                    if j + dk < gc {
+                        let (a, b) = (raw[i][j], raw[i][j + dk]);
+                        if !a.is_nan() && !b.is_nan() {
+                            p = 1;
+                            let dv = (b - a).abs();
+                            s = u32::from(dv > tol && dv < fold);
+                        }
+                    }
+                    ps[j + 1] = ps[j] + s;
+                    pp[j + 1] = pp[j] + p;
+                }
+                let (mut s, mut p) = (vec![0u16; gc], vec![0u16; gc]);
+                for j in 0..gc {
+                    let lo = (j as i32 - COH_RANGE_HALF).max(0) as usize;
+                    let hi = ((j as i32 + COH_RANGE_HALF) as usize).min(gc - 1);
+                    s[j] = (ps[hi + 1] - ps[lo]) as u16;
+                    p[j] = (pp[hi + 1] - pp[lo]) as u16;
+                }
+                (s, p)
+            })
+            .collect();
+        (0..n)
+            .flat_map(|i| {
+                (0..gc)
+                    .map(|j| {
+                        if raw[i][j].is_nan() {
+                            return false;
+                        }
+                        let (mut s, mut p) = (0u32, 0u32);
+                        for da in -COH_AZ_HALF..=COH_AZ_HALF {
+                            if let Some(ai) = rows.neighbour(i, da) {
+                                s += u32::from(per_row[ai].0[j]);
+                                p += u32::from(per_row[ai].1[j]);
+                            }
+                        }
+                        p > 0 && (s as f64) > COH_MAX_STRADDLE * p as f64
+                    })
+                    .collect::<Vec<bool>>()
+            })
+            .collect()
+    }
+
+    /// [`straddle_fixture`] with deterministic holes punched through it, so the
+    /// present-pair counts vary along every row and between rows rather than
+    /// standing at the window width everywhere.
+    ///
+    /// A hole is what makes the count prefix sum carry anything: with no NaN a
+    /// row's `pcn` is the identity and a stale carry could not be told from a
+    /// correct one.
+    fn holed_straddle_fixture(n: usize, gates: usize) -> (Vec<Vec<f64>>, Vec<f64>) {
+        let (mut grid, azimuths) = straddle_fixture(n, gates);
+        for (i, row) in grid.iter_mut().enumerate() {
+            for (j, v) in row.iter_mut().enumerate() {
+                if (i * 11 + j * 5) % 37 < 4 {
+                    *v = f64::NAN;
+                }
+            }
+        }
+        (grid, azimuths)
+    }
+
+    /// Both windowing stages hold one prefix-sum pair **per job the pool splits
+    /// off** rather than one per row, and a row cannot tell.
+    ///
+    /// This is the property the pooling rests on, and it is not obvious: a
+    /// reused pair arrives holding the row before it. It is safe because index
+    /// 0 of each is zero at construction and no row ever writes it, and every
+    /// other index a row reads it has already written this row — so nothing a
+    /// previous row left is reachable. The oracle is the same arithmetic with a
+    /// fresh pair per row, compared bit for bit, `f32` narrowing and all.
+    ///
+    /// 360 rows, so no pool this test can run under gives every row its own job
+    /// and the reuse is really exercised; 400 gates, so the range window is
+    /// clipped at both ends and reads the prefix sum rather than the whole row.
+    #[test]
+    fn a_pooled_prefix_sum_and_a_fresh_one_are_the_same_row() {
+        let (n, gates) = (360usize, 400usize);
+        let (grid, azimuths) = holed_straddle_fixture(n, gates);
+        assert!(
+            grid.iter().flatten().any(|v| v.is_nan()),
+            "the fixture must have holes for the counts to carry",
+        );
+        let vg = grid.clone();
+        let sweep = straddle_sweep(&vg, &azimuths, gates);
+        let rows = sweep_rows(&sweep, n);
+
+        assert_eq!(
+            bits(&range_texture(&grid, &sweep, rows)),
+            bits(&range_texture_fresh_scratch(&grid, &sweep, rows)),
+            "the texture a pooled scratch produces is the texture a fresh one does",
+        );
+
+        let interval = sweep.gate_interval_km;
+        let pooled = incoherent_velocity(&grid, rows, gates, interval, STRADDLE_VNY);
+        let fresh = incoherent_velocity_fresh_scratch(&grid, rows, gates, interval, STRADDLE_VNY);
+        assert!(
+            pooled.iter().any(|m| *m),
+            "the fixture must refuse something"
+        );
+        assert!(
+            !pooled.iter().all(|m| *m),
+            "and must not refuse everything, or the comparison is one value",
+        );
+        assert_eq!(pooled, fresh);
+    }
+
     /// The radial a near-zero gate is confirmed against is the one facing it,
     /// and the seed asks for it at 180° rather than at half the rows.
     ///
