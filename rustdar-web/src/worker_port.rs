@@ -5,7 +5,9 @@
 //! `rustdar-web` → `rustdar-frontend`, and adding `web-sys` to the frontend to
 //! close the loop would put browser types in the crate desktop, Android and iOS
 //! all share. So the worker is *installed* into the funnel as a
-//! [`WorkerPort`], from here.
+//! [`JobSink`], from here — and this file is where a `JobRequest` becomes the
+//! bytes a `postMessage` transfer list can move, because that cost is the
+//! browser's and belongs in the browser's adapter.
 //!
 //! Until [`attach`] succeeds — and forever, in a browser where it cannot —
 //! `offload_job` runs rasterization inline, which is the behaviour the web
@@ -13,7 +15,7 @@
 //! ends in "leave it inline" rather than in an error the user sees.
 
 use crate::worker_protocol as proto;
-use rustdar_frontend::offload::{self, JobOutput, RenderedFrame, WorkerPort};
+use rustdar_frontend::offload::{self, JobOutput, JobRequest, JobSink, RenderedFrame};
 use wasm_bindgen::prelude::*;
 
 /// Where the worker's bootstrap lives, relative to the page.
@@ -174,8 +176,19 @@ struct Port {
     worker: web_sys::Worker,
 }
 
-impl WorkerPort for Port {
-    fn post(&self, id: u64, request: Vec<u8>) -> bool {
+impl JobSink for Port {
+    /// # The serialisation lives here, and nowhere above here
+    ///
+    /// A `JobRequest` is not a thing a `Worker` can be handed: the only payload
+    /// a `postMessage` transfer list moves is a detachable `ArrayBuffer`, so
+    /// this arm turns the request into bytes on its way out. That is the
+    /// browser's charge for handover and it is charged where it is incurred —
+    /// the funnel calls `send(id, request)` and names no representation, so a
+    /// transport that can move an owned value pays none of this.
+    ///
+    /// `to_bytes` borrows, so a failed post still owns the request and hands it
+    /// back for the funnel to run inline.
+    fn send(&self, id: u64, request: JobRequest) -> Result<(), JobRequest> {
         let message = js_sys::Object::new();
         proto::set_field(&message, proto::KIND, &JsValue::from_str(proto::JOB));
         proto::set_field(&message, proto::ID, &JsValue::from_f64(id as f64));
@@ -183,18 +196,18 @@ impl WorkerPort for Port {
         // Copied out of linear memory once, then transferred: the request is
         // one radar sweep, ~1.3 MB for an 8-bit moment and more for NROT, and
         // structured-cloning it would copy it a second time on arrival.
-        let payload = js_sys::Uint8Array::from(request.as_slice());
+        let payload = js_sys::Uint8Array::from(request.to_bytes().as_slice());
         let transfer = js_sys::Array::new();
         transfer.push(&payload.buffer());
         proto::set_field(&message, proto::REQUEST, &payload);
 
         match self.worker.post_message_with_transfer(&message, &transfer) {
-            Ok(()) => true,
+            Ok(()) => Ok(()),
             Err(e) => {
-                // The funnel runs the job here instead. A port that keeps
+                // The funnel runs the job here instead. A sink that keeps
                 // refusing is a worker that has died, and `onerror` retires it.
                 log::warn!("could not post job {id} to the worker: {e:?}");
-                false
+                Err(request)
             }
         }
     }

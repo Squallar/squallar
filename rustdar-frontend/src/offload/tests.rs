@@ -5,6 +5,11 @@ use std::sync::mpsc;
 
 /// What a `FakePort` recorded: the id it was given and the bytes it was
 /// asked to post, in order.
+///
+/// Bytes and not `JobRequest`s, though the trait now hands over the request
+/// itself. The browser's sink serialises on its way out and this one stands in
+/// for it, so recording what it *would have posted* keeps the codec on the path
+/// these tests walk.
 type Posted = Arc<std::sync::Mutex<Vec<(u64, Vec<u8>)>>>;
 
 /// A port that records what it was handed instead of posting anywhere.
@@ -13,12 +18,16 @@ struct FakePort {
     accept: bool,
 }
 
-impl WorkerPort for FakePort {
-    fn post(&self, id: u64, request: Vec<u8>) -> bool {
-        if self.accept {
-            self.posted.lock().unwrap().push((id, request));
+impl JobSink for FakePort {
+    fn send(&self, id: u64, request: JobRequest) -> Result<(), JobRequest> {
+        if !self.accept {
+            // The refusal path, and the reason it hands the request back: the
+            // funnel keeps no other copy, so a sink that dropped one here would
+            // lose the job rather than let it run inline.
+            return Err(request);
         }
-        self.accept
+        self.posted.lock().unwrap().push((id, request.to_bytes()));
+        Ok(())
     }
 }
 
