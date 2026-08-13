@@ -88,6 +88,19 @@ pub(crate) const MAX_ADJACENT_GAP_STEPS: f64 = 1.5;
 /// merely generous but absurd caps it at the call site: a wedge width does, at
 /// `render::MAX_WEDGE_DEG`.
 pub(crate) fn median_azimuth_step_deg(azimuths: impl IntoIterator<Item = f64>) -> Option<f64> {
+    let gaps = circular_gaps_deg(azimuths);
+    gaps.get(gaps.len() / 2).copied()
+}
+
+/// Every positive circular gap between adjacent azimuths, ascending.
+///
+/// The walk [`median_azimuth_step_deg`] and [`largest_azimuth_gap_deg`] share,
+/// so the step a sweep is read at and the hole it is judged by are two order
+/// statistics of **one** list rather than two walks that could come to disagree
+/// about the same sweep. Extracted from `median_azimuth_step_deg` unchanged,
+/// quantization included — see its doc for why the `f64`/`f32` round trip is
+/// load-bearing and must not be tidied into end-to-end `f64`.
+fn circular_gaps_deg(azimuths: impl IntoIterator<Item = f64>) -> Vec<f64> {
     let mut sorted: Vec<f32> = azimuths
         .into_iter()
         .map(|az| az.rem_euclid(360.0) as f32)
@@ -104,7 +117,49 @@ pub(crate) fn median_azimuth_step_deg(azimuths: impl IntoIterator<Item = f64>) -
         }
     }
     gaps.sort_by(f64::total_cmp);
-    gaps.get(gaps.len() / 2).copied()
+    gaps
+}
+
+/// The widest circular gap between adjacent azimuths, degrees, or `None` when
+/// there are no two distinct azimuths to measure between.
+///
+/// The companion to [`median_azimuth_step_deg`], and the measurement this
+/// module was missing: the median says how far apart the radials that *are*
+/// there sit, and deliberately does not move when one enormous hole opens
+/// (`one_enormous_hole_does_not_move_the_median`). That is the right property
+/// for a footprint and the wrong one for noticing the hole, so the hole needs
+/// its own number, taken off the same list.
+///
+/// Both ends of the sweep are one gap here, because the walk is circular: a cut
+/// that lost its *last* chunk and a cut that lost a *middle* one are the same
+/// shape to this, which is what makes it the whole test rather than half of one.
+/// [`Rows`] cannot answer it — it knows only where a grid ends, not where it is
+/// sparse — and its doc says so.
+pub(crate) fn largest_azimuth_gap_deg(azimuths: impl IntoIterator<Item = f64>) -> Option<f64> {
+    circular_gaps_deg(azimuths).last().copied()
+}
+
+/// Whether a sweep's azimuths cover the circle without an interior hole.
+///
+/// The rule is [`MAX_ADJACENT_GAP_STEPS`] applied to the sweep as a whole rather
+/// than to one pair of radials: a sweep is whole when its widest gap is a gap
+/// the sampler would have been willing to interpolate across, and sectored when
+/// it is one the sampler would refuse. Reusing that constant is the point —
+/// "these two radials are not adjacent" and "this sweep has a hole in it" are
+/// the same judgement asked at two scales, and a second threshold here could
+/// come to disagree with the one the renderer already draws by.
+///
+/// Scale-free by construction: the comparison is against the sweep's *own*
+/// median step, so a 0.5° cut and a 1.0° cut are judged alike without either
+/// number appearing here. A sweep with nothing to measure between is not
+/// called sectored — one radial is not a hole, and the caller that cares about
+/// emptiness has the count.
+pub(crate) fn covers_the_circle(azimuths: &[f64]) -> bool {
+    let gaps = circular_gaps_deg(azimuths.iter().copied());
+    let (Some(median), Some(largest)) = (gaps.get(gaps.len() / 2), gaps.last()) else {
+        return true;
+    };
+    largest <= &(median * MAX_ADJACENT_GAP_STEPS)
 }
 
 /// How much of the circle a grid's rows must account for, at their own measured
@@ -296,6 +351,96 @@ mod tests {
     fn two_radials_report_the_larger_circular_gap() {
         assert_eq!(median_azimuth_step_deg([0.0, 10.0]), Some(350.0));
         assert_eq!(median_azimuth_step_deg([10.0, 0.0]), Some(350.0));
+    }
+
+    /// The measurement the median deliberately refuses to make, made: the same
+    /// 400-radial tail whose *step* stays 0.5° reports its 160° hole here.
+    ///
+    /// Both numbers come off one list, so this is also what says the two agree
+    /// about a sweep rather than merely coexisting.
+    #[test]
+    fn the_hole_the_median_ignores_is_what_the_largest_gap_reports() {
+        let tail: Vec<f64> = (0..400).map(|i| f64::from(i) * 0.5).collect();
+        assert_eq!(median_azimuth_step_deg(tail.iter().copied()), Some(0.5));
+        // 400 radials at 0.5° reach 199.5°, so the hole closing the circle is
+        // 160.5° — the tail the module doc calls "200°", to its last radial.
+        assert_eq!(largest_azimuth_gap_deg(tail.iter().copied()), Some(160.5));
+
+        // A complete sweep's widest gap is one step: the seam that closes the
+        // circle is a gap like any other, not the sweep's one big hole.
+        let whole: Vec<f64> = (0..720).map(|i| f64::from(i) * 0.5).collect();
+        assert_eq!(largest_azimuth_gap_deg(whole), Some(0.5));
+
+        assert_eq!(largest_azimuth_gap_deg([]), None);
+        assert_eq!(largest_azimuth_gap_deg([37.5]), None);
+    }
+
+    /// The hole a lost chunk leaves is the same size wherever in the sweep it
+    /// falls, because the walk is circular — a cut missing its *last* 120
+    /// radials and one missing 120 out of its middle both report 60.5°.
+    ///
+    /// This is the case `Rows` cannot see: both of these still *end* where a
+    /// complete sweep ends once you close the circle, so a measurement of where
+    /// the rows stop calls them whole. Only the gap catches the interior one.
+    #[test]
+    fn a_lost_chunk_measures_the_same_wherever_it_falls() {
+        let present = |keep: &dyn Fn(usize) -> bool| -> Vec<f64> {
+            (0..720)
+                .filter(|i| keep(*i))
+                .map(|i| i as f64 * 0.5)
+                .collect()
+        };
+        let lost_middle = present(&|i| !(240..360).contains(&i));
+        let lost_tail = present(&|i| i < 600);
+
+        for azimuths in [&lost_middle, &lost_tail] {
+            assert_eq!(azimuths.len(), 600);
+            assert_eq!(
+                largest_azimuth_gap_deg(azimuths.iter().copied()),
+                Some(60.5)
+            );
+            assert_eq!(median_azimuth_step_deg(azimuths.iter().copied()), Some(0.5));
+            assert!(!covers_the_circle(azimuths));
+        }
+    }
+
+    /// The verdict rides on the sweep's own step, so the same judgement is
+    /// reached at 0.5° and at 1.0° without either number appearing in the rule.
+    #[test]
+    fn wholeness_is_measured_against_the_sweeps_own_spacing() {
+        let super_res: Vec<f64> = (0..720).map(|i| i as f64 * 0.5).collect();
+        let standard: Vec<f64> = (0..360).map(|i| i as f64).collect();
+        assert!(covers_the_circle(&super_res));
+        assert!(covers_the_circle(&standard));
+
+        // One chunk short of each: 600 of 720 and 240 of 360.
+        let short_super: Vec<f64> = (0..600).map(|i| i as f64 * 0.5).collect();
+        let short_standard: Vec<f64> = (0..240).map(|i| i as f64).collect();
+        assert!(!covers_the_circle(&short_super));
+        assert!(!covers_the_circle(&short_standard));
+
+        // Jitter is not a hole. A real cut's azimuths wander a few hundredths
+        // of a step, which must not be read as an absence.
+        let jittered: Vec<f64> = (0..720)
+            .map(|i| i as f64 * 0.5 + 0.02 * (i as f64 * 1.7).sin())
+            .collect();
+        assert!(covers_the_circle(&jittered));
+
+        // Nothing to measure between is not a hole either.
+        assert!(covers_the_circle(&[]));
+        assert!(covers_the_circle(&[37.5]));
+    }
+
+    /// A single dropped radial is a two-step gap, which is exactly what
+    /// [`MAX_ADJACENT_GAP_STEPS`] declines to bridge — so the rule that stops
+    /// the sampler painting across it also refuses to call the sweep whole.
+    /// One rule, asked at two scales.
+    #[test]
+    fn one_dropped_radial_is_already_a_hole() {
+        let mut azimuths: Vec<f64> = (0..720).map(|i| i as f64 * 0.5).collect();
+        azimuths.remove(300);
+        assert_eq!(largest_azimuth_gap_deg(azimuths.iter().copied()), Some(1.0));
+        assert!(!covers_the_circle(&azimuths));
     }
 
     fn ring(n: usize) -> Vec<f64> {

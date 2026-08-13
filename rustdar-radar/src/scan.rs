@@ -41,6 +41,114 @@ pub struct DecodedScan {
     pub declared_nyquist: crate::nyquist::DeclaredNyquist,
 }
 
+/// How much of the circle one assembled sweep actually covers.
+///
+/// # Why an archive volume needs this at all
+///
+/// Because a Level-II file is a faithful record of an **incomplete** radial
+/// stream, and nothing in the file says so. Radials reach the archive in LDM
+/// records of `chunks::RADIALS_PER_CHUNK`, and a record lost upstream
+/// of the archive leaves a file that is perfectly well-formed — framing intact,
+/// every record's bzip2 valid, no truncation — carrying 600 radials for a cut
+/// that declares 0.5° spacing. Measured over 180 volumes decoded independently
+/// (MetPy and a raw ICD walk, agreeing radial for radial), 8 of them hold at
+/// least one such cut: 30 short cuts in 2243, whose median widest gap is
+/// **60.5°**, and 28 of whose shortfalls are an exact multiple of 120.
+///
+/// The live path already refuses these: [`crate::chunks`] abandons a cut under
+/// `MIN_SEALED_RADIAL_PERCENT` and keeps it out of every snapshot, for the
+/// reason its `Cut::Abandoned` doc gives — a grid with a hole in the middle is
+/// differentiated across the seam like any other pair of adjacent rows. The
+/// archive path had no equivalent. The same volume arriving as a file rendered
+/// with a 60° wedge missing and read as whole, which is what this exists to
+/// end: `KCRP20260717_211257_V06` draws its 0.5° Doppler cut from 600 radials
+/// spanning 299.5°, and said nothing.
+///
+/// # What it is not
+///
+/// Not a repair. The radials are gone before the file exists, so there is
+/// nothing here to recover and nothing is interpolated across the hole —
+/// `azimuth::MAX_ADJACENT_GAP_STEPS` already stops the sampler and the
+/// rasterizer bridging it. This only makes the absence *nameable*, so a reader
+/// can tell a sweep that covers 300° from one that covers 360°.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SweepCoverage {
+    /// The cut's elevation number, as [`nexrad_model::data::Sweep`] reports it.
+    pub elevation_number: u8,
+    /// Radials the sweep holds.
+    pub radials: usize,
+    /// The angle between adjacent radials, from
+    /// `azimuth::median_azimuth_step_deg` — the sweep's own measured
+    /// spacing, not what its radials declare, and a median so that the hole
+    /// this type is about does not widen it.
+    pub azimuth_step_degrees: f64,
+    /// The widest gap between adjacent azimuths, degrees, walked circularly so
+    /// that a lost trailing chunk and a lost middle one measure alike.
+    pub largest_gap_degrees: f64,
+    /// Whether the sweep covers the circle — its widest gap is one the sampler
+    /// would interpolate across. See `azimuth::covers_the_circle`.
+    pub is_whole: bool,
+}
+
+impl SweepCoverage {
+    /// How much of the circle the sweep covers, degrees.
+    ///
+    /// `360` less the one hole, which is the number to put in front of a reader:
+    /// a whole sweep answers 360, and the KCRP cut above answers 299.5. It
+    /// deliberately charges only the *widest* gap, so a sweep missing two
+    /// separate chunks reports the larger absence rather than their sum — this
+    /// is a description of the worst hole, not an area measurement.
+    #[must_use]
+    pub fn arc_degrees(&self) -> f64 {
+        if self.is_whole {
+            360.0
+        } else {
+            (360.0 - self.largest_gap_degrees).max(0.0)
+        }
+    }
+}
+
+/// Measure every sweep in a scan. See [`SweepCoverage`].
+///
+/// Derived on request rather than stored on [`DecodedScan`], so that it cannot
+/// disagree with the scan it describes — a stored copy would have to survive
+/// [`DecodedScan::to_bytes`] and every test that builds a volume by hand, and
+/// the first one to skip it would put a stale verdict in front of a reader.
+#[must_use]
+pub fn sweep_coverage(scan: &Scan) -> Vec<SweepCoverage> {
+    scan.sweeps()
+        .iter()
+        .map(|sweep| {
+            let azimuths: Vec<f64> = sweep
+                .radials()
+                .iter()
+                .map(|radial| f64::from(radial.azimuth_angle_degrees()))
+                .collect();
+            SweepCoverage {
+                elevation_number: sweep.elevation_number(),
+                radials: sweep.radials().len(),
+                azimuth_step_degrees: crate::azimuth::median_azimuth_step_deg(
+                    azimuths.iter().copied(),
+                )
+                .unwrap_or(0.0),
+                largest_gap_degrees: crate::azimuth::largest_azimuth_gap_deg(
+                    azimuths.iter().copied(),
+                )
+                .unwrap_or(0.0),
+                is_whole: crate::azimuth::covers_the_circle(&azimuths),
+            }
+        })
+        .collect()
+}
+
+impl DecodedScan {
+    /// This volume's per-sweep coverage. See [`SweepCoverage`].
+    #[must_use]
+    pub fn sweep_coverage(&self) -> Vec<SweepCoverage> {
+        sweep_coverage(&self.scan)
+    }
+}
+
 /// Decode a downloaded volume into its `Scan` and its declared Nyquist table,
 /// in **one** pass over the file.
 ///
@@ -340,6 +448,22 @@ fn fold_contributions(
         Some(site) => Scan::with_site(site, coverage_pattern, sweeps),
         None => Scan::new(coverage_pattern, sweeps),
     };
+
+    // A file cannot report its own missing records, so the decode says it. The
+    // live assembler logs the same fact as an abandoned cut and then withholds
+    // the sweep; here the sweep is all there is of that cut, so it is handed
+    // over and named rather than withheld. See `SweepCoverage`.
+    for cut in sweep_coverage(&scan).iter().filter(|c| !c.is_whole) {
+        log::warn!(
+            "Cut {} covers {:.1}° of azimuth, not 360°: {} radials at {:.2}° spacing with a \
+             {:.1}° gap. Radials absent from the volume, not dropped in decoding.",
+            cut.elevation_number,
+            cut.arc_degrees(),
+            cut.radials,
+            cut.azimuth_step_degrees,
+            cut.largest_gap_degrees,
+        );
+    }
 
     Ok(DecodedScan {
         scan,
