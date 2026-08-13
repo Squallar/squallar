@@ -21,7 +21,7 @@
 //! posts jobs carrying `None` here and is dealiased against the estimate, the
 //! same as it was before any of this existed.
 
-use crate::offload::{JobRequest, WorkerPort};
+use crate::offload::{JobRequest, JobSink};
 use crate::platform_double::TestBridge;
 use rustdar_radar::types::RadarProduct;
 use std::sync::{Arc, Mutex};
@@ -42,10 +42,14 @@ const OTHER_CUT_MS: f64 = 31.35;
 /// A worker port that keeps what it was handed instead of posting it.
 struct Recorder(Arc<Mutex<Vec<Vec<u8>>>>);
 
-impl WorkerPort for Recorder {
-    fn post(&self, _id: u64, request: Vec<u8>) -> bool {
-        self.0.lock().unwrap().push(request);
-        true
+impl JobSink for Recorder {
+    /// Serialises here, as the browser's own sink does, so what these tests
+    /// read back has been through `to_bytes`/`from_bytes` exactly as a job
+    /// crossing a real worker boundary has. The funnel stopped doing it on
+    /// every sink's behalf; a recorder standing in for the browser still must.
+    fn send(&self, _id: u64, request: JobRequest) -> Result<(), JobRequest> {
+        self.0.lock().unwrap().push(request.to_bytes());
+        Ok(())
     }
 }
 

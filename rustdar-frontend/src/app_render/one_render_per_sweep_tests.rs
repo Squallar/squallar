@@ -10,7 +10,7 @@
 //! job.
 //!
 //! The observable is the **job posted on the wire**, counted through the same
-//! `WorkerPort` a browser has and read back with the same `from_bytes` a worker
+//! `JobSink` a browser has and read back with the same `from_bytes` a worker
 //! uses. A timing would not do: on a 32-core desktop the duplicates run in
 //! parallel and the wall-clock latency barely moves, while the CPU and the
 //! resident memory they cost move a great deal — and on wasm, where
@@ -28,7 +28,7 @@
 //! coarsened later. Both are guards worth keeping and neither is evidence that
 //! the suppression works.
 
-use crate::offload::{JobRequest, WorkerPort};
+use crate::offload::{JobRequest, JobSink};
 use rustdar_overlays::render::overlay_state::OverlayKind;
 use rustdar_radar::types::RadarProduct;
 use std::sync::{Arc, Mutex};
@@ -46,10 +46,14 @@ const OTHER_TILT: f32 = 1.5;
 /// rather than raced against workers finishing.
 struct Recorder(Arc<Mutex<Vec<Vec<u8>>>>);
 
-impl WorkerPort for Recorder {
-    fn post(&self, _id: u64, request: Vec<u8>) -> bool {
-        self.0.lock().unwrap().push(request);
-        true
+impl JobSink for Recorder {
+    /// Serialises here, as the browser's own sink does, so what these tests
+    /// read back has been through `to_bytes`/`from_bytes` exactly as a job
+    /// crossing a real worker boundary has. The funnel stopped doing it on
+    /// every sink's behalf; a recorder standing in for the browser still must.
+    fn send(&self, _id: u64, request: JobRequest) -> Result<(), JobRequest> {
+        self.0.lock().unwrap().push(request.to_bytes());
+        Ok(())
     }
 }
 

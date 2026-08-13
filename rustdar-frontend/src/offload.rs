@@ -1085,7 +1085,7 @@ pub fn decode_polar(bytes: &[u8]) -> rustdar_radar::render::polar::PolarField {
     })
 }
 
-// ── The worker port ──────────────────────────────────────────────────────────
+// ── The job sink ─────────────────────────────────────────────────────────────
 
 /// A place to send [`JobRequest`]s that is not this thread.
 ///
@@ -1093,13 +1093,37 @@ pub fn decode_polar(bytes: &[u8]) -> rustdar_radar::render::polar::PolarField {
 /// installed rather than constructed here, because the dependency runs the
 /// other way: `rustdar-web` depends on this crate, and nothing in this crate
 /// may reach back for `web-sys`.
-pub trait WorkerPort {
-    /// Send `request` to be executed. `id` comes back with the reply so the
-    /// funnel can pair them.
+///
+/// # The payload is a `JobRequest`, not bytes
+///
+/// [`send`](Self::send) takes the request **by value**, and that is the whole
+/// point of the shape. What both transports actually implement is one
+/// operation — **handover**: `postMessage` with a transfer list is a move, and
+/// so is a channel send. They differ only in what the platform charges for it.
+/// A browser cannot hand over anything but a detachable buffer, so
+/// `rustdar-web`'s implementation serialises; a transport that can move an
+/// owned value has no reason to, and must not be made to.
+///
+/// This used to take a `Vec<u8>`, which meant the funnel called `to_bytes` on
+/// behalf of every implementation including ones that did not want it. The
+/// serialisation now lives inside the implementation that needs it, and the
+/// funnel names no representation at all.
+pub trait JobSink {
+    /// Hand `request` over to be executed. `id` comes back with the reply so
+    /// the funnel can pair them.
     ///
-    /// `false` if it could not be posted at all, which makes the caller run the
-    /// job here instead of waiting for a reply that is not coming.
-    fn post(&self, id: u64, request: Vec<u8>) -> bool;
+    /// # Refusal returns the request
+    ///
+    /// `Err(request)` is "I could not take this", and it carries the job back
+    /// so the caller can run it here instead of waiting for a reply that is not
+    /// coming. That is why this is a `Result<(), JobRequest>` and not a `bool`:
+    /// a `bool` forces the caller to keep a copy against a refusal it almost
+    /// never sees, which is exactly the serialise-on-everyone's-behalf that
+    /// taking bytes used to force. Giving it back costs an implementation
+    /// nothing it would not already have: `JobRequest::to_bytes` **borrows**,
+    /// so the browser's arm still owns the request after building the buffer it
+    /// failed to post, and a moving arm has not moved it if the send failed.
+    fn send(&self, id: u64, request: JobRequest) -> Result<(), JobRequest>;
 }
 
 /// The state a posted job needs when its reply lands.
@@ -1117,7 +1141,7 @@ thread_local! {
     /// Single-threaded by construction: only the browser build installs a port,
     /// and the browser's main thread is the only place these are registered or
     /// retired.
-    static WORKER: RefCell<Option<Box<dyn WorkerPort>>> = const { RefCell::new(None) };
+    static WORKER: RefCell<Option<Box<dyn JobSink>>> = const { RefCell::new(None) };
     static PENDING: RefCell<HashMap<u64, Pending>> = RefCell::new(HashMap::new());
     static NEXT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
 }
@@ -1128,7 +1152,7 @@ thread_local! {
 /// itself with a build-token handshake. Until then — and forever, on a browser
 /// where the worker could not start — [`offload_job`] runs jobs inline, which
 /// is the behaviour the web build had before any of this existed.
-pub fn set_worker(port: Box<dyn WorkerPort>) {
+pub fn set_worker(port: Box<dyn JobSink>) {
     WORKER.with(|w| *w.borrow_mut() = Some(port));
 }
 
@@ -1158,7 +1182,7 @@ pub fn worker_attached() -> bool {
     WORKER.with(|w| w.borrow().is_some())
 }
 
-/// A [`WorkerPort`] installed for the length of a test, retired when this drops.
+/// A [`JobSink`] installed for the length of a test, retired when this drops.
 ///
 /// [`WORKER`] is a thread-local and the test harness reuses its threads, so a
 /// port left installed is a port the *next* test on that thread inherits — and
@@ -1186,7 +1210,7 @@ impl Drop for InstalledTestWorker {
 /// The test-only counterpart of [`set_worker`] — see [`InstalledTestWorker`]
 /// for why the retirement is a guard rather than a call at the end of the test.
 #[cfg(test)]
-pub fn install_test_worker(port: Box<dyn WorkerPort>) -> InstalledTestWorker {
+pub fn install_test_worker(port: Box<dyn JobSink>) -> InstalledTestWorker {
     set_worker(port);
     InstalledTestWorker
 }
@@ -1220,34 +1244,38 @@ pub fn offload_job(name: &'static str, job: Job, deliver: impl FnOnce(JobResult)
         id
     });
 
-    // Try the worker on every target. Nothing installs one outside the browser,
+    // Try the sink on every target. Nothing installs one outside the browser,
     // so this is a single load of a `None` on desktop — and it means the
-    // browser path is reachable from a host test with a fake port rather than
+    // browser path is reachable from a host test with a fake sink rather than
     // only from a browser.
-    let posted = WORKER.with(|w| {
-        w.borrow()
-            .as_ref()
-            .map(|port| port.post(id, request.to_bytes()))
+    //
+    // The request goes in **by value**, so nothing is serialised here on behalf
+    // of a transport that would rather move it; `JobSink` says what that buys.
+    // `Err` hands the job straight back, which is what lets the fallthrough
+    // below exist without the funnel keeping a copy against a refusal it almost
+    // never sees.
+    let refused = WORKER.with(|w| match w.borrow().as_ref() {
+        Some(sink) => sink.send(id, request).err().map(|back| (back, true)),
+        None => Some((request, false)),
     });
-    match posted {
-        Some(true) => {
-            PENDING.with(|p| {
-                p.borrow_mut().insert(
-                    id,
-                    Pending {
-                        kind,
-                        started: web_time::Instant::now(),
-                        deliver: Box::new(deliver),
-                    },
-                );
-            });
-            return;
-        }
-        // The port exists but would not take the job. Falling through runs it
-        // here, which is slow but correct; a port that keeps refusing is a
+    let Some((request, had_sink)) = refused else {
+        PENDING.with(|p| {
+            p.borrow_mut().insert(
+                id,
+                Pending {
+                    kind,
+                    started: web_time::Instant::now(),
+                    deliver: Box::new(deliver),
+                },
+            );
+        });
+        return;
+    };
+    if had_sink {
+        // The sink exists but would not take the job. Falling through runs it
+        // here, which is slow but correct; a sink that keeps refusing is a
         // worker that has died, and `abandon_worker` is what retires it.
-        Some(false) => log::warn!("{name}: worker refused the job; running it here"),
-        None => {}
+        log::warn!("{name}: worker refused the job; running it here");
     }
 
     offload(name, move || deliver(execute(&request)));
