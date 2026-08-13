@@ -58,6 +58,57 @@ const MICRO_DEGREES_PER_DEGREE: f64 = 1_000_000.0;
 /// Metres in one international foot, exactly.
 const METRES_PER_FOOT: f64 = 0.3048;
 
+/// How far a volume's own position may sit from the fetched catalogue's before
+/// the volume stops being believed, in kilometres.
+///
+/// # Measured, and then placed in the gap
+///
+/// A volume and the published station record are two descriptions of one
+/// antenna, so their disagreement is a quantity that can be read off the
+/// archive rather than guessed at. Over **170 volumes from 77 sites** — the
+/// whole longitude spread of the network, Alaska and Hawaii and Puerto Rico
+/// included, both instruments, and both TDWR producers — the largest
+/// disagreement is **186.7 m**, at `PAIH`. The distribution behind it:
+///
+/// ```text
+///                     n      max        median
+/// WSR-88D             60    186.7 m      2.5 m
+/// TDWR               110    111.4 m      0.2 m
+///   in degrees        82    111.4 m      0.2 m
+///   in thousandths    28      0.0 m      0.0 m
+/// ```
+///
+/// The TDWR ceiling is not a coincidence and not an error: the catalogue quotes
+/// a terminal radar to three decimals, so 111.4 m is one quantum of its own
+/// precision. And the 28 pre-correction volumes land **exactly** on the
+/// catalogue — 0.0 m, every one — which is the strongest evidence available
+/// that reading them as thousandths recovers the real position rather than a
+/// plausible one.
+///
+/// Real *movement* is smaller still. The largest step any site in the archive
+/// makes is `KTLX`'s re-survey: its own volumes state 35.333057/−97.277481 in
+/// 2013 and 35.333363/−97.277763 in 2020, which is **43 m**.
+///
+/// So one kilometre is not a round number chosen for its roundness. It is 5.4×
+/// the largest disagreement 170 real volumes produce and 23× the largest real
+/// re-survey, and three orders of magnitude *below* the smallest thing it has
+/// to catch: the nearest of the constructed corruptions in `nexrad_decode`'s
+/// `position_tests` — a hypothetical hundredths producer writing
+/// `(4180, -8786)` for `TORD` — lands 4,180 km away. Between 0.19 km and
+/// 4,180 km the archive contains nothing at all, so every value in that band
+/// accepts and refuses exactly the same volumes, and the constant is fitted to
+/// nothing. It is stated in kilometres because that is the band it sits in.
+///
+/// # What it costs
+///
+/// A radar that genuinely *relocates* by more than this — `RKSG` moved from
+/// Osan to Camp Humphreys, about 15 km — is refused until the catalogue catches
+/// up, and the catalogue is fetched live rather than compiled in, so it
+/// generally already has. The refusal is logged at error level for exactly this
+/// case: it must never be silent, because a silent refusal is the same class of
+/// defect as the silent acceptance it replaces.
+pub const CATALOGUE_DISAGREEMENT_LIMIT_KM: f64 = 1.0;
+
 /// Where the position on a [`crate::types::ScanInfo`]'s site came from.
 ///
 /// The order of the variants is the precedence order, and

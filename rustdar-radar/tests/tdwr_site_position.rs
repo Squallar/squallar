@@ -4,18 +4,26 @@
 //! # What went wrong
 //!
 //! The Volume Data Block's `Lat`/`Long` are `Real*4` degrees — ICD 2620002AA
-//! Table XVII-B, *Data Block #1 (Volume Data)*. TDWR Level II volumes written
-//! before 2021-09-15 carry the **Level III** radar position in those fields
-//! instead: ICD 2620001AD's Product Description Block halfwords 11-12 and
-//! 13-14, an `INT*4` count of thousandths of a degree, widened into the
-//! `Real*4` without being divided. `TORD20200810_000135_V08` states
-//! `41797.0, -87858.0`.
+//! Table XVII-B, *Data Block #1 (Volume Data)*. Older TDWR Level II volumes
+//! carry the **Level III** radar position in those fields instead: ICD
+//! 2620001AD's Product Description Block halfwords 11-12 and 13-14, an `INT*4`
+//! count of thousandths of a degree, widened into the `Real*4` without being
+//! divided. `TORD20200810_000135_V08` states `41797.0, -87858.0`.
 //!
-//! Read as degrees, that is not a place on Earth, and
+//! "Older", and not "written before 2021-09-15", which is what this said until
+//! the switch was measured at more than one radar. It is a **per-site
+//! rollout**: five of the terminal radars below were already writing degrees on
+//! 2021-09-14 while `TORD` was not, and `TMIA` was still writing thousandths on
+//! 2021-09-16. `nexrad_decode`'s `VolumeDataBlock::latitude_raw` carries the
+//! table. The 2020 and 2026 fixtures here sit either side of every site's own
+//! switch whenever it happened, so the pairing is unaffected.
+//!
+//! Read as degrees, thousandths are not a place on Earth, and
 //! [`SitePosition::from_volume`](rustdar_radar::site_position::SitePosition::from_volume)
-//! refused it — correctly, on the evidence it had. Every TDWR volume in the
-//! archive older than that date therefore placed no radar at all, and the whole
-//! terminal network was untestable through any path that needs a position.
+//! refused them — correctly, on the evidence it had. Every TDWR volume in the
+//! archive older than its site's switch therefore placed no radar at all, and
+//! the whole terminal network was untestable through any path that needs a
+//! position.
 //!
 //! The reading is in `nexrad-decode`'s `VolumeDataBlock`, which is the one seam
 //! all four consumers of those fields pass through. This file is the check that
@@ -69,8 +77,9 @@ struct Fixture {
     truth_lon: f64,
 }
 
-/// The five TDWR sites as they read **before** 2021-09-15 — thousandths of a
-/// degree in a field declared in degrees.
+/// The five TDWR sites as they read **before their own switch** — thousandths
+/// of a degree in a field declared in degrees. All five are 2020 volumes, which
+/// is a year clear of the earliest switch any of them made.
 const THOUSANDTHS: [Fixture; 5] = [
     Fixture {
         name: "TORD20200810_000135_V08",

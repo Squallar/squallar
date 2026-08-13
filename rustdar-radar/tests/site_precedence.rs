@@ -55,9 +55,26 @@ fn serialized() -> std::sync::MutexGuard<'static, ()> {
     GATE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Latitude the *volume* states, degrees. A whole degree from everything else.
-const VOLUME_LAT: f32 = 30.0;
-/// Latitude a *learned* position holds.
+/// Latitude the *volume* states, degrees.
+///
+/// **Not** a whole degree from the rest, and it used to be. A volume only
+/// outranks the catalogue while it agrees with it to within
+/// [`CATALOGUE_DISAGREEMENT_LIMIT_KM`], so a volume a degree from the
+/// catalogue no longer wins this ladder — it is refused, which is the rule
+/// `a_volume_that_disagrees_with_the_catalogue_does_not_displace_it` exists
+/// for. 55 m of separation is what is left: legal, and still visible in a
+/// failure message, which is what the degree was for.
+const VOLUME_LAT: f32 = 32.0005;
+/// The micro-degrees [`VOLUME_LAT`] becomes.
+///
+/// Spelled separately because the two are not the same number: no `f32` holds
+/// 32.0005 exactly, and a `SitePosition` carries the rounded integer rather
+/// than the float it was rounded from. Every other candidate here is already
+/// written in micro-degrees for the same reason.
+const VOLUME_LAT_UDEG: i32 = 32_000_500;
+/// Latitude a *learned* position holds. A whole degree from everything else,
+/// which it may be — nothing checks a learned position against the catalogue,
+/// because a learned position is a volume the check already ran on.
 const LEARNED_LAT_UDEG: i32 = 31_000_000;
 /// Latitude the *network catalogue* holds.
 const NETWORK_LAT_UDEG: i32 = 32_000_000;
@@ -200,14 +217,14 @@ fn the_precedence_is_volume_learned_network_unplaced() {
             "the volume in hand outranks everything, learned included",
             scan_stating(VOLUME_LAT),
             Some(learned()),
-            f64::from(VOLUME_LAT),
+            f64::from(VOLUME_LAT_UDEG) / 1e6,
             SitePositionSource::Volume,
         ),
         (
             "and outranks the table with nothing learned",
             scan_stating(VOLUME_LAT),
             None,
-            f64::from(VOLUME_LAT),
+            f64::from(VOLUME_LAT_UDEG) / 1e6,
             SitePositionSource::Volume,
         ),
         (
@@ -235,6 +252,97 @@ fn the_precedence_is_volume_learned_network_unplaced() {
     // unreachable for any real ICAO, because the seed placed all of them.
     let orphan = ScanInfo::from_scan(&silent_scan(), "ZZPU", at(), None);
     assert_eq!(orphan.site_source, SitePositionSource::Unknown);
+}
+
+/// **The rung above the ladder**: a volume outranks the catalogue by metres,
+/// not by kilometres.
+///
+/// A volume's `Lat`/`Long` are two `Real*4` fields with nothing checking them,
+/// and one of the two readings this workspace takes of them is an *inference* —
+/// `nexrad_decode` divides an out-of-range integral pair by 1000, because the
+/// older TDWR producer wrote thousandths of a degree there. Damage inside a
+/// terminal radar's own block satisfies that reading in full: `(100, -100)`
+/// divides into `(0.1, -0.1)`, a place in the Gulf of Guinea, and the volume
+/// rung would then have outranked every other source *and* been persisted as a
+/// learned position. `nexrad_decode`'s `a_forged_pair_in_a_terminal_block_is_not_refused_here`
+/// is the same three pairs from the other side, pinning that the block cannot
+/// refuse them itself.
+///
+/// So the confirmation happens here, against the only source no volume wrote.
+/// The rows are the four cases the rule has:
+///
+/// * agreement inside the limit wins, because that is the whole point of
+///   preferring a volume — a radar reporting itself is better than a record
+///   about it, at the scale radars actually move;
+/// * disagreement outside it loses, whichever direction it is in;
+/// * and a radar the catalogue never placed keeps the volume's word, because
+///   there is nothing to confirm against and no position is worse than an
+///   unconfirmed one.
+///
+/// `ZZPQ`'s two rows are the same volume against the same catalogue with only
+/// the distance changed, so what the assertion turns on is the distance and not
+/// the fixture.
+#[test]
+fn a_volume_that_disagrees_with_the_catalogue_does_not_displace_it() {
+    let _gate = serialized();
+    for site in ["ZZPQ", "ZZPN"] {
+        assert!(
+            !sites::knows_site(site),
+            "precondition: {site} must be unknown, or this proves nothing",
+        );
+    }
+    // `ZZPQ` is placed by the catalogue. `ZZPN` is placed by nothing.
+    sites::resolve([("ZZPQ", network())]);
+
+    let catalogue_lat = f64::from(NETWORK_LAT_UDEG) / 1e6;
+    for (case, site, volume_lat, want_lat, want_source) in [
+        (
+            "a volume within the limit still outranks the catalogue",
+            "ZZPQ",
+            VOLUME_LAT,
+            f64::from(VOLUME_LAT_UDEG) / 1e6,
+            SitePositionSource::Volume,
+        ),
+        (
+            "a volume a degree away does not — 111 km is not a re-survey",
+            "ZZPQ",
+            32.0 + 1.0,
+            catalogue_lat,
+            SitePositionSource::Table,
+        ),
+        (
+            "and the sign of the disagreement is not what decides it",
+            "ZZPQ",
+            32.0 - 1.0,
+            catalogue_lat,
+            SitePositionSource::Table,
+        ),
+        (
+            "the Gulf of Guinea, which is where a forged pair divides to",
+            "ZZPQ",
+            0.1,
+            catalogue_lat,
+            SitePositionSource::Table,
+        ),
+        (
+            "a radar the catalogue never placed keeps its volume's word",
+            "ZZPN",
+            0.1,
+            0.1,
+            SitePositionSource::Volume,
+        ),
+    ] {
+        let info = ScanInfo::from_scan(&scan_stating(volume_lat), site, at(), None);
+        assert_eq!(info.site.lat, want_lat, "{case}");
+        assert_eq!(info.site_source, want_source, "{case}");
+    }
+
+    // The refusal is a refusal of *this volume*, not a refusal to learn: the
+    // catalogue's own row is exactly where it was, so nothing was half-applied
+    // on the way past.
+    let row = sites::get_radar_site("ZZPQ").expect("the catalogue placed it");
+    assert_eq!(row.lat, catalogue_lat);
+    assert_eq!(row.lon, f64::from(LON_UDEG) / 1e6);
 }
 
 /// A fetched elevation must not take a learned row's measured tower away.

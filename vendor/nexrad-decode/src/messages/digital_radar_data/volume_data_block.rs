@@ -21,8 +21,12 @@ fn is_on_earth(lat: f32, lon: f32) -> bool {
     (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon)
 }
 
-/// Whether the pair is a Level III radar position rather than the degrees the
-/// block declares — see [`VolumeDataBlock::latitude_raw`].
+/// Whether `lat`/`lon` read as a count of thousandths of a degree rather than
+/// as the degrees the block declares.
+///
+/// The **numeric** half of the reading; [`VolumeDataBlock::states_thousandths`]
+/// is the whole of it and holds the argument for why a numeric half is not
+/// enough on its own.
 ///
 /// Three conditions, and all three are needed:
 ///
@@ -36,7 +40,7 @@ fn is_on_earth(lat: f32, lon: f32) -> bool {
 ///   corruption, and corruption is for the caller to refuse;
 /// * a thousandth of the pair **is** a position, so the reading is one the
 ///   result can be checked against rather than an assumption about the source.
-fn states_thousandths(lat: f32, lon: f32) -> bool {
+fn pair_reads_as_thousandths(lat: f32, lon: f32) -> bool {
     !is_on_earth(lat, lon)
         && lat.fract() == 0.0
         && lon.fract() == 0.0
@@ -132,23 +136,50 @@ impl<'a> VolumeDataBlock<'a> {
     /// `Long` at bytes 12-15, both "deg". No revision of that table states any
     /// other scale, and every WSR-88D volume writes degrees.
     ///
-    /// TDWR Level II volumes written before 2021-09-15 do not. They carry the
-    /// **Level III** radar position instead: ICD 2620001AD's Product
-    /// Description Block halfwords 11-12 and 13-14, an `INT*4` count of
-    /// thousandths of a degree, widened into the `Real*4` without being
-    /// divided. `TORD` reads `41797.0, -87858.0` where it means
-    /// 41.797 °N, 87.858 °W, and the same holds at `TOKC`, `TDAL`, `TPIT`,
-    /// `TMIA`, `TSJU` and `TPHX` on the same day. The producer was corrected
-    /// between `TORD20210914_000151_V08` and `TORD20210915_000148_V08`;
-    /// everything filed before that date is still in the archive and still
-    /// reads that way. Neither height field is affected — `TORD` states 226 m
-    /// on both sides of the change.
+    /// Older TDWR Level II volumes do not. They carry the **Level III** radar
+    /// position instead: ICD 2620001AD's Product Description Block halfwords
+    /// 11-12 and 13-14, an `INT*4` count of thousandths of a degree, widened
+    /// into the `Real*4` without being divided. `TORD` reads
+    /// `41797.0, -87858.0` where it means 41.797 °N, 87.858 °W, and the same
+    /// holds at `TOKC`, `TDAL`, `TPIT`, `TATL`, `TMIA`, `TSJU` and `TPHX`.
+    /// Neither height field is affected — `TORD` states 226 m on both sides of
+    /// the change.
     ///
-    /// So this returns degrees for both, converting only a pair that
-    /// [`states_thousandths`] recognises. That predicate cannot fire on a value
-    /// the ICD's own range admits, which is what makes every conforming volume
-    /// byte-for-byte what it was; and it does not rescue a pair that is merely
-    /// wrong, which stays out of range for the caller to refuse.
+    /// # The correction was a rollout, not a date
+    ///
+    /// It is tempting to key this to 2021-09-15, because that is where a bisect
+    /// over `TORD` lands: `TORD20210914_000151_V08` is the last thousandths
+    /// volume and `TORD20210915_000148_V08` the first in degrees. **That date
+    /// is `TORD`'s and no one else's.** Read one volume per site per sample
+    /// date out of `s3://unidata-nexrad-level2`:
+    ///
+    /// ```text
+    /// site   last seen in thousandths   first seen in degrees
+    /// TATL   2021-06-15                 2021-09-14
+    /// TDAL   2021-06-15                 2021-09-14
+    /// TOKC   2021-06-15                 2021-09-14
+    /// TPHX   2021-06-15                 2021-09-14
+    /// TPIT   2021-06-15                 2021-09-14
+    /// TORD   2021-09-14                 2021-09-15
+    /// TMIA   2021-09-16                 2021-09-20
+    /// TSJU   2020-08-10                 2022-08-10
+    /// ```
+    ///
+    /// Five sites were already corrected on the day `TORD` was not, and `TMIA`
+    /// was still writing thousandths five days *after* the date `TORD` suggests
+    /// — so a rule that read "before 2021-09-15" would mis-read `TMIA`'s
+    /// 2021-09-16 volume in one direction and nothing in the other. The
+    /// timestamp is not the flag, and neither is anything else structural: see
+    /// [`states_thousandths`](Self::states_thousandths) for the field-by-field
+    /// comparison that says so.
+    ///
+    /// So this returns degrees for both, converting only a block that
+    /// [`states_thousandths`](Self::states_thousandths) recognises. That
+    /// predicate cannot fire on a value the ICD's own range admits, which is
+    /// what makes every conforming volume byte-for-byte what it was; it cannot
+    /// fire on a block no terminal radar would have written; and it does not
+    /// rescue a pair that is merely wrong, which stays out of range for the
+    /// caller to refuse.
     pub fn latitude_raw(&self) -> f32 {
         self.position_degrees().0
     }
@@ -171,6 +202,67 @@ impl<'a> VolumeDataBlock<'a> {
         }
     }
 
+    /// Whether this block is one the thousandths-writing producer wrote.
+    ///
+    /// # Why this is not only a test on the numbers
+    ///
+    /// [`pair_reads_as_thousandths`] asks whether a pair *could* be
+    /// thousandths, and a pair that could be is not a pair that is. `(100.0,
+    /// -100.0)` is not a position, both halves are integers, and a thousandth
+    /// of it — `(0.1, -0.1)` — is a position in the Gulf of Guinea. Two bytes
+    /// of damage in a coordinate therefore used to *become* a coordinate, and
+    /// one that outranks the site catalogue and is then persisted. So the
+    /// numeric reading has to be accompanied by something corrupt coordinates
+    /// cannot forge: a fact about the block that says *which producer wrote
+    /// it*.
+    ///
+    /// # What the archive offers, and what it does not
+    ///
+    /// **There is no structural signal for the era.** A pre-correction TDWR
+    /// volume and a post-correction one from the same radar are byte-identical
+    /// outside the two coordinates — checked field by field over the 7 terminal
+    /// radars that have volumes on both 2021-09-14 and 2021-09-15, and over 93
+    /// TDWR volumes from 9 sites between 2020 and 2026. The volume header, both
+    /// metadata messages, the Message 31 data header, the pointer table, and
+    /// the ELV and RAD blocks all compare equal; only the timestamps, the
+    /// weather, and `Lat`/`Long` differ. See
+    /// [`latitude_raw`](Self::latitude_raw) for the rollout that rules the date
+    /// out as well.
+    ///
+    /// What the archive does offer is a signal for the **instrument**, and
+    /// since the terminal producer is the only one that ever wrote thousandths,
+    /// that is the fact worth requiring:
+    ///
+    /// * **the 40-byte block** ([`is_legacy`](Self::is_legacy)). Every volume
+    ///   ever observed in thousandths is one. A WSR-88D's block expanded to 48
+    ///   bytes at Build 20.0 and a TDWR's never did, so requiring the short
+    ///   block costs a terminal radar nothing and puts the entire current
+    ///   WSR-88D fleet permanently out of reach of this branch.
+    /// * **one height stated twice**. A TDWR volume reports `tower_height`
+    ///   byte-identical to `site_height` and no WSR-88D volume does — the
+    ///   correspondence this crate's consumers already tell the two instruments
+    ///   apart by, exact over the 205 volumes that built the site table and
+    ///   over the 170 read for this. The nearest misses were checked rather
+    ///   than assumed: the 6 WSR-88D whose published elevation equals a
+    ///   standard tower height are `KJAX` 19/29, `KTLH` 19/34, `PAKC` 19/24,
+    ///   `KCRP` 14/29 and `KLTX` 20/24, none of them equal.
+    ///
+    /// # What this still cannot do
+    ///
+    /// Narrow the door; not shut it. Damage confined to the two coordinates of
+    /// a genuine TDWR block still satisfies every condition here, and so would
+    /// a producer that wrote *hundredths* — `(4180, -8786)` is integral, out of
+    /// range, and a thousandth of it is a place. Neither is a question this
+    /// block can answer about itself, and both are refused a rung up, where a
+    /// position can be held against a source outside the volume. See
+    /// `rustdar_radar::types::ScanInfo::from_scan`.
+    fn states_thousandths(&self) -> bool {
+        let (lat, lon) = self.stated_position();
+        self.is_legacy()
+            && i32::from(self.site_height_raw()) == i32::from(self.tower_height_raw())
+            && pair_reads_as_thousandths(lat, lon)
+    }
+
     /// The stated pair in degrees, whichever of the two scales it is in.
     ///
     /// One function for both coordinates because the scale is a property of the
@@ -180,7 +272,7 @@ impl<'a> VolumeDataBlock<'a> {
     /// itself and land the radar in a place neither reading names.
     fn position_degrees(&self) -> (f32, f32) {
         let (lat, lon) = self.stated_position();
-        if states_thousandths(lat, lon) {
+        if self.states_thousandths() {
             (lat / THOUSANDTHS_PER_DEGREE, lon / THOUSANDTHS_PER_DEGREE)
         } else {
             (lat, lon)
