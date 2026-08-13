@@ -3,30 +3,76 @@
 //!
 //! # What is implemented, and from which documents
 //!
-//! **Flow** — ORPG man pages `hrvil(1)` and `hrvil(4)` (task `cpc014/tsk010`,
-//! High Resolution VIL), from the WSR-88D CODE distribution: per 1° × 1 km
-//! polar gate, a *partial VIL* is computed for each elevation and summed as
-//! the volume completes; the total is the product. The HRVIL task's own
-//! source is not in any public CODE distribution (the same closed `cpc014`
-//! family as HREET), so the arithmetic below is the legacy VIL/Echo Tops
-//! task's (`cpc013/tsk001`), which the man page describes HRVIL as applying
-//! per radial gate instead of per 4 km × 4 km box.
+//! **The governing document is FMH-11 Part C § 3.2.6**, "Digital High
+//! Resolution Vertically Integrated Liquid Water" (Federal Meteorological
+//! Handbook No. 11, *WSR-88D Products and Algorithms*, FCM-H11C-2017, OFCM,
+//! October 2017, pp. 3-13 – 3-14). It is the specification this module was
+//! missing for a long time, and finding it closed the multiplicative deficit
+//! recorded below. Every convention here is now quoted from it rather than
+//! inferred from the legacy task or arbitrated from twins.
 //!
-//! **Liquid water** — Greene & Clark (1972), computed in floating point and
-//! capped at 56 dBZ:
+//! **Flow** — ORPG man pages `hrvil(1)` and `hrvil(4)` (task `cpc014/tsk010`,
+//! High Resolution VIL): per 1° × 1 km polar gate, a *partial VIL* is
+//! computed for each elevation and summed as the volume completes; the total
+//! is the product. The HRVIL task's own source is in no public CODE
+//! distribution and will not be — see "Why the source is unobtainable" below
+//! — so the arithmetic is FMH-11's, cross-checked against the legacy VIL/Echo
+//! Tops task (`cpc013/tsk001`), whose source *is* public and which FMH-11
+//! says DVL's partial VIL matches except in two named respects.
+//!
+//! **Cell statistic** — the largest sub-gate, [`CellStat::Max`]. FMH-11
+//! § 3.2.6, verbatim:
+//!
+//! > Each column is populated by a set of range gate sample volumes from each
+//! > intersected elevation tilt plane of the radar volume. The DVL determines
+//! > the partial VIL contribution from each intersected elevation tilt plane
+//! > of the column by **selecting the range gate sample volume with the
+//! > largest reflectivity factor**, converting it to equivalent liquid water,
+//! > and vertically integrating through the depth of the range gate sample
+//! > volume.
+//!
+//! The legacy Fortran does the same thing in its own 4 km × 4 km box, and it
+//! is worth reading because it is the one piece of this algorithm family whose
+//! source is public. `a313g1.ftn`'s `A313G1__CART_MAP1` keeps a running
+//! `MXLIQWAT` per box and **assigns** — never accumulates — the partial VIL:
 //!
 //! ```text
-//! LW = 3.44e-3 · Z^(4/7)   g/m³,   Z = 10^(dBZ/10),   dBZ ≤ 56
+//! IF (LIQWAT(NBIN) .GT. MXLIQWAT(IH(W),JH(W))) THEN
+//!   MXLIQWAT(IH(W),JH(W))=LIQWAT(NBIN)
+//!   PTLVIL(IH(W),JH(W)) = FLOAT(LIQWAT(NBIN))*BEAM_DEPTH(NBIN)
+//! END IF
 //! ```
+//!
+//! So max-in-cell is the VIL family's convention in both the specification and
+//! the only implementation of it anyone can read.
+//!
+//! **Liquid water** — Greene & Clark (1972), floating point, **uncapped**:
+//!
+//! ```text
+//! LW = 3.44e-3 · Z^(4/7)   g/m³,   Z = 10^(dBZ/10)
+//! ```
+//!
+//! FMH-11 § 3.2.6 again: DVL's partial VIL "is the same as that done for the
+//! VIL Algorithm except that DVL uses **non-quantized** reflectivity factor
+//! data and includes the conversion to VIL of reflectivity factor **below 18
+//! dBZ threshold and above the greater dBZ (i.e., all reflectivity used)**."
+//! That sentence settles three things at once, and all three were previously
+//! open questions arbitrated from twins:
+//!
+//! * *non-quantized* → the unfloored analytic form, not the `A313B1` table;
+//! * *below 18 dBZ included* → no participation gate;
+//! * *above the greater dBZ* → **no 56 dBZ hail cap**.
 //!
 //! The legacy task reads the `A313B1` look-up table (`a313.inc`) instead —
 //! verified here entry for entry to be this formula **floored at hundredths
-//! of g/m³** and saturated at 5.40 from data level 178 (56.0 dBZ) up — but
-//! the twin survey arbitrates decisively for the unfloored form: product
-//! 134's linear region steps by 0.011 kg/m², the table's floor biases every
-//! weak-echo column a level or more low, and switching to floating point
+//! of g/m³** and saturated at 5.40 from data level 178 (56.0 dBZ) up. That
+//! floor and that saturation are the *legacy 16-level product's*, and the twin
+//! survey independently reached FMH-11's answer before FMH-11 was found:
+//! product 134's linear region steps by 0.011 kg/m², the table's floor biases
+//! every weak-echo column a level or more low, and switching to floating point
 //! moved within-±1 by 30–40 points at half the surveyed sites. The floored
-//! table stays as the harness's `TableFloor` A/B variant.
+//! table stays as the harness's `TableFloor` A/B variant, which is now
+//! precisely what it should be: a model of the *legacy* product.
 //!
 //! **Threshold** — none in the primary. The legacy task gates every sample
 //! on `min_refl` 18.3 dBZ (`vil_echo_tops.alg`; `IREFMIN = NINT(2·18.3 +
@@ -85,30 +131,58 @@
 //!   and other artifacts, the raw derivation defines more bins than the
 //!   twin, and carries returns in them the RPG deleted; the harness's
 //!   presence-disagreement gate is what measures that.
-//! * **Cell statistic**: settled against the ORPG source, not inferred.
-//!   `combine_radials.c` (`cpc004/tsk009`, the `recomb` task) recombines
-//!   super-resolution reflectivity to 1° × 1 km by a **linear-Z mean** in
-//!   both axes — `Combine_range` accumulates `Get_z` over four 0.25 km
-//!   gates and quantizes `ZNUM · .25`, `Combine_azi` writes
-//!   `(Get_z(z1) + Get_z(z2)) · .5` over the two 0.5° radials — and
-//!   `product_attr_table` gives COMBBASE (96) `gen_task recomb`, which is
-//!   `dqa(1)`'s input and therefore HRVIL's. So [`CellStat::LinearZMean`]
-//!   is the RPG's own statistic and is the primary for cause, not by
-//!   arbitration.
-//!
-//!   **`Max` must not be adopted here even though an A/B will favour it.**
-//!   Measured 2026-08-13 at KFTG against the RPG's own published N0B
-//!   recombined by the rule above: this module's grid sits **−0.66 dB**
-//!   from it, [`CellStat::Max`] **+1.39 dB** above it. `Max` moves the
-//!   VIL ratio below from ~0.70 to ~1.00 purely by adding ~2 dB the RPG
-//!   does not have — the exact shape of a tuning constant, and the source
-//!   refutes it. This also settles the cross-cutting inconsistency with
-//!   [`crate::eet`]'s `Max`: the disagreement is real, and `vil.rs` has
-//!   the side the RPG is on.
 //! * **Elevation angles**: the RPG builds its depth table from the VCP's
 //!   nominal angles in tenths of degrees; here each sweep's measured median
 //!   elevation is used (the antenna's real ladder, within a few hundredths
 //!   of a degree of nominal).
+//!
+//! # The `LinearZMean` error, and why it looked so well-founded
+//!
+//! This module shipped [`CellStat::LinearZMean`] as its primary for months,
+//! with a paragraph asserting that [`CellStat::Max`] "must not be adopted
+//! here even though an A/B will favour it". That paragraph was wrong, and the
+//! way it was wrong is worth keeping, because the reasoning was sound and the
+//! premise was not.
+//!
+//! The argument ran: `combine_radials.c` (`cpc004/tsk009`, the `recomb` task)
+//! recombines super-resolution reflectivity to 1° × 1 km by a **linear-Z
+//! mean** in both axes — `Combine_range` accumulates `Get_z` over four 0.25 km
+//! gates, `Combine_azi` writes `(Get_z(z1) + Get_z(z2)) · .5` over the two
+//! 0.5° radials — and `product_attr_table` gives COMBBASE (96) `gen_task
+//! recomb`, which is `dqa(1)`'s input and therefore HRVIL's. Therefore the
+//! RPG's own statistic is a linear-Z mean, and `Max`'s ~2 dB is "2 dB the RPG
+//! does not have".
+//!
+//! Every clause of that is true and the conclusion still does not follow. It
+//! conflates two different stages:
+//!
+//! * how the **base data** is recombined from super-resolution — a linear-Z
+//!   mean, `combine_radials.c`, correctly read; and
+//! * how the **VIL algorithm** picks which sample volume in its cell
+//!   contributes — the largest, `a313g1.ftn` and FMH-11 § 3.2.6.
+//!
+//! The second is applied *on top of* the first, and it is the one this
+//! module's `stat` knob models. Reading the recombination rule as the answer
+//! to the cell-statistic question is the whole of the mistake. A linear-Z mean
+//! appears nowhere in the VIL algorithm family; a max appears in both the
+//! specification and the legacy source.
+//!
+//! [`crate::eet`] was on the correct side throughout, and the "cross-cutting
+//! inconsistency" this module used to record against it was this module's own.
+//! FMH-11 gives EET (§ 3.2.3) and DVL (§ 3.2.6) a word-for-word identical DQA
+//! preamble and the same column model, and EET's rule — any sample volume in
+//! the column meeting the threshold sets the top — is max semantics too.
+//!
+//! Two independent measurements agree with the specification. [`crate::eet`]'s
+//! own survey against the RPG's product 135 (186,102 bins, seven sites) scores
+//! `Max` at **70.6%** within 1 kft against **59.3%** for a linear-Z mean on the
+//! range axis and **60.0%** on both axes; and its values-blind footprint is
+//! blunter still — under the mean the RPG defines **5,309 bins at KFTG that the
+//! derivation does not**, against 68 the other way. The RPG has echo where a
+//! 1 km × 1° linear-Z mean has none, which is what selecting the largest
+//! sub-gate does and what averaging it away cannot. That survey also found
+//! `Combine_azi` is **never called**, so the "linear-Z mean in *both* axes"
+//! half of the old premise described a routine that does not run.
 //!
 //! # Validation status — read before trusting the twin harness to pass
 //!
@@ -238,30 +312,76 @@
 //!   **floored** and saturated at 5.40 g/m³ — strictly ≤ the unfloored form
 //!   used here, so the RPG's documented mapping can only make a derivation
 //!   *smaller*, never 1.4× larger.
-//! * **The reflectivity cap** — `viletalg.doc` truncates above 55 dBZ and
-//!   `A313B1` saturates from data level 178 (56.0 dBZ). Capping is the RPG's
-//!   behaviour, so it cannot be the cause; it is only the reason the deficit
-//!   *worsens* above 40 kg/m² (KFTG 0.572 capped against 0.722 uncapped).
-//!   Removing the cap would be unfaithful and would still not reach 1.0.
+//! * **The reflectivity cap** — this bullet used to read "capping is the
+//!   RPG's behaviour, so it cannot be the cause", citing `viletalg.doc`'s
+//!   truncation above 55 dBZ and `A313B1`'s saturation from data level 178.
+//!   Both citations are to the **legacy** task. FMH-11 § 3.2.6 says DVL
+//!   converts reflectivity "above the greater dBZ (i.e., all reflectivity
+//!   used)", so the cap was never product 134's and has been removed. It was
+//!   worth ~0.15 of ratio in hail cores on its own (KFTG 0.572 capped against
+//!   0.722 uncapped) and nothing at all below 56 dBZ, which is why it could
+//!   never have explained a deficit that is flat in max dBZ.
 //! * **The codec** — MetPy's product-134 LUT reproduces the ORPG's own
 //!   `decode_VIL` (`cpc013/tsk007/ptype_read_VIL.c`: `(s−2)/90.66` below
 //!   level 20, `exp((s−83.9028)/38.8763)` above) to **0.08%** across the
 //!   whole range, so the oracle's values are real, including its 79.5 kg/m²
-//!   maxima against this module's 68.9.
-//! * **The cell statistic** — settled from `combine_radials.c`; see the
-//!   bullet above. `Max` closes the ratio and is wrong.
+//!   maxima against this module's 68.9. This one still stands.
 //!
-//! **What is left, stated as an open defect rather than papered over.** A
-//! ~1.33× scale on the integrand, exponent-independent and geometry-
-//! independent, that nothing in the public ORPG drop accounts for. The
-//! decisive file is not in it: `hiresvil` is `cpc014/tsk010`, and `cpc014`
-//! ships `tsk001`–`tsk017` **without** `tsk010`, so `hrvil_compute_vil`'s
-//! arithmetic is unavailable and the man pages (`hrvil(1)`, `hrvil(4)`)
-//! describe only the flow. **No coefficient was introduced to close this.**
-//! A constant that made the ratio 1.0 without a mechanism would be worse
-//! than the documented gap, because it would silently mis-scale every
-//! derived consumer — the hail SHI column above all — the moment the real
-//! cause turned out to be something else.
+//! # What it was: the cell statistic, and the arithmetic that confirms it
+//!
+//! The ~1.33× was [`CellStat::LinearZMean`]. FMH-11 § 3.2.6 specifies the
+//! largest sub-gate, `a313g1.ftn` implements the largest sub-gate, and the
+//! magnitude checks out to better than a twentieth of a dB:
+//!
+//! Measured 2026-08-13 at KFTG against the RPG's own published N0B, this
+//! module's `LinearZMean` grid sat **−0.66 dB** from it and [`CellStat::Max`]
+//! **+1.39 dB** above it — a **2.05 dB** separation between the two statistics.
+//! Greene–Clark turns dB into liquid water as `10^(ΔdB · 4/70)`, so:
+//!
+//! ```text
+//! predicted  10^(2.05 · 4/70) = 1.310
+//! required   1 / 0.751         = 1.331     (0.03 dB apart)
+//! ```
+//!
+//! A mechanism that lands within 0.03 dB of a deficit measured over 78,051
+//! columns is not a coincidence, and three further things fall out of it that
+//! a bare coefficient could never have explained:
+//!
+//! * **Flatness.** The max-minus-mean gap is a property of sub-cell
+//!   reflectivity *texture*. It has no reason to vary with range, column
+//!   depth, max dBZ, beam height or the share of VIL in the lowest tilt — and
+//!   the survey found it varying with none of them. A geometry or units error
+//!   would have bent against at least one.
+//! * **The per-site spread**, which was the one fact the constant theory could
+//!   not hold. The ratio ran 0.563 at KMLB to 1.012 at KMSX. A constant cannot
+//!   do that; a max-minus-mean gap must, and in exactly that order — deep
+//!   tropical convection has the sharpest sub-cell gradients and the widest
+//!   gap, a smooth mountain-west volume has almost none and needs almost no
+//!   correction.
+//! * **The A/B that kept favouring `Max`.** The bounded matrix split 15/21 for
+//!   `Max` with its only large wins at the two deepest-convection sites. That
+//!   was read as noise plus two outliers. It was the effect, concentrated
+//!   where the mechanism predicts it is largest.
+//!
+//! **What is still owed.** The nine-site band-by-band ratio table has **not**
+//! been re-measured with this fix. The live harness lives on branch
+//! `campaign-harness`, which has diverged substantially from main, and the
+//! original survey ran against live volumes on a sky that no longer exists, so
+//! the same 78,051 columns are not reproducible on demand. The figures above
+//! are the module's own prior measurements re-interpreted, not a fresh run.
+//! Re-running it is the next step, and until it has run this section states a
+//! mechanism with an arithmetic check behind it rather than a verified 1.00.
+//!
+//! # Why the source is unobtainable, stated once so nobody looks again
+//!
+//! `hiresvil` is `cpc014/tsk010` and the public Build 21.0r1.7 CODE drop ships
+//! `tsk001`–`tsk017` **without** it. This is not an oversight in one release:
+//! `cpc014/tsk012` (`hireseet`, product 135's task) is absent from the same
+//! drop, and the high-resolution product family is MIT Lincoln Laboratory work
+//! that is stripped from every public CODE edition as a matter of policy. No
+//! build, mirror or archive carries it, and none will. `hrvil_compute_vil.c`
+//! is not a file that can be found; FMH-11 Part C is the substitute, and for
+//! this algorithm it turned out to be a sufficient one.
 //!
 //! # VIL density — measured 2026-07-29, and the local derivation retired
 //!
@@ -509,7 +629,9 @@ pub const VIL_MIN_REFL_DBZ: f32 = 18.3;
 const GREENE_CLARK_COEFF: f64 = 3.44e-3;
 
 /// The `A313B1` table's saturation value, hundredths of g/m³: every data
-/// level from 178 (56.0 dBZ) up maps to 540 — the product's 56 dBZ hail cap.
+/// level from 178 (56.0 dBZ) up maps to 540. This is the **legacy** 16-level
+/// product's hail cap and belongs only to [`LwMapping::TableFloor`], which
+/// models it; product 134 uses all reflectivity (FMH-11 Part C § 3.2.6).
 const LW_CAP_HUNDREDTHS: f64 = 540.0;
 
 /// `A313T1__COMPUTE_DEPTH`'s hardcoded beamwidth, **radians** (`BW = .017`):
@@ -531,11 +653,15 @@ enum LwMapping {
     /// and the offline tests construct it, so the lib build sees it dead.
     #[cfg_attr(not(test), allow(dead_code))]
     TableFloor,
-    /// Greene–Clark in floating point, capped at 56 dBZ's own 5.452 g/m³.
-    /// The primary: against live product-134 twins the floored table reads
-    /// a systematic level low across the LUT's 0.011 kg/m² linear region —
-    /// 30–40 points of within-±1 at some sites — so HRVIL's C code
-    /// (`hrvil_compute_vil`, not public) evidently computes unfloored.
+    /// Greene–Clark in floating point over the **whole** dBZ range — no
+    /// floor and no 56 dBZ hail cap. The primary, and both halves of that
+    /// are specified: FMH-11 Part C § 3.2.6 has DVL using "non-quantized
+    /// reflectivity factor data" and converting reflectivity "below 18 dBZ
+    /// threshold and above the greater dBZ (i.e., all reflectivity used)".
+    /// The floor and the cap are the *legacy* 16-level product's, and live
+    /// twins agree: the floored table reads a systematic level low across
+    /// the LUT's 0.011 kg/m² linear region, 30–40 points of within-±1 at
+    /// some sites.
     Analytic,
 }
 
@@ -563,13 +689,14 @@ struct VilOptions {
 }
 
 impl VilOptions {
-    /// The primary: linear-Z recombination, floating-point Greene–Clark,
-    /// depths at the outer bin edge, no participation gate, every
-    /// data-carrying column defined — see the module doc's validation
-    /// section for how each choice was arbitrated against live twins.
+    /// The primary: the largest sub-gate in the cell, floating-point
+    /// Greene–Clark, depths at the outer bin edge, no participation gate,
+    /// every data-carrying column defined. Every one of these is now the
+    /// **specified** convention — FMH-11 Part C § 3.2.6, quoted in the
+    /// module doc — rather than a twin arbitration.
     const fn primary() -> Self {
         Self {
-            stat: CellStat::LinearZMean,
+            stat: CellStat::Max,
             lw: LwMapping::Analytic,
             depth_at_centre: false,
             min_refl: None,
@@ -597,7 +724,7 @@ fn liquid_water_g_m3(dbz: f32, mapping: LwMapping) -> f64 {
     let lw = GREENE_CLARK_COEFF * 10f64.powf(f64::from(dbz) * 4.0 / 70.0);
     match mapping {
         LwMapping::TableFloor => (lw * 100.0).floor().min(LW_CAP_HUNDREDTHS) / 100.0,
-        LwMapping::Analytic => lw.min(GREENE_CLARK_COEFF * 10f64.powf(56.0 * 4.0 / 70.0)),
+        LwMapping::Analytic => lw,
     }
 }
 
@@ -839,8 +966,9 @@ mod tests {
     /// 0.597664238 / 0.541292613 / 0.541622832 / 0.402838053 km (Σd =
     /// 2.083418), and the unfloored LWs are 2.4757187 (50 dBZ), 0.66416
     /// (40), 0.1781739 (30), 0.0922847 (25), 0.0477986 (20), 0.0247572
-    /// (15), 0.0128229 (10), 0.0066416 (5), 5.4520326 (56 and above),
-    /// 5.1048974 (55.5) g/m³:
+    /// (15), 0.0128229 (10), 0.0066416 (5), 9.2284735 (60), 5.4520326 (56),
+    /// 5.1048974 (55.5) g/m³ — the mapping is uncapped, so 60 dBZ is its own
+    /// value and not 56's:
     ///
     /// * az 10: LW(50) · Σd = **5.157956** kg/m²;
     /// * az 20: Σ LWᵢ·dᵢ over 40/30/20/10 = **0.524443**;
@@ -848,10 +976,10 @@ mod tests {
     /// * az 40: LW(15) · Σd = **0.051580**;
     /// * az 45: LW(5) · Σd = **0.013837** — no zero floor in the primary
     ///   mapping;
-    /// * az 60 and 61: 5.4520326·d₀ = **3.258485** — the 56 dBZ cap makes
-    ///   60 dBZ and 56 dBZ indistinguishable;
-    /// * az 62: 5.1048974·d₀ = **3.051015** — half a dB under the cap is
-    ///   its own value.
+    /// * az 60: 9.2284735·d₀ = **5.515529**, and az 61: 5.4520326·d₀ =
+    ///   **3.258485** — with no hail truncation, 60 dBZ and 56 dBZ are
+    ///   distinguishable, which under the old cap they were not;
+    /// * az 62: 5.1048974·d₀ = **3.051015**.
     #[test]
     fn the_documented_rpg_rules_produce_hand_computed_vil() {
         let grid = compute_vil(&golden_scan());
@@ -888,11 +1016,17 @@ mod tests {
         assert!(grid.values[50][r].is_nan(), "a censored column made VIL");
         assert!(grid.values[10][GATES].is_nan(), "beyond the data extent");
 
-        assert_eq!(
-            grid.values[60][r], grid.values[61][r],
-            "60 dBZ and 56 dBZ must both read the capped 5.452 g/m³",
+        // No cap: 60 dBZ must now out-run 56 dBZ rather than tie with it.
+        // This is the pin that fails if the legacy hail truncation is ever
+        // reintroduced into the primary mapping.
+        assert!(
+            grid.values[60][r] > grid.values[61][r],
+            "the 56 dBZ cap is gone: 60 dBZ ({}) must exceed 56 dBZ ({})",
+            grid.values[60][r],
+            grid.values[61][r],
         );
-        assert!((grid.values[60][r] - 3.258_485).abs() < 1e-4);
+        assert!((grid.values[60][r] - 5.515_529).abs() < 1e-4);
+        assert!((grid.values[61][r] - 3.258_485).abs() < 1e-4);
         assert!(
             (grid.values[62][r] - 3.051_015).abs() < 1e-4,
             "55.5 dBZ sits under the cap at its own value: got {}",
@@ -958,10 +1092,24 @@ mod tests {
                 "LWC({byte}) = {got}, table says {hundredths}",
             );
         }
-        // The analytic variant is unfloored and caps at 56 dBZ's own value.
-        let analytic_cap = liquid_water_g_m3(94.0, LwMapping::Analytic);
-        assert!((analytic_cap - 5.452_032_582).abs() < 1e-6);
-        assert!(analytic_cap > liquid_water_g_m3(94.0, LwMapping::TableFloor));
+        // The analytic variant is unfloored and **uncapped**: FMH-11 Part C
+        // § 3.2.6 has DVL converting reflectivity "above the greater dBZ
+        // (i.e., all reflectivity used)", so 94 dBZ keeps rising past the
+        // legacy table's 5.40 saturation instead of stopping at 56 dBZ's
+        // 5.452. Greene–Clark at 94 dBZ: 3.44e-3 · 10^(94·4/70).
+        let analytic_94 = liquid_water_g_m3(94.0, LwMapping::Analytic);
+        assert!(
+            (analytic_94 - 809.071_706_464).abs() < 1e-6,
+            "uncapped Greene-Clark at 94 dBZ: got {analytic_94}",
+        );
+        // 56 dBZ is no longer a ceiling, only a point on the curve.
+        let analytic_56 = liquid_water_g_m3(56.0, LwMapping::Analytic);
+        assert!((analytic_56 - 5.452_032_582).abs() < 1e-6);
+        assert!(
+            analytic_94 > analytic_56,
+            "the cap is gone: 94 dBZ must exceed 56 dBZ",
+        );
+        assert!(analytic_94 > liquid_water_g_m3(94.0, LwMapping::TableFloor));
     }
 
     /// `A313T1__COMPUTE_DEPTH`'s three cases against hand-computed depths at
@@ -1083,5 +1231,116 @@ mod tests {
         // Uninvolved cells agree bit for bit: NaN everywhere else.
         assert!(primary.values[11][r].is_nan());
         assert!(table.values[11][r].is_nan());
+    }
+
+    /// Every convention of the primary is the one FMH-11 Part C § 3.2.6
+    /// specifies, and this is the pin that fails if one drifts back.
+    ///
+    /// Each was previously arbitrated from live twins and each is now
+    /// quoted: the cell statistic from "selecting the range gate sample
+    /// volume with the largest reflectivity factor"; the other three from
+    /// "DVL uses non-quantized reflectivity factor data and includes the
+    /// conversion to VIL of reflectivity factor below 18 dBZ threshold and
+    /// above the greater dBZ (i.e., all reflectivity used)".
+    #[test]
+    fn the_primary_conventions_are_the_ones_fmh11_specifies() {
+        let p = VilOptions::primary();
+        assert_eq!(
+            p.stat,
+            CellStat::Max,
+            "FMH-11 § 3.2.6 selects the largest sample volume in the cell; \
+             a linear-Z mean is the base-data recombination, not the VIL \
+             algorithm's statistic, and reading it as one cost a flat 0.751",
+        );
+        assert_eq!(
+            p.lw,
+            LwMapping::Analytic,
+            "'non-quantized' rules out the floored A313B1 table",
+        );
+        assert!(
+            p.min_refl.is_none(),
+            "'below 18 dBZ threshold ... included' rules out IREFMIN",
+        );
+        assert!(
+            !p.echo_only,
+            "product 134 defines every data-carrying column",
+        );
+        // The mapping carries no ceiling: 'above the greater dBZ' means the
+        // legacy 56 dBZ hail truncation is not product 134's.
+        assert!(
+            liquid_water_g_m3(70.0, LwMapping::Analytic)
+                > liquid_water_g_m3(56.0, LwMapping::Analytic),
+            "the primary mapping must not truncate at 56 dBZ",
+        );
+    }
+
+    /// The mechanism, demonstrated: a 1° × 1 km cell holding four 250 m
+    /// sub-gates reads its **peak**, not their linear-Z mean.
+    ///
+    /// This is what the 0.751 was. The sub-gates here are 20/20/20/50 dBZ,
+    /// a single hot gate in an otherwise weak cell — the sharp-gradient case
+    /// that deep convection supplies and a smooth stratiform volume does
+    /// not, which is why the deficit ran 0.563 at KMLB and 1.012 at KMSX.
+    #[test]
+    fn a_textured_cell_reads_its_largest_sub_gate() {
+        const SUB: usize = 4;
+        let byte = |dbz: f64| ((dbz * f64::from(SCALE) + f64::from(OFFSET)).round() as i64) as u8;
+        // 250 m gates: four per 1 km cell. Cell 0 is 20/20/20/50 dBZ.
+        let gates: Vec<u8> = vec![byte(20.0), byte(20.0), byte(20.0), byte(50.0)];
+        let radials = (0..360)
+            .map(|i| {
+                Radial::new(
+                    0,
+                    i as u16,
+                    i as f32 + 0.5,
+                    1.0,
+                    RadialStatus::IntermediateRadialData,
+                    1,
+                    0.5,
+                    Some(MomentData::from_fixed_point(
+                        SUB as u16,
+                        0,
+                        250,
+                        8,
+                        SCALE,
+                        OFFSET,
+                        gates.clone(),
+                    )),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            })
+            .collect();
+        let scan = Scan::new(vcp(), vec![Sweep::new(1, radials)]);
+
+        let peak = compute_vil_impl(&scan, VilOptions::primary());
+        let mean = compute_vil_impl(
+            &scan,
+            VilOptions {
+                stat: CellStat::LinearZMean,
+                ..VilOptions::primary()
+            },
+        );
+
+        let (p, m) = (peak.values[0][0], mean.values[0][0]);
+        assert!(p.is_finite() && m.is_finite(), "cell 0 must be defined");
+        assert!(
+            p > m,
+            "the largest sub-gate must beat their linear-Z mean: {p} vs {m}",
+        );
+        // Depth is common to both arms, so the ratio is purely the
+        // statistic: LW(50 dBZ) against LW of the mean of 10^2,10^2,10^2,10^5.
+        let z_mean = (3.0 * 10f64.powf(2.0) + 10f64.powf(5.0)) / 4.0;
+        let expected = liquid_water_g_m3(50.0, LwMapping::Analytic)
+            / liquid_water_g_m3(10.0 * z_mean.log10() as f32, LwMapping::Analytic);
+        let ratio = f64::from(p) / f64::from(m);
+        assert!(
+            (ratio - expected).abs() < 1e-3,
+            "ratio {ratio} should be the pure LW ratio {expected}",
+        );
     }
 }
