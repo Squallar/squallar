@@ -6069,6 +6069,81 @@ fn harness_requesting_overlays() -> InputHarness {
     h
 }
 
+/// A 2D overlay is planned in **physical pixels**, so a display at two of them
+/// per point gets twice the texels per axis and not the same texture stretched
+/// over twice the pixels.
+///
+/// **Run at 2x deliberately, and the fixture is checked at 1x first.** At the
+/// harness's default scale points and pixels are the same number, so an
+/// assertion about pixels passes whether the production code multiplies or not
+/// — the same trap `the_painter_is_told_the_pane_size_in_physical_pixels`
+/// records for the 3D arm, and the reason `InputHarness::set_pixels_per_point`
+/// exists. Two sites in this workspace multiplied by `pixels_per_point` before
+/// allocating and both were 3D; the 2D path sized itself from `ui.max_rect()`
+/// in points and consulted no display density anywhere.
+///
+/// The consequence was measured on a real second device rather than argued: a
+/// Chrome window on an AMD 890M at `devicePixelRatio` 2, whose 1376x755 CSS
+/// canvas has a 2752x1510 backing store. The framebuffer the overlay is
+/// composited into was HiDPI and the overlay was not, so every overlay texel
+/// covered a 2x2 block of physical pixels.
+///
+/// Both directions are pinned. Asserting only that 2x is larger would pass a
+/// build that multiplied twice, which would ask a phone browser for four times
+/// the texels it can afford and cost it the whole overdraw band.
+#[test]
+fn a_hidpi_pane_plans_its_overlay_in_physical_pixels_not_points() {
+    let mut h = harness_requesting_overlays();
+    // A limit neither run can reach, so what this test measures is the density
+    // and not the clamp. Left at the harness's own 2048 the 2x run spends the
+    // whole limit on the viewport, gives up its overdraw to do it, and lands on
+    // 2048 — which is correct behaviour and says nothing about the doubling.
+    h.set_max_texture_side(16384);
+    let at_1x = requested_plans(&h);
+    assert!(
+        !at_1x.is_empty(),
+        "fixture must actually reach the render path — no RenderOverlay was emitted",
+    );
+    for plan in &at_1x {
+        assert_eq!(
+            plan.pixels_per_point, 1.0,
+            "the harness starts unscaled, which is what makes the 2x run mean \
+             something",
+        );
+    }
+
+    h.set_pixels_per_point(2.0);
+    h.frames_for(2, FRAME_DT);
+    let at_2x = requested_plans(&h);
+    assert_eq!(
+        at_2x.len(),
+        at_1x.len(),
+        "the same overlays must still be requested at 2x",
+    );
+
+    for (one, two) in at_1x.iter().zip(&at_2x) {
+        assert_eq!(
+            two.pixels_per_point, 2.0,
+            "the plan must carry the density it was sized at, or the rasterizer \
+             draws every marker at half size",
+        );
+        // The pane occupies the same *points* at either scale, so the texel
+        // counts stand in exactly 2:1. Compared with a one-texel slack because
+        // both sides are a truncating `as u32` of a float, not because the
+        // relationship is approximate.
+        for (axis, a, b) in [
+            ("width", one.width, two.width),
+            ("height", one.height, two.height),
+        ] {
+            assert!(
+                b.abs_diff(a * 2) <= 1,
+                "{axis}: {a} px at 1x became {b} px at 2x, which is not the \
+                 doubling a 2x display asks for",
+            );
+        }
+    }
+}
+
 /// The whole point of the change, exercised through the real UI: the number the
 /// adapter reports reaches `plan_overlay_texture` via `RawInput` and bounds what
 /// the pane asks for. Forcing the limit is how a WebGL2-class device is tested

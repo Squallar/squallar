@@ -6,6 +6,11 @@ use super::*;
 const DESKTOP_LIMIT: u32 = 8192;
 /// WebGL2's guaranteed floor, and the whole reason clamping exists.
 const WEBGL2_LIMIT: u32 = 2048;
+/// A display that is not scaled: one texel per point, which is what every
+/// assertion in this file was written against and what the development box
+/// reports. The HiDPI cases are named for it — see
+/// `a_hidpi_pane_is_planned_in_physical_pixels_not_points`.
+const NO_SCALING: f32 = 1.0;
 
 fn pane(w: f32, h: f32) -> egui::Rect {
     egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(w, h))
@@ -43,6 +48,7 @@ fn plan_with_overdraw(overdraw: f32) -> OverlayTexturePlan {
         width: 1,
         height: 1,
         overdraw,
+        pixels_per_point: NO_SCALING,
     }
 }
 
@@ -135,7 +141,7 @@ fn a_pane_that_would_overflow_the_limit_gives_up_overdraw_instead() {
         "fixture must actually cross the limit: {unclamped} vs {WEBGL2_LIMIT}"
     );
 
-    let plan = plan_overlay_texture(pane(w, 400.0), WEBGL2_LIMIT);
+    let plan = plan_overlay_texture(pane(w, 400.0), WEBGL2_LIMIT, NO_SCALING);
     assert!(
         plan.width <= WEBGL2_LIMIT,
         "width {} exceeds the limit",
@@ -163,7 +169,7 @@ fn a_pane_that_would_overflow_the_limit_gives_up_overdraw_instead() {
 fn a_full_size_browser_pane_stays_within_the_limit() {
     let w = clamped_side(WEBGL2_LIMIT);
     let h = w * 10.0 / 16.0;
-    let plan = plan_overlay_texture(pane(w, h), WEBGL2_LIMIT);
+    let plan = plan_overlay_texture(pane(w, h), WEBGL2_LIMIT, NO_SCALING);
     assert!(plan.width <= WEBGL2_LIMIT && plan.height <= WEBGL2_LIMIT);
     // Width is the binding axis, so it lands on the limit — to within the texel
     // the `as u32` floors off the product.
@@ -184,7 +190,7 @@ fn a_full_size_browser_pane_stays_within_the_limit() {
 fn the_taller_axis_can_be_the_binding_one() {
     let h = clamped_side(WEBGL2_LIMIT);
     let w = h * 10.0 / 35.0;
-    let plan = plan_overlay_texture(pane(w, h), WEBGL2_LIMIT);
+    let plan = plan_overlay_texture(pane(w, h), WEBGL2_LIMIT, NO_SCALING);
     assert!(plan.width <= WEBGL2_LIMIT && plan.height <= WEBGL2_LIMIT);
     assert!(
         plan.height + 1 >= WEBGL2_LIMIT,
@@ -204,7 +210,7 @@ fn a_desktop_adapter_limit_changes_nothing() {
         (2560.0, 1440.0),
         (100.0, 100.0),
     ] {
-        let plan = plan_overlay_texture(pane(w, h), DESKTOP_LIMIT);
+        let plan = plan_overlay_texture(pane(w, h), DESKTOP_LIMIT, NO_SCALING);
         assert_eq!(
             plan.overdraw, OVERDRAW_FRACTION,
             "{w}x{h} should keep the full overdraw on a desktop adapter"
@@ -224,7 +230,7 @@ fn a_pane_wider_than_the_limit_falls_back_to_zero_overdraw() {
         rect.width().min(rect.height()) > WEBGL2_LIMIT as f32,
         "fixture must overflow on both axes for both clamps to be reached"
     );
-    let plan = plan_overlay_texture(rect, WEBGL2_LIMIT);
+    let plan = plan_overlay_texture(rect, WEBGL2_LIMIT, NO_SCALING);
     assert_eq!(plan.overdraw, 0.0, "nothing left to give up");
     assert_eq!(plan.width, WEBGL2_LIMIT);
     assert_eq!(plan.height, WEBGL2_LIMIT);
@@ -234,7 +240,7 @@ fn a_pane_wider_than_the_limit_falls_back_to_zero_overdraw() {
 /// natural size. Clamping both to the limit would stretch the overlay.
 #[test]
 fn only_the_overflowing_axis_is_truncated() {
-    let plan = plan_overlay_texture(pane(3000.0, 900.0), WEBGL2_LIMIT);
+    let plan = plan_overlay_texture(pane(3000.0, 900.0), WEBGL2_LIMIT, NO_SCALING);
     assert_eq!(plan.overdraw, 0.0);
     assert_eq!(
         plan.width, WEBGL2_LIMIT,
@@ -249,7 +255,7 @@ fn only_the_overflowing_axis_is_truncated() {
 /// arithmetic really does stay finite rather than that a guard branch exists.
 #[test]
 fn a_degenerate_pane_produces_a_finite_plan() {
-    let plan = plan_overlay_texture(pane(0.0, 0.0), WEBGL2_LIMIT);
+    let plan = plan_overlay_texture(pane(0.0, 0.0), WEBGL2_LIMIT, NO_SCALING);
     assert!(plan.overdraw.is_finite(), "got {}", plan.overdraw);
     assert_eq!(
         plan.overdraw, OVERDRAW_FRACTION,
@@ -262,7 +268,7 @@ fn a_degenerate_pane_produces_a_finite_plan() {
 /// normally rather than being dragged to zero or to `inf` by its neighbour.
 #[test]
 fn a_pane_with_one_zero_axis_still_sizes_the_other() {
-    let plan = plan_overlay_texture(pane(0.0, 3000.0), WEBGL2_LIMIT);
+    let plan = plan_overlay_texture(pane(0.0, 3000.0), WEBGL2_LIMIT, NO_SCALING);
     assert!(plan.overdraw.is_finite());
     assert_eq!(
         plan.overdraw, 0.0,
@@ -638,7 +644,7 @@ fn the_plans_overdraw_is_what_the_coverage_check_reads_back() {
     let vp = viewport();
     let (lat_range, _) = viewport_ranges();
     let w = clamped_side(WEBGL2_LIMIT);
-    let plan = plan_overlay_texture(pane(w, w * 10.0 / 16.0), WEBGL2_LIMIT);
+    let plan = plan_overlay_texture(pane(w, w * 10.0 / 16.0), WEBGL2_LIMIT, NO_SCALING);
     assert!(
         plan.overdraw < OVERDRAW_FRACTION,
         "fixture must be a clamped one"
@@ -678,7 +684,7 @@ fn the_bounds_grow_by_the_plans_overdraw_not_the_constant() {
     // A pane in the clamped band against WebGL2's floor: the plan has to give
     // overdraw up, and has some left to describe.
     let w = clamped_side(WEBGL2_LIMIT);
-    let plan = plan_overlay_texture(pane(w, w * 10.0 / 16.0), WEBGL2_LIMIT);
+    let plan = plan_overlay_texture(pane(w, w * 10.0 / 16.0), WEBGL2_LIMIT, NO_SCALING);
     assert!(
         plan.overdraw < OVERDRAW_FRACTION,
         "fixture must be a clamped plan, else this test cannot tell the two apart"
@@ -735,4 +741,86 @@ fn latitude_is_clamped_to_the_mercator_range() {
     assert_eq!(bounds.max_lat, MERCATOR_LAT_LIMIT);
     assert_eq!(bounds.min_lat, -MERCATOR_LAT_LIMIT);
     assert_eq!(bounds.min_lon, -10.0 - 20.0 * OVERDRAW_FRACTION as f64);
+}
+
+/// The plan is sized in physical pixels, and where the limit cannot pay for
+/// both it spends them on density before overdraw.
+///
+/// [`plan_overlay_texture`] takes a rect in **points** and a limit in
+/// **texels**, and until the density was a parameter it compared the two
+/// directly — so the texture came out one texel per point and, on a scaled
+/// display, one texel per `ppp²` physical pixels. The `affordable` arithmetic
+/// was weighing a point count against a texel limit at the same time.
+///
+/// The second half is the trade this makes on a device that cannot afford
+/// both, and it is a real cost rather than a free win. A HiDPI pane against the
+/// WebGL2 floor gives its overdraw up to stay sharp, which means re-rendering
+/// on every pan step instead of every third of a viewport. That is the right
+/// way round — a soft overlay is permanent where a frequent re-render is only
+/// slow — but it is asserted here so that it is a decision on the record and
+/// not a surprise. It binds at half the pane width it used to: 1365 points
+/// against a 2048 limit at one texel per point, 683 at two.
+#[test]
+fn a_hidpi_pane_is_planned_in_physical_pixels_not_points() {
+    // Small enough that even at 2x it is nowhere near a desktop limit, so this
+    // half measures density alone.
+    let rect = pane(600.0, 400.0);
+    let unscaled = plan_overlay_texture(rect, DESKTOP_LIMIT, NO_SCALING);
+    let doubled = plan_overlay_texture(rect, DESKTOP_LIMIT, 2.0);
+
+    assert_eq!(doubled.width, unscaled.width * 2);
+    assert_eq!(doubled.height, unscaled.height * 2);
+    assert_eq!(
+        doubled.overdraw, unscaled.overdraw,
+        "with room to spare, density must not have been bought out of overdraw",
+    );
+    assert_eq!(doubled.pixels_per_point, 2.0);
+
+    // Where the limit is the binding constraint, density wins and overdraw is
+    // what pays. `narrowest_clamped` is the width at which one texel per point
+    // first has to give something up; at two texels per point half of it
+    // already does.
+    let tight = pane(narrowest_clamped(WEBGL2_LIMIT) / 2.0 + 1.0, 200.0);
+    let at_1x = plan_overlay_texture(tight, WEBGL2_LIMIT, NO_SCALING);
+    let at_2x = plan_overlay_texture(tight, WEBGL2_LIMIT, 2.0);
+    assert_eq!(
+        at_1x.overdraw, OVERDRAW_FRACTION,
+        "fixture must not be clamped at 1x, or the comparison says nothing",
+    );
+    assert!(
+        at_2x.overdraw < at_1x.overdraw,
+        "a HiDPI pane at the WebGL2 floor must give overdraw up rather than \
+         density: got {} at 2x against {} at 1x",
+        at_2x.overdraw,
+        at_1x.overdraw,
+    );
+    assert!(
+        at_2x.width > at_1x.width,
+        "and it must still be denser for having done so",
+    );
+    assert!(at_2x.width <= WEBGL2_LIMIT && at_2x.height <= WEBGL2_LIMIT);
+}
+
+/// A density that is not a positive number is not a description of a display,
+/// and is read as an unscaled one rather than carried into an allocation.
+///
+/// egui never reports one. This value reaches `Pixmap::new` and
+/// `ColorImage::new` by way of the plan's width and height, and a `NaN` or a
+/// zero arrives there as a zero-sized texture — a blank overlay behind no error
+/// anyone can read — rather than as a failure.
+#[test]
+fn a_density_that_is_not_a_positive_number_plans_an_unscaled_texture() {
+    let rect = pane(600.0, 400.0);
+    let sane = plan_overlay_texture(rect, DESKTOP_LIMIT, NO_SCALING);
+    for (ppp, why) in [
+        (0.0, "a zero density"),
+        (-2.0, "a negative density"),
+        (f32::NAN, "a density that is not a number"),
+        (f32::INFINITY, "an infinite density"),
+    ] {
+        let plan = plan_overlay_texture(rect, DESKTOP_LIMIT, ppp);
+        assert_eq!(plan.width, sane.width, "{why}");
+        assert_eq!(plan.height, sane.height, "{why}");
+        assert_eq!(plan.pixels_per_point, NO_SCALING, "{why}");
+    }
 }

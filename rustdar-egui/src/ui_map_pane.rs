@@ -530,7 +530,12 @@ pub(super) fn render_pane_map_content(
         // `load_texture`, so a release build that ignored it would reach
         // `Device::create_texture` and fail as a wgpu validation error at runtime.
         let max_texture_side = ui.ctx().input(|i| i.max_texture_side) as u32;
-        let tex_plan = plan_overlay_texture(screen_rect, max_texture_side);
+        // In physical pixels, not points: the framebuffer this is composited
+        // into is at the display's density and an overlay sized in points is
+        // one texel per `ppp²` physical pixels. `ui_map`'s volume arm already
+        // multiplies by this for the 3D offscreen; the 2D path did not.
+        let tex_plan =
+            plan_overlay_texture(screen_rect, max_texture_side, ui.ctx().pixels_per_point());
 
         // Whether any overlay on this pane is showing a texture rasterised at a
         // zoom other than the map's — i.e. whether a settle render is still owed.
@@ -557,7 +562,9 @@ pub(super) fn render_pane_map_content(
             // ends while a render is in flight would take an extra frame to
             // notice. The flight check moved to the dispatch below, where it
             // belongs.
-            let stale = enabled && has_data && cache.needs_rerender(token, zoom, &viewport_bounds);
+            let stale = enabled
+                && has_data
+                && cache.needs_rerender(token, zoom, &viewport_bounds, &tex_plan);
             if stale && !cache.render_in_flight {
                 ctx.actions.push(GuiAction::RenderOverlay {
                     pane_idx: ctx.pane_idx,
