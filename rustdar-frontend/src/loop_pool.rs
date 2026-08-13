@@ -142,8 +142,8 @@
 //! What is **not** established either way is whether a PWA's *memory limit*
 //! differs from a Safari tab's — no primary source says so, and the widely
 //! repeated ~200 MB figure appears in none. The figure that is sourced is
-//! WebKit's own: ~1.5 GB for `WebContent` on most iPhones. The 48 MiB floor is
-//! 3 % of that, which is the margin this arm is entitled to given that it cannot
+//! WebKit's own: ~1.5 GB for `WebContent` on most iPhones. The 56 MiB floor is
+//! under 4 % of that, which is the margin this arm is entitled to given that it cannot
 //! measure, cannot predict, and cannot recover without taking every other tab
 //! with it.
 //!

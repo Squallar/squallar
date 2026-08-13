@@ -1673,12 +1673,12 @@ fn floor_lanes(
 /// desktop cell budget at four bytes a cell, and then the whole mip pyramid a
 /// coarse level buys — see `volume::raymarch::grid_bytes_at`), 15.5 MiB on
 /// mobile and 4.58 MiB on wasm. At `MAX_PANES_DESKTOP` = 6 that is 219 MiB of
-/// backdrop — 43% of [`crate::constants::LOOP_POOL_FLOOR_BYTES`]
-/// (512 MiB desktop), which is also `VOLUME_LOOP_TEXTURE_BUDGET_BYTES`, so it
+/// backdrop — 38% of [`crate::constants::LOOP_POOL_FLOOR_BYTES`]
+/// (576 MiB desktop), which is also `VOLUME_LOOP_TEXTURE_BUDGET_BYTES`, so it
 /// comes straight out of what a 3D loop may hold: six of the fourteen grids
-/// that floor buys, gone. On wasm the floor is 48 MiB and four panes of
-/// backdrop are 18 MiB of it, 37.5%. Against
-/// [`crate::constants::APP_TEXTURE_BUDGET_BYTES`] alone (3840 MiB desktop, 256
+/// that floor buys, gone. On wasm the floor is 56 MiB and four panes of
+/// backdrop are 18 MiB of it, 33%. Against
+/// [`crate::constants::APP_TEXTURE_BUDGET_BYTES`] alone (3840 MiB desktop, 288
 /// MiB wasm) it would look affordable, and that is exactly the reading to
 /// distrust: `enforce_budget` evicts oldest-first, so what a permanent
 /// per-pane resident actually displaces is a *live* loop's frames.

@@ -198,8 +198,8 @@ fn a_loop_frame_is_dispatched_leaner_than_the_still_frame_beside_it() {
     assert_eq!(
         ceiling(&jobs[0]),
         crate::constants::LOOP_IMAGE_SIZE,
-        "a loop frame took more than the loop ceiling: thirty textured 4096 \
-         frames is 1.9 GiB a pane against a 512 MiB loop budget",
+        "a loop frame took more than the loop ceiling: thirty-six textured 4096 \
+         frames is 2.3 GiB a pane against a 576 MiB loop budget",
     );
     assert_eq!(
         ceiling(&jobs[1]),

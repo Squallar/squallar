@@ -164,8 +164,8 @@ fn format_span(secs: i64) -> String {
 /// same timestamps, so the listing's own jitter cancels and the frame median
 /// sits at exactly one listing step until two-step gaps are the **majority**.
 /// That resolves 2x decimation and nothing gentler. Measured on the shipped
-/// caps: a browser loop holding 12 of a 17-scan listing announced "every scan"
-/// with **29.4% of the scans dropped**, and a desktop loop holding 60 of 89
+/// caps: a browser loop holding 14 of a 20-scan listing announced "every scan"
+/// with **30.0% of the scans dropped**, and a desktop loop holding 60 of 89
 /// announced it with **32.6% dropped**. Both are the ordinary case — a lookback
 /// slightly past what the cap covers — not an extreme.
 ///
@@ -195,7 +195,7 @@ fn format_span(secs: i64) -> String {
 /// The third is why the fidelity clause has to come **first** and has to be
 /// right. On a sampled loop the range is the sampler's arithmetic showing
 /// through, and a caption that read "every scan, 4 min to 9 min apart" — which
-/// is what a 17-into-12 browser loop printed — offered the user only one
+/// is what a 20-into-14 browser loop printed — offered the user only one
 /// explanation for that spread, an RDA outage or a VCP change at the radar. It
 /// was neither. Saying "sampled from ~4 min scans" first attributes the spread
 /// where it belongs before the numbers that would otherwise be read as the
