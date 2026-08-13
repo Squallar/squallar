@@ -37,3 +37,88 @@ pub(crate) fn create_handlers() -> Vec<Box<dyn OverlayHandler>> {
         Box::new(colorscale::ColorScaleHandler::new()),
     ]
 }
+
+/// The one step of the coverage guarantee the compiler cannot take on its own.
+///
+/// `OverlayState::downcast_round` unifies the round type's declared
+/// [`RoundShape`](crate::fetch_policy::RoundShape) with the layer's, and that
+/// unification is the link that makes an assembled round unable to reach
+/// `set_data`. A handler that spells the downcast itself —
+/// `result.downcast::<MyFetchResult>()`, which is exactly how all seven of
+/// these were written before — steps around the link, keeps whatever shape it
+/// felt like declaring, and is back to the silence with nothing complaining.
+///
+/// Not reachable by the type system: `FetchPayload` is a `Box<dyn Any>` and
+/// `Any` will always downcast for anybody who asks. Sealing it is not available
+/// either — the same alias carries pane state, which `rustdar-egui` downcasts
+/// on its own side. So this is checked over the source of every handler
+/// instead, which is small, exhaustive over the set, and fails loudly.
+#[cfg(test)]
+mod round_delivery_tests {
+    /// Every handler file, whether or not it fetches today: the one that
+    /// reintroduces this is by definition the one nobody has read yet.
+    const HANDLER_SOURCES: [(&str, &str); 12] = [
+        ("alert", include_str!("alert.rs")),
+        ("colorscale", include_str!("colorscale.rs")),
+        ("discussion", include_str!("discussion.rs")),
+        ("glm", include_str!("glm.rs")),
+        ("labels", include_str!("labels.rs")),
+        ("location", include_str!("location.rs")),
+        ("metar", include_str!("metar.rs")),
+        ("model", include_str!("model.rs")),
+        ("outlook", include_str!("outlook.rs")),
+        ("radar", include_str!("radar.rs")),
+        ("reports", include_str!("reports.rs")),
+        ("sites", include_str!("sites.rs")),
+    ];
+
+    /// `apply_fetch_result`'s body, from its signature to the next item at the
+    /// same indent, for a handler that **has** a round to take delivery of.
+    ///
+    /// `None` for the five layers that never fetch: their bodies are
+    /// `fn apply_fetch_result(&mut self, _result: FetchPayload) {}`, and a
+    /// payload bound to `_result` is a payload nothing is ever done with. That
+    /// is the test's own way of counting which handlers are in scope, so it
+    /// cannot be satisfied by a handler quietly leaving the set.
+    ///
+    /// Scoped to that one function rather than the whole file so a future
+    /// handler downcasting its **pane state** — a different payload, with no
+    /// coverage question in it — is not caught by this.
+    fn round_delivery_body(src: &str) -> Option<&str> {
+        let start = src.find("fn apply_fetch_result(&mut self, result: FetchPayload)")?;
+        let rest = &src[start..];
+        Some(match rest.find("\n    fn ") {
+            Some(end) => &rest[..end],
+            None => rest,
+        })
+    }
+
+    #[test]
+    fn no_handler_takes_delivery_of_its_round_by_hand() {
+        let mut checked = 0;
+        for (name, src) in HANDLER_SOURCES {
+            let Some(body) = round_delivery_body(src) else {
+                continue;
+            };
+            checked += 1;
+            assert!(
+                !body.contains(".downcast::<"),
+                "the {name} handler downcasts its own fetch result. That skips \
+                 `OverlayState::downcast_round`, which is the only place the \
+                 round type's declared shape is checked against the layer's — \
+                 and skipping it is how a round assembled from several requests \
+                 gets its `set_data` back",
+            );
+            assert!(
+                body.contains("downcast_round::<"),
+                "the {name} handler has an `apply_fetch_result` that takes \
+                 delivery of its round some other way",
+            );
+        }
+        assert_eq!(
+            checked, 7,
+            "seven handlers fetch; a handler that started or stopped fetching \
+             must be accounted for here rather than silently skipped",
+        );
+    }
+}
