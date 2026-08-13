@@ -1218,6 +1218,7 @@ fn a_cells_status_names_which_of_the_decoders_answers_its_gates_gave() {
         RadarProduct::Reflectivity,
         CellStat::Max,
         1.0,
+        GateFiling::AsDeclared,
     );
 
     assert_eq!(status[0][0], GateReport::BelowThreshold, "cell 0");
@@ -1678,4 +1679,346 @@ fn along_one_tilt_the_echo_top_rises_with_range() {
         seen += 1;
     }
     assert!(seen > 100, "saw only {seen} cells");
+}
+
+// ---------------------------------------------------------------------------
+// Long-pulse 500 m replication: [`GateFiling`], [`replicated_pairs`].
+// ---------------------------------------------------------------------------
+
+/// How a run of 500 m reflectivity samples is written onto the wire by
+/// [`replicated_sweep`].
+#[derive(Clone, Copy)]
+enum SampleForm {
+    /// As they are: 500 m gates whose first is centred at 2250 m — the true
+    /// geometry of a long-pulse sweep's content, declared honestly. Nothing
+    /// on the wire looks like this; it is the oracle the wire form is scored
+    /// against.
+    Honest500m,
+    /// The wire form a long-pulse volume actually uses: each sample duplicated
+    /// onto two 250 m gates, the first centred at 2125 m.
+    Replicated250m,
+    /// The oracle with the registration error this whole exercise is about —
+    /// 500 m samples filed from 2125 m, the first *sub*-gate's centre, rather
+    /// than 2250 m, the pair's own.
+    Honest500mMisregistered,
+}
+
+/// Declared first-gate range, metres, of a real long-pulse reflectivity
+/// moment. The ICD's range to the **centre** of gate 0, so the declared grid's
+/// leading edge is 2000 m.
+const LONG_PULSE_FIRST_GATE_M: u16 = 2125;
+
+/// One sweep carrying `samples` — 500 m-resolution gate bytes — written in
+/// `form`, over `n_radials` evenly spaced azimuths, every radial identical, so
+/// the grid this produces is a pure function of the range arithmetic.
+///
+/// `n_radials` is a parameter because [`replicated_pairs`] pools its evidence
+/// over [`REPLICATION_SAMPLE_RADIALS`] radials rather than one, so a sweep's
+/// radial count is part of how much evidence it can offer.
+fn replicated_sweep_n(
+    n_radials: usize,
+    elevation_deg: f32,
+    samples: &[u8],
+    form: SampleForm,
+) -> Sweep {
+    let (bytes, first_gate_m, gate_m): (Vec<u8>, u16, u16) = match form {
+        SampleForm::Honest500m => (samples.to_vec(), 2250, 500),
+        SampleForm::Honest500mMisregistered => (samples.to_vec(), LONG_PULSE_FIRST_GATE_M, 500),
+        SampleForm::Replicated250m => (
+            samples.iter().flat_map(|&b| [b, b]).collect(),
+            LONG_PULSE_FIRST_GATE_M,
+            250,
+        ),
+    };
+    let spacing = 360.0 / n_radials as f32;
+    let radials = (0..n_radials)
+        .map(|i| {
+            Radial::new(
+                0,
+                i as u16,
+                i as f32 * spacing + 0.5,
+                spacing,
+                RadialStatus::IntermediateRadialData,
+                1,
+                elevation_deg,
+                Some(MomentData::from_fixed_point(
+                    bytes.len() as u16,
+                    first_gate_m,
+                    gate_m,
+                    8,
+                    SCALE,
+                    OFFSET,
+                    bytes.clone(),
+                )),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        })
+        .collect();
+    Sweep::new(1, radials)
+}
+
+/// [`replicated_sweep_n`] over a full 360-radial sweep.
+fn replicated_sweep(elevation_deg: f32, samples: &[u8], form: SampleForm) -> Sweep {
+    replicated_sweep_n(360, elevation_deg, samples, form)
+}
+
+/// A run of 500 m samples with structure at every scale a bin can straddle:
+/// a slow ramp so neighbours differ, and below-threshold gaps so the status
+/// plane and the numeric-pair count are both exercised.
+fn sample_run() -> Vec<u8> {
+    (0..920)
+        .map(|k: usize| {
+            if k.is_multiple_of(97) {
+                0 // below threshold
+            } else {
+                (2 + (k * 7) % 200) as u8
+            }
+        })
+        .collect()
+}
+
+/// The elevation ceiling of the only VCPs that use a long pulse: every
+/// long-pulse volume in the 158-volume corpus tops out between 4.44° and
+/// 4.53°, VCP 34 included. `cos 4.5°` is 0.99692, so a 1 km **ground** bin
+/// holds 4.0124 declared 250 m gates — which is the whole reason a replicated
+/// pair ever straddles a bin edge, and the reason it so rarely does.
+const LONG_PULSE_TOP_TILT_DEG: f32 = 4.5;
+
+/// One sweep on the ground grid, as [`compute_echo_tops`]'s cube would build
+/// it: the production statistic for reflectivity, and the filing the sweep's
+/// own content asks for.
+fn ground_grid(sweep: &Sweep) -> Vec<Vec<f32>> {
+    let radials = sweep.radials();
+    let binning = RangeBinning::Ground;
+    sweep_to_grid(
+        radials,
+        RadarProduct::Reflectivity,
+        CellStat::LinearZMean,
+        binning.range_scale(radials),
+        binning.gate_filing(radials, RadarProduct::Reflectivity),
+    )
+    .0
+}
+
+/// **The wire form and the honest form must grid to the same numbers.**
+///
+/// The oracle here is not a stored digest of this function's own output — it is
+/// the *same physical content* declared a second, independent way: 500 m gates
+/// at 500 m spacing, first centred at 2250 m, which is what a long-pulse
+/// sweep's content actually is. If the pair walk reads the right gates and
+/// files them at the right range, the two must agree bit for bit, and there is
+/// nothing to pin because the reference is constructed rather than recorded.
+#[test]
+fn a_replicated_pair_grids_as_the_500_m_sample_it_encodes() {
+    let samples = sample_run();
+    let wire = replicated_sweep(
+        LONG_PULSE_TOP_TILT_DEG,
+        &samples,
+        SampleForm::Replicated250m,
+    );
+    let honest = replicated_sweep(LONG_PULSE_TOP_TILT_DEG, &samples, SampleForm::Honest500m);
+    let (a, b) = (ground_grid(&wire), ground_grid(&honest));
+    let mut differing = 0usize;
+    for (row_a, row_b) in a.iter().zip(&b) {
+        for (x, y) in row_a.iter().zip(row_b) {
+            if x.to_bits() != y.to_bits() {
+                differing += 1;
+            }
+        }
+    }
+    assert_eq!(
+        differing, 0,
+        "the pair walk does not reproduce the 500 m content it encodes"
+    );
+    // And the comparison is not vacuous: the grids carry data.
+    let defined = a.iter().flatten().filter(|v| !v.is_nan()).count();
+    assert!(defined > 200, "only {defined} cells defined");
+}
+
+/// **The half-gate is not optional**, and this is what forgetting it costs.
+///
+/// Same content, same pair walk, filed from 2125 m — the first *sub*-gate's
+/// centre — instead of 2250 m, the pair's own. Under the `cos e` scaling the
+/// 125 m moves samples across bin edges, and this asserts the two conventions
+/// are distinguishable so that picking the wrong one cannot pass unnoticed.
+#[test]
+fn the_first_sub_gates_centre_is_not_the_pairs_centre() {
+    let samples = sample_run();
+    let wire = replicated_sweep(
+        LONG_PULSE_TOP_TILT_DEG,
+        &samples,
+        SampleForm::Replicated250m,
+    );
+    let trap = replicated_sweep(
+        LONG_PULSE_TOP_TILT_DEG,
+        &samples,
+        SampleForm::Honest500mMisregistered,
+    );
+    let (a, b) = (ground_grid(&wire), ground_grid(&trap));
+    let differing = a
+        .iter()
+        .flatten()
+        .zip(b.iter().flatten())
+        .filter(|(x, y)| x.to_bits() != y.to_bits())
+        .count();
+    assert!(
+        differing > 0,
+        "the 2125 m and 2250 m registrations produced identical grids, so this \
+         test cannot tell a right answer from a wrong one"
+    );
+}
+
+/// **Under [`RangeBinning::Slant`] the replication costs nothing**, which is
+/// why [`crate::eet`] and [`crate::vil`] are left alone.
+///
+/// A 1 km slant bin holds declared gates `4r-8 ..= 4r-5`; the start index is
+/// even, so it holds two whole replicated pairs and each 500 m sample is
+/// weighted exactly once. Read as [`CellStat::Max`] — the statistic
+/// [`crate::eet`] uses, and the one that cannot be confounded by summation
+/// order — the wire form and the honest form must already agree without any
+/// decimation at all.
+#[test]
+fn slant_bins_hold_whole_pairs_so_replication_costs_them_nothing() {
+    let samples = sample_run();
+    let wire = replicated_sweep(
+        LONG_PULSE_TOP_TILT_DEG,
+        &samples,
+        SampleForm::Replicated250m,
+    );
+    let honest = replicated_sweep(LONG_PULSE_TOP_TILT_DEG, &samples, SampleForm::Honest500m);
+    let grid = |s: &Sweep| {
+        let radials = s.radials();
+        sweep_to_grid(
+            radials,
+            RadarProduct::Reflectivity,
+            CellStat::Max,
+            RangeBinning::Slant.range_scale(radials),
+            RangeBinning::Slant.gate_filing(radials, RadarProduct::Reflectivity),
+        )
+        .0
+    };
+    let (a, b) = (grid(&wire), grid(&honest));
+    let differing = a
+        .iter()
+        .flatten()
+        .zip(b.iter().flatten())
+        .filter(|(x, y)| x.to_bits() != y.to_bits())
+        .count();
+    assert_eq!(
+        differing, 0,
+        "slant bins do not hold whole replicated pairs after all"
+    );
+}
+
+/// The detector recognises replication and declines a field that is merely
+/// smooth.
+///
+/// The negative is deliberately far smoother than any measured sweep: gate `j`
+/// carries `j / 7`, so 6 adjacent gates in 7 are equal — against a measured
+/// short-pulse ceiling of 0.25 on numeric pairs. The parity structure is what
+/// gives it away, not the agreement rate, and 7 is odd so a block boundary
+/// eventually lands inside an even pair.
+#[test]
+fn the_detector_reads_parity_and_not_smoothness() {
+    let replicated = replicated_sweep(1.5, &sample_run(), SampleForm::Replicated250m);
+    assert!(
+        replicated_pairs(replicated.radials(), RadarProduct::Reflectivity),
+        "replicated content was not recognised"
+    );
+    let smooth_bytes: Vec<u8> = (0..1840u32).map(|j| (2 + (j / 7) % 200) as u8).collect();
+    let smooth = replicated_sweep(1.5, &smooth_bytes, SampleForm::Honest500m);
+    assert!(
+        !replicated_pairs(smooth.radials(), RadarProduct::Reflectivity),
+        "a smooth ramp was mistaken for replicated content"
+    );
+}
+
+/// A sweep cannot qualify on too little evidence, and cannot qualify on
+/// emptiness at all.
+///
+/// [`REPLICATION_MIN_PAIRS`] is a floor on gate pairs carrying **numbers**
+/// precisely so that a cut whose every pair is two below-threshold sentinels —
+/// which does satisfy "every pair is identical" — is not read as 500 m content.
+#[test]
+fn the_detector_needs_numbers_and_needs_enough_of_them() {
+    let short: Vec<u8> = (0..(REPLICATION_MIN_PAIRS as usize - 1))
+        .map(|k| (2 + k % 200) as u8)
+        .collect();
+    let sweep = replicated_sweep_n(1, 1.5, &short, SampleForm::Replicated250m);
+    assert!(
+        !replicated_pairs(sweep.radials(), RadarProduct::Reflectivity),
+        "{} numeric pairs cleared a floor of {}",
+        short.len(),
+        REPLICATION_MIN_PAIRS
+    );
+
+    let empty = vec![0u8; 920];
+    let sweep = replicated_sweep(1.5, &empty, SampleForm::Replicated250m);
+    assert!(
+        !replicated_pairs(sweep.radials(), RadarProduct::Reflectivity),
+        "a sweep of nothing but below-threshold pairs qualified as replicated"
+    );
+}
+
+/// The floor is a floor and not a wall: one pair over it is enough.
+#[test]
+fn the_detector_clears_the_floor_at_exactly_the_floor() {
+    let just_enough: Vec<u8> = (0..REPLICATION_MIN_PAIRS as usize)
+        .map(|k| (2 + k % 200) as u8)
+        .collect();
+    let sweep = replicated_sweep_n(1, 1.5, &just_enough, SampleForm::Replicated250m);
+    assert!(
+        replicated_pairs(sweep.radials(), RadarProduct::Reflectivity),
+        "exactly {} numeric pairs did not clear a floor of {}",
+        REPLICATION_MIN_PAIRS,
+        REPLICATION_MIN_PAIRS
+    );
+}
+
+/// **Nothing that is not replicated is ever decimated**, which is the safety
+/// property the short-pulse arm rests on: [`RangeBinning::gate_filing`] answers
+/// [`GateFiling::AsDeclared`] for ordinary content under *both* binnings, and
+/// for replicated content under [`RangeBinning::Slant`].
+#[test]
+fn only_ground_binning_of_replicated_content_ever_decimates() {
+    let refl = RadarProduct::Reflectivity;
+    let replicated = replicated_sweep(1.5, &sample_run(), SampleForm::Replicated250m);
+    let ordinary = replicated_sweep(1.5, &sample_run(), SampleForm::Honest500m);
+    for (sweep, binning, want, what) in [
+        (
+            &replicated,
+            RangeBinning::Ground,
+            GateFiling::ReplicatedPairs,
+            "replicated content on the ground grid",
+        ),
+        (
+            &replicated,
+            RangeBinning::Slant,
+            GateFiling::AsDeclared,
+            "replicated content on the slant grid",
+        ),
+        (
+            &ordinary,
+            RangeBinning::Ground,
+            GateFiling::AsDeclared,
+            "ordinary content on the ground grid",
+        ),
+        (
+            &ordinary,
+            RangeBinning::Slant,
+            GateFiling::AsDeclared,
+            "ordinary content on the slant grid",
+        ),
+    ] {
+        assert_eq!(
+            binning.gate_filing(sweep.radials(), refl),
+            want,
+            "{what} was filed the wrong way"
+        );
+    }
 }
