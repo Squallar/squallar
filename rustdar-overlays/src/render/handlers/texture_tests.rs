@@ -233,9 +233,12 @@ pub(super) fn seed(handler: &mut dyn OverlayHandler) -> bool {
             product: OutlookProduct::Categorical,
             result: Ok(outlook_fixture()),
         }),
-        OverlayKind::StormReports => Box::new(super::reports::StormReportsFetchResult(Ok(vec![
-            report_fixture(),
-        ]))),
+        OverlayKind::StormReports => Box::new(super::reports::StormReportsFetchResult(Ok(
+            crate::spc::reports::StormReportRound {
+                reports: vec![report_fixture()],
+                failed_kinds: Vec::new(),
+            },
+        ))),
         OverlayKind::Lightning => Box::new(GlmFetchResult(Ok(GlmFetchOutcome {
             flashes: vec![glm_fixture()],
             dead_feeds: Vec::new(),
