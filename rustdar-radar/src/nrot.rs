@@ -2695,6 +2695,34 @@ fn half_turn_rows(rows: crate::azimuth::Rows) -> i32 {
     }
 }
 
+/// **What this hands back does not say which gates it examined**, and the
+/// obvious way to recover that is measured to be useless. A pass either places
+/// a gate on a fold branch, refuses it under
+/// [`DealiasKnobs::refuse_incoherent`], or never reaches it — three different
+/// facts, and the grid that comes out carries none of them.
+///
+/// The cheap recovery is to call a gate resolved when its value moved. Counted
+/// on real volumes, 2026-08-12, lowest Doppler cut, against the passes' own
+/// account:
+///
+/// | volume | placed on a branch | of those, value unchanged |
+/// |---|---|---|
+/// | KTLX 2024-12-16 | 91896 | **99.996%** |
+/// | KFTG 2023-06-22 | 344171 | **99.92%** |
+/// | KHNX 2024-12-16 | 14950 | **99.87%** |
+/// | KDMX 2022-03-05 | 167967 | **98.31%** |
+/// | KCRP 2017-08-26 | 396077 | **85.43%** |
+///
+/// So that test finds between 0.004% and 15% of what it is looking for, and it
+/// is wrong in the other direction too (at KDMX, 12069 of the 14901 gates whose
+/// value moved were not placed by any pass). The reason is ordinary: most gates
+/// are already on the right branch, so a pass *confirms* rather than moves
+/// them, and a confirmation leaves the value identical.
+///
+/// That is exactly the distinction worth having — "a pass examined this and
+/// confirmed it" against "nothing ever looked here" — and it is most of the
+/// population. Nothing consumes it yet, so nothing is plumbed; recorded so the
+/// next reader reaches for the measurement instead of the comparison.
 pub(crate) fn dealias(
     vel_grid: &mut [Vec<f64>],
     sweep: &VelocitySweep,
