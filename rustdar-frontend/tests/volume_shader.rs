@@ -538,45 +538,243 @@ fn the_gradient_epsilon_states_its_metric_and_what_it_is_worth() {
 /// A shader edit that renames or restructures the composite fails here rather
 /// than silently deleting the check. That is the intended cost: re-anchor it,
 /// and if the arm is genuinely gone, delete this deliberately.
-#[test]
-fn the_floor_composites_arm_is_a_property_of_the_frame() {
-    const BINDING: &str = "let eye_above_plane = ";
-    let at = VOLUME_SHADER_WGSL
-        .find(BINDING)
-        .expect("the composite no longer binds its arm to a name this can read");
-    assert_eq!(
-        VOLUME_SHADER_WGSL.matches(BINDING).count(),
-        1,
-        "the arm is bound in more than one place, so this test cannot say which \
-         one the composite reads",
-    );
-    let expression = VOLUME_SHADER_WGSL[at + BINDING.len()..]
-        .split(';')
-        .next()
-        .expect("split always yields at least one piece");
+/// WGSL source with line and block comments replaced by a space.
+///
+/// Scanning raw source is unsound, and not in theory. This test used to delimit
+/// the arm expression at the first `;` **anywhere** after the binding, so
+///
+/// ```wgsl
+/// let eye_above_plane = eye.z >= 0.0 // one number; the frame's own
+///     && floor_t > span.x;
+/// ```
+///
+/// truncated at the semicolon inside the comment and never saw the live
+/// per-pixel term on the next line. Executed: naga folded the continuation into
+/// the binding, the shader was valid, and this test stayed green.
+fn without_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    loop {
+        let line = rest.find("//");
+        let block = rest.find("/*");
+        let Some(at) = line.into_iter().chain(block).min() else {
+            break;
+        };
+        out.push_str(&rest[..at]);
+        out.push(' ');
+        let is_line = line == Some(at);
+        let closer = if is_line { "\n" } else { "*/" };
+        let after = &rest[at + 2..];
+        match after.find(closer) {
+            // The newline stays: it terminates the *next* line comment.
+            Some(end) if is_line => rest = &after[end..],
+            Some(end) => rest = &after[end + closer.len()..],
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
+}
 
-    assert!(
-        expression.contains("eye.z"),
-        "the composite's arm is `{expression}`, which does not read the eye's \
-         height at all — it is `floor_fade`'s own number and has to be the same \
-         one, or the fade and the order it scales can disagree about which side \
-         of the plane the camera is on",
-    );
-    for per_pixel in ["floor_t", "span", "direction", "in.ndc"] {
-        assert!(
-            !expression.contains(per_pixel),
-            "the composite's arm is `{expression}`, which reads `{per_pixel}` — \
-             a per-pixel quantity. The arm is a property of the frame; deciding \
-             it per pixel is how one frame came to composite 193 pixels behind \
-             the volume and 1172 in front of it",
+/// Every identifier in `src`, deduplicated, in source order.
+///
+/// The rule below is a **whitelist**, and that is the point. This test used to
+/// forbid a list of per-pixel names, and a blacklist over an expression can
+/// always be aliased around: `let entry = span.x;` followed by `floor_t > entry`
+/// reads exactly the quantity the fix removed and contains none of the
+/// forbidden words. What the arm may legitimately read is a short closed set;
+/// what it may not is not enumerable.
+fn identifiers(src: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for word in src.split(|c: char| !c.is_alphanumeric() && c != '_') {
+        if word.is_empty() || word.starts_with(|c: char| c.is_ascii_digit()) {
+            continue;
+        }
+        if !names.iter().any(|n| n == word) {
+            names.push(word.to_string());
+        }
+    }
+    names
+}
+
+/// The rule itself, over any shader source, so it can be aimed at a mutant.
+///
+/// A textual rule cannot have GPU mutants — that is the whole reason this test
+/// exists, since the pre-fix shader was uniform on every camera of the 78-camera
+/// sweep on the adapter it was written against. What it can have, and now does,
+/// is `the_arm_rule_rejects_every_way_the_defect_can_come_back`: the rule aimed
+/// at sources that put the per-ray discriminant back, each of which passed the
+/// whole suite when the rule was a blacklist over the binding alone.
+fn frame_uniform_arm(shader: &str) -> Result<(), String> {
+    let source = without_comments(shader);
+
+    const BINDING: &str = "let eye_above_plane =";
+    let at = source
+        .find(BINDING)
+        .ok_or("the composite no longer binds its arm to a name this can read")?;
+    if source.matches(BINDING).count() != 1 {
+        return Err(
+            "the arm is bound in more than one place, so this test cannot say \
+             which one the composite reads"
+                .into(),
         );
     }
+    // The whole composite, not the binding alone. Both edits that got past the
+    // first version of this rule left the binding untouched and put the per-ray
+    // discriminant back in a **branch condition**: `floor_t > span.x &&
+    // eye_above_plane` is the pre-fix arm exactly for every above-plane camera,
+    // and the same edit on the second arm deletes the map floor outright for
+    // every camera under the plane. Both were valid WGSL, both translated to
+    // legal GLSL ES 300, and both passed all 714 tests.
+    let composite = &source[at..];
+    let composite = &composite[..composite
+        .find("let alpha =")
+        .ok_or("the composite no longer ends at the alpha it feeds")?];
 
-    // And it is the name the two branches actually switch on, so a binding that
-    // had stopped being read would fail here rather than pass by existing.
-    assert!(
-        VOLUME_SHADER_WGSL.contains("&& eye_above_plane {"),
-        "nothing branches on `eye_above_plane`, so binding it correctly proves \
-         nothing about what the composite does",
-    );
+    let expression = composite[BINDING.len()..]
+        .split(';')
+        .next()
+        .expect("split always yields at least one piece")
+        .trim();
+
+    // The eye's height, and nothing else. `floor_fade` is scaled by the same
+    // number, and if the two disagree about which side of the plane the camera
+    // is on, the fade and the order it scales are describing different frames.
+    const FRAME_UNIFORM: [&str; 4] = ["eye", "z", "volume", "eye_in_box"];
+    for name in identifiers(expression) {
+        if !FRAME_UNIFORM.contains(&name.as_str()) {
+            return Err(format!(
+                "the composite's arm is `{expression}`, which reads `{name}`. The \
+                 arm may read the eye's height and nothing else — anything varying \
+                 per pixel is how one frame came to composite 193 pixels behind the \
+                 volume and 1172 in front of it. If `{name}` really is \
+                 frame-uniform, add it to `FRAME_UNIFORM` deliberately",
+            ));
+        }
+    }
+    if !expression.contains("eye_in_box.z") && !expression.contains("eye.z") {
+        return Err(format!(
+            "the composite's arm is `{expression}`, which does not read the eye's \
+             height at all",
+        ));
+    }
+
+    // Both branch conditions, not just the first. That one was checked before
+    // by a literal `&& eye_above_plane {`, which also rejected the identical
+    // `eye_above_plane && floor_t >= 0.0` with the message "nothing branches on
+    // `eye_above_plane`" — brittle in the direction that fails a correct shader,
+    // and blind in the direction that passes a broken one.
+    let conditions: Vec<&str> = composite
+        .match_indices("if ")
+        .map(|(at, _)| {
+            let after = &composite[at + 3..];
+            after.find('{').map_or(after, |end| &after[..end]).trim()
+        })
+        .collect();
+    if conditions.len() != 2 {
+        return Err(format!(
+            "the composite is no longer the two arms this rule knows how to read: \
+             {conditions:?}",
+        ));
+    }
+
+    // The second arm is the `else`, so the frame's verdict reaches it by the
+    // first not having been taken rather than by being named again. What both
+    // must obey is the whitelist: `floor_t` belongs here, because "does this ray
+    // meet the plane at all" is genuinely per-ray and always was, and so does
+    // `floor_fade`, the same frame-uniform height read once more. What may not
+    // appear in either is anything that decides *which arm* — which is what
+    // `span` was.
+    if !conditions[0].contains("eye_above_plane") {
+        return Err(format!(
+            "the arm is chosen by `{}`, which does not read the frame's own \
+             verdict — a binding nothing branches on proves nothing about what \
+             the composite does",
+            conditions[0],
+        ));
+    }
+    const ARM_CONDITION: [&str; 3] = ["floor_t", "eye_above_plane", "floor_fade"];
+    for condition in &conditions {
+        for name in identifiers(condition) {
+            if !ARM_CONDITION.contains(&name.as_str()) {
+                return Err(format!(
+                    "the arm is chosen by `{condition}`, which reads `{name}`. \
+                     Which side of the plane the camera is on is a property of the \
+                     frame; asking it of a per-pixel quantity is the defect this \
+                     pins, and it does not matter whether that quantity is spelled \
+                     `span.x` or bound to a local first",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn the_floor_composites_arm_is_a_property_of_the_frame() {
+    if let Err(why) = frame_uniform_arm(VOLUME_SHADER_WGSL) {
+        panic!("{why}");
+    }
+}
+
+/// **The rule's own mutants.** Every source below is a way the defect comes
+/// back, and every one of them passed this test — and the other 713 — when the
+/// rule was a blacklist of per-pixel names over the binding expression alone.
+///
+/// The last row is the control that keeps the rule honest in the other
+/// direction: a semantically identical operand swap, which the old literal
+/// `&& eye_above_plane {` rejected with a message asserting the shader did not
+/// branch on `eye_above_plane` when it plainly did.
+#[test]
+fn the_arm_rule_rejects_every_way_the_defect_can_come_back() {
+    // (name, from, to, must be rejected)
+    let mutants: [(&str, &str, &str, bool); 5] = [
+        (
+            "the pre-fix per-ray discriminant, back in the first arm",
+            "if floor_t >= 0.0 && eye_above_plane {",
+            "if floor_t > span.x && eye_above_plane {",
+            true,
+        ),
+        (
+            "the same edit on the else arm, which deletes the floor below the plane",
+            "} else if floor_t >= 0.0 && floor_fade > 0.0 {",
+            "} else if floor_t > span.x && floor_fade > 0.0 {",
+            true,
+        ),
+        (
+            "a live per-pixel term hidden behind a semicolon inside a comment",
+            "let eye_above_plane = eye.z >= 0.0;",
+            "let eye_above_plane = eye.z >= 0.0 // one number; the frame's own\n        && floor_t > span.x;",
+            true,
+        ),
+        (
+            "the box entry aliased to a local, so no forbidden name appears",
+            "if floor_t >= 0.0 && eye_above_plane {",
+            "let entry = span.x;\n    if floor_t > entry && eye_above_plane {",
+            true,
+        ),
+        (
+            "CONTROL: the operands swapped, which is the same shader",
+            "if floor_t >= 0.0 && eye_above_plane {",
+            "if eye_above_plane && floor_t >= 0.0 {",
+            false,
+        ),
+    ];
+
+    for (name, from, to, must_reject) in mutants {
+        assert!(
+            VOLUME_SHADER_WGSL.contains(from),
+            "{name}: the anchor `{from}` is gone, so this mutant is not being \
+             applied to anything — re-anchor it rather than deleting it",
+        );
+        let mutated = VOLUME_SHADER_WGSL.replacen(from, to, 1);
+        match (frame_uniform_arm(&mutated), must_reject) {
+            (Err(_), true) | (Ok(()), false) => {}
+            (Ok(()), true) => panic!(
+                "{name}: the rule accepted a shader that decides the floor's arm \
+                 per pixel",
+            ),
+            (Err(why), false) => panic!("{name}: the rule rejected a correct shader: {why}"),
+        }
+    }
 }
