@@ -412,7 +412,7 @@ fn the_3d_loop_holds_exactly_what_it_marches() {
         // treadmill this loop kind cannot afford.
         //
         //  * what the byte budget admits **beside one live grid**, which binds
-        //    desktop (13 of the 30 frames a plan-view loop textures). The
+        //    desktop (12 of the 30 frames a plan-view loop textures). The
         //    subtracted grid is not padding: see
         //    `a_full_3d_loop_leaves_room_for_a_live_grid_beside_it` for the
         //    layout it is there for and what happens without it.
@@ -1719,5 +1719,72 @@ fn a_rasters_side_is_read_back_from_its_length_against_a_closed_set() {
         ),
     ] {
         assert_eq!(raster_side_from_rgba_len(len), None, "{why}");
+    }
+}
+
+/// **The budget table in `VOLUME_LOOP_TEXTURE_BUDGET_BYTES`'s doc is the one
+/// the constants derive.**
+///
+/// Because it stopped being. The desktop row went on reading `13 | 36.001 MiB |
+/// 468.0 MiB | 44.0 MiB` after the mip pyramid was charged for and
+/// `DESKTOP_MAX_LOOP_VOLUME_FRAMES` a hundred lines below the table became 12 —
+/// prose and code contradicting each other inside one file, with the prose the
+/// half a reader reaches for when deciding whether a frame count is safe to
+/// move. Every other figure in that row was pre-fix too, on every row.
+///
+/// So the doc is parsed rather than trusted. A figure that drifts fails here
+/// with both numbers, which is the only thing that keeps a hand-written table
+/// honest against a constant it is not computed from.
+#[test]
+fn the_loop_budget_table_is_the_one_the_constants_derive() {
+    const MIB: f64 = 1024.0 * 1024.0;
+    // Anchored on this table's own header: `constants.rs` carries a dozen
+    // tables keyed by target name, and matching on the names alone reads all of
+    // them.
+    const HEADER: &str = "| target  | frames | 3D texture | resident  | headroom | share   |";
+    let source = include_str!("../constants.rs");
+    let rows: Vec<Vec<String>> = source
+        .lines()
+        .map(|line| line.trim().trim_start_matches("///").trim())
+        .skip_while(|line| *line != HEADER)
+        .skip(2) // the header and the alignment rule
+        .take_while(|line| line.starts_with('|'))
+        .map(|row| {
+            row.split('|')
+                .map(|cell| cell.trim().replace(" MiB", ""))
+                .filter(|cell| !cell.is_empty())
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        rows.len(),
+        3,
+        "the budget table is no longer three target rows this can read: {rows:?}",
+    );
+
+    for (arm, row) in arms().into_iter().zip(rows) {
+        assert_eq!(
+            row[0], arm.name,
+            "the table's rows are out of order: {row:?}"
+        );
+        let grid = crate::volume::raymarch::resident_grid_bytes(arm.grid)
+            .expect("a shipped grid shape cannot overflow");
+        let frames = arm.volume_loop_frames;
+        let resident = grid * frames;
+        let expected = [
+            arm.name.to_string(),
+            frames.to_string(),
+            format!("{:.3}", grid as f64 / MIB),
+            format!("{:.2}", resident as f64 / MIB),
+            format!("{:.2}", (arm.volume_loop_budget - resident) as f64 / MIB),
+            format!("{}", arm.volume_loop_budget / (1024 * 1024)),
+        ];
+        assert_eq!(
+            row, expected,
+            "the {} row of the budget table has drifted from what the constants \
+             derive — the table is what a reader consults before moving a frame \
+             count, so it is the half that has to be right",
+            arm.name,
+        );
     }
 }
