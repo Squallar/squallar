@@ -267,6 +267,52 @@ fn the_derived_packet_carries_quarter_kilometre_gates() {
     }
 }
 
+fn set_first_range_bin(msg: &mut Level3Message, bin: i16) {
+    let sym = msg.symbology.as_mut().expect("the fixture has symbology");
+    for layer in &mut sym.layers {
+        for p in &mut layer.packets {
+            if let DataPacket::DigitalRadial(rp) = p {
+                rp.first_range_bin = bin;
+            }
+        }
+    }
+}
+
+/// The first bin is an *index*, counted in gates
+/// ([`nexrad_level3::model::RadialPacket::gate_range_km`]), so re-spacing the
+/// derived packet from the source's declared ~1 km to the product's real
+/// 0.25 km has to re-index it too. Carried over unchanged, the same number 4
+/// would move the field's start from 4 km out to 1 km out — the whole field
+/// pulled four times closer to the radar.
+///
+/// Every live velocity product declares 0 here, so nothing on the wire shows
+/// this; the fixture has to push the index off zero to hold it at all.
+#[test]
+fn re_spacing_the_derived_packet_keeps_the_first_gate_where_the_source_put_it() {
+    for code in VELOCITY_PRODUCT_CODES {
+        let mut msg = uniform(code, &[0.0], 1.0, 0.0);
+        set_first_range_bin(&mut msg, 4);
+
+        let src = radial_packet(&msg).unwrap();
+        let src_first_edge = f64::from(src.first_range_bin) * src.gate_interval_km();
+
+        let d = derive(&msg, &sample(0.0, 0.0, 7108)).unwrap();
+        let out_gate = d.packet.gate_interval_km();
+        let out_first_edge = f64::from(d.packet.first_range_bin) * out_gate;
+
+        assert!(
+            (out_first_edge - src_first_edge).abs() <= out_gate / 2.0,
+            "product {code}: the first gate moved from {src_first_edge} km to \
+             {out_first_edge} km across the re-spacing",
+        );
+        // 4 bins of the declared 1.001 km, re-indexed onto 0.25 km gates.
+        assert_eq!(
+            d.packet.first_range_bin, 16,
+            "product {code}: 4 x 1.001 km re-indexes to 16 x 0.25 km",
+        );
+    }
+}
+
 /// Elevation comes from the Product Description Block. `N1G` is 1.3° in
 /// VCP 212, not the 1.5° its mnemonic suggests, and the two adjacent cuts
 /// at one angle are told apart only by elevation number.
