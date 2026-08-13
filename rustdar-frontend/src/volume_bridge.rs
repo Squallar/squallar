@@ -1094,8 +1094,13 @@ pub struct BridgeVolumePainter {
     /// The quality this adapter was classified into, from
     /// `AdapterInfo::device_type`. Fixed for the life of the renderer: a device
     /// does not change class, and the thing that *does* change per frame — the
-    /// pane's size — is applied by `fit_to_budget` below.
+    /// pane's size — is applied by `VolumeQuality::fit` below.
     quality: VolumeQuality,
+    /// The resolved `Budgets::offscreen_bytes` this renderer fits every pane's
+    /// raymarch target into. Handed in rather than read from a `cfg` constant,
+    /// for the reason `quality` is: a budget read inline is a budget checkable
+    /// on the one arm the test runner compiled.
+    offscreen_bytes: usize,
     /// What the capability probe said when the renderer was built. Re-consulted
     /// through `volume::support` on every frame, so a device error latched
     /// halfway through a session degrades the pane rather than being remembered
@@ -1138,10 +1143,16 @@ pub struct BridgeVolumePainter {
 const NO_FLOOR_DEMAND: u32 = u32::MAX;
 
 impl BridgeVolumePainter {
-    pub fn new(store: Arc<VolumeStore>, quality: VolumeQuality, probed: VolumeSupport) -> Self {
+    pub fn new(
+        store: Arc<VolumeStore>,
+        quality: VolumeQuality,
+        offscreen_bytes: usize,
+        probed: VolumeSupport,
+    ) -> Self {
         Self {
             store,
             quality,
+            offscreen_bytes,
             probed,
             floor_demand: std::sync::atomic::AtomicU32::new(NO_FLOOR_DEMAND),
         }
@@ -1239,7 +1250,7 @@ impl VolumePainter for BridgeVolumePainter {
             return VolumePaint::Empty(why);
         }
 
-        let fitted = self.quality.fit_to_budget(frame.size_px);
+        let fitted = self.quality.fit(frame.size_px, self.offscreen_bytes);
         // The box the pane asked for, which is the grid's own whenever the
         // build for it has landed. While it has not, this is what makes the
         // zoom immediate: the camera frames the new box and the floor is
@@ -1281,7 +1292,7 @@ impl VolumePainter for BridgeVolumePainter {
         // divide by it unguarded.
         uniform.vertical_exaggeration = frame.camera.vertical_exaggeration();
         // The rung this pane actually got, not the one the adapter was offered:
-        // `fit_to_budget` can step the resolution down, and shading rides the
+        // The fit can step the resolution down, and shading rides the
         // same struct. The smoothed reconstruction rides the same rung as the
         // lighting on purpose — together they are the cloud look, and a device
         // that cannot afford one cannot afford the other; the floor rung stays

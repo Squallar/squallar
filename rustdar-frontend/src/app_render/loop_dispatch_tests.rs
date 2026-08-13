@@ -1,4 +1,5 @@
 use super::*;
+use crate::constants::MAX_LOOP_FRAMES;
 use crate::loop_downloads::LoopDownloadManager;
 use nexrad_model::data::{
     MomentData, PulseWidth, Radial, RadialStatus, Scan, Sweep, VolumeCoveragePattern,
@@ -319,15 +320,28 @@ fn a_listing_for_the_site_the_loop_left_is_refused() {
     let stale = vec![(ts(0), identifier("KTLX20240101_000000_V06"))];
 
     assert!(
-        accept_scan_listing(test_loop_allocation(), &mut koun, "KTLX", stale).is_none(),
+        accept_scan_listing(
+            test_loop_allocation(),
+            &test_budgets(),
+            &mut koun,
+            "KTLX",
+            stale
+        )
+        .is_none(),
         "a KTLX listing is not this KOUN loop's frame list"
     );
     assert!(koun.frames.is_empty(), "and left no frames behind");
 
     // The loop's own listing is taken.
     let live = vec![(ts(0), identifier("KOUN20240101_000000_V06"))];
-    let plan = accept_scan_listing(test_loop_allocation(), &mut koun, "KOUN", live)
-        .expect("its own listing");
+    let plan = accept_scan_listing(
+        test_loop_allocation(),
+        &test_budgets(),
+        &mut koun,
+        "KOUN",
+        live,
+    )
+    .expect("its own listing");
     assert_eq!(
         plan.site, "KOUN",
         "the plan carries the site it was listed for"
@@ -344,7 +358,16 @@ fn a_listing_for_an_inactive_loop_is_refused() {
     ls.phase = LoopPhase::Inactive;
 
     let scans = vec![(ts(0), identifier("KTLX20240101_000000_V06"))];
-    assert!(accept_scan_listing(test_loop_allocation(), &mut ls, "KTLX", scans).is_none());
+    assert!(
+        accept_scan_listing(
+            test_loop_allocation(),
+            &test_budgets(),
+            &mut ls,
+            "KTLX",
+            scans
+        )
+        .is_none()
+    );
 }
 
 /// The wedge. A failed listing is delivered as an empty list, and so is a
@@ -360,7 +383,14 @@ fn an_empty_listing_switches_the_loop_off() {
     ls.phase = LoopPhase::FetchingScanList;
 
     assert!(
-        accept_scan_listing(test_loop_allocation(), &mut ls, "KTLX", Vec::new()).is_none(),
+        accept_scan_listing(
+            test_loop_allocation(),
+            &test_budgets(),
+            &mut ls,
+            "KTLX",
+            Vec::new()
+        )
+        .is_none(),
         "there is nothing to download"
     );
     assert!(
@@ -480,8 +510,14 @@ fn the_frame_list_and_the_frame_plan_describe_the_same_scans() {
         .map(|i| (ts(i), identifier(&format!("KTLX2024010{}_V06", i))))
         .collect();
 
-    let plan =
-        accept_scan_listing(test_loop_allocation(), &mut ls, "KTLX", scans).expect("accepted");
+    let plan = accept_scan_listing(
+        test_loop_allocation(),
+        &test_budgets(),
+        &mut ls,
+        "KTLX",
+        scans,
+    )
+    .expect("accepted");
 
     assert_eq!(plan.frames.len(), MAX_LOOP_FRAMES, "capped");
     assert_eq!(
@@ -517,7 +553,14 @@ fn a_long_listing_is_sampled_evenly_across_its_whole_span() {
         .map(|i| (ts(i), identifier(&format!("KTLX2024010{}_V06", i))))
         .collect();
 
-    accept_scan_listing(test_loop_allocation(), &mut ls, "KTLX", scans).expect("accepted");
+    accept_scan_listing(
+        test_loop_allocation(),
+        &test_budgets(),
+        &mut ls,
+        "KTLX",
+        scans,
+    )
+    .expect("accepted");
 
     // `ts` is one minute per listing position, so a frame's minute *is* the
     // position it was sampled from, and the gaps below are index strides.

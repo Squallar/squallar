@@ -1,4 +1,5 @@
 use super::*;
+use crate::constants::MAX_RENDER_CACHE_ENTRIES;
 
 fn key(site: &str, elevation_tenths: i32) -> RenderCacheKey {
     (
