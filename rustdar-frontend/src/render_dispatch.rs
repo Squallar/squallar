@@ -250,17 +250,55 @@ pub struct RenderCache {
     entries: HashMap<RenderCacheKey, CachedRenderOutput>,
     recency: VecDeque<RenderCacheKey>,
     capacity: usize,
+    /// Bytes the resident entries occupy, kept in step with `entries` by
+    /// [`Self::insert`], [`Self::retain`] and [`Self::clear`] — the three
+    /// places an entry can arrive or leave.
+    resident_bytes: usize,
+    byte_capacity: usize,
 }
 
 impl RenderCache {
     /// `capacity` is floored at 1 — a zero-capacity cache would evict every entry
     /// on the way in, which is a silent way to disable pane sharing entirely.
-    pub fn new(capacity: usize) -> Self {
+    ///
+    /// `byte_capacity` is the second bound and the one that actually holds now.
+    /// A count was a fair proxy for memory while every plan view was one of
+    /// three sizes: eight entries of `4096² × 8` is 1 GiB, and that figure was
+    /// what the count meant. It stopped being a proxy when the side became the
+    /// device's answer spent as far as a sweep's gates justify — the same eight
+    /// entries of a 7362 px surveillance cut are **3.3 GiB**, which is a
+    /// regression this cache would have introduced silently.
+    ///
+    /// So the bytes are counted. Both bounds apply, and which one binds depends
+    /// on what is resident: 1 GiB buys two long-range rasters, eight base-size
+    /// ones (where the count binds first, exactly as before) or thirty-two of a
+    /// browser's loop frames.
+    pub fn new(capacity: usize, byte_capacity: usize) -> Self {
         Self {
             entries: HashMap::new(),
             recency: VecDeque::new(),
             capacity: capacity.max(1),
+            resident_bytes: 0,
+            // Deliberately **not** floored the way `capacity` is. A budget too
+            // small for one entry cannot disable sharing here, because
+            // [`Self::insert`] never evicts down to nothing — the guard is
+            // structural rather than a constant that has to stay large enough,
+            // which is the same property with one fewer thing to keep true.
+            byte_capacity,
         }
+    }
+
+    /// What one entry costs: the texture egui holds and the value grid a hover
+    /// reads, both `side² × 4`.
+    ///
+    /// Measured off the buffers rather than derived from a side, because the
+    /// two are not always the same shape — a cross-section's raster is
+    /// `SECTION_WIDTH × SECTION_HEIGHT` and its value grid is sized to match —
+    /// and a cache that costed a section as though it were square would evict
+    /// against a number describing nothing in it.
+    fn entry_bytes(value: &CachedRenderOutput) -> usize {
+        value.image.pixels.len() * std::mem::size_of::<egui::Color32>()
+            + value.value_data.len() * std::mem::size_of::<f32>()
     }
 
     /// Move `key` to the most-recently-used end. No-op if absent.
@@ -286,24 +324,44 @@ impl RenderCache {
         self.entries.get(key)
     }
 
-    /// Insert an entry, evicting the least recently used until within capacity.
+    /// Insert an entry, evicting the least recently used until within **both**
+    /// capacities.
+    ///
+    /// The entry going in is never the one evicted, even when it alone exceeds
+    /// the byte budget: the loop stops while it is the only thing left, because
+    /// a cache that refused the render just handed to it would make the pane
+    /// that asked re-render forever.
     pub fn insert(&mut self, key: RenderCacheKey, value: CachedRenderOutput) {
-        if self.entries.insert(key.clone(), value).is_some() {
+        let bytes = Self::entry_bytes(&value);
+        if let Some(old) = self.entries.insert(key.clone(), value) {
             // Replacing an existing entry: it is already in `recency`, just refresh it.
+            self.resident_bytes = self.resident_bytes.saturating_sub(Self::entry_bytes(&old));
             self.touch(&key);
         } else {
             self.recency.push_back(key);
         }
-        while self.entries.len() > self.capacity {
+        self.resident_bytes += bytes;
+        while self.entries.len() > self.capacity
+            || (self.resident_bytes > self.byte_capacity && self.entries.len() > 1)
+        {
             let Some(oldest) = self.recency.pop_front() else {
                 break;
             };
-            self.entries.remove(&oldest);
+            if let Some(gone) = self.entries.remove(&oldest) {
+                self.resident_bytes = self.resident_bytes.saturating_sub(Self::entry_bytes(&gone));
+            }
         }
     }
 
     /// Drop every entry whose key fails `keep`.
     pub fn retain(&mut self, keep: impl Fn(&RenderCacheKey) -> bool) {
+        let freed: usize = self
+            .entries
+            .iter()
+            .filter(|(k, _)| !keep(k))
+            .map(|(_, v)| Self::entry_bytes(v))
+            .sum();
+        self.resident_bytes = self.resident_bytes.saturating_sub(freed);
         self.entries.retain(|k, _| keep(k));
         self.recency.retain(|k| keep(k));
     }
@@ -311,6 +369,13 @@ impl RenderCache {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.recency.clear();
+        self.resident_bytes = 0;
+    }
+
+    /// Bytes the resident entries occupy.
+    #[cfg(test)]
+    pub fn resident_bytes(&self) -> usize {
+        self.resident_bytes
     }
 
     #[cfg(test)]
@@ -756,7 +821,10 @@ impl RenderDispatcher {
             fetch_generations: HashMap::new(),
             // Owned here so there is exactly one render budget counter in the process.
             renders_in_flight: Arc::new(AtomicUsize::new(0)),
-            render_cache: RenderCache::new(budgets.render_cache_entries),
+            render_cache: RenderCache::new(
+                budgets.render_cache_entries,
+                budgets.render_cache_budget_bytes(),
+            ),
             concurrent_renders: budgets.concurrent_renders,
             raster_side_ceiling_px: budgets.image_side_px,
             last_storm_motion_override: None,
