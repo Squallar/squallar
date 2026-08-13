@@ -1,12 +1,16 @@
 use std::any::Any;
 use std::fmt::Debug;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use rustdar_units::UserPreferences;
 
-use crate::fetch_policy::{DataCompleteness, FetchError, FetchFailure, FetchHealth, FetchRetry};
+use crate::fetch_policy::{
+    Assembled, DataCompleteness, FetchError, FetchFailure, FetchHealth, FetchRetry, FetchRound,
+    RoundShape, Whole,
+};
 use crate::render::controls::{
     ControlEffect, ControlItem, ControlUpdate, PaneControlContext, PaneControlContextMut,
 };
@@ -39,7 +43,20 @@ pub struct OverlayLegend {
 }
 
 /// Fetch-cache-generation lifecycle shared by every overlay type.
-pub struct OverlayState<T> {
+///
+/// `S` is the layer's declared [`RoundShape`], and it decides which
+/// data-installing method this state has at all — [`set_data`] for a [`Whole`]
+/// round, [`set_data_with_coverage`] and only that for an [`Assembled`] one.
+/// There is deliberately **no default** for it: a default is a way of not
+/// saying, and not saying is precisely how five layers came to declare a
+/// half-delivered round whole.
+///
+/// Nothing about it costs a `Whole` layer anything beyond the word: no field
+/// with a runtime size, no branch, no call it did not already make.
+///
+/// [`set_data`]: OverlayState::set_data
+/// [`set_data_with_coverage`]: OverlayState::set_data_with_coverage
+pub struct OverlayState<T, S: RoundShape> {
     pub data: T,
     /// Stamped on a **good answer only**. Was the sole input to "is a fetch
     /// due?", which is what made a failing layer due on every frame — see
@@ -49,9 +66,12 @@ pub struct OverlayState<T> {
     pub data_generation: u64,
     /// What the last fetch did, and what the next automatic one may do.
     pub retry: FetchRetry,
+    /// `fn() -> S` rather than `S`, so the marker can never make this state
+    /// less `Send` or less `Sync` than the data it holds.
+    shape: PhantomData<fn() -> S>,
 }
 
-impl<T: Default> Default for OverlayState<T> {
+impl<T: Default, S: RoundShape> Default for OverlayState<T, S> {
     fn default() -> Self {
         Self {
             data: T::default(),
@@ -59,52 +79,95 @@ impl<T: Default> Default for OverlayState<T> {
             fetching: false,
             data_generation: 0,
             retry: FetchRetry::new(),
+            shape: PhantomData,
         }
     }
 }
 
-impl<T: Default> OverlayState<T> {
+impl<T: Default, S: RoundShape> OverlayState<T, S> {
     pub fn new() -> Self {
         Self::default()
     }
 }
 
-impl<T> OverlayState<T> {
+impl<T> OverlayState<T, Whole> {
     /// Bumps `data_generation`, which is what invalidates cached textures.
     ///
     /// Also ends the fetch and clears the retry ladder: this **is** the good
     /// answer, and a handler should not have to remember to say so three times.
     ///
-    /// And declares the answer **whole**. A handler that says nothing about
-    /// coverage is saying its round cannot half-succeed, which is true of most
-    /// of them; the ones whose round is several requests call
-    /// [`set_data_with_coverage`](Self::set_data_with_coverage) instead. The
-    /// declaration is here rather than left as "whatever was there before" so
-    /// that a layer which recovers stops being marked incomplete without its
-    /// handler remembering to say so.
+    /// And declares the answer **whole** — which is now a thing it is entitled
+    /// to say, rather than a thing it says by default. This method exists only
+    /// on a state whose layer declared [`Whole`], and a layer only gets to
+    /// declare that by taking delivery of a round type that declared it too;
+    /// see [`FetchRound`]. A round assembled from several requests reaches
+    /// [`set_data_with_coverage`](OverlayState::set_data_with_coverage) or it
+    /// reaches nothing.
     pub fn set_data(&mut self, data: T) {
-        self.set_data_with_coverage(data, DataCompleteness::default());
+        self.install(data, DataCompleteness::default());
     }
+}
 
-    /// [`set_data`](Self::set_data) for a round that can deliver less than it
-    /// was asked for, carrying the report of how much less.
+impl<T> OverlayState<T, Assembled> {
+    /// The **only** way data reaches the map of a layer whose round can deliver
+    /// less than it was asked for. It carries the report of how much less
+    /// because there is nothing else to carry it with: this state has no
+    /// `set_data`.
     ///
-    /// One call rather than two, so the order cannot be got wrong: `set_data`
-    /// declares its answer whole, so a handler that recorded coverage first and
-    /// data second would erase its own report and be back to the silence this
-    /// exists to end.
+    /// One call rather than two, so the order cannot be got wrong: an ordinary
+    /// `set_data` declares its answer whole, so a handler that recorded
+    /// coverage first and data second would erase its own report and be back to
+    /// the silence this exists to end.
     ///
     /// The data still lands, the clock still stamps, the ladder still resets. A
     /// half-delivered round is a **good answer missing pieces**, not a failure:
     /// what arrived is real and has to be drawn, and filing it as a failure
     /// would back the layer off from the very retry that could complete it.
+    ///
+    /// A recovered round passes [`DataCompleteness::default`] through here and
+    /// the mark clears, so an assembled layer that is whole again does not have
+    /// to remember to say so either.
     pub fn set_data_with_coverage(&mut self, data: T, coverage: DataCompleteness) {
+        self.install(data, coverage);
+    }
+}
+
+impl<T, S: RoundShape> OverlayState<T, S> {
+    /// What both of the above do, which is the same thing: the difference
+    /// between them is what each is *allowed to pass*, never what happens next.
+    fn install(&mut self, data: T, coverage: DataCompleteness) {
         self.data = data;
         self.fetch_time = Some(web_time::Instant::now());
         self.data_generation = self.data_generation.wrapping_add(1);
         self.fetching = false;
         self.retry.record_success();
         self.retry.record_coverage(coverage);
+    }
+
+    /// This layer's own round, out of the payload the host handed back — and
+    /// the seam where the round type's declaration meets the layer's.
+    ///
+    /// `R::Shape` unifies with this state's `S`, which is what turns one
+    /// declaration into the whole guarantee. A handler holding a [`Whole`]
+    /// state cannot take delivery of a round that declared itself
+    /// [`Assembled`]: it does not compile, and the only fix is to say
+    /// `Assembled` in the state's own type — at which point `set_data` is gone
+    /// and the sole route onto the map is
+    /// [`set_data_with_coverage`](OverlayState::set_data_with_coverage), which
+    /// cannot be called without the report.
+    ///
+    /// Every handler takes delivery here rather than reaching for `downcast`
+    /// itself, because reaching for `downcast` is how a handler would step
+    /// around the unification and get its `Whole` state back;
+    /// `no_handler_takes_delivery_of_its_round_by_hand` fails if one starts.
+    ///
+    /// `None` is "this payload is not mine", which every caller logs and
+    /// returns on, exactly as it did when it wrote the downcast itself.
+    pub fn downcast_round<R>(&self, payload: FetchPayload) -> Option<R>
+    where
+        R: FetchRound<Shape = S>,
+    {
+        payload.downcast::<R>().ok().map(|round| *round)
     }
 
     /// A good answer that replaced no data — the outlook handler stamps its own
@@ -1477,7 +1540,7 @@ mod retry_ledger_tests {
     /// a handler that never clears it never polls again.
     #[test]
     fn recording_a_failure_ends_the_fetch() {
-        let mut state: OverlayState<Vec<u8>> = OverlayState::new();
+        let mut state: OverlayState<Vec<u8>, Whole> = OverlayState::new();
         state.fetching = true;
         state.record_failure(&FetchError::transient("network down"));
         assert!(!state.fetching);
@@ -1596,7 +1659,7 @@ mod retry_ledger_tests {
             (true, Some(true), true, "data drawn but broken: ask"),
         ];
         for (has_data, unhealthy, expected, why) in cases {
-            let mut state: OverlayState<Vec<u8>> = OverlayState::new();
+            let mut state: OverlayState<Vec<u8>, Whole> = OverlayState::new();
             if has_data {
                 state.set_data(vec![1]);
             }
@@ -1923,7 +1986,7 @@ mod retry_ledger_tests {
     fn switching_on_a_layer_that_under_drew_re_asks() {
         use crate::fetch_policy::DataCompleteness;
 
-        let mut state: OverlayState<Vec<u8>> = OverlayState::new();
+        let mut state: OverlayState<Vec<u8>, Assembled> = OverlayState::new();
         state.set_data_with_coverage(
             vec![1],
             DataCompleteness {
@@ -1935,7 +1998,10 @@ mod retry_ledger_tests {
         assert!(!state.retry.is_unhealthy(), "premise: the round succeeded");
         assert!(state.enable_should_refetch(true));
 
-        state.set_data(vec![1]);
+        // The recovered round, spelled the way an assembled layer has to spell
+        // it: there is no `set_data` on this state, and the whole report is
+        // what clears the mark.
+        state.set_data_with_coverage(vec![1], DataCompleteness::default());
         assert!(
             !state.enable_should_refetch(true),
             "a whole round must not spend a request on being switched on",
@@ -1964,7 +2030,7 @@ mod retry_ledger_tests {
     /// answer.
     #[test]
     fn switching_a_layer_on_does_not_double_a_fetch_in_flight() {
-        let mut state: OverlayState<Vec<u8>> = OverlayState::new();
+        let mut state: OverlayState<Vec<u8>, Whole> = OverlayState::new();
         state
             .retry
             .record_failure(&FetchError::transient("timeout"));

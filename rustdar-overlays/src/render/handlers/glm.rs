@@ -4,6 +4,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use rustdar_units::UserPreferences;
 
+use crate::fetch_policy::Assembled;
 use crate::glm::fetch::GlmCache;
 use crate::glm::{
     DeadFeed, FetchFailures, GLM_MAX_TIME_WINDOW_SECS, GLM_MIN_TIME_WINDOW_SECS, GlmDataLevel,
@@ -262,7 +263,7 @@ impl SatelliteSelection {
 const SECS_PER_MIN: f64 = 60.0;
 
 pub(crate) struct GlmHandler {
-    pub state: OverlayState<Vec<Arc<GlmFlashItem>>>,
+    pub state: OverlayState<Vec<Arc<GlmFlashItem>>, Assembled>,
     pub enabled: bool,
     pub satellite: SatelliteSelection,
     /// Time window in seconds, clamped to
@@ -612,7 +613,7 @@ impl OverlayHandler for GlmHandler {
     }
 
     fn apply_fetch_result(&mut self, result: FetchPayload) {
-        let Some(fetch) = result.downcast::<GlmFetchResult>().ok() else {
+        let Some(fetch) = self.state.downcast_round::<GlmFetchResult>(result) else {
             log::error!("GLM handler received unexpected fetch result type");
             return;
         };

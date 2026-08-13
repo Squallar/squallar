@@ -546,6 +546,98 @@ impl DataCompleteness {
     }
 }
 
+/// Whether a layer's fetch round is **one answer or several**, and so whether
+/// it can come back `Ok` with pieces of itself missing.
+///
+/// A distinction in the type system rather than a field, because what it has to
+/// control is *which method exists*. [`DataCompleteness`] made "fresh but
+/// under-drawn" **expressible**; it did not make declaring it **unavoidable**,
+/// and five handlers proved that the gap between those two is the entire
+/// defect. `OverlayState::set_data` is one call, it declares the answer whole,
+/// and it is what anybody writing a handler reaches for. Every one of the five
+/// silences was written by reaching for it, and every one of the five fixes was
+/// a reviewer noticing afterwards.
+///
+/// So a layer whose round is [`Assembled`] has no `set_data` to reach for. Not
+/// a lint and not a review note: the method is not in scope for that type, and
+/// what put it out of scope is the round type the layer takes delivery of — see
+/// [`FetchRound`].
+///
+/// Sealed. The two shapes below are the whole question, the same way
+/// [`crate::nws::zones::ZoneFailure`] has no fall-through: a third shape would
+/// be a place for a round to be neither, which is where a silence would live.
+pub trait RoundShape: sealed::Sealed {}
+
+/// One request, one answer: it arrived or it did not, and there is no third
+/// outcome to declare.
+///
+/// The shape of most layers, and the reason this is not a tax on all of them. A
+/// `Whole` layer writes `set_data(items)` exactly as it always did and says
+/// nothing at all about coverage, because it has nothing to say.
+///
+/// **HRRR is the instructive one.** Its round asks two model runs an hour
+/// apart and keeps whichever answers, so it looks multi-request — and it is not
+/// assembled, because either run alone is the same product and a whole answer
+/// to the question asked. A round that fell back to the older run has not
+/// under-delivered; it has answered. The line this trait draws is *can the
+/// answer be missing pieces*, never *how many requests did it take*, and a
+/// design that made HRRR declare coverage would be a design HRRR was worked
+/// around.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Whole;
+
+/// Several requests, each of which can fail on its own — so the round can end
+/// in `Ok`, stamp a fresh clock, read green, and leave part of the map blank.
+///
+/// The shape of every silence this module exists for. What was absent, under
+/// `Updated 0s ago` and no mark of any kind:
+///
+/// - **NWS alerts** — 212 of 297 warnings, whose UGC zone boundaries are one
+///   request each.
+/// - **GLM lightning**, twice — two satellite listings and a granule per
+///   object. Driven over a socket with both listings 200 and every granule
+///   503: **0 flashes, `is_complete()` true, no mark.**
+/// - **SPC storm reports** — three CSVs, one per kind. The tornado CSV 503s
+///   and every tornado report in the country leaves the map, indistinguishable
+///   from a quiet day on every user-visible surface.
+/// - **METAR** — one request per state network. One state refuses, that state
+///   blanks.
+///
+/// A layer that declares this shape gets `set_data_with_coverage` and nothing
+/// else, so the report is not something it can forget: there is no other way to
+/// put data on its map.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Assembled;
+
+impl RoundShape for Whole {}
+impl RoundShape for Assembled {}
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for super::Whole {}
+    impl Sealed for super::Assembled {}
+}
+
+/// What a layer's fetch hands back, and the shape of the round it belongs to.
+///
+/// **This is where the declaration is made, and it is made once.** The impl
+/// sits beside the round type, which is where the failure lists are in view —
+/// `MetarRound::failed_networks`, `StormReportRound::failed_kinds`,
+/// `GlmFetchOutcome::dead_feeds`, `ZoneResolution::failures`. Writing a `Vec`
+/// of failures into a round and then writing [`Whole`] under it is the one
+/// thing left that a person could still do; every other step is the compiler's.
+///
+/// From here the shape propagates on its own.
+/// `OverlayState::downcast_round` is how a handler takes delivery of its round,
+/// and it unifies `Self::Shape` with the state's own — so a state that says
+/// [`Whole`] cannot accept an [`Assembled`] round, and a state that says
+/// `Assembled` has no `set_data`. One declaration, two compile errors between
+/// it and a map that under-draws in silence.
+pub trait FetchRound: 'static {
+    /// [`Whole`] or [`Assembled`]; see each for which a round is.
+    type Shape: RoundShape;
+}
+
 /// The per-layer record of what the last fetch did and what the next automatic
 /// one is allowed to do.
 ///

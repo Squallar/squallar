@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use rustdar_units::UserPreferences;
 
+use crate::fetch_policy::Assembled;
 use crate::metar::types::{MetarOb, WindDir};
 use crate::render::controls::{
     ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext,
@@ -18,6 +19,17 @@ use crate::render::station_model;
 pub(crate) struct MetarFetchResult(
     pub Result<crate::metar::fetch::MetarRound, crate::fetch_policy::FetchError>,
 );
+/// [`Assembled`]: one request per state network, refused as a round only when
+/// every one of them was. A single state's network declining takes every
+/// station in that state off the map while the round still returns `Ok`,
+/// because the rest of the country's observations are real — and a viewport
+/// centred on the one dead state then drew nothing at all under `Updated 0s
+/// ago`.
+///
+/// [`Assembled`]: crate::fetch_policy::Assembled
+impl crate::fetch_policy::FetchRound for MetarFetchResult {
+    type Shape = crate::fetch_policy::Assembled;
+}
 
 const METAR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -177,7 +189,7 @@ impl OverlayItem for MetarItem {
 }
 
 pub(crate) struct MetarHandler {
-    pub state: OverlayState<Vec<Arc<MetarItem>>>,
+    pub state: OverlayState<Vec<Arc<MetarItem>>, Assembled>,
     cached_points: Vec<MapPoint>,
     pub enabled: bool,
 }
@@ -278,7 +290,7 @@ impl OverlayHandler for MetarHandler {
     }
 
     fn apply_fetch_result(&mut self, result: FetchPayload) {
-        let Some(fetch) = result.downcast::<MetarFetchResult>().ok() else {
+        let Some(fetch) = self.state.downcast_round::<MetarFetchResult>(result) else {
             log::error!("METAR handler received unexpected fetch result type");
             return;
         };
