@@ -11,6 +11,27 @@ pub enum AlertCategory {
 }
 
 impl AlertCategory {
+    /// **Every category, and the only enumeration of them.** The default
+    /// enabled set, the per-category toggles, the toggle handler and the
+    /// status line are all built by walking this, so a variant cannot exist in
+    /// the enum and be missing from the set that decides whether it paints.
+    ///
+    /// It could: `Other` was never inserted by any of the four writers of
+    /// `enabled_categories`, so `is_drawn` was permanently false for it and
+    /// every Air Quality Alert, Civil Emergency Message and Evacuation
+    /// Immediate in the feed was silently dropped — 25 of 271 active alerts in
+    /// the sample that found it. The counts filtered on the same predicate, so
+    /// the status line excluded them too and read a confident number that was
+    /// wrong by exactly the invisible set.
+    ///
+    /// Order is the order the UI offers them, most severe first.
+    pub const ALL: [AlertCategory; 4] = [
+        AlertCategory::Warning,
+        AlertCategory::Watch,
+        AlertCategory::Advisory,
+        AlertCategory::Other,
+    ];
+
     pub fn from_event(event: &str) -> Self {
         let lower = event.to_lowercase();
         if lower.contains("warning") {
@@ -33,6 +54,47 @@ impl AlertCategory {
             AlertCategory::Watch => "Watch",
             AlertCategory::Advisory => "Advisory",
             AlertCategory::Other => "Other",
+        }
+    }
+
+    /// The toggle's stable id. Persisted in saved control state, so these
+    /// strings are a compatibility surface and must not be respelled.
+    pub fn control_id(self) -> &'static str {
+        match self {
+            AlertCategory::Warning => "warnings",
+            AlertCategory::Watch => "watches",
+            AlertCategory::Advisory => "advisories",
+            AlertCategory::Other => "other",
+        }
+    }
+
+    /// Inverse of [`control_id`](AlertCategory::control_id); `None` for a
+    /// control that is not a category toggle at all.
+    pub fn from_control_id(id: &str) -> Option<Self> {
+        AlertCategory::ALL
+            .into_iter()
+            .find(|category| category.control_id() == id)
+    }
+
+    /// The toggle's label. Not `display_name` plus an "s": the plurals are
+    /// irregular and "Other" does not take one.
+    pub fn plural_label(self) -> &'static str {
+        match self {
+            AlertCategory::Warning => "Warnings",
+            AlertCategory::Watch => "Watches",
+            AlertCategory::Advisory => "Advisories",
+            AlertCategory::Other => "Other",
+        }
+    }
+
+    /// The status line's abbreviation, e.g. the `W/Wa/Adv/Oth` in
+    /// `"3 shown - W/Wa/Adv/Oth"`.
+    pub fn short_name(self) -> &'static str {
+        match self {
+            AlertCategory::Warning => "W",
+            AlertCategory::Watch => "Wa",
+            AlertCategory::Advisory => "Adv",
+            AlertCategory::Other => "Oth",
         }
     }
 }

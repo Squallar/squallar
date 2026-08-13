@@ -128,14 +128,10 @@ pub(crate) struct NwsAlertHandler {
 
 impl NwsAlertHandler {
     pub fn new() -> Self {
-        let mut enabled = HashSet::new();
-        enabled.insert(AlertCategory::Warning);
-        enabled.insert(AlertCategory::Watch);
-        enabled.insert(AlertCategory::Advisory);
         Self {
             state: OverlayState::new(),
             hidden_alerts: HashSet::new(),
-            enabled_categories: enabled,
+            enabled_categories: AlertCategory::ALL.into_iter().collect(),
         }
     }
 
@@ -200,8 +196,8 @@ impl OverlayHandler for NwsAlertHandler {
     }
 
     /// The master toggle over a layer whose "enabled" is really a category
-    /// set. Off clears the set; on restores the default three **only when the
-    /// set is empty**, so flipping the master off and on loses the user's
+    /// set. Off clears the set; on restores [`AlertCategory::ALL`] **only when
+    /// the set is empty**, so flipping the master off and on loses the user's
     /// subset — accepted, because remembering it would be a shadow copy of
     /// `enabled_categories` that persistence and the category toggles would
     /// both have to keep honest.
@@ -209,9 +205,7 @@ impl OverlayHandler for NwsAlertHandler {
         let was = self.is_enabled();
         if enabled {
             if self.enabled_categories.is_empty() {
-                self.enabled_categories.insert(AlertCategory::Warning);
-                self.enabled_categories.insert(AlertCategory::Watch);
-                self.enabled_categories.insert(AlertCategory::Advisory);
+                self.enabled_categories.extend(AlertCategory::ALL);
             }
         } else {
             self.enabled_categories.clear();
@@ -223,7 +217,7 @@ impl OverlayHandler for NwsAlertHandler {
         }
     }
 
-    /// E.g. `"3 shown - W/Wa/Adv"`: how many alerts are on the map, and which
+    /// E.g. `"3 shown - W/Wa/Adv/Oth"`: how many alerts are on the map, and which
     /// categories are letting them through. Counted through
     /// [`painted_count`] and [`drawn_count`], not by taking the length of
     /// `clickable_items`, which builds a `Vec` and an `Arc` per alert for a
@@ -249,16 +243,14 @@ impl OverlayHandler for NwsAlertHandler {
         } else {
             format!("{painted} of {allowed}")
         };
-        let mut cats = Vec::new();
-        for (category, short) in [
-            (AlertCategory::Warning, "W"),
-            (AlertCategory::Watch, "Wa"),
-            (AlertCategory::Advisory, "Adv"),
-        ] {
-            if self.enabled_categories.contains(&category) {
-                cats.push(short);
-            }
-        }
+        // Walked from `AlertCategory::ALL`, not from a list spelled out here:
+        // a hand-written list is what let `Other` be enabled and still go
+        // unnamed, and before that unenabled and uncounted.
+        let cats: Vec<&str> = AlertCategory::ALL
+            .into_iter()
+            .filter(|category| self.enabled_categories.contains(category))
+            .map(AlertCategory::short_name)
+            .collect();
         Some(format!("{shown} shown - {}", cats.join("/")))
     }
 
@@ -464,26 +456,21 @@ impl OverlayHandler for NwsAlertHandler {
     }
 
     fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
-        let mut items = vec![
-            ControlItem::Heading {
-                text: "NWS Alerts".into(),
-            },
-            ControlItem::Toggle {
-                id: "warnings",
-                label: "Warnings".into(),
-                enabled: self.enabled_categories.contains(&AlertCategory::Warning),
-            },
-            ControlItem::Toggle {
-                id: "watches",
-                label: "Watches".into(),
-                enabled: self.enabled_categories.contains(&AlertCategory::Watch),
-            },
-            ControlItem::Toggle {
-                id: "advisories",
-                label: "Advisories".into(),
-                enabled: self.enabled_categories.contains(&AlertCategory::Advisory),
-            },
-        ];
+        let mut items = vec![ControlItem::Heading {
+            text: "NWS Alerts".into(),
+        }];
+        // One toggle per category, walked from `AlertCategory::ALL` rather
+        // than written out: a category with no toggle is a category the user
+        // cannot turn on, and `Other` had none.
+        items.extend(
+            AlertCategory::ALL
+                .into_iter()
+                .map(|category| ControlItem::Toggle {
+                    id: category.control_id(),
+                    label: category.plural_label().into(),
+                    enabled: self.enabled_categories.contains(&category),
+                }),
+        );
 
         // Ungated on enabled (the every-option rule, M9.1): a hidden
         // layer's options stay visible and editable - edits take effect
@@ -539,48 +526,76 @@ impl OverlayHandler for NwsAlertHandler {
         update: &ControlUpdate,
         _ctx: &mut PaneControlContextMut<'_>,
     ) -> ControlEffect {
-        match update.id {
-            "warnings" | "watches" | "advisories" => {
-                let category = match update.id {
-                    "warnings" => AlertCategory::Warning,
-                    "watches" => AlertCategory::Watch,
-                    "advisories" => AlertCategory::Advisory,
-                    _ => return ControlEffect::None,
-                };
-                if let ControlValue::Bool(enabled) = update.value {
-                    let was_enabled = self.is_enabled();
-                    if enabled {
-                        self.enabled_categories.insert(category);
-                    } else {
-                        self.enabled_categories.remove(&category);
-                    }
-                    self.state.data_generation = self.state.data_generation.wrapping_add(1);
-                    if !was_enabled
-                        && self.is_enabled()
-                        && self.state.enable_should_refetch(self.has_data())
-                    {
-                        return ControlEffect::Fetch;
-                    }
-                }
-                ControlEffect::None
-            }
-            "refresh" => ControlEffect::Fetch,
-            _ => ControlEffect::None,
+        if update.id == "refresh" {
+            return ControlEffect::Fetch;
         }
+        // Resolved through `AlertCategory::from_control_id`, so the set of
+        // toggles this accepts is the same enumeration `controls` offers. The
+        // two used to be independent lists of three ids each, which is how a
+        // fourth category ended up with no way to turn it on.
+        let Some(category) = AlertCategory::from_control_id(update.id) else {
+            return ControlEffect::None;
+        };
+        if let ControlValue::Bool(enabled) = update.value {
+            let was_enabled = self.is_enabled();
+            if enabled {
+                self.enabled_categories.insert(category);
+            } else {
+                self.enabled_categories.remove(&category);
+            }
+            self.state.data_generation = self.state.data_generation.wrapping_add(1);
+            if !was_enabled
+                && self.is_enabled()
+                && self.state.enable_should_refetch(self.has_data())
+            {
+                return ControlEffect::Fetch;
+            }
+        }
+        ControlEffect::None
     }
 
+    /// `known_categories` records which categories *this build offered a
+    /// toggle for*, beside the ones the user left on. It exists so
+    /// [`deserialize_state`] can tell "the user turned this off" apart from
+    /// "the build that saved this had no way to turn it on" — see there.
+    ///
+    /// [`deserialize_state`]: OverlayHandler::deserialize_state
     fn serialize_state(&self) -> serde_json::Value {
         serde_json::json!({
             "enabled_categories": self.enabled_categories,
+            "known_categories": AlertCategory::ALL,
         })
     }
 
+    /// A category the saving build never offered is **not** a category the
+    /// user declined, so it comes back on.
+    ///
+    /// Without this, the fix for the unreachable `Other` category would have
+    /// reached only new installs: every existing user carries a persisted set
+    /// of exactly three, saved by a build whose control list had three
+    /// toggles, and restoring it verbatim would keep every Air Quality Alert
+    /// off their map forever while the new toggle sat there reading "off" as
+    /// though they had chosen it.
+    ///
+    /// An **empty** set is left alone: that is the master toggle off, a
+    /// deliberate state, and widening it would turn the whole layer back on.
     fn deserialize_state(&mut self, value: serde_json::Value) {
         if let Some(cats) = value
             .get("enabled_categories")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
         {
             self.enabled_categories = cats;
+            let known: HashSet<AlertCategory> = value
+                .get("known_categories")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            if !self.enabled_categories.is_empty() {
+                self.enabled_categories.extend(
+                    AlertCategory::ALL
+                        .into_iter()
+                        .filter(|c| !known.contains(c)),
+                );
+            }
         }
     }
 }
@@ -820,7 +835,7 @@ mod tests {
         );
         assert_eq!(
             handler.status_line().as_deref(),
-            Some("1 of 3 shown - W/Wa/Adv"),
+            Some("1 of 3 shown - W/Wa/Adv/Oth"),
             "two alerts with no shape must not be counted as shown",
         );
 
@@ -829,14 +844,17 @@ mod tests {
         handler.hidden_alerts.insert("a".to_string());
         assert_eq!(
             handler.status_line().as_deref(),
-            Some("0 of 2 shown - W/Wa/Adv"),
+            Some("0 of 2 shown - W/Wa/Adv/Oth"),
             "both numbers must move with the filters, not just the denominator",
         );
 
         // And once the boundaries arrive, the split spelling goes away.
         handler.hidden_alerts.clear();
         handler.apply_fetch_result(whole(vec![zone_alert("a", "Tornado Warning", 3)]));
-        assert_eq!(handler.status_line().as_deref(), Some("1 shown - W/Wa/Adv"));
+        assert_eq!(
+            handler.status_line().as_deref(),
+            Some("1 shown - W/Wa/Adv/Oth")
+        );
     }
 
     /// The status line counts what would *draw* — category-filtered and
@@ -848,17 +866,23 @@ mod tests {
             alert("a", "Tornado Warning"),
             alert("b", "Severe Thunderstorm Warning"),
         ]);
-        assert_eq!(handler.status_line().as_deref(), Some("2 shown - W/Wa/Adv"));
+        assert_eq!(
+            handler.status_line().as_deref(),
+            Some("2 shown - W/Wa/Adv/Oth")
+        );
 
         handler.hidden_alerts.insert("b".to_string());
         assert_eq!(
             handler.status_line().as_deref(),
-            Some("1 shown - W/Wa/Adv"),
+            Some("1 shown - W/Wa/Adv/Oth"),
             "a hidden alert is not shown, so it must not be counted as shown"
         );
 
         handler.enabled_categories.remove(&AlertCategory::Advisory);
         handler.enabled_categories.remove(&AlertCategory::Watch);
+        assert_eq!(handler.status_line().as_deref(), Some("1 shown - W/Oth"));
+
+        handler.enabled_categories.remove(&AlertCategory::Other);
         assert_eq!(handler.status_line().as_deref(), Some("1 shown - W"));
 
         handler.enabled_categories.clear();
@@ -885,15 +909,15 @@ mod tests {
         assert!(handler.is_enabled());
         assert_eq!(
             handler.enabled_categories.len(),
-            3,
-            "on from nothing restores all three categories"
+            AlertCategory::ALL.len(),
+            "on from nothing restores every category"
         );
 
         handler.enabled_categories.remove(&AlertCategory::Advisory);
         handler.set_enabled(true);
         assert_eq!(
             handler.enabled_categories.len(),
-            2,
+            AlertCategory::ALL.len() - 1,
             "on over a live subset must not widen the user's selection"
         );
     }
@@ -992,6 +1016,192 @@ mod tests {
 
         handler.enabled_categories.clear();
         agree(&handler, 0, "the whole layer off draws and answers nothing");
+    }
+
+    /// Real NWS event names, from the same capture of
+    /// `api.weather.gov/alerts/types` that `nws::colors` checks its table
+    /// against. Provenance and refresh instructions are in the file's header.
+    const EVENT_TYPES_FIXTURE: &str = include_str!("../../nws/event_types.txt");
+
+    fn every_nws_event_type() -> Vec<&'static str> {
+        EVENT_TYPES_FIXTURE
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect()
+    }
+
+    /// **Every product NWS can send must be paintable by a fresh install.**
+    ///
+    /// This is the check that was missing, and it is deliberately driven by
+    /// *NWS's* enumeration rather than by `AlertCategory::ALL`: asserting that
+    /// our four variants are all enabled would only assert that our list
+    /// equals our list, and the defect lived precisely in the gap between the
+    /// enum and the set of toggles somebody wrote out by hand.
+    ///
+    /// Before the fix, 11 of the 111 published event types classified as
+    /// `Other` — Air Quality Alert, Civil Emergency Message, Evacuation
+    /// Immediate, Child Abduction Emergency, Blue Alert, Local Area Emergency,
+    /// 911 Telephone Outage, Administrative Message, Extreme Fire Danger,
+    /// Short Term Forecast, Test — and no code path anywhere inserted `Other`
+    /// into `enabled_categories`, so all 11 were unpaintable by construction.
+    /// In the live sample that found it, 25 of 271 active alerts were Air
+    /// Quality Alerts.
+    #[test]
+    fn every_nws_event_type_lands_in_a_category_a_fresh_install_draws() {
+        let handler = NwsAlertHandler::new();
+        let events = every_nws_event_type();
+        assert!(
+            events.len() > 100,
+            "fixture: expected the full NWS product list, got {}; an empty \
+             fixture would make this pass vacuously",
+            events.len(),
+        );
+
+        let orphaned: Vec<(&str, AlertCategory)> = events
+            .iter()
+            .map(|e| (*e, AlertCategory::from_event(e)))
+            .filter(|(_, category)| !handler.enabled_categories.contains(category))
+            .collect();
+        assert!(
+            orphaned.is_empty(),
+            "these NWS products classify into a category no default install \
+             enables, so they can never be drawn: {orphaned:?}",
+        );
+    }
+
+    /// **Every category must have a toggle, and the toggle must work.**
+    ///
+    /// The other half of the same defect: `Other` had no `ControlItem::Toggle`
+    /// and `apply_control` accepted no id that resolved to it, so even a user
+    /// who knew alerts were missing had no way to ask for them. Driving both
+    /// the control list and the handler from `AlertCategory::ALL` is what
+    /// makes that unrepresentable; this pins it.
+    #[test]
+    fn every_category_has_a_toggle_that_turns_it_on_and_off() {
+        let mut handler = NwsAlertHandler::new();
+        let offered: Vec<&str> = handler
+            .controls(&PaneControlContext {
+                pane_idx: 0,
+                pane_state: None,
+            })
+            .into_iter()
+            .filter_map(|item| match item {
+                ControlItem::Toggle { id, .. } => Some(id),
+                _ => None,
+            })
+            .collect();
+
+        for category in AlertCategory::ALL {
+            assert!(
+                offered.contains(&category.control_id()),
+                "{category} has no toggle; the panel offers {offered:?}",
+            );
+
+            let mut ctx = PaneControlContextMut {
+                pane_idx: 0,
+                pane_state: None,
+            };
+            handler.apply_control(
+                &ControlUpdate {
+                    id: category.control_id(),
+                    value: ControlValue::Bool(false),
+                },
+                &mut ctx,
+            );
+            assert!(
+                !handler.enabled_categories.contains(&category),
+                "{category}'s toggle did not turn it off",
+            );
+            handler.apply_control(
+                &ControlUpdate {
+                    id: category.control_id(),
+                    value: ControlValue::Bool(true),
+                },
+                &mut ctx,
+            );
+            assert!(
+                handler.enabled_categories.contains(&category),
+                "{category}'s toggle did not turn it back on",
+            );
+        }
+    }
+
+    /// **The count that would have revealed the gap excluded it too.**
+    ///
+    /// `drawn_count` and `painted_count` both filter on `is_drawn`, which was
+    /// permanently false for `Other`, so the status line reported a confident
+    /// number that was wrong by exactly the set the user could not see. An Air
+    /// Quality Alert now counts and is clickable like any other product, and
+    /// turning its category off takes it out of both.
+    #[test]
+    fn an_air_quality_alert_is_drawn_counted_and_clickable() {
+        let mut handler = handler_with(vec![
+            alert("a", "Tornado Warning"),
+            alert("b", "Air Quality Alert"),
+        ]);
+        assert_eq!(
+            AlertCategory::from_event("Air Quality Alert"),
+            AlertCategory::Other,
+            "fixture: this is the category the whole defect was about",
+        );
+
+        assert_eq!(
+            handler.drawn_count(),
+            2,
+            "the air quality alert is missing from the count that would have \
+             shown it missing from the map",
+        );
+        assert_eq!(handler.clickable_items().len(), 2);
+        assert_eq!(
+            handler.status_line().as_deref(),
+            Some("2 shown - W/Wa/Adv/Oth"),
+        );
+
+        // And it is a real filter, not an unconditional pass.
+        handler.enabled_categories.remove(&AlertCategory::Other);
+        assert_eq!(handler.drawn_count(), 1);
+        assert_eq!(handler.status_line().as_deref(), Some("1 shown - W/Wa/Adv"));
+    }
+
+    /// A set persisted by a build that had three toggles is not a user who
+    /// turned the fourth off — they were never offered it — so restoring it
+    /// must not carry the invisible category forward. Without this the fix
+    /// reaches new installs only, and every existing user keeps a map with no
+    /// air quality alerts on it.
+    ///
+    /// An empty set is the master toggle off and stays off.
+    #[test]
+    fn a_category_the_saved_build_never_offered_comes_back_on() {
+        let legacy = serde_json::json!({
+            "enabled_categories": ["Warning", "Watch", "Advisory"],
+        });
+        let mut handler = NwsAlertHandler::new();
+        handler.deserialize_state(legacy);
+        assert!(
+            handler.enabled_categories.contains(&AlertCategory::Other),
+            "a category with no toggle in the saving build was never declined",
+        );
+
+        // A choice this build *did* offer is honoured.
+        let mut handler = NwsAlertHandler::new();
+        handler.deserialize_state(serde_json::json!({
+            "enabled_categories": ["Warning"],
+            "known_categories": AlertCategory::ALL,
+        }));
+        assert_eq!(
+            handler.enabled_categories,
+            HashSet::from([AlertCategory::Warning]),
+            "the user turned three categories off and they must stay off",
+        );
+
+        // The master toggle off stays off.
+        let mut handler = NwsAlertHandler::new();
+        handler.deserialize_state(serde_json::json!({ "enabled_categories": [] }));
+        assert!(
+            handler.enabled_categories.is_empty(),
+            "an empty set is a deliberate state, not a build to migrate",
+        );
     }
 
     /// The fold is order-free: the same set in another order is the same

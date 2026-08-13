@@ -815,7 +815,7 @@ impl OverlayRegistry {
     /// one click away in the layer's options
     /// ([`DataCompleteness::status_note`]), and the handler's own line is
     /// already standing right beside this saying how much of it drew —
-    /// `! incomplete - 85 of 297 shown - W/Wa/Adv`.
+    /// `! incomplete - 85 of 297 shown - W/Wa/Adv/Oth`.
     pub fn status_line(&self, kind: OverlayKind) -> Option<String> {
         let handler = self.handler(kind)?;
         let line = handler.status_line();
@@ -1726,7 +1726,7 @@ mod retry_ledger_tests {
         });
         assert_eq!(
             registry.status_line(kind).as_deref(),
-            Some("297 shown - W/Wa/Adv"),
+            Some("297 shown - W/Wa/Adv/Oth"),
             "a whole round must read as a plain count",
         );
         let quiet = registry.controls(kind, &ctx).len();
@@ -1751,7 +1751,7 @@ mod retry_ledger_tests {
         // that no longer claims 297 warnings are on a map holding 85.
         assert_eq!(
             registry.status_line(kind).as_deref(),
-            Some("! incomplete - 85 of 297 shown - W/Wa/Adv"),
+            Some("! incomplete - 85 of 297 shown - W/Wa/Adv/Oth"),
             "a layer drawing 85 of 297 warnings must not read as healthy",
         );
 
@@ -1815,7 +1815,7 @@ mod retry_ledger_tests {
         });
         assert_eq!(
             registry.status_line(kind).as_deref(),
-            Some("297 shown - W/Wa/Adv"),
+            Some("297 shown - W/Wa/Adv/Oth"),
             "the mark outlived the round it was about",
         );
     }
@@ -1851,7 +1851,7 @@ mod retry_ledger_tests {
         });
         assert_eq!(
             registry.status_line(kind).as_deref(),
-            Some("! incomplete - 85 of 297 shown - W/Wa/Adv"),
+            Some("! incomplete - 85 of 297 shown - W/Wa/Adv/Oth"),
         );
 
         // The origin then goes away entirely. What is drawn is now both a
@@ -1859,7 +1859,7 @@ mod retry_ledger_tests {
         registry.record_fetch_failure(kind, &FetchError::transient("connection refused"));
         assert_eq!(
             registry.status_line(kind).as_deref(),
-            Some("! not updating, incomplete - 85 of 297 shown - W/Wa/Adv"),
+            Some("! not updating, incomplete - 85 of 297 shown - W/Wa/Adv/Oth"),
             "a failure must not overwrite the coverage verdict, or the reverse",
         );
 
@@ -1886,7 +1886,7 @@ mod retry_ledger_tests {
         registry.clear_retry(kind);
         assert_eq!(
             registry.status_line(kind).as_deref(),
-            Some("! incomplete - 85 of 297 shown - W/Wa/Adv"),
+            Some("! incomplete - 85 of 297 shown - W/Wa/Adv/Oth"),
             "clearing the retry ladder marked the layer whole before the answer \
              that would make it whole had landed",
         );
