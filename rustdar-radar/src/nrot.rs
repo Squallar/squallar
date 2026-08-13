@@ -2264,6 +2264,43 @@ const TEXTURE_RANGE_HALF_KM: f64 = 1.0;
 /// beam. A physical distance rather than a gate count, because a super-res
 /// velocity cut repeats one estimate over two 0.25 km gates and adjacent-gate
 /// differences there are structurally zero half the time.
+///
+/// # How much of the corpus reports that way
+///
+/// Not an edge case. Of 158 volumes surveyed, 38 — 24% — are long pulse, and
+/// every one of them declares 250 m gate spacing while delivering 500 m
+/// content replicated exactly 2x: adjacent gates are bit-identical at every
+/// even-indexed pair, on all seven moments. `pulse_width == 4` is the
+/// discriminator, and it is exact — no disagreement in either direction
+/// anywhere in the survey. The VCP number is **not** one, and nothing may key
+/// on it: VCP 34 replicates as readily as VCP 31. Py-ART and MetPy decode the
+/// same replication at 100.000% agreement, so this is a property of the data
+/// and not of a decoder.
+///
+/// Both volumes this module is tuned against are in that class. KHNX
+/// 2024-12-16 08:01:56 — the null control that must paint nothing — and KTLX
+/// 2025-02-19 — the reference field [`COH_MAX_STRADDLE`] is measured against —
+/// are both VCP 31 `pulse_width = 4`. The KDDC holdout is short pulse.
+///
+/// Reading the declared grid rather than the 500 m samples under it costs
+/// nothing measurable. Across the corpus the straddling fraction moves by a
+/// mean of 0.013% and a max of 0.036%, and the refused fraction by at most
+/// 0.00066 percentage points: KHNX 92.98% against 93.00%, KTLX 14.26% against
+/// 14.26%. No threshold flips, and [`COH_MAX_STRADDLE`]'s own measured margins
+/// are three orders of magnitude wider. Collapsing the replication before the
+/// rules read it would therefore buy nothing on the 24% and wreck the other
+/// 76%, where the same operation moves the field by up to 97% — and it would
+/// fork the baseline the reference comparison is stated in.
+///
+/// # The floor under the conversion
+///
+/// Both derivations of the separation floor the rounded quotient at one gate.
+/// At a gate interval of 0.75 km or wider the quotient rounds to zero and the
+/// floor substitutes one gate, which is a shorter span than the thresholds
+/// above are calibrated for — and silently, since nothing about the result
+/// says the conversion did not survive. It is unreachable on this corpus: all
+/// 157 velocity sweeps land at two gates (155 of them) or three (2 TDWR cuts).
+/// Recorded, not handled.
 const TEXTURE_STEP_KM: f64 = 0.5;
 
 /// Azimuthal half-span of the texture window, in rows: the widest span any
@@ -3251,6 +3288,9 @@ fn incoherent_velocity(
     // The same separation [`range_texture`] differences at, and for the same
     // reason: a super-res velocity cut repeats one estimate over two 0.25 km
     // gates, so adjacent-gate differences are structurally zero half the time.
+    // `TEXTURE_STEP_KM` carries how much of the corpus reports that way, and
+    // what the floor below would cost on a cut that declared wider gates than
+    // any of it does.
     let dk = ((TEXTURE_STEP_KM / gate_interval_km).round() as usize).max(1);
     // Per row, the straddling and present pair counts and their running window
     // sums, so the azimuthal pass adds rows rather than rewalking gates —
@@ -4686,6 +4726,127 @@ mod tests {
                 assert_eq!(refused, 0, "a wrapping ramp is refused nowhere");
             }
         }
+    }
+
+    /// One physical field twice: as the short-pulse cut whose gates really are
+    /// 0.5 km apart, and as the long-pulse cut that declares 0.25 km gates and
+    /// fills each pair of them with one estimate.
+    ///
+    /// Returns `(coarse, replicated, azimuths)`. `replicated` is `coarse` with
+    /// every value duplicated into an adjacent gate pair — bit-identical
+    /// neighbours, exactly as a `pulse_width = 4` volume reports them (see
+    /// [`TEXTURE_STEP_KM`]).
+    ///
+    /// One cell in `SPARSE` carries a `+1.00·Vny` spike, so a spike puts its
+    /// two neighbouring cell pairs inside the straddling band and the fraction
+    /// of straddling pairs is 2/`SPARSE` ≈ 5.9%. That is over
+    /// [`COH_MAX_STRADDLE`]'s 3.9% and *under twice* it, which is the whole
+    /// point: differencing adjacent gates on the replicated grid reads half
+    /// the pairs as structurally zero, halving the fraction to ≈ 2.9% — under
+    /// the threshold. The band is narrow because the dilution is exactly 2x
+    /// and nothing else about the field changes, so if [`COH_MAX_STRADDLE`]
+    /// moves, `SPARSE` has to move with it to stay inside (3.9%, 7.8%).
+    ///
+    /// The base is a wind rather than a constant for the same reason
+    /// [`straddle_fixture`]'s is, and both terms stay inside the declared
+    /// limit so nothing in it folds.
+    fn long_pulse_fixture(n: usize, cells: usize) -> (Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<f64>) {
+        const SPARSE: usize = 34;
+        let azimuths = ring_azimuths(n);
+        let coarse: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                let base = 5.0 + 8.0 * azimuths[i].to_radians().cos();
+                (0..cells)
+                    .map(|k| {
+                        if (i * 7 + k * 13) % SPARSE == 0 {
+                            base + STRADDLE_VNY
+                        } else {
+                            base
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let replicated = coarse
+            .iter()
+            .map(|row| row.iter().flat_map(|&v| [v, v]).collect())
+            .collect();
+        (coarse, replicated, azimuths)
+    }
+
+    /// [`incoherent_velocity`] separates its samples by a physical distance
+    /// converted through the declared gate spacing, and **not** by gate
+    /// adjacency — which is the only reason long-pulse volumes do not defeat
+    /// it.
+    ///
+    /// A `pulse_width = 4` WSR-88D volume declares 250 m gates and delivers
+    /// 500 m content replicated exactly 2x: adjacent gates are bit-identical
+    /// at every even-indexed pair. `dk = round(`[`TEXTURE_STEP_KM`]` / gi)` is
+    /// 2 gates there, so the comparison straddles the replication period at
+    /// every parity and never differences a gate against its own copy. Written
+    /// as a bare `1` — which is what `((0.5 / gi).round() as usize).max(1)`
+    /// invites a reader to "simplify" it to — half of every comparison is a
+    /// value against itself, the straddling fraction halves, and the rule stops
+    /// refusing. On KHNX 2024-12-16 08:01:56, the null control that must paint
+    /// nothing, that is a collapse from 92.98% of bins refused to 0.45%: a 19x
+    /// error, and the failure is **silent** — no panic, no NaN, no warning,
+    /// just a control volume that quietly stops controlling.
+    ///
+    /// Three legs, the same physical field throughout:
+    ///
+    /// - the honest 0.5 km-gate declaration refuses it — the field really is
+    ///   incoherent at 500 m, so the other two legs are about the grid and not
+    ///   about the field;
+    /// - the replicated 0.25 km-gate declaration refuses it too, because the
+    ///   0.5 km span is conserved as 2 gates;
+    /// - handing the replicated grid a 0.5 km spacing forces the separation to
+    ///   one gate and the refusal disappears. That leg is the counterfactual,
+    ///   and it is what makes the second leg discriminate: with the separation
+    ///   hardcoded to 1 the second leg reads like the third and fails.
+    #[test]
+    fn the_gate_separation_is_a_distance_and_not_a_gate_count() {
+        let (n, cells) = (360usize, 400usize);
+        let (coarse, replicated, azimuths) = long_pulse_fixture(n, cells);
+        assert!(
+            (0..cells).all(|k| replicated[0][2 * k] == replicated[0][2 * k + 1]),
+            "the fixture must carry 500 m content on a declared 250 m grid",
+        );
+
+        let coarse_sweep = VelocitySweep {
+            vel_grid: &coarse,
+            azimuths_deg: &azimuths,
+            gate_count: cells,
+            first_gate_range_km: 2.125,
+            gate_interval_km: 0.5,
+            declared_nyquist_ms: Some(STRADDLE_VNY),
+        };
+        let rows = sweep_rows(&coarse_sweep, n);
+        let refused = |grid: &[Vec<f64>], gc: usize, gi: f64| {
+            incoherent_velocity(grid, rows, gc, gi, STRADDLE_VNY)
+                .iter()
+                .filter(|m| **m)
+                .count()
+        };
+
+        // The field is incoherent at 500 m, whichever grid reports it.
+        assert_eq!(
+            refused(&coarse, cells, 0.5),
+            n * cells,
+            "the 0.5 km-gate cut must refuse every bin of it",
+        );
+        assert_eq!(
+            refused(&replicated, 2 * cells, 0.25),
+            n * 2 * cells,
+            "and so must the same field replicated onto a 0.25 km grid",
+        );
+
+        // The counterfactual: one gate apart on the replicated grid, half of
+        // every comparison is a value against its own copy.
+        assert_eq!(
+            refused(&replicated, 2 * cells, 0.5),
+            0,
+            "differencing adjacent gates on replicated content refuses nothing",
+        );
     }
 
     /// What the dealiaser does with it: nothing at all. Not a value unfolded,
