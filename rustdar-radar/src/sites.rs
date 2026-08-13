@@ -276,6 +276,18 @@ pub struct SiteTable {
     /// Identifiers that exist but have no position, sorted and deduplicated.
     /// Disjoint from `rows` by construction — see [`extended`].
     unplaced: &'static [&'static str],
+    /// Where the fetched catalogue put each radar it placed, micro-degrees,
+    /// kept beside the rows rather than folded into them.
+    ///
+    /// A row is the *answer* — whichever source won. This is one particular
+    /// source's claim, retained because it is the only one a volume cannot
+    /// have written, and so the only one a volume can honestly be checked
+    /// against. Checking a volume against the row instead would let a position
+    /// learned from one bad volume confirm itself forever: the bad position
+    /// becomes the row, and every later good volume then "disagrees" with it.
+    ///
+    /// Read through [`catalogue_position`](Self::catalogue_position).
+    catalogued: HashMap<&'static str, (i32, i32)>,
 }
 
 impl SiteTable {
@@ -334,6 +346,28 @@ impl SiteTable {
     /// of it and has no position for it.
     pub fn get(&self, site: &str) -> Option<&'static RadarSite> {
         self.by_name.get(site).copied()
+    }
+
+    /// Where the **fetched catalogue** put `site`, degrees, or `None` if no
+    /// catalogue this process read has placed it.
+    ///
+    /// Deliberately not [`get`](Self::get): that answers "where is this radar",
+    /// which is a question every source gets to answer. This answers "what does
+    /// the one source outside the volume stream say", which is what
+    /// [`crate::types::ScanInfo::from_scan`] needs in order to hold a volume's
+    /// own claim against something.
+    ///
+    /// `None` is a real state and a common one — a fresh install that has not
+    /// reached the network yet has no catalogue at all, and two identifiers
+    /// with real Level II data (`TPBI`, `KCRI`) are 404 from
+    /// `api.weather.gov/radar/stations` and will never appear here.
+    pub fn catalogue_position(&self, site: &str) -> Option<(f64, f64)> {
+        self.catalogued.get(site).map(|&(lat_udeg, lon_udeg)| {
+            (
+                crate::site_position::degrees_from_micro(lat_udeg),
+                crate::site_position::degrees_from_micro(lon_udeg),
+            )
+        })
     }
 
     /// The row closest to `lat`/`lon`, with its distance in kilometres.
@@ -618,7 +652,20 @@ where
     // never outranks a learned one" a property of the *input* rather than of
     // the order two loops happened to run in.
     let mut best: HashMap<&'a str, SiteFix> = HashMap::new();
+    // Every catalogue claim in this resolution, recorded *before* ranking.
+    // Ranking is lossy on purpose — a learned position supplied alongside a
+    // fetched one discards the fetched one — and the discarded half is exactly
+    // what `catalogued` exists to keep. Reading it out of `best` afterwards
+    // would silently lose the catalogue for every radar this install has
+    // already learned, which is every radar the check below matters for.
+    let mut claimed: Vec<(&'a str, (i32, i32))> = Vec::new();
     for (name, fix) in fixes {
+        if let SiteFix::Network {
+            lat_udeg, lon_udeg, ..
+        } = fix
+        {
+            claimed.push((name, (lat_udeg, lon_udeg)));
+        }
         match best.entry(name) {
             std::collections::hash_map::Entry::Vacant(slot) => {
                 slot.insert(fix);
@@ -681,6 +728,21 @@ where
         }
         changed = true;
     }
+    // Keyed by the row's own `&'static str` rather than by the borrowed name,
+    // so a catalogue re-read every launch reuses the identifier already leaked
+    // and adds nothing. Every `Network` fix carries a position and so always
+    // produces a row, which is why a claim that finds none is dropped rather
+    // than remembered against a name nothing placed.
+    let mut catalogued = base.catalogued.clone();
+    let placed: HashMap<&str, &'static str> = rows.iter().map(|row| (row.name, row.name)).collect();
+    for (name, position) in claimed {
+        if let Some(&name) = placed.get(name)
+            && catalogued.insert(name, position) != Some(position)
+        {
+            changed = true;
+        }
+    }
+
     if !changed {
         return None;
     }
@@ -692,6 +754,7 @@ where
         rows,
         by_name,
         unplaced: Box::leak(unplaced.into_boxed_slice()),
+        catalogued,
     })))
 }
 
@@ -709,6 +772,7 @@ fn empty_table() -> &'static SiteTable {
             rows: &[],
             by_name: HashMap::new(),
             unplaced: &[],
+            catalogued: HashMap::new(),
         }))
     });
     *EMPTY
@@ -844,6 +908,13 @@ pub fn static_name(site: &str) -> Option<&'static str> {
 /// radar.
 pub fn get_radar_site(site: &str) -> Option<&'static RadarSite> {
     table().get(site)
+}
+
+/// Where the fetched catalogue put `site`, degrees, or `None` if none has.
+///
+/// See [`SiteTable::catalogue_position`].
+pub fn catalogue_position(site: &str) -> Option<(f64, f64)> {
+    table().catalogue_position(site)
 }
 
 /// Great-circle distance between two coordinates, in kilometres.
@@ -1542,19 +1613,59 @@ mod tests {
     /// `PartialEq`: Android resolves twice from the same cached catalogue, and
     /// a rebuild there would leak a whole table — every row of it — for a
     /// catalogue that had not changed since the last call.
+    ///
+    /// # A catalogue claim is not only a row
+    ///
+    /// The middle third of this used to be the whole of it, asserting that a
+    /// *first* `Network` fix reproducing an existing row builds nothing. That
+    /// stopped being true when the table started keeping
+    /// [`SiteTable::catalogue_position`], and it stopped being true because it
+    /// stopped being *correct*: a table that has the catalogue's own claim can
+    /// hold a volume against it and a table without it cannot, so the two are
+    /// not the same table however identical their rows.
+    ///
+    /// The property Android needs is untouched and is the last third — the
+    /// same catalogue applied twice.
     #[test]
     fn a_fix_that_changes_nothing_reuses_the_table() {
         let base = build_table([("ZZZA", learned(-30_000_000, -140_000_000, 100, 20))]);
+
+        assert!(
+            extended(
+                base,
+                [("ZZZA", learned(-30_000_000, -140_000_000, 100, 20))]
+            )
+            .is_none(),
+            "a fix that reproduces the row it lands on must not build a table",
+        );
+
         let identical = SiteFix::Network {
             lat_udeg: -30_000_000,
             lon_udeg: -140_000_000,
             // Whatever the row already records wins, so this is ignored.
             elevation_m: 1,
         };
+        let catalogued = extended(base, [("ZZZA", identical)])
+            .expect("the first catalogue claim is something the table did not have");
+        assert_eq!(
+            catalogued.get("ZZZA"),
+            base.get("ZZZA"),
+            "and it is not a row change: the row is what it was",
+        );
+        assert_eq!(
+            catalogued.catalogue_position("ZZZA"),
+            Some((-30.0, -140.0)),
+            "what it added is the claim itself",
+        );
+        assert_eq!(
+            base.catalogue_position("ZZZA"),
+            None,
+            "which the table it was built from does not have",
+        );
 
         assert!(
-            extended(base, [("ZZZA", identical)]).is_none(),
-            "a fix that reproduces the row it lands on must not build a table",
+            extended(catalogued, [("ZZZA", identical)]).is_none(),
+            "and the same catalogue a second time — Android's case — builds nothing",
         );
     }
 
