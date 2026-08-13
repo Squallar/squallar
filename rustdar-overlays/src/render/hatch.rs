@@ -374,6 +374,82 @@ mod tests {
         assert_eq!(coverage(&mask, 50, 5), 0, "control: outside the exterior");
     }
 
+    /// **The whole path, on SPC's own bytes: feed → parse → raster → ink.**
+    ///
+    /// Every other test in this module drives `hatch_mask_with_exclusions`
+    /// directly with synthetic squares, which proves the geometry is right and
+    /// proves nothing about whether anything ever calls it. That question is
+    /// worth a test of its own, because it was once answered wrongly in both
+    /// directions: an audit concluded the subsystem was unreachable in
+    /// production because SPC's live product that day had no significant-severe
+    /// area in it at all.
+    ///
+    /// So this one starts from a real archived product
+    /// (`day1otlk_20260425_1300_hail.lyr.geojson`, saved verbatim), runs it
+    /// through the parser and the public rasterizer the handler calls, and
+    /// asserts hatch-coloured pixels landed on the texture. The hatch colour
+    /// is passed in by the caller — it is theme-dependent — so a colour SPC
+    /// never uses makes the ink unambiguous.
+    #[test]
+    fn a_real_spc_product_puts_hatch_lines_on_the_texture() {
+        use crate::spc::outlook::{OutlookDay, OutlookProduct, parse_geojson};
+        use crate::types::{GeoBounds, HatchPattern};
+
+        let raw = include_str!("../../testdata/day1otlk_20260425_1300_hail.lyr.geojson");
+        let json: serde_json::Value = serde_json::from_str(raw).expect("SPC's own JSON");
+        let outlook = parse_geojson(&json, OutlookDay::Day1, OutlookProduct::Hail)
+            .expect("a real product must parse");
+        assert!(
+            outlook
+                .features
+                .iter()
+                .any(|f| f.hatch != HatchPattern::None),
+            "premise: this product carries a significant-severe area",
+        );
+
+        // The product's own extent, so the hatched area is on the texture.
+        let (mut min_lat, mut max_lat) = (f64::MAX, f64::MIN);
+        let (mut min_lon, mut max_lon) = (f64::MAX, f64::MIN);
+        for feature in &outlook.features {
+            for polygon in &feature.polygons {
+                for ring in polygon {
+                    for &(lat, lon) in ring {
+                        min_lat = min_lat.min(lat);
+                        max_lat = max_lat.max(lat);
+                        min_lon = min_lon.min(lon);
+                        max_lon = max_lon.max(lon);
+                    }
+                }
+            }
+        }
+        let bounds = GeoBounds {
+            min_lat,
+            max_lat,
+            min_lon,
+            max_lon,
+        };
+
+        // Pure blue at full alpha: SPC's palette here is greys, greens,
+        // yellows and pinks, so any blue pixel came from the hatch pass.
+        let hatch_color = [0u8, 0, 255, 255];
+        let rgba = crate::render::rasterize::rasterize_spc_outlooks(
+            &outlook.features,
+            &bounds,
+            512,
+            512,
+            hatch_color,
+        );
+        let hatch_pixels = rgba
+            .chunks_exact(4)
+            .filter(|p| p[2] > 200 && p[0] < 60 && p[1] < 60)
+            .count();
+        assert!(
+            hatch_pixels > 100,
+            "the hatch pass drew {hatch_pixels} pixels on a product with a \
+             significant-severe area in it: nothing is reaching draw_hatch_pass",
+        );
+    }
+
     /// A hole in an *exclusion* polygon is not excluded — the lower level's
     /// hatching shows through it, because the higher level does not cover it.
     #[test]

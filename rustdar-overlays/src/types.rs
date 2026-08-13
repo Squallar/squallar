@@ -15,8 +15,13 @@ impl ScreenPoint {
 /// Ramer-Douglas-Peucker epsilon, degrees. 0.005° ≈ 500 m.
 pub const SIMPLIFY_EPSILON: f64 = 0.005;
 
-/// Deliberately low so the hatch lines stay visible through the fill.
-pub const CIG_FILL_ALPHA: u8 = 40;
+/// The fill for a layer drawn **over** another one: SPC's significant-severe
+/// area, which sits on top of the probability contours it qualifies.
+///
+/// Deliberately low, for two reasons that point the same way — so the hatch
+/// lines stay visible through the fill, and so the contours underneath stay
+/// readable rather than being buried by the thing describing them.
+pub const SIGNIFICANT_FILL_ALPHA: u8 = 40;
 pub const REGULAR_FILL_ALPHA: u8 = 100;
 pub const NWS_FILL_ALPHA: u8 = 80;
 pub const STROKE_ALPHA: u8 = 255;
@@ -64,7 +69,12 @@ pub fn parse_polygon_coords(coords: &serde_json::Value) -> Option<GeoPolygon> {
     }
 }
 
-/// CIG (Conditional Intensity Group) hatching.
+/// Hatching for SPC's significant-severe area.
+///
+/// The three levels are SPC's Conditional Intensity Groups, which NWS Service
+/// Change Notice 26-11 introduced on 2026-03-02 to replace the single `SIGN`
+/// area with three intensity distributions. Higher levels hatch over lower
+/// ones; see [`crate::render::hatch::draw_hatch_pass`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HatchPattern {
     None,
