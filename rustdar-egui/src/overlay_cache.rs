@@ -216,6 +216,20 @@ pub struct OverlayTexturePlan {
     ///
     /// Read through [`Self::coverage`] rather than passed around loose.
     pub overdraw: f32,
+    /// Physical pixels per logical point the texture was sized at — the
+    /// display density [`plan_overlay_texture`] was handed, after the same
+    /// clamping the pixel counts got.
+    ///
+    /// Load-bearing, not diagnostic, and for the same reason `overdraw` is:
+    /// the rasterizer draws markers, label pills and strokes at sizes in
+    /// *texels*, and a texture at two texels per point renders every one of
+    /// them at half its intended size on screen unless it is told. It travels
+    /// with the plan so that the density the pixels were counted at and the
+    /// density the symbols are drawn at cannot be two different numbers.
+    ///
+    /// `1.0` on a display that is not scaled, which is every case before this
+    /// field existed.
+    pub pixels_per_point: f32,
 }
 
 impl OverlayTexturePlan {
@@ -252,19 +266,57 @@ impl OverlayTexturePlan {
 /// is 8192–32768 and nothing is given up; the WebGL2 floor of 2048 is the case
 /// this exists for.
 ///
+/// # Points in, pixels out
+///
+/// `screen_rect` is in **logical points** and `max_texture_side` is in
+/// **physical texels**, and until `pixels_per_point` was a parameter this
+/// function compared the two directly and sized the texture in points. On an
+/// unscaled display those are the same number and nothing was wrong; on a 2x
+/// display it meant one texel per 2x2 physical pixels — the framebuffer was
+/// HiDPI and the overlay drawn into it was not. Measured on a second device: a
+/// 1376x755 CSS canvas with a 2752x1510 backing store, every overlay sized
+/// 1376x755.
+///
+/// So the density enters here, once, and everything downstream is in texels.
+/// It also makes the `affordable` comparison below honest, which it was not
+/// before: it weighed a point count against a texel limit.
+///
 /// Overdraw is the free variable because the alternative — keeping the full
 /// three-viewport coverage and shrinking the pixels — makes the overlay blurrier
 /// the wider the window gets, which is exactly backwards. Cutting overdraw keeps
-/// one texel per point and costs only re-render frequency.
+/// one texel per physical pixel and costs only re-render frequency.
+///
+/// **What that costs where the limit is tight.** A pane wide enough to spend
+/// the whole limit on its viewport gets no overdraw and re-renders on every pan
+/// step. At one texel per point a 1365-point pane reached that against a 2048
+/// limit; at two it is a 683-point pane, which is most of a HiDPI phone
+/// browser. That is the deliberate trade and it falls the right way — density
+/// first, overdraw second — because a sharp overlay that re-renders more often
+/// is recoverable where a permanently soft one is not. It only binds on a
+/// device that really reports the WebGL2 floor; Firefox on the development box
+/// reports 32768.
 ///
 /// The returned `overdraw` is load-bearing, not diagnostic: it is what the geo
 /// bounds get expanded by, so the texture's coverage and its pixel count describe
 /// the same rectangle. Expanding by [`OVERDRAW_FRACTION`] after the pixels were
 /// clamped would claim ground the texture does not cover, and
 /// [`pan_exceeds_coverage`] would then hold off re-rendering over that gap.
-pub fn plan_overlay_texture(screen_rect: egui::Rect, max_texture_side: u32) -> OverlayTexturePlan {
-    let screen_w = screen_rect.width().max(0.0);
-    let screen_h = screen_rect.height().max(0.0);
+pub fn plan_overlay_texture(
+    screen_rect: egui::Rect,
+    max_texture_side: u32,
+    pixels_per_point: f32,
+) -> OverlayTexturePlan {
+    // A density that is not a positive number is not a description of a
+    // display. egui never reports one, but this value reaches a texture
+    // allocation and a `NaN` would arrive there as a zero-sized texture rather
+    // than as an error anybody could read.
+    let density = if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+        pixels_per_point
+    } else {
+        1.0
+    };
+    let screen_w = screen_rect.width().max(0.0) * density;
+    let screen_h = screen_rect.height().max(0.0) * density;
     let max_side = max_texture_side.max(1);
 
     // Largest overdraw this axis can afford: `side * (1 + 2f) == max_side`.
@@ -286,6 +338,7 @@ pub fn plan_overlay_texture(screen_rect: egui::Rect, max_texture_side: u32) -> O
         width: ((screen_w * scale) as u32).min(max_side),
         height: ((screen_h * scale) as u32).min(max_side),
         overdraw,
+        pixels_per_point: density,
     }
 }
 
@@ -492,7 +545,13 @@ impl OverlayTextureCache {
     /// Relaxing the zoom key cannot strand the viewport off the texture: see
     /// [`pan_exceeds_coverage`], whose containment result holds for any zoom
     /// band at all.
-    pub fn needs_rerender(&mut self, token: u64, zoom: f64, viewport_bounds: &GeoBounds) -> bool {
+    pub fn needs_rerender(
+        &mut self,
+        token: u64,
+        zoom: f64,
+        viewport_bounds: &GeoBounds,
+        plan: &OverlayTexturePlan,
+    ) -> bool {
         let settled = self.last_seen_zoom == Some(zoom);
         self.last_seen_zoom = Some(zoom);
 
@@ -500,6 +559,19 @@ impl OverlayTextureCache {
             return true;
         };
         if tex.data_generation != token {
+            return true;
+        }
+        // The texture is no longer the size this pane would ask for. Nothing
+        // else here can notice that: a display-density change — a window moved
+        // to a second monitor, an OS scale setting, a browser zoom — leaves the
+        // zoom and the geographic bounds exactly as they were and changes only
+        // how many texels a point is worth. Without this the pane would keep a
+        // half-density texture for as long as it stayed put.
+        //
+        // These two fields were written and never read before this. They are
+        // the plan's own output, so the comparison is against what this frame
+        // would allocate rather than against any constant.
+        if tex.width != plan.width || tex.height != plan.height {
             return true;
         }
         let render_zoom = tex.render_zoom as f64 / ZOOM_QUANTIZATION_FACTOR;
