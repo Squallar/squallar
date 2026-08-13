@@ -702,6 +702,81 @@ fn a_config_naming_a_pane_kind_from_the_future_still_loads() {
     );
 }
 
+/// A hand-edited `site` made of bytes no identifier contains is refused here,
+/// at the file, and never reaches the byte range that used to split it.
+///
+/// This is the config-side door of a **panic**, not of a wrong picture.
+/// `level3::site_code` reduces the four-letter ICAO to the three-letter code
+/// the Level III bucket keys on by taking `&id[1..]`, and `id.len()` counts
+/// bytes: `"éab"` is four bytes with a two-byte leading character, so that
+/// range landed inside a UTF-8 sequence. `ui.json` is a file on the user's
+/// disk, so typing those three characters into it was enough to kill the
+/// process on the next Level III fetch.
+///
+/// Both `site` fields are hostile, because they are two separate doors — the
+/// top-level one seeds panes the file did not describe, and the per-pane one
+/// overrides it. Empty is the refusal, which `apply_to` already reads as "not
+/// set"; the pane keeps the site startup picked rather than a name no radar
+/// has. The lookback and the second pane's site are ordinary and must survive,
+/// so a load that failed outright cannot pass this by looking like a fresh one.
+#[test]
+fn a_config_naming_a_site_no_radar_could_have_is_refused_not_sliced() {
+    let store = MemoryConfigStore::default();
+    store
+        .store(
+            UI_CONFIG_KEY,
+            r#"{
+                    "site": "éab",
+                    "loop_lookback_secs": 7200,
+                    "pane_count": 2,
+                    "panes": [
+                        {"site": "Ω12"},
+                        {"site": "KDMX"}
+                    ]
+                }"#,
+        )
+        .expect("the memory store accepts a write");
+
+    let mut gui = crate::Gui::new();
+    let default_site = crate::Gui::new().pane(0).map(|pane| pane.site.clone());
+    assert!(
+        gui.load_ui_config(&store),
+        "one impossible site must not fail the whole config load",
+    );
+
+    let restored = gui.pane(0).map(|pane| pane.site.clone()).expect("a pane");
+
+    // Reduced before anything is asserted about *which* site survived, and
+    // that order is the point of the test: the defect is a panic, not a wrong
+    // answer, so the line that has to run is the one the process used to die
+    // in. Remove either half of the fix and this is where the run ends, with
+    // `byte index 1 is not a char boundary`, reached from nothing but a text
+    // editor pointed at `ui.json`.
+    assert!(
+        rustdar_radar::level3::site_code(&restored).is_ascii(),
+        "the surviving identifier must reduce cleanly",
+    );
+    assert!(
+        restored.is_ascii(),
+        "no non-ASCII identifier may survive the load: {restored:?}",
+    );
+    assert_eq!(
+        Some(&restored),
+        default_site.as_ref(),
+        "a refused site leaves the pane on whatever startup picked",
+    );
+
+    assert_eq!(
+        gui.pane(1).map(|pane| pane.site.as_str()),
+        Some("KDMX"),
+        "the pane beside the refused one keeps its own site",
+    );
+    assert_eq!(
+        gui.loop_lookback_secs, 7200,
+        "the rest of the file must survive the refused site",
+    );
+}
+
 /// An alpha curve saved for an unknown product is dropped, never
 /// reassigned to a product this build knows.
 ///
