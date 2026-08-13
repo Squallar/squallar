@@ -742,6 +742,7 @@ fn image() -> rustdar_egui::pane::RadarImageData {
         lon: -97.27,
         max_range_km: 100.0,
         nyquist_ms: None,
+        melting_layer_source: None,
         value_data: Arc::new(Vec::new()),
     }
 }

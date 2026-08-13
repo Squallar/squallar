@@ -123,6 +123,7 @@ fn loop_on(ctx: &egui::Context, site: &'static str, textured: &[usize]) -> LoopP
                 lon: -97.0,
                 max_range_km: 100.0,
                 nyquist_ms: None,
+                melting_layer_source: None,
                 value_data: Arc::new(Vec::new()),
             },
         ));
@@ -154,6 +155,7 @@ fn response(
         image: Some(egui::ColorImage::filled([1, 1], egui::Color32::WHITE)),
         max_range_km: 100.0,
         nyquist_ms: None,
+        melting_layer_source: None,
     }
 }
 

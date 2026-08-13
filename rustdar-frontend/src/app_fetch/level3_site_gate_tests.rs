@@ -76,6 +76,9 @@ fn the_gate_skips_the_objects_and_leaves_the_sounding_alone() {
     let objects = body
         .find("for code in RadarProduct::level3_codes_for(")
         .expect("the object loop left the function");
+    let melting_layer = body
+        .find("self.channels.melting_layer_sender")
+        .expect("the melting-layer spawn left the function");
 
     assert!(
         sounding < gate,
@@ -85,5 +88,15 @@ fn the_gate_skips_the_objects_and_leaves_the_sounding_alone() {
     assert!(
         gate < objects,
         "the object loop runs before the gate, which is the same as no gate",
+    );
+    // The melting layer sits on the *other* side of the gate from the
+    // sounding, and deliberately so: it is a Level III object, published by an
+    // RPG, and a TDWR's Supplemental Product Generator makes none. Outside the
+    // gate it would be a fifth doomed request per scan load and per poll at
+    // every TDWR — the exact cost this gate was added to remove.
+    assert!(
+        gate < melting_layer,
+        "the melting-layer fetch runs before the RPG gate, so a TDWR asks S3 \
+             for an N0M its SPG never generates",
     );
 }

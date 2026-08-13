@@ -302,6 +302,7 @@ fn the_panes_that_asked_for_nothing_are_served_anyway() {
                 max_range_km: 230.0,
                 value_data: Arc::new(Vec::new()),
                 nyquist_ms: None,
+                melting_layer_source: None,
             }),
             product: RadarProduct::Reflectivity,
             elevation: TILT,

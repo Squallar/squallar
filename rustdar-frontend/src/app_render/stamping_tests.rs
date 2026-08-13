@@ -73,6 +73,7 @@ fn finished(product: RadarProduct, elevation: f32) -> CachedPaneRender {
         product,
         elevation,
         nyquist_ms: None,
+        melting_layer_source: None,
     }
 }
 
@@ -312,6 +313,7 @@ fn a_long_range_render_is_placed_at_the_size_it_was_rendered_at() {
         // `nyquist_velocity = 0` on every cut, which `DeclaredNyquist::declare`
         // refuses, so it arrives here with nothing to stamp.
         nyquist_ms: Some(23.84),
+        melting_layer_source: None,
     };
     app.apply_render_to_pane(&ctx, 0, &render, &mut PlanViewUploads::default());
 
@@ -365,6 +367,7 @@ fn a_resume_puts_back_the_fold_limit_it_took_down() {
     let mut app = app_showing_site();
     let render = CachedPaneRender {
         nyquist_ms: Some(26.42),
+        melting_layer_source: None,
         ..finished(PRODUCT, 0.5)
     };
     app.apply_render_to_pane(&ctx, 0, &render, &mut PlanViewUploads::default());
@@ -410,6 +413,7 @@ fn a_resumed_velocity_pane_annotates_the_fold_again() {
 
     let render = CachedPaneRender {
         nyquist_ms: Some(26.42),
+        melting_layer_source: None,
         ..finished(RadarProduct::Velocity, 0.5)
     };
     app.apply_render_to_pane(&ctx, 0, &render, &mut PlanViewUploads::default());

@@ -135,6 +135,7 @@ fn app_showing_a_drawn_volume(product: RadarProduct) -> App {
             max_range_km: 100.0,
             value_data: Arc::new(Vec::new()),
             nyquist_ms: None,
+            melting_layer_source: None,
         },
     );
     app

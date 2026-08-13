@@ -351,6 +351,7 @@ impl super::App {
                 product: rr.product,
                 elevation: rr.elevation,
                 nyquist_ms: rendered.nyquist_ms,
+                melting_layer_source: rendered.melting_layer_source,
             };
 
             // Cache the render output for sharing with other panes on the same site
@@ -375,6 +376,7 @@ impl super::App {
                     max_range_km: render_result.max_range_km,
                     value_data: Arc::clone(&render_result.value_data),
                     nyquist_ms: render_result.nyquist_ms,
+                    melting_layer_source: render_result.melting_layer_source,
                 },
             );
 
@@ -623,6 +625,7 @@ impl super::App {
                 product: render.product,
                 elevation: render.elevation,
                 nyquist_ms: render.nyquist_ms,
+                melting_layer_source: render.melting_layer_source,
             });
         }
 
@@ -659,6 +662,11 @@ impl super::App {
                 lon,
                 max_range_km: render.max_range_km,
                 nyquist_ms: render.nyquist_ms,
+                // Where the classification behind these pixels stood, on the
+                // same terms as the fold limit: it describes *this* image, and
+                // the object it came from belongs to a volume that will have
+                // rolled by the time anything could look it up again.
+                melting_layer_source: render.melting_layer_source,
                 // What these pixels are, travelling with them. Whichever
                 // datasource produced them: this is the one assignment behind
                 // `PaneState::stale_image_on_screen`, so a Level II and a
@@ -871,6 +879,43 @@ impl super::App {
                 log::info!(
                     "Env heights moved for {}: dropped the renders that read them",
                     sounding.site
+                );
+            }
+        }
+        while let Ok(ml) = self.channels.melting_layer_receiver.try_recv() {
+            if self.render.is_fetch_stale(&ml.site, ml.generation) {
+                continue;
+            }
+            // A site that published no object for this volume caches nothing
+            // and is not retried: `fetch_product_for_volume` already opened
+            // every candidate in the pairing window, so "not found" is an
+            // answer about the volume rather than a failure to reach the
+            // bucket. The classification falls to the next rung and the pane
+            // says which one — the gap is visible, not silent.
+            let Some(bytes) = ml.object else {
+                continue;
+            };
+            log::info!(
+                "Melting layer cached for {} (volume {}, {} bytes)",
+                ml.site,
+                ml.volume_start,
+                bytes.len()
+            );
+            // Through the setter, so a classification pane already drawn
+            // against the fleet default is redrawn against the measured layer
+            // rather than waiting for the volume to roll — the same reason the
+            // sounding above goes through `set_env_heights`.
+            if self.render.set_melting_layer(
+                &ml.site,
+                crate::render_dispatch::MeltingLayerObject {
+                    volume_start: ml.volume_start,
+                    bytes,
+                },
+                &self.gui,
+            ) {
+                log::info!(
+                    "Melting layer moved for {}: dropped the classification renders",
+                    ml.site
                 );
             }
         }
@@ -1162,6 +1207,7 @@ impl super::App {
                             product,
                             elevation,
                             nyquist_ms: cached.nyquist_ms,
+                            melting_layer_source: cached.melting_layer_source,
                         };
                         log::info!(
                             "Reusing cached render for pane {}: {:?} at {:.1}°",
@@ -1234,6 +1280,14 @@ impl super::App {
                             &pane_site,
                             data,
                             &declared,
+                            // Which volume this render is *of*, so the
+                            // dispatcher can decide whether the melting-layer
+                            // object it holds belongs to it. Off the pane's own
+                            // `scan_info`, which is the same field
+                            // `spawn_level3_fetches` paired that object
+                            // against — one statement of "the volume on this
+                            // pane", read at both ends.
+                            scan_info.timestamp,
                             self.channels.render_sender.clone(),
                             self.window.clone(),
                         );
@@ -1722,6 +1776,7 @@ impl super::App {
             let product = cached.product;
             let elevation = cached.elevation;
             let nyquist_ms = cached.nyquist_ms;
+            let melting_layer_source = cached.melting_layer_source;
 
             let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx) else {
                 continue;
@@ -1785,6 +1840,11 @@ impl super::App {
                         // with nothing saying so — and, for the fold limit,
                         // annotating one cut's velocity with another cut's PRF.
                         nyquist_ms,
+                        // And, for the melting layer, restoring a fleet-default
+                        // classification with no qualification on it at all —
+                        // the picture this whole path exists to stop being
+                        // indistinguishable from a measured one.
+                        melting_layer_source,
                         product,
                         elevation,
                     }),
@@ -3736,6 +3796,7 @@ fn rendered_image(
         lon: rr.site_lon,
         max_range_km: rr.max_range_km,
         nyquist_ms: rr.nyquist_ms,
+        melting_layer_source: rr.melting_layer_source,
         value_data: Arc::new(Vec::new()),
     }
 }

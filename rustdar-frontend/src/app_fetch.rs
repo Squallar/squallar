@@ -75,6 +75,15 @@ pub(super) fn site_offers_level3(site: &str) -> bool {
     rustdar_radar::sites::get_radar_site(site).is_none_or(|radar| radar.is_wsr88d())
 }
 
+/// The AWIPS id of the RPG's Melting Layer product (Level III code 166).
+///
+/// Deliberately not in [`RadarProduct::level3_codes_for`]'s walk: nothing draws
+/// this object. It is a *render input* to the hybrid classification, paired to
+/// one volume, and the by-code cache that walk fills is keyed by code alone
+/// and takes the latest — which for this object is the wrong answer four
+/// minutes out of every five.
+const MELTING_LAYER_CODE: &str = "N0M";
+
 impl super::App {
     /// Spawn a detached future on whatever executor this target provides.
     ///
@@ -221,6 +230,73 @@ impl super::App {
         if !site_offers_level3(site) {
             log::debug!("{site} has no RPG, so no Level III objects are fetched for it");
             return;
+        }
+        // The RPG's own Melting Layer object (Level III 166, AWIPS `N0M`) for
+        // the volume this site currently has loaded — the top rung of
+        // `rustdar_radar::hca::resolve_melting_layer`, and the difference
+        // between a classification that agrees with the RPG's own `N0H` 83–96 %
+        // of the time and one that agrees 16 % of the time in winter.
+        //
+        // # Why here, and why the volume start is read rather than passed
+        //
+        // This function is called from three places and every one of them
+        // installs the site's `ScanInfo` on the pane immediately before calling
+        // — the archive drain, the chunk feed's volume close, and JumpToLive's
+        // cached-scan path. So "the volume this site has loaded" is already on
+        // screen by the time we get here, and `latest_scan_time_for_site` is
+        // the app's existing answer to that question: it reads each pane's own
+        // `scan_info.timestamp`, which is the same quantity a loop frame pairs
+        // its Level III objects against (`spawn_loop_l3_pairing`). Threading a
+        // fourth parameter through three call sites would put a second answer
+        // beside that one, and the two could disagree.
+        //
+        // No volume loaded means nothing to pair against, so nothing is
+        // fetched — which is right: an object fetched for no volume could only
+        // ever be applied to a guess about which volume it belonged to.
+        //
+        // Inside the RPG gate, unlike the sounding above it: this is a Level
+        // III object and a TDWR's Supplemental Product Generator does not make
+        // one.
+        if let Some(volume_start) = latest_scan_time_for_site(self.gui.panes(), site) {
+            // Already in hand for this volume: the poll would re-download an
+            // object we are already classifying against. Not a TTL — the
+            // identity is the whole gate, and it opens exactly when the volume
+            // rolls.
+            if self.render.melting_layer_volume(site) != Some(volume_start) {
+                let sender = self.channels.melting_layer_sender.clone();
+                let site = site.to_string();
+                self.spawn_async_task(sender, async move {
+                    let sources = rustdar_radar::sources::DataSources::production();
+                    // `VolumePick::NEAREST`: `N0M` is a once-per-volume
+                    // product, so the object nearest the volume start that
+                    // *names* the volume is the object. The naming is checked
+                    // inside — nothing here falls back to the newest key.
+                    let found = rustdar_radar::level3::fetch_product_for_volume(
+                        &sources,
+                        &site,
+                        MELTING_LAYER_CODE,
+                        volume_start,
+                        rustdar_radar::level3::VolumePick::NEAREST,
+                    )
+                    .await;
+                    match &found {
+                        Some(p) => log::info!(
+                            "{site} melting layer for volume {volume_start} is {}",
+                            p.stamp.key
+                        ),
+                        None => log::info!(
+                            "{site} published no {MELTING_LAYER_CODE} for volume \
+                             {volume_start}; the classification falls back"
+                        ),
+                    }
+                    crate::channels::MeltingLayerResponse {
+                        generation,
+                        site,
+                        volume_start,
+                        object: found.map(|p| p.bytes),
+                    }
+                });
+            }
         }
         // One request per distinct object, not per (product, object). Three
         // products read `DVL` and `EET` between them — VIL, echo tops, and the
@@ -1341,6 +1417,40 @@ impl super::App {
                 // from the same cache the static pane render uses — so a loop
                 // frame and the still frame agree about the melting layer.
                 let env_heights = self.render.env_heights_km_msl_for(product, &target.site);
+                // The melting layer does **not** ride the same way, and the
+                // difference is `timestamp`: it is this frame's own volume
+                // start, not the site's current one, so the accessor answers
+                // `None` for every frame whose volume is not the one the
+                // cached object names. That is the whole point of asking it
+                // per frame. A loop steps back through volumes the app never
+                // fetched an `N0M` for, and handing those frames the still
+                // frame's object would animate one volume's measured melting
+                // layer across twenty other volumes' classifications — all of
+                // them reporting themselves as measured.
+                //
+                // # A known limitation, scoped and captioned rather than hidden
+                //
+                // Only one volume per site has an `N0M` object fetched for it —
+                // the one the pane is on — so in practice **every other frame
+                // of a classification loop classifies on the fallback**. Those
+                // frames are not wrong about themselves: they carry
+                // `MeltingLayerSource::Sounding` or `FleetDefault` and the pane
+                // says so as they play, which is the difference between a
+                // limitation and a defect.
+                //
+                // Closing it is a per-frame pairing, and the machinery is
+                // already here: [`Self::spawn_loop_l3_listing`] lists a code's
+                // keys across the loop's span once, and
+                // [`Self::spawn_loop_l3_pairing`] pairs one per frame by PDB.
+                // Pointing that pair at `N0M` and widening the cache from one
+                // object per site to one per (site, volume) is the whole of it.
+                // Left undone deliberately: it is a fetch-budget question — a
+                // twenty-frame loop would add twenty ~6 kB objects and one
+                // listing — and the still frame is where a classification is
+                // actually read.
+                let melting_layer =
+                    self.render
+                        .melting_layer_product_for(product, &target.site, timestamp);
                 match rustdar_radar::render_input::RenderInput::extract(
                     &scan_data,
                     snapped,
@@ -1358,7 +1468,11 @@ impl super::App {
                             // calmest sector estimated while the static render
                             // of the newest frame folded around the RDA's
                             // declaration — one storm, two pictures, no error.
-                            input: Box::new(input.with_declared_nyquist(&declared)),
+                            input: Box::new(
+                                input
+                                    .with_declared_nyquist(&declared)
+                                    .with_melting_layer_product(melting_layer),
+                            ),
                             // Loop frames store an empty value grid, so asking
                             // for one would produce `LOOP_IMAGE_SIZE² × 4` bytes
                             // per frame to be dropped on arrival — and copied
@@ -1406,7 +1520,7 @@ impl super::App {
             // section's differently-shaped buffers. See `JobOutput::frame`.
             let frame = output.and_then(crate::offload::JobOutput::frame);
             // A failed render still has to be sent, so render_in_flight gets cleared.
-            let (image, max_range_km, nyquist_ms) = match frame {
+            let (image, max_range_km, nyquist_ms, melting_layer_source) = match frame {
                 Some(frame) => {
                     // Converted here, in `deliver`, so `rgba` drops at the end
                     // of this scope and only one of the two buffers is ever in
@@ -1415,14 +1529,19 @@ impl super::App {
                     // render that lands on the main thread, and it is a
                     // reinterpretation of 4 MiB rather than a rasterization.
                     let converted = match loop_frame_image(&frame.image) {
-                        Some(image) => (Some(image), frame.max_range_km, frame.nyquist_ms),
+                        Some(image) => (
+                            Some(image),
+                            frame.max_range_km,
+                            frame.nyquist_ms,
+                            frame.melting_layer_source,
+                        ),
                         None => {
                             log::error!(
                                 "Loop render for pane {pane_idx} produced {} bytes, expected {}",
                                 frame.image.len(),
                                 LOOP_IMAGE_SIZE * LOOP_IMAGE_SIZE * 4
                             );
-                            (None, 0.0, None)
+                            (None, 0.0, None, None)
                         }
                     };
                     // `rgba` drops at the end of this scope either way, as the
@@ -1446,7 +1565,7 @@ impl super::App {
                     rustdar_radar::render::recycle_image(frame.image);
                     converted
                 }
-                None => (None, 0.0, None),
+                None => (None, 0.0, None, None),
             };
             // One send site for both outcomes, so `snapped` cannot come to differ
             // between them. It describes the render that was dispatched — the sweep
@@ -1465,6 +1584,7 @@ impl super::App {
                 image,
                 max_range_km,
                 nyquist_ms,
+                melting_layer_source,
             });
             super::notify_redraw(&window);
         });
@@ -1954,6 +2074,10 @@ mod loop_full_res_tests;
 #[path = "app_fetch/loop_pane_tests.rs"]
 #[cfg(test)]
 mod loop_pane_tests;
+
+#[path = "app_fetch/melting_layer_dispatch_tests.rs"]
+#[cfg(test)]
+mod melting_layer_dispatch_tests;
 
 #[path = "app_fetch/site_switch_tests.rs"]
 #[cfg(test)]

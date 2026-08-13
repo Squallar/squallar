@@ -17,6 +17,7 @@ fn output(range: f64) -> CachedRenderOutput {
         max_range_km: range,
         value_data: Arc::new(Vec::new()),
         nyquist_ms: None,
+        melting_layer_source: None,
     }
 }
 

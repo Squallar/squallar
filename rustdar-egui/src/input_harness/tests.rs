@@ -1526,7 +1526,7 @@ fn velocity_pane_on(screen: egui::Vec2, site: &str, nyquist_ms: Option<f64>) -> 
     h.offer_product(0, RadarProduct::Reflectivity, 0.5);
     h.offer_product(0, RadarProduct::Velocity, 0.5);
     h.select_product(0, RadarProduct::Velocity);
-    h.place_radar_image(0, RadarProduct::Velocity, 0.5, nyquist_ms);
+    h.place_radar_image(0, RadarProduct::Velocity, 0.5, nyquist_ms, None);
     h
 }
 
@@ -1728,7 +1728,7 @@ fn a_sweep_that_declared_no_nyquist_gets_the_bar_unchanged() {
     };
     let undeclared = title_baseline(&h, "mph");
     h.select_product(0, RadarProduct::Reflectivity);
-    h.place_radar_image(0, RadarProduct::Reflectivity, 0.5, None);
+    h.place_radar_image(0, RadarProduct::Reflectivity, 0.5, None, None);
     assert_eq!(
         undeclared,
         title_baseline(&h, "dBZ"),
@@ -1816,13 +1816,25 @@ fn a_pane_annotates_no_fold_while_its_image_lags_the_selection() {
     // pane has snapped to 0.5° — a different cut, and a different PRF. Nothing
     // is claimed until the pane's own sweep is on the glass.
     h.select_product(0, RadarProduct::Velocity);
-    h.place_radar_image(0, RadarProduct::Velocity, 2.4, Some(DECLARED_NYQUIST_MS));
+    h.place_radar_image(
+        0,
+        RadarProduct::Velocity,
+        2.4,
+        Some(DECLARED_NYQUIST_MS),
+        None,
+    );
     assert_eq!(
         fold_line_painted(&h),
         None,
         "a fold limit was drawn over a sweep the pane did not select",
     );
-    h.place_radar_image(0, RadarProduct::Velocity, 0.5, Some(DECLARED_NYQUIST_MS));
+    h.place_radar_image(
+        0,
+        RadarProduct::Velocity,
+        0.5,
+        Some(DECLARED_NYQUIST_MS),
+        None,
+    );
     assert!(
         fold_line_painted(&h).is_some(),
         "the annotation did not come back with the pane's own sweep",
@@ -2113,7 +2125,7 @@ fn the_range_folded_purple_is_keyed_on_the_bars_that_can_paint_it() {
 
     h.offer_product(0, RadarProduct::SpectrumWidth, 0.5);
     h.select_product(0, RadarProduct::SpectrumWidth);
-    h.place_radar_image(0, RadarProduct::SpectrumWidth, 0.5, None);
+    h.place_radar_image(0, RadarProduct::SpectrumWidth, 0.5, None, None);
     assert!(
         keyed(&h),
         "spectrum width carries range-folded gates too and has no key for \
@@ -2125,7 +2137,7 @@ fn the_range_folded_purple_is_keyed_on_the_bars_that_can_paint_it() {
     assert_eq!(fold_line_painted(&h), None);
 
     h.select_product(0, RadarProduct::Reflectivity);
-    h.place_radar_image(0, RadarProduct::Reflectivity, 0.5, None);
+    h.place_radar_image(0, RadarProduct::Reflectivity, 0.5, None, None);
     assert!(
         !keyed(&h),
         "the reflectivity bar keys a colour its surveillance cut does not \
@@ -2166,7 +2178,13 @@ fn the_fold_annotation_returns_with_the_picture_rather_than_from_a_config() {
     );
 
     // …and the restore, which re-uploads the kept copy with the same metadata.
-    h.place_radar_image(0, RadarProduct::Velocity, 0.5, Some(DECLARED_NYQUIST_MS));
+    h.place_radar_image(
+        0,
+        RadarProduct::Velocity,
+        0.5,
+        Some(DECLARED_NYQUIST_MS),
+        None,
+    );
     assert_eq!(
         fold_line_painted(&h).as_deref(),
         Some(before.as_str()),
@@ -4988,6 +5006,7 @@ fn a_compact_mouse_press_and_hold_raises_the_value_popup() {
         rustdar_radar::types::RadarProduct::Reflectivity,
         0.5,
         None,
+        None,
     );
     h.warm_up();
 
@@ -5732,7 +5751,7 @@ fn pane_showing(showing: rustdar_radar::types::RadarProduct) -> InputHarness {
     h.offer_product(0, RadarProduct::Reflectivity, 0.5);
     h.offer_product(0, RadarProduct::EchoTops, 0.5);
     h.select_product(0, showing);
-    h.place_radar_image(0, showing, 0.5, None);
+    h.place_radar_image(0, showing, 0.5, None, None);
     h
 }
 
@@ -5807,7 +5826,7 @@ fn a_pane_says_when_its_image_is_not_the_selected_product() {
     );
 
     // The render lands and the notice goes.
-    h.place_radar_image(0, RadarProduct::EchoTops, 0.5, None);
+    h.place_radar_image(0, RadarProduct::EchoTops, 0.5, None, None);
     assert!(
         !any_notice_painted(&h),
         "the notice outlived the render it was waiting for; painted: {:?}",
@@ -5830,7 +5849,7 @@ fn a_same_selection_re_render_draws_no_notice() {
     // Two more volumes' worth of the same selection re-rendered, as an
     // auto-poll or the chunk feed produces.
     for _ in 0..2 {
-        h.place_radar_image(0, RadarProduct::Reflectivity, 0.5, None);
+        h.place_radar_image(0, RadarProduct::Reflectivity, 0.5, None, None);
         assert!(
             !any_notice_painted(&h),
             "a routine re-render of the selected product drew a notice; \
@@ -5908,8 +5927,8 @@ fn the_pending_notice_is_identical_for_both_datasources() {
     );
 
     // And each one clears on its own render landing, the same way.
-    awaiting_l3.place_radar_image(0, l3, 0.5, None);
-    awaiting_l2.place_radar_image(0, l2, 0.5, None);
+    awaiting_l3.place_radar_image(0, l3, 0.5, None, None);
+    awaiting_l2.place_radar_image(0, l2, 0.5, None, None);
     assert!(!any_notice_painted(&awaiting_l3));
     assert!(!any_notice_painted(&awaiting_l2));
 }
@@ -15082,5 +15101,165 @@ fn a_stale_zoom_asks_for_the_frame_its_settle_needs() {
          another frame; on a reactive UI the settle render is then waiting for \
          an input event that may never come — got {:?}",
         h.repaint_delay(),
+    );
+}
+
+/// A harness with one pane on KTLX showing a finished hybrid-classification
+/// image that stood on `source`.
+///
+/// [`pane_showing`]'s sibling for the melting-layer notice, and built the same
+/// way — through the real UI, with the image *placed* rather than the accessor
+/// stubbed — so what is asserted is what a viewer would be looking at.
+fn classification_showing(source: Option<rustdar_radar::hca::MeltingLayerSource>) -> InputHarness {
+    use rustdar_radar::types::RadarProduct;
+
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.load_scan("KTLX");
+    h.gui_mut()
+        .pane_mut(0)
+        .unwrap()
+        .set_overlay_enabled(OverlayKind::Radar, true);
+    h.offer_product(0, RadarProduct::HydrometeorClassification, 0.5);
+    h.select_product(0, RadarProduct::HydrometeorClassification);
+    h.place_radar_image(
+        0,
+        RadarProduct::HydrometeorClassification,
+        0.5,
+        None,
+        source,
+    );
+    h
+}
+
+/// The melting-layer notice a pane painted, if any.
+///
+/// Matched on the caption itself rather than on a leading icon: the notice
+/// deliberately carries none (see `ui_map_pane::melting_layer_notice`), and
+/// the caption *is* the whole message.
+fn melting_layer_notice_painted(h: &InputHarness) -> Option<String> {
+    use rustdar_radar::hca::MeltingLayerSource;
+    let captions = [
+        MeltingLayerSource::Rpg.caption(),
+        MeltingLayerSource::RadarDetected.caption(),
+        MeltingLayerSource::Sounding.caption(),
+        MeltingLayerSource::FleetDefault.caption(),
+    ];
+    h.painted_text_strings()
+        .iter()
+        .find(|t| captions.contains(&t.as_str()))
+        .cloned()
+}
+
+/// **A viewer can tell a classification from a guess — and is not nagged about
+/// the ordinary case.**
+///
+/// Both halves matter and the second is the harder one. The same classifier
+/// scored against ten RPG `N0H` products gets 82.8–95.9 % exact standing on the
+/// RPG's own melting layer and 16.0–19.8 % standing on the fleet default, so a
+/// pane that drew the two identically would be drawing a measurement and a
+/// guess with the same authority.
+///
+/// But a caveat that fires on the measured case as well is worse than none: the
+/// section pane's module header records what that cost — a warning styled as a
+/// fault, shown on nearly every volume, read as something the user had broken
+/// and became an alarm people learn to skip. So the measured sources say
+/// **nothing at all**, and the unmeasured ones say it in the pane's ordinary
+/// quiet plate rather than in red.
+#[test]
+fn a_classification_says_when_its_melting_layer_was_never_measured() {
+    use rustdar_radar::hca::MeltingLayerSource;
+
+    // The two measured sources: the pane is silent.
+    for measured in [MeltingLayerSource::Rpg, MeltingLayerSource::RadarDetected] {
+        let h = classification_showing(Some(measured));
+        assert!(
+            measured.is_measured(),
+            "precondition: {measured:?} is a measured layer",
+        );
+        assert_eq!(
+            melting_layer_notice_painted(&h),
+            None,
+            "{measured:?} drew a caveat on the ordinary case; painted: {:?}",
+            h.painted_text_strings(),
+        );
+    }
+
+    // The fleet default: the pane says so, in the source's own words, which
+    // quote the measured cost rather than hedging.
+    let h = classification_showing(Some(MeltingLayerSource::FleetDefault));
+    let notice = melting_layer_notice_painted(&h).unwrap_or_else(|| {
+        panic!(
+            "a classification on the fleet default said nothing; painted: {:?}",
+            h.painted_text_strings()
+        )
+    });
+    assert!(
+        notice.contains(MeltingLayerSource::FleetDefault.caption()),
+        "the notice does not carry the source's own caption: {notice:?}",
+    );
+    // Over the pane it is about, not somewhere in the chrome: in a split
+    // layout each pane answers for its own image.
+    let pane_rect = h.pane_rects()[0];
+    assert!(
+        h.text_painted_in(pane_rect, MeltingLayerSource::FleetDefault.caption()),
+        "the notice was painted outside the pane it describes; painted: {:?}",
+        h.painted_text_strings(),
+    );
+
+    // The sounding is the other unmeasured rung and is treated the same way —
+    // right height, no azimuthal structure, and only as contemporaneous as the
+    // sounding is.
+    let sounding = classification_showing(Some(MeltingLayerSource::Sounding));
+    assert!(
+        melting_layer_notice_painted(&sounding)
+            .is_some_and(|t| t.contains(MeltingLayerSource::Sounding.caption())),
+        "a classification on a sounding's freezing level said nothing; painted: {:?}",
+        sounding.painted_text_strings(),
+    );
+
+    // And a render that states no source at all — every product that
+    // classifies nothing — says nothing either.
+    assert_eq!(
+        melting_layer_notice_painted(&classification_showing(None)),
+        None
+    );
+}
+
+/// The two top-of-pane notices are never on screen together.
+///
+/// They occupy the same spot by design (one plate, one voice), and the
+/// arrangement that keeps them apart is not draw-order arithmetic: it is
+/// `PaneState::displayed_melting_layer_source`'s `stale_image_on_screen` gate.
+/// While the pane is showing somebody else's product it says nothing about
+/// this one's melting layer, because it is not the melting layer of the
+/// picture on the glass.
+#[test]
+fn the_two_top_of_pane_notices_never_stack() {
+    use rustdar_radar::hca::MeltingLayerSource;
+    use rustdar_radar::types::RadarProduct;
+
+    let mut h = classification_showing(Some(MeltingLayerSource::FleetDefault));
+    assert!(
+        melting_layer_notice_painted(&h).is_some() && !any_notice_painted(&h),
+        "precondition: the melting-layer notice alone; painted: {:?}",
+        h.painted_text_strings(),
+    );
+
+    // Switch product with no render landed: the pixels are now somebody
+    // else's, so the pending notice takes the plate and the melting-layer one
+    // goes quiet rather than sharing it.
+    h.offer_product(0, RadarProduct::Reflectivity, 0.5);
+    h.select_product(0, RadarProduct::Reflectivity);
+    assert!(
+        any_notice_painted(&h),
+        "precondition: the pane is showing a classification labelled \
+             reflectivity; painted: {:?}",
+        h.painted_text_strings(),
+    );
+    assert_eq!(
+        melting_layer_notice_painted(&h),
+        None,
+        "both notices were painted over one another; painted: {:?}",
+        h.painted_text_strings(),
     );
 }

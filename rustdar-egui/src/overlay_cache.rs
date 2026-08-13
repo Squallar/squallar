@@ -322,6 +322,16 @@ pub struct RadarTextureMeta {
     /// and a fold limit that outlives its picture annotates the next one with
     /// the previous cut's PRF.
     pub nyquist_ms: Option<f64>,
+    /// Where the melting layer these pixels were classified against came from,
+    /// or `None` for a raster that classified nothing.
+    ///
+    /// Travels with the texture for the reason the two above it do, and it is
+    /// the one where a pane-level copy would be worst: the layer is per-volume,
+    /// so a field on the pane would outlive its object by exactly one volume
+    /// and then describe a fresh classification with the previous volume's
+    /// provenance — reporting a guess as measured, which is the failure this
+    /// value exists to make visible.
+    pub melting_layer_source: Option<rustdar_radar::hca::MeltingLayerSource>,
     /// The product these pixels depict.
     ///
     /// Not the pane's `selected_product`: that is what the user has *asked* for,

@@ -47,6 +47,15 @@ pub struct RadarImageData {
     /// reselects PRFs between them, so the frame on the glass is the only thing
     /// that can say where the picture on the glass wraps.
     pub nyquist_ms: Option<f64>,
+    /// Where the melting layer this frame was classified against came from, or
+    /// `None` for a frame that classified nothing.
+    ///
+    /// Per frame for a sharper version of `nyquist_ms`'s reason: the object is
+    /// paired to one volume, so a loop routinely animates one frame classified
+    /// against the RPG's own layer beside twenty classified on the fleet
+    /// default. The frame on the glass is the only thing that can say which
+    /// this one is.
+    pub melting_layer_source: Option<rustdar_radar::hca::MeltingLayerSource>,
 }
 
 /// Holds a rendered cross-section raster and the little that has to travel with
@@ -1860,6 +1869,48 @@ impl PaneState {
             .radar_meta
             .as_ref()?
             .nyquist_ms
+    }
+
+    /// Where the melting layer behind the classification **on screen** came
+    /// from, or `None` when the picture is not a classification.
+    ///
+    /// [`displayed_nyquist_ms`](Self::displayed_nyquist_ms)'s sibling, sharing
+    /// every one of its gates and for the same reasons:
+    ///
+    /// * **One product.** A melting layer is a render input to the hybrid
+    ///   classification and to nothing else, so every other product answers
+    ///   `None` rather than reporting whatever the last classification stood
+    ///   on.
+    /// * **The playing frame wins over the texture.** A loop's frames are
+    ///   separate volumes with separately-paired objects, so the texture's
+    ///   metadata describes the static render the animation replaced.
+    /// * **Only what the pixels are.** Gated through
+    ///   [`stale_image_on_screen`](Self::stale_image_on_screen), so a pane
+    ///   still showing the previous product says nothing about a
+    ///   classification it is not displaying. This gate is also what keeps the
+    ///   pane from ever having two notices to draw at once: while the
+    ///   pending-render plate is up, this is `None` by construction.
+    ///
+    /// Map panes only. A section or a 3D pane is assembled from a whole tilt
+    /// ladder and its own classification is not what this describes.
+    pub fn displayed_melting_layer_source(&self) -> Option<rustdar_radar::hca::MeltingLayerSource> {
+        if self.selected_product != RadarProduct::HydrometeorClassification || !self.is_map() {
+            return None;
+        }
+        if self.loop_state.is_active() {
+            return self
+                .active_image()
+                .and_then(|frame| frame.melting_layer_source);
+        }
+        if self.stale_image_on_screen().is_some() {
+            return None;
+        }
+        self.overlay_cache(OverlayKind::Radar)?
+            .current
+            .as_ref()?
+            .radar_meta
+            .as_ref()?
+            .melting_layer_source
     }
 
     /// Whether this overlay is enabled for this pane.

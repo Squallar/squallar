@@ -15,7 +15,12 @@ fn a_restored_image_still_says_what_it_depicts() {
         .find("RadarTextureMeta {")
         .expect("restore_cached_render no longer describes the texture it places");
     let fields = &body[meta..];
-    for field in ["product,", "elevation,", "nyquist_ms,"] {
+    for field in [
+        "product,",
+        "elevation,",
+        "nyquist_ms,",
+        "melting_layer_source,",
+    ] {
         assert!(
             fields.contains(field),
             "a restored image carries no `{field}`, so a pane switched while \
@@ -29,6 +34,7 @@ fn a_restored_image_still_says_what_it_depicts() {
         "let product = cached.product;",
         "let elevation = cached.elevation;",
         "let nyquist_ms = cached.nyquist_ms;",
+        "let melting_layer_source = cached.melting_layer_source;",
     ] {
         assert!(
             body.contains(source),

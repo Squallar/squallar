@@ -40,6 +40,12 @@ pub struct CachedPaneRender {
     /// it puts back the way the render described them, and the volume behind
     /// them may be gone by then.
     pub nyquist_ms: Option<f64>,
+    /// Where the melting layer these cached pixels were classified against came
+    /// from. Kept for exactly the reason the fold limit is: the object behind it
+    /// is per-volume and the cache holding it will have been replaced by the
+    /// time a suspended pane resumes, so a restore that re-derived this would
+    /// caption an old classification with a new volume's provenance.
+    pub melting_layer_source: Option<rustdar_radar::hca::MeltingLayerSource>,
 }
 
 /// Per-pane render tracking state.
@@ -206,6 +212,10 @@ pub struct CachedRenderOutput {
     /// argument: two panes on one `(site, product, view, elevation)` are
     /// looking at one raster of one cut, so they are looking at one fold limit.
     pub nyquist_ms: Option<f64>,
+    /// Where the melting layer behind this shared raster came from — shared for
+    /// the same argument as the two above: one buffer, one classification, one
+    /// provenance, whichever pane is looking at it.
+    pub melting_layer_source: Option<rustdar_radar::hca::MeltingLayerSource>,
 }
 
 /// `(site, product, view, elevation_tenths)` — see [`elevation_key`] and
@@ -441,6 +451,28 @@ pub struct RenderDispatcher {
     /// aged out. Survives both reset paths: the environment does not change
     /// because a pane was reset, and the TTL is the eviction policy.
     pub env_heights: HashMap<String, rustdar_radar::sounding::EnvHeights>,
+    /// The RPG's own Melting Layer object per site — the top rung of
+    /// `rustdar_radar::hca::resolve_melting_layer`, staged for the one product
+    /// that reads it and invalidated by
+    /// [`set_melting_layer`](Self::set_melting_layer).
+    ///
+    /// # Why this one carries a volume and `env_heights` does not
+    ///
+    /// A sounding is a fact about a place and an hour: applying an hour-old one
+    /// to this volume is merely old, which is why that map is keyed by site
+    /// alone and aged out on a TTL. An `N0M` object is a fact about **one
+    /// volume**. Applied to another it does not degrade, it lies — it places a
+    /// measured-looking layer at a height nothing measured for the volume on
+    /// screen, which is the same failure as the fleet default with the caption
+    /// removed. So the volume it names is stored with it and
+    /// [`melting_layer_product_for`](Self::melting_layer_product_for) refuses
+    /// every other volume.
+    ///
+    /// Survives both reset paths for the reason `env_heights` does, and more
+    /// safely: a stale entry here cannot be *applied*, so eviction is not what
+    /// makes it correct. Keeping it is what lets a pane switched back to a
+    /// volume still in hand classify without a second round-trip.
+    melting_layer: HashMap<String, MeltingLayerObject>,
     /// Generation counter to discard stale render results after a **full** reset.
     ///
     /// Bumped by [`reset_panes`](Self::reset_panes) only. Per-site resets abandon
@@ -516,6 +548,26 @@ pub struct RenderDispatcher {
     /// per-frame dispatch would not merely be wasteful but would queue behind
     /// itself.
     section_input: Option<SectionInput>,
+}
+
+/// One site's `N0M` object **and the volume start it names**.
+///
+/// The pair is the type. A bare `Arc<Vec<u8>>` would be an object with no
+/// statement of what it is an object *of*, and every consumer would then have
+/// to remember to ask — which is exactly the omission that produces a
+/// confidently misplaced melting layer. Held together, the question cannot be
+/// skipped: [`RenderDispatcher::melting_layer_product_for`] is the only reader
+/// and it compares before it hands anything out.
+///
+/// The bytes and not the decoded message: `rustdar_radar::render_input`
+/// carries the object to the worker as a blob, and a `Level3Message` has no
+/// wire form — the same reason `try_spawn_level3_render` dispatches bytes.
+pub struct MeltingLayerObject {
+    /// The Level II volume start this object's PDB names, already validated by
+    /// `rustdar_radar::level3::fetch_product_for_volume` — so this field is
+    /// never a guess and never "close enough by listing time".
+    pub volume_start: chrono::NaiveDateTime,
+    pub bytes: Arc<Vec<u8>>,
 }
 
 /// A whole-volume payload and the volume it came out of.
@@ -676,6 +728,7 @@ impl RenderDispatcher {
             pane_render: vec![PaneRenderState::new()],
             level3_data: HashMap::new(),
             env_heights: HashMap::new(),
+            melting_layer: HashMap::new(),
             render_generation: 0,
             fetch_generations: HashMap::new(),
             // Owned here so there is exactly one render budget counter in the process.
@@ -795,6 +848,50 @@ impl RenderDispatcher {
         }
         self.render_cache
             .retain(|(s, product, _view, _elev)| s != site || !product.reads_env_heights());
+        true
+    }
+
+    /// Record a site's `N0M` object for the volume it names and, if that
+    /// changes what the classification would stand on, drop the site's
+    /// classification renders.
+    ///
+    /// The per-volume counterpart of
+    /// [`set_env_heights`](Self::set_env_heights), and it invalidates on a
+    /// narrower set for a narrower reason: exactly one product reads a melting
+    /// layer, so exactly one product's pictures can change when one lands.
+    ///
+    /// The comparison is on the **volume**, not on the bytes. Two objects for
+    /// one volume are the same answer however they were keyed, and an object
+    /// for a different volume is a different answer even if the bytes were
+    /// identical — which is the whole distinction this path is built on.
+    ///
+    /// Returns whether anything was invalidated.
+    pub fn set_melting_layer(
+        &mut self,
+        site: &str,
+        object: MeltingLayerObject,
+        gui: &rustdar_egui::Gui,
+    ) -> bool {
+        let unchanged = self
+            .melting_layer
+            .get(site)
+            .is_some_and(|old| old.volume_start == object.volume_start);
+        self.melting_layer.insert(site.to_string(), object);
+        if unchanged {
+            return false;
+        }
+        for (idx, prs) in self.pane_render.iter_mut().enumerate() {
+            if gui.pane(idx).is_some_and(|p| p.site == site)
+                && prs
+                    .last_rendered
+                    .is_some_and(|(p, _)| p == RadarProduct::HydrometeorClassification)
+            {
+                prs.last_rendered = None;
+            }
+        }
+        self.render_cache.retain(|(s, product, _view, _elev)| {
+            s != site || *product != RadarProduct::HydrometeorClassification
+        });
         true
     }
 
@@ -1170,6 +1267,54 @@ impl RenderDispatcher {
             .flatten()
     }
 
+    /// The `N0M` object a render of `volume_start` may classify against — and
+    /// `None` for every other volume, whatever is cached.
+    ///
+    /// # The comparison is the feature
+    ///
+    /// The cache holds one object per site and a site produces a new volume
+    /// every four to six minutes, so "the object we have" and "the object for
+    /// the picture being drawn" agree only in the window between the fetch
+    /// landing and the next volume rolling. Outside it the cached object names
+    /// the *previous* volume, whose melting layer is a real measurement of a
+    /// real atmosphere — and that is exactly what makes handing it over worse
+    /// than handing over nothing. `resolve_melting_layer`'s lower rungs know
+    /// they are guessing and say so on screen; an object from the volume before
+    /// would be reported as [`Rpg`](rustdar_radar::hca::MeltingLayerSource::Rpg)
+    /// — measured, for this volume — while being neither.
+    ///
+    /// There is deliberately no "latest object" fallback for the same reason.
+    /// `fetch_product_for_volume` already refuses an object whose PDB does not
+    /// name the volume, so nothing unvalidated can reach the map; this is the
+    /// other half — a validated object cannot outlive the volume it validated
+    /// against.
+    ///
+    /// Gated on the product as [`env_heights_km_msl_for`](Self::env_heights_km_msl_for)
+    /// is. `RenderInput::with_melting_layer_product` drops the object for every
+    /// other product anyway, so this gate buys no correctness — it buys not
+    /// cloning an `Arc` and not describing a render as classification-shaped
+    /// when it is a reflectivity sweep.
+    pub(crate) fn melting_layer_product_for(
+        &self,
+        product: RadarProduct,
+        site: &str,
+        volume_start: chrono::NaiveDateTime,
+    ) -> Option<Arc<Vec<u8>>> {
+        if product != RadarProduct::HydrometeorClassification {
+            return None;
+        }
+        let cached = self.melting_layer.get(site)?;
+        (cached.volume_start == volume_start).then(|| Arc::clone(&cached.bytes))
+    }
+
+    /// The volume the site's cached `N0M` object names, if there is one.
+    ///
+    /// The fetch gate's read: a poll that would ask for an object already in
+    /// hand for this volume asks for nothing instead.
+    pub(crate) fn melting_layer_volume(&self, site: &str) -> Option<chrono::NaiveDateTime> {
+        self.melting_layer.get(site).map(|held| held.volume_start)
+    }
+
     /// The object cached for one `(AWIPS code, site)`.
     ///
     /// The by-code counterpart of [`nearest_tilt`](Self::nearest_tilt), for a
@@ -1328,6 +1473,7 @@ impl RenderDispatcher {
         site: &str,
         data: Arc<nexrad_model::data::Scan>,
         declared: &rustdar_radar::nyquist::DeclaredNyquist,
+        volume_start: chrono::NaiveDateTime,
         sender: std::sync::mpsc::Sender<RenderResponse>,
         window: Option<WindowRef>,
     ) {
@@ -1353,6 +1499,15 @@ impl RenderDispatcher {
         // runs on its adaptation defaults, which is the documented
         // no-sounding behavior, not an error.
         let env_heights = self.env_heights_km_msl_for(product, site);
+        // And the RPG's own melting layer for **this** volume, for the one
+        // product that classifies. `volume_start` is a parameter and not a
+        // field read because the dispatcher genuinely does not know which
+        // volume it is drawing — `data` is the volume and carries no start the
+        // pairing agrees on — so this is the one render input the caller has to
+        // name. Everything downstream of it is still a field read: the object
+        // is looked up in the map `set_melting_layer` invalidates on, and the
+        // lookup refuses any volume but this one.
+        let melting_layer = self.melting_layer_product_for(product, site, volume_start);
         log::info!(
             "Spawning background render for pane {}: {:?} at {:.1}°",
             pane_idx,
@@ -1386,7 +1541,16 @@ impl RenderDispatcher {
                     // for the vertical views — this is the plan view joining
                     // them on it, so a section and the map under it fold the
                     // same sweep at the same speed.
-                    input: Box::new(input.with_declared_nyquist(declared)),
+                    // Stamped alongside the fold table and for the same
+                    // reason: the walk builds the payload out of the sweeps,
+                    // and the melting layer is not in them. `None` here is
+                    // not an error — it is `resolve_melting_layer` falling to
+                    // its next rung, which the pane then says out loud.
+                    input: Box::new(
+                        input
+                            .with_declared_nyquist(declared)
+                            .with_melting_layer_product(melting_layer),
+                    ),
                     // A static pane keeps the grid: it is what a hover reads.
                     values_wanted: true,
                     // And it is the one render kind that may take the
@@ -1692,6 +1856,7 @@ impl RenderDispatcher {
                             max_range_km: frame.max_range_km,
                             value_data: Arc::new(frame.values),
                             nyquist_ms: frame.nyquist_ms,
+                            melting_layer_source: frame.melting_layer_source,
                         })
                     }),
                     product,
