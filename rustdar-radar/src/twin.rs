@@ -206,7 +206,7 @@ pub mod compare {
     ///   the cell centre `az + 0.5°`, so radials that do not start on whole
     ///   degrees land correctly;
     /// * **range** by taking, per 1-km cell, the packet gate whose centre
-    ///   `(first_range_bin + j + 0.5) · gate_km` falls nearest the cell
+    ///   [`RadialPacket::gate_range_km`] reports falls nearest the cell
     ///   centre — both sides' first-bin offsets honoured, sub-kilometre
     ///   products represented by their centre gate.
     ///
@@ -235,7 +235,7 @@ pub mod compare {
         let mut gate_for_bin: Vec<Option<usize>> = vec![None; RANGE_BINS];
         let mut best = vec![f64::INFINITY; RANGE_BINS];
         for j in 0..n_gates {
-            let centre = (packet.first_range_bin as f64 + j as f64 + 0.5) * l3_gate_km;
+            let centre = packet.gate_range_km(j, l3_gate_km);
             let bin = centre.floor() as i64;
             if !(0..RANGE_BINS as i64).contains(&bin) {
                 continue;

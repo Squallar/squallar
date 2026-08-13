@@ -474,13 +474,17 @@ fn decode_xdr_radial_component(
         1.0
     };
 
-    // Metres to range bins. `first_gate` is the range of the **centre** of
-    // the first bin (the generic radial component's own definition — the
-    // RPG's `buildDPR_Packet28.c` writes `first_range = 125.0` for a
-    // 250 m bin, half a bin), while `first_range_bin` is a bin *index*
-    // whose centre sits at `(index + 0.5) · gate_width`. Converting one to
-    // the other therefore drops the half bin; rounding the raw ratio
-    // instead put every gate of a half-bin product one bin too far out.
+    // Metres to range bins: the inverse of `RadialPacket::gate_range_km`,
+    // which carries the ICD citation for the half bin.
+    //
+    // `first_gate` is the range of the **centre** of the first bin (the
+    // generic radial component's own definition — ICD 2620001AD Figure E-3,
+    // "Range to the center of the first bin"; the RPG's
+    // `buildDPR_Packet28.c` writes `first_range = 125.0` for a 250 m bin,
+    // half a bin), while `first_range_bin` is a bin *index* whose centre
+    // sits at `(index + 0.5) · gate_width`. Converting one to the other
+    // therefore drops the half bin; rounding the raw ratio instead put every
+    // gate of a half-bin product one bin too far out.
     let first_range_bin = if gate_width > 0.0 {
         (((first_gate / gate_width) - 0.5).max(0.0)).round() as i16
     } else {
@@ -592,7 +596,7 @@ mod tests {
                 "gate_width {gate_width} first_gate {first_gate}",
             );
             // And the bin the model reports covers the declared centre.
-            let centre = (f64::from(packet.first_range_bin) + 0.5) * packet.gate_interval_km();
+            let centre = packet.first_gate_range_km();
             assert!(
                 (centre - f64::from(first_gate) / 1000.0).abs() <= packet.gate_interval_km() * 0.5,
                 "bin {} centre {centre} km does not cover the declared {first_gate} m",

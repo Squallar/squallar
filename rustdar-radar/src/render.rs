@@ -2853,6 +2853,18 @@ pub fn render_level3_radial_to_image(
 /// is also re-derived from `first_range_bin` at the chosen spacing rather
 /// than taken from the packet.
 ///
+/// # Gate centres, because that is what `render_gate` is handed
+///
+/// [`RadialPacket::gate_range_km`] answers the range of a gate's **centre**,
+/// which is the half-gate-shifted reading ICD 2620001AD fixes (Appendix E:
+/// "Range to the center of the first bin"). That is the coordinate
+/// `Projection::render_gate` wants — it paints `range_km ± gate_interval/2` —
+/// and the coordinate the four Level II rasterizers above already pass it,
+/// `nexrad_model`'s `MomentData::first_gate_range_km` being a declared centre
+/// too. The reach handed to the projection stays an *edge*
+/// ([`RadialPacket::reach_km`]): the last gate's outer boundary, not its
+/// centre.
+///
 /// # No `cos e` here, unlike the four Level II paths
 ///
 /// The sweep rasterizers above turn a gate's slant range into the ground
@@ -2893,9 +2905,8 @@ fn render_level3_radial_with_gate_km(
         return None;
     }
 
-    let first_gate_range = radial_packet.first_range_bin as f64 * gate_interval;
     let num_bins = radial_packet.num_range_bins as usize;
-    let actual_max_range = first_gate_range + num_bins as f64 * gate_interval;
+    let actual_max_range = radial_packet.reach_km(num_bins, gate_interval);
 
     let radials = &radial_packet.radials;
 
@@ -2908,7 +2919,9 @@ fn render_level3_radial_with_gate_km(
             shape: polar::PolarShape {
                 radials: radials.len(),
                 gates: num_bins,
-                first_gate_km: first_gate_range,
+                // The same centre the gate loop below paints gate 0 at, which
+                // is what this field has to agree with.
+                first_gate_km: radial_packet.gate_range_km(0, gate_interval),
             },
         },
         product,
@@ -2937,7 +2950,7 @@ fn render_level3_radial_with_gate_km(
                             continue;
                         }
 
-                        let range_km = first_gate_range + gate_idx as f64 * gate_interval;
+                        let range_km = radial_packet.gate_range_km(gate_idx, gate_interval);
                         if range_km > proj.extent_km {
                             break;
                         }
