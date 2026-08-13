@@ -507,3 +507,76 @@ fn the_gradient_epsilon_states_its_metric_and_what_it_is_worth() {
         );
     }
 }
+
+/// **The floor composite's arm is decided by the frame, never by the ray.**
+///
+/// The composite after the march has two arms — the floor under the
+/// accumulation for an eye above the box's bottom plane, over it (faded) for an
+/// eye below — and `floor_fade` is already a function of `eye.z` alone. The arm
+/// has to be a function of the same one number, or a single frame can composite
+/// its floor two different ways in two different pixels.
+///
+/// It used to be `floor_t > span.x`: the ray's own crossing of the plane
+/// against the ray's own entry into the box. Both vary per pixel, both are the
+/// same quantity computed two ways — `floor_hit` divided where
+/// `slab_entry_exit` multiplies by a reciprocal — and at a grazing eye they
+/// land within a ULP of each other, so the comparison went both ways inside one
+/// frame.
+///
+/// # Why this test is textual, and why it is the load-bearing half
+///
+/// Because the property is about *which quantities the expression may read*,
+/// and that is a fact about the source rather than about a picture. The GPU
+/// half — `volume_gpu::the_floor_composites_on_one_arm_per_frame`, `#[ignore]`d
+/// behind a real adapter — sweeps 78 cameras and requires each frame to match a
+/// forced arm byte for byte, which is the stronger statement where it applies;
+/// but it can only report what its own driver rounds to, and on the adapter it
+/// was written against the pre-fix shader was uniform on every camera in the
+/// sweep. This one holds on every machine, including the ones with no GPU at
+/// all, and it cannot go quiet because a driver contracted a multiply.
+///
+/// A shader edit that renames or restructures the composite fails here rather
+/// than silently deleting the check. That is the intended cost: re-anchor it,
+/// and if the arm is genuinely gone, delete this deliberately.
+#[test]
+fn the_floor_composites_arm_is_a_property_of_the_frame() {
+    const BINDING: &str = "let eye_above_plane = ";
+    let at = VOLUME_SHADER_WGSL
+        .find(BINDING)
+        .expect("the composite no longer binds its arm to a name this can read");
+    assert_eq!(
+        VOLUME_SHADER_WGSL.matches(BINDING).count(),
+        1,
+        "the arm is bound in more than one place, so this test cannot say which \
+         one the composite reads",
+    );
+    let expression = VOLUME_SHADER_WGSL[at + BINDING.len()..]
+        .split(';')
+        .next()
+        .expect("split always yields at least one piece");
+
+    assert!(
+        expression.contains("eye.z"),
+        "the composite's arm is `{expression}`, which does not read the eye's \
+         height at all — it is `floor_fade`'s own number and has to be the same \
+         one, or the fade and the order it scales can disagree about which side \
+         of the plane the camera is on",
+    );
+    for per_pixel in ["floor_t", "span", "direction", "in.ndc"] {
+        assert!(
+            !expression.contains(per_pixel),
+            "the composite's arm is `{expression}`, which reads `{per_pixel}` — \
+             a per-pixel quantity. The arm is a property of the frame; deciding \
+             it per pixel is how one frame came to composite 193 pixels behind \
+             the volume and 1172 in front of it",
+        );
+    }
+
+    // And it is the name the two branches actually switch on, so a binding that
+    // had stopped being read would fail here rather than pass by existing.
+    assert!(
+        VOLUME_SHADER_WGSL.contains("&& eye_above_plane {"),
+        "nothing branches on `eye_above_plane`, so binding it correctly proves \
+         nothing about what the composite does",
+    );
+}

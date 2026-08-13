@@ -2763,3 +2763,180 @@ fn the_charged_grid_bytes_are_never_under_what_the_device_reserved() {
     }
     assert_eq!(checked, 12, "every rung and both coarse arms were measured");
 }
+
+/// **Every pixel of a frame composites the floor on the same arm.**
+///
+/// The composite after the march has two arms — the floor under the
+/// accumulation for an eye above the bottom plane, over it (faded) for an eye
+/// below — and the design is that which arm runs is a property of the *frame*.
+/// It was not. The discriminant was `floor_t > span.x`: the ray's own crossing
+/// against the ray's own box entry, two quantities that vary per pixel and, at
+/// a grazing eye, land within a ULP of each other. Swept over 175 cameras, 68
+/// were not uniform, and one mixed visibly — `eye.z = -0.0703`,
+/// `floor_fade = 0.121`, 193 pixels behind and 1172 in front, in one frame.
+///
+/// # Why this is exact rather than a tolerance
+///
+/// Widening a tolerance is precisely what this must not do, so the test never
+/// compares a mixed frame against a threshold. It builds the shipped shader and
+/// two mutants of it — one whose arm is forced on, one whose arm is forced off
+/// — and requires the shipped frame to be **byte-identical** to one of the two.
+/// A frame that took one arm in some pixels and the other arm elsewhere matches
+/// neither, whatever the difference between them is worth in 8-bit levels. The
+/// forcing goes through [`VolumePipelines::from_shader_source`], the same seam
+/// `tests/volume_shader_mutants.rs` uses, so both arms are the shipped arms
+/// rather than a restatement.
+///
+/// # The sweep
+///
+/// A solid volume standing on an opaque floor — the two arms are algebraically
+/// identical over an empty box, so a fixture without a volume in it could not
+/// tell them apart at all — and the eye walked through the bottom plane in
+/// 0.002 steps, which puts forty cameras inside the 0.08 fade band and several
+/// on the crossing itself.
+///
+/// # What this half cannot do, and what stands under it instead
+///
+/// It is a behavioural check and it can only report what its own adapter does.
+/// The pre-fix shader was rebuilt through the same seam and run over this whole
+/// sweep on an RTX 3090 (Vulkan 610.57.04): **it was uniform on every one of
+/// the 78 cameras.** That driver evidently emits the same bits for `a / b` and
+/// `a * (1.0 / b)` at these inputs, so the ULP the old discriminant turned on
+/// never opened here. A defect that is invisible on the adapter in front of you
+/// is exactly the one a behavioural test cannot be the whole answer to, so the
+/// driver-independent half is
+/// `volume_shader::the_floor_composites_arm_is_a_property_of_the_frame`, which
+/// pins the arm's expression rather than its consequences and runs everywhere.
+///
+/// ```text
+/// cargo test -p rustdar-frontend --test volume_gpu \
+///     the_floor_composites_on_one_arm_per_frame -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
+fn the_floor_composites_on_one_arm_per_frame() {
+    use rustdar_frontend::volume::raymarch::VOLUME_SHADER_WGSL;
+
+    /// The one line the two forced builds replace. Asserted to match, because a
+    /// battery whose anchor has moved is a green test that proves nothing.
+    const ARM: &str = "let eye_above_plane = eye.z >= 0.0;";
+
+    let _serialised = gpu_lock();
+    let (device, queue) = device();
+    assert_eq!(
+        VOLUME_SHADER_WGSL.matches(ARM).count(),
+        1,
+        "the composite's arm is no longer decided by `{ARM}`, so this test is \
+         forcing something that does not exist",
+    );
+    let forced =
+        |on: bool| VOLUME_SHADER_WGSL.replace(ARM, &format!("let eye_above_plane = {on};"));
+
+    let format = wgpu::TextureFormat::Bgra8Unorm;
+    let shipped = VolumePipelines::new(&device, attachments(format));
+    let behind = VolumePipelines::from_shader_source(&device, attachments(format), &forced(true));
+    let in_front =
+        VolumePipelines::from_shader_source(&device, attachments(format), &forced(false));
+    for pipelines in [&shipped, &behind, &in_front] {
+        pipelines.upload_quad(&queue);
+    }
+
+    const SIZE: [u32; 2] = [64, 64];
+    const CELLS: [u32; 3] = [8, 8, 8];
+    let red: Vec<u8> = std::iter::repeat_n([255u8, 0, 0, 255], 64)
+        .flatten()
+        .collect();
+    let solid = vec![255u8; (CELLS[0] * CELLS[1] * CELLS[2]) as usize];
+    let lut = opaque_white_lut();
+
+    // Looking up, for an eye under the bottom plane: the mirror of
+    // `box_from_clip_down(2)`, so depth 1 unprojects above the top face.
+    let mut looking_up = [[0.0f32; 4]; 4];
+    looking_up[0][0] = 0.5;
+    looking_up[1][1] = 0.5;
+    looking_up[3][0] = 0.5;
+    looking_up[3][1] = 0.5;
+    looking_up[2][2] = 2.5;
+    looking_up[3][2] = -0.5;
+    looking_up[3][3] = 1.0;
+
+    let frame = |pipelines: &VolumePipelines, eye_z: f32| {
+        let floor = planted_mirror(&device, &queue, pipelines, [8, 8], &red);
+        let mut uniform = VolumeUniform::new(equatorial_box_km(), CELLS);
+        // The mirror standing exactly over the box's footprint, so every ray
+        // that reaches the bottom plane inside the box lands on ground rather
+        // than on whatever a default lane clamps to.
+        let (floor_uv, floor_geo) = equatorial_floor_lanes(floor.is_gamma_encoded());
+        uniform.floor_uv = floor_uv;
+        uniform.floor_geo = floor_geo;
+        // Down the z axis from above, up it from below — the two ways a ray
+        // reaches the bottom plane at all, and the only cameras under which
+        // the arm question arises.
+        uniform.box_from_clip = if eye_z >= 0.0 {
+            box_from_clip_down(2)
+        } else {
+            looking_up
+        };
+        uniform.eye_in_box = [0.5, 0.5, eye_z];
+        uniform.extinction_per_km = 1000.0;
+        uniform.gradient_shading = false;
+        uniform.map_floor = true;
+        raymarch_once_with_floor(
+            &device, &queue, pipelines, CELLS, &solid, &lut, &uniform, SIZE, &floor,
+        )
+    };
+
+    // The fade band is 0.08 box heights. Below the plane it is walked in 0.002
+    // steps, because that is where the two discriminants disagree: an upward
+    // ray's box entry IS its floor crossing, so `floor_t > span.x` compares a
+    // number against itself and a ULP of difference decides. Above the plane
+    // the eye is walked out of the box and away.
+    let mut heights: Vec<f32> = (1..40).map(|n| -(n as f32) * 0.002).collect();
+    heights.extend((1..30).map(|n| n as f32 * 0.002));
+    heights.extend([-1.5, -0.5, -0.09, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 3.0]);
+
+    let (mut above, mut below, mut agreed) = (0usize, 0usize, 0usize);
+    for eye_z in heights {
+        let shipped_px = frame(&shipped, eye_z);
+        let behind_px = frame(&behind, eye_z);
+        let front_px = frame(&in_front, eye_z);
+        let is_behind = shipped_px == behind_px;
+        let is_front = shipped_px == front_px;
+        assert!(
+            is_behind || is_front,
+            "eye.z = {eye_z}: the frame matches neither forced arm, so its \
+             pixels did not agree on one — {} of {} pixels differ from the \
+             behind arm and {} from the in-front arm",
+            shipped_px
+                .iter()
+                .zip(&behind_px)
+                .filter(|(a, b)| a != b)
+                .count(),
+            shipped_px.len(),
+            shipped_px
+                .iter()
+                .zip(&front_px)
+                .filter(|(a, b)| a != b)
+                .count(),
+        );
+        match (is_behind, is_front) {
+            (true, true) => agreed += 1,
+            (true, false) => above += 1,
+            (false, true) => below += 1,
+            (false, false) => unreachable!("the assertion above already fired"),
+        }
+    }
+    // Both arms are actually resolved, and by a margin. A sweep that only ever
+    // reached one of them — or one on which the two arms happened to paint the
+    // same picture everywhere — would pass the loop above vacuously.
+    assert!(
+        above >= 10 && below >= 30,
+        "the sweep resolved {above} frames onto the behind arm and {below} onto \
+         the in-front arm ({agreed} could not be told apart); it is meant to \
+         cross the plane with the two arms visibly different either side",
+    );
+    eprintln!(
+        "arm uniformity: {above} frames behind, {below} in front, {agreed} \
+         where the two arms paint the same picture"
+    );
+}

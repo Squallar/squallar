@@ -826,6 +826,55 @@ fn probe_floor_from_below(
     reading
 }
 
+/// A solid volume standing on an opaque floor, seen from an eye above the
+/// bottom plane — which is the only fixture where the composite's two arms give
+/// different pictures.
+///
+/// Every other floor probe here draws an *empty* box, and over an empty box the
+/// two arms are algebraically identical: `0 + 1 * cover * ground` and
+/// `ground * cover + 0 * (1 - cover)` are the same colour. So a mutation of the
+/// arm itself is invisible to all of them, which is exactly the hole this
+/// closes. Behind the volume the ground is absorbed and the pixel is white; in
+/// front of it the ground covers the volume and the pixel is red.
+fn probe_floor_arm_over_a_solid_volume(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipelines: &VolumePipelines,
+) -> Vec<f64> {
+    let size = [64u32, 64];
+    let cells = [8u32, 8, 8];
+    let rgba: Vec<u8> = std::iter::repeat_n([255u8, 0, 0, 255], 64)
+        .flatten()
+        .collect();
+    let floor = planted_mirror(device, queue, pipelines, [8, 8], &rgba);
+
+    let mut uniform = VolumeUniform::new(equatorial_box_km(), cells);
+    // Down the z axis from the box's own middle: above the bottom plane, but
+    // not above the box, so a mutation that moves the plane to the top face has
+    // somewhere to be wrong. An eye outside the near face would be above both
+    // and could not tell them apart.
+    uniform.box_from_clip = box_from_clip_down(2);
+    uniform.eye_in_box = [0.5, 0.5, 0.5];
+    uniform.extinction_per_km = 1000.0;
+    uniform.gradient_shading = false;
+    uniform.map_floor = true;
+    let (floor_uv, floor_geo) = equatorial_floor_lanes(floor.is_gamma_encoded());
+    uniform.floor_uv = floor_uv;
+    uniform.floor_geo = floor_geo;
+    // Solid, so the march has actually absorbed the ground by the time the
+    // behind arm composites it.
+    let solid = vec![255u8; (cells[0] * cells[1] * cells[2]) as usize];
+    let lut = opaque_white_lut();
+    let pixels = raymarch_once_with_floor(
+        device, queue, pipelines, cells, &solid, &lut, &uniform, size, &floor,
+    );
+    vec![
+        channel_mean(&pixels, 0),
+        channel_mean(&pixels, 1),
+        painted_fraction(&pixels),
+    ]
+}
+
 /// How wide one voxel paints, at the raw field and at the cloud rung.
 ///
 /// The reconstruction knob is the difference between the two numbers; the
@@ -1131,6 +1180,11 @@ static FLOOR_FROM_BELOW: Probe = Probe {
     name: "an empty box seen from under its bottom plane",
     tolerance: 0.012,
     run: probe_floor_from_below,
+};
+static FLOOR_ARM: Probe = Probe {
+    name: "which side of the accumulation the floor lands on, over a solid volume",
+    tolerance: 0.012,
+    run: probe_floor_arm_over_a_solid_volume,
 };
 static LONE_VOXEL: Probe = Probe {
     name: "one voxel's painted footprint, raw and at the cloud rung",
@@ -1484,6 +1538,39 @@ static MUTANTS: &[Mutant] = &[
         occurrences: 1,
         probe: &THIN_SLAB_RESOLUTION,
     },
+    Mutant {
+        name: "slab_direction drops the ray's sign, so every ray solves as if it pointed up",
+        class: "geometry",
+        pattern: "return select(magnitude, -magnitude, rd < vec3<f32>(0.0));",
+        replacement: "return magnitude;",
+        occurrences: 1,
+        // An eye outside the near face, where an unsigned direction sends the
+        // slab's far bound behind the camera and the box is missed outright.
+        // Not FLOOR_ARM: its eye is inside the box, and from there the
+        // unsigned solve still enters and the picture barely moves.
+        probe: &TRANSLUCENT_VOLUME,
+    },
+    Mutant {
+        name: "the composite's plane is the box top rather than its bottom face",
+        class: "geometry",
+        pattern: "let eye_above_plane = eye.z >= 0.0;",
+        replacement: "let eye_above_plane = eye.z >= 1.0;",
+        occurrences: 1,
+        probe: &FLOOR_ARM,
+    },
+    // Not here, and deliberately: reverting the arm to `floor_t > span.x`, and
+    // reverting `floor_hit` to a plain `-eye.z / direction.z`. Both are the
+    // defect the composite's own comment describes, and NEITHER is reachable by
+    // a probe — off the grazing boundary the two expressions agree to the last
+    // bit, and at it they disagree by one ULP in a band where `floor_fade` has
+    // already multiplied both arms by ~0. What stands on them is
+    // `volume_gpu::the_floor_composites_on_one_arm_per_frame` — `#[ignore]`d
+    // behind a real adapter, run with `cargo test -p rustdar-frontend --test
+    // volume_gpu -- --ignored` — which asks a different question: not "does
+    // this pixel move" but "is the whole frame on one arm", which is the
+    // property that was false. Its host-side half,
+    // `volume_shader::the_floor_composites_arm_is_a_property_of_the_frame`,
+    // runs everywhere and needs no adapter at all.
 ];
 
 /// Every pattern in [`MUTANTS`] still names something in the shader, exactly as

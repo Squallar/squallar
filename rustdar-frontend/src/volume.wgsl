@@ -449,13 +449,25 @@ fn unproject(ndc: vec2<f32>, depth: f32) -> vec3<f32> {
     return homogeneous.xyz / homogeneous.w;
 }
 
+// The ray direction as every plane crossing in this shader solves against it:
+// each component's magnitude floored at RAY_DIRECTION_EPSILON, its sign kept.
+//
+// One function rather than the same three lines twice, because the two callers
+// have to agree to the BIT. `floor_hit` used to divide where this multiplies by
+// a reciprocal, so the box's bottom face had two answers a ULP apart — and the
+// composite below then read the difference as "which side of the plane is the
+// eye on", a question the ray has no business being asked. See the composite
+// at the end of `fs_raymarch`.
+fn slab_direction(rd: vec3<f32>) -> vec3<f32> {
+    let magnitude = max(abs(rd), vec3<f32>(RAY_DIRECTION_EPSILON));
+    return select(magnitude, -magnitude, rd < vec3<f32>(0.0));
+}
+
 // Where the ray enters and leaves the unit cube, as (entry, exit) parameters.
 // `exit <= entry` means it misses. Entry is clamped to zero so that a camera
 // inside the box marches from itself rather than from behind itself.
 fn slab_entry_exit(ro: vec3<f32>, rd: vec3<f32>) -> vec2<f32> {
-    let magnitude = max(abs(rd), vec3<f32>(RAY_DIRECTION_EPSILON));
-    let signed = select(magnitude, -magnitude, rd < vec3<f32>(0.0));
-    let inverse = vec3<f32>(1.0) / signed;
+    let inverse = vec3<f32>(1.0) / slab_direction(rd);
     let to_min = (vec3<f32>(0.0) - ro) * inverse;
     let to_max = (vec3<f32>(1.0) - ro) * inverse;
     let near = min(to_min, to_max);
@@ -792,15 +804,20 @@ fn iso_surface_colour(p: vec3<f32>) -> vec3<f32> {
 // The floor is the z = 0 plane clipped to the unit square in x and y — the
 // box's own bottom face, so a hit is always on the box boundary: for an eye
 // above the plane it coincides with the ray's box exit, and for an eye below
-// it with (or before) the entry. That dichotomy is what lets the march
-// composite the floor with one comparison after the loop — behind the
-// accumulation from above, in front of it (faded) from below — instead of
-// interleaving it into the loop.
+// it with (or before) the entry.
+//
+// **Solved through `slab_direction`, so that coincidence is exact.** The plain
+// `-eye.z / direction.z` this used to be is the same value to within a ULP and
+// not the same float: `slab_entry_exit` multiplies by a reciprocal, and
+// `a * (1.0 / b)` is not `a / b`. A ULP is nothing to a sample position, and
+// the sample position is all this feeds now — but it was once compared against
+// the slab's own bound to choose a composite order, and there a ULP is the
+// whole answer.
 fn floor_hit(eye: vec3<f32>, direction: vec3<f32>) -> f32 {
     if abs(direction.z) < RAY_DIRECTION_EPSILON {
         return -1.0;
     }
-    let t = -eye.z / direction.z;
+    let t = (0.0 - eye.z) * (1.0 / slab_direction(direction).z);
     if t <= 0.0 {
         return -1.0;
     }
@@ -1060,6 +1077,26 @@ fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
         t = t + dt;
     }
 
+    // Which side of the bottom plane the EYE is on, which is the whole of what
+    // decides the composite order. `floor_fade` is already a function of this
+    // one number and the arm has to be the same function of it, or a frame can
+    // composite its floor two different ways in two different pixels.
+    //
+    // **It could, and it did.** This read `floor_t > span.x` — the ray's own
+    // crossing against the ray's own box entry — which is the same question
+    // asked of a quantity that varies per pixel and lands within a ULP of the
+    // boundary at a grazing eye. Swept over 175 cameras, 68 were not uniform in
+    // their arm and one mixed visibly: at `eye.z = -0.0703`, 193 pixels
+    // composited the floor behind the volume and 1172 composited it in front,
+    // in one frame. It was invisible only because every mixing camera found was
+    // deep enough in the fade band that both arms multiply by ~0 — an accident
+    // of where the boundary sits, not a property anything enforces.
+    //
+    // `>= 0.0` rather than `> 0.0`: an eye exactly on the plane has no floor
+    // hit at all (`floor_hit` refuses `t <= 0`), so the branch is unreachable
+    // there and the boundary is placed where the fade's is.
+    let eye_above_plane = eye.z >= 0.0;
+
     // The floor behind the volume: an eye above the plane meets it at the box
     // exit, so whatever light the march did not absorb lands on the ground
     // and composites under the accumulation — the same premultiplied algebra
@@ -1068,7 +1105,7 @@ fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
     // own alpha times the fade — 1 above the plane, so this arm is unchanged
     // there.
     var transmitted = transmittance;
-    if floor_t > span.x {
+    if floor_t >= 0.0 && eye_above_plane {
         let ground = floor_colour(eye, direction, floor_t);
         let cover = ground.a * floor_fade;
         accumulated = accumulated + transmittance * cover * ground.rgb;
@@ -1078,9 +1115,8 @@ fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
         // at (or before) the box entry, so the faded ground composites OVER
         // the march — the same over operator from the other side. At fade 0
         // this arm vanishes and the volume shows through where the wall
-        // stood; `span.x` rather than 0 in the test above so an inside-the-
-        // box eye — whose entry is clamped to 0 strictly above the plane —
-        // never takes it.
+        // stood. An inside-the-box eye is above the plane and so takes the
+        // arm above, which is what `span.x` used to be here for.
         let ground = floor_colour(eye, direction, floor_t);
         let cover = ground.a * floor_fade;
         accumulated = ground.rgb * cover + accumulated * (1.0 - cover);
