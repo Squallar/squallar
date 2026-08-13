@@ -27,9 +27,9 @@
 //! is over there.
 
 use super::{
-    COVERAGE_MARGIN, MAX_FRAMING_PASSES, MAX_ZOOM_LEVEL, MIN_ZOOM_LEVEL, RegionDrag, corners_for,
-    dolly_for_step, ground_half_extent, solve_viewport, viewport_for_region, wheel_rate_correction,
-    zoom_step,
+    COVERAGE_MARGIN, COVERAGE_TARGET, MAX_FRAMING_PASSES, MAX_ZOOM_LEVEL, MIN_ZOOM_LEVEL,
+    RegionDrag, corners_for, dolly_for_step, ground_half_extent, solve_viewport,
+    viewport_for_region, wheel_rate_correction, zoom_step,
 };
 
 /// A frame whose timing is unusable leaves walkers exactly as it found it.
@@ -525,6 +525,178 @@ fn the_framed_strip_covers_the_whole_box() {
     }
 }
 
+/// How far a delivered margin may sit from the band's ends before it counts as
+/// outside it, as a fraction of the end.
+///
+/// The solve computes its target and its step in one arithmetic; a test measures
+/// what came back by building a **fresh** projector and running the geodesy
+/// again. The two agree to a few parts in 1e8 rather than exactly, and the band
+/// this file asserts is 1e-3 wide, so an exact `contains` would be asserting
+/// that a round trip through Mercator and a haversine is lossless. Measured
+/// worst deviation over the 865 280-framing sweep: 2.2e-8 below
+/// [`COVERAGE_MARGIN`] would be needed to trip the floor, and 8.5e-11 above
+/// [`COVERAGE_TARGET`] was the largest excess seen at the ceiling.
+///
+/// One part in a million, which is four orders clear of both and still six
+/// orders inside the defect it exists to catch — a solve that settles for zero
+/// margin delivers 3.3e-8, not 9.99e-4.
+const BAND_ROUND_TRIP: f64 = 1e-6;
+
+/// **The margin is delivered, not merely aimed at.**
+///
+/// [`COVERAGE_MARGIN`] promises "0.1% of a 920 km box is 920 m … the price of
+/// never being short", and for as long as the solve aimed and settled at the
+/// same number that promise was not kept. The east–west lane is *exact* — one
+/// logarithm lands the strip on the target to rounding — so a solve aimed at the
+/// box plus the margin and settling for the box plus nothing came back covering
+/// the box and nothing more. Measured over this sweep with the old bar: the
+/// worst delivered margin was **3.28e-8**, 2.09% of framings delivered under a
+/// tenth of the margin, and 438 of them delivered under `f32::EPSILON`. The
+/// mirror registers through walkers' **f32** `Projector::project`, so those last
+/// ones had spent the margin past the precision of the projection it protects.
+///
+/// The old coverage tests could not see it: they assert `covered >= box`, which
+/// zero margin satisfies exactly. This asserts the *band* —
+/// [`COVERAGE_MARGIN`] at the floor, [`COVERAGE_TARGET`] at the ceiling — which
+/// is a claim with a number in it that a solve can come in under.
+///
+/// The sweep is the shipped one at fixture scale: ten strip sizes on each axis,
+/// every whole degree of latitude both sides of the equator, and eight boxes
+/// including the 470 km cap a maximal drag commits and the two rectangles that
+/// straddle it. A solve that ran out of zoom is excluded — a strip physically
+/// too small to show the box has no margin to deliver, and
+/// [`a_box_wider_than_the_strip_can_show_is_framed_as_wide_as_walkers_allows`]
+/// is what covers that exit.
+///
+/// [`a_box_wider_than_the_strip_can_show_is_framed_as_wide_as_walkers_allows`]:
+///     a_box_wider_than_the_strip_can_show_is_framed_as_wide_as_walkers_allows
+#[test]
+fn the_framing_delivers_the_margin_it_promises() {
+    let mut framings = 0usize;
+    let mut worst = f64::INFINITY;
+    let mut worst_at = String::new();
+    let mut widest = f64::NEG_INFINITY;
+    let mut widest_at = String::new();
+
+    for w in FRAMING_SWEEP_SIDES {
+        for h in FRAMING_SWEEP_SIDES {
+            let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(w, h));
+            // Half a degree, not whole ones: the framing that spent the whole
+            // margin sits at 64.5°N, and a sweep on integers walks past it.
+            for half_degrees in -168..=168 {
+                let lat = f64::from(half_degrees) * 0.5;
+                let centre = walkers::lat_lon(lat, -97.28);
+                for box_half in FRAMING_SWEEP_BOXES {
+                    let (memory, passes) =
+                        solve_viewport(rect, centre, box_half).expect("framable");
+                    // Out of zoom is a strip that cannot show the box at all.
+                    // The budget's last pass is the one exit where a settle and
+                    // an exhaustion look alike from outside, and the band below
+                    // is the settle condition restated — so asserting it there
+                    // would be asserting that nothing ever exhausts, which
+                    // `a_solve_that_runs_out_of_passes_is_short_only_beside_the_pole`
+                    // measures instead.
+                    if memory.zoom() <= MIN_ZOOM_LEVEL || passes == MAX_FRAMING_PASSES {
+                        continue;
+                    }
+                    framings += 1;
+                    let covered = ground_half_extent(rect, &memory, centre).expect("measurable");
+                    let delivered = (covered.east_km / box_half.east_km)
+                        .min(covered.north_km / box_half.north_km)
+                        - 1.0;
+                    if delivered < worst {
+                        worst = delivered;
+                        worst_at = format!("{w}x{h} at {lat}N framed on {box_half:?}");
+                    }
+                    if delivered > widest {
+                        widest = delivered;
+                        widest_at = format!("{w}x{h} at {lat}N framed on {box_half:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        framings > 100_000,
+        "the sweep settled only {framings} framings, which is too few to be \
+         the measurement this doc quotes",
+    );
+    assert!(
+        worst >= COVERAGE_MARGIN * (1.0 - BAND_ROUND_TRIP),
+        "the worst framing delivered a margin of {worst:e} against the {:e} \
+         `COVERAGE_MARGIN` promises, at {worst_at} - short of the promise is \
+         the volume standing on transparency, and under f32::EPSILON ({:e}) it \
+         is short of the precision the mirror is drawn in",
+        COVERAGE_MARGIN,
+        f32::EPSILON,
+    );
+    assert!(
+        widest <= COVERAGE_TARGET * (1.0 + BAND_ROUND_TRIP),
+        "a framing was left {widest:e} wider than its box against the {:e} \
+         ceiling `COVERAGE_TARGET` sets, at {widest_at} - past the band is \
+         mirror resolution spent on ground the box clips away",
+        COVERAGE_TARGET,
+    );
+}
+
+/// The strip sizes and boxes the framing properties are swept over.
+///
+/// Awkward on purpose. The shapes that stress the solve hardest are the
+/// lopsided ones — a 536 × 8 strip at 58°N, a 1256 × 56 at 65°N — so a list of
+/// round sizes measures the solve as easier than it is.
+const FRAMING_SWEEP_SIDES: [f32; 10] = [
+    8.0, 24.0, 56.0, 96.0, 200.0, 392.0, 536.0, 680.0, 1016.0, 1256.0,
+];
+
+/// The boxes [`FRAMING_SWEEP_SIDES`] is swept against.
+///
+/// The whole ring, the **470 km cap a maximal drag commits**, 300 km, the 10 km
+/// floor, the 664 × 10 km rectangle the corner bound allows and its transpose,
+/// an ordinary 120 × 75, and the 235 × 470 rectangle that binds on the axis the
+/// square one does not — with its transpose, which is the shape that spent the
+/// margin hardest: a 96 × 56 strip at 64.5°N framed on 470 × 235 is the framing
+/// that delivered **3.28e-8** while the solve aimed and settled at the same
+/// number.
+const FRAMING_SWEEP_BOXES: [rustdar_radar::voxel::HalfExtentKm; 9] = [
+    rustdar_radar::voxel::HalfExtentKm {
+        east_km: 460.125,
+        north_km: 460.125,
+    },
+    rustdar_radar::voxel::HalfExtentKm {
+        east_km: 470.0,
+        north_km: 470.0,
+    },
+    rustdar_radar::voxel::HalfExtentKm {
+        east_km: 300.0,
+        north_km: 300.0,
+    },
+    rustdar_radar::voxel::HalfExtentKm {
+        east_km: 10.0,
+        north_km: 10.0,
+    },
+    rustdar_radar::voxel::HalfExtentKm {
+        east_km: 664.0,
+        north_km: 10.0,
+    },
+    rustdar_radar::voxel::HalfExtentKm {
+        east_km: 10.0,
+        north_km: 664.0,
+    },
+    rustdar_radar::voxel::HalfExtentKm {
+        east_km: 120.0,
+        north_km: 75.0,
+    },
+    rustdar_radar::voxel::HalfExtentKm {
+        east_km: 235.0,
+        north_km: 470.0,
+    },
+    rustdar_radar::voxel::HalfExtentKm {
+        east_km: 470.0,
+        north_km: 235.0,
+    },
+];
+
 /// The framing is **tight**, not merely sufficient.
 ///
 /// The mirror is a fixed number of pixels, so every kilometre of ground outside
@@ -532,11 +704,14 @@ fn the_framed_strip_covers_the_whole_box() {
 /// solve that zoomed out "to be safe" would pass the coverage test above and
 /// cost the floor detail on every 3D pane in the application.
 ///
-/// The binding axis is asserted to land inside [`COVERAGE_MARGIN`] and a little
-/// over — the margin is what the solve converges *through*, so landing a
-/// fraction of it wide is the intended outcome rather than slack. The other axis
-/// is free, because a square box in a 16:9 strip must overhang east–west and
-/// there is no framing that avoids it.
+/// The binding axis is asserted to land inside [`COVERAGE_TARGET`], the ceiling
+/// of the band the solve settles in — the margin is what the solve converges
+/// *through*, so landing a fraction of it wide is the intended outcome rather
+/// than slack. The other axis is free, because a square box in a 16:9 strip must
+/// overhang east–west and there is no framing that avoids it.
+///
+/// 0.2% of the 470 km cap a maximal drag commits is 940 m of mirror outside the
+/// box on each side, which is where the ceiling was set and why.
 #[test]
 fn the_framing_spends_no_more_of_the_mirror_than_the_box_needs() {
     let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(700.0, 450.0));
@@ -546,7 +721,7 @@ fn the_framing_spends_no_more_of_the_mirror_than_the_box_needs() {
         let covered = ground_half_extent(rect, &memory, centre).expect("measurable");
         let slack = (covered.east_km / box_half.east_km).min(covered.north_km / box_half.north_km);
         assert!(
-            slack <= 1.0 + 2.0 * COVERAGE_MARGIN,
+            slack <= 1.0 + COVERAGE_TARGET * (1.0 + BAND_ROUND_TRIP),
             "framing {box_half:?} left the binding axis {slack:.6}x wider than \
              the box; every bit past the margin is mirror resolution the box \
              clips away",
@@ -603,43 +778,45 @@ fn the_solve_stops_as_soon_as_the_strip_covers_the_box() {
             "the solve used its whole {MAX_FRAMING_PASSES}-pass budget on a              {w}x{h} strip at {lat}N, so the early-out did not fire",
         );
 
-        // What the early-out fired *on*: the strip covers the box, and is still
-        // inside the margin rather than past it. Both directions matter — short
-        // is transparent floor, wide is mirror resolution spent outside the box.
+        // What the early-out fired *on*: the strip covers the box plus the
+        // margin the constant promises, and is not past the ceiling the solve
+        // aims at. Both directions matter — short is transparent floor, wide is
+        // mirror resolution spent outside the box.
         let covered = ground_half_extent(rect, &memory, centre).expect("measurable");
+        let delivered =
+            (covered.east_km / box_half.east_km).min(covered.north_km / box_half.north_km) - 1.0;
         assert!(
-            covered.east_km >= box_half.east_km && covered.north_km >= box_half.north_km,
-            "the solve stopped at {covered:?}, short of {box_half:?}",
+            delivered >= COVERAGE_MARGIN * (1.0 - BAND_ROUND_TRIP),
+            "the early-out fired on a strip delivering {delivered:e} over the \
+             box, against the {COVERAGE_MARGIN:e} `COVERAGE_MARGIN` promises - \
+             a bar the strip merely *covers* is one an exact lane clears with \
+             nothing left over, which is what it used to be",
         );
-        let settled = ((box_half.east_km * (1.0 + COVERAGE_MARGIN)) / covered.east_km)
-            .max((box_half.north_km * (1.0 + COVERAGE_MARGIN)) / covered.north_km);
         assert!(
-            (1.0..=1.0 + COVERAGE_MARGIN).contains(&settled),
-            "the solve settled at {settled}, outside the margin it converges              through - below 1.0 makes `COVERAGE_MARGIN` slack rather than the              direction the solve is wrong in, above it is a strip left wide",
+            delivered <= COVERAGE_TARGET * (1.0 + BAND_ROUND_TRIP),
+            "the early-out left a strip {delivered:e} wider than the box, past \
+             the {COVERAGE_TARGET:e} ceiling the solve aims at",
         );
     }
 }
 
-/// The pass table on [`MAX_FRAMING_PASSES`], re-measured — including the row
-/// that says the solve does not converge at all.
+/// The pass table on [`MAX_FRAMING_PASSES`], re-measured — every row of it,
+/// including the last one, which is the budget entire.
 ///
 /// The budget is a claim about every strip, latitude and box this application
 /// can produce, and the last one to be measured on a single fixture was measured
-/// on the easy one. So this sweeps: ten strip sizes on each axis from a
-/// collapsed 8 points to a 1400-point ultrawide, every whole degree from the
-/// equator to 84°, and six boxes — the whole ring, 300 km, the 10 km floor, the
-/// 664 × 10 km rectangle a config can carry, its transpose, and an ordinary
-/// 120 × 75.
+/// on the easy one. So this sweeps [`FRAMING_SWEEP_SIDES`] on each axis and
+/// [`FRAMING_SWEEP_BOXES`] at every whole degree from the equator to 84°.
 ///
-/// Two things are held. Up to 79° every solve settles inside its band's row, and
-/// each row is *reached* — a table whose numbers are all overstatements is a
-/// table nobody can use to choose the budget. Past 80° some shape must exhaust
-/// the budget, because that row claims the solve stops converging there and an
-/// unreachable claim is one that has quietly become false.
+/// Two things are held. Every solve settles inside its band's row, and each row
+/// is *reached* — a table whose numbers are all overstatements is a table nobody
+/// can use to choose the budget, and until the 470 km cap and the 80°+ rows
+/// joined it the table peaked at seven, so a [`MAX_FRAMING_PASSES`] of 7 would
+/// have passed every test there was.
 ///
-/// A solve that runs out of zoom rather than out of passes is excluded from the
-/// coverage half: the clamp at [`MIN_ZOOM_LEVEL`] is the strip being physically
-/// unable to show the box, which
+/// A solve that runs out of zoom rather than out of passes is excluded: the
+/// clamp at [`MIN_ZOOM_LEVEL`] is the strip being physically unable to show the
+/// box, which
 /// [`a_box_wider_than_the_strip_can_show_is_framed_as_wide_as_walkers_allows`]
 /// covers and this is not about.
 ///
@@ -647,65 +824,28 @@ fn the_solve_stops_as_soon_as_the_strip_covers_the_box() {
 ///     a_box_wider_than_the_strip_can_show_is_framed_as_wide_as_walkers_allows
 #[test]
 fn the_framing_budget_covers_every_latitude_a_region_can_sit_at() {
-    /// The row of [`MAX_FRAMING_PASSES`]' table that `lat` falls in.
-    fn documented_passes(lat: f64) -> usize {
-        match lat as i64 {
-            0..=49 => 4,
-            50..=59 => 5,
-            60..=69 => 6,
-            _ => 7,
-        }
-    }
-
-    // Awkward on purpose. The shapes that stress the solve hardest are the
-    // lopsided ones — a 536 × 8 strip at 58°N, a 1256 × 56 at 65°N — so a list
-    // of round sizes measures the table as easier than it is.
-    const SIDES: [f32; 10] = [
-        8.0, 24.0, 56.0, 96.0, 200.0, 392.0, 536.0, 680.0, 1016.0, 1256.0,
-    ];
-    let boxes = [
-        half(460.125, 460.125),
-        half(300.0, 300.0),
-        half(10.0, 10.0),
-        half(664.0, 10.0),
-        half(10.0, 664.0),
-        half(120.0, 75.0),
-    ];
-
     let mut reached = std::collections::BTreeMap::<usize, usize>::new();
-    let mut exhausted_past_80 = 0usize;
-    for w in SIDES {
-        for h in SIDES {
+    for w in FRAMING_SWEEP_SIDES {
+        for h in FRAMING_SWEEP_SIDES {
             let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(w, h));
             for degrees in 0..=84 {
                 let lat = f64::from(degrees);
                 let centre = walkers::lat_lon(lat, -97.28);
-                for box_half in boxes {
+                for box_half in FRAMING_SWEEP_BOXES {
                     let (memory, passes) =
                         solve_viewport(rect, centre, box_half).expect("framable");
-                    if lat > 79.0 {
-                        if passes == MAX_FRAMING_PASSES && memory.zoom() > MIN_ZOOM_LEVEL {
-                            exhausted_past_80 += 1;
-                        }
+                    // Out of zoom is a different exit and has its own test.
+                    if memory.zoom() <= MIN_ZOOM_LEVEL {
                         continue;
                     }
                     let budget = documented_passes(lat);
                     assert!(
                         passes <= budget,
-                        "a {w}x{h} strip at {lat}N framed on {box_half:?} took                          {passes} passes against the {budget} its band records",
+                        "a {w}x{h} strip at {lat}N framed on {box_half:?} took \
+                         {passes} passes against the {budget} its band records",
                     );
                     *reached.entry(budget).or_default() =
                         (*reached.entry(budget).or_default()).max(passes);
-                    // Out of zoom is a different failure and has its own test.
-                    if memory.zoom() > MIN_ZOOM_LEVEL {
-                        let covered =
-                            ground_half_extent(rect, &memory, centre).expect("measurable");
-                        assert!(
-                            covered.east_km >= box_half.east_km
-                                && covered.north_km >= box_half.north_km,
-                            "a {w}x{h} strip at {lat}N settled on {covered:?},                              short of {box_half:?}",
-                        );
-                    }
                 }
             }
         }
@@ -714,13 +854,298 @@ fn the_framing_budget_covers_every_latitude_a_region_can_sit_at() {
     for (budget, worst) in &reached {
         assert_eq!(
             budget, worst,
-            "no shape in the band that documents {budget} passes needed more              than {worst}, so the table overstates what the budget is for",
+            "no shape in the band that documents {budget} passes needed more \
+             than {worst}, so the table overstates what the budget is for",
         );
     }
-    assert!(
-        exhausted_past_80 > 0,
-        "every shape past 80N settled inside {MAX_FRAMING_PASSES} passes, so          the table's last row no longer describes anything",
+    assert_eq!(
+        reached.get(&MAX_FRAMING_PASSES),
+        Some(&MAX_FRAMING_PASSES),
+        "no shape in this sweep needed the whole {MAX_FRAMING_PASSES}-pass \
+         budget, so the constant is an assertion about nothing and a smaller \
+         one would pass every test here",
     );
+}
+
+/// The row of [`MAX_FRAMING_PASSES`]' table that `lat` falls in.
+///
+/// Free rather than nested so that
+/// [`a_solve_that_runs_out_of_passes_is_short_only_beside_the_pole`] reads the
+/// same table this one does.
+fn documented_passes(lat: f64) -> usize {
+    match lat.abs() as i64 {
+        0..=29 => 3,
+        30..=61 => 4,
+        62..=72 => 5,
+        73..=76 => 6,
+        77..=79 => 7,
+        _ => 8,
+    }
+}
+
+/// **The budget's last pass is one a maximal drag really needs**, and the box
+/// that needs it is the exact one the selector commits at its cap.
+///
+/// [`MAX_FRAMING_PASSES`] is 8 and the sweep above only ever showed 7 until the
+/// 470 km square joined it, which is a constant asserting nothing: seven would
+/// have been green everywhere. This drives the cap in a square strip at the
+/// latitudes where the north lane's convergence has slowed to a crawl, and holds
+/// **both** ends of the claim at once.
+///
+/// A budget of 7 fails the second assertion rather than the first: the solve
+/// would still answer `(memory, 7)`, because running out of passes and settling
+/// on the last one are the same count — but it would answer with the strip it
+/// had not finished converging, short of the margin. A budget of 9 fails the
+/// first. So the pair pins 8 from above and below, which one of them alone
+/// cannot do.
+#[test]
+fn the_budgets_last_pass_is_one_a_maximal_drag_really_needs() {
+    let cap = half(
+        rustdar_radar::voxel::MAX_HALF_WIDTH_KM,
+        rustdar_radar::voxel::MAX_HALF_WIDTH_KM,
+    );
+    let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(96.0, 96.0));
+    for lat in [82.5, 83.0, 83.5, 83.8] {
+        let centre = walkers::lat_lon(lat, -97.28);
+        let (memory, passes) = solve_viewport(rect, centre, cap).expect("framable");
+        assert_eq!(
+            passes,
+            MAX_FRAMING_PASSES,
+            "a 96x96 strip at {lat}N framed on the {} km cap took {passes} \
+             passes, so this fixture no longer drives the budget to its end and \
+             the constant is unheld again",
+            rustdar_radar::voxel::MAX_HALF_WIDTH_KM,
+        );
+        assert!(
+            memory.zoom() > MIN_ZOOM_LEVEL,
+            "the fixture ran out of zoom rather than out of passes, which is a \
+             different exit and a different test",
+        );
+        let covered = ground_half_extent(rect, &memory, centre).expect("measurable");
+        let delivered = (covered.east_km / cap.east_km).min(covered.north_km / cap.north_km) - 1.0;
+        assert!(
+            delivered >= COVERAGE_MARGIN * (1.0 - BAND_ROUND_TRIP),
+            "the last pass of the budget left {delivered:e} of margin at {lat}N \
+             against the {COVERAGE_MARGIN:e} promised, so the budget is one \
+             pass short of what this box needs",
+        );
+    }
+}
+
+/// **What running out of passes really answers.** It is not "biased outward",
+/// and the comment that said so is the reason this is measured.
+///
+/// The claim was that the loop's last act is a step, so an exhausted answer is
+/// one whole measured shortfall wider than the last thing measured short. The
+/// step is real; the conclusion does not follow, because the north lane's ground
+/// is **sub**linear in the zoom it is bought with — a step sized by the linear
+/// model gains less than it asks for, and near the pole it gains almost nothing.
+/// Measured before [`ground_half_extent`]'s longitude clamp landed, the worst
+/// exhausted answer covered **13.9%** of its box: a 460 km square at 83.5°N in a
+/// 536 × 96 strip, where the east lane was folding back on itself and shrinking
+/// as the strip widened, so the solve had nothing to converge to. That was the
+/// fold, and it is fixed.
+///
+/// What is left is the pole, and it is bounded on both sides:
+///
+/// * Exhaustion needs a centre at **81.5°** or higher *and* a box whose poleward
+///   edge reaches within **2.53°** of the pole — 87.47°N at the nearest measured.
+///   Mercator's `y` runs to infinity there, so the ground the last pass is
+///   buying costs an unbounded number of zoom levels.
+/// * No box a **drag** can commit is left short at all. The selector caps at
+///   [`MAX_HALF_WIDTH_KM`](rustdar_radar::voxel::MAX_HALF_WIDTH_KM), and every
+///   exhausted framing of a box inside that cap still covered its box — worst
+///   measured 1.00068, which is margin rather than shortfall.
+/// * Past the cap — the rectangles the corner bound allows, up to 664 km on an
+///   axis — an exhausted answer covers at worst **95.9%** of its box.
+///
+/// That last one is a real 4% of transparent floor and it is answered rather
+/// than refused, for the same reason the clamp exit is: the alternative is the
+/// caller's own map memory, centred on the site rather than on the box, and
+/// `the_floor_is_framed_on_a_dragged_region_rather_than_on_the_site` is what
+/// that costs.
+#[test]
+fn a_solve_that_runs_out_of_passes_is_short_only_beside_the_pole() {
+    let mut exhausted = 0usize;
+    let mut lowest_centre = f64::INFINITY;
+    let mut nearest_edge_to_pole = f64::INFINITY;
+    let mut worst_covered = f64::INFINITY;
+    let mut worst_covered_at = String::new();
+    let mut worst_within_cap = f64::INFINITY;
+    let mut worst_within_cap_at = String::new();
+
+    for w in FRAMING_SWEEP_SIDES {
+        for h in FRAMING_SWEEP_SIDES {
+            let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(w, h));
+            for degrees in -84..=84 {
+                let lat = f64::from(degrees);
+                let centre = walkers::lat_lon(lat, -97.28);
+                for box_half in FRAMING_SWEEP_BOXES {
+                    let (memory, passes) =
+                        solve_viewport(rect, centre, box_half).expect("framable");
+                    if passes != MAX_FRAMING_PASSES || memory.zoom() <= MIN_ZOOM_LEVEL {
+                        continue;
+                    }
+                    let covered = ground_half_extent(rect, &memory, centre).expect("measurable");
+                    let delivered = (covered.east_km / box_half.east_km)
+                        .min(covered.north_km / box_half.north_km);
+                    // Settling on the budget's last pass is not exhausting it.
+                    if delivered >= 1.0 + COVERAGE_MARGIN * (1.0 - BAND_ROUND_TRIP) {
+                        continue;
+                    }
+                    exhausted += 1;
+                    lowest_centre = lowest_centre.min(lat.abs());
+                    // Where the box's poleward edge sits. A bound rather than a
+                    // position, so the codebase's one degrees-to-kilometres
+                    // figure is exactly the right instrument for it.
+                    let edge_deg =
+                        lat.abs() + box_half.north_km / rustdar_radar::types::KM_PER_DEGREE_LAT;
+                    nearest_edge_to_pole = nearest_edge_to_pole.min(90.0 - edge_deg);
+                    let what = format!("a {w}x{h} strip at {lat}N framed on {box_half:?}");
+                    if delivered < worst_covered {
+                        worst_covered = delivered;
+                        worst_covered_at = what.clone();
+                    }
+                    let within_cap = box_half.east_km <= rustdar_radar::voxel::MAX_HALF_WIDTH_KM
+                        && box_half.north_km <= rustdar_radar::voxel::MAX_HALF_WIDTH_KM;
+                    if within_cap && delivered < worst_within_cap {
+                        worst_within_cap = delivered;
+                        worst_within_cap_at = what;
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        exhausted > 0,
+        "nothing in this sweep ran out of passes, so the exit this measures no \
+         longer describes anything and the prose on `solve_viewport` is stale",
+    );
+    assert!(
+        lowest_centre >= 80.0,
+        "a solve ran out of passes at {lowest_centre}N, inside the latitudes \
+         `MAX_FRAMING_PASSES` says its table covers",
+    );
+    assert!(
+        nearest_edge_to_pole <= 3.0,
+        "a solve ran out of passes on a box whose poleward edge was still \
+         {nearest_edge_to_pole} degrees from the pole, so the reason this exit \
+         is documented with - Mercator's y running away at the pole - is not \
+         the reason it is being taken",
+    );
+    assert!(
+        worst_covered >= 0.95,
+        "an exhausted framing covered {worst_covered} of its box, at \
+         {worst_covered_at} - the doc bounds this at 95.9%",
+    );
+    assert!(
+        worst_within_cap >= 1.0,
+        "an exhausted framing of a box inside the selector's \
+         {} km cap covered only {worst_within_cap} of it, at \
+         {worst_within_cap_at} - a box a user can actually drag is left \
+         standing on transparency",
+        rustdar_radar::voxel::MAX_HALF_WIDTH_KM,
+    );
+}
+
+/// **A strip wider than the world measures the world, not the fold.**
+///
+/// walkers' `unproject` is the plain inverse Mercator and does not wrap, so a
+/// point a whole world left of the centre reads back as `centre − 360°`
+/// literally — and the geodesy between two longitudes exactly 360° apart is the
+/// distance from a point to itself. Measured before the clamp landed, at
+/// [`MIN_ZOOM_LEVEL`] about 35.33°N:
+///
+/// | strip width | worlds across | east half-extent |
+/// |---|---|---|
+/// | 128 pt | 0.50 | 7 835 km |
+/// | 256 pt | 1.00 | 12 158 km |
+/// | 300 pt | 1.17 | 11 529 km |
+/// | 512 pt | 2.00 | **2.47e-12 km** |
+/// | 513 pt | 2.00 | 63.8 km |
+/// | 1400 pt | 5.47 | 8 271 km |
+///
+/// Two failures in one. The near-zero is **one guard from `None`**, and `None`
+/// here is [`viewport_for_region`] refusing, which drops the caller onto the
+/// pane's own map memory centred on the *site* — the fallback the stored region
+/// exists to keep away from and the one that put a 470 km box on a fraction of
+/// a kilometre of floor. And the non-monotonicity broke the framing solve
+/// outright: [`super::solve_viewport`] steps by a logarithm of the shortfall on
+/// the assumption that a wider strip shows more ground, and out there a wider
+/// strip showed less — so a solve whose north lane had already converged could
+/// never settle. That is what left the worst exhausted framing covering 13.9%
+/// of its box, and
+/// [`a_solve_that_runs_out_of_passes_is_short_only_beside_the_pole`] is what
+/// bounds the exit now that this is fixed.
+///
+/// So this asserts the property the solve needs rather than the six numbers
+/// above: **monotone in width, and saturating at the half-circumference.** Half
+/// a turn is the whole of the axis, and a strip showing two worlds is showing
+/// the same ground as a strip showing one.
+///
+/// The north lane is checked alongside to show it needs no such clamp: latitude
+/// comes back through `atan(sinh(y))`, which is bounded into ±90° for every
+/// pixel there is, so a latitude offset cannot reach half a turn to begin with.
+#[test]
+fn a_strip_wider_than_the_world_measures_the_world_rather_than_the_fold() {
+    let centre = walkers::lat_lon(35.33, -97.28);
+    // The whole world is one 256-point tile at `MIN_ZOOM_LEVEL`.
+    let mut world = walkers::MapMemory::default();
+    world
+        .set_zoom(MIN_ZOOM_LEVEL)
+        .expect("walkers accepts its own wide end");
+
+    // Half the world either side of the centre: the most ground an east-west
+    // axis has, and what every wider strip has to answer.
+    let (_, half_circumference_km) = rustdar_radar::beam::site_bearing_range_km(
+        centre.y(),
+        centre.x(),
+        centre.y(),
+        centre.x() + 180.0,
+    );
+
+    let mut previous = 0.0_f64;
+    let mut previous_width = 0.0_f32;
+    for width in [
+        64.0_f32, 128.0, 200.0, 250.0, 256.0, 257.0, 300.0, 400.0, 511.0, 512.0, 513.0, 700.0,
+        1024.0, 1400.0, 4096.0,
+    ] {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(width, 400.0));
+        let measured = ground_half_extent(rect, &world, centre)
+            .expect("a strip with area over a world with area is measurable");
+        assert!(
+            measured.east_km >= previous,
+            "a {width}-point strip measured {} km of east-west ground where a \
+             {previous_width}-point one measured {previous} km - the solve \
+             steps by a logarithm on the assumption that a wider strip shows \
+             more ground, and a fold makes that assumption false",
+            measured.east_km,
+        );
+        assert!(
+            measured.east_km <= half_circumference_km * (1.0 + BAND_ROUND_TRIP),
+            "a {width}-point strip measured {} km either side of the centre, \
+             past the {half_circumference_km} km there is",
+            measured.east_km,
+        );
+        if f64::from(width) >= 512.0 {
+            assert!(
+                (measured.east_km - half_circumference_km).abs()
+                    <= half_circumference_km * BAND_ROUND_TRIP,
+                "a {width}-point strip shows every meridian there is and \
+                 measured {} km against the {half_circumference_km} km that is",
+                measured.east_km,
+            );
+        }
+        // The north lane is bounded by the projection itself and needs nothing.
+        assert!(
+            measured.north_km > 0.0 && measured.north_km <= half_circumference_km,
+            "the north lane measured {} km, which is not ground",
+            measured.north_km,
+        );
+        previous = measured.east_km;
+        previous_width = width;
+    }
 }
 
 /// A box or a pane that cannot be framed is refused, so the caller falls back to
@@ -826,8 +1251,8 @@ fn a_box_wider_than_the_strip_can_show_is_framed_as_wide_as_walkers_allows() {
     // The trigger, computed the way the solve computes it.
     let opening = walkers::MapMemory::default();
     let covered = ground_half_extent(rect, &opening, centre).expect("measurable");
-    let shortfall = (box_half.east_km * (1.0 + COVERAGE_MARGIN) / covered.east_km)
-        .max(box_half.north_km * (1.0 + COVERAGE_MARGIN) / covered.north_km);
+    let shortfall = (box_half.east_km * (1.0 + COVERAGE_TARGET) / covered.east_km)
+        .max(box_half.north_km * (1.0 + COVERAGE_TARGET) / covered.north_km);
     let step = opening.zoom() - shortfall.log2();
     assert!(
         step < MIN_ZOOM_LEVEL,
