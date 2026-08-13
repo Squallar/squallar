@@ -85,12 +85,26 @@
 //!   and other artifacts, the raw derivation defines more bins than the
 //!   twin, and carries returns in them the RPG deleted; the harness's
 //!   presence-disagreement gate is what measures that.
-//! * **Cell statistic**: the RPG feeds HRVIL recombined 1° × 1 km
-//!   reflectivity, documented as a linear-Z average of the super-resolution
-//!   gates, so [`CellStat::LinearZMean`] is the primary; the EET campaign's
-//!   twin-arbitrated `Max` is kept as an A/B variant in the live harness
-//!   (the 2026-07-28 survey scores the two within half a point of each
-//!   other pooled, mixed per site).
+//! * **Cell statistic**: settled against the ORPG source, not inferred.
+//!   `combine_radials.c` (`cpc004/tsk009`, the `recomb` task) recombines
+//!   super-resolution reflectivity to 1° × 1 km by a **linear-Z mean** in
+//!   both axes — `Combine_range` accumulates `Get_z` over four 0.25 km
+//!   gates and quantizes `ZNUM · .25`, `Combine_azi` writes
+//!   `(Get_z(z1) + Get_z(z2)) · .5` over the two 0.5° radials — and
+//!   `product_attr_table` gives COMBBASE (96) `gen_task recomb`, which is
+//!   `dqa(1)`'s input and therefore HRVIL's. So [`CellStat::LinearZMean`]
+//!   is the RPG's own statistic and is the primary for cause, not by
+//!   arbitration.
+//!
+//!   **`Max` must not be adopted here even though an A/B will favour it.**
+//!   Measured 2026-08-13 at KFTG against the RPG's own published N0B
+//!   recombined by the rule above: this module's grid sits **−0.66 dB**
+//!   from it, [`CellStat::Max`] **+1.39 dB** above it. `Max` moves the
+//!   VIL ratio below from ~0.70 to ~1.00 purely by adding ~2 dB the RPG
+//!   does not have — the exact shape of a tuning constant, and the source
+//!   refutes it. This also settles the cross-cutting inconsistency with
+//!   [`crate::eet`]'s `Max`: the disagreement is real, and `vil.rs` has
+//!   the side the RPG is on.
 //! * **Elevation angles**: the RPG builds its depth table from the VCP's
 //!   nominal angles in tenths of degrees; here each sweep's measured median
 //!   elevation is used (the antenna's real ladder, within a few hundredths
@@ -120,9 +134,11 @@
 //! * **Level agreement** tracks storm-core (log-region) mass: quiet sites
 //!   sit at 97–99% within-±1, while sites whose twins carry 10–20k
 //!   log-region bins (KMRX 45.1%, KMLB 43.2%, KSGF 55.7%) fall off a
-//!   cliff — the fine hybrid levels (0.011 kg/m² linear steps, ~2.6%
-//!   relative in the log region) amplify whatever reflectivity editing and
-//!   smoothing HRVIL inherits from the DQA.
+//!   cliff. This module used to read that as reflectivity editing and
+//!   smoothing inherited from the DQA. **That attribution was wrong** —
+//!   see "The deficit is multiplicative" below, which measured the
+//!   physical field rather than the data levels and found a scale error,
+//!   not an editing difference.
 //! * The bounded A/B matrix (cell statistic × LW mapping × participation
 //!   gate × depth datum, eight rows) arbitrated three conventions, each on
 //!   the **whole 21-site roster** — plains, southeast/coastal,
@@ -147,6 +163,106 @@
 //! the hail SHI column's liquid-water machinery, and as the retired VIL
 //! density input recorded below.
 //!
+//! # The deficit is multiplicative, and it is not the DQA — measured 2026-08-13
+//!
+//! An independent survey (ten volumes, ten sites, four VCPs, six weather
+//! regimes, two untouched holdouts; Level III decoded by **MetPy**, so no
+//! shared-decoder bug can cancel) put a number on the residual, and a
+//! follow-up run against the **ORPG Build 21.0r1.7 source** established what
+//! it is not. Both are recorded here because the shape of the error is the
+//! whole finding.
+//!
+//! **The measurement.** Pooled over **78,051** columns at nine sites, the
+//! median ratio of this module to the RPG's product 134 is **0.751**, and it
+//! is flat against every property a geometry or input error would bend:
+//!
+//! ```text
+//! range km        0-30  30-60  60-90  90-120 120-150 150-180 180-230
+//!                 0.739  0.761  0.747  0.767  0.769   0.756   0.723
+//! column depth km  0-2    2-4    4-6    6-8   8-12    12-16   16-24
+//!                 0.838  0.742  0.692  0.727  0.764   0.751   0.709
+//! max dBZ         20-30  30-35  35-40  40-45  45-50   50-55   55-60
+//!                 0.768  0.762  0.748  0.734  0.748   0.764   0.736
+//! VIL-weighted mean beam height km ARL   0-1    1-2   2-3  3-4  4-5  5-7
+//!                                       0.818  0.742 0.749 .744 .749 .766
+//! fraction of the column's VIL from the lowest tilt  <0.2 ... 0.8-0.95
+//!                                                   0.754 ...  0.741
+//! ```
+//!
+//! Per site it runs 0.563 (KMLB) to 1.012 (KMSX), so it is not one universal
+//! constant either — but within a volume it is a scalar. **A DQA-input gap
+//! cannot produce this.** Editing moves presence and edges; presence
+//! disagreement is 2.4–8.1% at the deep sites, bin-for-bin registration is
+//! exactly zero on a values-blind footprint test, and the clear-air control
+//! scores 98.9% exact. The bins are the same bins; the values in them are
+//! about a third short.
+//!
+//! **The liquid water the RPG implies.** In columns whose VIL this module
+//! puts ≥ 85% into one layer, `RPG ÷ Δh` *is* the RPG's own liquid water at
+//! that gate's reflectivity, read off the data with no assumed functional
+//! form (n = 2089, six sites):
+//!
+//! ```text
+//! dBZ      15-20  20-25  25-30  30-35  35-40  40-45  45-50  50-55
+//! RPG/G&C  1.364  1.516  1.428  1.360  1.309  1.377  1.502  1.315
+//! ```
+//!
+//! Flat at ~1.4 over four decades of Z. A free fit gives `Z^0.543` against
+//! Greene–Clark's `Z^0.5714`. **The exponent is right and the scale is not**
+//! — so the error is a constant on the integrand, not a mis-shaped mapping.
+//!
+//! **What the ORPG source rules out.** Every hypothesis that could supply a
+//! constant was checked against the Build 21.0r1.7 public source drop, and
+//! each is either verbatim-correct here or points the wrong way:
+//!
+//! * **Layer depths** — `a313t1.ftn` was re-read line for line and
+//!   `layer_depths_km` transcribes it exactly, hardcoded `BW = .017` rad
+//!   included (that constant is the `.alg`'s declared 1.00° beamwidth
+//!   expressed in radians, 0.974°, so it is fidelity and *not* the unit slip
+//!   it looks like — do not "fix" it). Independently, the resulting
+//!   thicknesses equal the true 4/3-earth geometric layer thicknesses and
+//!   tile the column from the ground to a quarter-beamwidth above the top
+//!   cut with no gap and no overlap. There is no room for 1.4× of depth
+//!   short of extrapolating outside the beam coverage. Split cuts telescope:
+//!   `a313t1` builds its table over the VCP's full cut list, and the two
+//!   halves' depths sum to the single deduped layer's, so
+//!   [`DedupPolicy::FirstOfVolume`] loses nothing.
+//! * **Units and bounds** — `a313j1.ftn`'s `PTLVIL = LIQWAT · BEAM_DEPTH` is
+//!   hundredths of g/m³ × km and `a313h1.ftn` scales by `HUNDRETH`, i.e.
+//!   g/m³ · km = kg/m², which is what this module sums. Nothing integrates
+//!   in dBZ anywhere; the sum is linear-Z throughout.
+//! * **The liquid-water mapping** — Greene & Clark (1972) eq. (7)–(8) give
+//!   `M = 3.44e-3 · Z^(4/7)` g/m³ and `M* = 3.44e-6 ∫ Z^(4/7) dh'` with `h'`
+//!   in metres, kg/m²: the coefficient, the exponent and the unit chain here
+//!   are the canonical ones. The RPG's own `A313B1` table is that formula
+//!   **floored** and saturated at 5.40 g/m³ — strictly ≤ the unfloored form
+//!   used here, so the RPG's documented mapping can only make a derivation
+//!   *smaller*, never 1.4× larger.
+//! * **The reflectivity cap** — `viletalg.doc` truncates above 55 dBZ and
+//!   `A313B1` saturates from data level 178 (56.0 dBZ). Capping is the RPG's
+//!   behaviour, so it cannot be the cause; it is only the reason the deficit
+//!   *worsens* above 40 kg/m² (KFTG 0.572 capped against 0.722 uncapped).
+//!   Removing the cap would be unfaithful and would still not reach 1.0.
+//! * **The codec** — MetPy's product-134 LUT reproduces the ORPG's own
+//!   `decode_VIL` (`cpc013/tsk007/ptype_read_VIL.c`: `(s−2)/90.66` below
+//!   level 20, `exp((s−83.9028)/38.8763)` above) to **0.08%** across the
+//!   whole range, so the oracle's values are real, including its 79.5 kg/m²
+//!   maxima against this module's 68.9.
+//! * **The cell statistic** — settled from `combine_radials.c`; see the
+//!   bullet above. `Max` closes the ratio and is wrong.
+//!
+//! **What is left, stated as an open defect rather than papered over.** A
+//! ~1.33× scale on the integrand, exponent-independent and geometry-
+//! independent, that nothing in the public ORPG drop accounts for. The
+//! decisive file is not in it: `hiresvil` is `cpc014/tsk010`, and `cpc014`
+//! ships `tsk001`–`tsk017` **without** `tsk010`, so `hrvil_compute_vil`'s
+//! arithmetic is unavailable and the man pages (`hrvil(1)`, `hrvil(4)`)
+//! describe only the flow. **No coefficient was introduced to close this.**
+//! A constant that made the ratio 1.0 without a mechanism would be worse
+//! than the documented gap, because it would silently mis-scale every
+//! derived consumer — the hail SHI column above all — the moment the real
+//! cause turned out to be something else.
+//!
 //! # VIL density — measured 2026-07-29, and the local derivation retired
 //!
 //! **Outcome first**: VIL density is no longer computed here. It is now
@@ -154,8 +270,10 @@
 //! `1000 · DVL / ((EET_published + 0.5) · 304.8)` — because the survey below
 //! measured the local `compute_vil / compute_eet` quotient against exactly
 //! that expression and found it **effectively mute at the thresholds the
-//! product is read for**. The residual is [`compute_vil`]'s, and it is the
-//! DQA gap recorded above, which is not reachable from raw Level II. Rather
+//! product is read for**. The residual is [`compute_vil`]'s — and it is the
+//! multiplicative deficit characterised below, *not* the DQA gap this
+//! paragraph used to name; VILD inherits VIL's low bias whatever its
+//! cause, so the conclusion the survey drew is unaffected. Rather
 //! than ship a hail discriminator that does not discriminate, the product was
 //! rebuilt as the reference itself: both inputs are already fetched and drawn
 //! by the app, so the change costs no new datasource and the shipped field is
