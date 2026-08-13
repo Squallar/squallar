@@ -679,3 +679,70 @@ fn a_derived_radial_declares_the_step_its_own_grid_sits_at() {
         }
     }
 }
+
+/// A tilt whose leading radial lost its ΦDP is still derived.
+///
+/// The guard admitted a sweep on `radials.first().differential_phase()` while
+/// [`crate::kdp::compute_kdp`] — the estimator it then called — reads every
+/// radial. The two disagreed, so one blank leading radial refused a cut the
+/// estimator was perfectly willing to derive, and the tilt vanished from the
+/// KDP volume with no warning: the same guard-versus-extractor split
+/// `crate::velocity` closed for the wind fit.
+#[test]
+fn a_tilt_whose_leading_radial_lost_its_phase_is_still_derived() {
+    let clean = scan_with(&|_, slant| (Some(45.0), None, Some(10.0 + slant), Some(0.99)));
+    let maimed = Scan::new(
+        clean.coverage_pattern().clone(),
+        clean
+            .sweeps()
+            .iter()
+            .map(|sweep| {
+                let radials: Vec<Radial> = sweep
+                    .radials()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| {
+                        Radial::new(
+                            r.collection_timestamp(),
+                            r.azimuth_number(),
+                            r.azimuth_angle_degrees(),
+                            r.azimuth_spacing_degrees(),
+                            r.radial_status(),
+                            r.elevation_number(),
+                            r.elevation_angle_degrees(),
+                            r.reflectivity().cloned(),
+                            r.velocity().cloned(),
+                            r.spectrum_width().cloned(),
+                            r.differential_reflectivity().cloned(),
+                            (i > 0).then(|| r.differential_phase().cloned()).flatten(),
+                            r.correlation_coefficient().cloned(),
+                            r.clutter_filter_power().cloned(),
+                        )
+                    })
+                    .collect();
+                Sweep::new(sweep.elevation_number(), radials)
+            })
+            .collect(),
+    );
+    assert!(
+        maimed.sweeps()[0].radials()[0]
+            .differential_phase()
+            .is_none(),
+        "the fixture must be blank in front",
+    );
+
+    let prepared = prepare(
+        (&maimed).into(),
+        RadarProduct::SpecificDifferentialPhase,
+        None,
+    )
+    .expect("a \u{3a6}DP volume derives");
+    let Prepared::Derived(derived) = prepared else {
+        panic!("KDP must be derived, never served from the raw scan");
+    };
+    assert_eq!(
+        derived.sweeps().len(),
+        clean.sweeps().len(),
+        "one blank leading radial dropped a tilt from the KDP volume",
+    );
+}

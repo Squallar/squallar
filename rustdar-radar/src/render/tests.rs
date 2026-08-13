@@ -3286,3 +3286,73 @@ fn the_rasterizer_places_a_gate_where_the_beam_module_says_it_is() {
          {lat}\u{b0}N / {az}\u{b0} / {range:.1} km",
     );
 }
+
+/// A cut whose leading radial lost the product's moment is still offered to
+/// the loop's snap.
+///
+/// [`find_closest_elevation`] is what `rustdar_frontend`'s loop dispatch asks
+/// which elevation each historical scan actually holds. Asked of the leading
+/// radial alone, one blank radial took the whole cut out of that answer, so a
+/// steady selection snapped to a *neighbouring* tilt — or, on a volume with no
+/// neighbour, to nothing — while every other radial of the cut carried the
+/// moment. It is the same first-radial assumption
+/// [`find_sweep_owner`] and [`crate::velocity::tilts`] dropped.
+#[test]
+fn a_cut_whose_leading_radial_is_blank_is_still_offered_to_the_loop() {
+    let intact = scan_of(vec![
+        settling_sweep(1, 0.68, 0.44, false),
+        settling_sweep(2, 0.30, 0.84, false),
+    ]);
+    // The 0.4° cut with its first radial's reflectivity stripped, and nothing
+    // else touched.
+    let maimed = scan_of(
+        intact
+            .sweeps()
+            .iter()
+            .enumerate()
+            .map(|(s, sweep)| {
+                let radials: Vec<Radial> = sweep
+                    .radials()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| {
+                        Radial::new(
+                            r.collection_timestamp(),
+                            r.azimuth_number(),
+                            r.azimuth_angle_degrees(),
+                            r.azimuth_spacing_degrees(),
+                            r.radial_status(),
+                            r.elevation_number(),
+                            r.elevation_angle_degrees(),
+                            (!(s == 0 && i == 0))
+                                .then(|| r.reflectivity().cloned())
+                                .flatten(),
+                            r.velocity().cloned(),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                    })
+                    .collect();
+                nexrad_model::data::Sweep::new(sweep.elevation_number(), radials)
+            })
+            .collect(),
+    );
+    assert!(
+        maimed.sweeps()[0].radials()[0].reflectivity().is_none(),
+        "the fixture must be blank in front",
+    );
+    assert!(
+        maimed.sweeps()[0].radials()[1].reflectivity().is_some(),
+        "and only in front",
+    );
+
+    assert_eq!(
+        find_closest_elevation(&maimed, PRODUCT, 0.5),
+        Some(0.4),
+        "one blank leading radial hid the 0.4\u{b0} cut from the loop's snap",
+    );
+    assert_eq!(find_closest_elevation(&maimed, PRODUCT, 0.8), Some(0.8));
+}

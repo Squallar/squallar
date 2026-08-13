@@ -1173,6 +1173,11 @@ pub const ELEVATION_WINDOW: f64 = 0.1;
 /// the first radial is not the tilt the sweep flew, and the loop would snap a
 /// steady selection onto a different cut from one frame to the next as the
 /// antenna's settling wandered.
+///
+/// Whether the sweep carries the product is asked of **every** radial, for the
+/// reason [`find_sweep_owner`] gives: it is a property of the sweep, and a
+/// blank leading radial asked to answer for 720 took the whole cut out of this
+/// list — so the elevation the loop snapped to was a *different* tilt, or none.
 pub fn find_closest_elevation(
     scan: &Scan,
     product: types::RadarProduct,
@@ -1182,10 +1187,12 @@ pub fn find_closest_elevation(
         .iter()
         .filter_map(|sweep| {
             let radials = sweep.radials();
-            let r = radials.first()?;
             let elevation = crate::volumetric::sweep_elevation_deg(radials)?;
             let rounded = (elevation * 10.0).round() as f32 / 10.0;
-            product.get_moment(r).is_some().then_some(rounded)
+            radials
+                .iter()
+                .any(|r| product.get_moment(r).is_some())
+                .then_some(rounded)
         })
         .min_by(|a, b| ((*a - target_elevation).abs()).total_cmp(&((*b - target_elevation).abs())))
 }
