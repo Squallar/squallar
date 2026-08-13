@@ -34,8 +34,12 @@ pub mod types;
 pub mod velocity;
 pub mod vil;
 pub mod vild;
+pub mod volume_wire;
 pub mod volumetric;
 pub mod voxel;
 pub mod xsect;
 
 pub use palette::{LegendScale, RANGE_FOLDED, get_color_for_value, get_legend_scale};
+
+/// The crate's one bounds-checked cursor over untrusted payload bytes.
+mod wire;

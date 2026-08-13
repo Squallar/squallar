@@ -30,6 +30,12 @@ pub type Result<T> = std::result::Result<T, ScanError>;
 /// same walk. `declared_nyquist` is empty rather than absent for a volume that
 /// declared nothing — an all-Message-1 archive, which has no such field —
 /// and readers estimate for the cuts it does not name. See [`crate::nyquist`].
+///
+/// `PartialEq` because this is now a job's *answer* and a round trip through
+/// [`Self::to_bytes`] has to be checkable as one value against another, rather
+/// than field by field at each test that cares. `Debug` rides with it for the
+/// assertion messages that comparison produces.
+#[derive(Debug, PartialEq)]
 pub struct DecodedScan {
     pub scan: Scan,
     pub declared_nyquist: crate::nyquist::DeclaredNyquist,
@@ -339,6 +345,32 @@ fn fold_contributions(
         scan,
         declared_nyquist,
     })
+}
+
+/// Decode an archive volume that is already in memory.
+///
+/// [`decoded`] over a [`nexrad_data::volume::File`] built from `bytes`, which is
+/// the same walk every download below ends in — one pass, both the `Scan` and
+/// the declared Nyquist table, off the same decompressed records.
+///
+/// # Why this is public
+///
+/// Because the decode is a **job**, and a job's input has to be nameable. Every
+/// entry above pairs a download with a decode inside one `async fn`, which is
+/// exactly the shape that cannot be handed to a Web Worker: the network half
+/// belongs to whoever has the fetch stack, and the CPU half is the 0.9–5.3
+/// billion instructions [`decoded`] documents. Splitting them at the bytes lets
+/// the frontend download on the thread that can and decode wherever it should —
+/// see `rustdar_frontend::offload::JobRequest::Volume`, whose payload is
+/// precisely these bytes.
+///
+/// The `Vec` is taken by value because [`nexrad_data::volume::File`] owns its
+/// data and every caller is handing over a buffer it has finished with: a
+/// download's response body, or a worker's copy of a transferred `ArrayBuffer`.
+/// Borrowing would put a second copy of a 16.9 MB volume on the one target where
+/// linear memory only grows.
+pub fn decode_bytes(bytes: Vec<u8>) -> Result<DecodedScan> {
+    decoded(&nexrad_data::volume::File::new(bytes))
 }
 
 // `crate::archive`'s two network entry points, shadowed so that every call site

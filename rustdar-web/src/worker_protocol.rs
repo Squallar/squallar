@@ -107,7 +107,13 @@ pub const OUT_KIND: &str = "outkind";
 /// a classification standing on the fleet default, which is the picture that
 /// scores 16 % against the RPG's own answer. Silently indistinguishable from
 /// the 95 % one is precisely what the version number is here to prevent.
-const PROTOCOL_VERSION: u32 = 4;
+/// Version 5 widened [`OUT_KIND`] past `RenderView`'s three codes: a decoded
+/// Level II volume is an output that is not a view of anything, and it takes
+/// code 4. A version 4 worker has no encoder for it and a version 4 page no
+/// decoder, and either mismatch would be a decode that silently produced
+/// nothing — the browser's whole radar picture, missing, with no error. The
+/// token is what turns that into a clean termination.
+const PROTOCOL_VERSION: u32 = 5;
 
 /// What the page and the worker compare before the page trusts the worker.
 ///

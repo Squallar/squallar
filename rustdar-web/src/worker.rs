@@ -171,12 +171,21 @@ fn post_result(
             }
         }
         Some(output) => {
-            let kind = output.view().wire_code();
+            // `None` only for a frame, which the arm above answered; naming
+            // that here keeps a fifth output kind from silently posting an
+            // untagged payload.
+            let kind = output
+                .out_kind()
+                .expect("the frame arm is above, and every other output has an out kind");
             let bytes = match output {
                 JobOutput::Section(section) => section.to_bytes(),
                 JobOutput::Voxels(grid) => grid.to_bytes(),
+                // 47-69 MiB for a real volume. Built here, then transferred
+                // below, so the page adopts the buffer instead of being sent a
+                // second copy of it.
+                JobOutput::Volume(volume) => volume.to_bytes(),
                 // Answered above; naming it keeps the match exhaustive by value
-                // so a fourth output kind stops the build here rather than
+                // so a fifth output kind stops the build here rather than
                 // falling into a catch-all that posts an empty payload.
                 JobOutput::Frame(_) => unreachable!("the frame arm is above"),
             };

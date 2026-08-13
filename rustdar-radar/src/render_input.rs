@@ -47,6 +47,7 @@
 //! reading one, the byte-identity test is what fails.
 
 use crate::types::{MomentSlot, RadarProduct};
+use crate::wire::Reader;
 use nexrad_model::data::{
     ChannelConfiguration, DataMoment, ElevationCut, MomentData, PulseWidth, Radial, RadialStatus,
     Scan, Sweep, VolumeCoveragePattern, WaveformType,
@@ -319,7 +320,7 @@ struct RadialData {
 /// A moment block in the fixed-point form the decoder produced it in, so
 /// `MomentData::from_fixed_point` can rebuild it exactly.
 #[derive(Debug, Clone, PartialEq)]
-struct MomentPayload {
+pub(crate) struct MomentPayload {
     gate_count: u16,
     /// Metres. `MomentDataBlock` stores this as a `u16` of metres and exposes
     /// it as `km = raw * 0.001`; the model offers no raw accessor, so the
@@ -331,7 +332,7 @@ struct MomentPayload {
     offset: f32,
     /// Raw gate codes, exactly as `DataMoment::raw_values` returns them: one
     /// byte per gate at 8-bit, a big-endian pair at 16-bit.
-    gates: Vec<u8>,
+    pub(crate) gates: Vec<u8>,
 }
 
 impl RenderInput {
@@ -838,7 +839,7 @@ impl RenderInput {
 /// the angle, and a fabricated SAILS flag or PRF number would be a lie a
 /// consumer could act on. Shared by the declared table and the reconstructed
 /// one so the two cannot come to differ in anything but their angles.
-fn rebuild_pattern(vcp: u16, angles: &[f64]) -> VolumeCoveragePattern {
+pub(crate) fn rebuild_pattern(vcp: u16, angles: &[f64]) -> VolumeCoveragePattern {
     VolumeCoveragePattern::new(
         vcp,
         0,
@@ -1211,7 +1212,11 @@ pub(crate) fn placeholder_coverage_pattern(pattern_number: u16) -> VolumeCoverag
 }
 
 impl MomentPayload {
-    fn from_moment_data(moment: &MomentData) -> Self {
+    /// Generic over [`DataMoment`] rather than taking a `MomentData`, so the
+    /// **clutter-filter power** moment — a `CFPMomentData`, a distinct type
+    /// over the same block — encodes through this one implementation too. See
+    /// [`crate::volume_wire`], which carries it.
+    pub(crate) fn from_moment_data(moment: &impl DataMoment) -> Self {
         Self {
             gate_count: moment.gate_count(),
             first_gate_range_m: km_to_metres(moment.first_gate_range_km()),
@@ -1223,7 +1228,21 @@ impl MomentPayload {
         }
     }
 
-    fn to_moment_data(&self) -> MomentData {
+    /// The clutter-filter power moment these bytes describe, for the one
+    /// payload that carries one. Same block, a different newtype over it.
+    pub(crate) fn to_cfp_moment_data(&self) -> nexrad_model::data::CFPMomentData {
+        nexrad_model::data::CFPMomentData::from_fixed_point(
+            self.gate_count,
+            self.first_gate_range_m,
+            self.gate_interval_m,
+            self.word_size,
+            self.scale,
+            self.offset,
+            self.gates.clone(),
+        )
+    }
+
+    pub(crate) fn to_moment_data(&self) -> MomentData {
         MomentData::from_fixed_point(
             self.gate_count,
             self.first_gate_range_m,
@@ -1576,7 +1595,7 @@ impl RenderInput {
 }
 
 /// One moment payload's wire form, shared by the slot moment and the extras.
-fn encode_moment(out: &mut Vec<u8>, moment: &MomentPayload) {
+pub(crate) fn encode_moment(out: &mut Vec<u8>, moment: &MomentPayload) {
     out.extend_from_slice(&moment.gate_count.to_le_bytes());
     out.extend_from_slice(&moment.first_gate_range_m.to_le_bytes());
     out.extend_from_slice(&moment.gate_interval_m.to_le_bytes());
@@ -1587,7 +1606,7 @@ fn encode_moment(out: &mut Vec<u8>, moment: &MomentPayload) {
     out.extend_from_slice(&moment.gates);
 }
 
-fn decode_moment(r: &mut Reader) -> Option<MomentPayload> {
+pub(crate) fn decode_moment(r: &mut Reader) -> Option<MomentPayload> {
     let gate_count = r.u16()?;
     let first_gate_range_m = r.u16()?;
     let gate_interval_m = r.u16()?;
@@ -1605,62 +1624,6 @@ fn decode_moment(r: &mut Reader) -> Option<MomentPayload> {
         offset,
         gates,
     })
-}
-
-/// A bounds-checked cursor. Every accessor returns `None` rather than panicking,
-/// because the bytes come off a message port and are not trusted.
-struct Reader<'a> {
-    bytes: &'a [u8],
-    at: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, at: 0 }
-    }
-
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        let end = self.at.checked_add(n)?;
-        let slice = self.bytes.get(self.at..end)?;
-        self.at = end;
-        Some(slice)
-    }
-
-    fn u8(&mut self) -> Option<u8> {
-        self.take(1).map(|b| b[0])
-    }
-
-    fn u16(&mut self) -> Option<u16> {
-        Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
-    }
-
-    fn u32(&mut self) -> Option<u32> {
-        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
-    }
-
-    fn f32(&mut self) -> Option<f32> {
-        Some(f32::from_le_bytes(self.take(4)?.try_into().ok()?))
-    }
-
-    fn f64(&mut self) -> Option<f64> {
-        Some(f64::from_le_bytes(self.take(8)?.try_into().ok()?))
-    }
-
-    fn i64(&mut self) -> Option<i64> {
-        Some(i64::from_le_bytes(self.take(8)?.try_into().ok()?))
-    }
-
-    /// `count` as a capacity, refused if the buffer cannot possibly hold that
-    /// many items of `min_size` bytes each. Keeps a corrupt length from
-    /// reserving gigabytes before the read fails.
-    fn bounded(&self, count: u32, min_size: usize) -> Option<usize> {
-        let count = count as usize;
-        (count.checked_mul(min_size)? <= self.bytes.len() - self.at).then_some(count)
-    }
-
-    fn at_end(&self) -> bool {
-        self.at == self.bytes.len()
-    }
 }
 
 #[cfg(test)]
