@@ -54,6 +54,15 @@ fn a_position_that_is_not_a_place_is_refused_rather_than_encoded() {
         ("negative infinite longitude", 35.33306, f32::NEG_INFINITY),
         ("latitude off the planet", 91.0, -97.2775),
         ("longitude off the planet", 35.33306, 181.0),
+        // The scale a TDWR volume older than 2021-09-15 states its position
+        // in, which `nexrad-decode`'s Volume Data Block reads as the degrees
+        // it means. Anything reaching here still holding it is not a decoded
+        // block, and 41797° is no more a place than it was before that was
+        // understood.
+        ("thousandths of a degree", 41797.0, -87858.0),
+        // And the same shape one digit further out, which no scale in either
+        // ICD accounts for.
+        ("millionths of a degree", 41797000.0, -87858000.0),
         // A zeroed Volume Data Block, not a radar in the Gulf of Guinea.
         ("null island", 0.0, 0.0),
     ] {
