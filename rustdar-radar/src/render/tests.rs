@@ -2770,3 +2770,136 @@ fn a_checked_out_value_grid_is_empty_at_every_length() {
 // assert only what a checkout must satisfy *whatever* the slot held, so no
 // interleaving can make them fail. See that file for how a separate process
 // gets the exact-contents claim back without the race.
+
+/// A volume of velocity tilts carrying one exact VAD signature.
+///
+/// Gate `(az, r)` of a cut at elevation `el` reads the radial component of a
+/// single horizontal wind — `u·sin(az)·cos(el) + v·cos(az)·cos(el)` — through
+/// the real 8-bit velocity codec, so the samples the fit sees are quantized to
+/// 0.5 m/s like a radar's. Each cut opens at its own azimuth, as a real
+/// volume's do, and each reaches a different height, so the layers are pooled
+/// from three tilts rather than one.
+fn vad_volume(wind: (f64, f64)) -> Scan {
+    use nexrad_model::data::{MomentData, PulseWidth, RadialStatus, Sweep, VolumeCoveragePattern};
+    const N_RADIALS: usize = 360;
+    const N_GATES: usize = 240;
+    let (u, v) = wind;
+    let spacing = 360.0 / N_RADIALS as f32;
+    let sweeps = [(1u8, 0.53f32, 0.0f64), (2, 1.47, 97.3), (3, 2.42, 211.8)]
+        .into_iter()
+        .map(|(elevation_number, elevation_deg, az0)| {
+            let cos_el = f64::from(elevation_deg).to_radians().cos();
+            let radials = (0..N_RADIALS)
+                .map(|i| {
+                    let az = (az0 + i as f64 * f64::from(spacing)).rem_euclid(360.0);
+                    let (s, c) = az.to_radians().sin_cos();
+                    let vr = (u * s + v * c) * cos_el;
+                    let byte = ((vr * 2.0 + 129.0).round() as i64).clamp(2, 255) as u8;
+                    Radial::new(
+                        0,
+                        i as u16,
+                        az as f32,
+                        spacing,
+                        RadialStatus::IntermediateRadialData,
+                        elevation_number,
+                        elevation_deg,
+                        None,
+                        Some(MomentData::from_fixed_point(
+                            N_GATES as u16,
+                            2125,
+                            250,
+                            8,
+                            2.0,
+                            129.0,
+                            vec![byte; N_GATES],
+                        )),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                })
+                .collect();
+            Sweep::new(elevation_number, radials)
+        })
+        .collect();
+    Scan::new(
+        VolumeCoveragePattern::new(
+            212,
+            0,
+            0.5,
+            PulseWidth::Short,
+            false,
+            0,
+            false,
+            0,
+            false,
+            false,
+            0,
+            false,
+            false,
+            Vec::new(),
+        ),
+        sweeps,
+    )
+}
+
+/// [`profile_bits`] of [`vad_volume`]'s `(12, -5)` volume, hashed. Recorded
+/// from the render path's fit; it is the number the SRV path's fit has to
+/// return too, and the number any later single implementation has to keep.
+const VAD_DIGEST: u64 = 0xc001_5958_cdc9_1e48;
+
+/// The wind at every one of the profile's forty layer centres, as raw bits.
+fn profile_bits(profile: &crate::nrot::WindProfile) -> Vec<Option<(u64, u64)>> {
+    (0..40)
+        .map(|l| {
+            let h = (l as f64 + 0.5) * crate::nrot::WindProfile::LAYER_KM;
+            profile
+                .wind_at_km(h)
+                .map(|(u, v)| (u.to_bits(), v.to_bits()))
+        })
+        .collect()
+}
+
+/// The render path's wind fit and `crate::srv::volume_wind_profile` are the
+/// same fit, to the bit, on the same volume.
+///
+/// Both drive `nrot::WindProfileBuilder` over every velocity tilt of the scan;
+/// this pins that the two *drivers* — which tilts they admit, what geometry
+/// and elevation they hand the builder — agree, which is the only thing that
+/// could have differed.
+#[test]
+fn the_render_wind_fit_and_the_srv_wind_fit_are_one_fit() {
+    let scan = vad_volume((12.0, -5.0));
+    let rendered = super::build_wind_profile(&scan).expect("three noiseless cuts fit");
+    let derived = crate::srv::volume_wind_profile(&scan).expect("three noiseless cuts fit");
+    assert_eq!(
+        profile_bits(&rendered),
+        profile_bits(&derived),
+        "the two wind-profile drivers disagree",
+    );
+
+    // The numbers themselves, so that whatever the two drivers are eventually
+    // folded into has something to reproduce rather than a tautology to
+    // re-derive. The bottom layer reads (12.005937120836029,
+    // -5.006059913529244): the 0.5 m/s codec rounds every sample the same way
+    // around a smooth field, so the residue is a bias of six thousandths of a
+    // metre per second and not noise that would average out.
+    let mut h = DefaultHasher::new();
+    profile_bits(&rendered).hash(&mut h);
+    assert_eq!(h.finish(), VAD_DIGEST, "the fitted profile moved");
+
+    // And the fit is the planted wind, so the equality above is not two copies
+    // of the same nothing: the codec quantizes to 0.5 m/s and the fit averages
+    // tens of thousands of those, so it lands far inside a level.
+    for (u, v) in profile_bits(&rendered)
+        .iter()
+        .filter_map(|b| b.map(|(u, v)| (f64::from_bits(u), f64::from_bits(v))))
+    {
+        assert!(
+            (u - 12.0).abs() < 0.05 && (v + 5.0).abs() < 0.05,
+            "fitted ({u:.4}, {v:.4}), planted (12, -5)",
+        );
+    }
+}
