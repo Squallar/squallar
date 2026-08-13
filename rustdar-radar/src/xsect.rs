@@ -445,12 +445,12 @@ impl SectionAxes {
 /// The fields are private and the lengths are checked in
 /// [`from_parts`](Self::from_parts), because a mis-shaped section is not a
 /// recoverable error anywhere downstream. `rustdar-frontend`'s
-/// `app_render::apply_render_to_pane` builds a `ColorImage` from a buffer and a
-/// size (`app_render.rs:331`); the length check is `epaint`'s own, an
-/// `assert_eq!` inside `ColorImage::from_rgba_unmultiplied`
-/// (`epaint-0.35.0/src/image.rs:114`). It runs on the **main thread**, live in
-/// release, and under wasm a main-thread panic takes the whole app down. A
-/// decoder handed a short payload has to find out here instead.
+/// `app_render::upload_section_raster` builds a `ColorImage` from a buffer and
+/// a size; the length check is `epaint`'s own, an `assert_eq!` inside
+/// `ColorImage::from_rgba_premultiplied` (`epaint-0.35.0/src/image.rs:128`). It
+/// runs on the **main thread**, live in release, and under wasm a main-thread
+/// panic takes the whole app down. A decoder handed a short payload has to find
+/// out here instead.
 #[derive(Debug, Clone)]
 pub struct CrossSection {
     image: Vec<u8>,
@@ -524,10 +524,11 @@ impl CrossSection {
     ///
     /// * **A plane that is not exactly this build's [`SECTION_WIDTH`] ×
     ///   [`SECTION_HEIGHT`].** Not a recoverable error anywhere downstream:
-    ///   `rustdar-frontend`'s `app_render::apply_render_to_pane` builds a
+    ///   `rustdar-frontend`'s `app_render::upload_section_raster` builds a
     ///   `ColorImage` from a buffer and a size, and the length check is
-    ///   `epaint`'s own `assert_eq!` inside `ColorImage::from_rgba_unmultiplied`
-    ///   (`epaint-0.35.0/src/image.rs:114`), on the **main thread**, live in
+    ///   `epaint`'s own `assert_eq!` inside
+    ///   `ColorImage::from_rgba_premultiplied`
+    ///   (`epaint-0.35.0/src/image.rs:128`), on the **main thread**, live in
     ///   release, where under wasm it takes the whole app down. It is also the
     ///   ordinary shape of a cross-build payload: this constant is 2048 native
     ///   and 1024 on wasm.
@@ -617,6 +618,26 @@ impl CrossSection {
     /// bytes.
     pub fn image(&self) -> &[u8] {
         &self.image
+    }
+
+    /// The same pixels, to rewrite in place.
+    ///
+    /// A `&mut [u8]` and not a `&mut Vec<u8>`, which is the whole of the
+    /// safety: the length is what [`from_parts`](Self::from_parts) validated
+    /// and what every consumer's `ColorImage` assertion stands on, and a slice
+    /// cannot change it. What a caller may do is change the *convention* the
+    /// bytes are in, which is exactly the one caller there is:
+    /// `rustdar-frontend`'s `offload::execute` premultiplies each raster before
+    /// it leaves the job, so a section reaches its texture upload as a
+    /// reinterpretation rather than as a per-pixel walk on the frame thread.
+    ///
+    /// The alpha convention is therefore a property of *where a section came
+    /// from* and not of this type: what [`render_section`]
+    /// returns is straight alpha, and what crosses the job boundary is
+    /// premultiplied. This crate keeps the first — nothing here reads a pixel
+    /// back — and the second is documented where it is done.
+    pub fn image_mut(&mut self) -> &mut [u8] {
+        &mut self.image
     }
 
     /// The product's own units, `f32::NAN` wherever there is no value.
