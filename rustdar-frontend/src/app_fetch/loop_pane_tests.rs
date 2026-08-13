@@ -5,11 +5,15 @@ use rustdar_radar::archive::Identifier;
 use rustdar_radar::sites::RadarSite;
 use rustdar_radar::types::{RadarProduct, ScanInfo};
 
+/// `minute` minutes past midnight, added as a duration rather than written into
+/// the minute field: the frame-cap tests below walk a whole day of lookback, and
+/// `and_hms_opt(0, 90, 0)` is `None`.
 fn ts(minute: u32) -> NaiveDateTime {
     chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
         .unwrap()
-        .and_hms_opt(0, minute, 0)
+        .and_hms_opt(0, 0, 0)
         .unwrap()
+        + chrono::Duration::minutes(i64::from(minute))
 }
 
 fn identifier(name: &str) -> Identifier {
@@ -68,9 +72,28 @@ fn pane_looping_on(site: RadarSite, lookback_secs: u64, frames: &[u32]) -> PaneS
         rustdar_radar::types::RenderView::PlanView,
     );
     for &minute in frames {
-        append_polled_frame(&mut pane.loop_state, site.name, ts(minute));
+        let held = crate::app::render::loop_frames_held(
+            crate::app::render::test_loop_allocation(),
+            pane.loop_state.view,
+            &crate::app::render::test_budgets(),
+        );
+        append_polled_frame(&mut pane.loop_state, site.name, ts(minute), held);
     }
     pane
+}
+
+/// The pool's answer for a single loop at the floor — what a pane used to get
+/// before the pool existed, which is the shape every test here is written
+/// against. Named once so the frame cap these appends are held to is the
+/// shipped one rather than a literal.
+fn allocation() -> crate::loop_pool::LoopAllocation {
+    crate::app::render::test_loop_allocation()
+}
+
+/// This build's resolved budgets, which is where the raster frame cap now comes
+/// from. Named beside [`allocation`] because `loop_frames_held` reads both.
+fn budgets() -> crate::budget::Budgets {
+    crate::app::render::test_budgets()
 }
 
 fn frame_times(pane: &PaneState) -> Vec<NaiveDateTime> {
@@ -244,7 +267,7 @@ fn a_polled_scan_only_reaches_loops_on_its_own_site() {
         pane_looping_on(koun, 3600, &[0, 5]),
     ];
 
-    append_polled_frame_to_loops(&mut panes, "KTLX", ts(10));
+    append_polled_frame_to_loops(&mut panes, "KTLX", ts(10), allocation(), &budgets());
 
     assert_eq!(frame_times(&panes[0]), vec![ts(0), ts(5), ts(10)]);
     assert_eq!(
@@ -265,14 +288,14 @@ fn the_loops_site_decides_not_the_panes_live_site() {
     // `propagate_layer_sync` converges the pane's site without rebuilding loops.
     panes[0].site = "KTLX".to_string();
 
-    append_polled_frame_to_loops(&mut panes, "KTLX", ts(10));
+    append_polled_frame_to_loops(&mut panes, "KTLX", ts(10), allocation(), &budgets());
     assert_eq!(
         frame_times(&panes[0]),
         vec![ts(0)],
         "the loop is still a KOUN loop"
     );
 
-    append_polled_frame_to_loops(&mut panes, "KOUN", ts(10));
+    append_polled_frame_to_loops(&mut panes, "KOUN", ts(10), allocation(), &budgets());
     assert_eq!(frame_times(&panes[0]), vec![ts(0), ts(10)]);
 }
 
@@ -286,8 +309,8 @@ fn an_inactive_loop_takes_no_frames() {
         "precondition: placeholder site"
     );
 
-    append_polled_frame_to_loops(&mut panes, "KTLX", ts(10));
-    append_polled_frame_to_loops(&mut panes, "", ts(11));
+    append_polled_frame_to_loops(&mut panes, "KTLX", ts(10), allocation(), &budgets());
+    append_polled_frame_to_loops(&mut panes, "", ts(11), allocation(), &budgets());
 
     assert!(panes[0].loop_state.frames.is_empty());
 }
@@ -298,10 +321,10 @@ fn a_polled_frame_is_inserted_in_time_order_and_never_twice() {
     let mut panes = [pane_looping_on(ktlx, 3600, &[0, 10])];
 
     // Out-of-order arrival still lands between its neighbours.
-    append_polled_frame_to_loops(&mut panes, "KTLX", ts(5));
+    append_polled_frame_to_loops(&mut panes, "KTLX", ts(5), allocation(), &budgets());
     assert_eq!(frame_times(&panes[0]), vec![ts(0), ts(5), ts(10)]);
 
-    append_polled_frame_to_loops(&mut panes, "KTLX", ts(5));
+    append_polled_frame_to_loops(&mut panes, "KTLX", ts(5), allocation(), &budgets());
     assert_eq!(
         frame_times(&panes[0]),
         vec![ts(0), ts(5), ts(10)],
@@ -316,7 +339,7 @@ fn appending_evicts_past_the_lookback_window() {
     // 10 minutes of lookback, frames every 5 minutes.
     let mut panes = [pane_looping_on(ktlx, 600, &[0, 5, 10])];
 
-    append_polled_frame_to_loops(&mut panes, "KTLX", ts(15));
+    append_polled_frame_to_loops(&mut panes, "KTLX", ts(15), allocation(), &budgets());
 
     assert_eq!(
         frame_times(&panes[0]),
@@ -340,7 +363,7 @@ fn eviction_pulls_the_playhead_back_inside_the_list() {
 
     // 15 minutes on from the newest frame, with a 10 minute window: everything
     // that was there is now older than the cutoff.
-    append_polled_frame_to_loops(&mut panes, "KTLX", ts(25));
+    append_polled_frame_to_loops(&mut panes, "KTLX", ts(25), allocation(), &budgets());
 
     assert_eq!(
         frame_times(&panes[0]),
@@ -359,4 +382,134 @@ fn eviction_pulls_the_playhead_back_inside_the_list() {
             .is_some(),
         "and resolve to one, which is what the pane renders through"
     );
+}
+
+/// **The frame cap holds against live appends, not only against the listing.**
+///
+/// The measured defect, at the shipped desktop numbers: a 24 h loop on a
+/// WSR-88D in precip lists ~333 volumes and `accept_scan_listing` samples them
+/// down to [`MAX_LOOP_FRAMES`]. Every poll after that appended a frame and the
+/// only eviction it ran was the lookback window's — which cannot bind here, by
+/// construction: a loop that had to sample its listing is one whose window
+/// already holds more scans than the cap. Sixty appends later the loop held
+/// **120 frames against a stated cap of 60**, and the transport's own caption
+/// printed both numbers in one sentence.
+///
+/// The cap is read off `loop_frames_held` rather than written down, so the two
+/// enforcement points cannot come to disagree about what the cap is.
+#[test]
+fn live_appends_do_not_take_a_loop_past_its_frame_cap() {
+    let ktlx = site("KTLX", 35.33, -97.27);
+    let held = crate::app::render::loop_frames_held(
+        allocation(),
+        rustdar_radar::types::RenderView::PlanView,
+        &budgets(),
+    );
+    // Three days of lookback against a day and a bit of frames, so the window
+    // eviction never fires and the cap is the only thing standing between this
+    // loop and unbounded growth.
+    let sampled: Vec<u32> = (0..held as u32).map(|i| i * 26).collect();
+    let mut panes = [pane_looping_on(ktlx, 72 * 3600, &sampled)];
+    panes[0].loop_state.listing_sampled = Some(true);
+    assert_eq!(
+        panes[0].loop_state.frames.len(),
+        held,
+        "precondition: the loop starts full",
+    );
+
+    let newest = *sampled.last().expect("the cap is not zero");
+    for i in 1..=held as u32 {
+        append_polled_frame_to_loops(
+            &mut panes,
+            "KTLX",
+            ts(newest + i * 4),
+            allocation(),
+            &budgets(),
+        );
+    }
+
+    assert_eq!(
+        panes[0].loop_state.frames.len(),
+        held,
+        "{held} appends took the loop to {} frames against a cap of {held}",
+        panes[0].loop_state.frames.len(),
+    );
+    assert!(
+        panes[0].loop_state.current_frame < panes[0].loop_state.frames.len(),
+        "the playhead must land on a frame that exists",
+    );
+}
+
+/// The cap costs resolution, never span — the invariant `accept_scan_listing`
+/// samples rather than truncates for, held across the append path too.
+///
+/// Taking the surplus off the old end would satisfy the cap just as well and is
+/// what a reader expects an eviction to do. It would also give back a whole
+/// sampled step per append while gaining one scan interval, so a 24 h loop's
+/// window would erode in front of the user: this pins that both ends stay put.
+#[test]
+fn capping_an_appended_loop_keeps_its_whole_window() {
+    let ktlx = site("KTLX", 35.33, -97.27);
+    let held = crate::app::render::loop_frames_held(
+        allocation(),
+        rustdar_radar::types::RenderView::PlanView,
+        &budgets(),
+    );
+    let sampled: Vec<u32> = (0..held as u32).map(|i| i * 26).collect();
+    let mut panes = [pane_looping_on(ktlx, 72 * 3600, &sampled)];
+    panes[0].loop_state.listing_sampled = Some(true);
+    let oldest = ts(sampled[0]);
+
+    let newest = *sampled.last().expect("the cap is not zero");
+    let appended = ts(newest + 4);
+    append_polled_frame_to_loops(&mut panes, "KTLX", appended, allocation(), &budgets());
+
+    let times = frame_times(&panes[0]);
+    assert_eq!(times.len(), held, "back inside the cap");
+    assert_eq!(
+        times[0], oldest,
+        "the oldest frame was dropped, so the loop no longer covers the \
+         lookback the user asked for",
+    );
+    assert_eq!(
+        *times.last().expect("frames"),
+        appended,
+        "the scan that was just polled is not in the loop, so the loop is not \
+         showing the present",
+    );
+}
+
+/// A loop holding every scan re-measures the site's cadence as it follows the
+/// site forward; a sampled one keeps the listing's figure.
+///
+/// `scan_step_secs` was written once, by `accept_scan_listing`, and never again.
+/// It is what the timeline caption quotes as the site's cadence, and every VCP
+/// change makes a stale one wrong — on 2026-08-11 every measured site but TDFW
+/// alternated VCPs during the day, and a WSR-88D going VCP 212 to VCP 35 moves
+/// from 259 s to 517 s.
+///
+/// The two halves are one rule: refresh it exactly where it is measurable. On a
+/// loop holding every scan the frame list *is* the listing and its median gap is
+/// the same statistic. On a sampled loop every gap is a sampled gap — the reason
+/// the figure was recorded before the sampling at all — so there is nothing to
+/// measure and the listing's median stands, which is precisely what "sampled
+/// from ~4 min scans" claims.
+#[test]
+fn a_loop_holding_every_scan_re_measures_the_cadence_as_it_follows_the_site() {
+    let ktlx = site("KTLX", 35.33, -97.27);
+    // Nine minutes apart: a WSR-88D in clear air, VCP 35.
+    let mut panes = [pane_looping_on(ktlx, 72 * 3600, &[0, 9, 18, 27])];
+
+    for (sampled, expected) in [(Some(false), Some(540)), (Some(true), Some(259))] {
+        panes[0].loop_state.listing_sampled = sampled;
+        panes[0].loop_state.scan_step_secs = Some(259);
+        append_polled_frame_to_loops(&mut panes, "KTLX", ts(36), allocation(), &budgets());
+
+        assert_eq!(
+            panes[0].loop_state.scan_step_secs, expected,
+            "listing_sampled = {sampled:?}",
+        );
+        // Put the loop back where the row above found it.
+        panes[0].loop_state.frames.pop();
+    }
 }

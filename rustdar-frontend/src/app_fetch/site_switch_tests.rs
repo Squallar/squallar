@@ -420,7 +420,12 @@ fn re_picking_the_site_a_pane_is_on_keeps_its_loop() {
         rustdar_radar::types::RenderView::PlanView,
     );
     for minute in [0, 4, 8] {
-        super::append_polled_frame(&mut pane.loop_state, WSR88D, at(minute));
+        let held = crate::app::render::loop_frames_held(
+            crate::app::render::test_loop_allocation(),
+            pane.loop_state.view,
+            &crate::app::render::test_budgets(),
+        );
+        super::append_polled_frame(&mut pane.loop_state, WSR88D, at(minute), held);
     }
     let frames_before: Vec<NaiveDateTime> = pane
         .loop_state
@@ -438,9 +443,12 @@ fn re_picking_the_site_a_pane_is_on_keeps_its_loop() {
         0,
         crate::loop_downloads::PendingDownloads {
             site: WSR88D.to_string(),
-            queue: [(at(8), Identifier::new("KPBZ20260811_180800_V06".to_string()))]
-                .into_iter()
-                .collect(),
+            queue: [(
+                at(8),
+                Identifier::new("KPBZ20260811_180800_V06".to_string()),
+            )]
+            .into_iter()
+            .collect(),
         },
     );
     assert!(
@@ -450,7 +458,11 @@ fn re_picking_the_site_a_pane_is_on_keeps_its_loop() {
 
     switch_to(&mut app, WSR88D);
 
-    let loop_state = &app.gui.pane(0).expect("a fresh Gui has one pane").loop_state;
+    let loop_state = &app
+        .gui
+        .pane(0)
+        .expect("a fresh Gui has one pane")
+        .loop_state;
     assert!(
         loop_state.is_active(),
         "a no-op pick switched the pane's loop off; nothing rebuilds it, so the \

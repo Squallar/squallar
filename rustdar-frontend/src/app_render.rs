@@ -3673,7 +3673,12 @@ fn accept_scan_listing(
     // The site's own cadence, read off the listing *before* the sampling below
     // throws scans away. Once sampled there is no way back to it, and it is what
     // the timeline caption needs to tell "every scan" from "one in five".
-    ls.scan_step_secs = median_step_secs(&scans);
+    ls.scan_step_secs = median_step_secs(
+        &scans
+            .iter()
+            .map(|(timestamp, _id)| *timestamp)
+            .collect::<Vec<_>>(),
+    );
 
     // Cap the downloads by evenly sampling the listing. A 3D loop's cap is its
     // *resident* one and is far lower, because for that kind the frame list and
@@ -3713,9 +3718,9 @@ fn accept_scan_listing(
     Some(FramePlan::new(site.to_string(), scans))
 }
 
-/// The median gap between consecutive scans in a listing, in whole seconds.
+/// The median gap between consecutive scan times, in whole seconds.
 ///
-/// `None` for a listing too short to have a gap. Zero and negative gaps are
+/// `None` for a run too short to have a gap. Zero and negative gaps are
 /// dropped rather than clamped: a listing is oldest-first and strictly
 /// increasing, so a non-positive gap is a duplicate key or an out-of-order one,
 /// and averaging it in would pull the cadence toward a value no radar ran at.
@@ -3724,12 +3729,17 @@ fn accept_scan_listing(
 /// event, not a corner case: across the six TDWR and four WSR-88D sites measured
 /// for 2026-08-11, every site but TDFW alternated VCPs during the day. A window
 /// holding a 259 s run and a 517 s run has no meaningful mean.
-fn median_step_secs(
-    scans: &[(chrono::NaiveDateTime, rustdar_radar::archive::Identifier)],
-) -> Option<u32> {
-    let mut gaps: Vec<i64> = scans
+///
+/// Takes bare timestamps rather than a listing because there are two runs it has
+/// to answer for and they are not the same type: the listing
+/// `accept_scan_listing` was handed, and the frame list `append_polled_frame`
+/// re-measures as a loop that holds every scan follows the site forward. One
+/// median for both, so the figure a loop starts with and the figure it keeps
+/// cannot be two different statistics.
+pub(super) fn median_step_secs(times: &[chrono::NaiveDateTime]) -> Option<u32> {
+    let mut gaps: Vec<i64> = times
         .windows(2)
-        .map(|pair| (pair[1].0 - pair[0].0).num_seconds())
+        .map(|pair| (pair[1] - pair[0]).num_seconds())
         .filter(|secs| *secs > 0)
         .collect();
     if gaps.is_empty() {
@@ -4211,7 +4221,7 @@ pub(crate) fn test_budgets() -> crate::budget::Budgets {
 /// `crate::loop_pool::LoopAllocation`.
 ///
 /// Exhaustive, like every other classification by view in this workspace.
-fn loop_frames_held(
+pub(super) fn loop_frames_held(
     allocation: LoopAllocation,
     view: rustdar_radar::types::RenderView,
     budgets: &crate::budget::Budgets,

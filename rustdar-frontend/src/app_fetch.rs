@@ -1641,7 +1641,9 @@ impl super::App {
         // the same volume.
         self.loop_mgr.cache_scan(site, timestamp, (scan, declared));
 
-        append_polled_frame_to_loops(self.gui.panes_mut(), site, timestamp);
+        let allocation = self.loop_allocation();
+        let budgets = self.budgets;
+        append_polled_frame_to_loops(self.gui.panes_mut(), site, timestamp, allocation, &budgets);
     }
 
     /// Re-initialize radar loops on all panes that have an active loop.
@@ -2016,13 +2018,20 @@ fn begin_loop_for_pane(
 /// before the cache carried a site, it resolved to this scan and drew it around
 /// the other site's coordinates, which is data from one radar under another
 /// radar's label. Loops on other sites get their own frames from their own polls.
+///
+/// The allocation and the budgets come in because the frame cap is resolved from
+/// both, and this is one of the two places it has to be applied — see
+/// [`append_polled_frame`].
 fn append_polled_frame_to_loops(
     panes: &mut [rustdar_egui::pane::PaneState],
     site: &str,
     timestamp: chrono::NaiveDateTime,
+    allocation: crate::loop_pool::LoopAllocation,
+    budgets: &crate::budget::Budgets,
 ) {
     for (pane_idx, pane) in panes.iter_mut().enumerate() {
-        if append_polled_frame(&mut pane.loop_state, site, timestamp) {
+        let held = super::render::loop_frames_held(allocation, pane.loop_state.view, budgets);
+        if append_polled_frame(&mut pane.loop_state, site, timestamp, held) {
             log::info!(
                 "Appended {} scan {} to loop on pane {} ({} frames)",
                 site,
@@ -2037,13 +2046,33 @@ fn append_polled_frame_to_loops(
 /// Add a frame at `timestamp` to `ls` if the loop is active, is on `site`, and does
 /// not already have that frame. Returns whether a frame was added.
 ///
-/// Evicting past the lookback window is part of the same step: the window is
-/// measured from the newest frame, so it can only be applied once the new frame is
-/// in place.
+/// Two evictions are part of the same step, and both can only run once the new
+/// frame is in place.
+///
+/// The **lookback window** is measured from the newest frame, so it moves with
+/// every append.
+///
+/// The **frame cap** was missing entirely, and its absence is why a loop could
+/// print "over 120 frames" beside "keeps up to 60 frames on this platform" in
+/// one caption. `accept_scan_listing` applied `held` once, to the listing, and
+/// nothing applied it again — while the window eviction cannot stand in for it,
+/// because a loop that had to sample its listing is by construction a loop whose
+/// window holds more scans than `held`. See
+/// [`LoopPlaybackState::cap_frames`](rustdar_egui::pane::LoopPlaybackState::cap_frames)
+/// for why the surplus is re-sampled rather than taken off the old end.
+///
+/// The cadence is refreshed here too, and only from a frame that lands at the
+/// newest end. That is the one case where the gap just observed is a gap between
+/// two *consecutive* scans of the site — an append is the newest scan the poll
+/// found, and the frame before it is the newest the loop held. A frame inserted
+/// anywhere else is a backfill across a hole whose width says nothing about the
+/// site's cadence, and folding it in would drag the figure toward a value no
+/// radar ran at, which is the same reason `median_step_secs` takes a median.
 fn append_polled_frame(
     ls: &mut rustdar_egui::pane::LoopPlaybackState,
     site: &str,
     timestamp: chrono::NaiveDateTime,
+    held: usize,
 ) -> bool {
     use rustdar_egui::pane::LoopFrame;
 
@@ -2082,6 +2111,33 @@ fn append_polled_frame(
         if ls.current_frame >= ls.frames.len() {
             ls.current_frame = ls.frames.len().saturating_sub(1);
         }
+    }
+
+    // Re-measure the site's cadence, while it is still measurable. On a loop
+    // holding every scan the frame list *is* the listing, so its median gap is
+    // the same statistic `accept_scan_listing` recorded — now over a window that
+    // has moved. A loop left on a stale figure quotes the cadence the site ran
+    // at when its listing was taken, which every VCP change makes wrong: on
+    // 2026-08-11 every measured site but TDFW alternated VCPs during the day,
+    // and a WSR-88D going VCP 212 to VCP 35 moves from 259 s to 517 s.
+    //
+    // A sampled loop is deliberately left alone, and its figure is still the
+    // honest one. Every gap in a sampled frame list is a sampled gap — the
+    // reason `scan_step_secs` was recorded before the sampling in the first
+    // place — so there is nothing here to measure, and the listing's median is
+    // exactly what "sampled from ~4 min scans" claims: the cadence of the
+    // listing this loop is a sample of.
+    if ls.listing_sampled != Some(true) {
+        let times: Vec<_> = ls.frames.iter().map(|f| f.timestamp).collect();
+        if let Some(step) = super::render::median_step_secs(&times) {
+            ls.scan_step_secs = Some(step);
+        }
+    }
+
+    // And back inside the frame cap. Last, so the cadence above is read off the
+    // full scan list on the append that first overruns the cap.
+    if ls.cap_frames(held) {
+        log::info!("Loop: live appends took the frame list past {held}; re-sampled for {site}");
     }
 
     true
