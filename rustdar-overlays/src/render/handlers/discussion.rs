@@ -268,14 +268,21 @@ impl OverlayHandler for SpcDiscussionHandler {
         });
     }
 
-    fn prepare_rasterize(&self, _ctx: &RasterizeContext) -> Option<RasterizeFn> {
+    fn prepare_rasterize(&self, ctx: &RasterizeContext) -> Option<RasterizeFn> {
+        let device_scale = ctx.device_scale;
         if self.state.data.is_empty() {
             return None;
         }
         let discussions: Vec<SpcDiscussion> =
             self.state.data.iter().map(|i| i.md.clone()).collect();
         Some(Box::new(move |bounds: &GeoBounds, width, height| {
-            let rgba = rasterize::rasterize_spc_discussions(&discussions, bounds, width, height);
+            let rgba = rasterize::rasterize_spc_discussions(
+                &discussions,
+                bounds,
+                width,
+                height,
+                device_scale,
+            );
             RasterizeOutput {
                 rgba,
                 hit_map: None,

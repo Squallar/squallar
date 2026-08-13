@@ -905,6 +905,11 @@ impl super::App {
                 let rctx = rustdar_overlays::render::overlay_state::RasterizeContext {
                     is_dark: self.cached_dark_theme.unwrap_or(false),
                     zoom: zoom as f64 / ZOOM_QUANTIZATION_FACTOR,
+                    // Off the plan the pixel count came from, never re-read
+                    // from the context: a rasterizer told a different density
+                    // than the one its texture was sized at draws every marker
+                    // at the wrong size. See `OverlayTexturePlan`.
+                    device_scale: texture.pixels_per_point,
                 };
                 let Some(rasterize_fn) = self.gui.overlays.prepare_rasterize(kind, &rctx) else {
                     // Nothing to render — clear in-flight
@@ -941,6 +946,9 @@ impl super::App {
                 let target_loading = target_pane.loading_site.clone();
                 let is_dark = self.cached_dark_theme.unwrap_or(false);
                 let actual_zoom = zoom as f64 / ZOOM_QUANTIZATION_FACTOR;
+                // See the `RasterizeContext` above: the density the pixels were
+                // counted at is the density the symbols are drawn at.
+                let device_scale = texture.pixels_per_point;
                 let sites: Vec<rasterize::RadarSiteInfo> = rustdar_radar::sites::radars()
                     .iter()
                     .map(|s| rasterize::RadarSiteInfo {
@@ -959,6 +967,7 @@ impl super::App {
                         height,
                         actual_zoom,
                         is_dark,
+                        device_scale,
                     );
                     // Same conversion, same place, same reason — see
                     // `OverlayRenderResponse::image`. This one is not the

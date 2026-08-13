@@ -680,6 +680,7 @@ impl OverlayHandler for GlmHandler {
             .collect();
         let zoom = ctx.zoom;
         let is_dark = ctx.is_dark;
+        let device_scale = ctx.device_scale;
         let time_window_secs = self.time_window_secs;
         let now = Utc::now().naive_utc();
         Some(Box::new(move |bounds: &GeoBounds, width, height| {
@@ -690,6 +691,7 @@ impl OverlayHandler for GlmHandler {
                 width,
                 height,
                 &rasterize::GlmRenderParams {
+                    device_scale,
                     zoom,
                     is_dark,
                     time_window_secs,

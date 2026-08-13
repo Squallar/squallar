@@ -606,14 +606,21 @@ impl OverlayHandler for SpcOutlookHandler {
         if features.is_empty() {
             return None;
         }
+        let device_scale = ctx.device_scale;
         let hatch_color = if ctx.is_dark {
             [200, 200, 200, 180]
         } else {
             [60, 60, 60, 180]
         };
         Some(Box::new(move |bounds: &GeoBounds, width, height| {
-            let rgba =
-                rasterize::rasterize_spc_outlooks(&features, bounds, width, height, hatch_color);
+            let rgba = rasterize::rasterize_spc_outlooks(
+                &features,
+                bounds,
+                width,
+                height,
+                hatch_color,
+                device_scale,
+            );
             RasterizeOutput {
                 rgba,
                 hit_map: None,

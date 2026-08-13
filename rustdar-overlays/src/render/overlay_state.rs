@@ -515,6 +515,22 @@ pub struct FetchConfig {
 pub struct RasterizeContext {
     pub is_dark: bool,
     pub zoom: f64,
+    /// Texels per logical point the texture being rasterized was sized at —
+    /// `rustdar_egui::overlay_cache::OverlayTexturePlan::pixels_per_point`.
+    ///
+    /// Every marker radius, label pill and stroke width in
+    /// [`crate::render::rasterize`] is a length in **texels**, chosen from the
+    /// map zoom so that it comes out at a sensible size on screen. That
+    /// reasoning silently assumed one texel per point, which held for as long
+    /// as the overlay textures were sized in points. They are sized in physical
+    /// pixels now, so on a display at two of them per point an unscaled radius
+    /// would draw at half the size it is meant to — and the site label pill,
+    /// whose glyphs egui draws over it per frame at a fixed *point* size, would
+    /// be half the width of the text it is a background for.
+    ///
+    /// `1.0` is one texel per point, which is every display that is not scaled
+    /// and every reading this field had before it existed.
+    pub device_scale: f32,
 }
 
 // ── Fetch-path thread bounds ─────────────────────────────────────────────
