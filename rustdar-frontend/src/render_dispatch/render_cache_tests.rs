@@ -285,7 +285,11 @@ fn the_whole_volume_predicate_is_both_halves() {
         // (view, product, needs the whole volume?)
         (RenderView::PlanView, RadarProduct::Reflectivity, false), // neither half
         (RenderView::CrossSection, RadarProduct::Reflectivity, true), // the view's sake alone
-        (RenderView::PlanView, RadarProduct::EchoTopsInterpolated, true), // the product's alone
+        (
+            RenderView::PlanView,
+            RadarProduct::EchoTopsInterpolated,
+            true,
+        ), // the product's alone
         (
             RenderView::CrossSection,
             RadarProduct::EchoTopsInterpolated,
