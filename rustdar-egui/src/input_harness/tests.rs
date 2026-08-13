@@ -10633,6 +10633,11 @@ fn the_timeline_row2_caption_states_the_running_loops_span_and_fidelity() {
             rustdar_radar::types::RenderView::PlanView,
         );
         pane.loop_state.phase = crate::pane::LoopPhase::Playing;
+        // What `accept_scan_listing` records for a listing that fitted the cap
+        // whole: the site's own cadence, and the sampler's answer that it threw
+        // nothing away. The fidelity claim is made from the second — the first
+        // only supplies the figure the sampled phrasing quotes.
+        pane.loop_state.listing_sampled = Some(false);
         pane.loop_state.scan_step_secs = Some(259);
         let base = written_ago(60);
         pane.loop_state.frames = (0..14)

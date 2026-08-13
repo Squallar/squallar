@@ -3678,16 +3678,21 @@ fn accept_scan_listing(
     // Cap the downloads by evenly sampling the listing. A 3D loop's cap is its
     // *resident* one and is far lower, because for that kind the frame list and
     // the resident set are one thing — see `loop_frames_held`.
+    //
+    // The kept/given ratio is the loop's own answer to "am I showing every
+    // scan", and it is recorded here because here is the only place it exists:
+    // one line further down the listing is gone and nothing left behind can
+    // reconstruct it. See `LoopPlaybackState::listing_sampled`.
     let held = loop_frames_held(allocation, ls.view, budgets);
-    let scans = if scans.len() > held {
-        let total = scans.len();
-        let sampled: Vec<_> = (0..held)
-            .map(|i| scans[i * (total - 1) / (held - 1).max(1)].clone())
-            .collect();
-        log::info!("Loop: sampled {total} down to {held} frames for {site}");
-        sampled
-    } else {
-        scans
+    let total = scans.len();
+    let sample = rustdar_egui::pane::listing_sample_indices(total, held);
+    ls.listing_sampled = Some(sample.is_some());
+    let scans = match sample {
+        Some(indices) => {
+            log::info!("Loop: sampled {total} down to {held} frames for {site}");
+            indices.into_iter().map(|i| scans[i].clone()).collect()
+        }
+        None => scans,
     };
 
     ls.phase = rustdar_egui::pane::LoopPhase::Rendering;

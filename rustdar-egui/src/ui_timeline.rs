@@ -149,11 +149,25 @@ fn format_span(secs: i64) -> String {
 /// at that lookback a desktop loop is showing 60 of ~333 WSR-88D volumes, four
 /// scans in five dropped, and the span is exactly the number that hides it.
 ///
-/// So the spacing is reported beside the span, and calibrated against
-/// `scan_step_secs` — the site's own cadence, caught before the sampling. With
-/// it the caption commits to "every scan" or to "sampled from ~4 min scans";
-/// without it (an older loop, or a listing too short to have a gap) it states
-/// the spacing and claims nothing about fidelity, which is the honest silence.
+/// So the spacing is reported beside the span, and the fidelity beside both.
+///
+/// # Fidelity is the sampler's own answer, never a statistic over the frames
+///
+/// `listing_sampled` is what [`crate::pane::listing_sample_indices`] decided:
+/// the loop was given so many scans, it kept so many, and whether it dropped
+/// any is a fact recorded at that moment. `scan_step_secs` is the site's cadence
+/// caught before the sampling, and supplies the "~4 min" the sampled phrasing
+/// quotes — but it decides nothing.
+///
+/// It used to decide everything, and could not. The rule was
+/// `markedly_longer(median frame gap, scan_step_secs)`: two medians over the
+/// same timestamps, so the listing's own jitter cancels and the frame median
+/// sits at exactly one listing step until two-step gaps are the **majority**.
+/// That resolves 2x decimation and nothing gentler. Measured on the shipped
+/// caps: a browser loop holding 12 of a 17-scan listing announced "every scan"
+/// with **29.4% of the scans dropped**, and a desktop loop holding 60 of 89
+/// announced it with **32.6% dropped**. Both are the ordinary case — a lookback
+/// slightly past what the cap covers — not an extreme.
 ///
 /// # The awkward cases
 ///
@@ -169,13 +183,26 @@ fn format_span(secs: i64) -> String {
 ///   measured site but TDFW alternated VCPs during the day, and a TDWR switching
 ///   VCP 80 to 90 or a WSR-88D switching VCP 212 to 35 moves its cadence by up to
 ///   2x mid-window.
+/// - **The sampler's own uneven spacing.** `i * (total - 1) / (held - 1)` leaves
+///   gaps of alternating width, so a decimated loop is unevenly spaced *by
+///   construction*.
 ///
-/// The last two are deliberately **not** distinguished. From timestamps alone
-/// they are the same evidence — one gap of roughly twice the cadence — and
-/// nothing in the frame list says which. So the caption reports the honest range
-/// it can defend, "4 to 9 min apart", and never guesses at a cause.
+/// The first two are deliberately **not** distinguished from each other: from
+/// timestamps alone they are the same evidence, one gap of roughly twice the
+/// cadence, and nothing in the frame list says which. So the caption reports the
+/// honest range it can defend and never guesses at a cause.
+///
+/// The third is why the fidelity clause has to come **first** and has to be
+/// right. On a sampled loop the range is the sampler's arithmetic showing
+/// through, and a caption that read "every scan, 4 min to 9 min apart" — which
+/// is what a 17-into-12 browser loop printed — offered the user only one
+/// explanation for that spread, an RDA outage or a VCP change at the radar. It
+/// was neither. Saying "sampled from ~4 min scans" first attributes the spread
+/// where it belongs before the numbers that would otherwise be read as the
+/// radar's behaviour.
 fn loop_span_phrase(
     frames: &[LoopFrame],
+    listing_sampled: Option<bool>,
     scan_step_secs: Option<u32>,
     settled: bool,
 ) -> Option<String> {
@@ -218,12 +245,18 @@ fn loop_span_phrase(
         format!("~{} apart", format_span(typical))
     };
 
-    let fidelity = match scan_step_secs {
-        Some(step) if markedly_longer(typical, i64::from(step)) => {
+    let fidelity = match (listing_sampled, scan_step_secs) {
+        (Some(true), Some(step)) => {
             format!("sampled from ~{} scans, ", format_span(i64::from(step)))
         }
-        Some(_) => "every scan, ".to_owned(),
-        None => String::new(),
+        // A listing short enough to have no measurable gap is also short enough
+        // to fit any cap, so this pairing is not reachable from
+        // `accept_scan_listing`. It is written out rather than folded into the
+        // arm above because the two halves are independent facts and a match
+        // that assumed otherwise would print "sampled from ~0 min scans".
+        (Some(true), None) => "sampled, ".to_owned(),
+        (Some(false), _) => "every scan, ".to_owned(),
+        (None, _) => String::new(),
     };
 
     Some(format!(
@@ -1235,7 +1268,12 @@ impl super::Gui {
         // pane announce "This loop is 1 frame".
         let span = if loop_active {
             let ls = &self.panes[pane_idx].loop_state;
-            loop_span_phrase(&ls.frames, ls.scan_step_secs, ls.is_render_ready())
+            loop_span_phrase(
+                &ls.frames,
+                ls.listing_sampled,
+                ls.scan_step_secs,
+                ls.is_render_ready(),
+            )
         } else {
             None
         };
