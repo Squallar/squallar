@@ -82,8 +82,9 @@ pub enum ZoneFailure {
     /// the origin: a `GeometryCollection`, which is how the NWS serves 227 of
     /// its 11,651 zones, and a zone every one of whose rings the simplifier ate.
     /// With those closed, **no zone in the published corpus reaches this
-    /// variant** — see [`zone_geometry_tests`]. A count against it now really
-    /// does mean the origin sent something undrawable.
+    /// variant** — measured over all 11,651 of them by the `zone_geometry_tests`
+    /// module, which is `cfg(test)` and so cannot be linked from here. A count
+    /// against it now really does mean the origin sent something undrawable.
     NoBoundary,
 }
 
