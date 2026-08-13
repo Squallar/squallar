@@ -2675,6 +2675,22 @@ fn the_crop_magnifies_a_sub_box_and_answers_air_outside_the_grid() {
 /// has to stay right for one, or the constraint and the accounting could drift
 /// apart with nothing to notice.
 ///
+/// # The margin is asserted, not just printed
+///
+/// `charged >= actual` is the contract, and on its own it let a claim rot in
+/// the doc it was written into: `volume::raymarch::grid_bytes_at` said the tile
+/// arithmetic reproduced the driver "exactly" on six shapes and came 512 B under
+/// on a seventh, while every rung this test drives was in fact 512 B under. The
+/// margin was never checked, so nothing noticed.
+///
+/// So the surplus is pinned exactly. It is
+/// `TEXTURE_ALLOCATION_SLACK_BYTES - 512`, one page of slack less the constant
+/// the driver adds to every `D3` image, and it is the same on every rung and
+/// both arms because that constant does not vary with the shape. Pinning it
+/// rather than bounding it is what makes this a measurement: a driver that
+/// started rounding differently, or a model that started naming the 512 B, moves
+/// this number and has to say so here.
+///
 /// ```text
 /// cargo test -p rustdar-frontend --test volume_gpu \
 ///     the_charged_grid_bytes_are_never_under_what_the_device_reserved \
@@ -2685,6 +2701,13 @@ fn the_crop_magnifies_a_sub_box_and_answers_air_outside_the_grid() {
 fn the_charged_grid_bytes_are_never_under_what_the_device_reserved() {
     use rustdar_frontend::volume::raymarch::grid_bytes_at;
     use rustdar_frontend::volume::raymarch::staging::VolumeStaging;
+
+    /// What every grid's charge runs over the driver's own figure: the 4,096 B
+    /// page `volume::raymarch::TEXTURE_ALLOCATION_SLACK_BYTES` adds, less the
+    /// 512 B the driver adds to every `D3` image and the tile model does not
+    /// name. Constant across shape, byte count and mip level count — swept from
+    /// 1×1×1 to 256×256×128 — because neither term varies with any of them.
+    const GRID_CHARGE_SURPLUS_BYTES: u64 = 4096 - 512;
 
     let _serialised = gpu_lock();
     let (device, queue) = device();
@@ -2749,6 +2772,15 @@ fn the_charged_grid_bytes_are_never_under_what_the_device_reserved() {
             eprintln!(
                 "{cells:?} {coarse:?}: reserved {actual}, charged {charged} \
                  (+{} B)",
+                charged - actual,
+            );
+            assert_eq!(
+                charged - actual,
+                GRID_CHARGE_SURPLUS_BYTES,
+                "{cells:?} {coarse:?}: the charge ran {} B over the device's \
+                 figure, not the {GRID_CHARGE_SURPLUS_BYTES} B every other rung \
+                 runs over — see `TEXTURE_ALLOCATION_SLACK_BYTES` for what that \
+                 surplus is made of",
                 charged - actual,
             );
             checked += 1;

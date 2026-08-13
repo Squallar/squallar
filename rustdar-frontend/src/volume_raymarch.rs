@@ -1475,14 +1475,42 @@ const TEXTURE_TILE_LAYERS_Z: usize = 16;
 
 /// Slack allowed on every texture allocation over the tile arithmetic above.
 ///
-/// One 4 KiB page. Not decoration and not a guess: the same image measured
-/// twice on the same device differs by up to 736 bytes according to whether the
-/// allocator placed it in a fresh block or sub-allocated it, and the tile model
-/// lands *exactly* on the driver's figure for six of the seven shapes swept —
-/// which means without an allowance it is a knife-edge that the seventh
-/// (320×320×34, short by 512 B) already falls off. A page turns an
-/// exactly-right model into a certainly-not-under one, and it is 0.01% of a
-/// desktop grid.
+/// One 4 KiB page, and it is 0.01% of a desktop grid.
+///
+/// # What it is actually covering, which is not what this used to say
+///
+/// This doc claimed the tile model "lands *exactly* on the driver's figure for
+/// six of the seven shapes swept", so that the page was covering a knife-edge
+/// one shape fell off. **That is false, and it was false in the safe
+/// direction.** Re-measured through `the_charged_grid_bytes_are_never_under_
+/// what_the_device_reserved` in `tests/volume_gpu.rs` — `#[ignore]`d behind a
+/// real adapter, so it runs only under `-- --ignored` — on the same RTX 3090 and
+/// driver [`TEXTURE_TILE_TEXELS_X`] names, the tile model is **512 B under on
+/// every 3D shape, uniformly**: twelve of twelve readings across six shapes and
+/// both [`CoarseLevel`] arms, and a further seven shapes swept down to 1×1×1
+/// gave the same 512.
+///
+/// It is uniform because it is not rounding at all: the driver adds a constant
+/// 512 B to every `D3` image, independent of the shape, of the byte count and of
+/// how many mip levels the descriptor asks for. A 1×1×1 grid whose tiles come to
+/// 512 B reserves 1,024; a 256×256×128 whose tiles come to 33,554,432 reserves
+/// 33,554,944. It is a property of the *dimension*, not of the size: the `D2`
+/// colour table and the `D2` jitter tile land on their tile figures exactly, so
+/// this term applies to the grid and to nothing else here.
+///
+/// So the page is not covering a knife-edge. It is covering a constant term the
+/// model does not name, plus the real placement variance — the same image
+/// measured twice on one device differs by up to 736 bytes according to whether
+/// the allocator gave it a fresh block or sub-allocated it. What that leaves is
+/// **+3,584 B of genuine margin on every grid**, measured, and the charge has
+/// never gone under.
+///
+/// Naming the 512 B here and taking it out of the page would make the model
+/// exact, which is the better shape. It is deliberately not done in this change:
+/// [`grid_bytes_at`] feeds `resident_grid_bytes`, which feeds the derived loop
+/// budget table on `constants::VOLUME_LOOP_TEXTURE_BUDGET_BYTES`, and moving a
+/// residency figure is a change to the budget architecture rather than to this
+/// arithmetic.
 const TEXTURE_ALLOCATION_SLACK_BYTES: usize = 4096;
 
 /// One axis of one mip level, rounded up to the tile the backend lays it out in.
@@ -1598,12 +1626,26 @@ pub fn grid_bytes_with_mips(cells: [u32; 3]) -> Option<usize> {
 /// The pyramid is exact arithmetic on the shape and holds on any backend — no
 /// driver reserves *fewer* levels than the descriptor names, so counting all of
 /// them can only over-state. The tiles are a measured property of one backend
-/// (see [`TEXTURE_TILE_TEXELS_X`]) and this is the honest reading of them: the
-/// model reproduces the driver's figure **exactly** on 256×256×128, 512×512×32,
-/// 128×128×64, 192×192×96, 256×256×16, 64×64×32 and 1024×1024×8, and comes
-/// 512 B under on 320×320×34, which [`TEXTURE_ALLOCATION_SLACK_BYTES`] covers.
-/// A backend tiling more coarsely than 16×8×16 would need this re-measured;
-/// the ones measured so far are covered with 3,360–4,608 B to spare.
+/// (see [`TEXTURE_TILE_TEXELS_X`]).
+///
+/// This used to claim the tile arithmetic "reproduces the driver's figure
+/// **exactly**" on six named shapes and came 512 B under on a seventh. **Neither
+/// half survives re-measurement.** The shapes the check actually sweeps are
+/// 256×256×128, 512×512×32, 320×320×32, 192×192×96, 128×128×64 and 64×64×34 —
+/// three of the seven named here were never among them — and the tile arithmetic
+/// is 512 B under on **all** of them, on both [`CoarseLevel`] arms, twelve
+/// readings out of twelve. It is under by the same 512 B on every 3D shape swept
+/// down to 1×1×1, because the term it is missing is a constant the driver adds
+/// to every `D3` image rather than anything to do with rounding. See
+/// [`TEXTURE_ALLOCATION_SLACK_BYTES`], which is what covers it.
+///
+/// So the figure this returns has never been under what the device reserved —
+/// it runs **+3,584 B over on every shape measured**, uniformly, rather than
+/// over by the 3,360–4,608 B range the old prose quoted. A backend tiling more
+/// coarsely than 16×8×16, or adding a larger constant than 512 B, would need
+/// this re-measured; `the_charged_grid_bytes_are_never_under_what_the_device_
+/// reserved` in `tests/volume_gpu.rs` is what re-measures it, and being
+/// `#[ignore]`d it does so only under `-- --ignored` against a real adapter.
 pub fn grid_bytes_at(cells: [u32; 3], coarse: CoarseLevel) -> Option<usize> {
     texture_allocation_bytes(
         cells,
