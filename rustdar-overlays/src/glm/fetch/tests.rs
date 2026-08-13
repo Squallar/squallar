@@ -1361,3 +1361,47 @@ fn a_round_fails_only_when_no_satellite_could_be_listed() {
         err.message,
     );
 }
+
+/// A bucket key whose `_s` field carries a multi-byte character is undatable,
+/// not fatal.
+///
+/// The keys come from the text of `<Key>` nodes in the bucket's own
+/// `ListObjectsV2` reply and are filtered on nothing but a `.nc` suffix, so the
+/// shape of the `_s` field is the server's word and not this build's. The gate
+/// that used to guard the six byte ranges below was `s_field.len() < 14`, in
+/// bytes, and a multi-byte character anywhere in the first fourteen put one of
+/// them inside a UTF-8 sequence — a panic in the GLM poll task, from a listing.
+///
+/// The last two cases are the ones a length gate cannot catch by counting: they
+/// are long enough, and wrong in the middle.
+#[test]
+fn a_multibyte_key_is_undatable_rather_than_fatal() {
+    for key in [
+        "GLM-L2-LCFA/2026/205/12/OR_GLM-L2-LCFA_G19_sé.nc",
+        "OR_GLM-L2-LCFA_G19_séééééé.nc",
+        "OR_GLM-L2-LCFA_G19_s2026205120000é_e1_c2.nc",
+        "OR_GLM-L2-LCFA_G19_s20é62051200000_e1_c2.nc",
+    ] {
+        assert_eq!(
+            parse_filename_start_time(key),
+            None,
+            "{key:?} names no time, and must not panic on the way to saying so",
+        );
+    }
+}
+
+/// The fix must not have made every key undatable: a real one still dates.
+///
+/// Without this, `parse_filename_start_time` could return `None` unconditionally
+/// and the test above would still pass — and every GLM granule would silently
+/// re-download on every poll.
+#[test]
+fn the_ascii_ranges_a_real_key_carries_still_parse() {
+    let key = "GLM-L2-LCFA/2026/205/12/\
+               OR_GLM-L2-LCFA_G19_s20262051200000_e20262051200200_c20262051200214.nc";
+    let start = parse_filename_start_time(key).expect("a real key must still date");
+    assert_eq!(
+        start.format("%Y-%m-%d %H:%M:%S").to_string(),
+        "2026-07-24 12:00:00"
+    );
+}
