@@ -2964,8 +2964,9 @@ impl super::App {
             // A 3D loop's budget is its own, and it is the *whole* frame list
             // rather than a window inside it: a resident grid re-entered costs
             // ~140 ms to rebuild against a 200 ms playback interval, so the
-            // walking window the other two kinds use does not close here. See
-            // `MAX_LOOP_VOLUME_FRAMES`.
+            // walking window the other two kinds use does not close here. The
+            // count is `LoopAllocation::volume_frames`, which is what
+            // `frames_for` answers on this view.
             let indices = ls.render_set_indices(allocation.frames_for(ls.view));
 
             // A 3D loop's frames are resident grids rather than rasters, so it

@@ -158,7 +158,8 @@ const MINUTES: [u32; 4] = [0, 5, 10, 15];
 /// walks. Re-entering a resident 3D window costs ~140 ms (89 ms resample +
 /// 51 ms upload) against the 200 ms interval at `DEFAULT_LOOP_SPEED_FPS`, so
 /// that treadmill does not close here — which is why `loop_frame_budget` and
-/// `loop_frames_held` both answer `MAX_LOOP_VOLUME_FRAMES` for a volume loop.
+/// `loop_frames_held` both answer `LoopAllocation::volume_frames` for a volume
+/// loop.
 ///
 /// Reverting any of that shows up here: a render set smaller than the frame
 /// list leaves the far frames unbuilt, and a `retain_set` that did not state

@@ -833,11 +833,16 @@ pub const DEFAULT_TOP_KM_MSL: f64 = 18.0;
 
 /// What one grid's index plane may occupy, bytes.
 ///
-/// Not a runtime check — nothing measures against it, exactly as
-/// `LOOP_TEXTURE_BUDGET_BYTES` is not measured against. It is the budget the
-/// three named shapes were chosen to fit, written down so that adding a fourth
-/// has to be a deliberate decision about GPU memory.
-/// `every_named_shape_fits_the_texture_budget` enforces it.
+/// **A runtime check, and this doc said it was not for as long as it had a
+/// consumer.** `rustdar_frontend::offload`'s voxel job refuses a request whose
+/// `shape.cells()` exceeds this figure — one byte a cell, so the cell count
+/// *is* the plane's length — and a refusal is a logged blank 3D pane rather
+/// than an allocation nobody sized. That matters because the shape is a runtime
+/// answer now: [`shape_for_budget`] spends the cell budget against whatever
+/// `max_texture_dimension_3d` the adapter reports, so the thing this bounds is
+/// no longer only a constant a reviewer can read. It is still also the budget
+/// the three named shapes were chosen to fit, and
+/// `every_named_shape_fits_the_texture_budget` is what holds those to it.
 ///
 /// The **value** plane is not in this budget: it is host memory, it is four
 /// times larger, and it is optional. Its figures are in the module doc's
@@ -845,7 +850,7 @@ pub const DEFAULT_TOP_KM_MSL: f64 = 18.0;
 ///
 /// **Not the same thing as `rustdar_frontend::constants::VOLUME_TEXTURE_BUDGET_BYTES`,
 /// despite the names, and deliberately not bound to it.** That one is
-/// per-target (1.5 MiB / 5 MiB / 12 MiB) and carries ~1.5× headroom for the
+/// per-target (6 MiB / 20 MiB / 48 MiB) and carries ~1.3× headroom for the
 /// alignment and driver overhead a real GPU allocation costs; this one is a
 /// flat ceiling equal to the largest index plane this module will produce, so
 /// that adding a fourth shape has to be a decision. They answer different

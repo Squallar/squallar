@@ -1,11 +1,10 @@
 use super::*;
 use crate::constants::{
     DESKTOP_LOOP_IMAGE_SIZE, DESKTOP_LOOP_POOL_CEILING_BYTES, DESKTOP_LOOP_POOL_FLOOR_BYTES,
-    DESKTOP_MAX_LOOP_RENDER_BUDGET, DESKTOP_MAX_LOOP_VOLUME_FRAMES, DESKTOP_VOLUME_GRID_CELLS,
-    MOBILE_LOOP_IMAGE_SIZE, MOBILE_LOOP_POOL_CEILING_BYTES, MOBILE_LOOP_POOL_FLOOR_BYTES,
-    MOBILE_MAX_LOOP_RENDER_BUDGET, MOBILE_MAX_LOOP_VOLUME_FRAMES, MOBILE_VOLUME_GRID_CELLS,
-    WASM_LOOP_IMAGE_SIZE, WASM_LOOP_POOL_CEILING_BYTES, WASM_LOOP_POOL_FLOOR_BYTES,
-    WASM_MAX_LOOP_RENDER_BUDGET, WASM_MAX_LOOP_VOLUME_FRAMES, WASM_VOLUME_GRID_CELLS,
+    DESKTOP_MAX_LOOP_RENDER_BUDGET, DESKTOP_VOLUME_GRID_CELLS, MOBILE_LOOP_IMAGE_SIZE,
+    MOBILE_LOOP_POOL_CEILING_BYTES, MOBILE_LOOP_POOL_FLOOR_BYTES, MOBILE_MAX_LOOP_RENDER_BUDGET,
+    MOBILE_VOLUME_GRID_CELLS, WASM_LOOP_IMAGE_SIZE, WASM_LOOP_POOL_CEILING_BYTES,
+    WASM_LOOP_POOL_FLOOR_BYTES, WASM_MAX_LOOP_RENDER_BUDGET, WASM_VOLUME_GRID_CELLS,
 };
 use rustdar_egui::config_store::MemoryConfigStore;
 use rustdar_radar::xsect::{NATIVE_SECTION_WIDTH, WASM_SECTION_WIDTH};
@@ -26,6 +25,13 @@ struct Arm {
     max_panes: usize,
     /// The 3D frame count this class ships, which the pool must reproduce for a
     /// single loop at the floor.
+    ///
+    /// **A literal, and this is the only place one is written.** It used to be
+    /// `MAX_LOOP_VOLUME_FRAMES`, a `cfg` cascade with no runtime consumer that
+    /// restated what `LoopPool::plan` already computed; the constant is retired
+    /// and the pin lives here, against the planner, where a divergence is a
+    /// failure rather than two numbers agreeing by hand. The rows are the
+    /// `frames` column of `VOLUME_LOOP_TEXTURE_BUDGET_BYTES`' table.
     volume_loop_frames: usize,
 }
 
@@ -63,7 +69,7 @@ fn arms() -> [Arm; 3] {
                 ceiling: WASM_LOOP_POOL_CEILING_BYTES,
             },
             max_panes: rustdar_egui::pane::MAX_PANES_DESKTOP,
-            volume_loop_frames: WASM_MAX_LOOP_VOLUME_FRAMES,
+            volume_loop_frames: 8,
         },
         Arm {
             name: "mobile",
@@ -78,7 +84,7 @@ fn arms() -> [Arm; 3] {
                 ceiling: MOBILE_LOOP_POOL_CEILING_BYTES,
             },
             max_panes: rustdar_egui::pane::MAX_PANES_MOBILE,
-            volume_loop_frames: MOBILE_MAX_LOOP_VOLUME_FRAMES,
+            volume_loop_frames: 12,
         },
         Arm {
             name: "desktop",
@@ -93,7 +99,7 @@ fn arms() -> [Arm; 3] {
                 ceiling: DESKTOP_LOOP_POOL_CEILING_BYTES,
             },
             max_panes: rustdar_egui::pane::MAX_PANES_DESKTOP,
-            volume_loop_frames: DESKTOP_MAX_LOOP_VOLUME_FRAMES,
+            volume_loop_frames: 12,
         },
     ]
 }
@@ -325,11 +331,15 @@ fn the_3d_set_is_not_double_counted_across_two_panes() {
 /// A single 3D loop at the floor holds exactly the count this target ships.
 ///
 /// The continuity property for the loop kind whose frame list *is* its resident
-/// set: `MAX_LOOP_VOLUME_FRAMES` was chosen as the tighter of what the budget
-/// admits beside one live grid and `MAX_LOOP_RENDER_BUDGET`, and
-/// `LoopPool::plan` has to reproduce that number rather than merely come close
-/// to it — the dispatcher, the store and the readiness check all read the pool
-/// now, and a count one frame different is a rebuild treadmill.
+/// set: the shipped count is the tighter of what the budget admits beside one
+/// live grid and `MAX_LOOP_RENDER_BUDGET`, and `LoopPool::plan` has to
+/// reproduce it rather than merely come close — the dispatcher, the store and
+/// the readiness check all read the pool, and a count one frame different is a
+/// rebuild treadmill.
+///
+/// This is now the **only** statement of the figure. The constant that used to
+/// hold it beside the planner had no runtime consumer and is retired; see
+/// `Arm::volume_loop_frames`.
 #[test]
 fn the_pool_reproduces_the_shipped_3d_frame_count() {
     for arm in arms() {
