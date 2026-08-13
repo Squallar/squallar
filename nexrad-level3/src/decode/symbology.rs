@@ -1,9 +1,65 @@
 //! Decoder for the Symbology Block and its data layers.
 
-use crate::model::{DataLayer, DataPacket, SymbologyBlock};
-use crate::result::Result;
+use crate::model::{DataLayer, DataPacket, LinkedContourPacket, SymbologyBlock};
+use crate::result::{Error, Result};
 
 use super::header::{checked_end, read_i16, read_u16, read_u32};
+
+/// Set Colour Level (packet code 0x0802), ICD 2620001 Figure 3-11a: the code,
+/// a `0x0002` value indicator, then the level. Six bytes, fixed.
+///
+/// Returns the level and the offset after the packet.
+fn decode_contour_colour(data: &[u8], offset: usize) -> Result<(u16, usize)> {
+    let indicator = read_u16(data, offset + 2)?;
+    if indicator != 0x0002 {
+        return Err(Error::InvalidSymbologyBlock(format!(
+            "set-colour packet at offset {offset} has value indicator 0x{indicator:04X}, not 0x0002"
+        )));
+    }
+    Ok((read_u16(data, offset + 4)?, offset + 6))
+}
+
+/// Linked Contour Vector (packet code 0x0E03), ICD 2620001 Figure 3-10.
+///
+/// ```text
+/// HW 1    Packet code (0x0E03)
+/// HW 2    Initial point indicator (0x8000)
+/// HW 3    I of the initial point (signed)
+/// HW 4    J of the initial point (signed)
+/// HW 5    Length of the vectors that follow, in bytes
+/// ...     (I, J) pairs, signed halfwords
+/// ```
+///
+/// The length halfword counts only the chained points, not the initial one —
+/// which is why the initial point is read before it rather than being the
+/// first pair. A byte count that is not a whole number of `(I, J)` pairs is
+/// refused rather than truncated: it means the packet is not this packet, and
+/// half-reading it would leave the rest of the layer misaligned.
+fn decode_linked_contour(data: &[u8], offset: usize) -> Result<(LinkedContourPacket, usize)> {
+    let indicator = read_u16(data, offset + 2)?;
+    if indicator != 0x8000 {
+        return Err(Error::InvalidSymbologyBlock(format!(
+            "linked-contour packet at offset {offset} has initial-point indicator \
+             0x{indicator:04X}, not 0x8000"
+        )));
+    }
+    let start = (read_i16(data, offset + 4)?, read_i16(data, offset + 6)?);
+    let num_bytes = read_u16(data, offset + 8)? as usize;
+    if num_bytes % 4 != 0 {
+        return Err(Error::InvalidSymbologyBlock(format!(
+            "linked-contour packet at offset {offset} declares {num_bytes} bytes of vectors, \
+             which is not a whole number of (I, J) pairs"
+        )));
+    }
+    let body = offset + 10;
+    let end = checked_end(data, body, num_bytes)?;
+    let mut points = Vec::with_capacity(1 + num_bytes / 4);
+    points.push(start);
+    for pair in (body..end).step_by(4) {
+        points.push((read_i16(data, pair)?, read_i16(data, pair + 2)?));
+    }
+    Ok((LinkedContourPacket { points }, end))
+}
 
 /// Decode the Product Symbology Block starting at `offset` in `data`.
 ///
@@ -73,6 +129,18 @@ pub(crate) fn decode_symbology_block(data: &[u8], offset: usize) -> Result<Symbo
                         break;
                     }
                 },
+                // Set Colour Level: the level the contours after it carry.
+                0x0802 => {
+                    let (level, new_offset) = decode_contour_colour(data, o)?;
+                    packets.push(DataPacket::ContourColour(level));
+                    o = new_offset;
+                }
+                // Linked Contour Vector: one polyline.
+                0x0E03 => {
+                    let (contour, new_offset) = decode_linked_contour(data, o)?;
+                    packets.push(DataPacket::LinkedContour(contour));
+                    o = new_offset;
+                }
                 _ => {
                     // No length field to skip by, so abandon the layer.
                     log::warn!(
@@ -106,6 +174,140 @@ pub(crate) fn decode_symbology_block(data: &[u8], offset: usize) -> Result<Symbo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Wrap `packets` in the block and layer headers a real product carries.
+    fn block_of(packets: &[u8]) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&(-1i16).to_be_bytes()); // block divider
+        d.extend_from_slice(&1u16.to_be_bytes()); // block id
+        d.extend_from_slice(&((packets.len() + 10) as u32).to_be_bytes());
+        d.extend_from_slice(&1u16.to_be_bytes()); // one layer
+        d.extend_from_slice(&(-1i16).to_be_bytes()); // layer divider
+        d.extend_from_slice(&(packets.len() as u32).to_be_bytes());
+        d.extend_from_slice(packets);
+        d
+    }
+
+    /// A Set Colour Level packet at `level`, ICD Figure 3-11a.
+    fn colour(level: u16) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&0x0802u16.to_be_bytes());
+        p.extend_from_slice(&0x0002u16.to_be_bytes());
+        p.extend_from_slice(&level.to_be_bytes());
+        p
+    }
+
+    /// A Linked Contour Vector packet: `start` then `chain`, ICD Figure 3-10.
+    fn contour(start: (i16, i16), chain: &[(i16, i16)]) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&0x0E03u16.to_be_bytes());
+        p.extend_from_slice(&0x8000u16.to_be_bytes());
+        p.extend_from_slice(&start.0.to_be_bytes());
+        p.extend_from_slice(&start.1.to_be_bytes());
+        p.extend_from_slice(&((chain.len() * 4) as u16).to_be_bytes());
+        for (i, j) in chain {
+            p.extend_from_slice(&i.to_be_bytes());
+            p.extend_from_slice(&j.to_be_bytes());
+        }
+        p
+    }
+
+    /// The two packets the Melting Layer product is drawn from, in the order
+    /// it writes them, decoded off bytes laid out by hand from the ICD
+    /// figures — so this pins the layout and not our own encoder.
+    #[test]
+    fn a_colour_and_contour_pair_decodes_to_its_level_and_its_points() {
+        let mut packets = colour(3);
+        packets.extend(contour((40, 0), &[(0, 40), (-40, 0), (0, -40), (40, 0)]));
+        // `let ... else` and not `expect`: the crate denies both
+        // `unwrap_used` and `expect_used`, tests included.
+        let Ok(block) = decode_symbology_block(&block_of(&packets), 0) else {
+            panic!("the hand-laid block should decode")
+        };
+
+        assert_eq!(block.layers.len(), 1);
+        assert_eq!(block.layers[0].packets.len(), 2, "both packets are kept");
+
+        let DataPacket::ContourColour(level) = block.layers[0].packets[0] else {
+            panic!("first packet should be the colour level");
+        };
+        assert_eq!(level, 3);
+
+        let DataPacket::LinkedContour(ref c) = block.layers[0].packets[1] else {
+            panic!("second packet should be the contour");
+        };
+        assert_eq!(
+            c.points,
+            vec![(40, 0), (0, 40), (-40, 0), (0, -40), (40, 0)],
+            "the initial point leads the chain",
+        );
+        // 1/4 km screen units, +I east and +J north: a 40-unit ring is 10 km.
+        let km: Vec<(f64, f64)> = c.points_km().collect();
+        assert_eq!(km[0], (10.0, 0.0), "due east");
+        assert_eq!(km[1], (0.0, 10.0), "due north");
+        assert_eq!(km[2], (-10.0, 0.0), "due west");
+        assert_eq!(km[3], (0.0, -10.0), "due south");
+    }
+
+    /// A second contour after the first has to start where the first ended,
+    /// which is what the byte count is for. Two rings in one layer prove the
+    /// decoder advances by exactly the packet's own length.
+    #[test]
+    fn contours_after_the_first_are_found_at_the_right_offset() {
+        let mut packets = colour(1);
+        packets.extend(contour((8, 0), &[(0, 8)]));
+        packets.extend(colour(2));
+        packets.extend(contour((16, 0), &[(0, 16), (-16, 0)]));
+        // `let ... else` and not `expect`: the crate denies both
+        // `unwrap_used` and `expect_used`, tests included.
+        let Ok(block) = decode_symbology_block(&block_of(&packets), 0) else {
+            panic!("the hand-laid block should decode")
+        };
+
+        let contours: Vec<&crate::model::LinkedContourPacket> = block.layers[0]
+            .packets
+            .iter()
+            .filter_map(|p| match p {
+                DataPacket::LinkedContour(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(contours.len(), 2);
+        assert_eq!(contours[0].points, vec![(8, 0), (0, 8)]);
+        assert_eq!(contours[1].points, vec![(16, 0), (0, 16), (-16, 0)]);
+        let levels: Vec<u16> = block.layers[0]
+            .packets
+            .iter()
+            .filter_map(|p| match p {
+                DataPacket::ContourColour(l) => Some(*l),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(levels, vec![1, 2]);
+    }
+
+    /// The two indicator halfwords are the only thing that says a packet is
+    /// the packet its code claims. A wrong one is refused rather than read
+    /// as coordinates, which would silently misplace a contour.
+    #[test]
+    fn a_wrong_indicator_halfword_is_refused() {
+        let mut bad_contour = contour((8, 0), &[(0, 8)]);
+        bad_contour[2..4].copy_from_slice(&0x4000u16.to_be_bytes());
+        assert!(decode_symbology_block(&block_of(&bad_contour), 0).is_err());
+
+        let mut bad_colour = colour(1);
+        bad_colour[2..4].copy_from_slice(&0x0003u16.to_be_bytes());
+        assert!(decode_symbology_block(&block_of(&bad_colour), 0).is_err());
+    }
+
+    /// A byte count that is not a whole number of `(I, J)` pairs cannot be
+    /// this packet; half-reading it would leave the layer misaligned.
+    #[test]
+    fn a_contour_byte_count_that_is_not_whole_pairs_is_refused() {
+        let mut odd = contour((8, 0), &[(0, 8)]);
+        odd[8..10].copy_from_slice(&6u16.to_be_bytes());
+        assert!(decode_symbology_block(&block_of(&odd), 0).is_err());
+    }
 
     /// A one-layer block whose declared layer length is `u32::MAX`. Adding
     /// it to the running offset overflows a 32-bit `usize` (wasm32); on
