@@ -1486,6 +1486,10 @@ fn format_legend_value(product: RadarProduct, value: f32, prefs: &UserPreference
             100 => "HA".into(),
             110 => "LH".into(),
             120 => "GH".into(),
+            // `hc.lgd`'s own displayed code for melting snow. The palette
+            // carries a swatch for the class, so without this arm the bar
+            // would key it with the bare number `130`.
+            130 => "MS".into(),
             140 => "UK".into(),
             150 => "RF".into(),
             _ => format!("{value:.0}"),

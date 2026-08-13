@@ -473,6 +473,30 @@ static MEHS: ColorScale = &(
 
 /// Hydrometeor Classification. Categorical: thresholds are the ICD class
 /// codes, 0 = ND.
+///
+/// **The codes are the RPG's and the colours are ours** — a deliberate split,
+/// recorded here because a silence would read as a failed transcription.
+/// ORPG Build 21.0r1.7 configures product 177 with `legends/hc.lgd` +
+/// `colors/hc_256.plt` (`src/code_util/tsk001/config/prod_config`); of the
+/// fourteen visible classes only HA/100's `#FF0000` coincides with this
+/// table, because these colours are the same authored house ramp that
+/// `ECHO_TOPS`, `VIL`, `VIL_DENSITY`, `POSH`, `MEHS` and `PRECIP_RATE`
+/// share, not a transcription of the RPG's.
+///
+/// **Class 130 (MS, melting snow) is the one exception, and takes the RPG's
+/// own `#9B7850`.** The house ramp has no melting-snow entry to be consistent
+/// with, and omitting the code was worse than either choice: because
+/// [`scale_color`] takes the last stop at or below the value, an MS gate did
+/// not go unpainted — it read as class 120, giant hail. A class this table
+/// does not know must never come out as a *different* class.
+///
+/// The table spans the whole class-code space, not the subset this crate can
+/// currently produce: [`crate::hhc`] composites `crate::hca`'s
+/// `CLASS_EXTERNAL`, which stops at 140, so 110/120/130/150 arrive only from
+/// an RPG-generated object. That is the point — the codes are the product's,
+/// and a code with no stop is a wrong answer waiting for its first gate.
+/// `every_rpg_hydrometeor_class_has_its_own_colour` enumerates `hc.lgd`
+/// against this table so the next hole is caught by construction.
 static HHC: ColorScale = &(
     &[
         (10.0, (128, 128, 128)),  // BI (Biological)
@@ -487,6 +511,7 @@ static HHC: ColorScale = &(
         (100.0, (255, 0, 0)),     // HA (Hail w/ rain)
         (110.0, (200, 0, 0)),     // LH (Large hail)
         (120.0, (255, 200, 200)), // GH (Giant hail)
+        (130.0, (155, 120, 80)),  // MS (Melting snow) — hc_256.plt's own
         (140.0, (200, 200, 200)), // UK (Unknown)
         (150.0, (100, 0, 150)),   // RF (Range folded)
     ],
@@ -710,6 +735,86 @@ mod tests {
                 "{probe} m/s does not paint sw_8.plt level {level}",
             );
         }
+    }
+
+    /// Every hydrometeor class the operational source enumerates has a stop
+    /// of its own, and melting snow is not painted as giant hail.
+    ///
+    /// **Non-circular by construction:** the class list and the melting-snow
+    /// colour below are the RPG's, not ours. ORPG Build 21.0r1.7's
+    /// `src/code_util/tsk001/config/prod_config` configures product 177 —
+    /// this product — as `legends/hc.lgd` + `colors/hc_256.plt`, and product
+    /// 165 the same way. `hc.lgd` lines 4–19 are the class list reproduced
+    /// below, and `hc_256.plt` paints each class across the three data levels
+    /// centred on its code: levels 129–131 carry melting snow's
+    /// `(155, 120, 80)`.
+    ///
+    /// Class 130 had no stop in [`HHC`] until this test was written, and
+    /// because [`scale_color`] takes the last stop at or below the value that
+    /// did not leave an MS gate unpainted — it painted it class 120, giant
+    /// hail. Hence the second half of this test: a class whose colour equals
+    /// the class below it is indistinguishable from a class this table has
+    /// forgotten, so no two may share one.
+    #[test]
+    fn every_rpg_hydrometeor_class_has_its_own_colour() {
+        /// `hc.lgd` lines 4–19, code and displayed code, verbatim.
+        const HC_LGD: [(f32, &str); 16] = [
+            (0.0, "ND"),
+            (10.0, "BI"),
+            (20.0, "GC"),
+            (30.0, "IC"),
+            (40.0, "DS"),
+            (50.0, "WS"),
+            (60.0, "RA"),
+            (70.0, "HR"),
+            (80.0, "BD"),
+            (90.0, "GR"),
+            (100.0, "HA"),
+            (110.0, "LH"),
+            (120.0, "GH"),
+            (130.0, "MS"),
+            (140.0, "UK"),
+            (150.0, "RF"),
+        ];
+        /// `hc_256.plt`, data levels 129–131.
+        const HC_256_MELTING_SNOW: (u8, u8, u8, u8) = (155, 120, 80, TRANSPARENCY);
+
+        let legend = get_legend_scale(RadarProduct::HydrometeorClassification);
+
+        // ND is the below-threshold class; the dispatcher's `< 10` cut paints
+        // it transparent, so it is the one code with no stop.
+        assert_eq!(
+            get_color_for_value(RadarProduct::HydrometeorClassification, 0.0),
+            (0, 0, 0, 0),
+            "hc.lgd's class 0 (ND) is below threshold and must not paint",
+        );
+
+        for &(code, label) in &HC_LGD[1..] {
+            assert!(
+                legend.thresholds.iter().any(|&(t, _)| t == code),
+                "hc.lgd class {code} ({label}) has no stop of its own, so \
+                 scale_color paints it as the class below it",
+            );
+        }
+
+        // The fall-through signature: two classes reading the same colour.
+        for (i, &(code, label)) in HC_LGD[1..].iter().enumerate() {
+            for &(other, other_label) in &HC_LGD[1..][..i] {
+                assert_ne!(
+                    get_color_for_value(RadarProduct::HydrometeorClassification, code),
+                    get_color_for_value(RadarProduct::HydrometeorClassification, other),
+                    "class {code} ({label}) and class {other} ({other_label}) \
+                     paint the same colour",
+                );
+            }
+        }
+
+        // And the class the campaign found, pinned to the source's colour.
+        assert_eq!(
+            get_color_for_value(RadarProduct::HydrometeorClassification, 130.0),
+            HC_256_MELTING_SNOW,
+            "melting snow is not hc_256.plt's melting snow",
+        );
     }
 
     /// ZDR's first stop is a NEG_INFINITY floor; interpolating from it would
