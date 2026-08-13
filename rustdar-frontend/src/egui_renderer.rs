@@ -595,6 +595,16 @@ impl EguiRenderer {
         );
     }
 
+    /// Whether every texel egui handed over for `id` has reached the GPU.
+    ///
+    /// The one question the app asks of the upload machinery — see
+    /// [`texture_upload::TextureUploads::is_delivered`]. Forwarded rather than
+    /// handing out the uploads themselves, because everything else on that type
+    /// is this renderer's own business.
+    pub fn is_delivered(&self, id: egui::TextureId) -> bool {
+        self.uploads.is_delivered(id)
+    }
+
     /// Free textures that are no longer needed.  Call after `queue.submit()`.
     pub fn free_textures(&mut self, ids: &[egui::TextureId]) {
         for id in ids {
