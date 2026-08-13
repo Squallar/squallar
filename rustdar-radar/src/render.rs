@@ -1293,6 +1293,16 @@ pub(crate) fn find_sweep(
 /// carry the moment, which on every well-formed sweep is the first radial.
 /// `a_sweep_whose_leading_radial_is_blank_is_still_found_and_still_framed_by_its_own_reach`
 /// is the guard.
+///
+/// **The two questions do not take the same answer, though.** "Does this sweep
+/// carry the product" is `any`, because one surviving radial is proof that it
+/// does. "Is this the split cut's Doppler half" is not: `any` there lets one
+/// stray velocity radial declare a *surveillance* cut to be the Doppler one,
+/// which hides it from the preference below and drops the request onto the
+/// short cut beside it — 417 km reframed to 88.8 on a TDWR, the same 328 km
+/// move in the same direction as the defect the `any` above fixed. So that one
+/// is [`sweep_carries_velocity`], the sweep's *majority*, for the reason
+/// [`crate::volumetric::sweep_elevation_deg`] is its median.
 pub(crate) fn find_sweep_owner(
     scan: &Scan,
     product: types::RadarProduct,
@@ -1305,7 +1315,7 @@ pub(crate) fn find_sweep_owner(
                 .map(|elevation| {
                     (elevation - f64::from(elevation_angle)).abs() < ELEVATION_WINDOW
                         && radials.iter().any(|r| product.get_moment(r).is_some())
-                        && !(surveillance_only && radials.iter().any(|r| r.velocity().is_some()))
+                        && !(surveillance_only && sweep_carries_velocity(radials))
                 })
                 .unwrap_or(false)
         })
@@ -1317,6 +1327,35 @@ pub(crate) fn find_sweep_owner(
         | types::RadarProduct::StormRelativeVelocity => newest(false),
         _ => newest(true).or_else(|| newest(false)),
     }
+}
+
+/// Whether a sweep is a split cut's **Doppler half** — most of its radials
+/// carry velocity.
+///
+/// A majority rather than `any` or `all`, because the question is about the
+/// sweep and both extremes let one radial decide it:
+///
+/// * `any` lets a single stray velocity radial in a *surveillance* cut declare
+///   it Doppler, which takes it out of [`find_sweep_owner`]'s surveillance
+///   preference and drops a reflectivity request onto the short cut beside it.
+///   Measured on a TDWR-shaped split volume, one contaminated radial out of 360
+///   reframed the pane from 417.0 km to 88.8 km — the same move, in the same
+///   direction, as the blank-leading-radial defect that put `any` here.
+/// * `all` is the mirror of it: one blank radial in a real Doppler half would
+///   leave the half unmarked and the preference would then answer with the
+///   newest cut, which is that same Doppler half.
+///
+/// The majority survives both, and it is the rule
+/// [`crate::volumetric::sweep_elevation_deg`] already applies to the other
+/// per-sweep property this search reads. An empty sweep carries nothing:
+/// `0 > 0` is false.
+///
+/// It costs one pass where `any` short-circuited. That pass is over `Option`
+/// discriminants on a slice this function already walks for its elevation, and
+/// runs once per sweep per sweep-selection, not per gate.
+fn sweep_carries_velocity(radials: &[Radial]) -> bool {
+    let carrying = radials.iter().filter(|r| r.velocity().is_some()).count();
+    carrying * 2 > radials.len()
 }
 
 /// The widest wedge any radial is ever painted at, degrees.

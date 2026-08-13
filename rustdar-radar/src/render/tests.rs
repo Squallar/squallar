@@ -3356,3 +3356,133 @@ fn a_cut_whose_leading_radial_is_blank_is_still_offered_to_the_loop() {
     );
     assert_eq!(find_closest_elevation(&maimed, PRODUCT, 0.8), Some(0.8));
 }
+
+/// A split TDWR-shaped volume: a surveillance half carrying only reflectivity
+/// out to 417 km and a Doppler half carrying both out to 88.8 km, at one
+/// elevation, the Doppler half last. `stray` gives the surveillance half's
+/// *n*-th radial a velocity moment it has no business carrying.
+fn split_volume_with_stray_velocity(stray: Option<usize>) -> Scan {
+    use nexrad_model::data::{MomentData, PulseWidth, RadialStatus, Sweep, VolumeCoveragePattern};
+
+    let refl = |gates: usize, interval_km: f64| {
+        MomentData::from_fixed_point(
+            gates as u16,
+            0,
+            (interval_km * 1000.0) as u16,
+            8,
+            SCALE,
+            OFFSET,
+            vec![200; gates],
+        )
+    };
+    let vel = || {
+        MomentData::from_fixed_point(
+            TDWR_DOPPLER_GATES as u16,
+            0,
+            (TDWR_DOPPLER_GATE_KM * 1000.0) as u16,
+            8,
+            2.0,
+            129.0,
+            vec![200; TDWR_DOPPLER_GATES],
+        )
+    };
+    let half = |number: u8, gates: usize, interval_km: f64, velocity: &dyn Fn(usize) -> bool| {
+        let radials = (0..360)
+            .map(|i| {
+                Radial::new(
+                    0,
+                    i as u16,
+                    i as f32,
+                    1.0,
+                    RadialStatus::IntermediateRadialData,
+                    number,
+                    L2_ELEVATION,
+                    Some(refl(gates, interval_km)),
+                    velocity(i).then(vel),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            })
+            .collect();
+        Sweep::new(number, radials)
+    };
+
+    Scan::new(
+        VolumeCoveragePattern::new(
+            80,
+            0,
+            0.5,
+            PulseWidth::Short,
+            false,
+            0,
+            false,
+            0,
+            false,
+            false,
+            0,
+            false,
+            false,
+            Vec::new(),
+        ),
+        vec![
+            half(1, TDWR_GATES, TDWR_GATE_KM, &|i| stray == Some(i)),
+            half(2, TDWR_DOPPLER_GATES, TDWR_DOPPLER_GATE_KM, &|_| true),
+        ],
+    )
+}
+
+/// One stray velocity radial does not turn a surveillance cut into a Doppler
+/// one, and so does not reframe the reflectivity pane.
+///
+/// The surveillance preference asks whether a sweep is the split cut's Doppler
+/// half. Asked as `any`, one radial out of 360 answered yes for the
+/// surveillance half, the preference then found no surveillance cut at all, and
+/// the fallback handed reflectivity the newest sweep carrying it — the Doppler
+/// half, 88.8 km wide. That is the same 328 km reframing, in the same
+/// direction, as the blank-leading-radial defect the `any` was introduced to
+/// fix, so the question is the sweep's majority.
+///
+/// The blank radial is run at both ends: in front, where a first-radial test
+/// would have been fooled, and in the middle, where an `any` test is.
+#[test]
+fn one_stray_velocity_radial_does_not_reframe_the_reflectivity_pane() {
+    let cos_e = f64::from(L2_ELEVATION).to_radians().cos();
+    let long_range_km = TDWR_GATES as f64 * TDWR_GATE_KM * cos_e;
+
+    for stray in [None, Some(0usize), Some(200)] {
+        let scan = split_volume_with_stray_velocity(stray);
+        let owner = find_sweep_owner(&scan, types::RadarProduct::Reflectivity, L2_ELEVATION)
+            .expect("both halves carry reflectivity");
+        assert_eq!(
+            owner.elevation_number(),
+            1,
+            "stray velocity radial {stray:?} hid the surveillance half",
+        );
+
+        let render = render_radar_to_image(
+            &scan,
+            L2_ELEVATION,
+            types::RadarProduct::Reflectivity,
+            LAT,
+            LON,
+        )
+        .expect("the surveillance half renders");
+        assert!(
+            (render.max_range_km - long_range_km).abs() < 1e-9,
+            "stray velocity radial {stray:?} reframed the pane at {} km \
+             instead of {long_range_km:.5} km",
+            render.max_range_km,
+        );
+    }
+
+    // And the Doppler half is still recognised as one: a velocity request
+    // reaches it, framed at its own much shorter reach.
+    let scan = split_volume_with_stray_velocity(Some(200));
+    let vel = render_radar_to_image(&scan, L2_ELEVATION, types::RadarProduct::Velocity, LAT, LON)
+        .expect("the Doppler half carries velocity");
+    let doppler_km = TDWR_DOPPLER_GATES as f64 * TDWR_DOPPLER_GATE_KM * cos_e;
+    assert!((vel.max_range_km - doppler_km).abs() < 1e-9);
+}
