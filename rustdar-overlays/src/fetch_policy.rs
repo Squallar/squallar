@@ -626,6 +626,14 @@ pub struct Whole;
 /// A layer that declares this shape gets `set_data_with_coverage` and nothing
 /// else, so the report is not something it can forget: there is no other way to
 /// put data on its map.
+///
+/// **A shape is not a fault rate.** The alerts entry above has since had both
+/// of its real causes closed — they were the parser's and the simplifier's, not
+/// the origin's, and the transport failure count across the whole zone corpus
+/// measured zero — and the layer stays assembled, because what this axis asks
+/// is whether a part *can* fail on its own and not whether one did last
+/// Tuesday. The argument in full is on `NwsAlertFetchResult`, at the
+/// declaration a reader would be about to delete.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Assembled;
 
