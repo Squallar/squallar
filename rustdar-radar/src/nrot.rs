@@ -227,7 +227,7 @@ const MIN_RANGE_NM: f64 = 7.05;
 ///                Vny   this module   agreeing   reference   precision   refused
 ///     KTLX     11.49          1640        730        3546      0.4451       910
 ///     KHNX     11.66             0          0         252           —         0
-///     KCRP     31.52           941        905        4357      0.9617        36
+///     KCRP     31.52           935        905        4357      0.9679        30
 ///     KDMX     27.93          1453       1107        2564      0.7619       346
 ///     KFTG     24.01           903        758        1668      0.8394       145
 ///     KATX     25.32           469        432         840      0.9211        37
@@ -236,24 +236,31 @@ const MIN_RANGE_NM: f64 = 7.05;
 ///     KDDC     25.84          2731       2161        5823      0.7913       570
 /// ```
 ///
-/// KCRP's 36 average |0.729|. **Four of them are the only bins over |2.0| that
-/// the reference refuses at any of the nine sites**, and they are one cluster
-/// — az 72.72° to 74.21°, 9.52 to 9.65 nm — reaching 4.776, which is also the
-/// largest magnitude this module reports anywhere on any of the nine cuts. The
-/// second largest anywhere is 2.14. **Nothing reaches the [`NROT_LIMIT`] clamp
-/// on any of them**, so the question of what the reference does at its own
-/// ceiling is now about a branch this corpus does not exercise. It does the
-/// same thing: hovered on the KCRP cut, GR2Analyst's Product Details panel
-/// reports a minimum of −5.00 and a maximum of +5.00.
+/// KCRP's 30 average |0.281|, and **nothing this module reports anywhere on
+/// any of the nine cuts exceeds |2.2|** — the largest is 2.1445. **Nothing
+/// reaches the [`NROT_LIMIT`] clamp on any of them**, so the question of what
+/// the reference does at its own ceiling is now about a branch this corpus does
+/// not exercise. It does the same thing: hovered on the KCRP cut, GR2Analyst's
+/// Product Details panel reports a minimum of −5.00 and a maximum of +5.00.
 ///
-/// The four are not the mechanism [`CENSOR_VNY_FRAC`] describes — that one is
-/// gone from this cut entirely, along with the last refused bin. They are
+/// # The cluster that used to sit at the top of that column
+///
+/// The row above read 941/905/0.9617 with 36 refused until
+/// [`MEDIAN_MIN_DEALIASED_OCC`] landed, and four of those 36 were the only bins
+/// over |2.0| the reference refused at any of the nine sites: one cluster, az
+/// 72.72° to 74.21°, 9.52 to 9.65 nm, reaching **4.776**. That figure is the
+/// pre-[`MEDIAN_MIN_DEALIASED_OCC`] state and survives here only as the
+/// motivating defect — its own record carries the move, 4.7759 → 2.1445.
+///
+/// The four were never the mechanism [`CENSOR_VNY_FRAC`] describes — that one
+/// is gone from this cut entirely, along with the last refused bin. They were
 /// [`median_filter`]'s: the wind there sits at the fold, the raw sweep is a
 /// ±30 checkerboard against a declared 31.52, the fold censor cuts it to a
-/// filament and the median then returns **0.00** at a bin whose dealiased
+/// filament and the median then returned **0.00** at a bin whose dealiased
 /// value is **+30.00**, from a window holding {31, 30, −31, 30, 30, 0, −30,
 /// −30, 0}. The operator differentiates that. GR2Analyst hovered at that bin
-/// reads **+0.18**.
+/// reads **+0.18**. [`MEDIAN_MIN_DEALIASED_OCC`] is the floor that refuses such
+/// a window a median at all, and it takes all four.
 ///
 /// Three guards against it were measured — refuse a median window spanning
 /// more than k·Vny, one whose sorted values leave a k·Vny gap, one that moves
