@@ -308,11 +308,20 @@ impl SpcOutlookHandler {
     /// simply not there: the layer is updating, and what a user needs is which
     /// product they are not looking at. The row names all four.
     ///
-    /// So a product counts as missing here only when it has **nothing drawn**.
-    /// One that failed this round while its previous outlook is still on the
-    /// map is drawn and stale, which is precisely what the health axis already
-    /// says; counting it on both would put two marks on the row for one fault
-    /// and make neither mean anything.
+    /// So a product counts as missing here only when **it has never answered
+    /// for this day** — `state.data` has no entry for it. One that failed this
+    /// round while its previous outlook is still there is drawn and stale,
+    /// which is precisely what the health axis already says; counting it on
+    /// both would put two marks on the row for one fault and make neither mean
+    /// anything.
+    ///
+    /// Entry presence, not `!features.is_empty()`, and that difference is
+    /// deliberate: SPC publishing a product with no risk areas is an answer,
+    /// and the empty map it produces is the **right** map. Marking it would put
+    /// a fault on the row of a layer drawing exactly what was issued, which is
+    /// the same argument [`Absent`] gets below. It is also the reading
+    /// [`round_verdict`](Self::round_verdict)'s `drew` takes, and the two must
+    /// agree or the layer would call one round both complete and empty.
     ///
     /// A product with no failure on file and nothing in `state.data` is not
     /// missing either — it has not been asked yet, which is the same reading
@@ -392,18 +401,31 @@ impl SpcOutlookHandler {
                 );
                 self.state.retry.record_failure(&merged);
             }
-            return;
-        }
-        match self.round_verdict() {
-            RoundVerdict::Failed(e) | RoundVerdict::NotPublished(e) => {
-                self.state.retry.record_failure(&e);
+        } else {
+            match self.round_verdict() {
+                RoundVerdict::Failed(e) | RoundVerdict::NotPublished(e) => {
+                    self.state.retry.record_failure(&e);
+                }
+                RoundVerdict::Clear => self.state.retry.record_success(),
             }
-            RoundVerdict::Clear => self.state.retry.record_success(),
         }
         // The other axis, written in the same one-writing-per-round, and the
         // half this layer never had: the verdict above says whether the round
         // completed, and this says which of the products the row is naming are
         // not on the map.
+        //
+        // Filed on **every** ending, including the round that answered nothing
+        // in scope, which is the one place the verdict above cannot be written.
+        // A user can untick the product that failed, or leave its day, while
+        // its request is still on the wire: the selection change defers to this
+        // round (`refile_after_selection_change` returns while `outstanding` is
+        // non-zero), and then this round answers nothing it is still asked
+        // about. Skipping the report here left `missing 1 of 2 outlook
+        // products` in the options panel of a layer with that product no longer
+        // ticked — the stuck mark this file already has one function for, on
+        // the axis that function does not write. Safe because
+        // [`round_coverage`](Self::round_coverage) is derived from the
+        // selection as it stands now, not from anything this round did.
         let coverage = self.round_coverage();
         self.state.record_coverage(coverage);
     }
@@ -1567,8 +1589,11 @@ mod tests {
             );
         }
 
-        // A product that failed while its **previous** outlook is still drawn
-        // is stale, not missing, and must not be counted on both axes.
+        // A product that failed while its **previous** outlook is still on
+        // file is stale, not missing, and must not be counted on both axes.
+        // `outlook()` builds an outlook with no features, which is the harder
+        // half of that rule on purpose: a product SPC published with no risk
+        // areas has answered, and the empty map it produces is the right map.
         let mut drawn = four_product_handler();
         round(
             &mut drawn,
@@ -1594,8 +1619,8 @@ mod tests {
         );
         assert!(
             !drawn.state.retry.is_incomplete(),
-            "the previous tornado outlook is still on the map, which is stale \
-             and is what the health axis is for",
+            "the tornado product has answered for this day and what it \
+             answered is stale, which is what the health axis is for",
         );
 
         // Unticking the product that would not load leaves the layer drawing
@@ -1604,6 +1629,58 @@ mod tests {
         assert!(
             !h.state.retry.is_incomplete(),
             "the mark outlived the selection it was about",
+        );
+    }
+
+    /// **The round that answers nothing it is still asked about.**
+    ///
+    /// A selection change while a round is in flight defers to that round —
+    /// `refile_after_selection_change` returns on `outstanding > 0` — and the
+    /// round then lands entirely out of scope, so `file_round_verdict` takes
+    /// its `!answered` path. That path files a stray failure and used to file
+    /// nothing else, which left the previous round's coverage report standing
+    /// about products nobody is asking for any more: `missing 1 of 2 outlook
+    /// products: Tornado` in the options panel of a layer with no product
+    /// ticked at all.
+    ///
+    /// The same stuck mark `refile_after_selection_change` was written for, on
+    /// the axis it does not write, which is why the report is filed on **every**
+    /// ending of a round and not only on the ones that answered.
+    #[test]
+    fn a_round_that_lands_wholly_out_of_scope_still_retires_its_coverage_report() {
+        use OutlookProduct::{Categorical, Tornado};
+        let mut h = SpcOutlookHandler::new();
+        h.enabled_products.insert(Categorical);
+        h.enabled_products.insert(Tornado);
+        round(
+            &mut h,
+            vec![
+                (Categorical, Ok(outlook(Categorical))),
+                (Tornado, Err(transient())),
+            ],
+        );
+        assert!(
+            h.state.retry.is_incomplete(),
+            "premise: the tornado outlook did not load and is on no map",
+        );
+
+        // A second round goes out, and the user unticks both products while it
+        // is on the wire. Nothing the round is about is asked for any more.
+        h.set_fetching(true);
+        assert_eq!(toggle(&mut h, "tor", false), ControlEffect::None);
+        assert_eq!(toggle(&mut h, "cat", false), ControlEffect::None);
+        land(&mut h, Categorical, Ok(outlook(Categorical)));
+        land(&mut h, Tornado, Err(transient()));
+
+        assert!(
+            !h.state.retry.is_incomplete(),
+            "the layer asks for no product at all and its options still name \
+             one as missing from the map",
+        );
+        assert_eq!(
+            h.state.retry.coverage().status_note(),
+            None,
+            "a report about a selection that no longer exists",
         );
     }
 

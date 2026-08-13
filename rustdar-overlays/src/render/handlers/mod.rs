@@ -127,14 +127,17 @@ mod round_delivery_tests {
                 continue;
             };
             checked += 1;
-            assert!(
-                !body.contains(".downcast::<"),
-                "the {name} handler downcasts its own fetch result. That skips \
-                 `OverlayState::downcast_round`, which is the only place the \
-                 round type's declared shape is checked against the layer's — \
-                 and skipping it is how a round assembled from several requests \
-                 gets its `set_data` back",
-            );
+            for spelling in [".downcast::<", ".downcast_ref::<", ".downcast_mut::<"] {
+                assert!(
+                    !body.contains(spelling),
+                    "the {name} handler reaches for `{spelling}` on its own \
+                     fetch result. That skips `OverlayState::downcast_round`, \
+                     which is the only place the round type's declared shape is \
+                     checked against the layer's — and skipping it is how a \
+                     round assembled from several requests gets its `set_data` \
+                     back",
+                );
+            }
             assert!(
                 body.contains("downcast_round::<"),
                 "the {name} handler has an `apply_fetch_result` that takes \
