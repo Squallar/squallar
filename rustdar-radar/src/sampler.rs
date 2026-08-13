@@ -527,6 +527,50 @@ impl Blend {
 /// interpolate across them. One floor: two copies could drift, and the drift
 /// would show up as a section and a plan view taking different views of the
 /// same pair of gates, with nothing anywhere reporting a disagreement.
+///
+/// # The margin, measured on 208 volumes rather than ten
+///
+/// The paragraph above rests on a ten-volume control. The corpus sweep on
+/// branch `campaign-harness` re-reads it over the 208-volume, 17-site corpus
+/// registered for `SEAM_PROXIMITY_ACROSS_TILTS`. **That measurement is not in
+/// this tree and cannot be** — it needs the archive volumes on disk — so the
+/// figures below are the record of a run rather than a standing guard, and the
+/// apparatus is named so the run can be repeated rather than trusted. It
+/// sorts
+/// every sweep's declared Nyquist by whether that sweep carries a velocity
+/// moment at all. It replicates, and it is worse than "thin":
+///
+/// | | sweeps | min | median | max | under 8.00 |
+/// |---|---|---|---|---|---|
+/// | velocity-bearing (arb / holdout) | 1102 / 951 | **12.37** / **12.37** | 26.38 / 26.24 | 35.55 / 35.55 | 0 / 0 |
+/// | no velocity moment | 372 / 340 | **8.33** / **8.32** | 8.90 / 8.90 | 9.68 / 9.68 | 0 / 0 |
+///
+/// Two facts, and they pull in opposite directions.
+///
+/// **The floor is comfortable where it is asked.** The slowest declaration on
+/// any velocity-bearing sweep in the corpus is 12.37 m/s — 4.37 m/s of
+/// headroom, not the 0.27 the surveillance figures suggest — and nothing
+/// anywhere declared under 8.00. Every rung this constant actually bounds sits
+/// well clear of it, at all 17 sites.
+///
+/// **The exposed band is not an edge case; it is a census.** *Every one* of
+/// the 712 non-velocity sweeps — 372 of 372 and 340 of 340, at all 17 sites,
+/// on every date — declares inside `[8.32, 9.68]`. There is no site where the
+/// surveillance half declares safely, and no volume without one. The worst
+/// single readings are KRLX cut #1 at 0.48° declaring **8.32 m/s** and KABX
+/// cut #1 at 0.48° declaring **8.33** — a **16.64 m/s fold interval laid over
+/// a field that never wraps**, if either were ever routed to a rung.
+///
+/// So the shape of the risk is now exact. This is not a constant that would be
+/// wrong for a few unlucky volumes under a routing change; it is one that
+/// would be wrong for **the lowest cut of essentially every WSR-88D volume in
+/// the archive**, and the 0.32 m/s between the floor and the nearest real
+/// declaration means raising the floor cannot fix it either. The whole defence
+/// is [`Blend::folds_at_measured_limit`]'s restriction to velocity and the
+/// per-sweep keying in [`Rung::fold_limit_ms`]. Those two are load-bearing
+/// safety properties, not conveniences, and **`crate::nrot::fold_limit_ms`
+/// inherits exactly the same exposure through the same shared floor** — a
+/// change on either side of that `pub(crate)` arms both paths at once.
 pub(crate) const FOLD_LIMIT_FLOOR_MS: f64 = 8.0;
 
 /// One rung of the tilt ladder: the sweep that won its cut, indexed for random
@@ -1698,14 +1742,14 @@ fn estimate_fold_limit(radials: &[Radial], slot: MomentSlot) -> Option<f64> {
 /// oracle-confirmed folds (now averaged across the seam — given up) and
 /// oracle-confirmed shear (no longer refused — won). The fraction stops
 /// earning at the step where the band's confirmed shear stops outnumbering
-/// its confirmed folds — where that ratio crosses 1. Swept by `seam_probe`
-/// over its arbitration corpus — 56 VCP 31 volumes over 22 sites and eight
+/// its confirmed folds — where that ratio crosses 1. Swept by the corpus
+/// apparatus on branch `campaign-harness` over its arbitration corpus — 56 VCP 31 volumes over 22 sites and eight
 /// dates, VCP 31 being the only operational pattern that puts the seam at
 /// 11–12.5 m/s — the quad bands cross between 0.55 and 0.65, so `0.60`. The
 /// KILN holdout, a site the arbitration never saw, measured once and
 /// afterwards, reproduces the crossing to within one band; the seven-volume
 /// storm control and the VCP 32/35 mid-Nyquist control are recorded with the
-/// corpus in `seam_probe`'s module doc.
+/// corpus on that branch.
 ///
 /// # What the shipped point costs
 ///
@@ -1725,7 +1769,8 @@ fn estimate_fold_limit(radials: &[Radial], slot: MomentSlot) -> Option<f64> {
 ///
 /// The oracle those bands were counted against abstains where the decision
 /// is hard and, worse, is *wrong* in a direction that depends on the path.
-/// `seam_truth` re-scores both paths against labelled ground truth — sweeps
+/// `seam_truth` — the corpus instrument on branch `campaign-harness`, not in
+/// this tree — re-scores both paths against labelled ground truth: it sweeps
 /// the declared Nyquist says never wrapped, re-folded at a real VCP 31 seam
 /// with the RDA's own arithmetic, so every pair's answer is known. Of the
 /// oracle's `Smooth` verdicts on **quads**, 7.4% (arbitration) and 12.1%
@@ -1753,6 +1798,44 @@ fn estimate_fold_limit(radials: &[Radial], slot: MomentSlot) -> Option<f64> {
 /// in one pass would also confound the two paths' evidence, which is the
 /// mistake the split exists to prevent. A low-base-rate labelled quad
 /// holdout is what would settle it.
+///
+/// # The low-base-rate quad holdout now exists, and it moves this number up
+///
+/// The fresh corpus described on [`SEAM_PROXIMITY_ACROSS_TILTS`] — 18 sites
+/// and four dates disjoint from every corpus above, registered before
+/// fetching — carries quad base rates of **54.5%** and **26.7%**, against the
+/// 64% and 69% here. That is the missing stratum, and it confirms the
+/// suspicion this text records rather than overturning it: the 1:1 crossing is
+/// a **function of the base rate**, not of the guard.
+///
+/// | corpus | quad base rate | 1:1 crossing | err argmin |
+/// |---|---|---|---|
+/// | shipped arbitration | 64% | 0.25–0.30 | — |
+/// | shipped holdout | 69% | 0.25–0.30 | — |
+/// | fresh arbitration | 54.5% | 0.40–0.45 | 0.40 |
+/// | fresh holdout | 26.7% | 0.45–0.50 | 0.45 |
+/// | KILN (oracle-era) | 12% | — | 0.45–0.50 |
+///
+/// Five populations, monotone — and the relationship is pinned in this tree by
+/// `the_break_even_moves_up_as_folds_get_rarer`, which needs no corpus because
+/// the effect is arithmetic. So "the labelled bands cross between 0.25 and
+/// 0.30" was never a statement about where this line belongs; it was a
+/// statement about how fold-rich those two corpora were. **The reason given
+/// above for not moving this number was the right reason, and the evidence
+/// that would have moved it does not exist.**
+///
+/// It does not, however, reach `0.60`. Even at a 12–27% base rate the labelled
+/// break-even sits near `0.45–0.50`, so this constant remains roughly one to
+/// three grid steps above where the labelled evidence puts it. What that costs
+/// is small and is now measured on a disjoint corpus: at `0.60` quad recall is
+/// **90.6%** (fresh arbitration) and **78.4%** (fresh holdout) against 93.5%
+/// and 85.1% at `0.50`, for a false-fire rate of **0.544%** and **0.863%**
+/// against 1.085% and 1.811%. The 86–90% recall quoted above replicates on a
+/// fold-rich half and **does not** on a fold-poor one, which is the same
+/// lesson the vertical table teaches: these percentages are corpus
+/// properties. The trade at the shipped point is still a defensible one and
+/// the number is left where it is, now with a reason that survives its own
+/// evidence.
 const SEAM_PROXIMITY_ACROSS_GATES: f64 = 0.60;
 
 /// How near the seam both rungs must sit before a straddle between adjacent
@@ -1903,6 +1986,154 @@ const SEAM_PROXIMITY_ACROSS_GATES: f64 = 0.60;
 /// The older KILN-holdout figure this replaces — rung recall 63.06% at
 /// `0.67` — was scored against the oracle, not against a label, and is kept
 /// out of the table above for that reason.
+///
+/// # Where the evidence for this number lives, at two levels of effort
+///
+/// * **In this tree, on every build** — `sampler::seam_fixture` scores the
+///   shipped rule against labelled truth on a generated population. It runs in
+///   milliseconds, is not `#[ignore]`d, and pins the *structure* the argument
+///   below depends on: that the fraction trades recall against false fires in
+///   one direction, that the break-even moves up as folds get rarer, that
+///   recall collapses once the pair's own true change reaches the guard's
+///   line, and what both shipped fractions produce on that fixture. Moving
+///   either constant one grid step fails it.
+/// * **On branch `campaign-harness`** — the corpus apparatus: the fetch, the
+///   labelling machinery, and the 208-volume sweep that produced every
+///   percentage below. That is where the cost *on real weather* is measured,
+///   and it needs a corpus on disk.
+///
+/// The fixture cannot say what the guard costs on weather and the sweep cannot
+/// run in CI, so neither is redundant. What follows is the sweep's.
+///
+/// # Replicated on a fresh corpus, and what the replication changed
+///
+/// The corpora above are not reproducible from this tree. A third was built to
+/// be **site-disjoint and date-disjoint from both** — 18 sites and four 2025
+/// dates registered in writing before the first volume was fetched, 208
+/// volumes held, 97 contributing — and run through the same `seam_truth`
+/// labelling with nothing re-tuned. It splits into a fold-rich half and, for
+/// the first time, **the low-base-rate labelled corpus the text above says
+/// would settle this and had never been built**.
+///
+/// | corpus | rung base rate | recall @ 0.50 | false-fire @ 0.50 |
+/// |---|---|---|---|
+/// | shipped arbitration | 47.9% | 65.0% | 5.26% |
+/// | shipped holdout | 63.8% | 70.2% | 7.70% |
+/// | **fresh arbitration** | **48.1%** | **58.9%** | **2.98%** |
+/// | **fresh holdout** | **10.9%** | **27.9%** | **0.92%** |
+///
+/// At a base rate matched to the shipped arbitration corpus almost exactly —
+/// 48.1% against 47.9% — recall lands 6.1 points low and false-fire 2.28
+/// points low, both about one corpus-to-corpus spread from the figures above.
+/// The table is **substantially replicated and not exactly reproduced**, and
+/// the residual has a visible cause: recall on this path is strongly
+/// height-dependent (below) and the two corpora do not share a height
+/// distribution. **The honest reading is that 65.0–70.2% is not a property of
+/// this constant. It is a property of a corpus, and it should be read as an
+/// order of magnitude rather than as a figure.**
+///
+/// **And the residual has a known sign.** Source sweeps are rougher than the
+/// population this guard governs — mean adjacent-gate step 1.069 m/s against
+/// the governed 0.479 on the fresh arbitration half, 1.479 against 0.851 on
+/// the holdout — so `SEAM_MAX_STEP` was used to walk the source population
+/// towards the governed one:
+///
+/// | roughness ceiling | volumes | rung base rate | recall @ 0.50 |
+/// |---|---|---|---|
+/// | unbounded (mean 1.069) | 43 | 48.1% | 58.9% |
+/// | 0.90 m/s | 5 | 57.3% | 64.6% |
+/// | 0.70 m/s | 2 | 60.8% | 80.5% |
+/// | 0.479 m/s (the governed mean) | **0** | — | — |
+///
+/// Recall rises monotonically as the sources approach the field this guard
+/// actually runs on, and the matched stratum is **empty** — no source sweep in
+/// 208 is as smooth as the governed population's mean, which is the same wall
+/// the module doc records for the VCP 31 stratum. So the "recalls are
+/// pessimistic" claim above is confirmed with a direction and a slope, on two
+/// to five volumes rather than none: the operational recall of this guard is
+/// **higher than any figure in either table**, and 58.9% is a floor rather
+/// than an estimate. The confound is bounded, not removed.
+///
+/// What the fresh corpus does settle is the number itself. Scoring the
+/// marginal bands the way the text above does, the 1:1 crossing moves
+/// monotonically with the fold base rate, on both paths:
+///
+/// | corpus | path | base rate | 1:1 crossing | err argmin |
+/// |---|---|---|---|---|
+/// | fresh arbitration | rungs | 48.1% | 0.30–0.35 | 0.25 (grid floor) |
+/// | **fresh holdout** | **rungs** | **10.9%** | **0.50–0.55** | **0.40** |
+/// | fresh arbitration | quads | 54.5% | 0.40–0.45 | 0.40 |
+/// | fresh holdout | quads | 26.7% | 0.45–0.50 | 0.45 |
+///
+/// So the argument above — that a fold-rich population pulls the error minimum
+/// down and therefore cannot arbitrate — is no longer only plausible, it is
+/// measured: at a 10.9% base rate the argmin lifts off the grid floor to an
+/// interior `0.40`, and the vertical break-even lands **on the shipped
+/// fraction**. `0.50` was kept as a floor taken from the rule's own algebra
+/// rather than from a fold-rich argmin, and a corpus with an operational base
+/// rate independently puts the break-even there. **The constant is right, and
+/// now for a second and unrelated reason.** The base-rate relationship itself
+/// is arithmetic rather than weather, so it is pinned in this tree too, by
+/// `the_break_even_moves_up_as_folds_get_rarer`.
+///
+/// # Where this guard fails, and what it shares with the dealiaser
+///
+/// Scored in strata of the pair's mid-beam height on the fresh arbitration
+/// half — the axis the dealiaser's own recovery failure organises on:
+///
+/// | mid-beam height | candidates | recall @ 0.50 | mean true \|Δv\| |
+/// |---|---|---|---|
+/// | 0–1 km | 13 297 | 37.2% | 1.47 m/s |
+/// | 1–2 km | 9 390 | 62.9% | 1.67 |
+/// | 2–4 km | 8 819 | 80.0% | 1.89 |
+/// | 4–6 km | 9 716 | 73.5% | 2.78 |
+/// | **6–8 km** | 7 290 | **46.8%** | **5.39** |
+/// | 8–11 km | 7 379 | 39.9% | 5.79 |
+/// | 11+ km | 1 301 | 27.3% | 7.95 |
+///
+/// Binned by **slant range** instead, over the same candidates, recall reads
+/// 55.3 / 66.9 / 54.4 / 52.8 / 52.0 / 56.7 / 48.0% across 0–20 … 125+ km — a
+/// 19-point spread with no trend, against a 53-point spread that falls
+/// monotonically from 4 km up. **Height is the organising axis; range is
+/// not**, and the control is what makes that a finding rather than a
+/// coincidence of two correlated variables.
+///
+/// The mechanism is the last column, and it is this constant's own premise
+/// failing. [`straddles_fold`] assumes the pair's true change is small next to
+/// the Nyquist interval. At `f = 0.50` against the corpus's 11.50 m/s seam the
+/// guard's line sits at 5.75 m/s, and the mean *true* change between adjacent
+/// rungs reaches **5.39 m/s in the 6–8 km stratum** — 47% of the interval,
+/// which is the line itself. Recall collapses exactly where the premise does,
+/// and `recall_falls_away_as_the_true_change_reaches_the_guards_own_line` pins
+/// that mechanism in this tree without needing a volume.
+/// Moving the fraction cannot repair it: bringing the line in far enough to
+/// catch those folds catches the real shear with them, which is what that
+/// stratum's false-fire rate — 7.14%, the corpus maximum — already shows.
+///
+/// **This is why this guard and the dealiaser fail together without either
+/// feeding the other.** That the two are disconnected is checkable rather than
+/// asserted, in three steps that between them close the path:
+///
+/// 1. `crate::nrot::dealias` takes `&mut [Vec<f64>]` — a bare velocity grid —
+///    and returns no [`Scan`]. Its output cannot become a sweep, so it cannot
+///    reach a [`VolumeSampler`] by that route at all.
+/// 2. The only scans in the crate carrying post-dealias content are
+///    `crate::derive`'s synthetic ones, and `synth_sweep` tags every one of
+///    them `NormalizedRotation`, `StormRelativeVelocity` or
+///    `SpecificDifferentialPhase`. **`RadarProduct::Velocity` is never a
+///    derived product** — the string does not appear in that module.
+/// 3. [`Blend::folds_at_measured_limit`] arms this guard for
+///    `RadarProduct::Velocity` and nothing else.
+///
+/// So the field this guard runs on is the archive's own folded velocity
+/// moment, every time, and a dealiaser fix cannot reach it. The shared failure
+/// is
+/// therefore not a dependency but a shared cause — above 6–8 km the real
+/// velocity change between adjacent measurement heights becomes comparable to
+/// the Nyquist interval, and every method that resolves the ambiguity by
+/// assuming vertical continuity loses its footing at the same place. The
+/// relationship is **independent code paths, one common cause**, on the same
+/// axis with the same knee. A repair to one will not move the other.
 const SEAM_PROXIMITY_ACROSS_TILTS: f64 = 0.50;
 
 /// Which adjacency a velocity blend spans, carrying the fold limit its guard
@@ -1957,7 +2188,10 @@ enum Seam {
 /// # What the fractions buy, and what they do not
 ///
 /// The recall, false-fire and per-band numbers live with the constants, and
-/// the instrument that measured them is `seam_probe`. An earlier version of
+/// two instruments measured them: `sampler::seam_fixture` in this tree, which
+/// scores this function against labelled truth on every build, and the corpus
+/// apparatus on branch `campaign-harness`, which does it on archive volumes.
+/// An earlier version of
 /// this comment carried a was→now fire table over a fourteen-volume mixed
 /// corpus and two claims measured at the first shipped fraction — `0.5` on
 /// both paths: that neither the old rule nor this one ever fires on a pair
@@ -2097,3 +2331,6 @@ fn blend(kind: Blend, corners: &[Sample], weights: &[f64], seam: Option<Seam>) -
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod seam_fixture;
