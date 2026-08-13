@@ -39,7 +39,7 @@
 //! | tier | was | now | |
 //! |---|---|---|---|
 //! | web | 2.0–2.3 ms | 4.6–4.7 ms | 128×128×64 → 256×256×16 |
-//! | mobile | 4.1–4.2 ms | 7.7–7.8 ms | 192×192×96 → 320×320×34 |
+//! | mobile | 4.1–4.2 ms | 7.7–7.8 ms | 192×192×96 → 320×320×32 |
 //! | desktop | 7.9–8.3 ms | 18.2–18.4 ms | 256×256×128 → 512×512×32 |
 //!
 //! So **about 2.2×**, not the 4× the column arithmetic on its own suggests.
@@ -977,6 +977,36 @@ pub const NZ_MIN: usize = 16;
 /// the one most of the uploads in this codebase read as taking.
 pub const HORIZONTAL_AXIS_MULTIPLE: usize = 64;
 
+/// What the vertical axis is held to a multiple of, in cells.
+///
+/// # Derived from the allocation, not chosen
+///
+/// [`HORIZONTAL_AXIS_MULTIPLE`]'s twin, one step further in: that one is about
+/// the *copy* into the texture, this one is about the texture itself. A 3D
+/// texture is laid out block-linearly and the depth of the block is 16 layers,
+/// so an `nz` that is not a multiple of it is rounded up to one and the
+/// rounding is allocated. Measured through
+/// `wgpu::Device::generate_allocator_report` on an NVIDIA RTX 3090 (Vulkan,
+/// driver 610.57.04) by sweeping the depth of a 320x320 `Rg16Float` image one
+/// layer at a time: 17 is laid out as 32, 33 as 48, 49 as 64, 65 as 80.
+///
+/// **The cost of ignoring it is a budget overrun, silently.** [`spend_budget`]
+/// puts whatever the horizontal alignment and the device cap left over back
+/// into the vertical, and on the mobile tier that produced `320 x 320 x 34`:
+/// two layers of extra picture bought with fourteen layers of memory, **+41% on
+/// mip 0**, taking a grid budgeted at 20 MiB to a measured 23.18 MiB. The
+/// horizontal cannot reach an unaligned value -- 64 is four of these -- so the
+/// vertical is the only axis the leftover-spending step can spoil.
+///
+/// `rustdar_frontend`'s `the_vertical_axis_multiple_is_the_texture_depth_block`
+/// is the other end, where this number is tied to the layout arithmetic the
+/// frontend charges against, since only that crate has `wgpu` to ask.
+///
+/// Both [`NZ_PREFERRED`] and [`NZ_MIN`] are already multiples of this, so
+/// neither rung's derivation changes; what changes is only what the leftover
+/// may be spent on.
+pub const VERTICAL_AXIS_MULTIPLE: usize = 16;
+
 /// The grid to build for the tier `shipped` names, on a device whose 3D
 /// textures may be `max_axis` on a side.
 ///
@@ -998,16 +1028,20 @@ pub const HORIZONTAL_AXIS_MULTIPLE: usize = 64;
 /// spent.
 ///
 /// So, twice: **maximise the horizontal axis subject to `nx² · nz ≤` the cell
-/// budget, `nx` a multiple of [`HORIZONTAL_AXIS_MULTIPLE`], and every axis
-/// `≤ max_axis`** — once at [`NZ_PREFERRED`] and, if that does not leave the
-/// horizontal strictly finer than the tier already had, again at [`NZ_MIN`].
-/// **Prefer the smoother vertical, but never at the cost of a horizontal
-/// regression.**
+/// budget, `nx` a multiple of [`HORIZONTAL_AXIS_MULTIPLE`], `nz` a multiple of
+/// [`VERTICAL_AXIS_MULTIPLE`], and every axis `≤ max_axis`** — once at
+/// [`NZ_PREFERRED`] and, if that does not leave the horizontal strictly finer
+/// than the tier already had, again at [`NZ_MIN`]. **Prefer the smoother
+/// vertical, but never at the cost of a horizontal regression.**
+///
+/// The budget is therefore not always spent to the last cell, and the mobile
+/// row below is where that shows: the leftover buys 34 layers and only 32 of
+/// them are free. See [`VERTICAL_AXIS_MULTIPLE`] for what the other two cost.
 ///
 /// | tier | budget | shape | horizontal | vertical | budget spent |
 /// |---|---|---|---|---|---|
 /// | [`DESKTOP_SHAPE`] | 8,388,608 | 512 × 512 × 32 | **1.797 km** | 0.5625 km | 100% |
-/// | [`MOBILE_SHAPE`] | 3,538,944 | 320 × 320 × 34 | **2.876 km** | 0.529 km | 98.4% |
+/// | [`MOBILE_SHAPE`] | 3,538,944 | 320 × 320 × 32 | **2.876 km** | 0.5625 km | 92.6% |
 /// | [`WASM_SHAPE`] | 1,048,576 | 256 × 256 × 16 | **3.595 km** | 1.125 km | 100% |
 ///
 /// (Horizontal figures over the 920.25 km box a WSR-88D's reflectivity reach
@@ -1097,6 +1131,13 @@ const fn spend_budget(cell_budget: usize, nz_floor: usize, cap: usize) -> VoxelS
     let mut nz = cell_budget / (nx * nx);
     if nz > cap {
         nz = cap;
+    }
+    // And down to the layout alignment, for the reason the horizontal is: a
+    // vertical the texture's own block depth will round up is memory spent
+    // without a cell to show for it. See [`VERTICAL_AXIS_MULTIPLE`] — this is
+    // the step that kept mobile's 34 layers from being allocated as 48.
+    if nz >= VERTICAL_AXIS_MULTIPLE {
+        nz -= nz % VERTICAL_AXIS_MULTIPLE;
     }
     if nz < 1 {
         nz = 1;

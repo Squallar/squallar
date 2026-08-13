@@ -174,7 +174,6 @@
 use crate::constants::{
     LOOP_IMAGE_SIZE, LOOP_POOL_CEILING_BYTES, LOOP_POOL_DWELL_FRAMES, LOOP_POOL_FLOOR_BYTES,
     LOOP_POOL_HYSTERESIS, MAX_LOOP_RENDER_BUDGET, MIN_LOOP_FRAMES_PER_PANE, VOLUME_GRID_CELLS,
-    VOLUME_LUT_BYTES,
 };
 use crate::volume::quality::DeviceClass;
 use rustdar_egui::config_store::ConfigStore;
@@ -260,8 +259,8 @@ impl LoopFrameModel {
         Self {
             plan_view: side * side * 4,
             section: rustdar_radar::xsect::SECTION_WIDTH * rustdar_radar::xsect::SECTION_HEIGHT * 4,
-            grid: crate::volume::raymarch::grid_bytes_with_mips(VOLUME_GRID_CELLS)
-                .map_or(usize::MAX, |bytes| bytes + VOLUME_LUT_BYTES),
+            grid: crate::volume::raymarch::resident_grid_bytes(VOLUME_GRID_CELLS)
+                .unwrap_or(usize::MAX),
             render_budget: MAX_LOOP_RENDER_BUDGET,
         }
     }

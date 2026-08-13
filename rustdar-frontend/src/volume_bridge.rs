@@ -480,8 +480,8 @@ impl StoredVolume {
     /// nothing uploaded.
     ///
     /// Computed from the grid's own shape through
-    /// `raymarch::grid_bytes_with_mips` — the same arithmetic the upload path
-    /// allocates by, including the coarse mip level — rather than from a
+    /// [`crate::volume::raymarch::resident_grid_bytes`] — what the upload
+    /// path's descriptors actually reserve — rather than from a
     /// per-target constant, because the eviction has to measure what is
     /// actually resident, and a runtime step-down can hand the store a grid
     /// smaller than [`crate::constants::VOLUME_GRID_CELLS`].
@@ -503,9 +503,7 @@ impl StoredVolume {
         else {
             return 0;
         };
-        crate::volume::raymarch::grid_bytes_with_mips(cells)
-            .unwrap_or(0)
-            .saturating_add(crate::constants::VOLUME_LUT_BYTES)
+        crate::volume::raymarch::resident_grid_bytes(cells).unwrap_or(0)
     }
 }
 
@@ -1660,12 +1658,13 @@ fn floor_lanes(
 /// whole-volume grid per 3D pane, kept as a permanent backdrop.
 ///
 /// **It does not fit, and it is not the memory that decides it.** The bytes are
-/// real: a whole-volume grid is 36 MiB of GPU texture on desktop
-/// (`DESKTOP_SHAPE` 256×256×128 at four bytes a cell, plus its 4 MiB coarse
-/// level), 15.19 MiB on mobile and 4.5 MiB on wasm. At `MAX_PANES_DESKTOP` = 6
-/// that is 216 MiB of backdrop — 42% of [`crate::constants::LOOP_POOL_FLOOR_BYTES`]
+/// real: a whole-volume grid reserves 36.6 MiB of GPU texture on desktop (the
+/// desktop cell budget at four bytes a cell, and then the whole mip pyramid a
+/// coarse level buys — see `volume::raymarch::grid_bytes_at`), 15.5 MiB on
+/// mobile and 4.58 MiB on wasm. At `MAX_PANES_DESKTOP` = 6 that is 219 MiB of
+/// backdrop — 43% of [`crate::constants::LOOP_POOL_FLOOR_BYTES`]
 /// (512 MiB desktop), which is also `VOLUME_LOOP_TEXTURE_BUDGET_BYTES`, so it
-/// comes straight out of what a 3D loop may hold: six of the fourteen grids
+/// comes straight out of what a 3D loop may hold: six of the thirteen grids
 /// that floor buys, gone. On wasm the floor is 48 MiB and four panes of
 /// backdrop are 18 MiB of it, 37.5%. Against
 /// [`crate::constants::APP_TEXTURE_BUDGET_BYTES`] alone (3840 MiB desktop, 256

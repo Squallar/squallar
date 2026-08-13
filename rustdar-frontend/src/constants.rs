@@ -660,11 +660,12 @@ pub const DESKTOP_VOLUME_LOOP_TEXTURE_BUDGET_BYTES: usize = DESKTOP_LOOP_POOL_FL
 ///
 /// # Desktop takes fewer frames at the full grid, not more at a coarser one
 ///
-/// 13 frames of the full 512×512×32 grid is ~65 minutes of history where 30
+/// 12 frames of the full 512×512×32 grid is ~60 minutes of history where 30
 /// frames would be ~150. That is a real loss and it is stated rather than
 /// hidden. (The shape was 256×256×128 when this was written, and is the same
 /// 8,388,608 cells either way — `shape_for_budget` respends the budget rather
-/// than enlarging it — so the 13 is unchanged and only the triple has moved.)
+/// than enlarging it — so the triple moved without moving the count. What did
+/// move the count is below.)
 /// The alternative — a loop-specific coarser grid — was rejected for three
 /// reasons, in the order they bite:
 ///
@@ -682,13 +683,29 @@ pub const DESKTOP_VOLUME_LOOP_TEXTURE_BUDGET_BYTES: usize = DESKTOP_LOOP_POOL_FL
 /// # Each arm is the tighter of two bounds
 ///
 /// What [`VOLUME_LOOP_TEXTURE_BUDGET_BYTES`] admits **beside one live grid**,
-/// and [`MAX_LOOP_RENDER_BUDGET`]. The budget binds desktop (13 grids where a
+/// and [`MAX_LOOP_RENDER_BUDGET`]. The budget binds desktop (12 grids where a
 /// plan-view loop textures 30 frames); the render budget binds wasm32 and
 /// mobile, where the grids are small enough that the budget would admit 9 and
 /// 15 — a 3D loop is not licensed to hold *more* history than the plan-view
 /// loop beside it on the same device merely because its frames are cheaper
 /// there. `the_3d_loop_holds_exactly_what_it_marches` computes both and pins
 /// the minimum.
+///
+/// # Desktop 13 → 12, and it is the same defect a second time
+///
+/// The correction below was made against a per-grid figure that charged the
+/// two mip levels the descriptor names. A two-level descriptor is laid out
+/// with **every** level down to 1×1×1, measured — see
+/// `volume::raymarch::grid_bytes_at` — so a desktop grid costs 38.4 MiB and
+/// not 36.0, and 13 of them beside a live one is 512.4 MiB of a 512 MiB
+/// budget. That is the treadmill described below, arrived at from 1.6% of
+/// accounting rather than from a missing subtraction, and it is why this arm
+/// is 12.
+///
+/// **No budget moved.** [`VOLUME_LOOP_TEXTURE_BUDGET_BYTES`] is untouched;
+/// what changed is what a grid is known to cost inside it, and
+/// `the_3d_loop_holds_exactly_what_it_marches` derives this count from the two
+/// rather than restating it.
 ///
 /// The subtracted grid is the correction to the count this loop kind shipped
 /// with. Desktop was 14 — the whole budget, to the last 1.5% — and the store
@@ -715,7 +732,7 @@ pub const WASM_MAX_LOOP_VOLUME_FRAMES: usize = 8;
 /// The mobile arm. See [`MAX_LOOP_VOLUME_FRAMES`].
 pub const MOBILE_MAX_LOOP_VOLUME_FRAMES: usize = 12;
 /// The desktop arm. See [`MAX_LOOP_VOLUME_FRAMES`].
-pub const DESKTOP_MAX_LOOP_VOLUME_FRAMES: usize = 13;
+pub const DESKTOP_MAX_LOOP_VOLUME_FRAMES: usize = 12;
 
 /// How many voxel grids a 3D loop may *dispatch* in one frame.
 ///
@@ -1172,15 +1189,19 @@ pub const WEBGL2_MAX_TEXTURE_DIMENSION_3D: u32 =
 /// each — and it carries `volume::raymarch::GRID_MIP_LEVELS` levels, the raw
 /// field and the hand-built box mean below it:
 ///
-/// | target  | grid        | mip 0     | mip 1     | + LUT      | budget |
-/// |---------|-------------|----------:|----------:|-----------:|-------:|
-/// | desktop | 256x256x128 |    32 MiB |     4 MiB | 36.001 MiB | 48 MiB |
-/// | mobile  | 192x192x96  |  13.5 MiB | 1.688 MiB | 15.189 MiB | 20 MiB |
-/// | wasm32  | 128x128x64  |     4 MiB |   0.5 MiB |  4.501 MiB |  6 MiB |
+/// The table is what the device **reserves**, not what the levels pack into:
+/// naming a second mip level buys the whole pyramid down to 1x1x1, measured,
+/// and the tail is charged. See `volume::raymarch::grid_bytes_at`.
 ///
-/// Every arm keeps ~1.33x headroom, which is deliberate: enough for the
-/// alignment and driver overhead a real 3D texture allocation carries, not
-/// enough to hide a doubled axis.
+/// | target  | cell budget | mip 0     | + pyramid | + LUT, jitter | budget |
+/// |---------|-------------|----------:|----------:|--------------:|-------:|
+/// | desktop | 256x256x128 |    32 MiB | 36.577 MiB|    36.597 MiB | 48 MiB |
+/// | mobile  | 192x192x96  |  13.5 MiB | 15.530 MiB|    15.550 MiB | 20 MiB |
+/// | wasm32  | 128x128x64  |     4 MiB |  4.578 MiB|     4.598 MiB |  6 MiB |
+///
+/// Every arm keeps ~1.3x headroom, which is deliberate: room for a driver
+/// laying textures out more coarsely than the one those figures were measured
+/// on, not enough to hide a doubled axis.
 ///
 /// # What the half-float channels cost, arm by arm
 ///

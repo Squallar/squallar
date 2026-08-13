@@ -673,9 +673,11 @@ mod tests {
             );
             assert_eq!(
                 layout.bytes,
-                super::super::grid_bytes_at(cells, super::super::CoarseLevel::Omitted)
-                    .expect("a shipped rung fits") as u64,
-                "the {cells:?} rung's staging buffer is not its mip-0 plane",
+                super::super::grid_bytes(cells).expect("a shipped rung fits") as u64,
+                "the {cells:?} rung's staging buffer is not its mip-0 plane — \
+                 and the figure it is held to is `grid_bytes`, the packed \
+                 payload, never `grid_bytes_at`, which is what the *device* \
+                 reserves and is larger by the mip tail and the tiling",
             );
         }
 

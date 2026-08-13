@@ -594,10 +594,10 @@ fn the_rebalanced_shapes_are_the_ones_the_rule_documents() {
             VoxelShape {
                 nx: 320,
                 ny: 320,
-                nz: 34,
+                nz: 32,
             },
             2.876,
-            0.529,
+            0.5625,
         ),
         (
             "desktop",

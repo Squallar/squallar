@@ -1422,15 +1422,12 @@ fn the_fade_bar_is_inclusive_and_bites_one_index_below_it() {
 fn the_store_eviction_actually_bounds() {
     let store = VolumeStore::new();
     let one = match ready_grid() {
-        VolumeEntry::Ready(grid) => {
-            crate::volume::raymarch::grid_bytes_with_mips([
-                u32::try_from(grid.shape().nx).unwrap(),
-                u32::try_from(grid.shape().ny).unwrap(),
-                u32::try_from(grid.shape().nz).unwrap(),
-            ])
-            .expect("a fixture grid cannot overflow")
-                + crate::constants::VOLUME_LUT_BYTES
-        }
+        VolumeEntry::Ready(grid) => crate::volume::raymarch::resident_grid_bytes([
+            u32::try_from(grid.shape().nx).unwrap(),
+            u32::try_from(grid.shape().ny).unwrap(),
+            u32::try_from(grid.shape().nz).unwrap(),
+        ])
+        .expect("a fixture grid cannot overflow"),
         _ => unreachable!("ready_grid is Ready"),
     };
     assert!(one > 0, "precondition: a resident grid costs something");
@@ -1569,13 +1566,12 @@ fn one_grid_texture_bytes() -> usize {
     match ready_grid() {
         VolumeEntry::Ready(grid) => {
             let shape = grid.shape();
-            crate::volume::raymarch::grid_bytes_with_mips([
+            crate::volume::raymarch::resident_grid_bytes([
                 u32::try_from(shape.nx).unwrap(),
                 u32::try_from(shape.ny).unwrap(),
                 u32::try_from(shape.nz).unwrap(),
             ])
             .expect("a fixture grid cannot overflow")
-                + crate::constants::VOLUME_LUT_BYTES
         }
         _ => unreachable!("ready_grid is Ready"),
     }

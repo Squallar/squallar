@@ -1102,9 +1102,7 @@ impl VolumePipelines {
             // above has already rejected a shape whose product overflows, so the
             // `None` arm is unreachable and reports 0 rather than panicking on
             // the frame thread.
-            bytes: grid_bytes_at(cells, coarse)
-                .unwrap_or(0)
-                .saturating_add(VOLUME_LUT_BYTES),
+            bytes: resident_grid_bytes_at(cells, coarse).unwrap_or(0),
             uniform,
             bind_group,
             lut_texture,
@@ -1367,8 +1365,8 @@ impl VolumeTextures {
         self.cells
     }
 
-    /// GPU texture bytes this upload occupies: the grid at the levels it was
-    /// actually given, plus its colour table.
+    /// GPU texture bytes this upload occupies: the grid as it was laid out,
+    /// plus its colour table and its jitter tile.
     ///
     /// The uniform buffer is left out — [`VOLUME_UNIFORM_BYTES`] is 224 bytes
     /// against tens of megabytes, and every budget in `constants` is written
@@ -1438,14 +1436,118 @@ pub fn cell_count(cells: [u32; 3]) -> Option<usize> {
 }
 
 /// Bytes a [`VOLUME_TEXTURE_FORMAT`] grid of this shape occupies at **mip 0**,
-/// or `None` if it overflows. See [`grid_bytes_with_mips`] for what the
-/// allocation actually costs.
+/// packed, or `None` if it overflows.
+///
+/// This is a **payload** size, not an allocation: it is how many bytes a caller
+/// has to hand `write_texture`, and what `staging::PlaneLayout` pads rows out
+/// of. What the device actually reserves is [`grid_bytes_at`], and on the
+/// desktop shape the two differ by 1.6%.
 pub fn grid_bytes(cells: [u32; 3]) -> Option<usize> {
     cell_count(cells)?.checked_mul(GRID_BYTES_PER_CELL as usize)
 }
 
-/// Bytes the grid texture costs **at its worst**: every level
-/// [`grid_mip_levels`] can give it, at [`GRID_BYTES_PER_CELL`] a cell.
+/// Texels a 3D texture's **width** is rounded up to.
+///
+/// # Measured, not assumed
+///
+/// Every figure in this block was read off a real device rather than reasoned
+/// about: `wgpu::Device::generate_allocator_report` names each live allocation
+/// by its texture label (`wgpu-hal` hands `TextureDescriptor::label` to the
+/// allocator) and reports the `VkMemoryRequirements::size` the driver asked
+/// for, so the cost of a shape is directly readable. Swept one axis at a time
+/// on an NVIDIA RTX 3090, Vulkan, driver 610.57.04, `Rg16Float`:
+///
+/// | axis | rounding | witnesses |
+/// |---|---|---|
+/// | width | multiple of **16 texels** (one 64-byte gob) | 33→48, 65→80, 129→144 |
+/// | height | multiple of **8 rows** | 33→40, 65→72, 129→136 |
+/// | depth | next power of two to 16, then multiples of 16 | 17→32, 33→48, 49→64, 65→80 |
+///
+/// The depth rule is the one that bites: `voxel::shape_for_budget` spends a
+/// tier's leftover cells on the vertical, and a `nz` of 34 is laid out as 48 —
+/// **+41% on mip 0**, for two layers of picture.
+const TEXTURE_TILE_TEXELS_X: usize = 16;
+/// Rows a 3D texture's **height** is rounded up to. See [`TEXTURE_TILE_TEXELS_X`].
+const TEXTURE_TILE_ROWS_Y: usize = 8;
+/// Layers a 3D texture's **depth** is rounded up to, above the point where the
+/// rounding stops being to a power of two. See [`TEXTURE_TILE_TEXELS_X`].
+const TEXTURE_TILE_LAYERS_Z: usize = 16;
+
+/// Slack allowed on every texture allocation over the tile arithmetic above.
+///
+/// One 4 KiB page. Not decoration and not a guess: the same image measured
+/// twice on the same device differs by up to 736 bytes according to whether the
+/// allocator placed it in a fresh block or sub-allocated it, and the tile model
+/// lands *exactly* on the driver's figure for six of the seven shapes swept —
+/// which means without an allowance it is a knife-edge that the seventh
+/// (320×320×34, short by 512 B) already falls off. A page turns an
+/// exactly-right model into a certainly-not-under one, and it is 0.01% of a
+/// desktop grid.
+const TEXTURE_ALLOCATION_SLACK_BYTES: usize = 4096;
+
+/// One axis of one mip level, rounded up to the tile the backend lays it out in.
+fn tile_up(n: usize, tile: usize) -> usize {
+    n.div_ceil(tile).saturating_mul(tile)
+}
+
+/// The depth rule, which is not a plain multiple. See [`TEXTURE_TILE_TEXELS_X`].
+fn tile_up_layers(n: usize) -> usize {
+    if n <= TEXTURE_TILE_LAYERS_Z {
+        n.max(1).next_power_of_two()
+    } else {
+        tile_up(n, TEXTURE_TILE_LAYERS_Z)
+    }
+}
+
+/// Bytes one mip level of a texture of this shape reserves, tiles included.
+fn level_bytes(cells: [u32; 3], level: u32, bytes_per_texel: usize) -> Option<usize> {
+    let extent = |axis: usize| (cells[axis] >> level).max(1) as usize;
+    tile_up(extent(0), TEXTURE_TILE_TEXELS_X)
+        .checked_mul(tile_up(extent(1), TEXTURE_TILE_ROWS_Y))?
+        .checked_mul(tile_up_layers(extent(2)))?
+        .checked_mul(bytes_per_texel)
+}
+
+/// Mip levels a texture of this shape has all the way down to 1×1×1.
+///
+/// Not [`grid_mip_levels`], which is how many the *descriptor* asks for. See
+/// [`grid_bytes_at`] for why the difference is the whole bug.
+fn full_mip_levels(cells: [u32; 3]) -> u32 {
+    u32::BITS
+        - cells
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(1)
+            .max(1)
+            .leading_zeros()
+}
+
+/// Bytes a texture of this shape reserves on the device: every level it will be
+/// laid out with, each rounded up to the backend's tiles, plus
+/// [`TEXTURE_ALLOCATION_SLACK_BYTES`]. `None` if it overflows.
+///
+/// `asks_for_mips` is whether the descriptor names more than one level — not
+/// how many, because past one it stops mattering. See [`grid_bytes_at`].
+fn texture_allocation_bytes(
+    cells: [u32; 3],
+    bytes_per_texel: usize,
+    asks_for_mips: bool,
+) -> Option<usize> {
+    let levels = if asks_for_mips {
+        full_mip_levels(cells)
+    } else {
+        1
+    };
+    (0..levels)
+        .try_fold(0usize, |acc, level| {
+            acc.checked_add(level_bytes(cells, level, bytes_per_texel)?)
+        })?
+        .checked_add(TEXTURE_ALLOCATION_SLACK_BYTES)
+}
+
+/// Bytes the grid texture costs **at its worst**: laid out with every level a
+/// grid of this shape can have, at [`GRID_BYTES_PER_CELL`] a cell.
 ///
 /// Separate from [`grid_bytes`] because the two answer different questions —
 /// `grid_bytes` sizes the upload buffer for one level, this sizes the
@@ -1457,7 +1559,7 @@ pub fn grid_bytes(cells: [u32; 3]) -> Option<usize> {
 /// The coarse level, when [`CoarseLevel::Omitted`] leaves it out. A budget is a
 /// ceiling and a residency figure feeding an eviction is a thing that must not
 /// under-count, so both want the level that *may* be there — an upload that
-/// skipped it costs 11% less than this says on the desktop shape, which is the
+/// skipped it costs 12% less than this says on the desktop shape, which is the
 /// safe direction for both callers. The saving is real GPU memory either way;
 /// what it does not do is let the loop hold a fourteenth frame.
 pub fn grid_bytes_with_mips(cells: [u32; 3]) -> Option<usize> {
@@ -1472,12 +1574,98 @@ pub fn grid_bytes_with_mips(cells: [u32; 3]) -> Option<usize> {
 /// under-count, so it assumes the level that *may* be there. This one is asked
 /// by [`VolumeTextures::texture_bytes`], where the level either was allocated
 /// or was not, and guessing would make a release report bytes it never held.
+///
+/// # A two-level descriptor is laid out with *every* level, and that was the
+/// under-count
+///
+/// This used to be mip 0 plus [`coarse_cells`], packed — the two levels the
+/// descriptor names. Measured against the driver's own figure it charged
+/// 37,749,760 B for a grid that reserved 38,351,360 B: **601,600 B short, 1.6%,
+/// on the side its own doc forbids.** Swept over `mip_level_count` on one
+/// 256×256×128 image, holding everything else fixed, the allocation is
+/// **identical from two levels to nine** — 38,351,584 B at every rung — and
+/// 33,555,168 B at one. Asking for a second level buys the whole pyramid down
+/// to 1×1×1 whether or not anything will ever write to it; that tail is
+/// 599,188 B of the 601,600, and the remaining 2,412 is the tile rounding
+/// [`TEXTURE_TILE_TEXELS_X`] describes.
+///
+/// So the level count here is a **boolean**, not a count: `Built` means the
+/// full pyramid, `Omitted` means one level, and there is nothing in between to
+/// express.
+///
+/// # It is derived, and where it is only conservative it says so
+///
+/// The pyramid is exact arithmetic on the shape and holds on any backend — no
+/// driver reserves *fewer* levels than the descriptor names, so counting all of
+/// them can only over-state. The tiles are a measured property of one backend
+/// (see [`TEXTURE_TILE_TEXELS_X`]) and this is the honest reading of them: the
+/// model reproduces the driver's figure **exactly** on 256×256×128, 512×512×32,
+/// 128×128×64, 192×192×96, 256×256×16, 64×64×32 and 1024×1024×8, and comes
+/// 512 B under on 320×320×34, which [`TEXTURE_ALLOCATION_SLACK_BYTES`] covers.
+/// A backend tiling more coarsely than 16×8×16 would need this re-measured;
+/// the ones measured so far are covered with 3,360–4,608 B to spare.
 pub fn grid_bytes_at(cells: [u32; 3], coarse: CoarseLevel) -> Option<usize> {
-    let mut total = grid_bytes(cells)?;
-    if grid_mip_levels(cells, coarse) > 1 {
-        total = total.checked_add(grid_bytes(coarse_cells(cells))?)?;
-    }
-    Some(total)
+    texture_allocation_bytes(
+        cells,
+        GRID_BYTES_PER_CELL as usize,
+        grid_mip_levels(cells, coarse) > 1,
+    )
+}
+
+/// Bytes the colour table's own texture reserves beside the grid.
+///
+/// [`VOLUME_LUT_BYTES`] is the table's **payload** — 256 RGBA entries, 1 KiB —
+/// and charging that as the residency was the same class of error as counting
+/// mip 0 alone: a 256×1 `Rgba8Unorm` image is laid out eight rows deep by
+/// [`TEXTURE_TILE_ROWS_Y`], so the driver reserves 8,192 B for it, measured.
+pub fn lut_allocation_bytes() -> usize {
+    texture_allocation_bytes([lut_texel_count(), 1, 1], LUT_BYTES_PER_TEXEL, false)
+        .unwrap_or(VOLUME_LUT_BYTES)
+}
+
+/// Bytes the march's stratification tile reserves.
+///
+/// Counted because it is per *upload* rather than per renderer — see
+/// [`VolumePipelines::upload_volume_at`], which creates one beside every grid —
+/// so a residency figure that left it out under-counted by 4,096 B a grid, and
+/// a release that gave it back could not be measured.
+pub fn jitter_allocation_bytes() -> usize {
+    texture_allocation_bytes(
+        [BLUE_NOISE_EDGE, BLUE_NOISE_EDGE, 1],
+        JITTER_BYTES_PER_TEXEL,
+        false,
+    )
+    .unwrap_or(0)
+}
+
+/// Bytes one texel of [`LUT_FORMAT`] occupies.
+const LUT_BYTES_PER_TEXEL: usize = 4;
+/// Bytes one texel of [`JITTER_FORMAT`] occupies.
+const JITTER_BYTES_PER_TEXEL: usize = 1;
+
+/// **Everything one resident grid costs the device**: the grid texture as it is
+/// laid out, its colour table's texture, and the jitter tile created beside it.
+///
+/// The figure every residency and eviction question in this crate is answered
+/// with — `volume::bridge::StoredVolume::texture_bytes`,
+/// [`VolumeTextures::texture_bytes`] and `loop_pool::LoopFrameModel` all read
+/// it — so that the store's view of what it is holding, the pool's view of what
+/// a frame costs and the renderer's view of what a release gave back are one
+/// number rather than three that agree by hand.
+///
+/// `None` only where the shape overflows a `usize`. Callers on the frame thread
+/// take 0; the pool takes `usize::MAX`, so an unrepresentable grid buys no
+/// frames rather than infinitely many.
+pub fn resident_grid_bytes(cells: [u32; 3]) -> Option<usize> {
+    resident_grid_bytes_at(cells, CoarseLevel::Built)
+}
+
+/// [`resident_grid_bytes`], for an upload whose coarse decision is already
+/// made. See [`grid_bytes_at`] for which question is which.
+pub fn resident_grid_bytes_at(cells: [u32; 3], coarse: CoarseLevel) -> Option<usize> {
+    grid_bytes_at(cells, coarse)?
+        .checked_add(lut_allocation_bytes())?
+        .checked_add(jitter_allocation_bytes())
 }
 
 /// Whether an upload gives the grid texture its coarse mip level at all.
@@ -1518,16 +1706,17 @@ pub fn grid_bytes_at(cells: [u32; 3], coarse: CoarseLevel) -> Option<usize> {
 /// 424 km Doppler box over 256 cells was 1.657 km/cell and built the level too;
 /// what changed is the box and the shape together, and they left this decision
 /// where it was. What *is* new is the headroom. When the level is built it costs
-/// +4 MiB a grid and a CPU pass over the whole index plane measured at **5.9 ms
-/// on the frame thread**, so a 13-frame velocity loop is 13 × 36 + 36 = 504 MiB
-/// of the 512 MiB budget — **98.4%**, 8 MiB spare. Changing the policy is a
-/// separate decision from recording it; this records it.
+/// **+4.58 MiB** a grid — the level itself is 4 MiB and naming it buys the rest
+/// of the pyramid, measured; see [`grid_bytes_at`] — plus a CPU pass over the
+/// whole index plane measured at **5.9 ms on the frame thread**. So a 12-frame
+/// velocity loop is 12 × 36.6 + 36.6 = 476 MiB of the 512 MiB budget,
+/// **92.9%**, where the same loop at one level would be 421 MiB. Changing the
+/// policy is a separate decision from recording it; this records it.
 ///
-/// Where the level is omitted it was 4 MiB of a 36 MiB upload, a second
+/// Where the level is omitted it was 4.58 MiB of a 36.6 MiB upload, a second
 /// `write_texture`, and a CPU pass over the whole index plane, to fill a level
-/// nothing sampled. A desktop 3D loop's 13 reflectivity frames held 52 MiB of
-/// it, and 56 MiB at the peak `DESKTOP_MAX_LOOP_VOLUME_FRAMES` is sized for:
-/// those grids beside the one live volume the budget also has to admit.
+/// nothing sampled. A desktop 3D loop's 12 reflectivity frames held 55 MiB of
+/// it, beside the one live volume the budget also has to admit.
 ///
 /// Both facts the decision needs are fixed for a grid's whole life — the
 /// adapter's shading rung is chosen once when the renderer is built, and the

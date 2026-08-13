@@ -1077,38 +1077,85 @@ fn the_transfer_functions_match_eguis_own() {
     }
 }
 
-/// Grid byte counts — one byte per cell on the wire, four in the texture,
-/// plus the coarse level — including the overflow the multiplication can hit.
+/// Grid byte counts — one byte per cell on the wire, four in the texture, and
+/// what the *device* reserves for those four — including the overflow the
+/// multiplication can hit.
 ///
 /// The three figures are deliberately separate. `cell_count` is what
 /// `upload_refusal` measures the caller's index plane against; `grid_bytes`
-/// sizes the one-level upload; `grid_bytes_with_mips` is what the memory
-/// budget in `constants` is a claim about. Collapsing any two of them was
-/// how the coarse level came to be missing from the budget entirely.
+/// sizes the one-level upload; `grid_bytes_with_mips` is the allocation.
+/// Collapsing any two of them was how the coarse level came to be missing from
+/// the budget entirely, and then how the mip tail came to be missing from the
+/// eviction figure.
+///
+/// The allocation figures are the driver's own, read through
+/// `generate_allocator_report` on the adapter [`TEXTURE_TILE_TEXELS_X`] names.
+/// `the_charged_grid_bytes_are_never_under_what_the_device_reserved` in
+/// `tests/volume_gpu.rs` is what holds this arithmetic to a real allocation
+/// rather than to itself; it is `#[ignore]`d behind a real adapter.
 #[test]
 fn a_grids_byte_count_is_four_per_cell_and_the_budget_counts_the_mip() {
     assert_eq!(cell_count([256, 256, 128]), Some(8 * 1024 * 1024));
     assert_eq!(grid_bytes([256, 256, 128]), Some(32 * 1024 * 1024));
     assert_eq!(
         grid_bytes_with_mips([256, 256, 128]),
-        Some(36 * 1024 * 1024),
-        "the desktop grid is 32 MiB of premultiplied cells over a 4 MiB \
-             coarse level, which is the figure the budget table states"
+        Some(38_354_944),
+        "the desktop grid is 32 MiB of premultiplied cells and then the whole \
+         mip pyramid a second level buys, which the device reserved \
+         38,350,848 B for before the page of slack",
     );
     assert_eq!(grid_bytes([128, 128, 64]), Some(4 * 1024 * 1024));
-    assert_eq!(
-        grid_bytes_with_mips([128, 128, 64]),
-        Some(4 * 1024 * 1024 + 512 * 1024)
-    );
-    // Too small to halve on any axis: one level, so the two figures agree.
+    assert_eq!(grid_bytes_with_mips([128, 128, 64]), Some(4_800_512));
+    // Too small to halve on any axis: one level. The payload is still four
+    // bytes; the allocation is a whole tile, because a 1x1x1 image is laid out
+    // in the same 16x8 gob a 16x8 one is.
     assert_eq!(grid_bytes([1, 1, 1]), Some(4));
-    assert_eq!(grid_bytes_with_mips([1, 1, 1]), Some(4));
+    assert_eq!(grid_bytes_with_mips([1, 1, 1]), Some(512 + 4096));
     for overflowing in [cell_count, grid_bytes, grid_bytes_with_mips] {
         assert_eq!(
             overflowing([u32::MAX, u32::MAX, u32::MAX]),
             None,
             "a grid whose cell count overflows `usize` must not wrap to a \
                  small number and then be compared against a slice length"
+        );
+    }
+}
+
+/// **A second mip level buys the whole pyramid, and the count says so.**
+///
+/// The 601,600 B under-count this closes, stated as the property that was
+/// missing rather than as the number it produced: a two-level descriptor is
+/// laid out with every level down to 1×1×1, so the charge for one level has to
+/// be the charge for all of them. Swept on a real device, the allocation for a
+/// 256×256×128 grid is identical at `mip_level_count` 2 through 9 — see
+/// [`grid_bytes_at`]'s doc for the readings.
+///
+/// An inequality against the packed two-level sum rather than a literal, so it
+/// holds for every shape: whatever the tiling does, the count may never be
+/// those two levels alone again. The upper bound is the other half — a full 3D
+/// pyramid is 8/7 of its base, so a count that had started charging for
+/// something else entirely would show here rather than passing for being big.
+#[test]
+fn a_second_mip_level_is_charged_as_the_whole_pyramid() {
+    for cells in [
+        [256u32, 256, 128],
+        [512, 512, 32],
+        [192, 192, 96],
+        [128, 128, 64],
+        [320, 320, 32],
+    ] {
+        let packed_two = grid_bytes(cells).unwrap() + grid_bytes(coarse_cells(cells)).unwrap();
+        let charged = grid_bytes_with_mips(cells).unwrap();
+        assert!(
+            charged > packed_two,
+            "{cells:?}: charged {charged} B for a two-level descriptor, no more \
+             than the {packed_two} B its two levels pack into — so the pyramid \
+             below them is uncounted again",
+        );
+        assert!(
+            charged * 10 < packed_two * 11,
+            "{cells:?}: charged {charged} B against {packed_two} B packed, more \
+             than the mip tail and the tiling together can account for",
         );
     }
 }
@@ -1144,16 +1191,25 @@ fn an_omitted_coarse_level_leaves_the_texture_with_one_level() {
             "the {cells:?} grid still allocates a coarse level nothing on \
              this device will sample",
         );
-        // What the saving is, on the shape it is largest: 4 MiB of 36.
+        // What the saving is, on the shape it is largest. Not the coarse level
+        // alone: leaving it out of the descriptor takes the whole pyramid with
+        // it, which is why this is measured against `grid_bytes_at` rather
+        // than reconstructed from `coarse_cells`.
         let with = grid_bytes_with_mips(cells).expect("a shipped shape fits");
-        let without = grid_bytes(cells).expect("a shipped shape fits");
-        assert_eq!(with - without, grid_bytes(coarse_cells(cells)).unwrap());
-        assert_eq!(
+        let without = grid_bytes_at(cells, CoarseLevel::Omitted).expect("a shipped shape fits");
+        let raw = grid_bytes(cells).expect("a shipped shape fits");
+        assert!(
+            with - without >= raw / 8,
+            "{cells:?}: the second level saves {} B, under the eighth of the \
+             raw field the level itself is — so the pyramid it drags with it \
+             is not being counted",
             with - without,
-            without / 8,
-            "every shipped shape halves on all three axes, so the level left \
-             out is an eighth of the raw field — 4 MiB of the desktop grid's \
-             36, and 52 MiB across a desktop 3D loop's 13 frames",
+        );
+        assert!(
+            with - without < raw / 6,
+            "{cells:?}: the second level saves {} B, more than a 3D pyramid's \
+             8/7 of a {raw} B base can account for",
+            with - without,
         );
     }
     // A grid too small to halve keeps one level either way — the shape rung

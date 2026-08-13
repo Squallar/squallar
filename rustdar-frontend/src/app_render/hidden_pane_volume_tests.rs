@@ -45,13 +45,12 @@ fn one_grid() -> usize {
         unreachable!("ready_grid is Ready")
     };
     let shape = grid.shape();
-    crate::volume::raymarch::grid_bytes_with_mips([
+    crate::volume::raymarch::resident_grid_bytes([
         u32::try_from(shape.nx).unwrap(),
         u32::try_from(shape.ny).unwrap(),
         u32::try_from(shape.nz).unwrap(),
     ])
     .expect("a fixture grid cannot overflow")
-        + crate::constants::VOLUME_LUT_BYTES
 }
 
 /// Make `pane_idx` a 3D pane, and record that it has already been served

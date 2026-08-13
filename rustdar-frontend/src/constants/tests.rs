@@ -130,9 +130,8 @@ impl Arm {
     /// because `Rg16Float` is *filterable* under `Features::empty()` where
     /// `R32Float` is not.
     fn volume_bytes(&self) -> usize {
-        crate::volume::raymarch::grid_bytes_with_mips(self.grid)
+        crate::volume::raymarch::resident_grid_bytes(self.grid)
             .expect("a shipped grid shape cannot overflow")
-            + VOLUME_LUT_BYTES
     }
 
     /// Every GPU texture the application budgets at once, worst case.
@@ -1478,6 +1477,49 @@ fn the_horizontal_axis_multiple_is_the_copy_alignment_in_cells() {
     // to either fails by name rather than by cancelling out.
     assert_eq!(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT, 256);
     assert_eq!(crate::volume::raymarch::GRID_BYTES_PER_CELL, 4);
+}
+
+/// `voxel::VERTICAL_AXIS_MULTIPLE` is the depth block a 3D texture is laid out
+/// in, and this is the only crate that can say so.
+///
+/// The twin of the test above, and tied the same way: `rustdar-radar` rounds
+/// the vertical down to 16 and documents why, but it has no texture arithmetic
+/// to check itself against. The binding is deliberately made against the
+/// *charging function* rather than against a second constant — what has to
+/// stay true is that a vertical on the multiple costs what it asks for and one
+/// off it costs a whole block more, which is a property a renamed or retuned
+/// tile constant cannot quietly satisfy.
+#[test]
+fn the_vertical_axis_multiple_is_the_texture_depth_block() {
+    use crate::volume::raymarch::{CoarseLevel, grid_bytes, grid_bytes_at};
+    let multiple = rustdar_radar::voxel::VERTICAL_AXIS_MULTIPLE;
+    // One level, so this is mip 0's own layout with nothing else folded in.
+    let padding = |nz: usize| {
+        let cells = [320, 320, nz as u32];
+        grid_bytes_at(cells, CoarseLevel::Omitted).expect("a swept shape fits")
+            - grid_bytes(cells).expect("a swept shape fits")
+    };
+    let block = 320 * 320 * (multiple - 1) * crate::volume::raymarch::GRID_BYTES_PER_CELL as usize;
+    for k in 1..=4 {
+        assert!(
+            padding(multiple * k) < block,
+            "{} layers is a multiple of {multiple} and is still being padded by \
+             {} B, so the multiple does not describe the layout",
+            multiple * k,
+            padding(multiple * k),
+        );
+        assert!(
+            padding(multiple * k + 1) >= block,
+            "{} layers is one over the multiple and is padded by only {} B, so \
+             rounding the vertical down to {multiple} buys nothing",
+            multiple * k + 1,
+            padding(multiple * k + 1),
+        );
+    }
+    // Both rungs the vertical is chosen at already sit on it, which is what
+    // makes the rounding a constraint on the *leftover* alone.
+    assert_eq!(rustdar_radar::voxel::NZ_PREFERRED % multiple, 0);
+    assert_eq!(rustdar_radar::voxel::NZ_MIN % multiple, 0);
 }
 
 /// The pane mirror's ceiling is the cap squared, four bytes a texel — and the

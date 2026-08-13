@@ -2309,7 +2309,7 @@ fn blitted(
 fn release_pane_frees_that_panes_offscreen_and_the_uploads_the_store_let_go_of() {
     use rustdar_frontend::volume::bridge::VolumeResources;
     use rustdar_frontend::volume::quality::offscreen_bytes;
-    use rustdar_frontend::volume::raymarch::grid_bytes_at;
+    use rustdar_frontend::volume::raymarch::resident_grid_bytes_at;
 
     let _serialised = gpu_lock();
     let (device, queue) = device();
@@ -2361,10 +2361,10 @@ fn release_pane_frees_that_panes_offscreen_and_the_uploads_the_store_let_go_of()
 
     let kept_pane = offscreen_bytes(KEPT_PANE_PX);
     let gone_pane = offscreen_bytes(GONE_PANE_PX);
-    let kept_grid = grid_bytes_at(kept_cells, CoarseLevel::Omitted).expect("a tiny grid fits")
-        + VOLUME_LUT_BYTES;
-    let gone_grid = grid_bytes_at(gone_cells, CoarseLevel::Omitted).expect("a tiny grid fits")
-        + VOLUME_LUT_BYTES;
+    let kept_grid =
+        resident_grid_bytes_at(kept_cells, CoarseLevel::Omitted).expect("a tiny grid fits");
+    let gone_grid =
+        resident_grid_bytes_at(gone_cells, CoarseLevel::Omitted).expect("a tiny grid fits");
     assert!(
         gone_pane > 0 && kept_pane > gone_pane && kept_grid > gone_grid,
         "precondition: the fixtures cost something and each differs from its \
@@ -2643,4 +2643,123 @@ fn the_crop_magnifies_a_sub_box_and_answers_air_outside_the_grid() {
          as air and not as that grid's rim, which would be the picture claiming \
          weather nobody measured",
     );
+}
+
+/// **What this crate charges for a resident grid is never under what the
+/// device reserved for it.**
+///
+/// The contract `volume::raymarch::grid_bytes_with_mips` states and, until the
+/// mip tail was counted, did not hold: an eviction figure that under-counts
+/// lets the store believe it is inside a budget it has already left. This is
+/// the only test in the workspace that can check it, because the only honest
+/// source for "what did the device reserve" is the device.
+///
+/// # How the real figure is read
+///
+/// `wgpu::Device::generate_allocator_report` returns one `AllocationReport` per
+/// live allocation, and `name` is the **texture label** — `wgpu-hal`'s Vulkan
+/// backend passes `TextureDescriptor::label` straight into the allocator — so
+/// `rustdar.volume.grid` picks the grid texture out and `size` is the
+/// `VkMemoryRequirements::size` the driver asked for. Nothing is inferred and
+/// nothing is scaled.
+///
+/// The report is `None` outside Vulkan and DX12 (wgpu 29.0.4), which is a skip
+/// rather than a failure: on those backends there is nothing to compare
+/// against, and the arithmetic is pinned by
+/// `volume::raymarch::tests::a_second_mip_level_is_charged_as_the_whole_pyramid`
+/// on every target regardless.
+///
+/// Both coarse arms and every shipped shape rung, plus one rung with a
+/// deliberately unaligned depth — `shape_for_budget` cannot produce one any
+/// more (`voxel::VERTICAL_AXIS_MULTIPLE`), and that is exactly why the charge
+/// has to stay right for one, or the constraint and the accounting could drift
+/// apart with nothing to notice.
+///
+/// ```text
+/// cargo test -p rustdar-frontend --test volume_gpu \
+///     the_charged_grid_bytes_are_never_under_what_the_device_reserved \
+///     -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
+fn the_charged_grid_bytes_are_never_under_what_the_device_reserved() {
+    use rustdar_frontend::volume::raymarch::grid_bytes_at;
+    use rustdar_frontend::volume::raymarch::staging::VolumeStaging;
+
+    let _serialised = gpu_lock();
+    let (device, queue) = device();
+    let Some(_) = device.generate_allocator_report() else {
+        eprintln!(
+            "this backend reports no allocator; nothing to compare the charge \
+             against, so the check is skipped rather than passed"
+        );
+        return;
+    };
+    let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Bgra8Unorm));
+
+    let reserved = |device: &wgpu::Device| -> u64 {
+        device
+            .generate_allocator_report()
+            .expect("the backend reported an allocator a moment ago")
+            .allocations
+            .iter()
+            .filter(|a| a.name == "rustdar.volume.grid")
+            .map(|a| a.size)
+            .sum()
+    };
+
+    let mut checked = 0;
+    for cells in [
+        [256u32, 256, 128],
+        [512, 512, 32],
+        [320, 320, 32],
+        [192, 192, 96],
+        [128, 128, 64],
+        [64, 64, 34],
+    ] {
+        for coarse in [CoarseLevel::Built, CoarseLevel::Omitted] {
+            let indices = vec![7u8; cells.iter().map(|&n| n as usize).product::<usize>()];
+            let before = reserved(&device);
+            let volume = pipelines
+                .upload_volume_at(
+                    &device,
+                    &queue,
+                    cells,
+                    &indices,
+                    &opaque_white_lut(),
+                    coarse,
+                    &mut VolumeStaging::new(&device),
+                )
+                .expect("a shipped rung is not refused");
+            let actual = reserved(&device) - before;
+            let charged = grid_bytes_at(cells, coarse).expect("a shipped rung fits") as u64;
+            assert!(
+                actual > 0,
+                "{cells:?} {coarse:?}: the grid texture is not showing up in the \
+                 allocator report under its label, so this test is comparing \
+                 the charge against nothing",
+            );
+            assert!(
+                charged >= actual,
+                "{cells:?} {coarse:?}: charged {charged} B for a grid the device \
+                 reserved {actual} B for — {} B short, which is the direction an \
+                 eviction figure may never be wrong in",
+                actual - charged,
+            );
+            eprintln!(
+                "{cells:?} {coarse:?}: reserved {actual}, charged {charged} \
+                 (+{} B)",
+                charged - actual,
+            );
+            checked += 1;
+
+            // The drop is not the free: wgpu holds the texture until a
+            // submission is triaged, and a bare `poll` on an idle device has no
+            // submission index to advance past. So: submit, then wait.
+            drop(volume);
+            queue.submit(None);
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        }
+    }
+    assert_eq!(checked, 12, "every rung and both coarse arms were measured");
 }

@@ -447,9 +447,10 @@ fn the_new_sites_chunks_accumulate_from_nothing_rather_than_onto_the_old_site() 
 //
 // The three above are about what a pane *says* after a switch. These are about
 // what it still *holds*: a resolved `VoxelGrid` is 8.00 MiB of host bytes and
-// 36.00 MiB of GPU texture on the desktop shape (256×256×128, measured through
-// `rustdar_radar::voxel::build_voxels` at `voxel::DESKTOP_SHAPE`), and the pane
-// went on holding the radar it had just left.
+// 36.6 MiB of GPU texture at the desktop cell budget (built through
+// `rustdar_radar::voxel::build_voxels` at `voxel::DESKTOP_SHAPE`, which is the
+// budget triple rather than the shape a discrete desktop respends it into),
+// and the pane went on holding the radar it had just left.
 //
 // Every assertion here is in **bytes off a real `VoxelGrid`**, for the reason
 // the hidden-pane suite gives: a store of `Refused` stubs satisfies an
@@ -481,13 +482,12 @@ fn one_grid_bytes() -> usize {
         unreachable!("ready_grid is Ready")
     };
     let shape = grid.shape();
-    crate::volume::raymarch::grid_bytes_with_mips([
+    crate::volume::raymarch::resident_grid_bytes([
         u32::try_from(shape.nx).unwrap(),
         u32::try_from(shape.ny).unwrap(),
         u32::try_from(shape.nz).unwrap(),
     ])
     .expect("a fixture grid cannot overflow")
-        + crate::constants::VOLUME_LUT_BYTES
 }
 
 /// Make `pane_idx` a 3D pane on `WSR88D`, already served — `rendered_for` set

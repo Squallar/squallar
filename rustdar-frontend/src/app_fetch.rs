@@ -582,8 +582,8 @@ impl super::App {
                 // nothing calls `VolumeStore::share_held`, nothing calls
                 // `StoreInner::shed`, and the callback's `prepare` never runs
                 // to prune the GPU side either. The pane went on holding the
-                // radar it just left: 8.00 MiB of host grid and 36.00 MiB of
-                // GPU texture on the desktop shape (256×256×128), plus its
+                // radar it just left: 8.00 MiB of host grid and 36.6 MiB of
+                // GPU texture at the desktop cell budget, plus its
                 // pane-sized offscreen, until the *new* site's first volume was
                 // extracted — which is seconds on a good fetch and never at all
                 // on a site that has no data or whose download fails.
