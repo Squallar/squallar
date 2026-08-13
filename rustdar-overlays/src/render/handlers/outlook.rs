@@ -294,6 +294,68 @@ impl SpcOutlookHandler {
         RoundVerdict::Clear
     }
 
+    /// What of this selection is **not on the map**, as distinct from what is
+    /// merely out of date.
+    ///
+    /// The coverage axis for the one layer that builds its map a product at a
+    /// time. [`round_verdict`](Self::round_verdict) above is the time axis and
+    /// stays exactly as it is: a round in which one of four products refused
+    /// did not complete, and the ladder has to hear about it or a genuinely
+    /// dead SPC endpoint never reaches
+    /// [`Broken`](crate::fetch_policy::FetchHealth::Broken). But that verdict
+    /// was the *whole* of what the row said, and `! not updating` is the wrong
+    /// half of the answer when three products are fresh and the fourth is
+    /// simply not there: the layer is updating, and what a user needs is which
+    /// product they are not looking at. The row names all four.
+    ///
+    /// So a product counts as missing here only when it has **nothing drawn**.
+    /// One that failed this round while its previous outlook is still on the
+    /// map is drawn and stale, which is precisely what the health axis already
+    /// says; counting it on both would put two marks on the row for one fault
+    /// and make neither mean anything.
+    ///
+    /// A product with no failure on file and nothing in `state.data` is not
+    /// missing either — it has not been asked yet, which is the same reading
+    /// `round_verdict` takes of it.
+    ///
+    /// [`Absent`] is not missing, for the reason
+    /// [`StormReportRound::completeness`] gives at length: SPC does not keep
+    /// every product up at every hour, and a mark that is on when nothing is
+    /// wrong is a mark nobody reads on the day something is.
+    ///
+    /// [`Absent`]: crate::fetch_policy::FetchFailure::Absent
+    /// [`StormReportRound::completeness`]: crate::spc::reports::StormReportRound::completeness
+    fn round_coverage(&self) -> crate::fetch_policy::DataCompleteness {
+        let day = self.selected_day;
+        let mut expected = 0;
+        let mut missing = 0;
+        let mut reasons = Vec::new();
+        for &product in day.products() {
+            if !self.enabled_products.contains(&product) {
+                continue;
+            }
+            expected += 1;
+            let key = (day, product);
+            let Some(error) = self.per_product_error.get(&key) else {
+                continue;
+            };
+            if error.failure == crate::fetch_policy::FetchFailure::Absent
+                || self.state.data.contains_key(&key)
+            {
+                continue;
+            }
+            missing += 1;
+            reasons.push((format!("{product:?}: {}", error.message), 1));
+        }
+        crate::fetch_policy::DataCompleteness {
+            expected,
+            missing,
+            unit: "outlook products",
+            reasons,
+            ..crate::fetch_policy::DataCompleteness::default()
+        }
+    }
+
     /// File the round's verdict on the ledger — **once**, when the last of its
     /// tasks lands.
     ///
@@ -338,6 +400,12 @@ impl SpcOutlookHandler {
             }
             RoundVerdict::Clear => self.state.retry.record_success(),
         }
+        // The other axis, written in the same one-writing-per-round, and the
+        // half this layer never had: the verdict above says whether the round
+        // completed, and this says which of the products the row is naming are
+        // not on the map.
+        let coverage = self.round_coverage();
+        self.state.record_coverage(coverage);
     }
 
     /// Drop what is no longer asked for, and take the layer back off the ledger
@@ -372,6 +440,13 @@ impl SpcOutlookHandler {
             RoundVerdict::NotPublished(e) => self.state.retry.record_failure(&e),
             RoundVerdict::Clear => self.state.retry.clear(),
         }
+        // Coverage moves here even though the ladder does not, because what the
+        // layer was *asked* for has changed: unticking the product that would
+        // not load leaves the layer drawing everything it asks for, and a mark
+        // that outlived the selection it was about is the stuck `! not
+        // updating` this function exists for, one axis over.
+        let coverage = self.round_coverage();
+        self.state.record_coverage(coverage);
     }
 
     fn combined_generation(&self) -> u64 {
@@ -1440,6 +1515,95 @@ mod tests {
         assert!(
             !h.state.retry.is_unhealthy(),
             "every product the layer asks for arrived in this very round",
+        );
+    }
+
+    /// **The sixth silence, and the one the shapes surfaced.**
+    ///
+    /// This layer's round is up to four products at once, so it is
+    /// [`Assembled`](crate::fetch_policy::Assembled) — and it declared nothing
+    /// at all on the coverage axis. A tornado outlook that would not load left
+    /// the row saying `! not updating`, which is the *other* fault: three of
+    /// the four products were fresh, the layer was updating, and the status
+    /// line went on naming a product that was not on the map anywhere.
+    ///
+    /// Both axes now, because the round is both things at once: it did not
+    /// complete, so the ladder hears about it and a dead endpoint can still
+    /// reach `Broken`; and one of the four products the row names is absent, so
+    /// the row says that too.
+    #[test]
+    fn a_product_that_would_not_load_is_missing_from_the_map_and_not_merely_stale() {
+        use OutlookProduct::{Categorical, Hail, Tornado, Wind};
+        let mut h = four_product_handler();
+        round(
+            &mut h,
+            vec![
+                (Categorical, Ok(outlook(Categorical))),
+                (Wind, Ok(outlook(Wind))),
+                (Hail, Ok(outlook(Hail))),
+                (Tornado, Err(transient())),
+            ],
+        );
+
+        assert!(
+            h.state.retry.is_unhealthy(),
+            "premise: the round did not complete, and the ladder still hears it",
+        );
+        assert!(
+            h.state.retry.is_incomplete(),
+            "the tornado outlook is on no map anywhere and the layer said only \
+             that it had stopped updating",
+        );
+        let note = h
+            .state
+            .retry
+            .coverage()
+            .status_note()
+            .expect("the options must say which product is not drawn");
+        for expected in ["missing 1 of 4 outlook products", "Tornado"] {
+            assert!(
+                note.contains(expected),
+                "the note must name what is off the map - missing {expected:?}: {note}",
+            );
+        }
+
+        // A product that failed while its **previous** outlook is still drawn
+        // is stale, not missing, and must not be counted on both axes.
+        let mut drawn = four_product_handler();
+        round(
+            &mut drawn,
+            OutlookDay::Day1
+                .products()
+                .iter()
+                .map(|&p| (p, Ok(outlook(p))))
+                .collect(),
+        );
+        assert!(!drawn.state.retry.is_incomplete(), "premise: all four drew");
+        round(
+            &mut drawn,
+            vec![
+                (Categorical, Ok(outlook(Categorical))),
+                (Wind, Ok(outlook(Wind))),
+                (Hail, Ok(outlook(Hail))),
+                (Tornado, Err(transient())),
+            ],
+        );
+        assert!(
+            drawn.state.retry.is_unhealthy(),
+            "premise: the second round failed",
+        );
+        assert!(
+            !drawn.state.retry.is_incomplete(),
+            "the previous tornado outlook is still on the map, which is stale \
+             and is what the health axis is for",
+        );
+
+        // Unticking the product that would not load leaves the layer drawing
+        // everything it asks for, on both axes.
+        assert_eq!(toggle(&mut h, "tor", false), ControlEffect::None);
+        assert!(
+            !h.state.retry.is_incomplete(),
+            "the mark outlived the selection it was about",
         );
     }
 

@@ -188,6 +188,23 @@ impl<T> OverlayState<T, Assembled> {
     pub fn set_data_with_coverage(&mut self, data: T, coverage: DataCompleteness) {
         self.install(data, coverage);
     }
+
+    /// Coverage on its own, for the assembled layer that **stamps its own map**
+    /// rather than replacing it — the same exception
+    /// [`record_success`](OverlayState::record_success) exists for, one axis
+    /// over.
+    ///
+    /// SPC outlooks are keyed by `(day, product)` and arrive one product per
+    /// payload, so there is no moment at which the layer holds a finished
+    /// answer to hand to `set_data_with_coverage`; its round is finished when
+    /// the last of several tasks lands, and that is where it writes its ledger.
+    /// This is on the assembled impl and not the shared one so it stays what it
+    /// is — a second way in for a layer that already declared it can
+    /// under-deliver — rather than a way for any layer at all to start moving
+    /// the coverage axis.
+    pub fn record_coverage(&mut self, coverage: DataCompleteness) {
+        self.retry.record_coverage(coverage);
+    }
 }
 
 impl<T, S: RoundShape> OverlayState<T, S> {
