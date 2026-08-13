@@ -732,11 +732,23 @@ fn the_framing_spends_no_more_of_the_mirror_than_the_box_needs() {
 /// **The early-out fires.** [`MAX_FRAMING_PASSES`] is a budget the solve stops
 /// short of, and this counts the passes it really ran.
 ///
-/// It ran four, always, for as long as this function has existed. The loop's
-/// settle test compared a shortfall measured against the box *plus*
-/// [`COVERAGE_MARGIN`] to `1.0` — a value the margin's own doc says the solve
-/// approaches from above and never reaches — so the condition was unsatisfiable
-/// and the constant described a ceiling nothing could come in under.
+/// Two settle tests ago the loop compared a shortfall measured against the box
+/// *plus* [`COVERAGE_MARGIN`] to `1.0` — a value the margin's own doc says the
+/// solve approaches from above and never reaches. This doc used to conclude from
+/// that the condition was unsatisfiable and every framing ran the whole budget.
+/// **It is not what happened**, and the difference is the point of the test.
+/// The margin's "never reaches" is true of the real numbers and false of `f64`:
+/// restoring that loop whole and running it over the sweep
+/// [`the_framing_budget_covers_every_latitude_a_region_can_sit_at`] performs
+/// today, it **settled on 6,347 of 76,500 framings, 8.30%**, at passes two,
+/// three and four. [`MAX_FRAMING_PASSES`] carries the full reading, and says
+/// which of the several "old bars" this one is.
+///
+/// So the constant did not describe a ceiling nothing could come in under. It
+/// described one that a twelfth of framings came in under and the rest did not,
+/// for a reason no reading of either the loop or the prose would reveal — which
+/// is why the count has to come out of the shipped loop rather than out of an
+/// argument about it.
 ///
 /// The predecessor of this test could not have caught it, and the shape of the
 /// mistake is worth keeping in view: it re-ran the solve's arithmetic in the
