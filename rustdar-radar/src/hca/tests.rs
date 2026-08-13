@@ -316,26 +316,122 @@ fn mem_table_gr_matches_hca_alg() {
     );
 }
 
-/// The weight matrix, against `hca.alg`'s `weight_*` arrays (columns
-/// RA…GR), and the f/g coefficients against the paper's Eqs. (4)–(5),
-/// which the .alg values reproduce exactly.
+/// The six `weight_*` arrays of `cpc104/lib006/hca.alg` (CODE B21.0r1.7),
+/// lines 291, 298, 305, 312, 319 and 326, quoted **verbatim** — including
+/// the source's own erratic spacing, which is left alone so the lines can be
+/// diffed against the file character for character.
+///
+/// Quoted rather than transposed by hand because the hand transposition is
+/// what went wrong: `WEIGHT`'s DS row carried Park et al. (2009)'s ρhv
+/// weight of 0.6 where `weight_RHOhv`'s ninth entry says 1.0, and the test
+/// that was supposed to catch it restated the same 0.6 in the same layout
+/// and therefore only asserted that our array equalled our array. See
+/// [`weights_match_the_alg_arrays`].
+const HCA_ALG_WEIGHT_ARRAYS: [(&str, &str); 6] = [
+    (
+        "weight_Z",
+        "0.0, 0.0, 1.0, 1.0, 1.0, 0.8, 0.4, 0.2, 1.0, 0.6, 1.0, 0.8, 0.0, 0.0",
+    ),
+    (
+        "weight_Zdr",
+        "0.0, 0.0, 0.8, 0.8, 0.8, 1.0, 0.6, 0.4, 0.8, 0.8, 0.6, 1.0, 0.0, 0.0",
+    ),
+    (
+        "weight_RHOhv",
+        "0.0, 0.0, 0.6, 0.6, 0.6, 0.6, 1.0, 1.0, 1.0, 1.0, 0.4, 0.4, 0.0, 0.0",
+    ),
+    (
+        "weight_LKdp",
+        "0.0, 0.0, 0.0, 1.0, 1.0,0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0",
+    ),
+    (
+        "weight_SDZ",
+        "0.0, 0.0, 0.2, 0.2, 0.2,0.2, 0.8,0.6, 0.2, 0.2, 0.2, 0.2, 0.0, 0.0",
+    ),
+    (
+        "weight_SDPHIdp",
+        "0.0, 0.0, 0.2, 0.2, 0.2,0.2, 0.8,0.8, 0.2, 0.2, 0.2, 0.2, 0.0, 0.0",
+    ),
+];
+
+/// The weight matrix, derived from `hca.alg`'s own text rather than compared
+/// against a restatement of itself.
+///
+/// The `.alg` arrays are per-input, fourteen entries long, in `hca.h`'s class
+/// order `U0 U1 RA HR RH BD BI GC DS WS IC GR UK NE`. [`WEIGHT`] is the
+/// transpose, ten rows of six, with the four never-scoring classes dropped.
+/// This test does that transposition **here**, mechanically, from the quoted
+/// lines — so a wrong value, a wrong class order, a transposed pair of
+/// classes, or a silently non-zero U0/U1/UK/NE all fail, and none of them can
+/// be hidden by writing the same mistake twice.
 #[test]
-fn weights_and_equation_coefficients_match_hca_alg() {
-    let expect: [(&str, [f64; 6]); 10] = [
-        ("RA", [1.0, 0.8, 0.0, 0.6, 0.2, 0.2]),
-        ("HR", [1.0, 0.8, 1.0, 0.6, 0.2, 0.2]),
-        ("RH", [1.0, 0.8, 1.0, 0.6, 0.2, 0.2]),
-        ("BD", [0.8, 1.0, 0.0, 0.6, 0.2, 0.2]),
-        ("BI", [0.4, 0.6, 0.0, 1.0, 0.8, 0.8]),
-        ("GC", [0.2, 0.4, 0.0, 1.0, 0.6, 0.8]),
-        ("DS", [1.0, 0.8, 0.0, 0.6, 0.2, 0.2]),
-        ("WS", [0.6, 0.8, 0.0, 1.0, 0.2, 0.2]),
-        ("IC", [1.0, 0.6, 0.5, 0.4, 0.2, 0.2]),
-        ("GR", [0.8, 1.0, 0.0, 0.4, 0.2, 0.2]),
+fn weights_match_the_alg_arrays() {
+    /// The `.alg` class order. The four that never score are named so the
+    /// assertion below can insist they really are zero.
+    const ALG_CLASS_ORDER: [&str; 14] = [
+        "U0", "U1", "RA", "HR", "RH", "BD", "BI", "GC", "DS", "WS", "IC", "GR", "UK", "NE",
     ];
-    for (i, (name, row)) in expect.iter().enumerate() {
-        assert_eq!(&WEIGHT[i], row, "{name} weights diverge from hca.alg");
+    /// `WEIGHT`'s column order — `fl_input`'s, from `hca.h`.
+    const WEIGHT_COLUMNS: [&str; NUM_FL_INPUTS] = [
+        "weight_Z",
+        "weight_Zdr",
+        "weight_LKdp",
+        "weight_RHOhv",
+        "weight_SDZ",
+        "weight_SDPHIdp",
+    ];
+
+    let parsed: Vec<(&str, Vec<f64>)> = HCA_ALG_WEIGHT_ARRAYS
+        .iter()
+        .map(|(name, line)| {
+            let values: Vec<f64> = line
+                .split(',')
+                .map(|v| v.trim().parse().expect("an .alg weight is a float"))
+                .collect();
+            assert_eq!(
+                values.len(),
+                ALG_CLASS_ORDER.len(),
+                "{name} does not carry one weight per class",
+            );
+            (*name, values)
+        })
+        .collect();
+
+    for (name, values) in &parsed {
+        for (class, value) in ALG_CLASS_ORDER.iter().zip(values) {
+            if matches!(*class, "U0" | "U1" | "UK" | "NE") {
+                assert_eq!(*value, 0.0, "{name}'s {class} entry should be 0");
+            }
+        }
     }
+
+    for (row, class) in ALG_CLASS_ORDER.iter().enumerate().skip(2).take(10) {
+        for (col, column) in WEIGHT_COLUMNS.iter().enumerate() {
+            let (_, values) = parsed
+                .iter()
+                .find(|(name, _)| name == column)
+                .expect("every WEIGHT column names an .alg array");
+            assert_eq!(
+                WEIGHT[row - 2][col],
+                values[row],
+                "WEIGHT[{class}][{column}] diverges from hca.alg",
+            );
+        }
+    }
+
+    // The one that was wrong, called out by name so a regression reads as
+    // itself rather than as an index mismatch.
+    assert_eq!(
+        WEIGHT[DS - RA][RHO],
+        1.0,
+        "DS's rho_hv weight is hca.alg:305's 1.0, not Park et al. (2009)'s 0.6",
+    );
+}
+
+/// The f/g coefficients, against the paper's Eqs. (4)–(5), which the .alg
+/// values reproduce exactly.
+#[test]
+fn equation_coefficients_match_hca_alg() {
     assert_eq!(F1_COEF, (0.000_750, 0.0025, -0.5));
     assert_eq!(F2_COEF, (0.002_92, -0.0481, 0.68));
     assert_eq!(F3_COEF, (0.000_485, 0.0667, 1.42));

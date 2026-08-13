@@ -247,6 +247,20 @@
 //! The source's constant tables win throughout; the paper values are noted
 //! so nobody "fixes" them back:
 //!
+//! * **DS's ρhv weight is 1.0**, `hca.alg:305`'s ninth `weight_RHOhv`
+//!   entry — the paper's Table 3 says 0.6, and 0.6 is what this module
+//!   carried until 2026-08-13. It is the only value in the whole
+//!   transcription that followed the paper over the source, and the test
+//!   that should have caught it restated our own array in our own layout;
+//!   `hca::tests::weights_match_the_alg_arrays` now derives the matrix from
+//!   the `.alg` lines instead. Measured on the ten-volume roster **with the
+//!   RPG's own melting layer in place**, the correction moves `N0H` exact
+//!   agreement **up at ten sites of ten** — +0.30 (KMLB) to +5.25 (KBUF),
+//!   +3.45 KMSX, +2.92 KOKX, +4.57 KATX — taking the range from
+//!   82.77–95.85 % to 84.21–98.59 % and the count of sites over 91 % from
+//!   seven to eight. On the hybrid product it is a wash: four sites up by
+//!   ≤ 0.13, five down by ≤ 0.58, KARX unchanged at 100 %. Reported both
+//!   ways because the second result is the honest one.
 //! * BD's Z membership is (10, 15, 45, 50) in `hca.alg`, (20, 25, 45, 50)
 //!   in the paper — with the BD hard threshold rewritten from
 //!   `ZDR < f2(Z) − 0.3` to fixed `Z < 15 || ZDR < 0.5`;
@@ -721,7 +735,15 @@ pub(crate) const MEM: [&MemTable; 10] = [
 /// `hca.alg`'s weight arrays, transposed to `[class − RA][input]`. The
 /// class columns of `weight_Z`…`weight_SDPHIdp` in order RA HR RH BD BI GC
 /// DS WS IC GR (U0/U1/UK/NE all carry 0 and never score).
-
+///
+/// **DS's ρhv weight is 1.0, and was 0.6 until 2026-08-13.** 0.6 is Park et
+/// al. (2009) Table 3; `hca.alg:305`'s `weight_RHOhv` array reads
+/// `0, 0, 0.6, 0.6, 0.6, 0.6, 1.0, 1.0, 1.0, 1.0, 0.4, 0.4, 0, 0` and its
+/// ninth entry — DS — is 1.0, alongside BI, GC and WS. The module's rule is
+/// that the released source wins over the paper, so following the paper here
+/// was a transcription slip, not a divergence; `weights_match_the_alg_arrays`
+/// now derives the whole matrix from the `.alg` text rather than restating
+/// this array, which is what let the slip survive its own test.
 pub(crate) const WEIGHT: [[f64; NUM_FL_INPUTS]; 10] = [
     // SMZ  ZDR  LKDP RHO  SDZ  SDP
     [1.0, 0.8, 0.0, 0.6, 0.2, 0.2], // RA
@@ -730,7 +752,7 @@ pub(crate) const WEIGHT: [[f64; NUM_FL_INPUTS]; 10] = [
     [0.8, 1.0, 0.0, 0.6, 0.2, 0.2], // BD
     [0.4, 0.6, 0.0, 1.0, 0.8, 0.8], // BI
     [0.2, 0.4, 0.0, 1.0, 0.6, 0.8], // GC
-    [1.0, 0.8, 0.0, 0.6, 0.2, 0.2], // DS
+    [1.0, 0.8, 0.0, 1.0, 0.2, 0.2], // DS
     [0.6, 0.8, 0.0, 1.0, 0.2, 0.2], // WS
     [1.0, 0.6, 0.5, 0.4, 0.2, 0.2], // IC
     [0.8, 1.0, 0.0, 0.4, 0.2, 0.2], // GR
