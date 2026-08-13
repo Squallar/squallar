@@ -764,7 +764,7 @@ impl VolumeStore {
     ///
     /// Oldest-first by store id, which is *build* order rather than playback
     /// order. That is deliberate. In steady state this never fires — the frame
-    /// counts in `MAX_LOOP_VOLUME_FRAMES` are chosen to fit — and the case it
+    /// counts `LoopPool::plan` derives are chosen to fit — and the case it
     /// exists for is the transition, where a pane holds its live grid and a
     /// loop set at the same time. The live grid was built first, so it is
     /// exactly what should go.

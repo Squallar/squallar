@@ -115,8 +115,9 @@ pub const LONG_RANGE_IMAGE_SIZE: usize = DESKTOP_LONG_RANGE_IMAGE_SIZE;
 /// ([`WASM_LOOP_TEXTURE_BUDGET_BYTES`]) and it textures eight frames at once;
 /// 2048² frames are 16 MiB apiece, so following the static size would need a
 /// 128 MiB loop budget — and [`VOLUME_LOOP_TEXTURE_BUDGET_BYTES`] is an alias
-/// of that one, so the 3D term rises with it: 6 × 128 + 128 + 30 puts
-/// [`APP_TEXTURE_BUDGET_BYTES`] at ~926 MiB against a 384 MiB ceiling.
+/// of that one, so the volume-store term rises with it. Even holding the pool
+/// *ceiling* where it is, 192 + 128 + 30 puts [`APP_TEXTURE_BUDGET_BYTES`] at
+/// 350 MiB against a 288 MiB ceiling.
 /// `the_whole_application_fits_its_gpu_ceiling` is the line that says so and
 /// `the_app_ceiling_is_not_slack_enough_to_hide_a_doubling` is why the ceiling
 /// cannot simply be raised to admit it. So web loops stay exactly the size and
@@ -601,7 +602,8 @@ pub const LOOP_POOL_DWELL_FRAMES: u32 = 15;
 /// [`MAX_LOOP_SPEED_FPS`]. The resample alone settles it at both speeds, so the
 /// conclusion is the one it always was and does not rest on the upload figure —
 /// which is just as well, since that figure turns out to depend on the card.
-/// [`MAX_LOOP_VOLUME_FRAMES`] is therefore both numbers at once, and
+/// A 3D loop's frame count is therefore both numbers at once — held and
+/// resident are one figure for this kind — and
 /// `the_3d_loop_holds_exactly_what_it_marches` pins it.
 ///
 /// # Why once for the application rather than once per pane
@@ -616,24 +618,38 @@ pub const LOOP_POOL_DWELL_FRAMES: u32 = 15;
 /// naive per-pane split would charge one resident set twice and under-serve the
 /// one loop kind that cannot re-render its way out of being short.
 ///
-/// **This one is enforced at runtime**, unlike the pool statement above:
-/// `VolumeStore::enforce_budget` evicts oldest-first until the resident grids
-/// fit, every frame, and `the_store_eviction_actually_bounds` drives it past
-/// the line. What it is held to at runtime is
-/// `LoopAllocation::volume_reserve_bytes` — one share per distinct set — and
+/// **This one is enforced at runtime**, and so — the doc here used to deny it —
+/// is the pool statement above: `VolumeStore::enforce_budget` evicts
+/// oldest-first until the resident grids fit, every frame, and
+/// `the_store_eviction_actually_bounds` drives it past the line. What it is
+/// held to at runtime is `LoopAllocation::volume_reserve_bytes` **floored at
+/// this constant** — `App::setup_egui_frame` takes the `max` of the two, so a
+/// session with no 3D loop still has room for the live grids ordinary 3D panes
+/// need — one share per distinct set — and
 /// the frame count that share buys is chosen so the eviction never has to fire
 /// for a loop and a live 3D pane together, which is the layout it would
 /// otherwise fire for constantly. The `headroom` column is what buys that, and
 /// `a_full_3d_loop_leaves_room_for_a_live_grid_beside_it` is why every row of
 /// it is at least one grid wide.
 ///
+/// The `3D texture` column is `volume::raymarch::resident_grid_bytes` — every
+/// mip level the device lays the grid out with, plus the colour table's own
+/// texture and the jitter tile created beside it — not the packed product of
+/// the two levels the descriptor names. The difference is 1.6% and it is the
+/// difference between twelve frames and thirteen; see
+/// `volume::raymarch::grid_bytes_at`.
+///
 /// Every figure below is derived and checked — `the_loop_budget_table_is_the
 /// _one_the_constants_derive` reads these rows back out of this doc comment and
 /// fails if any of them has drifted from `resident_grid_bytes`. It is here
 /// because they had: the table went on quoting a 13-frame desktop row at
-/// `36.001 MiB` for a while after the mip pyramid was charged for and the
-/// constant a hundred lines below became 12, so the prose and the code
-/// contradicted each other in the same file.
+/// `36.001 MiB` for a while after the mip pyramid was charged for and the frame
+/// count became 12, so the prose and the code contradicted each other in the
+/// same file.
+///
+/// The decimals are load-bearing rather than cosmetic: that test compares the
+/// cells as **strings**, at `{:.3}` for the texture column and `{:.2}` for the
+/// two derived from it, so a row rounded to one place fails it.
 ///
 /// | target  | frames | 3D texture | resident  | headroom | share   |
 /// |---------|-------:|-----------:|----------:|---------:|--------:|
@@ -654,19 +670,21 @@ pub const LOOP_POOL_DWELL_FRAMES: u32 = 15;
 /// The subtraction that keeps the live grid's room is inside `plan`, not baked
 /// into a constant, which is what makes the property hold at *every* pool size
 /// rather than at the one figure a constant was tuned against.
-pub const VOLUME_LOOP_TEXTURE_BUDGET_BYTES: usize = LOOP_POOL_FLOOR_BYTES;
-/// The wasm32 arm of [`VOLUME_LOOP_TEXTURE_BUDGET_BYTES`].
-pub const WASM_VOLUME_LOOP_TEXTURE_BUDGET_BYTES: usize = WASM_LOOP_POOL_FLOOR_BYTES;
-/// The mobile arm. See [`VOLUME_LOOP_TEXTURE_BUDGET_BYTES`].
-pub const MOBILE_VOLUME_LOOP_TEXTURE_BUDGET_BYTES: usize = MOBILE_LOOP_POOL_FLOOR_BYTES;
-/// The desktop arm. See [`VOLUME_LOOP_TEXTURE_BUDGET_BYTES`].
-pub const DESKTOP_VOLUME_LOOP_TEXTURE_BUDGET_BYTES: usize = DESKTOP_LOOP_POOL_FLOOR_BYTES;
-
-/// Frames a 3D volume loop holds — which is also how many voxel grids it keeps
-/// resident, because for this loop kind those are the same number. See
-/// [`VOLUME_LOOP_TEXTURE_BUDGET_BYTES`].
 ///
-/// # Desktop takes fewer frames at the full grid, not more at a coarser one
+/// # The `frames` column is derived, and there is no constant for it any more
+///
+/// There was: `MAX_LOOP_VOLUME_FRAMES`, an 8 / 12 / 12 cascade with three named
+/// arms. It had **no runtime consumer at all** — `LoopPool::plan` computed the
+/// real number from this budget and the grid's cost, and the constant sat
+/// beside it as a pinned expectation that the test re-derived. Two arithmetics
+/// for one number, one of which nothing executed, is the shape that lets a
+/// budget change land in one of them; the count is the planner's answer now,
+/// and `the_pool_reproduces_the_shipped_3d_frame_count` pins the planner
+/// against the literals in the table above.
+///
+/// What that retirement must not lose is the reasoning, which is below.
+///
+/// ## Desktop takes fewer frames at the full grid, not more at a coarser one
 ///
 /// 12 frames of the full 512×512×32 grid is ~60 minutes of history where 30
 /// frames would be ~150. That is a real loss and it is stated rather than
@@ -688,10 +706,10 @@ pub const DESKTOP_VOLUME_LOOP_TEXTURE_BUDGET_BYTES: usize = DESKTOP_LOOP_POOL_FL
 /// * There is no performance argument either way: 0.60 ms against 0.42 ms per
 ///   march on the measured hardware, both trivial against a 16.7 ms frame.
 ///
-/// # Each arm is the tighter of two bounds
+/// ## Each arm is the tighter of two bounds
 ///
-/// What [`VOLUME_LOOP_TEXTURE_BUDGET_BYTES`] admits **beside one live grid**,
-/// and [`MAX_LOOP_RENDER_BUDGET`]. The budget binds desktop (12 grids where a
+/// What this budget admits **beside one live grid**, and
+/// [`MAX_LOOP_RENDER_BUDGET`]. The budget binds desktop (12 grids where a
 /// plan-view loop textures 30 frames); the render budget binds wasm32 and
 /// mobile, where the grids are small enough that the budget would admit 9 and
 /// 15 — a 3D loop is not licensed to hold *more* history than the plan-view
@@ -699,21 +717,19 @@ pub const DESKTOP_VOLUME_LOOP_TEXTURE_BUDGET_BYTES: usize = DESKTOP_LOOP_POOL_FL
 /// there. `the_3d_loop_holds_exactly_what_it_marches` computes both and pins
 /// the minimum.
 ///
-/// # Desktop 13 → 12, and it is the same defect a second time
+/// ## Desktop 13 → 12, and it is the same defect a second time
 ///
 /// The correction below was made against a per-grid figure that charged the
 /// two mip levels the descriptor names. A two-level descriptor is laid out
 /// with **every** level down to 1×1×1, measured — see
-/// `volume::raymarch::grid_bytes_at` — so a desktop grid costs 38.4 MiB and
+/// `volume::raymarch::grid_bytes_at` — so a desktop grid costs 36.6 MiB and
 /// not 36.0, and 13 of them beside a live one is 512.4 MiB of a 512 MiB
 /// budget. That is the treadmill described below, arrived at from 1.6% of
-/// accounting rather than from a missing subtraction, and it is why this arm
+/// accounting rather than from a missing subtraction, and it is why the arm
 /// is 12.
 ///
-/// **No budget moved.** [`VOLUME_LOOP_TEXTURE_BUDGET_BYTES`] is untouched;
-/// what changed is what a grid is known to cost inside it, and
-/// `the_3d_loop_holds_exactly_what_it_marches` derives this count from the two
-/// rather than restating it.
+/// **No budget moved.** This constant is untouched; what changed is what a grid
+/// is known to cost inside it.
 ///
 /// The subtracted grid is the correction to the count this loop kind shipped
 /// with. Desktop was 14 — the whole budget, to the last 1.5% — and the store
@@ -724,23 +740,13 @@ pub const DESKTOP_VOLUME_LOOP_TEXTURE_BUDGET_BYTES: usize = DESKTOP_LOOP_POOL_FL
 /// at ~89 ms, and the store evicts frame 1 to make room: a permanent rebuild
 /// treadmill whose only symptoms are a warm machine and a loop one frame
 /// short. Two 3D panes, one looping and one live, is an ordinary layout.
-///
-/// Named outside the cascade for the reason [`WASM_VOLUME_GRID_CELLS`] gives.
-#[cfg(target_arch = "wasm32")]
-pub const MAX_LOOP_VOLUME_FRAMES: usize = WASM_MAX_LOOP_VOLUME_FRAMES;
-/// See the wasm32 arm above.
-#[cfg(all(not(target_arch = "wasm32"), mobile))]
-pub const MAX_LOOP_VOLUME_FRAMES: usize = MOBILE_MAX_LOOP_VOLUME_FRAMES;
-/// See the wasm32 arm above.
-#[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
-pub const MAX_LOOP_VOLUME_FRAMES: usize = DESKTOP_MAX_LOOP_VOLUME_FRAMES;
-
-/// The wasm32 arm of [`MAX_LOOP_VOLUME_FRAMES`].
-pub const WASM_MAX_LOOP_VOLUME_FRAMES: usize = 8;
-/// The mobile arm. See [`MAX_LOOP_VOLUME_FRAMES`].
-pub const MOBILE_MAX_LOOP_VOLUME_FRAMES: usize = 12;
-/// The desktop arm. See [`MAX_LOOP_VOLUME_FRAMES`].
-pub const DESKTOP_MAX_LOOP_VOLUME_FRAMES: usize = 12;
+pub const VOLUME_LOOP_TEXTURE_BUDGET_BYTES: usize = LOOP_POOL_FLOOR_BYTES;
+/// The wasm32 arm of [`VOLUME_LOOP_TEXTURE_BUDGET_BYTES`].
+pub const WASM_VOLUME_LOOP_TEXTURE_BUDGET_BYTES: usize = WASM_LOOP_POOL_FLOOR_BYTES;
+/// The mobile arm. See [`VOLUME_LOOP_TEXTURE_BUDGET_BYTES`].
+pub const MOBILE_VOLUME_LOOP_TEXTURE_BUDGET_BYTES: usize = MOBILE_LOOP_POOL_FLOOR_BYTES;
+/// The desktop arm. See [`VOLUME_LOOP_TEXTURE_BUDGET_BYTES`].
+pub const DESKTOP_VOLUME_LOOP_TEXTURE_BUDGET_BYTES: usize = DESKTOP_LOOP_POOL_FLOOR_BYTES;
 
 /// How many voxel grids a 3D loop may *dispatch* in one frame.
 ///
@@ -896,16 +902,40 @@ pub const MAX_LOOP_VOLUME_BUILDS_PER_FRAME: usize = 1;
 /// that raising any term has to come past
 /// `the_whole_application_fits_its_gpu_ceiling`.
 ///
-/// | target  | panes | loop pool | offscreens | total    | ceiling  | reachable |
-/// |---------|------:|----------:|-----------:|---------:|---------:|----------:|
-/// | desktop |     6 |  3072 MiB |    120 MiB | 3192 MiB | 3840 MiB |  3192 MiB |
-/// | mobile  |     4 |   640 MiB |     20 MiB |  660 MiB |  768 MiB |   532 MiB |
-/// | wasm32  |     6 |   192 MiB |     30 MiB |  222 MiB |  256 MiB |    78 MiB |
+/// | target  | panes | loop pool | store floor | offscreens | total    | ceiling  | reachable |
+/// |---------|------:|----------:|------------:|-----------:|---------:|---------:|----------:|
+/// | desktop |     6 |  3072 MiB |     512 MiB |    120 MiB | 3704 MiB | 3840 MiB |  3704 MiB |
+/// | mobile  |     4 |   640 MiB |     256 MiB |     20 MiB |  916 MiB | 1024 MiB |   788 MiB |
+/// | wasm32  |     6 |   192 MiB |      48 MiB |     30 MiB |  270 MiB |  288 MiB |   126 MiB |
 ///
 /// The last column is what the *device classification* actually admits, and it
 /// is the number a memory audit should care about: a phone GPU is
 /// `IntegratedGpu` and gets one doubling from the floor, and a browser is
 /// `Unknown` and gets the floor itself. See [`LOOP_POOL_CEILING_BYTES`].
+///
+/// # The `store floor` column, and the two ceilings it moved
+///
+/// `App::setup_egui_frame` bounds the volume store at
+/// `loop_allocation().volume_reserve_bytes().max(VOLUME_LOOP_TEXTURE_BUDGET_BYTES)`.
+/// That `max` is **outside** the pool, not inside it: with `v` volume sets out
+/// of `shares` loops the raster kinds hold at most `pool − v·share` while the
+/// store is allowed `max(v·share, floor)`, so the sum is
+/// `pool + max(0, floor − v·share)` and it is widest at `v = 0` — a screen with
+/// no 3D *loop* at all, where every byte of the pool goes to raster frames and
+/// the store is still floored so ordinary live 3D panes have somewhere to live.
+///
+/// This table had no such column and the sum was short by a whole pool floor.
+/// Desktop absorbed it (3192 → 3704 of 3840, unmoved). The other two did not:
+/// **mobile 768 → 1024 MiB** and **wasm32 256 → 288 MiB**. Mobile's was not
+/// merely a permitted overrun either — an `IntegratedGpu` phone resolves a
+/// 512 MiB pool, and 512 + 256 + 20 is 788 MiB, past the old ceiling with the
+/// pool nowhere near its own.
+///
+/// Neither raise loosens anything: both stay inside the 1.25× snugness
+/// `the_app_ceiling_is_not_slack_enough_to_hide_a_doubling` holds them to
+/// (1024 / 916 = 1.12, 288 / 270 = 1.07), and the reachable column — the figure
+/// a memory audit cares about — is unchanged in *kind*, having simply gained
+/// the same term the total did.
 ///
 /// # What changed in this table when the loop budget became a pool
 ///
@@ -920,15 +950,21 @@ pub const MAX_LOOP_VOLUME_BUILDS_PER_FRAME: usize = 1;
 /// unmoved — the loop pool's ceiling is deliberately the same 3072 MiB the
 /// per-pane figure could already reach (see [`LOOP_POOL_CEILING_BYTES`]), so
 /// nothing on a machine that has the memory changed, and the 512 MiB that went
-/// is the double-count the old sum carried.
+/// is the double-count the old sum carried. (It reads 3704 again above, and the
+/// coincidence is worth naming rather than tripping over: the 512 MiB is back
+/// as the store-floor term, which is a real second bound rather than the
+/// double-count of the first.)
 ///
 /// **The mobile ceiling came down from 1408 MiB to 768 MiB and the wasm32 one
-/// from 384 to 256 MiB.** Both follow their pool ceilings, which came down
+/// from 384 to 256 MiB.** Both followed their pool ceilings, which came down
 /// against measured platform limits rather than against arithmetic — a 4 GB
 /// iPhone's ~2098 MB jetsam hard limit and iOS Safari's ~300–500 MB WebGL heap
 /// band. [`LOOP_POOL_CEILING_BYTES`] carries the evidence and the sources.
-/// Desktop's is unmoved, because a discrete GPU has the memory and the old
-/// figure was never the problem.
+/// Desktop's was unmoved, because a discrete GPU has the memory and the old
+/// figure was never the problem. Both then went back up — 1024 and 288 — when
+/// the store-floor term above was found missing from the sum, which is a
+/// correction to the *arithmetic* and leaves those platform readings exactly
+/// where they were: the pool ceilings they argue for did not move.
 ///
 /// **What is not in this table**, and is worth saying because it is the figure
 /// a memory audit will go looking for: the pool is what the *loops* may hold,
@@ -953,9 +989,9 @@ pub const APP_TEXTURE_BUDGET_BYTES: usize = MOBILE_APP_TEXTURE_BUDGET_BYTES;
 pub const APP_TEXTURE_BUDGET_BYTES: usize = DESKTOP_APP_TEXTURE_BUDGET_BYTES;
 
 /// The wasm32 arm of [`APP_TEXTURE_BUDGET_BYTES`].
-pub const WASM_APP_TEXTURE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+pub const WASM_APP_TEXTURE_BUDGET_BYTES: usize = 288 * 1024 * 1024;
 /// The mobile arm. See [`APP_TEXTURE_BUDGET_BYTES`].
-pub const MOBILE_APP_TEXTURE_BUDGET_BYTES: usize = 768 * 1024 * 1024;
+pub const MOBILE_APP_TEXTURE_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
 /// The desktop arm. See [`APP_TEXTURE_BUDGET_BYTES`].
 pub const DESKTOP_APP_TEXTURE_BUDGET_BYTES: usize = 3840 * 1024 * 1024;
 
@@ -1184,12 +1220,21 @@ pub const WEBGL2_MAX_TEXTURE_DIMENSION_3D: u32 =
 
 /// Ceiling on what one pane's 3D volume textures may occupy, in bytes.
 ///
-/// Not a runtime check — nothing measures against it, exactly like
-/// [`LOOP_POOL_FLOOR_BYTES`]. It is the budget [`VOLUME_GRID_CELLS`] was
-/// chosen to fit, written down so that growing an axis has to be a deliberate
-/// decision about memory. `the_volume_grid_fits_the_target_texture_budget`
-/// enforces it and `the_volume_budget_is_not_slack_enough_to_hide_a_doubling`
-/// keeps it snug.
+/// Not a runtime check — the only things that read it are the `const _: () =
+/// assert!` beside `crate::volume::raymarch::GRID_MIP_LEVELS` and the tests
+/// below. It is the budget [`VOLUME_GRID_CELLS`] was chosen to fit, written
+/// down so that growing an axis has to be a deliberate decision about memory.
+/// `the_volume_grid_fits_the_target_texture_budget` enforces it and
+/// `the_volume_budget_is_not_slack_enough_to_hide_a_doubling` keeps it snug.
+///
+/// **Not "like [`LOOP_POOL_FLOOR_BYTES`]", which this used to say.** That one
+/// *is* measured against, twice: `LoopPoolLimits::for_target` makes it the
+/// floor a discovered pool is clamped to, and `App::setup_egui_frame` floors
+/// the volume store's eviction bound at it through
+/// [`VOLUME_LOOP_TEXTURE_BUDGET_BYTES`].
+/// The self-claim here was right and the comparison was not, which is the
+/// worse of the two ways to be half stale — it invites the next reader to
+/// treat an enforced bound as prose.
 ///
 /// One pane shows one volume, so the figure is one grid texture plus its LUT.
 /// The grid is [`crate::volume::VOLUME_TEXTURE_FORMAT`] — `Rg16Float`,
@@ -1280,7 +1325,9 @@ pub const VOLUME_OFFSCREEN_REFERENCE_PANE_PX: [u32; 2] = [2560, 1440];
 
 /// Ceiling on the pane-sized `Rgba8Unorm` target one volume renders into.
 ///
-/// Unlike [`LOOP_POOL_FLOOR_BYTES`] and [`VOLUME_TEXTURE_BUDGET_BYTES`],
+/// Unlike [`VOLUME_TEXTURE_BUDGET_BYTES`] — and *like* [`LOOP_POOL_FLOOR_BYTES`],
+/// which is measured against at `LoopPoolLimits::for_target` and again where
+/// the volume store's eviction bound is floored —
 /// **this one is enforced at runtime**: `VolumeQuality::fit` walks down the
 /// resolution ladder until the offscreen fits it. That makes it a real bound on
 /// fill rate as well as on memory, which is the point — the offscreen exists so
@@ -1346,8 +1393,8 @@ pub const VOLUME_OFFSCREEN_BUDGET_BYTES: usize = DESKTOP_VOLUME_OFFSCREEN_BUDGET
 /// low, close camera magnifies the floor it samples, and the answer to that is
 /// more texels, which is memory, which differs per target. This constant is
 /// what `MirrorLimits::for_device` holds the rung to, so it is *enforced*
-/// rather than merely stated — unlike [`LOOP_POOL_FLOOR_BYTES`] and
-/// [`VOLUME_TEXTURE_BUDGET_BYTES`], and like [`VOLUME_OFFSCREEN_BUDGET_BYTES`].
+/// rather than merely stated — unlike [`VOLUME_TEXTURE_BUDGET_BYTES`], and like
+/// [`VOLUME_OFFSCREEN_BUDGET_BYTES`] and [`LOOP_POOL_FLOOR_BYTES`].
 ///
 /// # The arithmetic, per target, four bytes a texel
 ///

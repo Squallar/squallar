@@ -39,8 +39,15 @@ struct Arm {
     grid: [u32; 3],
     volume_budget: usize,
     /// Frames — and so resident voxel grids — a 3D loop holds on this class.
-    /// See [`MAX_LOOP_VOLUME_FRAMES`]: for this loop kind the two are one
-    /// number, which `the_3d_loop_holds_exactly_what_it_marches` is about.
+    /// For this loop kind the two are one number, which
+    /// `the_3d_loop_holds_exactly_what_it_marches` is about.
+    ///
+    /// **A literal.** It used to read `MAX_LOOP_VOLUME_FRAMES`, a `cfg` cascade
+    /// with no runtime consumer that restated what `LoopPool::plan` already
+    /// computes. The constant is retired; the count is the planner's answer,
+    /// `loop_pool::tests::the_pool_reproduces_the_shipped_3d_frame_count` binds
+    /// the planner to these same figures, and the test below binds them to the
+    /// budget arithmetic they came out of.
     volume_loop_frames: usize,
     /// The application-wide ceiling on those grids.
     volume_loop_budget: usize,
@@ -150,8 +157,32 @@ impl Arm {
     ///
     /// The offscreen term *is* still per pane, correctly: each 3D pane
     /// raymarches into its own target, and no two panes share one.
+    ///
+    /// # The volume store's floor is a third term, and it used to be missing
+    ///
+    /// `App::setup_egui_frame` bounds the store at
+    /// `loop_allocation().volume_reserve_bytes().max(VOLUME_LOOP_TEXTURE_BUDGET_BYTES)`.
+    /// The `max` is not slack inside the pool term above — it is *outside* it.
+    /// Write the reserve as `v · share` for `v` volume sets out of
+    /// `shares = plan_view + section + v`, so `share = pool / shares`. The
+    /// raster loops then hold at most `pool − v·share` and the store is allowed
+    /// `max(v·share, floor)`, and the sum is
+    ///
+    /// ```text
+    /// pool − v·share + max(v·share, floor)  =  pool + max(0, floor − v·share)
+    /// ```
+    ///
+    /// which is maximised at **`v = 0`**, where it is `pool + floor`. A layout
+    /// with no 3D *loop* at all is exactly where the override bites hardest:
+    /// every byte of the pool goes to raster loops, and the store is still
+    /// floored at the whole pool floor so that ordinary live 3D panes have
+    /// somewhere to live.
+    ///
+    /// That term was absent, and its absence was not free — see
+    /// `the_whole_application_fits_its_gpu_ceiling` for the two arms whose
+    /// ceilings had to move to admit it.
     fn app_texture_bytes(&self) -> usize {
-        self.pool_ceiling + self.max_panes * self.offscreen_budget
+        self.pool_ceiling + self.volume_loop_budget + self.max_panes * self.offscreen_budget
     }
 }
 
@@ -171,7 +202,7 @@ fn arms() -> [Arm; 3] {
             pool_ceiling: WASM_LOOP_POOL_CEILING_BYTES,
             grid: WASM_VOLUME_GRID_CELLS,
             volume_budget: WASM_VOLUME_TEXTURE_BUDGET_BYTES,
-            volume_loop_frames: WASM_MAX_LOOP_VOLUME_FRAMES,
+            volume_loop_frames: 8,
             volume_loop_budget: WASM_VOLUME_LOOP_TEXTURE_BUDGET_BYTES,
             offscreen_budget: WASM_VOLUME_OFFSCREEN_BUDGET_BYTES,
             max_panes: rustdar_egui::pane::MAX_PANES_DESKTOP,
@@ -190,7 +221,7 @@ fn arms() -> [Arm; 3] {
             pool_ceiling: MOBILE_LOOP_POOL_CEILING_BYTES,
             grid: MOBILE_VOLUME_GRID_CELLS,
             volume_budget: MOBILE_VOLUME_TEXTURE_BUDGET_BYTES,
-            volume_loop_frames: MOBILE_MAX_LOOP_VOLUME_FRAMES,
+            volume_loop_frames: 12,
             volume_loop_budget: MOBILE_VOLUME_LOOP_TEXTURE_BUDGET_BYTES,
             offscreen_budget: MOBILE_VOLUME_OFFSCREEN_BUDGET_BYTES,
             max_panes: rustdar_egui::pane::MAX_PANES_MOBILE,
@@ -209,7 +240,7 @@ fn arms() -> [Arm; 3] {
             pool_ceiling: DESKTOP_LOOP_POOL_CEILING_BYTES,
             grid: DESKTOP_VOLUME_GRID_CELLS,
             volume_budget: DESKTOP_VOLUME_TEXTURE_BUDGET_BYTES,
-            volume_loop_frames: DESKTOP_MAX_LOOP_VOLUME_FRAMES,
+            volume_loop_frames: 12,
             volume_loop_budget: DESKTOP_VOLUME_LOOP_TEXTURE_BUDGET_BYTES,
             offscreen_budget: DESKTOP_VOLUME_OFFSCREEN_BUDGET_BYTES,
             max_panes: rustdar_egui::pane::MAX_PANES_DESKTOP,
@@ -393,10 +424,10 @@ fn a_full_3d_loop_leaves_room_for_a_live_grid_beside_it() {
 /// against a 200 ms interval at `DEFAULT_LOOP_SPEED_FPS` and 33 ms at
 /// `MAX_LOOP_SPEED_FPS`, so that treadmill does not close here.
 ///
-/// What this pins is that `MAX_LOOP_VOLUME_FRAMES` is *one* number rather than
-/// a held count and a resident count that could drift apart — and that it is at
-/// or under the budget the arm above just checked, with no second number in
-/// between. The dispatcher reads the same constant for both, and
+/// What this pins is that a 3D loop's count is *one* number rather than a held
+/// count and a resident count that could drift apart — and that it is at or
+/// under the budget the arm above just checked, with no second number in
+/// between. The dispatcher reads `LoopAllocation::volume_frames` for both, and
 /// `app_render::volume_loop_tests` drives it end to end.
 #[test]
 fn the_3d_loop_holds_exactly_what_it_marches() {
@@ -440,21 +471,103 @@ fn the_3d_loop_holds_exactly_what_it_marches() {
 /// This is the table in [`APP_TEXTURE_BUDGET_BYTES`]' doc, executed. It fails
 /// if `MAX_PANES_DESKTOP` grows, if any per-pane budget grows, or if the 3D
 /// loop's grids are ever made per-pane instead of application-wide.
+///
+/// # It did not model the path that runs, and two arms were over
+///
+/// The sum was `pool ceiling + panes × offscreen`, which is what the *pool*
+/// permits. What actually runs is `App::setup_egui_frame`'s
+/// `.max(VOLUME_LOOP_TEXTURE_BUDGET_BYTES)` on the volume store's eviction
+/// bound, and [`Arm::app_texture_bytes`] works through why that adds a whole
+/// pool floor on top rather than hiding inside the pool.
+///
+/// Adding it put mobile at 916 MiB against a 768 MiB ceiling and wasm32 at
+/// 270 against 256. Desktop was already clear at 3704 of 3840, which is why
+/// walking the desktop layouts found nothing — but the mobile figure is
+/// reachable rather than merely permitted: an `IntegratedGpu` phone resolves a
+/// 512 MiB pool, and 512 + 256 + 20 is 788 MiB, over the old ceiling with the
+/// pool nowhere near its own. So the two ceilings moved, deliberately, and
+/// `the_app_ceiling_is_not_slack_enough_to_hide_a_doubling` is what stops that
+/// from having been a way to admit anything else.
 #[test]
 fn the_whole_application_fits_its_gpu_ceiling() {
     for arm in arms() {
         let total = arm.app_texture_bytes();
         assert!(
             total <= arm.app_budget,
-            "{}: a {} MiB loop pool + {} panes x {} MiB of raymarch offscreen = \
-             {} MiB, over the {} MiB whole-application ceiling",
+            "{}: a {} MiB loop pool + a {} MiB volume-store floor + {} panes x \
+             {} MiB of raymarch offscreen = {} MiB, over the {} MiB \
+             whole-application ceiling",
             arm.name,
             arm.pool_ceiling / (1024 * 1024),
+            arm.volume_loop_budget / (1024 * 1024),
             arm.max_panes,
             arm.offscreen_budget / (1024 * 1024),
             total / (1024 * 1024),
             arm.app_budget / (1024 * 1024),
         );
+    }
+}
+
+/// The store's bound is what the sum above charges, on the arithmetic the
+/// application actually runs rather than on the reading of it.
+///
+/// `the_whole_application_fits_its_gpu_ceiling` charges `pool + floor` because
+/// that is the maximum of `pool − v·share + max(v·share, floor)` over the
+/// reachable `v`. A closed-form claim like that is exactly the kind that stays
+/// written down while the code underneath it moves, so it is swept here against
+/// `LoopPool::plan` and `LoopAllocation::volume_reserve_bytes` themselves, over
+/// every mix of loop kinds each arm's pane count admits and at both ends of the
+/// pool.
+#[test]
+fn the_volume_store_floor_is_the_widest_the_override_can_open() {
+    use crate::loop_pool::{LoopDemand, LoopFrameModel, LoopPool, LoopPoolLimits};
+
+    for arm in arms() {
+        let model = LoopFrameModel {
+            plan_view: arm.loop_frame_bytes(),
+            section: arm.section_frame_bytes(),
+            grid: arm.volume_bytes(),
+            render_budget: arm.render_budget,
+        };
+        let limits = LoopPoolLimits {
+            floor: arm.pool_floor,
+            ceiling: arm.pool_ceiling,
+        };
+        for pool_bytes in [arm.pool_floor, arm.pool_ceiling] {
+            let pool = LoopPool::new(pool_bytes, limits);
+            for plan_view_loops in 0..=arm.max_panes {
+                for section_loops in 0..=(arm.max_panes - plan_view_loops) {
+                    for volume_sets in 0..=(arm.max_panes - plan_view_loops - section_loops) {
+                        let demand = LoopDemand {
+                            plan_view_loops,
+                            section_loops,
+                            volume_sets,
+                        };
+                        let allocation = pool.plan(model, demand);
+                        // What `setup_egui_frame` hands `enforce_budget`.
+                        let store = allocation
+                            .volume_reserve_bytes()
+                            .max(arm.volume_loop_budget);
+                        // What the raster loops may cache beside it. Nothing at
+                        // runtime takes these back, so the division is the bound.
+                        let raster =
+                            plan_view_loops * allocation.plan_view_frames * model.plan_view
+                                + section_loops * allocation.section_frames * model.section;
+                        assert!(
+                            raster + store <= arm.pool_ceiling + arm.volume_loop_budget,
+                            "{}: {demand:?} at a {} MiB pool caches {} MiB of raster \
+                             frames beside a {} MiB store bound — over the \
+                             `pool ceiling + volume-store floor` the app ceiling \
+                             charges",
+                            arm.name,
+                            pool.bytes() / (1024 * 1024),
+                            raster / (1024 * 1024),
+                            store / (1024 * 1024),
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -882,8 +995,10 @@ fn every_cfg_arm_selects_the_constant_named_for_its_device_class() {
         // overlap is deliberate, because that test checks one cascade and
         // this one checks that no cascade is missing.
         "VOLUME_OFFSCREEN_BUDGET_BYTES",
-        // The 3D loop's two cascades, landed with it.
-        "MAX_LOOP_VOLUME_FRAMES",
+        // The 3D loop's cascade, landed with it. Its sibling
+        // `MAX_LOOP_VOLUME_FRAMES` was retired rather than lifted: it had no
+        // runtime consumer, and the count `LoopPool::plan` derives is the only
+        // one anything reads.
         "APP_TEXTURE_BUDGET_BYTES",
         // Lifted into three arms when the pane mirror gained an adaptive rung:
         // the ceiling stopped being "the guaranteed texture cap squared" (one
@@ -1726,11 +1841,17 @@ fn a_rasters_side_is_read_back_from_its_length_against_a_closed_set() {
 /// the constants derive.**
 ///
 /// Because it stopped being. The desktop row went on reading `13 | 36.001 MiB |
-/// 468.0 MiB | 44.0 MiB` after the mip pyramid was charged for and
-/// `DESKTOP_MAX_LOOP_VOLUME_FRAMES` a hundred lines below the table became 12 —
-/// prose and code contradicting each other inside one file, with the prose the
-/// half a reader reaches for when deciding whether a frame count is safe to
-/// move. Every other figure in that row was pre-fix too, on every row.
+/// 468.0 MiB | 44.0 MiB` after the mip pyramid was charged for and the frame
+/// count became 12 — prose and code contradicting each other inside one file,
+/// with the prose the half a reader reaches for when deciding whether a frame
+/// count is safe to move. Every other figure in that row was pre-fix too, on
+/// every row.
+///
+/// The count it is compared against is [`Arm::volume_loop_frames`], which is a
+/// literal now rather than `DESKTOP_MAX_LOOP_VOLUME_FRAMES` and its two
+/// siblings: that cascade had no runtime consumer and is retired, so this test
+/// and `the_3d_loop_holds_exactly_what_it_marches` are between them what hold
+/// the figures to the budget arithmetic they come out of.
 ///
 /// So the doc is parsed rather than trusted. A figure that drifts fails here
 /// with both numbers, which is the only thing that keeps a hand-written table
