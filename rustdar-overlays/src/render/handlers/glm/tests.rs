@@ -1168,3 +1168,197 @@ fn a_satellite_whose_listing_failed_marks_the_layer_and_names_it() {
         "the mark outlived the round it was about",
     );
 }
+
+// ── The other three ways this round under-delivers ────────────────────
+//
+// A listing is one of four. A dead feed lists `200` with no objects; listed
+// granules can refuse to download or to parse; and one hierarchy level can
+// stop parsing inside granules that otherwise did. All four end a poll with
+// flashes off the map, and the first draft of the coverage report counted
+// only the listing — so the other three stayed exactly as silent as the
+// listing had been, under a mechanism built to end that silence. The
+// transport case had a log line that said so in as many words: "the map is
+// blank despite a healthy S3 listing".
+
+/// A round with every listing healthy, parameterised by what went wrong
+/// after it.
+fn round(
+    dead_feeds: Vec<DeadFeed>,
+    transport_failures: Option<FetchFailures>,
+    parse_failures: Option<FetchFailures>,
+    level_failures: Vec<LevelFailure>,
+) -> FetchPayload {
+    Box::new(GlmFetchResult(Ok(crate::glm::GlmFetchOutcome {
+        flashes: Vec::new(),
+        dead_feeds,
+        queried: vec![GlmSatellite::GoesEast, GlmSatellite::GoesWest],
+        parse_failures,
+        transport_failures,
+        level_failures,
+        evaluated_levels: Vec::new(),
+        listing_failures: Vec::new(),
+    })))
+}
+
+/// The row and the note an enabled lightning layer shows for `payload`.
+fn marks(payload: FetchPayload) -> (String, Option<String>) {
+    use crate::render::controls::PaneControlContext;
+    use crate::render::overlay_state::{OverlayFetchResult, OverlayRegistry};
+
+    let kind = OverlayKind::Lightning;
+    let mut registry = OverlayRegistry::default();
+    registry.set_enabled(kind, true);
+    registry.apply_fetch_result(OverlayFetchResult {
+        kind,
+        data: payload,
+    });
+    let ctx = PaneControlContext {
+        pane_idx: 0,
+        pane_state: None,
+    };
+    let note = registry
+        .controls(kind, &ctx)
+        .into_iter()
+        .find_map(|item| match item {
+            ControlItem::InfoText { text } if text.starts_with("Incomplete") => Some(text),
+            _ => None,
+        });
+    (
+        registry
+            .status_line(kind)
+            .expect("an enabled lightning layer states its own line"),
+        note,
+    )
+}
+
+fn failures(in_window: usize, failed: usize) -> Option<FetchFailures> {
+    Some(FetchFailures {
+        in_window,
+        failed,
+        sample_error: "granule.nc: HTTP status error (503 Service Unavailable)".into(),
+    })
+}
+
+/// **Every granule refused, both listings healthy: a blank map.**
+///
+/// Measured over a socket before the fix — two feeds queried, zero listing
+/// failures, `transport_failures` 2 of 2, zero flashes, and
+/// `DataCompleteness::is_complete()` returning `true`. The layer's own
+/// warning for this state already named the cost; nothing carried it to the
+/// user.
+#[test]
+fn granules_that_will_not_download_mark_the_layer() {
+    let (line, note) = marks(round(Vec::new(), failures(20, 20), None, Vec::new()));
+    assert!(
+        line.starts_with("! incomplete"),
+        "the map is blank and the row says nothing: {line}",
+    );
+    let note = note.expect("the options must say what the row is marking");
+    assert!(
+        note.contains("missing 2 of 2 satellite feeds"),
+        "no granule of either feed reached the map: {note}",
+    );
+    assert!(
+        note.contains("0 of 20 granules resolved"),
+        "the note must count the granules it could not obtain: {note}",
+    );
+    assert!(
+        note.contains("503"),
+        "the note must keep the origin's own words: {note}",
+    );
+}
+
+/// Some granules refused: the feeds are drawing part of their window, which
+/// is a different sentence from drawing none of it.
+#[test]
+fn some_granules_refused_leaves_the_feeds_part_drawn() {
+    let (line, note) = marks(round(Vec::new(), failures(20, 7), None, Vec::new()));
+    assert!(line.starts_with("! incomplete"), "{line}");
+    let note = note.expect("note");
+    assert!(
+        note.contains("2 of 2 satellite feeds drawing only part of their area"),
+        "part of a window is not none of it: {note}",
+    );
+    assert!(note.contains("13 of 20 granules resolved"), "{note}");
+}
+
+/// A listing that answers `200` with no objects at all. GLM publishes a
+/// granule every twenty seconds, so this is the feed being gone — the
+/// handler's own log line says "not a quiet sky". It is in `queried`, which
+/// is exactly why counting listing failures alone read it as delivering.
+#[test]
+fn a_dead_feed_is_missing_even_though_its_listing_answered() {
+    let dead = DeadFeed {
+        satellite: GlmSatellite::GoesEast,
+        bucket: "noaa-goes16".into(),
+        prefixes: vec!["GLM-L2-LCFA/2026/225/06".into()],
+    };
+    let (line, note) = marks(round(vec![dead], None, None, Vec::new()));
+    assert!(
+        line.starts_with("! incomplete"),
+        "a feed returning no objects at all is not a whole round: {line}",
+    );
+    let note = note.expect("note");
+    assert!(note.contains("missing 1 of 2 satellite feeds"), "{note}",);
+    assert!(
+        note.contains(GlmSatellite::GoesEast.display_name()) && note.contains("no objects"),
+        "the note must name which feed and why: {note}",
+    );
+}
+
+/// Granules download and parse, one hierarchy level inside them does not:
+/// that layer alone is empty on the map and the others are unaffected, which
+/// is part-drawn rather than missing.
+#[test]
+fn a_level_that_stopped_parsing_marks_the_feeds_part_drawn() {
+    let level = LevelFailure {
+        satellite: GlmSatellite::GoesEast,
+        level: GlmDataLevel::Group,
+        sample_error: "GLM file has no 'group_area' variable".into(),
+    };
+    let (line, note) = marks(round(Vec::new(), None, None, vec![level]));
+    assert!(
+        line.starts_with("! incomplete"),
+        "a layer that went empty is not a whole round: {line}",
+    );
+    let note = note.expect("note");
+    assert!(
+        note.contains("drawing only part of their area"),
+        "the other levels still drew: {note}",
+    );
+    assert!(
+        note.contains("stopped parsing"),
+        "the note must say which level: {note}",
+    );
+}
+
+/// The control: nothing failed anywhere, so nothing is marked. Without this,
+/// every assertion above would pass on a `round_coverage` that simply always
+/// reported incomplete.
+#[test]
+fn a_whole_round_carries_no_mark() {
+    let (line, note) = marks(round(Vec::new(), None, None, Vec::new()));
+    assert!(
+        !line.starts_with("!"),
+        "nothing failed and the layer claims a fault: {line}",
+    );
+    assert_eq!(note, None, "nothing failed and the options say otherwise");
+}
+
+/// A dead feed and a granule failure at once must not charge the dead feed
+/// twice: it listed no objects, so none of the granules in the window were
+/// ever its to deliver.
+#[test]
+fn a_dead_feed_is_not_charged_again_for_the_other_feeds_granules() {
+    let dead = DeadFeed {
+        satellite: GlmSatellite::GoesEast,
+        bucket: "noaa-goes16".into(),
+        prefixes: vec!["GLM-L2-LCFA/2026/225/06".into()],
+    };
+    let (_, note) = marks(round(vec![dead], failures(20, 20), None, Vec::new()));
+    let note = note.expect("note");
+    assert!(
+        note.contains("missing 2 of 2 satellite feeds"),
+        "one feed is dead and one delivered no granules — two, not three: {note}",
+    );
+}
