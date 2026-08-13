@@ -175,7 +175,7 @@ pub const NATIVE_SECTION_WIDTH: usize = 2048;
 /// instead of inherited: they used to read [`crate::types::IMAGE_SIZE`], which
 /// stopped meaning "the picture a browser gets" when the web plan view went to
 /// 2048. Following it there would have quadrupled a web section loop's
-/// textures — eight resident frames at 8 MiB against a 48 MiB per-pane budget —
+/// textures — fourteen resident frames at 8 MiB against a 56 MiB per-pane budget —
 /// for a view whose cost the plan view's texture ceiling has nothing to say
 /// about.
 ///

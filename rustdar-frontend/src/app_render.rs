@@ -4230,6 +4230,23 @@ pub(crate) fn test_budgets() -> crate::budget::Budgets {
 ///
 /// Both bounds are at or above `MIN_LOOP_FRAMES_PER_PANE`, so their minimum is
 /// too — a loop that is not a loop is not reachable from here.
+///
+/// # The append path reads this one append behind, deliberately
+///
+/// `app_fetch::append_polled_frame` is handed `held` by its caller, then
+/// re-measures `scan_step_secs` over the new frame list, then caps. So on the
+/// append where a VCP change first moves the cadence, the cap applied is the
+/// one the *previous* cadence bought, and the new figure binds on the next
+/// append. That ordering is the append path's own and is right: it re-measures
+/// off the full scan list rather than off a list already cut to a cap derived
+/// from the stale figure.
+///
+/// It costs at most one frame, for at most one volume period, and only on a 3D
+/// loop — the raster kinds' held count does not read the cadence at all. It
+/// cannot cost memory in any case: the pool's share is the other half of the
+/// minimum above and does not move, so a lagging cadence can only leave the
+/// list a frame longer than the *span* wanted, never a frame longer than the
+/// bytes allow.
 fn loop_render_budget(
     allocation: LoopAllocation,
     ls: &rustdar_egui::pane::LoopPlaybackState,
@@ -4248,8 +4265,10 @@ fn loop_render_budget(
 /// it does not shrink when a pane arrives. It is deliberately **not** held to
 /// the span budget either: the frame list is what the loop shows over the
 /// user's whole lookback, and a lookback wider than the span budget is answered
-/// by sampling, which is the resolution the caption already reports. Capping
-/// the list at the span budget would throw away detail that costs no textures.
+/// by sampling, which `LoopPlaybackState::listing_sampled` records and the
+/// caption reports. Capping the list at the span budget would throw away detail
+/// that costs no textures — and it would do it silently, because the caption
+/// reports the *sampler's* answer and a shorter list is not a sample.
 ///
 /// A 3D loop's frames are resident grids and re-entering one costs ~140 ms
 /// against a 200 ms playback interval, so its list *is* its resident set: both

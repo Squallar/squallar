@@ -696,12 +696,28 @@ impl Budgets {
     /// # `None` is the *safe* arm, not the degraded one
     ///
     /// `LoopPlaybackState::scan_step_secs` is `None` until a listing has been
-    /// accepted, and after a site switch, which rebuilds the state. With no
-    /// cadence there is no honest conversion, so the answer is the arm's full
-    /// render budget: the loop behaves exactly as it did before this budget
-    /// existed until the listing that tells us what a frame is worth arrives.
-    /// Erring the other way — assuming the fastest radar and then shrinking —
-    /// would make a loop visibly lose frames a second after opening.
+    /// accepted, and again after a pane really changes radar, which replaces
+    /// the whole state. With no cadence there is no honest conversion, so the
+    /// answer is the arm's full render budget: the loop behaves exactly as it
+    /// did before this budget existed until the listing that tells us what a
+    /// frame is worth arrives. Erring the other way — assuming the fastest
+    /// radar and then shrinking — would make a loop visibly lose frames a
+    /// second after opening.
+    ///
+    /// **Re-picking the site a pane is already on is not that**, and it keeps
+    /// both the loop and its cadence. That is the right answer rather than a
+    /// gap in the reset: the figure describes the radar, the radar has not
+    /// changed, and re-measuring it would cost the whole listing to arrive at
+    /// the same number. `SwitchRadarSite` gates the teardown on the pane having
+    /// actually left a radar.
+    ///
+    /// A loop that keeps every scan re-measures as it polls — see
+    /// `app_fetch::append_polled_frame`, which re-reads the median after each
+    /// append precisely so a VCP change moves the cadence — so the figure this
+    /// converts is the site's current one rather than the one it ran at when
+    /// the listing was taken. A sampled loop is deliberately left on the
+    /// listing's median, which is the honest figure for it: every gap in a
+    /// sampled frame list is a sampled gap.
     ///
     /// A zero cadence takes the same arm rather than dividing: `median_step_secs`
     /// already drops non-positive gaps, so it is unreachable from the listing

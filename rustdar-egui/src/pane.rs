@@ -247,7 +247,7 @@ pub struct LoopFrame {
 /// median gap against the listing's, and that cannot resolve this at all. Even
 /// sampling keeps the frame median at one listing step until two-step gaps are
 /// the *majority*, so it caught 2x decimation cleanly and nothing below about
-/// 1.5x: a browser loop of 17 scans held at 12 drops 29.4% of them and every
+/// 1.5x: a browser loop of 20 scans held at 14 drops 30.0% of them and every
 /// gap the median can see is still one step. Two statistics over the same
 /// timestamps cannot answer a question about the timestamps that were thrown
 /// away.

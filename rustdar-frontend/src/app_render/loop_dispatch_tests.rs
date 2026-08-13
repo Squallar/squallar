@@ -1045,10 +1045,14 @@ fn a_loops_render_set_is_its_span_budget_at_its_own_sites_cadence() {
 /// A loop that has not learned a cadence yet keeps the whole render budget.
 ///
 /// `scan_step_secs` is `None` from `new_for_loop` until a listing is accepted,
-/// and again after a site switch, which rebuilds the state. There is no honest
-/// conversion without it, so the loop behaves exactly as it did before the span
-/// budget existed — erring the other way, by assuming the fastest radar, would
-/// make a loop visibly shed frames a second after opening.
+/// and again after a pane really changes radar, which replaces the whole state.
+/// There is no honest conversion without it, so the loop behaves exactly as it
+/// did before the span budget existed — erring the other way, by assuming the
+/// fastest radar, would make a loop visibly shed frames a second after opening.
+///
+/// Re-picking the site a pane is already on keeps the loop *and* its cadence,
+/// which is a different case and the right answer for it: the figure describes
+/// a radar the pane has not left. See `SwitchRadarSite`'s `left_a_radar` gate.
 #[test]
 fn a_loop_that_has_not_learned_a_cadence_keeps_the_whole_budget() {
     let ctx = egui::Context::default();
@@ -1105,4 +1109,73 @@ fn a_listing_teaches_the_cadence_before_the_frame_count_is_spent() {
         (1 + budgets.loop_span_secs / 360).min(budgets.loop_render_budget),
         "and the count spends that figure, not the arm's ceiling"
     );
+}
+
+/// **Every cap `rustdar_egui::ui_timeline`'s fidelity fixtures name is a cap
+/// this workspace actually ships.**
+///
+/// That crate cannot see `crate::budget` or `crate::constants`, so its
+/// measured-defect table writes the browser and desktop raster caps as bare
+/// numbers. Its doc names this test as the half that reads the resolved budget,
+/// and this is that half: the `held` column of the table, against the three
+/// shipped arms of `MAX_LOOP_FRAMES`.
+///
+/// # It is here because the previous guard could not have worked
+///
+/// The job used to belong to
+/// [`a_listing_one_scan_over_the_cap_is_recorded_as_sampled`], which asserts
+/// `test_budgets().loop_frames_held == MAX_LOOP_FRAMES`. Both sides of that are
+/// the arm *this build compiled* — desktop, on every host — so it is silent
+/// about the browser row by construction. When `LOOP_SPAN_BUDGET_SECS` priced a
+/// browser's 45 minutes at 14 frames and took `WASM_MAX_LOOP_FRAMES` from 12 to
+/// 14, the table went on quoting "12 of a 17-scan listing, 29.4% dropped" — a
+/// sentence about no shipped configuration — and every test in both crates
+/// stayed green. Reading the *named arms* rather than the compiled one is the
+/// whole difference.
+///
+/// What it does not check is the fixture array beneath the table, which is a
+/// second hand-written copy of the same rows. That is stated rather than
+/// papered over: this catches a cap that describes no arm, which is the failure
+/// that happened twice, and not a table and a fixture drifting from each other.
+#[test]
+fn the_caption_fixtures_name_caps_this_workspace_ships() {
+    const HEADER: &str = "| target | listing | held | dropped |";
+    let source = include_str!("../../../rustdar-egui/src/ui_timeline/tests.rs");
+    let caps: Vec<usize> = source
+        .lines()
+        .map(|line| line.trim().trim_start_matches("///").trim())
+        .skip_while(|line| *line != HEADER)
+        .skip(2) // the header and the alignment rule
+        .take_while(|line| line.starts_with('|'))
+        .map(|row| {
+            let cells: Vec<&str> = row
+                .split('|')
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .collect();
+            cells[2]
+                .parse()
+                .unwrap_or_else(|_| panic!("the `held` cell of {row:?} is not a frame count"))
+        })
+        .collect();
+    assert_eq!(
+        caps.len(),
+        2,
+        "the measured-defect table is no longer two rows this can read: {caps:?}",
+    );
+
+    let shipped: Vec<usize> = crate::budget::BudgetLimits::SHIPPED
+        .iter()
+        .map(|limits| limits.loop_frames_held.floor)
+        .collect();
+    for cap in caps {
+        assert!(
+            shipped.contains(&cap),
+            "`ui_timeline`'s fidelity table quotes a {cap}-frame raster cap, and \
+             the arms this workspace ships are {shipped:?}. The table is a claim \
+             about a measured defect on a real target, so a cap belonging to \
+             none of them makes it a claim about nothing — re-derive the row \
+             against the arm that moved.",
+        );
+    }
 }

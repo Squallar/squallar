@@ -819,6 +819,12 @@ fn a_slow_site_shortens_a_3d_loops_list_without_shortening_its_span() {
         Some(newest),
         "the newest scan went, so the loop stops short of what the pane shows",
     );
+    assert_eq!(
+        ls.listing_sampled,
+        Some(true),
+        "the span budget cut the list without the sampler recording it, so the \
+         caption would claim every scan over a list that dropped 31 of them",
+    );
 
     // And the plan-view loop beside it is untouched: a raster frame's history
     // costs no texture until it is in the render set, so holding fewer would

@@ -220,18 +220,26 @@ fn a_decimated_loop_admits_it_is_showing_a_sample() {
 ///
 /// | target | listing | held | dropped |
 /// |---|---|---|---|
-/// | browser | 17 scans, 69 min | 12 | 5, **29.4%** |
+/// | browser | 20 scans, 1h 22m | 14 | 6, **30.0%** |
 /// | desktop | 89 scans, 6h 20m | 60 | 29, **32.6%** |
 ///
 /// The caps appear here as bare numbers because the figure the application
 /// resolves them from — `budget::Budgets::loop_frames_held` — lives in the
 /// frontend crate and this one cannot see it. The half that reads the resolved
-/// budget, and so would catch either row drifting from it, is
-/// `a_listing_one_scan_over_the_cap_is_recorded_as_sampled` in the frontend's
-/// `app_render/loop_dispatch_tests.rs`.
+/// budget is `the_caption_fixtures_name_caps_this_workspace_ships` in the
+/// frontend's `app_render/loop_dispatch_tests.rs`, which parses the two `held`
+/// cells of the table above and requires each to be a shipped arm.
+///
+/// It used to name `a_listing_one_scan_over_the_cap_is_recorded_as_sampled`
+/// for that job, and that test cannot do it: it reads
+/// `test_budgets().loop_frames_held`, which on a host build is the **desktop**
+/// arm and says nothing about the browser row. So when
+/// `constants::LOOP_SPAN_BUDGET_SECS` moved the browser cap from 12 to 14, the
+/// browser row went stale with every test in both crates still green — which is
+/// the failure this table's own existence is an argument against.
 #[test]
 fn a_loop_that_dropped_a_third_of_the_scans_never_claims_every_scan() {
-    for (listing_scans, held, dropped_pct) in [(17usize, 12usize, 29.4), (89, 60, 32.6)] {
+    for (listing_scans, held, dropped_pct) in [(20usize, 14usize, 30.0), (89, 60, 32.6)] {
         let (frames, sampled) = loop_from_listing(&vec![WSR_PRECIP; listing_scans - 1], held);
         assert_eq!(frames.len(), held, "precondition: the loop filled its cap");
         let dropped = listing_scans - held;
@@ -262,7 +270,7 @@ fn a_loop_that_dropped_a_third_of_the_scans_never_claims_every_scan() {
 /// than the listing's own median step. Both are medians over the same
 /// timestamps, so even sampling keeps the frame median at exactly one listing
 /// step until two-step gaps are the *majority* — which needs a listing more
-/// than twice the cap. At 17-into-12 and at 89-into-60 the frame median is still
+/// than twice the cap. At 20-into-14 and at 89-into-60 the frame median is still
 /// one step and the rule is silent, whatever fraction was dropped.
 ///
 /// This is the property rather than the symptom: the signal is blind below
@@ -270,7 +278,7 @@ fn a_loop_that_dropped_a_third_of_the_scans_never_claims_every_scan() {
 /// worked.
 #[test]
 fn the_frame_medians_own_step_is_blind_to_a_third_of_the_scans_going_missing() {
-    for (listing_scans, held) in [(17usize, 12usize), (89, 60)] {
+    for (listing_scans, held) in [(20usize, 14usize), (89, 60)] {
         let (frames, _) = loop_from_listing(&vec![WSR_PRECIP; listing_scans - 1], held);
         let mut gaps: Vec<i64> = frames
             .windows(2)
