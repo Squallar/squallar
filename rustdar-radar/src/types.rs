@@ -1,4 +1,4 @@
-use crate::site_position::{SitePosition, SitePositionSource};
+use crate::site_position::{CATALOGUE_DISAGREEMENT_LIMIT_KM, SitePosition, SitePositionSource};
 use crate::sites::RadarSite;
 use crate::sites::get_radar_site;
 use chrono::NaiveDateTime;
@@ -572,6 +572,42 @@ pub struct ScanInfo {
     pub status: String,
 }
 
+/// Whether the fetched catalogue agrees that `site` is where `stated` puts it,
+/// or has nothing to say about `site` at all.
+///
+/// The one thing standing between a volume's two unchecked `Real*4` coordinate
+/// fields and a position that outranks every other source and is then
+/// persisted. See [`ScanInfo::from_scan`] for the rule and
+/// [`CATALOGUE_DISAGREEMENT_LIMIT_KM`] for the measurement behind the distance.
+///
+/// `true` when the catalogue cannot speak, which is the honest answer rather
+/// than a lenient one: a radar the catalogue has never placed has no second
+/// opinion to be confirmed by, and refusing it a position would leave it with
+/// none at all.
+///
+/// Pinned by `a_volume_that_disagrees_with_the_catalogue_does_not_displace_it`.
+fn confirmed_by_catalogue(site: &str, stated: &SitePosition) -> bool {
+    let Some((lat, lon)) = crate::sites::catalogue_position(site) else {
+        return true;
+    };
+    let apart_km = crate::sites::distance_km(stated.lat(), stated.lon(), lat, lon);
+    if apart_km > CATALOGUE_DISAGREEMENT_LIMIT_KM {
+        // Error, not warning. Every reachable cause is something somebody
+        // needs to see: a corrupt Volume Data Block, a producer writing a
+        // scale nothing here recognises, or a radar that genuinely relocated
+        // and whose catalogue entry has not caught up. The last of those is
+        // the only benign one and it is still a thing to act on.
+        log::error!(
+            "volume for {site} states ({:.5}, {:.5}), {apart_km:.1} km from where the \
+             catalogue places it ({lat:.5}, {lon:.5}); keeping the catalogue's position",
+            stated.lat(),
+            stated.lon(),
+        );
+        return false;
+    }
+    true
+}
+
 impl ScanInfo {
     /// Level III products are listed with empty elevation vectors, filled in
     /// later as L3 data arrives.
@@ -596,6 +632,30 @@ impl ScanInfo {
     ///    it is a step function — `KTLX` made one 43 m re-survey step between
     ///    2013 and 2016 — so a disagreement means a re-survey happened and the
     ///    newer value is the right one.
+    ///
+    ///    **Within a kilometre of the fetched catalogue, and not otherwise.**
+    ///    A radar reporting itself outranks a record about it by metres, which
+    ///    is the scale radars actually move at; it does not get to outrank it
+    ///    by kilometres. The volume's coordinates are two `Real*4` fields with
+    ///    no checksum over them, and one of the two readings this workspace
+    ///    takes of them — `nexrad_decode`'s thousandths repair, for the older
+    ///    TDWR producer — is an inference that damage in those same fields can
+    ///    satisfy: `(100, -100)` is not a position, divides into one, and
+    ///    would place the radar in the Gulf of Guinea. Nothing inside the
+    ///    volume can tell that apart from a real repair, so it is told apart
+    ///    here, against the one source no volume wrote. See
+    ///    [`CATALOGUE_DISAGREEMENT_LIMIT_KM`] for where the kilometre comes
+    ///    from — it is measured, and it sits in a band four orders of magnitude
+    ///    wide that the archive puts nothing in.
+    ///
+    ///    The check is skipped, not failed, when no catalogue has placed the
+    ///    radar: a fresh install before its first fetch, and the two
+    ///    identifiers with real Level II data that `api.weather.gov` 404s
+    ///    (`TPBI`, `KCRI`). Those keep the volume's word. That is the cost of
+    ///    confirming against an outside source — where there is no outside
+    ///    source there is no confirmation — and it is preferred to the
+    ///    alternative of refusing them a position at all, which would take the
+    ///    whole terminal-radar repair back off `TPBI`.
     ///
     /// 2. **A position learned from an earlier volume**, supplied by the
     ///    caller out of its own store. This is what makes a site stay
@@ -626,11 +686,11 @@ impl ScanInfo {
         // the precedence below reads a product or a timestamp, so it is free
         // to move up here.
         let row = get_radar_site(site);
-        let (site_position, site_source) = match (
-            data.site().and_then(SitePosition::from_volume),
-            learned,
-            row.is_some(),
-        ) {
+        let stated = data
+            .site()
+            .and_then(SitePosition::from_volume)
+            .filter(|stated| confirmed_by_catalogue(site, stated));
+        let (site_position, site_source) = match (stated, learned, row.is_some()) {
             (Some(volume), _, _) => (Some(volume), SitePositionSource::Volume),
             (None, Some(learned), _) => (Some(learned), SitePositionSource::Learned),
             (None, None, true) => (None, SitePositionSource::Table),

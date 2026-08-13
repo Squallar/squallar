@@ -5,14 +5,14 @@
 //! release — the same arrangement, for the same reason, as
 //! `crate::messages::framing_tests`.
 //!
-//! The three blocks quoted below are verbatim: 40 or 48 bytes lifted out of a
+//! The four blocks quoted below are verbatim: 40 or 48 bytes lifted out of a
 //! real archive, starting at the byte after the block's `RVOL` identifier. Each
 //! names the volume it came from, so a reader can pull the same file and get
 //! the same bytes.
 
 use super::raw::{VolumeDataBlock as RawModern, VolumeDataBlockLegacy as RawLegacy};
 use super::VolumeDataBlock;
-use crate::messages::raw::primitive_aliases::Real4;
+use crate::messages::raw::primitive_aliases::{Integer2, Real4};
 use zerocopy::FromBytes;
 
 /// `s3://unidata-nexrad-level2/2020/08/10/TORD/TORD20200810_203830_V08`, the
@@ -41,6 +41,19 @@ const KTLX_2026: [u8; 48] = [
     0x42, 0x70, 0x00, 0x00, 0x00, 0xd4, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
+/// `s3://unidata-nexrad-level2/2020/08/10/KAMX/KAMX20200810_000424_V06`, a
+/// WSR-88D's VOL block **in the 40-byte format**: `lrtup` 44, version 2.0.
+///
+/// The control [`KTLX_2026`] cannot be. A block that is legacy and is still not
+/// a terminal radar's, which is the only thing that can show the block *format*
+/// is not what the reading turns on: its two heights are 4 m of ground under a
+/// 29 m tower — `00 04` then `00 1d` — where a TDWR states one figure twice.
+const KAMX_2020: [u8; 40] = [
+    0x00, 0x2c, 0x02, 0x00, 0x41, 0xcc, 0xe3, 0x80, 0xc2, 0xa0, 0xd3, 0x49, 0x00, 0x04, 0x00, 0x1d,
+    0xc2, 0x36, 0xc9, 0x16, 0x43, 0xae, 0xe4, 0xd7, 0x43, 0x98, 0xef, 0x35, 0xbe, 0xfb, 0x52, 0x04,
+    0x42, 0x70, 0x00, 0x00, 0x00, 0xd4, 0x00, 0x01,
+];
+
 /// The `f32` pair sitting in a quoted block's latitude and longitude, read
 /// straight out of the bytes rather than through the accessors under test.
 fn stated(bytes: &[u8]) -> (f32, f32) {
@@ -49,12 +62,17 @@ fn stated(bytes: &[u8]) -> (f32, f32) {
     (lat, lon)
 }
 
-/// A legacy block carrying `lat`/`lon` and nothing else that matters here.
-fn legacy_at(lat: f32, lon: f32) -> RawLegacy {
-    let mut raw = RawLegacy::read_from_bytes(&TORD_2026[..]).expect("40 bytes is the legacy block");
+/// `bytes` as a legacy block, carrying `lat`/`lon` in place of its own.
+fn legacy_from(bytes: &[u8; 40], lat: f32, lon: f32) -> RawLegacy {
+    let mut raw = RawLegacy::read_from_bytes(&bytes[..]).expect("40 bytes is the legacy block");
     raw.latitude = Real4::new(lat);
     raw.longitude = Real4::new(lon);
     raw
+}
+
+/// A legacy block carrying `lat`/`lon` and nothing else that matters here.
+fn legacy_at(lat: f32, lon: f32) -> RawLegacy {
+    legacy_from(&TORD_2026, lat, lon)
 }
 
 /// The position a legacy block carrying `lat`/`lon` decodes to.
@@ -64,8 +82,27 @@ fn read_back(lat: f32, lon: f32) -> (f32, f32) {
     (block.latitude_raw(), block.longitude_raw())
 }
 
-/// The pre-2021-09-15 TDWR producer's thousandths are read as the degrees they
-/// mean. Chicago O'Hare's terminal radar is at 41.797 °N, 87.858 °W.
+/// Every pair the review found that a purely numeric reading turns into a
+/// place, with what each one is.
+///
+/// All three are integral, all three are outside the ICD's range, and a
+/// thousandth of each is a legal coordinate — so all three satisfy
+/// [`super::volume_data_block`]'s numeric half in full, and the numeric half is
+/// the whole of what used to be asked.
+const FORGERIES: [((f32, f32), &str); 3] = [
+    (
+        (100.0, -100.0),
+        "two bytes of damage that divide into the Gulf of Guinea",
+    ),
+    ((91.0, 181.0), "a pair one degree outside both ranges"),
+    (
+        (4180.0, -8786.0),
+        "what a hundredths producer would write for TORD, 4,180 km adrift",
+    ),
+];
+
+/// The older TDWR producer's thousandths are read as the degrees they mean.
+/// Chicago O'Hare's terminal radar is at 41.797 °N, 87.858 °W.
 #[test]
 fn a_tdwr_position_in_thousandths_is_read_in_degrees() {
     let raw = RawLegacy::read_from_bytes(&TORD_2020[..]).expect("40 bytes is the legacy block");
@@ -208,4 +245,113 @@ fn the_rest_of_the_block_is_untouched() {
     assert_eq!(block.site_height_raw(), 226);
     assert_eq!(block.tower_height_raw(), 226);
     assert_eq!(block.volume_coverage_pattern_number(), 80);
+}
+
+/// A block that states two different heights is a WSR-88D's, and a WSR-88D's
+/// coordinates are never rescaled — not even a pair that reads perfectly as
+/// thousandths.
+///
+/// The condition this is the whole justification for. `KAMX`'s 2020 volume is a
+/// **legacy** block, so the format cannot be what refuses it, and version 2.0,
+/// so nothing about the version needs to be believed either: what refuses it is
+/// that it reports 4 m of ground under a 29 m tower where a terminal radar
+/// reports one figure twice.
+///
+/// Both rows matter. The first is `TORD`'s own thousandths in a WSR-88D-shaped
+/// block, which must come back untouched even though every numeric condition
+/// holds — that is the difference between reading a producer and rescaling
+/// whatever divides. The rest are the forgeries, which a numeric-only reading
+/// turned into places.
+#[test]
+fn a_block_stating_two_heights_is_never_rescaled() {
+    let control = RawLegacy::read_from_bytes(&KAMX_2020[..]).expect("40 bytes is the legacy block");
+    let control = VolumeDataBlock::new_legacy(&control);
+    assert!(control.is_legacy(), "the control must be a legacy block");
+    assert_ne!(
+        i32::from(control.site_height_raw()),
+        i32::from(control.tower_height_raw()),
+        "and must state its tower separately, or it proves nothing",
+    );
+
+    for (pair, what) in [((41_797.0_f32, -87_858.0_f32), "TORD's own thousandths")]
+        .into_iter()
+        .chain(FORGERIES)
+    {
+        let raw = legacy_from(&KAMX_2020, pair.0, pair.1);
+        let block = VolumeDataBlock::new_legacy(&raw);
+        assert_eq!(
+            (
+                block.latitude_raw().to_bits(),
+                block.longitude_raw().to_bits()
+            ),
+            (pair.0.to_bits(), pair.1.to_bits()),
+            "({}, {}) — {what} — was rescaled in a block that states two heights",
+            pair.0,
+            pair.1,
+        );
+    }
+}
+
+/// The 48-byte block is never rescaled either, whatever it carries.
+///
+/// The second structural condition, and the one that puts the entire current
+/// WSR-88D fleet out of reach: every radar on Build 20.0 or later writes this
+/// block, and no volume ever observed in thousandths does. `KTLX`'s heights are
+/// 370 and 19, so this is deliberately checked with the heights *also* forced
+/// equal — the format alone has to be enough.
+#[test]
+fn a_modern_block_is_never_rescaled() {
+    for (pair, what) in [((41_797.0_f32, -87_858.0_f32), "TORD's own thousandths")]
+        .into_iter()
+        .chain(FORGERIES)
+    {
+        let mut raw =
+            RawModern::read_from_bytes(&KTLX_2026[..]).expect("48 bytes is the modern block");
+        raw.latitude = Real4::new(pair.0);
+        raw.longitude = Real4::new(pair.1);
+        raw.tower_height = Integer2::new(raw.site_height.get().unsigned_abs());
+        let block = VolumeDataBlock::new(&raw);
+        assert!(!block.is_legacy(), "lrtup 52 is the 48-byte block");
+        assert_eq!(
+            i32::from(block.site_height_raw()),
+            i32::from(block.tower_height_raw()),
+            "the heights were forced equal so the format is the only thing left",
+        );
+        assert_eq!(
+            (
+                block.latitude_raw().to_bits(),
+                block.longitude_raw().to_bits()
+            ),
+            (pair.0.to_bits(), pair.1.to_bits()),
+            "({}, {}) — {what} — was rescaled in a 48-byte block",
+            pair.0,
+            pair.1,
+        );
+    }
+}
+
+/// **This is what the block cannot decide**, stated as behaviour rather than
+/// left in a comment.
+///
+/// Damage confined to the two coordinates of an otherwise genuine terminal
+/// block satisfies every condition there is — the block really is 40 bytes, it
+/// really does state one height twice, and the pair really does divide into a
+/// place. So each forgery still becomes a coordinate here, and each is refused
+/// one rung up, where a position can be held against a source outside the
+/// volume it came from: `rustdar_radar::types::ScanInfo::from_scan`, pinned by
+/// `a_volume_that_disagrees_with_the_catalogue_does_not_displace_it`.
+///
+/// A future reading that closes this door will fail here, and that is the
+/// point: the numbers below are not a guarantee anybody wants, they are the
+/// measured size of the hole, and moving them should take an argument.
+#[test]
+fn a_forged_pair_in_a_terminal_block_is_not_refused_here() {
+    for ((lat, lon), what) in FORGERIES {
+        let (out_lat, out_lon) = read_back(lat, lon);
+        assert_eq!(
+            (out_lat, out_lon),
+            (lat / 1000.0, lon / 1000.0),
+            "({lat}, {lon}) — {what} — is expected to still divide here",
+        );
+    }
 }
