@@ -577,7 +577,7 @@ impl RenderInput {
     /// payload the extraction has already built.
     ///
     /// A second step and not an [`extract`](Self::extract) argument, for the
-    /// reason [`declaring_nyquist`](Self::declaring_nyquist) is one: the
+    /// reason [`with_declared_nyquist`](Self::with_declared_nyquist) is one: the
     /// object is fetched on its own schedule and pairs to the volume by its
     /// PDB, so it arrives after the moments do — and a caller that has no
     /// object simply does not call this, rather than threading a `None`

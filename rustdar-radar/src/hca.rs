@@ -1034,7 +1034,7 @@ impl MeltingLayer {
     ///
     /// Only the two **beam-centre** rings supply the answer, inverted through
     /// `melting_layer.c`'s own `IR·RE` beam-height model
-    /// ([`ml_height_from_range`]). That is deliberate: a centre ring needs no
+    /// (`ml_height_from_range`). That is deliberate: a centre ring needs no
     /// beamwidth, so the recovery does not inherit the 0.95°-vs-1.0°
     /// ambiguity between the real half-power beamwidth and the 1° this
     /// module's `hca_beamMLIntersection.c` transcription uses. The two edge
@@ -1201,10 +1201,10 @@ impl MeltingLayerRecovery {
 ///
 /// Half a beamwidth of elevation moves the crossing range, and the crossing
 /// range moves the height; at the ~1.5–2.5 km layer heights this product
-/// draws at, that is a couple of hundred metres. Measured across the ten
-/// campaign volumes the worst azimuth came to 0.11 km, so this is not a
-/// tuned bound — it is a bound the real data sits an order of magnitude
-/// inside.
+/// draws at, that is a couple of hundred metres. Measured across the
+/// ten-volume roster the worst azimuth of the worst site came to 0.15 km
+/// (KMLB; eight of ten sites stay under 0.045), so this is not a tuned bound
+/// — it is a bound the real data sits well inside.
 const MAX_ML_INCONSISTENCY_KM: f64 = 0.5;
 
 /// Per whole degree of azimuth, the radius of one contour, km.
