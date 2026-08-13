@@ -543,6 +543,43 @@ fn preprocess_velocity_with(
 const PROFILE_LAYER_KM: f64 = 0.3;
 /// Layers span 0..12 km AGL.
 const PROFILE_LAYERS: usize = 40;
+
+/// How far an unfitted layer may be filled from the nearest fitted one, in
+/// layers — 3, so **0.9 km** at [`PROFILE_LAYER_KM`].
+///
+/// # The two fills disagreed, and the unbounded one was the shipped one
+///
+/// [`WindProfile::from_levels`] has always bounded this fill to ±3 layers.
+/// [`WindProfileBuilder::finish`], right beside it and the constructor the
+/// render path actually uses, bounded it not at all: every unfitted layer took
+/// the nearest fitted layer's wind however far away that was, so the profile
+/// **always returned 40 of 40 layers** whenever a single layer anywhere fit.
+///
+/// Two things followed, both of them the code claiming more than it could
+/// support:
+///
+/// - [`crate::srv::BUNKERS_MIN_MEAN_LAYERS`] asks for 12 of the twenty 0–6 km
+///   layers to carry a fit before it will call their mean "the 0–6 km mean
+///   wind". Against a profile that always answers, that count was always 20
+///   and the refusal **could never fire** — dead code guarding a threshold
+///   nothing could cross.
+/// - Bunkers reads its shear from the 5.5–6.0 km band. At 7 of the 13 sites
+///   held, no layer near 6 km fit anything, and that band was a clamp-copy of
+///   a much lower layer — so the shear vector was computed between two winds
+///   that were, in part, the same wind, and reported as though it were not.
+///
+/// # Why 3 and not another number
+///
+/// It is not a new number: it is the bound `from_levels` already applied, now
+/// applied by both. Making the two agree is most of the point — one profile
+/// type with one filling rule, rather than a rule that depends on which
+/// constructor a caller happened to reach for.
+///
+/// 0.9 km is also the distance over which "winds vary slowly with height" —
+/// the justification the unbounded fill was written under — is actually true.
+/// It stays true across a layer or three and stops being true across the eight
+/// kilometres the unbounded fill was willing to reach.
+const PROFILE_FILL_MAX_LAYERS: i64 = 3;
 /// Sample cap per layer keeps memory bounded on wasm. A volume offers far
 /// more than this: KCRP 2017-08-26 04:41:14 has 326 657 gates to give the
 /// twenty layers under 6 km, and its lowest layer alone is offered more than
@@ -629,7 +666,7 @@ impl WindProfile {
                     .iter()
                     .min_by_key(|&&f| (f as i64 - l as i64).unsigned_abs());
                 if let Some(&f) = nearest
-                    && (f as i64 - l as i64).unsigned_abs() <= 3
+                    && (f as i64 - l as i64).abs() <= PROFILE_FILL_MAX_LAYERS
                 {
                     layers[l] = layers[f];
                 }
@@ -902,23 +939,28 @@ impl WindProfileBuilder {
             })
             .collect();
         let mut layers: Vec<Option<(f64, f64, f64)>> = layers;
-        // Clamp-extrapolate every unfitted layer from the nearest fitted one:
-        // winds vary slowly with height, and a None prediction is worse than
-        // the nearest fitted layer's — it vetoes every wind seed tile whose
-        // beam reaches that height. Measured once: without the extension most
-        // of the reference's far band is lost. The far-band counts behind that
-        // sentence are gone — branch `campaign-harness` has the probe that
-        // would count them again, not the count.
+        // Clamp-extrapolate every unfitted layer from the nearest fitted one,
+        // out to [`PROFILE_FILL_MAX_LAYERS`]: winds vary slowly with height,
+        // and a None prediction is worse than a near neighbour's — it vetoes
+        // every wind seed tile whose beam reaches that height. Measured once:
+        // without the extension most of the reference's far band is lost. The
+        // far-band counts behind that sentence are gone — branch
+        // `campaign-harness` has the probe that would count them again, not
+        // the count.
+        //
+        // The bound is what `from_levels` has always applied and this did not.
+        // Unbounded, "the nearest fitted layer" could be eight kilometres away
+        // and the profile answered all 40 layers whenever any one of them fit
+        // — which is why `srv::BUNKERS_MIN_MEAN_LAYERS` could never refuse.
         let filled: Vec<usize> = (0..layers.len()).filter(|&l| layers[l].is_some()).collect();
-        if !filled.is_empty() {
-            for l in 0..layers.len() {
-                if layers[l].is_none() {
-                    let f = *filled
-                        .iter()
-                        .min_by_key(|&&f| (f as i64 - l as i64).unsigned_abs())
-                        .unwrap();
-                    layers[l] = layers[f];
-                }
+        for l in 0..layers.len() {
+            if layers[l].is_none()
+                && let Some(&f) = filled
+                    .iter()
+                    .min_by_key(|&&f| (f as i64 - l as i64).unsigned_abs())
+                && (f as i64 - l as i64).abs() <= PROFILE_FILL_MAX_LAYERS
+            {
+                layers[l] = layers[f];
             }
         }
         any.then_some(WindProfile { layers })
@@ -4654,6 +4696,94 @@ mod tests {
             builder.finish().is_none(),
             "an 11.7 kt residual is over the RPG's 9.7 kt ceiling and must not \
              be published as a wind",
+        );
+    }
+
+    /// A volume that never sampled 6 km does not get to answer at 6 km.
+    ///
+    /// [`vad_sweep`]'s geometry — 200 gates a kilometre apart from 1 km, at
+    /// 0.5° — tops out at 199 km slant, which the beam puts at **4.068 km**.
+    /// So layers 0–13 collect samples (720 at the thinnest, well over the
+    /// 200-sample floor) and layers 14–39 collect none at all.
+    ///
+    /// [`PROFILE_FILL_MAX_LAYERS`] says the fill reaches three layers past the
+    /// top fitted one and stops: 14, 15 and 16 are the nearest fitted layer's
+    /// wind, and 17 upward are `None`. Unbounded — which is what `finish`
+    /// shipped — **all** of 14–39 answered, so a profile fitted on a volume
+    /// that saw nothing above 4 km reported a wind at 11.85 km, and
+    /// `srv::BUNKERS_MIN_MEAN_LAYERS` counted twenty of twenty every time.
+    ///
+    /// The layer indices here are arithmetic on the fixture's own geometry,
+    /// not readings taken from the profile under test.
+    #[test]
+    fn the_fill_reaches_three_layers_past_the_top_fitted_one_and_stops() {
+        let wind = (13.0, 4.0);
+        let (grid, azimuths) = vad_cut(360, 0.0, 1.0, wind, 0.5);
+        let mut builder = WindProfileBuilder::new();
+        builder.add_sweep(&vad_sweep(&grid, &azimuths), 0.5);
+        let profile = builder.finish().expect("layers 0-13 fit");
+
+        let centre = |l: usize| (l as f64 + 0.5) * PROFILE_LAYER_KM;
+        // 13 is the top layer the beam reached, and it fit.
+        assert!(
+            profile.wind_at_km(centre(13)).is_some(),
+            "layer 13 is the top layer this geometry samples and must fit",
+        );
+        // 14, 15, 16 are the fill, and carry layer 13's wind.
+        for l in 14..=16 {
+            let (u, v) = profile
+                .wind_at_km(centre(l))
+                .unwrap_or_else(|| panic!("layer {l} is within the fill's reach"));
+            assert!(
+                (u - wind.0).abs() < 1e-6 && (v - wind.1).abs() < 1e-6,
+                "layer {l} is a clamp-copy and must carry the fitted wind",
+            );
+        }
+        // 17 is one layer too far, and so is everything above it.
+        for l in 17..PROFILE_LAYERS {
+            assert!(
+                profile.wind_at_km(centre(l)).is_none(),
+                "layer {l} is {} layers past the top fitted one and must not \
+                 answer; unbounded, this profile answered at every layer to 39",
+                l - 13,
+            );
+        }
+    }
+
+    /// The two constructors fill by the same rule.
+    ///
+    /// `from_levels` has always bounded the fill to
+    /// [`PROFILE_FILL_MAX_LAYERS`]; `finish` did not, and `finish` is the one
+    /// the render path uses. This pins them together at the boundary — three
+    /// layers out answers, four does not — so the rule cannot drift back apart
+    /// in one of them.
+    #[test]
+    fn both_constructors_fill_to_the_same_reach() {
+        let centre = |l: usize| (l as f64 + 0.5) * PROFILE_LAYER_KM;
+        // One level, at the bottom: everything else is fill or nothing.
+        let from_levels = WindProfile::from_levels(&[(0.0, 7.0, -3.0)]).expect("one level is a profile");
+        let reach = PROFILE_FILL_MAX_LAYERS as usize;
+        assert!(
+            from_levels.wind_at_km(centre(reach)).is_some(),
+            "from_levels must fill {reach} layers out",
+        );
+        assert!(
+            from_levels.wind_at_km(centre(reach + 1)).is_none(),
+            "from_levels must stop at {reach} layers out",
+        );
+
+        // And `finish`, whose top fitted layer is 13 by the geometry above.
+        let (grid, azimuths) = vad_cut(360, 0.0, 1.0, (7.0, -3.0), 0.5);
+        let mut builder = WindProfileBuilder::new();
+        builder.add_sweep(&vad_sweep(&grid, &azimuths), 0.5);
+        let finished = builder.finish().expect("layers 0-13 fit");
+        assert!(
+            finished.wind_at_km(centre(13 + reach)).is_some(),
+            "finish must fill {reach} layers out, the same as from_levels",
+        );
+        assert!(
+            finished.wind_at_km(centre(13 + reach + 1)).is_none(),
+            "finish must stop at {reach} layers out, the same as from_levels",
         );
     }
 

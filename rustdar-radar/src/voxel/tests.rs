@@ -347,10 +347,30 @@ fn six_moment_scan() -> Scan {
         vcp(&[0.5, 4.5]),
         vec![
             sweep(1, LOW_DEG, 117.5, LOW_GATES),
-            sweep(2, HIGH_DEG, 41.0, HIGH_GATES),
+            sweep(2, HIGH_DEG, 41.0, SIX_MOMENT_HIGH_GATES),
         ],
     )
 }
+
+/// [`six_moment_scan`]'s upper tilt runs to 320 gates — 81.9 km slant, which
+/// at 4.47° the beam puts at **6.78 km** — where [`scan_of`]'s stops at
+/// [`HIGH_GATES`].
+///
+/// Not a free choice, and not the same question [`HIGH_GATES`] answers.
+/// `scan_of` truncates deliberately, at 51.9 km, because range truncation is
+/// one of the things its tests are about. `six_moment_scan` exists so every
+/// product builds a *real* grid, and SRV is a product whose grid does not
+/// exist below a certain height: `srv::bunkers_right_mover_uv` reads its shear
+/// from the 5.5–6.0 km band, and refuses outright when that band is empty.
+///
+/// At [`HIGH_GATES`] this volume reached 4.20 km and that band was empty. It
+/// nevertheless answered, because `WindProfileBuilder::finish` filled every
+/// unfitted layer from the nearest fitted one at any distance — so the shear
+/// was computed between the 4.05 km wind and itself, and SRV built on it.
+/// `nrot::PROFILE_FILL_MAX_LAYERS` stops that, `BUNKERS_MIN_MEAN_LAYERS` and
+/// the empty-band refusal became reachable, and the fixture had to start
+/// sampling the air it was claiming to describe.
+const SIX_MOMENT_HIGH_GATES: usize = 320;
 
 /// Three rungs that all reach 100 km, with reflectivity above threshold on
 /// **exactly one** of them (or none).
