@@ -972,6 +972,18 @@ fn a_reused_widening_buffer_is_the_plane_a_fresh_one_would_be() {
 /// `tests/volume_gpu.rs`, is the property test; this is the one that runs
 /// without a GPU. That one is `#[ignore]`d because it needs an adapter, so on
 /// a row without one this scan is the only cover the property has.
+///
+/// The anisotropy, in numbers, so a future reader who wants to simplify the
+/// shader can see what it costs: The wrong formula gives every direction
+/// the box's diagonal — 340 km on the 240 x 240 x 20 km box the volume
+/// actually uses — where the right one gives each axis-aligned ray that
+/// axis' own extent. A vertical step is therefore ~17x too long (340/20)
+/// and a horizontal one ~1.4x (340/240), leaving a vertical ray ~12x more
+/// opaque relative to a horizontal one — exactly the box's aspect ratio
+/// (240/20). Both figures are worth having: the absolute one says how far
+/// off a vertical ray is, and the relative one is why the result reads as
+/// haze rather than as a bug — the whole image gets denser together, so
+/// nothing looks inconsistent.
 #[test]
 fn the_step_length_scales_the_direction_not_just_the_box() {
     assert!(
@@ -984,52 +996,6 @@ fn the_step_length_scales_the_direction_not_just_the_box() {
         "the shader takes the length of the box size without the ray \
              direction, which makes opacity per step depend on nothing but the \
              box's diagonal"
-    );
-}
-
-/// The anisotropy the guard above exists to prevent, stated as numbers.
-///
-/// A source scan pins the text; this pins the *reason*, so a future reader
-/// who wants to simplify the shader can see what it costs. Both figures are
-/// worth having: the absolute one says how far off a vertical ray is, and
-/// the relative one is why the result reads as haze rather than as a bug —
-/// the whole image gets denser together, so nothing looks inconsistent.
-///
-/// The box is the one the volume actually uses: 240 km across, 20 km deep.
-#[test]
-fn the_wrong_step_length_is_seventeen_times_off_and_twelve_times_anisotropic() {
-    let box_size_km = [240.0f64, 240.0, 20.0];
-    // The wrong formula, `dt * length(box_size_km)`, gives every direction
-    // the box's diagonal.
-    let wrong = box_size_km.iter().map(|km| km * km).sum::<f64>().sqrt();
-
-    // The right one gives each axis-aligned ray that axis' own extent.
-    let vertical = box_size_km[2];
-    let horizontal = box_size_km[0];
-
-    let vertical_inflation = wrong / vertical;
-    let horizontal_inflation = wrong / horizontal;
-    assert!(
-        (16.5..17.5).contains(&vertical_inflation),
-        "a vertical step would be {vertical_inflation:.1}x too long, not \
-             the ~17x the shader's comment claims"
-    );
-    assert!(
-        (1.3..1.5).contains(&horizontal_inflation),
-        "a horizontal step would be {horizontal_inflation:.1}x too long, \
-             not the ~1.4x the shader's comment claims"
-    );
-
-    let anisotropy = vertical_inflation / horizontal_inflation;
-    assert!(
-        (11.5..12.5).contains(&anisotropy),
-        "the bug would leave a vertical ray {anisotropy:.1}x more opaque \
-             relative to a horizontal one, not the ~12x claimed"
-    );
-    assert!(
-        (anisotropy - horizontal / vertical).abs() < 1e-9,
-        "the relative distortion is exactly the box's aspect ratio, and \
-             this arithmetic no longer says so"
     );
 }
 

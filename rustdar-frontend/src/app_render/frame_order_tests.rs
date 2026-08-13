@@ -1,72 +1,43 @@
 use super::{SurfaceStatus, finish_then_acquire};
 
-/// Drive one frame whose surface acquisition fails.
+/// The two facts about refused surfaces this file still has to test: the
+/// status `acquire` returns comes back to the caller, and egui stays fully
+/// usable — pending scale changes included — after any number of refused
+/// frames.
 ///
-/// `status` ignores the finished pass it is handed; production uses that
-/// argument to make acquiring without one a compile error.
-fn skipped_frame(ctx: &egui::Context, status: fn(&egui::FullOutput) -> SurfaceStatus) {
-    ctx.begin_pass(egui::RawInput::default());
-    let (_finished, _status) = finish_then_acquire(|| ctx.end_pass(), status);
-}
-
-/// A frame that cannot acquire a surface must still end egui's pass.
-///
-/// `cumulative_pass_nr` is incremented by `Context::end_pass` and by nothing
-/// else, so it counts passes that actually completed. That is what tells
-/// "the pass ended and then the frame was abandoned" apart from "the frame
-/// was abandoned with the pass still open" — and only the second one leaks.
+/// This file used to assert finish-before-acquire ordering with pass
+/// counts. It no longer does, because the ordering is enforced by the type
+/// signature and cannot be broken while the code compiles:
+/// `finish_then_acquire` takes `finish_pass: impl FnOnce() -> P` and
+/// `acquire: impl FnOnce(&P) -> SurfaceStatus`, so the only `&P` that
+/// `acquire` can be handed is the one `finish_pass` produced — `P` flows
+/// from finish into acquire, and data flow, not statement order, carries
+/// the requirement. The production wiring at `app_render.rs:1929` is
+/// type-enforced the same way: `get_surface_texture` demands the
+/// `&PreparedFrame` that only `end_pass_and_upload` returns, so acquiring
+/// there without a finished pass fails to compile too.
 #[test]
-fn a_lost_surface_still_ends_the_egui_pass() {
+fn a_refused_surface_reaches_the_caller_and_scale_changes_still_apply() {
     let ctx = egui::Context::default();
 
+    // The status the closure returns is the status the caller sees — this
+    // is the value production matches on to decide to skip or reconfigure.
     ctx.begin_pass(egui::RawInput::default());
-    assert_eq!(ctx.cumulative_pass_nr(), 0, "pass is open, not yet ended");
-
     let (_finished, status) = finish_then_acquire(|| ctx.end_pass(), |_| SurfaceStatus::Lost);
-
     assert!(matches!(status, SurfaceStatus::Lost));
-    assert_eq!(
-        ctx.cumulative_pass_nr(),
-        1,
-        "the pass must be ended even though the surface was lost"
-    );
-}
 
-/// Repeated surface failures must not accumulate open passes.
-#[test]
-fn every_skipped_frame_completes_its_pass() {
-    let ctx = egui::Context::default();
-    const FRAMES: u64 = 5;
-
-    for _ in 0..FRAMES {
-        skipped_frame(&ctx, |_| SurfaceStatus::Skip);
-    }
-
-    assert_eq!(
-        ctx.cumulative_pass_nr(),
-        FRAMES,
-        "each skipped frame should have completed exactly one pass"
-    );
-}
-
-/// The user-visible half of the leak.
-///
-/// egui only consumes a pending zoom/scale change when it believes it is on
-/// the outermost viewport, and it stops believing that the moment one pass
-/// is left open — `begin_pass` pushes onto the viewport stack and only
-/// `end_pass` pops it. So a window moved to a different-DPI monitor after
-/// any skipped frame would never rescale again.
-///
-/// This asserts on a value the production path actually reads back:
-/// `end_pass_and_upload` tessellates at `ctx.pixels_per_point()`.
-#[test]
-fn scale_changes_still_apply_after_frames_the_surface_refused() {
-    let ctx = egui::Context::default();
-
+    // And after frames the surface refused, a pending zoom/scale change
+    // must still apply. egui only consumes one when it believes it is on
+    // the outermost viewport — `begin_pass` pushes onto the viewport stack
+    // and only `end_pass` pops it — so a single pass left open by a skipped
+    // frame would mean a window moved to a different-DPI monitor never
+    // rescales again. This asserts on a value the production path actually
+    // reads back: `end_pass_and_upload` tessellates at
+    // `ctx.pixels_per_point()`.
     for _ in 0..3 {
-        skipped_frame(&ctx, |_| SurfaceStatus::Skip);
+        ctx.begin_pass(egui::RawInput::default());
+        let _ = finish_then_acquire(|| ctx.end_pass(), |_| SurfaceStatus::Skip);
     }
-
     ctx.set_pixels_per_point(2.0);
     ctx.begin_pass(egui::RawInput::default());
     let applied = ctx.pixels_per_point();

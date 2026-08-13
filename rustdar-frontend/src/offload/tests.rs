@@ -303,42 +303,11 @@ fn the_retired_srm_tag_is_refused() {
     assert_eq!(JobRequest::from_bytes(&[TAG_SRM_RETIRED, 1, 2, 3]), None);
 }
 
-/// Every tag is distinct, and the two new ones are **not 4**.
-///
-/// 4 is [`TAG_LEVEL3_PAIR`], and because the new names are new consts
-/// nothing would have stopped the build. Worse, nothing would have stopped
-/// it at *runtime* either: that arm reads two `f64`s and a `u32` length and
-/// then takes the rest, which on a section's plausible bytes succeeds — so
-/// a section posted as tag 4 comes back as a VIL-density job built out of
-/// cross-section geometry, and renders. The assertion below is the whole
-/// guard, and it is cheap because the alternative is invisible.
-#[test]
-fn no_two_job_tags_collide() {
-    let tags = [
-        TAG_RADAR,
-        TAG_LEVEL3,
-        TAG_SRM_RETIRED,
-        TAG_LEVEL3_PAIR,
-        TAG_SECTION,
-        TAG_VOXELS,
-    ];
-    let mut seen = std::collections::HashSet::new();
-    for tag in tags {
-        assert!(seen.insert(tag), "tag {tag} is used twice");
-    }
-    assert_ne!(TAG_SECTION, TAG_LEVEL3_PAIR);
-    assert_ne!(TAG_VOXELS, TAG_LEVEL3_PAIR);
-    // And the framing really is tag-first, so the byte asserted above is
-    // the byte a decoder switches on.
-    assert_eq!(a_section_job().to_bytes()[0], TAG_SECTION);
-    assert_eq!(a_voxel_job().to_bytes()[0], TAG_VOXELS);
-}
-
 /// Every job tag is pinned to the literal byte it ships as.
 ///
-/// [`no_two_job_tags_collide`] above asserts distinctness, and the round
-/// trip asserts the two ends agree — but **both survive a renumbering**,
-/// because both read the constants they are checking. Swap
+/// Distinctness and the round trip are both entailed by this table, and
+/// neither would be enough on its own: a check that reads the constants it
+/// is checking **survives a renumbering**, and the round trip does too. Swap
 /// [`TAG_LEVEL3_PAIR`]'s 4 with [`TAG_VOXELS`]'s 6 and every tag is still
 /// distinct, every job still round-trips through this build, and the whole
 /// workspace still passes.

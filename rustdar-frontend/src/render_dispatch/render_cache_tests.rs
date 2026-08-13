@@ -269,20 +269,43 @@ fn a_vertical_view_ignores_the_elevation_and_still_misses_the_plan_view() {
     );
 }
 
-/// The whole-volume predicate is the `||` of its two named halves, for
-/// every (view, product) pair there is — so neither half can be dropped and
-/// no third copy can grow.
+/// The whole-volume predicate honours both of its halves — pinned as a
+/// truth table over one concrete pair per quadrant, with the expected
+/// answers written out as literals. This test used to restate production's
+/// own `view.reads_whole_volume() || product.reads_whole_volume()` on the
+/// expectation side, which could never disagree with the function it was
+/// checking; a table of hard-coded booleans can.
 #[test]
 fn the_whole_volume_predicate_is_both_halves() {
+    // The quadrant representatives: a cross-section is vertical structure
+    // one sweep does not have (the view half), and interpolated echo tops
+    // integrates the whole reflectivity volume (the product half), while a
+    // reflectivity plan view is one sweep of one moment (neither half).
+    let table = [
+        // (view, product, needs the whole volume?)
+        (RenderView::PlanView, RadarProduct::Reflectivity, false), // neither half
+        (RenderView::CrossSection, RadarProduct::Reflectivity, true), // the view's sake alone
+        (RenderView::PlanView, RadarProduct::EchoTopsInterpolated, true), // the product's alone
+        (
+            RenderView::CrossSection,
+            RadarProduct::EchoTopsInterpolated,
+            true,
+        ), // both halves
+    ];
+    for (view, product, expected) in table {
+        assert_eq!(
+            needs_whole_volume(view, product),
+            expected,
+            "needs_whole_volume({view:?}, {product:?}) is no longer {expected}",
+        );
+    }
+
+    // Non-vacuity: the view-only quadrant must really exist — a pair that
+    // needs the volume for the view's sake alone is the case the product
+    // half alone gets wrong, and every such pair must still answer true.
     let mut saw_view_only = false;
     for &view in RenderView::all() {
         for &product in RadarProduct::all() {
-            assert_eq!(
-                needs_whole_volume(view, product),
-                view.reads_whole_volume() || product.reads_whole_volume(),
-            );
-            // The pair the product half alone gets wrong: a section of a
-            // one-sweep product.
             if view.reads_whole_volume() && !product.reads_whole_volume() {
                 assert!(needs_whole_volume(view, product));
                 saw_view_only = true;
@@ -291,7 +314,8 @@ fn the_whole_volume_predicate_is_both_halves() {
     }
     assert!(
         saw_view_only,
-        "no (view, product) pair needs the volume for the view's sake alone,              so this says nothing about why both halves are asked",
+        "no (view, product) pair needs the volume for the view's sake alone, \
+             so this says nothing about why both halves are asked",
     );
     assert!(
         !needs_whole_volume(RenderView::PlanView, RadarProduct::Reflectivity),

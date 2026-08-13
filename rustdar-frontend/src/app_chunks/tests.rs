@@ -88,7 +88,7 @@ fn a_down_socket_is_retried_regardless_of_other_activity() {
         .expect("handle_redraw is gone from app.rs");
     let first_redraw = arm
         .find("notify_redraw(&self.window)")
-        .unwrap_or(usize::MAX);
+        .unwrap_or_else(|| panic!("notify_redraw(&self.window) is gone from handle_redraw"));
     assert!(
         arm.find("self.chunk_notify.handshake_pending()")
             .is_some_and(|at| at < first_redraw),
@@ -96,7 +96,7 @@ fn a_down_socket_is_retried_regardless_of_other_activity() {
              with auto-poll off is never retried"
     );
     assert!(
-        !arm[..first_redraw.min(arm.len())].contains("self.chunk_notify.next_retry_delay()"),
+        !arm[..first_redraw].contains("self.chunk_notify.next_retry_delay()"),
         "the notifier's backoff is back in the unconditional re-arm, which is \
              a permanent spinner for anyone who cannot reach the service: it \
              retries for the life of the session by design"
