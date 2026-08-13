@@ -11,7 +11,22 @@ const N_GATES: usize = 240;
 /// Recorded from `render::build_wind_profile` — one of the three drivers this
 /// module replaced — while all three still existed, and asserted here against
 /// their single successor. See `the_wind_fit_still_returns_the_number_the_three_drivers_did`.
-const VAD_DIGEST: u64 = 0xc001_5958_cdc9_1e48;
+///
+/// # Moved once, when the fill was bounded
+///
+/// Was `0xc001_5958_cdc9_1e48`. `nrot::PROFILE_FILL_MAX_LAYERS` bounded
+/// `WindProfileBuilder::finish`'s clamp-extrapolation to three layers, the
+/// reach `WindProfile::from_levels` had always used, and this volume's three
+/// cuts do not reach the top of the profile — so the layers past the fill are
+/// `None` now where they used to be copies of the highest fitted layer.
+///
+/// **No fitted layer moved.** The digest is over all 40 slots, fitted and
+/// filled alike, so it moves when the *filling* changes; the tolerance check
+/// underneath it is over the layers that carry a wind, and it reads the same
+/// planted `(12, −5)` to the same six thousandths of a m/s it always did. That
+/// is the split that makes this a golden update rather than a regression: the
+/// hash says which slots answer, the tolerance says what they answer.
+const VAD_DIGEST: u64 = 0x85c2_e75c_62bf_87d8;
 
 /// One velocity sweep carrying an exact VAD signature.
 ///
