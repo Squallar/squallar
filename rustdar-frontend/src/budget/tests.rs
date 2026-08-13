@@ -64,6 +64,7 @@ fn the_resolver_reproduces_every_shipped_constant() {
             concurrent_renders: WASM_MAX_CONCURRENT_RENDERS,
             concurrent_loop_downloads: NON_MOBILE_MAX_CONCURRENT_LOOP_DOWNLOADS,
             loop_frames_held: WASM_MAX_LOOP_FRAMES,
+            loop_span_secs: WASM_LOOP_SPAN_BUDGET_SECS,
             loop_render_budget: WASM_MAX_LOOP_RENDER_BUDGET,
             loop_pool_floor_bytes: WASM_LOOP_POOL_FLOOR_BYTES,
             loop_pool_ceiling_bytes: WASM_LOOP_POOL_CEILING_BYTES,
@@ -86,6 +87,7 @@ fn the_resolver_reproduces_every_shipped_constant() {
             concurrent_renders: MOBILE_MAX_CONCURRENT_RENDERS,
             concurrent_loop_downloads: MOBILE_MAX_CONCURRENT_LOOP_DOWNLOADS,
             loop_frames_held: MOBILE_MAX_LOOP_FRAMES,
+            loop_span_secs: MOBILE_LOOP_SPAN_BUDGET_SECS,
             loop_render_budget: MOBILE_MAX_LOOP_RENDER_BUDGET,
             loop_pool_floor_bytes: MOBILE_LOOP_POOL_FLOOR_BYTES,
             loop_pool_ceiling_bytes: MOBILE_LOOP_POOL_CEILING_BYTES,
@@ -108,6 +110,7 @@ fn the_resolver_reproduces_every_shipped_constant() {
             concurrent_renders: DESKTOP_MAX_CONCURRENT_RENDERS,
             concurrent_loop_downloads: NON_MOBILE_MAX_CONCURRENT_LOOP_DOWNLOADS,
             loop_frames_held: DESKTOP_MAX_LOOP_FRAMES,
+            loop_span_secs: DESKTOP_LOOP_SPAN_BUDGET_SECS,
             loop_render_budget: DESKTOP_MAX_LOOP_RENDER_BUDGET,
             loop_pool_floor_bytes: DESKTOP_LOOP_POOL_FLOOR_BYTES,
             loop_pool_ceiling_bytes: DESKTOP_LOOP_POOL_CEILING_BYTES,
@@ -155,6 +158,7 @@ fn the_compiled_targets_budgets_are_the_constants_this_build_selected() {
     assert_eq!(b.concurrent_renders, MAX_CONCURRENT_RENDERS);
     assert_eq!(b.concurrent_loop_downloads, MAX_CONCURRENT_LOOP_DOWNLOADS);
     assert_eq!(b.loop_frames_held, MAX_LOOP_FRAMES);
+    assert_eq!(b.loop_span_secs, LOOP_SPAN_BUDGET_SECS);
     assert_eq!(b.loop_render_budget, MAX_LOOP_RENDER_BUDGET);
     assert_eq!(b.loop_pool_floor_bytes, LOOP_POOL_FLOOR_BYTES);
     assert_eq!(b.loop_pool_ceiling_bytes, LOOP_POOL_CEILING_BYTES);
@@ -305,6 +309,7 @@ fn check_invariants(profile: &DeviceProfile, from: &str) {
         b.loop_frames_held,
         limits.loop_frames_held,
     );
+    within("loop_span_secs", b.loop_span_secs, limits.loop_span_secs);
     within(
         "loop_render_budget",
         b.loop_render_budget,
@@ -409,6 +414,29 @@ fn check_invariants(profile: &DeviceProfile, from: &str) {
     // dispatcher will texture rather than by what the pool would pay for.
     assert!(b.loop_render_budget >= crate::constants::MIN_LOOP_FRAMES_PER_PANE);
     assert!(b.loop_render_budget <= b.loop_frames_held);
+    // And a loop of *any* cadence is still a loop. Both ends of the clamp, on
+    // every bracket the sweep reaches: a radar so slow one volume outlasts the
+    // whole budget still gets two frames, and one so fast the median is a
+    // second cannot buy frames the pool has not been sized for.
+    assert!(b.loop_span_secs > 0, "{from} / {}: a zero span", b.name);
+    assert_eq!(
+        b.frames_for_span(Some(u32::MAX)),
+        crate::constants::MIN_LOOP_FRAMES_PER_PANE,
+        "{from} / {}: a very slow radar degrades a loop below the floor",
+        b.name,
+    );
+    assert_eq!(
+        b.frames_for_span(Some(1)),
+        b.loop_render_budget,
+        "{from} / {}: a very fast radar buys more than the render budget",
+        b.name,
+    );
+    assert_eq!(
+        b.frames_for_span(None),
+        b.loop_render_budget,
+        "{from} / {}: a loop with no cadence yet does not get the full budget",
+        b.name,
+    );
     assert!(b.concurrent_renders > 0);
     assert!(b.render_cache_entries > 0);
     assert!(b.concurrent_loop_downloads > 0);
@@ -575,5 +603,108 @@ fn a_random_sweep_of_profiles_satisfies_every_invariant() {
             ..shipped_profile(limits)
         };
         check_invariants(&profile, &format!("random row {row}"));
+    }
+}
+
+/// The measured inter-volume gaps, in seconds, and what each radar is.
+///
+/// Campaign of 2026-08-11: six TDWR and four WSR-88D sites, a full 24 h, with
+/// each object's VCP decoded from message 5 rather than inferred from its
+/// interval — which mattered, because VCP 80 and VCP 90 share a cadence and no
+/// interval could have told them apart.
+const MEASURED_CADENCES: [(&str, u32); 4] = [
+    ("TDWR VCP 80", 360),
+    ("TDWR VCP 90", 360),
+    ("WSR-88D precip (VCP 212/215)", 259),
+    ("WSR-88D clear air (VCP 35)", 517),
+];
+
+/// **The same budget is the same wall clock on every radar.**
+///
+/// The whole point of a span budget, stated as the property rather than as the
+/// formula: whatever the cadence, the frames the budget buys span at most the
+/// budget and at least the budget less one volume. A frame count could not make
+/// that claim — the desktop 30 frames this replaced spanned 2 h 05 m on a
+/// WSR-88D in precip, 2 h 54 m on a TDWR and 4 h 18 m on the same WSR-88D in
+/// clear air.
+///
+/// The lower bound is `span - cadence` rather than `span` because a truncating
+/// divide is what makes this a *cap*: 2 h at 517 s is 14 frames covering
+/// 1 h 52 m, and the fifteenth frame would put the loop over the budget.
+#[test]
+fn a_loop_spans_its_budget_on_every_measured_radar() {
+    for profile in profiles() {
+        let b = resolve(&profile);
+        for (radar, cadence) in MEASURED_CADENCES {
+            let frames = b.frames_for_span(Some(cadence));
+            assert!(
+                frames >= crate::constants::MIN_LOOP_FRAMES_PER_PANE,
+                "{} / {radar}: {frames} frames is not a loop",
+                b.name,
+            );
+            if frames == b.loop_render_budget {
+                // The arm ran out of frames before it ran out of budget, which
+                // is the ceiling doing its job rather than the span failing —
+                // `constants::tests::the_span_budget_is_the_longest_the_ceiling
+                // _can_pay_for` is where that case is argued.
+                continue;
+            }
+            let covered = (frames - 1) * cadence as usize;
+            assert!(
+                covered <= b.loop_span_secs,
+                "{} / {radar}: {frames} frames span {covered} s, over the {} s \
+                 budget — the cap is not a cap",
+                b.name,
+                b.loop_span_secs,
+            );
+            assert!(
+                covered + cadence as usize > b.loop_span_secs,
+                "{} / {radar}: {frames} frames span {covered} s of a {} s \
+                 budget with room for another whole volume, so the loop is \
+                 shorter than it was paid for",
+                b.name,
+                b.loop_span_secs,
+            );
+        }
+    }
+}
+
+/// **A radar that changes VCP mid-window moves the loop, and moves it by the
+/// majority cadence.**
+///
+/// Not a corner case: on 2026-08-11 every measured site but TDFW alternated
+/// VCPs during the day, and a WSR-88D going from precip to clear air doubles
+/// its volume length. `median_step_secs` is a median for exactly this reason —
+/// the mean of a 259 s run and a 517 s run describes neither — so the frame
+/// count follows whichever cadence held for more than half the listing, and
+/// steps to the other one when the majority does.
+///
+/// What that buys is the property the caption depends on: the loop's wall clock
+/// does not lurch when the radar changes mode, because both counts span the
+/// same budget. What it costs is a step in the frame count, which is bounded
+/// here.
+#[test]
+fn a_vcp_change_moves_the_frame_count_between_the_two_cadences() {
+    for profile in profiles() {
+        let b = resolve(&profile);
+        let precip = b.frames_for_span(Some(259));
+        let clear = b.frames_for_span(Some(517));
+        assert!(
+            clear <= precip,
+            "{}: clear air has longer volumes, so it cannot want more frames",
+            b.name,
+        );
+        // A window that straddles the change takes whichever ran for most of
+        // it, and both ends are inside the pair — there is no third answer for
+        // a mixed window to land on.
+        for straddling in [259, 300, 400, 500, 517] {
+            let frames = b.frames_for_span(Some(straddling));
+            assert!(
+                (clear..=precip).contains(&frames),
+                "{}: a {straddling} s median resolves {frames} frames, outside \
+                 the {clear}..={precip} the two VCPs bracket",
+                b.name,
+            );
+        }
     }
 }

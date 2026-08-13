@@ -200,13 +200,13 @@ pub const fn raster_bytes(side: usize) -> usize {
 /// asked to give.
 ///
 /// **The web arm is a third of the way down, at 1024, and that is the constant
-/// this whole cascade exists for.** A browser's per-pane loop budget is 48 MiB
-/// ([`WASM_LOOP_TEXTURE_BUDGET_BYTES`]) and it textures eight frames at once;
-/// 2048² frames are 16 MiB apiece, so following the static size would need a
-/// 128 MiB loop budget — and [`VOLUME_LOOP_TEXTURE_BUDGET_BYTES`] is an alias
-/// of that one, so the volume-store term rises with it. Even holding the pool
-/// *ceiling* where it is, 192 + 128 + 30 puts [`APP_TEXTURE_BUDGET_BYTES`] at
-/// 350 MiB against a 288 MiB ceiling.
+/// this whole cascade exists for.** A browser's per-pane loop budget is 56 MiB
+/// ([`WASM_LOOP_TEXTURE_BUDGET_BYTES`]) and it textures fourteen frames at
+/// once; 2048² frames are 16 MiB apiece, so following the static size would
+/// need a 224 MiB loop budget — and [`VOLUME_LOOP_TEXTURE_BUDGET_BYTES`] is an
+/// alias of that one, so the volume-store term rises with it. Even holding the
+/// pool *ceiling* where it is, 192 + 224 + 30 puts [`APP_TEXTURE_BUDGET_BYTES`]
+/// at 446 MiB against a 288 MiB ceiling.
 /// `the_whole_application_fits_its_gpu_ceiling` is the line that says so and
 /// `the_app_ceiling_is_not_slack_enough_to_hide_a_doubling` is why the ceiling
 /// cannot simply be raised to admit it. So web loops stay exactly the size and
@@ -306,14 +306,89 @@ pub const MAX_CONCURRENT_RENDERS: usize = MOBILE_MAX_CONCURRENT_RENDERS;
 #[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
 pub const MAX_CONCURRENT_RENDERS: usize = DESKTOP_MAX_CONCURRENT_RENDERS;
 
+/// The wall clock one loop covers, on wasm32. See [`LOOP_SPAN_BUDGET_SECS`];
+/// named outside the cascade for the reason [`WASM_VOLUME_GRID_CELLS`] gives.
+pub const WASM_LOOP_SPAN_BUDGET_SECS: usize = 45 * 60;
+/// The mobile arm. See [`LOOP_SPAN_BUDGET_SECS`].
+pub const MOBILE_LOOP_SPAN_BUDGET_SECS: usize = 60 * 60;
+/// The desktop arm. See [`LOOP_SPAN_BUDGET_SECS`].
+pub const DESKTOP_LOOP_SPAN_BUDGET_SECS: usize = 2 * 60 * 60;
+
+/// **How much weather a loop keeps ready to draw**, in seconds of wall clock.
+///
+/// This is the loop budget. [`MAX_LOOP_RENDER_BUDGET`] is what it costs in
+/// frames at the worst radar; `crate::budget::Budgets::frames_for_span` is the
+/// conversion, and it is a per-site one.
+///
+/// # A frame is not a unit of anything the user cares about
+///
+/// One frame is one volume scan, and a volume scan is not a fixed length of
+/// time. Measured 2026-08-11 over a full 24 h, with the VCP decoded per file
+/// from message 5 rather than inferred from the interval, across six TDWR and
+/// four WSR-88D sites plus a two-day two-extra-site holdout:
+///
+/// | radar | VCP | median inter-volume gap | n |
+/// |---|---|---:|---:|
+/// | TDWR | 80 | 360.0 s | 569 |
+/// | TDWR | 90 | 360.0 s | 832 |
+/// | WSR-88D precip | 212 / 215 | 259.0 s | 942 |
+/// | WSR-88D clear air | 35 | 517.0 s | 179 |
+///
+/// **A TDWR volume is six minutes and a WSR-88D precip volume is four**, so the
+/// widely-repeated claim that TDWR is the fastest-cadence radar is backwards:
+/// a TDWR loop covers *more* wall clock per frame, not less. Under the old
+/// 30-frame desktop budget the same slider bought 2 h 05 m on a WSR-88D in
+/// precip, 2 h 54 m on a TDWR and 4 h 18 m on a WSR-88D in clear air — three
+/// different amounts of weather from one number, and nothing on screen said so.
+///
+/// Stating the budget in seconds makes the loop mean one thing everywhere, and
+/// makes the frame count the *derived* quantity it always was.
+///
+/// # Each arm is the longest window its texture ceiling can pay for
+///
+/// The cost is not `span / median`: the count has to hold at the **fastest**
+/// listing a site can present, not at its typical one. Swept over every window
+/// of the measured day — see
+/// `tests::MEASURED_PEAK_LOOP_FRAMES` for the table and the sweep that
+/// produced it — the worst case is always a WSR-88D in precip, never a TDWR:
+///
+/// | span | TDWR | KPBZ | KLOT | KFTG | KOKX | frames | one loop | pool floor |
+/// |---|---:|---:|---:|---:|---:|---:|---:|---:|
+/// | 45 min |  8 | 14 | 14 | 12 | 12 | **14** |  56 MiB |  56 MiB |
+/// | 1 h    | 11 | 18 | 18 | 16 | 16 | **18** | 288 MiB | 288 MiB |
+/// | 1.25 h | 13 | 23 | 22 | 20 | 20 |     23 | 368 MiB |  — |
+/// | 2 h    | 21 | 36 | 35 | 30 | 30 | **36** | 576 MiB | 576 MiB |
+/// | 2.5 h  | 26 | 44 | 44 | 38 | 37 |     44 | 704 MiB |  — |
+///
+/// The windows are round ones a user can hold in their head rather than the
+/// byte-maximal figure each arm could reach — wasm32 could pay for 50 minutes
+/// and takes 45, which is the only place any arm leaves anything on the table,
+/// and it leaves it on the arm whose answer to exhausting texture memory is to
+/// restart the browser's whole GPU process.
+///
+/// [`APP_TEXTURE_BUDGET_BYTES`] leaves the pool floor 66 MiB on wasm32,
+/// 364 MiB on mobile and 648 MiB on desktop, so the next row up fails on every
+/// arm — 1 h costs a browser 72 MiB, 1.25 h costs a phone 368 MiB, 2.5 h costs
+/// a desktop 704 MiB. These three are the longest windows that fit, and
+/// `the_span_budget_is_the_longest_the_ceiling_can_pay_for` is where a change
+/// to any of the six numbers has to come past.
+#[cfg(target_arch = "wasm32")]
+pub const LOOP_SPAN_BUDGET_SECS: usize = WASM_LOOP_SPAN_BUDGET_SECS;
+/// See the wasm32 arm above.
+#[cfg(all(not(target_arch = "wasm32"), mobile))]
+pub const LOOP_SPAN_BUDGET_SECS: usize = MOBILE_LOOP_SPAN_BUDGET_SECS;
+/// See the wasm32 arm above.
+#[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
+pub const LOOP_SPAN_BUDGET_SECS: usize = DESKTOP_LOOP_SPAN_BUDGET_SECS;
+
 /// Maximum number of loop frames to consider for rendering per dispatch cycle,
 /// on wasm32. See [`MAX_LOOP_RENDER_BUDGET`]; named outside the cascade for the
 /// reason [`WASM_VOLUME_GRID_CELLS`] gives.
-pub const WASM_MAX_LOOP_RENDER_BUDGET: usize = 8;
+pub const WASM_MAX_LOOP_RENDER_BUDGET: usize = 14;
 /// The mobile arm. See [`MAX_LOOP_RENDER_BUDGET`].
-pub const MOBILE_MAX_LOOP_RENDER_BUDGET: usize = 12;
+pub const MOBILE_MAX_LOOP_RENDER_BUDGET: usize = 18;
 /// The desktop arm. See [`MAX_LOOP_RENDER_BUDGET`].
-pub const DESKTOP_MAX_LOOP_RENDER_BUDGET: usize = 30;
+pub const DESKTOP_MAX_LOOP_RENDER_BUDGET: usize = 36;
 
 /// Maximum number of loop frames to consider for rendering per dispatch cycle.
 ///
@@ -321,6 +396,27 @@ pub const DESKTOP_MAX_LOOP_RENDER_BUDGET: usize = 30;
 /// `LoopPlaybackState::evict_textures_outside_render_set` is called with this every
 /// dispatch and drops the texture of every frame outside the render set. That makes
 /// this — not `MAX_LOOP_FRAMES` — the binding term in the per-pane texture budget.
+///
+/// # It is [`LOOP_SPAN_BUDGET_SECS`] priced at the fastest radar, not a number of its own
+///
+/// The budget is the span; this is what the span costs where it costs the most.
+/// A loop on a slower radar takes fewer frames for the same wall clock and this
+/// is never reached — a TDWR needs 21 of a desktop's 36 for the same two hours,
+/// and a WSR-88D in clear air 14. So the arms are the *ceiling* on a per-site
+/// figure now rather than the figure itself, and
+/// `crate::budget::Budgets::frames_for_span` is where the site's own answer
+/// comes from.
+///
+/// | target  | span   | this | what it used to be | what that used to guarantee |
+/// |---------|-------:|-----:|-------------------:|----------------------------:|
+/// | wasm32  | 45 min |   14 |                  8 |                      26 min |
+/// | mobile  |    1 h |   18 |                 12 |                      39 min |
+/// | desktop |    2 h |   36 |                 30 |                  1 h 41 min |
+///
+/// The right-hand column is the same sweep read backwards, and it is the reason
+/// the arms moved at all: a frame count is a promise about *pictures*, and the
+/// promise about time hiding inside it was shorter than anyone would have
+/// guessed and different on every arm.
 #[cfg(target_arch = "wasm32")]
 pub const MAX_LOOP_RENDER_BUDGET: usize = WASM_MAX_LOOP_RENDER_BUDGET;
 /// See the wasm32 arm above.
@@ -384,7 +480,14 @@ pub const MAX_LOOP_FRAMES: usize = MOBILE_MAX_LOOP_FRAMES;
 pub const MAX_LOOP_FRAMES: usize = DESKTOP_MAX_LOOP_FRAMES;
 
 /// The wasm32 arm of [`MAX_LOOP_FRAMES`].
-pub const WASM_MAX_LOOP_FRAMES: usize = 12;
+///
+/// 12 until [`LOOP_SPAN_BUDGET_SECS`] priced a browser's 45 minutes at 14
+/// frames. A held frame is scan data and a timestamp rather than a texture, so
+/// the two extra cost the loop pool nothing — but a hold cap *below* the render
+/// budget would be a loop that textures every frame it has and still cannot
+/// reach the span it was budgeted, which
+/// `the_render_budget_is_what_bounds_the_textured_frames` is the guard against.
+pub const WASM_MAX_LOOP_FRAMES: usize = 14;
 /// The mobile arm. See [`MAX_LOOP_FRAMES`].
 pub const MOBILE_MAX_LOOP_FRAMES: usize = 20;
 /// The desktop arm. See [`MAX_LOOP_FRAMES`].
@@ -406,8 +509,8 @@ pub const DESKTOP_MAX_LOOP_FRAMES: usize = 60;
 /// One, measured: on a real VCP-212 reflectivity volume the extraction is
 /// ~1.0 ms and the rasterization it feeds is ~6.1 ms. At one per frame the
 /// frame thread pays roughly what a single live re-cut already costs it, the
-/// expensive half is on the worker, and a full desktop render set of 30 frames
-/// is dispatched over 30 frames — half a second at 60 fps, during which the
+/// expensive half is on the worker, and a full desktop render set of 36 frames
+/// is dispatched over 36 frames — six tenths of a second at 60 fps, during which the
 /// pane shows every frame that has landed rather than blocking on the batch.
 ///
 /// It is deliberately not a per-target cascade. The number is chosen against
@@ -433,23 +536,30 @@ pub const MAX_LOOP_SECTION_CUTS_PER_FRAME: usize = 1;
 /// [`crate::loop_pool`]. What the number is chosen to be is the interesting
 /// part:
 ///
-/// **The floor is exactly what one pane used to get all to itself.** Not a
-/// coincidence and not nostalgia — it is the property that makes this change
-/// safe to ship. A session with one loop open, on the worst device this target
-/// admits, gets byte for byte and frame for frame what it gets today, because
-/// one loop's share of a floor-sized pool *is* the old per-pane budget. What
-/// changes is that six of them no longer cost six times it.
+/// **The floor is exactly what one loop's span budget costs.** Not slack and
+/// not a round number — it is the property that makes the pool safe to ship: a
+/// session with one loop open, on the worst device this target admits, gets the
+/// whole of [`LOOP_SPAN_BUDGET_SECS`] textured at the fastest radar there is,
+/// because one loop's share of a floor-sized pool *is*
+/// [`MAX_LOOP_RENDER_BUDGET`] frames. What the pool changed is that six of them
+/// no longer cost six times it.
+///
+/// It used to be "exactly what one pane used to get all to itself", which was
+/// the same equality read off the frame count instead of the span — the arms
+/// were 480 / 192 / 32 MiB against 512 / 256 / 48 MiB floors, and the rounding
+/// up to a power of two was the only slack in it. Pricing the span rather than
+/// the frame count removed even that.
 ///
 /// A plan-view frame is a [`LOOP_IMAGE_SIZE`]² RGBA raster — not the size a
 /// static pane render takes, because a loop's frames are held by the dozen and
 /// a still frame is held once. On the web that difference is the whole reason
 /// this budget still fits; natively the two are the same 2048.
 ///
-/// | target  | textured | frame size | one loop | floor   |
-/// |---------|---------:|-----------:|---------:|--------:|
-/// | desktop |       30 |     16 MiB |  480 MiB | 512 MiB |
-/// | mobile  |       12 |     16 MiB |  192 MiB | 256 MiB |
-/// | wasm32  |        8 |      4 MiB |   32 MiB |  48 MiB |
+/// | target  | span   | textured | frame size | one loop | floor   |
+/// |---------|-------:|---------:|-----------:|---------:|--------:|
+/// | desktop |    2 h |       36 |     16 MiB |  576 MiB | 576 MiB |
+/// | mobile  |    1 h |       18 |     16 MiB |  288 MiB | 288 MiB |
+/// | wasm32  | 45 min |       14 |      4 MiB |   56 MiB |  56 MiB |
 ///
 /// The textured-frame count is `min(MAX_LOOP_FRAMES, MAX_LOOP_RENDER_BUDGET)`,
 /// not `MAX_LOOP_FRAMES`: `evict_textures_outside_render_set` runs every
@@ -479,10 +589,12 @@ pub const MAX_LOOP_SECTION_CUTS_PER_FRAME: usize = 1;
 ///
 /// [`MIN_LOOP_FRAMES_PER_PANE`] is what stops a busy layout cliff-ing to
 /// nothing, and it is only reachable if the floor can pay for it on every pane
-/// the width class admits. wasm32's row is exact — six loops at two frames of
-/// 4 MiB is 48 MiB, to the byte — which is the honest statement of how tight
-/// the browser is, and `the_floor_seats_every_pane_without_blanking_one` is
-/// where a change to any of those four numbers has to come past.
+/// the width class admits. wasm32 is the tight row — six loops at two frames of
+/// 4 MiB is 48 MiB against a 56 MiB floor, one frame of slack in the whole
+/// browser arm — and `the_floor_seats_every_pane_without_blanking_one` is where
+/// a change to any of those four numbers has to come past. It was exact to the
+/// byte at the old 48 MiB floor; the eight the span budget added are the only
+/// margin that rule has ever had.
 ///
 /// # wasm32 is the arm a constant cannot serve at all, and that is why this is a floor
 ///
@@ -496,13 +608,13 @@ pub const MAX_LOOP_SECTION_CUTS_PER_FRAME: usize = 1;
 ///
 /// That is the strongest argument for the whole floor/ceiling design, and it is
 /// why the browser sits at its **floor** today: WebGL2 reports
-/// `DeviceType::Other`, so `DeviceClass::Unknown`, so 48 MiB — which is the
+/// `DeviceType::Other`, so `DeviceClass::Unknown`, so 56 MiB — which is the
 /// right number for a phone browser and a conservative one for a workstation.
 /// Being conservative on the target we cannot measure is the correct way round;
 /// the follow-up is to *raise* the workstation browser, never to lower the
 /// phone.
 ///
-/// 48 MiB is a defensible share of what a phone browser actually has. On
+/// 56 MiB is a defensible share of what a phone browser actually has. On
 /// Android our textures live in Chrome's **own GPU process**, beside a
 /// compositor budgeted 96 MiB on a low-end or sub-2 GB device (256 MiB
 /// otherwise) and a transfer cache of 1 MiB low-end / 128 MiB normal. On iOS
@@ -545,11 +657,11 @@ pub const LOOP_POOL_FLOOR_BYTES: usize = MOBILE_LOOP_POOL_FLOOR_BYTES;
 pub const LOOP_POOL_FLOOR_BYTES: usize = DESKTOP_LOOP_POOL_FLOOR_BYTES;
 
 /// The wasm32 arm of [`LOOP_POOL_FLOOR_BYTES`].
-pub const WASM_LOOP_POOL_FLOOR_BYTES: usize = 48 * 1024 * 1024;
+pub const WASM_LOOP_POOL_FLOOR_BYTES: usize = 56 * 1024 * 1024;
 /// The mobile arm. See [`LOOP_POOL_FLOOR_BYTES`].
-pub const MOBILE_LOOP_POOL_FLOOR_BYTES: usize = 256 * 1024 * 1024;
+pub const MOBILE_LOOP_POOL_FLOOR_BYTES: usize = 288 * 1024 * 1024;
 /// The desktop arm. See [`LOOP_POOL_FLOOR_BYTES`].
-pub const DESKTOP_LOOP_POOL_FLOOR_BYTES: usize = 512 * 1024 * 1024;
+pub const DESKTOP_LOOP_POOL_FLOOR_BYTES: usize = 576 * 1024 * 1024;
 
 /// The most this target will ever spend on loop textures, however much memory
 /// the device claims to have.
@@ -569,8 +681,8 @@ pub const DESKTOP_LOOP_POOL_FLOOR_BYTES: usize = 512 * 1024 * 1024;
 /// reach**, and that is deliberate: a machine that genuinely has the memory
 /// behaves exactly as it does today, so nobody with a discrete GPU loses a
 /// frame of history. It is reachable only by `DeviceClass::Discrete`. An
-/// integrated desktop adapter gets one doubling from the floor — 1024 MiB —
-/// which against the ~50 % of system RAM Windows lets an iGPU share is 25 % of
+/// integrated desktop adapter gets one doubling from the floor — 1152 MiB —
+/// which against the ~50 % of system RAM Windows lets an iGPU share is 28 % of
 /// an 8 GB laptop's shared pool.
 ///
 /// # The two arms that came *down*, and the evidence for each
@@ -596,11 +708,15 @@ pub const DESKTOP_LOOP_POOL_FLOOR_BYTES: usize = 512 * 1024 * 1024;
 /// application is willing to be of a phone it did not choose.
 ///
 /// It is also mostly a bound on a value nothing reaches: a phone GPU is
-/// `IntegratedGpu`, so `for_device` gives it **512 MiB**, one doubling from the
-/// floor. The gap between 512 and 640 is the room a future signal that
+/// `IntegratedGpu`, so `for_device` gives it **576 MiB**, one doubling from the
+/// floor. The gap between 576 and 640 is the room a future signal that
 /// *measures* would have — `os_proc_available_memory()` on iOS returns exactly
 /// this budget, and is the one platform API in this whole area that answers the
-/// question directly.
+/// question directly. That gap narrowed when [`LOOP_SPAN_BUDGET_SECS`] took the
+/// floor from 256 MiB to 288: a doubling of the floor is the *only* step
+/// between the two, so raising the floor moves the reachable value twice as
+/// fast as it moves the floor, and one more doubling of the span budget would
+/// put the integrated arm at the ceiling rather than under it.
 ///
 /// **wasm32, 288 → 192 MiB.** iOS Safari's practical WebGL heap sits somewhere
 /// around 300–500 MB (secondary sources; treat the band, not the endpoints),
@@ -779,9 +895,9 @@ pub const LOOP_POOL_DWELL_FRAMES: u32 = 15;
 ///
 /// | target  | frames | 3D texture | resident  | headroom | share   |
 /// |---------|-------:|-----------:|----------:|---------:|--------:|
-/// | wasm32  |      8 |  4.598 MiB |  36.78 MiB | 11.22 MiB |  48 MiB |
-/// | mobile  |     12 | 15.550 MiB | 186.60 MiB | 69.40 MiB | 256 MiB |
-/// | desktop |     12 | 36.598 MiB | 439.17 MiB | 72.83 MiB | 512 MiB |
+/// | wasm32  |     11 |  4.598 MiB |  50.57 MiB |  5.43 MiB |  56 MiB |
+/// | mobile  |     17 | 15.550 MiB | 264.35 MiB | 23.65 MiB | 288 MiB |
+/// | desktop |     14 | 36.598 MiB | 512.37 MiB | 63.63 MiB | 576 MiB |
 ///
 /// # Why this is the *floor* rather than a number of its own
 ///
@@ -812,9 +928,12 @@ pub const LOOP_POOL_DWELL_FRAMES: u32 = 15;
 ///
 /// ## Desktop takes fewer frames at the full grid, not more at a coarser one
 ///
-/// 12 frames of the full 512×512×32 grid is ~60 minutes of history where 30
-/// frames would be ~150. That is a real loss and it is stated rather than
-/// hidden. (The shape was 256×256×128 when this was written, and is the same
+/// 14 frames of the full 512×512×32 grid is ~56 minutes of a WSR-88D in precip
+/// where the 2 h [`LOOP_SPAN_BUDGET_SECS`] buys a plan-view loop beside it.
+/// That is a real loss and it is stated rather than hidden — it is also the one
+/// place in this application where a loop does *not* deliver the span budget,
+/// and it is bounded by bytes rather than by a decision. (The shape was
+/// 256×256×128 when this was written, and is the same
 /// 8,388,608 cells either way — `shape_for_budget` respends the budget rather
 /// than enlarging it — so the triple moved without moving the count. What did
 /// move the count is below.)
@@ -835,10 +954,13 @@ pub const LOOP_POOL_DWELL_FRAMES: u32 = 15;
 /// ## Each arm is the tighter of two bounds
 ///
 /// What this budget admits **beside one live grid**, and
-/// [`MAX_LOOP_RENDER_BUDGET`]. The budget binds desktop (12 grids where a
-/// plan-view loop textures 30 frames); the render budget binds wasm32 and
-/// mobile, where the grids are small enough that the budget would admit 9 and
-/// 15 — a 3D loop is not licensed to hold *more* history than the plan-view
+/// [`MAX_LOOP_RENDER_BUDGET`]. The budget binds every arm now — 11, 17 and 14
+/// grids against render budgets of 14, 18 and 36 — where it used to bind
+/// desktop alone. That is [`LOOP_SPAN_BUDGET_SECS`]' doing and it is the right
+/// way round: a grid is 4 to 9 times a raster frame, so pricing the span in
+/// frames buys a raster loop the whole window and a 3D loop as much of it as
+/// the grids allow. The render budget is still the other half of the minimum,
+/// because a 3D loop is not licensed to hold *more* history than the plan-view
 /// loop beside it on the same device merely because its frames are cheaper
 /// there. `the_3d_loop_holds_exactly_what_it_marches` computes both and pins
 /// the minimum.
@@ -849,13 +971,17 @@ pub const LOOP_POOL_DWELL_FRAMES: u32 = 15;
 /// two mip levels the descriptor names. A two-level descriptor is laid out
 /// with **every** level down to 1×1×1, measured — see
 /// `volume::raymarch::grid_bytes_at` — so a desktop grid costs 36.6 MiB and
-/// not 36.0, and 13 of them beside a live one is 512.4 MiB of a 512 MiB
-/// budget. That is the treadmill described below, arrived at from 1.6% of
-/// accounting rather than from a missing subtraction, and it is why the arm
-/// is 12.
+/// not 36.0, and 13 of them beside a live one was 512.4 MiB of the 512 MiB
+/// budget of the day. That is the treadmill described below, arrived at from
+/// 1.6% of accounting rather than from a missing subtraction, and it is why the
+/// arm was 12 while the floor was 512 MiB.
 ///
-/// **No budget moved.** This constant is untouched; what changed is what a grid
-/// is known to cost inside it.
+/// **No budget moved for that one.** What changed was what a grid is known to
+/// cost inside it. The arm is 14 today for the opposite kind of reason: the
+/// budget itself moved, because it is [`LOOP_POOL_FLOOR_BYTES`] and that floor
+/// is now [`LOOP_SPAN_BUDGET_SECS`] priced in raster frames. The subtraction
+/// below is what keeps the count honest through a budget change rather than
+/// only through a cost change.
 ///
 /// The subtracted grid is the correction to the count this loop kind shipped
 /// with. Desktop was 14 — the whole budget, to the last 1.5% — and the store
@@ -1002,7 +1128,7 @@ pub const DESKTOP_VOLUME_LOOP_TEXTURE_BUDGET_BYTES: usize = DESKTOP_LOOP_POOL_FL
 /// without the feature still sees and what a device with one sees on a frame its
 /// ring could not serve.
 ///
-/// One per frame means a full desktop set of 12 is dispatched over 12 frames —
+/// One per frame means a full desktop set of 14 is dispatched over 14 frames —
 /// under a quarter of a second at 60 fps — and every grid that lands is shown
 /// as it lands rather than the pane blocking on the batch.
 ///
@@ -1030,9 +1156,22 @@ pub const MAX_LOOP_VOLUME_BUILDS_PER_FRAME: usize = 1;
 ///
 /// | target  | panes | loop pool | store floor | offscreens | total    | ceiling  | reachable |
 /// |---------|------:|----------:|------------:|-----------:|---------:|---------:|----------:|
-/// | desktop |     6 |  3072 MiB |     512 MiB |    120 MiB | 3704 MiB | 3840 MiB |  3704 MiB |
-/// | mobile  |     4 |   640 MiB |     256 MiB |     20 MiB |  916 MiB | 1024 MiB |   788 MiB |
-/// | wasm32  |     6 |   192 MiB |      48 MiB |     30 MiB |  270 MiB |  288 MiB |   126 MiB |
+/// | desktop |     6 |  3072 MiB |     576 MiB |    120 MiB | 3768 MiB | 3840 MiB |  3768 MiB |
+/// | mobile  |     4 |   640 MiB |     288 MiB |     20 MiB |  948 MiB | 1024 MiB |   884 MiB |
+/// | wasm32  |     6 |   192 MiB |      56 MiB |     30 MiB |  278 MiB |  288 MiB |   142 MiB |
+///
+/// # This table is what bounded the span budget
+///
+/// The `store floor` column is [`LOOP_POOL_FLOOR_BYTES`], and that floor is
+/// [`LOOP_SPAN_BUDGET_SECS`] priced at the fastest radar measured — so the
+/// slack between `total` and `ceiling` *is* the room the span budget had. It
+/// leaves the floor 66 MiB on wasm32, 364 MiB on mobile and 648 MiB on desktop,
+/// which at 4 / 16 / 16 MiB a frame is 16 / 22 / 40 frames, which is 47 min /
+/// 1 h 15 m / 2 h 12 m of the worst measured radar. The next round window up on
+/// each arm — 1 h, 1.25 h, 2.5 h — needs 18 / 23 / 44 and does not fit. **No
+/// ceiling here moved to make room; the windows were chosen to fit the ceilings
+/// that were already argued for**, which is the only order that keeps this
+/// constant the independent bound its own doc says it is.
 ///
 /// The last column is what the *device classification* actually admits, and it
 /// is the number a memory audit should care about: a phone GPU is
@@ -1059,7 +1198,7 @@ pub const MAX_LOOP_VOLUME_BUILDS_PER_FRAME: usize = 1;
 ///
 /// Neither raise loosens anything: both stay inside the 1.25× snugness
 /// `the_app_ceiling_is_not_slack_enough_to_hide_a_doubling` holds them to
-/// (1024 / 916 = 1.12, 288 / 270 = 1.07), and the reachable column — the figure
+/// (1024 / 948 = 1.08, 288 / 278 = 1.04), and the reachable column — the figure
 /// a memory audit cares about — is unchanged in *kind*, having simply gained
 /// the same term the total did.
 ///
@@ -1426,8 +1565,8 @@ pub const WEBGL2_MAX_TEXTURE_DIMENSION_3D: u32 =
 /// memory is the one-byte-per-cell index plane the worker built (unchanged at
 /// 1 MiB — coverage is exactly `index != 0`, so it is synthesised at upload
 /// and never travels) plus the transient staging copy of the 4 MiB
-/// premultiplied plane. For scale, the same target budgets 48 MiB for loop
-/// textures, so this is a 5% move against the largest thing on the page and
+/// premultiplied plane. For scale, the same target budgets 56 MiB for loop
+/// textures, so this is a 4% move against the largest thing on the page and
 /// no grid-spec change is needed: every axis stays at or under the
 /// [`WEBGL2_MAX_TEXTURE_DIMENSION_3D`] guarantee and no shape shrinks.
 ///
@@ -1655,8 +1794,8 @@ pub const DEFAULT_LOOP_SPEED_FPS: f32 = 5.0;
 /// This is the control on `build.rs` actually running. If it is deleted, or the
 /// manifest stops pointing at it, or its condition is wrong, `mobile` is simply
 /// never set — and every cascade above then silently selects the *desktop* arm.
-/// On a phone that means `MAX_CONCURRENT_RENDERS` 6 instead of 3 and a 512 MiB
-/// texture budget instead of 256 MiB, which is an OOM, not a warning.
+/// On a phone that means `MAX_CONCURRENT_RENDERS` 6 instead of 3 and a 576 MiB
+/// texture budget instead of 288 MiB, which is an OOM, not a warning.
 ///
 /// `rustc-check-cfg` alone does not cover this: a missing build script turns
 /// each `mobile` arm into an `unexpected_cfgs` warning, and nothing in CI turns
@@ -1675,6 +1814,13 @@ compile_error!(
 const _: () = const {
     assert!(MAX_LOOP_FRAMES > 0);
     assert!(MAX_LOOP_RENDER_BUDGET > 0);
+    // `frames_for_span` divides by the cadence and adds one, so a zero span
+    // would resolve every loop to the minimum on every radar — a loop budget
+    // that is not a budget. The upper bound is what stops a cascade edit from
+    // making the span the binding term instead of the memory: the render budget
+    // is what the span costs at the fastest radar, so a span this arm's frames
+    // cannot pay for is a promise the loop silently breaks.
+    assert!(LOOP_SPAN_BUDGET_SECS > 0);
     assert!(LOOP_POOL_FLOOR_BYTES > 0);
     // A crossed pair would make `LoopPoolLimits::hold`'s `clamp` panic at
     // startup on one target only, which is exactly the arm a host test cannot
