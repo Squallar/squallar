@@ -672,6 +672,42 @@ const MAX_FRAMING_PASSES: usize = 4;
 /// the shipped grid's 3.6 km — which is the price of never being short.
 const COVERAGE_MARGIN: f64 = 0.001;
 
+/// The widest zoom `walkers::MapMemory::set_zoom` will accept: the whole world
+/// in one 256-point tile.
+///
+/// Restated here rather than imported because walkers does not export it.
+/// `Zoom::try_from` is
+///
+/// ```text
+/// if !(0. ..=26.).contains(&value) { Err(InvalidZoom) } else { Ok(Self(value)) }
+/// ```
+///
+/// — `walkers-0.56.0/src/zoom.rs:14` — and `Zoom` is `pub(crate)` to walkers, so
+/// `set_zoom`'s `Err(InvalidZoom)` is the only way a caller can learn where the
+/// bounds are. [`a_zoom_walkers_refuses_is_one_this_module_clamps_away`] drives
+/// `set_zoom` across both ends and fails if walkers ever moves them, which is
+/// what keeps this pair honest across a version bump.
+///
+/// **`RangeInclusive::contains` is false for a `NaN`**, so a `NaN` zoom is
+/// refused too — and a `NaN` survives `f64::clamp` rather than being bounded
+/// away by it. That is why [`viewport_for_region`]'s finiteness test comes
+/// *before* the clamp and not after.
+///
+/// [`a_zoom_walkers_refuses_is_one_this_module_clamps_away`]:
+///     tests::a_zoom_walkers_refuses_is_one_this_module_clamps_away
+const MIN_ZOOM_LEVEL: f64 = 0.0;
+
+/// The tightest zoom `walkers::MapMemory::set_zoom` will accept. See
+/// [`MIN_ZOOM_LEVEL`] for where both numbers come from; walkers' own comment
+/// calls this end "artificial".
+///
+/// Unreachable from [`viewport_for_region`]'s solve, which starts at
+/// `MapMemory::default()`'s 16 and only ever zooms *out* — the step is
+/// `-log2(shortfall)` and the loop has already refused any `shortfall` at or
+/// below 1.0. It is applied anyway, because "the caller only moves one way" is
+/// a property of today's loop rather than of walkers' contract.
+const MAX_ZOOM_LEVEL: f64 = 26.0;
+
 /// A map viewport that frames `rect` on the box of `half` about `centre` —
 /// **the inverse of the measurement this module used to make**.
 ///
@@ -729,9 +765,41 @@ const COVERAGE_MARGIN: f64 = 0.001;
 /// pixels, so every kilometre of ground outside the box is floor resolution
 /// spent on ground the box will clip away.
 ///
-/// `None` for a rect with no area, an extent that is not finite and positive, or
-/// a zoom outside `walkers`' own range. The caller falls back to the pane's own
-/// map memory, which is what the strip was always drawn through.
+/// # A box the strip cannot show is framed as wide as it can be, not abandoned
+///
+/// The solve's step is a zoom, and walkers refuses one outside
+/// [`MIN_ZOOM_LEVEL`]`..=`[`MAX_ZOOM_LEVEL`]. A strip whose *shorter* side is a
+/// few points across needs more than the 16 levels between
+/// `MapMemory::default()` and the world-in-one-tile end to reach a
+/// continental box, so the step it asks for is a **negative** zoom and walkers
+/// says no. That is reachable rather than theoretical: with a whole-ring box the
+/// bar is about 7 points at the equator and about 14 at 65°N, which a pane
+/// collapsed by a divider drag, a web canvas in a shrunk container, or a frame
+/// mid-resize all clear.
+///
+/// The step is therefore **clamped** into walkers' range and the solve stops
+/// when the clamp leaves it nowhere to go. The strip that comes back is short of
+/// the box, and says so by being the widest walkers can draw — but it is
+/// centred on the box, which the caller's fallback is not: `floor_frame_for`
+/// answers the pane's own map memory, at whatever zoom the user left their plan
+/// view and centred on the *site* rather than on a picked region. At the
+/// geometry that trips this the difference is the middle 374 km of a 470 km box
+/// against a fraction of one kilometre of it, so returning the clamped framing
+/// is not a consolation prize; it is most of the floor against almost none of
+/// it.
+///
+/// This used to be `set_zoom(..).ok()?` — a refusal indistinguishable from a
+/// box that was never framable, which is what put the caller on the fallback.
+/// [`a_box_wider_than_the_strip_can_show_is_framed_as_wide_as_walkers_allows`]
+/// drives the geometry that trips it, and asserts on the trip as well as on the
+/// answer so that it cannot quietly stop being a trigger.
+///
+/// `None` for a rect with no area or an extent that is not finite and positive
+/// — the two asks that have no framing at all. The caller falls back to the
+/// pane's own map memory, which is what the strip was always drawn through.
+///
+/// [`a_box_wider_than_the_strip_can_show_is_framed_as_wide_as_walkers_allows`]:
+///     tests::a_box_wider_than_the_strip_can_show_is_framed_as_wide_as_walkers_allows
 pub(crate) fn viewport_for_region(
     rect: egui::Rect,
     centre: walkers::Position,
@@ -767,8 +835,26 @@ pub(crate) fn viewport_for_region(
             return Some(memory);
         }
         // Ground per point halves with every zoom level, so the zoom that
-        // covers the target is one logarithm away rather than a search.
-        memory.set_zoom(memory.zoom() - shortfall.log2()).ok()?;
+        // covers the target is one logarithm away rather than a search — held
+        // inside the range walkers will accept, for the reason above the
+        // signature. `shortfall` is finite and positive and `memory.zoom()` is
+        // in range, so this is finite and the clamp therefore bounds it.
+        let target = (memory.zoom() - shortfall.log2()).clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL);
+        // The clamp bit, and there is nowhere left to go: the next pass would
+        // measure the same projection and ask for the same refused zoom. So the
+        // widest strip walkers can draw is the answer, and it is centred on the
+        // box.
+        if target == memory.zoom() {
+            return Some(memory);
+        }
+        // Unreachable: `target` is finite and inside the range walkers checks,
+        // which is the whole of `Zoom::try_from`. Handled rather than unwrapped
+        // because a panic in a paint is not a proportionate answer to walkers
+        // moving its bounds — and keeping the framing already solved is the same
+        // degradation the clamp above makes, for the same reason.
+        if memory.set_zoom(target).is_err() {
+            return Some(memory);
+        }
     }
     // Out of passes, and by construction still inside the margin rather than
     // short of the box: every pass moves outward and the first one already

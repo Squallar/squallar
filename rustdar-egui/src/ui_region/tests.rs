@@ -27,8 +27,8 @@
 //! is over there.
 
 use super::{
-    COVERAGE_MARGIN, MAX_FRAMING_PASSES, RegionDrag, corners_for, dolly_for_step,
-    ground_half_extent, viewport_for_region, wheel_rate_correction, zoom_step,
+    COVERAGE_MARGIN, MAX_FRAMING_PASSES, MAX_ZOOM_LEVEL, MIN_ZOOM_LEVEL, RegionDrag, corners_for,
+    dolly_for_step, ground_half_extent, viewport_for_region, wheel_rate_correction, zoom_step,
 };
 
 /// A frame whose timing is unusable leaves walkers exactly as it found it.
@@ -634,6 +634,122 @@ fn an_unframable_box_or_pane_is_refused() {
             "{bad:?} was framed rather than refused",
         );
     }
+}
+
+/// Where `walkers::MapMemory::set_zoom` answers `Err(InvalidZoom)`, pinned so
+/// that [`MIN_ZOOM_LEVEL`] and [`MAX_ZOOM_LEVEL`] cannot drift from the crate
+/// they restate.
+///
+/// walkers keeps the bounds inside a `pub(crate)` type — `Zoom::try_from` is
+/// `if !(0. ..=26.).contains(&value) { Err(InvalidZoom) }` at
+/// `walkers-0.56.0/src/zoom.rs:14` — so a consumer has no constant to import and
+/// no way to read them but to try. A version bump that moved either end would
+/// leave this module clamping to the wrong place, and the symptom would be the
+/// silent refusal the clamp exists to remove, back again with a clamp in front
+/// of it.
+///
+/// The `NaN` row is the one that is easy to get wrong: `contains` is false for
+/// a `NaN`, so walkers refuses one — and `f64::clamp` **propagates** a `NaN`
+/// rather than bounding it, so clamping is not a defence against one. That is
+/// why the solve's finiteness test runs before the clamp.
+#[test]
+fn a_zoom_walkers_refuses_is_one_this_module_clamps_away() {
+    let accepts = |zoom: f64| walkers::MapMemory::default().set_zoom(zoom).is_ok();
+
+    assert!(accepts(MIN_ZOOM_LEVEL), "walkers moved the wide end");
+    assert!(accepts(MAX_ZOOM_LEVEL), "walkers moved the tight end");
+    for outside in [
+        MIN_ZOOM_LEVEL - 1e-9,
+        MAX_ZOOM_LEVEL + 1e-9,
+        -1.0,
+        27.0,
+        f64::NEG_INFINITY,
+        f64::INFINITY,
+        f64::NAN,
+    ] {
+        assert!(
+            !accepts(outside),
+            "walkers accepted {outside}, so this module's range is wrong",
+        );
+    }
+    // And the clamp's own contract: every finite zoom the solve can compute
+    // lands somewhere walkers takes.
+    for asked in [-3.5_f64, -0.0001, 0.0, 13.0, 26.0, 99.0, f64::MAX, f64::MIN] {
+        let clamped = asked.clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL);
+        assert!(
+            accepts(clamped),
+            "a step of {asked} clamped to {clamped}, which walkers still refuses",
+        );
+    }
+}
+
+/// **The refusal that used to be silent.** A strip too small to reach the box
+/// inside walkers' zoom range is framed as wide as walkers allows, centred on
+/// the box, rather than abandoned to the caller's fallback.
+///
+/// The solve starts at `MapMemory::default()`'s zoom 16 and buys ground by
+/// zooming out, so it has 16 levels — a factor of 65 536 — before walkers
+/// refuses the step. A pane whose shorter side is a handful of points needs more
+/// than that to reach a continental box, and that gap is what the stored region
+/// made reachable: the box used to *be* the viewport, so the two could not
+/// disagree by a factor of 65 536; a picked region is a fact about the ground
+/// that outlives any pane size, including a pane a divider drag or a canvas
+/// resize has left a few points across.
+///
+/// **The trip is asserted as well as the answer.** A fixture that quietly
+/// stopped driving `set_zoom` out of range would leave this passing while
+/// testing nothing, so the first step is computed here and checked to be a zoom
+/// walkers really does refuse.
+#[test]
+fn a_box_wider_than_the_strip_can_show_is_framed_as_wide_as_walkers_allows() {
+    let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(8.0, 6.0));
+    let centre = walkers::lat_lon(35.33, -97.28);
+    let box_half = half(470.0, 470.0);
+
+    // The trigger, computed the way the solve computes it.
+    let opening = walkers::MapMemory::default();
+    let covered = ground_half_extent(rect, &opening, centre).expect("measurable");
+    let shortfall = (box_half.east_km * (1.0 + COVERAGE_MARGIN) / covered.east_km)
+        .max(box_half.north_km * (1.0 + COVERAGE_MARGIN) / covered.north_km);
+    let step = opening.zoom() - shortfall.log2();
+    assert!(
+        step < MIN_ZOOM_LEVEL,
+        "this fixture no longer drives the solve past walkers' wide end - it \
+         asks for zoom {step}, which walkers accepts, so nothing here is tested",
+    );
+    assert!(
+        walkers::MapMemory::default().set_zoom(step).is_err(),
+        "walkers accepted zoom {step}",
+    );
+
+    let framed = viewport_for_region(rect, centre, box_half)
+        .expect("a box too wide for the strip is framed as wide as it can be");
+    assert_eq!(
+        framed.zoom(),
+        MIN_ZOOM_LEVEL,
+        "the framing stopped short of the widest zoom walkers allows",
+    );
+
+    // And it is the answer that is worth having: centred on the box, showing
+    // most of it, against the fallback's fraction of one kilometre of it.
+    let projector = walkers::Projector::new(rect, &framed, centre);
+    let middle = projector.unproject(rect.center().to_vec2());
+    let (_, off_km) =
+        rustdar_radar::beam::site_bearing_range_km(centre.y(), centre.x(), middle.y(), middle.x());
+    assert!(
+        off_km < 0.001,
+        "the clamped strip's middle is {off_km} km from the box's centre",
+    );
+    let clamped = ground_half_extent(rect, &framed, centre).expect("measurable");
+    assert!(
+        clamped.north_km > 300.0 && clamped.east_km > 400.0,
+        "the clamped strip covers only {clamped:?} of a 470 km box",
+    );
+    assert!(
+        clamped.north_km > 1000.0 * covered.north_km,
+        "the clamped strip covers {clamped:?} against the opening zoom's \
+         {covered:?} - the fallback this replaces is that second one",
+    );
 }
 
 /// A framed strip is centred on the box, not on wherever the pane's map was
