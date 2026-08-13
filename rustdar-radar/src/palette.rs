@@ -188,6 +188,16 @@ fn nrot_lookup(nrot: f32) -> (u8, u8, u8, u8) {
 // ————————————————————————————————————————————————————————————————————
 
 /// Reflectivity (dBZ). Gradient regions 0-10 dBZ approximated with discrete steps.
+///
+/// **Authored here, not the RPG's, and deliberately so.** ORPG Build
+/// 21.0r1.7's own reflectivity tables — `colors/refl_16.plt` for the legacy
+/// 16-level products and `colors/hires_refl.plt` for the super-res ones —
+/// open cyan `#00ECEC` at the bottom of the scale and share only four
+/// mid-range colours with this ramp, at different dBZ. This one opens grey,
+/// carries no cyan at all, and spends the cool end on the 7.5–20 dBZ band.
+/// It is the reflectivity leg of this crate's house ramp; anyone diffing it
+/// against the RPG will find nothing in common, which is the intent and not
+/// a drift.
 static REFLECTIVITY: ColorScale = &(
     &[
         (0.0, (0, 0, 0)),
@@ -217,6 +227,15 @@ static REFLECTIVITY: ColorScale = &(
 );
 
 /// Velocity outbound / positive (mph thresholds).
+///
+/// The RPG's scheme at the RPG's bins — exact 10-knot steps, `#FF0000` at the
+/// outbound extreme and `#00FF00` at the inbound one, both byte-exact against
+/// `colors/vel_66.plt` and `colors/hires_vel1.plt` — but **interpolated where
+/// the RPG hand-tunes**: these eight stops ramp 100→255 linearly across the
+/// channel, and deliberately omit the RPG's grey zero-crossing band
+/// (`#777777`, `#7F7777`, `#845A5A`) and its magenta high-outbound tail
+/// (`#E80026`, `#C0004C`, `#A80072`). Two clean directional ramps beat a
+/// third colour family at the point where the sign flips.
 static VELOCITY_OUTBOUND: ColorScale = &(
     &[
         (0.0, (100, 0, 0)),
@@ -273,7 +292,12 @@ static SPECTRUM_WIDTH: ColorScale = &(
     false,
 );
 
-/// Differential reflectivity ZDR (dB).
+/// Differential reflectivity ZDR (dB). Derived from the RPG's `zdr_16.plt`
+/// (product 158/159, `prod_config`) — the same hue order, `#FFFFFF` at the
+/// top exactly, and several stops that are a uniform per-channel offset from
+/// it (`#7B67A3` is `#8C78B4` less 17 on every channel) — but re-toned, not
+/// transcribed. Recorded as a derivation so nobody reads the residual as
+/// drift from a table this was never a copy of.
 static ZDR: ColorScale = &(
     &[
         (f32::NEG_INFINITY, (66, 66, 66)),
@@ -293,7 +317,37 @@ static ZDR: ColorScale = &(
     true,
 );
 
-/// Correlation coefficient (0-1).
+/// Correlation coefficient (0-1): a seven-stop gradient reduction of the
+/// RPG's own ρhv ramp, at the RPG's own diagnostic breaks.
+///
+/// The colours are `colors/cc_16.plt`'s. ORPG Build 21.0r1.7's `prod_config`
+/// pairs that file with `legends/cc_raw_5.lgd` for products 161 and 167, the
+/// operational digital-ρhv displays — i.e. the display of the very field
+/// this palette paints. `cc_raw_5.lgd` assigns fourteen colours at explicit
+/// data levels, converted by its own declared scale 300 / offset −60
+/// (`(level + 60) / 300`, the same 300 `test_base_prods_8bit_main.c:115`
+/// gives ρhv):
+///
+/// | ρ | 0.207 | 0.45 | 0.65 | 0.75 | 0.80 | 0.85 | 0.90 | 0.93 | 0.95 | 0.96 | 0.97 | 0.98 | 0.99 | 1.00 |
+/// |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+/// | | grey | `#14148C` | `#0000D9` | `#8787FF` | `#55FF55` | `#87CF00` | `#FFFF00` | `#FFC800` | `#FF8C00` | `#FF2D00` | `#E10000` | `#A00000` | `#990062` | `#FF8CAA` |
+///
+/// Seven gradient stops cannot resolve fourteen discrete steps, so this table
+/// keeps the anchors a forecaster actually reads and drops the four reds
+/// packed between 0.95 and 0.99. What survives lands where the RPG puts it:
+/// blue at 0.45 (exact), periwinkle at 0.75 (exact), yellow at 0.90 (exact),
+/// orange at 0.96 against the RPG's 0.95, magenta at 0.98 against its 0.99.
+/// The two loose stops are 0.55's lightened `#0000D9` and 0.80's `#87CF00`,
+/// 0.10 and 0.05 *below* where the source puts those colours. Every deviation
+/// is low or zero; none is high.
+///
+/// **Not `cc_64.plt`/`cc_064.lgd`.** The same `prod_config` gives that pair
+/// only to the *test* raw-data products 605 and 705, and `cc_064.lgd` carries
+/// no level→colour assignment at all — only tick labels — so its 62 colours
+/// spread linearly over data level rather than sitting at the operational
+/// thresholds. Measured against that spread these stops appear 0.08–0.13
+/// *high*; measured against the operational legend they are 0.00–0.10 low.
+/// The operational legend is the one that decides.
 static RHO: ColorScale = &(
     &[
         (0.45, (21, 19, 143)),
@@ -309,6 +363,27 @@ static RHO: ColorScale = &(
 
 /// Differential phase (degrees, pre-wrapped to 0-360). Cyclic: the tail returns
 /// toward the first color so 0° and 360° are visually continuous.
+///
+/// **Authored, and deliberately not the RPG's**, which paints ΦDP as a
+/// greyscale: `colors/phi_64.plt` is 52 grey steps under a red top, and the
+/// 55-colour `generic_method_5_86.plt` that `legends/phi_raw_5.lgd` selects
+/// for product 168 is the same idea at more levels. A cyclic rainbow is the
+/// choice here because the field is an angle.
+///
+/// **The 360° wrap loses nothing, because 360° is the whole domain.** The
+/// input is the Level II ΦDP moment, and ORPG Build 21.0r1.7 states its
+/// encoding twice: `src/cpc102/tsk018/test_base_prods_8bit_main.c:103-105`
+/// gives `data_offset = 2.0` with `data_scale = 2.8361 /* 10-bit */` and
+/// `0.70277 /* 8-bit */`, and `src/cpc102/tsk085/superes8bit.c:20,21,776`
+/// spells the direction out as `t = roundf((f * PHI_SCALE) + PHI_OFFSET)`.
+/// The scale is levels **per degree**, so the 10-bit moment spans
+/// `(1023 − 2) / 2.8361 = 360.00°` and the 8-bit product
+/// `(255 − 2) / 0.70277 = 360.0°`. `rem_euclid(360.0)` is therefore an
+/// identity on every value this product can carry.
+///
+/// The ~717° span one can read off `legends/phi.lgd` is that same 2.8361 read
+/// backwards, as degrees per level; no `prod_config` row references that
+/// file, and both files that products do reference agree on 360°.
 static PHI: ColorScale = &(
     &[
         (0.0, (151, 151, 242)),
@@ -339,7 +414,11 @@ static PHI: ColorScale = &(
     true,
 );
 
-/// Specific differential phase KDP (deg/km).
+/// Specific differential phase KDP (deg/km). Derived from the RPG's
+/// `kdp_16.plt` (products 162/163, `prod_config`): `#767676`, `#4B4B4B`,
+/// `#4B0000`, `#14B932` and `#0AFF0A` are that table's exactly, but this one
+/// drops its two pinks and darkens the top two stops where the RPG lightens.
+/// Recorded as a derivation, not a transcription with drift.
 static KDP: ColorScale = &(
     &[
         (-2.0, (118, 118, 118)),
@@ -360,6 +439,15 @@ static KDP: ColorScale = &(
 );
 
 /// Enhanced Echo Tops (thousands of feet).
+///
+/// **The house ramp, authored — not the RPG's `hreet`/`et_16` tables**, which
+/// put `#0000F5` at 25 kft where this is green and agree with none of these
+/// twelve stops. `#646464 → #0064FF → #00C8FF → #00C800 → #FFFF00 → #FFC800
+/// → #FF9600 → #FF0000 → #C80000 → #FF00FF → #C800C8 → #FFFFFF` is one ramp
+/// reused across the volume products — this one, [`VIL`], [`VIL_DENSITY`],
+/// [`POSH`], [`MEHS`], [`PRECIP_RATE`] and [`HHC`] — so they read as one
+/// family and a forecaster learns the colours once. Only the *breakpoints*
+/// are per-product, and where those cite an authority the doc says which.
 static ECHO_TOPS: ColorScale = &(
     &[
         (5.0, (100, 100, 100)), // dispatcher renders < 5 transparent
@@ -378,7 +466,11 @@ static ECHO_TOPS: ColorScale = &(
     true,
 );
 
-/// Vertically Integrated Liquid (kg/m2).
+/// Vertically Integrated Liquid (kg/m2). The house ramp described on
+/// [`ECHO_TOPS`], at VIL's own linear breakpoints — **not** the RPG's
+/// `dvil_255.plt`/`dvil_66.plt`, whose `dvil_2.lgd` breakpoints are
+/// nonlinear and whose colours agree with none of these eleven stops.
+/// Authored, deliberately.
 static VIL: ColorScale = &(
     &[
         (1.0, (100, 100, 100)), // dispatcher renders < 1 transparent
@@ -518,7 +610,10 @@ static HHC: ColorScale = &(
     false,
 );
 
-/// Precipitation Rate (in/hr).
+/// Precipitation Rate (in/hr). The house ramp described on [`ECHO_TOPS`], at
+/// rate breakpoints — **not** the RPG's `dpr_66v1.plt`, which product 176
+/// pairs with `dpr_5v3.lgd` and which agrees with none of these eleven
+/// stops. Authored, deliberately.
 static PRECIP_RATE: ColorScale = &(
     &[
         (0.01, (100, 100, 100)), // dispatcher renders < 0.01 transparent
