@@ -959,11 +959,21 @@ impl VolumeStore {
     /// that wants to be visible in a log the day someone finds a path that
     /// keeps a grid a pane no longer needs.
     ///
-    /// The one such path this doc used to disclose — reducing the pane count
-    /// hides a 3D pane without converting it, and `ReleaseVolume` fires only on
-    /// a *kind* change — is closed: [`Self::hidden_holders`] names those panes
-    /// and `App::release_hidden_pane_volumes` releases them, once per frame,
-    /// outside every `mem::take` window.
+    /// Two such paths have been disclosed here, and both are closed:
+    ///
+    /// * Reducing the pane count hides a 3D pane without converting it, and
+    ///   `ReleaseVolume` fires only on a *kind* change.
+    ///   [`Self::hidden_holders`] names those panes and
+    ///   `App::release_hidden_pane_volumes` releases them, once per frame,
+    ///   outside every `mem::take` window.
+    /// * Switching radar site leaves the pane on a site with no published
+    ///   stamp, and `ui_map`'s volume arm returns its empty state *before* it
+    ///   emits `PrepareVolume` or paints — so nothing reached [`Self::share`],
+    ///   nothing reached [`StoreInner::shed`], and the radar the pane just left
+    ///   stayed attached to it until the *new* site's first volume was
+    ///   extracted, which on a site with no data is never.
+    ///   `GuiAction::SwitchRadarSite` now calls `App::handle_release_volume`
+    ///   for every pane that really changed radar, on the switch itself.
     pub fn memory_bytes(&self) -> usize {
         self.lock()
             .entries

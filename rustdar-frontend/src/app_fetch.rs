@@ -534,12 +534,19 @@ impl super::App {
                 // that: with no `ScanInfo` it centres on the new site's own
                 // `sites::radars()` coordinates, so the switch arrives on the new
                 // radar immediately instead of holding the old one's position.
+                // The panes that really left a radar, for the volume release
+                // below. Collected rather than released inside the loop because
+                // the release needs `&mut self` — the store *and* egui's
+                // callback resources — while `pane_mut` holds a borrow of
+                // `self.gui`.
+                let mut left_a_radar: Vec<usize> = Vec::new();
                 for idx in moving {
                     if let Some(pane) = self.gui.pane_mut(idx) {
                         // Only where the site really moves. `moving` is the
                         // linked group, and a pane already on `site` — with its
                         // volume drawn and its menu right — is not switching.
                         if pane.site != site {
+                            left_a_radar.push(idx);
                             pane.scan_info = None;
                             pane.data_time = None;
                             // The picture and the key that names what it was cut
@@ -563,6 +570,63 @@ impl super::App {
                     }
                 }
                 self.loop_mgr.clear_all();
+
+                // The third way a 3D pane stops needing its volume, beside the
+                // kind change (`GuiAction::ReleaseVolume`) and the pane-count
+                // reduction (`App::release_hidden_pane_volumes`): it changes
+                // radar. Nothing downstream covered it, and the reason is the
+                // order the frame is written in. `ui_map`'s volume arm returns
+                // the "Downloading the first … volume" empty state as soon as
+                // the site has no published stamp — *before* it emits
+                // `PrepareVolume` and before it paints — so after a switch
+                // nothing calls `VolumeStore::share_held`, nothing calls
+                // `StoreInner::shed`, and the callback's `prepare` never runs
+                // to prune the GPU side either. The pane went on holding the
+                // radar it just left: 8.00 MiB of host grid and 36.00 MiB of
+                // GPU texture on the desktop shape (256×256×128), plus its
+                // pane-sized offscreen, until the *new* site's first volume was
+                // extracted — which is seconds on a good fetch and never at all
+                // on a site that has no data or whose download fails.
+                //
+                // It was bounded at one grid per pane rather than growing:
+                // `same_scope` is site-and-product, so the new site's eventual
+                // `begin_build_held` did shed the old one. That makes it a
+                // question of *when* rather than of how much, and the answer
+                // "when some other site finally delivers" is not an answer.
+                // `VolumeStore::enforce_budget` never reclaimed it either — it
+                // only fires over budget, and one stale grid never is.
+                //
+                // Released here rather than left to any of those: the switch is
+                // the moment the bytes stop describing anything the user asked
+                // for. `handle_release_volume` gives back the host entry, the
+                // GPU upload and the offscreen together, and detaching also
+                // drops the pane's in-flight `Building` entry, so a build
+                // dispatched for the abandoned radar lands on a store that is
+                // no longer waiting and is dropped by `VolumeStore::complete`
+                // instead of admitting a fresh grid for a site nobody is on.
+                //
+                // `rendered_for` goes with it, and that half is not
+                // bookkeeping. `PrepareVolume` is level-triggered on it, so a
+                // pane released while it still named a target would come back
+                // from a switch *back* to a site whose stamp is still published,
+                // match the stale key, never ask again, and read "Building…"
+                // for ever. The same pairing `release_hidden_pane_volumes`
+                // makes, for the same reason.
+                //
+                // The cost is that returning to a site re-resamples rather than
+                // finding the grid still in hand. That is the trade
+                // `VolumeStore::retain_set` already states for the loop's own
+                // set — release first, rebuild after, and accept the first-build
+                // message for the fraction of a second it costs — applied to
+                // the one holder that was not yet keeping to it.
+                for idx in left_a_radar {
+                    self.handle_release_volume(idx);
+                    if let Some(pane) = self.gui.pane_mut(idx)
+                        && let Some(volume) = pane.volume_mut()
+                    {
+                        volume.rendered_for = None;
+                    }
+                }
 
                 let utc_timestamp = Self::local_to_utc(new_config.timestamp);
                 self.spawn_fetch(site, utc_timestamp);

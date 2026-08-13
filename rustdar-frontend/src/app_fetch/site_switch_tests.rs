@@ -441,3 +441,251 @@ fn the_new_sites_chunks_accumulate_from_nothing_rather_than_onto_the_old_site() 
         "the pane's scan info names a radar other than the one it is on",
     );
 }
+
+// ---------------------------------------------------------------------------
+// The 3D pane's voxel grid, and the moment it stops describing anything.
+//
+// The three above are about what a pane *says* after a switch. These are about
+// what it still *holds*: a resolved `VoxelGrid` is 8.00 MiB of host bytes and
+// 36.00 MiB of GPU texture on the desktop shape (256×256×128, measured through
+// `rustdar_radar::voxel::build_voxels` at `voxel::DESKTOP_SHAPE`), and the pane
+// went on holding the radar it had just left.
+//
+// Every assertion here is in **bytes off a real `VoxelGrid`**, for the reason
+// the hidden-pane suite gives: a store of `Refused` stubs satisfies an
+// entry-count assertion while giving nothing back, so counting entries would
+// pass on a fix that freed nothing.
+// ---------------------------------------------------------------------------
+
+use crate::volume::bridge::tests::ready_grid;
+use crate::volume::bridge::{Hold, VolumeEntry};
+use rustdar_egui::pane::{VolumeStamp, VolumeTarget};
+
+/// A 3D target on `site`, at a time that separates one volume from the next.
+fn volume_target(site: &str, minute: u32) -> VolumeTarget {
+    VolumeTarget {
+        region: None,
+        product: RadarProduct::Reflectivity,
+        volume: VolumeStamp {
+            site: site.to_owned(),
+            collected: at(minute),
+        },
+    }
+}
+
+/// GPU texture bytes one [`ready_grid`] costs the store — what the assertions
+/// below are denominated in, so that a fix which drops the entry without
+/// freeing the grid cannot pass.
+fn one_grid_bytes() -> usize {
+    let VolumeEntry::Ready(grid) = ready_grid() else {
+        unreachable!("ready_grid is Ready")
+    };
+    let shape = grid.shape();
+    crate::volume::raymarch::grid_bytes_with_mips([
+        u32::try_from(shape.nx).unwrap(),
+        u32::try_from(shape.ny).unwrap(),
+        u32::try_from(shape.nz).unwrap(),
+    ])
+    .expect("a fixture grid cannot overflow")
+        + crate::constants::VOLUME_LUT_BYTES
+}
+
+/// Make `pane_idx` a 3D pane on `WSR88D`, already served — `rendered_for` set
+/// is what stops `PrepareVolume` firing again, and so what a release has to
+/// clear.
+fn volume_pane_on_the_wsr88d(app: &mut crate::app::App, pane_idx: usize, t: &VolumeTarget) {
+    let pane = app.gui.pane_mut(pane_idx).expect("the pane exists");
+    pane.site = WSR88D.to_owned();
+    pane.set_view(rustdar_radar::types::RenderView::Volume);
+    pane.volume_mut()
+        .expect("a 3D pane has volume state")
+        .rendered_for = Some(t.clone());
+}
+
+/// Open and resolve a build the way production does.
+fn make_resident(app: &crate::app::App, pane_idx: usize, t: &VolumeTarget, hold: Hold) {
+    app.volume_store.begin_build_held(pane_idx, t, hold);
+    assert!(
+        app.volume_store.complete(t, ready_grid()),
+        "precondition: the entry this just opened takes the result",
+    );
+}
+
+/// **The switch gives the previous radar's grid back, and does not wait for the
+/// new one to arrive to do it.**
+///
+/// This is the case the defect was actually about. Nothing is ever fetched for
+/// `TPIT` here — no scan, no stamp, no `PrepareVolume` — which is exactly the
+/// state a pane sits in while a fetch is in flight, and the state it sits in
+/// *for ever* when that fetch fails or the site has no data. Before the fix the
+/// store still read one whole grid at this point, because every path that would
+/// have shed it runs off a target the pane cannot yet form.
+#[test]
+fn switching_radar_releases_the_previous_sites_3d_grid_without_waiting_for_the_new_one() {
+    let one = one_grid_bytes();
+    assert!(one > 0, "precondition: a resident grid costs something");
+
+    let mut app = headless(TestBridge::desktop());
+    let left_behind = volume_target(WSR88D, 0);
+    volume_pane_on_the_wsr88d(&mut app, 0, &left_behind);
+    make_resident(&app, 0, &left_behind, Hold::Single);
+
+    assert_eq!(
+        app.volume_store.texture_bytes(),
+        one,
+        "precondition: the pane holds exactly one grid's worth of GPU texture",
+    );
+    let host_before = app.volume_store.memory_bytes();
+    assert!(
+        host_before > 0,
+        "precondition: the resident grid has host bytes to give back",
+    );
+
+    switch_to(&mut app, TDWR);
+
+    assert_eq!(
+        app.volume_store.texture_bytes(),
+        0,
+        "the radar the pane just left is still resident on the GPU. Nothing \
+         downstream reclaims it: `ui_map` returns the \"Downloading the first \
+         …\" empty state before it can emit `PrepareVolume`, so no shed runs, \
+         and `enforce_budget` only fires over budget — which one grid never is",
+    );
+    assert_eq!(
+        app.volume_store.memory_bytes(),
+        0,
+        "the host grid outlived the site it describes",
+    );
+    assert!(
+        app.volume_store.live_ids().is_empty(),
+        "the store is still holding an entry for a radar nobody is on",
+    );
+    assert_eq!(
+        app.gui
+            .pane(0)
+            .and_then(|p| p.volume())
+            .and_then(|v| v.rendered_for.clone()),
+        None,
+        "`rendered_for` still names the radar that was left. `PrepareVolume` \
+         is level-triggered on it, so switching *back* to a site whose stamp is \
+         still published would match this stale key, never re-ask, and leave \
+         the pane reading \"Building…\" for ever",
+    );
+}
+
+/// **A build dispatched for the radar being left is dropped rather than
+/// admitted.**
+///
+/// The half that is easy to miss: releasing only what is *resolved* would let
+/// the in-flight resample land afterwards and put a fresh grid for the
+/// abandoned radar into the store, where nothing would ask for it again.
+/// Detaching the pane prunes the `Building` entry, and that absence is what
+/// `VolumeStore::complete` reads as "nothing is waiting for this".
+#[test]
+fn a_resample_dispatched_for_the_radar_being_left_lands_on_a_store_that_dropped_it() {
+    let mut app = headless(TestBridge::desktop());
+    let in_flight = volume_target(WSR88D, 0);
+    volume_pane_on_the_wsr88d(&mut app, 0, &in_flight);
+    app.volume_store.begin_build(0, &in_flight);
+
+    switch_to(&mut app, TDWR);
+
+    assert!(
+        !app.volume_store.complete(&in_flight, ready_grid()),
+        "the abandoned radar's resample was admitted after the switch, so the \
+         store gained a whole grid for a site no pane is on",
+    );
+    assert_eq!(
+        app.volume_store.memory_bytes(),
+        0,
+        "a grid for the abandoned radar is resident on the host",
+    );
+}
+
+/// **A 3D loop's whole resident set goes on the switch itself, not a frame
+/// later.**
+///
+/// `dispatch_loop_renders` does reclaim a torn-down loop's set — the switch
+/// resets `loop_state`, and the next frame's `retire_queues` pass calls
+/// `release_set`. That left the set resident for the frame in between, which
+/// on the desktop shape is thirteen grids. The release is now edge-triggered on
+/// the switch, so no frame is drawn with it still held, and the set holder is
+/// unmarked with it.
+#[test]
+fn switching_radar_releases_a_3d_loops_whole_resident_set_on_the_switch_frame() {
+    let mut app = headless(TestBridge::desktop());
+    let live = volume_target(WSR88D, 0);
+    volume_pane_on_the_wsr88d(&mut app, 0, &live);
+    for minute in 1..=3 {
+        make_resident(&app, 0, &volume_target(WSR88D, minute), Hold::Set);
+    }
+    assert_eq!(
+        app.volume_store.texture_bytes(),
+        one_grid_bytes() * 3,
+        "precondition: the pane holds a three-frame set",
+    );
+
+    switch_to(&mut app, TDWR);
+
+    assert_eq!(
+        app.volume_store.texture_bytes(),
+        0,
+        "the loop's frames outlived the radar they were resampled from, for at \
+         least the frame between the switch and the next `dispatch_loop_renders`",
+    );
+    assert!(
+        !app.volume_store.holds_set(0),
+        "the pane is still marked a set holder, which exempts it from every \
+         shed there is — so its next live grid would never be shed either",
+    );
+}
+
+/// **A pane that did not change radar keeps what it holds.**
+///
+/// The over-release direction, and the one a blanket "drop everything on a
+/// switch" would fail. `layer_sync_targets` moves the linked group alone, so an
+/// unlinked second pane stays where it is — and the store refcounts by pane, so
+/// the entry the two share must survive the first pane letting go of it.
+#[test]
+fn a_pane_that_did_not_change_radar_keeps_its_3d_grid() {
+    let one = one_grid_bytes();
+    let mut app = two_pane_app(WSR88D, WSR88D);
+    let shared = volume_target(WSR88D, 0);
+    volume_pane_on_the_wsr88d(&mut app, 0, &shared);
+    volume_pane_on_the_wsr88d(&mut app, 1, &shared);
+    // Panes are layer-linked by default (`PaneState::layer_link`), and a linked
+    // group moves together — which would make this the *same* transition as the
+    // test above rather than its complement. Unlinking the second pane is what
+    // leaves it a pane the switch genuinely does not move.
+    app.gui.pane_mut(1).expect("the pane exists").layer_link = false;
+    make_resident(&app, 0, &shared, Hold::Single);
+    assert!(
+        app.volume_store.share(1, &shared),
+        "precondition: the second pane attaches to the same entry",
+    );
+    assert_eq!(
+        app.volume_store.texture_bytes(),
+        one,
+        "precondition: two panes on one volume share one grid",
+    );
+
+    // Pane 0 alone. `two_pane_app`'s panes are not layer-linked, so
+    // `layer_sync_targets` names only the pane that was clicked.
+    switch_to(&mut app, TDWR);
+
+    assert_eq!(
+        app.volume_store.texture_bytes(),
+        one,
+        "releasing the switching pane took the grid out from under the pane \
+         that is still on that radar and still painting it",
+    );
+    assert_eq!(
+        app.gui
+            .pane(1)
+            .and_then(|p| p.volume())
+            .and_then(|v| v.rendered_for.clone()),
+        Some(shared),
+        "the pane that did not move had its level-triggered key cleared, so it \
+         will rebuild a grid it is already holding",
+    );
+}
