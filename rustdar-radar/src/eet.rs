@@ -92,6 +92,47 @@
 //!   reading real data there rather than bad data. Closing this needs a
 //!   defensible value for "what is above the echo", which no public document
 //!   supplies and which must not be fitted to the twin.
+//!
+//!   **What the clamp is made of is now known, and lifting it is now measured
+//!   to lose.** The cube carries [`crate::types::GateReport`], so the `NaN`
+//!   above a crossing can be asked which of three things it is. It is
+//!   essentially always a measurement: of the clamping columns, **99.2–100%
+//!   are censored** (the tilt above looked and found nothing) and 0–0.8% are
+//!   a gate that was never reported — KDMX 4402 clamps at 100.0% censored,
+//!   KFTG 2143 at 99.8%, KMSX 502 at 99.2%. So the first half of the
+//!   mechanism above is confirmed: the RPG is reading its DQA buffer where
+//!   this crate has a censored cell, not where it has a coverage hole.
+//!
+//!   The second half does not follow. Whatever value "what is above the echo"
+//!   took, the interpolation is monotone in it, so an honest termination must
+//!   land somewhere in `[h, h_up]` — the crossing tilt's own altitude, which
+//!   is what ships, up to the tilt above it. Measured against product 135 on
+//!   KFTG/KDMX/KMSX (6,238 censored-clamp bins, twins paired by volume
+//!   identity, oracle decoded with MetPy), sweeping the top a fixed fraction
+//!   `f` up its own bracket:
+//!
+//!   | `f` | <15 | 15–25 | 25–35 | 35–45 | ≥45 kft | pooled mean (within 1 kft) |
+//!   |---|---|---|---|---|---|---|
+//!   | 0.00 — ships today | +1.27 | +0.61 | +0.23 | −0.62 | −3.08 | **−0.01 (52.6%)** |
+//!   | 0.10 | +1.57 | +1.12 | +0.86 | +0.19 | −2.10 | +0.63 (47.6%) |
+//!   | 0.32 | +2.24 | +2.23 | +2.27 | +1.95 | +0.05 | +2.02 (20.8%) |
+//!   | 1.00 — bracket ceiling | +4.30 | +5.65 | +6.60 | +7.41 | +6.69 | +6.31 (2.2%) |
+//!
+//!   `f = 0` is the optimum and every step up is monotonically worse. The
+//!   clamped population carries the **same** sign flip with height the whole
+//!   grid does (+1.27 shallow to −3.08 deep), and a bracket fraction moves
+//!   every band the same way, so the `f = 0.32` that zeroes the deep band
+//!   does it by pushing all four shallower bands to about +2.2 and halving
+//!   the within-a-level share. No value for "what is above the echo" — however
+//!   it were justified — flattens that grade.
+//!
+//!   And the grade is not the clamp's to begin with: columns that **never
+//!   clamp**, that interpolate against real data above, grade +0.70 → −1.87
+//!   over the same bands. The clamp is a steeper copy of a bias that is
+//!   already there without it. So the clamp stays, the information loss that
+//!   hid its composition is closed, and **the depth residual is somewhere
+//!   else** — HREET's own pre/post-processing remains the backstop candidate.
+//!   Do not spend another pass on the recombination or on this clamp.
 //! * **SAILS/MRLE revisits**: HREET consumes each elevation's DQA buffer once
 //!   as the volume completes, so the cube is deduplicated
 //!   [`DedupPolicy::FirstOfVolume`] — the coherent first pass the RPG's
@@ -175,14 +216,17 @@
 //! instead is the "bad data above" clamp among the gaps above, whose share
 //! of columns rises from 2.0% to 52.7% across those same bands.
 //!
-//! So the next hand on this should go to the clamp, and to how a top is
-//! placed inside the ~10 kft gap between the highest cuts — not to the
-//! recombination, which has now been measured three ways and lost. HREET's
-//! own pre/post-processing remains the backstop candidate (its input is the
-//! DQA buffer and its source, `cpc014/tsk012`, is in no public CODE
-//! distribution), so the residual is recorded here rather than papered
-//! over: do not lower the bar, and do not calibrate further heuristics
-//! against a single twin volume.
+//! **The clamp has since been that next hand, and it came back negative.**
+//! The bullet above has the measurement: the clamp's `NaN` is 99.2–100%
+//! censored rather than unreported, so the mechanism was correctly
+//! identified, but no honest termination inside the bracket the physics
+//! allows improves the grade, and columns that never clamp carry the same
+//! grade anyway (+0.70 → −1.87). Two candidates are now spent — the
+//! recombination, measured three ways, and the clamp. HREET's own
+//! pre/post-processing is what is left (its input is the DQA buffer and its
+//! source, `cpc014/tsk012`, is in no public CODE distribution), so the
+//! residual is recorded here rather than papered over: do not lower the bar,
+//! and do not calibrate further heuristics against a single twin volume.
 
 use crate::sites::Datum;
 use crate::types::RadarProduct;
