@@ -483,7 +483,8 @@ async fn live_substrate_costs_are_measured() {
     let crate::scan::DecodedScan {
         scan,
         declared_nyquist,
-    } = crate::scan::get_scan(site, now).await.expect("a volume");
+    } = crate::scan::decode_bytes(crate::scan::fetch_scan(site, now).await.expect("a volume"))
+        .expect("the volume decodes");
     println!("declared Nyquist velocities: {:?}", declared_nyquist);
 
     // The downloaded volume states where its own radar is, so this places it

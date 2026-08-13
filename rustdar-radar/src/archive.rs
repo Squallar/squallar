@@ -516,13 +516,16 @@ pub async fn list_files(
     Ok(keys.iter().map(|key| key_to_identifier(key)).collect())
 }
 
-/// Download the volume an identifier names. [`nexrad_data::volume::File`] still
-/// owns decompression and decoding. The bucket comes from
-/// [`DataSources::level2_bucket`] — see [`list_files`].
-pub async fn download_file(
-    sources: &DataSources,
-    identifier: Identifier,
-) -> Result<nexrad_data::volume::File> {
+/// Download the volume an identifier names, as the bytes the bucket served.
+/// The bucket comes from [`DataSources::level2_bucket`] — see [`list_files`].
+///
+/// **Bytes and not a [`nexrad_data::volume::File`]**, which is all a `File`
+/// holds anyway. Wrapping here put the archive one type away from being a
+/// job's input: `crate::scan::decode_bytes` is where the decode happens now,
+/// it may happen in a Web Worker that never saw this download, and the thing
+/// that crosses to it is a buffer. A caller that wants upstream's wrapper can
+/// still say `File::new`, and the decode path does exactly that.
+pub async fn download_file(sources: &DataSources, identifier: Identifier) -> Result<Vec<u8>> {
     let client = shared_client();
 
     let date = identifier
@@ -541,7 +544,7 @@ pub async fn download_file(
         StatusClass::Ok => {
             let data = response.bytes().await?.to_vec();
             log::debug!("Object {key:?} is {} bytes", data.len());
-            Ok(nexrad_data::volume::File::new(data))
+            Ok(data)
         }
         StatusClass::NotFound => Err(ArchiveError::NotFound(key)),
         StatusClass::Failed => {

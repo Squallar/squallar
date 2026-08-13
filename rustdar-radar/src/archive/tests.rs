@@ -536,17 +536,19 @@ async fn live_archive_lists_downloads_and_decodes_a_volume() {
         .expect("at least one V06 volume");
     println!("downloading {}", volume.name());
 
-    let file = download_file(&sources, volume.clone())
+    let bytes = download_file(&sources, volume.clone())
         .await
         .expect("download should succeed");
-    println!("downloaded {} bytes", file.data().len());
+    println!("downloaded {} bytes", bytes.len());
     assert!(
-        file.data().len() > 1_000_000,
+        bytes.len() > 1_000_000,
         "a Level II volume should be megabytes, got {}",
-        file.data().len()
+        bytes.len()
     );
 
-    let scan = file.scan().expect("volume should decode");
+    let scan = nexrad_data::volume::File::new(bytes)
+        .scan()
+        .expect("volume should decode");
     let sweeps = scan.sweeps().len();
     println!("decoded {sweeps} sweeps");
     assert!(sweeps > 0, "decoded a volume with no sweeps");
@@ -686,11 +688,13 @@ async fn live_volume_elevation_numbers_are_contiguous_and_terminated() {
         .iter()
         .find(|f| f.name().ends_with("_V06"))
         .expect("at least one V06 volume");
-    let scan = download_file(&sources, volume.clone())
-        .await
-        .expect("download")
-        .scan()
-        .expect("decode");
+    let scan = nexrad_data::volume::File::new(
+        download_file(&sources, volume.clone())
+            .await
+            .expect("download"),
+    )
+    .scan()
+    .expect("decode");
 
     println!(
         "{} -> VCP {}, {} sweeps",

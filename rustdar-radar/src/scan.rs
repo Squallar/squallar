@@ -389,7 +389,7 @@ pub(crate) async fn list_files(site: &str, date: &chrono::NaiveDate) -> Result<V
     Ok(crate::archive::list_files(&crate::sources::DataSources::production(), site, date).await?)
 }
 
-pub(crate) async fn download_file(identifier: Identifier) -> Result<nexrad_data::volume::File> {
+pub(crate) async fn download_file(identifier: Identifier) -> Result<Vec<u8>> {
     crate::tls::init();
     Ok(
         crate::archive::download_file(&crate::sources::DataSources::production(), identifier)
@@ -441,7 +441,14 @@ pub async fn check_latest_scan(
     Ok(latest_time.map(|t| effective_date.and_time(t)))
 }
 
-pub async fn get_scan(site: &str, timestamp: NaiveDateTime) -> Result<DecodedScan> {
+/// Locate and download the archive volume nearest `timestamp`, **undecoded**.
+///
+/// The decode is [`decode_bytes`], and it is deliberately not called here: on
+/// the web this future runs on the browser's main thread (`spawn_local`), and
+/// the decode is the second this application must not spend there. Splitting at
+/// the bytes lets the caller hand the CPU half to a worker — see
+/// `rustdar_frontend::offload::JobRequest::Decode`.
+pub async fn fetch_scan(site: &str, timestamp: NaiveDateTime) -> Result<Vec<u8>> {
     let date = timestamp.date();
     let Some((metas, effective_date)) = list_files_with_fallback(site, &date).await? else {
         return Err(ScanError::NoScan(
@@ -522,18 +529,20 @@ pub async fn get_scan(site: &str, timestamp: NaiveDateTime) -> Result<DecodedSca
     log::info!("Downloading file \"{}\"...", meta.name());
     let downloaded_file = download_file(meta.clone()).await?;
 
-    log::info!("Data file size (bytes): {}", downloaded_file.data().len());
+    log::info!("Data file size (bytes): {}", downloaded_file.len());
 
-    decoded(&downloaded_file)
+    Ok(downloaded_file)
 }
 
-/// Fetch the latest scan if it is newer than `current_timestamp`. One
-/// `list_files` call, unlike `check_latest_scan` + `get_scan`, which LIST twice.
-pub async fn check_and_fetch_latest(
+/// Download the latest scan if it is newer than `current_timestamp`,
+/// **undecoded**. One `list_files` call, unlike `check_latest_scan` +
+/// [`fetch_scan`], which LIST twice. See [`fetch_scan`] for why the decode is
+/// the caller's.
+pub async fn fetch_latest_if_newer(
     site: &str,
     date: &chrono::NaiveDate,
     current_timestamp: Option<NaiveDateTime>,
-) -> Result<Option<(DecodedScan, NaiveDateTime)>> {
+) -> Result<Option<(Vec<u8>, NaiveDateTime)>> {
     let Some((metas, effective_date)) = list_files_with_fallback(site, date).await? else {
         return Ok(None);
     };
@@ -567,7 +576,7 @@ pub async fn check_and_fetch_latest(
 
     log::info!("Fetching newer scan: {}", latest_meta.name());
     let downloaded_file = download_file(latest_meta.clone()).await?;
-    Ok(Some((decoded(&downloaded_file)?, latest_dt)))
+    Ok(Some((downloaded_file, latest_dt)))
 }
 
 /// Scans within a time range, sorted oldest-first. One S3 LIST per date in the
@@ -604,20 +613,23 @@ pub async fn list_scans_for_range(
     Ok(results)
 }
 
-pub async fn download_scan(identifier: Identifier) -> Result<DecodedScan> {
+/// Download one archive object by identifier, **undecoded**. Every loop frame
+/// comes through here. See [`fetch_scan`] for why the decode is the caller's.
+pub async fn fetch_scan_object(identifier: Identifier) -> Result<Vec<u8>> {
     log::info!("Downloading scan \"{}\"...", identifier.name());
-    let downloaded_file = download_file(identifier).await?;
-    decoded(&downloaded_file)
+    download_file(identifier).await
 }
 
 /// The scan adjacent to `current_timestamp`, strictly after it when `forward`
 /// and strictly before it otherwise, capped to the extremes of what the
-/// neighbouring day holds. Returns `(Scan, actual_utc_timestamp)`.
-pub async fn get_adjacent_scan(
+/// neighbouring day holds, **undecoded**. Returns
+/// `(archive_bytes, actual_utc_timestamp)`. See [`fetch_scan`] for why the
+/// decode is the caller's.
+pub async fn fetch_adjacent_scan(
     site: &str,
     current_timestamp: NaiveDateTime,
     forward: bool,
-) -> Result<(DecodedScan, NaiveDateTime)> {
+) -> Result<(Vec<u8>, NaiveDateTime)> {
     let date = current_timestamp.date();
 
     let mut all: Vec<(NaiveDateTime, Identifier)> = Vec::new();
@@ -672,7 +684,7 @@ pub async fn get_adjacent_scan(
 
     let ts = *ts;
     let downloaded = download_file(ident.clone()).await?;
-    Ok((decoded(&downloaded)?, ts))
+    Ok((downloaded, ts))
 }
 
 // ---------------------------------------------------------------------------
