@@ -135,6 +135,10 @@ impl VelocityGrid {
     /// that is not an omission: it never unfolds anything — it trims folded
     /// samples out of each layer statistically — so it has no use for a fold
     /// limit, and handing it one would suggest it did.
+    ///
+    /// The view carries [`status`](Self::status) as well as `values`, so a
+    /// consumer in `nrot` that asks "did the radar look here" gets the
+    /// decoder's answer rather than the flattened `NaN`.
     pub fn sweep(&self, declared_nyquist_ms: Option<f64>) -> VelocitySweep<'_> {
         VelocitySweep {
             vel_grid: &self.values,
@@ -143,6 +147,7 @@ impl VelocityGrid {
             first_gate_range_km: self.first_gate_range_km,
             gate_interval_km: self.gate_interval_km,
             declared_nyquist_ms,
+            status: Some(&self.status),
         }
     }
 }
