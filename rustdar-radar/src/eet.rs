@@ -336,6 +336,20 @@ pub fn compute_eet(scan: &Scan, radar_height_ft: f64) -> EetGrid {
 /// `only_a_tdwr_row_cannot_answer_the_base_datum` states. For those this
 /// returns a neighbour's ground, which is why no render path asks for that
 /// datum. An empty table answers `None`, having nothing else to say.
+///
+/// # Why the neighbour search measures kilometres
+///
+/// The degradation above is only as good as the word "nearest", and a degree
+/// of longitude is not a degree of latitude anywhere but the equator. This
+/// used to rank candidates on raw degree-squared separation, which weighs the
+/// two axes equally and so stretches the longitude axis by `1/cos(lat)` — a
+/// 2.4:1 skew at 65°N, where the fleet has rows. That picks a row that is
+/// further away in kilometres over one that is nearer, and the whole point of
+/// the fallback is that the answer degrades by the terrain between two
+/// genuinely close sites. [`crate::sites::distance_km`] is the same haversine
+/// the plausibility bound two lines above is measured with, so the search and
+/// the bound now agree about what "far" means instead of disagreeing by a
+/// factor that grows with latitude.
 pub fn radar_height_ft_near(lat: f64, lon: f64, datum: Datum) -> Option<f64> {
     let (nearest, _) = crate::sites::nearest_radar_site(lat, lon)?;
     if crate::sites::distance_km(lat, lon, nearest.lat, nearest.lon) > crate::types::BASE_EXTENT_KM
@@ -346,9 +360,8 @@ pub fn radar_height_ft_near(lat: f64, lon: f64, datum: Datum) -> Option<f64> {
         .iter()
         .filter_map(|s| s.height_ft(datum).map(|ft| (s, ft)))
         .min_by(|(a, _), (b, _)| {
-            let da = (a.lat - lat).powi(2) + (a.lon - lon).powi(2);
-            let db = (b.lat - lat).powi(2) + (b.lon - lon).powi(2);
-            da.total_cmp(&db)
+            crate::sites::distance_km(lat, lon, a.lat, a.lon)
+                .total_cmp(&crate::sites::distance_km(lat, lon, b.lat, b.lon))
         })
         .map(|(_, ft)| f64::from(ft))
 }
@@ -615,6 +628,56 @@ mod tests {
         assert_eq!(
             radar_height_ft_near(35.4, -97.2, Datum::Feedhorn),
             Some(1276.0)
+        );
+    }
+
+    /// The neighbour search ranks candidates by ground distance, not by raw
+    /// degree-squared separation.
+    ///
+    /// The two disagree wherever a degree of longitude has stopped being a
+    /// degree of latitude, which is everywhere but the equator and matters at
+    /// the latitudes the fleet actually reaches. From (65°N, 150°W) the
+    /// fixture's `PAZA` is 1.0° north and `PAZB` is 1.8° east: degree-squared
+    /// ranks those 1.00 against 3.24 and answers with `PAZA`, while on the
+    /// ground they are 111 km and 85 km away and the nearer row is `PAZB`.
+    ///
+    /// Pinned through `radar_height_ft_near` rather than on a distance helper
+    /// because the defect was in *this* function's own comparator, and the
+    /// heights are what a caller would have been handed: a whole different
+    /// site's terrain, reported with the same confidence as the right one.
+    #[test]
+    fn the_nearest_row_is_measured_in_kilometres_not_degrees() {
+        // The radars this renders against; there are none until a test asks.
+        crate::sites::fixture::install();
+        let (lat, lon) = (65.0, -150.0);
+
+        // The precondition: the two rankings really do disagree here, so this
+        // fails first if the fixture ever moves and stops discriminating.
+        let za = crate::sites::get_radar_site("PAZA").expect("in the table");
+        let zb = crate::sites::get_radar_site("PAZB").expect("in the table");
+        let deg2 = |s: &crate::sites::RadarSite| (s.lat - lat).powi(2) + (s.lon - lon).powi(2);
+        assert!(
+            deg2(za) < deg2(zb),
+            "precondition: degree-squared must prefer PAZA",
+        );
+        let km = |s: &crate::sites::RadarSite| crate::sites::distance_km(lat, lon, s.lat, s.lon);
+        assert!(
+            km(zb) < km(za),
+            "precondition: kilometres must prefer PAZB ({} vs {})",
+            km(zb),
+            km(za),
+        );
+
+        // And the lookup follows the kilometres.
+        assert_eq!(
+            radar_height_ft_near(lat, lon, Datum::Feedhorn),
+            zb.height_ft(Datum::Feedhorn).map(f64::from),
+            "the lookup answered with the further row",
+        );
+        assert_ne!(
+            radar_height_ft_near(lat, lon, Datum::Feedhorn),
+            za.height_ft(Datum::Feedhorn).map(f64::from),
+            "the two rows must differ in height or this proves nothing",
         );
     }
 
