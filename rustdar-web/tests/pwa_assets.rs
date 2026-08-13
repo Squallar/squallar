@@ -561,19 +561,19 @@ fn the_rasterization_worker_uses_only_relative_paths() {
 #[test]
 fn the_worker_protocol_version_is_the_one_these_shapes_ship() {
     assert!(
-        WORKER_PROTOCOL.contains("const PROTOCOL_VERSION: u32 = 4;"),
-        "worker_protocol.rs does not declare PROTOCOL_VERSION 4. Version 3 \
+        WORKER_PROTOCOL.contains("const PROTOCOL_VERSION: u32 = 5;"),
+        "worker_protocol.rs does not declare PROTOCOL_VERSION 5. Version 3 \
          added the `nyq` field, where a plan-view reply began reporting the \
          fold limit of the sweep it drew; version 4 added `mls`, where it \
          began reporting which melting layer the classification stood on — a \
          reply that omits it is a reply whose classification cannot say \
-         whether it was measured or guessed. Changing the message shapes \
-         without changing this number is the whole failure it prevents."
-    );
-    assert!(
-        WORKER_PROTOCOL.contains("PROTOCOL_VERSION,"),
-        "PROTOCOL_VERSION is declared but not folded into build_token, so a \
-         page and a worker on different protocol versions would shake hands"
+         whether it was measured or guessed; version 5 widened `outkind` past \
+         `RenderView`'s three codes, when a decoded Level II volume became an \
+         output a worker could answer with. A version 4 worker has no encoder \
+         for that and a version 4 page no decoder, and either mismatch is a \
+         decode that silently produces nothing — the browser's whole radar \
+         picture missing, with no error. Changing the message shapes without \
+         changing this number is the whole failure it prevents.",
     );
 }
 

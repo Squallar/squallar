@@ -171,6 +171,34 @@ pub enum JobRequest {
         input: Box<RenderInput>,
         request: VoxelRequest,
     },
+    /// **Decode a downloaded Level II archive volume.**
+    ///
+    /// The one job here that does not rasterize anything, and the one whose
+    /// input is not already a decoded volume — it is what *produces* the
+    /// volume every other variant is built from.
+    ///
+    /// It is a job for the reason the renders are: on the web the work has to
+    /// happen somewhere that is not the one thread the browser has.
+    /// `rustdar_radar::scan`'s own doc predicted this — the walk is paid "on
+    /// cold start, on every timeline scrub, on every 'next scan', and once per
+    /// frame of a loop download … and on the web it is paid on the browser's
+    /// main thread" — and the frame-thread audit put a number on it: **1021.9
+    /// ms in Firefox 153 and 911.4 ms in Chrome 151** for a 16.9 MB, 21-sweep
+    /// volume, against 42–66 ms on a native thread pool. Nothing else this
+    /// application does blocks a frame for a second.
+    ///
+    /// # The bytes, not a `File`
+    ///
+    /// `nexrad_data::volume::File` owns a `Vec<u8>` and nothing else, so the
+    /// archive bytes *are* the job's input and no wrapper has to cross. They
+    /// arrive here straight off the download, which is the split this variant
+    /// exists to make: the network half belongs to whoever has the fetch stack
+    /// and stays on the async task, and the CPU half comes here.
+    ///
+    /// `Arc` so that the dispatch site — which may hold the bytes for a retry —
+    /// does not have to hand over its only copy, and so the enum's `Clone`
+    /// costs a refcount rather than 16 MB.
+    Decode { archive: std::sync::Arc<Vec<u8>> },
 }
 
 /// What a job produces.
@@ -194,6 +222,14 @@ pub enum JobOutput {
     Section(Box<CrossSection>),
     /// Boxed for the same reason, more so: a desktop grid is 8 MiB of indices.
     Voxels(Box<VoxelGrid>),
+    /// A decoded Level II volume — the answer to [`JobRequest::Decode`], and
+    /// the only output here that is not a picture of anything.
+    ///
+    /// Boxed like the two above and for a stronger version of their reason: a
+    /// `DecodedScan` owns every gate of every radial of every sweep, 47–69 MiB
+    /// across the volumes this was measured on, which is an order of magnitude
+    /// past the largest thing that had been in this enum.
+    Volume(Box<rustdar_radar::scan::DecodedScan>),
 }
 
 impl JobOutput {
@@ -206,7 +242,7 @@ impl JobOutput {
     pub fn frame(self) -> Option<RenderedFrame> {
         match self {
             Self::Frame(frame) => Some(frame),
-            Self::Section(_) | Self::Voxels(_) => None,
+            Self::Section(_) | Self::Voxels(_) | Self::Volume(_) => None,
         }
     }
 
@@ -214,7 +250,7 @@ impl JobOutput {
     pub fn section(self) -> Option<Box<CrossSection>> {
         match self {
             Self::Section(section) => Some(section),
-            Self::Frame(_) | Self::Voxels(_) => None,
+            Self::Frame(_) | Self::Voxels(_) | Self::Volume(_) => None,
         }
     }
 
@@ -222,22 +258,61 @@ impl JobOutput {
     pub fn voxels(self) -> Option<Box<VoxelGrid>> {
         match self {
             Self::Voxels(grid) => Some(grid),
-            Self::Frame(_) | Self::Section(_) => None,
+            Self::Frame(_) | Self::Section(_) | Self::Volume(_) => None,
         }
     }
 
-    /// Which view this output is of. For a cache key and for the sibling
-    /// broadcast, both of which must never hand a consumer a wrong-shaped
-    /// buffer.
-    pub fn view(&self) -> rustdar_radar::types::RenderView {
-        use rustdar_radar::types::RenderView;
+    /// The decoded volume, or `None` for an output of another kind.
+    ///
+    /// The same shape as the three above, and the same reason: a consumer
+    /// handed the wrong kind sees `None`, which every caller already treats as
+    /// "the job produced nothing" — a state a failed decode and a failed
+    /// render have always shared.
+    pub fn volume(self) -> Option<Box<rustdar_radar::scan::DecodedScan>> {
         match self {
-            Self::Frame(_) => RenderView::PlanView,
-            Self::Section(_) => RenderView::CrossSection,
-            Self::Voxels(_) => RenderView::Volume,
+            Self::Volume(volume) => Some(volume),
+            Self::Frame(_) | Self::Section(_) | Self::Voxels(_) => None,
+        }
+    }
+
+    /// Which decoder owns this output's bytes when it travels as the worker
+    /// reply's out-of-band payload, or `None` for a frame — which does not
+    /// travel that way at all, having its own fields on the message.
+    ///
+    /// # Its own code space, and no longer `RenderView`'s
+    ///
+    /// It used to be `view().wire_code()`, and that read as a tidy reuse right
+    /// up until an output arrived that is not a view of anything. A decoded
+    /// volume is not a plan view, a cross-section or a raymarch grid; it is
+    /// what all three are *made from*. Widening `RenderView` to admit it would
+    /// have put a variant into the enum that decides pane layout, tilt-family
+    /// widening and download scope
+    /// ([`RenderView::reads_whole_volume`](rustdar_radar::types::RenderView::reads_whole_volume)),
+    /// none of which a decode has an answer for.
+    ///
+    /// So the wire gets its own byte. The two existing values are unchanged
+    /// deliberately — a cross-section is still 2 and a voxel grid still 3 — so
+    /// this is a widening of the code space rather than a renumbering of it,
+    /// and the protocol version bump beside it is what refuses a worker that
+    /// predates the fourth.
+    pub fn out_kind(&self) -> Option<u8> {
+        match self {
+            // A frame rides the `IMAGE`/`POLAR`/`MAX_RANGE` fields.
+            Self::Frame(_) => None,
+            Self::Section(_) => Some(OUT_KIND_SECTION),
+            Self::Voxels(_) => Some(OUT_KIND_VOXELS),
+            Self::Volume(_) => Some(OUT_KIND_VOLUME),
         }
     }
 }
+
+/// A cross-section raster. Was `RenderView::CrossSection`'s wire code and keeps
+/// its value — see [`JobOutput::out_kind`].
+pub const OUT_KIND_SECTION: u8 = 2;
+/// A Cartesian voxel grid. Was `RenderView::Volume`'s wire code.
+pub const OUT_KIND_VOXELS: u8 = 3;
+/// A decoded Level II volume. The first code that never was a `RenderView`.
+pub const OUT_KIND_VOLUME: u8 = 4;
 
 /// What a rasterizing job produces: the RGBA texture, the half-width it was
 /// projected at, and the per-pixel value grid (`NAN` where no gate landed).
@@ -462,6 +537,16 @@ impl JobRequest {
                 out.extend_from_slice(&input.to_bytes());
                 out
             }
+            // The tag and then the archive, which takes the rest: an archive
+            // volume has no framing this needs to know about, and a length
+            // prefix would be a second statement of a length the buffer
+            // already has.
+            Self::Decode { archive } => {
+                let mut out = Vec::with_capacity(1 + archive.len());
+                out.push(TAG_DECODE);
+                out.extend_from_slice(archive);
+                out
+            }
         }
     }
 
@@ -524,6 +609,9 @@ impl JobRequest {
                     request,
                 })
             }
+            TAG_DECODE => Some(Self::Decode {
+                archive: std::sync::Arc::new(rest.to_vec()),
+            }),
             _ => None,
         }
     }
@@ -568,7 +656,7 @@ impl JobRequest {
             | Self::Level3Pair {
                 side_ceiling_px, ..
             } => *side_ceiling_px as usize,
-            Self::Section { .. } | Self::Voxels { .. } => 0,
+            Self::Section { .. } | Self::Voxels { .. } | Self::Decode { .. } => 0,
         }
     }
 
@@ -584,6 +672,7 @@ impl JobRequest {
             Self::Level3Pair { .. } => "level3/vild",
             Self::Section { .. } => "section",
             Self::Voxels { .. } => "voxels",
+            Self::Decode { .. } => "decode",
         }
     }
 }
@@ -750,6 +839,8 @@ const TAG_LEVEL3_PAIR: u8 = 4;
 const TAG_SECTION: u8 = 5;
 /// A Cartesian voxel grid.
 const TAG_VOXELS: u8 = 6;
+/// A Level II archive volume to decode. The one job that is not a render.
+const TAG_DECODE: u8 = 7;
 
 /// A bounds-checked cursor over a job's fixed-width header.
 ///
@@ -858,6 +949,8 @@ fn premultiplied(output: JobOutput) -> JobOutput {
             JobOutput::Section(section)
         }
         JobOutput::Voxels(grid) => JobOutput::Voxels(grid),
+        // A decoded volume carries gate codes, not pixels.
+        JobOutput::Volume(volume) => JobOutput::Volume(volume),
     }
 }
 
@@ -996,6 +1089,25 @@ pub fn execute(request: &JobRequest) -> JobResult {
             )
             .map(|section| JobOutput::Section(Box::new(section)))
         }
+        // The one arm that produces a volume rather than consuming one. It is
+        // also the one arm whose input is bigger than a pointer: `File::new`
+        // takes the archive by value, so the bytes are cloned out of the `Arc`
+        // here. That is one 16 MB memcpy against a decode of ~1000 ms in a
+        // browser, and it happens wherever the job ran rather than on the
+        // thread that asked for it.
+        JobRequest::Decode { archive } => {
+            match rustdar_radar::scan::decode_bytes(archive.as_ref().clone()) {
+                Ok(volume) => Some(JobOutput::Volume(Box::new(volume))),
+                Err(e) => {
+                    // "Nothing to draw", which is what every other arm's
+                    // failure already means, and what the caller's `deliver`
+                    // already handles: the fetch reports it and the pane keeps
+                    // whatever it had.
+                    log::error!("could not decode a Level II volume: {e}");
+                    None
+                }
+            }
+        }
         JobRequest::Voxels { input, request } => {
             let (scan, declared) = (input.to_scan(), input.declared_nyquist());
             rustdar_radar::voxel::build_voxels_with_motion(
@@ -1048,16 +1160,19 @@ pub fn execute_bytes(bytes: &[u8]) -> JobResult {
 /// this one. All three are "nothing to draw", which is what a failed render has
 /// always meant, and all three still deliver.
 pub fn decode_output(kind: u8, bytes: &[u8]) -> Option<JobOutput> {
-    use rustdar_radar::types::RenderView;
-    match RenderView::from_wire_code(kind)? {
-        RenderView::CrossSection => {
+    match kind {
+        OUT_KIND_SECTION => {
             CrossSection::from_bytes(bytes).map(|section| JobOutput::Section(Box::new(section)))
         }
-        RenderView::Volume => {
+        OUT_KIND_VOXELS => {
             VoxelGrid::from_bytes(bytes).map(|grid| JobOutput::Voxels(Box::new(grid)))
         }
-        RenderView::PlanView => {
-            log::error!("a worker sent an out-of-band payload tagged as a plan view");
+        OUT_KIND_VOLUME => rustdar_radar::scan::DecodedScan::from_bytes(bytes)
+            .map(|volume| JobOutput::Volume(Box::new(volume))),
+        _ => {
+            log::error!(
+                "a worker sent an out-of-band payload tagged {kind}, which this build has no decoder for"
+            );
             None
         }
     }

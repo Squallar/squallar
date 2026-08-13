@@ -331,13 +331,14 @@ fn the_retired_srm_tag_is_refused() {
 #[test]
 fn every_job_tag_is_the_literal_byte_it_ships_as() {
     // Deliberately spelled out. Do not regenerate this from the constants.
-    let table: [(&str, u8, u8); 6] = [
+    let table: [(&str, u8, u8); 7] = [
         ("TAG_RADAR", TAG_RADAR, 1),
         ("TAG_LEVEL3", TAG_LEVEL3, 2),
         ("TAG_SRM_RETIRED", TAG_SRM_RETIRED, 3),
         ("TAG_LEVEL3_PAIR", TAG_LEVEL3_PAIR, 4),
         ("TAG_SECTION", TAG_SECTION, 5),
         ("TAG_VOXELS", TAG_VOXELS, 6),
+        ("TAG_DECODE", TAG_DECODE, 7),
     ];
     for (name, actual, expected) in table {
         assert_eq!(
@@ -349,12 +350,13 @@ fn every_job_tag_is_the_literal_byte_it_ships_as() {
     // And the encoder really posts those bytes — the constant could be
     // right while the arm that writes it is not. Every constructible kind,
     // framed against its literal rather than against its own constant.
-    let framing: [(JobRequest, u8); 5] = [
+    let framing: [(JobRequest, u8); 6] = [
         (a_job(), 1),
         (a_level3_job(), 2),
         (a_level3_pair_job(), 4),
         (a_section_job(), 5),
         (a_voxel_job(), 6),
+        (a_decode_job(), 7),
     ];
     for (job, tag) in framing {
         let bytes = job.to_bytes();
@@ -376,10 +378,12 @@ fn every_job_tag_is_the_literal_byte_it_ships_as() {
     }
 
     // The unallocated bytes on either end of the table stay unallocated.
-    // A seventh kind added without a line in the table above makes 7
-    // decode, and this is what says so.
+    // An eighth kind added without a line in the table above makes 8
+    // decode, and this is what says so. **7 left this list when the decode
+    // job took it**, which is the whole point of the list: a new kind cannot
+    // be added without coming here and saying so.
     let mut bytes = a_voxel_job().to_bytes();
-    for unallocated in [0u8, 7] {
+    for unallocated in [0u8, 8] {
         bytes[0] = unallocated;
         assert_eq!(
             JobRequest::from_bytes(&bytes),
@@ -496,25 +500,22 @@ fn a_malformed_vertical_job_is_refused_rather_than_misread() {
 #[test]
 fn the_vertical_jobs_produce_their_own_output_kinds() {
     let section = execute(&a_section_job()).expect("the section job draws");
-    assert_eq!(
-        section.view(),
-        rustdar_radar::types::RenderView::CrossSection
-    );
+    assert_eq!(section.out_kind(), Some(crate::offload::OUT_KIND_SECTION));
     assert!(section.section().is_some());
 
     let voxels = execute(&a_voxel_job()).expect("the voxel job builds");
-    assert_eq!(voxels.view(), rustdar_radar::types::RenderView::Volume);
+    assert_eq!(voxels.out_kind(), Some(crate::offload::OUT_KIND_VOXELS));
     let grid = voxels.voxels().expect("the voxel job answers a grid");
     assert_eq!(grid.shape().cells(), 8 * 6 * 4);
 
     // And the same jobs off the wire, which is the path a worker takes.
     assert_eq!(
-        execute_bytes(&a_section_job().to_bytes()).map(|o| o.view()),
-        Some(rustdar_radar::types::RenderView::CrossSection),
+        execute_bytes(&a_section_job().to_bytes()).map(|o| o.out_kind()),
+        Some(Some(crate::offload::OUT_KIND_SECTION)),
     );
     assert_eq!(
-        execute_bytes(&a_voxel_job().to_bytes()).map(|o| o.view()),
-        Some(rustdar_radar::types::RenderView::Volume),
+        execute_bytes(&a_voxel_job().to_bytes()).map(|o| o.out_kind()),
+        Some(Some(crate::offload::OUT_KIND_VOXELS)),
     );
 }
 
@@ -876,4 +877,95 @@ fn a_reply_for_a_retired_job_is_ignored() {
         1,
         "a late reply must not deliver a second response for one render"
     );
+}
+
+// ── The decode job ──────────────────────────────────────────────────────────
+
+/// A `Decode` request whose archive is bytes no decoder will accept. The point
+/// is the *framing*, which has to survive whatever the payload turns out to be.
+fn a_decode_job() -> JobRequest {
+    JobRequest::Decode {
+        archive: std::sync::Arc::new(b"AR2V0006.001not-a-real-volume".to_vec()),
+    }
+}
+
+#[test]
+fn a_decode_job_round_trips_its_archive_whole() {
+    let job = a_decode_job();
+    let back = JobRequest::from_bytes(&job.to_bytes()).expect("this build wrote it");
+    assert_eq!(back, job);
+}
+
+/// The tag space is shared with five render kinds, and a decode's payload is
+/// arbitrary bytes — so a `Decode` posted to a build that read it as any other
+/// kind is exactly the misparse the tag byte exists to prevent.
+#[test]
+fn a_decode_job_is_not_readable_as_another_kind() {
+    let mut bytes = a_decode_job().to_bytes();
+    for tag in [1u8, 2, 3, 4, 5, 6] {
+        bytes[0] = tag;
+        // Whatever it decodes to, it must not decode to a `Decode`.
+        assert!(
+            !matches!(
+                JobRequest::from_bytes(&bytes),
+                Some(JobRequest::Decode { .. })
+            ),
+            "tag {tag} produced a decode job"
+        );
+    }
+}
+
+/// An archive this build cannot read is "nothing", which is what a failed
+/// render has always answered — not a panic in a browser tab where nobody
+/// would see it.
+#[test]
+fn an_archive_that_does_not_decode_produces_nothing() {
+    assert_eq!(execute(&a_decode_job()), None);
+    assert_eq!(execute_bytes(&a_decode_job().to_bytes()), None);
+}
+
+/// The reply half: a decoded volume comes back through `decode_output` under
+/// its own kind byte, and under nobody else's.
+#[test]
+fn a_decoded_volume_comes_back_under_its_own_out_kind() {
+    // An empty volume: this test is about the envelope, and the payload codec
+    // has its own round-trip row in `rustdar-radar`.
+    let pattern = nexrad_model::data::VolumeCoveragePattern::new(
+        212,
+        0,
+        0.5,
+        nexrad_model::data::PulseWidth::Unknown,
+        false,
+        0,
+        false,
+        0,
+        false,
+        false,
+        0,
+        false,
+        false,
+        Vec::new(),
+    );
+    let volume = rustdar_radar::scan::DecodedScan {
+        scan: nexrad_model::data::Scan::new(pattern, Vec::new()),
+        declared_nyquist: rustdar_radar::nyquist::DeclaredNyquist::empty(),
+    };
+    let bytes = volume.to_bytes();
+
+    let back = decode_output(crate::offload::OUT_KIND_VOLUME, &bytes)
+        .expect("a volume payload under the volume kind");
+    assert_eq!(back.out_kind(), Some(crate::offload::OUT_KIND_VOLUME));
+    assert_eq!(*back.volume().expect("it is a volume"), volume);
+
+    // The same bytes under the other kinds' tags are refused by those types'
+    // own magic rather than half-decoded into something plausible.
+    for kind in [
+        crate::offload::OUT_KIND_SECTION,
+        crate::offload::OUT_KIND_VOXELS,
+    ] {
+        assert!(
+            decode_output(kind, &bytes).is_none(),
+            "kind {kind} accepted"
+        );
+    }
 }

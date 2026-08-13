@@ -263,6 +263,60 @@ impl DeclaredNyquist {
         self.contradicted.extend(newer.contradicted.iter().copied());
     }
 
+    /// Encode for a message port.
+    ///
+    /// This table rides beside the `Scan` on every path that carries one —
+    /// [`crate::scan::DecodedScan`] says why the pair is inseparable — so when
+    /// the volume itself became something a worker could hand back, this had to
+    /// become writable too.
+    ///
+    /// **Both halves travel.** [`Self::contradicted`] is not a convenience the
+    /// far side could recompute: nothing but [`Self::declare`] ever records
+    /// one, and a decoder rebuilding the table by replaying `declare` over the
+    /// pairs would replay each key exactly once and therefore always answer
+    /// "nothing contradicted". A cut whose two waveforms disagreed would arrive
+    /// looking trustworthy, which is the one thing this set exists to prevent.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + self.by_elevation.len() * 9 + self.contradicted.len());
+        out.extend_from_slice(&(self.by_elevation.len() as u32).to_le_bytes());
+        for (elevation_number, metres_per_second) in self.iter() {
+            out.push(elevation_number);
+            out.extend_from_slice(&metres_per_second.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.contradicted.len() as u32).to_le_bytes());
+        out.extend(self.contradicted.iter().copied());
+        out
+    }
+
+    /// The inverse of [`to_bytes`](Self::to_bytes), reading from the shared
+    /// cursor so this table can sit inside a larger payload without either side
+    /// having to say where it ended.
+    ///
+    /// `None` for a payload this build cannot read. The two ends of a message
+    /// port can be different builds, so a short or malformed table is a clean
+    /// refusal rather than a half-filled one.
+    ///
+    /// The pairs are written straight into the map rather than replayed through
+    /// [`Self::declare`], which would apply [`Self::is_a_fold_limit`] a second
+    /// time and silently drop entries the *sender's* admission test had already
+    /// passed. Re-filtering here would let a decoded table differ from the one
+    /// encoded, on a path whose whole job is to move it unchanged.
+    pub(crate) fn read(r: &mut crate::wire::Reader) -> Option<Self> {
+        let pairs = r.u32()?;
+        let declared = r.bounded(pairs, 9)?;
+        let mut table = Self::empty();
+        for _ in 0..declared {
+            let elevation_number = r.u8()?;
+            table.by_elevation.insert(elevation_number, r.f64()?);
+        }
+        let flagged = r.u32()?;
+        let contradicted = r.bounded(flagged, 1)?;
+        for _ in 0..contradicted {
+            table.contradicted.insert(r.u8()?);
+        }
+        Some(table)
+    }
+
     /// [`Self::declare`]'s last-wins twin: replace whatever this table held
     /// for `elevation_number`.
     ///
