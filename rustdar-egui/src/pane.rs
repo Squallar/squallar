@@ -38,7 +38,14 @@ pub struct RadarImageData {
     /// handed back, and the only statement of where these pixels are. The
     /// texture is placed between the corners
     /// [`rustdar_radar::types::ImageBounds::from_radar_site`] builds from it,
-    /// the range ring is drawn on it, and the hover picks a pixel out of it.
+    /// and the range ring is drawn on it.
+    ///
+    /// The hover no longer reads it, and that sentence used to be here. A
+    /// readout divided the pointer's position by the rectangle the raster was
+    /// drawn into and so had to be told which frame that was; it asks the gates
+    /// where a point is now, and a gate knows its own range. `RadarHoverData`
+    /// in `ui_map_pane` records the same retraction in its own doc; this one
+    /// outlived it.
     pub max_range_km: f64,
     /// The gates behind these pixels, and whatever is holding their numbers.
     ///
@@ -1909,11 +1916,14 @@ impl PaneState {
     ///
     /// Read off [`crate::overlay_cache::RadarTextureMeta`], which travels *with*
     /// the texture, so this cannot outlive or lag the image it describes: the two
-    /// are placed together by `apply_render_to_pane` and dropped together whenever
-    /// the radar cache is cleared. That is also what keeps it from firing on a
-    /// routine refresh — a new volume for the site clears the dispatcher's
-    /// `last_rendered` and re-renders, but the image on screen still depicts the
-    /// selected product, so there is nothing to disown.
+    /// are placed together by `apply_render_to_pane`, arrive together — a raster
+    /// still crossing to the GPU is held with its own description and neither
+    /// half goes on screen without the other ([`Self::place_radar_raster`]) —
+    /// and are dropped together whenever the radar cache is cleared. That is
+    /// also what keeps it from firing on a routine refresh — a new volume for
+    /// the site clears the dispatcher's `last_rendered` and re-renders, but the
+    /// image on screen still depicts the selected product, so there is nothing
+    /// to disown.
     ///
     /// The elevation is compared within [`ELEVATION_TOLERANCE`] against the
     /// *snapped* selection from [`get_rendering_params`](Self::get_rendering_params)
@@ -2177,6 +2187,41 @@ impl PaneState {
         cache.show(held.data);
         self.data_time = held.data_time;
         true
+    }
+
+    /// Put a freshly placed raster on this pane — now, or when it is whole.
+    ///
+    /// `already_whole` says the caller knows every texel of `data.texture` is
+    /// already on the GPU: it is the handle this pane was showing, re-described
+    /// rather than re-uploaded. Anything else has pixels still crossing.
+    ///
+    /// # A pane with no picture shows the new one arriving
+    ///
+    /// The hold exists to protect a *complete* picture from being replaced by a
+    /// partial one. Where there is no picture it protects nothing and costs the
+    /// whole upload in latency — a pane at start-up, or every pane after a
+    /// resume, would show empty map for as long as the bands take and then all
+    /// of it at once. A raster filling in top-down is a late answer; with no
+    /// predecessor there is no earlier answer to be had and no complete one
+    /// being spoiled. So it goes up straight away, and its caption with it,
+    /// which is correct because the caption describes exactly the pixels
+    /// arriving.
+    ///
+    /// That is the whole of the exception. From a pane's second raster onwards
+    /// its picture changes in one step and never in bands.
+    pub fn place_radar_raster(
+        &mut self,
+        data: crate::overlay_cache::OverlayTextureData,
+        data_time: Option<chrono::NaiveDateTime>,
+        already_whole: bool,
+    ) {
+        let cache = self.overlay_cache_mut(OverlayKind::Radar);
+        if already_whole || cache.current().is_none() {
+            cache.show(data);
+            self.data_time = data_time;
+        } else {
+            cache.hold(data, data_time);
+        }
     }
 
     /// Get rendering params for this pane (product + closest elevation).

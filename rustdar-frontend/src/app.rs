@@ -1142,6 +1142,15 @@ impl App {
         // [`Self::auto_poll_at`], which schedules its wake instead.
         if self.render.any_render_in_flight()
             || self.gui.any_loop_active()
+            // A pane holding the previous picture while the next one's bands
+            // cross. It finishes — see `Gui::any_raster_held` — and until it
+            // does the loop owes the frames those bands move on *and* the frame
+            // that swaps. `end_pass_and_upload`'s zero `repaint_delay` covers
+            // only the first: on the frame the last band lands nothing is
+            // pending any more, so without this term a raster would finish
+            // uploading and then sit unswapped behind the previous sweep until
+            // some unrelated input woke the loop.
+            || self.gui.any_raster_held()
             || self.chunk_feeds.any_in_flight()
             // A down socket reconnects from `sync_sites`, which only runs on a
             // frame. Without this term the retry would depend on something else
