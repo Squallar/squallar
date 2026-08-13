@@ -298,7 +298,12 @@ fn the_side_follows_the_extent_up_to_the_ceiling_the_caller_owns() {
         // And a ceiling *below* it is honoured rather than clamped away —
         // the web's loop frames, which are deliberately leaner than its
         // static renders.
-        (BASE_EXTENT_KM, 1024, 1024, "a loop frame at the reference extent"),
+        (
+            BASE_EXTENT_KM,
+            1024,
+            1024,
+            "a loop frame at the reference extent",
+        ),
         (460.125, 1024, 1024, "a loop frame of a surveillance cut"),
     ] {
         assert_eq!(

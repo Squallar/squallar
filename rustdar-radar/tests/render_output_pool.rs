@@ -94,7 +94,10 @@ const SMALL_SIDE: usize = 1024;
 /// claiming no pixel at all — the sharpest probe there is of what the texture
 /// arrived holding.
 fn packet(bins: usize, painted_bins: usize) -> RadialPacket {
-    assert!(painted_bins <= bins, "cannot paint more gates than there are");
+    assert!(
+        painted_bins <= bins,
+        "cannot paint more gates than there are"
+    );
     let radials = (0..RADIALS)
         .map(|i| RadialRun {
             start_angle: i as f32,

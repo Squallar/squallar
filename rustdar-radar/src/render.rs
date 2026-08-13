@@ -1231,8 +1231,7 @@ pub(crate) fn find_sweep_owner(
                 .map(|elevation| {
                     (elevation - f64::from(elevation_angle)).abs() < ELEVATION_WINDOW
                         && radials.iter().any(|r| product.get_moment(r).is_some())
-                        && !(surveillance_only
-                            && radials.iter().any(|r| r.velocity().is_some()))
+                        && !(surveillance_only && radials.iter().any(|r| r.velocity().is_some()))
                 })
                 .unwrap_or(false)
         })

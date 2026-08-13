@@ -414,12 +414,7 @@ fn pixel_at(image: &[u8], idx: usize) -> (u8, u8, u8, u8) {
 /// the frame [`l2_sweep`]'s own reach gives it.
 fn assert_probes(values: &[f32], painted: bool, probes: &[(f64, f64)], why: &str) {
     for &(az, range) in probes {
-        let v = values[probe_at(
-            l2_ground_reach_km(),
-            types::IMAGE_SIZE,
-            az,
-            range,
-        )];
+        let v = values[probe_at(l2_ground_reach_km(), types::IMAGE_SIZE, az, range)];
         assert_eq!(
             !v.is_nan(),
             painted,
@@ -1089,14 +1084,16 @@ fn a_tdwr_doppler_sweep_is_projected_at_its_own_reach_not_the_base_extent() {
     ] {
         let scan = tdwr_doppler_volume();
 
-        let vel = render_radar_to_image(&scan, L2_ELEVATION, types::RadarProduct::Velocity, lat, lon)
-            .expect("the Doppler moment is on the sweep");
+        let vel =
+            render_radar_to_image(&scan, L2_ELEVATION, types::RadarProduct::Velocity, lat, lon)
+                .expect("the Doppler moment is on the sweep");
         let refl = render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, lat, lon)
             .expect("the reflectivity moment is on the same sweep");
 
         // The defect, stated as the assertion that would have failed.
         assert_ne!(
-            vel.max_range_km, types::BASE_EXTENT_KM,
+            vel.max_range_km,
+            types::BASE_EXTENT_KM,
             "{name}: a velocity pane is still framed at 230 km",
         );
         assert!(
@@ -1193,7 +1190,10 @@ fn a_sweep_whose_leading_radial_is_blank_is_still_found_and_still_framed_by_its_
     assert!(radials[0].velocity().is_none(), "the fixture must be blank");
     assert!(radials[1].velocity().is_some(), "and only in front");
 
-    let scan = Scan::new(full.coverage_pattern().clone(), vec![Sweep::new(1, radials)]);
+    let scan = Scan::new(
+        full.coverage_pattern().clone(),
+        vec![Sweep::new(1, radials)],
+    );
 
     let vel = render_radar_to_image(&scan, L2_ELEVATION, types::RadarProduct::Velocity, LAT, LON)
         .expect("359 radials carry the moment and the sweep must still be found");
@@ -1686,12 +1686,39 @@ fn nothing_is_painted_outside_the_extent_a_render_declares() {
     let side = types::IMAGE_SIZE;
     let px_per_km = side as f64 / (2.0 * extent_km);
     for (name, row, col) in [
-        ("east", side / 2, (0..side).rev().find(|&c| !values[side / 2 * side + c].is_nan()).unwrap()),
-        ("west", side / 2, (0..side).find(|&c| !values[side / 2 * side + c].is_nan()).unwrap()),
-        ("north", (0..side).find(|&r| !values[r * side + side / 2].is_nan()).unwrap(), side / 2),
-        ("south", (0..side).rev().find(|&r| !values[r * side + side / 2].is_nan()).unwrap(), side / 2),
+        (
+            "east",
+            side / 2,
+            (0..side)
+                .rev()
+                .find(|&c| !values[side / 2 * side + c].is_nan())
+                .unwrap(),
+        ),
+        (
+            "west",
+            side / 2,
+            (0..side)
+                .find(|&c| !values[side / 2 * side + c].is_nan())
+                .unwrap(),
+        ),
+        (
+            "north",
+            (0..side)
+                .find(|&r| !values[r * side + side / 2].is_nan())
+                .unwrap(),
+            side / 2,
+        ),
+        (
+            "south",
+            (0..side)
+                .rev()
+                .find(|&r| !values[r * side + side / 2].is_nan())
+                .unwrap(),
+            side / 2,
+        ),
     ] {
-        let radius_px = ((row as f64 - side as f64 / 2.0).abs()).max((col as f64 - side as f64 / 2.0).abs());
+        let radius_px =
+            ((row as f64 - side as f64 / 2.0).abs()).max((col as f64 - side as f64 / 2.0).abs());
         let radius_km = radius_px / px_per_km;
         assert!(
             radius_km <= extent_km + 1.0 / px_per_km,
@@ -2854,7 +2881,12 @@ fn a_range_folded_gate_paints_the_dedicated_purple_and_below_threshold_does_not(
         render_radar_to_image(&scan, L2_ELEVATION, types::RadarProduct::Velocity, LAT, LON)
             .expect("the fixture renders");
 
-    let folded = probe_at(l2_ground_reach_km(), types::IMAGE_SIZE, FOLDED_AZ as f64, 50.0);
+    let folded = probe_at(
+        l2_ground_reach_km(),
+        types::IMAGE_SIZE,
+        FOLDED_AZ as f64,
+        50.0,
+    );
     assert_eq!(
         pixel_at(&image, folded),
         crate::palette::RANGE_FOLDED,
@@ -2871,7 +2903,12 @@ fn a_range_folded_gate_paints_the_dedicated_purple_and_below_threshold_does_not(
         "and it is the canonical NaN, not the sentinel the cell held",
     );
 
-    let below = probe_at(l2_ground_reach_km(), types::IMAGE_SIZE, BELOW_AZ as f64, 50.0);
+    let below = probe_at(
+        l2_ground_reach_km(),
+        types::IMAGE_SIZE,
+        BELOW_AZ as f64,
+        50.0,
+    );
     assert_eq!(
         pixel_at(&image, below).3,
         0,
