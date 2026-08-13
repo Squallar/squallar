@@ -143,6 +143,7 @@ pub struct PolarGeometry {
     first_gate_km: f64,
     gate_interval_km: f64,
     gates: usize,
+    reach_gates: usize,
 }
 
 impl PolarGeometry {
@@ -177,11 +178,11 @@ impl PolarGeometry {
     /// The gate whose footprint holds `ground_km`, or `None` past either end of
     /// a radial.
     fn gate_at(&self, ground_km: f64) -> Option<usize> {
-        if self.gate_interval_km <= 0.0 || self.gates == 0 {
+        if self.gate_interval_km <= 0.0 || self.reach_gates == 0 {
             return None;
         }
         let g = ((ground_km - self.first_gate_km) / self.gate_interval_km + 0.5).floor();
-        (g >= 0.0 && g < self.gates as f64).then_some(g as usize)
+        (g >= 0.0 && g < self.reach_gates as f64).then_some(g as usize)
     }
 
     /// The wedge each radial was painted over, in the render's radial order.
@@ -194,9 +195,28 @@ impl PolarGeometry {
         self.wedges.len()
     }
 
-    /// How many gates each of them carries.
+    /// How many gates each radial's row holds — the stride, and what the fill
+    /// *declared*.
     pub fn gates(&self) -> usize {
         self.gates
+    }
+
+    /// How many of them the render actually reached, which is the bound
+    /// [`Self::pick`] answers within.
+    ///
+    /// Not the same as [`Self::gates`], and the difference is the extent. Every
+    /// fill stops at `proj.extent_km`, and [`crate::types::plan_view_extent_km`]
+    /// caps that at [`crate::types::MAX_EXTENT_KM`] — so a radial declaring
+    /// gates past 470 km has them, and the picture does not. Without this bound
+    /// a readout over the corner of the square, outside the disc the data was
+    /// drawn in, would name a gate nothing was painted from.
+    ///
+    /// No product this display draws reaches that far: a WSR-88D surveillance
+    /// cut is 1832 × 0.25 km = 458 km and a TDWR long-range reflectivity 417.
+    /// It is bounded here anyway, because the alternative is a rule that is
+    /// correct only for the sweeps that exist today.
+    pub fn reach_gates(&self) -> usize {
+        self.reach_gates
     }
 
     /// The ground range of gate 0's centre, km.
@@ -212,7 +232,7 @@ impl PolarGeometry {
     /// Whether this describes no gates at all, which is what a render that
     /// painted nothing produces.
     pub fn is_empty(&self) -> bool {
-        self.wedges.is_empty() || self.gates == 0
+        self.wedges.is_empty() || self.reach_gates == 0
     }
 
     /// What holding this costs, bytes.
@@ -233,6 +253,7 @@ impl PolarGeometry {
             first_gate_km,
             gate_interval_km,
             gates,
+            reach_gates: gates,
         }
     }
 }
@@ -434,17 +455,36 @@ impl PolarBuffers {
                 half_width_deg: f32::from_bits(*h.get_mut()),
             })
             .collect();
-        let values = self
+        // The reach falls out of the same pass rather than costing one of its
+        // own, and out of what was *painted* rather than what was declared —
+        // see `PolarGeometry::reach_gates`. A `fetch_max` per gate in
+        // `render_gate` would have answered it too, and would have put an
+        // atomic read-modify-write in the loop `POOLED_CELLS` measures.
+        let mut reach_gates = 0usize;
+        let gates = self.gates;
+        let values: Vec<f32> = self
             .values
             .iter_mut()
-            .map(|v| f32::from_bits(*v.get_mut()))
+            .enumerate()
+            .map(|(i, v)| {
+                let bits = *v.get_mut();
+                let v = f32::from_bits(bits);
+                // On the bits and not on `is_nan`, because a range-folded gate
+                // is painted and its sentinel *is* a NaN — see
+                // `RANGE_FOLDED_BITS`. "Was this slot written" is the question.
+                if bits != UNPAINTED_BITS && gates > 0 {
+                    reach_gates = reach_gates.max(i % gates + 1);
+                }
+                v
+            })
             .collect();
         PolarField {
             geometry: PolarGeometry {
                 wedges,
                 first_gate_km: self.first_gate_km,
                 gate_interval_km: self.gate_interval_km,
-                gates: self.gates,
+                gates,
+                reach_gates,
             },
             values,
         }

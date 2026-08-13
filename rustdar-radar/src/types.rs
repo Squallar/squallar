@@ -923,6 +923,25 @@ impl MomentSlot {
             MomentSlot::CorrelationCoefficient => radial.correlation_coefficient(),
         }
     }
+
+    /// The product that **is** this moment, rather than one computed from it.
+    ///
+    /// The inverse of the six identity rows of [`RadarProduct::moment_slot`],
+    /// and the reason [`RadarProduct::is_wire_moment`] can be written without a
+    /// second copy of the list: a product is its own moment exactly when its
+    /// slot points back at it. The other eleven products also have slots —
+    /// normalized rotation reads velocity, the hail pair read reflectivity —
+    /// and those rows are the ones that must not round-trip.
+    pub fn product(&self) -> RadarProduct {
+        match self {
+            MomentSlot::Reflectivity => RadarProduct::Reflectivity,
+            MomentSlot::Velocity => RadarProduct::Velocity,
+            MomentSlot::SpectrumWidth => RadarProduct::SpectrumWidth,
+            MomentSlot::DifferentialReflectivity => RadarProduct::DifferentialReflectivity,
+            MomentSlot::DifferentialPhase => RadarProduct::DifferentialPhase,
+            MomentSlot::CorrelationCoefficient => RadarProduct::CorrelationCoefficient,
+        }
+    }
 }
 
 /// Why a cell of a decoded grid has no number — or, for [`GateReport::Value`],
@@ -1545,6 +1564,27 @@ impl RadarProduct {
     /// The moment data for this product on a radial.
     pub fn get_moment<'a>(&self, radial: &'a Radial) -> Option<&'a nexrad_model::data::MomentData> {
         self.moment_slot()?.read(radial)
+    }
+
+    /// Whether this product **is** a moment the RDA put on the wire, rather
+    /// than a field computed from one.
+    ///
+    /// The question a readout has to ask before reading a number out of a
+    /// volume. [`Self::moment_slot`] says which moment a product *needs* and is
+    /// `Some` for seventeen products; six of them need their own, and the other
+    /// eleven need one to compute from. Normalized rotation reads velocity,
+    /// storm-relative velocity reads velocity, the hail pair and the hybrid
+    /// classification read reflectivity — and handing any of those the raw
+    /// moment would print metres per second under a colour scale that means
+    /// shear, in a place where nothing would look wrong.
+    ///
+    /// Written as a round trip through [`MomentSlot::product`] rather than as a
+    /// second list of six, so a product added to either table cannot be
+    /// classified twice. `every_product_is_its_own_moment_or_is_derived` walks
+    /// the whole enum against it.
+    pub fn is_wire_moment(&self) -> bool {
+        self.moment_slot()
+            .is_some_and(|slot| slot.product() == *self)
     }
 
     /// Whether this product reads every tilt carrying its moment, rather than
