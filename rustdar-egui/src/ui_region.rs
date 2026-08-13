@@ -686,17 +686,47 @@ fn dolly_for_step(step: f64) -> f32 {
 /// northernmost radar the US network has and are reachable only by panning a map
 /// to the Arctic and picking a region there.
 ///
-/// # Why this was four, and dead
+/// # Why this was four, and all but dead
 ///
 /// It was four with a doc claiming "pass two is already inside `COVERAGE_MARGIN`
 /// and the loop stops there; four is that with two passes to spare". Both halves
-/// were wrong. The loop could not stop at all — its early-out compared the
-/// margin-inflated shortfall against 1.0, a value the solve approaches from
-/// above and never reaches, for the reason [`COVERAGE_MARGIN`] exists — so every
-/// framing in the application ran exactly four passes. And the shape the figure
-/// was measured on, a 450 × 900 point strip, is the *easy* one: it binds east
-/// and settles in two. Turn it on its side and 700 × 450 at 64.8°N takes four,
-/// which is the budget entire, with nothing spare.
+/// were wrong, and the shape the figure was measured on — a 450 × 900 point
+/// strip — is the *easy* one: it binds east and settles in two. Turn it on its
+/// side and 700 × 450 at 64.8°N takes four, which is the budget entire, with
+/// nothing spare.
+///
+/// The early-out was the other half. It compared the margin-inflated shortfall
+/// against 1.0 rather than against the margin, which is the wrong bar for the
+/// reason [`COVERAGE_MARGIN`] gives: the solve approaches 1.0 from above, so in
+/// exact arithmetic that condition is never met.
+///
+/// **It was not, however, unsatisfiable — and the correction is recorded here
+/// because this doc, and the message of the commit that revived the early-out,
+/// both said it was.** Floating point is not exact arithmetic: the east lane is
+/// a single logarithm and lands on the target ratio exactly, and the north
+/// lane's sequence — 1.00098, 1.0000019, 1.0000000038 — reaches 1.0 in `f64`
+/// within three or four terms.
+///
+/// Measured by restoring that whole loop — aim at the box plus
+/// [`COVERAGE_MARGIN`], settle at `shortfall <= 1.0`, budget of four — over
+/// `FRAMING_SWEEP_SIDES` × `FRAMING_SWEEP_BOXES` × 0–84°, the 76,500
+/// framings [`the_framing_budget_covers_every_latitude_a_region_can_sit_at`]
+/// sweeps today: it **settled 6,347 times, 8.30%** — 435 at pass two, 1,145 at
+/// pass three, 4,767 at pass four. "Every framing ran exactly four passes" is
+/// false twice over, because the zoom clamp is a second early exit and framings
+/// came back at pass two on both of them.
+///
+/// So the bar was not dead. It was *unreliable*: right about one framing in
+/// twelve and silently wrong about the rest, which is worse than dead and reads
+/// exactly the same from outside. The shipped loop over that same sweep settles
+/// **69,874 of 76,500, 91.34%**, 32,936 of them at pass two.
+///
+/// **Which "old bar":** this one is `shortfall <= 1.0`, two revisions back.
+/// [`SETTLE_SHORTFALL`] also speaks of "the old test", and means a different and
+/// later one — `shortfall <= 1 + COVERAGE_MARGIN`, the bar that replaced *this*
+/// one and was in turn replaced when the solve began aiming at
+/// [`COVERAGE_TARGET`]. The two figures are not comparable and neither
+/// contradicts the other.
 ///
 /// [`the_solve_stops_as_soon_as_the_strip_covers_the_box`] holds the early-out
 /// to firing, and [`the_framing_budget_covers_every_latitude_a_region_can_sit_at`]
@@ -730,6 +760,14 @@ const MAX_FRAMING_PASSES: usize = 8;
 /// solve settles in, and [`COVERAGE_TARGET`] is its ceiling** — the two are
 /// different numbers on purpose, and
 /// [`the_framing_delivers_the_margin_it_promises`] is what holds the floor.
+///
+/// "Never crossing 1.0" above is a statement about the real numbers and not
+/// about `f64`, and the difference is not academic: an early-out that asked
+/// `shortfall <= 1.0` was met on a tenth of a sweep rather than never, because
+/// these terms do reach 1.0 in double precision. That bar is two revisions old
+/// and is **not** the `1 + COVERAGE_MARGIN` one [`SETTLE_SHORTFALL`] calls "the
+/// old test"; [`MAX_FRAMING_PASSES`] tells the two apart and carries the
+/// measurement.
 ///
 /// 0.1% of a 920 km box is 920 m — under a third of one cell at the shipped
 /// grid's 3.6 km — which is the price of never being short. It also has to clear
@@ -928,9 +966,13 @@ pub(crate) fn viewport_for_region(
 /// loop does, and the only honest way to hold a loop to a claim about its own
 /// iterations is to count the ones that ran. It used to be checked by a test
 /// that re-ran the solve's arithmetic beside it and counted *that* — which is
-/// how the early-out came to be dead for as long as it was: the copy in the test
-/// used the settle condition the prose describes, the loop here used a different
-/// one, and no run of either could notice.
+/// how the early-out went so long without anyone noticing what it did: the copy
+/// in the test used the settle condition the prose describes, the loop here used
+/// a different one, and no run of either could tell them apart.
+///
+/// "What it did" rather than "that it was dead": that bar settled on 8.30% of
+/// the sweep, so what the two copies disagreed about was eleven framings in
+/// twelve rather than all of them. See [`MAX_FRAMING_PASSES`].
 ///
 /// It is a bare `usize` on a private tuple rather than a field on a named
 /// struct so that there is nothing for the application to branch on: the count
