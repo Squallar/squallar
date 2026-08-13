@@ -9,6 +9,18 @@ pub enum StormReportKind {
     Wind,
 }
 
+impl StormReportKind {
+    /// Reads inside a sentence — `"tornado reports did not load"` — so it is
+    /// lowercase and carries no punctuation of its own.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tornado => "tornado",
+            Self::Hail => "hail",
+            Self::Wind => "wind",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct StormReport {
     pub kind: StormReportKind,
@@ -40,6 +52,67 @@ pub(crate) fn report_url(
     format!("{}/climo/reports/today_{name}.csv", sources.spc_base)
 }
 
+/// What one round of the three CSVs delivered.
+///
+/// The failures used to be dropped on the floor here. `fetch_storm_reports`
+/// refuses the round only when **all three** CSVs failed, which is right — a day
+/// with tornado and hail reports but a wind CSV that would not load is still
+/// worth drawing — but one or two failing then returned a bare `Ok(reports)`,
+/// went through `set_data`, and declared the answer whole. Measured over a
+/// socket: the tornado CSV refused 503, hail and wind fine, and the layer was
+/// indistinguishable from a complete round on every surface a user can see —
+/// health `Ok`, no mark, `Updated 0s ago` — with every tornado report in the
+/// country absent from the map.
+///
+/// Nothing about that is *stale*, so no rung of the health ladder could express
+/// it. It is the coverage axis, and this is what carries it.
+#[derive(Debug)]
+pub struct StormReportRound {
+    pub reports: Vec<StormReport>,
+    /// The kinds whose CSV did not answer, and why. Empty on a whole round.
+    pub failed_kinds: Vec<(StormReportKind, FetchError)>,
+}
+
+impl StormReportRound {
+    /// The layer-agnostic report the UI renders.
+    ///
+    /// A kind is the unit: the three CSVs are three disjoint products, and a
+    /// missing one takes every report of that kind off the map. There is no
+    /// part-drawn case — a CSV either parsed or it did not — and no second
+    /// denominator, because a kind *is* the part.
+    ///
+    /// **A routine 404 is not missing data.** `today_*.csv` is rebuilt each
+    /// convective day and a kind with nothing in it yet simply is not there,
+    /// which [`fetch_csv`] already classifies [`Absent`] — the same "the origin
+    /// answered, and *not published right now* is an answer" that keeps
+    /// [`FetchHealth::Absent`] out of `is_unhealthy`. Counting it here would put
+    /// a fault on the row on every quiet day, and a mark that is on when nothing
+    /// is wrong is a mark nobody reads on the day something is.
+    ///
+    /// [`Absent`]: crate::fetch_policy::FetchFailure::Absent
+    /// [`FetchHealth::Absent`]: crate::fetch_policy::FetchHealth::Absent
+    pub fn completeness(&self) -> crate::fetch_policy::DataCompleteness {
+        let absent: Vec<&(StormReportKind, FetchError)> = self
+            .failed_kinds
+            .iter()
+            .filter(|(_, e)| e.failure != crate::fetch_policy::FetchFailure::Absent)
+            .collect();
+        crate::fetch_policy::DataCompleteness {
+            expected: 3,
+            partial: 0,
+            missing: absent.len(),
+            parts_requested: 0,
+            parts_resolved: 0,
+            unit: "report kinds",
+            part_unit: "CSVs",
+            reasons: absent
+                .iter()
+                .map(|(kind, e)| (format!("{}: {}", kind.label(), e.message), 1))
+                .collect(),
+        }
+    }
+}
+
 /// `client` must be the preflight-safe [`crate::spc::fetch::spc_client`].
 ///
 /// Three CSVs, and a partial result is a real result — a day with tornado and
@@ -47,10 +120,12 @@ pub(crate) fn report_url(
 /// **all three failing is not `Ok(vec![])`**: that is indistinguishable from a
 /// quiet day, and it used to be reported as one, which both hid the outage from
 /// the user and stamped the poll clock as though the fetch had succeeded.
+///
+/// A partial round now says which kind is absent — see [`StormReportRound`].
 pub async fn fetch_storm_reports(
     client: &reqwest::Client,
     sources: &rustdar_radar::sources::DataSources,
-) -> Result<Vec<StormReport>, FetchError> {
+) -> Result<StormReportRound, FetchError> {
     log::info!("Fetching SPC storm reports");
 
     let (torn, hail, wind) = futures::future::join3(
@@ -73,31 +148,54 @@ pub async fn fetch_storm_reports(
     .await;
 
     let mut reports = Vec::new();
-    let mut failures: Vec<FetchError> = Vec::new();
-    for (label, outcome) in [("tornado", torn), ("hail", hail), ("wind", wind)] {
+    let mut failed_kinds: Vec<(StormReportKind, FetchError)> = Vec::new();
+    for (kind, outcome) in [
+        (StormReportKind::Tornado, torn),
+        (StormReportKind::Hail, hail),
+        (StormReportKind::Wind, wind),
+    ] {
         match outcome {
             Ok(r) => reports.extend(r),
             Err(e) => {
-                log::warn!("Failed to fetch {label} reports: {e}");
-                failures.push(e);
+                log::warn!("Failed to fetch {} reports: {e}", kind.label());
+                failed_kinds.push((kind, e));
             }
         }
     }
 
-    if failures.len() == 3 {
+    if failed_kinds.len() == 3 {
         // Every CSV failed. The round's verdict is the merge of all three, not
         // whichever happened to be listed first: `failures[0]` is always the
         // tornado CSV, so one 400 there condemned the layer even when hail and
         // wind had merely timed out. Merged, the round is refused only if all
         // three were — the rule every other multi-request round here follows.
+        let failures: Vec<FetchError> = failed_kinds.into_iter().map(|(_, e)| e).collect();
         return Err(FetchError::of_round(
             &failures,
             "no storm report CSV could be fetched",
         ));
     }
 
+    if !failed_kinds.is_empty() {
+        // WARN, not INFO: the layer is about to draw a report set with a whole
+        // kind missing from it, on a fresh clock. The line above is per-CSV and
+        // says nothing about what the round as a whole ended up holding.
+        log::warn!(
+            "Storm reports incomplete: {} of 3 kinds did not load ({}), so none of \
+             those reports are on the map",
+            failed_kinds.len(),
+            failed_kinds
+                .iter()
+                .map(|(kind, _)| kind.label())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
     log::info!("Fetched {} storm reports total", reports.len());
-    Ok(reports)
+    Ok(StormReportRound {
+        reports,
+        failed_kinds,
+    })
 }
 
 /// A 404 is **routine**: `today_*.csv` is rebuilt each convective day, and a

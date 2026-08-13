@@ -12,11 +12,11 @@ use crate::render::overlay_state::{
     OverlayState, PopupContent, PopupSection, RasterizeContext, RasterizeFn, RenderMode,
 };
 use crate::render::rasterize;
-use crate::spc::reports::{StormReport, StormReportKind};
+use crate::spc::reports::{StormReport, StormReportKind, StormReportRound};
 use crate::types::GeoBounds;
 
 pub(crate) struct StormReportsFetchResult(
-    pub Result<Vec<StormReport>, crate::fetch_policy::FetchError>,
+    pub Result<StormReportRound, crate::fetch_policy::FetchError>,
 );
 
 #[derive(Debug)]
@@ -210,14 +210,24 @@ impl OverlayHandler for StormReportsHandler {
             return;
         };
         match fetch.0 {
-            Ok(reports) => {
-                log::info!("Received {} storm reports", reports.len());
-                let items = reports
+            Ok(round) => {
+                log::info!("Received {} storm reports", round.reports.len());
+                // The coverage report travels with the data it describes.
+                // `fetch_storm_reports` refuses the round only when **all
+                // three** CSVs failed, so one or two failing arrives here as
+                // `Ok` — a good answer with a whole kind of report absent from
+                // it, which is the coverage axis and not the health one. It
+                // used to go through `set_data`, which declares an answer
+                // whole, so every tornado report in the country could be off
+                // the map under a green `Updated 0s ago`.
+                let coverage = round.completeness();
+                let items = round
+                    .reports
                     .into_iter()
                     .enumerate()
                     .map(|(i, report)| Arc::new(StormReportItem { report, index: i }))
                     .collect();
-                self.state.set_data(items);
+                self.state.set_data_with_coverage(items, coverage);
             }
             Err(e) => {
                 log::error!("Storm reports fetch failed: {e}");
@@ -415,5 +425,186 @@ mod tests {
             };
             assert_eq!(size, expected, "{unit:?}");
         }
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod round_tests {
+    use super::*;
+    use crate::render::controls::PaneControlContext;
+    use crate::render::overlay_state::{OverlayFetchResult, OverlayRegistry};
+    use crate::spc::reports::fetch_storm_reports;
+
+    fn http(status_line: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: text/csv\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len(),
+        )
+    }
+
+    /// Serve the three `today_*.csv` from loopback, so the round under test is
+    /// driven over a real socket rather than around it. The origin comes from
+    /// `DataSources::spc_base`, which the fetch never spells.
+    fn spc_serving(responses: Vec<(&'static str, String)>) -> rustdar_radar::sources::DataSources {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut scratch = [0u8; 4096];
+                let read = stream.read(&mut scratch).unwrap_or(0);
+                let request = String::from_utf8_lossy(&scratch[..read]).to_string();
+                let out = responses
+                    .iter()
+                    .find(|(name, _)| request.contains(&format!("today_{name}.csv")))
+                    .map(|(_, r)| r.clone())
+                    .unwrap_or_else(|| http("404 Not Found", ""));
+                let _ = stream.write_all(out.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        rustdar_radar::sources::DataSources {
+            spc_base: format!("http://127.0.0.1:{port}").into(),
+            ..rustdar_radar::sources::DataSources::production()
+        }
+    }
+
+    const TORN: &str = "Time,F_Scale,Location,County,State,Lat,Lon,Comments\n\
+         2030,UNK,SHAWNEE,POTTAWATOMIE,OK,35.33,-96.92,on the ground\n";
+    const HAIL: &str = "Time,Size,Location,County,State,Lat,Lon,Comments\n\
+         2015,175,NORMAN,CLEVELAND,OK,35.22,-97.44,golf ball\n";
+    const WIND: &str = "Time,Speed,Location,County,State,Lat,Lon,Comments\n\
+         2020,60,MOORE,CLEVELAND,OK,35.34,-97.48,trees down\n";
+
+    /// Fetch over the socket and push the result through the production ingest
+    /// path, returning the row and the options note a user would see.
+    fn round(responses: Vec<(&'static str, String)>) -> (Option<String>, Option<String>) {
+        rustdar_radar::tls::init();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("client");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let sources = spc_serving(responses);
+        let result = runtime.block_on(fetch_storm_reports(&client, &sources));
+
+        let kind = OverlayKind::StormReports;
+        let mut registry = OverlayRegistry::default();
+        registry.set_enabled(kind, true);
+        registry.apply_fetch_result(OverlayFetchResult {
+            kind,
+            data: Box::new(StormReportsFetchResult(result)) as FetchPayload,
+        });
+        let ctx = PaneControlContext {
+            pane_idx: 0,
+            pane_state: None,
+        };
+        let note = registry
+            .controls(kind, &ctx)
+            .into_iter()
+            .find_map(|item| match item {
+                ControlItem::InfoText { text } if text.starts_with("Incomplete") => Some(text),
+                _ => None,
+            });
+        (registry.status_line(kind), note)
+    }
+
+    /// **A CSV that would not load takes a whole kind of report off the map.**
+    ///
+    /// `fetch_storm_reports` refuses the round only when all three failed,
+    /// which is right — hail and wind reports are worth drawing without the
+    /// tornado CSV. What was wrong is that it then said nothing. Measured over
+    /// this socket against the shipped code: health `Ok`, `is_incomplete()`
+    /// false, no mark, a fresh clock, and the round byte-for-byte
+    /// indistinguishable from a whole one on every surface a user can see.
+    #[test]
+    fn a_report_csv_that_would_not_load_marks_the_layer_and_names_the_kind() {
+        let (line, note) = round(vec![
+            ("torn", http("503 Service Unavailable", "down")),
+            ("hail", http("200 OK", HAIL)),
+            ("wind", http("200 OK", WIND)),
+        ]);
+        let line = line.expect("an enabled reports layer states its own line");
+        assert!(
+            line.starts_with("! incomplete"),
+            "every tornado report in the country is absent and the row says \
+             nothing: {line}",
+        );
+        assert!(
+            line.contains("2 reports"),
+            "the layer's own line must survive the mark: {line}",
+        );
+        let note = note.expect("the options must say what the row is marking");
+        assert!(
+            note.contains("missing 1 of 3 report kinds"),
+            "the note must count the kinds, not the reports: {note}",
+        );
+        assert!(
+            note.contains("tornado") && note.contains("503"),
+            "the note must name which kind and why: {note}",
+        );
+        assert!(
+            !line.contains("not updating"),
+            "two CSVs answered on a fresh clock — this is not stale: {line}",
+        );
+    }
+
+    /// A 404 is the SPC rebuilding `today_*.csv` for a kind with nothing in it
+    /// yet, which is a **normal answer**. Marking the layer for it would put a
+    /// fault on the row on every quiet day, which is the failure mode in the
+    /// other direction and would teach a user to ignore the mark.
+    #[test]
+    fn a_kind_with_nothing_reported_yet_is_not_a_fault() {
+        let (line, note) = round(vec![
+            ("torn", http("404 Not Found", "")),
+            ("hail", http("200 OK", HAIL)),
+            ("wind", http("200 OK", WIND)),
+        ]);
+        let line = line.expect("line");
+        assert!(
+            !line.starts_with("!"),
+            "a quiet tornado day is not an outage: {line}",
+        );
+        assert_eq!(note, None, "a quiet day must not raise a note: {note:?}");
+    }
+
+    /// The control: three CSVs answering carries no mark at all.
+    #[test]
+    fn a_whole_round_carries_no_mark() {
+        let (line, note) = round(vec![
+            ("torn", http("200 OK", TORN)),
+            ("hail", http("200 OK", HAIL)),
+            ("wind", http("200 OK", WIND)),
+        ]);
+        let line = line.expect("line");
+        assert!(line.contains("3 reports"), "{line}");
+        assert!(!line.starts_with("!"), "nothing failed: {line}");
+        assert_eq!(note, None);
+    }
+
+    /// All three failing is still a failed round, on the health axis. The two
+    /// axes must not have swapped places: this one is stale, not incomplete —
+    /// the previous poll's reports stay on the map deliberately.
+    #[test]
+    fn every_csv_failing_is_still_a_failed_round() {
+        let (line, _) = round(vec![
+            ("torn", http("503 Service Unavailable", "down")),
+            ("hail", http("503 Service Unavailable", "down")),
+            ("wind", http("503 Service Unavailable", "down")),
+        ]);
+        let line = line.expect("line");
+        assert!(
+            line.contains("not updating"),
+            "a round where nothing answered is stale: {line}",
+        );
+        assert!(
+            !line.contains("incomplete"),
+            "nothing arrived to be incomplete about: {line}",
+        );
     }
 }
