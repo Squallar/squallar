@@ -1262,6 +1262,60 @@ impl LoopPlaybackState {
         true
     }
 
+    /// Bring the frame list back inside `held`, by the same even sampling the
+    /// listing was capped with. Returns whether anything was dropped.
+    ///
+    /// # Why an append needs this at all
+    ///
+    /// `accept_scan_listing` caps the listing once, and that was the only place
+    /// the cap was ever applied. Live appends then grow the list past it,
+    /// because the only eviction they run is the *lookback window* one — and a
+    /// loop whose listing had to be sampled is by definition one whose window
+    /// holds more scans than the cap, so that eviction is not binding. Measured
+    /// on the shipped desktop numbers: a 24 h loop sampled 333 scans down to 60,
+    /// and sixty live appends later held **120 frames against a stated cap of
+    /// 60**, with the transport's own caption printing both numbers side by
+    /// side.
+    ///
+    /// # Why re-sampling, rather than dropping the oldest
+    ///
+    /// Dropping from the old end is the cheaper answer and it breaks the one
+    /// invariant the cap is designed around: `accept_scan_listing` samples
+    /// instead of truncating precisely so that **the cap costs resolution and
+    /// never span**. Each append extends the newest end by one scan interval, so
+    /// evicting the oldest frame of a sampled loop would give back a whole
+    /// sampled step — around 26 min against 4 min gained on the 24 h shape — and
+    /// the window the user asked for would erode away in front of them.
+    ///
+    /// Re-sampling keeps the ends and drops one interior frame per append, so
+    /// the loop goes on covering its whole lookback at slightly coarser
+    /// resolution, which is exactly what the cap means everywhere else. It is
+    /// also why [`Self::listing_sampled`] is raised here: scans this loop was
+    /// holding have now been dropped, whether or not the original listing fitted.
+    ///
+    /// The playhead follows the frame it was on, or the nearest survivor, for
+    /// the reason `append_polled_frame`'s own eviction pulls it back inside the
+    /// list: `displayed_frame` resolves `current_frame` with `get()`, so an index
+    /// left past the end renders a blank pane, and a paused loop never advances
+    /// off it.
+    pub fn cap_frames(&mut self, held: usize) -> bool {
+        let Some(indices) = listing_sample_indices(self.frames.len(), held) else {
+            return false;
+        };
+        // The survivor nearest the playhead, so a paused loop stays on the
+        // moment the user parked it rather than jumping to the start.
+        self.current_frame = indices
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, frame)| frame.abs_diff(self.current_frame))
+            .map(|(position, _)| position)
+            .unwrap_or(0);
+        let mut kept: Vec<Option<LoopFrame>> = self.frames.drain(..).map(Some).collect();
+        self.frames = indices.into_iter().filter_map(|i| kept[i].take()).collect();
+        self.listing_sampled = Some(true);
+        true
+    }
+
     /// Drop textures outside the intended render set once more than `budget` frames
     /// are textured, capping loop memory.
     ///
